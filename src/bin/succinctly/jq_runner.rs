@@ -13845,11 +13845,13 @@ fn seq_record_plain_value(bytes: &[u8]) -> Option<OwnedValue> {
     succinctly::jq::parse_plain(std::str::from_utf8(bytes).ok()?)
 }
 
-/// The record read by the checked materializer, which decides every record the one-pass reader
-/// declines.
+/// The record read by the checked materializer: the route every record took before #6620, and
+/// still the one that decides each record the one-pass reader declines (jq's leniencies such as
+/// `nan` and leading zeros, a repeated key, nesting past 128 levels, a grammar error). Not
+/// redundant: without it those records would be dropped.
 fn seq_record_general_value(bytes: &[u8]) -> Option<OwnedValue> {
-    // #2295: the sequence reader already checks the grammar, but retain the checked
-    // materializer as defense in depth.
+    // #2295: it also holds the record to the nesting ceiling and the grammar, which the walk has
+    // already checked and which this keeps as defense in depth.
     json_bytes_to_owned_value_checked(bytes).ok()
 }
 
@@ -21900,7 +21902,9 @@ mod tests {
     #[test]
     fn seq_record_plain_value_agrees_with_the_checked_materializer_6620() {
         let deep = |n: usize| format!("{}1{}", "[".repeat(n), "]".repeat(n));
-        let mut records: Vec<String> = [
+        // What the one-pass reader takes: plain RFC 8259 text, and nesting up to the 127 levels a
+        // scalar can sit in under its 128-level limit.
+        let mut plain_records: Vec<String> = [
             "1",
             "-0",
             "0.0",
@@ -21928,12 +21932,21 @@ mod tests {
             r#"{"a":1.50,"b":1.5}"#,
             r" [ 1 , 2 ] ",
             "\n\t{\"a\" : 1}\r\n",
-            r#"{"a":1,"a":2}"#,
             r#"{"b":1,"a":2,"c":3}"#,
             r#"{"":1}"#,
             r#"{"a\u0000b":1}"#,
             "[[],{},[[]],{\"a\":{}}]",
-            // What the reader declines (jq's leniencies, bad grammar, unknown tokens).
+        ]
+        .iter()
+        .map(|r| (*r).to_string())
+        .collect();
+        for n in [1, 2, 64, 100, 127] {
+            plain_records.push(deep(n));
+        }
+        // What it declines, for the materializer to decide as before: jq's leniencies, a repeated
+        // key, any grammar error, an unterminated token and nesting past its limit.
+        let mut declined_records: Vec<String> = [
+            r#"{"a":1,"a":2}"#,
             "nan",
             "-nan",
             "NaN",
@@ -21965,10 +21978,14 @@ mod tests {
         .iter()
         .map(|r| (*r).to_string())
         .collect();
-        // Nesting around the reader's own limit (128 levels) and the walk's ceilings.
-        for n in [1, 2, 64, 100, 127, 128, 129, 130, 200, 255, 256, 257] {
-            records.push(deep(n));
+        for n in [128, 129, 130, 200, 255, 256, 257] {
+            declined_records.push(deep(n));
         }
+        let records: Vec<String> = plain_records
+            .iter()
+            .chain(&declined_records)
+            .cloned()
+            .collect();
         let mut taken = 0;
         for record in &records {
             let bytes = record.as_bytes();
