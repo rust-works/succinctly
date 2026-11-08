@@ -36,36 +36,65 @@ jobs:
           key: cache-lychee-${{ github.sha }}
           restore-keys: cache-lychee-
 
-      - name: Check markdown links
-        id: lychee
-        uses: lycheeverse/lychee-action@v2
-        with:
-          # Don't fail yet; the retry step below decides the job outcome.
-          fail: false
-          # The options (retries, the excludes, the pinned-link remap) live in
-          # lychee.toml, which the retry step below reads too, so the two passes
-          # cannot disagree about which links they skip (#3620).
-          args: >-
-            --config lychee.toml
-            '**/*.md'
+      # lycheeverse/lychee-action downloads the binary with a bare `curl -sfLO`
+      # and its second invocation downloads it again, so one 5xx from
+      # github.com's release CDN failed the job before a single link was
+      # checked (PR #6645: `curl` exit 22, then a 504 for minutes afterwards).
+      # Install the pinned release once, retrying for up to five minutes, and
+      # run lychee directly.
+      - name: Install lychee
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LYCHEE_VERSION: v0.24.2
+        run: |
+          dir="$RUNNER_TEMP/lychee-install"
+          mkdir -p "$dir/bin"
+          curl -sSfL --retry 10 --retry-delay 15 --retry-all-errors --retry-max-time 300 \
+            -o "$dir/lychee.tar.gz" \
+            "https://github.com/lycheeverse/lychee/releases/download/lychee-${LYCHEE_VERSION}/lychee-x86_64-unknown-linux-gnu.tar.gz"
+          tar -xzf "$dir/lychee.tar.gz" -C "$dir"
+          # The binary sits at the archive root or in a `lychee-*` folder.
+          bin="$(find "$dir" -name lychee -type f | head -n 1)"
+          if [ -z "$bin" ]; then
+            echo "::error::no lychee binary in the ${LYCHEE_VERSION} archive"
+            exit 1
+          fi
+          install "$bin" "$dir/bin/lychee"
+          echo "$dir/bin" >> "$GITHUB_PATH"
+          "$dir/bin/lychee" --version
 
-      # Self-heal transient flakes: the first attempt cached every successful
-      # link, so this re-checks only the links that just failed. lychee does
-      # not retry connect-phase resets internally, so a second in-job attempt
-      # is the only way to heal them without re-running the whole job.
-      - name: Retry links that failed the first attempt
-        if: steps.lychee.outputs.exit_code != '0'
-        uses: lycheeverse/lychee-action@v2
-        with:
-          # The same options as the first attempt, from lychee.toml, which also
-          # skips the first attempt's own report (`lychee/out.md`).
-          args: >-
-            --config lychee.toml
-            '**/*.md'
+      # Self-heal transient flakes: the first attempt caches every successful
+      # link, so the second re-checks only the links that just failed. lychee
+      # does not retry connect-phase resets internally, so a second in-job
+      # attempt is the only way to heal them without re-running the whole job.
+      # Both attempts run `lychee --config lychee.toml '**/*.md'` (#3620), so
+      # they cannot disagree about which links they skip. The report goes to
+      # $RUNNER_TEMP, outside the checkout, so the second attempt does not read
+      # the first one's list of failing URLs as links to check.
+      - name: Check markdown links
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          report="$RUNNER_TEMP/lychee-report.md"
+          code=0
+          for attempt in 1 2; do
+            code=0
+            lychee --config lychee.toml --mode task --format markdown \
+              --output "$report" '**/*.md' || code=$?
+            [ "$code" -eq 0 ] && break
+            echo "::warning::lychee attempt ${attempt} exited ${code}"
+          done
+          if [ ! -f "$report" ]; then
+            echo "No output. Check the log to see if lychee panicked." > "$report"
+          fi
+          cat "$report"
+          cp "$report" "$GITHUB_STEP_SUMMARY"
+          # No links at all means the glob or the config broke, not that the
+          # docs are clean (lychee-action's failIfEmpty).
+          if grep -Eq 'Total\s+\|\s+0' "$report"; then
+            echo "::error::lychee found no links; check the glob and lychee.toml"
+            exit 1
+          fi
+          exit "$code"
 
       # actions/cache's automatic post-save is skipped on job failure; save
       # explicitly so successes from a failing run still make the next run cheap.

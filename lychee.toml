@@ -1,6 +1,6 @@
-# The options of both lychee passes in .github/workflows/links.yml (the first
-# attempt and the retry that follows it), so an exclude added here reaches both
-# (#3620). Both steps run `lychee --config lychee.toml '**/*.md'`.
+# The options of both lychee attempts in .github/workflows/links.yml (the first
+# and the retry that follows it), so an exclude added here reaches both (#3620).
+# Both run `lychee --config lychee.toml '**/*.md'`.
 #
 # lychee reads ./lychee.toml by default, so a bare `lychee '**/*.md'` from the
 # repository root uses these too, including the one-day cache of successful
@@ -28,10 +28,7 @@ accept = ["100..=399"]
 # Neither holds a tracked file, so CI never sees them; `tests/data/` is tracked
 # and is checked.
 #
-# The last entry is the first attempt's own report, which lists every failing
-# URL as a link, so the retry skips it (it does not exist yet during the first
-# attempt).
-exclude_path = ['(^|/)target/', '^(\./)?data/', '(^|/)lychee/out\.md$']
+exclude_path = ['(^|/)target/', '^(\./)?data/']
 
 exclude = [
   '^https://crates\.io/crates/',
