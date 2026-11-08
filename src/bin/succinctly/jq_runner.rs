@@ -13832,6 +13832,22 @@ fn seq_record_value(
         substituted = succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(raw);
         substituted.as_bytes()
     };
+    seq_record_plain_value(bytes).or_else(|| seq_record_general_value(bytes))
+}
+
+/// A record of plain RFC 8259 text read in one pass (#6620), where [`seq_record_general_value`]
+/// indexes the record, walks it twice (its delimiters, then its conversion) and builds it from the
+/// cursor: 52% of a 100 MB `--seq` stream with one truncated record (Apple M5), whose records all
+/// take this route. `None` for anything the one-pass reader does not take (the leniencies jq has,
+/// a repeated key, a depth past 128 levels, any grammar error), which the general route decides
+/// exactly as it did.
+fn seq_record_plain_value(bytes: &[u8]) -> Option<OwnedValue> {
+    succinctly::jq::parse_plain(std::str::from_utf8(bytes).ok()?)
+}
+
+/// The record read by the checked materializer, which decides every record the one-pass reader
+/// declines.
+fn seq_record_general_value(bytes: &[u8]) -> Option<OwnedValue> {
     // #2295: the sequence reader already checks the grammar, but retain the checked
     // materializer as defense in depth.
     json_bytes_to_owned_value_checked(bytes).ok()
@@ -21865,6 +21881,139 @@ mod tests {
     fn parse_seq(stream: &str) -> Vec<OwnedValue> {
         let mut locations = InputLocations::new(vec![None]);
         seq_build(&[(None, stream.to_string())], &mut locations)
+    }
+
+    /// The spellings a value prints in, so two values that print alike on every route compare
+    /// equal and a number kept as written (`1.50`) is told from one computed (`1.5`). A NaN gets an
+    /// identity of its own at every conversion (#3309), which the input-bridge spelling prints, so a
+    /// record holding one is compared in the two spellings that do not.
+    fn seq_record_prints(record: &str, value: &OwnedValue) -> Vec<String> {
+        let mut prints = vec![value.to_json(), value.to_json_jq_preserve()];
+        if !record.to_ascii_lowercase().contains("nan") {
+            prints.push(value.to_json_input_bridge());
+        }
+        prints
+    }
+
+    /// #6620: a record the one-pass reader takes is the value the checked materializer builds, in
+    /// every spelling it prints in, and everything the reader declines is the materializer's alone.
+    #[test]
+    fn seq_record_plain_value_agrees_with_the_checked_materializer_6620() {
+        let deep = |n: usize| format!("{}1{}", "[".repeat(n), "]".repeat(n));
+        let mut records: Vec<String> = [
+            "1",
+            "-0",
+            "0.0",
+            "1.50",
+            "1e2",
+            "1E+2",
+            "1e400",
+            "-1e400",
+            "100000000000000000000",
+            "9007199254740993",
+            "0.1",
+            "-12.5e-3",
+            "true",
+            "false",
+            "null",
+            r#""""#,
+            r#""a""#,
+            r#""\u00e9\ud83d\ude00""#,
+            r#""\n\t\\\"\/""#,
+            "\"caf\u{e9} \u{1f600}\"",
+            "[]",
+            "{}",
+            "[1,2,3]",
+            r#"{"a":1,"b":[true,null,{"c":"d"}]}"#,
+            r#"{"a":1.50,"b":1.5}"#,
+            r" [ 1 , 2 ] ",
+            "\n\t{\"a\" : 1}\r\n",
+            r#"{"a":1,"a":2}"#,
+            r#"{"b":1,"a":2,"c":3}"#,
+            r#"{"":1}"#,
+            r#"{"a\u0000b":1}"#,
+            "[[],{},[[]],{\"a\":{}}]",
+            // What the reader declines (jq's leniencies, bad grammar, unknown tokens).
+            "nan",
+            "-nan",
+            "NaN",
+            "Infinity",
+            "-Infinity",
+            "[nan]",
+            "01",
+            "[01]",
+            "1.",
+            ".5",
+            "+1",
+            "[1,]",
+            "{\"a\":1,}",
+            "[1 2]",
+            "{\"a\" 1}",
+            "{\"a\":}",
+            "tru",
+            "nul",
+            "\"abc",
+            "\"a\u{1}b\"",
+            "\"\\x\"",
+            "\"\\ud800\"",
+            "'x'",
+            "[1]]",
+            "{",
+            "[",
+            "",
+        ]
+        .iter()
+        .map(|r| (*r).to_string())
+        .collect();
+        // Nesting around the reader's own limit (128 levels) and the walk's ceilings.
+        for n in [1, 2, 64, 100, 127, 128, 129, 130, 200, 255, 256, 257] {
+            records.push(deep(n));
+        }
+        let mut taken = 0;
+        for record in &records {
+            let bytes = record.as_bytes();
+            let general = seq_record_general_value(bytes);
+            match seq_record_plain_value(bytes) {
+                Some(plain) => {
+                    taken += 1;
+                    let materialized = general.as_ref().unwrap_or_else(|| {
+                        panic!("the reader took {record:?}, which the materializer refuses")
+                    });
+                    assert_eq!(
+                        seq_record_prints(record, &plain),
+                        seq_record_prints(record, materialized),
+                        "{record:?}"
+                    );
+                }
+                None => {
+                    // The record's value is whatever the general route says, as before.
+                    let direct = seq_record_value(bytes, usize::MAX, 0, bytes.len());
+                    assert_eq!(
+                        direct.as_ref().map(|v| seq_record_prints(record, v)),
+                        general.as_ref().map(|v| seq_record_prints(record, v)),
+                        "{record:?}"
+                    );
+                }
+            }
+            // Through the one function both routes call, a record is its general value either way.
+            assert_eq!(
+                seq_record_value(bytes, usize::MAX, 0, bytes.len())
+                    .as_ref()
+                    .map(|v| seq_record_prints(record, v)),
+                general.as_ref().map(|v| seq_record_prints(record, v)),
+                "{record:?}"
+            );
+        }
+        assert!(
+            taken > 20,
+            "the reader must take the plain records: {taken}"
+        );
+        // Invalid UTF-8 never reaches the reader: it is substituted first, as before.
+        let raw = b"\"a\xffb\"";
+        assert_eq!(
+            seq_record_value(raw, 0, 0, raw.len()).map(|v| v.to_json()),
+            Some("\"a\u{fffd}b\"".to_string())
+        );
     }
 
     /// #1243: same leading-zero tolerance as `--slurpfile`/`--slurp` above,
