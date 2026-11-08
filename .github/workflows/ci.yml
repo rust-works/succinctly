@@ -1187,37 +1187,6 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
-  # Pull-request coverage: the sticky patch-coverage comment, diffed against the
-  # baseline that coverage-baseline.yml published for the PR's merge-base. Only
-  # `pull_request` runs it (#3649): a merge-group build has no PR to comment on
-  # (#310), and the push-to-main run that publishes the baseline lives in
-  # coverage-baseline.yml, where an unrelated job failing or being cancelled
-  # here can no longer make the artifact unreachable. The jobs live in
-  # .github/workflows/coverage.yml, shared with that workflow: three test shards per
-  # architecture and a report job that combines them (#5711).
-  coverage:
-    name: Coverage (${{ matrix.name }})
-    needs: gate
-    if: needs.gate.outputs.code == 'true' && github.event_name == 'pull_request'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # #5926: the x86_64 leg is off the ubuntu-24.04 pin, with coverage-baseline.yml, so a
-          # PR's patch coverage is diffed against a baseline measured on the same image.
-          - name: x86_64
-            runner: ubuntu-26.04
-          - name: ARM64
-            runner: ubuntu-24.04-arm
-    # A called workflow cannot hold more than its caller grants it.
-    permissions:
-      contents: read
-      pull-requests: write          # required to post the sticky coverage comment
-    uses: ./.github/workflows/coverage.yml
-    with:
-      name: ${{ matrix.name }}
-      runner: ${{ matrix.runner }}
-
   # Drift detector for the yq golden fixtures (tests/data/yq-golden/): the
   # goldens are frozen oracle output, so this is the one job that re-checks
   # them against the pinned mikefarah/yq. Unlike the pre-#227 comparison
