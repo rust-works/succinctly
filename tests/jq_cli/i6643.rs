@@ -20,6 +20,7 @@ fn each_fault_of_a_seq_stream_is_placed_by_its_own_read_beside_a_last_directory_
         ("f", "\u{1e}1\n\u{1e}{\"a\n\u{1e}5\n"),
         ("nonl", "\u{1e}1\n\u{1e}2"),
         ("trunc", "\u{1e}[1,"),
+        ("bad1", "\u{1e}{\"a\n"),
         ("c", "\u{1e}1\n\u{1e}2\n"),
         ("mideof", "\u{1e}1\n\u{1e}{\"a\n\u{1e}5\n\u{1e}[1,"),
         ("twomid", "\u{1e}1\n\u{1e}{\"a\n\u{1e}5\n\u{1e}}\n\u{1e}6\n"),
@@ -44,6 +45,11 @@ fn each_fault_of_a_seq_stream_is_placed_by_its_own_read_beside_a_last_directory_
         (&[][..], "[inputs]", &["f", "trunc", "dd"][..], "", "jq: error (at @DIR@/f.seq:3): Truncated value at line 3, column 1\njq: error (at @DIR@/dd:0): Unfinished JSON term at EOF at line 4, column 4\n", 2),
         (&["-n"][..], "[inputs]", &["c", "nonl", "dd"][..], "", "jq: error (at @DIR@/dd:0): Potentially truncated top-level numeric value at EOF at line 4, column 2\n", 2),
         (&["-n"][..], "input", &["c", "nonl", "dd"][..], "\u{1e}1\n", "", 0),
+        // Three reads over two faulting files: each read pops its own fault, so a flag that never
+        // advanced would read the second fault as the first.
+        (&["-n"][..], "[(try input catch .),(try input catch .),(try input catch .)]", &["nonl", "trunc", "dd"][..], "\u{1e}[1,\"Potentially truncated top-level numeric value at line 2, column 3\",\"Unfinished JSON term at EOF at line 2, column 6\"]\n", "", 2),
+        (&["-n"][..], "[(try input catch .),(try input catch .),(try input catch .)]", &["trunc", "nonl", "dd"][..], "\u{1e}[\"Truncated value at line 1, column 5\",1,\"Potentially truncated top-level numeric value at EOF at line 2, column 2\"]\n", "", 2),
+        (&["-n"][..], "[(try input catch .),(try input catch .),(try input catch .)]", &["bad1", "nonl", "dd"][..], "\u{1e}[\"Truncated value at line 2, column 1\",1,\"Potentially truncated top-level numeric value at EOF at line 3, column 2\"]\n", "", 2),
     ] {
         let mut args = vec!["--seq", "-c"];
         args.extend_from_slice(flags);
