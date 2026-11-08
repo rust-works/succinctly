@@ -7467,11 +7467,28 @@ fn read_inputs(
         // that is the call after the array's is met after every file, so it loses the array
         // beside any file that failed (#6481).
         let mut slurp_stopped = false;
+        // #6700: but a stream that ends in an unfinished term, with every failure before the last
+        // file that has bytes, is read through to its end before the failure is met again: jq
+        // prints the array and never says the warning.
+        let eof_term_after_failures = seq_stream_places_failures
+            && args.slurp
+            && !held_open_failures.is_empty()
+            && raw_bytes
+                .iter()
+                .rposition(|(_, raw)| !raw.is_empty())
+                .is_some_and(|last| held_open_failures.iter().all(|&(at, _)| at <= last));
+        let eof_term_dropped = |fault: &crate::jq_stream_errors::SeqFault| -> bool {
+            eof_term_after_failures
+                && fault.after_array
+                && fault.message.starts_with("Unfinished JSON term at EOF")
+        };
         let array_lost = slurped_array_lost(
             args.slurp && !faults_as_inputs,
             any_open_failure,
             if seq_stream_places_failures {
-                read.faults.iter().any(|fault| fault.after_array)
+                read.faults
+                    .iter()
+                    .any(|fault| fault.after_array && !eof_term_dropped(fault))
             } else {
                 !read.faults.is_empty()
             },
@@ -7510,6 +7527,8 @@ fn read_inputs(
                     "{}",
                     crate::jq_seq_reader::ignored_parse_error(&fault.message)
                 );
+            } else if eof_term_dropped(&fault) {
+                // Never said (#6700).
             } else if trailing_error.is_none() {
                 // The warning of a call after the slurped array: jq prints it once the program
                 // has run on the array, and has lost its position by then (#3201). Only one can
