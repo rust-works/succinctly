@@ -323,7 +323,11 @@ QUERY_FLAGS = {
     "seq_name_bad_last": ["--seq", "-r"],
     # yq's lexer has no `keys_unsorted`, so yq mode needs the flag for it (#4808); its cost
     # is one boolean in the parser, nothing on the keys walk this row measures.
-    "users_yq_keys_unsorted": ["--jq-extensions"],
+    "users_yq_keys_unsorted": ["--jq-extensions", "-o", "yaml"],
+    # The yq rows read a `.json` fixture, and `-o` defaults to `auto` (#6703), which prints JSON for
+    # one: `users_yq_del_select` fell 41% in instructions because it stopped running the YAML
+    # writer it exists to guard. `-o yaml` keeps the workload these rows were baselined on.
+    "users_yq_del_select": ["-o", "yaml"],
 }
 
 # Rows whose fixture is the base `users`/2mb document's records, one compact
