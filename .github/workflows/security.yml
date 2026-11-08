@@ -46,17 +46,30 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: EmbarkStudios/cargo-deny-action@v2.1.1
-        with:
-          command: check all
+      # #6652: EmbarkStudios/cargo-deny-action builds a Docker image that pipes
+      # `curl` of github.com/<repo>/releases/download/ into `tar`, so the 504 that
+      # URL answered for hours on 2026-11-08 failed this job ("gzip: invalid
+      # magic"). Install the release the action pinned (v2.1.1 -> 0.20.2) through
+      # the API asset endpoint instead, and run cargo-deny directly: once for the
+      # root deny.toml, then once per isolated workspace with its own config
+      # (root deny.toml is intentionally tuned to the shipped crate's dependency
+      # tree only).
+      - name: Install cargo-deny
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CARGO_DENY_VERSION: 0.20.2
+        run: |
+          dir="$RUNNER_TEMP/cargo-deny-install"
+          mkdir -p "$dir/bin"
+          ./scripts/gh-release-download.sh EmbarkStudios/cargo-deny "${CARGO_DENY_VERSION}" \
+            "cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz" "$dir/cargo-deny.tar.gz"
+          tar -xzf "$dir/cargo-deny.tar.gz" -C "$dir"
+          install "$dir/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl/cargo-deny" "$dir/bin/cargo-deny"
+          echo "$dir/bin" >> "$GITHUB_PATH"
+          "$dir/bin/cargo-deny" --version
 
-      # Same isolation gap as cargo-audit above. cargo-deny-action has no
-      # input for a custom config path, so invoke cargo-deny directly with
-      # each workspace's own deny.toml (root deny.toml is intentionally
-      # tuned to the shipped crate's dependency tree only).
-      - uses: taiki-e/install-action@v2.87.31
-        with:
-          tool: cargo-deny
+      - name: Dependency Policy
+        run: cargo deny check all
 
       - name: Dependency Policy (fuzz workspace)
         run: cargo deny --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check all

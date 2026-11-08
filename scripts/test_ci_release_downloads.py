@@ -14,9 +14,11 @@ Three kinds of check, none of which touches the network (a fake `gh` stands in):
   - each pinned-tool install step goes through the helper and passes it a token;
   - the helper retries, then gives up with an error, and hands `gh` the arguments it was given.
 
-It reads the workflow text, so it cannot see a third-party action that downloads from that URL inside
-its own code (`lycheeverse/lychee-action` did; it was replaced for that reason): a new `uses:` that
-installs a tool is a review question, not something this test answers.
+It reads the workflow text, so it cannot see inside a third-party action. The two this repo used that
+download from that URL in their own code (`lycheeverse/lychee-action`, `EmbarkStudios/cargo-deny-action`,
+whose Docker build pipes the 504 page into `tar`) were replaced, and are listed in
+`ACTIONS_THAT_CURL_THE_DOWNLOAD_URL` so they stay out; any other `uses:` that installs a tool is a
+review question, not something this test answers.
 
 Run directly (`python3 scripts/test_ci_release_downloads.py`).
 """
@@ -35,6 +37,19 @@ HELPER = SCRIPTS / "gh-release-download.sh"
 
 # The URL shape of the direct download, whoever fetches it. A `gh release download` never spells it.
 DIRECT_DOWNLOAD = re.compile(r"/releases/(?:latest/)?download/")
+
+
+# Actions whose own code fetches a release asset from the direct URL, so using one is the same fault.
+ACTIONS_THAT_CURL_THE_DOWNLOAD_URL = ("lycheeverse/lychee-action", "EmbarkStudios/cargo-deny-action")
+
+
+def used_actions(text, names):
+    """`(line number, line)` for each non-comment `uses:` line that names one of `names`."""
+    return [
+        (i, line.strip())
+        for i, line in enumerate(text.splitlines(), 1)
+        if "uses:" in line and not line.lstrip().startswith("#") and any(n in line for n in names)
+    ]
 
 
 def direct_download_lines(text):
@@ -69,6 +84,20 @@ class DirectDownloadGuardTests(unittest.TestCase):
                     "not from /releases/download/, which answered 504 for hours on 2026-11-08 (#6652)",
                 )
 
+    def test_no_workflow_uses_an_action_that_curls_the_direct_download_url(self):
+        for path in sorted(WORKFLOWS.glob("*.yml")):
+            with self.subTest(workflow=path.name):
+                found = [
+                    f"line {i}: {line}"
+                    for i, line in used_actions(path.read_text(encoding="utf-8"), ACTIONS_THAT_CURL_THE_DOWNLOAD_URL)
+                ]
+                self.assertEqual(found, [], "install the pinned release with scripts/gh-release-download.sh (#6652)")
+
+    def test_the_action_detector_flags_a_use_and_ignores_a_comment(self):
+        self.assertTrue(used_actions("      - uses: EmbarkStudios/cargo-deny-action@v2.1.1", ACTIONS_THAT_CURL_THE_DOWNLOAD_URL))
+        self.assertTrue(used_actions("        uses: lycheeverse/lychee-action@v2", ACTIONS_THAT_CURL_THE_DOWNLOAD_URL))
+        self.assertEqual(used_actions("      # uses: lycheeverse/lychee-action@v2", ACTIONS_THAT_CURL_THE_DOWNLOAD_URL), [])
+
     def test_the_detector_flags_every_spelling_of_the_direct_download(self):
         for label, text in (
             ("curl", 'curl -fsSL "https://github.com/o/r/releases/download/v1/a" -o a'),
@@ -96,6 +125,7 @@ class InstallStepTests(unittest.TestCase):
         ("ci.yml", "Install pinned yq", "mikefarah/yq", "yq_linux_amd64"),
         ("ci.yml", "Install pinned jq", "jqlang/jq", "jq-linux-amd64"),
         ("links.yml", "Install lychee", "lycheeverse/lychee", "lychee-x86_64-unknown-linux-gnu.tar.gz"),
+        ("security.yml", "Install cargo-deny", "EmbarkStudios/cargo-deny", "cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz"),
     )
 
     def test_each_pinned_tool_install_goes_through_the_helper_with_a_token(self):
