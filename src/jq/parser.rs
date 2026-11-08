@@ -2540,6 +2540,9 @@ impl<'a> Parser<'a> {
                 '\\' => quoted.push_str("\\\\"),
                 '\n' => quoted.push_str("\\n"),
                 '\t' => quoted.push_str("\\t"),
+                '\r' => quoted.push_str("\\r"),
+                // Go's `%q` writes the other ASCII controls as `\xNN`.
+                c if c < ' ' || c == '\x7f' => quoted.push_str(&format!("\\x{:02x}", c as u32)),
                 other => quoted.push(other),
             }
         }

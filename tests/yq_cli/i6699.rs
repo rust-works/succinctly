@@ -64,3 +64,29 @@ fn test_yq_reads_the_other_quoted_dotted_names_and_the_empty_key_6699() -> Resul
     }
     Ok(())
 }
+
+/// The message names the text after the spaces, quoted as Go's `%q` does (yq v4.53.3 prints
+/// `lexer: invalid input text "b\""` for `."a b"`).
+#[test]
+fn test_yq_names_the_text_after_the_spaces_in_the_lexer_error_6699() -> Result<()> {
+    use crate::run_yq_stdin_with_stderr;
+    for (filter, text) in [
+        (r#"."a b""#, r#""b\"""#),
+        (r#".x."a b""#, r#""b\"""#),
+        (r#"."a  b""#, r#""b\"""#),
+        (r#"." a""#, r#""a\"""#),
+        (r#"."a ""#, r#""\"""#),
+        (r#"."p q".r"#, r#""q\".r""#),
+        (r#"."a b" = 9"#, r#""b\" = 9""#),
+        (r#"."a b"#, r#""b""#),
+        (r#"."a b" # c"#, r#""b\" # c""#),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[])?;
+        assert_eq!((stdout.as_str(), code), ("", 1), "{filter}");
+        assert!(
+            stderr.contains(&format!("lexer: invalid input text {text}")),
+            "{filter}: {stderr}"
+        );
+    }
+    Ok(())
+}

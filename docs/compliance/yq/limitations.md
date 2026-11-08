@@ -6718,6 +6718,7 @@ Every other character is inside the token, a tab and a newline included (`."a\tb
 `.["a b"]` is the spelling both accept for a key with a space.
 An empty name is not unquoted: `.""` is the key made of two quote characters, so it reads `null` over a document whose key is `""`, and `.x."" = 9` creates that key.
 `succinctly jq` is unchanged: jq reads `."a b"` as a string index and `.""` as the key `""`.
+A quoted name with no closing quote (`."a`) is still a parse error here, where yq's token is the key `"a` and answers `null`; that is the same token rule, left open.
 Pinned in `tests/yq_cli/i6699.rs` and `tests/jq_cli/i6699.rs`.
 
 A wildcard key costs one pass over the mapping's keys plus one keyed lookup per match, and
