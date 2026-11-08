@@ -190,3 +190,29 @@ fn input_dsv_rows_are_read_from_the_file_they_end_in_past_a_missing_one_6585() -
     assert_eq!(code, 2);
     Ok(())
 }
+
+#[test]
+fn input_dsv_on_error_stop_ends_the_run_before_a_later_file_and_its_failure_6585() -> Result<()> {
+    // `--on-error=stop` is succinctly's own (jq has no such option): the error on the last row of
+    // the first file ends the run before the next file is read, so a missing file behind it is
+    // never reached; one before it was reached by the first row and still makes the status 2.
+    let dir = tempfile::tempdir()?;
+    let d = dir.path().to_string_lossy().into_owned();
+    std::fs::write(dir.path().join("e1.csv"), "a,b\n")?;
+    std::fs::write(dir.path().join("e2.csv"), "c,d\n")?;
+    let flags = ["-c", "--on-error=stop", "--input-dsv", ",", "error(\"e\")"];
+    let (out, err, code) = run(&d, &flags, &["e1.csv", "e2.csv", "gone.csv"])?;
+    assert_eq!(out, "");
+    assert_eq!(err, format!("jq: error (at {d}/e1.csv:1): e\n"));
+    assert_eq!(code, 5);
+    let (out, err, code) = run(&d, &flags, &["gone.csv", "e1.csv", "e2.csv"])?;
+    assert_eq!(out, "");
+    assert_eq!(
+        err,
+        format!(
+            "jq: error: Could not open file {d}/gone.csv: No such file or directory\njq: error (at {d}/e1.csv:1): e\n"
+        )
+    );
+    assert_eq!(code, 2);
+    Ok(())
+}
