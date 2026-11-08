@@ -45,18 +45,16 @@ enum Pin {
     /// harness runs against jq 1.8.1 alone: a jq 1.8 name is not succinctly-only, so it has no
     /// "the reference must reject" row.
     Vendored18,
-    /// A row another change adds (#6673 adds `isvalid`'s).
-    Elsewhere,
 }
 
-use Pin::{Elsewhere, Row, Vendored18};
+use Pin::{Row, Vendored18};
 
 /// `(class, name, pin)`.
 const ROSTER: &[(&str, &str, Pin)] = &[
     (OWN, "at_offset", Row("at-offset")),
     (OWN, "at_position", Row("at-position")),
     (OWN, "leaf_paths", Row("leaf-paths")),
-    (OWN, "isvalid", Elsewhere),
+    (OWN, "isvalid", Row("isvalid")),
     (OWN, "isnull", Row("isnull")),
     (OWN, "isboolean", Row("isboolean")),
     (OWN, "isnumber", Row("isnumber")),
@@ -178,7 +176,6 @@ fn every_name_is_pinned_by_its_own_row_or_the_vendored_tests_6672() -> Result<()
                 has_word(&vendored, name),
                 "`{name}` is not exercised by jq 1.8.1's vendored jq.test"
             ),
-            Elsewhere => {}
         }
     }
     // A row belongs to a name: one nobody lists (and that is not one of the surface rows from
