@@ -1216,7 +1216,10 @@ pub struct YqCommand {
     pub filter: Option<String>,
 
     /// Input files (reads from stdin if none provided)
-    #[arg(trailing_var_arg = true)]
+    ///
+    /// Not `trailing_var_arg`: that made every word after the first file a file, flags included,
+    /// so `yq '.a' f.yaml -o=json` and `yq '.a = 1' f.yaml -i` failed with "failed to read file:
+    /// -o=json". yq reads a flag wherever it appears (#6705, as `jq` does, #3447).
     pub files: Vec<String>,
 
     // === Input Options ===
