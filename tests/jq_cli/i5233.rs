@@ -94,31 +94,26 @@ fn an_extension_builtin_beside_a_static_path_target_still_answers_5233() -> Resu
 
 /// A dynamic path program over a document the interpreter cannot materialize raises the decode
 /// error instead of answering from the parts it reads: a lone surrogate, which jq rejects at
-/// parse time, and a scalar at the 257th level, which jq's parser accepts and the materializer
-/// refuses (#5497: a document past jq's parse-depth limit is refused before any filter runs). A
-/// program with no dynamic target still reads only what it navigates (#4412).
+/// parse time. A document of 256 nested arrays, which jq's parser accepts, is read (#6631: the
+/// materializer used to refuse its scalar as the 257th level; a document past jq's parse-depth
+/// limit is refused before any filter runs, #5497). A program with no dynamic target still reads
+/// only what it navigates (#4412).
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq's `{k:.}`, not a format argument
 fn a_dynamic_path_program_over_an_undecodable_document_raises_5233() -> Result<()> {
     let lone = r#"{"a":"\ud800","d":5}"#;
     let deep = format!("{}1{}", "[".repeat(256), "]".repeat(256));
-    for (filter, input, message) in [
-        (
-            "[.d | path(if . then . else empty end)]",
-            lone,
-            "invalid unicode escape sequence",
-        ),
-        (
-            ". as $y | [path($y)]",
-            deep.as_str(),
-            "nesting depth exceeds limit of 256",
-        ),
-    ] {
-        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
-        assert_eq!((stdout.as_str(), code), ("", 5), "`{filter}`: {stderr}");
-        assert!(names_fault(&stderr, message), "`{filter}`: {stderr}");
-    }
+    let filter = "[.d | path(if . then . else empty end)]";
+    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(lone))?;
+    assert_eq!((stdout.as_str(), code), ("", 5), "`{filter}`: {stderr}");
+    assert!(
+        names_fault(&stderr, "invalid unicode escape sequence"),
+        "`{filter}`: {stderr}"
+    );
     let (stdout, stderr, code) = run_jq_full(&["-c", "[.d | path(.)]"], Some(lone))?;
+    assert_eq!((stdout.as_str(), code), ("[[]]\n", 0), "{stderr}");
+    // #6631: a document 256 containers deep is read by the dynamic path walk, as jq reads it.
+    let (stdout, stderr, code) = run_jq_full(&["-c", ". as $y | [path($y)]"], Some(&deep))?;
     assert_eq!((stdout.as_str(), code), ("[[]]\n", 0), "{stderr}");
     Ok(())
 }

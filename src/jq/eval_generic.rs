@@ -1952,8 +1952,7 @@ fn walk_child_holed<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOutput, H:
     hole: &H,
 ) -> Result<B::Out, EvalError> {
     if let Some(value) = &known {
-        // The callee's own first check, then its scalar-override arm.
-        check_depth(depth)?;
+        // The callee's scalar-override arm; a container goes on to the callee's own check (#6631).
         if let Some(owned) = scalar_override(cursor, value) {
             return Ok(B::scalar(owned));
         }
@@ -2025,9 +2024,11 @@ fn to_owned_cursor_at_depth_holed<
     nested: &[usize],
     hole: &H,
 ) -> Result<B::Out, EvalError> {
-    check_depth(depth)?;
+    // #6631: the ceiling counts containers, as jq's parser does (256 deep is read, 257 refused), so
+    // `check_depth` is asked where a container opens and not of the scalar a deepest one holds.
     let value = known.unwrap_or_else(|| cursor.value());
     if let Some(fields) = value.as_object_rendered() {
+        check_depth(depth)?;
         let mut map = ObjectBuilder::with_capacity(capacity);
         let mut guard = DisplayKeyGuard::default();
         // #3478: the collision bookkeeping of a walk that keeps no members
@@ -2153,6 +2154,7 @@ fn to_owned_cursor_at_depth_holed<
         }
         Ok(out)
     } else if let Some(elements) = value.as_array() {
+        check_depth(depth)?;
         let mut items = Vec::new();
         let mut elems = elements;
         let mut is_first = true;
@@ -2244,19 +2246,12 @@ fn to_owned_cursor_at_depth_holed<
             // being in scope -- `value` is already proven scalar by this
             // point (the caller's own container arms above return before
             // reaching this `else`), so `to_owned_at_depth`'s `cursor`
-            // parameter is never consulted on this path. Its depth check
-            // still runs, since `check_depth` above is the caller's own
-            // contract and may be laxer; `scalar_to_owned` is what follows
+            // parameter is never consulted on this path. A scalar has no
+            // depth check of its own (#6631): it recurses no deeper, and the
+            // ceiling counts containers. `scalar_to_owned` is what follows
             // it there, and a walk that keeps nothing (#3478) asks it not to
             // build what it would drop.
-            None => {
-                if depth >= MAX_NESTING_DEPTH {
-                    return Err(EvalError::decode_failure(
-                        super::value::nesting_depth_exceeded_message(MAX_NESTING_DEPTH),
-                    ));
-                }
-                scalar_to_owned::<S, _>(&value, B::KEEPS_MEMBERS).map(B::scalar)
-            }
+            None => scalar_to_owned::<S, _>(&value, B::KEEPS_MEMBERS).map(B::scalar),
         }
     }
 }
@@ -5661,10 +5656,13 @@ fn owned_from_standard_json_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
     // every other walk over one is, by `MAX_VALUE_TREE_DEPTH` or by the floor: the document
     // ceiling refused a value the output could print. Anywhere else (a library caller that did
     // not opt in) nothing says the text is a built value, so the document ceiling stays.
-    if depth >= MAX_NESTING_DEPTH && super::eval::value_depth_floor_armed() {
-        super::value::check_value_tree_depth(depth)?;
-    } else {
-        guard_nesting_depth(depth)?;
+    // #6631: the ceilings count containers, so a scalar at one is not too deep.
+    if matches!(value, StandardJson::Array(_) | StandardJson::Object(_)) {
+        if depth >= MAX_NESTING_DEPTH && super::eval::value_depth_floor_armed() {
+            super::value::check_value_tree_depth(depth)?;
+        } else {
+            guard_nesting_depth(depth)?;
+        }
     }
     Ok(match value {
         StandardJson::Null => OwnedValue::Null,
@@ -7590,12 +7588,13 @@ fn push_generic_document_validation_error<C: DocumentCursor>(
     c: &C,
     depth: usize,
 ) -> Option<Control> {
-    if depth >= MAX_NESTING_DEPTH {
+    let value = c.value();
+    // #6631: the ceiling counts containers, so a scalar at it is not too deep.
+    if depth >= MAX_NESTING_DEPTH && (value.as_object().is_some() || value.as_array().is_some()) {
         return Some(Control::Error(EvalError::decode_failure(
             super::value::nesting_depth_exceeded_message(MAX_NESTING_DEPTH),
         )));
     }
-    let value = c.value();
     if let Some(fields) = value.as_object() {
         // #1804: do not walk *into* an alias's container target here. A
         // document shaped as a chain of anchors each referencing the
@@ -12065,12 +12064,15 @@ fn embed_lazy<S: EvalSemantics, C: DocumentCursor>(cursor: &C) -> embed_table::L
 
 /// The height [`to_owned_cursor_at_depth`] walks below `cursor`'s node:
 /// `0` for a scalar or an empty container, else one more than the tallest
-/// child, capped at `cap` (#3179). Measured on the document, not on a bound
+/// child, capped at `cap` (#3179). A scalar leaf counts as a level, which the walk no longer
+/// checks (#6631), so a reuse is declined one level early at the ceiling: a fresh walk runs
+/// instead and passes, which costs the sharing there and nothing else. Measured on the document, not on a bound
 /// value: the walk descends into every member, a duplicate key's included,
 /// where the value keeps only the last. A walk that starts the node at depth
 /// `d` visits depths `d..=d + height`, so it passes the `MAX_NESTING_DEPTH`
-/// check exactly when `d + height < MAX_NESTING_DEPTH`; a height at `cap`
-/// already fails that for every `d >= 1`, so the recursion stops there.
+/// check when `d + height < MAX_NESTING_DEPTH` (and, a scalar leaf being no check of the walk's
+/// since #6631, also when it is one level more); a height at `cap` already fails that for every
+/// `d >= 1`, so the recursion stops there.
 fn cursor_height<C: DocumentCursor>(cursor: &C, cap: usize) -> usize {
     if cap == 0 {
         return 0;
@@ -12198,8 +12200,8 @@ fn embed_descendant_shared<C: DocumentCursor>(cursor: &C) -> Option<OwnedValue> 
 /// [`embed_at_or_within`] named `nested` (#3179), when handing it back skips
 /// no check the fresh walk would have failed. The depth is the only one it
 /// could: the bind's own walk made every other check over the same text.
-/// And `depth + height < MAX_NESTING_DEPTH` is exactly when the fresh walk
-/// passes it. The membership test is a compare against a handful of ids,
+/// And `depth + height < MAX_NESTING_DEPTH` implies the fresh walk passes it (it declines one
+/// level early where the deepest level is a scalar, #6631). The membership test is a compare against a handful of ids,
 /// so a child that is no binding's node costs neither a table borrow nor a
 /// cursor lookup.
 fn embed_shared_nested<C: DocumentCursor, B: CursorWalkOutput>(
@@ -45088,7 +45090,8 @@ mod tests {
     #[test]
     fn test_arithmetic_wildcard_bridge_with_cursor_reports_clean_error_past_nesting_limit_2627() {
         use crate::json::JsonIndex;
-        let json = format!("{}1{}", "[".repeat(256), "]".repeat(256));
+        // #6631: 257 containers, one past the ceiling (256 are read, as jq reads them).
+        let json = format!("{}1{}", "[".repeat(257), "]".repeat(257));
         let json = json.as_bytes();
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
@@ -56142,31 +56145,35 @@ mod tests {
         }
     }
 
-    /// A scalar answers the nesting-depth failure itself when the caller's
-    /// `check_depth` is laxer than [`MAX_NESTING_DEPTH`]: the guard at the
-    /// walk's entry has already passed it, and the scalar arm re-checks
-    /// because that depth contract is the caller's to loosen (#3478 moved the
-    /// check into the scalar arm with the rest of the scalar decode).
+    /// The ceiling counts containers (#6631), as jq's parser does: 256 are read, scalar included,
+    /// and the 257th is refused where it opens, whatever the caller's `check_depth` lets pass. A
+    /// scalar is never asked (#3478 had it re-checked in the scalar arm, which refused the leaf of
+    /// a document jq reads).
     #[test]
-    fn scalar_arm_enforces_nesting_depth_under_a_lax_check_3478() {
-        let depth = MAX_NESTING_DEPTH;
-        let doc = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
-        let index = JsonIndex::build(doc.as_bytes());
+    fn the_ceiling_counts_containers_not_the_scalar_they_hold_6631() {
+        let nested = |depth: usize| {
+            let doc = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+            let index = JsonIndex::build(doc.as_bytes());
+            (doc, index)
+        };
+
+        let (doc, index) = nested(MAX_NESTING_DEPTH);
         let cursor = index.root(doc.as_bytes());
+        assert!(to_owned_cursor::<JqSemantics, _>(&cursor).is_ok());
+        assert!(to_owned_cursor_with::<_, JqSemantics>(&cursor, |_| Ok(()), |_, _| None).is_ok());
 
-        // The strict contract refuses a level earlier, at the scalar's own
-        // entry; the lax one lets the scalar arm see it.
+        // One container more is refused by the strict contract, at the container's own entry.
+        let (doc, index) = nested(MAX_NESTING_DEPTH + 1);
+        let cursor = index.root(doc.as_bytes());
         let strict = to_owned_cursor::<JqSemantics, _>(&cursor).expect_err("too deep");
-        let lax = to_owned_cursor_with::<_, JqSemantics>(&cursor, |_| Ok(()), |_, _| None)
-            .expect_err("a scalar this deep must still be refused");
-        let expected = crate::jq::value::nesting_depth_exceeded_message(MAX_NESTING_DEPTH);
-        assert_eq!(strict.message, expected);
-        assert_eq!(lax.message, expected);
-        assert!(lax.is_decode_failure());
+        assert_eq!(
+            strict.message,
+            crate::jq::value::nesting_depth_exceeded_message(MAX_NESTING_DEPTH)
+        );
+        assert!(strict.is_decode_failure());
 
-        // One level shallower the same scalar is fine under both.
-        let doc = format!("{}1{}", "[".repeat(depth - 1), "]".repeat(depth - 1));
-        let index = JsonIndex::build(doc.as_bytes());
+        // And one fewer is fine under both.
+        let (doc, index) = nested(MAX_NESTING_DEPTH - 1);
         let cursor = index.root(doc.as_bytes());
         assert!(to_owned_cursor::<JqSemantics, _>(&cursor).is_ok());
         assert!(to_owned_cursor_with::<_, JqSemantics>(&cursor, |_| Ok(()), |_, _| None).is_ok());

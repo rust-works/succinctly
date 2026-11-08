@@ -565,9 +565,9 @@ Since [#5233](https://github.com/rust-works/succinctly/issues/5233) no jq-mode p
 One that also uses a succinctly extension the interpreter does not run (`key`, `file_index`, `parent`, `parent(n)`, bare `path`, or a cursor-metadata builtin: `line`, `column`, `document_index`, `anchor`, `style`, the comment builtins, `at_offset`, `at_position`) is refused with `<name> is not supported in a program whose path expression does more than navigate`, wherever in the program the extension sits.
 The CLI reports it once, as a compile error (exit 3) before any input is read; the library entries return it as an evaluation error.
 jq 1.7.1 rejects each such program at compile time (`key/0 is not defined`), so no jq answer is lost; the same extension beside navigation-only targets still answers (`(.a[] | select(. > 1)) |= (parent | length)`).
-A dynamic-target program over a document the interpreter cannot materialize whole (a lone surrogate, a scalar at the 257th level) raises the decode error (`invalid unicode escape sequence`, `nesting depth exceeds limit of 256`, exit 5).
+A dynamic-target program over a document the interpreter cannot materialize whole (a lone surrogate) raises the decode error (`invalid unicode escape sequence`, exit 5).
 jq rejects the lone surrogate when it parses the document, with its own parse error (`Invalid \uXXXX\uXXXX surrogate pair escape`), so the wording and the reported location differ from jq's while both refuse; a program with no dynamic target still decodes only what it reads (#4412).
-A document past jq's own parse-depth limit never reaches the interpreter: every document route refuses it first, as jq does (see "Nesting depth" below, #5497); the scalar at the 257th level is one jq accepts, the materializer's band recorded there.
+A document past jq's own parse-depth limit never reaches the interpreter: every document route refuses it first, as jq does (see "Nesting depth" below, #5497); the deepest document jq accepts, 256 nested arrays around a scalar, is read by the interpreter too since #6631.
 yq mode is unchanged.
 
 So the sections below that describe the path resolver's inferred register (the `Path-mode ...` sections, the register refusals under [Where succinctly errors and jq does not](#where-succinctly-errors-and-jq-does-not), the "artefact guard" and every "refused where jq answers" row) describe the shipped route, which jq mode no longer reaches with a dynamic target.
@@ -597,7 +597,7 @@ The interpreter's own recorded divergences:
   Refusing was chosen over implementing the builtins in the interpreter: it works on a materialized value, which has no cursor to read a line, an anchor, a comment or a byte offset from.
   [#5233](https://github.com/rust-works/succinctly/issues/5233) removed the shipped resolver from jq mode's dynamic targets, so the other dynamic targets beside those builtins (a bind in the target with no fold: `at_offset(5) as $x | del(.a | $x)`; a fold outside every path target) are refused the same way instead of answered from the inferred register.
   Since [#5243](https://github.com/rust-works/succinctly/issues/5243) an index key that only computes a value is navigation, so `.a[(0,1)] |= key` has a static target and answers again (`{"a":[0,1,3]}`).
-  A document the interpreter cannot materialize (a lone surrogate, nesting past 256 levels) still runs on the shipped route for every program, as above.
+  A document the interpreter cannot materialize (a lone surrogate) still runs on the shipped route for every program, as above.
 
 ## `as` binds the Term before it, in jq mode (#3397)
 
@@ -7283,6 +7283,12 @@ Measured on an M4 Pro (`scripts/ab-cli.py`, interleaved, 11 repetitions, `-c` wi
 A 6.9 MB document 200 levels deep, the one shape that takes the walk, reads +17% to +26%; the walk costs about 0.4 ms per MB, paid only by a document deeper than 128 levels.
 A 7950X read the ordinary rows neutral too (−4.2% to +2.4%, control −8.4% to +4.7%), measured before the walk replaced the parser on deep documents.
 
+The routes that materialize a document (`input`/`inputs`, `--slurpfile`, and the filters that build an owned copy, such as `tojson`, `del`, `walk`, `==` and `sort`) hold a container to `MAX_NESTING_DEPTH` (256) and a scalar to nothing, since [#6631](https://github.com/rust-works/succinctly/issues/6631) and [#6636](https://github.com/rust-works/succinctly/issues/6636).
+A document of 256 nested arrays around a scalar, or 255 arrays around `{"a":1}`, the deepest jq reads, is read by every document route and a filter over it answers as jq's does.
+Until then the guards counted the scalar as a 257th level and refused that document with `nesting depth exceeds limit of 256`, so one document answered differently by route.
+The guard is shared with `succinctly yq` across the evaluator, where the YAML parser stops at 128 levels first.
+The routes that wrap the document in a slurp array keep their ceiling, below.
+
 What still differs:
 
 - Under `--slurp` the message names `at line L, column C` for input files (#6628): the files are read again as one stream, as jq's parser reads them, to place the refused bracket.
@@ -7290,9 +7296,6 @@ What still differs:
   A deep document that also holds a fault the splitter stops at is placed, from stdin as well.
 - jq's `--stream` uses its streaming parser, which has no depth limit, and succinctly's `--stream` does not apply jq's parse limit either.
   Except without `-s` (#5498), it still materializes each document before it streams the events, though, so it stops at the materializer's ceiling below (a document of 257 nested arrays), where jq streams on.
-- The routes that materialize a document (`input`/`inputs`, `--slurpfile`, and the filters that build an owned copy, such as `tojson`, `del` and `sort`) check every node, leaves included, against `MAX_NESTING_DEPTH` (256).
-  A document jq accepts with a scalar at its 257th level, which only 256 nested containers can hold (`[[…[1]…]]` with 256 arrays, or 255 arrays around `{"a":1}`), is refused there with `nesting depth exceeds limit of 256`.
-  The guard is shared with `succinctly yq` across the evaluator, and a one-level band is not worth moving it for.
 - `--preserve-input`'s raw echo (a succinctly extension that echoes a document without validating it) does not apply the limit.
 - A document deeper than 128 levels whose first fault in jq's order is something else keeps the default route's lazy handling of that fault: the depth check refuses only what jq's depth limit refuses.
 
@@ -7396,7 +7399,7 @@ them to fail: `nested_arrays(300) | not` now answers `false` at exit 0, where it
 raise `nesting depth exceeds limit of 256`. This is a corollary of the same rule the rest of
 this section's #2692 instance rests on, not a fresh decision, and it does not touch the
 guard itself — `sort_by`/`unique_by`/`min_by`/`max_by` still materialize a comparison key
-through `key_elements_generic`, and `group_by` checks each element's depth from the array it sits in (#5306), and still trip it on the same document.
+through `key_elements_generic`, and `group_by` checks each element's depth from the array it sits in (#5306); a document of 256 nested arrays passes all of them since #6631.
 Pinned by `test_truthiness_probes_do_not_trip_the_depth_guard_2692`
 (`tests/jq_cli_tests.rs`).
 
@@ -10302,7 +10305,7 @@ reads) plus two consequences of the route:
   **The routes that still materialize keep that ceiling, and it is a divergence from jq:** a
   256-level document under `--seq -s`, or under `-s` with `input`/`inputs`, exits 5 with
   `nesting depth exceeds limit of 256` (the slurp array is the 257th level), where jq 1.7.1
-  reads and prints it (a 255-level document is fine on both). It is the evaluator's own
+  reads and prints it (a 255-level document is fine on both, scalar leaf included since #6631). It is the evaluator's own
   materialization ceiling (`MAX_NESTING_DEPTH`) and fails cleanly, never as a panic (#2299);
   it goes away for these routes only if they stop materializing. Pinned by
   `test_seq_slurp_materializes_lazy_results_and_the_wrap_boundary_2847`.

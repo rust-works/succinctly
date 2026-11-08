@@ -14134,16 +14134,22 @@ mod bridge_docs {
 
 /// `generic_to_owned_checked`'s nesting ceiling ([`check_nesting_depth`]) applied to a value that is
 /// handed on without being converted (#5624): every container level is held to it, and the walk stops at
-/// the first level that is not, so a deeper value costs no more than the ceiling.
+/// the first level that is not, so a deeper value costs no more than the ceiling. A scalar is held to
+/// nothing (#6631): it recurses no deeper, and the ceiling counts containers.
 fn check_output_nesting(value: &OwnedValue, depth: usize) -> core::result::Result<(), EvalError> {
-    check_nesting_depth(depth)?;
     match value {
-        OwnedValue::Array(items) => items
-            .iter()
-            .try_for_each(|item| check_output_nesting(item, depth + 1)),
-        OwnedValue::Object(fields) => fields
-            .values()
-            .try_for_each(|item| check_output_nesting(item, depth + 1)),
+        OwnedValue::Array(items) => {
+            check_nesting_depth(depth)?;
+            items
+                .iter()
+                .try_for_each(|item| check_output_nesting(item, depth + 1))
+        }
+        OwnedValue::Object(fields) => {
+            check_nesting_depth(depth)?;
+            fields
+                .values()
+                .try_for_each(|item| check_output_nesting(item, depth + 1))
+        }
         _ => Ok(()),
     }
 }
@@ -23044,9 +23050,9 @@ mod tests {
             assert_eq!(built, 1, "{filter}");
             assert!(!outputs.is_empty(), "{filter}");
         }
-        // The nesting ceiling of a converted output (256 levels) holds for the shortcut too: 255
-        // levels print, 256 do not.
-        for (depth, prints) in [(255usize, 1usize), (256, 0), (300, 0)] {
+        // The nesting ceiling of a converted output (256 containers) holds for the shortcut too: 256
+        // containers around a scalar print (#6631: the scalar is no level), 257 do not.
+        for (depth, prints) in [(255usize, 1usize), (256, 1), (257, 0), (300, 0)] {
             let mut nest = OwnedValue::Int(1);
             for _ in 0..depth {
                 nest = OwnedValue::array_from(vec![nest]);

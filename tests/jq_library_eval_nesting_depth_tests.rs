@@ -141,7 +141,7 @@ fn run_on_stack(
 ///
 /// The native walkers (`paths`, `leaf_paths`, `.. | path`, and `path(..)` since #3850) stop at
 /// `MAX_PATH_WALK_DEPTH` (384); `paths(f)` materializes the document first and stops at
-/// `MAX_NESTING_DEPTH` (256).
+/// `MAX_NESTING_DEPTH` (256) containers (#6631: a scalar the 256th holds is not a 257th).
 #[test]
 fn test_public_eval_path_family_over_depth_is_a_clean_error_3457() {
     for (filter, depths, limit) in [
@@ -157,7 +157,7 @@ fn test_public_eval_path_family_over_depth_is_a_clean_error_3457() {
         ("[path(recurse)] | length", &[384, 1000][..], 384),
         (
             r#"[paths(type == "number")] | length"#,
-            &[256, 300, 384, 1000][..],
+            &[257, 300, 384, 1000][..],
             256,
         ),
     ] {
@@ -195,14 +195,17 @@ fn test_public_eval_path_family_under_depth_answers_3457() {
             );
         }
     }
-    // The materializing form is still bounded by the lower ceiling.
-    assert_eq!(
-        run_on_big_stack(
-            nested_arrays(255),
-            r#"[paths(type == "number")] | length"#.to_string()
-        ),
-        Ok(vec!["1".to_string()])
-    );
+    // The materializing form is still bounded by the lower ceiling: 256 containers, scalar included.
+    for depth in [255, 256] {
+        assert_eq!(
+            run_on_big_stack(
+                nested_arrays(depth),
+                r#"[paths(type == "number")] | length"#.to_string()
+            ),
+            Ok(vec!["1".to_string()]),
+            "depth {depth}"
+        );
+    }
 }
 
 /// #3429: a static chain (`path(.k.k...k)`) is bounded by the same ceiling:
@@ -366,13 +369,21 @@ fn test_public_eval_embed_nested_reuse_keeps_the_depth_limit_3179() {
         let (_, message) = run_on_big_stack(nested(256), filter.to_string()).expect_err("refuses");
         assert!(message.contains("nesting depth"), "{filter}: {message}");
     }
-    let dup = format!(
-        r#"{{"a":{{"x":{}1{},"x":1}}}}"#,
-        "[".repeat(254),
-        "]".repeat(254)
-    );
+    // #6631: the ceiling counts containers, so the dropped duplicate's arrays fail the walk from
+    // 255 of them (the scalar they hold was the 256th level before), and 254 pass.
+    let dup = |n: usize| {
+        format!(
+            r#"{{"a":{{"x":{}1{},"x":1}}}}"#,
+            "[".repeat(n),
+            "]".repeat(n)
+        )
+    };
     for filter in [r"{k:., j:1} | .k.a", r".a as $y | {k:., j:1} | .k.a"] {
-        let (_, message) = run_on_big_stack(dup.clone(), filter.to_string()).expect_err("refuses");
+        assert!(
+            run_on_big_stack(dup(254), filter.to_string()).is_ok(),
+            "dup `{filter}` @ 254"
+        );
+        let (_, message) = run_on_big_stack(dup(255), filter.to_string()).expect_err("refuses");
         assert!(
             message.contains("nesting depth"),
             "dup `{filter}`: {message}"
