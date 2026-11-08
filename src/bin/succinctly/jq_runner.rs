@@ -7007,6 +7007,12 @@ fn read_inputs(
                 *open_failed = true;
                 defer_open_failures(directory, false);
                 SLURP_DIRECTORY_READ.with(|slurp| slurp.set(true));
+            } else if fault_leaves_last_directory_to_reads(args, &failures, reached) {
+                // #6625: a `-n` run over a text that faults hands the fault to the first read
+                // and then goes on: jq's reader reaches what follows the fault on the reads after
+                // it, and a program that stops at the fault never does. So the failures past it
+                // are for those reads to place, a last directory included (#6615).
+                defer_open_failures(failures, false);
             } else if seq_slurp_places_failures(args) {
                 let mut failures = failures;
                 // #6604, as above: a last directory is read by the extra input a program that
@@ -7042,6 +7048,17 @@ fn read_inputs(
                 failures.truncate(reached);
                 held_open_failures = failures.into();
                 seq_stream_places_failures = true;
+            } else if last_directory_left_to_reads(args, track_eof, &failures, reached) {
+                // #6625: an earlier failure sent the run up front, which reports every failure
+                // at once. The directory given last is still the reads' to place (#6615): jq says
+                // `Is a directory` for it on the program's next read after the one that reaches
+                // it, as it does with nothing before it, and the failures before it are said as
+                // the reader moves past them, which this route already does.
+                let mut failures = failures;
+                let directory = failures.split_off(failures.len() - 1);
+                report_open_failures(&failures, open_failed);
+                let fault_ends_text = matches!(first_stream_fault(&raws), Some((_, true)));
+                defer_open_failures(directory, fault_ends_text);
             } else {
                 report_open_failures(&failures[..reached], open_failed);
             }
@@ -9595,7 +9612,51 @@ fn reach_last_directory(at: usize, read: Option<u32>) -> bool {
     }
     LAZY_OPEN_FAILED.with(|seen| seen.set(true));
     let read_before = LAST_DIRECTORY_READ.with(|seen| seen.replace(true));
-    read.is_none() && read_before && REPORTED_BY_READ.with(std::cell::Cell::get)
+    read_before && REPORTED_BY_READ.with(std::cell::Cell::get)
+}
+
+/// Whether the directory given last, behind other failures that the run reports up front, is left
+/// to the reads that [`reach_last_directory`] follows (#6625): a run whose program reads `input`
+/// (or `-n`), over JSON or `-R` text that is not slurped, with every failure reached.
+fn last_directory_left_to_reads(
+    args: &JqCommand,
+    track_eof: bool,
+    failures: &[(usize, InputFileOpenError)],
+    reached: usize,
+) -> bool {
+    (args.null_input || track_eof)
+        && !(args.slurp
+            || args.seq
+            || args.stream
+            || args.stream_errors
+            || args.input_dsv.is_some()
+            || args.validate)
+        && failures.len() > 1
+        && reached == failures.len()
+        && failures.last().is_some_and(|(_, failure)| {
+            failure.kind == InputFileErrorKind::Directory { last: true }
+        })
+}
+
+/// Whether a `-n` run's text faults before the directory given last, which the fault left out of
+/// the failures its reads reached (#6625): the reads that follow the fault place it
+/// ([`reach_last_directory`]).
+fn fault_leaves_last_directory_to_reads(
+    args: &JqCommand,
+    failures: &[(usize, InputFileOpenError)],
+    reached: usize,
+) -> bool {
+    args.null_input
+        && !(args.seq
+            || args.raw_input
+            || args.stream
+            || args.stream_errors
+            || args.input_dsv.is_some()
+            || args.validate)
+        && reached < failures.len()
+        && failures.last().is_some_and(|(_, failure)| {
+            failure.kind == InputFileErrorKind::Directory { last: true }
+        })
 }
 
 /// Whether a source's last byte ends what jq's parser reads there, so that a read of its last value
@@ -12313,6 +12374,19 @@ fn seed_input_queue(
         let mut errors = errors;
         if let (Some(end), Some(last)) = (locations.fault_end(), errors.last_mut()) {
             last.2 = end;
+        }
+        // #6625: a slurp's faults each say whether they are at the end of the text, for the hook
+        // to place a last directory by, when it has more than the one fault the whole read names.
+        if slurp
+            && errors.len() > 1
+            && PENDING_OPEN_FAILURES.with(|pending| !pending.borrow().is_empty())
+        {
+            SEQ_FAULT_ENDS.with(|ends| {
+                *ends.borrow_mut() = errors
+                    .iter()
+                    .map(|(_, error, _)| error.to_string().contains(" at EOF"))
+                    .collect();
+            });
         }
         jq::seed_remaining_inputs_with_errors(queue, locations.exhausted(slurp), errors);
         // #4303: where the stream's own end was recorded, reads past it
