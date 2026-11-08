@@ -26767,7 +26767,7 @@ fn is_fusable_index_target(target: &Expr) -> bool {
 
 /// Whether a pipe's first stage is a slice, computed or literal-bounded (#4323), bare or under a
 /// postfix `?` (#4288): the cheap check in front of [`fusable_slice_read`] on the two pipe drivers.
-fn is_slice_head(stage: &Expr) -> bool {
+pub(crate) fn is_slice_head(stage: &Expr) -> bool {
     match stage {
         Expr::SliceExpr { .. } | Expr::Slice { .. } => true,
         Expr::Optional(inner) => matches!(**inner, Expr::SliceExpr { .. } | Expr::Slice { .. }),
@@ -27028,14 +27028,48 @@ fn fused_slice_window<S: EvalSemantics, V: DocumentValue>(
 /// path, and what this builds (the bounds, the target, the element) must not widen
 /// their native frames, which the stack-depth guard is calibrated against.
 #[inline(never)]
-fn fused_slice_pipe_head<S: EvalSemantics, V: DocumentValue>(
+pub(crate) fn fused_slice_pipe_head<S: EvalSemantics, V: DocumentValue>(
     exprs: &[Expr],
     value: V,
     cursor: Option<V::Cursor>,
 ) -> Option<(OwnedValue, &[Expr])> {
-    let (slice, read) = fusable_slice_read(exprs)?;
+    let Some((slice, read)) = fusable_slice_read(exprs) else {
+        // #6692: not a read, but a second slice of the first (`.[$i:][:2]`).
+        let owned = fused_slice_of_slice::<S, V>(exprs, value, cursor)?;
+        return Some((owned, &exprs[2..]));
+    };
     let owned = try_fused_slice_read::<S, V>(slice, read, value, cursor)?;
     Some((owned, &exprs[2..]))
+}
+
+/// `E[a:b][c:d]` for a literal second slice (#6692): the first slice's resolved range, then the
+/// second's resolved against that range's width, as one sub-array of the underlying elements, so
+/// the elements the second slice drops are never converted. A loop that takes two elements of a
+/// moving tail (`.[$i:][:2]`) was quadratic in the array otherwise, as jq's slice is an O(1) view.
+///
+/// jq mode only, as the other fusions' jq-only arms are: yq's slice rules are its own. `None`
+/// declines to the ordinary route, which re-derives whatever error or value a decline stands for:
+/// a target that is not a readable array (the window declines), a first slice that is not pure,
+/// and a second slice that is not a literal one. Nothing visible happens before a decline. Out of
+/// line for the reason [`fused_slice_pipe_head`] gives.
+#[inline(never)]
+fn fused_slice_of_slice<S: EvalSemantics, V: DocumentValue>(
+    exprs: &[Expr],
+    value: V,
+    cursor: Option<V::Cursor>,
+) -> Option<OwnedValue> {
+    let [first, Expr::Slice { start, end, .. }, ..] = exprs else {
+        return None;
+    };
+    if S::TAG != EvalTag::Jq || !is_pure_fusable_slice(first) {
+        return None;
+    }
+    let (elements, range) = fused_slice_window::<S, V>(first, value, cursor)?;
+    let inner = SliceBounds::from_literals(*start, *end).resolve(range.len());
+    let from = i64::try_from(range.start + inner.start).ok()?;
+    let to = i64::try_from(range.start + inner.end).ok()?;
+    let items = to_owned_array_slice::<S, V>(&elements, Some(from), Some(to), true).ok()?;
+    Some(OwnedValue::array_from(items))
 }
 
 /// `E[a:b][$k]` for a computed index (#4317): the slice's resolved range read at `k`, without

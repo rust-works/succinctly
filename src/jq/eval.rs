@@ -10318,6 +10318,13 @@ fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     if rest.is_empty() {
         return eval_each::<W, S>(first, value, optional, sink);
     }
+    // #6692: `E[a:b][k]`, `E[a:b] | length`, `first` and `last` read the slice's resolved range
+    // instead of building the slice, as the generic evaluator's pipe does (#4195, #4288).
+    if super::eval_generic::is_slice_head(first) {
+        if let Some(flow) = eval_each_fused_slice_read::<W, S>(exprs, &value, optional, sink) {
+            return flow;
+        }
+    }
 
     // Whatever ended the *downstream* stages, recorded out-of-band because the
     // driver closure can only answer `Demand`. A downstream stop or escape has
@@ -10379,6 +10386,53 @@ fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         stopped_at,
         direct_pattern_retry(first),
     )
+}
+
+/// [`eval_pipe`]'s fused head (#6692): the value the slice stage and the read after it answer
+/// from the slice's resolved range, without building the slice. `None` leaves the whole pipe to
+/// the ordinary route, which re-derives whatever error or value a decline stands for; the shape,
+/// the purity of the bounds and every decline are
+/// [`fused_slice_pipe_head`](super::eval_generic::fused_slice_pipe_head)'s, the one definition the
+/// generic evaluator uses too. Out of line, as that function is, so the pipe's frame, which the
+/// stack-depth guard is calibrated against, does not grow with what this builds.
+#[inline(never)]
+fn eval_pipe_fused_slice_read<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    exprs: &[Expr],
+    value: &StandardJson<'a, W>,
+) -> Option<OwnedValue> {
+    super::eval_generic::fused_slice_pipe_head::<S, StandardJson<'a, W>>(exprs, value.clone(), None)
+        .map(|(owned, _)| owned)
+}
+
+/// [`eval_each_pipe`]'s fused head (#6692): the slice stage and the read after it answered from the
+/// slice's resolved range, then the rest of the pipe over that one value. `None` leaves the whole
+/// pipe to the ordinary route, which re-derives whatever error or value a decline stands for; the
+/// shape, the purity of the bounds and every decline are
+/// [`fused_slice_pipe_head`](super::eval_generic::fused_slice_pipe_head)'s, the one definition the
+/// generic evaluator uses too. Out of line, as that function is, so the pipe driver's frame, which
+/// the stack-depth guard is calibrated against, does not grow with what this builds.
+#[inline(never)]
+fn eval_each_fused_slice_read<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    exprs: &[Expr],
+    value: &StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Option<Flow> {
+    let (owned, rest) = super::eval_generic::fused_slice_pipe_head::<S, StandardJson<'a, W>>(
+        exprs,
+        value.clone(),
+        None,
+    )?;
+    Some(if rest.is_empty() {
+        match sink(Item::Owned(owned)) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped { pending: None },
+        }
+    } else {
+        RestPipe::new(rest).run_owned::<S>(&owned, optional, Reentry::REBUILT, &mut |o| {
+            sink(Item::Owned(o))
+        })
+    })
 }
 
 /// Collect a sink's items back into a `QueryResult`, reproducing
@@ -39478,8 +39532,19 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let (first, rest) = exprs.split_first().unwrap();
     let rest_tail = tail.rest();
 
-    // Evaluate first expression
-    let result = eval_single::<W, S>(first, value, optional);
+    // #6692: `E[a:b][k]`, `E[a:b] | length`, `first` and `last` read the slice's resolved range
+    // instead of building the slice, as the generic evaluator's pipe does (#4195, #4288): a loop
+    // that reads one element of a moving tail was quadratic in the array.
+    let fused = if rest.is_empty() || !super::eval_generic::is_slice_head(first) {
+        None
+    } else {
+        eval_pipe_fused_slice_read::<W, S>(exprs, &value)
+    };
+    let (result, rest, rest_tail) = match fused {
+        // The slice and its read are two stages: what follows is the pipe from the third on.
+        Some(owned) => (QueryResult::Owned(owned), &rest[1..], rest_tail.rest()),
+        None => (eval_single::<W, S>(first, value, optional), rest, rest_tail),
+    };
 
     if rest.is_empty() {
         return result;
