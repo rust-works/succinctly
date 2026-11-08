@@ -177752,7 +177752,7 @@ mod touched_edge_cases_2999 {
             assert_eq!(run(filter, false), expected, "{filter}");
         }
         // `--jq-extensions` keeps the identifier key and the `{x}` shorthand.
-        assert_eq!(run("{a}", false), r#"{"a":1}"#);
+        assert_eq!(run("{a}", true), r#"{"a":1}"#);
         assert_eq!(run("{k: .a}", true), r#"{"k":1}"#);
     }
 
