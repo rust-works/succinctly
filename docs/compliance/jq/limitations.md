@@ -7285,9 +7285,9 @@ A 7950X read the ordinary rows neutral too (−4.2% to +2.4%, control −8.4% to
 
 The routes that materialize a document (`input`/`inputs`, `--slurpfile`, and the filters that build an owned copy, such as `tojson`, `del`, `walk`, `==` and `sort`) hold a container to `MAX_NESTING_DEPTH` (256) and a scalar to nothing, since [#6631](https://github.com/rust-works/succinctly/issues/6631) and [#6636](https://github.com/rust-works/succinctly/issues/6636).
 A document of 256 nested arrays around a scalar, or 255 arrays around `{"a":1}`, the deepest jq reads, is read by every document route and a filter over it answers as jq's does.
-`--argjson` and `--jsonargs` still refuse text deeper than 128 containers ([#6637](https://github.com/rust-works/succinctly/issues/6637)), and the routes that wrap the document in a slurp array keep their ceiling, below.
 Until then the guards counted the scalar as a 257th level and refused that document with `nesting depth exceeds limit of 256`, so one document answered differently by route.
 The guard is shared with `succinctly yq` across the evaluator, where the YAML parser stops at 128 levels first.
+The routes that wrap the document in a slurp array keep their ceiling, below.
 
 What still differs:
 

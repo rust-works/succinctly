@@ -23017,9 +23017,9 @@ mod tests {
             assert_eq!(built, 1, "{filter}");
             assert!(!outputs.is_empty(), "{filter}");
         }
-        // The nesting ceiling of a converted output (256 levels) holds for the shortcut too: 255
-        // levels print, 256 do not.
-        for (depth, prints) in [(255usize, 1usize), (256, 0), (300, 0)] {
+        // The nesting ceiling of a converted output (256 containers) holds for the shortcut too: 256
+        // containers around a scalar print (#6631: the scalar is no level), 257 do not.
+        for (depth, prints) in [(255usize, 1usize), (256, 1), (257, 0), (300, 0)] {
             let mut nest = OwnedValue::Int(1);
             for _ in 0..depth {
                 nest = OwnedValue::array_from(vec![nest]);
