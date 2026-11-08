@@ -6726,6 +6726,7 @@ fn read_inputs(
     defer_open_failures(Vec::new(), false);
     LAZY_OPEN_FAILED.with(|seen| seen.set(false));
     SLURP_DIRECTORY_READ.with(|slurp| slurp.set(false));
+    LAST_DIRECTORY_READ.with(|read| read.set(false));
     UNOPENED_TAIL_NAME.with(|tail| *tail.borrow_mut() = None);
     LAST_VALUE_AT_TAIL.with(|at| at.set(false));
     FAULT_AT_TAIL.with(|at| at.set(false));
@@ -6902,9 +6903,13 @@ fn read_inputs(
         seq_readers_place_reads = seq_stream_shape && !args.slurp && !unplaced_tail;
         let ends_cleanly = raw_lines_read_whole
             || seq_readers_place_reads
-            || failures.iter().all(|&(at, _)| {
+            || failures.iter().all(|(at, failure)| {
+                let at = *at;
+                // #6615: a directory last is read by whichever read reaches it, which the hook
+                // tells apart ([`reach_last_directory`]).
+                failure.kind == InputFileErrorKind::Directory { last: true }
                 // The last file with bytes before it: an empty one between sends the reader on too.
-                (last_value_at_tail && at >= raws.len())
+                || (last_value_at_tail && at >= raws.len())
                     || raws
                         .iter()
                         .take(at)
@@ -9213,6 +9218,9 @@ thread_local! {
     /// Whether the pending failure is a directory last in a slurp that reads `input` (#6604): the
     /// read that finds the stream at its end says it, where every other route leaves it out.
     static SLURP_DIRECTORY_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether a read has reached the directory that is the last file, outside a slurp (#6615):
+    /// jq's reader then counts the failure, and says it on the program's next read.
+    static LAST_DIRECTORY_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Whether the failure being reported is reported by such a read, and not by the run's own
     /// flush of what its reads did not reach.
     static REPORTED_BY_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -9442,6 +9450,13 @@ fn report_reached_open_failures(read: Option<u32>, fault: bool) {
         let next = PENDING_OPEN_FAILURES.with(|pending| {
             let mut pending = pending.borrow_mut();
             match pending.front() {
+                Some((at, failure)) if is_last_directory_outside_slurp(failure) => {
+                    if reach_last_directory(*at, read) {
+                        pending.pop_front()
+                    } else {
+                        None
+                    }
+                }
                 Some(&(at, _)) if read.map_or(true, |source| at <= source as usize) => {
                     pending.pop_front()
                 }
@@ -9449,10 +9464,37 @@ fn report_reached_open_failures(read: Option<u32>, fault: bool) {
             }
         });
         let Some((_, failure)) = next else { return };
+        if is_last_directory_outside_slurp(&failure) {
+            report_usage_error(&failure.to_string());
+            return;
+        }
         let mut failed = false;
         report_unopenable_input(&failure, &mut failed);
         LAZY_OPEN_FAILED.with(|seen| seen.set(seen.get() || failed));
     }
+}
+
+/// Whether `failure` is a directory given last, in a run that is not a slurp (#6615), whose
+/// reads [`reach_last_directory`] follows. A slurp's is [`SLURP_DIRECTORY_READ`]'s (#6604).
+fn is_last_directory_outside_slurp(failure: &InputFileOpenError) -> bool {
+    failure.kind == InputFileErrorKind::Directory { last: true }
+        && !SLURP_DIRECTORY_READ.with(std::cell::Cell::get)
+}
+
+/// What a read does to the directory given last, pending after the `at` files before it (#6615),
+/// and whether it says `Is a directory` now. jq's reader counts the failure when its read of the
+/// directory fails, which makes the run exit 2, and prints the message the next time it is asked
+/// for more. A read reaches the directory when its value comes from it (a last value that
+/// completes only at the end of the text, read on into the directory) or when it finds the stream
+/// at its end (`read` is `None`). Only the program asks again after that: jq's main loop reads no
+/// more once a read has failed.
+fn reach_last_directory(at: usize, read: Option<u32>) -> bool {
+    if read.is_some_and(|source| (source as usize) + 1 < at) {
+        return false;
+    }
+    LAZY_OPEN_FAILED.with(|seen| seen.set(true));
+    let read_before = LAST_DIRECTORY_READ.with(|seen| seen.replace(true));
+    read.is_none() && read_before && REPORTED_BY_READ.with(std::cell::Cell::get)
 }
 
 /// Whether a source's last byte ends what jq's parser reads there, so that a read of its last value
@@ -9808,7 +9850,8 @@ enum InputFileErrorKind {
     /// has the file open and finds `ferror` set when it asks for more input, which is when it
     /// prints `jq: error: Is a directory`. It never asks after the last file, so `last` says
     /// whether any file follows, and the message is left out when none does. The exit status is 2
-    /// either way (`state->failures`).
+    /// once a read has reached it (`state->failures`): a `-n` program that stops reading earlier
+    /// exits 0, and a read after the one that reached it still prints the message (#6615).
     Directory { last: bool },
 }
 
