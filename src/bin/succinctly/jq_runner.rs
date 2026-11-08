@@ -9325,7 +9325,8 @@ thread_local! {
     /// For each fault the `--seq` reader holds, in the order its reads deliver them, whether the
     /// fault is at the end of the text (#6643): a stream that faults in the middle and at its end
     /// has one of each, and only the read of the last reaches a directory given last. Empty where
-    /// [`FAULT_ENDS_TEXT`] decides alone.
+    /// [`FAULT_ENDS_TEXT`] decides alone. A `-n` slurp's text with several faults fills it too
+    /// (#6625), in `seed_input_queue` after `defer_open_failures` has cleared it.
     static SEQ_FAULT_ENDS: RefCell<std::collections::VecDeque<bool>> =
         const { RefCell::new(std::collections::VecDeque::new()) };
 }
@@ -9605,7 +9606,9 @@ fn is_last_directory_outside_slurp(failure: &InputFileOpenError) -> bool {
 /// for more. A read reaches the directory when its value comes from it (a last value that
 /// completes only at the end of the text, read on into the directory) or when it finds the stream
 /// at its end (`read` is `None`). Only the program asks again after that: jq's main loop reads no
-/// more once a read has failed.
+/// more once a read has failed. The message comes with the first read after the one that reached
+/// it, whatever that read returns: past the end it is `break`, and for a slurp whose text faulted
+/// it is the array the faults were ahead of (#6625).
 fn reach_last_directory(at: usize, read: Option<u32>) -> bool {
     if read.is_some_and(|source| (source as usize) + 1 < at) {
         return false;
@@ -9625,17 +9628,11 @@ fn last_directory_left_to_reads(
     reached: usize,
 ) -> bool {
     (args.null_input || track_eof)
-        && !(args.slurp
-            || args.seq
-            || args.stream
-            || args.stream_errors
-            || args.input_dsv.is_some()
-            || args.validate)
+        && !args.slurp
+        && reads_place_json_or_text_failures(args)
         && failures.len() > 1
         && reached == failures.len()
-        && failures.last().is_some_and(|(_, failure)| {
-            failure.kind == InputFileErrorKind::Directory { last: true }
-        })
+        && ends_in_last_directory(failures)
 }
 
 /// Whether a `-n` run's text faults before the directory given last, which the fault left out of
@@ -9647,16 +9644,24 @@ fn fault_leaves_last_directory_to_reads(
     reached: usize,
 ) -> bool {
     args.null_input
-        && !(args.seq
-            || args.raw_input
-            || args.stream
-            || args.stream_errors
-            || args.input_dsv.is_some()
-            || args.validate)
+        && !args.raw_input
+        && reads_place_json_or_text_failures(args)
         && reached < failures.len()
-        && failures.last().is_some_and(|(_, failure)| {
-            failure.kind == InputFileErrorKind::Directory { last: true }
-        })
+        && ends_in_last_directory(failures)
+}
+
+/// Whether the input is JSON text or `-R` lines, the readers whose reads [`reach_last_directory`]
+/// follows (#6625), and not `--seq`, `--stream`, `--stream-errors`, DSV or `--validate`, which
+/// place their own (#6624).
+fn reads_place_json_or_text_failures(args: &JqCommand) -> bool {
+    !(args.seq || args.stream || args.stream_errors || args.input_dsv.is_some() || args.validate)
+}
+
+/// Whether the last of `failures` is a directory given last.
+fn ends_in_last_directory(failures: &[(usize, InputFileOpenError)]) -> bool {
+    failures
+        .last()
+        .is_some_and(|(_, failure)| failure.kind == InputFileErrorKind::Directory { last: true })
 }
 
 /// Whether a source's last byte ends what jq's parser reads there, so that a read of its last value
@@ -12384,6 +12389,7 @@ fn seed_input_queue(
             SEQ_FAULT_ENDS.with(|ends| {
                 *ends.borrow_mut() = errors
                     .iter()
+                    // The text of the fault, as `seq_faults_all_before_end` tells them apart.
                     .map(|(_, error, _)| error.to_string().contains(" at EOF"))
                     .collect();
             });
