@@ -270,11 +270,21 @@ class NewPatternRowTests(unittest.TestCase):
         self.assertEqual([f[0] for f in failed], ["wide_identity"])
 
     def test_the_new_rows_own_threshold_applies_once_it_has_a_baseline(self):
-        measured = {q[0]: 100.0 for q in perf_guard.QUERIES}
-        baseline = dict(measured)
-        baseline["seq_name_bad_last"] = 100.0 / 1.045  # a revert of #6594 reads about +4.5%
-        failed, _ = self._drift(baseline, measured)
-        self.assertEqual([f[0] for f in failed], ["seq_name_bad_last"])
+        # Whatever the row's threshold is now (#6619 set 3.0, #6620 raises it while the change it
+        # speeds up is not in the merge-base), drift over it fails and drift under it passes.
+        threshold = perf_guard.QUERY_THRESHOLDS["seq_name_bad_last"]
+        self.assertGreater(threshold, 0)
+        for drift, fails in ((threshold + 0.5, True), (threshold - 0.5, False)):
+            measured = {q[0]: 100.0 for q in perf_guard.QUERIES}
+            baseline = dict(measured)
+            baseline["seq_name_bad_last"] = 100.0 / (1 + drift / 100)
+            failed, _ = self._drift(baseline, measured)
+            self.assertEqual([f[0] for f in failed], ["seq_name_bad_last"] if fails else [])
+
+    def test_the_new_rows_threshold_is_not_looser_than_the_changes_that_set_it(self):
+        # The override is temporary: it is the measured drift of the one change that speeds this
+        # row up (-30.0% x86_64, -27.4% ARM64-Linux), with room, and no more.
+        self.assertLessEqual(perf_guard.QUERY_THRESHOLDS["seq_name_bad_last"], 35.0)
 
 
 class MeasuredPathTests(unittest.TestCase):
