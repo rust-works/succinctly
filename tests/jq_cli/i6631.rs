@@ -84,3 +84,22 @@ fn a_document_257_containers_deep_is_refused_by_the_reader_6631() -> Result<()> 
     );
     Ok(())
 }
+
+/// The identity shortcut's output check (`check_output_nesting`) held the scalar to the ceiling
+/// too: `--seq -s` wraps 255 arrays around a scalar in the slurp array, 256 containers in all,
+/// which jq prints. 256 arrays under the wrapper is the divergence the limitations page records.
+#[test]
+fn the_slurp_wrapper_around_255_arrays_and_a_scalar_prints_6631() -> Result<()> {
+    let record = format!("\u{1e}{}\n", nested(255));
+    let (stdout, stderr, code) = run_jq_full(&["--seq", "-s", "-c", "."], Some(&record))?;
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        (format!("\u{1e}[{}]\n", nested(255)).as_str(), "", 0)
+    );
+    let (stdout, stderr, code) = run_jq_full(&["--seq", "-s", "-c", "length"], Some(&record))?;
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        ("\u{1e}1\n", "", 0)
+    );
+    Ok(())
+}

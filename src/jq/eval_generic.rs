@@ -12064,12 +12064,15 @@ fn embed_lazy<S: EvalSemantics, C: DocumentCursor>(cursor: &C) -> embed_table::L
 
 /// The height [`to_owned_cursor_at_depth`] walks below `cursor`'s node:
 /// `0` for a scalar or an empty container, else one more than the tallest
-/// child, capped at `cap` (#3179). Measured on the document, not on a bound
+/// child, capped at `cap` (#3179). A scalar leaf counts as a level, which the walk no longer
+/// checks (#6631), so a reuse is declined one level early at the ceiling: a fresh walk runs
+/// instead and passes, which costs the sharing there and nothing else. Measured on the document, not on a bound
 /// value: the walk descends into every member, a duplicate key's included,
 /// where the value keeps only the last. A walk that starts the node at depth
 /// `d` visits depths `d..=d + height`, so it passes the `MAX_NESTING_DEPTH`
-/// check exactly when `d + height < MAX_NESTING_DEPTH`; a height at `cap`
-/// already fails that for every `d >= 1`, so the recursion stops there.
+/// check when `d + height < MAX_NESTING_DEPTH` (and, a scalar leaf being no check of the walk's
+/// since #6631, also when it is one level more); a height at `cap` already fails that for every
+/// `d >= 1`, so the recursion stops there.
 fn cursor_height<C: DocumentCursor>(cursor: &C, cap: usize) -> usize {
     if cap == 0 {
         return 0;
@@ -12197,8 +12200,8 @@ fn embed_descendant_shared<C: DocumentCursor>(cursor: &C) -> Option<OwnedValue> 
 /// [`embed_at_or_within`] named `nested` (#3179), when handing it back skips
 /// no check the fresh walk would have failed. The depth is the only one it
 /// could: the bind's own walk made every other check over the same text.
-/// And `depth + height < MAX_NESTING_DEPTH` is exactly when the fresh walk
-/// passes it. The membership test is a compare against a handful of ids,
+/// And `depth + height < MAX_NESTING_DEPTH` implies the fresh walk passes it (it declines one
+/// level early where the deepest level is a scalar, #6631). The membership test is a compare against a handful of ids,
 /// so a child that is no binding's node costs neither a table borrow nor a
 /// cursor lookup.
 fn embed_shared_nested<C: DocumentCursor, B: CursorWalkOutput>(

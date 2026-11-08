@@ -94,9 +94,10 @@ fn an_extension_builtin_beside_a_static_path_target_still_answers_5233() -> Resu
 
 /// A dynamic path program over a document the interpreter cannot materialize raises the decode
 /// error instead of answering from the parts it reads: a lone surrogate, which jq rejects at
-/// parse time, and a scalar at the 257th level, which jq's parser accepts and the materializer
-/// refuses (#5497: a document past jq's parse-depth limit is refused before any filter runs). A
-/// program with no dynamic target still reads only what it navigates (#4412).
+/// parse time. A document of 256 nested arrays, which jq's parser accepts, is read (#6631: the
+/// materializer used to refuse its scalar as the 257th level; a document past jq's parse-depth
+/// limit is refused before any filter runs, #5497). A program with no dynamic target still reads
+/// only what it navigates (#4412).
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq's `{k:.}`, not a format argument
 fn a_dynamic_path_program_over_an_undecodable_document_raises_5233() -> Result<()> {
