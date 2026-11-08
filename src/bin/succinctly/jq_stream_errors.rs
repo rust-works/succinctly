@@ -746,6 +746,9 @@ pub(crate) fn read(sources: &[(Option<usize>, Vec<u8>)]) -> StreamErrorsRead {
 /// differs between them.
 const NEXT_FILE_PROBES: [&[u8]; 6] = [b"0", b"]", b"\"", b"n\"", b"e", b"l"];
 
+/// The longest prefix [`first_event_completes_in`] reads: 1 MiB.
+const FIRST_EVENT_PREFIX_LIMIT: usize = 1 << 20;
+
 /// Whether the first thing `--stream-errors` yields from `raw` is complete inside it (#6591): the
 /// next file's bytes, whatever they are, do not change it. A bare number or a half-read string at
 /// the end of a file waits for the next file, so the same read followed by each of
@@ -753,11 +756,13 @@ const NEXT_FILE_PROBES: [&[u8]; 6] = [b"0", b"]", b"\"", b"n\"", b"e", b"l"];
 /// loop stops one event past an open failure, so a first event that is complete in its file never
 /// opens the file after it.
 ///
-/// A prefix of `raw` is read, doubling until the answer is settled or the prefix is all of `raw`:
-/// the prefix's end stands in for the file's end, so equal events at some prefix mean the event
-/// was complete before it. The probes are no proof for every cut token (a literal cut after two
-/// letters is broken by all of them alike), but such a split across files is the only case left
-/// where this answers `true` for a first event the next file would change.
+/// A prefix of `raw` is read, doubling until the answer is settled, the prefix is all of `raw`, or
+/// it reaches [`FIRST_EVENT_PREFIX_LIMIT`] (the answer is then `false`: a first event that long is
+/// not worth reading the file for, and `false` reports every file, as before): the prefix's end
+/// stands in for the file's end, so equal events at some prefix mean the event was complete before
+/// it. The probes are no proof for every cut token (a literal cut after two letters is broken by
+/// all of them alike), so this is the answer for a file that starts a token of its own, which is
+/// what the caller establishes first ([`text_ends_between_tokens`] in `jq_runner`).
 pub(crate) fn first_event_completes_in(raw: &[u8]) -> bool {
     let first = |prefix: &[u8], next: &[u8]| {
         let sources = [(None, prefix.to_vec()), (None, next.to_vec())];
@@ -775,7 +780,7 @@ pub(crate) fn first_event_completes_in(raw: &[u8]) -> bool {
         {
             return true;
         }
-        if end == raw.len() {
+        if end == raw.len() || end >= FIRST_EVENT_PREFIX_LIMIT {
             return false;
         }
         end = (end * 2).min(raw.len());
@@ -2109,6 +2114,11 @@ mod tests {
         assert!(!first_event_completes_in(&long));
         long.extend_from_slice(b"\",");
         assert!(first_event_completes_in(&long));
+        // And one past the limit is not read for: the answer is `false`.
+        let mut huge = b"[\"".to_vec();
+        huge.extend(std::iter::repeat(b'x').take(FIRST_EVENT_PREFIX_LIMIT + 10));
+        huge.extend_from_slice(b"\",");
+        assert!(!first_event_completes_in(&huge));
     }
 
     /// #5498: `--slurp` keeps the location of the last few values only, and of the first error, and

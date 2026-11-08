@@ -9128,10 +9128,18 @@ fn first_value_completes_in(raw: &[u8], args: &JqCommand) -> bool {
 /// [`first_value_completes_in`] for the file at `at` of `raws`, and for `--stream-errors`, whose
 /// first event is complete inside the file when the next file's bytes cannot change it (#6591),
 /// whatever follows it in the file: `[1,` is complete, `[1` is not.
+///
+/// That holds only when the files before it leave the parser between tokens
+/// ([`text_ends_between_tokens`]). One that ends inside a string, a number or a literal hands its
+/// token on, so the first event is made of its end and this file's start, and this file alone
+/// cannot say whether it is complete: it is judged as a clean whole, as it was before.
 fn first_value_completes_at(raws: &[Vec<u8>], at: usize, args: &JqCommand) -> bool {
     if args.stream_errors && !args.seq {
-        // jq skips a byte-order mark at the front of its input: of the first file with bytes.
         let raw = &raws[at][..];
+        if !text_ends_between_tokens(&raws[..at]) {
+            return source_ends_cleanly(raw, args) && first_stream_fault(&raws[at..=at]).is_none();
+        }
+        // jq skips a byte-order mark at the front of its input: of the first file with bytes.
         let bom = if raws[..at].iter().all(Vec::is_empty) {
             crate::front_matter::leading_bom_len(raw)
         } else {
@@ -9141,6 +9149,31 @@ fn first_value_completes_at(raws: &[Vec<u8>], at: usize, args: &JqCommand) -> bo
     } else {
         first_value_completes_in(&raws[at], args)
     }
+}
+
+/// Whether the text the files `raws` make ends between JSON tokens (#6591): outside a string, and
+/// not on a byte a number or a literal goes on with. The next file then starts a token of its own.
+/// One pass over the bytes, tracking only quotes and backslashes.
+fn text_ends_between_tokens(raws: &[Vec<u8>]) -> bool {
+    let (mut in_string, mut escaped) = (false, false);
+    for &byte in raws.iter().flatten() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+        } else if byte == b'"' {
+            in_string = true;
+        }
+    }
+    let last = raws.iter().rev().find_map(|raw| raw.last());
+    !in_string
+        && last.map_or(true, |&byte| {
+            !(byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+        })
 }
 
 /// The file jq's parser is reading when it meets the first fault of the text the files `raws`

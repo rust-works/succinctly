@@ -23,6 +23,10 @@ fn stream_errors_stops_past_the_first_failure_and_places_its_end_fault_6591() ->
         ("bare.json", "1"),
         ("line.json", "1\n"),
         ("empty.json", ""),
+        ("str.json", "\"ab"),
+        ("br.json", "]"),
+        ("sp.json", " "),
+        ("tail.json", ",2]"),
     ] {
         std::fs::write(dir.path().join(name), text)?;
     }
@@ -44,6 +48,12 @@ fn stream_errors_stops_past_the_first_failure_and_places_its_end_fault_6591() ->
         // No missing file: the fault event is read in the file itself.
         (&["--stream-errors", "-c", "[., input_filename, input_line_number]"][..], &["jbad"][..], "[[[0],1],\"@DIR@/jbad.json\",0]\n[[\"Unfinished JSON term at EOF at line 1, column 3\",[1]],null,0]\n", "", 0),
         (&["--stream-errors", "-c", "-n", "[inputs, input_filename]"][..], &["jbad", "gone"][..], "[[[0],1],[\"Unfinished JSON term at EOF at line 1, column 3\",[1]],\"@DIR@/gone.json\"]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        // A file before the failure that ends inside a token hands it on to the next one, so the
+        // first event past the failure is not complete in the next file alone.
+        (&["--stream-errors", "-c", "."][..], &["str", "gone", "br", "gone2"][..], "[\"Unfinished string at EOF at line 1, column 4\",[]]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: error: Could not open file @DIR@/gone2.json: No such file or directory\n", 2),
+        (&["--stream-errors", "-c", "."][..], &["str", "gone", "tail", "gone2"][..], "[\"Unfinished string at EOF at line 1, column 6\",[]]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: error: Could not open file @DIR@/gone2.json: No such file or directory\n", 2),
+        (&["--stream-errors", "-c", "."][..], &["bare", "gone", "sp", "gone2"][..], "[[],1]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["--stream-errors", "-c", "."][..], &["line", "gone", "sp", "gone2"][..], "[[],1]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: error: Could not open file @DIR@/gone2.json: No such file or directory\n", 2),
     ];
     for (flags, names, stdout, stderr, status) in rows {
         let files: Vec<String> = names
