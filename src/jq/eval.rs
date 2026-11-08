@@ -10320,7 +10320,7 @@ fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
     // #6692: `E[a:b][k]`, `E[a:b] | length`, `first` and `last` read the slice's resolved range
     // instead of building the slice, as the generic evaluator's pipe does (#4195, #4288).
-    if super::eval_generic::is_slice_head(first) {
+    if may_lead_with_slice(first) {
         if let Some(flow) = eval_each_fused_slice_read::<W, S>(exprs, &value, optional, sink) {
             return flow;
         }
@@ -10386,6 +10386,70 @@ fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         stopped_at,
         direct_pattern_retry(first),
     )
+}
+
+/// The rest of a pipe over an owned value, as the result type the pipe answers in.
+// `inline(always)`: this was the body of `eval_pipe`'s own `Owned` arm, and `. + 1`-style stages
+// reach it once per element.
+#[inline(always)]
+fn eval_pipe_owned_rest<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    rest_tail: PipeTail<'_>,
+    v: OwnedValue,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Continue piping with owned value using eval_owned_pipe
+    // Convert the result type since eval_owned_pipe uses Vec<u64> internally
+    match eval_owned_pipe::<Vec<u64>, S>(rest_tail, v, optional) {
+        QueryResult::Owned(o) => QueryResult::Owned(o),
+        QueryResult::Error(e) => QueryResult::Error(e),
+        QueryResult::None => QueryResult::None,
+        QueryResult::ManyOwned(vs) => QueryResult::ManyOwned(vs),
+        QueryResult::Break(label) => QueryResult::Break(label),
+        QueryResult::Halt(code) => QueryResult::Halt(code),
+        QueryResult::Partial(vs, control) => QueryResult::Partial(vs, control),
+        // #2182: was a wildcard `_ =>` -- verified by tracing
+        // `eval_owned_pipe`'s full call chain (`eval_owned_input` ->
+        // `eval_owned_fast_path`/`eval_owned_input_bridge` ->
+        // `detach_from_temp_document`, the last already an
+        // exhaustive per-variant match): every path resolves to
+        // `Owned`/`None`/`Error`/`ManyOwned`/`Break`/`Halt`/
+        // `Partial`, never `One`/`OneCursor`/`Many`, so this is a
+        // provably closed set today. Spelled out per-variant so a
+        // future `QueryResult` variant this chain starts returning
+        // is a compile error here, not a silent absorption into a
+        // catch-all.
+        QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => {
+            unreachable!("eval_owned_pipe only returns Owned-family variants")
+        }
+    }
+}
+
+/// What follows the fused slice read in [`eval_pipe`] (#6692): the value itself when the read was
+/// the pipe's last stage, otherwise the rest of the pipe over it. Out of line with the other fused
+/// helpers, so the pipe's frame does not grow with it.
+#[inline(never)]
+fn eval_pipe_after_fused_slice_read<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    rest_tail: PipeTail<'_>,
+    owned: OwnedValue,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    if rest_tail.stages().is_empty() {
+        QueryResult::Owned(owned)
+    } else {
+        eval_pipe_owned_rest::<W, S>(rest_tail, owned, optional)
+    }
+}
+
+/// Whether `stage` is one of the four shapes [`is_slice_head`](super::eval_generic::is_slice_head)
+/// can accept, on the discriminant alone (#6692). Every stage of every pipe asks, and a stage that
+/// is not a slice, a `?` or a postfix chain (`. + 1`, `tostring`, `length`) is the common one: it
+/// settles here with no call, where `is_slice_head` is out of line.
+#[inline(always)]
+fn may_lead_with_slice(stage: &Expr) -> bool {
+    matches!(
+        stage,
+        Expr::SliceExpr { .. } | Expr::Slice { .. } | Expr::Optional(_) | Expr::Pipe(_)
+    ) && super::eval_generic::is_slice_head(stage)
 }
 
 /// [`eval_pipe`]'s fused head (#6692): the value the slice stage and the read after it answer
@@ -39534,17 +39598,16 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     // #6692: `E[a:b][k]`, `E[a:b] | length`, `first` and `last` read the slice's resolved range
     // instead of building the slice, as the generic evaluator's pipe does (#4195, #4288): a loop
-    // that reads one element of a moving tail was quadratic in the array.
-    let fused = if rest.is_empty() || !super::eval_generic::is_slice_head(first) {
-        None
-    } else {
-        eval_pipe_fused_slice_read::<W, S>(exprs, &value)
-    };
-    let (result, rest, rest_tail) = match fused {
-        // The slice and its read are two stages: what follows is the pipe from the third on.
-        Some(owned) => (QueryResult::Owned(owned), &rest[1..], rest_tail.rest()),
-        None => (eval_single::<W, S>(first, value, optional), rest, rest_tail),
-    };
+    // that reads one element of a moving tail was quadratic in the array. The slice and its read
+    // are two stages, so what follows is the pipe from the third on.
+    if !rest.is_empty() && may_lead_with_slice(first) {
+        if let Some(owned) = eval_pipe_fused_slice_read::<W, S>(exprs, &value) {
+            return eval_pipe_after_fused_slice_read::<W, S>(rest_tail.rest(), owned, optional);
+        }
+    }
+
+    // Evaluate first expression
+    let result = eval_single::<W, S>(first, value, optional);
 
     if rest.is_empty() {
         return result;
@@ -39659,33 +39722,7 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
         QueryResult::Halt(code) => QueryResult::Halt(code),
-        QueryResult::Owned(v) => {
-            // Continue piping with owned value using eval_owned_pipe
-            // Convert the result type since eval_owned_pipe uses Vec<u64> internally
-            match eval_owned_pipe::<Vec<u64>, S>(rest_tail, v, optional) {
-                QueryResult::Owned(o) => QueryResult::Owned(o),
-                QueryResult::Error(e) => QueryResult::Error(e),
-                QueryResult::None => QueryResult::None,
-                QueryResult::ManyOwned(vs) => QueryResult::ManyOwned(vs),
-                QueryResult::Break(label) => QueryResult::Break(label),
-                QueryResult::Halt(code) => QueryResult::Halt(code),
-                QueryResult::Partial(vs, control) => QueryResult::Partial(vs, control),
-                // #2182: was a wildcard `_ =>` -- verified by tracing
-                // `eval_owned_pipe`'s full call chain (`eval_owned_input` ->
-                // `eval_owned_fast_path`/`eval_owned_input_bridge` ->
-                // `detach_from_temp_document`, the last already an
-                // exhaustive per-variant match): every path resolves to
-                // `Owned`/`None`/`Error`/`ManyOwned`/`Break`/`Halt`/
-                // `Partial`, never `One`/`OneCursor`/`Many`, so this is a
-                // provably closed set today. Spelled out per-variant so a
-                // future `QueryResult` variant this chain starts returning
-                // is a compile error here, not a silent absorption into a
-                // catch-all.
-                QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => {
-                    unreachable!("eval_owned_pipe only returns Owned-family variants")
-                }
-            }
-        }
+        QueryResult::Owned(v) => eval_pipe_owned_rest::<W, S>(rest_tail, v, optional),
         QueryResult::ManyOwned(vs) => pipe_owned_prefix::<S, W>(rest_tail, vs, None, optional),
         // `first`'s own stream produced `vs` before terminating in
         // `outer_control` (#400, #494): pipe each already-produced value
