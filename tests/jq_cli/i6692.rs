@@ -95,6 +95,29 @@ fn a_fused_slice_read_and_a_slice_of_a_slice_answer_as_jq_does_6692() -> Result<
     Ok(())
 }
 
+/// jq parses the whole input first, so a malformed element anywhere rejects the document. A fused
+/// slice read does not validate the rest of the range (`docs/compliance/jq/limitations.md`, #4195):
+/// the element a read names is converted, the others are not, and since #6692 a second slice is
+/// composed onto the first's range, so an element of the first slice that the second drops is not
+/// converted either. A bare slice, and a read that names the malformed element, still raise.
+#[test]
+fn a_malformed_element_the_composed_slice_drops_is_not_read_6692() -> Result<()> {
+    for (input, program, stdout, status) in [
+        ("[1,{\"a\":},3]", ".[:2][:1]", "[1]\n", 0),
+        ("[1,{\"a\":},3]", ".[1:][1:]", "[3]\n", 0),
+        ("[1,tru,3]", ".[:2][:1]", "[1]\n", 0),
+        ("[1,tru,3]", ".[1:] | length", "2\n", 0),
+        ("[1,tru,3]", ".[:2][:2]", "", 5),
+        ("[1,tru,3]", ".[1:][0]", "", 5),
+        ("[1,tru,3]", ".[:2]", "", 5),
+    ] {
+        let (out, code) = run_jq_stdin(program, input, &["-c"])?;
+        assert_eq!(out, stdout, "{input} | {program}");
+        assert_eq!(code, status, "{input} | {program}");
+    }
+    Ok(())
+}
+
 /// The reads and the slice of a slice in the shapes of a loop over a built array, one per pipe
 /// driver: a plain pipe, a generator's (`first`, `select`, `limit`) and one inside a `try`. The
 /// array is 30,000 long, so a loop that builds each tail is over 4e8 element conversions, which

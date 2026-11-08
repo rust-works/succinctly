@@ -27022,7 +27022,10 @@ fn fused_slice_window<S: EvalSemantics, V: DocumentValue>(
 
 /// The fused head of a pipe (#4195): when `exprs` starts with a slice and a read
 /// [`fusable_slice_read`] accepts, and [`try_fused_slice_read`] answers, the read's
-/// value and the stages after it. `None` leaves the whole pipe to the ordinary route.
+/// value and the stages after it. Since #6692 also a second literal slice
+/// ([`fused_slice_of_slice`]), whose two stages are consumed the same way. Both of `eval.rs`'s
+/// pipe drivers and the generic evaluator's two ask here, so this is the one definition of the
+/// shape and of every decline. `None` leaves the whole pipe to the ordinary route.
 ///
 /// Out of line on purpose: the two pipe drivers are on the evaluator's recursion
 /// path, and what this builds (the bounds, the target, the element) must not widen

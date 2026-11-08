@@ -10319,8 +10319,9 @@ fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         return eval_each::<W, S>(first, value, optional, sink);
     }
     // #6692: `E[a:b][k]`, `E[a:b] | length`, `first` and `last` read the slice's resolved range
-    // instead of building the slice, as the generic evaluator's pipe does (#4195, #4288).
-    if may_lead_with_slice(first) {
+    // instead of building the slice, as the generic evaluator's sink route does (#4195, #4288), and
+    // not under a `?` (`optional`), as its gate has it.
+    if !optional && may_lead_with_slice(first) {
         if let Some(flow) = eval_each_fused_slice_read::<W, S>(exprs, &value, optional, sink) {
             return flow;
         }
@@ -10493,9 +10494,16 @@ fn eval_each_fused_slice_read<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Demand::Stop => Flow::Stopped { pending: None },
         }
     } else {
-        RestPipe::new(rest).run_owned::<S>(&owned, optional, Reentry::REBUILT, &mut |o| {
-            sink(Item::Owned(o))
-        })
+        let flow =
+            RestPipe::new(rest).run_owned::<S>(&owned, optional, Reentry::REBUILT, &mut |o| {
+                sink(Item::Owned(o))
+            });
+        // What the pipe driver adds on an escape, as `finish_fused_slice_pipe` does: a halt or a
+        // decode failure past the slice must not be retried by an enclosing `?//`.
+        if let Flow::Escaped(control) = &flow {
+            mark_nonretryable_escape(control);
+        }
+        flow
     })
 }
 
