@@ -5503,16 +5503,13 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 // reports first.
                 // The stitch can have moved the value into a later file, so its file is the last
                 // with bytes as they stand now.
-                let at_tail = value_tail.is_some()
-                    && Some((start, end)) == last_span
+                let is_last_value = Some((start, end)) == last_span
                     && raw_inputs[idx + 1..].iter().all(Vec::is_empty);
+                let at_tail = value_tail.is_some() && is_last_value;
                 // #6683: the last value of a text read on into a directory given last counts the
                 // failure (and says whatever failed before it) when it is read, before the program
                 // runs on it.
-                if value_dir_tail
-                    && Some((start, end)) == last_span
-                    && raw_inputs[idx + 1..].iter().all(Vec::is_empty)
-                {
+                if value_dir_tail && is_last_value {
                     report_open_failures(&failures[next_failure..], &mut open_failed);
                     next_failure = failures.len();
                 }

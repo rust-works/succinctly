@@ -66,6 +66,7 @@ fn a_halt_after_a_last_value_read_on_into_a_last_directory_exits_2_6683() -> Res
     std::fs::write(dir.path().join("p.json"), "1")?;
     std::fs::write(dir.path().join("p2.json"), "1 2")?;
     std::fs::write(dir.path().join("a.json"), "[1]")?;
+    std::fs::write(dir.path().join("e.json"), "")?;
     #[rustfmt::skip]
     let rows = [
         // The number completes only at the end of its file: the read reaches the directory.
@@ -76,7 +77,11 @@ fn a_halt_after_a_last_value_read_on_into_a_last_directory_exits_2_6683() -> Res
         (&["-c", ".,halt"][..], &["p.json", "dir"][..], "1\n", "", 2),
         (&["-c", "halt_error"][..], &["p.json", "missing.json", "dir"][..], "", "jq: error: Could not open file @DIR@/missing.json: No such file or directory\n1\n", 2),
         (&["-c", "halt_error"][..], &["p.json", "dir", "dir2"][..], "", "jq: error: Is a directory\n1\n", 2),
+        (&["-c", "halt_error"][..], &["p.json", "e.json", "dir"][..], "", "1\n", 2),
+        (&["-s", "-c", "halt_error"][..], &["p.json", "dir"][..], "", "[1]\n", 2),
+        (&["-c", "halt_error"][..], &["p.json", "dir", "p2.json"][..], "", "jq: error: Is a directory\n11\n", 2),
         // The value completes on its own: the program stops before the reader moves on.
+        (&["-n", "-c", "halt_error"][..], &["p.json", "dir"][..], "", "", 5),
         (&["-c", "halt_error"][..], &["pn.json", "dir"][..], "", "1\n", 5),
         (&["-c", "halt"][..], &["pn.json", "dir"][..], "", "", 0),
         (&["-c", "halt_error"][..], &["p2.json", "dir"][..], "", "1\n", 5),
