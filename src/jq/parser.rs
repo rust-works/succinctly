@@ -936,6 +936,55 @@ fn dollar_var_expr(name: String, line: usize) -> Expr {
 /// Deliberately not lexically aware -- does not skip string literals or
 /// comments, so `"def foo"` or `# def foo` also add `foo` to the set. Plain
 /// substring scanning, not a real lexer pass, by design.
+/// jq 1.7.1's `_nwise` (#6684), as its builtin.jq defines it:
+///
+/// ```jq
+/// def _nwise($n): def n: if length <= $n then . else .[0:$n] , (.[$n:] | n) end; n;
+/// def _nwise(a; $n): a | _nwise($n);
+/// ```
+///
+/// (Both captured against the pinned jq, not taken from its manual: the manual does not document
+/// it, and the second form was not what the first draft of this guessed.) Expanded at the call
+/// site, with the argument expressions put in where jq's `$n` and `a` are bound, so `[_nwise(2,3)]`
+/// chunks by 2 and then by 3, `_nwise(a; 3)` chunks each output of `a`, and a `$n` generator
+/// is the outer loop. The one extra name, `$__nwise_m`, is not one a program writes (as jq's own
+/// `$__loc__`), and the arguments are parsed outside the template, so they cannot see its
+/// variables.
+///
+/// `Err(args)` hands the arguments back when the template does not have the shape this fills in
+/// (it is parsed from the text above, so a test pins the shape): the call stays a plain call.
+fn nwise_expansion(mut args: Vec<Expr>) -> Result<Expr, Vec<Expr>> {
+    // `n` and `$n` are jq's own names. An argument expression is parsed outside this template and
+    // sits outside the scope of both (`a` of the two-argument form is evaluated under `$__nwise_m`
+    // alone), so it cannot see them.
+    const BODY: &str = "def n: if length <= $n then . else .[0:$n] , (.[$n:] | n) end; n";
+    let template = if args.len() == 1 {
+        format!("0 as $n | {BODY}")
+    } else {
+        format!("0 as $__nwise_m | 1 | ($__nwise_m as $n | {BODY})")
+    };
+    let Ok(mut parsed) = parse_with_mode(&template, ParserMode::Jq) else {
+        return Err(args);
+    };
+    let Expr::As { expr, body, .. } = &mut parsed else {
+        return Err(args);
+    };
+    if args.len() == 1 {
+        **expr = args.remove(0);
+    } else {
+        // `_nwise(a; $n)`: `$n`'s generator is the outer loop, `a` is evaluated inside it.
+        let Expr::Pipe(stages) = &mut **body else {
+            return Err(args);
+        };
+        let (Some(slot), 2) = (stages.first_mut(), args.len()) else {
+            return Err(args);
+        };
+        *slot = args.remove(0);
+        **expr = args.remove(0);
+    }
+    Ok(Expr::Paren(Box::new(parsed)))
+}
+
 fn collect_def_names(input: &str) -> BTreeSet<String> {
     // Yq mode's own `-`-in-identifier extension (`.my-key`) is folded in
     // unconditionally here too, even though real `def` doesn't exist in yq
@@ -6098,6 +6147,26 @@ impl<'a> Parser<'a> {
         // #2085: record where this call's identifier actually started, so an
         // unresolved-call diagnostic can cite the call rather than text-search
         // for the name and find an unrelated same-spelling occurrence.
+        // #6684: jq's `_nwise` is defined in its builtin.jq. A `def _nwise` of the program's (or of
+        // an included module's, `extra`) keeps the name, as any builtin is shadowed.
+        if self.mode == ParserMode::Jq
+            && name == "_nwise"
+            && matches!(args.len(), 1 | 2)
+            && !self.shadowable_defs.contains("_nwise")
+        {
+            return match nwise_expansion(args) {
+                Ok(expanded) => Ok(expanded),
+                Err(args) => {
+                    self.record_call_site(name.clone(), args.len(), start_pos);
+                    Ok(Expr::FuncCall {
+                        name,
+                        args,
+                        builtin_fallback: None,
+                    })
+                }
+            };
+        }
+
         self.record_call_site(name.clone(), args.len(), start_pos);
         Ok(Expr::FuncCall {
             name,
@@ -16057,6 +16126,50 @@ mod tests {
                 "`{program}` (the `{word}` form) does not parse with --jq-extensions"
             );
         }
+    }
+
+    /// #6684: `_nwise(n)` and `_nwise(a; n)` are expanded to jq's definitions at the call site, in
+    /// jq mode; any other arity, yq mode and a program that defines `_nwise` itself keep a plain
+    /// call (jq's own "not defined", yq's refusal, and the program's own def).
+    #[test]
+    fn nwise_expands_in_jq_mode_unless_the_program_defines_it_6684() {
+        use super::super::walk::any_subexpr;
+        let calls_nwise = |e: &Expr| {
+            any_subexpr(
+                e,
+                &mut |x| matches!(x, Expr::FuncCall { name, .. } if name == "_nwise"),
+            )
+        };
+        for src in [
+            "[1,2,3] | _nwise(2)",
+            "[1,2,3] | _nwise(.; 2)",
+            "[1] | _nwise(1, 2)",
+        ] {
+            let expr = parse(src).unwrap();
+            assert!(!calls_nwise(&expr), "{src}: expanded");
+        }
+        for src in [
+            "_nwise",
+            "_nwise(1; 2; 3)",
+            "def _nwise($n): $n; _nwise(1)",
+            "def _nwise(a; $n): a; _nwise(1; 2)",
+        ] {
+            let expr = parse(src).unwrap();
+            assert!(calls_nwise(&expr), "{src}: kept");
+        }
+        let yq = parse_with_mode("_nwise(2)", ParserMode::Yq);
+        assert!(
+            yq.map_or(true, |e| calls_nwise(&e)),
+            "yq mode: refused or kept"
+        );
+        // The argument is the call's own expression, evaluated outside the template: the
+        // expansion holds it once, where jq binds `$n` to it.
+        let expr = parse("_nwise($x)").unwrap();
+        assert_eq!(
+            format!("{expr:?}").matches("Var(\"x\")").count(),
+            1,
+            "{expr:?}"
+        );
     }
 
     /// #5590: a def name, a call and a prescan agree that `a::b` is one name, in jq mode only.
