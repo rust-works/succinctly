@@ -5904,6 +5904,9 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         // queue holds at most this one trailing error, so whatever
         // `InputPop::ParseError` the driver pops *is* it.
         let trailing_is_seq_warning = trailing_error.as_ref().is_some_and(|t| t.seq_warning);
+        // #6589: the warning a `--seq -s` read defers past the array comes from a read jq's main
+        // loop never makes once a file has failed to open; the program's own `input` still makes it.
+        let seq_warning_unread = seq_slurp_places_failures(&args) && open_failed;
         // #6115: `--seq --stream` reads a fault as a record's end, and the main loop warns and goes
         // on to the next input.
         let seq_stream_warns = seq_by_stream_reader(&args) && !args.stream_errors;
@@ -6033,10 +6036,12 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                         // jq's main loop prints a `--seq` parse error as
                         // ignored, and reads on to the end (#3201).
                         jq::InputPop::ParseError(error) if trailing_is_seq_warning => {
-                            eprintln!(
-                                "{}",
-                                crate::jq_seq_reader::ignored_parse_error(&error.message)
-                            );
+                            if !seq_warning_unread {
+                                eprintln!(
+                                    "{}",
+                                    crate::jq_seq_reader::ignored_parse_error(&error.message)
+                                );
+                            }
                             break;
                         }
                         // #6137: and so does a fault of the `--seq` reader the program's own
@@ -6239,7 +6244,9 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             // documents before it (#2961) -- or, for `--seq -s`, the warning
             // jq defers past the filter (#3201).
             if let Some(t) = trailing_error.filter(|_| !stopped(args.on_error, &sink)) {
-                if t.seq_warning {
+                if t.seq_warning && seq_warning_unread {
+                    // #6589: see `seq_warning_unread`.
+                } else if t.seq_warning {
                     eprintln!(
                         "{}",
                         crate::jq_seq_reader::ignored_parse_error(&t.error.message)
@@ -6833,6 +6840,13 @@ fn read_inputs(
     let mut unopened_tail = false;
     // #6481: whether any input file failed to open, in the middle of the list or at its end.
     let mut any_open_failure = false;
+    // #6589: the open failures a `--seq -s` read reports among its warnings, as jq's reader reaches
+    // them ([`seq_slurp_places_failures`]).
+    let mut held_open_failures: std::collections::VecDeque<(usize, InputFileOpenError)> =
+        std::collections::VecDeque::new();
+    // Whether a last directory was left to the read that reaches it (#6604): it fails the run
+    // whether or not a read does, but only once the warnings have been placed among the others.
+    let mut seq_directory_deferred = false;
     let (files, mut raw_bytes): OpenedInputs = if let Some(bytes) = read_whole {
         // Stdin is the one source with no file index.
         let tag = (!files.is_empty()).then_some(0);
@@ -6923,6 +6937,7 @@ fn read_inputs(
                 defer_open_failures(failures, false);
             } else if args.slurp
                 && (args.null_input || track_eof)
+                && !seq_slurp_places_failures(args)
                 && matches!(
                     failures[..reached].last(),
                     Some((_, e)) if e.kind == InputFileErrorKind::Directory { last: true }
@@ -6939,6 +6954,22 @@ fn read_inputs(
                 *open_failed = true;
                 defer_open_failures(directory, false);
                 SLURP_DIRECTORY_READ.with(|slurp| slurp.set(true));
+            } else if seq_slurp_places_failures(args) {
+                let mut failures = failures;
+                // #6604, as above: a last directory is read by the extra input a program that
+                // reads `input` asks for after the array, so it is left to that read.
+                if track_eof
+                    && matches!(
+                        failures.last(),
+                        Some((_, e)) if e.kind == InputFileErrorKind::Directory { last: true }
+                    )
+                {
+                    let directory = failures.split_off(failures.len() - 1);
+                    defer_open_failures(directory, false);
+                    SLURP_DIRECTORY_READ.with(|slurp| slurp.set(true));
+                    seq_directory_deferred = true;
+                }
+                held_open_failures = failures.into();
             } else {
                 report_open_failures(&failures[..reached], open_failed);
             }
@@ -7052,6 +7083,9 @@ fn read_inputs(
     if seq_readers_place_reads && UNOPENED_TAIL_NAME.with(|tail| tail.borrow().is_some()) {
         raw_bytes.push((Some(files.len()), Vec::new()));
     }
+    // #6589: whether jq's main loop stopped on a warning met after a file that did not open, so the
+    // slurp hands over no array.
+    let mut seq_slurp_stopped = false;
     let seq_warnings_apply = seq_stream_shape && !args.null_input && !seq_by_stream_reader;
     if seq_by_stream_reader {
         // The streaming reader finds the records and their faults itself.
@@ -7063,9 +7097,16 @@ fn read_inputs(
         seq_slurp_position_lost = match seq_no_rs_byte_warning(&raw_bytes) {
             Some(warning) => {
                 seq_warned = true;
-                // #6555: a stream with no record separator holds no value, so jq's reader reads
-                // past every file before it warns at the end: each deferred failure comes first.
-                report_reached_open_failures(None, false);
+                if seq_slurp_places_failures(args) {
+                    // #6589: the template is the EOF branch's report, met after every file.
+                    seq_slurp_stopped =
+                        report_held_open_failures(&mut held_open_failures, usize::MAX, open_failed);
+                } else {
+                    // #6555: a stream with no record separator holds no value, so jq's reader
+                    // reads past every file before it warns at the end: each deferred failure
+                    // comes first.
+                    report_reached_open_failures(None, false);
+                }
                 eprintln!("{warning}");
                 // #1525's arm prints its own template instead of the
                 // reader's, but the location still needs the walk. A
@@ -7081,16 +7122,29 @@ fn read_inputs(
                 // #6137: a program that reads `input`/`inputs` meets each fault as an input,
                 // as under `-n`, so it is queued rather than printed here.
                 let queue_faults = seq_faults_queued(args, track_eof);
-                let walk = crate::jq_seq_reader::walk_stream_collecting(
+                let ends = crate::jq_seq_reader::source_ends(&raw_bytes);
+                let walk = crate::jq_seq_reader::walk_stream_collecting_at(
                     &raw_bytes,
                     args.slurp,
                     queue_faults,
                     crate::jq_seq_reader::Tail::of(unopened_tail),
-                    &mut |warning| {
-                        if !queue_faults {
-                            seq_warned = true;
-                            eprintln!("{warning}");
+                    &mut |warning, at| {
+                        // #6589: jq's main loop reads no further after a warning once a file has
+                        // failed to open.
+                        if queue_faults || seq_slurp_stopped {
+                            return;
                         }
+                        // The source the warning was met in: a failure before it is reported
+                        // first, as jq's reader opens the files in order.
+                        let source = if at == crate::jq_seq_reader::AT_EOF {
+                            usize::MAX
+                        } else {
+                            ends.partition_point(|&end| end <= at)
+                        };
+                        seq_slurp_stopped =
+                            report_held_open_failures(&mut held_open_failures, source, open_failed);
+                        seq_warned = true;
+                        eprintln!("{warning}");
                     },
                 );
                 seq_values = walk.values;
@@ -7120,6 +7174,15 @@ fn read_inputs(
         // `-n -s`'s `input`/`inputs` read the deferred warning too.
         seq_deferred_warning = walk.deferred_warning;
         seq_slurp_position_lost = walk.slurp_position_lost;
+    }
+
+    // #6589: what the warnings did not reach is reached at the end of the read, unless a warning
+    // stopped it first.
+    if !seq_slurp_stopped {
+        report_held_open_failures(&mut held_open_failures, usize::MAX, open_failed);
+    }
+    if seq_directory_deferred {
+        *open_failed = true;
     }
 
     // Answered here, before the UTF-8 substitution below consumes
@@ -8052,11 +8115,16 @@ fn read_inputs(
             Some((src, line)) => locations.resolve(src, line),
             None => InputLocation::unknown(),
         };
-        let array_lost = slurped_array_lost(
-            args.seq,
-            any_open_failure,
-            seq_warned || trailing_error.as_ref().is_some_and(|t| t.seq_warning),
-        );
+        // #6589: a read that places its failures among its warnings knows whether one stopped it.
+        let array_lost = if seq_slurp_places_failures(args) {
+            seq_slurp_stopped
+        } else {
+            slurped_array_lost(
+                args.seq,
+                any_open_failure,
+                seq_warned || trailing_error.as_ref().is_some_and(|t| t.seq_warning),
+            )
+        };
         let slurped = if array_lost {
             Vec::new()
         } else {
@@ -8081,7 +8149,12 @@ fn read_inputs(
             ahead.extend(trailing_error.take().map(|fault| (0, fault)));
             return Ok(Ok((slurped, slurped_locations, None, ahead)));
         }
-        let slurped_locations = InputLocations::single_at_end(at, locations.unopened_tail);
+        // No array, no location: the queue of a program that reads `input` holds nothing (#6589).
+        let slurped_locations = if array_lost {
+            InputLocations::new(locations.files().to_vec())
+        } else {
+            InputLocations::single_at_end(at, locations.unopened_tail)
+        };
         Ok(Ok((
             slurped,
             slurped_locations,
@@ -8198,11 +8271,43 @@ fn seq_by_stream_reader(args: &JqCommand) -> bool {
     args.seq && !args.raw_input && args.input_dsv.is_none() && (args.stream || args.stream_errors)
 }
 
+/// Whether a `--seq -s` read reports its open failures among the reader's warnings (#6589), as
+/// jq's reader reaches each file: a stream read as JSON texts by the record reader, outside `-n`
+/// (where the program's `input` reads the stream). jq's main loop reads the whole slurp in its
+/// first call, and stops at the first warning it meets once a file has failed to open: the array
+/// is then lost, and nothing after that warning is read or reported.
+fn seq_slurp_places_failures(args: &JqCommand) -> bool {
+    args.seq
+        && args.slurp
+        && !args.null_input
+        && !args.raw_input
+        && args.input_dsv.is_none()
+        && !seq_by_stream_reader(args)
+}
+
+/// Reports the held open failures of [`seq_slurp_places_failures`] that sit before the opened
+/// source `source` (`usize::MAX` for the end of the stream), and answers whether any failure has
+/// been reported by now, so that a warning met there stops jq's main loop.
+fn report_held_open_failures(
+    held: &mut std::collections::VecDeque<(usize, InputFileOpenError)>,
+    source: usize,
+    open_failed: &mut bool,
+) -> bool {
+    while held.front().is_some_and(|&(at, _)| at <= source) {
+        if let Some((_, failure)) = held.pop_front() {
+            report_unopenable_input(&failure, open_failed);
+        }
+    }
+    *open_failed
+}
+
 /// Whether a `--seq` slurp has no array to print (#6481): jq's main loop reads no further once a
 /// file has failed to open, and a stream that holds a fault has the fault, not the array, in its
 /// last call, so with a file that did not open the warning is all there is and the run exits 2.
 /// `seq_slurp` says the run is one that reads the stream whole, `faulted` that it holds a fault.
-/// One definition for the two routes that read a `--seq` stream.
+/// One definition for the two routes that read a `--seq` stream. The record reader's plain `-s`
+/// route places each failure among its warnings instead, and so knows where the loop stopped
+/// ([`seq_slurp_places_failures`], #6589).
 fn slurped_array_lost(seq_slurp: bool, any_open_failure: bool, faulted: bool) -> bool {
     seq_slurp && any_open_failure && faulted
 }
