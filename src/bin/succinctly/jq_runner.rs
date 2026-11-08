@@ -6903,13 +6903,12 @@ fn read_inputs(
         seq_readers_place_reads = seq_stream_shape && !args.slurp && !unplaced_tail;
         let ends_cleanly = raw_lines_read_whole
             || seq_readers_place_reads
-            || failures.iter().all(|(at, failure)| {
-                let at = *at;
-                // #6615: a directory last is read by whichever read reaches it, which the hook
-                // tells apart ([`reach_last_directory`]).
+            || failures.iter().all(|&(at, ref failure)| {
+                // #6615: the reads place a directory given last ([`reach_last_directory`]).
                 failure.kind == InputFileErrorKind::Directory { last: true }
-                // The last file with bytes before it: an empty one between sends the reader on too.
-                || (last_value_at_tail && at >= raws.len())
+                    // The last file with bytes before it: an empty one between sends the reader on
+                    // too.
+                    || (last_value_at_tail && at >= raws.len())
                     || raws
                         .iter()
                         .take(at)
@@ -9447,24 +9446,27 @@ fn first_stream_fault(raws: &[Vec<u8>]) -> Option<(usize, bool)> {
 fn report_reached_open_failures(read: Option<u32>, fault: bool) {
     let read = read.filter(|_| !(fault && FAULT_ENDS_TEXT.with(std::cell::Cell::get)));
     loop {
+        // The failure the read reached, and whether it is a directory given last that this read
+        // says (#6615), which `report_unopenable_input` would leave out.
         let next = PENDING_OPEN_FAILURES.with(|pending| {
             let mut pending = pending.borrow_mut();
-            match pending.front() {
-                Some((at, failure)) if is_last_directory_outside_slurp(failure) => {
-                    if reach_last_directory(*at, read) {
-                        pending.pop_front()
-                    } else {
-                        None
-                    }
-                }
-                Some(&(at, _)) if read.map_or(true, |source| at <= source as usize) => {
-                    pending.pop_front()
-                }
-                _ => None,
-            }
+            let last_directory = pending
+                .front()
+                .is_some_and(|(_, failure)| is_last_directory_outside_slurp(failure));
+            let reached = match pending.front() {
+                Some(&(at, _)) if last_directory => reach_last_directory(at, read),
+                Some(&(at, _)) => read.map_or(true, |source| at <= source as usize),
+                None => false,
+            };
+            reached
+                .then(|| pending.pop_front())
+                .flatten()
+                .map(|(_, failure)| (failure, last_directory))
         });
-        let Some((_, failure)) = next else { return };
-        if is_last_directory_outside_slurp(&failure) {
+        let Some((failure, last_directory)) = next else {
+            return;
+        };
+        if last_directory {
             report_usage_error(&failure.to_string());
             return;
         }
@@ -9908,7 +9910,8 @@ impl std::error::Error for InputFileOpenError {}
 /// the failure in `open_failed` (#5472).
 fn report_unopenable_input(e: &InputFileOpenError, open_failed: &mut bool) {
     // #6472: jq's reader does not ask for more after the last file, so a directory there is not
-    // reported, but it still fails the run.
+    // reported, but it still fails the run. A read that asks again after reaching it does say it,
+    // which the deferred reads follow outside a slurp ([`reach_last_directory`], #6615).
     // #6604: but a slurp's extra read does read it.
     let by_slurp_read = SLURP_DIRECTORY_READ.with(std::cell::Cell::get)
         && REPORTED_BY_READ.with(std::cell::Cell::get);
