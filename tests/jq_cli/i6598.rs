@@ -89,6 +89,36 @@ fn seq_raw_input_reports_unopened_files_as_raw_input_does_6598() -> Result<()> {
             GONE_BOTH,
             2,
         ),
+        // The output side still frames with RS (or not, under -r/-j), and -s/--stream/-e read as -R does.
+        (
+            &["-r", "."][..],
+            &["nl", "gone", "one", "gone2"][..],
+            "a\nb\nx\n",
+            GONE_BOTH,
+            2,
+        ),
+        (&["-j", "."][..], &["nl", "gone"][..], "ab", GONE, 2),
+        (
+            &["-c", "-s", "."][..],
+            &["nl", "gone", "one"][..],
+            "\u{1e}\"a\\nb\\nx\"\n",
+            GONE,
+            2,
+        ),
+        (
+            &["-c", "--stream", "."][..],
+            &["nl", "gone", "gone2"][..],
+            "\u{1e}\"a\"\n\u{1e}\"b\"\n",
+            GONE_BOTH,
+            2,
+        ),
+        (
+            &["-c", "-e", "."][..],
+            &["pnum", "gone", "empty", "gone2"][..],
+            "\u{1e}\"1\"\n\u{1e}\"2\"\n",
+            GONE_BOTH,
+            2,
+        ),
     ] {
         let files: Vec<String> = names
             .iter()
