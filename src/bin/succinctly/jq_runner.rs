@@ -8185,7 +8185,7 @@ fn read_inputs(
         // No array, no location: the queue of a program that reads `input` holds nothing (#6589).
         let slurped_locations = if array_lost {
             InputLocations::new(locations.files().to_vec())
-        } else if !resumed_errors.is_empty() || seq_slurp_defers_failures(args) {
+        } else if seq_slurp_defers_failures(args) {
             // #6599: a fault the queue raises names the file it was met in by its index in the
             // whole table, and a read of the array reaches the failures up to its source, so the
             // table stays whole and the array is one entry in it, at the last source
