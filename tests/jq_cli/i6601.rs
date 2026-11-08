@@ -32,6 +32,10 @@ fn a_quoted_record_spanning_files_is_one_row_6601() -> Result<()> {
         ("esc1.csv", "a,\"b\"\"\n"),
         ("esc2.csv", "c\",d\n"),
         ("empty.csv", ""),
+        ("crlf1.csv", "a,\"b\r\n"),
+        ("crlf2.csv", "c\"\r\n"),
+        ("nn1.csv", "x,y"),
+        ("nn2.csv", "z,w\n"),
     ] {
         std::fs::write(dir.path().join(name), text)?;
     }
@@ -77,6 +81,20 @@ fn a_quoted_record_spanning_files_is_one_row_6601() -> Result<()> {
             &["."][..],
             &["ok.csv", "span.csv"][..],
             "[\"x\",\"y\"]\n[\"a\",\"b\\nc\",\"d\"]\n",
+        ),
+        // `-R` with `--input-dsv` reads the same rows.
+        (&["-R", "."][..], &["span1.csv", "span2.csv"][..], joined),
+        // A last row with no newline stays its own row: only an open quote joins.
+        (
+            &["."][..],
+            &["nn1.csv", "nn2.csv"][..],
+            "[\"x\",\"y\"]\n[\"z\",\"w\"]\n",
+        ),
+        // CRLF records read as the joined file does.
+        (
+            &["."][..],
+            &["crlf1.csv", "crlf2.csv"][..],
+            "[\"a\",\"\\\"b\\r\\nc\\\"\\r\"]\n",
         ),
         // A record still open at the end of the last file is read as it stood.
         (
