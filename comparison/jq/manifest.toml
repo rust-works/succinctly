@@ -557,6 +557,64 @@ size = "100mb"
 seed = 1
 sha256 = "d2b70721c060f089443907eddc0347b1e20472ac59d304e20d674f6d73c7330b"
 
+# A `--seq` stream with one truncated record at its start or its end (#6619): the shape a clean `jsonseq`
+# file never makes, where `--seq` runs behind a diagnostic and the walk has to place every record
+# (#6500). The records are `jsonseq`'s own, so the fault is the only difference between the files.
+
+[[input]]
+id = "jsonseq-bad-first-1mb"
+shape = "jsonseq-bad-first"
+tier = "1mb"
+pattern = "json-seq-bad-first"
+size = "1mb"
+seed = 1
+sha256 = "2ee76cb12a7a0ac32e972b62217f0e5e5fd6455b95a34e151af478f0997f2466"
+
+[[input]]
+id = "jsonseq-bad-last-1mb"
+shape = "jsonseq-bad-last"
+tier = "1mb"
+pattern = "json-seq-bad-last"
+size = "1mb"
+seed = 1
+sha256 = "9ef5543496cd85f2f57a41c3451bce78dd61a052e6db677c6898c448890868b3"
+
+[[input]]
+id = "jsonseq-bad-first-10mb"
+shape = "jsonseq-bad-first"
+tier = "10mb"
+pattern = "json-seq-bad-first"
+size = "10mb"
+seed = 1
+sha256 = "cc14d02e05bbcf5bc9af8f018bc9fe6487a0ca2b78338b442c6072ea9e45bb03"
+
+[[input]]
+id = "jsonseq-bad-last-10mb"
+shape = "jsonseq-bad-last"
+tier = "10mb"
+pattern = "json-seq-bad-last"
+size = "10mb"
+seed = 1
+sha256 = "1bd5623b3e6c26a16f3fe3de9d19a709b3d9017da9592cf1f5742728df392e5f"
+
+[[input]]
+id = "jsonseq-bad-first-100mb"
+shape = "jsonseq-bad-first"
+tier = "100mb"
+pattern = "json-seq-bad-first"
+size = "100mb"
+seed = 1
+sha256 = "2c53076601eb915a1f9f10376cc26221a2415218c7c76f25998410e40d7b5021"
+
+[[input]]
+id = "jsonseq-bad-last-100mb"
+shape = "jsonseq-bad-last"
+tier = "100mb"
+pattern = "json-seq-bad-last"
+size = "100mb"
+seed = 1
+sha256 = "156154efacf44c46f011af8b37ee0a07d2951be78e055b0e4e48ffa373c7fb05"
+
 # Dimensions D/E on real files (#5552): JSON files from the benchmark corpus, copied from the vendored seed or from
 # `scripts/sync-bench-corpus.sh`'s fetch, each pinned by the sha256 the corpus manifest records. A fetched file that is
 # not on the machine drops its rows with a note. They are 0.5 KB to 0.8 MB, so most rows are startup-bound.

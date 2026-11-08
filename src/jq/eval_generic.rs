@@ -980,11 +980,18 @@ fn to_owned_at_depth<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<&V::Cursor>,
     depth: usize,
 ) -> Result<OwnedValue, EvalError> {
-    // Check containers first (arrays and objects have no type ambiguity). A container is held to
-    // the ceiling, a scalar is not: it recurses no deeper, and jq's own limit of 256 containers
-    // leaves room for the scalar inside the 256th (#6618).
+    // #6618: the ceiling counts containers, not the scalar a deepest container holds (jq's own
+    // parser accepts 256 and refuses 257), so a scalar at `MAX_NESTING_DEPTH` is not too deep.
+    let too_deep = || {
+        EvalError::decode_failure(super::value::nesting_depth_exceeded_message(
+            MAX_NESTING_DEPTH,
+        ))
+    };
+    // Check containers first (arrays and objects have no type ambiguity)
     if let Some(fields) = value.as_object_rendered() {
-        nesting_depth_check(depth)?;
+        if depth >= MAX_NESTING_DEPTH {
+            return Err(too_deep());
+        }
         let mut map = ObjectBuilder::new();
         let mut guard = DisplayKeyGuard::default();
         let mut f = fields;
@@ -1022,7 +1029,9 @@ fn to_owned_at_depth<S: EvalSemantics, V: DocumentValue>(
         tail_gap_ok(cursor, last_field.as_ref(), b'}')?;
         Ok(OwnedValue::Object(map.finish()))
     } else if let Some(elements) = value.as_array() {
-        nesting_depth_check(depth)?;
+        if depth >= MAX_NESTING_DEPTH {
+            return Err(too_deep());
+        }
         let mut items = Vec::new();
         let mut elems = elements;
         let mut is_first = true;
@@ -44986,6 +44995,7 @@ mod tests {
     #[test]
     fn test_arithmetic_wildcard_bridge_reports_clean_error_past_nesting_limit_2627() {
         use crate::json::JsonIndex;
+        // #6618: 257 containers, one past jq's ceiling; 256 is accepted (the next test).
         let json = format!("{}1{}", "[".repeat(257), "]".repeat(257));
         let json = json.as_bytes();
         let index = JsonIndex::build(json);
@@ -45003,6 +45013,30 @@ mod tests {
                 );
             }
             other => panic!("expected a decode failure, got: {other:?}"),
+        }
+    }
+
+    /// #6618: jq's ceiling counts containers, not the scalar the deepest holds, so a document 256
+    /// containers deep is read (jq 1.7.1 prints it): `. + 1` over it is the ordinary type error of
+    /// adding a number to an array, not a nesting-depth decode failure.
+    #[test]
+    fn test_arithmetic_wildcard_bridge_accepts_exactly_the_nesting_limit_6618() {
+        use crate::json::JsonIndex;
+        let json = format!("{}1{}", "[".repeat(256), "]".repeat(256));
+        let json = json.as_bytes();
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let expr = crate::jq::parse(". + 1").unwrap();
+
+        match eval(&expr, value) {
+            GenericResult::Error(e) => {
+                assert!(
+                    !e.is_decode_failure() && !e.message.contains("nesting depth"),
+                    "256 containers are within the limit, got: {e:?}"
+                );
+            }
+            other => panic!("expected the type error of array + number, got: {other:?}"),
         }
     }
 

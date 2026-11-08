@@ -92,10 +92,8 @@ fn test_depth_refusal_comes_before_a_later_fault_5497() -> Result<()> {
         let (out, err, exit) = run_jq_full(&["-c", "length"], Some(&input))?;
         assert_eq!((out.as_str(), err, exit), ("", refused(1, 257), 5));
         let (out, err, exit) = run_jq_full(&["-s", "-c", "length"], Some(&input))?;
-        assert_eq!(
-            (out.as_str(), err.as_str(), exit),
-            ("", "jq: parse error: Exceeds depth limit for parsing\n", 5)
-        );
+        // #6628: and the slurp names the bracket too, as jq does.
+        assert_eq!((out.as_str(), err, exit), ("", refused(1, 257), 5));
         let (out, err, exit) = run_jq_full(&["-n", "-c", "[inputs]"], Some(&input))?;
         assert_eq!((out.as_str(), exit), ("", 5));
         assert_eq!(

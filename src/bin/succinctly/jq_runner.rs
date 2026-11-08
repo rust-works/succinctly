@@ -4875,8 +4875,11 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     // `-R`'s alone. Every input-side `args.seq` test then sees the `-R` route, rather than each
     // one having to exclude `args.raw_input` itself. From here `args.seq` means "reads as `--seq`";
     // the output's RS framing is `output_config.seq`, taken above, so output code must read that.
+    // #6616: so do `--stream` and `--stream-errors`, which jq's JSON parser reads and `-R` bypasses.
     if args.raw_input {
         args.seq = false;
+        args.stream = false;
+        args.stream_errors = false;
     }
 
     // #5553, #5558: jq writes the line `debug`/`debug(msg)` send to stderr with its dump options
@@ -5021,11 +5024,12 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         if !args.slurp && !args.null_input && !uses_input_builtins {
             // Streaming mode: process each row independently
             let files = get_input_files(&args);
-            let (files, raw_inputs, failures) = if files.is_empty() {
+            let (files, mut raw_inputs, failures) = if files.is_empty() {
                 (files, vec![read_stdin_bytes()?], Vec::new())
             } else {
                 read_input_files(&files)
             };
+            join_dsv_records_across_files(&mut raw_inputs, dsv_config(delimiter).quote_char);
             report_open_failures(&failures, &mut open_failed);
             // `input_filename` on this route too (#3046 review), named after the files that
             // opened: `raw_inputs`' indexes are its source tags (#5472).
@@ -5039,7 +5043,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 let file = files.get(file_idx).map(|p| input_display_name(p));
 
                 // Build DSV index (memory-efficient with SIMD)
-                let config = DsvConfig::default().with_delimiter(delimiter as u8);
+                let config = dsv_config(delimiter);
                 let index = build_dsv_index(&raw, &config);
 
                 // Stream rows using the cursor - no materialization of all rows
@@ -5266,8 +5270,12 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 // `--validate` already printed its own report.
                 Err(SlurpFailure::Validation(exit_code)) => return Ok(exit_code),
                 // #6476: a file that did not open makes the run exit 2 after any of these faults.
-                Err(SlurpFailure::DepthLimit) => {
-                    sink.report_parse_error("Exceeds depth limit for parsing");
+                Err(SlurpFailure::DepthLimit(message)) => {
+                    sink.report_parse_error(
+                        message
+                            .as_deref()
+                            .unwrap_or("Exceeds depth limit for parsing"),
+                    );
                     return Ok(halt_exit_code(DiagStyle::Jq.error_exit_code(), open_failed));
                 }
                 // Line 0 of the first file, where `get_inputs` has always
@@ -5497,6 +5505,14 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                         .flatten()
                         .filter(|read| jq::is_jq_depth_fault(read))
                         .unwrap_or(message);
+                    // #6628: a slurp joined the documents, so the position is that of the files
+                    // read again as one stream, and the fault is the first jq meets there (stdin
+                    // and a pipe cannot be read again, and keep the bare message).
+                    let message = if source == jq::InputSource::Slurped {
+                        reread_stream_fault(&files).unwrap_or(message)
+                    } else {
+                        message
+                    };
                     sink.report_parse_error(&message);
                     run_stopped = true;
                     break 'files;
@@ -5901,6 +5917,9 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         // queue holds at most this one trailing error, so whatever
         // `InputPop::ParseError` the driver pops *is* it.
         let trailing_is_seq_warning = trailing_error.as_ref().is_some_and(|t| t.seq_warning);
+        // #6589: the warning a `--seq -s` read defers past the array comes from a read jq's main
+        // loop never makes once a file has failed to open; the program's own `input` still makes it.
+        let seq_warning_unread = seq_slurp_places_failures(&args) && open_failed;
         // #6115: `--seq --stream` reads a fault as a record's end, and the main loop warns and goes
         // on to the next input.
         let seq_stream_warns = seq_by_stream_reader(&args) && !args.stream_errors;
@@ -6030,10 +6049,12 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                         // jq's main loop prints a `--seq` parse error as
                         // ignored, and reads on to the end (#3201).
                         jq::InputPop::ParseError(error) if trailing_is_seq_warning => {
-                            eprintln!(
-                                "{}",
-                                crate::jq_seq_reader::ignored_parse_error(&error.message)
-                            );
+                            if !seq_warning_unread {
+                                eprintln!(
+                                    "{}",
+                                    crate::jq_seq_reader::ignored_parse_error(&error.message)
+                                );
+                            }
                             break;
                         }
                         // #6137: and so does a fault of the `--seq` reader the program's own
@@ -6236,7 +6257,9 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             // documents before it (#2961) -- or, for `--seq -s`, the warning
             // jq defers past the filter (#3201).
             if let Some(t) = trailing_error.filter(|_| !stopped(args.on_error, &sink)) {
-                if t.seq_warning {
+                if t.seq_warning && seq_warning_unread {
+                    // #6589: see `seq_warning_unread`.
+                } else if t.seq_warning {
                     eprintln!(
                         "{}",
                         crate::jq_seq_reader::ignored_parse_error(&t.error.message)
@@ -6699,6 +6722,7 @@ fn read_inputs(
     LAZY_JSON_INPUTS.with(|slot| *slot.borrow_mut() = None);
     LAZY_RAW_INPUTS.with(|slot| *slot.borrow_mut() = None);
     LAZY_STREAM_INPUTS.with(|slot| *slot.borrow_mut() = None);
+    LAZY_SEQ_INPUTS.with(|slot| *slot.borrow_mut() = None);
     defer_open_failures(Vec::new(), false);
     LAZY_OPEN_FAILED.with(|seen| seen.set(false));
     SLURP_DIRECTORY_READ.with(|slurp| slurp.set(false));
@@ -6727,6 +6751,15 @@ fn read_inputs(
 
     // Get input files
     let files = get_input_files(args);
+    // Shared by the open-failure deferral, `seq_warnings_apply` below, the `-n`-forced-read
+    // fallback just after it, and the `build_seq_values` gate further down -- one definition rather
+    // than hand-copies of the same shape, so a future change to it can't desynchronize them
+    // (CLAUDE.md: "Duplicated predicates diverge silently").
+    let seq_stream_shape = args.seq && !args.raw_input && args.input_dsv.is_none();
+    // #6584: whether the `--seq` readers place each read where jq's reader stands when it completes
+    // it, a fault included: their positions follow the reader into the next file, and a last file
+    // that did not open is a source of their own (below, #6588). A slurp reads every file first.
+    let mut seq_readers_place_reads = false;
 
     // #5498: a program that asks for the `--stream` events as it goes reads them from the files a
     // chunk at a time, as jq does, and not from their bytes read whole first.
@@ -6821,6 +6854,13 @@ fn read_inputs(
     let mut unopened_tail = false;
     // #6481: whether any input file failed to open, in the middle of the list or at its end.
     let mut any_open_failure = false;
+    // #6589: the open failures a `--seq -s` read reports among its warnings, as jq's reader reaches
+    // them ([`seq_slurp_places_failures`]).
+    let mut held_open_failures: std::collections::VecDeque<(usize, InputFileOpenError)> =
+        std::collections::VecDeque::new();
+    // Whether a last directory was left to the read that reaches it (#6604): it fails the run
+    // whether or not a read does, but only once the warnings have been placed among the others.
+    let mut seq_directory_deferred = false;
     let (files, mut raw_bytes): OpenedInputs = if let Some(bytes) = read_whole {
         // Stdin is the one source with no file index.
         let tag = (!files.is_empty()).then_some(0);
@@ -6855,7 +6895,13 @@ fn read_inputs(
         // stops on an earlier line never gets there, as in jq. `--stream` and `--stream-errors`
         // place that tail themselves and keep the test.
         let raw_lines_read_whole = args.raw_input && !args.stream && !args.stream_errors;
+        // A last failure that is not a source of its own (a directory) is reported by a read past
+        // the end, which a fault raised first never makes: that stream keeps #6586's rule below.
+        let unplaced_tail = failures.last().is_some_and(|&(at, _)| at >= files.len())
+            && unopened_tail_name(&failures, files.len()).is_none();
+        seq_readers_place_reads = seq_stream_shape && !args.slurp && !unplaced_tail;
         let ends_cleanly = raw_lines_read_whole
+            || seq_readers_place_reads
             || failures.iter().all(|&(at, _)| {
                 // The last file with bytes before it: an empty one between sends the reader on too.
                 (last_value_at_tail && at >= raws.len())
@@ -6869,15 +6915,17 @@ fn read_inputs(
         // #6525: so does a program that reads `input` without `-n`, whose main loop reads the first
         // file before the program does and stops one value past a failure. Every route that reads
         // `input` seeds the queue the hook reports from.
-        // #6555: a `--seq` stream its reader reads without a fault pops its values as a JSON
-        // stream's are, so the reads reach the failures as they do there; `-R` reads the lines of
-        // one with its own reader, as it reads any text. With nothing to report the walk is not
-        // worth its copy of the text.
+        // #6555, #6584: `-R` reads the lines of a `--seq` stream with its own reader, as it reads
+        // any text, and the `--seq` readers place each read where the reader stands, a fault
+        // included, so their reads reach the failures as a JSON stream's do. A stream they cannot
+        // place the reads of is deferred only when it reads without a fault, as a JSON stream's
+        // values are placed then; with nothing to report the walk is not worth its copy of the text.
         if (args.null_input || track_eof)
             && !args.slurp
             && args.input_dsv.is_none()
             && (!args.seq
                 || args.raw_input
+                || seq_readers_place_reads
                 || (any_open_failure
                     // #6588: the streaming readers (`read_seq`) still end the stream at the
                     // final buffer of the last file that opened (#6591), so for them an unopened
@@ -6885,7 +6933,9 @@ fn read_inputs(
                     && seq_text_reads_clean(&raws, unopened_tail && !seq_by_stream_reader(args))))
             && ends_cleanly
         {
-            let fault_ends_text = matches!(first_stream_fault(&raws), Some((_, true)));
+            // The `--seq` readers place their own faults: the JSON text's fault is not theirs.
+            let fault_ends_text =
+                !seq_readers_place_reads && matches!(first_stream_fault(&raws), Some((_, true)));
             defer_open_failures(failures, fault_ends_text);
         } else {
             // #6522: only the main loop reads, one value at a time, when nothing asks for more.
@@ -6901,6 +6951,9 @@ fn read_inputs(
                 defer_open_failures(failures, false);
             } else if args.slurp
                 && (args.null_input || track_eof)
+                && !seq_slurp_places_failures(args)
+                // #6599: `--seq -s -n` defers every failure, a last directory included.
+                && !seq_slurp_defers_failures(args)
                 && matches!(
                     failures[..reached].last(),
                     Some((_, e)) if e.kind == InputFileErrorKind::Directory { last: true }
@@ -6917,6 +6970,34 @@ fn read_inputs(
                 *open_failed = true;
                 defer_open_failures(directory, false);
                 SLURP_DIRECTORY_READ.with(|slurp| slurp.set(true));
+            } else if seq_slurp_places_failures(args) {
+                let mut failures = failures;
+                // #6604, as above: a last directory is read by the extra input a program that
+                // reads `input` asks for after the array, so it is left to that read.
+                if track_eof
+                    && matches!(
+                        failures.last(),
+                        Some((_, e)) if e.kind == InputFileErrorKind::Directory { last: true }
+                    )
+                {
+                    let directory = failures.split_off(failures.len() - 1);
+                    defer_open_failures(directory, false);
+                    SLURP_DIRECTORY_READ.with(|slurp| slurp.set(true));
+                    seq_directory_deferred = true;
+                }
+                held_open_failures = failures.into();
+            } else if seq_slurp_defers_failures(args) {
+                // #6599: under `-n` nothing prints while the stream is read: the program's `input`
+                // reads it, and a failure is for the read that reaches the file (a fault met
+                // before it stops the program first). A last directory is read by the extra
+                // `input` the array's read makes way for (#6604), as the plain slurp's is.
+                if matches!(
+                    failures.last(),
+                    Some((_, e)) if e.kind == InputFileErrorKind::Directory { last: true }
+                ) {
+                    SLURP_DIRECTORY_READ.with(|slurp| slurp.set(true));
+                }
+                defer_open_failures(failures, false);
             } else {
                 report_open_failures(&failures[..reached], open_failed);
             }
@@ -7023,12 +7104,20 @@ fn read_inputs(
     // The walk's diagnostics, kept only where `input`/`inputs` raise them ([`seq_faults_queued`]):
     // each comes out in order with the values, where a plain run prints it as a warning.
     let mut seq_fault_errors: Vec<(usize, TrailingParseError)> = Vec::new();
-    // Shared by `seq_warnings_apply` below, the `-n`-forced-read fallback
-    // just after it, and the `build_seq_values` gate further down -- one
-    // definition rather than three hand-copies of the same shape, so a
-    // future change to it can't desynchronize them (CLAUDE.md: "Duplicated
-    // predicates diverge silently").
-    let seq_stream_shape = args.seq && !args.raw_input && args.input_dsv.is_none();
+    // #6584: a last file that did not open is one more source to jq's `--seq` readers, an empty one
+    // they stand at, line 0. The walk's own `Tail` (#6588) keeps the end-of-stream drop (#2998) off
+    // the last file that opened; this source is where what is read past it is placed: the fault at
+    // the end of the text (#6531) and a value that completes only there.
+    // #6599: `-s -n` reads the same stream through the program's `input`, so the fault at the end of
+    // the text is raised there too.
+    if (seq_readers_place_reads || seq_slurp_defers_failures(args))
+        && UNOPENED_TAIL_NAME.with(|tail| tail.borrow().is_some())
+    {
+        raw_bytes.push((Some(files.len()), Vec::new()));
+    }
+    // #6589: whether jq's main loop stopped on a warning met after a file that did not open, so the
+    // slurp hands over no array.
+    let mut seq_slurp_stopped = false;
     let seq_warnings_apply = seq_stream_shape && !args.null_input && !seq_by_stream_reader;
     if seq_by_stream_reader {
         // The streaming reader finds the records and their faults itself.
@@ -7040,6 +7129,16 @@ fn read_inputs(
         seq_slurp_position_lost = match seq_no_rs_byte_warning(&raw_bytes) {
             Some(warning) => {
                 seq_warned = true;
+                if seq_slurp_places_failures(args) {
+                    // #6589: the template is the EOF branch's report, met after every file.
+                    seq_slurp_stopped =
+                        report_held_open_failures(&mut held_open_failures, usize::MAX, open_failed);
+                } else {
+                    // #6555: a stream with no record separator holds no value, so jq's reader
+                    // reads past every file before it warns at the end: each deferred failure
+                    // comes first.
+                    report_reached_open_failures(None, false);
+                }
                 eprintln!("{warning}");
                 // #1525's arm prints its own template instead of the
                 // reader's, but the location still needs the walk. A
@@ -7055,16 +7154,29 @@ fn read_inputs(
                 // #6137: a program that reads `input`/`inputs` meets each fault as an input,
                 // as under `-n`, so it is queued rather than printed here.
                 let queue_faults = seq_faults_queued(args, track_eof);
-                let walk = crate::jq_seq_reader::walk_stream_collecting(
+                let ends = crate::jq_seq_reader::source_ends(&raw_bytes);
+                let walk = crate::jq_seq_reader::walk_stream_collecting_at(
                     &raw_bytes,
                     args.slurp,
                     queue_faults,
                     crate::jq_seq_reader::Tail::of(unopened_tail),
-                    &mut |warning| {
-                        if !queue_faults {
-                            seq_warned = true;
-                            eprintln!("{warning}");
+                    &mut |warning, at| {
+                        // #6589: jq's main loop reads no further after a warning once a file has
+                        // failed to open.
+                        if queue_faults || seq_slurp_stopped {
+                            return;
                         }
+                        // The source the warning was met in: a failure before it is reported
+                        // first, as jq's reader opens the files in order.
+                        let source = if at == crate::jq_seq_reader::AT_EOF {
+                            usize::MAX
+                        } else {
+                            ends.partition_point(|&end| end <= at)
+                        };
+                        seq_slurp_stopped =
+                            report_held_open_failures(&mut held_open_failures, source, open_failed);
+                        seq_warned = true;
+                        eprintln!("{warning}");
                     },
                 );
                 seq_values = walk.values;
@@ -7094,6 +7206,15 @@ fn read_inputs(
         // `-n -s`'s `input`/`inputs` read the deferred warning too.
         seq_deferred_warning = walk.deferred_warning;
         seq_slurp_position_lost = walk.slurp_position_lost;
+    }
+
+    // #6589: what the warnings did not reach is reached at the end of the read, unless a warning
+    // stopped it first.
+    if !seq_slurp_stopped {
+        report_held_open_failures(&mut held_open_failures, usize::MAX, open_failed);
+    }
+    if seq_directory_deferred {
+        *open_failed = true;
     }
 
     // Answered here, before the UTF-8 substitution below consumes
@@ -7343,8 +7464,18 @@ fn read_inputs(
             values.extend(outside);
             value_locations.extend(outside_locations);
         }
-        for &at in &value_locations {
-            let (source, line) = stream_location(&raw_bytes, at);
+        // #6591: the fault event at the end of the text is read at a last file that did not open,
+        // line 0, as the JSON reader's fault is (#6480).
+        let fault_at_tail = !args.slurp
+            && UNOPENED_TAIL_NAME.with(|tail| tail.borrow().is_some())
+            && values.last().is_some_and(is_eof_fault_event);
+        let last = value_locations.len().saturating_sub(1);
+        for (index, &at) in value_locations.iter().enumerate() {
+            let (source, line) = if fault_at_tail && index == last {
+                (files.len(), 0)
+            } else {
+                stream_location(&raw_bytes, at)
+            };
             locations.push(source, line);
         }
         if track_eof && !args.slurp {
@@ -7549,17 +7680,6 @@ fn read_inputs(
     // filter's own `input`. jq has lost its position by then -- the call
     // that raises it closed the stream -- so it names `<unknown>`.
     let mut resumed_errors: Vec<(usize, TrailingParseError)> = seq_fault_errors;
-    // #6531: `--seq`'s reader raises its own faults, and the last one, at the end of the text, is
-    // raised at a last file that did not open, line 0, as the JSON reader's is (#6480).
-    if !args.slurp && UNOPENED_TAIL_NAME.with(|tail| tail.borrow().is_some()) {
-        if let Some((_, fault)) = resumed_errors
-            .last_mut()
-            .filter(|(_, fault)| fault.error.message.contains(" at EOF"))
-        {
-            fault.source = u32::try_from(files.len()).unwrap_or(u32::MAX);
-            fault.line = 0;
-        }
-    }
     // #6019: whether `-n -s` read a stream with a fault the resuming way (below).
     let mut resume_slurp_done = false;
     let mut trailing_error: Option<TrailingParseError> =
@@ -7586,7 +7706,29 @@ fn read_inputs(
     // against), so they also keep the per-file loop -- including when
     // combined with `-R` (`args.raw_input && args.input_dsv.is_some()`),
     // which the DSV branch inside the loop already takes over first.
-    if seq_stream_shape {
+    // #6500: a stream read through the `input` queue (every non-slurped `--seq` run, #6147) turns
+    // each record into its value when the queue is asked for it, as `-R`'s lines are. The values
+    // of the whole stream held ten times its size. What `lazy` would have to place at a last file
+    // that did not open (#6480, #6531), or defer past the array (#3201), keeps the eager route.
+    let seq_lazy = seq_stream_shape
+        && !args.slurp
+        && track_eof
+        && !any_open_failure
+        && trailing_error.is_none()
+        && UNOPENED_TAIL_NAME.with(|tail| tail.borrow().is_none())
+        && !lazy_route_forced_off();
+    if seq_lazy {
+        // The end of the stream is where an `input` that runs past it names its source (#6146).
+        locations.eof_tail = Some(seq_eof_tail(&seq_raw, &seq_values));
+        LAZY_SEQ_INPUTS.with(|slot| {
+            *slot.borrow_mut() = Some(LazySeqInputs::new(
+                seq_raw,
+                std::mem::take(&mut seq_values),
+                &seq_value_locations,
+                std::mem::take(&mut resumed_errors),
+            ));
+        });
+    } else if seq_stream_shape {
         values = build_seq_values(
             &seq_raw,
             &seq_values,
@@ -7636,6 +7778,9 @@ fn read_inputs(
         // so this is the one count made ahead of a refusal: a newline count of each file but
         // the last, on a route that already decodes every byte of each, and none at all where
         // no message can read it (`--stream`, DSV).
+        if let Some(delimiter) = args.input_dsv {
+            join_dsv_records_across_files(&mut raw_inputs, dsv_config(delimiter).quote_char);
+        }
         let last = raw_inputs.len().saturating_sub(1);
         LAZY_JSON_INPUTS.with(|slot| *slot.borrow_mut() = None);
         LAZY_RAW_INPUTS.with(|slot| *slot.borrow_mut() = None);
@@ -8037,11 +8182,21 @@ fn read_inputs(
             Some((src, line)) => locations.resolve(src, line),
             None => InputLocation::unknown(),
         };
-        let array_lost = slurped_array_lost(
-            args.seq,
-            any_open_failure,
-            seq_warned || trailing_error.as_ref().is_some_and(|t| t.seq_warning),
-        );
+        // #6589: a read that places its failures among its warnings knows whether one stopped it.
+        let array_lost = if seq_slurp_places_failures(args) {
+            seq_slurp_stopped
+        } else if seq_slurp_defers_failures(args) {
+            // #6599: no main loop reads the stream under `-n`, so no failure stops it: a fault the
+            // slurp's own call met is queued ahead of the array, and one it did not is queued
+            // behind it.
+            false
+        } else {
+            slurped_array_lost(
+                args.seq,
+                any_open_failure,
+                seq_warned || trailing_error.as_ref().is_some_and(|t| t.seq_warning),
+            )
+        };
         let slurped = if array_lost {
             Vec::new()
         } else {
@@ -8066,7 +8221,24 @@ fn read_inputs(
             ahead.extend(trailing_error.take().map(|fault| (0, fault)));
             return Ok(Ok((slurped, slurped_locations, None, ahead)));
         }
-        let slurped_locations = InputLocations::single_at_end(at, locations.unopened_tail);
+        // No array, no location: the queue of a program that reads `input` holds nothing (#6589).
+        let slurped_locations = if array_lost {
+            InputLocations::new(locations.files().to_vec())
+        } else if seq_slurp_defers_failures(args) {
+            // #6599: a fault the queue raises names the file it was met in by its index in the
+            // whole table, and a read of the array reaches the failures up to its source, so the
+            // table stays whole and the array is one entry in it, at the last source
+            // (`single_at_end` keeps only the array's own file).
+            let (src, line) = locations
+                .slurp_eof(slurp_eof_line)
+                .unwrap_or((0, UNKNOWN_LINE));
+            let mut slurped = InputLocations::new(locations.files().to_vec());
+            slurped.unopened_tail = locations.unopened_tail;
+            slurped.push(src as usize, line as usize);
+            slurped
+        } else {
+            InputLocations::single_at_end(at, locations.unopened_tail)
+        };
         Ok(Ok((
             slurped,
             slurped_locations,
@@ -8147,6 +8319,16 @@ fn seq_fault_errors_of(
         .collect()
 }
 
+/// Whether `value` is the `--stream-errors` event of a parse error at the end of the text: the
+/// `[message, path]` a path event (`[[...], leaf]`) is told from by its string first element.
+fn is_eof_fault_event(value: &OwnedValue) -> bool {
+    value
+        .as_array()
+        .and_then(|event| event.first())
+        .and_then(OwnedValue::as_str)
+        .is_some_and(|message| message.contains(" at EOF"))
+}
+
 /// Whether a plain `--stream` walk (#5498) is read by the stream reader through the input queue:
 /// a program with no `-n` and no `-s`, over JSON documents. Under `-n` the program asks for its
 /// inputs itself, and `-s` holds the whole array.
@@ -8183,11 +8365,55 @@ fn seq_by_stream_reader(args: &JqCommand) -> bool {
     args.seq && !args.raw_input && args.input_dsv.is_none() && (args.stream || args.stream_errors)
 }
 
+/// Whether a `--seq -s` read reports its open failures among the reader's warnings (#6589), as
+/// jq's reader reaches each file: a stream read as JSON texts by the record reader, outside `-n`
+/// (where the program's `input` reads the stream). jq's main loop reads the whole slurp in its
+/// first call, and stops at the first warning it meets once a file has failed to open: the array
+/// is then lost, and nothing after that warning is read or reported.
+fn seq_slurp_places_failures(args: &JqCommand) -> bool {
+    args.seq
+        && args.slurp
+        && !args.null_input
+        && !args.raw_input
+        && args.input_dsv.is_none()
+        && !seq_by_stream_reader(args)
+}
+
+/// Whether a `--seq -s -n` read leaves its open failures to the reads of the program's `input`
+/// (#6599), as [`defer_open_failures`] does for the non-slurp queue (#6475): the same stream as
+/// [`seq_slurp_places_failures`] reads, under `-n`.
+fn seq_slurp_defers_failures(args: &JqCommand) -> bool {
+    args.seq
+        && args.slurp
+        && args.null_input
+        && !args.raw_input
+        && args.input_dsv.is_none()
+        && !seq_by_stream_reader(args)
+}
+
+/// Reports the held open failures of [`seq_slurp_places_failures`] that sit before the opened
+/// source `source` (`usize::MAX` for the end of the stream), and answers whether any failure has
+/// been reported by now, so that a warning met there stops jq's main loop.
+fn report_held_open_failures(
+    held: &mut std::collections::VecDeque<(usize, InputFileOpenError)>,
+    source: usize,
+    open_failed: &mut bool,
+) -> bool {
+    while held.front().is_some_and(|&(at, _)| at <= source) {
+        if let Some((_, failure)) = held.pop_front() {
+            report_unopenable_input(&failure, open_failed);
+        }
+    }
+    *open_failed
+}
+
 /// Whether a `--seq` slurp has no array to print (#6481): jq's main loop reads no further once a
 /// file has failed to open, and a stream that holds a fault has the fault, not the array, in its
 /// last call, so with a file that did not open the warning is all there is and the run exits 2.
 /// `seq_slurp` says the run is one that reads the stream whole, `faulted` that it holds a fault.
-/// One definition for the two routes that read a `--seq` stream.
+/// One definition for the two routes that read a `--seq` stream. The record reader's plain `-s`
+/// route places each failure among its warnings instead, and so knows where the loop stopped
+/// ([`seq_slurp_places_failures`], #6589).
 fn slurped_array_lost(seq_slurp: bool, any_open_failure: bool, faulted: bool) -> bool {
     seq_slurp && any_open_failure && faulted
 }
@@ -9014,7 +9240,8 @@ fn defer_open_failures(failures: Vec<(usize, InputFileOpenError)>, fault_ends_te
 /// where a JSON stream's is and nothing else comes out of the input queue. That holds for
 /// `--stream` and `--stream-errors` too, whose events of a clean record stream are placed as their
 /// values'. A slurp reads every file before the program runs, so this is asked only of a run
-/// without `-s`.
+/// without `-s`. Since #6584 it decides only a run whose last failure is not a source of its own
+/// (a directory), the rest being placed by `seq_readers_place_reads`.
 fn seq_text_reads_clean(raws: &[Vec<u8>], unopened_tail: bool) -> bool {
     let sources: Vec<(Option<usize>, Vec<u8>)> = raws
         .iter()
@@ -9106,13 +9333,54 @@ fn first_value_completes_in(raw: &[u8], args: &JqCommand) -> bool {
 }
 
 /// [`first_value_completes_in`] for the file at `at` of `raws`, and for `--stream-errors`, whose
-/// text is whole JSON that ends where a value does: its first event is complete however it is read.
+/// first event is complete inside the file when the next file's bytes cannot change it (#6591),
+/// whatever follows it in the file: `[1,` is complete, `[1` is not.
+///
+/// That holds only when the files before it leave the parser between tokens
+/// ([`text_ends_between_tokens`]). One that ends inside a string, a number or a literal hands its
+/// token on, so the first event is made of its end and this file's start, and this file alone
+/// cannot say whether it is complete: it is judged as a clean whole, as it was before.
 fn first_value_completes_at(raws: &[Vec<u8>], at: usize, args: &JqCommand) -> bool {
     if args.stream_errors && !args.seq {
-        source_ends_cleanly(&raws[at], args) && first_stream_fault(&raws[at..=at]).is_none()
+        let raw = &raws[at][..];
+        if !text_ends_between_tokens(&raws[..at]) {
+            return source_ends_cleanly(raw, args) && first_stream_fault(&raws[at..=at]).is_none();
+        }
+        // jq skips a byte-order mark at the front of its input: of the first file with bytes.
+        let bom = if raws[..at].iter().all(Vec::is_empty) {
+            crate::front_matter::leading_bom_len(raw)
+        } else {
+            0
+        };
+        crate::jq_stream_errors::first_event_completes_in(&raw[bom..])
     } else {
         first_value_completes_in(&raws[at], args)
     }
+}
+
+/// Whether the text the files `raws` make ends between JSON tokens (#6591): outside a string, and
+/// not on a byte a number or a literal goes on with. The next file then starts a token of its own.
+/// One pass over the bytes, tracking only quotes and backslashes.
+fn text_ends_between_tokens(raws: &[Vec<u8>]) -> bool {
+    let (mut in_string, mut escaped) = (false, false);
+    for &byte in raws.iter().flatten() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+        } else if byte == b'"' {
+            in_string = true;
+        }
+    }
+    let last = raws.iter().rev().find_map(|raw| raw.last());
+    !in_string
+        && last.map_or(true, |&byte| {
+            !(byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+        })
 }
 
 /// The file jq's parser is reading when it meets the first fault of the text the files `raws`
@@ -11784,7 +12052,17 @@ fn seed_input_queue(
     trailing_error: Option<TrailingParseError>,
     resumed_errors: Vec<(usize, TrailingParseError)>,
 ) {
-    if let Some(files) = LAZY_RAW_INPUTS.with(|slot| slot.borrow_mut().take()) {
+    if let Some(lazy) = LAZY_SEQ_INPUTS.with(|slot| slot.borrow_mut().take()) {
+        // #6500: a `--seq` stream's records, converted as the program reads them, with the
+        // reader's faults between them. `inputs` is empty and the faults are in `lazy`.
+        debug_assert!(inputs.is_empty() && trailing_error.is_none() && resumed_errors.is_empty());
+        debug_assert!(
+            locations.unopened_end().is_none(),
+            "a missing last file takes the eager route"
+        );
+        jq::seed_remaining_inputs_from(lazy.into_producer(locations.exhausted(slurp)));
+        locations.count_reads_past_end(slurp);
+    } else if let Some(files) = LAZY_RAW_INPUTS.with(|slot| slot.borrow_mut().take()) {
         // #5857: `-R`'s lines, converted as the program reads them. There is no parse error to
         // queue behind them, and `inputs` is empty.
         debug_assert!(inputs.is_empty() && trailing_error.is_none() && resumed_errors.is_empty());
@@ -11931,6 +12209,101 @@ impl Iterator for LazyTail {
     }
 }
 
+/// A `--seq` stream's records, converted as the program reads them (#6500).
+///
+/// The walk of [`crate::jq_seq_reader`] has already found every record's bytes, its place, and the
+/// faults between the records, so nothing here is parsed again to decide anything: a record is
+/// turned into its value when the queue asks for it, and the value is dropped once the program has
+/// read it. The eager route built every record's value before the program ran, which held about
+/// ten times the stream (1.1 GB at 100 MB) and spent 40% of the run before the first output.
+struct LazySeqInputs {
+    /// The sources' bytes as one stream, which a record's range indexes.
+    combined: Vec<u8>,
+    /// [`first_invalid_utf8`] of `combined`.
+    first_invalid: usize,
+    /// Each record's `(start, end)` in `combined`.
+    ranges: Vec<(usize, usize)>,
+    /// `(source tag, line)` of every record, as jq's reader stood when it yielded it.
+    places: Vec<(u32, u32)>,
+    /// The reader's faults, each with how many records come before it.
+    errors: std::iter::Peekable<std::vec::IntoIter<(usize, TrailingParseError)>>,
+    /// The record [`LazySeqInputs::next`] reads next.
+    next: usize,
+}
+
+impl LazySeqInputs {
+    /// The stream `sources` make, with the records the walk found in it (`ranges`, and each one's
+    /// `(source index, line)` in `value_locations`) and the faults between them.
+    fn new(
+        mut sources: Vec<(Option<usize>, Vec<u8>)>,
+        ranges: Vec<(usize, usize)>,
+        value_locations: &[(usize, usize)],
+        errors: Vec<(usize, TrailingParseError)>,
+    ) -> Self {
+        debug_assert_eq!(value_locations.len(), ranges.len(), "one place per record");
+        let places = value_locations
+            .iter()
+            .map(|&(source, line)| {
+                (
+                    u32::try_from(sources[source].0.unwrap_or(0)).unwrap_or(u32::MAX),
+                    u32::try_from(line).unwrap_or(u32::MAX),
+                )
+            })
+            .collect();
+        // One source (stdin, or a single file) is the stream as it is; only a multi-file stream,
+        // whose records can span a boundary, is copied into one buffer (as `build_seq_values`).
+        let combined = if sources.len() == 1 {
+            sources.pop().map(|(_, raw)| raw).unwrap_or_default()
+        } else {
+            let mut all = Vec::with_capacity(sources.iter().map(|(_, raw)| raw.len()).sum());
+            for (_, raw) in &sources {
+                all.extend_from_slice(raw);
+            }
+            all
+        };
+        Self {
+            first_invalid: first_invalid_utf8(&combined),
+            combined,
+            ranges,
+            places,
+            errors: errors.into_iter().peekable(),
+            next: 0,
+        }
+    }
+
+    /// The next record or fault, or `None` once both are all out. A fault comes ahead of the record
+    /// its count names, and the faults after the last record come last, as the queue the eager
+    /// route builds orders them ([`LazyTail`] does the same for a lazy JSON stream).
+    fn next(&mut self) -> Option<jq::ProducedInput> {
+        loop {
+            let error_next = self
+                .errors
+                .peek()
+                .is_some_and(|&(before, _)| before <= self.next || self.next >= self.ranges.len());
+            if error_next {
+                // As a plain error: jq's `try input catch .` catches a parse error like any
+                // other, where the materializer's own error is tagged as an uncatchable decode
+                // failure.
+                return self.errors.next().map(|(_, t)| {
+                    jq::ProducedInput::Error(EvalError::new(t.error.message), (t.source, t.line))
+                });
+            }
+            let &(start, end) = self.ranges.get(self.next)?;
+            let (source, line) = self.places[self.next];
+            self.next += 1;
+            // A record the checked materializer refuses is dropped, with its place.
+            if let Some(value) = seq_record_value(&self.combined, self.first_invalid, start, end) {
+                return Some(jq::ProducedInput::Document(value, source, line));
+            }
+        }
+    }
+
+    /// The producer the `input` queue pulls the stream from; `exhausted` is where its end is read.
+    fn into_producer(mut self, exhausted: Option<(u32, u32)>) -> jq::InputProducer {
+        Box::new(move || self.next().unwrap_or(jq::ProducedInput::End(exhausted)))
+    }
+}
+
 /// `--stream` and `--stream-errors` inputs read as the program asks for them (#5498): jq's streaming parser over
 /// the sources' bytes, and what its source indices mean.
 struct LazyStreamInputs {
@@ -12000,6 +12373,10 @@ thread_local! {
     /// Set by [`get_inputs`] for `-R` (#5857): each file's source tag and text, in order, which the
     /// call site that seeds the `input` queue takes.
     static LAZY_RAW_INPUTS: std::cell::RefCell<Option<Vec<(u32, String)>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Set by [`get_inputs`] for a `--seq` stream (#6500): its records, converted as the program
+    /// reads them, which the call site that seeds the `input` queue takes.
+    static LAZY_SEQ_INPUTS: std::cell::RefCell<Option<LazySeqInputs>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -12622,9 +12999,9 @@ enum SlurpFailure {
     /// when its parser stops there too.
     Unsplittable(Option<String>),
     /// jq's parse-depth limit refuses the document the splitter gave up on, before the fault it
-    /// stopped at (#5497). Reported as jq's parse error, without the position, as every depth
-    /// refusal under `--slurp` is.
-    DepthLimit,
+    /// stopped at (#5497). Carries jq's own parse error for it, with the position of the bracket
+    /// it refuses (#6628), when the stream can be read again to place it.
+    DepthLimit(Option<String>),
 }
 
 /// What [`slurp_documents`] hands the lazy per-document loop (#2847).
@@ -12639,6 +13016,16 @@ struct SlurpedInput {
     /// The parse error jq raises after the slurped array when the stream ends in a bare token
     /// straight before one last opener (#6004): the array holds the token, the error follows it.
     fault: Option<String>,
+}
+
+/// The bytes of the regular file `path`, read again, or `None` when it cannot be (#6628): a named
+/// pipe, a socket or a device gives its bytes once, and opening it again waits for a writer that is
+/// not coming. A message that needs the re-read is then left as the run found it.
+fn read_again(path: &Path) -> Option<Vec<u8>> {
+    std::fs::metadata(path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .and_then(|_| std::fs::read(path).ok())
 }
 
 /// jq's parse error for a `--slurp` stream the splitter gave up on in `raw`, file `idx` of `files`
@@ -12658,11 +13045,7 @@ fn slurp_fault(
         files
             .iter()
             // A `-` is stdin, which cannot be read again (and not a file of that name).
-            .map(|path| {
-                (!is_stdin_dash(path))
-                    .then(|| std::fs::read(path).ok())
-                    .flatten()
-            })
+            .map(|path| (!is_stdin_dash(path)).then(|| read_again(path)).flatten())
             .collect()
     });
     match earlier {
@@ -12686,11 +13069,11 @@ fn reread_stream_fault(files: &[PathBuf]) -> Option<String> {
     let mut at_front = true;
     let chunks = files.iter().map_while(|path| {
         match if is_stdin_dash(path) {
-            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            None
         } else {
-            std::fs::read(path)
+            read_again(path)
         } {
-            Ok(mut raw) => {
+            Some(mut raw) => {
                 // The bytes as read, not as substituted: jq's parser counts those (#5964).
                 if at_front && !raw.is_empty() {
                     at_front = false;
@@ -12698,7 +13081,7 @@ fn reread_stream_fault(files: &[PathBuf]) -> Option<String> {
                 }
                 Some(raw)
             }
-            Err(_) => {
+            None => {
                 unreadable = true;
                 None
             }
@@ -12750,14 +13133,18 @@ fn slurp_documents(
         }
         let (spans, split_error) = split_json_values(&raw);
         if let Some(offset) = split_error {
-            // #5497: jq meets its depth limit first when the refused bracket comes first.
-            if jq::jq_depth_fault_offset(&raw[offset..]).is_some() {
-                return Err(SlurpFailure::DepthLimit);
-            }
             let read = originals
                 .get(idx)
                 .and_then(Option::as_deref)
                 .unwrap_or(&raw);
+            // #5497: jq meets its depth limit first when the refused bracket comes first.
+            if jq::jq_depth_fault_offset(&raw[offset..]).is_some() {
+                // #6628: and names where its parser stood, as the stream route does. The first
+                // fault of the stream is the one jq meets, an earlier one included.
+                return Err(SlurpFailure::DepthLimit(slurp_fault(
+                    files, idx, read, origin,
+                )));
+            }
             let message = slurp_fault(files, idx, read, origin);
             // #6004: a bare token straight before the stream's last byte, an opener, is a value
             // by the time jq meets the fault: the array keeps it and the error follows.
@@ -12870,8 +13257,20 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
         anyhow::bail!("Invalid JSON: empty text");
     }
 
-    validate::validate_jq_lenient(s.as_bytes())
+    // #6637: containers may nest as deep as jq's parse-depth ceiling, not the validator's default
+    // of 128 (as `fromjson` reads them, #5688). jq counts an object as two entries of that
+    // ceiling, so a text past the old default is also put to jq's own count.
+    let mut validator = validate::Validator::new(s.as_bytes())
+        .jq_lenient()
+        .with_max_depth(jq::JQ_MAX_PARSING_DEPTH);
+    validator
+        .validate()
         .map_err(|e| anyhow::anyhow!("Invalid JSON: {s}: {e}"))?;
+    if validator.deepest() > jq::JQ_MAX_PARSING_DEPTH / 2
+        && jq::jq_depth_fault_offset(s.as_bytes()).is_some()
+    {
+        anyhow::bail!("Invalid JSON: {s}: Exceeds depth limit for parsing");
+    }
     // #2295: the checked materializer, not the bare panicking one -- `s` is
     // genuinely external text, and the depth guard has to be this call's
     // own rather than an incidental by-product of whatever validated it.
@@ -13363,33 +13762,46 @@ fn remap_ends_to_locations<S: AsRef<[u8]>>(
 ///
 /// [`jq_seq_reader::walk_stream`]: crate::jq_seq_reader::walk_stream
 fn seq_values_with_indices(combined: &[u8], ranges: &[(usize, usize)]) -> Vec<(OwnedValue, usize)> {
-    // One pass over the whole stream. Almost every stream is valid, and then
-    // no value needs a check of its own; otherwise only a value reaching
-    // past the first invalid byte can hold one.
-    let first_invalid = succinctly::text::utf8::validate_utf8(combined)
-        .err()
-        .map_or(usize::MAX, |e| e.offset);
+    let first_invalid = first_invalid_utf8(combined);
     ranges
         .iter()
         .enumerate()
         .filter_map(|(index, &(start, end))| {
-            let raw = &combined[start..end];
-            let substituted;
-            let bytes =
-                if end <= first_invalid || succinctly::text::utf8::validate_utf8(raw).is_ok() {
-                    raw
-                } else {
-                    substituted =
-                        succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(raw);
-                    substituted.as_bytes()
-                };
-            // #2295: the sequence reader already checks the grammar, but
-            // retain the checked materializer as defense in depth.
-            json_bytes_to_owned_value_checked(bytes)
-                .ok()
-                .map(|value| (value, index))
+            seq_record_value(combined, first_invalid, start, end).map(|value| (value, index))
         })
         .collect()
+}
+
+/// Where the first invalid UTF-8 byte of a `--seq` stream is, `usize::MAX` for a valid one.
+/// One pass over the whole stream: almost every stream is valid, and then no record needs a
+/// check of its own; otherwise only a record reaching past it can hold one.
+fn first_invalid_utf8(combined: &[u8]) -> usize {
+    succinctly::text::utf8::validate_utf8(combined)
+        .err()
+        .map_or(usize::MAX, |e| e.offset)
+}
+
+/// The value of the record at `start..end` of the `--seq` stream `combined`, for
+/// [`seq_values_with_indices`] and [`LazySeqInputs`] (#6500), which must agree on every record.
+/// `first_invalid` is [`first_invalid_utf8`] of the stream. `None` for a record the checked
+/// materializer refuses, which both routes drop.
+fn seq_record_value(
+    combined: &[u8],
+    first_invalid: usize,
+    start: usize,
+    end: usize,
+) -> Option<OwnedValue> {
+    let raw = &combined[start..end];
+    let substituted;
+    let bytes = if end <= first_invalid || succinctly::text::utf8::validate_utf8(raw).is_ok() {
+        raw
+    } else {
+        substituted = succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(raw);
+        substituted.as_bytes()
+    };
+    // #2295: the sequence reader already checks the grammar, but retain the checked
+    // materializer as defense in depth.
+    json_bytes_to_owned_value_checked(bytes).ok()
 }
 
 /// Real jq's own stderr warning ("`jq: ignoring parse error: ...`") for a
@@ -13487,12 +13899,86 @@ fn validate_dsv_delimiter(delimiter: char) -> Result<()> {
     }
 }
 
+/// A file's text, as the two `--input-dsv` routes hold it: bytes, or a decoded string with the
+/// index of the file it came from (#6601).
+trait DsvSource: Sized {
+    fn bytes(&self) -> &[u8];
+    /// Takes the text from `at` on out of `self`.
+    fn split_off_at(&mut self, at: usize) -> Self;
+    /// Puts `head` in front of `self`.
+    fn prepend(&mut self, head: Self);
+}
+
+impl DsvSource for Vec<u8> {
+    fn bytes(&self) -> &[u8] {
+        self
+    }
+    fn split_off_at(&mut self, at: usize) -> Self {
+        self.split_off(at)
+    }
+    fn prepend(&mut self, mut head: Self) {
+        head.append(self);
+        *self = head;
+    }
+}
+
+impl DsvSource for (Option<usize>, String) {
+    fn bytes(&self) -> &[u8] {
+        self.1.as_bytes()
+    }
+    fn split_off_at(&mut self, at: usize) -> Self {
+        (self.0, self.1.split_off(at))
+    }
+    fn prepend(&mut self, head: Self) {
+        self.1.insert_str(0, &head.1);
+    }
+}
+
+/// The configuration every `--input-dsv` reader indexes and parses with, and the join across files
+/// (#6601) reads its quote byte from, so they cannot disagree about which byte toggles a quote.
+fn dsv_config(delimiter: char) -> DsvConfig {
+    DsvConfig::default().with_delimiter(delimiter as u8)
+}
+
+/// Where the record a text ends inside starts, when it ends inside a quoted field (#6601): every
+/// quote byte toggles the state the DSV index tracks, so the text ends inside a quote exactly when
+/// it holds an odd number of them. `None` for a text whose last record is complete.
+fn open_dsv_record_start(text: &[u8], quote: u8) -> Option<usize> {
+    if text.iter().filter(|&&byte| byte == quote).count() % 2 == 0 {
+        return None;
+    }
+    let (mut quoted, mut start) = (false, 0);
+    for (at, &byte) in text.iter().enumerate() {
+        if byte == quote {
+            quoted = !quoted;
+        } else if byte == b'\n' && !quoted {
+            start = at + 1;
+        }
+    }
+    Some(start)
+}
+
+/// Reads the files `--input-dsv` is given as one stream of records, as jq reads its files (and as
+/// `-R` joins a line to the next file's): a record whose quoted field runs past the end of its file
+/// continues in the next file that opened, and is read, and named, there (#6601). A last record
+/// with no newline stays its own row: only a quote that is still open joins, as one would in a
+/// single file. The common run, of one file or of files that end on a record, pays a count of each
+/// earlier file's quote bytes and no copy; a spanning record copies the next file once.
+fn join_dsv_records_across_files<T: DsvSource>(sources: &mut [T], quote: u8) {
+    for at in 1..sources.len() {
+        if let Some(start) = open_dsv_record_start(sources[at - 1].bytes(), quote) {
+            let open = sources[at - 1].split_off_at(start);
+            sources[at].prepend(open);
+        }
+    }
+}
+
 /// Parse DSV (delimiter-separated values) input into JSON arrays.
 /// Each row becomes a JSON array of strings.
 fn parse_dsv_input(s: &str, delimiter: char) -> Vec<OwnedValue> {
-    use succinctly::dsv::{Dsv, DsvConfig};
+    use succinctly::dsv::Dsv;
 
-    let config = DsvConfig::default().with_delimiter(delimiter as u8);
+    let config = dsv_config(delimiter);
 
     let dsv = Dsv::parse_with_config(s.as_bytes(), &config);
     let mut values = Vec::with_capacity(dsv.row_count());
@@ -15676,9 +16162,11 @@ fn validate_json_delimiters<W: Clone + AsRef<[u64]>>(
     // instead of routing through `print_json`), reusing each child's
     // already-resolved `text_position()` via `value_at` (see `scalar_end_pos`'s
     // own doc comment) the same way `check_preceding_delimiter` does.
+    // #6618: jq's ceiling counts containers, not the scalar a deepest container holds, so a
+    // record 256 containers deep is accepted and one 257 deep is refused: the check is each
+    // container's, at the depth it opens.
     match cursor.value() {
         StandardJson::Array(elements) => {
-            // A container is held to the ceiling, a scalar is not (#6618).
             check_nesting_depth(depth)?;
             let mut saw_any = false;
             let mut last_child = None;
@@ -17232,6 +17720,151 @@ mod tests {
         }
         LAZY_CHUNK_BYTES.with(|c| c.set(None));
         (seen, lazy_documents)
+    }
+
+    /// What a `--seq` run holds for `files` (written under `dir`, in order) after [`get_inputs`]:
+    /// whether the records are left to be converted as the queue is read ([`LAZY_SEQ_INPUTS`]), how
+    /// many values were built up front, and everything the queue pops (every document and
+    /// parse error, with the `(at ...)` marker after each, through and past the end, #4303).
+    /// `lazy_off` is the eager route, the reference the lazy one is held to.
+    fn observe_seq(
+        dir: &std::path::Path,
+        files: &[&[u8]],
+        flags: &[&str],
+        lazy_off: bool,
+    ) -> (bool, usize, Vec<String>) {
+        use clap::Parser;
+
+        let mut argv = vec!["jq".to_string(), "--seq".to_string()];
+        argv.extend(flags.iter().map(|&flag| flag.to_owned()));
+        argv.push(if flags.contains(&"-n") { "inputs" } else { "." }.to_string());
+        for (index, bytes) in files.iter().enumerate() {
+            let path = dir.join(format!("seq{index}.json"));
+            std::fs::write(&path, bytes).unwrap();
+            argv.push(path.to_string_lossy().into_owned());
+        }
+        let cmd = JqCommand::try_parse_from(argv).unwrap();
+        LAZY_ROUTE_OFF.with(|f| f.set(lazy_off));
+        let (mut open_failed, mut opened) = (false, Vec::new());
+        // The run's own reading: every non-slurped `--seq` run reads through the queue (#6147).
+        let read = get_inputs(&cmd, true, true, &mut open_failed, &mut opened);
+        LAZY_ROUTE_OFF.with(|f| f.set(false));
+        let (inputs, locations, trailing, resumed) = read.expect("no exit code").expect("reads");
+        let lazy = LAZY_SEQ_INPUTS.with(|slot| slot.borrow().is_some());
+        let built = inputs.len();
+        seed_input_queue(cmd.slurp, inputs, &locations, trailing, resumed);
+        let mut seen = Vec::new();
+        loop {
+            let popped = match jq::pop_input() {
+                jq::InputPop::Document(v) => format!("doc {v:?}"),
+                jq::InputPop::ParseError(e) => format!("error {}", e.message),
+                jq::InputPop::Exhausted => "end".to_string(),
+            };
+            seen.push(format!("{popped} at {:?}", jq::current_input_location()));
+            if popped == "end"
+                && seen
+                    .iter()
+                    .rev()
+                    .take_while(|s| s.starts_with("end"))
+                    .count()
+                    > 2
+            {
+                break;
+            }
+        }
+        (lazy, built, seen)
+    }
+
+    /// #6500: a `--seq` stream read through the queue converts each record when the queue is read,
+    /// and the queue hands out what the eager route's does: every record, the reader's faults in
+    /// order with them, and the `(at ...)` marker after each, through and past the end. Every
+    /// stream of up to three pieces drawn from the shapes the walk tells apart (valid records,
+    /// faults of each wording, a byte that is not UTF-8, a record with no newline, a record cut at
+    /// the end), as `-n inputs` and as the plain run, over one file and over two with a record
+    /// across their boundary. The pin can fail: it does with the faults ordered after the records,
+    /// with a dropped record's place kept, and with the substitution of a byte that is not UTF-8
+    /// left out.
+    #[test]
+    fn a_seq_stream_converts_its_records_as_the_queue_is_read_6500() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pieces: [&[u8]; 9] = [
+            b"\x1e{\"a\":1}\n",
+            b"\x1e[1,\n",
+            b"\x1e\"\xff\"\n",
+            b"\x1e\"\xc3\"\n",
+            b"\x1e12",
+            b"\x1e}\n",
+            b"\x1e1 2\n",
+            b"xyz\n",
+            b"\x1e\"cut",
+        ];
+        let mut streams: Vec<Vec<u8>> = Vec::new();
+        for a in pieces {
+            streams.push(a.to_vec());
+            for b in pieces {
+                streams.push([a, b].concat());
+                for c in pieces {
+                    streams.push([a, b, c].concat());
+                }
+            }
+        }
+        let mut lazy_runs = 0;
+        for stream in &streams {
+            for flags in [&["-n"][..], &[][..]] {
+                let (lazy, built, seen) = observe_seq(dir.path(), &[stream], flags, false);
+                let (eager_lazy, _, eager_seen) = observe_seq(dir.path(), &[stream], flags, true);
+                assert!(!eager_lazy, "the reference must be eager");
+                assert_eq!(
+                    seen,
+                    eager_seen,
+                    "{flags:?} {:?}",
+                    String::from_utf8_lossy(stream)
+                );
+                assert!(!lazy || built == 0, "a lazy route builds no value up front");
+                lazy_runs += usize::from(lazy);
+            }
+        }
+        assert!(
+            lazy_runs > streams.len(),
+            "the lazy route must be the one tested"
+        );
+        // A record across the boundary of two files.
+        let (lazy, _, seen) =
+            observe_seq(dir.path(), &[b"\x1e{\"a\":", b"1}\n\x1e[1,\n"], &[], false);
+        let (_, _, eager) = observe_seq(dir.path(), &[b"\x1e{\"a\":", b"1}\n\x1e[1,\n"], &[], true);
+        assert!(lazy);
+        assert_eq!(seen, eager);
+        assert!(seen[0].starts_with("doc "), "{seen:?}");
+    }
+
+    /// #6500: what the lazy route leaves to the eager one: a slurp (one array of every record), and
+    /// a last file that did not open (its position is placed at the unopened file, #6480).
+    #[test]
+    fn a_seq_stream_the_lazy_route_cannot_place_is_read_eagerly_6500() {
+        use clap::Parser;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (lazy, built, _) = observe_seq(dir.path(), &[b"\x1e1\n\x1e[1,\n"], &["-s"], false);
+        assert!(!lazy && built == 1, "a slurp builds its array: {built}");
+        let (lazy, _, _) = observe_seq(dir.path(), &[b"\x1e1\n\x1e[1,\n"], &[], false);
+        assert!(lazy);
+        // A last file that did not open.
+        let file = dir.path().join("present.seq");
+        std::fs::write(&file, b"\x1e1\n\x1e[1,\n").unwrap();
+        let missing = dir.path().join("missing.seq");
+        let cmd = JqCommand::try_parse_from([
+            "jq".to_string(),
+            "--seq".to_string(),
+            ".".to_string(),
+            file.to_string_lossy().into_owned(),
+            missing.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let (mut open_failed, mut opened) = (false, Vec::new());
+        let read = get_inputs(&cmd, false, true, &mut open_failed, &mut opened);
+        let (inputs, ..) = read.expect("no exit code").expect("reads");
+        assert!(LAZY_SEQ_INPUTS.with(|slot| slot.borrow().is_none()));
+        assert_eq!(inputs.len(), 1);
     }
 
     /// #6451: a lone source started on the front of it reads as one read whole: every document and
@@ -20146,6 +20779,29 @@ mod tests {
     /// #5576: a slurped stream's fault is read again from its files, a file at a time, as the
     /// default route reads them; a file that cannot be read again leaves the evaluator's wording.
     #[test]
+    fn read_again_reads_regular_files_only_6628() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("f.json");
+        std::fs::File::create(&file)
+            .and_then(|mut f| f.write_all(b"[1]\n"))
+            .expect("write");
+        assert_eq!(read_again(&file).as_deref(), Some(&b"[1]\n"[..]));
+        // A directory, a file that is not there, and a named pipe, which would wait for a writer
+        // that is not coming, are none of them read again.
+        assert_eq!(read_again(dir.path()), None);
+        assert_eq!(read_again(&dir.path().join("gone.json")), None);
+        #[cfg(unix)]
+        {
+            let fifo = dir.path().join("pipe");
+            let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+            if made.is_ok_and(|status| status.success()) {
+                assert_eq!(read_again(&fifo), None);
+            }
+        }
+    }
+
+    #[test]
     fn reread_stream_fault_reads_the_files_as_one_stream_5576() {
         use std::io::Write;
         let file = |body: &[u8]| {
@@ -20823,7 +21479,7 @@ mod tests {
                 )),
                 Err(f) => Err(match f {
                     SlurpFailure::Unsplittable(_) => "unsplittable",
-                    SlurpFailure::DepthLimit => "depth",
+                    SlurpFailure::DepthLimit(_) => "depth",
                     SlurpFailure::Validation(_) => "validation",
                 }),
             }

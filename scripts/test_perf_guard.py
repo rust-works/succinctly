@@ -179,6 +179,104 @@ class CensusRowTests(unittest.TestCase):
             self.assertEqual(a.read(), b.read())
 
 
+class NewPatternRowTests(unittest.TestCase):
+    """#6619: a PR that adds a generator pattern and a guard row over it is compared with its
+    merge-base build, which cannot generate that fixture. The row is new in the PR: reported, not
+    compared, and nothing else about the comparison changes."""
+
+    CLAP = "error: invalid value 'json-seq-bad-last' for '--pattern <PATTERN>'\n"
+
+    def test_only_the_unknown_pattern_error_counts_as_unknown(self):
+        self.assertTrue(perf_guard.pattern_is_unknown(self.CLAP, "json-seq-bad-last"))
+        self.assertFalse(perf_guard.pattern_is_unknown(self.CLAP, "users"))
+        self.assertFalse(perf_guard.pattern_is_unknown("error: disk full\n", "json-seq-bad-last"))
+        self.assertFalse(perf_guard.pattern_is_unknown("", "json-seq-bad-last"))
+
+    def _generate(self, returncode, stderr):
+        result = mock.Mock(returncode=returncode, stderr=stderr)
+        with mock.patch.object(perf_guard.subprocess, "run", return_value=result):
+            return perf_guard.generate_fixture_if_known(
+                "bin", "json-seq-bad-last", "2mb", 1, "out.json"
+            )
+
+    def test_a_baseline_that_does_not_know_the_pattern_is_skipped(self):
+        self.assertFalse(self._generate(2, self.CLAP))
+
+    def test_a_baseline_that_generates_it_is_used(self):
+        self.assertTrue(self._generate(0, ""))
+
+    def test_any_other_generation_failure_is_still_fatal(self):
+        with self.assertRaises(SystemExit):
+            self._generate(1, "error: disk full\n")
+
+    def test_the_binary_under_test_must_know_every_pattern(self):
+        result = mock.Mock(returncode=2, stderr=self.CLAP)
+        with mock.patch.object(perf_guard.subprocess, "run", return_value=result):
+            with self.assertRaises(SystemExit):
+                perf_guard.generate_fixture("bin", "json-seq-bad-last", "2mb", 1, "out.json")
+
+    def test_measure_all_leaves_out_the_row_a_baseline_cannot_generate(self):
+        measured_filters = []
+
+        def fake_known(binary, pattern, size, seed, out_path):
+            if pattern == "json-seq-bad-last":
+                return False
+            with open(out_path, "w") as f:
+                f.write("{}")
+            return True
+
+        def fake_derive(binary, source_path, out_path):
+            with open(out_path, "w") as f:
+                f.write('{"users":[{"age":1,"score":1}]}')
+
+        def fake_measure(valgrind_bin, binary, mode, flags, filter_expr, fixture_path, reps):
+            measured_filters.append(filter_expr)
+            return 1
+
+        with contextlib.ExitStack() as stack:
+            for name, fn in {
+                "generate_fixture_if_known": fake_known,
+                "generate_compact_fixture": fake_derive,
+                "generate_lines_fixture": fake_derive,
+                "measure_query": fake_measure,
+            }.items():
+                stack.enter_context(mock.patch.object(perf_guard, name, fn))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            measured = perf_guard.measure_all("bin", "valgrind", 1, baseline_run=True)
+        self.assertNotIn("seq_name_bad_last", measured)
+        self.assertIn("wide_length", measured)
+        self.assertEqual(len(measured), len(perf_guard.QUERIES) - 1)
+
+    def _drift(self, baseline, measured):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            failed = perf_guard.report_drift(baseline, measured, 5.0)
+        return failed, out.getvalue()
+
+    def test_a_new_row_is_reported_and_not_compared(self):
+        measured = {q[0]: 100.0 for q in perf_guard.QUERIES}
+        baseline = {k: v for k, v in measured.items() if k != "seq_name_bad_last"}
+        failed, text = self._drift(baseline, measured)
+        self.assertEqual(failed, [])
+        line = next(l for l in text.splitlines() if l.startswith("seq_name_bad_last"))
+        self.assertIn("(new row)", line)
+        self.assertIn("not compared", line)
+
+    def test_every_other_row_is_still_compared_beside_a_new_one(self):
+        measured = {q[0]: 100.0 for q in perf_guard.QUERIES}
+        baseline = {k: v for k, v in measured.items() if k != "seq_name_bad_last"}
+        baseline["wide_identity"] = 80.0  # +25% now
+        failed, _ = self._drift(baseline, measured)
+        self.assertEqual([f[0] for f in failed], ["wide_identity"])
+
+    def test_the_new_rows_own_threshold_applies_once_it_has_a_baseline(self):
+        measured = {q[0]: 100.0 for q in perf_guard.QUERIES}
+        baseline = dict(measured)
+        baseline["seq_name_bad_last"] = 100.0 / 1.045  # a revert of #6594 reads about +4.5%
+        failed, _ = self._drift(baseline, measured)
+        self.assertEqual([f[0] for f in failed], ["seq_name_bad_last"])
+
+
 class MeasuredPathTests(unittest.TestCase):
     """#6153: valgrind starts every measured binary from a path of one length."""
 

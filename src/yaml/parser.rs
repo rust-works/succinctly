@@ -4747,7 +4747,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
         // Check what follows
         if self.at_line_end() {
-            self.defer_item_value_to_later_lines(indent, had_property, wrapper_bp);
+            self.defer_item_value_to_later_lines(indent, had_property, wrapper_bp, None);
             return Ok(());
         }
 
@@ -4880,12 +4880,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// `indent` is the `-`'s column, `wrapper_bp` the item wrapper's own bp. `had_property` is
     /// whether properties follow the dash on its line: an ordinary item passes it, the first item
     /// of an explicit key's sequence passes `false` (properties there are read by its own #6570
-    /// branch, so only a dash alone on its line reaches this).
+    /// branch, so only a dash alone on its line reaches this). `lines_above_dash` is how many
+    /// pending head lines were above the dash, when the caller's lookahead has already recorded
+    /// the lines below it (#6593); `None` counts them here, before this routine's own lookahead.
     fn defer_item_value_to_later_lines(
         &mut self,
         indent: usize,
         had_property: bool,
         wrapper_bp: usize,
+        lines_above_dash: Option<usize>,
     ) {
         // A trailing comment here belongs to this item's own deferred
         // value, not to the item's dash line (#784, same shape as
@@ -4920,7 +4923,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // the deferred value and belong to its first node
             // (`-\n  # c\n  - x\n` heads `.[0][0]`, measured), so only
             // the lines already pending here are this value's own head.
-            let above_dash = self.pending_head_lines.len();
+            let above_dash = lines_above_dash.unwrap_or(self.pending_head_lines.len());
             let value_is_null = self
                 .next_line_settles_value_is_null(indent)
                 .unwrap_or_else(|| self.following_value_is_null(indent));
@@ -6108,11 +6111,20 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // stays open for the main loop, and its comments are placed by the one routine
                 // an ordinary item uses.
                 if self.at_line_end() {
+                    // #6593: this lookahead records the comment lines below the dash as pending,
+                    // as the routine's own does, so the routine is told how many lines were above
+                    // the dash before it: the rest head the value's first node, not its container.
+                    let above_dash = self.pending_head_lines.len();
                     let value_is_null = self
                         .next_line_settles_value_is_null(seq_indent)
                         .unwrap_or_else(|| self.following_value_is_null(seq_indent));
                     if !value_is_null {
-                        self.defer_item_value_to_later_lines(seq_indent, false, item_wrapper_bp);
+                        self.defer_item_value_to_later_lines(
+                            seq_indent,
+                            false,
+                            item_wrapper_bp,
+                            Some(above_dash),
+                        );
                         value_on_a_later_line = true;
                     }
                 }

@@ -7277,6 +7277,7 @@ Every jq-mode document route refuses exactly those documents: the default route 
 The documents before the refused one are printed, nothing after it is read, and the run exits 5, as jq's does.
 The default route writes jq's own line, `jq: parse error: Exceeds depth limit for parsing at line L, column C`, with the line counted across files as jq reads them; `input`/`inputs` raise the same message, catchable as in jq, and name the line jq has read to.
 `--seq` and `fromjson` already applied jq's limit through their own ports of jq's parser, and `--argjson`/`--jsonargs` refuse such text too.
+They held it to the validator's 128 containers until #6637, which refused 129 to 256 nested arrays that jq reads; they now put a text deeper than 128 to jq's own count, as `fromjson` does.
 The check reads the balanced parentheses of the index each document already builds: no bracket can be refused below 129 nested containers, so a document whose parentheses never rise above 128 costs one popcount per 64 of them, and only a deeper one is read by a port of jq's parser (`jq_input_depth_fault`, `src/jq/parse_message.rs`).
 Measured on an M4 Pro (`scripts/ab-cli.py`, interleaved, 11 repetitions, `-c` with `.` and `length`, against the commit before): documents of 1 to 100 MB (records, NDJSON lines, and the structurally densest generator pattern) read within the control run's noise, medians −2.2% to +1.3% against a control of −3.4% to +0.5%.
 A 6.9 MB document 200 levels deep, the one shape that takes the walk, reads +17% to +26%; the walk costs about 0.4 ms per MB, paid only by a document deeper than 128 levels.
@@ -7284,7 +7285,9 @@ A 7950X read the ordinary rows neutral too (−4.2% to +2.4%, control −8.4% to
 
 What still differs:
 
-- Under `--slurp` the message has no `at line L, column C`: the files are joined into one array before it is indexed, so the position is gone by then.
+- Under `--slurp` the message names `at line L, column C` for input files (#6628): the files are read again as one stream, as jq's parser reads them, to place the refused bracket.
+  Standard input and a pipe (a named pipe, a process substitution) cannot be read again, so a slurp of them prints the message without the position when the refused document is otherwise well-formed.
+  A deep document that also holds a fault the splitter stops at is placed, from stdin as well.
 - jq's `--stream` uses its streaming parser, which has no depth limit, and succinctly's `--stream` does not apply jq's parse limit either.
   Except without `-s` (#5498), it still materializes each document before it streams the events, though, so it stops at the materializer's ceiling below (a document of 257 nested arrays), where jq streams on.
 - The routes that read a document into an owned value (`input`/`inputs`, `--slurpfile`, a `--seq` record) hold only a container to `MAX_NESTING_DEPTH` (256), since a scalar recurses no deeper (#6618).
@@ -14191,6 +14194,10 @@ Two residuals remain, both with a missing file *and* a feature that routes input
   A filter that uses `input`/`inputs` under `-n` reports a missing file when a read reaches it, since [#6475](https://github.com/rust-works/succinctly/issues/6475): `jq -n -c input data.json missing` prints the first value and exits 0, as in jq, because the reader never asks for the file after it.
   Without `-n`, a filter that reads `input`, `inputs` or `input_line_number` reports a missing file the same way, since [#6525](https://github.com/rust-works/succinctly/issues/6525): the main loop reads the first file before the program does and stops one value past the first failure, so `jq -c 'try input catch .' missing.json three.json m2.json` reports `missing.json` and never `m2.json`.
   A read that finds the stream at its end reports every one it has not reached, and a failure fails the run when it is reported.
+  A `--seq` stream does so whatever it holds, a fault included, since [#6584](https://github.com/rust-works/succinctly/issues/6584): its readers place each value and fault at the file jq's reader is in when it completes it.
+  A last file that did not open is one more, empty source to them, since [#6588](https://github.com/rust-works/succinctly/issues/6588): `jq --seq -n -c '[inputs]' q.seq missing` over `\x1e1\n\x1e[2]` keeps `[2]`, which the end-of-stream drop of [#2998](https://github.com/rust-works/succinctly/issues/2998) took when the missing file was not counted.
+  `--seq -s -n` does too, since [#6599](https://github.com/rust-works/succinctly/issues/6599): the program's `input` reads the stream, so `jq --seq -s -n input bad.json missing` over a record cut short in `bad.json` raises the fault at `bad.json:3` and exits 5 without ever reporting `missing`, and no failure loses the array.
+  Still up front or out of order: `--seq --stream` and `--seq --stream-errors` with several missing files at the end, or in a main loop jq cuts earlier ([#6591](https://github.com/rust-works/succinctly/issues/6591)), and a faulting `--seq` stream followed by a directory under `-n input` without `-s`, which exits 2 where jq exits 5 ([#6610](https://github.com/rust-works/succinctly/issues/6610)).
   So does the read of a fault at the end of the text, since [#6480](https://github.com/rust-works/succinctly/issues/6480): `[1,` waits for more, so jq's parser asks the reader for the next file before it raises `Unfinished JSON term at EOF` (`jq -n '[inputs]' t1.json missing` reports `missing` and exits 2, and under `try` the run still exits 2).
   Two cases still report a missing file up front: the chunked `--stream` walk, and a file whose last value is a bare number or literal with no newline after it when a file that opened comes after it (`jq -n input one.json missing two.json`, `one.json` holding `1`): that value completes only at the end of its file and so sends jq's reader on to the next one.
   A bare number or literal last in the whole input is read at a missing last file instead, which reports it at that read (#6480): `jq -n input nonl.json missing` over `1\n2` reads `1` and exits 0, because `1` completes at its newline, and `jq -n input one.json missing` reports the file before `1`, as jq does.
@@ -14200,6 +14207,12 @@ Two residuals remain, both with a missing file *and* a feature that routes input
   A line with no newline goes on into the next file that has bytes, as in jq, so a missing file between the two is reported and one after the file that ends the line is not.
   A program that reads `input`, `-n` and `-s` report every missing file when a read reaches it, or up front, as above.
   `-n` with `input_line_number` and no `input`/`inputs` opens no file, so it reports no missing one (#6464).
+* `--input-dsv` joins a quoted field that runs past the end of its file to the next file, since [#6601](https://github.com/rust-works/succinctly/issues/6601), as jq reads its files as one stream and as `-R` joins a line to the next file's.
+  `a,"b` in one file and `c",d` in the next is the one row `["a","b\nc","d"]`, as the two files joined are.
+  `input_filename` and an error in that row name the file the record ends in, where jq's reader stands when it completes the record, and its row number counts from the start of that file.
+  Only a quote that is still open joins: a last row with no newline stays its own row, where `-R` would join that line to the next file's, since many files end that way and joining them would merge two rows.
+  A record still open at the end of the last file is read as it stood.
+  jq has no DSV input to compare with, so this is a succinctly extension.
 * jq keeps the name of the last file it tried even when it did not open, so a diagnostic or `input_filename` after a missing last file names that file (`jq -s -c input_filename data.json missing` prints `"missing"`).
   `succinctly jq` does the same once a read reaches the end of the input, since [#6480](https://github.com/rust-works/succinctly/issues/6480): the missing last file is a source past the ones that opened, at line 0, so `[inputs], input_filename` under `-n`, an error after `[inputs]`, and every `-s` route name it.
   So does a last value that completes only at the end of the input, since #6480's next step: a bare number or literal in the last bytes (`jq -c '[., input_filename]' num.json missing` over `12` is `[12,"missing"]`), or the last `-R` line with no newline, is read at the missing file, line 0, and the open error is said at that read, after the values before it.

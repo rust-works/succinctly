@@ -1,16 +1,67 @@
-//! #6618: a record or document at jq's own nesting ceiling, 256 containers, is read by every route
-//! that builds its value, as jq reads it. The ceiling of the materializer counted the scalar inside
-//! the 256th container as one level more, so `--seq` (queue and `-s`), `-n input` and `--slurpfile`
-//! dropped or refused it, where one more container is jq's own refusal. Every expected string was
-//! captured from jq 1.7.1 (`/usr/bin/jq`).
+//! #6618: jq's parser counts containers against its depth ceiling, not the scalar the deepest one
+//! holds, so a document 256 containers deep is read and one 257 deep is refused. The `--seq`
+//! queue and `-s` routes, and plain `-n` with `inputs`, refused the 256 (one container short of
+//! the ceiling, the scalar counted as a level), and the queue dropped the record with no word.
+//! Every row was captured from jq 1.7.1.
 
 use anyhow::Result;
 
 use crate::run_jq_full;
 
+/// `depth` nested arrays around `1`, then a string document after it.
+fn nested(depth: usize, seq: bool) -> Vec<u8> {
+    let mut text = Vec::new();
+    if seq {
+        text.push(0x1e);
+    }
+    text.extend(std::iter::repeat(b'[').take(depth));
+    text.push(b'1');
+    text.extend(std::iter::repeat(b']').take(depth));
+    text.push(b'\n');
+    if seq {
+        text.push(0x1e);
+    }
+    text.extend_from_slice(b"\"y\"\n");
+    text
+}
+
+#[test]
+fn a_document_256_containers_deep_is_read_and_257_is_refused_6618() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let seq = dir.path().join("deep.seq");
+    let json = dir.path().join("deep.json");
+    let seq = seq.to_string_lossy().into_owned();
+    let json = json.to_string_lossy().into_owned();
+    // (flags, program, depth, stdout, stderr, status); `@FILE@` is the file the row reads.
+    for (flags, program, depth, stdout, stderr, status) in [
+        (&["--seq", "-nc"][..], "[inputs|type]", 255, "\u{1e}[\"array\",\"string\"]\n", "", 0),
+        (&["--seq", "-sc"][..], "length", 255, "\u{1e}2\n", "", 0),
+        (&["-nc"][..], "[inputs|type]", 255, "[\"array\",\"string\"]\n", "", 0),
+        (&["--seq", "-nc"][..], "[inputs|type]", 256, "\u{1e}[\"array\",\"string\"]\n", "", 0),
+        (&["--seq", "-sc"][..], "length", 256, "\u{1e}2\n", "", 0),
+        (&["-nc"][..], "[inputs|type]", 256, "[\"array\",\"string\"]\n", "", 0),
+        (&["--seq", "-nc"][..], "[inputs|type]", 257, "", "jq: error (at @FILE@:1): Exceeds depth limit for parsing at line 1, column 258 (need RS to resync)\n", 5),
+        (&["-nc"][..], "[inputs|type]", 257, "", "jq: error (at @FILE@:1): Exceeds depth limit for parsing at line 1, column 257\n", 5),
+    ] {
+        let is_seq = flags.contains(&"--seq");
+        let file = if is_seq { &seq } else { &json };
+        std::fs::write(file, nested(depth, is_seq))?;
+        let mut args = flags.to_vec();
+        args.extend([program, file.as_str()]);
+        let (out, err, code) = run_jq_full(&args, None)?;
+        let expected_err = stderr.replace("@FILE@", file);
+        assert_eq!(
+            (out.as_str(), err.as_str(), code),
+            (stdout, expected_err.as_str(), status),
+            "{flags:?} {program} at depth {depth}"
+        );
+    }
+    Ok(())
+}
+
 /// `containers` nested containers around the shape's innermost value: a scalar, an object holding
 /// one, or an empty array (which jq counts as a container, so it has no scalar to spare a level).
-fn nested(shape: &str, containers: usize) -> String {
+fn nested_shape(shape: &str, containers: usize) -> String {
     match shape {
         "scalar" => format!("{}1{}", "[".repeat(containers), "]".repeat(containers)),
         "object" => format!(
@@ -49,7 +100,7 @@ fn a_value_at_the_nesting_ceiling_is_read_as_jq_reads_it_6618() -> Result<()> {
     ];
     for (shape, containers) in ok {
         for (route, args, framed) in routes {
-            let doc = nested(shape, containers);
+            let doc = nested_shape(shape, containers);
             let input = if framed {
                 format!("{RS}{doc}\n")
             } else {
@@ -71,7 +122,7 @@ fn a_value_at_the_nesting_ceiling_is_read_as_jq_reads_it_6618() -> Result<()> {
     }
     for shape in ["scalar", "empty"] {
         for (route, args, framed) in routes {
-            let doc = nested(shape, 257);
+            let doc = nested_shape(shape, 257);
             let input = if framed {
                 format!("{RS}{doc}\n")
             } else {
@@ -106,7 +157,7 @@ fn slurpfile_reads_a_value_at_the_nesting_ceiling_6618() -> Result<()> {
     let file = dir.path().join("deep.json");
     let path = file.to_string_lossy().into_owned();
     for shape in ["scalar", "object", "empty"] {
-        std::fs::write(&file, format!("{}\n", nested(shape, 256)))?;
+        std::fs::write(&file, format!("{}\n", nested_shape(shape, 256)))?;
         let (out, err, code) = run_jq_full(&["-nc", "--slurpfile", "v", &path, "$v|length"], None)?;
         assert_eq!(
             (out.as_str(), err.as_str(), code),
@@ -114,7 +165,7 @@ fn slurpfile_reads_a_value_at_the_nesting_ceiling_6618() -> Result<()> {
             "{shape}"
         );
     }
-    std::fs::write(&file, format!("{}\n", nested("scalar", 257)))?;
+    std::fs::write(&file, format!("{}\n", nested_shape("scalar", 257)))?;
     let (out, _, code) = run_jq_full(&["-nc", "--slurpfile", "v", &path, "$v|length"], None)?;
     assert_eq!((out.as_str(), code), ("", 2));
     Ok(())
@@ -126,7 +177,7 @@ fn slurpfile_reads_a_value_at_the_nesting_ceiling_6618() -> Result<()> {
 /// change to those guards moves this row and the page with it.
 #[test]
 fn the_cursor_walk_guards_still_hold_a_scalar_at_the_ceiling_6618() -> Result<()> {
-    let doc = format!("{}\n", nested("scalar", 256));
+    let doc = format!("{}\n", nested_shape("scalar", 256));
     for filter in ["tojson|length", "input_line_number", "walk(.)|length"] {
         let (out, err, code) = run_jq_full(&["-c", filter], Some(&doc))?;
         assert_eq!(

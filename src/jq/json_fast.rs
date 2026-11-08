@@ -28,7 +28,16 @@ use super::value::OwnedValue;
 
 /// Deeper than this the general route decides (it enforces the document nesting ceilings and
 /// words the refusal).
-pub(crate) const MAX_DEPTH: usize = 64;
+///
+/// This is the validator's own ceiling ([`crate::json::validate::MAX_NESTING_DEPTH`], which the
+/// assertion below holds it to), not a smaller one (#6614). The walk tries this reader on every
+/// child of a container (`plain_owned_jq`), and a subtree it declines for depth has cost the whole
+/// descent to the limit before the walk tries that node's own children, one level shallower each
+/// time. At 64 that made a tree of 40 nodes nested in a chain (80 levels) read 2x slower than one
+/// of 30 (60 levels): `[.[] | recurse(empty)]` over 200,000 nodes, 0.09 s at 30 and 0.19 s from 40
+/// (Apple M5). The recursion costs 128 frames of native stack, which every caller has: the
+/// evaluation thread has 256 MB and a library caller's 2 MiB holds it with room to spare.
+pub(crate) const MAX_DEPTH: usize = 128;
 
 // The reader must never accept what a ceiling of the general route refuses.
 const _: () = assert!(MAX_DEPTH <= crate::json::validate::MAX_NESTING_DEPTH);
@@ -524,6 +533,59 @@ mod tests {
         // Past the end, and on a byte that starts no value.
         assert!(parse_plain_at(b"[1]", 3).is_none());
         assert!(parse_plain_at(b"[1]", 2).is_none());
+    }
+
+    /// #6614: a record tree of 40 nodes nested in a chain is 80 levels (an object and its array
+    /// per node), and the walk tries this reader on each such subtree: a reader that stops at 64
+    /// declines it after the whole descent and the walk pays that at every level above.
+    #[test]
+    fn a_chain_of_forty_nodes_is_read_in_one_pass_6614() {
+        let chain = |n: usize| {
+            let mut text = alloc::format!(r#"{{"id":{n},"children":[]}}"#);
+            for id in (1..n).rev() {
+                text = alloc::format!(r#"{{"id":{id},"children":[{text}]}}"#);
+            }
+            text
+        };
+        for n in [30, 40, 50, 63] {
+            let text = chain(n);
+            let (value, nodes) = parse_plain_at(text.as_bytes(), 0)
+                .unwrap_or_else(|| panic!("{n} nodes ({} levels) must be read", 2 * n));
+            // Per node: two keys, the `id` value, the `children` array and the child object that
+            // sits in it; the root itself is not counted.
+            assert_eq!(nodes, 5 * n - 1, "{n} nodes");
+            assert_eq!(value.to_json(), text, "{n} nodes");
+        }
+        // 64 nodes is exactly the limit; 65 is one level past it.
+        assert!(parse_plain_at(chain(64).as_bytes(), 0).is_some());
+        assert!(parse_plain_at(chain(65).as_bytes(), 0).is_none());
+    }
+
+    /// #6614: the reader recurses once per level, and the limit is now 128. A debug build has the
+    /// largest frames, so a 256 KiB thread (an eighth of the 2 MiB a library caller's spawned thread
+    /// gets) reading the deepest nesting it accepts, as arrays and as objects, shows the room that
+    /// is left.
+    #[cfg(feature = "std")]
+    #[test]
+    fn the_deepest_nesting_is_read_on_a_small_stack_6614() {
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                // MAX_DEPTH containers, the innermost empty: a scalar inside the last one would
+                // be a value at depth MAX_DEPTH, which the reader declines.
+                let arrays = alloc::format!("{}{}", "[".repeat(MAX_DEPTH), "]".repeat(MAX_DEPTH));
+                let objects = alloc::format!(
+                    "{}{{}}{}",
+                    r#"{"a":"#.repeat(MAX_DEPTH - 1),
+                    "}".repeat(MAX_DEPTH - 1)
+                );
+                for text in [arrays, objects] {
+                    let value = parse_plain(&text).expect("the deepest nesting is read");
+                    assert_eq!(value.to_json(), text);
+                }
+            })
+            .expect("spawns");
+        handle.join().expect("no stack overflow");
     }
 
     #[test]

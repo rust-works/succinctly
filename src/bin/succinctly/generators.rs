@@ -20,13 +20,41 @@ pub enum Pattern {
     WideEscapedKeys,
     Ndjson,
     JsonSeq,
+    JsonSeqBadFirst,
+    JsonSeqBadLast,
 }
 
 impl Pattern {
     /// One document per line (`ndjson`, `json-seq`), not a single document: `--verify` checks
     /// each line, and there is nothing to pretty-print.
     pub fn is_line_delimited(self) -> bool {
-        matches!(self, Self::Ndjson | Self::JsonSeq)
+        matches!(
+            self,
+            Self::Ndjson | Self::JsonSeq | Self::JsonSeqBadFirst | Self::JsonSeqBadLast
+        )
+    }
+
+    /// Each record is introduced by an RS byte (RFC 7464): the `json-seq` family.
+    pub fn is_framed(self) -> bool {
+        matches!(
+            self,
+            Self::JsonSeq | Self::JsonSeqBadFirst | Self::JsonSeqBadLast
+        )
+    }
+
+    /// Whether the pattern holds one truncated record (#6619).
+    pub fn has_fault(self) -> bool {
+        matches!(self, Self::JsonSeqBadFirst | Self::JsonSeqBadLast)
+    }
+
+    /// Which line of a generated `json-seq` stream is the one truncated record, when the pattern
+    /// has one (#6619): the first or the last of `lines` lines.
+    pub fn fault_line(self, lines: usize) -> Option<usize> {
+        match self {
+            Self::JsonSeqBadFirst => (lines > 0).then_some(0),
+            Self::JsonSeqBadLast => lines.checked_sub(1),
+            _ => None,
+        }
     }
 }
 
@@ -58,6 +86,8 @@ pub fn generate_json(
         }
         Pattern::Ndjson => generate_ndjson_json(target_size, seed, false),
         Pattern::JsonSeq => generate_ndjson_json(target_size, seed, true),
+        Pattern::JsonSeqBadFirst => generate_json_seq_with_fault(target_size, seed, true),
+        Pattern::JsonSeqBadLast => generate_json_seq_with_fault(target_size, seed, false),
     }
 }
 
@@ -519,6 +549,28 @@ pub fn generate_ndjson_json(target_size: usize, seed: Option<u64>, framed: bool)
         i += 1;
     }
     json
+}
+
+/// The truncated record of the faulty `json-seq` patterns: an RS byte, a record cut off inside a
+/// string, and the line feed after it. jq 1.7.1's `--seq` reader ends it at the next RS with
+/// `ignoring parse error: Truncated value`, or at the end of the stream with `Unfinished string at
+/// EOF`, one warning each, and every record around it is read (checked against `/usr/bin/jq` for
+/// both patterns: the ids come out as the clean stream's). The record is not counted against the
+/// size the generator stops at, so a file is a few dozen bytes over its tier.
+const JSON_SEQ_FAULT: &str = "\u{1e}{\"id\":-1,\"name\":\"cut\n";
+
+/// [`generate_ndjson_json`] framed as `json-seq`, with one truncated record ([`JSON_SEQ_FAULT`])
+/// before the first record or after the last (#6619). Every other `--seq` row reads a clean
+/// stream, which takes the plain route; a stream with a fault anywhere is the shape #6500 made
+/// cheaper, and nothing else generates it. The records are the `json-seq` pattern's own, so the
+/// fault is the only difference between the two files.
+pub fn generate_json_seq_with_fault(target_size: usize, seed: Option<u64>, first: bool) -> String {
+    let records = generate_ndjson_json(target_size, seed, true);
+    if first {
+        format!("{JSON_SEQ_FAULT}{records}")
+    } else {
+        format!("{records}{JSON_SEQ_FAULT}")
+    }
 }
 
 /// Generate a wide flat object: many distinct top-level scalar keys, no
@@ -1052,10 +1104,45 @@ mod tests {
         assert_eq!(seq.replace('\u{1e}', ""), plain);
     }
 
+    /// #6619: the faulty patterns are the `json-seq` pattern's own records plus one truncated one,
+    /// at the start or at the end, and nowhere else.
+    #[test]
+    fn test_json_seq_fault_patterns_hold_one_truncated_record_at_one_end() {
+        let clean = generate_json(4096, Pattern::JsonSeq, Some(42), 5, 0.1);
+        let first = generate_json(4096, Pattern::JsonSeqBadFirst, Some(42), 5, 0.1);
+        let last = generate_json(4096, Pattern::JsonSeqBadLast, Some(42), 5, 0.1);
+        assert_eq!(first, format!("{JSON_SEQ_FAULT}{clean}"));
+        assert_eq!(last, format!("{clean}{JSON_SEQ_FAULT}"));
+        for (text, pattern) in [
+            (&first, Pattern::JsonSeqBadFirst),
+            (&last, Pattern::JsonSeqBadLast),
+        ] {
+            let lines: Vec<&str> = text.lines().collect();
+            let bad = pattern.fault_line(lines.len()).expect("a fault line");
+            for (n, line) in lines.iter().enumerate() {
+                let record = line
+                    .strip_prefix('\u{1e}')
+                    .expect("every line opens with RS");
+                let parses = serde_json::from_str::<serde_json::Value>(record).is_ok();
+                assert_eq!(parses, n != bad, "line {n}");
+            }
+        }
+        assert!(Pattern::JsonSeqBadFirst.has_fault() && Pattern::JsonSeqBadLast.has_fault());
+        assert!(!Pattern::JsonSeq.has_fault() && !Pattern::Ndjson.has_fault());
+        // No line to put it on in an empty stream.
+        assert_eq!(Pattern::JsonSeqBadFirst.fault_line(0), None);
+        assert_eq!(Pattern::JsonSeqBadLast.fault_line(0), None);
+        assert_eq!(Pattern::JsonSeq.fault_line(10), None);
+        assert_eq!(Pattern::Ndjson.fault_line(10), None);
+        assert!(Pattern::JsonSeqBadLast.is_framed() && !Pattern::Ndjson.is_framed());
+    }
+
     #[test]
     fn test_only_the_ndjson_patterns_are_line_delimited() {
         assert!(Pattern::Ndjson.is_line_delimited());
         assert!(Pattern::JsonSeq.is_line_delimited());
+        assert!(Pattern::JsonSeqBadFirst.is_line_delimited());
+        assert!(Pattern::JsonSeqBadLast.is_line_delimited());
         assert!(!Pattern::Users.is_line_delimited());
         assert!(!Pattern::Pretty.is_line_delimited());
     }
