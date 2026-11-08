@@ -47,6 +47,13 @@ fn test_jq_index_and_slice_loops_over_a_built_array_match_jq_6666() -> Result<()
             "true\n",
         ),
         ("[range(100)] | [range(0;100) as $i | .[$i]] == .", "true\n"),
+        // `length` and `has` in the loop, and a wide object's keys (the memoized length and key
+        // index, not a walk per read).
+        ("[range(100)] | [range(0;100;7) as $i | length] | add", "1500\n"),
+        ("[range(100)] | [range(0;100;9) as $i | .[length - 1 - $i]]", "[99,90,81,72,63,54,45,36,27,18,9,0]\n"),
+        ("[range(100)] | [range(-3;104;9) as $i | has($i)] | map(select(.)) | length", "11\n"),
+        ("[range(100)|{key:tostring,value:.}] | from_entries | [range(0;110;11) as $i | .[$i|tostring]]", "[0,11,22,33,44,55,66,77,88,99]\n"),
+        ("[range(100)|{key:tostring,value:.}] | from_entries | [range(0;110;11) as $i | has($i|tostring)] | map(select(.)) | length", "10\n"),
     ] {
         let (stdout, code) = run_jq_null(filter, &["-c"])?;
         assert_eq!((stdout.as_str(), code), (want, 0), "{filter}");
@@ -80,6 +87,14 @@ fn test_jq_index_loop_over_a_wide_built_array_is_not_quadratic_6666() -> Result<
         (
             "[range(200000)] | last(range(0; length; 1) as $i | .[$i:$i+2][0])",
             "199999\n",
+        ),
+        (
+            "[range(100000)|{key:tostring,value:.}] | from_entries | last(range(0; 100000) as $i | .[$i|tostring])",
+            "99999\n",
+        ),
+        (
+            "[range(200000)] | [range(0; length; 2) as $i | length] | add",
+            "20000000000\n",
         ),
     ] {
         let started = std::time::Instant::now();

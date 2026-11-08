@@ -46,6 +46,7 @@ use super::document::{
     DocumentElements, DocumentFields,
 };
 use super::glob::yq_match_key;
+use super::key_index;
 use super::local_zone::{self, LocalZone};
 use super::locale_time;
 use super::math;
@@ -19814,7 +19815,9 @@ fn builtin_length<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // either shipped CLI (see this fix's issue for why), but a real
         // gap for a library consumer of `jq::eval*` navigating raw,
         // unvalidated document bytes directly.
-        StandardJson::Array(elements) => match (*elements).len_checked() {
+        // #6666: the memoized length, so `length` read once per iteration of a loop over a wide
+        // array (`range(...) as $i | .[length - 1 - $i]`) is not a walk of it each time.
+        StandardJson::Array(elements) => match array_index::len_checked_memoized(elements) {
             Ok(len) => QueryResult::Owned(OwnedValue::Int(len as i64)),
             Err(e) => QueryResult::Error(e),
         },
@@ -20057,8 +20060,9 @@ fn has_one_key<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `eval_has_one_key` object arm already closed (#2291). See
         // `contains_checked`'s own doc comment (`document.rs`) for the
         // early-exit-on-match trade this inherits.
+        // #6666: memoized, as the generic evaluator's own `has` is (#4002).
         (StandardJson::Object(fields), OwnedValue::String(key)) => {
-            match fields.contains_checked(key) {
+            match key_index::contains_memoized(fields, key) {
                 Ok(found) => QueryResult::Owned(OwnedValue::Bool(found)),
                 Err(e) => QueryResult::Error(e),
             }
@@ -20089,7 +20093,8 @@ fn has_one_key<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // either way, so paying for it even when the key is later
             // discarded is the same "ride the already-mandatory walk"
             // trade #2261 uses everywhere else, not a new cost class.
-            let len = match (*elements).len_checked() {
+            // #6666: memoized, as `length` above: `has($i)` per iteration of a loop.
+            let len = match array_index::len_checked_memoized(elements) {
                 Ok(len) => len as i64,
                 Err(e) => return QueryResult::Error(e),
             };
@@ -39779,7 +39784,11 @@ fn find_field<'a, W: Clone + AsRef<[u64]>>(
     fields: JsonFields<'a, W>,
     name: &str,
 ) -> Result<Option<StandardJson<'a, W>>, EvalError> {
-    fields.find(name)
+    // #6666: from the key index once the object has proved wide, as the generic evaluator's own
+    // field read does (#3913): a loop over a wide object's keys (`.[$k]`, `has`, `select`) walked
+    // its members on every read. The same answer and the same errors as `find` (the index is
+    // only built for an object the walk would not raise on).
+    key_index::find_cursor_memoized(&fields, name).map(|found| found.map(|cursor| cursor.value()))
 }
 
 /// Look a string key up in an object — the shared body of `.foo`, `.["foo"]`
@@ -116148,6 +116157,64 @@ mod tests {
         let (builds, hits) = memo::work();
         assert_eq!(builds - before.0, 1, "one index across 1000 sink calls");
         assert!(hits - before.1 >= 900, "{} hits", hits - before.1);
+    }
+
+    /// #6666: the same for what a loop reads besides `.[$i]`: the array's `length` and `has` (the
+    /// memoized length), and a wide object's keys (`.[$k]`, `has`, `select` of a read: the key
+    /// index). One index is built and the loop's later reads hit it.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_loop_over_an_owned_array_or_object_reads_length_and_keys_from_the_memos_6666() {
+        use crate::jq::{array_index::memo as elements, key_index::memo as keys};
+        let array = OwnedValue::array_from((0..2000).map(OwnedValue::Int).collect::<Vec<_>>());
+        let object =
+            OwnedValue::object_from((0..2000).map(|i| (i.to_string(), OwnedValue::Int(i))));
+        let run = |filter: &str, input: &OwnedValue| {
+            let expr = parse(filter).unwrap();
+            let mut out = Vec::new();
+            let flow =
+                eval_each_owned::<JqSemantics>(&expr, input, false, Reentry::REBUILT, &mut |v| {
+                    out.push(v.to_json());
+                    Demand::Continue
+                });
+            assert!(matches!(flow, Flow::Exhausted), "{filter}");
+            out
+        };
+        for (filter, expected) in [
+            ("[range(0; length; 2) as $i | length] | add", "2000000"),
+            (
+                "[range(0; length; 2) as $i | .[length - 1 - $i]] | add",
+                "1000000",
+            ),
+            (
+                "[range(0; length + 10; 2) as $i | has($i)] | map(select(.)) | length",
+                "1000",
+            ),
+        ] {
+            let before = elements::work();
+            assert_eq!(run(filter, &array), [expected], "{filter}");
+            let (builds, hits) = elements::work();
+            assert_eq!(builds - before.0, 1, "{filter}: one element index");
+            assert!(hits - before.1 >= 900, "{filter}: {} hits", hits - before.1);
+        }
+        for (filter, expected) in [
+            (
+                "[range(0; 2000; 2) as $i | .[$i | tostring]] | add",
+                "999000",
+            ),
+            ("[range(0; 2010) as $i | .[$i | tostring]] | length", "2010"),
+            (
+                "[range(0; 2010) as $i | select(has($i | tostring))] | length",
+                "2000",
+            ),
+            ("[keys[] as $k | .[$k]] | add", "1999000"),
+        ] {
+            let before = keys::work();
+            assert_eq!(run(filter, &object), [expected], "{filter}");
+            let (builds, hits) = keys::work();
+            assert_eq!(builds - before.0, 1, "{filter}: one key index");
+            assert!(hits - before.1 >= 900, "{filter}: {} hits", hits - before.1);
+        }
     }
 
     /// #5274: a fold's `.[1:]` cuts a uniquely owned array in place and leaves a shared one
