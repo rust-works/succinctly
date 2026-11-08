@@ -9225,6 +9225,15 @@ YAML, though — every YAML cursor's `preceding_delimiter_ok` uses the trait def
 to this evaluator-level check the way JSON's semi-index does — so there is no YAML input
 this gap check can actually catch or skip either way, today.
 
+## `isvalid(f)` is a succinctly extension
+
+`isvalid(f)` runs in `succinctly jq`, where jq 1.6, 1.7.1 and 1.8.2 each refuse it at compile time (`isvalid/1 is not defined`, exit 3).
+It is an extension under ADR-0018 rule 5, not a divergence: no program jq accepts changes meaning.
+A user `def isvalid(f): ...` shadows it as in jq, `isvalid` and `isvalid(a; b)` stay jq's compile error, an object key `isvalid` is a key, and `builtins` omits it.
+`succinctly yq` refuses the name unless `--jq-extensions` is passed, since real yq's lexer rejects it.
+[#6662](https://github.com/rust-works/succinctly/issues/6662) recorded it, after #2658's note above called it an extension only in passing.
+Pinned in `tests/jq_cli/i6662.rs`.
+
 ## `skip` with a generator count
 
 `skip(n; f)` is a succinctly extension relative to the pinned jq 1.7.1,

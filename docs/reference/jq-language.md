@@ -256,7 +256,7 @@ echo '["a","b","c"]' | jq -r '@dsv(";")'        # Output: "a";"b";"c"
 - [x] `env`, `$ENV.VAR`, `env(VAR)`, `strenv(VAR)`
 - [x] `now` - Current Unix timestamp
 - [x] `builtins` - List all builtin function names: jq 1.7.1's 218 `name/arity` entries, in jq's order, and no other (#5304).
-  A name that is only an extension here (`trim`, `leaf_paths`, the yq metadata getters) is callable but not listed.
+  A name that is only an extension here (`trim`, `leaf_paths`, `isvalid`, the yq metadata getters) is callable but not listed.
 
 ### Assignment Operators
 - [x] `.a = value` - Simple assignment
@@ -297,7 +297,6 @@ printf 'a: [1, 2]\nb: [3, 4]\n' | succinctly yq '.a *= .b'               # a: [3
 - [x] `any` / `all`
 - [x] `recurse` / `recurse(f)` / `recurse(f; cond)`
 - [x] `walk(f)`
-- [x] `isvalid(expr)`
 - [x] `modulemeta` (arity 0 like real jq's — #2035; errors the same way real jq's does — #2111; resolves the module on `-L` and answers its metadata, `deps` and `defs` — #5321)
 - [x] `tojsonstream` / `fromjsonstream`
 - [x] `tostream` / `fromstream(f)` / `truncate_stream(f)` — jq's standard streaming
@@ -417,6 +416,7 @@ These are succinctly-specific extensions not available in standard jq or yq:
 
 - [x] `at_offset(n)` - Jump to node at byte offset n (0-indexed)
 - [x] `at_position(line; col)` - Jump to node at line/column (1-indexed)
+- [x] `isvalid(f)` - `true` when `f` yields an output and no error, `false` when it yields nothing or raises (#6662)
 
 These enable IDE integration and programmatic navigation to specific document positions.
 
@@ -491,6 +491,22 @@ type-based `scalars` filter doesn't fully capture. See
 rejects) is gated behind `--jq-extensions` and off by default since #1512 —
 `succinctly jq` above is unaffected either way. See
 [yq-language.md](yq-language.md#gated-jq-builtins---jq-extensions) for the full list.
+
+#### `isvalid(f)`
+
+`isvalid(f)` is **not a jq builtin**: jq 1.6, 1.7.1 and 1.8.2 each refuse it with
+`isvalid/1 is not defined` (exit 3). It is a succinctly extension (ADR-0018 rule 5) that is
+`true` when `f` yields an output and raises no error, and `false` when `f` yields nothing or raises.
+
+```bash
+echo '{"a": 1}' | succinctly jq -c '[isvalid(.a), isvalid(.a.b), isvalid(empty)]'
+# [true,false,false]
+```
+
+It changes no program jq accepts: a `def isvalid(f): ...` of your own wins, other arities
+(`isvalid`, `isvalid(a; b)`) are jq's own compile error, and `builtins` does not list it.
+Pinned in `tests/jq_cli/i6662.rs`.
+`succinctly yq` gates it behind `--jq-extensions`, as real yq's lexer rejects it.
 
 ---
 
