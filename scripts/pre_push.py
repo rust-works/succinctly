@@ -239,6 +239,7 @@ NOT_MIRRORED = (
     (r"^cargo bench\b", "scheduled benchmarks"),
     (r"^cargo check --manifest-path fuzz/", "compiles the separate fuzz crate; CI-only"),
     (r"^\./scripts/sync-[\w-]+\.sh", "golden and corpus drift checks need the pinned yq/jq/corpus tooling CI installs"),
+    (r"^\./scripts/gh-release-download\.sh", "fetches a pinned tool onto the CI runner (#6652); scripts/test_ci_release_downloads.py, run by the script-tests gate, is the local check"),
     (r"^python3 scripts/perf-guard\.py", "needs valgrind and a release binary on Linux"),
     (r"^python3 scripts/ci_leg_times\.py", "reads the Actions API with a token and opens an issue (scheduled.yml); scripts/test_ci_leg_times.py is the local check"),
     (r"^python3 scripts/changelog\.py check-pr", "needs the PR's title, body and labels"),
