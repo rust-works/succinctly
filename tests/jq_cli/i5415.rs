@@ -153,8 +153,9 @@ fn test_malformed_scalar_is_refused_with_the_default_routes_message_5415() -> Re
 }
 
 /// A document the streamed route cannot vouch for keeps the refusals of the materializing one:
-/// an unpaired surrogate (#1247) and nesting past the limit (#1818), at a scalar 256 levels down,
-/// the deepest document jq's parser accepts (#5497).
+/// an unpaired surrogate (#1247); nesting past the limit is refused by the reader before any
+/// route (#5497), and the deepest document jq's parser accepts, 256 containers around a scalar, is
+/// rendered (#6631).
 #[test]
 fn test_undecodable_and_over_deep_documents_are_still_refused_under_color_5415() -> Result<()> {
     let (out, err, code) = run_jq_full(&["-C", "-c", "."], Some(r#"{"a":"\ud800"}"#))?;
@@ -168,8 +169,8 @@ fn test_undecodable_and_over_deep_documents_are_still_refused_under_color_5415()
     assert_eq!((out.as_str(), code), ("{\"a\":\"\\ud800\"}\n", 0));
     let deep = format!("{}1{}", "[".repeat(256), "]".repeat(256));
     let (out, err, code) = run_jq_full(&["-C", "-c", "."], Some(&deep))?;
-    assert_eq!((out.as_str(), code), ("", 5), "{err}");
-    assert!(err.contains("nesting depth exceeds limit of 256"), "{err}");
+    assert_eq!((code, err.as_str()), (0, ""), "{out}");
+    assert!(out.starts_with("\u{1b}["), "{out}");
     Ok(())
 }
 
