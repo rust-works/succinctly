@@ -6900,7 +6900,27 @@ fn read_inputs(
         let unplaced_tail = failures.last().is_some_and(|&(at, _)| at >= files.len())
             && unopened_tail_name(&failures, files.len()).is_none();
         seq_readers_place_reads = seq_stream_shape && !args.slurp && !unplaced_tail;
+        // #6643: a directory last beside a stream the `--seq` reader finds faults in: each fault says
+        // whether it is at the end, for the hook to place the directory's read by (see
+        // `SEQ_FAULT_ENDS`). Only the reader of the queue, which delivers them in this order.
+        let seq_fault_ends_of_stream = if (args.null_input || track_eof)
+            && !args.slurp
+            && args.seq
+            && !args.raw_input
+            && args.input_dsv.is_none()
+            && !seq_by_stream_reader(args)
+            && any_open_failure
+            && unplaced_tail
+        {
+            seq_fault_ends(&raws, unopened_tail)
+        } else {
+            Vec::new()
+        };
+        // #6643: the reader's own faults stand in for the JSON text's rule of where a value ends: a
+        // number at the end of the last file is the fault `Potentially truncated top-level numeric
+        // value at EOF`, which the hook places by the fault's own read.
         let ends_cleanly = raw_lines_read_whole
+            || !seq_fault_ends_of_stream.is_empty()
             || seq_readers_place_reads
             || failures.iter().all(|&(at, _)| {
                 // The last file with bytes before it: an empty one between sends the reader on too.
@@ -6930,21 +6950,23 @@ fn read_inputs(
                     // #6610: a directory last is read only by a read past the end, which a fault
                     // before the end stops the program ahead of: jq's exit status is that fault's.
                     // A fault at the end is raised by that same read, which reaches the directory.
+                    // #6643: the reader's faults are told apart one by one, for the reads of the
+                    // queue; the streaming readers keep the rule of faults all before the end.
                     // #6588: the streaming readers (`read_seq`) still end the stream at the
                     // final buffer of the last file that opened (#6591), so for them an unopened
                     // file after it does not change what the walk calls clean.
                     && (seq_text_reads_clean(&raws, unopened_tail && !seq_by_stream_reader(args))
+                        || !seq_fault_ends_of_stream.is_empty()
                         || (unplaced_tail
-                            && seq_faults_all_before_end(
-                                &raws,
-                                unopened_tail && !seq_by_stream_reader(args),
-                            )))))
+                            && seq_by_stream_reader(args)
+                            && seq_faults_all_before_end(&raws, false)))))
             && ends_cleanly
         {
             // The `--seq` readers place their own faults: the JSON text's fault is not theirs.
             let fault_ends_text =
                 !seq_readers_place_reads && matches!(first_stream_fault(&raws), Some((_, true)));
             defer_open_failures(failures, fault_ends_text);
+            SEQ_FAULT_ENDS.with(|ends| *ends.borrow_mut() = seq_fault_ends_of_stream.into());
         } else {
             // #6522: only the main loop reads, one value at a time, when nothing asks for more.
             let main_loop_only = !args.null_input
@@ -9233,6 +9255,12 @@ thread_local! {
     /// Whether the first fault of the text is at its end (#6480): the read of that fault sent
     /// jq's reader past the last file, so it reaches every pending failure.
     static FAULT_ENDS_TEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// For each fault the `--seq` reader holds, in the order its reads deliver them, whether the
+    /// fault is at the end of the text (#6643): a stream that faults in the middle and at its end
+    /// has one of each, and only the read of the last reaches a directory given last. Empty where
+    /// [`FAULT_ENDS_TEXT`] decides alone.
+    static SEQ_FAULT_ENDS: RefCell<std::collections::VecDeque<bool>> =
+        const { RefCell::new(std::collections::VecDeque::new()) };
 }
 
 /// Leaves `failures` for the reads of the `input` queue to report as they reach them (#6475).
@@ -9241,6 +9269,7 @@ thread_local! {
 fn defer_open_failures(failures: Vec<(usize, InputFileOpenError)>, fault_ends_text: bool) {
     PENDING_OPEN_FAILURES.with(|pending| *pending.borrow_mut() = failures.into());
     FAULT_ENDS_TEXT.with(|ends| ends.set(fault_ends_text));
+    SEQ_FAULT_ENDS.with(|ends| ends.borrow_mut().clear());
 }
 
 /// Whether `--seq`'s own reader over the text the files `raws` make faults, and only before the end
@@ -9266,6 +9295,27 @@ fn seq_faults_all_before_end(raws: &[Vec<u8>], unopened_tail: bool) -> bool {
             .faults
             .iter()
             .all(|fault| !fault.body.contains(" at EOF"))
+}
+
+/// For each fault `--seq`'s own reader holds over the text the files `raws` make, in order, whether
+/// it is at the end of the text (#6643), for [`SEQ_FAULT_ENDS`]. Empty for a stream without a fault.
+fn seq_fault_ends(raws: &[Vec<u8>], unopened_tail: bool) -> Vec<bool> {
+    let sources: Vec<(Option<usize>, Vec<u8>)> = raws
+        .iter()
+        .enumerate()
+        .map(|(at, raw)| (Some(at), raw.clone()))
+        .collect();
+    crate::jq_seq_reader::walk_stream_collecting(
+        &sources,
+        false,
+        true,
+        crate::jq_seq_reader::Tail::of(unopened_tail),
+        &mut |_| {},
+    )
+    .faults
+    .iter()
+    .map(|fault| fault.body.contains(" at EOF"))
+    .collect()
 }
 
 /// Whether `--seq`'s own reader reads the text the files `raws` make without a fault (#6555): no
@@ -9437,7 +9487,13 @@ fn first_stream_fault(raws: &[Vec<u8>]) -> Option<(usize, bool)> {
 /// of the text found the end too (#6480): `[1,` waits for more, so jq's reader asks the next file
 /// before it raises `Unfinished JSON term at EOF`.
 fn report_reached_open_failures(read: Option<u32>, fault: bool) {
-    let read = read.filter(|_| !(fault && FAULT_ENDS_TEXT.with(std::cell::Cell::get)));
+    // #6643: a `--seq` stream names, per fault, whether it is at the end; the rest of the routes hold
+    // one fault at most, which the flag of the whole read names.
+    let ends_text = fault
+        && SEQ_FAULT_ENDS
+            .with(|ends| ends.borrow_mut().pop_front())
+            .unwrap_or_else(|| FAULT_ENDS_TEXT.with(std::cell::Cell::get));
+    let read = read.filter(|_| !ends_text);
     loop {
         let next = PENDING_OPEN_FAILURES.with(|pending| {
             let mut pending = pending.borrow_mut();
