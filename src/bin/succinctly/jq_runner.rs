@@ -5505,11 +5505,10 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                         .filter(|read| jq::is_jq_depth_fault(read))
                         .unwrap_or(message);
                     // #6628: a slurp joined the documents, so the position is that of the files
-                    // read again as one stream (stdin cannot be, and keeps the bare message).
+                    // read again as one stream, and the fault is the first jq meets there (stdin
+                    // and a pipe cannot be read again, and keep the bare message).
                     let message = if source == jq::InputSource::Slurped {
-                        reread_stream_fault(&files)
-                            .filter(|read| jq::is_jq_depth_fault(read))
-                            .unwrap_or(message)
+                        reread_stream_fault(&files).unwrap_or(message)
                     } else {
                         message
                     };
@@ -12836,6 +12835,16 @@ struct SlurpedInput {
     fault: Option<String>,
 }
 
+/// The bytes of the regular file `path`, read again, or `None` when it cannot be (#6628): a named
+/// pipe, a socket or a device gives its bytes once, and opening it again waits for a writer that is
+/// not coming. A message that needs the re-read is then left as the run found it.
+fn read_again(path: &Path) -> Option<Vec<u8>> {
+    std::fs::metadata(path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .and_then(|_| std::fs::read(path).ok())
+}
+
 /// jq's parse error for a `--slurp` stream the splitter gave up on in `raw`, file `idx` of `files`
 /// (#5555), or `None` when jq's parser reads it all.
 ///
@@ -12853,11 +12862,7 @@ fn slurp_fault(
         files
             .iter()
             // A `-` is stdin, which cannot be read again (and not a file of that name).
-            .map(|path| {
-                (!is_stdin_dash(path))
-                    .then(|| std::fs::read(path).ok())
-                    .flatten()
-            })
+            .map(|path| (!is_stdin_dash(path)).then(|| read_again(path)).flatten())
             .collect()
     });
     match earlier {
@@ -12881,11 +12886,11 @@ fn reread_stream_fault(files: &[PathBuf]) -> Option<String> {
     let mut at_front = true;
     let chunks = files.iter().map_while(|path| {
         match if is_stdin_dash(path) {
-            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            None
         } else {
-            std::fs::read(path)
+            read_again(path)
         } {
-            Ok(mut raw) => {
+            Some(mut raw) => {
                 // The bytes as read, not as substituted: jq's parser counts those (#5964).
                 if at_front && !raw.is_empty() {
                     at_front = false;
@@ -12893,7 +12898,7 @@ fn reread_stream_fault(files: &[PathBuf]) -> Option<String> {
                 }
                 Some(raw)
             }
-            Err(_) => {
+            None => {
                 unreadable = true;
                 None
             }
@@ -12951,10 +12956,11 @@ fn slurp_documents(
                 .unwrap_or(&raw);
             // #5497: jq meets its depth limit first when the refused bracket comes first.
             if jq::jq_depth_fault_offset(&raw[offset..]).is_some() {
-                // #6628: and names where its parser stood, as the stream route does.
-                let message =
-                    slurp_fault(files, idx, read, origin).filter(|m| jq::is_jq_depth_fault(m));
-                return Err(SlurpFailure::DepthLimit(message));
+                // #6628: and names where its parser stood, as the stream route does. The first
+                // fault of the stream is the one jq meets, an earlier one included.
+                return Err(SlurpFailure::DepthLimit(slurp_fault(
+                    files, idx, read, origin,
+                )));
             }
             let message = slurp_fault(files, idx, read, origin);
             // #6004: a bare token straight before the stream's last byte, an opener, is a value
@@ -20334,6 +20340,29 @@ mod tests {
     /// not every file -- and a partial or doubled one is left for the parser to refuse.
     /// #5576: a slurped stream's fault is read again from its files, a file at a time, as the
     /// default route reads them; a file that cannot be read again leaves the evaluator's wording.
+    #[test]
+    fn read_again_reads_regular_files_only_6628() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("f.json");
+        std::fs::File::create(&file)
+            .and_then(|mut f| f.write_all(b"[1]\n"))
+            .expect("write");
+        assert_eq!(read_again(&file).as_deref(), Some(&b"[1]\n"[..]));
+        // A directory, a file that is not there, and a named pipe, which would wait for a writer
+        // that is not coming, are none of them read again.
+        assert_eq!(read_again(dir.path()), None);
+        assert_eq!(read_again(&dir.path().join("gone.json")), None);
+        #[cfg(unix)]
+        {
+            let fifo = dir.path().join("pipe");
+            let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+            if made.is_ok_and(|status| status.success()) {
+                assert_eq!(read_again(&fifo), None);
+            }
+        }
+    }
+
     #[test]
     fn reread_stream_fault_reads_the_files_as_one_stream_5576() {
         use std::io::Write;
