@@ -14810,7 +14810,7 @@ fn evaluate_queue_record(
     output_config: &OutputConfig,
     on_value: &mut dyn FnMut(&mut ErrorSink, OwnedValue) -> Result<bool>,
 ) -> Result<()> {
-    let declined = evaluate_input_streaming_via(
+    let outcome = evaluate_input_streaming_via(
         input,
         expr,
         context,
@@ -14820,7 +14820,7 @@ fn evaluate_queue_record(
         queue_record_route(args, door),
         on_value,
     )?;
-    door.note(declined);
+    door.note(outcome);
     Ok(())
 }
 
@@ -14836,46 +14836,77 @@ enum OwnedRoute {
     WhereAnswered,
 }
 
+/// What [`evaluate_input_streaming_via`] did with the owned door for one input (#6620).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DoorOutcome {
+    /// The door was not asked: the route is not [`OwnedRoute::WhereAnswered`], or the program was
+    /// answered before any route (`.`, `--preserve-input`).
+    NotAsked,
+    /// [`OwnedRoute::WhereAnswered`] evaluated the program.
+    Answered,
+    /// [`OwnedRoute::WhereAnswered`] found no door for the program, and the input was read through
+    /// its own index.
+    Declined,
+}
+
 /// How many records in a row [`OwnedRoute::WhereAnswered`] may decline before a stream stops
-/// asking (#6620).
+/// asking for a while (#6620).
 const DOOR_DECLINES_BEFORE_CLOSING: u8 = 4;
+/// How many records the door stays closed for the first time, and at most (it doubles each time
+/// the record that follows is declined too).
+const DOOR_FIRST_CLOSE: u32 = 64;
+const DOOR_LONGEST_CLOSE: u32 = 1 << 16;
 
 /// What a stream that reads its records one at a time remembers of [`OwnedRoute::WhereAnswered`]
 /// (#6620).
 ///
-/// A program the owned evaluator's doors do not answer is declined by every record, and each
-/// decline costs the doors' look at the record: 2-6% of a `--seq` run's time on a 7950X and an
-/// M4 Pro (`[.id,.name]`, `keys`). The program is the same for every record, so a run of declines
-/// closes the door for the rest of the stream, which reads each record through its own index as
-/// it did before the door. A record the door answers ends the run, so a program some of the
-/// records take it for keeps it. Closing is only a choice of route: both routes print the same.
+/// A program the owned evaluator's doors do not answer is declined by the records it declines, and
+/// each decline costs the doors' look at the record: 2-6% of a `--seq` run's time on a 7950X and
+/// an M4 Pro (`[.id,.name]`, `keys`). A run of declines closes the door for a stretch of records,
+/// which read through their own index as they did before the door; the record that follows the
+/// stretch asks again, and a decline of it closes the door for twice as long, up to
+/// [`DOOR_LONGEST_CLOSE`]. A record the door answers ends the run and the backoff, so a stream
+/// whose records the program answers in some shapes and declines in others (`if type == "array"
+/// then .[0] else keys end`) gets the door back when its records change shape, and one that never
+/// is answered asks about once in 65,536 records. Closing is only a choice of route: both routes
+/// print the same.
 #[derive(Default)]
 struct DoorMemory {
     declined_in_a_row: u8,
+    /// Records still to read without asking; the door is open at 0.
+    closed_for: u32,
+    /// How long the door closes for next time (0 reads as [`DOOR_FIRST_CLOSE`]).
+    next_close: u32,
 }
 
 impl DoorMemory {
     fn is_open(&self) -> bool {
-        self.declined_in_a_row < DOOR_DECLINES_BEFORE_CLOSING
+        self.closed_for == 0
     }
 
-    /// Records whether the record just evaluated was declined by the door. A closed door is
-    /// never asked again, so it stays closed.
-    fn note(&mut self, declined: bool) {
-        if !self.is_open() {
-            return;
+    /// Counts the record just evaluated, which [`Self::is_open`] decided the route of.
+    fn note(&mut self, outcome: DoorOutcome) {
+        match outcome {
+            DoorOutcome::NotAsked => self.closed_for = self.closed_for.saturating_sub(1),
+            DoorOutcome::Answered => {
+                self.declined_in_a_row = 0;
+                self.next_close = DOOR_FIRST_CLOSE;
+            }
+            DoorOutcome::Declined => {
+                self.declined_in_a_row += 1;
+                if self.declined_in_a_row >= DOOR_DECLINES_BEFORE_CLOSING {
+                    self.closed_for = self.next_close.max(DOOR_FIRST_CLOSE);
+                    self.next_close = (self.closed_for * 2).min(DOOR_LONGEST_CLOSE);
+                    // The record that asks again is declined or not on its own.
+                    self.declined_in_a_row = DOOR_DECLINES_BEFORE_CLOSING - 1;
+                }
+            }
         }
-        self.declined_in_a_row = if declined {
-            self.declined_in_a_row + 1
-        } else {
-            0
-        };
     }
 }
 
 /// Evaluates `expr` over one input that is already a tree and hands each answer to `on_value`.
-/// Returns whether `OwnedRoute::WhereAnswered` found no door for the program, so the input was
-/// read through its own index instead (#6620): the caller's [`DoorMemory`] counts it.
+/// Returns what it did with the owned door (#6620), which the caller's [`DoorMemory`] counts.
 #[allow(clippy::too_many_arguments)]
 fn evaluate_input_streaming_via(
     input: &OwnedValue,
@@ -14886,7 +14917,7 @@ fn evaluate_input_streaming_via(
     output_config: &OutputConfig,
     owned_route: OwnedRoute,
     on_value: &mut dyn FnMut(&mut ErrorSink, OwnedValue) -> Result<bool>,
-) -> Result<bool> {
+) -> Result<DoorOutcome> {
     // #2852: `to_json()` always reformats a `NumberLiteral` to jq's own
     // spelling -- before this, every call site here reindexed through it
     // unconditionally, silently reformatting this one input value's own
@@ -14929,14 +14960,14 @@ fn evaluate_input_streaming_via(
         // empty arrays is 257 levels with the slurp wrapper, and is refused), then the tree depth.
         if let Err(e) = check_output_nesting(input, 0).and_then(|()| input.check_tree_depth()) {
             sink.report(DiagStyle::Jq, &e, &at.resolve());
-            return Ok(false);
+            return Ok(DoorOutcome::NotAsked);
         }
         on_value(sink, input.clone())?;
-        return Ok(false);
+        return Ok(DoorOutcome::NotAsked);
     }
     let mut write_err: Option<anyhow::Error> = None;
-    // Whether `OwnedRoute::WhereAnswered` found no door for the program (#6620).
-    let declined = std::cell::Cell::new(false);
+    // What `OwnedRoute::WhereAnswered` did (#6620).
+    let outcome = std::cell::Cell::new(DoorOutcome::NotAsked);
     // Hands one answer to the writer: `None` is nothing to write (genuinely no value, or a failure
     // this call already reported to `sink`, the same "report and keep going" contract the eager
     // path's own arms followed, #355). No depth gate: this runner writes under jq's conventions, whose
@@ -14976,9 +15007,10 @@ fn evaluate_input_streaming_via(
                             deliver(sink, Some(v))
                         })
                     {
+                        outcome.set(DoorOutcome::Answered);
                         return control;
                     }
-                    declined.set(true);
+                    outcome.set(DoorOutcome::Declined);
                 }
                 OwnedRoute::Off => {}
             }
@@ -15020,7 +15052,7 @@ fn evaluate_input_streaming_via(
     if let Some(e) = write_err {
         return Err(e);
     }
-    Ok(declined.get())
+    Ok(outcome.get())
 }
 
 /// One streamed output as an `OwnedValue`, or `None` when there is nothing to
@@ -23860,8 +23892,9 @@ mod tests {
         let open = DoorMemory::default();
         let mut closed = DoorMemory::default();
         for _ in 0..DOOR_DECLINES_BEFORE_CLOSING {
-            closed.note(true);
+            closed.note(DoorOutcome::Declined);
         }
+        assert!(!closed.is_open());
         // (flags, route with the door open)
         let rows = [
             (&["--seq", ".name"][..], OwnedRoute::WhereAnswered),
@@ -23886,8 +23919,9 @@ mod tests {
     }
 
     /// #6620: the main loop's own call counts what the door did with each record: a program no
-    /// door answers closes it after a run, a program it answers keeps it open, and a closed door
-    /// reads each record through its own index (which prints what the open one does).
+    /// door answers closes it after a run and asks again after the stretch, a program it answers
+    /// keeps it open, and a closed door reads each record through its own index (which prints what
+    /// the open one does).
     #[test]
     fn the_main_loop_closes_the_door_on_a_program_it_declines_6620() {
         use clap::Parser;
@@ -23910,12 +23944,13 @@ mod tests {
             ("name".to_string(), OwnedValue::String("n".into())),
         ]);
         let args = JqCommand::try_parse_from(["jq", "--seq", "-c", "."]).unwrap();
-        // The door left open after `records` records of `filter`, and what each printed.
-        let run = |filter: &str, records: usize| -> (bool, Vec<Vec<String>>) {
+        // Whether the door is open before each of `records` records of `filter`, and what each printed.
+        let run = |filter: &str, records: usize| -> (Vec<bool>, Vec<Vec<String>>) {
             let expr = jq::parse(filter).expect("parses");
             let mut door = DoorMemory::default();
-            let mut printed = Vec::new();
+            let (mut open, mut printed) = (Vec::new(), Vec::new());
             for _ in 0..records {
+                open.push(door.is_open());
                 let mut outputs = Vec::new();
                 evaluate_queue_record(
                     &args,
@@ -23934,55 +23969,94 @@ mod tests {
                 .expect("evaluates");
                 printed.push(outputs);
             }
-            (door.is_open(), printed)
+            (open, printed)
         };
         let n = usize::from(DOOR_DECLINES_BEFORE_CLOSING);
+        let stretch = DOOR_FIRST_CLOSE as usize;
         for filter in ["[.id,.name]", "keys"] {
-            let (open, printed) = run(filter, n - 1);
-            assert!(open, "{filter}: one short of the run");
-            let (open, printed_more) = run(filter, n + 3);
-            assert!(!open, "{filter}: a run of declines closes it");
+            let (open, printed) = run(filter, n + stretch + 3);
+            let mut want = vec![true; n]; // the run of declines
+            want.extend(vec![false; stretch]); // the stretch
+            want.extend([true, false, false]); // the probe, declined, closes it again
+            assert_eq!(open, want, "{filter}: when the door is asked");
             assert!(
-                printed_more.windows(2).all(|pair| pair[0] == pair[1]),
-                "{filter}: the closed door prints what the open one did"
+                printed.windows(2).all(|pair| pair[0] == pair[1]),
+                "{filter}: every route prints the same"
             );
-            assert_eq!(printed[0], printed_more[0], "{filter}");
         }
-        for filter in [".name", "{id,name}", "."] {
-            let (open, _) = run(filter, n + 3);
-            assert!(open, "{filter}: an answered program keeps the door open");
+        for filter in [".name", "{id,name}"] {
+            let (open, _) = run(filter, n + stretch + 3);
+            assert!(
+                open.iter().all(|asked| *asked),
+                "{filter}: an answered program keeps the door open"
+            );
         }
     }
 
-    /// #6620: a run of declines closes the door for the rest of the stream, a record the door
-    /// answers ends the run, and a closed door stays closed.
+    /// #6620: a run of declines closes the door for a stretch of records, a record the door answers
+    /// ends the run and the backoff, and the record after a stretch asks again: a decline of it
+    /// closes the door for twice as long, up to a ceiling, and an answer reopens it for good.
     #[test]
-    fn a_run_of_declines_closes_the_owned_door_6620() {
+    fn a_run_of_declines_closes_the_owned_door_for_a_stretch_6620() {
+        use DoorOutcome::{Answered, Declined, NotAsked};
+        let n = DOOR_DECLINES_BEFORE_CLOSING;
         let mut door = DoorMemory::default();
         assert!(door.is_open());
-        for _ in 0..DOOR_DECLINES_BEFORE_CLOSING - 1 {
-            door.note(true);
+        for _ in 0..n - 1 {
+            door.note(Declined);
         }
         assert!(door.is_open(), "one short of the run");
-        door.note(false);
-        for _ in 0..DOOR_DECLINES_BEFORE_CLOSING - 1 {
-            door.note(true);
+        door.note(Answered);
+        for _ in 0..n - 1 {
+            door.note(Declined);
         }
         assert!(door.is_open(), "an answer ended the run");
-        door.note(true);
+        // A record the door was not asked about (`.`, `--preserve-input`) neither counts nor ends it.
+        door.note(NotAsked);
+        door.note(Declined);
         assert!(!door.is_open(), "a full run closes it");
-        door.note(false);
-        assert!(
-            !door.is_open(),
-            "an answer after the close does not reopen it"
-        );
+        // The records of the stretch are read without asking; the one after it asks again.
+        for left in (1..=DOOR_FIRST_CLOSE).rev() {
+            assert!(!door.is_open(), "{left} records left of the first stretch");
+            door.note(NotAsked);
+        }
+        assert!(door.is_open(), "the stretch is over");
+        door.note(Declined);
+        assert!(!door.is_open(), "one decline of the probe closes it again");
+        for _ in 0..2 * DOOR_FIRST_CLOSE - 1 {
+            door.note(NotAsked);
+            assert!(!door.is_open(), "the second stretch is twice as long");
+        }
+        door.note(NotAsked);
+        assert!(door.is_open());
+        door.note(Answered);
+        door.note(Declined);
+        assert!(door.is_open(), "an answered probe starts the count again");
+        // The stretch stops doubling at the ceiling.
+        let mut door = DoorMemory::default();
+        let mut longest = 0;
+        for _ in 0..40 {
+            for _ in 0..n {
+                door.note(Declined);
+                if !door.is_open() {
+                    break;
+                }
+            }
+            longest = longest.max(door.closed_for);
+            while !door.is_open() {
+                door.note(NotAsked);
+            }
+        }
+        assert_eq!(longest, DOOR_LONGEST_CLOSE);
     }
 
-    /// #6620: `evaluate_input_streaming_via` says whether `WhereAnswered` declined, which is what
-    /// the main loop's [`DoorMemory`] counts, and no other route ever does. The programs are the
-    /// ones #6620 measured: `.name` is answered, `[.id,.name]` and `keys` are declined.
+    /// #6620: `evaluate_input_streaming_via` says what `WhereAnswered` did, which is what the main
+    /// loop's [`DoorMemory`] counts, and no other route ever asks. The programs are the ones #6620
+    /// measured: `.name` is answered, `[.id,.name]` and `keys` are declined; `.` is answered before
+    /// any route.
     #[test]
-    fn the_door_reports_a_decline_6620() {
+    fn the_door_reports_what_it_did_6620() {
+        use DoorOutcome::{Answered, Declined, NotAsked};
         let config = OutputConfig {
             compact: true,
             raw_output: false,
@@ -24001,11 +24075,11 @@ mod tests {
             ("id".to_string(), OwnedValue::Int(7)),
             ("name".to_string(), OwnedValue::String("n".into())),
         ]);
-        let run = |filter: &str, route: OwnedRoute| -> (Vec<String>, bool) {
+        let run = |filter: &str, route: OwnedRoute| -> (Vec<String>, DoorOutcome) {
             let expr = jq::parse(filter).expect("parses");
             let mut outputs = Vec::new();
             let mut sink = ErrorSink::default();
-            let declined = evaluate_input_streaming_via(
+            let outcome = evaluate_input_streaming_via(
                 &record,
                 &expr,
                 &EvalContext::default(),
@@ -24019,22 +24093,23 @@ mod tests {
                 },
             )
             .expect("evaluates");
-            (outputs, declined)
+            (outputs, outcome)
         };
-        for (filter, declined) in [
-            (".name", false),
-            (".", false),
-            ("[.id,.name]", true),
-            ("keys", true),
+        for (filter, want) in [
+            (".name", Answered),
+            ("{id,name}", Answered),
+            (".", NotAsked),
+            ("[.id,.name]", Declined),
+            ("keys", Declined),
         ] {
-            let (want, off) = run(filter, OwnedRoute::Off);
-            assert!(!off, "{filter}: the old route declines nothing");
+            let (expected, off) = run(filter, OwnedRoute::Off);
+            assert_eq!(off, NotAsked, "{filter}: the old route asks nothing");
             let (got, said) = run(filter, OwnedRoute::WhereAnswered);
-            assert_eq!(got, want, "{filter}: outputs");
-            assert_eq!(said, declined, "{filter}: declined");
+            assert_eq!(got, expected, "{filter}: outputs");
+            assert_eq!(said, want, "{filter}: what the door did");
             let (got, always) = run(filter, OwnedRoute::Always);
-            assert_eq!(got, want, "{filter}: outputs, always");
-            assert!(!always, "{filter}: `Always` never declines");
+            assert_eq!(got, expected, "{filter}: outputs, always");
+            assert_eq!(always, NotAsked, "{filter}: `Always` never declines");
         }
     }
 
