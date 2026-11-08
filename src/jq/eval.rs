@@ -11131,6 +11131,106 @@ pub(crate) fn map_projection_body(expr: &Expr) -> Option<&Expr> {
     }
 }
 
+/// `.[]?`, `.children[]?`, `.a.b[]?` and `.[0][]?` over an owned value, answered from the tree
+/// instead of through the re-index bridge (#6595): the value the static path reaches, whose
+/// elements (an array) or field values (an object) [`owned_children_flow`] then emits. Each
+/// visit of `recurse(.children[]?)` wrote its node out as text and indexed it again to read the
+/// children, so a node at depth `d` was written out once per ancestor: 0.08x of jq 1.7.1 on a
+/// tree 60 levels deep (Apple M5).
+///
+/// jq's `?` in `.k[]?` guards the iteration only (`1 | .k[]?` raises `Cannot index number`), so
+/// the path is read as [`eval_owned_map_projection`] reads a step, and everything that would
+/// raise declines: a `.name` step on anything but an object or `null`, a `.[n]` step on anything
+/// but an array or `null`. The bridge then keeps its diagnostics; nothing has been sent to the
+/// sink, and the read has no side effect, so it can start over. A missing key, an out-of-range
+/// index and `null` read `null`, and iterating anything but a container answers nothing, as
+/// `.[]?` does. An owned object is already key-deduplicated, in the order the bridge writes it
+/// out, so its values come in the order the bridge would iterate them. jq mode only: yq's `.[]`
+/// and its navigation have rules of their own. Not under an embed table, as
+/// [`eval_owned_map_projection`]: a node a binding tracks is answered by the bridge, which can
+/// name it.
+fn owned_path_each_optional<'v, S: EvalSemantics>(
+    expr: &Expr,
+    input: &'v OwnedValue,
+) -> Option<&'v OwnedValue> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    // Every program the front doors are offered reaches here, so the last stage is checked before
+    // any are collected.
+    match last_path_stage(expr) {
+        Some(Expr::Optional(inner)) if matches!(unwrap_paren(inner), Expr::Iterate) => {}
+        _ => return None,
+    }
+    if super::eval_generic::embed_table_active() {
+        return None;
+    }
+    let mut stages = Vec::new();
+    path_stages(expr, &mut stages);
+    let (_, path) = stages.split_last()?;
+    let mut at = input;
+    for stage in path {
+        at = match (static_step(stage)?, at) {
+            (_, OwnedValue::Null) => NULL_VALUE,
+            (StepKey::Field(name), OwnedValue::Object(map)) => {
+                map.get(name.as_ref()).unwrap_or(NULL_VALUE)
+            }
+            (StepKey::Index(idx), OwnedValue::Array(elements)) => array_slot(elements.len(), idx)
+                .and_then(|slot| elements.get(slot))
+                .unwrap_or(NULL_VALUE),
+            _ => return None,
+        };
+    }
+    Some(at)
+}
+
+/// The stages of `expr` with every parenthesis and pipe nesting flattened and identity stages
+/// dropped: `. | (.a | .b[]?)` is `[.a, .b, .[]?]` (#6595). A pipe runs each stage on every output
+/// of the one before it, so the nesting changes nothing about the value a stage reads.
+fn path_stages<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
+    match unwrap_paren(expr) {
+        Expr::Pipe(stages) => stages.iter().for_each(|stage| path_stages(stage, out)),
+        Expr::Identity => {}
+        other => out.push(other),
+    }
+}
+
+/// The last of [`path_stages`]'s stages of `expr`, found without collecting them: `None` when
+/// every stage is an identity.
+fn last_path_stage(expr: &Expr) -> Option<&Expr> {
+    match unwrap_paren(expr) {
+        Expr::Pipe(stages) => stages.iter().rev().find_map(last_path_stage),
+        Expr::Identity => None,
+        other => Some(other),
+    }
+}
+
+/// The outputs of `.[]?` over `container`, in order ([`owned_children_flow`]'s, collected).
+fn owned_children(container: &OwnedValue) -> Vec<OwnedValue> {
+    let mut children = Vec::new();
+    owned_children_flow(container, &mut |child| {
+        children.push(child);
+        Demand::Continue
+    });
+    children
+}
+
+/// The outputs of `.[]?` over `container` sent to `sink` in order: an array's elements, an
+/// object's field values, nothing for anything else ([`owned_path_each_optional`], #6595).
+fn owned_children_flow(container: &OwnedValue, sink: &mut dyn FnMut(OwnedValue) -> Demand) -> Flow {
+    let mut emit = |child: &OwnedValue| sink(child.clone()) == Demand::Continue;
+    let finished = match container {
+        OwnedValue::Array(items) => items.iter().all(&mut emit),
+        OwnedValue::Object(map) => map.values().all(&mut emit),
+        _ => true,
+    };
+    if finished {
+        Flow::Exhausted
+    } else {
+        Flow::Stopped { pending: None }
+    }
+}
+
 /// A stage that never reads `.`, answered without the owned input (#4053).
 ///
 /// `[$x] | 1` handed the stage `1` an owned array holding the whole of `$x`, and
@@ -12263,6 +12363,11 @@ pub(crate) fn eval_each_owned_front_doors<S: EvalSemantics>(
             Demand::Continue => Flow::Exhausted,
             Demand::Stop => Flow::Stopped { pending: None },
         });
+    }
+    // #6595: `.children[]?` reads the children of an owned node, not the node written out and
+    // indexed again (once per ancestor in a `recurse` walk).
+    if let Some(children) = owned_path_each_optional::<S>(expr, input) {
+        return Some(owned_children_flow(children, sink));
     }
     // #6527: `add`, `min` and `max` of an owned array of computed numbers fold them.
     if let Some(folded) = eval_owned_number_fold::<S>(expr, input) {
@@ -81086,7 +81191,12 @@ impl<S: EvalSemantics> ValueRecurseWalk<'_, '_, '_, S> {
         // (#636) -- but only after whatever `f` already produced at this node
         // (kept via `eval_owned_multi_keep_partial`, #842) has had its own
         // full recursive treatment.
-        let (children, mut deferred_error) = eval_owned_multi_keep_partial::<S>(self.f, current);
+        //
+        // #6595: `.children[]?` is read off the tree, as [`Self::expand`]'s route reads it.
+        let (children, mut deferred_error) = match owned_path_each_optional::<S>(self.f, current) {
+            Some(container) => (owned_children(container), None),
+            None => eval_owned_multi_keep_partial::<S>(self.f, current),
+        };
 
         // Collected in encounter order, then pushed onto `stack` reversed by
         // `queue_recurse_children` -- see `resolve_recurse_sink`'s doc
@@ -151260,6 +151370,150 @@ mod tests {
             }
         }
         assert!(taken > 250, "the matrix must reach the door: {taken}");
+    }
+
+    /// [`owned_path_each_optional`]'s outcome for `src` over `input` in `S`, as the bridge's
+    /// `(values, tag)` pair: `None` when it declines.
+    fn path_each_optional_outcome<S: EvalSemantics>(
+        src: &str,
+        input: &OwnedValue,
+    ) -> Option<(Vec<OwnedValue>, String)> {
+        let expr = parse(src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
+        owned_path_each_optional::<S>(&expr, input)
+            .map(|container| (owned_children(container), "ok".to_string()))
+    }
+
+    /// #6595: [`owned_path_each_optional`] answers what the reindex bridge answers for every value
+    /// x `.k[]?`-shaped body it takes -- the children it emits, in order and as spelled -- and
+    /// declines the rest: a step that would raise (`1 | .k[]?` raises in jq, whose `?` guards only
+    /// the iteration), a body that is not static steps ending in `.[]?`, and yq mode.
+    #[test]
+    fn owned_path_each_optional_agrees_with_the_reindex_bridge_6595() {
+        let object = |pairs: &[(&str, OwnedValue)]| {
+            OwnedValue::object_from(pairs.iter().map(|(k, v)| ((*k).to_string(), v.clone())))
+        };
+        let literal = OwnedValue::from_number_literal::<JqSemantics>("1.50");
+        let big = OwnedValue::from_number_literal::<JqSemantics>("100000000000000000000");
+        let kids = OwnedValue::array_from(vec![
+            object(&[
+                ("id", OwnedValue::Int(1)),
+                ("children", OwnedValue::array_from(vec![])),
+            ]),
+            literal.clone(),
+            OwnedValue::Null,
+            big.clone(),
+        ]);
+        let by_key = object(&[
+            ("z", OwnedValue::Int(1)),
+            ("a", OwnedValue::String("x".into())),
+            ("m", kids.clone()),
+        ]);
+        let mut values = vec![
+            object(&[("children", kids.clone())]),
+            object(&[("children", by_key.clone())]),
+            object(&[("children", OwnedValue::Null)]),
+            object(&[("children", OwnedValue::Int(5))]),
+            object(&[("children", OwnedValue::String("s".into()))]),
+            object(&[("children", OwnedValue::array_from(vec![]))]),
+            object(&[("id", OwnedValue::Int(1))]),
+            object(&[("a", object(&[("b", kids.clone())]))]),
+            object(&[("a", OwnedValue::array_from(vec![kids.clone()]))]),
+            object(&[("a", OwnedValue::Int(3))]),
+            object(&[]),
+            kids.clone(),
+            by_key.clone(),
+            OwnedValue::array_from(vec![kids.clone(), by_key.clone()]),
+            OwnedValue::array_from(vec![]),
+            OwnedValue::Null,
+            OwnedValue::Int(1),
+            OwnedValue::String("s".into()),
+            OwnedValue::Bool(false),
+        ];
+        for v in pure_scalar_matrix() {
+            values.push(object(&[(
+                "children",
+                OwnedValue::array_from(vec![v.clone()]),
+            )]));
+            values.push(object(&[("children", object(&[("k", v.clone())]))]));
+            values.push(OwnedValue::array_from(vec![v]));
+        }
+        values.extend(pure_value_matrix());
+        // Bodies the door answers (some input), spelled every way its stage may be wrapped.
+        let answered = [
+            ".[]?",
+            "(.[]?)",
+            ". | .[]?",
+            ".children[]?",
+            "(.children[]?)",
+            ". | .children[]?",
+            ".children | .[]?",
+            "(.children | .[]?)",
+            ".a.b[]?",
+            ".a | .b | .[]?",
+            ".a[0][]?",
+            ".[0][]?",
+            ".[-1][]?",
+            ".[5][]?",
+            r#".["children"][]?"#,
+        ];
+        // Bodies it leaves to the bridge whatever the input is.
+        let left = [
+            ".[]",
+            ".children[]",
+            "(.children[])?",
+            ".children[]? | .id",
+            ".children?[]?",
+            ".[]?[]?",
+            ".children[]?, 1",
+            "if . then .children[]? else empty end",
+            "..",
+            ".children",
+        ];
+        let mut taken = 0;
+        let mut declined_raising = 0;
+        for src in answered {
+            let mut reached = false;
+            let expr = parse(src).unwrap();
+            for value in &values {
+                let bridge = normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                    &expr, value, false,
+                ));
+                assert!(
+                    path_each_optional_outcome::<YqSemantics>(src, value).is_none(),
+                    "yq mode must keep its own `.[]`: {src:?}"
+                );
+                let Some(door) = path_each_optional_outcome::<JqSemantics>(src, value) else {
+                    // A decline is only ever a read that raises.
+                    assert!(
+                        bridge.1.starts_with("error:"),
+                        "{src:?} on {value:?} declined where the bridge answers {bridge:?}"
+                    );
+                    declined_raising += 1;
+                    continue;
+                };
+                reached = true;
+                taken += 1;
+                assert_eq!(
+                    select_door_observable(&door),
+                    select_door_observable(&bridge),
+                    "{src:?} on {value:?} disagrees with the reindex bridge"
+                );
+            }
+            assert!(reached, "{src:?} never reached the door");
+        }
+        for src in left {
+            for value in &values {
+                assert!(
+                    path_each_optional_outcome::<JqSemantics>(src, value).is_none(),
+                    "{src:?} on {value:?} must be left to the bridge"
+                );
+            }
+        }
+        assert!(taken > 400, "the matrix must reach the door: {taken}");
+        assert!(
+            declined_raising > 50,
+            "the matrix must reach a raising step: {declined_raising}"
+        );
     }
 
     /// #6560: `environment_object_in` is the environment, built fresh or read back from the
