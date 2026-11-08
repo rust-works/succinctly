@@ -5950,6 +5950,11 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
         return GenericResult::Owned(mapped);
     }
 
+    // #6608: nor does `{id, name}` or `[.a]`, which read their fields off the tree.
+    if let Some(built) = crate::jq::eval::eval_owned_construct::<S>(expr, &owned) {
+        return GenericResult::Owned(built);
+    }
+
     // #4053: a stage that never reads `.` needs no index over it either.
     if let Some(value) = crate::jq::eval::eval_owned_closed::<S>(expr) {
         return GenericResult::Owned(value);
