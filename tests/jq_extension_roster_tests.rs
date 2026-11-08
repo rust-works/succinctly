@@ -45,18 +45,16 @@ enum Pin {
     /// harness runs against jq 1.8.1 alone: a jq 1.8 name is not succinctly-only, so it has no
     /// "the reference must reject" row.
     Vendored18,
-    /// A row another change adds (#6673 adds `isvalid`'s).
-    Elsewhere,
 }
 
-use Pin::{Elsewhere, Row, Vendored18};
+use Pin::{Row, Vendored18};
 
 /// `(class, name, pin)`.
 const ROSTER: &[(&str, &str, Pin)] = &[
     (OWN, "at_offset", Row("at-offset")),
     (OWN, "at_position", Row("at-position")),
     (OWN, "leaf_paths", Row("leaf-paths")),
-    (OWN, "isvalid", Elsewhere),
+    (OWN, "isvalid", Row("isvalid")),
     (OWN, "isnull", Row("isnull")),
     (OWN, "isboolean", Row("isboolean")),
     (OWN, "isnumber", Row("isnumber")),
@@ -178,7 +176,6 @@ fn every_name_is_pinned_by_its_own_row_or_the_vendored_tests_6672() -> Result<()
                 has_word(&vendored, name),
                 "`{name}` is not exercised by jq 1.8.1's vendored jq.test"
             ),
-            Elsewhere => {}
         }
     }
     // A row belongs to a name: one nobody lists (and that is not one of the surface rows from
@@ -229,6 +226,50 @@ fn every_probe_row_runs_under_succinctly_jq_6672() -> Result<()> {
             "row {id}: exit {:?}: {}",
             out.status.code(),
             String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
+/// Rule 5's second half: an extension changes no filter the reference accepts. A name jq 1.7.1
+/// does not define is still free for a program to use, and every such use answers what jq 1.7.1
+/// answers. The expectations were captured from `/usr/bin/jq` 1.7.1 for all 45 roster names
+/// (1,035 rows over 23 program shapes, then 225 over `include`, `import` and `~/.jq`, none
+/// differing); the five shapes here are the ones a lookup change would break first.
+#[test]
+fn a_roster_name_stays_free_for_a_program_to_use_6672() -> Result<()> {
+    let run = |program: &str| -> Result<String> {
+        let out = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["jq", "-n", "-c", program])
+            .output()?;
+        assert!(
+            out.status.success(),
+            "{program}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(String::from_utf8(out.stdout)?.trim().to_string())
+    };
+    for (_, name, _) in ROSTER {
+        // A user definition shadows the extension, at each arity it is given.
+        assert_eq!(run(&format!("def {name}: 42; {name}"))?, "42", "{name}/0");
+        assert_eq!(
+            run(&format!("def {name}(f): [f]; {name}(1,2)"))?,
+            "[1,2]",
+            "{name}/1"
+        );
+        assert_eq!(
+            run(&format!("def {name}(f; g): [f,g]; {name}(1;2)"))?,
+            "[1,2]",
+            "{name}/2"
+        );
+        // It is still an object key, a field name, a variable and a parameter.
+        assert_eq!(run(&format!("{{{name}: 1}}"))?, format!("{{\"{name}\":1}}"));
+        assert_eq!(run(&format!(".{name}"))?, "null", ".{name}");
+        assert_eq!(run(&format!("1 as ${name} | ${name}"))?, "1", "${name}");
+        assert_eq!(
+            run(&format!("def f({name}): {name}; f(7)"))?,
+            "7",
+            "param {name}"
         );
     }
     Ok(())

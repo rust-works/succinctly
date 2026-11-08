@@ -473,6 +473,8 @@ The list was captured on 2026-11-09 by running every name the parser matches, at
   `succinctly yq` follows yq for all of them.
 - `isvalid` has its own paragraph under "Succinctly Extensions" (#6662), and `at_offset`, `at_position` and `leaf_paths` their own sections.
   `isnull` to `isobject` are the zero-argument type tests of the "Type Functions" list above; `tojsonstream` and `fromjsonstream` are the non-standard event pair described under "Other", distinct from `tostream`/`fromstream`.
+- None of these names changes a filter jq 1.7.1 accepts (checked on 2026-11-09 against `/usr/bin/jq` 1.7.1, 1,260 rows, none differing): each is still free as a user `def` at arities 0 to 2 (also a recursive one), an object key, a field name, a `$variable`, a `--arg`, a function or variable parameter, a `label`, an `include`d or `import`ed module's function, and a `~/.jq` definition.
+  Only the bare call, and `try NAME catch ...` or `"\(NAME)"` around it, reaches the extension.
 - `tests/jq_extension_roster_tests.rs` keeps this table, the rows of `comparison/jq/probes/extensions.tsv` and `succinctly jq` in agreement: each name is listed on its class's row, each name has its own probe row (or, for a jq 1.8 name, a use in jq 1.8.1's vendored tests), each row belongs to a name, and each row runs.
 
 #### `leaf_paths`
