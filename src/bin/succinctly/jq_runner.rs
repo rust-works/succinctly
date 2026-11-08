@@ -7050,12 +7050,20 @@ fn read_inputs(
                 && !args.slurp
                 && (!track_eof || (args.seq && !PROGRAM_READS_INPUTS.with(std::cell::Cell::get)));
             let reached = open_failures_reached(&failures, &raws, args, main_loop_only).len();
+            let text_faults = first_stream_fault(&raws).is_some();
             if main_loop_only && (args.raw_input || args.input_dsv.is_some()) && !args.validate {
                 // #6531: `-R`'s main loop reports a file when the line it reads comes from past it,
                 // after the lines before. #6585: and `--input-dsv`'s, for a record.
                 let mut failures = failures;
                 failures.truncate(reached);
                 defer_open_failures(failures, false);
+            } else if fault_leaves_failures_to_reads(args, &failures, reached, text_faults) {
+                // #6625: a `-n` run over a text that faults hands the fault to the first read
+                // and then goes on: jq's reader reaches what follows the fault on the reads after
+                // it, and a program that stops at the fault never does. So the failures past it
+                // are for those reads to place, a last directory included (#6615).
+                let fault_ends_text = matches!(first_stream_fault(&raws), Some((_, true)));
+                defer_open_failures(failures, fault_ends_text);
             } else if args.slurp
                 && (args.null_input || track_eof)
                 && !seq_slurp_places_failures(args)
@@ -7077,12 +7085,6 @@ fn read_inputs(
                 *open_failed = true;
                 defer_open_failures(directory, false);
                 SLURP_DIRECTORY_READ.with(|slurp| slurp.set(true));
-            } else if fault_leaves_failures_to_reads(args, &failures, reached) {
-                // #6625: a `-n` run over a text that faults hands the fault to the first read
-                // and then goes on: jq's reader reaches what follows the fault on the reads after
-                // it, and a program that stops at the fault never does. So the failures past it
-                // are for those reads to place, a last directory included (#6615).
-                defer_open_failures(failures, false);
             } else if seq_slurp_places_failures(args) {
                 let mut failures = failures;
                 // #6604, as above: a last directory is read by the extra input a program that
@@ -9784,11 +9786,13 @@ fn fault_leaves_failures_to_reads(
     args: &JqCommand,
     failures: &[(usize, InputFileOpenError)],
     reached: usize,
+    text_faults: bool,
 ) -> bool {
     args.null_input
         && !args.raw_input
         && reads_place_json_or_text_failures(args)
-        && reached < failures.len()
+        // A slurp's text that faults hands its reads the fault and then the array (#6671).
+        && (reached < failures.len() || (args.slurp && text_faults))
 }
 
 /// Whether the input is JSON text or `-R` lines, the readers whose reads [`reach_last_directory`]
