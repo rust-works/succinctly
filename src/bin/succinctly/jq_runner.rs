@@ -5270,8 +5270,12 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 // `--validate` already printed its own report.
                 Err(SlurpFailure::Validation(exit_code)) => return Ok(exit_code),
                 // #6476: a file that did not open makes the run exit 2 after any of these faults.
-                Err(SlurpFailure::DepthLimit) => {
-                    sink.report_parse_error("Exceeds depth limit for parsing");
+                Err(SlurpFailure::DepthLimit(message)) => {
+                    sink.report_parse_error(
+                        message
+                            .as_deref()
+                            .unwrap_or("Exceeds depth limit for parsing"),
+                    );
                     return Ok(halt_exit_code(DiagStyle::Jq.error_exit_code(), open_failed));
                 }
                 // Line 0 of the first file, where `get_inputs` has always
@@ -5501,6 +5505,14 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                         .flatten()
                         .filter(|read| jq::is_jq_depth_fault(read))
                         .unwrap_or(message);
+                    // #6628: a slurp joined the documents, so the position is that of the files
+                    // read again as one stream, and the fault is the first jq meets there (stdin
+                    // and a pipe cannot be read again, and keep the bare message).
+                    let message = if source == jq::InputSource::Slurped {
+                        reread_stream_fault(&files).unwrap_or(message)
+                    } else {
+                        message
+                    };
                     sink.report_parse_error(&message);
                     run_stopped = true;
                     break 'files;
@@ -12940,9 +12952,9 @@ enum SlurpFailure {
     /// when its parser stops there too.
     Unsplittable(Option<String>),
     /// jq's parse-depth limit refuses the document the splitter gave up on, before the fault it
-    /// stopped at (#5497). Reported as jq's parse error, without the position, as every depth
-    /// refusal under `--slurp` is.
-    DepthLimit,
+    /// stopped at (#5497). Carries jq's own parse error for it, with the position of the bracket
+    /// it refuses (#6628), when the stream can be read again to place it.
+    DepthLimit(Option<String>),
 }
 
 /// What [`slurp_documents`] hands the lazy per-document loop (#2847).
@@ -12957,6 +12969,16 @@ struct SlurpedInput {
     /// The parse error jq raises after the slurped array when the stream ends in a bare token
     /// straight before one last opener (#6004): the array holds the token, the error follows it.
     fault: Option<String>,
+}
+
+/// The bytes of the regular file `path`, read again, or `None` when it cannot be (#6628): a named
+/// pipe, a socket or a device gives its bytes once, and opening it again waits for a writer that is
+/// not coming. A message that needs the re-read is then left as the run found it.
+fn read_again(path: &Path) -> Option<Vec<u8>> {
+    std::fs::metadata(path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .and_then(|_| std::fs::read(path).ok())
 }
 
 /// jq's parse error for a `--slurp` stream the splitter gave up on in `raw`, file `idx` of `files`
@@ -12976,11 +12998,7 @@ fn slurp_fault(
         files
             .iter()
             // A `-` is stdin, which cannot be read again (and not a file of that name).
-            .map(|path| {
-                (!is_stdin_dash(path))
-                    .then(|| std::fs::read(path).ok())
-                    .flatten()
-            })
+            .map(|path| (!is_stdin_dash(path)).then(|| read_again(path)).flatten())
             .collect()
     });
     match earlier {
@@ -13004,11 +13022,11 @@ fn reread_stream_fault(files: &[PathBuf]) -> Option<String> {
     let mut at_front = true;
     let chunks = files.iter().map_while(|path| {
         match if is_stdin_dash(path) {
-            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            None
         } else {
-            std::fs::read(path)
+            read_again(path)
         } {
-            Ok(mut raw) => {
+            Some(mut raw) => {
                 // The bytes as read, not as substituted: jq's parser counts those (#5964).
                 if at_front && !raw.is_empty() {
                     at_front = false;
@@ -13016,7 +13034,7 @@ fn reread_stream_fault(files: &[PathBuf]) -> Option<String> {
                 }
                 Some(raw)
             }
-            Err(_) => {
+            None => {
                 unreadable = true;
                 None
             }
@@ -13068,14 +13086,18 @@ fn slurp_documents(
         }
         let (spans, split_error) = split_json_values(&raw);
         if let Some(offset) = split_error {
-            // #5497: jq meets its depth limit first when the refused bracket comes first.
-            if jq::jq_depth_fault_offset(&raw[offset..]).is_some() {
-                return Err(SlurpFailure::DepthLimit);
-            }
             let read = originals
                 .get(idx)
                 .and_then(Option::as_deref)
                 .unwrap_or(&raw);
+            // #5497: jq meets its depth limit first when the refused bracket comes first.
+            if jq::jq_depth_fault_offset(&raw[offset..]).is_some() {
+                // #6628: and names where its parser stood, as the stream route does. The first
+                // fault of the stream is the one jq meets, an earlier one included.
+                return Err(SlurpFailure::DepthLimit(slurp_fault(
+                    files, idx, read, origin,
+                )));
+            }
             let message = slurp_fault(files, idx, read, origin);
             // #6004: a bare token straight before the stream's last byte, an opener, is a value
             // by the time jq meets the fault: the array keeps it and the error follows.
@@ -20691,6 +20713,29 @@ mod tests {
     /// #5576: a slurped stream's fault is read again from its files, a file at a time, as the
     /// default route reads them; a file that cannot be read again leaves the evaluator's wording.
     #[test]
+    fn read_again_reads_regular_files_only_6628() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("f.json");
+        std::fs::File::create(&file)
+            .and_then(|mut f| f.write_all(b"[1]\n"))
+            .expect("write");
+        assert_eq!(read_again(&file).as_deref(), Some(&b"[1]\n"[..]));
+        // A directory, a file that is not there, and a named pipe, which would wait for a writer
+        // that is not coming, are none of them read again.
+        assert_eq!(read_again(dir.path()), None);
+        assert_eq!(read_again(&dir.path().join("gone.json")), None);
+        #[cfg(unix)]
+        {
+            let fifo = dir.path().join("pipe");
+            let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+            if made.is_ok_and(|status| status.success()) {
+                assert_eq!(read_again(&fifo), None);
+            }
+        }
+    }
+
+    #[test]
     fn reread_stream_fault_reads_the_files_as_one_stream_5576() {
         use std::io::Write;
         let file = |body: &[u8]| {
@@ -21368,7 +21413,7 @@ mod tests {
                 )),
                 Err(f) => Err(match f {
                     SlurpFailure::Unsplittable(_) => "unsplittable",
-                    SlurpFailure::DepthLimit => "depth",
+                    SlurpFailure::DepthLimit(_) => "depth",
                     SlurpFailure::Validation(_) => "validation",
                 }),
             }

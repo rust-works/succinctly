@@ -7284,7 +7284,9 @@ A 7950X read the ordinary rows neutral too (−4.2% to +2.4%, control −8.4% to
 
 What still differs:
 
-- Under `--slurp` the message has no `at line L, column C`: the files are joined into one array before it is indexed, so the position is gone by then.
+- Under `--slurp` the message names `at line L, column C` for input files (#6628): the files are read again as one stream, as jq's parser reads them, to place the refused bracket.
+  Standard input and a pipe (a named pipe, a process substitution) cannot be read again, so a slurp of them prints the message without the position when the refused document is otherwise well-formed.
+  A deep document that also holds a fault the splitter stops at is placed, from stdin as well.
 - jq's `--stream` uses its streaming parser, which has no depth limit, and succinctly's `--stream` does not apply jq's parse limit either.
   Except without `-s` (#5498), it still materializes each document before it streams the events, though, so it stops at the materializer's ceiling below (a document of 257 nested arrays), where jq streams on.
 - The routes that materialize a document (`input`/`inputs`, `--slurpfile`, and the filters that build an owned copy, such as `tojson`, `del` and `sort`) check every node, leaves included, against `MAX_NESTING_DEPTH` (256).
