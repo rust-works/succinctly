@@ -20,6 +20,9 @@ fn raw_input_reports_an_unopened_file_only_when_a_read_reaches_it_6602() -> Resu
         ("pq.json", "p\nq"),
         ("empty.json", ""),
         ("nl.json", "a\nb\n"),
+        ("xy.json", "x\ny"),
+        ("bom.json", "\u{feff}q\nz\n"),
+        ("fa.json", "[1,"),
     ] {
         std::fs::write(dir.path().join(name), text)?;
     }
@@ -99,6 +102,64 @@ fn raw_input_reports_an_unopened_file_only_when_a_read_reaches_it_6602() -> Resu
             &["-R", "-c", "input"][..],
             &["pq", "gone", "nl"][..],
             "\"qa\"\n",
+            GONE,
+            2,
+        ),
+        // The missing file last, `-e`, a BOM and empty files around the failure, a text that looks
+        // like unfinished JSON, and `--stream`, which still reports up front where a read reaches the file anyway.
+        (
+            &["-R", "-n", "-c", "input"][..],
+            &["pnum", "gone"][..],
+            "\"1\"\n",
+            "",
+            0,
+        ),
+        (
+            &["-R", "-n", "-c", "[inputs]"][..],
+            &["pnum", "gone"][..],
+            "[\"1\",\"2\"]\n",
+            GONE,
+            2,
+        ),
+        (
+            &["-R", "-n", "-e", "-c", "input"][..],
+            &["pnum", "gone", "empty", "gone2"][..],
+            "\"1\"\n",
+            "",
+            0,
+        ),
+        (
+            &["-R", "-n", "-c", "input"][..],
+            &["xy", "gone", "empty", "bom"][..],
+            "\"x\"\n",
+            "",
+            0,
+        ),
+        (
+            &["-R", "-n", "-c", "[input,input,input]"][..],
+            &["xy", "gone", "empty", "bom"][..],
+            "[\"x\",\"y\u{feff}q\",\"z\"]\n",
+            GONE,
+            2,
+        ),
+        (
+            &["-R", "-n", "-c", "[input,input]"][..],
+            &["xy", "gone", "empty", "gone2", "bom"][..],
+            "[\"x\",\"y\u{feff}q\"]\n",
+            GONE_BOTH,
+            2,
+        ),
+        (
+            &["-R", "-n", "-c", "input"][..],
+            &["fa", "gone", "nl"][..],
+            "\"[1,a\"\n",
+            GONE,
+            2,
+        ),
+        (
+            &["-R", "-n", "--stream", "-c", "[input,input]"][..],
+            &["pnum", "gone"][..],
+            "[\"1\",\"2\"]\n",
             GONE,
             2,
         ),
