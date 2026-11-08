@@ -984,11 +984,7 @@ fn to_owned_at_depth<S: EvalSemantics, V: DocumentValue>(
     // the ceiling, a scalar is not: it recurses no deeper, and jq's own limit of 256 containers
     // leaves room for the scalar inside the 256th (#6618).
     if let Some(fields) = value.as_object_rendered() {
-        if depth >= MAX_NESTING_DEPTH {
-            return Err(EvalError::decode_failure(
-                super::value::nesting_depth_exceeded_message(MAX_NESTING_DEPTH),
-            ));
-        }
+        nesting_depth_check(depth)?;
         let mut map = ObjectBuilder::new();
         let mut guard = DisplayKeyGuard::default();
         let mut f = fields;
@@ -1026,11 +1022,7 @@ fn to_owned_at_depth<S: EvalSemantics, V: DocumentValue>(
         tail_gap_ok(cursor, last_field.as_ref(), b'}')?;
         Ok(OwnedValue::Object(map.finish()))
     } else if let Some(elements) = value.as_array() {
-        if depth >= MAX_NESTING_DEPTH {
-            return Err(EvalError::decode_failure(
-                super::value::nesting_depth_exceeded_message(MAX_NESTING_DEPTH),
-            ));
-        }
+        nesting_depth_check(depth)?;
         let mut items = Vec::new();
         let mut elems = elements;
         let mut is_first = true;
@@ -44880,6 +44872,40 @@ mod tests {
             "message: {}",
             err.message
         );
+    }
+
+    /// #6618: `to_owned` (the unchecked walk the checked one stands in for) draws the same boundary
+    /// as `to_owned_checked`: 256 containers around a scalar read, the 257th is refused with the
+    /// catchable decode failure. The two must agree, as #2299's review required.
+    #[test]
+    fn test_to_owned_draws_the_checked_walks_nesting_boundary_6618() {
+        use crate::json::JsonIndex;
+        for (shape, open, close) in [("array", "[", "]"), ("object", "{\"a\":", "}")] {
+            for (containers, reads) in [(255usize, true), (256, true), (257, false)] {
+                let json = format!("{}1{}", open.repeat(containers), close.repeat(containers));
+                let json = json.as_bytes();
+                let index = JsonIndex::build(json);
+                let cursor = index.root(json);
+                let value = cursor.value();
+                let plain = to_owned::<JqSemantics, _>(&value);
+                let checked = to_owned_checked::<JqSemantics, _>(&value);
+                assert_eq!(plain.is_ok(), reads, "{shape} x{containers}: to_owned");
+                assert_eq!(
+                    checked.is_ok(),
+                    reads,
+                    "{shape} x{containers}: to_owned_checked"
+                );
+                if !reads {
+                    for err in [plain.unwrap_err(), checked.unwrap_err()] {
+                        assert!(
+                            err.message.contains("nesting depth exceeds limit of 256"),
+                            "{shape} x{containers}: {}",
+                            err.message
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Companion to the test above: legitimately-nested input well under

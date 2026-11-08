@@ -555,8 +555,9 @@ settled decision. The plain (non-combined) flags all match real yq:
 
 Real yq has no nesting ceiling: it evaluates a 300-deep block-style mapping like any other
 (`sort`, `. as $x | $x`, `-P .` and the rest all exit 0). The evaluator here recurses on the
-native stack and refuses a document nested 256 levels or deeper where it has to materialize
-it, which is what ADR-0018 rule 4(c) permits (matching would take the host process down).
+native stack and refuses a document nested more than 256 containers deep where it has to
+materialize it (a scalar inside the 256th container is read, #6618), which is what ADR-0018 rule
+4(c) permits (matching would take the host process down).
 The YAML parser's own 128 ceiling counts only flow/compact-inline nesting, so block-style
 nesting reaches the 256 one:
 

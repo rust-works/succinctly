@@ -28867,23 +28867,27 @@ fn test_json_input_rejects_adversarial_nesting_via_eval_all_998() -> Result<()> 
     Ok(())
 }
 
-/// #2282: pins the exact boundary `check_nesting_depth` now enforces
-/// (catchably) at `to_owned_canonicalizing_numbers_at_depth`'s own call
-/// site -- 256 levels of `[...]` wrapped around a scalar leaf reaches
-/// `check_nesting_depth(256)` (256 `>=` `MAX_NESTING_DEPTH`, errors). An
-/// earlier revision of this fix used a separate, container-only-counting
-/// pre-check walk instead of fixing the guard itself, and that walk
-/// under-counted a leaf-terminated subtree by one level relative to the
-/// real guard's own per-node counting -- confirmed live at the time: this
-/// exact input still panicked (exit 101) even with that pre-check already
-/// run and declined to reject it. Kept as a regression test for the
-/// boundary itself, independent of which mechanism enforces it.
+/// #2282, moved by #6618: pins the exact boundary `check_nesting_depth` enforces (catchably) at
+/// `to_owned_canonicalizing_numbers_at_depth`'s own call site. A container is held to the ceiling and
+/// a scalar is not, so 256 levels of `[...]` wrapped around a scalar leaf read (yq v4.53.3 answers
+/// `1`, and has no ceiling of its own) and the 257th container is refused. An earlier revision of
+/// this fix used a separate, container-only-counting pre-check walk, which under-counted a
+/// leaf-terminated subtree and let this input panic (exit 101); the guard itself now counts
+/// containers, so the one place that decides is the call site this test exercises. Kept as a
+/// regression test for the boundary itself, independent of which mechanism enforces it.
 #[test]
-fn test_json_eval_all_rejects_scalar_terminated_nesting_at_exact_boundary_2282() -> Result<()> {
-    let depth = 256;
-    let input = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+fn test_json_eval_all_draws_the_nesting_boundary_at_256_containers_2282() -> Result<()> {
+    let at_limit = format!("{}1{}", "[".repeat(256), "]".repeat(256));
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(
+        ".|length",
+        &at_limit,
+        &["--input-format", "json", "--eval-all"],
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "1\n");
+    let past = format!("{}1{}", "[".repeat(257), "]".repeat(257));
     let (_stdout, stderr, code) =
-        run_yq_stdin_with_stderr(".", &input, &["--input-format", "json", "--eval-all"])?;
+        run_yq_stdin_with_stderr(".", &past, &["--input-format", "json", "--eval-all"])?;
     assert_eq!(code, 1, "stderr: {stderr:?}");
     assert!(
         stderr.contains("nesting depth exceeds limit of 256"),

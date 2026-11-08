@@ -7290,8 +7290,10 @@ What still differs:
 - The routes that read a document into an owned value (`input`/`inputs`, `--slurpfile`, a `--seq` record) hold only a container to `MAX_NESTING_DEPTH` (256), since a scalar recurses no deeper (#6618).
   A document jq accepts with a scalar at its 257th level, which only 256 nested containers can hold (`[[…[1]…]]` with 256 arrays, or 255 arrays around `{"a":1}`), is read there, as jq reads it.
   Until #6618 those routes checked every node, leaves included, and refused it with `nesting depth exceeds limit of 256`; `--seq` dropped the record without a word (`--seq -nc '[inputs|type]'` printed `[]`, `--seq -s length` printed `0`).
-  The filters that build an owned copy (`tojson`, `tostring`, `del`, `walk` and `flatten`, measured over 256 arrays around `1`) still check every node against the ceiling and refuse the same document with `nesting depth exceeds limit of 256`.
+  The guards of the cursor walk still check every node, leaves included, so the same 256-container document is refused with `nesting depth exceeds limit of 256` by `tojson`, `tostring`, `@json`, `@text`, `del`, `walk`, `flatten`, `group_by`, `tostream`, `ltrimstr`, `input_line_number`, a `path` of a bound document (`. as $y | [path($y)]`) and the `-C` and `-a` output flags, all of which jq answers.
+  `sort`, `length`, `paths`, `..`, `map`, `keys`, `reverse`, `to_entries` and `-S` read it.
   Their guards are shared with `succinctly yq` across the evaluator, and a one-level band is not worth moving them for.
+  `--argjson` and `--jsonargs` have a ceiling of their own, 128 levels (`validate_jq_lenient`), and refuse the document at 200 levels already, where jq reads it up to 256 (#6618 left it alone).
 - `--preserve-input`'s raw echo (a succinctly extension that echoes a document without validating it) does not apply the limit.
 - A document deeper than 128 levels whose first fault in jq's order is something else keeps the default route's lazy handling of that fault: the depth check refuses only what jq's depth limit refuses.
 

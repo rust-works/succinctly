@@ -98,17 +98,49 @@ fn a_value_at_the_nesting_ceiling_is_read_as_jq_reads_it_6618() -> Result<()> {
 }
 
 /// `--slurpfile` reads the file's values through the same materializer: 256 containers around a
-/// scalar is one value, as jq reads it, and 257 is refused.
+/// scalar, around an object holding one, or around an empty array is one value, as jq reads it,
+/// and 257 is refused.
 #[test]
 fn slurpfile_reads_a_value_at_the_nesting_ceiling_6618() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let file = dir.path().join("deep.json");
-    std::fs::write(&file, format!("{}\n", nested("scalar", 256)))?;
     let path = file.to_string_lossy().into_owned();
-    let (out, err, code) = run_jq_full(&["-nc", "--slurpfile", "v", &path, "$v|length"], None)?;
-    assert_eq!((out.as_str(), err.as_str(), code), ("1\n", "", 0));
+    for shape in ["scalar", "object", "empty"] {
+        std::fs::write(&file, format!("{}\n", nested(shape, 256)))?;
+        let (out, err, code) = run_jq_full(&["-nc", "--slurpfile", "v", &path, "$v|length"], None)?;
+        assert_eq!(
+            (out.as_str(), err.as_str(), code),
+            ("1\n", "", 0),
+            "{shape}"
+        );
+    }
     std::fs::write(&file, format!("{}\n", nested("scalar", 257)))?;
     let (out, _, code) = run_jq_full(&["-nc", "--slurpfile", "v", &path, "$v|length"], None)?;
     assert_eq!((out.as_str(), code), ("", 2));
+    Ok(())
+}
+
+/// What still refuses a 256-container document, recorded in `limitations.md` (the one-level band):
+/// the filters that build an owned copy and the output flags that walk the document through the
+/// cursor guards, which jq answers (`tojson|length` is 513, `input_line_number` is 1). Pinned so a
+/// change to those guards moves this row and the page with it.
+#[test]
+fn the_cursor_walk_guards_still_hold_a_scalar_at_the_ceiling_6618() -> Result<()> {
+    let doc = format!("{}\n", nested("scalar", 256));
+    for filter in ["tojson|length", "input_line_number", "walk(.)|length"] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(&doc))?;
+        assert_eq!(
+            (
+                out.as_str(),
+                code,
+                err.contains("nesting depth exceeds limit of 256")
+            ),
+            ("", 5, true),
+            "{filter}"
+        );
+    }
+    // `sort` and `length` read it without the owned copy, as jq does.
+    let (out, _, code) = run_jq_full(&["-c", "sort|length"], Some(&doc))?;
+    assert_eq!((out.as_str(), code), ("1\n", 0));
     Ok(())
 }

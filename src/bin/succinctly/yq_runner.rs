@@ -2061,8 +2061,10 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
     // reporting a clean, catchable error (exit 1) -- confirmed live,
     // `succinctly yq --eval-all --input-format json` on 300 levels of
     // `[...]` nesting used to panic here.
-    check_nesting_depth(depth)?;
+    // A container is held to the ceiling, a scalar is not (#6618), as `eval_generic::to_owned_at_depth`
+    // holds them: 256 containers around a scalar read, the 257th is refused.
     Ok(if let Some(fields) = value.as_object() {
+        check_nesting_depth(depth)?;
         let mut map = ObjectBuilder::new();
         let mut guard = DisplayKeyGuard::default();
         let mut f = fields;
@@ -2112,6 +2114,7 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
         tail_gap_ok(Some(cursor), last_field.as_ref(), b'}')?;
         OwnedValue::Object(map.finish())
     } else if let Some(elements) = value.as_array() {
+        check_nesting_depth(depth)?;
         let mut items = Vec::new();
         let mut elems = elements;
         let mut is_first = true;
