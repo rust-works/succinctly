@@ -91,32 +91,46 @@ fn seq_stream_places_a_warning_among_the_open_failures_6591() -> Result<()> {
     }
     const WARN: &str = "jq: ignoring parse error: Truncated value at line 3, column 1\n";
     const GONE: &str = "jq: error: Could not open file @DIR@/gone.seq: No such file or directory\n";
+    const GONE2: &str =
+        "jq: error: Could not open file @DIR@/gone2.seq: No such file or directory\n";
+    const STREAM: &[&str] = &["-c", "--seq", "--stream", "."];
+    const EVENTS: &[&str] = &["-c", "--seq", "--stream-errors", "."];
+    let both_gone = format!("{GONE}{GONE2}");
     let both = format!("{WARN}{GONE}");
     #[rustfmt::skip]
     let rows = [
         // The warning is met at the end of `bad`, which is read before the failure.
-        (&["bad", "gone"][..], "\u{1e}[[],1]\n\u{1e}[[],2]\n", both.as_str(), 2),
-        (&["bad", "gone", "ok"][..], "\u{1e}[[],1]\n\u{1e}[[],2]\n\u{1e}[[],3]\n", both.as_str(), 2),
-        (&["mid", "gone", "ok"][..], "\u{1e}[[],1]\n\u{1e}[[],2]\n\u{1e}[[],5]\n\u{1e}[[],3]\n", both.as_str(), 2),
+        (STREAM, &["bad", "gone"][..], "\u{1e}[[],1]\n\u{1e}[[],2]\n", both.as_str(), 2),
+        (STREAM, &["bad", "gone", "ok"][..], "\u{1e}[[],1]\n\u{1e}[[],2]\n\u{1e}[[],3]\n", both.as_str(), 2),
+        (STREAM, &["mid", "gone", "ok"][..], "\u{1e}[[],1]\n\u{1e}[[],2]\n\u{1e}[[],5]\n\u{1e}[[],3]\n", both.as_str(), 2),
+        // Two files that do not open: the warning sits before the first, and the reader stops there.
+        (STREAM, &["mid", "gone", "bad", "gone2"][..], "\u{1e}[[],1]\n\u{1e}[[],2]\n\u{1e}[[],5]\n\u{1e}[[],1]\n", both.as_str(), 2),
+        (STREAM, &["bad", "gone", "ok", "gone2"][..], "\u{1e}[[],1]\n\u{1e}[[],2]\n\u{1e}[[],3]\n", both.as_str(), 2),
+        (STREAM, &["ok", "gone", "gone2", "bad"][..], "\u{1e}[[],3]\n\u{1e}[[],4]\n\u{1e}[[],1]\n", both_gone.as_str(), 2),
         // The value that takes the reader past the failure is the last one read: a warning after
         // it, in that file or the next, never comes.
-        (&["gone", "bad"][..], "\u{1e}[[],1]\n", GONE, 2),
-        (&["gone", "d"][..], "\u{1e}[[0],1]\n", GONE, 2),
-        (&["gone", "ok", "bad"][..], "\u{1e}[[],3]\n", GONE, 2),
-        (&["ok", "gone", "bad"][..], "\u{1e}[[],3]\n\u{1e}[[],4]\n\u{1e}[[],1]\n", GONE, 2),
+        (STREAM, &["gone", "bad"][..], "\u{1e}[[],1]\n", GONE, 2),
+        (STREAM, &["gone", "d"][..], "\u{1e}[[0],1]\n", GONE, 2),
+        (STREAM, &["gone", "ok", "bad"][..], "\u{1e}[[],3]\n", GONE, 2),
+        (STREAM, &["gone", "mid", "gone2", "ok"][..], "\u{1e}[[],1]\n", GONE, 2),
+        (STREAM, &["ok", "gone", "bad"][..], "\u{1e}[[],3]\n\u{1e}[[],4]\n\u{1e}[[],1]\n", GONE, 2),
         // No failure: the warning is all there is.
-        (&["bad"][..], "\u{1e}[[],1]\n\u{1e}[[],2]\n", WARN, 0),
+        (STREAM, &["bad"][..], "\u{1e}[[],1]\n\u{1e}[[],2]\n", WARN, 0),
+        // `--stream-errors` has no warnings: a fault is an event, and the failures are as before.
+        (EVENTS, &["bad", "gone"][..], "\u{1e}[[],1]\n\u{1e}[\"Truncated value at line 3, column 1\",[null]]\n\u{1e}[[],2]\n", GONE, 2),
+        (EVENTS, &["gone", "bad"][..], "\u{1e}[[],1]\n", GONE, 2),
+        (EVENTS, &["gone", "d"][..], "\u{1e}[[0],1]\n", GONE, 2),
     ];
-    for (names, stdout, stderr, status) in rows {
+    for (flags, names, stdout, stderr, status) in rows {
         let files: Vec<String> = names.iter().map(|name| format!("{d}/{name}.seq")).collect();
-        let mut args: Vec<&str> = vec!["-c", "--seq", "--stream", "."];
+        let mut args: Vec<&str> = flags.to_vec();
         args.extend(files.iter().map(String::as_str));
         let (out, err, code) = run_jq_full(&args, None)?;
         let want_err = stderr.replace("@DIR@", &d);
         assert_eq!(
             (out.as_str(), err.as_str(), code),
             (stdout, want_err.as_str(), status),
-            "{names:?}"
+            "{flags:?} {names:?}"
         );
     }
     Ok(())

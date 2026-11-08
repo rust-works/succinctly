@@ -7001,7 +7001,7 @@ fn read_inputs(
                     SLURP_DIRECTORY_READ.with(|slurp| slurp.set(true));
                 }
                 defer_open_failures(failures, false);
-            } else if seq_by_stream_reader(args) && !args.slurp && !args.null_input && !track_eof {
+            } else if seq_stream_places_failures_by_warning(args, track_eof) {
                 // #6591: the reader's warnings come out as jq's main loop pops each fault, and a
                 // failure is said when the reader opens the file, so it sits among them by source.
                 let mut failures = failures;
@@ -8420,6 +8420,18 @@ fn seq_slurp_defers_failures(args: &JqCommand) -> bool {
         && !args.raw_input
         && args.input_dsv.is_none()
         && !seq_by_stream_reader(args)
+}
+
+/// Whether a plain `--seq --stream` run reports its open failures among the reader's warnings
+/// (#6591): the program reads no `input` (`track_eof`), so jq's main loop pops each fault and says
+/// a failure when its reader opens the file. `--stream-errors` has no warnings: each fault is an
+/// event of its own.
+fn seq_stream_places_failures_by_warning(args: &JqCommand, track_eof: bool) -> bool {
+    seq_by_stream_reader(args)
+        && !args.stream_errors
+        && !args.slurp
+        && !args.null_input
+        && !track_eof
 }
 
 /// Reports the held open failures of [`seq_slurp_places_failures`] that sit before the opened
