@@ -12,6 +12,12 @@ use std::process::Command;
 
 use anyhow::Result;
 
+/// The object without the variables a coverage-instrumented binary adds to its own environment
+/// (`__LLVM_PROFILE_RT_INIT_ONCE`), which would otherwise show in `$ENV` under `cargo llvm-cov`.
+fn own(object: &str) -> String {
+    format!("({object} | with_entries(select(.key | startswith(\"__LLVM_PROFILE\") | not)))")
+}
+
 fn run_with_env(name: &[u8], value: &[u8], filter: &str) -> Result<(String, String, bool)> {
     let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
         .arg("jq")
@@ -57,7 +63,7 @@ fn a_non_utf8_environment_value_is_substituted_as_jq_does_6564() -> Result<()> {
         let (stdout, stderr, ok) = run_with_env(
             b"BADVAR",
             value,
-            "[$ENV | length, ($ENV | has(\"BADVAR\"))]",
+            &format!("[{0} | length, ({0} | has(\"BADVAR\"))]", own("$ENV")),
         )?;
         assert!(ok, "{value:?}: {stderr}");
         assert_eq!(stdout.trim_end(), "[1,true]", "{value:?}");
@@ -68,8 +74,9 @@ fn a_non_utf8_environment_value_is_substituted_as_jq_does_6564() -> Result<()> {
 /// A name that is not valid UTF-8 is substituted the same way (jq: `BAD\u{fffd}NAME`).
 #[test]
 fn a_non_utf8_environment_name_is_substituted_as_jq_does_6564() -> Result<()> {
-    for filter in ["$ENV | keys | map(explode)", "env | keys | map(explode)"] {
-        let (stdout, stderr, ok) = run_with_env(b"BAD\xffNAME", b"1", filter)?;
+    for object in ["$ENV", "env"] {
+        let filter = format!("{} | keys | map(explode)", own(object));
+        let (stdout, stderr, ok) = run_with_env(b"BAD\xffNAME", b"1", &filter)?;
         assert!(ok, "{filter}: {stderr}");
         assert_eq!(
             stdout.trim_end(),
