@@ -88947,6 +88947,38 @@ fn owned_one_value_stage(stage: &Expr) -> bool {
         )
 }
 
+/// Whether `expr` is an array or object constructor with exactly one member that is `.` itself
+/// (`[$i, .]`, `{i: $i, s: .}`) and every other member, and key, a shape [`off_the_tree_shape`]
+/// accepts: the constructor a `foreach` EXTRACT builds on the owned tree (#6581). Any other
+/// constructor is the evaluator's own route, so a step that would decline it costs nothing here:
+/// a constructor with no `.` member, two, or a member the step evaluates and then declines (`(1, 2)`,
+/// `empty`) was measured 1.02x-1.15x slower than not trying (7950X).
+fn constructor_holds_state_once(expr: &Expr) -> bool {
+    let is_dot = |e: &Expr| matches!(unwrap_paren(e), Expr::Identity);
+    let fits = |e: &Expr| is_dot(e) || off_the_tree_shape(e);
+    match unwrap_paren(expr) {
+        Expr::Array(inner) => {
+            let items = match unwrap_paren(inner) {
+                Expr::Comma(items) => items.as_slice(),
+                single => core::slice::from_ref(single),
+            };
+            items.iter().filter(|item| is_dot(item)).count() == 1 && items.iter().all(fits)
+        }
+        Expr::Object(entries) => {
+            entries.iter().filter(|entry| is_dot(&entry.value)).count() == 1
+                && entries.iter().all(|entry| {
+                    fits(&entry.value)
+                        && match &entry.key {
+                            ObjectKey::Literal(_) => true,
+                            ObjectKey::Expr(key) => off_the_tree_shape(key),
+                            ObjectKey::Bare => false,
+                        }
+                })
+        }
+        _ => false,
+    }
+}
+
 /// `[.]`, `[., <closed>…]` and `{<key>: .}` as a fold's UPDATE (#5875): a container built around
 /// the state itself, with every other element or member closed. The new container takes the moved
 /// state as its one `.` member, so a fold of `N` steps costs `O(N)`. Through the bridge each step
@@ -92509,7 +92541,41 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                                     }
                                     None => (hoisted, Reentry::Proven),
                                 };
-                            eval_each_owned::<S>(ext_expr, &update_val, optional, reentry, sink)
+                            // #6581: a constructor EXTRACT around the state (`[$i, .]`,
+                            // `{i: $i, s: .}`; one `.` member, [`constructor_holds_state_once`]) is built on the owned tree, as an UPDATE of the
+                            // same shape is (#5875, #6528), instead of on the generic route,
+                            // where every read of `.` inside it re-indexes the state. The state
+                            // is one `Rc` clone for a container: it is this step's output and
+                            // the next step's accumulator at once, as the implicit-identity arm
+                            // below already has it. A constructor the step declines (a member
+                            // outside its shapes, the embed table live, yq mode) is untouched
+                            // and runs as before.
+                            let by_value = if constructor_holds_state_once(ext_expr) {
+                                Some(owned_constructor_step::<S>(ext_expr, update_val.clone()))
+                            } else {
+                                None
+                            };
+                            match by_value {
+                                Some(Ok(OwnedStep::Handled(Ok(value)))) => match sink(value) {
+                                    Demand::Continue => Flow::Exhausted,
+                                    Demand::Stop => Flow::Stopped { pending: None },
+                                },
+                                // Only an allocation failure (#6538), as in `fold_step_each`.
+                                Some(Ok(OwnedStep::Handled(Err(error)))) => {
+                                    if optional {
+                                        Flow::Exhausted // patchcov: coverage tolerate-line reason="unreachable in practice: a constructor step errs only on an allocation failure (#6538, #6581)"
+                                    } else {
+                                        Flow::Escaped(Control::Error(error)) // patchcov: coverage tolerate-line reason="unreachable in practice: a constructor step errs only on an allocation failure (#6538, #6581)"
+                                    }
+                                }
+                                _ => eval_each_owned::<S>(
+                                    ext_expr,
+                                    &update_val,
+                                    optional,
+                                    reentry,
+                                    sink,
+                                ),
+                            }
                         }
                         // EXTRACT omitted is EXTRACT `.` (jq desugars `foreach f as
                         // $x (init; update)` to `(init; update; .)`), so the push
