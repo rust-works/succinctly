@@ -57,6 +57,8 @@ seq_identity	--seq -c	.	jsonseq	100mb
 seq_field	--seq -r	.name	jsonseq	100mb
 seq_slurp	--seq -s -c	map(.score)|add	jsonseq	10mb
 users_seq_output	--seq -c	.users[]|.id	users	10mb
+seq_field_bad_first	--seq -r	.name	jsonseq-bad-first	100mb
+seq_field_bad_last	--seq -r	.name	jsonseq-bad-last	100mb
 users_slurpfile	-n --slurpfile d @INPUT@	$d[0].users|length	users	10mb
 ndjson_slurpfile	-n --slurpfile d @INPUT@	$d|length	ndjson	10mb
 users_rawfile	-n --rawfile s @INPUT@	$s|length	users	100mb
