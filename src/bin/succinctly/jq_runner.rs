@@ -6717,6 +6717,21 @@ fn take_unopened_tail(locations: &mut InputLocations) {
     }
 }
 
+/// Whether the JSON text the files `raws` make faults somewhere (#6663). The reads of a program that
+/// reads `input` meet each fault and go on past it, reaching the failures after it as they do, so
+/// the hook places them, whatever the text's last token is. The up-front route cuts its report at
+/// the first fault, which is right only for the main loop's own read of it, and that route is the
+/// one a last value that completes only at its end (`2` of `1 }` and `2`) sends the run to.
+fn json_text_faults(raws: &[Vec<u8>], args: &JqCommand) -> bool {
+    !(args.raw_input
+        || args.seq
+        || args.stream
+        || args.stream_errors
+        || args.input_dsv.is_some()
+        || args.validate)
+        && first_stream_fault(raws).is_some()
+}
+
 /// Whether the first fault of the JSON text the files `raws` make is at its end (#6480): `[1,`
 /// waits for more, so jq's parser asks the reader past the last file before it gives up, and the
 /// fault is raised there. `--seq` and the streaming readers raise their own faults.
@@ -6964,6 +6979,7 @@ fn read_inputs(
         let ends_cleanly = raw_lines_read_whole
             || !seq_fault_ends_of_stream.is_empty()
             || seq_readers_place_reads
+            || json_text_faults(&raws, args)
             || failures.iter().all(|&(at, ref failure)| {
                 // #6615: the reads place a directory given last ([`reach_last_directory`]).
                 failure.kind == InputFileErrorKind::Directory { last: true }
