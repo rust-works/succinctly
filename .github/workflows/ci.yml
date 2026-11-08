@@ -1239,10 +1239,25 @@ jobs:
 
       - name: Install pinned yq
         if: needs.gate.outputs.code == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           V="$(cat tests/data/yq-golden/YQ_VERSION)"
-          curl -fsSL "https://github.com/mikefarah/yq/releases/download/${V}/yq_linux_amd64" \
-            -o /usr/local/bin/yq
+          # `gh release download` fetches through the API asset endpoint. The
+          # github.com/<repo>/releases/download/ URL that curl used returned 504
+          # for hours on 2026-11-08 while the API endpoint kept answering; the
+          # loop covers the shorter blips.
+          for attempt in 1 2 3 4 5; do
+            if gh release download "${V}" -R mikefarah/yq -p yq_linux_amd64 \
+              -O /usr/local/bin/yq --clobber; then
+              break
+            fi
+            if [ "$attempt" = 5 ]; then
+              echo "::error::could not download yq ${V} after $attempt attempts"
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
           chmod +x /usr/local/bin/yq
           yq --version | grep -F "version ${V}"
 
@@ -1267,10 +1282,25 @@ jobs:
 
       - name: Install pinned jq
         if: needs.gate.outputs.code == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           V="$(cat tests/data/jq-golden/JQ_VERSION)"
-          curl -fsSL "https://github.com/jqlang/jq/releases/download/${V}/jq-linux-amd64" \
-            -o /usr/local/bin/jq
+          # `gh release download` fetches through the API asset endpoint. The
+          # github.com/<repo>/releases/download/ URL that curl used returned 504
+          # for hours on 2026-11-08 while the API endpoint kept answering; the
+          # loop covers the shorter blips.
+          for attempt in 1 2 3 4 5; do
+            if gh release download "${V}" -R jqlang/jq -p jq-linux-amd64 \
+              -O /usr/local/bin/jq --clobber; then
+              break
+            fi
+            if [ "$attempt" = 5 ]; then
+              echo "::error::could not download jq ${V} after $attempt attempts"
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
           chmod +x /usr/local/bin/jq
           jq --version | grep -F "${V}"
 
