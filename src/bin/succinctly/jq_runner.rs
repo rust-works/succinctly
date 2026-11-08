@@ -6067,6 +6067,8 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 // the filter's own `input` calls did not read it first: the
                 // loop reports it uncaught, at exit 5, and stops -- the prefix
                 // before it already ran, and nothing after it exists (#2961).
+                // #6620: what the loop has learned of the owned door.
+                let mut door = DoorMemory::default();
                 loop {
                     if stopped(args.on_error, &sink) || !main_loop_reads_on() {
                         break;
@@ -6144,14 +6146,20 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     //
                     // #5498: a `--stream` event is a tree with no source text, read where it is
                     // as the lazy walk's events were (#5681).
-                    evaluate_input_streaming_via(
+                    //
+                    // #6620: a `--seq` record the queue converted is one too, read where it is for
+                    // a program the owned evaluator answers without the reindex bridge, which took
+                    // 30-40% off `.name` over a stream with a diagnostic. `--preserve-input`
+                    // writes its own text and keeps its route, as does a slurped stream.
+                    evaluate_queue_record(
+                        &args,
+                        &mut door,
                         &input,
                         &expr,
                         &context,
                         &ErrorAt::Live(&locations),
                         &mut sink,
                         &output_config,
-                        owned_route_for(args.stream, false, false),
                         &mut |sink, result| {
                             had_output = true;
                             last_output = Some(result.clone());
@@ -14757,20 +14765,63 @@ fn evaluate_input_streaming(
         OwnedRoute::Off,
         on_value,
     )
+    .map(|_| ())
 }
 
 /// The route `run_jq` gives an input that is already a tree (#5681, #5764): a
 /// `--stream` event or a `-R` line (`events`, `raw_line`) always reads it where it is; the array
 /// `--stream -s` slurps (`slurped_stream_array`) does so only for a program the owned evaluator
-/// answers without re-indexing; anything else is written out and read through its own index.
-fn owned_route_for(events: bool, raw_line: bool, slurped_stream_array: bool) -> OwnedRoute {
+/// answers without re-indexing, as does a `--seq` record the queue converted (#6620,
+/// `where_answered`: the caller's [`DoorMemory`] still has the door open); anything else is
+/// written out and read through its own index.
+fn owned_route_for(events: bool, raw_line: bool, where_answered: bool) -> OwnedRoute {
     if events || raw_line {
         OwnedRoute::Always
-    } else if slurped_stream_array {
+    } else if where_answered {
         OwnedRoute::WhereAnswered
     } else {
         OwnedRoute::Off
     }
+}
+
+/// The route of a record the main loop pops off the input queue (#5498, #6620): a `--stream` event
+/// is read where it is, a `--seq` record that is not slurped is too for a program the owned
+/// evaluator answers (while `door` has not seen enough declines to close, [`DoorMemory`]), and
+/// anything else reads its own index.
+fn queue_record_route(args: &JqCommand, door: &DoorMemory) -> OwnedRoute {
+    owned_route_for(
+        args.stream,
+        false,
+        args.seq && !args.slurp && door.is_open(),
+    )
+}
+
+/// [`evaluate_input_streaming_via`] for a record the main loop popped off the input queue, over
+/// the route [`queue_record_route`] picks, with the outcome counted by `door` (#6620).
+#[allow(clippy::too_many_arguments)]
+fn evaluate_queue_record(
+    args: &JqCommand,
+    door: &mut DoorMemory,
+    input: &OwnedValue,
+    expr: &jq::Expr,
+    context: &EvalContext,
+    at: &ErrorAt<'_>,
+    sink: &mut ErrorSink,
+    output_config: &OutputConfig,
+    on_value: &mut dyn FnMut(&mut ErrorSink, OwnedValue) -> Result<bool>,
+) -> Result<()> {
+    let declined = evaluate_input_streaming_via(
+        input,
+        expr,
+        context,
+        at,
+        sink,
+        output_config,
+        queue_record_route(args, door),
+        on_value,
+    )?;
+    door.note(declined);
+    Ok(())
 }
 
 /// How [`evaluate_input_streaming_via`] reads an input that is already a tree.
@@ -14785,6 +14836,46 @@ enum OwnedRoute {
     WhereAnswered,
 }
 
+/// How many records in a row [`OwnedRoute::WhereAnswered`] may decline before a stream stops
+/// asking (#6620).
+const DOOR_DECLINES_BEFORE_CLOSING: u8 = 4;
+
+/// What a stream that reads its records one at a time remembers of [`OwnedRoute::WhereAnswered`]
+/// (#6620).
+///
+/// A program the owned evaluator's doors do not answer is declined by every record, and each
+/// decline costs the doors' look at the record: 2-6% of a `--seq` run's time on a 7950X and an
+/// M4 Pro (`[.id,.name]`, `keys`). The program is the same for every record, so a run of declines
+/// closes the door for the rest of the stream, which reads each record through its own index as
+/// it did before the door. A record the door answers ends the run, so a program some of the
+/// records take it for keeps it. Closing is only a choice of route: both routes print the same.
+#[derive(Default)]
+struct DoorMemory {
+    declined_in_a_row: u8,
+}
+
+impl DoorMemory {
+    fn is_open(&self) -> bool {
+        self.declined_in_a_row < DOOR_DECLINES_BEFORE_CLOSING
+    }
+
+    /// Records whether the record just evaluated was declined by the door. A closed door is
+    /// never asked again, so it stays closed.
+    fn note(&mut self, declined: bool) {
+        if !self.is_open() {
+            return;
+        }
+        self.declined_in_a_row = if declined {
+            self.declined_in_a_row + 1
+        } else {
+            0
+        };
+    }
+}
+
+/// Evaluates `expr` over one input that is already a tree and hands each answer to `on_value`.
+/// Returns whether `OwnedRoute::WhereAnswered` found no door for the program, so the input was
+/// read through its own index instead (#6620): the caller's [`DoorMemory`] counts it.
 #[allow(clippy::too_many_arguments)]
 fn evaluate_input_streaming_via(
     input: &OwnedValue,
@@ -14795,7 +14886,7 @@ fn evaluate_input_streaming_via(
     output_config: &OutputConfig,
     owned_route: OwnedRoute,
     on_value: &mut dyn FnMut(&mut ErrorSink, OwnedValue) -> Result<bool>,
-) -> Result<()> {
+) -> Result<bool> {
     // #2852: `to_json()` always reformats a `NumberLiteral` to jq's own
     // spelling -- before this, every call site here reindexed through it
     // unconditionally, silently reformatting this one input value's own
@@ -14838,12 +14929,14 @@ fn evaluate_input_streaming_via(
         // empty arrays is 257 levels with the slurp wrapper, and is refused), then the tree depth.
         if let Err(e) = check_output_nesting(input, 0).and_then(|()| input.check_tree_depth()) {
             sink.report(DiagStyle::Jq, &e, &at.resolve());
-            return Ok(());
+            return Ok(false);
         }
         on_value(sink, input.clone())?;
-        return Ok(());
+        return Ok(false);
     }
     let mut write_err: Option<anyhow::Error> = None;
+    // Whether `OwnedRoute::WhereAnswered` found no door for the program (#6620).
+    let declined = std::cell::Cell::new(false);
     // Hands one answer to the writer: `None` is nothing to write (genuinely no value, or a failure
     // this call already reported to `sink`, the same "report and keep going" contract the eager
     // path's own arms followed, #355). No depth gate: this runner writes under jq's conventions, whose
@@ -14885,6 +14978,7 @@ fn evaluate_input_streaming_via(
                     {
                         return control;
                     }
+                    declined.set(true);
                 }
                 OwnedRoute::Off => {}
             }
@@ -14926,7 +15020,7 @@ fn evaluate_input_streaming_via(
     if let Some(e) = write_err {
         return Err(e);
     }
-    Ok(())
+    Ok(declined.get())
 }
 
 /// One streamed output as an `OwnedValue`, or `None` when there is nothing to
@@ -23749,6 +23843,198 @@ mod tests {
                     assert_eq!(built, docs, "{filter}: bridge documents built");
                 }
             }
+        }
+    }
+
+    /// #6620: the route of a record the main loop pops. Every output comparison passes whichever
+    /// route is picked, so a branch edited to the wrong route would show up only as the 30-40% a
+    /// `--seq` stream with a diagnostic loses for a program the door answers.
+    #[test]
+    fn a_popped_seq_record_takes_the_owned_door_where_answered_6620() {
+        use clap::Parser;
+        let route = |argv: &[&str], door: &DoorMemory| {
+            let mut full = vec!["jq"];
+            full.extend_from_slice(argv);
+            queue_record_route(&JqCommand::try_parse_from(full).unwrap(), door)
+        };
+        let open = DoorMemory::default();
+        let mut closed = DoorMemory::default();
+        for _ in 0..DOOR_DECLINES_BEFORE_CLOSING {
+            closed.note(true);
+        }
+        // (flags, route with the door open)
+        let rows = [
+            (&["--seq", ".name"][..], OwnedRoute::WhereAnswered),
+            (&["--seq", "-c", "keys"], OwnedRoute::WhereAnswered),
+            // A slurped stream is one array, read the way `--stream -s`'s is (#5764).
+            (&["--seq", "-s", ".name"], OwnedRoute::Off),
+            // Plain JSON and DSV rows have no door here.
+            (&[".name"], OwnedRoute::Off),
+            // A `--stream` event is read where it is, closed door or not.
+            (&["--stream", ".[1]"], OwnedRoute::Always),
+            (&["--seq", "--stream", ".[1]"], OwnedRoute::Always),
+        ];
+        for (argv, want) in rows {
+            assert!(route(argv, &open) == want, "{argv:?}, door open");
+            let closed_want = if want == OwnedRoute::WhereAnswered {
+                OwnedRoute::Off
+            } else {
+                want
+            };
+            assert!(route(argv, &closed) == closed_want, "{argv:?}, door closed");
+        }
+    }
+
+    /// #6620: the main loop's own call counts what the door did with each record: a program no
+    /// door answers closes it after a run, a program it answers keeps it open, and a closed door
+    /// reads each record through its own index (which prints what the open one does).
+    #[test]
+    fn the_main_loop_closes_the_door_on_a_program_it_declines_6620() {
+        use clap::Parser;
+        let config = OutputConfig {
+            compact: true,
+            raw_output: false,
+            join_output: false,
+            raw_output0: false,
+            ascii_output: false,
+            color_output: false,
+            color_scheme: ColorScheme::default(),
+            sort_keys: false,
+            indent_string: String::new(),
+            unbuffered: false,
+            seq: true,
+            convention: JsonConvention::JqCompat,
+        };
+        let record = OwnedValue::object_from([
+            ("id".to_string(), OwnedValue::Int(7)),
+            ("name".to_string(), OwnedValue::String("n".into())),
+        ]);
+        let args = JqCommand::try_parse_from(["jq", "--seq", "-c", "."]).unwrap();
+        // The door left open after `records` records of `filter`, and what each printed.
+        let run = |filter: &str, records: usize| -> (bool, Vec<Vec<String>>) {
+            let expr = jq::parse(filter).expect("parses");
+            let mut door = DoorMemory::default();
+            let mut printed = Vec::new();
+            for _ in 0..records {
+                let mut outputs = Vec::new();
+                evaluate_queue_record(
+                    &args,
+                    &mut door,
+                    &record,
+                    &expr,
+                    &EvalContext::default(),
+                    &ErrorAt::Fixed(InputLocation::unknown()),
+                    &mut ErrorSink::default(),
+                    &config,
+                    &mut |_, value| {
+                        outputs.push(value.to_json());
+                        Ok(true)
+                    },
+                )
+                .expect("evaluates");
+                printed.push(outputs);
+            }
+            (door.is_open(), printed)
+        };
+        let n = usize::from(DOOR_DECLINES_BEFORE_CLOSING);
+        for filter in ["[.id,.name]", "keys"] {
+            let (open, printed) = run(filter, n - 1);
+            assert!(open, "{filter}: one short of the run");
+            let (open, printed_more) = run(filter, n + 3);
+            assert!(!open, "{filter}: a run of declines closes it");
+            assert!(
+                printed_more.windows(2).all(|pair| pair[0] == pair[1]),
+                "{filter}: the closed door prints what the open one did"
+            );
+            assert_eq!(printed[0], printed_more[0], "{filter}");
+        }
+        for filter in [".name", "{id,name}", "."] {
+            let (open, _) = run(filter, n + 3);
+            assert!(open, "{filter}: an answered program keeps the door open");
+        }
+    }
+
+    /// #6620: a run of declines closes the door for the rest of the stream, a record the door
+    /// answers ends the run, and a closed door stays closed.
+    #[test]
+    fn a_run_of_declines_closes_the_owned_door_6620() {
+        let mut door = DoorMemory::default();
+        assert!(door.is_open());
+        for _ in 0..DOOR_DECLINES_BEFORE_CLOSING - 1 {
+            door.note(true);
+        }
+        assert!(door.is_open(), "one short of the run");
+        door.note(false);
+        for _ in 0..DOOR_DECLINES_BEFORE_CLOSING - 1 {
+            door.note(true);
+        }
+        assert!(door.is_open(), "an answer ended the run");
+        door.note(true);
+        assert!(!door.is_open(), "a full run closes it");
+        door.note(false);
+        assert!(
+            !door.is_open(),
+            "an answer after the close does not reopen it"
+        );
+    }
+
+    /// #6620: `evaluate_input_streaming_via` says whether `WhereAnswered` declined, which is what
+    /// the main loop's [`DoorMemory`] counts, and no other route ever does. The programs are the
+    /// ones #6620 measured: `.name` is answered, `[.id,.name]` and `keys` are declined.
+    #[test]
+    fn the_door_reports_a_decline_6620() {
+        let config = OutputConfig {
+            compact: true,
+            raw_output: false,
+            join_output: false,
+            raw_output0: false,
+            ascii_output: false,
+            color_output: false,
+            color_scheme: ColorScheme::default(),
+            sort_keys: false,
+            indent_string: String::new(),
+            unbuffered: false,
+            seq: true,
+            convention: JsonConvention::JqCompat,
+        };
+        let record = OwnedValue::object_from([
+            ("id".to_string(), OwnedValue::Int(7)),
+            ("name".to_string(), OwnedValue::String("n".into())),
+        ]);
+        let run = |filter: &str, route: OwnedRoute| -> (Vec<String>, bool) {
+            let expr = jq::parse(filter).expect("parses");
+            let mut outputs = Vec::new();
+            let mut sink = ErrorSink::default();
+            let declined = evaluate_input_streaming_via(
+                &record,
+                &expr,
+                &EvalContext::default(),
+                &ErrorAt::Fixed(InputLocation::unknown()),
+                &mut sink,
+                &config,
+                route,
+                &mut |_, value| {
+                    outputs.push(value.to_json());
+                    Ok(true)
+                },
+            )
+            .expect("evaluates");
+            (outputs, declined)
+        };
+        for (filter, declined) in [
+            (".name", false),
+            (".", false),
+            ("[.id,.name]", true),
+            ("keys", true),
+        ] {
+            let (want, off) = run(filter, OwnedRoute::Off);
+            assert!(!off, "{filter}: the old route declines nothing");
+            let (got, said) = run(filter, OwnedRoute::WhereAnswered);
+            assert_eq!(got, want, "{filter}: outputs");
+            assert_eq!(said, declined, "{filter}: declined");
+            let (got, always) = run(filter, OwnedRoute::Always);
+            assert_eq!(got, want, "{filter}: outputs, always");
+            assert!(!always, "{filter}: `Always` never declines");
         }
     }
 
