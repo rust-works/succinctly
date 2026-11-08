@@ -6128,6 +6128,9 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
     // arms rather than `.unwrap()`/`.expect()` because the *type* (`Result`)
     // is what lets a real failure, if this invariant is ever violated by a
     // future change, surface as a normal `EvalError` instead of a panic.
+    // #6666: the memos belong to a document, and `rebuilt` is this bridge's own (a `rooted` one
+    // is the caller's, whose scope is already open: opening it again is a no-op).
+    let _scope = enter_document_scope(cursor.document_token());
     query_result_to_generic::<V, S>(full_eval::<Vec<u64>, S>(&expr, cursor))
 }
 
@@ -12385,6 +12388,21 @@ fn eval_with_cursor_unscoped<S: EvalSemantics, C: DocumentCursor>(
         }
     }
     eval_with_cursor_shipped::<S, C>(expr, cursor)
+}
+
+/// What [`enter_document_scope`] opens: the per-document memos (the slot scans, #3702, and the
+/// key and element indexes beside them, #3913, #4035), closed when it drops.
+pub(crate) type DocumentScope = slot_memo::Guard;
+
+/// Open the memos for evaluations over the document `token` names (#6666).
+///
+/// The generic evaluator opens them at each entry point, over the document it was handed. The
+/// owned evaluator's reindex bridge builds a document of its own and evaluates over it, and a
+/// memo is consulted only for the document it was opened for, so without this a loop over that
+/// document's array (`[range(N)] | [range(0; length) as $i | .[$i]]`) walked the whole array on
+/// every read instead of building the element index on the third.
+pub(crate) fn enter_document_scope(token: usize) -> DocumentScope {
+    slot_memo::enter(token)
 }
 
 /// [`eval_with_cursor_unscoped`]'s route for every program the path-mode
@@ -26460,7 +26478,7 @@ fn slice_one_generic<S: EvalSemantics, V: DocumentValue>(
 /// O(range), not O(length). A delimiter that walk raises on keeps the
 /// collecting read for the computed spelling `E[S:T]`, which never ran its checks and still
 /// does not; `strict` (the literal spelling, #6231) raises it instead, as the bridge did.
-fn to_owned_array_slice<S: EvalSemantics, V: DocumentValue>(
+pub(crate) fn to_owned_array_slice<S: EvalSemantics, V: DocumentValue>(
     elements: &V::Elements,
     start: Option<i64>,
     end: Option<i64>,

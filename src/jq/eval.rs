@@ -39,6 +39,7 @@ use std::rc::Rc;
 use core::marker::PhantomData;
 use indexmap::IndexMap;
 
+use super::array_index;
 use super::document::{
     effective_fields, effective_fields_checked, effective_keys, effective_len_checked,
     key_display_string, key_display_string_kind, tail_gap_ok, DisplayKeyGuard, DocumentCursor,
@@ -3865,74 +3866,43 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         Expr::Slice { start, end, .. } => match value {
             StandardJson::Array(elements) => {
-                let all: Vec<_> = elements.collect();
-                // jq array slicing yields a single sub-array, not a stream of
-                // elements. #1932: `to_owned`, not an unchecked
-                // `to_owned_lossy`, per element -- an undecodable element's string
-                // content must raise `decode_failure`, not silently become
-                // `""` (the same #1755 shape the adjacent `StandardJson::
-                // Object` arm below already guards against; this arm was
-                // apparently missed when #1755 patched that one). Mirrors
-                // that `Object` arm's own single `to_owned` call
-                // (code review, #1941: an earlier version of this fix used
-                // `promote_borrowed` instead, built for a different
-                // shape -- accumulating a partial prefix for a fan-out
-                // stream to report on error -- that this single-aggregate-
-                // value arm has no use for and was discarding unconditionally).
-                // #2001: `suppress_or_raise`, not an unconditional `Error`
-                // -- a #1194 malformed-member error nested inside a sliced
-                // element respects `optional` the same way the sibling
-                // `Object` arm below already does (#1953); can't use the
-                // `to_owned_or_suppress!` macro directly inside
-                // `.map()` here since its `return` would return from the
-                // closure, not this function.
+                // #6666: only the sliced range is read, by index once the array has proved wide
+                // (#4035), as the generic evaluator's own slice does (#4287, #6231). This arm
+                // collected and decoded every element and took the range afterwards, so a loop
+                // of narrow slices over one array (`range(...) as $i | .[$i:$i+2]`) was
+                // quadratic. `strict`: a delimiter the walk raises on raises here too.
                 //
-                // Validated unconditionally, ahead of the #3306 fast path
-                // just below: `test_style_0012_routed_sites_still_raise_2334`
-                // pins `.[0:1]` on a malformed single-element array as one of
-                // the "routed sites" that must still raise eagerly, which an
-                // early return *before* this validation would silently skip
-                // -- a slice is a materializing operation for this purpose
-                // even when its own range happens to be the identity one,
-                // unlike a bare `.`/`Expr::Identity`, which never decodes at
-                // all.
-                let items = match all
-                    .iter()
-                    .map(to_owned::<S, _>)
-                    .collect::<Result<Vec<_>, _>>()
-                {
+                // #1932/#2001: `to_owned_array_slice` converts the range's elements in order, so
+                // the first undecodable one raises, and `suppress_or_raise` lets `?` suppress it.
+                let items = match super::eval_generic::to_owned_array_slice::<S, StandardJson<'_, W>>(
+                    &elements, *start, *end, true,
+                ) {
                     Ok(items) => items,
                     Err(e) => return suppress_or_raise(e, optional),
                 };
-                // Fast path (#3306, jq mode only): jq's own slice identity
-                // rule -- `jv_slice(a, 0, len)` hands back `a` itself, not a
-                // copy, so a slice naming every element of a non-empty array
-                // must return the original value unchanged, the same as
-                // the syntactically fully-open spelling (`.[0:]`; `.[:]` too in
-                // yq mode, where jq's grammar does not apply, #4407)
-                // this fast path already special-cased -- widened here to
-                // any closed bound pair that happens to resolve to the
-                // same range (`.[0:2]` on a 2-element array, `.[0:5]` on
-                // one with fewer than 5 elements, ...). Mode-gated the same
-                // way, and for the same reason, as `eval_generic.rs`'s own
-                // native `Expr::Slice` arm (see its doc comment): real yq's
-                // own slicing always re-marshals its result to a fresh
-                // style regardless of range, so preserving style through a
-                // full-range slice here would diverge in yq mode for a
-                // jq-only extension's benefit.
-                if S::TAG != EvalTag::Yq
-                    && SliceBounds::from_literals(*start, *end).is_full_range(all.len())
-                {
-                    return QueryResult::One(value);
+                // Fast path (#3306, jq mode only): jq's own slice identity rule --
+                // `jv_slice(a, 0, len)` hands back `a` itself, not a copy, so a slice naming
+                // every element of a non-empty array must return the original value
+                // unchanged, the same as the syntactically fully-open spelling (`.[0:]`; `.[:]`
+                // too in yq mode, where jq's grammar does not apply, #4407) this fast path
+                // already special-cased -- widened here to any closed bound pair that happens
+                // to resolve to the same range (`.[0:2]` on a 2-element array, `.[0:5]` on one
+                // with fewer than 5 elements, ...). Mode-gated the same way, and for the same
+                // reason, as `eval_generic.rs`'s own native `Expr::Slice` arm (see its doc
+                // comment): real yq's own slicing always re-marshals its result to a fresh
+                // style regardless of range, so preserving style through a full-range slice
+                // here would diverge in yq mode for a jq-only extension's benefit. The range
+                // was decoded above (a slice is a materializing operation for this purpose,
+                // `test_style_0012_routed_sites_still_raise_2334`), so handing the original
+                // back skips nothing the identity rule did not already pay.
+                if S::TAG != EvalTag::Yq {
+                    if let Ok(len) = array_index::len_checked_memoized(&elements) {
+                        if SliceBounds::from_literals(*start, *end).is_full_range(len) {
+                            return QueryResult::One(value);
+                        }
+                    }
                 }
-                let range = SliceBounds::from_literals(*start, *end).resolve(all.len());
-                QueryResult::Owned(OwnedValue::Array(
-                    items
-                        .into_iter()
-                        .skip(range.start)
-                        .take(range.len())
-                        .collect(),
-                ))
+                QueryResult::Owned(OwnedValue::Array(items.into()))
             }
             // yq treats a null/number/boolean target as an empty container
             // for slicing purposes (#1065, verified live against real yq
@@ -13252,16 +13222,29 @@ fn eval_each_owned_past_front_doors_in<S: EvalSemantics>(
         }
     };
     let cursor = doc.root();
+    // #6666: the memos (element index, key index, slot scans) belong to a document, and this one
+    // is the bridge's own: a loop over its arrays reads each by index, so an unscoped read walks
+    // the whole array every time.
+    //
+    // Only while the program runs over this document: the `sink` continues the *caller's*
+    // program, often a fan-out over its own document, whose memos a nested scope replaces. So
+    // the scope is left around each `sink` call and entered again after it.
+    let token = cursor.document_token();
+    let mut scope = Some(super::eval_generic::enter_document_scope(token));
 
     eval_each::<Vec<u64>, S>(expr, cursor.value(), optional, &mut |item| {
         // The document is `to_json_for_reindex` of an already-decoded value, so there is
         // nothing to fail to decode (the same lossy read `Item::into_owned_lossy` made here
         // before it learned to share, #5487).
-        sink(match item {
+        let value = match item {
             // STYLE-0012: a reindexed, already-decoded value cannot fail to decode.
             Item::Borrowed(v) => to_owned_lossy_shared::<S, _>(&v),
             Item::Owned(v) => v,
-        })
+        };
+        drop(scope.take());
+        let demand = sink(value);
+        scope = Some(super::eval_generic::enter_document_scope(token));
+        demand
     })
 }
 
@@ -43258,6 +43241,17 @@ fn get_element_at_index<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // means either jq mode, or yq mode with `resolved >= 0`.
         return Ok(None);
     }
+    // #6666: an array the length lookup has proved wide and read again has an element index
+    // (`array_index`), which answers in one lookup where `get_fast` selects. Only an answer is
+    // taken from it: a read it cannot answer keeps `get_fast`, which is cheaper than the memo's
+    // own walk.
+    if let array_index::Read::Answered(found) = array_index::memo::get(&elements, resolved as usize)
+    {
+        return Ok(match found {
+            array_index::Element::Found(cursor) => Some(cursor.value()),
+            array_index::Element::Past => None,
+        });
+    }
     Ok(elements.get_fast(resolved as usize))
 }
 
@@ -43270,7 +43264,10 @@ fn get_element_at_index<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 fn count_elements<W: Clone + AsRef<[u64]>>(
     elements: JsonElements<'_, W>,
 ) -> Result<usize, EvalError> {
-    elements.len_checked()
+    // #6666: the memoized length, as the generic evaluator's own `Expr::Index` arm asks it
+    // (#4035): the same walk and the same checks until the array has proved wide, then the
+    // element index's length.
+    array_index::len_checked_memoized(&elements)
 }
 
 /// Evaluate a jq expression against a JSON cursor.
@@ -116066,6 +116063,45 @@ mod tests {
             ),
         ] {
             assert_eq!(outputs(records, filter), [expected], "{filter}");
+        }
+    }
+
+    /// #6666: a loop that reads an array the program built by index, or by a narrow slice, answers
+    /// from the element index (#4035) instead of walking the array on every read. The reindex
+    /// bridge builds a document of its own, so the memo is opened for it there: one index is built
+    /// (on the third length lookup) and every later read of the loop is a hit. The slice arm reads
+    /// only its range, so the loop is O(reads), not O(reads x length).
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_loop_over_an_owned_array_reads_its_element_index_6666() {
+        use crate::jq::array_index::memo;
+        let input = OwnedValue::array_from((0..2000).map(OwnedValue::Int).collect::<Vec<_>>());
+        for (filter, expected) in [
+            ("[range(0; length; 2) as $i | .[$i]] | length", "1000"),
+            ("[range(0; length; 2) as $i | .[$i:$i+2]] | length", "1000"),
+            ("[range(0; length; 2) as $i | .[3:5]] | length", "1000"),
+            (
+                "[range(0; length; 2) as $i | .[$i:$i+2][1]] | add",
+                "1000000",
+            ),
+        ] {
+            let expr = parse(filter).unwrap();
+            let before = memo::work();
+            let mut out = Vec::new();
+            let flow =
+                eval_each_owned::<JqSemantics>(&expr, &input, false, Reentry::REBUILT, &mut |v| {
+                    out.push(v.to_json());
+                    Demand::Continue
+                });
+            assert!(matches!(flow, Flow::Exhausted), "{filter}");
+            assert_eq!(out, [expected], "{filter}");
+            let (builds, hits) = memo::work();
+            assert_eq!(builds - before.0, 1, "{filter}: one index for the loop");
+            assert!(
+                hits - before.1 >= 900,
+                "{filter}: the index answered the loop's reads ({} hits)",
+                hits - before.1
+            );
         }
     }
 
