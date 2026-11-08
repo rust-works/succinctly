@@ -13219,6 +13219,10 @@ fn eval_each_owned_past_front_doors_in<S: EvalSemantics>(
     if let Some(flow) = owned_select_door::<S>(expr, input, optional, reentry, sink) {
         return flow;
     }
+    // #6437: `fromjson` of a string (a `-R` line) is parsed in place, not through the bridge.
+    if let Some(flow) = owned_fromjson_door::<S>(expr, input, optional, reentry, sink) {
+        return flow;
+    }
     // #5764: no door answers this program, and the caller has a route that reads it better than
     // the bridge below. Before the reroot, which only the bridge needs.
     if let Some(declined) = declined {
@@ -13363,6 +13367,60 @@ fn owned_select_door<S: EvalSemantics>(
         });
     }
     Some(RestPipe::new(stages).run_owned::<S>(input, optional, Reentry::REBUILT, sink))
+}
+
+/// A leading `fromjson` over an owned string (#6437), parsed in place.
+///
+/// `jq -R 'fromjson | ...'` hands every line to the bridge as an owned string; the bridge writes it
+/// out as JSON text, indexes that, and `fromjson` then decodes the string back out of the index
+/// before parsing it: about a fifth of the run at 10 MB. The text is already in hand, and the parse
+/// is [`parse_complete_json`], the one [`builtin_fromjson`] runs, so a text that parses gives the
+/// value the bridge gives. The result is a fresh value that names no node of `input`, so the rest of
+/// the pipe starts on it as it would on any owned value.
+///
+/// A text that does not parse declines the whole pipe to the bridge, which raises its error with
+/// its own wording and location. `optional`, an active embed table, a re-entry that is not the
+/// rebuilt one, yq mode (its own parse and errors) and a rest that reads the node's place all
+/// decline too, as [`owned_select_door`] does.
+fn owned_fromjson_door<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+    reentry: Reentry,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Option<Flow> {
+    if optional
+        || S::TAG != EvalTag::Jq
+        || reentry != Reentry::REBUILT
+        || super::eval_generic::embed_table_active()
+    {
+        return None;
+    }
+    let OwnedValue::String(text) = input else {
+        return None;
+    };
+    let stages = match unwrap_paren(expr) {
+        Expr::Pipe(stages) => skip_identity_stages(stages),
+        single => core::slice::from_ref(single),
+    };
+    let [first, rest @ ..] = stages else {
+        return None;
+    };
+    if !matches!(unwrap_paren(first), Expr::Builtin(Builtin::FromJson)) {
+        return None;
+    }
+    let rest = skip_identity_stages(rest);
+    if rest.iter().any(needs_path_context) {
+        return None;
+    }
+    let value = parse_complete_json(text, false).ok()?;
+    if rest.is_empty() {
+        return Some(match sink(value) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped { pending: None },
+        });
+    }
+    Some(RestPipe::new(rest).run_owned::<S>(&value, optional, Reentry::REBUILT, sink))
 }
 
 /// The condition of a stage [`owned_select_door`] settles, and whether it keeps the input when the
