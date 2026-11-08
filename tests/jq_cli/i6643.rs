@@ -29,7 +29,7 @@ fn each_fault_of_a_seq_stream_is_placed_by_its_own_read_beside_a_last_directory_
     }
     std::fs::create_dir(dir.path().join("dd"))?;
     let path = |name: &str| match name {
-        "dd" => format!("{d}/dd"),
+        "dd" | "gone" => format!("{d}/{name}"),
         _ => format!("{d}/{name}.seq"),
     };
     for (flags, program, names, stdout, stderr, status) in [
@@ -50,6 +50,14 @@ fn each_fault_of_a_seq_stream_is_placed_by_its_own_read_beside_a_last_directory_
         (&["-n"][..], "[(try input catch .),(try input catch .),(try input catch .)]", &["nonl", "trunc", "dd"][..], "\u{1e}[1,\"Potentially truncated top-level numeric value at line 2, column 3\",\"Unfinished JSON term at EOF at line 2, column 6\"]\n", "", 2),
         (&["-n"][..], "[(try input catch .),(try input catch .),(try input catch .)]", &["trunc", "nonl", "dd"][..], "\u{1e}[\"Truncated value at line 1, column 5\",1,\"Potentially truncated top-level numeric value at EOF at line 2, column 2\"]\n", "", 2),
         (&["-n"][..], "[(try input catch .),(try input catch .),(try input catch .)]", &["bad1", "nonl", "dd"][..], "\u{1e}[\"Truncated value at line 2, column 1\",1,\"Potentially truncated top-level numeric value at EOF at line 3, column 2\"]\n", "", 2),
+        // The streaming readers (`--seq --stream`, `--stream-errors`) read their faults with another
+        // reader and keep the rule of faults all before the end (#6610): the rows fail without it.
+        (&["--stream"][..], "[inputs]", &["f", "gone", "dd"][..], "\u{1e}[]\n", "jq: error (at @DIR@/f.seq:3): Truncated value at line 3, column 1\njq: error: Could not open file @DIR@/gone: No such file or directory\n", 2),
+        (&["--stream"][..], "input", &["f", "gone", "dd"][..], "", "jq: error (at @DIR@/f.seq:3): Truncated value at line 3, column 1\njq: error: Could not open file @DIR@/gone: No such file or directory\njq: error (at @DIR@/dd:0): break\n", 2),
+        (&["--stream", "-n"][..], "[inputs]", &["f", "dd"][..], "", "jq: error (at @DIR@/f.seq:3): Truncated value at line 3, column 1\n", 5),
+        (&["--stream", "-n"][..], "input", &["twomid", "dd"][..], "\u{1e}[[],1]\n", "", 0),
+        (&["--stream-errors", "-n"][..], "input", &["f", "dd"][..], "\u{1e}[[],1]\n", "", 0),
+        (&["--stream-errors", "-n"][..], "input", &["twomid", "dd"][..], "\u{1e}[[],1]\n", "", 0),
     ] {
         let mut args = vec!["--seq", "-c"];
         args.extend_from_slice(flags);
