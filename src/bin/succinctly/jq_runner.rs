@@ -9801,10 +9801,19 @@ fn last_directory_left_to_reads(
 ) -> bool {
     (args.null_input || track_eof)
         && !args.slurp
-        && reads_place_json_or_text_failures(args)
+        && (reads_place_json_or_text_failures(args) || stream_errors_reads_place_failures(args))
         && failures.len() > 1
         && reached == failures.len()
         && ends_in_last_directory(failures)
+}
+
+/// Whether `args` read JSON text with `--stream-errors` alone: its in-memory route (without `-n`, or
+/// with a program that reads `input`) is placed by the reads as a JSON text is (#6661), where
+/// `--seq`, DSV and `--validate` place their own. Not [`reads_place_json_or_text_failures`], which
+/// also gates [`fault_leaves_failures_to_reads`]: a `--stream-errors` fault is an event the
+/// reader goes on past, not one that stops the program ahead of the directory.
+fn stream_errors_reads_place_failures(args: &JqCommand) -> bool {
+    args.stream_errors && !(args.seq || args.input_dsv.is_some() || args.validate)
 }
 
 /// Whether a `-n` run's text faults before some of its open failures, which the fault left out of
