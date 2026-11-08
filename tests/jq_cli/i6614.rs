@@ -62,3 +62,51 @@ fn a_chain_past_the_nesting_limit_is_refused_as_jq_6614() -> Result<()> {
     assert_eq!((stdout.as_str(), code), ("", 5));
     Ok(())
 }
+
+/// `fromjson` reads the same reader: text 65 to 127 levels deep (it used to go the general way) must
+/// answer as before, number spellings and a repeated key included, and a truncated one is still
+/// refused in jq's words.
+#[test]
+fn fromjson_across_the_text_readers_old_limit_answers_as_jq_6614() -> Result<()> {
+    for (depth, leaf, want) in [
+        (
+            64,
+            "{\"a\":1.50,\"a\":2,\"b\":100000000000000000000}",
+            "161\n",
+        ),
+        (64, "0.10", "132\n"),
+        (
+            65,
+            "{\"a\":1.50,\"a\":2,\"b\":100000000000000000000}",
+            "163\n",
+        ),
+        (65, "0.10", "134\n"),
+        (
+            100,
+            "{\"a\":1.50,\"a\":2,\"b\":100000000000000000000}",
+            "233\n",
+        ),
+        (100, "0.10", "204\n"),
+        (
+            127,
+            "{\"a\":1.50,\"a\":2,\"b\":100000000000000000000}",
+            "287\n",
+        ),
+        (127, "0.10", "258\n"),
+    ] {
+        let text = format!("{}{leaf}{}", "[".repeat(depth), "]".repeat(depth));
+        let input = serde_json::to_string(&text)?;
+        let (stdout, stderr, code) =
+            run_jq_full(&["-c", "fromjson | tojson | length"], Some(&input))?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (want, "", 0),
+            "{depth} levels"
+        );
+    }
+    let text = format!("{}1{}", "[".repeat(100), "]".repeat(99));
+    let input = serde_json::to_string(&text)?;
+    let (stdout, _, code) = run_jq_full(&["-c", "try fromjson catch ."], Some(&input))?;
+    assert_eq!((stdout.as_str(), code), ("\"Unfinished JSON term at EOF at line 1, column 200 (while parsing '[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]')\"\n", 0));
+    Ok(())
+}

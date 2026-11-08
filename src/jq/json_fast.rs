@@ -561,6 +561,33 @@ mod tests {
         assert!(parse_plain_at(chain(65).as_bytes(), 0).is_none());
     }
 
+    /// #6614: the reader recurses once per level, and the limit is now 128. A debug build has the
+    /// largest frames, so a 256 KiB thread (an eighth of the 2 MiB a library caller's spawned thread
+    /// gets) reading the deepest nesting it accepts, as arrays and as objects, shows the room that
+    /// is left.
+    #[cfg(feature = "std")]
+    #[test]
+    fn the_deepest_nesting_is_read_on_a_small_stack_6614() {
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                // MAX_DEPTH containers, the innermost empty: a scalar inside the last one would
+                // be a value at depth MAX_DEPTH, which the reader declines.
+                let arrays = alloc::format!("{}{}", "[".repeat(MAX_DEPTH), "]".repeat(MAX_DEPTH));
+                let objects = alloc::format!(
+                    "{}{{}}{}",
+                    r#"{"a":"#.repeat(MAX_DEPTH - 1),
+                    "}".repeat(MAX_DEPTH - 1)
+                );
+                for text in [arrays, objects] {
+                    let value = parse_plain(&text).expect("the deepest nesting is read");
+                    assert_eq!(value.to_json(), text);
+                }
+            })
+            .expect("spawns");
+        handle.join().expect("no stack overflow");
+    }
+
     #[test]
     fn nesting_past_the_limit_is_declined() {
         let deep = |n: usize| alloc::format!("{}{}", "[".repeat(n), "]".repeat(n));
