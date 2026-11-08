@@ -1855,6 +1855,7 @@ fn spawn_eval_thread() -> Result<std::thread::JoinHandle<Result<()>>> {
 fn main() -> Result<()> {
     #[cfg(all(target_arch = "x86_64", target_feature = "popcnt"))]
     require_popcnt();
+    malloc_arena::use_one();
     // Run everything on a thread with an explicitly sized stack, then
     // propagate its result. A panic in the child is resumed here rather than
     // swallowed, so panic behaviour (and the abort/backtrace a panic produces)
@@ -3022,6 +3023,7 @@ mod jq_seq_reader;
 mod jq_stream_errors;
 mod json_validate;
 mod m2_gate;
+mod malloc_arena;
 mod output;
 mod select_stats_report;
 mod sigpipe;

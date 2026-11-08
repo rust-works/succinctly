@@ -91,6 +91,7 @@ jobs:
               - 'src/jq/math.rs'
               - 'src/jq/local_zone.rs'
               - 'src/bin/succinctly/address_space.rs'
+              - 'src/bin/succinctly/malloc_arena.rs'
               - 'src/bin/succinctly/bench_runner/utils.rs'
               - 'src/bin/succinctly/compare/*.rs'
               - 'src/bin/succinctly/dsv_bench.rs'
