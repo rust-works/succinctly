@@ -6006,7 +6006,11 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     if stopped(args.on_error, &sink) || !main_loop_reads_on() {
                         break;
                     }
-                    let input = match jq::pop_input() {
+                    // #6604: the loop's own read, which a slurp's directory is not read by.
+                    MAIN_LOOP_READ.with(|own| own.set(true));
+                    let popped = jq::pop_input();
+                    MAIN_LOOP_READ.with(|own| own.set(false));
+                    let input = match popped {
                         jq::InputPop::Document(input) => input,
                         // #6141: `--seq --stream`'s end-of-stream stop ends the input call that met it,
                         // and the main loop when it is the one that pops it.
@@ -6697,6 +6701,7 @@ fn read_inputs(
     LAZY_STREAM_INPUTS.with(|slot| *slot.borrow_mut() = None);
     defer_open_failures(Vec::new(), false);
     LAZY_OPEN_FAILED.with(|seen| seen.set(false));
+    SLURP_DIRECTORY_READ.with(|slurp| slurp.set(false));
     UNOPENED_TAIL_NAME.with(|tail| *tail.borrow_mut() = None);
     LAST_VALUE_AT_TAIL.with(|at| at.set(false));
     FAULT_AT_TAIL.with(|at| at.set(false));
@@ -6887,6 +6892,24 @@ fn read_inputs(
                 let mut failures = failures;
                 failures.truncate(reached);
                 defer_open_failures(failures, false);
+            } else if args.slurp
+                && (args.null_input || track_eof)
+                && matches!(
+                    failures[..reached].last(),
+                    Some((_, e)) if e.kind == InputFileErrorKind::Directory { last: true }
+                )
+            {
+                // #6604: a slurp that reads `input` asks for one more input after the array, and
+                // jq's reader reads the directory then, so the read that finds the stream at its
+                // end says `Is a directory`. A program that never makes that read does not.
+                let mut failures = failures;
+                failures.truncate(reached);
+                let directory = failures.split_off(reached - 1);
+                report_open_failures(&failures, open_failed);
+                // It fails the run whether or not a read reaches it.
+                *open_failed = true;
+                defer_open_failures(directory, false);
+                SLURP_DIRECTORY_READ.with(|slurp| slurp.set(true));
             } else {
                 report_open_failures(&failures[..reached], open_failed);
             }
@@ -8946,6 +8969,14 @@ thread_local! {
         const { RefCell::new(std::collections::VecDeque::new()) };
     /// Whether a pending failure was reported by a read, which makes the run exit 2 (#6475).
     static LAZY_OPEN_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether the pending failure is a directory last in a slurp that reads `input` (#6604): the
+    /// read that finds the stream at its end says it, where every other route leaves it out.
+    static SLURP_DIRECTORY_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether the failure being reported is reported by such a read, and not by the run's own
+    /// flush of what its reads did not reach.
+    static REPORTED_BY_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether the read in progress is the main loop's own (#6604), and not the program's.
+    static MAIN_LOOP_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Whether the program itself reads `input`, `inputs` or `input_line_number` (#6522), which
     /// [`read_inputs`]' `track_eof` cannot say for `--seq`: its main loop reads through the queue
     /// whatever the program is.
@@ -9132,7 +9163,12 @@ fn source_ends_cleanly(bytes: &[u8], args: &JqCommand) -> bool {
 /// (#6475). After the seed, which clears the hook.
 fn install_open_failure_hook() {
     if PENDING_OPEN_FAILURES.with(|pending| !pending.borrow().is_empty()) {
-        jq::set_input_read_hook(report_reached_open_failures);
+        jq::set_input_read_hook(|read, fault| {
+            REPORTED_BY_READ
+                .with(|by_read| by_read.set(!MAIN_LOOP_READ.with(std::cell::Cell::get)));
+            report_reached_open_failures(read, fault);
+            REPORTED_BY_READ.with(|by_read| by_read.set(false));
+        });
     }
 }
 
@@ -9522,7 +9558,10 @@ impl std::error::Error for InputFileOpenError {}
 fn report_unopenable_input(e: &InputFileOpenError, open_failed: &mut bool) {
     // #6472: jq's reader does not ask for more after the last file, so a directory there is not
     // reported, but it still fails the run.
-    if !matches!(e.kind, InputFileErrorKind::Directory { last: true }) {
+    // #6604: but a slurp's extra read does read it.
+    let by_slurp_read = SLURP_DIRECTORY_READ.with(std::cell::Cell::get)
+        && REPORTED_BY_READ.with(std::cell::Cell::get);
+    if by_slurp_read || !matches!(e.kind, InputFileErrorKind::Directory { last: true }) {
         report_usage_error(&e.to_string());
     }
     *open_failed = true;
