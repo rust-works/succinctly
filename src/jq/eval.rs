@@ -89005,10 +89005,12 @@ fn owned_one_value_stage(stage: &Expr) -> bool {
         )
 }
 
-/// Whether `expr` is an array or object constructor with at most one member that is `.` itself
-/// (`[$i, .]`, `{i: $i, s: .}`, `[.a, .b]`) and every other member, and key, a shape
-/// [`off_the_tree_shape`] accepts: the constructor a `foreach` EXTRACT builds on the owned tree
-/// (#6581, and with no `.` member #6629). Any other constructor is the evaluator's own route, so a
+/// Whether `expr` is an array constructor with at most one member that is `.` itself (`[$i, .]`,
+/// `[.a, .b]`), or an object constructor with exactly one (`{i: $i, s: .}`), and every other member,
+/// and key, a shape [`off_the_tree_shape`] accepts: the constructor a `foreach` EXTRACT builds on the
+/// owned tree (#6581, and an array with no `.` member #6629). An object with no `.` member is left to
+/// the evaluator, which already answers it off the tree (#6608): the step measured 1.03x of it there
+/// (`{x: .a, y: .b}`, 7950X). Any other constructor is the evaluator's own route, so a
 /// step that would decline it costs nothing here: a constructor with two `.` members, or a member
 /// the step evaluates and then declines (`(1, 2)`, `empty`) was measured 1.02x-1.15x slower than
 /// not trying (7950X). A fold asks this once ([`extract_constructor_eligible`]), not for every
@@ -89025,7 +89027,7 @@ fn constructor_holds_state_at_most_once(expr: &Expr) -> bool {
             items.iter().filter(|item| is_dot(item)).count() <= 1 && items.iter().all(fits)
         }
         Expr::Object(entries) => {
-            entries.iter().filter(|entry| is_dot(&entry.value)).count() <= 1
+            entries.iter().filter(|entry| is_dot(&entry.value)).count() == 1
                 && entries.iter().all(|entry| {
                     fits(&entry.value)
                         && match &entry.key {
@@ -177750,7 +177752,7 @@ mod touched_edge_cases_2999 {
             assert_eq!(run(filter, false), expected, "{filter}");
         }
         // `--jq-extensions` keeps the identifier key and the `{x}` shorthand.
-        assert_eq!(run("{a}", true), r#"{"a":1}"#);
+        assert_eq!(run("{a}", false), r#"{"a":1}"#);
         assert_eq!(run("{k: .a}", true), r#"{"k":1}"#);
     }
 
@@ -179886,10 +179888,10 @@ mod fold_operand_inert_tests_5745 {
         let names = vec!["i".to_string()];
         for (source, eligible) in [
             ("[.a, .b]", true),
-            ("{x: .a, y: .b}", true),
+            ("{x: .a, y: .b}", false),
             ("[$i, .a]", true),
-            ("{k: $i, v: .b}", true),
-            ("{(.k): .a}", true),
+            ("{k: $i, v: .b}", false),
+            ("{(.k): .a}", false),
             ("[$i, .]", true),
             ("{i: $i, s: .}", true),
             ("[1, 2]", true),
@@ -179901,7 +179903,7 @@ mod fold_operand_inert_tests_5745 {
             ("[$i, (.a | map(.b))]", true),
             ("[.a, ($i | tojson | fromjson)]", true),
             ("[.a, (.b | paths)]", false),
-            ("{a}", true),
+            ("{a}", false),
             (".a", false),
             ("$i", false),
             ("[.a] | .[0]", false),
@@ -179990,6 +179992,10 @@ mod fold_operand_inert_tests_5745 {
             ),
             (
                 "[foreach range(50) as $i ({a: 1, b: 2}; .a += 1; {x: .a, i: $i})]",
+                (0, 0),
+            ),
+            (
+                "[foreach range(50) as $i ({a: 1, b: 2}; .a += 1; [$i, .a])]",
                 (steps, steps),
             ),
             (

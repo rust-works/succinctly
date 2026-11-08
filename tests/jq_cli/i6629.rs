@@ -1,4 +1,4 @@
-//! #6629: a `foreach` whose EXTRACT is a constructor with no `.` member (`[.a, .b]`, `{x: .a}`) is
+//! #6629: a `foreach` whose EXTRACT is an array with no `.` member (`[.a, .b]`) is
 //! built on the owned tree, and whether an EXTRACT is such a constructor is decided once per fold
 //! rather than walked for every step. Every expected string was captured from jq 1.7.1
 //! (`/usr/bin/jq`).
