@@ -645,6 +645,25 @@ fn trace_at_depth(
                 return None;
             };
             let mut children = Vec::new();
+            // #6335: `to_entries` lists a repeated key once per entry, and the by-key tree holds
+            // the live one's presentation. `totals` counts the entries of each key and `earlier`
+            // those listed so far, so an entry before the last is a shadow, found by its position
+            // among them. Counted once, and only for a mapping that repeats a key.
+            let has_shadows = matches!(value, OwnedValue::Object(o) if o.has_shadows())
+                && matches!(expr, Expr::Builtin(Builtin::ToEntries));
+            let mut totals: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
+            if has_shadows {
+                for output in outputs {
+                    if let OwnedValue::Object(entry) = output {
+                        if let Some(OwnedValue::String(key)) = entry.get("key") {
+                            *totals.entry(key.as_ref()).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+            let mut earlier: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
             for (i, output) in outputs.iter().enumerate() {
                 let is_entries = matches!(expr, Expr::Builtin(Builtin::ToEntries));
                 let key = if is_entries {
@@ -675,7 +694,19 @@ fn trace_at_depth(
                                 tree.key_alias(key)
                                     .map(|name| AnchorMark::Aliases(name.to_string()))
                             });
-                        (CommentTree::Leaf(key_meta), tree.field(key).clone())
+                        let value_tree = if has_shadows {
+                            let seen = earlier.entry(key.as_ref()).or_insert(0);
+                            let ordinal = *seen;
+                            *seen += 1;
+                            if ordinal + 1 < totals.get(key.as_ref()).copied().unwrap_or(0) {
+                                tree.shadow_field(key, ordinal).clone()
+                            } else {
+                                tree.field(key).clone()
+                            }
+                        } else {
+                            tree.field(key).clone()
+                        };
+                        (CommentTree::Leaf(key_meta), value_tree)
                     }
                     OwnedValue::Array(_) => (CommentTree::empty(), tree.at_index(i).clone()),
                     _ => return None,
@@ -702,6 +733,8 @@ fn trace_at_depth(
             };
             let mut fields = IndexMap::new();
             let mut keys = IndexMap::new();
+            // #6335: an entry a later one of the same key replaces is a shadow of it.
+            let mut shadow_leaves: IndexMap<String, Vec<CommentTree>> = IndexMap::new();
             for (i, entry) in entries.iter().enumerate() {
                 let OwnedValue::Object(entry) = entry else {
                     return None;
@@ -714,7 +747,14 @@ fn trace_at_depth(
                 };
                 let value_field = "value";
                 let entry_tree = tree.at_index(i);
-                fields.insert(key.to_string(), entry_tree.field(value_field).clone());
+                if let Some(earlier) =
+                    fields.insert(key.to_string(), entry_tree.field(value_field).clone())
+                {
+                    shadow_leaves
+                        .entry(key.to_string())
+                        .or_default()
+                        .push(KeyMeta::shadow_leaf(&earlier));
+                }
                 // Last occurrence wins, including an unstyled key. Never
                 // leave the earlier occurrence's style behind on collision.
                 keys.shift_remove(key.as_ref());
@@ -730,6 +770,7 @@ fn trace_at_depth(
                     keys.insert(key.to_string(), meta);
                 }
             }
+            KeyMeta::record_shadows(&mut keys, shadow_leaves);
             Some((result, CommentTree::Object(NodeMeta::empty(), fields, keys)))
         }
         // #4386: a sorted mapping is the same entries in another order, each keeping the comments,
@@ -747,13 +788,16 @@ fn trace_at_depth(
             let mut keys = IndexMap::new();
             for key in sorted.keys() {
                 fields.insert(key.clone(), tree.field(key).clone());
-                if let Some(meta) = KeyMeta::with_alias(
+                if let Some(meta) = KeyMeta::with_shadows(
                     None,
                     false,
                     tree.key_style(key),
                     tree.key_anchor(key).map(str::to_string),
                     tree.key_tag(key).map(str::to_string),
                     tree.key_alias(key).map(str::to_string),
+                    // #6335
+                    tree.key_meta(key)
+                        .map_or_else(Vec::new, |meta| meta.shadows().to_vec()),
                 ) {
                     keys.insert(key.clone(), meta);
                 }
@@ -1157,13 +1201,17 @@ fn merge_tree(
             };
             fields.insert(key.clone(), child);
             let key_tree = if lvalue.is_some() { lt } else { rt };
-            if let Some(meta) = KeyMeta::with_alias(
+            if let Some(meta) = KeyMeta::with_shadows(
                 None,
                 false,
                 key_tree.key_style(key),
                 key_tree.key_anchor(key).map(str::to_string),
                 key_tree.key_tag(key).map(str::to_string),
                 key_tree.key_alias(key).map(str::to_string),
+                // #6335: the key's earlier entries are the ones the merge left where they were.
+                key_tree
+                    .key_meta(key)
+                    .map_or_else(Vec::new, |meta| meta.shadows().to_vec()),
             ) {
                 keys.insert(key.clone(), meta);
             }

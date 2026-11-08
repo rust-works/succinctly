@@ -3528,6 +3528,12 @@ pub struct KeyMeta {
     /// key itself is the anchor's text; a key that is an alias declares no anchor and carries
     /// no tag of its own (#1374).
     alias: Option<String>,
+    /// What the key's *earlier* entries (its shadows, ADR-0027) say about how their value was
+    /// spelled, one leaf per shadow in document order (#6335). The per-field tree is keyed by key
+    /// and so describes the live (last) entry only; a shadow's own spelling (`a:` as the empty
+    /// value, `~`, `True`) has nowhere else to live. Empty unless some shadow was spelled other
+    /// than the canonical way; each leaf holds the spelling and nothing else.
+    shadows: Vec<CommentTree>,
 }
 
 /// The key style (see [`CommentTree::key_style`]) for a key whose quoting `-P` stripped.
@@ -3585,6 +3591,20 @@ impl KeyMeta {
         tag: Option<String>,
         alias: Option<String>,
     ) -> Option<Self> {
+        Self::with_shadows(comment, value_absent, style, anchor, tag, alias, Vec::new())
+    }
+
+    /// [`Self::with_alias`] for a key whose earlier entries (its shadows) were spelled in a way
+    /// worth keeping (#6335), which earns the key an entry on its own.
+    pub fn with_shadows(
+        comment: Option<String>,
+        value_absent: bool,
+        style: &'static str,
+        anchor: Option<String>,
+        tag: Option<String>,
+        alias: Option<String>,
+        shadows: Vec<CommentTree>,
+    ) -> Option<Self> {
         let style = match style {
             "single" | "double" | KEY_STYLE_STRING => style,
             _ => "",
@@ -3594,6 +3614,7 @@ impl KeyMeta {
             && anchor.is_none()
             && tag.is_none()
             && alias.is_none()
+            && shadows.is_empty()
         {
             return None;
         }
@@ -3604,7 +3625,36 @@ impl KeyMeta {
             anchor,
             tag,
             alias,
+            shadows,
         })
+    }
+
+    /// The leaves describing how this key's earlier entries were spelled, one per shadow in
+    /// document order, or an empty slice (#6335).
+    pub fn shadows(&self) -> &[CommentTree] {
+        &self.shadows
+    }
+
+    /// The leaf a key keeps for an earlier entry whose tree was `earlier` (the one a later entry
+    /// of the same key replaced in a by-key map): its spelling, nothing else (#6335).
+    pub fn shadow_leaf(earlier: &CommentTree) -> CommentTree {
+        CommentTree::Leaf(
+            NodeMeta::empty().with_spelling(earlier.meta().spelling().map(str::to_string)),
+        )
+    }
+
+    /// Store `leaves` (per repeated key, one per earlier entry in document order) in `keys`,
+    /// creating an entry for a key that had none, but only for a key some earlier entry of which
+    /// was spelled non-canonically: the rest print as the writer's default already (#6335).
+    pub fn record_shadows(
+        keys: &mut IndexMap<String, Self>,
+        leaves: IndexMap<String, Vec<CommentTree>>,
+    ) {
+        for (key, leaves) in leaves {
+            if leaves.iter().any(|leaf| leaf.meta().spelling().is_some()) {
+                keys.entry(key).or_default().shadows = leaves;
+            }
+        }
     }
 
     /// This entry with `value_absent` re-derived and, when `keep_style` is
@@ -3612,13 +3662,14 @@ impl KeyMeta {
     /// `None` once nothing is left to say.
     #[must_use]
     pub fn carried_over(&self, value_absent: bool, keep_style: bool) -> Option<Self> {
-        Self::with_alias(
+        Self::with_shadows(
             self.comment.clone(),
             value_absent,
             if keep_style { self.style } else { "" },
             self.anchor.clone(),
             self.tag.clone(),
             self.alias.clone(),
+            self.shadows.clone(),
         )
     }
 
@@ -3745,6 +3796,16 @@ impl CommentTree {
             Self::Object(_, fields, _) => fields.get(key).unwrap_or(&EMPTY_COMMENT_TREE),
             _ => &EMPTY_COMMENT_TREE,
         }
+    }
+
+    /// The presentation of the `ordinal`-th earlier entry (shadow, counting from 0 in document
+    /// order) of a repeated object field `key`: the leaf [`KeyMeta::shadows`] holds for it, or
+    /// the empty tree when the key's earlier entries kept nothing (#6335). The tree is keyed by
+    /// key, so [`Self::field`] describes the live entry and never one of these.
+    pub fn shadow_field(&self, key: &str, ordinal: usize) -> &Self {
+        self.key_meta(key)
+            .and_then(|k| k.shadows.get(ordinal))
+            .unwrap_or(&EMPTY_COMMENT_TREE)
     }
 
     /// A comment trailing object field `key`'s own *key* line, when its
@@ -4135,6 +4196,8 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
         let mut map = ObjectBuilder::new();
         let mut comment_map = IndexMap::new();
         let mut key_comment_map = IndexMap::new();
+        // #6335: per repeated key, one leaf per earlier entry. `IndexMap::new` does not allocate.
+        let mut shadow_leaves: IndexMap<String, Vec<CommentTree>> = IndexMap::new();
         let mut guard = DisplayKeyGuard::default();
         // #2513: a merge-resolved list holds fields of the merge sources (`<<: *base`), and the
         // source is written where it stands too, so a field of one is a copy whose `&anchor`
@@ -4202,7 +4265,14 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
                 }
             }
             map.push::<S>(key.clone(), v);
-            comment_map.insert(key.clone(), c);
+            // #6335: the entry this one replaces in the by-key tree is a shadow, whose own
+            // spelling (`a:`, `~`) would otherwise be lost.
+            if let Some(earlier) = comment_map.insert(key.clone(), c) {
+                shadow_leaves
+                    .entry(key.clone())
+                    .or_default()
+                    .push(KeyMeta::shadow_leaf(&earlier));
+            }
             // A comment trailing the key's own line, when the value is
             // deferred to a following line (issue #765) - distinct from
             // `c`'s own comment above, which belongs to the value.
@@ -4285,6 +4355,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
         // `to_owned_at_depth` runs -- `cursor` is `None` only at the true
         // top level, same residual gap its own doc comment describes.
         tail_gap_ok(cursor, last_field.as_ref(), b'}')?;
+        KeyMeta::record_shadows(&mut key_comment_map, shadow_leaves);
         Ok((
             OwnedValue::Object(map.finish()),
             CommentTree::Object(own_meta, comment_map, key_comment_map),
@@ -54287,6 +54358,51 @@ mod tests {
         let (_, comments) =
             to_owned_with_comments::<_, YqSemantics>(&value, Some(&second)).expect("converts");
         assert_eq!(comments.meta().preamble(), None);
+    }
+
+    /// #6335: a repeated key's earlier entries keep their spelling, in document order, only when
+    /// one of them was spelled non-canonically; the entry survives a write and a missing ordinal
+    /// falls back to the empty tree.
+    #[test]
+    fn test_key_meta_shadow_spellings_6335() {
+        let spelled =
+            |text: &str| CommentTree::Leaf(NodeMeta::empty().with_spelling(Some(text.to_string())));
+        let plain = CommentTree::empty();
+        assert!(KeyMeta::with_shadows(None, false, "", None, None, None, Vec::new()).is_none());
+
+        // Nothing spelled: no entry is made for the key.
+        let mut keys = IndexMap::new();
+        KeyMeta::record_shadows(
+            &mut keys,
+            IndexMap::from([("a".to_string(), vec![KeyMeta::shadow_leaf(&plain)])]),
+        );
+        assert!(keys.is_empty());
+
+        // `a:` then `a: ~` then `a: 2`: both earlier entries are shadows, in order.
+        let first = CommentTree::Leaf(NodeMeta::empty().with_spelling(Some(String::new())));
+        let second = spelled("~");
+        KeyMeta::record_shadows(
+            &mut keys,
+            IndexMap::from([(
+                "a".to_string(),
+                vec![KeyMeta::shadow_leaf(&first), KeyMeta::shadow_leaf(&second)],
+            )]),
+        );
+        let tree = CommentTree::Object(NodeMeta::empty(), IndexMap::new(), keys);
+        assert_eq!(tree.shadow_field("a", 0).meta().spelling(), Some(""));
+        assert_eq!(tree.shadow_field("a", 1).meta().spelling(), Some("~"));
+        assert_eq!(tree.shadow_field("a", 2).meta().spelling(), None);
+        assert_eq!(tree.shadow_field("b", 0).meta().spelling(), None);
+        assert_eq!(tree.key_meta("a").unwrap().shadows().len(), 2);
+
+        // A write that carries the key over keeps them, and the leaf holds nothing but the spelling.
+        let carried = tree
+            .key_meta("a")
+            .unwrap()
+            .carried_over(false, false)
+            .expect("shadows earn the entry");
+        assert_eq!(carried.shadows().len(), 2);
+        assert!(CommentTree::shadow_field(&tree, "a", 1).own().is_none());
     }
 
     /// #2598: an anchor alone earns a `KeyMeta` entry, and survives a write.

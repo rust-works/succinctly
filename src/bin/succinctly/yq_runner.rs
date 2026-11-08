@@ -9204,8 +9204,13 @@ fn join_block_entries(entries: Vec<(String, bool)>) -> String {
 /// out of `emit_yaml_value_at_depth`'s frame, which the nesting-depth guard is sized against (#1017).
 enum ObjectEntries<'a> {
     Plain(indexmap::map::Iter<'a, String, OwnedValue>),
-    Listed(std::vec::IntoIter<(&'a String, &'a OwnedValue, bool)>),
+    Listed(std::vec::IntoIter<ObjectEntry<'a>>),
 }
+
+/// One entry of a mapping: its key, its value, whether it is the live (last) entry of its key,
+/// and, for a shadow, its position among that key's earlier entries (0 for the first), which is
+/// how [`field_comments_of`] finds the spelling the tree kept for it (#6335).
+type ObjectEntry<'a> = (&'a String, &'a OwnedValue, bool, usize);
 
 impl<'a> ObjectEntries<'a> {
     fn of(obj: &'a ObjectMap, sort_keys: bool) -> Self {
@@ -9216,8 +9221,25 @@ impl<'a> ObjectEntries<'a> {
     }
 
     #[inline(never)]
-    fn listed(obj: &'a ObjectMap, sort_keys: bool) -> Vec<(&'a String, &'a OwnedValue, bool)> {
-        let mut entries: Vec<_> = obj.occurrences().flagged().collect();
+    fn listed(obj: &'a ObjectMap, sort_keys: bool) -> Vec<ObjectEntry<'a>> {
+        // Document order, so the count of a key's earlier shadows is the ordinal of this one;
+        // sorting is stable, so a key's entries keep that order after it.
+        let mut seen: std::collections::HashMap<&String, usize> = std::collections::HashMap::new();
+        let mut entries: Vec<_> = obj
+            .occurrences()
+            .flagged()
+            .map(|(k, v, live)| {
+                let ordinal = if live {
+                    0
+                } else {
+                    let slot = seen.entry(k).or_insert(0);
+                    let ordinal = *slot;
+                    *slot += 1;
+                    ordinal
+                };
+                (k, v, live, ordinal)
+            })
+            .collect();
         if sort_keys {
             entries.sort_by(|a, b| a.0.cmp(b.0));
         }
@@ -9226,12 +9248,12 @@ impl<'a> ObjectEntries<'a> {
 }
 
 impl<'a> Iterator for ObjectEntries<'a> {
-    type Item = (&'a String, &'a OwnedValue, bool);
+    type Item = ObjectEntry<'a>;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            Self::Plain(iter) => iter.next().map(|(k, v)| (k, v, true)),
+            Self::Plain(iter) => iter.next().map(|(k, v)| (k, v, true, 0)),
             Self::Listed(iter) => iter.next(),
         }
     }
@@ -9251,11 +9273,18 @@ fn key_comments_of(comments: &CommentTree, live: bool) -> &CommentTree {
 /// The presentation subtree for an object entry. The tree is keyed by key, so it describes the
 /// live (last) entry of a repeated key; an earlier entry of that key (a shadow, ADR-0027) has none
 /// of its own and is written plain rather than wearing its sibling's comments, anchor and style.
-fn field_comments_of<'a>(comments: &'a CommentTree, key: &str, live: bool) -> &'a CommentTree {
+/// The one thing a shadow does keep is how its value was spelled (`a:` as an empty value, `~`,
+/// `True`), found by its `ordinal` among the key's earlier entries (#6335).
+fn field_comments_of<'a>(
+    comments: &'a CommentTree,
+    key: &str,
+    live: bool,
+    ordinal: usize,
+) -> &'a CommentTree {
     if live {
         comments.field(key)
     } else {
-        CommentTree::shared_empty()
+        comments.shadow_field(key, ordinal)
     }
 }
 
@@ -9588,7 +9617,7 @@ fn emit_yaml_value_at_depth(
                 let ci = flow_continuation(indent, &config.indent_str);
                 let child_indent = flow_child_indent(&ci, &config.indent_str);
                 let entries: Vec<_> = ObjectEntries::of(obj, false)
-                    .map(|(k, v, live)| {
+                    .map(|(k, v, live, ordinal)| {
                         let kc = key_comments_of(comments, live);
                         let key = with_key_anchor(
                             kc,
@@ -9596,7 +9625,7 @@ fn emit_yaml_value_at_depth(
                             yaml_quote_key(k, kc.key_style(k), true, config.json_sourced_floats),
                             true,
                         );
-                        let field_comments = field_comments_of(comments, k, live);
+                        let field_comments = field_comments_of(comments, k, live, ordinal);
                         let val = emit_yaml_value_at_depth(
                             v,
                             field_comments,
@@ -9619,7 +9648,7 @@ fn emit_yaml_value_at_depth(
 
                 let items: Vec<(String, bool)> = entries
                     .iter()
-                    .map(|(k, v, live)| {
+                    .map(|(k, v, live, ordinal)| {
                         let kc = key_comments_of(comments, *live);
                         // #1485/#1881: rounded up from the field's own
                         // column -- see `compact_child_indent`.
@@ -9682,7 +9711,7 @@ fn emit_yaml_value_at_depth(
                                 false,
                             )
                         });
-                        let field_comments = field_comments_of(comments, k, *live);
+                        let field_comments = field_comments_of(comments, k, *live, *ordinal);
                         let comment_suffix = trailing_comment_suffix(field_comments, indent);
                         let anchor = anchor_decl_prefix(field_comments);
                         // Check if value needs to be on next line - a
