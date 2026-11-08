@@ -1,7 +1,7 @@
 //! #6666: a loop over an array the program built reads it by index or by a narrow slice through
 //! the element index, not by walking it per read. The answers are jq 1.7.1's (captured from it);
-//! the timing bound is the quadratic's own: 400,000 reads of a 400,000-element array took 40 s
-//! before, and the whole sweep below runs in well under a second now.
+//! the timing test is a floor under the mechanism's own pin (`jq::eval::tests`): 40,000 reads
+//! of a 40,000-element array took 40 s before, and 200,000 now take about 0.1 s.
 
 use anyhow::Result;
 

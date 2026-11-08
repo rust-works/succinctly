@@ -1150,6 +1150,64 @@ mod tests {
             assert!(answers.iter().all(|a| *a == Ok(WIDE_ELEMENTS * 2)));
         }
 
+        /// #6666: a nested scope can be set aside, so the scope it replaced answers, and put back
+        /// intact: the index it built is still there, and the flag every lookup reads follows
+        /// each swap (a stale flag would answer from the wrong scope, or never ask).
+        #[test]
+        fn a_scope_set_aside_keeps_its_index_and_hands_the_replaced_one_back_6666() {
+            let outer_doc = wide_array(WIDE_ELEMENTS * 2);
+            let outer_index = JsonIndex::build(outer_doc.as_bytes());
+            let outer = outer_index.root(outer_doc.as_bytes());
+            let inner_doc = wide_array(WIDE_ELEMENTS * 3);
+            let inner_index = JsonIndex::build(inner_doc.as_bytes());
+            let inner = inner_index.root(inner_doc.as_bytes());
+            let outer_elements = outer.value().as_array().expect("an array document");
+            let inner_elements = inner.value().as_array().expect("an array document");
+
+            let _outer_scope = memo::enter(outer.document_token());
+            for _ in 0..3 {
+                assert!(len_checked_memoized(&outer_elements).is_ok());
+            }
+            let mut inner_scope = memo::enter(inner.document_token());
+            for _ in 0..3 {
+                assert!(len_checked_memoized(&inner_elements).is_ok());
+            }
+            // Both indexes are built; only the live scope's answers.
+            assert_eq!(memo::len(&inner_elements), Some(WIDE_ELEMENTS * 3));
+            assert_eq!(
+                memo::len(&outer_elements),
+                None,
+                "the outer scope is not live"
+            );
+
+            inner_scope.swap();
+            assert_eq!(memo::len(&outer_elements), Some(WIDE_ELEMENTS * 2));
+            assert_eq!(
+                memo::len(&inner_elements),
+                None,
+                "the inner scope is set aside"
+            );
+            inner_scope.swap();
+            let before = memo::work();
+            assert_eq!(
+                memo::len(&inner_elements),
+                Some(WIDE_ELEMENTS * 3),
+                "kept, not rebuilt"
+            );
+            assert_eq!(memo::len(&outer_elements), None);
+            assert_eq!(
+                memo::work().0,
+                before.0,
+                "no index was built by the swap back"
+            );
+            drop(inner_scope);
+            assert_eq!(
+                memo::len(&outer_elements),
+                Some(WIDE_ELEMENTS * 2),
+                "restored on drop"
+            );
+        }
+
         #[test]
         fn element_reads_use_the_index_but_never_build_one_4035() {
             let doc = wide_array(WIDE_ELEMENTS * 2);

@@ -3904,6 +3904,10 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // Only a slice that can name every element asks for the length again: a start
                 // after the first element or an end before the last never does, which is every
                 // narrow slice of a loop.
+                //
+                // `map_or(true, ..)` rather than `is_none_or`: the crate's MSRV is 1.73 and
+                // `Option::is_none_or` is stable since 1.82.
+                #[allow(clippy::unnecessary_map_or)]
                 let may_be_full = start.map_or(true, |s| s <= 0) && end.map_or(true, |e| e >= 0);
                 if S::TAG != EvalTag::Yq && may_be_full {
                     if let Ok(len) = array_index::len_checked_memoized(&elements) {
@@ -13239,7 +13243,7 @@ fn eval_each_owned_past_front_doors_in<S: EvalSemantics>(
     // The `sink` continues the *caller's* program, often a fan-out over its own document, so
     // the scope is set aside around each `sink` call and keeps what it built (an element index)
     // for the next output: a loop that streams `.[$i]` per output stays linear too.
-    let mut scope = super::eval_generic::enter_document_scope(cursor.document_token());
+    let mut scope = super::eval_generic::enter_document_scope(&doc);
 
     eval_each::<Vec<u64>, S>(expr, cursor.value(), optional, &mut |item| {
         // The document is `to_json_for_reindex` of an already-decoded value, so there is
@@ -13250,7 +13254,7 @@ fn eval_each_owned_past_front_doors_in<S: EvalSemantics>(
             Item::Borrowed(v) => to_owned_lossy_shared::<S, _>(&v),
             Item::Owned(v) => v,
         };
-        let _aside = scope.suspended();
+        let _aside = scope.as_mut().map(|s| s.suspended());
         sink(value)
     })
 }

@@ -6092,6 +6092,9 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
     // demoting rebuilds `expr` whenever it holds a marker at all.
     let expr = reentry.reroot::<S>(expr);
     let rebuilt;
+    // #6666: the memos belong to a document, and `rebuilt` is this bridge's own (a `rooted` one
+    // is the caller's, whose scope is already open: opening it again would be a no-op).
+    let mut scope = None;
     let cursor = match rooted.as_deref() {
         Some(doc) => doc.root(),
         None => {
@@ -6099,6 +6102,7 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
                 Ok(doc) => doc,
                 Err(error) => return GenericResult::Error(error),
             };
+            scope = enter_document_scope(&rebuilt);
             rebuilt.root()
         }
     };
@@ -6128,10 +6132,9 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
     // arms rather than `.unwrap()`/`.expect()` because the *type* (`Result`)
     // is what lets a real failure, if this invariant is ever violated by a
     // future change, surface as a normal `EvalError` instead of a panic.
-    // #6666: the memos belong to a document, and `rebuilt` is this bridge's own (a `rooted` one
-    // is the caller's, whose scope is already open: opening it again is a no-op).
-    let _scope = enter_document_scope(cursor.document_token());
-    query_result_to_generic::<V, S>(full_eval::<Vec<u64>, S>(&expr, cursor))
+    let result = query_result_to_generic::<V, S>(full_eval::<Vec<u64>, S>(&expr, cursor));
+    drop(scope);
+    result
 }
 
 /// Materialize `value` (with its `cursor`, if any) and hand `expr` to the
@@ -12441,8 +12444,17 @@ pub(crate) type DocumentScope = slot_memo::Guard;
 /// memo is consulted only for the document it was opened for, so without this a loop over that
 /// document's array (`[range(N)] | [range(0; length) as $i | .[$i]]`) walked the whole array on
 /// every read instead of building the element index on the third.
-pub(crate) fn enter_document_scope(token: usize) -> DocumentScope {
-    slot_memo::enter(token)
+///
+/// `None` for a document too small to hold anything a memo remembers: an array or an object is
+/// wide at 64 elements or members ([`crate::jq::array_index::WIDE_ELEMENTS`],
+/// [`crate::jq::key_index::WIDE_MEMBERS`]), and 64 of either take at least 127 bytes of text. A
+/// per-record program bridges thousands of small values, and the scope's setup is a cost of
+/// about 140 ns per bridge that it would pay for nothing (the review of #6666 measured +8% on
+/// `map(.name | ascii_downcase | ltrimstr("user"))`).
+pub(crate) fn enter_document_scope(doc: &super::value::ReindexedDoc) -> Option<DocumentScope> {
+    const SMALLEST_WIDE_DOCUMENT: usize = 2 * crate::jq::array_index::WIDE_ELEMENTS - 1;
+    (doc.text().len() >= SMALLEST_WIDE_DOCUMENT)
+        .then(|| slot_memo::enter(doc.root().document_token()))
 }
 
 /// [`eval_with_cursor_unscoped`]'s route for every program the path-mode
