@@ -88856,21 +88856,33 @@ fn owned_one_value_stage(stage: &Expr) -> bool {
 }
 
 /// Whether `expr` is an array or object constructor with exactly one member that is `.` itself
-/// (`[$i, .]`, `{i: $i, s: .}`): the shape a `foreach` EXTRACT builds on the owned tree (#6581). A
-/// constructor with no `.` member, or two, is the evaluator's own route, so a step that would
-/// decline it costs nothing here: the `.`-free constructors the step also answers were measured
-/// 1.02x-1.15x slower on the shapes it declines after evaluating a member (7950X).
+/// (`[$i, .]`, `{i: $i, s: .}`) and every other member, and key, a shape [`off_the_tree_shape`]
+/// accepts: the constructor a `foreach` EXTRACT builds on the owned tree (#6581). Any other
+/// constructor is the evaluator's own route, so a step that would decline it costs nothing here:
+/// a constructor with no `.` member, two, or a member the step evaluates and then declines (`(1, 2)`,
+/// `empty`) was measured 1.02x-1.15x slower than not trying (7950X).
 fn constructor_holds_state_once(expr: &Expr) -> bool {
     let is_dot = |e: &Expr| matches!(unwrap_paren(e), Expr::Identity);
+    let fits = |e: &Expr| is_dot(e) || off_the_tree_shape(e);
     match unwrap_paren(expr) {
         Expr::Array(inner) => {
             let items = match unwrap_paren(inner) {
                 Expr::Comma(items) => items.as_slice(),
                 single => core::slice::from_ref(single),
             };
-            items.iter().filter(|item| is_dot(item)).count() == 1
+            items.iter().filter(|item| is_dot(item)).count() == 1 && items.iter().all(fits)
         }
-        Expr::Object(entries) => entries.iter().filter(|entry| is_dot(&entry.value)).count() == 1,
+        Expr::Object(entries) => {
+            entries.iter().filter(|entry| is_dot(&entry.value)).count() == 1
+                && entries.iter().all(|entry| {
+                    fits(&entry.value)
+                        && match &entry.key {
+                            ObjectKey::Literal(_) => true,
+                            ObjectKey::Expr(key) => off_the_tree_shape(key),
+                            ObjectKey::Bare => false,
+                        }
+                })
+        }
         _ => false,
     }
 }
