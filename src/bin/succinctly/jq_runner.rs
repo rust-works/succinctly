@@ -4871,6 +4871,13 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
 
     // Configure output
     let output_config = OutputConfig::from_args(&args);
+    // #6598: `-R` takes over from `--seq` on input, so past the output's RS what jq reads is
+    // `-R`'s alone. Every input-side `args.seq` test then sees the `-R` route, rather than each
+    // one having to exclude `args.raw_input` itself. From here `args.seq` means "reads as `--seq`";
+    // the output's RS framing is `output_config.seq`, taken above, so output code must read that.
+    if args.raw_input {
+        args.seq = false;
+    }
 
     // #5553, #5558: jq writes the line `debug`/`debug(msg)` send to stderr with its dump options
     // minus the indent flags, so `-C` colors it and `-S`/`-a` sort and escape it. Without any of
