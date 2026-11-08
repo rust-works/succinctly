@@ -6710,6 +6710,7 @@ fn read_inputs(
     LAZY_JSON_INPUTS.with(|slot| *slot.borrow_mut() = None);
     LAZY_RAW_INPUTS.with(|slot| *slot.borrow_mut() = None);
     LAZY_STREAM_INPUTS.with(|slot| *slot.borrow_mut() = None);
+    LAZY_SEQ_INPUTS.with(|slot| *slot.borrow_mut() = None);
     defer_open_failures(Vec::new(), false);
     LAZY_OPEN_FAILED.with(|seen| seen.set(false));
     SLURP_DIRECTORY_READ.with(|slurp| slurp.set(false));
@@ -7675,7 +7676,29 @@ fn read_inputs(
     // against), so they also keep the per-file loop -- including when
     // combined with `-R` (`args.raw_input && args.input_dsv.is_some()`),
     // which the DSV branch inside the loop already takes over first.
-    if seq_stream_shape {
+    // #6500: a stream read through the `input` queue (every non-slurped `--seq` run, #6147) turns
+    // each record into its value when the queue is asked for it, as `-R`'s lines are. The values
+    // of the whole stream held ten times its size. What `lazy` would have to place at a last file
+    // that did not open (#6480, #6531), or defer past the array (#3201), keeps the eager route.
+    let seq_lazy = seq_stream_shape
+        && !args.slurp
+        && track_eof
+        && !any_open_failure
+        && trailing_error.is_none()
+        && UNOPENED_TAIL_NAME.with(|tail| tail.borrow().is_none())
+        && !lazy_route_forced_off();
+    if seq_lazy {
+        // The end of the stream is where an `input` that runs past it names its source (#6146).
+        locations.eof_tail = Some(seq_eof_tail(&seq_raw, &seq_values));
+        LAZY_SEQ_INPUTS.with(|slot| {
+            *slot.borrow_mut() = Some(LazySeqInputs::new(
+                seq_raw,
+                std::mem::take(&mut seq_values),
+                &seq_value_locations,
+                std::mem::take(&mut resumed_errors),
+            ));
+        });
+    } else if seq_stream_shape {
         values = build_seq_values(
             &seq_raw,
             &seq_values,
@@ -11970,7 +11993,17 @@ fn seed_input_queue(
     trailing_error: Option<TrailingParseError>,
     resumed_errors: Vec<(usize, TrailingParseError)>,
 ) {
-    if let Some(files) = LAZY_RAW_INPUTS.with(|slot| slot.borrow_mut().take()) {
+    if let Some(lazy) = LAZY_SEQ_INPUTS.with(|slot| slot.borrow_mut().take()) {
+        // #6500: a `--seq` stream's records, converted as the program reads them, with the
+        // reader's faults between them. `inputs` is empty and the faults are in `lazy`.
+        debug_assert!(inputs.is_empty() && trailing_error.is_none() && resumed_errors.is_empty());
+        debug_assert!(
+            locations.unopened_end().is_none(),
+            "a missing last file takes the eager route"
+        );
+        jq::seed_remaining_inputs_from(lazy.into_producer(locations.exhausted(slurp)));
+        locations.count_reads_past_end(slurp);
+    } else if let Some(files) = LAZY_RAW_INPUTS.with(|slot| slot.borrow_mut().take()) {
         // #5857: `-R`'s lines, converted as the program reads them. There is no parse error to
         // queue behind them, and `inputs` is empty.
         debug_assert!(inputs.is_empty() && trailing_error.is_none() && resumed_errors.is_empty());
@@ -12117,6 +12150,101 @@ impl Iterator for LazyTail {
     }
 }
 
+/// A `--seq` stream's records, converted as the program reads them (#6500).
+///
+/// The walk of [`crate::jq_seq_reader`] has already found every record's bytes, its place, and the
+/// faults between the records, so nothing here is parsed again to decide anything: a record is
+/// turned into its value when the queue asks for it, and the value is dropped once the program has
+/// read it. The eager route built every record's value before the program ran, which held about
+/// ten times the stream (1.1 GB at 100 MB) and spent 40% of the run before the first output.
+struct LazySeqInputs {
+    /// The sources' bytes as one stream, which a record's range indexes.
+    combined: Vec<u8>,
+    /// [`first_invalid_utf8`] of `combined`.
+    first_invalid: usize,
+    /// Each record's `(start, end)` in `combined`.
+    ranges: Vec<(usize, usize)>,
+    /// `(source tag, line)` of every record, as jq's reader stood when it yielded it.
+    places: Vec<(u32, u32)>,
+    /// The reader's faults, each with how many records come before it.
+    errors: std::iter::Peekable<std::vec::IntoIter<(usize, TrailingParseError)>>,
+    /// The record [`LazySeqInputs::next`] reads next.
+    next: usize,
+}
+
+impl LazySeqInputs {
+    /// The stream `sources` make, with the records the walk found in it (`ranges`, and each one's
+    /// `(source index, line)` in `value_locations`) and the faults between them.
+    fn new(
+        mut sources: Vec<(Option<usize>, Vec<u8>)>,
+        ranges: Vec<(usize, usize)>,
+        value_locations: &[(usize, usize)],
+        errors: Vec<(usize, TrailingParseError)>,
+    ) -> Self {
+        debug_assert_eq!(value_locations.len(), ranges.len(), "one place per record");
+        let places = value_locations
+            .iter()
+            .map(|&(source, line)| {
+                (
+                    u32::try_from(sources[source].0.unwrap_or(0)).unwrap_or(u32::MAX),
+                    u32::try_from(line).unwrap_or(u32::MAX),
+                )
+            })
+            .collect();
+        // One source (stdin, or a single file) is the stream as it is; only a multi-file stream,
+        // whose records can span a boundary, is copied into one buffer (as `build_seq_values`).
+        let combined = if sources.len() == 1 {
+            sources.pop().map(|(_, raw)| raw).unwrap_or_default()
+        } else {
+            let mut all = Vec::with_capacity(sources.iter().map(|(_, raw)| raw.len()).sum());
+            for (_, raw) in &sources {
+                all.extend_from_slice(raw);
+            }
+            all
+        };
+        Self {
+            first_invalid: first_invalid_utf8(&combined),
+            combined,
+            ranges,
+            places,
+            errors: errors.into_iter().peekable(),
+            next: 0,
+        }
+    }
+
+    /// The next record or fault, or `None` once both are all out. A fault comes ahead of the record
+    /// its count names, and the faults after the last record come last, as the queue the eager
+    /// route builds orders them ([`LazyTail`] does the same for a lazy JSON stream).
+    fn next(&mut self) -> Option<jq::ProducedInput> {
+        loop {
+            let error_next = self
+                .errors
+                .peek()
+                .is_some_and(|&(before, _)| before <= self.next || self.next >= self.ranges.len());
+            if error_next {
+                // As a plain error: jq's `try input catch .` catches a parse error like any
+                // other, where the materializer's own error is tagged as an uncatchable decode
+                // failure.
+                return self.errors.next().map(|(_, t)| {
+                    jq::ProducedInput::Error(EvalError::new(t.error.message), (t.source, t.line))
+                });
+            }
+            let &(start, end) = self.ranges.get(self.next)?;
+            let (source, line) = self.places[self.next];
+            self.next += 1;
+            // A record the checked materializer refuses is dropped, with its place.
+            if let Some(value) = seq_record_value(&self.combined, self.first_invalid, start, end) {
+                return Some(jq::ProducedInput::Document(value, source, line));
+            }
+        }
+    }
+
+    /// The producer the `input` queue pulls the stream from; `exhausted` is where its end is read.
+    fn into_producer(mut self, exhausted: Option<(u32, u32)>) -> jq::InputProducer {
+        Box::new(move || self.next().unwrap_or(jq::ProducedInput::End(exhausted)))
+    }
+}
+
 /// `--stream` and `--stream-errors` inputs read as the program asks for them (#5498): jq's streaming parser over
 /// the sources' bytes, and what its source indices mean.
 struct LazyStreamInputs {
@@ -12186,6 +12314,10 @@ thread_local! {
     /// Set by [`get_inputs`] for `-R` (#5857): each file's source tag and text, in order, which the
     /// call site that seeds the `input` queue takes.
     static LAZY_RAW_INPUTS: std::cell::RefCell<Option<Vec<(u32, String)>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Set by [`get_inputs`] for a `--seq` stream (#6500): its records, converted as the program
+    /// reads them, which the call site that seeds the `input` queue takes.
+    static LAZY_SEQ_INPUTS: std::cell::RefCell<Option<LazySeqInputs>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -13549,33 +13681,46 @@ fn remap_ends_to_locations<S: AsRef<[u8]>>(
 ///
 /// [`jq_seq_reader::walk_stream`]: crate::jq_seq_reader::walk_stream
 fn seq_values_with_indices(combined: &[u8], ranges: &[(usize, usize)]) -> Vec<(OwnedValue, usize)> {
-    // One pass over the whole stream. Almost every stream is valid, and then
-    // no value needs a check of its own; otherwise only a value reaching
-    // past the first invalid byte can hold one.
-    let first_invalid = succinctly::text::utf8::validate_utf8(combined)
-        .err()
-        .map_or(usize::MAX, |e| e.offset);
+    let first_invalid = first_invalid_utf8(combined);
     ranges
         .iter()
         .enumerate()
         .filter_map(|(index, &(start, end))| {
-            let raw = &combined[start..end];
-            let substituted;
-            let bytes =
-                if end <= first_invalid || succinctly::text::utf8::validate_utf8(raw).is_ok() {
-                    raw
-                } else {
-                    substituted =
-                        succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(raw);
-                    substituted.as_bytes()
-                };
-            // #2295: the sequence reader already checks the grammar, but
-            // retain the checked materializer as defense in depth.
-            json_bytes_to_owned_value_checked(bytes)
-                .ok()
-                .map(|value| (value, index))
+            seq_record_value(combined, first_invalid, start, end).map(|value| (value, index))
         })
         .collect()
+}
+
+/// Where the first invalid UTF-8 byte of a `--seq` stream is, `usize::MAX` for a valid one.
+/// One pass over the whole stream: almost every stream is valid, and then no record needs a
+/// check of its own; otherwise only a record reaching past it can hold one.
+fn first_invalid_utf8(combined: &[u8]) -> usize {
+    succinctly::text::utf8::validate_utf8(combined)
+        .err()
+        .map_or(usize::MAX, |e| e.offset)
+}
+
+/// The value of the record at `start..end` of the `--seq` stream `combined`, for
+/// [`seq_values_with_indices`] and [`LazySeqInputs`] (#6500), which must agree on every record.
+/// `first_invalid` is [`first_invalid_utf8`] of the stream. `None` for a record the checked
+/// materializer refuses, which both routes drop.
+fn seq_record_value(
+    combined: &[u8],
+    first_invalid: usize,
+    start: usize,
+    end: usize,
+) -> Option<OwnedValue> {
+    let raw = &combined[start..end];
+    let substituted;
+    let bytes = if end <= first_invalid || succinctly::text::utf8::validate_utf8(raw).is_ok() {
+        raw
+    } else {
+        substituted = succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(raw);
+        substituted.as_bytes()
+    };
+    // #2295: the sequence reader already checks the grammar, but retain the checked
+    // materializer as defense in depth.
+    json_bytes_to_owned_value_checked(bytes).ok()
 }
 
 /// Real jq's own stderr warning ("`jq: ignoring parse error: ...`") for a
@@ -17487,6 +17632,151 @@ mod tests {
         }
         LAZY_CHUNK_BYTES.with(|c| c.set(None));
         (seen, lazy_documents)
+    }
+
+    /// What a `--seq` run holds for `files` (written under `dir`, in order) after [`get_inputs`]:
+    /// whether the records are left to be converted as the queue is read ([`LAZY_SEQ_INPUTS`]), how
+    /// many values were built up front, and everything the queue pops (every document and
+    /// parse error, with the `(at ...)` marker after each, through and past the end, #4303).
+    /// `lazy_off` is the eager route, the reference the lazy one is held to.
+    fn observe_seq(
+        dir: &std::path::Path,
+        files: &[&[u8]],
+        flags: &[&str],
+        lazy_off: bool,
+    ) -> (bool, usize, Vec<String>) {
+        use clap::Parser;
+
+        let mut argv = vec!["jq".to_string(), "--seq".to_string()];
+        argv.extend(flags.iter().map(|&flag| flag.to_owned()));
+        argv.push(if flags.contains(&"-n") { "inputs" } else { "." }.to_string());
+        for (index, bytes) in files.iter().enumerate() {
+            let path = dir.join(format!("seq{index}.json"));
+            std::fs::write(&path, bytes).unwrap();
+            argv.push(path.to_string_lossy().into_owned());
+        }
+        let cmd = JqCommand::try_parse_from(argv).unwrap();
+        LAZY_ROUTE_OFF.with(|f| f.set(lazy_off));
+        let (mut open_failed, mut opened) = (false, Vec::new());
+        // The run's own reading: every non-slurped `--seq` run reads through the queue (#6147).
+        let read = get_inputs(&cmd, true, true, &mut open_failed, &mut opened);
+        LAZY_ROUTE_OFF.with(|f| f.set(false));
+        let (inputs, locations, trailing, resumed) = read.expect("no exit code").expect("reads");
+        let lazy = LAZY_SEQ_INPUTS.with(|slot| slot.borrow().is_some());
+        let built = inputs.len();
+        seed_input_queue(cmd.slurp, inputs, &locations, trailing, resumed);
+        let mut seen = Vec::new();
+        loop {
+            let popped = match jq::pop_input() {
+                jq::InputPop::Document(v) => format!("doc {v:?}"),
+                jq::InputPop::ParseError(e) => format!("error {}", e.message),
+                jq::InputPop::Exhausted => "end".to_string(),
+            };
+            seen.push(format!("{popped} at {:?}", jq::current_input_location()));
+            if popped == "end"
+                && seen
+                    .iter()
+                    .rev()
+                    .take_while(|s| s.starts_with("end"))
+                    .count()
+                    > 2
+            {
+                break;
+            }
+        }
+        (lazy, built, seen)
+    }
+
+    /// #6500: a `--seq` stream read through the queue converts each record when the queue is read,
+    /// and the queue hands out what the eager route's does: every record, the reader's faults in
+    /// order with them, and the `(at ...)` marker after each, through and past the end. Every
+    /// stream of up to three pieces drawn from the shapes the walk tells apart (valid records,
+    /// faults of each wording, a byte that is not UTF-8, a record with no newline, a record cut at
+    /// the end), as `-n inputs` and as the plain run, over one file and over two with a record
+    /// across their boundary. The pin can fail: it does with the faults ordered after the records,
+    /// with a dropped record's place kept, and with the substitution of a byte that is not UTF-8
+    /// left out.
+    #[test]
+    fn a_seq_stream_converts_its_records_as_the_queue_is_read_6500() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pieces: [&[u8]; 9] = [
+            b"\x1e{\"a\":1}\n",
+            b"\x1e[1,\n",
+            b"\x1e\"\xff\"\n",
+            b"\x1e\"\xc3\"\n",
+            b"\x1e12",
+            b"\x1e}\n",
+            b"\x1e1 2\n",
+            b"xyz\n",
+            b"\x1e\"cut",
+        ];
+        let mut streams: Vec<Vec<u8>> = Vec::new();
+        for a in pieces {
+            streams.push(a.to_vec());
+            for b in pieces {
+                streams.push([a, b].concat());
+                for c in pieces {
+                    streams.push([a, b, c].concat());
+                }
+            }
+        }
+        let mut lazy_runs = 0;
+        for stream in &streams {
+            for flags in [&["-n"][..], &[][..]] {
+                let (lazy, built, seen) = observe_seq(dir.path(), &[stream], flags, false);
+                let (eager_lazy, _, eager_seen) = observe_seq(dir.path(), &[stream], flags, true);
+                assert!(!eager_lazy, "the reference must be eager");
+                assert_eq!(
+                    seen,
+                    eager_seen,
+                    "{flags:?} {:?}",
+                    String::from_utf8_lossy(stream)
+                );
+                assert!(!lazy || built == 0, "a lazy route builds no value up front");
+                lazy_runs += usize::from(lazy);
+            }
+        }
+        assert!(
+            lazy_runs > streams.len(),
+            "the lazy route must be the one tested"
+        );
+        // A record across the boundary of two files.
+        let (lazy, _, seen) =
+            observe_seq(dir.path(), &[b"\x1e{\"a\":", b"1}\n\x1e[1,\n"], &[], false);
+        let (_, _, eager) = observe_seq(dir.path(), &[b"\x1e{\"a\":", b"1}\n\x1e[1,\n"], &[], true);
+        assert!(lazy);
+        assert_eq!(seen, eager);
+        assert!(seen[0].starts_with("doc "), "{seen:?}");
+    }
+
+    /// #6500: what the lazy route leaves to the eager one: a slurp (one array of every record), and
+    /// a last file that did not open (its position is placed at the unopened file, #6480).
+    #[test]
+    fn a_seq_stream_the_lazy_route_cannot_place_is_read_eagerly_6500() {
+        use clap::Parser;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (lazy, built, _) = observe_seq(dir.path(), &[b"\x1e1\n\x1e[1,\n"], &["-s"], false);
+        assert!(!lazy && built == 1, "a slurp builds its array: {built}");
+        let (lazy, _, _) = observe_seq(dir.path(), &[b"\x1e1\n\x1e[1,\n"], &[], false);
+        assert!(lazy);
+        // A last file that did not open.
+        let file = dir.path().join("present.seq");
+        std::fs::write(&file, b"\x1e1\n\x1e[1,\n").unwrap();
+        let missing = dir.path().join("missing.seq");
+        let cmd = JqCommand::try_parse_from([
+            "jq".to_string(),
+            "--seq".to_string(),
+            ".".to_string(),
+            file.to_string_lossy().into_owned(),
+            missing.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let (mut open_failed, mut opened) = (false, Vec::new());
+        let read = get_inputs(&cmd, false, true, &mut open_failed, &mut opened);
+        let (inputs, ..) = read.expect("no exit code").expect("reads");
+        assert!(LAZY_SEQ_INPUTS.with(|slot| slot.borrow().is_none()));
+        assert_eq!(inputs.len(), 1);
     }
 
     /// #6451: a lone source started on the front of it reads as one read whole: every document and
