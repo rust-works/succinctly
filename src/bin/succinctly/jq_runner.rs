@@ -6927,10 +6927,18 @@ fn read_inputs(
                 || args.raw_input
                 || seq_readers_place_reads
                 || (any_open_failure
+                    // #6610: a directory last is read only by a read past the end, which a fault
+                    // before the end stops the program ahead of: jq's exit status is that fault's.
+                    // A fault at the end is raised by that same read, which reaches the directory.
                     // #6588: the streaming readers (`read_seq`) still end the stream at the
                     // final buffer of the last file that opened (#6591), so for them an unopened
                     // file after it does not change what the walk calls clean.
-                    && seq_text_reads_clean(&raws, unopened_tail && !seq_by_stream_reader(args))))
+                    && (seq_text_reads_clean(&raws, unopened_tail && !seq_by_stream_reader(args))
+                        || (unplaced_tail
+                            && seq_faults_all_before_end(
+                                &raws,
+                                unopened_tail && !seq_by_stream_reader(args),
+                            )))))
             && ends_cleanly
         {
             // The `--seq` readers place their own faults: the JSON text's fault is not theirs.
@@ -9233,6 +9241,31 @@ thread_local! {
 fn defer_open_failures(failures: Vec<(usize, InputFileOpenError)>, fault_ends_text: bool) {
     PENDING_OPEN_FAILURES.with(|pending| *pending.borrow_mut() = failures.into());
     FAULT_ENDS_TEXT.with(|ends| ends.set(fault_ends_text));
+}
+
+/// Whether `--seq`'s own reader over the text the files `raws` make faults, and only before the end
+/// of the text (#6610): a fault in the middle of the stream stops a program that reads it before a
+/// read past the last file is made. The reader's report of what it holds open at the end
+/// (`... at EOF`) is raised by that read instead, which reaches a directory last, and a stream
+/// holding both is not told apart by the hook, which treats every fault read alike.
+fn seq_faults_all_before_end(raws: &[Vec<u8>], unopened_tail: bool) -> bool {
+    let sources: Vec<(Option<usize>, Vec<u8>)> = raws
+        .iter()
+        .enumerate()
+        .map(|(at, raw)| (Some(at), raw.clone()))
+        .collect();
+    let walk = crate::jq_seq_reader::walk_stream_collecting(
+        &sources,
+        false,
+        true,
+        crate::jq_seq_reader::Tail::of(unopened_tail),
+        &mut |_| {},
+    );
+    !walk.faults.is_empty()
+        && walk
+            .faults
+            .iter()
+            .all(|fault| !fault.body.contains(" at EOF"))
 }
 
 /// Whether `--seq`'s own reader reads the text the files `raws` make without a fault (#6555): no
