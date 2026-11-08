@@ -4875,8 +4875,11 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     // `-R`'s alone. Every input-side `args.seq` test then sees the `-R` route, rather than each
     // one having to exclude `args.raw_input` itself. From here `args.seq` means "reads as `--seq`";
     // the output's RS framing is `output_config.seq`, taken above, so output code must read that.
+    // #6616: so do `--stream` and `--stream-errors`, which jq's JSON parser reads and `-R` bypasses.
     if args.raw_input {
         args.seq = false;
+        args.stream = false;
+        args.stream_errors = false;
     }
 
     // #5553, #5558: jq writes the line `debug`/`debug(msg)` send to stderr with its dump options
