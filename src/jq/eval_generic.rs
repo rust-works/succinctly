@@ -62053,6 +62053,40 @@ mod tests {
         assert_eq!(slot_memo::resume(1, 3, 300), None);
     }
 
+    /// #6666: a scope set aside (by `suspended`) hands the one it replaced back, keeps its own
+    /// entries, and takes the place again when the set-aside drops; a guard that opened nothing
+    /// sets nothing aside.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_slot_memo_scope_set_aside_keeps_its_entries_6666() {
+        let _outer = slot_memo::enter(1);
+        slot_memo::remember(1, 7, 70, 3, Some(71), false, None);
+        let mut inner = slot_memo::enter(2);
+        slot_memo::remember(2, 9, 90, 5, None, false, None);
+        assert_eq!(slot_memo::resume(2, 9, 1_000), Some((90, 5, false)));
+        assert_eq!(slot_memo::resume(1, 7, 1_000), None, "another document");
+        {
+            let _aside = inner.suspended();
+            assert_eq!(slot_memo::resume(1, 7, 1_000), Some((70, 3, false)));
+            assert_eq!(slot_memo::resume(2, 9, 1_000), None, "set aside");
+        }
+        assert_eq!(slot_memo::resume(2, 9, 1_000), Some((90, 5, false)), "kept");
+        assert_eq!(slot_memo::resume(1, 7, 1_000), None);
+        drop(inner);
+        assert_eq!(
+            slot_memo::resume(1, 7, 1_000),
+            Some((70, 3, false)),
+            "restored on drop"
+        );
+        let mut same = slot_memo::enter(1);
+        let _aside = same.suspended();
+        assert_eq!(
+            slot_memo::resume(1, 7, 1_000),
+            Some((70, 3, false)),
+            "nothing to set aside"
+        );
+    }
+
     /// #3702: an evaluation of another document inside an open scope gets a
     /// scope of its own, and the first one is back when it returns; no entry
     /// is ever answered for a document it does not describe.

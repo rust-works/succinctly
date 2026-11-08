@@ -3909,12 +3909,13 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // `Option::is_none_or` is stable since 1.82.
                 #[allow(clippy::unnecessary_map_or)]
                 let may_be_full = start.map_or(true, |s| s <= 0) && end.map_or(true, |e| e >= 0);
-                if S::TAG != EvalTag::Yq && may_be_full {
-                    if let Ok(len) = array_index::len_checked_memoized(&elements) {
-                        if SliceBounds::from_literals(*start, *end).is_full_range(len) {
-                            return QueryResult::One(value);
-                        }
-                    }
+                if S::TAG != EvalTag::Yq
+                    && may_be_full
+                    && array_index::len_checked_memoized(&elements).is_ok_and(|len| {
+                        SliceBounds::from_literals(*start, *end).is_full_range(len)
+                    })
+                {
+                    return QueryResult::One(value);
                 }
                 QueryResult::Owned(OwnedValue::Array(items.into()))
             }
@@ -116102,6 +116103,11 @@ mod tests {
             (
                 "[range(0; length; 2) as $i | .[$i:$i+2][1]] | add",
                 vec!["1000000"],
+            ),
+            // Reads past the end are answered by the index too (`Element::Past`): null.
+            (
+                "[range(0; length + 10) as $i | .[$i]] | length",
+                vec!["2010"],
             ),
             (
                 "range(0; length; 500) as $i | .[$i]",

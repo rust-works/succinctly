@@ -1206,6 +1206,10 @@ mod tests {
                 Some(WIDE_ELEMENTS * 2),
                 "restored on drop"
             );
+            // A guard that opened nothing (the scope was already open) has nothing to set aside.
+            let mut same = memo::enter(outer.document_token());
+            same.swap();
+            assert_eq!(memo::len(&outer_elements), Some(WIDE_ELEMENTS * 2));
         }
 
         #[test]

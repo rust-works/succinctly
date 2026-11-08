@@ -791,6 +791,49 @@ mod tests {
             assert!(matches!(answers[0], Ok(Some(_))));
         }
 
+        /// #6666: a scope set aside keeps its index and hands the replaced one back; a guard that
+        /// opened nothing (the document's scope was already open) has nothing to set aside.
+        #[test]
+        fn a_scope_set_aside_keeps_its_index_and_hands_the_replaced_one_back_6666() {
+            let outer_doc = wide_object(WIDE_MEMBERS * 2);
+            let outer_index = JsonIndex::build(outer_doc.as_bytes());
+            let outer = outer_index.root(outer_doc.as_bytes());
+            let inner_doc = wide_object(WIDE_MEMBERS * 3);
+            let inner_index = JsonIndex::build(inner_doc.as_bytes());
+            let inner = inner_index.root(inner_doc.as_bytes());
+            let outer_fields = outer.value().as_object().expect("an object document");
+            let inner_fields = inner.value().as_object().expect("an object document");
+            let found = |fields: &_| shown(find_cursor_memoized(fields, "k100"));
+
+            let _outer_scope = memo::enter(outer.document_token());
+            let mut same = memo::enter(outer.document_token());
+            same.swap();
+            same.swap();
+            let outer_answer = found(&outer_fields);
+            let mut inner_scope = memo::enter(inner.document_token());
+            let inner_answer = found(&inner_fields);
+            let before = memo::work();
+            assert_eq!(found(&inner_fields), inner_answer);
+            assert_eq!(
+                memo::work().1,
+                before.1 + 1,
+                "the live scope's index answers"
+            );
+
+            inner_scope.swap();
+            let before = memo::work();
+            assert_eq!(found(&outer_fields), outer_answer);
+            assert_eq!(
+                memo::work().1,
+                before.1 + 1,
+                "the replaced scope answers while set aside"
+            );
+            inner_scope.swap();
+            let before = memo::work();
+            assert_eq!(found(&inner_fields), inner_answer);
+            assert_eq!(memo::work(), (before.0, before.1 + 1), "kept, not rebuilt");
+        }
+
         #[test]
         fn a_small_object_is_never_registered_3913() {
             let doc = wide_object(WIDE_MEMBERS - 1);
