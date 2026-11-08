@@ -40127,13 +40127,12 @@ fn test_yq_auto_output_slurp_uniform_format_1493() -> Result<()> {
     Ok(())
 }
 
-/// Known gap (#1493's own scope note): a genuinely mixed-format `--slurp
-/// -o=auto` falls back to Yaml for the whole output here, where real yq
-/// renders each element in its own source format (a much deeper
-/// per-element behavior, live-verified but not replicated by this fix).
-/// Pinning the current (documented, not the real-yq-matching) behavior.
+/// A genuinely mixed-format `--slurp -o=auto` prints YAML for the whole output (the first file's
+/// extension decides, #4394, #6703), and the JSON file's mapping keeps its flow style, which is
+/// what real yq's `ea '[.]' a.yaml b.json` prints (live against v4.53.3). This was #1493's known
+/// gap while `auto` resolved per source.
 #[test]
-fn test_yq_auto_output_slurp_mixed_format_known_gap_1493() -> Result<()> {
+fn test_yq_auto_output_slurp_mixed_format_matches_yq_1493() -> Result<()> {
     let dir = TempDir::new()?;
     let yaml_file = dir.path().join("a.yaml");
     let json_file = dir.path().join("b.json");
@@ -40151,9 +40150,7 @@ fn test_yq_auto_output_slurp_mixed_format_known_gap_1493() -> Result<()> {
         .output()?;
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout)?;
-    // Real yq: `- a: 1\n- {"b": 2}\n` (per-element format) -- not
-    // replicated here; if this ever changes, update or remove this test.
-    assert_eq!(stdout, "- a: 1\n- b: 2\n");
+    assert_eq!(stdout, "- a: 1\n- {\"b\": 2}\n");
     Ok(())
 }
 
@@ -42006,7 +42003,11 @@ fn test_pjson_invalid_utf8_from_files_and_inplace_1616() -> Result<()> {
 
     let (out, code) = run_yq_file(".", path, &["-o", "json", "-I", "0"])?;
     assert_eq!((code, out.trim()), (0, "{\"a\":\"x\u{fffd}y\"}"));
+    // The default output is `auto` (#6703): a `.json` file prints JSON, so the substitution
+    // applies and the run succeeds, as in yq. YAML output is the one that fails.
     let (out, code) = run_yq_file(".", path, &[])?;
+    assert_eq!((code, out.trim()), (0, "{\n  \"a\": \"x\u{fffd}y\"\n}"));
+    let (out, code) = run_yq_file(".", path, &["-o", "yaml"])?;
     assert_eq!(code, 1, "stdout: {out:?}");
 
     let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))

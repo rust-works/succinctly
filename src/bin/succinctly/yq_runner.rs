@@ -10753,6 +10753,23 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         args.output_format = OutputFormat::Json;
     }
 
+    // yq's `-o` defaults to `auto` (#6703): the run's own input format, picked once from the first
+    // file's extension (#4394). A `.json` file prints JSON; standard input, `.yaml`, `.yml` and any
+    // other name print YAML. There is nothing to match under `-n`, `-R` or `--front-matter`, and an
+    // explicit `-p` keeps the old YAML default (yq v4.53.3 says so in a deprecation warning, #5721).
+    // Resolved here once, so everything below reads a concrete format; `OutputConfig::for_source`
+    // still resolves it per source for a caller that builds one from an unresolved `Auto`.
+    if args.output_format == OutputFormat::Auto {
+        let nothing_to_match = args.null_input || args.raw_input || args.front_matter.is_some();
+        let json_input = args.input_format == InputFormat::Auto
+            && resolve_run_input_format(InputFormat::Auto, &args.files) == InputFormat::Json;
+        args.output_format = if json_input && !nothing_to_match {
+            OutputFormat::Json
+        } else {
+            OutputFormat::Yaml
+        };
+    }
+
     // Handle --version
     if args.version {
         println!("succinctly-yq {}", env!("CARGO_PKG_VERSION"));
