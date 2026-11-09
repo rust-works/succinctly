@@ -19702,14 +19702,15 @@ mod standalone_comment_attribution_2811 {
             "- -\n    - 1.5\n    - a: null\n      c: 2\n\n    #c2\n# c3 tail\n\n# c4\n\n#c5\n- - \"q\"\n",
             &[
                 (".[0][0][1].c | key | foot_comment", "#c2"),
-                (".[1] | head_comment", "c3 tail\nc4\n#c5"),
+                // #6772: the blank lines of the block stay, as in yq.
+                (".[1] | head_comment", "c3 tail\n\nc4\n\n#c5"),
             ],
         )?;
         assert_slots(
             "a:\n  b:\n    c: 1\n\n    # c2\n# c3\n\n# c4\nz: 1\n",
             &[
                 (".a.b.c | key | foot_comment", "c2"),
-                (".z | key | head_comment", "c3\nc4"),
+                (".z | key | head_comment", "c3\n\nc4"),
             ],
         )?;
         for input in [
@@ -19823,7 +19824,8 @@ mod standalone_comment_attribution_2811 {
         assert_slots(
             "a: \"x\"\n# f\n\nb: 2\n",
             &[
-                (".b | key | head_comment", "f"),
+                // #6772: the blank line after the block ends the text with a line feed.
+                (".b | key | head_comment", "f\n"),
                 (".a | key | foot_comment", ""),
             ],
         )?;

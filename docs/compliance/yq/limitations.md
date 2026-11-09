@@ -7316,3 +7316,10 @@ Captured live (yq v4.53.3):
 | `a: x\n\n  y\nb: 1 # c\n` | `a: \|-\n  x\n  y\nb: 1 # c\n` | `a: "x\ny"\nb: 1 # c\n` |
 
 Both read back as the same value, and `-P` (the DOM route) is unaffected.
+
+## `head_comment` keeps a block's blank lines; an indented continuation is still read as a comment line ([#6772](https://github.com/rust-works/succinctly/issues/6772))
+
+yq's head comment is the text above the node with its blank lines kept.
+`# c` / blank / `a: 1` is `c` followed by a line feed, a blank line inside the block stays, and a first document's comment above a leading `---` is one text with the comment under it (`# c` / `---` / `# d` is `c` and `d` on two lines).
+`succinctly yq` answers the same, and the first key the comment under the marker was indexed on has none of its own (`.a | key | head_comment` is empty there, as in yq).
+Still different: a comment line indented under the first one (`# c` / `  # d`) is `c` and `d` here, where yq keeps the indentation and the `#` (`c` and `  # d`).
