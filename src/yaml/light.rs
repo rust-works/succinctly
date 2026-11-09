@@ -8982,6 +8982,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentFields for YamlFields<'a, W> {
     type Value = YamlValue<'a, W>;
     type Cursor = YamlCursor<'a, W>;
 
+    #[inline]
+    fn is_merge_resolved(&self) -> bool {
+        matches!(self.inner, FieldsInner::Merged { .. })
+    }
+
     fn uncons(&self) -> Option<(DocumentField<Self::Value, Self::Cursor>, Self)> {
         let (field, rest) = YamlFields::uncons(self)?;
         Some((

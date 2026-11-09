@@ -28780,6 +28780,52 @@ trait StepTrail<V: DocumentValue>: Clone {
     ) -> Self {
         self.extend_with(component, from)
     }
+
+    /// [`extend_member_with`](Self::extend_member_with) for a member that may sit elsewhere in the
+    /// document than under the node the step left (#6723): a value a `<<` merge lists lives in the
+    /// anchor's mapping, and yq names its location, not the merging mapping's key. A trail that
+    /// records locations takes `located` and starts over from there; every other trail keeps the
+    /// step it was given, which is what a write through the path does.
+    #[inline]
+    fn extend_member_located(
+        &self,
+        component: impl FnOnce() -> OwnedValue,
+        from: &PathNode<V>,
+        _located: impl FnOnce() -> Option<MemberLocation<V::Cursor>>,
+    ) -> Self {
+        self.extend_member_with(component, from)
+    }
+}
+
+/// Where a member sits in its document: the path to it, the node at every proper prefix of that
+/// path, and whether each level is a mapping member (the shape [`cursor_path_ancestors_members_for`]
+/// climbs).
+type MemberLocation<C> = (Vec<OwnedValue>, Vec<C>, Vec<bool>);
+
+/// Where `member`, a value `fields` lists, lives in its document when that is not under `parent`
+/// (#6723): a member a `<<` merge brought in, whose home is the anchor's mapping. `None` for every
+/// other member, in jq mode, and for a mapping that merges nothing, so only a document with a
+/// merge key pays for the climb.
+fn merged_member_location<S: EvalSemantics, V: DocumentValue>(
+    fields: &V::Fields,
+    parent: &V::Cursor,
+    member: &V::Cursor,
+) -> Option<MemberLocation<V::Cursor>> {
+    if S::TAG != EvalTag::Yq || !fields.is_merge_resolved() {
+        return None;
+    }
+    if member.document_parent()?.node_id() == parent.node_id() {
+        return None;
+    }
+    let (path, ancestors, _, members) =
+        cursor_path_ancestors_members_for::<S, V::Cursor>(member, true).ok()?;
+    // The climb has to reach the document root. It stops short where a node hangs off a `<<` key
+    // (an inline `<<: {q: 1}`), which the merged view of its mapping does not list, and a path
+    // that starts anywhere else would name a location that is not there.
+    if ancestors.first()?.document_parent().is_some() {
+        return None;
+    }
+    Some((path, ancestors, members))
 }
 
 impl<V: DocumentValue> StepTrail<V> for Rc<PathTrail> {
@@ -29112,6 +29158,18 @@ impl<V: DocumentValue> StepTrail<V> for PathContextTrail<V> {
     ) -> Self {
         self.link(component(), from, self.seed_depth(), true)
     }
+
+    fn extend_member_located(
+        &self,
+        component: impl FnOnce() -> OwnedValue,
+        from: &PathNode<V>,
+        located: impl FnOnce() -> Option<MemberLocation<V::Cursor>>,
+    ) -> Self {
+        match located() {
+            Some((path, ancestors, members)) => Self::from_climb_members(path, ancestors, &members),
+            None => self.extend_member_with(component, from),
+        }
+    }
 }
 
 /// Walk `expr` from `node`, appending one `OwnedValue::Array` per emitted
@@ -29294,6 +29352,7 @@ fn path_field_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
     path: &T,
 ) -> Result<Option<(T, PathNode<V>)>, EvalError> {
     guard_path_walk_depth(path.recursion_depth())?;
+    let mut located = None;
     let next = match node {
         PathNode::Absent => PathNode::Absent,
         PathNode::Owned(_) => unreachable!("owned nodes step through path_step_owned"), // patchcov: coverage tolerate-line reason="unreachable: both step dispatchers route owned nodes to path_step_owned before calling this cursor helper (#3022)"
@@ -29306,7 +29365,10 @@ fn path_field_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
                 // `find_cursor`, so it needs its own check.
                 empty_fields_tail_gap_ok(&fields, Some(c))?;
                 match crate::jq::key_index::find_cursor_memoized(&fields, name)? {
-                    Some(fc) => PathNode::At(fc),
+                    Some(fc) => {
+                        located = merged_member_location::<S, V>(&fields, c, &fc);
+                        PathNode::At(fc)
+                    }
                     None => PathNode::Absent,
                 }
             } else if v.as_array().is_none() && yq_field_index_on_scalar_is_empty::<S>() {
@@ -29342,9 +29404,10 @@ fn path_field_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
         _ => None,
     };
     Ok(Some((
-        path.extend_member_with(
+        path.extend_member_located(
             || typed.unwrap_or_else(|| OwnedValue::String(name.to_owned().into())),
             node,
+            || located,
         ),
         next,
     )))
@@ -29480,11 +29543,13 @@ fn path_iterate_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>
                     let Some(key) = key_display_string(&field.key) else {
                         return Err(fields.malformed_member_error()); // patchcov: coverage tolerate-line reason="unreachable: effective_fields_checked already rejects key_is_malformed, the same decoded_key_str Ok(None) that makes key_display_string return None (#3022)"
                     };
+                    // A literal `<<` entry (two merge sources that each merge) is no member's value.
+                    let literal_merge_key = &*key == "<<";
                     if matches!(
                         emit(
                             // #3023: the owned key is only built for a trail
                             // that keeps it.
-                            path.extend_member_with(
+                            path.extend_member_located(
                                 || {
                                     if S::TAG == EvalTag::Yq {
                                         yq_path_component(key, &field.key_cursor)
@@ -29493,6 +29558,17 @@ fn path_iterate_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>
                                     }
                                 },
                                 node,
+                                || {
+                                    (!literal_merge_key)
+                                        .then(|| {
+                                            merged_member_location::<S, V>(
+                                                &fields,
+                                                c,
+                                                &field.value_cursor,
+                                            )
+                                        })
+                                        .flatten()
+                                },
                             ),
                             PathNode::At(field.value_cursor),
                             Some((field.key_cursor, &field.key)),
