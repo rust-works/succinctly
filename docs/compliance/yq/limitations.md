@@ -7183,3 +7183,18 @@ These differ:
   yq reads the bytes: `strenv(BADVAR)` with `BADVAR` set to `\xff\xfe` prints those two bytes, and `env(BADVAR)` reads them as a YAML document (`Error: EOF`).
   A string value here cannot hold non-UTF-8 text, so both stop with `value for env variable 'BADVAR' is not valid UTF-8 in strenv()` (or `env()`) and exit status 1, where they said `not provided` before #6566.
   An unset variable is `not provided`, as in yq.
+
+### A multi-line plain scalar in a document with a trailing comment keeps the double-quoted spelling ([#6737](https://github.com/rust-works/succinctly/issues/6737))
+
+A plain scalar the source folds across blank lines holds a line feed, which yq writes as a literal block (`k: |-` then the lines).
+The cursor streamers write that block when the document has no trailing same-line comment.
+A document with one keeps the spelling the streamers used before #6737, a double-quoted string with `\n` (`k: "a\nb"`), for any such scalar.
+They write a line comment after the value, which a literal block would read as the last line of its text, and yq puts it on the block's header instead (`k: |- # c`).
+Captured live (yq v4.53.3):
+
+| input                     | real yq                        | succinctly yq           |
+|---------------------------|--------------------------------|-------------------------|
+| `k: a\n\n  b # c\n`       | `k: \|- # c\n  a\n  b\n`       | `k: "a\nb" # c\n`       |
+| `a: x\n\n  y\nb: 1 # c\n` | `a: \|-\n  x\n  y\nb: 1 # c\n` | `a: "x\ny"\nb: 1 # c\n` |
+
+Both read back as the same value, and `-P` (the DOM route) is unaffected.
