@@ -7889,13 +7889,40 @@ fn read_inputs(
         }
         // #6591: the fault event at the end of the text is read at a last file that did not open,
         // line 0, as the JSON reader's fault is (#6480).
-        let fault_at_tail = !args.slurp
+        // #6775: a `-n` slurp reads that event as an input of its own, after the array.
+        let fault_at_tail = (!args.slurp || args.null_input)
             && UNOPENED_TAIL_NAME.with(|tail| tail.borrow().is_some())
             && values.last().is_some_and(is_eof_fault_event);
+        // #6775: a `-n` slurp over a last directory leaves the directory to the read that finds the
+        // stream at its end (#6604). A fault event at the end of the text is that read: jq's reader
+        // went past the last file to find the token still open, so it has been through the
+        // directory and says so there, where the event read as a value of the first file would not.
+        let fault_at_directory = args.slurp
+            && args.null_input
+            && SLURP_DIRECTORY_READ.with(std::cell::Cell::get)
+            && values.last().is_some_and(is_eof_fault_event);
+        let directory_at = fault_at_directory
+            .then(|| {
+                PENDING_OPEN_FAILURES.with(|pending| {
+                    pending
+                        .borrow()
+                        .back()
+                        .filter(|(_, failure)| failure.is_last_directory())
+                        .map(|&(at, _)| at)
+                })
+            })
+            .flatten();
+        debug_assert_eq!(
+            values.len(),
+            value_locations.len(),
+            "one location per value"
+        );
         let last = value_locations.len().saturating_sub(1);
         for (index, &at) in value_locations.iter().enumerate() {
             let (source, line) = if fault_at_tail && index == last {
                 (files.len(), 0)
+            } else if let (Some(directory), true) = (directory_at, index == last) {
+                (directory, 0)
             } else {
                 stream_location(&raw_bytes, at)
             };
