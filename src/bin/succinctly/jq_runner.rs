@@ -7731,7 +7731,13 @@ fn read_inputs(
                 resumed.push((0, fault(message, at)));
             }
             let mut values = vec![OwnedValue::array_from(read.array)];
-            let (source, line) = place(read.slurp_at);
+            // #6730: with a last file that did not open, jq's reader goes on to it before the array
+            // closes, so the array is read there (line 0) and its read reaches the failure.
+            let (source, line) = if UNOPENED_TAIL_NAME.with(|tail| tail.borrow().is_some()) {
+                (files.len(), 0)
+            } else {
+                place(read.slurp_at)
+            };
             locations.push(source, line);
             for item in read.after {
                 match item {
@@ -10132,10 +10138,24 @@ fn fault_leaves_failures_to_reads(
 ) -> bool {
     args.null_input
         && !args.raw_input
-        && reads_place_json_or_text_failures(args)
+        && (reads_place_json_or_text_failures(args) || slurp_stream_reads_place_failures(args))
         // A slurp's text that faults hands its reads the fault and then the array (#6671).
         && !failures.is_empty()
         && (reached < failures.len() || (args.slurp && text_faults))
+}
+
+/// Whether `-n -s --stream` reads a JSON text in memory (#6730): the stream reader's faults are
+/// events the program's `input` meets one by one and goes on past, and then the array, so the
+/// failures after a fault are the reads' to place as the plain `-n -s` text's are. `--seq`,
+/// `--stream-errors`, `-R`, DSV and `--validate` place their own.
+fn slurp_stream_reads_place_failures(args: &JqCommand) -> bool {
+    args.slurp
+        && args.stream
+        && !(args.stream_errors
+            || args.seq
+            || args.raw_input
+            || args.input_dsv.is_some()
+            || args.validate)
 }
 
 /// Whether the input is JSON text or `-R` lines, the readers whose reads [`reach_last_directory`]
