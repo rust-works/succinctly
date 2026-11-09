@@ -5320,7 +5320,7 @@ ruled out), even though real yq supports every one of them:
   one by one, each judged against the comments the document held before the assignment, so the head a
   value leaves on the next key is not taken for a head that key owns; a target whose neighbour held lines
   before the assignment is refused as a single target is. Checked by
-  13 `meta_assign_entry_*_2796` goldens, 13 `meta_assign_multi_*_2796` ones, and a differential fuzz of ~5,300 accepted writes
+  13 `meta_assign_entry_*_2796` goldens, 14 `meta_assign_multi_*_2796` ones, and a differential fuzz of ~5,300 accepted writes
   over random documents with and without comments (none differed; ~4,300 more were refused), and a 348-row
   matrix of several targets (12 setter forms x 29 target shapes over documents with and without comments)
   where 304 rows match yq, the rest are refused, and none is silently different.
