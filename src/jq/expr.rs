@@ -991,6 +991,8 @@ pub enum MetaSlot {
     Style,
     /// `anchor = ...` — the node's `&anchor` declaration.
     Anchor,
+    /// `alias = ...` — turns the node into a `*alias` of the named anchor (yq mode only, #5483).
+    Alias,
     /// `tag = ...` — the node's YAML type tag. Parses; not yet supported (#798 PR1).
     Tag,
     /// `head_comment = ...` — standalone comment lines above the node. Parses; not yet supported (#798 PR1).

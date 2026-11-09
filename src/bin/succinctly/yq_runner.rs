@@ -5662,6 +5662,11 @@ enum MetaEffect {
     /// `None` clears the anchor (live-verified: `.a anchor = ""` on
     /// `a: &z 1` => `a: 1`).
     Anchor(Option<String>),
+    /// `alias = "x"` (#5483): the node becomes a `*x` of the anchor `x`. Only the mark is written:
+    /// the node keeps its value, and [`enforce_anchor_soundness`] keeps `*x` only where an earlier
+    /// `&x` holds an identical value, so an alias of nothing prints as the value it has, where yq
+    /// prints a `*x` it cannot read back. An empty text writes nothing (yq leaves the node alone).
+    Alias(String),
     /// `head_comment = ""`, `foot_comment = ""` and `comments = ""` (#2796): drop the
     /// standalone head lines, the trailing line comment and/or the standalone foot lines of
     /// the node. Only the clearing form is supported; see [`apply_clear`] for where each slot
@@ -5720,6 +5725,8 @@ enum WritableSlot {
     LineComment,
     Style,
     Anchor,
+    /// `alias = "x"` (#5483): see [`MetaEffect::Alias`].
+    Alias,
     /// `tag = "!!str"` (#2796): see [`MetaEffect::Tag`].
     Tag,
     HeadComment,
@@ -5736,6 +5743,7 @@ impl WritableSlot {
             MetaSlot::LineComment => Some(Self::LineComment),
             MetaSlot::Style => Some(Self::Style),
             MetaSlot::Anchor => Some(Self::Anchor),
+            MetaSlot::Alias => Some(Self::Alias),
             MetaSlot::HeadComment => Some(Self::HeadComment),
             MetaSlot::FootComment => Some(Self::FootComment),
             MetaSlot::Comments => Some(Self::Comments),
@@ -5814,6 +5822,20 @@ fn meta_comment_text(s: &str) -> Option<String> {
 /// too. Refusing matters: the emitter would otherwise write `&bad name 1`
 /// for `"bad name"` and change the value on read-back.
 fn meta_anchor_name(s: &str) -> Result<Option<String>, EvalError> {
+    anchor_or_alias_name(s, "anchor")
+}
+
+/// The anchor name an `alias = s` write points at (#5483; `None` for an empty text, which yq
+/// leaves alone, unlike `anchor = ""`, which clears), or real yq's refusal. The emitter checks an
+/// alias name by the same rule as an anchor name ([`meta_anchor_name`]): `x y`, `a,b`, `a:b` and
+/// `é` are refused, `&q`, `*q` and `5` (the text of a number) are accepted. Every row is captured
+/// from yq v4.53.3.
+fn meta_alias_name(s: &str) -> Result<Option<String>, EvalError> {
+    anchor_or_alias_name(s, "alias")
+}
+
+/// [`meta_anchor_name`]'s rule for a name of the given kind (`anchor` or `alias`).
+fn anchor_or_alias_name(s: &str, kind: &str) -> Result<Option<String>, EvalError> {
     if s.is_empty() {
         return Ok(None);
     }
@@ -5824,9 +5846,9 @@ fn meta_anchor_name(s: &str) -> Result<Option<String>, EvalError> {
         Ok(Some(s.to_string()))
     } else {
         // Real yq's exact text, doubled `yaml: ` prefix included.
-        Err(EvalError::new(
-            "yaml: yaml: anchor value must contain valid characters only",
-        ))
+        Err(EvalError::new(format!(
+            "yaml: yaml: {kind} value must contain valid characters only"
+        )))
     }
 }
 
@@ -6238,6 +6260,20 @@ fn writes_tag(expr: &Expr) -> bool {
     })
 }
 
+/// Whether `expr` contains an `alias` metadata write anywhere (#5483): the one slot that puts a
+/// `*name` mark in a document that had none, so the soundness pass has to run for it.
+fn writes_alias(expr: &Expr) -> bool {
+    jq::walk::any_subexpr(expr, &mut |e| {
+        matches!(
+            e,
+            Expr::MetaAssign {
+                slot: MetaSlot::Alias,
+                ..
+            }
+        )
+    })
+}
+
 /// Whether `expr` contains a `head_comment`, `foot_comment` or `comments` metadata write
 /// anywhere (#2796).
 fn writes_head_foot_or_comments(expr: &Expr) -> bool {
@@ -6570,7 +6606,7 @@ fn resolve_one_meta_assign(
     if (with_keys || key_prefix.is_some() || mixed_keys)
         && matches!(
             slot,
-            WritableSlot::Style | WritableSlot::Anchor | WritableSlot::Tag
+            WritableSlot::Style | WritableSlot::Anchor | WritableSlot::Alias | WritableSlot::Tag
         )
     {
         // Their key-node counterparts (a quoted key, an `&anchor` on a key, a tag on a key) are not modelled for
@@ -6853,6 +6889,15 @@ fn resolve_one_meta_assign(
                     return false;
                 }
             },
+            WritableSlot::Alias => match meta_alias_name(&s) {
+                Ok(Some(name)) => MetaEffect::Alias(name),
+                // An empty text leaves the node as it is, a leftover `*x` included.
+                Ok(None) => continue,
+                Err(e) => {
+                    sink.report(DiagStyle::Yq, &e, &no_location());
+                    return false;
+                }
+            },
         };
         out.push(ResolvedMetaWrite {
             batch,
@@ -7069,6 +7114,9 @@ fn apply_meta_assign_writes(
             }
             MetaEffect::Anchor(name) => {
                 node.meta_mut().anchor = name.clone().map(AnchorMark::Declares);
+            }
+            MetaEffect::Alias(name) => {
+                node.meta_mut().anchor = Some(AnchorMark::Aliases(name.clone()));
             }
             MetaEffect::Tag(tag) => apply_tag(tag, node_value, node),
             // Handled above, before the node is borrowed.
@@ -8530,7 +8578,9 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
     // document with no `*name` anywhere has nothing it *could* change. The
     // walk is not free — it visits every node of the reconciled tree — and
     // an alias-free document is the overwhelmingly common case.
-    if has_aliases {
+    // An `alias = "x"` write (#5483) adds an `Aliases` mark to a document that had none, so it
+    // needs the pass too.
+    if has_aliases || writes_alias(expr) {
         if let Ok(docs) = &mut docs {
             for (value, comments) in docs.iter_mut() {
                 enforce_anchor_soundness(value, comments, sort_keys);

@@ -7108,7 +7108,7 @@ A path other than `.` (`explode(.a)`, `explode(..)`) is a parse error: yq leaves
 `.a | explode(.)` is refused by the existing rule that a metadata write cannot sit behind a navigation.
 The presentation of an expanded alias copy is lost: its flow style (`b: *x` over `a: &x {p: 1}` prints a block mapping where yq prints `b: {p: 1}`), its quotes (`b: *s` over `a: &s "q"` prints `b: q`) and its explicit tag (`a: &x !!str 1` prints `b: "1"`), the family tracked on [#2651](https://github.com/rust-works/succinctly/issues/2651), and a comment after the alias moves with it.
 The value is the same each time; only how it is written differs.
-The `alias =` setter is still undefined (`.b alias = "z"` is a parse error); the getter has its own section below.
+The `alias` getter and the `alias =` setter have their own sections below.
 Pinned by `tests/yq_cli/i5483.rs`, whose rows were captured from yq v4.53.3.
 
 ## The `alias` getter answers a node's `Value`, as yq does ([#5483](https://github.com/rust-works/succinctly/issues/5483))
@@ -7125,6 +7125,27 @@ An absent key and a computed `null` answer `"null"`, as in yq.
 `.[] | select(alias != "")` prints the resolved target of an alias node where yq prints `*x`, the read-route alias echo tracked with the alias-mark family (#2505, #5249).
 Under `--jq-extensions`, `path(...)` and `paths(...)` run with no cursor, so they cannot see an alias node (`paths(alias != "")` lists every scalar), as they cannot see an `anchor`; no yq oracle exists for that surface.
 Pinned by `tests/yq_cli/i5483_alias.rs`, whose rows were captured from yq v4.53.3.
+
+## The `alias =` setter writes `*name` only where `&name` holds the same value ([#5483](https://github.com/rust-works/succinctly/issues/5483))
+
+yq's `PATH alias = "name"` (and `|=`) turns each node `PATH` selects into an alias node whose `Value` is `name`, and prints it `*name` whether or not an `&name` exists.
+`succinctly yq` writes the same mark, then holds it to the soundness rule of every alias mark (anchor/alias section above): it prints `*name` only where an earlier `&name` holds an identical value, and otherwise prints the value the node has.
+That is a divergence under the rule that `succinctly yq` never emits YAML it cannot read back, and each row below is one the rule refuses.
+- No such anchor: `.b alias = "z"` over `a: &x 1` / `b: 1` is `b: *z` in yq, `b: 1` here.
+- An anchor holding another value: `.c alias = "x"` over `c: 2` is `c: *x` in yq, which reads back as `1`, and `c: 2` here.
+- The text of a number, a boolean or `null` is a name too (`.b alias = 5` is `b: *5` in yq), and meets the same rule.
+- A path the write creates is `null`: `.d alias = "x"` is `d: *x` in yq, `d: null` here.
+- Aliasing the declaring node (`.a alias = "x"` over `a: &x 1`) leaves no declaration, so every alias of it, the node itself included, prints the value.
+- `-o json` prints `null` in yq for an alias node the setter made (it has no target) and the node's value here.
+- A bare scalar result keeps no mark, so `.b alias = "x" | .b` is `*x` in yq and `1` here, as for any bare scalar alias (see the soundness section above).
+- A later write does not clear the mark where it leaves the value alone: `.c alias = "x" | .c = 1` is `c: 1` in yq and `c: *x` here, since `1` is still the anchor's value.
+
+What matches yq, byte for byte, in the rows captured from v4.53.3: an equal anchor (`.b alias = "x"` over `a: &x 1` / `b: 1` is `b: *x`), `|=`, several targets, a container aliased to an equal container, and the refusals.
+An empty text writes nothing and does not clear an alias already there (unlike `anchor = ""`).
+A sequence or non-empty mapping right side has no text and writes nothing; `{}` and a name with whitespace, `,`, `:`, a bracket, a brace or a non-ASCII character is refused with `yaml: yaml: alias value must contain valid characters only`, the rule of an anchor name.
+The right side of `.e alias = .b` is read as the value of `.b`, not as the alias node it is, so it writes nothing where yq writes `*x`.
+It is yq-mode only: in jq mode `alias =` is not a write.
+Pinned by `tests/yq_cli/i5483_alias_setter.rs`.
 
 ## A value the program builds is bounded by the native-stack floor, not by 384 levels ([#5876](https://github.com/rust-works/succinctly/issues/5876))
 

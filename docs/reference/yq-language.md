@@ -288,6 +288,9 @@ These functions access YAML-specific metadata not available in JSON:
 
 `alias` is yq's node `Value` (#5483): the anchor's name for an alias node, a scalar's own text (`1.50`,
 `0x1F`) for any other scalar, `""` for a collection.
+`PATH alias = "name"` makes the node a `*name` alias of `&name`; `succinctly yq` writes it only where an
+earlier `&name` holds the same value, so it never prints an alias it could not read back (see the yq
+limitations page).
 
 (*) A node that carries a property reports the position of its first `&anchor`/`!tag`
 token, not of its value: `b: &anc [1,2]` is column 4 (the `&`), as in yq (#2712).
