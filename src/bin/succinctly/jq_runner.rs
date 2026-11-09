@@ -24542,7 +24542,13 @@ mod tests {
     /// fallback to the stopping walk removed.
     #[test]
     fn the_kept_walk_decides_as_the_stopping_walk_did_6620() {
-        let streams = random_seq_streams(20_000);
+        let mut streams = random_seq_streams(20_000);
+        // Streams only the walk finds clean (the record check wants an LF after each record).
+        streams.extend([
+            b"\x1e\"a\"\x1e\"b\"".to_vec(),
+            b"\x1e[1] \x1e{}".to_vec(),
+            b"\x1e{\"a\":1}\x1e{\"a\":2}".to_vec(),
+        ]);
         let (mut clean, mut kept, mut declined) = (0, 0, 0);
         for raw in streams {
             let stopping = seq_stream_as_plain_json_with(raw.clone(), false, None);
@@ -24550,6 +24556,7 @@ mod tests {
             match (stopping, keeping) {
                 (Ok(a), Ok(b)) => {
                     assert_eq!(a, b, "{raw:?}");
+                    assert!(!b.contains(&ASCII_RS), "{raw:?}: every RS is blanked");
                     clean += 1;
                 }
                 (Err((a, _)), Err((b, walk))) => {
@@ -24587,7 +24594,7 @@ mod tests {
             }
         }
         // The test must reach each shape, or it proves nothing.
-        assert!(clean > 0, "{clean} clean streams");
+        assert!(clean >= 3, "{clean} clean streams");
         assert!(kept > 1_000, "{kept} streams handed on");
         assert!(
             declined > 20,
