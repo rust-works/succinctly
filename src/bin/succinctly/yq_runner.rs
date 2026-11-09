@@ -17014,7 +17014,7 @@ mod tests {
 
     /// #2796: what the key node cannot take exactly is refused: a foot or a line comment already
     /// there, a line comment on a container value, a flow collection, a style or anchor, a
-    /// newline-only text, and several targets.
+    /// newline-only text, and a key node among value targets (several key nodes are written, #6792).
     #[test]
     fn key_node_text_refuses_what_it_cannot_place_2796() {
         for (yaml, filter) in [
@@ -17025,7 +17025,7 @@ mod tests {
             ("a: 1\n", "(.a | key) style = \"double\""),
             ("a: 1\n", "(.a | key) anchor = \"z\""),
             ("a: 1\n", "(.a | key) head_comment = \"\\n\""),
-            ("a: 1\nb: 2\n", "(.[] | key) head_comment = \"x\""),
+            ("a: 1\nb: 2\n", "((.a | key), .b) head_comment = \"x\""),
         ] {
             let expr = jq::parse_with_mode(filter, jq::ParserMode::Yq).unwrap();
             let mut sink = ErrorSink::default();
