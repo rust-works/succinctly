@@ -69,3 +69,38 @@ fn a_halting_program_comes_before_the_streams_warnings_and_failures_6725() -> Re
     }
     Ok(())
 }
+
+/// A `--seq --stream -s` run reads the whole stream in its first call, warning as it goes: once a
+/// file that did not open has been said, jq's main loop reads no further, so the warnings the file
+/// after it holds past its first are never said. Every row was captured from jq 1.7.1.
+#[test]
+fn a_slurp_says_no_warning_past_the_one_that_reaches_a_failure_6725() -> Result<()> {
+    let rows: &[Row] = &[
+        (&["--seq", "--stream", "-s", "."], &["miss", "warn2"], "", "jq: error: Could not open file @D@/miss: No such file or directory\njq: ignoring parse error: Truncated value at line 1, column 4\n", 2),
+        (&["--seq", "--stream", "-s", "."], &["warn2", "miss", "warn2"], "", "jq: ignoring parse error: Truncated value at line 1, column 4\njq: ignoring parse error: Truncated value at line 1, column 7\njq: error: Could not open file @D@/miss: No such file or directory\njq: ignoring parse error: Truncated value at line 2, column 4\n", 2),
+        (&["--seq", "--stream", "-s", "."], &["one", "dir", "warn2"], "", "jq: error: Is a directory\njq: ignoring parse error: Truncated value at line 2, column 4\n", 2),
+    ];
+    let dir = tempfile::tempdir()?;
+    let d = dir.path().to_string_lossy().into_owned();
+    std::fs::create_dir(dir.path().join("dir"))?;
+    for (name, text) in [("warn2", "\x1e[1\x1e[2\x1e[3]\n"), ("one", "\x1e1\n")] {
+        std::fs::write(dir.path().join(name), text)?;
+    }
+    for (flags, order, stdout, stderr, status) in rows {
+        let mut args: Vec<String> = vec!["-c".into()];
+        args.extend(flags.iter().map(|flag| (*flag).to_string()));
+        args.extend(order.iter().map(|name| format!("{d}/{name}")));
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (out, err, code) = run_jq_full(&args, None)?;
+        assert_eq!(
+            (out.as_str(), err.as_str(), code),
+            (
+                stdout.replace("@D@", &d).as_str(),
+                stderr.replace("@D@", &d).as_str(),
+                *status
+            ),
+            "{flags:?} over {order:?}"
+        );
+    }
+    Ok(())
+}

@@ -6991,8 +6991,8 @@ fn read_inputs(
     // Whether a last directory was left to the read that reaches it (#6604): it fails the run
     // whether or not a read does, but only once the warnings have been placed among the others.
     let mut seq_directory_deferred = false;
-    // #6591: whether a `--seq --stream` run that warns as it goes holds its open failures to place
-    // them among the warnings, as `--seq -s` does ([`seq_slurp_places_failures`]).
+    // #6591, #6676: whether a `--seq --stream -s` run holds its open failures to place them among
+    // the warnings, as `--seq -s` does ([`seq_slurp_places_failures`]).
     let mut seq_stream_places_failures = false;
     // #6646, #6725: `--stream-errors` and `--seq --stream` read the text as one stream through jq's
     // streaming parser, which reads a file that did not open as an empty read. Not `--stream` alone
@@ -7254,13 +7254,6 @@ fn read_inputs(
                 SEQ_FAULT_ENDS.with(|ends| {
                     *ends.borrow_mut() = seq_fault_ends(&raws, unopened_tail).into();
                 });
-            } else if seq_stream_places_failures_by_warning(args, track_eof) {
-                // #6591: the reader's warnings come out as jq's main loop pops each fault, and a
-                // failure is said when the reader opens the file, so it sits among them by source.
-                let mut failures = failures;
-                failures.truncate(reached);
-                held_open_failures = failures.into();
-                seq_stream_places_failures = true;
             } else if last_directory_left_to_reads(args, track_eof, &failures, reached) {
                 // #6625: an earlier failure sent the run up front, which reports every failure
                 // at once. The directory given last is still the reads' to place (#6615): jq says
@@ -7583,17 +7576,6 @@ fn read_inputs(
                 unknown: read.open_at_end.is_none(),
             });
         }
-        // #6591: the value that took jq's reader past the first file that did not open is the last
-        // one its main loop reads (#6006), so a warning met reading any later value never comes.
-        let main_loop_stops_at = if seq_stream_places_failures && !args.slurp {
-            read.locations.iter().position(|&at| {
-                let (source, line) = stream_location(&raw_bytes, at);
-                line != UNKNOWN_LINE as usize
-                    && source_is_past_open_failure(u32::try_from(source).ok())
-            })
-        } else {
-            None
-        };
         let mut resumed: Vec<(usize, TrailingParseError)> = Vec::new();
         let mut trailing_error = None;
         // #6676: a slurp that places its failures among the warnings lost the array where a
@@ -7643,7 +7625,7 @@ fn read_inputs(
                 ));
             } else if !fault.after_array {
                 if seq_stream_places_failures {
-                    if main_loop_stops_at.is_some_and(|stop| fault.before > stop) || slurp_stopped {
+                    if slurp_stopped {
                         continue;
                     }
                     // The warning at the end of the text is raised by the read that has been
@@ -8801,18 +8783,6 @@ fn seq_slurp_defers_failures(args: &JqCommand) -> bool {
         && !args.raw_input
         && args.input_dsv.is_none()
         && !seq_by_stream_reader(args)
-}
-
-/// Whether a plain `--seq --stream` run reports its open failures among the reader's warnings
-/// (#6591): the program reads no `input` (`track_eof`), so jq's main loop pops each fault and says
-/// a failure when its reader opens the file. `--stream-errors` has no warnings: each fault is an
-/// event of its own.
-fn seq_stream_places_failures_by_warning(args: &JqCommand, track_eof: bool) -> bool {
-    seq_by_stream_reader(args)
-        && !args.stream_errors
-        && !args.slurp
-        && !args.null_input
-        && !track_eof
 }
 
 /// Whether a `--seq --stream -s` run reports its open failures among the stream reader's warnings
@@ -19659,6 +19629,34 @@ mod tests {
         );
         // Drain the queue so the next test starts clean.
         while !matches!(jq::pop_input(), jq::InputPop::Exhausted) {}
+    }
+
+    /// #6725: `--seq --stream` and `--seq --stream-errors` read through the queue now, so the
+    /// in-memory route's tests of where a first value ends no longer reach `--seq` through a
+    /// run. The predicates keep their contract: a `--seq` record is complete once the next record
+    /// separator is in the file, and a `--stream-errors` run with no failure reached places none.
+    #[test]
+    fn first_value_predicates_keep_their_seq_contract_6725() {
+        use clap::Parser;
+
+        let parse = |argv: &[&str]| JqCommand::try_parse_from(argv.iter().copied()).unwrap();
+        let seq = parse(&["jq", "--seq", "--stream", "."]);
+        let closed = b"\x1e[1,2]\n\x1e3\n".to_vec();
+        let open = b"\x1e[1,2".to_vec();
+        for (raw, complete) in [(&closed, true), (&open, false), (&Vec::new(), false)] {
+            assert_eq!(first_value_completes_in(raw, &seq), complete, "{raw:?}");
+            assert_eq!(
+                first_value_completes_at(&[Vec::new(), raw.clone()], 1, &seq),
+                complete,
+                "{raw:?} after an empty file"
+            );
+        }
+        let events = parse(&["jq", "--stream-errors", "."]);
+        assert!(!stream_errors_main_loop_places_failures(
+            &events,
+            &[],
+            &[closed]
+        ));
     }
 
     /// #6437: a `-R` program that reads no `input` gets its lines from the producer `input` reads
