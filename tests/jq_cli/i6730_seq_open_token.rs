@@ -5,8 +5,10 @@
 //! array, and the fault comes in a read the main loop never makes, so the array is printed and the
 //! warning never said (`ptr miss`, where nothing is held back, meets the fault inside the array and
 //! loses it); a directory is that read too, so `--stream-errors` does not print the fault as a second
-//! output. Every row was captured from jq 1.7.1; the rows without a held-back closing event do not
-//! move.
+//! output. A second read behind the last file with bytes (another failure, an empty file, a
+//! directory) is the read the fault is met in, inside the array, which `--stream` loses with the
+//! warning said. Every row was captured from jq 1.7.1; the rows without a held-back closing event do
+//! not move.
 
 use anyhow::Result;
 
@@ -18,7 +20,7 @@ fn a_seq_slurp_leaves_a_record_open_across_files_to_the_read_of_the_failed_file_
     let dir = tempfile::tempdir()?;
     let d = dir.path().to_string_lossy().into_owned();
     std::fs::create_dir(dir.path().join("dir"))?;
-    for (name, text) in [("trunc", "\u{1e}[1,"), ("pa", "[1]")] {
+    for (name, text) in [("trunc", "\u{1e}[1,"), ("pa", "[1]"), ("empty", "")] {
         std::fs::write(dir.path().join(name), text)?;
     }
     #[rustfmt::skip]
@@ -36,6 +38,12 @@ fn a_seq_slurp_leaves_a_record_open_across_files_to_the_read_of_the_failed_file_
         (&["-c", "--seq", "-s", "--stream-errors", "error(\"x\")"][..], &["trunc", "pa", "dir"][..], "", "jq: error (at @DIR@/dir:0): x\n", 2),
         (&["-c", "--seq", "-s", "--stream-errors", "[., input_filename]"][..], &["pa", "dir"][..], "\u{1e}[[[\"Unfinished abandoned text at EOF at line 1, column 3\",[]]],\"@DIR@/dir\"]\n", "", 2),
         (&["-c", "--seq", "-s", "--stream-errors", "."][..], &["trunc", "miss"][..], "\u{1e}[[[0],1],[\"Unfinished JSON term at EOF at line 1, column 4\",[1]]]\n", "jq: error: Could not open file @DIR@/miss: No such file or directory\n", 2),
+        (&["-c", "--seq", "-s", "--stream", "."][..], &["trunc", "pa", "miss", "empty"][..], "", "jq: error: Could not open file @DIR@/miss: No such file or directory\njq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 7\n", 2),
+        (&["-c", "--seq", "-s", "--stream", "."][..], &["trunc", "pa", "empty", "miss"][..], "", "jq: error: Could not open file @DIR@/miss: No such file or directory\njq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 7\n", 2),
+        (&["-c", "--seq", "-s", "--stream", "."][..], &["trunc", "pa", "miss", "miss2"][..], "", "jq: error: Could not open file @DIR@/miss: No such file or directory\njq: error: Could not open file @DIR@/miss2: No such file or directory\njq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 7\n", 2),
+        (&["-c", "--seq", "-s", "--stream", "."][..], &["trunc", "pa", "dir", "miss"][..], "", "jq: error: Is a directory\njq: error: Could not open file @DIR@/miss: No such file or directory\njq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 7\n", 2),
+        (&["-c", "--seq", "-s", "--stream", "."][..], &["trunc", "miss", "pa", "miss2"][..], "\u{1e}[[[0],1],[[1,0],1],[[1,0]]]\n", "jq: error: Could not open file @DIR@/miss: No such file or directory\njq: error: Could not open file @DIR@/miss2: No such file or directory\n", 2),
+        (&["-c", "--seq", "-s", "--stream", "."][..], &["trunc", "miss", "pa", "dir"][..], "\u{1e}[[[0],1],[[1,0],1],[[1,0]]]\n", "jq: error: Could not open file @DIR@/miss: No such file or directory\n", 2),
     ];
     check_rows(&d, &rows)
 }

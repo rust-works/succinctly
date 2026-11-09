@@ -7614,14 +7614,20 @@ fn read_inputs(
                 .iter()
                 .rposition(|(_, raw)| !raw.is_empty())
                 .is_some_and(|last| {
-                    // #6730: one failure behind the last file with bytes is the read that brings out the
-                    // closing event that file held back, and the fault comes after the array; a second one
-                    // is the read the fault is met in, inside the array.
-                    held_open_failures
+                    // #6730: one read behind the last file with bytes (a file that did not open, a
+                    // directory or an empty file) brings out the closing event that file held back,
+                    // and the fault comes after the array; a second one is the read the fault is
+                    // met in, inside the array. The source pushed for a last file that did not open
+                    // is that file's read, not another.
+                    let reads_behind = raw_bytes[last + 1..]
                         .iter()
-                        .filter(|&&(at, _)| at > last)
+                        .filter(|(source, _)| source.is_some_and(|source| source < files.len()))
                         .count()
-                        <= 1
+                        + held_open_failures
+                            .iter()
+                            .filter(|(at, failure)| *at > last && !failure.is_directory())
+                            .count();
+                    held_open_failures.iter().all(|&(at, _)| at <= last) || reads_behind <= 1
                 });
         let eof_term_dropped = |fault: &crate::jq_stream_errors::SeqFault| -> bool {
             eof_term_after_failures
