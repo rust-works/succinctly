@@ -339,15 +339,14 @@ fn test_a_computed_operand_that_is_not_one_node_stays_plain_5249() -> Result<()>
             "a: &x 1\nb: *x\nc: 2\n",
         ),
         ("a: !Foo x\n", ".b = \"lit\"", "a: !Foo x\nb: lit\n"),
-        // Several results, a construction and a compound assignment are not one node read: yq
-        // aliases `.c` in the first and third (the rows #5249 still tracks); the value is right.
+        // Several results are not one node read: yq aliases `.c` in the first (the row #5249 still
+        // tracks); the value is right.
         (
             "a: &x 1\nb: *x\n",
             ".c = (.a, .b)",
             "a: &x 1\nb: *x\nc: 1\n",
         ),
         ("a: !Foo x\n", ".c = [.a]", "a: !Foo x\nc:\n  - x\n"),
-        ("a: &x 1\nb: *x\n", ".c += .b", "a: &x 1\nb: *x\nc: 1\n"),
         // An operand that falls back to a value has no node to copy.
         ("a: !Foo x\n", ".c = (.nope // 7)", "a: !Foo x\nc: 7\n"),
     ] {
@@ -420,6 +419,41 @@ fn test_a_construction_of_unknown_width_stays_plain_5249() -> Result<()> {
             "a: &x 1\nb: *x\n",
             ".c = {(\"k\"): .b}",
             "a: &x 1\nb: *x\nc:\n  k: 1\n",
+        ),
+    ] {
+        let (output, exit_code) = run_yq_stdin(filter, input, &[])?;
+        assert_eq!(exit_code, 0, "filter: {filter} on {input:?}");
+        assert_eq!(output, expected, "filter: {filter} on {input:?}");
+    }
+    Ok(())
+}
+
+/// `+=` and `-=` into a target yq holds no value in take the source node itself, and `+=` onto a
+/// sequence appends it; any other target computes a value with no alias in it.
+#[test]
+fn test_a_compound_assignment_into_an_empty_target_keeps_the_alias_5249() -> Result<()> {
+    for (input, filter, expected) in [
+        ("a: &x 1\nb: *x\n", ".c += .b", "a: &x 1\nb: *x\nc: *x\n"),
+        ("a: &x 1\nb: *x\n", ".c -= .b", "a: &x 1\nb: *x\nc: *x\n"),
+        (
+            "a: &x 1\nb: *x\nc: ~\n",
+            ".c += .b",
+            "a: &x 1\nb: *x\nc: *x\n",
+        ),
+        (
+            "a: &x 1\nb: *x\n",
+            ".d.e += .b",
+            "a: &x 1\nb: *x\nd:\n  e: *x\n",
+        ),
+        (
+            "a: &x 1\nb: *x\nc: [1]\n",
+            ".c += .b",
+            "a: &x 1\nb: *x\nc: [1, *x]\n",
+        ),
+        (
+            "a: &x 1\nb: [*x, 2]\n",
+            ".c += .b[0]",
+            "a: &x 1\nb: [*x, 2]\nc: *x\n",
         ),
     ] {
         let (output, exit_code) = run_yq_stdin(filter, input, &[])?;

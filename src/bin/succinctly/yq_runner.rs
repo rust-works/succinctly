@@ -27,8 +27,8 @@ use succinctly::jq::stream::StreamFailure;
 use succinctly::jq::{
     self, alias_identity, assert_value_tree_depth, is_alias_sensitive_assign,
     nesting_depth_exceeded_message, nonfinite_display_string, nonfinite_literal_display,
-    sync_aliased_paths, Builtin, DefScope, EvalError, Expr, Literal, MetaSlot, NumberRepr,
-    ObjectKey, ObjectMap, OwnedValue, QueryResult, YqSemantics,
+    sync_aliased_paths, AssignOp, Builtin, DefScope, EvalError, Expr, Literal, MetaSlot,
+    NumberRepr, ObjectKey, ObjectMap, OwnedValue, QueryResult, YqSemantics,
 };
 use succinctly::json::light::JsonCursor;
 use succinctly::json::validate;
@@ -4731,9 +4731,23 @@ fn collect_assign_chain(expr: &Expr) -> Option<Vec<(&Expr, &Expr)>> {
 fn propagate_assign_alias_marks(
     expr: &Expr,
     value: &OwnedValue,
-    pristine: Option<&CommentTree>,
+    pristine: Option<(&OwnedValue, &CommentTree)>,
     tree: &mut CommentTree,
 ) {
+    if let Some((op, path_expr, value_expr)) = lone_compound_assign(expr) {
+        if let Some((pristine_value, pristine_tree)) = pristine {
+            propagate_compound_alias_mark(
+                op,
+                path_expr,
+                value_expr,
+                pristine_value,
+                pristine_tree,
+                tree,
+            );
+        }
+        return;
+    }
+    let pristine = pristine.map(|(_, tree)| tree);
     let Some(stages) = collect_assign_chain(expr) else {
         return;
     };
@@ -4824,6 +4838,61 @@ fn propagate_assign_alias_marks(
                 None => {}
             }
         }
+    }
+}
+
+/// `expr` as a single `+=` or `-=` (the two compound assignments that put a node in a target
+/// yq has no value in, #5249), through parentheses.
+fn lone_compound_assign(expr: &Expr) -> Option<(&AssignOp, &Expr, &Expr)> {
+    match expr {
+        Expr::Paren(inner) | Expr::Optional(inner) => lone_compound_assign(inner),
+        Expr::CompoundAssign { op, path, value } if matches!(op, AssignOp::Add | AssignOp::Sub) => {
+            Some((op, path, value))
+        }
+        _ => None,
+    }
+}
+
+/// yq's `+=`/`-=` of a scalar alias read: into a target that is `null` or absent the result is
+/// the source node itself (`.c += .b` over `b: *x` is `c: *x`), and `+=` onto a sequence appends
+/// it as an element (`c: [1, *x]`). Any other target computes a value, which carries no alias
+/// (#5249). The source and the target are read from the document as it came in.
+fn propagate_compound_alias_mark(
+    op: &AssignOp,
+    path_expr: &Expr,
+    value_expr: &Expr,
+    pristine_value: &OwnedValue,
+    pristine: &CommentTree,
+    tree: &mut CommentTree,
+) {
+    let Some(mut targets) = static_nav_targets(path_expr) else {
+        return;
+    };
+    let (Some(target), None) = (targets.pop(), targets.pop()) else {
+        return;
+    };
+    let Some(source) = nav_node(pristine, value_expr).filter(|node| node.alias_name().is_some())
+    else {
+        return;
+    };
+    // The alias must stand for a scalar: a sequence source concatenates in jq's model.
+    let Some(read) = static_nav_steps(value_expr)
+        .and_then(|steps| owned_value_at(pristine_value, &meta_path_of(&steps)))
+    else {
+        return;
+    };
+    if matches!(read, OwnedValue::Object(_) | OwnedValue::Array(_)) {
+        return;
+    }
+    let held = owned_value_at(pristine_value, &meta_path_of(&target));
+    let mut at = target.clone();
+    match (held, op) {
+        (None | Some(OwnedValue::Null), _) => {}
+        (Some(OwnedValue::Array(items)), AssignOp::Add) => at.push(TreeStep::Index(items.len())),
+        _ => return,
+    }
+    if let Some(node) = comment_tree_at_path_or_create_mut(tree, &at) {
+        node.meta_mut().anchor = source.anchor_mark().cloned();
     }
 }
 
@@ -8151,9 +8220,11 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
     // whether the mark this pass adds is safe to keep.
     if has_aliases && presentation_sync_ctx.is_some() {
         if let Ok(docs) = &mut docs {
-            let pristine_tree = presentation_sync_ctx.as_ref().map(|(_, tree)| tree);
+            let pristine_ctx = presentation_sync_ctx
+                .as_ref()
+                .map(|(value, tree)| (value, tree));
             for (value, comments) in docs.iter_mut() {
-                propagate_assign_alias_marks(pass_expr, value, pristine_tree, comments);
+                propagate_assign_alias_marks(pass_expr, value, pristine_ctx, comments);
             }
         }
     }
