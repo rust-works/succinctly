@@ -36,8 +36,8 @@ fn a_halting_program_does_not_reach_the_files_behind_its_first_value_under_strea
         (&["-c", "--stream-errors", "halt_error"][..], &["p.json", "dir"][..], "", "[[],1]\n", 2),
         (&["-c", "--stream-errors", "halt_error"][..], &["p.json", "missing.json"][..], "", "jq: error: Could not open file @DIR@/missing.json: No such file or directory\n[[],1]\n", 2),
         (&["-c", "--stream-errors", "-e", "halt"][..], &["pn.json", "dir"][..], "", "", 0),
-        // A good file behind a failure keeps the up-front report: its bare number reads on into the
-        // next failure, which the loop that stops at that value would otherwise leave unsaid.
+        // A program that goes on reading reaches the good file behind the failure, whose bare number
+        // reads on into the next failure: the loop's reads place both, as the up-front report did.
         (&["-c", "--stream-errors", "."][..], &["pn.json", "dir", "p.json", "missing.json"][..], "[[],1]\n[[],1]\n", "jq: error: Is a directory\njq: error: Could not open file @DIR@/missing.json: No such file or directory\n", 2),
         (&["-c", "--stream-errors", "limit(1;.)"][..], &["pn.json", "missing.json", "p.json", "dir"][..], "[[],1]\n[[],1]\n", "jq: error: Could not open file @DIR@/missing.json: No such file or directory\n", 2),
     ];
@@ -185,6 +185,34 @@ fn the_rows_that_reach_the_failures_keep_their_rows_6683() -> Result<()> {
         (&["-c", "--stream-errors", "halt_error"][..], &["p", "dir"][..], "", "[[],1]\n", 2),
         (&["-c", "--stream-errors", "halt_error"][..], &["pn", "dir", "empty", "gone"][..], "", "[[],1]\n", 5),
         (&["-c", "--stream-errors", "[inputs]"][..], &["pn", "dir", "p", "gone"][..], "[[[],1]]\n", "jq: error: Is a directory\njq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+    ];
+    check_halt_rows(&rows)
+}
+
+/// Programs that stop after more than the first value, and an empty file between the first value
+/// and the failure: the reads reach what they reach, and the rows match jq as they did before or
+/// now do.
+#[test]
+fn programs_that_stop_after_a_few_values_reach_what_their_reads_reach_6683() -> Result<()> {
+    #[rustfmt::skip]
+    let rows = [
+        (&["-c", "--stream-errors", ".,halt"][..], &["pn", "dir", "p", "gone"][..], "[[],1]\n", "", 0),
+        (&["-c", "--stream-errors", ".,halt"][..], &["pn", "empty", "dir", "p"][..], "[[],1]\n", "", 0),
+        (&["-c", "--stream-errors", ".,halt"][..], &["arr", "gone", "pn", "dir"][..], "[[0],1]\n", "", 0),
+        (&["-c", "--stream-errors", "-e", ".,halt"][..], &["pn", "dir", "p", "gone"][..], "[[],1]\n", "", 0),
+        (&["-c", "--stream-errors", "first(.)"][..], &["pn", "dir", "p", "gone"][..], "[[],1]\n[[],1]\n", "jq: error: Is a directory\njq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-c", "--stream-errors", "first(.)"][..], &["pn", "empty", "dir", "p"][..], "[[],1]\n[[],1]\n", "jq: error: Is a directory\n", 2),
+        (&["-c", "--stream-errors", "first(.)"][..], &["arr", "gone", "pn", "dir"][..], "[[0],1]\n[[1],2]\n[[1]]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-c", "--stream-errors", "first(.)"][..], &["p", "empty", "dir", "pn"][..], "[[],11]\n", "jq: error: Is a directory\n", 2),
+        (&["-c", "--stream-errors", "limit(2;.)"][..], &["pn", "dir", "p", "gone"][..], "[[],1]\n[[],1]\n", "jq: error: Is a directory\njq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-c", "--stream-errors", "limit(2;.)"][..], &["pn", "empty", "dir", "p"][..], "[[],1]\n[[],1]\n", "jq: error: Is a directory\n", 2),
+        (&["-c", "--stream-errors", "limit(2;.)"][..], &["arr", "gone", "pn", "dir"][..], "[[0],1]\n[[1],2]\n[[1]]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-c", "--stream-errors", "limit(2;.)"][..], &["p", "empty", "dir", "pn"][..], "[[],11]\n", "jq: error: Is a directory\n", 2),
+        (&["-c", "--stream-errors", ".,halt"][..], &["p", "empty", "dir", "pn"][..], "[[],11]\n", "jq: error: Is a directory\n", 2),
+        (&["-c", "--stream-errors", "first(.,.)"][..], &["pn", "dir", "p", "gone"][..], "[[],1]\n[[],1]\n", "jq: error: Is a directory\njq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-c", "--stream-errors", "first(.,.)"][..], &["pn", "empty", "dir", "p"][..], "[[],1]\n[[],1]\n", "jq: error: Is a directory\n", 2),
+        (&["-c", "--stream-errors", "first(.,.)"][..], &["arr", "gone", "pn", "dir"][..], "[[0],1]\n[[1],2]\n[[1]]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-c", "--stream-errors", "first(.,.)"][..], &["p", "empty", "dir", "pn"][..], "[[],11]\n", "jq: error: Is a directory\n", 2),
     ];
     check_halt_rows(&rows)
 }
