@@ -3155,13 +3155,24 @@ The routes that build an owned value still write the key as `""`, since the key 
 They copied the whole sequence into an owned value and a comment tree first: a 100 MB file peaked at 2,350 MB and now peaks at 262 MB (AMD Ryzen 9 7950X).
 The body is navigation to one node, or navigation that fans out with `.[]` and goes on only through `.`, `.[]` and `select(...)`.
 A stage that computes, a `.a` after a fan-out (which can be missing, and an owned `null` beside nodes is written in the owned route's spelling), a slice and a `,` keep the owned route, and so does any run with `--sort-keys`.
-A YAML document with a comment or an alias keeps it too.
-The streamers write a sequence without the comments between its items (`- a` / `# c` / `- b` prints without `# c`, which `map(.)` already did and yq does not), and they write an `*alias` whose `&anchor` the array does not hold, which the owned route's soundness pass expands.
+A YAML document with an alias keeps it too: the streamers write an `*alias` whose `&anchor` the array does not hold, which the owned route's soundness pass expands.
+So does a document with a comment when the array can hold the document itself (`[.]`, `[select(.a)]`), since the document's own head and foot comments are written only by the owned route.
+Any other array over a commented document streams (#6736).
 JSON output has no comment or alias to lose, so it always streams.
 The nodes are read for the first time while they stream, so each is validated before the first byte: a scalar that fails to decode, a complex key that collides with another, or a node past the depth limit prints nothing and exits 1, as it did.
 The route writes each scalar as `.` does, not as the owned route's encoder does.
 A plain scalar yq quotes (`- a: ---`, `...`, a lone `-`) is written as it was spelled, and a multi-line plain scalar is a double-quoted string (`"a\nb"`) where yq writes a `|-` block; the same input already printed so through `.`, `.users` and `map(.)`.
 A collection key whose value is a block collection, inside a compact sequence entry with `-I=3` or a larger step, pads the value's `:` line as the previous paragraph describes, which the owned route (it wrote `'': ...`) did not reach.
+
+**A streamed sequence keeps the comments between its items (#6736).**
+`map(.)`, `sort`, `sort_by`, `reverse`, `unique`, `select` over `.[]` and an array of nodes write each item's head and foot comments, as the sequence arm of `.` does: `- a` / `# c` / `- b` prints its `# c`, a foot comment is followed by a blank line when another item follows, and the comment on a bare `-` (`- # on dash`) stays on the dash.
+Before, only the owned route kept them.
+What is still not written is pinned by `test_what_a_streamed_sequence_still_does_not_write_6736`; all but the third was never written by a streamer, and the third was written by the owned route for an array of nodes (`[.[0][]]`), which streams over a commented document now:
+The document's own foot comment after a sorted or reordered root sequence (`# foot` after `sort`).
+The trailing foot comment after a `reverse` or `sort_by` of a sequence of mappings (`- k: 3` / `# c` / `- k: 1` / `# e` drops `# e`; a sequence of scalars keeps it).
+The comment on a bare `-` that holds a nested sequence, when the inner elements are streamed on their own (`- # c0` / `  - 1`, then `.[0][]`).
+The comments of a chain of two reordering stages (`sort_by(.id) | reverse`), whose second stage is handed owned items.
+A foot comment owned by an item inside a flow mapping (`- {a: 1,}`, #5058), which `.` writes with its comma.
 
 **A top-level comma of navigation reads such a document the way `.` does (#5283, answering #2645).**
 Real yq rejects the document for every filter, as it rejects a single undecodable key, so this is the same divergence as `.`, not a new one.
