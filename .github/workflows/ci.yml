@@ -223,11 +223,16 @@ jobs:
           # binary here, and `--exact` keeps it from matching anything but those names.
           # #5705: `yq_cli_tests` (~30% of this leg's test time) is not run here either: it runs
           # in the `deep-recursion` leg below, with no skip list (the names are all jq_cli_tests').
+          # #6741: every `#![cfg(feature = "cli")]` file in tests/ is named here (or in the
+          # `deep-recursion` leg), on all three platforms: a plain `cargo test` compiles such a file
+          # to nothing, and one nobody listed ran only under `Coverage`, which is not required.
+          # `scripts/test_cli_gated_tests.py`, run by the `deep-recursion` legs, fails the required
+          # `Test (...)` check when a file is missing or the platforms' lists differ.
           - name: cli-gated
             buildCli: true
             testCmd: |
               skip=$(scripts/deep-recursion-tests.sh skip-args)
-              cargo test --features cli --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests --test serde_tests --test locate_cli_tests --test corpus_stats_cli_tests --test yq_tonumber_fixture_tests --test jq_path_context_alphabet_tests -- $skip
+              cargo test --features cli --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests --test serde_tests --test locate_cli_tests --test corpus_stats_cli_tests --test yq_tonumber_fixture_tests --test jq_path_context_alphabet_tests --test jq_extension_roster_tests --test jq_path_context_streaming_tests --test validate_snippet_multibyte_5988 -- $skip
           # `tests/orchestrate_cli_tests.rs` is `#![cfg(feature = "bench-runner")]`
           # and must stay isolated from the cli-gated leg above (#1705): its
           # `cargo run`-spawned CLI subprocesses would otherwise re-link the
@@ -302,6 +307,7 @@ jobs:
             buildCli: true
             testCmd: |
               python3 scripts/test_deep_recursion_tests.py
+              python3 scripts/test_cli_gated_tests.py
               scripts/deep-recursion-tests.sh run
               cargo test --features cli --test yq_cli_tests
     env:
@@ -404,7 +410,7 @@ jobs:
             buildCli: true
             testCmd: |
               skip=$(scripts/deep-recursion-tests.sh skip-args)
-              cargo test --features cli --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests --test serde_tests --test locate_cli_tests --test corpus_stats_cli_tests --test yq_tonumber_fixture_tests --test jq_path_context_alphabet_tests -- $skip
+              cargo test --features cli --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests --test serde_tests --test locate_cli_tests --test corpus_stats_cli_tests --test yq_tonumber_fixture_tests --test jq_path_context_alphabet_tests --test jq_extension_roster_tests --test jq_path_context_streaming_tests --test validate_snippet_multibyte_5988 -- $skip
           # The bin's `bench-runner` unit tests run here too (#5409; see the x86_64 leg).
           - name: bench-runner-gated
             buildCli: true
@@ -496,6 +502,7 @@ jobs:
             buildCli: true
             testCmd: |
               python3 scripts/test_deep_recursion_tests.py
+              python3 scripts/test_cli_gated_tests.py
               scripts/deep-recursion-tests.sh run
               cargo test --features cli --test yq_cli_tests
     env:
@@ -674,7 +681,7 @@ jobs:
             buildCli: true
             testCmd: |
               skip=$(scripts/deep-recursion-tests.sh skip-args)
-              cargo test --features cli --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests --test serde_tests --test locate_cli_tests --test corpus_stats_cli_tests --test yq_tonumber_fixture_tests --test jq_path_context_alphabet_tests -- $skip
+              cargo test --features cli --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests --test serde_tests --test locate_cli_tests --test corpus_stats_cli_tests --test yq_tonumber_fixture_tests --test jq_path_context_alphabet_tests --test jq_extension_roster_tests --test jq_path_context_streaming_tests --test validate_snippet_multibyte_5988 -- $skip
           # `tests/orchestrate_cli_tests.rs` is `#![cfg(feature = "bench-runner")]`
           # and must stay isolated from the cli-gated leg above (#1705): its
           # `cargo run`-spawned CLI subprocesses would otherwise re-link the
@@ -702,6 +709,7 @@ jobs:
             buildCli: true
             testCmd: |
               python3 scripts/test_deep_recursion_tests.py
+              python3 scripts/test_cli_gated_tests.py
               scripts/deep-recursion-tests.sh run
               cargo test --features cli --test yq_cli_tests
     env:
