@@ -190,46 +190,73 @@ pub fn can_use_m2_streaming(expr: &Expr) -> bool {
     }
 }
 
-/// [`can_use_m2_streaming`], plus an array built from nodes (yq only, #3475).
+/// Whether `expr` is an array that holds nothing but the document's own nodes (yq only, #3475):
+/// `[.users[] | select(.age > 30)]`, `[.[]]`, `[.users]`, `.users | [.[]]`.
 ///
-/// `[.users[] | select(.age > 30)]`, `[.[]]` and `.users | [.[]]` answer a `GenericResult::LazySeq`
-/// over the nodes themselves (`LazySeq::from_cursors`), which the streaming writers render one live
-/// cursor at a time. On the DOM route the same sequence was first copied into an owned value and a
-/// comment tree (`sequence_of_nodes`): 256 MB against `map(select(...))`'s 38 MB over a 10 MB file,
-/// for the same output.
+/// Such an array answers a `GenericResult::LazySeq` of cursors (`LazySeq::from_cursors`), which the
+/// streaming writers render one live cursor at a time. The DOM route copied the whole sequence into
+/// an owned value and a comment tree (`sequence_of_nodes`) first: 2,350 MB against
+/// `map(select(...))`'s 260 MB over a 100 MB file, for the same output.
 ///
-/// Only the array's own body is checked, and only for the shapes that yield nodes -- navigation and
-/// `select`, never a stage that computes (`[.[] | .a + 1]`, `[.[] | length]`), whose owned results
-/// need the DOM route's number and string formatting. A `,` body stays on the DOM route: yq answers
-/// `[., .]` as one node (#3477), which `top_level_comma_branches`' own handling does not cover.
-pub fn can_use_m2_streaming_yq(expr: &Expr) -> bool {
-    if can_use_m2_streaming(expr) {
-        return true;
-    }
+/// The gate has to know *before evaluating* that every element is a node, because an owned element
+/// (a missing key's `null` beside real nodes, a `LazySeq` a `sort_by` or `map` hands on) makes the
+/// whole array owned, and the streamers write an owned value in another spelling than the DOM
+/// route's encoder: a block scalar as a quoted string, a `1e-7` float as `0.0000001`. So the body
+/// is navigation to one node (a node, or a lone `null`, which both routes print alike), or
+/// navigation that fans out with `.[]` and goes on only through stages that forward the node they
+/// are given (`.`, `.[]`, `select(...)`): never a stage that computes, a `.a` after a fan-out that
+/// can be missing, a slice, or a `,`, which is not jq's in yq (`[., .]` has one element). A prefix is
+/// navigation to one node. `array_of_nodes_always_evaluates_to_cursors_3475` checks the claim
+/// against the evaluator.
+pub fn is_array_of_nodes(expr: &Expr) -> bool {
     match expr {
-        Expr::Array(body) => body_yields_nodes(body),
-        Expr::Paren(inner) => can_use_m2_streaming_yq(inner),
-        // `.users | [.[]]`: a streamable prefix, then the array last. An array in the middle
-        // (`[.[]] | .[0]`) feeds a later stage an owned value and stays on the DOM route.
-        Expr::Pipe(stages) => match stages.split_last() {
-            Some((Expr::Array(body), prefix)) => {
-                body_yields_nodes(body) && prefix.iter().all(can_use_m2_streaming)
-            }
-            _ => false,
-        },
+        Expr::Array(body) => body_yields_only_nodes(body),
+        Expr::Paren(inner) => is_array_of_nodes(inner),
+        // `.users | [.[]]`: the array last. An array in the middle feeds a later stage an owned
+        // value and stays on the DOM route.
+        Expr::Pipe(stages) => stages.split_last().is_some_and(|(last, prefix)| {
+            is_array_of_nodes(last) && prefix.iter().all(is_navigation)
+        }),
         _ => false,
     }
 }
 
-/// Whether an array body answers document nodes: navigation and `select` only (see
-/// [`can_use_m2_streaming_yq`]).
-fn body_yields_nodes(body: &Expr) -> bool {
-    match body {
-        Expr::Identity | Expr::Field(_) | Expr::Index { .. } | Expr::Iterate => true,
-        Expr::Builtin(Builtin::Select(_)) => true,
-        Expr::Pipe(stages) => stages.iter().all(body_yields_nodes),
-        Expr::Optional(inner) | Expr::Paren(inner) => body_yields_nodes(inner),
+/// `.`, `.a`, `.[0]`, `.a.b`: steps that answer at most one node.
+fn is_navigation(stage: &Expr) -> bool {
+    match stage {
+        Expr::Identity | Expr::Field(_) | Expr::Index { .. } => true,
+        Expr::Optional(inner) | Expr::Paren(inner) => is_navigation(inner),
+        Expr::Pipe(stages) => stages.iter().all(is_navigation),
         _ => false,
+    }
+}
+
+/// A stage that hands on the node it was given, or the nodes inside it: `.`, `.[]`, `select(...)`.
+fn forwards_nodes(stage: &Expr) -> bool {
+    match stage {
+        Expr::Identity | Expr::Iterate | Expr::Builtin(Builtin::Select(_)) => true,
+        Expr::Optional(inner) | Expr::Paren(inner) => forwards_nodes(inner),
+        Expr::Pipe(stages) => stages.iter().all(forwards_nodes),
+        _ => false,
+    }
+}
+
+/// An array body whose every output is a node of the document (see [`is_array_of_nodes`]).
+fn body_yields_only_nodes(body: &Expr) -> bool {
+    // The parser nests a pipe in a pipe (`.users[] | select(.a)` is `Pipe([Pipe([users, .[]]), select])`).
+    fn flatten<'a>(expr: &'a Expr, stages: &mut Vec<&'a Expr>) {
+        match expr {
+            Expr::Pipe(inner) => inner.iter().for_each(|stage| flatten(stage, stages)),
+            Expr::Paren(inner) => flatten(inner, stages),
+            other => stages.push(other),
+        }
+    }
+    let mut stages = Vec::new();
+    flatten(body, &mut stages);
+    // Navigation up to the first stage that fans out, then only stages that forward nodes.
+    match stages.iter().position(|stage| !is_navigation(stage)) {
+        None => true,
+        Some(fan_out) => stages[fan_out..].iter().all(|stage| forwards_nodes(stage)),
     }
 }
 
@@ -352,55 +379,152 @@ mod tests {
             "Builtin::NthStream shares NthExpr's arm and must answer the same"
         );
     }
-    /// #3475: yq streams an array built from document nodes (navigation and `select`), alone or
-    /// behind a streamable prefix, and keeps every array that computes, joins branches or feeds a
-    /// later stage on the DOM route. jq's own gate is unchanged: it never sees these shapes.
+    /// The arrays [`is_array_of_nodes`] admits: the gate test asserts each streams, and the
+    /// agreement test that each evaluates to cursors, so the two cannot drift apart.
+    const ARRAYS_OF_NODES: &[&str] = &[
+        "[.]",
+        "[.[]]",
+        "[.[]?]",
+        "[.users]",
+        "[.a.b]",
+        "[.[0]]",
+        "[.users[]]",
+        "[.users[] | select(.age > 30)]",
+        "[.a.b[] | select(.x) | select(.y)]",
+        "[.[][]]",
+        "[select(.a)]",
+        "([.[]])",
+        ".users | [.[]]",
+        ".a.b | [.[] | select(.x)]",
+        ". | ([.[]])",
+        ".missing | [.[]]",
+        ".missing | [.[]?]",
+        "[.missing]",
+        "[.users[] | select(.name)]",
+    ];
+
+    /// #3475: yq streams an array whose every element is a node of the document, and keeps every
+    /// other array on the DOM route. jq's own gate is unchanged: it never sees these shapes.
     #[test]
-    fn test_yq_gate_streams_an_array_of_nodes_only_3475() {
-        let parse = |f: &str| succinctly::jq::parse(f).expect("parses");
-        for streams in [
-            "[.]",
-            "[.[]]",
-            "[.a]",
-            "[.[0]]",
-            "[.a[]?]",
-            "[.users[] | select(.age > 30)]",
-            "[select(.a)]",
-            "([.[]])",
-            ".users | [.[]]",
-            ".a.b | [.[] | select(.x)]",
-        ] {
+    fn test_array_of_nodes_gate_admits_only_provable_nodes_3475() {
+        let parse = |f: &str| {
+            let program = succinctly::jq::parse_program_with_mode_and_extensions(
+                f,
+                succinctly::jq::ParserMode::Yq,
+                false,
+            )
+            .expect("parses");
+            program.expr
+        };
+        for streams in ARRAYS_OF_NODES
+            .iter()
+            .copied()
+            .filter(|f| !f.contains("missing"))
+        {
             let expr = parse(streams);
-            assert!(can_use_m2_streaming_yq(&expr), "{streams} should stream");
+            assert!(is_array_of_nodes(&expr), "{streams} should stream");
             assert!(
                 !can_use_m2_streaming(&expr),
                 "{streams}: the shared gate (jq's too) stays as it was"
             );
         }
         for stays in [
-            // A stage that computes needs the DOM route's number and string formatting.
+            // A field or index after a fan-out can be missing: an owned `null` among the nodes.
+            "[.[] | .a]",
+            "[.users[].name]",
+            "[.users[] | select(.a) | .b]",
+            "[.users[] | .a | select(.b)]",
+            // A stage that computes, a slice, and `,` (not jq's in yq: `[., .]` has one element).
             "[.[] | .a + 1]",
             "[.[] | length]",
-            "[.[] | tostring]",
             "[.[] | keys]",
-            // A slice is built, not navigated; `,` is yq's one-node-per-name union (#3477).
             "[.[1:]]",
             "[., .]",
             "[.a, .b]",
-            // The array feeds a later stage, or a prefix that does not stream.
+            // A prefix that is not one node, or an array that feeds a later stage.
+            ".[] | [.a]",
+            ".[] | [.[]]",
+            "sort_by(.id) | [.[]]",
+            "reverse | [.[]]",
+            "map(.) | [.[]]",
             "[.[]] | .[0]",
             "[.[]] | length",
-            ".a | length | [.]",
             "{a: [.[]]}",
         ] {
             assert!(
-                !can_use_m2_streaming_yq(&parse(stays)),
+                !is_array_of_nodes(&parse(stays)),
                 "{stays} should keep the DOM route"
             );
         }
-        // What already streams still does.
-        assert!(can_use_m2_streaming_yq(&parse(".a | map(.)")));
-        assert!(can_use_m2_streaming_yq(&parse(".[]")));
+        // What already streams is the shared gate's, not this one's.
+        assert!(!is_array_of_nodes(&parse(".a | map(.)")));
+        assert!(!is_array_of_nodes(&parse(".[]")));
+    }
+
+    /// #3475: the claim [`is_array_of_nodes`] rests on, checked against the evaluator: an admitted
+    /// shape never answers an owned element, over documents where a key is missing, a value is
+    /// `null`, a block scalar, an alias or a scalar root.
+    #[test]
+    fn array_of_nodes_always_evaluates_to_cursors_3475() {
+        use succinctly::jq::eval_generic::{eval_with_cursor_using, GenericResult, LazyElem};
+        use succinctly::jq::{OwnedValue, YqSemantics};
+        use succinctly::yaml::YamlIndex;
+        let shapes = ARRAYS_OF_NODES;
+        let docs = [
+            "users:\n  - {name: a, age: 31}\n  - {age: 20}\n  - ~\n  - |\n    block\n",
+            "a: {b: [{x: 1, y: 2}, {x: 1}, 3, null]}\n",
+            "- {a: 1}\n- {b: 2}\n- &n {a: 3}\n- *n\n",
+            "42\n",
+            "null\n",
+            "",
+            "{}\n",
+            "[]\n",
+        ];
+        for doc in docs {
+            // The empty document has no root to evaluate against.
+            let Ok(index) = YamlIndex::build_yq(doc.as_bytes()) else {
+                continue;
+            };
+            let root = index.root(doc.as_bytes());
+            let Some(cursor) = root.first_child() else {
+                continue;
+            };
+            for shape in shapes {
+                let program = succinctly::jq::parse_program_with_mode_and_extensions(
+                    shape,
+                    succinctly::jq::ParserMode::Yq,
+                    false,
+                )
+                .expect("parses");
+                assert!(is_array_of_nodes(&program.expr), "{shape}");
+                match eval_with_cursor_using::<YqSemantics, _>(&program.expr, cursor) {
+                    GenericResult::LazySeq(seq) => {
+                        let items = seq.as_ref().clone().drain_atomic().expect("drains");
+                        assert!(
+                            items.iter().all(|item| matches!(item, LazyElem::Cursor(_))),
+                            "{shape} over {doc:?} holds an owned element"
+                        );
+                    }
+                    // An empty array has no element to be owned, a lone `null` is a missing path
+                    // (both routes print it alike), and a failure prints nothing.
+                    GenericResult::Owned(OwnedValue::Array(items)) => {
+                        assert!(
+                            items.is_empty() || matches!(items.as_slice(), [OwnedValue::Null]),
+                            "{shape} over {doc:?}: {items:?}"
+                        )
+                    }
+                    GenericResult::Error(_) | GenericResult::None => {}
+                    other => panic!(
+                        "{shape} over {doc:?} answered {}",
+                        match other {
+                            GenericResult::One(_) | GenericResult::OneCursor(_) => "a node",
+                            GenericResult::Owned(_) => "an owned value",
+                            _ => "another result",
+                        }
+                    ),
+                }
+            }
+        }
     }
 
     /// #2416 phase 2: a path-context pipe the cursor walk takes whole streams

@@ -3145,7 +3145,21 @@ A collection key under a compact sequence entry with `-I=3` or a larger step pad
 A value's comment on the `:` line of a collection key moves to the end of its text in yq (`: x # c`) and is dropped here.
 A comment on the `?` line above a block collection key (`? # c` / `  - p`) is written at the end of the key's first line in yq (`? - p # c`) and is dropped here.
 A flow mapping that holds a collection key (`{[a]: v}`) still writes `{"": v}` where yq writes `{? [a] : v}`: the flow writer has no explicit-key form for it.
-The routes that build an owned value still write the key as `""`, since the key is a string by then ([#6547](https://github.com/rust-works/succinctly/issues/6547)): `-P`, `keys`, `to_entries`, `sort_keys(.)`, `. as $x | $x`, `[.]` and a write.
+The routes that build an owned value still write the key as `""`, since the key is a string by then ([#6547](https://github.com/rust-works/succinctly/issues/6547)): `-P`, `keys`, `to_entries`, `sort_keys(.)`, `. as $x | $x` and a write.
+`[.]` is one of them only for a document with a comment or an alias; otherwise it is an array of nodes (next paragraph) and writes the key node.
+
+**An array of the document's own nodes is written from their cursors (#3475).**
+`[.users[] | select(.age > 30)]`, `[.[]]`, `[.users]` and `.users | [.[]]` print each node from the source, as `.`, `.[]` and `map(.)` do.
+They copied the whole sequence into an owned value and a comment tree first: a 100 MB file peaked at 2,350 MB and now peaks at 262 MB (AMD Ryzen 9 7950X).
+The body is navigation to one node, or navigation that fans out with `.[]` and goes on only through `.`, `.[]` and `select(...)`.
+A stage that computes, a `.a` after a fan-out (which can be missing, and an owned `null` beside nodes is written in the owned route's spelling), a slice and a `,` keep the owned route, and so does any run with `--sort-keys`.
+A YAML document with a comment or an alias keeps it too.
+The streamers write a sequence without the comments between its items (`- a` / `# c` / `- b` prints without `# c`, which `map(.)` already did and yq does not), and they write an `*alias` whose `&anchor` the array does not hold, which the owned route's soundness pass expands.
+JSON output has no comment or alias to lose, so it always streams.
+The nodes are read for the first time while they stream, so each is validated before the first byte: a scalar that fails to decode, a complex key that collides with another, or a node past the depth limit prints nothing and exits 1, as it did.
+The route writes each scalar as `.` does, not as the owned route's encoder does.
+A plain scalar yq quotes (`- a: ---`, `...`, a lone `-`) is written as it was spelled, and a multi-line plain scalar is a double-quoted string (`"a\nb"`) where yq writes a `|-` block; the same input already printed so through `.`, `.users` and `map(.)`.
+A collection key whose value is a block collection, inside a compact sequence entry with `-I=3` or a larger step, pads the value's `:` line as the previous paragraph describes, which the owned route (it wrote `'': ...`) did not reach.
 
 **A top-level comma of navigation reads such a document the way `.` does (#5283, answering #2645).**
 Real yq rejects the document for every filter, as it rejects a single undecodable key, so this is the same divergence as `.`, not a new one.

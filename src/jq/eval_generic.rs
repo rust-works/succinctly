@@ -16302,8 +16302,11 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             // #3317, #3856: a `,` body keeps its document nodes as cursors in
             // jq mode, whatever its other branches compute, where the printer
             // renders a cursor sequence copy-free and a node is validated
-            // only where something reads it. yq's printer materializes a
-            // `LazySeq` anyway, so yq keeps the owned route below.
+            // only where something reads it. yq builds a `,` array owned: its
+            // `,` is not jq's (`[., .]` has one element there), which the
+            // cursor route below does not model. An array of nodes with no
+            // `,` is a `LazySeq` of cursors in both modes (#3475,
+            // `is_array_of_nodes`).
             if S::TAG == EvalTag::Jq {
                 // An unguarded `,` body never declines; a `?` around
                 // navigation branches (`[(.a, .b)?]`, #4294) may.
@@ -56746,7 +56749,7 @@ mod tests {
         }
         // Single-item bodies are #2575's producer, which never validated.
         assert_eq!(comma_array_route::<JqSemantics>("[.]", doc), "lazy");
-        // yq's printer materializes a sequence anyway, so yq stays owned.
+        // yq's `,` is not jq's (`[., .]` has one element there), so a `,` array stays owned.
         assert_eq!(comma_array_route::<YqSemantics>("[.a, .b]", doc), "owned");
         // A body that is not an array construction is none of the three.
         assert_eq!(comma_array_route::<JqSemantics>(".m", doc), "other");

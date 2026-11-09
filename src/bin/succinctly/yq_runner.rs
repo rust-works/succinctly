@@ -43,9 +43,7 @@ use succinctly::yaml::{
     YamlIndex, YamlValue,
 };
 
-use super::m2_gate::{
-    can_use_m2_streaming, can_use_m2_streaming_yq, eval_all_matches_per_document,
-};
+use super::m2_gate::{can_use_m2_streaming, eval_all_matches_per_document, is_array_of_nodes};
 use super::{FrontMatterMode, InputFormat, OutputFormat, YqCommand};
 use crate::front_matter;
 use crate::output::{
@@ -2541,10 +2539,11 @@ fn evaluate_yaml_direct_filtered(
 /// produces YAML succinctly itself cannot read back. Routes one file's (or
 /// stdin's) output through the DOM evaluator instead of the M2 streamers,
 /// reusing `bytes` already in hand -- a second parse, not a second read.
-/// Callers gate this on `sort_keys && index.has_aliases()` (an index they
-/// already built to decide the M2 path in the first place), so the cost is
-/// paid only under `--sort-keys` on alias-bearing documents; every other
-/// invocation is unaffected.
+/// Callers ask [`needs_dom_fallback`] with an index they already built to
+/// decide the M2 path in the first place, so the cost is paid only under
+/// `--sort-keys` on alias-bearing documents, for a sort of a mapping, and for
+/// an array of the document's own nodes over a document with a comment or an
+/// alias (#3475); every other invocation is unaffected.
 ///
 /// Deliberately whole-*file* granularity, not per-document within a
 /// multi-document file, matching the fix locus named in #1350's own
@@ -2585,34 +2584,22 @@ struct FallbackStreamState<'a> {
 /// sort of a mapping, which the streamers write without its entries' presentation (#4386). The
 /// one definition both the stdin and the per-file site read.
 ///
-/// `streams_array_of_nodes` (#3475): the query is an array built from the document's own nodes,
-/// which the M2 streamers print copy-free, but without the comments *between* a sequence's items
-/// and after its last (`# between` is dropped, as it is for `map(.)`), and with an error after
-/// the first document of a stream printing that document's `---` first. A document with a
-/// comment, or a stream of several documents, takes the DOM route, which keeps both.
+/// An array of the document's own nodes (#3475, [`is_array_of_nodes`]) streams from their cursors, so
+/// a YAML document with a comment or an alias takes the DOM route instead: the streamers write a
+/// sequence without the comments between its items (`map(.)` drops them too, where yq keeps them),
+/// and write an `*alias` whose `&anchor` the array does not hold, which the DOM route's soundness
+/// pass expands (CLAUDE.md: succinctly never emits YAML it cannot read back).
 fn needs_dom_fallback(
     sort_keys: bool,
     output_format: OutputFormat,
     index: &YamlIndex,
     expr: &Expr,
     bytes: &[u8],
-    streams_array_of_nodes: bool,
 ) -> bool {
     output_format == OutputFormat::Yaml
         && ((sort_keys && index.has_aliases())
             || sorts_a_mapping(expr, index, bytes)
-            || (streams_array_of_nodes
-                && (index.has_comments() || has_several_documents(index, bytes))))
-}
-
-/// Whether `bytes` holds more than one YAML document.
-fn has_several_documents(index: &YamlIndex, bytes: &[u8]) -> bool {
-    let root = index.root(bytes);
-    let YamlValue::Sequence(docs) = root.value() else {
-        return false;
-    };
-    docs.uncons_cursor()
-        .is_some_and(|(_, rest)| rest.uncons_cursor().is_some())
+            || (is_array_of_nodes(expr) && (index.has_comments() || index.has_aliases())))
 }
 
 /// Whether `expr` is itself a `sort`, `sort_by`, `reverse`, `unique` or `unique_by`: on a
@@ -10705,18 +10692,17 @@ impl<V: DocumentValue> Iterator for BranchResults<V> {
 /// complex key that collides with another after its display form, or a node past the depth limit
 /// would be found with the array already half written. The owned route this replaces found all
 /// three before it wrote a byte; [`validate_cursor`] is that walk, instantiated to build nothing.
+/// Every element of an [`is_array_of_nodes`] array is a cursor, and gathering them cannot fail
+/// (a `from_cursors` source has no stage to raise), so there is no other case to answer.
 fn validated_array_of_nodes<V: DocumentValue>(result: GenericResult<V>) -> GenericResult<V> {
-    let GenericResult::LazySeq(seq) = &result else {
-        return result;
-    };
-    // A failure of the sequence itself is the streamer's to report, as it is for `map(.)`.
-    let Ok(items) = seq.as_ref().clone().drain_atomic() else {
-        return result;
-    };
-    for item in &items {
-        if let LazyElem::Cursor(node) = item {
-            if let Err(error) = validate_cursor::<YqSemantics, _>(node) {
-                return GenericResult::Error(error);
+    if let GenericResult::LazySeq(seq) = &result {
+        if let Ok(items) = seq.as_ref().clone().drain_atomic() {
+            for item in &items {
+                if let LazyElem::Cursor(node) = item {
+                    if let Err(error) = validate_cursor::<YqSemantics, _>(node) {
+                        return GenericResult::Error(error);
+                    }
+                }
             }
         }
     }
@@ -10730,18 +10716,16 @@ fn validated_array_of_nodes<V: DocumentValue>(result: GenericResult<V>) -> Gener
 /// failed branch is the only result streamed and its diagnostic is the whole output. That covers a
 /// failure the evaluation raised; one found while a later branch streams (an undecodable scalar)
 /// comes after the earlier branches were written, as it does for `.[]`.
-///
-/// `validate_nodes` (#3475): the query is an array of the document's own nodes, so its elements
-/// are read for the first time while they stream. The array is atomic, so each is checked first.
 fn stream_branch_results<C: DocumentCursor + Copy>(
     branches: &[&Expr],
     cursor: C,
-    validate_nodes: bool,
 ) -> BranchResults<C::Value> {
     let eval = |branch: &Expr| {
         let result =
             discard_yq_partial_prefix(eval_with_cursor_using::<YqSemantics, _>(branch, cursor));
-        if validate_nodes {
+        // #3475: an array of nodes reads its elements for the first time while they stream, and an
+        // array is atomic, so each is checked before the first byte is written.
+        if is_array_of_nodes(branch) {
             validated_array_of_nodes(result)
         } else {
             result
@@ -11175,10 +11159,12 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     // input at all: it now gets *both* correct numbers and duplicate-key
     // preservation, matching real yq on both counts.
     let is_m2_streamable = can_use_m2_streaming(&program.expr);
-    // #3475: an array built from the document's own nodes (`[.users[] | select(.age > 30)]`)
-    // streams from their cursors too, to stdout: the DOM route copied the whole sequence into an
-    // owned value and a comment tree first. `--inplace` and `--slurp` keep their own gates.
-    let streams_array_of_nodes = !is_m2_streamable && can_use_m2_streaming_yq(&program.expr);
+    // #3475: an array of the document's own nodes (`[.users[] | select(.age > 30)]`) streams from
+    // their cursors too, to stdout: the DOM route copied the whole sequence into an owned value
+    // and a comment tree first. `--inplace` and `--slurp` keep their own gates. `--sort-keys`
+    // sorts a flow mapping in the streamers and not on the DOM route, so it keeps the DOM route
+    // for every document rather than only those without a comment.
+    let streams_array_of_nodes = !args.sort_keys && is_array_of_nodes(&program.expr);
     // #5283: a query that is itself a `,` of M2-streamable branches streams too. The evaluator
     // already answers one as the nodes its branches name (`eval_comma_generic`, #1361), and the
     // DOM route they used to take rebuilt each as an `IndexMap`, collapsing a duplicate mapping
@@ -11583,8 +11569,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                     // #5283: a streamed comma is its branches, one `stream_cursor!` result each; only the
                     // first that produces output may write the document's `---`.
                     let mut doc_has_output = false;
-                    let branch_results =
-                        stream_branch_results(&stream_branches, $cursor, streams_array_of_nodes);
+                    let branch_results = stream_branch_results(&stream_branches, $cursor);
                     for result in branch_results {
                         // A throwaway flag once the document has output: `emit_yaml_doc_separator` sets it.
                         let mut comma_dummy = false;
@@ -11596,7 +11581,8 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                         // A comma that failed in a branch prints the diagnostic and nothing else, not even a
                         // document separator ahead of it (#5283); one expression keeps its own rule.
                         let produces_output = result.produces_output()
-                            && !(is_m2_streamable_comma && result.is_failure());
+                            && !((is_m2_streamable_comma || streams_array_of_nodes)
+                                && result.is_failure());
                         doc_has_output |= produces_output;
                         // `produces_output` is an exhaustive match on
                         // `GenericResult`, not a hand-maintained exclusion
@@ -11762,8 +11748,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                     // `None`), so there's no ordering constraint here beyond
                     // preceding `stream_json` itself.
                     // #5283: see the YAML arm above.
-                    let branch_results =
-                        stream_branch_results(&stream_branches, $cursor, streams_array_of_nodes);
+                    let branch_results = stream_branch_results(&stream_branches, $cursor);
                     for result in branch_results {
                         let stats = stream_maybe_colored(
                             $writer,
@@ -11893,14 +11878,13 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             // correct evaluation here, not just identity) for this whole
             // input, which already gets it right. `index` is already built
             // (this check costs nothing extra); the fallback itself is a
-            // second parse of `yaml_bytes`, paid only here.
+            // second parse of `yaml_bytes`, paid only where it is taken.
             if needs_dom_fallback(
                 sort_keys,
                 output_config.output_format,
                 &index,
                 &program.expr,
                 &yaml_bytes,
-                streams_array_of_nodes,
             ) {
                 let doc_filter = args.document.map(|target| (target, global_doc_index));
                 // Single stdin input, no further reads to filter -- unlike
@@ -12125,7 +12109,6 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                     &index,
                     &program.expr,
                     &yaml_bytes,
-                    streams_array_of_nodes,
                 ) {
                     let doc_filter = args.document.map(|target| (target, global_doc_index));
                     let num_docs = stream_yaml_sort_keys_alias_fallback(
