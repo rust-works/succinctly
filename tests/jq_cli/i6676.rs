@@ -7,8 +7,8 @@
 //! the warning at the end of the text is met after every file. Every row was captured from jq 1.7.1.
 //!
 //! A program that reads `input` is no exception: that whole slurp comes first, warnings and failures
-//! included, and its `input` reads what is left after the array: the end of the stream, or the one
-//! fault the slurp's last call left. A last file that did not open is a source of the stream reader's
+//! included, and its `input` reads what is left after the array: the events and the one fault the
+//! slurp's last call left, then the end of the stream. A last file that did not open is a source of the stream reader's
 //! own, with or without `-n`: a closing event held back at the end of the file before it goes in the
 //! array, and the array is read at the failure.
 
@@ -191,6 +191,34 @@ fn a_slurp_stopped_by_a_warning_says_nothing_after_it_6676() -> Result<()> {
         (&["-c", "-s", "--seq", "--stream", "try input catch ."][..], &["two.seq", "missing.json", "bad.seq", "trunc.seq"][..], "", "jq: error: Could not open file @DIR@/missing.json: No such file or directory\njq: ignoring parse error: Unmatched '}' in the middle of an array at line 2, column 4 (need RS to resync)\n", 2),
         (&["-c", "-s", "--seq", "--stream", "[inputs, input_filename]"][..], &["dir", "bad.seq", "nors.seq", "missing.json", "trunc.seq"][..], "", "jq: error: Is a directory\njq: ignoring parse error: Unmatched '}' in the middle of an array at line 1, column 4 (need RS to resync)\n", 2),
         (&["-c", "-s", "--seq", "--stream", "."][..], &["dir", "mix.seq", "rend.seq"][..], "", "jq: error: Is a directory\njq: ignoring parse error: Unmatched ']' in the middle of an object at line 1, column 3 (need RS to resync)\n", 2),
+    ];
+    check_rows(&dir.path().to_string_lossy(), rows)
+}
+
+/// `--stream-errors` reads the same way, under `-n` and without it. Under `-n` a failure is for the read
+/// that reaches it, so a program that names `input` and never makes that read says nothing and exits 0.
+/// The last two rows are `--stream` under `-n`, for comparison.
+#[test]
+fn stream_errors_reads_a_slurp_the_same_way_6676() -> Result<()> {
+    let dir = fixtures()?;
+    #[rustfmt::skip]
+    let rows: &[Row<'_>] = &[
+        (&["-c", "-n", "-s", "--seq", "--stream-errors", "input"][..], &["arr.seq", "missing.json"][..], "\u{1e}[[[0],1],[[0]]]\n", "jq: error: Could not open file @DIR@/missing.json: No such file or directory\n", 2),
+        (&["-c", "-n", "-s", "--seq", "--stream-errors", "[inputs]"][..], &["arr.seq", "missing.json"][..], "\u{1e}[[[[0],1],[[0]]]]\n", "jq: error: Could not open file @DIR@/missing.json: No such file or directory\n", 2),
+        (&["-c", "-n", "-s", "--seq", "--stream-errors", "if false then input else . end"][..], &["arr.seq", "missing.json"][..], "\u{1e}null\n", "", 0),
+        (&["-c", "-n", "-s", "--seq", "--stream-errors", "[limit(0; inputs)]"][..], &["two.seq", "missing.json"][..], "\u{1e}[]\n", "", 0),
+        (&["-c", "-n", "-s", "--seq", "--stream-errors", "def f: input; ."][..], &["two.seq", "missing.json"][..], "\u{1e}null\n", "", 0),
+        (&["-c", "-n", "-s", "--seq", "--stream-errors", "if false then input else . end"][..], &["dir"][..], "\u{1e}null\n", "", 0),
+        (&["-c", "-n", "-s", "--seq", "--stream-errors", "if false then input else . end"][..], &["missing.json", "dir"][..], "\u{1e}null\n", "", 0),
+        (&["-c", "-n", "-s", "--seq", "--stream-errors", "input"][..], &["missing.json", "two.seq"][..], "\u{1e}[[[],2]]\n", "jq: error: Could not open file @DIR@/missing.json: No such file or directory\n", 2),
+        (&["-c", "-n", "-s", "--seq", "--stream-errors", "[inputs]"][..], &["two.seq", "dir"][..], "\u{1e}[[[[],2]]]\n", "jq: error: Is a directory\n", 2),
+        (&["-c", "-n", "-s", "--seq", "--stream-errors", "[inputs]"][..], &["bad.seq", "missing.json"][..], "\u{1e}[[[\"Unmatched '}' in the middle of an array at line 1, column 4 (need RS to resync)\",[0]]]]\n", "jq: error: Could not open file @DIR@/missing.json: No such file or directory\n", 2),
+        (&["-c", "-s", "--seq", "--stream-errors", "input"][..], &["arr.seq", "missing.json"][..], "", "jq: error: Could not open file @DIR@/missing.json: No such file or directory\njq: error (at @DIR@/missing.json:0): break\n", 2),
+        (&["-c", "-s", "--seq", "--stream-errors", "[inputs]"][..], &["arr.seq", "missing.json"][..], "\u{1e}[]\n", "jq: error: Could not open file @DIR@/missing.json: No such file or directory\n", 2),
+        (&["-c", "-s", "--seq", "--stream-errors", "[.,input]"][..], &["two.seq", "missing.json"][..], "", "jq: error: Could not open file @DIR@/missing.json: No such file or directory\njq: error (at @DIR@/missing.json:0): break\n", 2),
+        (&["-c", "-s", "--seq", "--stream-errors", "input"][..], &["two.seq", "dir"][..], "", "jq: error: Is a directory\njq: error (at <unknown>): break\n", 2),
+        (&["-c", "-n", "-s", "--seq", "--stream", "def f: input; ."][..], &["two.seq", "missing.json"][..], "\u{1e}null\n", "", 0),
+        (&["-c", "-n", "-s", "--seq", "--stream", "if false then input else . end"][..], &["two.seq", "missing.json"][..], "\u{1e}null\n", "", 0),
     ];
     check_rows(&dir.path().to_string_lossy(), rows)
 }
