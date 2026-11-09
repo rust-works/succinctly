@@ -13,7 +13,8 @@ use anyhow::Result;
 use crate::run_jq_full;
 
 #[test]
-fn a_seq_slurp_leaves_a_record_open_across_files_to_the_read_of_the_failed_file_6730() -> Result<()> {
+fn a_seq_slurp_leaves_a_record_open_across_files_to_the_read_of_the_failed_file_6730() -> Result<()>
+{
     let dir = tempfile::tempdir()?;
     let d = dir.path().to_string_lossy().into_owned();
     std::fs::create_dir(dir.path().join("dir"))?;
