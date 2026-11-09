@@ -7642,7 +7642,15 @@ fn read_inputs(
         for fault in read.faults {
             if faults_as_inputs {
                 // `input`/`inputs` raise what a plain run only warns about (#5640).
-                let (source, line) = stream_location(&raw_bytes, fault.location);
+                // #6788: the fault at the end of the text is met at a last file that did not open,
+                // line 0, where the stream has closed and has no position of its own.
+                let (source, line) = if fault.message.contains(" at EOF")
+                    && UNOPENED_TAIL_NAME.with(|tail| tail.borrow().is_some())
+                {
+                    (files.len(), 0)
+                } else {
+                    stream_location(&raw_bytes, fault.location)
+                };
                 resumed.push((
                     fault.before,
                     TrailingParseError {
@@ -7687,10 +7695,17 @@ fn read_inputs(
                 // has run on the array, and has lost its position by then (#3201). Only one can
                 // come after it: what follows the array is the events the last byte left pending
                 // and the one report of the EOF branch.
+                // #6788: but a last file that did not open is the read the program stands at when
+                // it takes the fault, line 0, as it is for the array (`input_filename` names it).
+                let at_tail = UNOPENED_TAIL_NAME.with(|tail| tail.borrow().is_some());
                 trailing_error = Some(TrailingParseError {
                     error: EvalError::new(fault.message),
-                    source: NO_SOURCE,
-                    line: UNKNOWN_LINE,
+                    source: if at_tail {
+                        u32::try_from(files.len()).unwrap_or(u32::MAX)
+                    } else {
+                        NO_SOURCE
+                    },
+                    line: if at_tail { 0 } else { UNKNOWN_LINE },
                     seq_warning: true,
                     as_parse_error: false,
                 });
