@@ -6996,10 +6996,12 @@ fn read_inputs(
     let mut seq_stream_places_failures = false;
     // #6646: `--stream-errors` reads the text as one stream through jq's streaming parser, which
     // reads a file that did not open as an empty read.
+    // #6725: so does `--seq --stream` (and `--seq --stream-errors`), not slurped.
     // #6730: so does a slurp by the streaming parser (`-s --stream`, `-s --stream-errors`): each file
     // that did not open is one more read of the stream, an empty one, and the fault a token left open
     // across files ends in comes with the read of the last, not of the first.
-    let failed_as_sources = ((plain_stream_errors(args) && !args.slurp)
+    let failed_as_sources = (((plain_stream_errors(args) || seq_by_stream_reader(args))
+        && !args.slurp)
         || slurp_by_stream_parser(args))
         && !args.validate;
     let (files, mut raw_bytes): OpenedInputs = if let Some(bytes) = read_whole {
@@ -8678,7 +8680,6 @@ fn seq_faults_queued(args: &JqCommand, track_eof: bool) -> bool {
     args.seq
         && !args.raw_input
         && args.input_dsv.is_none()
-        && !seq_by_stream_reader(args)
         && (args.null_input || (track_eof && !args.slurp))
 }
 
@@ -10105,6 +10106,18 @@ fn report_reached_open_failures(read: Option<u32>, fault: bool) {
             .with(|ends| ends.borrow_mut().pop_front())
             .unwrap_or_else(|| FAULT_ENDS_TEXT.with(std::cell::Cell::get));
     let read = read.filter(|_| !ends_text);
+    // #6725: a read that comes from a directory in the middle of the list (the closer the file
+    // before it held back, read where its own read failed) has counted the failure already,
+    // which makes the run exit 2 whatever else it does; what jq says of it comes on a read after.
+    PENDING_OPEN_FAILURES.with(|pending| {
+        if let (Some(&(at, ref failure)), Some(source)) = (pending.borrow().front(), read) {
+            if failure.kind == (InputFileErrorKind::Directory { last: false })
+                && at.checked_sub(1) == Some(source as usize)
+            {
+                LAZY_OPEN_FAILED.with(|seen| seen.set(true));
+            }
+        }
+    });
     loop {
         // The failure the read reached, and whether it is a directory given last that this read
         // says (#6615), which `report_unopenable_input` would leave out.
