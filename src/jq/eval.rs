@@ -11336,13 +11336,7 @@ pub(crate) fn eval_owned_construct<S: EvalSemantics>(
     if S::TAG != EvalTag::Jq {
         return None;
     }
-    let shape = match unwrap_paren(expr) {
-        Expr::Pipe(stages) => match skip_identity_stages(stages) {
-            [only] => unwrap_paren(only),
-            _ => return None,
-        },
-        other => other,
-    };
+    let shape = lone_door_shape(expr)?;
     if !matches!(shape, Expr::Array(_) | Expr::Object(_))
         || super::eval_generic::embed_table_active()
     {
@@ -11366,14 +11360,20 @@ pub(crate) fn eval_owned_container_key_door<S: EvalSemantics>(
     if S::TAG != EvalTag::Jq {
         return None;
     }
-    let shape = match unwrap_paren(expr) {
+    owned_container_key_builtin::<S>(lone_door_shape(expr)?, input)
+}
+
+/// The one stage a front door looks at: `expr` with its parentheses removed, and a pipe of identity
+/// stages around a single stage reduced to that stage (`(. | keys)` is `keys`). `None` for a pipe of
+/// several stages, which is the peel's.
+fn lone_door_shape(expr: &Expr) -> Option<&Expr> {
+    Some(match unwrap_paren(expr) {
         Expr::Pipe(stages) => match skip_identity_stages(stages) {
             [only] => unwrap_paren(only),
             _ => return None,
         },
         other => other,
-    };
-    owned_container_key_builtin::<S>(shape, input)
+    })
 }
 
 /// One operand of [`eval_owned_construct`]: a dispatch only, with one `#[inline(never)]` function
@@ -13743,6 +13743,8 @@ fn projection_peel<S: EvalSemantics>(
         .or_else(|| eval_owned_map_projection::<S>(first, input))
         // #6608: or a constructor of static reads, `{id, name}`.
         .or_else(|| eval_owned_construct::<S>(first, input))
+        // #6620: or `keys` / `has(K)` of an owned container.
+        .or_else(|| eval_owned_container_key_door::<S>(first, input))
         // #6527: or `add`, `min` or `max` of an array of computed numbers.
         .or_else(|| eval_owned_number_fold::<S>(first, input))
         // #6539: or `map(body)` of one, which steps to the array of the answers.
@@ -152378,6 +152380,67 @@ mod tests {
             }
         }
         assert!(taken > 50, "the matrix must reach the door: {taken}");
+    }
+
+    /// #6620: a repeated key reads as jq reads it (the last value wins, one key) through the comma
+    /// array and `keys`/`has`, and no comma array is answered while a binding's embed table is up
+    /// (a node it tracks is the bridge's to name).
+    #[test]
+    #[cfg(feature = "std")]
+    fn comma_array_and_keys_read_the_collapsed_object_and_decline_under_an_embed_table_6620() {
+        use crate::jq::eval_generic::embed_table_push;
+
+        let mut fields = ObjectMap::new();
+        fields.push_occurrence("a".to_string(), OwnedValue::Int(1));
+        fields.push_occurrence("b".to_string(), OwnedValue::Int(5));
+        fields.push_occurrence("a".to_string(), OwnedValue::Int(2));
+        let repeated = OwnedValue::Object(fields);
+        let OwnedValue::Object(held) = &repeated else {
+            unreachable!("built as an object")
+        };
+        assert!(held.has_shadows(), "the object holds a repeated key");
+        let read = |src: &str, value: &OwnedValue| {
+            let expr = parse(src).unwrap();
+            let door = eval_owned_construct::<JqSemantics>(&expr, value)
+                .or_else(|| eval_owned_container_key_door::<JqSemantics>(&expr, value));
+            let bridge = normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                &expr, value, false,
+            ));
+            (door, bridge)
+        };
+        for src in [
+            "[.a, .b]",
+            "[.a, .a, .b, .zz]",
+            "keys",
+            "has(\"a\")",
+            "has(\"c\")",
+        ] {
+            let (door, bridge) = read(src, &repeated);
+            let door = door.unwrap_or_else(|| panic!("{src:?} declined a repeated-key object"));
+            assert_eq!(
+                select_door_observable(&(vec![door], "ok".to_string())),
+                select_door_observable(&bridge),
+                "{src:?} on a repeated-key object disagrees with the reindex bridge"
+            );
+        }
+        // Under a binding's embed table the comma array is the bridge's, as `[.a]` is.
+        let origin = BindOrigin::Node {
+            node: 1,
+            document: 9,
+        };
+        let mut bound = repeated.clone();
+        let guard =
+            embed_table_push::<JqSemantics>(Some(&origin), &mut bound).expect("a container bind");
+        for src in ["[.a, .b]", "[.a]"] {
+            let expr = parse(src).unwrap();
+            assert!(
+                eval_owned_construct::<JqSemantics>(&expr, &repeated).is_none(),
+                "{src:?} must be left to the bridge under an embed table"
+            );
+        }
+        drop(guard);
+        let expr = parse("[.a, .b]").unwrap();
+        assert!(eval_owned_construct::<JqSemantics>(&expr, &repeated).is_some());
     }
 
     /// #6560: `environment_object_in` is the environment, built fresh or read back from the

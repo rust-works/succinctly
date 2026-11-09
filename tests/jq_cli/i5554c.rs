@@ -125,6 +125,8 @@ fn a_walk_past_the_native_stack_floor_refuses_at_exit_5_5554() -> Result<()> {
         // #6620), and a walk of its own.
         format!("{PAST_THE_FLOOR} | [., (1, 2)] | length"),
         format!("{PAST_THE_FLOOR} | flatten"),
+        // #6620: a constructor of reads answers off the tree, and the walk after it is what refuses.
+        format!("{PAST_THE_FLOOR} | [., .] | flatten"),
         // A splice site's panicking guard, caught by #5526's net.
         format!("{PAST_THE_FLOOR} as $v | reduce $v as $x (0; if $x then 1 else 2 end)"),
         // A resource limit (#2132's table, #3261's row): no spelling of `try` absorbs it.
