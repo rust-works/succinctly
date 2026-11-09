@@ -3,6 +3,10 @@
 //! and a directory given last then takes the read that delivers the closer the file held back. The
 //! main loop reads no further after that read, so the fault the text ends in (`Unfinished JSON term
 //! at EOF`) is for the program's own `input` reads, and a program that makes none never sees it.
+//! (`input` over `open2.json obj.json dir` prints the fault and `input` over `open.json obj.json dir` does
+//! not only because the extra event `[1,` makes puts the closer one read later: the program's read is the
+//! one that reaches the directory in the first and the loop's in the second.)
+//! The closer can also be in a file that only finishes a container an earlier file opened (`[[` then `1]`).
 //! An empty file between, or a closer that is not held back, leaves the read to the fault as before.
 //! Every row was captured from jq 1.7.1.
 
@@ -21,6 +25,10 @@ fn a_last_directory_that_takes_a_held_closers_read_stops_the_main_loop_before_th
     std::fs::write(dir.path().join("obj.json"), r#"{"a":1}"#)?;
     std::fs::write(dir.path().join("arr.json"), "[1,[2]]")?;
     std::fs::write(dir.path().join("empty.json"), "")?;
+    std::fs::write(dir.path().join("ob.json"), "[[")?;
+    std::fs::write(dir.path().join("two.json"), "1]")?;
+    std::fs::write(dir.path().join("oa2.json"), r#"[{"a":"#)?;
+    std::fs::write(dir.path().join("one.json"), "1}")?;
     #[rustfmt::skip]
     let rows = [
         (&["-c", "--stream-errors", "."][..], &["open.json", "obj.json", "dir"][..], "[[0,\"a\"],1]\n[[0,\"a\"]]\n", "", 2),
@@ -36,6 +44,14 @@ fn a_last_directory_that_takes_a_held_closers_read_stops_the_main_loop_before_th
         (&["-c", "--stream-errors", "."][..], &["open.json", "arr.json", "dir"][..], "[[0,0],1]\n[[0,1,0],2]\n[[0,1,0]]\n[[0,1]]\n[\"Unfinished JSON term at EOF at line 1, column 8\",[0]]\n", "", 2),
         (&["-c", "--stream-errors", "."][..], &["open.json", "dir"][..], "[\"Unfinished JSON term at EOF at line 1, column 1\",[0]]\n", "", 2),
         (&["-c", "--stream-errors", "."][..], &["open.json", "obj.json", "dir", "obj.json"][..], "[[0,\"a\"],1]\n[[0,\"a\"]]\n", "", 2),
+        // A closer in a file that only finishes a container an earlier file opened, and under `-n`.
+        (&["-c", "--stream-errors", "."][..], &["ob.json", "two.json", "dir"][..], "[[0,0],1]\n[[0,0]]\n", "", 2),
+        (&["-c", "--stream-errors", "input"][..], &["ob.json", "two.json", "dir"][..], "[[0,0]]\n", "", 2),
+        (&["-c", "--stream-errors", "."][..], &["oa2.json", "one.json", "dir"][..], "[[0,\"a\"],1]\n[[0,\"a\"]]\n", "", 2),
+        (&["-c", "--stream-errors", "[inputs]"][..], &["oa2.json", "one.json", "dir"][..], "[[[0,\"a\"]],[\"Unfinished JSON term at EOF at line 1, column 8\",[0]]]\n", "jq: error: Is a directory\n", 2),
+        (&["-c", "--stream-errors", "-n", "[inputs]"][..], &["open.json", "obj.json", "dir"][..], "[[[0,\"a\"],1],[[0,\"a\"]],[\"Unfinished JSON term at EOF at line 1, column 8\",[0]]]\n", "jq: error: Is a directory\n", 2),
+        (&["-c", "--stream-errors", "-n", "input"][..], &["open.json", "obj.json", "dir"][..], "[[0,\"a\"],1]\n", "", 0),
+        (&["-c", "--stream-errors", "-n", "[inputs]"][..], &["ob.json", "two.json", "dir"][..], "[[[0,0],1],[[0,0]],[\"Unfinished JSON term at EOF at line 1, column 4\",[0]]]\n", "jq: error: Is a directory\n", 2),
     ];
     for (flags, names, stdout, stderr, status) in rows {
         let files: Vec<String> = names.iter().map(|name| format!("{d}/{name}")).collect();

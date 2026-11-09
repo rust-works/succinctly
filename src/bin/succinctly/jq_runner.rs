@@ -7044,7 +7044,8 @@ fn read_inputs(
             FAULT_AT_TAIL.with(|at| at.set(fault_reaches_end(&raws, args)));
         }
         any_open_failure = !failures.is_empty();
-        if let Some(&(at, ref failure)) = failures.first() {
+        if let Some(first) = failures.first() {
+            let (at, failure) = (first.0, &first.1);
             // #6646: the main loop ends at the read of a directory that delivers the closer the file
             // before it held back, so a directory in the middle is the read it stops at; its
             // message is placed past it, where the reader moves on.
@@ -7069,7 +7070,7 @@ fn read_inputs(
                 || (failed_as_sources
                     && plain_stream_errors(args)
                     && failure.kind == InputFileErrorKind::Directory { last: true }
-                    && held_back_closer_before(args, &raws, (at, failure)));
+                    && held_back_closer_before(args, &raws, &failures[0]));
             note_open_failure_at(at.saturating_sub(usize::from(held_back_at_directory)));
         }
         // #6475: under `-n` the program asks for each file as it goes, and says what it cannot
@@ -9964,10 +9965,59 @@ fn held_back_closer_before(
     let (at, ref error) = *failure;
     let own = if error.is_directory() { at - 1 } else { at };
     streams
-        && own
-            .checked_sub(1)
-            .and_then(|before| raws.get(before))
-            .is_some_and(|raw| closing_event_lags(raw, args.seq))
+        && own.checked_sub(1).is_some_and(|before| {
+            raws.get(before)
+                .is_some_and(|raw| closing_event_lags(raw, args.seq))
+                // #6732: the files are one byte stream, so the closer may belong to a container an
+                // earlier file left open, which the file alone is not a value of.
+                // A file between, even an empty one, takes the read, so the closer is its own.
+                || (plain_stream_errors(args)
+                    && !raws[before].is_empty()
+                    // A fault met before the end (`1` after a value with no separator) is raised
+                    // where it is, and the closer after it is not the read the directory takes.
+                    && !matches!(first_stream_fault(&raws[..=before]), Some((_, false)))
+                    && closer_lags_in_joined_text(&raws[..=before]))
+        })
+}
+
+/// Whether the text the files `raws` make, read as one stream, ends in a closing event the stream
+/// parser holds back (#6732): its last byte closes a container, and the byte before it is a
+/// scalar's. [`closing_event_lags`] asks the same of one file that is a whole value; here the closer
+/// may close a container an earlier file opened (`[` then `{"a":1}`, `[[` then `1]`), so the whole
+/// stream is scanned, and a text whose brackets do not match, which faults, does not lag.
+fn closer_lags_in_joined_text(raws: &[Vec<u8>]) -> bool {
+    let total: usize = raws.iter().map(Vec::len).sum();
+    let (mut open, mut in_string, mut escaped) = (Vec::new(), false, false);
+    let mut previous = 0u8;
+    for (at, &byte) in raws.iter().flatten().enumerate() {
+        if in_string {
+            match (escaped, byte) {
+                (true, _) => escaped = false,
+                (false, b'\\') => escaped = true,
+                (false, b'"') => in_string = false,
+                _ => {}
+            }
+            previous = byte;
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' => open.push(b']'),
+            b'{' => open.push(b'}'),
+            b']' | b'}' => {
+                if open.pop() != Some(byte) {
+                    return false;
+                }
+                if at + 1 == total {
+                    return !matches!(previous, b'[' | b'{' | b']' | b'}' | b',' | b':');
+                }
+            }
+            b' ' | b'\t' | b'\n' | b'\r' => continue,
+            _ => {}
+        }
+        previous = byte;
+    }
+    false
 }
 
 /// Whether the last record of the `--seq` text `raw` leaves jq's stream parser holding its closing
