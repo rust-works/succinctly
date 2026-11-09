@@ -64,3 +64,87 @@ fn test_a_comment_free_sequence_is_written_as_before_6736() -> Result<()> {
     assert_eq!((out.as_str(), code), ("- a\n- b: 1\n- [c]\n", 0));
     Ok(())
 }
+
+#[test]
+fn test_a_streamed_sequence_is_written_as_dot_writes_it_6736() -> Result<()> {
+    // `stream_yaml_sequence` and the `Sequence` arm of `.` each write the comments between items,
+    // from different places; over a sequence with no header or document foot they must agree.
+    for doc in [
+        "- a\n# c\n- b\n",
+        "- a: 1\n  # foot a\n\n# head b\n- b: 2  # l\n- c\n",
+        "- - a\n  # in\n  - b\n# out\n- c\n",
+        "-\n  # inner head\n  a: 1\n# between\n- # on dash\n  b: 2\n",
+        "- a\n- # sc\n  b\n",
+        "- a\n\n# c\n\n- b\n\n\n- c\n",
+    ] {
+        let (dot, _) = run_yq_stdin(".", doc, &[])?;
+        let (mapped, _) = run_yq_stdin("map(.)", doc, &[])?;
+        assert_eq!(mapped, dot, "{doc:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_an_array_of_nodes_over_a_commented_document_matches_the_dom_route_6736() -> Result<()> {
+    // Which arrays stream over a comment is decided by `array_holds_the_document`; `-P` forces the
+    // DOM route, so this pins the decision to what is written, whatever the predicates say.
+    let docs = [
+        "# head\n- a: 1\n# between\n- b: x\n# end\n",
+        "users:\n  - id: 1\n    # foot\n  # head2\n  - id: 2\n  # last\nother: 1\n",
+    ];
+    for doc in docs {
+        for filter in [
+            "[.]",
+            "[.[]]",
+            "[.[0]]",
+            "[.users]",
+            "[.users[]]",
+            ".users | [.[]]",
+            "[.[] | select(.id)]",
+            "[.users[] | select(.id)]",
+            "[select(.users)]",
+            "[. | select(.[0])]",
+            "[select(.[0])]",
+        ] {
+            let (streamed, code) = run_yq_stdin(filter, doc, &[])?;
+            let (dom, dom_code) = run_yq_stdin(filter, doc, &["-P"])?;
+            // A filter that does not fit the document fails the same way on both routes.
+            assert_eq!(code, dom_code, "`{filter}` over {doc:?}");
+            assert_eq!(streamed, dom, "`{filter}` over {doc:?}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_the_comments_between_items_follow_the_indent_and_the_other_callers_6736() -> Result<()> {
+    let nested = "- - a\n  # in\n  - b\n# out\n- c\n";
+    for indent in ["-I=2", "-I=3", "-I=4"] {
+        let (out, code) = run_yq_stdin("map(.)", nested, &[indent])?;
+        assert_eq!((out.as_str(), code), (nested, 0), "{indent}");
+    }
+    // `--slurp` writes document contents, which are not sequence items: unchanged.
+    let docs = "# h\n- a\n# c\n- b\n---\n- c\n# d\n- d\n";
+    let (out, code) = run_yq_stdin(".", docs, &["--slurp"])?;
+    assert_eq!(
+        (out.as_str(), code),
+        ("- - a\n  # c\n  - b\n- - c\n  # d\n  - d\n", 0)
+    );
+    // An alias takes the DOM route over a comment, which expands it and keeps the comment.
+    let aliased = "# c\nbase: &b {x: 1}\nitems:\n  - *b\n  # between\n  - y: 2\n";
+    let (out, code) = run_yq_stdin("[.items[]]", aliased, &[])?;
+    assert_eq!((out.as_str(), code), ("- x: 1\n# between\n- y: 2\n", 0));
+    Ok(())
+}
+
+#[test]
+fn test_what_a_streamed_sequence_still_does_not_write_6736() -> Result<()> {
+    // Recorded divergences (docs/compliance/yq/limitations.md), pinned so a change to them is seen.
+    // yq prints the `# c0` on a bare `-` that holds the sequence, ahead of its first element.
+    let (out, code) = run_yq_stdin("[.[0][]]", "- # c0\n  - 1\n  # z\n  - 2\n  # tail\n", &[])?;
+    assert_eq!((out.as_str(), code), ("- 1\n# z\n- 2\n# tail\n", 0));
+    // yq prints the trailing `# e` after a reordered sequence of mappings.
+    let (out, code) = run_yq_stdin("reverse", "- k: 3\n# c\n- k: 1\n# e\n", &[])?;
+    assert_eq!((out.as_str(), code), ("# c\n- k: 1\n- k: 3\n", 0));
+    Ok(())
+}

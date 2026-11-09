@@ -548,12 +548,12 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         }
     }
 
-    /// The bp of the item wrapper this cursor is the content of, when it is an element of a
+    /// The item wrapper this cursor is the content of, when it is an element of a
     /// sequence (#6736): `- a` / `# c` / `- b` has the `# c` on `b`'s content node, which is where a
     /// cursor handed out by `.[]`, `map(.)` or `sort` stands, so the comments between items are
     /// written from it. `None` for a mapping value, a document's own content and the root, none of
     /// which has a sequence item's head and foot to write.
-    fn sequence_item_wrapper(&self) -> Option<usize> {
+    fn sequence_item_wrapper(&self) -> Option<Self> {
         // One flag on a document without a comment, which is what keeps this off its profile.
         if !self.index.has_comments() {
             return None;
@@ -566,7 +566,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             return None;
         }
         let owner = wrapper.parent()?;
-        (owner.bp_pos != 0 && owner.is_container()).then_some(wrapper.bp_pos)
+        (owner.bp_pos != 0 && owner.is_container()).then_some(wrapper)
     }
 
     /// The comment on the bare `-` of the sequence item this cursor is the value of (#4256):
@@ -10569,7 +10569,9 @@ where
 /// (same container-vs-scalar branching, same empty-sequence `"[]"`
 /// shortcut, same `#785` compact-form handling, same anchor/tag handling
 /// via `write_anchor_tag`/`write_deferred_value`, and per-item
-/// trailing-comment write) so multi-document slurped output matches
+/// trailing-comment write, and, for an element that is a sequence item of
+/// a commented document, the head and foot comments around it and the
+/// comment on a bare `-`, #6736) so multi-document slurped output matches
 /// single-document M2 streaming byte-for-byte, including #1077's
 /// deferred-and-absent-value handling: an earlier draft of this comment
 /// claimed that case was unreachable through `--slurp`'s own construction
@@ -10582,6 +10584,12 @@ where
 /// instead of `- &anc !!mytag`, the tag silently dropped and a spurious
 /// `null` value synthesized) and fixed by routing this branch through
 /// `write_deferred_value` the same as its `stream_yaml_value` counterpart.
+///
+/// The comments between items (#6736) are the one part with a second copy: the `Sequence` arm of
+/// `stream_yaml_value` writes them from the parent's item loop, this from each cursor's own
+/// position. `tests/yq_cli/i6736.rs` pins that `map(.)` and `.` agree over a commented sequence.
+/// What the arm also does for an item that owns a foot inside a flow mapping (`- {a: 1,}`, #5058)
+/// is not carried over.
 pub fn stream_yaml_sequence<'a, W, I, Out>(
     cursors: I,
     out: &mut Out,
@@ -10636,15 +10644,17 @@ where
                 write_yaml_indent(out, current_indent, unit)?;
             }
             first = false;
-            if let Some(wrapper) = item_wrapper {
-                cursor.write_item_head_comments_at(out, &level_indent, wrapper, cursor.bp_pos)?;
+            if let Some(wrapper) = &item_wrapper {
+                cursor.write_item_head_comments_at(
+                    out,
+                    &level_indent,
+                    wrapper.bp_pos,
+                    cursor.bp_pos,
+                )?;
             }
             // A comment on a bare `-` whose value deferred to the next line (#1079, #6736), as the
             // `Sequence` arm of `stream_yaml_value` reads it: it lives on the item's wrapper.
-            let wrapper_cursor = item_wrapper.and_then(|_| cursor.parent());
-            let wrapper_comment = wrapper_cursor
-                .as_ref()
-                .and_then(YamlCursor::line_comment_raw);
+            let wrapper_comment = item_wrapper.as_ref().and_then(YamlCursor::line_comment_raw);
             // Mirrors `stream_yaml_value`'s `Sequence` block-style arm
             // exactly, including its `#785` compact-form handling (see the
             // comment there).
@@ -10738,11 +10748,11 @@ where
                     write_line_comment(out, cursor.line_comment_raw())?;
                 }
             }
-            prev_had_foot = match item_wrapper {
+            prev_had_foot = match &item_wrapper {
                 Some(wrapper) => cursor.write_item_foot_comments_at(
                     out,
                     &level_indent,
-                    wrapper,
+                    wrapper.bp_pos,
                     cursor.bp_pos,
                 )?,
                 None => false,

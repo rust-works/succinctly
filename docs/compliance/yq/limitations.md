@@ -3167,10 +3167,12 @@ A collection key whose value is a block collection, inside a compact sequence en
 **A streamed sequence keeps the comments between its items (#6736).**
 `map(.)`, `sort`, `sort_by`, `reverse`, `unique`, `select` over `.[]` and an array of nodes write each item's head and foot comments, as the sequence arm of `.` does: `- a` / `# c` / `- b` prints its `# c`, a foot comment is followed by a blank line when another item follows, and the comment on a bare `-` (`- # on dash`) stays on the dash.
 Before, only the owned route kept them.
-Three things are still not written, none of them new.
-The document's own foot comment after a sorted or reordered root sequence is dropped (yq keeps it).
-A comment that is a document's header, before its first node, is written once at the top as it always was.
-`sort_by(.id) | reverse` hands the second stage owned items, which carry no comments, so a chain of two reordering stages loses them where one stage keeps them.
+What is still not written is pinned by `test_what_a_streamed_sequence_still_does_not_write_6736`; all but the third was never written by a streamer, and the third was written by the owned route for an array of nodes (`[.[0][]]`), which streams over a commented document now:
+The document's own foot comment after a sorted or reordered root sequence (`# foot` after `sort`).
+The trailing foot comment after a `reverse` or `sort_by` of a sequence of mappings (`- k: 3` / `# c` / `- k: 1` / `# e` drops `# e`; a sequence of scalars keeps it).
+The comment on a bare `-` that holds a nested sequence, when the inner elements are streamed on their own (`- # c0` / `  - 1`, then `.[0][]`).
+The comments of a chain of two reordering stages (`sort_by(.id) | reverse`), whose second stage is handed owned items.
+A foot comment owned by an item inside a flow mapping (`- {a: 1,}`, #5058), which `.` writes with its comma.
 
 **A top-level comma of navigation reads such a document the way `.` does (#5283, answering #2645).**
 Real yq rejects the document for every filter, as it rejects a single undecodable key, so this is the same divergence as `.`, not a new one.
