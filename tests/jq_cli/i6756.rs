@@ -19,10 +19,10 @@ fn select_compares_a_container_without_decoding_it_6756() -> Result<()> {
     for (doc, filter, want) in [
         (
             r#"[{"x":"\ud800"}]"#,
-            r#".[] | select(. != null)"#,
+            r".[] | select(. != null)",
             "{\"x\":\"\\ud800\"}\n",
         ),
-        (r#"[{"x":"\ud800"}]"#, r#".[] | select(. == null)"#, ""),
+        (r#"[{"x":"\ud800"}]"#, r".[] | select(. == null)", ""),
         (
             r#"[{"x":"\ud800"}]"#,
             r#".[] | select(type == "object")"#,
@@ -30,34 +30,34 @@ fn select_compares_a_container_without_decoding_it_6756() -> Result<()> {
         ),
         (
             r#"[{"x":"\ud800"}]"#,
-            r#".[] | select(. != null and . != false)"#,
+            r".[] | select(. != null and . != false)",
             "{\"x\":\"\\ud800\"}\n",
         ),
         (
             r#"{"a":{"x":"\ud800"}}"#,
-            r#".[] | select(. != null)"#,
+            r".[] | select(. != null)",
             "{\"x\":\"\\ud800\"}\n",
         ),
         (
             r#"[{"x":"\ud800"}]"#,
-            r#"select(. != null)"#,
+            r"select(. != null)",
             "[{\"x\":\"\\ud800\"}]\n",
         ),
         // The other shapes #6350 answers: the literal on the left, `or`, `not`, a `type` that
         // keeps or drops, and an array in the container's place.
         (
             r#"[{"x":"\ud800"}]"#,
-            r#".[] | select(null != .)"#,
+            r".[] | select(null != .)",
             "{\"x\":\"\\ud800\"}\n",
         ),
         (
             r#"[{"x":"\ud800"}]"#,
-            r#".[] | select(. == null or . != null)"#,
+            r".[] | select(. == null or . != null)",
             "{\"x\":\"\\ud800\"}\n",
         ),
         (
             r#"[{"x":"\ud800"}]"#,
-            r#".[] | select((. != null) | not)"#,
+            r".[] | select((. != null) | not)",
             "",
         ),
         (
@@ -67,7 +67,7 @@ fn select_compares_a_container_without_decoding_it_6756() -> Result<()> {
         ),
         (
             r#"[["\ud800"]]"#,
-            r#".[] | select(. != null)"#,
+            r".[] | select(. != null)",
             "[\"\\ud800\"]\n",
         ),
         (
@@ -95,8 +95,8 @@ fn select_compares_a_container_without_decoding_it_6756() -> Result<()> {
 #[test]
 fn a_consumer_of_the_kept_container_still_raises_6756() -> Result<()> {
     for filter in [
-        r#"[.[] | select(. != null)] | tojson"#,
-        r#".[] | select(.x != null)"#,
+        r"[.[] | select(. != null)] | tojson",
+        r".[] | select(.x != null)",
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"[{"x":"\ud800"}]"#))?;
         assert_eq!(
@@ -126,9 +126,9 @@ fn select_still_decodes_a_scalar_it_compares_6756() -> Result<()> {
         "stderr {stderr:?}"
     );
     for filter in [
-        r#".[] | select(. != null)"#,
-        r#".[] | select(. == null)"#,
-        r#".[] | select(. != null and . != false)"#,
+        r".[] | select(. != null)",
+        r".[] | select(. == null)",
+        r".[] | select(. != null and . != false)",
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"["\x"]"#))?;
         assert_eq!(code, 5, "`{filter}` decodes the scalar\nstdout: {stdout:?}");
