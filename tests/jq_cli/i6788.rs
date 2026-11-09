@@ -2,8 +2,9 @@
 //! `--seq` record left open ends in. When the last file did not open, jq has the program standing at
 //! that file, line 0, when it takes the fault: the error says `(at missing:0)` and `input_filename`
 //! afterwards is `"missing"`. succinctly gave the fault no position (`(at <unknown>)`, `null`). A last
-//! directory is the read jq itself leaves `<unknown>` at, and a plain `.` says the warning with no
-//! position, so those rows were right and still are. Every row was captured from jq 1.7.1.
+//! directory is the read jq itself leaves `<unknown>` at, a plain `.` says the warning with no
+//! position, and a fault that is not the one at the end of the text keeps its own (`bad`, a lone `}`),
+//! so those rows were right and still are. Every row was captured from jq 1.7.1.
 
 use anyhow::Result;
 
@@ -22,11 +23,13 @@ fn the_fault_a_program_takes_is_at_the_last_file_that_did_not_open_6788() -> Res
         ("trunc", &b"\x1e[1,"[..]),
         ("trunc2", b"\x1e{\"a\":"),
         ("pa", b"[1]"),
+        ("bad", b"\x1e}"),
+        ("badtr", b"\x1e}\x1e[1,"),
     ] {
         std::fs::write(dir.path().join(name), bytes)?;
     }
     #[rustfmt::skip]
-    let rows: [Row<'_>; 12] = [
+    let rows: [Row<'_>; 16] = [
         (&["-c", "--seq", "-s", "--stream", "input"][..], &["trunc", "pa", "missing"][..], "", "jq: error: Could not open file @DIR@/missing: No such file or directory\njq: error (at @DIR@/missing:0): Unfinished JSON term at EOF at line 1, column 7\n", 2),
         (&["-c", "--seq", "-s", "--stream", "[., input]"][..], &["trunc", "pa", "missing"][..], "", "jq: error: Could not open file @DIR@/missing: No such file or directory\njq: error (at @DIR@/missing:0): Unfinished JSON term at EOF at line 1, column 7\n", 2),
         (&["-c", "--seq", "-s", "--stream", "[inputs]"][..], &["trunc", "pa", "missing"][..], "", "jq: error: Could not open file @DIR@/missing: No such file or directory\njq: error (at @DIR@/missing:0): Unfinished JSON term at EOF at line 1, column 7\n", 2),
@@ -39,6 +42,10 @@ fn the_fault_a_program_takes_is_at_the_last_file_that_did_not_open_6788() -> Res
         (&["-c", "--seq", "-s", "--stream", "input"][..], &["trunc", "pa"][..], "\u{1e}[[1,0]]\n", "jq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 7\n", 0),
         (&["-c", "--seq", "-s", "--stream-errors", "input"][..], &["trunc", "pa", "missing"][..], "\u{1e}[\"Unfinished JSON term at EOF at line 1, column 7\",[1]]\n", "jq: error: Could not open file @DIR@/missing: No such file or directory\n", 2),
         (&["-c", "--seq", "-n", "-s", "--stream", "[inputs]"][..], &["trunc", "pa", "dir"][..], "", "jq: error: Is a directory\njq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 7\n", 2),
+        (&["-c", "--seq", "-s", "--stream", "input"][..], &["badtr", "pa", "missing"][..], "", "jq: ignoring parse error: Unmatched '}' at the top-level at line 1, column 2 (need RS to resync)\njq: error: Could not open file @DIR@/missing: No such file or directory\njq: error (at @DIR@/missing:0): Unfinished JSON term at EOF at line 1, column 9\n", 2),
+        (&["-c", "--seq", "-s", "--stream", "input"][..], &["bad", "pa", "missing"][..], "", "jq: ignoring parse error: Unmatched '}' at the top-level at line 1, column 2 (need RS to resync)\njq: error: Could not open file @DIR@/missing: No such file or directory\njq: error (at @DIR@/missing:0): break\n", 2),
+        (&["-c", "--seq", "-n", "-s", "--stream", "[inputs]"][..], &["badtr", "pa", "missing"][..], "", "jq: error (at @DIR@/badtr:0): Unmatched '}' at the top-level at line 1, column 2 (need RS to resync)\n", 5),
+        (&["-c", "--seq", "--stream", "[inputs]"][..], &["trunc", "pa", "missing"][..], "", "jq: error: Could not open file @DIR@/missing: No such file or directory\njq: error (at @DIR@/missing:0): Unfinished JSON term at EOF at line 1, column 7\n", 2),
     ];
     for (flags, names, stdout, stderr, status) in rows {
         let files: Vec<String> = names.iter().map(|name| format!("{d}/{name}")).collect();

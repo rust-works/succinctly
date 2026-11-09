@@ -7644,13 +7644,10 @@ fn read_inputs(
                 // `input`/`inputs` raise what a plain run only warns about (#5640).
                 // #6788: the fault at the end of the text is met at a last file that did not open,
                 // line 0, where the stream has closed and has no position of its own.
-                let (source, line) = if fault.message.contains(" at EOF")
-                    && UNOPENED_TAIL_NAME.with(|tail| tail.borrow().is_some())
-                {
-                    (files.len(), 0)
-                } else {
-                    stream_location(&raw_bytes, fault.location)
-                };
+                let (source, line) = fault_is_at_eof(&fault.message)
+                    .then(|| unopened_tail_location(&files))
+                    .flatten()
+                    .unwrap_or_else(|| stream_location(&raw_bytes, fault.location));
                 resumed.push((
                     fault.before,
                     TrailingParseError {
@@ -7668,7 +7665,7 @@ fn read_inputs(
                     }
                     // The warning at the end of the text is raised by the read that has been
                     // through every file (#6676).
-                    let source = if fault.message.contains(" at EOF") {
+                    let source = if fault_is_at_eof(&fault.message) {
                         usize::MAX
                     } else {
                         stream_location(&raw_bytes, fault.location).0
@@ -7697,15 +7694,17 @@ fn read_inputs(
                 // and the one report of the EOF branch.
                 // #6788: but a last file that did not open is the read the program stands at when
                 // it takes the fault, line 0, as it is for the array (`input_filename` names it).
-                let at_tail = UNOPENED_TAIL_NAME.with(|tail| tail.borrow().is_some());
+                let at_tail = fault_is_at_eof(&fault.message)
+                    .then(|| unopened_tail_location(&files))
+                    .flatten();
                 trailing_error = Some(TrailingParseError {
                     error: EvalError::new(fault.message),
-                    source: if at_tail {
-                        u32::try_from(files.len()).unwrap_or(u32::MAX)
-                    } else {
-                        NO_SOURCE
-                    },
-                    line: if at_tail { 0 } else { UNKNOWN_LINE },
+                    source: at_tail.map_or(NO_SOURCE, |(source, _)| {
+                        u32::try_from(source).unwrap_or(u32::MAX)
+                    }),
+                    line: at_tail.map_or(UNKNOWN_LINE, |(_, line)| {
+                        u32::try_from(line).unwrap_or(u32::MAX)
+                    }),
                     seq_warning: true,
                     as_parse_error: false,
                 });
@@ -13196,6 +13195,14 @@ fn note_fault_ends<M: AsRef<str>>(messages: impl Iterator<Item = M>) {
 /// Whether a parse error's message says the fault is at the end of the text: jq's `... at EOF`.
 fn fault_is_at_eof(message: &str) -> bool {
     message.contains(" at EOF")
+}
+
+/// Where jq's reader stands when a last file did not open and a fault at the end of the text is met
+/// (#6788): that file's source, line 0. `None` when the last file opened, or none was named.
+fn unopened_tail_location(files: &[PathBuf]) -> Option<(usize, usize)> {
+    UNOPENED_TAIL_NAME
+        .with(|tail| tail.borrow().is_some())
+        .then_some((files.len(), 0))
 }
 
 /// What a stream that turned malformed after its lazy start (#5853) hands out once the lazy
