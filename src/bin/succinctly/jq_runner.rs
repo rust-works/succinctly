@@ -6787,6 +6787,16 @@ fn fault_reaches_end(raws: &[Vec<u8>], args: &JqCommand) -> bool {
 /// `--seq` and the streaming readers place their values themselves, and `--validate` checks each
 /// file on its own.
 fn last_value_reaches_end(raws: &[Vec<u8>], args: &JqCommand) -> bool {
+    last_value_reaches_end_past_faults(raws, args, false)
+}
+
+/// [`last_value_reaches_end`], where `past_faults` says the reads of the program go on past a fault
+/// in the text (#6712), so a last value after one is placed at the end like any other.
+fn last_value_reaches_end_past_faults(
+    raws: &[Vec<u8>],
+    args: &JqCommand,
+    past_faults: bool,
+) -> bool {
     if args.seq || args.stream || args.stream_errors || args.validate {
         return false;
     }
@@ -6805,7 +6815,8 @@ fn last_value_reaches_end(raws: &[Vec<u8>], args: &JqCommand) -> bool {
     let Some(last) = raws.iter().rev().find(|raw| !raw.is_empty()) else {
         return false;
     };
-    !source_ends_cleanly(last, args) && (args.raw_input || first_stream_fault(raws).is_none())
+    !source_ends_cleanly(last, args)
+        && (args.raw_input || past_faults || first_stream_fault(raws).is_none())
 }
 
 /// [`get_inputs`], up to the source for a last file that did not open.
@@ -6978,7 +6989,13 @@ fn read_inputs(
         unopened_tail = failures.iter().any(|&(at, _)| at >= files.len());
         if let Some(name) = unopened_tail_name(&failures, files.len()) {
             UNOPENED_TAIL_NAME.with(|tail| *tail.borrow_mut() = Some(name));
-            LAST_VALUE_AT_TAIL.with(|at| at.set(last_value_reaches_end(&raws, args)));
+            LAST_VALUE_AT_TAIL.with(|at| {
+                at.set(last_value_reaches_end_past_faults(
+                    &raws,
+                    args,
+                    args.null_input || track_eof,
+                ));
+            });
             FAULT_AT_TAIL.with(|at| at.set(fault_reaches_end(&raws, args)));
         }
         any_open_failure = !failures.is_empty();
@@ -12720,15 +12737,17 @@ fn seed_input_queue(
             .map(|(v, (src, line))| (v, src, line))
             .collect();
         // #6480: the last value, read at a last file that did not open, unless a fault follows it.
+        let documents = queue.len();
         if let (Some(end), Some(last)) = (locations.last_value_end(), queue.last_mut()) {
-            if trailing_error.is_none() && resumed_errors.is_empty() {
+            if trailing_error.is_none()
+                && resumed_errors.iter().all(|&(before, _)| before < documents)
+            {
                 (last.1, last.2) = end;
             }
         }
         // A stream that turned malformed partway queues each parse
         // error behind the documents before it (#2961), and the
         // documents jq read after resuming behind it (#4311).
-        let documents = queue.len();
         let errors = resumed_errors
             .into_iter()
             .chain(trailing_error.map(|t| (documents, t)))
