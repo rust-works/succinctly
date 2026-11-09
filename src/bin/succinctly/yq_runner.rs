@@ -7711,6 +7711,26 @@ fn is_key_stage(expr: &Expr) -> bool {
     matches!(expr, Expr::Builtin(Builtin::Key))
 }
 
+/// `expr` as a non-empty static navigation followed by one last stage (parentheses removed),
+/// the shape both key-listing routes of #5450 start from; `None` for any other.
+fn split_static_nav_then_last(expr: &Expr) -> Option<(Vec<&Expr>, &Expr)> {
+    let mut stages = Vec::new();
+    flatten_plain_pipe(expr, &mut stages);
+    let (last, nav) = stages.split_last()?;
+    if nav.is_empty()
+        || !nav
+            .iter()
+            .all(|stage| static_nav_steps(stage).is_some_and(|steps| !steps.is_empty()))
+    {
+        return None;
+    }
+    let mut last = *last;
+    while let Expr::Paren(inner) = last {
+        last = inner;
+    }
+    Some((nav.to_vec(), last))
+}
+
 /// `expr` as a *static navigation* followed by `map(key)`, split into the navigation and the
 /// `map(key)` (#5450); `None` for any other shape.
 ///
@@ -7720,24 +7740,11 @@ fn is_key_stage(expr: &Expr) -> bool {
 /// which the path-context walk behind the navigation (it holds owned values) does not. `.a | key`
 /// and the other reads of the node's own place are not this shape.
 fn split_leading_static_nav_map_key(expr: &Expr) -> Option<(Expr, Expr)> {
-    let mut stages = Vec::new();
-    flatten_plain_pipe(expr, &mut stages);
-    let (last, nav) = stages.split_last()?;
-    if nav.is_empty()
-        || !nav
-            .iter()
-            .all(|stage| static_nav_steps(stage).is_some_and(|steps| !steps.is_empty()))
-    {
-        return None;
-    }
-    let mut last = *last;
-    while let Expr::Paren(inner) = last {
-        last = inner;
-    }
+    let (nav, last) = split_static_nav_then_last(expr)?;
     let Expr::Builtin(Builtin::Map(body)) = last else {
         return None;
     };
-    is_key_stage(body).then(|| (pipe_of(nav), last.clone()))
+    is_key_stage(body).then(|| (pipe_of(&nav), last.clone()))
 }
 
 /// `NAV | [.[] | key]` as `[NAV | .[] | key]` for a static navigation `NAV` (#5450): the same
@@ -7746,20 +7753,7 @@ fn split_leading_static_nav_map_key(expr: &Expr) -> Option<(Expr, Expr)> {
 /// The walk behind a navigation in front of a path-context read holds owned values, where the key
 /// is its text. `None` for any other shape.
 fn fold_nav_into_key_array(expr: &Expr) -> Option<Expr> {
-    let mut stages = Vec::new();
-    flatten_plain_pipe(expr, &mut stages);
-    let (last, nav) = stages.split_last()?;
-    if nav.is_empty()
-        || !nav
-            .iter()
-            .all(|stage| static_nav_steps(stage).is_some_and(|steps| !steps.is_empty()))
-    {
-        return None;
-    }
-    let mut last = *last;
-    while let Expr::Paren(inner) = last {
-        last = inner;
-    }
+    let (nav, last) = split_static_nav_then_last(expr)?;
     let Expr::Array(inner) = last else {
         return None;
     };
@@ -11509,9 +11503,12 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     if let Err(unresolved) = jq::resolve_func_calls(&mut program.expr) {
         anyhow::bail!("{unresolved}");
     }
-    // #5450: `.a | [.[] | key]` is `[.a[] | key]`, whose key nodes keep their presentation.
-    if let Some(folded) = fold_nav_into_key_array(&program.expr) {
-        program.expr = folded;
+    // #5450: `.a | [.[] | key]` is `[.a[] | key]`, whose key nodes keep their presentation. Not under
+    // `--eval-all`, where an array collects every document's results into one (#4380).
+    if !args.eval_all {
+        if let Some(folded) = fold_nav_into_key_array(&program.expr) {
+            program.expr = folded;
+        }
     }
 
     // Parse the --split-exp expression, if given, once up front, applying

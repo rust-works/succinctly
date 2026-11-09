@@ -76,3 +76,33 @@ fn test_key_listing_behind_a_navigation_in_json_and_pretty_output_5450() -> Resu
     }
     Ok(())
 }
+
+#[test]
+fn test_key_listing_behind_optional_and_index_navigation_5450() -> Result<()> {
+    // yq: the same answers with a `?`, an index step and a missing or scalar target.
+    let input = "a:\n  \"k\": 1\nc: 5\nl:\n  - \"p\": 1\n";
+    for (filter, want) in [
+        (".a? | [.[] | key]", "- \"k\"\n"),
+        (".c? | [.[] | key]", "[]\n"),
+        (".c[0]? | [.[] | key]", "[]\n"),
+        (".l[0] | [.[] | key]", "- \"p\"\n"),
+        (".l[0] | map(key)", "- \"p\"\n"),
+    ] {
+        let (out, code) = run_yq_stdin(filter, input, &[])?;
+        assert_eq!((out.as_str(), code), (want, 0), "`{filter}`");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_key_array_behind_a_navigation_under_eval_all_collects_per_document_5450() -> Result<()> {
+    // `--eval-all` evaluates an array once over every document, so the navigation stays outside
+    // it: the keys keep printing as they did (a recorded gap), one result per document.
+    let (out, code) = run_yq_stdin(
+        ".a | [.[] | key]",
+        "a:\n  \"k\": 1\n---\na:\n  \"z\": 2\n",
+        &["--eval-all"],
+    )?;
+    assert_eq!((out.as_str(), code), ("- k\n---\n- z\n", 0));
+    Ok(())
+}
