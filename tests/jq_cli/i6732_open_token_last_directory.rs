@@ -29,6 +29,10 @@ fn a_last_directory_that_takes_a_held_closers_read_stops_the_main_loop_before_th
     std::fs::write(dir.path().join("two.json"), "1]")?;
     std::fs::write(dir.path().join("oa2.json"), r#"[{"a":"#)?;
     std::fs::write(dir.path().join("one.json"), "1}")?;
+    std::fs::write(dir.path().join("obje.json"), "{\"a\":1}\n")?;
+    std::fs::write(dir.path().join("ws.json"), "[1 ]")?;
+    std::fs::write(dir.path().join("a.json"), r#"["a"#)?;
+    std::fs::write(dir.path().join("b.json"), r#"b"]"#)?;
     #[rustfmt::skip]
     let rows = [
         (&["-c", "--stream-errors", "."][..], &["open.json", "obj.json", "dir"][..], "[[0,\"a\"],1]\n[[0,\"a\"]]\n", "", 2),
@@ -44,6 +48,12 @@ fn a_last_directory_that_takes_a_held_closers_read_stops_the_main_loop_before_th
         (&["-c", "--stream-errors", "."][..], &["open.json", "arr.json", "dir"][..], "[[0,0],1]\n[[0,1,0],2]\n[[0,1,0]]\n[[0,1]]\n[\"Unfinished JSON term at EOF at line 1, column 8\",[0]]\n", "", 2),
         (&["-c", "--stream-errors", "."][..], &["open.json", "dir"][..], "[\"Unfinished JSON term at EOF at line 1, column 1\",[0]]\n", "", 2),
         (&["-c", "--stream-errors", "."][..], &["open.json", "obj.json", "dir", "obj.json"][..], "[[0,\"a\"],1]\n[[0,\"a\"]]\n", "", 2),
+        // A newline after the closer reads with it (no held-back event), a space before it does not matter,
+        // and a string that crosses the file boundary is one scalar.
+        (&["-c", "--stream-errors", "."][..], &["open.json", "obje.json", "dir"][..], "[[0,\"a\"],1]\n[[0,\"a\"]]\n[\"Unfinished JSON term at EOF at line 2, column 0\",[0]]\n", "", 2),
+        (&["-c", "--stream-errors", "."][..], &["a.json", "b.json", "dir"][..], "[[0],\"ab\"]\n[[0]]\n", "", 2),
+        (&["-c", "--stream-errors", "[inputs]"][..], &["a.json", "b.json", "dir"][..], "[[[0]]]\n", "jq: error: Is a directory\n", 2),
+        (&["-c", "--stream-errors", "."][..], &["open.json", "ws.json", "dir"][..], "[[0,0],1]\n[[0,0]]\n", "", 2),
         // A closer in a file that only finishes a container an earlier file opened, and under `-n`.
         (&["-c", "--stream-errors", "."][..], &["ob.json", "two.json", "dir"][..], "[[0,0],1]\n[[0,0]]\n", "", 2),
         (&["-c", "--stream-errors", "input"][..], &["ob.json", "two.json", "dir"][..], "[[0,0]]\n", "", 2),

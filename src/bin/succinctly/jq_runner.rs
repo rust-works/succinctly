@@ -9966,17 +9966,18 @@ fn held_back_closer_before(
     let own = if error.is_directory() { at - 1 } else { at };
     streams
         && own.checked_sub(1).is_some_and(|before| {
-            raws.get(before)
-                .is_some_and(|raw| closing_event_lags(raw, args.seq))
-                // #6732: the files are one byte stream, so the closer may belong to a container an
-                // earlier file left open, which the file alone is not a value of.
-                // A file between, even an empty one, takes the read, so the closer is its own.
-                || (plain_stream_errors(args)
-                    && !raws[before].is_empty()
-                    // A fault met before the end (`1` after a value with no separator) is raised
-                    // where it is, and the closer after it is not the read the directory takes.
-                    && !matches!(first_stream_fault(&raws[..=before]), Some((_, false)))
-                    && closer_lags_in_joined_text(&raws[..=before]))
+            raws.get(before).is_some_and(|raw| {
+                closing_event_lags(raw, args.seq)
+                    // #6732: the files are one byte stream, so the closer may belong to a container
+                    // an earlier file left open, which the file alone is not a value of. A file
+                    // between, even an empty one, takes the read, so the closer is its own.
+                    || (plain_stream_errors(args)
+                        && !raw.is_empty()
+                        // A fault met before the end (`1` after a value with no separator) is raised
+                        // where it is, and the closer after it is not the read the directory takes.
+                        && !matches!(first_stream_fault(&raws[..=before]), Some((_, false)))
+                        && closer_lags_in_joined_text(&raws[..=before]))
+            })
         })
 }
 
@@ -18868,6 +18869,47 @@ mod tests {
 
     /// #6646: which `--seq` texts leave a closing event held back, each shape captured from jq
     /// 1.7.1 (one failure reported where it lags, two where it does not).
+    #[test]
+    fn the_joined_text_lag_agrees_with_the_single_file_lag_on_whole_values_6732() {
+        // Two predicates answer "does this closer lag": `closing_event_lags` for one file that is a
+        // whole value, `closer_lags_in_joined_text` for the stream the files make. On a whole value
+        // they must agree, or a change to one desynchronises the two.
+        for text in [
+            "[1]",
+            "{\"a\":\"b\"}",
+            "[[],1]",
+            "[1,2]",
+            "[]",
+            "[[1]]",
+            "{\"a\":{}}",
+            "[1]\n",
+            "[\"]\"]",
+            "{\"a\":\"x}\"}",
+            "[1 ]",
+            "[true]",
+            "[null,\"a\\\"b\"]",
+            "  [1]",
+        ] {
+            assert_eq!(
+                closer_lags_in_joined_text(&[text.as_bytes().to_vec()]),
+                closing_event_lags(text.as_bytes(), false),
+                "{text:?}"
+            );
+        }
+        // A closer that finishes a container another file opened lags with the joined text only.
+        assert!(closer_lags_in_joined_text(&[
+            b"[[".to_vec(),
+            b"1]".to_vec()
+        ]));
+        assert!(closer_lags_in_joined_text(&[
+            b"[[1".to_vec(),
+            b"]".to_vec()
+        ]));
+        // A mismatched closer faults, and an unclosed text has no closer at its end.
+        assert!(!closer_lags_in_joined_text(&[b"[1}".to_vec()]));
+        assert!(!closer_lags_in_joined_text(&[b"[1".to_vec()]));
+    }
+
     #[test]
     fn closing_event_lags_matches_jq_6646() {
         for (text, lags) in [
