@@ -43,10 +43,7 @@ use succinctly::yaml::{
     YamlIndex, YamlValue,
 };
 
-use super::m2_gate::{
-    array_holds_the_document, can_use_m2_streaming, eval_all_matches_per_document,
-    is_array_of_nodes,
-};
+use super::m2_gate::{can_use_m2_streaming, eval_all_matches_per_document, is_array_of_nodes};
 use super::{FrontMatterMode, InputFormat, OutputFormat, YqCommand};
 use crate::front_matter;
 use crate::output::{
@@ -2590,10 +2587,8 @@ struct FallbackStreamState<'a> {
 /// An array of the document's own nodes (#3475, [`is_array_of_nodes`]) streams from their cursors, so
 /// a YAML document with an alias takes the DOM route instead: the streamers write an `*alias` whose
 /// `&anchor` the array does not hold, which the DOM route's soundness pass expands (CLAUDE.md:
-/// succinctly never emits YAML it cannot read back). So does a document with a comment when the
-/// array can hold the document itself ([`array_holds_the_document`]): its head and foot comments are
-/// written only by the DOM route. The comments between a sequence's items are the streamers' own
-/// since #6736.
+/// succinctly never emits YAML it cannot read back). The comments between a sequence's items, and a
+/// document's own foot comment, are the streamers' own since #6736 and #3475.
 fn needs_dom_fallback(
     sort_keys: bool,
     output_format: OutputFormat,
@@ -2604,9 +2599,7 @@ fn needs_dom_fallback(
     output_format == OutputFormat::Yaml
         && ((sort_keys && index.has_aliases())
             || sorts_a_mapping(expr, index, bytes)
-            || (is_array_of_nodes(expr)
-                && (index.has_aliases()
-                    || (index.has_comments() && array_holds_the_document(expr)))))
+            || (is_array_of_nodes(expr) && index.has_aliases()))
 }
 
 /// Whether `expr` is itself a `sort`, `sort_by`, `reverse`, `unique` or `unique_by`: on a
