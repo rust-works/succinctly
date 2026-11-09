@@ -77,3 +77,20 @@ fn test_jq_sub_still_refuses_a_comma_6769() -> Result<()> {
     assert_eq!((stdout.as_str(), code), ("", 3));
     Ok(())
 }
+
+/// A `def` of the same name (`--jq-extensions`, as yq has no `def`) takes the call, as it did before.
+#[test]
+fn test_yq_a_def_named_sub_or_with_dtf_still_takes_the_comma_call_6769() -> Result<()> {
+    for (filter, want) in [
+        ("def sub(a): \"mine\"; sub(\"a\", \"b\")", "\"mine\"\n"),
+        (
+            "def with_dtf(a): \"mine\"; with_dtf(\"a\", \"b\")",
+            "\"mine\"\n",
+        ),
+    ] {
+        let (stdout, code) =
+            run_yq_stdin(filter, "\"a\"\n", &["--jq-extensions", "-o=json", "-I=0"])?;
+        assert_eq!((stdout.as_str(), code), (want, 0), "{filter}");
+    }
+    Ok(())
+}

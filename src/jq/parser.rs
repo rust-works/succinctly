@@ -1979,8 +1979,9 @@ impl<'a> Parser<'a> {
     ///
     /// `first` is what `parse_expr` read before a `)`. Yq mode only: jq has no such spelling, and
     /// `succinctly jq` keeps refusing it. Anything but a comma of two or more is handed back.
-    fn split_yq_comma_arguments(&self, first: Expr) -> Result<(Expr, Expr), Expr> {
-        if self.mode != ParserMode::Yq {
+    fn split_yq_comma_arguments(&self, name: &str, first: Expr) -> Result<(Expr, Expr), Expr> {
+        // A `def` of the same name (`--jq-extensions` only) may take the one comma argument.
+        if self.mode != ParserMode::Yq || self.shadowable_defs.contains(name) {
             return Err(first);
         }
         let mut inner = &first;
@@ -6841,7 +6842,7 @@ impl<'a> Parser<'a> {
         let first = self.parse_expr()?;
         self.skip_ws();
         let first = if self.peek() == Some(')') {
-            match self.split_yq_comma_arguments(first) {
+            match self.split_yq_comma_arguments("with_dtf", first) {
                 Ok(pair) => {
                     self.next();
                     return Ok(Some(pair));
@@ -7832,7 +7833,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let re = if self.peek() == Some(')') {
                 // #6769: the comma spelling, `sub("a", "b")`.
-                match self.split_yq_comma_arguments(re) {
+                match self.split_yq_comma_arguments("sub", re) {
                     Ok((re, replacement)) => {
                         self.next();
                         return Ok(Some(Builtin::Sub(Box::new(re), Box::new(replacement))));
