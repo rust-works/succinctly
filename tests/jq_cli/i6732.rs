@@ -21,6 +21,16 @@ fn check(rows: &[Row<'_>]) -> Result<()> {
     for (name, text) in [
         ("p.json", "1"),
         ("one.json", "1"),
+        ("tru.json", "tru"),
+        ("x.json", "2x y"),
+        ("bom.json", "\u{feff}2 3"),
+        ("alpha.json", "ue 1"),
+        ("open.json", "\"ab"),
+        ("q.json", "\"a\" 1"),
+        ("dot5.json", ".5 1"),
+        ("e5.json", "5 1"),
+        ("comma.json", "2,3"),
+        ("close.json", "] 1"),
         ("empty.json", ""),
         ("pn.json", "1\n"),
         ("r2.json", "1 2"),
@@ -96,6 +106,22 @@ fn the_files_that_do_not_complete_the_event_keep_their_rows_6732() -> Result<()>
         (&["-c", "--stream-errors", "."][..], &["pn", "dir", "r2", "gone"][..], "[[],1]\n[[],1]\n", "jq: error: Is a directory\n", 2),
         (&["-c", "--stream-errors", "[inputs]"][..], &["p", "dir", "r2", "gone"][..], "[[[],2]]\n", "jq: error: Is a directory\njq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
         (&["-c", "--stream-errors", "halt_error"][..], &["p", "dir", "r2"][..], "", "jq: error: Is a directory\n[[],11]\n", 2),
+    ];
+    check(&rows)
+}
+
+/// What the first event is made of when the files before end in a number or a literal, or inside a
+/// string: a file that starts on a byte that continues the token, a byte-order mark in the middle of
+/// the stream, a delimiter, and a string left open. Rows that already matched jq stay as they were.
+#[test]
+fn the_first_event_after_an_open_token_matches_jq_6732() -> Result<()> {
+    #[rustfmt::skip]
+    let rows = [
+        (&["-c", "--stream-errors", "halt_error"][..], &["p", "dir", "bom", "gone"][..], "", "jq: error: Is a directory\n[\"Invalid numeric literal at line 1, column 6\",[]]\n", 2),
+        (&["-c", "--stream-errors", "halt_error"][..], &["tru", "dir", "r2", "gone"][..], "", "jq: error: Is a directory\n[\"Invalid literal at line 1, column 5\",[]]\n", 2),
+        (&["-c", "--stream-errors", "halt_error"][..], &["p", "dir", "dot5", "gone"][..], "", "jq: error: Is a directory\n[[],1.5]\n", 2),
+        (&["-c", "--stream-errors", "halt_error"][..], &["p", "dir", "e5", "gone"][..], "", "jq: error: Is a directory\n[[],15]\n", 2),
+        (&["-c", "--stream-errors", "halt_error"][..], &["p", "gone", "x", "dir"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n[\"Invalid numeric literal at line 1, column 4\",[]]\n", 2),
     ];
     check(&rows)
 }
