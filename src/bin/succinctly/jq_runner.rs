@@ -7044,7 +7044,8 @@ fn read_inputs(
             FAULT_AT_TAIL.with(|at| at.set(fault_reaches_end(&raws, args)));
         }
         any_open_failure = !failures.is_empty();
-        if let Some(&(at, ref failure)) = failures.first() {
+        if let Some(first) = failures.first() {
+            let (at, failure) = (first.0, &first.1);
             // #6646: the main loop ends at the read of a directory that delivers the closer the file
             // before it held back, so a directory in the middle is the read it stops at; its
             // message is placed past it, where the reader moves on.
@@ -7062,7 +7063,14 @@ fn read_inputs(
                 // end of the text.
                 || (failed_as_sources
                     && seq_by_stream_reader(args)
-                    && failure.kind == InputFileErrorKind::Directory { last: true });
+                    && failure.kind == InputFileErrorKind::Directory { last: true })
+                // #6732: and so does a last directory that takes the read delivering a closer the
+                // file before it held back: the fault a token left open across files ends the text
+                // in is then for the program's own reads, not the loop's.
+                || (failed_as_sources
+                    && plain_stream_errors(args)
+                    && failure.kind == InputFileErrorKind::Directory { last: true }
+                    && held_back_closer_before(args, &raws, &failures[0]));
             note_open_failure_at(at.saturating_sub(usize::from(held_back_at_directory)));
         }
         // #6475: under `-n` the program asks for each file as it goes, and says what it cannot
@@ -9957,10 +9965,68 @@ fn held_back_closer_before(
     let (at, ref error) = *failure;
     let own = if error.is_directory() { at - 1 } else { at };
     streams
-        && own
-            .checked_sub(1)
-            .and_then(|before| raws.get(before))
-            .is_some_and(|raw| closing_event_lags(raw, args.seq))
+        && own.checked_sub(1).is_some_and(|before| {
+            raws.get(before).is_some_and(|raw| {
+                closing_event_lags(raw, args.seq)
+                    // #6732: the files are one byte stream, so the closer may belong to a container
+                    // an earlier file left open, which the file alone is not a value of. A file
+                    // between, even an empty one, takes the read, so the closer is its own.
+                    || (plain_stream_errors(args)
+                        && !raw.is_empty()
+                        && !last_read_fills_buffer(raw)
+                        // A fault met before the end (`1` after a value with no separator) is raised
+                        // where it is, and the closer after it is not the read the directory takes.
+                        && !matches!(first_stream_fault(&raws[..=before]), Some((_, false)))
+                        && closer_lags_in_joined_text(&raws[..=before]))
+            })
+        })
+}
+
+/// Whether the text the files `raws` make, read as one stream, ends in a closing event the stream
+/// parser holds back (#6732): its last byte closes a container, and the byte before it is a
+/// scalar's. [`closing_event_lags`] asks the same of one file that is a whole value; here the closer
+/// may close a container an earlier file opened (`[` then `{"a":1}`, `[[` then `1]`), so the whole
+/// stream is scanned, and a text whose brackets do not match, which faults, does not lag.
+fn closer_lags_in_joined_text(raws: &[Vec<u8>]) -> bool {
+    let total: usize = raws.iter().map(Vec::len).sum();
+    let (mut open, mut in_string, mut escaped) = (Vec::new(), false, false);
+    let mut previous = 0u8;
+    for (at, &byte) in raws.iter().flatten().enumerate() {
+        if in_string {
+            match (escaped, byte) {
+                (true, _) => escaped = false,
+                (false, b'\\') => escaped = true,
+                (false, b'"') => in_string = false,
+                _ => {}
+            }
+            previous = byte;
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' => open.push(b']'),
+            b'{' => open.push(b'}'),
+            b']' | b'}' => {
+                if open.pop() != Some(byte) {
+                    return false;
+                }
+                if at + 1 == total {
+                    return !matches!(previous, b'[' | b'{' | b']' | b'}' | b',' | b':');
+                }
+            }
+            b' ' | b'\t' | b'\n' | b'\r' => continue,
+            _ => {}
+        }
+        previous = byte;
+    }
+    false
+}
+
+/// Whether the last read of the file `raw` fills jq's `fgets` buffer, so that a read of the same
+/// file that returns nothing follows it (#6760). One definition for [`closing_event_lags`] and the
+/// joined-text test of [`held_back_closer_before`] (#6732), which must agree on it.
+fn last_read_fills_buffer(raw: &[u8]) -> bool {
+    crate::jq_seq_reader::fgets_chunk_lens(raw).last() == Some(crate::jq_seq_reader::JQ_FGETS_CHUNK)
 }
 
 /// Whether the last record of the `--seq` text `raw` leaves jq's stream parser holding its closing
@@ -9974,9 +10040,7 @@ fn held_back_closer_before(
 fn closing_event_lags(raw: &[u8], seq: bool) -> bool {
     // A last read that fills jq's buffer is followed by a read of the same file that returns
     // nothing, and the closer comes out of that one, in the file itself (#6760).
-    if crate::jq_seq_reader::fgets_chunk_lens(raw).last()
-        == Some(crate::jq_seq_reader::JQ_FGETS_CHUNK)
-    {
+    if last_read_fills_buffer(raw) {
         return false;
     }
     let record = if seq {
@@ -18807,6 +18871,47 @@ mod tests {
         );
         let long = vec![b'1'; crate::jq_stream_errors::FIRST_EVENT_PREFIX_LIMIT + 10];
         assert_eq!(first_event_completing_file(&[long, b"1\n".to_vec()]), None);
+    }
+
+    #[test]
+    fn the_joined_text_lag_agrees_with_the_single_file_lag_on_whole_values_6732() {
+        // Two predicates answer "does this closer lag": `closing_event_lags` for one file that is a
+        // whole value, `closer_lags_in_joined_text` for the stream the files make. On a whole value
+        // they must agree, or a change to one desynchronises the two.
+        for text in [
+            "[1]",
+            "{\"a\":\"b\"}",
+            "[[],1]",
+            "[1,2]",
+            "[]",
+            "[[1]]",
+            "{\"a\":{}}",
+            "[1]\n",
+            "[\"]\"]",
+            "{\"a\":\"x}\"}",
+            "[1 ]",
+            "[true]",
+            "[null,\"a\\\"b\"]",
+            "  [1]",
+        ] {
+            assert_eq!(
+                closer_lags_in_joined_text(&[text.as_bytes().to_vec()]),
+                closing_event_lags(text.as_bytes(), false),
+                "{text:?}"
+            );
+        }
+        // A closer that finishes a container another file opened lags with the joined text only.
+        assert!(closer_lags_in_joined_text(&[
+            b"[[".to_vec(),
+            b"1]".to_vec()
+        ]));
+        assert!(closer_lags_in_joined_text(&[
+            b"[[1".to_vec(),
+            b"]".to_vec()
+        ]));
+        // A mismatched closer faults, and an unclosed text has no closer at its end.
+        assert!(!closer_lags_in_joined_text(&[b"[1}".to_vec()]));
+        assert!(!closer_lags_in_joined_text(&[b"[1".to_vec()]));
     }
 
     /// #6646: which `--seq` texts leave a closing event held back, each shape captured from jq
