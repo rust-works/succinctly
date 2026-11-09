@@ -729,6 +729,11 @@ struct Parser<'a, const HAS_CR: bool> {
     /// (`---` / `&a` / `---` / `x` is two documents: a property is content, though it writes no
     /// node).
     leading_run_from: usize,
+    /// With `yq_mode`, the stream has no head at all (#5357): yq's slurp found nothing to set aside
+    /// because the input began with a byte-order mark, so go-yaml reads every line, and no line is
+    /// "more of the head" (`only_yq_header_lines_since` is never true). `---` / `---` / `x` is then
+    /// a null document and `x`, as in the spec.
+    yq_no_head: bool,
 }
 
 impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
@@ -810,6 +815,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             saw_non_header_directive: false,
             documents_started: 0,
             leading_run_from: 0,
+            yq_no_head: false,
             #[cfg(debug_assertions)]
             wrapper_slots: Vec::with_capacity(estimated_opens),
             #[cfg(debug_assertions)]
@@ -9812,6 +9818,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// a leading `---` and the next one when the second is more of yq's header (#6349). A node
     /// property (`&a`, `!!str`) is not header, though it writes no node of its own.
     fn only_yq_header_lines_since(&self, from: usize) -> bool {
+        if self.yq_no_head {
+            return false;
+        }
         let mut i = from;
         let end = self.pos.min(self.input.len());
         while i < end {
@@ -11136,6 +11145,23 @@ pub fn build_semi_index_yq(input: &[u8]) -> Result<SemiIndex, YamlError> {
     )
 }
 
+/// [`build_semi_index_yq`] for text whose UTF-8 byte-order mark was dropped (#5357): yq's header
+/// slurp finds no head behind a mark, so no line is read as more of it. See `Parser::yq_no_head`.
+///
+/// # Errors
+///
+/// As [`build_semi_index`].
+pub fn build_semi_index_yq_no_head(input: &[u8]) -> Result<SemiIndex, YamlError> {
+    build_semi_index_impl(
+        input,
+        BuildMode {
+            yq_mode: true,
+            yq_no_head: true,
+            ..BuildMode::default()
+        },
+    )
+}
+
 /// [`build_semi_index`], enforcing real yq's own `-p json` grammar (#2279,
 /// #2778, #2777) -- for callers that already know the bytes are JSON and
 /// pair this with
@@ -11167,6 +11193,8 @@ struct BuildMode {
     json_strict: bool,
     /// `Parser::yq_mode`.
     yq_mode: bool,
+    /// `Parser::yq_no_head`.
+    yq_no_head: bool,
 }
 
 fn build_semi_index_impl(input: &[u8], mode: BuildMode) -> Result<SemiIndex, YamlError> {
@@ -11188,11 +11216,13 @@ fn build_semi_index_impl(input: &[u8], mode: BuildMode) -> Result<SemiIndex, Yam
         let mut p = Parser::<true>::new(input);
         p.json_strict = mode.json_strict;
         p.yq_mode = mode.yq_mode;
+        p.yq_no_head = mode.yq_no_head;
         p.parse()
     } else {
         let mut p = Parser::<false>::new(input);
         p.json_strict = mode.json_strict;
         p.yq_mode = mode.yq_mode;
+        p.yq_no_head = mode.yq_no_head;
         p.parse()
     }
 }
@@ -11260,6 +11290,49 @@ mod tests {
                 count(crate::yaml::YamlIndex::build(yaml).unwrap()),
                 spec_docs,
                 "build {:?}",
+                String::from_utf8_lossy(yaml)
+            );
+        }
+    }
+
+    /// #5357: behind a byte-order mark yq's header slurp finds no head, so no line is "more of the
+    /// head": a run of leading `---` markers is a null document per marker, as the YAML spec reads
+    /// it (the document counts of `build`), and the index has no header. A `...` that opens the
+    /// stream is still the first token go-yaml sees, which has no node to close, so it stays an
+    /// error; the rest of yq's reading (a tab, a directive without its `---`) is `build_yq`'s.
+    #[test]
+    fn test_after_a_bom_the_leading_markers_are_not_a_head_5357() {
+        for yaml in [
+            &b"---\n---\nx\n"[..],
+            b"---\n---\n",
+            b"---\n---\n---\nx\n",
+            b"---\n# c\n---\nx\n",
+            b"---\n--- x\ny\n",
+            b"---\nx\n",
+            b"x\n---\n---\ny\n",
+        ] {
+            let docs = |index: crate::yaml::YamlIndex| index.document_starts().len();
+            assert_eq!(
+                docs(crate::yaml::YamlIndex::build_yq_after_bom(yaml).unwrap()),
+                docs(crate::yaml::YamlIndex::build(yaml).unwrap()),
+                "{:?}",
+                String::from_utf8_lossy(yaml)
+            );
+        }
+        // The head's other rules go with it: `...` after a leading `---` closes an empty document
+        // here, where `build_yq` reads the `---` as head and has nothing for `...` to close.
+        let yaml = b"---\n...\n---\nx\n";
+        let docs = |index: crate::yaml::YamlIndex| index.document_starts().len();
+        assert_eq!(
+            docs(crate::yaml::YamlIndex::build_yq_after_bom(yaml).unwrap()),
+            2
+        );
+        assert!(crate::yaml::YamlIndex::build_yq(yaml).is_err());
+        // Still an error with nothing before it.
+        for yaml in [&b"...\n"[..], b"\n...\n", b"# c\n...\n"] {
+            assert!(
+                crate::yaml::YamlIndex::build_yq_after_bom(yaml).is_err(),
+                "{:?}",
                 String::from_utf8_lossy(yaml)
             );
         }

@@ -621,15 +621,26 @@ the parser accepts, or in how a plain scalar's type resolves against a published
 below that line: it is settled by the spec succinctly targets and recorded on the relevant
 spec page, not by a rule-4 carve-out. This section exists so the case is not mistaken for one.
 
-### A leading byte-order mark is skipped, but yq's leading `---` echo differs after one (#5356)
+### A leading byte-order mark is skipped, and yq's header slurp finds nothing after one (#5356, #5357)
 
 A UTF-8 byte-order mark at the front of a YAML file is dropped from each input before it is indexed, as yq does.
 Every claim here was captured from yq v4.53.3 and is pinned by `tests/yq_cli/i5356.rs`.
 That covers stdin, files, `--eval-all`, `-i`, `load()`, and a file that holds only the mark, which counts as an empty file.
 A mark that is not at the front of a file stays data, and a JSON document with a mark is refused, as in yq.
 `yq-locate` and `at_offset`/`at_position` count from the first byte after the mark.
-yq prints no leading `---` for a BOM-prefixed file whose first line is `---`, where the same file without the mark prints it.
-This prints it in both cases ([#5357](https://github.com/rust-works/succinctly/issues/5357)).
+yq's default `--header-preprocess` looks for its leading blank, comment, `%YAML` and `---` lines at the first byte of the input, and a mark is not one of them.
+A BOM-prefixed file therefore has no header: yq decodes it as an ordinary stream, as `--header-preprocess=false` reads the same text (which this does not implement).
+The first document's explicit `---` is read, not echoed, so a file whose first line is `---` prints without it where the same file without the mark prints it.
+`---` / `---` / `x` is a null document and then `x`, blank lines and a comment's indent ahead of the first content are normalised away, and a text with no content is one empty document, a blank line.
+The streaming routes read it that way ([#5357](https://github.com/rust-works/succinctly/issues/5357), `tests/yq_cli/i5357.rs`): stdin and files, with `.`, `-N`, `-I=0`, `-o=json` and a path.
+Each file is judged on its own, so a mark on the second file leaves it no header while the first keeps its own.
+These shapes still differ from yq after a mark, each captured from v4.53.3:
+- The DOM routes (`-P`, a write such as `.a = 2`, `-i`) keep the header model and still echo the leading `---`.
+- `line` and `column` count from the first line of the stream, where yq counts the `---` line (`---` / `a: 1` is line 2 in yq, 1 here).
+- `head_comment` of a comment in front of a first `---` is the comment here, empty in yq.
+- A first document written on its marker line (`--- # c`, `--- !!map`, `--- |`) is not read as yq reads it: `--- # c` / `a: 1` prints `# c` / `a: 1` in yq.
+- `%YAML 1.2` as the first line is an error in yq (`found incompatible YAML document`), and is read here.
+- `---` / `...` is an empty document in yq (a blank line), and an error here.
 
 ### YAML 1.1 legacy numeric forms
 
