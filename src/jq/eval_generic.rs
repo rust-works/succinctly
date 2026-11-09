@@ -29543,8 +29543,6 @@ fn path_iterate_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>
                     let Some(key) = key_display_string(&field.key) else {
                         return Err(fields.malformed_member_error()); // patchcov: coverage tolerate-line reason="unreachable: effective_fields_checked already rejects key_is_malformed, the same decoded_key_str Ok(None) that makes key_display_string return None (#3022)"
                     };
-                    // A literal `<<` entry (two merge sources that each merge) is no member's value.
-                    let literal_merge_key = &*key == "<<";
                     if matches!(
                         emit(
                             // #3023: the owned key is only built for a trail
@@ -29558,17 +29556,7 @@ fn path_iterate_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>
                                     }
                                 },
                                 node,
-                                || {
-                                    (!literal_merge_key)
-                                        .then(|| {
-                                            merged_member_location::<S, V>(
-                                                &fields,
-                                                c,
-                                                &field.value_cursor,
-                                            )
-                                        })
-                                        .flatten()
-                                },
+                                || merged_member_location::<S, V>(&fields, c, &field.value_cursor),
                             ),
                             PathNode::At(field.value_cursor),
                             Some((field.key_cursor, &field.key)),
@@ -47776,6 +47764,45 @@ mod tests {
     }
 
     // ========== YAML Tests ==========
+
+    /// #6723: only a member a `<<` merge brought in has a location apart from its mapping's own,
+    /// and only in yq mode; a mapping's own member (`k`) skips the climb, and an index that merges
+    /// nothing never builds the fields that would answer.
+    #[test]
+    fn merged_member_location_is_only_for_a_member_the_mapping_does_not_hold_6723() {
+        use crate::yaml::{YamlIndex, YamlValue};
+
+        let yaml = b"a: &a {x: 1}\nitem: {<<: *a, k: 0}\nplain: {q: 1}\n";
+        let index = YamlIndex::build_yq(yaml).unwrap();
+        let top = index.root(yaml).first_child().expect("a document");
+        use crate::yaml::{YamlCursor, YamlFields};
+        fn named<'a>(parent: &YamlCursor<'a>, name: &str) -> (YamlFields<'a>, YamlCursor<'a>) {
+            let fields = parent.value().as_object().expect("a mapping");
+            let found = DocumentFields::find_cursor(&fields, name).unwrap();
+            (fields, found.expect("a member"))
+        }
+        let (_, item) = named(&top, "item");
+        let (fields, x) = named(&item, "x");
+        let (_, k) = named(&item, "k");
+        let located = merged_member_location::<YqSemantics, YamlValue<'_>>(&fields, &item, &x);
+        let (path, ancestors, members) = located.expect("the anchor's location");
+        assert_eq!(
+            path,
+            [OwnedValue::from("a"), OwnedValue::from("x")],
+            "a merged member is named by its anchor"
+        );
+        assert_eq!((ancestors.len(), members), (2, vec![true, true]));
+        assert!(merged_member_location::<YqSemantics, YamlValue<'_>>(&fields, &item, &k).is_none());
+        // jq has no merge key, and a mapping that merges nothing has no merged member to place.
+        assert!(merged_member_location::<JqSemantics, YamlValue<'_>>(&fields, &item, &x).is_none());
+        let (_, plain) = named(&top, "plain");
+        let (plain_fields, q) = named(&plain, "q");
+        assert!(!plain_fields.is_merge_resolved() && fields.is_merge_resolved());
+        assert!(
+            merged_member_location::<YqSemantics, YamlValue<'_>>(&plain_fields, &plain, &q)
+                .is_none()
+        );
+    }
 
     #[test]
     fn test_yaml_generic_identity() {
