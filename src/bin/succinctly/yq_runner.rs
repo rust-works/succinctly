@@ -4728,7 +4728,12 @@ fn collect_assign_chain(expr: &Expr) -> Option<Vec<(&Expr, &Expr)>> {
 /// `Declares` left anywhere — `enforce_anchor_soundness` then drops both
 /// (rule 4(a), `a: 1` / `b: 1`, recorded in
 /// `docs/compliance/yq/limitations.md` next to the `del(.a)` example).
-fn propagate_assign_alias_marks(expr: &Expr, value: &OwnedValue, tree: &mut CommentTree) {
+fn propagate_assign_alias_marks(
+    expr: &Expr,
+    value: &OwnedValue,
+    pristine: Option<&CommentTree>,
+    tree: &mut CommentTree,
+) {
     let Some(stages) = collect_assign_chain(expr) else {
         return;
     };
@@ -4736,7 +4741,7 @@ fn propagate_assign_alias_marks(expr: &Expr, value: &OwnedValue, tree: &mut Comm
     // element leaves as long as it was, so a lone plain assignment resolves it against the
     // finished value. With more stages a later write may have grown the array (#5407).
     let resolve = stages.len() == 1 && is_plain_assign_chain(expr);
-    for (path_expr, value_expr) in stages {
+    for (stage, (path_expr, value_expr)) in stages.into_iter().enumerate() {
         let resolved = resolve
             .then(|| resolve_negative_indices(path_expr, value))
             .flatten();
@@ -4748,14 +4753,21 @@ fn propagate_assign_alias_marks(expr: &Expr, value: &OwnedValue, tree: &mut Comm
         // mark `.c` held going in. A negative index counts from the end of the node's array
         // (#2505), which only the tree can say, so the source walks the tree rather than a
         // path ([`static_nav_steps`] declines `.[-1]`).
-        let source = nav_node(tree, value_expr)
+        // The first stage reads the document as it came in, so a target that replaces the node
+        // it reads (`.b = [.b]`) still finds the source's mark there (#6716); a later stage
+        // reads what an earlier one wrote.
+        let reading: &CommentTree = match (stage, pristine) {
+            (0, Some(pristine)) => pristine,
+            _ => tree,
+        };
+        let source = nav_node(reading, value_expr)
             .filter(|node| contains_alias_mark(node))
             .cloned();
         // A construction of static reads (`.c = [.b]`, `.c = {"z": .b}`) is a node of its own whose
         // children are copies of the nodes it reads, so each alias among them stays one at its
         // slot (#5249). The slots are read before any target is written, like the source above.
         let slots: Option<Vec<(Vec<TreeStep<'_>>, CommentTree)>> =
-            construction_alias_slots(tree, value_expr).map(|found| {
+            construction_alias_slots(reading, value_expr).map(|found| {
                 found
                     .into_iter()
                     .map(|(steps, node)| (steps, node.clone()))
@@ -8139,8 +8151,9 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
     // whether the mark this pass adds is safe to keep.
     if has_aliases && presentation_sync_ctx.is_some() {
         if let Ok(docs) = &mut docs {
+            let pristine_tree = presentation_sync_ctx.as_ref().map(|(_, tree)| tree);
             for (value, comments) in docs.iter_mut() {
-                propagate_assign_alias_marks(pass_expr, value, comments);
+                propagate_assign_alias_marks(pass_expr, value, pristine_tree, comments);
             }
         }
     }
