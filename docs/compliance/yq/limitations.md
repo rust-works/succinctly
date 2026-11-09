@@ -633,14 +633,14 @@ A BOM-prefixed file therefore has no header: yq decodes it as an ordinary stream
 The first document's explicit `---` is read, not echoed, so a file whose first line is `---` prints without it where the same file without the mark prints it.
 `---` / `---` / `x` is a null document and then `x`, blank lines and a comment's indent ahead of the first content are normalised away, and a text with no content is one empty document, a blank line.
 The streaming routes read it that way ([#5357](https://github.com/rust-works/succinctly/issues/5357), `tests/yq_cli/i5357.rs`): stdin and files, with `.`, `-N`, `-I=0`, `-o=json` and a path.
+The routes that gather a source before indexing it do too ([#6762](https://github.com/rust-works/succinctly/issues/6762), `tests/yq_cli/i6762.rs`): `-P`, a write such as `.a = 2`, `-i`, `--eval-all` and `--slurp`.
+There the first document has no preamble to print back, `line` and `column` count every line (`---` / `a: 1` is line 2), and the blank lines or the marker between a head comment and the content are not part of the comment.
 Each file is judged on its own, so a mark on the second file leaves it no header while the first keeps its own.
 These shapes still differ from yq after a mark, each captured from v4.53.3:
-- The DOM routes (`-P`, a write such as `.a = 2`, `-i`) keep the header model and still echo the leading `---`.
-- `line` and `column` count from the first line of the stream, where yq counts the `---` line (`---` / `a: 1` is line 2 in yq, 1 here).
 - `head_comment` of a comment in front of a first `---` is the comment here, empty in yq.
-- A first document written on its marker line (`--- # c`, `--- !!map`, `--- |`) is not read as yq reads it: `--- # c` / `a: 1` prints `# c` / `a: 1` in yq.
+- A first document written on its marker line (`--- # c`, `--- !!map`, `--- |`) is not read as yq reads it: `--- # c` / `a: 1` prints `# c` / `a: 1` in yq, `--- !!map` / `a: 1` prints `!!map` / `a: 1`, and `--- |` / `  x` is a parse error here.
 - `%YAML 1.2` as the first line is an error in yq (`found incompatible YAML document`), and is read here.
-- `---` / `...` is an empty document in yq (a blank line), and an error here.
+- A text with only a comment prints a blank line on the streaming routes, as in yq, and still prints the comment (or, for a write, keeps it above the result) on the DOM routes.
 
 ### YAML 1.1 legacy numeric forms
 

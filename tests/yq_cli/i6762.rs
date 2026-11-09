@@ -119,6 +119,12 @@ fn test_eval_all_reads_a_bom_file_with_no_header_6762() -> Result<()> {
         ("---\na: 1\n---\na: 2\n", "[.a, (.a | line)]", "[1,2,2,4]\n"),
         ("# c\n---\na: 1\n", ".a | line", "3\n"),
         ("---\na: 1\n---\nb: 2\n", ".", "{\"a\":1}\n{\"b\":2}\n"),
+        // A run of leading markers is a null document and then the next: the documents are counted
+        // so, and `line` finds the second one's node.
+        ("---\n---\na: 1\n", ".", "null\n{\"a\":1}\n"),
+        ("---\n---\na: 1\n", "document_index", "0\n1\n"),
+        ("---\n---\na: 1\n", "[.a, (.a | line)]", "[1,3]\n"),
+        ("---\n...\n---\na: 1\n", "[.a, (.a | line)]", "[1,4]\n"),
     ] {
         let (stdout, code) = run_yq_stdin(filter, &format!("{BOM}{text}"), &extra)?;
         assert_eq!((stdout.as_str(), code), (want, 0), "{filter} on {text:?}");
@@ -136,5 +142,17 @@ fn test_the_sort_keys_alias_fallback_reads_a_bom_source_with_no_header_6762() ->
         &["--sort-keys"],
     )?;
     assert_eq!((stdout.as_str(), code), ("a: 1\nb: &x 1\n", 0));
+    Ok(())
+}
+
+#[test]
+fn test_slurp_reads_a_bom_file_with_no_header_6762() -> Result<()> {
+    // Captured from `yq ea '[.]'`: a run of leading markers is a null document and then the next.
+    let (stdout, code) = run_yq_stdin(
+        ".",
+        &format!("{BOM}---\n---\na: 1\n"),
+        &["--slurp", "-o=json", "-I=0"],
+    )?;
+    assert_eq!((stdout.as_str(), code), ("[null,{\"a\":1}]\n", 0));
     Ok(())
 }
