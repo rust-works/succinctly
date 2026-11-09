@@ -562,8 +562,8 @@ struct SeqMode {
     slurp: bool,
     /// Whether a parse error is an input of its own (`--stream-errors`).
     errors_are_events: bool,
-    /// Whether the program reads inputs of its own, which meet the end-of-stream stop as a
-    /// barrier (#6141).
+    /// Whether the reads go through the input queue, which meets the end-of-stream stop as a barrier
+    /// (#6141). A slurp never stops there, so this says nothing under `slurp`.
     stop_is_barrier: bool,
 }
 
