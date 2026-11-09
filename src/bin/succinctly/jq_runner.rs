@@ -7001,9 +7001,14 @@ fn read_inputs(
     // #6730: so does a slurp by the streaming parser (`-s --stream`, `-s --stream-errors`): each file
     // that did not open is one more read of the stream, an empty one, and the fault a token left open
     // across files ends in comes with the read of the last, not of the first.
+    // #6773: so does `--seq -s --stream-errors`, whose fault is an event of the stream: a record left
+    // open meets it at the read of the last file that failed, which a failed file in the middle
+    // is one of. (`--seq -s --stream` keeps the failed file out of the sources: its fault is a
+    // warning placed by [`seq_slurp_places_failures`], #6764.)
     let failed_as_sources = (((plain_stream_errors(args) || seq_by_stream_reader(args))
         && !args.slurp)
-        || slurp_by_stream_parser(args))
+        || slurp_by_stream_parser(args)
+        || (seq_by_stream_reader(args) && args.slurp && args.stream_errors))
         && !args.validate;
     let (files, mut raw_bytes): OpenedInputs = if let Some(bytes) = read_whole {
         // Stdin is the one source with no file index.
@@ -7418,6 +7423,11 @@ fn read_inputs(
         // before this one (`failed_as_sources`), and the last of them is pushed here.
         || (args.validate && slurp_by_stream_parser(args)))
         && UNOPENED_TAIL_NAME.with(|tail| tail.borrow().is_some())
+        // #6773: a failed file that is a source of the read (`failed_as_sources`) has been given
+        // its tail already, and a second one would be one more read of the stream.
+        && !raw_bytes
+            .iter()
+            .any(|(source, _)| *source == Some(files.len()))
     {
         raw_bytes.push((Some(files.len()), Vec::new()));
     }
