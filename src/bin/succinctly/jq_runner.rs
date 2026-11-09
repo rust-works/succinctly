@@ -7901,6 +7901,11 @@ fn read_inputs(
                 })
             })
             .flatten();
+        debug_assert_eq!(
+            values.len(),
+            value_locations.len(),
+            "one location per value"
+        );
         let last = value_locations.len().saturating_sub(1);
         for (index, &at) in value_locations.iter().enumerate() {
             let (source, line) = if fault_at_tail && index == last {
