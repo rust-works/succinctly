@@ -1178,7 +1178,7 @@ fn empty_input_reads_as(
         front_matter,
         glue_leading_marker,
     )
-    .map(|(bytes, format, _synthesized)| (bytes, format))
+    .map(|(bytes, format, _synthesized, _had_bom)| (bytes, format))
 }
 
 thread_local! {
@@ -1199,7 +1199,7 @@ fn read_input_noting_empty_document(
     at: usize,
     front_matter: bool,
     glue_leading_marker: bool,
-) -> Option<(Vec<u8>, InputFormat)> {
+) -> Option<(Vec<u8>, InputFormat, bool)> {
     empty_input_reads_as_flagged(
         bytes,
         format,
@@ -1208,12 +1208,59 @@ fn read_input_noting_empty_document(
         front_matter,
         glue_leading_marker,
     )
-    .map(|(bytes, format, synthesized)| {
+    .map(|(bytes, format, synthesized, had_bom)| {
         if synthesized {
             EMPTY_DOCUMENT_RUN.with(|run| run.set(true));
         }
-        (bytes, format)
+        (bytes, format, had_bom)
     })
+}
+
+/// Whether `text` holds one document and no content: blank lines, `#` comment lines and at most
+/// one `---` marker line (#5357). A tab or a `\r` is not blank here, so those keep the route they
+/// had.
+fn holds_no_content(text: &[u8]) -> bool {
+    let mut markers = 0;
+    for line in text.split(|&b| b == b'\n') {
+        let end = line.iter().rposition(|&b| b != b' ').map_or(0, |at| at + 1);
+        let line = &line[..end];
+        let indent = line.iter().position(|&b| b != b' ').unwrap_or(line.len());
+        if line.get(indent).map_or(true, |&b| b == b'#') {
+            continue;
+        }
+        markers += usize::from(line == b"---");
+        if line != b"---" || markers > 1 {
+            return false;
+        }
+    }
+    true
+}
+
+/// The index of a YAML source `succinctly yq` reads (#5357): `had_bom` is whether a byte-order mark
+/// was dropped from its front, which leaves yq no header to set aside (see
+/// [`YamlIndex::build_yq_after_bom`]).
+fn build_yq_source(
+    bytes: &[u8],
+    had_bom: bool,
+) -> Result<YamlIndex<Vec<u64>>, succinctly::yaml::YamlError> {
+    if had_bom {
+        YamlIndex::build_yq_after_bom(bytes)
+    } else {
+        YamlIndex::build_yq(bytes)
+    }
+}
+
+/// `bytes` and `had_bom` for a source the streaming routes index (#5357). With no header, a text
+/// that holds no content is yq's one empty document, which it prints as a blank line (the comments
+/// of a comment-only one are lost with the mark in front of them), where an index of such a text
+/// prints nothing or its comment. A line break is the empty document the header route prints as
+/// exactly that.
+fn settle_bom_source(bytes: Vec<u8>, had_bom: bool) -> (Vec<u8>, bool) {
+    if had_bom && !bytes.is_empty() && holds_no_content(&bytes) {
+        (b"\n".to_vec(), false)
+    } else {
+        (bytes, had_bom)
+    }
 }
 
 /// Tells an index built from the empty document the run made up that it was (#5008).
@@ -1239,8 +1286,10 @@ fn eval_all_names_scope() -> Option<jq::FileNamesScope> {
         .then(|| jq::enter_file_names_scope(Vec::new()))
 }
 
-/// [`empty_input_reads_as`] with a third element: whether the document is the synthesized empty
-/// one (the input held none), not one the input spelled.
+/// [`empty_input_reads_as`] with two more elements: whether the document is the synthesized empty
+/// one (the input held none), not one the input spelled, and whether a UTF-8 byte-order mark was
+/// dropped from the front of a YAML input that still holds a document (#5357), which yq reads as
+/// an input with no header (see [`YamlIndex::build_yq_after_bom`]).
 fn empty_input_reads_as_flagged(
     mut bytes: Vec<u8>,
     format: InputFormat,
@@ -1248,14 +1297,17 @@ fn empty_input_reads_as_flagged(
     at: usize,
     front_matter: bool,
     glue_leading_marker: bool,
-) -> Option<(Vec<u8>, InputFormat, bool)> {
+) -> Option<(Vec<u8>, InputFormat, bool, bool)> {
+    let mut had_bom = false;
     // #5356: yq reads past a UTF-8 byte-order mark at the front of a YAML stream, each file
     // being a stream of its own; it was becoming part of the first key. A JSON document with
     // one is `invalid character 'ï'` in yq, so JSON keeps its mark and is refused as before.
     // Done here, where every route's bytes pass before anything is indexed, and ahead of the
     // emptiness test: a file that is only the mark reads as an empty one.
     if format != InputFormat::Json {
-        bytes.drain(..crate::front_matter::leading_bom_len(&bytes));
+        let bom_len = crate::front_matter::leading_bom_len(&bytes);
+        bytes.drain(..bom_len);
+        had_bom = bom_len > 0;
         // #6276: the break after a leading `--- text` line is lost to yq's header slurp. Not under
         // `--front-matter`, whose own extraction reads the input first and was not captured.
         if !front_matter && glue_leading_marker {
@@ -1273,7 +1325,9 @@ fn empty_input_reads_as_flagged(
         }
     }
     if !holds_no_document(&bytes, format) || front_matter {
-        return Some((bytes, format, false));
+        // Under `--front-matter` the extraction reads the input first, and a BOM there was not
+        // captured: it keeps the header model it had.
+        return Some((bytes, format, false, had_bom && !front_matter));
     }
     // `at == 0` first: it settles every input but the first without opening a file.
     (at == 0
@@ -1282,8 +1336,8 @@ fn empty_input_reads_as_flagged(
                 .iter()
                 .all(|file| input_file_holds_no_document_bytes(file, format))))
     .then(|| match format {
-        InputFormat::Json => (b"\n".to_vec(), InputFormat::Yaml, true),
-        _ => (b"\n".to_vec(), format, true),
+        InputFormat::Json => (b"\n".to_vec(), InputFormat::Yaml, true, false),
+        _ => (b"\n".to_vec(), format, true, false),
     })
 }
 
@@ -1918,7 +1972,9 @@ fn gather_input_sources(
     let mut sources = Vec::new();
     let resolved_format = resolve_run_input_format(input_format, input_files);
     if input_files.is_empty() {
-        let (raw_bytes, resolved_format) = read_input_noting_empty_document(
+        // #5357: the BOM flag is for the streaming routes, which index a source right after reading it;
+        // a gathered source is indexed later, by routes that do not carry it.
+        let (raw_bytes, resolved_format, _had_bom) = read_input_noting_empty_document(
             read_stdin()?,
             resolved_format,
             input_files,
@@ -1926,7 +1982,7 @@ fn gather_input_sources(
             front_matter.is_some(),
             true,
         )
-        .unwrap_or_else(|| (Vec::new(), resolved_format));
+        .unwrap_or_else(|| (Vec::new(), resolved_format, false));
         let (input_bytes, format, body) =
             apply_front_matter(raw_bytes, resolved_format, front_matter, "<stdin>")?;
         let input_bytes = substitute_json_utf8(input_bytes, format, output_format);
@@ -1940,7 +1996,7 @@ fn gather_input_sources(
             if is_drained_stdin_file_argument(path) {
                 continue;
             }
-            let Some((raw_bytes, resolved_format)) = read_input_noting_empty_document(
+            let Some((raw_bytes, resolved_format, _had_bom)) = read_input_noting_empty_document(
                 read_file(path)?,
                 resolved_format,
                 input_files,
@@ -12055,7 +12111,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
 
         if input_files.is_empty() {
             let fmt = resolve_input_format(args.input_format, None);
-            let (yaml_bytes, fmt) = read_input_noting_empty_document(
+            let (yaml_bytes, fmt, had_bom) = read_input_noting_empty_document(
                 read_stdin()?,
                 fmt,
                 &input_files,
@@ -12063,13 +12119,13 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 args.front_matter.is_some(),
                 true,
             )
-            .unwrap_or_else(|| (Vec::new(), fmt));
+            .unwrap_or_else(|| (Vec::new(), fmt, false));
             // #1616: a `-p json` document's invalid UTF-8, for JSON output.
             let yaml_bytes = substitute_json_utf8(yaml_bytes, fmt, args.output_format);
             if let Some(code) = yaml_validate_guard(&yaml_bytes, fmt, args.validate, None) {
                 return Ok(code);
             }
-            let mut yaml_bytes = yaml_bytes;
+            let (mut yaml_bytes, had_bom) = settle_bom_source(yaml_bytes, had_bom);
             let mut index = if fmt == InputFormat::Json {
                 // #2279: see `evaluate_yaml_direct_filtered`'s own call.
                 // #2839: several top-level values are several documents.
@@ -12080,7 +12136,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 }
                 index
             } else {
-                YamlIndex::build_yq(&yaml_bytes)
+                build_yq_source(&yaml_bytes, had_bom)
                     .map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?
             };
             // #2795: `-N` also drops the `---` lines of the first
@@ -12262,7 +12318,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 // `yaml_validate_guard`/`YamlIndex::build` returns just
                 // below) -- `flush_then_err` keeps this error as the
                 // reported one even if the flush also fails.
-                let (yaml_bytes, fmt) = match read_file(path) {
+                let (yaml_bytes, fmt, had_bom) = match read_file(path) {
                     Ok(bytes) => match read_input_noting_empty_document(
                         bytes,
                         // #4394: the first file's extension decides for all of them.
@@ -12299,7 +12355,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                     return Ok(code);
                 }
                 // #2279: see `evaluate_yaml_direct_filtered`'s own call.
-                let mut yaml_bytes = yaml_bytes;
+                let (mut yaml_bytes, had_bom) = settle_bom_source(yaml_bytes, had_bom);
                 let built = if fmt == InputFormat::Json {
                     build_json_sourced_streaming(&yaml_bytes).map(|(index, stream)| {
                         if let Some(stream) = stream {
@@ -12308,7 +12364,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                         index
                     })
                 } else {
-                    YamlIndex::build_yq(&yaml_bytes)
+                    build_yq_source(&yaml_bytes, had_bom)
                 };
                 let mut index = match built {
                     Ok(index) => index,
@@ -13089,7 +13145,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             }
             // #4394: the first file's extension decides for all of them.
             let resolved_format = run_input_format;
-            let Some((raw_bytes, resolved_format)) = read_input_noting_empty_document(
+            let Some((raw_bytes, resolved_format, _had_bom)) = read_input_noting_empty_document(
                 read_file(path)?,
                 resolved_format,
                 &input_files,
@@ -13994,6 +14050,100 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #5357: a text holds no content when it is blank lines, `#` comment lines and at most one
+    /// `---` line; anything else (content, a second marker, a directive, a `...`, a tab, a `\r`) keeps
+    /// the route it had.
+    #[test]
+    fn test_holds_no_content_5357() {
+        for yes in [
+            "\n",
+            "\n\n",
+            "  \n",
+            "---",
+            "---\n",
+            "--- \n",
+            "\n---\n\n",
+            "# c",
+            "# c\n",
+            "  # c\n",
+            "# c\n\n---\n# d\n",
+        ] {
+            assert!(holds_no_content(yes.as_bytes()), "{yes:?}");
+        }
+        for no in [
+            "a: 1\n",
+            "---\n---\n",
+            "--- 5\n",
+            "---\na: 1\n",
+            "...\n",
+            "%YAML 1.2\n---\n",
+            "\t\n",
+            "\r\n",
+            "# c\n\r\n",
+            "  ---\n",
+            "----\n",
+            "- x\n",
+        ] {
+            assert!(!holds_no_content(no.as_bytes()), "{no:?}");
+        }
+    }
+
+    /// #5357: only a BOM-prefixed source with no content is rewritten, to the line break the header
+    /// route prints as a blank line, and then it is no longer read as a mark-led source.
+    #[test]
+    fn test_settle_bom_source_5357() {
+        assert_eq!(
+            settle_bom_source(b"---\n".to_vec(), true),
+            (b"\n".to_vec(), false)
+        );
+        assert_eq!(
+            settle_bom_source(b"# c\n".to_vec(), true),
+            (b"\n".to_vec(), false)
+        );
+        // Content keeps its bytes and its mark.
+        assert_eq!(
+            settle_bom_source(b"a: 1\n".to_vec(), true),
+            (b"a: 1\n".to_vec(), true)
+        );
+        // No mark: nothing changes, whatever the text.
+        assert_eq!(
+            settle_bom_source(b"---\n".to_vec(), false),
+            (b"---\n".to_vec(), false)
+        );
+        // Nothing at all is not rewritten (the synthesized empty document is the reader's).
+        assert_eq!(settle_bom_source(Vec::new(), true), (Vec::new(), true));
+    }
+
+    /// #5357: the reader reports a dropped mark for YAML that still holds a document, and only then.
+    #[test]
+    fn test_the_reader_reports_a_dropped_bom_5357() {
+        let read = |bytes: &[u8], format: InputFormat, front_matter: bool| {
+            empty_input_reads_as_flagged(bytes.to_vec(), format, &[], 0, front_matter, true)
+                .map(|(bytes, _format, synthesized, had_bom)| (bytes, synthesized, had_bom))
+        };
+        let bom = "\u{feff}---\na: 1\n".as_bytes();
+        assert_eq!(
+            read(bom, InputFormat::Yaml, false),
+            Some((b"---\na: 1\n".to_vec(), false, true))
+        );
+        // No mark, no flag.
+        assert_eq!(
+            read(b"---\na: 1\n", InputFormat::Yaml, false),
+            Some((b"---\na: 1\n".to_vec(), false, false))
+        );
+        // JSON keeps its mark (yq refuses it), and `--front-matter` keeps the header model.
+        assert_eq!(
+            read(bom, InputFormat::Json, false).map(|r| r.2),
+            Some(false)
+        );
+        assert_eq!(read(bom, InputFormat::Yaml, true).map(|r| r.2), Some(false));
+        // A file of only the mark is the synthesized empty document, which has no mark to report.
+        assert_eq!(
+            read("\u{feff}".as_bytes(), InputFormat::Yaml, false),
+            Some((b"\n".to_vec(), true, false))
+        );
     }
 
     /// Colors `yaml` through [`YamlColorizer`] in pieces: a piece ends at every one of `cuts`

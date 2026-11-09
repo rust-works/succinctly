@@ -1393,7 +1393,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// two apart.
     pub fn is_header_only_document(&self) -> bool {
         let self_ = self.resolve_bare_seq_item();
+        // After a byte-order mark there is no header to carry the line break (#5357).
         self_.is_document_content()
+            && !self_.index.after_bom()
             && self_.bp_pos == FIRST_DOCUMENT_BP
             && matches!(
                 self_.resolve_alias_target_cursor().unwrap_or(self_).value(),
@@ -19124,6 +19126,40 @@ plain: hello
                 .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
                 .unwrap();
             assert_eq!(out, "# lead\na: 1");
+        }
+
+        /// #5357: the text of a BOM-prefixed file once the mark is dropped has no header, so its
+        /// leading `---` is read, not re-emitted, and an empty first document prints as a document.
+        #[test]
+        fn after_a_bom_there_is_no_header_to_re_emit_5357() {
+            fn printed(index: &YamlIndex<Vec<u64>>, yaml: &[u8]) -> String {
+                let mut out = String::new();
+                index
+                    .root(yaml)
+                    .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
+                    .unwrap();
+                out
+            }
+            let yaml = b"---\na: 1\n";
+            let header = YamlIndex::build_yq(yaml).unwrap();
+            assert_eq!(printed(&header, yaml), "---\na: 1");
+            let bom = YamlIndex::build_yq_after_bom(yaml).unwrap();
+            assert!(bom.after_bom() && !header.after_bom());
+            assert_eq!(bom.yq_header(|| unreachable!("measured")), (0, false));
+            assert_eq!(printed(&bom, yaml), "a: 1");
+            // A leading comment is the document's own head comment, not a header.
+            let yaml = b"# c\n\na: 1\n";
+            let bom = YamlIndex::build_yq_after_bom(yaml).unwrap();
+            assert_eq!(printed(&bom, yaml), "# c\na: 1");
+            // The first document has no content: no header to carry its line break, so it is not
+            // "header only" there, where it is for a header-measuring index.
+            let yaml = b"---\n---\na: 1\n";
+            let bom = YamlIndex::build_yq_after_bom(yaml).unwrap();
+            let first = bom.root(yaml).first_child().expect("a document");
+            assert!(!first.is_header_only_document());
+            let header = YamlIndex::build_yq(b"---\n").unwrap();
+            let first = header.root(b"---\n").first_child().expect("a document");
+            assert!(first.is_header_only_document());
         }
 
         #[test]

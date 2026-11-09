@@ -21,7 +21,8 @@ use super::end_positions::EndPositions;
 use super::error::YamlError;
 use super::light::YamlCursor;
 use super::parser::{
-    build_semi_index, build_semi_index_json_strict, build_semi_index_yq, NodeComments, SemiIndex,
+    build_semi_index, build_semi_index_json_strict, build_semi_index_yq,
+    build_semi_index_yq_no_head, NodeComments, SemiIndex,
 };
 use super::starts_seq_entry;
 
@@ -121,6 +122,10 @@ pub struct YamlIndex<W = Vec<u64>> {
     /// [`Self::mark_synthesized_empty`]: its line break is not a blank line of the input, so a write over it
     /// prints none. Off by default.
     synthesized_empty: bool,
+    /// Whether the text was read as yq reads an input whose byte-order mark was dropped (#5357), set
+    /// by [`Self::build_yq_after_bom`]: there is no header, so a first document with no content
+    /// prints as a document of its own, not as the header's line break. Off by default.
+    after_bom: bool,
     /// Whether any node carries a standalone head/foot comment (#2795).
     /// The streaming emitter consults this once per node before looking up
     /// either list, so a comment-free document -- the common case, and the
@@ -196,6 +201,25 @@ impl YamlIndex<Vec<u64>> {
         Self::from_semi_index(yaml, build_semi_index_yq(yaml)?)
     }
 
+    /// [`build_yq`](Self::build_yq) for YAML text whose UTF-8 byte-order mark the caller dropped
+    /// (#5357). yq's header slurp looks for its leading lines at the first byte of the input, and
+    /// a mark is not one of them, so a BOM-prefixed input has no header: yq decodes the whole text
+    /// as an ordinary stream, and the first document's explicit `---` (and any comment or blank
+    /// line ahead of the first content) is read, not set aside and re-emitted. The parse is
+    /// [`build_yq`](Self::build_yq)'s without its head: `---` / `---` / `x` is a null document and
+    /// then `x`, and the header is measured as empty.
+    ///
+    /// # Errors
+    ///
+    /// As [`build`](Self::build).
+    pub fn build_yq_after_bom(yaml: &[u8]) -> Result<Self, YamlError> {
+        let mut index = Self::from_semi_index(yaml, build_semi_index_yq_no_head(yaml)?)?;
+        // A fresh cell, so this cannot already be set.
+        let _ = index.yq_header.set((0, false));
+        index.after_bom = true;
+        Ok(index)
+    }
+
     /// [`build`](Self::build) for input the caller already knows is JSON,
     /// pairing the parse with [`mark_json_sourced`](Self::mark_json_sourced)
     /// so the two can never drift apart (#2279).
@@ -260,6 +284,7 @@ impl YamlIndex<Vec<u64>> {
             header_doc_markers: true,
             merge_rendering_aliases_only: false,
             synthesized_empty: false,
+            after_bom: false,
             yq_header: OnceCell::new(),
             text_is_ascii: OnceCell::new(),
             may_have_merge_keys: OnceCell::new(),
@@ -337,6 +362,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             header_doc_markers: true,
             merge_rendering_aliases_only: false,
             synthesized_empty: false,
+            after_bom: false,
             yq_header: OnceCell::new(),
             text_is_ascii: OnceCell::new(),
             may_have_merge_keys: OnceCell::new(),
@@ -433,6 +459,12 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     /// reads from is not a blank line of the input, which a write would otherwise print above its result.
     pub fn mark_synthesized_empty(&mut self) {
         self.synthesized_empty = true;
+    }
+
+    /// Whether the text was built by [`Self::build_yq_after_bom`].
+    #[inline]
+    pub(crate) fn after_bom(&self) -> bool {
+        self.after_bom
     }
 
     /// Whether [`Self::mark_synthesized_empty`] was called.
