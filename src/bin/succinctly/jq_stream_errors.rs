@@ -214,6 +214,9 @@ pub(crate) struct ChunkedSources {
     /// The chunk handed out last ended at a newline or filled the buffer, so it is not yet known
     /// whether it was the end of `current`.
     unsettled: bool,
+    /// The unsettled chunk filled the buffer with no newline: if it was the end of its source,
+    /// jq's next `fgets` of it returns nothing, a refill of its own (#6760).
+    unsettled_full: bool,
     last: Option<(usize, bool)>,
     closed: bool,
     error: Option<std::io::Error>,
@@ -232,6 +235,7 @@ impl ChunkedSources {
             current: None,
             source: 0,
             unsettled: false,
+            unsettled_full: false,
             last: None,
             closed: false,
             error: None,
@@ -334,9 +338,22 @@ impl RefillSource for ChunkedSources {
                         true
                     }
                 };
+                let filled = core::mem::take(&mut self.unsettled_full);
                 if ended {
                     self.current = None;
                     self.source += 1;
+                    if filled && !last_source {
+                        // jq's `fgets` filled its buffer and has not seen the end of the file, so
+                        // it reads once more, gets nothing, and a closing event the file held
+                        // back comes out in this file (#6760).
+                        buf.clear();
+                        self.last = Some((source, false));
+                        return Some(Refill {
+                            source,
+                            newline: false,
+                            is_last: false,
+                        });
+                    }
                     continue;
                 }
             }
@@ -364,6 +381,7 @@ impl RefillSource for ChunkedSources {
                 self.source += 1;
             } else {
                 self.unsettled = true;
+                self.unsettled_full = end == ChunkEnd::Full;
             }
             if !newline {
                 // The parser sees a chunk with no newline up to its first NUL (`strlen`).
@@ -423,6 +441,9 @@ struct RefillCursor {
     /// empty closing refill follows.
     last: Option<(usize, bool)>,
     closed: bool,
+    /// The source whose last chunk filled the buffer with no newline, so that jq's next `fgets` of
+    /// it returns nothing, a refill of its own that is not the last (#6760).
+    empty_after: Option<usize>,
 }
 
 /// A refill of the in-memory sources, with its bytes borrowed from them.
@@ -435,6 +456,15 @@ struct CursorRefill<'a> {
 
 impl RefillCursor {
     fn next<'a>(&mut self, sources: &'a [(Option<usize>, Vec<u8>)]) -> Option<CursorRefill<'a>> {
+        if let Some(source) = self.empty_after.take() {
+            self.last = Some((source, false));
+            return Some(CursorRefill {
+                source,
+                bytes: &[],
+                newline: false,
+                is_last: false,
+            });
+        }
         while let Some((_, raw)) = sources.get(self.source) {
             let last_source = self.source + 1 == sources.len();
             let source = self.source;
@@ -470,6 +500,9 @@ impl RefillCursor {
             };
             let is_last = last_source && at_end && hit_eof;
             self.last = Some((source, is_last));
+            if at_end && !last_source && !newline && len == JQ_FGETS_CHUNK {
+                self.empty_after = Some(source);
+            }
             return Some(CursorRefill {
                 source,
                 bytes,
@@ -2487,6 +2520,11 @@ mod tests {
                     newline,
                     last_source && k + 1 == lens.len() && hit_eof,
                 ));
+                // #6760: a last chunk that filled the buffer is followed by a read that returns
+                // nothing, in the same source.
+                if !last_source && k + 1 == lens.len() && !newline && len == JQ_FGETS_CHUNK {
+                    refills.push((index, Vec::new(), false, false));
+                }
             }
         }
         if let Some(last) = refills.last() {

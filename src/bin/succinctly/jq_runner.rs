@@ -9901,6 +9901,13 @@ fn held_back_closer_before(
 /// `seq` is a `--seq` stream, whose last record is what follows its last record separator; plain
 /// JSON's last value is the text's end (#6646).
 fn closing_event_lags(raw: &[u8], seq: bool) -> bool {
+    // A last read that fills jq's buffer is followed by a read of the same file that returns
+    // nothing, and the closer comes out of that one, in the file itself (#6760).
+    if crate::jq_seq_reader::fgets_chunk_lens(raw).last()
+        == Some(crate::jq_seq_reader::JQ_FGETS_CHUNK)
+    {
+        return false;
+    }
     let record = if seq {
         raw.rsplit(|&b| b == 0x1e).next().unwrap_or(raw)
     } else {
