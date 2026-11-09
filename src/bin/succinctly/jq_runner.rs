@@ -6996,7 +6996,12 @@ fn read_inputs(
     let mut seq_stream_places_failures = false;
     // #6646: `--stream-errors` reads the text as one stream through jq's streaming parser, which
     // reads a file that did not open as an empty read.
-    let failed_as_sources = plain_stream_errors(args) && !args.slurp && !args.validate;
+    // #6730: so does a slurp by the streaming parser (`-s --stream`, `-s --stream-errors`): each file
+    // that did not open is one more read of the stream, an empty one, and the fault a token left open
+    // across files ends in comes with the read of the last, not of the first.
+    let failed_as_sources = ((plain_stream_errors(args) && !args.slurp)
+        || slurp_by_stream_parser(args))
+        && !args.validate;
     let (files, mut raw_bytes): OpenedInputs = if let Some(bytes) = read_whole {
         // Stdin is the one source with no file index.
         let tag = (!files.is_empty()).then_some(0);
@@ -7037,8 +7042,12 @@ fn read_inputs(
             // #6646: the main loop ends at the read of a directory that delivers the closer the file
             // before it held back, so a directory in the middle is the read it stops at; its
             // message is placed past it, where the reader moves on.
-            let held_back_at_directory =
-                failed_as_sources && failure.kind == InputFileErrorKind::Directory { last: false };
+            // #6730: a slurp by the streaming parser reads a last directory in the call that closes
+            // its array, so the loop has stopped by the time it would read what follows.
+            let held_back_at_directory = failed_as_sources
+                && (failure.kind == InputFileErrorKind::Directory { last: false }
+                    || (slurp_by_stream_parser(args)
+                        && failure.kind == InputFileErrorKind::Directory { last: true }));
             note_open_failure_at(at.saturating_sub(usize::from(held_back_at_directory)));
         }
         // #6475: under `-n` the program asks for each file as it goes, and says what it cannot
@@ -7398,7 +7407,9 @@ fn read_inputs(
     if (seq_readers_place_reads
         || seq_slurp_defers_failures(args)
         || (seq_by_stream_reader && args.slurp)
-        || (json_input_mode && args.slurp && (stream_by_reader || args.stream_errors)))
+        // #6724: `--validate` reads the files whole, so no failed file is a source of the stream
+        // before this one (`failed_as_sources`), and the last of them is pushed here.
+        || (args.validate && slurp_by_stream_parser(args)))
         && UNOPENED_TAIL_NAME.with(|tail| tail.borrow().is_some())
     {
         raw_bytes.push((Some(files.len()), Vec::new()));
@@ -7794,7 +7805,10 @@ fn read_inputs(
             // #6481: with a file that did not open after the last one that did, the call that
             // consumes the last byte is not the last call: jq's reader goes on to the missing
             // file, and the fault is met before the array closes, so it is the whole result.
-            if args.slurp && !unopened_tail {
+            // #6730: the failed file is a source of the read ([`slurp_by_stream_parser`]), so the
+            // reader places the fault itself: before the array's last call it is the whole result,
+            // and after it (behind a closing event the file before the failure held back) it is not.
+            if args.slurp {
                 let deferred = crate::jq_stream_errors::read_for_deferred_slurp(&raw_bytes);
                 if deferred.before.is_empty() {
                     let place = |at| stream_location(&raw_bytes, at);
@@ -7811,7 +7825,10 @@ fn read_inputs(
                             }
                             // #6485: jq's main loop reads no further once a file has failed to
                             // open, and the fault comes from a read after the array.
-                            crate::jq_stream_errors::Afterwards::Fault(..) if any_open_failure => {
+                            crate::jq_stream_errors::Afterwards::Fault(..)
+                                if any_open_failure
+                                    && !PROGRAM_READS_INPUTS.with(std::cell::Cell::get) =>
+                            {
                                 break;
                             }
                             crate::jq_stream_errors::Afterwards::Fault(message, at) => {
@@ -9846,6 +9863,17 @@ fn open_failures_reached<'a>(
 /// the file before it held back is read there (#6646).
 fn plain_stream_errors(args: &JqCommand) -> bool {
     args.stream_errors && !args.seq && !args.raw_input && args.input_dsv.is_none()
+}
+
+/// Whether `args` slurp JSON text through jq's streaming parser without `--seq` (`-s --stream`,
+/// `-s --stream-errors`, #6730): the files are one stream there too, so a file that did not open is
+/// an empty read of it.
+fn slurp_by_stream_parser(args: &JqCommand) -> bool {
+    args.slurp
+        && !args.seq
+        && !args.raw_input
+        && args.input_dsv.is_none()
+        && (args.stream || args.stream_errors)
 }
 
 /// Whether the source read just before `failure` ends in a closing event the stream parser holds
