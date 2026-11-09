@@ -10013,10 +10013,10 @@ fn last_directory_left_to_reads(
 ///
 /// Only where the first value the loop reads completes inside its own file, before the first
 /// failure: one that needs the next file to end (a bare number with no newline) sends the reader
-/// into the failure on that first read, which then counts it whatever the program does next. And
-/// only where no file with bytes follows the first failure: the loop stops at the value that took
-/// the reader past it, with the failures behind that value's own file reported by what that value
-/// needed to end, which the up-front report places.
+/// into the failure on that first read, which then counts it whatever the program does next. A file
+/// with bytes behind the failure does not matter then (#6683): the loop reads its next value from
+/// there, and a program that halts first never gets so far, so jq reports nothing and exits with the
+/// halt's status.
 fn stream_errors_main_loop_places_failures(
     args: &JqCommand,
     reached: &[(usize, InputFileOpenError)],
@@ -10026,7 +10026,6 @@ fn stream_errors_main_loop_places_failures(
         return false;
     };
     stream_errors_reads_place_failures(args)
-        && raws.iter().skip(first_failure).all(Vec::is_empty)
         && raws
             .iter()
             .position(|raw| !raw.is_empty())
