@@ -6082,7 +6082,9 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 // before it already ran, and nothing after it exists (#2961).
                 loop {
                     if stopped(args.on_error, &sink) || !main_loop_reads_on() {
-                        count_directory_stopped_at(None);
+                        if plain_stream_errors(&args) {
+                            count_directory_stopped_at(None);
+                        }
                         break;
                     }
                     // #6604: the loop's own read, which a slurp's directory is not read by.
@@ -6308,9 +6310,11 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 // `--stream-errors` event is read by the stream parser, which is how it reads
                 // the closer the file before the failure held back.
                 if source_is_past_open_failure(source)
-                    || (args.stream_errors && !args.seq && !main_loop_reads_on())
+                    || (plain_stream_errors(&args) && !main_loop_reads_on())
                 {
-                    count_directory_stopped_at(source);
+                    if plain_stream_errors(&args) {
+                        count_directory_stopped_at(source);
+                    }
                     ended_early = true;
                     break 'documents;
                 }
@@ -6965,12 +6969,7 @@ fn read_inputs(
     let mut seq_stream_places_failures = false;
     // #6646: `--stream-errors` reads the text as one stream through jq's streaming parser, which
     // reads a file that did not open as an empty read.
-    let failed_as_sources = args.stream_errors
-        && !args.seq
-        && !args.slurp
-        && !args.validate
-        && !args.raw_input
-        && args.input_dsv.is_none();
+    let failed_as_sources = plain_stream_errors(args) && !args.slurp && !args.validate;
     let (files, mut raw_bytes): OpenedInputs = if let Some(bytes) = read_whole {
         // Stdin is the one source with no file index.
         let tag = (!files.is_empty()).then_some(0);
@@ -6995,7 +6994,7 @@ fn read_inputs(
             // message is placed past it, where the reader moves on.
             let held_back_at_directory =
                 failed_as_sources && failure.kind == InputFileErrorKind::Directory { last: false };
-            note_open_failure_at(at - usize::from(held_back_at_directory));
+            note_open_failure_at(at.saturating_sub(usize::from(held_back_at_directory)));
         }
         // #6475: under `-n` the program asks for each file as it goes, and says what it cannot
         // open when its read gets there. A slurp reads them all first, and so does a text that
@@ -9715,6 +9714,13 @@ fn open_failures_reached<'a>(
     }
 }
 
+/// Whether `args` read JSON text with `--stream-errors` and no `--seq`: jq's streaming parser reads
+/// the files as one stream, so a file that did not open is an empty read in it and a closing event
+/// the file before it held back is read there (#6646).
+fn plain_stream_errors(args: &JqCommand) -> bool {
+    args.stream_errors && !args.seq && !args.raw_input && args.input_dsv.is_none()
+}
+
 /// Whether the source read just before `failure` ends in a closing event the stream parser holds
 /// back until the next read (#6646), which is the read of the failed file: the main loop ends
 /// there. A file between the two, even an empty one, takes that read, and the failure is then met
@@ -9725,8 +9731,7 @@ fn held_back_closer_before(
     raws: &[Vec<u8>],
     failure: &(usize, InputFileOpenError),
 ) -> bool {
-    let streams = (args.seq && (args.stream || args.stream_errors))
-        || (args.stream_errors && !args.raw_input && args.input_dsv.is_none());
+    let streams = (args.seq && (args.stream || args.stream_errors)) || plain_stream_errors(args);
     // A directory is a source of its own, which the failure is placed after (#6472); a file that
     // did not open is placed at the source it would have been, which is an empty one on the routes
     // that give it one (#6646), and at the end of the sources for the last file named.

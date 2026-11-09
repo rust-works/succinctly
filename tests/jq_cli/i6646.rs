@@ -111,6 +111,14 @@ fn stream_errors_reads_a_failed_file_as_an_empty_source_6646() -> Result<()> {
         (&[("f.json", "[1,2]"), ("e.json", "")], &["--stream-errors", "."], &["f.json", "e.json", "dir", "g.json"], "[[0],1]\n[[1],2]\n[[1]]\n[[\"a\"],1]\n", "jq: error: Is a directory\n"),
         (&[("f.json", "[1,2]")], &["--stream-errors", "first(inputs)"], &["f.json", "dir", "g.json"], "[[1],2]\n[[\"a\"],1]\n", "jq: error: Is a directory\n"),
         (&[("f.json", "[1,2]\n")], &["--stream-errors", "."], &["f.json", "dir", "g.json"], "[[0],1]\n[[1],2]\n[[1]]\n[[\"a\"],1]\n", "jq: error: Is a directory\n"),
+        // The same files read by the other readers, which are not changed (#6646).
+        (&[("f.json", "[1,2]")], &["-n", "[inputs]"], &["f.json", "dir", "g.json"], "[[1,2],{\"a\":1}]\n", "jq: error: Is a directory\n"),
+        (&[("f.json", "[1,2]")], &["."], &["f.json", "dir", "g.json"], "[1,2]\n{\"a\":1}\n", "jq: error: Is a directory\n"),
+        (&[("f.json", "[1,2]")], &["-s", "."], &["f.json", "dir", "g.json"], "[[1,2],{\"a\":1}]\n", "jq: error: Is a directory\n"),
+        (&[("f.json", "[1,2]")], &["-n", "--stream", "[inputs]"], &["f.json", "dir", "g.json"], "[[[0],1],[[1],2],[[1]],[[\"a\"],1],[[\"a\"]]]\n", "jq: error: Is a directory\n"),
+        (&[("f.json", "[1,2]")], &["-n", "--stream-errors", "[inputs]"], &["f.json", "dir", "g.json"], "[[[0],1],[[1],2],[[1]],[[\"a\"],1],[[\"a\"]]]\n", "jq: error: Is a directory\n"),
+        (&[("f.json", "[1,2]")], &["-n", "[inputs]"], &["f.json", "gone", "dir"], "[[1,2]]\n", "jq: error: Could not open file @D@/gone: No such file or directory\n"),
+        (&[("f.json", "[1,2]")], &["--stream-errors", "-s", "."], &["f.json", "dir", "g.json"], "[[[0],1],[[1],2],[[1]],[[\"a\"],1]]\n", "jq: error: Is a directory\n"),
     ];
     let dir = tempfile::tempdir()?;
     let d = dir.path().to_string_lossy().into_owned();
