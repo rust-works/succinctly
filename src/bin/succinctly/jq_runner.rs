@@ -7062,7 +7062,14 @@ fn read_inputs(
                 // end of the text.
                 || (failed_as_sources
                     && seq_by_stream_reader(args)
-                    && failure.kind == InputFileErrorKind::Directory { last: true });
+                    && failure.kind == InputFileErrorKind::Directory { last: true })
+                // #6732: and so does a last directory that takes the read delivering a closer the
+                // file before it held back: the fault a token left open across files ends the text
+                // in is then for the program's own reads, not the loop's.
+                || (failed_as_sources
+                    && plain_stream_errors(args)
+                    && failure.kind == InputFileErrorKind::Directory { last: true }
+                    && held_back_closer_before(args, &raws, (at, failure)));
             note_open_failure_at(at.saturating_sub(usize::from(held_back_at_directory)));
         }
         // #6475: under `-n` the program asks for each file as it goes, and says what it cannot
