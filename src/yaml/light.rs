@@ -8109,7 +8109,9 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     }
 
     fn document_preamble(&self, through_content: bool) -> Option<&str> {
-        if !self.is_document_content() {
+        // After a byte-order mark yq sets no header aside, so nothing in front of the first
+        // document is printed back as one (#6762): its `---` is read, not echoed.
+        if !self.is_document_content() || self.index.after_bom() {
             return None;
         }
         let start = self.text_position()?;
@@ -8300,7 +8302,15 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
                 && !lines.is_empty()
                 && !blank_line_before(self.text, first_start as usize)
             {
-                for _ in 0..blank_lines_between(self.text, last_end as usize, pos) {
+                // After a byte-order mark no header carries the first document's leading lines
+                // verbatim, so go-yaml reads them: the block is the head comment alone, and the
+                // blank lines (or `---` marker) between it and the content are not part of it (#6762).
+                let blanks = if self.index.after_bom() && self.is_first_document_content() {
+                    0
+                } else {
+                    blank_lines_between(self.text, last_end as usize, pos)
+                };
+                for _ in 0..blanks {
                     lines.push(String::new());
                 }
             }
@@ -19160,6 +19170,31 @@ plain: hello
             let header = YamlIndex::build_yq(b"---\n").unwrap();
             let first = header.root(b"---\n").first_child().expect("a document");
             assert!(first.is_header_only_document());
+        }
+
+        /// #6762: the routes that gather a source before indexing it read a BOM-led text with no header
+        /// too: the first document has no preamble to print back, `line` counts every line, and the
+        /// blank lines after its head comment are not part of it.
+        #[test]
+        fn after_a_bom_the_first_document_has_no_preamble_and_every_line_counts_6762() {
+            use crate::jq::document::DocumentCursor;
+            let yaml = b"---\na: 1\n";
+            let header = YamlIndex::build_yq(yaml).unwrap();
+            let first = header.root(yaml).first_child().expect("a document");
+            assert_eq!(first.document_preamble(true), Some("---\n"));
+            let bom = YamlIndex::build_yq_after_bom(yaml).unwrap();
+            let first = bom.root(yaml).first_child().expect("a document");
+            assert_eq!(first.document_preamble(true), None);
+            assert_eq!(bom.yq_preamble(|| unreachable!("measured")), (0, 0));
+
+            // The head comment is the block alone: with a header the blank line stays in it.
+            let yaml = b"# c\n\na: 1\n";
+            let head = |index: &YamlIndex<Vec<u64>>| {
+                let first = index.root(yaml).first_child().expect("a document");
+                DocumentCursor::head_comment_raw(&first)
+            };
+            assert_eq!(head(&YamlIndex::build_yq(yaml).unwrap()), ["# c", ""]);
+            assert_eq!(head(&YamlIndex::build_yq_after_bom(yaml).unwrap()), ["# c"]);
         }
 
         #[test]
