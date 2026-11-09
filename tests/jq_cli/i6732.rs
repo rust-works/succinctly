@@ -43,6 +43,14 @@ fn check(rows: &[Row<'_>]) -> Result<()> {
         ("arr.json", "[1,2]"),
         ("str.json", "\"a\" 12"),
         ("str2.json", "\"a\" 12"),
+        ("objx.json", "{\"a\":1}"),
+        ("arrx.json", "[1]"),
+        ("arrn.json", "[1]\n"),
+        ("flt.json", "1.5"),
+        ("nest.json", "[[1],2]"),
+        ("bomonly.json", "\u{feff}"),
+        ("bom1.json", "\u{feff}1\n"),
+        ("bom2.json", "\u{feff}1"),
     ] {
         std::fs::write(dir.path().join(name), text)?;
     }
@@ -122,6 +130,93 @@ fn the_first_event_after_an_open_token_matches_jq_6732() -> Result<()> {
         (&["-c", "--stream-errors", "halt_error"][..], &["p", "dir", "dot5", "gone"][..], "", "jq: error: Is a directory\n[[],1.5]\n", 2),
         (&["-c", "--stream-errors", "halt_error"][..], &["p", "dir", "e5", "gone"][..], "", "jq: error: Is a directory\n[[],15]\n", 2),
         (&["-c", "--stream-errors", "halt_error"][..], &["p", "gone", "x", "dir"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n[\"Invalid numeric literal at line 1, column 4\",[]]\n", 2),
+    ];
+    check(&rows)
+}
+
+/// The closing event of a container that ends its file with no newline (`{"a":1}`, `[1]`) is held back
+/// until the next read, which is the open of the directory behind it. A program whose own `input`
+/// reads it has read the directory, which counts (exit 2) and says nothing until a read after that
+/// one; a program that halts first never makes it. A bare number after the directory sends the run
+/// up front no longer. Every row was captured from jq 1.7.1.
+#[test]
+fn a_program_that_reads_input_counts_the_directory_behind_the_closer_it_reads_6732() -> Result<()> {
+    #[rustfmt::skip]
+    let rows = [
+        (&["-c", "--stream-errors", "input,halt_error"][..], &["objx", "dir", "gone"][..], "[[\"a\"]]\n", "[[\"a\"],1]\n", 2),
+        (&["-c", "--stream-errors", "first(inputs)|halt_error"][..], &["objx", "dir", "gone"][..], "", "[[\"a\"]]\n", 2),
+        (&["-c", "--stream-errors", "[.,input]|halt_error"][..], &["objx", "dir", "gone"][..], "", "[[[\"a\"],1],[[\"a\"]]]\n", 2),
+        (&["-c", "--stream-errors", "input"][..], &["objx", "dir", "gone"][..], "[[\"a\"]]\n", "", 2),
+        (&["-c", "--stream-errors", "input,halt_error"][..], &["arrx", "dir", "gone"][..], "[[0]]\n", "[[0],1]\n", 2),
+        (&["-c", "--stream-errors", "input,halt_error"][..], &["arrx", "dir", "p", "gone"][..], "[[0]]\n", "[[0],1]\n", 2),
+        (&["-c", "--stream-errors", "input"][..], &["arrx", "dir", "p", "gone"][..], "[[0]]\n", "", 2),
+        (&["-c", "--stream-errors", "[.,input]|halt_error"][..], &["arrx", "dir", "p", "gone"][..], "", "[[[0],1],[[0]]]\n", 2),
+        (&["-c", "--stream-errors", "first(inputs)|halt_error"][..], &["arrx", "dir", "p", "gone"][..], "", "[[0]]\n", 2),
+        (&["-c", "--stream-errors", "[.,input,input]"][..], &["objx", "dir", "gone"][..], "", "jq: error: Is a directory\njq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: error (at @DIR@/gone.json:0): break\n", 2),
+        (&["-c", "--stream-errors", "[.,input,input]"][..], &["arrx", "dir", "p", "gone"][..], "[[[0],1],[[0]],[[],1]]\n", "jq: error: Is a directory\njq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+    ];
+    check(&rows)
+}
+
+/// A newline after the closer reads it with its own token, so nothing is held back, and a program
+/// that reads past the container meets the failures as before.
+#[test]
+fn a_closer_that_ends_with_a_newline_keeps_its_rows_6732() -> Result<()> {
+    #[rustfmt::skip]
+    let rows = [
+        (&["-c", "--stream-errors", "input,halt_error"][..], &["arrn", "dir", "gone"][..], "[[0]]\n", "[[0],1]\n", 5),
+        (&["-c", "--stream-errors", "input"][..], &["arrn", "dir", "gone"][..], "[[0]]\n", "jq: error: Is a directory\njq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-c", "--stream-errors", "."][..], &["objx", "dir", "gone"][..], "[[\"a\"],1]\n[[\"a\"]]\n", "", 2),
+        (&["-c", "--stream-errors", "[inputs]"][..], &["arrx", "dir", "gone"][..], "[[[0]]]\n", "jq: error: Is a directory\njq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-c", "--stream-errors", "input,halt_error"][..], &["p", "dir", "gone"][..], "", "jq: error: Is a directory\njq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: error (at @DIR@/gone.json:0): break\n", 2),
+        (&["-c", "--stream-errors", "input,halt_error"][..], &["pn", "dir", "gone"][..], "", "jq: error: Is a directory\njq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: error (at @DIR@/gone.json:0): break\n", 2),
+    ];
+    check(&rows)
+}
+
+/// A first event a file hands on to the next (`1` then `1\n`, `1.5` then `{"a":1}`) is whole in the
+/// file that ends it, so a halting program stops before the failure behind that file, and a failure
+/// in front of the files that complete it is the one that is said.
+#[test]
+fn a_first_event_that_spans_two_files_is_complete_before_the_failure_6732() -> Result<()> {
+    #[rustfmt::skip]
+    let rows = [
+        (&["-c", "--stream-errors", "halt_error"][..], &["p", "pn", "gone"][..], "", "[[],11]\n", 5),
+        (&["-c", "--stream-errors", "halt_error"][..], &["flt", "objx", "gone"][..], "", "[[],1.5]\n", 5),
+        (&["-c", "--stream-errors", "halt_error"][..], &["p", "nest", "dir"][..], "", "[[],1]\n", 5),
+        (&["-c", "--stream-errors", "halt_error"][..], &["flt", "r2", "dir"][..], "", "[[],1.51]\n", 5),
+        (&["-c", "--stream-errors", "halt_error"][..], &["gone", "p", "str", "gone2"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n[[],1]\n", 2),
+        (&["-c", "--stream-errors", "input_filename"][..], &["dir", "flt", "r2", "gone2"][..], "\"@DIR@/r2.json\"\n", "jq: error: Is a directory\n", 2),
+        (&["-c", "--stream-errors", "halt_error"][..], &["p", "empty", "pn", "gone"][..], "", "[[],11]\n", 5),
+        (&["-c", "--stream-errors", "."][..], &["p", "pn", "gone"][..], "[[],11]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+    ];
+    check(&rows)
+}
+
+/// `-n` places a program's reads of `input` the way a run without it does, and matched jq before this
+/// change: the rows stay as they were.
+#[test]
+fn under_null_input_the_program_reads_keep_their_rows_6732() -> Result<()> {
+    #[rustfmt::skip]
+    let rows = [
+        (&["-c", "--stream-errors", "-n", "input,halt_error"][..], &["objx", "dir", "gone"][..], "[[\"a\"],1]\n", "", 5),
+        (&["-c", "--stream-errors", "-n", "[inputs]"][..], &["arrx", "dir", "p", "gone"][..], "[[[0],1],[[0]],[[],1]]\n", "jq: error: Is a directory\njq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-c", "--stream-errors", "-n", "input"][..], &["p", "pn", "gone"][..], "[[],11]\n", "", 0),
+        (&["-c", "--stream-errors", "-n", "first(inputs)|halt_error"][..], &["p", "pn", "gone"][..], "", "[[],11]\n", 5),
+        (&["-c", "--stream-errors", "-n", "input,halt_error"][..], &["arrx", "dir", "gone"][..], "[[0],1]\n", "", 5),
+    ];
+    check(&rows)
+}
+
+/// jq skips a byte-order mark at the front of its input, of the first file with bytes: one in the
+/// middle of the stream is part of the number it follows.
+#[test]
+fn a_byte_order_mark_is_skipped_only_at_the_front_of_the_stream_6732() -> Result<()> {
+    #[rustfmt::skip]
+    let rows = [
+        (&["-c", "--stream-errors", "halt_error"][..], &["bomonly", "bom1", "gone"][..], "", "[\"Invalid numeric literal at line 2, column 0\",[]]\n", 5),
+        (&["-c", "--stream-errors", "halt_error"][..], &["bomonly", "bom2", "pn", "gone"][..], "", "[\"Invalid numeric literal at line 2, column 0\",[]]\n", 5),
+        (&["-c", "--stream-errors", "halt_error"][..], &["bom2", "bom1", "gone"][..], "", "[\"Invalid numeric literal at line 2, column 0\",[]]\n", 5),
     ];
     check(&rows)
 }

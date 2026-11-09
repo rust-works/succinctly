@@ -747,7 +747,7 @@ pub(crate) fn read(sources: &[(Option<usize>, Vec<u8>)]) -> StreamErrorsRead {
 const NEXT_FILE_PROBES: [&[u8]; 6] = [b"0", b"]", b"\"", b"n\"", b"e", b"l"];
 
 /// The longest prefix [`first_event_completes_in`] reads: 1 MiB.
-const FIRST_EVENT_PREFIX_LIMIT: usize = 1 << 20;
+pub(crate) const FIRST_EVENT_PREFIX_LIMIT: usize = 1 << 20;
 
 /// Whether the first thing `--stream-errors` yields from `raw` is complete inside it (#6591): the
 /// next file's bytes, whatever they are, do not change it. A bare number or a half-read string at
