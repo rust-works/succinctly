@@ -18602,6 +18602,33 @@ fn format_json_text(value: &OwnedValue, config: &OutputConfig) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// #6732: the first event a stream makes of several files is complete in the file that ends it,
+    /// the files that leave a container open do not, and a first event longer than the prefix a
+    /// read looks at is not judged (its failures are all reported, as before).
+    #[test]
+    fn first_event_completing_file_finds_the_file_that_ends_the_event_6732() {
+        let files = |texts: &[&[u8]]| texts.iter().map(|t| t.to_vec()).collect::<Vec<_>>();
+        assert_eq!(
+            first_event_completing_file(&files(&[b"1", b"1\n"])),
+            Some(1)
+        );
+        assert_eq!(
+            first_event_completing_file(&files(&[b"1", b"", b"2"])),
+            None
+        );
+        assert_eq!(
+            first_event_completing_file(&files(&[b"[1", b",2]"])),
+            Some(1)
+        );
+        assert_eq!(first_event_completing_file(&files(&[b"[", b"\"s\""])), None);
+        assert_eq!(
+            first_event_completing_file(&files(&[b"\xef\xbb\xbf", b"[1]\n"])),
+            Some(1)
+        );
+        let long = vec![b'1'; crate::jq_stream_errors::FIRST_EVENT_PREFIX_LIMIT + 10];
+        assert_eq!(first_event_completing_file(&[long, b"1\n".to_vec()]), None);
+    }
+
     /// #6646: which `--seq` texts leave a closing event held back, each shape captured from jq
     /// 1.7.1 (one failure reported where it lags, two where it does not).
     #[test]
