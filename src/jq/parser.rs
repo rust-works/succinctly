@@ -1675,6 +1675,62 @@ const META_OP_KEYWORDS: &[(&str, MetaSlot)] = &[
 /// source (no jq identifier starts with `%`), so it cannot capture or shadow a user's.
 const VALUE_ARG_VAR: &str = "%arg";
 
+/// Whether a `,` sits in the flat stages of `expr`: a comma itself, or a stage of a pipe, a
+/// parenthesis or the body of an `as` binding. A comma inside a construction (`[a, b]`) or a call's
+/// argument is its own context, which no walk over a list reaches (#6770).
+fn has_flat_union(expr: &Expr) -> bool {
+    match expr {
+        Expr::Comma(_) => true,
+        Expr::Paren(inner) => has_flat_union(inner),
+        Expr::Pipe(stages) => stages.iter().any(has_flat_union),
+        Expr::As { body, .. } => has_flat_union(body),
+        _ => false,
+    }
+}
+
+/// #6770: yq's `map(f)` splats its node and runs `f` once over the whole list of members
+/// (`mapOperator`, `GetMatchingNodes(splatted, RHS)`), so a union in `f` runs each branch over every
+/// member before the next: `map(.a, .b)` is every `.a`, then every `.b`. That is the walk
+/// `[.[] | f]` already takes (the context-list model, `eval_yq_context_pipe`), so a union-bodied
+/// `map` over a sequence or a mapping with members is written
+/// `(if has-members then [.[] | f] else . end) | map(.)`.
+///
+/// The trailing `map(.)` is what keeps everything else as it was. It makes the result a node of its
+/// own with no path, as `map`'s is (`del(.a | map(., 0))` deletes nothing in yq, where the bare
+/// collection is `.a`'s own position), and it answers a scalar (itself, `f` never runs), `null` (`[]`)
+/// and an empty mapping (itself, #5918) exactly as the arm did, whatever `f` is. `f` appears once,
+/// so a nest of such maps stays linear.
+fn yq_map_union_body_over_the_list(call: Expr) -> Expr {
+    let Expr::Builtin(Builtin::Map(body)) = &call else {
+        return call;
+    };
+    if !has_flat_union(body) {
+        return call;
+    }
+    // Whether the node has members to walk: a sequence or a mapping with entries. A scalar, `null`,
+    // an empty sequence and an empty mapping (or one whose only entry is a `<<` of an empty anchor)
+    // have none, and `map(.)` below answers each as the arm always did. This reads no node property
+    // (`kind`, `tag`), which would make a write target that holds the call resolve through the
+    // node's own position.
+    let container = Expr::Compare {
+        op: CompareOp::Gt,
+        left: Box::new(Expr::pipe(vec![
+            Expr::array(Expr::Iterate),
+            Expr::Builtin(Builtin::Length),
+        ])),
+        right: Box::new(Expr::Literal(Literal::Int(0))),
+    };
+    let over_the_list = Expr::array(Expr::pipe(vec![Expr::Iterate, (**body).clone()]));
+    Expr::pipe(vec![
+        Expr::If {
+            cond: Box::new(container),
+            then_branch: Box::new(over_the_list),
+            else_branch: Box::new(Expr::Identity),
+        },
+        Expr::Builtin(Builtin::Map(Box::new(Expr::Identity))),
+    ])
+}
+
 /// `B(K)` as jq runs it, `K as $v | B($v)`, when `K` holds a `?//` bind (#3487).
 ///
 /// jq evaluates a builtin's argument as a backtracking sub-expression, so a failure raised
@@ -4774,6 +4830,10 @@ impl<'a> Parser<'a> {
                                 // leave that call as written.
                                 if shadow_candidate {
                                     Expr::Builtin(builtin)
+                                } else if self.mode == ParserMode::Yq {
+                                    yq_map_union_body_over_the_list(bind_retrying_value_arg(
+                                        builtin,
+                                    ))
                                 } else {
                                     bind_retrying_value_arg(builtin)
                                 },
