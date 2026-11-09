@@ -247,6 +247,12 @@ const DUMP_KEEP: usize = 11;
 const DUMP_BUDGET_WIDE: usize = 29;
 const DUMP_KEEP_WIDE: usize = 26;
 
+/// jq 1.8.2's `@urid` error truncates the dump of the string it names to the same 29 bytes as
+/// [`DUMP_BUDGET_WIDE`], but keeps 25 of them and ends on the dump's own closing quote after the
+/// `...` (#6726, [`EvalError::urid_not_a_valid_uri_encoding`]).
+const URID_DUMP_BUDGET: usize = 29;
+const URID_DUMP_KEEP: usize = 25;
+
 /// A value's JSON dump, truncated the way jq truncates it.
 ///
 /// Unlike jq — which builds the entire dump with `jv_dump_string` and then
@@ -1144,14 +1150,10 @@ impl EvalError {
 
     /// `invalid URL escape "<escape>"` (#1138).
     ///
-    /// Raised by `@urid` when a `%` isn't immediately followed by two
-    /// valid hex digits. Unlike [`Self::base64_illegal_data`] above --
-    /// genuinely yq-only, since jq's own real `@base64d` has independently
-    /// verified wording to diverge against -- `@urid` is a succinctly
-    /// extension with **no jq analogue at all**, so there's no competing
-    /// jq-mode wording to preserve: this fires identically in both jq and
-    /// yq mode (`format_urid`'s malformed-escape check has no `S::TAG`
-    /// branch).
+    /// Raised by yq mode's `@urid` when a `%` isn't immediately followed by two
+    /// valid hex digits. jq mode raises jq 1.8.2's own wording instead
+    /// ([`Self::urid_not_a_valid_uri_encoding`], #6726): while `@urid` had no jq oracle this
+    /// fired identically in both modes, and `format_urid` now branches on `S::TAG` for it.
     ///
     /// `raw` is `%` plus whatever 0, 1, or 2 bytes actually follow it in
     /// the input (not validated -- confirmed live against yq v4.53.3 that
@@ -1172,6 +1174,29 @@ impl EvalError {
     /// deliberate divergence, this is what #1216 closes).
     pub fn urid_invalid_escape(raw: &[u8]) -> Self {
         Self::new(format!("invalid URL escape {}", quote_bytes_go_style(raw)))
+    }
+
+    /// `string (<value>) is not a valid uri encoding` (#6726).
+    ///
+    /// Raised by `@urid` in jq mode, as jq 1.8.2 raises it, for a `%` that is not followed by two hex
+    /// digits and for escapes that decode to bytes that are not valid UTF-8. `text` is the
+    /// stringified input, which jq names whole (the message is always `string (...)`, whatever the
+    /// input was before `tostring`). jq 1.8.2 truncates the dump of a value in this message to 29
+    /// bytes: a longer one keeps its first 25 bytes (cut back to a character boundary, never to a
+    /// U+FFFD), then `...`, then the dump's own last byte, here the closing quote
+    /// (`string ("%aaaaaaaaaaaaaaaaaaaaaaa...")`); the 1.7.1 messages cut a 15-byte buffer and drop the
+    /// closing byte, which is what the other messages here write (`describe`).
+    pub fn urid_not_a_valid_uri_encoding(text: &str) -> Self {
+        let mut sink = PreviewSink::new(URID_DUMP_BUDGET);
+        let _ = stream_owned_value_json_jq(&OwnedValue::String(text.into()), &mut sink);
+        let dump = if sink.overflowed {
+            sink.truncate_to(URID_DUMP_KEEP);
+            sink.buf.push_str("...\"");
+            sink.buf
+        } else {
+            sink.buf
+        };
+        Self::new(format!("string ({dump}) is not a valid uri encoding"))
     }
 
     /// `Invalid path expression with result <value>` (#530).
@@ -2434,6 +2459,54 @@ mod tests {
         // 0xFF is never a valid UTF-8 lead byte at all.
         assert_eq!(quote_bytes_go_style(b"%\xff"), r#""%\xff""#);
         assert_eq!(quote_bytes_go_style(b"%\xff\xfe"), r#""%\xff\xfe""#);
+    }
+
+    /// #6726: jq 1.8.2's `@urid` error text. A dump of at most 29 bytes is whole; a longer one keeps its
+    /// first 25 bytes cut back to a character boundary (never a U+FFFD), then `...` and the closing
+    /// quote. Every row captured from jq 1.8.2 over `@urid`.
+    #[test]
+    fn urid_not_a_valid_uri_encoding_truncates_as_jq_1_8_2_does_6726() {
+        let a = |n: usize| "a".repeat(n);
+        for (text, shown) in [
+            ("%".to_string(), "\"%\"".to_string()),
+            ("abc%".to_string(), "\"abc%\"".to_string()),
+            // 29 bytes of dump: whole. 30: cut.
+            (format!("%{}", a(26)), format!("\"%{}\"", a(26))),
+            (format!("%{}", a(27)), format!("\"%{}...\"", a(23))),
+            (format!("%{}", a(40)), format!("\"%{}...\"", a(23))),
+            // The cut never splits a character (here an `\u{e9}` that would straddle byte 25).
+            (
+                format!("{}\u{e9}%tail...more", a(21)),
+                format!("\"{}\u{e9}%...\"", a(21)),
+            ),
+            (
+                format!("{}\u{e9}%tail...more", a(22)),
+                format!("\"{}\u{e9}...\"", a(22)),
+            ),
+            (
+                format!("{}\u{e9}%tail...more", a(23)),
+                format!("\"{}...\"", a(23)),
+            ),
+            (
+                format!("{}\u{e9}%tail...more", a(24)),
+                format!("\"{}...\"", a(24)),
+            ),
+            // The dump is JSON: control characters and quotes are escaped before it is cut.
+            (
+                "%\n\t\\xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".to_string(),
+                "\"%\\n\\t\\\\xxxxxxxxxxxxxxxxx...\"".to_string(),
+            ),
+            (
+                "\u{1f600}\u{1f600}\u{1f600}\u{1f600}\u{1f600}\u{1f600}\u{1f600}%".to_string(),
+                "\"\u{1f600}\u{1f600}\u{1f600}\u{1f600}\u{1f600}\u{1f600}...\"".to_string(),
+            ),
+        ] {
+            assert_eq!(
+                EvalError::urid_not_a_valid_uri_encoding(&text).message,
+                format!("string ({shown}) is not a valid uri encoding"),
+                "{text:?}"
+            );
+        }
     }
 
     #[test]

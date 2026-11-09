@@ -374,7 +374,6 @@ fn test_parity_formats_type_errors() {
         (br#"{"a":1}"#.as_slice(), "@sh"),
         (b"42", "@csv"),
         (b"42", "@tsv"),
-        (b"42", "@urid"),
         (br#""notanarray""#, "@csv"),
     ] {
         assert_parity(json, filter);
@@ -491,7 +490,8 @@ fn test_formats_non_finite_owned_pipe_parity() {
 /// `?` on a format applied to a *constructed* value (arithmetic, array/object
 /// construction, ...) must still suppress a type-mismatch error, producing no
 /// output at all -- verified against jq 1.7.1 (`jq -n '(1+1 | @csv)?'` and
-/// the `@tsv`/`@base64d`/`@urid` siblings all produce nothing, exit 0;
+/// the `@tsv`/`@base64d` siblings all produce nothing, exit 0 (`@urid` stringifies since #6726,
+/// see `test_format_urid_stringifies_in_both_evaluators_6726`);
 /// `@dsv` has no jq equivalent to check directly, since it's this crate's
 /// own extension, but shares `format_csv`'s exact suppression code path).
 ///
@@ -504,9 +504,8 @@ fn test_formats_non_finite_owned_pipe_parity() {
 /// behavior. See `test_format_base64_constructed_scalar_no_longer_suppressed_1096`
 /// below for that corrected case.
 ///
-/// Before #693, `format_csv`/`format_tsv`/`format_dsv`/`format_base64d`/
-/// `format_urid`'s own `_ if optional => Ok(String::new())`
-/// arm was the *only* thing that made `?` work here -- there was no separate
+/// Before #693, `format_csv`/`format_tsv`/`format_dsv`/`format_base64d`'s own
+/// `_ if optional => Ok(String::new())` arm was the *only* thing that made `?` work here -- there was no separate
 /// `Expr::Optional`-catches-`Error` fallback for this path, so a suppressed
 /// format fell back to the empty *string* `""` (a real output) rather than
 /// true suppression (no output), because `format_owned` returns `Result<
@@ -526,12 +525,44 @@ fn test_formats_optional_owned_type_error_parity_124() {
         (b"null", "(1+1 | @tsv)?"),
         (b"null", r#"(1+1 | @dsv("|"))?"#),
         (b"null", "(1+1 | @base64d)?"),
-        (b"null", "(1+1 | @urid)?"),
     ] {
         assert_eq!(
             full_outputs(json, filter),
             Vec::<String>::new(),
             "full evaluator output changed for `{filter}`"
+        );
+        assert_parity(json, filter);
+    }
+}
+
+/// #6726: `@urid` follows jq 1.8.2 and stringifies any value first, so `(1+1 | @urid)?` has no type
+/// error to suppress (it was in the list above while `@urid` raised on a non-string), and the same
+/// holds on every route a value takes to the format. A malformed escape still raises, and `?` still
+/// suppresses it. Every answer captured from jq 1.8.2.
+#[test]
+fn test_format_urid_stringifies_in_both_evaluators_6726() {
+    for (json, filter, want) in [
+        (b"null".as_slice(), "(1+1 | @urid)?", vec!["\"2\""]),
+        (b"42", "@urid", vec!["\"42\""]),
+        (b"null", "@urid", vec!["\"null\""]),
+        (br#"["%41"]"#, "@urid", vec![r#""[\"A\"]""#]),
+        (br#"{"a":"%41"}"#, "map_values(@urid)", vec![r#"{"a":"A"}"#]),
+        (br#""%E4""#, "@urid?", vec![]),
+        (
+            br#""%E4""#,
+            "try @urid catch .",
+            vec![r#""string (\"%E4\") is not a valid uri encoding""#],
+        ),
+        (
+            br#""%""#,
+            "try @urid catch .",
+            vec![r#""string (\"%\") is not a valid uri encoding""#],
+        ),
+    ] {
+        assert_eq!(
+            as_strs(&full_outputs(json, filter)),
+            want,
+            "full evaluator output for `{filter}`"
         );
         assert_parity(json, filter);
     }

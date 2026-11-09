@@ -245,7 +245,7 @@ The format table (`@csv`, `@tsv`, `@dsv(delim)`, `@json`, `@text`, `@uri`, `@uri
 
 - **`@uri`/`@base64`/`@html` on an array or object (jq mode only):** the container is JSON-encoded first, as real jq does (`[1,2] | @uri` => `"%5B1%2C2%5D"`). `succinctly yq` rejects a container for all three, as real yq does (#1096), and `@html` needs `--jq-extensions` there (#5444).
 - **Format-prefixed interpolation (jq mode only):** `@fmt "lit\(E)lit"` formats each `\(E)` slot and leaves the literal text alone; a literal with no interpolation never runs the format. yq's lexer rejects a format followed by a string, and `succinctly yq` matches (#3316).
-- **`@text` and `@urid`:** `@text` is `tostring`. `@urid` (URI percent decoding) is new in jq 1.8; `succinctly jq` follows 1.8, where jq 1.7.1 answers `urid is not a valid format` (the `str-format-urid` ledger entry).
+- **`@text` and `@urid`:** `@text` is `tostring`. `@urid` (URI percent decoding) is new in jq 1.8; `succinctly jq` follows 1.8.2 for the format itself (a non-string is stringified first, a bad `%` escape or bytes that are not valid UTF-8 raise `string (...) is not a valid uri encoding`, #6726), where jq 1.7.1 answers `urid is not a valid format`; `format("urid")` keeps 1.7.1's answer (the `str-format-urid` ledger entry).
 - **`@dsv(delim)`:** every string field is double-quoted whatever its content (as `@csv` does), non-strings are bare, null is empty, an inner `"` is doubled, and `@dsv(",")` is identical to `@csv`.
 - **`*`/`*=`:** two objects merge recursively in both modes (real jq does too). Two arrays are replaced wholesale in yq mode only; `succinctly jq` errors on array `*`, as real jq does.
 
