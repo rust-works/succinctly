@@ -7001,9 +7001,11 @@ fn read_inputs(
     // #6730: so does a slurp by the streaming parser (`-s --stream`, `-s --stream-errors`): each file
     // that did not open is one more read of the stream, an empty one, and the fault a token left open
     // across files ends in comes with the read of the last, not of the first.
+    // #6773: so does `--seq -s --stream-errors` ([`seq_slurp_by_stream_errors`]).
     let failed_as_sources = (((plain_stream_errors(args) || seq_by_stream_reader(args))
         && !args.slurp)
-        || slurp_by_stream_parser(args))
+        || slurp_by_stream_parser(args)
+        || seq_slurp_by_stream_errors(args))
         && !args.validate;
     let (files, mut raw_bytes): OpenedInputs = if let Some(bytes) = read_whole {
         // Stdin is the one source with no file index.
@@ -7052,9 +7054,7 @@ fn read_inputs(
                 && (failure.kind == InputFileErrorKind::Directory { last: false }
                     || (slurp_by_stream_parser(args)
                         && failure.kind == InputFileErrorKind::Directory { last: true })))
-                || (seq_by_stream_reader(args)
-                    && args.slurp
-                    && args.stream_errors
+                || (seq_slurp_by_stream_errors(args)
                     && failure.kind == InputFileErrorKind::Directory { last: true })
                 // #6761: a last directory is read where it delivers the closer the file before it
                 // held back, as one in the middle is: the loop stops there, short of a fault at the
@@ -7418,6 +7418,9 @@ fn read_inputs(
         // before this one (`failed_as_sources`), and the last of them is pushed here.
         || (args.validate && slurp_by_stream_parser(args)))
         && UNOPENED_TAIL_NAME.with(|tail| tail.borrow().is_some())
+        // #6773: `--seq -s --stream-errors` has been given its tail by `failed_as_sources`, and a
+        // second one would be one more read of the stream.
+        && !(seq_slurp_by_stream_errors(args) && failed_as_sources)
     {
         raw_bytes.push((Some(files.len()), Vec::new()));
     }
@@ -8814,6 +8817,14 @@ fn stream_location(
 /// One definition for the read in `get_inputs` and for the main loop that warns about its faults.
 fn seq_by_stream_reader(args: &JqCommand) -> bool {
     args.seq && !args.raw_input && args.input_dsv.is_none() && (args.stream || args.stream_errors)
+}
+
+/// Whether `args` slurp a `--seq` stream with `--stream-errors` (#6773): the stream reader's fault is
+/// an event of the stream, met at the read of the last file that failed, so a failed file in the
+/// middle of the list is a source of the read (`failed_as_sources`). `--seq -s --stream` is not:
+/// its fault is a warning, placed by [`seq_slurp_places_failures`] (#6764).
+fn seq_slurp_by_stream_errors(args: &JqCommand) -> bool {
+    seq_by_stream_reader(args) && args.slurp && args.stream_errors
 }
 
 /// Whether a `--seq -s` read reports its open failures among the reader's warnings (#6589), as
