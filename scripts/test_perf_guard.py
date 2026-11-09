@@ -243,9 +243,14 @@ class NewPatternRowTests(unittest.TestCase):
                 stack.enter_context(mock.patch.object(perf_guard, name, fn))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             measured = perf_guard.measure_all("bin", "valgrind", 1, baseline_run=True)
-        self.assertNotIn("seq_name_bad_last", measured)
+        # Every row over the pattern is left out (#6620 added two beside `seq_name_bad_last`).
+        seq_rows = {q[0] for q in perf_guard.QUERIES if q[1] == "json-seq-bad-last"}
+        self.assertIn("seq_name_bad_last", seq_rows)
+        self.assertGreaterEqual(len(seq_rows), 3)
+        for name in seq_rows:
+            self.assertNotIn(name, measured)
         self.assertIn("wide_length", measured)
-        self.assertEqual(len(measured), len(perf_guard.QUERIES) - 1)
+        self.assertEqual(len(measured), len(perf_guard.QUERIES) - len(seq_rows))
 
     def _drift(self, baseline, measured):
         out = io.StringIO()
