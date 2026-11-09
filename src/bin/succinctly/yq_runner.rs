@@ -7702,6 +7702,81 @@ fn split_leading_static_nav(expr: &Expr) -> Option<(Expr, Expr, Vec<TreeStep<'_>
     Some((pipe_of(nav), rest, steps))
 }
 
+/// Whether `expr` is `key` (parentheses allowed).
+fn is_key_stage(expr: &Expr) -> bool {
+    let mut expr = expr;
+    while let Expr::Paren(inner) = expr {
+        expr = inner;
+    }
+    matches!(expr, Expr::Builtin(Builtin::Key))
+}
+
+/// `expr` as a *static navigation* followed by `map(key)`, split into the navigation and the
+/// `map(key)` (#5450); `None` for any other shape.
+///
+/// `map(key)` lists the keys *of the navigated node's members*, which are the same on the node run
+/// as its own document, so the navigation can be taken with the cursor and the listing run on what
+/// it reaches: the key nodes then keep the quoting, `~` spelling and anchor they were written with,
+/// which the path-context walk behind the navigation (it holds owned values) does not. `.a | key`
+/// and the other reads of the node's own place are not this shape.
+fn split_leading_static_nav_map_key(expr: &Expr) -> Option<(Expr, Expr)> {
+    let mut stages = Vec::new();
+    flatten_plain_pipe(expr, &mut stages);
+    let (last, nav) = stages.split_last()?;
+    if nav.is_empty()
+        || !nav
+            .iter()
+            .all(|stage| static_nav_steps(stage).is_some_and(|steps| !steps.is_empty()))
+    {
+        return None;
+    }
+    let mut last = *last;
+    while let Expr::Paren(inner) = last {
+        last = inner;
+    }
+    let Expr::Builtin(Builtin::Map(body)) = last else {
+        return None;
+    };
+    is_key_stage(body).then(|| (pipe_of(nav), last.clone()))
+}
+
+/// `NAV | [.[] | key]` as `[NAV | .[] | key]` for a static navigation `NAV` (#5450): the same
+/// listing, with the navigation inside the array, where the cursor reaches the key nodes and they
+/// keep the quoting, `~` spelling and anchor they were written with (`[.a[] | key]` already does).
+/// The walk behind a navigation in front of a path-context read holds owned values, where the key
+/// is its text. `None` for any other shape.
+fn fold_nav_into_key_array(expr: &Expr) -> Option<Expr> {
+    let mut stages = Vec::new();
+    flatten_plain_pipe(expr, &mut stages);
+    let (last, nav) = stages.split_last()?;
+    if nav.is_empty()
+        || !nav
+            .iter()
+            .all(|stage| static_nav_steps(stage).is_some_and(|steps| !steps.is_empty()))
+    {
+        return None;
+    }
+    let mut last = *last;
+    while let Expr::Paren(inner) = last {
+        last = inner;
+    }
+    let Expr::Array(inner) = last else {
+        return None;
+    };
+    let mut parts = Vec::new();
+    flatten_plain_pipe(inner, &mut parts);
+    let [Expr::Iterate, key] = parts.as_slice() else {
+        return None;
+    };
+    if !is_key_stage(key) {
+        return None;
+    }
+    let mut folded: Vec<Expr> = nav.iter().map(|stage| (*stage).clone()).collect();
+    folded.push(Expr::Iterate);
+    folded.push((*key).clone());
+    Some(Expr::array(Expr::Pipe(folded.into())))
+}
+
 /// Whether `expr` writes anything: an assignment of any kind, a metadata write, `del`,
 /// `setpath`, `delpaths` or `sort_keys(f)` (#2679, #5286). A navigation followed by a plain read
 /// is answered by the cursor with the source's own presentation and takes no part in this.
@@ -7819,6 +7894,26 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
             strip_style,
             sort_keys,
         );
+    }
+    // The key nodes of a mapping behind a static navigation (`.a | map(key)`, #5450): the listing
+    // on the navigated node, run as the document it is, so each key keeps its presentation.
+    // (`.a | [.[] | key]` is folded into `[.a[] | key]` once, where the program is built.)
+    if let Some((nav, listing)) = split_leading_static_nav_map_key(expr) {
+        if let GenericResult::OneCursor(navigated) =
+            eval_with_cursor_using::<YqSemantics, _>(&nav, cursor)
+        {
+            if matches!(navigated.value(), YamlValue::Mapping(m) if !m.is_empty()) {
+                return evaluate_yaml_cursor_core(
+                    navigated,
+                    &listing,
+                    sink,
+                    need_comments,
+                    strip_style,
+                    sort_keys,
+                    None,
+                );
+            }
+        }
     }
     // A write behind a static navigation (#2679 for a metadata write, #5286 for any other) is the
     // write on the navigated node, run as the document it is: only when the node is there to be
@@ -11413,6 +11508,10 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     // needs revisiting alongside it.
     if let Err(unresolved) = jq::resolve_func_calls(&mut program.expr) {
         anyhow::bail!("{unresolved}");
+    }
+    // #5450: `.a | [.[] | key]` is `[.a[] | key]`, whose key nodes keep their presentation.
+    if let Some(folded) = fold_nav_into_key_array(&program.expr) {
+        program.expr = folded;
     }
 
     // Parse the --split-exp expression, if given, once up front, applying
