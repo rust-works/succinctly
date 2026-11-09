@@ -27,6 +27,15 @@ fn a_halting_program_comes_before_the_streams_warnings_and_failures_6725() -> Re
         (&["--seq", "--stream", "error(\"x\")"], &["arr", "dir", "two"], "", "jq: error (at @D@/arr:0): x\njq: error (at @D@/dir:0): x\n", 2),
         (&["--seq", "--stream", "."], &["mix", "two"], "\x1e[[],2]\n\x1e[[],2]\n", "jq: ignoring parse error: Unmatched ']' in the middle of an object at line 1, column 3 (need RS to resync)\n", 0),
         (&["--seq", "--stream", "halt"], &["two", "trunc", "mix"], "", "", 0),
+        (&["--seq", "--stream-errors", "."], &["mix", "two"], "\x1e[\"Unmatched ']' in the middle of an object at line 1, column 3 (need RS to resync)\",[null]]\n\x1e[[],2]\n\x1e[[],2]\n", "", 0),
+        (&["--seq", "--stream-errors", "."], &["two", "dir"], "\x1e[[],2]\n", "", 2),
+        (&["--seq", "--stream", "."], &["two", "dir"], "\x1e[[],2]\n", "", 2),
+        (&["--seq", "--stream-errors", "error(\"x\")"], &["arr", "dir", "two"], "", "jq: error (at @D@/arr:0): x\njq: error (at @D@/dir:0): x\n", 2),
+        (&["--seq", "--stream-errors", "error(\"x\")"], &["arr", "dir"], "", "jq: error (at @D@/arr:0): x\njq: error (at @D@/dir:0): x\n", 2),
+        (&["-n", "--seq", "--stream", "[inputs]"], &["two", "miss", "arr"], "\x1e[[[],2]]\n", "jq: error: Could not open file @D@/miss: No such file or directory\n", 2),
+        (&["-n", "--seq", "--stream-errors", "[inputs]"], &["arr", "miss", "two"], "\x1e[[[0],1],[[0]],[[],2]]\n", "jq: error: Could not open file @D@/miss: No such file or directory\n", 2),
+        (&["--seq", "--stream", "[., input]"], &["multi", "two", "miss"], "\x1e[[[],1],[[],2]]\n", "jq: error: Could not open file @D@/miss: No such file or directory\njq: error (at @D@/miss:0): break\n", 2),
+        (&["--seq", "--stream-errors", "[., input]"], &["multi", "dir", "arr"], "\x1e[[[],1],[[],2]]\n", "jq: error: Is a directory\n", 2),
     ];
     let dir = tempfile::tempdir()?;
     let d = dir.path().to_string_lossy().into_owned();

@@ -6994,9 +6994,9 @@ fn read_inputs(
     // #6591: whether a `--seq --stream` run that warns as it goes holds its open failures to place
     // them among the warnings, as `--seq -s` does ([`seq_slurp_places_failures`]).
     let mut seq_stream_places_failures = false;
-    // #6646: `--stream-errors` reads the text as one stream through jq's streaming parser, which
-    // reads a file that did not open as an empty read.
-    // #6725: so does `--seq --stream` (and `--seq --stream-errors`), not slurped.
+    // #6646, #6725: `--stream-errors` and `--seq --stream` read the text as one stream through jq's
+    // streaming parser, which reads a file that did not open as an empty read. Not `--stream` alone
+    // (read as JSON documents, #6680 for its chunked reader).
     // #6730: so does a slurp by the streaming parser (`-s --stream`, `-s --stream-errors`): each file
     // that did not open is one more read of the stream, an empty one, and the fault a token left open
     // across files ends in comes with the read of the last, not of the first.
@@ -8674,8 +8674,10 @@ fn read_inputs(
 /// other). jq's `input` raises a fault it reads as an error, and its main loop prints one it pops as ignored and reads
 /// on, so the records after a fault pair with the main loop as they do in jq. `-s` reads the whole
 /// stream before the program runs, warning as it goes. Only a `--seq` stream read as JSON texts
-/// has the reader: `-R` and `--input-dsv` take over from it, and `--stream`/`--stream-errors` read
-/// it with the streaming parser instead ([`seq_by_stream_reader`]).
+/// has the reader: `-R` and `--input-dsv` take over from it. `--stream`/`--stream-errors` read it
+/// with the streaming parser ([`seq_by_stream_reader`]) and take the same route: its faults
+/// (`--stream`) wait in the queue as the record reader's do, and a failure is said by the read that
+/// reaches the file (#6725).
 fn seq_faults_queued(args: &JqCommand, track_eof: bool) -> bool {
     args.seq
         && !args.raw_input
