@@ -1970,6 +1970,38 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// #6769: yq reads the arguments of `sub` and `with_dtf` as the left and right child of whatever
+    /// node holds them (`getSubstituteParameters`, `withDateTimeFormat`), so a comma spells them as
+    /// well as `;` does: `sub("dogs", "cats")`, `with_dtf("%Y", .a += "3h")`. The first child is
+    /// the pattern (the layout), and the rest is the replacement (the body), a comma again when it
+    /// holds several (`sub("a", "X", "Y")` reads `X`, the first output). Parentheses are only
+    /// grouping there, so `sub(("a", "X"))` is the same call.
+    ///
+    /// `first` is what `parse_expr` read before a `)`. Yq mode only: jq has no such spelling, and
+    /// `succinctly jq` keeps refusing it. Anything but a comma of two or more is handed back.
+    fn split_yq_comma_arguments(&self, first: Expr) -> Result<(Expr, Expr), Expr> {
+        if self.mode != ParserMode::Yq {
+            return Err(first);
+        }
+        let mut inner = &first;
+        while let Expr::Paren(next) = inner {
+            inner = next;
+        }
+        let Expr::Comma(items) = inner else {
+            return Err(first);
+        };
+        if items.len() < 2 {
+            return Err(first);
+        }
+        let mut rest = items[1..].to_vec();
+        let replacement = if rest.len() == 1 {
+            rest.remove(0)
+        } else {
+            Expr::Comma(rest)
+        };
+        Ok((items[0].clone(), replacement))
+    }
+
     /// Check if current position matches a keyword (followed by non-ident char).
     fn matches_keyword(&self, keyword: &str) -> bool {
         self.matches_spelling(keyword)
@@ -6794,6 +6826,45 @@ impl<'a> Parser<'a> {
         Ok(Some((first, second)))
     }
 
+    /// [`Self::parse_required_two_args`] for a builtin whose yq reading also takes a comma (#6769,
+    /// see [`Self::split_yq_comma_arguments`]): `with_dtf("layout", body)`.
+    fn parse_required_two_args_or_comma(
+        &mut self,
+        start_pos: usize,
+    ) -> Result<Option<(Expr, Expr)>, ParseError> {
+        self.skip_ws();
+        if let Err(early) = self.expect_or_none('(', start_pos) {
+            return early;
+        }
+        self.next();
+        self.skip_ws();
+        let first = self.parse_expr()?;
+        self.skip_ws();
+        let first = if self.peek() == Some(')') {
+            match self.split_yq_comma_arguments(first) {
+                Ok(pair) => {
+                    self.next();
+                    return Ok(Some(pair));
+                }
+                Err(first) => first,
+            }
+        } else {
+            first
+        };
+        if self.peek() != Some(';') {
+            return self.builtin_wrong_arity_or_expect(start_pos, ';', vec![first]);
+        }
+        self.next();
+        self.skip_ws();
+        let second = self.parse_expr()?;
+        self.skip_ws();
+        if self.peek() != Some(')') {
+            return self.builtin_wrong_arity_or_expect(start_pos, ')', vec![first, second]);
+        }
+        self.next();
+        Ok(Some((first, second)))
+    }
+
     /// #2036 Direction 3: entry point for every *fixed*-arity special form
     /// (`limit`, `until`, `while`, `repeat`, `range`, `first`, `last`,
     /// `error`). `parse_original` is the keyword's own dedicated parser
@@ -7759,6 +7830,18 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let re = self.parse_expr()?;
             self.skip_ws();
+            let re = if self.peek() == Some(')') {
+                // #6769: the comma spelling, `sub("a", "b")`.
+                match self.split_yq_comma_arguments(re) {
+                    Ok((re, replacement)) => {
+                        self.next();
+                        return Ok(Some(Builtin::Sub(Box::new(re), Box::new(replacement))));
+                    }
+                    Err(re) => re,
+                }
+            } else {
+                re
+            };
             if self.peek() != Some(';') {
                 return self.builtin_wrong_arity_or_expect(keyword_start, ';', vec![re]);
             }
@@ -9199,7 +9282,7 @@ impl<'a> Parser<'a> {
             let keyword_start = self.pos;
             self.consume_keyword("with_dtf");
             return Ok(self
-                .parse_required_two_args(keyword_start)?
+                .parse_required_two_args_or_comma(keyword_start)?
                 .map(|(layout, body)| Builtin::WithDtf(Box::new(layout), Box::new(body))));
         }
 
