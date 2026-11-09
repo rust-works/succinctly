@@ -36,6 +36,7 @@ fn a_last_read_that_fills_the_buffer_is_followed_by_an_empty_read_6760() -> Resu
         ("full.json", full_json),
         ("arr", b"\x1e[1]".to_vec()),
         ("two", b"\x1e2\n".to_vec()),
+        ("empty0", Vec::new()),
         ("p.json", b"[7]".to_vec()),
     ] {
         std::fs::write(dir.path().join(name), bytes)?;
@@ -45,7 +46,7 @@ fn a_last_read_that_fills_the_buffer_is_followed_by_an_empty_read_6760() -> Resu
     assert_eq!(std::fs::metadata(dir.path().join("long.seq"))?.len(), 4096);
     assert_eq!(std::fs::metadata(dir.path().join("full.json"))?.len(), 4095);
     #[rustfmt::skip]
-    let rows: [Row<'_>; 15] = [
+    let rows: [Row<'_>; 18] = [
         (&["-c", "--seq", "--stream", "."][..], &["full.seq", "arr"][..], "\u{1e}[[0],1]\n\u{1e}[[0]]\n", "", 0),
         (&["-c", "--seq", "--stream-errors", "."][..], &["full.seq", "arr"][..], "\u{1e}[[0],1]\n\u{1e}[[0]]\n", "", 0),
         (&["-c", "--seq", "--stream", "[., input_filename]"][..], &["full.seq", "arr"][..], "\u{1e}[[[0],1],\"@DIR@/full.seq\"]\n\u{1e}[[[0]],\"@DIR@/full.seq\"]\n", "", 0),
@@ -61,6 +62,9 @@ fn a_last_read_that_fills_the_buffer_is_followed_by_an_empty_read_6760() -> Resu
         (&["-c", "--stream-errors", "."][..], &["full.json", "dir", "gone"][..], "[[0],1]\n[[0]]\n", "jq: error: Is a directory\njq: error: Could not open file @DIR@/gone: No such file or directory\n", 2),
         (&["-c", "--seq", "--stream", "."][..], &["full.seq", "gone"][..], "\u{1e}[[0],1]\n\u{1e}[[0]]\n", "jq: error: Could not open file @DIR@/gone: No such file or directory\n", 2),
         (&["-c", "--seq", "--stream", "."][..], &["short.seq", "gone"][..], "\u{1e}[[0],1]\n\u{1e}[[0]]\n", "jq: error: Could not open file @DIR@/gone: No such file or directory\n", 2),
+        (&["-c", "--seq", "--stream", "."][..], &["full.seq"][..], "\u{1e}[[0],1]\n\u{1e}[[0]]\n", "", 0),
+        (&["-c", "--stream", "[., input_filename]"][..], &["full.json"][..], "[[[0],1],\"@DIR@/full.json\"]\n[[[0]],\"@DIR@/full.json\"]\n", "", 0),
+        (&["-c", "--stream-errors", "[., input_filename]"][..], &["full.json", "empty0"][..], "[[[0],1],\"@DIR@/full.json\"]\n[[[0]],\"@DIR@/full.json\"]\n", "", 0),
     ];
     for (flags, names, stdout, stderr, status) in rows {
         let files: Vec<String> = names.iter().map(|name| format!("{d}/{name}")).collect();

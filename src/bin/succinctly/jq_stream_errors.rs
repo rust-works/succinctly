@@ -330,8 +330,12 @@ impl RefillSource for ChunkedSources {
                 self.unsettled = false;
                 // Whether the last chunk ended its source is found now, by the first read of the
                 // next one.
+                let mut clean_eof = false;
                 let ended = match reader.fill_buf() {
-                    Ok(available) => available.is_empty(),
+                    Ok(available) => {
+                        clean_eof = available.is_empty();
+                        clean_eof
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => false,
                     Err(e) => {
                         self.fail(e);
@@ -342,7 +346,8 @@ impl RefillSource for ChunkedSources {
                 if ended {
                     self.current = None;
                     self.source += 1;
-                    if filled && !last_source {
+                    // Only at the end of the file: a read error is not an empty read.
+                    if filled && clean_eof && !last_source {
                         // jq's `fgets` filled its buffer and has not seen the end of the file, so
                         // it reads once more, gets nothing, and a closing event the file held
                         // back comes out in this file (#6760).
@@ -1925,7 +1930,17 @@ mod tests {
         let long_line = format!("[{}1]\n[2]\n", "1,".repeat(3000));
         let exact: String = format!("[{}]\n{{\"a\":1}}\n", "1".repeat(4095 - 3)); // 4095-byte first line
         let one_over: String = format!("[{}]\n7", "1".repeat(4096 - 3));
+        // #6760: a source whose last read fills the buffer with no newline, one that ends in a
+        // NUL at the buffer's edge, and each followed by another source or by none.
+        let full: String = format!("[{}]", "1".repeat(4095 - 2));
+        let full_nul: String = format!("[{}\u{0}", "1".repeat(4095 - 2));
         let streams: Vec<Vec<&str>> = vec![
+            vec![&full],
+            vec![&full, "[2]"],
+            vec![&full, "", "[2]"],
+            vec!["[1]\n", &full, "}\n", "[3"],
+            vec![&full_nul, "[2]"],
+            vec![&full, &full, "7"],
             vec![""],
             vec!["1"],
             vec!["[1,2]"],
@@ -2556,6 +2571,7 @@ mod tests {
             b"a\0b".to_vec(),
             long(JQ_FGETS_CHUNK - 1, b"\n"),
             long(JQ_FGETS_CHUNK, b""),
+            long(JQ_FGETS_CHUNK - 1, b"\0"),
             long(JQ_FGETS_CHUNK, b"\n"),
             long(JQ_FGETS_CHUNK + 1, b""),
             long(2 * JQ_FGETS_CHUNK, b"\nx"),
