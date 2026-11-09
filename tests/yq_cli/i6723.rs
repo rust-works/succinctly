@@ -65,7 +65,11 @@ fn test_the_shapes_that_keep_the_mappings_own_path_6723() -> Result<()> {
         ),
     ] {
         let (stdout, code) = run_yq_stdin(filter, document, JSON)?;
-        assert_eq!((stdout.as_str(), code), (want, 0), "{filter} on {document:?}");
+        assert_eq!(
+            (stdout.as_str(), code),
+            (want, 0),
+            "{filter} on {document:?}"
+        );
     }
     Ok(())
 }
