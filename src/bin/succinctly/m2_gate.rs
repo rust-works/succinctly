@@ -236,7 +236,6 @@ fn forwards_nodes(stage: &Expr) -> bool {
     match stage {
         Expr::Identity | Expr::Iterate | Expr::Builtin(Builtin::Select(_)) => true,
         Expr::Optional(inner) | Expr::Paren(inner) => forwards_nodes(inner),
-        Expr::Pipe(stages) => stages.iter().all(forwards_nodes),
         _ => false,
     }
 }
@@ -519,14 +518,7 @@ mod tests {
                         );
                     }
                     GenericResult::Error(_) | GenericResult::None => {}
-                    other => panic!(
-                        "{shape} over {doc:?} answered {}",
-                        match other {
-                            GenericResult::One(_) | GenericResult::OneCursor(_) => "a node",
-                            GenericResult::Owned(_) => "an owned value",
-                            _ => "another result",
-                        }
-                    ),
+                    _ => panic!("{shape} over {doc:?} did not answer cursors"),
                 }
             }
         }
