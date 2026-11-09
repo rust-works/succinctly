@@ -6519,6 +6519,16 @@ fn meta_rhs_nodes(current: &OwnedValue, value: &Expr, sink: &mut ErrorSink) -> V
     nodes
 }
 
+/// The branches of a union of targets, parentheses and nested commas peeled (#6792): `((.a | key),
+/// .b)` is `(.a | key)` and `.b`, and any other expression is its own one branch.
+fn union_branches(expr: &Expr) -> Vec<&Expr> {
+    match expr {
+        Expr::Paren(inner) => union_branches(inner),
+        Expr::Comma(items) => items.iter().flat_map(union_branches).collect(),
+        other => vec![other],
+    }
+}
+
 /// Resolve one `Expr::MetaAssign` stage against `current`, the document it
 /// runs on, pushing one [`ResolvedMetaWrite`] per candidate onto `out`.
 /// Returns `false` (after reporting via `sink`) only on a genuine
@@ -6547,7 +6557,17 @@ fn resolve_one_meta_assign(
     let with_keys = matches!(target, Expr::RecursiveDescentWithKeys);
     // `(PATH | key)` addresses the key node of the member `PATH` names (#2796).
     let key_prefix = target.key_node_prefix();
-    if (with_keys || key_prefix.is_some())
+    // A union of targets (`((.a | key), .b)`) takes each branch on its own (#6792): a `(PATH | key)`
+    // branch names key nodes, the others values, and a branch must not be lost for being
+    // spelled inside a comma, where the whole target is no `(PATH | key)`.
+    let branches = union_branches(target);
+    let mixed_keys = key_prefix.is_none()
+        && !with_keys
+        && branches.len() > 1
+        && branches
+            .iter()
+            .any(|branch| branch.key_node_prefix().is_some());
+    if (with_keys || key_prefix.is_some() || mixed_keys)
         && matches!(
             slot,
             WritableSlot::Style | WritableSlot::Anchor | WritableSlot::Tag
@@ -6564,31 +6584,40 @@ fn resolve_one_meta_assign(
         );
         return false;
     }
-    let path_target = if with_keys {
-        Expr::RecursiveDescent
-    } else if let Some(prefix) = &key_prefix {
-        prefix.clone()
-    } else {
-        target.clone()
-    };
-    let path_expr = Expr::Builtin(Builtin::Path(Box::new(path_target)));
-    let Some(paths) = evaluate_input_quiet(current, &path_expr) else {
-        return true;
-    };
-    let paths: Vec<Vec<MetaPathStep>> = paths
-        .iter()
-        .filter_map(|p| meta_path_from_value(p, current))
-        .collect();
-    if paths.is_empty() {
-        return true;
-    }
     // A key target keeps the members only: the key of a sequence item is its index, not a node.
-    let key_target = key_prefix.is_some();
-    let mut paths: Vec<(Vec<MetaPathStep>, bool)> = paths
-        .into_iter()
-        .filter(|path| !key_target || matches!(path.last(), Some(MetaPathStep::Key(_))))
-        .map(|path| (path, key_target))
-        .collect();
+    let key_target = key_prefix.is_some() || mixed_keys;
+    let mut paths: Vec<(Vec<MetaPathStep>, bool)> = Vec::new();
+    let one_target = [target];
+    let per_branch: &[&Expr] = if mixed_keys { &branches } else { &one_target };
+    for branch in per_branch {
+        let branch_prefix = if mixed_keys {
+            branch.key_node_prefix()
+        } else {
+            key_prefix.clone()
+        };
+        let path_target = if with_keys {
+            Expr::RecursiveDescent
+        } else if let Some(prefix) = &branch_prefix {
+            prefix.clone()
+        } else {
+            (*branch).clone()
+        };
+        let path_expr = Expr::Builtin(Builtin::Path(Box::new(path_target)));
+        let Some(found) = evaluate_input_quiet(current, &path_expr) else {
+            if mixed_keys {
+                continue;
+            }
+            return true;
+        };
+        let is_key = branch_prefix.is_some();
+        paths.extend(
+            found
+                .iter()
+                .filter_map(|p| meta_path_from_value(p, current))
+                .filter(|path| !is_key || matches!(path.last(), Some(MetaPathStep::Key(_))))
+                .map(|path| (path, is_key)),
+        );
+    }
     if paths.is_empty() {
         return true;
     }
@@ -6656,6 +6685,10 @@ fn resolve_one_meta_assign(
     // before the assignment (`apply_set_entry`), which is what lets a head one target leaves on
     // the next key stand beside that key's own write.
     let single_target = texts.len() == 1;
+    // Key nodes keep their comments on their own member, so several of them do not interact
+    // (#6792); a key among value targets does (the next key's head is a value's head), which is
+    // refused.
+    let only_keys = texts.iter().all(|(_, on_key, _)| *on_key);
     let batch = out.len();
     for (path, on_key, s) in texts {
         // A key node's trailing comment is the key line's own, not the value's: only the
@@ -6672,7 +6705,7 @@ fn resolve_one_meta_assign(
             | WritableSlot::KeyLineComment => {
                 // A key node takes a text (#2796): its head above the key, its line comment on the
                 // key's line and its foot below the entry, which is what the entry's own lines are.
-                if key_target && single_target && on_key && !s.is_empty() {
+                if key_target && (single_target || only_keys) && on_key && !s.is_empty() {
                     let keyword = match slot {
                         WritableSlot::HeadComment => "head_comment",
                         WritableSlot::FootComment => "foot_comment",

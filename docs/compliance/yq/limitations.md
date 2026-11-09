@@ -5344,9 +5344,13 @@ ruled out), even though real yq supports every one of them:
   head first (`# x`, `a: 1 # x`, `# x`, a blank, `b:`). A foot or a line comment already
   there (go-yaml prints a key's line comment on a later line when the value has one), a line
   comment on a container value (a different slot), anything under a flow collection,
-  `style`/`anchor`, a newline-only text and several targets are refused. Checked by 11
-  `meta_assign_key_*_2796` goldens and a differential fuzz of ~7,200 accepted writes over
+  `style`/`anchor` and a newline-only text are refused.
+  Several key targets are written when every target is a key node (`(.[] | key) head_comment = "x"`, `((.a | key), (.c | key)) comments = "x"`, `|=` too), since a key keeps its comments on its own member ([#6792](https://github.com/rust-works/succinctly/issues/6792)).
+  A key node among value targets (`((.a | key), .b) head_comment = "x"`) is refused: a value's head is the next key's, and the order go-yaml's emitter resolves the two in is not modelled.
+  Before #6792 that key target was dropped without a word, as was a `(PATH | key)` branch of any union.
+  Checked by 11 `meta_assign_key_*_2796` goldens, 9 `meta_assign_keys_*_6792` ones (two of them the refused mixed shapes) and a differential fuzz of ~7,200 accepted writes over
   random documents with and without comments (none differed; ~2,000 more were refused).
+  A 224-row matrix of key targets against yq has 116 rows that match, and none silently different (before: 120 rows exited 0 with a different result).
 - **The clearing forms are written** ([#2796](https://github.com/rust-works/succinctly/issues/2796),
   part 1): `head_comment = ""`, `foot_comment = ""`, `comments = ""` and `line_comment = ""`,
   `=` or `|=`, on any target, and `...` (yq's recursive descent that also visits mapping
