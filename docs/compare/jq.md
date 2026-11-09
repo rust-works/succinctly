@@ -6,5 +6,5 @@ Generated comparison of `jq` 1.7.1 (primary) and 1.8.1 (secondary) with `succinc
 
 | Platform | CPU | Commit | Builtins agreeing | CLI probes | Upstream jq tests | Geomean speedup |
 |----------|-----|--------|-------------------|------------|-------------------|-----------------|
-| [linux-x86_64](jq-linux-x86_64.md) | AMD Ryzen 9 7950X 16-Core Processor | `7ca2b70e2` | 98.1% | 470/482 | 738/738 | 1.63x |
-| [macos-aarch64](jq-macos-aarch64.md) | Apple M4 Pro | `b53b0f9a5` | 98.1% | 466/474 | 738/738 | 1.85x |
+| [linux-x86_64](jq-linux-x86_64.md) | AMD Ryzen 9 7950X 16-Core Processor | `66e7eaf` | 98.1% | 470/482 | 738/738 | 1.74x |
+| [macos-aarch64](jq-macos-aarch64.md) | Apple M4 Pro | `66e7eaf` | 98.1% | 474/482 | 738/738 | 1.96x |
