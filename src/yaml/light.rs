@@ -1913,14 +1913,24 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             // An anchor, a tag or a comment on the `:` line keeps the first entry
                             // off it (#4950: `? key` / `: &a` / `  a: 1`, `? key` / `: # c` /
                             // `  a: 1`).
+                            // `? key` / `: a: 1`: the value's first entry shares the `:` line
+                            // (#3587), at the column its own continuation lines are at (#6738):
+                            // `child_indent` is rounded up from the key's column, so inside a
+                            // `- ` item it is not one step in. With no room for a blank between
+                            // the `:` and that column the entry goes on a line of its own, as
+                            // yq's does (`:- 1` is not a sequence).
+                            let pad = if unit == ' ' {
+                                child_indent.len().saturating_sub(indent.len() + 1)
+                            } else {
+                                indent_spaces.saturating_sub(1)
+                            };
                             if explicit_key
                                 && !key_comment_written
                                 && value.anchor().is_none()
                                 && value.explicit_tag_at(None).is_none()
+                                && pad > 0
                             {
-                                // `? key` / `: a: 1`: the value's first entry shares the
-                                // `:` line (#3587), at the column one indent step in.
-                                for _ in 1..indent_spaces {
+                                for _ in 0..pad {
                                     out.write_char(' ')?;
                                 }
                             } else {
@@ -9489,9 +9499,21 @@ fn write_yaml_block_field_key<W: AsRef<[u64]>, Out: core::fmt::Write>(
                 .saturating_sub(indent.chars().count() + 1)
                 .max(1)
         };
+        // #6738: with no room for a blank between the `?` and the column the key's other lines
+        // stand at (`-I=3` inside a compact sequence entry), the block key starts on a line of its
+        // own, as yq's does: `? - a` would put its first line one column past the rest.
+        let no_room = unit == ' '
+            && !flow
+            && properties.is_empty()
+            && child_indent.chars().count() <= indent.chars().count() + 1;
         out.write_char('?')?;
-        for _ in 0..blanks {
-            out.write_char(' ')?;
+        if no_room {
+            out.write_char('\n')?;
+            out.write_str(&child_indent)?;
+        } else {
+            for _ in 0..blanks {
+                out.write_char(' ')?;
+            }
         }
         if !properties.is_empty() {
             out.write_str(&properties)?;

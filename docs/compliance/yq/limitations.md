@@ -3143,7 +3143,7 @@ keys that share one fallback spelling (the guard still refuses those).
 **A collection key is written as the key node on the cursor route (#6496).**
 `.` and navigation over a mapping with a key that is a sequence, a mapping or a flow collection write `? - p` / `: v` as yq does; they wrote `"": v` before.
 An empty `[]` or `{}` key is written `[]: v`, a simple key.
-A collection key under a compact sequence entry with `-I=3` or a larger step pads the value's `:` line by the indent step (`:   - v`), as it already did for a scalar key.
+A collection key under a compact sequence entry starts its value, and its own first line, at the column its continuation lines stand at (`: - v` under `-I=4`), and on a line of its own when there is no room for a blank (`-I=3`), as yq does ([#6738](https://github.com/rust-works/succinctly/issues/6738)).
 A value's comment on the `:` line of a collection key moves to the end of its text in yq (`: x # c`) and is dropped here.
 A comment on the `?` line above a block collection key (`? # c` / `  - p`) is written at the end of the key's first line in yq (`? - p # c`) and is dropped here.
 A flow mapping that holds a collection key (`{[a]: v}`) still writes `{"": v}` where yq writes `{? [a] : v}`: the flow writer has no explicit-key form for it.
