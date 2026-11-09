@@ -44179,12 +44179,14 @@ mod tests {
             "map(. + 1 | . as $x | . + $x)",
             "map(. + 1 | . as $x | . as $y | $x + $y)",
             "map(. + 1 | (. as $x | $x))",
+            // #6620: a comma of such elements, each one output.
+            "map(. + 1 | [., ., 3])",
         ] {
             assert_eq!(reindexes(filter), 0, "{filter} bridged");
         }
         // A generator element, a body the owned routes do not answer, a NaN, a destructuring bind
         // and `?` keep the bridge.
-        assert!(reindexes("map(. + 1 | [., .])") > 0);
+        assert!(reindexes("map(. + 1 | [range(.)])") > 0);
         assert!(reindexes("map(. + 1 | {a: (., 1)})") > 0);
         assert!(reindexes("map(. + 1 | {(\"k\"): .})") > 0);
         assert!(reindexes("map(. + 1 | . as $x | [$x, .] | length)") > 0);
