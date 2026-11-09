@@ -54,13 +54,14 @@ fn test_recurse_cond_true_answers_what_recursive_descent_answers_4095() -> Resul
 }
 
 /// The owned walk this replaces expanded an alias, so `recurse(.[]?; true)` visited the anchor's
-/// children again at every alias; `recurse(.[]?)` and `..` already stopped there (#3719, #4214).
+/// children again at every alias; `recurse(.[]?)` and `..` already stopped there (#3719, #4214). 26 is yq v4.53.3's
+/// count: `d`'s merged members are not walked from `d` (#5000; they counted before, making 29).
 #[test]
 fn test_recurse_cond_stops_at_an_alias_4095() -> Result<()> {
     for (filter, want) in [
-        ("[recurse(.[]?; true)] | length", "29"),
-        ("[..] | length", "29"),
-        ("[recurse(.[]?)] | length", "29"),
+        ("[recurse(.[]?; true)] | length", "26"),
+        ("[..] | length", "26"),
+        ("[recurse(.[]?)] | length", "26"),
         (".e | [recurse(.[]?; true)] | length", "8"),
         (".e | [..] | length", "8"),
     ] {

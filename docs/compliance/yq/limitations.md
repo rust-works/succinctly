@@ -3241,8 +3241,10 @@ yq's JSON rendering leaves an *inline-mapping* source out (`<<: {q: 1}` renders 
 The library view `succinctly jq` over YAML reads keeps the inline source's keys in the rendering, because no reference tool drops them there.
 The rule applies to the direct JSON writers (`-o json` of a document node, `.`, `.item`, a nested value), not to a value the evaluator materializes first.
 `[.item]`, `{a: .item}`, `.item | tojson`, `. * {}` and a write such as `.item.k = 1` still list the inline source's keys in JSON, because a write expands the merge key and dropping the source there would drop its keys from the document.
+`..` walks a mapping's own entries (the `<<` key and its aliases among them) and does not descend into the merged members, as yq does, since [#5000](https://github.com/rust-works/succinctly/issues/5000) (over a live node; a mapping a write or construction materialized first has no `<<` entry left to list, below).
 Still divergent: `path` of a merged member
-names its anchor's location in yq (`["a","x"]`) and the mapping's own here (`["item","x"]`); `..` does not descend into a merged mapping's members at all in yq, and walks them here (in the iteration's order since #4983, the rendering's before). `to_entries`, `with_entries`, `paths` and `tostream` keep the rendering's order.
+names its anchor's location in yq (`["a","x"]`) and the mapping's own here (`["item","x"]`).
+`to_entries`, `with_entries`, `paths` and `tostream` keep the rendering's order.
 
 Still divergent, because the mapping is no longer a document node by the time the builtin runs
 and an owned object has no `<<` entry to list:
