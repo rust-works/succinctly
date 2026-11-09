@@ -4868,6 +4868,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     // no fault to order and is taken off the queue again by #5674's probe.
     let uses_input_builtins = program_reads_inputs || seq_faults_by_queue(&args);
     PROGRAM_READS_INPUTS.with(|reads| reads.set(program_reads_inputs));
+    PROGRAM_PULLS_INPUTS.with(|pulls| pulls.set(jq::walk::pulls_inputs(&expr)));
 
     // Configure output
     let output_config = OutputConfig::from_args(&args);
@@ -7663,11 +7664,15 @@ fn read_inputs(
                     "{}",
                     crate::jq_seq_reader::ignored_parse_error(&fault.message)
                 );
-            } else if slurp_stopped || (eof_term_dropped(&fault) && !track_eof) {
+            } else if slurp_stopped
+                || (eof_term_dropped(&fault)
+                    && !(track_eof && PROGRAM_PULLS_INPUTS.with(std::cell::Cell::get)))
+            {
                 // Never said (#6700): a warning stopped the loop first, so no program runs (#6676),
                 // or the program cannot read it. One that names `input` is handed it, and says it
                 // only if a read reaches it: the main loop never does, having read past the failure
-                // for the array ([`main_loop_reads_on`]).
+                // for the array ([`main_loop_reads_on`]). `input_line_number` reads nothing, so it
+                // is not handed it (#6774).
             } else if trailing_error.is_none() {
                 // The warning of a call after the slurped array: jq prints it once the program
                 // has run on the array, and has lost its position by then (#3201). Only one can
@@ -9676,6 +9681,10 @@ thread_local! {
     /// [`read_inputs`]' `track_eof` cannot say for `--seq`: its main loop reads through the queue
     /// whatever the program is.
     static PROGRAM_READS_INPUTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether the program calls `input` or `inputs` (#6774): the part of
+    /// [`PROGRAM_READS_INPUTS`] that reads the text after the read it is in. `input_line_number`
+    /// asks where the read stands and reads nothing, so a warning it cannot reach is not said.
+    static PROGRAM_PULLS_INPUTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The name of the last file named, when it did not open (#6480), for [`get_inputs`] to give a
     /// source of its own.
     static UNOPENED_TAIL_NAME: RefCell<Option<String>> = const { RefCell::new(None) };
