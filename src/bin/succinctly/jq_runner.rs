@@ -7059,7 +7059,6 @@ fn read_inputs(
                 // held back, as one in the middle is: the loop stops there, short of a fault at the
                 // end of the text.
                 || (failed_as_sources
-                    && !args.slurp
                     && seq_by_stream_reader(args)
                     && failure.kind == InputFileErrorKind::Directory { last: true });
             note_open_failure_at(at.saturating_sub(usize::from(held_back_at_directory)));

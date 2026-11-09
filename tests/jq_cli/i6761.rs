@@ -25,6 +25,10 @@ fn a_last_directory_stops_the_loop_at_the_closer_the_file_before_it_held_back_67
         (&["--seq", "--stream", "."], &["arr", "dir"], "\x1e[[0],1]\n\x1e[[0]]\n", "", 2),
         (&["--seq", "--stream", "."], &["arr", "nors", "dir"], "\x1e[[0],1]\n\x1e[[0]]\n\x1e[[0],1]\n\x1e[[0]]\n", "", 2),
         (&["--seq", "--stream-errors", "."], &["trunc", "dir"], "\x1e[[0],1]\n\x1e[\"Unfinished JSON term at EOF at line 1, column 4\",[1]]\n", "", 2),
+        (&["--stream-errors", "."], &["trunc", "nors", "dir"], "[\"Invalid numeric literal at line 1, column 2\",[]]\n[[0],1]\n[[0]]\n", "", 2),
+        (&["-n", "--seq", "--stream", "[inputs]"], &["trunc", "nors", "dir"], "", "jq: error: Is a directory\njq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 7\n", 2),
+        (&["--seq", "--stream", "."], &["dir", "trunc", "nors"], "\x1e[[0],1]\n", "jq: error: Is a directory\n", 2),
+        (&["--seq", "--stream", "."], &["nors", "dir"], "", "jq: ignoring parse error: Unfinished abandoned text at EOF at line 1, column 3\n", 2),
     ];
     let dir = tempfile::tempdir()?;
     let d = dir.path().to_string_lossy().into_owned();
