@@ -9935,8 +9935,9 @@ fn first_value_completes_at(raws: &[Vec<u8>], at: usize, args: &JqCommand) -> bo
             let completes = if text_ends_in_string(&raws[..at]) {
                 source_ends_cleanly(raw, args)
             } else {
-                raw.iter()
-                    .any(|&byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')))
+                raw.iter().any(|&byte| {
+                    !(byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+                })
             };
             return completes && first_stream_fault(&raws[at..=at]).is_none();
         }
