@@ -49,6 +49,20 @@ fn a_program_that_reads_one_input_says_the_slurps_last_directory_6789() -> Resul
     ])
 }
 
+/// A failed file ahead of the directory is said by the slurp's own read, so the directory is still
+/// the program's first read after it; and a program that reads twice says it once.
+#[test]
+fn an_earlier_failure_does_not_move_the_slurps_directory_read_6789() -> Result<()> {
+    check(&[
+        (&["--seq", "-s", "--stream-errors", "input"], &["gone", "trunc", "pa", "dir"], "\x1e[\"Unfinished JSON term at EOF at line 1, column 7\",[1]]\n", "jq: error: Could not open file @D@/gone: No such file or directory\njq: error: Is a directory\n", 2),
+        (&["--seq", "-s", "--stream-errors", "input"], &["trunc", "gone", "pa", "dir"], "\x1e[\"Unfinished JSON term at EOF at line 1, column 7\",[1]]\n", "jq: error: Could not open file @D@/gone: No such file or directory\njq: error: Is a directory\n", 2),
+        (&["--seq", "-s", "--stream-errors", "[., input]"], &["trunc", "pa", "gone", "dir"], "", "jq: error: Could not open file @D@/gone: No such file or directory\njq: error: Is a directory\njq: error (at <unknown>): break\n", 2),
+        (&["--seq", "-s", "--stream-errors", "(try input catch .), (try input catch .)"], &["trunc", "gone", "pa", "dir"], "\x1e[\"Unfinished JSON term at EOF at line 1, column 7\",[1]]\n\x1e\"break\"\n", "jq: error: Could not open file @D@/gone: No such file or directory\njq: error: Is a directory\n", 2),
+        (&["--seq", "-s", "--stream-errors", "[., input, input]"], &["trunc", "pa", "dir"], "", "jq: error: Is a directory\njq: error (at <unknown>): break\n", 2),
+        (&["--seq", "-s", "--stream-errors", "."], &["trunc", "gone", "pa", "dir"], "\x1e[[[0],1],[[1,0],1],[[1,0]]]\n", "jq: error: Could not open file @D@/gone: No such file or directory\n", 2),
+    ])
+}
+
 /// Rows that matched jq before: a program that reads to the end, a last file that is missing, the
 /// other readers, and `-n`.
 #[test]

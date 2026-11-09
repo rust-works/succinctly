@@ -10162,6 +10162,9 @@ fn report_reached_open_failures(read: Option<u32>, fault: bool) {
             .with(|ends| ends.borrow_mut().pop_front())
             .unwrap_or_else(|| FAULT_ENDS_TEXT.with(std::cell::Cell::get));
     let read = read.filter(|_| !ends_text);
+    // #6789: a slurp's own read is the first one made; the failures it reaches before the directory
+    // given last do not change that, so the flag is taken here and not where the directory is met.
+    let after_slurp_read = SLURP_READ_SEEN.with(|seen| seen.replace(true));
     // #6725: a read that comes from a directory in the middle of the list (the closer the file
     // before it held back, read where its own read failed) has counted the failure already,
     // which makes the run exit 2 whatever else it does; what jq says of it comes on a read after.
@@ -10184,8 +10187,11 @@ fn report_reached_open_failures(read: Option<u32>, fault: bool) {
                 .is_some_and(|(_, failure)| is_last_directory_outside_slurp(failure));
             let reached = match pending.front() {
                 Some(&(at, _)) if last_directory => reach_last_directory(at, read),
-                Some((at, failure)) if failure.is_last_directory() => {
-                    slurp_directory_reached(*at, read)
+                Some((at, failure))
+                    if failure.is_last_directory()
+                        && SLURP_DIRECTORY_READ.with(std::cell::Cell::get) =>
+                {
+                    slurp_directory_reached(*at, read, after_slurp_read)
                 }
                 Some(&(at, _)) => read.map_or(true, |source| at <= source as usize),
                 None => false,
@@ -10240,9 +10246,8 @@ fn reach_last_directory(at: usize, read: Option<u32>) -> bool {
 /// own, which went through the directory when it read every file: jq's reader says the failure on
 /// the next read it is asked for, whatever that read returns (the fault event a `--seq -s
 /// --stream-errors` stream ends in is such a read). The main loop's own read never says it.
-fn slurp_directory_reached(at: usize, read: Option<u32>) -> bool {
-    let read_before = SLURP_READ_SEEN.with(|seen| seen.replace(true));
-    (read_before && REPORTED_BY_READ.with(std::cell::Cell::get))
+fn slurp_directory_reached(at: usize, read: Option<u32>, after_slurp_read: bool) -> bool {
+    (after_slurp_read && REPORTED_BY_READ.with(std::cell::Cell::get))
         || read.map_or(true, |source| at <= source as usize)
 }
 
