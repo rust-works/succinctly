@@ -7263,11 +7263,11 @@ fn read_inputs(
                 defer_open_failures(directory, fault_ends_text);
             } else if main_loop_only
                 && failed_as_sources
-                && matches!(
-                    failures[0].1.kind,
-                    InputFileErrorKind::Directory { last: false }
-                )
-                && held_back_closer_before(args, &raws, &failures[0])
+                // #6755: every file may have opened, which leaves nothing to index.
+                && failures.first().is_some_and(|first| {
+                    matches!(first.1.kind, InputFileErrorKind::Directory { last: false })
+                        && held_back_closer_before(args, &raws, first)
+                })
             {
                 // #6646: the main loop ends at the read of a directory that delivers the held-back
                 // closer, which counts the failure and says nothing: the message comes on the
