@@ -7044,10 +7044,15 @@ fn read_inputs(
             // message is placed past it, where the reader moves on.
             // #6730: a slurp by the streaming parser reads a last directory in the call that closes
             // its array, so the loop has stopped by the time it would read what follows.
-            let held_back_at_directory = failed_as_sources
+            // So does `--seq -s --stream-errors`, whose fault is an event of the stream as well.
+            let held_back_at_directory = (failed_as_sources
                 && (failure.kind == InputFileErrorKind::Directory { last: false }
                     || (slurp_by_stream_parser(args)
-                        && failure.kind == InputFileErrorKind::Directory { last: true }));
+                        && failure.kind == InputFileErrorKind::Directory { last: true })))
+                || (seq_by_stream_reader(args)
+                    && args.slurp
+                    && args.stream_errors
+                    && failure.kind == InputFileErrorKind::Directory { last: true });
             note_open_failure_at(at.saturating_sub(usize::from(held_back_at_directory)));
         }
         // #6475: under `-n` the program asks for each file as it goes, and says what it cannot
@@ -7608,7 +7613,16 @@ fn read_inputs(
             && raw_bytes
                 .iter()
                 .rposition(|(_, raw)| !raw.is_empty())
-                .is_some_and(|last| held_open_failures.iter().all(|&(at, _)| at <= last));
+                .is_some_and(|last| {
+                    // #6730: one failure behind the last file with bytes is the read that brings out the
+                    // closing event that file held back, and the fault comes after the array; a second one
+                    // is the read the fault is met in, inside the array.
+                    held_open_failures
+                        .iter()
+                        .filter(|&&(at, _)| at > last)
+                        .count()
+                        <= 1
+                });
         let eof_term_dropped = |fault: &crate::jq_stream_errors::SeqFault| -> bool {
             eof_term_after_failures
                 && fault.after_array
