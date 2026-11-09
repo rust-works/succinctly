@@ -3285,7 +3285,7 @@ The rule applies to the direct JSON writers (`-o json` of a document node, `.`, 
 A write through `..` behind a path step (`.item | (.. | select(tag == "!!int")) |= 7`) and a mapping a write or construction materialized first still walk the merged members (yq changes only `k` there; [#6718](https://github.com/rust-works/succinctly/issues/6718)).
 `path`, `key` and `parent` of a merged member name its anchor's location, as yq does, since [#6723](https://github.com/rust-works/succinctly/issues/6723): `.item.x | path` is `["a","x"]` where it was `["item","x"]`, and a step taken from it carries on from there (`.item.x.p | path` is `["a","x","p"]`).
 Only the path-context walk (`path`, `key`, `parent`, `parents`) names it that way; a write through the same path keeps the mapping's own entry (`.item.x = 5` changes `item`'s copy, where yq changes the shared anchor's `x`).
-Two shapes keep the mapping's own path because the walk cannot climb to them: a member of an inline `<<: {q: 1}` (`["item","<<","q"]` in yq, `["item","q"]` here) and a literal `<<` entry listed for two merge sources that each merge.
+Two shapes keep the mapping's own path because the walk cannot climb to them: a member of an inline `<<: {q: 1}` (`["item","<<","q"]` in yq, `["item","q"]` here), and the entries behind a merge of a mapping that itself merges (`n2: {<<: *n}` with `n: &n {<<: *b, m: 1}`): `[.n2[] | path]` lists a literal `<<` entry where yq lists `b`'s entries (`[["n2","<<"],["n","m"]]` here, `[["b","x"],["b","w"],["n","m"]]` in yq), though a member named directly (`.n2.x | path`) is placed.
 `to_entries`, `with_entries`, `paths` and `tostream` keep the rendering's order.
 
 Still divergent, because the mapping is no longer a document node by the time the builtin runs

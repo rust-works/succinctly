@@ -28750,6 +28750,10 @@ type StepEmit<'e, V, T> = &'e mut dyn for<'k> FnMut(T, PathNode<V>, MemberKey<'k
 ///
 /// `Clone` shares the trail (an `Rc` bump) for a step that keeps the position.
 trait StepTrail<V: DocumentValue>: Clone {
+    /// Whether the trail takes [`extend_member_located`](Self::extend_member_located)'s location, so a
+    /// step computes it only for a trail that uses it (#6723): the write-path trail never does.
+    const LOCATES: bool = false;
+
     /// Steps taken by native recursion since this walk's own root; O(1) --
     /// what [`guard_path_walk_depth`] guards against a Rust stack overflow,
     /// not the trail's distance from the *document* root (#3020). `PathTrail`
@@ -29143,6 +29147,8 @@ impl<V: DocumentValue> PathContextTrail<V> {
 }
 
 impl<V: DocumentValue> StepTrail<V> for PathContextTrail<V> {
+    const LOCATES: bool = true;
+
     fn recursion_depth(&self) -> usize {
         self.depth() - self.seed_depth()
     }
@@ -29366,7 +29372,9 @@ fn path_field_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
                 empty_fields_tail_gap_ok(&fields, Some(c))?;
                 match crate::jq::key_index::find_cursor_memoized(&fields, name)? {
                     Some(fc) => {
-                        located = merged_member_location::<S, V>(&fields, c, &fc);
+                        if T::LOCATES {
+                            located = merged_member_location::<S, V>(&fields, c, &fc);
+                        }
                         PathNode::At(fc)
                     }
                     None => PathNode::Absent,
@@ -47770,17 +47778,16 @@ mod tests {
     /// nothing never builds the fields that would answer.
     #[test]
     fn merged_member_location_is_only_for_a_member_the_mapping_does_not_hold_6723() {
-        use crate::yaml::{YamlIndex, YamlValue};
-
-        let yaml = b"a: &a {x: 1}\nitem: {<<: *a, k: 0}\nplain: {q: 1}\n";
-        let index = YamlIndex::build_yq(yaml).unwrap();
-        let top = index.root(yaml).first_child().expect("a document");
-        use crate::yaml::{YamlCursor, YamlFields};
+        use crate::yaml::{YamlCursor, YamlFields, YamlIndex, YamlValue};
         fn named<'a>(parent: &YamlCursor<'a>, name: &str) -> (YamlFields<'a>, YamlCursor<'a>) {
             let fields = parent.value().as_object().expect("a mapping");
             let found = DocumentFields::find_cursor(&fields, name).unwrap();
             (fields, found.expect("a member"))
         }
+
+        let yaml = b"a: &a {x: 1}\nitem: {<<: *a, k: 0}\nplain: {q: 1}\n";
+        let index = YamlIndex::build_yq(yaml).unwrap();
+        let top = index.root(yaml).first_child().expect("a document");
         let (_, item) = named(&top, "item");
         let (fields, x) = named(&item, "x");
         let (_, k) = named(&item, "k");
