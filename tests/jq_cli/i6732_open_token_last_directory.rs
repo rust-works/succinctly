@@ -33,6 +33,18 @@ fn a_last_directory_that_takes_a_held_closers_read_stops_the_main_loop_before_th
     std::fs::write(dir.path().join("ws.json"), "[1 ]")?;
     std::fs::write(dir.path().join("a.json"), r#"["a"#)?;
     std::fs::write(dir.path().join("b.json"), r#"b"]"#)?;
+    // `1`, spaces, `]` at 4,095 and 4,094 bytes: a last read that fills jq's buffer is followed by an
+    // empty read of the same file, which delivers the held-back closer in that file (#6760). These
+    // rows agree with jq either way; the joined-text test's use of that rule is pinned by the `gone`
+    // rows of `tests/jq_cli/i6760.rs`, which fail without it.
+    std::fs::write(
+        dir.path().join("full.json"),
+        format!("1{}]", " ".repeat(4093)),
+    )?;
+    std::fs::write(
+        dir.path().join("short.json"),
+        format!("1{}]", " ".repeat(4092)),
+    )?;
     #[rustfmt::skip]
     let rows = [
         (&["-c", "--stream-errors", "."][..], &["open.json", "obj.json", "dir"][..], "[[0,\"a\"],1]\n[[0,\"a\"]]\n", "", 2),
@@ -53,6 +65,8 @@ fn a_last_directory_that_takes_a_held_closers_read_stops_the_main_loop_before_th
         (&["-c", "--stream-errors", "."][..], &["open.json", "obje.json", "dir"][..], "[[0,\"a\"],1]\n[[0,\"a\"]]\n[\"Unfinished JSON term at EOF at line 2, column 0\",[0]]\n", "", 2),
         (&["-c", "--stream-errors", "."][..], &["a.json", "b.json", "dir"][..], "[[0],\"ab\"]\n[[0]]\n", "", 2),
         (&["-c", "--stream-errors", "[inputs]"][..], &["a.json", "b.json", "dir"][..], "[[[0]]]\n", "jq: error: Is a directory\n", 2),
+        (&["-c", "--stream-errors", "[inputs]"][..], &["open.json", "full.json", "dir"][..], "[[[0]]]\n", "", 2),
+        (&["-c", "--stream-errors", "[inputs]"][..], &["open.json", "short.json", "dir"][..], "[[[0]]]\n", "jq: error: Is a directory\n", 2),
         (&["-c", "--stream-errors", "."][..], &["open.json", "ws.json", "dir"][..], "[[0,0],1]\n[[0,0]]\n", "", 2),
         // A closer in a file that only finishes a container an earlier file opened, and under `-n`.
         (&["-c", "--stream-errors", "."][..], &["ob.json", "two.json", "dir"][..], "[[0,0],1]\n[[0,0]]\n", "", 2),

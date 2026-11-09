@@ -9973,6 +9973,7 @@ fn held_back_closer_before(
                     // between, even an empty one, takes the read, so the closer is its own.
                     || (plain_stream_errors(args)
                         && !raw.is_empty()
+                        && !last_read_fills_buffer(raw)
                         // A fault met before the end (`1` after a value with no separator) is raised
                         // where it is, and the closer after it is not the read the directory takes.
                         && !matches!(first_stream_fault(&raws[..=before]), Some((_, false)))
@@ -10021,6 +10022,13 @@ fn closer_lags_in_joined_text(raws: &[Vec<u8>]) -> bool {
     false
 }
 
+/// Whether the last read of the file `raw` fills jq's `fgets` buffer, so that a read of the same
+/// file that returns nothing follows it (#6760). One definition for [`closing_event_lags`] and the
+/// joined-text test of [`held_back_closer_before`] (#6732), which must agree on it.
+fn last_read_fills_buffer(raw: &[u8]) -> bool {
+    crate::jq_seq_reader::fgets_chunk_lens(raw).last() == Some(crate::jq_seq_reader::JQ_FGETS_CHUNK)
+}
+
 /// Whether the last record of the `--seq` text `raw` leaves jq's stream parser holding its closing
 /// event until the next read (#6646): a top-level container that ends at the last byte of the text,
 /// whose closer follows a scalar. `[1]`, `{"a":"b"}`, `[[],1]` and `[1,2]` do; `[]`, `[[1]]`,
@@ -10032,9 +10040,7 @@ fn closer_lags_in_joined_text(raws: &[Vec<u8>]) -> bool {
 fn closing_event_lags(raw: &[u8], seq: bool) -> bool {
     // A last read that fills jq's buffer is followed by a read of the same file that returns
     // nothing, and the closer comes out of that one, in the file itself (#6760).
-    if crate::jq_seq_reader::fgets_chunk_lens(raw).last()
-        == Some(crate::jq_seq_reader::JQ_FGETS_CHUNK)
-    {
+    if last_read_fills_buffer(raw) {
         return false;
     }
     let record = if seq {
@@ -18867,8 +18873,6 @@ mod tests {
         assert_eq!(first_event_completing_file(&[long, b"1\n".to_vec()]), None);
     }
 
-    /// #6646: which `--seq` texts leave a closing event held back, each shape captured from jq
-    /// 1.7.1 (one failure reported where it lags, two where it does not).
     #[test]
     fn the_joined_text_lag_agrees_with_the_single_file_lag_on_whole_values_6732() {
         // Two predicates answer "does this closer lag": `closing_event_lags` for one file that is a
@@ -18910,6 +18914,8 @@ mod tests {
         assert!(!closer_lags_in_joined_text(&[b"[1".to_vec()]));
     }
 
+    /// #6646: which `--seq` texts leave a closing event held back, each shape captured from jq
+    /// 1.7.1 (one failure reported where it lags, two where it does not).
     #[test]
     fn closing_event_lags_matches_jq_6646() {
         for (text, lags) in [
