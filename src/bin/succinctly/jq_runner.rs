@@ -6976,7 +6976,7 @@ fn read_inputs(
     let mut unopened_tail = false;
     // #6620: the walk `seq_plain_json_inputs` made of this stream, with whether it recorded faults and
     // the length of the bytes it walked, when this read is of the same source.
-    let mut handed: Option<(crate::jq_seq_reader::SeqStreamWalk, bool, usize)> = None;
+    let mut handed: Option<HandedWalk> = None;
     // #6481: whether any input file failed to open, in the middle of the list or at its end.
     let mut any_open_failure = false;
     // #6589: the open failures a `--seq -s` read reports among its warnings, as jq's reader reaches
@@ -7450,7 +7450,7 @@ fn read_inputs(
                 });
                 let walk = if let Some((mut walk, ..)) = handed_walk {
                     walk.place_values(&raw_bytes);
-                    walk
+                    *walk
                 } else {
                     crate::jq_seq_reader::walk_stream_collecting_at(
                         &raw_bytes,
@@ -9567,6 +9567,10 @@ fn advance_source(
     advance_position(at, bytes)
 }
 
+/// The walk [`seq_plain_json_inputs`] hands on (#6620), with whether it recorded the reader's faults
+/// and the length of the bytes it walked.
+type HandedWalk = (Box<crate::jq_seq_reader::SeqStreamWalk>, bool, usize);
+
 /// What [`seq_plain_json_inputs`] read and walked of a `--seq` stream it found not clean, for the
 /// materializing route to take instead of reading and walking it again (#6620).
 struct SeqPreread {
@@ -9578,7 +9582,7 @@ struct SeqPreread {
     /// [`STDIN_PUSHBACK`]).
     prepared: Option<PreparedInputs>,
     /// The walk, with the values unplaced (`jq_seq_reader::walk_stream_keeping`).
-    walk: crate::jq_seq_reader::SeqStreamWalk,
+    walk: Box<crate::jq_seq_reader::SeqStreamWalk>,
     /// Whether that walk recorded the reader's faults, as the route that queues them asks.
     collect_faults: bool,
 }
@@ -13310,7 +13314,7 @@ fn seq_plain_json_inputs(args: &JqCommand) -> Result<Option<PreparedInputs>> {
 fn take_seq_preread(
     named: &[PathBuf],
     len: usize,
-    handed: &mut Option<(crate::jq_seq_reader::SeqStreamWalk, bool, usize)>,
+    handed: &mut Option<HandedWalk>,
 ) -> Option<PreparedInputs> {
     SEQ_PREREAD.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -13335,7 +13339,7 @@ fn seq_stream_as_plain_json(raw: Vec<u8>, slurp: bool) -> std::result::Result<Ve
 
 /// What [`seq_stream_as_plain_json_with`] hands back for a stream that is not clean: its bytes, and
 /// the walk that found it so when it made one (#6620).
-type NotPlain = (Vec<u8>, Option<crate::jq_seq_reader::SeqStreamWalk>);
+type NotPlain = (Vec<u8>, Option<Box<crate::jq_seq_reader::SeqStreamWalk>>);
 
 /// [`seq_stream_as_plain_json`], keeping the walk that decides when `keep_walk` says which faults
 /// it should record (#6620): `Some(collect_faults)` for a stream that is not slurped, `None` to
@@ -13426,7 +13430,7 @@ fn seq_stream_walked_as_plain_json_with(
     // again unless it is handed this walk.
     macro_rules! not_plain {
         ($raw:expr, $walk:expr) => {
-            return Err(($raw, kept.then_some($walk)))
+            return Err(($raw, kept.then(|| Box::new($walk))))
         };
     }
     if warned
