@@ -8237,21 +8237,23 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
             Some(rest) => rest.to_string(),
             None => line,
         };
-        let mut header_lines: Option<Vec<String>> = None;
-        if in_header && header_has_marker(&self.text[..header_end]) {
-            // The block belongs to the document: the first key the comment under the marker was
-            // indexed on has none of its own (`.a | key | head_comment` is `""` in yq).
-            header_lines = if self.is_first_document_content() {
-                header_head_lines(
-                    &self.text[..header_end],
-                    self.index.synthesized_empty(),
-                    true,
-                )
-                .map(|lines| lines.into_iter().map(strip).collect())
+        // The block belongs to the document: the first key the comment under the marker was
+        // indexed on has none of its own (`.a | key | head_comment` is `""` in yq).
+        let header_lines: Option<Vec<String>> =
+            if in_header && header_has_marker(&self.text[..header_end]) {
+                if self.is_first_document_content() {
+                    header_head_lines(
+                        &self.text[..header_end],
+                        self.index.synthesized_empty(),
+                        true,
+                    )
+                    .map(|lines| lines.into_iter().map(strip).collect())
+                } else {
+                    Some(Vec::new())
+                }
             } else {
-                Some(Vec::new())
+                None
             };
-        }
         let from_header = header_lines.is_some();
         let mut lines: Vec<String> = match header_lines {
             Some(lines) => lines,
