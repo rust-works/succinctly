@@ -7055,6 +7055,12 @@ fn read_inputs(
                 || (seq_by_stream_reader(args)
                     && args.slurp
                     && args.stream_errors
+                    && failure.kind == InputFileErrorKind::Directory { last: true })
+                // #6761: a last directory is read where it delivers the closer the file before it
+                // held back, as one in the middle is: the loop stops there, short of a fault at the
+                // end of the text.
+                || (failed_as_sources
+                    && seq_by_stream_reader(args)
                     && failure.kind == InputFileErrorKind::Directory { last: true });
             note_open_failure_at(at.saturating_sub(usize::from(held_back_at_directory)));
         }
