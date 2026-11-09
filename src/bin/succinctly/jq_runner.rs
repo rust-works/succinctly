@@ -6854,6 +6854,7 @@ fn read_inputs(
     LAZY_OPEN_FAILED.with(|seen| seen.set(false));
     SLURP_DIRECTORY_READ.with(|slurp| slurp.set(false));
     LAST_DIRECTORY_READ.with(|read| read.set(false));
+    SLURP_READ_SEEN.with(|seen| seen.set(false));
     UNOPENED_TAIL_NAME.with(|tail| *tail.borrow_mut() = None);
     LAST_VALUE_AT_TAIL.with(|at| at.set(false));
     FAULT_AT_TAIL.with(|at| at.set(false));
@@ -9716,6 +9717,9 @@ thread_local! {
     /// Whether a read has reached the directory that is the last file, outside a slurp (#6615):
     /// jq's reader then counts the failure, and says it on the program's next read.
     static LAST_DIRECTORY_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether a read has been made since a slurp's last directory was left to the reads (#6789):
+    /// the slurp's own read went through the directory, and the program's next read says it.
+    static SLURP_READ_SEEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Whether the failure being reported is reported by such a read, and not by the run's own
     /// flush of what its reads did not reach.
     static REPORTED_BY_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -10180,6 +10184,9 @@ fn report_reached_open_failures(read: Option<u32>, fault: bool) {
                 .is_some_and(|(_, failure)| is_last_directory_outside_slurp(failure));
             let reached = match pending.front() {
                 Some(&(at, _)) if last_directory => reach_last_directory(at, read),
+                Some((at, failure)) if failure.is_last_directory() => {
+                    slurp_directory_reached(*at, read)
+                }
                 Some(&(at, _)) => read.map_or(true, |source| at <= source as usize),
                 None => false,
             };
@@ -10226,6 +10233,17 @@ fn reach_last_directory(at: usize, read: Option<u32>) -> bool {
     LAZY_OPEN_FAILED.with(|seen| seen.set(true));
     LAST_DIRECTORY_READ.with(|seen| seen.set(true));
     read_before && REPORTED_BY_READ.with(std::cell::Cell::get)
+}
+
+/// Whether a read reaches the directory a slurp's last file is (#6604, #6789): the read that finds
+/// the stream at its end, a read from a source past it, and the program's read after the slurp's
+/// own, which went through the directory when it read every file: jq's reader says the failure on
+/// the next read it is asked for, whatever that read returns (the fault event a `--seq -s
+/// --stream-errors` stream ends in is such a read). The main loop's own read never says it.
+fn slurp_directory_reached(at: usize, read: Option<u32>) -> bool {
+    let read_before = SLURP_READ_SEEN.with(|seen| seen.replace(true));
+    (read_before && REPORTED_BY_READ.with(std::cell::Cell::get))
+        || read.map_or(true, |source| at <= source as usize)
 }
 
 /// Whether the directory given last, behind other failures that the run reports up front, is left
