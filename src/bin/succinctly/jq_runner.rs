@@ -10345,7 +10345,13 @@ fn note_open_failure_at(at: usize) {
 fn main_loop_reads_on() -> bool {
     match FIRST_OPEN_FAILURE_AT.with(std::cell::Cell::get) {
         None => true,
-        Some(at) => jq::current_input_location().map_or(true, |(source, _)| (source as usize) < at),
+        // #6781: a failure a read has reached is counted whatever the location of the value that
+        // read returned last: the closing event a file held back is read at the end of the text, a
+        // position that names no later source, and the program's own `input` may have read it.
+        Some(at) => {
+            !LAZY_OPEN_FAILED.with(std::cell::Cell::get)
+                && jq::current_input_location().map_or(true, |(source, _)| (source as usize) < at)
+        }
     }
 }
 
