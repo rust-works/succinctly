@@ -18211,6 +18211,7 @@ fn each_recurse_cursor_generic<S: EvalSemantics, V: DocumentValue>(
             &PathNode::At(cursor),
             &NoTrail,
             true,
+            descent_lists_own_entries::<S>(),
             &mut |_, child, _| {
                 match child {
                     PathNode::At(c) => pending.push(c),
@@ -29423,10 +29424,17 @@ fn path_index_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
 /// is what lets the path-context walk stream `.[]` rather than hold one
 /// buffer entry per child -- the child *cursors* still come from the checked
 /// collection helpers, whose validation this does not touch.
+/// Whether `..` lists a mapping's own entries (a `<<` key among them) instead of the merged view `.[]` reads
+/// (#5000): yq's recursive descent walks the node's `Content`. One definition for every `..` walk.
+fn descent_lists_own_entries<S: EvalSemantics>() -> bool {
+    S::TAG == EvalTag::Yq
+}
+
 fn path_iterate_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
     node: &PathNode<V>,
     path: &T,
     collapse_duplicate_keys: bool,
+    listed: bool,
     emit: StepEmit<'_, V, T>,
 ) -> Result<Demand, EvalError> {
     guard_path_walk_depth(path.recursion_depth())?;
@@ -29447,7 +29455,14 @@ fn path_iterate_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>
         PathNode::Owned(_) => unreachable!("owned nodes step through path_step_owned"), // patchcov: coverage tolerate-line reason="unreachable: both step dispatchers route owned nodes to path_step_owned before calling this cursor helper (#3022)"
         PathNode::At(c) => {
             let v = c.value();
-            if let Some(fields) = v.as_object() {
+            // #5000: yq's `..` walks a mapping's own `Content` -- the entries it
+            // spells, a `<<` key among them -- where `.[]` reads the merged view.
+            let object = if listed {
+                v.as_object_listed()
+            } else {
+                v.as_object()
+            };
+            if let Some(fields) = object {
                 // #2594: the zero-field `{,}` `effective_fields_checked`
                 // cannot see, same as the value-side `Expr::Iterate` arm.
                 empty_fields_tail_gap_ok(&fields, Some(c))?;
@@ -29615,7 +29630,7 @@ fn path_step_each_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
             }
         }
         Expr::Iterate => {
-            path_iterate_step_generic::<S, V, T>(node, path, collapse_duplicate_keys, emit)
+            path_iterate_step_generic::<S, V, T>(node, path, collapse_duplicate_keys, false, emit)
         }
         other => unreachable!("not a navigational step: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable: both callers match Field, Index or Iterate before dispatching here (#3022)"
     }
@@ -29698,6 +29713,7 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
             node,
             path,
             collapse_duplicate_keys,
+            false,
             &mut |trail, child, _| {
                 out.push((trail, child));
                 Demand::Continue
@@ -29811,7 +29827,18 @@ fn path_descent_children<S: EvalSemantics, V: DocumentValue>(
         settled?;
         return Ok(children);
     }
-    match path_step_generic::<S, V, _>(&Expr::Iterate, here, at, true, &mut children) {
+    let stepped = match here {
+        // #5000: the own-entries view, as the cursor walk lists them.
+        PathNode::At(_) if descent_lists_own_entries::<S>() => {
+            path_iterate_step_generic::<S, V, _>(here, at, true, true, &mut |trail, child, _| {
+                children.push((trail, child));
+                Demand::Continue
+            })
+            .map(|_| ())
+        }
+        _ => path_step_generic::<S, V, _>(&Expr::Iterate, here, at, true, &mut children),
+    };
+    match stepped {
         // What `.[]?` never swallows: a decode failure, and the errors no `?` or `try` can catch.
         Err(e) if e.is_decode_failure() || e.is_uncatchable_at_value_position() => Err(e),
         _ => Ok(children),
@@ -31755,7 +31782,35 @@ fn path_context_step_recurse_each<S: EvalSemantics, V: DocumentValue>(
         return Ok(Demand::Continue);
     }
     let mut children = Vec::new();
-    path_context_step_try::<S, V>(&Expr::Iterate, None, pos, &mut children)?;
+    if descent_lists_own_entries::<S>() && matches!(pos.node, PathNode::At(_)) {
+        // #5000: the members of a live node, as yq's `..` lists them (see
+        // `path_iterate_step_generic`'s `listed`). It is `.[]?`: a catchable
+        // failure ends the branch, an uncatchable one escapes.
+        if let Some(settled) = swallowed_path_leaf::<S, V>(&Expr::Iterate, None, &pos.node) {
+            return settled.map(|()| Demand::Continue).map_err(Control::Error);
+        }
+        let stepped = path_iterate_step_generic::<S, V, _>(
+            &pos.node,
+            &pos.trail,
+            true,
+            true,
+            &mut |trail, node, _| {
+                children.push(PathContextPos {
+                    node,
+                    trail,
+                    at_key: false,
+                });
+                Demand::Continue
+            },
+        );
+        if let Err(e) = stepped {
+            if e.is_uncatchable_at_value_position() {
+                return Err(Control::Error(e));
+            }
+        }
+    } else {
+        path_context_step_try::<S, V>(&Expr::Iterate, None, pos, &mut children)?;
+    }
     for child in &children {
         if let Some(cond) = cond {
             if !path_context_recurse_cond_keeps::<S, V>(cond, child)? {
