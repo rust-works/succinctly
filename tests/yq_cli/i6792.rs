@@ -51,6 +51,11 @@ fn test_several_key_targets_are_written_6792() -> Result<()> {
             r#"(.[] | key) line_comment = "x""#,
             "a: 1 # x\nb: 2 # x\nc: 3 # x\n",
         ),
+        // The same key twice is one node, written once.
+        (
+            r#"((.[] | key), (.a | key)) head_comment |= . + "x""#,
+            "# ax\na: 1\n# bx\nb: 2\n# cx\nc: 3\n",
+        ),
         (
             r#"(.[] | key) head_comment |= "x""#,
             "# x\na: 1\n# x\nb: 2\n# x\nc: 3\n",

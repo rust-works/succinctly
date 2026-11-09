@@ -6603,10 +6603,9 @@ fn resolve_one_meta_assign(
             (*branch).clone()
         };
         let path_expr = Expr::Builtin(Builtin::Path(Box::new(path_target)));
+        // A branch the evaluation cannot take leaves the whole target unresolved, as a target of
+        // one branch does: the real evaluation reports it, and nothing is written for the rest.
         let Some(found) = evaluate_input_quiet(current, &path_expr) else {
-            if mixed_keys {
-                continue;
-            }
             return true;
         };
         let is_key = branch_prefix.is_some();
