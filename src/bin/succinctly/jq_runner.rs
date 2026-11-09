@@ -6100,9 +6100,11 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     MAIN_LOOP_READ.with(|own| own.set(true));
                     let popped = jq::pop_input();
                     MAIN_LOOP_READ.with(|own| own.set(false));
-                    slurp_read_made = true;
                     let input = match popped {
-                        jq::InputPop::Document(input) => input,
+                        jq::InputPop::Document(input) => {
+                            slurp_read_made = true;
+                            input
+                        }
                         // #6141: `--seq --stream`'s end-of-stream stop ends the input call that met it,
                         // and the main loop when it is the one that pops it.
                         jq::InputPop::ParseError(error)

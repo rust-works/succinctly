@@ -112,6 +112,19 @@ fn a_slurp_by_the_seq_stream_errors_reader_runs_the_loop_once_past_a_failure_679
     ])
 }
 
+/// The failed file first or last in the list, a program that reads nothing, and two failures.
+#[test]
+fn the_slurps_loop_ends_after_its_first_call_wherever_the_failure_is_6796() -> Result<()> {
+    check(&[
+        (&["--seq", "-s", "--stream", "input"], &["gone", "trunc", "obj"], "\x1e[[1,\"a\"]]\n", "jq: error: Could not open file @D@/gone: No such file or directory\n", 2),
+        (&["--seq", "-s", "--stream", "input"], &["trunc", "obj", "gone"], "", "jq: error: Could not open file @D@/gone: No such file or directory\njq: error (at @D@/gone:0): Unfinished JSON term at EOF at line 1, column 11\n", 2),
+        (&["--seq", "-s", "--stream-errors", "[., input]"], &["gone", "rend", "nors"], "\x1e[[[[],12],[[0],1],[[1,0],1]],[[1,0]]]\n", "jq: error: Could not open file @D@/gone: No such file or directory\n", 2),
+        (&["--seq", "-s", "--stream-errors", "[., input]"], &["rend", "nors", "dir"], "\x1e[[[[],12],[[0],1],[[1,0],1],[[1,0]]],[\"Unfinished JSON term at EOF at line 2, column 7\",[1]]]\n", "jq: error: Is a directory\n", 2),
+        (&["--seq", "-s", "--stream", "empty"], &["trunc", "gone", "obj"], "", "jq: error: Could not open file @D@/gone: No such file or directory\n", 2),
+        (&["--seq", "-s", "--stream", "first(inputs)"], &["gone", "dir", "trunc"], "", "jq: error: Could not open file @D@/gone: No such file or directory\njq: error: Is a directory\njq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 4\n", 2),
+    ])
+}
+
 /// Rows that matched jq before: a program that reads nothing or reads to the end, a slurp with no
 /// failure, `-n`, and the readers that are not `--seq`.
 #[test]
