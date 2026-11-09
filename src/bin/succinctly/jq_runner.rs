@@ -24338,7 +24338,7 @@ mod tests {
         };
         let n = usize::from(DOOR_DECLINES_BEFORE_CLOSING);
         let stretch = DOOR_FIRST_CLOSE as usize;
-        for filter in ["[.id,.name]", "keys"] {
+        for filter in ["[.id + 1]", "del(.name)"] {
             let (open, printed) = run(filter, n + stretch + 3);
             let mut want = vec![true; n]; // the run of declines
             want.extend(vec![false; stretch]); // the stretch
@@ -24349,7 +24349,7 @@ mod tests {
                 "{filter}: every route prints the same"
             );
         }
-        for filter in [".name", "{id,name}"] {
+        for filter in [".name", "{id,name}", "[.id,.name]", "keys"] {
             let (open, _) = run(filter, n + stretch + 3);
             assert!(
                 open.iter().all(|asked| *asked),
@@ -24417,8 +24417,8 @@ mod tests {
 
     /// #6620: `evaluate_input_streaming_via` says what `WhereAnswered` did, which is what the main
     /// loop's [`DoorMemory`] counts, and no other route ever asks. The programs are the ones #6620
-    /// measured: `.name` is answered, `[.id,.name]` and `keys` are declined; `.` is answered before
-    /// any route.
+    /// measured: `.name`, `[.id,.name]` and `keys` are answered, `[.id + 1]` and `del(.name)` are declined;
+    /// `.` is answered before any route.
     #[test]
     fn the_door_reports_what_it_did_6620() {
         use DoorOutcome::{Answered, Declined, NotAsked};
@@ -24464,8 +24464,11 @@ mod tests {
             (".name", Answered),
             ("{id,name}", Answered),
             (".", NotAsked),
-            ("[.id,.name]", Declined),
-            ("keys", Declined),
+            // #6620: a comma of reads and `keys` are doors now.
+            ("[.id,.name]", Answered),
+            ("keys", Answered),
+            ("[.id + 1]", Declined),
+            ("del(.name)", Declined),
         ] {
             let (expected, off) = run(filter, OwnedRoute::Off);
             assert_eq!(off, NotAsked, "{filter}: the old route asks nothing");

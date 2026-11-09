@@ -11315,7 +11315,7 @@ fn path_stages<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
     }
 }
 
-/// `[.a]`, `{id, name}`, `{id: .id, kind: "x", pos: {x: .x}}` over an owned value, answered from the
+/// `[.a]`, `[.a, .b]`, `{id, name}`, `{id: .id, kind: "x", pos: {x: .x}}` over an owned value, answered from the
 /// tree instead of through the re-index bridge (#6608): a `recurse(.children[]?) | {id, name}` wrote
 /// every visited node, and so its whole subtree, out as text and indexed it again to read two fields,
 /// so the walk grew with depth at a fixed node count (0.27-0.55x of jq 1.7.1 on a 7950X).
@@ -11336,19 +11336,44 @@ pub(crate) fn eval_owned_construct<S: EvalSemantics>(
     if S::TAG != EvalTag::Jq {
         return None;
     }
-    let shape = match unwrap_paren(expr) {
-        Expr::Pipe(stages) => match skip_identity_stages(stages) {
-            [only] => unwrap_paren(only),
-            _ => return None,
-        },
-        other => other,
-    };
+    let shape = lone_door_shape(expr)?;
     if !matches!(shape, Expr::Array(_) | Expr::Object(_))
         || super::eval_generic::embed_table_active()
     {
         return None;
     }
     construct_operand::<S>(shape, input)
+}
+
+/// `keys` and `has(K)` of an owned object or array (#6620), answered from the tree instead of through
+/// the re-index bridge: a `--seq` record read where it is for `keys` was written out as JSON,
+/// indexed and read back to list its field names (declined by every door, 0.6x of jq 1.7.1 on a
+/// 7950X over a stream with a diagnostic). The answer is [`owned_container_key_builtin`]'s: a
+/// fresh array or boolean, which carries no node of `input` and so needs no embed-table check, and
+/// `None` for any other input, whose diagnostics stay the bridge's. The stage may be wrapped as
+/// every front door's is. jq mode only: yq lists a mapping's keys in document order and has rules
+/// of its own for `has`.
+pub(crate) fn eval_owned_container_key_door<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    owned_container_key_builtin::<S>(lone_door_shape(expr)?, input)
+}
+
+/// The one stage a front door looks at: `expr` with its parentheses removed, and a pipe of identity
+/// stages around a single stage reduced to that stage (`(. | keys)` is `keys`). `None` for a pipe of
+/// several stages, which is the peel's.
+fn lone_door_shape(expr: &Expr) -> Option<&Expr> {
+    Some(match unwrap_paren(expr) {
+        Expr::Pipe(stages) => match skip_identity_stages(stages) {
+            [only] => unwrap_paren(only),
+            _ => return None,
+        },
+        other => other,
+    })
 }
 
 /// One operand of [`eval_owned_construct`]: a dispatch only, with one `#[inline(never)]` function
@@ -11364,7 +11389,21 @@ fn construct_operand<S: EvalSemantics>(expr: &Expr, input: &OwnedValue) -> Optio
 
 #[inline(never)]
 fn construct_array<S: EvalSemantics>(inner: &Expr, input: &OwnedValue) -> Option<OwnedValue> {
-    construct_operand::<S>(inner, input).map(|element| OwnedValue::array_from(vec![element]))
+    match unwrap_paren(inner) {
+        // #6620: `[.id, .name]`. Each operand is one output (a literal, a static read, or a
+        // container built from those), so the array has an element per operand, in order. A comma
+        // inside an operand is a generator, which `construct_operand` declines. `[]` is a comma of
+        // none and stays the bridge's.
+        Expr::Comma(operands) if !operands.is_empty() => {
+            let mut elements = vec_with_capacity(operands.len());
+            for operand in operands {
+                elements.push(construct_operand::<S>(operand, input)?);
+            }
+            Some(OwnedValue::array_from(elements))
+        }
+        other => construct_operand::<S>(other, input)
+            .map(|element| OwnedValue::array_from(vec![element])),
+    }
 }
 
 #[inline(never)]
@@ -12566,6 +12605,13 @@ pub(crate) fn eval_each_owned_front_doors<S: EvalSemantics>(
             Demand::Stop => Flow::Stopped { pending: None },
         });
     }
+    // #6620: `keys` and `has(K)` of an owned container are a fresh array or boolean.
+    if let Some(answer) = eval_owned_container_key_door::<S>(expr, input) {
+        return Some(match sink(answer) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped { pending: None },
+        });
+    }
     // #6595: `.children[]?` reads the children of an owned node, not the node written out and
     // indexed again (once per ancestor in a `recurse` walk).
     if let Some(children) = owned_path_each_optional::<S>(expr, input) {
@@ -13697,6 +13743,8 @@ fn projection_peel<S: EvalSemantics>(
         .or_else(|| eval_owned_map_projection::<S>(first, input))
         // #6608: or a constructor of static reads, `{id, name}`.
         .or_else(|| eval_owned_construct::<S>(first, input))
+        // #6620: or `keys` / `has(K)` of an owned container.
+        .or_else(|| eval_owned_container_key_door::<S>(first, input))
         // #6527: or `add`, `min` or `max` of an array of computed numbers.
         .or_else(|| eval_owned_number_fold::<S>(first, input))
         // #6539: or `map(body)` of one, which steps to the array of the answers.
@@ -152167,10 +152215,20 @@ mod tests {
             "{id: .a.b.c.d}",
             "{}",
             "[1]",
+            // #6620: a comma of operands.
+            "[.id, .name]",
+            "[.id, .a[0], 3, {x: .name}, [.a, .zz]]",
+            "[.[0], .[1], .[-1]]",
+            "[(.id), (.name)]",
+            // A parenthesised comma collects as the bare one does.
+            "[(.id, .name)]",
         ];
         let left = [
             "{(.id | tostring): 1}",
-            "[.id, .name]",
+            "[.id, (.name, .id)]",
+            "[.id, .a[]]",
+            "[.id, .name?]",
+            "[.id, $__loc__]",
             "[.a[]]",
             "[.a[]?]",
             "{id: (.id, .name)}",
@@ -152222,6 +152280,167 @@ mod tests {
             }
         }
         assert!(taken > 300, "the matrix must reach the door: {taken}");
+    }
+
+    /// #6620: [`eval_owned_container_key_door`] answers what the reindex bridge answers for `keys` and
+    /// `has(K)` of an owned object or array (key order included: by code point, whatever the
+    /// insertion order), declines every other input so the bridge keeps its error, and is jq mode's.
+    #[test]
+    fn owned_container_key_door_agrees_with_the_reindex_bridge_6620() {
+        let object = |pairs: &[(&str, OwnedValue)]| {
+            OwnedValue::object_from(pairs.iter().map(|(k, v)| ((*k).to_string(), v.clone())))
+        };
+        let mut values = vec![
+            // Inserted out of order, with keys that sort differently by byte and by locale.
+            object(&[
+                ("z", OwnedValue::Int(1)),
+                ("\u{e9}", OwnedValue::Null),
+                ("A", OwnedValue::Bool(true)),
+                ("a b", OwnedValue::String("s".into())),
+                ("\u{1f600}", OwnedValue::Int(2)),
+                ("", OwnedValue::Int(3)),
+                ("id", OwnedValue::Int(4)),
+                ("10", OwnedValue::Int(5)),
+                ("9", OwnedValue::Int(6)),
+            ]),
+            object(&[("id", OwnedValue::Int(1)), ("name", OwnedValue::Null)]),
+            object(&[]),
+            OwnedValue::array_from(vec![]),
+            OwnedValue::array_from(vec![
+                OwnedValue::Int(7),
+                OwnedValue::Null,
+                OwnedValue::Int(9),
+            ]),
+            OwnedValue::Null,
+            OwnedValue::Int(1),
+            OwnedValue::String("s".into()),
+            OwnedValue::Bool(false),
+        ];
+        values.extend(pure_value_matrix());
+        let answered = [
+            "keys",
+            "(keys)",
+            ". | keys",
+            "has(\"id\")",
+            "has(\"zz\")",
+            "has(\"\")",
+            "has(0)",
+            "has(2)",
+            "has(-1)",
+            "has(1.5)",
+        ];
+        let left = [
+            "keys_unsorted",
+            "keys | length",
+            "has(.id)",
+            "has(null)",
+            "[keys]",
+            ".id | keys",
+        ];
+        let mut taken = 0;
+        for src in answered {
+            let expr = parse(src).unwrap();
+            let mut reached = false;
+            for value in &values {
+                let door = eval_owned_container_key_door::<JqSemantics>(&expr, value);
+                assert!(
+                    eval_owned_container_key_door::<YqSemantics>(&expr, value).is_none(),
+                    "yq mode must keep its own `keys` and `has`: {src:?}"
+                );
+                let bridge = normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                    &expr, value, false,
+                ));
+                let Some(door) = door else {
+                    // A decline is a value that is no container, or one `keys`/`has` raises on (a
+                    // `has` key of the wrong kind for it).
+                    assert!(
+                        !matches!(value, OwnedValue::Object(_) | OwnedValue::Array(_))
+                            || bridge.1.starts_with("error:"),
+                        "{src:?} on {value:?} declined where the bridge answers {bridge:?}"
+                    );
+                    continue;
+                };
+                reached = true;
+                taken += 1;
+                assert_eq!(
+                    select_door_observable(&(vec![door], "ok".to_string())),
+                    select_door_observable(&bridge),
+                    "{src:?} on {value:?} disagrees with the reindex bridge"
+                );
+            }
+            assert!(reached, "{src:?} never reached the door");
+        }
+        for src in left {
+            let Ok(expr) = parse(src) else { continue };
+            for value in &values {
+                assert!(
+                    eval_owned_container_key_door::<JqSemantics>(&expr, value).is_none(),
+                    "{src:?} on {value:?} must be left to the bridge"
+                );
+            }
+        }
+        assert!(taken > 50, "the matrix must reach the door: {taken}");
+    }
+
+    /// #6620: a repeated key reads as jq reads it (the last value wins, one key) through the comma
+    /// array and `keys`/`has`, and no comma array is answered while a binding's embed table is up
+    /// (a node it tracks is the bridge's to name).
+    #[test]
+    #[cfg(feature = "std")]
+    fn comma_array_and_keys_read_the_collapsed_object_and_decline_under_an_embed_table_6620() {
+        use crate::jq::eval_generic::embed_table_push;
+
+        let mut fields = ObjectMap::new();
+        fields.push_occurrence("a".to_string(), OwnedValue::Int(1));
+        fields.push_occurrence("b".to_string(), OwnedValue::Int(5));
+        fields.push_occurrence("a".to_string(), OwnedValue::Int(2));
+        let repeated = OwnedValue::Object(fields);
+        let OwnedValue::Object(held) = &repeated else {
+            unreachable!("built as an object")
+        };
+        assert!(held.has_shadows(), "the object holds a repeated key");
+        let read = |src: &str, value: &OwnedValue| {
+            let expr = parse(src).unwrap();
+            let door = eval_owned_construct::<JqSemantics>(&expr, value)
+                .or_else(|| eval_owned_container_key_door::<JqSemantics>(&expr, value));
+            let bridge = normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                &expr, value, false,
+            ));
+            (door, bridge)
+        };
+        for src in [
+            "[.a, .b]",
+            "[.a, .a, .b, .zz]",
+            "keys",
+            "has(\"a\")",
+            "has(\"c\")",
+        ] {
+            let (door, bridge) = read(src, &repeated);
+            let door = door.unwrap_or_else(|| panic!("{src:?} declined a repeated-key object"));
+            assert_eq!(
+                select_door_observable(&(vec![door], "ok".to_string())),
+                select_door_observable(&bridge),
+                "{src:?} on a repeated-key object disagrees with the reindex bridge"
+            );
+        }
+        // Under a binding's embed table the comma array is the bridge's, as `[.a]` is.
+        let origin = BindOrigin::Node {
+            node: 1,
+            document: 9,
+        };
+        let mut bound = repeated.clone();
+        let guard =
+            embed_table_push::<JqSemantics>(Some(&origin), &mut bound).expect("a container bind");
+        for src in ["[.a, .b]", "[.a]"] {
+            let expr = parse(src).unwrap();
+            assert!(
+                eval_owned_construct::<JqSemantics>(&expr, &repeated).is_none(),
+                "{src:?} must be left to the bridge under an embed table"
+            );
+        }
+        drop(guard);
+        let expr = parse("[.a, .b]").unwrap();
+        assert!(eval_owned_construct::<JqSemantics>(&expr, &repeated).is_some());
     }
 
     /// #6560: `environment_object_in` is the environment, built fresh or read back from the
