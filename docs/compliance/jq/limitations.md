@@ -221,7 +221,7 @@ Pinned in `src/jq/error.rs` (`dump_truncation_that_splits_a_character_writes_one
 
 `substitute_invalid_utf8_jq_style` ([src/text/utf8/mod.rs](../../../src/text/utf8/mod.rs),
 #1617) matches jq 1.7.1's maximal-subpart substitution rule for document/raw-input decode,
-and — since #1719 — for `@base64d`/`@urid`'s own invalid-UTF-8 output too, collapsing a
+and — since #1719 — for `@base64d`'s (and yq mode's `@urid`'s) own invalid-UTF-8 output too, collapsing a
 structurally-valid overlong/surrogate/out-of-range 3-/4-byte lead to a single U+FFFD where
 `String::from_utf8_lossy`'s WHATWG rule gives one per byte.
 
@@ -269,7 +269,7 @@ essentially never reproduce it. Every caller is now scoped the way jq scopes it:
 
 | Caller                                                 | Scope                                                          | Issue |
 |--------------------------------------------------------|----------------------------------------------------------------|-------|
-| `@base64d`/`@urid` (`owned_string_from_decoded_bytes`) | One decoded string, already                                    | #1719 |
+| `@base64d`/yq `@urid` (`owned_string_from_decoded_bytes`) | One decoded string, already                                  | #1719 |
 | `--raw-input` (non-slurp)                              | Per line, split before substituting                            | #1742 |
 | JSON document / `--slurp` / `--seq`                    | Per JSON string                                                | #1743 |
 | `--raw-input --slurp`                                  | Whole buffer — **matching real jq**, which has one string here | —     |
@@ -14624,3 +14624,19 @@ These keep the character step, and differ from jq where the shape occurs:
   3 of the 1,854 patterns are of this kind.
 
 Pinned by `tests/jq_cli/i6326.rs`.
+
+## `@urid`: jq 1.8.2's behaviour for the format, jq 1.7.1's for `format("urid")`
+
+`@urid` is new in jq 1.8, so the pinned jq 1.7.1 answers `urid is not a valid format` (the `str-format-urid` ledger entry).
+`succinctly jq` implements it as jq 1.8.2 does (#6726; every row captured from that binary):
+
+- a non-string is stringified first, as `@uri` and `@base64d` do here, so `1 | @urid` is `"1"` and `["%41"] | @urid` decodes inside the JSON text (`"[\"A\"]"`);
+- a `%` that is not followed by two hex digits, and escapes that decode to bytes that are not valid UTF-8 (`%E4`, `%FF%FE`, an overlong form, a surrogate, a code point past U+10FFFF), raise `string (<value>) is not a valid uri encoding` instead of decoding to U+FFFD;
+- `+` is literal, a decoded `%00` is a U+0000, and a literal non-ASCII character passes through.
+
+The error text names the whole stringified input with jq 1.8.2's truncation, which is wider than the 1.7.1 rule the rest of the error messages here follow.
+A dump of at most 29 bytes is whole, and a longer one keeps 25 bytes (cut back to a character boundary), `...` and the closing quote (`string ("%aaaaaaaaaaaaaaaaaaaaaaa...") is not a valid uri encoding`).
+`succinctly yq` is unchanged: `url.QueryUnescape` stringifies a scalar, reads `+` as a space, raises `invalid URL escape "..."` and substitutes U+FFFD for bytes that are not valid UTF-8.
+
+`format("urid")` is the one divergence from the 1.8.2 behaviour: `"%41" | format("urid")` is `"A"` there, and here it stays jq 1.7.1's `urid is not a valid format` (pinned in `tests/jq_cli_tests.rs` and `tests/jq_cli/i6726.rs`).
+It keeps following the pin, as `add/1`, `trimstr/1`, `have_decnum/0` and `have_literal_numbers/0` do.

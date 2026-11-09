@@ -32817,12 +32817,24 @@ fn test_yq_base64d_container_stringifies_to_empty_1109() -> Result<()> {
     Ok(())
 }
 
-/// jq `@urid` is unaffected by #1109's yq-only stringification. `@base64d`
-/// now follows jq's stringify-first rule instead (#3358).
+/// jq `@urid` follows jq 1.8.2 and stringifies a non-string first, as `@base64d` does (#3358) and as
+/// yq's does (#1109): `42 | @urid` is `"42"` (#6726; it raised a type error before). A container is its
+/// JSON text, so what the escapes inside it decode to is part of the answer.
 #[test]
-fn test_jq_urid_still_rejects_non_string_1109() -> Result<()> {
-    let (_out, code) = run_jq_stdin("@urid", "42", &[])?;
-    assert_ne!(code, 0);
+fn test_jq_urid_stringifies_non_strings_6726() -> Result<()> {
+    for (input, want) in [
+        ("42", "\"42\""),
+        ("null", "\"null\""),
+        ("true", "\"true\""),
+        ("1.5", "\"1.5\""),
+        ("[1]", "\"[1]\""),
+        (r#"["%41"]"#, r#""[\"A\"]""#),
+        (r#"{"a":"%41"}"#, r#""{\"a\":\"A\"}""#),
+    ] {
+        let (out, code) = run_jq_stdin("@urid", input, &["-c"])?;
+        assert_eq!(code, 0, "input={input} out: {out:?}");
+        assert_eq!(out.trim(), want, "input={input}");
+    }
     Ok(())
 }
 
@@ -37018,44 +37030,73 @@ fn test_jq_base64d_still_lenient_on_inputs_yq_now_rejects_1135() -> Result<()> {
     Ok(())
 }
 
-/// jq mode's `@urid` lossy-UTF-8-substitution path (an invalid percent-decode
-/// like `%FF`) previously had no regression test either.
+/// yq mode's `@urid` lossy-UTF-8-substitution path (an invalid percent-decode like `%FF`): real yq
+/// replaces the bytes with U+FFFD where jq 1.8.2 (and so jq mode, #6726) raises.
 #[test]
-fn test_jq_urid_invalid_utf8_after_percent_decode_is_lossy_1146() -> Result<()> {
-    let (out, code) = run_jq_stdin("@urid", "\"%FF\"", &[])?;
+fn test_yq_urid_invalid_utf8_after_percent_decode_is_lossy_1146() -> Result<()> {
+    let (out, code) = run_yq_stdin("@urid", "\"%FF\"", &["-o", "json"])?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "\"\u{fffd}\"");
     Ok(())
 }
 
-/// #1719 also switched `@urid`'s jq-mode invalid-UTF-8 substitution rule
-/// (same `owned_string_from_decoded_bytes` call site as `@base64d`), even
-/// though `@urid` itself has no real jq oracle to verify against -- "mode
-/// decides" applies regardless (see `format_urid`'s own doc comment). An
-/// overlong percent-decoded 3-byte lead now collapses to one U+FFFD in jq
-/// mode, same as the `%FF` single-invalid-byte case above stayed
-/// unaffected (WHATWG and jq's rule already agreed on that shape).
+/// jq mode's `@urid` raises on percent-decoded bytes that are not valid UTF-8, with jq 1.8.2's text
+/// (#6726): a lone `%E4`, `%FF%FE`, a continuation without its lead, an overlong form, a surrogate
+/// and a code point past U+10FFFF. Every row captured from jq 1.8.2.
 #[test]
-fn test_jq_urid_overlong_percent_decode_collapses_to_one_fffd_1719() -> Result<()> {
-    let (out, code) = run_jq_stdin("@urid | explode", "\"%E0%80%80\"", &["-c"])?;
-    assert_eq!(code, 0, "out: {out:?}");
-    assert_eq!(out.trim(), "[65533]");
+fn test_jq_urid_invalid_utf8_after_percent_decode_raises_6726() -> Result<()> {
+    for input in [
+        "%FF",
+        "%E4",
+        "%FF%FE",
+        "a%E4b",
+        "%C3\u{a9}",
+        "%BF",
+        "%E0%80%80",
+        "%C0%80",
+        "%ED%A0%80",
+        "%F4%90%80%80",
+        "%E2%82",
+    ] {
+        let json = format!("\"{input}\"");
+        let (_out, stderr, code) = run_jq_stdin_with_stderr("@urid", &json, &[])?;
+        assert_eq!(code, 5, "{input}: {stderr:?}");
+        assert_eq!(
+            stderr,
+            format!("jq: error (at <stdin>:0): string (\"{input}\") is not a valid uri encoding\n"),
+            "{input}"
+        );
+    }
     Ok(())
 }
 
-/// #1138: real jq has no `@urid` at all (it's a succinctly extension
-/// reachable in both modes, per `format_urid`'s own doc comment), so
-/// there's no jq oracle to preserve the old silent-passthrough behavior
-/// against -- the malformed-escape decode loop has no mode-specific
-/// branch, so jq mode gets the same error yq mode does (#1138's own
-/// primary fix, verified against real yq above).
+/// #1719 switched `@urid`'s jq-mode invalid-UTF-8 substitution rule (the `owned_string_from_decoded_bytes`
+/// call site `@base64d` shares) when `@urid` had no jq oracle: an overlong 3-byte lead collapsed to one
+/// U+FFFD. jq 1.8.2 is the oracle now, and it raises (#6726), so the rule is yq's alone: yq mode keeps
+/// its own substitution (a U+FFFD per byte of the overlong form, `url.QueryUnescape` and Go's
+/// conversion), which this pins.
+#[test]
+fn test_yq_urid_overlong_percent_decode_substitutes_per_byte_1719() -> Result<()> {
+    let (out, code) = run_yq_stdin("@urid | explode", "\"%E0%80%80\"", &["-o", "json", "-I=0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(
+        out.trim().replace(char::is_whitespace, ""),
+        "[65533,65533,65533]"
+    );
+    Ok(())
+}
+
+/// #1138: a malformed escape raises rather than passing the `%` through. jq mode raised yq's
+/// `invalid URL escape "%"` too while `@urid` had no jq oracle; jq 1.8.2 names the whole input
+/// instead (#6726), so the two modes' texts differ now and each is pinned (yq's in
+/// `test_yq_urid_malformed_escape_errors_1138`).
 #[test]
 fn test_jq_urid_malformed_escape_errors_1138() -> Result<()> {
     let (_out, stderr, code) = run_jq_stdin_with_stderr("@urid", "\"abc%\"", &[])?;
-    assert_ne!(code, 0, "stderr: {stderr:?}");
-    assert!(
-        stderr.contains(r#"invalid URL escape "%""#),
-        "stderr: {stderr:?}"
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    assert_eq!(
+        stderr,
+        "jq: error (at <stdin>:0): string (\"abc%\") is not a valid uri encoding\n"
     );
     Ok(())
 }

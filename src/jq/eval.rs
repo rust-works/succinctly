@@ -25071,29 +25071,32 @@ fn owned_string_from_decoded_bytes<S: EvalSemantics>(bytes: Vec<u8>) -> String {
 
 /// @urid - URI/percent decode
 ///
-/// jq has no `@urid` at all, so there's no jq-mode oracle to match; real
-/// yq accepts any scalar by stringifying it first (see
-/// [`yq_stringify_scalar_or_empty`]) -- decoding a plain string with no `%`
-/// escapes is a no-op, so a stringified scalar just echoes back unchanged
-/// (`1.5 | @urid` is `"1.5"`). jq mode is unaffected: it keeps erroring on
-/// every non-string type, unchanged from before. Note real yq's `@uri`
-/// *encode* direction does not share this behavior -- it errors on a
-/// non-string scalar rather than stringifying it (`42 | @uri` errors in
-/// real yq); [`format_uri`]'s own unconditional stringification (in both
-/// jq and yq mode) is a separate, pre-existing divergence from real yq,
+/// `@urid` is new in jq 1.8 (jq 1.7.1, the pin, has no such format), and `succinctly jq` follows
+/// jq 1.8.2 for it (#6726), captured from that binary: a non-string is stringified first, as
+/// `@uri` and `@base64d` do here (`1 | @urid` is `"1"`, and `["%41"] | @urid` decodes inside the
+/// JSON text, `"[\"A\"]"`); a `%` that is not followed by two hex digits, and escapes that decode to
+/// bytes that are not valid UTF-8 (`%E4`, `%FF%FE`, an overlong or surrogate sequence), raise
+/// `string (<value>) is not a valid uri encoding` rather than decoding to U+FFFD. `format("urid")`
+/// keeps jq 1.7.1's `urid is not a valid format`, the pin, which the format table records.
+///
+/// Real yq (`url.QueryUnescape`) accepts any scalar by stringifying it first (see
+/// [`yq_stringify_scalar_or_empty`]), reads `+` as a space, raises `invalid URL escape "..."` and
+/// replaces bytes that are not valid UTF-8 with U+FFFD, so yq mode keeps all four. Note real yq's
+/// `@uri` *encode* direction does not share this behavior -- it errors on a non-string scalar
+/// rather than stringifying it (`42 | @uri` errors in real yq); [`format_uri`]'s own unconditional
+/// stringification (in both jq and yq mode) is a separate, pre-existing divergence from real yq,
 /// not touched here.
 ///
-/// Percent-decoded bytes that turn out to be invalid UTF-8 go through
-/// [`owned_string_from_decoded_bytes`], whose substitution rule is
-/// per-mode (`EvalSemantics::UTF8_LOSSY_USES_JQ_MAXIMAL_SUBPART_RULE`,
-/// #1719) even here, despite `@urid` itself having no jq oracle to verify
-/// against -- "mode decides" per ADR-0018 applies regardless.
-fn format_urid<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
+/// The percent-decoded bytes of a yq run that turn out to be invalid UTF-8 go through
+/// [`owned_string_from_decoded_bytes`], whose substitution rule is per-mode
+/// (`EvalSemantics::UTF8_LOSSY_USES_JQ_MAXIMAL_SUBPART_RULE`, #1719).
+fn format_urid<S: EvalSemantics>(value: &OwnedValue, _optional: bool) -> Result<String, EvalError> {
+    let jq = S::TAG != EvalTag::Yq;
     let s = match value {
         OwnedValue::String(s) => s.clone(),
-        _ if S::TAG == EvalTag::Yq => yq_stringify_scalar_or_empty::<S>(value).into(),
-        _ if optional => return Ok(String::new()),
-        _ => return Err(EvalError::type_error("string", value.type_name())),
+        _ if !jq => yq_stringify_scalar_or_empty::<S>(value).into(),
+        // jq mode stringifies every value, a container as its JSON text.
+        _ => stringify_for_format::<S>(value).unwrap_or_default().into(),
     };
 
     // Byte-oriented, not char-oriented (#1123): a non-ASCII byte pushed
@@ -25119,6 +25122,10 @@ fn format_urid<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<S
                     continue;
                 }
             }
+            // Malformed escape (#6726): jq 1.8.2 names the whole input.
+            if jq {
+                return Err(EvalError::urid_not_a_valid_uri_encoding(&s));
+            }
             // Malformed escape (#1138): real yq errors rather than
             // silently passing the `%` through, quoting `%` plus
             // whatever 0, 1, or 2 bytes actually follow it (up to end of
@@ -25141,6 +25148,11 @@ fn format_urid<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<S
         // Not a percent sign at all, just copy the byte
         result.push(bytes[i]);
         i += 1;
+    }
+    if jq {
+        // #6726: jq 1.8.2 raises on bytes that are not valid UTF-8 (an overlong form, a surrogate,
+        // a lone `%E4`) instead of substituting U+FFFD.
+        return String::from_utf8(result).map_err(|_| EvalError::urid_not_a_valid_uri_encoding(&s));
     }
     Ok(owned_string_from_decoded_bytes::<S>(result))
 }
@@ -147099,9 +147111,8 @@ mod tests {
         // output of `f` and none for `empty`, where `isvalid` always yields
         // exactly one (`tests/jq_cli/i6662.rs`). Run on `1` under jq 1.7.1 and
         // 1.8.2, it answers `false` for `@base64d`, `@csv` and `@tsv`, each of
-        // which raises there. `@urid` agrees only with 1.7.1, which has no such
-        // format; 1.8.2 decodes `1` to `"1"`, so it answers `true`. `@dsv` is
-        // succinctly's own. Before this fix, the `@format` builtins' own `_ if optional =>
+        // which raises there. `@urid` is not in this list: it stringifies `1` as jq 1.8.2
+        // does (#6726), so it answers `true`. `@dsv` is succinctly's own. Before this fix, the `@format` builtins' own `_ if optional =>
         // Ok(String::new())` arm (`format_urid`/`format_csv`/etc,
         // `src/jq/eval.rs`) was reachable *only* through `isvalid`'s forced
         // broadcast — a succinctly-only quirk, not modeled on any real jq
@@ -147112,7 +147123,6 @@ mod tests {
         // directly after the format, e.g. `@urid?`) and each of these reports
         // `false` because the format raises on `1` here.
         for expr in [
-            "isvalid(@urid)",
             "isvalid(@csv)",
             "isvalid(@tsv)",
             r#"isvalid(@dsv("|"))"#,
@@ -147122,6 +147132,15 @@ mod tests {
                 QueryResult::Owned(OwnedValue::Bool(false)) => {}
             );
         }
+
+        // `@urid` (#6726) stringifies `1` as jq 1.8.2 does, so `isvalid(@urid)` is `true` on it and
+        // `false` on an input with a malformed escape.
+        query!(br"1", "isvalid(@urid)",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+        query!(br#""%""#, "isvalid(@urid)",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
 
         // `@base64` (encode) is the odd one out here: #1096 fixed it to
         // convert a scalar to its display string first, same as `@uri`/
@@ -160257,17 +160276,18 @@ mod tests {
     /// #1138: a malformed `%` escape (not immediately followed by two
     /// valid hex digits) errors rather than silently passing the `%`
     /// through -- matching real yq's `invalid URL escape "..."` wording
-    /// (yq is the only oracle here; real jq has no `@urid` at all). An
+    /// (yq was the only oracle then, jq mode follows jq 1.8.2 since #6726). An
     /// earlier version of `test_format_urid` above pinned the old
     /// passthrough behavior for exactly this input
     /// (`"hello%GGworld"` -> `"hello%GGworld"`); this replaces it.
     #[test]
     fn test_format_urid_malformed_escape_errors_1138() {
+        // jq mode names the whole input, as jq 1.8.2 does (#6726); yq's wording is the CLI tests'.
         query!(br#""hello%GGworld""#, "@urid",
             QueryResult::Error(e) => {
-                assert!(
-                    e.to_string().contains(r#"invalid URL escape "%GG""#),
-                    "error: {e}"
+                assert_eq!(
+                    e.to_string(),
+                    r#"string ("hello%GGworld") is not a valid uri encoding"#
                 );
             }
         );

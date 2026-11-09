@@ -374,7 +374,6 @@ fn test_parity_formats_type_errors() {
         (br#"{"a":1}"#.as_slice(), "@sh"),
         (b"42", "@csv"),
         (b"42", "@tsv"),
-        (b"42", "@urid"),
         (br#""notanarray""#, "@csv"),
     ] {
         assert_parity(json, filter);
@@ -526,12 +525,44 @@ fn test_formats_optional_owned_type_error_parity_124() {
         (b"null", "(1+1 | @tsv)?"),
         (b"null", r#"(1+1 | @dsv("|"))?"#),
         (b"null", "(1+1 | @base64d)?"),
-        (b"null", "(1+1 | @urid)?"),
     ] {
         assert_eq!(
             full_outputs(json, filter),
             Vec::<String>::new(),
             "full evaluator output changed for `{filter}`"
+        );
+        assert_parity(json, filter);
+    }
+}
+
+/// #6726: `@urid` follows jq 1.8.2 and stringifies any value first, so `(1+1 | @urid)?` has no type
+/// error to suppress (it was in the list above while `@urid` raised on a non-string), and the same
+/// holds on every route a value takes to the format. A malformed escape still raises, and `?` still
+/// suppresses it. Every answer captured from jq 1.8.2.
+#[test]
+fn test_format_urid_stringifies_in_both_evaluators_6726() {
+    for (json, filter, want) in [
+        (b"null".as_slice(), "(1+1 | @urid)?", vec!["\"2\""]),
+        (b"42", "@urid", vec!["\"42\""]),
+        (b"null", "@urid", vec!["\"null\""]),
+        (br#"["%41"]"#, "@urid", vec![r#""[\"A\"]""#]),
+        (br#"{"a":"%41"}"#, "map_values(@urid)", vec![r#"{"a":"A"}"#]),
+        (br#""%E4""#, "@urid?", vec![]),
+        (
+            br#""%E4""#,
+            "try @urid catch .",
+            vec![r#""string (\"%E4\") is not a valid uri encoding""#],
+        ),
+        (
+            br#""%""#,
+            "try @urid catch .",
+            vec![r#""string (\"%\") is not a valid uri encoding""#],
+        ),
+    ] {
+        assert_eq!(
+            as_strs(&full_outputs(json, filter)),
+            want,
+            "full evaluator output for `{filter}`"
         );
         assert_parity(json, filter);
     }

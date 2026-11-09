@@ -115458,7 +115458,7 @@ fn test_format_prefixed_string_both_evaluator_routes_3316() -> Result<()> {
 
 /// #3316: the parser doesn't special-case which format precedes a string,
 /// so succinctly's own jq-mode extension formats (`@dsv`, `@yaml`, `@props`,
-/// `@urid` -- real jq has none of these, gated behind `--jq-extensions` in
+/// `@urid` -- real jq 1.7.1 has none of these, gated behind `--jq-extensions` in
 /// yq mode per #1512, and unrestricted in jq mode) desugar the same way.
 /// Self-snapshot: no jq oracle exists for any of these, so the pin is
 /// against succinctly's own value.
