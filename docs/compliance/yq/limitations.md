@@ -7214,7 +7214,11 @@ These differ:
 - **An environment variable whose value is not valid UTF-8 is refused by `strenv()` and `env()` (#6566).**
   yq reads the bytes: `strenv(BADVAR)` with `BADVAR` set to `\xff\xfe` prints those two bytes, and `env(BADVAR)` reads them as a YAML document (`Error: EOF`).
   A string value here cannot hold non-UTF-8 text, so both stop with `value for env variable 'BADVAR' is not valid UTF-8 in strenv()` (or `env()`) and exit status 1, where they said `not provided` before #6566.
-  An unset variable is `not provided`, as in yq.
+  An unset variable is `not provided` for `env()`, as in yq, and `""` for `strenv()`, which yq never checks ([#6771](https://github.com/rust-works/succinctly/issues/6771)).
+- **`env(NAME)` decodes the value as YAML through `from_yaml`'s decoder, so it shares that decoder's gaps ([#6771](https://github.com/rust-works/succinctly/issues/6771)).**
+  `12` is a number, `true` a boolean, `{b: fish}` a mapping and `~` a null, an empty value is `not provided`, and the first document of several is the answer, as in yq.
+  A timestamp (`2024-01-02`) keeps the tag `!!str` and not `!!timestamp`, and the YAML 1.1 spellings `0b11` and `1_000` stay strings (`from_yaml` shares both, and [#2802](https://github.com/rust-works/succinctly/issues/2802) tracks the spellings).
+  A mapping with a repeated key reads as one entry for `length`, where yq counts both.
 
 ### A multi-line plain scalar in a document with a trailing comment keeps the double-quoted spelling ([#6737](https://github.com/rust-works/succinctly/issues/6737))
 
