@@ -33,3 +33,4 @@ seq_item_double_outdent_rejected  yaml_parser  a block sequence continuation tha
 
 path_ctx_path_with_arg      yq_gating      `path(.a)` answers `["a"]` and exits 0; real yq has no `path(f)` at all (only bare `path`) and rejects it with "bad expression, please check expression syntax" — #1512
 meta_assign_container_head_first_child_wins_2796  yq_gating  `.a head_comment = "x"` where the first child already owns a head comment is refused as not yet supported; yq discards the write silently and keeps the child's own head (ADR-0018 rule 4: matching would discard a write) — #2796
+meta_assign_multi_neighbour_owns_2796  yq_gating  `.[] head_comment = "x"` over a mapping whose entries already own head or foot lines (`# mid` above a key, a foot below the last) is refused as not yet supported: the order go-yaml's emitter flushes the two in is not modelled, so a refusal stands in for it rather than a merge that could be wrong — #2796

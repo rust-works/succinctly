@@ -5315,10 +5315,15 @@ ruled out), even though real yq supports every one of them:
   lines are the member's own head and foot (what `# mid` above `b:` is): the next member's
   head for a value head, this member's foot for the rest. A node, or its successor, that
   already owns head or foot lines is refused rather than merged (the order yq flushes them
-  in is not modelled), as is anything under a flow collection, a container target's foot or line comment (its head is part 5, below), a text of
-  newlines alone, and a write to more than one target (`.[] head_comment = "x"`). Checked by
-  13 `meta_assign_entry_*_2796` goldens and a differential fuzz of ~5,300 accepted writes
-  over random documents with and without comments (none differed; ~4,300 more were refused).
+  in is not modelled), as is anything under a flow collection, a container target's foot or line comment (its head is part 5, below) and a text of
+  newlines alone. Several targets (`.[] head_comment = "x"`, `(.a, .b) comments = "x"`, `|=` too) are written
+  one by one, each judged against the comments the document held before the assignment, so the head a
+  value leaves on the next key is not taken for a head that key owns; a target whose neighbour held lines
+  before the assignment is refused as a single target is. Checked by
+  13 `meta_assign_entry_*_2796` goldens, 13 `meta_assign_multi_*_2796` ones, and a differential fuzz of ~5,300 accepted writes
+  over random documents with and without comments (none differed; ~4,300 more were refused), and a 348-row
+  matrix of several targets (12 setter forms x 29 target shapes over documents with and without comments)
+  where 304 rows match yq, the rest are refused, and none is silently different.
 - **A mapping or sequence value takes a head** ([#2796](https://github.com/rust-works/succinctly/issues/2796),
   part 5): `.a head_comment = "x"` on a non-empty block mapping or sequence prints inside it,
   above its first entry at that entry's indent (`a:\n  # x\n  b: 1`), and above the dash for a

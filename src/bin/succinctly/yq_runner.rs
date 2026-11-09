@@ -5699,6 +5699,10 @@ enum MetaEffect {
 
 /// One resolved metadata write: which node, and what to do to it.
 struct ResolvedMetaWrite {
+    /// The assignment this write came from, among those of the pipe (#2796): the targets of one
+    /// `PATHS head_comment = "x"` share it, and are judged against the comments the pipe had
+    /// before it, not against what its own earlier targets deposited.
+    batch: usize,
     path: Vec<MetaPathStep>,
     /// The write addresses the mapping *key* node of the member at `path` (`...` visits those;
     /// `..` and a path do not) rather than its value (#2796).
@@ -6650,6 +6654,7 @@ fn resolve_one_meta_assign(
     // Writes to neighbouring entries interact (a value's head is the next key's), which is not
     // modelled: a text goes to a single target.
     let single_target = texts.len() == 1;
+    let batch = out.len();
     for (path, on_key, s) in texts {
         // A key node's trailing comment is the key line's own, not the value's: only the
         // clearing form reaches it (#2796), through the same effect the other slots clear with.
@@ -6693,6 +6698,7 @@ fn resolve_one_meta_assign(
                             | WritableSlot::KeyLineComment
                     );
                     out.push(ResolvedMetaWrite {
+                        batch,
                         path,
                         on_key,
                         effect: MetaEffect::SetKey {
@@ -6717,6 +6723,7 @@ fn resolve_one_meta_assign(
                     let head = matches!(slot, WritableSlot::HeadComment | WritableSlot::Comments);
                     let foot = matches!(slot, WritableSlot::FootComment | WritableSlot::Comments);
                     out.push(ResolvedMetaWrite {
+                        batch,
                         path,
                         on_key,
                         effect: MetaEffect::SetRoot {
@@ -6731,7 +6738,6 @@ fn resolve_one_meta_assign(
                 // lands, and whether the surrounding comments allow it, is decided against the
                 // result's comment tree when the write is applied.
                 let sets_entry = !s.is_empty()
-                    && single_target
                     && !on_key
                     && !path.is_empty()
                     && !matches!(slot, WritableSlot::KeyLineComment)
@@ -6745,6 +6751,7 @@ fn resolve_one_meta_assign(
                     let head = matches!(slot, WritableSlot::HeadComment | WritableSlot::Comments);
                     let foot = matches!(slot, WritableSlot::FootComment | WritableSlot::Comments);
                     out.push(ResolvedMetaWrite {
+                        batch,
                         path,
                         on_key,
                         effect: MetaEffect::SetEntry {
@@ -6814,6 +6821,7 @@ fn resolve_one_meta_assign(
             },
         };
         out.push(ResolvedMetaWrite {
+            batch,
             path,
             on_key,
             effect,
@@ -6885,6 +6893,9 @@ fn apply_meta_assign_writes(
     // Paths a container head was written to earlier in this pipe: that head lives on the
     // container's first entry, which a clear of the container's own slot does not reach.
     let mut container_heads: Vec<&[MetaPathStep]> = Vec::new();
+    // The comment tree as the assignment being applied found it (#2796): its targets are judged
+    // against it, so a head one target leaves on the next entry is not that entry's own.
+    let mut before_batch: Option<(usize, CommentTree)> = None;
     for write in writes {
         let steps: Vec<TreeStep<'_>> = write
             .path
@@ -6941,9 +6952,19 @@ fn apply_meta_assign_writes(
             if container == Some(false) && matches!(write.path.last(), Some(MetaPathStep::Key(_))) {
                 container_heads.push(write.path.as_slice());
             }
+            if before_batch
+                .as_ref()
+                .map_or(true, |(batch, _)| *batch != write.batch)
+            {
+                before_batch = Some((write.batch, tree.clone()));
+            }
+            let Some((_, before)) = &before_batch else {
+                continue; // patchcov: coverage tolerate-line reason="unreachable: the snapshot was just taken (#2796)"
+            };
             apply_set_entry(
                 &steps,
                 tree,
+                before,
                 container.is_some(),
                 first_key.as_deref(),
                 head.as_ref(),
@@ -7211,6 +7232,7 @@ fn block_ancestors(tree: &CommentTree, parent_steps: &[TreeStep<'_>]) -> Result<
 fn apply_set_entry(
     steps: &[TreeStep<'_>],
     tree: &mut CommentTree,
+    before: &CommentTree,
     container: bool,
     first_key: Option<&str>,
     head: Option<&Vec<String>>,
@@ -7304,13 +7326,23 @@ fn apply_set_entry(
         }
         return Ok(());
     }
-    if owns_lines(members[index]) {
+    // What each member of the parent held when this assignment began: lines a target of the same
+    // assignment deposited are not what yq's emitter would find there.
+    let held_before = |at: usize| {
+        match comment_tree_at_path(before, parent_steps) {
+            Some(CommentTree::Object(_, fields, _)) => fields.get_index(at).map(|(_, node)| node),
+            Some(CommentTree::Array(_, items)) => items.get(at),
+            _ => None,
+        }
+        .is_some_and(owns_lines)
+    };
+    if held_before(index) {
         return Err(set_entry_unsupported(
             "the node already has head or foot comment lines (in the document or from an earlier write)",
         ));
     }
     // A sequence item that is a collection takes only a head, which never touches the next entry.
-    if !container && !last_entry && owns_lines(members[index + 1]) {
+    if !container && !last_entry && held_before(index + 1) {
         return Err(set_entry_unsupported(
             "the next entry already has head or foot comment lines (in the document or from an earlier write)",
         ));
@@ -7331,8 +7363,10 @@ fn apply_set_entry(
             lines_of(None, set_foot, false)
         };
         if !own_foot.is_empty() {
+            // Keeping the head a target before this one left here, as the next key's.
             let meta = members[index].meta();
-            *members[index].meta_mut() = meta.with_head_foot(Vec::new(), own_foot);
+            *members[index].meta_mut() =
+                meta.with_head_foot(meta.head_comment().to_vec(), own_foot);
         }
     } else {
         // A sequence item's head is its own, above it.
