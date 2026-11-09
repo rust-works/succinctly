@@ -4751,6 +4751,35 @@ fn propagate_assign_alias_marks(expr: &Expr, value: &OwnedValue, tree: &mut Comm
         let source = nav_node(tree, value_expr)
             .filter(|node| contains_alias_mark(node))
             .cloned();
+        // A construction of static reads (`.c = [.b]`, `.c = {"z": .b}`) is a node of its own whose
+        // children are copies of the nodes it reads, so each alias among them stays one at its
+        // slot (#5249). The slots are read before any target is written, like the source above.
+        let slots: Option<Vec<(Vec<TreeStep<'_>>, CommentTree)>> =
+            construction_alias_slots(tree, value_expr).map(|found| {
+                found
+                    .into_iter()
+                    .map(|(steps, node)| (steps, node.clone()))
+                    .collect()
+            });
+        if let Some(slots) = slots {
+            for path_steps in &targets {
+                if let Some(node) = comment_tree_at_path_mut(tree, path_steps) {
+                    clear_alias_marks(node);
+                }
+                for (rel, src) in &slots {
+                    let full: Vec<TreeStep<'_>> =
+                        path_steps.iter().chain(rel.iter()).copied().collect();
+                    if let Some(node) = comment_tree_at_path_or_create_mut(tree, &full) {
+                        clear_alias_marks(node);
+                        if src.alias_name().is_some() {
+                            node.meta_mut().anchor = src.anchor_mark().cloned();
+                        }
+                        copy_alias_marks(src, node);
+                    }
+                }
+            }
+            continue;
+        }
         let targets_len = targets.len();
         for path_steps in targets {
             match &source {
@@ -4825,6 +4854,78 @@ fn nav_node<'t>(node: &'t CommentTree, expr: &Expr) -> Option<&'t CommentTree> {
             .try_fold(node, |current, stage| nav_node(current, stage)),
         _ => None,
     }
+}
+
+/// The slots of a construction (`[.b, .c]`, `{"z": .b}`, nested) that hold a node with an alias
+/// mark in `tree`: each slot's steps under the constructed value and the node it reads (#5249).
+/// `None` when `expr` is not a construction, or when a member could yield a number of outputs the
+/// slot index cannot be known for (`[.b[]]`, a dynamic key, a read of a key the tree lacks); a
+/// literal fills a slot but carries no mark.
+fn construction_alias_slots<'t, 'e>(
+    tree: &'t CommentTree,
+    expr: &'e Expr,
+) -> Option<Vec<(Vec<TreeStep<'e>>, &'t CommentTree)>> {
+    fn member<'t, 'e>(
+        tree: &'t CommentTree,
+        expr: &'e Expr,
+        prefix: &[TreeStep<'e>],
+        out: &mut Vec<(Vec<TreeStep<'e>>, &'t CommentTree)>,
+    ) -> Option<()> {
+        match expr {
+            Expr::Paren(inner) => member(tree, inner, prefix, out),
+            Expr::Array(_) | Expr::Object(_) => {
+                out.extend(construction_alias_slots_under(tree, expr, prefix)?);
+                Some(())
+            }
+            Expr::Literal(_) => Some(()),
+            _ => {
+                if let Some(src) = nav_node(tree, expr) {
+                    if contains_alias_mark(src) {
+                        out.push((prefix.to_vec(), src));
+                    }
+                    Some(())
+                } else {
+                    // An absent key read is empty in yq (`[.nope, .b]` has one element), so a
+                    // member the tree cannot find shifts every slot after it: not known.
+                    None
+                }
+            }
+        }
+    }
+    fn construction_alias_slots_under<'t, 'e>(
+        tree: &'t CommentTree,
+        expr: &'e Expr,
+        prefix: &[TreeStep<'e>],
+    ) -> Option<Vec<(Vec<TreeStep<'e>>, &'t CommentTree)>> {
+        let mut out = Vec::new();
+        match expr {
+            Expr::Paren(inner) => return construction_alias_slots_under(tree, inner, prefix),
+            Expr::Array(inner) => {
+                let items: &[Expr] = match &**inner {
+                    Expr::Comma(items) => items,
+                    one => std::slice::from_ref(one),
+                };
+                for (i, item) in items.iter().enumerate() {
+                    let mut at = prefix.to_vec();
+                    at.push(TreeStep::Index(i));
+                    member(tree, item, &at, &mut out)?;
+                }
+            }
+            Expr::Object(entries) => {
+                for entry in entries {
+                    let ObjectKey::Literal(key) = &entry.key else {
+                        return None;
+                    };
+                    let mut at = prefix.to_vec();
+                    at.push(TreeStep::Key(key.as_str()));
+                    member(tree, &entry.value, &at, &mut out)?;
+                }
+            }
+            _ => return None,
+        }
+        Some(out)
+    }
+    construction_alias_slots_under(tree, expr, &[])
 }
 
 /// [`static_nav_steps`] for an assignment's target, which may also be a comma of such paths

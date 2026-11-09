@@ -357,3 +357,74 @@ fn test_a_computed_operand_that_is_not_one_node_stays_plain_5249() -> Result<()>
     }
     Ok(())
 }
+
+/// A construction of reads holds copies of the nodes it reads, so an alias among them stays one in
+/// its slot, nested or not; each expected output is what yq prints for the same input and filter.
+#[test]
+fn test_an_alias_read_into_a_construction_stays_an_alias_5249() -> Result<()> {
+    const B: &str = "a: &x 1\nb: *x\n";
+    const ARR: &str = "a: &x 1\nb: [*x, &y 2]\nz: 3\n";
+    for (input, filter, expected) in [
+        (B, ".c = [.b]", "a: &x 1\nb: *x\nc:\n  - *x\n"),
+        (B, ".c = {\"z\": .b}", "a: &x 1\nb: *x\nc:\n  z: *x\n"),
+        (
+            B,
+            ".c = [.b, .a, .b]",
+            "a: &x 1\nb: *x\nc:\n  - *x\n  - 1\n  - *x\n",
+        ),
+        (
+            B,
+            ".c = {\"p\": [.b], \"q\": {\"r\": .b}}",
+            "a: &x 1\nb: *x\nc:\n  p:\n    - *x\n  q:\n    r: *x\n",
+        ),
+        (B, ".c = ([.b])", "a: &x 1\nb: *x\nc:\n  - *x\n"),
+        (
+            ARR,
+            ".c = [.b[0], .z, 5]",
+            "a: &x 1\nb: [*x, &y 2]\nz: 3\nc:\n  - *x\n  - 3\n  - 5\n",
+        ),
+        // Every target of a comma and a target under a parent the write creates.
+        (
+            B,
+            "(.c, .d) = [.b]",
+            "a: &x 1\nb: *x\nc:\n  - *x\nd:\n  - *x\n",
+        ),
+        (B, ".c.e = [.b]", "a: &x 1\nb: *x\nc:\n  e:\n    - *x\n"),
+        // The construction replaces what the target held, aliases included.
+        (
+            "a: &x 1\nb: *x\nc: [*x]\n",
+            ".c = [1]",
+            "a: &x 1\nb: *x\nc: [1]\n",
+        ),
+        // A later write through the element is its own node again.
+        (B, ".c = [.b] | .c[0] = 9", "a: &x 1\nb: *x\nc:\n  - 9\n"),
+    ] {
+        let (output, exit_code) = run_yq_stdin(filter, input, &[])?;
+        assert_eq!(exit_code, 0, "filter: {filter} on {input:?}");
+        assert_eq!(output, expected, "filter: {filter} on {input:?}");
+    }
+    Ok(())
+}
+
+/// A construction whose slot count the tree cannot tell keeps writing plain values.
+#[test]
+fn test_a_construction_of_unknown_width_stays_plain_5249() -> Result<()> {
+    for (input, filter, expected) in [
+        // `.b[]` and a missing key yield a number of outputs the slot index cannot know.
+        (
+            "a: &x 1\nb: [*x]\n",
+            ".c = [.b[]]",
+            "a: &x 1\nb: [*x]\nc:\n  - 1\n",
+        ),
+        (
+            "a: &x 1\nb: *x\n",
+            ".c = {(\"k\"): .b}",
+            "a: &x 1\nb: *x\nc:\n  k: 1\n",
+        ),
+    ] {
+        let (output, exit_code) = run_yq_stdin(filter, input, &[])?;
+        assert_eq!(exit_code, 0, "filter: {filter} on {input:?}");
+        assert_eq!(output, expected, "filter: {filter} on {input:?}");
+    }
+    Ok(())
+}
