@@ -20,8 +20,8 @@ use succinctly::jq::escape::AsciiEscapeWriter;
 use succinctly::jq::eval_generic::{
     check_nesting_depth, depth_guard_panic_message, eval_with_cursor_using,
     to_owned as generic_to_owned, to_owned_cursor as generic_to_owned_cursor,
-    to_owned_with_comments, to_owned_yaml_cursor, AnchorMark, CommentTree, GenericResult, NodeMeta,
-    ObjectBuilder, KEY_STYLE_STRING, VALUE_STYLE_STRING,
+    to_owned_with_comments, to_owned_yaml_cursor, validate_cursor, AnchorMark, CommentTree,
+    GenericResult, LazyElem, NodeMeta, ObjectBuilder, KEY_STYLE_STRING, VALUE_STYLE_STRING,
 };
 use succinctly::jq::stream::StreamFailure;
 use succinctly::jq::{
@@ -10699,6 +10699,30 @@ impl<V: DocumentValue> Iterator for BranchResults<V> {
     }
 }
 
+/// An array of document nodes (#3475) that fails to decode is the failure, and prints nothing.
+///
+/// The streamers write each node as they read it, so a scalar that fails to decode (`"x\q"`), a
+/// complex key that collides with another after its display form, or a node past the depth limit
+/// would be found with the array already half written. The owned route this replaces found all
+/// three before it wrote a byte; [`validate_cursor`] is that walk, instantiated to build nothing.
+fn validated_array_of_nodes<V: DocumentValue>(result: GenericResult<V>) -> GenericResult<V> {
+    let GenericResult::LazySeq(seq) = &result else {
+        return result;
+    };
+    // A failure of the sequence itself is the streamer's to report, as it is for `map(.)`.
+    let Ok(items) = seq.as_ref().clone().drain_atomic() else {
+        return result;
+    };
+    for item in &items {
+        if let LazyElem::Cursor(node) = item {
+            if let Err(error) = validate_cursor::<YqSemantics, _>(node) {
+                return GenericResult::Error(error);
+            }
+        }
+    }
+    result
+}
+
 /// Evaluate each of `branches` against `cursor` and collapse a partial failure the way a lone
 /// query does (#2392).
 ///
@@ -10706,12 +10730,22 @@ impl<V: DocumentValue> Iterator for BranchResults<V> {
 /// failed branch is the only result streamed and its diagnostic is the whole output. That covers a
 /// failure the evaluation raised; one found while a later branch streams (an undecodable scalar)
 /// comes after the earlier branches were written, as it does for `.[]`.
+///
+/// `validate_nodes` (#3475): the query is an array of the document's own nodes, so its elements
+/// are read for the first time while they stream. The array is atomic, so each is checked first.
 fn stream_branch_results<C: DocumentCursor + Copy>(
     branches: &[&Expr],
     cursor: C,
+    validate_nodes: bool,
 ) -> BranchResults<C::Value> {
     let eval = |branch: &Expr| {
-        discard_yq_partial_prefix(eval_with_cursor_using::<YqSemantics, _>(branch, cursor))
+        let result =
+            discard_yq_partial_prefix(eval_with_cursor_using::<YqSemantics, _>(branch, cursor));
+        if validate_nodes {
+            validated_array_of_nodes(result)
+        } else {
+            result
+        }
     };
     if let [only] = branches {
         return BranchResults::One(Some(eval(only)));
@@ -11549,7 +11583,8 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                     // #5283: a streamed comma is its branches, one `stream_cursor!` result each; only the
                     // first that produces output may write the document's `---`.
                     let mut doc_has_output = false;
-                    let branch_results = stream_branch_results(&stream_branches, $cursor);
+                    let branch_results =
+                        stream_branch_results(&stream_branches, $cursor, streams_array_of_nodes);
                     for result in branch_results {
                         // A throwaway flag once the document has output: `emit_yaml_doc_separator` sets it.
                         let mut comma_dummy = false;
@@ -11727,7 +11762,8 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                     // `None`), so there's no ordering constraint here beyond
                     // preceding `stream_json` itself.
                     // #5283: see the YAML arm above.
-                    let branch_results = stream_branch_results(&stream_branches, $cursor);
+                    let branch_results =
+                        stream_branch_results(&stream_branches, $cursor, streams_array_of_nodes);
                     for result in branch_results {
                         let stats = stream_maybe_colored(
                             $writer,

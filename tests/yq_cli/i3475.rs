@@ -106,3 +106,36 @@ fn test_an_array_of_nodes_keeps_a_merge_key_and_a_complex_key_3475() -> Result<(
     assert_eq!((out.as_str(), code), ("- ? [a, b]\n  : 1\n", 0));
     Ok(())
 }
+
+#[test]
+fn test_an_array_of_nodes_is_all_or_nothing_3475() -> Result<()> {
+    use crate::run_yq_stdin_with_stderr;
+    // The streamers write a node as they read it. A scalar that fails to decode, or a complex key
+    // that collides with another after its display form, is found only then: the array is atomic,
+    // so each node is checked before the first byte is written.
+    let bad_escape = "- ok\n- \"x\\qy\"\n";
+    let colliding = "- a\n- ? [1]\n  : v1\n  ? [2]\n  : v2\n";
+    for (doc, expected) in [
+        (bad_escape, "invalid escape sequence"),
+        (
+            colliding,
+            "is ambiguous: a complex or undecodable key's display form",
+        ),
+    ] {
+        for filter in ["[.[]]", "[.[] | select(. != null)]", "[.[1]]"] {
+            for args in [&[][..], &["-o=json", "-I=0"][..]] {
+                let (out, err, code) = run_yq_stdin_with_stderr(filter, doc, args)?;
+                if filter == "[.[1]]" && doc == colliding {
+                    continue; // the one node is the colliding mapping: covered by `[.[]]`
+                }
+                assert_eq!(out, "", "`{filter}` {args:?} on {doc:?}: stdout");
+                assert_eq!(code, 1, "`{filter}` {args:?} on {doc:?}");
+                assert!(
+                    err.contains(expected),
+                    "`{filter}` {args:?} on {doc:?}: stderr {err:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
