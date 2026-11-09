@@ -24,6 +24,7 @@ fn check(rows: &[Row<'_>]) -> Result<()> {
         ("s.json", "\"a\"\n"),
         ("flt.json", "1 }"),
         ("trunc.json", "[1,"),
+        ("seqb.json", "\u{1e}\"a\"\u{1e}12"),
     ] {
         std::fs::write(dir.path().join(name), text)?;
     }
@@ -54,6 +55,7 @@ fn a_last_value_after_a_fault_reaches_the_failure_behind_it_6712() -> Result<()>
         (&["-c", "[., input]"][..], &["flt", "miss", "str", "miss2"][..], "[\"a\",12]\n", "jq: error (at @DIR@/flt.json:0): Unmatched '}' at line 1, column 3\njq: error: Could not open file @DIR@/miss.json: No such file or directory\njq: error: Could not open file @DIR@/miss2.json: No such file or directory\n", 2),
         (&["-c", "[input_line_number, input]"][..], &["flt", "miss", "str", "miss2"][..], "[0,12]\n", "jq: error (at @DIR@/flt.json:0): Unmatched '}' at line 1, column 3\njq: error: Could not open file @DIR@/miss.json: No such file or directory\njq: error: Could not open file @DIR@/miss2.json: No such file or directory\n", 2),
         (&["-c", "[., input]"][..], &["one", "flt", "miss", "str", "miss2"][..], "[\"a\",12]\n", "jq: error (at @DIR@/flt.json:0): Unmatched '}' at line 1, column 4\njq: error: Could not open file @DIR@/miss.json: No such file or directory\njq: error: Could not open file @DIR@/miss2.json: No such file or directory\n", 2),
+        (&["-c", "-e", "input"][..], &["flt", "miss", "str", "miss2"][..], "12\n", "jq: error (at @DIR@/flt.json:0): Unmatched '}' at line 1, column 3\njq: error: Could not open file @DIR@/miss.json: No such file or directory\njq: error: Could not open file @DIR@/miss2.json: No such file or directory\n", 2),
     ];
     check(&rows)
 }
@@ -76,6 +78,20 @@ fn the_rows_around_a_fault_that_already_matched_keep_matching_6712() -> Result<(
         (&["-c", "-n", "input"][..], &["flt", "miss", "miss2"][..], "1\n", "", 0),
         (&["-c", "-s", "input"][..], &["flt", "miss", "str", "miss2"][..], "", "jq: parse error: Unmatched '}' at line 1, column 3\n", 5),
         (&["-c", "-R", "input"][..], &["flt", "miss", "str", "miss2"][..], "", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\njq: error: Could not open file @DIR@/miss2.json: No such file or directory\njq: error (at @DIR@/miss2.json:0): break\n", 2),
+        (&["-c", "-n", "1"][..], &["flt", "miss", "str", "miss2"][..], "1\n", "", 0),
+        (&["-c", "-n", "."][..], &["flt", "miss", "str", "miss2"][..], "null\n", "", 0),
+        (&["-c", "-n", "[.,input]"][..], &["flt", "miss", "str", "miss2"][..], "[null,1]\n", "", 0),
+        (&["-c", "-n", "first(inputs)"][..], &["flt", "miss", "str", "miss2"][..], "1\n", "", 0),
+        (&["-c", "-n", "[.,input]"][..], &["trunc", "miss", "str", "miss2"][..], "", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\njq: error: Could not open file @DIR@/miss2.json: No such file or directory\njq: error (at @DIR@/miss2.json:0): Expected separator between values at EOF at line 1, column 9\n", 2),
+        (&["-c", "[.,input]"][..], &["trunc", "miss", "str", "miss2"][..], "", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\njq: error: Could not open file @DIR@/miss2.json: No such file or directory\njq: parse error: Expected separator between values at EOF at line 1, column 9\n", 2),
+        (&["-c", "-n", "input"][..], &["trunc", "miss", "str", "miss2"][..], "", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\njq: error: Could not open file @DIR@/miss2.json: No such file or directory\njq: error (at @DIR@/miss2.json:0): Expected separator between values at EOF at line 1, column 9\n", 2),
+        (&["-c", "--seq", "input"][..], &["seqb", "miss", "str", "miss2"][..], "\u{1e}12\n", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\n", 2),
+        (&["-c", "--stream", "input"][..], &["flt", "miss", "str", "miss2"][..], "[[],12]\n", "jq: error (at @DIR@/flt.json:0): Unmatched '}' at the top-level at line 1, column 3\njq: error: Could not open file @DIR@/miss.json: No such file or directory\njq: error: Could not open file @DIR@/miss2.json: No such file or directory\n", 2),
+        (&["-c", "--stream-errors", "input"][..], &["flt", "miss", "str", "miss2"][..], "[\"Unmatched '}' at the top-level at line 1, column 3\",[]]\n[[],12]\n", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\njq: error: Could not open file @DIR@/miss2.json: No such file or directory\n", 2),
+        (&["-c", "-n", "--stream", "[inputs]"][..], &["flt", "miss", "str", "miss2"][..], "", "jq: error (at @DIR@/flt.json:0): Unmatched '}' at the top-level at line 1, column 3\n", 5),
+        (&["-c", "-R", "input"][..], &["flt", "miss", "str", "miss2"][..], "", "jq: error: Could not open file @DIR@/miss.json: No such file or directory\njq: error: Could not open file @DIR@/miss2.json: No such file or directory\njq: error (at @DIR@/miss2.json:0): break\n", 2),
+        (&["-c", "-s", "input"][..], &["flt", "miss", "str", "miss2"][..], "", "jq: parse error: Unmatched '}' at line 1, column 3\n", 5),
+        (&["-c", "-n", "[inputs,input_filename]"][..], &["flt", "miss", "str", "miss2"][..], "", "jq: error (at @DIR@/flt.json:0): Unmatched '}' at line 1, column 3\n", 5),
     ];
     check(&rows)
 }
