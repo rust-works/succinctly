@@ -17,9 +17,12 @@ counted.
 
 Usage:
   cargo build --release --features cli
-  ./scripts/jq-seq-door-sweep.py [--seed N] [--cases N] [--base BASE] [--oracle JQ] [--file] [binary]
+  ./scripts/jq-seq-door-sweep.py [--seed N] [--cases N] [--base BASE] [--oracle JQ] [--file | --both] [binary]
 
-Exits non-zero when a regression is found (or, without `--base`, when any case differs from jq).
+Exits 1 when a regression is found (or, without `--base`, when any case differs from jq), and 2 on a
+setup error. `succinctly dev compare jq --dimension sweeps` runs it with `--both` and no base
+(`comparison/jq/manifest.toml`, id `seq-door`), where it is a plain oracle sweep: every case must
+match jq 1.7.1.
 """
 
 import argparse
@@ -96,7 +99,9 @@ def resolve_oracle(given):
             continue
         if out.stdout.strip().startswith("jq-1.7.1"):
             return candidate
-    sys.exit("error: no jq 1.7.1 found; pass --oracle")
+    # A setup error exits 2, not 1: the compare harness reads 1 as "diverges" (comparison/jq/manifest.toml).
+    print("error: no jq 1.7.1 found; pass --oracle", file=sys.stderr)
+    sys.exit(2)
 
 
 def run(argv, data, as_file=False):
@@ -152,21 +157,27 @@ def main():
     parser.add_argument("--oracle")
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--file", action="store_true", help="give each stream as a file argument, not on stdin")
+    parser.add_argument("--both", action="store_true", help="run every case on stdin and as a file argument")
     args = parser.parse_args()
+    if not os.access(args.binary, os.X_OK):
+        print(f"error: succinctly binary not found at {args.binary}", file=sys.stderr)
+        return 2
     jq = resolve_oracle(args.oracle)
 
-    def one(case):
-        program, flags, stream = case
+    def one(work):
+        (program, flags, stream), as_file = work
         argv = flags + ["--seq", program]
-        want = run([jq] + argv, stream, args.file)
-        got = run([args.binary, "jq"] + argv, stream, args.file)
-        before = run([args.base, "jq"] + argv, stream, args.file) if args.base else None
-        return case, want, got, before
+        want = run([jq] + argv, stream, as_file)
+        got = run([args.binary, "jq"] + argv, stream, as_file)
+        before = run([args.base, "jq"] + argv, stream, as_file) if args.base else None
+        return (program, flags, stream), want, got, before
 
+    routes = [False, True] if args.both else [args.file]
+    work = [(case, route) for case in make_cases(args.cases, args.seed) for route in routes]
     tally = collections.Counter()
     regressions, fixes, shared = [], [], []
     with ThreadPoolExecutor(args.jobs) as pool:
-        for case, want, got, before in pool.map(one, make_cases(args.cases, args.seed)):
+        for case, want, got, before in pool.map(one, work):
             tally["cases"] += 1
             if got == want:
                 tally["match jq"] += 1
