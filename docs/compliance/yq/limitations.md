@@ -7219,6 +7219,10 @@ These differ:
   `12` is a number, `true` a boolean, `{b: fish}` a mapping and `~` a null, an empty value is `not provided`, and the first document of several is the answer, as in yq.
   A timestamp (`2024-01-02`) keeps the tag `!!str` and not `!!timestamp`, and the YAML 1.1 spellings `0b11` and `1_000` stay strings (`from_yaml` shares both, and [#2802](https://github.com/rust-works/succinctly/issues/2802) tracks the spellings).
   A mapping with a repeated key reads as one entry for `length`, where yq counts both.
+  A value with a leading byte-order mark keeps it in its first key (`\ufeffa`), where yq drops it.
+  A value nested more than 128 levels deep is refused (`nesting depth exceeds limit of 128`), where yq reads up to 10000.
+  `!!binary aGVsbG8=` has the tag `!!str`, not `!!binary`.
+  The node keeps no style, anchor or spelling of its own: `[1, 2]` has no `style` (yq: `flow`), an alias reads as its value, and a comment-only value is `null` where yq prints the comment.
 
 ### A multi-line plain scalar in a document with a trailing comment keeps the double-quoted spelling ([#6737](https://github.com/rust-works/succinctly/issues/6737))
 
