@@ -728,7 +728,7 @@
 [{"x":"\ud800"}]	.a | (., debug)	5	5	
 [{"x":"\ud800"}]	.a | if . then . else . end	5	5	
 [{"x":"\ud800"}]	.a | 1+1	5	5	
-[{"x":"\ud800"}]	.[] | select(. != null)	5	5	
+[{"x":"\ud800"}]	.[] | select(. != null)	5	0	{"x":"\ud800"}
 [{"x":"\ud800"}]	.[] | tostring	5	5	
 [{"x":"\ud800"}]	true and true	5	0	true
 [{"x":"\ud800"}]	. and true	5	0	true

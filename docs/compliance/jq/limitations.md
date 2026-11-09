@@ -10125,6 +10125,25 @@ uncaught, as it does through `try` (#1620), instead of being digested into `fals
 in `test_any_all_cond_isvalid_loops_validate_only_what_they_read_2658` and
 `test_lazy_validation_boundary_2168`'s answering column.
 
+[#6350](https://github.com/rust-works/succinctly/issues/6350) answered `select(cond)` from the node itself, without the owned copy the general route made of it, for a `cond` of `.`, `type`, a literal, `not`, `and`/`or` and a comparison between `.` or `type` and a literal.
+That copy was the last place such a `select` validated what it kept.
+A container compared with a literal is decided by being one (`. != null` is true of every container, `. == null` false), so nothing inside it is read: the rule #2692 applied to a condition that reads only truthiness.
+A scalar is still copied to be compared, so a scalar that does not decode still raises.
+[#6756](https://github.com/rust-works/succinctly/issues/6756) found it through `scripts/jq-m2-streaming-sweep.sh`.
+On `[{"x":"\ud800"}]`:
+
+| filter                                                                     | jq 1.7.1 | before #6350           | now                        |
+|----------------------------------------------------------------------------|----------|------------------------|----------------------------|
+| `.[] \| select(. != null)`, `select(. != null)`                            | error    | error — **matched jq** | the element — **diverges** |
+| `.[] \| select(. == null)`                                                 | error    | error — **matched jq** | empty — **diverges**       |
+| `.[] \| select(type == "object")`                                          | error    | error — **matched jq** | the element — **diverges** |
+| `.[] \| select(.x != null)`, `[.[] \| select(. != null)] \| tojson`         | error    | error                  | error — **matched jq**     |
+
+The last row reads what the others do not: `.x` decodes the element, and the consumer reads the element it is handed.
+On `["\x"]` the same comparisons over the scalar still raise, as jq does.
+Pinned in `tests/jq_cli/i6756.rs` and in the golden row `[{"x":"\ud800"}] .[] | select(. != null)` of `scripts/jq-m2-streaming-sweep.expected`.
+The three reasons below apply unchanged: the agreement being given up was the copy's side effect, the answer depended on how the condition was spelled (`select(.)` already passed this document through and `select(. != null)` did not), and the copy cost the container's whole subtree at every node it was asked about.
+
 Step 2 of ADR-0018's decision order therefore separates the two options and favours the
 behaviour being given up. No rule-4 condition applies — the output is readable, nothing is
 corrupted or discarded, and neither choice takes the process down. **This is a deliberate
