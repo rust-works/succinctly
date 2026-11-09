@@ -511,6 +511,17 @@ echo '"a1b"' | succinctly yq 'sub("a"; .)'                 # "a1b1b" (. is the i
 echo '"abab"' | succinctly yq 'sub("(b)"; "<$1>")'         # "a<b>a<b>"
 ```
 
+yq reads the arguments of `sub` as the left and right child of whatever node holds them, so a comma spells the call as
+well as `;` does, and it is how yq's own string-operators page writes it (#6769). The first item is the pattern and the
+rest is the replacement, of which the first output is read:
+
+```bash
+echo '"dogs are great"' | succinctly yq 'sub("dogs", "cats")'        # "cats are great"
+echo '"dogs are great"' | succinctly yq 'sub("dogs", "X", "Y")'      # "X are great"
+```
+
+`with_dtf(layout, expr)` takes the same comma. `succinctly jq` keeps refusing it, as jq does.
+
 `gsub` (any arity), `scan`, and `splits` are not real yq builtins at all — real yq's own
 lexer rejects them outright (confirmed live against yq v4.53.3, #1436). succinctly's `gsub`
 support in yq mode is therefore a succinctly-only convenience, gated behind
