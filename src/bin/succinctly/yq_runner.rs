@@ -6967,9 +6967,11 @@ fn apply_meta_assign_writes(
                 before,
                 container.is_some(),
                 first_key.as_deref(),
-                head.as_ref(),
-                foot.as_ref(),
-                line.as_ref(),
+                EntryText {
+                    head: head.as_ref(),
+                    foot: foot.as_ref(),
+                    line: line.as_ref(),
+                },
             )?;
             continue;
         }
@@ -7208,6 +7210,14 @@ fn block_ancestors(tree: &CommentTree, parent_steps: &[TreeStep<'_>]) -> Result<
     Ok(true)
 }
 
+/// The texts one entry write sets (#2796): a head, a foot and a line comment, each only when the
+/// slot is written.
+struct EntryText<'a> {
+    head: Option<&'a Vec<String>>,
+    foot: Option<&'a Vec<String>>,
+    line: Option<&'a String>,
+}
+
 /// Apply a text write to a scalar mapping value or sequence item (`.a.b head_comment = "x"`,
 /// #2796), or refuse it.
 ///
@@ -7235,10 +7245,9 @@ fn apply_set_entry(
     before: &CommentTree,
     container: bool,
     first_key: Option<&str>,
-    head: Option<&Vec<String>>,
-    foot: Option<&Vec<String>>,
-    line: Option<&String>,
+    text: EntryText<'_>,
 ) -> Result<(), EvalError> {
+    let EntryText { head, foot, line } = text;
     let Some((last, parent_steps)) = steps.split_last() else {
         return Ok(());
     };
