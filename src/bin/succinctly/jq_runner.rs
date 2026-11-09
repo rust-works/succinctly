@@ -7388,7 +7388,8 @@ fn read_inputs(
     // so that a read of the array reaches it.
     if (seq_readers_place_reads
         || seq_slurp_defers_failures(args)
-        || (seq_by_stream_reader && args.slurp))
+        || (seq_by_stream_reader && args.slurp)
+        || (json_input_mode && args.slurp && (stream_by_reader || args.stream_errors)))
         && UNOPENED_TAIL_NAME.with(|tail| tail.borrow().is_some())
     {
         raw_bytes.push((Some(files.len()), Vec::new()));
