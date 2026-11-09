@@ -1913,14 +1913,23 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             // An anchor, a tag or a comment on the `:` line keeps the first entry
                             // off it (#4950: `? key` / `: &a` / `  a: 1`, `? key` / `: # c` /
                             // `  a: 1`).
+                            // `? key` / `: a: 1`: the value's first entry shares the `:` line
+                            // (#3587), at the column its own continuation lines are at (#6738),
+                            // unless there is no room for a blank (`explicit_key_lead_blanks`),
+                            // when it goes on a line of its own, as yq's does. The tab unit keeps
+                            // its step.
+                            let pad = if unit == ' ' {
+                                explicit_key_lead_blanks(indent, &child_indent)
+                            } else {
+                                indent_spaces.saturating_sub(1)
+                            };
                             if explicit_key
                                 && !key_comment_written
                                 && value.anchor().is_none()
                                 && value.explicit_tag_at(None).is_none()
+                                && (pad > 0 || unit != ' ')
                             {
-                                // `? key` / `: a: 1`: the value's first entry shares the
-                                // `:` line (#3587), at the column one indent step in.
-                                for _ in 1..indent_spaces {
+                                for _ in 0..pad {
                                     out.write_char(' ')?;
                                 }
                             } else {
@@ -9483,15 +9492,23 @@ fn write_yaml_block_field_key<W: AsRef<[u64]>, Out: core::fmt::Write>(
         let blanks = if flow || !properties.is_empty() {
             1
         } else {
-            child_indent
-                .chars()
-                .count()
-                .saturating_sub(indent.chars().count() + 1)
-                .max(1)
+            explicit_key_lead_blanks(indent, &child_indent).max(1)
         };
+        // #6738: with no room for a blank between the `?` and the column the key's other lines
+        // stand at (`-I=3` inside a compact sequence entry), the block key starts on a line of its
+        // own, as yq's does: `? - a` would put its first line one column past the rest.
+        let no_room = unit == ' '
+            && !flow
+            && properties.is_empty()
+            && explicit_key_lead_blanks(indent, &child_indent) == 0;
         out.write_char('?')?;
-        for _ in 0..blanks {
-            out.write_char(' ')?;
+        if no_room {
+            out.write_char('\n')?;
+            out.write_str(&child_indent)?;
+        } else {
+            for _ in 0..blanks {
+                out.write_char(' ')?;
+            }
         }
         if !properties.is_empty() {
             out.write_str(&properties)?;
@@ -9537,6 +9554,19 @@ fn write_yaml_block_field_key<W: AsRef<[u64]>, Out: core::fmt::Write>(
     }
     write_yaml_field_key(out, field, false)?;
     Ok(false)
+}
+
+/// How many blanks follow the `?` or the `:` of an explicit key before the block collection that
+/// starts on its line (#6738): the column `child_indent` puts the collection's other lines at, less
+/// the key's own column and the `?`/`:` character. `0` is no room: yq starts the collection on a
+/// line of its own then, as `?- a` and `:- 1` would not be a collection. One definition for the
+/// key and the value, which must agree (a mapping's column is `indent`, rounded up to the step by
+/// [`deeper_yaml_indent`] for `child_indent`, so inside a `- ` item it is not one step in).
+fn explicit_key_lead_blanks(indent: &str, child_indent: &str) -> usize {
+    child_indent
+        .chars()
+        .count()
+        .saturating_sub(indent.chars().count() + 1)
 }
 
 /// [`write_yaml_block_field_key`] for a document that might hold a key over 128 bytes: a key
