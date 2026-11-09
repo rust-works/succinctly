@@ -47165,6 +47165,7 @@ fn eval_meta_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         MetaSlot::LineComment
         | MetaSlot::Style
         | MetaSlot::Anchor
+        | MetaSlot::Alias
         | MetaSlot::HeadComment
         | MetaSlot::FootComment
         | MetaSlot::Comments

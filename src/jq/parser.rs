@@ -1669,6 +1669,7 @@ const META_OP_KEYWORDS: &[(&str, MetaSlot)] = &[
     ("style", MetaSlot::Style),
     ("tag", MetaSlot::Tag),
     ("anchor", MetaSlot::Anchor),
+    ("alias", MetaSlot::Alias),
 ];
 
 /// The variable [`bind_retrying_value_arg`] binds a builtin's argument to. Not spellable in
@@ -10200,6 +10201,12 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
+    /// Whether `slot` is spelled in the parser's mode: `alias =` is yq's (#5483), and in jq mode the
+    /// word stays whatever it was before (an error, `alias` being no jq builtin).
+    fn meta_slot_in_mode(&self, slot: MetaSlot) -> bool {
+        slot != MetaSlot::Alias || self.mode == ParserMode::Yq
+    }
+
     /// yq metadata-assignment grammar (#798): `PATH <slot> = value` /
     /// `PATH <slot> |= filter`, e.g. `.a style = "flow"`. Distinct production
     /// from both dotted-field access (`.a.style` parses as three chained
@@ -10221,7 +10228,7 @@ impl<'a> Parser<'a> {
     fn try_parse_meta_op(&mut self, left: Expr) -> Result<Result<Expr, Expr>, ParseError> {
         let Some(&(keyword, slot)) = META_OP_KEYWORDS
             .iter()
-            .find(|(kw, _)| self.matches_keyword(kw))
+            .find(|(kw, slot)| self.matches_keyword(kw) && self.meta_slot_in_mode(*slot))
         else {
             return Ok(Err(left));
         };
@@ -10263,7 +10270,7 @@ impl<'a> Parser<'a> {
     fn peeks_meta_op_keyword_then_assign(&mut self) -> bool {
         let Some(&(keyword, _)) = META_OP_KEYWORDS
             .iter()
-            .find(|(kw, _)| self.matches_keyword(kw))
+            .find(|(kw, slot)| self.matches_keyword(kw) && self.meta_slot_in_mode(*slot))
         else {
             return false;
         };
