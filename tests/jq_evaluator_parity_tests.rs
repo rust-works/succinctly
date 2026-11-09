@@ -490,7 +490,8 @@ fn test_formats_non_finite_owned_pipe_parity() {
 /// `?` on a format applied to a *constructed* value (arithmetic, array/object
 /// construction, ...) must still suppress a type-mismatch error, producing no
 /// output at all -- verified against jq 1.7.1 (`jq -n '(1+1 | @csv)?'` and
-/// the `@tsv`/`@base64d`/`@urid` siblings all produce nothing, exit 0;
+/// the `@tsv`/`@base64d` siblings all produce nothing, exit 0 (`@urid` stringifies since #6726,
+/// see `test_format_urid_stringifies_in_both_evaluators_6726`);
 /// `@dsv` has no jq equivalent to check directly, since it's this crate's
 /// own extension, but shares `format_csv`'s exact suppression code path).
 ///
@@ -503,9 +504,8 @@ fn test_formats_non_finite_owned_pipe_parity() {
 /// behavior. See `test_format_base64_constructed_scalar_no_longer_suppressed_1096`
 /// below for that corrected case.
 ///
-/// Before #693, `format_csv`/`format_tsv`/`format_dsv`/`format_base64d`/
-/// `format_urid`'s own `_ if optional => Ok(String::new())`
-/// arm was the *only* thing that made `?` work here -- there was no separate
+/// Before #693, `format_csv`/`format_tsv`/`format_dsv`/`format_base64d`'s own
+/// `_ if optional => Ok(String::new())` arm was the *only* thing that made `?` work here -- there was no separate
 /// `Expr::Optional`-catches-`Error` fallback for this path, so a suppressed
 /// format fell back to the empty *string* `""` (a real output) rather than
 /// true suppression (no output), because `format_owned` returns `Result<

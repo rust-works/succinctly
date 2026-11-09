@@ -161,6 +161,14 @@ below and [ADR-0019](../adrs/adr-0019.md).
 | **@yaml**    | `@yaml`             | YAML block-style encoding (yq)                    | `a: 1\nb: 2\n`      |
 | **@props**   | `@props`            | Java properties format (yq)                       | `key = value`       |
 
+**@urid (jq mode):** new in jq 1.8, and `succinctly jq` follows jq 1.8.2 for it (#6726): a non-string is
+stringified first (`1 | @urid` => `"1"`, `["%41"] | @urid` => `"[\"A\"]"`), and a `%` not followed by two
+hex digits, or escapes that decode to bytes that are not valid UTF-8 (`%E4`, `%FF%FE`), raise
+`string ("%E4") is not a valid uri encoding`. `succinctly yq` keeps yq's own rules (`+` is a space,
+`invalid URL escape "%"`, U+FFFD for bad bytes), and `format("urid")` keeps jq 1.7.1's
+`urid is not a valid format` (the pin); see
+[limitations](../compliance/jq/limitations.md#urid-jq-182s-behaviour-for-the-format-jq-171s-for-formaturid).
+
 **@uri/@base64/@html on arrays/objects (jq mode only):** a container is JSON-encoded
 first, then formatted, matching real jq (`[1,2] | @uri` => `"%5B1%2C2%5D"`) — `succinctly
 yq` still rejects a container outright for all three, matching real yq's own

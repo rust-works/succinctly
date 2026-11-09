@@ -269,7 +269,7 @@ essentially never reproduce it. Every caller is now scoped the way jq scopes it:
 
 | Caller                                                 | Scope                                                          | Issue |
 |--------------------------------------------------------|----------------------------------------------------------------|-------|
-| `@base64d`/yq `@urid` (`owned_string_from_decoded_bytes`) | One decoded string, already                                  | #1719 |
+| `@base64d`/yq `@urid` (`..._from_decoded_bytes`)       | One decoded string, already                                    | #1719 |
 | `--raw-input` (non-slurp)                              | Per line, split before substituting                            | #1742 |
 | JSON document / `--slurp` / `--seq`                    | Per JSON string                                                | #1743 |
 | `--raw-input --slurp`                                  | Whole buffer — **matching real jq**, which has one string here | —     |

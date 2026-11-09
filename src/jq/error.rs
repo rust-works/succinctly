@@ -1150,14 +1150,10 @@ impl EvalError {
 
     /// `invalid URL escape "<escape>"` (#1138).
     ///
-    /// Raised by `@urid` when a `%` isn't immediately followed by two
-    /// valid hex digits. Unlike [`Self::base64_illegal_data`] above --
-    /// genuinely yq-only, since jq's own real `@base64d` has independently
-    /// verified wording to diverge against -- `@urid` is a succinctly
-    /// extension with **no jq analogue at all**, so there's no competing
-    /// jq-mode wording to preserve: this fires identically in both jq and
-    /// yq mode (`format_urid`'s malformed-escape check has no `S::TAG`
-    /// branch).
+    /// Raised by yq mode's `@urid` when a `%` isn't immediately followed by two
+    /// valid hex digits. jq mode raises jq 1.8.2's own wording instead
+    /// ([`Self::urid_not_a_valid_uri_encoding`], #6726): while `@urid` had no jq oracle this
+    /// fired identically in both modes, and `format_urid` now branches on `S::TAG` for it.
     ///
     /// `raw` is `%` plus whatever 0, 1, or 2 bytes actually follow it in
     /// the input (not validated -- confirmed live against yq v4.53.3 that
@@ -1189,7 +1185,7 @@ impl EvalError {
     /// bytes: a longer one keeps its first 25 bytes (cut back to a character boundary, never to a
     /// U+FFFD), then `...`, then the dump's own last byte, here the closing quote
     /// (`string ("%aaaaaaaaaaaaaaaaaaaaaaa...")`); the 1.7.1 messages cut a 15-byte buffer and drop the
-    /// closing byte, which is what [`describe`] writes.
+    /// closing byte, which is what the other messages here write (`describe`).
     pub fn urid_not_a_valid_uri_encoding(text: &str) -> Self {
         let mut sink = PreviewSink::new(URID_DUMP_BUDGET);
         let _ = stream_owned_value_json_jq(&OwnedValue::String(text.into()), &mut sink);

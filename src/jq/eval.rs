@@ -25426,8 +25426,8 @@ fn format_base64<S: EvalSemantics>(
     let s = match stringify_for_format::<S>(value) {
         Some(s) => s,
         // Mirrors every sibling format's own `_ if optional =>
-        // Ok(String::new())` arm (`format_urid`/`format_tsv`/`format_dsv`/
-        // `format_csv` above) for consistency, but is very likely
+        // Ok(String::new())` arm (`format_tsv`/`format_dsv`/`format_csv`
+        // above) for consistency, but is very likely
         // unreachable dead code post-#693 for the same reason those are:
         // `Expr::Optional` now forces the inner evaluation's ambient
         // `optional` to `false` and catches the resulting `Error` itself,
@@ -147113,7 +147113,7 @@ mod tests {
         // 1.8.2, it answers `false` for `@base64d`, `@csv` and `@tsv`, each of
         // which raises there. `@urid` is not in this list: it stringifies `1` as jq 1.8.2
         // does (#6726), so it answers `true`. `@dsv` is succinctly's own. Before this fix, the `@format` builtins' own `_ if optional =>
-        // Ok(String::new())` arm (`format_urid`/`format_csv`/etc,
+        // Ok(String::new())` arm (`format_csv`/etc,
         // `src/jq/eval.rs`) was reachable *only* through `isvalid`'s forced
         // broadcast — a succinctly-only quirk, not modeled on any real jq
         // behavior, that made `isvalid(@urid)` on bad input wrongly report
