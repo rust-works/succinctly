@@ -7137,7 +7137,9 @@ That is a divergence under the rule that `succinctly yq` never emits YAML it can
 - A path the write creates is `null`: `.d alias = "x"` is `d: *x` in yq, `d: null` here.
 - Aliasing the declaring node (`.a alias = "x"` over `a: &x 1`) leaves no declaration, so every alias of it, the node itself included, prints the value.
 - `-o json` prints `null` in yq for an alias node the setter made (it has no target) and the node's value here.
-- A bare scalar result keeps no mark, so `.b alias = "x" | .b` is `*x` in yq and `1` here, as for any bare scalar alias (see the soundness section above).
+- A bare scalar result keeps no mark, so `.b alias = "x" | .b` is `*x` in yq and `1` here, as for any bare scalar alias (see the soundness section above); the same holds for the document root, `. alias = "x"`.
+- `--eval-all` evaluates through the owned-value route, which writes no metadata: `alias =` is a no-op there, as `anchor =` is (the route keeps no anchors at all, #4380).
+- A document whose anchor is aliased elsewhere keeps yq's other alias: `.a alias = "x"` over `a: &y 1` / `b: *y` is `a: *x` / `b: *y` in yq, and `a: 1` / `b: 1` here, the declaration being gone.
 - A later write does not clear the mark where it leaves the value alone: `.c alias = "x" | .c = 1` is `c: 1` in yq and `c: *x` here, since `1` is still the anchor's value.
 
 What matches yq, byte for byte, in the rows captured from v4.53.3: an equal anchor (`.b alias = "x"` over `a: &x 1` / `b: 1` is `b: *x`), `|=`, several targets, a container aliased to an equal container, and the refusals.
