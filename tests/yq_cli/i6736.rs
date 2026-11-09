@@ -28,6 +28,9 @@ fn test_streamed_sequences_keep_the_comments_between_items_6736() -> Result<()> 
         ("# head\n- a\n# c\n- b\n# end\n", "map(.)", "- a\n# c\n- b\n# end\n"),
         ("# head\n- a\n# c\n- b\n# end\n", "[.[]]", "- a\n# c\n- b\n# end\n"),
         ("# head\n- a\n# c\n- b\n# end\n", "[.]", "- - a\n  # c\n  - b\n  # end\n"),
+        ("- a\n# f\n\n- b\n", "map(.)", "- a\n# f\n\n- b\n"),
+        ("- &x a\n# f\n\n- b\n# g\n\n- c\n", "map(.)", "- &x a\n# f\n\n- b\n# g\n\n- c\n"),
+        ("- [1]\n# f\n\n- {k: v}\n", "map(.)", "- [1]\n# f\n- {k: v}\n"),
     ];
     for &(doc, filter, want) in rows {
         let (out, code) = run_yq_stdin(filter, doc, &[])?;
