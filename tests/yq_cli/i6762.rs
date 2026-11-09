@@ -22,6 +22,7 @@ const ROWS: &[(&str, &[&str], &str)] = &[
     // Comments: the head comment stays and the blank line or marker after it is not its.
     ("# c\n---\na: 1\n", &[".a = 5"], "# c\na: 5\n"),
     ("# c\n\na: 1\n", &[".a = 5"], "# c\na: 5\n"),
+    ("---\n# k\n\na: 1\n", &["-P", "."], "# k\na: 1\n"),
     (
         "---\n# k\na: 1\n# foot\n",
         &["-P", "."],
