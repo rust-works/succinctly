@@ -6083,8 +6083,14 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 // before it already ran, and nothing after it exists (#2961).
                 // #6620: what the loop has learned of the owned door.
                 let mut door = DoorMemory::default();
+                // #6796: a slurp reads every file in its first call, so a failure it counted ends jq's
+                // loop after that call, whatever the stream still holds for the program's `input`.
+                let mut slurp_read_made = false;
                 loop {
-                    if stopped(args.on_error, &sink) || !main_loop_reads_on() {
+                    if stopped(args.on_error, &sink)
+                        || !main_loop_reads_on()
+                        || (slurp_read_made && args.slurp && !args.null_input && open_failed)
+                    {
                         if plain_stream_errors(&args) {
                             count_directory_stopped_at(None);
                         }
@@ -6094,6 +6100,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     MAIN_LOOP_READ.with(|own| own.set(true));
                     let popped = jq::pop_input();
                     MAIN_LOOP_READ.with(|own| own.set(false));
+                    slurp_read_made = true;
                     let input = match popped {
                         jq::InputPop::Document(input) => input,
                         // #6141: `--seq --stream`'s end-of-stream stop ends the input call that met it,
