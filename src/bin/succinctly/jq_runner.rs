@@ -12397,6 +12397,8 @@ fn lazy_scan_on(
                         &ends,
                         values.len(),
                     );
+                    // #6678: as in `hand_off_later_sources`.
+                    note_fault_ends(errors.iter().map(|(_, fault)| &fault.error.message));
                     *tail = Box::new(lazy_tail_items(values, &locations, None, errors));
                 }
                 // patchcov: coverage tolerate reason="unreachable: the splitter is the more lenient of the two parsers and the prefix parse materializes from its spans, so it cannot find fewer values (the guard `read_json_tail` keeps per segment, #4311)"
@@ -12503,6 +12505,9 @@ fn hand_off_later_sources(
     }
     let sources: Vec<&[u8]> = texts.iter().map(String::as_bytes).collect();
     let end = EofTail::of(&sources, false, &seams, false);
+    // #6678: the faults the eager reader found are the stream's all, and the hook places the
+    // failures behind each by whether it is at the end of the text, as for a stream read eagerly.
+    note_fault_ends(errors.iter().map(|(_, fault)| &fault.error.message));
     (
         Box::new(lazy_tail_items(values, &locations, None, errors)),
         (!end.unknown).then_some((last_source, end.newlines)),
