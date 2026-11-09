@@ -281,12 +281,11 @@ class NewPatternRowTests(unittest.TestCase):
             failed, _ = self._drift(baseline, measured)
             self.assertEqual([f[0] for f in failed], ["seq_name_bad_last"] if fails else [])
 
-    def test_the_new_rows_threshold_is_not_looser_than_the_change_that_set_it(self):
-        # The override is temporary: it is the measured drift of the one change that speeds this
-        # row up (#6620's owned door: -36.3% x86_64, -34.6% ARM64-Linux), with room, and no more.
-        # Once `main` carries it the row goes back to #6619's 3.0, and this test back to the one
-        # that holds it under a revert of #6594 (+4.5%).
-        self.assertLessEqual(perf_guard.QUERY_THRESHOLDS["seq_name_bad_last"], 45.0)
+    def test_the_new_rows_threshold_is_tighter_than_the_default(self):
+        # #6619's point: a revert of #6594 reads +4.5%, which the default 5.0 lets through.
+        # #6620 raised the row while the changes it speeds up were not yet in the merge-base; they
+        # are now, and the row is back to 3.0.
+        self.assertLess(perf_guard.QUERY_THRESHOLDS["seq_name_bad_last"], 4.5)
 
 
 class MeasuredPathTests(unittest.TestCase):
