@@ -332,10 +332,12 @@ variables, so the set of variables that matter is ultimately whatever your queri
 | `$ENV`                    | Object of every variable | n/a                      |
 | `env`                     | Object of every variable | n/a                      |
 | `env.VAR`, `$ENV.VAR`     | The value                | `null`                   |
-| `env(VAR)` (yq syntax)    | The value                | Error                    |
-| `strenv(VAR)` (yq syntax) | The value                | Error                    |
+| `env(VAR)` (yq syntax)    | The value (see below)    | Error                    |
+| `strenv(VAR)` (yq syntax) | The value, as a string   | `""` in yq, error in jq  |
 
-Values are always strings; nothing is coerced to a number or boolean.
+Values are strings; nothing is coerced to a number or boolean, except by `env(VAR)` in `succinctly yq`.
+There `env(VAR)` decodes the value as YAML and answers its first document, as yq does: `12` is a number, `true` a boolean, `{b: fish}` a mapping, and an empty value is an error (#6771).
+`strenv(VAR)` is the text, and an unset variable is the empty string in yq (`succinctly jq`'s `strenv(VAR)` extension raises).
 
 ```bash
 API_KEY=secret succinctly jq -n 'env.API_KEY'      # "secret"

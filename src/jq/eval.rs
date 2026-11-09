@@ -19786,8 +19786,8 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Phase 10: Environment
         Builtin::Env => builtin_env::<W>(value, optional),
         Builtin::EnvVar(var) => builtin_envvar::<W, S>(var, value, optional),
-        Builtin::EnvObject(name) => builtin_env_object::<W>(name, optional),
-        Builtin::StrEnv(name) => builtin_strenv::<W>(name, optional),
+        Builtin::EnvObject(name) => builtin_env_object::<W, S>(name, optional),
+        Builtin::StrEnv(name) => builtin_strenv::<W, S>(name, optional),
 
         // Phase 10: Null handling
         Builtin::NullLit => QueryResult::Owned(OwnedValue::Null),
@@ -26885,6 +26885,15 @@ fn builtin_from_yaml<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         _ => return QueryResult::Owned(to_owned_lossy::<S, _>(&value)),
     };
+    decode_yaml_text::<W, S>(text, optional)
+}
+
+/// The first document of `text` read as yq's YAML decoder reads a string, for `from_yaml` and for
+/// `env(NAME)` (#6771).
+fn decode_yaml_text<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    text: String,
+    optional: bool,
+) -> QueryResult<'a, W> {
     // Only the empty string is yq's `EOF`: whitespace or a bare comment is a document with no
     // content, which decodes to null.
     if text.is_empty() {
@@ -109943,13 +109952,28 @@ fn env_value_refusal(name: &str, builtin: &str, error: &std::env::VarError) -> S
     }
 }
 
-/// Builtin: env(VAR_NAME) - get environment variable by literal name (yq syntax)
+/// Builtin: env(VAR_NAME) - get environment variable by literal name (yq syntax).
+///
+/// yq decodes the value as YAML and answers the first document (`envOperator`, #6771): `12` is a
+/// number, `{b: fish}` a mapping, `~` a null. An empty value is "not provided", as an unset one is.
+/// `succinctly jq`'s own `env(VAR)` extension answers the text, as it always did.
 #[cfg(feature = "std")]
-fn builtin_env_object<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_env_object<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     name: &str,
     optional: bool,
 ) -> QueryResult<'a, W> {
     match std::env::var(name) {
+        Ok(val) if S::TAG == EvalTag::Yq => {
+            if val.is_empty() {
+                return suppress_or_raise(
+                    EvalError::new(format!(
+                        "value for env variable '{name}' not provided in env()"
+                    )),
+                    optional,
+                );
+            }
+            decode_yaml_text::<W, S>(val, optional)
+        }
         Ok(val) => QueryResult::Owned(OwnedValue::String(val.into())),
         Err(_) if optional => QueryResult::None,
         Err(error) => QueryResult::Error(EvalError::new(env_value_refusal(name, "env()", &error))),
@@ -109957,7 +109981,7 @@ fn builtin_env_object<'a, W: Clone + AsRef<[u64]>>(
 }
 
 #[cfg(not(feature = "std"))]
-fn builtin_env_object<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_env_object<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     name: &str,
     optional: bool,
 ) -> QueryResult<'a, W> {
@@ -109971,12 +109995,20 @@ fn builtin_env_object<'a, W: Clone + AsRef<[u64]>>(
     }
 }
 
-/// Builtin: strenv(VAR_NAME) - get environment variable as string (yq syntax)
-/// This is the same as env() but explicitly for strings
+/// Builtin: strenv(VAR_NAME) - get environment variable as string (yq syntax).
+///
+/// yq answers `os.Getenv` as a string and never checks that it is set (`envOperator`, #6771), so an
+/// unset variable is `""`. `succinctly jq`'s own `strenv(VAR)` extension raises for an unset one.
 #[cfg(feature = "std")]
-fn builtin_strenv<'a, W: Clone + AsRef<[u64]>>(name: &str, optional: bool) -> QueryResult<'a, W> {
+fn builtin_strenv<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    name: &str,
+    optional: bool,
+) -> QueryResult<'a, W> {
     match std::env::var(name) {
         Ok(val) => QueryResult::Owned(OwnedValue::String(val.into())),
+        Err(std::env::VarError::NotPresent) if S::TAG == EvalTag::Yq => {
+            QueryResult::Owned(OwnedValue::String("".into()))
+        }
         Err(_) if optional => QueryResult::None,
         Err(error) => {
             QueryResult::Error(EvalError::new(env_value_refusal(name, "strenv()", &error)))
@@ -109985,7 +110017,10 @@ fn builtin_strenv<'a, W: Clone + AsRef<[u64]>>(name: &str, optional: bool) -> Qu
 }
 
 #[cfg(not(feature = "std"))]
-fn builtin_strenv<'a, W: Clone + AsRef<[u64]>>(name: &str, optional: bool) -> QueryResult<'a, W> {
+fn builtin_strenv<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    name: &str,
+    optional: bool,
+) -> QueryResult<'a, W> {
     if optional {
         QueryResult::None
     } else {
