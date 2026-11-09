@@ -19655,7 +19655,16 @@ mod tests {
         assert!(!stream_errors_main_loop_places_failures(
             &events,
             &[],
-            &[closed]
+            std::slice::from_ref(&closed)
+        ));
+        // A `--seq` stream places its own failures, whatever the files hold.
+        let failure = InputFileOpenError::new(std::path::Path::new("gone"), "x".into());
+        let raws = [closed, Vec::new()];
+        let seq_events = parse(&["jq", "--seq", "--stream-errors", "."]);
+        assert!(!stream_errors_main_loop_places_failures(
+            &seq_events,
+            &[(1, failure)],
+            &raws
         ));
     }
 
