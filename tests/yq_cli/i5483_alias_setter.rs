@@ -115,3 +115,19 @@ fn test_alias_setter_drops_an_alias_it_could_not_read_back_5483() -> Result<()> 
     }
     Ok(())
 }
+
+#[test]
+fn test_a_field_named_alias_is_still_a_field_write_5483() -> Result<()> {
+    // yq: `alias` after a `.` with no space is a field name, as `style` and `anchor` are.
+    let input = "alias: 5\na: {alias: 1}\n";
+    for (filter, expected) in [
+        (".alias = 1", "alias: 1\na: {alias: 1}\n"),
+        (".a.alias = 3", "alias: 5\na: {alias: 3}\n"),
+        (".alias |= 2", "alias: 2\na: {alias: 1}\n"),
+    ] {
+        let (out, code) = run_yq_stdin(filter, input, &[])?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(out, expected, "{filter}");
+    }
+    Ok(())
+}
