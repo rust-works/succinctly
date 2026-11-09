@@ -11886,6 +11886,8 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 &program.expr,
                 &yaml_bytes,
             ) {
+                // The fallback parses `yaml_bytes` again, so the first index is not kept beside it.
+                drop(index);
                 let doc_filter = args.document.map(|target| (target, global_doc_index));
                 // Single stdin input, no further reads to filter -- unlike
                 // the per-file loop's identical call below, `global_doc_index`
@@ -12110,6 +12112,8 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                     &program.expr,
                     &yaml_bytes,
                 ) {
+                    // The fallback parses `yaml_bytes` again, so the first index is not kept beside it.
+                    drop(index);
                     let doc_filter = args.document.map(|target| (target, global_doc_index));
                     let num_docs = stream_yaml_sort_keys_alias_fallback(
                         &mut writer,

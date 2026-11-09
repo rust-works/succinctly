@@ -511,7 +511,7 @@ mod tests {
                         assert!(
                             items.is_empty() || matches!(items.as_slice(), [OwnedValue::Null]),
                             "{shape} over {doc:?}: {items:?}"
-                        )
+                        );
                     }
                     GenericResult::Error(_) | GenericResult::None => {}
                     other => panic!(
