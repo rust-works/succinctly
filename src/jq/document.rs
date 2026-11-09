@@ -1750,6 +1750,14 @@ pub trait DocumentFields: Sized + Clone {
     /// The cursor type.
     type Cursor: DocumentCursor;
 
+    /// Whether these fields are a merge-resolved view of a YAML mapping (#6723): some of the values
+    /// they list sit in another node (a `<<` source's anchor), not under the mapping itself. Only a
+    /// YAML mapping that holds a merge key answers `true`.
+    #[inline]
+    fn is_merge_resolved(&self) -> bool {
+        false
+    }
+
     /// Get the first field and remaining fields.
     #[allow(clippy::type_complexity)] // STYLE-0004: uncons returns the cons-list contract (field, rest); the nested tuple is intentional
     fn uncons(&self) -> Option<(DocumentField<Self::Value, Self::Cursor>, Self)>;
