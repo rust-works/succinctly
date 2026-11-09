@@ -8397,13 +8397,14 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
         indent: IndentSpec,
         sort_keys: bool,
     ) -> StreamResult {
-        stream_yaml_sequence(
+        stream_yaml_sequence_with(
             resolved_sequence_cursors(cursors),
             out,
             0,
             indent.width,
             indent.unit,
             sort_keys,
+            true,
         )
     }
 
@@ -10630,8 +10631,8 @@ where
 /// The comments between items (#6736) are the one part with a second copy: the `Sequence` arm of
 /// `stream_yaml_value` writes them from the parent's item loop, this from each cursor's own
 /// position. `tests/yq_cli/i6736.rs` pins that `map(.)` and `.` agree over a commented sequence.
-/// What the arm also does for an item that owns a foot inside a flow mapping (`- {a: 1,}`, #5058)
-/// is not carried over.
+/// An item that owns a foot comment inside a non-empty flow mapping gets the trailing `,` the arm
+/// writes (`- {a: 1,}`, #5058), and so does a document element (`[.]`, #3475).
 pub fn stream_yaml_sequence<'a, W, I, Out>(
     cursors: I,
     out: &mut Out,
@@ -10639,6 +10640,34 @@ pub fn stream_yaml_sequence<'a, W, I, Out>(
     indent_spaces: usize,
     unit: char,
     sort_keys: bool,
+) -> StreamResult
+where
+    W: AsRef<[u64]> + 'a,
+    I: IntoIterator<Item = YamlCursor<'a, W>>,
+    Out: core::fmt::Write,
+{
+    stream_yaml_sequence_with(
+        cursors,
+        out,
+        current_indent,
+        indent_spaces,
+        unit,
+        sort_keys,
+        false,
+    )
+}
+
+/// [`stream_yaml_sequence`], where `document_foot` also writes the foot comment of an element
+/// that is a document's own content (`[.]`, #3475). `--slurp` writes documents as elements too and
+/// leaves it off: its output carries no document comments, as on the owned route.
+pub fn stream_yaml_sequence_with<'a, W, I, Out>(
+    cursors: I,
+    out: &mut Out,
+    current_indent: usize,
+    indent_spaces: usize,
+    unit: char,
+    sort_keys: bool,
+    document_foot: bool,
 ) -> StreamResult
 where
     W: AsRef<[u64]> + 'a,
@@ -10697,6 +10726,17 @@ where
             // A comment on a bare `-` whose value deferred to the next line (#1079, #6736), as the
             // `Sequence` arm of `stream_yaml_value` reads it: it lives on the item's wrapper.
             let wrapper_comment = item_wrapper.as_ref().and_then(YamlCursor::line_comment_raw);
+            // Whether this element owns a foot comment (an item's, or the document's for `[.]`), which
+            // a non-empty flow mapping marks with a trailing `,` (#5058, #3475).
+            let document_foot_owned = document_foot
+                && item_wrapper.is_none()
+                && cursor.index.has_standalone_comments()
+                && cursor.is_document_content()
+                && !cursor.index.get_foot_comments(cursor.bp_pos).is_empty();
+            let owns_foot = match &item_wrapper {
+                Some(wrapper) => cursor.item_owns_foot(wrapper.bp_pos, cursor.bp_pos),
+                None => document_foot_owned,
+            };
             // Mirrors `stream_yaml_value`'s `Sequence` block-style arm
             // exactly, including its `#785` compact-form handling (see the
             // comment there).
@@ -10779,26 +10819,51 @@ where
                     out.write_str(&level_indent)?;
                 }
                 out.write_char('-')?;
-                if !write_deferred_value_with_header_comment(
-                    out,
-                    &cursor,
-                    &child_indent,
-                    indent_spaces,
-                    unit,
-                    sort_keys,
-                )? {
+                let header_comment = if owns_foot
+                    && cursor.style() == "flow"
+                    && matches!(cursor.value(), YamlValue::Mapping(fields) if !fields.is_empty())
+                {
+                    // #5058: go-yaml writes a `,` before the `}` of a non-empty flow mapping that
+                    // owns a foot comment (`- {a: 1,}`).
+                    let mut rendered = String::new();
+                    let header_comment = write_deferred_value_with_header_comment(
+                        &mut rendered,
+                        &cursor,
+                        &child_indent,
+                        indent_spaces,
+                        unit,
+                        sort_keys,
+                    )?;
+                    if rendered.ends_with('}') && !rendered.contains('\n') {
+                        rendered.insert(rendered.len() - 1, ',');
+                    }
+                    out.write_str(&rendered)?;
+                    header_comment
+                } else {
+                    write_deferred_value_with_header_comment(
+                        out,
+                        &cursor,
+                        &child_indent,
+                        indent_spaces,
+                        unit,
+                        sort_keys,
+                    )?
+                };
+                if !header_comment {
                     write_line_comment(out, cursor.line_comment_raw())?;
                 }
             }
-            // An element that is a document's own content (`[.]`) owns the document's foot comment,
-            // which yq writes after a blank line, ahead of the sequence it was nested in (#3475).
-            if item_wrapper.is_none()
-                && cursor.index.has_standalone_comments()
-                && cursor.is_document_content()
-                && !cursor.index.get_foot_comments(cursor.bp_pos).is_empty()
-            {
-                out.write_char('\n')?;
-                cursor.write_foot_comments_at(out, &level_indent, cursor.bp_pos)?;
+            // An element that is a document's own content (`[.]`) owns the document's foot comment.
+            // yq writes it after a blank line when the document is a block collection, ahead of the
+            // sequence it was nested in, and directly under a scalar or flow collection (#3475).
+            if document_foot_owned {
+                let mut foot = String::new();
+                if cursor.write_foot_comments_at(&mut foot, &level_indent, cursor.bp_pos)? {
+                    if cursor.is_container() && cursor.style() != "flow" {
+                        out.write_char('\n')?;
+                    }
+                    out.write_str(&foot)?;
+                }
             }
             prev_had_foot = match &item_wrapper {
                 Some(wrapper) => cursor.write_item_foot_comments_at(

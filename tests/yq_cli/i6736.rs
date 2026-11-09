@@ -31,6 +31,7 @@ fn test_streamed_sequences_keep_the_comments_between_items_6736() -> Result<()> 
         ("- a\n# f\n\n- b\n", "map(.)", "- a\n# f\n\n- b\n"),
         ("- &x a\n# f\n\n- b\n# g\n\n- c\n", "map(.)", "- &x a\n# f\n\n- b\n# g\n\n- c\n"),
         ("- [1]\n# f\n\n- {k: v}\n", "map(.)", "- [1]\n# f\n- {k: v}\n"),
+        ("- {a: 1, b: 2}\n# f\n\n- {c: 3}\n# g\n", "map(.)", "- {a: 1, b: 2}\n# f\n- {c: 3,}\n# g\n"),
     ];
     for &(doc, filter, want) in rows {
         let (out, code) = run_yq_stdin(filter, doc, &[])?;
@@ -93,6 +94,11 @@ fn test_an_array_of_nodes_over_a_commented_document_matches_the_dom_route_6736()
     let docs = [
         "# head\n- a: 1\n# between\n- b: x\n# end\n",
         "users:\n  - id: 1\n    # foot\n  # head2\n  - id: 2\n  # last\nother: 1\n",
+        // The document's own foot, alone, several documents, and a scalar document (#3475).
+        "a: 1\n# foot\n---\nb: 2\n# f2\n",
+        "# h\n- a\n# c\n- b\n---\n- c\n# d\n- d\n",
+        "# c\nfoo\n# f\n",
+        "- a: 1\n- a: 4\n# foot\n",
     ];
     for doc in docs {
         for filter in [

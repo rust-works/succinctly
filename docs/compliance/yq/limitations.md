@@ -3156,7 +3156,11 @@ They copied the whole sequence into an owned value and a comment tree first: a 1
 The body is navigation to one node, or navigation that fans out with `.[]` and goes on only through `.`, `.[]` and `select(...)`.
 A stage that computes, a `.a` after a fan-out (which can be missing, and an owned `null` beside nodes is written in the owned route's spelling), a slice and a `,` keep the owned route, and so does any run with `--sort-keys`.
 A YAML document with an alias keeps it too: the streamers write an `*alias` whose `&anchor` the array does not hold, which the owned route's soundness pass expands.
-A comment does not: the comments between a sequence's items (#6736) and a document's own foot comment, which `[.]` holds and writes after a blank line when it belongs to the document and with the last item when it belongs to that, are the streamers' own.
+A comment does not keep an array off the streamers.
+The comments between a sequence's items (#6736) are the streamers' own.
+So is a document's own foot comment, which `[.]` holds as its element.
+It is written after a blank line when the document is a collection and the foot belongs to the document, with the last item when it belongs to that, and directly under a scalar document, as yq does.
+`--slurp` writes documents as elements too and writes no foot comment, as before.
 JSON output has no comment or alias to lose, so it always streams.
 The nodes are read for the first time while they stream, so each is validated before the first byte: a scalar that fails to decode, a complex key that collides with another, or a node past the depth limit prints nothing and exits 1, as it did.
 The route writes each scalar as `.` does, not as the owned route's encoder does.
@@ -3171,7 +3175,6 @@ The document's own foot comment after a sorted or reordered root sequence (`# fo
 The trailing foot comment after a `reverse` or `sort_by` of a sequence of mappings (`- k: 3` / `# c` / `- k: 1` / `# e` drops `# e`; a sequence of scalars keeps it).
 The comment on a bare `-` that holds a nested sequence, when the inner elements are streamed on their own (`- # c0` / `  - 1`, then `.[0][]`).
 The comments of a chain of two reordering stages (`sort_by(.id) | reverse`), whose second stage is handed owned items.
-A foot comment owned by an item inside a flow mapping (`- {a: 1,}`, #5058), which `.` writes with its comma.
 
 **A top-level comma of navigation reads such a document the way `.` does (#5283, answering #2645).**
 Real yq rejects the document for every filter, as it rejects a single undecodable key, so this is the same divergence as `.`, not a new one.

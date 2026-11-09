@@ -312,6 +312,9 @@ fn test_the_document_in_an_array_keeps_its_foot_comment_3475() -> Result<()> {
             "# head\n- a: 1\n# between\n- b: x\n# end\n",
             "- - a: 1\n  # between\n  - b: x\n\n# end\n",
         ),
+        ("# c\nfoo\n# f\n", "- foo\n# f\n"),
+        ("[1, 2]\n# f\n", "- [1, 2]\n# f\n"),
+        ("{a: 1}\n# f\n", "- {a: 1,}\n# f\n"),
     ];
     for &(doc, want) in rows {
         let (out, code) = run_yq_stdin("[.]", doc, &[])?;
@@ -319,5 +322,14 @@ fn test_the_document_in_an_array_keeps_its_foot_comment_3475() -> Result<()> {
         let (also, _) = run_yq_stdin("[select(.)]", doc, &[])?;
         assert_eq!(also, want, "{doc:?}");
     }
+    Ok(())
+}
+
+#[test]
+fn test_slurp_writes_no_document_foot_comment_3475() -> Result<()> {
+    // `--slurp` writes documents as the elements of one sequence too, and leaves the foot comment
+    // that `[.]` writes out, as the owned route does.
+    let (out, code) = run_yq_stdin(".", "a: 1\n# foot\n---\nb: 2\n# f2\n", &["--slurp"])?;
+    assert_eq!((out.as_str(), code), ("- a: 1\n- b: 2\n  # f2\n", 0));
     Ok(())
 }
