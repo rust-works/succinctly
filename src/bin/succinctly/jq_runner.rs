@@ -10380,10 +10380,22 @@ fn note_open_failure_at(at: usize) {
 /// one that did not open (`while (jq_util_input_errors(...) == 0 && ...)` in jq's `main`). The
 /// input that took it there is still processed: `missing a.json` under `--stream` prints the first
 /// event of `a.json` and stops (#6006).
+///
+/// Two signs say the reader got there, and either ends the loop: the location of the value read
+/// last names a source past the failure, or a read has reported the failure
+/// ([`LAZY_OPEN_FAILED`], #6781). The second covers the closing event a file held back, which is
+/// read at the end of the text and names no later source: a program's own `input` that reads it
+/// leaves the first sign false.
 fn main_loop_reads_on() -> bool {
     match FIRST_OPEN_FAILURE_AT.with(std::cell::Cell::get) {
         None => true,
-        Some(at) => jq::current_input_location().map_or(true, |(source, _)| (source as usize) < at),
+        // #6781: a failure a read has reached is counted whatever the location of the value that
+        // read returned last: the closing event a file held back is read at the end of the text, a
+        // position that names no later source, and the program's own `input` may have read it.
+        Some(at) => {
+            !LAZY_OPEN_FAILED.with(std::cell::Cell::get)
+                && jq::current_input_location().map_or(true, |(source, _)| (source as usize) < at)
+        }
     }
 }
 
