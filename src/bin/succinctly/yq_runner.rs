@@ -6651,8 +6651,10 @@ fn resolve_one_meta_assign(
         );
     }
 
-    // Writes to neighbouring entries interact (a value's head is the next key's), which is not
-    // modelled: a text goes to a single target.
+    // A key node and the document root take a text for a single target only (#2796). The entries
+    // of a collection take it for several: each is judged against the comments the document held
+    // before the assignment (`apply_set_entry`), which is what lets a head one target leaves on
+    // the next key stand beside that key's own write.
     let single_target = texts.len() == 1;
     let batch = out.len();
     for (path, on_key, s) in texts {
@@ -6896,7 +6898,19 @@ fn apply_meta_assign_writes(
     // The comment tree as the assignment being applied found it (#2796): its targets are judged
     // against it, so a head one target leaves on the next entry is not that entry's own.
     let mut before_batch: Option<(usize, CommentTree)> = None;
+    // Only an assignment that writes entries needs the snapshot, taken before its first write of
+    // any kind (a key node's text, a clear) changes the tree.
+    let entry_batches: Vec<usize> = writes
+        .iter()
+        .filter(|write| matches!(write.effect, MetaEffect::SetEntry { .. }))
+        .map(|write| write.batch)
+        .collect();
     for write in writes {
+        if entry_batches.contains(&write.batch)
+            && !matches!(&before_batch, Some((batch, _)) if *batch == write.batch)
+        {
+            before_batch = Some((write.batch, tree.clone()));
+        }
         let steps: Vec<TreeStep<'_>> = write
             .path
             .iter()
@@ -6952,14 +6966,10 @@ fn apply_meta_assign_writes(
             if container == Some(false) && matches!(write.path.last(), Some(MetaPathStep::Key(_))) {
                 container_heads.push(write.path.as_slice());
             }
-            if before_batch
-                .as_ref()
-                .map_or(true, |(batch, _)| *batch != write.batch)
-            {
-                before_batch = Some((write.batch, tree.clone()));
-            }
             let Some((_, before)) = &before_batch else {
-                continue; // patchcov: coverage tolerate-line reason="unreachable: the snapshot was just taken (#2796)"
+                return Err(set_entry_unsupported(
+                    "the comments the assignment began with were not kept", // patchcov: coverage tolerate-line reason="unreachable: every batch with an entry write took its snapshot above (#2796)"
+                ));
             };
             apply_set_entry(
                 &steps,
