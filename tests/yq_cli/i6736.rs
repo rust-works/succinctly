@@ -40,10 +40,9 @@ fn test_streamed_sequences_keep_the_comments_between_items_6736() -> Result<()> 
 }
 
 #[test]
-fn test_a_commented_array_of_nodes_streams_and_keeps_the_dom_route_for_the_document_6736(
-) -> Result<()> {
-    // `[.[]]` streams over a commented document now (#3475 kept the owned route for it); `[.]`
-    // is the document itself, whose head and foot comments only the owned route writes.
+fn test_a_commented_array_of_nodes_streams_and_agrees_with_the_document_6736() -> Result<()> {
+    // `[.[]]` streams over a commented document now (#3475 kept the owned route for it), and so
+    // does `[.]`, whose element is the document itself and owns its foot comment (#3475).
     let doc = "# head\n- a\n# c\n- b\n# end\n";
     let (streamed, code) = run_yq_stdin("[.[]]", doc, &[])?;
     assert_eq!((streamed.as_str(), code), ("- a\n# c\n- b\n# end\n", 0));
@@ -89,8 +88,8 @@ fn test_a_streamed_sequence_is_written_as_dot_writes_it_6736() -> Result<()> {
 
 #[test]
 fn test_an_array_of_nodes_over_a_commented_document_matches_the_dom_route_6736() -> Result<()> {
-    // Which arrays stream over a comment is decided by `array_holds_the_document`; `-P` forces the
-    // DOM route, so this pins the decision to what is written, whatever the predicates say.
+    // `-P` forces the DOM route, so this pins what the streamed array writes over a comment to what
+    // the owned route writes.
     let docs = [
         "# head\n- a: 1\n# between\n- b: x\n# end\n",
         "users:\n  - id: 1\n    # foot\n  # head2\n  - id: 2\n  # last\nother: 1\n",

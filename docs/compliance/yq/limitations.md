@@ -3156,8 +3156,7 @@ They copied the whole sequence into an owned value and a comment tree first: a 1
 The body is navigation to one node, or navigation that fans out with `.[]` and goes on only through `.`, `.[]` and `select(...)`.
 A stage that computes, a `.a` after a fan-out (which can be missing, and an owned `null` beside nodes is written in the owned route's spelling), a slice and a `,` keep the owned route, and so does any run with `--sort-keys`.
 A YAML document with an alias keeps it too: the streamers write an `*alias` whose `&anchor` the array does not hold, which the owned route's soundness pass expands.
-So does a document with a comment when the array can hold the document itself (`[.]`, `[select(.a)]`), since the document's own head and foot comments are written only by the owned route.
-Any other array over a commented document streams (#6736).
+A comment does not: the comments between a sequence's items (#6736) and a document's own foot comment, which `[.]` holds and writes after a blank line when it belongs to the document and with the last item when it belongs to that, are the streamers' own.
 JSON output has no comment or alias to lose, so it always streams.
 The nodes are read for the first time while they stream, so each is validated before the first byte: a scalar that fails to decode, a complex key that collides with another, or a node past the depth limit prints nothing and exits 1, as it did.
 The route writes each scalar as `.` does, not as the owned route's encoder does.

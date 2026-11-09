@@ -295,3 +295,29 @@ fn test_an_array_of_nodes_keeps_tags_and_anchors_3475() -> Result<()> {
     assert_eq!((out.as_str(), code), (doc, 0));
     Ok(())
 }
+
+#[test]
+fn test_the_document_in_an_array_keeps_its_foot_comment_3475() -> Result<()> {
+    // `[.]` holds the document itself, whose foot comment follows a blank line when it belongs to
+    // the document and sits with the last item when it belongs to that: the array streams over a
+    // commented document (the owned route no longer has to), and writes both as yq does.
+    let rows: &[(&str, &str)] = &[
+        (
+            "# head\n- a: 1  # line a\n  b: 2\n# between\n- a: 3\n\n- a: 4 # l4\n# foot\n",
+            "- - a: 1 # line a\n    b: 2\n  # between\n  - a: 3\n  - a: 4 # l4\n\n# foot\n",
+        ),
+        ("- a\n- b # l\n# foot\n", "- - a\n  - b # l\n  # foot\n"),
+        ("- a: 1\n- a: 4\n# foot\n", "- - a: 1\n  - a: 4\n\n# foot\n"),
+        (
+            "# head\n- a: 1\n# between\n- b: x\n# end\n",
+            "- - a: 1\n  # between\n  - b: x\n\n# end\n",
+        ),
+    ];
+    for &(doc, want) in rows {
+        let (out, code) = run_yq_stdin("[.]", doc, &[])?;
+        assert_eq!((out.as_str(), code), (want, 0), "{doc:?}");
+        let (also, _) = run_yq_stdin("[select(.)]", doc, &[])?;
+        assert_eq!(also, want, "{doc:?}");
+    }
+    Ok(())
+}

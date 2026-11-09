@@ -10790,6 +10790,16 @@ where
                     write_line_comment(out, cursor.line_comment_raw())?;
                 }
             }
+            // An element that is a document's own content (`[.]`) owns the document's foot comment,
+            // which yq writes after a blank line, ahead of the sequence it was nested in (#3475).
+            if item_wrapper.is_none()
+                && cursor.index.has_standalone_comments()
+                && cursor.is_document_content()
+                && !cursor.index.get_foot_comments(cursor.bp_pos).is_empty()
+            {
+                out.write_char('\n')?;
+                cursor.write_foot_comments_at(out, &level_indent, cursor.bp_pos)?;
+            }
             prev_had_foot = match &item_wrapper {
                 Some(wrapper) => cursor.write_item_foot_comments_at(
                     out,
