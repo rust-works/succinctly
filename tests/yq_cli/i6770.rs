@@ -10,7 +10,7 @@ use anyhow::Result;
 
 use crate::{run_jq_stdin, run_yq_stdin};
 
-const DOCS: [(&str, &str); 7] = [
+const DOCS: [(&str, &str); 8] = [
     ("arr", "b: [1, 2, 3]\n"),
     (
         "objs",
@@ -21,6 +21,7 @@ const DOCS: [(&str, &str); 7] = [
     ("emptyseq", "b: []\n"),
     ("scalar", "b: 5\n"),
     ("null", "b: ~\n"),
+    ("two", "a: [1, 2, 3]\nb: 1\n"),
 ];
 
 fn doc(name: &str) -> &'static str {
@@ -74,6 +75,13 @@ fn test_yq_map_with_a_union_body_runs_each_branch_over_the_whole_list_6770() -> 
         ("scalar", ".b | map(1, error(\"boom\"))", "5\n"),
         ("null", ".b | map(1, 2)", "[]\n"),
         ("arr", ".b | map((. , 0)) | .[3]", "0\n"),
+        ("two", "(.a | map(., 0)) |= 5", "{\"a\":[1,2,3],\"b\":1}\n"),
+        ("two", "(.a | map(., 0)) = 5", "{\"a\":[1,2,3],\"b\":1}\n"),
+        ("two", ".a | map(., 0) | path", "[]\n"),
+        ("two", "map(., 0) = 5", "{\"a\":[1,2,3],\"b\":1}\n"),
+        ("two", ".a | map(., 0)", "[1,2,3,0,0,0]\n"),
+        ("two", ".a | map(map(., 0), 9)", "[1,2,3,9,9,9]\n"),
+        ("two", ". as $r | .a | map(., 0)", "[1,2,3,0,0,0]\n"),
     ] {
         let (stdout, code) = run_yq_stdin(filter, doc(name), &["-o=json", "-I=0"])?;
         assert_eq!((stdout.as_str(), code), (want, 0), "{name}: {filter}");
@@ -86,5 +94,18 @@ fn test_yq_map_with_a_union_body_runs_each_branch_over_the_whole_list_6770() -> 
 fn test_jq_map_with_a_union_body_still_interleaves_6770() -> Result<()> {
     let (stdout, code) = run_jq_stdin("map(., 0)", "[1,2,3]", &["-c"])?;
     assert_eq!((stdout.as_str(), code), ("[1,0,2,0,3,0]\n", 0));
+    Ok(())
+}
+
+/// The call is rewritten with its body once, so nesting stays linear: 24 levels is 2^24 copies of
+/// the innermost body if each level keeps a second one.
+#[test]
+fn test_yq_a_nest_of_union_bodied_maps_stays_linear_6770() -> Result<()> {
+    let mut filter = String::from("map(., .)");
+    for _ in 0..24 {
+        filter = format!("map({filter}, .)");
+    }
+    let (stdout, code) = run_yq_stdin(&filter, "[]\n", &["-o=json", "-I=0"])?;
+    assert_eq!((stdout.as_str(), code), ("[]\n", 0));
     Ok(())
 }

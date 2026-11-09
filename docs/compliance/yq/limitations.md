@@ -4983,7 +4983,8 @@ mode decides; `succinctly jq` keeps jq's model unchanged):
 yq's `mapOperator` splats the node and runs `f` once over the whole list of members, so `map(. + 1, . + 2)` over `[1, 2, 3]` is `[2, 3, 4, 3, 4, 5]`.
 `succinctly yq` writes a union-bodied `map` over a sequence or a non-empty mapping as `[.[] | f]`, which the context-list walk answers that way.
 A scalar, `null` and an empty mapping keep the `map` arm, and `succinctly jq` still runs the body per member.
-Two shapes still interleave: a union-bodied `map` on the right of `|=`, and a body that reads its own path or key (`map(path, key)`), which the plain pipe `[.[] | (path, key)]` shares.
+Three shapes still interleave, and the plain pipe `[.[] | (a, b)]` shares each: a union-bodied `map` on the right of an assignment (`|=`, `=`, `with`), one over a value the program computed first (`[.[]] | map(., 0)`), and a body that reads its own path or key (`map(path, key)`).
+In a write target (`del(.a | map(., 0))`) it is as it was: yq changes nothing there, and the call is refused here.
 
 Four related divergences are **not** covered and stay open:
 
