@@ -221,6 +221,29 @@ pub fn is_array_of_nodes(expr: &Expr) -> bool {
     }
 }
 
+/// Whether an [`is_array_of_nodes`] array can hold the document itself: every stage is `.` or
+/// `select(...)`, so `[.]` and `[select(.a)]` (but not `[.[]]`, `[.users]` or `.users | [.]`) answer
+/// the document's content node. Its own head and foot comments are the document's, which the owned
+/// route writes and the sequence streamers do not (#6736), so a commented document keeps that route.
+pub fn array_holds_the_document(expr: &Expr) -> bool {
+    fn only_the_node(stage: &Expr) -> bool {
+        match stage {
+            Expr::Identity | Expr::Builtin(Builtin::Select(_)) => true,
+            Expr::Optional(inner) | Expr::Paren(inner) => only_the_node(inner),
+            Expr::Pipe(stages) => stages.iter().all(only_the_node),
+            _ => false,
+        }
+    }
+    match expr {
+        Expr::Array(body) => only_the_node(body),
+        Expr::Paren(inner) => array_holds_the_document(inner),
+        Expr::Pipe(stages) => stages.split_last().is_some_and(|(last, prefix)| {
+            array_holds_the_document(last) && prefix.iter().all(only_the_node)
+        }),
+        _ => false,
+    }
+}
+
 /// `.`, `.a`, `.[0]`, `.a.b`: steps that answer at most one node.
 fn is_navigation(stage: &Expr) -> bool {
     match stage {
@@ -459,6 +482,27 @@ mod tests {
                 !is_array_of_nodes(&parse(stays)),
                 "{stays} should keep the DOM route"
             );
+        }
+        // Only an array that can hold the document itself keeps the DOM route over a comment.
+        for holds in [
+            "[.]",
+            "[select(.a)]",
+            "[. | select(.a)]",
+            ". | [.]",
+            "([.])",
+        ] {
+            assert!(array_holds_the_document(&parse(holds)), "{holds}");
+        }
+        for holds_not in [
+            "[.[]]",
+            "[.users]",
+            ".users | [.]",
+            "[.a]",
+            "[.[0]]",
+            ".a | [.[]]",
+            ".[]",
+        ] {
+            assert!(!array_holds_the_document(&parse(holds_not)), "{holds_not}");
         }
         // What already streams is the shared gate's, not this one's.
         assert!(!is_array_of_nodes(&parse(".a | map(.)")));

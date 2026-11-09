@@ -548,6 +548,27 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         }
     }
 
+    /// The bp of the item wrapper this cursor is the content of, when it is an element of a
+    /// sequence (#6736): `- a` / `# c` / `- b` has the `# c` on `b`'s content node, which is where a
+    /// cursor handed out by `.[]`, `map(.)` or `sort` stands, so the comments between items are
+    /// written from it. `None` for a mapping value, a document's own content and the root, none of
+    /// which has a sequence item's head and foot to write.
+    fn sequence_item_wrapper(&self) -> Option<usize> {
+        // One flag on a document without a comment, which is what keeps this off its profile.
+        if !self.index.has_comments() {
+            return None;
+        }
+        let wrapper = self.parent()?;
+        if wrapper.bp_pos == 0 || !self.index.is_seq_item(self.text, wrapper.bp_pos) {
+            return None;
+        }
+        if wrapper.resolve_bare_seq_item().bp_pos != self.bp_pos {
+            return None;
+        }
+        let owner = wrapper.parent()?;
+        (owner.bp_pos != 0 && owner.is_container()).then_some(wrapper.bp_pos)
+    }
+
     /// The comment on the bare `-` of the sequence item this cursor is the value of (#4256):
     /// `- # own` / `  c: 2`. It lives on the item's wrapper node, which a navigation such as
     /// `.a[1]` steps past, so it is read from the parent: the parent is that wrapper exactly when
@@ -10601,12 +10622,29 @@ where
         let own_indent = deeper_yaml_indent("", current_indent, unit);
         let child_indent = compact_yaml_indent(&own_indent);
         let mut first = true;
+        // The comments between items (#6736), as `stream_yaml_value`'s `Sequence` arm writes them: a
+        // foot comment is followed by a blank line when another item comes after it.
+        let level_indent: String = core::iter::repeat(unit).take(current_indent).collect();
+        let mut prev_had_foot = false;
         for cursor in iter {
+            let item_wrapper = cursor.sequence_item_wrapper();
             if !first {
+                if prev_had_foot {
+                    out.write_char('\n')?;
+                }
                 out.write_char('\n')?;
                 write_yaml_indent(out, current_indent, unit)?;
             }
             first = false;
+            if let Some(wrapper) = item_wrapper {
+                cursor.write_item_head_comments_at(out, &level_indent, wrapper, cursor.bp_pos)?;
+            }
+            // A comment on a bare `-` whose value deferred to the next line (#1079, #6736), as the
+            // `Sequence` arm of `stream_yaml_value` reads it: it lives on the item's wrapper.
+            let wrapper_cursor = item_wrapper.and_then(|_| cursor.parent());
+            let wrapper_comment = wrapper_cursor
+                .as_ref()
+                .and_then(YamlCursor::line_comment_raw);
             // Mirrors `stream_yaml_value`'s `Sequence` block-style arm
             // exactly, including its `#785` compact-form handling (see the
             // comment there).
@@ -10616,7 +10654,21 @@ where
                 // #2619: `is_yaml_cursor_container` above already proves
                 // `cursor` isn't `Alias`, so `None` skips a second resolve.
                 let tag = cursor.explicit_tag_at(None);
-                if anchor.is_some() || tag.is_some() {
+                if let Some(comment) = wrapper_comment {
+                    // The comment keeps the dash's line and the value starts on the next one.
+                    out.write_str("- ")?;
+                    out.write_str(comment)?;
+                    out.write_char('\n')?;
+                    out.write_str(&child_indent)?;
+                    cursor.stream_yaml_value(
+                        out,
+                        &child_indent,
+                        indent_spaces,
+                        unit,
+                        sort_keys,
+                        true,
+                    )?;
+                } else if anchor.is_some() || tag.is_some() {
                     out.write_char('-')?;
                     write_anchor_tag(out, anchor, tag)?;
                     out.write_char('\n')?;
@@ -10668,6 +10720,12 @@ where
                 // yq -- `child_indent` (already computed above), not a
                 // fresh normal step off `own_indent`, is the right value
                 // here.
+                if let Some(comment) = wrapper_comment {
+                    // A bare item's own comment is the scalar's it defers to (#1079).
+                    out.write_str(comment)?;
+                    out.write_char('\n')?;
+                    out.write_str(&level_indent)?;
+                }
                 out.write_char('-')?;
                 if !write_deferred_value_with_header_comment(
                     out,
@@ -10680,6 +10738,15 @@ where
                     write_line_comment(out, cursor.line_comment_raw())?;
                 }
             }
+            prev_had_foot = match item_wrapper {
+                Some(wrapper) => cursor.write_item_foot_comments_at(
+                    out,
+                    &level_indent,
+                    wrapper,
+                    cursor.bp_pos,
+                )?,
+                None => false,
+            };
         }
         Ok(())
     }
