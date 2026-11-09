@@ -43,6 +43,38 @@ fn select_compares_a_container_without_decoding_it_6756() -> Result<()> {
             r#"select(. != null)"#,
             "[{\"x\":\"\\ud800\"}]\n",
         ),
+        // The other shapes #6350 answers: the literal on the left, `or`, `not`, a `type` that
+        // keeps or drops, and an array in the container's place.
+        (
+            r#"[{"x":"\ud800"}]"#,
+            r#".[] | select(null != .)"#,
+            "{\"x\":\"\\ud800\"}\n",
+        ),
+        (
+            r#"[{"x":"\ud800"}]"#,
+            r#".[] | select(. == null or . != null)"#,
+            "{\"x\":\"\\ud800\"}\n",
+        ),
+        (
+            r#"[{"x":"\ud800"}]"#,
+            r#".[] | select((. != null) | not)"#,
+            "",
+        ),
+        (
+            r#"[{"x":"\ud800"}]"#,
+            r#".[] | select(type == "array")"#,
+            "",
+        ),
+        (
+            r#"[["\ud800"]]"#,
+            r#".[] | select(. != null)"#,
+            "[\"\\ud800\"]\n",
+        ),
+        (
+            r#"[[1,"\ud800"]]"#,
+            r#".[] | select(type == "array")"#,
+            "[1,\"\\ud800\"]\n",
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
         assert_eq!(
@@ -80,9 +112,19 @@ fn a_consumer_of_the_kept_container_still_raises_6756() -> Result<()> {
 }
 
 /// A scalar is copied to be compared, so the comparison still reads it: an escape that does not
-/// decode raises, as before #6350.
+/// decode, or a lone surrogate, raises, as before #6350.
 #[test]
 fn select_still_decodes_a_scalar_it_compares_6756() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", ".[] | select(. != null)"], Some(r#"["\ud800"]"#))?;
+    assert_eq!(
+        code, 5,
+        "a lone-surrogate scalar is read\nstdout: {stdout:?}"
+    );
+    assert!(
+        names_fault(&stderr, "surrogate pair escape"),
+        "stderr {stderr:?}"
+    );
     for filter in [
         r#".[] | select(. != null)"#,
         r#".[] | select(. == null)"#,

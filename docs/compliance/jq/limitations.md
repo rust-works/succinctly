@@ -10132,15 +10132,16 @@ A scalar is still copied to be compared, so a scalar that does not decode still 
 [#6756](https://github.com/rust-works/succinctly/issues/6756) found it through `scripts/jq-m2-streaming-sweep.sh`.
 On `[{"x":"\ud800"}]`:
 
-| filter                                                                     | jq 1.7.1 | before #6350           | now                        |
-|----------------------------------------------------------------------------|----------|------------------------|----------------------------|
-| `.[] \| select(. != null)`, `select(. != null)`                            | error    | error — **matched jq** | the element — **diverges** |
-| `.[] \| select(. == null)`                                                 | error    | error — **matched jq** | empty — **diverges**       |
-| `.[] \| select(type == "object")`                                          | error    | error — **matched jq** | the element — **diverges** |
-| `.[] \| select(.x != null)`, `[.[] \| select(. != null)] \| tojson`         | error    | error                  | error — **matched jq**     |
+| filter                                          | jq 1.7.1 | before #6350           | now                        |
+|-------------------------------------------------|----------|------------------------|----------------------------|
+| `.[] \| select(. != null)`, `select(. != null)` | error    | error — **matched jq** | the element — **diverges** |
+| `.[] \| select(. == null)`                      | error    | error — **matched jq** | empty — **diverges**       |
+| `.[] \| select(type == "object")`               | error    | error — **matched jq** | the element — **diverges** |
+| `.[] \| select(.x != null)`                     | error    | error — **matched jq** | error — **matched jq**     |
+| `[.[] \| select(. != null)] \| tojson`          | error    | error — **matched jq** | error — **matched jq**     |
 
-The last row reads what the others do not: `.x` decodes the element, and the consumer reads the element it is handed.
-On `["\x"]` the same comparisons over the scalar still raise, as jq does.
+The last two read what the others do not: `.x` decodes the element, and `tojson` reads the element it is handed.
+On `["\x"]` and `["\ud800"]` the same comparisons over the scalar still raise, as jq does.
 Pinned in `tests/jq_cli/i6756.rs` and in the golden row `[{"x":"\ud800"}] .[] | select(. != null)` of `scripts/jq-m2-streaming-sweep.expected`.
 The three reasons below apply unchanged: the agreement being given up was the copy's side effect, the answer depended on how the condition was spelled (`select(.)` already passed this document through and `select(. != null)` did not), and the copy cost the container's whole subtree at every node it was asked about.
 
