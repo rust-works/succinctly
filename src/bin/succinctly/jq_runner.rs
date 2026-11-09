@@ -7000,15 +7000,18 @@ fn read_inputs(
         let pushed_back = STDIN_PUSHBACK.with(|slot| slot.borrow().is_some());
         match read_stdin_bytes() {
             Ok(b) => {
-                if pushed_back {
-                    take_seq_preread(&files, b.len(), &mut handed);
+                if pushed_back && seq_stream_shape && !args.slurp {
+                    take_seq_preread(PrereadSource::Stdin(&b), &mut handed);
                 }
                 (files, vec![(None, b)])
             }
             Err(e) => return Ok(Err(e)),
         }
     } else {
-        let (files, raws, failures) = match take_seq_preread(&files, 0, &mut handed) {
+        let preread = (seq_stream_shape && !args.slurp)
+            .then(|| take_seq_preread(PrereadSource::Files(&files), &mut handed))
+            .flatten();
+        let (files, raws, failures) = match preread {
             Some(prepared) => prepared,
             None => read_input_files(&files, failed_as_sources),
         };
@@ -7441,14 +7444,14 @@ fn read_inputs(
                 // #6620: the walk the clean check made is this one when it queued the same faults
                 // over the same bytes, from a first source that opened; its warnings are queued as
                 // faults, which this route's own would not have printed.
-                let handed_walk = handed.take().filter(|(_, faults, len)| {
+                let handed_walk = handed.take().filter(|handed| {
                     queue_faults
-                        && *faults
+                        && handed.collect_faults
                         && !args.slurp
                         && !unopened_tail
-                        && matches!(raw_bytes.as_slice(), [(_, only)] if only.len() == *len)
+                        && matches!(raw_bytes.as_slice(), [(_, only)] if only.len() == handed.len)
                 });
-                let walk = if let Some((mut walk, ..)) = handed_walk {
+                let walk = if let Some(HandedWalk { mut walk, .. }) = handed_walk {
                     walk.place_values(&raw_bytes);
                     *walk
                 } else {
@@ -9567,9 +9570,14 @@ fn advance_source(
     advance_position(at, bytes)
 }
 
-/// The walk [`seq_plain_json_inputs`] hands on (#6620), with whether it recorded the reader's faults
-/// and the length of the bytes it walked.
-type HandedWalk = (Box<crate::jq_seq_reader::SeqStreamWalk>, bool, usize);
+/// The walk [`seq_plain_json_inputs`] hands on (#6620).
+struct HandedWalk {
+    walk: Box<crate::jq_seq_reader::SeqStreamWalk>,
+    /// Whether it recorded the reader's faults, as the route that queues them asks.
+    collect_faults: bool,
+    /// The length of the bytes it walked.
+    len: usize,
+}
 
 /// What [`seq_plain_json_inputs`] read and walked of a `--seq` stream it found not clean, for the
 /// materializing route to take instead of reading and walking it again (#6620).
@@ -9578,6 +9586,10 @@ struct SeqPreread {
     named: Vec<PathBuf>,
     /// The source's length, which the route that takes the walk checks against the bytes it has.
     len: usize,
+    /// Where stdin's bytes are in memory (they move to [`STDIN_PUSHBACK`] and back without being
+    /// copied), so that the read that takes them is known to hold the bytes the walk saw; 0 for a
+    /// named source.
+    stdin_at: usize,
     /// The files that opened and their bytes, for a named source (stdin's are in
     /// [`STDIN_PUSHBACK`]).
     prepared: Option<PreparedInputs>,
@@ -13284,6 +13296,7 @@ fn seq_plain_json_inputs(args: &JqCommand) -> Result<Option<PreparedInputs>> {
         Ok(text) => Ok(Some((files, vec![text], failures))),
         Err((raw, walk)) => {
             let len = raw.len();
+            let stdin_at = if from_stdin { raw.as_ptr() as usize } else { 0 };
             let mut prepared = None;
             if from_stdin {
                 STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = Some(raw));
@@ -13295,6 +13308,7 @@ fn seq_plain_json_inputs(args: &JqCommand) -> Result<Option<PreparedInputs>> {
                     *slot.borrow_mut() = Some(SeqPreread {
                         named,
                         len,
+                        stdin_at,
                         prepared,
                         walk,
                         collect_faults,
@@ -13306,26 +13320,43 @@ fn seq_plain_json_inputs(args: &JqCommand) -> Result<Option<PreparedInputs>> {
     }
 }
 
-/// What [`seq_plain_json_inputs`] read of `named` (#6620), taken by the read that would otherwise
-/// read it again: the files' bytes when it kept them (a source named on the command line), or only
-/// the walk for stdin, whose bytes are in [`STDIN_PUSHBACK`] and are `len` long. The walk goes to
-/// `handed`, which the route that walks a `--seq` stream asks for; a preread of another source is
-/// left alone.
+/// The source a read of the input asks [`take_seq_preread`] about.
+enum PrereadSource<'a> {
+    /// Standard input, whose bytes the read already has (from [`STDIN_PUSHBACK`]).
+    Stdin(&'a [u8]),
+    /// The files named on the command line.
+    Files(&'a [PathBuf]),
+}
+
+/// What [`seq_plain_json_inputs`] read of `source` (#6620), taken by the read that would otherwise
+/// read it again: a named source's files and bytes, when it kept them. The walk goes to `handed`,
+/// which the route that walks a `--seq` stream asks for. A preread of another source is left
+/// alone, and so is one of stdin that does not hold these very bytes.
 fn take_seq_preread(
-    named: &[PathBuf],
-    len: usize,
+    source: PrereadSource<'_>,
     handed: &mut Option<HandedWalk>,
 ) -> Option<PreparedInputs> {
     SEQ_PREREAD.with(|slot| {
         let mut slot = slot.borrow_mut();
         let preread = slot.as_ref()?;
-        let ours = preread.named == named
-            && (named.is_empty() && preread.len == len || preread.prepared.is_some());
+        let ours = match source {
+            PrereadSource::Stdin(bytes) => {
+                preread.named.is_empty()
+                    && preread.prepared.is_none()
+                    && preread.len == bytes.len()
+                    && preread.stdin_at == bytes.as_ptr() as usize
+            }
+            PrereadSource::Files(files) => preread.named == files && preread.prepared.is_some(),
+        };
         if !ours {
             return None;
         }
         let preread = slot.take()?;
-        *handed = Some((preread.walk, preread.collect_faults, preread.len));
+        *handed = Some(HandedWalk {
+            walk: preread.walk,
+            collect_faults: preread.collect_faults,
+            len: preread.len,
+        });
         preread.prepared
     })
 }
@@ -13334,7 +13365,9 @@ fn take_seq_preread(
 /// blanked when it is clean, the bytes as they were when it is not.
 #[cfg(test)]
 fn seq_stream_as_plain_json(raw: Vec<u8>, slurp: bool) -> std::result::Result<Vec<u8>, Vec<u8>> {
-    seq_stream_as_plain_json_with(raw, slurp, None).map_err(|(raw, _)| raw)
+    // The arguments `seq_plain_json_inputs` passes, so that the tests of the verdict run the
+    // shipped walk.
+    seq_stream_as_plain_json_with(raw, slurp, (!slurp).then_some(true)).map_err(|(raw, _)| raw)
 }
 
 /// What [`seq_stream_as_plain_json_with`] hands back for a stream that is not clean: its bytes, and
@@ -13391,7 +13424,8 @@ fn seq_stream_walked_as_plain_json(
     raw: Vec<u8>,
     slurp: bool,
 ) -> std::result::Result<Vec<u8>, Vec<u8>> {
-    seq_stream_walked_as_plain_json_with(raw, slurp, None).map_err(|(raw, _)| raw)
+    seq_stream_walked_as_plain_json_with(raw, slurp, (!slurp).then_some(true))
+        .map_err(|(raw, _)| raw)
 }
 
 fn seq_stream_walked_as_plain_json_with(
@@ -24475,6 +24509,152 @@ mod tests {
             3,
             "the end-of-stream drop is decided by the stopping walk, and nothing is handed on"
         );
+    }
+
+    /// Streams of RS bytes, newlines and the characters JSON is made of, from a fixed seed: most are
+    /// malformed, and some hold the empty record that reaches jq's end-of-stream drop (#2998).
+    fn random_seq_streams(count: usize) -> Vec<Vec<u8>> {
+        let alphabet: &[u8] = b"\x1e\x1e\x1e\n\n {}[]\":,1a0.tnul-";
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        (0..count)
+            .map(|_| {
+                let len = 1 + (next() % 40) as usize;
+                (0..len)
+                    .map(|_| alphabet[(next() % alphabet.len() as u64) as usize])
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// #6620: the walk the check keeps (one that records faults) gives the verdict the walk that
+    /// stops at jq's end-of-stream drop gave, and is the walk the reading route would have made.
+    /// The streams reach the drop, warnings, faults and clean shapes; the test fails with the
+    /// fallback to the stopping walk removed.
+    #[test]
+    fn the_kept_walk_decides_as_the_stopping_walk_did_6620() {
+        let streams = random_seq_streams(20_000);
+        let (mut clean, mut kept, mut declined) = (0, 0, 0);
+        for raw in streams {
+            let stopping = seq_stream_as_plain_json_with(raw.clone(), false, None);
+            let keeping = seq_stream_as_plain_json_with(raw.clone(), false, Some(true));
+            match (stopping, keeping) {
+                (Ok(a), Ok(b)) => {
+                    assert_eq!(a, b, "{raw:?}");
+                    clean += 1;
+                }
+                (Err((a, _)), Err((b, walk))) => {
+                    assert_eq!(a, b, "{raw:?}");
+                    let Some(mut walk) = walk else {
+                        declined += 1;
+                        continue;
+                    };
+                    kept += 1;
+                    // The walk the reading route makes over the same bytes.
+                    let sources = [(None, raw.clone())];
+                    let mut fresh = crate::jq_seq_reader::walk_stream_collecting_at(
+                        &sources,
+                        false,
+                        true,
+                        crate::jq_seq_reader::Tail::Opened,
+                        &mut |_, _| {},
+                    );
+                    walk.place_values(&sources);
+                    assert_eq!(walk.values, fresh.values, "{raw:?}");
+                    assert_eq!(walk.locations, fresh.locations, "{raw:?}");
+                    assert_eq!(walk.faults, fresh.faults, "{raw:?}");
+                    assert_eq!(walk.deferred_warning, fresh.deferred_warning, "{raw:?}");
+                    assert_eq!(
+                        walk.slurp_position_lost, fresh.slurp_position_lost,
+                        "{raw:?}"
+                    );
+                    fresh.values.clear();
+                }
+                (stopping, keeping) => panic!(
+                    "{raw:?}: the stopping walk says {}, the kept one {}",
+                    stopping.is_ok(),
+                    keeping.is_ok()
+                ),
+            }
+        }
+        // The test must reach each shape, or it proves nothing.
+        assert!(clean > 0, "{clean} clean streams");
+        assert!(kept > 1_000, "{kept} streams handed on");
+        assert!(
+            declined > 20,
+            "{declined} streams that hand nothing on (the drop)"
+        );
+    }
+
+    /// #6620: reading a `--seq` file the check found not clean from the check's own bytes and walk
+    /// gives what reading and walking it again does, and does not read it again: the file is
+    /// replaced between the two, and the read still holds the stream the walk saw.
+    #[test]
+    fn a_handed_walk_reads_what_a_second_walk_would_6620() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("s.seq");
+        let argv = ["jq", "--seq", ".name", path.to_str().unwrap()];
+        let cmd = JqCommand::try_parse_from(argv).unwrap();
+        // What the lazy producer holds after `get_inputs`: records, places, and faults.
+        type Held = (
+            Vec<u8>,
+            Vec<(usize, usize)>,
+            Vec<(u32, u32)>,
+            Vec<(usize, String)>,
+        );
+        // Held after `get_inputs`, and whether the check kept its walk and the file's bytes.
+        let read =
+            |text: &[u8], handoff: bool, replace_with: Option<&[u8]>| -> Option<(Held, bool)> {
+                std::fs::write(&path, text).unwrap();
+                if seq_plain_json_inputs(&cmd).expect("reads").is_some() {
+                    return None;
+                }
+                let kept = SEQ_PREREAD.with(|slot| slot.borrow().is_some());
+                if !handoff {
+                    SEQ_PREREAD.with(|slot| slot.borrow_mut().take());
+                }
+                if let Some(other) = replace_with {
+                    std::fs::write(&path, other).unwrap();
+                }
+                let (mut open_failed, mut opened) = (false, Vec::new());
+                get_inputs(&cmd, true, true, &mut open_failed, &mut opened)
+                    .expect("no exit code")
+                    .expect("reads");
+                SEQ_PREREAD.with(|slot| slot.borrow_mut().take());
+                let lazy = LAZY_SEQ_INPUTS.with(|slot| slot.borrow_mut().take())?;
+                let errors = lazy
+                    .errors
+                    .map(|(before, t)| (before, t.error.message))
+                    .collect();
+                Some(((lazy.combined, lazy.ranges, lazy.places, errors), kept))
+            };
+        let (mut compared, mut read_once) = (0, 0);
+        for raw in random_seq_streams(600) {
+            let Some((rewalked, _)) = read(&raw, false, None) else {
+                continue;
+            };
+            let (handed, kept) =
+                read(&raw, true, None).expect("the same stream takes the same route");
+            assert_eq!(handed, rewalked, "{raw:?}");
+            compared += 1;
+            if kept {
+                // Replaced after the check: the handed-on bytes are the ones that were walked.
+                let (replaced, _) = read(&raw, true, Some(b"\x1e{\"name\":0}\n")).expect("handed");
+                assert_eq!(replaced, rewalked, "{raw:?}, file replaced after the check");
+                read_once += 1;
+            }
+        }
+        assert!(
+            compared > 50,
+            "{compared} streams reached the lazy producer"
+        );
+        assert!(read_once > 50, "{read_once} files read once");
     }
 
     /// #5624: the filter `.` over an owned input -- a `--stream` event, a `--seq` record, a DSV
