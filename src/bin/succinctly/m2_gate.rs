@@ -379,6 +379,7 @@ mod tests {
             "Builtin::NthStream shares NthExpr's arm and must answer the same"
         );
     }
+
     /// The arrays [`is_array_of_nodes`] admits: the gate test asserts each streams, and the
     /// agreement test that each evaluates to cursors, so the two cannot drift apart.
     const ARRAYS_OF_NODES: &[&str] = &[
@@ -441,6 +442,10 @@ mod tests {
             "[.[1:]]",
             "[., .]",
             "[.a, .b]",
+            // A generator index answers several nodes.
+            ".[0,1] | [.[]]",
+            ".[\"a\",\"b\"] | [.[]]",
+            "[.[0,1]]",
             // A prefix that is not one node, or an array that feeds a later stage.
             ".[] | [.a]",
             ".[] | [.[]]",

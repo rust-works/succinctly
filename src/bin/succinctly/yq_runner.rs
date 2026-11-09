@@ -10692,8 +10692,10 @@ impl<V: DocumentValue> Iterator for BranchResults<V> {
 /// complex key that collides with another after its display form, or a node past the depth limit
 /// would be found with the array already half written. The owned route this replaces found all
 /// three before it wrote a byte; [`validate_cursor`] is that walk, instantiated to build nothing.
-/// Every element of an [`is_array_of_nodes`] array is a cursor, and gathering them cannot fail
-/// (a `from_cursors` source has no stage to raise), so there is no other case to answer.
+/// Every element of an [`is_array_of_nodes`] array is a cursor of a `from_cursors` source, so
+/// gathering them copies pointers (the `select` ran while the array was built). Were that to fail,
+/// the streamer gathers the same elements the same way before it writes a byte, so the failure is
+/// its to report and there is nothing here to validate.
 fn validated_array_of_nodes<V: DocumentValue>(result: GenericResult<V>) -> GenericResult<V> {
     if let GenericResult::LazySeq(seq) = &result {
         if let Ok(items) = seq.as_ref().clone().drain_atomic() {
@@ -10719,13 +10721,14 @@ fn validated_array_of_nodes<V: DocumentValue>(result: GenericResult<V>) -> Gener
 fn stream_branch_results<C: DocumentCursor + Copy>(
     branches: &[&Expr],
     cursor: C,
+    validate_nodes: bool,
 ) -> BranchResults<C::Value> {
     let eval = |branch: &Expr| {
         let result =
             discard_yq_partial_prefix(eval_with_cursor_using::<YqSemantics, _>(branch, cursor));
         // #3475: an array of nodes reads its elements for the first time while they stream, and an
         // array is atomic, so each is checked before the first byte is written.
-        if is_array_of_nodes(branch) {
+        if validate_nodes {
             validated_array_of_nodes(result)
         } else {
             result
@@ -11569,7 +11572,8 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                     // #5283: a streamed comma is its branches, one `stream_cursor!` result each; only the
                     // first that produces output may write the document's `---`.
                     let mut doc_has_output = false;
-                    let branch_results = stream_branch_results(&stream_branches, $cursor);
+                    let branch_results =
+                        stream_branch_results(&stream_branches, $cursor, streams_array_of_nodes);
                     for result in branch_results {
                         // A throwaway flag once the document has output: `emit_yaml_doc_separator` sets it.
                         let mut comma_dummy = false;
@@ -11748,7 +11752,8 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                     // `None`), so there's no ordering constraint here beyond
                     // preceding `stream_json` itself.
                     // #5283: see the YAML arm above.
-                    let branch_results = stream_branch_results(&stream_branches, $cursor);
+                    let branch_results =
+                        stream_branch_results(&stream_branches, $cursor, streams_array_of_nodes);
                     for result in branch_results {
                         let stats = stream_maybe_colored(
                             $writer,

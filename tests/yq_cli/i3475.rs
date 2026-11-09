@@ -246,3 +246,52 @@ fn test_an_array_of_nodes_is_all_or_nothing_3475() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn test_an_array_of_nodes_honours_the_output_flags_3475() -> Result<()> {
+    // `-e`: an empty array and an array of one `null` are both values, so the exit status is 0.
+    let (out, code) = run_yq_stdin("[.users[] | select(.age > 99)]", USERS, &["-e"])?;
+    assert_eq!((out.as_str(), code), ("[]\n", 0));
+    let (out, code) = run_yq_stdin("[.users[0].missing]", USERS, &["-e"])?;
+    assert_eq!((out.as_str(), code), ("- null\n", 0));
+    // `-0` ends each result with a NUL.
+    let (out, code) = run_yq_stdin("[.users[0].age]", USERS, &["-0"])?;
+    assert_eq!((out.as_str(), code), ("- 31\0", 0));
+    // `--doc N` selects one document of several.
+    let (out, code) = run_yq_stdin(
+        "[.a]",
+        "a: [1]\n---\na: [2]\n---\na: [3]\n",
+        &["--doc", "1"],
+    )?;
+    assert_eq!((out.as_str(), code), ("- [2]\n", 0));
+    // `-C` colours it, and the colours leave the text as it was.
+    let (plain, _) = run_yq_stdin("[.users[0]]", USERS, &[])?;
+    let (coloured, code) = run_yq_stdin("[.users[0]]", USERS, &["-C"])?;
+    assert_eq!(code, 0);
+    assert!(coloured.contains('\u{1b}'), "{coloured:?}");
+    let mut stripped = String::new();
+    let mut chars = coloured.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for skipped in chars.by_ref() {
+                if skipped == 'm' {
+                    break;
+                }
+            }
+        } else {
+            stripped.push(c);
+        }
+    }
+    assert_eq!(stripped, plain);
+    Ok(())
+}
+
+#[test]
+fn test_an_array_of_nodes_keeps_tags_and_anchors_3475() -> Result<()> {
+    // The nodes are written from the source, so a tag and an anchor with no alias stay as written
+    // (an alias takes the DOM route, `test_an_alias_whose_anchor_is_not_in_the_array_is_expanded_3475`).
+    let doc = "- !!binary aGk=\n- &x v\n- !foo bar\n- !!str 12\n";
+    let (out, code) = run_yq_stdin("[.[]]", doc, &[])?;
+    assert_eq!((out.as_str(), code), (doc, 0));
+    Ok(())
+}
