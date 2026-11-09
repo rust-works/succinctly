@@ -26,3 +26,16 @@ fn test_5000_recursive_descent_walks_a_mappings_own_entries_not_its_merged_membe
     }
     Ok(())
 }
+
+/// `path(..)` and `recurse` list the same entries as `..` (the review of #6715). Both are jq-only spellings in yq,
+/// so they run under `--jq-extensions`; the paths are relative to `.item`, and are the `..` listing above.
+#[test]
+fn test_5000_path_of_recursive_descent_agrees_with_the_walk() -> Result<()> {
+    let want = "[[],[\"<<\"],[\"<<\",0],[\"<<\",1],[\"k\"]]";
+    for filter in ["[.item | path(..)]", "[.item | path(recurse(.[]?))]"] {
+        let (out, code) = run_yq_stdin(filter, MERGED, &["-o=json", "-I=0", "--jq-extensions"])?;
+        assert_eq!(code, 0, "{filter}: {out:?}");
+        assert_eq!(out.trim_end(), want, "{filter}");
+    }
+    Ok(())
+}

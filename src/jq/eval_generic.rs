@@ -18211,7 +18211,7 @@ fn each_recurse_cursor_generic<S: EvalSemantics, V: DocumentValue>(
             &PathNode::At(cursor),
             &NoTrail,
             true,
-            S::TAG == EvalTag::Yq,
+            descent_lists_own_entries::<S>(),
             &mut |_, child, _| {
                 match child {
                     PathNode::At(c) => pending.push(c),
@@ -29424,6 +29424,12 @@ fn path_index_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
 /// is what lets the path-context walk stream `.[]` rather than hold one
 /// buffer entry per child -- the child *cursors* still come from the checked
 /// collection helpers, whose validation this does not touch.
+/// Whether `..` lists a mapping's own entries (a `<<` key among them) instead of the merged view `.[]` reads
+/// (#5000): yq's recursive descent walks the node's `Content`. One definition for every `..` walk.
+fn descent_lists_own_entries<S: EvalSemantics>() -> bool {
+    S::TAG == EvalTag::Yq
+}
+
 fn path_iterate_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
     node: &PathNode<V>,
     path: &T,
@@ -29821,7 +29827,18 @@ fn path_descent_children<S: EvalSemantics, V: DocumentValue>(
         settled?;
         return Ok(children);
     }
-    match path_step_generic::<S, V, _>(&Expr::Iterate, here, at, true, &mut children) {
+    let stepped = match here {
+        // #5000: the own-entries view, as the cursor walk lists them.
+        PathNode::At(_) if descent_lists_own_entries::<S>() => {
+            path_iterate_step_generic::<S, V, _>(here, at, true, true, &mut |trail, child, _| {
+                children.push((trail, child));
+                Demand::Continue
+            })
+            .map(|_| ())
+        }
+        _ => path_step_generic::<S, V, _>(&Expr::Iterate, here, at, true, &mut children),
+    };
+    match stepped {
         // What `.[]?` never swallows: a decode failure, and the errors no `?` or `try` can catch.
         Err(e) if e.is_decode_failure() || e.is_uncatchable_at_value_position() => Err(e),
         _ => Ok(children),
@@ -31765,10 +31782,13 @@ fn path_context_step_recurse_each<S: EvalSemantics, V: DocumentValue>(
         return Ok(Demand::Continue);
     }
     let mut children = Vec::new();
-    if S::TAG == EvalTag::Yq && matches!(pos.node, PathNode::At(_)) {
+    if descent_lists_own_entries::<S>() && matches!(pos.node, PathNode::At(_)) {
         // #5000: the members of a live node, as yq's `..` lists them (see
         // `path_iterate_step_generic`'s `listed`). It is `.[]?`: a catchable
         // failure ends the branch, an uncatchable one escapes.
+        if let Some(settled) = swallowed_path_leaf::<S, V>(&Expr::Iterate, None, &pos.node) {
+            return settled.map(|()| Demand::Continue).map_err(Control::Error);
+        }
         let stepped = path_iterate_step_generic::<S, V, _>(
             &pos.node,
             &pos.trail,
