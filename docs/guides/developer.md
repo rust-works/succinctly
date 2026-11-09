@@ -175,8 +175,8 @@ does not reproduce the leg. A plain `cargo test --features cli` still runs every
 ### Differential sweeps against jq
 
 A change to the jq evaluator, the path register above all, is judged against `/usr/bin/jq` (1.7.1) over a
-generated grid, not only against the golden fixtures. `scripts/` holds 27 such sweeps, each written as the gate
-for one fix and kept as the regression net for its class. 26 of them run under
+generated grid, not only against the golden fixtures. `scripts/` holds 28 such sweeps, each written as the gate
+for one fix and kept as the regression net for its class. 27 of them run under
 `succinctly dev compare jq --dimension sweeps` (`comparison/jq/manifest.toml`'s `[[sweep]]`, #5552), with the
 arguments listed there, against one build and jq alone. To judge a change, run the ones that reach it by hand
 as well, with `--base` set to a `main` build where the script takes one: that is what finds a lost match, and
@@ -210,6 +210,7 @@ give the base its own checkout so it is not rebuilt. Read each script's header f
 | `path-context-oracle-sweep.sh`           | the path-context evaluators, jq and yq mode (#2416)                         | `--jq-only`                  |
 | `path-register-sweep.py`                 | jq's path register (#3456, #3289, #3428), 63.6M rows                        | `--jq-gate --sample 2000`    |
 | `reduce-update-bind-sweep.py`            | a `reduce` UPDATE destructuring an outer `$x` (#4934), and its `?//` grid   | `--jq-gate`, sampled, twice  |
+| `seq-door-sweep.py`                      | `--seq` over a stream with a diagnostic, program by program (#6620)         | `--cases 3000 --both`        |
 | `seq-oracle-sweep.py`                    | `--seq`'s parse-error diagnostics (#1723)                                   | whole grid                   |
 | `stream-errors-oracle-sweep.py`          | `--stream-errors` (#5474)                                                   | whole grid                   |
 

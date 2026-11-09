@@ -336,6 +336,12 @@ args = ["--oracle", "{jq}", "{subject}"]
 timeout_s = 300
 
 [[sweep]]
+id = "seq-door"
+script = "scripts/jq-seq-door-sweep.py"
+args = ["--oracle", "{jq}", "--cases", "3000", "--both", "{subject}"]
+timeout_s = 300
+
+[[sweep]]
 id = "stream-errors"
 script = "scripts/jq-stream-errors-oracle-sweep.py"
 args = ["{subject}", "--oracle", "{jq}"]
