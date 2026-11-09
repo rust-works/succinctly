@@ -5,9 +5,9 @@
 //! lines and a comment's indent ahead of the first content are normalised away. Every row is a live
 //! yq v4.53.3 capture (`printf '\xef\xbb\xbf<text>' | yq <flags> .`).
 //!
-//! The streaming routes read it (stdin and files, `.`, `-N`, `-I=0`, `-o=json`, a path). The DOM
-//! routes (`-P`, a write, `--eval-all`, `--slurp`) still model the header and keep printing the
-//! leading `---` (`test_the_dom_route_still_echoes_the_marker_after_a_bom_5357`).
+//! The streaming routes read it (stdin and files, `.`, `-N`, `-I=0`, `-o=json`, a path); the routes
+//! that gather a source first (`-P`, writes, `-i`) read it the same way since #6762
+//! (`tests/yq_cli/i6762.rs`).
 
 use std::io::Write;
 
@@ -110,15 +110,5 @@ fn test_an_input_other_than_the_first_keeps_its_own_header_model_5357() -> Resul
         ("b: 2\n---\nb: 2\n", 0),
         "{stderr}"
     );
-    Ok(())
-}
-
-#[test]
-fn test_the_dom_route_still_echoes_the_marker_after_a_bom_5357() -> Result<()> {
-    // Not yq's output (`a: 1`): the DOM routes keep the header model, so this is a recorded
-    // difference (docs/compliance/yq/limitations.md), pinned so the page stays true.
-    let input = format!("{BOM}---\na: 1\n");
-    let (stdout, code) = run_yq_stdin(".", &input, &["-P"])?;
-    assert_eq!((stdout.as_str(), code), ("---\na: 1\n", 0));
     Ok(())
 }

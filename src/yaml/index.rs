@@ -216,6 +216,8 @@ impl YamlIndex<Vec<u64>> {
         let mut index = Self::from_semi_index(yaml, build_semi_index_yq_no_head(yaml)?)?;
         // A fresh cell, so this cannot already be set.
         let _ = index.yq_header.set((0, false));
+        // No slurped lines to leave out of `line` and `column`: yq counts every line of the text (#6762).
+        let _ = index.yq_preamble.set((0, 0));
         index.after_bom = true;
         Ok(index)
     }

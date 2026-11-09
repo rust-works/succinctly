@@ -8109,7 +8109,9 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     }
 
     fn document_preamble(&self, through_content: bool) -> Option<&str> {
-        if !self.is_document_content() {
+        // After a byte-order mark yq sets no header aside, so nothing in front of the first
+        // document is printed back as one (#6762): its `---` is read, not echoed.
+        if !self.is_document_content() || self.index.after_bom() {
             return None;
         }
         let start = self.text_position()?;
@@ -8300,7 +8302,17 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
                 && !lines.is_empty()
                 && !blank_line_before(self.text, first_start as usize)
             {
-                for _ in 0..blank_lines_between(self.text, last_end as usize, pos) {
+                // After a byte-order mark no header carries the first document's leading lines
+                // verbatim, so go-yaml reads them: the block is the head comment alone, and the
+                // blank lines (or `---` marker) between it and the content are not part of it (#6762).
+                let blanks = if self.index.after_bom()
+                    && lies_in_first_document_lead(self.text, first_start as usize)
+                {
+                    0
+                } else {
+                    blank_lines_between(self.text, last_end as usize, pos)
+                };
+                for _ in 0..blanks {
                     lines.push(String::new());
                 }
             }
@@ -9958,6 +9970,30 @@ fn blank_lines_between(text: &[u8], from: usize, to: usize) -> usize {
         }
     }
     breaks.saturating_sub(1)
+}
+
+/// Whether everything in `text` before `at` is the lead of the stream's first document (#6762): blank
+/// lines, `#` comment lines and at most one `---` line, so a head comment block at `at` belongs to that
+/// document. A second marker starts another document, and anything else is content.
+fn lies_in_first_document_lead(text: &[u8], at: usize) -> bool {
+    let mut markers = 0;
+    for line in text[..at.min(text.len())].split(|&b| b == b'\n') {
+        let blank = |b: &u8| matches!(b, b' ' | b'\t' | b'\r');
+        let start = line.iter().position(|b| !blank(b)).unwrap_or(line.len());
+        let end = line
+            .iter()
+            .rposition(|b| !blank(b))
+            .map_or(start, |at| at + 1);
+        let line = &line[start..end];
+        if line.is_empty() || line.starts_with(b"#") {
+            continue;
+        }
+        markers += usize::from(line == b"---");
+        if line != b"---" || markers > 1 {
+            return false;
+        }
+    }
+    true
 }
 
 /// Whether the line just above the one `at` is on is blank -- empty or only blanks (#4093).
@@ -19160,6 +19196,46 @@ plain: hello
             let header = YamlIndex::build_yq(b"---\n").unwrap();
             let first = header.root(b"---\n").first_child().expect("a document");
             assert!(first.is_header_only_document());
+        }
+
+        /// #6762: the routes that gather a source before indexing it read a BOM-led text with no header
+        /// too: the first document has no preamble to print back, `line` counts every line, and the
+        /// blank lines after its head comment are not part of it.
+        #[test]
+        fn after_a_bom_the_first_document_has_no_preamble_and_every_line_counts_6762() {
+            use crate::jq::document::DocumentCursor;
+            let yaml = b"---\na: 1\n";
+            let header = YamlIndex::build_yq(yaml).unwrap();
+            let first = header.root(yaml).first_child().expect("a document");
+            assert_eq!(first.document_preamble(true), Some("---\n"));
+            let bom = YamlIndex::build_yq_after_bom(yaml).unwrap();
+            let first = bom.root(yaml).first_child().expect("a document");
+            assert_eq!(first.document_preamble(true), None);
+            assert_eq!(bom.yq_preamble(|| unreachable!("measured")), (0, 0));
+
+            // The head comment is the block alone: with a header the blank line stays in it.
+            let yaml = b"# c\n\na: 1\n";
+            let head = |index: &YamlIndex<Vec<u64>>| {
+                let first = index.root(yaml).first_child().expect("a document");
+                DocumentCursor::head_comment_raw(&first)
+            };
+            assert_eq!(head(&YamlIndex::build_yq(yaml).unwrap()), ["# c", ""]);
+            assert_eq!(head(&YamlIndex::build_yq_after_bom(yaml).unwrap()), ["# c"]);
+
+            // The block after the first `---` is that document's lead too; after a second marker it
+            // is the next document's, whose blank line stays.
+            for (yaml, kept) in [
+                (&b"---\n# k\n\na: 1\n"[..], false),
+                (b"# h\n---\n# k\n\na: 1\n", false),
+                (b"---\n---\n# k\n\na: 1\n", true),
+                (b"x: 0\n---\n# k\n\na: 1\n", true),
+            ] {
+                assert_eq!(
+                    lies_in_first_document_lead(yaml, yaml.len() - 5),
+                    !kept,
+                    "{yaml:?}"
+                );
+            }
         }
 
         #[test]

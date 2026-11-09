@@ -43,10 +43,11 @@ pub(super) fn enter(
     let sources: Vec<Source> = input_sources
         .iter()
         .enumerate()
-        .filter(|(_, (_, format, _))| *format != InputFormat::Json)
-        .map(|(source_idx, (bytes, ..))| Source {
+        .filter(|(_, (_, format, _, _))| *format != InputFormat::Json)
+        .map(|(source_idx, (bytes, _, _, after_bom))| Source {
             file: file_indices.get(source_idx).copied().unwrap_or(source_idx),
             bytes: bytes.clone(),
+            after_bom: *after_bom,
             loaded: OnceCell::new(),
         })
         .collect();
@@ -64,6 +65,8 @@ pub(super) fn enter(
 struct Source {
     file: usize,
     bytes: Vec<u8>,
+    /// The file lost a leading byte-order mark, so yq read it with no header (#6762).
+    after_bom: bool,
     loaded: OnceCell<Option<Loaded>>,
 }
 
@@ -105,7 +108,7 @@ impl Source {
     fn loaded(&self) -> Option<&Loaded> {
         self.loaded
             .get_or_init(|| {
-                let index = YamlIndex::build_yq(&self.bytes).ok()?;
+                let index = super::build_yq_source(&self.bytes, self.after_bom).ok()?;
                 let mut documents = Vec::new();
                 let YamlValue::Sequence(mut rest) = index.root(&self.bytes).value() else {
                     return None;

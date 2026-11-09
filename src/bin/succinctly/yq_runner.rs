@@ -1011,8 +1011,8 @@ impl OutputConfig {
 /// the rule, so only the traversal is written twice.
 /// `validate_yaml_display_keys_agrees_with_yaml_to_owned_value_1349` pins
 /// that the two answer identically.
-fn validate_yaml_display_keys(bytes: &[u8]) -> Result<()> {
-    walk_yaml_display_keys(bytes, false)
+fn validate_yaml_display_keys(bytes: &[u8], after_bom: bool) -> Result<()> {
+    walk_yaml_display_keys(bytes, false, after_bom)
 }
 
 /// Refuse a `--inplace` rewrite of a document holding a *complex* mapping key
@@ -1031,8 +1031,12 @@ fn validate_yaml_display_keys(bytes: &[u8]) -> Result<()> {
 /// Refuses even a filter whose output omits the key (`-i '.b'`): proving that
 /// would mean tracking each output's provenance, and ADR-0018 allows the
 /// divergence where matching the reference would corrupt a write.
-fn refuse_yaml_complex_keys_for_inplace(bytes: &[u8], file_path: &str) -> Result<()> {
-    walk_yaml_display_keys(bytes, true).map_err(|e| {
+fn refuse_yaml_complex_keys_for_inplace(
+    bytes: &[u8],
+    file_path: &str,
+    after_bom: bool,
+) -> Result<()> {
+    walk_yaml_display_keys(bytes, true, after_bom).map_err(|e| {
         if e.downcast_ref::<ComplexKeyRefusal>().is_some() {
             anyhow::anyhow!(
                 "refusing to rewrite {file_path} in place: it has a complex mapping key \
@@ -1060,7 +1064,7 @@ impl std::error::Error for ComplexKeyRefusal {}
 /// [`validate_yaml_display_keys`]'s walk; `refuse_complex` additionally raises
 /// [`ComplexKeyRefusal`] once the whole document has been walked and held a
 /// complex key (#3463).
-fn walk_yaml_display_keys(bytes: &[u8], refuse_complex: bool) -> Result<()> {
+fn walk_yaml_display_keys(bytes: &[u8], refuse_complex: bool, after_bom: bool) -> Result<()> {
     fn walk<W: AsRef<[u64]> + Clone>(
         cursor: YamlCursor<'_, W>,
         depth: usize,
@@ -1110,7 +1114,8 @@ fn walk_yaml_display_keys(bytes: &[u8], refuse_complex: bool) -> Result<()> {
         }
     }
 
-    let index = YamlIndex::build_yq(bytes).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
+    let index =
+        build_yq_source(bytes, after_bom).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
     let mut saw_complex = false;
     walk(index.root(bytes), 0, &mut saw_complex)?;
     if refuse_complex && saw_complex {
@@ -1892,7 +1897,7 @@ fn eval_all_documents(
         input_files,
         resolve_run_input_format(input_format, input_files),
     );
-    for (source_idx, (bytes, format, _)) in input_sources.iter().enumerate() {
+    for (source_idx, (bytes, format, _, after_bom)) in input_sources.iter().enumerate() {
         let file_idx = source_file_indices
             .get(source_idx)
             .copied()
@@ -1901,7 +1906,7 @@ fn eval_all_documents(
         // plain `parse_input` for JSON-sourced input) now reports its
         // own nesting-depth violations as a catchable error rather than
         // panicking -- see that function's own doc comment for why.
-        let inputs = parse_input(bytes, *format)?;
+        let inputs = parse_input(bytes, *format, *after_bom)?;
         for (doc_idx, input) in inputs.into_iter().enumerate() {
             let should_include = document.map_or(true, |target| target == global_doc_index);
             if should_include {
@@ -1939,9 +1944,10 @@ fn apply_front_matter(
     Ok((fm.yaml.to_vec(), InputFormat::Yaml, body))
 }
 
-/// One gathered input source: its bytes, resolved format, and (only under
-/// `--front-matter=process`) the untouched body carried alongside it.
-type GatheredSource = (Vec<u8>, InputFormat, Option<Vec<u8>>);
+/// One gathered input source: its bytes, resolved format, (only under
+/// `--front-matter=process`) the untouched body carried alongside it, and whether a UTF-8
+/// byte-order mark was dropped from its front, which leaves yq no header to set aside (#6762).
+type GatheredSource = (Vec<u8>, InputFormat, Option<Vec<u8>>, bool);
 
 /// Reads each input source -- stdin if `input_files` is empty, else each
 /// file in listed order -- applying `--front-matter` (a no-op unless the
@@ -1972,9 +1978,7 @@ fn gather_input_sources(
     let mut sources = Vec::new();
     let resolved_format = resolve_run_input_format(input_format, input_files);
     if input_files.is_empty() {
-        // #5357: the BOM flag is for the streaming routes, which index a source right after reading it;
-        // a gathered source is indexed later, by routes that do not carry it.
-        let (raw_bytes, resolved_format, _had_bom) = read_input_noting_empty_document(
+        let (raw_bytes, resolved_format, had_bom) = read_input_noting_empty_document(
             read_stdin()?,
             resolved_format,
             input_files,
@@ -1989,14 +1993,14 @@ fn gather_input_sources(
         if let Some(code) = yaml_validate_guard(&input_bytes, format, validate, None) {
             return Ok((sources, Some(code)));
         }
-        sources.push((input_bytes, format, body));
+        sources.push((input_bytes, format, body, had_bom));
     } else {
         for (at, file_path) in input_files.iter().enumerate() {
             let path = Path::new(file_path);
             if is_drained_stdin_file_argument(path) {
                 continue;
             }
-            let Some((raw_bytes, resolved_format, _had_bom)) = read_input_noting_empty_document(
+            let Some((raw_bytes, resolved_format, had_bom)) = read_input_noting_empty_document(
                 read_file(path)?,
                 resolved_format,
                 input_files,
@@ -2013,7 +2017,7 @@ fn gather_input_sources(
             {
                 return Ok((sources, Some(code)));
             }
-            sources.push((input_bytes, format, body));
+            sources.push((input_bytes, format, body, had_bom));
         }
     }
     Ok((sources, None))
@@ -2346,7 +2350,11 @@ fn json_nested_past_depth_limit<W: AsRef<[u64]>>(
 /// delegating to [`parse_input`] and building a second index of the same
 /// bytes (#2296). The check still runs before any materialization, so the
 /// message and exit code are unchanged.
-fn parse_input_m2_parity(bytes: &[u8], format: InputFormat) -> Result<Vec<OwnedValue>> {
+fn parse_input_m2_parity(
+    bytes: &[u8],
+    format: InputFormat,
+    after_bom: bool,
+) -> Result<Vec<OwnedValue>> {
     if format == InputFormat::Json {
         return parse_json_values(bytes, |value| {
             let index = JsonIndex::build(value);
@@ -2357,7 +2365,7 @@ fn parse_input_m2_parity(bytes: &[u8], format: InputFormat) -> Result<Vec<OwnedV
             parse_json_input_from_cursor(&cursor)
         });
     }
-    parse_input(bytes, format)
+    parse_input(bytes, format, after_bom)
 }
 
 /// Reads every top-level value of a `-p json` input through `parse_value`, which reads one
@@ -2406,7 +2414,7 @@ fn parse_json_input_from_cursor<W: AsRef<[u64]> + Clone>(
 }
 
 /// Parse input bytes according to the specified format.
-fn parse_input(bytes: &[u8], format: InputFormat) -> Result<Vec<OwnedValue>> {
+fn parse_input(bytes: &[u8], format: InputFormat, after_bom: bool) -> Result<Vec<OwnedValue>> {
     match format {
         InputFormat::Json => parse_json_values(bytes, |value| {
             let index = JsonIndex::build(value);
@@ -2414,8 +2422,8 @@ fn parse_input(bytes: &[u8], format: InputFormat) -> Result<Vec<OwnedValue>> {
         }),
         InputFormat::Yaml | InputFormat::Auto => {
             // Parse as YAML (Auto defaults to YAML when no extension hint)
-            let mut index =
-                YamlIndex::build_yq(bytes).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
+            let mut index = build_yq_source(bytes, after_bom)
+                .map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
             index.render_merges_through_aliases_only(); // #4987, see the stdin site
             note_synthesized_empty(&mut index); // #5008
             let root = index.root(bytes);
@@ -2455,6 +2463,8 @@ struct DirectEvalOptions {
     /// Stop evaluating further documents at the first error the program raises, as real yq
     /// does (#2810). Off for the callers that keep going: `--split-exp` and `--inplace`.
     stop_at_error: bool,
+    /// The source lost a leading byte-order mark, so yq read it with no header (#6762).
+    after_bom: bool,
 }
 
 /// Evaluate YAML *or JSON* input directly using the generic evaluator with
@@ -2491,6 +2501,7 @@ fn evaluate_yaml_direct_filtered(
         sort_keys,
         mark_json_sourced,
         stop_at_error,
+        after_bom,
     } = opts;
     // #2279: build_json_sourced parses with JSON's flow-sequence delimiter
     // rules *and* marks the index; the two cannot be applied separately,
@@ -2504,7 +2515,7 @@ fn evaluate_yaml_direct_filtered(
         streamed = stream;
         index
     } else {
-        YamlIndex::build_yq(source).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?
+        build_yq_source(source, after_bom).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?
     };
     index.render_merges_through_aliases_only(); // #4987, see the stdin site
     note_synthesized_empty(&mut index); // #5008
@@ -2633,6 +2644,8 @@ struct FallbackStreamState<'a> {
     sort_keys: bool,
     doc_streamed: &'a mut bool,
     any_truthy: &'a mut bool,
+    /// The source lost a leading byte-order mark (#6762).
+    after_bom: bool,
 }
 
 /// Whether a YAML output takes the DOM route for the whole input instead of the M2 streamers:
@@ -2738,6 +2751,7 @@ fn stream_yaml_sort_keys_alias_fallback<W: Write>(
         sort_keys,
         doc_streamed,
         any_truthy,
+        after_bom,
     } = state;
     // Every caller of this function already parsed `bytes` successfully
     // (that `YamlIndex::build` is exactly how `index.has_aliases()` was
@@ -2756,6 +2770,7 @@ fn stream_yaml_sort_keys_alias_fallback<W: Write>(
             sort_keys,
             mark_json_sourced: false,
             stop_at_error: true,
+            after_bom,
         },
     );
     let (doc_results, num_docs) = eval_result?; // patchcov: coverage tolerate-line reason="unreachable: bytes already parsed successfully by every caller (#1350)"
@@ -12180,6 +12195,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                         sort_keys,
                         doc_streamed: &mut yaml_doc_streamed,
                         any_truthy: &mut any_truthy,
+                        after_bom: had_bom,
                     },
                 )?;
                 writer.flush()?;
@@ -12403,6 +12419,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                             sort_keys,
                             doc_streamed: &mut yaml_doc_streamed,
                             any_truthy: &mut any_truthy,
+                            after_bom: had_bom,
                         },
                     )?;
                     global_doc_index += num_docs;
@@ -12573,7 +12590,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         // rationale on the mixed-format case).
         let mut source_formats = input_sources
             .iter()
-            .map(|(_, format, _)| output_basis_format(&args, &input_files, *format));
+            .map(|(_, format, _, _)| output_basis_format(&args, &input_files, *format));
         let uniform_format = match source_formats.next() {
             Some(first) if source_formats.all(|f| f == first) => first,
             _ => InputFormat::Yaml,
@@ -12725,7 +12742,9 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 &input_files,
                 resolve_run_input_format(args.input_format, &input_files),
             );
-            'files: for (source_idx, (bytes, format, _)) in input_sources.iter().enumerate() {
+            'files: for (source_idx, (bytes, format, _, after_bom)) in
+                input_sources.iter().enumerate()
+            {
                 // #2839: see the `'m2_files` loop.
                 if json_stream_tail_error_pending() {
                     break;
@@ -12776,6 +12795,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                         sort_keys: output_config.sort_keys,
                         mark_json_sourced: *format == InputFormat::Json,
                         stop_at_error: true,
+                        after_bom: *after_bom,
                     },
                 )?;
                 global_doc_index += num_docs;
@@ -12939,7 +12959,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             // `Vec` unless their backing bytes/index all outlive that `Vec`.
             let mut parsed_sources: Vec<(Vec<u8>, YamlIndex<Vec<u64>>)> =
                 Vec::with_capacity(input_sources.len());
-            for (bytes, _format, _) in input_sources {
+            for (bytes, _format, _, after_bom) in input_sources {
                 // #2276: no `mark_json_sourced()` call here anymore --
                 // `can_slurp_fast_path` now requires `!any_input_is_json`
                 // (see its own doc comment), so every source reaching this
@@ -12949,7 +12969,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 // No `suppress_header_doc_markers` here (#2795): a slurped
                 // array streams its documents as elements, never as
                 // documents, so no header is ever printed on this path.
-                let mut index = YamlIndex::build_yq(&bytes)
+                let mut index = build_yq_source(&bytes, after_bom)
                     .map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
                 index.render_merges_through_aliases_only(); // #4987, see the stdin site
                 note_synthesized_empty(&mut index); // #5008
@@ -13066,7 +13086,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             // in the test suite).
             let mut source_formats = input_sources
                 .iter()
-                .map(|(_, format, _)| output_basis_format(&args, &input_files, *format));
+                .map(|(_, format, _, _)| output_basis_format(&args, &input_files, *format));
             let uniform_format = match source_formats.next() {
                 Some(first) if source_formats.all(|f| f == first) => first,
                 _ => InputFormat::Yaml,
@@ -13077,11 +13097,11 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
 
             // Parse all inputs and collect documents
             let mut global_doc_index: usize = 0;
-            for (bytes, format, _) in &input_sources {
+            for (bytes, format, _, after_bom) in &input_sources {
                 // #2276: `parse_input_m2_parity`, not plain `parse_input` --
                 // this is `--slurp`'s own DOM fallback, reached exactly
                 // when its M2 fast path declines JSON-sourced input.
-                let inputs = parse_input_m2_parity(bytes, *format)?;
+                let inputs = parse_input_m2_parity(bytes, *format, *after_bom)?;
                 for input in inputs {
                     // Apply --doc filter if specified
                     if let Some(target_doc) = args.document {
@@ -13145,7 +13165,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             }
             // #4394: the first file's extension decides for all of them.
             let resolved_format = run_input_format;
-            let Some((raw_bytes, resolved_format, _had_bom)) = read_input_noting_empty_document(
+            let Some((raw_bytes, resolved_format, had_bom)) = read_input_noting_empty_document(
                 read_file(path)?,
                 resolved_format,
                 &input_files,
@@ -13173,7 +13193,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             // written back with that key spelled `""`. Refused before either
             // route runs, so the file stays byte-identical.
             if format != InputFormat::Json {
-                refuse_yaml_complex_keys_for_inplace(&input_bytes, file_path)?;
+                refuse_yaml_complex_keys_for_inplace(&input_bytes, file_path, had_bom)?;
             }
 
             let mut output_buffer = Vec::new();
@@ -13237,7 +13257,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 // `can_inplace_fast_path` now requires `!any_input_is_json`
                 // (see its own doc comment), so `format` is never `Json`
                 // for any file reaching this branch.
-                let mut index = YamlIndex::build_yq(&input_bytes)
+                let mut index = build_yq_source(&input_bytes, had_bom)
                     .map_err(|e| anyhow::anyhow!("YAML parse error in {file_path}: {e}"))?;
                 if args.no_doc {
                     index.suppress_header_doc_markers(); // #2795, see the stdin site
@@ -13394,7 +13414,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                     // -- this is `--inplace`'s own DOM fallback, reached
                     // exactly when its M2 fast path declines JSON-sourced
                     // input.
-                    let inputs = parse_input_m2_parity(&input_bytes, format)?;
+                    let inputs = parse_input_m2_parity(&input_bytes, format, had_bom)?;
                     // Count matching docs for multi-doc separator logic
                     let matching_docs: usize = if let Some(target_doc) = args.document {
                         usize::from(
@@ -13448,7 +13468,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                     // `parse_input_m2_parity` for this instead and paid a
                     // second full materialization of the document for it --
                     // 2.1x slower and 2.9x peak RSS on a 5 MB file.
-                    validate_yaml_display_keys(&input_bytes)?;
+                    validate_yaml_display_keys(&input_bytes, had_bom)?;
 
                     let (collected, num_docs) = evaluate_yaml_direct_filtered(
                         &input_bytes,
@@ -13464,6 +13484,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                             sort_keys: output_config.sort_keys,
                             mark_json_sourced: false,
                             stop_at_error: false,
+                            after_bom: had_bom,
                         },
                     )?;
                     global_doc_index += num_docs;
@@ -13684,7 +13705,9 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             &input_files,
             resolve_run_input_format(args.input_format, &input_files),
         );
-        'collect: for (source_idx, (bytes, format, _)) in input_sources.iter().enumerate() {
+        'collect: for (source_idx, (bytes, format, _, after_bom)) in
+            input_sources.iter().enumerate()
+        {
             let file_index = source_file_indices
                 .get(source_idx)
                 .copied()
@@ -13722,6 +13745,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                     sort_keys: output_config.sort_keys,
                     mark_json_sourced: *format == InputFormat::Json,
                     stop_at_error: true,
+                    after_bom: *after_bom,
                 },
             )?;
             global_doc_index += num_docs;
@@ -13761,7 +13785,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         for (file_idx, doc_results) in all_results.into_iter().enumerate() {
             let front_matter_body = input_sources
                 .get(file_idx)
-                .and_then(|(_, _, body)| body.as_ref());
+                .and_then(|(_, _, body, _)| body.as_ref());
             // Per-file `OutputConfig` (#978/#1398's `json_sourced_floats`,
             // #1493's `Auto` resolution) -- both need this specific
             // source's own `InputFormat`, not the invocation-wide default,
@@ -13769,7 +13793,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             // one invocation.
             let source_format = input_sources
                 .get(file_idx)
-                .map_or(InputFormat::Yaml, |(_, format, _)| *format);
+                .map_or(InputFormat::Yaml, |(_, format, _, _)| *format);
             let file_output_config = output_config.for_source(
                 &args,
                 output_basis_format(&args, &input_files, source_format),
@@ -14926,6 +14950,7 @@ mod tests {
                 sort_keys: false,
                 mark_json_sourced: false,
                 stop_at_error: false,
+                after_bom: false,
             },
         )
         .unwrap();
@@ -14947,6 +14972,7 @@ mod tests {
                 sort_keys: false,
                 mark_json_sourced: false,
                 stop_at_error: false,
+                after_bom: false,
             },
         )
         .unwrap();
@@ -15017,7 +15043,7 @@ mod tests {
     fn test_slurp_multi_doc_yaml() {
         // Test slurp behavior by parsing multi-doc YAML manually
         let yaml = b"---\nname: Alice\n---\nname: Bob\n---\nname: Charlie";
-        let inputs = parse_input(yaml, InputFormat::Yaml).unwrap();
+        let inputs = parse_input(yaml, InputFormat::Yaml, false).unwrap();
 
         // Multi-doc YAML should parse into 3 documents
         assert_eq!(inputs.len(), 3);
@@ -15061,7 +15087,7 @@ mod tests {
     fn test_slurp_with_length() {
         // Test that slurped docs can have length computed
         let yaml = b"---\nname: Alice\n---\nname: Bob\n---\nname: Charlie";
-        let inputs = parse_input(yaml, InputFormat::Yaml).unwrap();
+        let inputs = parse_input(yaml, InputFormat::Yaml, false).unwrap();
         let slurped = OwnedValue::array_from(inputs);
 
         let expr = succinctly::jq::parse("length").unwrap();
@@ -15076,7 +15102,7 @@ mod tests {
         // Test explicit key syntax with empty key
         // YAML: ?\n: value
         let yaml = b"?\n: value\n";
-        let inputs = parse_input(yaml, InputFormat::Yaml).unwrap();
+        let inputs = parse_input(yaml, InputFormat::Yaml, false).unwrap();
 
         assert_eq!(inputs.len(), 1);
         if let OwnedValue::Object(map) = &inputs[0] {
@@ -16726,6 +16752,7 @@ mod tests {
                     sort_keys: false,
                     mark_json_sourced: false,
                     stop_at_error: false,
+                    after_bom: false,
                 },
             )
             .unwrap();
@@ -16746,6 +16773,7 @@ mod tests {
                 sort_keys: false,
                 mark_json_sourced: false,
                 stop_at_error: false,
+                after_bom: false,
             },
         )
         .unwrap();
@@ -16840,6 +16868,7 @@ mod tests {
                     sort_keys: false,
                     mark_json_sourced: false,
                     stop_at_error: false,
+                    after_bom: false,
                 },
             )
             .unwrap();
@@ -16925,6 +16954,7 @@ mod tests {
                     sort_keys: false,
                     mark_json_sourced: false,
                     stop_at_error: false,
+                    after_bom: false,
                 },
             )
             .unwrap();
@@ -17029,6 +17059,7 @@ mod tests {
                     sort_keys: false,
                     mark_json_sourced: false,
                     stop_at_error: false,
+                    after_bom: false,
                 },
             )
             .unwrap();
