@@ -13475,8 +13475,8 @@ fn seq_stream_walked_as_plain_json_with(
 ) -> std::result::Result<Vec<u8>, NotPlain> {
     let mut sources = vec![(None, raw)];
     let mut warned = false;
-    let mut kept = keep_walk.is_some() && !slurp;
-    let mut walk = match keep_walk {
+    let kept = keep_walk.is_some() && !slurp;
+    let walk = match keep_walk {
         Some(collect_faults) if !slurp => {
             crate::jq_seq_reader::walk_stream_keeping(&sources, collect_faults, &mut |_| {
                 warned = true;
@@ -13485,18 +13485,28 @@ fn seq_stream_walked_as_plain_json_with(
         _ => crate::jq_seq_reader::walk_stream_values(&sources, slurp, &mut |_| warned = true),
     };
     // A walk that records faults goes on past jq's end-of-stream drop (#2998), where the one that
-    // does not stops, so the two differ on a stream that reaches it: the verdict is the stopping
-    // walk's, as it was before the walk was kept (#6620), and nothing is handed on.
-    if kept
-        && walk
-            .faults
-            .iter()
-            .any(|fault| fault.body == crate::jq_seq_reader::MESSAGELESS_RETURN)
-    {
-        warned = false;
-        walk = crate::jq_seq_reader::walk_stream_values(&sources, false, &mut |_| warned = true);
-        kept = false;
-    }
+    // does not stops. The verdict is the stopping walk's (it was before the walk was kept, #6620),
+    // which is this walk's up to the drop: the warnings met before it, and the values it had
+    // yielded (`values_before`). The stopping walk has no end-of-text warning to defer and no lost
+    // position without a warning before it. What is handed on is this whole walk, which is the one
+    // the reading route makes.
+    let drop = kept
+        .then(|| {
+            walk.faults
+                .iter()
+                .position(|fault| fault.body == crate::jq_seq_reader::MESSAGELESS_RETURN)
+        })
+        .flatten();
+    let (warned, deferred, position_lost, values_end) = match drop {
+        Some(at) => (at > 0, false, false, walk.faults[at].values_before),
+        None => (
+            warned,
+            walk.deferred_warning.is_some(),
+            walk.slurp_position_lost,
+            walk.values.len(),
+        ),
+    };
+    let values = &walk.values[..values_end];
     let Some((_, mut raw)) = sources.pop() else {
         return Err((Vec::new(), None)); // patchcov: coverage tolerate-line reason="unreachable: the one source pushed above"
     };
@@ -13507,11 +13517,7 @@ fn seq_stream_walked_as_plain_json_with(
             return Err(($raw, kept.then(|| Box::new($walk))))
         };
     }
-    if warned
-        || walk.deferred_warning.is_some()
-        || walk.slurp_position_lost
-        || walk.values.is_empty()
-    {
+    if warned || deferred || position_lost || values.is_empty() {
         not_plain!(raw, walk);
     }
     // `-s` wraps the values in one array, which is a level more than the deepest value has: a
@@ -13523,9 +13529,9 @@ fn seq_stream_walked_as_plain_json_with(
     // byte of the stream stands there: one inside a value would be a character of it.
     let separator = |&b: &u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | ASCII_RS);
     let gaps = (|| {
-        let mut gaps = Vec::with_capacity(walk.values.len() + 1);
+        let mut gaps = Vec::with_capacity(values.len() + 1);
         let mut at = 0;
-        for &(start, end) in &walk.values {
+        for &(start, end) in values {
             if start < at || end > raw.len() || !raw[at..start].iter().all(separator) {
                 return None;
             }
@@ -24502,9 +24508,9 @@ mod tests {
     }
 
     /// #6620: a `--seq` stream with a diagnostic is walked once, not by the clean check and again by
-    /// the route that reads it. A file is read once too. The shapes the handoff must decline keep
-    /// both walks: a slurp (a different walk), and a stream that reaches jq's end-of-stream drop (the
-    /// clean check's verdict is the stopping walk's, which the other walk is not).
+    /// the route that reads it. A file is read once too. A slurp keeps both walks (it is a different
+    /// walk), and a stream that reaches jq's end-of-stream drop is walked once like any other: its
+    /// verdict is read off the kept walk up to the drop.
     #[test]
     fn a_seq_stream_with_a_diagnostic_is_walked_once_6620() {
         use clap::Parser;
@@ -24549,8 +24555,8 @@ mod tests {
         assert_eq!(walks_made(faulty, &["-s"]), 2, "a slurp walks for itself");
         assert_eq!(
             walks_made(b"\x1e{\"name\":1}\n\x1e\x1etrue", &[]),
-            3,
-            "the end-of-stream drop is decided by the stopping walk, and nothing is handed on"
+            1,
+            "the end-of-stream drop's verdict is read off the kept walk"
         );
     }
 
@@ -24578,7 +24584,7 @@ mod tests {
     /// #6620: the walk the check keeps (one that records faults) gives the verdict the walk that
     /// stops at jq's end-of-stream drop gave, and is the walk the reading route would have made.
     /// The streams reach the drop, warnings, faults and clean shapes; the test fails with the
-    /// fallback to the stopping walk removed.
+    /// drop's truncation of the kept walk's warnings and values removed.
     #[test]
     fn the_kept_walk_decides_as_the_stopping_walk_did_6620() {
         let mut streams = random_seq_streams(20_000);
@@ -24587,8 +24593,21 @@ mod tests {
             b"\x1e\"a\"\x1e\"b\"".to_vec(),
             b"\x1e[1] \x1e{}".to_vec(),
             b"\x1e{\"a\":1}\x1e{\"a\":2}".to_vec(),
+            // The end-of-stream drop (#2998): an empty record in the final buffer ends the stopping
+            // walk, so what follows it is not read, and the stream is clean only when nothing does.
+            b"\x1e1\n\x1e\x1e2\n".to_vec(),
+            b"\x1e1\n\x1e\x1e".to_vec(),
+            b"\x1e{\"a\":1}\n\x1e\x1e{\"a\":2}".to_vec(),
+            b"\x1e{\"a\":1}\n\x1e\x1e{\"a\":2}\n".to_vec(),
+            b"\x1e1\n\x1e\x1e2 ".to_vec(),
+            b"\x1e\x1e1\n".to_vec(),
+            b"\x1e1\n\x1e\x1e\n".to_vec(),
+            // A warning before the drop makes the stream not clean whatever follows.
+            b"\x1e1\n\x1e2}\n\x1e\x1e3".to_vec(),
+            b"\x1e1\n\x1e}\n\x1e\x1e".to_vec(),
+            b"\x1e{\"a\":1}\n\x1etru\n\x1e\x1e".to_vec(),
         ]);
-        let (mut clean, mut kept, mut declined) = (0, 0, 0);
+        let (mut clean, mut kept, mut drops) = (0, 0, 0);
         for raw in streams {
             let stopping = seq_stream_as_plain_json_with(raw.clone(), false, None);
             let keeping = seq_stream_as_plain_json_with(raw.clone(), false, Some(true));
@@ -24600,11 +24619,15 @@ mod tests {
                 }
                 (Err((a, _)), Err((b, walk))) => {
                     assert_eq!(a, b, "{raw:?}");
-                    let Some(mut walk) = walk else {
-                        declined += 1;
-                        continue;
-                    };
+                    let mut walk = walk.expect("every walked stream hands its walk on");
                     kept += 1;
+                    // The streams that reach jq's end-of-stream drop: the walk goes past it, and
+                    // its verdict is the stopping walk's.
+                    drops += usize::from(
+                        walk.faults
+                            .iter()
+                            .any(|fault| fault.body == crate::jq_seq_reader::MESSAGELESS_RETURN),
+                    );
                     // The walk the reading route makes over the same bytes.
                     let sources = [(None, raw.clone())];
                     let mut fresh = crate::jq_seq_reader::walk_stream_collecting_at(
@@ -24636,8 +24659,8 @@ mod tests {
         assert!(clean >= 3, "{clean} clean streams");
         assert!(kept > 1_000, "{kept} streams handed on");
         assert!(
-            declined > 20,
-            "{declined} streams that hand nothing on (the drop)"
+            drops > 20,
+            "{drops} streams that reach the end-of-stream drop"
         );
     }
 
