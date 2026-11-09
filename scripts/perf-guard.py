@@ -298,6 +298,13 @@ QUERIES = [
     # is the `json-seq` pattern's records and one cut-off record after them, read as `-r .name`
     # (`QUERY_FLAGS`), so the time and, through the instruction count, the work are both watched.
     ("seq_name_bad_last", "json-seq-bad-last", "2mb", "jq", ".name"),
+    # #6620: the same stream read through the owned evaluator's other doors. `.name` is a path
+    # read, and `[.id,.name]` and `keys` were the programs no door answered (2.5 s against jq's
+    # 1.5 s over 100 MB on a 7950X, 0.59x and 0.72x) until #6739 made them doors: a change that
+    # sent either back through the re-index bridge reads about +80% here and nothing on any row
+    # above, which has no `--seq` row over a constructor or `keys`.
+    ("seq_array_bad_last", "json-seq-bad-last", "2mb", "jq", "[.id,.name]"),
+    ("seq_keys_bad_last", "json-seq-bad-last", "2mb", "jq", "keys"),
     # The mid-width shape: an array of equal objects of a few hundred keys,
     # where #4167's prefilter gate (128 keys) applies per object. -6.8% Ir
     # there, -0.85% on the same filter over 8-key objects (so no 8-key row:
@@ -321,6 +328,8 @@ QUERY_FLAGS = {
     "users_yq_raw_concat": ["-R"],
     "users_yq_raw_test": ["-R"],
     "seq_name_bad_last": ["--seq", "-r"],
+    "seq_array_bad_last": ["--seq", "-c"],
+    "seq_keys_bad_last": ["--seq", "-c"],
     # yq's lexer has no `keys_unsorted`, so yq mode needs the flag for it (#4808); its cost
     # is one boolean in the parser, nothing on the keys walk this row measures.
     "users_yq_keys_unsorted": ["--jq-extensions", "-o", "yaml"],
