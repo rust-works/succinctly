@@ -6999,7 +6999,7 @@ fn read_inputs(
     // #6730: so does a slurp by the streaming parser (`-s --stream`, `-s --stream-errors`): each file
     // that did not open is one more read of the stream, an empty one, and the fault a token left open
     // across files ends in comes with the read of the last, not of the first.
-    let failed_as_sources = (plain_stream_errors(args) && !args.slurp
+    let failed_as_sources = ((plain_stream_errors(args) && !args.slurp)
         || slurp_by_stream_parser(args))
         && !args.validate;
     let (files, mut raw_bytes): OpenedInputs = if let Some(bytes) = read_whole {
@@ -7406,7 +7406,10 @@ fn read_inputs(
     // so that a read of the array reaches it.
     if (seq_readers_place_reads
         || seq_slurp_defers_failures(args)
-        || (seq_by_stream_reader && args.slurp))
+        || (seq_by_stream_reader && args.slurp)
+        // #6724: `--validate` reads the files whole, so no failed file is a source of the stream
+        // before this one (`failed_as_sources`), and the last of them is pushed here.
+        || (args.validate && slurp_by_stream_parser(args)))
         && UNOPENED_TAIL_NAME.with(|tail| tail.borrow().is_some())
     {
         raw_bytes.push((Some(files.len()), Vec::new()));
@@ -7802,6 +7805,9 @@ fn read_inputs(
             // #6481: with a file that did not open after the last one that did, the call that
             // consumes the last byte is not the last call: jq's reader goes on to the missing
             // file, and the fault is met before the array closes, so it is the whole result.
+            // #6730: the failed file is a source of the read ([`slurp_by_stream_parser`]), so the
+            // reader places the fault itself: before the array's last call it is the whole result,
+            // and after it (behind a closing event the file before the failure held back) it is not.
             if args.slurp {
                 let deferred = crate::jq_stream_errors::read_for_deferred_slurp(&raw_bytes);
                 if deferred.before.is_empty() {

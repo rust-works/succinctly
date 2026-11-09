@@ -5,9 +5,9 @@
 //! back comes out in the read of the first, the fault in the read of the next, and the slurp loop
 //! closes its array at the last. So `ptr pa miss` has the closing event in its array and never meets
 //! the fault (jq's main loop reads no further once a file has failed), where `ptr pa miss miss2` has
-//! the fault in its array too; a program's `input` after the array reads the fault there (jq's main
+//! the fault in its array too (`-s --stream` says it as a parse error with nothing printed); a program's `input` after the array reads the fault there (jq's main
 //! loop does not). Every row was captured from jq 1.7.1; the rows of `ptr miss`,
-//! `pa ptr miss` and `ptr pa` do not move.
+//! `pa ptr miss`, `ptr pa`, `pa dir` and `ptr miss pa dir` do not move.
 
 use anyhow::Result;
 
@@ -36,6 +36,10 @@ fn a_token_left_open_across_files_meets_its_fault_at_the_read_jq_makes_it_in_673
         (&["-c", "-s", "--stream-errors", "[., input_filename]"][..], &["ptr", "pa", "miss", "miss2"][..], "[[[[0],1],[[1,0],1],[[1,0]],[\"Unfinished JSON term at EOF at line 1, column 6\",[1]]],\"@DIR@/miss2\"]\n", "jq: error: Could not open file @DIR@/miss: No such file or directory\njq: error: Could not open file @DIR@/miss2: No such file or directory\n", 2),
         (&["-c", "-s", "--stream-errors", "[., input_filename]"][..], &["ptr", "pa", "miss", "dir"][..], "[[[[0],1],[[1,0],1],[[1,0]],[\"Unfinished JSON term at EOF at line 1, column 6\",[1]]],\"@DIR@/dir\"]\n", "jq: error: Could not open file @DIR@/miss: No such file or directory\n", 2),
         (&["-c", "-s", "--stream-errors", "[., input_filename]"][..], &["ptr", "miss"][..], "[[[[0],1],[\"Unfinished JSON term at EOF at line 1, column 3\",[1]]],\"@DIR@/miss\"]\n", "jq: error: Could not open file @DIR@/miss: No such file or directory\n", 2),
+        (&["-c", "-s", "--stream", "[., input_filename]"][..], &["pa", "dir"][..], "[[[[0],1],[[0]]],\"@DIR@/dir\"]\n", "", 2),
+        (&["-c", "-s", "--stream-errors", "[., input_filename]"][..], &["pa", "dir"][..], "[[[[0],1],[[0]]],\"@DIR@/dir\"]\n", "", 2),
+        (&["-c", "-s", "--stream", "[., input_filename]"][..], &["ptr", "miss", "pa", "dir"][..], "[[[[0],1],[[1,0],1],[[1,0]]],\"@DIR@/dir\"]\n", "jq: error: Could not open file @DIR@/miss: No such file or directory\n", 2),
+        (&["-c", "-s", "--stream-errors", "[., input_filename]"][..], &["ptr", "miss", "pa", "dir"][..], "[[[[0],1],[[1,0],1],[[1,0]]],\"@DIR@/dir\"]\n", "jq: error: Could not open file @DIR@/miss: No such file or directory\n", 2),
         (&["-c", "-s", "--stream-errors", "[., input_filename]"][..], &["pa", "ptr", "miss"][..], "[[[[0],1],[[0]],[[0],1],[\"Unfinished JSON term at EOF at line 1, column 6\",[1]]],\"@DIR@/miss\"]\n", "jq: error: Could not open file @DIR@/miss: No such file or directory\n", 2),
         (&["-c", "-s", "--stream-errors", "[., input_filename]"][..], &["ptr", "pa"][..], "[[[[0],1],[[1,0],1]],\"@DIR@/pa\"]\n[[[1,0]],null]\n[[\"Unfinished JSON term at EOF at line 1, column 6\",[1]],null]\n", "", 0),
     ];
