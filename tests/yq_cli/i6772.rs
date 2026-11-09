@@ -145,6 +145,14 @@ fn test_yq_head_comment_keeps_the_blank_lines_and_joins_a_leading_marker_6772() 
         ("# c\n\n\"s\"\n", "head_comment", "\"c\\n\"\n"),
         ("# c\n\n\"s\"\n", ".. | head_comment", "\"c\\n\"\n"),
         ("# c\n\n\"s\"\n", ".a | key | head_comment", ""),
+        // A scalar item's `- # c` comment goes after the block above it, blank lines counted.
+        (
+            "k: 1\nm:\n  # a\n\n  # b\n  - # d\n    x\n",
+            ".m[0] | head_comment",
+            "\"a\\n\\nb\\nd\"\n",
+        ),
+        ("---\n# d\n- # e\n  x\n", ".[0] | head_comment", "\"e\"\n"),
+        ("---\n# d\n- # e\n  x\n", "head_comment", "\"d\"\n"),
     ] {
         let (stdout, code) = run_yq_stdin(filter, doc, &["-o=json", "-I=0"])?;
         assert_eq!((stdout.as_str(), code), (want, 0), "{doc:?}: {filter}");

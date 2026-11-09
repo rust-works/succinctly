@@ -8237,28 +8237,34 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
             Some(rest) => rest.to_string(),
             None => line,
         };
+        let mut header_lines: Option<Vec<String>> = None;
         if in_header && header_has_marker(&self.text[..header_end]) {
             // The block belongs to the document: the first key the comment under the marker was
             // indexed on has none of its own (`.a | key | head_comment` is `""` in yq).
-            if !self.is_first_document_content() {
-                return Vec::new();
-            }
-            if let Some(lines) = header_head_lines(
-                &self.text[..header_end],
-                self.index.synthesized_empty(),
-                true,
-            ) {
-                return lines.into_iter().map(strip).collect();
-            }
+            header_lines = if self.is_first_document_content() {
+                header_head_lines(
+                    &self.text[..header_end],
+                    self.index.synthesized_empty(),
+                    true,
+                )
+                .map(|lines| lines.into_iter().map(strip).collect())
+            } else {
+                Some(Vec::new())
+            };
         }
-        let mut lines: Vec<String> = <Self as DocumentCursor>::head_comment_raw(self)
-            .into_iter()
-            .map(strip)
-            .collect();
+        let from_header = header_lines.is_some();
+        let mut lines: Vec<String> = match header_lines {
+            Some(lines) => lines,
+            None => <Self as DocumentCursor>::head_comment_raw(self)
+                .into_iter()
+                .map(strip)
+                .collect(),
+        };
         // The blank entries after the block stand for blank lines between it and the node. A
         // floated comment (`- # c` before the key, #1079) has other lines there (`!!str`, the next
         // dash), which are not blanks.
-        if let (Some(&(_, last_end)), Some(pos)) = (
+        if let (false, Some(&(_, last_end)), Some(pos)) = (
+            from_header,
             self.index.get_head_comments(self.bp_pos).last(),
             self.text_position(),
         ) {
@@ -8295,7 +8301,25 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
                     .iter()
                     .filter(|&&(at, _)| (at as usize) < start)
                     .count();
-                lines.insert(before.min(lines.len()), comment.to_string());
+                // `lines` holds blank entries between the comment lines, which `before` (a count of
+                // comment ranges) does not: the dash comment goes after that many comment lines.
+                let mut at = 0;
+                let mut seen = 0;
+                if before > 0 {
+                    for (i, line) in lines.iter().enumerate() {
+                        if !line.is_empty() {
+                            seen += 1;
+                            if seen == before {
+                                at = i + 1;
+                                break;
+                            }
+                        }
+                    }
+                    if seen < before {
+                        at = lines.len();
+                    }
+                }
+                lines.insert(at, comment.to_string());
             }
         }
         lines
