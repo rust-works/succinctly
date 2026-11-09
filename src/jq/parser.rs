@@ -1675,6 +1675,56 @@ const META_OP_KEYWORDS: &[(&str, MetaSlot)] = &[
 /// source (no jq identifier starts with `%`), so it cannot capture or shadow a user's.
 const VALUE_ARG_VAR: &str = "%arg";
 
+/// Whether a `,` sits in the flat stages of `expr`: a comma itself, or a stage of a pipe, a
+/// parenthesis or the body of an `as` binding. A comma inside a construction (`[a, b]`) or a call's
+/// argument is its own context, which no walk over a list reaches (#6770).
+fn has_flat_union(expr: &Expr) -> bool {
+    match expr {
+        Expr::Comma(_) => true,
+        Expr::Paren(inner) => has_flat_union(inner),
+        Expr::Pipe(stages) => stages.iter().any(has_flat_union),
+        Expr::As { body, .. } => has_flat_union(body),
+        _ => false,
+    }
+}
+
+/// #6770: yq's `map(f)` splats its node and runs `f` once over the whole list of members
+/// (`mapOperator`, `GetMatchingNodes(splatted, RHS)`), so a union in `f` runs each branch over every
+/// member before the next branch: `map(.a, .b)` is every `.a`, then every `.b`. That is the walk
+/// `[.[] | f]` already takes (the context-list model, `eval_yq_context_pipe`), so a union-bodied
+/// `map` over a sequence or a non-empty mapping is written that way. A scalar (`5 | map(f)` is `5`),
+/// `null` and an empty mapping (#5918) keep the `map` arm, which never runs `f` on them.
+fn yq_map_union_body_over_the_list(call: Expr) -> Expr {
+    let Expr::Builtin(Builtin::Map(body)) = &call else {
+        return call;
+    };
+    if !has_flat_union(body) {
+        return call;
+    }
+    let kind_is = |name: &str| Expr::Compare {
+        op: CompareOp::Eq,
+        left: Box::new(Expr::Builtin(Builtin::Kind)),
+        right: Box::new(Expr::Literal(Literal::String(name.into()))),
+    };
+    let non_empty_mapping = Expr::And(
+        Box::new(kind_is("map")),
+        Box::new(Expr::Compare {
+            op: CompareOp::Gt,
+            left: Box::new(Expr::Builtin(Builtin::Length)),
+            right: Box::new(Expr::Literal(Literal::Int(0))),
+        }),
+    );
+    let over_the_list = Expr::array(Expr::pipe(vec![Expr::Iterate, (**body).clone()]));
+    Expr::If {
+        cond: Box::new(Expr::Or(
+            Box::new(kind_is("seq")),
+            Box::new(non_empty_mapping),
+        )),
+        then_branch: Box::new(over_the_list),
+        else_branch: Box::new(call),
+    }
+}
+
 /// `B(K)` as jq runs it, `K as $v | B($v)`, when `K` holds a `?//` bind (#3487).
 ///
 /// jq evaluates a builtin's argument as a backtracking sub-expression, so a failure raised
@@ -4774,6 +4824,10 @@ impl<'a> Parser<'a> {
                                 // leave that call as written.
                                 if shadow_candidate {
                                     Expr::Builtin(builtin)
+                                } else if self.mode == ParserMode::Yq {
+                                    yq_map_union_body_over_the_list(bind_retrying_value_arg(
+                                        builtin,
+                                    ))
                                 } else {
                                     bind_retrying_value_arg(builtin)
                                 },

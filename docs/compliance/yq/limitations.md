@@ -4979,6 +4979,12 @@ mode decides; `succinctly jq` keeps jq's model unchanged):
    loops the left operand's matches outermost and re-evaluates the right operand inside
    that loop, so `(.a.c, .b.c) + (1, 10)` is `4 13 6 15` where jq gives `4 6 13 15`.
 
+`map(f)` takes rule 1 too ([#6770](https://github.com/rust-works/succinctly/issues/6770)).
+yq's `mapOperator` splats the node and runs `f` once over the whole list of members, so `map(. + 1, . + 2)` over `[1, 2, 3]` is `[2, 3, 4, 3, 4, 5]`.
+`succinctly yq` writes a union-bodied `map` over a sequence or a non-empty mapping as `[.[] | f]`, which the context-list walk answers that way.
+A scalar, `null` and an empty mapping keep the `map` arm, and `succinctly jq` still runs the body per member.
+Two shapes still interleave: a union-bodied `map` on the right of `|=`, and a body that reads its own path or key (`map(path, key)`), which the plain pipe `[.[] | (path, key)]` shares.
+
 Four related divergences are **not** covered and stay open:
 
 - **`EvaluateTogether`** ([#2427](https://github.com/rust-works/succinctly/issues/2427)) is
