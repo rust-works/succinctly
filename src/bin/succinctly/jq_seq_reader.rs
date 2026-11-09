@@ -412,6 +412,25 @@ pub(crate) fn walk_stream_values(
     )
 }
 
+/// [`walk_stream_values`] for a non-slurped stream whose caller may hand the walk on to the reader
+/// that places values and queues faults (#6620): it records faults when `collect_faults` is set, as
+/// [`walk_stream_collecting`] does, and leaves the values unplaced for [`SeqStreamWalk::place_values`].
+/// A stream with one source that opened, so the tail is [`Tail::Opened`].
+pub(crate) fn walk_stream_keeping(
+    raw_bytes: &[(Option<usize>, Vec<u8>)],
+    collect_faults: bool,
+    emit: &mut dyn FnMut(&str),
+) -> SeqStreamWalk {
+    walk_stream_placing(
+        raw_bytes,
+        false,
+        collect_faults,
+        false,
+        Tail::Opened,
+        &mut |warning, _| emit(warning),
+    )
+}
+
 /// The guards of [`plain_record_sequence`], as data so that a test can drop one and show the
 /// check unsound without it (#6501). Each closes one way for a stream of valid records to still
 /// not be clean; the shipped check has all three ([`PlainGuards::ALL`]).
@@ -508,6 +527,25 @@ impl Tail {
     }
 }
 
+/// Test-only count of the walks made on this thread, so that a test can pin how many a run makes
+/// (#6620).
+#[cfg(test)]
+pub(crate) mod walks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static MADE: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn bump() {
+        MADE.with(|n| n.set(n.get() + 1));
+    }
+
+    pub(crate) fn made() -> usize {
+        MADE.with(Cell::get)
+    }
+}
+
 fn walk_stream_placing(
     raw_bytes: &[(Option<usize>, Vec<u8>)],
     slurp: bool,
@@ -516,6 +554,8 @@ fn walk_stream_placing(
     tail: Tail,
     emit: &mut dyn FnMut(&str, usize),
 ) -> SeqStreamWalk {
+    #[cfg(test)]
+    walks::bump();
     let bom = bom_prefix(raw_bytes);
     let mut reader = Reader::new(bom, emit);
     reader.collect_faults = collect_faults;
@@ -598,19 +638,35 @@ fn walk_stream_placing(
     } else {
         Vec::new()
     };
+    // Only non-slurp output names a location per value; `-s` would throw this pass away.
+    let (locations, unplaced) = if slurp {
+        (Vec::new(), Vec::new())
+    } else if place_values {
+        debug_assert_eq!(reader.yielded_at.len(), reader.values.len());
+        (value_locations(raw_bytes, &reader.yielded_at), Vec::new())
+    } else {
+        // Kept, so a caller that finds it needs them after all places them without a second walk
+        // ([`SeqStreamWalk::place_values`], #6620).
+        (Vec::new(), std::mem::take(&mut reader.yielded_at))
+    };
     SeqStreamWalk {
         faults,
         slurp_position_lost,
-        // Only non-slurp output names a location per value; `-s` would throw
-        // this pass away.
-        locations: if slurp || !place_values {
-            Vec::new()
-        } else {
-            debug_assert_eq!(reader.yielded_at.len(), reader.values.len());
-            value_locations(raw_bytes, &reader.yielded_at)
-        },
+        locations,
+        unplaced,
         deferred_warning,
         values: reader.values,
+    }
+}
+
+impl SeqStreamWalk {
+    /// The locations a walk made with `place_values` off would have returned (#6620): the walk is
+    /// not repeated, only the pass over the stream's `fgets` chunks that places each value. A no-op
+    /// on a walk that placed them, or that is slurped (which names no location per value).
+    pub(crate) fn place_values(&mut self, raw_bytes: &[(Option<usize>, Vec<u8>)]) {
+        if !self.unplaced.is_empty() {
+            self.locations = value_locations(raw_bytes, &std::mem::take(&mut self.unplaced));
+        }
     }
 }
 
@@ -636,6 +692,9 @@ pub(crate) struct SeqFault {
 /// `-s`'s location come back here -- so a caller that needs several of them
 /// pays for the walk once.
 pub(crate) struct SeqStreamWalk {
+    /// Where the reader yielded each value, when the walk was asked not to place them
+    /// ([`walk_stream_keeping`]); [`Self::place_values`] turns it into [`Self::locations`].
+    unplaced: Vec<usize>,
     /// Every diagnostic the walk reported, in order, when [`walk_stream_collecting`] was asked
     /// to record them (#5640); empty otherwise.
     pub(crate) faults: Vec<SeqFault>,

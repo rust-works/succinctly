@@ -17,7 +17,7 @@ counted.
 
 Usage:
   cargo build --release --features cli
-  ./scripts/jq-seq-door-sweep.py [--seed N] [--cases N] [--base BASE] [--oracle JQ] [binary]
+  ./scripts/jq-seq-door-sweep.py [--seed N] [--cases N] [--base BASE] [--oracle JQ] [--file] [binary]
 
 Exits non-zero when a regression is found (or, without `--base`, when any case differs from jq).
 """
@@ -97,18 +97,29 @@ def resolve_oracle(given):
     sys.exit("error: no jq 1.7.1 found; pass --oracle")
 
 
-def run(argv, data):
-    # stdin from a file, never a pipe (see jq-seq-oracle-sweep.py).
+def run(argv, data, as_file=False):
+    # stdin from a file, never a pipe (see jq-seq-oracle-sweep.py). `as_file` names the file as an
+    # argument instead, which is the other route a stream reaches the reader by (#6620).
     with tempfile.NamedTemporaryFile(delete=False) as handle:
         handle.write(data)
         path = handle.name
     try:
         with open(path, "rb") as stdin:
             try:
-                done = subprocess.run(argv, stdin=stdin, capture_output=True, timeout=30)
+                done = subprocess.run(
+                    argv + [path] if as_file else argv,
+                    stdin=subprocess.DEVNULL if as_file else stdin,
+                    capture_output=True,
+                    timeout=30,
+                )
             except subprocess.TimeoutExpired:
                 return ("timeout", b"", b"")
-        return (done.returncode, done.stdout, done.stderr)
+        out, err = done.stdout, done.stderr
+        if as_file:
+            # The file's name is in a diagnostic or `input_filename`; make it comparable.
+            err = err.replace(path.encode(), b"<file>")
+            out = out.replace(path.encode(), b"<file>")
+        return (done.returncode, out, err)
     finally:
         os.unlink(path)
 
@@ -138,15 +149,16 @@ def main():
     parser.add_argument("--cases", type=int, default=3000)
     parser.add_argument("--oracle")
     parser.add_argument("--jobs", type=int, default=4)
+    parser.add_argument("--file", action="store_true", help="give each stream as a file argument, not on stdin")
     args = parser.parse_args()
     jq = resolve_oracle(args.oracle)
 
     def one(case):
         program, flags, stream = case
         argv = flags + ["--seq", program]
-        want = run([jq] + argv, stream)
-        got = run([args.binary, "jq"] + argv, stream)
-        before = run([args.base, "jq"] + argv, stream) if args.base else None
+        want = run([jq] + argv, stream, args.file)
+        got = run([args.binary, "jq"] + argv, stream, args.file)
+        before = run([args.base, "jq"] + argv, stream, args.file) if args.base else None
         return case, want, got, before
 
     tally = collections.Counter()
