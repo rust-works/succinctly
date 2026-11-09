@@ -4774,7 +4774,7 @@ fn propagate_assign_alias_marks(
             (0, Some(pristine)) => pristine,
             _ => tree,
         };
-        let source = nav_node(reading, value_expr)
+        let source = last_read_node(reading, value_expr)
             .filter(|node| contains_alias_mark(node))
             .cloned();
         // A construction of static reads (`.c = [.b]`, `.c = {"z": .b}`) is a node of its own whose
@@ -4893,6 +4893,36 @@ fn propagate_compound_alias_mark(
     }
     if let Some(node) = comment_tree_at_path_or_create_mut(tree, &at) {
         node.meta_mut().anchor = source.anchor_mark().cloned();
+    }
+}
+
+/// The node an assignment's right side leaves in its target, when it is static navigation or a
+/// comma of it: a target takes each result in turn, so the last member that names a node wins
+/// and one that names none (a key the tree lacks) is skipped (`.c = (.a, .b)` keeps `.b`'s alias,
+/// #5249). `None` for a comma with a member that is not static navigation.
+fn last_read_node<'t>(node: &'t CommentTree, expr: &Expr) -> Option<&'t CommentTree> {
+    match expr {
+        Expr::Paren(inner) => last_read_node(node, inner),
+        Expr::Comma(items) => items.iter().rev().find_map(|item| {
+            match last_read_node(node, item) {
+                Some(found) => Some(Some(found)),
+                // An absent static read yields nothing; anything else is not known.
+                None if is_static_read(item) => None,
+                None => Some(None),
+            }
+        })?,
+        _ => nav_node(node, expr),
+    }
+}
+
+/// Whether `expr` is static navigation, or a comma or parenthesis of it.
+fn is_static_read(expr: &Expr) -> bool {
+    match expr {
+        Expr::Paren(inner) => is_static_read(inner),
+        Expr::Comma(items) => items.iter().all(is_static_read),
+        // `nav_node` also reads a negative index, which `static_nav_steps` declines.
+        Expr::Index { .. } => true,
+        _ => static_nav_steps(expr).is_some(),
     }
 }
 
