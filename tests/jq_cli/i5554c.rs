@@ -121,15 +121,16 @@ fn the_rows_answer_on_the_document_route_too_5554() -> Result<()> {
 #[test]
 fn a_walk_past_the_native_stack_floor_refuses_at_exit_5_5554() -> Result<()> {
     for filter in [
-        // The re-index bridge, and a walk of its own.
-        format!("{PAST_THE_FLOOR} | [., 1] | length"),
+        // The re-index bridge (a generator element keeps it: `[., 1]` is answered off the tree,
+        // #6620), and a walk of its own.
+        format!("{PAST_THE_FLOOR} | [., (1, 2)] | length"),
         format!("{PAST_THE_FLOOR} | flatten"),
         // A splice site's panicking guard, caught by #5526's net.
         format!("{PAST_THE_FLOOR} as $v | reduce $v as $x (0; if $x then 1 else 2 end)"),
         // A resource limit (#2132's table, #3261's row): no spelling of `try` absorbs it.
         format!("try ({PAST_THE_FLOOR} | flatten) catch 0"),
-        format!("[{PAST_THE_FLOOR} | [., 1]?] | length"),
-        format!("[try ({PAST_THE_FLOOR} | [., 1])] | length"),
+        format!("[{PAST_THE_FLOOR} | [., (1, 2)]?] | length"),
+        format!("[try ({PAST_THE_FLOOR} | [., (1, 2)])] | length"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-nc", &filter], None)?;
         assert_eq!(code, 5, "{filter}: {stderr}");
@@ -144,6 +145,9 @@ fn a_walk_past_the_native_stack_floor_refuses_at_exit_5_5554() -> Result<()> {
     for (filter, want) in [
         (format!("{PAST_THE_FLOOR} | tojson | length"), "533\n"),
         (format!("{PAST_THE_FLOOR} | length"), "1\n"),
+        // #6620: and a constructor of reads builds from the tree without walking the value it holds.
+        (format!("{PAST_THE_FLOOR} | [., 1] | length"), "2\n"),
+        (format!("{PAST_THE_FLOOR} | [., .] | length"), "2\n"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-nc", &filter], None)?;
         assert_eq!(
