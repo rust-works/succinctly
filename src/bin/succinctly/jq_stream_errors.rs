@@ -214,6 +214,9 @@ pub(crate) struct ChunkedSources {
     /// The chunk handed out last ended at a newline or filled the buffer, so it is not yet known
     /// whether it was the end of `current`.
     unsettled: bool,
+    /// The unsettled chunk filled the buffer with no newline: if it was the end of its source,
+    /// jq's next `fgets` of it returns nothing, a refill of its own (#6760).
+    unsettled_full: bool,
     last: Option<(usize, bool)>,
     closed: bool,
     error: Option<std::io::Error>,
@@ -232,6 +235,7 @@ impl ChunkedSources {
             current: None,
             source: 0,
             unsettled: false,
+            unsettled_full: false,
             last: None,
             closed: false,
             error: None,
@@ -326,17 +330,35 @@ impl RefillSource for ChunkedSources {
                 self.unsettled = false;
                 // Whether the last chunk ended its source is found now, by the first read of the
                 // next one.
+                let mut clean_eof = false;
                 let ended = match reader.fill_buf() {
-                    Ok(available) => available.is_empty(),
+                    Ok(available) => {
+                        clean_eof = available.is_empty();
+                        clean_eof
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => false,
                     Err(e) => {
                         self.fail(e);
                         true
                     }
                 };
+                let filled = core::mem::take(&mut self.unsettled_full);
                 if ended {
                     self.current = None;
                     self.source += 1;
+                    // Only at the end of the file: a read error is not an empty read.
+                    if filled && clean_eof && !last_source {
+                        // jq's `fgets` filled its buffer and has not seen the end of the file, so
+                        // it reads once more, gets nothing, and a closing event the file held
+                        // back comes out in this file (#6760).
+                        buf.clear();
+                        self.last = Some((source, false));
+                        return Some(Refill {
+                            source,
+                            newline: false,
+                            is_last: false,
+                        });
+                    }
                     continue;
                 }
             }
@@ -364,6 +386,7 @@ impl RefillSource for ChunkedSources {
                 self.source += 1;
             } else {
                 self.unsettled = true;
+                self.unsettled_full = end == ChunkEnd::Full;
             }
             if !newline {
                 // The parser sees a chunk with no newline up to its first NUL (`strlen`).
@@ -423,6 +446,9 @@ struct RefillCursor {
     /// empty closing refill follows.
     last: Option<(usize, bool)>,
     closed: bool,
+    /// The source whose last chunk filled the buffer with no newline, so that jq's next `fgets` of
+    /// it returns nothing, a refill of its own that is not the last (#6760).
+    empty_after: Option<usize>,
 }
 
 /// A refill of the in-memory sources, with its bytes borrowed from them.
@@ -435,6 +461,15 @@ struct CursorRefill<'a> {
 
 impl RefillCursor {
     fn next<'a>(&mut self, sources: &'a [(Option<usize>, Vec<u8>)]) -> Option<CursorRefill<'a>> {
+        if let Some(source) = self.empty_after.take() {
+            self.last = Some((source, false));
+            return Some(CursorRefill {
+                source,
+                bytes: &[],
+                newline: false,
+                is_last: false,
+            });
+        }
         while let Some((_, raw)) = sources.get(self.source) {
             let last_source = self.source + 1 == sources.len();
             let source = self.source;
@@ -470,6 +505,9 @@ impl RefillCursor {
             };
             let is_last = last_source && at_end && hit_eof;
             self.last = Some((source, is_last));
+            if at_end && !last_source && !newline && len == JQ_FGETS_CHUNK {
+                self.empty_after = Some(source);
+            }
             return Some(CursorRefill {
                 source,
                 bytes,
@@ -1892,7 +1930,17 @@ mod tests {
         let long_line = format!("[{}1]\n[2]\n", "1,".repeat(3000));
         let exact: String = format!("[{}]\n{{\"a\":1}}\n", "1".repeat(4095 - 3)); // 4095-byte first line
         let one_over: String = format!("[{}]\n7", "1".repeat(4096 - 3));
+        // #6760: a source whose last read fills the buffer with no newline, one that ends in a
+        // NUL at the buffer's edge, and each followed by another source or by none.
+        let full: String = format!("[{}]", "1".repeat(4095 - 2));
+        let full_nul: String = format!("[{}\u{0}", "1".repeat(4095 - 2));
         let streams: Vec<Vec<&str>> = vec![
+            vec![&full],
+            vec![&full, "[2]"],
+            vec![&full, "", "[2]"],
+            vec!["[1]\n", &full, "}\n", "[3"],
+            vec![&full_nul, "[2]"],
+            vec![&full, &full, "7"],
             vec![""],
             vec!["1"],
             vec!["[1,2]"],
@@ -2487,6 +2535,11 @@ mod tests {
                     newline,
                     last_source && k + 1 == lens.len() && hit_eof,
                 ));
+                // #6760: a last chunk that filled the buffer is followed by a read that returns
+                // nothing, in the same source.
+                if !last_source && k + 1 == lens.len() && !newline && len == JQ_FGETS_CHUNK {
+                    refills.push((index, Vec::new(), false, false));
+                }
             }
         }
         if let Some(last) = refills.last() {
@@ -2518,6 +2571,7 @@ mod tests {
             b"a\0b".to_vec(),
             long(JQ_FGETS_CHUNK - 1, b"\n"),
             long(JQ_FGETS_CHUNK, b""),
+            long(JQ_FGETS_CHUNK - 1, b"\0"),
             long(JQ_FGETS_CHUNK, b"\n"),
             long(JQ_FGETS_CHUNK + 1, b""),
             long(2 * JQ_FGETS_CHUNK, b"\nx"),
