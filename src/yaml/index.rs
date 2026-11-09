@@ -128,6 +128,9 @@ pub struct YamlIndex<W = Vec<u64>> {
     /// branch per node instead of two map probes (measured +2% median,
     /// +5% on sequences, before this gate).
     has_standalone_comments: bool,
+    /// Whether any node carries a trailing same-line comment, settled when the index is built
+    /// (#6737).
+    has_line_comments: bool,
     /// The leading header's byte length (#2795; see
     /// `light.rs`'s `yq_header_len`), measured once on first use since every
     /// standalone-comment write site consults it to keep a comment the
@@ -250,6 +253,7 @@ impl YamlIndex<Vec<u64>> {
                 .comments
                 .values()
                 .any(|c| !c.head.is_empty() || !c.foot.is_empty()),
+            has_line_comments: semi.comments.values().any(|c| !c.line.is_empty()),
             comments: semi.comments,
             lines: OnceCell::new(),
             canonicalize_numbers: false,
@@ -327,6 +331,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             // given an explicit parameter then.
             comments: BTreeMap::new(),
             has_standalone_comments: false,
+            has_line_comments: false,
             lines: OnceCell::new(),
             canonicalize_numbers: false,
             header_doc_markers: true,
@@ -734,11 +739,11 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
 
     /// Whether any node carries a trailing same-line comment (#6737): `false` is a proof that no
     /// comment is written after a value on its line, so a writer may end a literal block on the
-    /// value's last line. A scan of the comment table, so a caller asks it only where a block is
-    /// in question.
+    /// value's last line. Settled when the index is built, so a caller may ask it for every scalar.
+    #[inline]
     #[must_use]
     pub fn has_line_comments(&self) -> bool {
-        self.comments.values().any(|c| !c.line.is_empty())
+        self.has_line_comments
     }
 
     /// Get the raw trailing-comment byte range(s) for a BP position, if the

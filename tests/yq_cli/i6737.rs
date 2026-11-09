@@ -85,3 +85,41 @@ fn test_a_plain_scalar_yq_quotes_or_blocks_is_written_as_yq_writes_it_6737() -> 
     }
     Ok(())
 }
+
+/// Rows of the same families that agree with yq (an anchor and a tag on the folded scalar, a wider indent,
+/// a sibling flow collection), and the ones that keep the quoted spelling because the document has a
+/// trailing same-line comment, where yq writes the comment on the block's header
+/// (`docs/compliance/yq/limitations.md`): the second list is succinctly yq's own answer, not yq's.
+#[test]
+fn test_a_folded_plain_scalar_next_to_other_shapes_and_comments_6737() -> Result<()> {
+    for (input, extra, expected) in [
+        ("k: &a x\n\n  y\n", &[][..], "k: &a |-\n  x\n  y\n"),
+        ("k: !!str x\n\n  y\n", &[][..], "k: !!str |-\n  x\n  y\n"),
+        (
+            "k:\n  n: x\n\n    y\n",
+            &["-I4"][..],
+            "k:\n    n: |-\n        x\n        y\n",
+        ),
+        ("- - x\n\n    y\n", &["-I4"][..], "- - |-\n    x\n    y\n"),
+        (
+            "k: [a, b]\nm: x\n\n  y\n",
+            &[][..],
+            "k: [a, b]\nm: |-\n  x\n  y\n",
+        ),
+        ("k: a\n  b # c\nz: 1\n", &[][..], "k: a b # c\nz: 1\n"),
+    ] {
+        let (output, exit_code) = run_yq_stdin(".", input, extra)?;
+        assert_eq!(exit_code, 0, "{input:?} {extra:?}");
+        assert_eq!(output, expected, "{input:?} {extra:?}");
+    }
+    for (input, expected) in [
+        ("a: x\n\n  y\nb: 1 # c\n", "a: \"x\\ny\"\nb: 1 # c\n"),
+        ("k: # c\n  a\n\n  b\n", "k: \"a\\nb\" # c\n"),
+        ("k: a\n\n  b # c\n", "k: \"a\\nb\" # c\n"),
+    ] {
+        let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+        assert_eq!(exit_code, 0, "{input:?}");
+        assert_eq!(output, expected, "{input:?}");
+    }
+    Ok(())
+}

@@ -1688,8 +1688,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 // (`|- # c`). Head and foot comments are written on lines of their own and stay.
                 let block = block.filter(|_| {
                     !(matches!(s, YamlString::Unquoted { .. })
+                        && self.index.has_line_comments()
                         && s.raw_bytes().contains(&b'\n')
-                        && self.index.has_line_comments())
+                        && s.as_str().is_ok_and(|text| text.contains('\n')))
                 });
                 stream_yaml_string_value(
                     out,
@@ -11114,8 +11115,9 @@ fn stream_yaml_string_value<Out: core::fmt::Write>(
             // #6737: a plain scalar the source folded across blank lines holds line breaks, which
             // go-yaml's emitter spells as a literal block in block context (`|-`), where the
             // fallback below would write one double-quoted line with `\n` escapes.
-            if let Some(scalar) =
-                block.and_then(|(indent, step)| go_yaml_multiline_scalar(&str_val, indent, step))
+            if let Some(scalar) = block
+                .filter(|_| s.raw_bytes().contains(&b'\n'))
+                .and_then(|(indent, step)| go_yaml_multiline_scalar(&str_val, indent, step))
             {
                 return Ok(out.write_str(&scalar)?);
             }
