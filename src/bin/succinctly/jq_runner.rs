@@ -7379,7 +7379,9 @@ fn read_inputs(
     let mut seq_warned = false;
     // The raw walk's value ranges (`jq_seq_reader::SeqStreamWalk::values`,
     // #3247): the same pass that decides jq's warnings decides its values,
-    // over the same raw bytes, already cut at #2998's end-of-stream drop.
+    // over the same raw bytes, cut at #2998's end-of-stream drop when the walk records no faults
+    // (a walk that does, as the queue's reads and the clean check's handed-on one do, goes past it
+    // and holds the message-less fault there instead).
     // Empty for #1525's no-RS-byte stream, where nothing ever leaves
     // `WAITING_FOR_RS`: the warning arm runs no walk, and under `-n` the walk
     // finds no value but records the `Unfinished abandoned text` fault `input` raises
@@ -24584,7 +24586,8 @@ mod tests {
     /// #6620: the walk the check keeps (one that records faults) gives the verdict the walk that
     /// stops at jq's end-of-stream drop gave, and is the walk the reading route would have made.
     /// The streams reach the drop, warnings, faults and clean shapes; the test fails with the
-    /// drop's truncation of the kept walk's warnings and values removed.
+    /// drop's truncation of the kept walk's values removed (its warnings half is subsumed by the
+    /// gap check, so no stream pins it alone).
     #[test]
     fn the_kept_walk_decides_as_the_stopping_walk_did_6620() {
         let mut streams = random_seq_streams(20_000);
@@ -24602,11 +24605,33 @@ mod tests {
             b"\x1e1\n\x1e\x1e2 ".to_vec(),
             b"\x1e\x1e1\n".to_vec(),
             b"\x1e1\n\x1e\x1e\n".to_vec(),
-            // A warning before the drop makes the stream not clean whatever follows.
+            // A warning before the drop makes the stream not clean whatever follows. (The gap check
+            // rejects such a stream too, since a warning leaves junk in a gap, so the `at > 0` term of
+            // the rule is defence in depth: no stream tells it from `false`.)
             b"\x1e1\n\x1e2}\n\x1e\x1e3".to_vec(),
             b"\x1e1\n\x1e}\n\x1e\x1e".to_vec(),
             b"\x1e{\"a\":1}\n\x1etru\n\x1e\x1e".to_vec(),
         ]);
+        // The final-buffer boundaries of jq's `fgets` (4095-byte chunks): records padded to sizes on
+        // both sides of 4094, 4095, 4096 and 8190 bytes, ending in a drop, a warning or neither.
+        for target in [4093, 4094, 4095, 4096, 4097, 8189, 8190, 8191, 8192] {
+            for tail in [&b"\x1e\x1e2"[..], b"\x1e\x1e", b"\x1e}", b"\x1e[1]\n"] {
+                let mut raw = b"\x1e1\n".to_vec();
+                while raw.len() + tail.len() < target {
+                    raw.push(b' ');
+                }
+                raw.extend_from_slice(tail);
+                streams.push(raw.clone());
+                // The same stream with a newline-free padding before the tail, and one with a line
+                // break every 100 bytes, so the final buffer starts in different places.
+                let mut broken = b"\x1e1\n".to_vec();
+                while broken.len() + tail.len() < target {
+                    broken.push(if broken.len() % 100 == 0 { b'\n' } else { b' ' });
+                }
+                broken.extend_from_slice(tail);
+                streams.push(broken);
+            }
+        }
         let (mut clean, mut kept, mut drops) = (0, 0, 0);
         for raw in streams {
             let stopping = seq_stream_as_plain_json_with(raw.clone(), false, None);
