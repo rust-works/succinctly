@@ -732,6 +732,15 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         !self.comments.is_empty()
     }
 
+    /// Whether any node carries a trailing same-line comment (#6737): `false` is a proof that no
+    /// comment is written after a value on its line, so a writer may end a literal block on the
+    /// value's last line. A scan of the comment table, so a caller asks it only where a block is
+    /// in question.
+    #[must_use]
+    pub fn has_line_comments(&self) -> bool {
+        self.comments.values().any(|c| !c.line.is_empty())
+    }
+
     /// Get the raw trailing-comment byte range(s) for a BP position, if the
     /// node at that position has any same-line comment (issue #710).
     /// Usually zero or one entry; a mapping key can hold two (#1085) -- a

@@ -1681,6 +1681,16 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 // holding a line break can be a literal block.
                 let block =
                     (indent_spaces != 0 && !indent.is_empty()).then_some((indent, indent_spaces));
+                // #6737: a comment after a plain scalar the source folded across lines is written
+                // after the value (and a comment on its key's line moves there), which a literal
+                // block would take as a line of its own text. A document with trailing comments keeps the
+                // quoted spelling for such a scalar; yq puts the comment on the block's header
+                // (`|- # c`). Head and foot comments are written on lines of their own and stay.
+                let block = block.filter(|_| {
+                    !(matches!(s, YamlString::Unquoted { .. })
+                        && s.raw_bytes().contains(&b'\n')
+                        && self.index.has_line_comments())
+                });
                 stream_yaml_string_value(
                     out,
                     &s,
@@ -9741,10 +9751,11 @@ fn write_yaml_child_inline<W: AsRef<[u64]>, Out: core::fmt::Write>(
         }
     }
     // #5467: a plain scalar holding a `:` or `?` is single-quoted here, as go-yaml's emitter
-    // does in flow context; the tag, which `stream_yaml_value_at`'s scalar arm would have
-    // written, goes first. Every other scalar goes through that arm unchanged.
+    // does in flow context (#6737: and a lone `-`); the tag, which `stream_yaml_value_at`'s scalar
+    // arm would have written, goes first. Every other scalar goes through that arm unchanged.
     if let Some(YamlValue::String(string @ YamlString::Unquoted { .. })) = &resolved {
-        if string.raw_bytes().iter().any(|&b| b == b':' || b == b'?') {
+        if string.raw_bytes().iter().any(|&b| b == b':' || b == b'?') || string.raw_bytes() == b"-"
+        {
             if let Some(tag) = value.explicit_tag_at(None) {
                 out.write_str(tag)?;
                 out.write_char(' ')?;
@@ -11100,6 +11111,14 @@ fn stream_yaml_string_value<Out: core::fmt::Write>(
             {
                 return Ok(number.write(out)?);
             }
+            // #6737: a plain scalar the source folded across blank lines holds line breaks, which
+            // go-yaml's emitter spells as a literal block in block context (`|-`), where the
+            // fallback below would write one double-quoted line with `\n` escapes.
+            if let Some(scalar) =
+                block.and_then(|(indent, step)| go_yaml_multiline_scalar(&str_val, indent, step))
+            {
+                return Ok(out.write_str(&scalar)?);
+            }
             // Source plain scalar: re-emit verbatim so both the scalar type and
             // its representation survive (`1`, `true`, `1.0`, `.5`, `yes`),
             // matching yq. Quote only when the decoded value cannot round-trip
@@ -11107,12 +11126,19 @@ fn stream_yaml_string_value<Out: core::fmt::Write>(
             // multiline plains with blank lines, or a leading sequence-entry
             // indicator — `- x` emitted bare under a `- ` would read back as a
             // nested sequence, #332).
-            if str_val.is_empty()
+            if flow && str_val == "-" {
+                // #6737: a lone `-` inside `[...]` or `{...}` is single-quoted by yq.
+                Ok(write_go_yaml_single_quoted(out, &str_val)?)
+            } else if str_val.is_empty()
                 || (!str_val.bytes().all(|b| (0x20..0x7F).contains(&b))
                     && (str_val.bytes().any(|b| b < 0x20) || has_unwritable_char(&str_val)))
                 || starts_seq_entry(str_val.as_bytes(), 0)
             {
                 Ok(write_go_yaml_double_quoted(out, &str_val)?)
+            } else if str_val.starts_with("---") || str_val.starts_with("...") {
+                // #6737: go-yaml's emitter takes a plain scalar that starts like a document
+                // marker (`---`, `... x`, `---x`) to single quotes, in every context.
+                Ok(write_go_yaml_single_quoted(out, &str_val)?)
             } else if flow
                 && str_val.bytes().any(|b| matches!(b, b':' | b'?'))
                 && flow_plain_needs_single_quotes(&str_val)
@@ -13450,8 +13476,8 @@ mod tests {
     fn test_stream_yaml_multiline_plain_folds_to_one_line() {
         // A multiline plain scalar decodes with folded spaces; verbatim
         // re-emission on one line preserves the decoded value. Blank lines
-        // decode to `\n`, which cannot round-trip as a plain scalar and must
-        // be double-quoted.
+        // decode to `\n`, which cannot round-trip as a plain scalar: yq writes
+        // it as a literal block in block context (#6737; it was double-quoted).
         let yaml = b"a: one\n  two\nb: one\n\n  two\n";
         let index = YamlIndex::build(yaml).unwrap();
         let mut out = String::new();
@@ -13459,7 +13485,7 @@ mod tests {
             .root(yaml)
             .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
             .unwrap();
-        assert_eq!(out, "a: one two\nb: \"one\\ntwo\"");
+        assert_eq!(out, "a: one two\nb: |-\n  one\n  two");
     }
 
     #[test]
