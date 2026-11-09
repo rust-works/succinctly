@@ -5027,7 +5027,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             let (files, mut raw_inputs, failures) = if files.is_empty() {
                 (files, vec![read_stdin_bytes()?], Vec::new())
             } else {
-                read_input_files(&files)
+                read_input_files(&files, false)
             };
             join_dsv_records_across_files(&mut raw_inputs, dsv_config(delimiter).quote_char);
             // #6585: as `-R`'s main loop does (#6531), a file that did not open is reported when
@@ -5229,7 +5229,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 if files.is_empty() {
                     (files, vec![read_stdin_bytes()?], Vec::new())
                 } else {
-                    read_input_files(&files)
+                    read_input_files(&files, false)
                 }
             }
         };
@@ -6082,6 +6082,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 // before it already ran, and nothing after it exists (#2961).
                 loop {
                     if stopped(args.on_error, &sink) || !main_loop_reads_on() {
+                        count_directory_stopped_at(None);
                         break;
                     }
                     // #6604: the loop's own read, which a slurp's directory is not read by.
@@ -6303,7 +6304,13 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 // #6464: jq's main loop reads no further input once its reader has read from a
                 // file past one that did not open, and the value that took it there is still
                 // processed (`-R . missing lines.txt` prints the first line and stops).
-                if source_is_past_open_failure(source) {
+                // #6646: and one the program's own `input` calls moved the reader past, where a
+                // `--stream-errors` event is read by the stream parser, which is how it reads
+                // the closer the file before the failure held back.
+                if source_is_past_open_failure(source)
+                    || (args.stream_errors && !args.seq && !main_loop_reads_on())
+                {
+                    count_directory_stopped_at(source);
                     ended_early = true;
                     break 'documents;
                 }
@@ -6956,6 +6963,14 @@ fn read_inputs(
     // #6591: whether a `--seq --stream` run that warns as it goes holds its open failures to place
     // them among the warnings, as `--seq -s` does ([`seq_slurp_places_failures`]).
     let mut seq_stream_places_failures = false;
+    // #6646: `--stream-errors` reads the text as one stream through jq's streaming parser, which
+    // reads a file that did not open as an empty read.
+    let failed_as_sources = args.stream_errors
+        && !args.seq
+        && !args.slurp
+        && !args.validate
+        && !args.raw_input
+        && args.input_dsv.is_none();
     let (files, mut raw_bytes): OpenedInputs = if let Some(bytes) = read_whole {
         // Stdin is the one source with no file index.
         let tag = (!files.is_empty()).then_some(0);
@@ -6966,7 +6981,7 @@ fn read_inputs(
             Err(e) => return Ok(Err(e)),
         }
     } else {
-        let (files, raws, failures) = read_input_files(&files);
+        let (files, raws, failures) = read_input_files(&files, failed_as_sources);
         unopened_tail = failures.iter().any(|&(at, _)| at >= files.len());
         if let Some(name) = unopened_tail_name(&failures, files.len()) {
             UNOPENED_TAIL_NAME.with(|tail| *tail.borrow_mut() = Some(name));
@@ -6974,8 +6989,13 @@ fn read_inputs(
             FAULT_AT_TAIL.with(|at| at.set(fault_reaches_end(&raws, args)));
         }
         any_open_failure = !failures.is_empty();
-        if let Some(&(at, _)) = failures.first() {
-            note_open_failure_at(at);
+        if let Some(&(at, ref failure)) = failures.first() {
+            // #6646: the main loop ends at the read of a directory that delivers the closer the file
+            // before it held back, so a directory in the middle is the read it stops at; its
+            // message is placed past it, where the reader moves on.
+            let held_back_at_directory =
+                failed_as_sources && failure.kind == InputFileErrorKind::Directory { last: false };
+            note_open_failure_at(at - usize::from(held_back_at_directory));
         }
         // #6475: under `-n` the program asks for each file as it goes, and says what it cannot
         // open when its read gets there. A slurp reads them all first, and so does a text that
@@ -7206,15 +7226,32 @@ fn read_inputs(
                 report_open_failures(&failures, open_failed);
                 let fault_ends_text = matches!(first_stream_fault(&raws), Some((_, true)));
                 defer_open_failures(directory, fault_ends_text);
+            } else if main_loop_only
+                && failed_as_sources
+                && matches!(
+                    failures[0].1.kind,
+                    InputFileErrorKind::Directory { last: false }
+                )
+                && held_back_closer_before(args, &raws, &failures[0])
+            {
+                // #6646: the main loop ends at the read of a directory that delivers the held-back
+                // closer, which counts the failure and says nothing: the message comes on the
+                // read after it, which is never made.
+                *open_failed = true;
             } else {
                 report_open_failures(&failures[..reached], open_failed);
             }
         }
-        let raws = raws
+        let mut raws: Vec<(Option<usize>, Vec<u8>)> = raws
             .into_iter()
             .enumerate()
             .map(|(idx, raw)| (Some(idx), raw))
             .collect();
+        // #6646: a last file that did not open is the read the stream ends at, which a bare token
+        // at the end of the file before it completes in: a source with no bytes of its own.
+        if failed_as_sources && UNOPENED_TAIL_NAME.with(|tail| tail.borrow().is_some()) {
+            raws.push((Some(files.len()), Vec::new()));
+        }
         (files, raws)
     };
     opened.clone_from(&files);
@@ -9641,13 +9678,7 @@ fn open_failures_reached<'a>(
             // container with a scalar before its closer holds that closer's event back until
             // the next read, which is the open of the failed file: the main loop ends there, so
             // the failures after the first are not reached.
-            if args.seq
-                && (args.stream || args.stream_errors)
-                && raws[..failures[0].0.min(raws.len())]
-                    .iter()
-                    .rfind(|raw| !raw.is_empty())
-                    .is_some_and(|raw| closing_event_lags(raw))
-            {
+            if held_back_closer_before(args, raws, &failures[0]) {
                 return &failures[..1];
             }
             // The first file with bytes from the first failure on holds the value, or the end of
@@ -9684,13 +9715,44 @@ fn open_failures_reached<'a>(
     }
 }
 
+/// Whether the source read just before `failure` ends in a closing event the stream parser holds
+/// back until the next read (#6646), which is the read of the failed file: the main loop ends
+/// there. A file between the two, even an empty one, takes that read, and the failure is then met
+/// by a later one. `--seq --stream` and `--stream-errors` read with the streaming parser, as does
+/// plain `--stream-errors`.
+fn held_back_closer_before(
+    args: &JqCommand,
+    raws: &[Vec<u8>],
+    failure: &(usize, InputFileOpenError),
+) -> bool {
+    let streams = (args.seq && (args.stream || args.stream_errors))
+        || (args.stream_errors && !args.raw_input && args.input_dsv.is_none());
+    // A directory is a source of its own, which the failure is placed after (#6472); a file that
+    // did not open is placed at the source it would have been, which is an empty one on the routes
+    // that give it one (#6646), and at the end of the sources for the last file named.
+    let (at, ref error) = *failure;
+    let own = if error.is_directory() { at - 1 } else { at };
+    streams
+        && own
+            .checked_sub(1)
+            .and_then(|before| raws.get(before))
+            .is_some_and(|raw| closing_event_lags(raw, args.seq))
+}
+
 /// Whether the last record of the `--seq` text `raw` leaves jq's stream parser holding its closing
 /// event until the next read (#6646): a top-level container that ends at the last byte of the text,
 /// whose closer follows a scalar. `[1]`, `{"a":"b"}`, `[[],1]` and `[1,2]` do; `[]`, `[[1]]`,
 /// `{"a":{}}` and a text with a byte after the closer (`[1]\n`) do not, as the closer then reads
 /// with the scalar's own token. Captured from jq 1.7.1.
-fn closing_event_lags(raw: &[u8]) -> bool {
-    let record = raw.rsplit(|&b| b == 0x1e).next().unwrap_or(raw);
+///
+/// `seq` is a `--seq` stream, whose last record is what follows its last record separator; plain
+/// JSON's last value is the text's end (#6646).
+fn closing_event_lags(raw: &[u8], seq: bool) -> bool {
+    let record = if seq {
+        raw.rsplit(|&b| b == 0x1e).next().unwrap_or(raw)
+    } else {
+        raw
+    };
     let start = record
         .iter()
         .position(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
@@ -10029,6 +10091,29 @@ fn main_loop_reads_on() -> bool {
         None => true,
         Some(at) => jq::current_input_location().map_or(true, |(source, _)| (source as usize) < at),
     }
+}
+
+/// Counts, without a word, the directory in the middle of the list that jq's main loop stopped at
+/// (#6646): the read of it failed, which makes the run exit 2, and what jq says of it comes on a
+/// read after that one, which a loop that has stopped never makes. `source` is where the value that
+/// stopped the loop was read, or where the program's own reads left the reader.
+fn count_directory_stopped_at(source: Option<u32>) {
+    let source = source.or_else(|| jq::current_input_location().map(|(source, _)| source));
+    if !source_is_past_open_failure(source) {
+        return;
+    }
+    let first = FIRST_OPEN_FAILURE_AT.with(std::cell::Cell::get);
+    PENDING_OPEN_FAILURES.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        let at_directory = pending.front().is_some_and(|(at, failure)| {
+            first.is_some_and(|first| at.checked_sub(1) == Some(first))
+                && failure.kind == InputFileErrorKind::Directory { last: false }
+        });
+        if at_directory {
+            pending.pop_front();
+            LAZY_OPEN_FAILED.with(|seen| seen.set(true));
+        }
+    });
 }
 
 /// Whether a value read from `source` (a position among the files that opened, as a location's
@@ -10450,7 +10535,10 @@ type OpenFailures = Vec<(usize, InputFileOpenError)>;
 /// the index is how many files opened before it: the position it sits at among them. It is
 /// the caller that reports it ([`report_open_failures`]), because jq reports a file when its
 /// reader reaches it, and the run can end before that.
-fn read_input_files(files: &[PathBuf]) -> (Vec<PathBuf>, Vec<Vec<u8>>, OpenFailures) {
+fn read_input_files(
+    files: &[PathBuf],
+    failed_as_sources: bool,
+) -> (Vec<PathBuf>, Vec<Vec<u8>>, OpenFailures) {
     let mut opened = Vec::with_capacity(files.len());
     let mut raws = Vec::with_capacity(files.len());
     let mut failures = Vec::new();
@@ -10478,6 +10566,14 @@ fn read_input_files(files: &[PathBuf]) -> (Vec<PathBuf>, Vec<Vec<u8>>, OpenFailu
                 opened.push(path.clone());
                 raws.push(Vec::new());
                 failures.push((opened.len(), e));
+            }
+            // #6646: to jq's reader a file that did not open in the middle of the list is an
+            // empty read, as a directory is, so a stream reader has the file as a source with no
+            // bytes: what the file before it held back is read there.
+            Err(e) if failed_as_sources && at + 1 < files.len() => {
+                failures.push((opened.len(), e));
+                opened.push(path.clone());
+                raws.push(Vec::new());
             }
             Err(e) => failures.push((opened.len(), e)),
         }
@@ -13087,7 +13183,7 @@ fn seq_plain_json_inputs(args: &JqCommand) -> Result<Option<PreparedInputs>> {
     let (files, mut raws, failures) = if from_stdin {
         (named, vec![read_stdin_bytes()?], Vec::new())
     } else {
-        read_input_files(&named)
+        read_input_files(&named, false)
     };
     // Stdin is one source that always opens, so a file list is all that can fail this.
     if raws.len() != 1 || !failures.is_empty() {
@@ -18114,16 +18210,16 @@ mod tests {
             ("]", false),
         ] {
             let seq = format!("\u{1e}{text}");
-            assert_eq!(closing_event_lags(seq.as_bytes()), lags, "{text:?}");
+            assert_eq!(closing_event_lags(seq.as_bytes(), true), lags, "{text:?}");
         }
         // Only a well-formed value lags: a mismatched closer or a key with no value is a fault.
         for text in ["[1}", "{\"a\":1]", "{\"a\"}", "[1][2]", "[1] [2]"] {
             let seq = format!("\u{1e}{text}");
-            assert!(!closing_event_lags(seq.as_bytes()), "{text:?}");
+            assert!(!closing_event_lags(seq.as_bytes(), true), "{text:?}");
         }
         // Only the last record counts.
-        assert!(closing_event_lags(b"\x1e[[1]]\n\x1e[2]"));
-        assert!(!closing_event_lags(b"\x1e[1]\x1e{}"));
+        assert!(closing_event_lags(b"\x1e[[1]]\n\x1e[2]", true));
+        assert!(!closing_event_lags(b"\x1e[1]\x1e{}", true));
     }
 
     use super::*;
