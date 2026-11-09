@@ -1225,7 +1225,7 @@ fn holds_no_content(text: &[u8]) -> bool {
         let end = line.iter().rposition(|&b| b != b' ').map_or(0, |at| at + 1);
         let line = &line[..end];
         let indent = line.iter().position(|&b| b != b' ').unwrap_or(line.len());
-        if line.get(indent).is_none_or(|&b| b == b'#') {
+        if line.get(indent).map_or(true, |&b| b == b'#') {
             continue;
         }
         markers += usize::from(line == b"---");
