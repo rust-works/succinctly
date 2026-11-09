@@ -5,7 +5,8 @@
 //! so the fault was met one read late and dropped from the array: `trunc pa missing missing2` printed
 //! the array without `["Unfinished JSON term at EOF ...",[1]]`. One failed file after the last file
 //! with bytes (`trunc pa missing`, `trunc pa dir`) was already right and still is, as are
-//! `--seq -s --stream` (whose fault is a warning) and `-s --stream-errors`.
+//! `--seq -s --stream` (whose fault is a warning), `-s --stream-errors`, and the `-n` and
+//! non-slurp readers, which are rows here because they build the same tail source.
 //! Every row was captured from jq 1.7.1.
 
 use anyhow::Result;
@@ -30,7 +31,7 @@ fn a_fault_met_two_reads_behind_the_last_file_is_in_the_array_6773() -> Result<(
         std::fs::write(dir.path().join(name), bytes)?;
     }
     #[rustfmt::skip]
-    let rows: [Row<'_>; 14] = [
+    let rows: [Row<'_>; 21] = [
         (&["-c", "--seq", "-s", "--stream-errors", "."][..], &["trunc", "pa", "missing", "missing2"][..], "\u{1e}[[[0],1],[[1,0],1],[[1,0]],[\"Unfinished JSON term at EOF at line 1, column 7\",[1]]]\n", "jq: error: Could not open file @DIR@/missing: No such file or directory\njq: error: Could not open file @DIR@/missing2: No such file or directory\n", 2),
         (&["-c", "--seq", "-s", "--stream-errors", "."][..], &["trunc", "pa", "missing", "empty"][..], "\u{1e}[[[0],1],[[1,0],1],[[1,0]],[\"Unfinished JSON term at EOF at line 1, column 7\",[1]]]\n", "jq: error: Could not open file @DIR@/missing: No such file or directory\n", 2),
         (&["-c", "--seq", "-s", "--stream-errors", "."][..], &["trunc", "pa", "missing", "dir"][..], "\u{1e}[[[0],1],[[1,0],1],[[1,0]],[\"Unfinished JSON term at EOF at line 1, column 7\",[1]]]\n", "jq: error: Could not open file @DIR@/missing: No such file or directory\n", 2),
@@ -45,6 +46,13 @@ fn a_fault_met_two_reads_behind_the_last_file_is_in_the_array_6773() -> Result<(
         (&["-c", "--seq", "-s", "--stream", "."][..], &["trunc", "pa", "missing", "missing2"][..], "", "jq: error: Could not open file @DIR@/missing: No such file or directory\njq: error: Could not open file @DIR@/missing2: No such file or directory\njq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 7\n", 2),
         (&["-c", "--seq", "-s", "--stream", "."][..], &["trunc", "pa", "missing", "dir"][..], "", "jq: error: Could not open file @DIR@/missing: No such file or directory\njq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 7\n", 2),
         (&["-c", "-s", "--stream-errors", "."][..], &["trunc", "pa", "missing", "missing2"][..], "[[\"Invalid numeric literal at line 1, column 2\",[]],[[0],1],[[0]]]\n", "jq: error: Could not open file @DIR@/missing: No such file or directory\njq: error: Could not open file @DIR@/missing2: No such file or directory\n", 2),
+        (&["-c", "--seq", "-s", "--stream-errors", "."][..], &["trunc", "missing", "pa"][..], "\u{1e}[[[0],1],[[1,0],1]]\n", "jq: error: Could not open file @DIR@/missing: No such file or directory\n", 2),
+        (&["-c", "--seq", "-s", "--stream-errors", "."][..], &["missing", "trunc", "pa", "missing2"][..], "\u{1e}[[[0],1],[[1,0],1],[[1,0]]]\n", "jq: error: Could not open file @DIR@/missing: No such file or directory\njq: error: Could not open file @DIR@/missing2: No such file or directory\n", 2),
+        (&["-c", "--seq", "-s", "-n", "--stream-errors", "[., input]"][..], &["trunc", "pa", "missing", "missing2"][..], "\u{1e}[null,[[[0],1],[[1,0],1],[[1,0]],[\"Unfinished JSON term at EOF at line 1, column 7\",[1]]]]\n", "jq: error: Could not open file @DIR@/missing: No such file or directory\njq: error: Could not open file @DIR@/missing2: No such file or directory\n", 2),
+        (&["-c", "--seq", "-s", "-n", "--stream-errors", "input"][..], &["trunc", "pa", "missing"][..], "\u{1e}[[[0],1],[[1,0],1],[[1,0]]]\n", "jq: error: Could not open file @DIR@/missing: No such file or directory\n", 2),
+        (&["-c", "--seq", "-n", "--stream-errors", "[inputs]"][..], &["trunc", "pa", "missing", "missing2"][..], "\u{1e}[[[0],1],[[1,0],1],[[1,0]],[\"Unfinished JSON term at EOF at line 1, column 7\",[1]]]\n", "jq: error: Could not open file @DIR@/missing: No such file or directory\njq: error: Could not open file @DIR@/missing2: No such file or directory\n", 2),
+        (&["-c", "--seq", "--stream", "[., input]"][..], &["trunc", "pa", "missing"][..], "\u{1e}[[[0],1],[[1,0],1]]\n", "jq: error: Could not open file @DIR@/missing: No such file or directory\njq: error (at @DIR@/missing:0): Unfinished JSON term at EOF at line 1, column 7\n", 2),
+        (&["-c", "--seq", "--stream-errors", "[., input]"][..], &["trunc", "pa", "missing", "missing2"][..], "\u{1e}[[[0],1],[[1,0],1]]\n\u{1e}[[[1,0]],[\"Unfinished JSON term at EOF at line 1, column 7\",[1]]]\n", "jq: error: Could not open file @DIR@/missing: No such file or directory\njq: error: Could not open file @DIR@/missing2: No such file or directory\n", 2),
     ];
     for (flags, names, stdout, stderr, status) in rows {
         let files: Vec<String> = names.iter().map(|name| format!("{d}/{name}")).collect();
