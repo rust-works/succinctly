@@ -48,6 +48,9 @@ fn check(rows: &[Row<'_>]) -> Result<()> {
         ("arrn.json", "[1]\n"),
         ("flt.json", "1.5"),
         ("nest.json", "[[1],2]"),
+        ("bomonly.json", "\u{feff}"),
+        ("bom1.json", "\u{feff}1\n"),
+        ("bom2.json", "\u{feff}1"),
     ] {
         std::fs::write(dir.path().join(name), text)?;
     }
@@ -186,6 +189,34 @@ fn a_first_event_that_spans_two_files_is_complete_before_the_failure_6732() -> R
         (&["-c", "--stream-errors", "input_filename"][..], &["dir", "flt", "r2", "gone2"][..], "\"@DIR@/r2.json\"\n", "jq: error: Is a directory\n", 2),
         (&["-c", "--stream-errors", "halt_error"][..], &["p", "empty", "pn", "gone"][..], "", "[[],11]\n", 5),
         (&["-c", "--stream-errors", "."][..], &["p", "pn", "gone"][..], "[[],11]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+    ];
+    check(&rows)
+}
+
+/// `-n` places a program's reads of `input` the way a run without it does, and matched jq before this
+/// change: the rows stay as they were.
+#[test]
+fn under_null_input_the_program_reads_keep_their_rows_6732() -> Result<()> {
+    #[rustfmt::skip]
+    let rows = [
+        (&["-c", "--stream-errors", "-n", "input,halt_error"][..], &["objx", "dir", "gone"][..], "[[\"a\"],1]\n", "", 5),
+        (&["-c", "--stream-errors", "-n", "[inputs]"][..], &["arrx", "dir", "p", "gone"][..], "[[[0],1],[[0]],[[],1]]\n", "jq: error: Is a directory\njq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (&["-c", "--stream-errors", "-n", "input"][..], &["p", "pn", "gone"][..], "[[],11]\n", "", 0),
+        (&["-c", "--stream-errors", "-n", "first(inputs)|halt_error"][..], &["p", "pn", "gone"][..], "", "[[],11]\n", 5),
+        (&["-c", "--stream-errors", "-n", "input,halt_error"][..], &["arrx", "dir", "gone"][..], "[[0],1]\n", "", 5),
+    ];
+    check(&rows)
+}
+
+/// jq skips a byte-order mark at the front of its input, of the first file with bytes: one in the
+/// middle of the stream is part of the number it follows.
+#[test]
+fn a_byte_order_mark_is_skipped_only_at_the_front_of_the_stream_6732() -> Result<()> {
+    #[rustfmt::skip]
+    let rows = [
+        (&["-c", "--stream-errors", "halt_error"][..], &["bomonly", "bom1", "gone"][..], "", "[\"Invalid numeric literal at line 2, column 0\",[]]\n", 5),
+        (&["-c", "--stream-errors", "halt_error"][..], &["bomonly", "bom2", "pn", "gone"][..], "", "[\"Invalid numeric literal at line 2, column 0\",[]]\n", 5),
+        (&["-c", "--stream-errors", "halt_error"][..], &["bom2", "bom1", "gone"][..], "", "[\"Invalid numeric literal at line 2, column 0\",[]]\n", 5),
     ];
     check(&rows)
 }

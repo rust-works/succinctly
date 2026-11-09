@@ -9982,19 +9982,24 @@ fn first_value_completes_at(raws: &[Vec<u8>], at: usize, args: &JqCommand) -> bo
 /// time ([`first_value_completes_at`]) cannot see. `None` where no file ends it or it is too long
 /// to read for.
 fn first_event_completing_file(raws: &[Vec<u8>]) -> Option<usize> {
+    let limit = crate::jq_stream_errors::FIRST_EVENT_PREFIX_LIMIT;
     let mut text: Vec<u8> = Vec::new();
-    for (at, raw) in raws.iter().enumerate().filter(|(_, raw)| !raw.is_empty()) {
+    let files = raws.iter().enumerate().filter(|(_, raw)| !raw.is_empty());
+    for (position, (at, raw)) in files.enumerate() {
         // jq skips a byte-order mark at the front of its input: of the first file with bytes.
-        let bom = if text.is_empty() {
+        let bom = if position == 0 {
             crate::front_matter::leading_bom_len(raw)
         } else {
             0
         };
-        text.extend_from_slice(&raw[bom..]);
+        // Never more than the prefix a first event is read in: a longer one is not worth the copy.
+        let room = limit - text.len();
+        let bytes = &raw[bom..];
+        text.extend_from_slice(&bytes[..bytes.len().min(room)]);
         if crate::jq_stream_errors::first_event_completes_in(&text) {
             return Some(at);
         }
-        if text.len() >= crate::jq_stream_errors::FIRST_EVENT_PREFIX_LIMIT {
+        if text.len() >= limit {
             return None;
         }
     }
