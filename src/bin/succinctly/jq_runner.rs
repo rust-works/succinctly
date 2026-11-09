@@ -6190,6 +6190,11 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     )?;
                     if let Some(code) = sink.halted() {
                         out.flush()?;
+                        // #6732: a program that halts after its `input` read the closer the file
+                        // before a directory held back has read the directory, which counts.
+                        if plain_stream_errors(&args) {
+                            count_directory_stopped_at(None);
+                        }
                         return Ok(halt_exit_code(code, open_failed));
                     }
                 }
@@ -7084,6 +7089,10 @@ fn read_inputs(
             || !seq_fault_ends_of_stream.is_empty()
             || seq_readers_place_reads
             || json_text_faults(&raws, args)
+            // #6732: `--stream-errors` places a program's reads of `input` the same way, so the
+            // reads reach what the file before a failure left open, and a program that halts first
+            // never does.
+            || (plain_stream_errors(args) && track_eof)
             || failures.iter().all(|&(at, ref failure)| {
                 // #6615: the reads place a directory given last ([`reach_last_directory`]).
                 failure.kind == InputFileErrorKind::Directory { last: true }
@@ -9794,6 +9803,14 @@ fn open_failures_reached<'a>(
                     .next()
                     .filter(|(at, _)| first_value_completes_at(raws, *at, args))
                     .map(|(at, _)| at)
+                    // #6732: a first event that a file hands on to the next (`1` then `1\n`) is
+                    // read where the files together complete it.
+                    .or_else(|| {
+                        plain_stream_errors(args)
+                            .then(|| first_event_completing_file(raws))
+                            .flatten()
+                            .filter(|&file| file >= failures[0].0)
+                    })
             };
             if let Some(file) = file {
                 let reached = failures.iter().take_while(|&&(at, _)| at <= file).count();
@@ -9959,6 +9976,31 @@ fn first_value_completes_at(raws: &[Vec<u8>], at: usize, args: &JqCommand) -> bo
     }
 }
 
+/// The file the first event of the `--stream-errors` text the files `raws` make is complete in
+/// (#6732), whatever follows it: a bare number (`1`, then `1\n`) or a container's scalar (`[1`,
+/// then `,2]`) that a file hands on is finished by the next one, which a judgment of one file at a
+/// time ([`first_value_completes_at`]) cannot see. `None` where no file ends it or it is too long
+/// to read for.
+fn first_event_completing_file(raws: &[Vec<u8>]) -> Option<usize> {
+    let mut text: Vec<u8> = Vec::new();
+    for (at, raw) in raws.iter().enumerate().filter(|(_, raw)| !raw.is_empty()) {
+        // jq skips a byte-order mark at the front of its input: of the first file with bytes.
+        let bom = if text.is_empty() {
+            crate::front_matter::leading_bom_len(raw)
+        } else {
+            0
+        };
+        text.extend_from_slice(&raw[bom..]);
+        if crate::jq_stream_errors::first_event_completes_in(&text) {
+            return Some(at);
+        }
+        if text.len() >= crate::jq_stream_errors::FIRST_EVENT_PREFIX_LIMIT {
+            return None;
+        }
+    }
+    None
+}
+
 /// Whether the text the files `raws` make ends between JSON tokens (#6591): outside a string, and
 /// not on a byte a number or a literal goes on with. The next file then starts a token of its own.
 fn text_ends_between_tokens(raws: &[Vec<u8>]) -> bool {
@@ -10111,11 +10153,15 @@ fn stream_errors_main_loop_places_failures(
     let Some(&(first_failure, _)) = reached.first() else {
         return false;
     };
-    stream_errors_reads_place_failures(args)
-        && raws
-            .iter()
-            .position(|raw| !raw.is_empty())
-            .is_some_and(|file| file < first_failure && first_value_completes_at(raws, file, args))
+    if !stream_errors_reads_place_failures(args) {
+        return false;
+    }
+    // #6732: a first event that a file hands on to the next (`1` then `1\n`) completes in the
+    // file that ends it, so the failure behind that file is not the first read's.
+    raws.iter()
+        .position(|raw| !raw.is_empty())
+        .is_some_and(|file| file < first_failure && first_value_completes_at(raws, file, args))
+        || first_event_completing_file(raws).is_some_and(|file| file < first_failure)
 }
 
 /// Whether `args` read JSON text with `--stream-errors` alone: its in-memory route (without `-n`, or
