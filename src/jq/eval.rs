@@ -1565,15 +1565,16 @@ pub mod alias_identity {
             let is_proper_prefix = i < components.len();
             // A merged member is the source's node whether the path goes on or ends here: yq
             // writes `.item.x = 5` into the anchor, where `.b = 5` over an alias rebinds (#6785).
-            if hops < table.hop_bound() {
-                if let Some(member) = table.merged_at(doc, &prefix) {
-                    // A write home is a path of string and index steps, which every step maps to.
-                    let mut redirected: Vec<Expr> =
-                        member.write_home.iter().filter_map(step_to_expr).collect();
-                    redirected.extend(components[i..].iter().cloned());
-                    redirect_components(redirected, doc, table, opts, hops + 1, out);
-                    return;
-                }
+            if let Some(member) = table
+                .merged_at(doc, &prefix)
+                .filter(|_| hops < table.hop_bound())
+            {
+                // A write home is a path of string and index steps, which every step maps to.
+                let mut redirected: Vec<Expr> =
+                    member.write_home.iter().filter_map(step_to_expr).collect();
+                redirected.extend(components[i..].iter().cloned());
+                redirect_components(redirected, doc, table, opts, hops + 1, out);
+                return;
             }
             if (is_proper_prefix || opts.through_terminal) && hops < table.hop_bound() {
                 if let Some(def) = table.anchor_for(&prefix) {

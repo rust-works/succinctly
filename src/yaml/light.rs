@@ -5872,10 +5872,13 @@ pub fn collect_merged_members<W: AsRef<[u64]> + Clone>(
         .into_iter()
         .filter_map(|p| {
             let write_home = homes.get(&p.write_node)?.clone();
-            let render_home = match p.render_node {
-                Some(node) => homes.get(&node)?.clone(),
-                None => write_home.clone(),
-            };
+            // The rendering lists every key the iteration does, so the first holder is found; the
+            // write home stands in for the one source that is not a node of its own.
+            let render_home = p
+                .render_node
+                .and_then(|node| homes.get(&node))
+                .unwrap_or(&write_home)
+                .clone();
             // The other sources holding the key, in the order they would show through if the
             // first lost it. A source that is not a node of its own (written in place) has no home.
             let fallbacks = p
