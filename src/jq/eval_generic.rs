@@ -21844,11 +21844,24 @@ fn yq_context_item<V: DocumentValue, S: EvalSemantics>(
 /// Allocation-free on purpose: this runs on *every* yq-mode pipe, and only
 /// the ones that answer `true` pay for the flattening.
 fn yq_pipe_has_union(stages: &[Expr]) -> bool {
-    stages.iter().any(|stage| match unwrap_paren(stage) {
-        Expr::Comma(_) => true,
-        Expr::Pipe(inner) => yq_pipe_has_union(inner),
-        _ => false,
-    })
+    yq_pipe_has_list_stage(stages, false)
+}
+
+/// [`yq_pipe_has_union`] with the second kind of stage the walk owns in any context: an empty
+/// `{}` after another stage (#6801), which yq builds once however many nodes reach it.
+/// `seen` is whether a stage already stands before `stages`, in the pipe that holds them.
+fn yq_pipe_has_list_stage(stages: &[Expr], seen: bool) -> bool {
+    let mut seen = seen;
+    for stage in stages {
+        match unwrap_paren(stage) {
+            Expr::Comma(_) => return true,
+            Expr::Object(entries) if seen && entries.is_empty() => return true,
+            Expr::Pipe(inner) if yq_pipe_has_list_stage(inner, seen) => return true,
+            _ => {}
+        }
+        seen = true;
+    }
+    false
 }
 
 /// Splice nested pipes into one flat stage list, stripping parens.
@@ -22032,6 +22045,14 @@ fn yq_list_stage(stages: &[Expr], together: bool) -> Option<(usize, YqListStage)
     for (i, stage) in stages.iter().enumerate() {
         if matches!(stage, Expr::Comma(_)) {
             found = Some((i, YqListStage::Union));
+            break;
+        }
+        // An empty `{}` is one mapping whatever reaches it, with or without
+        // `EvaluateTogether` (#6801): `.x[] | {}` is one `{}`. At any index: the stage list
+        // here is the rest of a pipe the walk already split, or a union branch, whose inputs
+        // are the list the stage before it left.
+        if matches!(stage, Expr::Object(entries) if entries.is_empty()) {
+            found = Some((i, YqListStage::EmptyObject));
             break;
         }
         if together {
