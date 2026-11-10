@@ -2683,8 +2683,7 @@ that reaches the root variable through anything but identities still empties the
 What stays
 different, all of it yq's node identity ([#2643](https://github.com/rust-works/succinctly/issues/2643)):
 a variable bound below the root (`.a as $y | del($y)` deletes `.a` in yq, refuses here),
-the mixed orders
-`del(., $y)` / `del(.a, $y)` (yq keeps the document, succinctly empties it): a bound variable
+and the mixed orders `del(., $y)` / `del(.a, $y)` (yq keeps the document, succinctly empties it): a bound variable
 is tracked here, so it does not end the loop the way yq's parentless node does.
 
 A `null`/`true`/`false` literal identical to the input that sits in a `del()` the order rule
@@ -5285,8 +5284,9 @@ Still different, each in yq v4.53.3 against `succinctly yq`:
 - **A variable-rooted path inside the left side of a write.**
   `(.a as $y | .c | $y.b) = 5`, `(.a as $y | .a | $y.b) = 5` and `del(.a as $y | .c | $y)` keep the document, or delete `.a`, in yq, and refuse here.
   `(. as $y | $y.a) = 5` keeps the document in yq and writes `.a` here.
-- **A write stage that is not a stage of the `as` body's own pipe.**
-  `.a as $y | ($y.b = 5), $y` (a write inside a comma) is the document in yq and refuses here.
+- **A write inside a construction.**
+  `.a as $y | [$y.b = 5]` and `.a as $y | {"k": ($y.b = 5)}` collect the unchanged document in yq, and refuse here.
+  Only stages of the `as` body's pipe, of a pipe nested in it, and of the body of a nested `as` are rewritten.
 - **A stale index.**
   `.a[1] as $y | del(.a[0]) | del($y)` deletes by the live parent and the old index in yq, and refuses here.
 - **`.[] as $y | del($y)`.**

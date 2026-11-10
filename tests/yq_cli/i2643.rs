@@ -15,6 +15,7 @@ use crate::{run_jq_stdin, run_yq_stdin};
 const MAP: &str = "a: {b: 1}\nc: {b: 1}\n";
 const ARR: &str = "a:\n  - 1\n  - 2\n  - 3\n";
 const ANC: &str = "a: &x {p: 1}\nb: *x\n";
+const NEST: &str = "a: {b: 1}\nc: {b: 2}\n";
 
 /// (filter, stdout) on [`MAP`], each the same as yq v4.53.3's with exit code 0.
 const MAP_ROWS: &[(&str, &str)] = &[
@@ -60,6 +61,76 @@ const ANC_ROWS: &[(&str, &str)] = &[
     (".a as $y | del($y.p) | $y", "{}\n"),
 ];
 
+/// Nested binders, nested pipes, comma paths and a parenthesised stage, on [`NEST`].
+const NEST_ROWS: &[(&str, &str)] = &[
+    (
+        ".a as $x | .c as $y | $x.k = 5 | $x",
+        "{\"b\":1,\"k\":5}
+",
+    ),
+    (
+        ".a as $y | .c as $z | $y.b = 9 | $z",
+        "{\"b\":2}
+",
+    ),
+    (
+        ".a as $x | .c as $y | $y.k = 5 | $x",
+        "{\"b\":1}
+",
+    ),
+    (
+        ".a as $y | $y.b = 5 | (.c | $y.b = 9) | $y",
+        "{\"b\":9}
+",
+    ),
+    (
+        ".a as $y | (.c | $y.b = 9) | $y",
+        "{\"b\":9}
+",
+    ),
+    (
+        ".a as $y | .c | $y.b = 9 | $y",
+        "{\"b\":9}
+",
+    ),
+    (
+        ".a as $y | del($y.b, $y.k) | $y",
+        "{}
+",
+    ),
+    (
+        ".a as $y | ($y.b, $y.k) = 5 | $y",
+        "{\"b\":5,\"k\":5}
+",
+    ),
+    (
+        ".a as $y | ($y.b, $y.k) |= 7 | $y",
+        "{\"b\":7,\"k\":7}
+",
+    ),
+    (
+        ".a as $x | .c as $y | $x.k = 5 | $y.k = 6 | [$x, $y]",
+        "[{\"b\":1,\"k\":5},{\"b\":2,\"k\":6}]
+",
+    ),
+    (
+        ".a as $x | .c as $x | $x.k = 5 | $x",
+        "{\"b\":2,\"k\":5}
+",
+    ),
+    (
+        ".a as $y | ($y.b = 5), $y",
+        "{\"a\":{\"b\":1},\"c\":{\"b\":2}}
+",
+    ),
+    (
+        ".a as $y | ($y.b = 5 | $y), 1",
+        "{\"b\":5}
+1
+",
+    ),
+];
+
 fn check(doc: &str, rows: &[(&str, &str)]) -> Result<()> {
     for (filter, expected) in rows {
         let (stdout, code) = run_yq_stdin(filter, doc, &["-o", "json", "-I0"])?;
@@ -82,6 +153,11 @@ fn a_write_through_a_bound_sequence_changes_the_copy_2643() -> Result<()> {
 #[test]
 fn a_write_through_a_bound_anchor_changes_the_copy_2643() -> Result<()> {
     check(ANC, ANC_ROWS)
+}
+
+#[test]
+fn a_write_through_an_outer_or_nested_binding_changes_its_copy_2643() -> Result<()> {
+    check(NEST, NEST_ROWS)
 }
 
 /// The jq rule is unchanged: `succinctly jq` refuses a write through a bound variable, as jq does

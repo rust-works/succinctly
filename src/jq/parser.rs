@@ -1748,16 +1748,23 @@ fn yq_map_union_body_over_the_list(call: Expr) -> Expr {
 }
 
 /// The variable that holds the stage's input while a rebound write's right side is evaluated
-/// against it (#2643). Not a name the parser produces (`$` followed by an identifier), so it never
-/// collides with a user variable; a nest of such rebinds shadows it lexically, innermost first.
+/// against it (#2643). Not a name the parser produces (`$` followed by an identifier), like
+/// [`JOIN_IDX_VAR`] and [`VALUE_ARG_VAR`], so it never collides with a user variable; a nest of
+/// such rebinds shadows it lexically, innermost first.
 const VAR_WRITE_INPUT: &str = "#in";
 
 /// The path of a var-rooted write target, after the variable: `$y.b` is `.b`, `$y[0].c` is
-/// `[0].c`, and a bare `$y` is `.`. `None` when the expression is not rooted at `$var`.
+/// `[0].c`, a bare `$y` is `.`, and a comma of such paths (`$y.a, $y.b`) is a comma of their
+/// tails. `None` when any part is not rooted at `$var`.
 fn var_write_tail(path: &Expr, var: &str) -> Option<Expr> {
     match path {
         Expr::Paren(inner) => var_write_tail(inner, var),
         Expr::Var(name) if name == var => Some(Expr::Identity),
+        Expr::Comma(items) => items
+            .iter()
+            .map(|item| var_write_tail(item, var))
+            .collect::<Option<Vec<_>>>()
+            .map(Expr::Comma),
         Expr::Pipe(stages) if stages.len() > 1 => {
             let mut head = &stages[0];
             while let Expr::Paren(inner) = head {
@@ -1769,6 +1776,104 @@ fn var_write_tail(path: &Expr, var: &str) -> Option<Expr> {
             }
         }
         _ => None,
+    }
+}
+
+/// A write through a variable, apart from its path (#2643).
+enum VarWrite {
+    Assign(Expr),
+    Compound(AssignOp, Expr),
+    Alternative(Expr),
+    Update(Expr),
+    Delete,
+}
+
+impl VarWrite {
+    /// The write stage that is a var-rooted write, and its path after the variable. A bare
+    /// `del($y)` is not one: yq deletes the node `$y` was bound to from its live parent, which is
+    /// not a write to the copy and keeps its own rule.
+    fn of(stage: &Expr, var: &str) -> Option<(Expr, Self)> {
+        let mut stage = stage;
+        while let Expr::Paren(inner) = stage {
+            stage = inner;
+        }
+        match stage {
+            Expr::Assign { path, value } => {
+                Some((var_write_tail(path, var)?, Self::Assign((**value).clone())))
+            }
+            Expr::CompoundAssign { op, path, value } => Some((
+                var_write_tail(path, var)?,
+                Self::Compound(*op, (**value).clone()),
+            )),
+            Expr::AlternativeAssign { path, value } => Some((
+                var_write_tail(path, var)?,
+                Self::Alternative((**value).clone()),
+            )),
+            Expr::Update { path, filter } => {
+                Some((var_write_tail(path, var)?, Self::Update((**filter).clone())))
+            }
+            Expr::Builtin(Builtin::Del(path)) => match var_write_tail(path, var)? {
+                Expr::Identity => None,
+                tail => Some((tail, Self::Delete)),
+            },
+            _ => None,
+        }
+    }
+
+    /// Whether the right side is read against the stage's input, and so needs [`VAR_WRITE_INPUT`].
+    /// `|=` and `del` read nothing from it: the filter runs on the value at the path.
+    fn reads_input(&self) -> bool {
+        matches!(
+            self,
+            Self::Assign(_) | Self::Compound(..) | Self::Alternative(_)
+        )
+    }
+
+    /// The write over the copy: the same operator on `tail`, its right side read from the input.
+    fn over(self, tail: Expr) -> Expr {
+        let path = Box::new(tail);
+        let from_input = |value: Expr| {
+            Box::new(Expr::pipe(alloc::vec![
+                Expr::Var(VAR_WRITE_INPUT.to_string()),
+                value,
+            ]))
+        };
+        match self {
+            Self::Assign(value) => Expr::Assign {
+                path,
+                value: from_input(value),
+            },
+            Self::Compound(op, value) => Expr::CompoundAssign {
+                op,
+                path,
+                value: from_input(value),
+            },
+            Self::Alternative(value) => Expr::AlternativeAssign {
+                path,
+                value: from_input(value),
+            },
+            Self::Update(filter) => Expr::Update {
+                path,
+                filter: Box::new(filter),
+            },
+            Self::Delete => Expr::Builtin(Builtin::Del(path)),
+        }
+    }
+}
+
+/// Splice nested pipes (and parenthesised ones) into one stage list. `(A | B) | C` and
+/// `A | B | C` are the same evaluation, so a var-rooted write inside `(.c | $y.b = 9)` is seen as
+/// the stage it is.
+fn flatten_var_write_stages(stages: &[Expr], out: &mut Vec<Expr>) {
+    for stage in stages {
+        let mut inner = stage;
+        while let Expr::Paren(next) = inner {
+            inner = next;
+        }
+        match inner {
+            Expr::Pipe(nested) => flatten_var_write_stages(nested, out),
+            _ => out.push(stage.clone()),
+        }
     }
 }
 
@@ -1789,117 +1894,77 @@ fn var_write_tail(path: &Expr, var: &str) -> Option<Expr> {
 /// - `PRE | del($y<p>) | REST` is `PRE | (($y | del(<p>)) as $y | REST)`
 ///
 /// An empty `REST` is `.`, so the stage answers its input; a later var-rooted write in `REST` is
-/// rewritten the same way. Only a stage of the `as` body's own pipe is seen: one inside a
-/// construction, a branch or a path position (`(.a as $y | $y.b) = 5`) keeps its old answer.
+/// rewritten the same way, and so is one inside the body of a nested `as` of another variable
+/// (`.a as $x | .c as $y | $x.k = 5`), whose body is the rest of the pipe. Only stages of the
+/// body's pipe, and of the pipes nested in it, are seen: a write inside a construction, a branch or
+/// a path position (`(.a as $y | $y.b) = 5`) keeps its old answer.
 fn yq_var_write_rebind(var: &str, body: Expr) -> Expr {
-    let stages: Vec<Expr> = match body {
+    let stages: Vec<Expr> = match &body {
         Expr::Pipe(stages) => stages.to_vec(),
-        other => alloc::vec![other],
+        other => alloc::vec![other.clone()],
     };
-    rebind_var_writes(var, stages)
+    rebind_var_writes(var, &stages).unwrap_or(body)
 }
 
-fn rebind_var_writes(var: &str, mut stages: Vec<Expr>) -> Expr {
-    let found = stages.iter().enumerate().find_map(|(i, stage)| {
-        let mut peeled = stage;
-        while let Expr::Paren(inner) = peeled {
-            peeled = inner;
+/// `None` when no stage writes through `$var`, so the caller keeps the body as it was written.
+fn rebind_var_writes(var: &str, stages: &[Expr]) -> Option<Expr> {
+    let mut flat: Vec<Expr> = Vec::new();
+    flatten_var_write_stages(stages, &mut flat);
+    for at in 0..flat.len() {
+        let stage = flat[at].clone();
+        if let Some((tail, write)) = VarWrite::of(&stage, var) {
+            let rest = flat.split_off(at + 1);
+            flat.truncate(at);
+            let rest = if rest.is_empty() {
+                Expr::Identity
+            } else {
+                rebind_var_writes(var, &rest).unwrap_or_else(|| Expr::pipe(rest))
+            };
+            let needs_input = write.reads_input();
+            let rebound = Expr::As {
+                expr: Box::new(Expr::pipe(alloc::vec![
+                    Expr::Var(var.to_string()),
+                    write.over(tail),
+                ])),
+                var: var.to_string(),
+                body: Box::new(rest),
+            };
+            flat.push(if needs_input {
+                Expr::As {
+                    expr: Box::new(Expr::Identity),
+                    var: VAR_WRITE_INPUT.to_string(),
+                    body: Box::new(rebound),
+                }
+            } else {
+                rebound
+            });
+            return Some(Expr::pipe(flat));
         }
-        let (tail, rebuild): (Expr, Box<dyn Fn(Expr) -> Expr>) = match peeled {
-            Expr::Assign { path, value } => {
-                let value = (**value).clone();
-                (
-                    var_write_tail(path, var)?,
-                    Box::new(move |tail| Expr::Assign {
-                        path: Box::new(tail),
-                        value: Box::new(Expr::pipe(alloc::vec![
-                            Expr::Var(VAR_WRITE_INPUT.to_string()),
-                            value.clone(),
-                        ])),
-                    }),
-                )
+        // A nested binder of another variable owns the rest of the pipe as its body.
+        if let Expr::As {
+            expr,
+            var: inner,
+            body,
+        } = &stage
+        {
+            if inner != var {
+                let inner_stages: Vec<Expr> = match body.as_ref() {
+                    Expr::Pipe(stages) => stages.to_vec(),
+                    other => alloc::vec![other.clone()],
+                };
+                if let Some(rewritten) = rebind_var_writes(var, &inner_stages) {
+                    flat.truncate(at);
+                    flat.push(Expr::As {
+                        expr: expr.clone(),
+                        var: inner.clone(),
+                        body: Box::new(rewritten),
+                    });
+                    return Some(Expr::pipe(flat));
+                }
             }
-            Expr::CompoundAssign { op, path, value } => {
-                let (op, value) = (*op, (**value).clone());
-                (
-                    var_write_tail(path, var)?,
-                    Box::new(move |tail| Expr::CompoundAssign {
-                        op,
-                        path: Box::new(tail),
-                        value: Box::new(Expr::pipe(alloc::vec![
-                            Expr::Var(VAR_WRITE_INPUT.to_string()),
-                            value.clone(),
-                        ])),
-                    }),
-                )
-            }
-            Expr::AlternativeAssign { path, value } => {
-                let value = (**value).clone();
-                (
-                    var_write_tail(path, var)?,
-                    Box::new(move |tail| Expr::AlternativeAssign {
-                        path: Box::new(tail),
-                        value: Box::new(Expr::pipe(alloc::vec![
-                            Expr::Var(VAR_WRITE_INPUT.to_string()),
-                            value.clone(),
-                        ])),
-                    }),
-                )
-            }
-            Expr::Update { path, filter } => {
-                let filter = (**filter).clone();
-                (
-                    var_write_tail(path, var)?,
-                    Box::new(move |tail| Expr::Update {
-                        path: Box::new(tail),
-                        filter: Box::new(filter.clone()),
-                    }),
-                )
-            }
-            // A bare `del($y)` deletes the node `$y` was bound to from its live parent (yq's
-            // `deleteChildOperator`), which is not a write to the copy: it is left to its own rule.
-            Expr::Builtin(Builtin::Del(path)) => match var_write_tail(path, var)? {
-                Expr::Identity => return None,
-                tail => (
-                    tail,
-                    Box::new(|tail| Expr::Builtin(Builtin::Del(Box::new(tail)))),
-                ),
-            },
-            _ => return None,
-        };
-        Some((
-            i,
-            tail,
-            rebuild,
-            matches!(peeled, Expr::Update { .. } | Expr::Builtin(_)),
-        ))
-    });
-    let Some((at, tail, rebuild, no_input_needed)) = found else {
-        return Expr::pipe(stages);
-    };
-    let rest = stages.split_off(at + 1);
-    stages.pop();
-    let rest = if rest.is_empty() {
-        Expr::Identity
-    } else {
-        rebind_var_writes(var, rest)
-    };
-    let written = Expr::pipe(alloc::vec![Expr::Var(var.to_string()), rebuild(tail)]);
-    let rebound = Expr::As {
-        expr: Box::new(written),
-        var: var.to_string(),
-        body: Box::new(rest),
-    };
-    stages.push(if no_input_needed {
-        rebound
-    } else {
-        Expr::As {
-            expr: Box::new(Expr::Identity),
-            var: VAR_WRITE_INPUT.to_string(),
-            body: Box::new(rebound),
         }
-    });
-    Expr::pipe(stages)
+    }
+    None
 }
 
 /// `B(K)` as jq runs it, `K as $v | B($v)`, when `K` holds a `?//` bind (#3487).
