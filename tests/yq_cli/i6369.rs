@@ -95,6 +95,19 @@ const ROWS: &[(&str, Option<&str>)] = &[
         "a: |\r\n  x\u{2028}  y\r\nb: 1\r\n",
         Some("{\"a\":\"x\\u2028y\\n\",\"b\":1}"),
     ),
+    // an empty line made of a break, before the first content line and at the end of the text
+    (
+        "a: |\n  \u{2028}\n  x\n",
+        Some("{\"a\":\"\\u2028\\nx\\n\"}"),
+    ),
+    ("a: >\n \u{85}  x\n", Some("{\"a\":\"\\nx\\n\"}")),
+    (
+        "a: |2\n\u{2028}  x\nb: 1\n",
+        Some("{\"a\":\"\\u2028x\\n\",\"b\":1}"),
+    ),
+    ("a: |\n  x\u{2028}  ", Some("{\"a\":\"x\\u2028\"}")),
+    ("a: |+\n  x\n\u{2029}  ", Some("{\"a\":\"x\\n\\u2029\"}")),
+    ("a: |\n\u{2028}\n  x\n", Some("{\"a\":\"\\u2028\\nx\\n\"}")),
 ];
 
 #[test]
