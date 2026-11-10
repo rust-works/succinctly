@@ -1177,6 +1177,12 @@ pub mod alias_identity {
         /// `(anchor definition path, [alias paths...])`, one entry per anchor
         /// that has at least one alias — the shape `sync_aliased_paths` takes.
         groups: Vec<(Vec<OwnedValue>, Vec<Vec<OwnedValue>>)>,
+        /// The index in `groups` of the first group holding each alias position (as
+        /// [`position_key`] spells it), so a path prefix finds its anchor without a scan of every
+        /// alias: a fan-out over N aliases asked each of its N paths that question (#6839).
+        alias_group: std::collections::HashMap<Vec<u8>, usize>,
+        /// Every proper prefix of an alias position, the root included.
+        alias_prefixes: std::collections::HashSet<Vec<u8>>,
         /// The members a `<<` merge brought into a mapping (#6785).
         merged: Vec<MergedMember>,
         /// `merged` by the member's position (as [`position_key`] spells it), so a path prefix
@@ -1190,8 +1196,36 @@ pub mod alias_identity {
         /// Builds a table from `collect_alias_groups`'s output. Paths are
         /// plain `String`/`Int` key sequences addressing the `OwnedValue` tree.
         pub fn from_groups(groups: Vec<(Vec<OwnedValue>, Vec<Vec<OwnedValue>>)>) -> Self {
+            let mut alias_group = std::collections::HashMap::new();
+            let mut alias_prefixes = std::collections::HashSet::new();
+            for (idx, (_, aliases)) in groups.iter().enumerate() {
+                for alias in aliases {
+                    // A position of string and index steps, which is all the document walk
+                    // produces.
+                    let Some(key) = position_key(alias) else {
+                        continue;
+                    };
+                    alias_group.entry(key).or_insert(idx);
+                    let mut prefix = Vec::new();
+                    for step in &alias[..alias.len().saturating_sub(1)] {
+                        // The root, then each proper prefix; the aliases of one list share nearly
+                        // all of them, so a prefix is only copied the first time it is seen.
+                        if !alias_prefixes.contains(&prefix) {
+                            alias_prefixes.insert(prefix.clone());
+                        }
+                        if push_step_key(&mut prefix, step).is_none() {
+                            break;
+                        }
+                    }
+                    if !alias_prefixes.contains(&prefix) {
+                        alias_prefixes.insert(prefix.clone());
+                    }
+                }
+            }
             Self {
                 groups,
+                alias_group,
+                alias_prefixes,
                 merged: Vec::new(),
                 merged_by_member: std::collections::HashMap::new(),
                 merged_prefixes: std::collections::HashSet::new(),
@@ -1235,23 +1269,17 @@ pub mod alias_identity {
 
         /// The anchor path this exact alias position resolves to, if any.
         fn anchor_for(&self, prefix: &[OwnedValue]) -> Option<&[OwnedValue]> {
-            self.groups.iter().find_map(|(def, aliases)| {
-                aliases
-                    .iter()
-                    .any(|a| a.as_slice() == prefix)
-                    .then_some(def.as_slice())
-            })
+            // A prefix is built from field and index steps, the only ones with a key.
+            let idx = self.alias_group.get(&position_key(prefix)?)?;
+            Some(self.groups[*idx].0.as_slice())
         }
 
         /// Whether any alias position lies strictly *below* `prefix` — the
         /// only case in which fanning an `Iterate` out into per-element
         /// paths can change what a write does.
         fn has_alias_under(&self, prefix: &[OwnedValue]) -> bool {
-            self.groups.iter().any(|(_, aliases)| {
-                aliases
-                    .iter()
-                    .any(|a| a.len() > prefix.len() && a[..prefix.len()] == *prefix)
-            }) || self.has_merged_under(prefix)
+            position_key(prefix).is_some_and(|key| self.alias_prefixes.contains(&key))
+                || self.has_merged_under(prefix)
         }
 
         fn hop_bound(&self) -> usize {
@@ -1266,14 +1294,47 @@ pub mod alias_identity {
 
     thread_local! {
         static TABLE: RefCell<Option<Rc<AliasTable>>> = const { RefCell::new(None) };
+        /// How many update bodies are running with a path of their own (see [`enter_update_body`]).
+        static BODY_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
-    /// Whether a table is installed for the current evaluation.
+    /// Whether the evaluation is inside an update body that runs below the document's root.
+    fn in_update_body() -> bool {
+        BODY_DEPTH.with(|d| d.get() > 0)
+    }
+
+    /// Ends [`enter_update_body`]'s scope on drop.
+    #[must_use]
+    pub(crate) struct BodyGuard;
+
+    impl Drop for BodyGuard {
+        fn drop(&mut self) {
+            BODY_DEPTH.with(|d| d.set(d.get() - 1));
+        }
+    }
+
+    /// The table names positions from the document's root, so it means nothing to a write that an
+    /// update body makes below its target: `.list[] |= (.x = 7)` runs `.x = 7` on each element, and
+    /// its path `["x"]` is not the position `["x"]` of the document (#6839). Matched anyway, a body
+    /// write could be redirected onto an unrelated anchor, and each one walked the whole table,
+    /// which made the update quadratic in the number of aliases and merged members. Inside a body
+    /// every hook is off; the write the update itself makes at its target is still redirected,
+    /// before the body runs, and mirrored after it.
+    pub(crate) fn enter_update_body() -> BodyGuard {
+        BODY_DEPTH.with(|d| d.set(d.get() + 1));
+        BodyGuard
+    }
+
+    /// Whether a table is installed for the current evaluation, and the position it names is the
+    /// one being written.
     pub fn active() -> bool {
-        TABLE.with(|t| t.borrow().is_some())
+        !in_update_body() && TABLE.with(|t| t.borrow().is_some())
     }
 
     fn with_table<R>(f: impl FnOnce(&AliasTable) -> R) -> Option<R> {
+        if in_update_body() {
+            return None;
+        }
         let table = TABLE.with(|t| t.borrow().clone())?;
         Some(f(&table))
     }
@@ -1406,9 +1467,11 @@ pub mod alias_identity {
     fn push_step_key(key: &mut Vec<u8>, step: &OwnedValue) -> Option<()> {
         match step {
             OwnedValue::String(name) => {
+                // Length first, so a name holding the tag or terminator bytes cannot read as two
+                // steps (`"a\0kb"` against `["a", "b"]`).
                 key.push(b'k');
+                key.extend_from_slice(&(name.len() as u64).to_le_bytes());
                 key.extend_from_slice(name.as_bytes());
-                key.push(0);
             }
             OwnedValue::Int(idx) => {
                 key.push(b'i');
@@ -1772,6 +1835,108 @@ pub mod alias_identity {
         }
         Some(steps)
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn s(name: &str) -> OwnedValue {
+            OwnedValue::String(name.into())
+        }
+
+        fn i(idx: i64) -> OwnedValue {
+            OwnedValue::Int(idx)
+        }
+
+        /// The scans the indexes replaced (#6839).
+        fn anchor_by_scan<'t>(
+            table: &'t AliasTable,
+            prefix: &[OwnedValue],
+        ) -> Option<&'t [OwnedValue]> {
+            table.groups.iter().find_map(|(def, aliases)| {
+                aliases
+                    .iter()
+                    .any(|a| a.as_slice() == prefix)
+                    .then_some(def.as_slice())
+            })
+        }
+
+        fn under_by_scan(table: &AliasTable, prefix: &[OwnedValue]) -> bool {
+            table.groups.iter().any(|(_, aliases)| {
+                aliases
+                    .iter()
+                    .any(|a| a.len() > prefix.len() && a[..prefix.len()] == *prefix)
+            })
+        }
+
+        /// Every position a lookup could be asked about is answered as the scan answers it: nested
+        /// and index steps, the same alias listed under two anchors (the first group wins), and
+        /// names that hold the key encoding's own bytes.
+        #[test]
+        fn the_alias_indexes_answer_as_the_scans_they_replace_6839() {
+            let groups = vec![
+                (
+                    vec![s("a")],
+                    vec![
+                        vec![s("b")],
+                        vec![s("l"), i(0)],
+                        vec![s("l"), i(1), s("x")],
+                        vec![s("a\0kb")],
+                    ],
+                ),
+                (
+                    vec![s("c")],
+                    vec![vec![s("l"), i(0)], vec![s("d"), s("e"), s("f")], vec![i(3)]],
+                ),
+            ];
+            let table = AliasTable::from_groups(groups.clone());
+            let mut probes: Vec<Vec<OwnedValue>> = vec![
+                vec![],
+                vec![s("a"), s("b")],
+                vec![s("l")],
+                vec![s("l"), i(1)],
+                vec![s("l"), i(2)],
+                vec![s("d")],
+                vec![s("d"), s("e")],
+                vec![s("zz")],
+                vec![i(3)],
+                vec![i(0)],
+            ];
+            for (def, aliases) in &groups {
+                probes.push(def.clone());
+                for alias in aliases {
+                    probes.push(alias.clone());
+                    for depth in 0..alias.len() {
+                        probes.push(alias[..depth].to_vec());
+                    }
+                }
+            }
+            for probe in &probes {
+                assert_eq!(
+                    table.anchor_for(probe),
+                    anchor_by_scan(&table, probe),
+                    "anchor_for {probe:?}"
+                );
+                assert_eq!(
+                    position_key(probe).is_some_and(|key| table.alias_prefixes.contains(&key)),
+                    under_by_scan(&table, probe),
+                    "has_alias_under {probe:?}"
+                );
+            }
+            // The first group listing a position decides, as the scan did.
+            assert_eq!(table.anchor_for(&[s("l"), i(0)]), Some([s("a")].as_slice()));
+        }
+
+        /// A name holding the tag and terminator bytes is one step, never two.
+        #[test]
+        fn a_name_with_the_key_bytes_in_it_is_not_two_steps_6839() {
+            assert_ne!(position_key(&[s("a\0kb")]), position_key(&[s("a"), s("b")]));
+            assert_ne!(position_key(&[s("ab")]), position_key(&[s("a"), s("b")]));
+            let table = AliasTable::from_groups(vec![(vec![s("x")], vec![vec![s("a\0kb")]])]);
+            assert_eq!(table.anchor_for(&[s("a"), s("b")]), None);
+            assert_eq!(table.anchor_for(&[s("a\0kb")]), Some([s("x")].as_slice()));
+        }
+    }
 }
 
 /// `no_std` stand-in for the ambient alias-identity table: there is no
@@ -1813,6 +1978,13 @@ pub mod alias_identity {
     pub(crate) fn redirect_concrete_path(_path: &mut Vec<OwnedValue>, _doc: &OwnedValue) {}
 
     pub(crate) fn mirror_after_write(_pre: &OwnedValue, _post: &mut OwnedValue) {}
+
+    /// Nothing to gate without a table.
+    pub(crate) struct BodyGuard;
+
+    pub(crate) fn enter_update_body() -> BodyGuard {
+        BodyGuard
+    }
 
     pub(crate) fn adopt_body_member_edits(
         _pre: &OwnedValue,
@@ -45501,6 +45673,12 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 defer_deletes.then_some(&mut deletes),
             )
         } else {
+            // #6839: the body's own writes are relative to this target, not to the root. Only an
+            // update that has a table (`pre`) has anything to switch off, and a root path that
+            // comes after an earlier write (`(.a, .) |= f`) has a body whose paths are the
+            // document's.
+            let _body =
+                (pre.is_some() && !is_root_path(path)).then(alias_identity::enter_update_body);
             update_path_with_deletes::<S>(
                 &mut result,
                 path,
@@ -99260,13 +99438,10 @@ fn propagate_anchor_writes(
                 if !get_value_at_path(post, alias).is_some_and(|v| v.identical(want)) {
                     continue;
                 }
-                // The alias slots are named by string and index components
-                // only, so the mode `set_value_at_path` is told never decides
-                // anything here (#3506 added the one arm that reads it).
-                if let Ok(updated) =
-                    set_value_at_path::<JqSemantics>(post.clone(), alias, new.clone())
-                {
-                    *post = updated;
+                // The slot resolved a moment ago (the comparison above), so it is replaced in
+                // place: rebuilding the document around it copied the containers on the way to
+                // it once per alias, which made a fan-out over N aliases quadratic (#6839).
+                if replace_existing_at_path(post, alias, new.clone()) {
                     expected[g][a] = Some(new.clone());
                     changed = true;
                 }
@@ -175614,6 +175789,38 @@ mod tests {
             let mut post = json(r#"{"a":{"p":5,"q":1},"b":{"p":1,"q":1}}"#);
             alias_identity::mirror_after_write(&pre, &mut post);
             assert_eq!(post, json(r#"{"a":{"p":5,"q":5},"b":{"p":5,"q":5}}"#));
+        }
+
+        /// #6839: the table names positions from the root, so a write an update body makes below
+        /// its target neither redirects nor mirrors, and an update body nests.
+        #[test]
+        fn an_update_body_switches_every_hook_off_and_nests_6839() {
+            let _guard = alias_identity::enter(table());
+            let pre = json(DOC);
+            let rebound = r#"{"a":{"p":9,"q":2},"b":{"p":1,"q":2},"c":null}"#;
+            assert!(alias_identity::active());
+            {
+                let _outer = alias_identity::enter_update_body();
+                {
+                    let _inner = alias_identity::enter_update_body();
+                    assert!(!alias_identity::active());
+                }
+                // Still inside the outer body.
+                assert!(!alias_identity::active());
+                let mut post = json(rebound);
+                alias_identity::mirror_after_write(&pre, &mut post);
+                assert_eq!(post, json(rebound), "no mirror inside a body");
+                let mut paths = vec![Expr::Pipe(
+                    vec![Expr::Field("b".into()), Expr::Field("p".into())].into(),
+                )];
+                let before = paths.clone();
+                alias_identity::redirect_paths(&mut paths, &pre, alias_identity::Redirect::THROUGH);
+                assert_eq!(paths, before, "no redirect inside a body");
+            }
+            assert!(alias_identity::active());
+            let mut post = json(rebound);
+            alias_identity::mirror_after_write(&pre, &mut post);
+            assert_ne!(post, json(rebound), "the mirror is back outside it");
         }
 
         #[test]
