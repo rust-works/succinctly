@@ -46,6 +46,22 @@ const ROWS: &[(&str, Option<&str>)] = &[
     ("- |\n#x\n- q\n", Some("[\"\",\"q\"]")),
     ("a: |\n  #x\n  y\n", Some("{\"a\":\"#x\\ny\\n\"}")),
     ("a: >-\n    #x\n    y\n", Some("{\"a\":\"#x y\"}")),
+    // an explicit indent, CRLF, a second document, a nested key, a tab, a stream
+    ("a: |2\n#x\n  y\n", None),
+    ("a: |2\n  #x\n  y\n", Some("{\"a\":\"#x\\ny\\n\"}")),
+    ("a: |\r\n#x\r\n  y\r\n", None),
+    ("a: |\r\n#x\r\nb: 1\r\n", Some("{\"a\":\"\",\"b\":1}")),
+    ("a: 1\n---\nb: |\n#x\n  y\n", None),
+    ("a:\n  b: |\n#x\n    y\n", None),
+    (
+        "a:\n  b: |\n  #x\nc: 1\n",
+        Some("{\"a\":{\"b\":\"\"},\"c\":1}"),
+    ),
+    ("a: |\n  \t\n#x\n  y\n", None),
+    ("- - |\n  #x\n    y\n", None),
+    ("a: |\n#x\n  y\n---\nb: 1\n", None),
+    ("- |\n  #x\n    y\n", Some("[\"#x\\n  y\\n\"]")),
+    ("a: |\n#x\n  y\n---\nb: |\n  z\n", None),
 ];
 
 #[test]
