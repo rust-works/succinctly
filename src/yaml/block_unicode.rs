@@ -235,6 +235,11 @@ mod tests {
         );
         assert_eq!(end(format!("  x{LS}"), 2), Ok(6), "the end of the input");
         assert_eq!(end(format!("  x{LS}\n"), 2), Ok(7), "LS and a newline");
+        assert_eq!(
+            end(format!("  x{LS}  "), 2),
+            Ok(8),
+            "spaces to the end of the text"
+        );
     }
 
     #[test]
