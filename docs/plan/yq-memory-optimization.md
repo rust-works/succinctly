@@ -123,7 +123,8 @@ both.
   one beside the pristine tree. That is why `-o yaml` writes cost 27-60 MiB of RSS per MiB of input,
   and why the M1-M6 figures above (all `-o json`) understate the YAML cost.
 - **The presentation tree's width landed as #6815.** A `CommentTree` node is 32 bytes, from 224: its
-  `NodeMeta` sits behind a one-word `MetaSlot` that boxes it only when the node says something, an
+  `NodeMeta` (80 bytes) sits behind a one-word `MetaBox` that boxes it only when the node says something
+  (the `meta_mut` guard unboxes it again if a write leaves it empty), an
   object's field map behind a one-word `ChildMap`, and its per-key metadata behind a `KeyMap` that
   allocates on its first entry. Output is byte-identical on every row below. Interleaved A/B on `main`
   @ `5c9222a76`, release builds, peak RSS (median of 5 at 20 MiB, of 3 at 100 MiB) and the fastest
@@ -140,8 +141,13 @@ both.
   | `nested` 100 MiB                  |  2821 / 7.88 |  1627 / 7.02 |   2790 / 4.65 |  1629 / 4.46 |
 
   That is 37-49% less peak RSS and 4-15% less time. The controls do not move: the JSON-output write
-  (1060 MiB on the 7950X before and after) and the `.` fast path (261 and 262 MiB). A `users` query
-  whose results carry a tree falls 159 to 135 MiB (7950X) and 175 to 139 MiB (M4 Pro). DHAT on the
+  (1060 MiB on the 7950X before and after) and the `.` fast path (261 and 262 MiB). The 20 MiB `users`
+  query `.users[] | {"name": .name, "age": .age, "city": .city}` with `-o yaml`, whose results carry a
+  tree, falls 159 to 135 MiB (7950X) and 175 to 139 MiB (M4 Pro). Other shapes at 5 MiB with
+  `.zzz = 1` and `-o yaml` (7950X, one run each): `flow` 550 to 290, `mixed` 217 to 118, `sequences` 240
+  to 109, `strings` 157 to 96, `anchors` 605 to 438, `unicode` 155 to 122, `block-scalars` 48 to 47 and
+  `config` 15 to 16 (nothing to save: a scalar carries no tree, or the document is under a kilobyte), so
+  the 37-49% above is for records and nested documents, not every shape. DHAT on the
   20 MiB `users` write (7950X) reads 436.1 MiB live at the peak, from 864.6. What remains is four
   62 MiB blocks (the document materialized as `OwnedValue` twice, once by `to_owned_with_comments` and
   once by the assignment's target resolution, plus a pristine and a reconciled tree), each tree also
@@ -149,7 +155,7 @@ both.
   consumed as the reconciled one is built (several results reconcile against it, and a later pass reads
   it), and collapsing a subtree that says nothing into one leaf changes what the comment setters
   (`head_comment =` and its relatives, which index a node's members by position) find, so neither is
-  part of this change.
+  part of this change: the second copy of the document is #6879 and the two trees are #6880.
 
 ## Problem Statement
 

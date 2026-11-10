@@ -166,9 +166,11 @@ fn unflow_mappings(value: &OwnedValue, tree: &mut CommentTree) {
 /// The standalone comment above a node belongs to the key that introduces it (or to the document),
 /// not to the node, so a node taken into a construction leaves it behind; its foot stays (#865).
 fn drop_head_comment(tree: &mut CommentTree) {
-    let meta = tree.meta_mut();
-    if !meta.head_comment().is_empty() {
-        *meta = meta.with_head_foot(Vec::new(), meta.foot_comment().to_vec());
+    if !tree.meta().head_comment().is_empty() {
+        let kept = tree
+            .meta()
+            .with_head_foot(Vec::new(), tree.meta().foot_comment().to_vec());
+        tree.set_meta(kept);
     }
 }
 

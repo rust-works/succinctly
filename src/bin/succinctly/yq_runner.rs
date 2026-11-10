@@ -5225,7 +5225,7 @@ fn copy_alias_marks(src: &CommentTree, dst: &mut CommentTree) {
             }
         }
         CommentTree::Object(_, fields, _) => {
-            for (key, field) in fields {
+            for (key, field) in fields.iter() {
                 if contains_alias_mark(field) {
                     if let Some(child) =
                         comment_tree_at_path_or_create_mut(dst, &[TreeStep::Key(key.as_str())])
@@ -6971,7 +6971,7 @@ fn comment_tree_at_path_or_create_mut<'t>(
     let mut node = tree;
     for step in steps {
         if let CommentTree::Leaf(_) = node {
-            let meta = core::mem::take(node.meta_mut());
+            let meta = node.take_meta();
             *node = match step {
                 TreeStep::Key(_) => CommentTree::object(meta, IndexMap::new(), IndexMap::new()),
                 TreeStep::Index(_) => CommentTree::array(meta, Vec::new()),
@@ -6980,10 +6980,10 @@ fn comment_tree_at_path_or_create_mut<'t>(
         node = match (node, step) {
             (CommentTree::Object(_, fields, _), TreeStep::Key(k)) => fields
                 .entry((*k).to_string())
-                .or_insert_with(|| CommentTree::leaf(NodeMeta::empty())),
+                .or_insert_with(CommentTree::empty),
             (CommentTree::Array(_, items), TreeStep::Index(i)) => {
                 if items.len() <= *i {
-                    items.resize_with(*i + 1, || CommentTree::leaf(NodeMeta::empty()));
+                    items.resize_with(*i + 1, CommentTree::empty);
                 }
                 &mut items[*i]
             }
