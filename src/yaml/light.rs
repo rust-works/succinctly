@@ -6765,7 +6765,7 @@ impl<'a> YamlString<'a> {
             // node below it is the document's root, as for a `---` at column 0.
             if indent > 0
                 && rest.starts_with(b"---")
-                && matches!(rest.get(3), None | Some(b' ' | b'\t'))
+                && rest[3..].iter().all(|&b| b == b' ' || b == b'\t')
             {
                 return Some(0);
             }
@@ -10549,10 +10549,7 @@ fn header_head_lines(header: &[u8], synthesized: bool, force: bool) -> Option<Ve
         let line = core::str::from_utf8(&rest[..line_end]).ok()?;
         let crlf = brk == 2 && rest[line_end] == b'\r';
         // An indented bare `---` is the header's marker too (#6859).
-        let trimmed = line.trim_start_matches([' ', '\t']);
-        let indented_marker = trimmed.len() < line.len()
-            && trimmed.starts_with("---")
-            && trimmed[3..].bytes().all(|b| b == b' ' || b == b'\t');
+        let indented_marker = is_indented_bare_marker(line.as_bytes());
         if line.is_empty() {
             out.push(if crlf {
                 "# \r".to_string()
@@ -10823,12 +10820,16 @@ fn yq_header_len(text: &[u8]) -> (usize, bool) {
             || rest[indent_len] == b'#'
             || super::parser::starts_yq_yaml_directive(&rest[indent_len..])
             || (indent_len == 0 && rest[indent_len..].starts_with(b"---"))
-            || is_indented_bare_marker(
-                &rest[..rest
-                    .iter()
-                    .position(|&b| is_line_break(b))
-                    .unwrap_or(rest.len())],
-            );
+            // Only a line of blanks and then `---` can be an indented marker, which is decided before the
+            // line end is looked for, as for every other shape (#6859).
+            || (indent_len > 0
+                && rest[indent_len..].starts_with(b"---")
+                && is_indented_bare_marker(
+                    &rest[..rest
+                        .iter()
+                        .position(|&b| is_line_break(b))
+                        .unwrap_or(rest.len())],
+                ));
         if !header_shaped {
             return (pos, false);
         }
@@ -10888,10 +10889,7 @@ fn write_yq_header<W: AsRef<[u64]>, Out: core::fmt::Write>(
         // (A marker ended by a bare `\r` is left as it is: yq reads that as a marker with an empty line, not as ours.)
         // An indented `---` of the head is a marker too, written without its indent (#6859).
         let trimmed = line.trim_start_matches([' ', '\t']);
-        let indented_marker = trimmed.len() < line.len()
-            && trimmed.starts_with("---")
-            && trimmed[3..].bytes().all(|b| b == b' ' || b == b'\t');
-        let marker = line.starts_with("---") || indented_marker;
+        let marker = line.starts_with("---") || is_indented_bare_marker(line.as_bytes());
         unterminated = if marker {
             (brk == 0).then_some(true)
         } else {

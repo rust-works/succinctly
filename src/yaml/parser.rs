@@ -10120,17 +10120,21 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         if !self.yq_mode || !(self.pos == 0 || Self::is_break(self.input[self.pos - 1])) {
             return None;
         }
-        let mut at = self.pos;
-        while matches!(self.input.get(at), Some(b' ' | b'\t')) {
-            at += 1;
-        }
+        // The head test is two comparisons; the indent walk and the line walk come after it, so a line
+        // past the head costs those and nothing else.
         let in_head = match self.documents_started {
             0 => !self.in_document,
             1 => self.in_document && self.bp_pos == self.document_start_bp_pos,
             _ => false,
         };
+        if !in_head {
+            return None;
+        }
+        let mut at = self.pos;
+        while matches!(self.input.get(at), Some(b' ' | b'\t')) {
+            at += 1;
+        }
         (at > self.pos
-            && in_head
             && Self::marker_prefix(&self.input[at..], b"---")
             && self.only_yq_header_lines_before_cursor())
         .then_some(at)
