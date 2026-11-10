@@ -45574,7 +45574,8 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         &mut paths,
         &result,
         alias_identity::Redirect {
-            through_terminal: is_alias_sensitive_assign(filter_expr),
+            through_terminal: is_alias_sensitive_assign(filter_expr)
+                && !assigns_to_its_own_target(filter_expr),
             fan_out_iterate: true,
         },
     );
@@ -49529,6 +49530,32 @@ fn position_update_filter<S: EvalSemantics>(
 /// learns to unwrap reaches both call sites for free.
 fn is_root_path(path: &Expr) -> bool {
     is_effectively_identity(path)
+}
+
+/// Whether an update body writes to the node it runs on (`. = {..}`, `. |= f`, `del(.)`,
+/// `setpath([]; X)`), at the top of a pipe, a group or behind a binding (#6861). That write replaces
+/// the node at the position the update names, so for an alias target it rebinds the position and
+/// leaves the shared node alone, where a write *below* the target (`.p = 9`) reaches it.
+///
+/// One answer per update, so a body that writes below the target first and replaces it after
+/// (`.p = 5 | . = X`) is written positionally as a whole, where yq's first write reaches the shared
+/// node (recorded in the limitations ledger). A comma is not looked into: `is_alias_sensitive_assign`
+/// does not accept one, and the comma `|=` bodies that start with a write are pipes by the time they
+/// get here (#6854).
+fn assigns_to_its_own_target(body: &Expr) -> bool {
+    match body {
+        Expr::Assign { path, .. }
+        | Expr::Update { path, .. }
+        | Expr::CompoundAssign { path, .. }
+        | Expr::AlternativeAssign { path, .. }
+        | Expr::Builtin(Builtin::Del(path)) => is_root_path(path),
+        // `setpath([]; X)` names the whole node.
+        Expr::Builtin(Builtin::SetPath(path, _)) => is_empty_array_literal(path),
+        Expr::Paren(inner) | Expr::Optional(inner) => assigns_to_its_own_target(inner),
+        Expr::Pipe(stages) => stages.iter().any(assigns_to_its_own_target),
+        Expr::As { body, .. } | Expr::AsPattern { body, .. } => assigns_to_its_own_target(body),
+        _ => false,
+    }
 }
 
 /// Whether an update body is a chain of writes that each name a path below the node it runs on
