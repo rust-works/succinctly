@@ -127,27 +127,28 @@ both.
   (the `meta_mut` guard unboxes it again if a write leaves it empty), an
   object's field map behind a one-word `ChildMap`, and its per-key metadata behind a `KeyMap` that
   allocates on its first entry. Output is byte-identical on every row below. Interleaved A/B on `main`
-  @ `5c9222a76`, release builds, peak RSS (median of 5 at 20 MiB, of 3 at 100 MiB) and the fastest
-  wall time, `.zzz = 1` with `-o yaml` unless noted:
+  @ `5c9222a76` against the merged code, release builds, peak RSS (median of 5 at 20 MiB, of 3 at 100
+  MiB) and the fastest wall time, `.zzz = 1` with `-o yaml` unless noted:
 
   | peak RSS (MiB) / time (s)         | 7950X before |  7950X after | M4 Pro before | M4 Pro after |
   |-----------------------------------|-------------:|-------------:|--------------:|-------------:|
-  | `users` 20 MiB                    |   999 / 2.33 |   594 / 2.06 |   1008 / 1.32 |   589 / 1.25 |
-  | `users` 20 MiB, `-P`              |  1324 / 2.61 |   717 / 2.22 |   1290 / 1.46 |   672 / 1.36 |
-  | `users` 20 MiB, `del(.users[0])`  |  1000 / 2.32 |   634 / 2.04 |   1098 / 1.35 |   611 / 1.28 |
-  | `users` 100 MiB                   | 4905 / 11.74 | 2898 / 10.16 |   4960 / 7.04 |  2852 / 6.63 |
-  | `navigation` 100 MiB (`.[0].zzz`) | 5718 / 13.35 | 3316 / 11.88 |   5975 / 7.24 |  3069 / 6.72 |
-  | `comprehensive` 100 MiB           |  3750 / 9.37 |  2092 / 8.28 |   3856 / 6.08 |  2014 / 5.65 |
-  | `nested` 100 MiB                  |  2821 / 7.88 |  1627 / 7.02 |   2790 / 4.65 |  1629 / 4.46 |
+  | `users` 20 MiB                    |   996 / 2.30 |   594 / 2.02 |   1008 / 1.34 |   612 / 1.27 |
+  | `users` 20 MiB, `-P`              |  1320 / 2.62 |   716 / 2.21 |   1286 / 1.47 |   705 / 1.37 |
+  | `users` 20 MiB, `del(.users[0])`  |   996 / 2.29 |   634 / 2.03 |   1094 / 1.36 |   612 / 1.29 |
+  | `users` 20 MiB, `.zzz = .users`   |  1648 / 3.08 |   842 / 2.57 |   1643 / 1.81 |   852 / 1.66 |
+  | `users` 100 MiB                   | 4902 / 11.79 | 2897 / 10.11 |   5036 / 6.61 |  2886 / 6.29 |
+  | `navigation` 100 MiB (`.[0].zzz`) | 5714 / 13.37 | 3317 / 11.94 |   5965 / 6.88 |  3274 / 6.36 |
+  | `comprehensive` 100 MiB           |  3747 / 9.55 |  2092 / 8.20 |   3852 / 5.71 |  2106 / 5.31 |
+  | `nested` 100 MiB                  |  2818 / 8.02 |  1627 / 7.23 |   2789 / 4.49 |  1633 / 4.20 |
 
-  That is 37-49% less peak RSS and 4-15% less time. The controls do not move: the JSON-output write
+  That is 36-49% less peak RSS and 5-17% less time. The controls do not move: the JSON-output write
   (1060 MiB on the 7950X before and after) and the `.` fast path (261 and 262 MiB). The 20 MiB `users`
   query `.users[] | {"name": .name, "age": .age, "city": .city}` with `-o yaml`, whose results carry a
-  tree, falls 159 to 135 MiB (7950X) and 175 to 139 MiB (M4 Pro). Other shapes at 5 MiB with
+  tree, falls 156 to 134 MiB (7950X) and 175 to 139 MiB (M4 Pro). Other shapes at 5 MiB with
   `.zzz = 1` and `-o yaml` (7950X, one run each): `flow` 550 to 290, `mixed` 217 to 118, `sequences` 240
   to 109, `strings` 157 to 96, `anchors` 605 to 438, `unicode` 155 to 122, `block-scalars` 48 to 47 and
   `config` 15 to 16 (nothing to save: a scalar carries no tree, or the document is under a kilobyte), so
-  the 37-49% above is for records and nested documents, not every shape. DHAT on the
+  the 36-49% above is for records and nested documents, not every shape. DHAT on the
   20 MiB `users` write (7950X) reads 436.1 MiB live at the peak, from 864.6. What remains is four
   62 MiB blocks (the document materialized as `OwnedValue` twice, once by `to_owned_with_comments` and
   once by the assignment's target resolution, plus a pristine and a reconciled tree), each tree also
