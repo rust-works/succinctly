@@ -86813,7 +86813,7 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
 /// multiset, so a path that is listed twice loses one entry per mention, as the scan did; any
 /// other shape is matched by equality.
 fn remove_first_occurrences(paths: &mut Vec<Expr>, gone: &[Expr]) {
-    let mut keyed: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
+    let mut keyed: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
     let mut unkeyed: Vec<&Expr> = Vec::new();
     for path in gone {
         match static_path_key(path) {
