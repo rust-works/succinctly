@@ -1149,6 +1149,8 @@ fn write_docs(root: &std::path::Path, results: &Results, args: &CompareJqArgs) -
     // leaves every committed file as it was.
     let bench = root.join(docs::BENCHMARKS_DOC);
     let bench_doc = docs::patch_benchmarks(&std::fs::read_to_string(&bench)?, &runs)?;
+    let summary = root.join(docs::SUMMARY_DOC);
+    let summary_doc = docs::patch_summary(&std::fs::read_to_string(&summary)?, &runs)?;
     std::fs::write(
         dir.join(format!("jq-{p}.md")),
         docs::sanitize(
@@ -1159,9 +1161,11 @@ fn write_docs(root: &std::path::Path, results: &Results, args: &CompareJqArgs) -
     std::fs::write(dir.join(format!("jq-{p}.json")), json)?;
     std::fs::write(dir.join("jq.md"), docs::index(&runs))?;
     std::fs::write(&bench, bench_doc)?;
+    std::fs::write(&summary, summary_doc)?;
     println!(
-        "wrote docs/compare/jq-{p}.md, jq-{p}.json, jq.md and {}",
-        docs::BENCHMARKS_DOC
+        "wrote docs/compare/jq-{p}.md, jq-{p}.json, jq.md, {} and {}",
+        docs::BENCHMARKS_DOC,
+        docs::SUMMARY_DOC
     );
     Ok(())
 }
@@ -1172,11 +1176,15 @@ fn render_docs(root: &std::path::Path) -> Result<()> {
     let runs = docs::committed_runs(&dir, None)?;
     let bench = root.join(docs::BENCHMARKS_DOC);
     let bench_doc = docs::patch_benchmarks(&std::fs::read_to_string(&bench)?, &runs)?;
+    let summary = root.join(docs::SUMMARY_DOC);
+    let summary_doc = docs::patch_summary(&std::fs::read_to_string(&summary)?, &runs)?;
     std::fs::write(dir.join("jq.md"), docs::index(&runs))?;
     std::fs::write(&bench, bench_doc)?;
+    std::fs::write(&summary, summary_doc)?;
     println!(
-        "rendered docs/compare/jq.md and {} from {} committed run(s)",
+        "rendered docs/compare/jq.md, {} and {} from {} committed run(s)",
         docs::BENCHMARKS_DOC,
+        docs::SUMMARY_DOC,
         runs.len()
     );
     Ok(())

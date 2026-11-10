@@ -80,6 +80,7 @@ cargo build --release --features cli,simd,regex,serde --target-dir target/subjec
 A platform's first run needs the two markers added at the top of its section there.
 The section's `**CPU**:` line must name the run's CPU (two machines can share a platform), and `--write-docs` checks that before it measures anything.
 `--render-docs` measures nothing: it re-renders the index and every block from the committed jsons, after a change to how they are rendered.
+Both also regenerate the `<!-- compare:jq-summary -->` block of `CLAUDE.md` (one row per committed run: the geomean speedup of each size tier), from every committed json.
 The bin's `benchmarks_doc_quotes_the_committed_results` test fails when a block and its json disagree.
 CI is `.github/workflows/compare-jq.yml`, run by hand or on a release, not on pull requests.
 `.github/workflows/compare-jq-ledger.yml` runs the correctness dimensions (no timing rows) on pull requests that touch
