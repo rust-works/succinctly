@@ -92,7 +92,7 @@ both.
 | M4, streaming JSON      | **Done**, as the printer      | #6814 | `to_json` already writes into one buffer; `format_json_impl` (`output.rs`) still does not: 42-51% of the live heap at a whole-document write, about 11% for a result-shaped print |
 | M5, lazy `IndexMap`     | **Not pursued**               | -     | At most 6-9% of peak RSS (table above); touches the `Deref` contract of `ObjectMapOf`                                                                                             |
 | M6, key interning       | **Not pursued**               | -     | At most 15% (7950X) / 8% (M4 Pro) of peak RSS on record-shaped input, 3-6% on unique-key shapes; changes the key type of every object                                             |
-| (new) presentation tree | **Implement**                 | #6815 | 58% of the live heap at a YAML-output write; that write is 3.3-3.9x the JSON-output write (3.7-3.9x on the 7950X, 3.3x on the M4 Pro)                                             |
+| (new) presentation tree | **Narrowed**, #6815           | #6815 | 58% of the live heap at a YAML-output write; that write is 3.3-3.9x the JSON-output write (3.7-3.9x on the 7950X, 3.3x on the M4 Pro)                                             |
 
 - **M1** is the largest term that a query-shaped workload hits and the only one with an existing
   implementation in the same binary (`jq` mode). Streaming needs the evaluator to hand results out one
@@ -122,6 +122,34 @@ both.
   record's `OwnedValue`), comment-free nodes included, and `reconcile_presentation` builds a second
   one beside the pristine tree. That is why `-o yaml` writes cost 27-60 MiB of RSS per MiB of input,
   and why the M1-M6 figures above (all `-o json`) understate the YAML cost.
+- **The presentation tree's width landed as #6815.** A `CommentTree` node is 32 bytes, from 224: its
+  `NodeMeta` sits behind a one-word `MetaSlot` that boxes it only when the node says something, an
+  object's field map behind a one-word `ChildMap`, and its per-key metadata behind a `KeyMap` that
+  allocates on its first entry. Output is byte-identical on every row below. Interleaved A/B on `main`
+  @ `5c9222a76`, release builds, peak RSS (median of 5 at 20 MiB, of 3 at 100 MiB) and the fastest
+  wall time, `.zzz = 1` with `-o yaml` unless noted:
+
+  | peak RSS (MiB) / time (s)         | 7950X before |  7950X after | M4 Pro before | M4 Pro after |
+  |-----------------------------------|-------------:|-------------:|--------------:|-------------:|
+  | `users` 20 MiB                    |   999 / 2.33 |   594 / 2.06 |   1008 / 1.32 |   589 / 1.25 |
+  | `users` 20 MiB, `-P`              |  1324 / 2.61 |   717 / 2.22 |   1290 / 1.46 |   672 / 1.36 |
+  | `users` 20 MiB, `del(.users[0])`  |  1000 / 2.32 |   634 / 2.04 |   1098 / 1.35 |   611 / 1.28 |
+  | `users` 100 MiB                   | 4905 / 11.74 | 2898 / 10.16 |   4960 / 7.04 |  2852 / 6.63 |
+  | `navigation` 100 MiB (`.[0].zzz`) | 5718 / 13.35 | 3316 / 11.88 |   5975 / 7.24 |  3069 / 6.72 |
+  | `comprehensive` 100 MiB           |  3750 / 9.37 |  2092 / 8.28 |   3856 / 6.08 |  2014 / 5.65 |
+  | `nested` 100 MiB                  |  2821 / 7.88 |  1627 / 7.02 |   2790 / 4.65 |  1629 / 4.46 |
+
+  That is 37-49% less peak RSS and 4-15% less time. The controls do not move: the JSON-output write
+  (1060 MiB on the 7950X before and after) and the `.` fast path (261 and 262 MiB). A `users` query
+  whose results carry a tree falls 159 to 135 MiB (7950X) and 175 to 139 MiB (M4 Pro). DHAT on the
+  20 MiB `users` write (7950X) reads 436.1 MiB live at the peak, from 864.6. What remains is four
+  62 MiB blocks (the document materialized as `OwnedValue` twice, once by `to_owned_with_comments` and
+  once by the assignment's target resolution, plus a pristine and a reconciled tree), each tree also
+  paying 12 MiB for its hash tables and 10 MiB for the object boxes. The pristine tree cannot be
+  consumed as the reconciled one is built (several results reconcile against it, and a later pass reads
+  it), and collapsing a subtree that says nothing into one leaf changes what the comment setters
+  (`head_comment =` and its relatives, which index a node's members by position) find, so neither is
+  part of this change.
 
 ## Problem Statement
 
