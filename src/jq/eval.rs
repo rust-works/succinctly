@@ -94387,6 +94387,26 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
     finish_fold_forks(terminal, init_flow, retry.init, optional)
 }
 
+/// The UPDATE a yq fold step runs: the loop variables spliced in, unless it reads none (`inert`).
+fn bind_yq_update<'e>(
+    expr: &'e Expr,
+    inert: bool,
+    bindings: &[(String, OwnedValue)],
+    all_var_names: &[String],
+) -> Cow<'e, Expr> {
+    if inert {
+        Cow::Borrowed(expr)
+    } else {
+        Cow::Owned(substitute_fold_step(
+            expr,
+            bindings,
+            all_var_names,
+            LoopVarSplice::Literal,
+            false,
+        ))
+    }
+}
+
 /// yq's `reduce` (#6802): a fold over a *list* of accumulators, where jq's is one independent fork per
 /// INIT output that keeps UPDATE's last output.
 ///
@@ -94427,36 +94447,25 @@ fn reduce_list_yq<S: EvalSemantics>(
         return finish_fork_flow(None, optional);
     }
 
-    let mut shared_budget = REDUCE_FOREACH_MAX_STEPS;
-    let mut budget = FoldBudget::for_fork(&mut shared_budget, true);
+    // The list's growth is what is charged: a step on one accumulator is free, as the first fork of
+    // jq's fold is, and each accumulator past the first spends a unit, so a union in UPDATE that
+    // doubles the list every step is refused at 100,000 accumulators where yq grows it until the
+    // process dies (`ireduce (0; (. + 1, . + 2))` over 30 elements is 2^30).
+    let mut extra_budget = REDUCE_FOREACH_MAX_STEPS;
     let mut failure: Option<Control> = None;
     let source_flow = drive_source(SourceInput::Real, &mut |element| {
         let sets_flow = each_pattern_binding_set::<S>(pattern, &element, false, &mut |bindings| {
-            if let Some(control) = budget.charge_step("reduce") {
-                failure = Some(control);
-                return Demand::Stop;
-            }
             let current = core::mem::take(&mut accumulators);
             let stepped: Result<Vec<OwnedValue>, Control> = if current.len() == 1 {
                 // The list's own allocation takes the outputs, so a step that answers once
                 // allocates nothing.
                 let mut outputs = current;
                 let state = outputs.pop().expect("one accumulator");
+                // yq mode never witnesses a node (`FoldOperand::new`), so this is the hoisted
+                // UPDATE the several-accumulator step below runs too.
                 let (expr, reentry) = update.against::<S>(&state);
-                let rebuilt;
-                let substituted: &Expr = if update.inert {
-                    expr
-                } else {
-                    rebuilt = substitute_fold_step(
-                        expr,
-                        bindings,
-                        &all_var_names,
-                        LoopVarSplice::Literal,
-                        false,
-                    );
-                    &rebuilt
-                };
-                match fold_step_each::<S>(substituted, state, optional, reentry, &mut |v| {
+                let substituted = bind_yq_update(expr, update.inert, bindings, &all_var_names);
+                match fold_step_each::<S>(&substituted, state, optional, reentry, &mut |v| {
                     outputs.push(v);
                     Demand::Continue
                 }) {
@@ -94464,25 +94473,28 @@ fn reduce_list_yq<S: EvalSemantics>(
                     _ => Ok(outputs),
                 }
             } else {
-                let rebuilt;
-                let substituted: &Expr = if update.inert {
-                    update.hoisted
-                } else {
-                    rebuilt = substitute_fold_step(
-                        update.hoisted,
-                        bindings,
-                        &all_var_names,
-                        LoopVarSplice::Literal,
-                        false,
-                    );
-                    &rebuilt
-                };
-                super::eval_generic::eval_yq_over_owned_list::<S>(substituted, current, optional)
+                let substituted =
+                    bind_yq_update(update.hoisted, update.inert, bindings, &all_var_names);
+                super::eval_generic::eval_yq_over_owned_list::<S>(&substituted, current, optional)
             };
             match stepped {
                 Ok(next) => {
+                    let extra = next.len().saturating_sub(1);
+                    if extra > extra_budget {
+                        // #2132: uncatchable, as every step budget's.
+                        failure = Some(Control::Error(EvalError::resource_limit(
+                            "reduce: maximum iterations exceeded".to_string(),
+                        )));
+                        return Demand::Stop;
+                    }
+                    extra_budget -= extra;
                     accumulators = next;
-                    Demand::Continue
+                    // An empty list stays empty: the rest of the source is not read.
+                    if accumulators.is_empty() {
+                        Demand::Stop
+                    } else {
+                        Demand::Continue
+                    }
                 }
                 Err(control) => {
                     failure = Some(control);
@@ -94493,7 +94505,7 @@ fn reduce_list_yq<S: EvalSemantics>(
         if let Flow::Escaped(control) = sets_flow {
             failure.get_or_insert(control);
         }
-        if failure.is_some() {
+        if failure.is_some() || accumulators.is_empty() {
             Demand::Stop
         } else {
             Demand::Continue

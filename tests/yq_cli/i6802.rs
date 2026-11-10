@@ -83,3 +83,48 @@ fn an_error_in_the_update_prints_nothing_6802() -> Result<()> {
     assert_eq!(stdout, "");
     Ok(())
 }
+
+/// A source of three elements: the list a step leaves is the one the next step starts from.
+const THREE: &[(&str, &str)] = &[
+    (
+        ".n[] as $i ireduce(0; (. + $i, . * 10))",
+        "6\n5\n13\n3\n30\n20\n100\n0\n",
+    ),
+    (
+        ".n[] as $i ireduce((1, 2); (. + $i, . - 1))",
+        "7\n8\n5\n6\n4\n5\n2\n3\n3\n4\n1\n2\n0\n1\n-2\n-1\n",
+    ),
+    (
+        ".n[] as $i ireduce(0; ((. + $i), (. * 2)) | . + 1)",
+        "9\n8\n9\n7\n11\n9\n11\n7\n",
+    ),
+    (".n[] as $i ireduce(0; select(. < 4) | . + $i)", "6\n"),
+    (
+        ".n[] as $i ireduce([]; . + [$i], . + [$i * 10])",
+        "[1,2,3]\n[10,2,3]\n[1,20,3]\n[10,20,3]\n[1,2,30]\n[10,2,30]\n[1,20,30]\n[10,20,30]\n",
+    ),
+];
+
+#[test]
+fn the_list_carries_from_step_to_step_6802() -> Result<()> {
+    for (filter, expected) in THREE {
+        let (stdout, code) = run_yq_stdin(filter, "n: [1, 2, 3]\n", &["-o", "json", "-I0"])?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(&stdout, expected, "{filter}");
+    }
+    Ok(())
+}
+
+/// A list that doubles every step is refused at the step budget, where yq grows it until it dies.
+#[test]
+fn a_list_that_doubles_every_step_is_refused_6802() -> Result<()> {
+    let input = "n: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]\n";
+    let (stdout, code) = run_yq_stdin(
+        ".n[] as $i ireduce (0; (. + 1, . + 2)) | length",
+        input,
+        &["-o", "json", "-I0"],
+    )?;
+    assert_ne!(code, 0);
+    assert_eq!(stdout, "");
+    Ok(())
+}
