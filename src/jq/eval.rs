@@ -175043,9 +175043,6 @@ mod tests {
         query!(br"5", "(implode)?", QueryResult::None => {});
     }
 
-    /// #1351: `alias_identity`'s redirect and mirror, exercised directly on
-    /// hand-built tables so each gate is pinned independently of the CLI
-    /// tests that drive the same code end to end.
     #[cfg(feature = "std")]
     mod merged_member_helpers_6785 {
         use super::*;
@@ -175103,6 +175100,10 @@ mod tests {
         }
     }
 
+    /// #1351: `alias_identity`'s redirect and mirror, exercised directly on
+    /// hand-built tables so each gate is pinned independently of the CLI
+    /// tests that drive the same code end to end.
+    #[cfg(feature = "std")]
     mod alias_identity_tests_1351 {
         use super::*;
 
