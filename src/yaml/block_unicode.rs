@@ -22,6 +22,9 @@
 //! all become `\n` in the value, and LS and PS stay as they were. LS and PS never fold, and the
 //! last break of a scalar under `clip` or `keep` is whichever one the text has.
 
+#[cfg(not(test))]
+use alloc::{string::String, vec::Vec};
+
 use super::light::{ChompingIndicator, YamlStringError};
 
 /// Width of the NEL (two bytes), LS or PS (three) at `pos`, or 0.
