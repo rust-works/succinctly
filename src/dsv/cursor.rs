@@ -146,6 +146,17 @@ impl<'a> DsvCursor<'a> {
         core::str::from_utf8(self.current_field())
     }
 
+    /// Whether the text ends right after a delimiter, so that the cursor stands at its end with one
+    /// empty field left to read (#6875): `a,b,` is three fields, as `a,b,` and a line break is. The
+    /// delimiter is the last byte and a marker (one inside a quote is not), and not a newline.
+    fn at_trailing_empty_field(&self) -> bool {
+        let len = self.text.len();
+        self.position == len
+            && len > 0
+            && self.index.markers_rank1(len) > self.index.markers_rank1(len - 1)
+            && self.index.newlines_rank1(len) == self.index.newlines_rank1(len - 1)
+    }
+
     /// Check if the current byte is a newline marker.
     fn at_newline(&self) -> bool {
         if self.position == 0 || self.position > self.text.len() {
@@ -195,7 +206,7 @@ impl<'a> DsvRow<'a> {
             ..self.cursor
         };
 
-        for _ in 0..column {
+        for step in 0..column {
             // Check if we hit a newline before reaching the column
             let field = cursor.current_field();
             if field.is_empty() && cursor.at_end() {
@@ -203,7 +214,9 @@ impl<'a> DsvRow<'a> {
             }
 
             if !cursor.next_field() {
-                return None;
+                // The empty field after a delimiter that ends the text (#6875).
+                return (step + 1 == column && cursor.at_trailing_empty_field())
+                    .then(|| &cursor.text[cursor.text.len()..]);
             }
 
             // Check if we moved to the next row
@@ -297,6 +310,10 @@ impl<'a> Iterator for DsvFields<'a> {
         // Move to next field
         if !self.cursor.next_field() {
             self.finished = true;
+            // The empty field after a delimiter that ends the text (#6875).
+            if self.cursor.at_trailing_empty_field() {
+                return Some(&self.cursor.text[self.cursor.text.len()..]);
+            }
             return None;
         }
 
@@ -340,6 +357,34 @@ mod tests {
     use super::super::parser::build_index;
     use super::super::DsvConfig;
     use super::*;
+
+    #[test]
+    fn a_delimiter_that_ends_the_text_leaves_an_empty_field_6875() {
+        let rows = |text: &[u8]| -> Vec<Vec<String>> {
+            let index = build_index(text, &DsvConfig::default());
+            DsvRows::new(text, &index)
+                .map(|row| {
+                    row.fields()
+                        .map(|f| String::from_utf8(f.to_vec()).unwrap())
+                        .collect()
+                })
+                .collect()
+        };
+        assert_eq!(rows(b"a,b,"), vec![vec!["a", "b", ""]]);
+        assert_eq!(rows(b"a,b,\n"), vec![vec!["a", "b", ""]]);
+        assert_eq!(rows(b"a,b\n1,,"), vec![vec!["a", "b"], vec!["1", "", ""]]);
+        assert_eq!(rows(b","), vec![vec!["", ""]]);
+        // A delimiter inside a quote is not one, and a newline at the end is a row end.
+        assert_eq!(rows(b"\"a,\""), vec![vec!["\"a,\""]]);
+        assert_eq!(rows(b"a,b\n"), vec![vec!["a", "b"]]);
+        // `get` reads the same field the iterator does, and none past it.
+        let text = b"a,b,";
+        let index = build_index(text, &DsvConfig::default());
+        let row = DsvRows::new(text, &index).next().unwrap();
+        assert_eq!(row.get(2), Some(b"".as_slice()));
+        assert_eq!(row.get(3), None);
+        assert_eq!(row.get(1), Some(b"b".as_slice()));
+    }
 
     #[test]
     fn crlf_is_the_record_terminator_6874() {
