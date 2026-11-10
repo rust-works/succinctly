@@ -9937,6 +9937,30 @@ fn explicit_key_lead_blanks(indent: &str, child_indent: &str) -> usize {
 /// A key's source span of 128 bytes or less without a backslash cannot decode to more or to a
 /// break, and a plain key's span is known without a scan, so a short key goes on to the ordinary
 /// writer.
+/// Writes a mapping key as an explicit one, `? <properties><scalar>` and the line break that
+/// leads back to `indent` for the `:` line, for a key whose scalar the caller has already spelled
+/// (#6075, #4913). The key's own anchor and tag come first, as `write_yaml_field_key` writes them.
+fn write_explicit_scalar_key<W: AsRef<[u64]>, Out: core::fmt::Write>(
+    out: &mut Out,
+    field: YamlField<'_, W>,
+    scalar: &str,
+    indent: &str,
+) -> core::fmt::Result {
+    out.write_str("? ")?;
+    if let Some(anchor) = field.key_cursor().anchor() {
+        out.write_char('&')?;
+        out.write_str(anchor)?;
+        out.write_char(' ')?;
+    }
+    if let Some(tag) = field.key_cursor().explicit_tag_at(None) {
+        out.write_str(tag)?;
+        out.write_char(' ')?;
+    }
+    out.write_str(scalar)?;
+    out.write_char('\n')?;
+    out.write_str(indent)
+}
+
 #[inline(never)]
 fn write_yaml_block_field_key_checked<W: AsRef<[u64]>, Out: core::fmt::Write>(
     out: &mut Out,
@@ -9956,20 +9980,7 @@ fn write_yaml_block_field_key_checked<W: AsRef<[u64]>, Out: core::fmt::Write>(
                 if let Ok(decoded) = s.as_str() {
                     let child_indent = deeper_yaml_indent(indent, indent_spaces, unit);
                     if let Some(scalar) = go_yaml_single_quoted_line_feed(&decoded, &child_indent) {
-                        out.write_str("? ")?;
-                        // The key's own anchor and tag, as `write_yaml_field_key` writes them.
-                        if let Some(anchor) = field.key_cursor().anchor() {
-                            out.write_char('&')?;
-                            out.write_str(anchor)?;
-                            out.write_char(' ')?;
-                        }
-                        if let Some(tag) = field.key_cursor().explicit_tag_at(None) {
-                            out.write_str(tag)?;
-                            out.write_char(' ')?;
-                        }
-                        out.write_str(&scalar)?;
-                        out.write_char('\n')?;
-                        out.write_str(indent)?;
+                        write_explicit_scalar_key(out, field, &scalar, indent)?;
                         return Ok(true);
                     }
                 }
@@ -9984,19 +9995,7 @@ fn write_yaml_block_field_key_checked<W: AsRef<[u64]>, Out: core::fmt::Write>(
                         if let Some(scalar) =
                             go_yaml_unicode_separator_scalar(&decoded, &child_indent, indent_spaces)
                         {
-                            out.write_str("? ")?;
-                            if let Some(anchor) = field.key_cursor().anchor() {
-                                out.write_char('&')?;
-                                out.write_str(anchor)?;
-                                out.write_char(' ')?;
-                            }
-                            if let Some(tag) = field.key_cursor().explicit_tag_at(None) {
-                                out.write_str(tag)?;
-                                out.write_char(' ')?;
-                            }
-                            out.write_str(&scalar)?;
-                            out.write_char('\n')?;
-                            out.write_str(indent)?;
+                            write_explicit_scalar_key(out, field, &scalar, indent)?;
                             return Ok(true);
                         }
                     }
