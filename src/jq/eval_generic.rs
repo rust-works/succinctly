@@ -42701,10 +42701,14 @@ fn owned_identity_after_prefetch(
 /// cursor's own `style()` stays the style without the tag: the writers echo it.
 fn node_style_getter<C: DocumentCursor>(cursor: &C) -> &'static str {
     let style = cursor.style();
-    match cursor.explicit_tag_of_non_alias() {
-        Some(tag) if tag != "!" && style.is_empty() => "tagged",
-        Some(tag) if tag != "!" => "<unknown>",
-        _ => style,
+    // `!<!>` is the verbatim spelling of the non-specific `!`.
+    match cursor
+        .explicit_tag_of_non_alias()
+        .filter(|tag| !matches!(*tag, "!" | "!<!>"))
+    {
+        Some(_) if style.is_empty() => "tagged",
+        Some(_) => "<unknown>",
+        None => style,
     }
 }
 

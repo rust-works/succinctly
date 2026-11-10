@@ -75,6 +75,15 @@ const ROWS: &[(&str, &str, &str)] = &[
         "0\n",
     ),
     ("a: !foo x\n", ".a as $v | $v | style", "\"tagged\"\n"),
+    ("a: !<!> x\n", ".a | style", "\"\"\n"),
+    ("a: !foo []\n", ".a | style", "\"<unknown>\"\n"),
+    ("a: !foo {}\n", ".a | style", "\"<unknown>\"\n"),
+    (
+        "a: !foo x\n---\nb: !bar \"y\"\n",
+        "[.. | style]",
+        "[\"\",\"tagged\"]\n[\"\",\"<unknown>\"]\n",
+    ),
+    ("a: !foo x\n", ".a | style", "\"tagged\"\n"),
 ];
 
 #[test]
