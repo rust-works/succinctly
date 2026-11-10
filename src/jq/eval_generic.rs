@@ -44168,6 +44168,40 @@ mod tests {
         }
     }
 
+    /// #6833: the same in yq mode through a call to a parameterless `def` whose body is `length`:
+    /// the bytes of string written out for a reindex do not grow with the round count. It can
+    /// fail: with the `DefCall` arm of `string_length_stage` removed the counts differ by the
+    /// rounds. A body that is more than the builtin (`length + 1`) still bridges, and answers.
+    #[cfg(feature = "std")]
+    #[test]
+    fn yq_def_call_of_a_string_length_in_a_loop_body_is_not_bridged_per_round_6833() {
+        use crate::jq::value::reindex_count;
+
+        let json = br#""hello""#;
+        let index = JsonIndex::build(json);
+        let run = |filter: &str| {
+            let expr = crate::jq::parse(filter).unwrap();
+            let before = reindex_count::string_bytes();
+            let result = eval_using::<YqSemantics, _>(&expr, index.root(json).value())
+                .collect_owned::<YqSemantics>()
+                .unwrap();
+            let text = result.iter().map(OwnedValue::to_json).collect::<Vec<_>>();
+            (text, reindex_count::string_bytes() - before)
+        };
+        let (few, few_reindexes) = run(r#"def f: length; (. + "é") as $t | [range(3) | ($t | f)]"#);
+        let (many, many_reindexes) =
+            run(r#"def f: length; (. + "é") as $t | [range(30) | ($t | f)]"#);
+        assert_eq!(few, ["[7,7,7]"]);
+        assert_eq!(many.len(), 1);
+        assert_eq!(many[0].matches('7').count(), 30);
+        assert_eq!(
+            few_reindexes, many_reindexes,
+            "a call must not write the bound string out again"
+        );
+        let (more, _) = run(r#"def f: length + 1; (. + "é") as $t | [range(2) | ($t | f)]"#);
+        assert_eq!(more, ["[8,8]"]);
+    }
+
     /// #5593: `floor`, `ceil`, `round`, `trunc`, `sqrt` and `fabs` of a document number are
     /// answered from the number, not bridged: the bridge serialises the value and indexes it again
     /// (`reindex_count` counts exactly that), once per number. A value that is not a finite number
