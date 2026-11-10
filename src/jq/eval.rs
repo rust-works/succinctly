@@ -88841,10 +88841,9 @@ fn owned_arith_accumulator_shape<S: EvalSemantics>(expr: &Expr) -> Option<(Arith
 /// extends the accumulator's string in place twice instead of re-evaluating it whole.
 /// Two links at least: one is the shape above.
 fn owned_arith_chain_shape<S: EvalSemantics>(expr: &Expr) -> Option<Vec<(ArithOp, OwnedValue)>> {
-    if !matches!(expr, Expr::Arithmetic { .. }) {
-        return None;
-    }
-    // #6802: each right operand is read-only in yq, as in `owned_arith_accumulator_shape`.
+    // #6802: each right operand is read-only in yq, as in `owned_arith_accumulator_shape`. The one
+    // caller, `owned_arith_chain_step`, is only reached for an arithmetic UPDATE whose left is
+    // arithmetic too, so the scope is never entered for a shape this declines at once.
     let _read_only = S::READ_ONLY_ABSENT_KEY_IS_EMPTY.then(yq_read_only_context::enter);
     let mut links = Vec::new();
     let mut at = expr;
