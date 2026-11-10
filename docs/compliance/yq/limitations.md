@@ -1134,6 +1134,30 @@ $ succinctly yq --eval-all -o=json -I0 '. as $x | [$x]' f1.yaml f2.yaml
 `. as $d | $d` (no collect in the body) agrees, as does every other row of #2427's own
 capture table.
 
+### `SRC as $x ireduce (INIT; UPDATE)` and `{}` under `--eval-all` read the whole document list ([#2427](https://github.com/rust-works/succinctly/issues/2427))
+
+`--eval-all` folds every document of every file, as yq's `reduceOperator` does: it reads SRC and INIT against the whole list, then folds each source node into each accumulator.
+`yq ea '. as $item ireduce ({}; . * $item)' a.yaml b.yaml` is the two files merged, which is the recipe yq's own documentation gives for merging files.
+`succinctly yq` answers it the same, and `. as $i ireduce (0; . + 1)` is the document count once per document, as in yq (`0` is one literal per context node, each its own accumulator).
+An empty `{}` is one mapping whatever the context holds (`yq ea '{}' f1 f2` prints one `{}`, where `0` prints one per document), so `ireduce ({}; ...)` starts one fold.
+The reads of the loop variable's node (`$i | document_index`, `file_index`, `path`, `line`, `tag`, `kind`) answer from the document the node came from.
+Both rules apply to a list whose entries all came straight from the reader, like `[...]` and the binary operators.
+After a navigation they do not, and the plain route is unchanged.
+
+Three things still differ, each in yq v4.53.3 against `succinctly yq`:
+
+- **An empty `{}` after a fan-out outside `--eval-all`.**
+  yq builds one mapping there too (`yq '.x[] | {}'` over `x: [1, 2, 3]` prints one `{}`, and so does `.x | map({})` as `[{}]`).
+  `succinctly yq` prints one per input node.
+- **A read of an absent position.**
+  `.b as $i ireduce ([]; . + [$i | key])` reads `"b"` for every document in yq, where a document without `b` is a `null` node that still has a place.
+  Here that `null` has no position, so `key` and `parent` of it answer nothing and `path` answers `[]`.
+- **An absent key read through the loop variable.**
+  `. as $i ireduce ([]; . + [$i.a])` over a document with no `a` is `[]` in yq and `[null]` here, on the plain route as well as under `--eval-all`.
+
+The accumulators are values the fold computed, so they carry no document origin: `. as $i ireduce ({}; . * $i) | file_index` is `0`, as in yq.
+An UPDATE with several outputs folds as it does on the ordinary route (the last output), where yq keeps every one as its own accumulator.
+
 ### Duplicate mapping keys — an owned value keeps every entry (#1344); a few narrower gaps remain
 
 **Since [#1344](https://github.com/rust-works/succinctly/issues/1344) ([ADR-0027](../../adrs/adr-0027.md)) an `OwnedValue::Object` keeps a repeated mapping key's earlier entries beside its collapsed `IndexMap`.**
@@ -4992,7 +5016,7 @@ Four related divergences are **not** covered and stay open:
   what makes `[...]` collect once across documents and binary operators go cartesian under
   `--eval-all`. It is a flag on the document nodes the all-at-once multi-file reader
   builds, never set inside a single document, so it changes nothing here. Implemented for
-  `[...]` and for binary operators by #2427; `as` still consults it in real yq and does not
+  `[...]`, for binary operators, for `ireduce` and for an empty `{}` by #2427; `as` still consults it in real yq and does not
   here, which is the one row of that issue's capture table still open (see
   [that section](#-as-x--x-under---eval-all-collects-one-copy-per-document-not-one-per-binding-2427)).
 - **A union of two assignments.** yq's pointer guard also fires for two operands that both
