@@ -8,13 +8,14 @@
 
 #[cfg(not(test))]
 use alloc::{
-    borrow::Cow, collections::BTreeMap, format, rc::Rc, string::String, string::ToString, vec::Vec,
+    borrow::Cow, collections::BTreeMap, collections::BTreeSet, format, rc::Rc, string::String,
+    string::ToString, vec::Vec,
 };
 
 #[cfg(test)]
 use std::borrow::Cow;
 #[cfg(test)]
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 use std::rc::Rc;
 #[cfg(test)]
@@ -5348,19 +5349,47 @@ fn resolve_merge_keys<'a, W: AsRef<[u64]>>(
             let mut entries: Vec<(YamlCursor<'a, W>, YamlCursor<'a, W>)> =
                 Vec::with_capacity(seen.len() + 1);
             let mut positions = KeyPositions::default();
+            let own_before = seen.len();
             for (key, value, key_value) in seen {
                 upsert_field(&mut entries, &mut positions, key, value, &key_value);
             }
-            let mut views_differ =
-                merge_key_field(&mut entries, &mut positions, &field, &key_value, view);
+            // #6851: the rendering lists a merged member that an own key written after the `<<`
+            // replaces where that own key stands, so the merged copy is left out of the merge.
+            let replaced = (view != MergeView::Iteration)
+                .then(|| own_keys_after_lone_merge(&field, &rest))
+                .flatten();
+            let mut views_differ = merge_key_field(
+                &mut entries,
+                &mut positions,
+                &field,
+                &key_value,
+                view,
+                replaced.as_ref(),
+            );
 
             fields = rest;
             while let Some((field, rest)) = fields.uncons() {
                 let key_value = field.key_cursor.value();
                 if is_merge_key_value(&key_value) {
-                    views_differ |=
-                        merge_key_field(&mut entries, &mut positions, &field, &key_value, view);
+                    views_differ |= merge_key_field(
+                        &mut entries,
+                        &mut positions,
+                        &field,
+                        &key_value,
+                        view,
+                        None,
+                    );
                 } else {
+                    // The iteration upserts such a key onto the merged member's slot, so the two
+                    // views differ once an own key lands on one (#6851).
+                    if view == MergeView::Iteration && !views_differ {
+                        let (name, is_fallback) = key_value.key_string_kind();
+                        views_differ = !is_fallback
+                            && positions
+                                .by_name
+                                .get(name.as_ref())
+                                .is_some_and(|&at| at >= own_before);
+                    }
                     upsert_field(
                         &mut entries,
                         &mut positions,
@@ -5380,6 +5409,34 @@ fn resolve_merge_keys<'a, W: AsRef<[u64]>>(
     }
 }
 
+/// The names of the own keys written after a `<<` that merges exactly one source (#6851), or `None`
+/// when it has several sources or no own key follows.
+///
+/// yq's rendering of `<<: *g` / `a: 9`, where `*g` also has `a`, is `{"b":2,"c":3,"a":9}`: the own
+/// key stands where it was written and the merged member it replaces is not listed. A `<<` with a
+/// sequence of sources folds them in an order of its own (#4983) and is left to that.
+fn own_keys_after_lone_merge<'a, W: AsRef<[u64]>>(
+    merge: &YamlField<'a, W>,
+    rest: &YamlFields<'a, W>,
+) -> Option<BTreeSet<String>> {
+    if merge_sources_tagged(merge.value_cursor).len() != 1 {
+        return None;
+    }
+    let mut names = BTreeSet::new();
+    for field in rest.clone() {
+        let key_value = field.key_cursor.value();
+        if is_merge_key_value(&key_value) {
+            // A second `<<` makes the order depend on both.
+            return None;
+        }
+        let (name, is_fallback) = key_value.key_string_kind();
+        if !is_fallback {
+            names.insert(name.into_owned());
+        }
+    }
+    (!names.is_empty()).then_some(names)
+}
+
 /// Expand one `<<` field into `entries`, returning whether the views of the mapping can differ.
 ///
 /// A `<<` that contributes no field (its value is a scalar, `null`, an alias to a sequence of
@@ -5394,9 +5451,10 @@ fn merge_key_field<'a, W: AsRef<[u64]>>(
     field: &YamlField<'a, W>,
     key_value: &YamlValue<'a, W>,
     view: MergeView,
+    replaced: Option<&BTreeSet<String>>,
 ) -> bool {
     let (views_differ, contributed) =
-        merge_field_into(entries, positions, field.value_cursor, view);
+        merge_field_into(entries, positions, field.value_cursor, view, replaced);
     if contributed {
         return views_differ;
     }
@@ -5593,6 +5651,7 @@ fn merge_field_into<'a, W: AsRef<[u64]>>(
     positions: &mut KeyPositions,
     value_cursor: YamlCursor<'a, W>,
     view: MergeView,
+    replaced: Option<&BTreeSet<String>>,
 ) -> (bool, bool) {
     let tagged = merge_sources_tagged(value_cursor);
     // #4987: yq's rendering expands only an alias source; an index that says so drops the rest from
@@ -5615,6 +5674,12 @@ fn merge_field_into<'a, W: AsRef<[u64]>>(
         for source_field in YamlFields::raw(source.first_child()) {
             contributed = true;
             let key_value = source_field.key_cursor.value();
+            if let Some(replaced) = replaced {
+                let (name, is_fallback) = key_value.key_string_kind();
+                if !is_fallback && replaced.contains(name.as_ref()) {
+                    continue;
+                }
+            }
             upsert_field(
                 entries,
                 positions,

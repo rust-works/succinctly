@@ -6277,7 +6277,9 @@ fn test_yq_merge_keys_still_override_ordinary_and_genuine_empty_keys_3467() -> R
             "a: &a\n  '': x\nc: &c\n  '': w\nb:\n  '': x\n  z: 1\n",
         ),
         (ORDINARY, "[.b[]] | length", "3\n"),
-        (ORDINARY, ".b | to_entries | map(.key)", "- p\n- q\n- r\n"),
+        // yq lists `<<`, `p`, `r` here (#4954); `p` is replaced by an own key after the merge, so
+        // the merged `q` comes first (#6851).
+        (ORDINARY, ".b | to_entries | map(.key)", "- q\n- p\n- r\n"),
         (ORDINARY, ".b.p", "2\n"),
         (GENUINE_EMPTY, "[.b[]] | length", "1\n"),
         (
@@ -9970,7 +9972,9 @@ fn test_yaml_merge_key_nested_traversal_resolves_1318() -> Result<()> {
     // rendering of it, are untouched by this fix.
     let (output, exit_code) = run_yq_stdin(".z", input, &["-o", "json", "-I0"])?;
     assert_eq!(exit_code, 0);
-    assert_eq!(output.trim(), r#"{"<<":{"x":1,"y":5,"q":0},"q":9,"y":99}"#);
+    // The inner mapping is `mid` as yq renders it (`.mid` is `{"x":1,"q":0,"y":5}`: `y` is replaced
+    // by an own key written after the `<<`, so it is listed last, #6851).
+    assert_eq!(output.trim(), r#"{"<<":{"x":1,"q":0,"y":5},"q":9,"y":99}"#);
 
     Ok(())
 }
