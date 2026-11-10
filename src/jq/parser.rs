@@ -566,7 +566,8 @@ fn is_ident_start_char(c: char) -> bool {
 /// where the select passes. The result is an expression that takes the node and answers it
 /// changed:
 ///
-/// - an assignment is itself;
+/// - an assignment is itself, and so is a `del(...)` or `delpaths(...)` (#6840), which changes the
+///   node in place;
 /// - a comma applies each part in turn;
 /// - `select(f) | rest` is `if f then <rest> else . end`, so a failing select leaves the node;
 /// - a navigation then `rest` (`.b | .c = 1`, `.[] | select(..) | ..`) is `nav |= <rest>`, which
@@ -579,6 +580,9 @@ fn with_update_effect(update: &Expr) -> Expr {
         | Expr::Update { .. }
         | Expr::CompoundAssign { .. }
         | Expr::AlternativeAssign { .. } => update.clone(),
+        // #6840: a delete changes the node in place, as an assignment does (`with(.a; del(.x))`
+        // removes `x`), so it is kept and not evaluated for its discarded value.
+        Expr::Builtin(Builtin::Del(_) | Builtin::DelPaths(_)) => update.clone(),
         Expr::Paren(inner) => with_update_effect(inner),
         Expr::Comma(items) => Expr::pipe(items.iter().map(with_update_effect).collect()),
         Expr::Pipe(stages) => with_update_pipe_effect(stages),
@@ -627,7 +631,7 @@ fn with_update_pipe_effect(stages: &[Expr]) -> Expr {
             stages.extend_from_slice(rest);
             with_update_pipe_effect(&stages)
         }
-        head if is_assignment_expr(head) => Expr::pipe(vec![
+        head if is_with_write_expr(head) => Expr::pipe(vec![
             with_update_effect(head),
             with_update_pipe_effect(rest),
         ]),
@@ -652,17 +656,21 @@ fn is_navigation_expr(expr: &Expr) -> bool {
     }
 }
 
-/// Whether `expr` is an assignment (`=`, `|=`, `op=`, `//=`), alone or comma'd or piped with
-/// others.
-fn is_assignment_expr(expr: &Expr) -> bool {
+/// Whether `expr` is an in-place write of a `with` update: an assignment (`=`, `|=`, `op=`, `//=`)
+/// or a delete (`del`, `delpaths`, #6840), alone or comma'd or piped with others. Not
+/// `eval::is_assignment_expr`, whose answer serves the evaluator's own analyses and so has to
+/// stay what they need.
+fn is_with_write_expr(expr: &Expr) -> bool {
     match expr {
         Expr::Assign { .. }
         | Expr::Update { .. }
         | Expr::CompoundAssign { .. }
         | Expr::AlternativeAssign { .. } => true,
-        Expr::Paren(inner) => is_assignment_expr(inner),
-        Expr::Comma(items) => !items.is_empty() && items.iter().all(is_assignment_expr),
-        Expr::Pipe(stages) => !stages.is_empty() && stages.iter().all(is_assignment_expr),
+        // #6840: `del` and `delpaths` write in place like an assignment (see `with_update_effect`).
+        Expr::Builtin(Builtin::Del(_) | Builtin::DelPaths(_)) => true,
+        Expr::Paren(inner) => is_with_write_expr(inner),
+        Expr::Comma(items) => !items.is_empty() && items.iter().all(is_with_write_expr),
+        Expr::Pipe(stages) => !stages.is_empty() && stages.iter().all(is_with_write_expr),
         _ => false,
     }
 }
