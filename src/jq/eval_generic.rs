@@ -8924,20 +8924,21 @@ impl<V: DocumentValue> GenericResult<V> {
         sort_keys: bool,
         on_value: impl FnMut(&mut W) -> core::fmt::Result,
     ) -> Result<crate::jq::stream::StreamStats, core::fmt::Error> {
-        self.stream_yaml_terminating::<W, S>(out, indent, sort_keys, false, on_value)
+        self.stream_yaml_terminating::<W, S>(out, indent, sort_keys, None, on_value)
     }
 
-    /// [`stream_yaml`](Self::stream_yaml), where `skip_header_only_terminator` leaves `on_value`
-    /// uncalled after a cursor result that is a document with no content (#5721): it prints only
-    /// the verbatim header, whose own line break already ends it, so a line-break terminator on
-    /// top is a blank line yq never writes. A caller whose terminator is not a line break (`-0`)
-    /// passes `false`: the NUL still has to end the record.
+    /// [`stream_yaml`](Self::stream_yaml), where `on_header_only` replaces `on_value` after a
+    /// cursor result that is a document with no content (#5721): it prints only the verbatim
+    /// header, whose own line break already ends it, so a line-break terminator on top is a
+    /// blank line yq never writes. A caller whose terminator is a line break passes a no-op; one
+    /// whose terminator is not (`-0`) passes a hook that takes the header's break back and
+    /// writes the NUL in its place, as yq does.
     pub fn stream_yaml_terminating<W: core::fmt::Write, S: EvalSemantics>(
         &self,
         out: &mut W,
         indent: IndentSpec,
         sort_keys: bool,
-        skip_header_only_terminator: bool,
+        mut on_header_only: Option<&mut dyn FnMut(&mut W) -> core::fmt::Result>,
         mut on_value: impl FnMut(&mut W) -> core::fmt::Result,
     ) -> Result<crate::jq::stream::StreamStats, core::fmt::Error> {
         use crate::jq::stream::{StreamStats, StreamableValue};
@@ -8967,8 +8968,9 @@ impl<V: DocumentValue> GenericResult<V> {
                     return Ok(stats);
                 }
                 // #5721: see `stream_yaml_terminating`.
-                if !(skip_header_only_terminator && c.is_header_only_document()) {
-                    on_value(out)?;
+                match on_header_only.as_deref_mut() {
+                    Some(end) if c.is_header_only_document() => end(out)?,
+                    _ => on_value(out)?,
                 }
                 stats.count = 1;
                 stats.last_was_falsy = c.is_falsy();
@@ -9002,8 +9004,9 @@ impl<V: DocumentValue> GenericResult<V> {
                         return Ok(stats);
                     }
                     // #5721: see `OneCursor` above.
-                    if !(skip_header_only_terminator && c.is_header_only_document()) {
-                        on_value(out)?;
+                    match on_header_only.as_deref_mut() {
+                        Some(end) if c.is_header_only_document() => end(out)?,
+                        _ => on_value(out)?,
                     }
                     stats.last_was_falsy = c.is_falsy();
                     stats.any_truthy |= !stats.last_was_falsy;
