@@ -8362,8 +8362,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 b',' | b'}' | b']' => break,
                 b':' if Self::is_ws_break_or_eoi(self.peek_at(1)) => break,
                 b'#' => {
-                    // # is a comment if preceded by whitespace
-                    if self.pos > start && matches!(self.input[self.pos - 1], b' ' | b'\t') {
+                    // # is a comment if preceded by whitespace, or by a line break: the scan steps over a
+                    // blank line's two breaks at once, so a `#` that opens the line after one has the
+                    // break behind it (#6855)
+                    if self.pos > start
+                        && matches!(self.input[self.pos - 1], b' ' | b'\t' | b'\n' | b'\r')
+                    {
                         break;
                     }
                     self.advance();
@@ -8412,10 +8416,21 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             }
         }
 
-        // Trim trailing whitespace
+        // Trim trailing whitespace. A blank line before the closer or the comma (`[42` / `` / `]`)
+        // leaves the scan at the second break, so the run of line breaks that ended it goes too, a
+        // NEL, LS or PS among them: it separates the scalar from what follows and is no content of
+        // it (#6855).
         let mut end = self.pos;
-        while end > start && matches!(self.input[end - 1], b' ' | b'\t') {
-            end -= 1;
+        while end > start {
+            if matches!(self.input[end - 1], b' ' | b'\t' | b'\n' | b'\r') {
+                end -= 1;
+            } else if end - start >= 2 && self.unicode_break_len_at(end - 2) == 2 {
+                end -= 2;
+            } else if end - start >= 3 && self.unicode_break_len_at(end - 3) == 3 {
+                end -= 3;
+            } else {
+                break;
+            }
         }
 
         Ok(end)
@@ -8716,9 +8731,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             }
         }
 
-        // Trim trailing whitespace
+        // Trim trailing whitespace; a run of line breaks before the `:` is not content either (#6855).
         let mut end = self.pos;
-        while end > start && matches!(self.input[end - 1], b' ' | b'\t') {
+        while end > start && matches!(self.input[end - 1], b' ' | b'\t' | b'\n' | b'\r') {
             end -= 1;
         }
 
