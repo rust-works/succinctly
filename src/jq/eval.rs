@@ -1668,7 +1668,7 @@ pub mod alias_identity {
             // and not by a scan of every target (a fan-out names one per element).
             let targets: std::collections::HashSet<Vec<u8>> = targets
                 .iter()
-                .filter_map(concrete_steps)
+                .filter_map(|target| concrete_steps(target, pre))
                 .filter_map(|steps| position_key(&steps))
                 .collect();
             for member in &table.merged {
@@ -1726,18 +1726,28 @@ pub mod alias_identity {
         });
     }
 
-    /// A path of field and non-negative index steps as the values the document walk spells.
-    fn concrete_steps(path: &Expr) -> Option<Vec<OwnedValue>> {
+    /// A path of field and index steps as the values the document walk spells, an index counted
+    /// from the end made absolute against `doc`. `None` for a step that names no one slot (a
+    /// slice, an iteration).
+    fn concrete_steps(path: &Expr, doc: &OwnedValue) -> Option<Vec<OwnedValue>> {
         let mut components = Vec::new();
         push_path_components(&mut components, path);
-        components
-            .iter()
-            .map(|component| match unwrap_path_component(component).0 {
-                Expr::Field(name) => Some(OwnedValue::String(name.clone().into())),
-                Expr::Index { idx, .. } if *idx >= 0 => Some(OwnedValue::Int(*idx)),
-                _ => None,
-            })
-            .collect()
+        let mut steps: Vec<OwnedValue> = Vec::with_capacity(components.len());
+        for component in &components {
+            let step = match unwrap_path_component(component).0 {
+                Expr::Field(name) => OwnedValue::String(name.clone().into()),
+                Expr::Index { idx, .. } if *idx >= 0 => OwnedValue::Int(*idx),
+                Expr::Index { idx, .. } => {
+                    let OwnedValue::Array(arr) = get_value_at_path(doc, &steps)? else {
+                        return None;
+                    };
+                    OwnedValue::Int(usize::try_from(*idx + arr.len() as i64).ok()? as i64)
+                }
+                _ => return None,
+            };
+            steps.push(step);
+        }
+        Some(steps)
     }
 }
 

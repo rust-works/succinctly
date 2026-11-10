@@ -19,6 +19,9 @@ const ONE: &str = "base: &base {x: 1, y: 2, n: {p: 1, q: 2}}\nitem: {<<: *base, 
 /// A whole source.
 const WHOLE: &str = "a: &a {x: 1}\nitem: {<<: *a, k: 0}\n";
 
+/// A source and two aliases of it, no merge key.
+const ALIAS: &str = "base: &base {x: 1, y: 2}\nlist: [*base, *base]\n";
+
 /// A mapping with a merged member that is itself anchored and aliased.
 const ALIASED: &str = "base: &base {m: 1}\nl:\n  - {<<: *base}\n  - &s {<<: *base, z: 1}\n  - *s\n";
 
@@ -41,6 +44,11 @@ const BODY_WRITES: &[(&str, &str, &str)] = &[
     (TWO, ".item |= (.z = 7 | .x = 5)", "{\"a\":{\"x\":5,\"z\":9},\"b\":{\"y\":2,\"z\":7},\"item\":{\"y\":2,\"z\":9,\"x\":5,\"k\":0}}\n"),
     (ALIASED, ".l[1] |= (.m = 7)", "{\"base\":{\"m\":7},\"l\":[{\"m\":7},{\"m\":7,\"z\":1},{\"m\":7,\"z\":1}]}\n"),
     (WHOLE, ".item |= (.x = 9)", "{\"a\":{\"x\":9},\"item\":{\"x\":9,\"k\":0}}\n"),
+    (ONE, ".list[-1] |= (.x = 7)", "{\"base\":{\"x\":7,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":7,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":7,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":7,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n"),
+    (ONE, ".item = {\"k\": 0} | .item |= (.q = 1)", "{\"base\":{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"k\":0,\"q\":1},\"list\":[{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n"),
+    (ONE, ".item = {\"x\": 99, \"k\": 0} | .item |= (.q = 1)", "{\"base\":{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":99,\"k\":0,\"q\":1},\"list\":[{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n"),
+    (ALIAS, ".list[] |= (.x = 7)", "{\"base\":{\"x\":7,\"y\":2},\"list\":[{\"x\":7,\"y\":2},{\"x\":7,\"y\":2}]}\n"),
+    (ALIAS, ".list[0] |= (.p = 9)", "{\"base\":{\"x\":1,\"y\":2,\"p\":9},\"list\":[{\"x\":1,\"y\":2,\"p\":9},{\"x\":1,\"y\":2,\"p\":9}]}\n"),
 ];
 
 /// A body that replaces the mapping leaves the sources alone, in yq as here.
@@ -52,6 +60,7 @@ const BODY_REPLACES: &[(&str, &str, &str)] = &[
 
 /// yq's answers for the shapes the update body's edit is not carried for.
 const STILL_DIVERGENT: &[(&str, &str, &str)] = &[
+    (ONE, ".list[0:1] |= (.[0].x = 5)", "{\"base\":{\"x\":5,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":5,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":5,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":5,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n"),
     (ONE, ".list[] |= (.x += 1)", "{\"base\":{\"x\":3,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":3,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":3,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":3,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n"),
     (ONE, ".list[0] |= (del(.x) | .x = 3)", "{\"base\":{\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0,\"x\":3},{\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n"),
     (ONE, ".list[0] |= (.x = 3 | del(.y))", "{\"base\":{\"x\":3,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":3,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":3,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":3,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n"),
@@ -85,7 +94,7 @@ fn test_the_body_shapes_that_still_change_only_the_mappings_copy_6827() -> Resul
     // then writes more cannot be told from a changed member by comparing the two documents, so the
     // mapping's copy changes and the source stays. A body that reads the member it writes
     // (`.x += 1` over mappings that share a source) writes the source once, where yq counts each
-    // mapping's turn. The rows hold yq's answers; the difference is asserted below.
+    // mapping's turn, and a target that is a slice (`.list[0:1] |= (.[0].x = 5)`) is not looked into. The rows hold yq's answers; the difference is asserted below.
     for (document, filter, want) in STILL_DIVERGENT {
         let (stdout, code) = run_yq_stdin(filter, document, JSON)?;
         assert_eq!(code, 0, "{filter}");
