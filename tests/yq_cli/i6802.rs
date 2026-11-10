@@ -128,3 +128,38 @@ fn a_list_that_doubles_every_step_is_refused_6802() -> Result<()> {
     assert_eq!(stdout, "");
     Ok(())
 }
+
+/// An INIT that raises ends the run, and an INIT with no output prints nothing and never reads the
+/// source: both as yq's.
+#[test]
+fn an_init_that_raises_or_answers_nothing_6802() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(
+        ".l[] as $i ireduce (error(\"i\"); . + $i)",
+        DOC,
+        &["-o", "json", "-I0"],
+    )?;
+    assert_ne!(code, 0);
+    assert_eq!(stdout, "");
+    let (stdout, code) = run_yq_stdin(
+        ".l[] as $i ireduce (select(false); . + $i)",
+        DOC,
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// A destructuring pattern the element does not fit raises (succinctly's own `--jq-extensions`
+/// syntax; yq has none).
+#[test]
+fn a_pattern_the_element_does_not_fit_raises_6802() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(
+        ".l[] as [$a] ireduce (0; . + 1)",
+        DOC,
+        &["--jq-extensions", "-o", "json", "-I0"],
+    )?;
+    assert_ne!(code, 0);
+    assert_eq!(stdout, "");
+    Ok(())
+}
