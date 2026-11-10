@@ -2582,8 +2582,11 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 // one hop: the resolved cursor's own `.value()` is
                 // guaranteed non-`Alias`, so this recursive call terminates
                 // in exactly one more step regardless of chain length.
+                //
+                // The node, not `stream_json_value`: the alias and its target are one node to yq's
+                // encoder, so the target adds no marshal-failure wrap of its own (#6867).
                 match target.and_then(|t| t.resolve_alias_target_cursor()) {
-                    Some(resolved) => resolved.stream_json_value(
+                    Some(resolved) => resolved.stream_json_node(
                         out,
                         current_indent,
                         indent_spaces,

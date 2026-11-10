@@ -7480,3 +7480,6 @@ The results before the failing one are whole in both, and the run stops there, a
 The route that evaluates a result first (a computed number, `-P`) writes nothing of it, as yq does.
 Buffering each streamed result to match would give up the constant-memory write that route exists for, the same trade as the decode failures above.
 The exit code and the error line are identical either way, so a caller that checks the status sees the failure, and it is pinned by `tests/yq_cli/i6867.rs`.
+Two neighbours are not covered ([#6887](https://github.com/rust-works/succinctly/issues/6887)).
+The `to_json` and `@json` operators still write `null` for a non-finite float, where yq fails with the same marshal error (`.a | to_json` over `a: .inf`, `[1 / 0] | @json`): they stringify through `to_json_yq`, not the `-o=json` writer.
+Arithmetic on a document `.inf` (`.a + 1`, `.a * 2`) fails in yq while it computes (`strconv.ParseFloat: parsing ".inf": invalid syntax`, in every output format), where `succinctly yq` computes `+Inf`, so under `-o=json` it fails with the encoder's `+Inf` message instead.

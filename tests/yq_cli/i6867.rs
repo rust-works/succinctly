@@ -134,6 +134,11 @@ const SOURCE: &[(&str, &str, usize, &str)] = &[
     ("a: [.inf, 1]\n", "[.a[]]", 2, ".inf"),
     ("a: [.inf, 1]\n", ".a | [.]", 3, ".inf"),
     ("a: [.inf, 1]\n", "{\"x\": .a}", 3, ".inf"),
+    // An alias and its target are one node.
+    ("a: &x .inf\nb: *x\n", ".b", 1, ".inf"),
+    ("a: &x .inf\nb: *x\n", ".", 2, ".inf"),
+    ("a: &x [.inf]\nb: *x\n", ".b", 2, ".inf"),
+    ("a: &x [.inf]\nb: *x\n", ".", 3, ".inf"),
 ];
 
 #[test]

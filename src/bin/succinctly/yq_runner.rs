@@ -9624,6 +9624,8 @@ fn output_value<W: Write>(
     );
 
     // #6867: the writer put `null` where yq's JSON encoder fails.
+    // A flag the walk cannot explain (a query literal like `1e400` under `--input-format json`,
+    // #1498) keeps the `null` it was written with.
     if output::take_non_finite_json_write() {
         if let Some(message) = non_finite_json_error(value, config.sort_keys) {
             anyhow::bail!(message);
