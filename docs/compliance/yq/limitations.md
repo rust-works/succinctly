@@ -6496,11 +6496,14 @@ ignored, with only the path evaluated, and the input comes back untouched, as yq
 (`with(.a; . = 1; 2)`). Still different: a stage after a discarded value-producing stage is not
 evaluated (yq runs it on the discarded value); `(.b = 2) as $x | .c = $x` (a binding whose
 source is an assignment) does not apply the source's change; a binding whose source yields several
-values applies its body once (yq: once per value, `with(.a; .[] as $v | .[0] = $v)`); `del(.b)` inside the
-update is dropped (yq applies it); and a bare `empty` update is accepted where yq's lexer rejects it
+values applies its body once (yq: once per value, `with(.a; .[] as $v | .[0] = $v)`); and a bare `empty` update is accepted where yq's lexer rejects it
 (#4808's gap). The evaluation costs a `reduce` frame per node `path` selects for a discarded
 stage: `with(.[]; . + 1)` over a million-element array, a no-op in yq too, takes 649 ms where it took
 299 ms; an update with an assignment is unchanged.
+A `del(...)` or `delpaths(...)` in the update is applied like an assignment (#6840): `with(.a; del(.x))` removes `x`, and an assignment piped after it still runs.
+Still different: `with(.b[]; del(.))` empties the array in yq and changes nothing here.
+A value-producing head that yq changes in place and hands on (`with(.a; sort_keys(.) | .z = 1)` writes `z` in yq) drops the assignment after it here.
+A write wrapped in `//` (`with(.a; del(.x) // 1)`, `with(.a; (.z = 1) // 2)`) is dropped here and applied in yq.
 
 `from_yaml` of text the semi-index does not reject still decodes where yq fails: `"--- \n..."` is
 `null` and `"a: !!int x"` is the string `x` (`"a: b: c"` used to be `{"a":"b"}` and is yq's
