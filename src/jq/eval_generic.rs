@@ -44120,6 +44120,54 @@ mod tests {
         assert_eq!(without_table_reindexes, 0);
     }
 
+    /// #6534: in yq mode a string's `length` inside a loop body is read off the string, not off a
+    /// copy written out and indexed again each round: `. as $t | [range(n) | . as $w | ($t | length)]` over a
+    /// computed string bridged once per round, so the bytes of string it wrote out grew with `n`.
+    /// The pin is those bytes at two round counts: equal means no round bridges the string. It can
+    /// fail: with `string_length_stage` made to return `None` the counts differ by the rounds. A string
+    /// counts in the unit the mode counts (bytes in yq), and a bound array, object, number or
+    /// null still bridges, so the evaluator keeps its own answer for those.
+    #[cfg(feature = "std")]
+    #[test]
+    fn yq_string_length_in_a_loop_body_is_not_bridged_per_round_6534() {
+        use crate::jq::value::reindex_count;
+
+        let json = br#""hello""#;
+        let index = JsonIndex::build(json);
+        let run = |filter: &str| {
+            let expr = crate::jq::parse(filter).unwrap();
+            let before = reindex_count::string_bytes();
+            let result = eval_using::<YqSemantics, _>(&expr, index.root(json).value())
+                .collect_owned::<YqSemantics>()
+                .unwrap();
+            let text = result.iter().map(OwnedValue::to_json).collect::<Vec<_>>();
+            (text, reindex_count::string_bytes() - before)
+        };
+        let (few, few_reindexes) = run(r#"(. + "é") as $t | [range(3) | ($t | length)]"#);
+        let (many, many_reindexes) = run(r#"(. + "é") as $t | [range(30) | ($t | length)]"#);
+        // "hello" + "é" is 7 bytes in yq mode (5 and 2).
+        assert_eq!(few, ["[7,7,7]"]);
+        assert_eq!(many.len(), 1);
+        assert_eq!(many[0].matches('7').count(), 30);
+        assert_eq!(
+            few_reindexes, many_reindexes,
+            "a round must not write the bound string out again"
+        );
+        // A bound container or number is not a string: the evaluator answers it.
+        for (filter, want) in [
+            (
+                r"([1, 2] + [3]) as $t | [range(2) | ($t | length)]",
+                "[3,3]",
+            ),
+            (
+                r#"({"a": 1} + {"b": 2}) as $t | [range(2) | ($t | length)]"#,
+                "[2,2]",
+            ),
+        ] {
+            assert_eq!(run(filter).0, [want], "{filter}");
+        }
+    }
+
     /// #5593: `floor`, `ceil`, `round`, `trunc`, `sqrt` and `fabs` of a document number are
     /// answered from the number, not bridged: the bridge serialises the value and indexes it again
     /// (`reindex_count` counts exactly that), once per number. A value that is not a finite number

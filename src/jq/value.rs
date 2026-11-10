@@ -4824,7 +4824,12 @@ impl OwnedValue {
     /// crate-private `bridge_provenance` module.
     pub fn reindexed<S: EvalSemantics>(&self) -> Result<ReindexedDoc, EvalError> {
         #[cfg(test)]
-        reindex_count::bump();
+        {
+            reindex_count::bump();
+            if let Self::String(text) = self {
+                reindex_count::bump_string(text.len());
+            }
+        }
         Ok(ReindexedDoc::new(
             self.to_json_for_reindex::<S>()?,
             S::REINDEX_BRIDGE_KEEPS_IDENTITY.then_some(self),
@@ -4882,6 +4887,7 @@ pub(crate) mod reindex_count {
 
     thread_local! {
         static COUNT: Cell<usize> = const { Cell::new(0) };
+        static STRING_BYTES: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(crate) fn bump() {
@@ -4890,6 +4896,16 @@ pub(crate) mod reindex_count {
 
     pub(crate) fn get() -> usize {
         COUNT.with(Cell::get)
+    }
+
+    /// Records the bytes of a string that was written out for a reindex (#6534): a round that
+    /// bridges a loop's number costs a few bytes, one that bridges a bound string costs its length.
+    pub(crate) fn bump_string(len: usize) {
+        STRING_BYTES.with(|c| c.set(c.get() + len));
+    }
+
+    pub(crate) fn string_bytes() -> usize {
+        STRING_BYTES.with(Cell::get)
     }
 }
 

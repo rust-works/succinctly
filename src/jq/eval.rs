@@ -14822,6 +14822,21 @@ fn closed_pipe_to_owned<S: EvalSemantics>(
     value
 }
 
+/// A string's `length` as an owned stage (#6534): the count of the string, in the unit the mode
+/// counts (`string_length`), which is the answer the reindex bridge gives for it. The input is
+/// read in place and the answer is a fresh integer, never a node of it. Any other stage or input
+/// is `None`, and the evaluator keeps its own rules and diagnostics. Its own function, not inline
+/// in [`eval_owned_relocated_or_closed`], so that call keeps the frame its doc comment guards.
+#[inline(never)]
+fn string_length_stage<S: EvalSemantics>(stage: &Expr, input: &OwnedValue) -> Option<OwnedValue> {
+    match (unwrap_paren(stage), input) {
+        (Expr::Builtin(Builtin::Length), OwnedValue::String(text)) => {
+            Some(OwnedValue::Int(string_length::<S>(text)))
+        }
+        _ => None,
+    }
+}
+
 fn closed_expr_to_owned_node<S: EvalSemantics>(
     expr: &Expr,
     depth: usize,
@@ -90854,6 +90869,8 @@ fn eval_owned_expr_full<S: EvalSemantics>(
 /// it. Without it a stage that closes over a bound value (`. as $t | [range(25) | ($t | length)]`,
 /// where `$t` is a computed string or array) wrote the input out and indexed it again to evaluate a
 /// stage that never reads it, once per round: 1.8 s against 0.17 s over a 6.6 MB string.
+/// In yq mode (#6534) the closed grammar is not taken (yq's is narrower), and the only door is
+/// [`string_length_stage`]: a string input's `length`, answered from the string.
 ///
 /// One call in [`eval_owned_input`] and not two, and `#[inline(never)]`: that function is inlined
 /// into the recursive [`eval_owned_pipe`], and a second `Option<OwnedValue>` there cost it 80 bytes
@@ -90871,7 +90888,11 @@ fn eval_owned_relocated_or_closed<S: EvalSemantics>(
     if S::TAG == EvalTag::Jq {
         return eval_owned_closed::<S>(expr);
     }
-    None
+    // #6534: a string's `length` is read off the string in yq mode too. The jq door above
+    // answers it as a closed expression; yq's grammar for that is narrower, and without this the
+    // stage wrote the string out, indexed it and decoded it again once per round
+    // (`. as $t | [range(n) | . as $w | ($t | length)]`).
+    string_length_stage::<S>(expr, input)
 }
 
 /// Evaluate an expression with an OwnedValue as input, preserving the full
