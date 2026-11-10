@@ -90,11 +90,12 @@ fn a_quoted_record_spanning_files_is_one_row_6601() -> Result<()> {
             &["nn1.csv", "nn2.csv"][..],
             "[\"x\",\"y\"]\n[\"z\",\"w\"]\n",
         ),
-        // CRLF records read as the joined file does.
+        // CRLF records read as the joined file does: the `\r` of the terminator is no part of the
+        // quoted last field (#6874), and the `\r\n` inside it is content.
         (
             &["."][..],
             &["crlf1.csv", "crlf2.csv"][..],
-            "[\"a\",\"\\\"b\\r\\nc\\\"\\r\"]\n",
+            "[\"a\",\"b\\r\\nc\"]\n",
         ),
         // A record still open at the end of the last file is read as it stood.
         (
