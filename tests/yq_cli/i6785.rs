@@ -18,6 +18,16 @@ const TWO: &str = "a: &a {x: 1, z: 9}\nb: &b {y: 2, z: 8}\nitem: {<<: [*a, *b], 
 /// One source, and two more mappings that merge it.
 const ONE: &str = "base: &base {x: 1, y: 2, n: {p: 1, q: 2}}\nitem: {<<: *base, k: 0}\nlist:\n  - {<<: *base, i: 0}\n  - {<<: *base, i: 1}\n";
 
+/// A whole source removed or replaced.
+const WHOLE: &str = "a: &a {x: 1}\nitem: {<<: *a, k: 0}\n";
+
+/// A mapping with a merged member that is itself anchored and aliased.
+const ALIASED: &str = "base: &base {m: 1}\nl:\n  - {<<: *base}\n  - &s {<<: *base, z: 1}\n  - *s\n";
+
+/// Three sources hold `z`.
+const THREE: &str =
+    "a: &a {x: 1, z: 1}\nb: &b {y: 2, z: 2}\nc: &c {w: 3, z: 3}\nitem: {<<: [*a, *b, *c], k: 0}\n";
+
 /// `(document, filter, yq's output)`.
 const ROWS: &[(&str, &str, &str)] = &[
     (TWO, ".item.x = 5", "{\"a\":{\"x\":5,\"z\":9},\"b\":{\"y\":2,\"z\":8},\"item\":{\"y\":2,\"z\":9,\"x\":5,\"k\":0}}\n"),
@@ -54,6 +64,16 @@ const ROWS: &[(&str, &str, &str)] = &[
     (ONE, ".item.n.p = 9 | .list[0].n.q = 8", "{\"base\":{\"x\":1,\"y\":2,\"n\":{\"p\":9,\"q\":8}},\"item\":{\"x\":1,\"y\":2,\"n\":{\"p\":9,\"q\":8},\"k\":0},\"list\":[{\"x\":1,\"y\":2,\"n\":{\"p\":9,\"q\":8},\"i\":0},{\"x\":1,\"y\":2,\"n\":{\"p\":9,\"q\":8},\"i\":1}]}\n"),
     (ONE, "del(.list[0].x)", "{\"base\":{\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n"),
     (ONE, ".item.x as $v | .list[0].x = 3", "{\"base\":{\"x\":3,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":3,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":3,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":3,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n"),
+    (WHOLE, "del(.a)", "{\"item\":{\"x\":1,\"k\":0}}\n"),
+    (WHOLE, "del(.a.x)", "{\"a\":{},\"item\":{\"k\":0}}\n"),
+    (WHOLE, ".a.x = 3", "{\"a\":{\"x\":3},\"item\":{\"x\":3,\"k\":0}}\n"),
+    (ALIASED, ".l[0].m = 7", "{\"base\":{\"m\":7},\"l\":[{\"m\":7},{\"m\":7,\"z\":1},{\"m\":7,\"z\":1}]}\n"),
+    (ALIASED, ".l[1].m = 7", "{\"base\":{\"m\":7},\"l\":[{\"m\":7},{\"m\":7,\"z\":1},{\"m\":7,\"z\":1}]}\n"),
+    (ALIASED, ".l[2].m = 7", "{\"base\":{\"m\":7},\"l\":[{\"m\":7},{\"m\":7,\"z\":1},{\"m\":7,\"z\":1}]}\n"),
+    (ALIASED, ".l[1].z = 7", "{\"base\":{\"m\":1},\"l\":[{\"m\":1},{\"m\":1,\"z\":7},{\"m\":1,\"z\":7}]}\n"),
+    (THREE, "del(.a.z)", "{\"a\":{\"x\":1},\"b\":{\"y\":2,\"z\":2},\"c\":{\"w\":3,\"z\":3},\"item\":{\"w\":3,\"z\":2,\"y\":2,\"x\":1,\"k\":0}}\n"),
+    (THREE, "del(.b.z)", "{\"a\":{\"x\":1,\"z\":1},\"b\":{\"y\":2},\"c\":{\"w\":3,\"z\":3},\"item\":{\"w\":3,\"z\":1,\"y\":2,\"x\":1,\"k\":0}}\n"),
+    (THREE, ".item.z = 9", "{\"a\":{\"x\":1,\"z\":1},\"b\":{\"y\":2,\"z\":2},\"c\":{\"w\":3,\"z\":9},\"item\":{\"w\":3,\"z\":1,\"y\":2,\"x\":1,\"k\":0}}\n"),
 ];
 
 #[test]
@@ -74,12 +94,19 @@ fn test_the_writes_that_still_change_only_the_mappings_copy_6785() -> Result<()>
     // Not yq's answers, recorded in docs/compliance/yq/limitations.md: a write whose body runs on
     // the merging mapping with a path of its own (`|= (.x = 7)`, `with(...)`) has no position to
     // redirect from, so it changes the mapping's copy and leaves the source alone; and a key the
-    // source loses is placed where the mapping listed it, where yq re-renders it last.
+    // source loses is placed where the mapping listed it, where yq re-renders it last; and a source
+    // replaced by a mapping with other keys (`.base = {"q": 1}`) drops the members it held, where yq
+    // shows the new keys (`{"q":1,"k":0}`).
     for (document, filter, want) in [
         (
             ONE,
             ".list[] |= (.x = 7)",
             "{\"base\":{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":7,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":7,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n",
+        ),
+        (
+            ONE,
+            ".base = {\"q\": 1}",
+            "{\"base\":{\"q\":1},\"item\":{\"k\":0},\"list\":[{\"i\":0},{\"i\":1}]}\n",
         ),
         (
             TWO,

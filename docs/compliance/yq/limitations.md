@@ -3325,14 +3325,15 @@ A write through `..` behind a path step (`.item | (.. | select(tag == "!!int")) 
 Only the path-context walk (`path`, `key`, `parent`, `parents`) names it that way.
 A write through the same path changes the source's node, as yq does, since [#6785](https://github.com/rust-works/succinctly/issues/6785): `.item.x = 5`, `.item.x |= . + 1`, `del(.item.x)`, `(.item | .[]) |= 7` and `setpath(["item","x"]; 5)` change `a`'s `x`, and so the `x` of every mapping that merges `a`.
 A key several sources hold is written in the last one (`.item.z = 7` sets `b.z`) while the mapping keeps showing the first (`item.z` stays `9`), the two listings of #4983.
-A write to the source reaches the merging mapping too (`.a.x = 5`, `del(.a.x)`), and a key the source loses shows through from the next source that holds it.
+A write to the source reaches the merging mapping too (`.a.x = 5`, `del(.a.x)`), and a key the source loses shows through from the next source that holds it, in listed order.
+A source removed whole (`del(.a)`) leaves the members it merged in place, as in yq, and a mapping that is itself anchored and aliased passes a merged member's new value on to its alias slots.
 The library does this by position, as an alias write does (`jq::alias_identity`, ADR-0017): `yaml::collect_merged_members` lists each member with the node a write lands on and the node its value is copied from, a write path that reaches one is redirected to the first, and the mapping's copy follows the second while it is still an untouched copy.
 A mapping a write replaced (`.item = {"q": 1} | .item.x = 5`) and an own key keep their own entry.
 Still divergent: a write whose body runs on the merging mapping with a path of its own (`.list[] |= (.x = 7)`, `with(.item; .x = 4)`) has no position to redirect from and changes only the mapping's copy.
 A write followed by a read stage (`del(.item.z) | .item.z`) is not an alias-sensitive write, so no table is installed for it, as for an alias.
-A member whose source is a `<<` mapping written in place has no other node and keeps the mapping's own entry.
+A source replaced by a mapping with other keys (`.a = {"y": 1}`, `.a |= {"y": 2}`) drops the members it held from the merging mapping, where yq shows the new keys (`item` is `{y: 1, k: 0}`): the table lists the members the document had, so a key the source gains is not followed.
+A member whose source is a `<<` mapping written in place, or one reached through a mapping that itself merges (`n2: {<<: *n}` with `n: &n {<<: *b}`), has no node of its own to write and keeps the mapping's own entry.
 After `del(.b.z)` or `del(.item.z)` over two sources, yq lists the surviving key last (`y, x, z`) where the mapping keeps its place (`y, z, x`).
-When three sources hold a key and the first loses it, the mapping shows the last one's value, where yq shows the second's.
 The YAML output of a write still prints the merged members expanded, without the `<<` entry, as before.
 Two shapes keep the mapping's own path because the walk cannot climb to them: a member of an inline `<<: {q: 1}` (`["item","<<","q"]` in yq, `["item","q"]` here), and the entries behind a merge of a mapping that itself merges (`n2: {<<: *n}` with `n: &n {<<: *b, m: 1}`): `[.n2[] | path]` lists a literal `<<` entry where yq lists `b`'s entries (`[["n2","<<"],["n","m"]]` here, `[["b","x"],["b","w"],["n","m"]]` in yq), though a member named directly (`.n2.x | path`) is placed.
 `to_entries`, `with_entries`, `paths` and `tostream` keep the rendering's order.

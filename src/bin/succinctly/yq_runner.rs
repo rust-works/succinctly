@@ -8522,8 +8522,8 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
     if let Some((pristine, groups, merged)) = &alias_sync_ctx {
         if let Ok(docs) = &mut docs {
             for (value, _comments) in docs.iter_mut() {
-                sync_aliased_paths(value, pristine, groups);
                 sync_merged_members(value, pristine, merged);
+                sync_aliased_paths(value, pristine, groups);
             }
         }
     }

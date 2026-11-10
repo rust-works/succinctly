@@ -5776,6 +5776,8 @@ pub fn collect_merged_members<W: AsRef<[u64]> + Clone>(
         member: Vec<OwnedValue>,
         write_node: usize,
         render_node: Option<usize>,
+        /// Every source node holding the key, in listed order.
+        holders: Vec<usize>,
     }
 
     fn step(key: &YamlField<'_, impl AsRef<[u64]>>) -> OwnedValue {
@@ -5793,6 +5795,7 @@ pub fn collect_merged_members<W: AsRef<[u64]> + Clone>(
                 // The rendering reads each key from another source than the iteration does only
                 // where a `<<` lists several, so it is built for those mappings alone.
                 let mut rendered: Option<BTreeMap<String, usize>> = None;
+                let mut sources: Option<Vec<YamlCursor<'_, W>>> = None;
                 for field in fields.clone() {
                     let value = field.value_cursor();
                     path.push(step(&field));
@@ -5811,14 +5814,32 @@ pub fn collect_merged_members<W: AsRef<[u64]> + Clone>(
                                     })
                                     .collect()
                             });
+                            let name = field.key().key_string();
+                            let sources = sources.get_or_insert_with(|| {
+                                fields
+                                    .listed()
+                                    .filter(|f| is_merge_key_value(&f.key()))
+                                    .flat_map(|f| merge_sources(f.value_cursor()))
+                                    .collect()
+                            });
+                            let holders = sources
+                                .iter()
+                                .filter_map(|source| {
+                                    YamlFields::raw(source.first_child())
+                                        .filter(|f| field_key_is_named(&f.key(), &name))
+                                        .last()
+                                        .map(|f| f.value_cursor().bp_pos)
+                                })
+                                .collect();
                             pending.push(Pending {
                                 member: path.clone(),
                                 write_node: value.bp_pos,
-                                render_node: render.get(&*field.key().key_string()).copied(),
+                                render_node: render.get(&*name).copied(),
+                                holders,
                             });
                         }
                     } else {
-                        homes.insert(value.bp_pos, path.clone());
+                        homes.entry(value.bp_pos).or_insert_with(|| path.clone());
                         walk(value, path, homes, pending);
                     }
                     path.pop();
@@ -5829,7 +5850,7 @@ pub fn collect_merged_members<W: AsRef<[u64]> + Clone>(
                 let mut rest = elements;
                 while let Some((element, next)) = rest.uncons_resolved_cursor() {
                     path.push(OwnedValue::Int(idx));
-                    homes.insert(element.bp_pos, path.clone());
+                    homes.entry(element.bp_pos).or_insert_with(|| path.clone());
                     walk(element, path, homes, pending);
                     path.pop();
                     idx += 1;
@@ -5855,10 +5876,19 @@ pub fn collect_merged_members<W: AsRef<[u64]> + Clone>(
                 Some(node) => homes.get(&node)?.clone(),
                 None => write_home.clone(),
             };
+            // The other sources holding the key, in the order they would show through if the
+            // first lost it. A source that is not a node of its own (written in place) has no home.
+            let fallbacks = p
+                .holders
+                .iter()
+                .filter(|node| Some(**node) != p.render_node)
+                .filter_map(|node| homes.get(node).cloned())
+                .collect();
             Some(crate::jq::MergedMember {
                 member: p.member,
                 write_home,
                 render_home,
+                fallbacks,
             })
         })
         .collect()

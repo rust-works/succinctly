@@ -1117,6 +1117,9 @@ pub struct MergedMember {
     /// earlier-listed source, for the same key). It is `write_home` unless several sources hold
     /// the key.
     pub render_home: Vec<OwnedValue>,
+    /// The other sources holding the key, in listed order: the one that shows through when
+    /// `render_home` loses it (`del(.a.z)` over `<<: [*a, *b, *c]` shows `b`'s `z`).
+    pub fallbacks: Vec<Vec<OwnedValue>>,
 }
 
 /// Ambient alias-identity table for yq-mode writes (#1351 — the remaining half of
@@ -1175,6 +1178,11 @@ pub mod alias_identity {
         groups: Vec<(Vec<OwnedValue>, Vec<Vec<OwnedValue>>)>,
         /// The members a `<<` merge brought into a mapping (#6785).
         merged: Vec<MergedMember>,
+        /// `merged` by the member's position (as [`position_key`] spells it), so a path prefix
+        /// finds its member without a scan of the document's merges.
+        merged_by_member: std::collections::HashMap<Vec<u8>, usize>,
+        /// Every proper prefix of a member's position.
+        merged_prefixes: std::collections::HashSet<Vec<u8>>,
     }
 
     impl AliasTable {
@@ -1184,6 +1192,8 @@ pub mod alias_identity {
             Self {
                 groups,
                 merged: Vec::new(),
+                merged_by_member: std::collections::HashMap::new(),
+                merged_prefixes: std::collections::HashSet::new(),
             }
         }
 
@@ -1191,6 +1201,18 @@ pub mod alias_identity {
         /// source's node, as it does through an alias.
         #[must_use]
         pub fn with_merged(mut self, merged: Vec<MergedMember>) -> Self {
+            for (idx, member) in merged.iter().enumerate() {
+                let mut key = Vec::new();
+                for (depth, step) in member.member.iter().enumerate() {
+                    if depth > 0 {
+                        self.merged_prefixes.insert(key.clone());
+                    }
+                    if push_step_key(&mut key, step).is_none() {
+                        break;
+                    }
+                }
+                self.merged_by_member.insert(key, idx);
+            }
             self.merged = merged;
             self
         }
@@ -1199,16 +1221,18 @@ pub mod alias_identity {
         /// value comes from -- one an earlier stage rebound is written positionally, as for an
         /// alias ([`same_node`]).
         fn merged_at(&self, doc: &OwnedValue, prefix: &[OwnedValue]) -> Option<&MergedMember> {
-            self.merged
-                .iter()
-                .find(|m| m.member.as_slice() == prefix && same_node(doc, prefix, &m.render_home))
+            if self.merged.is_empty() {
+                return None;
+            }
+            let member = &self.merged[*self.merged_by_member.get(&position_key(prefix)?)?];
+            same_node(doc, prefix, &member.render_home).then_some(member)
         }
 
         /// Whether any merged member lies strictly below `prefix`.
         fn has_merged_under(&self, prefix: &[OwnedValue]) -> bool {
-            self.merged
-                .iter()
-                .any(|m| m.member.len() > prefix.len() && m.member[..prefix.len()] == *prefix)
+            !self.merged.is_empty()
+                && (prefix.is_empty()
+                    || position_key(prefix).is_some_and(|key| self.merged_prefixes.contains(&key)))
         }
 
         /// The anchor path this exact alias position resolves to, if any.
@@ -1616,9 +1640,11 @@ pub mod alias_identity {
     /// pristine input of the whole pipe -- which is what makes the "was a copy
     /// before this write" test exact mid-pipe.
     pub(crate) fn mirror_after_write(pre: &OwnedValue, post: &mut OwnedValue) {
+        // Merged members first: a mapping that is itself aliased copies the member's new value
+        // on to its alias slots in the pass after (#6785).
         with_table(|table| {
-            propagate_anchor_writes(pre, post, &table.groups);
             propagate_merged_members(pre, post, &table.merged);
+            propagate_anchor_writes(pre, post, &table.groups);
         });
     }
 }
@@ -99000,6 +99026,56 @@ fn propagate_anchor_writes(
     }
 }
 
+/// Replace the value at `path` (string and index steps only) in place, when every step already
+/// exists. Unlike [`set_value_at_path`] it takes no ownership of the document, so it neither
+/// clones it nor copies a container that has no other handle (#6785). `false` when a step does
+/// not resolve, with the document unchanged.
+fn replace_existing_at_path(root: &mut OwnedValue, path: &[OwnedValue], new: OwnedValue) -> bool {
+    let mut slot = root;
+    for step in path {
+        let next = match (step, slot) {
+            (OwnedValue::String(key), OwnedValue::Object(entries)) => entries.get_mut(key.as_str()),
+            (OwnedValue::Int(idx), OwnedValue::Array(arr)) => {
+                usize::try_from(*idx).ok().and_then(|i| arr.get_mut(i))
+            }
+            _ => None,
+        };
+        match next {
+            Some(inner) => slot = inner,
+            None => return false,
+        }
+    }
+    *slot = new;
+    true
+}
+
+/// Remove the member at `path` (string and index steps only) in place; `false` when it is not there.
+fn remove_existing_at_path(root: &mut OwnedValue, path: &[OwnedValue]) -> bool {
+    let Some((last, parents)) = path.split_last() else {
+        return false;
+    };
+    let mut slot = root;
+    for step in parents {
+        let next = match (step, slot) {
+            (OwnedValue::String(key), OwnedValue::Object(entries)) => entries.get_mut(key.as_str()),
+            (OwnedValue::Int(idx), OwnedValue::Array(arr)) => {
+                usize::try_from(*idx).ok().and_then(|i| arr.get_mut(i))
+            }
+            _ => None,
+        };
+        match next {
+            Some(inner) => slot = inner,
+            None => return false,
+        }
+    }
+    match (last, slot) {
+        (OwnedValue::String(key), OwnedValue::Object(entries)) => {
+            entries.shift_remove(key.as_str()).is_some()
+        }
+        _ => false,
+    }
+}
+
 /// Re-derive each merged member from the node its value comes from, after a write (#6785).
 ///
 /// A member is still "derived" while it is the untouched copy of its `render_home` in `pre` and
@@ -99025,28 +99101,31 @@ fn propagate_merged_members(pre: &OwnedValue, post: &mut OwnedValue, merged: &[M
         match get_value_at_path(post, &member.render_home) {
             Some(new) if new.identical(&slot_pre) => {}
             Some(new) => {
-                if let Ok(updated) =
-                    set_value_at_path::<JqSemantics>(post.clone(), &member.member, new)
-                {
-                    *post = updated;
-                }
+                replace_existing_at_path(post, &member.member, new);
             }
-            // The source lost the key. Another source that holds it shows through (`del(.a.z)`
-            // over `<<: [*a, *b]` leaves `item.z` as `b`'s): the last one, which is the next in
-            // line when two sources hold it. The key leaves the mapping when none does.
             None => {
-                let next = get_value_at_path(post, &member.write_home);
-                let updated = match next {
+                // The source mapping itself is gone or no longer a mapping (`del(.a)`): yq keeps
+                // the members it merged, so there is nothing to follow. Only a key the source
+                // lost leaves the mapping, or shows through from the next source holding it.
+                let source_is_mapping = member
+                    .render_home
+                    .split_last()
+                    .and_then(|(_, parent)| get_value_at_path(post, parent))
+                    .is_some_and(|v| matches!(v, OwnedValue::Object(_)));
+                if !source_is_mapping {
+                    continue;
+                }
+                match member
+                    .fallbacks
+                    .iter()
+                    .find_map(|home| get_value_at_path(post, home))
+                {
                     Some(value) => {
-                        set_value_at_path::<JqSemantics>(post.clone(), &member.member, value)
+                        replace_existing_at_path(post, &member.member, value);
                     }
                     None => {
-                        let paths: [&[OwnedValue]; 1] = [&member.member];
-                        delete_paths_sorted::<JqSemantics>(post.clone(), &paths, 0)
+                        remove_existing_at_path(post, &member.member);
                     }
-                };
-                if let Ok(updated) = updated {
-                    *post = updated;
                 }
             }
         }
