@@ -1192,6 +1192,12 @@ pub mod alias_identity {
         alias_group: std::collections::HashMap<Vec<u8>, usize>,
         /// Every proper prefix of an alias position, the root included.
         alias_prefixes: std::collections::HashSet<Vec<u8>>,
+        /// How many alias positions the groups hold. `hop_bound` is this, the merged members and
+        /// one: the most redirects one path can follow (`redirect_components`). Counted once, not
+        /// summed per question: it is asked for every component of every fanned-out path, so a
+        /// sum over the groups made a write through N aliases of N different anchors quadratic
+        /// (#6869).
+        alias_count: usize,
         /// The members a `<<` merge brought into a mapping (#6785).
         merged: Vec<MergedMember>,
         /// `merged` by the member's position (as [`position_key`] spells it), so a path prefix
@@ -1231,10 +1237,12 @@ pub mod alias_identity {
                     }
                 }
             }
+            let alias_count = groups.iter().map(|(_, aliases)| aliases.len()).sum();
             Self {
                 groups,
                 alias_group,
                 alias_prefixes,
+                alias_count,
                 merged: Vec::new(),
                 merged_by_member: std::collections::HashMap::new(),
                 merged_prefixes: std::collections::HashSet::new(),
@@ -1292,12 +1300,7 @@ pub mod alias_identity {
         }
 
         fn hop_bound(&self) -> usize {
-            self.groups
-                .iter()
-                .map(|(_, aliases)| aliases.len())
-                .sum::<usize>()
-                + self.merged.len()
-                + 1
+            self.alias_count + self.merged.len() + 1
         }
     }
 
@@ -1934,6 +1937,30 @@ pub mod alias_identity {
             }
             // The first group listing a position decides, as the scan did.
             assert_eq!(table.anchor_for(&[s("l"), i(0)]), Some([s("a")].as_slice()));
+        }
+
+        /// The redirect bound counts the alias positions once and the live merged members: one more
+        /// than both, what the per-question sum was (#6869).
+        #[test]
+        fn the_hop_bound_is_kept_and_counts_aliases_and_members_6869() {
+            let groups = vec![
+                (vec![s("a")], vec![vec![s("b")], vec![s("c")]]),
+                (vec![s("d")], vec![vec![s("e")]]),
+            ];
+            let table = AliasTable::from_groups(groups.clone());
+            assert_eq!(table.hop_bound(), 3 + 1);
+            let member = |name: &str| MergedMember {
+                member: vec![s("m"), s(name)],
+                write_home: vec![s("src"), s(name)],
+                render_home: vec![s("src"), s(name)],
+                fallbacks: Vec::new(),
+            };
+            let table = table.with_merged(vec![member("x"), member("y")]);
+            assert_eq!(table.hop_bound(), 3 + 2 + 1);
+            // A table that is given its members again does not count the old ones twice.
+            let table = table.with_merged(vec![member("x")]);
+            assert_eq!(table.hop_bound(), 3 + 1 + 1);
+            assert_eq!(AliasTable::from_groups(Vec::new()).hop_bound(), 1);
         }
 
         /// A name holding the tag and terminator bytes is one step, never two.
