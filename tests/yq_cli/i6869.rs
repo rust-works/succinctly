@@ -37,7 +37,7 @@ fn test_a_write_through_many_aliases_of_different_anchors_is_not_quadratic_6869(
     assert!(
         stdout.starts_with("{\"l\":[{\"p\":1},{\"p\":2},"),
         "{}",
-        &stdout[..40]
+        stdout.chars().take(80).collect::<String>()
     );
     assert!(stdout.contains(&format!("{{\"p\":{n}}}],\"m\":[{{\"p\":1}},")));
     assert!(stdout.ends_with(&format!("{{\"p\":{n}}}]}}\n")));
