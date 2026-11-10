@@ -760,7 +760,8 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     }
 
     /// Whether the block scalar whose `|` or `>` is at text offset `header_pos` holds a NEL, LS or
-    /// PS, or is ended by a line that begins with one (#6369). Its lines are then read with those as
+    /// PS, is ended by a line that begins with one (#6369), or has its header line ended by one
+    /// (#6820). Its lines are then read with those as
     /// breaks, as go-yaml reads them. Free for a document with none: the list is empty.
     #[inline]
     pub(crate) fn block_scalar_holds_unicode_break(&self, header_pos: usize) -> bool {

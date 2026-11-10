@@ -88,21 +88,3 @@ fn test_a_header_that_holds_only_indicators_blanks_and_a_comment_still_reads_634
     }
     Ok(())
 }
-
-/// Recorded divergence: U+0085, U+2028 and U+2029 end a line to yq as `\n` does, so a block scalar's
-/// header ends at one and the lines below it are the content (`a: |<LS>` / `  x` is `"\nx\n"`). The
-/// index does not model them as breaks (#4913), so the header's rest is not refused but the value is
-/// wrong. Pinned to what succinctly answers today; delete a row when it starts to fail.
-#[test]
-fn test_recorded_divergence_a_unicode_break_ends_the_header_in_yq_6348() -> Result<()> {
-    for (doc, expected) in [
-        ("a: |\u{2028}\n  x\n", "{\"a\":\"x\\n\"}"),
-        ("a: |\u{85}\n  x\n", "{\"a\":\"x\\n\"}"),
-        // yq refuses this (`while scanning a simple key`); the rest of the line is dropped here.
-        ("a: |\u{2028}garbage\n  x\n", "{\"a\":\"x\\n\"}"),
-    ] {
-        let (stdout, code) = run_yq_stdin(".", doc, ARGS)?;
-        assert_eq!((stdout.trim_end(), code), (expected, 0), "{doc:?}");
-    }
-    Ok(())
-}
