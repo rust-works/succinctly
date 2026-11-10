@@ -120,7 +120,15 @@ impl<'a> DsvCursor<'a> {
             .markers_select1(current_rank)
             .unwrap_or(self.text.len());
 
-        &self.text[start..end]
+        let field = &self.text[start..end];
+        // A CRLF record ends with the two bytes (RFC 4180): a `\r` right before the `\n` that ends
+        // the record, or before the end of the text, belongs to the terminator and not to the last
+        // field (#6874). One in front of a delimiter is content, and so is one inside a quoted
+        // field, which then ends in the closing quote.
+        match field.split_last() {
+            Some((&b'\r', head)) if end >= self.text.len() || self.text[end] == b'\n' => head,
+            _ => field,
+        }
     }
 
     /// Get current field as a string slice.
@@ -323,6 +331,46 @@ mod tests {
     use super::super::parser::build_index;
     use super::super::DsvConfig;
     use super::*;
+
+    #[test]
+    fn crlf_is_the_record_terminator_6874() {
+        let fields = |text: &[u8]| -> Vec<Vec<Vec<u8>>> {
+            let index = build_index(text, &DsvConfig::default());
+            DsvRows::new(text, &index)
+                .map(|row| row.fields().map(<[u8]>::to_vec).collect())
+                .collect()
+        };
+        let strs = |rows: Vec<Vec<Vec<u8>>>| -> Vec<Vec<String>> {
+            rows.into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|f| String::from_utf8(f).unwrap())
+                        .collect()
+                })
+                .collect()
+        };
+        // The terminator's `\r` is not part of the last field, quoted or not, and not at the end of the
+        // text either.
+        assert_eq!(
+            strs(fields(b"a,b\r\n1,\"x y\"\r\n")),
+            vec![vec!["a", "b"], vec!["1", "\"x y\""]]
+        );
+        assert_eq!(
+            strs(fields(b"a,b\r\n1,2\r")),
+            vec![vec!["a", "b"], vec!["1", "2"]]
+        );
+        // A `\r` in front of a delimiter, or inside a quoted field, is content.
+        assert_eq!(strs(fields(b"a\r,b\r\n")), vec![vec!["a\r", "b"]]);
+        assert_eq!(
+            strs(fields(b"\"x\r\ny\",z\r\n")),
+            vec![vec!["\"x\r\ny\"", "z"]]
+        );
+        // `get` reads the same field the iterator does.
+        let text = b"a,b\r\n1,2\r\n";
+        let index = build_index(text, &DsvConfig::default());
+        let row = DsvRows::new(text, &index).nth(1).unwrap();
+        assert_eq!(row.get(1), Some(b"2".as_slice()));
+    }
 
     #[test]
     fn test_cursor_navigation() {
