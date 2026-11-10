@@ -22719,6 +22719,35 @@ pub(crate) fn eval_yq_documents_together<S: EvalSemantics, C: DocumentCursor>(
     partial_generic(owned, control)
 }
 
+/// An `ireduce` step's UPDATE over the whole list of accumulators (#6802), the owned-value twin of
+/// [`eval_yq_documents_together`]'s walk without its `EvaluateTogether` flag.
+///
+/// yq's `reduceOperator` evaluates UPDATE against the *list* of accumulators, so a union in it
+/// is branch-major over that list (`. as $i ireduce ((1, 2); (. + $i, . * 10))` runs `. + $i` over
+/// both accumulators before `. * 10` does) and every output is an accumulator of the next step.
+/// Entries are owned values, so the walk is instantiated over the JSON cursor type with none of
+/// them a cursor.
+pub(crate) fn eval_yq_over_owned_list<S: EvalSemantics>(
+    expr: &Expr,
+    accumulators: Vec<OwnedValue>,
+    optional: bool,
+) -> Result<Vec<OwnedValue>, Control> {
+    type Value = <crate::json::light::JsonCursor<'static> as DocumentCursor>::Value;
+    let inputs: Vec<YqContextItem<Value>> = accumulators
+        .into_iter()
+        .map(|value| YqContextItem::new(YqContextNode::Owned(value), YqContextTag::default()))
+        .collect();
+    let mut flat: Vec<Expr> = Vec::new();
+    yq_flatten_pipe_stages(core::slice::from_ref(expr), &mut flat);
+    let cur = core::cell::Cell::new(YqContextTag::default());
+    collect_yq_context::<S, Value>(&flat, &inputs, optional, &cur)?
+        .into_iter()
+        // STYLE-0012: an unreadable accumulator is a decode failure, which an ambient `?` never
+        // silences (#1620, #1902); it ends the fold like any other control.
+        .map(|item| generic_item_into_owned::<_, S>(item.to_generic_item()))
+        .collect()
+}
+
 /// Generic-evaluator twin of `eval::each_take_first` (#1461): pull at most
 /// one output of `inner` via [`eval_each_generic`], then stop the generator
 /// -- jq's `def first(f): label $out | (f, break $out);`.

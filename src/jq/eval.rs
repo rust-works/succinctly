@@ -94280,6 +94280,17 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
     retry: FoldDirectRetry,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Flow {
+    // #6802: yq's fold keeps a list of accumulators, not jq's one fork per INIT output.
+    if S::TAG == EvalTag::Yq && patterns.len() == 1 {
+        return reduce_list_yq::<S>(
+            &patterns[0],
+            update,
+            drive_init,
+            optional,
+            drive_source,
+            sink,
+        );
+    }
     // #3036/#3122: UPDATE reruns against the fold's own accumulator, which
     // is almost never a document node, so its `Snapshot` markers are demoted
     // against `Owned` -- once per fold, here, rather than once per element
@@ -94374,6 +94385,144 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
     });
 
     finish_fold_forks(terminal, init_flow, retry.init, optional)
+}
+
+/// The UPDATE a yq fold step runs: the loop variables spliced in, unless it reads none (`inert`).
+fn bind_yq_update<'e>(
+    expr: &'e Expr,
+    inert: bool,
+    bindings: &[(String, OwnedValue)],
+    all_var_names: &[String],
+) -> Cow<'e, Expr> {
+    if inert {
+        Cow::Borrowed(expr)
+    } else {
+        Cow::Owned(substitute_fold_step(
+            expr,
+            bindings,
+            all_var_names,
+            LoopVarSplice::Literal,
+            false,
+        ))
+    }
+}
+
+/// yq's `reduce` (#6802): a fold over a *list* of accumulators, where jq's is one independent fork per
+/// INIT output that keeps UPDATE's last output.
+///
+/// yq's `reduceOperator` (`pkg/yqlib/operator_reduce.go`, v4.53.3) evaluates INIT once into a list,
+/// reads the source **once**, and runs UPDATE against the whole list for each source node: every
+/// output of UPDATE is an accumulator of the next step, an UPDATE with no output drops its
+/// accumulator, and a union in UPDATE is branch-major over the list. The answers are the final list.
+/// `. as $i ireduce (0; (. + $i, . * 10))` over `[1, 2]` is `3 2 10 0`, a `select(false)` UPDATE
+/// prints nothing, and INIT `(0, 100)` folds both over the same source (`3 103`; jq's later forks read
+/// a `null` source, #3895).
+///
+/// One accumulator -- the common case -- is stepped through the ordinary UPDATE dispatch
+/// ([`fold_step_each`], collecting every output), so a fold that never fans out costs what it did.
+/// Several go through the context-list walk ([`super::eval_generic::eval_yq_over_owned_list`]), whose
+/// per-entry run is the same evaluator. A single pattern only: `?//` alternatives are jq syntax.
+fn reduce_list_yq<S: EvalSemantics>(
+    pattern: &Pattern,
+    update: &Expr,
+    drive_init: ForeachInitDrive<'_>,
+    optional: bool,
+    drive_source: ForeachSourceDrive<'_>,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Flow {
+    let hoisted_update = demote_for_reentry(update, &RootWitness::Owned);
+    let all_var_names = pattern_alternatives_var_names(core::slice::from_ref(pattern));
+    let update = FoldOperand::new::<S>(update, &hoisted_update).inert_for(&all_var_names);
+
+    let mut accumulators: Vec<OwnedValue> = Vec::new();
+    let init_flow = drive_init(&mut |seed| {
+        accumulators.push(seed);
+        Demand::Continue
+    });
+    if let Flow::Escaped(control) = init_flow {
+        return finish_fork_flow(Some(control), optional);
+    }
+    // Nothing to fold: the source is never read, as for jq (#2440).
+    if accumulators.is_empty() {
+        return finish_fork_flow(None, optional);
+    }
+
+    // The list's growth is what is charged: a step on one accumulator is free, as the first fork of
+    // jq's fold is, and each accumulator past the first spends a unit, so a union in UPDATE that
+    // doubles the list every step is refused at 100,000 accumulators where yq grows it until the
+    // process dies (`ireduce (0; (. + 1, . + 2))` over 30 elements is 2^30).
+    let mut extra_budget = REDUCE_FOREACH_MAX_STEPS;
+    let mut failure: Option<Control> = None;
+    let source_flow = drive_source(SourceInput::Real, &mut |element| {
+        let sets_flow = each_pattern_binding_set::<S>(pattern, &element, false, &mut |bindings| {
+            let current = core::mem::take(&mut accumulators);
+            let stepped: Result<Vec<OwnedValue>, Control> = if current.len() == 1 {
+                // The list's own allocation takes the outputs, so a step that answers once
+                // allocates nothing.
+                let mut outputs = current;
+                let state = outputs.pop().expect("one accumulator");
+                // yq mode never witnesses a node (`FoldOperand::new`), so this is the hoisted
+                // UPDATE the several-accumulator step below runs too.
+                let (expr, reentry) = update.against::<S>(&state);
+                let substituted = bind_yq_update(expr, update.inert, bindings, &all_var_names);
+                match fold_step_each::<S>(&substituted, state, optional, reentry, &mut |v| {
+                    outputs.push(v);
+                    Demand::Continue
+                }) {
+                    Flow::Escaped(control) => Err(control),
+                    _ => Ok(outputs),
+                }
+            } else {
+                let substituted =
+                    bind_yq_update(update.hoisted, update.inert, bindings, &all_var_names);
+                super::eval_generic::eval_yq_over_owned_list::<S>(&substituted, current, optional)
+            };
+            match stepped {
+                Ok(next) => {
+                    let extra = next.len().saturating_sub(1);
+                    if extra > extra_budget {
+                        // #2132: uncatchable, as every step budget's.
+                        failure = Some(Control::Error(EvalError::resource_limit(
+                            "reduce: maximum iterations exceeded".to_string(),
+                        )));
+                        return Demand::Stop;
+                    }
+                    extra_budget -= extra;
+                    accumulators = next;
+                    // An empty list stays empty: the rest of the source is not read.
+                    if accumulators.is_empty() {
+                        Demand::Stop
+                    } else {
+                        Demand::Continue
+                    }
+                }
+                Err(control) => {
+                    failure = Some(control);
+                    Demand::Stop
+                }
+            }
+        });
+        if let Flow::Escaped(control) = sets_flow {
+            failure.get_or_insert(control);
+        }
+        if failure.is_some() || accumulators.is_empty() {
+            Demand::Stop
+        } else {
+            Demand::Continue
+        }
+    });
+    if let Flow::Escaped(control) = source_flow {
+        failure.get_or_insert(control);
+    }
+    if let Some(control) = failure {
+        return finish_fork_flow(Some(control), optional);
+    }
+    for accumulator in accumulators {
+        if let Demand::Stop = sink(accumulator) {
+            return Flow::Stopped { pending: None };
+        }
+    }
+    finish_fork_flow(None, optional)
 }
 
 /// The tail both fold cores share: adjudicate the fork verdict `terminal`

@@ -1142,7 +1142,12 @@ capture table.
 An empty `{}` is one mapping whatever the context holds (`yq ea '{}' f1 f2` prints one `{}`, where `0` prints one per document, and `yq '.x[] | {}'` is one `{}` on any route), so `ireduce ({}; ...)` starts one fold.
 The reads of the loop variable's node (`$i | document_index`, `file_index`, `path`, `line`, `tag`, `kind`) answer from the document the node came from.
 Both rules apply to a list whose entries all came straight from the reader, like `[...]` and the binary operators.
-After a navigation they do not, and the plain route is unchanged.
+After a navigation they do not.
+On every route a yq `ireduce` folds a list of accumulators, as yq's does ([#6802](https://github.com/rust-works/succinctly/issues/6802)): each output of UPDATE is an accumulator of the next step, a union in UPDATE is branch-major over the list, an UPDATE with no output drops its accumulator, and several INIT outputs all fold the one source.
+`. as $i ireduce (0; (. + $i, . * 10))` over `[1, 2]` is `3 2 10 0`, and `ireduce (0; select(false))` prints nothing.
+jq's `reduce` is unchanged: one fork per INIT output, the last UPDATE output wins.
+The same rule holds for `reduce` under `--jq-extensions` in yq mode, since the mode decides, for a single pattern (a `?//` alternative list keeps jq's fold).
+A list that grows past 100,000 accumulators is refused with `reduce: maximum iterations exceeded`, where yq grows it until it runs out of memory (`ireduce (0; (. + 1, . + 2))` over 30 elements is 2^30 accumulators), as ADR-0018 allows for a run that would take the host down.
 
 Six things still differ, each in yq v4.53.3 against `succinctly yq`:
 
@@ -1157,12 +1162,13 @@ Six things still differ, each in yq v4.53.3 against `succinctly yq`:
   Here that `null` has no position, so `key` and `parent` of it answer nothing and `path` answers `[]`.
 - **An absent key read through the loop variable.**
   `. as $i ireduce ([]; . + [$i.a])` over a document with no `a` is `[]` in yq and `[null]` here, on the plain route as well as under `--eval-all` ([#6802](https://github.com/rust-works/succinctly/issues/6802)).
-
-- **An UPDATE with several outputs.**
-  `. as $i ireduce (0; (. + 1, . + 10))` keeps every output as its own accumulator in yq, and the last one here, as on the plain route ([#6802](https://github.com/rust-works/succinctly/issues/6802)).
+- **A union of writes over a container accumulator.**
+  yq's assignments mutate the accumulator in place and hand back the same node, so the list keeps it once: `.n[] as $i ireduce ({}; (.a += 1, .a += 2))` over `n: [1, 2, 3]` is `{"a":9}` and `ireduce ({}; (.a = 1, .b = 2))` is `{"a":1,"b":2}`.
+  Here each branch writes its own copy, so the list holds one accumulator per combination (eight outputs after three elements).
+  It is the same pointer rule as the "A union of two assignments" entry in the duplicate-keys section below, in a plain pipe ([#6802](https://github.com/rust-works/succinctly/issues/6802)).
 - **An UPDATE that answers the loop variable itself.**
-  `. as $i ireduce (null; $i)` is the last document, once, with its own `file_index` and `document_index` in yq.
-  Here it is one copy per document, and each has no origin (`file_index` is `0`).
+  `. as $i ireduce (null; $i)` is the last document, once, with its own `file_index` and `document_index` in yq, because the accumulators it produces are the same node and yq's list keeps it once.
+  Here it is one copy per accumulator, and each has no origin (`file_index` is `0`).
 
 An accumulator the fold computed carries no document origin: `. as $i ireduce ({}; . * $i) | file_index` is `0`, as in yq.
 
