@@ -1397,6 +1397,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             } else if let Some((_, next_column)) = next {
                 // A blank line after the run's second block changes nothing: it is still the foot of the key
                 // that owns the blocks the first one closed (#5053).
+                if self.defers_foot_to_next_item(next_column) {
+                    self.defer_pending_foot_to_next_item();
+                    return;
+                }
                 if let Some(owner) = self.outer_key_of_settled_foot(next_column) {
                     self.drain_pending_into_owner_foot(owner);
                     return;
@@ -1419,6 +1423,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             if next_column < prev_indent && column != next_column {
                 if self.pending_block.after_split && column < prev_indent {
                     self.settle_dedented_block(next, root);
+                } else if self.defers_foot_to_next_item(next_column) {
+                    self.defer_pending_foot_to_next_item();
                 } else if let Some(owner) = self.outer_key_of_settled_foot(next_column) {
                     // The run's first block already closed the blocks at its column as `PREV`'s foot, so this
                     // one is the foot of the key that owns them (#5053).
@@ -1500,6 +1506,24 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             .iter()
             .find(|frame| frame.indent == next_column)
             .and_then(|frame| frame.is_mapping.then_some(frame.last_key_bp).flatten())
+    }
+
+    /// Whether the pending block is the second of a run that a blank line split, and the node opening now is
+    /// an item of a sequence that the block is deeper than: yq makes it the foot of that item's first key, not of
+    /// an outer key (#5053); a block at or left of the item's column is placed by that column.
+    /// GitHub's default CodeQL workflow has `languages:` / block / blank / block / blank / `- name:`.
+    fn defers_foot_to_next_item(&self, next_column: usize) -> bool {
+        self.pending_block.follows_foot_at.is_some()
+            && self.current_type == Some(NodeType::SequenceItem)
+            && self.pending_block.column > next_column
+    }
+
+    /// Hand the pending block to the first key of the item opening now, keeping the blank lines between its
+    /// lines (see [`Self::defers_foot_to_next_item`]).
+    fn defer_pending_foot_to_next_item(&mut self) {
+        self.mark_blank_runs_in_pending();
+        let pending = &mut self.pending_head_lines;
+        self.deferred_foot_lines.append(pending);
     }
 
     /// Place a dedented block (`column < prev_indent`) whose adjacency no
