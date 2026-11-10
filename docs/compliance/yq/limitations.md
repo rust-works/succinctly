@@ -932,6 +932,19 @@ The blanks beside any of the three are trimmed as beside a `\n`, so the space-be
 A backslash before any of the three continues the line in a double-quoted scalar, as it does before a `\n`.
 A quoted implicit key that spans such a break is accepted for the same reason as a block plain scalar with one.
 
+A *block* scalar (`|` or `>`) that holds any of the three is read as go-yaml reads it
+([#6369](https://github.com/rust-works/succinctly/issues/6369)).
+Each of the three ends a line as `\n` does, so the spaces after one are indentation, a line left of the indent after one ends the scalar (in the middle of what a `\n`-only reader sees as one physical line), and a key, a sequence item, a comment or a document marker there is read as structure.
+In the value U+0085 is a `\n` and U+2028 and U+2029 stay as they are, and none of the three folds in a `>` scalar.
+A tab left of the indent after one is refused (#6287).
+The parser notes one on the line walk it already makes, looking at a byte only where a `0xC2` or `0xE2` lead byte shows up, and lists the scalar's header offset in the index (`YamlIndex::block_scalar_holds_unicode_break`).
+Only a listed scalar is read line by line, with `src/yaml/block_unicode.rs`, so the decoders never scan for the three and an index rebuilt from its parts (`from_parts`) reads every block scalar the old way.
+A scalar whose dedent line is spaces and one of the three is listed too, because go-yaml reads that line as an empty line and the scalar runs on past it.
+Checked against yq v4.53.3 on 960 documents (four headers, the three breaks, 0-3 spaces on each side, five tails) and on 40,000 random ones (seventeen headers, with properties, `+`, explicit indents, sequence items and a nested key), with no difference, as long as no break follows a line left of the scalar's indent: those are the shapes below.
+Still different, and not block scalars: a plain scalar or key in block context that spans one of the three (`x<LS>b: 1` is `could not find expected ':'` in yq), a comment line, which ends at the break in yq, and the first blank line of a document-root `--- |` when it is spaces and one of the three ([#6820](https://github.com/rust-works/succinctly/issues/6820)).
+Also still different ([#6820](https://github.com/rust-works/succinctly/issues/6820)): the block scalar header's own line ends only at `\n` and `\r` (`a: |<NEL>  x` is `x\n` in yq and empty here, as before), a comment on a dedent line that begins with one of the three runs to the next `\n` where yq's ends at the break (an invalid document such as that is accepted), and a last content line of the form `x:` followed by a dedented `- z` drops the item without an error.
+A scalar that holds one of the three is read about twice as slowly as one that does not: a 10 MB document of 14,240 block scalars that each hold an LS indexed in 28.0 ms against 14.6 ms before, on an AMD Ryzen 9 7950X, where yq's answer for all of them was previously wrong.
+
 **One deliberate divergence (ADR-0018, output the reference cannot read back).** go-yaml tests only the
 first character of the string for the indentation indicator, so a string that starts with a break and
 then a space (`"\n a"`) is written `|-` / blank / `   a`, and reads back as `"\na"` even in yq. Ours
