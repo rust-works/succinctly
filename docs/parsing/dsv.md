@@ -55,6 +55,10 @@ row2,data\n
          10, 21  (newlines set here)
 ```
 
+### Line Endings
+
+A record ends at a `\n` outside quotes, and a `\r` right before that `\n` (RFC 4180's `CRLF`), or right before the end of the text, belongs to the terminator: the field accessors ([`DsvCursor::current_field`](../../src/dsv/cursor.rs), and so `DsvRow::fields` and `get`) leave it out of the last field of the row, quoted or not (#6874). The index is unchanged, since the `\r` carries no marker. A `\r` in front of a delimiter, or inside a quoted field, is content, and so is a lone `\r` between two fields: a file with classic Mac `\r`-only line endings is read as one record.
+
 ---
 
 ## Quote Handling
