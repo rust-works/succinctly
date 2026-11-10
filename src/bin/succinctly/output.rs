@@ -776,7 +776,7 @@ pub fn format_json(value: &OwnedValue, opts: &JsonFormatOpts) -> String {
     format_json_impl(value, opts, 0)
 }
 
-/// Recursive JSON formatter behind [`format_json`].
+/// The JSON text of `value`, built by [`write_json_impl`] into one buffer.
 ///
 /// Panics past `succinctly::jq::MAX_VALUE_TREE_DEPTH` levels of nesting
 /// (#1005) — see that constant's own doc comment for why. `value` is the
@@ -784,27 +784,90 @@ pub fn format_json(value: &OwnedValue, opts: &JsonFormatOpts) -> String {
 /// with no adversarial document involved; `serde_json`'s own input-depth
 /// limit (used elsewhere on this eager-output path) never sees it.
 fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> String {
+    let mut out = String::new();
+    write_json_impl(&mut out, value, opts, level);
+    out
+}
+
+/// Appends the JSON text of `value` to `out`: a container writes its own
+/// punctuation and its children straight into the one buffer, where it used to
+/// build a `String` per child, a `Vec<String>` of them and a `join` per level
+/// (#6814: 42-51% of the live heap at a whole-document write). A scalar is the
+/// text [`scalar_json_text`] gives, unchanged.
+fn write_json_impl(out: &mut String, value: &OwnedValue, opts: &JsonFormatOpts, level: usize) {
     if level > JQ_MAX_PRINT_DEPTH && opts.convention.skips_past_print_depth() {
-        return SkippedKind::of(value)
-            .marker(opts.mark_nan_for_color)
-            .to_string();
+        out.push_str(SkippedKind::of(value).marker(opts.mark_nan_for_color));
+        return;
     }
     assert_value_tree_depth(level);
     let indent = opts.indent;
     let compact = indent.is_empty();
-    let current_indent = if compact {
-        String::new()
-    } else {
-        indent.repeat(level)
+    let push_indent = |out: &mut String, depth: usize| {
+        for _ in 0..depth {
+            out.push_str(indent);
+        }
     };
-    let next_indent = if compact {
-        String::new()
-    } else {
-        indent.repeat(level + 1)
-    };
-    let separator = if compact { "" } else { "\n" };
-    let space_after_colon = if compact { "" } else { " " };
+    match value {
+        OwnedValue::Array(arr) => {
+            if arr.is_empty() {
+                out.push_str("[]");
+                return;
+            }
+            out.push('[');
+            for (i, v) in arr.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                if !compact {
+                    out.push('\n');
+                    push_indent(out, level + 1);
+                }
+                write_json_impl(out, v, opts, level + 1);
+            }
+            if !compact {
+                out.push('\n');
+                push_indent(out, level);
+            }
+            out.push(']');
+        }
+        OwnedValue::Object(obj) => {
+            if obj.is_empty() {
+                out.push_str("{}");
+                return;
+            }
+            let mut entries: Vec<(&String, &OwnedValue)> = obj.occurrences().collect();
+            if opts.sort_keys {
+                entries.sort_by(|a, b| a.0.cmp(b.0));
+            }
+            out.push('{');
+            for (i, (k, v)) in entries.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                if !compact {
+                    out.push('\n');
+                    push_indent(out, level + 1);
+                }
+                out.push('"');
+                out.push_str(&escape_json_body(k, opts));
+                out.push_str("\":");
+                if !compact {
+                    out.push(' ');
+                }
+                write_json_impl(out, v, opts, level + 1);
+            }
+            if !compact {
+                out.push('\n');
+                push_indent(out, level);
+            }
+            out.push('}');
+        }
+        _ => out.push_str(&scalar_json_text(value, opts)),
+    }
+}
 
+/// The JSON text of a scalar (anything but an array or object).
+fn scalar_json_text(value: &OwnedValue, opts: &JsonFormatOpts) -> String {
     match value {
         OwnedValue::Null => "null".to_string(),
         OwnedValue::Bool(b) => b.to_string(),
@@ -985,70 +1048,8 @@ fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> 
         OwnedValue::String(s) => {
             format!("\"{}\"", escape_json_body(s, opts))
         }
-        OwnedValue::Array(arr) => {
-            if arr.is_empty() {
-                "[]".to_string()
-            } else if compact {
-                let items: Vec<String> = arr
-                    .iter()
-                    .map(|v| format_json_impl(v, opts, level + 1))
-                    .collect();
-                format!("[{}]", items.join(","))
-            } else {
-                let items: Vec<String> = arr
-                    .iter()
-                    .map(|v| format!("{}{}", next_indent, format_json_impl(v, opts, level + 1)))
-                    .collect();
-                format!(
-                    "[{}{}{separator}{}]",
-                    separator,
-                    items.join(&format!(",{separator}")),
-                    current_indent
-                )
-            }
-        }
-        OwnedValue::Object(obj) => {
-            if obj.is_empty() {
-                return "{}".to_string();
-            }
-            let mut entries: Vec<(&String, &OwnedValue)> = obj.occurrences().collect();
-            if opts.sort_keys {
-                entries.sort_by(|a, b| a.0.cmp(b.0));
-            }
-            if compact {
-                let items: Vec<String> = entries
-                    .iter()
-                    .map(|(k, v)| {
-                        let key = escape_json_body(k, opts);
-                        format!("\"{}\":{}", key, format_json_impl(v, opts, level + 1))
-                    })
-                    .collect();
-                format!("{{{}}}", items.join(","))
-            } else {
-                let items: Vec<String> = entries
-                    .iter()
-                    .map(|(k, v)| {
-                        let key = escape_json_body(k, opts);
-                        format!(
-                            "\"{}\":{}{}",
-                            key,
-                            space_after_colon,
-                            format_json_impl(v, opts, level + 1)
-                        )
-                    })
-                    .collect();
-                // Add indent before each key
-                let indented_items: Vec<String> = items
-                    .iter()
-                    .map(|item| format!("{next_indent}{item}"))
-                    .collect();
-                format!(
-                    "{{{}{}{separator}{}}}",
-                    separator,
-                    indented_items.join(&format!(",{separator}")),
-                    current_indent
-                )
-            }
+        OwnedValue::Array(_) | OwnedValue::Object(_) => {
+            unreachable!("write_json_impl writes the containers")
         }
     }
 }
@@ -2319,6 +2320,55 @@ mod tests {
             json_sourced: false,
         };
         assert_eq!(format_json(&value, &opts), r#"{"a":2,"z":1}"#);
+    }
+
+    /// #6814: containers append into one buffer, so their punctuation and
+    /// indentation are written by hand. `serde_json` is the independent oracle
+    /// for compact and 2-space output over nesting, empties and every
+    /// first/middle/last-child position (key sorting has its own test above).
+    #[test]
+    fn format_json_containers_match_serde_json_6814() {
+        fn owned(v: &serde_json::Value) -> OwnedValue {
+            match v {
+                serde_json::Value::Null => OwnedValue::Null,
+                serde_json::Value::Bool(b) => OwnedValue::Bool(*b),
+                serde_json::Value::Number(n) => OwnedValue::Int(n.as_i64().unwrap()),
+                serde_json::Value::String(s) => OwnedValue::String(s.as_str().into()),
+                serde_json::Value::Array(a) => {
+                    OwnedValue::Array(a.iter().map(owned).collect::<Vec<_>>().into())
+                }
+                serde_json::Value::Object(o) => OwnedValue::Object(
+                    o.iter()
+                        .map(|(k, v)| (k.clone(), owned(v)))
+                        .collect::<IndexMap<_, _>>()
+                        .into(),
+                ),
+            }
+        }
+        let doc = r#"{"e":{},"a":[],"n":[[],[[]],{"x":{}},[{"b":[1,2,{"c":null}]}]],
+            "z":{"b":1,"a":{"y":true,"x":[false,"s"]}},"m":[{"q":1},{"q":2}],"last":0}"#;
+        let value: serde_json::Value = serde_json::from_str(doc).unwrap();
+        let value_owned = owned(&value);
+        for indent in ["", "  "] {
+            let opts = JsonFormatOpts {
+                mark_nan_for_color: false,
+                indent,
+                sort_keys: false,
+                ascii: false,
+                convention: JsonConvention::JqCompat,
+                json_sourced: false,
+            };
+            let expected = if indent.is_empty() {
+                serde_json::to_string(&value).unwrap()
+            } else {
+                serde_json::to_string_pretty(&value).unwrap()
+            };
+            assert_eq!(
+                format_json(&value_owned, &opts),
+                expected,
+                "indent {indent:?}"
+            );
+        }
     }
 
     /// jq mode's `OwnedValue::Float` arm always uses [`jq_bare_float_display`]

@@ -89,7 +89,7 @@ both.
 | M1, stream results      | **Implement**                 | #6813 | `yq` 716 / 814 MiB against `jq` 118 / 114 MiB on the same query at 100 MiB (7950X / M4 Pro): 6.1x / 7.1x                                                                          |
 | M2, cursor navigation   | Shipped                       | -     | -                                                                                                                                                                                 |
 | M3, exit-status clone   | Shipped                       | -     | No measurable change (see "M3 Results")                                                                                                                                           |
-| M4, streaming JSON      | **Implement**, as the printer | #6814 | `to_json` already writes into one buffer; `format_json_impl` (`output.rs`) still does not: 42-51% of the live heap at a whole-document write, about 11% for a result-shaped print |
+| M4, streaming JSON      | **Done**, as the printer      | #6814 | `to_json` already writes into one buffer; `format_json_impl` (`output.rs`) still does not: 42-51% of the live heap at a whole-document write, about 11% for a result-shaped print |
 | M5, lazy `IndexMap`     | **Not pursued**               | -     | At most 6-9% of peak RSS (table above); touches the `Deref` contract of `ObjectMapOf`                                                                                             |
 | M6, key interning       | **Not pursued**               | -     | At most 15% (7950X) / 8% (M4 Pro) of peak RSS on record-shaped input, 3-6% on unique-key shapes; changes the key type of every object                                             |
 | (new) presentation tree | **Implement**                 | #6815 | 58% of the live heap at a YAML-output write; that write is 3.3-3.9x the JSON-output write (3.7-3.9x on the 7950X, 3.3x on the M4 Pro)                                             |
@@ -101,6 +101,12 @@ both.
 - **M4** as the plan wrote it (`to_json`'s `Vec<String>` and `join`) no longer exists:
   `OwnedValue::write_json_at_depth` appends into one `String`. The same shape is alive in
   `output.rs`, which the CLI reaches for a computed result, and that is #6814.
+- **M4 landed as #6814**: `format_json_impl` appends arrays and objects into one buffer. Output is
+  byte-identical (827 flag/mode/input runs against the old binary, and a `serde_json`-oracle unit test).
+  Interleaved A/B, 7 repetitions, median peak RSS and fastest time, `.zzz = 1` with `-o json`: 100 MiB
+  `users` 1260 to 1059 MiB (`-I0`) and 1454 to 1059 MiB (indented) on the 7950X, 1505 to 1174 and 1730 to
+  1197 MiB on the M4 Pro; over the four patterns RSS falls 9-47% and time 10-45%, and a result that is
+  only part of the document falls 3-12% and 6-24%. Indented output now peaks where compact does.
 - **M5** would save at most 6-9% of the peak on the shapes measured, and it would change what
   `ObjectMapOf` derefs to: 135 `as_object()` call sites, 885 `OwnedValue::Object` arms, the `Rc`
   pointer used as node identity (`ptr_eq`, #2889) and the shadow list of a repeated key. A map that
@@ -822,7 +828,7 @@ struct InternedString {
 | Phase | Impact    | Complexity  | Priority                      | Status              |
 |-------|-----------|-------------|-------------------------------|---------------------|
 | M3    | Low       | Low         | **P1** (quick win)            | ✅ Done              |
-| M4    | Medium    | Low-Medium  | **P1** (quick win)            | #6814 (the printer) |
+| M4    | Medium    | Low-Medium  | **P1** (quick win)            | ✅ Done (#6814)     |
 | M1    | High      | Medium      | **P2** (major improvement)    | #6813               |
 | M2    | Very High | High        | **P3** (requires design work) | ✅ Done              |
 | M5    | Medium    | Medium      | **P4** (nice to have)         | Not pursued (#5865) |
