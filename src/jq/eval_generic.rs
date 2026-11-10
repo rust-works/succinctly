@@ -3078,6 +3078,36 @@ fn yq_type_tag<V: DocumentValue>(value: &V, cursor: Option<V::Cursor>) -> String
     document_value_type_tag(value).to_string()
 }
 
+/// [`yq_slices_to_empty_sequence`] for a target that may not be a string at all, in yq mode only:
+/// the answer a computed-bound slice needs once its target has left its cursor (#4569).
+fn yq_scalar_is_not_a_string<S: EvalSemantics, V: DocumentValue>(
+    cursor: &V::Cursor,
+    value: &V,
+) -> bool {
+    S::TAG == EvalTag::Yq && value.as_str().is_some() && yq_slices_to_empty_sequence(cursor, value)
+}
+
+/// Whether yq slices the string-valued scalar at `cursor` to an empty sequence instead of cutting
+/// its text (#4569): an alias, a scalar with an explicit core tag other than `!!str`
+/// (`!!binary`, `!!timestamp`, `!!int "5"`, also spelled as a verbatim `!<tag:yaml.org,2002:..>`)
+/// and a plain timestamp are not strings to it, where a quoted date, an explicit `!!str` and a
+/// custom-tagged scalar are. An explicit tag decides alone, as it does for `tag`
+/// (`!!str 2024-01-01` is a string), so the text is only read for a node with none.
+fn yq_slices_to_empty_sequence<C: DocumentCursor, V: DocumentValue>(cursor: &C, value: &V) -> bool {
+    if cursor.is_alias() {
+        return true;
+    }
+    match cursor.explicit_tag().filter(|tag| *tag != "!") {
+        Some(tag) => {
+            let core = tag
+                .strip_prefix("!!")
+                .or_else(|| tag.strip_prefix("!<tag:yaml.org,2002:")?.strip_suffix('>'));
+            core.is_some_and(|core| core != "str")
+        }
+        None => plain_timestamp(cursor, value),
+    }
+}
+
 /// Whether `cursor` is a plain scalar go-yaml resolves to `!!timestamp` (`2001-12-14`,
 /// `2001-12-14T21:59:43.10-05:00`), which yq reports as its tag and its string builtins refuse
 /// (#5836). A quoted date and a JSON string are strings. The first byte is checked before the
@@ -15338,6 +15368,19 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             slice_one_generic::<S, V>(value, *start, *end, optional, true)
         }
 
+        // #4569 (yq mode): yq slices only a plain string as text; every other scalar, an unquoted
+        // timestamp, a `!!binary` and an alias to a string included, comes out as an empty
+        // sequence, as an integer, a boolean and `null` already do (#1065). The scalar's text
+        // alone cannot say which it is (`2024-01-01` is a string once quoted), so this is read
+        // from the cursor, where the style and the tag still are.
+        Expr::Slice { .. }
+            if cursor
+                .as_ref()
+                .is_some_and(|c| yq_scalar_is_not_a_string::<S, V>(c, &value)) =>
+        {
+            GenericResult::Owned(OwnedValue::array())
+        }
+
         Expr::Field(name) => {
             // #2470 (yq mode, read-only context only): see
             // `eval::yq_absent_key_read_is_empty` -- the same rule the eager
@@ -26413,6 +26456,10 @@ fn slice_pair_generic<S: EvalSemantics, V: DocumentValue>(
             Borrowed(Vec<V>),
             Owned(Vec<OwnedValue>),
         }
+        // #4569: per borrowed target, whether yq reads it as something other than a string (an
+        // unquoted timestamp, a `!!binary`, an alias), which it slices to an empty sequence. Empty
+        // unless the target came from cursors in yq mode.
+        let mut not_a_string: Vec<bool> = Vec::new();
         let targets = match eval_single::<S, V>(target, value.clone(), false, cursor) {
             GenericResult::Error(e) => escape!(Control::Error(e)),
             GenericResult::Break(label) => escape!(Control::Break(label)),
@@ -26465,6 +26512,9 @@ fn slice_pair_generic<S: EvalSemantics, V: DocumentValue>(
                 if let Some(err) = empty_container_gap_error(&v, Some(&c)) {
                     escape!(Control::Error(err));
                 }
+                // #4569: the cursor is gone once the target is a value, so what yq reads a string
+                // scalar as is settled here, as the literal spelling settles it.
+                not_a_string = vec![yq_scalar_is_not_a_string::<S, V>(&c, &v)];
                 Targets::Borrowed(vec![v])
             }
             GenericResult::ManyCursor(cs) => {
@@ -26474,6 +26524,11 @@ fn slice_pair_generic<S: EvalSemantics, V: DocumentValue>(
                         escape!(Control::Error(err));
                     }
                 }
+                not_a_string = vs
+                    .iter()
+                    .zip(&cs)
+                    .map(|(v, c)| yq_scalar_is_not_a_string::<S, V>(c, v))
+                    .collect();
                 Targets::Borrowed(vs)
             }
             // See `eval_index_expr`'s identical arm for the
@@ -26494,7 +26549,22 @@ fn slice_pair_generic<S: EvalSemantics, V: DocumentValue>(
                 if out.try_reserve(ts.len()).is_err() {
                     escape!(Control::Error(cannot_reserve_cross_product(&[ts.len()])));
                 }
-                for t in ts {
+                for (at, t) in ts.iter().enumerate() {
+                    if not_a_string.get(at).copied().unwrap_or(false) {
+                        // A sequence with no element slices to one, and the bounds are ruled on as
+                        // for any other target of a mapping or scalar kind.
+                        match slice_owned_value_read_computed::<S>(
+                            &OwnedValue::array(),
+                            s,
+                            e,
+                            optional,
+                        ) {
+                            Ok(Some(v)) => out.push(v),
+                            Ok(None) => {}
+                            Err(e) => escape!(Control::Error(e)),
+                        }
+                        continue;
+                    }
                     match slice_one_generic_computed::<S, V>(t.clone(), s, e, optional) {
                         GenericResult::Owned(v) => out.push(v),
                         GenericResult::None => {}
