@@ -11172,7 +11172,7 @@ jq has no such cap and would have produced the capped input's output, so exiting
 
 `--on-error` is a succinctly extension (ADR-0018 rule 5): `continue` keeps every input running and exits 5 if any of them raised, which was the default from [#355](https://github.com/rust-works/succinctly/issues/355) until #5471, and `stop` evaluates nothing after the first failure.
 [#1855](https://github.com/rust-works/succinctly/issues/1855) had kept the sticky status as the default and [#1923](https://github.com/rust-works/succinctly/issues/1923) recorded it here as a divergence none of rule 4's conditions covered; making it opt-in removes the divergence without dropping the behaviour.
-`succinctly yq` is unaffected: real yq stops at the first error and exits 1, and so does `succinctly yq` (#2810); [#5507](https://github.com/rust-works/succinctly/issues/5507) tracks the same flag there.
+`succinctly yq` has the same flag ([#5507](https://github.com/rust-works/succinctly/issues/5507)), but its default is different: real yq stops at the first error and exits 1, and so does `succinctly yq` (#2810), so there `continue` is the opt-in and `stop` spells out the default.
 
 ### `ascii_downcase`/`ascii_upcase` inside `path()` name the outer value, not jq's inner exploded-array step — fixed by the path-mode interpreter (#5223)
 

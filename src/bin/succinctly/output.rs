@@ -198,6 +198,9 @@ pub struct ErrorSink {
     input_start: usize,
     /// Whether an error with no jq counterpart was reported (see [`Self::beyond_jq`]).
     beyond_jq: bool,
+    /// `--on-error=continue` on `succinctly yq`: an error the program raised no longer ends the
+    /// run (see [`Self::ends_run_since`], #5507).
+    continue_past_program_errors: bool,
     halt: Option<i32>,
 }
 
@@ -345,6 +348,20 @@ impl ErrorSink {
     /// end a run the way one of these does (#2810).
     pub fn program_error_count(&self) -> usize {
         self.program_errors
+    }
+
+    /// `succinctly yq --on-error=continue`: keep evaluating the documents and files after an
+    /// error the program raised, where yq (and so the default) stops at the first (#5507).
+    pub fn continue_past_program_errors(&mut self) {
+        self.continue_past_program_errors = true;
+    }
+
+    /// Whether yq's stop-at-the-first-error rule ends the run now: the program raised an error
+    /// since `before` ([`Self::program_error_count`] read earlier) and `--on-error=continue`
+    /// did not switch the rule off (#2810, #5507). The one definition the runner's stop sites
+    /// share, so the flag cannot reach some of them and miss the rest.
+    pub fn ends_run_since(&self, before: usize) -> bool {
+        !self.continue_past_program_errors && self.program_errors > before
     }
 
     /// How many uncaught errors have been reported so far. Unlike `hit()`

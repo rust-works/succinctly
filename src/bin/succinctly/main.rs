@@ -1138,13 +1138,14 @@ struct JqCommand {
     build_configuration: bool,
 }
 
-/// `succinctly jq --on-error`: how an uncaught error affects the run (#5471).
+/// `--on-error` of `succinctly jq` (#5471) and `succinctly yq` (#5507): how an uncaught error
+/// affects the run. The exit code is the subcommand's own error code (jq 5, yq 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum OnError {
-    /// Process every input; exit 5 if any of them failed.
+    /// Process every input, reporting every error; the run fails if any of them did.
     #[value(name = "continue")]
     Continue,
-    /// Evaluate no input after the first one that failed; exit 5.
+    /// Evaluate no input after the first one that failed.
     #[value(name = "stop")]
     Stop,
 }
@@ -1373,6 +1374,13 @@ pub struct YqCommand {
     /// Set exit status based on output (0 if last output != false/null)
     #[arg(short = 'e', long, overrides_with = "exit_status")]
     pub exit_status: bool,
+
+    /// What an uncaught error does to the run (succinctly extension, not a yq flag). Without it
+    /// yq's rule holds: stop at the first error the program raises, exit 1. `continue` evaluates
+    /// every document and file, reports every error and exits 1 if any failed; `stop` is the
+    /// default spelled out, and under `--inplace` it also edits no file after a failed one (#5507)
+    #[arg(long, value_name = "MODE", overrides_with = "on_error")]
+    pub on_error: Option<OnError>,
 
     // === Info ===
     /// Show version information

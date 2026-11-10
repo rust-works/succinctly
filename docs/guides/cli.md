@@ -446,6 +446,7 @@ succinctly yq '.users[]' input.yaml
 ### Exit Status
 
 - `-e, --exit-status`: Set exit status based on output (0 if last output != false/null)
+- `--on-error <continue|stop>`: What an uncaught error does to the run (succinctly extension, not a yq flag; see below)
 
 | Code | Meaning                                                              |
 |------|----------------------------------------------------------------------|
@@ -466,6 +467,26 @@ echo $?                                     # 1
 Note this differs from the `jq` subcommand, which follows jq's convention of
 exit code 5 and a `jq: error (at <file>:<line>)` diagnostic. Each subcommand
 matches its own upstream.
+
+Like yq, `succinctly yq` stops at the first error the program raises: the
+documents and files after it are never evaluated, and what the earlier ones
+printed stays. `--on-error` is a succinctly extension (yq has no such flag) that
+makes this explicit, or switches it off:
+
+| Mode                  | Behaviour                                                                |
+|-----------------------|--------------------------------------------------------------------------|
+| *(not given)*         | yq's: stop at the first error, exit 1 (`--inplace` carries on)           |
+| `--on-error=stop`     | The same, and `--inplace` too edits no file after a failed one           |
+| `--on-error=continue` | Every document and file is still evaluated, every error reported; exit 1 |
+
+```bash
+printf 'a: 1\n---\na: x\n---\na: 2\n' | succinctly yq '.a | tonumber'                      # 1, then the error
+printf 'a: 1\n---\na: x\n---\na: 2\n' | succinctly yq --on-error=continue '.a | tonumber'  # 1, the error, 2
+```
+
+The exit code is 1 in every mode (yq's is 1 for an error and for `-e`'s falsy
+result alike). `--inplace` carries on past a failed file and leaves it
+untouched unless `--on-error=stop` is given.
 
 ### Examples
 
