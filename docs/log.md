@@ -2,6 +2,21 @@
 
 Tracks updates to the knowledge wiki pages in `docs/`.
 
+## 2026-11-10 — The yq memory plan's unlanded phases are decided (issue #5865)
+
+**Sources ingested:**
+- `docs/plan/yq-memory-optimization.md` against `main` @ `f2535c855`: peak RSS of M1, M4 and a
+  whole-document write at 20 and 100 MiB on a Ryzen 9 7950X and an Apple M4 Pro, DHAT attribution of
+  the peak on the 7950X, and `succinctly jq` as the streaming control for M1
+- `src/bin/succinctly/output.rs` (`format_json_impl`), `src/bin/succinctly/yq_runner.rs` (the
+  `all_results` collection) and `src/jq/eval_generic.rs` (`CommentTree`, `NodeMeta`)
+
+**Pages updated:**
+- [plan/yq-memory-optimization.md](plan/yq-memory-optimization.md) — a "Phase decisions" section with
+  the measurements: M1 is #6813, M4 is #6814 (the printer, not `to_json`), M5 and M6 are not pursued,
+  and the presentation tree (#6815) is the largest term of a YAML-output write; archived in place
+- [plan/README.md](plan/README.md) — the plan moves from Live to Archived Plans as a Snapshot
+
 ## 2026-11-05 — The owned front doors answer `map(.field)` (issue #6122)
 
 **Sources ingested:**

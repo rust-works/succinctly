@@ -2,12 +2,118 @@
 
 This document analyzes memory usage in the `yq` command and proposes optimizations to reduce memory consumption.
 
-**Status: Partial (figures dated 2026-01).** M2 shipped as the cursor-streaming navigation path
+**Status: Archived (snapshot, decided in #5865).** M2 shipped as the cursor-streaming navigation path
 ([M2 Streaming Navigation Benchmarks](../benchmarks/yq.md#m2-streaming-navigation-benchmarks));
-M3 shipped with no measurable effect (see "M3 Results"). M1, M4, M5 and M6 are not known to have
-landed: `yq_runner.rs` still collects `all_results` before printing on the DOM route. #5865
-tracks deciding each of them. The memory
-figures and the `OwnedValue` size table predate the `Rc` container layout (#2999/#3000).
+M3 shipped with no measurable effect (see "M3 Results"). The other four phases were re-measured on
+2026-11-10 and decided in [Phase decisions](#phase-decisions-5865) below: **M1** is #6813, **M4** is
+#6814 (the printer the CLI reaches, not `to_json`), **M5 and M6 are not pursued**, and the largest term
+was in none of the phases: the presentation tree, #6815. Everything under "Problem Statement" and after
+is the January 2026 analysis, kept as the design record; its memory figures and the `OwnedValue` size
+table predate the `Rc` container layout (#2999/#3000).
+
+## Phase decisions (#5865)
+
+Re-measured on 2026-11-10 at `f2535c855` (`main`), a release build with `--features cli`, on both
+architectures: an AMD Ryzen 9 7950X (WSL2, 30 GiB) and an Apple M4 Pro (macOS 26.5.1, 24 GiB). No
+other build or benchmark was running on either (the 7950X at load average 0.6; the M4 Pro showed only
+Spotlight indexing and an idle daemon, with a load average near 3 that macOS inflates). Peak RSS does
+not depend on CPU contention, so this does not bias these figures the way it would a timing. Every
+`succinctly` run was under `memcap.py`. Inputs are `succinctly yaml generate 20mb|100mb -p <pattern>`
+files (20.0 and 100.0 MiB). Each figure is the median of three runs of the peak resident set from
+`/usr/bin/time` (`-f %M` on Linux, `-l` on macOS). Output went to `/dev/null`. The attribution is
+`valgrind --tool=dhat` on the 7950X at 20 MiB, and `t-gmax` is DHAT's moment of peak live heap.
+
+**Peak RSS, `users` pattern.** The fast-path row is the floor: the file plus the index.
+
+| `users` file, peak RSS (MiB)               | 20 MiB 7950X | 20 MiB M4 Pro | 100 MiB 7950X | 100 MiB M4 Pro |
+|--------------------------------------------|-------------:|--------------:|--------------:|---------------:|
+| `.` (cursor fast path, the floor)          |           58 |            58 |           259 |            274 |
+| `.users[] \| {3 fields}` (M1)              |          156 |           175 |           735 |            844 |
+| same, `\| length` (one number per result)  |           83 |           117 |           372 |            553 |
+| `[.users[] \| {3 fields}]` (M4)            |          148 |           163 |           660 |            737 |
+| same, `\| length`                          |          131 |           139 |           614 |            665 |
+| `.zzz = 1`, `-o json -I0` (whole document) |          265 |           309 |          1259 |           1494 |
+| `.zzz = 1`, `-o json` (indented)           |          341 |           337 |          1454 |           1722 |
+| `.zzz = 1`, `-o yaml`                      |          995 |          1008 |          4901 |           4959 |
+
+**Peak RSS, the whole-document write across the four patterns at 100 MiB.**
+
+| 100 MiB, `.zzz = 1` (peak RSS, MiB) | -I0 7950X | -I0 M4 Pro | indent 7950X | indent M4 Pro | yaml 7950X | yaml M4 Pro |
+|-------------------------------------|----------:|-----------:|-------------:|--------------:|-----------:|------------:|
+| `users`                             |      1259 |       1494 |         1454 |          1722 |       4901 |        4959 |
+| `navigation` (`.[0].zzz = 1`)       |      1343 |       1509 |         1378 |          1613 |       5713 |        5991 |
+| `comprehensive`                     |       993 |       1111 |         1160 |          1226 |       3746 |        3855 |
+| `nested`                            |       766 |       1178 |         1081 |          1335 |       2816 |        2785 |
+
+**M1 control: the same query in `jq` mode.** `succinctly jq` hands each result to the printer as the
+evaluator produces it (`evaluate_bytes_streaming`); `succinctly yq` collects them all first. Both read
+the same JSON file.
+
+| `users` as JSON, `Q = .users[] \| {name, age, city}` | 20 MiB 7950X | 20 MiB M4 Pro | 100 MiB 7950X | 100 MiB M4 Pro |
+|------------------------------------------------------|-------------:|--------------:|--------------:|---------------:|
+| `succinctly yq -o json -I0 Q`                        |          152 |           167 |           716 |            814 |
+| `succinctly jq -c Q`                                 |           31 |            27 |           118 |            114 |
+| `succinctly jq -c .` (the floor)                     |           29 |            26 |           116 |            113 |
+
+**Where the heap is at the peak.**
+
+| DHAT, 20 MiB `users`, 7950X             | live at peak (MiB) | where                                                |
+|-----------------------------------------|-------------------:|------------------------------------------------------|
+| `.zzz = 1`, `-o json -I0`               |              217.0 | 42% under `format_json_impl` and its `join`          |
+| `.zzz = 1`, `-o json`                   |              260.1 | 51% under `format_json_impl` and its `join`          |
+| `.zzz = 1`, `-o yaml`                   |              864.6 | 57.6% in two `CommentTree` bucket arrays (2 x 249.2) |
+| `.users[] \| {3 fields}`, `-o json -I0` |              126.7 | 20 MiB source, the index and every result object     |
+
+**M5 and M6 are bounded by counting, not by building them.** The 20 MiB `users` file has 145,830
+objects, 1,020,804 entries and 8 distinct keys; the DHAT run shows 1,020,796 key allocations for 4.1
+MB of key text, which is 31.1 MiB of 32-byte glibc chunks (15.6 MiB of 16-byte `libmalloc` chunks on
+the M4 Pro) plus 7.8 MiB for shrinking a 24-byte `String` to a 16-byte handle. The hash tables measure
+12.2 MiB per copy (145,829 x 88 bytes) plus 7.8 MiB of stored hashes. The same arithmetic on each
+pattern's structure counts, as a share of the 20 MiB `.zzz = 1` `-o json -I0` peak RSS above:
+
+| Phase                                                  | `users` 7950X | `users` M4 Pro | `navigation` 7950X | `comprehensive` 7950X | `nested` 7950X |
+|--------------------------------------------------------|--------------:|---------------:|-------------------:|----------------------:|---------------:|
+| M5, lazy `IndexMap` (hash table + stored hashes)       |          8.0% |           6.1% |               8.1% |                  6.7% |           8.8% |
+| M6, shared key strings (blocks + 24 to 16 byte handle) |         14.7% |           7.6% |              12.3% |                  2.9% |           5.9% |
+
+`comprehensive` and `nested` have mostly unique keys (490,891 distinct of 703,071 entries and 334,341
+of 656,962), so sharing finds little. The `users` rows agree with DHAT (20.0 MiB measured against 21.1
+modelled for M5; 38.9 MiB for M6 on both).
+
+### Decisions
+
+| Phase                   | Verdict                       | Where | Measured headroom                                                                                                                                                                 |
+|-------------------------|-------------------------------|-------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| M1, stream results      | **Implement**                 | #6813 | `yq` 716 / 814 MiB against `jq` 118 / 114 MiB on the same query at 100 MiB (7950X / M4 Pro): 6.1x / 7.1x                                                                          |
+| M2, cursor navigation   | Shipped                       | -     | -                                                                                                                                                                                 |
+| M3, exit-status clone   | Shipped                       | -     | No measurable change (see "M3 Results")                                                                                                                                           |
+| M4, streaming JSON      | **Implement**, as the printer | #6814 | `to_json` already writes into one buffer; `format_json_impl` (`output.rs`) still does not: 42-51% of the live heap at a whole-document write, about 11% for a result-shaped print |
+| M5, lazy `IndexMap`     | **Not pursued**               | -     | At most 6-9% of peak RSS (table above); touches the `Deref` contract of `ObjectMapOf`                                                                                             |
+| M6, key interning       | **Not pursued**               | -     | At most 15% (7950X) / 8% (M4 Pro) of peak RSS on record-shaped input, 3-6% on unique-key shapes; changes the key type of every object                                             |
+| (new) presentation tree | **Implement**                 | #6815 | 58% of the live heap at a YAML-output write; that write is 3.7-3.9x the JSON-output write                                                                                         |
+
+- **M1** is the largest term that a query-shaped workload hits and the only one with an existing
+  implementation in the same binary (`jq` mode). Streaming needs the evaluator to hand results out one
+  at a time, not only the runner: `evaluate_yaml_cursor` returns a `Vec` before `all_results` is
+  filled. #6813 sets out the `---` look-ahead and the error-ordering rules a change has to keep.
+- **M4** as the plan wrote it (`to_json`'s `Vec<String>` and `join`) no longer exists:
+  `OwnedValue::write_json_at_depth` appends into one `String`. The same shape is alive in
+  `output.rs`, which the CLI reaches for a computed result, and that is #6814.
+- **M5** would save at most 6-9% of the peak on the shapes measured, and it would change what
+  `ObjectMapOf` derefs to: 135 `as_object()` call sites, 885 `OwnedValue::Object` arms, the `Rc`
+  pointer used as node identity (`ptr_eq`, #2889) and the shadow list of a repeated key. A map that
+  builds its index on the first lookup needs interior mutability behind a type that is `Rc`-shared,
+  for a few percent.
+- **M6** is shape-dependent (15% on repeated-key records, 3% on `comprehensive`) and changes the key
+  type that `IndexMap<String, V>` exposes at every one of those sites. #3000 is the warning about
+  trading allocations for RSS: shrinking one type while its twin kept its width cost +25..+41% RSS
+  with 15% less live heap. Revisit only if a measurement taken after #6813 and #6815 shows keys as
+  the leading remaining term.
+- **The presentation tree (#6815)** was not in the plan. A `CommentTree` is about 224 bytes a node
+  (DHAT: a 7-field record's bucket array is 1,792 bytes, 256 per bucket against 64 for the same
+  record's `OwnedValue`), comment-free nodes included, and `reconcile_presentation` builds a second
+  one beside the pristine tree. That is why `-o yaml` writes cost 27-60 MiB of RSS per MiB of input,
+  and why the M1-M6 figures above (all `-o json`) understate the YAML cost.
 
 ## Problem Statement
 
@@ -711,14 +817,14 @@ struct InternedString {
 
 ## Implementation Priority
 
-| Phase | Impact    | Complexity  | Priority                     | Status      |
-|-------|-----------|-------------|------------------------------|-------------|
-| M3    | Low       | Low         | **P1** (quick win)           | ✅ Done     |
-| M4    | Medium    | Low-Medium  | **P1** (quick win)           | Pending     |
-| M1    | High      | Medium      | **P2** (major improvement)   | Pending     |
-| M2    | Very High | High        | **P3** (requires design work)| ✅ Done     |
-| M5    | Medium    | Medium      | **P4** (nice to have)        | Pending     |
-| M6    | Medium    | Medium-High | **P4** (nice to have)        | Pending     |
+| Phase | Impact    | Complexity  | Priority                      | Status              |
+|-------|-----------|-------------|-------------------------------|---------------------|
+| M3    | Low       | Low         | **P1** (quick win)            | ✅ Done              |
+| M4    | Medium    | Low-Medium  | **P1** (quick win)            | #6814 (the printer) |
+| M1    | High      | Medium      | **P2** (major improvement)    | #6813               |
+| M2    | Very High | High        | **P3** (requires design work) | ✅ Done              |
+| M5    | Medium    | Medium      | **P4** (nice to have)         | Not pursued (#5865) |
+| M6    | Medium    | Medium-High | **P4** (nice to have)         | Not pursued (#5865) |
 
 ### M3 Results
 
@@ -774,6 +880,7 @@ The goal is to bring standard path closer to fast path performance.
 
 | Date       | Change                                                            |
 |------------|-------------------------------------------------------------------|
+| 2026-11-10 | **M1, M4, M5, M6 decided (#5865)**: re-measured on both architectures; M1 and M4 filed (#6813, #6814), M5 and M6 not pursued, #6815 added; archived in place |
 | 2026-01-24 | **M3 completed**: Eliminated exit status cloning (no perf impact) |
 | 2026-01-24 | Added detailed M2 implementation plan with 5 sub-phases           |
 | 2026-01-24 | Initial analysis and optimization plan                            |
