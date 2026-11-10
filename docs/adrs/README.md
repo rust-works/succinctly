@@ -54,6 +54,7 @@ by Michael Nygard.
 | [ADR-0025](adr-0025.md) | ✅ Accepted | 2026-09-26 | Guard Recursion by the Native Stack It Spends (#3262)         |
 | [ADR-0026](adr-0026.md) | ✅ Accepted | 2026-10-25 | Carry jq's Path Register, Not Infer It (#5223)                |
 | [ADR-0027](adr-0027.md) | ✅ Accepted | 2026-10-28 | Keep a Repeated Key's Earlier Entries Beside the Map (#1344)  |
+| [ADR-0028](adr-0028.md) | 🟡 Proposed | 2026-11-10 | Carry Null and Bool Spellings in OwnedValue (#2802)           |
 
 The inventory is maintained by the [`update-adr-inventory`](../../.claude/skills/update-adr-inventory/SKILL.md)
 skill, which scans `adr-*.md` for the title and status and derives the date from git history.
