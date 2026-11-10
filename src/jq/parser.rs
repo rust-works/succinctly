@@ -1767,7 +1767,9 @@ fn yq_var_stage_once(stages: Vec<Expr>) -> Expr {
         return Expr::pipe(stages);
     }
     let mut flat = Vec::with_capacity(stages.len());
-    stages.iter().for_each(|stage| splice(stage, &mut flat));
+    for stage in &stages {
+        splice(stage, &mut flat);
+    }
     // A prefix that answers one node per input leaves one node for the variable either way, so it
     // is left alone, with the bound node's position and its path context as they were.
     let Some(at) = (1..flat.len())
@@ -1807,10 +1809,10 @@ fn yq_map_union_body_over_the_list(call: Expr, var_stage_once: bool) -> Expr {
     let Expr::Builtin(Builtin::Map(body)) = &call else {
         return call;
     };
-    if !has_flat_union(body)
-        && !has_flat_empty_object(body)
-        && !(var_stage_once && has_flat_var_stage(body))
-    {
+    let owned_by_the_list = has_flat_union(body)
+        || has_flat_empty_object(body)
+        || (var_stage_once && has_flat_var_stage(body));
+    if !owned_by_the_list {
         return call;
     }
     // Whether the node has members to walk: a sequence or a mapping with entries. A scalar, `null`,
