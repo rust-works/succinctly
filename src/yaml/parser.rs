@@ -8982,6 +8982,14 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                         offset: self.pos,
                     });
                 }
+                // A comment line at or left of the parent's indent ends a block scalar that has no content
+                // yet, as go-yaml reads it (#6843): the scalar is empty and the lines after the comment
+                // are the document's, so a deeper one is refused as stray (`a: |` / `#x` / `  y`). Only
+                // the document's root node reads past it (`--- |` / `#x` / `  y` is `"y\n"`).
+                Some(b'#') if indent <= base_indent && self.type_stack.len() > 1 => {
+                    self.pos = saved_pos;
+                    return Ok(None);
+                }
                 Some(b'#') if indent <= base_indent => {
                     // Comment line at or below the parent's indent - skip to end. A `#` line indented deeper
                     // is the first content line (#5073) and falls to the arm below: it sets the indent, so a
