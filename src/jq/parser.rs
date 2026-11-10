@@ -5408,17 +5408,18 @@ impl<'a> Parser<'a> {
         called
     }
 
-    /// Parse yq's `explode(.)` (#5483): every alias in the document becomes a copy of its
-    /// anchor's node, the anchors go, and a `<<` merge is expanded.
+    /// Parse yq's `explode(f)` (#5483): every alias in the nodes `f` selects, and in their
+    /// descendants, becomes a copy of its anchor's node, the anchors there go, and a `<<` merge is
+    /// expanded.
     ///
-    /// A write that clears every anchor already does exactly that: the aliases that named a
-    /// cleared anchor are written out as the nodes they stood for (`enforce_anchor_soundness`),
-    /// and a write materializes merges. So this is `(.. | select(kind != "alias")) anchor = ""`.
-    /// The alias nodes are skipped because they carry no anchor of their own.
+    /// A write that clears the anchor *and* the alias mark of those nodes already does exactly that:
+    /// the aliases that named a cleared anchor are written out as the nodes they stood for
+    /// (`enforce_anchor_soundness`), an alias node that is cleared itself prints as its value, and a
+    /// write materializes merges. So this is `(f | ..) anchor = ""`, with `..` alone for `.`.
     ///
-    /// Only the argument `.` is supported. yq's `explode(.a)` leaves the aliases outside `.a` as
-    /// they are, and a copy made inside `.a` of a node anchored outside it is the part that has no
-    /// route here yet; a wrong answer would be worse than this refusal.
+    /// Where it differs from yq, all of it in the YAML text and none in the data: an alias outside
+    /// `f` that named an anchor `f` cleared is written as its value (yq writes a `*name` it cannot
+    /// read back), and a write expands every merge in the document, not only those under `f`.
     fn parse_explode_expr(&mut self) -> Result<Expr, ParseError> {
         let start_pos = self.pos;
         self.consume_keyword("explode");
@@ -5434,21 +5435,38 @@ impl<'a> Parser<'a> {
             return self.wrong_arity_or_expect(start_pos, ')', vec![target]);
         }
         self.next();
+        // `(f | ..) anchor = ""`: the write that clears the anchor and the alias mark of every node
+        // under the ones `f` selects.
+        let template = parse_with_mode_and_extensions("(..) anchor = \"\"", ParserMode::Yq, true)?;
+        let Expr::MetaAssign {
+            target: template_target,
+            slot,
+            value,
+            is_update,
+        } = template
+        else {
+            unreachable!("the explode template is a metadata write");
+        };
+        let Expr::Paren(recurse) = *template_target else {
+            unreachable!("the explode template's target is parenthesised");
+        };
+        // `explode(.)` and `explode(..)` select the whole document: `..` alone is the same nodes
+        // without a second walk under each one.
         let mut inner = &target;
         while let Expr::Paren(expr) = inner {
             inner = expr;
         }
-        if !matches!(inner, Expr::Identity) {
-            return Err(ParseError::new(
-                "explode(f) is only supported as explode(.)",
-                start_pos,
-            ));
-        }
-        parse_with_mode_and_extensions(
-            "(.. | select(kind != \"alias\")) anchor = \"\"",
-            ParserMode::Yq,
-            true,
-        )
+        let selected = if matches!(inner, Expr::Identity) || *inner == *recurse {
+            *recurse
+        } else {
+            Expr::pipe(vec![target, *recurse])
+        };
+        Ok(Expr::MetaAssign {
+            target: Box::new(Expr::Paren(Box::new(selected))),
+            slot,
+            value,
+            is_update,
+        })
     }
 
     /// Parse yq's `with(path; update)` (#4206): `path` is the nodes to work on and `update` runs

@@ -308,10 +308,14 @@ succinctly yq '.description | style' file.yaml
 
 # Expand every alias into a copy of its anchor's node, drop the anchors, expand `<<` merges
 succinctly yq 'explode(.)' file.yaml
+
+# The same for the nodes a path selects, and their descendants; the rest of the document keeps its aliases
+succinctly yq 'explode(.spec.template)' file.yaml
 ```
 
-`explode(.)` is the only form of yq's `explode(f)` supported (#5483): a path other than `.` is a
-parse error, and `.a | explode(.)` is refused (a metadata write behind a navigation).
+`explode(f)` takes any path (#5483). `.a | explode(.)` is refused (a metadata write behind a
+navigation), and an alias outside `f` that named an anchor `f` cleared is written as its value, not as
+a `*name` with no anchor, which yq writes and cannot read back.
 
 ### Multi-Document Support
 
