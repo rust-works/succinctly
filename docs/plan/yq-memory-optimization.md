@@ -77,8 +77,10 @@ pattern's structure counts, as a share of the 20 MiB `.zzz = 1` `-o json -I0` pe
 | M6, shared key strings (blocks + 24 to 16 byte handle) |         14.7% |           7.6% |              12.3% |                  2.9% |           5.9% |
 
 `comprehensive` and `nested` have mostly unique keys (490,891 distinct of 703,071 entries and 334,341
-of 656,962), so sharing finds little. The `users` rows agree with DHAT (20.0 MiB measured against 21.1
-modelled for M5; 38.9 MiB for M6 on both).
+of 656,962), so sharing finds little. The percentages use a structure model that rounds each table to
+a malloc chunk. On `users` it agrees with the counts above: 21.1 MiB modelled for M5 against 20.0 MiB
+counted (12.2 MiB of tables measured by DHAT plus 7.8 MiB of stored hashes), and 38.9 MiB for M6 by
+both.
 
 ### Decisions
 
@@ -90,7 +92,7 @@ modelled for M5; 38.9 MiB for M6 on both).
 | M4, streaming JSON      | **Implement**, as the printer | #6814 | `to_json` already writes into one buffer; `format_json_impl` (`output.rs`) still does not: 42-51% of the live heap at a whole-document write, about 11% for a result-shaped print |
 | M5, lazy `IndexMap`     | **Not pursued**               | -     | At most 6-9% of peak RSS (table above); touches the `Deref` contract of `ObjectMapOf`                                                                                             |
 | M6, key interning       | **Not pursued**               | -     | At most 15% (7950X) / 8% (M4 Pro) of peak RSS on record-shaped input, 3-6% on unique-key shapes; changes the key type of every object                                             |
-| (new) presentation tree | **Implement**                 | #6815 | 58% of the live heap at a YAML-output write; that write is 3.7-3.9x the JSON-output write                                                                                         |
+| (new) presentation tree | **Implement**                 | #6815 | 58% of the live heap at a YAML-output write; that write is 3.3-3.9x the JSON-output write (3.7-3.9x on the 7950X, 3.3x on the M4 Pro)                                             |
 
 - **M1** is the largest term that a query-shaped workload hits and the only one with an existing
   implementation in the same binary (`jq` mode). Streaming needs the evaluator to hand results out one
