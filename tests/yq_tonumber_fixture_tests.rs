@@ -91,6 +91,11 @@ fn parse_fixture() -> Vec<Row> {
 /// probe string as a Rust-escaped double-quoted filter literal (never
 /// through a shell), and returns `(stdout, exit_code)`.
 fn run_tonumber(input: &str) -> Result<(String, i32)> {
+    run_tonumber_as(input, "-o=json")
+}
+
+/// [`run_tonumber`] with the output format named, for the rows JSON cannot show.
+fn run_tonumber_as(input: &str, output_format: &str) -> Result<(String, i32)> {
     let filter = format!("{input:?} | tonumber");
     let (output, exit_code) = spawn_with_signal_retry(
         || {
@@ -98,7 +103,7 @@ fn run_tonumber(input: &str) -> Result<(String, i32)> {
             command
                 .arg("yq")
                 .arg("-n")
-                .arg("-o=json")
+                .arg(output_format)
                 .arg("-I=0")
                 .arg(&filter);
             command
@@ -114,7 +119,13 @@ fn yq_tonumber_matches_pinned_yq_grammar_2960() -> Result<()> {
     let rows = parse_fixture();
     let mut failures = Vec::new();
     for row in &rows {
-        let (stdout, exit_code) = run_tonumber(&row.input)?;
+        let (stdout, exit_code) = if row.accept && row.json_value.is_empty() {
+            // The oracle's own JSON marshal fails on these (`+Inf`/`NaN`), and so does
+            // succinctly's since #6867, so accepting is read off the YAML output instead.
+            run_tonumber_as(&row.input, "-o=yaml")?
+        } else {
+            run_tonumber(&row.input)?
+        };
         if row.accept {
             if exit_code != 0 {
                 failures.push(format!(
@@ -126,9 +137,8 @@ fn yq_tonumber_matches_pinned_yq_grammar_2960() -> Result<()> {
             // An empty fixture value means the oracle's own JSON marshal
             // failed on a genuinely-accepted non-finite value (`inf`/`nan`)
             // -- Go's `encoding/json` cannot represent `+Inf`/`NaN` at all,
-            // unrelated to `tonumber`'s grammar, and the same limitation
-            // succinctly's own JSON output has today (#1071/#2579, tracked
-            // separately). Only accept/reject is asserted for these rows.
+            // unrelated to `tonumber`'s grammar, and succinctly's own JSON output
+            // refuses them too (#6867). Only accept/reject is asserted for these rows.
             if row.json_value.is_empty() {
                 continue;
             }
