@@ -13525,12 +13525,20 @@ fn test_yaml_special_floats_passthrough() -> Result<()> {
 }
 
 #[test]
-fn test_yaml_special_floats_to_json_are_null() -> Result<()> {
-    // JSON has no NaN/Infinity literals, so non-finite floats serialize as null.
+fn test_yaml_special_floats_to_json_fail_like_yq_6867() -> Result<()> {
+    // JSON has no NaN/Infinity literals, and yq's encoder fails on one (it parses the scalar's own
+    // text) where this used to print `null` (#6867); `tests/yq_cli/i6867.rs` has the full matrix.
     let input = "x: .nan\ny: .inf\nz: -.inf\n";
-    let (output, exit_code) = run_yq_stdin(".", input, &["-o", "json", "-I", "0"])?;
-    assert_eq!(exit_code, 0);
-    assert_eq!(output, "{\"x\":null,\"y\":null,\"z\":null}\n");
+    let (output, err, exit_code) =
+        run_yq_stdin_with_stderr(".", input, &["-o", "json", "-I", "0"])?;
+    assert_eq!(exit_code, 1, "{err}");
+    assert!(!output.contains("null"), "{output:?}");
+    assert_eq!(
+        err.lines().next().unwrap_or(""),
+        "Error: json: error calling MarshalJSON for type *yqlib.CandidateNode: json: error \
+         calling MarshalJSON for type *yqlib.CandidateNode: strconv.ParseFloat: parsing \
+         \".nan\": invalid syntax"
+    );
     Ok(())
 }
 
@@ -13595,12 +13603,16 @@ fn test_yq_at_csv_special_floats_use_yaml_spelling_1060() -> Result<()> {
 
 /// #1060 scope note: `@json`/`-o json` output is untouched by this fix (a
 /// separate code path, `to_json`/`to_json_yq`, already RFC-8259-correct) --
-/// pinning that this stays `null` after the `numeric_display_string` change.
+/// pinning that it never leaks the YAML spelling into JSON. It printed `null`
+/// until #6867, when it started to fail as yq's encoder does.
 #[test]
-fn test_yq_json_output_special_floats_still_null_after_1060() -> Result<()> {
+fn test_yq_json_output_special_floats_never_leak_the_yaml_spelling_after_1060() -> Result<()> {
     let (stdout, code) = run_yq_stdin(".", "x: .nan\ny: .inf\nz: -.inf\n", &["-o", "json", "-I0"])?;
-    assert_eq!(code, 0);
-    assert_eq!(stdout.trim_end(), r#"{"x":null,"y":null,"z":null}"#);
+    assert_eq!(code, 1);
+    assert!(
+        !stdout.contains(".nan") && !stdout.contains(".inf"),
+        "{stdout:?}"
+    );
     Ok(())
 }
 
@@ -33437,7 +33449,8 @@ fn test_1198_mixed_int_float_subtraction_unaffected() -> Result<()> {
 // real oracle too, but for an unrelated reason -- real yq's JSON output
 // layer refuses to serialize the resulting `+Inf` at all ("json:
 // unsupported value: +Inf"), a pre-existing output-formatting gap, not an
-// arithmetic-evaluation one, and out of scope for both #1199 and #1231.
+// arithmetic-evaluation one, and out of scope for both #1199 and #1231
+// (closed by #6867: `-o=json` of a non-finite float fails the same way here).
 
 #[test]
 fn test_1199_binary_op_error_preserves_number_literal_spelling_yq_mode() -> Result<()> {
@@ -33453,13 +33466,15 @@ fn test_1231_yq_integer_modulo_by_zero_errors_but_division_does_not() -> Result<
     assert_eq!(code, 1, "{err}");
     assert!(err.contains("cannot modulo by 0"), "{err}");
 
-    // Division by zero is unaffected -- still succeeds (as Infinity, which
-    // `-o=json` serializes as `null`, JSON having no numeric representation
-    // for it -- a pre-existing, unrelated serialization choice, not part of
-    // #1231's own scope).
-    let (out, code) = run_yq_stdin("10 / 0", "null", &["-o=json", "-I=0"])?;
+    // Division by zero is unaffected -- still evaluates (to Infinity, which `-o=yaml` prints as
+    // `+Inf`); `-o=json` fails as yq's encoder does, JSON having no numeric representation for it
+    // (#6867; it printed `null` before).
+    let (out, code) = run_yq_stdin("10 / 0", "null", &["-o=yaml"])?;
     assert_eq!(code, 0, "out: {out:?}");
-    assert_eq!(out.trim(), "null");
+    assert_eq!(out.trim(), "+Inf");
+    let (out, err, code) = run_yq_stdin_with_stderr("10 / 0", "null", &["-o=json", "-I=0"])?;
+    assert_eq!((out.as_str(), code), ("", 1), "{err}");
+    assert!(err.contains("json: unsupported value: +Inf"), "{err}");
     Ok(())
 }
 
@@ -42943,15 +42958,15 @@ fn test_gmtime_localtime_seconds_slot_is_yq_float_shaped_3071() -> Result<()> {
         "- 1970\n- 0\n- 1\n- 0\n- 0\n- !!float 0\n- 4\n- 0"
     );
 
-    // A NaN input still serializes its seconds slot as `null`/`~`, same as
-    // every other NaN this evaluator computes.
-    let (out, code) = run_yq_stdin(
+    // A NaN input keeps NaN in its seconds slot, which `-o=json` refuses as it does every other
+    // NaN this evaluator computes (#6867; it printed `null` before).
+    let (out, err, code) = run_yq_stdin_with_stderr(
         "nan | gmtime",
         "null\n",
         &["--jq-extensions", "-o=json", "-I=0"],
     )?;
-    assert_eq!(code, 0);
-    assert_eq!(out.trim(), "[1970,0,1,0,0,null,4,0]");
+    assert_eq!((out.as_str(), code), ("", 1), "{err}");
+    assert!(err.contains("json: unsupported value: NaN"), "{err}");
 
     Ok(())
 }

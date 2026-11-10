@@ -7455,3 +7455,28 @@ yq's head comment is the text above the node with its blank lines kept.
 `# c` / blank / `a: 1` is `c` followed by a line feed, a blank line inside the block stays, and a first document's comment above a leading `---` is one text with the comment under it (`# c` / `---` / `# d` is `c` and `d` on two lines).
 `succinctly yq` answers the same, and the first key the comment under the marker was indexed on has none of its own (`.a | key | head_comment` is empty there, as in yq).
 Still different: a comment line indented under the first one (`# c` / `  # d`) is `c` and `d` here, where yq keeps the indentation and the `#` (`c` and `  # d`).
+
+## `-o=json` of a non-finite float fails as yq's encoder does; a streamed result keeps its prefix ([#6867](https://github.com/rust-works/succinctly/issues/6867))
+
+yq's JSON encoder refuses a float that is `+Inf`, `-Inf` or `NaN`, and `succinctly yq -o=json` fails the same way instead of printing `null`.
+Two failures exist, and the message tells them apart (yq v4.53.3):
+
+```console
+$ yq -n -o=json '1 / 0'
+Error: json: error calling MarshalJSON for type *yqlib.CandidateNode: json: unsupported value: +Inf
+$ printf 'a: .inf\n' | yq -o=json '.'
+Error: json: error calling MarshalJSON for type *yqlib.CandidateNode: json: error calling MarshalJSON for type *yqlib.CandidateNode: strconv.ParseFloat: parsing ".inf": invalid syntax
+```
+
+A computed number fails in `encoding/json` (`+Inf`, `-Inf`, `NaN`).
+A document `.inf`/`.nan` scalar, in any of its twelve spellings or under `!!float`, fails earlier, parsing its own text.
+yq wraps the failure once per node from the number up to the root, the number's own node included, and `succinctly yq` repeats the wrap the same number of times (`1 / 0` once, `[1 / 0]` twice, `{"a": [0 / 0]}` three times; a sequence the program builds counts as a node).
+`-r` on a bare scalar skips the encoder in both and prints the number's own text (`+Inf`, `NaN`, or the document's `.inf`).
+A quoted `".inf"`, an unknown spelling such as `.infx` and every non-JSON output format are unchanged.
+
+The difference that remains is on the streamed route, where `-o=json` copies a document's scalars straight from the source (#808): the part of the failing result before the number has been written when the failure comes, where yq writes none of it.
+`printf 'a: [1, .NaN]\n' | succinctly yq -o=json '.'` leaves `{`, `"a": [` and `1,` on stdout and then fails; yq prints nothing.
+The results before the failing one are whole in both, and the run stops there, as it does for any other decode failure on a streamed route (#1615).
+The route that evaluates a result first (a computed number, `-P`) writes nothing of it, as yq does.
+Buffering each streamed result to match would give up the constant-memory write that route exists for, the same trade as the decode failures above.
+The exit code and the error line are identical either way, so a caller that checks the status sees the failure, and it is pinned by `tests/yq_cli/i6867.rs`.

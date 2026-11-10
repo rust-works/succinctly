@@ -2392,7 +2392,23 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// A guard here would make `yq . deep.yaml` fail where yq succeeds, for no
     /// safety gain; `test_m2_streaming_lazyseq_streams_past_materialization_ceiling_2187`
     /// pins the behaviour.
+    #[inline(always)]
     fn stream_json_value<Out: core::fmt::Write>(
+        &self,
+        out: &mut Out,
+        current_indent: usize,
+        indent_spaces: usize,
+        unit: char,
+        sort_keys: bool,
+    ) -> StreamResult {
+        // #6867: every level a non-finite scalar's failure passes through adds yq's own wrap, so
+        // the message carries one per node from the scalar up to the written root. Nothing runs
+        // on the success path.
+        self.stream_json_node(out, current_indent, indent_spaces, unit, sort_keys)
+            .map_err(wrap_non_finite_marshal_failure)
+    }
+
+    fn stream_json_node<Out: core::fmt::Write>(
         &self,
         out: &mut Out,
         current_indent: usize,
@@ -2415,6 +2431,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 if let Some(explicit) = self.explicit_tag_at(None) {
                     if let Ok(str_val) = s.as_str() {
                         if let Some(resolved) = resolve_tagged(&str_val, explicit) {
+                            reject_non_finite_json_scalar(resolved, &str_val)?;
                             return Ok(stream_resolved_scalar_as_json(
                                 out,
                                 resolved,
@@ -2443,10 +2460,14 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         Ok(str_val) => {
                             if s.is_unquoted() {
                                 // Plain scalar - resolve per the core schema
-                                Ok(stream_yaml_scalar_as_json(
+                                let canonicalize = self.index.canonicalize_numbers();
+                                let resolved = resolve_plain_sourced(&str_val, canonicalize);
+                                reject_non_finite_json_scalar(resolved, &str_val)?;
+                                Ok(stream_resolved_scalar_as_json(
                                     out,
+                                    resolved,
                                     &str_val,
-                                    self.index.canonicalize_numbers(),
+                                    canonicalize,
                                 )?)
                             } else {
                                 // Block scalars are always strings
@@ -4788,6 +4809,52 @@ fn stream_yaml_string_to_json<Out: core::fmt::Write>(
             Ok(true)
         }
         YamlString::Unquoted { .. } => Ok(false),
+    }
+}
+
+/// yq's own wrap around a failing node's JSON encoding, one per level (#6867).
+const MARSHAL_FAILURE_WRAP: &str =
+    "json: error calling MarshalJSON for type *yqlib.CandidateNode: ";
+
+/// The start of the failure itself, before the scalar's text.
+const PARSE_FLOAT_FAILURE: &str = "strconv.ParseFloat: parsing ";
+
+/// The failure real yq raises for a document `.inf`/`.nan` scalar written as JSON (#6867): its
+/// encoder parses the scalar's own text as a float and fails (`strconv.ParseFloat: parsing
+/// ".inf": invalid syntax`, v4.53.3). The streaming writers used to print `null`, which hid it.
+///
+/// Checked on the `Float` arm only, so a scalar of any other kind pays nothing.
+#[inline]
+fn reject_non_finite_json_scalar(
+    resolved: ResolvedScalar,
+    str_val: &str,
+) -> Result<(), StreamFailure> {
+    match resolved {
+        ResolvedScalar::Float(f) if !f.is_finite() => {
+            Err(StreamFailure::Decode(EvalError::decode_failure(format!(
+                "{PARSE_FLOAT_FAILURE}\"{str_val}\": invalid syntax"
+            ))))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Adds one level of yq's marshal-failure wrap to a [`reject_non_finite_json_scalar`] failure as
+/// it passes up through a node, the scalar's own included (#6867); any other failure passes
+/// unchanged.
+#[cold]
+fn wrap_non_finite_marshal_failure(failure: StreamFailure) -> StreamFailure {
+    match failure {
+        StreamFailure::Decode(e)
+            if e.message.starts_with(MARSHAL_FAILURE_WRAP)
+                || e.message.starts_with(PARSE_FLOAT_FAILURE) =>
+        {
+            StreamFailure::Decode(EvalError::decode_failure(format!(
+                "{MARSHAL_FAILURE_WRAP}{}",
+                e.message
+            )))
+        }
+        other => other,
     }
 }
 
@@ -11064,7 +11131,10 @@ where
             out.write_char('\n')?;
             write_yaml_indent(out, next_indent, unit)?;
         }
-        cursor.stream_json_value(out, next_indent, indent_spaces, unit, sort_keys)?;
+        // The sequence is a node of its own in yq's encoder, one more level of wrap (#6867).
+        cursor
+            .stream_json_value(out, next_indent, indent_spaces, unit, sort_keys)
+            .map_err(wrap_non_finite_marshal_failure)?;
     }
     if indent_spaces > 0 {
         out.write_char('\n')?;
