@@ -5955,8 +5955,12 @@ position and then by length, as `sort_by(.a, .b)` is in yq. jq mode is untouched
   top. The items stream from their own cursors and the result has no node to read that block
   from, so the runner prints the document's head (the verbatim header of the first document and
   the comments above the sequence) before the items when the query *is* one of these builtins
-  over a document whose root is a sequence. Not covered: a sequence reached through a path
-  (`.a | sort`, which yq also keeps in flow style), the comment block above a later document,
+  over a document whose root is a sequence.
+  A flow-style sequence, at the root or behind a static path (`.a | sort`), is answered through the write form `(.a |= sort) | .a` instead.
+  It keeps its flow style, line comment, quoting and anchor, as yq does (#6877).
+  A document of the input holding such a sequence sends the whole input to the DOM route, as a sort of a mapping does (#4386).
+  `-i` and a prefix that is not a static path (`select(...) | .l | sort`) keep the streamers' block style.
+  Not covered: a block-style sequence reached through a path (its items stream without the node's own comments), a reorder that is only part of the read (`[.a | sort]`, `.a | sort, .b | sort`), the comment block above a later document,
   which yq attaches to the item that ends up first, the foot comment below the sequence,
   which yq moves with its last item, and a sequence whose items include an alias (reordered as
   owned values, so it keeps neither the head nor the `&anchor`/`*alias` marks).
