@@ -164,3 +164,17 @@ fn the_documented_merge_recipe_merges_every_file_2427() -> Result<()> {
     assert!(stdout.contains("a: 9"), "{stdout}");
     Ok(())
 }
+
+/// A destructuring loop pattern is succinctly's own (`--jq-extensions`; yq has none), and folds
+/// the same document list: two documents give two seeds, each folding both.
+#[test]
+fn a_destructuring_pattern_folds_the_document_list_2427() -> Result<()> {
+    let (stdout, stderr, code) = crate::run_yq_stdin_with_stderr(
+        ". as [$a] ireduce (0; . + $a)",
+        "[1, 2]\n---\n[3]\n",
+        &["--eval-all", "--jq-extensions", "-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, "4\n4\n");
+    Ok(())
+}

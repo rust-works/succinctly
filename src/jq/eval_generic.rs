@@ -22317,6 +22317,7 @@ fn fold_together<S: EvalSemantics, V: DocumentValue>(
     else {
         // `yq_list_stage` matched this exact pattern to pick `at`.
         unreachable!("the stage yq_list_stage selected as a fold is an Expr::Reduce")
+        // patchcov: coverage tolerate-line reason="unreachable: yq_list_stage matched this exact pattern to pick the stage (#2427)"
     };
     let over_context = |operand: &Expr| {
         // yq builds its one `{}` even from an empty context (`select(false) | . as $i
@@ -22409,7 +22410,7 @@ fn fold_together<S: EvalSemantics, V: DocumentValue>(
     match flow {
         Flow::Exhausted | Flow::Stopped { pending: None } => Ok(produced),
         Flow::Stopped {
-            pending: Some(control),
+            pending: Some(control), // patchcov: coverage tolerate-line reason="defensive: the sink above never stops, so a stop with a pending control cannot come back (#2427)"
         }
         | Flow::Escaped(control) => Err(Flow::Escaped(control)),
     }
@@ -22436,9 +22437,9 @@ fn ireduce_node_read_tuple<'a>(
     match input {
         Expr::Pipe(stages) => match stages.as_slice() {
             [Expr::Paren(source), tuple @ Expr::Array(_)] => Some((&**source, tuple)),
-            _ => None,
+            _ => None, // patchcov: coverage tolerate-line reason="unreachable: the parser's rewrite (bind_ireduce_node_reads) is the only source of a read variable and always builds this shape (#6088)"
         },
-        _ => None,
+        _ => None, // patchcov: coverage tolerate-line reason="unreachable: as the arm above, the rewrite's source is always a pipe (#6088)"
     }
 }
 
