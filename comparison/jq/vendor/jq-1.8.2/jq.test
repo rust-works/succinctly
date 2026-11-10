@@ -698,6 +698,10 @@ null
 4
 15
 
+"123\u0000456" | try tonumber catch .
+null
+"string (\"123\\u0000456\") cannot be parsed as a number"
+
 map(toboolean)
 ["false","true",false,true]
 [false,true,false,true]
@@ -712,6 +716,11 @@ map(toboolean)
 "string (\"falsee\") cannot be parsed as a boolean"
 "array ([]) cannot be parsed as a boolean"
 "object ({}) cannot be parsed as a boolean"
+
+"true\u0000x", "false\u0000" | try toboolean catch .
+null
+"string (\"true\\u0000x\") cannot be parsed as a boolean"
+"string (\"false\\u0000\") cannot be parsed as a boolean"
 
 [{"a":42},.object,10,.num,false,true,null,"b",[1,4]] | .[] as $x | [$x == .[]]
 {"object": {"a":42}, "num":10.0}
@@ -935,19 +944,19 @@ null
 # Destructuring DUP/POP issues
 .[] | . as {a:$a} ?// {a:$a} ?// {a:$a} | $a
 [[3],[4],[5],6]
-# Runtime error: "jq: Cannot index array with string \"c\""
+# Runtime error: "jq: Cannot index array with string (\"c\")"
 
 .[] as {a:$a} ?// {a:$a} ?// {a:$a} | $a
 [[3],[4],[5],6]
-# Runtime error: "jq: Cannot index array with string \"c\""
+# Runtime error: "jq: Cannot index array with string (\"c\")"
 
 [[3],[4],[5],6][] | . as {a:$a} ?// {a:$a} ?// {a:$a} | $a
 null
-# Runtime error: "jq: Cannot index array with string \"c\""
+# Runtime error: "jq: Cannot index array with string (\"c\")"
 
 [[3],[4],[5],6] | .[] as {a:$a} ?// {a:$a} ?// {a:$a} | $a
 null
-# Runtime error: "jq: Cannot index array with string \"c\""
+# Runtime error: "jq: Cannot index array with string (\"c\")"
 
 .[] | . as {a:$a} ?// {a:$a} ?// $a | $a
 [[3],[4],[5],6]
@@ -1176,6 +1185,14 @@ del(.[1], .[-6], .[2], .[-3:9])
 [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 [0, 3, 5, 6, 9]
 
+del(.[nan])
+[1,2,3]
+[1,2,3]
+
+del(.[nan,nan])
+[1,2,3]
+[1,2,3]
+
 # negative index
 setpath([-1]; 1)
 [0]
@@ -1242,10 +1259,10 @@ def inc(x): x |= .+1; inc(.[].a)
 [null,{"b":0},{"a":0},{"a":null},{"a":[0,1]},{"a":{"b":1}},{"a":[{}]},{"a":[{"c":3}]}]
 {"a":[{"b":5}]}
 {"b":0,"a":[{"b":5}]}
-"Cannot index number with number"
+"Cannot index number with number (0)"
 {"a":[{"b":5}]}
-"Cannot index number with string \"b\""
-"Cannot index object with number"
+"Cannot index number with string (\"b\")"
+"Cannot index object with number (0)"
 {"a":[{"b":5}]}
 {"a":[{"c":3,"b":5}]}
 
@@ -1430,7 +1447,7 @@ null
 # Try/catch and general `?` operator
 [.[]|try if . == 0 then error("foo") elif . == 1 then .a elif . == 2 then empty else . end catch .]
 [0,1,2,3]
-["foo","Cannot index number with string \"a\"",3]
+["foo","Cannot index number with string (\"a\")",3]
 
 [.[]|(.a, .a)?]
 [null,true,{"a":1}]
@@ -1512,6 +1529,18 @@ split("")
 ["fo", "foo", "barfoo", "foobarfoo", "foob"]
 ["fo","","bar","bar","b"]
 
+[.[]|ltrimstr("")]
+["a", "xx", ""]
+["a", "xx", ""]
+
+[.[]|rtrimstr("")]
+["a", "xx", ""]
+["a", "xx", ""]
+
+[.[]|trimstr("")]
+["a", "xx", ""]
+["a", "xx", ""]
+
 [(index(","), rindex(",")), indices(",")]
 "a,bc,def,ghij,klmno"
 [1,13,[1,4,8,13]]
@@ -1519,6 +1548,15 @@ split("")
 [ index("aba"), rindex("aba"), indices("aba") ]
 "xababababax"
 [1,7,[1,3,5,7]]
+
+# _strindices is used by indices/1 but is callable
+try _strindices("abc") catch .
+123
+"number (123) cannot be searched, as it is not a string"
+
+try _strindices(123) catch .
+"abc"
+"number (123) is not a string"
 
 # trim
 # \u000b is vertical tab (\v not supported by json)
@@ -1822,6 +1860,10 @@ gmtime
 1425599507
 [2015,2,5,23,51,47,4,63]
 
+gmtime[5]
+1425599507.25
+47.25
+
 # test invalid tm input
 try strftime("%Y-%m-%dT%H:%M:%SZ") catch .
 ["a",1,2,3,4,5,6,7]
@@ -1847,10 +1889,6 @@ try ["OK", strflocaltime({})] catch ["KO", .]
 [strptime("%Y-%m-%dT%H:%M:%SZ")|(.,mktime)]
 "2015-03-05T23:51:47Z"
 [[2015,2,5,23,51,47,4,63],1425599507]
-
-[strptime("%FT%T")|(.,mktime)]
-"2025-06-07T08:09:10"
-[[2025,5,7,8,9,10,6,157],1749283750]
 
 # Check day-of-week and day of year computations
 # (should trip an assert if this fails)
@@ -1957,21 +1995,25 @@ null
 true
 
 try -. catch .
-"very-long-string"
-"string (\"very-long-...) cannot be negated"
+"very-long-long-long-long-string"
+"string (\"very-long-long-long-long...\") cannot be negated"
 
 try (.-.) catch .
-"very-long-string"
-"string (\"very-long-...) and string (\"very-long-...) cannot be subtracted"
+"very-long-long-long-long-string"
+"string (\"very-long-long-long-long...\") and string (\"very-long-long-long-long...\") cannot be subtracted"
 
-"x" * range(0; 12; 2) + "☆" * 5 | try -. catch .
+"x" * range(0; 12; 2) + "☆" * 8 | try -. catch .
 null
-"string (\"☆☆☆...) cannot be negated"
-"string (\"xx☆☆...) cannot be negated"
-"string (\"xxxx☆☆...) cannot be negated"
-"string (\"xxxxxx☆...) cannot be negated"
-"string (\"xxxxxxxx...) cannot be negated"
-"string (\"xxxxxxxxxx...) cannot be negated"
+"string (\"☆☆☆☆☆☆☆☆\") cannot be negated"
+"string (\"xx☆☆☆☆☆☆☆☆\") cannot be negated"
+"string (\"xxxx☆☆☆☆☆☆...\") cannot be negated"
+"string (\"xxxxxx☆☆☆☆☆☆...\") cannot be negated"
+"string (\"xxxxxxxx☆☆☆☆☆...\") cannot be negated"
+"string (\"xxxxxxxxxx☆☆☆☆...\") cannot be negated"
+
+try (. + "x") catch . == if have_decnum then "number (12345678901234567890123456...) and string (\"x\") cannot be added" else "number (12345678901234568000000000...) and string (\"x\") cannot be added" end
+123456789012345678901234567890
+true
 
 join(",")
 ["1",2,true,false,3.4]
@@ -1991,7 +2033,7 @@ join(",")
 
 try join(",") catch .
 ["1","2",{"a":{"b":{"c":33}}}]
-"string (\"1,2,\") and object ({\"a\":{\"b\":{...) cannot be added"
+"string (\"1,2,\") and object ({\"a\":{\"b\":{\"c\":33}}}) cannot be added"
 
 try join(",") catch .
 ["1","2",[3,4,5]]
@@ -2368,7 +2410,7 @@ map(try implode catch .)
 
 try 0[implode] catch .
 []
-"Cannot index number with string \"\""
+"Cannot index number with string (\"\")"
 
 # walk
 walk(.)
@@ -2444,14 +2486,14 @@ null
 
 try ("foobar" | .[1.5]) catch .
 null
-"Cannot index string with number"
+"Cannot index string with number (1.5)"
 
 
 # setpath/2 does not leak the input after an invalid get #2970
 
 try ["ok", setpath([1]; 1)] catch ["ko", .]
 {"hi":"hello"}
-["ko","Cannot index object with number"]
+["ko","Cannot index object with number (1)"]
 
 try fromjson catch .
 "{'a': 123}"
@@ -2502,8 +2544,92 @@ foreach .[] as $x (0, 1; . + $x)
 
 # regression test for CVE-2025-49014 (use of fmt after free)
 # tests with both empty string literal and empty string created by function
-# as they seems to behave referecne wise differently.
+# as they seems to behave reference wise differently.
 strflocaltime("" | ., @uri)
 0
 ""
 ""
+
+# regression tests for #3413
+# upper range bounds should be in sync with the constants defined at
+#   src/jv_parse.c:#define MAX_PARSING_DEPTH (N)
+#   src/jv_print.c:#define MAX_PRINT_DEPTH (N)
+# (N-1)
+reduce range(9999) as $_ ([];[.]) | tojson | fromjson | flatten
+null
+[]
+
+# (N)
+reduce range(10000) as $_ ([];[.]) | tojson | try (fromjson) catch . | (contains("<skipped: too deep>") | not) and contains("Exceeds depth limit for parsing")
+null
+true
+
+# (N+1)
+reduce range(10001) as $_ ([];[.]) | tojson | contains("<skipped: too deep>")
+null
+true
+
+# regression test for CVE-2026-33947
+setpath([range(10000) | 0]; 0) | flatten
+null
+[0]
+
+try setpath([range(10001) | 0]; 0) catch .
+null
+"Path too deep"
+
+getpath([range(10000) | 0])
+null
+null
+
+try getpath([range(10001) | 0]) catch .
+null
+"Path too deep"
+
+delpaths([[range(10000) | 0]])
+null
+null
+
+try delpaths([[range(10001) | 0]]) catch .
+null
+"Path too deep"
+
+# regression test for CVE-2026-40612
+reduce range(10000) as $_ ([]; [.]) | contains([[]])
+null
+true
+
+try (reduce range(10001) as $_ ([]; [.]) as $x | $x | contains($x)) catch .
+null
+"Containment check too deep"
+
+# regression test for CVE-2026-43896
+reduce range(10000) as $_ ({}; {a: .}) as $x | $x * $x | length
+null
+1
+
+try (reduce range(10001) as $_ ({}; {a: .}) as $x | $x * $x) catch .
+null
+"Object merge too deep"
+
+# regression test for deep structural equality recursion
+try ((reduce range(10001) as $_ ([]; [.])) as $x | (reduce range(10001) as $_ ([]; [.])) as $y | $x == $y) catch .
+null
+"Equality check too deep"
+
+# regression tests for deep ordering comparisons
+try ((reduce range(10001) as $_ ([]; [.])) as $x | [$x, $x] | sort) catch .
+null
+"Comparison too deep"
+
+try ((reduce range(10001) as $_ ([]; [.])) as $x | [$x, $x] | unique) catch .
+null
+"Comparison too deep"
+
+try ((reduce range(10001) as $_ ({}; {a: .})) as $x | [$x, $x] | sort) catch .
+null
+"Comparison too deep"
+
+try ((reduce range(10001) as $_ ({}; {a: .})) as $x | [$x, $x] | unique) catch .
+null
+"Comparison too deep"

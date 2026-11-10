@@ -8,7 +8,7 @@
 //! - every name in [`ROSTER`] is listed under its class in the table of
 //!   `docs/reference/jq-language.md`'s "Names jq 1.7.1 does not define" section;
 //! - every name is pinned by its own row in `extensions.tsv` (whose program uses it), or by jq
-//!   1.8.1's vendored tests, and every row belongs to a name;
+//!   1.8.2's vendored tests, and every row belongs to a name;
 //! - every row of `extensions.tsv` runs under `succinctly jq` and exits 0, the half of the verdict
 //!   that needs no reference (the harness judges the other half against jq 1.7.1).
 //!
@@ -41,8 +41,8 @@ const OLD_ALIAS: &str = "an old alias";
 enum Pin {
     /// Its own row in `comparison/jq/probes/extensions.tsv`: the row's id.
     Row(&'static str),
-    /// The vendored jq 1.8.1 test files (`comparison/jq/vendor/jq-1.8.1/jq.test`), which the
-    /// harness runs against jq 1.8.1 alone: a jq 1.8 name is not succinctly-only, so it has no
+    /// The vendored jq 1.8.2 test files (`comparison/jq/vendor/jq-1.8.2/jq.test`), which the
+    /// harness runs against jq 1.8.2 alone: a jq 1.8 name is not succinctly-only, so it has no
     /// "the reference must reject" row.
     Vendored18,
 }
@@ -158,7 +158,7 @@ fn every_name_is_listed_under_its_class_in_the_reference_6672() -> Result<()> {
 #[test]
 fn every_name_is_pinned_by_its_own_row_or_the_vendored_tests_6672() -> Result<()> {
     let rows = probe_rows()?;
-    let vendored = std::fs::read_to_string(root().join("comparison/jq/vendor/jq-1.8.1/jq.test"))?;
+    let vendored = std::fs::read_to_string(root().join("comparison/jq/vendor/jq-1.8.2/jq.test"))?;
     for (_, name, pin) in ROSTER {
         match pin {
             Row(id) => {
@@ -174,7 +174,7 @@ fn every_name_is_pinned_by_its_own_row_or_the_vendored_tests_6672() -> Result<()
             }
             Vendored18 => assert!(
                 has_word(&vendored, name),
-                "`{name}` is not exercised by jq 1.8.1's vendored jq.test"
+                "`{name}` is not exercised by jq 1.8.2's vendored jq.test"
             ),
         }
     }

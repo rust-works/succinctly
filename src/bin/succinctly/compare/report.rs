@@ -522,7 +522,7 @@ fn differential_section(s: &mut String, r: &Results) {
 /// and none of it is counted above.
 fn differential_secondary_section(s: &mut String, r: &Results) {
     if !r.secondary_suites_skipped.is_empty() {
-        let _ = writeln!(s, "\n### B2. jq 1.8.1's own test files: not run\n");
+        let _ = writeln!(s, "\n### B2. jq 1.8.2's own test files: not run\n");
         for why in &r.secondary_suites_skipped {
             let _ = writeln!(s, "- {why}");
         }
@@ -530,7 +530,7 @@ fn differential_secondary_section(s: &mut String, r: &Results) {
     if r.differential_secondary.is_empty() {
         return;
     }
-    let _ = writeln!(s, "\n### B2. jq 1.8.1's own test files (informational)\n");
+    let _ = writeln!(s, "\n### B2. jq 1.8.2's own test files (informational)\n");
     let _ = writeln!(
         s,
         "The same comparison against the secondary reference. `succinctly jq` follows jq 1.7.1, so a \
@@ -627,7 +627,7 @@ fn perf_sections(s: &mut String, r: &Results) {
          except where marked †: a row that long is moved by run-to-run noise, so its ratio is of \
          each tool's fastest of the {} runs, which the noise moves least (the times beside it stay \
          medians). A row marked `CV>5%` is noise-dominated, and its ratio is not a finding on its \
-         own. `1.8.1 ÷ 1.7.1` is the secondary reference's own change in speed, always of medians.{}\n",
+         own. `1.8.2 ÷ 1.7.1` is the secondary reference's own change in speed, always of medians.{}\n",
         r.reps,
         perf::SLOW_ROW_MS,
         perf::SLOW_ROW_REPS,
@@ -687,7 +687,7 @@ fn perf_sections(s: &mut String, r: &Results) {
         s.push('\n');
     }
     let _ = writeln!(s, "### All timed rows\n");
-    let _ = writeln!(s, "| Query | Input | jq 1.7.1 | succinctly | vs 1.7.1 | jq 1.8.1 | vs 1.8.1 | 1.8.1 ÷ 1.7.1 | CV>5% |");
+    let _ = writeln!(s, "| Query | Input | jq 1.7.1 | succinctly | vs 1.7.1 | jq 1.8.2 | vs 1.8.2 | 1.8.2 ÷ 1.7.1 | CV>5% |");
     let _ = writeln!(s, "|-------|-------|----------|------------|----------|----------|----------|---------------|-------|");
     for x in &timed {
         let _ = writeln!(

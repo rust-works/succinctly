@@ -2,7 +2,7 @@
 
 # jq vs succinctly jq
 
-Generated comparison of `jq` 1.7.1 (primary) and 1.8.1 (secondary) with `succinctly jq`: features, correctness, performance, memory, robustness and operational properties. Reproduce with `succinctly dev compare jq`; see [comparison/jq/README.md](../../comparison/jq/README.md). Each platform has its own report; memory-bound effects do not port across architectures, so no figure is extrapolated between them.
+Generated comparison of `jq` 1.7.1 (primary) and 1.8.2 (secondary) with `succinctly jq`: features, correctness, performance, memory, robustness and operational properties. Reproduce with `succinctly dev compare jq`; see [comparison/jq/README.md](../../comparison/jq/README.md). Each platform has its own report; memory-bound effects do not port across architectures, so no figure is extrapolated between them.
 
 | Platform | CPU | Commit | Builtins agreeing | CLI probes | Upstream jq tests | Geomean speedup |
 |----------|-----|--------|-------------------|------------|-------------------|-----------------|
