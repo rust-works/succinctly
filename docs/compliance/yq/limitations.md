@@ -94,6 +94,8 @@ c: *x
 $ printf 'a: &x {p: 1}\nb: *x\nc: *x\n' | succinctly yq -o=json -I=0 '.[] .p += 1'
 {"a":{"p":4},"b":{"p":4},"c":{"p":4}}        # three positions, one node: matches yq
 ```
+A write to the node an update targets rebinds that position and leaves the shared node alone, as in yq ([#6861](https://github.com/rust-works/succinctly/issues/6861)): `.b |= (. = {"p": 3})` over `b: *x` changes `b` only, where `.b |= (.p = 9)` (a write below the target) reaches the shared node and every position follows.
+Still divergent: a body whose first write reaches the shared node and whose later write replaces the target (`.b |= (.p = 5 | . = {"p": 3})`, where yq leaves `a` and `c` at `p: 5`) writes only the position's own copy, so `a` and `c` keep `p: 1`.
 
 The redirect is gated on structural identity: it applies only while the alias position
 still holds the anchor's value, so a position rebound earlier in the pipe (`.b = 5 | .b.p =
