@@ -9162,6 +9162,41 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         })
     }
 
+    /// After an empty block scalar, pass the empty lines below it that end in NEL, LS or PS (#6369): go-yaml
+    /// reads each as an empty line, which the line dispatcher would otherwise take for stray structure
+    /// (`a: |` / `  <PS>` / `b: 1`). Spaces and an ASCII break are passed with them but only kept when a
+    /// Unicode break was among them, so the common empty scalar leaves the cursor where it was; such a
+    /// scalar is listed like any that holds one.
+    #[cold]
+    fn skip_unicode_empty_lines(&mut self) {
+        let mut at = self.pos;
+        let mut keep = self.pos;
+        loop {
+            while self.input.get(at) == Some(&b' ') {
+                at += 1;
+            }
+            let unicode = self.unicode_break_len_at(at);
+            let ascii = if HAS_CR {
+                line_break_len(self.input, at)
+            } else {
+                usize::from(self.input.get(at) == Some(&b'\n'))
+            };
+            if unicode > 0 {
+                at += unicode;
+                keep = at;
+            } else if ascii > 0 {
+                at += ascii;
+            } else {
+                break;
+            }
+        }
+        if keep > self.pos {
+            // Listed, so `|+` keeps those lines: each is its own break (`  <PS>` / `b: 1` is `"\u2029\n"`).
+            self.unicode_block_scalars.push(self.block_header_pos);
+        }
+        self.pos = keep;
+    }
+
     /// Parse a block scalar (| or >) including all content lines.
     fn parse_block_scalar(&mut self, base_indent: usize) -> Result<(), YamlError> {
         self.block_header_pos = self.pos;
@@ -9192,6 +9227,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // the marker (#5067). `find_block_scalar_end` never looks at the first line.
                 self.set_bp_text_end_position(self.pos);
                 self.write_bp_close();
+                self.skip_unicode_empty_lines();
                 return Ok(());
             }
             content_indent
@@ -9207,6 +9243,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     // (#710, see `set_bp_text_end_position`'s doc comment).
                     self.set_bp_text_end_position(self.pos);
                     self.write_bp_close();
+                    self.skip_unicode_empty_lines();
                     return Ok(());
                 }
             }

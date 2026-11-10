@@ -108,6 +108,34 @@ const ROWS: &[(&str, Option<&str>)] = &[
     ("a: |\n  x\u{2028}  ", Some("{\"a\":\"x\\u2028\"}")),
     ("a: |+\n  x\n\u{2029}  ", Some("{\"a\":\"x\\n\\u2029\"}")),
     ("a: |\n\u{2028}\n  x\n", Some("{\"a\":\"\\u2028\\nx\\n\"}")),
+    // a scalar with no content line, only empty lines that end in a Unicode break: a parse of the lines below it
+    // (a regression found in review), and what `|+` keeps
+    ("a: |\n  \u{2029}\nb: 1\n", Some("{\"a\":\"\",\"b\":1}")),
+    (
+        "a: |+\n  \u{2029}\nb: 1\n",
+        Some("{\"a\":\"\\u2029\\n\",\"b\":1}"),
+    ),
+    ("a: |-\n  \u{2029}\nb: 1\n", Some("{\"a\":\"\",\"b\":1}")),
+    (
+        "a: >+\n  \u{2029}\n  \u{85}\nb: 1\n",
+        Some("{\"a\":\"\\u2029\\n\\n\\n\",\"b\":1}"),
+    ),
+    (
+        "a:\n  b: >+\n    \u{2028}",
+        Some("{\"a\":{\"b\":\"\\u2028\"}}"),
+    ),
+    (
+        "- |+\r\n  \u{2029}\r\n- z\r\n",
+        Some("[\"\\u2029\\n\",\"z\"]"),
+    ),
+    (
+        "a: |+\n  \n  \u{2028}\n\nb: 1\n",
+        Some("{\"a\":\"\\n\\u2028\\n\\n\",\"b\":1}"),
+    ),
+    (
+        "a: |+\n  \u{2028}\n  x\n",
+        Some("{\"a\":\"\\u2028\\nx\\n\"}"),
+    ),
 ];
 
 #[test]

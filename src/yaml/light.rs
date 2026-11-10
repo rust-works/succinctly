@@ -7448,12 +7448,12 @@ fn decode_block_literal(
 
     // A scalar that holds NEL, LS or PS is read as go-yaml reads it (#6369).
     if unicode {
-        if let Some(indent) =
+        // No content line at all (`None`): every space is indentation, and the lines are the empty
+        // ones `|+` keeps, each as its own break.
+        let indent =
             YamlString::block_content_indent(text, indicator_pos, content_start, explicit_indent)
-        {
-            return decode_block_unicode(text, content_start, indent, chomping, false)
-                .map(Cow::Owned);
-        }
+                .unwrap_or(usize::MAX);
+        return decode_block_unicode(text, content_start, indent, chomping, false).map(Cow::Owned);
     }
 
     let content = &text[content_start..content_end];
@@ -7579,12 +7579,12 @@ fn decode_block_folded(
 
     // See `decode_block_literal` (#6369).
     if unicode {
-        if let Some(indent) =
+        // No content line at all (`None`): every space is indentation, and the lines are the empty
+        // ones `|+` keeps, each as its own break.
+        let indent =
             YamlString::block_content_indent(text, indicator_pos, content_start, explicit_indent)
-        {
-            return decode_block_unicode(text, content_start, indent, chomping, true)
-                .map(Cow::Owned);
-        }
+                .unwrap_or(usize::MAX);
+        return decode_block_unicode(text, content_start, indent, chomping, true).map(Cow::Owned);
     }
 
     let content = &text[content_start..content_end];
