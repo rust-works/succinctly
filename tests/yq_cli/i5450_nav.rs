@@ -23,6 +23,7 @@ fn test_map_key_behind_a_navigation_keeps_each_key_5450() -> Result<()> {
     check(&[
         (".a | map(key)", a),
         (".a | (map(key))", a),
+        (".a | map((key))", a),
         (".x.y | map(key)", y),
         (".x | .y | map(key)", y),
         // A later stage reads the keys the listing made.
@@ -39,6 +40,7 @@ fn test_key_array_behind_a_navigation_keeps_each_key_5450() -> Result<()> {
         (".a | [.[] | key]", a),
         (".x.y | [.[] | key]", y),
         (".x | .y | [.[] | key]", y),
+        (".x.y | [.[] | (key)]", y),
         ("(.x.y | [.[] | key])", y),
         (".x.y | [.[] | key] | .[0]", "q\n"),
     ])
