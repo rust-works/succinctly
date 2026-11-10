@@ -1732,7 +1732,7 @@ pub mod alias_identity {
     fn concrete_steps(path: &Expr, doc: &OwnedValue) -> Option<Vec<OwnedValue>> {
         let mut components = Vec::new();
         push_path_components(&mut components, path);
-        let mut steps: Vec<OwnedValue> = Vec::with_capacity(components.len());
+        let mut steps: Vec<OwnedValue> = vec_with_capacity(components.len());
         for component in &components {
             let step = match unwrap_path_component(component).0 {
                 Expr::Field(name) => OwnedValue::String(name.clone().into()),
