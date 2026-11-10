@@ -22371,7 +22371,11 @@ fn fold_together<S: EvalSemantics, V: DocumentValue>(
             .collect::<Result<Vec<_>, _>>()
             .map_err(Flow::Escaped)
     };
+    // STYLE-0012: an element that cannot be read is a decode failure, which an ambient `?`
+    // never silences (#1620, #1902), and it ends the whole yq expression like any other
+    // control on this walk (`collect_yq_context`).
     let source = to_owned_list(&source)?;
+    // STYLE-0012: as the source just above.
     let seeds = to_owned_list(&seeds)?;
     // One drive of an owned list, the consumer's stop ending the walk.
     let drive = |values: &[OwnedValue], per_item: &mut dyn FnMut(OwnedValue) -> Demand| {
