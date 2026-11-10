@@ -9944,6 +9944,30 @@ fn explicit_key_lead_blanks(indent: &str, child_indent: &str) -> usize {
 /// A key's source span of 128 bytes or less without a backslash cannot decode to more or to a
 /// break, and a plain key's span is known without a scan, so a short key goes on to the ordinary
 /// writer.
+/// Writes a mapping key as an explicit one, `? <properties><scalar>` and the line break that
+/// leads back to `indent` for the `:` line, for a key whose scalar the caller has already spelled
+/// (#6075, #4913). The key's own anchor and tag come first, as `write_yaml_field_key` writes them.
+fn write_explicit_scalar_key<W: AsRef<[u64]>, Out: core::fmt::Write>(
+    out: &mut Out,
+    field: YamlField<'_, W>,
+    scalar: &str,
+    indent: &str,
+) -> core::fmt::Result {
+    out.write_str("? ")?;
+    if let Some(anchor) = field.key_cursor().anchor() {
+        out.write_char('&')?;
+        out.write_str(anchor)?;
+        out.write_char(' ')?;
+    }
+    if let Some(tag) = field.key_cursor().explicit_tag_at(None) {
+        out.write_str(tag)?;
+        out.write_char(' ')?;
+    }
+    out.write_str(scalar)?;
+    out.write_char('\n')?;
+    out.write_str(indent)
+}
+
 #[inline(never)]
 fn write_yaml_block_field_key_checked<W: AsRef<[u64]>, Out: core::fmt::Write>(
     out: &mut Out,
@@ -9963,23 +9987,39 @@ fn write_yaml_block_field_key_checked<W: AsRef<[u64]>, Out: core::fmt::Write>(
                 if let Ok(decoded) = s.as_str() {
                     let child_indent = deeper_yaml_indent(indent, indent_spaces, unit);
                     if let Some(scalar) = go_yaml_single_quoted_line_feed(&decoded, &child_indent) {
-                        out.write_str("? ")?;
-                        // The key's own anchor and tag, as `write_yaml_field_key` writes them.
-                        if let Some(anchor) = field.key_cursor().anchor() {
-                            out.write_char('&')?;
-                            out.write_str(anchor)?;
-                            out.write_char(' ')?;
-                        }
-                        if let Some(tag) = field.key_cursor().explicit_tag_at(None) {
-                            out.write_str(tag)?;
-                            out.write_char(' ')?;
-                        }
-                        out.write_str(&scalar)?;
-                        out.write_char('\n')?;
-                        out.write_str(indent)?;
+                        write_explicit_scalar_key(out, field, &scalar, indent)?;
                         return Ok(true);
                     }
                 }
+            }
+            // #4913: a key that holds U+2028 or U+2029 has a break, so it is no simple key either
+            // (`? 'x<LS>y'`); it is written as the explicit key the write route writes, with its
+            // own anchor and tag.
+            if matches!(s, YamlString::SingleQuoted { .. }) && s.may_hold_unicode_line_separator() {
+                if let Ok(decoded) = s.as_str() {
+                    let child_indent = deeper_yaml_indent(indent, indent_spaces, unit);
+                    if !decoded.contains('\n') {
+                        if let Some(scalar) =
+                            go_yaml_unicode_separator_scalar(&decoded, &child_indent, indent_spaces)
+                        {
+                            write_explicit_scalar_key(out, field, &scalar, indent)?;
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+            // A double-quoted key keeps its style (`? "x\L y"`): go-yaml spells the separator as an
+            // escape there, and the key is still no simple key.
+            if matches!(s, YamlString::DoubleQuoted { .. })
+                && s.raw_bytes().iter().any(|&b| matches!(b, 0xE2 | b'\\'))
+                && s.as_str()
+                    .is_ok_and(|decoded| decoded.contains(['\u{2028}', '\u{2029}']))
+            {
+                out.write_str("? ")?;
+                write_yaml_field_key(out, field, false)?;
+                out.write_char('\n')?;
+                out.write_str(indent)?;
+                return Ok(true);
             }
             // A break is spelled as an escape in a one-line key, so it takes a backslash.
             let long = match s {

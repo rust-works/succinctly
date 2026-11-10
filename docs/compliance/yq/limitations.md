@@ -919,13 +919,15 @@ becoming single-quoted). The streaming route used to copy the source text. The i
 enclosing collection's plus one step, so a flow item under a block mapping sits two steps in and a
 root flow collection's items one step past that; the streaming route knows it for the first flow
 level only, the DOM route (a write) at every depth. Not covered: a flow collection nested in
-another on the streaming route (`a: [[x\u2028y]]`), an explicit-key scalar (`? 'x\u2028y'`), a scalar
+another on the streaming route (`a: [[x\u2028y]]`), a scalar
 whose source has a space beside the break (yq trims it on decode, this keeps it and so
 double-quotes), a multi-line source scalar that holds a `\n` as well, and a *block* plain scalar
 with such a break, which yq rejects (`could not find expected ':'`) and the parser has always
 accepted (a semi-index does not validate to that depth). The decode half is
 [#4913](https://github.com/rust-works/succinctly/issues/4913).
 The decode half landed with #4913 for a quoted scalar and a flow collection's plain scalar.
+A mapping key that holds U+2028 or U+2029 is an explicit key on the streaming route as on the write route (`? 'x\u2028  y'`, the quotes of a double-quoted one kept).
+Not matched: `keys` over such a key writes the continuation line without its indent (`- 'x\u2028y'`, yq `- 'x\u2028  y'`), and `-P` drops the quotes of an anchored one (`? &k x\u2028y`).
 U+0085 folds like a `\n` there (`'x\u0085y'` is `x y`).
 U+2028 and U+2029 stay in the value.
 The blanks beside any of the three are trimmed as beside a `\n`, so the space-beside-the-break case in the list above is fixed.
