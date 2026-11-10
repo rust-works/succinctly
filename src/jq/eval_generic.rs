@@ -22319,6 +22319,16 @@ fn fold_together<S: EvalSemantics, V: DocumentValue>(
         unreachable!("the stage yq_list_stage selected as a fold is an Expr::Reduce")
     };
     let over_context = |operand: &Expr| {
+        // yq builds its one `{}` even from an empty context (`select(false) | . as $i
+        // ireduce ({}; ...)` is `{}`), which a walk over no entries cannot see.
+        if context.is_empty()
+            && matches!(unwrap_paren(operand), Expr::Object(entries) if entries.is_empty())
+        {
+            return Ok(vec![YqContextItem::new(
+                YqContextNode::Owned(OwnedValue::object_from([])),
+                YqContextTag::default(),
+            )]);
+        }
         let mut flat: Vec<Expr> = Vec::new();
         yq_flatten_pipe_stages(core::slice::from_ref(operand), &mut flat);
         collect_yq_context::<S, V>(&flat, context, optional, cur)
@@ -22352,17 +22362,22 @@ fn fold_together<S: EvalSemantics, V: DocumentValue>(
         None => over_context(input).map_err(Flow::Escaped)?,
     };
     let seeds = over_context(init).map_err(Flow::Escaped)?;
-    // One drive of a collected list: each entry as the owned value the fold
-    // binds, an unreadable one escaping and the consumer's stop ending the walk.
-    let drive = |items: &[YqContextItem<V>], per_item: &mut dyn FnMut(OwnedValue) -> Demand| {
-        for item in items {
-            match generic_item_into_owned::<_, S>(item.to_generic_item()) {
-                Ok(value) => {
-                    if let Demand::Stop = per_item(value) {
-                        return Flow::Stopped { pending: None };
-                    }
-                }
-                Err(control) => return Flow::Escaped(control),
+    // Each list is made owned once: every INIT output is a fork that folds the same
+    // source, so converting inside the fork would convert every document once per fork.
+    let to_owned_list = |items: &[YqContextItem<V>]| -> Result<Vec<OwnedValue>, Flow> {
+        items
+            .iter()
+            .map(|item| generic_item_into_owned::<_, S>(item.to_generic_item()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Flow::Escaped)
+    };
+    let source = to_owned_list(&source)?;
+    let seeds = to_owned_list(&seeds)?;
+    // One drive of an owned list, the consumer's stop ending the walk.
+    let drive = |values: &[OwnedValue], per_item: &mut dyn FnMut(OwnedValue) -> Demand| {
+        for value in values {
+            if let Demand::Stop = per_item(value.clone()) {
+                return Flow::Stopped { pending: None };
             }
         }
         Flow::Exhausted

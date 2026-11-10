@@ -94,6 +94,9 @@ const ROWS: &[(&str, &str)] = &[
     ("[.] | {}", "{}\n"),
     (". as $x | {}", "{}\n{}\n{}\n{}\n"),
     ("select(.a > 1) | {}", "{}\n"),
+    (".zz as $i ireduce ({}; . * $i)", "{}\n"),
+    (".zz[] as $i ireduce (0; . + 1)", "0\n0\n0\n0\n"),
+    ("select(fi == 9) | . as $i ireduce ({}; . * $i)", "{}\n"),
 ];
 
 fn files() -> Result<Vec<NamedTempFile>> {
