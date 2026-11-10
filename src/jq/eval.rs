@@ -1266,14 +1266,47 @@ pub mod alias_identity {
 
     thread_local! {
         static TABLE: RefCell<Option<Rc<AliasTable>>> = const { RefCell::new(None) };
+        /// How many update bodies are running with a path of their own (see [`enter_update_body`]).
+        static BODY_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
-    /// Whether a table is installed for the current evaluation.
+    /// Whether the evaluation is inside an update body that runs below the document's root.
+    fn in_update_body() -> bool {
+        BODY_DEPTH.with(|d| d.get() > 0)
+    }
+
+    /// Ends [`enter_update_body`]'s scope on drop.
+    #[must_use]
+    pub(crate) struct BodyGuard;
+
+    impl Drop for BodyGuard {
+        fn drop(&mut self) {
+            BODY_DEPTH.with(|d| d.set(d.get() - 1));
+        }
+    }
+
+    /// The table names positions from the document's root, so it means nothing to a write that an
+    /// update body makes below its target: `.list[] |= (.x = 7)` runs `.x = 7` on each element, and
+    /// its path `["x"]` is not the position `["x"]` of the document (#6839). Matched anyway, a body
+    /// write could be redirected onto an unrelated anchor, and each one walked the whole table,
+    /// which made the update quadratic in the number of aliases and merged members. Inside a body
+    /// every hook is off; the write the update itself makes at its target is still redirected,
+    /// before the body runs, and mirrored after it.
+    pub(crate) fn enter_update_body() -> BodyGuard {
+        BODY_DEPTH.with(|d| d.set(d.get() + 1));
+        BodyGuard
+    }
+
+    /// Whether a table is installed for the current evaluation, and the position it names is the
+    /// one being written.
     pub fn active() -> bool {
-        TABLE.with(|t| t.borrow().is_some())
+        !in_update_body() && TABLE.with(|t| t.borrow().is_some())
     }
 
     fn with_table<R>(f: impl FnOnce(&AliasTable) -> R) -> Option<R> {
+        if in_update_body() {
+            return None;
+        }
         let table = TABLE.with(|t| t.borrow().clone())?;
         Some(f(&table))
     }
@@ -1813,6 +1846,13 @@ pub mod alias_identity {
     pub(crate) fn redirect_concrete_path(_path: &mut Vec<OwnedValue>, _doc: &OwnedValue) {}
 
     pub(crate) fn mirror_after_write(_pre: &OwnedValue, _post: &mut OwnedValue) {}
+
+    /// Nothing to gate without a table.
+    pub(crate) struct BodyGuard;
+
+    pub(crate) fn enter_update_body() -> BodyGuard {
+        BodyGuard
+    }
 
     pub(crate) fn adopt_body_member_edits(
         _pre: &OwnedValue,
@@ -45452,6 +45492,8 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 defer_deletes.then_some(&mut deletes),
             )
         } else {
+            // #6839: the body's own writes are relative to this target, not to the root.
+            let _body = alias_identity::enter_update_body();
             update_path_with_deletes::<S>(
                 &mut result,
                 path,
@@ -175565,6 +175607,38 @@ mod tests {
             let mut post = json(r#"{"a":{"p":5,"q":1},"b":{"p":1,"q":1}}"#);
             alias_identity::mirror_after_write(&pre, &mut post);
             assert_eq!(post, json(r#"{"a":{"p":5,"q":5},"b":{"p":5,"q":5}}"#));
+        }
+
+        /// #6839: the table names positions from the root, so a write an update body makes below
+        /// its target neither redirects nor mirrors, and an update body nests.
+        #[test]
+        fn an_update_body_switches_every_hook_off_and_nests_6839() {
+            let _guard = alias_identity::enter(table());
+            let pre = json(DOC);
+            let rebound = r#"{"a":{"p":9,"q":2},"b":{"p":1,"q":2},"c":null}"#;
+            assert!(alias_identity::active());
+            {
+                let _outer = alias_identity::enter_update_body();
+                {
+                    let _inner = alias_identity::enter_update_body();
+                    assert!(!alias_identity::active());
+                }
+                // Still inside the outer body.
+                assert!(!alias_identity::active());
+                let mut post = json(rebound);
+                alias_identity::mirror_after_write(&pre, &mut post);
+                assert_eq!(post, json(rebound), "no mirror inside a body");
+                let mut paths = vec![Expr::Pipe(
+                    vec![Expr::Field("b".into()), Expr::Field("p".into())].into(),
+                )];
+                let before = paths.clone();
+                alias_identity::redirect_paths(&mut paths, &pre, alias_identity::Redirect::THROUGH);
+                assert_eq!(paths, before, "no redirect inside a body");
+            }
+            assert!(alias_identity::active());
+            let mut post = json(rebound);
+            alias_identity::mirror_after_write(&pre, &mut post);
+            assert_ne!(post, json(rebound), "the mirror is back outside it");
         }
 
         #[test]
