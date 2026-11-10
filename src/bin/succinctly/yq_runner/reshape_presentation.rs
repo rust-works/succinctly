@@ -152,8 +152,9 @@ fn unflow_mappings(value: &OwnedValue, tree: &mut CommentTree) {
     };
     if meta.style == "flow" && !fields.is_empty() {
         // The comment that trailed the closing brace has no place in a block mapping: yq drops it.
-        *meta = meta.with_style("");
-        meta.comment = None;
+        let mut unflowed = meta.with_style("");
+        unflowed.comment = None;
+        meta.set(unflowed);
     }
     for (key, child) in children.iter_mut() {
         if let Some(field) = fields.get(key.as_str()) {
@@ -353,7 +354,7 @@ fn node_pair_as<C: DocumentCursor>(
 /// caller then prints the keys bare, as it did before.
 pub(super) fn key_nodes<F: DocumentFields>(fields: &F, collapse: bool) -> Option<CommentTree> {
     let (_, trees) = key_list(fields, collapse)?;
-    Some(CommentTree::Array(NodeMeta::empty(), trees))
+    Some(CommentTree::array(NodeMeta::empty(), trees))
 }
 
 /// A `keys` result built from the mapping's key nodes, value and presentation: what
@@ -363,7 +364,7 @@ fn keys_pair<F: DocumentFields>(fields: &F, collapse: bool) -> Option<ResultWith
     let (values, trees) = key_list(fields, collapse)?;
     Some((
         OwnedValue::Array(values.into_iter().collect()),
-        CommentTree::Array(NodeMeta::empty(), trees),
+        CommentTree::array(NodeMeta::empty(), trees),
     ))
 }
 
@@ -377,7 +378,7 @@ fn node_keys_pair<C: DocumentCursor>(node: &C) -> Option<ResultWithComments> {
     let len = value.as_array()?.len();
     Some((
         OwnedValue::Array((0..len).map(|i| OwnedValue::Int(i as i64)).collect()),
-        CommentTree::Array(NodeMeta::empty(), vec![CommentTree::empty(); len]),
+        CommentTree::array(NodeMeta::empty(), vec![CommentTree::empty(); len]),
     ))
 }
 
@@ -414,7 +415,7 @@ fn key_list<F: DocumentFields>(
         // The key's node value: a key that is not a string (`1:`, `true:`) lists as its scalar,
         // as yq lists it. The caller checks the result against the evaluated one.
         values.push(key_value);
-        trees.push(CommentTree::Leaf(meta));
+        trees.push(CommentTree::leaf(meta));
     }
     Some((values, trees))
 }
@@ -436,7 +437,7 @@ pub(super) fn sequence_of_nodes<C: DocumentCursor>(
     }
     Ok((
         OwnedValue::array_from(values),
-        CommentTree::Array(NodeMeta::empty(), trees),
+        CommentTree::array(NodeMeta::empty(), trees),
     ))
 }
 
@@ -498,7 +499,7 @@ fn entry_pair<C: DocumentCursor>(e: &Expr, root: &C, depth: usize) -> Option<Res
                 CommentTree::empty()
             } else {
                 // A number computed from a node keeps the node's comment and style.
-                CommentTree::Leaf(l.1.meta().clone())
+                CommentTree::leaf(l.1.meta().clone())
             };
             Some((result, tree))
         }
@@ -570,7 +571,7 @@ fn construct<C: DocumentCursor>(expr: &Expr, root: &C, depth: usize) -> Option<R
             }
             Some((
                 OwnedValue::Object(values.into()),
-                CommentTree::Object(NodeMeta::empty(), trees, IndexMap::new()),
+                CommentTree::object(NodeMeta::empty(), trees, IndexMap::new()),
             ))
         }
         Expr::Slice { start, end, .. } => {
@@ -586,7 +587,7 @@ fn construct<C: DocumentCursor>(expr: &Expr, root: &C, depth: usize) -> Option<R
             }
             Some((
                 OwnedValue::Array(values.into_iter().collect()),
-                CommentTree::Array(NodeMeta::empty(), trees),
+                CommentTree::array(NodeMeta::empty(), trees),
             ))
         }
         Expr::Array(inner) => {
@@ -599,7 +600,7 @@ fn construct<C: DocumentCursor>(expr: &Expr, root: &C, depth: usize) -> Option<R
             }
             Some((
                 OwnedValue::Array(values.into_iter().collect()),
-                CommentTree::Array(NodeMeta::empty(), trees),
+                CommentTree::array(NodeMeta::empty(), trees),
             ))
         }
         _ => None,
@@ -763,13 +764,13 @@ fn trace_at_depth(
                         } else {
                             tree.field(key).clone()
                         };
-                        (CommentTree::Leaf(key_meta), value_tree)
+                        (CommentTree::leaf(key_meta), value_tree)
                     }
                     OwnedValue::Array(_) => (CommentTree::empty(), tree.at_index(i).clone()),
                     _ => return None,
                 };
                 children.push(if is_entries {
-                    CommentTree::Object(
+                    CommentTree::object(
                         NodeMeta::empty(),
                         IndexMap::from([
                             ("key".to_string(), key_tree),
@@ -781,7 +782,7 @@ fn trace_at_depth(
                     key_tree
                 });
             }
-            Some((result, CommentTree::Array(NodeMeta::empty(), children)))
+            Some((result, CommentTree::array(NodeMeta::empty(), children)))
         }
         Expr::Builtin(Builtin::FromEntries) => {
             let result = evaluated(expr, value)?;
@@ -828,7 +829,7 @@ fn trace_at_depth(
                 }
             }
             KeyMeta::record_shadows(&mut keys, shadow_leaves);
-            Some((result, CommentTree::Object(NodeMeta::empty(), fields, keys)))
+            Some((result, CommentTree::object(NodeMeta::empty(), fields, keys)))
         }
         // #4386: a sorted mapping is the same entries in another order, each keeping the comments,
         // style, anchor and tag of its own node and its key. A sorted array already keeps its
@@ -861,7 +862,7 @@ fn trace_at_depth(
             }
             Some((
                 result,
-                CommentTree::Object(tree.meta().clone(), fields, keys),
+                CommentTree::object(tree.meta().clone(), fields, keys),
             ))
         }
         // #5003: a picked entry is the document's own node, key and all: its comments, style,
@@ -896,7 +897,7 @@ fn trace_at_depth(
                 }
                 Some((
                     OwnedValue::Object(values.into()),
-                    CommentTree::Object(tree.meta().clone(), fields, keys),
+                    CommentTree::object(tree.meta().clone(), fields, keys),
                 ))
             }
             _ => next(&Expr::Builtin(Builtin::Map(f.clone())), input),
@@ -926,7 +927,7 @@ fn trace_at_depth(
                 .with_head_foot(tree.meta().head_comment().to_vec(), Vec::new());
             Some((
                 OwnedValue::Array(values.into_iter().collect()),
-                CommentTree::Array(meta, trees),
+                CommentTree::array(meta, trees),
             ))
         }
         // #6102: `pivot` moves each cell into a new sequence or mapping, with its comment, style,
@@ -966,7 +967,7 @@ fn trace_at_depth(
             };
             Some((
                 OwnedValue::Array(values.into_iter().collect()),
-                CommentTree::Array(meta, trees),
+                CommentTree::array(meta, trees),
             ))
         }
         Expr::Arithmetic {
@@ -1018,7 +1019,7 @@ fn trace_at_depth(
 /// The tree of a node `pivot` creates to pad a short row (#6102): a `null` with an empty spelling,
 /// which yq prints as nothing (`-` with no value, `key:` bare) and `-o=json` as `null`.
 fn pivot_padding() -> CommentTree {
-    CommentTree::Leaf(NodeMeta::empty().with_spelling(Some(String::new())))
+    CommentTree::leaf(NodeMeta::empty().with_spelling(Some(String::new())))
 }
 
 /// `pivot` replayed from the cells' own nodes (#6102): every cell keeps its comment, style, anchor
@@ -1039,7 +1040,7 @@ fn pivot_pair(expr: &Expr, input: &ResultWithComments) -> Option<ResultWithComme
             pivot_padding()
         }
     };
-    let column = |cells: Vec<CommentTree>| CommentTree::Array(NodeMeta::empty(), cells);
+    let column = |cells: Vec<CommentTree>| CommentTree::array(NodeMeta::empty(), cells);
     match &result {
         OwnedValue::Array(columns) => {
             let mut trees = Vec::with_capacity(columns.len());
@@ -1054,7 +1055,7 @@ fn pivot_pair(expr: &Expr, input: &ResultWithComments) -> Option<ResultWithComme
                     .collect();
                 trees.push(column(cells));
             }
-            Some((result, CommentTree::Array(NodeMeta::empty(), trees)))
+            Some((result, CommentTree::array(NodeMeta::empty(), trees)))
         }
         OwnedValue::Object(columns) => {
             let mut fields = IndexMap::new();
@@ -1074,7 +1075,7 @@ fn pivot_pair(expr: &Expr, input: &ResultWithComments) -> Option<ResultWithComme
                     .collect();
                 fields.insert(key.clone(), column(cells));
             }
-            Some((result, CommentTree::Object(NodeMeta::empty(), fields, keys)))
+            Some((result, CommentTree::object(NodeMeta::empty(), fields, keys)))
         }
         _ => None,
     }
@@ -1135,7 +1136,7 @@ fn renamed_tree(
                     keys.insert(new_key.clone(), meta);
                 }
             }
-            Some(CommentTree::Object(tree.meta().clone(), fields, keys))
+            Some(CommentTree::object(tree.meta().clone(), fields, keys))
         }
         (OwnedValue::Array(before), OwnedValue::Array(after)) => {
             if before.len() != after.len() {
@@ -1151,7 +1152,7 @@ fn renamed_tree(
                     depth + 1,
                 )?);
             }
-            Some(CommentTree::Array(tree.meta().clone(), items))
+            Some(CommentTree::array(tree.meta().clone(), items))
         }
         (old, new) => (old == new).then(|| tree.clone()),
     }
@@ -1215,7 +1216,7 @@ fn pick_pair(keys: &Expr, input: &ResultWithComments) -> Option<ResultWithCommen
             }
             Some((
                 OwnedValue::Object(picked.into()),
-                CommentTree::Object(tree.meta().clone(), fields, key_metas),
+                CommentTree::object(tree.meta().clone(), fields, key_metas),
             ))
         }
         OwnedValue::Array(items) => {
@@ -1236,7 +1237,7 @@ fn pick_pair(keys: &Expr, input: &ResultWithComments) -> Option<ResultWithCommen
             }
             Some((
                 OwnedValue::Array(picked.into_iter().collect()),
-                CommentTree::Array(tree.meta().clone(), children),
+                CommentTree::array(tree.meta().clone(), children),
             ))
         }
         _ => None,
@@ -1261,7 +1262,7 @@ fn merge_tree(
                 .map(|i| lt.at_index(i).clone())
                 .chain((0..r.len()).map(|i| rt.at_index(i).clone()))
                 .collect();
-            return Some(CommentTree::Array(lt.meta().clone(), children));
+            return Some(CommentTree::array(lt.meta().clone(), children));
         }
     }
     if let (OwnedValue::Object(l), OwnedValue::Object(r), OwnedValue::Object(out)) =
@@ -1301,11 +1302,11 @@ fn merge_tree(
                 keys.insert(key.clone(), meta);
             }
         }
-        Some(CommentTree::Object(lt.meta().clone(), fields, keys))
+        Some(CommentTree::object(lt.meta().clone(), fields, keys))
     } else if !matches!(lv, OwnedValue::Array(_) | OwnedValue::Object(_))
         && !matches!(rv, OwnedValue::Array(_) | OwnedValue::Object(_))
     {
-        Some(CommentTree::Leaf(lt.meta().clone()))
+        Some(CommentTree::leaf(lt.meta().clone()))
     } else {
         // Replaced arrays take the RHS children, unlike recursive mapping
         // merges. Kind changes likewise have no left child provenance.
@@ -1350,17 +1351,17 @@ mod tests {
                 .into(),
             )
         };
-        let styled = CommentTree::Object(
+        let styled = CommentTree::object(
             NodeMeta::empty(),
             IndexMap::from([(
                 "key".to_string(),
-                CommentTree::Leaf(NodeMeta::from_comment_and_style(None, "single")),
+                CommentTree::leaf(NodeMeta::from_comment_and_style(None, "single")),
             )]),
             IndexMap::new(),
         );
         let input = (
             OwnedValue::Array([entry(1), entry(2)].into_iter().collect()),
-            CommentTree::Array(NodeMeta::empty(), vec![styled, CommentTree::empty()]),
+            CommentTree::array(NodeMeta::empty(), vec![styled, CommentTree::empty()]),
         );
         let (value, tree) = trace(&Expr::Builtin(Builtin::FromEntries), &input).unwrap();
         assert_eq!(
