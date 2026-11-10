@@ -2683,7 +2683,7 @@ that reaches the root variable through anything but identities still empties the
 What stays
 different, all of it yq's node identity ([#2643](https://github.com/rust-works/succinctly/issues/2643)):
 a variable bound below the root (`.a as $y | del($y)` deletes `.a` in yq, refuses here),
-`. as $y | del($y.a)` (yq keeps the document, succinctly deletes `.a`), and the mixed orders
+the mixed orders
 `del(., $y)` / `del(.a, $y)` (yq keeps the document, succinctly empties it): a bound variable
 is tracked here, so it does not end the loop the way yq's parentless node does.
 
@@ -5214,7 +5214,7 @@ that document), which the value model could not answer at all: they are cursor-o
 never derivable from an accumulated path.
 
 Read-side residues remain, all of them predating #2072 and none caused by the
-binding carrying an origin; the write side is unchanged and still refuse-only (below).
+binding carrying an origin; the write side is #2643's (below).
 
 **A variable bound from an absent key — resolved (#2650).**
 Real yq's `as` binds a *candidate list*, and a key lookup that finds nothing contributes no candidate, so the variable is never bound while the same key read without a binding is `null` at a real position.
@@ -5260,26 +5260,39 @@ rule 4(a)). What *is* a gap is the flow style: `.c` alone prints
 `[1, 2]`, and through the binding the alias's origin resolves to the alias node, whose own
 style mark is not the anchor node's, so the value is re-emitted in block style.
 
-**Writes through a variable are refuse-only.** Real yq's `as` copies the node into the
-variable, so a write through `$x` mutates the copy and the document is left alone; the
-copy is observable only if the same expression reads `$x` back. succinctly refuses the
-path expression outright. Captured on `a: [1, 2, 3]`:
+**A write through a variable changes the bound copy ([#2643](https://github.com/rust-works/succinctly/issues/2643)).**
+Real yq's `as` copies the node into the variable (`variableLoopSingleChild` stores `candidate.Copy()`).
+A write through `$x` (`$x.b = 5`, `$x[0] |= f`, `$x.b += 1`, `del($x.b)`) therefore changes the copy and leaves the document alone.
+Every later read of `$x` sees the change, the write stage answers its input, and the right side of `=` and `op=` is evaluated against that input and not against `$x`.
+It was refused (`Invalid path expression`, exit 1) until #2643, apart from an identity-bound `$x` (`. as $x | $x.a.b = 5`), which wrote the document.
+Captured on `a: [1, 2, 3]`:
 
 | filter                          | real yq (exit 0) | succinctly      |
 |---------------------------------|------------------|-----------------|
-| `.a as $x \| $x[0] = 9`         | `a: [1, 2, 3]`   | refuses, exit 1 |
-| `.a as $x \| del($x[0])`        | `a: [1, 2, 3]`   | refuses, exit 1 |
-| `.a as $x \| $x[0] \|= 9`       | `a: [1, 2, 3]`   | refuses, exit 1 |
-| `.a as $x \| $x[0] \|= 9 \| $x` | `[9, 2, 3]`      | refuses, exit 1 |
+| `.a as $x \| $x[0] = 9`         | `a: [1, 2, 3]`   | `a: [1, 2, 3]`  |
+| `.a as $x \| del($x[0])`        | `a: [1, 2, 3]`   | `a: [1, 2, 3]`  |
+| `.a as $x \| $x[0] \|= 9`       | `a: [1, 2, 3]`   | `a: [1, 2, 3]`  |
+| `.a as $x \| $x[0] \|= 9 \| $x` | `[9, 2, 3]`      | `[9, 2, 3]`     |
 
-succinctly's refusal is `Error: Invalid path expression near attempt to access element 0
-of [1,2,3]` in every row.
+The parser does it in yq mode (`yq_var_write_rebind` in [src/jq/parser.rs](../../../src/jq/parser.rs)): the first stage of an `as` body that writes a path rooted at `$x` becomes a rebinding of `$x` to the written copy, and a later such stage is rewritten the same way, so both evaluators and every output route see one shape.
+`succinctly jq` matches jq 1.7.1 (`Invalid path expression ...`, exit 5) and is not affected.
 
-Refuse-only is the permitted direction (ADR-0018 rule 4): the document is untouched under
-`-i` as well. #2072 deliberately did not change it — jq's `path()` resolver honours only
-`BoundVar::tracked` and never the origin, so nothing a cursor-emitting `$x` does can turn
-`$x[0] = 9` into a document write. `succinctly jq` matches jq 1.7.1 here exactly (both
-raise `Invalid path expression …`, exit 5) and is not affected.
+Still different, each in yq v4.53.3 against `succinctly yq`:
+
+- **A bare `del($x)`.**
+  yq deletes the node `$x` was bound to from its live parent, by key or index (`.a as $y | del($y)` is `{"c":{"b":1}}`, `.a as $y | .c | del($y)` is `{"b":1}`, `.a.b as $y | .a | del($y)` is `{}`), and keeps the document when `$y` is the root.
+  `succinctly yq` refuses a variable bound below the root with `Invalid path expression`.
+- **A variable-rooted path inside the left side of a write.**
+  `(.a as $y | .c | $y.b) = 5`, `(.a as $y | .a | $y.b) = 5` and `del(.a as $y | .c | $y)` keep the document, or delete `.a`, in yq, and refuse here.
+  `(. as $y | $y.a) = 5` keeps the document in yq and writes `.a` here.
+- **A write stage that is not a stage of the `as` body's own pipe.**
+  `.a as $y | ($y.b = 5), $y` (a write inside a comma) is the document in yq and refuses here.
+- **A stale index.**
+  `.a[1] as $y | del(.a[0]) | del($y)` deletes by the live parent and the old index in yq, and refuses here.
+- **`.[] as $y | del($y)`.**
+  Both results are the one mutated root in yq (`{}` twice), where each binding here has its own copy.
+- **The presentation of the copy.**
+  A written copy of a flow mapping prints in block style (`.a as $y | $y.b = 5 | $y` over `a: {b: 1}` is `{b: 5}` in yq and `b: 5` here), as `.a as $y | $y | .b = 5` already did.
 
 ### Metadata assignment (`PATH <slot> = value`): what `succinctly yq` refuses or drops (#798 PR1)
 

@@ -108390,11 +108390,10 @@ fn test_navigated_bind_positional_controls_refuse_3134() -> Result<()> {
     Ok(())
 }
 
-/// yq mode is untouched by #3037: real yq v4.53.3 treats `($y.b) = 9`
-/// through a variable as a no-op and prints the document unchanged
-/// (`b: 1`), at the marker's own node and at a sibling alike, where
-/// succinctly refuses loudly. The promotion is jq-only so that refusal
-/// never becomes a write yq does not perform.
+/// yq mode is untouched by #3037: real yq v4.53.3 treats `($y.b) = 9` through a variable as a
+/// write to the bound copy and prints the stage's input unchanged (`b: 1`), at the marker's
+/// own node and at a sibling alike. The promotion is jq-only so that jq's refusal never becomes a
+/// write yq does not perform; yq mode gets yq's own answer from #2643, which refused it before.
 #[test]
 fn test_navigated_bind_yq_mode_unchanged_3037() -> Result<()> {
     let (output, code) = spawn_with_signal_retry(
@@ -108407,9 +108406,9 @@ fn test_navigated_bind_yq_mode_unchanged_3037() -> Result<()> {
     )?;
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
-    assert_eq!(code, 1, "#3037 yq: got stdout={stdout:?} stderr={stderr:?}");
-    assert!(
-        stderr.contains(r#"Invalid path expression near attempt to access element "b" of {"b":1}"#),
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("b: 1\n", 0),
         "#3037 yq: stderr={stderr:?}"
     );
     Ok(())
@@ -109501,15 +109500,12 @@ fn test_owned_embed_rebuilt_copies_still_refuse_2889() -> Result<()> {
 }
 
 /// yq mode is untouched by #2889, the same jq-only gate #3037's promotion
-/// takes: real yq's node model is #2643's business, and turning one of its
-/// refusals into a write with no oracle behind it is the corrupting
-/// direction (ADR-0018 -- the mode decides, never the input format).
+/// takes (ADR-0018 -- the mode decides, never the input format).
 ///
-/// Every row below was captured from the pre-#2889 binary and is
-/// reproduced byte for byte after it. The writes still refuse loudly; the
-/// `path()` reads -- which need `--jq-extensions`, since `path(f)` is not
-/// part of yq's own syntax (#1512) -- still answer nothing at all, which is
-/// exactly what they did before.
+/// A write through `$x` was refused here until #2643 gave it yq's meaning: yq's `as` binds a
+/// copy, so the write changes the copy and the stage answers its input (`a: 1`). The `path()`
+/// reads -- which need `--jq-extensions`, since `path(f)` is not part of yq's own syntax (#1512)
+/// -- still answer nothing at all, which is exactly what they did before #2889.
 #[test]
 fn test_owned_embed_yq_mode_unchanged_2889() -> Result<()> {
     let yq = |extra: &[&str], filter: &str| -> Result<(String, String, i32)> {
@@ -109539,13 +109535,8 @@ fn test_owned_embed_yq_mode_unchanged_2889() -> Result<()> {
     ] {
         let (stdout, stderr, code) = yq(&[], filter)?;
         assert_eq!(
-            code, 1,
-            "#2889 yq: `{filter}`: got stdout={stdout:?} stderr={stderr:?}"
-        );
-        assert!(
-            stderr.contains(
-                r#"Invalid path expression near attempt to access element "a" of {"a":1}"#
-            ),
+            (stdout.as_str(), code),
+            ("a: 1\n", 0),
             "#2889 yq: `{filter}`: stderr={stderr:?}"
         );
     }

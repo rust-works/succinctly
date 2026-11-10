@@ -32484,17 +32484,15 @@ fn test_yq_del_after_untracked_branch_navigation_1868() -> Result<()> {
     Ok(())
 }
 
-/// #1868: only a scalar literal is pruned. A bound variable's node (the owned routes inline one as
-/// a literal array or object), a computed key, `..` and a fan-out over the failing step keep the
-/// refusal, since yq's variables hold the document's own nodes and a write through them reaches it
-/// (#2072, #3037); `(.a, 1 | .[$k]) = 5` and `(.a, 1 | ..) = 5` are recorded residuals in
+/// #1868: only a scalar literal is pruned. A computed key, `..` and a fan-out over the failing step
+/// keep the refusal; a write through a bound variable is answered since #2643, as it changes the
+/// bound copy (#2072, #3037); `(.a, 1 | .[$k]) = 5` and `(.a, 1 | ..) = 5` are recorded residuals in
 /// `docs/compliance/yq/limitations.md`. A step into a *computed* value (`(1 | tostring) | .[0]`, a
 /// constructed `[1] | .[0]`) is answered since #4360: that member finds nothing to write through,
 /// so only `.a` is written, as yq does (rows captured from yq v4.53.3).
 #[test]
 fn test_yq_untracked_branch_navigation_still_refuses_what_is_not_a_constant_1868() -> Result<()> {
     for filter in [
-        ".a as $y | .a | ($y.b) = 9",
         "del(.a, [1] | .[])",
         "\"x\" as $k | (.a, 1 | .[$k]) = 5",
         "(.a, 1 | ..) = 5",
@@ -32507,6 +32505,8 @@ fn test_yq_untracked_branch_navigation_still_refuses_what_is_not_a_constant_1868
     for (filter, expected) in [
         ("(.a, (1 | tostring) | .[0]) = 5", "{\"a\":5}\n"),
         ("(.a, [1] | .[0]) = 5", "{\"a\":5}\n"),
+        // A write through a bound variable changes the bound copy (#2643), as in yq.
+        (".a as $y | .a | ($y.b) = 9", "{\"b\":1}\n"),
     ] {
         let (out, code) = run_yq_stdin(filter, "a:\n  b: 1\n", &["-o=json", "-I=0"])?;
         assert_eq!((code, out.as_str()), (0, expected), "{filter}");
@@ -58950,11 +58950,9 @@ fn test_bound_variable_eval_all_rows_2072() -> Result<()> {
 }
 
 /// #2072: writing *through* a bound variable (`$x[0] = 9`, `del($x[0])`,
-/// `$x[0] |= 9 | $x`) must stay refused in succinctly, whatever step 3 does
-/// for the read side — the write side is out of scope entirely (ADR-0018,
-/// refuse-only), because nothing in the path resolver reads a `TrackedVar`'s
-/// origin, so a fix that made `$x` *read* like the node it was bound from
-/// must not accidentally let a write reach the document through it.
+/// `$x[0] |= 9 | $x`) must never reach the document through a read-side fix for
+/// `$x` (nothing in the path resolver reads a `TrackedVar`'s origin). It was
+/// refused until #2643 gave the write its meaning.
 ///
 /// Real yq does not refuse: it *copies* the bound node, so a write through
 /// `$x` mutates the copy and the original document survives unchanged for
@@ -58968,37 +58966,35 @@ fn test_bound_variable_eval_all_rows_2072() -> Result<()> {
 /// $ yq -i '.a as $x | $x[0] |= 9 | $x' scratch.yaml      # scratch.yaml: [9, 2, 3]
 /// ```
 ///
-/// succinctly refuses all three today with `Invalid path expression …` and
-/// exit code **1** (not 5 — that is jq mode's convention; yq mode's write
-/// refusals exit 1, matching `test_foreach_register_reentry_is_jq_mode_only_on_the_write_side_2161`
-/// and the other `Invalid path expression` yq-mode tests in this file).
+/// succinctly answers all three as yq does since #2643 (it refused them with `Invalid path
+/// expression …` and exit code 1 before): the write is made on the bound copy, the first two leave
+/// the file alone, and the third answers the copy.
 #[test]
-fn test_write_through_bound_variable_stays_refused_2072() -> Result<()> {
-    for filter in [
-        ".a as $x | $x[0] = 9",
-        ".a as $x | del($x[0])",
-        ".a as $x | $x[0] |= 9 | $x",
+fn test_write_through_bound_variable_changes_only_the_copy_2072() -> Result<()> {
+    for (filter, stdout_json, file_after) in [
+        (
+            ".a as $x | $x[0] = 9",
+            "{\"a\":[1,2,3]}\n",
+            BOUND_VAR_ARRAY_DOC_2072,
+        ),
+        (
+            ".a as $x | del($x[0])",
+            "{\"a\":[1,2,3]}\n",
+            BOUND_VAR_ARRAY_DOC_2072,
+        ),
+        (".a as $x | $x[0] |= 9 | $x", "[9,2,3]\n", "- 9\n- 2\n- 3\n"),
     ] {
         let (stdout, stderr, code) =
             run_yq_stdin_with_stderr(filter, BOUND_VAR_ARRAY_DOC_2072, &["-o", "json", "-I0"])?;
         assert_eq!(
-            code, 1,
+            code, 0,
             "`{filter}` -- stdout: {stdout:?} stderr: {stderr:?}"
         );
-        assert!(
-            stdout.trim().is_empty(),
-            "`{filter}` must not write: stdout: {stdout:?}"
-        );
-        assert!(
-            stderr.contains("Invalid path expression"),
-            "`{filter}` -- stderr: {stderr:?}"
-        );
+        assert_eq!(stdout, stdout_json, "`{filter}`");
 
-        // `-i` on a scratch copy: the refusal must leave the file
-        // byte-identical, not merely leave stdout empty.
+        // `-i` on a scratch copy writes the pipeline's own output.
         let mut scratch = NamedTempFile::new()?;
         write!(scratch, "{BOUND_VAR_ARRAY_DOC_2072}")?;
-        let before = std::fs::read(scratch.path())?;
 
         let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
             .arg("yq")
@@ -59007,13 +59003,10 @@ fn test_write_through_bound_variable_stays_refused_2072() -> Result<()> {
             .arg(scratch.path())
             .output()?;
         let inplace_code = exit_code_or_signal_death(output.status, &output.stderr)?;
-        assert_eq!(inplace_code, 1, "`{filter}` -i -- {output:?}");
+        assert_eq!(inplace_code, 0, "`{filter}` -i -- {output:?}");
 
-        let after = std::fs::read(scratch.path())?;
-        assert_eq!(
-            before, after,
-            "`{filter}` -i must leave the file byte-identical"
-        );
+        let after = std::fs::read_to_string(scratch.path())?;
+        assert_eq!(after, file_after, "`{filter}` -i");
     }
 
     Ok(())
