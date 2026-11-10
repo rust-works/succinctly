@@ -12,11 +12,10 @@ to it and it records nothing that is not recorded elsewhere (#5847).
 
 These still track open work.
 
-| Plan                                                   | Status      | Module                            | Description                                        |
-|--------------------------------------------------------|-------------|-----------------------------------|----------------------------------------------------|
-| [cspoppy.md](cspoppy.md)                               | Implemented | `src/trees/bp.rs`, `src/bits/`    | Combined sampling, BP select; F1 (#596) still open |
-| [yq-memory-optimization.md](yq-memory-optimization.md) | Partial     | `yq_runner.rs`, `eval_generic.rs` | yq memory plan; M2/M3 done, M1/M4-M6 open (#5865)  |
-| [yq-remaining.md](yq-remaining.md)                     | Open        | `src/yaml/`, `yq_runner.rs`       | yq operators, encoders and flags not yet supported |
+| Plan                               | Status      | Module                         | Description                                        |
+|------------------------------------|-------------|--------------------------------|----------------------------------------------------|
+| [cspoppy.md](cspoppy.md)           | Implemented | `src/trees/bp.rs`, `src/bits/` | Combined sampling, BP select; F1 (#596) still open |
+| [yq-remaining.md](yq-remaining.md) | Open        | `src/yaml/`, `yq_runner.rs`    | yq operators, encoders and flags not yet supported |
 
 ## Archived Plans
 
@@ -47,6 +46,7 @@ the alternatives that were tried, and measurements that may not be recorded anyw
 | [yaml-index-post-compactrank.md](yaml-index-post-compactrank.md)               | Superseded  | `src/yaml/index.rs`                | Index analysis from the CompactRank era                        |
 | [compact-index-investigation.md](compact-index-investigation.md)               | Rejected    | `src/yaml/index.rs`                | Elias-Fano for position arrays (#58)                           |
 | [jq-remaining.md](jq-remaining.md)                                             | Implemented | `src/jq/`, CLI                     | jq CLI and module-system items, all matching jq 1.7.1 now      |
+| [yq-memory-optimization.md](yq-memory-optimization.md)                         | Snapshot    | `yq_runner.rs`, `output.rs`        | yq memory phases M1-M6 re-measured and decided (#5865)         |
 
 ## Plan Status Legend
 
