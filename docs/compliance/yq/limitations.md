@@ -1204,6 +1204,7 @@ Four things differ.
   `.x[] | (5, $v)` is `5 5 5 7` in yq and `5 5 5 7 7 7` here: the walk that evaluates a union over the list reads a variable branch per node.
 - **A prefix that answers one node.**
   `.x | $v` and `. | $v` are left alone, since one node reaches the variable either way, which keeps the bound node's `line` and the path context of `del(. | $y)`.
+  So is a write (`.a as $y | $y.b = 5 | $y`), which answers its input once and rebinds `$y` for the stages after it ([#2643](https://github.com/rust-works/succinctly/issues/2643)).
 - **The bound node's position.**
   `.n as $v | .x[] | $v | line` is `2` (and `column` is `4`) in yq and `0` here: the stage that runs the prefix builds a new value, so the pipe leaves the route that resolves a bound node's position from the document.
   Before this change the same filter answered `2` three times, the right value for the wrong count.

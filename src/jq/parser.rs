@@ -1718,11 +1718,20 @@ fn yq_stage_head_var(stage: &Expr) -> bool {
     }
 }
 
-/// Whether `stage` answers exactly one node per input: `.`, a field, an index, a variable, and
-/// parentheses or pipes of those.
+/// Whether `stage` answers exactly one node per input: `.`, a field, an index, a variable, a write,
+/// and parentheses or pipes of those.
 fn yq_stage_single_valued(stage: &Expr) -> bool {
     match stage {
         Expr::Identity | Expr::Field(_) | Expr::Index { .. } | Expr::Var(_) => true,
+        // A write answers its input once, and rebinds the variable it wrote through for the stages
+        // after it (#2643: `.a as $y | $y.b = 5 | $y` reads the changed copy), which a discarded
+        // prefix would hide from them.
+        Expr::Assign { .. }
+        | Expr::Update { .. }
+        | Expr::CompoundAssign { .. }
+        | Expr::AlternativeAssign { .. }
+        | Expr::MetaAssign { .. }
+        | Expr::Builtin(Builtin::Del(_)) => true,
         Expr::Paren(inner) => yq_stage_single_valued(inner),
         Expr::Pipe(stages) => stages.iter().all(yq_stage_single_valued),
         _ => false,
