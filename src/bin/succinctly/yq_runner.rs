@@ -2708,6 +2708,7 @@ fn needs_dom_fallback(
     output_format == OutputFormat::Yaml
         && ((sort_keys && index.has_aliases())
             || sorts_a_mapping(expr, index, bytes)
+            || reorders_a_flow_sequence(expr, index, bytes)
             || (is_array_of_nodes(expr) && index.has_aliases()))
 }
 
@@ -2729,6 +2730,96 @@ fn reorders_a_sequence(expr: &Expr) -> bool {
                 | Builtin::UniqueBy(_)
         )
     )
+}
+
+/// `expr` as `NAV | REORDER` for a static navigation `NAV` (none for the document itself) and a
+/// `sort`, `sort_by`, `reverse`, `unique` or `unique_by`: the navigation (`None` at the root) and
+/// the reorder; `None` for any other shape (#6877).
+fn split_reorder_read(expr: &Expr) -> Option<(Option<Expr>, Expr)> {
+    let mut stages = Vec::new();
+    flatten_plain_pipe(expr, &mut stages);
+    let (last, nav) = stages.split_last()?;
+    let mut last = *last;
+    while let Expr::Paren(inner) = last {
+        last = inner;
+    }
+    if !reorders_a_sequence(last) {
+        return None;
+    }
+    // `. | sort` is `sort`: an identity stage in front of the navigation moves nothing.
+    let nav: Vec<&Expr> = nav
+        .iter()
+        .copied()
+        .filter(|stage| !matches!(stage, Expr::Identity))
+        .collect();
+    if nav.is_empty() {
+        return Some((None, last.clone()));
+    }
+    nav.iter()
+        .all(|stage| static_nav_steps(stage).is_some_and(|steps| !steps.is_empty()))
+        .then(|| (Some(pipe_of(&nav)), last.clone()))
+}
+
+/// The node `nav` reaches from `cursor` (`cursor` itself for none), when it is a flow-style
+/// sequence: the one definition of "the target of a reorder that keeps its presentation" that
+/// [`reorder_read_as_write`] and [`reorders_a_flow_sequence`] share (#6877).
+fn flow_sequence_target<'a, W: AsRef<[u64]> + Clone>(
+    nav: Option<&Expr>,
+    cursor: YamlCursor<'a, W>,
+) -> Option<YamlCursor<'a, W>> {
+    let target = match nav {
+        None => cursor,
+        Some(nav) => match eval_with_cursor_using::<YqSemantics, _>(nav, cursor) {
+            GenericResult::OneCursor(target) => target,
+            _ => return None,
+        },
+    };
+    (matches!(target.value(), YamlValue::Sequence(_)) && target.style() == "flow").then_some(target)
+}
+
+/// The write form of a read that reorders a flow-style sequence (#6877): `NAV | sort` is
+/// `(NAV |= sort) | NAV`, which keeps what yq keeps of the node it reorders in place (its flow
+/// style and its comments) because the write replays the pristine tree. `None` unless `expr` is
+/// such a read and the node it reaches is a flow-style sequence: a block-style one stays on the
+/// streamers, which write it as yq does.
+fn reorder_read_as_write<W: AsRef<[u64]> + Clone>(
+    cursor: YamlCursor<'_, W>,
+    expr: &Expr,
+) -> Option<Expr> {
+    let (nav, reorder) = split_reorder_read(expr)?;
+    flow_sequence_target(nav.as_ref(), cursor)?;
+    let path = nav.unwrap_or(Expr::Identity);
+    Some(Expr::Pipe(
+        vec![
+            Expr::Update {
+                path: Box::new(path.clone()),
+                filter: Box::new(reorder),
+            },
+            path,
+        ]
+        .into(),
+    ))
+}
+
+/// Whether `expr` is `NAV | REORDER` ([`split_reorder_read`]) over a flow-style sequence in some
+/// document of `bytes`: the YAML output of it takes the DOM route, which answers it through
+/// [`reorder_read_as_write`] with the sequence's style and comments (#6877). The streamers write
+/// the reordered items without them.
+fn reorders_a_flow_sequence(expr: &Expr, index: &YamlIndex, bytes: &[u8]) -> bool {
+    let Some((nav, _)) = split_reorder_read(expr) else {
+        return false;
+    };
+    let root = index.root(bytes);
+    let YamlValue::Sequence(mut docs) = root.value() else {
+        return false;
+    };
+    while let Some((doc, rest)) = docs.uncons_cursor() {
+        if flow_sequence_target(nav.as_ref(), doc).is_some() {
+            return true;
+        }
+        docs = rest;
+    }
+    false
 }
 
 /// Whether `expr` is a `sort`/`sort_by` of a mapping in some document of `bytes`, which the M2
@@ -7934,6 +8025,20 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
             strip_style,
             sort_keys,
         );
+    }
+    // #6877: a reorder of a flow-style sequence, answered through its write form so the node keeps
+    // the flow style and the comments yq keeps when it reorders it in place.
+    if need_comments {
+        if let Some(written) = reorder_read_as_write(cursor, expr) {
+            return evaluate_yaml_cursor(
+                cursor,
+                &written,
+                sink,
+                need_comments,
+                strip_style,
+                sort_keys,
+            );
+        }
     }
     // The key nodes of a mapping behind a static navigation (`.a | map(key)`, #5450): the listing
     // on the navigated node, run as the document it is, so each key keeps its presentation.
