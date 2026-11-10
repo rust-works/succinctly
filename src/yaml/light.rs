@@ -8222,9 +8222,61 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
 
     #[inline]
     fn head_comment(&self) -> Vec<String> {
-        let mut lines: Vec<String> = YamlCursor::head_comment(self)
-            .map(ToString::to_string)
-            .collect();
+        // #6772: yq's head comment is the text above the node with its blank lines kept (an interior
+        // one, and the ones between the block and a node at column 0), which the raw lines carry as
+        // empty entries; and a first document's comment above a leading `---` is one text with the
+        // comment under it.
+        let header_end = self.header_end();
+        let in_header = header_end > 0
+            && (self.is_first_document_content()
+                || matches!(
+                    self.index.get_head_comments(self.bp_pos).first(),
+                    Some(&(first_start, _)) if (first_start as usize) < header_end
+                ));
+        let strip = |line: String| match line.strip_prefix("# ") {
+            Some(rest) => rest.to_string(),
+            None => line,
+        };
+        // The block belongs to the document: the first key the comment under the marker was
+        // indexed on has none of its own (`.a | key | head_comment` is `""` in yq).
+        let header_lines: Option<Vec<String>> =
+            if in_header && header_has_marker(&self.text[..header_end]) {
+                if self.is_first_document_content() {
+                    header_head_lines(
+                        &self.text[..header_end],
+                        self.index.synthesized_empty(),
+                        true,
+                    )
+                    .map(|lines| lines.into_iter().map(strip).collect())
+                } else {
+                    Some(Vec::new())
+                }
+            } else {
+                None
+            };
+        let from_header = header_lines.is_some();
+        let mut lines: Vec<String> = match header_lines {
+            Some(lines) => lines,
+            None => <Self as DocumentCursor>::head_comment_raw(self)
+                .into_iter()
+                .map(strip)
+                .collect(),
+        };
+        // The blank entries after the block stand for blank lines between it and the node. A
+        // floated comment (`- # c` before the key, #1079) has other lines there (`!!str`, the next
+        // dash), which are not blanks.
+        if let (false, Some(&(_, last_end)), Some(pos)) = (
+            from_header,
+            self.index.get_head_comments(self.bp_pos).last(),
+            self.text_position(),
+        ) {
+            let between = self.text.get(last_end as usize..pos).unwrap_or_default();
+            if between.iter().any(|b| !b.is_ascii_whitespace()) {
+                while lines.last().is_some_and(String::is_empty) {
+                    lines.pop();
+                }
+            }
+        }
         // #4268: a scalar item's `- # c` comment is the scalar's head comment in yq, after any
         // standalone block above the dash. A head that is itself a floated dash comment of an
         // absent item before this one (`- # c1` / `- # c2` / `  x`, #1079) is yq's whole answer.
@@ -8251,7 +8303,25 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
                     .iter()
                     .filter(|&&(at, _)| (at as usize) < start)
                     .count();
-                lines.insert(before.min(lines.len()), comment.to_string());
+                // `lines` holds blank entries between the comment lines, which `before` (a count of
+                // comment ranges) does not: the dash comment goes after that many comment lines.
+                let mut at = 0;
+                let mut seen = 0;
+                if before > 0 {
+                    for (i, line) in lines.iter().enumerate() {
+                        if !line.is_empty() {
+                            seen += 1;
+                            if seen == before {
+                                at = i + 1;
+                                break;
+                            }
+                        }
+                    }
+                    if seen < before {
+                        at = lines.len();
+                    }
+                }
+                lines.insert(at, comment.to_string());
             }
         }
         lines
@@ -8283,9 +8353,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
             // document's all the same.
             || (header_end > 0 && self.is_first_document_content());
         if in_header {
-            if let Some(lines) =
-                header_head_lines(&self.text[..header_end], self.index.synthesized_empty())
-            {
+            if let Some(lines) = header_head_lines(
+                &self.text[..header_end],
+                self.index.synthesized_empty(),
+                false,
+            ) {
                 return lines;
             }
         }
@@ -10070,15 +10142,22 @@ fn header_is_rebuilt_from_text(header: &[u8], synthesized: bool) -> bool {
         || (!synthesized && header_keeps_empty_lines(header))
 }
 
+/// Whether a first-document header holds a `---` line, which `head_comment` reads past (#6772).
+fn header_has_marker(header: &[u8]) -> bool {
+    header
+        .split(|&b| is_line_break(b))
+        .any(|line| line.starts_with(b"---"))
+}
+
 /// The comment lines of a first-document header (`header`: [`yq_header_len`]'s bytes) as yq prints them when a line
 /// break in it is `\r\n` or a line of it holds only blanks, or `None` for a header with neither: every comment line
 /// keeps its `\r` where its break is CRLF, and a blank line with a CRLF break is `# \r` -- the `\r` is comment text to
 /// go-yaml -- where one with a bare `\n` stays a blank line (#5053). A line of only blanks is `# ` plus the line
 /// (#6401), which the comment index does not hold, and so are blank lines a header starts with or repeats (#5008),
 /// unless `synthesized`: the empty document the CLI makes up has a line break that is not the input's. The `---` and
-/// `%` lines are the header's own, not comment lines.
-fn header_head_lines(header: &[u8], synthesized: bool) -> Option<Vec<String>> {
-    if !header_is_rebuilt_from_text(header, synthesized) {
+/// `%` lines are the header's own, not comment lines. `force` rebuilds a header that needs no rebuilding.
+fn header_head_lines(header: &[u8], synthesized: bool, force: bool) -> Option<Vec<String>> {
+    if !force && !header_is_rebuilt_from_text(header, synthesized) {
         return None;
     }
     let mut out = Vec::new();
@@ -19297,15 +19376,15 @@ plain: hello
             assert!(!header_keeps_empty_lines(b"\n---\n"));
             assert!(!header_keeps_empty_lines(b"\n%YAML 1.2\n"));
             assert_eq!(
-                header_head_lines(b"\n\n# c\n", false).unwrap(),
+                header_head_lines(b"\n\n# c\n", false, false).unwrap(),
                 ["", "", "# c"]
             );
             assert_eq!(
-                header_head_lines(b"# h\n\n\n# g\n", false).unwrap(),
+                header_head_lines(b"# h\n\n\n# g\n", false, false).unwrap(),
                 ["# h", "", "", "# g"]
             );
             // The empty document the CLI makes up has a break that is not the input's.
-            assert!(header_head_lines(b"\n", true).is_none());
+            assert!(header_head_lines(b"\n", true, false).is_none());
         }
 
         #[test]
@@ -19322,7 +19401,7 @@ plain: hello
             assert!(!is_blank_line(b""));
             assert!(!is_blank_line(b" #"));
             assert_eq!(
-                header_head_lines(b"# c\r\n \r\n\r\n", false).unwrap(),
+                header_head_lines(b"# c\r\n \r\n\r\n", false, false).unwrap(),
                 ["# c\r", "#  \r", "# \r"]
             );
         }
