@@ -27,8 +27,8 @@ use succinctly::jq::stream::StreamFailure;
 use succinctly::jq::{
     self, alias_identity, assert_value_tree_depth, is_alias_sensitive_assign,
     nesting_depth_exceeded_message, nonfinite_display_string, nonfinite_literal_display,
-    sync_aliased_paths, AssignOp, Builtin, DefScope, EvalError, Expr, Literal, MetaSlot,
-    NumberRepr, ObjectKey, ObjectMap, OwnedValue, QueryResult, YqSemantics,
+    sync_aliased_paths, sync_merged_members, AssignOp, Builtin, DefScope, EvalError, Expr, Literal,
+    MetaSlot, NumberRepr, ObjectKey, ObjectMap, OwnedValue, QueryResult, YqSemantics,
 };
 use succinctly::json::light::JsonCursor;
 use succinctly::json::validate;
@@ -8109,7 +8109,11 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
             let Some(pristine) = sink.materialize(DiagStyle::Yq, pristine, &no_location()) else {
                 return Ok(Vec::new());
             };
-            Some((pristine, collect_alias_groups(cursor)))
+            Some((
+                pristine,
+                collect_alias_groups(cursor),
+                succinctly::yaml::collect_merged_members(cursor),
+            ))
         }
         None => None,
     };
@@ -8217,8 +8221,10 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
     // an alias (`.b.p = 9` on `b: *x`) lands on the anchor's node and every
     // alias slot follows -- see `jq::alias_identity`. Same gate as the sync
     // context above: nothing is installed for a read or an alias-free document.
-    let mut alias_identity_guard = alias_sync_ctx.as_ref().map(|(_, groups)| {
-        alias_identity::enter(alias_identity::AliasTable::from_groups(groups.clone()))
+    let mut alias_identity_guard = alias_sync_ctx.as_ref().map(|(_, groups, merged)| {
+        alias_identity::enter(
+            alias_identity::AliasTable::from_groups(groups.clone()).with_merged(merged.clone()),
+        )
     });
     // #4856: a query that is itself a `,` is answered branch by branch (see
     // `top_level_comma_branches`), so a node among computed values keeps its presentation.
@@ -8513,10 +8519,11 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
         }
     }
 
-    if let Some((pristine, groups)) = &alias_sync_ctx {
+    if let Some((pristine, groups, merged)) = &alias_sync_ctx {
         if let Ok(docs) = &mut docs {
             for (value, _comments) in docs.iter_mut() {
                 sync_aliased_paths(value, pristine, groups);
+                sync_merged_members(value, pristine, merged);
             }
         }
     }
