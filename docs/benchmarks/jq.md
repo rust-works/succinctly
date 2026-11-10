@@ -10,6 +10,8 @@ Results are provided for ARM (Apple M4 Pro, Apple M1 Max, AWS Graviton) and x86_
 
 The AMD Ryzen 9 7950X and Apple M4 Pro sections open with a generated *Harness comparison* block: the pinned jq 1.7.1, interleaved repetitions and output-gated rows of `succinctly dev compare jq`, quoted from the committed run in [docs/compare/](../compare/jq.md) and checked against it by a test. Where a hand-written figure below disagrees with one of those blocks, the block is the measurement.
 
+Every other table and figure in this page is a `bench run jq_bench` or `dev bench jq` result measured before #5409 made those runners interleave, so none of it is generated from or checked against a committed run. The M1 Max and Neoverse sections have no harness run to replace them, and the per-pattern tables cover shapes the harness does not generate (`arrays`, `literals`, `mixed`, `pathological`, `unicode`), so all of it is kept as history. For a current figure, quote a *Harness comparison* block or the table in [CLAUDE.md](../../CLAUDE.md#performance-summary).
+
 ## Architectural Differences
 
 Before reviewing the benchmarks, it's important to understand the fundamental differences between these tools:
@@ -443,6 +445,7 @@ The `users_mix` query set (`succinctly dev bench jq --patterns users --queries u
 **succinctly**: Built with `--release --features bench-runner`
 **SIMD**: NEON (128-bit), SVE2 (128-bit vectors), SVEBITPERM (BDEP/BEXT)
 **Date**: 2026-01-29
+**Method**: `bench run jq_bench`, measured before #5409 made it interleave (all of jq's runs, then all of succinctly's, against the `jq` named above). Historical: no `dev compare jq` run exists for this platform, so it has no generated *Harness comparison* block.
 
 ## Summary - Comprehensive Pattern
 
@@ -584,6 +587,7 @@ The `users_mix` query set (`succinctly dev bench jq --patterns users --queries u
 **succinctly**: Built with `--release --features cli`
 **SIMD**: NEON (128-bit), SVE (256-bit vectors)
 **Date**: 2026-01-29
+**Method**: `bench run jq_bench`, measured before #5409 made it interleave (all of jq's runs, then all of succinctly's, against the `jq` named above). Historical: no `dev compare jq` run exists for this platform, so it has no generated *Harness comparison* block.
 
 ## Summary - Comprehensive Pattern
 
@@ -723,6 +727,7 @@ The `users_mix` query set (`succinctly dev bench jq --patterns users --queries u
 **OS**: macOS
 **jq version**: System jq
 **succinctly**: Built with `--release --features cli`
+**Method**: `bench run jq_bench`, measured before #5409 made it interleave (all of jq's runs, then all of succinctly's, against the `jq` named above). Historical: no `dev compare jq` run exists for this platform, so it has no generated *Harness comparison* block.
 
 ## Pattern: arrays
 
@@ -1218,6 +1223,8 @@ The `users_mix` query set (`succinctly dev bench jq --patterns users --queries u
 | **users**         | Realistic user record objects                   |
 
 ## Key Findings
+
+These summarise the hand-written tables above, which predate #5409's interleaving and are not checked against a committed run. The generated *Harness comparison* blocks and [docs/compare/jq.md](../compare/jq.md) are the current measurement.
 
 ### Speed
 
