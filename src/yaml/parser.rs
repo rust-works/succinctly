@@ -32,6 +32,7 @@ use alloc::{
 #[cfg(test)]
 use std::collections::BTreeMap;
 
+use super::block_unicode;
 use super::error::YamlError;
 use super::line_break::{
     blank_line_between, crlf_comment_blank_between, is_line_break, line_break_len,
@@ -2804,11 +2805,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// ends a line at these as at `\n`; the index keeps them as scalar content (#4913).
     #[inline]
     fn unicode_break_len_at(&self, pos: usize) -> usize {
-        match self.input.get(pos..) {
-            Some([0xC2, 0x85, ..]) => 2,
-            Some([0xE2, 0x80, 0xA8 | 0xA9, ..]) => 3,
-            _ => 0,
-        }
+        super::block_unicode::unicode_break_len(self.input, pos)
     }
 
     /// A Unicode break inside a flow plain scalar (#6214): the tab rule of #6059 reads the lines after
@@ -3539,22 +3536,22 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
     }
 
-    /// [`Self::skip_to_eol`] eight bytes at a time, and whether the bytes it passed held a tab (#6287).
-    /// Each word is tested for a break byte (exactly: the high bit of every zero byte of the word xor
-    /// the pattern) and for a tab; the first break in a word ends the line, and only the tabs before it
-    /// count.
+    /// [`Self::skip_to_eol`] eight bytes at a time, and whether the bytes it passed held one outside
+    /// ASCII (#6369; it noted tabs for #6287 before). Each word is tested for a break byte (exactly:
+    /// the high bit of every zero byte of the word xor the pattern) and for a high bit; the first
+    /// break in a word ends the line, and only the bytes before it count.
     #[inline]
-    fn skip_to_eol_noting_tab(&mut self, saw_tab: &mut bool) {
+    fn skip_to_eol_noting_non_ascii(&mut self, saw_non_ascii: &mut bool) {
         const NL: u64 = 0x0A0A_0A0A_0A0A_0A0A;
         const CR: u64 = 0x0D0D_0D0D_0D0D_0D0D;
-        const TAB: u64 = 0x0909_0909_0909_0909;
+        const HIGH: u64 = 0x8080_8080_8080_8080;
         let input = self.input;
         let mut at = self.pos;
         while at + 8 <= input.len() {
             let mut word = [0u8; 8];
             word.copy_from_slice(&input[at..at + 8]);
             let w = u64::from_le_bytes(word);
-            let tabs = zero_bytes(w ^ TAB);
+            let high = w & HIGH;
             let breaks = if HAS_CR {
                 zero_bytes(w ^ NL) | zero_bytes(w ^ CR)
             } else {
@@ -3562,16 +3559,16 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             };
             if breaks != 0 {
                 let first = (breaks.trailing_zeros() / 8) as usize;
-                // the tabs in the bytes below the first break
-                *saw_tab |= tabs & ((1u64 << (8 * first)) - 1) != 0;
+                // the bytes below the first break
+                *saw_non_ascii |= high & ((1u64 << (8 * first)) - 1) != 0;
                 self.pos = at + first;
                 return;
             }
-            *saw_tab |= tabs != 0;
+            *saw_non_ascii |= high != 0;
             at += 8;
         }
         while at < input.len() && !Self::is_break(input[at]) {
-            *saw_tab |= input[at] == b'\t';
+            *saw_non_ascii |= input[at] >= 0x80;
             at += 1;
         }
         self.pos = at;
@@ -8893,6 +8890,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             match self.peek() {
                 None => break false,
                 Some(b'\n' | b'\r') => self.skip_line_break(),
+                // NEL, LS and PS end an empty line as `\n` does (#6369).
+                Some(0xC2 | 0xE2) if self.unicode_break_len_at(self.pos) > 0 => {
+                    self.advance_by(self.unicode_break_len_at(self.pos));
+                }
                 // A tab below the indent the header gave, on a leading line or on the first content one,
                 // is the error go-yaml raises while it eats the indentation (#6372; the auto-detected
                 // indent has the same rule in `detect_block_content_indent`, #6295).
@@ -8936,6 +8937,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     // Empty line - skip and continue
                     widest_blank = widest_blank.max(indent);
                     self.skip_line_break();
+                }
+                // NEL, LS and PS end an empty line as `\n` does (#6369).
+                Some(0xC2 | 0xE2) if self.unicode_break_len_at(self.pos) > 0 => {
+                    widest_blank = widest_blank.max(indent);
+                    self.advance_by(self.unicode_break_len_at(self.pos));
                 }
                 // #6295: the scalar's indent is not known yet, and go-yaml refuses a tab right after
                 // the spaces of any line it scans for it, blank or not (`found a tab character where
@@ -8988,21 +8994,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         let block_end = simd::find_block_scalar_end(self.input, self.pos, content_indent)
             .unwrap_or(self.input.len());
         let region_start = self.pos;
-        let mut saw_tab = false;
-
-        // The line that ends the scalar by being dedented: go-yaml eats its spaces as the scalar's
-        // indentation, and a tab after them is the error (#6372). A space-only dedent is the ordinary end.
-        let mut after_spaces = block_end;
-        while self.input.get(after_spaces) == Some(&b' ') {
-            after_spaces += 1;
-        }
-        if self.input.get(after_spaces) == Some(&b'\t') {
-            self.pos = after_spaces;
-            return Err(YamlError::TabIndentation {
-                line: self.current_line(),
-                offset: after_spaces,
-            });
-        }
+        let mut saw_non_ascii = false;
 
         // Now we need to walk through the content to find:
         // 1. last_content_end - position after last non-empty line
@@ -9028,7 +9020,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 }
                 _ => {
                     // This is a content line - skip to end
-                    self.skip_to_eol_noting_tab(&mut saw_tab);
+                    self.skip_to_eol_noting_non_ascii(&mut saw_non_ascii);
                     last_content_end = self.pos;
                     trailing_newline_start = self.pos;
                     self.skip_line_break();
@@ -9036,9 +9028,32 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             }
         }
 
-        // The walk saw a tab: read each one for a Unicode break before it (#6287).
-        if saw_tab {
-            self.reject_tab_after_unicode_break_in_block(region_start, block_end, content_indent)?;
+        // The line that ends the scalar by being dedented: go-yaml eats its spaces as the scalar's
+        // indentation, and a tab after them is the error (#6372). A space-only dedent is the ordinary end.
+        let mut after_spaces = block_end;
+        while self.input.get(after_spaces) == Some(&b' ') {
+            after_spaces += 1;
+        }
+
+        // go-yaml ends a line at NEL, LS and PS as at `\n`; the kernel and the walk above do not (#6369).
+        // A scalar holding one is read again, line by line, the way go-yaml reads it. Almost none does:
+        // the walk says whether it passed a byte outside ASCII at all, and only then are the two lead
+        // bytes looked for. The line that ends the scalar counts too: spaces and a break are an empty
+        // line to go-yaml, which the scalar then runs past.
+        if (saw_non_ascii
+            && block_unicode::holds_unicode_break(&self.input[region_start..block_end]))
+            || self.unicode_break_len_at(after_spaces) > 0
+        {
+            self.pos = region_start;
+            return self.consume_block_scalar_content_unicode(content_indent, chomping);
+        }
+
+        if self.input.get(after_spaces) == Some(&b'\t') {
+            self.pos = after_spaces;
+            return Err(YamlError::TabIndentation {
+                line: self.current_line(),
+                offset: after_spaces,
+            });
         }
 
         // Position should now be at block_end
@@ -9060,45 +9075,64 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         })
     }
 
-    /// #6287: go-yaml ends a block scalar's line at U+2028, U+2029 and U+0085 as it does at `\n`, so a
-    /// tab after fewer than `content_indent` spaces on what follows is `found a tab character where an
-    /// indentation space is expected`, as it is after a `\n`. The index keeps those three as content
-    /// (#4913), so the line the scalar scanners walk never ends there. The walk over the scalar's lines
-    /// ([`Self::skip_to_eol_noting_tab`]) says whether it passed a tab at all, which block text rarely
-    /// holds; only then is `start..block_end` searched for them, and each one is read backwards: the
-    /// spaces before it, then whether a break ends there.
-    fn reject_tab_after_unicode_break_in_block(
+    /// [`Self::consume_block_scalar_content`] for a scalar that holds NEL, LS or PS (#6369): every one
+    /// of the three ends a line as `\n` does, so the spaces after it are indentation, a dedent after
+    /// it ends the scalar (in the middle of what a `\n`-only reader sees as one line), a tab below the
+    /// indent is refused (#6287), and a line of spaces and a break is an empty line. The end is
+    /// [`block_unicode::scan_block_end`]'s; the walk after it is the byte walk's with those breaks.
+    #[cold]
+    fn consume_block_scalar_content_unicode(
         &mut self,
-        start: usize,
-        block_end: usize,
         content_indent: usize,
-    ) -> Result<(), YamlError> {
-        debug_assert!(
-            start == 0 || Self::is_break(self.input[start - 1]),
-            "a block scalar's text starts a line"
-        );
-        let mut from = start;
-        while let Some(tab) = find_tab_swar(&self.input[..block_end], from) {
-            from = tab + 1;
-            let mut spaces_start = tab;
-            while spaces_start > start && self.input[spaces_start - 1] == b' ' {
-                spaces_start -= 1;
-            }
-            if tab - spaces_start >= content_indent {
-                continue;
-            }
-            if matches!(
-                &self.input[start..spaces_start],
-                [.., 0xE2, 0x80, 0xA8 | 0xA9] | [.., 0xC2, 0x85]
-            ) {
+        chomping: ChompingIndicator,
+    ) -> Result<usize, YamlError> {
+        let start = self.pos;
+        let block_end = match block_unicode::scan_block_end(self.input, start, content_indent) {
+            Ok(end) => end,
+            Err(tab) => {
                 self.pos = tab;
                 return Err(YamlError::TabIndentation {
                     line: self.current_line(),
                     offset: tab,
                 });
             }
+        };
+
+        let mut last_content_end = start;
+        let mut trailing_newline_start = start;
+        while self.pos < block_end {
+            let line_start = self.pos;
+            let _line_indent = self.skip_spaces_simd();
+            let break_len = block_unicode::any_break_len(self.input, self.pos);
+            if break_len > 0 {
+                trailing_newline_start = line_start;
+                self.advance_by(break_len);
+            } else if self.pos >= self.input.len() {
+                break;
+            } else {
+                while self.pos < block_end
+                    && block_unicode::any_break_len(self.input, self.pos) == 0
+                {
+                    self.pos += 1;
+                }
+                last_content_end = self.pos;
+                trailing_newline_start = self.pos;
+                self.advance_by(block_unicode::any_break_len(self.input, self.pos));
+            }
         }
-        Ok(())
+
+        self.pos = block_end;
+        Ok(match chomping {
+            ChompingIndicator::Strip => last_content_end,
+            ChompingIndicator::Clip => {
+                if last_content_end > 0 && trailing_newline_start > last_content_end {
+                    last_content_end + block_unicode::any_break_len(self.input, last_content_end)
+                } else {
+                    last_content_end
+                }
+            }
+            ChompingIndicator::Keep => self.pos,
+        })
     }
 
     /// Parse a block scalar (| or >) including all content lines.
@@ -11354,31 +11388,11 @@ fn build_semi_index_impl(input: &[u8], mode: BuildMode) -> Result<SemiIndex, Yam
 }
 
 /// The high bit of every zero byte of `x`, exactly: no byte above a zero one is flagged, so the
-/// lowest flag is the first zero byte (#6287).
+/// lowest flag is the first zero byte (#6287, #6369).
 #[inline(always)]
 fn zero_bytes(x: u64) -> u64 {
     const LOW7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
     !(((x & LOW7) + LOW7) | x | LOW7)
-}
-
-/// The offset of the first tab in `bytes[from..]`, or `None`, eight bytes a step (#6287).
-#[inline]
-fn find_tab_swar(bytes: &[u8], from: usize) -> Option<usize> {
-    const TAB: u64 = 0x0909_0909_0909_0909;
-    let mut at = from;
-    while at + 8 <= bytes.len() {
-        let mut word = [0u8; 8];
-        word.copy_from_slice(&bytes[at..at + 8]);
-        let tabs = zero_bytes(u64::from_le_bytes(word) ^ TAB);
-        if tabs != 0 {
-            return Some(at + (tabs.trailing_zeros() / 8) as usize);
-        }
-        at += 8;
-    }
-    bytes[at.min(bytes.len())..]
-        .iter()
-        .position(|&b| b == b'\t')
-        .map(|i| at + i)
 }
 
 #[cfg(test)]
@@ -11464,30 +11478,31 @@ mod tests {
         }
     }
 
-    /// #6287: the eight-bytes-a-step line skip stops where the plain one stops, from every start, and
-    /// its tab flag is exactly whether a tab lies between the start and the stop, under both
-    /// `HAS_CR` specializations (a CR is a break only under `true`).
+    /// #6369: the eight-bytes-a-step walk stops where the plain skip does, and its flag is exactly
+    /// whether a byte outside ASCII lies between the start and the stop, under both `HAS_CR`
+    /// specializations (a CR is a break only under `true`).
     #[test]
-    fn skip_to_eol_noting_tab_agrees_with_the_plain_skip_6287() {
+    fn skip_to_eol_noting_non_ascii_agrees_with_the_plain_skip_6369() {
         fn check<const HAS_CR: bool>(bytes: &[u8], from: usize) {
             let mut plain = Parser::<HAS_CR>::new(bytes);
             plain.pos = from;
             plain.skip_to_eol();
             let mut fast = Parser::<HAS_CR>::new(bytes);
             fast.pos = from;
-            let mut saw_tab = false;
-            fast.skip_to_eol_noting_tab(&mut saw_tab);
+            let mut saw_non_ascii = false;
+            fast.skip_to_eol_noting_non_ascii(&mut saw_non_ascii);
             assert_eq!(
                 fast.pos, plain.pos,
                 "{bytes:?} from {from} (HAS_CR {HAS_CR})"
             );
             assert_eq!(
-                saw_tab,
-                bytes[from..plain.pos].contains(&b'\t'),
+                saw_non_ascii,
+                bytes[from..plain.pos].iter().any(|&b| b >= 0x80),
                 "{bytes:?} from {from} (HAS_CR {HAS_CR})"
             );
         }
-        let alphabet: [u8; 8] = [b'a', b'\t', b'\n', b'\r', 0x01, 0x08, 0x0A ^ 0x80, b' '];
+        // 0x8A and 0x8D sit one bit above a line feed and a carriage return
+        let alphabet: [u8; 9] = [b'a', b'\t', b'\n', b'\r', 0x01, 0x8A, 0x8D, 0xC2, b' '];
         let mut seed = 0x2545_F491_4F6C_DD1Du64;
         for _ in 0..4000 {
             let len = {
@@ -11501,7 +11516,7 @@ mod tests {
                     seed ^= seed << 13;
                     seed ^= seed >> 7;
                     seed ^= seed << 17;
-                    // mostly plain text, so a break or a tab lands at every alignment
+                    // mostly plain text, so a break or a high byte lands at every alignment
                     if seed % 5 == 0 {
                         alphabet[(seed >> 8) as usize % alphabet.len()]
                     } else {
@@ -11514,35 +11529,6 @@ mod tests {
                 // `Parser::<false>` is built for input without a CR only
                 if !bytes.contains(&b'\r') {
                     check::<false>(&bytes, from);
-                }
-            }
-        }
-    }
-
-    /// #6287: the eight-bytes-a-step tab search agrees with the plain one at every length, start
-    /// and tab position, including the near-misses of the zero-byte test (`0x01` above a tab,
-    /// `0x08` and `0x0A` beside it).
-    #[test]
-    fn find_tab_swar_agrees_with_a_plain_search_6287() {
-        let fills: [u8; 4] = [b'a', 0x01, 0x08, 0x0A];
-        for fill in fills {
-            for len in 0..40usize {
-                for tab in std::iter::once(None).chain((0..len).map(Some)) {
-                    let mut bytes = vec![fill; len];
-                    if let Some(t) = tab {
-                        bytes[t] = b'\t';
-                    }
-                    for from in 0..=len {
-                        let want = bytes[from..]
-                            .iter()
-                            .position(|&b| b == b'\t')
-                            .map(|i| from + i);
-                        assert_eq!(
-                            find_tab_swar(&bytes, from),
-                            want,
-                            "fill {fill:#04x}, len {len}, tab {tab:?}, from {from}"
-                        );
-                    }
                 }
             }
         }
