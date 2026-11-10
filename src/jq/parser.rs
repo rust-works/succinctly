@@ -1832,6 +1832,114 @@ fn has_flat_var_stage(expr: &Expr) -> bool {
     }
 }
 
+/// Whether a `select` condition reads only the node it is given (#6860), not where the node stands:
+/// the rewrite below runs the `select` from each printed node down, where `key`, `path`, `parent`,
+/// `line`, `column` and `document_index` would no longer see the position they see in the whole list.
+fn reads_only_the_value(cond: &Expr) -> bool {
+    if super::eval::needs_path_context(cond) {
+        return false;
+    }
+    let text = format!("{cond:?}");
+    !["Builtin(Line)", "Builtin(Column)", "Builtin(DocumentIndex)"]
+        .iter()
+        .any(|reader| text.contains(reader))
+}
+
+/// Whether [`yq_assignment_over_list`] would rewrite `stage`, without building it.
+fn is_assignment_over_list(stage: &Expr) -> bool {
+    match stage {
+        Expr::Paren(inner) => is_assignment_over_list(inner),
+        Expr::Update { .. } => true,
+        Expr::Assign { value, .. } | Expr::CompoundAssign { value, .. } => is_literal_rhs(value),
+        _ => false,
+    }
+}
+
+/// A right side yq reads once for the list and this evaluator at each node, so only a constant is
+/// the same in both: a literal, `[]`, `{}` and the constant collections.
+fn is_literal_rhs(value: &Expr) -> bool {
+    match value {
+        Expr::Literal(_) => true,
+        Expr::Paren(inner) => is_literal_rhs(inner),
+        Expr::Array(inner) => is_literal_rhs(inner),
+        Expr::Comma(items) => items.iter().all(is_literal_rhs),
+        Expr::Object(entries) => entries.iter().all(|entry| {
+            matches!(entry.key, ObjectKey::Literal(_)) && is_literal_rhs(&entry.value)
+        }),
+        _ => false,
+    }
+}
+
+/// #6860: `stage` as an assignment over another target, when it is one yq runs once over the whole
+/// list: `|=` (its filter runs at each target, as in yq) and `=` or a compound form with a literal
+/// right side (yq reads that side once for the list and this evaluator at each node, so only a
+/// literal is the same in both). Returns the stage's own target and the assignment rebuilt over
+/// `retarget`.
+fn yq_assignment_over_list(stage: &Expr, retarget: impl FnOnce(&Expr) -> Expr) -> Option<Expr> {
+    match stage {
+        Expr::Paren(inner) => yq_assignment_over_list(inner, retarget),
+        Expr::Update { path, filter } => Some(Expr::Update {
+            path: Box::new(retarget(path)),
+            filter: filter.clone(),
+        }),
+        Expr::Assign { path, value } if is_literal_rhs(value) => Some(Expr::Assign {
+            path: Box::new(retarget(path)),
+            value: value.clone(),
+        }),
+        Expr::CompoundAssign { op, path, value } if is_literal_rhs(value) => {
+            Some(Expr::CompoundAssign {
+                op: *op,
+                path: Box::new(retarget(path)),
+                value: value.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// #6860: yq's pipe evaluates its right side once over the whole list its left side produced, so an
+/// assignment after `..` writes every node it selects across the list before any node is printed,
+/// and each node of the list is then printed as that update left it: `.. | select(tag == "!!int")
+/// |= . + 1` answers the document with every int incremented, then each node of it, itself updated.
+/// Run per node, the first result (the document, which holds all the others) came out as it was read.
+///
+/// A node of the list holds every other node of the list below it, so what yq prints for it is the
+/// node with every target below it written: `A | .. | B | lhs |= f` (`A` navigation, `B` `select`s)
+/// is `A | .. | B | ((.. | B | lhs) |= f)`, the target taken from the node and down. The list is
+/// still read from the document as it was, so a node that the update moves (`|= reverse` over a
+/// sequence's items) is printed where it was, as yq prints the node it holds. Only that shape
+/// qualifies: one `..`, navigation before it, `select`s after it.
+fn yq_assign_after_descent(stages: Vec<Expr>) -> Vec<Expr> {
+    // `A | .. | B`: the index of the one `..`, with navigation before it and `select`s after it.
+    fn descent_prefix(prefix: &[Expr]) -> Option<usize> {
+        let at = prefix
+            .iter()
+            .position(|stage| matches!(stage, Expr::RecursiveDescent))?;
+        let shaped = prefix[..at].iter().all(is_navigation_expr)
+            && prefix[at + 1..].iter().all(|stage| {
+                matches!(stage, Expr::Builtin(Builtin::Select(cond)) if reads_only_the_value(cond))
+            });
+        shaped.then_some(at)
+    }
+    let Some((at, descent)) = (1..stages.len()).find_map(|i| {
+        let descent = descent_prefix(&stages[..i])?;
+        is_assignment_over_list(&stages[i]).then_some((i, descent))
+    }) else {
+        return stages;
+    };
+    let mut target = stages[descent..at].to_vec();
+    let Some(update) = yq_assignment_over_list(&stages[at], |path| {
+        target.push(path.clone());
+        Expr::Paren(Box::new(Expr::pipe(target.clone())))
+    }) else {
+        return stages;
+    };
+    let mut out = stages[..at].to_vec();
+    out.push(update);
+    out.extend_from_slice(&stages[at + 1..]);
+    out
+}
+
 /// #6821: a pipe in yq mode whose stage after the first is a bare `$name`. yq's `GET_VARIABLE`
 /// returns the list the variable is stored in, and a pipe evaluates its right side once over the
 /// whole list the left side produced, so `$name` after a fan-out answers its value **once**, however
@@ -11465,7 +11573,7 @@ impl<'a> Parser<'a> {
         }
 
         if self.mode == ParserMode::Yq && self.in_path_arg == 0 {
-            return Ok(yq_var_stage_once(exprs));
+            return Ok(yq_var_stage_once(yq_assign_after_descent(exprs)));
         }
         Ok(Expr::pipe(exprs))
     }
