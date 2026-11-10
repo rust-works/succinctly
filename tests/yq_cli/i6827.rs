@@ -98,8 +98,9 @@ fn test_the_body_shapes_that_still_change_only_the_mappings_copy_6827() -> Resul
     // Not yq's answers, recorded in docs/compliance/yq/limitations.md. A body that deletes a key and
     // then writes more (also behind a group) cannot be told from a changed member by comparing the
     // two documents. A body that reads the member it writes (`.x += 1` over mappings that share a
-    // source) writes the source once, where yq counts each mapping's turn. A slice target, and a body that is not a chain of writes (`map(.x = 7)`) is not looked into. Both
-    // answers are pinned, so a change in either shows.
+    // source) writes the source once, where yq counts each mapping's turn. A slice target, and a
+    // body that is not a chain of writes (`map(.x = 7)`), are not looked into. Both answers are
+    // pinned, so a change in either shows.
     for (document, filter, yq, ours) in STILL_DIVERGENT {
         let (stdout, code) = run_yq_stdin(filter, document, JSON)?;
         assert_eq!(

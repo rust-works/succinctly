@@ -601,39 +601,72 @@ fn with_update_effect(update: &Expr) -> Expr {
 /// the target node itself, an assignment in it changes that node in place, and the update then
 /// takes the first output: so `.a |= (.x = 7, .y = 1)` applies both assignments (the first
 /// output is the node), where a functional evaluation keeps only the first. A comma whose first
-/// branch is a write gets the same treatment `with` gives its update ([`with_update_effect`]):
-/// the writes apply in order to the evolving node, and any other branch is evaluated for its
-/// errors. A body whose first branch is a value (`5`, `.x`, `. + 1`) keeps its first output, as
-/// yq's does, and so does every body without such a comma. The comma may sit inside a group or
-/// a pipe (`(.x = 7, .y = 1) | .z = 3`).
-fn update_body_effect(body: Expr) -> Expr {
+/// branch answers the node gets the same treatment `with` gives its update
+/// ([`with_update_effect`]): the writes apply in order to the evolving node, and any other branch
+/// is evaluated for its errors. The comma may sit in a group, a pipe, behind a binding or ahead of
+/// a `//` (`(.x = 7, .y = 1) | .z = 3`, `. as $v | .y = $v.x, .x = 9`).
+///
+/// `None` when nothing is rewritten, so a body without such a comma is not copied. A body whose
+/// first branch is a value (`5`, `.x`, `. + 1`) keeps its first output, as yq's does; so does one
+/// whose first branch may be empty (`select(..)`) while a later branch is not a write, since the
+/// first output is then that later branch's value (`.a |= (select(.x == 2), 5)` is `5`).
+fn update_body_effect(body: &Expr) -> Option<Expr> {
     match body {
-        Expr::Paren(inner) => Expr::Paren(Box::new(update_body_effect(*inner))),
-        Expr::Pipe(stages) => Expr::pipe(stages.iter().cloned().map(update_body_effect).collect()),
-        // The first branch answers the node once its writes are done: a write, or writes with a
-        // `select` ahead of them (`select(.x == 1) | .y = 9`).
-        Expr::Comma(items) if items.first().is_some_and(yields_the_node) => {
-            with_update_effect(&Expr::Comma(items))
+        Expr::Paren(inner) => update_body_effect(inner).map(|inner| Expr::Paren(Box::new(inner))),
+        Expr::Pipe(stages) => {
+            let rewritten: Vec<Option<Expr>> = stages.iter().map(update_body_effect).collect();
+            if rewritten.iter().all(Option::is_none) {
+                return None;
+            }
+            Some(Expr::pipe(
+                stages
+                    .iter()
+                    .zip(rewritten)
+                    .map(|(stage, rewritten)| rewritten.unwrap_or_else(|| stage.clone()))
+                    .collect(),
+            ))
         }
-        other => other,
+        Expr::As { expr, var, body } => update_body_effect(body).map(|body| Expr::As {
+            expr: expr.clone(),
+            var: var.clone(),
+            body: Box::new(body),
+        }),
+        Expr::Alternative(left, right) => {
+            update_body_effect(left).map(|left| Expr::Alternative(Box::new(left), right.clone()))
+        }
+        Expr::Comma(items) => items
+            .split_first()
+            .is_some_and(|(first, rest)| {
+                answers_the_node(first, false)
+                    || (answers_the_node(first, true)
+                        && rest.iter().all(|branch| answers_the_node(branch, false)))
+            })
+            .then(|| with_update_effect(body)),
+        _ => None,
     }
 }
 
-/// Whether `expr` answers the node it runs on, once its in-place writes are done: `.`, `select`,
-/// an assignment or a delete, alone or in a group or a pipe of those. The branches after it in a
-/// comma then change that same node, which the update's first output is.
-fn yields_the_node(expr: &Expr) -> bool {
+/// Whether `expr` answers the node it runs on, once its in-place writes are done: `.`, an
+/// assignment or a delete, alone or in a group, a pipe or behind a binding. `allow_empty` also
+/// admits `select`, which answers nothing when it fails.
+fn answers_the_node(expr: &Expr, allow_empty: bool) -> bool {
     match expr {
-        Expr::Identity | Expr::Builtin(Builtin::Select(_)) => true,
+        Expr::Identity => true,
+        Expr::Builtin(Builtin::Select(_)) => allow_empty,
         Expr::Assign { .. }
         | Expr::Update { .. }
         | Expr::CompoundAssign { .. }
         | Expr::AlternativeAssign { .. }
         | Expr::Builtin(Builtin::Del(_) | Builtin::DelPaths(_)) => true,
-        Expr::Paren(inner) => yields_the_node(inner),
-        Expr::Pipe(stages) => stages.iter().all(yields_the_node),
+        Expr::Paren(inner) => answers_the_node(inner, allow_empty),
+        Expr::Pipe(stages) => stages
+            .iter()
+            .all(|stage| answers_the_node(stage, allow_empty)),
+        Expr::As { body, .. } => answers_the_node(body, allow_empty),
         // The first output of a comma is its first branch's.
-        Expr::Comma(items) => items.first().is_some_and(yields_the_node),
+        Expr::Comma(items) => items
+            .first()
+            .is_some_and(|first| answers_the_node(first, false)),
         _ => false,
     }
 }
@@ -10884,10 +10917,9 @@ impl<'a> Parser<'a> {
             self.next(); // =
             self.skip_ws();
             let filter = self.parse_assignment_operand()?;
-            let filter = if self.mode == ParserMode::Yq {
-                update_body_effect(filter)
-            } else {
-                filter
+            let filter = match self.mode == ParserMode::Yq {
+                true => update_body_effect(&filter).unwrap_or(filter),
+                false => filter,
             };
             return Ok(self.assign_or_rename_key(left, filter, true));
         }
