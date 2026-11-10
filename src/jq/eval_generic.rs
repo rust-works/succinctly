@@ -29787,13 +29787,29 @@ fn path_index_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
                 (v.as_object(), yq_numeric_index_on_object_is_null::<S>())
             {
                 // #4079: the member whose key text is the index (`.[1]` finds `1:`); a miss
-                // stays the absent position of #2459. The component is the index itself, which
-                // is what yq's `path` answers for a typed key.
+                // stays the absent position of #2459. The component is the matched key's own
+                // value, as for a name (#2801): the index for a typed key (`1:`), and the
+                // string for a quoted one (`"1":`), which is what yq's `key` and `path` answer
+                // (#2435). A miss keeps the index.
                 match crate::jq::key_index::find_cursor_memoized(
                     &fields,
                     &component_text_for_index(idx, key),
                 ) {
-                    Ok(Some(c)) => PathNode::At(c),
+                    Ok(Some(c)) => {
+                        // A key tagged with a type other than `!!str` (`!!int "6":`) keeps the
+                        // index: `yq_path_component` reads the spelling of a plain key only.
+                        let typed = c.prev_sibling().and_then(|kc: V::Cursor| {
+                            if kc.explicit_tag().is_some_and(|tag| tag != "!!str") {
+                                return None;
+                            }
+                            let display = key_display_string(&kc.value())?.into_owned();
+                            Some(yq_path_component(Cow::Owned(display), &kc))
+                        });
+                        if let Some(typed) = typed {
+                            component = typed;
+                        }
+                        PathNode::At(c)
+                    }
                     Ok(None) => PathNode::Absent,
                     Err(err) => return Err(err),
                 }
