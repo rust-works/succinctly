@@ -2,7 +2,7 @@
 //! an accumulator of the next step, a union in UPDATE is branch-major over the list, an UPDATE with
 //! no output drops its accumulator, and several INIT outputs all fold the one source (jq's later
 //! forks read a `null` source). Every row is `yq -o=json -I0 FILTER` on [`DOC`], captured from yq
-//! v4.53.3. `docs/compliance/yq/limitations.md` records the absent-key read that still differs.
+//! v4.53.3. `docs/compliance/yq/limitations.md` records what still differs.
 
 use anyhow::Result;
 
@@ -181,6 +181,20 @@ const ABSENT_ROWS: &[(&str, &str)] = &[
     (". as $i ireduce (\"s\"; . + \"x\" + $i.b)", "\"sx1\"\n"),
     (". as $i ireduce ([]; . + [$i.a // 7])", "[7]\n"),
     (". as $i ireduce (0; $i.a // 5)", "5\n"),
+    // Every arithmetic operator reads its right operand the same way: a missing key is no output
+    // (the accumulator is not kept, unlike `+`).
+    (". as $i ireduce (5; . - $i.a)", ""),
+    (". as $i ireduce (5; . - $i.b)", "4\n"),
+    (". as $i ireduce (5; . * $i.a)", ""),
+    (". as $i ireduce (5; . * $i.b)", "5\n"),
+    (". as $i ireduce (6; . / $i.a)", ""),
+    (". as $i ireduce (7; . % $i.a)", ""),
+    (". as $i ireduce (7; . % $i.b)", "0\n"),
+    (". as $i ireduce ({}; . * {\"k\": $i.a})", ""),
+    (
+        ". as $i ireduce ({\"k\": 0}; . * {\"k\": $i.b})",
+        "{\"k\":1}\n",
+    ),
     // The same read as the whole UPDATE or as a write's value is a `null` node.
     (". as $i ireduce ([]; [$i.a])", "[null]\n"),
     (". as $i ireduce ({}; .x = $i.a)", "{\"x\":null}\n"),
@@ -222,16 +236,8 @@ fn an_absent_key_of_the_loop_variable_under_eval_all_6802() -> Result<()> {
 /// jq's `reduce` has no read-only operand: an absent key is `null`.
 #[test]
 fn jq_mode_keeps_the_null_6802() -> Result<()> {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args(["jq", "-c", "reduce . as $i ([]; . + [$i.a])"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            child.stdin.take().expect("piped").write_all(b"{\"b\":1}")?;
-            child.wait_with_output()
-        })?;
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "[null]\n");
+    let (stdout, code) =
+        crate::run_jq_stdin("reduce . as $i ([]; . + [$i.a])", "{\"b\":1}", &["-c"])?;
+    assert_eq!((stdout.as_str(), code), ("[null]\n", 0));
     Ok(())
 }
