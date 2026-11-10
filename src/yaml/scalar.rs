@@ -225,7 +225,8 @@ pub fn resolve_plain_sourced(s: &str, json_sourced: bool) -> ResolvedScalar {
         // #6866: go-yaml reads a leading `0` as octal, which an `8` or `9` breaks, and falls back to
         // the float: `08` is `!!float` in a YAML document, `8.0` in JSON.
         ResolvedScalar::Int(n) if !json_sourced && is_zero_padded_with_8_or_9(s) => {
-            ResolvedScalar::Float(n as f64)
+            // The float go-yaml's `ParseFloat` reads, which is the rounded text above 2^53.
+            ResolvedScalar::Float(s.parse().unwrap_or(n as f64))
         }
         // #3577: yq's JSON decoder types a whole-valued float as an integer
         // (`2.0`, `1e2` and `-0.0` are `!!int`), where go-yaml keeps it a

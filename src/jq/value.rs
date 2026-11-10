@@ -3486,7 +3486,10 @@ impl OwnedValue {
             NumberRepr::Int(n)
                 if S::TAG == EvalTag::Yq && crate::yaml::is_zero_padded_with_8_or_9(&literal) =>
             {
-                Self::NumberLiteral(NumberRepr::Float(n as f64), literal.into())
+                Self::NumberLiteral(
+                    NumberRepr::Float(literal.parse().unwrap_or(n as f64)),
+                    literal.into(),
+                )
             }
             // jq's own lenient literals (`007`, `+5`) stay literals in either mode.
             NumberRepr::Int(n)
