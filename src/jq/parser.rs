@@ -5436,36 +5436,22 @@ impl<'a> Parser<'a> {
         }
         self.next();
         // `(f | ..) anchor = ""`: the write that clears the anchor and the alias mark of every node
-        // under the ones `f` selects.
-        let template = parse_with_mode_and_extensions("(..) anchor = \"\"", ParserMode::Yq, true)?;
-        let Expr::MetaAssign {
-            target: template_target,
-            slot,
-            value,
-            is_update,
-        } = template
-        else {
-            unreachable!("the explode template is a metadata write");
-        };
-        let Expr::Paren(recurse) = *template_target else {
-            unreachable!("the explode template's target is parenthesised");
-        };
-        // `explode(.)` and `explode(..)` select the whole document: `..` alone is the same nodes
-        // without a second walk under each one.
+        // under the ones `f` selects. `explode(.)` and `explode(..)` select the whole document, where
+        // `..` alone is the same nodes without a second walk under each one.
         let mut inner = &target;
         while let Expr::Paren(expr) = inner {
             inner = expr;
         }
-        let selected = if matches!(inner, Expr::Identity) || *inner == *recurse {
-            *recurse
+        let selected = if matches!(inner, Expr::Identity | Expr::RecursiveDescent) {
+            Expr::RecursiveDescent
         } else {
-            Expr::pipe(vec![target, *recurse])
+            Expr::pipe(vec![target, Expr::RecursiveDescent])
         };
         Ok(Expr::MetaAssign {
             target: Box::new(Expr::Paren(Box::new(selected))),
-            slot,
-            value,
-            is_update,
+            slot: MetaSlot::Anchor,
+            value: Box::new(Expr::Literal(Literal::String("".into()))),
+            is_update: false,
         })
     }
 

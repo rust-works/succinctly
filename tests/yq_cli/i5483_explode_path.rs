@@ -118,3 +118,48 @@ fn test_explode_of_a_value_that_is_no_path_is_an_error_5483() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn test_explode_of_a_path_runs_per_document_5483() -> Result<()> {
+    // yq: the second document is untouched by a selection that finds nothing in it, and the first
+    // document's alias is the one expanded; a `{p: 1}` copy is written in flow style by yq.
+    let doc = "a: &x {p: 1}\nb: *x\n---\nc: &y 2\nd: *y\n";
+    let (out, code) = run_yq_stdin("explode(.b)", doc, &["-o=json", "-I=0"])?;
+    assert_eq!(
+        (out.as_str(), code),
+        (
+            "{\"a\":{\"p\":1},\"b\":{\"p\":1}}\n{\"c\":2,\"d\":2,\"b\":null}\n",
+            0
+        )
+    );
+    Ok(())
+}
+
+#[test]
+fn test_explode_of_a_selected_alias_whose_anchor_holds_more_anchors_5483() -> Result<()> {
+    // Data as yq's (`b` is `{k: 1, l: 1}`, `c` is 1); yq also keeps `&w`/`*w` inside the copy.
+    let doc = "a: &x\n  k: &w 1\n  l: *w\nb: *x\nc: *w\n";
+    let (out, code) = run_yq_stdin("explode(.b)", doc, &["-o=json", "-I=0"])?;
+    assert_eq!(
+        (out.as_str(), code),
+        (
+            "{\"a\":{\"k\":1,\"l\":1},\"b\":{\"k\":1,\"l\":1},\"c\":1}\n",
+            0
+        )
+    );
+    let (out, code) = run_yq_stdin("explode(.b)", doc, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        out,
+        "a: &x\n  k: &w 1\n  l: *w\nb:\n  k: 1\n  l: 1\nc: *w\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_explode_of_a_path_in_a_collect_keeps_the_data_5483() -> Result<()> {
+    // yq keeps `&x` on `a` here; the owned route holds no marks, so it is dropped (data is the same).
+    let (out, code) = run_yq_stdin("[explode(.b)]", "a: &x [1]\nb: *x\n", &["-o=json", "-I=0"])?;
+    assert_eq!((out.as_str(), code), ("[{\"a\":[1],\"b\":[1]}]\n", 0));
+    Ok(())
+}
