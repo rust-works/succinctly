@@ -33338,6 +33338,25 @@ fn collect_each_generic<S: EvalSemantics, V: DocumentValue>(
     collected_items_result::<_, S>(items, flow)
 }
 
+/// How many delivered outputs [`collected_items_result`] converted to owned values for a partial
+/// prefix (#5505). `cfg(test)` only: the shipped build carries no counter.
+#[cfg(test)]
+pub(crate) mod prefix_conversions {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn bump() {
+        COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn get() -> usize {
+        COUNT.with(Cell::get)
+    }
+}
+
 /// The `GenericResult` of a sink evaluation that collected `items` and ended
 /// in `flow`: the items themselves when the sink ran out, else the prefix
 /// delivered before the escape, carrying it.
@@ -33357,8 +33376,22 @@ fn collected_items_result<V: DocumentValue, S: EvalSemantics>(
         }
         | Flow::Escaped(control) => control,
     };
+    // #5505: a yq document answers all or nothing (`ERROR_DISCARDS_THE_OUTPUTS_BEFORE_IT`), so an
+    // error ends it and no consumer of this collection reads the outputs delivered before it: a
+    // `try`, `label` or `limit` over a walk reads them from the streaming route instead, which is
+    // not this function (`try W catch "c"` prints them, pinned in `tests/yq_cli/i5505.rs`).
+    // Converting each of them (a cursor to its whole subtree, for a
+    // `recurse(f; cond)` walk) was most of the cost of a `cond` that raises late: 0.81 s and
+    // 140 MB over 60,000 integers 120 levels deep, against 0.05 s and 25 MB for the same walk that
+    // does not raise. Only an error: a `break` or a `halt` keeps the prefix a `label` or the
+    // output reads. jq mode keeps it too, as jq prints what came before an error.
+    if S::ERROR_DISCARDS_THE_OUTPUTS_BEFORE_IT && matches!(control, Control::Error(_)) {
+        return partial_generic(Vec::new(), control);
+    }
     let mut owned = vec_with_capacity(items.len());
     for item in items {
+        #[cfg(test)]
+        prefix_conversions::bump();
         match generic_item_into_owned::<_, S>(item) {
             Ok(v) => owned.push(v),
             // A decode failure while rendering the prefix is the error: the
@@ -44216,6 +44249,36 @@ mod tests {
         );
         let (more, _) = run(r#"def f: length + 1; (. + "é") as $t | [range(2) | ($t | f)]"#);
         assert_eq!(more, ["[8,8]"]);
+    }
+
+    /// #5505: in yq mode an error ends the document and nothing reads the outputs delivered before
+    /// it, so a `recurse(f; cond)` whose `cond` raises late does not convert each delivered node to
+    /// an owned value for a prefix. The pin is that count (`prefix_conversions`), zero. It can
+    /// fail: with the yq early return in `collected_items_result` removed, the count is the nodes
+    /// delivered before the raise.
+    #[cfg(feature = "std")]
+    #[test]
+    fn yq_recurse_cond_that_raises_late_does_not_convert_a_prefix_5505() {
+        use super::prefix_conversions;
+
+        let json = br"[1,[2,[3,[4,5]]]]";
+        let index = JsonIndex::build(json);
+        let filter = r#"[recurse(.[]?; if . == 5 then error("x") else true end) | 1]"#;
+        let expr = crate::jq::parser::parse_with_mode_and_extensions(
+            filter,
+            crate::jq::parser::ParserMode::Yq,
+            true,
+        )
+        .unwrap();
+
+        let before = prefix_conversions::get();
+        let yq = eval_with_cursor_using::<YqSemantics, _>(&expr, index.root(json));
+        let yq_converted = prefix_conversions::get() - before;
+        assert!(
+            matches!(yq, GenericResult::Error(_)),
+            "the raise is the answer"
+        );
+        assert_eq!(yq_converted, 0, "yq reads no prefix of an erroring walk");
     }
 
     /// #5593: `floor`, `ceil`, `round`, `trunc`, `sqrt` and `fabs` of a document number are
