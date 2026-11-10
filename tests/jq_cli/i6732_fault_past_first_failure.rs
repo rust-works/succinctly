@@ -5,8 +5,8 @@
 //! that did not open (`[` then `miss`, `1 2`, `miss`: both reported, where we stopped at the first),
 //! or one raised in a file that comes after a second failure (`[`, `miss`, `1 2`, `miss`, `[`).
 //! A fault met mid-text in the file before the failures (`[1,2` then `{"a":1}`) is not a closing
-//! event held back for the failure's read either. Every row was captured from jq 1.7.1; the last
-//! five do not move.
+//! event held back for the failure's read either. Every row was captured from jq 1.7.1; `unchanged`
+//! holds the rows that already matched and must not move, a fault met in an earlier file among them.
 
 use anyhow::Result;
 
@@ -24,11 +24,13 @@ fn a_fault_past_the_first_failure_counts_every_failure_the_reader_asked_past_in_
         ("open3", "[1,2"),
         ("r2", "1 2"),
         ("obj", "{\"a\":1}"),
+        ("arr", "[1]"),
+        ("bad", "1}"),
     ] {
         std::fs::write(dir.path().join(name), text)?;
     }
     #[rustfmt::skip]
-    let rows = [
+    let fixed = [
         (&["-c", "--stream-errors", "."][..], &["open", "miss", "r2", "miss"][..], "[\"Expected separator between values at EOF at line 1, column 4\",[0]]\n", "jq: error: Could not open file @DIR@/miss: No such file or directory\njq: error: Could not open file @DIR@/miss: No such file or directory\n", 2),
         (&["-c", "--stream-errors", "."][..], &["open", "miss", "r2", "miss", "dir"][..], "[\"Expected separator between values at EOF at line 1, column 4\",[0]]\n", "jq: error: Could not open file @DIR@/miss: No such file or directory\njq: error: Could not open file @DIR@/miss: No such file or directory\n", 2),
         (&["-c", "--stream-errors", "halt_error"][..], &["open", "miss", "r2", "miss"][..], "", "jq: error: Could not open file @DIR@/miss: No such file or directory\njq: error: Could not open file @DIR@/miss: No such file or directory\n[\"Expected separator between values at EOF at line 1, column 4\",[0]]\n", 2),
@@ -39,13 +41,19 @@ fn a_fault_past_the_first_failure_counts_every_failure_the_reader_asked_past_in_
         (&["-c", "--stream-errors", "."][..], &["open2", "miss", "r2", "miss", "obj"][..], "[[0],1]\n[\"Expected separator between values at line 1, column 7\",[1]]\n", "jq: error: Could not open file @DIR@/miss: No such file or directory\njq: error: Could not open file @DIR@/miss: No such file or directory\n", 2),
         (&["-c", "--stream-errors", "."][..], &["open3", "obj", "miss", "miss"][..], "[[0],1]\n[\"Expected a separator between values at line 1, column 5\",[1]]\n", "jq: error: Could not open file @DIR@/miss: No such file or directory\njq: error: Could not open file @DIR@/miss: No such file or directory\n", 2),
         (&["-c", "--stream-errors", "."][..], &["open3", "obj", "dir", "miss"][..], "[[0],1]\n[\"Expected a separator between values at line 1, column 5\",[1]]\n", "jq: error: Is a directory\njq: error: Could not open file @DIR@/miss: No such file or directory\n", 2),
+        (&["-c", "--stream-errors", "."][..], &["open3", "arr", "miss", "miss"][..], "[[0],1]\n[\"Expected a separator between values at line 1, column 5\",[1]]\n", "jq: error: Could not open file @DIR@/miss: No such file or directory\njq: error: Could not open file @DIR@/miss: No such file or directory\n", 2),
+    ];
+    #[rustfmt::skip]
+    let unchanged = [
         (&["-c", "--stream-errors", "input"][..], &["open", "miss", "r2", "miss"][..], "", "jq: error: Could not open file @DIR@/miss: No such file or directory\njq: error: Could not open file @DIR@/miss: No such file or directory\njq: error (at @DIR@/miss:0): break\n", 2),
         (&["-c", "--stream-errors", "."][..], &["open", "miss", "r2"][..], "[\"Expected separator between values at EOF at line 1, column 4\",[0]]\n", "jq: error: Could not open file @DIR@/miss: No such file or directory\n", 2),
         (&["-c", "--stream-errors", "."][..], &["open", "r2", "miss", "miss"][..], "[\"Expected separator between values at EOF at line 1, column 4\",[0]]\n", "jq: error: Could not open file @DIR@/miss: No such file or directory\njq: error: Could not open file @DIR@/miss: No such file or directory\n", 2),
         (&["-c", "--stream-errors", "."][..], &["open", "miss", "obj", "miss"][..], "[[0,\"a\"],1]\n", "jq: error: Could not open file @DIR@/miss: No such file or directory\n", 2),
         (&["-c", "--stream-errors", "."][..], &["open", "miss", "miss", "r2"][..], "[\"Expected separator between values at EOF at line 1, column 4\",[0]]\n", "jq: error: Could not open file @DIR@/miss: No such file or directory\njq: error: Could not open file @DIR@/miss: No such file or directory\n", 2),
+        (&["-c", "--stream-errors", "."][..], &["bad", "obj", "miss", "miss"][..], "[\"Unmatched '}' at the top-level at line 1, column 2\",[]]\n[[\"a\"],1]\n[[\"a\"]]\n", "jq: error: Could not open file @DIR@/miss: No such file or directory\n", 2),
     ];
-    check_rows(&d, &rows)
+    check_rows(&d, &fixed)?;
+    check_rows(&d, &unchanged)
 }
 
 /// One row: the flags and program, the files under the fixture directory, and jq 1.7.1's stdout,
