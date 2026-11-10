@@ -79,6 +79,10 @@ pub struct YamlIndex<W = Vec<u64>> {
     /// `&anchor`/`!tag` token (#2712). Only `line`/`column` read it; every
     /// navigation and streaming path keeps using `open_positions` (the value).
     property_starts: BTreeMap<usize, usize>,
+    /// Text offset of the `|`/`>` of every block scalar that holds NEL, LS or PS, sorted (#6369).
+    /// go-yaml ends a line at those as at `\n`, so such a scalar is read line by line with them as
+    /// breaks; every other block scalar is read as before, and almost every document lists none.
+    unicode_block_scalars: Vec<usize>,
     /// Head/line/foot comments, keyed by the BP position of the owning node.
     /// See [`NodeComments`].
     comments: BTreeMap<usize, NodeComments>,
@@ -275,6 +279,7 @@ impl YamlIndex<Vec<u64>> {
             aliases: semi.aliases,
             tags: semi.tags,
             property_starts: semi.property_starts,
+            unicode_block_scalars: semi.unicode_block_scalars,
             has_standalone_comments: semi
                 .comments
                 .values()
@@ -353,6 +358,9 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             // Like `comments`, a serialized index carries no property
             // offsets, so `line`/`column` fall back to the value's position.
             property_starts: BTreeMap::new(),
+            // Like the property offsets, not serialized: a block scalar that holds NEL, LS or PS is
+            // read as the byte reader reads it (#6369).
+            unicode_block_scalars: Vec::new(),
             // `from_parts` predates comment tracking and has no caller
             // in this codebase today; a future caller that needs it can be
             // given an explicit parameter then.
@@ -749,6 +757,18 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     #[inline]
     pub fn property_start(&self, bp_pos: usize) -> Option<usize> {
         self.property_starts.get(&bp_pos).copied()
+    }
+
+    /// Whether the block scalar whose `|` or `>` is at text offset `header_pos` holds a NEL, LS or
+    /// PS, or is ended by a line that begins with one (#6369). Its lines are then read with those as
+    /// breaks, as go-yaml reads them. Free for a document with none: the list is empty.
+    #[inline]
+    pub(crate) fn block_scalar_holds_unicode_break(&self, header_pos: usize) -> bool {
+        !self.unicode_block_scalars.is_empty()
+            && self
+                .unicode_block_scalars
+                .binary_search(&header_pos)
+                .is_ok()
     }
 
     /// Whether any node in the document carries an explicit tag.

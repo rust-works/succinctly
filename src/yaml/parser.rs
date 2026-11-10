@@ -283,6 +283,9 @@ pub struct SemiIndex {
     /// Head/line/foot comments, keyed by the BP position of the node they
     /// attach to. See [`NodeComments`].
     pub comments: BTreeMap<usize, NodeComments>,
+    /// Text offset of the `|`/`>` of every block scalar that holds NEL, LS or PS (#6369), sorted.
+    /// Almost always empty. See the `Parser` field of the same name.
+    pub unicode_block_scalars: Vec<usize>,
 }
 
 /// Maximum nesting depth for recursively-parsed constructs (flow collections
@@ -386,6 +389,12 @@ struct Parser<'a, const HAS_CR: bool> {
     /// `tags`, first property wins (`&x !!str 5` and `!!str &x 5` both name
     /// the first token) — see [`Self::note_property_start`].
     property_starts: BTreeMap<usize, usize>,
+    /// Text offset of the `|`/`>` of every block scalar that holds NEL, LS or PS, or that one of them
+    /// ends the dedent line of (#6369): go-yaml reads those scalars line by line with the three as
+    /// breaks, which the decoder does only for a scalar listed here. In source order.
+    unicode_block_scalars: Vec<usize>,
+    /// Text offset of the header of the block scalar being parsed ([`Self::parse_block_scalar`]).
+    block_header_pos: usize,
     /// `bp_pos` of the node an anchor or tag was just scanned for, if that
     /// node hasn't opened yet. An alias node opening at this same `bp_pos`
     /// would mean the property was meant for it — invalid per the YAML 1.2
@@ -777,6 +786,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             aliases: BTreeMap::new(),
             tags: BTreeMap::new(),
             property_starts: BTreeMap::new(),
+            unicode_block_scalars: Vec::new(),
+            block_header_pos: 0,
             pending_property_bp: None,
             comments: BTreeMap::new(),
             pending_head_comment: None,
@@ -3536,39 +3547,59 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
     }
 
-    /// [`Self::skip_to_eol`] eight bytes at a time, and whether the bytes it passed held one outside
-    /// ASCII (#6369; it noted tabs for #6287 before). Each word is tested for a break byte (exactly:
-    /// the high bit of every zero byte of the word xor the pattern) and for a high bit; the first
-    /// break in a word ends the line, and only the bytes before it count.
+    /// [`Self::skip_to_eol`] eight bytes at a time, and whether the line it passed held a NEL, LS or PS
+    /// (#6369; it noted tabs for #6287 before). Each word is tested for a break byte (exactly: the high
+    /// bit of every zero byte of the word xor the pattern) and for the two lead bytes, `0xC2` and
+    /// `0xE2`; the first break in a word ends the line, and only a lead byte before it is read, in
+    /// place, for the break it may begin. Text with no lead byte reads no byte twice, and text full of
+    /// U+2014 or U+00E9 reads only those.
     #[inline]
-    fn skip_to_eol_noting_non_ascii(&mut self, saw_non_ascii: &mut bool) {
+    fn skip_to_eol_noting_unicode_break(&mut self, saw_unicode_break: &mut bool) {
         const NL: u64 = 0x0A0A_0A0A_0A0A_0A0A;
         const CR: u64 = 0x0D0D_0D0D_0D0D_0D0D;
-        const HIGH: u64 = 0x8080_8080_8080_8080;
+        const NEL_LEAD: u64 = 0xC2C2_C2C2_C2C2_C2C2;
+        const LS_PS_LEAD: u64 = 0xE2E2_E2E2_E2E2_E2E2;
         let input = self.input;
         let mut at = self.pos;
         while at + 8 <= input.len() {
             let mut word = [0u8; 8];
             word.copy_from_slice(&input[at..at + 8]);
             let w = u64::from_le_bytes(word);
-            let high = w & HIGH;
+            let mut leads = zero_bytes(w ^ NEL_LEAD) | zero_bytes(w ^ LS_PS_LEAD);
             let breaks = if HAS_CR {
                 zero_bytes(w ^ NL) | zero_bytes(w ^ CR)
             } else {
                 zero_bytes(w ^ NL)
             };
-            if breaks != 0 {
+            let line_end = if breaks != 0 {
                 let first = (breaks.trailing_zeros() / 8) as usize;
-                // the bytes below the first break
-                *saw_non_ascii |= high & ((1u64 << (8 * first)) - 1) != 0;
+                // the lead bytes below the first break
+                leads &= (1u64 << (8 * first)) - 1;
+                Some(first)
+            } else {
+                None
+            };
+            if !*saw_unicode_break {
+                while leads != 0 {
+                    let i = (leads.trailing_zeros() / 8) as usize;
+                    if block_unicode::unicode_break_len(input, at + i) > 0 {
+                        *saw_unicode_break = true;
+                        break;
+                    }
+                    // the next flagged byte (a flag is the high bit of its byte)
+                    leads &= leads - 1;
+                }
+            }
+            if let Some(first) = line_end {
                 self.pos = at + first;
                 return;
             }
-            *saw_non_ascii |= high != 0;
             at += 8;
         }
         while at < input.len() && !Self::is_break(input[at]) {
-            *saw_non_ascii |= input[at] >= 0x80;
+            if !*saw_unicode_break && block_unicode::unicode_break_len(input, at) > 0 {
+                *saw_unicode_break = true;
+            }
             at += 1;
         }
         self.pos = at;
@@ -8994,7 +9025,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         let block_end = simd::find_block_scalar_end(self.input, self.pos, content_indent)
             .unwrap_or(self.input.len());
         let region_start = self.pos;
-        let mut saw_non_ascii = false;
+        let mut saw_unicode_break = false;
 
         // Now we need to walk through the content to find:
         // 1. last_content_end - position after last non-empty line
@@ -9020,7 +9051,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 }
                 _ => {
                     // This is a content line - skip to end
-                    self.skip_to_eol_noting_non_ascii(&mut saw_non_ascii);
+                    self.skip_to_eol_noting_unicode_break(&mut saw_unicode_break);
                     last_content_end = self.pos;
                     trailing_newline_start = self.pos;
                     self.skip_line_break();
@@ -9036,14 +9067,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
 
         // go-yaml ends a line at NEL, LS and PS as at `\n`; the kernel and the walk above do not (#6369).
-        // A scalar holding one is read again, line by line, the way go-yaml reads it. Almost none does:
-        // the walk says whether it passed a byte outside ASCII at all, and only then are the two lead
-        // bytes looked for. The line that ends the scalar counts too: spaces and a break are an empty
-        // line to go-yaml, which the scalar then runs past.
-        if (saw_non_ascii
-            && block_unicode::holds_unicode_break(&self.input[region_start..block_end]))
-            || self.unicode_break_len_at(after_spaces) > 0
-        {
+        // A scalar holding one is read again, line by line, the way go-yaml reads it, and listed so the
+        // decoder reads it so too. Almost none does: the walk says whether it passed one, looking only
+        // at the bytes that could start one. The line that ends the scalar counts too: spaces and a
+        // break are an empty line to go-yaml, which the scalar then runs past.
+        if saw_unicode_break || self.unicode_break_len_at(after_spaces) > 0 {
+            self.unicode_block_scalars.push(self.block_header_pos);
             self.pos = region_start;
             return self.consume_block_scalar_content_unicode(content_indent, chomping);
         }
@@ -9137,6 +9166,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
     /// Parse a block scalar (| or >) including all content lines.
     fn parse_block_scalar(&mut self, base_indent: usize) -> Result<(), YamlError> {
+        self.block_header_pos = self.pos;
         // Mark the indicator position
         self.set_ib();
         self.write_bp_open();
@@ -9707,6 +9737,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             tags: core::mem::take(&mut self.tags),
             property_starts: core::mem::take(&mut self.property_starts),
             comments: core::mem::take(&mut self.comments),
+            unicode_block_scalars: {
+                let mut listed = core::mem::take(&mut self.unicode_block_scalars);
+                listed.sort_unstable();
+                listed.dedup();
+                listed
+            },
         })
     }
 
@@ -11479,59 +11515,73 @@ mod tests {
     }
 
     /// #6369: the eight-bytes-a-step walk stops where the plain skip does, and its flag is exactly
-    /// whether a byte outside ASCII lies between the start and the stop, under both `HAS_CR`
-    /// specializations (a CR is a break only under `true`).
+    /// whether a NEL, LS or PS lies in the line it passed, under both `HAS_CR` specializations (a
+    /// CR is a break only under `true`). The pieces are the bytes the word tests could confuse for
+    /// each other: the lead bytes with and without their continuation, an em dash, and a byte one
+    /// bit from a break, at every offset in a word and across word ends.
     #[test]
-    fn skip_to_eol_noting_non_ascii_agrees_with_the_plain_skip_6369() {
+    fn skip_to_eol_noting_unicode_break_agrees_with_the_plain_skip_6369() {
         fn check<const HAS_CR: bool>(bytes: &[u8], from: usize) {
             let mut plain = Parser::<HAS_CR>::new(bytes);
             plain.pos = from;
             plain.skip_to_eol();
             let mut fast = Parser::<HAS_CR>::new(bytes);
             fast.pos = from;
-            let mut saw_non_ascii = false;
-            fast.skip_to_eol_noting_non_ascii(&mut saw_non_ascii);
+            let mut saw = false;
+            fast.skip_to_eol_noting_unicode_break(&mut saw);
             assert_eq!(
                 fast.pos, plain.pos,
                 "{bytes:?} from {from} (HAS_CR {HAS_CR})"
             );
-            assert_eq!(
-                saw_non_ascii,
-                bytes[from..plain.pos].iter().any(|&b| b >= 0x80),
-                "{bytes:?} from {from} (HAS_CR {HAS_CR})"
-            );
+            let want = (from..plain.pos).any(|i| block_unicode::unicode_break_len(bytes, i) > 0);
+            assert_eq!(saw, want, "{bytes:?} from {from} (HAS_CR {HAS_CR})");
         }
-        // 0x8A and 0x8D sit one bit above a line feed and a carriage return
-        let alphabet: [u8; 9] = [b'a', b'\t', b'\n', b'\r', 0x01, 0x8A, 0x8D, 0xC2, b' '];
+        let pieces: [&[u8]; 14] = [
+            b"a",
+            b"x",
+            b" ",
+            b"\t",
+            b"\n",
+            b"\r",
+            &[0xC2],
+            &[0xC2, 0x85],
+            &[0xE2],
+            &[0xE2, 0x80],
+            &[0xE2, 0x80, 0xA8],
+            &[0xE2, 0x80, 0xA9],
+            &[0xE2, 0x80, 0x94],
+            &[0x8A],
+        ];
         let mut seed = 0x2545_F491_4F6C_DD1Du64;
-        for _ in 0..4000 {
-            let len = {
-                seed ^= seed << 13;
-                seed ^= seed >> 7;
-                seed ^= seed << 17;
-                (seed % 40) as usize
-            };
-            let bytes: Vec<u8> = (0..len)
-                .map(|_| {
-                    seed ^= seed << 13;
-                    seed ^= seed >> 7;
-                    seed ^= seed << 17;
-                    // mostly plain text, so a break or a high byte lands at every alignment
-                    if seed % 5 == 0 {
-                        alphabet[(seed >> 8) as usize % alphabet.len()]
-                    } else {
-                        b'x'
-                    }
-                })
-                .collect();
-            for from in 0..=len {
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut with_break = 0;
+        for _ in 0..6000 {
+            let mut bytes: Vec<u8> = Vec::new();
+            for _ in 0..(next() % 14) {
+                // mostly plain text, so each piece lands at every alignment
+                if next() % 3 == 0 {
+                    bytes.extend_from_slice(pieces[(next() % pieces.len() as u64) as usize]);
+                } else {
+                    bytes.push(b'x');
+                }
+            }
+            for from in 0..=bytes.len() {
                 check::<true>(&bytes, from);
                 // `Parser::<false>` is built for input without a CR only
                 if !bytes.contains(&b'\r') {
                     check::<false>(&bytes, from);
                 }
             }
+            with_break += usize::from(
+                (0..bytes.len()).any(|i| block_unicode::unicode_break_len(&bytes, i) > 0),
+            );
         }
+        assert!(with_break > 500, "only {with_break} inputs held a break");
     }
 
     /// #6348: a block scalar header holds one chomping character, one digit 1-9, blanks, a comment

@@ -20,9 +20,7 @@ use std::rc::Rc;
 #[cfg(test)]
 use std::string::ToString;
 
-use super::block_unicode::{
-    any_break_len, decode_block_unicode, needs_unicode_reading, unicode_break_len,
-};
+use super::block_unicode::{any_break_len, decode_block_unicode, unicode_break_len};
 use super::encode_style::{
     flow_plain_needs_single_quotes, go_yaml_explicit_key_scalar, go_yaml_key_is_simple,
     go_yaml_multiline_scalar, go_yaml_single_quoted_line_feed, go_yaml_unicode_separator_scalar,
@@ -425,6 +423,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                     indicator_pos: effective_text_pos,
                     chomping,
                     explicit_indent,
+                    unicode: self
+                        .index
+                        .block_scalar_holds_unicode_break(effective_text_pos),
                 })
             }
             b'>' => {
@@ -435,6 +436,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                     indicator_pos: effective_text_pos,
                     chomping,
                     explicit_indent,
+                    unicode: self
+                        .index
+                        .block_scalar_holds_unicode_break(effective_text_pos),
                 })
             }
             _ => {
@@ -6041,6 +6045,8 @@ pub enum YamlString<'a> {
         chomping: ChompingIndicator,
         /// Explicit indentation indicator (1-9), or None for auto-detect
         explicit_indent: Option<u8>,
+        /// Whether the scalar holds NEL, LS or PS, which end a line to go-yaml as `\n` does (#6369)
+        unicode: bool,
     },
     /// Block folded scalar (`>`): folds newlines to spaces
     BlockFolded {
@@ -6049,6 +6055,8 @@ pub enum YamlString<'a> {
         chomping: ChompingIndicator,
         /// Explicit indentation indicator (1-9), or None for auto-detect
         explicit_indent: Option<u8>,
+        /// Whether the scalar holds NEL, LS or PS, which end a line to go-yaml as `\n` does (#6369)
+        unicode: bool,
     },
 }
 
@@ -6099,18 +6107,21 @@ impl<'a> YamlString<'a> {
                 indicator_pos,
                 chomping,
                 explicit_indent,
+                unicode,
             }
             | YamlString::BlockFolded {
                 text,
                 indicator_pos,
                 chomping,
                 explicit_indent,
+                unicode,
             } => {
                 let (_, content_end) = Self::find_block_content_range(
                     text,
                     *indicator_pos,
                     *chomping,
                     *explicit_indent,
+                    *unicode,
                 );
                 &text[*indicator_pos..content_end]
             }
@@ -6196,13 +6207,15 @@ impl<'a> YamlString<'a> {
                 indicator_pos,
                 chomping,
                 explicit_indent,
-            } => decode_block_literal(text, *indicator_pos, *chomping, *explicit_indent),
+                unicode,
+            } => decode_block_literal(text, *indicator_pos, *chomping, *explicit_indent, *unicode),
             YamlString::BlockFolded {
                 text,
                 indicator_pos,
                 chomping,
                 explicit_indent,
-            } => decode_block_folded(text, *indicator_pos, *chomping, *explicit_indent),
+                unicode,
+            } => decode_block_folded(text, *indicator_pos, *chomping, *explicit_indent, *unicode),
         }
     }
 
@@ -6284,56 +6297,41 @@ impl<'a> YamlString<'a> {
     }
 
     /// Find content range for a block scalar.
-    /// Returns (content_start, content_end).
+    /// Returns (content_start, content_end). `unicode` is the scalar's own flag (#6369): it reads
+    /// NEL, LS and PS as line breaks, as go-yaml does; every other scalar is read as before.
     fn find_block_content_range(
         text: &[u8],
         indicator_pos: usize,
         chomping: ChompingIndicator,
         explicit_indent: Option<u8>,
+        unicode: bool,
     ) -> (usize, usize) {
-        let (start, end, _) =
-            Self::find_block_content_range_unicode(text, indicator_pos, chomping, explicit_indent);
-        (start, end)
-    }
-
-    /// [`Self::find_block_content_range`], and whether the scalar holds NEL, LS or PS and was read
-    /// the way go-yaml reads one, which ends a line at each of them as at `\n` (#6369). The range is
-    /// found first as the `\n`-and-`\r` reader finds it, which is the whole cost for the scalar
-    /// without one: a scan of its bytes for a byte outside ASCII ([`needs_unicode_reading`]).
-    fn find_block_content_range_unicode(
-        text: &[u8],
-        indicator_pos: usize,
-        chomping: ChompingIndicator,
-        explicit_indent: Option<u8>,
-    ) -> (usize, usize, bool) {
-        let (start, end, scanned_to) = Self::find_block_content_range_impl::<false>(
-            text,
-            indicator_pos,
-            chomping,
-            explicit_indent,
-        );
-        if needs_unicode_reading(text, start, scanned_to) {
-            let (start, end, _) = Self::find_block_content_range_impl::<true>(
+        let (start, end) = if unicode {
+            Self::find_block_content_range_impl::<true>(
                 text,
                 indicator_pos,
                 chomping,
                 explicit_indent,
-            );
-            return (start, end, true);
-        }
-        (start, end, false)
+            )
+        } else {
+            Self::find_block_content_range_impl::<false>(
+                text,
+                indicator_pos,
+                chomping,
+                explicit_indent,
+            )
+        };
+        (start, end)
     }
 
-    /// The range of a block scalar's content and the position its lines were read up to (the
-    /// start of the dedent line that ended it, or the end of the text). `UNICODE` reads NEL, LS and
-    /// PS as line breaks too (#6369); without it this is the `\n`-and-`\r` reader every scalar
-    /// without those breaks gets.
+    /// The range of a block scalar's content. `UNICODE` reads NEL, LS and PS as line breaks too
+    /// (#6369); without it this is the `\n`-and-`\r` reader every scalar without those breaks gets.
     fn find_block_content_range_impl<const UNICODE: bool>(
         text: &[u8],
         indicator_pos: usize,
         chomping: ChompingIndicator,
         explicit_indent: Option<u8>,
-    ) -> (usize, usize, usize) {
+    ) -> (usize, usize) {
         // The width of the break at `pos` in this reading, or 0.
         #[inline(always)]
         fn break_at<const UNICODE: bool>(text: &[u8], pos: usize) -> usize {
@@ -6349,7 +6347,7 @@ impl<'a> YamlString<'a> {
             pos += 1;
         }
         if pos >= text.len() {
-            return (pos, pos, pos); // Empty block scalar
+            return (pos, pos); // Empty block scalar
         }
         pos += line_break_len(text, pos); // Skip the line break
 
@@ -6390,9 +6388,9 @@ impl<'a> YamlString<'a> {
                         // is `""`. Reaching back past `content_start` to borrow the
                         // indicator line's own terminator would fabricate a break the
                         // scalar never had (#344).
-                        return (content_start, end, content_start);
+                        return (content_start, end);
                     }
-                    return (content_start, content_start, content_start);
+                    return (content_start, content_start);
                 }
             };
 
@@ -6457,9 +6455,6 @@ impl<'a> YamlString<'a> {
             }
         }
 
-        // Where the lines were read up to, before chomping moves `pos` (keep) to its end.
-        let scanned_to = pos;
-
         // Apply chomping
         let content_end = match chomping {
             ChompingIndicator::Strip => last_content_end,
@@ -6475,7 +6470,7 @@ impl<'a> YamlString<'a> {
             ChompingIndicator::Keep => pos, // Include all trailing newlines
         };
 
-        (content_start, content_end, scanned_to)
+        (content_start, content_end)
     }
 
     /// The indent of the block that owns a block scalar whose header is the first thing on
@@ -7434,12 +7429,14 @@ fn decode_block_literal(
     indicator_pos: usize,
     chomping: ChompingIndicator,
     explicit_indent: Option<u8>,
+    unicode: bool,
 ) -> Result<Cow<'_, str>, YamlStringError> {
-    let (content_start, content_end, unicode) = YamlString::find_block_content_range_unicode(
+    let (content_start, content_end) = YamlString::find_block_content_range(
         text,
         indicator_pos,
         chomping,
         explicit_indent,
+        unicode,
     );
 
     if content_start >= content_end {
@@ -7564,12 +7561,14 @@ fn decode_block_folded(
     indicator_pos: usize,
     chomping: ChompingIndicator,
     explicit_indent: Option<u8>,
+    unicode: bool,
 ) -> Result<Cow<'_, str>, YamlStringError> {
-    let (content_start, content_end, unicode) = YamlString::find_block_content_range_unicode(
+    let (content_start, content_end) = YamlString::find_block_content_range(
         text,
         indicator_pos,
         chomping,
         explicit_indent,
+        unicode,
     );
 
     if content_start >= content_end {
@@ -14704,17 +14703,16 @@ mod tests {
                 ] {
                     let text = format!("a: {header}{suffix}\n{body}");
                     let bytes = text.as_bytes();
-                    let (start, _, unicode) =
-                        YamlString::find_block_content_range_unicode(bytes, 3, chomping, None);
-                    assert!(!unicode, "{text:?}");
+                    let (start, _) =
+                        YamlString::find_block_content_range(bytes, 3, chomping, None, false);
                     let Some(indent) = YamlString::block_content_indent(bytes, 3, start, None)
                     else {
                         continue;
                     };
                     let want = if folded {
-                        decode_block_folded(bytes, 3, chomping, None)
+                        decode_block_folded(bytes, 3, chomping, None, false)
                     } else {
-                        decode_block_literal(bytes, 3, chomping, None)
+                        decode_block_literal(bytes, 3, chomping, None, false)
                     };
                     let got = decode_block_unicode(bytes, start, indent, chomping, folded);
                     if let (Ok(want), Ok(got)) = (&want, &got) {

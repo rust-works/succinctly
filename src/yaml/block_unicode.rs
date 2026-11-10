@@ -9,9 +9,9 @@
 //!
 //! The kernels ([`super::simd::find_block_scalar_end`]) run once per block scalar and stay as they
 //! are. A scalar is read here instead only when its text holds one of the three breaks, which
-//! almost none does: the callers first ask whether any byte is outside ASCII (one `AND` per word
-//! on the walk they already make, or [`slice::is_ascii`]) and only then [`holds_unicode_break`].
-//! What this module holds is the slow path for that scalar, and it follows go-yaml's
+//! almost none does: the parser notes one on the line walk it makes anyway (looking at a byte only
+//! where a `0xC2` or `0xE2` lead byte shows up) and lists the scalar in the index, so the decoders
+//! never scan for one. What this module holds is the slow path for that scalar, and it follows go-yaml's
 //! `yaml_parser_scan_block_scalar`, which is where its answers (the end, the value, the refusals)
 //! come from:
 //!
@@ -43,35 +43,6 @@ pub(super) fn any_break_len(bytes: &[u8], pos: usize) -> usize {
         Some(0xC2 | 0xE2) => unicode_break_len(bytes, pos),
         _ => 0,
     }
-}
-
-/// Whether `bytes` holds a NEL, LS or PS. The callers have already seen a byte outside ASCII, so
-/// this looks for the two lead bytes, `0xC2` and `0xE2`, and reads only those.
-pub(super) fn holds_unicode_break(bytes: &[u8]) -> bool {
-    let mut at = 0;
-    while let Some(i) = bytes[at..].iter().position(|&b| b == 0xC2 || b == 0xE2) {
-        if unicode_break_len(bytes, at + i) > 0 {
-            return true;
-        }
-        at += i + 1;
-    }
-    false
-}
-
-/// Whether a block scalar whose lines lie in `bytes[start..end]` needs go-yaml's reading of
-/// Unicode breaks: its text holds one, or the line that ends it (`end`, a dedent) is only spaces
-/// and one, which go-yaml reads as an empty line that does not end the scalar.
-#[inline]
-pub(super) fn needs_unicode_reading(bytes: &[u8], start: usize, end: usize) -> bool {
-    let region = &bytes[start..end.min(bytes.len())];
-    if !region.is_ascii() && holds_unicode_break(region) {
-        return true;
-    }
-    let mut at = end;
-    while bytes.get(at) == Some(&b' ') {
-        at += 1;
-    }
-    unicode_break_len(bytes, at) > 0
 }
 
 /// Where a block scalar of `indent` spaces that begins at `start` (the first byte of the first
@@ -239,33 +210,6 @@ mod tests {
         // A lead byte cut off by the end of the input is no break.
         assert_eq!(unicode_break_len(&[0xE2, 0x80], 0), 0);
         assert_eq!(unicode_break_len(&[0xC2], 0), 0);
-    }
-
-    #[test]
-    fn holds_unicode_break_reads_past_lead_bytes_that_are_not_breaks() {
-        assert!(!holds_unicode_break(
-            "caf\u{e9} \u{2014} \u{c2a0} \u{20ac}".as_bytes()
-        ));
-        assert!(holds_unicode_break("\u{2014} x\u{2028}y".as_bytes()));
-        assert!(holds_unicode_break("\u{c2a0}\u{85}".as_bytes()));
-        assert!(!holds_unicode_break(b""));
-    }
-
-    #[test]
-    fn needs_unicode_reading_sees_a_break_in_the_text_or_in_the_dedent_line() {
-        let text = format!("  x{LS}y\nb: 1\n");
-        assert!(needs_unicode_reading(text.as_bytes(), 0, text.len()));
-        // No break in the text, the line that ends the scalar is spaces and a break: an empty line.
-        let text = format!("  x\n {PS}b: 1\n");
-        assert!(needs_unicode_reading(text.as_bytes(), 0, 4));
-        let text = "  x\nb: 1\n";
-        assert!(!needs_unicode_reading(text.as_bytes(), 0, 4));
-        let text = "  caf\u{e9}\u{2014}\nb: 1\n";
-        assert!(!needs_unicode_reading(
-            text.as_bytes(),
-            0,
-            text.find('b').unwrap()
-        ));
     }
 
     #[test]
