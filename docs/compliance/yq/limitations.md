@@ -3369,7 +3369,11 @@ sequence of sources folded in reverse, so the earlier source wins a shared key) 
 An own key written after the `<<` overrides the merged value in place and one written before it is
 overridden by it. `succinctly yq` matches both since #4983 (`MergeView::Rendering` for the JSON writers and
 the owned conversion, `MergeView::Iteration` for everything else that reads the fields), over the
-13 merge shapes in `tests/yq_cli/i4983.rs`. A mapping with one source reads the same either way. The
+13 merge shapes in `tests/yq_cli/i4983.rs`.
+A mapping with one source reads the same either way, unless an own key written after the `<<` replaces a member the source has (#6851).
+There yq's rendering lists the merged members that key does not replace and then the key (`<<: *g` / `a: 9` over `{a: 1, b: 2, c: 3}` renders `{"b":2,"c":3,"a":9}` and iterates `a, b, c`), and so does `succinctly yq`.
+A `<<` with several sources and an own key over one of them keeps the fold's order and differs: `<<: [*g, *h]` / `d: 5` / `a: 4` renders `{"c":3,"d":5,"b":2,"a":4}` in yq, where `d` (from `*h`) stays in place and `a` (from `*g`) moves.
+The
 layer is shared with `succinctly jq` over YAML, which therefore iterates a sequence merge the way yq
 does (and answers `.item.z` the way it already did).
 yq's JSON rendering leaves an *inline-mapping* source out (`<<: {q: 1}` renders `{"k":0}`; so do an anchored inline mapping and `{q: *a}`, while an alias source renders; `.item.q` and `.[]` still see them).
