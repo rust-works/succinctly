@@ -1958,18 +1958,6 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 .rposition(|frame| frame.indent == self.pending_block.column)
                 .and_then(|at| Self::last_mapping_key(core::iter::once(&frames[at])));
             if let Some(target) = target {
-                // An earlier block of the run already settled there: the blank line that split them is kept,
-                // as an empty line before this one.
-                let first_start = self.pending_head_lines.first().map(|&(start, _)| start);
-                if let Some(start) = first_start {
-                    if self
-                        .comments
-                        .get(&target)
-                        .is_some_and(|c| !c.foot.is_empty())
-                    {
-                        self.pending_head_lines.insert(0, (start, start));
-                    }
-                }
                 self.drain_pending_into_foot(target);
                 return;
             }
@@ -1981,28 +1969,23 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// `b: &x` or `b: !!str` (#5053). Its value, if any, comes on a later line, so a comment directly below
     /// it is read as part of looking for that value.
     fn follows_valueless_key(&self) -> bool {
-        let Some(&(first, _)) = self.pending_head_lines.first() else {
-            return false;
-        };
         let text = self.input;
-        let mut line_start = first as usize;
+        let mut line_start = self
+            .pending_head_lines
+            .first()
+            .map_or(0, |&(first, _)| first) as usize;
         while line_start > 0 && !is_line_break(text[line_start - 1]) {
             line_start -= 1;
         }
-        if line_start == 0 {
-            return false;
-        }
-        let mut line_end = line_start - 1;
-        if text[line_end] == b'\n' && line_end > 0 && text[line_end - 1] == b'\r' {
-            line_end -= 1;
-        }
-        let mut prev_start = line_end;
-        while prev_start > 0 && !is_line_break(text[prev_start - 1]) {
-            prev_start -= 1;
-        }
-        let Ok(line) = core::str::from_utf8(&text[prev_start..line_end]) else {
-            return false;
-        };
+        // The line above, without its break.
+        let above = &text[..line_start];
+        let above = above
+            .strip_suffix(b"\r\n")
+            .or_else(|| above.strip_suffix(b"\n"))
+            .or_else(|| above.strip_suffix(b"\r"))
+            .unwrap_or(above);
+        let line = above.rsplit(|&b| is_line_break(b)).next().unwrap_or(&[]);
+        let line = String::from_utf8_lossy(line);
         // The last token that is not a property or a trailing comment must end the key.
         let mut last = None;
         for token in line.split_ascii_whitespace() {

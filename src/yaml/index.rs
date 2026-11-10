@@ -1914,6 +1914,19 @@ mod tests {
         assert!(head.is_empty(), "{head:?}");
     }
 
+    /// Two standalone comment lines of a CRLF file are two blocks to go-yaml (a blank line follows each), so the
+    /// first is the previous key's foot and the second the next key's head (#5053; yq v4.53.3 answers
+    /// `.a | key | foot_comment` as `c1` and `.b | key | head_comment` as `c2`), where the LF text joins them.
+    #[test]
+    fn two_crlf_comment_lines_are_two_blocks_5053() {
+        let (_, foot) = field_key_head_foot(b"a: 1\r\n# c1\r\n# c2\r\nb: 2\r\n", "a");
+        assert_eq!(foot, ["# c1"]);
+        let (head, _) = field_key_head_foot(b"a: 1\r\n# c1\r\n# c2\r\nb: 2\r\n", "b");
+        assert_eq!(head, ["# c2"]);
+        let (head, _) = field_key_head_foot(b"a: 1\n# c1\n# c2\nb: 2\n", "b");
+        assert_eq!(head, ["# c1", "# c2"]);
+    }
+
     #[test]
     fn the_raw_range_keeps_the_hash_and_any_odd_spacing_798() {
         // `# ` (hash *space*) is stripped at read time, so a tab-separated
