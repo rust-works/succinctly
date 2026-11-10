@@ -124,9 +124,18 @@ impl<'a> DsvCursor<'a> {
         // A CRLF record ends with the two bytes (RFC 4180): a `\r` right before the `\n` that ends
         // the record, or before the end of the text, belongs to the terminator and not to the last
         // field (#6874). One in front of a delimiter is content, and so is one inside a quoted
-        // field, which then ends in the closing quote.
+        // field, which then ends in the closing quote; so is one in a quoted field that never
+        // closes, which is how a text that ends inside a quote reads. Like `strip_quotes`, this
+        // reads the default quote `"` and record terminator `\n`: the index does not carry its
+        // configuration, and `DsvConfig::newline` is read nowhere.
         match field.split_last() {
-            Some((&b'\r', head)) if end >= self.text.len() || self.text[end] == b'\n' => head,
+            Some((&b'\r', head))
+                if (end >= self.text.len() || self.text[end] == b'\n')
+                    && (head.first() != Some(&b'"')
+                        || (head.len() >= 2 && head.last() == Some(&b'"'))) =>
+            {
+                head
+            }
             _ => field,
         }
     }
@@ -365,6 +374,9 @@ mod tests {
             strs(fields(b"\"x\r\ny\",z\r\n")),
             vec![vec!["\"x\r\ny\"", "z"]]
         );
+        // A quoted field that never closes keeps its `\r`: it is content there.
+        assert_eq!(strs(fields(b"a,\"x\r")), vec![vec!["a", "\"x\r"]]);
+        assert_eq!(strs(fields(b"a,\"x\"\r")), vec![vec!["a", "\"x\""]]);
         // `get` reads the same field the iterator does.
         let text = b"a,b\r\n1,2\r\n";
         let index = build_index(text, &DsvConfig::default());
