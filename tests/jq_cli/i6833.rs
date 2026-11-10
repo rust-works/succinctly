@@ -54,7 +54,7 @@ const ROWS: &[(&str, &str)] = &[
         "[5,5]\n",
     ),
     (
-        r#"def f: length; [1,2,3] | map(.) | . as $t | [range(2) | ($t | f)]"#,
+        r"def f: length; [1,2,3] | map(.) | . as $t | [range(2) | ($t | f)]",
         "[3,3]\n",
     ),
     (
@@ -62,15 +62,15 @@ const ROWS: &[(&str, &str)] = &[
         "[2,2]\n",
     ),
     (
-        r#"def f: length; null | . as $t | [range(2) | ($t | f)]"#,
+        r"def f: length; null | . as $t | [range(2) | ($t | f)]",
         "[0,0]\n",
     ),
     (
-        r#"def f: length; -5 | . as $t | [range(2) | ($t | f)]"#,
+        r"def f: length; -5 | . as $t | [range(2) | ($t | f)]",
         "[5,5]\n",
     ),
     (
-        r#"def f: length; true | . as $t | [range(2) | try ($t | f) catch .]"#,
+        r"def f: length; true | . as $t | [range(2) | try ($t | f) catch .]",
         "[\"boolean (true) has no length\",\"boolean (true) has no length\"]\n",
     ),
     (
