@@ -11176,14 +11176,19 @@ pub(crate) fn eval_owned_count_door<S: EvalSemantics>(
 /// (`def f: length; ... | f`), answered from the owned value as the body written inline is
 /// (#6833). The call is its own door: it is not a closed-grammar stage, so the pipe that holds
 /// it sent every call through the re-index bridge, which writes the whole value out as text and
-/// indexes it again to take its length (0.85 s against 0.07 s for the inline `length`, over a
-/// 7 MB string called 100 times).
+/// indexes it again to take its length (1172 ms against 89 ms for the inline `length`, over a 7 MB
+/// string called 100 times, on a Ryzen 9 7950X; 537 ms against 42 ms on an M4 Pro).
 ///
 /// The body is read as the definition holds it, with no binding step and no frame charged: the
 /// doors answer only a body made of a literal, `.` and the builtins they know, which cannot call
 /// anything, recurse or raise, so there is no depth to guard and no argument to substitute. A
 /// body that is itself a call (`def f: g;`), one with a parameter, and every other shape
 /// decline, and the evaluator keeps them. The answer is a fresh value, as the count doors' are.
+///
+/// **This leans on what the doors decline.** A body that names a parameter or a variable of an
+/// enclosing scope (`def g(x): def f: length > x; ...`) is safe here only because the doors read
+/// neither, and `tests/jq_cli/i6833.rs` pins those rows. A door arm that evaluates a call or
+/// resolves a variable has to be kept out of this function, or given the binding step.
 fn eval_owned_def_call_count<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
@@ -179322,8 +179327,9 @@ mod touched_edge_cases_2999 {
             "def f: length; ascii_downcase | . as $t | [range(40) | ($t | f)] | length",
         );
         assert_eq!(called, "40");
+        // Not once per call: the bridge reads 82 here with the door off, the door 3 or fewer.
         assert!(
-            called_count <= inline_count,
+            called_count <= inline_count && called_count < 10,
             "the call is answered from the string: {called_count} against {inline_count}"
         );
         let (bridged, bridged_count) = run::<JqSemantics>(
@@ -179334,6 +179340,19 @@ mod touched_edge_cases_2999 {
             bridged_count >= inline_count + 40,
             "a parameter keeps the bridge: {bridged_count} against {inline_count}"
         );
+        // A container is counted off the tree by the same door, which is not the string's.
+        for input in ["[1,2,3] | map(.)", "{\"a\":1,\"b\":2} | with_entries(.)"] {
+            let program =
+                |body: &str| format!("{input} | . as $t | [range(40) | ($t | {body})] | length");
+            let (inline, inline_count) = run::<JqSemantics>(&program("length"));
+            let (called, called_count) =
+                run::<JqSemantics>(&format!("def f: length; {}", program("f")));
+            assert_eq!(called, inline, "{input}");
+            assert!(
+                called_count <= inline_count && called_count < 10,
+                "{input}: {called_count} against {inline_count}"
+            );
+        }
         for (name, run) in [
             ("jq", run::<JqSemantics> as fn(&str) -> (String, usize)),
             ("yq", run::<YqSemantics>),

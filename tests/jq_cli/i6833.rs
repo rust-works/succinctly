@@ -2,7 +2,8 @@
 //! count the string door answers) is answered from the string, as the same body written inline is,
 //! instead of through the reindex bridge once per call. Every row is `jq -nc PROGRAM` against what
 //! jq 1.7.1 (`/usr/bin/jq`) prints, with exit status 0: the shadowing, redefinition, parameter,
-//! non-string and error rows are the ones a door that read the body too loosely would change.
+//! non-string, error and closure-capturing rows are the ones a door that read the body too loosely
+//! would change.
 
 use anyhow::Result;
 
@@ -114,9 +115,50 @@ const ROWS: &[(&str, &str)] = &[
         r#"def f: length; "aé😀" | ascii_downcase | . as $t | [range(2) | ($t | f)]"#,
         "[3,3]\n",
     ),
+    // A nested def that captures an enclosing parameter or variable is not the door's to answer.
     (
-        r#"def f: length; "aé😀" | ascii_downcase | . as $t | [range(2) | ($t | f)]"#,
-        "[3,3]\n",
+        r#"def g(x): def f: length > x; "héllo" | ascii_downcase | . as $t | [range(2) | ($t | f)]; g(3)"#,
+        "[true,true]\n",
+    ),
+    (
+        r#"def g(x): def f: length > x; "héllo" | ascii_downcase | . as $t | [range(2) | ($t | f)]; g(9)"#,
+        "[false,false]\n",
+    ),
+    (
+        r#"def g($x): def f: length > $x; "héllo" | ascii_downcase | . as $t | [range(2) | ($t | f)]; g(3)"#,
+        "[true,true]\n",
+    ),
+    (
+        r#"3 as $n | def f: length > $n; "héllo" | ascii_downcase | . as $t | [range(2) | ($t | f)]"#,
+        "[true,true]\n",
+    ),
+    (
+        r#"9 as $n | def f: length > $n; "héllo" | ascii_downcase | . as $t | [range(2) | ($t | f)]"#,
+        "[false,false]\n",
+    ),
+    (
+        r#"def g(x): def f: length + x; "héllo" | ascii_downcase | . as $t | [range(2) | ($t | f)]; g(10)"#,
+        "[15,15]\n",
+    ),
+    (
+        r#"def g(x): def f: startswith(x); "héllo" | ascii_downcase | . as $t | [range(2) | ($t | f)]; g("h")"#,
+        "[true,true]\n",
+    ),
+    (
+        r#"def g(x): def f: startswith(x); "héllo" | ascii_downcase | . as $t | [range(2) | ($t | f)]; g("z")"#,
+        "[false,false]\n",
+    ),
+    (
+        r#""h" as $p | def f: startswith($p); "héllo" | ascii_downcase | . as $t | [range(2) | ($t | f)]"#,
+        "[true,true]\n",
+    ),
+    (
+        r#"def g(x): def f: if length > x then "long" else "short" end; "héllo" | ascii_downcase | . as $t | reduce range(2) as $i ([]; . + [$t | f]); g(9)"#,
+        "[\"short\",\"short\"]\n",
+    ),
+    (
+        r#"def f: length; def g: def f: 1; f; "héllo" | ascii_downcase | . as $t | [range(2) | ($t | g)]"#,
+        "[1,1]\n",
     ),
 ];
 
