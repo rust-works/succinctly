@@ -1188,6 +1188,34 @@ Five things still differ, each in yq v4.53.3 against `succinctly yq`:
 
 An accumulator the fold computed carries no document origin: `. as $i ireduce ({}; . * $i) | file_index` is `0`, as in yq.
 
+### A `$name` stage after a fan-out answers its value once ([#6821](https://github.com/rust-works/succinctly/issues/6821))
+
+yq's `GET_VARIABLE` returns the list the variable is stored in, and a pipe evaluates its right side once over the whole list its left side produced.
+So `$name` as a pipe stage after a fan-out is one node however many reached it, and even when none did, and every stage after it sees that one node.
+`.n as $v | .x[] | $v` is one `7`, `.x | map($v)` is `[7]`, `.x[] | select(. > 5) | $v` is one `7` from an empty context, and `.x[] | $v | . + 1` is one `8`.
+`succinctly yq` answered one per element.
+It follows yq now, in yq mode only: jq reads `$v` once per input, as `.x[] | $v` is three values there.
+The rewrite is made by the parser, where the stage is still a variable: the stages before it run to the end for their errors and answer `null` once, and the variable follows (`reduce PREFIX as $_ (null; null) | $v`).
+52 rows captured from yq v4.53.3 match, including `map` over a sequence, a mapping, a scalar, `null` and an empty collection, and `path`, `key`, `parent` and `tag` after the variable, which used to answer once per element.
+A `$name` that is not a stage is read per node in yq too and is unchanged: `[$v]`, `{"k": $v}`, `. + $v`, `$v + .`, and the body of an `as` (`.x[] | . as $w | $v`).
+Rows over a computed source (`.x | map(. + 1) | map($v)`), the right side of a write (`.x |= map($v)`, `.x = [.x[] | $v]`) and `--eval-all` (`.x as $v | .x | $v` over two files) match yq too.
+Four things differ.
+- **A variable as a branch of a union.**
+  `.x[] | (5, $v)` is `5 5 5 7` in yq and `5 5 5 7 7 7` here: the walk that evaluates a union over the list reads a variable branch per node.
+- **A prefix that answers one node.**
+  `.x | $v` and `. | $v` are left alone, since one node reaches the variable either way, which keeps the bound node's `line` and the path context of `del(. | $y)`.
+  So is a write (`.a as $y | $y.b = 5 | $y`), which answers its input once and rebinds `$y` for the stages after it ([#2643](https://github.com/rust-works/succinctly/issues/2643)).
+- **The bound node's position.**
+  `.n as $v | .x[] | $v | line` is `2` (and `column` is `4`) in yq and `0` here: the stage that runs the prefix builds a new value, so the pipe leaves the route that resolves a bound node's position from the document.
+  Before this change the same filter answered `2` three times, the right value for the wrong count.
+  An `if` that passes `.` on keeps the position, and leaves the path register at the root, so a write through it (`(. as $x | any | $x) = 5`) replaces the whole document, which the #3758 pins refuse.
+  The node's presentation goes the same way: `.m as $v | .x[] | $v` over `m: {a: 1}` prints `a: 1` here where yq prints `{a: 1}`, with the same data.
+  A prefix of single-valued navigation is not rewritten, so `.n as $v | .x | $v | line` is `2` and its flow style is kept.
+- **A path expression.**
+  The argument of `path(f)` (a `--jq-extensions` form, yq's `path` being nullary) keeps its per-node reading, as it had no oracle.
+  `del(.x[] | $v)` is `Invalid path expression` here, as before this change, and a no-op in yq ([#2643](https://github.com/rust-works/succinctly/issues/2643)).
+  The left side of a write (`(.x[] | $v) = 5`) is a no-op in both.
+
 ### Duplicate mapping keys — an owned value keeps every entry (#1344); a few narrower gaps remain
 
 **Since [#1344](https://github.com/rust-works/succinctly/issues/1344) ([ADR-0027](../../adrs/adr-0027.md)) an `OwnedValue::Object` keeps a repeated mapping key's earlier entries beside its collapsed `IndexMap`.**
