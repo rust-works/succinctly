@@ -50,6 +50,7 @@ const BODY_WRITES: &[(&str, &str, &str)] = &[
     (ALIAS, ".list[] |= (.x = 7)", "{\"base\":{\"x\":7,\"y\":2},\"list\":[{\"x\":7,\"y\":2},{\"x\":7,\"y\":2}]}\n"),
     (ALIAS, ".list[0] |= (.p = 9)", "{\"base\":{\"x\":1,\"y\":2,\"p\":9},\"list\":[{\"x\":1,\"y\":2,\"p\":9},{\"x\":1,\"y\":2,\"p\":9}]}\n"),
     (ONE, ".list[] |= (.x = .i)", "{\"base\":{\"x\":0,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":0,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":0,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":0,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n"),
+    (ONE, ".list[] |= (.x = 7, .y = 1)", "{\"base\":{\"x\":7,\"y\":1,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":7,\"y\":1,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":7,\"y\":1,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":7,\"y\":1,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n"),
 ];
 
 /// A body that replaces the mapping leaves the sources alone, in yq as here.
@@ -68,7 +69,6 @@ const STILL_DIVERGENT: &[(&str, &str, &str, &str)] = &[
     (ONE, ".list[] |= (.x += 1)", "{\"base\":{\"x\":3,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":3,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":3,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":3,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n", "{\"base\":{\"x\":2,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":2,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":2,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":2,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n"),
     (ONE, ".list[0:1] |= (.[0].x = 5)", "{\"base\":{\"x\":5,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":5,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":5,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":5,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n", "{\"base\":{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n"),
     (ONE, ".list |= map(.x = 7)", "{\"base\":{\"x\":7,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":7,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":7,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":7,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n", "{\"base\":{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":7,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":7,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n"),
-    (ONE, ".list[] |= (.x = 7, .y = 1)", "{\"base\":{\"x\":7,\"y\":1,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":7,\"y\":1,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":7,\"y\":1,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":7,\"y\":1,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n", "{\"base\":{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":7,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":7,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n"),
 ];
 
 fn check(rows: &[(&str, &str, &str)]) -> Result<()> {
@@ -98,9 +98,9 @@ fn test_the_body_shapes_that_still_change_only_the_mappings_copy_6827() -> Resul
     // Not yq's answers, recorded in docs/compliance/yq/limitations.md. A body that deletes a key and
     // then writes more (also behind a group) cannot be told from a changed member by comparing the
     // two documents. A body that reads the member it writes (`.x += 1` over mappings that share a
-    // source) writes the source once, where yq counts each mapping's turn. A slice target, a
-    // comma and a body that is not a chain of writes (`map(.x = 7)`) are not looked into. Both
-    // answers are pinned, so a change in either shows.
+    // source) writes the source once, where yq counts each mapping's turn. A slice target, and a
+    // body that is not a chain of writes (`map(.x = 7)`), are not looked into. Both answers are
+    // pinned, so a change in either shows.
     for (document, filter, yq, ours) in STILL_DIVERGENT {
         let (stdout, code) = run_yq_stdin(filter, document, JSON)?;
         assert_eq!(

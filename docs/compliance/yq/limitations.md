@@ -3402,8 +3402,14 @@ Still divergent, and unchanged from #6785 (the mapping's own copy changes and th
 - a body that reads the member it writes (`.list[] |= (.x += 1)`) writes the source once, where yq counts each mapping's turn (`3` for two mappings over `x: 1`, `2` here);
 - a body that deletes a key and then writes more (`del(.x) | .x = 3`, `.x = 3 | del(.y)`, also behind a group), where yq's write makes a new own entry;
 - an update whose target is a slice (`.list[0:1] |= (.[0].x = 5)`);
-- a body that is not a chain of writes: a comma (`.list[] |= (.x = 7, .y = 1)`, where yq applies both), `map(.x = 7)` over the list, `if`, `//` and a function call (`.list |= map(.x = 7)` leaves the source at `1` where yq writes `7`).
+- a body that is not a chain of writes: `map(.x = 7)` over the list, `if`, `//` and a function call (`.list |= map(.x = 7)` leaves the source at `1` where yq writes `7`).
+A comma whose first branch is a write (`.list[] |= (.x = 7, .y = 1)`) applies every write, as in yq, since [#6854](https://github.com/rust-works/succinctly/issues/6854): see the next paragraph.
 A body that replaces the mapping (`. = {"x": 5}`) leaves the sources alone, as in yq, and so does a filter that is not a write (`|= {"x": 5}`).
+A comma body of `|=` applies every write in it, as yq does (#6854): yq evaluates the body against the target node itself, an assignment in it changes that node in place, and the update takes the first output, so `.a |= (.x = 7, .y = 1)` sets both `x` and `y`.
+The comma is rewritten as `with(PATH; BODY)` already reads its update: the writes run in order on the evolving node and any other branch is evaluated for its errors.
+It applies in `succinctly yq` only (jq's `|=` keeps the first output of any body), to a comma whose first branch answers the node itself: an assignment, a delete or `.`, alone, grouped, piped or behind an `as` binding, with the comma in a group, a pipe, behind a binding or ahead of a `//`.
+A first branch that may be empty (`select(..)`) counts only while every later branch is a write: `.a |= (select(.x == 2), 5)` is `5` in yq and here, and so is a body that starts with a value (`.a |= (5, .x = 7)`, `.a |= (.x, .y = 5)`).
+A comma under a construct that is not yq syntax (`if`, `try`, `reduce`, under `--jq-extensions`) keeps its first output.
 A write followed by a read stage (`del(.item.z) | .item.z`) is not an alias-sensitive write, so no table is installed for it, as for an alias.
 A source replaced by a mapping with other keys (`.a = {"y": 1}`, `.a |= {"y": 2}`) drops the members it held from the merging mapping, where yq shows the new keys (`item` is `{y: 1, k: 0}`): the table lists the members the document had, so a key the source gains is not followed.
 A member whose source is a `<<` mapping written in place, or one reached through a mapping that itself merges (`n2: {<<: *n}` with `n: &n {<<: *b}`), has no node of its own to write and keeps the mapping's own entry.
