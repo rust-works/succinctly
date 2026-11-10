@@ -1513,9 +1513,17 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// an outer key (#5053); a block at or left of the item's column is placed by that column.
     /// GitHub's default CodeQL workflow has `languages:` / block / blank / block / blank / `- name:`.
     fn defers_foot_to_next_item(&self, next_column: usize) -> bool {
-        self.pending_block.follows_foot_at.is_some()
+        // Like `outer_key_of_settled_foot`: the node must dedent past the column the first block closed.
+        self.pending_block
+            .follows_foot_at
+            .is_some_and(|closed_at| next_column < closed_at)
             && self.current_type == Some(NodeType::SequenceItem)
             && self.pending_block.column > next_column
+            // yq drops the block before a flow collection item, which succinctly does not reproduce.
+            && !self.input[self.pos.min(self.input.len())..]
+                .iter()
+                .find(|&&b| !matches!(b, b' ' | b'\t'))
+                .is_some_and(|&b| matches!(b, b'[' | b'{'))
     }
 
     /// Hand the pending block to the first key of the item opening now, keeping the blank lines between its
