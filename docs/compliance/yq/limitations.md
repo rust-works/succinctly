@@ -1148,15 +1148,15 @@ Three things still differ, each in yq v4.53.3 against `succinctly yq`:
 
 - **An empty `{}` after a fan-out outside `--eval-all`.**
   yq builds one mapping there too (`yq '.x[] | {}'` over `x: [1, 2, 3]` prints one `{}`, and so does `.x | map({})` as `[{}]`).
-  `succinctly yq` prints one per input node.
+  `succinctly yq` prints one per input node ([#6801](https://github.com/rust-works/succinctly/issues/6801)).
 - **A read of an absent position.**
   `.b as $i ireduce ([]; . + [$i | key])` reads `"b"` for every document in yq, where a document without `b` is a `null` node that still has a place.
   Here that `null` has no position, so `key` and `parent` of it answer nothing and `path` answers `[]`.
 - **An absent key read through the loop variable.**
-  `. as $i ireduce ([]; . + [$i.a])` over a document with no `a` is `[]` in yq and `[null]` here, on the plain route as well as under `--eval-all`.
+  `. as $i ireduce ([]; . + [$i.a])` over a document with no `a` is `[]` in yq and `[null]` here, on the plain route as well as under `--eval-all` ([#6802](https://github.com/rust-works/succinctly/issues/6802)).
 
 The accumulators are values the fold computed, so they carry no document origin: `. as $i ireduce ({}; . * $i) | file_index` is `0`, as in yq.
-An UPDATE with several outputs folds as it does on the ordinary route (the last output), where yq keeps every one as its own accumulator.
+An UPDATE with several outputs folds as it does on the ordinary route (the last output), where yq keeps every one as its own accumulator (#6802).
 
 ### Duplicate mapping keys — an owned value keeps every entry (#1344); a few narrower gaps remain
 
