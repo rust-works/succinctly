@@ -9240,7 +9240,17 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // A comment deferred past properties on the line above (#4851) is claimed first, so it
         // precedes the header's own, as on a mapping key (see `take_pending_head_comment`).
         self.take_pending_head_comment(self.last_open_bp_pos);
-        self.maybe_capture_line_comment(self.last_open_bp_pos);
+        if let Some((start, end)) = self.scan_trailing_comment() {
+            // The comment ends at NEL, LS and PS as it does at `\n` (#6820): `a: | # c<LS>  x` has the
+            // comment `# c` and the text `x`. A comment holds a lead byte only when it holds non-ASCII
+            // text, so the walk below is a byte compare for the usual one.
+            let end = (start as usize..end as usize)
+                .find(|&at| {
+                    matches!(self.input[at], 0xC2 | 0xE2) && self.unicode_break_len_at(at) > 0
+                })
+                .map_or(end, |at| at as u32);
+            self.push_line_comment(self.last_open_bp_pos, (start, end));
+        }
         self.skip_block_header_line();
 
         // Determine content indentation

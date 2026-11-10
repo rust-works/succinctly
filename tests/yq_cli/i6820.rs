@@ -113,3 +113,48 @@ fn a_block_scalar_header_ends_at_a_unicode_break_as_in_go_yaml_6820() -> Result<
     }
     Ok(())
 }
+
+/// (document, yq's YAML answer): the header's comment ends at the break too, and the text after it is
+/// the scalar's first line, not part of the comment that is written back.
+const YAML_ROWS: &[(&str, &str)] = &[
+    ("a: | # c\u{85}  x\n", "a: | # c\n  x\n"),
+    (
+        "# top\na: |\u{85}  x\n  y\n# tail\nb: 1\n",
+        "# top\na: |\n  x\n  y\n# tail\nb: 1\n",
+    ),
+    ("a: | # c\u{85}  x\nb: 2 # k\n", "a: | # c\n  x\nb: 2 # k\n"),
+    ("a: >- # c\u{85}  x\n  y\n", "a: >- # c\n  x y\n"),
+    ("a: |\u{85}  x\nb: 2 # k\n", "a: |\n  x\nb: 2 # k\n"),
+    ("a: | # c\u{2028}  x\n", "a: | # c\n  x\n"),
+    (
+        "# top\na: |\u{2028}  x\n  y\n# tail\nb: 1\n",
+        "# top\na: |\n  x\n  y\n# tail\nb: 1\n",
+    ),
+    (
+        "a: | # c\u{2028}  x\nb: 2 # k\n",
+        "a: | # c\n  x\nb: 2 # k\n",
+    ),
+    ("a: >- # c\u{2028}  x\n  y\n", "a: >- # c\n  x y\n"),
+    ("a: |\u{2028}  x\nb: 2 # k\n", "a: |\n  x\nb: 2 # k\n"),
+    ("a: | # c\u{2029}  x\n", "a: | # c\n  x\n"),
+    (
+        "# top\na: |\u{2029}  x\n  y\n# tail\nb: 1\n",
+        "# top\na: |\n  x\n  y\n# tail\nb: 1\n",
+    ),
+    (
+        "a: | # c\u{2029}  x\nb: 2 # k\n",
+        "a: | # c\n  x\nb: 2 # k\n",
+    ),
+    ("a: >- # c\u{2029}  x\n  y\n", "a: >- # c\n  x y\n"),
+    ("a: |\u{2029}  x\nb: 2 # k\n", "a: |\n  x\nb: 2 # k\n"),
+];
+
+#[test]
+fn a_header_comment_ends_at_a_unicode_break_in_the_yaml_output_6820() -> Result<()> {
+    for &(input, expected) in YAML_ROWS {
+        let (out, code) = run_yq_stdin(".", input, &[])?;
+        assert_eq!(code, 0, "{input:?}: {out}");
+        assert_eq!(out, expected, "{input:?}");
+    }
+    Ok(())
+}
