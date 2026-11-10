@@ -86801,14 +86801,64 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
         let dropped = descent_paths_below_alias::<S>(expr, input, defer_trailing_iterate);
         if !dropped.is_empty() {
             let (Ok(paths) | Err((paths, _))) = &mut resolved;
-            for gone in &dropped {
-                if let Some(at) = paths.iter().position(|p| p == gone) {
-                    paths.remove(at);
-                }
-            }
+            remove_first_occurrences(paths, &dropped);
         }
     }
     resolved
+}
+
+/// Removes from `paths` the first equal entry for each of `gone`, in one pass (#6883): the
+/// quadratic spelling, a scan and a shift per dropped path, took minutes for a descent below
+/// thousands of aliases. A path of field and index steps is matched by a byte key counted in a
+/// multiset, so a path that is listed twice loses one entry per mention, as the scan did; any
+/// other shape is matched by equality.
+fn remove_first_occurrences(paths: &mut Vec<Expr>, gone: &[Expr]) {
+    let mut keyed: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
+    let mut unkeyed: Vec<&Expr> = Vec::new();
+    for path in gone {
+        match static_path_key(path) {
+            Some(key) => *keyed.entry(key).or_insert(0) += 1,
+            None => unkeyed.push(path),
+        }
+    }
+    paths.retain(|path| {
+        if let Some(count) = static_path_key(path).and_then(|key| keyed.get_mut(&key)) {
+            if *count > 0 {
+                *count -= 1;
+                return false;
+            }
+        }
+        if let Some(at) = unkeyed.iter().position(|p| *p == path) {
+            unkeyed.swap_remove(at);
+            return false;
+        }
+        true
+    });
+}
+
+/// A byte key for a path made of field and index steps (`None` for any other step): two such
+/// paths have the same key exactly when they are the same path, optional marks included.
+fn static_path_key(path: &Expr) -> Option<Vec<u8>> {
+    let mut components = Vec::new();
+    push_path_components(&mut components, path);
+    let mut key = Vec::new();
+    for component in &components {
+        let (step, optional) = unwrap_path_component(component);
+        key.push(u8::from(optional));
+        match step {
+            Expr::Field(name) => {
+                key.push(b'k');
+                key.extend_from_slice(&(name.len() as u64).to_le_bytes());
+                key.extend_from_slice(name.as_bytes());
+            }
+            Expr::Index { idx, key: None } => {
+                key.push(b'i');
+                key.extend_from_slice(&idx.to_le_bytes());
+            }
+            _ => return None,
+        }
+    }
+    Some(key)
 }
 
 /// Whether `expr` holds a recursive descent that yq's alias rule applies to: `..`, bare
@@ -175931,6 +175981,35 @@ mod tests {
             let mut post = json(r#"{"a":{"p":5,"q":1},"b":{"p":1,"q":1}}"#);
             alias_identity::mirror_after_write(&pre, &mut post);
             assert_eq!(post, json(r#"{"a":{"p":5,"q":5},"b":{"p":5,"q":5}}"#));
+        }
+
+        /// #6883: the descent paths below an alias are removed one entry per mention, in one pass,
+        /// as the scan did: a path listed twice loses one entry for one mention, a path of any
+        /// other shape is matched by equality, and the order of what stays is kept.
+        #[test]
+        fn dropped_descent_paths_lose_one_entry_each_in_order_6883() {
+            let field = |name: &str| Expr::Field(name.into());
+            let at = |idx: i64| Expr::Index { idx, key: None };
+            let path = |steps: Vec<Expr>| Expr::pipe(steps);
+            let a0 = path(vec![field("a"), at(0)]);
+            let a1 = path(vec![field("a"), at(1)]);
+            let b = path(vec![field("b")]);
+            let optional_b = Expr::Optional(Box::new(field("b")));
+            // An iteration has no key and falls back to equality.
+            let dynamic = path(vec![field("c"), Expr::Iterate]);
+            let mut paths = vec![
+                a0.clone(),
+                b.clone(),
+                a0.clone(),
+                optional_b.clone(),
+                dynamic.clone(),
+                a1.clone(),
+                dynamic.clone(),
+                b.clone(),
+            ];
+            remove_first_occurrences(&mut paths, &[a0.clone(), b.clone(), dynamic.clone()]);
+            // One `a[0]`, the first `b` (not the optional one) and the first dynamic path went.
+            assert_eq!(paths, vec![a0, optional_b, a1, dynamic, b]);
         }
 
         /// #6839: the table names positions from the root, so a write an update body makes below
