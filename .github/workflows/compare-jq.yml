@@ -1,7 +1,7 @@
 name: Compare jq
 
 # `succinctly dev compare jq --quick` on x86_64 and ARM64 Linux (#5409): builds the
-# pinned jq 1.7.1 and 1.8.1 from source (sha256-verified), runs every dimension, and
+# pinned jq 1.7.1 and 1.8.2 from source (sha256-verified), runs every dimension, and
 # uploads the report and results.json. It is not a required check and does not run on
 # pull requests: shared runners are too noisy for the timing rows, and the divergence
 # ledger is recorded on macOS, so entries that only hold there are tagged `platform`
@@ -35,7 +35,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential valgrind
           scripts/compare-jq-build.sh 1.7.1
-          scripts/compare-jq-build.sh 1.8.1
+          scripts/compare-jq-build.sh 1.8.2
       - name: Build succinctly (the manifest's feature set)
         run: cargo build --release --features cli,simd,regex,serde,bench-runner
       # A failed download drops the fetched corpus rows with a note in the report; it does not fail the run.

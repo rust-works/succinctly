@@ -145,7 +145,7 @@ pub struct CompareJqArgs {
     build_jq: bool,
 
     /// Run only the probes the `divergences/` ledger lists for this OS, and report entries that no
-    /// longer diverge (the stale half of the `Ledger drift` CI job, #5585). Needs no jq 1.8.1
+    /// longer diverge (the stale half of the `Ledger drift` CI job, #5585). Needs no jq 1.8.2
     /// build and falls back to `/usr/bin/jq` when the pinned 1.7.1 is not built; skips
     /// `since-secondary` entries, entries for another OS and the perf/operational dimensions.
     /// An unlisted divergence is not found this way: that half stays in CI

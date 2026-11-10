@@ -136,7 +136,7 @@ pub fn index(rows: &[(String, Value)]) -> String {
     let mut s = String::from(HEADER);
     s.push_str("# jq vs succinctly jq\n\n");
     s.push_str(
-        "Generated comparison of `jq` 1.7.1 (primary) and 1.8.1 (secondary) with `succinctly jq`: \
+        "Generated comparison of `jq` 1.7.1 (primary) and 1.8.2 (secondary) with `succinctly jq`: \
          features, correctness, performance, memory, robustness and operational properties. \
          Reproduce with `succinctly dev compare jq`; see [comparison/jq/README.md](../../comparison/jq/README.md). \
          Each platform has its own report; memory-bound effects do not port across architectures, \

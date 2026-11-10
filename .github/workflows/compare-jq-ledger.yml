@@ -104,7 +104,7 @@ jobs:
         with:
           path: |
             target/compare/jq-1.7.1
-            target/compare/jq-1.8.1
+            target/compare/jq-1.8.2
           key: compare-jq-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('comparison/jq/manifest.toml', 'scripts/compare-jq-build.sh') }}
 
       - name: Build the pinned references
@@ -113,7 +113,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential
           scripts/compare-jq-build.sh 1.7.1
-          scripts/compare-jq-build.sh 1.8.1
+          scripts/compare-jq-build.sh 1.8.2
 
       - name: Save the pinned jq builds
         if: steps.jq-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
@@ -121,7 +121,7 @@ jobs:
         with:
           path: |
             target/compare/jq-1.7.1
-            target/compare/jq-1.8.1
+            target/compare/jq-1.8.2
           key: ${{ steps.jq-cache.outputs.cache-primary-key }}
 
       - name: Build succinctly (the manifest's feature set)
