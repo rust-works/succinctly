@@ -3023,6 +3023,9 @@ key as yq does (`{"a":{"b":1,"5":1}}`) instead of raising `Cannot index object w
 A float literal keeps its spelling (`.[1.0]` finds the `1.0:` member and `.[1.9]` the `1.9:` one, as
 yq does), but `.[01]` is parsed as the integer `1`, so it finds -- and a write updates -- the `1:`
 member where yq answers the `01:` one (the recorded lost-spelling residual).
+The matched member is named by its key's own value, as a name is (#2801, #2435): `.a[5] | key` and `.a[5] | path` answer the string `"5"` for a quoted key (`"5": five`) and the number for a plain one (`7: seven`), as yq does, and the index when no member has that text.
+A mapping a filter built keeps no key types, so the same index into `(.a | . + {})` still answers the number where yq answers the string.
+The same holds for a mapping read inside `map(...)` (`[.a] | map(.[5] | key)`) and one bound after a pipe (`.a | .[5] as $v | $v | key`).
 
 **Grouped and multi-target writes follow the same rule
 ([#4085](https://github.com/rust-works/succinctly/issues/4085)).** The eager path walker
