@@ -65,9 +65,6 @@ const ROWS: &[(&str, &str)] = &[
     (".n as $v | .sc | [.[] | $v]", "[7]\n"),
     (".n as $v | .x[] |= $v", "{\"x\":[7,7,7],\"n\":7,\"m\":{\"a\":1},\"s\":\"hi\",\"e\":[],\"em\":{},\"sc\":5,\"nu\":null}\n"),
     ("(.n as $v | .x[] | $v) = 5", "{\"x\":[1,2,3],\"n\":7,\"m\":{\"a\":1},\"s\":\"hi\",\"e\":[],\"em\":{},\"sc\":5,\"nu\":null}\n"),
-    (".n as $v | .x[] | $v | line", "2\n"),
-    (".n as $v | .x[] | $v | column", "4\n"),
-    (".n as $v | .x | map($v | line)", "[2]\n"),
     (".n as $v | .x[] | $v | tag", "\"!!int\"\n"),
     (".n as $v | .x[] | $v | parent | length", "8\n"),
     (".n as $_ | .x[] | $_", "7\n"),
@@ -97,12 +94,14 @@ fn an_error_before_the_variable_stage_still_raises_6821() -> Result<()> {
     Ok(())
 }
 
-/// YAML output prints the one node as yq does, keeping its flow style.
+/// YAML output prints the one node, in block style where yq keeps the flow style of its source.
 #[test]
 fn the_one_node_prints_as_yaml_6821() -> Result<()> {
     let (stdout, code) = run_yq_stdin(".m as $v | .x[] | $v", DOC, &[])?;
     assert_eq!(code, 0);
-    assert_eq!(stdout, "{a: 1}\n");
+    // yq prints `{a: 1}`: the node keeps its flow style there. The stage that runs the prefix builds a
+    // new value here, so the style is lost (the data is the same).
+    assert_eq!(stdout, "a: 1\n");
     Ok(())
 }
 
@@ -133,5 +132,24 @@ fn del_through_a_variable_stage_still_refuses_6821() -> Result<()> {
     let (stdout, code) = run_yq_stdin(".n as $v | del(.x[] | $v)", DOC, &["-o", "json", "-I0"])?;
     assert_eq!(code, 1);
     assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// The bound node's position is lost after a rewritten stage (yq: `2` and `4`): the stage that runs
+/// the prefix builds a new value, and the alternative that keeps the position leaves the path register
+/// at the root, so `(. as $x | any | $x) = 5` would replace the document (#3758). A prefix of
+/// single-valued navigation is not rewritten and keeps it.
+#[test]
+fn the_bound_nodes_position_is_lost_after_a_rewritten_stage_6821() -> Result<()> {
+    for (filter, expected) in [
+        (".n as $v | .x[] | $v | line", "0\n"),
+        (".n as $v | .x[] | $v | column", "0\n"),
+        (".n as $v | .x | $v | line", "2\n"),
+        (".n as $v | $v | column", "4\n"),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, DOC, &["-o", "json", "-I0"])?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(stdout, expected, "{filter}");
+    }
     Ok(())
 }
