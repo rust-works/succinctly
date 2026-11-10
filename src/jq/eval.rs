@@ -87786,13 +87786,36 @@ impl<'a> LazyMarker<'a> {
 
     fn get(&self) -> Rc<Tracked> {
         Rc::clone(self.built.get_or_init(|| {
+            let mut value = self.value.clone();
+            share_large_bound_string(&mut value);
             Rc::new(Tracked {
-                value: self.value.clone(),
+                value,
                 origin: self.origin.clone(),
                 node: self.node.clone(),
                 fold_share: self.fold_share,
             })
         }))
+    }
+}
+
+/// A bound string from this many bytes up is held behind a refcount in its marker (#6832).
+///
+/// A string is stored inline, so every clone of it is a copy, and a marker is cloned wherever a
+/// pipe re-enters the evaluator: `rewrite_markers` rebuilds a re-rooted marker with
+/// `marker.value.clone()` once per pipe step, so `. as $t | [range(n) | . as $w | ($t | length)]`
+/// copied a computed 7 MB string every round (5 ms a round on a Ryzen 9 7950X, `memmove` being the
+/// whole profile). Behind an `Rc` that clone is a pointer bump. The bound value itself is
+/// copied once here, so the cost is one more copy of a string this large, at its bind; a string
+/// below the size is left inline (an `Rc` box on every bound string was ADR-0024's option D,
+/// +8% to +50% peak RSS).
+const SHARED_BOUND_STRING_BYTES: usize = 4096;
+
+/// [`SHARED_BOUND_STRING_BYTES`]: `value`'s string behind a refcount when it is that long.
+fn share_large_bound_string(value: &mut OwnedValue) {
+    if let OwnedValue::String(text) = value {
+        if text.len() >= SHARED_BOUND_STRING_BYTES {
+            text.promote();
+        }
     }
 }
 
@@ -172595,6 +172618,62 @@ mod tests {
         ] {
             let rerooted = reroot_markers::<JqSemantics>(&e, &other_root);
             assert!(matches!(rerooted, Cow::Borrowed(_)), "{label}");
+        }
+    }
+
+    /// #6832: a bound string of `SHARED_BOUND_STRING_BYTES` or more is held behind a refcount in
+    /// its marker, so the clone `rewrite_markers` makes of it at every re-entry is a pointer bump
+    /// and not a copy; a shorter one stays inline (an `Rc` box on every bound string was ADR-0024's
+    /// option D). The pin can fail: with `share_large_bound_string` a no-op the long string is
+    /// inline, and a clone of the marker's value is a copy.
+    #[test]
+    fn a_large_bound_string_is_shared_in_its_marker_6832() {
+        let long = OwnedValue::String("x".repeat(SHARED_BOUND_STRING_BYTES).into());
+        let short = OwnedValue::String("x".repeat(SHARED_BOUND_STRING_BYTES - 1).into());
+        let shared = |value: &OwnedValue| {
+            let marker = LazyMarker::new(value, Origin::Snapshot, None);
+            match &marker.get().value {
+                OwnedValue::String(text) => text.is_shared(),
+                other => panic!("expected a string, got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable by construction: the marker holds the string it was built from (#6832)"
+            }
+        };
+        assert!(shared(&long));
+        assert!(!shared(&short));
+        // A clone of the marker's value is the same storage, and the bound value is untouched.
+        let marker = LazyMarker::new(&long, Origin::Snapshot, None);
+        let (OwnedValue::String(a), OwnedValue::String(b)) =
+            (&marker.get().value.clone(), &marker.get().value.clone())
+        else {
+            unreachable!("both are the marker's string") // patchcov: coverage tolerate-line reason="unreachable by construction (#6832)"
+        };
+        assert!(a.ptr_eq(b));
+        assert!(matches!(&long, OwnedValue::String(t) if !t.is_shared()));
+
+        // The mechanism: a marker the pipe re-roots is rebuilt with a clone of this value
+        // (`rewrite_markers`), which is now the same storage and not a copy.
+        let node = |node: usize, document: usize| BindOrigin::Node { node, document };
+        let original = marker.get();
+        let bound = Expr::TrackedVar(Rc::new(Tracked {
+            value: original.value.clone(),
+            origin: Origin::Snapshot,
+            node: Some(node(4, 9)),
+            fold_share: false,
+        }));
+        let root = RootWitness::Node {
+            node: 3,
+            document: 9,
+        };
+        match reroot_markers::<JqSemantics>(&bound, &root).as_ref() {
+            Expr::TrackedVar(rebuilt) => {
+                assert_eq!(rebuilt.origin, Origin::Untracked, "the marker was demoted");
+                let (OwnedValue::String(old), OwnedValue::String(new)) =
+                    (&original.value, &rebuilt.value)
+                else {
+                    unreachable!("both hold the string") // patchcov: coverage tolerate-line reason="unreachable by construction (#6832)"
+                };
+                assert!(old.ptr_eq(new), "a re-rooted marker shares the string");
+            }
+            other => panic!("expected the marker back, got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable by construction: rewrite_markers rebuilds the node kind it was given (#6832)"
         }
     }
 
