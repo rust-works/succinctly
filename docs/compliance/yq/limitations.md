@@ -928,7 +928,7 @@ accepted (a semi-index does not validate to that depth). The decode half is
 The decode half landed with #4913 for a quoted scalar and a flow collection's plain scalar.
 A mapping key that holds U+2028 or U+2029 is an explicit key on the streaming route as on the write route (`? 'x\u2028  y'`, the quotes of a double-quoted one kept).
 `keys` over one writes the list item as yq does (`- 'x\u2028  y'`).
-Not matched: `-P` drops the quotes of an anchored one (`? &k x\u2028y`), and a flow `keys | . style="flow"` result.
+Not matched: `-P` drops the quotes of an anchored one (`? &k x\u2028y`), and `keys | . style="flow"` over one (yq `['x\u2028    y']`, a block list here).
 U+0085 folds like a `\n` there (`'x\u0085y'` is `x y`).
 U+2028 and U+2029 stay in the value.
 The blanks beside any of the three are trimmed as beside a `\n`, so the space-beside-the-break case in the list above is fixed.
