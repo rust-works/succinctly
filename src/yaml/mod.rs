@@ -288,6 +288,7 @@ pub use encode_style::{
 };
 pub use error::YamlError;
 pub use index::YamlIndex;
+pub use light::collect_merged_members;
 #[doc(hidden)] // shared with the `succinctly yq` DOM writer; not a supported API
 pub use light::deeper_yaml_indent;
 pub use light::{

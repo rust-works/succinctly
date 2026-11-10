@@ -1100,6 +1100,28 @@ pub(crate) mod yq_delete_context {
     }
 }
 
+/// A mapping member that a `<<` merge brought in, named by where its node really lives (#6785).
+///
+/// yq models a merged member as the *source's* node, so a write through the merging mapping
+/// (`.item.x = 5` over `item: {<<: *a}`) changes the source and every mapping that merges it,
+/// where `OwnedValue` holds an independent copy at `member`. [`alias_identity`] recovers the
+/// sharing the way it does for an alias: by position, from the pristine document.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergedMember {
+    /// The member's position in the merging mapping (`["item", "x"]`).
+    pub member: Vec<OwnedValue>,
+    /// Where a write through `member` lands: the node yq's path lookup finds (the last source
+    /// that holds the key, so `b.z` when both `a` and `b` do).
+    pub write_home: Vec<OwnedValue>,
+    /// Where the member's *value* comes from: the node the rendered mapping copies (`a.z`, the
+    /// earlier-listed source, for the same key). It is `write_home` unless several sources hold
+    /// the key.
+    pub render_home: Vec<OwnedValue>,
+    /// The other sources holding the key, in listed order: the one that shows through when
+    /// `render_home` loses it (`del(.a.z)` over `<<: [*a, *b, *c]` shows `b`'s `z`).
+    pub fallbacks: Vec<Vec<OwnedValue>>,
+}
+
 /// Ambient alias-identity table for yq-mode writes (#1351 — the remaining half of
 /// ADR-0017's mechanism 2).
 ///
@@ -1141,8 +1163,8 @@ pub(crate) mod yq_delete_context {
 #[cfg(feature = "std")]
 pub mod alias_identity {
     use super::{
-        get_value_at_path, propagate_anchor_writes, push_path_components, unwrap_path_component,
-        vec_with_capacity, Expr, OwnedValue,
+        get_value_at_path, propagate_anchor_writes, propagate_merged_members, push_path_components,
+        unwrap_path_component, vec_with_capacity, Expr, MergedMember, OwnedValue,
     };
     use alloc::rc::Rc;
     use alloc::vec::Vec;
@@ -1154,13 +1176,60 @@ pub mod alias_identity {
         /// `(anchor definition path, [alias paths...])`, one entry per anchor
         /// that has at least one alias — the shape `sync_aliased_paths` takes.
         groups: Vec<(Vec<OwnedValue>, Vec<Vec<OwnedValue>>)>,
+        /// The members a `<<` merge brought into a mapping (#6785).
+        merged: Vec<MergedMember>,
+        /// `merged` by the member's position (as [`position_key`] spells it), so a path prefix
+        /// finds its member without a scan of the document's merges.
+        merged_by_member: std::collections::HashMap<Vec<u8>, usize>,
+        /// Every proper prefix of a member's position.
+        merged_prefixes: std::collections::HashSet<Vec<u8>>,
     }
 
     impl AliasTable {
         /// Builds a table from `collect_alias_groups`'s output. Paths are
         /// plain `String`/`Int` key sequences addressing the `OwnedValue` tree.
         pub fn from_groups(groups: Vec<(Vec<OwnedValue>, Vec<Vec<OwnedValue>>)>) -> Self {
-            Self { groups }
+            Self {
+                groups,
+                merged: Vec::new(),
+                merged_by_member: std::collections::HashMap::new(),
+                merged_prefixes: std::collections::HashSet::new(),
+            }
+        }
+
+        /// Adds the merged members of the document (#6785): a write through one lands on the
+        /// source's node, as it does through an alias.
+        #[must_use]
+        pub fn with_merged(mut self, merged: Vec<MergedMember>) -> Self {
+            for (idx, member) in merged.iter().enumerate() {
+                let steps = &member.member;
+                // A position of string and index steps, which is all the document walk produces.
+                if let Some(key) = position_key(steps) {
+                    self.merged_by_member.insert(key, idx);
+                }
+                self.merged_prefixes
+                    .extend((1..steps.len()).filter_map(|depth| position_key(&steps[..depth])));
+            }
+            self.merged = merged;
+            self
+        }
+
+        /// The member at exactly `prefix`, when it is still the untouched copy of the node its
+        /// value comes from -- one an earlier stage rebound is written positionally, as for an
+        /// alias ([`same_node`]).
+        fn merged_at(&self, doc: &OwnedValue, prefix: &[OwnedValue]) -> Option<&MergedMember> {
+            if self.merged.is_empty() {
+                return None;
+            }
+            let member = &self.merged[*self.merged_by_member.get(&position_key(prefix)?)?];
+            same_node(doc, prefix, &member.render_home).then_some(member)
+        }
+
+        /// Whether any merged member lies strictly below `prefix`.
+        fn has_merged_under(&self, prefix: &[OwnedValue]) -> bool {
+            !self.merged.is_empty()
+                && (prefix.is_empty()
+                    || position_key(prefix).is_some_and(|key| self.merged_prefixes.contains(&key)))
         }
 
         /// The anchor path this exact alias position resolves to, if any.
@@ -1181,7 +1250,7 @@ pub mod alias_identity {
                 aliases
                     .iter()
                     .any(|a| a.len() > prefix.len() && a[..prefix.len()] == *prefix)
-            })
+            }) || self.has_merged_under(prefix)
         }
 
         fn hop_bound(&self) -> usize {
@@ -1189,6 +1258,7 @@ pub mod alias_identity {
                 .iter()
                 .map(|(_, aliases)| aliases.len())
                 .sum::<usize>()
+                + self.merged.len()
                 + 1
         }
     }
@@ -1493,6 +1563,19 @@ pub mod alias_identity {
             // Reaching here with `i == components.len()` means every component
             // was static, so the whole path names one concrete position.
             let is_proper_prefix = i < components.len();
+            // A merged member is the source's node whether the path goes on or ends here: yq
+            // writes `.item.x = 5` into the anchor, where `.b = 5` over an alias rebinds (#6785).
+            if let Some(member) = table
+                .merged_at(doc, &prefix)
+                .filter(|_| hops < table.hop_bound())
+            {
+                // A write home is a path of string and index steps, which every step maps to.
+                let mut redirected: Vec<Expr> =
+                    member.write_home.iter().filter_map(step_to_expr).collect();
+                redirected.extend(components[i..].iter().cloned());
+                redirect_components(redirected, doc, table, opts, hops + 1, out);
+                return;
+            }
             if (is_proper_prefix || opts.through_terminal) && hops < table.hop_bound() {
                 if let Some(def) = table.anchor_for(&prefix) {
                     if same_node(doc, &prefix, def) {
@@ -1551,7 +1634,12 @@ pub mod alias_identity {
     /// pristine input of the whole pipe -- which is what makes the "was a copy
     /// before this write" test exact mid-pipe.
     pub(crate) fn mirror_after_write(pre: &OwnedValue, post: &mut OwnedValue) {
-        with_table(|table| propagate_anchor_writes(pre, post, &table.groups));
+        // Merged members first: a mapping that is itself aliased copies the member's new value
+        // on to its alias slots in the pass after (#6785).
+        with_table(|table| {
+            propagate_merged_members(pre, post, &table.merged);
+            propagate_anchor_writes(pre, post, &table.groups);
+        });
     }
 }
 
@@ -98932,6 +99020,111 @@ fn propagate_anchor_writes(
     }
 }
 
+/// The slot at `path` (string and index steps only) inside `root`, mutably: through a handle
+/// no one else holds the containers are not copied (#6785). `None` when a step does not resolve.
+fn existing_slot_mut<'v>(
+    root: &'v mut OwnedValue,
+    path: &[OwnedValue],
+) -> Option<&'v mut OwnedValue> {
+    let mut slot = root;
+    for step in path {
+        slot = match (step, slot) {
+            (OwnedValue::String(key), OwnedValue::Object(entries)) => {
+                entries.get_mut(key.as_str())?
+            }
+            (OwnedValue::Int(idx), OwnedValue::Array(arr)) => {
+                arr.get_mut(usize::try_from(*idx).ok()?)?
+            }
+            _ => return None,
+        };
+    }
+    Some(slot)
+}
+
+/// Replace the value at `path` in place when every step exists; `false` leaves the document alone.
+fn replace_existing_at_path(root: &mut OwnedValue, path: &[OwnedValue], new: OwnedValue) -> bool {
+    existing_slot_mut(root, path)
+        .map(|slot| *slot = new)
+        .is_some()
+}
+
+/// Remove the mapping member at `path` in place; `false` when it is not there.
+fn remove_existing_at_path(root: &mut OwnedValue, path: &[OwnedValue]) -> bool {
+    let Some((OwnedValue::String(key), parents)) = path.split_last() else {
+        return false;
+    };
+    match existing_slot_mut(root, parents) {
+        Some(OwnedValue::Object(entries)) => entries.shift_remove(key.as_str()).is_some(),
+        _ => false,
+    }
+}
+
+/// Re-derive each merged member from the node its value comes from, after a write (#6785).
+///
+/// A member is still "derived" while it is the untouched copy of its `render_home` in `pre` and
+/// `post` has not rebound it since; then it follows the source. A source whose node `post` no
+/// longer holds takes the member with it, as a node deleted from the anchor leaves every mapping
+/// that merged it (`del(.item.x)` removes `x` from `a`, and from `item`). A member a write
+/// rebound, deleted or no longer resolves is never written or recreated, the rule
+/// [`propagate_anchor_writes`] applies to an alias slot.
+fn propagate_merged_members(pre: &OwnedValue, post: &mut OwnedValue, merged: &[MergedMember]) {
+    for member in merged {
+        let (Some(slot_pre), Some(home_pre)) = (
+            get_value_at_path(pre, &member.member),
+            get_value_at_path(pre, &member.render_home),
+        ) else {
+            continue;
+        };
+        if !slot_pre.identical(&home_pre) {
+            continue;
+        }
+        if !get_value_at_path(post, &member.member).is_some_and(|v| v.identical(&slot_pre)) {
+            continue;
+        }
+        match get_value_at_path(post, &member.render_home) {
+            Some(new) if new.identical(&slot_pre) => {}
+            Some(new) => {
+                replace_existing_at_path(post, &member.member, new);
+            }
+            None => {
+                // The source mapping itself is gone or no longer a mapping (`del(.a)`): yq keeps
+                // the members it merged, so there is nothing to follow. Only a key the source
+                // lost leaves the mapping, or shows through from the next source holding it.
+                let source_is_mapping = member
+                    .render_home
+                    .split_last()
+                    .and_then(|(_, parent)| get_value_at_path(post, parent))
+                    .is_some_and(|v| matches!(v, OwnedValue::Object(_)));
+                if !source_is_mapping {
+                    continue;
+                }
+                match member
+                    .fallbacks
+                    .iter()
+                    .find_map(|home| get_value_at_path(post, home))
+                {
+                    Some(value) => {
+                        replace_existing_at_path(post, &member.member, value);
+                    }
+                    None => {
+                        remove_existing_at_path(post, &member.member);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The per-write merged-member mirror, run over a whole pipe, as [`sync_aliased_paths`] is for the aliases
+/// (#6785): `pristine` is the document the pipe started from.
+pub fn sync_merged_members(
+    result: &mut OwnedValue,
+    pristine: &OwnedValue,
+    merged: &[MergedMember],
+) {
+    propagate_merged_members(pristine, result, merged);
+}
+
 /// Propagate a write through a YAML anchor to every alias sharing it (#711).
 ///
 /// YAML anchor/alias pairs are the same node in the representation graph: a
@@ -174849,6 +175042,63 @@ mod tests {
             QueryResult::Error(e) => assert!(!e.is_decode_failure(), "{}", e.message)
         );
         query!(br"5", "(implode)?", QueryResult::None => {});
+    }
+
+    #[cfg(feature = "std")]
+    mod merged_member_helpers_6785 {
+        use super::*;
+
+        fn json(s: &str) -> OwnedValue {
+            parse_complete_json(s, false).unwrap()
+        }
+
+        fn key(s: &str) -> OwnedValue {
+            OwnedValue::String(s.to_string().into())
+        }
+
+        #[test]
+        fn replace_and_remove_reach_only_what_exists_6785() {
+            let mut v = json(r#"{"a":{"x":1},"l":[10,20]}"#);
+            // Resolves: a key and an index.
+            assert!(replace_existing_at_path(
+                &mut v,
+                &[key("a"), key("x")],
+                OwnedValue::Int(2)
+            ));
+            assert!(replace_existing_at_path(
+                &mut v,
+                &[key("l"), OwnedValue::Int(1)],
+                OwnedValue::Int(3)
+            ));
+            assert_eq!(v, json(r#"{"a":{"x":2},"l":[10,3]}"#));
+            // Does not resolve: a missing key, an index past the end, a negative index, a key on
+            // an array, an index on a mapping, a step through a scalar. The document is left alone.
+            let before = v.clone();
+            for path in [
+                vec![key("nope")],
+                vec![key("l"), OwnedValue::Int(9)],
+                vec![key("l"), OwnedValue::Int(-1)],
+                vec![key("l"), key("x")],
+                vec![key("a"), OwnedValue::Int(0)],
+                vec![key("a"), key("x"), key("deeper")],
+            ] {
+                assert!(
+                    !replace_existing_at_path(&mut v, &path, OwnedValue::Null),
+                    "{path:?}"
+                );
+                assert!(!remove_existing_at_path(&mut v, &path), "{path:?}");
+            }
+            // Nothing to remove at the root, and an array element is not a mapping member.
+            assert!(!remove_existing_at_path(&mut v, &[]));
+            assert!(!remove_existing_at_path(
+                &mut v,
+                &[key("l"), OwnedValue::Int(0)]
+            ));
+            assert_eq!(v, before);
+            // A mapping member is removed.
+            assert!(remove_existing_at_path(&mut v, &[key("a"), key("x")]));
+            assert_eq!(v, json(r#"{"a":{},"l":[10,3]}"#));
+        }
     }
 
     /// #1351: `alias_identity`'s redirect and mirror, exercised directly on

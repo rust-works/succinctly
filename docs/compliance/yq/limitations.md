@@ -3338,7 +3338,19 @@ The rule applies to the direct JSON writers (`-o json` of a document node, `.`, 
 `..` walks a mapping's own entries (the `<<` key and its aliases among them) and does not descend into the merged members, as yq does, since [#5000](https://github.com/rust-works/succinctly/issues/5000) over a live node, in a read and in `path(..)`.
 A write through `..` behind a path step (`.item | (.. | select(tag == "!!int")) |= 7`) and a mapping a write or construction materialized first still walk the merged members (yq changes only `k` there; [#6718](https://github.com/rust-works/succinctly/issues/6718)).
 `path`, `key` and `parent` of a merged member name its anchor's location, as yq does, since [#6723](https://github.com/rust-works/succinctly/issues/6723): `.item.x | path` is `["a","x"]` where it was `["item","x"]`, and a step taken from it carries on from there (`.item.x.p | path` is `["a","x","p"]`).
-Only the path-context walk (`path`, `key`, `parent`, `parents`) names it that way; a write through the same path keeps the mapping's own entry (`.item.x = 5` changes `item`'s copy, where yq changes the shared anchor's `x`).
+Only the path-context walk (`path`, `key`, `parent`, `parents`) names it that way.
+A write through the same path changes the source's node, as yq does, since [#6785](https://github.com/rust-works/succinctly/issues/6785): `.item.x = 5`, `.item.x |= . + 1`, `del(.item.x)`, `(.item | .[]) |= 7` and `setpath(["item","x"]; 5)` change `a`'s `x`, and so the `x` of every mapping that merges `a`.
+A key several sources hold is written in the last one (`.item.z = 7` sets `b.z`) while the mapping keeps showing the first (`item.z` stays `9`), the two listings of #4983.
+A write to the source reaches the merging mapping too (`.a.x = 5`, `del(.a.x)`), and a key the source loses shows through from the next source that holds it, in listed order.
+A source removed whole (`del(.a)`) leaves the members it merged in place, as in yq, and a mapping that is itself anchored and aliased passes a merged member's new value on to its alias slots.
+The library does this by position, as an alias write does (`jq::alias_identity`, ADR-0017): `yaml::collect_merged_members` lists each member with the node a write lands on and the node its value is copied from, a write path that reaches one is redirected to the first, and the mapping's copy follows the second while it is still an untouched copy.
+A mapping a write replaced (`.item = {"q": 1} | .item.x = 5`) and an own key keep their own entry.
+Still divergent: a write whose body runs on the merging mapping with a path of its own (`.list[] |= (.x = 7)`, `with(.item; .x = 4)`) has no position to redirect from and changes only the mapping's copy.
+A write followed by a read stage (`del(.item.z) | .item.z`) is not an alias-sensitive write, so no table is installed for it, as for an alias.
+A source replaced by a mapping with other keys (`.a = {"y": 1}`, `.a |= {"y": 2}`) drops the members it held from the merging mapping, where yq shows the new keys (`item` is `{y: 1, k: 0}`): the table lists the members the document had, so a key the source gains is not followed.
+A member whose source is a `<<` mapping written in place, or one reached through a mapping that itself merges (`n2: {<<: *n}` with `n: &n {<<: *b}`), has no node of its own to write and keeps the mapping's own entry.
+After `del(.b.z)` or `del(.item.z)` over two sources, yq lists the surviving key last (`y, x, z`) where the mapping keeps its place (`y, z, x`).
+The YAML output of a write still prints the merged members expanded, without the `<<` entry, as before.
 Two shapes keep the mapping's own path because the walk cannot climb to them: a member of an inline `<<: {q: 1}` (`["item","<<","q"]` in yq, `["item","q"]` here), and the entries behind a merge of a mapping that itself merges (`n2: {<<: *n}` with `n: &n {<<: *b, m: 1}`): `[.n2[] | path]` lists a literal `<<` entry where yq lists `b`'s entries (`[["n2","<<"],["n","m"]]` here, `[["b","x"],["b","w"],["n","m"]]` in yq), though a member named directly (`.n2.x | path`) is placed.
 `to_entries`, `with_entries`, `paths` and `tostream` keep the rendering's order.
 

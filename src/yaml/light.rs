@@ -5764,6 +5764,146 @@ fn for_each_merge_source<'a, W: AsRef<[u64]>>(
     }
 }
 
+/// The members `<<` merges bring into the mappings of the document `cursor` roots, each with the
+/// position of the node a write through it lands on and the node its value is copied from (#6785).
+///
+/// yq finds a merged key by the last source that holds it and renders the value of the first
+/// (`.item.z` writes `b`'s `z` while `item` shows `a`'s, for `<<: [*a, *b]` and both holding `z`),
+/// so the two homes are read off the two listings ([`YamlFields`] iterates the first;
+/// its rendering is the second). A member whose node has no position of its own in the
+/// document (a `<<` source written in place) is left out: there is no other node to write.
+///
+/// Empty, and cheap, for a document whose text has no `<<` at all.
+pub fn collect_merged_members<W: AsRef<[u64]> + Clone>(
+    cursor: YamlCursor<'_, W>,
+) -> Vec<crate::jq::MergedMember> {
+    use crate::jq::OwnedValue;
+
+    struct Pending {
+        member: Vec<OwnedValue>,
+        write_node: usize,
+        render_node: Option<usize>,
+        /// Every source node holding the key, in listed order.
+        holders: Vec<usize>,
+    }
+
+    fn step(key: &YamlField<'_, impl AsRef<[u64]>>) -> OwnedValue {
+        OwnedValue::String(key.key().key_string().into_owned().into())
+    }
+
+    fn walk<W: AsRef<[u64]> + Clone>(
+        cursor: YamlCursor<'_, W>,
+        path: &mut Vec<OwnedValue>,
+        homes: &mut BTreeMap<usize, Vec<OwnedValue>>,
+        pending: &mut Vec<Pending>,
+    ) {
+        match cursor.value() {
+            YamlValue::Mapping(fields) => {
+                // The rendering reads each key from another source than the iteration does only
+                // where a `<<` lists several, so it is built for those mappings alone.
+                let mut rendered: Option<BTreeMap<String, usize>> = None;
+                let mut sources: Option<Vec<YamlCursor<'_, W>>> = None;
+                for field in fields.clone() {
+                    let value = field.value_cursor();
+                    path.push(step(&field));
+                    let merged = value
+                        .document_parent()
+                        .map_or(true, |parent| parent.bp_pos != cursor.bp_pos);
+                    if merged {
+                        // A key spelled by a fallback (a complex key) names no member.
+                        let (_, fallback) = field.key().key_string_kind();
+                        if !fallback {
+                            let render = rendered.get_or_insert_with(|| {
+                                fields
+                                    .rendered()
+                                    .map(|f| {
+                                        (f.key().key_string().into_owned(), f.value_cursor().bp_pos)
+                                    })
+                                    .collect()
+                            });
+                            let name = field.key().key_string();
+                            let sources = sources.get_or_insert_with(|| {
+                                fields
+                                    .listed()
+                                    .filter(|f| is_merge_key_value(&f.key()))
+                                    .flat_map(|f| merge_sources(f.value_cursor()))
+                                    .collect()
+                            });
+                            let holders = sources
+                                .iter()
+                                .filter_map(|source| {
+                                    YamlFields::raw(source.first_child())
+                                        .filter(|f| field_key_is_named(&f.key(), &name))
+                                        .last()
+                                        .map(|f| f.value_cursor().bp_pos)
+                                })
+                                .collect();
+                            pending.push(Pending {
+                                member: path.clone(),
+                                write_node: value.bp_pos,
+                                render_node: render.get(&*name).copied(),
+                                holders,
+                            });
+                        }
+                    } else {
+                        homes.entry(value.bp_pos).or_insert_with(|| path.clone());
+                        walk(value, path, homes, pending);
+                    }
+                    path.pop();
+                }
+            }
+            YamlValue::Sequence(elements) => {
+                let mut idx = 0i64;
+                let mut rest = elements;
+                while let Some((element, next)) = rest.uncons_resolved_cursor() {
+                    path.push(OwnedValue::Int(idx));
+                    homes.entry(element.bp_pos).or_insert_with(|| path.clone());
+                    walk(element, path, homes, pending);
+                    path.pop();
+                    idx += 1;
+                    rest = next;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !cursor.index.may_have_merge_keys(cursor.text) {
+        return Vec::new();
+    }
+    let mut homes = BTreeMap::new();
+    let mut pending = Vec::new();
+    homes.insert(cursor.bp_pos, Vec::new());
+    walk(cursor, &mut Vec::new(), &mut homes, &mut pending);
+    pending
+        .into_iter()
+        .filter_map(|p| {
+            let write_home = homes.get(&p.write_node)?.clone();
+            // The rendering lists every key the iteration does, so the first holder is found; the
+            // write home stands in for the one source that is not a node of its own.
+            let render_home = p
+                .render_node
+                .and_then(|node| homes.get(&node))
+                .unwrap_or(&write_home)
+                .clone();
+            // The other sources holding the key, in the order they would show through if the
+            // first lost it. A source that is not a node of its own (written in place) has no home.
+            let fallbacks = p
+                .holders
+                .iter()
+                .filter(|node| Some(**node) != p.render_node)
+                .filter_map(|node| homes.get(node).cloned())
+                .collect();
+            Some(crate::jq::MergedMember {
+                member: p.member,
+                write_home,
+                render_home,
+                fallbacks,
+            })
+        })
+        .collect()
+}
+
 // ============================================================================
 // YamlField: A single key-value pair
 // ============================================================================
