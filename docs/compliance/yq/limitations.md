@@ -663,6 +663,11 @@ the other four. The full table lives in
 [YAML 1.2 Compliance § Differences from System yq](../yaml/1.2.md#differences-from-system-yq);
 it is cross-referenced rather than duplicated here.
 
+A zero-padded decimal that holds an `8` or a `9` (`08`, `0018`, `-09`) is a `!!float` in yq, and here since [#6866](https://github.com/rust-works/succinctly/issues/6866).
+go-yaml tries a leading `0` as octal, which those digits break, and falls back to the float, so `a: 08` is `8.0` in JSON and keeps its spelling elsewhere.
+`007`, `0755` and `010` stay integers in both.
+Not matched: `tojson` and `@json` of such a scalar print `8` where yq prints `8.0`.
+
 An earlier draft filed this under rule 4(a), which was wrong twice over: 4(a) is about output
 the reference cannot re-read, and an *error* is not such output; and even read generously it
 would cover only the last two spellings, leaving `1_000` → `1000` and `0X2A` → `42` —

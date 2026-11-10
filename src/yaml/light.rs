@@ -33,8 +33,8 @@ use super::index::YamlIndex;
 use super::line_break::{blank_line_between, is_line_break, line_break_len};
 use super::scalar::{
     could_be_null_or_bool, is_overflowed_int_literal, is_preservable_float_literal, is_spelled_int,
-    preservable_float_literal_text, resolve_plain, resolve_plain_sourced, resolve_tagged,
-    whole_float_as_int, ResolvedScalar,
+    is_zero_padded_with_8_or_9, preservable_float_literal_text, resolve_plain,
+    resolve_plain_sourced, resolve_tagged, whole_float_as_int, ResolvedScalar,
 };
 use super::{starts_inline_seq_entry, starts_seq_entry};
 use crate::text::stream_region::{RegionGuard, StreamRegion};
@@ -9104,6 +9104,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
                         if !f.is_finite()
                             && crate::yaml::nonfinite_literal_index(&str_val).is_some() =>
                     {
+                        Some(str_val)
+                    }
+                    // #6866: `08` is a float that holds no `.` or exponent, so its spelling is
+                    // the literal.
+                    ResolvedScalar::Float(_) if is_zero_padded_with_8_or_9(&str_val) => {
                         Some(str_val)
                     }
                     // #1356: the spelling is the literal (`+2.0`, `2.`); the JSON writers ask for

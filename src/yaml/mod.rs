@@ -308,7 +308,8 @@ pub use scalar::{
     spelled_float_json_text, spelled_int_json_text, yq_json_number_text,
 };
 pub(crate) use scalar::{
-    is_overflowed_int_literal, nonfinite_literal_index, nonfinite_literal_value,
+    is_overflowed_int_literal, is_zero_padded_with_8_or_9, nonfinite_literal_index,
+    nonfinite_literal_value,
 };
 pub use scalar::{resolve_plain, resolve_plain_sourced, resolve_tagged, ResolvedScalar};
 pub use yq_header::glue_after_leading_marker_text;

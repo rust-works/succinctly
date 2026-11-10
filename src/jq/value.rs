@@ -3482,6 +3482,12 @@ impl OwnedValue {
             return Self::Null;
         };
         match repr {
+            // #6866: yq reads a zero-padded `08` as a float, and keeps its spelling.
+            NumberRepr::Int(n)
+                if S::TAG == EvalTag::Yq && crate::yaml::is_zero_padded_with_8_or_9(&literal) =>
+            {
+                Self::NumberLiteral(NumberRepr::Float(n as f64), literal.into())
+            }
             // jq's own lenient literals (`007`, `+5`) stay literals in either mode.
             NumberRepr::Int(n)
                 if S::TAG == EvalTag::Yq && crate::yaml::is_spelled_int(&literal) =>
