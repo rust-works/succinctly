@@ -14661,6 +14661,13 @@ fn closed_expr_shape(expr: &Expr) -> bool {
 /// Nothing here has a side effect or reads the input, so evaluating it
 /// earlier than jq would, or once where jq might ask twice, is unobservable.
 ///
+/// **yq mode:** the right operand of yq's arithmetic is read-only, so a key read off a literal
+/// that is not there is no output, not `null`. The step that uses this for an operand
+/// (`owned_arith_accumulator_shape`, `owned_arith_chain_shape`) enters
+/// [`yq_read_only_context`] around the call; this function answers `None` for a stage with no
+/// output, and the evaluator then answers (#6802). A new caller that evaluates an arithmetic
+/// operand has to do the same.
+///
 /// It replaces #2152's literal-only `literal_shaped_expr_to_owned`, of
 /// which it is a superset: every literal tree converts to the same value,
 /// and each addition is a pure function of the literal it starts from.
@@ -88821,6 +88828,10 @@ fn owned_arith_accumulator_shape<S: EvalSemantics>(expr: &Expr) -> Option<(Arith
     if !matches!(left.as_ref(), Expr::Identity) {
         return None;
     }
+    // #6802: the right operand of yq's arithmetic is read-only (`yq_read_only_context`), so a key
+    // it reads off a literal that is not there is no output, not `null`: `. + [$i.a]` over an
+    // absent `a` adds `[]`, not `[null]`. The closed walk then declines and the evaluator answers.
+    let _read_only = S::READ_ONLY_ABSENT_KEY_IS_EMPTY.then(yq_read_only_context::enter);
     Some((*op, closed_expr_to_owned::<S>(right.as_ref())?))
 }
 
@@ -88830,6 +88841,10 @@ fn owned_arith_accumulator_shape<S: EvalSemantics>(expr: &Expr) -> Option<(Arith
 /// extends the accumulator's string in place twice instead of re-evaluating it whole.
 /// Two links at least: one is the shape above.
 fn owned_arith_chain_shape<S: EvalSemantics>(expr: &Expr) -> Option<Vec<(ArithOp, OwnedValue)>> {
+    // #6802: each right operand is read-only in yq, as in `owned_arith_accumulator_shape`. The one
+    // caller, `owned_arith_chain_step`, is only reached for an arithmetic UPDATE whose left is
+    // arithmetic too, so the scope is never entered for a shape this declines at once.
+    let _read_only = S::READ_ONLY_ABSENT_KEY_IS_EMPTY.then(yq_read_only_context::enter);
     let mut links = Vec::new();
     let mut at = expr;
     loop {
