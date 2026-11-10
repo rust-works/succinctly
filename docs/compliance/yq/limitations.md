@@ -675,6 +675,11 @@ would cover only the last two spellings, leaving `1_000` → `1000` and `0X2A` �
 perfectly consumable output that succinctly simply declines to match — with no justification
 at all. The justification is the spec target, which is why the case belongs here.
 
+A zero-padded decimal that holds an `8` or a `9` (`08`, `0018`, `-09`) is a `!!float` in yq, and here since [#6866](https://github.com/rust-works/succinctly/issues/6866).
+go-yaml tries a leading `0` as octal, which those digits break, and falls back to the float, so `a: 08` is `8.0` in JSON and keeps its spelling elsewhere.
+`007`, `0755` and `010` stay integers in both.
+Not matched: `tojson` and `@json` of such a scalar print `8` where yq prints `8.0`.
+
 ### A tag with no value is the empty string, except `!!int` and `!!float` (#6291)
 
 A node that carries an explicit tag and no value (`k: !!seq`, `- !custom`, `--- !!str`) is the empty string in yq's JSON output and in a comparison with `""`.

@@ -139,6 +139,10 @@ impl ResolvedScalar {
             Self::Float(_) if is_preservable_float_literal(&text) => {
                 OwnedValue::from_number_literal::<YqSemantics>(&text)
             }
+            // #6866: `08` resolves to a float and keeps its text like `007.5` does.
+            Self::Float(_) if is_zero_padded_with_8_or_9(&text) => {
+                OwnedValue::from_number_literal::<YqSemantics>(&text)
+            }
             // #1071: a document `.inf`/`.NaN` keeps its spelling, which is what
             // tells it from a computed non-finite (a bare `Float`).
             Self::Float(f) if !f.is_finite() && nonfinite_literal_index(&text).is_some() => {
@@ -218,6 +222,12 @@ pub fn resolve_plain_sourced(s: &str, json_sourced: bool) -> ResolvedScalar {
     // compare, not a string compare, on the streaming hot path.
     match resolve_plain(s) {
         ResolvedScalar::Int(0) if !json_sourced && s == "-0" => ResolvedScalar::Float(-0.0),
+        // #6866: go-yaml reads a leading `0` as octal, which an `8` or `9` breaks, and falls back to
+        // the float: `08` is `!!float` in a YAML document, `8.0` in JSON.
+        ResolvedScalar::Int(n) if !json_sourced && is_zero_padded_with_8_or_9(s) => {
+            // The float go-yaml's `ParseFloat` reads, which is the rounded text above 2^53.
+            ResolvedScalar::Float(s.parse().unwrap_or(n as f64))
+        }
         // #3577: yq's JSON decoder types a whole-valued float as an integer
         // (`2.0`, `1e2` and `-0.0` are `!!int`), where go-yaml keeps it a
         // float. A YAML document's `2.0` is untouched.
@@ -226,6 +236,22 @@ pub fn resolve_plain_sourced(s: &str, json_sourced: bool) -> ResolvedScalar {
         }
         resolved => resolved,
     }
+}
+
+/// Whether `s` is decimal digits (after an optional sign) that start with `0` and hold an `8` or a
+/// `9` (`08`, `0018`, `-09`): the spellings go-yaml reads as a float, because it tries a leading
+/// `0` as octal first (#6866). A scalar that does not start with `0` pays two byte compares.
+#[inline(always)]
+pub(crate) fn is_zero_padded_with_8_or_9(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let digits = match bytes.first() {
+        Some(b'+' | b'-') => &bytes[1..],
+        _ => bytes,
+    };
+    digits.len() > 1
+        && digits[0] == b'0'
+        && digits.iter().all(u8::is_ascii_digit)
+        && digits.iter().any(|&d| d >= b'8')
 }
 
 /// The integer yq's JSON decoder reads a whole-valued float as, or `None` for a
@@ -622,6 +648,11 @@ pub fn spelled_float_json_text(raw: &str) -> Option<String> {
 /// Whether `raw` is a float spelled other than as JSON number syntax ([`spelled_float_json_text`]).
 #[must_use]
 pub fn is_spelled_float(raw: &str) -> bool {
+    // #6866: `08` is a float with no `.` or exponent to make it one, so it has no JSON-safe spelling
+    // to normalize to and is a spelled float on its text alone.
+    if is_zero_padded_with_8_or_9(raw) {
+        return raw.parse::<f64>().is_ok_and(f64::is_finite);
+    }
     has_non_json_float_marker(raw)
         && raw.parse::<f64>().is_ok_and(f64::is_finite)
         && preservable_float_literal_text(raw).is_some()
