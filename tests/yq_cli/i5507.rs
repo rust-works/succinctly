@@ -208,3 +208,23 @@ fn test_5507_an_unknown_mode_is_refused() -> Result<()> {
     assert!(err.contains("possible values: continue, stop"), "{err}");
     Ok(())
 }
+
+/// A decode failure is not an error the program raised, so `stop` under `--inplace` carries on
+/// past it exactly as the stdout routes do (#355, #1615); the file that failed stays untouched.
+#[test]
+fn test_5507_inplace_stop_is_not_ended_by_a_decode_failure() -> Result<()> {
+    let dir = TempDir::new()?;
+    let bad = dir.path().join("bad.yaml");
+    let good = dir.path().join("good.yaml");
+    std::fs::write(&bad, "a: \"bad \\q escape\"\n")?;
+    std::fs::write(&good, "a: 1\n")?;
+    let (_, err, code) = run_yq_files(
+        ".a |= (. | tostring)",
+        &[&bad, &good],
+        &["--inplace", "--on-error=stop"],
+    )?;
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(std::fs::read_to_string(&bad)?, "a: \"bad \\q escape\"\n");
+    assert_eq!(std::fs::read_to_string(&good)?, "a: \"1\"\n", "{err}");
+    Ok(())
+}

@@ -475,8 +475,8 @@ makes this explicit, or switches it off:
 
 | Mode                  | Behaviour                                                                |
 |-----------------------|--------------------------------------------------------------------------|
-| *(not given)*         | yq's: stop at the first error, exit 1                                    |
-| `--on-error=stop`     | The same; under `--inplace` it also edits no file after a failed one     |
+| *(not given)*         | yq's: stop at the first error, exit 1 (`--inplace` carries on)           |
+| `--on-error=stop`     | The same, and `--inplace` too edits no file after a failed one           |
 | `--on-error=continue` | Every document and file is still evaluated, every error reported; exit 1 |
 
 ```bash

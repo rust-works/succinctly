@@ -1138,13 +1138,14 @@ struct JqCommand {
     build_configuration: bool,
 }
 
-/// `succinctly jq --on-error`: how an uncaught error affects the run (#5471).
+/// `--on-error` of `succinctly jq` (#5471) and `succinctly yq` (#5507): how an uncaught error
+/// affects the run. The exit code is the subcommand's own error code (jq 5, yq 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum OnError {
-    /// Process every input; exit 5 if any of them failed.
+    /// Process every input, reporting every error; the run fails if any of them did.
     #[value(name = "continue")]
     Continue,
-    /// Evaluate no input after the first one that failed; exit 5.
+    /// Evaluate no input after the first one that failed.
     #[value(name = "stop")]
     Stop,
 }

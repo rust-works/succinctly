@@ -13455,6 +13455,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             // rather than a bool so *any* diagnostic raised while building
             // this file's buffer protects it, not only the streamed ones.
             let reports_before_file = sink.report_count();
+            let program_errors_before_file = sink.program_error_count();
             // Reset per file, not just per run: `--inplace` keeps editing the
             // remaining files after one fails, so a flag left set by an
             // earlier file would break the *next* file's document loop on its
@@ -13911,9 +13912,12 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             if sink.halted().is_some() {
                 break 'inplace_files;
             }
-            // `--on-error=stop` (#5507): the file that failed is left untouched above, and no
-            // later file is edited. Without the flag `--inplace` carries on (#1615).
-            if args.on_error == Some(OnError::Stop) && sink.report_count() > reports_before_file {
+            // `--on-error=stop` (#5507): the file whose program raised is left untouched above,
+            // and no later file is edited. Without the flag `--inplace` carries on (#1615); a
+            // decode failure or a resource cap does not stop it either, as on every other route.
+            if args.on_error == Some(OnError::Stop)
+                && sink.ends_run_since(program_errors_before_file)
+            {
                 break 'inplace_files;
             }
         }
