@@ -1400,6 +1400,10 @@ struct Parser<'a> {
     /// so `{a: -1 * 2}` is a syntax error in jq (#3397). Cleared inside every
     /// nested [`Parser::parse_expr`], where `-1 * 2` is `-(1 * 2)` as usual.
     expd_operand: bool,
+    /// How many `path(f)` arguments enclose the position being parsed. A `$name` stage there is
+    /// resolved as a path, where #6821's once-over-the-list rewrite has no oracle (yq's `path` is
+    /// nullary), so it is left as it was written.
+    in_path_arg: u32,
     /// Whether the outermost completed primary consumed jq's generic `?`.
     /// Navigation optionals inside that primary do not close a `try` body.
     last_primary_ended_generic_optional: bool,
@@ -1703,10 +1707,93 @@ fn has_flat_empty_object(expr: &Expr) -> bool {
     }
 }
 
+/// Whether `stage` is a bare `$name`, or a pipe or parenthesised pipe that starts with one
+/// (`$v`, `($v)`, `$v | keys`, `$v.a`). `$ENV` and `$ARGS` are not variables of yq's.
+fn yq_stage_head_var(stage: &Expr) -> bool {
+    match stage {
+        Expr::Paren(inner) => yq_stage_head_var(inner),
+        Expr::Pipe(stages) => stages.first().is_some_and(yq_stage_head_var),
+        Expr::Var(name) => !matches!(name.as_str(), "ENV" | "ARGS"),
+        _ => false,
+    }
+}
+
+/// Whether `stage` answers exactly one node per input: `.`, a field, an index, a variable, and
+/// parentheses or pipes of those.
+fn yq_stage_single_valued(stage: &Expr) -> bool {
+    match stage {
+        Expr::Identity | Expr::Field(_) | Expr::Index { .. } | Expr::Var(_) => true,
+        Expr::Paren(inner) => yq_stage_single_valued(inner),
+        Expr::Pipe(stages) => stages.iter().all(yq_stage_single_valued),
+        _ => false,
+    }
+}
+
+/// Whether `expr` is, or holds as a stage of its pipes, a bare `$name` (#6821): the stage yq
+/// answers once however many nodes reach it. Looks through parentheses and nested pipes as
+/// [`has_flat_empty_object`] does, and stops at an `as` body: `. as $w | $v` is one `$v` per node in
+/// yq.
+fn has_flat_var_stage(expr: &Expr) -> bool {
+    match expr {
+        Expr::Paren(inner) => has_flat_var_stage(inner),
+        Expr::Pipe(stages) => stages.iter().any(has_flat_var_stage),
+        other => yq_stage_head_var(other),
+    }
+}
+
+/// #6821: a pipe in yq mode whose stage after the first is a bare `$name`. yq's `GET_VARIABLE`
+/// returns the list the variable is stored in, and a pipe evaluates its right side once over the
+/// whole list the left side produced, so `$name` after a fan-out answers its value **once**, however
+/// many nodes reached it, and even when none did: `.n as $v | .x[] | $v` is one `7`, and so is
+/// `.x[] | select(. > 5) | $v`. Every stage after it sees that one node.
+///
+/// The variable is substituted into the body before the pipe runs, so the stage is a literal by
+/// then, and a literal is built once per node (`.x[] | 5` is three `5`s). So the rewrite is made
+/// here, where the stage is still a variable: everything before the last such stage becomes a
+/// stage that runs it for its errors and answers `null` once (`reduce PREFIX as $_ (null; null)`),
+/// and the variable follows. A `$name` that is not a stage (`[$v]`, `{"k": $v}`, `. + $v`) is read
+/// per node in yq too and is left as it is, as is a pipe's first stage, which has one input.
+fn yq_var_stage_once(stages: Vec<Expr>) -> Expr {
+    // A nested pipe is the same stages spliced in (`A | (B | $v)` is `A | B | $v`), so the variable
+    // is found wherever it stands; a pipe with none is returned as it was parsed.
+    fn splice(stage: &Expr, out: &mut Vec<Expr>) {
+        match stage {
+            Expr::Paren(inner) if matches!(**inner, Expr::Pipe(_)) => splice(inner, out),
+            Expr::Pipe(inner) => inner.iter().for_each(|stage| splice(stage, out)),
+            other => out.push(other.clone()),
+        }
+    }
+    if !stages.iter().any(has_flat_var_stage) {
+        return Expr::pipe(stages);
+    }
+    let mut flat = Vec::with_capacity(stages.len());
+    stages.iter().for_each(|stage| splice(stage, &mut flat));
+    // A prefix that answers one node per input leaves one node for the variable either way, so it
+    // is left alone, with the bound node's position and its path context as they were.
+    let Some(at) = (1..flat.len())
+        .rev()
+        .find(|&i| yq_stage_head_var(&flat[i]) && !flat[..i].iter().all(yq_stage_single_valued))
+    else {
+        return Expr::pipe(stages);
+    };
+    let mut prefix = flat;
+    let rest = prefix.split_off(at);
+    let mut out = Vec::with_capacity(rest.len() + 1);
+    out.push(Expr::Reduce {
+        input: Box::new(yq_var_stage_once(prefix)),
+        patterns: vec![Pattern::Var("_".to_string())],
+        init: Box::new(Expr::Literal(Literal::Null)),
+        update: Box::new(Expr::Literal(Literal::Null)),
+    });
+    out.extend(rest);
+    Expr::pipe(out)
+}
+
 /// #6770: yq's `map(f)` splats its node and runs `f` once over the whole list of members
 /// (`mapOperator`, `GetMatchingNodes(splatted, RHS)`), so a union in `f` runs each branch over every
 /// member before the next: `map(.a, .b)` is every `.a`, then every `.b`. An empty `{}` stage in `f`
-/// is built once, not per member (#6801: `.x | map({})` is `[{}]`). That is the walk
+/// is built once, not per member (#6801: `.x | map({})` is `[{}]`), and so is a bare `$name` stage (#6821:
+/// `.n as $v | .x | map($v)` is `[7]`). That is the walk
 /// `[.[] | f]` already takes (the context-list model, `eval_yq_context_pipe`), so a union-bodied
 /// (or empty-`{}`-bodied) `map` over a sequence or a mapping with members is written
 /// `(if has-members then [.[] | f] else . end) | map(.)`.
@@ -1716,11 +1803,14 @@ fn has_flat_empty_object(expr: &Expr) -> bool {
 /// collection is `.a`'s own position), and it answers a scalar (itself, `f` never runs), `null` (`[]`)
 /// and an empty mapping (itself, #5918) exactly as the arm did, whatever `f` is. `f` appears once,
 /// so a nest of such maps stays linear.
-fn yq_map_union_body_over_the_list(call: Expr) -> Expr {
+fn yq_map_union_body_over_the_list(call: Expr, var_stage_once: bool) -> Expr {
     let Expr::Builtin(Builtin::Map(body)) = &call else {
         return call;
     };
-    if !has_flat_union(body) && !has_flat_empty_object(body) {
+    if !has_flat_union(body)
+        && !has_flat_empty_object(body)
+        && !(var_stage_once && has_flat_var_stage(body))
+    {
         return call;
     }
     // Whether the node has members to walk: a sequence or a mapping with entries. A scalar, `null`,
@@ -1736,7 +1826,11 @@ fn yq_map_union_body_over_the_list(call: Expr) -> Expr {
         ])),
         right: Box::new(Expr::Literal(Literal::Int(0))),
     };
-    let over_the_list = Expr::array(Expr::pipe(vec![Expr::Iterate, (**body).clone()]));
+    let over_the_list = Expr::array(if var_stage_once {
+        yq_var_stage_once(vec![Expr::Iterate, (**body).clone()])
+    } else {
+        Expr::pipe(vec![Expr::Iterate, (**body).clone()])
+    });
     Expr::pipe(vec![
         Expr::If {
             cond: Box::new(container),
@@ -2066,6 +2160,7 @@ impl<'a> Parser<'a> {
             wrong_arity_call: None,
             last_primary_is_term: true,
             expd_operand: false,
+            in_path_arg: 0,
             last_primary_ended_generic_optional: false,
         }
     }
@@ -5067,9 +5162,10 @@ impl<'a> Parser<'a> {
                                 if shadow_candidate {
                                     Expr::Builtin(builtin)
                                 } else if self.mode == ParserMode::Yq {
-                                    yq_map_union_body_over_the_list(bind_retrying_value_arg(
-                                        builtin,
-                                    ))
+                                    yq_map_union_body_over_the_list(
+                                        bind_retrying_value_arg(builtin),
+                                        self.in_path_arg == 0,
+                                    )
                                 } else {
                                     bind_retrying_value_arg(builtin)
                                 },
@@ -8680,7 +8776,10 @@ impl<'a> Parser<'a> {
                 self.reject_unless_jq_extensions_at("path(f)", keyword_start)?;
                 self.next();
                 self.skip_ws();
-                let expr = self.parse_expr()?;
+                self.in_path_arg += 1;
+                let parsed = self.parse_expr();
+                self.in_path_arg -= 1;
+                let expr = parsed?;
                 self.skip_ws();
                 if self.peek() != Some(')') {
                     return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![expr]);
@@ -11264,6 +11363,9 @@ impl<'a> Parser<'a> {
             self.skip_ws();
         }
 
+        if self.mode == ParserMode::Yq && self.in_path_arg == 0 {
+            return Ok(yq_var_stage_once(exprs));
+        }
         Ok(Expr::pipe(exprs))
     }
 
