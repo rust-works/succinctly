@@ -1657,108 +1657,6 @@ pub mod alias_identity {
         out.push(rebuild(components));
     }
 
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        fn s(name: &str) -> OwnedValue {
-            OwnedValue::String(name.into())
-        }
-
-        fn i(idx: i64) -> OwnedValue {
-            OwnedValue::Int(idx)
-        }
-
-        /// The scans the indexes replaced (#6839).
-        fn anchor_by_scan<'t>(
-            table: &'t AliasTable,
-            prefix: &[OwnedValue],
-        ) -> Option<&'t [OwnedValue]> {
-            table.groups.iter().find_map(|(def, aliases)| {
-                aliases
-                    .iter()
-                    .any(|a| a.as_slice() == prefix)
-                    .then_some(def.as_slice())
-            })
-        }
-
-        fn under_by_scan(table: &AliasTable, prefix: &[OwnedValue]) -> bool {
-            table.groups.iter().any(|(_, aliases)| {
-                aliases
-                    .iter()
-                    .any(|a| a.len() > prefix.len() && a[..prefix.len()] == *prefix)
-            })
-        }
-
-        /// Every position a lookup could be asked about is answered as the scan answers it: nested
-        /// and index steps, the same alias listed under two anchors (the first group wins), and
-        /// names that hold the key encoding's own bytes.
-        #[test]
-        fn the_alias_indexes_answer_as_the_scans_they_replace_6839() {
-            let groups = vec![
-                (
-                    vec![s("a")],
-                    vec![
-                        vec![s("b")],
-                        vec![s("l"), i(0)],
-                        vec![s("l"), i(1), s("x")],
-                        vec![s("a\0kb")],
-                    ],
-                ),
-                (
-                    vec![s("c")],
-                    vec![vec![s("l"), i(0)], vec![s("d"), s("e"), s("f")], vec![i(3)]],
-                ),
-            ];
-            let table = AliasTable::from_groups(groups.clone());
-            let mut probes: Vec<Vec<OwnedValue>> = vec![
-                vec![],
-                vec![s("a"), s("b")],
-                vec![s("l")],
-                vec![s("l"), i(1)],
-                vec![s("l"), i(2)],
-                vec![s("d")],
-                vec![s("d"), s("e")],
-                vec![s("zz")],
-                vec![i(3)],
-                vec![i(0)],
-            ];
-            for (def, aliases) in &groups {
-                probes.push(def.clone());
-                for alias in aliases {
-                    probes.push(alias.clone());
-                    for depth in 0..alias.len() {
-                        probes.push(alias[..depth].to_vec());
-                    }
-                }
-            }
-            for probe in &probes {
-                assert_eq!(
-                    table.anchor_for(probe),
-                    anchor_by_scan(&table, probe),
-                    "anchor_for {probe:?}"
-                );
-                assert_eq!(
-                    position_key(probe).is_some_and(|key| table.alias_prefixes.contains(&key)),
-                    under_by_scan(&table, probe),
-                    "has_alias_under {probe:?}"
-                );
-            }
-            // The first group listing a position decides, as the scan did.
-            assert_eq!(table.anchor_for(&[s("l"), i(0)]), Some([s("a")].as_slice()));
-        }
-
-        /// A name holding the tag and terminator bytes is one step, never two.
-        #[test]
-        fn a_name_with_the_key_bytes_in_it_is_not_two_steps_6839() {
-            assert_ne!(position_key(&[s("a\0kb")]), position_key(&[s("a"), s("b")]));
-            assert_ne!(position_key(&[s("ab")]), position_key(&[s("a"), s("b")]));
-            let table = AliasTable::from_groups(vec![(vec![s("x")], vec![vec![s("a\0kb")]])]);
-            assert_eq!(table.anchor_for(&[s("a"), s("b")]), None);
-            assert_eq!(table.anchor_for(&[s("a\0kb")]), Some([s("x")].as_slice()));
-        }
-    }
-
     /// Redirect one concrete (`String`/`Int`) path, the form `setpath`/
     /// `delpaths` take. A slice descriptor or any other component shape
     /// leaves the path untouched.
@@ -1936,6 +1834,108 @@ pub mod alias_identity {
             steps.push(step);
         }
         Some(steps)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn s(name: &str) -> OwnedValue {
+            OwnedValue::String(name.into())
+        }
+
+        fn i(idx: i64) -> OwnedValue {
+            OwnedValue::Int(idx)
+        }
+
+        /// The scans the indexes replaced (#6839).
+        fn anchor_by_scan<'t>(
+            table: &'t AliasTable,
+            prefix: &[OwnedValue],
+        ) -> Option<&'t [OwnedValue]> {
+            table.groups.iter().find_map(|(def, aliases)| {
+                aliases
+                    .iter()
+                    .any(|a| a.as_slice() == prefix)
+                    .then_some(def.as_slice())
+            })
+        }
+
+        fn under_by_scan(table: &AliasTable, prefix: &[OwnedValue]) -> bool {
+            table.groups.iter().any(|(_, aliases)| {
+                aliases
+                    .iter()
+                    .any(|a| a.len() > prefix.len() && a[..prefix.len()] == *prefix)
+            })
+        }
+
+        /// Every position a lookup could be asked about is answered as the scan answers it: nested
+        /// and index steps, the same alias listed under two anchors (the first group wins), and
+        /// names that hold the key encoding's own bytes.
+        #[test]
+        fn the_alias_indexes_answer_as_the_scans_they_replace_6839() {
+            let groups = vec![
+                (
+                    vec![s("a")],
+                    vec![
+                        vec![s("b")],
+                        vec![s("l"), i(0)],
+                        vec![s("l"), i(1), s("x")],
+                        vec![s("a\0kb")],
+                    ],
+                ),
+                (
+                    vec![s("c")],
+                    vec![vec![s("l"), i(0)], vec![s("d"), s("e"), s("f")], vec![i(3)]],
+                ),
+            ];
+            let table = AliasTable::from_groups(groups.clone());
+            let mut probes: Vec<Vec<OwnedValue>> = vec![
+                vec![],
+                vec![s("a"), s("b")],
+                vec![s("l")],
+                vec![s("l"), i(1)],
+                vec![s("l"), i(2)],
+                vec![s("d")],
+                vec![s("d"), s("e")],
+                vec![s("zz")],
+                vec![i(3)],
+                vec![i(0)],
+            ];
+            for (def, aliases) in &groups {
+                probes.push(def.clone());
+                for alias in aliases {
+                    probes.push(alias.clone());
+                    for depth in 0..alias.len() {
+                        probes.push(alias[..depth].to_vec());
+                    }
+                }
+            }
+            for probe in &probes {
+                assert_eq!(
+                    table.anchor_for(probe),
+                    anchor_by_scan(&table, probe),
+                    "anchor_for {probe:?}"
+                );
+                assert_eq!(
+                    position_key(probe).is_some_and(|key| table.alias_prefixes.contains(&key)),
+                    under_by_scan(&table, probe),
+                    "has_alias_under {probe:?}"
+                );
+            }
+            // The first group listing a position decides, as the scan did.
+            assert_eq!(table.anchor_for(&[s("l"), i(0)]), Some([s("a")].as_slice()));
+        }
+
+        /// A name holding the tag and terminator bytes is one step, never two.
+        #[test]
+        fn a_name_with_the_key_bytes_in_it_is_not_two_steps_6839() {
+            assert_ne!(position_key(&[s("a\0kb")]), position_key(&[s("a"), s("b")]));
+            assert_ne!(position_key(&[s("ab")]), position_key(&[s("a"), s("b")]));
+            let table = AliasTable::from_groups(vec![(vec![s("x")], vec![vec![s("a\0kb")]])]);
+            assert_eq!(table.anchor_for(&[s("a"), s("b")]), None);
+            assert_eq!(table.anchor_for(&[s("a\0kb")]), Some([s("x")].as_slice()));
+        }
     }
 }
 
