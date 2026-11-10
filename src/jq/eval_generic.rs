@@ -36894,7 +36894,7 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
         }
 
         Builtin::Style => {
-            let style = cursor.map_or("", |c| c.style());
+            let style = cursor.map_or("", |c| node_style_getter(&c));
             GenericResult::Owned(OwnedValue::String(style.to_string().into()))
         }
 
@@ -42691,6 +42691,20 @@ fn owned_identity_after_prefetch(
     match (flow, escaped.into_inner()) {
         (Flow::Exhausted, Some(control)) => Flow::Escaped(control),
         (flow, _) => flow,
+    }
+}
+
+/// What yq's `style` getter answers for a node (#6881): the node's style, except that an explicit
+/// tag (other than the non-specific `!`) makes it `"tagged"` when nothing else styles the node and
+/// `"<unknown>"` when something does (quotes, a block scalar, a flow collection), because yq
+/// matches its `Style` flag bits one value at a time and the combination matches none. The
+/// cursor's own `style()` stays the style without the tag: the writers echo it.
+fn node_style_getter<C: DocumentCursor>(cursor: &C) -> &'static str {
+    let style = cursor.style();
+    match cursor.explicit_tag_of_non_alias() {
+        Some(tag) if tag != "!" && style.is_empty() => "tagged",
+        Some(tag) if tag != "!" => "<unknown>",
+        _ => style,
     }
 }
 

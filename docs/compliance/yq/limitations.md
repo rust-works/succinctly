@@ -5540,6 +5540,8 @@ ruled out), even though real yq supports every one of them:
   top-level outputs such as `(.a comments = ""), 1`) ignores a comment write as it always has.
   A comment after a sequence item's dash (`- # c\n  k: 1`) is lost on any DOM write here, a
   gap that predates this and that the fuzz skips.
+- **`style` of a tagged node** is `"tagged"` when only the tag styles it and `"<unknown>"` when it also has quotes, a block scalar or a flow collection ([#6881](https://github.com/rust-works/succinctly/issues/6881)), as in yq.
+  Over an owned value (`with_entries(.value |= style)`) there is no node to read, and the getter answers `""` as it did for an untagged one.
 - **`style = "tagged"`** renders the tag of the node's current value type
   ([#4066](https://github.com/rust-works/succinctly/issues/4066), the last piece of #2707):
   `!!int`/`!!float`/`!!bool`/`!!null`/`!!str` before a scalar, `!!seq`/`!!map` on the header
