@@ -1671,6 +1671,10 @@ pub mod alias_identity {
                 .filter_map(|target| concrete_steps(target, pre))
                 .filter_map(|steps| position_key(&steps))
                 .collect();
+            // The source nodes this update has already written: the first mapping to write one
+            // decides what every mapping shows (`.x = .i` over two mappings leaves each with the
+            // first's `x` in yq).
+            let mut written: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
             for member in &table.merged {
                 let mut key = Vec::new();
                 let below_target = member.member.split_last().is_some_and(|(_, parents)| {
@@ -1683,8 +1687,15 @@ pub mod alias_identity {
                 if !below_target {
                     continue;
                 }
-                let (Some(slot_pre), Some(render_pre), Some(home_pre)) = (
-                    get_value_at_path(pre, &member.member),
+                let Some(slot_pre) = get_value_at_path(pre, &member.member) else {
+                    continue;
+                };
+                let slot_post = get_value_at_path(post, &member.member);
+                // Nearly every member is untouched by the body: one comparison settles it.
+                if slot_post.as_ref().is_some_and(|v| v.identical(&slot_pre)) {
+                    continue;
+                }
+                let (Some(render_pre), Some(home_pre)) = (
                     get_value_at_path(pre, &member.render_home),
                     get_value_at_path(pre, &member.write_home),
                 ) else {
@@ -1694,13 +1705,23 @@ pub mod alias_identity {
                 if !slot_pre.identical(&render_pre) {
                     continue;
                 }
+                let home_key = position_key(&member.write_home);
+                if home_key.as_ref().is_some_and(|k| written.contains(k)) {
+                    // Another mapping's body got to the node first, so this one shows it.
+                    if slot_post.is_some() && member.write_home == member.render_home {
+                        if let Some(shown) = get_value_at_path(post, &member.render_home) {
+                            replace_existing_at_path(post, &member.member, shown);
+                        }
+                    }
+                    continue;
+                }
                 // A write that already reached the source's node was redirected there.
                 if !get_value_at_path(post, &member.write_home)
                     .is_some_and(|v| v.identical(&home_pre))
                 {
                     continue;
                 }
-                let Some(slot_post) = get_value_at_path(post, &member.member) else {
+                let Some(slot_post) = slot_post else {
                     // The body deleted the key from a mapping that is still there: yq's `del(.x)`
                     // found the source's node. (Not when another source holds the key too, which
                     // keeps showing through.)
@@ -1709,15 +1730,17 @@ pub mod alias_identity {
                         .split_last()
                         .and_then(|(_, parent)| get_value_at_path(post, parent))
                         .is_some_and(|v| matches!(v, OwnedValue::Object(_)));
-                    if mapping_is_there && member.write_home == member.render_home {
-                        remove_existing_at_path(post, &member.write_home);
+                    if mapping_is_there
+                        && member.write_home == member.render_home
+                        && remove_existing_at_path(post, &member.write_home)
+                    {
+                        written.extend(home_key);
                     }
                     continue;
                 };
-                if slot_post.identical(&slot_pre) {
-                    continue;
+                if replace_existing_at_path(post, &member.write_home, slot_post) {
+                    written.extend(home_key);
                 }
-                replace_existing_at_path(post, &member.write_home, slot_post);
                 // Several sources hold the key: the mapping keeps showing the first one's.
                 if member.write_home != member.render_home {
                     replace_existing_at_path(post, &member.member, slot_pre);
@@ -49272,11 +49295,18 @@ fn writes_only_below_target(body: &Expr) -> bool {
         // A `del` followed by a write to the same key makes a new own entry in yq, which the
         // comparison of the two documents cannot tell from a changed member.
         Expr::Pipe(stages) => {
-            stages.iter().all(writes_only_below_target)
-                && !stages
-                    .iter()
-                    .any(|stage| matches!(stage, Expr::Builtin(Builtin::Del(_))))
+            stages.iter().all(writes_only_below_target) && !stages.iter().any(contains_del)
         }
+        _ => false,
+    }
+}
+
+/// Whether `stage` is a `del`, or a pipe or group with one in it (`(del(.y))`, `(del(.y)?)`).
+fn contains_del(stage: &Expr) -> bool {
+    match stage {
+        Expr::Builtin(Builtin::Del(_)) => true,
+        Expr::Paren(inner) | Expr::Optional(inner) => contains_del(inner),
+        Expr::Pipe(stages) => stages.iter().any(contains_del),
         _ => false,
     }
 }

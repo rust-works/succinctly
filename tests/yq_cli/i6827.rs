@@ -49,6 +49,7 @@ const BODY_WRITES: &[(&str, &str, &str)] = &[
     (ONE, ".item = {\"x\": 99, \"k\": 0} | .item |= (.q = 1)", "{\"base\":{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":99,\"k\":0,\"q\":1},\"list\":[{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n"),
     (ALIAS, ".list[] |= (.x = 7)", "{\"base\":{\"x\":7,\"y\":2},\"list\":[{\"x\":7,\"y\":2},{\"x\":7,\"y\":2}]}\n"),
     (ALIAS, ".list[0] |= (.p = 9)", "{\"base\":{\"x\":1,\"y\":2,\"p\":9},\"list\":[{\"x\":1,\"y\":2,\"p\":9},{\"x\":1,\"y\":2,\"p\":9}]}\n"),
+    (ONE, ".list[] |= (.x = .i)", "{\"base\":{\"x\":0,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":0,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":0,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":0,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n"),
 ];
 
 /// A body that replaces the mapping leaves the sources alone, in yq as here.
@@ -58,12 +59,16 @@ const BODY_REPLACES: &[(&str, &str, &str)] = &[
     (ONE, ".item |= {\"x\": 5}", "{\"base\":{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":5},\"list\":[{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n"),
 ];
 
-/// yq's answers for the shapes the update body's edit is not carried for.
-const STILL_DIVERGENT: &[(&str, &str, &str)] = &[
-    (ONE, ".list[0:1] |= (.[0].x = 5)", "{\"base\":{\"x\":5,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":5,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":5,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":5,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n"),
-    (ONE, ".list[] |= (.x += 1)", "{\"base\":{\"x\":3,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":3,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":3,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":3,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n"),
-    (ONE, ".list[0] |= (del(.x) | .x = 3)", "{\"base\":{\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0,\"x\":3},{\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n"),
-    (ONE, ".list[0] |= (.x = 3 | del(.y))", "{\"base\":{\"x\":3,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":3,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":3,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":3,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n"),
+/// `(document, filter, yq's output, this tool's output)`: the shapes the update body's edit is not
+/// carried for, which still change only the mapping's copy.
+const STILL_DIVERGENT: &[(&str, &str, &str, &str)] = &[
+    (ONE, ".list[0] |= (del(.x) | .x = 3)", "{\"base\":{\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0,\"x\":3},{\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n", "{\"base\":{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0,\"x\":3},{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n"),
+    (ONE, ".list[0] |= (.x = 3 | del(.y))", "{\"base\":{\"x\":3,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":3,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":3,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":3,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n", "{\"base\":{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":3,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n"),
+    (ONE, ".list[0] |= ((del(.x)) | .x = 3)", "{\"base\":{\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0,\"x\":3},{\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n", "{\"base\":{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0,\"x\":3},{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n"),
+    (ONE, ".list[] |= (.x += 1)", "{\"base\":{\"x\":3,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":3,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":3,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":3,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n", "{\"base\":{\"x\":2,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":2,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":2,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":2,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n"),
+    (ONE, ".list[0:1] |= (.[0].x = 5)", "{\"base\":{\"x\":5,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":5,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":5,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":5,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n", "{\"base\":{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n"),
+    (ONE, ".list |= map(.x = 7)", "{\"base\":{\"x\":7,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":7,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":7,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":7,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n", "{\"base\":{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":7,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":7,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n"),
+    (ONE, ".list[] |= (.x = 7, .y = 1)", "{\"base\":{\"x\":7,\"y\":1,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":7,\"y\":1,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":7,\"y\":1,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":7,\"y\":1,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n", "{\"base\":{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":7,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":7,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n"),
 ];
 
 fn check(rows: &[(&str, &str, &str)]) -> Result<()> {
@@ -91,17 +96,21 @@ fn test_an_update_body_that_replaces_the_mapping_leaves_the_sources_alone_6827()
 #[test]
 fn test_the_body_shapes_that_still_change_only_the_mappings_copy_6827() -> Result<()> {
     // Not yq's answers, recorded in docs/compliance/yq/limitations.md. A body that deletes a key and
-    // then writes more cannot be told from a changed member by comparing the two documents, so the
-    // mapping's copy changes and the source stays. A body that reads the member it writes
-    // (`.x += 1` over mappings that share a source) writes the source once, where yq counts each
-    // mapping's turn, and a target that is a slice (`.list[0:1] |= (.[0].x = 5)`) is not looked into. The rows hold yq's answers; the difference is asserted below.
-    for (document, filter, want) in STILL_DIVERGENT {
+    // then writes more (also behind a group) cannot be told from a changed member by comparing the
+    // two documents. A body that reads the member it writes (`.x += 1` over mappings that share a
+    // source) writes the source once, where yq counts each mapping's turn. A slice target, a
+    // comma and a body that is not a chain of writes (`map(.x = 7)`) are not looked into. Both
+    // answers are pinned, so a change in either shows.
+    for (document, filter, yq, ours) in STILL_DIVERGENT {
         let (stdout, code) = run_yq_stdin(filter, document, JSON)?;
-        assert_eq!(code, 0, "{filter}");
+        assert_eq!(
+            (stdout.as_str(), code),
+            (*ours, 0),
+            "{filter} on {document:?}"
+        );
         assert_ne!(
-            stdout.as_str(),
-            *want,
-            "{filter} on {document:?} now matches yq"
+            ours, yq,
+            "{filter} on {document:?} now matches yq: move the row to BODY_WRITES"
         );
     }
     Ok(())

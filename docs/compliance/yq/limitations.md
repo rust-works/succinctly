@@ -3346,8 +3346,14 @@ The library does this by position, as an alias write does (`jq::alias_identity`,
 A mapping a write replaced (`.item = {"q": 1} | .item.x = 5`) and an own key keep their own entry.
 A write an update body makes below the mapping it runs on (`.list[] |= (.x = 7)`, `with(.item; .x = 4)`, `.item |= del(.x)`) reaches the source's node too, since [#6827](https://github.com/rust-works/succinctly/issues/6827).
 The body has a path of its own, so there is no position to redirect from: the update compares each merged member under a target with what it held before, and a member the body changed or deleted moves to the node it is written through, while the mapping's other members follow the source as for any write.
-Still divergent: a body that reads the member it writes (`.list[] |= (.x += 1)`) writes the source once, where yq counts each mapping's turn (`3` for two mappings over `x: 1`, `2` here), a body that deletes a key and then writes more (`del(.x) | .x = 3`, `.x = 3 | del(.y)`) changes only the mapping's copy, and so does an update whose target is a slice (`.list[0:1] |= (.[0].x = 5)`).
-A body that replaces the mapping (`. = {"x": 5}`) leaves the sources alone, as in yq, and so does a filter that is not a chain of writes (`|= {"x": 5}`).
+When several mappings' bodies write the same source node, the first one decides what every mapping shows, as in yq (`.list[] |= (.x = .i)` leaves each mapping with the first's `x`).
+Only a body that is a chain of writes to paths below its target is looked at (`.x = 7`, `.a.b += 1`, `del(.x)`, `.x = 1 | .y = 2`, with groups and `?`).
+Still divergent, and unchanged from #6785 (the mapping's own copy changes and the source stays):
+- a body that reads the member it writes (`.list[] |= (.x += 1)`) writes the source once, where yq counts each mapping's turn (`3` for two mappings over `x: 1`, `2` here);
+- a body that deletes a key and then writes more (`del(.x) | .x = 3`, `.x = 3 | del(.y)`, also behind a group), where yq's write makes a new own entry;
+- an update whose target is a slice (`.list[0:1] |= (.[0].x = 5)`);
+- a body that is not a chain of writes: a comma (`.list[] |= (.x = 7, .y = 1)`, where yq applies both), `map(.x = 7)` over the list, `if`, `//` and a function call (`.list |= map(.x = 7)` leaves the source at `1` where yq writes `7`).
+A body that replaces the mapping (`. = {"x": 5}`) leaves the sources alone, as in yq, and so does a filter that is not a write (`|= {"x": 5}`).
 A write followed by a read stage (`del(.item.z) | .item.z`) is not an alias-sensitive write, so no table is installed for it, as for an alias.
 A source replaced by a mapping with other keys (`.a = {"y": 1}`, `.a |= {"y": 2}`) drops the members it held from the merging mapping, where yq shows the new keys (`item` is `{y: 1, k: 0}`): the table lists the members the document had, so a key the source gains is not followed.
 A member whose source is a `<<` mapping written in place, or one reached through a mapping that itself merges (`n2: {<<: *n}` with `n: &n {<<: *b}`), has no node of its own to write and keeps the mapping's own entry.
