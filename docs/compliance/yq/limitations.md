@@ -1142,9 +1142,13 @@ capture table.
 An empty `{}` is one mapping whatever the context holds (`yq ea '{}' f1 f2` prints one `{}`, where `0` prints one per document, and `yq '.x[] | {}'` is one `{}` on any route), so `ireduce ({}; ...)` starts one fold.
 The reads of the loop variable's node (`$i | document_index`, `file_index`, `path`, `line`, `tag`, `kind`) answer from the document the node came from.
 Both rules apply to a list whose entries all came straight from the reader, like `[...]` and the binary operators.
-After a navigation they do not, and the plain route is unchanged.
+After a navigation they do not.
+On every route a yq `ireduce` folds a list of accumulators, as yq's does ([#6802](https://github.com/rust-works/succinctly/issues/6802)): each output of UPDATE is an accumulator of the next step, a union in UPDATE is branch-major over the list, an UPDATE with no output drops its accumulator, and several INIT outputs all fold the one source.
+`. as $i ireduce (0; (. + $i, . * 10))` over `[1, 2]` is `3 2 10 0`, and `ireduce (0; select(false))` prints nothing.
+jq's `reduce` is unchanged: one fork per INIT output, the last UPDATE output wins.
+The same rule holds for `reduce` under `--jq-extensions` in yq mode, since the mode decides.
 
-Six things still differ, each in yq v4.53.3 against `succinctly yq`:
+Five things still differ, each in yq v4.53.3 against `succinctly yq`:
 
 - **`map({})`.**
   yq builds its one empty mapping there as well (`.x | map({})` over `x: [1, 2, 3]` is `[{}]`, and `.x | map(select(. > 5) | {})` is `[{}]` too, where an empty `.e | map({})` is `[]`).
@@ -1157,12 +1161,9 @@ Six things still differ, each in yq v4.53.3 against `succinctly yq`:
   Here that `null` has no position, so `key` and `parent` of it answer nothing and `path` answers `[]`.
 - **An absent key read through the loop variable.**
   `. as $i ireduce ([]; . + [$i.a])` over a document with no `a` is `[]` in yq and `[null]` here, on the plain route as well as under `--eval-all` ([#6802](https://github.com/rust-works/succinctly/issues/6802)).
-
-- **An UPDATE with several outputs.**
-  `. as $i ireduce (0; (. + 1, . + 10))` keeps every output as its own accumulator in yq, and the last one here, as on the plain route ([#6802](https://github.com/rust-works/succinctly/issues/6802)).
 - **An UPDATE that answers the loop variable itself.**
-  `. as $i ireduce (null; $i)` is the last document, once, with its own `file_index` and `document_index` in yq.
-  Here it is one copy per document, and each has no origin (`file_index` is `0`).
+  `. as $i ireduce (null; $i)` is the last document, once, with its own `file_index` and `document_index` in yq, because the accumulators it produces are the same node and yq's list keeps it once.
+  Here it is one copy per accumulator, and each has no origin (`file_index` is `0`).
 
 An accumulator the fold computed carries no document origin: `. as $i ireduce ({}; . * $i) | file_index` is `0`, as in yq.
 
