@@ -1758,41 +1758,67 @@ fn has_flat_var_stage(expr: &Expr) -> bool {
     }
 }
 
+/// Whether a `select` condition reads only the node it is given (#6860), not where the node stands:
+/// the rewrite below runs the `select` from each printed node down, where `key`, `path`, `parent`,
+/// `line`, `column` and `document_index` would no longer see the position they see in the whole list.
+fn reads_only_the_value(cond: &Expr) -> bool {
+    if super::eval::needs_path_context(cond) {
+        return false;
+    }
+    let text = format!("{cond:?}");
+    !["Builtin(Line)", "Builtin(Column)", "Builtin(DocumentIndex)"]
+        .iter()
+        .any(|reader| text.contains(reader))
+}
+
+/// Whether [`yq_assignment_over_list`] would rewrite `stage`, without building it.
+fn is_assignment_over_list(stage: &Expr) -> bool {
+    match stage {
+        Expr::Paren(inner) => is_assignment_over_list(inner),
+        Expr::Update { .. } => true,
+        Expr::Assign { value, .. } | Expr::CompoundAssign { value, .. } => is_literal_rhs(value),
+        _ => false,
+    }
+}
+
+/// A right side yq reads once for the list and this evaluator at each node, so only a constant is
+/// the same in both: a literal, `[]`, `{}` and the constant collections.
+fn is_literal_rhs(value: &Expr) -> bool {
+    match value {
+        Expr::Literal(_) => true,
+        Expr::Paren(inner) => is_literal_rhs(inner),
+        Expr::Array(inner) => is_literal_rhs(inner),
+        Expr::Comma(items) => items.iter().all(is_literal_rhs),
+        Expr::Object(entries) => entries.iter().all(|entry| {
+            matches!(entry.key, ObjectKey::Literal(_)) && is_literal_rhs(&entry.value)
+        }),
+        _ => false,
+    }
+}
+
 /// #6860: `stage` as an assignment over another target, when it is one yq runs once over the whole
 /// list: `|=` (its filter runs at each target, as in yq) and `=` or a compound form with a literal
 /// right side (yq reads that side once for the list and this evaluator at each node, so only a
 /// literal is the same in both). Returns the stage's own target and the assignment rebuilt over
 /// `retarget`.
 fn yq_assignment_over_list(stage: &Expr, retarget: impl FnOnce(&Expr) -> Expr) -> Option<Expr> {
-    fn literal(value: &Expr) -> bool {
-        match value {
-            Expr::Literal(_) => true,
-            Expr::Paren(inner) => literal(inner),
-            // `[]`, `{}` and the constant collections: yq reads them once and builds a copy for each
-            // target, as this evaluator does.
-            Expr::Array(inner) => literal(inner),
-            Expr::Comma(items) => items.iter().all(literal),
-            Expr::Object(entries) => entries
-                .iter()
-                .all(|entry| matches!(entry.key, ObjectKey::Literal(_)) && literal(&entry.value)),
-            _ => false,
-        }
-    }
     match stage {
         Expr::Paren(inner) => yq_assignment_over_list(inner, retarget),
         Expr::Update { path, filter } => Some(Expr::Update {
             path: Box::new(retarget(path)),
             filter: filter.clone(),
         }),
-        Expr::Assign { path, value } if literal(value) => Some(Expr::Assign {
+        Expr::Assign { path, value } if is_literal_rhs(value) => Some(Expr::Assign {
             path: Box::new(retarget(path)),
             value: value.clone(),
         }),
-        Expr::CompoundAssign { op, path, value } if literal(value) => Some(Expr::CompoundAssign {
-            op: *op,
-            path: Box::new(retarget(path)),
-            value: value.clone(),
-        }),
+        Expr::CompoundAssign { op, path, value } if is_literal_rhs(value) => {
+            Some(Expr::CompoundAssign {
+                op: *op,
+                path: Box::new(retarget(path)),
+                value: value.clone(),
+            })
+        }
         _ => None,
     }
 }
@@ -1816,14 +1842,14 @@ fn yq_assign_after_descent(stages: Vec<Expr>) -> Vec<Expr> {
             .iter()
             .position(|stage| matches!(stage, Expr::RecursiveDescent))?;
         let shaped = prefix[..at].iter().all(is_navigation_expr)
-            && prefix[at + 1..]
-                .iter()
-                .all(|stage| matches!(stage, Expr::Builtin(Builtin::Select(_))));
+            && prefix[at + 1..].iter().all(|stage| {
+                matches!(stage, Expr::Builtin(Builtin::Select(cond)) if reads_only_the_value(cond))
+            });
         shaped.then_some(at)
     }
     let Some((at, descent)) = (1..stages.len()).find_map(|i| {
         let descent = descent_prefix(&stages[..i])?;
-        yq_assignment_over_list(&stages[i], Expr::clone).map(|_| (i, descent))
+        is_assignment_over_list(&stages[i]).then_some((i, descent))
     }) else {
         return stages;
     };
