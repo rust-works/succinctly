@@ -44,7 +44,7 @@ use succinctly::yaml::{
 };
 
 use super::m2_gate::{can_use_m2_streaming, eval_all_matches_per_document, is_array_of_nodes};
-use super::{FrontMatterMode, InputFormat, OutputFormat, YqCommand};
+use super::{FrontMatterMode, InputFormat, OnError, OutputFormat, YqCommand};
 use crate::front_matter;
 use crate::output::{
     self, exit_codes, flush_then_err, ColorScheme, DiagStyle, ErrorSink, InputLocation,
@@ -2561,7 +2561,7 @@ fn evaluate_yaml_direct_filtered(
                 }
                 // #2810: real yq stops at the first error the program raises, so no later
                 // document is evaluated; the documents before it keep their results.
-                if stop_at_error && sink.program_error_count() > errors_before {
+                if stop_at_error && sink.ends_run_since(errors_before) {
                     break;
                 }
             }
@@ -11574,6 +11574,9 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     // Uncaught evaluation errors. Evaluation continues past one, so the failure
     // is remembered here and turned into yq's exit 1 below (#355).
     let mut sink = ErrorSink::default();
+    if args.on_error == Some(OnError::Continue) {
+        sink.continue_past_program_errors();
+    }
     // #1615: set when a streamed *identity* render was cut off part-way
     // through a document by a decode failure. Only the identity/P9 branches
     // can leave the output mid-document: they stream a container's structure
@@ -12356,7 +12359,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     // a resource cap and a `halt` are not that kind of error and have their own handling.
     macro_rules! eval_error_ends_run {
         () => {
-            sink.halted().is_none() && !stream_truncated.get() && sink.program_error_count() > 0
+            sink.halted().is_none() && !stream_truncated.get() && sink.ends_run_since(0)
         };
     }
 
@@ -13076,7 +13079,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                     break 'files;
                 }
                 // #2810: yq stops writing at the first error, so a later file is not read.
-                if sink.program_error_count() > 0 {
+                if sink.ends_run_since(0) {
                     break 'files;
                 }
             }
@@ -13908,6 +13911,11 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             if sink.halted().is_some() {
                 break 'inplace_files;
             }
+            // `--on-error=stop` (#5507): the file that failed is left untouched above, and no
+            // later file is edited. Without the flag `--inplace` carries on (#1615).
+            if args.on_error == Some(OnError::Stop) && sink.report_count() > reports_before_file {
+                break 'inplace_files;
+            }
         }
     } else {
         // Standard path: evaluate inputs. Both YAML and JSON input go
@@ -14001,7 +14009,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             }
             // #2810: real yq reads no further after an error the program raised; what the earlier
             // documents produced still prints.
-            if sink.program_error_count() > 0 {
+            if sink.ends_run_since(0) {
                 break 'collect;
             }
         }

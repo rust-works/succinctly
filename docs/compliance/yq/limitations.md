@@ -2433,6 +2433,11 @@ It now stops at the first error the program raises, in every route that prints t
 A failure to decode a value (`a: "bad \q escape"`) and an evaluator resource cap are not such errors: yq has no counterpart for either, so the run still reaches the documents after one (#355, #1615, #1817).
 `--split-exp` stops the same way and keeps the files of the results before the error, as yq does.
 `--inplace` keeps going past an error as before, and leaves a file that failed untouched (#1615).
+`--on-error=continue|stop` is a succinctly extension (ADR-0018 rule 5, [#5507](https://github.com/rust-works/succinctly/issues/5507)), the flag `succinctly jq` has had since #5471.
+Without it nothing changes, and `stop` spells that default out.
+`continue` switches the stop-at-the-first-error rule off, since yq has no reference behaviour for carrying on: every document and file is evaluated on every route above and in `--split-exp`, every error is reported, and the exit code is 1 if any failed.
+Under `--inplace`, `stop` also edits no file after the first one that failed, where the default carries on.
+The exit code stays 1 in every mode, as yq's does for an error and for `-e`'s falsy result alike, so a script cannot tell them apart.
 `--eval-all` and `--slurp` evaluate everything together, so they have no later document to stop before.
 
 The `error` operator itself still differs: yq raises it for a document that `select` already dropped (`printf 'a: 1\n' | yq 'select(false) | error("x")'` is `Error: x`), where succinctly does not evaluate it.

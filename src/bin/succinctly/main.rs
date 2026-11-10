@@ -1374,6 +1374,13 @@ pub struct YqCommand {
     #[arg(short = 'e', long, overrides_with = "exit_status")]
     pub exit_status: bool,
 
+    /// What an uncaught error does to the run (succinctly extension, not a yq flag). Without it
+    /// yq's rule holds: stop at the first error the program raises, exit 1. `continue` evaluates
+    /// every document and file, reports every error and exits 1 if any failed; `stop` is the
+    /// default spelled out, and under `--inplace` it also edits no file after a failed one (#5507)
+    #[arg(long, value_name = "MODE", overrides_with = "on_error")]
+    pub on_error: Option<OnError>,
+
     // === Info ===
     /// Show version information
     #[arg(short = 'V', long, overrides_with = "version")]
