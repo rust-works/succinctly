@@ -23,4 +23,6 @@
 //! `carriage_returns` mask cannot be phrased as a byte predicate — and stay
 //! covered by the per-kernel differential tests.
 
-pub(super) use crate::text::line_break::{blank_line_between, is_line_break, line_break_len};
+pub(super) use crate::text::line_break::{
+    blank_line_between, crlf_comment_blank_between, is_line_break, line_break_len,
+};

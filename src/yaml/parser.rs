@@ -33,7 +33,9 @@ use alloc::{
 use std::collections::BTreeMap;
 
 use super::error::YamlError;
-use super::line_break::{blank_line_between, is_line_break, line_break_len};
+use super::line_break::{
+    blank_line_between, crlf_comment_blank_between, is_line_break, line_break_len,
+};
 use super::simd;
 use crate::text;
 
@@ -1111,6 +1113,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// sides.
     fn record_standalone_comment(&mut self, start: usize, end: usize) {
         let (start, end) = (start as u32, end as u32);
+        // Where the comment line recorded before this one ended, for `blank_line_precedes`.
+        let previous_comment_end = self.comment_watermark as usize;
         if start < self.comment_watermark {
             return;
         }
@@ -1140,11 +1144,24 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 && self.pending_block.column <= self.pending_block.prev_indent
             {
                 // Exactly one blank line: go-yaml keeps a run with two or more together (measured).
-                let one_blank = self.input[last_end as usize..start as usize]
+                // A CRLF ending a standalone comment line is a blank line of its own to go-yaml (#5053), but a
+                // blank line the source already has does not make it a run of two: yq answers `# A` / blank /
+                // `# B` the same in CRLF as in LF.
+                let breaks = self.input[last_end as usize..start as usize]
                     .iter()
                     .filter(|&&b| b == b'\n')
-                    .count()
-                    == 2;
+                    .count();
+                let blanks = if breaks >= 2 {
+                    breaks
+                } else {
+                    breaks
+                        + usize::from(crlf_comment_blank_between(
+                            self.input,
+                            last_end as usize,
+                            start as usize,
+                        ))
+                };
+                let one_blank = blanks == 2;
                 // ...and the first block sits at the innermost open block's own column, which is what ends that
                 // block for go-yaml (`unrollIndent`); one at an odd column leaves it open.
                 if one_blank
@@ -1153,7 +1170,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 {
                     follows_foot_at = Some(self.pending_block.column);
                 }
-                self.resolve_pending_block_backward();
+                self.resolve_split_block(column);
             }
         }
         // So does a line at a different column below the innermost open
@@ -1179,7 +1196,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             let blank_before = if after_split {
                 self.pending_block.blank_before
             } else {
-                self.blank_line_precedes(start as usize)
+                self.blank_line_precedes(start as usize, previous_comment_end)
             };
             self.capture_pending_block(column, after_split, blank_before, follows_foot_at);
         }
@@ -1918,6 +1935,42 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         self.block_passed_absent_item = true;
     }
 
+    /// [`Self::resolve_pending_block_backward`] for a block that a blank line split off a later one of its run
+    /// (#5053). A block dedented to the column of a mapping that is still open (`x:` / `  k: 1` / `# A` / blank
+    /// / `# B`) is the foot of that mapping's last key, as go-yaml's `unrollIndent` places it when the node
+    /// that follows is not yet known -- not of `PREV`, the innermost key, which would print it at `PREV`'s own
+    /// column, when the next block of the run is at that column too (a block after it at another column leaves
+    /// the choice to the node that follows, which is not known yet). Any other block settles on `PREV`.
+    fn resolve_split_block(&mut self, next_column: usize) {
+        if self.pending_block.column < self.pending_block.prev_indent
+            && next_column == self.pending_block.column
+            && self.attached_prev().is_some()
+        {
+            let frames = &self.pending_block.frames;
+            let target = frames
+                .iter()
+                .rposition(|frame| frame.indent == self.pending_block.column)
+                .and_then(|at| Self::last_mapping_key(frames[..=at].iter().rev().take(1)));
+            if let Some(target) = target {
+                // An earlier block of the run already settled there: the blank line that split them is kept,
+                // as an empty line before this one.
+                let first_start = self.pending_head_lines.first().map(|&(start, _)| start);
+                if let Some(start) = first_start {
+                    if self
+                        .comments
+                        .get(&target)
+                        .is_some_and(|c| !c.foot.is_empty())
+                    {
+                        self.pending_head_lines.insert(0, (start, start));
+                    }
+                }
+                self.drain_pending_into_foot(target);
+                return;
+            }
+        }
+        self.resolve_pending_block_backward();
+    }
+
     /// Settle a pending block whose forward attachment is already disproven
     /// (a blank line follows it) onto `PREV`'s foot -- or, with no `PREV` in
     /// the *current* document yet, onto the document that just closed
@@ -2286,7 +2339,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// Read straight off the text rather than tracked as parser state, so it
     /// cannot be confused by a `skip_newlines` call entered mid-line — see
     /// [`Self::record_standalone_comment`].
-    fn blank_line_precedes(&self, pos: usize) -> bool {
+    fn blank_line_precedes(&self, pos: usize, previous_comment_end: usize) -> bool {
         // Step back over this line's indent to its opening break, then over
         // that break, then check whether the line before it is empty.
         let mut p = pos;
@@ -2304,6 +2357,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
         if q == 0 {
             return false;
+        }
+        // A CRLF after a standalone comment line is a blank line of its own to go-yaml (#5053). The line
+        // must be a comment the parser recorded: a `#` line inside a block scalar is its content.
+        let prev_line_start = self.input[..q]
+            .iter()
+            .rposition(|&b| is_line_break(b))
+            .map_or(0, |i| i + 1);
+        if q == previous_comment_end && crlf_comment_blank_between(self.input, prev_line_start, p) {
+            return true;
         }
         // Walk the previous line backwards; blank iff we reach another break
         // (or the start of input) without meeting content.

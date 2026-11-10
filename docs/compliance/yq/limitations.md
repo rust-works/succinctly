@@ -6062,15 +6062,15 @@ Divergences, each classified by `scripts/yq-comment-oracle-fuzz.py`:
   where it sits between comments, a `---` or a `%YAML` line (#6401); the header covers it, so it prints the same.
   The DOM route (`-P`, a write) prints it too, but not the `---` and `%YAML` lines of the header.
   A whitespace-only line ahead of a leading `---` is printed as it is there, without the `# `.
-- **A genuinely blank CRLF line near a standalone comment, mid-document,** gets a spurious
-  extra blank line inserted by yq after the comment that the CRLF source never had at all
-  (go-yaml's scanner appears to special-case a blank line only for `\n`, not `\r\n`, in more
-  than one place) -- confirmed round-trips through yq itself, so this is accepted as an
-  unreplicated fidelity gap rather than a data-loss exception (#2795 review):
-  `a: 1\r\n# mid\r\nb: 2\r\n` prints `a: 1\n# mid\nb: 2\n` in succinctly, where yq inserts a
-  blank line it never had: `a: 1\n# mid\n\nb: 2\n` -- pinned by the CRLF/CR exemptions in
-  `tests/yq_golden_tests.rs`'s `KNOWN_CRLF_DIVERGENCES`, not the usual known-failures
-  manifest, since these cases pass under LF. The first document's *header* is reproduced as
+- **A CRLF after a standalone comment line is a blank line to yq's scanner** (go-yaml reads the `\r` as one break and the `\n` as a blank line of its own), so yq prints a blank line after every standalone comment of a CRLF file that the source never had (#5053).
+  `a: 1\r\n# mid\r\nb: 2\r\n` prints `a: 1\n# mid\n\nb: 2\n`, and a block of comments gets a blank line between its lines (`# c1\n\n# c2`).
+  succinctly reproduces this, the same placement included: the lone `# mid` is the foot of `a`, not the head of `b`, as it is in yq (`.a | key | foot_comment`).
+  The rule is the one shared predicate `blank_line_between` (`src/text/line_break.rs`, `crlf_comment_blank_between`), applied where the parser decides a comment's placement.
+  Measured on 196 documents over seven shapes (a sibling, a nested key, a dedent, a sequence, a first child, the end of the document, a sequence under a key), one to three comments and every blank-line gap: yq on the CRLF text equals yq on the LF text with one blank line added after each standalone comment line, and so does succinctly.
+  A comment after a node (`a: 1 # t`), a `#` line inside a block scalar and a lone `\r` break are not affected, as in yq.
+  Not reproduced: two or more standalone comment lines at differing columns at the end of a document (`# c28\r\n  # c1\r\n` after a nested sequence), a CRLF comment block after a sequence item that holds a block scalar (`- run: |` with the block's `#` lines, then `# tail` and `# of the step`), a navigated sequence item's comment lines after a write (`.z = 2 | .items[1]`), and a blank line below a block of comments on `-P` and writes (`# c1\r\n# c2\r\n\r\nb: 2`, where succinctly adds a blank line after `# c2`).
+  The first of these is the LF gap that a blank line between comments at differing columns already has (`k:\n  - v\n# c28\n\n  # c1\n` puts `# c28` at column 2, yq at column 0), which the extra blank line now reaches in a CRLF file.
+  The first document's *header* is reproduced as
   yq prints it ([#5053](https://github.com/rust-works/succinctly/issues/5053), item 3): its
   line breaks verbatim (not normalized to `\n` like the rest of a document's content), every
   comment line keeping its `\r`, and a blank CRLF line in it a literal `# \r` comment line

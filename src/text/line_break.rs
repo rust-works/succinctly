@@ -62,8 +62,14 @@ pub fn line_break_len(text: &[u8], pos: usize) -> usize {
 /// its line break as a blank line sent a block backwards onto `PREV`'s foot (`- 1\n# h\n-\n- 3\n`
 /// is `.[2]`'s head in real yq, #1079) or put a stray blank between two joined comment lines
 /// (`- # c\n  !!str\n# f\n- 2\n`, #2835). A count of breaks cannot tell those from a real blank
-/// line, so the scan tracks whether the line it just finished held content. `\r\n` counts once.
+/// line, so the scan tracks whether the line it just finished held content. `\r\n` counts once, with
+/// one exception: go-yaml's scanner reads the `\r\n` that ends a *standalone comment line* as two
+/// breaks, so the comment is followed by a blank line the source never had (`# a\r\n# b` has a blank
+/// line between its comments, #5053; see [`crlf_comment_blank_between`]).
 pub(crate) fn blank_line_between(text: &[u8], from: usize, to: usize) -> bool {
+    if crlf_comment_blank_between(text, from, to) {
+        return true;
+    }
     let mut seen_content = true;
     let mut p = from;
     let end = to.min(text.len());
@@ -83,6 +89,34 @@ pub(crate) fn blank_line_between(text: &[u8], from: usize, to: usize) -> bool {
         }
     }
     false
+}
+
+/// Whether the first break in `text[from..to)` is a `\r\n` that ends a line holding only a `#`
+/// comment, with the whole `\r\n` inside the range (#5053). yq reads such a file with the `\r` as one
+/// break and the `\n` as a blank line of its own, so a standalone comment of a CRLF document is always
+/// followed by a blank line the source never had: a block of comments prints with a blank line between
+/// its lines, and a lone comment between two siblings prints one after it. A comment after a node
+/// (`a: 1 # c\r\n`), a block scalar's `#` line and a lone `\r` are not affected. The line must be a
+/// comment from its first non-blank byte. Checked against pinned yq on 196 documents (seven shapes,
+/// one to three comments, every blank-line gap): yq on the CRLF text is yq on the LF text with one
+/// blank line added after each standalone comment line. Callers that count the breaks between two
+/// comments add this blank to their count (`record_standalone_comment`).
+pub(crate) fn crlf_comment_blank_between(text: &[u8], from: usize, to: usize) -> bool {
+    let end = to.min(text.len());
+    let Some(at) = (from..end).find(|&p| is_line_break(text[p])) else {
+        return false;
+    };
+    if line_break_len(text, at) != 2 || at + 2 > end {
+        return false;
+    }
+    let line_start = text[..at]
+        .iter()
+        .rposition(|&b| is_line_break(b))
+        .map_or(0, |i| i + 1);
+    text[line_start..at]
+        .iter()
+        .find(|&&b| !matches!(b, b' ' | b'\t'))
+        == Some(&b'#')
 }
 
 #[cfg(test)]
@@ -131,9 +165,9 @@ mod tests {
 
     #[test]
     fn blank_line_between_needs_a_blank_line_not_a_line_of_content() {
-        // Adjacent comments, and one with a CRLF break between.
+        // Adjacent comments. With a CRLF break between them go-yaml sees a blank line (#5053).
         assert!(!blank_line_between(b"# a\n# b\n", 3, 4));
-        assert!(!blank_line_between(b"# a\r\n# b\r\n", 3, 5));
+        assert!(blank_line_between(b"# a\r\n# b\r\n", 3, 5));
         // A blank line, blank-with-spaces, and a CRLF blank line.
         assert!(blank_line_between(b"# a\n\n# b\n", 3, 5));
         assert!(blank_line_between(b"# a\n  \n# b\n", 3, 8));
@@ -141,12 +175,37 @@ mod tests {
         // A line holding only node properties between two comments is content, not a gap
         // (#2835), and so is a bare `-`.
         assert!(!blank_line_between(b"# a\n  !!str\n# b\n", 3, 12));
-        assert!(!blank_line_between(b"# a\r\n  !!str\r\n# b\r\n", 3, 14));
+        assert!(!blank_line_between(b"- # a\r\n  !!str\r\n# b\r\n", 5, 16));
         assert!(!blank_line_between(b"# a\n-\n# b\n", 3, 6));
         assert!(blank_line_between(b"# a\n  !!str\n\n# b\n", 3, 13));
         // `to` falling inside a CRLF pair, and past the end of the text.
         assert!(!blank_line_between(b"# a\r\n# b", 3, 4));
         assert!(blank_line_between(b"# a\n\n", 3, 99));
+    }
+
+    /// go-yaml reads the `\r\n` that ends a standalone comment line as two breaks (#5053), measured
+    /// against yq v4.53.3: `a: 1\r\n# c1\r\n# c2\r\nb: 2\r\n` prints a blank line between the comments.
+    #[test]
+    fn a_crlf_after_a_standalone_comment_line_is_a_blank_line_5053() {
+        // The whole CRLF must lie inside the range, and the line must be a comment from its first
+        // non-blank byte.
+        assert!(crlf_comment_blank_between(b"# a\r\n# b", 3, 5));
+        assert!(crlf_comment_blank_between(b"  \t# a\r\n# b", 6, 8));
+        assert!(!crlf_comment_blank_between(b"# a\r\n# b", 3, 4));
+        assert!(!crlf_comment_blank_between(b"# a\r\n# b", 3, 3));
+        // A line ending in LF, or in a lone CR, is not affected.
+        assert!(!crlf_comment_blank_between(b"# a\n# b", 3, 4));
+        assert!(!crlf_comment_blank_between(b"# a\r# b", 3, 4));
+        // A comment after a node, a node line and a `-` entry are not standalone comments.
+        assert!(!crlf_comment_blank_between(b"a: 1 # c\r\n# b", 8, 10));
+        assert!(!crlf_comment_blank_between(b"- # c\r\n# b", 5, 7));
+        assert!(!crlf_comment_blank_between(b"a: 1\r\n# b", 4, 6));
+        // Only the first break counts: past a content line there is no gap to find.
+        assert!(!crlf_comment_blank_between(b"a: 1\r\nb: 2\r\n", 4, 12));
+        // `blank_line_between` includes it, without disturbing a real blank line or a comment after a node.
+        assert!(blank_line_between(b"# a\r\n# b", 3, 5));
+        assert!(blank_line_between(b"# a\r\n\r\n# b", 3, 7));
+        assert!(!blank_line_between(b"a: 1 # c\r\n# b", 8, 10));
     }
 
     /// The two helpers are one rule seen from two angles, and must not drift

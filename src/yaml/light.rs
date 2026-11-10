@@ -19412,7 +19412,10 @@ plain: hello
 
         #[test]
         fn blank_line_between_counts_crlf_once() {
-            assert!(!blank_line_between(b"# a\r\n# b\r\n", 3, 5));
+            // After a standalone comment line a CRLF is a blank line to go-yaml (#5053); after any other
+            // line it counts once.
+            assert!(blank_line_between(b"# a\r\n# b\r\n", 3, 5));
+            assert!(!blank_line_between(b"a: 1 # a\r\n# b\r\n", 8, 10));
             assert!(blank_line_between(b"# a\r\n\r\n# b\r\n", 3, 7));
             assert!(blank_line_between(b"# a\n\n# b\n", 3, 5));
             assert!(!blank_line_between(b"# a\n# b\n", 3, 4));
