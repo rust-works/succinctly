@@ -86807,13 +86807,21 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
     resolved
 }
 
+/// The multiset of [`remove_first_occurrences`]: hashed where `std` is there, ordered in the
+/// `no_std` build.
+#[cfg(feature = "std")]
+type PathCounts = std::collections::HashMap<Vec<u8>, usize>;
+#[cfg(not(feature = "std"))]
+type PathCounts = BTreeMap<Vec<u8>, usize>;
+
 /// Removes from `paths` the first equal entry for each of `gone`, in one pass (#6883): the
 /// quadratic spelling, a scan and a shift per dropped path, took minutes for a descent below
 /// thousands of aliases. A path of field and index steps is matched by a byte key counted in a
 /// multiset, so a path that is listed twice loses one entry per mention, as the scan did; any
-/// other shape is matched by equality.
+/// other shape is matched by equality, which stays a scan (the paths a `..` resolves are all of
+/// the first kind).
 fn remove_first_occurrences(paths: &mut Vec<Expr>, gone: &[Expr]) {
-    let mut keyed: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
+    let mut keyed = PathCounts::default();
     let mut unkeyed: Vec<&Expr> = Vec::new();
     for path in gone {
         match static_path_key(path) {
@@ -86821,11 +86829,14 @@ fn remove_first_occurrences(paths: &mut Vec<Expr>, gone: &[Expr]) {
             None => unkeyed.push(path),
         }
     }
+    let keyed_any = !keyed.is_empty();
     paths.retain(|path| {
-        if let Some(count) = static_path_key(path).and_then(|key| keyed.get_mut(&key)) {
-            if *count > 0 {
-                *count -= 1;
-                return false;
+        if keyed_any {
+            if let Some(count) = static_path_key(path).and_then(|key| keyed.get_mut(&key)) {
+                if *count > 0 {
+                    *count -= 1;
+                    return false;
+                }
             }
         }
         if let Some(at) = unkeyed.iter().position(|p| *p == path) {
@@ -86837,7 +86848,8 @@ fn remove_first_occurrences(paths: &mut Vec<Expr>, gone: &[Expr]) {
 }
 
 /// A byte key for a path made of field and index steps (`None` for any other step): two such
-/// paths have the same key exactly when they are the same path, optional marks included.
+/// paths have the same key exactly when they name the same steps with the same optional marks.
+/// A group or a nested pipe around a step names no step of its own and is not part of the key.
 fn static_path_key(path: &Expr) -> Option<Vec<u8>> {
     let mut components = Vec::new();
     push_path_components(&mut components, path);

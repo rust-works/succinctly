@@ -3,8 +3,8 @@
 //! with a scan and a shift per path, each a deep comparison. They are removed in one pass now. The
 //! output is what it was.
 //!
-//! The time cap is over an order of magnitude over the run (about 2 s in a debug build for 40,000
-//! anchors, where the removal took minutes), so a loaded machine does not trip it.
+//! The time cap is several times the run (about 3 s in a debug build for 60,000 anchors on an idle
+//! machine, up to about 20 s beside the rest of the suite), where the removal took minutes.
 
 use std::time::{Duration, Instant};
 
@@ -29,7 +29,7 @@ fn anchors(n: usize) -> String {
 
 #[test]
 fn test_a_descent_write_below_many_aliases_is_not_quadratic_6883() -> Result<()> {
-    let n = 40_000;
+    let n = 60_000;
     let started = Instant::now();
     let (stdout, code) = run_yq_stdin(
         "(.. | select(tag == \"!!int\")) |= . + 1",
@@ -43,7 +43,7 @@ fn test_a_descent_write_below_many_aliases_is_not_quadratic_6883() -> Result<()>
     assert!(stdout.starts_with("{\"l\":[{\"p\":1},{\"p\":2},"));
     assert!(stdout.contains(&format!("{{\"p\":{n}}}],\"m\":[{{\"p\":1}},")));
     assert!(stdout.ends_with(&format!("{{\"p\":{n}}}]}}\n")));
-    assert!(took < Duration::from_secs(60), "took {took:?}");
+    assert!(took < Duration::from_secs(120), "took {took:?}");
     Ok(())
 }
 
