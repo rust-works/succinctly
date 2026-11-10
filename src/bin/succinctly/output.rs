@@ -652,6 +652,28 @@ pub struct JsonFormatOpts<'a> {
 /// recolored (as `null`) before the text ever reaches a user.
 pub(crate) const NAN_COLOR_MARKER: &str = "nan";
 
+thread_local! {
+    /// Set by [`scalar_json_text`] when yq's convention writes `null` for a non-finite float
+    /// (#6867); read, and cleared, by [`take_non_finite_json_write`].
+    static NON_FINITE_JSON_WRITTEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a [`JsonConvention::Preserve`] write since the last call put `null` where the value
+/// held a `NaN`, an infinity or a document `.inf`/`.nan` scalar, clearing the answer (#6867).
+///
+/// Real yq's JSON encoder fails on those (`json: unsupported value: +Inf`), and the writer has no
+/// error channel, so the caller asks after the write and refuses the result before it reaches the
+/// output. A flag the writer sets on the rare arm costs the hot path nothing, where a walk of
+/// every result before it is written would charge every value. Call it once before the write
+/// (to drop what an unrelated `format_json` left) and once after.
+pub fn take_non_finite_json_write() -> bool {
+    NON_FINITE_JSON_WRITTEN.replace(false)
+}
+
+fn note_non_finite_json_write() {
+    NON_FINITE_JSON_WRITTEN.set(true);
+}
+
 /// The kind of a value jq's writer prints as [`SKIPPED_TOO_DEEP`], which colors the marker as
 /// it would have colored the value (#5497).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -891,6 +913,9 @@ fn scalar_json_text(value: &OwnedValue, opts: &JsonFormatOpts) -> String {
         OwnedValue::Int(i) => i.to_string(),
         OwnedValue::Float(f) => {
             if f.is_nan() {
+                if opts.convention == JsonConvention::Preserve {
+                    note_non_finite_json_write();
+                }
                 // JSON doesn't support NaN; it prints as "null", but jq
                 // colors it differently from a real null (#3413) -- see
                 // `mark_nan_for_color`'s own doc comment.
@@ -907,12 +932,10 @@ fn scalar_json_text(value: &OwnedValue, opts: &JsonFormatOpts) -> String {
                 match opts.convention {
                     JsonConvention::Preserve => {
                         if f.is_infinite() {
-                            // yq mode: still "null" -- real yq's own Go
-                            // encoding/json refuses to marshal Infinity at
-                            // all and errors instead, so this is a
-                            // deliberate, open design question left
-                            // unresolved here, not a parity bug (#1087's own
-                            // scope note).
+                            // yq mode writes "null" here, and flags it: real yq's Go
+                            // encoding/json refuses to marshal an infinity and errors, which
+                            // the caller turns the flag into (#6867, #1087's open question).
+                            note_non_finite_json_write();
                             "null".to_string()
                         } else if opts.json_sourced {
                             // A JSON-sourced float never keeps a decimal
@@ -968,6 +991,9 @@ fn scalar_json_text(value: &OwnedValue, opts: &JsonFormatOpts) -> String {
         }
         OwnedValue::NumberLiteral(repr, literal) => {
             if value.as_f64().is_some_and(f64::is_nan) {
+                if opts.convention == JsonConvention::Preserve {
+                    note_non_finite_json_write();
+                }
                 // Same NaN-vs-null color distinction as the `Float` arm
                 // above (#3413) -- a parsed NaN literal takes this arm
                 // instead, but renders identically either way.
@@ -1004,6 +1030,7 @@ fn scalar_json_text(value: &OwnedValue, opts: &JsonFormatOpts) -> String {
                         // `"null"` answer, rather than relying on that
                         // cross-file invariant to keep holding.
                         NumberRepr::Float(f) if opts.json_sourced && f.is_infinite() => {
+                            note_non_finite_json_write();
                             "null".to_string()
                         }
                         // #1071: a document `.inf` is no JSON number text; the bare
@@ -1012,6 +1039,7 @@ fn scalar_json_text(value: &OwnedValue, opts: &JsonFormatOpts) -> String {
                             if f.is_infinite()
                                 && succinctly::yaml::NONFINITE_LITERALS.contains(&&**literal) =>
                         {
+                            note_non_finite_json_write();
                             "null".to_string()
                         }
                         // #1498: a `NumberLiteral` can still reach here for

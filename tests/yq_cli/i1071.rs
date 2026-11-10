@@ -64,13 +64,13 @@ fn test_nonfinite_spelling_matches_yq_1071() -> Result<()> {
     Ok(())
 }
 
-/// yq's JSON encoder errors on a non-finite (#1087); succinctly prints `null`, a document spelling included, where
-/// it must not leak `.inf` as JSON.
+/// yq's JSON encoder errors on a non-finite (#1087), a document spelling included, and succinctly fails too since
+/// #6867 (`null` before); either way it must not leak `.inf` as JSON.
 #[test]
-fn test_nonfinite_json_output_stays_null_1071() -> Result<()> {
+fn test_nonfinite_json_output_fails_and_never_leaks_the_spelling_1071() -> Result<()> {
     for filter in [".", "[.a, .b, .c, .d]", ".a", "[.a, (1e300 * 1e300)]"] {
         let (stdout, code) = run_yq_stdin(filter, DOC, &["-o", "json", "-I0"])?;
-        assert_eq!(code, 0, "for {filter:?}: {stdout:?}");
+        assert_eq!(code, 1, "for {filter:?}: {stdout:?}");
         assert!(
             !stdout.contains(".inf") && !stdout.contains("INF") && !stdout.contains("NaN"),
             "for {filter:?}: {stdout:?}"

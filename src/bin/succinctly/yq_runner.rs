@@ -9405,6 +9405,62 @@ fn write_pending_separator<W: Write>(
     Ok(())
 }
 
+/// Go's `strconv` text for a computed non-finite float: `+Inf`, `-Inf`, `NaN` (#6867).
+fn go_non_finite_text(f: f64) -> &'static str {
+    if f.is_nan() {
+        "NaN"
+    } else if f.is_sign_negative() {
+        "-Inf"
+    } else {
+        "+Inf"
+    }
+}
+
+/// The error real yq's JSON encoder raises for the first non-finite number `value` holds, in the
+/// order it writes them, or `None` if there is none (#6867).
+///
+/// yq wraps the failure once per node on the way up, the number's own node included, so the
+/// `json: error calling MarshalJSON ...` prefix repeats `depth + 1` times (`1 / 0` once,
+/// `[1 / 0]` twice, `{"a": [0 / 0]}` three times; v4.53.3). A computed number fails in
+/// `encoding/json` (`json: unsupported value: +Inf`); a document `.inf`/`.nan` scalar fails
+/// earlier, parsing its own text (`strconv.ParseFloat: parsing ".inf": invalid syntax`).
+fn non_finite_json_error(value: &OwnedValue, sort_keys: bool) -> Option<String> {
+    const WRAP: &str = "json: error calling MarshalJSON for type *yqlib.CandidateNode: ";
+    fn cause(value: &OwnedValue) -> Option<String> {
+        match value {
+            OwnedValue::Float(f) if !f.is_finite() => Some(format!(
+                "json: unsupported value: {}",
+                go_non_finite_text(*f)
+            )),
+            OwnedValue::NumberLiteral(_, literal)
+                if succinctly::yaml::NONFINITE_LITERALS.contains(&&**literal) =>
+            {
+                Some(format!(
+                    "strconv.ParseFloat: parsing \"{literal}\": invalid syntax"
+                ))
+            }
+            _ => None,
+        }
+    }
+    fn walk(value: &OwnedValue, sort_keys: bool, depth: usize) -> Option<(String, usize)> {
+        match value {
+            OwnedValue::Array(items) => items.iter().find_map(|v| walk(v, sort_keys, depth + 1)),
+            OwnedValue::Object(map) => {
+                let mut entries: Vec<_> = map.occurrences().collect();
+                if sort_keys {
+                    entries.sort_by(|a, b| a.0.cmp(b.0));
+                }
+                entries
+                    .into_iter()
+                    .find_map(|(_, v)| walk(v, sort_keys, depth + 1))
+            }
+            _ => cause(value).map(|c| (c, depth)),
+        }
+    }
+    let (cause, depth) = walk(value, sort_keys, 0)?;
+    Some(format!("{}{cause}", WRAP.repeat(depth + 1)))
+}
+
 fn output_value<W: Write>(
     writer: &mut W,
     value: &OwnedValue,
@@ -9429,9 +9485,20 @@ fn output_value<W: Write>(
             if let OwnedValue::NumberLiteral(_, literal) = value {
                 if succinctly::yaml::overflowed_int_json_text(literal).is_some()
                     || succinctly::yaml::is_spelled_int(literal)
+                    || succinctly::yaml::NONFINITE_LITERALS.contains(&&**literal)
                 {
                     write_pending_separator(writer, separator, terminator_from_config(config))?;
                     write!(writer, "{literal}")?;
+                    write_terminator(writer, config)?;
+                    return Ok(());
+                }
+            }
+            // #6867: a computed `NaN` or infinity is Go's own text, as `-r` prints it
+            // (`-r -o=json '1 / 0'` is `+Inf`) where the JSON writer has none.
+            if let OwnedValue::Float(f) = value {
+                if !f.is_finite() {
+                    write_pending_separator(writer, separator, terminator_from_config(config))?;
+                    write!(writer, "{}", go_non_finite_text(*f))?;
                     write_terminator(writer, config)?;
                     return Ok(());
                 }
@@ -9635,6 +9702,7 @@ fn output_value<W: Write>(
     // formatting; #2988 removed a dead `float_style` field this site used to
     // pass, which never actually reached this convention's own float
     // rendering.
+    let _ = output::take_non_finite_json_write();
     let json_str = output::format_json(
         value,
         &JsonFormatOpts {
@@ -9660,6 +9728,14 @@ fn output_value<W: Write>(
         },
     );
 
+    // #6867: the writer put `null` where yq's JSON encoder fails.
+    // A flag the walk cannot explain (a query literal like `1e400` under `--input-format json`,
+    // #1498) keeps the `null` it was written with.
+    if output::take_non_finite_json_write() {
+        if let Some(message) = non_finite_json_error(value, config.sort_keys) {
+            anyhow::bail!(message);
+        }
+    }
     reject_nul_output(&json_str, config)?;
     write_pending_separator(writer, separator, terminator_from_config(config))?;
     if config.use_color {
@@ -11207,7 +11283,7 @@ fn colorize_yaml(yaml: &str) -> String {
 /// this materializer has nowhere to put an infinity: YAML output would
 /// render `.inf` -- which real yq then cannot read back
 /// (`yq -o=json` on `.inf` is `strconv.ParseFloat: parsing ".inf": invalid
-/// syntax`) -- and `-o=json` would print a silent `null`, exactly the
+/// syntax`) -- and `-o=json` printed a silent `null` until #6867, exactly the
 /// outcome #1095 added the serde gate to prevent.
 fn parse_json_value(s: &str) -> Result<OwnedValue> {
     let s = s.trim();

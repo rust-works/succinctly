@@ -4353,10 +4353,10 @@ impl OwnedValue {
     /// rather than substituting `null` (RFC 8259 forbids the literal
     /// `Infinity`, but a finite-magnitude stand-in is representable). `NaN`
     /// has no such stand-in and stays `null` unconditionally in both modes.
-    /// yq mode's own correct behavior is still an open design question (real
-    /// yq's Go `encoding/json` refuses to marshal Infinity at all and
-    /// errors) -- `to_json_yq` keeps the pre-existing `null` substitution
-    /// rather than guessing at that answer here.
+    /// Real yq's Go `encoding/json` refuses to marshal an infinity at all and errors;
+    /// `to_json_yq` still writes the `null` substitution, because it builds text for
+    /// stringifying and indexing as well as for output, and the CLI's own JSON writer is what
+    /// refuses the value (#6867).
     ///
     /// `jq_printer` is jq's writer, which prints anything more than
     /// [`JQ_MAX_PRINT_DEPTH`] levels down as [`SKIPPED_TOO_DEEP`] (#5497); the yq writer
@@ -5415,8 +5415,8 @@ pub(crate) fn infinite_float_preview_text(negative: bool) -> &'static str {
 /// pre-existing `null` substitution. Real yq's own Go `encoding/json`
 /// refuses to marshal Infinity at all and errors instead, so replicating
 /// jq's `DBL_MAX`-text behavior here would not actually match either
-/// oracle -- an open design question this fn deliberately doesn't resolve,
-/// see #1087's own text.
+/// oracle. The refusal is the CLI JSON writer's (#6867); this text is the
+/// stand-in for the paths that only stringify.
 fn yq_infinite_float_json_text(_negative: bool) -> &'static str {
     "null"
 }
