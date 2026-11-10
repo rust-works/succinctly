@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 
-use crate::run_yq_stdin;
+use crate::{run_jq_stdin, run_yq_stdin};
 
 const DOC: &str = "x: [1, 2, 3]\ny: {z: 1}\n";
 
@@ -139,5 +139,43 @@ fn map_and_its_splat_spelling_agree_6801() -> Result<()> {
     let (map, _) = run_yq_stdin(".x | map({})", DOC, &["-o", "json", "-I0"])?;
     let (spelled, _) = run_yq_stdin(".x | [.[] | {}]", DOC, &["-o", "json", "-I0"])?;
     assert_eq!(map, spelled);
+    Ok(())
+}
+
+/// The rule is yq's: `succinctly jq` builds one `{}` per member, as jq does, for the same filter
+/// (the mode decides, never the input format).
+#[test]
+fn jq_mode_map_of_the_empty_object_stays_per_member_6801() -> Result<()> {
+    let (stdout, code) = run_jq_stdin(".x | map({})", "{\"x\":[1,2,3]}", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[{},{},{}]\n");
+    let (stdout, code) = run_jq_stdin(".x | [.[] | {}]", "{\"x\":[1,2,3]}", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[{},{},{}]\n");
+    Ok(())
+}
+
+/// A body that builds the mapping some other way stays per member, as in yq: a constant that
+/// holds it, an arithmetic stage, an `as` binding and the `//` alternative.
+#[test]
+fn map_bodies_that_are_not_a_bare_empty_mapping_stay_per_member_6801() -> Result<()> {
+    for (filter, expected) in [
+        (
+            ".x | map({} + {\"a\": 1})",
+            "[{\"a\":1},{\"a\":1},{\"a\":1}]\n",
+        ),
+        (".x | map({} as $z | $z)", "[{},{},{}]\n"),
+        (
+            ".x | map({\"k\": {}})",
+            "[{\"k\":{}},{\"k\":{}},{\"k\":{}}]\n",
+        ),
+        (".x | map(select(. > 1) // {})", "[{},2,3]\n"),
+        (".x | map({} | select(true))", "[{}]\n"),
+        (".x | map({} | . as $z | $z)", "[{}]\n"),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, DOC, &["-o", "json", "-I0"])?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(stdout, expected, "{filter}");
+    }
     Ok(())
 }
