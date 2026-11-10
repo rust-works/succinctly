@@ -223,7 +223,7 @@ fn a_nul_replaces_the_line_break_of_a_header_only_result_5721() -> Result<()> {
 #[test]
 fn a_nul_still_follows_the_other_results_of_a_header_only_document_5721() -> Result<()> {
     let (out, code) = run_yq_stdin("select(. == null), 1", "# c\n", &["-0"])?;
-    assert_eq!((out.as_str(), code), ("# c\01\0", 0));
+    assert_eq!((out.as_str(), code), ("# c\x001\x00", 0));
     Ok(())
 }
 
@@ -238,12 +238,18 @@ fn a_nul_after_a_colored_header_only_result_5721() -> Result<()> {
         ("", "\0"),
         ("---\n# c\n", "---\n\u{1b}[90m# c\n\u{1b}[0m\0"),
     ] {
-        let (out, code) = run_yq_stdin(".", input, &["-0", "-C"])?;
-        assert_eq!(
-            (out.as_str(), code),
-            (expected, 0),
-            "-0 -C over {input:?}"
-        );
+        for (filter, extra) in [
+            (".", &["-0", "-C"][..]),
+            ("select(true)", &["-0", "-C"][..]),
+            (".", &["-0", "-C", "-P"][..]),
+        ] {
+            let (out, code) = run_yq_stdin(filter, input, extra)?;
+            assert_eq!(
+                (out.as_str(), code),
+                (expected, 0),
+                "{filter} {extra:?} over {input:?}"
+            );
+        }
     }
     Ok(())
 }

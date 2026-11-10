@@ -358,6 +358,16 @@ struct PendingSeparator<'a> {
     settled: bool,
 }
 
+/// Whether `-0` leaves the line break a header-only document ends in, where `header` is that
+/// header without the break (#5721). Uncolored, the NUL always replaces it. With `--colors` a
+/// comment line is one colored span that holds its own break (`ESC[90m# c<LF>ESC[0m<NUL>`), so
+/// it stays; the `---` marker has none inside its span. One definition for the streaming sink
+/// and the DOM route.
+fn header_break_stays(header: &str, colored: bool) -> bool {
+    let last_line = header.rsplit('\n').next().unwrap_or(header);
+    colored && last_line.trim_start().starts_with('#')
+}
+
 /// Per-result buffered writer used when `-0`/`--nul-output` is active
 /// (#1709). Buffers ONE streamed result's rendered text at a time -- not the
 /// whole document/stream. A per-*result* buffer keeps bounded, O(one result)
@@ -511,13 +521,11 @@ impl<W: Write> NulCheckedSink<'_, W> {
         let Some(header) = self.buf.strip_suffix('\n') else {
             return;
         };
-        let last_line = header.rsplit('\n').next().unwrap_or(header);
-        if self.colorizer.is_some() && last_line.trim_start().starts_with('#') {
+        if header_break_stays(header, self.colorizer.is_some()) {
             return;
         }
         self.buf.pop();
     }
-
     /// [`Self::flush_body`] plus the real terminator -- the evaluated
     /// multi-result path's per-result hook, reached through
     /// [`ColorSink::write_result_terminator`].
@@ -9478,8 +9486,7 @@ fn output_value<W: Write>(
         if header_only && config.nul_output && body.is_empty() && trailing.is_empty() {
             if let Some(without_break) = leading.strip_suffix('\n') {
                 // With `--colors` a comment line is one span that holds its own break.
-                let last_line = without_break.rsplit('\n').next().unwrap_or(without_break);
-                if !(config.use_color && last_line.trim_start().starts_with('#')) {
+                if !header_break_stays(without_break, config.use_color) {
                     leading = without_break.to_string();
                 }
             }
