@@ -3549,37 +3549,35 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
     /// [`Self::skip_to_eol`] eight bytes at a time, and whether the line it passed held a NEL, LS or PS
     /// (#6369; it noted tabs for #6287 before). Each word is tested for a break byte (exactly: the high
-    /// bit of every zero byte of the word xor the pattern) and for the two lead bytes, `0xC2` and
-    /// `0xE2`; the first break in a word ends the line, and only a lead byte before it is read, in
-    /// place, for the break it may begin. Text with no lead byte reads no byte twice, and text full of
-    /// U+2014 or U+00E9 reads only those.
+    /// bit of every zero byte of the word xor the pattern); the first break in a word ends the line.
+    /// A word with no byte outside ASCII, which is all of the usual text, costs one more `AND`. Only
+    /// a word with one is tested for the lead bytes, `0xC2` and `0xE2` (one test: they differ in bit
+    /// 5 alone), and only a lead byte before the break is read, in place, for the break it may begin,
+    /// so text full of U+2014 or U+00E9 reads only those bytes.
     #[inline]
     fn skip_to_eol_noting_unicode_break(&mut self, saw_unicode_break: &mut bool) {
         const NL: u64 = 0x0A0A_0A0A_0A0A_0A0A;
         const CR: u64 = 0x0D0D_0D0D_0D0D_0D0D;
-        const NEL_LEAD: u64 = 0xC2C2_C2C2_C2C2_C2C2;
-        const LS_PS_LEAD: u64 = 0xE2E2_E2E2_E2E2_E2E2;
+        const HIGH: u64 = 0x8080_8080_8080_8080;
+        const BIT5: u64 = 0x2020_2020_2020_2020;
+        const LEAD: u64 = 0xE2E2_E2E2_E2E2_E2E2;
         let input = self.input;
         let mut at = self.pos;
         while at + 8 <= input.len() {
             let mut word = [0u8; 8];
             word.copy_from_slice(&input[at..at + 8]);
             let w = u64::from_le_bytes(word);
-            let mut leads = zero_bytes(w ^ NEL_LEAD) | zero_bytes(w ^ LS_PS_LEAD);
             let breaks = if HAS_CR {
                 zero_bytes(w ^ NL) | zero_bytes(w ^ CR)
             } else {
                 zero_bytes(w ^ NL)
             };
-            let line_end = if breaks != 0 {
-                let first = (breaks.trailing_zeros() / 8) as usize;
-                // the lead bytes below the first break
-                leads &= (1u64 << (8 * first)) - 1;
-                Some(first)
-            } else {
-                None
-            };
-            if !*saw_unicode_break {
+            if w & HIGH != 0 && !*saw_unicode_break {
+                // the lead bytes below the first break, if the word has one
+                let mut leads = zero_bytes((w | BIT5) ^ LEAD);
+                if breaks != 0 {
+                    leads &= (1u64 << (breaks.trailing_zeros() & !7)) - 1;
+                }
                 while leads != 0 {
                     let i = (leads.trailing_zeros() / 8) as usize;
                     if block_unicode::unicode_break_len(input, at + i) > 0 {
@@ -3590,8 +3588,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     leads &= leads - 1;
                 }
             }
-            if let Some(first) = line_end {
-                self.pos = at + first;
+            if breaks != 0 {
+                self.pos = at + (breaks.trailing_zeros() / 8) as usize;
                 return;
             }
             at += 8;
