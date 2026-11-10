@@ -1988,7 +1988,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             let target = frames
                 .iter()
                 .rposition(|frame| frame.indent == self.pending_block.column)
-                .and_then(|at| Self::last_mapping_key(core::iter::once(&frames[at])));
+                .and_then(|at| Self::last_mapping_key(frames[..=at].iter().rev()));
             if let Some(target) = target {
                 self.drain_pending_into_foot(target);
                 return;
