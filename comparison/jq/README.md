@@ -81,6 +81,7 @@ A platform's first run needs the two markers added at the top of its section the
 The section's `**CPU**:` line must name the run's CPU (two machines can share a platform), and `--write-docs` checks that before it measures anything.
 `--render-docs` measures nothing: it re-renders the index and every block from the committed jsons, after a change to how they are rendered.
 Both also regenerate the `<!-- compare:jq-summary -->` block of `CLAUDE.md` (one row per committed run: the geomean speedup of each size tier), from every committed json.
+And the `<!-- compare:jq-identity -->` block of `README.md` (one table per committed run: the `identity` query on each 10 MB input, with peak memory, #6871). A test in `src/bin/succinctly/compare/docs.rs` fails when either of those two, or the `docs/benchmarks/jq.md` blocks, is edited by hand.
 The bin's `benchmarks_doc_quotes_the_committed_results` test fails when a block and its json disagree.
 CI is `.github/workflows/compare-jq.yml`, run by hand or on a release, not on pull requests.
 `.github/workflows/compare-jq-ledger.yml` runs the correctness dimensions (no timing rows) on pull requests that touch

@@ -1151,6 +1151,8 @@ fn write_docs(root: &std::path::Path, results: &Results, args: &CompareJqArgs) -
     let bench_doc = docs::patch_benchmarks(&std::fs::read_to_string(&bench)?, &runs)?;
     let summary = root.join(docs::SUMMARY_DOC);
     let summary_doc = docs::patch_summary(&std::fs::read_to_string(&summary)?, &runs)?;
+    let readme = root.join(docs::README_DOC);
+    let readme_doc = docs::patch_readme(&std::fs::read_to_string(&readme)?, &runs)?;
     std::fs::write(
         dir.join(format!("jq-{p}.md")),
         docs::sanitize(
@@ -1162,10 +1164,12 @@ fn write_docs(root: &std::path::Path, results: &Results, args: &CompareJqArgs) -
     std::fs::write(dir.join("jq.md"), docs::index(&runs))?;
     std::fs::write(&bench, bench_doc)?;
     std::fs::write(&summary, summary_doc)?;
+    std::fs::write(&readme, readme_doc)?;
     println!(
-        "wrote docs/compare/jq-{p}.md, jq-{p}.json, jq.md, {} and {}",
+        "wrote docs/compare/jq-{p}.md, jq-{p}.json, jq.md, {}, {} and {}",
         docs::BENCHMARKS_DOC,
-        docs::SUMMARY_DOC
+        docs::SUMMARY_DOC,
+        docs::README_DOC
     );
     Ok(())
 }
@@ -1178,13 +1182,17 @@ fn render_docs(root: &std::path::Path) -> Result<()> {
     let bench_doc = docs::patch_benchmarks(&std::fs::read_to_string(&bench)?, &runs)?;
     let summary = root.join(docs::SUMMARY_DOC);
     let summary_doc = docs::patch_summary(&std::fs::read_to_string(&summary)?, &runs)?;
+    let readme = root.join(docs::README_DOC);
+    let readme_doc = docs::patch_readme(&std::fs::read_to_string(&readme)?, &runs)?;
     std::fs::write(dir.join("jq.md"), docs::index(&runs))?;
     std::fs::write(&bench, bench_doc)?;
     std::fs::write(&summary, summary_doc)?;
+    std::fs::write(&readme, readme_doc)?;
     println!(
-        "rendered docs/compare/jq.md, {} and {} from {} committed run(s)",
+        "rendered docs/compare/jq.md, {}, {} and {} from {} committed run(s)",
         docs::BENCHMARKS_DOC,
         docs::SUMMARY_DOC,
+        docs::README_DOC,
         runs.len()
     );
     Ok(())
