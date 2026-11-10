@@ -9897,6 +9897,19 @@ fn open_failures_reached<'a>(
             if held_back_closer_before(args, raws, &failures[0]) {
                 return &failures[..1];
             }
+            // #6732: the stream parser's own first yield past the first failure says which file the
+            // value the main loop reads comes from, and what its reader has asked of the failures
+            // by then.
+            if plain_stream_errors(args) {
+                match first_yield_past_failure(raws, failures[0].0) {
+                    Some(YieldPast::EndOfText) => return failures,
+                    Some(YieldPast::File(file)) => {
+                        let reached = failures.iter().take_while(|&&(at, _)| at <= file).count();
+                        return &failures[..reached];
+                    }
+                    None => {}
+                }
+            }
             // The first file with bytes from the first failure on holds the value, or the end of
             // one that started before it. A line with no newline goes on into the next file with
             // bytes; the other readers stop where they cannot tell.
@@ -9976,19 +9989,74 @@ fn held_back_closer_before(
     streams
         && own.checked_sub(1).is_some_and(|before| {
             raws.get(before).is_some_and(|raw| {
-                closing_event_lags(raw, args.seq)
-                    // #6732: the files are one byte stream, so the closer may belong to a container
-                    // an earlier file left open, which the file alone is not a value of. A file
-                    // between, even an empty one, takes the read, so the closer is its own.
-                    || (plain_stream_errors(args)
-                        && !raw.is_empty()
-                        && !last_read_fills_buffer(raw)
-                        // A fault met before the end (`1` after a value with no separator) is raised
-                        // where it is, and the closer after it is not the read the directory takes.
-                        && !matches!(first_stream_fault(&raws[..=before]), Some((_, false)))
-                        && closer_lags_in_joined_text(&raws[..=before]))
+                // A fault met before the end (`1` after a value with no separator) is raised
+                // where it is, and the closer after it is not the read the directory takes.
+                // #6732: that holds for a closer that is a whole value of its own file too
+                // (`[1,2` then `{"a":1}` faults at the `{`).
+                let faults_before_end = plain_stream_errors(args)
+                    && matches!(first_stream_fault(&raws[..=before]), Some((_, false)));
+                !faults_before_end
+                    && (closing_event_lags(raw, args.seq)
+                        // #6732: the files are one byte stream, so the closer may belong to a
+                        // container an earlier file left open, which the file alone is not a value
+                        // of. A file between, even an empty one, takes the read, so the closer is
+                        // its own.
+                        || (plain_stream_errors(args)
+                            && !raw.is_empty()
+                            && !last_read_fills_buffer(raw)
+                            && closer_lags_in_joined_text(&raws[..=before])))
             })
         })
+}
+
+/// Where the first thing `--stream-errors` yields past the first open failure comes from (#6732).
+enum YieldPast {
+    /// The parse error that ends the text, or a value completed only by asking past the last file:
+    /// the reader has opened, and counted, every file that did not open by then.
+    EndOfText,
+    /// A value or a fault read while the parser was in this file.
+    File(usize),
+}
+
+/// The first thing the stream parser yields once its reader is past the first open failure (one
+/// that opened after `first_failure` files). A number or a literal the files end in completes only
+/// when the reader asks for more, so the yield may come from a file past a second failure (`[` then
+/// `1 2` then `[`: the fault is raised in the third file) or from the end of the text (`[` then
+/// `1 2`), and jq has by then opened, and counted, every file that did not open before it. `None`
+/// for a text longer than [`crate::jq_stream_errors::FIRST_EVENT_PREFIX_LIMIT`], which is not read
+/// for it, and for a stream that yields nothing past the failure.
+fn first_yield_past_failure(raws: &[Vec<u8>], first_failure: usize) -> Option<YieldPast> {
+    if raws.iter().map(Vec::len).sum::<usize>() > crate::jq_stream_errors::FIRST_EVENT_PREFIX_LIMIT
+    {
+        return None;
+    }
+    let first = raws.iter().position(|raw| !raw.is_empty());
+    let sources: Vec<(Option<usize>, Vec<u8>)> = raws
+        .iter()
+        .enumerate()
+        .map(|(at, raw)| {
+            let bom = if Some(at) == first {
+                crate::front_matter::leading_bom_len(raw)
+            } else {
+                0
+            };
+            (Some(at), raw[bom..].to_vec())
+        })
+        .collect();
+    let mut reader = crate::jq_stream_errors::Reader::new(&sources[..]);
+    while let Some(yielded) = reader.next_yielded() {
+        if yielded.location.0 >= first_failure {
+            // Only a fault is placed here: a value is placed by the rules below.
+            let fault = yielded.error.as_deref()?;
+            // One at the end of the text is raised by the read that asks past the last file.
+            return Some(if fault_is_at_eof(fault) {
+                YieldPast::EndOfText
+            } else {
+                YieldPast::File(yielded.location.0)
+            });
+        }
+    }
+    None
 }
 
 /// Whether the text the files `raws` make, read as one stream, ends in a closing event the stream
