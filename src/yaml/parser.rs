@@ -1974,11 +1974,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     }
 
     /// [`Self::resolve_pending_block_backward`] for a block that a blank line split off a later one of its run
-    /// (#5053). A block dedented to the column of a mapping that is still open (`x:` / `  k: 1` / `# A` / blank
-    /// / `# B`) is the foot of that mapping's last key, as go-yaml's `unrollIndent` places it when the node
-    /// that follows is not yet known -- not of `PREV`, the innermost key, which would print it at `PREV`'s own
-    /// column, when the next block of the run is at that column too (a block after it at another column leaves
-    /// the choice to the node that follows, which is not known yet). Any other block settles on `PREV`.
+    /// (#5053). A block dedented to the column of a block that is still open (`x:` / `  k: 1` / `# A` / blank /
+    /// `# B`, or `steps:` / `  - run: x` / `  # A` / blank / `  # B`) is the foot of the last key of the nearest
+    /// enclosing mapping, as go-yaml's `unrollIndent` places it when the node that follows is not yet known: a
+    /// block sequence hands the block on to the mapping that holds it. It is not `PREV`, the innermost key, which
+    /// would print it at `PREV`'s own column. That applies when the next block of the run is at that column too (a
+    /// block after it at another column leaves the choice to the node that follows, which is not known yet). Any
+    /// other block settles on `PREV`.
     fn resolve_split_block(&mut self, next_column: usize) {
         if self.pending_block.column < self.pending_block.prev_indent
             && next_column == self.pending_block.column
@@ -1988,7 +1990,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             let target = frames
                 .iter()
                 .rposition(|frame| frame.indent == self.pending_block.column)
-                .and_then(|at| Self::last_mapping_key(core::iter::once(&frames[at])));
+                .and_then(|at| Self::last_mapping_key(frames[..=at].iter().rev()));
             if let Some(target) = target {
                 self.drain_pending_into_foot(target);
                 return;
