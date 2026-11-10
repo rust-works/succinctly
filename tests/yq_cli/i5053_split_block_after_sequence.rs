@@ -22,6 +22,22 @@ const ROWS: &[(&str, &str)] = &[
     ("j:\r\n  - run: x\r\n  # t1\r\n  # t2\r\n", "j:\n  - run: x\n# t1\n# t2\n"),
     ("j:\n  k:\n    - run: |\n        t\n    # t1\n\n    # t2\n", "j:\n  k:\n    - run: |\n        t\n  # t1\n# t2\n"),
     ("j:\r\n  k:\r\n    - run: |\r\n        t\r\n    # t1\r\n\r\n    # t2\r\n", "j:\n  k:\n    - run: |\n        t\n  # t1\n# t2\n"),
+    ("k:\n- x\n# t1\n\n# t2\n", "k:\n  - x\n  # t1\n# t2\n"),
+    ("k:\r\n- x\r\n# t1\r\n\r\n# t2\r\n", "k:\n  - x\n  # t1\n# t2\n"),
+    ("k:\n  - - x\n    # t1\n\n    # t2\n", "k:\n  - - x\n    # t1\n# t2\n"),
+    ("k:\r\n  - - x\r\n    # t1\r\n\r\n    # t2\r\n", "k:\n  - - x\n    # t1\n# t2\n"),
+    ("- k:\n    - x\n    # t1\n\n    # t2\n", "- k:\n    - x\n    # t1\n# t2\n"),
+    ("- k:\r\n    - x\r\n    # t1\r\n\r\n    # t2\r\n", "- k:\n    - x\n    # t1\n# t2\n"),
+    ("k:\n  - x\n  - y\n  # t1\n\n  # t2\n", "k:\n  - x\n  - y\n  # t1\n# t2\n"),
+    ("k:\r\n  - x\r\n  - y\r\n  # t1\r\n\r\n  # t2\r\n", "k:\n  - x\n  - y\n  # t1\n# t2\n"),
+    ("k:\n  - [x]\n  # t1\n\n  # t2\n", "k:\n  - [x]\n  # t1\n# t2\n"),
+    ("k:\r\n  - [x]\r\n  # t1\r\n\r\n  # t2\r\n", "k:\n  - [x]\n  # t1\n# t2\n"),
+    ("k:\n  - \"x\"\n  # t1\n\n  # t2\n", "k:\n  - \"x\"\n  # t1\n# t2\n"),
+    ("k:\r\n  - \"x\"\r\n  # t1\r\n\r\n  # t2\r\n", "k:\n  - \"x\"\n  # t1\n# t2\n"),
+    ("k: &a\n  - x\n  # t1\n\n  # t2\n", "k: &a\n  - x\n  # t1\n# t2\n"),
+    ("k: &a\r\n  - x\r\n  # t1\r\n\r\n  # t2\r\n", "k: &a\n  - x\n  # t1\n# t2\n"),
+    ("k:\n  - x\n  # t1\n\n  # t2\n\nz: 1\n", "k:\n  - x\n  # t1\n# t2\n\nz: 1\n"),
+    ("k:\r\n  - x\r\n  # t1\r\n\r\n  # t2\r\n\r\nz: 1\r\n", "k:\n  - x\n  # t1\n# t2\n\nz: 1\n"),
 ];
 
 #[test]
