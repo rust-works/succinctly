@@ -9636,10 +9636,18 @@ fn test_yaml_anchor_alias_without_merge() -> Result<()> {
 /// from valid input; it's kept here as the regression test for the original
 /// bug ([`.y[0:2]`] silently gave `[]` instead of slicing the resolved
 /// string, even though `.y | type` already correctly reported `"string"`).
+///
+/// #4569: that expectation had never been captured from yq. Against yq v4.53.3 the alias node
+/// itself is not a plain string scalar, so `.y[0:2]` is `[]` (the anchor's own `.x[0:2]` is
+/// `"he"`), and the slice now answers that; the resolved string is still reachable through the
+/// anchor.
 #[test]
 fn test_yaml_single_hop_alias_as_str_slices_correctly_1191() -> Result<()> {
     let input = "x: &a hello\ny: *a\n";
     let (output, exit_code) = run_yq_stdin(".y[0:2]", input, &["-o=json"])?;
+    assert_eq!(exit_code, 0, "out: {output:?}");
+    assert_eq!(output.trim(), "[]");
+    let (output, exit_code) = run_yq_stdin(".x[0:2]", input, &["-o=json"])?;
     assert_eq!(exit_code, 0, "out: {output:?}");
     assert_eq!(output.trim(), r#""he""#);
     Ok(())
