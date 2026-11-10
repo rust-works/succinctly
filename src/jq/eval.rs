@@ -45514,8 +45514,9 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 defer_deletes.then_some(&mut deletes),
             )
         } else {
-            // #6839: the body's own writes are relative to this target, not to the root.
-            let _body = alias_identity::enter_update_body();
+            // #6839: the body's own writes are relative to this target, not to the root. Only an
+            // update that has a table (`pre`) has anything to switch off.
+            let _body = pre.is_some().then(alias_identity::enter_update_body);
             update_path_with_deletes::<S>(
                 &mut result,
                 path,
