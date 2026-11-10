@@ -1202,16 +1202,13 @@ pub mod alias_identity {
         #[must_use]
         pub fn with_merged(mut self, merged: Vec<MergedMember>) -> Self {
             for (idx, member) in merged.iter().enumerate() {
-                let mut key = Vec::new();
-                for (depth, step) in member.member.iter().enumerate() {
-                    if depth > 0 {
-                        self.merged_prefixes.insert(key.clone());
-                    }
-                    if push_step_key(&mut key, step).is_none() {
-                        break;
-                    }
+                let steps = &member.member;
+                // A position of string and index steps, which is all the document walk produces.
+                if let Some(key) = position_key(steps) {
+                    self.merged_by_member.insert(key, idx);
                 }
-                self.merged_by_member.insert(key, idx);
+                self.merged_prefixes
+                    .extend((1..steps.len()).filter_map(|depth| position_key(&steps[..depth])));
             }
             self.merged = merged;
             self
@@ -1570,16 +1567,12 @@ pub mod alias_identity {
             // writes `.item.x = 5` into the anchor, where `.b = 5` over an alias rebinds (#6785).
             if hops < table.hop_bound() {
                 if let Some(member) = table.merged_at(doc, &prefix) {
-                    if let Some(mut redirected) = member
-                        .write_home
-                        .iter()
-                        .map(step_to_expr)
-                        .collect::<Option<Vec<Expr>>>()
-                    {
-                        redirected.extend(components[i..].iter().cloned());
-                        redirect_components(redirected, doc, table, opts, hops + 1, out);
-                        return;
-                    } // patchcov: coverage tolerate-line reason="unreachable: a write home is a path of string and index steps, which step_to_expr never fails on (#6785)"
+                    // A write home is a path of string and index steps, which every step maps to.
+                    let mut redirected: Vec<Expr> =
+                        member.write_home.iter().filter_map(step_to_expr).collect();
+                    redirected.extend(components[i..].iter().cloned());
+                    redirect_components(redirected, doc, table, opts, hops + 1, out);
+                    return;
                 }
             }
             if (is_proper_prefix || opts.through_terminal) && hops < table.hop_bound() {
@@ -99026,52 +99019,41 @@ fn propagate_anchor_writes(
     }
 }
 
-/// Replace the value at `path` (string and index steps only) in place, when every step already
-/// exists. Unlike [`set_value_at_path`] it takes no ownership of the document, so it neither
-/// clones it nor copies a container that has no other handle (#6785). `false` when a step does
-/// not resolve, with the document unchanged.
-fn replace_existing_at_path(root: &mut OwnedValue, path: &[OwnedValue], new: OwnedValue) -> bool {
+/// The slot at `path` (string and index steps only) inside `root`, mutably: through a handle
+/// no one else holds the containers are not copied (#6785). `None` when a step does not resolve.
+fn existing_slot_mut<'v>(
+    root: &'v mut OwnedValue,
+    path: &[OwnedValue],
+) -> Option<&'v mut OwnedValue> {
     let mut slot = root;
     for step in path {
-        let next = match (step, slot) {
-            (OwnedValue::String(key), OwnedValue::Object(entries)) => entries.get_mut(key.as_str()),
-            (OwnedValue::Int(idx), OwnedValue::Array(arr)) => {
-                usize::try_from(*idx).ok().and_then(|i| arr.get_mut(i))
+        slot = match (step, slot) {
+            (OwnedValue::String(key), OwnedValue::Object(entries)) => {
+                entries.get_mut(key.as_str())?
             }
-            _ => None,
+            (OwnedValue::Int(idx), OwnedValue::Array(arr)) => {
+                arr.get_mut(usize::try_from(*idx).ok()?)?
+            }
+            _ => return None,
         };
-        match next {
-            Some(inner) => slot = inner,
-            None => return false,
-        }
     }
-    *slot = new;
-    true
+    Some(slot)
 }
 
-/// Remove the member at `path` (string and index steps only) in place; `false` when it is not there.
+/// Replace the value at `path` in place when every step exists; `false` leaves the document alone.
+fn replace_existing_at_path(root: &mut OwnedValue, path: &[OwnedValue], new: OwnedValue) -> bool {
+    existing_slot_mut(root, path)
+        .map(|slot| *slot = new)
+        .is_some()
+}
+
+/// Remove the mapping member at `path` in place; `false` when it is not there.
 fn remove_existing_at_path(root: &mut OwnedValue, path: &[OwnedValue]) -> bool {
-    let Some((last, parents)) = path.split_last() else {
+    let Some((OwnedValue::String(key), parents)) = path.split_last() else {
         return false;
     };
-    let mut slot = root;
-    for step in parents {
-        let next = match (step, slot) {
-            (OwnedValue::String(key), OwnedValue::Object(entries)) => entries.get_mut(key.as_str()),
-            (OwnedValue::Int(idx), OwnedValue::Array(arr)) => {
-                usize::try_from(*idx).ok().and_then(|i| arr.get_mut(i))
-            }
-            _ => None,
-        };
-        match next {
-            Some(inner) => slot = inner,
-            None => return false,
-        }
-    }
-    match (last, slot) {
-        (OwnedValue::String(key), OwnedValue::Object(entries)) => {
-            entries.shift_remove(key.as_str()).is_some()
-        }
+    match existing_slot_mut(root, parents) {
+        Some(OwnedValue::Object(entries)) => entries.shift_remove(key.as_str()).is_some(),
         _ => false,
     }
 }
@@ -175065,6 +175047,62 @@ mod tests {
     /// hand-built tables so each gate is pinned independently of the CLI
     /// tests that drive the same code end to end.
     #[cfg(feature = "std")]
+    mod merged_member_helpers_6785 {
+        use super::*;
+
+        fn json(s: &str) -> OwnedValue {
+            parse_complete_json(s, false).unwrap()
+        }
+
+        fn key(s: &str) -> OwnedValue {
+            OwnedValue::String(s.to_string().into())
+        }
+
+        #[test]
+        fn replace_and_remove_reach_only_what_exists_6785() {
+            let mut v = json(r#"{"a":{"x":1},"l":[10,20]}"#);
+            // Resolves: a key and an index.
+            assert!(replace_existing_at_path(
+                &mut v,
+                &[key("a"), key("x")],
+                OwnedValue::Int(2)
+            ));
+            assert!(replace_existing_at_path(
+                &mut v,
+                &[key("l"), OwnedValue::Int(1)],
+                OwnedValue::Int(3)
+            ));
+            assert_eq!(v, json(r#"{"a":{"x":2},"l":[10,3]}"#));
+            // Does not resolve: a missing key, an index past the end, a negative index, a key on
+            // an array, an index on a mapping, a step through a scalar. The document is left alone.
+            let before = v.clone();
+            for path in [
+                vec![key("nope")],
+                vec![key("l"), OwnedValue::Int(9)],
+                vec![key("l"), OwnedValue::Int(-1)],
+                vec![key("l"), key("x")],
+                vec![key("a"), OwnedValue::Int(0)],
+                vec![key("a"), key("x"), key("deeper")],
+            ] {
+                assert!(
+                    !replace_existing_at_path(&mut v, &path, OwnedValue::Null),
+                    "{path:?}"
+                );
+                assert!(!remove_existing_at_path(&mut v, &path), "{path:?}");
+            }
+            // Nothing to remove at the root, and an array element is not a mapping member.
+            assert!(!remove_existing_at_path(&mut v, &[]));
+            assert!(!remove_existing_at_path(
+                &mut v,
+                &[key("l"), OwnedValue::Int(0)]
+            ));
+            assert_eq!(v, before);
+            // A mapping member is removed.
+            assert!(remove_existing_at_path(&mut v, &[key("a"), key("x")]));
+            assert_eq!(v, json(r#"{"a":{},"l":[10,3]}"#));
+        }
+    }
+
     mod alias_identity_tests_1351 {
         use super::*;
 
