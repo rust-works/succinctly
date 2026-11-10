@@ -5349,15 +5349,21 @@ fn resolve_merge_keys<'a, W: AsRef<[u64]>>(
             let mut entries: Vec<(YamlCursor<'a, W>, YamlCursor<'a, W>)> =
                 Vec::with_capacity(seen.len() + 1);
             let mut positions = KeyPositions::default();
-            let own_before = seen.len();
-            for (key, value, key_value) in seen {
-                upsert_field(&mut entries, &mut positions, key, value, &key_value);
-            }
             // #6851: the rendering lists a merged member that an own key written after the `<<`
-            // replaces where that own key stands, so the merged copy is left out of the merge.
+            // replaces where that own key stands, so the merged copy is left out of the merge, and
+            // so is an own key written before the `<<` under the same name.
             let replaced = (view != MergeView::Iteration)
                 .then(|| own_keys_after_lone_merge(&field, &rest))
                 .flatten();
+            for (key, value, key_value) in seen {
+                if let Some(replaced) = &replaced {
+                    let (name, is_fallback) = key_value.key_string_kind();
+                    if !is_fallback && replaced.contains(name.as_ref()) {
+                        continue;
+                    }
+                }
+                upsert_field(&mut entries, &mut positions, key, value, &key_value);
+            }
             let mut views_differ = merge_key_field(
                 &mut entries,
                 &mut positions,
@@ -5380,15 +5386,13 @@ fn resolve_merge_keys<'a, W: AsRef<[u64]>>(
                         None,
                     );
                 } else {
-                    // The iteration upserts such a key onto the merged member's slot, so the two
-                    // views differ once an own key lands on one (#6851).
+                    // The iteration upserts such a key onto the slot of the member it replaces (or
+                    // of an own key of the same name before the `<<`), so the two views differ once
+                    // an own key lands on a slot (#6851).
                     if view == MergeView::Iteration && !views_differ {
                         let (name, is_fallback) = key_value.key_string_kind();
-                        views_differ = !is_fallback
-                            && positions
-                                .by_name
-                                .get(name.as_ref())
-                                .is_some_and(|&at| at >= own_before);
+                        views_differ =
+                            !is_fallback && positions.by_name.contains_key(name.as_ref());
                     }
                     upsert_field(
                         &mut entries,

@@ -83,6 +83,12 @@ const ROWS: &[Row] = &[
     ("x: &G\n  a: 1\n  b: 2\n  c: 3\ny:\n  <<: *G\n", &["-o=json", "-I0"], "[.y[]]", "[1,2,3]\n"),
     ("- &GA\n  release_tracks: [GA]\n  help_text: x\n  request: {method: delete}\n- <<: *GA\n  release_tracks: [BETA, ALPHA]\n  request: {method: delete2}\n", &["-o=json", "-I0"], ".", "[{\"release_tracks\":[\"GA\"],\"help_text\":\"x\",\"request\":{\"method\":\"delete\"}},{\"help_text\":\"x\",\"release_tracks\":[\"BETA\",\"ALPHA\"],\"request\":{\"method\":\"delete2\"}}]\n"),
     ("- &GA\n  release_tracks: [GA]\n  help_text: x\n- <<: *GA\n  release_tracks: [BETA]\n", &["-o=json", "-I0"], ".[1]", "{\"help_text\":\"x\",\"release_tracks\":[\"BETA\"]}\n"),
+    ("x: &G\n  a: 1\n  b: 2\n  c: 3\ny:\n  a: 5\n  <<: *G\n  a: 9\n", &["-o=json", "-I0"], ".y", "{\"b\":2,\"c\":3,\"a\":9}\n"),
+    ("x: &G\n  a: 1\n  b: 2\n  c: 3\ny:\n  a: 5\n  <<: *G\n  a: 9\n", &["-o=json", "-I0"], ".", "{\"x\":{\"a\":1,\"b\":2,\"c\":3},\"y\":{\"b\":2,\"c\":3,\"a\":9}}\n"),
+    ("x: &G\n  a: 1\n  b: 2\n  c: 3\ny:\n  a: 5\n  <<: *G\n  a: 9\n", &["-o=json", "-I0"], "[.y[]]", "[9,2,3]\n"),
+    ("x: &G\n  a: 1\n  b: 2\n  c: 3\ny:\n  a: 5\n  k: 1\n  <<: *G\n  a: 9\n  b: 7\n", &["-o=json", "-I0"], ".y", "{\"k\":1,\"c\":3,\"a\":9,\"b\":7}\n"),
+    ("x: &G\n  a: 1\n  b: 2\n  c: 3\ny:\n  a: 5\n  k: 1\n  <<: *G\n  a: 9\n  b: 7\n", &["-o=json", "-I0"], ".", "{\"x\":{\"a\":1,\"b\":2,\"c\":3},\"y\":{\"k\":1,\"c\":3,\"a\":9,\"b\":7}}\n"),
+    ("x: &G\n  a: 1\n  b: 2\n  c: 3\ny:\n  a: 5\n  k: 1\n  <<: *G\n  a: 9\n  b: 7\n", &["-o=json", "-I0"], "[.y[]]", "[9,1,7,3]\n"),
 ];
 
 #[test]
