@@ -597,6 +597,47 @@ fn with_update_effect(update: &Expr) -> Expr {
     }
 }
 
+/// What yq makes of a comma in the body of `LHS |= BODY` (#6854). yq evaluates the body against
+/// the target node itself, an assignment in it changes that node in place, and the update then
+/// takes the first output: so `.a |= (.x = 7, .y = 1)` applies both assignments (the first
+/// output is the node), where a functional evaluation keeps only the first. A comma whose first
+/// branch is a write gets the same treatment `with` gives its update ([`with_update_effect`]):
+/// the writes apply in order to the evolving node, and any other branch is evaluated for its
+/// errors. A body whose first branch is a value (`5`, `.x`, `. + 1`) keeps its first output, as
+/// yq's does, and so does every body without such a comma. The comma may sit inside a group or
+/// a pipe (`(.x = 7, .y = 1) | .z = 3`).
+fn update_body_effect(body: Expr) -> Expr {
+    match body {
+        Expr::Paren(inner) => Expr::Paren(Box::new(update_body_effect(*inner))),
+        Expr::Pipe(stages) => Expr::pipe(stages.iter().cloned().map(update_body_effect).collect()),
+        // The first branch answers the node once its writes are done: a write, or writes with a
+        // `select` ahead of them (`select(.x == 1) | .y = 9`).
+        Expr::Comma(items) if items.first().is_some_and(yields_the_node) => {
+            with_update_effect(&Expr::Comma(items))
+        }
+        other => other,
+    }
+}
+
+/// Whether `expr` answers the node it runs on, once its in-place writes are done: `.`, `select`,
+/// an assignment or a delete, alone or in a group or a pipe of those. The branches after it in a
+/// comma then change that same node, which the update's first output is.
+fn yields_the_node(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identity | Expr::Builtin(Builtin::Select(_)) => true,
+        Expr::Assign { .. }
+        | Expr::Update { .. }
+        | Expr::CompoundAssign { .. }
+        | Expr::AlternativeAssign { .. }
+        | Expr::Builtin(Builtin::Del(_) | Builtin::DelPaths(_)) => true,
+        Expr::Paren(inner) => yields_the_node(inner),
+        Expr::Pipe(stages) => stages.iter().all(yields_the_node),
+        // The first output of a comma is its first branch's.
+        Expr::Comma(items) => items.first().is_some_and(yields_the_node),
+        _ => false,
+    }
+}
+
 /// A stage of a `with` update whose value yq discards, kept for the one thing yq still does
 /// with it: evaluate it, so an error it raises (`. + 1` on a map, `error(\"x\")`) fails the
 /// `with` (#4327). `reduce STAGE as $_ (.; .)` answers the node unchanged.
@@ -10843,6 +10884,11 @@ impl<'a> Parser<'a> {
             self.next(); // =
             self.skip_ws();
             let filter = self.parse_assignment_operand()?;
+            let filter = if self.mode == ParserMode::Yq {
+                update_body_effect(filter)
+            } else {
+                filter
+            };
             return Ok(self.assign_or_rename_key(left, filter, true));
         }
 
@@ -11998,6 +12044,26 @@ mod tests {
         }
     }
     use super::*;
+
+    /// #6854: yq's `|=` body that is a comma starting with a write applies each write in place;
+    /// jq's `|=` takes the first output of its body, so jq mode keeps the comma as written.
+    #[test]
+    fn a_comma_update_body_is_rewritten_in_yq_mode_only_6854() {
+        let source = ".a |= (.x = 7, .y = 1)";
+        let jq = parse_with_mode(source, ParserMode::Jq).unwrap();
+        let yq = parse_with_mode(source, ParserMode::Yq).unwrap();
+        let comma_body = |expr: &Expr| match expr {
+            Expr::Update { filter, .. } => {
+                matches!(&**filter, Expr::Paren(inner) if matches!(&**inner, Expr::Comma(_)))
+            }
+            _ => false,
+        };
+        assert!(comma_body(&jq), "jq mode keeps the comma: {jq:?}");
+        assert!(!comma_body(&yq), "yq mode applies each write: {yq:?}");
+        // A body that starts with a value keeps its comma in both modes.
+        let value_first = parse_with_mode(".a |= (5, .x = 7)", ParserMode::Yq).unwrap();
+        assert!(comma_body(&value_first), "{value_first:?}");
+    }
 
     /// #5613, #5616: jq 1.7.1's lexer and yq v4.53.3's both skip only space, tab and newline
     /// between tokens; CR, form feed, vertical tab, NBSP, U+0085, U+2028 and U+3000 are refused
