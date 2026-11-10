@@ -88821,6 +88821,10 @@ fn owned_arith_accumulator_shape<S: EvalSemantics>(expr: &Expr) -> Option<(Arith
     if !matches!(left.as_ref(), Expr::Identity) {
         return None;
     }
+    // #6802: the right operand of yq's arithmetic is read-only (`yq_read_only_context`), so a key
+    // it reads off a literal that is not there is no output, not `null`: `. + [$i.a]` over an
+    // absent `a` adds `[]`, not `[null]`. The closed walk then declines and the evaluator answers.
+    let _read_only = S::READ_ONLY_ABSENT_KEY_IS_EMPTY.then(yq_read_only_context::enter);
     Some((*op, closed_expr_to_owned::<S>(right.as_ref())?))
 }
 
@@ -88830,6 +88834,8 @@ fn owned_arith_accumulator_shape<S: EvalSemantics>(expr: &Expr) -> Option<(Arith
 /// extends the accumulator's string in place twice instead of re-evaluating it whole.
 /// Two links at least: one is the shape above.
 fn owned_arith_chain_shape<S: EvalSemantics>(expr: &Expr) -> Option<Vec<(ArithOp, OwnedValue)>> {
+    // #6802: each right operand is read-only in yq, as in `owned_arith_accumulator_shape`.
+    let _read_only = S::READ_ONLY_ABSENT_KEY_IS_EMPTY.then(yq_read_only_context::enter);
     let mut links = Vec::new();
     let mut at = expr;
     loop {

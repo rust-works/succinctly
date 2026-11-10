@@ -1160,9 +1160,11 @@ On every route a yq `ireduce` folds a list of accumulators, as yq's does ([#6802
 `. as $i ireduce (0; (. + $i, . * 10))` over `[1, 2]` is `3 2 10 0`, and `ireduce (0; select(false))` prints nothing.
 jq's `reduce` is unchanged: one fork per INIT output, the last UPDATE output wins.
 The same rule holds for `reduce` under `--jq-extensions` in yq mode, since the mode decides, for a single pattern (a `?//` alternative list keeps jq's fold).
+An absent key read through the loop variable in an arithmetic operand is no output, as in yq: `. as $i ireduce ([]; . + [$i.a])` over a document with no `a` is `[]` (the right operand of `+` is read-only, and the fold's shortcut for `. + <closed expression>` now leaves a read that finds no key to the evaluator).
+The same read as a whole UPDATE (`ireduce ([]; [$i.a])`) or as the value of a write (`.x = $i.a`) is a `null` node in both.
 A list that grows past 100,000 accumulators is refused with `reduce: maximum iterations exceeded`, where yq grows it until it runs out of memory (`ireduce (0; (. + 1, . + 2))` over 30 elements is 2^30 accumulators), as ADR-0018 allows for a run that would take the host down.
 
-Six things still differ, each in yq v4.53.3 against `succinctly yq`:
+Five things still differ, each in yq v4.53.3 against `succinctly yq`:
 
 - **`{}` over a computed or a written source.**
   The one-`{}` rule holds where the collect reads the document (`.x | [.[] | {}]`, `.x | map({})`) and not where its source is a computed array or a value being written.
@@ -1176,8 +1178,6 @@ Six things still differ, each in yq v4.53.3 against `succinctly yq`:
 - **A read of an absent position.**
   `.b as $i ireduce ([]; . + [$i | key])` reads `"b"` for every document in yq, where a document without `b` is a `null` node that still has a place.
   Here that `null` has no position, so `key` and `parent` of it answer nothing and `path` answers `[]`.
-- **An absent key read through the loop variable.**
-  `. as $i ireduce ([]; . + [$i.a])` over a document with no `a` is `[]` in yq and `[null]` here, on the plain route as well as under `--eval-all` ([#6802](https://github.com/rust-works/succinctly/issues/6802)).
 - **A union of writes over a container accumulator.**
   yq's assignments mutate the accumulator in place and hand back the same node, so the list keeps it once: `.n[] as $i ireduce ({}; (.a += 1, .a += 2))` over `n: [1, 2, 3]` is `{"a":9}` and `ireduce ({}; (.a = 1, .b = 2))` is `{"a":1,"b":2}`.
   Here each branch writes its own copy, so the list holds one accumulator per combination (eight outputs after three elements).

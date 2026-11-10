@@ -163,3 +163,75 @@ fn a_pattern_the_element_does_not_fit_raises_6802() -> Result<()> {
     assert_eq!(stdout, "");
     Ok(())
 }
+
+/// The right operand of `. + X` is read-only in yq, so a key of the loop variable that is not there
+/// is no output (`. + [$i.a]` adds `[]`, not `[null]`) -- while the same read as a whole UPDATE, or
+/// as the value of a write, is a `null` node. Every row is `yq -o=json -I0` on `b: 1`.
+const ABSENT_ROWS: &[(&str, &str)] = &[
+    (". as $i ireduce ([]; . + [$i.a])", "[]\n"),
+    (". as $i ireduce ([]; . + [$i.b])", "[1]\n"),
+    (". as $i ireduce ([]; . + [$i.a.c])", "[]\n"),
+    (". as $i ireduce ([]; . + [$i | .a])", "[]\n"),
+    (". as $i ireduce ([]; . + [$i.a, 1])", "[1]\n"),
+    (". as $i ireduce ({}; . + {\"k\": $i.a})", "{}\n"),
+    (". as $i ireduce ({}; . + {\"k\": $i.b})", "{\"k\":1}\n"),
+    (". as $i ireduce (0; . + $i.a)", "0\n"),
+    (". as $i ireduce (0; . + $i.b)", "1\n"),
+    (". as $i ireduce (0; . + 1 + $i.a)", "1\n"),
+    (". as $i ireduce (\"s\"; . + \"x\" + $i.b)", "\"sx1\"\n"),
+    (". as $i ireduce ([]; . + [$i.a // 7])", "[7]\n"),
+    (". as $i ireduce (0; $i.a // 5)", "5\n"),
+    // The same read as the whole UPDATE or as a write's value is a `null` node.
+    (". as $i ireduce ([]; [$i.a])", "[null]\n"),
+    (". as $i ireduce ({}; .x = $i.a)", "{\"x\":null}\n"),
+    // A plain pipe took the same shortcut.
+    ("{\"b\":1} as $i | [] | . + [$i.a]", "[]\n"),
+];
+
+#[test]
+fn an_absent_key_of_the_loop_variable_is_no_output_in_an_arithmetic_operand_6802() -> Result<()> {
+    for (filter, expected) in ABSENT_ROWS {
+        let (stdout, code) = run_yq_stdin(filter, "b: 1\n", &["-o", "json", "-I0"])?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(&stdout, expected, "{filter}");
+    }
+    Ok(())
+}
+
+/// Under `--eval-all` the loop variable is each document in turn and `.a` is absent from two of
+/// the three.
+#[test]
+fn an_absent_key_of_the_loop_variable_under_eval_all_6802() -> Result<()> {
+    for (filter, expected) in [
+        (". as $i ireduce ([]; . + [$i.a])", "[3]\n"),
+        (". as $i ireduce ([]; . + [$i.b])", "[1,2]\n"),
+        (". as $i ireduce ({}; . + {\"k\": $i.a})", "{\"k\":3}\n"),
+        (". as $i ireduce (0; . + $i.a)", "3\n3\n3\n"),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(
+            filter,
+            "b: 1\n---\nb: 2\n---\na: 3\n",
+            &["--eval-all", "-o", "json", "-I0"],
+        )?;
+        assert_eq!(code, 0, "{filter}: {stderr}");
+        assert_eq!(stdout, expected, "{filter}");
+    }
+    Ok(())
+}
+
+/// jq's `reduce` has no read-only operand: an absent key is `null`.
+#[test]
+fn jq_mode_keeps_the_null_6802() -> Result<()> {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .args(["jq", "-c", "reduce . as $i ([]; . + [$i.a])"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().expect("piped").write_all(b"{\"b\":1}")?;
+            child.wait_with_output()
+        })?;
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "[null]\n");
+    Ok(())
+}
