@@ -40,7 +40,8 @@ use super::value::{
     infinite_float_preview_text, jq_bare_float_display, NumberRepr, OwnedValue,
 };
 use crate::yaml::encode_style::{
-    write_go_yaml_double_quoted, write_go_yaml_single_quoted, write_go_yaml_string,
+    go_yaml_unicode_separator_scalar, write_go_yaml_double_quoted, write_go_yaml_single_quoted,
+    write_go_yaml_string,
 };
 use crate::yaml::{format_float_with_fraction, format_float_yq_yaml, format_float_yq_yaml_nested};
 
@@ -1297,6 +1298,7 @@ fn stream_yaml_key_node<W: core::fmt::Write, C: DocumentCursor>(
     out: &mut W,
     key: &OwnedValue,
     cursor: &C,
+    block_indent: Option<(&str, usize)>,
 ) -> core::fmt::Result {
     if let Some(name) = cursor.alias() {
         out.write_char('*')?;
@@ -1344,6 +1346,16 @@ fn stream_yaml_key_node<W: core::fmt::Write, C: DocumentCursor>(
             return Ok(());
         }
         out.write_char(' ')?;
+    }
+    // #4913: a string that holds U+2028 or U+2029 is a line break to yq's emitter, which writes
+    // it as a multi-line single-quoted scalar, the break followed by the indent of the list item
+    // (`- 'x<LS>  y'`). A flow list has no such indent to give and is left as it was.
+    if let (Some((indent, step)), OwnedValue::String(text)) = (block_indent, key) {
+        if matches!(style, "" | "single") {
+            if let Some(scalar) = go_yaml_unicode_separator_scalar(text, indent, step) {
+                return out.write_str(&scalar);
+            }
+        }
     }
     stream_yaml_key_value(out, key, style)
 }
@@ -1400,7 +1412,7 @@ pub fn stream_lazy_keys_yaml<W: core::fmt::Write, F: DocumentFields>(
             if i > 0 {
                 out.write_str(", ")?;
             }
-            stream_yaml_key_node(out, &key, &cursor)?;
+            stream_yaml_key_node(out, &key, &cursor, None)?;
         }
         // #1956: `ended_unpaired()` alone missed a malformed `,`/`:` delimiter
         // -- `is_malformed()` checks both #1194 faults this walk can find.
@@ -1426,7 +1438,8 @@ pub fn stream_lazy_keys_yaml<W: core::fmt::Write, F: DocumentFields>(
                 out.write_char('\n')?;
             }
             out.write_str("- ")?;
-            stream_yaml_key_node(out, &key, &cursor)?;
+            // The continuation of an item's scalar sits two columns in, whatever `-I` says.
+            stream_yaml_key_node(out, &key, &cursor, Some(("  ", indent.width)))?;
         }
         // #1956: `ended_unpaired()` alone missed a malformed `,`/`:` delimiter
         // -- `is_malformed()` checks both #1194 faults this walk can find.
