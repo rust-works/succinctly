@@ -1164,7 +1164,8 @@ pub struct MergedMember {
 pub mod alias_identity {
     use super::{
         get_value_at_path, propagate_anchor_writes, propagate_merged_members, push_path_components,
-        unwrap_path_component, vec_with_capacity, Expr, MergedMember, OwnedValue,
+        remove_existing_at_path, replace_existing_at_path, unwrap_path_component,
+        vec_with_capacity, Expr, MergedMember, OwnedValue,
     };
     use alloc::rc::Rc;
     use alloc::vec::Vec;
@@ -1641,6 +1642,103 @@ pub mod alias_identity {
             propagate_anchor_writes(pre, post, &table.groups);
         });
     }
+
+    /// Carry a write that an update body made on a merging mapping over to the source's node
+    /// (#6827).
+    ///
+    /// `.list[] |= (.x = 7)` runs its body on each element with a path of its own (`.x`), so no
+    /// absolute position is there for [`redirect_paths`] to rewrite; the body changes the
+    /// mapping's copy of the merged member. yq's `.x` found the source's node, so the write
+    /// reaches it and every mapping that merges it. `targets` are the paths the update wrote to
+    /// (already redirected); `pre` and `post` the document before and after it. A merged member
+    /// below a target whose copy `post` changed, while the node it is written through did not,
+    /// moves its new value to that node; [`mirror_after_write`] then follows the source into the
+    /// other mappings. A member the body deleted leaves the source too, which is why
+    /// [`writes_only_below_target`] keeps out a body that replaces the mapping.
+    pub(crate) fn adopt_body_member_edits(
+        pre: &OwnedValue,
+        post: &mut OwnedValue,
+        targets: &[Expr],
+    ) {
+        with_table(|table| {
+            if table.merged.is_empty() {
+                return;
+            }
+            // The targets as byte keys, so a member finds the target above it by its own prefixes
+            // and not by a scan of every target (a fan-out names one per element).
+            let targets: std::collections::HashSet<Vec<u8>> = targets
+                .iter()
+                .filter_map(concrete_steps)
+                .filter_map(|steps| position_key(&steps))
+                .collect();
+            for member in &table.merged {
+                let mut key = Vec::new();
+                let below_target = member.member.split_last().is_some_and(|(_, parents)| {
+                    // The root counts too: `. |= (.item.x = 7)` has the empty path.
+                    targets.contains(&key)
+                        || parents.iter().any(|step| {
+                            push_step_key(&mut key, step).is_some() && targets.contains(&key)
+                        })
+                });
+                if !below_target {
+                    continue;
+                }
+                let (Some(slot_pre), Some(render_pre), Some(home_pre)) = (
+                    get_value_at_path(pre, &member.member),
+                    get_value_at_path(pre, &member.render_home),
+                    get_value_at_path(pre, &member.write_home),
+                ) else {
+                    continue;
+                };
+                // Only a member that was the untouched copy of its source in `pre`.
+                if !slot_pre.identical(&render_pre) {
+                    continue;
+                }
+                // A write that already reached the source's node was redirected there.
+                if !get_value_at_path(post, &member.write_home)
+                    .is_some_and(|v| v.identical(&home_pre))
+                {
+                    continue;
+                }
+                let Some(slot_post) = get_value_at_path(post, &member.member) else {
+                    // The body deleted the key from a mapping that is still there: yq's `del(.x)`
+                    // found the source's node. (Not when another source holds the key too, which
+                    // keeps showing through.)
+                    let mapping_is_there = member
+                        .member
+                        .split_last()
+                        .and_then(|(_, parent)| get_value_at_path(post, parent))
+                        .is_some_and(|v| matches!(v, OwnedValue::Object(_)));
+                    if mapping_is_there && member.write_home == member.render_home {
+                        remove_existing_at_path(post, &member.write_home);
+                    }
+                    continue;
+                };
+                if slot_post.identical(&slot_pre) {
+                    continue;
+                }
+                replace_existing_at_path(post, &member.write_home, slot_post);
+                // Several sources hold the key: the mapping keeps showing the first one's.
+                if member.write_home != member.render_home {
+                    replace_existing_at_path(post, &member.member, slot_pre);
+                }
+            }
+        });
+    }
+
+    /// A path of field and non-negative index steps as the values the document walk spells.
+    fn concrete_steps(path: &Expr) -> Option<Vec<OwnedValue>> {
+        let mut components = Vec::new();
+        push_path_components(&mut components, path);
+        components
+            .iter()
+            .map(|component| match unwrap_path_component(component).0 {
+                Expr::Field(name) => Some(OwnedValue::String(name.clone().into())),
+                Expr::Index { idx, .. } if *idx >= 0 => Some(OwnedValue::Int(*idx)),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 /// `no_std` stand-in for the ambient alias-identity table: there is no
@@ -1682,6 +1780,13 @@ pub mod alias_identity {
     pub(crate) fn redirect_concrete_path(_path: &mut Vec<OwnedValue>, _doc: &OwnedValue) {}
 
     pub(crate) fn mirror_after_write(_pre: &OwnedValue, _post: &mut OwnedValue) {}
+
+    pub(crate) fn adopt_body_member_edits(
+        _pre: &OwnedValue,
+        _post: &mut OwnedValue,
+        _targets: &[Expr],
+    ) {
+    }
 }
 
 /// A user-defined function visible at some point of a scoped walk (#2091).
@@ -45337,6 +45442,10 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
     }
     if let Some(pre) = &pre {
+        // #6827: a body that writes below the target (`|= (.x = 7)`) wrote a merged member's copy.
+        if writes_only_below_target(filter_expr) {
+            alias_identity::adopt_body_member_edits(pre, &mut result, &paths);
+        }
         alias_identity::mirror_after_write(pre, &mut result);
     }
 
@@ -49136,6 +49245,30 @@ fn position_update_filter<S: EvalSemantics>(
 /// learns to unwrap reaches both call sites for free.
 fn is_root_path(path: &Expr) -> bool {
     is_effectively_identity(path)
+}
+
+/// Whether an update body is a chain of writes that each name a path below the node it runs on
+/// (`.x = 7`, `del(.x)`, `.a.b += 1`), the shape whose merged-member writes yq lands on the
+/// source's node (#6827). A write to the node itself (`. = {..}`) replaces the mapping and
+/// leaves its sources alone, and every other body shape is not looked into.
+fn writes_only_below_target(body: &Expr) -> bool {
+    match body {
+        Expr::Assign { path, .. }
+        | Expr::Update { path, .. }
+        | Expr::CompoundAssign { path, .. }
+        | Expr::AlternativeAssign { path, .. } => !is_root_path(path),
+        Expr::Builtin(Builtin::Del(path)) => !is_root_path(path),
+        Expr::Paren(inner) | Expr::Optional(inner) => writes_only_below_target(inner),
+        // A `del` followed by a write to the same key makes a new own entry in yq, which the
+        // comparison of the two documents cannot tell from a changed member.
+        Expr::Pipe(stages) => {
+            stages.iter().all(writes_only_below_target)
+                && !stages
+                    .iter()
+                    .any(|stage| matches!(stage, Expr::Builtin(Builtin::Del(_))))
+        }
+        _ => false,
+    }
 }
 
 /// `|=`'s own leaf: run `filter_expr` on `root` and write its first output

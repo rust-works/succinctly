@@ -91,19 +91,12 @@ fn test_a_write_through_a_merged_member_reaches_its_source_6785() -> Result<()> 
 
 #[test]
 fn test_the_writes_that_still_change_only_the_mappings_copy_6785() -> Result<()> {
-    // Not yq's answers, recorded in docs/compliance/yq/limitations.md: a write whose body runs on
-    // the merging mapping with a path of its own (`|= (.x = 7)`, `with(...)`) has no position to
-    // redirect from, so it changes the mapping's copy and leaves the source alone; and a key the
+    // Not yq's answers, recorded in docs/compliance/yq/limitations.md: a key the
     // source loses is placed where the mapping listed it, where yq re-renders it last; a member of an
     // inline `<<: {q: 1}` has no node of its own to write (yq renders the mapping without it,
     // `{"k":0}`); and a source replaced by a mapping with other keys (`.base = {"q": 1}`) drops the members it held, where yq
     // shows the new keys (`{"q":1,"k":0}`).
     for (document, filter, want) in [
-        (
-            ONE,
-            ".list[] |= (.x = 7)",
-            "{\"base\":{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2}},\"item\":{\"x\":1,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"k\":0},\"list\":[{\"x\":7,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":0},{\"x\":7,\"y\":2,\"n\":{\"p\":1,\"q\":2},\"i\":1}]}\n",
-        ),
         (
             ONE,
             ".base = {\"q\": 1}",
