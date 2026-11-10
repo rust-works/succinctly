@@ -11331,13 +11331,19 @@ fn eval_owned_def_call_count<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
 ) -> Option<OwnedValue> {
+    let body = parameterless_def_body(expr)?;
+    eval_owned_length(body, input).or_else(|| eval_owned_string_door::<S>(body, input))
+}
+
+/// The body of a call to a user `def` that takes no parameters (`def f: length; ... | f`), read as
+/// the definition holds it: no binding step, no frame charged. The one definition of "a call
+/// whose body can be read in place" for [`eval_owned_def_call_count`] and [`string_length_stage`]
+/// (#6833), so a change to what counts as one reaches both.
+fn parameterless_def_body(expr: &Expr) -> Option<&Expr> {
     let Expr::DefCall { def, args, .. } = unwrap_paren(expr) else {
         return None;
     };
-    if !def.params.is_empty() || !args.is_empty() {
-        return None;
-    }
-    eval_owned_length(&def.body, input).or_else(|| eval_owned_string_door::<S>(&def.body, input))
+    (def.params.is_empty() && args.is_empty()).then_some(&def.body)
 }
 
 /// `map(.a)`, `map(.a.b)`, `map(.[0])` over an owned array, answered from the tree instead of
@@ -15000,14 +15006,22 @@ fn closed_pipe_to_owned<S: EvalSemantics>(
 /// read in place and the answer is a fresh integer, never a node of it. Any other stage or input
 /// is `None`, and the evaluator keeps its own rules and diagnostics. Its own function, not inline
 /// in [`eval_owned_relocated_or_closed`], so that call keeps the frame its doc comment guards.
+///
+/// A call to a user `def` with no parameters whose body is exactly the builtin `length`
+/// (`def f: length; ... | f`) is the same stage (#6833): [`eval_owned_def_call_count`] answers it
+/// for jq mode's range bodies and for both modes' `reduce` step, and yq's range body reaches this
+/// function instead. The body is read as the definition holds it, as there: a bare builtin
+/// cannot call anything, recurse, raise or read a binding, so there is nothing to substitute or
+/// to charge, and a body that is itself a call (`def f: g;`, `def length: 7; def f: length;`) is
+/// a `DefCall`, not the builtin, and declines.
 #[inline(never)]
 fn string_length_stage<S: EvalSemantics>(stage: &Expr, input: &OwnedValue) -> Option<OwnedValue> {
-    match (unwrap_paren(stage), input) {
-        (Expr::Builtin(Builtin::Length), OwnedValue::String(text)) => {
-            Some(OwnedValue::Int(string_length::<S>(text)))
-        }
-        _ => None,
-    }
+    let OwnedValue::String(text) = input else {
+        return None;
+    };
+    let stage = parameterless_def_body(stage).unwrap_or(stage);
+    matches!(unwrap_paren(stage), Expr::Builtin(Builtin::Length))
+        .then(|| OwnedValue::Int(string_length::<S>(text)))
 }
 
 fn closed_expr_to_owned_node<S: EvalSemantics>(
