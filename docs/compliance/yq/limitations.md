@@ -7151,19 +7151,26 @@ When the paths cannot be resolved on the cursor (the left side errors, or a path
 A write that clears an anchor leaves yq's dangling `*name` alias behind, where succinctly expands it (the anchor soundness rule above), exactly as `.a anchor = ""` already does.
 Pinned by `tests/yq_cli/i5479.rs`, whose rows were captured from yq v4.53.3.
 
-## `explode(.)` is the only `explode(f)` ([#5483](https://github.com/rust-works/succinctly/issues/5483))
+## `explode(f)` expands where yq does, and writes every alias it can read back ([#5483](https://github.com/rust-works/succinctly/issues/5483))
 
-yq's `explode(f)` expands every alias in the nodes `f` selects into a copy of its anchor's node, drops the anchors and expands `<<` merges.
-`explode(.)` parses here as `(.. | select(kind != "alias")) anchor = ""`: clearing every anchor makes the aliases that named one print as the nodes they stood for (`enforce_anchor_soundness`), and a write expands merges.
-Rows over a plain, a merge, a merge list, a nested, a sequence, a multi-document and an override document match yq v4.53.3.
+yq's `explode(f)` expands every alias in the nodes `f` selects, and in their descendants, into a copy of its anchor's node, drops the anchors there and expands `<<` merges there.
+An alias or anchor outside those nodes stays.
+`explode(f)` parses here as `(f | ..) anchor = ""`, and `explode(.)` and `explode(..)` as `(..) anchor = ""`.
+Clearing the anchor of every selected node makes the aliases that named one print as the nodes they stood for (`enforce_anchor_soundness`), an alias node that is selected clears its own mark and prints as its value, and a write expands merges.
+Rows over a selected alias, a selected nested alias whose anchor is outside the selection, several selected nodes, a selection that holds nothing and a merge under the selection match yq v4.53.3.
 jq's own `explode` is the nullary string builtin and is unchanged; the call form only exists in yq mode.
-Three things differ from yq.
-A path other than `.` (`explode(.a)`, `explode(..)`) is a parse error: yq leaves the aliases outside the selected nodes alone and expands those inside whose anchor is outside, which this route has no way to do, and a wrong answer would be worse than the refusal.
+Four things differ from yq.
+An alias *outside* the selection that named an anchor the selection cleared is written as its value (`explode(.a)` over `a: &x {p: 1}` / `b: *x` prints `b:` / `  p: 1`), where yq leaves `b: *x` with no `&x` anywhere, a document it then refuses to read ([ADR-0018](../../adrs/adr-0018.md) rule 4: it would emit output it cannot itself read back).
+A write expands every `<<` merge in the document, not only those under the selection, so `explode(.n)` also turns an unrelated `m: {<<: *x, q: 2}` into its keys where yq keeps `!!merge <<: *x`; every write does the same, and the family is listed above.
+An argument that is no path (`explode(1)`, `explode("a")`) is an error (`Invalid path expression with result 1`) where yq explodes a node that is in no document and answers the input unchanged.
+A write after `explode` in the same program still follows an alias that `explode` expanded (`explode(.) | .a = 3` over `a: &x {k: 1}` / `b: *x` writes `b` too, where yq's `b` is by then a copy of its own): the alias groups the write follows come from the source document, not from the marks `explode` cleared.
 `.a | explode(.)` is refused by the existing rule that a metadata write cannot sit behind a navigation.
 The presentation of an expanded alias copy is lost: its flow style (`b: *x` over `a: &x {p: 1}` prints a block mapping where yq prints `b: {p: 1}`), its quotes (`b: *s` over `a: &s "q"` prints `b: q`) and its explicit tag (`a: &x !!str 1` prints `b: "1"`), the family tracked on [#2651](https://github.com/rust-works/succinctly/issues/2651), and a comment after the alias moves with it.
+An anchor that an expanded copy carried from the node it copies is dropped from the copy, and what named it is written as a value: `explode(.b)` over `a: &x {k: &w 1, l: *w}` / `b: *x` / `c: *w` is `b: {k: &w 1, l: *w}` in yq and `b:` / `  k: 1` / `  l: 1` here, with `a` and `c: *w` as they were (`inner: *x` over `x: &x {n: &w [7]}` is `inner: {n: &w [7]}` in yq).
+Inside a collect or a binding (`[explode(.b)]`, `explode(.b) as $x | $x`) the program runs on the owned value, which holds no anchor or alias mark, so an anchor outside the selection is dropped there as well (`[explode(.b)]` over `a: &x [1]` / `b: *x` prints `a:` / `  - 1` where yq keeps `&x`); the data is the same.
 The value is the same each time; only how it is written differs.
 The `alias` getter and the `alias =` setter have their own sections below.
-Pinned by `tests/yq_cli/i5483.rs`, whose rows were captured from yq v4.53.3.
+Pinned by `tests/yq_cli/i5483.rs` and `tests/yq_cli/i5483_explode_path.rs`, whose rows were captured from yq v4.53.3.
 
 ## The `alias` getter answers a node's `Value`, as yq does ([#5483](https://github.com/rust-works/succinctly/issues/5483))
 

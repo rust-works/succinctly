@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 
-use crate::{run_jq_stdin, run_yq_stdin, run_yq_stdin_with_stderr};
+use crate::{run_jq_stdin, run_yq_stdin};
 
 #[test]
 fn test_explode_dot_matches_yq_5483() -> Result<()> {
@@ -79,26 +79,6 @@ fn test_explode_dot_matches_yq_5483() -> Result<()> {
     ] {
         let (out, code) = run_yq_stdin(filter, input, &[])?;
         assert_eq!((out.as_str(), code), (want, 0), "{filter} over {input:?}");
-    }
-    Ok(())
-}
-
-#[test]
-fn test_explode_of_a_path_other_than_dot_is_refused_5483() -> Result<()> {
-    // yq's `explode(.a)` leaves the aliases outside `.a` alone, which this route cannot do yet.
-    for filter in [
-        "explode(.a)",
-        "explode(.a, .b)",
-        "explode(..)",
-        "explode(. | .)",
-        "explode(.[])",
-    ] {
-        let (out, err, code) = run_yq_stdin_with_stderr(filter, "a: &x 1\nb: *x\n", &[])?;
-        assert_eq!((out.as_str(), code), ("", 1), "{filter}");
-        assert!(
-            err.contains("explode(f) is only supported as explode(.)"),
-            "{filter}: {err}"
-        );
     }
     Ok(())
 }
