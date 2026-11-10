@@ -21991,6 +21991,19 @@ enum YqListStage {
     /// context, so both operands see the full list and every pairing is
     /// emitted (#2427).
     Binary,
+    /// `SRC as $x ireduce (INIT; UPDATE)` over inputs that all carry
+    /// `EvaluateTogether`: real yq's `reduceOperator`
+    /// (`pkg/yqlib/operator_reduce.go`) evaluates SRC and INIT against the
+    /// **whole** context list, so the fold runs over every document of every
+    /// file -- `. as $item ireduce ({}; . * $item)` is yq's own recipe for
+    /// merging several files into one (#2427).
+    Fold,
+    /// The empty object literal `{}` over inputs that all carry
+    /// `EvaluateTogether`: real yq builds **one** empty mapping however many
+    /// nodes its context holds (`yq ea '{}' f1 f2` prints one `{}`, where `0`
+    /// prints one per document), so `ireduce ({}; ...)` starts one fold and not
+    /// one per document (#2427).
+    EmptyObject,
 }
 
 /// Where the walk splits a flat pipe: the first stage it owns, or `None` when
@@ -22029,6 +22042,14 @@ fn yq_list_stage(stages: &[Expr], together: bool) -> Option<(usize, YqListStage)
                 }
                 Expr::Arithmetic { .. } | Expr::Compare { .. } => {
                     found = Some((i, YqListStage::Binary));
+                    break;
+                }
+                Expr::Reduce { .. } => {
+                    found = Some((i, YqListStage::Fold));
+                    break;
+                }
+                Expr::Object(entries) if entries.is_empty() => {
+                    found = Some((i, YqListStage::EmptyObject));
                     break;
                 }
                 _ => {}
@@ -22177,6 +22198,15 @@ fn eval_yq_context_pipe<S: EvalSemantics, V: DocumentValue>(
             Ok(items) => items,
             Err(flow) => return flow,
         },
+        YqListStage::Fold => match fold_together::<S, V>(&stages[at], &context, optional, cur) {
+            Ok(items) => items,
+            Err(flow) => return flow,
+        },
+        // A node real yq builds from scratch: no flag, no origin.
+        YqListStage::EmptyObject => vec![YqContextItem::new(
+            YqContextNode::Owned(OwnedValue::object_from([])),
+            YqContextTag::default(),
+        )],
     };
 
     eval_yq_context_pipe::<S, V>(rest, &produced, optional, cur, sink)
@@ -22248,6 +22278,169 @@ fn collect_together<S: EvalSemantics, V: DocumentValue>(
         YqContextNode::Owned(OwnedValue::array_from(merged)),
         YqContextTag::default(),
     ))
+}
+
+/// `SRC as $x ireduce (INIT; UPDATE)` over a context list whose entries all
+/// carry `EvaluateTogether`: SRC and INIT are both evaluated over the **whole**
+/// list, and UPDATE folds every source node into each accumulator (#2427).
+///
+/// Real yq's `reduceOperator` (`pkg/yqlib/operator_reduce.go`, v4.53.3) reads
+/// `GetMatchingNodes(context, SRC)` and `GetMatchingNodes(context, INIT)` once
+/// each, both against the entire context, then folds the source nodes one at a
+/// time into the accumulator list. So `. as $i ireduce ({}; . * $i)` over two
+/// files is the two documents merged (one output), and `. as $i ireduce (0; . +
+/// 1)` is `2` twice: `0` is one literal per context node, each its own
+/// accumulator, and each one folds over both documents. Captured live against
+/// v4.53.3 over one, two and three documents.
+///
+/// The fold itself is [`reduce_forks`], the core every other `reduce` shares,
+/// so an INIT output is still one independent fork over the source. That is
+/// yq's accumulator list for any UPDATE that answers once, which is every
+/// recipe in yq's documentation; an UPDATE with several outputs follows the
+/// same rule here as it does for the ordinary route.
+///
+/// The accumulators are values the operator computed, so they carry neither
+/// `EvaluateTogether` nor an origin: `. as $i ireduce ({}; . * $i) | [.]` is one
+/// array per result.
+fn fold_together<S: EvalSemantics, V: DocumentValue>(
+    stage: &Expr,
+    context: &[YqContextItem<V>],
+    optional: bool,
+    cur: &core::cell::Cell<YqContextTag>,
+) -> Result<Vec<YqContextItem<V>>, Flow> {
+    let Expr::Reduce {
+        input,
+        patterns,
+        init,
+        update,
+    } = stage
+    else {
+        // `yq_list_stage` matched this exact pattern to pick `at`.
+        unreachable!("the stage yq_list_stage selected as a fold is an Expr::Reduce")
+        // patchcov: coverage tolerate-line reason="unreachable: yq_list_stage matched this exact pattern to pick the stage (#2427)"
+    };
+    let over_context = |operand: &Expr| {
+        // yq builds its one `{}` even from an empty context (`select(false) | . as $i
+        // ireduce ({}; ...)` is `{}`), which a walk over no entries cannot see.
+        if context.is_empty()
+            && matches!(unwrap_paren(operand), Expr::Object(entries) if entries.is_empty())
+        {
+            return Ok(vec![YqContextItem::new(
+                YqContextNode::Owned(OwnedValue::object_from([])),
+                YqContextTag::default(),
+            )]);
+        }
+        let mut flat: Vec<Expr> = Vec::new();
+        yq_flatten_pipe_stages(core::slice::from_ref(operand), &mut flat);
+        collect_yq_context::<S, V>(&flat, context, optional, cur)
+    };
+    // Source first, as `reduceOperator` reads it.
+    let source = match ireduce_node_read_tuple(input, patterns) {
+        // The parser's own `SRC | [., [READ], ...]` (#6088): SRC is read over the
+        // list, and the tuple of reads is then taken at each node where it
+        // stands, never collected across the list.
+        Some((node_source, tuple)) => {
+            let mut tuples: Vec<YqContextItem<V>> = Vec::new();
+            for node in over_context(node_source).map_err(Flow::Escaped)? {
+                let at_node = YqContextItem::new(
+                    node.node.clone(),
+                    YqContextTag {
+                        together: false,
+                        origin: node.tag.origin,
+                    },
+                );
+                let one = collect_yq_context::<S, V>(
+                    core::slice::from_ref(tuple),
+                    core::slice::from_ref(&at_node),
+                    optional,
+                    cur,
+                )
+                .map_err(Flow::Escaped)?;
+                tuples.extend(one);
+            }
+            tuples
+        }
+        None => over_context(input).map_err(Flow::Escaped)?,
+    };
+    let seeds = over_context(init).map_err(Flow::Escaped)?;
+    // Each list is made owned once: every INIT output is a fork that folds the same
+    // source, so converting inside the fork would convert every document once per fork.
+    let to_owned_list = |items: &[YqContextItem<V>]| -> Result<Vec<OwnedValue>, Flow> {
+        items
+            .iter()
+            .map(|item| generic_item_into_owned::<_, S>(item.to_generic_item()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Flow::Escaped)
+    };
+    // STYLE-0012: an element that cannot be read is a decode failure, which an ambient `?`
+    // never silences (#1620, #1902), and it ends the whole yq expression like any other
+    // control on this walk (`collect_yq_context`).
+    let source = to_owned_list(&source)?;
+    // STYLE-0012: as the source just above.
+    let seeds = to_owned_list(&seeds)?;
+    // One drive of an owned list, the consumer's stop ending the walk.
+    let drive = |values: &[OwnedValue], per_item: &mut dyn FnMut(OwnedValue) -> Demand| {
+        for value in values {
+            if let Demand::Stop = per_item(value.clone()) {
+                return Flow::Stopped { pending: None };
+            }
+        }
+        Flow::Exhausted
+    };
+    let retry = crate::jq::eval::FoldDirectRetry::of::<S>(init, input, patterns, update, None);
+    let mut produced: Vec<YqContextItem<V>> = Vec::new();
+    let flow = reduce_forks::<S>(
+        patterns,
+        update,
+        &mut |per_init| drive(&seeds, per_init),
+        optional,
+        // Every fork folds the same source: jq hands the forks after the first
+        // a `null` input (#3895), but SRC here has already been read from the
+        // list, which is what yq's single `GetMatchingNodes` does.
+        &mut |_input, per_element| drive(&source, per_element),
+        retry,
+        &mut |accumulator| {
+            produced.push(YqContextItem::new(
+                YqContextNode::Owned(accumulator),
+                YqContextTag::default(),
+            ));
+            Demand::Continue
+        },
+    );
+    match flow {
+        Flow::Exhausted | Flow::Stopped { pending: None } => Ok(produced),
+        Flow::Stopped {
+            pending: Some(control), // patchcov: coverage tolerate-line reason="defensive: the sink above never stops, so a stop with a pending control cannot come back (#2427)"
+        }
+        | Flow::Escaped(control) => Err(Flow::Escaped(control)),
+    }
+}
+
+/// The source of an `ireduce` the parser rewrote to read its loop variable's node
+/// (#6088): `(SRC) | [., [READ], ...]` bound by a destructuring pattern whose
+/// read variables carry a `\u{1}` no program can spell. Answers `SRC` and the
+/// tuple, or `None` for any other source.
+fn ireduce_node_read_tuple<'a>(
+    input: &'a Expr,
+    patterns: &[Pattern],
+) -> Option<(&'a Expr, &'a Expr)> {
+    let [Pattern::Array(vars)] = patterns else {
+        return None;
+    };
+    let reads_a_node = vars
+        .iter()
+        .skip(1)
+        .any(|var| matches!(var, Pattern::Var(name) if name.contains('\u{1}')));
+    if !reads_a_node {
+        return None;
+    }
+    match input {
+        Expr::Pipe(stages) => match stages.as_slice() {
+            [Expr::Paren(source), tuple @ Expr::Array(_)] => Some((&**source, tuple)),
+            _ => None, // patchcov: coverage tolerate-line reason="unreachable: the parser's rewrite (bind_ireduce_node_reads) is the only source of a read variable and always builds this shape (#6088)"
+        },
+        _ => None, // patchcov: coverage tolerate-line reason="unreachable: as the arm above, the rewrite's source is always a pipe (#6088)"
+    }
 }
 
 /// A binary operator over a context list whose entries all carry
