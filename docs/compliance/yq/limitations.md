@@ -6068,6 +6068,9 @@ Divergences, each classified by `scripts/yq-comment-oracle-fuzz.py`:
   The rule is the one shared predicate `blank_line_between` (`src/text/line_break.rs`, `crlf_comment_blank_between`), applied where the parser decides a comment's placement.
   Measured on 196 documents over seven shapes (a sibling, a nested key, a dedent, a sequence, a first child, the end of the document, a sequence under a key), one to three comments and every blank-line gap: yq on the CRLF text equals yq on the LF text with one blank line added after each standalone comment line, and so does succinctly.
   A comment after a node (`a: 1 # t`), a `#` line inside a block scalar and a lone `\r` break are not affected, as in yq.
+  Two older gaps that the extra blank line made reachable are fixed with it, in LF as well.
+  A comment below a key that has no value yet (`b:` / `# c` / blank / `h: 1`) is the next sibling's head in yq and no blank line follows it, where succinctly made it `b`'s foot with a blank line; the `-P` route still prints that blank line after an LF `b:` / `# c1` / blank / `h: 1`.
+  A write that changes a nested node's kind (`.a = 1` over a mapping, `.a = {}` over a scalar) dropped the standalone comments around the key, where yq keeps them; they are kept now.
   Not reproduced: two or more standalone comment lines at differing columns at the end of a document (`# c28\r\n  # c1\r\n` after a nested sequence), a CRLF comment block after a sequence item that holds a block scalar (`- run: |` with the block's `#` lines, then `# tail` and `# of the step`), a navigated sequence item's comment lines after a write (`.z = 2 | .items[1]`), and a blank line below a block of comments on `-P` and writes (`# c1\r\n# c2\r\n\r\nb: 2`, where succinctly adds a blank line after `# c2`).
   The first of these is the LF gap that a blank line between comments at differing columns already has (`k:\n  - v\n# c28\n\n  # c1\n` puts `# c28` at column 2, yq at column 0), which the extra blank line now reaches in a CRLF file.
   The first document's *header* is reproduced as
@@ -6137,11 +6140,10 @@ they used to be placed by their column: the foot of `k`, printed with a blank li
 small difference remains, pinned by `test_4851_g` in `tests/yq_cli/i4851.rs`: at the
 end of the document (`k:` / `  - # c` / `    !!str` and nothing after it) yq drops the comments
 outright and this keeps them as the document's foot, since matching would discard them; the same
-before a `---` or `...` (`k:` / `  -` / `    # x` / `    !!str` / `---`). Three more shapes differ,
-pinned by `test_4851_h`: a blank line between the properties and the next key still prints a blank
-line after the comments where yq prints none, and a comment after the properties line
+before a `---` or `...` (`k:` / `  -` / `    # x` / `    !!str` / `---`). One more shape differs,
+pinned by `test_4851_h`: a comment after the properties line
 (`    !!str` / `  # y`) prints after the block where yq prints it first, then a blank line, then the
-block.
+block. A blank line between the properties and the next key matches yq since #5053.
 
 A bare item's comment before a value that *does* follow (`- # note` / `  k: v`, #1079's other
 half) is the head comment of that value's first node in yq: the first key of a block mapping or the

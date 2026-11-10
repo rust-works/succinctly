@@ -180,3 +180,254 @@ fn test_a_dedented_comment_block_split_by_a_blank_line_is_the_outer_keys_foot_50
     }
     Ok(())
 }
+
+/// A comment below a key that has no value yet (`b:`, `b: &x`) is read while go-yaml looks for the value, so it is
+/// the next sibling's head and no blank line follows it, in LF and CRLF alike (yq v4.53.3). The `-P` route still
+/// prints the blank line after an LF `b:` / `# c1` / blank / `h: 1` (limitations.md).
+const VALUELESS_KEY_ROWS: &[(&str, &str, &[&str], &str)] = &[
+    ("b:\n# c1\n\nh: 1\n", ".", &[], "b:\n# c1\nh: 1\n"),
+    ("b:\r\n# c1\r\n\r\nh: 1\r\n", ".", &[], "b:\n# c1\nh: 1\n"),
+    ("b:\n# c1\nh: 1\n", ".", &[], "b:\n# c1\nh: 1\n"),
+    ("b:\r\n# c1\r\nh: 1\r\n", ".", &[], "b:\n# c1\nh: 1\n"),
+    ("b:\n# c1\n# c2\nh: 1\n", ".", &[], "b:\n# c1\n# c2\nh: 1\n"),
+    (
+        "b:\r\n# c1\r\n# c2\r\nh: 1\r\n",
+        ".",
+        &[],
+        "b:\n# c1\n\n# c2\nh: 1\n",
+    ),
+    ("b: &x\n# c1\n\nh: 1\n", ".", &[], "b: &x\n# c1\nh: 1\n"),
+    (
+        "b: &x\r\n# c1\r\n\r\nh: 1\r\n",
+        ".",
+        &[],
+        "b: &x\n# c1\nh: 1\n",
+    ),
+    (
+        "b: !!str\n# c1\n\nh: 1\n",
+        ".",
+        &[],
+        "b: !!str\n# c1\nh: 1\n",
+    ),
+    (
+        "b: !!str\r\n# c1\r\n\r\nh: 1\r\n",
+        ".",
+        &[],
+        "b: !!str\n# c1\nh: 1\n",
+    ),
+    (
+        "a:\n  b:\n  # c1\n\n  h: 1\n",
+        ".",
+        &[],
+        "a:\n  b:\n  # c1\n  h: 1\n",
+    ),
+    (
+        "a:\r\n  b:\r\n  # c1\r\n\r\n  h: 1\r\n",
+        ".",
+        &[],
+        "a:\n  b:\n  # c1\n  h: 1\n",
+    ),
+    ("b: # lc\n# c1\n\nh: 1\n", ".", &[], "b: # lc\n# c1\nh: 1\n"),
+    (
+        "b: # lc\r\n# c1\r\n\r\nh: 1\r\n",
+        ".",
+        &[],
+        "b: # lc\n# c1\nh: 1\n",
+    ),
+    ("b: x\n# c1\n\nh: 1\n", ".", &[], "b: x\n# c1\n\nh: 1\n"),
+    (
+        "b: x\r\n# c1\r\n\r\nh: 1\r\n",
+        ".",
+        &[],
+        "b: x\n# c1\n\nh: 1\n",
+    ),
+    ("b:\n  # c1\n\nh: 1\n", ".", &[], "b:\n# c1\nh: 1\n"),
+    ("b:\r\n  # c1\r\n\r\nh: 1\r\n", ".", &[], "b:\n# c1\nh: 1\n"),
+];
+
+#[test]
+fn test_a_comment_below_a_key_with_no_value_heads_the_next_sibling_5053() -> Result<()> {
+    for (doc, filter, flags, expected) in VALUELESS_KEY_ROWS {
+        let (stdout, code) = run_yq_stdin(filter, doc, flags)?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (*expected, 0),
+            "{doc:?} {filter} {flags:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A write that changes a nested node's kind keeps the standalone comments around its key (yq holds them on the
+/// key, which a write over the value does not touch). A CRLF file reaches this with every comment block, since its
+/// comment is then a foot rather than the next key's head.
+const KIND_CHANGE_ROWS: &[(&str, &str, &[&str], &str)] = &[
+    (
+        "a:\n  b: 1\n# c\n\nd: 2\n",
+        ".a = 1",
+        &[],
+        "a: 1\n# c\n\nd: 2\n",
+    ),
+    (
+        "a:\n  b: 1\n# c\n\nd: 2\n",
+        ".a = {}",
+        &[],
+        "a: {}\n# c\n\nd: 2\n",
+    ),
+    (
+        "a:\n  b: 1\n# c\n\nd: 2\n",
+        ".a = [1]",
+        &[],
+        "a:\n  - 1\n# c\n\nd: 2\n",
+    ),
+    (
+        "a:\n  b: 1\n# c\n\nd: 2\n",
+        ".a |= \"x\"",
+        &[],
+        "a: x\n# c\n\nd: 2\n",
+    ),
+    (
+        "a:\n  b: 1\n# c\n\nd: 2\n",
+        ".a = {\"k\": 1}",
+        &[],
+        "a:\n  k: 1\n# c\n\nd: 2\n",
+    ),
+    ("a: 1\n# c\n\nd: 2\n", ".a = 1", &[], "a: 1\n# c\n\nd: 2\n"),
+    (
+        "a: 1\n# c\n\nd: 2\n",
+        ".a = {}",
+        &[],
+        "a: {}\n# c\n\nd: 2\n",
+    ),
+    (
+        "a: 1\n# c\n\nd: 2\n",
+        ".a = [1]",
+        &[],
+        "a:\n  - 1\n# c\n\nd: 2\n",
+    ),
+    (
+        "a: 1\n# c\n\nd: 2\n",
+        ".a |= \"x\"",
+        &[],
+        "a: x\n# c\n\nd: 2\n",
+    ),
+    (
+        "a: 1\n# c\n\nd: 2\n",
+        ".a = {\"k\": 1}",
+        &[],
+        "a:\n  k: 1\n# c\n\nd: 2\n",
+    ),
+    (
+        "# h\na:\n  b: 1\nd: 2\n",
+        ".a = 1",
+        &[],
+        "# h\na: 1\nd: 2\n",
+    ),
+    (
+        "# h\na:\n  b: 1\nd: 2\n",
+        ".a = {}",
+        &[],
+        "# h\na: {}\nd: 2\n",
+    ),
+    (
+        "# h\na:\n  b: 1\nd: 2\n",
+        ".a = [1]",
+        &[],
+        "# h\na:\n  - 1\nd: 2\n",
+    ),
+    (
+        "# h\na:\n  b: 1\nd: 2\n",
+        ".a |= \"x\"",
+        &[],
+        "# h\na: x\nd: 2\n",
+    ),
+    (
+        "# h\na:\n  b: 1\nd: 2\n",
+        ".a = {\"k\": 1}",
+        &[],
+        "# h\na:\n  k: 1\nd: 2\n",
+    ),
+    (
+        "# h\na: 1\n# f\n\nd: 2\n",
+        ".a = 1",
+        &[],
+        "# h\na: 1\n# f\n\nd: 2\n",
+    ),
+    (
+        "# h\na: 1\n# f\n\nd: 2\n",
+        ".a = {}",
+        &[],
+        "# h\na: {}\n# f\n\nd: 2\n",
+    ),
+    (
+        "# h\na: 1\n# f\n\nd: 2\n",
+        ".a = [1]",
+        &[],
+        "# h\na:\n  - 1\n# f\n\nd: 2\n",
+    ),
+    (
+        "# h\na: 1\n# f\n\nd: 2\n",
+        ".a |= \"x\"",
+        &[],
+        "# h\na: x\n# f\n\nd: 2\n",
+    ),
+    (
+        "# h\na: 1\n# f\n\nd: 2\n",
+        ".a = {\"k\": 1}",
+        &[],
+        "# h\na:\n  k: 1\n# f\n\nd: 2\n",
+    ),
+    (
+        "a:\n  b: 1\n# c\nd: 2\n",
+        ".a = 1",
+        &[],
+        "a: 1\n# c\nd: 2\n",
+    ),
+    (
+        "a:\n  b: 1\n# c\nd: 2\n",
+        ".a = {}",
+        &[],
+        "a: {}\n# c\nd: 2\n",
+    ),
+    (
+        "a:\n  b: 1\n# c\nd: 2\n",
+        ".a = [1]",
+        &[],
+        "a:\n  - 1\n# c\nd: 2\n",
+    ),
+    (
+        "a:\n  b: 1\n# c\nd: 2\n",
+        ".a |= \"x\"",
+        &[],
+        "a: x\n# c\nd: 2\n",
+    ),
+    (
+        "a:\n  b: 1\n# c\nd: 2\n",
+        ".a = {\"k\": 1}",
+        &[],
+        "a:\n  k: 1\n# c\nd: 2\n",
+    ),
+];
+
+#[test]
+fn test_a_write_that_changes_a_nodes_kind_keeps_the_comments_around_its_key_5053() -> Result<()> {
+    for (doc, filter, flags, expected) in KIND_CHANGE_ROWS {
+        let (stdout, code) = run_yq_stdin(filter, doc, flags)?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (*expected, 0),
+            "{doc:?} {filter} {flags:?}"
+        );
+        // The same document with CRLF breaks keeps every comment (yq adds a blank line after each one).
+        let crlf = doc.replace('\n', "\r\n");
+        let (stdout, code) = run_yq_stdin(filter, &crlf, flags)?;
+        assert_eq!(code, 0, "{crlf:?} {filter}");
+        for comment in doc.lines().filter(|l| l.trim_start().starts_with('#')) {
+            assert!(
+                stdout.contains(comment.trim()),
+                "{crlf:?} {filter} lost {comment:?}: {stdout:?}"
+            );
+        }
+    }
+    Ok(())
+}

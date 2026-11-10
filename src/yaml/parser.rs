@@ -1372,7 +1372,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // `.m.k`'s key's head, measured against yq v4.53.3, #4099).
                 let heads_first_child =
                     next.is_some_and(|(_, next_column)| next_column > prev_indent);
+                // A key with no value yet (`b:` / `# c` / blank / `h: 1`): the comment is read while
+                // go-yaml looks for the value, so it is the next sibling's head, not `b`'s foot (#5053).
+                let heads_next_sibling = next
+                    .is_some_and(|(_, next_column)| next_column == prev_indent)
+                    && self.follows_valueless_key();
                 if !heads_first_child
+                    && !heads_next_sibling
                     && !self.first_node_takes_no_foot_quirk(prev, prev_indent, next.is_some())
                 {
                     self.drain_pending_into_foot(prev);
@@ -1950,7 +1956,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             let target = frames
                 .iter()
                 .rposition(|frame| frame.indent == self.pending_block.column)
-                .and_then(|at| Self::last_mapping_key(frames[..=at].iter().rev().take(1)));
+                .and_then(|at| Self::last_mapping_key(core::iter::once(&frames[at])));
             if let Some(target) = target {
                 // An earlier block of the run already settled there: the blank line that split them is kept,
                 // as an empty line before this one.
@@ -1969,6 +1975,45 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             }
         }
         self.resolve_pending_block_backward();
+    }
+
+    /// Whether the line just above the pending block is a mapping key that has no value on its line: `b:`,
+    /// `b: &x` or `b: !!str` (#5053). Its value, if any, comes on a later line, so a comment directly below
+    /// it is read as part of looking for that value.
+    fn follows_valueless_key(&self) -> bool {
+        let Some(&(first, _)) = self.pending_head_lines.first() else {
+            return false;
+        };
+        let text = self.input;
+        let mut line_start = first as usize;
+        while line_start > 0 && !is_line_break(text[line_start - 1]) {
+            line_start -= 1;
+        }
+        if line_start == 0 {
+            return false;
+        }
+        let mut line_end = line_start - 1;
+        if text[line_end] == b'\n' && line_end > 0 && text[line_end - 1] == b'\r' {
+            line_end -= 1;
+        }
+        let mut prev_start = line_end;
+        while prev_start > 0 && !is_line_break(text[prev_start - 1]) {
+            prev_start -= 1;
+        }
+        let Ok(line) = core::str::from_utf8(&text[prev_start..line_end]) else {
+            return false;
+        };
+        // The last token that is not a property or a trailing comment must end the key.
+        let mut last = None;
+        for token in line.split_ascii_whitespace() {
+            if token.starts_with('#') {
+                break;
+            }
+            if !(token.starts_with('&') || token.starts_with('!')) {
+                last = Some(token);
+            }
+        }
+        last.is_some_and(|token| token.ends_with(':'))
     }
 
     /// Settle a pending block whose forward attachment is already disproven
@@ -2360,12 +2405,14 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
         // A CRLF after a standalone comment line is a blank line of its own to go-yaml (#5053). The line
         // must be a comment the parser recorded: a `#` line inside a block scalar is its content.
-        let prev_line_start = self.input[..q]
-            .iter()
-            .rposition(|&b| is_line_break(b))
-            .map_or(0, |i| i + 1);
-        if q == previous_comment_end && crlf_comment_blank_between(self.input, prev_line_start, p) {
-            return true;
+        if q == previous_comment_end {
+            let prev_line_start = self.input[..q]
+                .iter()
+                .rposition(|&b| is_line_break(b))
+                .map_or(0, |i| i + 1);
+            if crlf_comment_blank_between(self.input, prev_line_start, p) {
+                return true;
+            }
         }
         // Walk the previous line backwards; blank iff we reach another break
         // (or the start of input) without meeting content.

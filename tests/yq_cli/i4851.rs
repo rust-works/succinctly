@@ -243,9 +243,9 @@ fn test_4851_g_comments_before_own_line_properties_at_the_end_of_the_document_ar
 
 /// Shapes next to the block that still differ from yq, pinned with this tool's answer so a change
 /// is deliberate (all recorded in `limitations.md`): a `---` or `...` after the empty node (yq
-/// drops the comments, this keeps them), a blank line between the properties and the next key
-/// (yq prints none after the comments), and a comment after the properties line (yq orders it
-/// before the block, with a blank line between them).
+/// drops the comments, this keeps them) and a comment after the properties line (yq orders it
+/// before the block, with a blank line between them). A blank line between the properties and the next
+/// key used to be a third (yq prints none after the comments); #5053 matched it.
 #[test]
 fn test_4851_h_residuals_next_to_the_block_are_pinned() -> Result<()> {
     let rows: &[(&str, &str)] = &[
@@ -256,7 +256,7 @@ fn test_4851_h_residuals_next_to_the_block_are_pinned() -> Result<()> {
         ("k:\n  -\n    # x\n    !!str\n...\n", "k:\n  - !!str\n# x\n"),
         (
             "k:\n  - # c\n    # x\n    !!str\n\nz: 1\n",
-            "k:\n  - !!str\n# c\n# x\n\nz: 1\n",
+            "k:\n  - !!str\n# c\n# x\nz: 1\n",
         ),
         (
             "k:\n  -\n    # x\n    !!str\n  # y\nz: 1\n",
