@@ -1151,9 +1151,12 @@ A list that grows past 100,000 accumulators is refused with `reduce: maximum ite
 
 Six things still differ, each in yq v4.53.3 against `succinctly yq`:
 
-- **`map({})`.**
-  yq builds its one empty mapping there as well (`.x | map({})` over `x: [1, 2, 3]` is `[{}]`, and `.x | map(select(. > 5) | {})` is `[{}]` too, where an empty `.e | map({})` is `[]`).
-  `succinctly yq` answers one per element (`[{},{},{}]`), and `.x[] | {}`, which is one `{}` in both ([#6801](https://github.com/rust-works/succinctly/issues/6801)).
+- **`{}` over a computed or a written source.**
+  The one-`{}` rule holds where the collect reads the document (`.x | [.[] | {}]`, `.x | map({})`) and not where its source is a computed array or a value being written.
+  `.x | map(. + 1) | [.[] | {}]` is `[{}]` in yq and `[{},{},{}]` here, and so is `.x | map(. + 1) | map({})`.
+  `.x |= map({})` and `.x = [.x[] | {}]` write `[{}]` in yq and three `{}` here.
+  The owned-value evaluator never enters the context-list walk for a collect, where the document route does.
+  `.x | map({})` over a flow sequence prints `[{}]` in YAML in yq (the result keeps its source's flow style) and `- {}` here ([#6801](https://github.com/rust-works/succinctly/issues/6801)).
 - **A constant over an empty context.**
   yq answers a literal from a context that holds no node (`yq ea 'select(fi == 9) | 0'` is `0`, and `select(fi == 9) | . as $i ireduce (0; . + 1)` is `0`).
   Only `{}` does here, so a fold whose INIT is another constant and whose source filter selects no document prints nothing ([#6801](https://github.com/rust-works/succinctly/issues/6801)).

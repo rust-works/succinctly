@@ -38,6 +38,7 @@ use super::eval::{
     pattern_alternatives_var_names, try_compare_op, EvalError, EvalSemantics, JqSemantics,
     YqSemantics,
 };
+use super::eval_generic::is_empty_object_literal;
 use super::expr::{
     ArithOp, ArithSettleMemo, AssignOp, Builtin, CompareOp, Expr, FormatType, FuncDefBound, Import,
     Include, Libm1, Libm2, Libm3, Literal, MergeFlags, MetaObject, MetaSlot, MetaValue, ModuleMeta,
@@ -1689,11 +1690,25 @@ fn has_flat_union(expr: &Expr) -> bool {
     }
 }
 
+/// Whether `expr` is, or is a stage of, an empty `{}` that yq builds once however many nodes reach
+/// it (#6801): the stage the context-list walk owns in `[.[] | f]`
+/// ([`is_empty_object_literal`]). Looks through parentheses and nested pipes as `has_flat_union`
+/// does, and stops at an `as` body: `. as $v | {}` is one `{}` per node in yq, so the walk does not
+/// own it.
+fn has_flat_empty_object(expr: &Expr) -> bool {
+    match expr {
+        Expr::Paren(inner) => has_flat_empty_object(inner),
+        Expr::Pipe(stages) => stages.iter().any(has_flat_empty_object),
+        other => is_empty_object_literal(other),
+    }
+}
+
 /// #6770: yq's `map(f)` splats its node and runs `f` once over the whole list of members
 /// (`mapOperator`, `GetMatchingNodes(splatted, RHS)`), so a union in `f` runs each branch over every
-/// member before the next: `map(.a, .b)` is every `.a`, then every `.b`. That is the walk
+/// member before the next: `map(.a, .b)` is every `.a`, then every `.b`. An empty `{}` stage in `f`
+/// is built once, not per member (#6801: `.x | map({})` is `[{}]`). That is the walk
 /// `[.[] | f]` already takes (the context-list model, `eval_yq_context_pipe`), so a union-bodied
-/// `map` over a sequence or a mapping with members is written
+/// (or empty-`{}`-bodied) `map` over a sequence or a mapping with members is written
 /// `(if has-members then [.[] | f] else . end) | map(.)`.
 ///
 /// The trailing `map(.)` is what keeps everything else as it was. It makes the result a node of its
@@ -1705,7 +1720,7 @@ fn yq_map_union_body_over_the_list(call: Expr) -> Expr {
     let Expr::Builtin(Builtin::Map(body)) = &call else {
         return call;
     };
-    if !has_flat_union(body) {
+    if !has_flat_union(body) && !has_flat_empty_object(body) {
         return call;
     }
     // Whether the node has members to walk: a sequence or a mapping with entries. A scalar, `null`,
