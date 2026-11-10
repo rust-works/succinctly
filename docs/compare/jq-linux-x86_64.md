@@ -2,7 +2,7 @@
 
 # jq vs succinctly jq
 
-AMD Ryzen 9 7950X 16-Core Processor · Ubuntu 22.04.5 LTS · 32 cores · `7601d0ffe`
+AMD Ryzen 9 7950X 16-Core Processor · Ubuntu 22.04.5 LTS · 32 cores · `968a5fa84`
 
 ## Summary
 
@@ -10,7 +10,7 @@ AMD Ryzen 9 7950X 16-Core Processor · Ubuntu 22.04.5 LTS · 32 cores · `7601d0
 |-----------------------------|-------|
 | Reference                   | jq-1.7.1 |
 | Smoke differential pass     | 20/20 |
-| Smoke geomean speedup       | 0.91x (0.81x–0.96x) |
+| Smoke geomean speedup       | 0.91x (0.81x–0.95x) |
 | Builtins defined by succinctly | 100.0% of 207 probed (218 listed, 11 not probed) |
 | Builtins agreeing with the reference | 98.1% (203/207) |
 | Syntax-form probes agreeing | 1096/1097 |
@@ -20,10 +20,11 @@ AMD Ryzen 9 7950X 16-Core Processor · Ubuntu 22.04.5 LTS · 32 cores · `7601d0
 | Robustness probes agreeing | 90/97 |
 | Robustness: crashes / timeouts, succinctly | 1 / 3 |
 | Robustness: crashes / timeouts, jq | 5 / 3 |
-| Geomean speedup vs jq-1.7.1 | 2.31x (0.60x–49.30x, n=201) |
-| Geomean peak RSS vs jq-1.7.1 | 1.50x (0.14x–49.98x) |
-| Geomean private memory vs jq-1.7.1 | 1.04x (0.13x–172.36x) |
-| Timing rows jq wins / noisy (CV > 5%) | 23 / 18 |
+| Geomean speedup vs jq-1.7.1 | 2.25x (0.58x–45.12x, n=201) |
+| Geomean speedup vs the secondary reference | 2.39x (0.57x–42.52x, n=201) |
+| Geomean peak RSS vs jq-1.7.1 | 1.49x (0.14x–49.46x) |
+| Geomean private memory vs jq-1.7.1 | 1.04x (0.13x–172.35x) |
+| Timing rows jq wins / noisy (CV > 5%) | 25 / 18 |
 | Known divergences (ledger) | 34 |
 | Ledger drift | 0 unlisted, 0 stale |
 
@@ -71,26 +72,26 @@ AMD Ryzen 9 7950X 16-Core Processor · Ubuntu 22.04.5 LTS · 32 cores · `7601d0
 
 | Query | jq median (MAD) | succinctly median (MAD) | speedup |
 |-------|-----------------|-------------------------|---------|
-| identity | 1.10 (0.02) | 1.15 (0.03) | 0.96x |
-| field | 1.07 (0.03) | 1.14 (0.03) | 0.94x |
-| iterate | 1.08 (0.03) | 1.16 (0.02) | 0.93x |
-| length | 1.09 (0.02) | 1.19 (0.02) | 0.92x |
-| keys | 1.08 (0.02) | 1.18 (0.02) | 0.91x |
-| map_select | 1.10 (0.03) | 1.23 (0.02) | 0.90x |
-| sort_by | 1.09 (0.03) | 1.23 (0.03) | 0.89x |
-| group_by | 1.08 (0.02) | 1.26 (0.04) | 0.86x |
-| reduce | 1.08 (0.02) | 1.26 (0.03) | 0.86x |
-| to_entries | 1.10 (0.02) | 1.20 (0.02) | 0.92x |
-| csv | 1.10 (0.03) | 1.20 (0.03) | 0.92x |
-| tojson | 1.09 (0.02) | 1.22 (0.03) | 0.89x |
-| update | 1.12 (0.02) | 1.25 (0.03) | 0.90x |
-| paths | 1.11 (0.02) | 1.21 (0.02) | 0.92x |
-| limit | 1.14 (0.02) | 1.21 (0.03) | 0.94x |
-| try_catch | 1.09 (0.03) | 1.21 (0.04) | 0.90x |
-| regex | 1.13 (0.02) | 1.40 (0.03) | 0.81x |
-| raw_output | 1.08 (0.03) | 1.15 (0.03) | 0.94x |
-| sort_keys | 1.07 (0.02) | 1.16 (0.03) | 0.92x |
-| big_int | 1.08 (0.02) | 1.14 (0.02) | 0.94x |
+| identity | 1.06 (0.03) | 1.13 (0.03) | 0.93x |
+| field | 1.06 (0.02) | 1.12 (0.03) | 0.94x |
+| iterate | 1.05 (0.02) | 1.13 (0.03) | 0.93x |
+| length | 1.05 (0.02) | 1.12 (0.01) | 0.94x |
+| keys | 1.06 (0.03) | 1.15 (0.03) | 0.93x |
+| map_select | 1.07 (0.03) | 1.20 (0.02) | 0.89x |
+| sort_by | 1.06 (0.02) | 1.19 (0.03) | 0.90x |
+| group_by | 1.06 (0.01) | 1.22 (0.03) | 0.87x |
+| reduce | 1.07 (0.03) | 1.24 (0.03) | 0.86x |
+| to_entries | 1.06 (0.03) | 1.17 (0.02) | 0.91x |
+| csv | 1.03 (0.01) | 1.15 (0.02) | 0.90x |
+| tojson | 1.04 (0.02) | 1.15 (0.02) | 0.91x |
+| update | 1.09 (0.03) | 1.22 (0.04) | 0.90x |
+| paths | 1.09 (0.03) | 1.17 (0.03) | 0.93x |
+| limit | 1.11 (0.02) | 1.17 (0.02) | 0.95x |
+| try_catch | 1.09 (0.02) | 1.20 (0.05) | 0.90x |
+| regex | 1.10 (0.03) | 1.36 (0.04) | 0.81x |
+| raw_output | 1.04 (0.02) | 1.12 (0.03) | 0.93x |
+| sort_keys | 1.06 (0.02) | 1.13 (0.02) | 0.94x |
+| big_int | 1.05 (0.02) | 1.12 (0.04) | 0.94x |
 
 n = 21 interleaved repetitions per row. Startup dominates at this input size; these rows measure process spawn, not throughput.
 
@@ -111,7 +112,14 @@ Not probed: `debug/0` (writes to stderr), `debug/1` (writes to stderr), `env/0` 
 
 ### Added after the primary reference
 
-Not run: jq-1.8.1 not built (scripts/compare-jq-build.sh 1.8.1, or --build-jq).
+jq-1.8.2 builtins: 5 match, 0 differ, 4 not implemented, 0 not probed.
+
+| Builtin | Status | Ledger |
+|---------|--------|--------|
+| `add/1` | not implemented | newer-than-primary: add(f) is new in jq 1.8; succinctly follows the 1.7.1 pin (ADR-0018). |
+| `have_decnum/0` | not implemented | newer-than-primary: have_decnum is new in jq 1.8; succinctly follows the 1.7.1 pin (ADR-0018). |
+| `have_literal_numbers/0` | not implemented | newer-than-primary: have_literal_numbers is new in jq 1.8; succinctly follows the 1.7.1 pin (ADR-0018). |
+| `trimstr/1` | not implemented | newer-than-primary: trimstr(s) is new in jq 1.8; succinctly follows the 1.7.1 pin (ADR-0018). |
 
 ### A. Syntax forms
 
@@ -241,15 +249,108 @@ Each case runs through both tools; stdout and exit status must be identical. The
 | Case | Program | Ledger |
 |------|---------|--------|
 
-### B2. jq 1.8.1's own test files: not run
+### B2. jq 1.8.2's own test files (informational)
 
-- upstream-1.8.1-jq.test: jq-1.8.1: jq-1.8.1 not built (scripts/compare-jq-build.sh 1.8.1, or --build-jq)
-- upstream-1.8.1-onig.test: jq-1.8.1: jq-1.8.1 not built (scripts/compare-jq-build.sh 1.8.1, or --build-jq)
-- upstream-1.8.1-man.test: jq-1.8.1: jq-1.8.1 not built (scripts/compare-jq-build.sh 1.8.1, or --build-jq)
-- upstream-1.8.1-optional.test: jq-1.8.1: jq-1.8.1 not built (scripts/compare-jq-build.sh 1.8.1, or --build-jq)
-- upstream-1.8.1-base64.test: jq-1.8.1: jq-1.8.1 not built (scripts/compare-jq-build.sh 1.8.1, or --build-jq)
-- upstream-1.8.1-manonig.test: jq-1.8.1: jq-1.8.1 not built (scripts/compare-jq-build.sh 1.8.1, or --build-jq)
-- upstream-1.8.1-uri.test: jq-1.8.1: jq-1.8.1 not built (scripts/compare-jq-build.sh 1.8.1, or --build-jq)
+The same comparison against the secondary reference. `succinctly jq` follows jq 1.7.1, so a disagreement here is a place where 1.8 changed, not necessarily a bug; these rows are not in the ledger and not in the counts above.
+
+| File | Cases | Agree |
+|------|-------|-------|
+| upstream-1.8.2-jq.test | 550 | 475 |
+| upstream-1.8.2-onig.test | 47 | 44 |
+| upstream-1.8.2-man.test | 231 | 224 |
+| upstream-1.8.2-optional.test | 2 | 2 |
+| upstream-1.8.2-base64.test | 10 | 9 |
+| upstream-1.8.2-manonig.test | 19 | 19 |
+| upstream-1.8.2-uri.test | 20 | 20 |
+
+| Case | Program |
+|------|---------|
+| `upstream-1.8.2-jq.test:229` | `try (.[999999999] = 0) catch .` |
+| `upstream-1.8.2-jq.test:349` | `[-foreach -.[] as $x (0; . + $x)]` |
+| `upstream-1.8.2-jq.test:353` | `[foreach .[] / .[] as $i (0; . + $i)]` |
+| `upstream-1.8.2-jq.test:357` | `[foreach .[] as $x (0; . + $x) as $x | $x]` |
+| `upstream-1.8.2-jq.test:373` | `try limit(-1; error) catch .` |
+| `upstream-1.8.2-jq.test:401` | `[first(range(.)), last(range(.))]` |
+| `upstream-1.8.2-jq.test:512` | `1 + 2 as $x | -$x` |
+| `upstream-1.8.2-jq.test:516` | `"x" as $x | "a"+"y" as $y | $x+","+$y` |
+| `upstream-1.8.2-jq.test:637` | `[-1 as $x | 1,$x]` |
+| `upstream-1.8.2-jq.test:701` | `"123\u0000456" | try tonumber catch .` |
+| `upstream-1.8.2-jq.test:709` | `.[] | try toboolean catch .` |
+| `upstream-1.8.2-jq.test:720` | `"true\u0000x", "false\u0000" | try toboolean catch .` |
+| `upstream-1.8.2-jq.test:766` | `[add(null), add(range(range(10))), add(empty), add(10,range(10))]` |
+| `upstream-1.8.2-jq.test:771` | `.sum = add(.arr[])` |
+| `upstream-1.8.2-jq.test:775` | `add({(.[]):1}) | keys` |
+| `upstream-1.8.2-jq.test:911` | `[-reduce -.[] as $x (0; . + $x)]` |
+| `upstream-1.8.2-jq.test:915` | `[reduce .[] / .[] as $i (0; . + $i)]` |
+| `upstream-1.8.2-jq.test:919` | `reduce .[] as $x (0; . + $x) as $x | $x` |
+| `upstream-1.8.2-jq.test:1258` | `.[] | try (getpath(["a",0,"b"]) |= 5) catch .` |
+| `upstream-1.8.2-jq.test:1362` | `{x: if true then 1 else 2 end}` |
+| `upstream-1.8.2-jq.test:1366` | `if true then [.] else . end []` |
+| `upstream-1.8.2-jq.test:1448` | `[.[]|try if . == 0 then error("foo") elif . == 1 then .a elif . == 2 then empty else . end catch .]` |
+| `upstream-1.8.2-jq.test:1485` | `{x: try 1, y: try error catch 2, z: if true then 3 end}` |
+| `upstream-1.8.2-jq.test:1489` | `{x: 1 + 2, y: false or true, z: null // 3}` |
+| `upstream-1.8.2-jq.test:1528` | `[.[]|trimstr("foo")]` |
+| `upstream-1.8.2-jq.test:1540` | `[.[]|trimstr("")]` |
+| `upstream-1.8.2-jq.test:1553` | `try _strindices("abc") catch .` |
+| `upstream-1.8.2-jq.test:1557` | `try _strindices(123) catch .` |
+| `upstream-1.8.2-jq.test:1575` | `try trim catch ., try ltrim catch ., try rtrim catch .` |
+| `upstream-1.8.2-jq.test:1597` | `index("!")` |
+| `upstream-1.8.2-jq.test:1601` | `.[:rindex("x")]` |
+| `upstream-1.8.2-jq.test:1605` | `indices("o")` |
+| `upstream-1.8.2-jq.test:1609` | `indices("o")` |
+| `upstream-1.8.2-jq.test:1641` | `try (. * 1000000000) catch .` |
+| `upstream-1.8.2-jq.test:1839` | `try ["OK", bsearch(0)] catch ["KO",.]` |
+| `upstream-1.8.2-jq.test:1851` | `strftime("%Y-%m-%dT%H:%M:%SZ")` |
+| `upstream-1.8.2-jq.test:1855` | `mktime` |
+| `upstream-1.8.2-jq.test:1881` | `try ["OK", strftime([])] catch ["KO", .]` |
+| `upstream-1.8.2-jq.test:1885` | `try ["OK", strflocaltime({})] catch ["KO", .]` |
+| `upstream-1.8.2-jq.test:1997` | `try -. catch .` |
+| `upstream-1.8.2-jq.test:2001` | `try (.-.) catch .` |
+| `upstream-1.8.2-jq.test:2005` | `"x" * range(0; 12; 2) + "☆" * 8 | try -. catch .` |
+| `upstream-1.8.2-jq.test:2014` | `try (. + "x") catch . == if have_decnum then "number (12345678901234567890123456...) and string (\"x\") cannot be added" else "number (12345678901234568000000000...) and string (\"x\") cannot be added" end` |
+| `upstream-1.8.2-jq.test:2034` | `try join(",") catch .` |
+| `upstream-1.8.2-jq.test:2196` | `.[0] | tostring | . == if have_decnum then "13911860366432393" else "13911860366432392" end` |
+| `upstream-1.8.2-jq.test:2200` | `.x | tojson | . == if have_decnum then "13911860366432393" else "13911860366432392" end` |
+| `upstream-1.8.2-jq.test:2204` | `(13911860366432393 == 13911860366432392) | . == if have_decnum then false else true end` |
+| `upstream-1.8.2-jq.test:2224` | `-. | tojson == if have_decnum then "-13911860366432393" else "-13911860366432392" end` |
+| `upstream-1.8.2-jq.test:2228` | `-. | tojson == if have_decnum then "0.12345678901234567890123456789" else "0.12345678901234568" end` |
+| `upstream-1.8.2-jq.test:2232` | `[1E+1000,-1E+1000 | tojson] == if have_decnum then ["1E+1000","-1E+1000"] else ["1.7976931348623157e+308","-1.7976931348623157e+308"] end` |
+| `upstream-1.8.2-jq.test:2271` | `[1E+1000,-1E+1000 | abs | tojson] | unique == if have_decnum then ["1E+1000"] else ["1.7976931348623157e+308"] end` |
+| `upstream-1.8.2-jq.test:2275` | `[1E+1000,-1E+1000 | length | tojson] | unique == if have_decnum then ["1E+1000"] else ["1.7976931348623157e+308"] end` |
+| `upstream-1.8.2-jq.test:2324` | `.[] | try (fromjson | isnan) catch .` |
+| `upstream-1.8.2-jq.test:2390` | `.[] |= try tonumber` |
+| `upstream-1.8.2-jq.test:2411` | `try 0[implode] catch .` |
+| `upstream-1.8.2-jq.test:2487` | `try ("foobar" | .[1.5]) catch .` |
+| `upstream-1.8.2-jq.test:2494` | `try ["ok", setpath([1]; 1)] catch ["ko", .]` |
+| `upstream-1.8.2-jq.test:2498` | `try fromjson catch .` |
+| `upstream-1.8.2-jq.test:2516` | `.[] as [$x, $y] | try ["ok", ($x | ltrimstr($y))] catch ["ko", .]` |
+| `upstream-1.8.2-jq.test:2523` | `.[] as [$x, $y] | try ["ok", ($x | rtrimstr($y))] catch ["ko", .]` |
+| `upstream-1.8.2-jq.test:2538` | `foreach .[] as $x (0, 1; . + $x)` |
+| `upstream-1.8.2-jq.test:2548` | `strflocaltime("" | ., @uri)` |
+| `upstream-1.8.2-jq.test:2558` | `reduce range(9999) as $_ ([];[.]) | tojson | fromjson | flatten` |
+| `upstream-1.8.2-jq.test:2563` | `reduce range(10000) as $_ ([];[.]) | tojson | try (fromjson) catch . | (contains("<skipped: too deep>") | not) and contains("Exceeds depth limit for parsing")` |
+| `upstream-1.8.2-jq.test:2577` | `try setpath([range(10001) | 0]; 0) catch .` |
+| `upstream-1.8.2-jq.test:2585` | `try getpath([range(10001) | 0]) catch .` |
+| `upstream-1.8.2-jq.test:2593` | `try delpaths([[range(10001) | 0]]) catch .` |
+| `upstream-1.8.2-jq.test:2602` | `try (reduce range(10001) as $_ ([]; [.]) as $x | $x | contains($x)) catch .` |
+| `upstream-1.8.2-jq.test:2607` | `reduce range(10000) as $_ ({}; {a: .}) as $x | $x * $x | length` |
+| `upstream-1.8.2-jq.test:2611` | `try (reduce range(10001) as $_ ({}; {a: .}) as $x | $x * $x) catch .` |
+| `upstream-1.8.2-jq.test:2616` | `try ((reduce range(10001) as $_ ([]; [.])) as $x | (reduce range(10001) as $_ ([]; [.])) as $y | $x == $y) catch .` |
+| `upstream-1.8.2-jq.test:2621` | `try ((reduce range(10001) as $_ ([]; [.])) as $x | [$x, $x] | sort) catch .` |
+| `upstream-1.8.2-jq.test:2625` | `try ((reduce range(10001) as $_ ([]; [.])) as $x | [$x, $x] | unique) catch .` |
+| `upstream-1.8.2-jq.test:2629` | `try ((reduce range(10001) as $_ ({}; {a: .})) as $x | [$x, $x] | sort) catch .` |
+| `upstream-1.8.2-jq.test:2633` | `try ((reduce range(10001) as $_ ({}; {a: .})) as $x | [$x, $x] | unique) catch .` |
+| `upstream-1.8.2-onig.test:2` | `[match("( )*"; "g")]` |
+| `upstream-1.8.2-onig.test:41` | `"a","b","c" | capture("(?<x>a)?b?")` |
+| `upstream-1.8.2-onig.test:47` | `"a","b","c" | match("(?<x>a)?b?")` |
+| `upstream-1.8.2-man.test:9` | `[., tojson] == if have_decnum then [12345678909876543212345,"12345678909876543212345"] else [12345678909876543000000,"12345678909876543000000"] end` |
+| `upstream-1.8.2-man.test:13` | `[1234567890987654321,-1234567890987654321 | tojson] == if have_decnum then ["1234567890987654321","-1234567890987654321"] else ["1234567890987654400","-1234567890987654400"] end` |
+| `upstream-1.8.2-man.test:21` | `map([., . == 1]) | tojson == if have_decnum then "[[1,true],[1.000,true],[1.0,true],[1.00,true]]" else "[[1,true],[1,true],[1,true],[1,true]]" end` |
+| `upstream-1.8.2-man.test:25` | `. as $big | [$big, $big + 1] | map(. > 10000000000000000000000000000000) | . == if have_decnum then [true, false] else [false, false] end` |
+| `upstream-1.8.2-man.test:365` | `add(.[].a)` |
+| `upstream-1.8.2-man.test:620` | `[.[]|trimstr("foo")]` |
+| `upstream-1.8.2-man.test:903` | `[first(empty), last(empty), nth(5; empty)]` |
+| `upstream-1.8.2-base64.test:40` | `. | try @base64d catch .` |
 
 ## C. Input conformance: JSONTestSuite
 
@@ -281,19 +382,19 @@ Each `scripts/jq-*-sweep.*` script listed in `manifest.toml`'s `[[sweep]]` runs 
 
 | Sweep | Script | Result | Seconds | Ledger |
 |-------|--------|--------|---------|--------|
-| `alt-passthrough` | `scripts/jq-alt-passthrough-sweep.py` | agrees | 117 |  |
-| `alt-retry` | `scripts/jq-alt-retry-oracle-sweep.sh` | agrees | 14 |  |
-| `assign-path` | `scripts/jq-assign-path-oracle-sweep.sh` | agrees | 143 |  |
+| `alt-passthrough` | `scripts/jq-alt-passthrough-sweep.py` | agrees | 113 |  |
+| `alt-retry` | `scripts/jq-alt-retry-oracle-sweep.sh` | agrees | 13 |  |
+| `assign-path` | `scripts/jq-assign-path-oracle-sweep.sh` | agrees | 137 |  |
 | `assign-rhs` | `scripts/jq-assign-rhs-oracle-sweep.py` | agrees | 10 |  |
 | `bind-origin` | `scripts/jq-bind-origin-oracle-sweep.sh` | agrees | 5 |  |
 | `fanout` | `scripts/jq-fanout-oracle-sweep.sh` | agrees | 2 |  |
-| `fold-body-register-grid` | `scripts/jq-fold-body-register-grid-sweep.py` | agrees | 48 |  |
-| `fold-fresh-source` | `scripts/jq-fold-fresh-source-sweep.py` | agrees | 15 |  |
+| `fold-body-register-grid` | `scripts/jq-fold-body-register-grid-sweep.py` | agrees | 47 |  |
+| `fold-fresh-source` | `scripts/jq-fold-fresh-source-sweep.py` | agrees | 14 |  |
 | `fold-source-alt-chain` | `scripts/jq-fold-source-alt-chain-sweep.py` | agrees | 7 |  |
 | `fold-source-register` | `scripts/jq-fold-source-register-sweep.py` | agrees | 43 |  |
 | `fold-update-alt-bind` | `scripts/jq-fold-update-alt-bind-sweep.py` | agrees | 52 |  |
 | `foreach-update-alt-alternate` | `scripts/jq-foreach-update-alt-alternate-sweep.py` | agrees | 57 |  |
-| `foreach-update-if-arm` | `scripts/jq-foreach-update-if-arm-sweep.py` | agrees | 62 |  |
+| `foreach-update-if-arm` | `scripts/jq-foreach-update-if-arm-sweep.py` | agrees | 61 |  |
 | `foreach-update-null-marker` | `scripts/jq-foreach-update-null-marker-sweep.py` | agrees | 57 |  |
 | `foreach-update-state-register` | `scripts/jq-foreach-update-state-register-sweep.py` | agrees | 13 |  |
 | `libm` | `scripts/jq-libm-oracle-sweep.sh` | agrees | 0 |  |
@@ -303,10 +404,10 @@ Each `scripts/jq-*-sweep.*` script listed in `manifest.toml`'s `[[sweep]]` runs 
 | `nested-fold-outer-var` | `scripts/jq-nested-fold-outer-var-sweep.py` | agrees | 29 |  |
 | `nested-fold-source` | `scripts/jq-nested-fold-source-sweep.py` | agrees | 13 |  |
 | `path-context` | `scripts/jq-path-context-oracle-sweep.sh` | agrees | 32 |  |
-| `path-register` | `scripts/jq-path-register-sweep.py` | agrees | 40 |  |
-| `reduce-update-bind` | `scripts/jq-reduce-update-bind-sweep.py` | agrees | 39 |  |
-| `reduce-update-bind-alt` | `scripts/jq-reduce-update-bind-sweep.py` | agrees | 26 |  |
-| `seq` | `scripts/jq-seq-oracle-sweep.py` | agrees | 11 |  |
+| `path-register` | `scripts/jq-path-register-sweep.py` | agrees | 39 |  |
+| `reduce-update-bind` | `scripts/jq-reduce-update-bind-sweep.py` | agrees | 38 |  |
+| `reduce-update-bind-alt` | `scripts/jq-reduce-update-bind-sweep.py` | agrees | 25 |  |
+| `seq` | `scripts/jq-seq-oracle-sweep.py` | agrees | 12 |  |
 | `seq-door` | `scripts/jq-seq-door-sweep.py` | agrees | 8 |  |
 | `stream-errors` | `scripts/jq-stream-errors-oracle-sweep.py` | agrees | 7 |  |
 
@@ -329,16 +430,16 @@ Each probe has a 10 s deadline. Class: `ok`, `error` (non-zero exit), `crash` (s
 
 | Probe | jq | succinctly | Ledger |
 |-------|----|-------------|--------|
-| `recursion-depth-10000` | ok 0 (4462 ms) | timeout signal (10008 ms) | by-design: A user-defined function recursing 10000 deep: jq answers (about 3 s); succinctly's stack guard refuses with `exceeded maximum recursion depth` (ADR-0025). |
-| `recursion-depth-100000` | timeout signal (10002 ms) | timeout signal (10007 ms) | by-design: Recursion 100000 deep: jq does not finish within 10 s; succinctly's stack guard refuses (ADR-0025). |
-| `regex-gsub-large` | timeout signal (10008 ms) | ok 0 (27 ms) | reference-slow: `gsub("a";"b")` over 100000 characters: jq 1.7.1 does not finish within 10 s; succinctly answers in tens of milliseconds. |
+| `recursion-depth-10000` | ok 0 (4424 ms) | timeout signal (10008 ms) | by-design: A user-defined function recursing 10000 deep: jq answers (about 3 s); succinctly's stack guard refuses with `exceeded maximum recursion depth` (ADR-0025). |
+| `recursion-depth-100000` | timeout signal (10001 ms) | timeout signal (10008 ms) | by-design: Recursion 100000 deep: jq does not finish within 10 s; succinctly's stack guard refuses (ADR-0025). |
+| `regex-gsub-large` | timeout signal (10006 ms) | ok 0 (26 ms) | reference-slow: `gsub("a";"b")` over 100000 characters: jq 1.7.1 does not finish within 10 s; succinctly answers in tens of milliseconds. |
 | `array-set-too-huge-index` | crash signal (6 ms) | error 5 (2 ms) | reference-crash: `[] | .[1e12] = 1`: jq aborts (SIGSEGV); succinctly refuses the index with an error (exit 5, #5500). |
-| `recursion-tail-100000` | timeout signal (10001 ms) | timeout signal (10007 ms) | by-design: Tail-position recursion 100000 deep: jq does not finish within 10 s; succinctly's stack guard refuses (ADR-0025), so it gets no tail-call elimination. |
-| `mem-limit-64m-identity` | crash signal (167 ms) | ok 0 (34 ms) | reference-crash: Under `ulimit -v` 64 MiB, 1M-integer array: the reference jq 1.7.1 aborts; succinctly answers, on an evaluation stack sized to the cap (#5634). |
-| `mem-limit-64m-wide` | crash signal (131 ms) | ok 0 (29 ms) | reference-crash: Under `ulimit -v` 64 MiB, 300000-key object: the reference jq 1.7.1 aborts; succinctly answers, on an evaluation stack sized to the cap (#5634). |
-| `mem-limit-64m-string` | ok 0 (151 ms) | error 1 (19 ms) | by-design: Under `ulimit -v` 64 MiB a 20 MB string is read by jq but aborts succinctly on a failed allocation. A trivial run already maps about 42 MiB (the binary, the main thread's 8 MiB stack and the evaluation stack, 16 MiB at the least under a cap, #5634), and the document takes 28 MiB more: the input, and its index in two allocations of 2.5 MB and 5 MB. That is the semi-index kept whole beside the input, not a leak: it fits in 70 MiB on Linux aarch64. |
-| `mem-limit-alloc-bomb` | crash signal (1994 ms) | crash signal (802 ms) | by-design: `[range(1e8)] | length` under `ulimit -v` 512 MiB: jq 1.7.1 and succinctly both abort (killed by a signal, no exit status). Rust ends the process on a failed allocation (`memory allocation of N bytes failed`) where jq's `jv_mem_alloc` prints `cannot allocate memory` and aborts, so the output matches; a graceful error would need every container growth to be fallible. |
-| `mem-limit-string-bomb` | crash signal (17 ms) | error 5 (4 ms) | reference-crash: `"a" * 1e9` under `ulimit -v` 512 MiB: jq 1.7.1 aborts; succinctly exits 5 with a graceful error. |
+| `recursion-tail-100000` | timeout signal (10001 ms) | timeout signal (10008 ms) | by-design: Tail-position recursion 100000 deep: jq does not finish within 10 s; succinctly's stack guard refuses (ADR-0025), so it gets no tail-call elimination. |
+| `mem-limit-64m-identity` | crash signal (170 ms) | ok 0 (34 ms) | reference-crash: Under `ulimit -v` 64 MiB, 1M-integer array: the reference jq 1.7.1 aborts; succinctly answers, on an evaluation stack sized to the cap (#5634). |
+| `mem-limit-64m-wide` | crash signal (135 ms) | ok 0 (30 ms) | reference-crash: Under `ulimit -v` 64 MiB, 300000-key object: the reference jq 1.7.1 aborts; succinctly answers, on an evaluation stack sized to the cap (#5634). |
+| `mem-limit-64m-string` | ok 0 (152 ms) | error 1 (20 ms) | by-design: Under `ulimit -v` 64 MiB a 20 MB string is read by jq but aborts succinctly on a failed allocation. A trivial run already maps about 42 MiB (the binary, the main thread's 8 MiB stack and the evaluation stack, 16 MiB at the least under a cap, #5634), and the document takes 28 MiB more: the input, and its index in two allocations of 2.5 MB and 5 MB. That is the semi-index kept whole beside the input, not a leak: it fits in 70 MiB on Linux aarch64. |
+| `mem-limit-alloc-bomb` | crash signal (1968 ms) | crash signal (758 ms) | by-design: `[range(1e8)] | length` under `ulimit -v` 512 MiB: jq 1.7.1 and succinctly both abort (killed by a signal, no exit status). Rust ends the process on a failed allocation (`memory allocation of N bytes failed`) where jq's `jv_mem_alloc` prints `cannot allocate memory` and aborts, so the output matches; a graceful error would need every container growth to be fallible. |
+| `mem-limit-string-bomb` | crash signal (28 ms) | error 5 (3 ms) | reference-crash: `"a" * 1e9` under `ulimit -v` 512 MiB: jq 1.7.1 aborts; succinctly exits 5 with a graceful error. |
 
 ## H. Platform and operational properties
 
@@ -346,6 +447,7 @@ Each probe has a 10 s deadline. Class: `ok`, `error` (non-zero exit), `crash` (s
 |------|-------------|-------------------|--------------------------------------|
 | succinctly jq | 26.8 MiB | 4 | 0.83 |
 | jq-1.7.1 | 2.5 MiB | 3 | 0.94 |
+| jq-1.8.2 | 2.6 MiB | 3 | 1.00 |
 
 A ratio near 1.00 means one thread. Rust dependencies of the shipped feature set (`cargo tree -e normal`): 53. Build time is not measured (`--build-time` does).
 
@@ -358,241 +460,243 @@ A ratio near 1.00 means one thread. Rust dependencies of the shipped feature set
 
 ## D. Performance (process spawn, ms; matching outputs only)
 
-Median of interleaved repetitions (21 requested, fewer at 100 MB; a row over 15 ms is topped up to 21 where the time allows), CV in parentheses; the tool order rotates each repetition. A speedup is reference ÷ succinctly, so below 1.00x jq is faster, and is a ratio of medians except where marked †: a row that long is moved by run-to-run noise, so its ratio is of each tool's fastest of the 21 runs, which the noise moves least (the times beside it stay medians). A row marked `CV>5%` is noise-dominated, and its ratio is not a finding on its own. `1.8.1 ÷ 1.7.1` is the secondary reference's own change in speed, always of medians. (no secondary column: jq-1.8.1 not built (scripts/compare-jq-build.sh 1.8.1, or --build-jq); corpus files not on this machine, so their rows are not run (scripts/sync-bench-corpus.sh fetches them): corpus-geojson, corpus-graph, corpus-pretty, corpus-tabular.)
+Median of interleaved repetitions (21 requested, fewer at 100 MB; a row over 15 ms is topped up to 21 where the time allows), CV in parentheses; the tool order rotates each repetition. A speedup is reference ÷ succinctly, so below 1.00x jq is faster, and is a ratio of medians except where marked †: a row that long is moved by run-to-run noise, so its ratio is of each tool's fastest of the 21 runs, which the noise moves least (the times beside it stay medians). A row marked `CV>5%` is noise-dominated, and its ratio is not a finding on its own. `1.8.2 ÷ 1.7.1` is the secondary reference's own change in speed, always of medians. (corpus files not on this machine, so their rows are not run (scripts/sync-bench-corpus.sh fetches them): corpus-geojson, corpus-graph, corpus-pretty, corpus-tabular.)
 
 ### Where jq is faster
 
 | Query | Input | jq 1.7.1 | succinctly | speedup | CV>5% |
 |-------|-------|----------|------------|---------|-------|
-| startup | none | 1.2 (3%) | 1.3 (6%) | 0.93x | yes |
-| identity | corpus-charts | 1.2 (4%) | 1.4 (8%) | 0.92x | yes |
-| identity | corpus-npm | 1.3 (3%) | 1.3 (5%) | 0.95x | yes |
-| identity_compact | corpus-charts | 1.2 (9%) | 1.3 (5%) | 0.92x | yes |
-| identity_compact | corpus-npm | 1.3 (2%) | 1.3 (2%) | 0.95x |  |
-| users_assign_update | users-1mb | 9.3 (4%) | 9.6 (3%) | 0.97x |  |
-| numbers_max | numbers-1mb | 13.3 (2%) | 14.0 (2%) | 0.95x |  |
-| ndjson_select | ndjson-1mb | 13.6 (1%) | 13.7 (2%) | 1.00x |  |
-| ndjson_inputs_first | ndjson-1mb | 1.3 (2%) | 1.7 (3%) | 0.75x |  |
-| ndjson_inputs_first | ndjson-10mb | 1.3 (2%) | 1.7 (6%) | 0.75x | yes |
-| ndjson_inputs_first | ndjson-100mb | 1.3 (3%) | 1.7 (1%) | 0.78x |  |
-| users_seq_output | users-1mb | 2.5 (6%) | 3.5 (5%) | 0.72x | yes |
-| users_seq_output | users-10mb | 13.2 (1%) | 22.4 (1%) | 0.60x† |  |
-| seq_field_bad_first | jsonseq-bad-first-1mb | 11.6 (1%) | 12.5 (2%) | 0.93x |  |
-| seq_field_bad_first | jsonseq-bad-first-10mb | 104.0 (2%) | 110.9 (2%) | 0.94x† |  |
-| seq_field_bad_first | jsonseq-bad-first-100mb | 1012.3 (3%) | 1083.0 (1%) | 0.93x |  |
-| seq_field_bad_last | jsonseq-bad-last-1mb | 11.7 (2%) | 13.1 (2%) | 0.90x |  |
-| seq_field_bad_last | jsonseq-bad-last-10mb | 104.2 (3%) | 115.4 (0%) | 0.89x† |  |
-| seq_field_bad_last | jsonseq-bad-last-100mb | 1009.5 (1%) | 1129.6 (1%) | 0.89x |  |
-| args_many | none | 1.3 (2%) | 1.4 (3%) | 0.88x |  |
-| corpus_npm_deps | corpus-npm | 1.3 (5%) | 1.5 (3%) | 0.84x |  |
-| corpus_npm_scripts | corpus-npm | 1.3 (3%) | 1.5 (3%) | 0.86x |  |
-| corpus_charts_titles | corpus-charts | 1.2 (3%) | 1.4 (4%) | 0.89x |  |
+| startup | none | 1.2 (29%) | 1.2 (28%) | 0.96x | yes |
+| identity | corpus-charts | 1.2 (4%) | 1.3 (5%) | 0.92x |  |
+| identity | corpus-npm | 1.2 (3%) | 1.3 (3%) | 0.94x |  |
+| identity_compact | corpus-charts | 1.2 (3%) | 1.3 (4%) | 0.91x |  |
+| identity_compact | corpus-npm | 1.2 (4%) | 1.3 (3%) | 0.93x |  |
+| users_assign_update | users-1mb | 8.9 (3%) | 9.3 (3%) | 0.95x |  |
+| numbers_max | numbers-1mb | 12.6 (2%) | 13.5 (2%) | 0.94x |  |
+| numbers_max | numbers-10mb | 119.3 (1%) | 119.6 (1%) | 0.99x† |  |
+| ndjson_select | ndjson-1mb | 13.1 (1%) | 13.3 (1%) | 0.98x |  |
+| ndjson_inputs_first | ndjson-1mb | 1.2 (3%) | 1.6 (3%) | 0.76x |  |
+| ndjson_inputs_first | ndjson-10mb | 1.2 (4%) | 1.6 (2%) | 0.75x |  |
+| ndjson_inputs_first | ndjson-100mb | 1.2 (2%) | 1.6 (6%) | 0.74x | yes |
+| users_seq_output | users-1mb | 2.4 (7%) | 3.4 (5%) | 0.71x | yes |
+| users_seq_output | users-10mb | 12.7 (2%) | 21.9 (1%) | 0.58x† |  |
+| seq_field_bad_first | jsonseq-bad-first-1mb | 11.3 (2%) | 12.0 (2%) | 0.94x |  |
+| seq_field_bad_first | jsonseq-bad-first-10mb | 99.9 (1%) | 105.5 (1%) | 0.94x† |  |
+| seq_field_bad_first | jsonseq-bad-first-100mb | 976.9 (1%) | 1039.5 (1%) | 0.94x |  |
+| seq_field_bad_last | jsonseq-bad-last-1mb | 11.2 (1%) | 12.5 (2%) | 0.90x |  |
+| seq_field_bad_last | jsonseq-bad-last-10mb | 100.0 (1%) | 110.7 (1%) | 0.90x† |  |
+| seq_field_bad_last | jsonseq-bad-last-100mb | 981.5 (1%) | 1082.1 (0%) | 0.91x |  |
+| args_many | none | 1.2 (4%) | 1.4 (4%) | 0.87x |  |
+| corpus_npm_deps | corpus-npm | 1.2 (4%) | 1.4 (3%) | 0.85x | yes |
+| corpus_npm_scripts | corpus-npm | 1.2 (3%) | 1.4 (4%) | 0.84x |  |
+| corpus_charts_titles | corpus-charts | 1.2 (4%) | 1.3 (3%) | 0.88x |  |
+| corpus_openapi_refs | corpus-openapi | 2.2 (3%) | 2.2 (4%) | 0.99x |  |
 
 ### All timed rows
 
-| Query | Input | jq 1.7.1 | succinctly | vs 1.7.1 | jq 1.8.1 | vs 1.8.1 | 1.8.1 ÷ 1.7.1 | CV>5% |
+| Query | Input | jq 1.7.1 | succinctly | vs 1.7.1 | jq 1.8.2 | vs 1.8.2 | 1.8.2 ÷ 1.7.1 | CV>5% |
 |-------|-------|----------|------------|----------|----------|----------|---------------|-------|
-| startup | none | 1.2 (3%) | 1.3 (6%) | 0.93x | n/a | n/a | n/a | yes |
-| identity | users-1mb | 17.5 (1%) | 8.4 (2%) | 2.16x† | n/a | n/a | n/a |  |
-| identity | users-10mb | 165.6 (1%) | 67.1 (1%) | 2.47x† | n/a | n/a | n/a |  |
-| identity | users-100mb | 1672.9 (1%) | 661.0 (1%) | 2.53x | n/a | n/a | n/a |  |
-| identity | numbers-1mb | 22.9 (1%) | 7.0 (3%) | 3.34x† | n/a | n/a | n/a |  |
-| identity | numbers-10mb | 219.9 (2%) | 54.3 (1%) | 4.08x† | n/a | n/a | n/a |  |
-| identity | numbers-100mb | 2254.6 (1%) | 525.2 (1%) | 4.29x | n/a | n/a | n/a |  |
-| identity | strings-1mb | 12.4 (1%) | 4.1 (4%) | 3.03x | n/a | n/a | n/a |  |
-| identity | strings-10mb | 117.2 (2%) | 26.8 (1%) | 4.48x† | n/a | n/a | n/a |  |
-| identity | strings-100mb | 1189.4 (1%) | 246.0 (1%) | 4.89x† | n/a | n/a | n/a |  |
-| identity | wide-1mb | 31.8 (1%) | 13.3 (1%) | 2.41x† | n/a | n/a | n/a |  |
-| identity | wide-10mb | 324.0 (1%) | 112.1 (0%) | 2.88x† | n/a | n/a | n/a |  |
-| identity | wide-100mb | 3824.4 (1%) | 1049.0 (1%) | 3.65x | n/a | n/a | n/a |  |
-| identity | nested-1mb | 13.8 (1%) | 4.7 (4%) | 2.96x | n/a | n/a | n/a |  |
-| identity | nested-10mb | 129.5 (1%) | 35.4 (2%) | 3.80x† | n/a | n/a | n/a |  |
-| identity | nested-100mb | 1286.7 (1%) | 334.2 (1%) | 3.82x† | n/a | n/a | n/a |  |
-| identity | comprehensive-1mb | 31.9 (2%) | 11.2 (2%) | 2.90x† | n/a | n/a | n/a |  |
-| identity | comprehensive-10mb | 305.6 (1%) | 90.2 (1%) | 3.38x† | n/a | n/a | n/a |  |
-| identity | comprehensive-100mb | 3137.9 (1%) | 907.3 (0%) | 3.46x | n/a | n/a | n/a |  |
-| identity | corpus-charts | 1.2 (4%) | 1.4 (8%) | 0.92x | n/a | n/a | n/a | yes |
-| identity | corpus-npm | 1.3 (3%) | 1.3 (5%) | 0.95x | n/a | n/a | n/a | yes |
-| identity | corpus-openapi | 1.9 (9%) | 1.6 (3%) | 1.13x | n/a | n/a | n/a | yes |
-| identity_compact | users-1mb | 15.8 (1%) | 3.2 (5%) | 5.05x† | n/a | n/a | n/a |  |
-| identity_compact | users-10mb | 146.0 (1%) | 18.6 (2%) | 8.06x† | n/a | n/a | n/a |  |
-| identity_compact | users-100mb | 1477.9 (1%) | 172.0 (1%) | 8.61x† | n/a | n/a | n/a |  |
-| identity_compact | numbers-1mb | 21.2 (1%) | 3.9 (4%) | 5.78x† | n/a | n/a | n/a |  |
-| identity_compact | numbers-10mb | 202.6 (1%) | 24.0 (2%) | 8.58x† | n/a | n/a | n/a |  |
-| identity_compact | numbers-100mb | 2071.5 (1%) | 230.2 (3%) | 9.00x | n/a | n/a | n/a |  |
-| identity_compact | strings-1mb | 12.1 (1%) | 2.9 (6%) | 4.12x | n/a | n/a | n/a | yes |
-| identity_compact | strings-10mb | 113.1 (1%) | 17.3 (2%) | 6.69x† | n/a | n/a | n/a |  |
-| identity_compact | strings-100mb | 1156.1 (1%) | 159.2 (1%) | 7.39x† | n/a | n/a | n/a |  |
-| identity_compact | wide-1mb | 31.0 (1%) | 6.2 (5%) | 5.23x† | n/a | n/a | n/a |  |
-| identity_compact | wide-10mb | 315.7 (1%) | 43.7 (1%) | 7.29x† | n/a | n/a | n/a |  |
-| identity_compact | wide-100mb | 3727.0 (1%) | 1043.6 (0%) | 3.57x | n/a | n/a | n/a |  |
-| identity_compact | nested-1mb | 13.7 (1%) | 3.3 (5%) | 4.17x | n/a | n/a | n/a | yes |
-| identity_compact | nested-10mb | 128.4 (1%) | 19.1 (2%) | 6.86x† | n/a | n/a | n/a |  |
-| identity_compact | nested-100mb | 1271.9 (1%) | 172.2 (1%) | 7.50x† | n/a | n/a | n/a |  |
-| identity_compact | comprehensive-1mb | 26.1 (1%) | 10.6 (2%) | 2.48x† | n/a | n/a | n/a |  |
-| identity_compact | comprehensive-10mb | 251.0 (1%) | 85.9 (1%) | 2.90x† | n/a | n/a | n/a |  |
-| identity_compact | comprehensive-100mb | 2595.4 (1%) | 856.5 (0%) | 3.03x | n/a | n/a | n/a |  |
-| identity_compact | corpus-charts | 1.2 (9%) | 1.3 (5%) | 0.92x | n/a | n/a | n/a | yes |
-| identity_compact | corpus-npm | 1.3 (2%) | 1.3 (2%) | 0.95x | n/a | n/a | n/a |  |
-| identity_compact | corpus-openapi | 1.8 (9%) | 1.6 (4%) | 1.09x | n/a | n/a | n/a | yes |
-| users_field | users-1mb | 9.2 (3%) | 3.1 (4%) | 2.97x | n/a | n/a | n/a |  |
-| users_field | users-10mb | 92.5 (2%) | 16.3 (2%) | 5.71x† | n/a | n/a | n/a |  |
-| users_field | users-100mb | 954.2 (1%) | 148.4 (1%) | 6.51x† | n/a | n/a | n/a |  |
-| users_length | users-1mb | 9.8 (3%) | 3.3 (4%) | 3.00x | n/a | n/a | n/a |  |
-| users_length | users-10mb | 97.8 (1%) | 18.2 (2%) | 5.48x† | n/a | n/a | n/a |  |
-| users_length | users-100mb | 1016.2 (2%) | 166.3 (1%) | 6.22x† | n/a | n/a | n/a |  |
-| users_names | users-1mb | 10.1 (3%) | 5.4 (4%) | 1.87x | n/a | n/a | n/a |  |
-| users_names | users-10mb | 102.3 (1%) | 38.2 (1%) | 2.63x† | n/a | n/a | n/a |  |
-| users_names | users-100mb | 1050.2 (1%) | 369.6 (1%) | 2.84x† | n/a | n/a | n/a |  |
-| users_map_select | users-1mb | 11.5 (3%) | 6.9 (3%) | 1.67x | n/a | n/a | n/a |  |
-| users_map_select | users-10mb | 138.7 (1%) | 52.8 (1%) | 2.60x† | n/a | n/a | n/a |  |
-| users_map_select | users-100mb | 1484.0 (1%) | 521.5 (1%) | 2.85x | n/a | n/a | n/a |  |
-| users_sort_by | users-1mb | 16.3 (2%) | 10.2 (2%) | 1.57x† | n/a | n/a | n/a |  |
-| users_sort_by | users-10mb | 191.6 (2%) | 90.4 (1%) | 2.11x† | n/a | n/a | n/a |  |
-| users_group_by | users-1mb | 17.0 (2%) | 10.0 (2%) | 1.68x† | n/a | n/a | n/a |  |
-| users_group_by | users-10mb | 208.7 (1%) | 89.5 (1%) | 2.34x† | n/a | n/a | n/a |  |
-| users_unique_by | users-1mb | 17.2 (2%) | 10.3 (4%) | 1.72x† | n/a | n/a | n/a |  |
-| users_unique_by | users-10mb | 212.5 (1%) | 89.4 (1%) | 2.31x† | n/a | n/a | n/a |  |
-| users_reduce | users-1mb | 10.7 (3%) | 8.4 (2%) | 1.28x | n/a | n/a | n/a |  |
-| users_reduce | users-10mb | 109.1 (3%) | 67.6 (1%) | 1.60x† | n/a | n/a | n/a |  |
-| users_reduce | users-100mb | 1123.2 (1%) | 664.0 (1%) | 1.69x | n/a | n/a | n/a |  |
-| users_to_entries | users-1mb | 9.2 (4%) | 3.3 (6%) | 2.81x | n/a | n/a | n/a | yes |
-| users_to_entries | users-10mb | 93.6 (2%) | 16.5 (2%) | 5.83x† | n/a | n/a | n/a |  |
-| users_to_entries | users-100mb | 957.5 (1%) | 148.9 (1%) | 6.54x† | n/a | n/a | n/a |  |
-| users_csv | users-1mb | 16.5 (1%) | 12.2 (1%) | 1.35x† | n/a | n/a | n/a |  |
-| users_csv | users-10mb | 156.1 (1%) | 106.1 (1%) | 1.46x† | n/a | n/a | n/a |  |
-| users_csv | users-100mb | 1585.7 (1%) | 1051.7 (2%) | 1.51x | n/a | n/a | n/a |  |
-| users_regex | users-1mb | 16.2 (2%) | 6.8 (3%) | 2.38x† | n/a | n/a | n/a |  |
-| users_regex | users-10mb | 164.0 (2%) | 50.8 (3%) | 3.23x† | n/a | n/a | n/a |  |
-| users_ascii_downcase | users-1mb | 28.0 (1%) | 7.6 (2%) | 3.74x† | n/a | n/a | n/a |  |
-| users_ascii_downcase | users-10mb | 303.3 (1%) | 60.1 (1%) | 5.02x† | n/a | n/a | n/a |  |
-| users_ascii_downcase | users-100mb | 3234.0 (1%) | 592.8 (1%) | 5.46x | n/a | n/a | n/a |  |
-| users_first_early_exit | users-1mb | 9.2 (3%) | 2.9 (6%) | 3.14x | n/a | n/a | n/a | yes |
-| users_first_early_exit | users-10mb | 79.9 (1%) | 14.6 (2%) | 5.51x† | n/a | n/a | n/a |  |
-| users_first_early_exit | users-100mb | 804.5 (1%) | 131.8 (2%) | 6.18x† | n/a | n/a | n/a |  |
-| users_limit_early_exit | users-1mb | 9.3 (2%) | 2.9 (6%) | 3.14x | n/a | n/a | n/a | yes |
-| users_limit_early_exit | users-10mb | 91.8 (2%) | 14.7 (2%) | 6.43x† | n/a | n/a | n/a |  |
-| users_limit_early_exit | users-100mb | 961.6 (1%) | 130.9 (2%) | 7.37x† | n/a | n/a | n/a |  |
-| users_assign_update | users-1mb | 9.3 (4%) | 9.6 (3%) | 0.97x | n/a | n/a | n/a |  |
-| users_assign_update | users-10mb | 95.7 (1%) | 75.2 (2%) | 1.30x† | n/a | n/a | n/a |  |
-| users_del | users-1mb | 9.7 (3%) | 9.4 (4%) | 1.03x | n/a | n/a | n/a |  |
-| users_del | users-10mb | 98.9 (1%) | 73.3 (4%) | 1.34x† | n/a | n/a | n/a |  |
-| users_paths | users-1mb | 34.8 (3%) | 18.7 (2%) | 1.88x† | n/a | n/a | n/a |  |
-| users_paths | users-10mb | 364.0 (1%) | 159.8 (1%) | 2.29x† | n/a | n/a | n/a |  |
-| users_tojson_roundtrip | users-1mb | 23.0 (1%) | 14.1 (3%) | 1.66x† | n/a | n/a | n/a |  |
-| users_tojson_roundtrip | users-10mb | 250.2 (1%) | 143.3 (2%) | 1.76x† | n/a | n/a | n/a |  |
-| users_walk | users-1mb | 81.2 (1%) | 19.2 (2%) | 4.33x† | n/a | n/a | n/a |  |
-| users_walk | users-10mb | 812.5 (1%) | 173.8 (2%) | 4.74x† | n/a | n/a | n/a |  |
-| users_slurp | users-1mb | 9.2 (2%) | 3.6 (6%) | 2.56x | n/a | n/a | n/a | yes |
-| users_slurp | users-10mb | 93.7 (1%) | 21.3 (2%) | 4.54x† | n/a | n/a | n/a |  |
-| users_stream | users-1mb | 27.6 (1%) | 23.8 (1%) | 1.17x† | n/a | n/a | n/a |  |
-| users_stream | users-10mb | 264.9 (1%) | 224.2 (1%) | 1.16x† | n/a | n/a | n/a |  |
-| numbers_add | numbers-1mb | 28.6 (1%) | 11.4 (2%) | 2.51x† | n/a | n/a | n/a |  |
-| numbers_add | numbers-10mb | 278.5 (1%) | 99.0 (0%) | 2.79x† | n/a | n/a | n/a |  |
-| numbers_add | numbers-100mb | 2834.7 (0%) | 971.7 (0%) | 2.92x | n/a | n/a | n/a |  |
-| numbers_sort | numbers-1mb | 46.8 (1%) | 30.8 (1%) | 1.54x† | n/a | n/a | n/a |  |
-| numbers_sort | numbers-10mb | 896.6 (2%) | 338.9 (1%) | 2.51x† | n/a | n/a | n/a |  |
-| numbers_max | numbers-1mb | 13.3 (2%) | 14.0 (2%) | 0.95x | n/a | n/a | n/a |  |
-| numbers_max | numbers-10mb | 123.4 (1%) | 121.7 (1%) | 1.01x† | n/a | n/a | n/a |  |
-| numbers_max | numbers-100mb | 1299.8 (2%) | 1198.0 (1%) | 1.08x | n/a | n/a | n/a |  |
-| numbers_map_floor | numbers-1mb | 34.9 (1%) | 16.2 (2%) | 2.16x† | n/a | n/a | n/a |  |
-| numbers_map_floor | numbers-10mb | 334.1 (1%) | 147.9 (1%) | 2.26x† | n/a | n/a | n/a |  |
-| numbers_map_floor | numbers-100mb | 3429.7 (0%) | 1446.5 (0%) | 2.37x | n/a | n/a | n/a |  |
-| strings_length | strings-1mb | 8.1 (3%) | 4.4 (5%) | 1.81x | n/a | n/a | n/a | yes |
-| strings_length | strings-10mb | 71.7 (1%) | 30.6 (1%) | 2.34x† | n/a | n/a | n/a |  |
-| strings_length | strings-100mb | 744.1 (1%) | 289.7 (1%) | 2.59x† | n/a | n/a | n/a |  |
-| strings_upcase | strings-1mb | 344.5 (3%) | 8.9 (3%) | 39.67x† | n/a | n/a | n/a |  |
-| strings_upcase | strings-10mb | 3445.1 (1%) | 72.1 (1%) | 47.77x | n/a | n/a | n/a |  |
-| strings_upcase | strings-100mb | 34959.0 (0%) | 709.1 (1%) | 49.30x | n/a | n/a | n/a |  |
-| strings_split | strings-1mb | 12.3 (2%) | 7.8 (2%) | 1.58x | n/a | n/a | n/a |  |
-| strings_split | strings-10mb | 114.6 (1%) | 63.1 (1%) | 1.81x† | n/a | n/a | n/a |  |
-| strings_test | strings-1mb | 12.6 (2%) | 5.1 (4%) | 2.48x | n/a | n/a | n/a |  |
-| strings_test | strings-10mb | 115.6 (2%) | 35.3 (1%) | 3.32x† | n/a | n/a | n/a |  |
-| wide_keys | wide-1mb | 31.1 (1%) | 7.5 (3%) | 4.27x† | n/a | n/a | n/a |  |
-| wide_keys | wide-10mb | 329.9 (1%) | 57.3 (1%) | 5.72x† | n/a | n/a | n/a |  |
-| wide_keys | wide-100mb | 4066.1 (0%) | 571.4 (1%) | 7.12x | n/a | n/a | n/a |  |
-| wide_to_entries | wide-1mb | 63.9 (2%) | 58.0 (2%) | 1.10x† | n/a | n/a | n/a |  |
-| wide_to_entries | wide-10mb | 715.8 (1%) | 530.9 (1%) | 1.36x† | n/a | n/a | n/a |  |
-| wide_map_values | wide-1mb | 132.4 (1%) | 53.4 (1%) | 2.47x† | n/a | n/a | n/a |  |
-| wide_map_values | wide-10mb | 1302.0 (1%) | 558.9 (1%) | 2.35x† | n/a | n/a | n/a |  |
-| wide_add_values | wide-1mb | 38.8 (1%) | 33.6 (1%) | 1.15x† | n/a | n/a | n/a |  |
-| wide_add_values | wide-10mb | 400.1 (1%) | 296.4 (1%) | 1.34x† | n/a | n/a | n/a |  |
-| wide_add_values | wide-100mb | 4484.3 (1%) | 2652.7 (1%) | 1.69x | n/a | n/a | n/a |  |
-| wide_with_entries | wide-1mb | 314.2 (1%) | 154.9 (2%) | 2.05x† | n/a | n/a | n/a |  |
-| wide_with_entries | wide-10mb | 3131.1 (1%) | 1503.3 (1%) | 2.08x | n/a | n/a | n/a |  |
-| nested_paths | nested-1mb | 6.4 (1%) | 4.0 (4%) | 1.61x | n/a | n/a | n/a |  |
-| nested_paths | nested-10mb | 53.1 (1%) | 24.2 (1%) | 2.23x† | n/a | n/a | n/a |  |
-| nested_recurse | nested-1mb | 6.3 (4%) | 4.5 (5%) | 1.42x | n/a | n/a | n/a |  |
-| nested_recurse | nested-10mb | 53.1 (1%) | 30.4 (1%) | 1.76x† | n/a | n/a | n/a |  |
-| comprehensive_paths | comprehensive-1mb | 81.4 (3%) | 39.8 (2%) | 2.07x† | n/a | n/a | n/a |  |
-| comprehensive_paths | comprehensive-10mb | 834.3 (1%) | 403.0 (1%) | 2.09x† | n/a | n/a | n/a |  |
-| comprehensive_tostream | comprehensive-1mb | 166.8 (1%) | 64.6 (1%) | 2.57x† | n/a | n/a | n/a |  |
-| comprehensive_tostream | comprehensive-10mb | 1705.0 (1%) | 642.4 (1%) | 2.61x† | n/a | n/a | n/a |  |
-| comprehensive_numbers | comprehensive-1mb | 59.9 (1%) | 28.9 (2%) | 2.05x† | n/a | n/a | n/a |  |
-| comprehensive_numbers | comprehensive-10mb | 606.2 (1%) | 277.6 (0%) | 2.17x† | n/a | n/a | n/a |  |
-| ndjson_identity | ndjson-1mb | 20.8 (1%) | 6.9 (2%) | 3.05x† | n/a | n/a | n/a |  |
-| ndjson_identity | ndjson-10mb | 193.4 (1%) | 55.5 (1%) | 3.51x† | n/a | n/a | n/a |  |
-| ndjson_identity | ndjson-100mb | 1893.0 (1%) | 533.1 (1%) | 3.55x | n/a | n/a | n/a |  |
-| ndjson_field | ndjson-1mb | 11.6 (2%) | 8.8 (1%) | 1.32x | n/a | n/a | n/a |  |
-| ndjson_field | ndjson-10mb | 101.4 (2%) | 72.7 (1%) | 1.38x† | n/a | n/a | n/a |  |
-| ndjson_field | ndjson-100mb | 999.0 (1%) | 697.0 (1%) | 1.43x | n/a | n/a | n/a |  |
-| ndjson_select | ndjson-1mb | 13.6 (1%) | 13.7 (2%) | 1.00x | n/a | n/a | n/a |  |
-| ndjson_select | ndjson-10mb | 123.3 (2%) | 119.3 (1%) | 1.02x† | n/a | n/a | n/a |  |
-| ndjson_select | ndjson-100mb | 1203.4 (1%) | 1145.9 (1%) | 1.05x | n/a | n/a | n/a |  |
-| ndjson_tsv | ndjson-1mb | 21.6 (2%) | 20.8 (2%) | 1.03x† | n/a | n/a | n/a |  |
-| ndjson_tsv | ndjson-10mb | 201.6 (1%) | 189.8 (1%) | 1.06x† | n/a | n/a | n/a |  |
-| ndjson_tsv | ndjson-100mb | 1981.5 (2%) | 1848.6 (1%) | 1.07x | n/a | n/a | n/a |  |
-| ndjson_slurp | ndjson-1mb | 18.3 (5%) | 10.3 (2%) | 1.79x† | n/a | n/a | n/a |  |
-| ndjson_slurp | ndjson-10mb | 197.0 (2%) | 80.8 (1%) | 2.41x† | n/a | n/a | n/a |  |
-| ndjson_inputs_reduce | ndjson-1mb | 12.9 (1%) | 11.8 (2%) | 1.09x | n/a | n/a | n/a |  |
-| ndjson_inputs_reduce | ndjson-10mb | 114.7 (1%) | 100.2 (2%) | 1.15x† | n/a | n/a | n/a |  |
-| ndjson_inputs_reduce | ndjson-100mb | 1118.1 (1%) | 959.9 (2%) | 1.16x | n/a | n/a | n/a |  |
-| ndjson_inputs_first | ndjson-1mb | 1.3 (2%) | 1.7 (3%) | 0.75x | n/a | n/a | n/a |  |
-| ndjson_inputs_first | ndjson-10mb | 1.3 (2%) | 1.7 (6%) | 0.75x | n/a | n/a | n/a | yes |
-| ndjson_inputs_first | ndjson-100mb | 1.3 (3%) | 1.7 (1%) | 0.78x | n/a | n/a | n/a |  |
-| ndjson_raw_lines | ndjson-1mb | 6.8 (3%) | 3.6 (5%) | 1.89x | n/a | n/a | n/a |  |
-| ndjson_raw_lines | ndjson-10mb | 58.0 (3%) | 23.3 (2%) | 2.39x† | n/a | n/a | n/a |  |
-| ndjson_raw_lines | ndjson-100mb | 567.8 (3%) | 208.5 (1%) | 2.58x† | n/a | n/a | n/a |  |
-| ndjson_raw_fromjson | ndjson-1mb | 14.4 (1%) | 11.7 (3%) | 1.23x | n/a | n/a | n/a |  |
-| ndjson_raw_fromjson | ndjson-10mb | 130.2 (1%) | 101.2 (1%) | 1.29x† | n/a | n/a | n/a |  |
-| ndjson_raw_slurp | ndjson-1mb | 5.2 (4%) | 2.2 (9%) | 2.39x | n/a | n/a | n/a | yes |
-| ndjson_raw_slurp | ndjson-10mb | 47.1 (4%) | 10.4 (3%) | 4.51x† | n/a | n/a | n/a |  |
-| ndjson_raw_slurp | ndjson-100mb | 449.9 (3%) | 89.1 (3%) | 4.83x† | n/a | n/a | n/a |  |
-| ndjson_three_files | ndjson-1mb | 33.4 (1%) | 22.5 (1%) | 1.46x† | n/a | n/a | n/a |  |
-| ndjson_three_files | ndjson-10mb | 321.2 (2%) | 211.1 (1%) | 1.51x† | n/a | n/a | n/a |  |
-| users_three_files | users-1mb | 20.8 (1%) | 6.1 (3%) | 3.49x† | n/a | n/a | n/a |  |
-| users_three_files | users-10mb | 232.2 (1%) | 46.7 (2%) | 5.03x† | n/a | n/a | n/a |  |
-| seq_identity | jsonseq-1mb | 20.7 (1%) | 8.9 (2%) | 2.34x† | n/a | n/a | n/a |  |
-| seq_identity | jsonseq-10mb | 194.1 (1%) | 74.9 (0%) | 2.59x† | n/a | n/a | n/a |  |
-| seq_identity | jsonseq-100mb | 1904.0 (1%) | 726.4 (1%) | 2.62x | n/a | n/a | n/a |  |
-| seq_field | jsonseq-1mb | 11.7 (1%) | 10.3 (2%) | 1.13x | n/a | n/a | n/a |  |
-| seq_field | jsonseq-10mb | 103.6 (1%) | 87.8 (1%) | 1.17x† | n/a | n/a | n/a |  |
-| seq_field | jsonseq-100mb | 1003.8 (3%) | 854.1 (1%) | 1.18x | n/a | n/a | n/a |  |
-| seq_slurp | jsonseq-1mb | 18.4 (2%) | 12.4 (2%) | 1.47x† | n/a | n/a | n/a |  |
-| seq_slurp | jsonseq-10mb | 198.5 (1%) | 104.4 (1%) | 1.87x† | n/a | n/a | n/a |  |
-| users_seq_output | users-1mb | 2.5 (6%) | 3.5 (5%) | 0.72x | n/a | n/a | n/a | yes |
-| users_seq_output | users-10mb | 13.2 (1%) | 22.4 (1%) | 0.60x† | n/a | n/a | n/a |  |
-| seq_field_bad_first | jsonseq-bad-first-1mb | 11.6 (1%) | 12.5 (2%) | 0.93x | n/a | n/a | n/a |  |
-| seq_field_bad_first | jsonseq-bad-first-10mb | 104.0 (2%) | 110.9 (2%) | 0.94x† | n/a | n/a | n/a |  |
-| seq_field_bad_first | jsonseq-bad-first-100mb | 1012.3 (3%) | 1083.0 (1%) | 0.93x | n/a | n/a | n/a |  |
-| seq_field_bad_last | jsonseq-bad-last-1mb | 11.7 (2%) | 13.1 (2%) | 0.90x | n/a | n/a | n/a |  |
-| seq_field_bad_last | jsonseq-bad-last-10mb | 104.2 (3%) | 115.4 (0%) | 0.89x† | n/a | n/a | n/a |  |
-| seq_field_bad_last | jsonseq-bad-last-100mb | 1009.5 (1%) | 1129.6 (1%) | 0.89x | n/a | n/a | n/a |  |
-| users_slurpfile | users-1mb | 9.4 (2%) | 6.8 (4%) | 1.38x | n/a | n/a | n/a |  |
-| users_slurpfile | users-10mb | 94.3 (1%) | 53.8 (2%) | 1.80x† | n/a | n/a | n/a |  |
-| ndjson_slurpfile | ndjson-1mb | 13.9 (2%) | 10.8 (4%) | 1.29x | n/a | n/a | n/a |  |
-| ndjson_slurpfile | ndjson-10mb | 144.0 (2%) | 89.7 (1%) | 1.62x† | n/a | n/a | n/a |  |
-| users_rawfile | users-1mb | 3.5 (6%) | 1.7 (9%) | 2.07x | n/a | n/a | n/a | yes |
-| users_rawfile | users-10mb | 24.1 (3%) | 4.9 (8%) | 5.50x† | n/a | n/a | n/a | yes |
-| users_rawfile | users-100mb | 258.9 (3%) | 35.2 (4%) | 7.89x† | n/a | n/a | n/a |  |
-| args_many | none | 1.3 (2%) | 1.4 (3%) | 0.88x | n/a | n/a | n/a |  |
-| corpus_npm_deps | corpus-npm | 1.3 (5%) | 1.5 (3%) | 0.84x | n/a | n/a | n/a |  |
-| corpus_npm_scripts | corpus-npm | 1.3 (3%) | 1.5 (3%) | 0.86x | n/a | n/a | n/a |  |
-| corpus_charts_titles | corpus-charts | 1.2 (3%) | 1.4 (4%) | 0.89x | n/a | n/a | n/a |  |
-| corpus_openapi_definitions | corpus-openapi | 1.6 (2%) | 1.5 (2%) | 1.07x | n/a | n/a | n/a |  |
-| corpus_openapi_strings | corpus-openapi | 2.0 (2%) | 1.9 (2%) | 1.06x | n/a | n/a | n/a |  |
-| corpus_openapi_refs | corpus-openapi | 2.3 (3%) | 2.3 (4%) | 1.01x | n/a | n/a | n/a |  |
-| corpus_openapi_paths | corpus-openapi | 2.2 (3%) | 2.0 (1%) | 1.11x | n/a | n/a | n/a |  |
+| startup | none | 1.2 (29%) | 1.2 (28%) | 0.96x | 1.1 (21%) | 0.92x | 0.96x | yes |
+| identity | users-1mb | 17.0 (13%) | 8.2 (2%) | 2.07x† | 17.6 (1%) | 2.16x† | 1.03x | yes |
+| identity | users-10mb | 160.7 (1%) | 66.0 (1%) | 2.42x† | 172.1 (1%) | 2.59x† | 1.07x |  |
+| identity | users-100mb | 1626.6 (0%) | 650.6 (1%) | 2.50x | 1730.2 (1%) | 2.66x | 1.06x |  |
+| identity | numbers-1mb | 22.3 (1%) | 6.8 (2%) | 3.29x† | 24.0 (1%) | 3.56x† | 1.08x |  |
+| identity | numbers-10mb | 214.3 (1%) | 53.0 (1%) | 4.02x† | 235.4 (2%) | 4.40x† | 1.10x |  |
+| identity | numbers-100mb | 2189.7 (0%) | 521.9 (1%) | 4.20x | 2416.7 (1%) | 4.63x | 1.10x |  |
+| identity | strings-1mb | 12.0 (1%) | 4.1 (3%) | 2.93x | 12.3 (1%) | 3.00x | 1.02x |  |
+| identity | strings-10mb | 112.7 (1%) | 27.3 (2%) | 4.14x† | 116.3 (0%) | 4.29x† | 1.03x |  |
+| identity | strings-100mb | 1152.1 (1%) | 257.1 (1%) | 4.48x | 1180.9 (0%) | 4.59x | 1.03x |  |
+| identity | wide-1mb | 30.9 (1%) | 13.0 (1%) | 2.33x† | 32.8 (1%) | 2.50x† | 1.06x |  |
+| identity | wide-10mb | 319.3 (1%) | 110.1 (0%) | 2.85x† | 343.9 (1%) | 3.06x† | 1.08x |  |
+| identity | wide-100mb | 3703.6 (1%) | 1037.5 (0%) | 3.57x | 4056.7 (1%) | 3.91x | 1.10x |  |
+| identity | nested-1mb | 13.4 (2%) | 4.6 (4%) | 2.93x | 13.5 (2%) | 2.94x | 1.00x |  |
+| identity | nested-10mb | 125.9 (2%) | 35.8 (2%) | 3.56x† | 127.5 (1%) | 3.61x† | 1.01x |  |
+| identity | nested-100mb | 1247.4 (1%) | 337.1 (1%) | 3.70x | 1252.4 (0%) | 3.72x | 1.00x |  |
+| identity | comprehensive-1mb | 31.3 (1%) | 11.0 (2%) | 2.86x† | 32.8 (1%) | 3.02x† | 1.05x |  |
+| identity | comprehensive-10mb | 297.8 (0%) | 89.0 (1%) | 3.35x† | 313.7 (1%) | 3.51x† | 1.05x |  |
+| identity | comprehensive-100mb | 3065.9 (0%) | 898.5 (1%) | 3.41x | 3179.0 (0%) | 3.54x | 1.04x |  |
+| identity | corpus-charts | 1.2 (4%) | 1.3 (5%) | 0.92x | 1.2 (4%) | 0.91x | 0.98x |  |
+| identity | corpus-npm | 1.2 (3%) | 1.3 (3%) | 0.94x | 1.2 (2%) | 0.92x | 0.98x |  |
+| identity | corpus-openapi | 1.8 (2%) | 1.6 (5%) | 1.13x | 1.8 (2%) | 1.12x | 1.00x | yes |
+| identity_compact | users-1mb | 15.2 (2%) | 3.2 (4%) | 4.87x† | 15.2 (1%) | 4.91x† | 1.00x |  |
+| identity_compact | users-10mb | 142.4 (1%) | 18.7 (2%) | 7.68x† | 148.1 (1%) | 8.04x† | 1.04x |  |
+| identity_compact | users-100mb | 1442.9 (1%) | 176.7 (1%) | 8.17x | 1495.9 (2%) | 8.47x | 1.04x |  |
+| identity_compact | numbers-1mb | 20.6 (1%) | 3.8 (4%) | 5.60x† | 21.9 (1%) | 5.97x† | 1.06x |  |
+| identity_compact | numbers-10mb | 196.9 (1%) | 24.1 (2%) | 8.20x† | 214.2 (1%) | 8.82x† | 1.09x |  |
+| identity_compact | numbers-100mb | 2012.4 (1%) | 228.2 (1%) | 8.82x | 2192.7 (1%) | 9.61x | 1.09x |  |
+| identity_compact | strings-1mb | 11.7 (2%) | 3.2 (5%) | 3.70x | 12.0 (2%) | 3.82x | 1.03x |  |
+| identity_compact | strings-10mb | 109.1 (1%) | 18.3 (1%) | 6.00x† | 114.3 (1%) | 6.26x† | 1.05x |  |
+| identity_compact | strings-100mb | 1119.7 (6%) | 172.0 (1%) | 6.51x | 1161.6 (1%) | 6.75x | 1.04x | yes |
+| identity_compact | wide-1mb | 29.7 (1%) | 6.1 (2%) | 4.91x† | 31.2 (1%) | 5.14x† | 1.05x |  |
+| identity_compact | wide-10mb | 313.2 (1%) | 43.6 (1%) | 7.18x† | 328.6 (1%) | 7.46x† | 1.05x |  |
+| identity_compact | wide-100mb | 3641.1 (1%) | 1033.9 (0%) | 3.52x | 3897.0 (1%) | 3.77x | 1.07x |  |
+| identity_compact | nested-1mb | 13.3 (1%) | 3.3 (3%) | 4.08x | 13.4 (1%) | 4.11x | 1.01x |  |
+| identity_compact | nested-10mb | 124.4 (2%) | 19.6 (1%) | 6.30x† | 127.2 (0%) | 6.50x† | 1.02x |  |
+| identity_compact | nested-100mb | 1225.8 (1%) | 180.2 (1%) | 6.80x | 1250.2 (0%) | 6.94x | 1.02x |  |
+| identity_compact | comprehensive-1mb | 25.3 (2%) | 10.5 (2%) | 2.38x† | 26.2 (1%) | 2.51x† | 1.04x |  |
+| identity_compact | comprehensive-10mb | 245.7 (1%) | 84.4 (1%) | 2.91x† | 254.8 (1%) | 2.99x† | 1.04x |  |
+| identity_compact | comprehensive-100mb | 2507.7 (1%) | 846.5 (0%) | 2.96x | 2596.2 (0%) | 3.07x | 1.04x |  |
+| identity_compact | corpus-charts | 1.2 (3%) | 1.3 (4%) | 0.91x | 1.2 (3%) | 0.89x | 0.97x |  |
+| identity_compact | corpus-npm | 1.2 (4%) | 1.3 (3%) | 0.93x | 1.2 (3%) | 0.91x | 0.98x |  |
+| identity_compact | corpus-openapi | 1.7 (2%) | 1.6 (7%) | 1.07x | 1.7 (2%) | 1.06x | 0.99x | yes |
+| users_field | users-1mb | 9.0 (3%) | 3.0 (5%) | 2.96x | 9.3 (3%) | 3.09x | 1.04x | yes |
+| users_field | users-10mb | 91.2 (1%) | 16.8 (1%) | 5.36x† | 106.1 (2%) | 6.30x† | 1.16x |  |
+| users_field | users-100mb | 928.0 (2%) | 152.9 (1%) | 6.07x | 1128.3 (1%) | 7.38x | 1.22x |  |
+| users_length | users-1mb | 9.2 (3%) | 3.3 (4%) | 2.75x | 9.8 (3%) | 2.92x | 1.06x |  |
+| users_length | users-10mb | 96.7 (3%) | 18.6 (2%) | 5.10x† | 112.8 (3%) | 5.97x† | 1.17x |  |
+| users_length | users-100mb | 990.3 (1%) | 170.5 (2%) | 5.81x | 1199.1 (1%) | 7.03x | 1.21x |  |
+| users_names | users-1mb | 9.5 (2%) | 5.3 (3%) | 1.80x | 9.7 (1%) | 1.83x | 1.02x |  |
+| users_names | users-10mb | 103.6 (2%) | 38.8 (1%) | 2.60x† | 116.6 (2%) | 2.95x† | 1.13x |  |
+| users_names | users-100mb | 1073.5 (1%) | 373.1 (1%) | 2.88x | 1241.5 (2%) | 3.33x | 1.16x |  |
+| users_map_select | users-1mb | 10.9 (3%) | 6.9 (4%) | 1.57x | 11.6 (2%) | 1.68x | 1.07x |  |
+| users_map_select | users-10mb | 134.5 (1%) | 52.7 (1%) | 2.54x† | 146.8 (2%) | 2.76x† | 1.09x |  |
+| users_map_select | users-100mb | 1434.0 (3%) | 519.8 (1%) | 2.76x | 1630.2 (1%) | 3.14x | 1.14x |  |
+| users_sort_by | users-1mb | 15.9 (3%) | 10.3 (2%) | 1.56x† | 17.3 (2%) | 1.73x† | 1.09x |  |
+| users_sort_by | users-10mb | 190.5 (2%) | 90.2 (1%) | 2.11x† | 216.0 (1%) | 2.40x† | 1.13x |  |
+| users_group_by | users-1mb | 16.7 (2%) | 9.9 (2%) | 1.70x† | 17.5 (2%) | 1.80x† | 1.05x |  |
+| users_group_by | users-10mb | 207.8 (1%) | 88.9 (1%) | 2.33x† | 222.6 (1%) | 2.51x† | 1.07x |  |
+| users_unique_by | users-1mb | 16.4 (3%) | 9.9 (2%) | 1.64x† | 17.8 (2%) | 1.76x† | 1.08x |  |
+| users_unique_by | users-10mb | 207.5 (1%) | 88.2 (1%) | 2.31x† | 247.3 (1%) | 2.77x† | 1.19x |  |
+| users_reduce | users-1mb | 10.3 (3%) | 8.2 (2%) | 1.25x | 10.9 (2%) | 1.33x | 1.06x |  |
+| users_reduce | users-10mb | 107.6 (1%) | 67.1 (1%) | 1.58x† | 125.4 (1%) | 1.85x† | 1.17x |  |
+| users_reduce | users-100mb | 1094.5 (0%) | 654.4 (1%) | 1.67x | 1312.9 (2%) | 2.01x | 1.20x |  |
+| users_to_entries | users-1mb | 8.7 (3%) | 3.3 (4%) | 2.68x | 9.4 (3%) | 2.88x | 1.08x |  |
+| users_to_entries | users-10mb | 90.8 (1%) | 17.1 (1%) | 5.31x† | 105.6 (1%) | 6.25x† | 1.16x |  |
+| users_to_entries | users-100mb | 930.0 (1%) | 154.2 (2%) | 6.03x | 1127.8 (1%) | 7.32x | 1.21x |  |
+| users_csv | users-1mb | 15.7 (2%) | 12.2 (2%) | 1.30x† | 16.2 (1%) | 1.36x† | 1.03x |  |
+| users_csv | users-10mb | 151.2 (1%) | 104.8 (2%) | 1.42x† | 160.2 (1%) | 1.52x† | 1.06x |  |
+| users_csv | users-100mb | 1542.6 (0%) | 1034.7 (2%) | 1.49x | 1627.5 (1%) | 1.57x | 1.06x |  |
+| users_regex | users-1mb | 15.7 (2%) | 7.0 (3%) | 2.28x† | 16.6 (2%) | 2.43x† | 1.05x |  |
+| users_regex | users-10mb | 158.6 (1%) | 51.0 (2%) | 3.14x† | 178.5 (1%) | 3.53x† | 1.13x |  |
+| users_ascii_downcase | users-1mb | 27.0 (2%) | 7.6 (3%) | 3.56x† | 27.4 (1%) | 3.68x† | 1.02x |  |
+| users_ascii_downcase | users-10mb | 296.2 (1%) | 60.5 (1%) | 4.83x† | 306.5 (1%) | 5.02x† | 1.03x |  |
+| users_ascii_downcase | users-100mb | 3131.0 (1%) | 595.2 (0%) | 5.26x | 3265.8 (1%) | 5.49x | 1.04x |  |
+| users_first_early_exit | users-1mb | 9.0 (4%) | 3.0 (5%) | 3.03x | 9.1 (3%) | 3.06x | 1.01x |  |
+| users_first_early_exit | users-10mb | 77.4 (1%) | 15.0 (1%) | 5.15x† | 83.4 (1%) | 5.57x† | 1.08x |  |
+| users_first_early_exit | users-100mb | 782.3 (2%) | 134.3 (2%) | 5.83x | 843.2 (1%) | 6.28x | 1.08x |  |
+| users_limit_early_exit | users-1mb | 8.8 (2%) | 3.0 (5%) | 2.94x | 9.3 (3%) | 3.12x | 1.06x | yes |
+| users_limit_early_exit | users-10mb | 90.3 (2%) | 15.2 (2%) | 5.93x† | 105.8 (2%) | 7.00x† | 1.17x |  |
+| users_limit_early_exit | users-100mb | 932.2 (2%) | 135.0 (2%) | 6.90x | 1130.2 (1%) | 8.37x | 1.21x |  |
+| users_assign_update | users-1mb | 8.9 (3%) | 9.3 (3%) | 0.95x | 9.4 (2%) | 1.01x | 1.06x |  |
+| users_assign_update | users-10mb | 92.2 (2%) | 73.8 (3%) | 1.26x† | 107.5 (2%) | 1.47x† | 1.17x |  |
+| users_del | users-1mb | 9.3 (2%) | 9.3 (3%) | 1.00x | 9.8 (2%) | 1.05x | 1.05x |  |
+| users_del | users-10mb | 95.8 (2%) | 72.9 (4%) | 1.32x† | 112.1 (1%) | 1.53x† | 1.17x |  |
+| users_paths | users-1mb | 33.5 (1%) | 18.2 (1%) | 1.86x† | 35.5 (44%) | 1.98x† | 1.06x | yes |
+| users_paths | users-10mb | 355.8 (1%) | 157.3 (1%) | 2.30x† | 385.7 (1%) | 2.50x† | 1.08x |  |
+| users_tojson_roundtrip | users-1mb | 22.1 (1%) | 14.0 (3%) | 1.62x† | 23.2 (1%) | 1.69x† | 1.05x |  |
+| users_tojson_roundtrip | users-10mb | 242.2 (1%) | 140.9 (1%) | 1.72x† | 268.7 (1%) | 1.92x† | 1.11x |  |
+| users_walk | users-1mb | 78.1 (1%) | 18.9 (2%) | 4.22x† | 84.5 (1%) | 4.60x† | 1.08x |  |
+| users_walk | users-10mb | 783.6 (2%) | 167.7 (3%) | 4.68x† | 853.9 (1%) | 5.11x† | 1.09x |  |
+| users_slurp | users-1mb | 9.1 (2%) | 3.6 (4%) | 2.53x | 9.5 (3%) | 2.66x | 1.05x |  |
+| users_slurp | users-10mb | 91.3 (2%) | 21.8 (1%) | 4.22x† | 107.8 (1%) | 4.93x† | 1.18x |  |
+| users_stream | users-1mb | 26.8 (1%) | 23.0 (2%) | 1.17x† | 27.1 (1%) | 1.17x† | 1.01x |  |
+| users_stream | users-10mb | 257.6 (1%) | 213.8 (2%) | 1.19x† | 257.0 (1%) | 1.19x† | 1.00x |  |
+| numbers_add | numbers-1mb | 27.7 (1%) | 11.1 (2%) | 2.51x† | 30.6 (1%) | 2.80x† | 1.11x |  |
+| numbers_add | numbers-10mb | 269.8 (1%) | 95.9 (1%) | 2.82x† | 302.5 (1%) | 3.18x† | 1.12x |  |
+| numbers_add | numbers-100mb | 2762.4 (1%) | 943.6 (1%) | 2.93x | 3100.8 (1%) | 3.29x | 1.12x |  |
+| numbers_sort | numbers-1mb | 45.2 (1%) | 30.0 (1%) | 1.52x† | 49.6 (1%) | 1.66x† | 1.10x |  |
+| numbers_sort | numbers-10mb | 888.3 (3%) | 331.8 (1%) | 2.65x† | 954.0 (1%) | 2.85x† | 1.07x |  |
+| numbers_max | numbers-1mb | 12.6 (2%) | 13.5 (2%) | 0.94x | 14.2 (1%) | 1.06x | 1.13x |  |
+| numbers_max | numbers-10mb | 119.3 (1%) | 119.6 (1%) | 0.99x† | 138.3 (1%) | 1.16x† | 1.16x |  |
+| numbers_max | numbers-100mb | 1259.9 (1%) | 1182.7 (1%) | 1.07x | 1472.7 (1%) | 1.25x | 1.17x |  |
+| numbers_map_floor | numbers-1mb | 33.4 (1%) | 15.8 (2%) | 2.12x† | 37.1 (9%) | 2.37x† | 1.11x | yes |
+| numbers_map_floor | numbers-10mb | 324.2 (1%) | 144.0 (1%) | 2.24x† | 363.8 (1%) | 2.51x† | 1.12x |  |
+| numbers_map_floor | numbers-100mb | 3310.6 (1%) | 1401.4 (1%) | 2.36x | 3795.4 (1%) | 2.71x | 1.15x |  |
+| strings_length | strings-1mb | 7.8 (2%) | 4.5 (3%) | 1.73x | 8.2 (2%) | 1.82x | 1.05x |  |
+| strings_length | strings-10mb | 69.7 (1%) | 31.7 (1%) | 2.22x† | 75.7 (2%) | 2.43x† | 1.09x |  |
+| strings_length | strings-100mb | 723.9 (1%) | 300.6 (1%) | 2.41x | 781.8 (1%) | 2.60x | 1.08x |  |
+| strings_upcase | strings-1mb | 329.9 (3%) | 9.4 (2%) | 34.84x† | 316.5 (1%) | 33.53x† | 0.96x |  |
+| strings_upcase | strings-10mb | 3324.2 (1%) | 76.6 (1%) | 43.37x | 3120.9 (1%) | 40.72x | 0.94x |  |
+| strings_upcase | strings-100mb | 33473.6 (1%) | 741.9 (1%) | 45.12x | 31541.8 (1%) | 42.52x | 0.94x |  |
+| strings_split | strings-1mb | 11.9 (2%) | 7.9 (3%) | 1.51x | 12.6 (1%) | 1.60x | 1.06x |  |
+| strings_split | strings-10mb | 111.7 (1%) | 64.1 (1%) | 1.73x† | 119.6 (1%) | 1.87x† | 1.07x |  |
+| strings_test | strings-1mb | 12.1 (1%) | 5.1 (3%) | 2.37x | 13.1 (1%) | 2.58x | 1.09x |  |
+| strings_test | strings-10mb | 112.6 (2%) | 37.0 (2%) | 3.11x† | 124.5 (7%) | 3.45x† | 1.11x | yes |
+| wide_keys | wide-1mb | 30.5 (1%) | 7.6 (2%) | 3.99x† | 33.9 (3%) | 4.52x† | 1.11x |  |
+| wide_keys | wide-10mb | 325.8 (1%) | 57.5 (1%) | 5.58x† | 364.5 (1%) | 6.34x† | 1.12x |  |
+| wide_keys | wide-100mb | 3977.9 (1%) | 570.5 (1%) | 6.97x | 4477.1 (1%) | 7.85x | 1.13x |  |
+| wide_to_entries | wide-1mb | 62.0 (2%) | 57.5 (2%) | 1.11x† | 65.9 (2%) | 1.18x† | 1.06x |  |
+| wide_to_entries | wide-10mb | 699.6 (1%) | 516.0 (1%) | 1.33x† | 726.8 (2%) | 1.40x† | 1.04x |  |
+| wide_map_values | wide-1mb | 127.7 (2%) | 52.0 (1%) | 2.45x† | 136.7 (1%) | 2.65x† | 1.07x |  |
+| wide_map_values | wide-10mb | 1262.5 (1%) | 541.4 (1%) | 2.33x | 1351.2 (1%) | 2.50x | 1.07x |  |
+| wide_add_values | wide-1mb | 37.5 (1%) | 32.9 (1%) | 1.14x† | 41.6 (1%) | 1.27x† | 1.11x |  |
+| wide_add_values | wide-10mb | 392.6 (1%) | 290.8 (1%) | 1.33x† | 438.7 (1%) | 1.47x† | 1.12x |  |
+| wide_add_values | wide-100mb | 4358.7 (1%) | 2589.1 (0%) | 1.68x | 4968.5 (0%) | 1.92x | 1.14x |  |
+| wide_with_entries | wide-1mb | 303.4 (1%) | 151.7 (2%) | 2.05x† | 321.3 (2%) | 2.16x† | 1.06x |  |
+| wide_with_entries | wide-10mb | 3036.4 (1%) | 1474.2 (0%) | 2.06x | 3182.9 (1%) | 2.16x | 1.05x |  |
+| nested_paths | nested-1mb | 6.0 (2%) | 3.8 (4%) | 1.59x | 6.1 (2%) | 1.60x | 1.01x |  |
+| nested_paths | nested-10mb | 51.1 (1%) | 24.4 (1%) | 2.09x† | 52.3 (1%) | 2.16x† | 1.02x |  |
+| nested_recurse | nested-1mb | 6.0 (2%) | 4.4 (3%) | 1.35x | 6.1 (2%) | 1.38x | 1.02x |  |
+| nested_recurse | nested-10mb | 50.8 (0%) | 30.6 (1%) | 1.69x† | 52.9 (1%) | 1.76x† | 1.04x |  |
+| comprehensive_paths | comprehensive-1mb | 79.1 (1%) | 38.7 (2%) | 2.04x† | 83.7 (1%) | 2.17x† | 1.06x |  |
+| comprehensive_paths | comprehensive-10mb | 813.7 (1%) | 394.3 (1%) | 2.07x† | 865.2 (1%) | 2.21x† | 1.06x |  |
+| comprehensive_tostream | comprehensive-1mb | 161.8 (1%) | 64.9 (2%) | 2.50x† | 188.0 (1%) | 2.93x† | 1.16x |  |
+| comprehensive_tostream | comprehensive-10mb | 1651.8 (1%) | 628.4 (1%) | 2.63x | 1917.2 (1%) | 3.05x | 1.16x |  |
+| comprehensive_numbers | comprehensive-1mb | 58.1 (1%) | 28.7 (2%) | 2.05x† | 63.4 (1%) | 2.23x† | 1.09x |  |
+| comprehensive_numbers | comprehensive-10mb | 587.9 (2%) | 271.1 (1%) | 1.99x† | 647.5 (7%) | 2.28x† | 1.10x | yes |
+| ndjson_identity | ndjson-1mb | 20.0 (1%) | 6.8 (2%) | 3.01x† | 20.9 (1%) | 3.15x† | 1.04x |  |
+| ndjson_identity | ndjson-10mb | 187.9 (1%) | 54.9 (1%) | 3.43x† | 197.9 (1%) | 3.60x† | 1.05x |  |
+| ndjson_identity | ndjson-100mb | 1833.7 (1%) | 527.0 (0%) | 3.48x | 1916.2 (1%) | 3.64x | 1.05x |  |
+| ndjson_field | ndjson-1mb | 11.0 (1%) | 8.6 (2%) | 1.29x | 11.9 (1%) | 1.39x | 1.08x |  |
+| ndjson_field | ndjson-10mb | 98.3 (2%) | 72.1 (1%) | 1.35x† | 107.0 (1%) | 1.48x† | 1.09x |  |
+| ndjson_field | ndjson-100mb | 962.3 (1%) | 694.9 (1%) | 1.38x | 1045.0 (1%) | 1.50x | 1.09x |  |
+| ndjson_select | ndjson-1mb | 13.1 (1%) | 13.3 (1%) | 0.98x | 14.2 (1%) | 1.07x | 1.09x |  |
+| ndjson_select | ndjson-10mb | 118.9 (2%) | 116.6 (0%) | 1.01x† | 129.6 (1%) | 1.10x† | 1.09x |  |
+| ndjson_select | ndjson-100mb | 1154.7 (1%) | 1128.3 (1%) | 1.02x | 1260.0 (1%) | 1.12x | 1.09x |  |
+| ndjson_tsv | ndjson-1mb | 20.9 (2%) | 20.3 (1%) | 1.03x† | 21.6 (20%) | 1.06x† | 1.04x | yes |
+| ndjson_tsv | ndjson-10mb | 194.7 (1%) | 186.0 (1%) | 1.04x† | 200.8 (1%) | 1.08x† | 1.03x |  |
+| ndjson_tsv | ndjson-100mb | 1913.9 (2%) | 1805.1 (1%) | 1.06x | 1958.7 (0%) | 1.09x | 1.02x |  |
+| ndjson_slurp | ndjson-1mb | 17.7 (2%) | 10.0 (2%) | 1.73x† | 19.0 (2%) | 1.87x† | 1.07x |  |
+| ndjson_slurp | ndjson-10mb | 191.6 (1%) | 80.4 (1%) | 2.37x† | 224.5 (1%) | 2.77x† | 1.17x |  |
+| ndjson_inputs_reduce | ndjson-1mb | 12.4 (1%) | 11.2 (4%) | 1.10x | 13.3 (1%) | 1.19x | 1.08x |  |
+| ndjson_inputs_reduce | ndjson-10mb | 110.8 (1%) | 94.3 (3%) | 1.17x† | 119.8 (1%) | 1.27x† | 1.08x |  |
+| ndjson_inputs_reduce | ndjson-100mb | 1081.7 (0%) | 908.7 (1%) | 1.19x | 1164.2 (1%) | 1.28x | 1.08x |  |
+| ndjson_inputs_first | ndjson-1mb | 1.2 (3%) | 1.6 (3%) | 0.76x | 1.2 (4%) | 0.74x | 0.98x |  |
+| ndjson_inputs_first | ndjson-10mb | 1.2 (4%) | 1.6 (2%) | 0.75x | 1.2 (1%) | 0.71x | 0.95x |  |
+| ndjson_inputs_first | ndjson-100mb | 1.2 (2%) | 1.6 (6%) | 0.74x | 1.2 (1%) | 0.71x | 0.96x | yes |
+| ndjson_raw_lines | ndjson-1mb | 6.4 (1%) | 3.5 (3%) | 1.83x | 6.6 (2%) | 1.90x | 1.04x |  |
+| ndjson_raw_lines | ndjson-10mb | 56.1 (1%) | 22.8 (2%) | 2.49x† | 54.5 (7%) | 2.41x† | 0.97x | yes |
+| ndjson_raw_lines | ndjson-100mb | 547.1 (1%) | 211.6 (2%) | 2.50x† | 556.0 (3%) | 2.54x† | 1.02x |  |
+| ndjson_raw_fromjson | ndjson-1mb | 13.8 (1%) | 11.4 (2%) | 1.21x | 14.6 (2%) | 1.28x | 1.06x |  |
+| ndjson_raw_fromjson | ndjson-10mb | 125.1 (1%) | 99.2 (1%) | 1.26x† | 133.0 (1%) | 1.35x† | 1.06x |  |
+| ndjson_raw_slurp | ndjson-1mb | 5.0 (2%) | 2.2 (4%) | 2.30x | 5.0 (3%) | 2.30x | 1.00x |  |
+| ndjson_raw_slurp | ndjson-10mb | 46.2 (1%) | 10.3 (3%) | 4.69x† | 42.2 (1%) | 4.31x† | 0.91x |  |
+| ndjson_raw_slurp | ndjson-100mb | 438.6 (4%) | 87.3 (2%) | 4.76x† | 402.3 (2%) | 4.73x† | 0.92x |  |
+| ndjson_three_files | ndjson-1mb | 32.3 (3%) | 22.3 (1%) | 1.43x† | 34.9 (1%) | 1.56x† | 1.08x |  |
+| ndjson_three_files | ndjson-10mb | 309.7 (1%) | 209.9 (1%) | 1.46x† | 332.5 (1%) | 1.57x† | 1.07x |  |
+| users_three_files | users-1mb | 20.1 (3%) | 6.4 (3%) | 3.33x† | 21.3 (1%) | 3.56x† | 1.06x |  |
+| users_three_files | users-10mb | 225.5 (1%) | 48.5 (1%) | 4.67x† | 268.6 (1%) | 5.53x† | 1.19x |  |
+| seq_identity | jsonseq-1mb | 20.1 (1%) | 8.4 (2%) | 2.41x† | 21.1 (1%) | 2.53x† | 1.05x |  |
+| seq_identity | jsonseq-10mb | 187.7 (2%) | 71.7 (1%) | 2.61x† | 197.7 (0%) | 2.76x† | 1.05x |  |
+| seq_identity | jsonseq-100mb | 1838.5 (1%) | 704.6 (1%) | 2.61x | 1932.2 (1%) | 2.74x | 1.05x |  |
+| seq_field | jsonseq-1mb | 11.2 (1%) | 10.0 (1%) | 1.13x | 12.1 (1%) | 1.22x | 1.08x |  |
+| seq_field | jsonseq-10mb | 100.1 (1%) | 86.1 (1%) | 1.16x† | 108.7 (1%) | 1.26x† | 1.09x |  |
+| seq_field | jsonseq-100mb | 974.5 (1%) | 834.6 (1%) | 1.17x | 1053.6 (1%) | 1.26x | 1.08x |  |
+| seq_slurp | jsonseq-1mb | 17.8 (2%) | 12.3 (2%) | 1.44x† | 19.3 (3%) | 1.55x† | 1.09x |  |
+| seq_slurp | jsonseq-10mb | 191.4 (1%) | 101.9 (1%) | 1.87x† | 226.4 (1%) | 2.20x† | 1.18x |  |
+| users_seq_output | users-1mb | 2.4 (7%) | 3.4 (5%) | 0.71x | 2.3 (4%) | 0.67x | 0.94x | yes |
+| users_seq_output | users-10mb | 12.7 (2%) | 21.9 (1%) | 0.58x† | 12.6 (1%) | 0.57x† | 0.99x |  |
+| seq_field_bad_first | jsonseq-bad-first-1mb | 11.3 (2%) | 12.0 (2%) | 0.94x | 12.2 (1%) | 1.02x | 1.08x |  |
+| seq_field_bad_first | jsonseq-bad-first-10mb | 99.9 (1%) | 105.5 (1%) | 0.94x† | 108.8 (1%) | 1.04x† | 1.09x |  |
+| seq_field_bad_first | jsonseq-bad-first-100mb | 976.9 (1%) | 1039.5 (1%) | 0.94x | 1059.7 (2%) | 1.02x | 1.08x |  |
+| seq_field_bad_last | jsonseq-bad-last-1mb | 11.2 (1%) | 12.5 (2%) | 0.90x | 12.2 (3%) | 0.98x | 1.09x |  |
+| seq_field_bad_last | jsonseq-bad-last-10mb | 100.0 (1%) | 110.7 (1%) | 0.90x† | 108.5 (1%) | 0.98x† | 1.08x |  |
+| seq_field_bad_last | jsonseq-bad-last-100mb | 981.5 (1%) | 1082.1 (0%) | 0.91x | 1056.3 (1%) | 0.98x | 1.08x |  |
+| users_slurpfile | users-1mb | 9.0 (3%) | 6.6 (4%) | 1.36x | 9.1 (3%) | 1.38x | 1.01x |  |
+| users_slurpfile | users-10mb | 90.6 (1%) | 52.2 (2%) | 1.74x† | 84.4 (1%) | 1.62x† | 0.93x |  |
+| ndjson_slurpfile | ndjson-1mb | 13.6 (2%) | 10.5 (3%) | 1.30x | 13.5 (2%) | 1.29x | 1.00x |  |
+| ndjson_slurpfile | ndjson-10mb | 139.1 (1%) | 87.2 (2%) | 1.63x† | 127.1 (1%) | 1.49x† | 0.91x |  |
+| users_rawfile | users-1mb | 3.3 (2%) | 1.7 (6%) | 1.95x | 3.3 (3%) | 1.93x | 0.99x | yes |
+| users_rawfile | users-10mb | 23.9 (3%) | 4.8 (4%) | 5.22x† | 23.0 (2%) | 5.26x† | 0.96x |  |
+| users_rawfile | users-100mb | 251.6 (3%) | 35.6 (3%) | 7.33x† | 250.6 (1%) | 7.40x† | 1.00x |  |
+| args_many | none | 1.2 (4%) | 1.4 (4%) | 0.87x | 1.2 (3%) | 0.85x | 0.97x |  |
+| corpus_npm_deps | corpus-npm | 1.2 (4%) | 1.4 (3%) | 0.85x | 1.2 (6%) | 0.82x | 0.96x | yes |
+| corpus_npm_scripts | corpus-npm | 1.2 (3%) | 1.4 (4%) | 0.84x | 1.2 (3%) | 0.83x | 0.99x |  |
+| corpus_charts_titles | corpus-charts | 1.2 (4%) | 1.3 (3%) | 0.88x | 1.1 (4%) | 0.86x | 0.98x |  |
+| corpus_openapi_definitions | corpus-openapi | 1.5 (6%) | 1.4 (4%) | 1.05x | 1.5 (3%) | 1.03x | 0.98x | yes |
+| corpus_openapi_strings | corpus-openapi | 1.9 (2%) | 1.9 (4%) | 1.04x | 1.9 (2%) | 1.04x | 1.00x |  |
+| corpus_openapi_refs | corpus-openapi | 2.2 (3%) | 2.2 (4%) | 0.99x | 2.1 (2%) | 0.96x | 0.97x |  |
+| corpus_openapi_paths | corpus-openapi | 2.1 (2%) | 1.9 (3%) | 1.08x | 2.1 (3%) | 1.08x | 1.00x |  |
 
 ## E. Memory (peak RSS and private memory, KiB; separate untimed runs, median of 3)
 
@@ -600,207 +704,207 @@ Peak RSS charges a process for the file-backed pages of its mapped executable an
 
 | Query | Input | jq 1.7.1 RSS | succinctly RSS | RSS ratio (succinctly ÷ jq) | jq 1.7.1 private | succinctly private | private ratio |
 |-------|-------|--------------|----------------|-----------------------------|------------------|--------------------|---------------|
-| startup | none | 3216 | 9908 | 3.08x | 832 | 940 | 1.13x |
-| identity | users-1mb | 9396 | 11724 | 1.25x | 6916 | 2868 | 0.41x |
-| identity | users-10mb | 69992 | 28504 | 0.41x | 67868 | 19956 | 0.29x |
-| identity | users-100mb | 679676 | 204184 | 0.30x | 677348 | 195572 | 0.29x |
-| identity | numbers-1mb | 11268 | 11992 | 1.06x | 8896 | 3416 | 0.38x |
-| identity | numbers-10mb | 89664 | 34008 | 0.38x | 87532 | 25376 | 0.29x |
-| identity | numbers-100mb | 875824 | 253884 | 0.29x | 873860 | 245268 | 0.28x |
-| identity | strings-1mb | 3504 | 11608 | 3.31x | 1460 | 2868 | 1.96x |
-| identity | strings-10mb | 15468 | 29784 | 1.93x | 13040 | 21052 | 1.61x |
-| identity | strings-100mb | 133688 | 210136 | 1.57x | 131396 | 201720 | 1.54x |
-| identity | wide-1mb | 18968 | 13216 | 0.70x | 16580 | 4556 | 0.27x |
-| identity | wide-10mb | 146776 | 43660 | 0.30x | 144676 | 35004 | 0.24x |
-| identity | wide-100mb | 1380644 | 267080 | 0.19x | 1378556 | 258292 | 0.19x |
-| identity | nested-1mb | 5044 | 11984 | 2.38x | 2884 | 3168 | 1.10x |
-| identity | nested-10mb | 23652 | 32148 | 1.36x | 21316 | 23336 | 1.09x |
-| identity | nested-100mb | 207800 | 233464 | 1.12x | 205632 | 224956 | 1.09x |
-| identity | comprehensive-1mb | 18012 | 12952 | 0.72x | 15700 | 3928 | 0.25x |
-| identity | comprehensive-10mb | 153152 | 39004 | 0.25x | 151048 | 30100 | 0.20x |
-| identity | comprehensive-100mb | 1484868 | 302228 | 0.20x | 1483036 | 293384 | 0.20x |
-| identity | corpus-charts | 2952 | 9660 | 3.27x | 832 | 944 | 1.13x |
-| identity | corpus-npm | 3036 | 9880 | 3.25x | 828 | 944 | 1.14x |
-| identity | corpus-openapi | 3184 | 9688 | 3.04x | 836 | 944 | 1.13x |
-| identity_compact | users-1mb | 9320 | 10180 | 1.09x | 6920 | 1700 | 0.25x |
-| identity_compact | users-10mb | 70168 | 17296 | 0.25x | 67864 | 9160 | 0.13x |
-| identity_compact | users-100mb | 679484 | 94984 | 0.14x | 677348 | 86636 | 0.13x |
-| identity_compact | numbers-1mb | 11096 | 10436 | 0.94x | 8900 | 2092 | 0.24x |
-| identity_compact | numbers-10mb | 89576 | 20568 | 0.23x | 87532 | 12384 | 0.14x |
-| identity_compact | numbers-100mb | 876028 | 124108 | 0.14x | 873864 | 116220 | 0.13x |
-| identity_compact | strings-1mb | 3692 | 10168 | 2.75x | 1456 | 1968 | 1.35x |
-| identity_compact | strings-10mb | 15444 | 19856 | 1.29x | 13040 | 11652 | 0.89x |
-| identity_compact | strings-100mb | 133588 | 116184 | 0.87x | 131396 | 107968 | 0.82x |
-| identity_compact | wide-1mb | 18816 | 12184 | 0.65x | 16580 | 4012 | 0.24x |
-| identity_compact | wide-10mb | 146888 | 35992 | 0.25x | 144676 | 27888 | 0.19x |
-| identity_compact | wide-100mb | 1380692 | 247392 | 0.18x | 1378552 | 238600 | 0.17x |
-| identity_compact | nested-1mb | 5120 | 10504 | 2.05x | 2884 | 2120 | 0.74x |
-| identity_compact | nested-10mb | 23656 | 21464 | 0.91x | 21316 | 13112 | 0.62x |
-| identity_compact | nested-100mb | 207984 | 130700 | 0.63x | 205636 | 122552 | 0.60x |
-| identity_compact | comprehensive-1mb | 18056 | 11980 | 0.66x | 15696 | 2856 | 0.18x |
-| identity_compact | comprehensive-10mb | 153200 | 29280 | 0.19x | 151044 | 20356 | 0.13x |
-| identity_compact | comprehensive-100mb | 1484916 | 202260 | 0.14x | 1483040 | 193436 | 0.13x |
-| identity_compact | corpus-charts | 3044 | 9688 | 3.18x | 832 | 940 | 1.13x |
-| identity_compact | corpus-npm | 3056 | 9880 | 3.23x | 832 | 944 | 1.13x |
-| identity_compact | corpus-openapi | 3080 | 9816 | 3.19x | 836 | 944 | 1.13x |
-| users_field | users-1mb | 8572 | 11156 | 1.30x | 6256 | 1700 | 0.27x |
-| users_field | users-10mb | 63396 | 18416 | 0.29x | 61308 | 9164 | 0.15x |
-| users_field | users-100mb | 613964 | 96120 | 0.16x | 611808 | 86636 | 0.14x |
-| users_length | users-1mb | 8824 | 12296 | 1.39x | 6452 | 2036 | 0.32x |
-| users_length | users-10mb | 66340 | 21400 | 0.32x | 64004 | 11476 | 0.18x |
-| users_length | users-100mb | 636972 | 118780 | 0.19x | 634880 | 108612 | 0.17x |
-| users_names | users-1mb | 8592 | 11156 | 1.30x | 6256 | 1700 | 0.27x |
-| users_names | users-10mb | 63324 | 18060 | 0.29x | 61308 | 9160 | 0.15x |
-| users_names | users-100mb | 613952 | 96152 | 0.16x | 611808 | 86640 | 0.14x |
-| users_map_select | users-1mb | 8820 | 13464 | 1.53x | 6404 | 2584 | 0.40x |
-| users_map_select | users-10mb | 64660 | 27544 | 0.43x | 62424 | 16944 | 0.27x |
-| users_map_select | users-100mb | 624168 | 174028 | 0.28x | 622128 | 163220 | 0.26x |
-| users_sort_by | users-1mb | 9204 | 13720 | 1.49x | 7056 | 3544 | 0.50x |
-| users_sort_by | users-10mb | 72868 | 39936 | 0.55x | 70576 | 29744 | 0.42x |
-| users_group_by | users-1mb | 9344 | 13736 | 1.47x | 6988 | 3432 | 0.49x |
-| users_group_by | users-10mb | 71008 | 38728 | 0.55x | 68980 | 28648 | 0.42x |
-| users_unique_by | users-1mb | 9344 | 13828 | 1.48x | 6992 | 3544 | 0.51x |
-| users_unique_by | users-10mb | 71312 | 40316 | 0.57x | 68984 | 29744 | 0.43x |
-| users_reduce | users-1mb | 8600 | 12920 | 1.50x | 6252 | 1700 | 0.27x |
-| users_reduce | users-10mb | 63296 | 20376 | 0.32x | 61308 | 9160 | 0.15x |
-| users_reduce | users-100mb | 613944 | 98200 | 0.16x | 611804 | 86636 | 0.14x |
-| users_to_entries | users-1mb | 8464 | 13240 | 1.56x | 6264 | 1696 | 0.27x |
-| users_to_entries | users-10mb | 63356 | 20376 | 0.32x | 61316 | 9160 | 0.15x |
-| users_to_entries | users-100mb | 613988 | 97944 | 0.16x | 611812 | 86636 | 0.14x |
-| users_csv | users-1mb | 8640 | 11672 | 1.35x | 6476 | 1700 | 0.26x |
-| users_csv | users-10mb | 65804 | 19092 | 0.29x | 63496 | 9160 | 0.14x |
-| users_csv | users-100mb | 635716 | 96944 | 0.15x | 633656 | 86640 | 0.14x |
-| users_regex | users-1mb | 8820 | 14692 | 1.67x | 6336 | 2588 | 0.41x |
-| users_regex | users-10mb | 64164 | 28940 | 0.45x | 61720 | 16948 | 0.27x |
-| users_ascii_downcase | users-1mb | 9080 | 13812 | 1.52x | 6700 | 2600 | 0.39x |
-| users_ascii_downcase | users-10mb | 68608 | 29904 | 0.44x | 66236 | 18808 | 0.28x |
-| users_ascii_downcase | users-100mb | 657828 | 195852 | 0.30x | 655488 | 184764 | 0.28x |
-| users_first_early_exit | users-1mb | 8416 | 11732 | 1.39x | 6264 | 1700 | 0.27x |
-| users_first_early_exit | users-10mb | 63560 | 19064 | 0.30x | 61316 | 9160 | 0.15x |
-| users_first_early_exit | users-100mb | 614100 | 96692 | 0.16x | 611816 | 86636 | 0.14x |
-| users_limit_early_exit | users-1mb | 8624 | 12184 | 1.41x | 6264 | 1700 | 0.27x |
-| users_limit_early_exit | users-10mb | 63368 | 19648 | 0.31x | 61316 | 9160 | 0.15x |
-| users_limit_early_exit | users-100mb | 614168 | 97232 | 0.16x | 611812 | 86636 | 0.14x |
-| users_assign_update | users-1mb | 8556 | 19352 | 2.26x | 6268 | 8256 | 1.32x |
-| users_assign_update | users-10mb | 63488 | 88664 | 1.40x | 61316 | 77804 | 1.27x |
-| users_del | users-1mb | 8840 | 19352 | 2.19x | 6464 | 8124 | 1.26x |
-| users_del | users-10mb | 66172 | 86656 | 1.31x | 64012 | 75620 | 1.18x |
-| users_paths | users-1mb | 13656 | 23704 | 1.74x | 11520 | 13420 | 1.16x |
-| users_paths | users-10mb | 120788 | 138648 | 1.15x | 118608 | 129160 | 1.09x |
-| users_tojson_roundtrip | users-1mb | 10076 | 19124 | 1.90x | 7756 | 8904 | 1.15x |
-| users_tojson_roundtrip | users-10mb | 76880 | 92340 | 1.20x | 74584 | 82400 | 1.10x |
-| users_walk | users-1mb | 11384 | 26564 | 2.33x | 9132 | 15448 | 1.69x |
-| users_walk | users-10mb | 91816 | 161280 | 1.76x | 89744 | 150480 | 1.68x |
-| users_slurp | users-1mb | 8460 | 11660 | 1.38x | 6256 | 2012 | 0.32x |
-| users_slurp | users-10mb | 63536 | 22488 | 0.35x | 61308 | 14336 | 0.23x |
-| users_stream | users-1mb | 3200 | 13016 | 4.07x | 840 | 1020 | 1.21x |
-| users_stream | users-10mb | 3048 | 13220 | 4.34x | 840 | 1020 | 1.21x |
-| numbers_add | numbers-1mb | 8388 | 13976 | 1.67x | 5920 | 4352 | 0.74x |
-| numbers_add | numbers-10mb | 56776 | 44248 | 0.78x | 54776 | 34364 | 0.63x |
-| numbers_add | numbers-100mb | 548528 | 344240 | 0.63x | 546292 | 334808 | 0.61x |
-| numbers_sort | numbers-1mb | 12244 | 22528 | 1.84x | 9868 | 12740 | 1.29x |
-| numbers_sort | numbers-10mb | 96376 | 109328 | 1.13x | 94204 | 99576 | 1.06x |
-| numbers_max | numbers-1mb | 8096 | 20200 | 2.50x | 5920 | 10540 | 1.78x |
-| numbers_max | numbers-10mb | 56932 | 108984 | 1.91x | 54768 | 99536 | 1.82x |
-| numbers_max | numbers-100mb | 548420 | 999316 | 1.82x | 546292 | 989720 | 1.81x |
-| numbers_map_floor | numbers-1mb | 10508 | 19692 | 1.87x | 8320 | 9760 | 1.17x |
-| numbers_map_floor | numbers-10mb | 80004 | 98968 | 1.24x | 77844 | 88976 | 1.14x |
-| numbers_map_floor | numbers-100mb | 714836 | 890936 | 1.25x | 712516 | 880948 | 1.24x |
-| strings_length | strings-1mb | 3780 | 12820 | 3.39x | 1656 | 2896 | 1.75x |
-| strings_length | strings-10mb | 18044 | 29528 | 1.64x | 15800 | 19920 | 1.26x |
-| strings_length | strings-100mb | 164900 | 199704 | 1.21x | 162916 | 190012 | 1.17x |
-| strings_upcase | strings-1mb | 4980 | 14780 | 2.97x | 2756 | 3448 | 1.25x |
-| strings_upcase | strings-10mb | 28232 | 39968 | 1.42x | 25924 | 28960 | 1.12x |
-| strings_upcase | strings-100mb | 262996 | 294612 | 1.12x | 260908 | 283352 | 1.09x |
-| strings_split | strings-1mb | 3800 | 13316 | 3.50x | 1656 | 2904 | 1.75x |
-| strings_split | strings-10mb | 17980 | 29960 | 1.67x | 15804 | 19976 | 1.26x |
-| strings_test | strings-1mb | 4088 | 14416 | 3.53x | 1684 | 2884 | 1.71x |
-| strings_test | strings-10mb | 18080 | 31384 | 1.74x | 15832 | 19952 | 1.26x |
-| wide_keys | wide-1mb | 19020 | 12724 | 0.67x | 16572 | 3112 | 0.19x |
-| wide_keys | wide-10mb | 146876 | 31640 | 0.22x | 144668 | 21744 | 0.15x |
-| wide_keys | wide-100mb | 1380476 | 193216 | 0.14x | 1378560 | 183728 | 0.13x |
-| wide_to_entries | wide-1mb | 50804 | 65304 | 1.29x | 48700 | 55896 | 1.15x |
-| wide_to_entries | wide-10mb | 444720 | 523464 | 1.18x | 442684 | 513996 | 1.16x |
-| wide_map_values | wide-1mb | 22584 | 46896 | 2.08x | 20172 | 35312 | 1.75x |
-| wide_map_values | wide-10mb | 172252 | 332452 | 1.93x | 170004 | 320964 | 1.89x |
-| wide_add_values | wide-1mb | 19244 | 28628 | 1.49x | 16896 | 18556 | 1.10x |
-| wide_add_values | wide-10mb | 158104 | 178392 | 1.13x | 155840 | 168340 | 1.08x |
-| wide_add_values | wide-100mb | 1363924 | 1583068 | 1.16x | 1361740 | 1573348 | 1.16x |
-| wide_with_entries | wide-1mb | 76764 | 109524 | 1.43x | 74708 | 97608 | 1.31x |
-| wide_with_entries | wide-10mb | 693696 | 862568 | 1.24x | 691632 | 850512 | 1.23x |
-| nested_paths | nested-1mb | 5332 | 12492 | 2.34x | 2880 | 2168 | 0.75x |
-| nested_paths | nested-10mb | 23636 | 23192 | 0.98x | 21332 | 13112 | 0.61x |
-| nested_recurse | nested-1mb | 5304 | 12440 | 2.35x | 2808 | 2164 | 0.77x |
-| nested_recurse | nested-10mb | 23592 | 23668 | 1.00x | 21268 | 13116 | 0.62x |
-| comprehensive_paths | comprehensive-1mb | 30792 | 44080 | 1.43x | 28412 | 33812 | 1.19x |
-| comprehensive_paths | comprehensive-10mb | 277244 | 334516 | 1.21x | 274992 | 324552 | 1.18x |
-| comprehensive_tostream | comprehensive-1mb | 39832 | 74904 | 1.88x | 37620 | 64076 | 1.70x |
-| comprehensive_tostream | comprehensive-10mb | 367360 | 631704 | 1.72x | 365344 | 621072 | 1.70x |
-| comprehensive_numbers | comprehensive-1mb | 17336 | 32032 | 1.85x | 15048 | 21860 | 1.45x |
-| comprehensive_numbers | comprehensive-10mb | 148508 | 214492 | 1.44x | 146500 | 204168 | 1.39x |
-| ndjson_identity | ndjson-1mb | 3248 | 10492 | 3.23x | 836 | 2272 | 2.72x |
-| ndjson_identity | ndjson-10mb | 3188 | 20944 | 6.57x | 836 | 12976 | 15.52x |
-| ndjson_identity | ndjson-100mb | 3040 | 127860 | 42.06x | 836 | 119596 | 143.06x |
-| ndjson_field | ndjson-1mb | 3072 | 10956 | 3.57x | 832 | 2272 | 2.73x |
-| ndjson_field | ndjson-10mb | 3064 | 21720 | 7.09x | 832 | 12972 | 15.59x |
-| ndjson_field | ndjson-100mb | 3196 | 127932 | 40.03x | 832 | 119600 | 143.75x |
-| ndjson_select | ndjson-1mb | 3032 | 12688 | 4.18x | 840 | 2272 | 2.70x |
-| ndjson_select | ndjson-10mb | 3180 | 23456 | 7.38x | 840 | 12976 | 15.45x |
-| ndjson_select | ndjson-100mb | 3048 | 129944 | 42.63x | 844 | 119596 | 141.70x |
-| ndjson_tsv | ndjson-1mb | 3180 | 12376 | 3.89x | 840 | 2272 | 2.70x |
-| ndjson_tsv | ndjson-10mb | 3052 | 22652 | 7.42x | 840 | 12980 | 15.45x |
-| ndjson_tsv | ndjson-100mb | 3176 | 129488 | 40.77x | 836 | 119596 | 143.06x |
-| ndjson_slurp | ndjson-1mb | 12240 | 15256 | 1.25x | 10016 | 3600 | 0.36x |
-| ndjson_slurp | ndjson-10mb | 99708 | 40088 | 0.40x | 97528 | 28428 | 0.29x |
-| ndjson_inputs_reduce | ndjson-1mb | 3044 | 13716 | 4.51x | 840 | 2172 | 2.59x |
-| ndjson_inputs_reduce | ndjson-10mb | 3192 | 22972 | 7.20x | 840 | 11432 | 13.61x |
-| ndjson_inputs_reduce | ndjson-100mb | 3196 | 114892 | 35.95x | 844 | 103596 | 122.74x |
-| ndjson_inputs_first | ndjson-1mb | 3084 | 12480 | 4.05x | 832 | 1204 | 1.45x |
-| ndjson_inputs_first | ndjson-10mb | 3028 | 12764 | 4.22x | 832 | 1204 | 1.45x |
-| ndjson_inputs_first | ndjson-100mb | 3224 | 12468 | 3.87x | 832 | 1204 | 1.45x |
-| ndjson_raw_lines | ndjson-1mb | 3012 | 10136 | 3.37x | 836 | 1968 | 2.35x |
-| ndjson_raw_lines | ndjson-10mb | 3048 | 19060 | 6.25x | 836 | 11188 | 13.38x |
-| ndjson_raw_lines | ndjson-100mb | 3224 | 111256 | 34.51x | 836 | 103344 | 123.62x |
-| ndjson_raw_fromjson | ndjson-1mb | 3232 | 10644 | 3.29x | 836 | 1968 | 2.35x |
-| ndjson_raw_fromjson | ndjson-10mb | 3032 | 19860 | 6.55x | 836 | 11184 | 13.38x |
-| ndjson_raw_slurp | ndjson-1mb | 4060 | 10628 | 2.62x | 1860 | 2996 | 1.61x |
-| ndjson_raw_slurp | ndjson-10mb | 20276 | 29080 | 1.43x | 17752 | 21420 | 1.21x |
-| ndjson_raw_slurp | ndjson-100mb | 141220 | 213400 | 1.51x | 138800 | 205684 | 1.48x |
-| ndjson_three_files | ndjson-1mb | 3060 | 12760 | 4.17x | 836 | 4208 | 5.03x |
-| ndjson_three_files | ndjson-10mb | 3044 | 42092 | 13.83x | 836 | 33448 | 40.01x |
-| users_three_files | users-1mb | 8568 | 12484 | 1.46x | 6268 | 3004 | 0.48x |
-| users_three_files | users-10mb | 63784 | 32188 | 0.50x | 61656 | 22604 | 0.37x |
-| seq_identity | jsonseq-1mb | 3072 | 10904 | 3.55x | 832 | 2276 | 2.74x |
-| seq_identity | jsonseq-10mb | 3032 | 21512 | 7.09x | 836 | 12960 | 15.50x |
-| seq_identity | jsonseq-100mb | 3212 | 128088 | 39.88x | 836 | 119452 | 142.89x |
-| seq_field | jsonseq-1mb | 3252 | 10668 | 3.28x | 832 | 2276 | 2.74x |
-| seq_field | jsonseq-10mb | 3076 | 21656 | 7.04x | 832 | 12964 | 15.58x |
-| seq_field | jsonseq-100mb | 3220 | 128152 | 39.80x | 832 | 119452 | 143.57x |
-| seq_slurp | jsonseq-1mb | 12100 | 15072 | 1.25x | 9920 | 3576 | 0.36x |
-| seq_slurp | jsonseq-10mb | 98848 | 40304 | 0.41x | 96632 | 28208 | 0.29x |
-| users_seq_output | users-1mb | 3012 | 9616 | 3.19x | 832 | 1596 | 1.92x |
-| users_seq_output | users-10mb | 3172 | 15540 | 4.90x | 828 | 7668 | 9.26x |
-| seq_field_bad_first | jsonseq-bad-first-1mb | 3240 | 10928 | 3.37x | 832 | 2488 | 2.99x |
-| seq_field_bad_first | jsonseq-bad-first-10mb | 3216 | 23256 | 7.23x | 836 | 15424 | 18.45x |
-| seq_field_bad_first | jsonseq-bad-first-100mb | 3252 | 150992 | 46.43x | 832 | 143396 | 172.35x |
-| seq_field_bad_last | jsonseq-bad-last-1mb | 3192 | 10940 | 3.43x | 832 | 2480 | 2.98x |
-| seq_field_bad_last | jsonseq-bad-last-10mb | 3244 | 23256 | 7.17x | 832 | 15412 | 18.52x |
-| seq_field_bad_last | jsonseq-bad-last-100mb | 3024 | 151128 | 49.98x | 832 | 143400 | 172.36x |
-| users_slurpfile | users-1mb | 9128 | 17640 | 1.93x | 6940 | 7824 | 1.13x |
-| users_slurpfile | users-10mb | 64228 | 80244 | 1.25x | 62000 | 73824 | 1.19x |
-| ndjson_slurpfile | ndjson-1mb | 12524 | 21904 | 1.75x | 10400 | 12640 | 1.22x |
-| ndjson_slurpfile | ndjson-10mb | 96088 | 124932 | 1.30x | 93736 | 118632 | 1.27x |
-| users_rawfile | users-1mb | 3512 | 11640 | 3.31x | 1484 | 1596 | 1.08x |
-| users_rawfile | users-10mb | 10240 | 17592 | 1.72x | 8360 | 7660 | 0.92x |
-| users_rawfile | users-100mb | 133040 | 80084 | 0.60x | 131004 | 70176 | 0.54x |
-| args_many | none | 3052 | 11652 | 3.82x | 840 | 960 | 1.14x |
-| corpus_npm_deps | corpus-npm | 3160 | 13308 | 4.21x | 836 | 940 | 1.12x |
-| corpus_npm_scripts | corpus-npm | 3292 | 12696 | 3.86x | 836 | 940 | 1.12x |
-| corpus_charts_titles | corpus-charts | 3012 | 10648 | 3.54x | 836 | 940 | 1.12x |
-| corpus_openapi_definitions | corpus-openapi | 3072 | 10904 | 3.55x | 836 | 940 | 1.12x |
-| corpus_openapi_strings | corpus-openapi | 3240 | 11992 | 3.70x | 836 | 1024 | 1.22x |
-| corpus_openapi_refs | corpus-openapi | 3216 | 14228 | 4.42x | 836 | 1096 | 1.31x |
-| corpus_openapi_paths | corpus-openapi | 3056 | 11700 | 3.83x | 840 | 1132 | 1.35x |
+| startup | none | 3192 | 9648 | 3.02x | 832 | 944 | 1.13x |
+| identity | users-1mb | 9368 | 11428 | 1.22x | 6916 | 2868 | 0.41x |
+| identity | users-10mb | 70148 | 28328 | 0.40x | 67864 | 19952 | 0.29x |
+| identity | users-100mb | 679596 | 204136 | 0.30x | 677348 | 195588 | 0.29x |
+| identity | numbers-1mb | 11224 | 11944 | 1.06x | 8900 | 3432 | 0.39x |
+| identity | numbers-10mb | 89516 | 33960 | 0.38x | 87528 | 25384 | 0.29x |
+| identity | numbers-100mb | 876076 | 253864 | 0.29x | 873864 | 245264 | 0.28x |
+| identity | strings-1mb | 3728 | 11400 | 3.06x | 1452 | 2840 | 1.96x |
+| identity | strings-10mb | 15476 | 29608 | 1.91x | 13040 | 21032 | 1.61x |
+| identity | strings-100mb | 133668 | 209884 | 1.57x | 131396 | 201676 | 1.53x |
+| identity | wide-1mb | 18776 | 13064 | 0.70x | 16580 | 4576 | 0.28x |
+| identity | wide-10mb | 146768 | 43420 | 0.30x | 144676 | 35008 | 0.24x |
+| identity | wide-100mb | 1380428 | 266732 | 0.19x | 1378556 | 258296 | 0.19x |
+| identity | nested-1mb | 5236 | 11716 | 2.24x | 2884 | 3176 | 1.10x |
+| identity | nested-10mb | 23464 | 31912 | 1.36x | 21316 | 23276 | 1.09x |
+| identity | nested-100mb | 207784 | 233384 | 1.12x | 205636 | 224956 | 1.09x |
+| identity | comprehensive-1mb | 17828 | 12712 | 0.71x | 15700 | 3864 | 0.25x |
+| identity | comprehensive-10mb | 153400 | 38504 | 0.25x | 151044 | 30116 | 0.20x |
+| identity | comprehensive-100mb | 1485156 | 301988 | 0.20x | 1483040 | 293356 | 0.20x |
+| identity | corpus-charts | 3220 | 9616 | 2.99x | 828 | 940 | 1.14x |
+| identity | corpus-npm | 2972 | 9436 | 3.17x | 832 | 940 | 1.13x |
+| identity | corpus-openapi | 3220 | 9640 | 2.99x | 836 | 940 | 1.12x |
+| identity_compact | users-1mb | 9280 | 9944 | 1.07x | 6916 | 1700 | 0.25x |
+| identity_compact | users-10mb | 70024 | 17360 | 0.25x | 67864 | 9160 | 0.13x |
+| identity_compact | users-100mb | 679484 | 94908 | 0.14x | 677348 | 86640 | 0.13x |
+| identity_compact | numbers-1mb | 11088 | 10088 | 0.91x | 8900 | 2096 | 0.24x |
+| identity_compact | numbers-10mb | 89752 | 20616 | 0.23x | 87536 | 12388 | 0.14x |
+| identity_compact | numbers-100mb | 875908 | 124328 | 0.14x | 873864 | 116220 | 0.13x |
+| identity_compact | strings-1mb | 3740 | 10156 | 2.72x | 1456 | 1972 | 1.35x |
+| identity_compact | strings-10mb | 15444 | 19624 | 1.27x | 13036 | 11652 | 0.89x |
+| identity_compact | strings-100mb | 133816 | 116124 | 0.87x | 131396 | 107972 | 0.82x |
+| identity_compact | wide-1mb | 18796 | 12200 | 0.65x | 16580 | 4016 | 0.24x |
+| identity_compact | wide-10mb | 147024 | 35744 | 0.24x | 144676 | 27892 | 0.19x |
+| identity_compact | wide-100mb | 1380728 | 247152 | 0.18x | 1378556 | 238596 | 0.17x |
+| identity_compact | nested-1mb | 5092 | 10408 | 2.04x | 2888 | 2164 | 0.75x |
+| identity_compact | nested-10mb | 23660 | 21416 | 0.91x | 21316 | 13112 | 0.62x |
+| identity_compact | nested-100mb | 208000 | 130524 | 0.63x | 205636 | 122556 | 0.60x |
+| identity_compact | comprehensive-1mb | 18140 | 11720 | 0.65x | 15696 | 2876 | 0.18x |
+| identity_compact | comprehensive-10mb | 153200 | 29040 | 0.19x | 151044 | 20352 | 0.13x |
+| identity_compact | comprehensive-100mb | 1485352 | 202020 | 0.14x | 1483040 | 193436 | 0.13x |
+| identity_compact | corpus-charts | 3068 | 9612 | 3.13x | 832 | 940 | 1.13x |
+| identity_compact | corpus-npm | 3016 | 9644 | 3.20x | 832 | 940 | 1.13x |
+| identity_compact | corpus-openapi | 3072 | 9692 | 3.15x | 836 | 944 | 1.13x |
+| users_field | users-1mb | 8448 | 10920 | 1.29x | 6256 | 1700 | 0.27x |
+| users_field | users-10mb | 63360 | 18388 | 0.29x | 61308 | 9164 | 0.15x |
+| users_field | users-100mb | 614112 | 95696 | 0.16x | 611808 | 86640 | 0.14x |
+| users_length | users-1mb | 8648 | 11732 | 1.36x | 6448 | 2052 | 0.32x |
+| users_length | users-10mb | 66288 | 20952 | 0.32x | 63996 | 11476 | 0.18x |
+| users_length | users-100mb | 637184 | 118440 | 0.19x | 634880 | 108612 | 0.17x |
+| users_names | users-1mb | 8532 | 10912 | 1.28x | 6252 | 1700 | 0.27x |
+| users_names | users-10mb | 63504 | 18376 | 0.29x | 61308 | 9160 | 0.15x |
+| users_names | users-100mb | 614160 | 95912 | 0.16x | 611808 | 86636 | 0.14x |
+| users_map_select | users-1mb | 8808 | 13224 | 1.50x | 6404 | 2580 | 0.40x |
+| users_map_select | users-10mb | 64796 | 27544 | 0.43x | 62420 | 16936 | 0.27x |
+| users_map_select | users-100mb | 624116 | 173976 | 0.28x | 622128 | 163228 | 0.26x |
+| users_sort_by | users-1mb | 9348 | 13736 | 1.47x | 7024 | 3544 | 0.50x |
+| users_sort_by | users-10mb | 72880 | 39984 | 0.55x | 70572 | 29744 | 0.42x |
+| users_group_by | users-1mb | 9364 | 13528 | 1.44x | 6988 | 3432 | 0.49x |
+| users_group_by | users-10mb | 71024 | 38504 | 0.54x | 68984 | 28648 | 0.42x |
+| users_unique_by | users-1mb | 9468 | 13732 | 1.45x | 6992 | 3544 | 0.51x |
+| users_unique_by | users-10mb | 71232 | 40060 | 0.56x | 68984 | 29744 | 0.43x |
+| users_reduce | users-1mb | 8324 | 12996 | 1.56x | 6256 | 1700 | 0.27x |
+| users_reduce | users-10mb | 63536 | 20364 | 0.32x | 61308 | 9160 | 0.15x |
+| users_reduce | users-100mb | 613968 | 98188 | 0.16x | 611808 | 86636 | 0.14x |
+| users_to_entries | users-1mb | 8464 | 13464 | 1.59x | 6264 | 1700 | 0.27x |
+| users_to_entries | users-10mb | 63516 | 20440 | 0.32x | 61312 | 9160 | 0.15x |
+| users_to_entries | users-100mb | 613956 | 98004 | 0.16x | 611816 | 86636 | 0.14x |
+| users_csv | users-1mb | 8672 | 11676 | 1.35x | 6480 | 1700 | 0.26x |
+| users_csv | users-10mb | 65856 | 19132 | 0.29x | 63496 | 9156 | 0.14x |
+| users_csv | users-100mb | 635924 | 96920 | 0.15x | 633656 | 86636 | 0.14x |
+| users_regex | users-1mb | 8640 | 14588 | 1.69x | 6332 | 2588 | 0.41x |
+| users_regex | users-10mb | 64188 | 28892 | 0.45x | 61728 | 16920 | 0.27x |
+| users_ascii_downcase | users-1mb | 9096 | 13572 | 1.49x | 6700 | 2596 | 0.39x |
+| users_ascii_downcase | users-10mb | 68400 | 29708 | 0.43x | 66236 | 18812 | 0.28x |
+| users_ascii_downcase | users-100mb | 657712 | 195608 | 0.30x | 655492 | 184720 | 0.28x |
+| users_first_early_exit | users-1mb | 8568 | 11624 | 1.36x | 6268 | 1704 | 0.27x |
+| users_first_early_exit | users-10mb | 63300 | 19084 | 0.30x | 61316 | 9164 | 0.15x |
+| users_first_early_exit | users-100mb | 614148 | 96216 | 0.16x | 611816 | 86636 | 0.14x |
+| users_limit_early_exit | users-1mb | 8436 | 11944 | 1.42x | 6264 | 1700 | 0.27x |
+| users_limit_early_exit | users-10mb | 63564 | 19368 | 0.30x | 61312 | 9160 | 0.15x |
+| users_limit_early_exit | users-100mb | 614088 | 96976 | 0.16x | 611816 | 86640 | 0.14x |
+| users_assign_update | users-1mb | 8564 | 19112 | 2.23x | 6268 | 8272 | 1.32x |
+| users_assign_update | users-10mb | 63504 | 88532 | 1.39x | 61316 | 77804 | 1.27x |
+| users_del | users-1mb | 8696 | 19112 | 2.20x | 6464 | 8128 | 1.26x |
+| users_del | users-10mb | 66316 | 86496 | 1.30x | 64012 | 75616 | 1.18x |
+| users_paths | users-1mb | 13892 | 23708 | 1.71x | 11524 | 13368 | 1.16x |
+| users_paths | users-10mb | 120668 | 138408 | 1.15x | 118612 | 129144 | 1.09x |
+| users_tojson_roundtrip | users-1mb | 10100 | 18844 | 1.87x | 7568 | 8904 | 1.18x |
+| users_tojson_roundtrip | users-10mb | 76988 | 92356 | 1.20x | 74584 | 82400 | 1.10x |
+| users_walk | users-1mb | 11416 | 26380 | 2.31x | 9136 | 15532 | 1.70x |
+| users_walk | users-10mb | 91968 | 161420 | 1.76x | 89740 | 150524 | 1.68x |
+| users_slurp | users-1mb | 8444 | 11688 | 1.38x | 6260 | 2136 | 0.34x |
+| users_slurp | users-10mb | 63496 | 22344 | 0.35x | 61308 | 14384 | 0.23x |
+| users_stream | users-1mb | 3180 | 12728 | 4.00x | 840 | 1024 | 1.22x |
+| users_stream | users-10mb | 3196 | 12944 | 4.05x | 840 | 1020 | 1.21x |
+| numbers_add | numbers-1mb | 8372 | 13972 | 1.67x | 5920 | 4352 | 0.74x |
+| numbers_add | numbers-10mb | 56816 | 43944 | 0.77x | 54772 | 34360 | 0.63x |
+| numbers_add | numbers-100mb | 548424 | 344232 | 0.63x | 546292 | 334808 | 0.61x |
+| numbers_sort | numbers-1mb | 12152 | 22584 | 1.86x | 9856 | 12740 | 1.29x |
+| numbers_sort | numbers-10mb | 96400 | 109328 | 1.13x | 94216 | 99568 | 1.06x |
+| numbers_max | numbers-1mb | 8196 | 20136 | 2.46x | 5916 | 10508 | 1.78x |
+| numbers_max | numbers-10mb | 56964 | 108968 | 1.91x | 54768 | 99492 | 1.82x |
+| numbers_max | numbers-100mb | 548484 | 998876 | 1.82x | 546288 | 989736 | 1.81x |
+| numbers_map_floor | numbers-1mb | 10568 | 19624 | 1.86x | 8320 | 9776 | 1.18x |
+| numbers_map_floor | numbers-10mb | 80236 | 98664 | 1.23x | 77848 | 88976 | 1.14x |
+| numbers_map_floor | numbers-100mb | 714584 | 890456 | 1.25x | 712516 | 880944 | 1.24x |
+| strings_length | strings-1mb | 3808 | 13056 | 3.43x | 1656 | 2848 | 1.72x |
+| strings_length | strings-10mb | 17828 | 29396 | 1.65x | 15804 | 19924 | 1.26x |
+| strings_length | strings-100mb | 165100 | 199632 | 1.21x | 162916 | 190004 | 1.17x |
+| strings_upcase | strings-1mb | 4808 | 14784 | 3.07x | 2756 | 3468 | 1.26x |
+| strings_upcase | strings-10mb | 28032 | 40048 | 1.43x | 25924 | 28968 | 1.12x |
+| strings_upcase | strings-100mb | 262976 | 294628 | 1.12x | 260908 | 283368 | 1.09x |
+| strings_split | strings-1mb | 4012 | 13320 | 3.32x | 1656 | 2912 | 1.76x |
+| strings_split | strings-10mb | 17996 | 29524 | 1.64x | 15804 | 19976 | 1.26x |
+| strings_test | strings-1mb | 4096 | 14304 | 3.49x | 1684 | 2912 | 1.73x |
+| strings_test | strings-10mb | 18112 | 31068 | 1.72x | 15832 | 19984 | 1.26x |
+| wide_keys | wide-1mb | 18936 | 12452 | 0.66x | 16576 | 3116 | 0.19x |
+| wide_keys | wide-10mb | 146788 | 31120 | 0.21x | 144664 | 21748 | 0.15x |
+| wide_keys | wide-100mb | 1380612 | 193188 | 0.14x | 1378556 | 183728 | 0.13x |
+| wide_to_entries | wide-1mb | 50972 | 65472 | 1.28x | 48696 | 55832 | 1.15x |
+| wide_to_entries | wide-10mb | 444744 | 523416 | 1.18x | 442684 | 513924 | 1.16x |
+| wide_map_values | wide-1mb | 22384 | 46960 | 2.10x | 20172 | 35312 | 1.75x |
+| wide_map_values | wide-10mb | 172308 | 332556 | 1.93x | 170000 | 320972 | 1.89x |
+| wide_add_values | wide-1mb | 19040 | 28352 | 1.49x | 16896 | 18580 | 1.10x |
+| wide_add_values | wide-10mb | 158028 | 178152 | 1.13x | 155844 | 168296 | 1.08x |
+| wide_add_values | wide-100mb | 1363724 | 1583176 | 1.16x | 1361736 | 1573324 | 1.16x |
+| wide_with_entries | wide-1mb | 76984 | 109444 | 1.42x | 74708 | 97612 | 1.31x |
+| wide_with_entries | wide-10mb | 693944 | 862576 | 1.24x | 691632 | 850500 | 1.23x |
+| nested_paths | nested-1mb | 5248 | 12236 | 2.33x | 2760 | 2164 | 0.78x |
+| nested_paths | nested-10mb | 23672 | 23472 | 0.99x | 21432 | 13112 | 0.61x |
+| nested_recurse | nested-1mb | 5280 | 12504 | 2.37x | 2948 | 2164 | 0.73x |
+| nested_recurse | nested-10mb | 23692 | 23252 | 0.98x | 21332 | 13116 | 0.61x |
+| comprehensive_paths | comprehensive-1mb | 30780 | 44052 | 1.43x | 28400 | 33820 | 1.19x |
+| comprehensive_paths | comprehensive-10mb | 276996 | 334784 | 1.21x | 274992 | 324556 | 1.18x |
+| comprehensive_tostream | comprehensive-1mb | 39796 | 74664 | 1.88x | 37624 | 64240 | 1.71x |
+| comprehensive_tostream | comprehensive-10mb | 367300 | 631768 | 1.72x | 365344 | 620932 | 1.70x |
+| comprehensive_numbers | comprehensive-1mb | 17496 | 31952 | 1.83x | 15048 | 21808 | 1.45x |
+| comprehensive_numbers | comprehensive-10mb | 148724 | 214388 | 1.44x | 146500 | 204136 | 1.39x |
+| ndjson_identity | ndjson-1mb | 3032 | 10436 | 3.44x | 832 | 2276 | 2.74x |
+| ndjson_identity | ndjson-10mb | 3228 | 21156 | 6.55x | 836 | 12976 | 15.52x |
+| ndjson_identity | ndjson-100mb | 3176 | 127880 | 40.26x | 836 | 119596 | 143.06x |
+| ndjson_field | ndjson-1mb | 3064 | 10664 | 3.48x | 832 | 2272 | 2.73x |
+| ndjson_field | ndjson-10mb | 3040 | 21416 | 7.04x | 832 | 12976 | 15.60x |
+| ndjson_field | ndjson-100mb | 3164 | 127892 | 40.42x | 832 | 119600 | 143.75x |
+| ndjson_select | ndjson-1mb | 3032 | 12712 | 4.19x | 840 | 2276 | 2.71x |
+| ndjson_select | ndjson-10mb | 3132 | 23452 | 7.49x | 840 | 12976 | 15.45x |
+| ndjson_select | ndjson-100mb | 3184 | 129752 | 40.75x | 840 | 119596 | 142.38x |
+| ndjson_tsv | ndjson-1mb | 3032 | 11944 | 3.94x | 840 | 2272 | 2.70x |
+| ndjson_tsv | ndjson-10mb | 3140 | 22736 | 7.24x | 836 | 12976 | 15.52x |
+| ndjson_tsv | ndjson-100mb | 3020 | 129448 | 42.86x | 844 | 119600 | 141.71x |
+| ndjson_slurp | ndjson-1mb | 12288 | 15064 | 1.23x | 10016 | 3604 | 0.36x |
+| ndjson_slurp | ndjson-10mb | 99804 | 39904 | 0.40x | 97532 | 28432 | 0.29x |
+| ndjson_inputs_reduce | ndjson-1mb | 3060 | 13784 | 4.50x | 844 | 2172 | 2.57x |
+| ndjson_inputs_reduce | ndjson-10mb | 3044 | 22952 | 7.54x | 836 | 11436 | 13.68x |
+| ndjson_inputs_reduce | ndjson-100mb | 3060 | 115112 | 37.62x | 844 | 103592 | 122.74x |
+| ndjson_inputs_first | ndjson-1mb | 3236 | 12476 | 3.86x | 832 | 1208 | 1.45x |
+| ndjson_inputs_first | ndjson-10mb | 3028 | 12428 | 4.10x | 828 | 1204 | 1.45x |
+| ndjson_inputs_first | ndjson-100mb | 3208 | 12456 | 3.88x | 832 | 1208 | 1.45x |
+| ndjson_raw_lines | ndjson-1mb | 3048 | 9832 | 3.23x | 836 | 1972 | 2.36x |
+| ndjson_raw_lines | ndjson-10mb | 3048 | 19164 | 6.29x | 836 | 11184 | 13.38x |
+| ndjson_raw_lines | ndjson-100mb | 3224 | 111272 | 34.51x | 836 | 103344 | 123.62x |
+| ndjson_raw_fromjson | ndjson-1mb | 3172 | 10664 | 3.36x | 832 | 1968 | 2.37x |
+| ndjson_raw_fromjson | ndjson-10mb | 3052 | 19868 | 6.51x | 836 | 11184 | 13.38x |
+| ndjson_raw_slurp | ndjson-1mb | 4104 | 10444 | 2.54x | 1860 | 2644 | 1.42x |
+| ndjson_raw_slurp | ndjson-10mb | 20428 | 28840 | 1.41x | 18064 | 21368 | 1.18x |
+| ndjson_raw_slurp | ndjson-100mb | 141072 | 213200 | 1.51x | 138852 | 205480 | 1.48x |
+| ndjson_three_files | ndjson-1mb | 3056 | 12680 | 4.15x | 836 | 4212 | 5.04x |
+| ndjson_three_files | ndjson-10mb | 3188 | 41872 | 13.13x | 836 | 33420 | 39.98x |
+| users_three_files | users-1mb | 8572 | 12456 | 1.45x | 6268 | 3004 | 0.48x |
+| users_three_files | users-10mb | 63912 | 32168 | 0.50x | 61656 | 22604 | 0.37x |
+| seq_identity | jsonseq-1mb | 3200 | 10664 | 3.33x | 840 | 2276 | 2.71x |
+| seq_identity | jsonseq-10mb | 3200 | 21352 | 6.67x | 836 | 12964 | 15.51x |
+| seq_identity | jsonseq-100mb | 3224 | 127656 | 39.60x | 836 | 119448 | 142.88x |
+| seq_field | jsonseq-1mb | 3236 | 10912 | 3.37x | 832 | 2276 | 2.74x |
+| seq_field | jsonseq-10mb | 3212 | 21416 | 6.67x | 832 | 12964 | 15.58x |
+| seq_field | jsonseq-100mb | 3016 | 127912 | 42.41x | 832 | 119448 | 143.57x |
+| seq_slurp | jsonseq-1mb | 12192 | 14980 | 1.23x | 9916 | 3576 | 0.36x |
+| seq_slurp | jsonseq-10mb | 98820 | 40000 | 0.40x | 96632 | 28212 | 0.29x |
+| users_seq_output | users-1mb | 3048 | 9608 | 3.15x | 832 | 1600 | 1.92x |
+| users_seq_output | users-10mb | 3088 | 15272 | 4.95x | 832 | 7664 | 9.21x |
+| seq_field_bad_first | jsonseq-bad-first-1mb | 3248 | 11144 | 3.43x | 836 | 2492 | 2.98x |
+| seq_field_bad_first | jsonseq-bad-first-10mb | 3212 | 23184 | 7.22x | 836 | 15404 | 18.43x |
+| seq_field_bad_first | jsonseq-bad-first-100mb | 3048 | 150764 | 49.46x | 832 | 143392 | 172.35x |
+| seq_field_bad_last | jsonseq-bad-last-1mb | 3040 | 10904 | 3.59x | 832 | 2480 | 2.98x |
+| seq_field_bad_last | jsonseq-bad-last-10mb | 3220 | 23400 | 7.27x | 832 | 15416 | 18.53x |
+| seq_field_bad_last | jsonseq-bad-last-100mb | 3056 | 150948 | 49.39x | 832 | 143384 | 172.34x |
+| users_slurpfile | users-1mb | 9448 | 17656 | 1.87x | 6944 | 7936 | 1.14x |
+| users_slurpfile | users-10mb | 64252 | 80260 | 1.25x | 61996 | 73992 | 1.19x |
+| ndjson_slurpfile | ndjson-1mb | 12664 | 22080 | 1.74x | 10400 | 12648 | 1.22x |
+| ndjson_slurpfile | ndjson-10mb | 95900 | 124892 | 1.30x | 93736 | 118724 | 1.27x |
+| users_rawfile | users-1mb | 3836 | 11684 | 3.05x | 1488 | 1588 | 1.07x |
+| users_rawfile | users-10mb | 10144 | 17116 | 1.69x | 8248 | 7660 | 0.93x |
+| users_rawfile | users-100mb | 133044 | 79816 | 0.60x | 131328 | 70172 | 0.53x |
+| args_many | none | 3176 | 11432 | 3.60x | 844 | 960 | 1.14x |
+| corpus_npm_deps | corpus-npm | 3184 | 12944 | 4.07x | 836 | 940 | 1.12x |
+| corpus_npm_scripts | corpus-npm | 3192 | 12360 | 3.87x | 836 | 936 | 1.12x |
+| corpus_charts_titles | corpus-charts | 3216 | 10408 | 3.24x | 836 | 940 | 1.12x |
+| corpus_openapi_definitions | corpus-openapi | 3236 | 10920 | 3.37x | 832 | 940 | 1.13x |
+| corpus_openapi_strings | corpus-openapi | 3016 | 12032 | 3.99x | 836 | 1016 | 1.22x |
+| corpus_openapi_refs | corpus-openapi | 3236 | 14244 | 4.40x | 836 | 1132 | 1.35x |
+| corpus_openapi_paths | corpus-openapi | 2952 | 11432 | 3.87x | 836 | 1132 | 1.35x |
 
 ## Reproduce
 
@@ -809,4 +913,4 @@ cargo build --release --features bench-runner
 ./target/release/succinctly dev compare jq --full
 ```
 
-manifest sha256 `9eb8d9dc87a452467a8cd4aeabe9a3b25c1145a27a984127d8ba3887e4a9da5e` · succinctly sha256 `915d4ff9ba305a9724e9322b694642cebaf59d7225505d8781ef04b08aa9ba41` · jq sha256 `467f468e72977663cbeee7f9df4462f7777b3af7eaece6c7f8640fe7f58c3817`
+manifest sha256 `418740d657b01a3f754eb1625a8591a8fa31b44f73b6d6eaf10869ac5daf5ea3` · succinctly sha256 `8d5805d575b53b2c1f2a9d993b017fa31465cbe66e3c7c58478fcb3dae6b9af4` · jq sha256 `467f468e72977663cbeee7f9df4462f7777b3af7eaece6c7f8640fe7f58c3817`
