@@ -1177,6 +1177,12 @@ pub mod alias_identity {
         /// `(anchor definition path, [alias paths...])`, one entry per anchor
         /// that has at least one alias — the shape `sync_aliased_paths` takes.
         groups: Vec<(Vec<OwnedValue>, Vec<Vec<OwnedValue>>)>,
+        /// The index in `groups` of the first group holding each alias position (as
+        /// [`position_key`] spells it), so a path prefix finds its anchor without a scan of every
+        /// alias: a fan-out over N aliases asked each of its N paths that question (#6839).
+        alias_group: std::collections::HashMap<Vec<u8>, usize>,
+        /// Every proper prefix of an alias position, the root included.
+        alias_prefixes: std::collections::HashSet<Vec<u8>>,
         /// The members a `<<` merge brought into a mapping (#6785).
         merged: Vec<MergedMember>,
         /// `merged` by the member's position (as [`position_key`] spells it), so a path prefix
@@ -1190,8 +1196,30 @@ pub mod alias_identity {
         /// Builds a table from `collect_alias_groups`'s output. Paths are
         /// plain `String`/`Int` key sequences addressing the `OwnedValue` tree.
         pub fn from_groups(groups: Vec<(Vec<OwnedValue>, Vec<Vec<OwnedValue>>)>) -> Self {
+            let mut alias_group = std::collections::HashMap::new();
+            let mut alias_prefixes = std::collections::HashSet::new();
+            for (idx, (_, aliases)) in groups.iter().enumerate() {
+                for alias in aliases {
+                    // A position of string and index steps, which is all the document walk
+                    // produces.
+                    let Some(key) = position_key(alias) else {
+                        continue;
+                    };
+                    alias_group.entry(key).or_insert(idx);
+                    let mut prefix = Vec::new();
+                    alias_prefixes.insert(prefix.clone());
+                    for step in &alias[..alias.len().saturating_sub(1)] {
+                        if push_step_key(&mut prefix, step).is_none() {
+                            break;
+                        }
+                        alias_prefixes.insert(prefix.clone());
+                    }
+                }
+            }
             Self {
                 groups,
+                alias_group,
+                alias_prefixes,
                 merged: Vec::new(),
                 merged_by_member: std::collections::HashMap::new(),
                 merged_prefixes: std::collections::HashSet::new(),
@@ -1235,23 +1263,17 @@ pub mod alias_identity {
 
         /// The anchor path this exact alias position resolves to, if any.
         fn anchor_for(&self, prefix: &[OwnedValue]) -> Option<&[OwnedValue]> {
-            self.groups.iter().find_map(|(def, aliases)| {
-                aliases
-                    .iter()
-                    .any(|a| a.as_slice() == prefix)
-                    .then_some(def.as_slice())
-            })
+            // A prefix is built from field and index steps, the only ones with a key.
+            let idx = self.alias_group.get(&position_key(prefix)?)?;
+            Some(self.groups[*idx].0.as_slice())
         }
 
         /// Whether any alias position lies strictly *below* `prefix` — the
         /// only case in which fanning an `Iterate` out into per-element
         /// paths can change what a write does.
         fn has_alias_under(&self, prefix: &[OwnedValue]) -> bool {
-            self.groups.iter().any(|(_, aliases)| {
-                aliases
-                    .iter()
-                    .any(|a| a.len() > prefix.len() && a[..prefix.len()] == *prefix)
-            }) || self.has_merged_under(prefix)
+            position_key(prefix).is_some_and(|key| self.alias_prefixes.contains(&key))
+                || self.has_merged_under(prefix)
         }
 
         fn hop_bound(&self) -> usize {
@@ -99253,13 +99275,10 @@ fn propagate_anchor_writes(
                 if !get_value_at_path(post, alias).is_some_and(|v| v.identical(want)) {
                     continue;
                 }
-                // The alias slots are named by string and index components
-                // only, so the mode `set_value_at_path` is told never decides
-                // anything here (#3506 added the one arm that reads it).
-                if let Ok(updated) =
-                    set_value_at_path::<JqSemantics>(post.clone(), alias, new.clone())
-                {
-                    *post = updated;
+                // The slot resolved a moment ago (the comparison above), so it is replaced in
+                // place: rebuilding the document around it copied the containers on the way to
+                // it once per alias, which made a fan-out over N aliases quadratic (#6839).
+                if replace_existing_at_path(post, alias, new.clone()) {
                     expected[g][a] = Some(new.clone());
                     changed = true;
                 }
