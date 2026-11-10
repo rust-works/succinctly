@@ -3195,6 +3195,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         }
 
         match self.text[effective_pos] {
+            // #6889: a block collection begins where its first key does, so a quoted key there is
+            // the key's quote, not the collection's style (yq answers `""` for the mapping).
+            b'"' | b'\'' if self.is_container() => "",
             b'"' => "double",
             b'\'' => "single",
             b'|' => "literal",
