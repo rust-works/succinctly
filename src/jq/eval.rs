@@ -11167,7 +11167,34 @@ pub(crate) fn eval_owned_count_door<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
 ) -> Option<OwnedValue> {
-    eval_owned_length(expr, input).or_else(|| eval_owned_string_door::<S>(expr, input))
+    eval_owned_length(expr, input)
+        .or_else(|| eval_owned_string_door::<S>(expr, input))
+        .or_else(|| eval_owned_def_call_count::<S>(expr, input))
+}
+
+/// A call to a user `def` with no parameters whose body the count doors answer
+/// (`def f: length; ... | f`), answered from the owned value as the body written inline is
+/// (#6833). The call is its own door: it is not a closed-grammar stage, so the pipe that holds
+/// it sent every call through the re-index bridge, which writes the whole value out as text and
+/// indexes it again to take its length (0.85 s against 0.07 s for the inline `length`, over a
+/// 7 MB string called 100 times).
+///
+/// The body is read as the definition holds it, with no binding step and no frame charged: the
+/// doors answer only a body made of a literal, `.` and the builtins they know, which cannot call
+/// anything, recurse or raise, so there is no depth to guard and no argument to substitute. A
+/// body that is itself a call (`def f: g;`), one with a parameter, and every other shape
+/// decline, and the evaluator keeps them. The answer is a fresh value, as the count doors' are.
+fn eval_owned_def_call_count<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    let Expr::DefCall { def, args, .. } = unwrap_paren(expr) else {
+        return None;
+    };
+    if !def.params.is_empty() || !args.is_empty() {
+        return None;
+    }
+    eval_owned_length(&def.body, input).or_else(|| eval_owned_string_door::<S>(&def.body, input))
 }
 
 /// `map(.a)`, `map(.a.b)`, `map(.[0])` over an owned array, answered from the tree instead of
@@ -14811,8 +14838,11 @@ fn closed_pipe_to_owned<S: EvalSemantics>(
                 // (`$t | length > 3`), or its prefix test, is read off the string: the
                 // answer is a fresh integer, boolean or `null`, never a node of it.
                 // jq mode only, like `closed_unary_builtin`.
+                // #6833: or a call to a parameterless `def` whose body is such a stage.
                 None if S::TAG == EvalTag::Jq => {
-                    eval_owned_string_door::<S>(unwrap_paren(stage), current)?
+                    let stage = unwrap_paren(stage);
+                    eval_owned_string_door::<S>(stage, current)
+                        .or_else(|| eval_owned_def_call_count::<S>(stage, current))?
                 }
                 None => return None,
             },
@@ -179248,6 +179278,72 @@ mod touched_edge_cases_2999 {
                 render(object_from_pairs::<YqSemantics>(pairs(rows)).unwrap()),
                 yq,
                 "yq: {rows:?}"
+            );
+        }
+    }
+
+    /// #6833: a call to a `def` with no parameters whose body is a string's `length` costs what the
+    /// `length` written inline costs, in the stages that hold a bound computed string: it used to
+    /// write the string out and index it again once per call. `reindex_count` counts every
+    /// serialize-and-index of an `OwnedValue`. The answers are the same, and a `def` the door
+    /// declines (a parameter) still takes the bridge once per call, so the counter is not one that
+    /// reads zero for everything.
+    #[test]
+    fn a_parameterless_def_of_length_is_answered_from_the_string_6833() {
+        use crate::jq::value::reindex_count;
+        fn run<S: EvalSemantics>(filter: &str) -> (String, usize) {
+            let expr = parse(filter).expect("filter parses");
+            let doc = alloc::rc::Rc::new(
+                OwnedValue::String("h\u{e9}llo".into())
+                    .reindexed_without_provenance::<JqSemantics>()
+                    .expect("shallow"),
+            );
+            let before = reindex_count::get();
+            let answer = eval::<Vec<u64>, S>(&expr, doc.root())
+                .collect_owned::<S>()
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect::<Vec<_>>()
+                .join(" ");
+            (answer, reindex_count::get() - before)
+        }
+        // jq mode takes the range body (the bound-value route), both modes the `reduce` step.
+        let jq = |body: &str| {
+            run::<JqSemantics>(&format!(
+                "ascii_downcase | . as $t | [range(40) | ($t | {body})] | length"
+            ))
+        };
+        let reduce = |body: &str| {
+            format!("ascii_downcase | . as $t | reduce range(40) as $i (0; . + ($t | {body}))")
+        };
+        let (inline, inline_count) = jq("length");
+        assert_eq!(inline, "40");
+        let (called, called_count) = run::<JqSemantics>(
+            "def f: length; ascii_downcase | . as $t | [range(40) | ($t | f)] | length",
+        );
+        assert_eq!(called, "40");
+        assert!(
+            called_count <= inline_count,
+            "the call is answered from the string: {called_count} against {inline_count}"
+        );
+        let (bridged, bridged_count) = run::<JqSemantics>(
+            "def f(x): length; ascii_downcase | . as $t | [range(40) | ($t | f(1))] | length",
+        );
+        assert_eq!(bridged, "40");
+        assert!(
+            bridged_count >= inline_count + 40,
+            "a parameter keeps the bridge: {bridged_count} against {inline_count}"
+        );
+        for (name, run) in [
+            ("jq", run::<JqSemantics> as fn(&str) -> (String, usize)),
+            ("yq", run::<YqSemantics>),
+        ] {
+            let (inline, inline_count) = run(&reduce("length"));
+            let (called, called_count) = run(&format!("def f: length; {}", reduce("f")));
+            assert_eq!(called, inline, "{name}");
+            assert!(
+                called_count <= inline_count,
+                "{name}: {called_count} against {inline_count}"
             );
         }
     }
