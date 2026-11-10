@@ -6483,13 +6483,20 @@ impl<'a> YamlString<'a> {
         }
         // Skip indicator and modifiers to find the end of the indicator line
         let mut pos = indicator_pos + 1;
-        while pos < text.len() && !is_line_break(text[pos]) {
-            pos += 1;
+        if UNICODE {
+            // The header line ends at NEL, LS and PS too (#6820): `a: |<NEL>  x` has its text next.
+            while pos < text.len() && any_break_len(text, pos) == 0 {
+                pos += 1;
+            }
+        } else {
+            while pos < text.len() && !is_line_break(text[pos]) {
+                pos += 1;
+            }
         }
         if pos >= text.len() {
             return (pos, pos); // Empty block scalar
         }
-        pos += line_break_len(text, pos); // Skip the line break
+        pos += break_at::<UNICODE>(text, pos); // Skip the line break
 
         let content_start = pos;
 
@@ -14863,6 +14870,35 @@ mod tests {
             }
         }
         assert!(checked > 5000, "only {checked} agreeing cases");
+    }
+
+    /// #6820: a block scalar whose header line ends at NEL, LS or PS is listed in the index, like one
+    /// that holds the break in its body (#6369), and a header that ends at `\n` or `\r` is not, so a
+    /// document without the three pays nothing. The header's `|` is at offset 3 in every text below.
+    #[test]
+    fn a_header_that_ends_at_a_unicode_break_lists_the_scalar_6820() {
+        for (text, listed) in [
+            ("a: |\n  x\n", false),
+            ("a: |\r\n  x\n", false),
+            ("a: | # c\n  x\n", false),
+            ("a: |  \n  x\n", false),
+            ("a: |\u{85}  x\n", true),
+            ("a: |\u{2028}  x\n", true),
+            ("a: |\u{2029}  x\n", true),
+            ("a: | \u{85}  x\n", true),
+            ("a: | # c\u{2028}  x\n", true),
+            ("a: |-\u{85}  x\n", true),
+            // The em dash shares LS's lead bytes, and a no-break space NEL's: neither is a break.
+            ("a: | # \u{2014}\n  x\n", false),
+            ("a: | # \u{a0}\n  x\n", false),
+        ] {
+            let index = YamlIndex::build(text.as_bytes()).unwrap();
+            assert_eq!(
+                index.block_scalar_holds_unicode_break(3),
+                listed,
+                "{text:?}"
+            );
+        }
     }
 
     /// The folded decoder is reached through three different call paths; a fix

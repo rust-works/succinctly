@@ -8795,8 +8795,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         {
             after += 1;
         }
-        // NEL, LS and PS end the line to yq as `\n` does, which the index does not model (#4913):
-        // left accepted, as before, rather than refused for a value that is already wrong.
+        // NEL, LS and PS end the header line as `\n` does (#6820): the line is over there, and what
+        // follows is the scalar's own first line, which `skip_block_header_line` passes the break for.
         if !matches!(self.input.get(after), None | Some(b'\n' | b'\r' | b'#'))
             && self.unicode_break_len_at(after) == 0
         {
@@ -9197,6 +9197,32 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         self.pos = keep;
     }
 
+    /// Pass the rest of a block scalar's header line and its break (#6820). go-yaml ends the line at NEL,
+    /// LS and PS as at `\n`, so `a: |<NEL>  x` has its content on the same physical line; such a scalar
+    /// is listed like one that holds a Unicode break in its body (#6369), so the decoders end the header
+    /// at the same place. The common header ends right here, at the `\n`, and costs one look at a byte.
+    #[inline]
+    fn skip_block_header_line(&mut self) {
+        if !matches!(self.peek(), None | Some(b'\n' | b'\r')) {
+            // Blanks and a comment follow the indicators: a short walk, once per scalar.
+            let mut at = self.pos;
+            while at < self.input.len() && block_unicode::any_break_len(self.input, at) == 0 {
+                at += 1;
+            }
+            if matches!(self.input.get(at), Some(0xC2 | 0xE2)) {
+                self.unicode_block_scalars.push(self.block_header_pos);
+            }
+            self.pos = at;
+        }
+        if let Some(&b) = self.input.get(self.pos) {
+            if matches!(b, b'\n' | b'\r') {
+                self.skip_line_break();
+            } else {
+                self.advance_by(block_unicode::any_break_len(self.input, self.pos));
+            }
+        }
+    }
+
     /// Parse a block scalar (| or >) including all content lines.
     fn parse_block_scalar(&mut self, base_indent: usize) -> Result<(), YamlError> {
         self.block_header_pos = self.pos;
@@ -9215,8 +9241,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // precedes the header's own, as on a mapping key (see `take_pending_head_comment`).
         self.take_pending_head_comment(self.last_open_bp_pos);
         self.maybe_capture_line_comment(self.last_open_bp_pos);
-        self.skip_to_eol();
-        self.skip_line_break();
+        self.skip_block_header_line();
 
         // Determine content indentation
         let content_indent = if header.explicit_indent > 0 {
