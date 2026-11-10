@@ -7015,7 +7015,7 @@ does, and differs where one does not: `[.]`, `{"a": .}` and `. as $x | [$x]` pri
 prints a bare `-` / `a:`, `line` is `1` where yq has `0`, and `@yaml` is `null` where yq's is empty.
 `filename` is empty over it, as in yq ([#5721](https://github.com/rust-works/succinctly/issues/5721)).
 A result that is a document with no content (`# c`, an empty input) is written once, with no blank line after it, by `select`, `(.)` and `..` as by `.`.
-Under `-0` the line break the header ends in stays, and `select` and `..` add the NUL after it, where yq writes the NUL in place of that line break (`# c<NUL>`).
+Under `-0` the NUL replaces the line break the header ends in (`# c<NUL>`, and a lone NUL over an empty input), as in yq; with `--colors` a comment's span keeps its break, as yq's does.
 `--eval-all` over an empty input still differs: `select(true)` prints `null` for a blank line, and `.a, filename` writes a `---` between its results.
 Not covered: `--front-matter` on an empty input keeps its
 `no front matter found` error (yq prints `null`); `-` cannot be known to be empty before it is read, so an

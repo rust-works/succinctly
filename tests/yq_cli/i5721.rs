@@ -181,17 +181,75 @@ fn an_inplace_write_over_an_empty_file_sees_no_filename_5721() -> Result<()> {
     Ok(())
 }
 
-/// Under `-0` the NUL still ends a header-only result: only a line-break terminator is dropped
-/// after it, as the header already ends in one. (yq writes the NUL in place of that line break,
-/// `# c<NUL>`; here the header's line break stays, recorded in `limitations.md`.)
+/// Under `-0` the NUL replaces the line break a header-only result ends in (`# c<NUL>`, a lone
+/// NUL over the empty document), as in yq v4.53.3: a comment-only, `---`-only or empty document
+/// through every filter that keeps it, on the streaming routes and under `-P`.
 #[test]
-fn a_nul_terminator_still_follows_a_header_only_result_5721() -> Result<()> {
-    let dir = TempDir::new()?;
-    let comment = dir.path().join("c.yaml");
-    std::fs::write(&comment, "# c\n")?;
-    for filter in ["select(true)", ".."] {
-        let (out, _, code) = run_yq_files(filter, &[&comment], &["-0"])?;
-        assert_eq!((out.as_str(), code), ("# c\n\0", 0), "{filter}");
+fn a_nul_replaces_the_line_break_of_a_header_only_result_5721() -> Result<()> {
+    for (input, expected) in [
+        ("", "\0"),
+        ("\n", "\0"),
+        ("# c\n", "# c\0"),
+        ("# c\n# d\n", "# c\n# d\0"),
+        ("# c\n\n", "# c\n\0"),
+        ("---\n", "---\0"),
+        ("---\n# c\n", "---\n# c\0"),
+        ("# c\n---\n", "# c\n---\0"),
+        ("# c\n---\n# d\n", "# c\n---\n# d\0"),
+        ("# c\n---\na: 1\n", "# c\n---\na: 1\0"),
+    ] {
+        for filter in [".", "select(true)", "select(. == null)", "(.)", ".."] {
+            if filter == ".." && input.contains("a: 1") {
+                continue; // `..` also yields the child
+            }
+            if filter == "select(. == null)" && input.contains("a: 1") {
+                continue; // the document is a mapping, so nothing is kept
+            }
+            let (out, code) = run_yq_stdin(filter, input, &["-0"])?;
+            assert_eq!(
+                (out.as_str(), code),
+                (expected, 0),
+                "-0 {filter} over {input:?}"
+            );
+        }
+        let (out, code) = run_yq_stdin(".", input, &["-0", "-P"])?;
+        assert_eq!((out.as_str(), code), (expected, 0), "-0 -P over {input:?}");
+    }
+    Ok(())
+}
+
+/// Another result of the same document still gets its NUL after the header-only one, which lost
+/// its break: `# c<NUL>1<NUL>`.
+#[test]
+fn a_nul_still_follows_the_other_results_of_a_header_only_document_5721() -> Result<()> {
+    let (out, code) = run_yq_stdin("select(. == null), 1", "# c\n", &["-0"])?;
+    assert_eq!((out.as_str(), code), ("# c\x001\x00", 0));
+    Ok(())
+}
+
+/// With `--colors` a comment line is one colored span that holds its own break, so under `-0`
+/// the NUL follows the span; a `---` has no break inside its span and loses it, as plain output
+/// does.
+#[test]
+fn a_nul_after_a_colored_header_only_result_5721() -> Result<()> {
+    for (input, expected) in [
+        ("# c\n", "\u{1b}[90m# c\n\u{1b}[0m\0"),
+        ("---\n", "---\0"),
+        ("", "\0"),
+        ("---\n# c\n", "---\n\u{1b}[90m# c\n\u{1b}[0m\0"),
+    ] {
+        for (filter, extra) in [
+            (".", &["-0", "-C"][..]),
+            ("select(true)", &["-0", "-C"][..]),
+            (".", &["-0", "-C", "-P"][..]),
+        ] {
+            let (out, code) = run_yq_stdin(filter, input, extra)?;
+            assert_eq!(
+                (out.as_str(), code),
+                (expected, 0),
+                "{filter} {extra:?} over {input:?}"
+            );
+        }
     }
     Ok(())
 }

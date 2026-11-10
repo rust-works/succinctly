@@ -358,6 +358,16 @@ struct PendingSeparator<'a> {
     settled: bool,
 }
 
+/// Whether `-0` leaves the line break a header-only document ends in, where `header` is that
+/// header without the break (#5721). Uncolored, the NUL always replaces it. With `--colors` a
+/// comment line is one colored span that holds its own break (`ESC[90m# c<LF>ESC[0m<NUL>`), so
+/// it stays; the `---` marker has none inside its span. One definition for the streaming sink
+/// and the DOM route.
+fn header_break_stays(header: &str, colored: bool) -> bool {
+    let last_line = header.rsplit('\n').next().unwrap_or(header);
+    colored && last_line.trim_start().starts_with('#')
+}
+
 /// Per-result buffered writer used when `-0`/`--nul-output` is active
 /// (#1709). Buffers ONE streamed result's rendered text at a time -- not the
 /// whole document/stream. A per-*result* buffer keeps bounded, O(one result)
@@ -500,6 +510,22 @@ impl<W: Write> NulCheckedSink<'_, W> {
         }
     }
 
+    /// Takes back the line break that ends a header-only document's verbatim header, so the NUL
+    /// that follows replaces it rather than comes after it (#5721): yq writes `# c<NUL>` for
+    /// `-0` over `# c<LF>`, and a lone NUL over the empty document.
+    ///
+    /// With `--colors` a comment line is one colored span that holds its own break
+    /// (`ESC[90m# c<LF>ESC[0m<NUL>`), so that break stays; the `---` marker has none inside its
+    /// span and loses it like the uncolored header.
+    fn drop_header_break(&mut self) {
+        let Some(header) = self.buf.strip_suffix('\n') else {
+            return;
+        };
+        if header_break_stays(header, self.colorizer.is_some()) {
+            return;
+        }
+        self.buf.pop();
+    }
     /// [`Self::flush_body`] plus the real terminator -- the evaluated
     /// multi-result path's per-result hook, reached through
     /// [`ColorSink::write_result_terminator`].
@@ -529,6 +555,20 @@ impl<W: Write> ColorSink<'_, W> {
             ColorSink::Direct(_) => terminator.write_fmt(self),
             ColorSink::NulChecked(sink) => sink.flush_result(terminator),
         }
+    }
+
+    /// Ends a result that is a document with no content (#5721). Its verbatim header already
+    /// ends in a line break, so a line-break terminator writes nothing more; a NUL replaces that
+    /// break, as yq's does. Only the NUL-checked sink buffers a result, so it is the only one
+    /// that can take the break back; the others never carry a NUL terminator over YAML.
+    fn end_header_only_result(&mut self, terminator: Terminator) -> core::fmt::Result {
+        if terminator != Terminator::Nul {
+            return Ok(());
+        }
+        if let ColorSink::NulChecked(sink) = self {
+            sink.drop_header_break();
+        }
+        self.write_result_terminator(terminator)
     }
 }
 
@@ -9435,6 +9475,22 @@ fn output_value<W: Write>(
         } else {
             (body, String::new())
         };
+        // A document with no content at all (`# c`, a bare `---`) prints only the header it was
+        // written with, and that header's own last line break already ends it: the terminator on
+        // top would be a blank line yq never writes (#2875). The twin of the streaming route's
+        // `is_header_only_document` skip. Under `-0` the NUL replaces that break instead (#5721).
+        let header_only = matches!(value, OwnedValue::Null)
+            && comments.meta().spelling() == Some("")
+            && (!comments.meta().head_comment().is_empty() || comments.meta().preamble().is_some());
+        let mut leading = leading;
+        if header_only && config.nul_output && body.is_empty() && trailing.is_empty() {
+            if let Some(without_break) = leading.strip_suffix('\n') {
+                // With `--colors` a comment line is one span that holds its own break.
+                if !header_break_stays(without_break, config.use_color) {
+                    leading = without_break.to_string();
+                }
+            }
+        }
         for part in [&leading, &body, &trailing] {
             reject_nul_output(part, config)?;
         }
@@ -9455,14 +9511,7 @@ fn output_value<W: Write>(
                 }
             }
         }
-        // A document with no content at all (`# c`, a bare `---`) prints only the header
-        // it was written with, and that header's own last line break already ends it:
-        // the terminator on top would be a blank line yq never writes (#2875). The twin
-        // of the streaming route's `is_header_only_document` skip.
-        let header_only = matches!(value, OwnedValue::Null)
-            && comments.meta().spelling() == Some("")
-            && (!comments.meta().head_comment().is_empty() || comments.meta().preamble().is_some());
-        if !header_only {
+        if !header_only || config.nul_output {
             write_terminator(writer, config)?;
         }
         return Ok(());
@@ -12063,13 +12112,23 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                     // No result ended here -- the terminator is written
                     // directly to `$writer` below, after the colorizer has
                     // closed its last span (#1708).
+                    let header_only = $cursor.is_header_only_document();
                     let rendered = stream_maybe_colored(
                         $writer,
                         $use_color,
                         terminator,
                         nul_separator,
                         ColorSyntax::Yaml,
-                        |out| $cursor.stream_yaml_as_document(out, yaml_indent, sort_keys),
+                        |out| {
+                            $cursor.stream_yaml_as_document(out, yaml_indent, sort_keys)?;
+                            // #5721: under `-0` the NUL replaces the header's line break.
+                            if header_only && terminator == Terminator::Nul {
+                                if let ColorSink::NulChecked(sink) = out {
+                                    sink.drop_header_break();
+                                }
+                            }
+                            Ok(())
+                        },
                     )?;
                     // #1615: this identity/P9 branch skips evaluation, so it
                     // has no `StreamStats` to carry a diagnostic -- route the
@@ -12085,7 +12144,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                         // comment -- so adding this terminator on top would
                         // double-terminate it, printing a spurious blank
                         // line real yq never has.
-                        if !$cursor.is_header_only_document() {
+                        if !header_only || terminator == Terminator::Nul {
                             terminator.write_io($writer)?;
                         }
                         // Streaming skips evaluation, so inspect the document
@@ -12187,8 +12246,10 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                                         yaml_indent,
                                         sort_keys,
                                         // #5721: a header-only document's own line break ends
-                                        // it; a NUL terminator is not that line break.
-                                        terminator != Terminator::Nul,
+                                        // it; a NUL replaces that break.
+                                        Some(&mut |w: &mut ColorSink<'_, _>| {
+                                            w.end_header_only_result(terminator)
+                                        }),
                                         |w| w.write_result_terminator(terminator),
                                     )
                                     .map_err(StreamFailure::from)
