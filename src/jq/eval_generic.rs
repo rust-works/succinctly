@@ -33376,13 +33376,16 @@ fn collected_items_result<V: DocumentValue, S: EvalSemantics>(
         }
         | Flow::Escaped(control) => control,
     };
-    // #5505: a yq document answers all or nothing, so an error ends it and no consumer reads the
-    // outputs delivered before it. Converting each of them (a cursor to its whole subtree, for a
+    // #5505: a yq document answers all or nothing (`ERROR_DISCARDS_THE_OUTPUTS_BEFORE_IT`), so an
+    // error ends it and no consumer of this collection reads the outputs delivered before it: a
+    // `try`, `label` or `limit` over a walk reads them from the streaming route instead, which is
+    // not this function (`try W catch "c"` prints them, pinned in `tests/yq_cli/i5505.rs`).
+    // Converting each of them (a cursor to its whole subtree, for a
     // `recurse(f; cond)` walk) was most of the cost of a `cond` that raises late: 0.81 s and
     // 140 MB over 60,000 integers 120 levels deep, against 0.05 s and 25 MB for the same walk that
     // does not raise. Only an error: a `break` or a `halt` keeps the prefix a `label` or the
     // output reads. jq mode keeps it too, as jq prints what came before an error.
-    if S::TAG == EvalTag::Yq && matches!(control, Control::Error(_)) {
+    if S::ERROR_DISCARDS_THE_OUTPUTS_BEFORE_IT && matches!(control, Control::Error(_)) {
         return partial_generic(Vec::new(), control);
     }
     let mut owned = vec_with_capacity(items.len());

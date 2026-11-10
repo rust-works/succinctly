@@ -23,6 +23,17 @@ const ROWS: &[(&str, &str, &str, i32)] = &[
     ("isempty(W)", "false\n", "", 0),
     ("any(W; . == 1)", "true\n", "", 0),
     ("all(W; . != 2)", "false\n", "", 0),
+    // A consumer that reads the outputs before the raise sees them: `try`, `?` and a comma take the
+    // streaming route, which this change does not touch.
+    (
+        "try W catch \"c\"",
+        "[1,[2,3]]\n1\n[2,3]\n2\n\"c\"\n",
+        "",
+        0,
+    ),
+    ("(1, W, 2)?", "1\n[1,[2,3]]\n1\n[2,3]\n2\n", "", 0),
+    ("try (1, (W | 1)) catch 7", "1\n7\n", "", 0),
+    ("try ([W]) catch \"c\"", "\"c\"\n", "", 0),
 ];
 
 #[test]

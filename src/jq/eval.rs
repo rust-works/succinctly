@@ -319,6 +319,13 @@ pub trait EvalSemantics: Copy + Default {
     /// count (#4270).
     const STRING_LENGTH_IS_BYTES: bool;
 
+    /// If true (yq), an error ends the document and every output delivered before it is
+    /// discarded: yq builds a context list and answers all or nothing (`1, error("x")` prints
+    /// nothing), so a collected walk that escapes with an error need not keep its prefix (#5505).
+    /// jq prints what came before an error (`1, error("x")` is `1` and then the error), and a
+    /// `break` or `halt` keeps the prefix in both modes.
+    const ERROR_DISCARDS_THE_OUTPUTS_BEFORE_IT: bool;
+
     /// If true (yq), `min` and `max` answer nothing for an input that has no element to pick:
     /// an empty array, and anything that is not an array (`[] | min`, `{} | max`, `1 | min`,
     /// #4236). jq answers `null` for an empty array and raises for a non-array.
@@ -438,6 +445,7 @@ impl EvalSemantics for JqSemantics {
     const ROOT_PATH_CONTEXT_YIELDS_NOTHING: bool = false;
     const UNBOUND_VARIABLE_YIELDS_NOTHING: bool = false;
     const STRING_LENGTH_IS_BYTES: bool = false;
+    const ERROR_DISCARDS_THE_OUTPUTS_BEFORE_IT: bool = false;
     const MIN_MAX_NEED_AN_ELEMENT: bool = false;
     const NULL_ENTRIES_AND_SPLIT_YIELD_NOTHING: bool = false;
     const EMPTY_OPERAND_BINARY_RULE: bool = false;
@@ -482,6 +490,7 @@ impl EvalSemantics for YqSemantics {
     const ROOT_PATH_CONTEXT_YIELDS_NOTHING: bool = true;
     const UNBOUND_VARIABLE_YIELDS_NOTHING: bool = true;
     const STRING_LENGTH_IS_BYTES: bool = true;
+    const ERROR_DISCARDS_THE_OUTPUTS_BEFORE_IT: bool = true;
     const MIN_MAX_NEED_AN_ELEMENT: bool = true;
     const NULL_ENTRIES_AND_SPLIT_YIELD_NOTHING: bool = true;
     const EMPTY_OPERAND_BINARY_RULE: bool = true;
