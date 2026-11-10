@@ -15374,11 +15374,9 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // alone cannot say which it is (`2024-01-01` is a string once quoted), so this is read
         // from the cursor, where the style and the tag still are.
         Expr::Slice { .. }
-            if S::TAG == EvalTag::Yq
-                && value.as_str().is_some()
-                && cursor
-                    .as_ref()
-                    .is_some_and(|c| yq_slices_to_empty_sequence(c, &value)) =>
+            if cursor
+                .as_ref()
+                .is_some_and(|c| yq_scalar_is_not_a_string::<S, V>(c, &value)) =>
         {
             GenericResult::Owned(OwnedValue::array())
         }

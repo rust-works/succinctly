@@ -4611,18 +4611,16 @@ stays a no-op but walks on over `null`, so `del(.a[0:2][5][-1])` fails with size
 One shape still differs, because the information is not in the value tree: an
 unquoted YAML timestamp (`a: 2024-01-01`) or a `!!binary` scalar is a string to succinctly but not
 to yq, so `del(.a[0:2].x)` no-ops here where yq fails (a *quoted* `"2024-01-01"` matches).
-A *read* of such a slice now matches: yq slices only a plain string as text and every other scalar to
-an empty sequence, so `.a[0:2]`, `.a[1+0:]` (a computed bound) and what follows (`| length`, `[0]`,
-`.x`) answer `[]`, `0`, `null` and an error for an unquoted timestamp, a `!!binary`, an explicit
-core tag other than `!!str` (`!!int "5"`) and an alias to a string, while a quoted date, `!!str`
-and a custom-tagged scalar still cut their text (#4569). That is read from the cursor, where the
-style and the tag are. A write or `del()` evaluates over the owned value, which holds the text and
-nothing else, so `|= .[0:2]`, `with_entries(.value |= .[0:2])` and the `del()` row above still cut
-the text or no-op; closing them needs a scalar kind carried with the value, the same question as
-#2802's spellings. The slice's own tag (`!!timestamp []` in yq, `!!seq []` here, as for an
-integer) is the missing tag slot of #1416.
-An alias to an array or a mapping is still sliced through to its target here (`y: *a` over `a: [1, 2, 3]`
-with `.y[0:2]` is `[1,2]`), where yq answers `[]` for every alias.
+A *read* of such a slice now matches (#4569).
+yq slices only a plain string as text and every other scalar to an empty sequence.
+So `.a[0:2]`, `.a[1+0:]` (a computed bound) and what follows (`| length`, `[0]`, `.x`) answer `[]`, `0`, `null` and an error for an unquoted timestamp, a `!!binary`, an explicit core tag other than `!!str` (`!!int "5"`) and an alias to a string.
+A quoted date, `!!str` and a custom-tagged scalar still cut their text.
+That is read from the cursor, where the style and the tag are.
+A write or `del()` evaluates over the owned value, which holds the text and nothing else, so `|= .[0:2]`, `with_entries(.value |= .[0:2])`, a slice of a comma's copies (`(.a, .b)[1+0:]`) and the `del()` row above still cut the text or no-op.
+Closing them needs a scalar kind carried with the value, the same question as #2802's spellings.
+Under `--eval-all` the document is read back from the owned value, which has lost the quotes, so a quoted date there reads as a plain one, as it already does for `tag` (`.a | tag` of `"2024-01-01"` is `!!timestamp`), and `map(.[0:2])` slices it to `[]`.
+The slice's own tag (`!!timestamp []` in yq, `!!seq []` here, as for an integer) is the missing tag slot of #1416.
+An alias to an array or a mapping is still sliced through to its target here (`y: *a` over `a: [1, 2, 3]` with `.y[0:2]` is `[1,2]`), where yq answers `[]` for every alias.
 
 A comma-grouped `del()` with an `.[]` branch no longer raises on a non-null scalar
 ([#4464](https://github.com/rust-works/succinctly/issues/4464)): `5 | del(.a, .[])` and

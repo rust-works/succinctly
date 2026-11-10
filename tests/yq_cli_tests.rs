@@ -9642,7 +9642,7 @@ fn test_yaml_anchor_alias_without_merge() -> Result<()> {
 /// `"he"`), and the slice now answers that; the resolved string is still reachable through the
 /// anchor.
 #[test]
-fn test_yaml_single_hop_alias_as_str_slices_correctly_1191() -> Result<()> {
+fn test_yaml_single_hop_alias_slice_is_empty_where_anchor_slices_1191() -> Result<()> {
     let input = "x: &a hello\ny: *a\n";
     let (output, exit_code) = run_yq_stdin(".y[0:2]", input, &["-o=json"])?;
     assert_eq!(exit_code, 0, "out: {output:?}");
