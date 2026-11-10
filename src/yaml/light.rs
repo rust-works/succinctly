@@ -6761,6 +6761,14 @@ impl<'a> YamlString<'a> {
                     _ => indent,
                 });
             }
+            // A `---` that is indented is a document marker in the head of a yq stream (#6859), and the
+            // node below it is the document's root, as for a `---` at column 0.
+            if indent > 0
+                && rest.starts_with(b"---")
+                && rest[3..].iter().all(|&b| b == b' ' || b == b'\t')
+            {
+                return Some(0);
+            }
             return Some(indent);
         }
         // Nothing above the header but blank lines, comments and node properties: it is the
@@ -8445,7 +8453,8 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
         let mut marker_seen = false;
         for line in preamble.split_inclusive('\n') {
             let bare = line.trim_end_matches(['\n', '\r']);
-            let trimmed = bare.trim_end_matches([' ', '\t']);
+            // An indented `---` is yq's marker as well (#6859); `normalized_preamble` writes it flush left.
+            let trimmed = bare.trim_matches([' ', '\t']);
             offset += line.len();
             if trimmed == "---" {
                 marker_seen = true;
@@ -10445,6 +10454,18 @@ fn blank_line_before(text: &[u8], at: usize) -> bool {
         .all(|b| matches!(b, b' ' | b'\t' | b'\r'))
 }
 
+/// Whether `line` (without its break) is a `---` behind blanks, with nothing but blanks after it (#6859): in the
+/// head of a yq stream that is yq's marker, as the one at column 0 is, and it is written back flush left.
+fn is_indented_bare_marker(line: &[u8]) -> bool {
+    let indent = line
+        .iter()
+        .take_while(|&&b| b == b' ' || b == b'\t')
+        .count();
+    indent > 0
+        && line[indent..].starts_with(b"---")
+        && line[indent + 3..].iter().all(|&b| b == b' ' || b == b'\t')
+}
+
 /// Whether `line` (without its break) is non-empty and holds only blanks: the header line go-yaml reads as the
 /// comment `# ` plus the line (#6401).
 fn is_blank_line(line: &[u8]) -> bool {
@@ -10465,7 +10486,7 @@ fn header_keeps_empty_lines(header: &[u8]) -> bool {
             .position(|&b| is_line_break(b))
             .unwrap_or(rest.len());
         let line = &rest[..line_end];
-        if line.starts_with(b"---") || line.starts_with(b"%") {
+        if line.starts_with(b"---") || line.starts_with(b"%") || is_indented_bare_marker(line) {
             return false;
         }
         if line.is_empty() {
@@ -10498,7 +10519,7 @@ fn header_is_rebuilt_from_text(header: &[u8], synthesized: bool) -> bool {
 fn header_has_marker(header: &[u8]) -> bool {
     header
         .split(|&b| is_line_break(b))
-        .any(|line| line.starts_with(b"---"))
+        .any(|line| line.starts_with(b"---") || is_indented_bare_marker(line))
 }
 
 /// The comment lines of a first-document header (`header`: [`yq_header_len`]'s bytes) as yq prints them when a line
@@ -10527,6 +10548,8 @@ fn header_head_lines(header: &[u8], synthesized: bool, force: bool) -> Option<Ve
         };
         let line = core::str::from_utf8(&rest[..line_end]).ok()?;
         let crlf = brk == 2 && rest[line_end] == b'\r';
+        // An indented bare `---` is the header's marker too (#6859).
+        let indented_marker = is_indented_bare_marker(line.as_bytes());
         if line.is_empty() {
             out.push(if crlf {
                 "# \r".to_string()
@@ -10540,7 +10563,7 @@ fn header_head_lines(header: &[u8], synthesized: bool, force: bool) -> Option<Ve
             } else {
                 format!("# {line}")
             });
-        } else if !(line.starts_with("---") || line.starts_with('%')) {
+        } else if !(line.starts_with("---") || line.starts_with('%') || indented_marker) {
             out.push(if crlf {
                 format!("{line}\r")
             } else {
@@ -10713,8 +10736,10 @@ fn yq_position_preamble(text: &[u8]) -> (usize, usize) {
             .unwrap_or(rest.len());
         let line = &rest[..line_end];
         let first = line.iter().position(|&b| b != b' ' && b != b'\t');
-        let bare_marker =
-            line.starts_with(b"---") && line[3..].iter().all(|&b| b == b' ' || b == b'\t');
+        // A bare `---` behind blanks is yq's marker too (#6859).
+        let bare_marker = first.is_some_and(|i| {
+            line[i..].starts_with(b"---") && line[i + 3..].iter().all(|&b| b == b' ' || b == b'\t')
+        });
         let leading = match first {
             None => true,
             Some(i) => line[i] == b'#' || (i == 0 && line.starts_with(b"%YAML")) || bare_marker,
@@ -10794,7 +10819,17 @@ fn yq_header_len(text: &[u8]) -> (usize, bool) {
         let header_shaped = at_break_or_eof
             || rest[indent_len] == b'#'
             || super::parser::starts_yq_yaml_directive(&rest[indent_len..])
-            || (indent_len == 0 && rest[indent_len..].starts_with(b"---"));
+            || (indent_len == 0 && rest[indent_len..].starts_with(b"---"))
+            // Only a line of blanks and then `---` can be an indented marker, which is decided before the
+            // line end is looked for, as for every other shape (#6859).
+            || (indent_len > 0
+                && rest[indent_len..].starts_with(b"---")
+                && is_indented_bare_marker(
+                    &rest[..rest
+                        .iter()
+                        .position(|&b| is_line_break(b))
+                        .unwrap_or(rest.len())],
+                ));
         if !header_shaped {
             return (pos, false);
         }
@@ -10811,6 +10846,9 @@ fn yq_header_len(text: &[u8]) -> (usize, bool) {
         if line.starts_with(b"---") {
             match line.get(3) {
                 None => {}
+                // Blanks and nothing else after it: a bare marker, which yq writes without them (#6859);
+                // the run of markers goes on.
+                Some(b' ' | b'\t') if line[3..].iter().all(|&b| b == b' ' || b == b'\t') => {}
                 Some(b' ' | b'\t') => return (pos + 3, true),
                 Some(_) => return (pos, false),
             }
@@ -10849,13 +10887,15 @@ fn write_yq_header<W: AsRef<[u64]>, Out: core::fmt::Write>(
         let line = &rest[..line_end];
         // A bare `\r` ends a line that is not a marker the same way end of input does: yq writes a `\n` after it.
         // (A marker ended by a bare `\r` is left as it is: yq reads that as a marker with an empty line, not as ours.)
-        let marker = line.starts_with("---");
+        // An indented `---` of the head is a marker too, written without its indent (#6859).
+        let trimmed = line.trim_start_matches([' ', '\t']);
+        let marker = line.starts_with("---") || is_indented_bare_marker(line.as_bytes());
         unterminated = if marker {
             (brk == 0).then_some(true)
         } else {
             (rest.as_bytes()[..line_end + brk].last() != Some(&b'\n')).then_some(false)
         };
-        if doc_markers || !line.starts_with("---") {
+        if doc_markers || !marker {
             // #5053: a blank line of a CRLF header is `# \r` in yq's output -- the `\r` is comment text to go-yaml,
             // which reads the line as a comment of its own -- where an LF header keeps the bare blank line.
             if line.is_empty() && brk == 2 && rest.as_bytes()[line_end] == b'\r' {
@@ -10871,7 +10911,14 @@ fn write_yq_header<W: AsRef<[u64]>, Out: core::fmt::Write>(
             {
                 out.write_str("# ")?;
             }
-            out.write_str(line)?;
+            // A marker is written bare: without its indent and without the blanks after it (#6859).
+            out.write_str(
+                if marker && trimmed.trim_end_matches([' ', '\t']) == "---" {
+                    "---"
+                } else {
+                    line
+                },
+            )?;
             // The break itself is reproduced verbatim, unlike every other
             // line break in the output, which is normalized to `\n` (#324):
             // measured against pinned yq, a CRLF/CR source header keeps its

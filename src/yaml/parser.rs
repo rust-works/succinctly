@@ -3618,6 +3618,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.pos = at;
                 self.skip_to_eol();
                 self.record_standalone_comment(at, self.pos);
+            } else if let Some(at) = self.yq_indented_head_marker() {
+                // #6859: an indented `---` in the head is yq's marker, read from the `---` on; the line
+                // dispatcher takes it from here.
+                self.pos = at;
+                break;
             } else if b == b'\t'
                 && (self.pos == 0 || Self::is_break(self.input[self.pos - 1]))
                 && self.documents_started <= 1
@@ -4139,6 +4144,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     continue;
                 }
                 self.pos = start;
+                // #6859: an indented `---` in the head is yq's marker, read from the `---` on.
+                if let Some(at) = self.yq_indented_head_marker() {
+                    self.pos = at;
+                }
                 break;
             } else {
                 break;
@@ -10099,6 +10108,34 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         (at > self.pos
             && in_head
             && starts_yq_yaml_directive(&self.input[at..])
+            && self.only_yq_header_lines_before_cursor())
+        .then_some(at)
+    }
+
+    /// The offset of the `---` of an indented document start marker (a space or tab before it) that the
+    /// cursor, at the start of its line, is on in the head of a yq stream (#6859): yq's slurp trims the
+    /// lines of the head, so `  ---` is its `---` as `  %YAML` is its `%YAML` (#6408), and what follows is
+    /// the document. The head is the same as for [`Self::yq_indented_head_directive`].
+    fn yq_indented_head_marker(&self) -> Option<usize> {
+        if !self.yq_mode || !(self.pos == 0 || Self::is_break(self.input[self.pos - 1])) {
+            return None;
+        }
+        // The head test is two comparisons; the indent walk and the line walk come after it, so a line
+        // past the head costs those and nothing else.
+        let in_head = match self.documents_started {
+            0 => !self.in_document,
+            1 => self.in_document && self.bp_pos == self.document_start_bp_pos,
+            _ => false,
+        };
+        if !in_head {
+            return None;
+        }
+        let mut at = self.pos;
+        while matches!(self.input.get(at), Some(b' ' | b'\t')) {
+            at += 1;
+        }
+        (at > self.pos
+            && Self::marker_prefix(&self.input[at..], b"---")
             && self.only_yq_header_lines_before_cursor())
         .then_some(at)
     }

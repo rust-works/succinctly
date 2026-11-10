@@ -4022,7 +4022,8 @@ fn normalized_preamble(preamble: &str) -> String {
         .split_inclusive('\n')
         .map(|line| {
             let bare = line.trim_end_matches(['\n', '\r']);
-            if bare.trim_end_matches([' ', '\t']) == "---" {
+            // A `---` loses its trailing blanks and, indented in the head of the stream, its indent (#6859).
+            if bare.trim_matches([' ', '\t']) == "---" {
                 alloc::borrow::Cow::Owned(format!("---{}", &line[bare.len()..]))
             } else if bare.is_empty() && line == "\r\n" {
                 // #5053: a blank CRLF line is `# \r` in yq's output (the `\r` is comment text to go-yaml).
