@@ -10232,9 +10232,17 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// key's column is the line's indent plus the `- ` markers it opens with, so the compact
     /// mapping of a sequence item (`- k:`) stands where its continuation lines do.
     fn previous_content_line_defers_a_value_at(&self, indent: usize) -> bool {
-        self.previous_line_key(LineMarkers::Dashes)
-            .is_some_and(|key| {
-                key.column == indent && line_ends_with_colon_after_properties(key.text)
+        // Read two ways. Past the dashes only, a `?` or `:` line is a key of its own at the line's
+        // column (a bare `:` is the value indicator that leaves its value below it, test suite
+        // 6PBE). Past the `?` and `:` of an explicit key as well (#6847), the compact mapping of
+        // `? k:` or `: k:` stands where its continuation lines do, and a zero-indented sequence
+        // at that column is the key's value.
+        [LineMarkers::Dashes, LineMarkers::Explicit]
+            .into_iter()
+            .any(|markers| {
+                self.previous_line_key(markers).is_some_and(|key| {
+                    key.column == indent && line_ends_with_colon_after_properties(key.text)
+                })
             })
     }
 
@@ -10242,9 +10250,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// column (the line's indent plus the markers, as their spacing leaves it), the text from the
     /// key on, and the last marker (its column, and whether it is a dash). The walk is the one
     /// definition of where a key stands for
-    /// [`Self::previous_content_line_defers_a_value_at`] (`LineMarkers::Dashes`: a `?` or `:` is
-    /// not walked past, as before) and [`Self::header_is_left_of_its_owner`]
-    /// (`LineMarkers::Explicit`, #6540, #6543).
+    /// [`Self::previous_content_line_defers_a_value_at`] (both readings) and
+    /// [`Self::header_is_left_of_its_owner`] (`LineMarkers::Explicit`, #6540, #6543).
     fn previous_line_key(&self, markers: LineMarkers) -> Option<PreviousLineKey<'_>> {
         let (lead, rest) = self.previous_content_line()?;
         let (marker_len, last_marker) = Self::walk_line_markers(lead, rest, markers);
