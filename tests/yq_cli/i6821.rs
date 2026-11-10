@@ -65,6 +65,13 @@ const ROWS: &[(&str, &str)] = &[
     (".n as $v | .sc | [.[] | $v]", "[7]\n"),
     (".n as $v | .x[] |= $v", "{\"x\":[7,7,7],\"n\":7,\"m\":{\"a\":1},\"s\":\"hi\",\"e\":[],\"em\":{},\"sc\":5,\"nu\":null}\n"),
     ("(.n as $v | .x[] | $v) = 5", "{\"x\":[1,2,3],\"n\":7,\"m\":{\"a\":1},\"s\":\"hi\",\"e\":[],\"em\":{},\"sc\":5,\"nu\":null}\n"),
+    (".n as $v | .x[] | $v | line", "2\n"),
+    (".n as $v | .x[] | $v | column", "4\n"),
+    (".n as $v | .x | map($v | line)", "[2]\n"),
+    (".n as $v | .x[] | $v | tag", "\"!!int\"\n"),
+    (".n as $v | .x[] | $v | parent | length", "8\n"),
+    (".n as $_ | .x[] | $_", "7\n"),
+    (".n as $v | .x[.x[]] | $v", "7\n"),
 ];
 
 #[test]
@@ -90,12 +97,12 @@ fn an_error_before_the_variable_stage_still_raises_6821() -> Result<()> {
     Ok(())
 }
 
-/// YAML output prints the one node as yq does.
+/// YAML output prints the one node as yq does, keeping its flow style.
 #[test]
 fn the_one_node_prints_as_yaml_6821() -> Result<()> {
     let (stdout, code) = run_yq_stdin(".m as $v | .x[] | $v", DOC, &[])?;
     assert_eq!(code, 0);
-    assert_eq!(stdout, "a: 1\n");
+    assert_eq!(stdout, "{a: 1}\n");
     Ok(())
 }
 
@@ -105,5 +112,26 @@ fn jq_mode_still_reads_the_variable_per_node_6821() -> Result<()> {
     let (stdout, code) = crate::run_jq_stdin(". as $v | [1, 2, 3] | .[] | $v", "7", &["-c"])?;
     assert_eq!(code, 0);
     assert_eq!(stdout, "7\n7\n7\n");
+    Ok(())
+}
+
+/// Still per node, and so a known difference from yq (`5 5 5 7`): a variable that is a branch of a
+/// union is read by the walk that evaluates the union over the list, not by the pipe's rewrite. When
+/// the walk owns it, this row moves to [`ROWS`].
+#[test]
+fn a_variable_as_a_union_branch_is_still_read_per_node_6821() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(".n as $v | .x[] | (5, $v)", DOC, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "5\n5\n5\n7\n7\n7\n");
+    Ok(())
+}
+
+/// A pipe in a write's path stays what it was: `del` refuses the variable stage as it did before
+/// this change, where yq makes it a no-op (#2643).
+#[test]
+fn del_through_a_variable_stage_still_refuses_6821() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(".n as $v | del(.x[] | $v)", DOC, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 1);
+    assert_eq!(stdout, "");
     Ok(())
 }

@@ -1750,8 +1750,10 @@ fn has_flat_var_stage(expr: &Expr) -> bool {
 /// The variable is substituted into the body before the pipe runs, so the stage is a literal by
 /// then, and a literal is built once per node (`.x[] | 5` is three `5`s). So the rewrite is made
 /// here, where the stage is still a variable: everything before the last such stage becomes a
-/// stage that runs it for its errors and answers `null` once (`reduce PREFIX as $_ (null; null)`),
-/// and the variable follows. A `$name` that is not a stage (`[$v]`, `{"k": $v}`, `. + $v`) is read
+/// stage that runs it to the end for its errors and answers the pipe's own input once
+/// (`if all(PREFIX; true) then . else . end`), and the variable follows. That form, rather than a
+/// `reduce` or a collect, keeps the pipe on the route that resolves the bound node's `line`, `column`
+/// and path from the document, which a stage that builds a new value would lose. A `$name` that is not a stage (`[$v]`, `{"k": $v}`, `. + $v`) is read
 /// per node in yq too and is left as it is, as is a pipe's first stage, which has one input.
 fn yq_var_stage_once(stages: Vec<Expr>) -> Expr {
     // A nested pipe is the same stages spliced in (`A | (B | $v)` is `A | B | $v`), so the variable
@@ -1781,11 +1783,13 @@ fn yq_var_stage_once(stages: Vec<Expr>) -> Expr {
     let mut prefix = flat;
     let rest = prefix.split_off(at);
     let mut out = Vec::with_capacity(rest.len() + 1);
-    out.push(Expr::Reduce {
-        input: Box::new(yq_var_stage_once(prefix)),
-        patterns: vec![Pattern::Var("_".to_string())],
-        init: Box::new(Expr::Literal(Literal::Null)),
-        update: Box::new(Expr::Literal(Literal::Null)),
+    out.push(Expr::If {
+        cond: Box::new(Expr::Builtin(Builtin::AllCond(
+            Box::new(yq_var_stage_once(prefix)),
+            Box::new(Expr::Literal(Literal::Bool(true))),
+        ))),
+        then_branch: Box::new(Expr::Identity),
+        else_branch: Box::new(Expr::Identity),
     });
     out.extend(rest);
     Expr::pipe(out)

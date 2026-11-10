@@ -1195,8 +1195,8 @@ So `$name` as a pipe stage after a fan-out is one node however many reached it, 
 `.n as $v | .x[] | $v` is one `7`, `.x | map($v)` is `[7]`, `.x[] | select(. > 5) | $v` is one `7` from an empty context, and `.x[] | $v | . + 1` is one `8`.
 `succinctly yq` answered one per element.
 It follows yq now, in yq mode only: jq reads `$v` once per input, as `.x[] | $v` is three values there.
-The rewrite is made by the parser, where the stage is still a variable: the stages before it run for their errors and answer `null` once, and the variable follows (`reduce PREFIX as $_ (null; null) | $v`).
-52 rows captured from yq v4.53.3 match, including `map` over a sequence, a mapping, a scalar, `null` and an empty collection, and `path`, `key` and `parent` after the variable, which used to answer once per element.
+The rewrite is made by the parser, where the stage is still a variable: the stages before it run to the end for their errors and answer the pipe's own input once, and the variable follows (`if all(PREFIX; true) then . else . end | $v`).
+52 rows captured from yq v4.53.3 match, including `map` over a sequence, a mapping, a scalar, `null` and an empty collection, and `path`, `key`, `parent`, `line` and `column` after the variable, which used to answer once per element.
 A `$name` that is not a stage is read per node in yq too and is unchanged: `[$v]`, `{"k": $v}`, `. + $v`, `$v + .`, and the body of an `as` (`.x[] | . as $w | $v`).
 Rows over a computed source (`.x | map(. + 1) | map($v)`), the right side of a write (`.x |= map($v)`, `.x = [.x[] | $v]`) and `--eval-all` (`.x as $v | .x | $v` over two files) match yq too.
 Three things differ.
