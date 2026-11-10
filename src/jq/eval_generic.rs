@@ -21847,6 +21847,13 @@ fn yq_pipe_has_union(stages: &[Expr]) -> bool {
     yq_pipe_has_list_stage(stages, false)
 }
 
+/// The one definition of "an empty `{}` stage" (#6801), which [`yq_pipe_has_list_stage`] (the entry
+/// check) and [`yq_list_stage`] (the split) both ask: the two must agree on which pipes the walk
+/// owns, or a pipe is sent in that the split then declines.
+fn is_empty_object_literal(stage: &Expr) -> bool {
+    matches!(unwrap_paren(stage), Expr::Object(entries) if entries.is_empty())
+}
+
 /// [`yq_pipe_has_union`] with the second kind of stage the walk owns in any context: an empty
 /// `{}` after another stage (#6801), which yq builds once however many nodes reach it.
 /// `seen` is whether a stage already stands before `stages`, in the pipe that holds them.
@@ -21855,7 +21862,7 @@ fn yq_pipe_has_list_stage(stages: &[Expr], seen: bool) -> bool {
     for stage in stages {
         match unwrap_paren(stage) {
             Expr::Comma(_) => return true,
-            Expr::Object(entries) if seen && entries.is_empty() => return true,
+            other if seen && is_empty_object_literal(other) => return true,
             Expr::Pipe(inner) if yq_pipe_has_list_stage(inner, seen) => return true,
             _ => {}
         }
@@ -22051,7 +22058,7 @@ fn yq_list_stage(stages: &[Expr], together: bool) -> Option<(usize, YqListStage)
         // `EvaluateTogether` (#6801): `.x[] | {}` is one `{}`. At any index: the stage list
         // here is the rest of a pipe the walk already split, or a union branch, whose inputs
         // are the list the stage before it left.
-        if matches!(stage, Expr::Object(entries) if entries.is_empty()) {
+        if is_empty_object_literal(stage) {
             found = Some((i, YqListStage::EmptyObject));
             break;
         }
@@ -22067,10 +22074,6 @@ fn yq_list_stage(stages: &[Expr], together: bool) -> Option<(usize, YqListStage)
                 }
                 Expr::Reduce { .. } => {
                     found = Some((i, YqListStage::Fold));
-                    break;
-                }
-                Expr::Object(entries) if entries.is_empty() => {
-                    found = Some((i, YqListStage::EmptyObject));
                     break;
                 }
                 _ => {}

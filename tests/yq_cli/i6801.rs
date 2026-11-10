@@ -8,7 +8,7 @@ use anyhow::Result;
 
 use crate::run_yq_stdin;
 
-const DOC: &str = "x: [1, 2, 3]\n";
+const DOC: &str = "x: [1, 2, 3]\ny: {z: 1}\n";
 
 /// (filter, stdout), each the same as yq v4.53.3's with exit code 0.
 const ROWS: &[(&str, &str)] = &[
@@ -38,10 +38,16 @@ const ROWS: &[(&str, &str)] = &[
     ("{}, .x[]", "{}\n1\n2\n3\n"),
     ("(.x[] | {}) as $e | $e", "{}\n"),
     (". as $r | .x[] | {}", "{}\n"),
-    ("del(.x[] | {})", "{\"x\":[1,2,3]}\n"),
-    (".x[] |= {}", "{\"x\":[{},{},{}]}\n"),
+    ("del(.x[] | {})", "{\"x\":[1,2,3],\"y\":{\"z\":1}}\n"),
+    (".x[] |= {}", "{\"x\":[{},{},{}],\"y\":{\"z\":1}}\n"),
     ("[.x[] | {}] | length", "1\n"),
     (".x[] | {} | keys", "[]\n"),
+    (".x[] | (.y | {})", "{}\n"),
+    (".x[] | (.zz // {})", "{}\n{}\n{}\n"),
+    (".x[] | (. as $v | {})", "{}\n{}\n{}\n"),
+    (".x[] | {} | .a", "null\n"),
+    (".x[] | select(true) | {}", "{}\n"),
+    (".y | {}", "{}\n"),
 ];
 
 #[test]
@@ -60,5 +66,16 @@ fn an_error_before_the_empty_mapping_still_raises_6801() -> Result<()> {
     let (stdout, code) = run_yq_stdin(".x[] | error(\"e\") | {}", DOC, &["-o", "json", "-I0"])?;
     assert_ne!(code, 0);
     assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// The default (YAML) output prints the one mapping as yq does, and a document with a comment keeps it.
+#[test]
+fn the_one_mapping_prints_as_yaml_6801() -> Result<()> {
+    for (filter, expected) in [(".x[] | {}", "{}\n"), (".x[] | ({} | .a = 1)", "a: 1\n")] {
+        let (stdout, code) = run_yq_stdin(filter, "x: [1, 2] # c\n", &[])?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(stdout, expected, "{filter}");
+    }
     Ok(())
 }
