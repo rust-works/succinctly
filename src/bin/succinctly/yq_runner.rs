@@ -4160,6 +4160,13 @@ fn kind_changed_leaf(
     // written `.a = 1` is `# c` / `a: 1`, and so is a comment-only file. The head always; the
     // foot with a container, which prints it (a scalar root does not).
     let meta = match rewritten_document {
+        // A nested node keeps the standalone comments around it: yq holds them on the key, which a
+        // write over the value does not touch (`a: 1` / `# c` / blank / `d: 2` written `.a = {}` keeps `# c`).
+        None => meta.with_head_foot_of(
+            pristine_tree.meta().head_comment().to_vec(),
+            pristine_tree.meta().foot_comment().to_vec(),
+            pristine_tree.meta(),
+        ),
         Some(container) => meta.with_head_foot_of(
             pristine_tree.meta().head_comment().to_vec(),
             if container {
@@ -4169,7 +4176,6 @@ fn kind_changed_leaf(
             },
             pristine_tree.meta(),
         ),
-        None => meta,
     };
     CommentTree::Leaf(meta)
 }

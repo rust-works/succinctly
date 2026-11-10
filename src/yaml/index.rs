@@ -1872,22 +1872,25 @@ mod tests {
         );
     }
 
-    /// `blank_line_between`/`blank_line_precedes` (`src/yaml/parser.rs`)
-    /// both special-case a CRLF so it counts as one line break rather than
-    /// two -- otherwise a lone `\r\n` between a comment and the next node
-    /// would be misread as a blank line. Every shape here needs the CRLF
-    /// to sit *inside* the scanned range (not just at its edge) to actually
-    /// exercise that collapse, mirroring the LF originals:
+    /// `blank_line_between`/`blank_line_precedes` (`src/yaml/parser.rs`) count a CRLF as one line break --
+    /// otherwise a lone `\r\n` between a node and the next would be misread as a blank line -- except after
+    /// a standalone comment line, where go-yaml's scanner reads the `\r` and the `\n` as two breaks and so
+    /// finds a blank line the source never had (#5053). Every shape here needs the CRLF to sit *inside* the
+    /// scanned range (not just at its edge), mirroring the LF originals:
     /// `standalone_comment_attaches_forward_to_the_next_key_798`,
     /// `a_blank_line_before_a_block_still_attaches_it_forward_798`,
     /// `a_blank_line_after_a_block_attaches_it_back_to_the_previous_key_798`,
-    /// `a_trailing_block_at_eof_attaches_back_to_the_last_key_798`.
+    /// `a_trailing_block_at_eof_attaches_back_to_the_last_key_798`. Measured against yq v4.53.3, which
+    /// answers `.b | key | head_comment` as empty and `.a | key | foot_comment` as `mid` for the first.
     #[test]
-    fn crlf_blank_line_detection_collapses_each_crlf_to_one_break_798() {
-        // No blank line: forward-attaches to `b`, same as the LF case --
-        // `blank_line_between`'s scanned range holds exactly one CRLF, and
-        // must not miscount it as two breaks.
+    fn a_crlf_after_a_standalone_comment_is_a_blank_line_798_5053() {
+        // The comment is followed by a blank line to go-yaml, so it detaches from `b` and is `a`'s foot,
+        // where the LF text attaches it forward.
         let (head, _) = field_key_head_foot(b"a: 1\r\n# mid\r\nb: 2\r\n", "b");
+        assert!(head.is_empty(), "{head:?}");
+        let (_, foot) = field_key_head_foot(b"a: 1\r\n# mid\r\nb: 2\r\n", "a");
+        assert_eq!(foot, ["# mid"]);
+        let (head, _) = field_key_head_foot(b"a: 1\n# mid\nb: 2\n", "b");
         assert_eq!(head, ["# mid"]);
 
         // A blank line *before* the comment: `blank_line_precedes` walks
@@ -1895,15 +1898,33 @@ mod tests {
         let (head, _) = field_key_head_foot(b"a: 1\r\n\r\n# mid\r\nb: 2\r\n", "b");
         assert_eq!(head, ["# mid"]);
 
-        // A blank line *after* the comment: `blank_line_between`'s scanned
-        // range now holds two full CRLFs back to back, so it must collapse
-        // the first before it can even reach the second.
+        // A blank line *after* the comment: the same foot of `a`.
         let (_, foot) = field_key_head_foot(b"a: 1\r\n# mid\r\n\r\nb: 2\r\n", "a");
         assert_eq!(foot, ["# mid"]);
 
         // Trailing block at EOF, no next node at all.
         let (_, foot) = field_key_head_foot(b"a: 1\r\nb: 2\r\n# trail\r\n", "b");
         assert_eq!(foot, ["# trail"]);
+
+        // A comment after a node is not a standalone comment: its CRLF counts once, and the next
+        // standalone comment attaches forward as in LF.
+        let (head, _) = field_key_head_foot(b"a: 1 # t\r\nb: 2\r\n", "b");
+        assert!(head.is_empty(), "{head:?}");
+        let (head, _) = field_key_head_foot(b"a: 1\r\nb: 2\r\n# trail\r\nc: 3\r\n", "c");
+        assert!(head.is_empty(), "{head:?}");
+    }
+
+    /// Two standalone comment lines of a CRLF file are two blocks to go-yaml (a blank line follows each), so the
+    /// first is the previous key's foot and the second the next key's head (#5053; yq v4.53.3 answers
+    /// `.a | key | foot_comment` as `c1` and `.b | key | head_comment` as `c2`), where the LF text joins them.
+    #[test]
+    fn two_crlf_comment_lines_are_two_blocks_5053() {
+        let (_, foot) = field_key_head_foot(b"a: 1\r\n# c1\r\n# c2\r\nb: 2\r\n", "a");
+        assert_eq!(foot, ["# c1"]);
+        let (head, _) = field_key_head_foot(b"a: 1\r\n# c1\r\n# c2\r\nb: 2\r\n", "b");
+        assert_eq!(head, ["# c2"]);
+        let (head, _) = field_key_head_foot(b"a: 1\n# c1\n# c2\nb: 2\n", "b");
+        assert_eq!(head, ["# c1", "# c2"]);
     }
 
     #[test]

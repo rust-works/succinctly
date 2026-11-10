@@ -309,6 +309,17 @@ const KNOWN_CRLF_DIVERGENCES: &[&str] = &[
     "standalone_comments_header_2795",
     "standalone_comments_header_no_doc_2795",
     "standalone_comments_identity_2795",
+    // #5053: a CRLF after a standalone comment line is a blank line to go-yaml, so yq's own CRLF output differs
+    // from the LF golden by a blank line after each comment, and so does ours now (the first five equal yq's
+    // CRLF output). `yaml_write_then_navigate_sequence_item_2706` still differs from yq's CRLF output, which
+    // prints both comment lines of the navigated item after a blank line (limitations.md, "A CRLF after a
+    // standalone comment line").
+    "meta_assign_clear_head_seq_items_2796",
+    "meta_assign_container_head_first_foot_2796",
+    "meta_assign_container_head_key_head_2796",
+    "standalone_comments_multi_doc_2795",
+    "standalone_comments_nested_2795",
+    "yaml_write_then_navigate_sequence_item_2706",
 ];
 
 /// The same goldens, with the input's line breaks rewritten to CRLF and to a
