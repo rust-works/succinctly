@@ -21893,7 +21893,7 @@ fn yq_pipe_has_union(stages: &[Expr]) -> bool {
 /// The one definition of "an empty `{}` stage" (#6801), which [`yq_pipe_has_list_stage`] (the entry
 /// check) and [`yq_list_stage`] (the split) both ask: the two must agree on which pipes the walk
 /// owns, or a pipe is sent in that the split then declines.
-fn is_empty_object_literal(stage: &Expr) -> bool {
+pub(super) fn is_empty_object_literal(stage: &Expr) -> bool {
     matches!(unwrap_paren(stage), Expr::Object(entries) if entries.is_empty())
 }
 
