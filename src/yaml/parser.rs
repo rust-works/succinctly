@@ -8417,11 +8417,20 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
 
         // Trim trailing whitespace. A blank line before the closer or the comma (`[42` / `` / `]`)
-        // leaves the scan at the second break, so the run of line breaks that ended it goes too: it
-        // separates the scalar from what follows and is no content of it (#6855).
+        // leaves the scan at the second break, so the run of line breaks that ended it goes too, a
+        // NEL, LS or PS among them: it separates the scalar from what follows and is no content of
+        // it (#6855).
         let mut end = self.pos;
-        while end > start && matches!(self.input[end - 1], b' ' | b'\t' | b'\n' | b'\r') {
-            end -= 1;
+        while end > start {
+            if matches!(self.input[end - 1], b' ' | b'\t' | b'\n' | b'\r') {
+                end -= 1;
+            } else if end - start >= 2 && self.unicode_break_len_at(end - 2) == 2 {
+                end -= 2;
+            } else if end - start >= 3 && self.unicode_break_len_at(end - 3) == 3 {
+                end -= 3;
+            } else {
+                break;
+            }
         }
 
         Ok(end)
