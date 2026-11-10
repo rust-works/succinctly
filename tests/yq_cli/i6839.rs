@@ -89,3 +89,23 @@ fn test_a_root_update_body_still_writes_through_an_alias_6839() -> Result<()> {
     );
     Ok(())
 }
+
+/// A body's path is relative to its target, so `.b.p` inside an element is the element's own `b`, not
+/// the document's alias position `["b"]`: with an element holding a copy of the anchor, the old
+/// matching sent the write to the element's `a` (`"a":{"p":9}`). A root path after another path keeps
+/// the table for its body, whose paths are the document's. Every row is a yq v4.53.3 capture.
+#[test]
+fn test_a_body_path_that_spells_an_alias_position_is_the_bodys_own_6839() -> Result<()> {
+    let document = "a: &x {p: 1}\nb: *x\nitems:\n  - {a: {p: 1}, b: {p: 1}}\n";
+    for (filter, want) in [
+    (".items[] |= (.b.p = 9)", "{\"a\":{\"p\":1},\"b\":{\"p\":1},\"items\":[{\"a\":{\"p\":1},\"b\":{\"p\":9}}]}\n"),
+    (".items[0] |= (.b.p = 9)", "{\"a\":{\"p\":1},\"b\":{\"p\":1},\"items\":[{\"a\":{\"p\":1},\"b\":{\"p\":9}}]}\n"),
+    (".items[] |= (.sub = 1 | .b.p = 9)", "{\"a\":{\"p\":1},\"b\":{\"p\":1},\"items\":[{\"a\":{\"p\":1},\"b\":{\"p\":9},\"sub\":1}]}\n"),
+    ("(.items[], .) |= (.b.p = 9)", "{\"a\":{\"p\":9},\"b\":{\"p\":9},\"items\":[{\"a\":{\"p\":1},\"b\":{\"p\":9}}]}\n"),
+    (".items[] |= (.sub |= (.b.p = 9))", "{\"a\":{\"p\":1},\"b\":{\"p\":1},\"items\":[{\"a\":{\"p\":1},\"b\":{\"p\":1},\"sub\":{\"b\":{\"p\":9}}}]}\n"),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, document, JSON)?;
+        assert_eq!((stdout.as_str(), code), (want, 0), "{filter}");
+    }
+    Ok(())
+}
