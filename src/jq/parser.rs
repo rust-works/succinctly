@@ -10917,9 +10917,10 @@ impl<'a> Parser<'a> {
             self.next(); // =
             self.skip_ws();
             let filter = self.parse_assignment_operand()?;
-            let filter = match self.mode == ParserMode::Yq {
-                true => update_body_effect(&filter).unwrap_or(filter),
-                false => filter,
+            let filter = if self.mode == ParserMode::Yq {
+                update_body_effect(&filter).unwrap_or(filter)
+            } else {
+                filter
             };
             return Ok(self.assign_or_rename_key(left, filter, true));
         }
