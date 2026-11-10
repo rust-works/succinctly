@@ -1139,16 +1139,16 @@ capture table.
 `--eval-all` folds every document of every file, as yq's `reduceOperator` does: it reads SRC and INIT against the whole list, then folds each source node into each accumulator.
 `yq ea '. as $item ireduce ({}; . * $item)' a.yaml b.yaml` is the two files merged, which is the recipe yq's own documentation gives for merging files.
 `succinctly yq` answers it the same, and `. as $i ireduce (0; . + 1)` is the document count once per document, as in yq (`0` is one literal per context node, each its own accumulator).
-An empty `{}` is one mapping whatever the context holds (`yq ea '{}' f1 f2` prints one `{}`, where `0` prints one per document), so `ireduce ({}; ...)` starts one fold.
+An empty `{}` is one mapping whatever the context holds (`yq ea '{}' f1 f2` prints one `{}`, where `0` prints one per document, and `yq '.x[] | {}'` is one `{}` on any route), so `ireduce ({}; ...)` starts one fold.
 The reads of the loop variable's node (`$i | document_index`, `file_index`, `path`, `line`, `tag`, `kind`) answer from the document the node came from.
 Both rules apply to a list whose entries all came straight from the reader, like `[...]` and the binary operators.
 After a navigation they do not, and the plain route is unchanged.
 
 Six things still differ, each in yq v4.53.3 against `succinctly yq`:
 
-- **An empty `{}` after a fan-out outside `--eval-all`.**
-  yq builds one mapping there too (`yq '.x[] | {}'` over `x: [1, 2, 3]` prints one `{}`, and so does `.x | map({})` as `[{}]`).
-  `succinctly yq` prints one per input node ([#6801](https://github.com/rust-works/succinctly/issues/6801)).
+- **`map({})`.**
+  yq builds its one empty mapping there as well (`.x | map({})` over `x: [1, 2, 3]` is `[{}]`, and `.x | map(select(. > 5) | {})` is `[{}]` too, where an empty `.e | map({})` is `[]`).
+  `succinctly yq` answers one per element (`[{},{},{}]`), and `.x[] | {}`, which is one `{}` in both ([#6801](https://github.com/rust-works/succinctly/issues/6801)).
 - **A constant over an empty context.**
   yq answers a literal from a context that holds no node (`yq ea 'select(fi == 9) | 0'` is `0`, and `select(fi == 9) | . as $i ireduce (0; . + 1)` is `0`).
   Only `{}` does here, so a fold whose INIT is another constant and whose source filter selects no document prints nothing ([#6801](https://github.com/rust-works/succinctly/issues/6801)).
