@@ -23,9 +23,15 @@ pub enum GoBase64Error {
     Corrupt(usize),
 }
 
-/// `text` decoded as yq decodes it, or Go's error.
-pub fn go_base64_decode(text: &[u8]) -> Result<Vec<u8>, GoBase64Error> {
-    decode_base64(text)
+impl core::fmt::Display for GoBase64Error {
+    /// Go's message, which yq prints for `@base64d` as `Error: <it>` and for `-p base64` after
+    /// `bad file '<name>': ` (#6925, #6997).
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::UnexpectedEof => f.write_str("unexpected EOF"),
+            Self::Corrupt(at) => write!(f, "illegal base64 data at input byte {at}"),
+        }
+    }
 }
 
 /// Why Go's base64 stream stopped.
@@ -39,18 +45,18 @@ enum StreamEnd {
     Corrupt(usize),
 }
 
-/// yq's `-p base64`: the input with Go's `strings.TrimSpace` applied, padded with `=` to a multiple
-/// of four bytes (counting any line break inside it), read through `base64.NewDecoder` by a
-/// `bytes.Buffer`. Go's stream decoder hands each chunk of the input to `Encoding.Decode` on its
-/// own, so where the chunks fall decides the answer for a malformed input: an error's offset counts
-/// from its chunk's start, and padding that ends one chunk is accepted with more data after it.
-/// [`GoBase64Stream`] reproduces the chunking, which follows the sizes `bytes.Buffer` grows to.
-fn decode_base64(raw: &[u8]) -> Result<Vec<u8>, GoBase64Error> {
+/// `text` decoded as yq decodes it (see the module comment), or Go's error.
+///
+/// Not inlined: the decoder's 1024-byte buffer stays in this frame, out of the evaluator frames
+/// that call `@base64d` and recurse (the native-stack floor of ADR-0025).
+#[inline(never)]
+pub fn go_base64_decode(raw: &[u8]) -> Result<Vec<u8>, GoBase64Error> {
     let src = go_trim_space(raw);
     let mut stream = GoBase64Stream::new(src, (4 - src.len() % 4) % 4);
     // `bytes.Buffer.ReadFrom`: before each read, grow so at least `MinRead` (512) bytes are free,
     // then offer the decoder the whole free capacity.
-    let mut out = Vec::new();
+    // Sized once for the whole output; `capacity` is the Go buffer's, which decides the chunks.
+    let mut out = Vec::with_capacity(src.len() / 4 * 3 + 3);
     let mut capacity = 0usize;
     loop {
         if capacity - out.len() < 512 {
@@ -165,7 +171,7 @@ impl<'a> GoBase64Stream<'a> {
 }
 
 /// The value of a base64 digit of the standard alphabet.
-fn base64_digit(byte: u8) -> Option<u8> {
+pub(crate) fn base64_digit(byte: u8) -> Option<u8> {
     match byte {
         b'A'..=b'Z' => Some(byte - b'A'),
         b'a'..=b'z' => Some(byte - b'a' + 26),

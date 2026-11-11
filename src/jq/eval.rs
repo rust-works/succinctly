@@ -26350,52 +26350,45 @@ fn format_base64<S: EvalSemantics>(
 /// position (#1123 no longer has the "only a complete 4-byte group is
 /// checked" gap an earlier version of this fix had, now that #1120's
 /// truncate-then-decode-every-length rewrite validates the whole prefix
-/// uniformly). Real yq is *stricter* than real jq for malformed/excess
-/// padding (e.g. `"===="` errors in yq, decodes to `""` in jq) — yq mode
-/// takes an entirely separate, dedicated decode path below for exactly
-/// this (#1135), rather than sharing jq's truncate-at-first-`=` loop.
+/// uniformly). yq mode reads the string through yq's own base64 decoder
+/// instead ([`super::go_base64`], #6997): Go's stream decoder, stricter than
+/// jq about padding (`"===="` errors in yq, decodes to `""` in jq).
 fn format_base64d<S: EvalSemantics>(
     value: &OwnedValue,
     _optional: bool,
 ) -> Result<String, EvalError> {
-    let s = match value {
-        OwnedValue::String(s) => String::clone(s),
-        _ if S::TAG == EvalTag::Yq => yq_stringify_scalar_or_empty::<S>(value),
-        _ => owned_to_string::<S>(value),
-    };
-
-    // Simple base64 decoding of a single non-padding character.
-    fn decode_char(c: u8) -> Option<u8> {
-        match c {
-            b'A'..=b'Z' => Some(c - b'A'),
-            b'a'..=b'z' => Some(c - b'a' + 26),
-            b'0'..=b'9' => Some(c - b'0' + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-
     // yq mode (#6997): yq's `@base64d` is its base64 decoder (`decoder_base64.go`, the one
     // `-p base64` reads with), which trims the text, pads it by its raw length and reads it through
     // Go's stream decoder: a line break inside the text is dropped, so the padding it was counted
     // in leaves a short quantum (`unexpected EOF`), and an error's offset counts from its chunk. It
     // replaces the in-place padding rules of #1135, which matched yq everywhere but a line break.
     if S::TAG == EvalTag::Yq {
-        let result = super::go_base64::go_base64_decode(s.as_bytes()).map_err(|e| match e {
-            super::go_base64::GoBase64Error::UnexpectedEof => EvalError::base64_unexpected_eof(),
-            super::go_base64::GoBase64Error::Corrupt(at) => EvalError::base64_illegal_data(at),
-        })?;
+        let stringified;
+        let text: &str = match value {
+            OwnedValue::String(s) => s,
+            _ => {
+                stringified = yq_stringify_scalar_or_empty::<S>(value);
+                &stringified
+            }
+        };
+        let result =
+            super::go_base64::go_base64_decode(text.as_bytes()).map_err(EvalError::go_base64)?;
         return Ok(owned_string_from_decoded_bytes::<S>(result));
     }
+
+    let s = match value {
+        OwnedValue::String(s) => String::clone(s),
+        _ => owned_to_string::<S>(value),
+    };
+    let decode_char = super::go_base64::base64_digit;
 
     // jq trims *nothing* (#1123): it errors even on leading or trailing whitespace
     // (`" aGVsbG8="` errors in jq 1.7.1), and `decode_char` below rejects it as an invalid
     // character.
-    let trimmed = s.as_str();
+    let input = s.as_bytes();
 
-    // Real jq truncates at the *first* `=` in the (whitespace-
-    // trimmed) input, discarding it and everything after it --
+    // Real jq truncates at the *first* `=` in the input, discarding it
+    // and everything after it --
     // not just within its own 4-character group, as an earlier
     // version of this fix assumed. Confirmed live against jq 1.7.1
     // across a wide matrix: `"AB=C"` -> `"AB"`'s decode (the `C` is
@@ -26410,9 +26403,9 @@ fn format_base64d<S: EvalSemantics>(
     // `break`s on any short trailing chunk, silently ignoring the
     // leftover `['=']`; a naive per-chunk fix without this
     // truncation step made it a hard error instead.
-    let prefix = match trimmed.as_bytes().iter().position(|&b| b == b'=') {
-        Some(i) => &trimmed.as_bytes()[..i],
-        None => trimmed.as_bytes(),
+    let prefix = match input.iter().position(|&b| b == b'=') {
+        Some(i) => &input[..i],
+        None => input,
     };
 
     let mut result = Vec::new();
@@ -26431,11 +26424,9 @@ fn format_base64d<S: EvalSemantics>(
     // construction (it's already been truncated above), so none of
     // these arms need to special-case it the way the very first
     // version of this fix's 4-char arm alone used to.
-    // jq-only from here down: yq mode already returned above (#1135), so
+    // jq-only from here down: yq mode already returned above (#6997), so
     // this closure and the loop below it need only jq's own wording
-    // (`base64_invalid_data`/`base64_trailing_byte`, #1146) -- yq's
-    // uniform, byte-position-based `base64_illegal_data` lives entirely in
-    // the strict decoder above now.
+    // (`base64_invalid_data`/`base64_trailing_byte`, #1146).
     let char_error = |_pos: usize| -> EvalError {
         EvalError::base64_invalid_data(&OwnedValue::string(s.clone()))
     };

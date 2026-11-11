@@ -34,6 +34,16 @@ const ROWS: &[(&str, &str, &str, i32)] = &[
         1,
     ),
     (r#""QQ""#, "\"A\"\n", "", 0),
+    // A CRLF pair inside the text: both bytes were counted in the padding and both are dropped.
+    (r#""aG\r\nk=""#, "", "Error: unexpected EOF", 1),
+    (r#""aGVs\r\nbG8=""#, "", "Error: unexpected EOF", 1),
+    (r#""aGVsbG8\r\n=""#, "", "Error: unexpected EOF", 1),
+    (
+        r#""aGk=\r\naGk=""#,
+        "",
+        "Error: illegal base64 data at input byte 4",
+        1,
+    ),
 ];
 
 #[test]

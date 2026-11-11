@@ -56,12 +56,7 @@ impl StringInput {
     /// input that does not decode, which it prints after `bad file '<name>': `.
     pub(super) fn transcode(self, raw: &[u8]) -> Result<Vec<u8>, String> {
         let decoded = match self {
-            Self::Base64 => succinctly::jq::go_base64_decode(raw).map_err(|e| match e {
-                succinctly::jq::GoBase64Error::UnexpectedEof => "unexpected EOF".to_owned(),
-                succinctly::jq::GoBase64Error::Corrupt(at) => {
-                    format!("illegal base64 data at input byte {at}")
-                }
-            })?,
+            Self::Base64 => succinctly::jq::go_base64_decode(raw).map_err(|e| e.to_string())?,
             Self::Uri => decode_uri(raw)?,
         };
         Ok(json_string(&decoded))
