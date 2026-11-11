@@ -7607,7 +7607,8 @@ When an update (`|=`, `map_values`) fails on several nodes, yq reports the last 
 The `@props` and `@csv` operators ignore those flags here, where yq applies them to the operators too.
 `-o=lua` is read as well, with `--lua-prefix`, `--lua-suffix`, `--lua-globals` and `--lua-unquoted` (#6924); where it differs from yq is in its own section below.
 `-o=ini` is read as well (#6924), as yq's go-ini encoder writes it: it agrees with yq v4.53.3 on 3,200 random JSON documents and on YAML input except for a null written `~` (see the list below).
-The other formats yq lists (`kyaml`, `xml`, `toml`, `hcl`) and every input format but YAML and JSON are still refused at the flag.
+`-o=toml` is read as well (#6924); where it differs from yq is in its own section below.
+The other formats yq lists (`kyaml`, `xml`, `hcl`) and every input format but YAML and JSON are still refused at the flag.
 Seven rows differ from yq v4.53.3, each pinned out of `tests/yq_cli/i6850.rs`:
 
 - A comment in a `props` document is not written.
@@ -7634,3 +7635,15 @@ The encoder runs over the value model, which keeps no node style, key tag or com
 - A comment is dropped, where yq writes a line comment as ` -- text` after the entry.
 - A timestamp (`2001-01-01`) and `!!binary` are written as strings, where yq stops with `lua encoder NYI -- !!timestamp`.
 - The integer spellings `-0o17` and `0O17` and the YAML 1.1 ones `1_000`, `0b11` and `0XfF` are strings here (see the YAML 1.1 section above), so they are quoted, where yq writes them bare.
+
+### `-o=toml` — comments and a value's source spelling are not read (#6924)
+
+`-o=toml` is a port of yq's TOML encoder (attributes before tables, `[a.b]` tables, `[[a]]` arrays of tables, inline tables inside arrays, Go `%q` strings) and agrees with yq v4.53.3 on 3,800 random JSON documents.
+Go's `%q` escapes every code point `unicode.IsPrint` rejects, and that set follows the Unicode version of the Go release that built yq, so `src/jq/go_print.rs` is generated from the pinned binary (`scripts/gen_go_print.py`) rather than from a Unicode table here.
+The encoder runs over the value model, which keeps no comment, node style or source spelling, so on a YAML input these still differ:
+
+- A head, line or foot comment is dropped, where yq writes a head comment above its key and a line comment after the value (`a = 1  # l`).
+- A boolean written `True`, `FALSE` or `yes` is `true` or `false`, where yq writes the source text.
+- The YAML 1.1 integers `1_000` and `0b11` are strings here (see the YAML 1.1 section above), so they are quoted, where yq writes them bare.
+- A timestamp (`2001-01-01`) and a `!!binary` scalar are quoted strings, where yq writes their text bare.
+- yq's inline-table hint exists only for TOML input, which `succinctly yq` does not read.

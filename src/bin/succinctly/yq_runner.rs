@@ -11789,6 +11789,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             globals: args.lua_globals,
         }))),
         OutputFormat::Ini => Some(YqOutputEncoder::Ini),
+        OutputFormat::Toml => Some(YqOutputEncoder::Toml),
         OutputFormat::Yaml | OutputFormat::Json | OutputFormat::Auto => None,
     };
     if output_encoder.is_some() {
