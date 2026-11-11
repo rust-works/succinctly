@@ -27136,7 +27136,8 @@ pub fn go_quote_bytes(bytes: &[u8]) -> String {
             Ok(_) => (rest.len(), 0),
             Err(e) => (
                 e.valid_up_to(),
-                e.error_len().unwrap_or(rest.len() - e.valid_up_to()),
+                e.error_len()
+                    .unwrap_or_else(|| rest.len() - e.valid_up_to()),
             ),
         };
         let valid = core::str::from_utf8(&rest[..valid_len]).unwrap_or_default();
