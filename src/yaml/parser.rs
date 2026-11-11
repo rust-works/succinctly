@@ -8298,7 +8298,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                                 break;
                             }
                             b'\n' | b'\r' => {
-                                // Newline - check next line
+                                // A line break after the blanks: whether the next line continues
+                                // the key is the `\n`/`\r` arm's to say, so walk on to it. Ending
+                                // the key here refused `{a ` / ` b}` where yq reads `"a b"` (#6949);
+                                // the explicit-key scanner does the same (#402).
+                                self.advance();
                                 break;
                             }
                             _ => {
@@ -8310,7 +8314,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     }
                     if lookahead == self.input.len()
                         || (self.input[lookahead] == b':' && colon_ends_key(lookahead))
-                        || matches!(self.input[lookahead], b',' | b'}' | b']' | b'\n' | b'\r')
+                        || matches!(self.input[lookahead], b',' | b'}' | b']')
                     {
                         break;
                     }
