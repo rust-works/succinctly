@@ -203,6 +203,18 @@ const ROWS: &[(&str, &str, &str)] = &[
         "0\n0\n0\n0\n0\n0\n1\n1\n1\n",
     ),
     ("two", ".a + 1 | file_index", "0\n0\n0\n1\n1\n1\n1\n1\n1\n"),
+    ("md", ".x - 1 | document_index", "0\n0\n1\n1\n"),
+    ("md", ".x - 1 | file_index", "0\n0\n0\n0\n"),
+    ("md", ".x / 2 | document_index", "0\n0\n1\n1\n"),
+    ("md", ".x / 2 | file_index", "0\n0\n0\n0\n"),
+    ("md", ".x % 2 | document_index", "0\n0\n1\n1\n"),
+    ("md", ".x % 2 | file_index", "0\n0\n0\n0\n"),
+    ("md", ".x - .y | document_index", "0\n0\n1\n1\n"),
+    ("md", ".x - .y | file_index", "0\n0\n0\n0\n"),
+    ("md", ".x / .y | document_index", "0\n0\n1\n1\n"),
+    ("md", ".x / .y | file_index", "0\n0\n0\n0\n"),
+    ("md", ".x * .y | document_index", "0\n0\n1\n1\n"),
+    ("md", ".x * .y | file_index", "0\n0\n0\n0\n"),
 ];
 
 fn file(text: &str) -> Result<NamedTempFile> {
