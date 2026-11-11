@@ -27389,7 +27389,7 @@ fn format_kyaml(value: &OwnedValue, indent: usize) -> String {
     }
     fn node(out: &mut String, value: &OwnedValue, indent: usize, level: usize, depth: usize) {
         assert_value_tree_depth(depth);
-        let pad = |out: &mut String, columns: usize| out.extend(core::iter::repeat_n(' ', columns));
+        let pad = |out: &mut String, columns: usize| out.push_str(&" ".repeat(columns));
         match value {
             OwnedValue::Object(entries) if entries.is_empty() => out.push_str("{}"),
             OwnedValue::Object(entries) => {
