@@ -2775,7 +2775,7 @@ fn needs_dom_fallback(
         && ((sort_keys && index.has_aliases())
             || sorts_a_mapping(expr, index, bytes)
             || reorders_a_flow_sequence(expr, index, bytes)
-            || maps_a_flow_collection(expr, index, bytes)
+            || (index.has_comments() && maps_a_flow_collection(expr, index, bytes))
             || (is_array_of_nodes(expr) && index.has_aliases()))
 }
 
@@ -2913,9 +2913,10 @@ fn reorders_a_flow_sequence(expr: &Expr, index: &YamlIndex, bytes: &[u8]) -> boo
 }
 
 /// Whether `expr` is `NAV | map(f)` ([`split_map_read`]) over a flow-style sequence or mapping in
-/// some document of `bytes`: the YAML output of it takes the DOM route, which gives the result the
-/// node's flow style ([`restyle_flow_map_result`]). The streamers write the mapped items as a block
-/// sequence (#6986).
+/// some document of `bytes` (#6986). The streamers write such a result in flow, but without the
+/// layout a comment between its items needs, so a document with comments takes the DOM route for
+/// it, which gives the result the node's flow style ([`restyle_flow_map_result`]) and lays its
+/// items' comments out; one without (any JSON input) keeps the streamers, several times faster.
 fn maps_a_flow_collection(expr: &Expr, index: &YamlIndex, bytes: &[u8]) -> bool {
     let Some((nav, _)) = split_map_read(expr) else {
         return false;
@@ -12365,6 +12366,9 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     // comma, each as a query of its own (a node keeps what its cursor carries), else the query.
     let stream_branches: Vec<&Expr> = comma_branches.unwrap_or_else(|| vec![&program.expr]);
     let reorders_root_sequence = reorders_a_sequence(&program.expr);
+    // #6986: the navigation in front of a `NAV | map(f)`, whose result prints in flow when the node
+    // it maps is a flow-style one.
+    let map_read_nav = split_map_read(&program.expr).map(|(nav, _)| nav);
     // #2276 code review (found live against this exact binary, on top of
     // #2262): `any_input_is_json` -- the same run-wide boolean #978
     // introduced and #996 later removed from `is_m2_streamable` above --
@@ -12829,6 +12833,19 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                         // comment block above it, which the items' streaming has no node to read.
                         let reordered_head =
                             reorders_root_sequence && matches!(result, GenericResult::LazySeq(_));
+                        // #6986: a `map` over a flow-style node is written in flow, as yq writes
+                        // it: width 0 is the streamers' flow layout (`IndentSpec::is_compact`).
+                        let result_indent = if matches!(result, GenericResult::LazySeq(_))
+                            && map_read_nav.as_ref().is_some_and(|nav| {
+                                flow_collection_target(nav.as_ref(), $cursor).is_some()
+                            }) {
+                            IndentSpec {
+                                width: 0,
+                                unit: yaml_indent.unit,
+                            }
+                        } else {
+                            yaml_indent
+                        };
                         let stats = stream_maybe_colored(
                             $writer,
                             $use_color,
@@ -12844,7 +12861,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                                 result
                                     .stream_yaml_terminating::<_, YqSemantics>(
                                         out,
-                                        yaml_indent,
+                                        result_indent,
                                         sort_keys,
                                         // #5721: a header-only document's own line break ends
                                         // it; a NUL replaces that break.

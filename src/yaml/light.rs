@@ -3266,6 +3266,12 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         let Some(parent) = self.parent() else {
             return false;
         };
+        // A document's parent is the virtual sequence of documents, whose text position is the
+        // first document's: when that one opens with `[`, a later block document is no flow
+        // element (#6986).
+        if parent.bp_pos == 0 {
+            return false;
+        }
         let Some(pos) = parent.text_position() else {
             return false;
         };
