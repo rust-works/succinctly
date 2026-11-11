@@ -2775,6 +2775,7 @@ fn needs_dom_fallback(
         && ((sort_keys && index.has_aliases())
             || sorts_a_mapping(expr, index, bytes)
             || reorders_a_flow_sequence(expr, index, bytes)
+            || maps_a_commented_flow_collection(expr, index, bytes)
             || (is_array_of_nodes(expr) && index.has_aliases()))
 }
 
@@ -2801,35 +2802,50 @@ fn reorders_a_sequence(expr: &Expr) -> bool {
 /// `expr` as `NAV | REORDER` for a static navigation `NAV` (none for the document itself) and a
 /// `sort`, `sort_by`, `reverse`, `unique` or `unique_by`: the navigation (`None` at the root) and
 /// the reorder; `None` for any other shape (#6877).
-fn split_reorder_read(expr: &Expr) -> Option<(Option<Expr>, Expr)> {
-    let mut stages = Vec::new();
-    flatten_plain_pipe(expr, &mut stages);
-    let (last, nav) = stages.split_last()?;
-    let mut last = *last;
-    while let Expr::Paren(inner) = last {
-        last = inner;
-    }
-    if !reorders_a_sequence(last) {
+fn split_reorder_read(expr: &Expr) -> Option<(Option<Expr>, &Expr)> {
+    split_static_nav_then(expr, reorders_a_sequence)
+}
+
+/// `expr` as `NAV | map(f)` for a static navigation `NAV` (none for the document itself): the
+/// navigation (`None` at the root) and the `map`; `None` for any other shape (#6986).
+fn split_map_read(expr: &Expr) -> Option<(Option<Expr>, &Expr)> {
+    split_static_nav_then(expr, |last| matches!(last, Expr::Builtin(Builtin::Map(_))))
+}
+
+/// `expr` as `NAV | LAST` for a static navigation `NAV` (none for the document itself) and a last
+/// stage `is_last` accepts: the navigation (`None` at the root) and that stage; `None` for any
+/// other shape. The one parse [`split_reorder_read`] (#6877) and [`split_map_read`] (#6986) share.
+fn split_static_nav_then(
+    expr: &Expr,
+    is_last: impl Fn(&Expr) -> bool,
+) -> Option<(Option<Expr>, &Expr)> {
+    let (mut nav, last) = split_last_stage(expr)?;
+    if !is_last(last) {
         return None;
     }
     // `. | sort` is `sort`: an identity stage in front of the navigation moves nothing.
-    let nav: Vec<&Expr> = nav
-        .iter()
-        .copied()
-        .filter(|stage| !matches!(stage, Expr::Identity))
-        .collect();
+    nav.retain(|stage| !matches!(stage, Expr::Identity));
     if nav.is_empty() {
-        return Some((None, last.clone()));
+        return Some((None, last));
     }
-    nav.iter()
-        .all(|stage| static_nav_steps(stage).is_some_and(|steps| !steps.is_empty()))
-        .then(|| (Some(pipe_of(&nav)), last.clone()))
+    all_static_nav(&nav).then(|| (Some(pipe_of(&nav)), last))
 }
 
 /// The node `nav` reaches from `cursor` (`cursor` itself for none), when it is a flow-style
 /// sequence: the one definition of "the target of a reorder that keeps its presentation" that
 /// [`reorder_read_as_write`] and [`reorders_a_flow_sequence`] share (#6877).
 fn flow_sequence_target<'a, W: AsRef<[u64]> + Clone>(
+    nav: Option<&Expr>,
+    cursor: YamlCursor<'a, W>,
+) -> Option<YamlCursor<'a, W>> {
+    flow_collection_target(nav, cursor)
+        .filter(|target| matches!(target.value(), YamlValue::Sequence(_)))
+}
+
+/// The node `nav` reaches from `cursor` (`cursor` itself for none), when it is a flow-style
+/// sequence or mapping: what [`flow_sequence_target`] narrows to a sequence, and the node whose
+/// style a `map` over it takes (#6986).
+fn flow_collection_target<'a, W: AsRef<[u64]> + Clone>(
     nav: Option<&Expr>,
     cursor: YamlCursor<'a, W>,
 ) -> Option<YamlCursor<'a, W>> {
@@ -2840,7 +2856,11 @@ fn flow_sequence_target<'a, W: AsRef<[u64]> + Clone>(
             _ => return None,
         },
     };
-    (matches!(target.value(), YamlValue::Sequence(_)) && target.style() == "flow").then_some(target)
+    (matches!(
+        target.value(),
+        YamlValue::Sequence(_) | YamlValue::Mapping(_)
+    ) && target.style() == "flow")
+        .then_some(target)
 }
 
 /// The write form of a read that reorders a flow-style sequence (#6877): `NAV | sort` is
@@ -2859,7 +2879,7 @@ fn reorder_read_as_write<W: AsRef<[u64]> + Clone>(
         vec![
             Expr::Update {
                 path: Box::new(path.clone()),
-                filter: Box::new(reorder),
+                filter: Box::new(reorder.clone()),
             },
             path,
         ]
@@ -2875,17 +2895,66 @@ fn reorders_a_flow_sequence(expr: &Expr, index: &YamlIndex, bytes: &[u8]) -> boo
     let Some((nav, _)) = split_reorder_read(expr) else {
         return false;
     };
+    any_document(index, bytes, |doc| {
+        flow_sequence_target(nav.as_ref(), doc).is_some()
+    })
+}
+
+/// Whether `expr` is `NAV | map(f)` ([`split_map_read`]) over a flow-style sequence or mapping
+/// with a comment inside it, in some document of `bytes` (#6986). The streamers write such a
+/// result in flow, but without the layout a comment between its items needs, so it takes the DOM
+/// route, which gives the result the node's flow style ([`restyle_flow_map_result`]) and lays the
+/// comments out. Every other flow node keeps the streamers, several times faster on a large one;
+/// a comment elsewhere in the document, or the node's own (which yq does not keep), does not count.
+fn maps_a_commented_flow_collection(expr: &Expr, index: &YamlIndex, bytes: &[u8]) -> bool {
+    if !index.has_comments() {
+        return false;
+    }
+    let Some((nav, _)) = split_map_read(expr) else {
+        return false;
+    };
+    any_document(index, bytes, |doc| {
+        flow_collection_target(nav.as_ref(), doc).is_some_and(|target| target.has_comment_below())
+    })
+}
+
+/// Whether `test` holds for some document of `bytes`.
+fn any_document(
+    index: &YamlIndex,
+    bytes: &[u8],
+    test: impl Fn(YamlCursor<'_, Vec<u64>>) -> bool,
+) -> bool {
     let root = index.root(bytes);
     let YamlValue::Sequence(mut docs) = root.value() else {
         return false;
     };
     while let Some((doc, rest)) = docs.uncons_cursor() {
-        if flow_sequence_target(nav.as_ref(), doc).is_some() {
+        if test(doc) {
             return true;
         }
         docs = rest;
     }
     false
+}
+
+/// Give the one array `results` holds the flow style of the node a `NAV | map(f)` maps, when that
+/// node is a flow-style sequence or mapping, and nothing else of that node: yq's `map` builds a
+/// new sequence that copies the style of the node it maps, not its comments or anchor (#6986).
+/// The items keep the trees the evaluation gave them.
+fn restyle_flow_map_result<W: AsRef<[u64]> + Clone>(
+    expr: &Expr,
+    cursor: YamlCursor<'_, W>,
+    results: &mut [ResultWithComments],
+) {
+    let [(OwnedValue::Array(_), tree)] = results else {
+        return;
+    };
+    let Some((nav, _)) = split_map_read(expr) else {
+        return;
+    };
+    if flow_collection_target(nav.as_ref(), cursor).is_some() {
+        tree.set_meta(NodeMeta::empty().with_style("flow"));
+    }
 }
 
 /// Whether `expr` is a `sort`/`sort_by` of a mapping in some document of `bytes`, which the M2
@@ -8053,21 +8122,26 @@ fn is_key_stage(expr: &Expr) -> bool {
 /// `expr` as a non-empty static navigation followed by one last stage (parentheses removed),
 /// the shape both key-listing routes of #5450 start from; `None` for any other.
 fn split_static_nav_then_last(expr: &Expr) -> Option<(Vec<&Expr>, &Expr)> {
+    split_last_stage(expr).filter(|(nav, _)| !nav.is_empty() && all_static_nav(nav))
+}
+
+/// `expr`'s plain-pipe stages before its last one, and the last one with its parentheses taken
+/// off: the split [`split_static_nav_then_last`] and [`split_static_nav_then`] (#6986) share.
+fn split_last_stage(expr: &Expr) -> Option<(Vec<&Expr>, &Expr)> {
     let mut stages = Vec::new();
     flatten_plain_pipe(expr, &mut stages);
-    let (last, nav) = stages.split_last()?;
-    if nav.is_empty()
-        || !nav
-            .iter()
-            .all(|stage| static_nav_steps(stage).is_some_and(|steps| !steps.is_empty()))
-    {
-        return None;
-    }
-    let mut last = *last;
+    let mut last = stages.pop()?;
     while let Expr::Paren(inner) = last {
         last = inner;
     }
-    Some((nav.to_vec(), last))
+    Some((stages, last))
+}
+
+/// Whether every one of `stages` is a static navigation of at least one step.
+fn all_static_nav(stages: &[&Expr]) -> bool {
+    stages
+        .iter()
+        .all(|stage| static_nav_steps(stage).is_some_and(|steps| !steps.is_empty()))
 }
 
 /// `expr` as a *static navigation* followed by `map(key)`, split into the navigation and the
@@ -8914,6 +8988,13 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
                     }
                 }
             }
+        }
+    }
+
+    // #6986: a `map` over a flow-style node prints in flow, whatever its body, as in yq.
+    if need_comments {
+        if let Ok(results) = &mut docs {
+            restyle_flow_map_result(expr, cursor, results);
         }
     }
 
@@ -12296,6 +12377,9 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     // comma, each as a query of its own (a node keeps what its cursor carries), else the query.
     let stream_branches: Vec<&Expr> = comma_branches.unwrap_or_else(|| vec![&program.expr]);
     let reorders_root_sequence = reorders_a_sequence(&program.expr);
+    // #6986: the navigation in front of a `NAV | map(f)`, whose result prints in flow when the node
+    // it maps is a flow-style one.
+    let map_read_nav = split_map_read(&program.expr).map(|(nav, _)| nav);
     // #2276 code review (found live against this exact binary, on top of
     // #2262): `any_input_is_json` -- the same run-wide boolean #978
     // introduced and #996 later removed from `is_m2_streamable` above --
@@ -12760,6 +12844,19 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                         // comment block above it, which the items' streaming has no node to read.
                         let reordered_head =
                             reorders_root_sequence && matches!(result, GenericResult::LazySeq(_));
+                        // #6986: a `map` over a flow-style node is written in flow, as yq writes
+                        // it: width 0 is the streamers' flow layout (`IndentSpec::is_compact`).
+                        let result_indent = if matches!(result, GenericResult::LazySeq(_))
+                            && map_read_nav.as_ref().is_some_and(|nav| {
+                                flow_collection_target(nav.as_ref(), $cursor).is_some()
+                            }) {
+                            IndentSpec {
+                                width: 0,
+                                unit: yaml_indent.unit,
+                            }
+                        } else {
+                            yaml_indent
+                        };
                         let stats = stream_maybe_colored(
                             $writer,
                             $use_color,
@@ -12775,7 +12872,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                                 result
                                     .stream_yaml_terminating::<_, YqSemantics>(
                                         out,
-                                        yaml_indent,
+                                        result_indent,
                                         sort_keys,
                                         // #5721: a header-only document's own line break ends
                                         // it; a NUL replaces that break.
