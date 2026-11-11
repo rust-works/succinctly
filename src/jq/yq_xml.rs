@@ -7,6 +7,10 @@
 //! unless text follows it, which keeps `<a>1</a>` on one line. Comments are not written (the value model
 //! keeps none).
 
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+
 use super::error::EvalError;
 use super::expr::XmlOptions;
 use super::value::{ObjectMap, OwnedValue};
