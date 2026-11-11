@@ -159117,6 +159117,35 @@ mod tests {
         assert_eq!(bounds.resolve_object_children(2), 0..4);
     }
 
+    /// #6984: the length a fractional bound folds against is an array's element count or a
+    /// string's character count, and nothing else's -- for a cursor into the document and for
+    /// an owned value alike.
+    #[test]
+    fn the_length_a_slice_bound_folds_against_is_elements_or_characters_6984() {
+        let len_in_document = |json: &[u8]| {
+            let index = crate::json::JsonIndex::build(json);
+            let root = index.root(json);
+            standard_json_slice_len(&root.value())
+        };
+        assert_eq!(len_in_document(b"[1,2,3]"), Some(3));
+        assert_eq!(len_in_document(b"[]"), Some(0));
+        assert_eq!(
+            len_in_document("\"h\u{e9}llo\u{1f600}\"".as_bytes()),
+            Some(6)
+        );
+        assert_eq!(len_in_document(b"null"), None);
+        assert_eq!(len_in_document(b"{\"a\":1}"), None);
+
+        let array = OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+        assert_eq!(owned_slice_len(&array), Some(2));
+        assert_eq!(
+            owned_slice_len(&OwnedValue::String("h\u{e9}llo".into())),
+            Some(5)
+        );
+        assert_eq!(owned_slice_len(&OwnedValue::Null), None);
+        assert_eq!(owned_slice_len(&OwnedValue::Int(3)), None);
+    }
+
     /// #499: `eval_slice_expr` (plain reads, no `=`/`|=`/`path()`/`del()`)
     /// covering the shapes `test_computed_slice_bounds` doesn't reach — every
     /// case there goes through path resolution (`resolve_slice_expr`), a
