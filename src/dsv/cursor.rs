@@ -377,6 +377,20 @@ mod tests {
         // A delimiter inside a quote is not one, and a newline at the end is a row end.
         assert_eq!(rows(b"\"a,\""), vec![vec!["\"a,\""]]);
         assert_eq!(rows(b"a,b\n"), vec![vec!["a", "b"]]);
+        // A quoted empty field before it, and another delimiter byte.
+        assert_eq!(rows(b"\"\","), vec![vec!["\"\"", ""]]);
+        assert_eq!(rows(b"\"a\"\"b\","), vec![vec!["\"a\"\"b\"", ""]]);
+        let tsv = b"a\tb\t";
+        let tsv_index = build_index(tsv, &DsvConfig::tsv());
+        let tsv_fields: Vec<_> = DsvRows::new(tsv, &tsv_index)
+            .next()
+            .unwrap()
+            .fields()
+            .collect();
+        assert_eq!(
+            tsv_fields,
+            vec![b"a".as_slice(), b"b".as_slice(), b"".as_slice()]
+        );
         // `get` reads the same field the iterator does, and none past it.
         let text = b"a,b,";
         let index = build_index(text, &DsvConfig::default());
@@ -384,6 +398,19 @@ mod tests {
         assert_eq!(row.get(2), Some(b"".as_slice()));
         assert_eq!(row.get(3), None);
         assert_eq!(row.get(1), Some(b"b".as_slice()));
+        // ... on a row of empty fields, and on the last of several rows.
+        let text = b"a,b\n1,,";
+        let index = build_index(text, &DsvConfig::default());
+        let last = DsvRows::new(text, &index).nth(1).unwrap();
+        assert_eq!(last.get(0), Some(b"1".as_slice()));
+        assert_eq!(last.get(1), Some(b"".as_slice()));
+        assert_eq!(last.get(2), Some(b"".as_slice()));
+        assert_eq!(last.get(3), None);
+        let text = b",,";
+        let index = build_index(text, &DsvConfig::default());
+        let row = DsvRows::new(text, &index).next().unwrap();
+        assert_eq!(row.get(2), Some(b"".as_slice()));
+        assert_eq!(row.fields().count(), 3);
     }
 
     #[test]
