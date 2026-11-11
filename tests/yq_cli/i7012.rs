@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 
-use crate::run_yq_stdin_with_stderr;
+use crate::{run_yq_files, run_yq_stdin_with_stderr};
 
 const DOC: &str = "s: paths\na: 4\n";
 
@@ -82,5 +82,45 @@ fn the_program_and_the_eval_text_are_gated_alike_7012() -> Result<()> {
     assert!(err.contains("pass --jq-extensions"), "{err}");
     let (out, _, code) = run_yq_stdin_with_stderr("paths", DOC, &["--jq-extensions", "-o=json"])?;
     assert_eq!(code, 0, "{out}");
+    Ok(())
+}
+
+/// The flag is part of the parsed call, so every route that evaluates the program sees it:
+/// `--arg` text, `--eval-all`, and an `--inplace` write through `eval`.
+#[test]
+fn the_flag_holds_on_the_other_routes_7012() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let one = dir.path().join("one.yaml");
+    std::fs::write(&one, DOC)?;
+
+    let (out, err, code) = run_yq_stdin_with_stderr(
+        "eval($e)",
+        DOC,
+        &["--jq-extensions", "-o=json", "-I=0", "--arg", "e", "paths"],
+    )?;
+    assert_eq!(
+        (out.as_str(), err.as_str(), code),
+        ("[\"s\"]\n[\"a\"]\n", "", 0),
+        "--arg"
+    );
+
+    let (out, err, code) = run_yq_files(
+        r#"eval("limit(1; .a)")"#,
+        &[one.as_path()],
+        &["--jq-extensions", "-o=json", "-I=0", "--eval-all"],
+    )?;
+    assert_eq!(
+        (out.as_str(), err.as_str(), code),
+        ("4\n", "", 0),
+        "--eval-all"
+    );
+
+    let (_, err, code) = run_yq_files(
+        r#"eval("limit(1; .a)") = 9"#,
+        &[one.as_path()],
+        &["--jq-extensions", "-i"],
+    )?;
+    assert_eq!((err.as_str(), code), ("", 0), "--inplace");
+    assert_eq!(std::fs::read_to_string(&one)?, "s: paths\na: 9\n");
     Ok(())
 }
