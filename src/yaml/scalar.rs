@@ -139,6 +139,11 @@ impl ResolvedScalar {
             Self::Float(_) if is_preservable_float_literal(&text) => {
                 OwnedValue::from_number_literal::<YqSemantics>(&text)
             }
+            // #6958: an underscored float (`!!float 1_0.5`) keeps its text, as an underscored
+            // integer does. Built directly: `from_number_literal` reads `1_000` as an integer.
+            Self::Float(f) if underscored_float_value(&text) == Some(f) => {
+                OwnedValue::NumberLiteral(crate::jq::NumberRepr::Float(f), text.into_owned().into())
+            }
             // #6866: `08` resolves to a float and keeps its text like `007.5` does.
             Self::Float(_) if is_zero_padded_with_8_or_9(&text) => {
                 OwnedValue::from_number_literal::<YqSemantics>(&text)
@@ -641,13 +646,42 @@ pub fn spelled_float_json_text(raw: &str) -> Option<String> {
     if !is_spelled_float(raw) {
         return None;
     }
+    if raw.contains('_') {
+        return underscored_float_value(raw).map(format_float_with_fraction);
+    }
     let f: f64 = raw.parse().ok().filter(|f: &f64| f.is_finite())?;
     Some(format_float_with_fraction(f))
+}
+
+/// The finite float an underscored float text names (`1_0.5`, `1_000`, `1_0e1_0`), or `None` for
+/// any other text (#6958).
+///
+/// Go's `ParseFloat` takes an `_` only between two digits, and yq's tag-forced `!!float` reads the
+/// text with them dropped ([`resolve_tagged`]); a misplaced one (`1__0.5`, `_1.5`, `1.5_`) is no
+/// float. The text is the literal yq echoes through `tostring` and YAML output, as it does an
+/// underscored integer's.
+#[must_use]
+pub(crate) fn underscored_float_value(raw: &str) -> Option<f64> {
+    if !raw.contains('_') || !underscores_sit_between_digits(raw) {
+        return None;
+    }
+    let digits = raw.replace('_', "");
+    match resolve_plain(&digits) {
+        ResolvedScalar::Float(f) if f.is_finite() => Some(f),
+        // `-0_0` is the float -0 (`-00` reads as the integer 0, which has no sign to keep).
+        ResolvedScalar::Int(0) if digits.starts_with('-') => Some(-0.0),
+        ResolvedScalar::Int(n) => Some(n as f64),
+        _ => None,
+    }
 }
 
 /// Whether `raw` is a float spelled other than as JSON number syntax ([`spelled_float_json_text`]).
 #[must_use]
 pub fn is_spelled_float(raw: &str) -> bool {
+    // #6958: an underscored float is its text and nothing else.
+    if raw.contains('_') {
+        return underscored_float_value(raw).is_some();
+    }
     // #6866: `08` is a float with no `.` or exponent to make it one, so it has no JSON-safe spelling
     // to normalize to and is a spelled float on its text alone.
     if is_zero_padded_with_8_or_9(raw) {
@@ -703,7 +737,7 @@ pub fn yq_json_number_text(raw: &str) -> Option<String> {
 /// [`spelled_int_json_text`] reads both as 8.
 #[must_use]
 pub fn yq_json_number_text_for(raw: &str, is_float: bool) -> Option<String> {
-    if is_float && is_zero_padded_with_8_or_9(raw) {
+    if is_float && (is_zero_padded_with_8_or_9(raw) || raw.contains('_')) {
         return spelled_float_json_text(raw);
     }
     overflowed_int_json_text(raw)
@@ -794,7 +828,7 @@ pub(super) fn preservable_float_literal_text(s: &str) -> Option<String> {
 /// computed negative zero is emitted bare, as real yq does, rather than as
 /// `!!float -0` (#3445).
 #[must_use]
-pub(crate) fn needs_explicit_float_tag_in_yaml(text: &str) -> bool {
+pub fn needs_explicit_float_tag_in_yaml(text: &str) -> bool {
     !matches!(resolve_plain_sourced(text, false), ResolvedScalar::Float(_))
 }
 
@@ -886,7 +920,8 @@ pub fn resolve_tagged(text: &str, tag: &str) -> Option<ResolvedScalar> {
             _ if text.contains('_') && underscores_sit_between_digits(text) => {
                 match resolve_plain(&text.replace('_', "")) {
                     ResolvedScalar::Float(f) => ResolvedScalar::Float(f),
-                    ResolvedScalar::Int(n) => ResolvedScalar::Float(n as f64),
+                    ResolvedScalar::Int(_) => underscored_float_value(text)
+                        .map_or(ResolvedScalar::Str, ResolvedScalar::Float),
                     _ => ResolvedScalar::Str,
                 }
             }
@@ -1714,6 +1749,40 @@ mod tests {
         ] {
             assert!(!is_spelled_float(raw), "{raw}");
             assert_eq!(spelled_float_json_text(raw), None, "{raw}");
+        }
+    }
+
+    /// #6958: an underscored float is its text; Go's `ParseFloat` takes an `_` only between two
+    /// digits, and the JSON writers print the number as yq's `FormatFloat` does.
+    #[test]
+    fn an_underscored_float_is_its_text_6958() {
+        for (raw, value, json) in [
+            ("1_0.5", 10.5, "10.5"),
+            ("1_000", 1000.0, "1000.0"),
+            ("0_8", 8.0, "8.0"),
+            ("1_0e1_0", 1e11, "100000000000.0"),
+            ("+1_0.5", 10.5, "10.5"),
+            ("-1_0.5", -10.5, "-10.5"),
+            ("1_0.", 10.0, "10.0"),
+            (".5_5", 0.55, "0.55"),
+            ("00_1.5", 1.5, "1.5"),
+        ] {
+            assert_eq!(underscored_float_value(raw), Some(value), "{raw}");
+            assert!(is_spelled_float(raw), "{raw}");
+            assert_eq!(spelled_float_json_text(raw).as_deref(), Some(json), "{raw}");
+            assert_eq!(
+                yq_json_number_text_for(raw, true).as_deref(),
+                Some(json),
+                "{raw}"
+            );
+        }
+        // The float -0 keeps its sign, which the integer reading of `-00` has not.
+        assert!(underscored_float_value("-0_0").is_some_and(f64::is_sign_negative));
+        for raw in [
+            "1__0.5", "1_.5", "1._5", "_1.5", "1.5_", "1_", "_", "1_a", "1.5",
+        ] {
+            assert_eq!(underscored_float_value(raw), None, "{raw}");
+            assert!(!is_spelled_float(raw), "{raw}");
         }
     }
 

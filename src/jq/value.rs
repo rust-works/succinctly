@@ -3588,6 +3588,13 @@ impl OwnedValue {
             }
             return Self::from_number_literal::<S>(&spelling);
         }
+        // #6958: and a float whose text reads as an integer (`!!float 1_000`) under its own.
+        if let Some(spelling) = n.bridge_float_spelling() {
+            if let Some(f) = crate::yaml::underscored_float_value(&spelling) {
+                return Self::NumberLiteral(NumberRepr::Float(f), spelling.into());
+            }
+            return Self::from_number_literal::<S>(&spelling);
+        }
         if let Some(spelling) = n.bridge_spelling() {
             return Self::from_number_literal::<S>(&spelling);
         }
@@ -4777,6 +4784,13 @@ impl OwnedValue {
                         || !crate::json::validate::number_span_decodes(literal.as_bytes())) =>
             {
                 out.push_str(&crate::json::validate::spelling_token(literal));
+            }
+            // #6958: an underscored float (`!!float 1_0.5`, `1_000`) crosses under the float token:
+            // its text alone reads as an integer, or as no number at all.
+            Self::NumberLiteral(NumberRepr::Float(_), literal)
+                if literal.contains('_') && crate::yaml::is_spelled_float(literal) =>
+            {
+                out.push_str(&crate::json::validate::float_spelling_token(literal));
             }
             // #1356: and a spelled float (`+2.0`, `2.`, `1.e5`, `+1e5`). In jq's number model the
             // reader keeps a lenient `.5` or `007.5` itself, but peels a `+` and completes a

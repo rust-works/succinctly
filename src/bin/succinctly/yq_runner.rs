@@ -10367,6 +10367,15 @@ fn emit_yaml_value_at_depth(
         {
             tagged_int_literal(literal)
         }
+        // #6958: an underscored float echoes its text, which alone reads as an integer or as no
+        // number, so anywhere nested it carries the `!!float` tag, as yq's encoder writes it.
+        OwnedValue::NumberLiteral(NumberRepr::Float(_), literal)
+            if depth > 0
+                && literal.contains('_')
+                && succinctly::yaml::needs_explicit_float_tag_in_yaml(literal) =>
+        {
+            format!("!!float {literal}")
+        }
         OwnedValue::NumberLiteral(_, literal) => {
             // Echo the source spelling verbatim (#1008) rather than
             // routing through `number_str()`/`format_number_jq_compat`,
