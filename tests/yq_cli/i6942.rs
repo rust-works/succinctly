@@ -1,6 +1,7 @@
 //! #6942: a lone `!` (the non-specific tag) on an empty node is `null` in yq, as it is untagged. It was
 //! read as the empty string, like `!!str` and a custom tag (#6291), which decide a kind; `!` decides none.
-//! A `!` with a value (`! x`, `! 12`) is unchanged: the value keeps its natural type. Every row is a live
+//! A `!` with a value (`! x`, `! 12`) is unchanged: the value keeps its natural type. The verbatim spelling
+//! `!<!>` is the same tag. Every row is a live
 //! yq v4.53.3 capture (`-o=json -I0`) over a mapping value, a sequence item, a flow entry, a whole
 //! document with and without `---`, an anchor and a comment, with `tag`, `type`, `==`, `//` and a write
 //! that selects the nulls; a row is kept only where both agree. Left out: the YAML output of these nodes
@@ -273,6 +274,118 @@ const ROWS: &[(&str, &str, &str)] = &[
     ("a: ! \"\"\n", ".a // \"d\"", "\"\"\n"),
     (
         "a: ! \"\"\n",
+        "(.. | select(. == null)) |= \"N\"",
+        "{\"a\":\"\"}\n",
+    ),
+    ("a: ! |\n  t\n", ".", "{\"a\":\"t\\n\"}\n"),
+    ("a: ! |\n  t\n", ".. | tag", "\"!!map\"\n\"!!str\"\n"),
+    (
+        "a: ! |\n  t\n",
+        "[..] | map(type)",
+        "[\"!!map\",\"!!str\"]\n",
+    ),
+    ("a: ! |\n  t\n", ".a == null", "false\n"),
+    ("a: ! |\n  t\n", ".a // \"d\"", "\"t\\n\"\n"),
+    (
+        "a: ! |\n  t\n",
+        "(.. | select(. == null)) |= \"N\"",
+        "{\"a\":\"t\\n\"}\n",
+    ),
+    ("a: !<!>\n", ".", "{\"a\":null}\n"),
+    ("a: !<!>\n", ".. | tag", "\"!!map\"\n\"!!null\"\n"),
+    ("a: !<!>\n", "[..] | map(type)", "[\"!!map\",\"!!null\"]\n"),
+    ("a: !<!>\n", ".a == null", "true\n"),
+    ("a: !<!>\n", ".a // \"d\"", "\"d\"\n"),
+    (
+        "a: !<!>\n",
+        "(.. | select(. == null)) |= \"N\"",
+        "{\"a\":\"N\"}\n",
+    ),
+    ("a: !<!> 12\n", ".", "{\"a\":12}\n"),
+    ("a: !<!> 12\n", ".. | tag", "\"!!map\"\n\"!!int\"\n"),
+    (
+        "a: !<!> 12\n",
+        "[..] | map(type)",
+        "[\"!!map\",\"!!int\"]\n",
+    ),
+    ("a: !<!> 12\n", ".a == null", "false\n"),
+    ("a: !<!> 12\n", ".a // \"d\"", "12\n"),
+    (
+        "a: !<!> 12\n",
+        "(.. | select(. == null)) |= \"N\"",
+        "{\"a\":12}\n",
+    ),
+    ("a: !<!> x\n", ".", "{\"a\":\"x\"}\n"),
+    ("a: !<!> x\n", ".. | tag", "\"!!map\"\n\"!!str\"\n"),
+    ("a: !<!> x\n", "[..] | map(type)", "[\"!!map\",\"!!str\"]\n"),
+    ("a: !<!> x\n", ".a == null", "false\n"),
+    ("a: !<!> x\n", ".a // \"d\"", "\"x\"\n"),
+    (
+        "a: !<!> x\n",
+        "(.. | select(. == null)) |= \"N\"",
+        "{\"a\":\"x\"}\n",
+    ),
+    ("!<!>\n", ".", "null\n"),
+    ("!<!>\n", ".. | tag", "\"!!null\"\n"),
+    ("!<!>\n", "[..] | map(type)", "[\"!!null\"]\n"),
+    ("!<!>\n", ".a == null", "true\n"),
+    ("!<!>\n", ".a // \"d\"", "\"d\"\n"),
+    ("!<!>\n", "(.. | select(. == null)) |= \"N\"", "\"N\"\n"),
+    ("- !<!>\n- 1\n", ".", "[null,1]\n"),
+    (
+        "- !<!>\n- 1\n",
+        ".. | tag",
+        "\"!!seq\"\n\"!!null\"\n\"!!int\"\n",
+    ),
+    (
+        "- !<!>\n- 1\n",
+        "[..] | map(type)",
+        "[\"!!seq\",\"!!null\",\"!!int\"]\n",
+    ),
+    (
+        "- !<!>\n- 1\n",
+        "(.. | select(. == null)) |= \"N\"",
+        "[\"N\",1]\n",
+    ),
+    ("a: !<!>\nb: 1\n", ".", "{\"a\":null,\"b\":1}\n"),
+    (
+        "a: !<!>\nb: 1\n",
+        ".. | tag",
+        "\"!!map\"\n\"!!null\"\n\"!!int\"\n",
+    ),
+    (
+        "a: !<!>\nb: 1\n",
+        "[..] | map(type)",
+        "[\"!!map\",\"!!null\",\"!!int\"]\n",
+    ),
+    ("a: !<!>\nb: 1\n", ".a == null", "true\n"),
+    ("a: !<!>\nb: 1\n", ".a // \"d\"", "\"d\"\n"),
+    (
+        "a: !<!>\nb: 1\n",
+        "(.. | select(. == null)) |= \"N\"",
+        "{\"a\":\"N\",\"b\":1}\n",
+    ),
+    ("a: !<!> \"\"\n", ".", "{\"a\":\"\"}\n"),
+    ("a: !<!> \"\"\n", ".. | tag", "\"!!map\"\n\"!!str\"\n"),
+    (
+        "a: !<!> \"\"\n",
+        "[..] | map(type)",
+        "[\"!!map\",\"!!str\"]\n",
+    ),
+    ("a: !<!> \"\"\n", ".a == null", "false\n"),
+    ("a: !<!> \"\"\n", ".a // \"d\"", "\"\"\n"),
+    (
+        "a: !<!> \"\"\n",
+        "(.. | select(. == null)) |= \"N\"",
+        "{\"a\":\"\"}\n",
+    ),
+    ("a: !<!foo>\n", ".", "{\"a\":\"\"}\n"),
+    ("a: !<!foo>\n", ".. | tag", "\"!!map\"\n\"!foo\"\n"),
+    ("a: !<!foo>\n", "[..] | map(type)", "[\"!!map\",\"!foo\"]\n"),
+    ("a: !<!foo>\n", ".a == null", "false\n"),
+    ("a: !<!foo>\n", ".a // \"d\"", "\"\"\n"),
+    (
+        "a: !<!foo>\n",
         "(.. | select(. == null)) |= \"N\"",
         "{\"a\":\"\"}\n",
     ),
