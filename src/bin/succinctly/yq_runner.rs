@@ -27,8 +27,9 @@ use succinctly::jq::stream::StreamFailure;
 use succinctly::jq::{
     self, alias_identity, assert_value_tree_depth, is_alias_sensitive_assign,
     nesting_depth_exceeded_message, nonfinite_display_string, nonfinite_literal_display,
-    sync_aliased_paths, sync_merged_members, AssignOp, Builtin, DefScope, EvalError, Expr, Literal,
-    MetaSlot, NumberRepr, ObjectKey, ObjectMap, OwnedValue, QueryResult, YqSemantics,
+    sync_aliased_paths, sync_merged_members, AssignOp, Builtin, DefScope, EvalError, Expr,
+    FormatType, Literal, MetaSlot, NumberRepr, ObjectKey, ObjectMap, OwnedValue, QueryResult,
+    YqOutputEncoder, YqSemantics,
 };
 use succinctly::json::light::JsonCursor;
 use succinctly::json::validate;
@@ -895,6 +896,9 @@ struct OutputConfig {
     compact: bool,
     raw_output: bool,
     nul_output: bool,
+    /// No terminator after a result (#6850): `-o=props` and the other encoders end a result
+    /// themselves, or (`base64`, `uri`) not at all.
+    join_output: bool,
     ascii_output: bool,
     sort_keys: bool,
     no_doc: bool,
@@ -953,6 +957,7 @@ impl OutputConfig {
             // output keeps its quotes and escapes unless `-r` is explicit.
             raw_output: args.raw_output,
             nul_output: args.nul_output,
+            join_output: args.output_encoder_joins,
             ascii_output: args.ascii_output,
             sort_keys: args.sort_keys,
             no_doc: args.no_doc,
@@ -1021,6 +1026,7 @@ impl OutputConfig {
             compact: self.compact,
             raw_output: self.raw_output,
             nul_output: self.nul_output,
+            join_output: self.join_output,
             ascii_output: self.ascii_output,
             sort_keys: self.sort_keys,
             no_doc: self.no_doc,
@@ -9440,7 +9446,7 @@ impl SplitDocState {
 /// path was taken (confirmed live on unmodified `main`, same root cause
 /// and fix shape as #1699's `--no-doc` gap in the same macro).
 fn terminator_from_config(config: &OutputConfig) -> Terminator {
-    Terminator::from_flags(config.nul_output, false)
+    Terminator::from_flags(config.nul_output, config.join_output)
 }
 
 /// Write the appropriate line terminator based on output config.
@@ -9505,6 +9511,15 @@ fn output_value<W: Write>(
     // Handle raw output for scalars
     if config.raw_output {
         if let OwnedValue::String(s) = value {
+            // #6850: an encoder's result under `-0` loses its own last line end before the NUL, as yq's
+            // printer trims the encoder's output.
+            let s = if config.join_output && config.nul_output {
+                s.strip_suffix("\r\n")
+                    .or_else(|| s.strip_suffix(['\r', '\n']))
+                    .unwrap_or(s)
+            } else {
+                s
+            };
             reject_nul_output(s, config)?;
             write_pending_separator(writer, separator, terminator_from_config(config))?;
             write!(writer, "{s}")?;
@@ -11601,6 +11616,26 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         };
     }
 
+    // #6850: `-o=props|shell|csv|tsv|base64|uri` is the run's results through that format's
+    // encoder, printed raw. The program is wrapped below, once it is parsed; from here on the run
+    // is a YAML-output run with `-r`.
+    let output_encoder = match args.output_format {
+        OutputFormat::Props => Some(YqOutputEncoder::Props),
+        OutputFormat::Shell => Some(YqOutputEncoder::Shell(args.shell_key_separator.clone())),
+        OutputFormat::Csv => Some(YqOutputEncoder::Csv),
+        OutputFormat::Tsv => Some(YqOutputEncoder::Tsv),
+        OutputFormat::Base64 => Some(YqOutputEncoder::Base64),
+        OutputFormat::Uri => Some(YqOutputEncoder::Uri),
+        OutputFormat::Yaml | OutputFormat::Json | OutputFormat::Auto => None,
+    };
+    if output_encoder.is_some() {
+        // Every encoder writes its own line ends (or none), so nothing is added after a result.
+        args.output_format = OutputFormat::Yaml;
+        args.raw_output = true;
+        args.no_doc = true;
+        args.output_encoder_joins = true;
+    }
+
     // Handle --version
     if args.version {
         println!("succinctly-yq {}", env!("CARGO_PKG_VERSION"));
@@ -11786,6 +11821,11 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         if let Some(folded) = fold_nav_into_key_array(&program.expr) {
             program.expr = folded;
         }
+    }
+
+    if let Some(format) = output_encoder {
+        program.expr =
+            Expr::Pipe(vec![program.expr, Expr::Format(FormatType::YqOutput(format))].into());
     }
 
     // Parse the --split-exp expression, if given, once up front, applying
@@ -15126,6 +15166,7 @@ mod tests {
             compact: true,
             raw_output: false,
             nul_output: false,
+            join_output: false,
             ascii_output: false,
             sort_keys: false,
             no_doc: false,
@@ -15242,6 +15283,7 @@ mod tests {
             compact: true,
             raw_output: false,
             nul_output: false,
+            join_output: false,
             ascii_output: false,
             sort_keys: false,
             no_doc: false,
@@ -15727,6 +15769,7 @@ mod tests {
             compact: false,
             raw_output: false,
             nul_output: false,
+            join_output: false,
             ascii_output: false,
             sort_keys: false,
             no_doc: false,
@@ -15783,6 +15826,7 @@ mod tests {
             compact: false,
             raw_output: false,
             nul_output: false,
+            join_output: false,
             ascii_output: false,
             sort_keys: false,
             no_doc: false,
@@ -17060,6 +17104,7 @@ mod tests {
             compact: false,
             raw_output: false,
             nul_output: false,
+            join_output: false,
             ascii_output: false,
             sort_keys: false,
             no_doc: false,

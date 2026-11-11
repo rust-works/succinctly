@@ -508,7 +508,7 @@ use super::expr::{
     retention_scope, ArithOp, ArithSettleMemo, AssignOp, BindOrigin, BoundBody, Builtin, CompareOp,
     Expr, FormatType, FuncDefBound, FuncDefData, Libm1, Libm2, Libm3, Literal, MergeFlags,
     MetaSlot, NumberKey, ObjectEntry, ObjectKey, Origin, Param, Pattern, PatternEntry, PipeStages,
-    SharedArg, SliceBoundKey, StageClass, StringPart, TailPlan, Tracked,
+    SharedArg, SliceBoundKey, StageClass, StringPart, TailPlan, Tracked, YqOutputEncoder,
 };
 #[cfg(test)]
 use super::value::SharableString;
@@ -25585,6 +25585,7 @@ pub(crate) fn format_owned<S: EvalSemantics>(
         FormatType::Urid => format_urid::<S>(owned, optional),
         FormatType::Yaml => format_yaml(owned),
         FormatType::Props => format_props(owned),
+        FormatType::YqOutput(encoder) => format_yq_output::<S>(encoder, owned),
         FormatType::YqJson(indent) => {
             // #6887: yq's JSON encoder refuses a non-finite number.
             if let Some(message) = owned.yq_non_finite_json_error(false) {
@@ -26040,7 +26041,11 @@ fn yq_csv_field(field: &str, comma: char) -> String {
 /// of scalars one record, an array of arrays one record each, and an array of flat objects a
 /// header record of the first object's keys then one record each. The trailing newlines are
 /// trimmed. A `null` is spelled `null` (yq keeps the source spelling, `~` included).
-fn format_yq_csv<S: EvalSemantics>(value: &OwnedValue, comma: char) -> Result<String, EvalError> {
+fn format_yq_csv<S: EvalSemantics>(
+    value: &OwnedValue,
+    comma: char,
+    line_ends: bool,
+) -> Result<String, EvalError> {
     fn scalar<S: EvalSemantics>(v: &OwnedValue) -> Option<String> {
         match v {
             OwnedValue::Array(_) | OwnedValue::Object(_) => None,
@@ -26070,7 +26075,13 @@ fn format_yq_csv<S: EvalSemantics>(value: &OwnedValue, comma: char) -> Result<St
                 "csv encoding only works for arrays, got: !!map".to_string(),
             ))
         }
-        scalar_input => return Ok(scalar::<S>(scalar_input).unwrap_or_default()),
+        scalar_input => {
+            let mut text = scalar::<S>(scalar_input).unwrap_or_default();
+            if line_ends {
+                text.push('\n');
+            }
+            return Ok(text);
+        }
     };
     let mut out = String::new();
     match items.first() {
@@ -26115,14 +26126,16 @@ fn format_yq_csv<S: EvalSemantics>(value: &OwnedValue, comma: char) -> Result<St
             record(&mut out, &fields, comma);
         }
     }
-    out.truncate(out.trim_end_matches('\n').len());
+    if !line_ends {
+        out.truncate(out.trim_end_matches('\n').len());
+    }
     Ok(out)
 }
 
 /// @csv - CSV format (for arrays)
 fn format_csv<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
     if S::TAG == EvalTag::Yq {
-        return format_yq_csv::<S>(value, ',');
+        return format_yq_csv::<S>(value, ',', false);
     }
     match value {
         OwnedValue::Array(arr) => {
@@ -26142,7 +26155,7 @@ fn format_csv<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<St
 /// @tsv - TSV format (for arrays)
 fn format_tsv<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
     if S::TAG == EvalTag::Yq {
-        return format_yq_csv::<S>(value, '\t');
+        return format_yq_csv::<S>(value, '\t', false);
     }
     match value {
         OwnedValue::Array(arr) => {
@@ -26782,6 +26795,126 @@ fn format_props_recursive(value: &OwnedValue, prefix: String, out: &mut String, 
             // else: a scalar whose joined key is empty (`{"":"v"}`) writes nothing in yq, not even a line
         }
     }
+}
+
+/// yq's `-o=<format>` encoders (#6850): the whole result as that format, line ends included, so the
+/// caller prints it with none of its own.
+///
+/// `props`, `shell`, `csv` and `tsv` end every line (`csv` and `tsv` write nothing for `[]`).
+/// `base64` and `uri` write no line break and take a string only (`@base64` and `@uri` stringify other
+/// values first; the encoders refuse them, naming the tag).
+fn format_yq_output<S: EvalSemantics>(
+    encoder: &YqOutputEncoder,
+    value: &OwnedValue,
+) -> Result<String, EvalError> {
+    match encoder {
+        YqOutputEncoder::Props => format_props(value),
+        YqOutputEncoder::Shell(separator) => Ok(format_shell_variables(value, separator)),
+        YqOutputEncoder::Csv => format_yq_csv::<S>(value, ',', true),
+        YqOutputEncoder::Tsv => format_yq_csv::<S>(value, '\t', true),
+        YqOutputEncoder::Base64 => match value {
+            OwnedValue::String(_) => format_base64::<S>(value, false),
+            other => Err(yq_encoder_needs_a_string(other, "base64")),
+        },
+        YqOutputEncoder::Uri => match value {
+            OwnedValue::String(_) => format_uri::<S>(value, false),
+            other => Err(yq_encoder_needs_a_string(other, "URI")),
+        },
+    }
+}
+
+/// What `-o=base64` and `-o=uri` say of a value that is not a string, naming its tag (#6850).
+fn yq_encoder_needs_a_string(value: &OwnedValue, format: &str) -> EvalError {
+    let tag = owned_yaml_type_tag(value);
+    if format == "URI" {
+        EvalError::new(format!(
+            "cannot encode {tag} as URI, can only operate on strings. Please first pipe through \
+             another encoding operator to convert the value to a string"
+        ))
+    } else {
+        EvalError::new(format!(
+            "cannot encode {tag} as {format}, can only operate on strings"
+        ))
+    }
+}
+
+/// yq's `-o=shell` encoder (#6850): one `name=value` line per scalar, comments dropped.
+///
+/// A key is reduced to a shell variable name one component at a time: a character outside `[A-Za-z0-9_]` becomes
+/// `_` and a non-ASCII or control character is dropped (yq decomposes with NFKD first, so `é` keeps its `e` there
+/// and is lost here). The root component gets a leading `_` unless it starts with a letter or `_`, which is also
+/// what an empty root key becomes. A root scalar is named `value`. A value is written as it is when it holds
+/// only `[A-Za-z0-9_]` and single-quoted otherwise, a `'` inside written `'"'"'`. Captured from yq v4.53.3.
+fn format_shell_variables(value: &OwnedValue, separator: &str) -> String {
+    fn component(raw: &str) -> String {
+        raw.chars()
+            .filter_map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    Some(c)
+                } else if (c as u32) < 32 || (c as u32) > 126 {
+                    None
+                } else {
+                    Some('_')
+                }
+            })
+            .collect()
+    }
+    fn append(path: &str, raw: &str, separator: &str) -> String {
+        let key = component(raw);
+        if path.is_empty() {
+            if key.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+                key
+            } else {
+                format!("_{key}")
+            }
+        } else {
+            format!("{path}{separator}{key}")
+        }
+    }
+    fn quote(text: &str) -> String {
+        if text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            text.to_string()
+        } else {
+            format!("'{}'", text.replace('\'', "'\"'\"'"))
+        }
+    }
+    fn walk(value: &OwnedValue, path: &str, separator: &str, out: &mut String, depth: usize) {
+        assert_value_tree_depth(depth);
+        match value {
+            OwnedValue::Object(obj) => {
+                for (key, val) in obj {
+                    walk(
+                        val,
+                        &append(path, key, separator),
+                        separator,
+                        out,
+                        depth + 1,
+                    );
+                }
+            }
+            OwnedValue::Array(arr) => {
+                for (idx, val) in arr.iter().enumerate() {
+                    walk(
+                        val,
+                        &append(path, &idx.to_string(), separator),
+                        separator,
+                        out,
+                        depth + 1,
+                    );
+                }
+            }
+            scalar => {
+                let name = if path.is_empty() { "value" } else { path };
+                out.push_str(name);
+                out.push('=');
+                out.push_str(&quote(&props_value_to_string(scalar, false)));
+                out.push('\n');
+            }
+        }
+    }
+    let mut out = String::new();
+    walk(value, "", separator, &mut out, 0);
+    out
 }
 
 /// yq's properties encoder escaping (#4977): the Java `.properties` rules of the library it uses, captured

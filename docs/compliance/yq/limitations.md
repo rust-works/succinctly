@@ -7534,3 +7534,21 @@ A document `.inf`/`.nan` used as a number fails in yq while it computes, in ever
 `==`, `!=`, `//`, a string or `null` on the other side, `length`, and a computed infinity (`1 / 0`) are unchanged, and `[.a] | max` has no comparison to make.
 When an update (`|=`, `map_values`) fails on several nodes, yq reports the last node's text and `succinctly yq` the first: over `a: .inf` and `b: -.inf`, `map_values(. + 1)` names `"-.inf"` in yq and `".inf"` here.
 `sort` and `sort_by` over such a scalar panic in yq with a Go stack trace, and order it here (see the NaN and infinities entry in the sort section).
+
+### `-o props|shell|csv|tsv|base64|uri` — the first slice of yq's output formats; six rows still differ ([#6850](https://github.com/rust-works/succinctly/issues/6850))
+
+`-o=props`, `-o=shell`, `-o=csv`, `-o=tsv`, `-o=base64` and `-o=uri` (and the short names `p`, `s`, `c`, `t`) run the filter and write each result through that format's encoder, with no `---` between documents.
+`--shell-key-separator` is read.
+The other formats yq lists (`kyaml`, `xml`, `toml`, `hcl`, `lua`, `ini`) and every input format but YAML and JSON are still refused at the flag, as are `--properties-separator`, `--properties-array-brackets` and `--csv-separator`.
+Six rows differ from yq v4.53.3, each pinned out of `tests/yq_cli/i6850.rs`:
+
+- A comment in a `props` document is not written.
+  yq writes a head and a line comment as `# ...` lines above the key, and the `@props` filter has the same gap.
+- A null written `~` prints `null`, where yq echoes the spelling (`c = ~`, `c='~'`, #2802).
+- An encoder that fails after earlier results printed leaves nothing on stdout here, where yq printed those results first: `printf 'a: x\nb: [1]\nc: {d: e}\n' | yq -o=csv '.[]'` prints `x` and `1` in yq.
+  The error line and the exit status are the same.
+  The failure is raised while the filter runs, because the encoder is the filter's last stage, and the filter's results are only printed when it finishes.
+- `-e` reads the encoded text, which is never null or false, so it exits 0 where yq exits 1 for a null or false result.
+- A `shell` key with an accented letter loses it (`é` is dropped), where yq decomposes it first and keeps the `e`.
+- `-o=csv` and `-o=tsv` with `-0` write each result's row here and a bare NUL in yq: yq's CSV writer is not flushed before the NUL, so the row is lost.
+  Writing it matches nothing yq can be asked to read back (rule 4(b)).
