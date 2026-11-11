@@ -4772,6 +4772,10 @@ so `--jq-extensions` `path(.[])` over `5` is empty rather than jq's raise. A `nu
 the resolver cannot tell a stored `null` from the `null` placeholder an out-of-range index or
 a missing key reads as, and dropping the branch for the placeholder would be silently wrong
 (`del(.[-1], .[4][])`).
+A `del()` with one target is not that case (#6892): `del(.zz[] | select(.n == 1))` over a document without `zz`, or with `zz: ~`, deletes nothing and leaves the document as it is, as yq does.
+There is no sibling for a placeholder to stand in for, so the resolver yields no branch for a `null` there.
+Over a stored `null` yq also turns it into `[]` (`a: ~` becomes `a: []`), which this does not.
+With a comma (`del(.zz[] | select(.n == 1), .kind)`) and for a field write through the same path (`(.zz[] | select(.n == 1)).x = 5`, which yq answers by adding `zz: []`) the raise stays.
 
 ### A slice keeps an explicit `!!str`/`!!int` tag, but not `!!binary` or an alias ([#4328](https://github.com/rust-works/succinctly/issues/4328))
 
