@@ -64,6 +64,73 @@ fn yq_uri_and_base64_refuse_a_computed_non_string_6980() -> Result<()> {
     Ok(())
 }
 
+/// An alias reaches the builtin as its anchor's value: refused when that is not a string, encoded
+/// when it is. A string node under `!!str` or a custom tag is still a string (yq v4.53.3).
+#[test]
+fn yq_uri_and_base64_of_an_alias_or_a_tagged_string_6980() -> Result<()> {
+    let input = "a: &x 1\nb: *x\ns: &y hi\nt: *y\ne: !!str 1\nf: !foo x\n";
+    for (filter, expected) in [
+        (".t | @uri", "\"hi\"\n"),
+        (".t | @base64", "\"aGk=\"\n"),
+        (".e | @uri", "\"1\"\n"),
+        (".e | @base64", "\"MQ==\"\n"),
+        (".f | @uri", "\"x\"\n"),
+        (".f | @base64", "\"eA==\"\n"),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, input, &["-o=json", "-I=0"])?;
+        assert_eq!((stdout.as_str(), code), (expected, 0), "{filter}: {stderr}");
+    }
+    for (filter, expected) in [
+        (
+            ".b | @uri",
+            format!("Error: cannot encode !!int as URI, {URI_HINT}"),
+        ),
+        (
+            ".b | @base64",
+            "Error: cannot encode !!int as base64, can only operate on strings".into(),
+        ),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, input, &["-o=json", "-I=0"])?;
+        assert_eq!((stdout.as_str(), code), ("", 1), "{filter}");
+        assert_eq!(stderr.trim_end(), expected, "{filter}");
+    }
+    Ok(())
+}
+
+/// Behind `--jq-extensions`, `format(name)` is `@name` in yq mode, as `format("sh")` already was, so
+/// `uri` and `base64` refuse a non-string too; `@html`, which yq lacks, still stringifies as jq does.
+#[test]
+fn yq_jq_extensions_format_names_follow_the_at_formats_6980() -> Result<()> {
+    let ext = ["--jq-extensions", "-o=json", "-I=0"];
+    for (filter, expected) in [
+        (
+            "1 | format(\"uri\")",
+            format!("Error: cannot encode !!int as URI, {URI_HINT}"),
+        ),
+        (
+            "1 | format(\"sh\")",
+            format!("Error: cannot encode !!int as URI, {URI_HINT}"),
+        ),
+        (
+            "1 | format(\"base64\")",
+            "Error: cannot encode !!int as base64, can only operate on strings".into(),
+        ),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, INPUT, &ext)?;
+        assert_eq!((stdout.as_str(), code), ("", 1), "{filter}");
+        assert_eq!(stderr.trim_end(), expected, "{filter}");
+    }
+    for (filter, expected) in [
+        ("1 | @html", "\"1\"\n"),
+        ("null | format(\"html\")", "\"null\"\n"),
+        ("\"a b\" | format(\"uri\")", "\"a+b\"\n"),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, INPUT, &ext)?;
+        assert_eq!((stdout.as_str(), code), (expected, 0), "{filter}: {stderr}");
+    }
+    Ok(())
+}
+
 /// jq stringifies a scalar first and JSON-encodes a container (#1096), unchanged by #6980
 /// (captured from jq 1.7.1).
 #[test]

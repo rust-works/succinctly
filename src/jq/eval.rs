@@ -25758,11 +25758,9 @@ fn format_json<S: EvalSemantics>(value: &OwnedValue) -> Result<String, EvalError
 /// `tostring`/`@json` do (`[1,2] | @uri` => `"%5B1%2C2%5D"`, confirmed
 /// against real jq 1.7.1, #1096).
 ///
-/// yq diverges here and keeps rejecting a container outright for all
-/// three of these formats ("cannot encode !!seq as URI/base64...",
-/// confirmed against real yq v4.53.3) -- `None` on that branch lets each
-/// caller's own existing type-error fallback fire unchanged, matching
-/// yq's pre-#1096 behavior exactly.
+/// yq mode returns `None` for a container. Only `@html` (a jq-only format, behind
+/// `--jq-extensions`) still reaches that arm there: `format_uri` and `format_base64`
+/// refuse every non-string first in yq mode, naming its tag as yq does (#6980).
 ///
 /// One definition instead of a hand-copy per caller, per this file's own
 /// #106 lesson (see [`owned_value_to_json`]'s doc comment, which this
@@ -26752,11 +26750,7 @@ fn format_sh<S: EvalSemantics>(value: &OwnedValue, _optional: bool) -> Result<St
         return match value {
             OwnedValue::String(s) => Ok(yq_shell_quote(s)),
             // #5836: yq refuses with its `@uri` wording, as the document route does.
-            _ => Err(EvalError::new(format!(
-                "cannot encode {} as URI, can only operate on strings. Please first pipe through \
-                 another encoding operator to convert the value to a string",
-                owned_yaml_type_tag(value)
-            ))),
+            _ => Err(yq_encoder_needs_a_string(value, "URI")),
         };
     }
 
@@ -26896,8 +26890,8 @@ fn format_props_recursive(
 /// caller prints it with none of its own.
 ///
 /// `props`, `shell`, `csv` and `tsv` end every line (`csv` and `tsv` write nothing for `[]`).
-/// `base64` and `uri` write no line break and take a string only (`@base64` and `@uri` stringify other
-/// values first; the encoders refuse them, naming the tag).
+/// `base64` and `uri` write no line break and take a string only, refusing any other value by its tag
+/// as `@base64` and `@uri` do in yq mode (#6980).
 fn format_yq_output<S: EvalSemantics>(
     encoder: &YqOutputEncoder,
     value: &OwnedValue,
@@ -26914,14 +26908,8 @@ fn format_yq_output<S: EvalSemantics>(
         YqOutputEncoder::Toml => format_toml(value),
         YqOutputEncoder::Kyaml(indent) => Ok(format_kyaml(value, *indent)),
         YqOutputEncoder::Tsv => format_yq_csv::<S>(value, '\t', true),
-        YqOutputEncoder::Base64 => match value {
-            OwnedValue::String(_) => format_base64::<S>(value, false),
-            other => Err(yq_encoder_needs_a_string(other, "base64")),
-        },
-        YqOutputEncoder::Uri => match value {
-            OwnedValue::String(_) => format_uri::<S>(value, false),
-            other => Err(yq_encoder_needs_a_string(other, "URI")),
-        },
+        YqOutputEncoder::Base64 => format_base64::<S>(value, false),
+        YqOutputEncoder::Uri => format_uri::<S>(value, false),
     }
 }
 
