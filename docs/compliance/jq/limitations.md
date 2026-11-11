@@ -11009,8 +11009,9 @@ jq tests the input before it reads the format.
 name, a `:name`, a path or a POSIX string, and the system zone when `TZ` is unset, with the offset
 and abbreviation in effect *at the timestamp* (see
 [the labels below](#strflocaltimes-z-z-and-s-are-the-zones-own-where-jq-171s-are-not-3054)). The
-`strftime` specifiers the two share, and `strftime`'s own `%z`/`%Z`, are tracked in
-[#3055](https://github.com/rust-works/succinctly/issues/3055).
+`strftime` specifiers the two share were [#3055](https://github.com/rust-works/succinctly/issues/3055);
+`strftime`'s own `%z`, `%Z` and `%s` are UTC's whatever `TZ` is, where jq 1.7.1's are not
+([below](#strftimes-z-z-and-s-are-utcs-where-jq-171s-follow-the-local-zone-7014)).
 
 ### `strflocaltime`'s `%z`, `%Z` and `%s` are the zone's own, where jq 1.7.1's are not (#3054)
 
@@ -11089,24 +11090,27 @@ and the `jq-linux-arm64` release binaries):
   The instants tried from `1000000000000` (year 33658) to `100000000000000` (year 3170843) agree on all three.
   The cause was not traced; glibc is the odd one out, the macOS jq and this implementation agreeing at `1000000000000000`.
 
-### `strftime("%s")` is the timestamp itself, where jq 1.7.1 shifts it by the zone's standard offset (#7014)
+### `strftime`'s `%z`, `%Z` and `%s` are UTC's, where jq 1.7.1's follow the local zone (#7014)
 
-jq 1.7.1 turns `strftime`'s UTC fields back into seconds for `%s` with the C library's *local* `mktime`, so away from UTC it prints a different instant from the input.
-`strftime` and `gmtime | strftime` agree with each other, and every other specifier is unaffected:
+`strftime` formats a UTC time, and succinctly labels it as one in every zone: `%z` is `+0000`, `%Z` is `UTC` and `%s` is the timestamp itself.
+jq 1.7.1 hands the C library's `strftime` a broken-down time with no zone of its own, so the label comes from `TZ`, and for `%s` it turns the UTC fields back into seconds with the *local* `mktime`.
+`strftime` and `gmtime | strftime` agree with each other, and the field specifiers (`%S %M %H %c %T` and the rest) are unaffected:
 
-| `TZ`               | input        | jq 1.7.1 (macOS and glibc) | jq 1.8.2 and succinctly |
-|--------------------|--------------|----------------------------|-------------------------|
-| `UTC`              | `1700000000` | `"1700000000"`             | `"1700000000"`          |
-| `EST5EDT`          | `0`          | `"18000"`                  | `"0"`                   |
-| `America/New_York` | `1720000000` | `"1720018000"`             | `"1720000000"`          |
-| `Asia/Kolkata`     | `1720000000` | `"1719980200"`             | `"1720000000"`          |
+| `TZ`               | input        | jq 1.7.1, macOS                 | jq 1.7.1, glibc                 | jq 1.8.2 (macOS) and succinctly |
+|--------------------|--------------|---------------------------------|---------------------------------|---------------------------------|
+| `UTC`              | `1700000000` | `"+0000 UTC 1700000000"`        | `"+0000 UTC 1700000000"`        | `"+0000 UTC 1700000000"`        |
+| `EST5EDT`          | `0`          | `"-0500 EST 18000"`             | `"+0000 EST 18000"`             | `"+0000 UTC 0"`                 |
+| `EST5EDT`          | `1700000000` | `"-0500 EST 1700018000"`        | `"+0000 EST 1700018000"`        | `"+0000 UTC 1700000000"`        |
+| `America/New_York` | `1720000000` | `"-0500 EST 1720018000"`        | `"+0000 EST 1720018000"`        | `"+0000 UTC 1720000000"`        |
+| `Asia/Kolkata`     | `1720000000` | `"+0530 IST 1719980200"`        | `"+0000 IST 1719980200"`        | `"+0000 UTC 1720000000"`        |
 
-The shift is the zone's *standard* offset even for a daylight-time instant (`1720000000` is in July, yet `America/New_York` moves it five hours, not four), because jq's broken-down time says daylight time is not in effect.
-The macOS and glibc builds of jq 1.7.1 print the same strings for every row above and for `0` and `1700000000` in each zone (`/usr/bin/jq` on macOS, `jq-1.7.1` on Ubuntu x86_64).
-This is the reading [#3054's entry](#strflocaltimes-z-z-and-s-are-the-zones-own-where-jq-171s-are-not-3054) takes for `strflocaltime`'s `%s`: an ADR-0018 rule 4 divergence ("matching would corrupt data"), since the string jq 1.7.1 prints names an instant offset from the one it was given, and jq 1.8.2 prints the input as succinctly does.
+(`strftime("%z %Z %s")`; `/usr/bin/jq` on macOS, `jq-1.7.1` on Ubuntu x86_64, `/opt/homebrew/bin/jq`; jq 1.8.2 on glibc was not captured.)
+The shift in `%s` is the zone's *standard* offset even for a daylight-time instant (`1720000000` is in July, yet `America/New_York` moves it five hours, not four), and `%z`/`%Z` name the standard time too, because jq's broken-down time says daylight time is not in effect.
+glibc's `%z` is `+0000` in every zone, as in #3054's table.
+This is the reading [#3054's entry](#strflocaltimes-z-z-and-s-are-the-zones-own-where-jq-171s-are-not-3054) takes for `strflocaltime`'s labels: an ADR-0018 rule 4 divergence ("matching would corrupt data"), since jq 1.7.1's `%s` names an instant offset from the one it was given and its `%z`/`%Z` label UTC fields with another zone, and jq 1.8.2 prints what succinctly does.
 That reading is likewise for the ADR's owners to confirm.
-`%s` of a time before 1900 is `-1` in both, by the `timegm` rule above.
-`tests/jq_cli/i7014.rs` pins the answers in the table under each `TZ`.
+Before 1900 the macOS jq's `%s` is `-1`, as succinctly's is by the `timegm` rule above; the glibc jq converts the date and shifts it (`TZ=EST5EDT`, `-2300000000` prints `"-2299982000"`).
+`tests/jq_cli/i7014.rs` pins succinctly's answers in the table.
 
 ### `strftime`/`strflocaltime` localize through the C library where there is one (#5754)
 
