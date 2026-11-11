@@ -459,8 +459,8 @@ Geomean speedup over jq-1.7.1 (its time over `succinctly jq`'s; below 1.00x jq i
 
 | CPU                                                                    | Commit      | Startup |  1 MB | 10 MB | 100 MB | All rows | jq faster on |
 |------------------------------------------------------------------------|-------------|---------|-------|-------|--------|----------|--------------|
-| [AMD Ryzen 9 7950X 16-Core Processor](docs/compare/jq-linux-x86_64.md) | `968a5fa84` |   0.92x | 1.77x | 2.52x |  3.13x |    2.25x |    25 of 201 |
-| [Apple M4 Pro](docs/compare/jq-macos-aarch64.md)                       | `968a5fa84` |   0.65x | 1.71x | 3.02x |  4.23x |    2.51x |    25 of 201 |
+| [AMD Ryzen 9 7950X 16-Core Processor](docs/compare/jq-linux-x86_64.md) | `edc89b5c1` |   0.99x | 1.76x | 2.55x |  3.15x |    2.21x |    19 of 221 |
+| [Apple M4 Pro](docs/compare/jq-macos-aarch64.md)                       | `edc89b5c1` |   0.61x | 1.55x | 3.01x |  4.24x |    2.31x |    38 of 221 |
 <!-- /compare:jq-summary -->
 
 The lead over jq grows with input size, and jq is faster at startup and on small inputs (the per-query tables in
