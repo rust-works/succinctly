@@ -143,15 +143,12 @@ fn test_raw_json_output_prints_the_spelling_2802() -> Result<()> {
 }
 
 /// A message names the number a spelled integer is (`number (31)`), not a mangled text
-/// (`x1f`, from reading its `0` as a leading zero); yq words these errors differently, so only
-/// the value is pinned.
+/// (`x1f`, from reading its `0` as a leading zero); yq words most of these errors differently, so
+/// only the value is pinned. (`.a - "x"` is yq's `!!int cannot be added to !!str` since #6904, with
+/// no value in it, and is pinned in `i6904.rs`.)
 #[test]
 fn test_error_previews_name_the_number_2802() -> Result<()> {
-    for (filter, number) in [
-        (r#".a - "x""#, "31"),
-        (".a | keys", "31"),
-        (".b | keys", "15"),
-    ] {
+    for (filter, number) in [(".a | keys", "31"), (".b | keys", "15")] {
         let (_, stderr, code) = crate::run_yq_stdin_with_stderr(filter, DOC, &[])?;
         assert_eq!(code, 1, "{filter}");
         assert!(

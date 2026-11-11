@@ -4175,6 +4175,11 @@ Every row of the issue is pinned against yq v4.53.3 in `tests/yq_cli/i5863.rs`, 
 - The `/` and `%` refusals of #5930 write a container or `null` operand differently: yq puts each operand's key in parentheses after its tag when the left operand is a container or `null`, or the right one is a container (`!!timestamp (t) cannot be divided by !!map (m)`), and a value here carries no key, so both are `()`.
   The `*` refusal has no parentheses in yq and none here.
   Only the message differs; the error and the exit status are the same.
+- An arithmetic operator over two kinds that do not combine words its error as yq does since #6904, in yq mode (`!!float cannot be added to !!null`, `!!seq () cannot be added to a !!float (f)`, `cannot multiply !!int with !!seq`, `!!float cannot be divided by !!null`, `!!int cannot modulo by !!str`, and yq's `-` over two scalars, `!!int cannot be added to !!str`, as it prints it).
+  jq mode keeps jq's `number (1.5) and null (null) cannot be added`.
+  A key yq writes in parentheses after a tag is `()` here whenever the operand is a container or the other operand of a container (`+`, `-`, `/`, `%`): a value carries no key, so `.f + .l` is `!!seq () cannot be added to a !!float ()` where yq says `!!seq (l) ... !!float (f)`.
+  A computed or literal operand has no key in yq either, so those rows agree exactly.
+  Only the message differs; the error and the exit status are the same.
 - A quoted date times a number (`"2026-01-01T00:00:00Z" * 2`) is yq's string repetition and raises here, since the text stands in for the tag, as above.
 - `tz("Europe")` and `tz("zone.tab")` (a directory and a file that is not a zone) raise a different message here (`is a directory`, `malformed time zone information`) from yq's.
 - Go matches a zone abbreviation read by a layout's `MST` against every zone the local zone has ever used; here only the zones in effect at the date and half a year either side are asked, which covers standard and daylight time.

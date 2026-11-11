@@ -1280,9 +1280,7 @@ fn test_dom_route_scalar_door_answers_like_the_cursor_route_3479() -> Result<()>
     assert_eq!(stderr.matches("cannot be added").count(), 2, "{stderr}");
     let cursor = run_yq_stdin_with_stderr(". + {}", "\"a\"\n", &doc)?;
     assert_eq!(cursor.2, 1, "{}", cursor.1);
-    assert!(cursor
-        .1
-        .contains("string (\"a\") and object ({}) cannot be added"));
+    assert!(cursor.1.contains("!!map () cannot be added to a !!str ()"));
     // A line that is not a bare string keeps its place in the output order.
     let (stdout, stderr, code) = run_yq_stdin_with_stderr(r#". + "!""#, "a\nb\nc\n", &raw)?;
     assert_eq!(
@@ -31371,7 +31369,7 @@ fn test_slice_mul_scalar_on_absent_target_still_errors_1390() -> Result<()> {
         let (out, err, code) = run_yq_stdin_with_stderr(&filter, "c: 0\n", &[])?;
         assert_eq!((code, out.as_str()), (1, ""), "[{filter}] stderr: {err}");
         assert!(
-            err.contains("cannot be multiplied"),
+            err.contains("cannot multiply !!null with"),
             "[{filter}] stderr: {err}"
         );
     }
@@ -33203,7 +33201,7 @@ fn test_1167_mul_null_noop_preserves_number_literal_spelling() -> Result<()> {
 fn test_1175_null_times_number_literal_errors() -> Result<()> {
     let (_, err, code) = run_yq_stdin_with_stderr("null * 1e10", "null", &["-o=json", "-I=0"])?;
     assert_eq!(code, 1);
-    assert!(err.contains("cannot be multiplied"), "{err}");
+    assert!(err.contains("cannot multiply !!null with !!float"), "{err}");
 
     Ok(())
 }
@@ -33298,7 +33296,10 @@ fn test_yq_left_null_scalar_errors_1175() -> Result<()> {
     for expr in ["null * 5", r#"null * "a""#, "null * true"] {
         let (_, err, code) = run_yq_stdin_with_stderr(expr, "null", &["-o=json", "-I=0"])?;
         assert_eq!(code, 1, "expr {expr:?}: {err}");
-        assert!(err.contains("cannot be multiplied"), "expr {expr:?}: {err}");
+        assert!(
+            err.contains("cannot multiply !!null with"),
+            "expr {expr:?}: {err}"
+        );
     }
     Ok(())
 }
@@ -33387,7 +33388,16 @@ fn test_1198_right_null_sub_still_errors_every_type() -> Result<()> {
     ] {
         let (_out, err, code) = run_yq_stdin_with_stderr(expr, "null", &["-o=json", "-I=0"])?;
         assert_eq!(code, 1, "expr {expr:?}: {err}");
-        assert!(err.contains("cannot be subtracted"), "expr {expr:?}: {err}");
+        // yq words `-` from the tags: `7 - null` is `!!int cannot be added to !!null`, a string
+        // on the left `strings cannot be subtracted`, a mapping `maps not yet supported` (#6904).
+        let expected = match expr {
+            "7 - null" => "Error: !!int cannot be added to !!null",
+            r#""a" - null"# => "Error: strings cannot be subtracted",
+            "true - null" => "Error: !!bool cannot be added to !!null",
+            "[1,2] - null" => "Error: !!null () cannot be subtracted from !!seq",
+            _ => "Error: maps not yet supported for subtraction",
+        };
+        assert_eq!(err.lines().next(), Some(expected), "expr {expr:?}: {err}");
     }
     Ok(())
 }
@@ -33466,7 +33476,11 @@ fn test_1198_mixed_int_float_subtraction_unaffected() -> Result<()> {
 fn test_1199_binary_op_error_preserves_number_literal_spelling_yq_mode() -> Result<()> {
     let (_out, err, code) = run_yq_stdin_with_stderr("1e10 * {}", "null", &["-o=json"])?;
     assert_eq!(code, 1, "{err}");
-    assert!(err.contains("number (1E+10)"), "{err}");
+    // yq names the tags, not the values (#6904); the spelling check lives in jq mode's `_1199` tests.
+    assert_eq!(
+        err.lines().next(),
+        Some("Error: cannot multiply !!float with !!map")
+    );
     Ok(())
 }
 
@@ -56767,7 +56781,9 @@ fn test_yq_scalar_string_concat_matrix_2507() -> Result<()> {
         let (_out, stderr, code) = run_yq_stdin_with_stderr(filter, "", args)?;
         assert_ne!(code, 0, "`{filter}` should still error");
         assert!(
-            stderr.contains("cannot be subtracted") || stderr.contains("cannot be multiplied"),
+            stderr.contains("cannot be subtracted")
+                || stderr.contains("cannot be added")
+                || stderr.contains("cannot multiply"),
             "`{filter}`: {stderr}"
         );
     }
@@ -68121,7 +68137,7 @@ fn test_object_construction_collect_errors_2783() -> Result<()> {
             r#"{"a":1} as $a | {$a, "b": 2}"#,
             "CollectObject: mismatching node sizes",
         ),
-        (r#"[{"k":1}] as $a | {"z": 0, $a}"#, "cannot be multiplied"),
+        (r#"[{"k":1}] as $a | {"z": 0, $a}"#, "cannot multiply !!map with !!int"),
     ] {
         let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, r#"{"a":1}"#, args)?;
         assert_eq!(stdout, "", "{filter}");
