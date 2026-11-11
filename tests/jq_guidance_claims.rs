@@ -290,12 +290,14 @@ fn the_category_table_matches_the_reports_6916() {
             .map(|l| l.split('|').map(str::trim).collect::<Vec<_>>())
             .find(|cells| cells.get(1) == Some(&name))
             .unwrap_or_else(|| panic!("no row for {name} in the guide's category table"));
-        assert!(
-            cells.len() >= 5,
+        // | name | queries | one figure per committed run, in the generator's order (sorted by platform) |
+        assert_eq!(
+            cells.len(),
+            2 + PLATFORMS.len() + 2,
             "the category table row for {name} needs a name, a queries cell and one figure per platform"
         );
         // | name | queries | x86_64 | aarch64 |
-        for (cell, report) in [cells[3], cells[4]].iter().zip(&reports) {
+        for (cell, report) in cells[3..3 + PLATFORMS.len()].iter().zip(&reports) {
             let printed: f64 = cell.trim_end_matches('x').parse().expect("a figure");
             let measured = geomean(report, select);
             assert!(
