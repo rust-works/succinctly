@@ -7748,7 +7748,7 @@ A key is split on `.` into a path: a segment that is an `int32` indexes a sequen
 A comment is assigned to the key (or the sequence element) the path ends at, and a comment that cannot be assigned skips its property silently, as yq's `return nil` does.
 An empty input has no document; a file holding only comments or blank lines is `{}`.
 Under `-p auto` a first input file named `*.properties`, `*.props` or `*.p` (any case) reads and, with `-o auto`, prints as props.
-These agree with yq v4.53.3 on 120 crafted files under `-o yaml`, `-o json`, `--properties-array-brackets` and three filters, apart from the rows below (`tests/yq_cli/i6925.rs` pins a sample).
+These agree with yq v4.53.3 on 120 crafted files under `-o yaml`, `-o json`, `--properties-array-brackets` and three filters, and on 1,600 random files under `-o yaml` and `-o json`, apart from the rows below (`tests/yq_cli/i6925.rs` pins a sample).
 
 These rows differ:
 
