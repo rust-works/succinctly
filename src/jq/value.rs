@@ -10673,6 +10673,35 @@ mod tests {
     /// `to_json`/`==` must each independently refuse to recurse past the
     /// same limit rather than overflow the stack.
     ///
+    /// #6887: the marshal error names the first non-finite number in the order the writer visits
+    /// the entries (a sorted write visits them by key), with one wrap per node down to it.
+    #[test]
+    fn yq_non_finite_json_error_follows_the_writers_order_6887() {
+        let wrap = "json: error calling MarshalJSON for type *yqlib.CandidateNode: ";
+        let object = OwnedValue::object_from([
+            ("b".to_string(), OwnedValue::Float(f64::INFINITY)),
+            (
+                "a".to_string(),
+                OwnedValue::array_from(vec![OwnedValue::Float(f64::NAN)]),
+            ),
+        ]);
+        // Insertion order meets `b` first, one level down: two wraps.
+        assert_eq!(
+            object.yq_non_finite_json_error(false),
+            Some(format!("{wrap}{wrap}json: unsupported value: +Inf"))
+        );
+        // A sorted write meets `a` first, two levels down: three wraps.
+        assert_eq!(
+            object.yq_non_finite_json_error(true),
+            Some(format!("{wrap}{wrap}{wrap}json: unsupported value: NaN"))
+        );
+        assert_eq!(OwnedValue::Int(1).yq_non_finite_json_error(true), None);
+        assert_eq!(
+            OwnedValue::go_non_finite_float_text(f64::NEG_INFINITY),
+            "-Inf"
+        );
+    }
+
     /// Since #5497 jq's writer stops at jq's own print depth, writing the marker there, so
     /// `to_json` never recurses as far as the limit; yq's writer prints the whole value and
     /// keeps the guard.

@@ -116,6 +116,7 @@ const ROWS: &[Row] = &[
     (".a + 1", "a: .inf\nb: -.inf\nc: .nan\nd: 2\ni: 0x10\ns: x\nf: 1.5\nj: 7\n", &["-o=yaml"], "", "Error: strconv.ParseFloat: parsing \".inf\": invalid syntax", 1),
     (".a + 1", "a: .inf\nb: -.inf\nc: .nan\nd: 2\ni: 0x10\ns: x\nf: 1.5\nj: 7\n", &["-r"], "", "Error: strconv.ParseFloat: parsing \".inf\": invalid syntax", 1),
     ("(.a + 1)", "a: .inf\nb: -.inf\nc: .nan\nd: 2\ni: 0x10\ns: x\nf: 1.5\nj: 7\n", &["-P"], "", "Error: strconv.ParseFloat: parsing \".inf\": invalid syntax", 1),
+    ("{\"b\": (1 / 0), \"a\": [(0 / 0)]}", "a: .inf\nb: -.inf\nc: .nan\nd: 2\ni: 0x10\ns: x\nf: 1.5\nj: 7\n", &["-o=json"], "", "Error: json: error calling MarshalJSON for type *yqlib.CandidateNode: json: error calling MarshalJSON for type *yqlib.CandidateNode: json: unsupported value: +Inf", 1),
 ];
 
 #[test]
