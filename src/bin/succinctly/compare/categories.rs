@@ -206,7 +206,7 @@ mod tests {
         let platforms: Vec<&str> = runs.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(
             platforms,
-            ["linux-x86_64", "macos-aarch64"],
+            ["linux-aarch64", "linux-x86_64", "macos-aarch64"],
             "the guide's table has one column per platform, in this order"
         );
         let guide = std::fs::read_to_string(root.join("docs/guides/choosing-jq.md")).unwrap();
