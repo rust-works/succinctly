@@ -507,6 +507,11 @@ const PROPS_ROWS: &[PropsRow] = &[
     ("=abcdefghijklmnop\n", &[], ".", "", "Error: bad file '-': properties: Line 1: \"abcdefghij\"...", 1),
     ("a=${b\n", &[], ".", "", "Error: bad file '-': malformed expression", 1),
     ("a=${b}\nb=${a}%d\n", &[], ".", "", "Error: bad file '-': circular reference in:", 1),
+    // Review: each segment runs over every match before the next starts, and a glob matches one
+    // key per spelling, the last.
+    ("x.a=1\ny.0=2\n*..-1=3\n", &[], ".", "", "Error: bad file '-': cannot index array with '' (strconv.ParseInt: parsing \"\": invalid syntax)", 1),
+    ("abc=1\nabd=2\n# c\nab*=9\n# d\nab*=8\n", &[], ".", "# d\nab*: \"1\"\n# d\nab*: \"8\"\n", "", 0),
+    ("abc=1\nabd=2\n# c\nab*=9\n", &["-o", "json"], ".", "{\n  \"ab*\": \"1\",\n  \"ab*\": \"9\"\n}\n", "", 0),
 ];
 
 #[test]

@@ -642,16 +642,88 @@ fn apply_property(
     assign(root, &path, &Write::Value(value), budget)
 }
 
-/// The assignment of `write` at `path` below `node`, through yq's `traverse` for each segment.
+/// A step from a node to one of its children: a mapping entry or a sequence element, by position.
+/// Positions stay valid while one assignment runs, since it only ever appends children.
+#[derive(Clone, Copy)]
+enum Step {
+    Entry(usize),
+    Item(usize),
+}
+
+/// The assignment of `write` at `path` below `root`, as yq evaluates it: the traversal tree is a
+/// pipe of one `traverse` per segment, so each segment runs over every match of the one before it
+/// (creating what it indexes) before the next segment starts, and the write comes once all of them
+/// have matched. An error stops it there, with what was created so far kept.
 fn assign(
-    node: &mut Node,
+    root: &mut Node,
     path: &[Segment],
     write: &Write<'_>,
     budget: &mut Budget,
 ) -> Result<(), String> {
-    let Some((segment, rest)) = path.split_first() else {
-        return Ok(());
-    };
+    let mut frontier: Vec<Vec<Step>> = vec![Vec::new()];
+    for segment in path {
+        let mut next = Vec::new();
+        for at in &frontier {
+            let node = node_at(root, at);
+            for step in traverse(node, segment, budget)? {
+                let mut child = at.clone();
+                child.push(step);
+                next.push(child);
+            }
+        }
+        frontier = next;
+    }
+    for at in &frontier {
+        let Some((last, parent)) = at.split_last() else {
+            continue; // patchcov: coverage tolerate-line reason="a path has at least one segment"
+        };
+        match (node_at(root, parent), *last) {
+            (Node::Map(entries), Step::Entry(i)) => {
+                let entry = &mut entries[i];
+                match write {
+                    Write::Value(value) => entry.value = Node::Str(Box::from(*value)),
+                    Write::Comment { text, comment } => {
+                        entry.key.clone_from(text);
+                        if !comment.is_empty() {
+                            entry.comment = Box::from(*comment);
+                        }
+                    }
+                }
+            }
+            (Node::Seq(items), Step::Item(i)) => {
+                let item = &mut items[i];
+                match write {
+                    Write::Value(value) => item.value = Node::Str(Box::from(*value)),
+                    Write::Comment { text, comment } => {
+                        item.value = Node::Str(Box::from(text.as_str()));
+                        if !comment.is_empty() {
+                            item.comment = Box::from(*comment);
+                        }
+                    }
+                }
+            }
+            _ => {} // patchcov: coverage tolerate-line reason="a step names a child of its own kind"
+        }
+    }
+    Ok(())
+}
+
+/// The node `path` leads to from `root`. Every step was taken by [`traverse`] into a child it
+/// found or made, so each names a child of its own kind.
+fn node_at<'a>(root: &'a mut Node, path: &[Step]) -> &'a mut Node {
+    let mut node = root;
+    for step in path {
+        node = match (node, *step) {
+            (Node::Map(entries), Step::Entry(i)) => &mut entries[i].value,
+            (Node::Seq(items), Step::Item(i)) => &mut items[i].value,
+            (other, _) => return other, // patchcov: coverage tolerate-line reason="a step names a child of its own kind"
+        };
+    }
+    node
+}
+
+/// yq's `traverse` of one segment from `node`: the children it matches, creating what it indexes.
+fn traverse(node: &mut Node, segment: &Segment, budget: &mut Budget) -> Result<Vec<Step>, String> {
     let wanted = segment.text();
     // An auto-created `null` becomes what its first index asks for, except for `[]`, which
     // leaves it a scalar that matches nothing.
@@ -663,42 +735,39 @@ fn assign(
     }
     match node {
         Node::Map(entries) => {
-            let mut matched: Vec<usize> = (0..entries.len())
-                .filter(|&i| yq_match_key(&entries[i].key, &wanted))
-                .collect();
-            if matched.is_empty() {
-                entries.push(Entry {
-                    key: wanted,
-                    comment: Box::default(),
-                    value: Node::Null,
-                });
-                matched.push(entries.len() - 1);
-            }
-            for i in matched {
-                let entry = &mut entries[i];
-                if !rest.is_empty() {
-                    assign(&mut entry.value, rest, write, budget)?;
+            // yq collects the matches in an ordered map keyed by the key's text (`GetKey`), so of
+            // two keys spelled alike (a glob's comment renames every key it matched) only the last
+            // is matched, in the place of the first.
+            let mut matched: Vec<Step> = Vec::new();
+            let mut spellings: Vec<&str> = Vec::new();
+            for (i, entry) in entries.iter().enumerate() {
+                if !yq_match_key(&entry.key, &wanted) {
                     continue;
                 }
-                match write {
-                    Write::Value(value) => entry.value = Node::Str(Box::from(*value)),
-                    Write::Comment { text, comment } => {
-                        entry.key.clone_from(text);
-                        if !comment.is_empty() {
-                            entry.comment = Box::from(*comment);
-                        }
+                match spellings.iter().position(|&k| k == entry.key) {
+                    Some(seen) => matched[seen] = Step::Entry(i),
+                    None => {
+                        spellings.push(&entry.key);
+                        matched.push(Step::Entry(i));
                     }
                 }
             }
-            Ok(())
+            if !matched.is_empty() {
+                return Ok(matched);
+            }
+            entries.push(Entry {
+                key: wanted,
+                comment: Box::default(),
+                value: Node::Null,
+            });
+            Ok(vec![Step::Entry(entries.len() - 1)])
         }
         Node::Seq(items) => {
             let index = seq_index(&wanted)?;
             let len = items.len();
             if let Ok(target) = usize::try_from(index) {
                 if target >= len {
-                    let grown = target - len + 1;
-                    budget.sequence_elements += grown;
+                    budget.sequence_elements += target - len + 1;
                     if budget.sequence_elements > MAX_SEQUENCE_ELEMENTS {
                         return Err(format!(
                             "Cannot grow array to {} elements",
@@ -716,23 +785,10 @@ fn assign(
             let Ok(position) = usize::try_from(position) else {
                 return Err(format!("index [{index}] out of range, array size is {len}"));
             };
-            let item = &mut items[position];
-            if !rest.is_empty() {
-                return assign(&mut item.value, rest, write, budget);
-            }
-            match write {
-                Write::Value(value) => item.value = Node::Str(Box::from(*value)),
-                Write::Comment { text, comment } => {
-                    item.value = Node::Str(Box::from(text.as_str()));
-                    if !comment.is_empty() {
-                        item.comment = Box::from(*comment);
-                    }
-                }
-            }
-            Ok(())
+            Ok(vec![Step::Item(position)])
         }
         // A string, or a `null` indexed by `[]`: nothing to traverse into.
-        Node::Null | Node::Str(_) => Ok(()),
+        Node::Null | Node::Str(_) => Ok(Vec::new()),
     }
 }
 
