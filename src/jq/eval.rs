@@ -26903,6 +26903,7 @@ fn format_yq_output<S: EvalSemantics>(
         YqOutputEncoder::Csv(comma) => format_yq_csv::<S>(value, *comma, true),
         YqOutputEncoder::Lua(options) => format_lua(value, options),
         YqOutputEncoder::Ini => format_ini(value),
+        YqOutputEncoder::Toml => format_toml(value),
         YqOutputEncoder::Tsv => format_yq_csv::<S>(value, '\t', true),
         YqOutputEncoder::Base64 => match value {
             OwnedValue::String(_) => format_base64::<S>(value, false),
@@ -27111,6 +27112,232 @@ fn format_lua(value: &OwnedValue, options: &LuaOptions) -> Result<String, EvalEr
     lua.any(value, 0);
     lua.out.push_str(&options.suffix);
     Ok(lua.out)
+}
+
+/// Go's `strconv.Quote` (the `%q` of yq's TOML encoder): `"` and `\` escaped, a printable character as it
+/// is, `\a \b \f \n \r \t \v`, `\xNN` for another control character below U+0080, `\uNNNN` and `\UNNNNNNNN`
+/// for the rest (#6924).
+fn go_quote(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{7}' => out.push_str("\\a"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{b}' => out.push_str("\\v"),
+            c if super::go_print::is_print(c) => out.push(c),
+            c if (c as u32) < 0x80 => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c if (c as u32) < 0x10000 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push_str(&format!("\\U{:08x}", c as u32)),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// yq's `-o=toml` encoder (#6924), a port of its `tomlEncoder`: a root mapping's attributes (scalars and arrays
+/// that are not arrays of tables) first, then its tables (`[a.b]`) and arrays of tables (`[[a]]`) in order. A
+/// table follows a blank line when an attribute was written since the last one. A key is bare when it holds
+/// only `[A-Za-z0-9_-]` and Go-quoted otherwise. A string is Go-quoted, other scalars are their text, a `null` is
+/// left out of a table and is `""` inside an array, and a mapping inside an array is an inline table. A root
+/// scalar is its text, any other root that is not a mapping is an error. Comments are not written.
+fn format_toml(value: &OwnedValue) -> Result<String, EvalError> {
+    struct Toml {
+        out: String,
+        wrote_root_attr: bool,
+    }
+    fn key(raw: &str) -> String {
+        if raw
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            raw.to_string()
+        } else {
+            go_quote(raw)
+        }
+    }
+    fn dotted(path: &[&str]) -> String {
+        path.iter()
+            .map(|part| key(part))
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+    fn scalar(value: &OwnedValue) -> String {
+        match value {
+            OwnedValue::String(s) => go_quote(s),
+            OwnedValue::Null => "\"\"".to_string(),
+            other => props_value_to_string(other, false),
+        }
+    }
+    fn is_tables(items: &[OwnedValue]) -> bool {
+        !items.is_empty()
+            && items
+                .iter()
+                .all(|item| matches!(item, OwnedValue::Object(_)))
+    }
+    fn is_attribute(value: &OwnedValue) -> bool {
+        match value {
+            OwnedValue::Object(_) => false,
+            OwnedValue::Array(items) => !is_tables(items),
+            _ => true,
+        }
+    }
+    fn inline_array(items: &[OwnedValue], depth: usize) -> String {
+        assert_value_tree_depth(depth);
+        let parts: Vec<String> = items.iter().map(|item| inline(item, depth + 1)).collect();
+        format!("[{}]", parts.join(", "))
+    }
+    fn inline_table(entries: &ObjectMap, depth: usize) -> String {
+        assert_value_tree_depth(depth);
+        let parts: Vec<String> = entries
+            .iter()
+            .filter(|(_, value)| !matches!(value, OwnedValue::Null))
+            .map(|(name, value)| format!("{} = {}", key(name), inline(value, depth + 1)))
+            .collect();
+        format!("{{ {} }}", parts.join(", "))
+    }
+    fn inline(value: &OwnedValue, depth: usize) -> String {
+        match value {
+            OwnedValue::Array(items) => inline_array(items, depth),
+            OwnedValue::Object(entries) => inline_table(entries, depth),
+            other => scalar(other),
+        }
+    }
+    impl Toml {
+        fn attribute(&mut self, name: &str, value: &OwnedValue) {
+            if matches!(value, OwnedValue::Null) {
+                return;
+            }
+            self.wrote_root_attr = true;
+            self.out
+                .push_str(&format!("{} = {}\n", key(name), scalar(value)));
+        }
+        fn array_attribute(&mut self, name: &str, items: &[OwnedValue]) {
+            self.wrote_root_attr = true;
+            self.out
+                .push_str(&format!("{} = {}\n", key(name), inline_array(items, 0)));
+        }
+        fn blank_line(&mut self) {
+            if self.wrote_root_attr {
+                self.out.push('\n');
+                self.wrote_root_attr = false;
+            }
+        }
+        fn array_of_tables(
+            &mut self,
+            path: &[&str],
+            name: &str,
+            items: &[OwnedValue],
+            depth: usize,
+        ) {
+            let mut full = path.to_vec();
+            full.push(name);
+            for item in items {
+                self.out.push_str(&format!("[[{}]]\n", dotted(&full)));
+                if let OwnedValue::Object(entries) = item {
+                    self.body(&full, entries, depth + 1);
+                }
+            }
+        }
+        fn top_level(&mut self, name: &str, value: &OwnedValue) {
+            match value {
+                OwnedValue::Array(items) if is_tables(items) => {
+                    self.blank_line();
+                    // The header is the key alone, the body's path the key: yq's own `[[key]]` spelling.
+                    self.array_of_tables(&[], name, items, 0);
+                }
+                OwnedValue::Array(items) => self.array_attribute(name, items),
+                OwnedValue::Object(entries) => self.separate(&[name], entries, 0),
+                scalar => self.attribute(name, scalar),
+            }
+        }
+        fn separate(&mut self, path: &[&str], entries: &ObjectMap, depth: usize) {
+            assert_value_tree_depth(depth);
+            let has_attrs = entries.values().any(|value| match value {
+                OwnedValue::Null | OwnedValue::Object(_) => false,
+                OwnedValue::Array(items) => !is_tables(items),
+                _ => true,
+            });
+            if has_attrs || entries.is_empty() {
+                self.blank_line();
+                self.out.push_str(&format!("[{}]\n", dotted(path)));
+                self.body(path, entries, depth + 1);
+                return;
+            }
+            for (name, value) in entries {
+                match value {
+                    OwnedValue::Object(inner) => {
+                        let mut child = path.to_vec();
+                        child.push(name);
+                        self.separate(&child, inner, depth + 1);
+                    }
+                    OwnedValue::Array(items) if is_tables(items) => {
+                        self.blank_line();
+                        self.array_of_tables(path, name, items, depth);
+                    }
+                    OwnedValue::Array(items) => self.array_attribute(name, items),
+                    scalar => self.attribute(name, scalar),
+                }
+            }
+        }
+        fn body(&mut self, path: &[&str], entries: &ObjectMap, depth: usize) {
+            assert_value_tree_depth(depth);
+            for (name, value) in entries {
+                match value {
+                    OwnedValue::Object(_) => {}
+                    OwnedValue::Array(items) if !is_tables(items) => {
+                        self.array_attribute(name, items);
+                    }
+                    OwnedValue::Array(_) => {}
+                    scalar => self.attribute(name, scalar),
+                }
+            }
+            for (name, value) in entries {
+                if let OwnedValue::Array(items) = value {
+                    if is_tables(items) {
+                        self.array_of_tables(path, name, items, depth);
+                    }
+                }
+            }
+            for (name, value) in entries {
+                if let OwnedValue::Object(inner) = value {
+                    let mut child = path.to_vec();
+                    child.push(name);
+                    self.separate(&child, inner, depth + 1);
+                }
+            }
+        }
+    }
+    let entries = match value {
+        OwnedValue::Object(entries) => entries,
+        OwnedValue::Array(_) => {
+            return Err(EvalError::new(
+                "TOML encoder expects a mapping at the root level".to_string(),
+            ))
+        }
+        scalar => return Ok(format!("{}\n", props_value_to_string(scalar, false))),
+    };
+    let mut toml = Toml {
+        out: String::new(),
+        wrote_root_attr: false,
+    };
+    for (name, value) in entries {
+        if is_attribute(value) {
+            toml.top_level(name, value);
+        }
+    }
+    for (name, value) in entries {
+        if !is_attribute(value) {
+            toml.top_level(name, value);
+        }
+    }
+    Ok(toml.out)
 }
 
 /// yq's `-o=ini` encoder (#6924), over go-ini: the root's scalars are the default section (written first, with

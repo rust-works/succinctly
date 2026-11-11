@@ -1178,6 +1178,9 @@ pub enum OutputFormat {
     /// Lua table literal (#6924)
     #[value(name = "lua", alias = "l")]
     Lua,
+    /// TOML tables and arrays of tables (#6924)
+    #[value(name = "toml")]
+    Toml,
     /// INI, sections and their scalars (#6924)
     #[value(name = "ini", alias = "i")]
     Ini,

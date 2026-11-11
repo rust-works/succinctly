@@ -834,7 +834,7 @@ same kind of thing as the rest of this table — extra, off by default.
 |-----------------------|-----------------------------------------------|
 | `-r, --unwrapScalar`  | Output raw strings without quotes             |
 | `-I, --indent N`      | Indent level (0 = compact for JSON, 4 spaces for YAML, #2606) |
-| `-o, --output-format` | Output format: `auto` (default), `yaml`, `json`, `props`, `shell`, `csv`, `tsv`, `base64`, `uri`, `lua`, `ini` |
+| `-o, --output-format` | Output format: `auto` (default), `yaml`, `json`, `props`, `shell`, `csv`, `tsv`, `base64`, `uri`, `lua`, `ini`, `toml` |
 | `-i, --inplace`       | Update file in place                          |
 | `-0, --nul-output`    | Use NUL separator instead of newline          |
 | `--no-doc`            | Omit document separators (`---`)              |

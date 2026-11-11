@@ -3344,6 +3344,8 @@ pub enum YqOutputEncoder {
     Tsv,
     /// `-o=ini`
     Ini,
+    /// `-o=toml`
+    Toml,
     /// `-o=base64`: a string only, and no line end
     Base64,
     /// `-o=uri`: a string only, and no line end
