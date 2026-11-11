@@ -42,6 +42,25 @@ const ACCEPTED: &[(&str, &str)] = &[
     ("{k }\n", "{\"k\":null}\n"),
     ("{a#b: c}\n", "{\"a#b\":\"c\"}\n"),
     ("{a\t# b\n}\n", "{\"a\":null}\n"),
+    ("{k\u{0085}\n}\n", "{\"k\":null}\n"),
+    ("{k\u{2028}\n}\n", "{\"k\":null}\n"),
+    ("{k\u{0085}\n\n}\n", "{\"k\":null}\n"),
+    ("{a\u{0085}b\n\n}\n", "{\"a b\":null}\n"),
+    ("{a\u{0085}\n, b}\n", "{\"a\":null,\"b\":null}\n"),
+    ("{&a k\n\n}\n", "{\"k\":null}\n"),
+    ("{!!str k\n\n}\n", "{\"k\":null}\n"),
+    ("{&a k # c\n}\n", "{\"k\":null}\n"),
+    ("{!!str k # c\n}\n", "{\"k\":null}\n"),
+    ("[&a k: v\n\n]\n", "[{\"k\":\"v\"}]\n"),
+    ("[k # c\n, j]\n", "[\"k\",\"j\"]\n"),
+    ("[&a k # c\n]\n", "[\"k\"]\n"),
+    ("{k\r\r}\r", "{\"k\":null}\n"),
+    ("{k\r# c\r}\r", "{\"k\":null}\n"),
+    ("[? k\n\n: v]\n", "[{\"k\":\"v\"}]\n"),
+    ("{\"k\"\n\n}\n", "{\"k\":null}\n"),
+    ("{\"k\" # c\n}\n", "{\"k\":null}\n"),
+    ("{a: 1, b # c\n}\n", "{\"a\":1,\"b\":null}\n"),
+    ("{b # c\n, a: 1}\n", "{\"b\":null,\"a\":1}\n"),
 ];
 
 /// Refused by yq (a key that continues to a `:` on a later line, or a comment that swallows the closer).
@@ -52,6 +71,9 @@ const REFUSED: &[&str] = &[
     "{a #b: c}\n",
     "[a # c\n: 1]\n",
     "[k\n\n: v]\n",
+    "[k\n\n: v]\n",
+    "[k # c\n: v]\n",
+    "{*a\n\n}\n",
 ];
 
 /// Block-style and flow-style YAML output of the blank-line shapes: `(document, extra arguments, expected)`.

@@ -8142,8 +8142,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// before the caller plants the key's interest bit, so the caller dispatches it to
     /// [`Self::parse_explicit_flow_key_node`] instead (#402).
     ///
-    /// Returns `true` when the key opened BP nodes of its own — a nested flow container.
-    /// The caller must **not** record an end position in that case — see
+    /// Returns `true` when the key opened BP nodes of its own — a nested flow container — or
+    /// recorded its own end (an unquoted key, whose end is short of the cursor when blanks or line
+    /// breaks trail it, #6941). The caller must **not** record an end position in that case — see
     /// [`Self::set_bp_text_end`].
     fn parse_flow_key(&mut self) -> Result<bool, YamlError> {
         // Check for a property (anchor and/or tag, either order) on the key.
@@ -8192,10 +8193,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             }
             _ => {
                 // The key ends where its trailing blanks and line breaks begin (#6941): the scan walks
-                // past a blank line before the closer (`{k` / `` / `}`) and returns the trimmed end,
-                // which the caller records as the key's text end from the cursor.
+                // past a blank line before the closer (`{k` / `` / `}`) and returns the trimmed end.
+                // The key records that end itself and the cursor stays where the scan stopped, so the
+                // caller's whitespace skip steps over what was trimmed, a NEL, LS or PS among it.
                 let end = self.parse_flow_unquoted_key()?;
-                self.pos = self.pos.min(end);
+                self.set_bp_text_end(end);
+                return Ok(true);
             }
         }
         Ok(false)
@@ -8233,9 +8236,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     // flow-value arms (#410, `parse_flow_unquoted_value`). The
                     // comment is not folded into the key text (#437). Otherwise
                     // `#` is ordinary key content (e.g. `a#b: value`).
-                    if self.pos > start
-                        && matches!(self.input[self.pos - 1], b' ' | b'\t' | b'\n' | b'\r')
-                    {
+                    if self.flow_hash_starts_comment(start) {
                         // #6941: the comment ends the key. A key with no `:` of its own is an entry
                         // with a null value (`{k # c` / `}`), and the caller refuses one that has a
                         // `:` on a later line (`{k # c` / `: v}`), as yq does.
@@ -8384,9 +8385,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     // # is a comment if preceded by whitespace, or by a line break: the scan steps over a
                     // blank line's two breaks at once, so a `#` that opens the line after one has the
                     // break behind it (#6855)
-                    if self.pos > start
-                        && matches!(self.input[self.pos - 1], b' ' | b'\t' | b'\n' | b'\r')
-                    {
+                    if self.flow_hash_starts_comment(start) {
                         break;
                     }
                     self.advance();
@@ -8436,6 +8435,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
 
         Ok(self.trim_flow_plain_end(start))
+    }
+
+    /// Whether the `#` at the cursor starts a comment inside a flow plain scalar or key that began
+    /// at `start`: it follows a blank or a line break (the scan steps over a blank line's two breaks
+    /// at once, so a `#` that opens the line after one has the break behind it, #6855). The one
+    /// definition for a flow value, a key and an explicit key (#6941); any other `#` is content.
+    #[inline]
+    fn flow_hash_starts_comment(&self, start: usize) -> bool {
+        self.pos > start && matches!(self.input[self.pos - 1], b' ' | b'\t' | b'\n' | b'\r')
     }
 
     /// Where a flow plain scalar that began at `start` and was scanned up to the cursor ends: the
@@ -8644,9 +8652,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     // preceded by a blank or a line break starts a comment, which
                     // ends the key rather than folding into it. Otherwise `#` is
                     // ordinary key content.
-                    if self.pos > start
-                        && matches!(self.input[self.pos - 1], b' ' | b'\t' | b'\n' | b'\r')
-                    {
+                    if self.flow_hash_starts_comment(start) {
                         break;
                     }
                     self.advance();
@@ -12114,15 +12120,21 @@ mod tests {
     /// the key `k` with no value).
     #[test]
     fn regression_issue_437_space_before_hash_starts_a_comment_in_a_flow_key() {
-        let result = build_semi_index(b"{a # b: c}\n");
-        assert!(result.is_err(), "an unterminated flow mapping: {result:?}");
+        let err = build_semi_index(b"{a # b: c}\n").unwrap_err();
+        assert!(
+            matches!(err, YamlError::UnexpectedCharacter { .. }),
+            "an unterminated flow mapping, got {err:?}"
+        );
     }
 
     /// #437: same gap, tab variant.
     #[test]
     fn regression_issue_437_tab_before_hash_starts_a_comment_in_a_flow_key() {
-        let result = build_semi_index(b"{a\t# b: c}\n");
-        assert!(result.is_err(), "an unterminated flow mapping: {result:?}");
+        let err = build_semi_index(b"{a\t# b: c}\n").unwrap_err();
+        assert!(
+            matches!(err, YamlError::UnexpectedCharacter { .. }),
+            "an unterminated flow mapping, got {err:?}"
+        );
     }
 
     /// #437: a `#` not preceded by whitespace stays ordinary key content, in flow
@@ -12142,8 +12154,11 @@ mod tests {
     /// has the same shape as the implicit key parser and was missing the same `#` arm.
     #[test]
     fn regression_issue_437_space_before_hash_starts_a_comment_in_an_explicit_flow_key() {
-        let result = build_semi_index(b"{? a # b : c}\n");
-        assert!(result.is_err(), "an unterminated flow mapping: {result:?}");
+        let err = build_semi_index(b"{? a # b : c}\n").unwrap_err();
+        assert!(
+            matches!(err, YamlError::UnexpectedCharacter { .. }),
+            "an unterminated flow mapping, got {err:?}"
+        );
     }
 
     /// A tab before a sequence entry is indentation just as much as one before a
