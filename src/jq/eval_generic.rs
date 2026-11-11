@@ -24613,7 +24613,14 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
                     from_literal: Option<&OwnedValue>|
      -> Demand {
         match (range_num(from), range_num(to), range_num(step)) {
-            (Ok(from_val), Ok(to_val), Ok(step_val)) => {
+            (Ok(from_val), Ok(to_val), Ok(step_val))
+                if crate::jq::eval::range_takes_numeric_walk::<S>(
+                    implicit_step,
+                    from,
+                    to,
+                    step,
+                ) =>
+            {
                 // #5292: handed over a batch at a time, as `each_range` does.
                 let end = each_range_batches(
                     from_val,
@@ -24643,7 +24650,8 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
                     RangeEnd::Exhausted => Demand::Continue,
                 }
             }
-            // #3409: at least one operand isn't a plain number -- only
+            // #3409: at least one operand isn't a plain number, or (#6993) is a
+            // literal the numeric walk's doubles cannot stand for -- only
             // reachable from range/3 (see this closure's own doc comment).
             // Real jq's range/3 desugar never type-checks from/to/step
             // itself; only the `+` that advances to the next value can
