@@ -3919,6 +3919,32 @@ impl CommentTree {
         Self::Leaf(MetaBox::empty())
     }
 
+    /// Replace this tree by the one-word [`Self::empty`] when it says nothing, and return whether
+    /// it did (#6880). The builder calls this on each child as soon as it is finished, so a
+    /// subtree with nothing to carry is never held: a node is silent when it has no comment,
+    /// style, anchor, head or foot line, tag or spelling, no key metadata, and every child is
+    /// already the empty leaf. A silent child that was not collapsed first counts as one that
+    /// says something, which only costs the saving.
+    ///
+    /// The empty tree answers every read as the silent subtree did ([`Self::field`] and
+    /// [`Self::at_index`] fall back to it, [`Self::meta`] is the empty metadata). What it cannot
+    /// stand in for is a tree something is written into by position, or one that is matched by
+    /// its shape (`Object`, `Array`): see the gate in `yq_runner.rs`.
+    pub fn collapse_if_silent(&mut self) -> bool {
+        let is_silent_leaf = |tree: &Self| matches!(tree, Self::Leaf(meta) if meta.is_empty());
+        let silent = match self {
+            Self::Leaf(meta) => return meta.is_empty(),
+            Self::Array(meta, items) => meta.is_empty() && items.iter().all(is_silent_leaf),
+            Self::Object(meta, fields, keys) => {
+                meta.is_empty() && keys.is_empty() && fields.values().all(is_silent_leaf)
+            }
+        };
+        if silent {
+            *self = Self::empty();
+        }
+        silent
+    }
+
     /// A node with no children and `meta` for its own metadata.
     pub fn leaf(meta: NodeMeta) -> Self {
         Self::Leaf(meta.into())
@@ -4200,8 +4226,38 @@ pub fn to_owned_with_comments<V: DocumentValue, S: EvalSemantics>(
     value: &V,
     cursor: Option<&V::Cursor>,
 ) -> Result<(OwnedValue, CommentTree), EvalError> {
-    let (v, mut comments) =
-        to_owned_with_comments_at_depth::<_, S>(value, cursor, 0, false, HeadFootRead::Own)?;
+    to_owned_with_comments_impl::<_, S>(value, cursor, false)
+}
+
+/// [`to_owned_with_comments`], with one word for each subtree that says nothing (#6880).
+///
+/// A container whose nodes have no comment, style, anchor, tag or spelling is held as the empty
+/// tree instead of a node per node of it, collapsed as the walk finishes it. Every read of the
+/// tree answers the same ([`CommentTree::collapse_if_silent`]); a caller that writes into the
+/// tree by position, or matches it by shape, wants [`to_owned_with_comments`].
+pub fn to_owned_with_comments_pruned<V: DocumentValue, S: EvalSemantics>(
+    value: &V,
+    cursor: Option<&V::Cursor>,
+) -> Result<(OwnedValue, CommentTree), EvalError> {
+    to_owned_with_comments_impl::<_, S>(value, cursor, true)
+}
+
+fn to_owned_with_comments_impl<V: DocumentValue, S: EvalSemantics>(
+    value: &V,
+    cursor: Option<&V::Cursor>,
+    prune_silent: bool,
+) -> Result<(OwnedValue, CommentTree), EvalError> {
+    let (v, mut comments) = to_owned_with_comments_at_depth::<_, S>(
+        value,
+        cursor,
+        0,
+        false,
+        HeadFootRead::Own,
+        prune_silent,
+    )?;
+    if prune_silent {
+        comments.collapse_if_silent();
+    }
     if let Some(c) = cursor {
         let is_collection = matches!(v, OwnedValue::Object(_) | OwnedValue::Array(_));
         let is_document_root = DocumentCursor::is_document_content(c);
@@ -4358,6 +4414,9 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
     depth: usize,
     under_alias: bool,
     head_foot_read: HeadFootRead,
+    // Collapse each child's tree to the empty one when it says nothing (#6880), after the
+    // comments that belong to it have been attached.
+    prune_silent: bool,
 ) -> Result<(OwnedValue, CommentTree), EvalError> {
     guard_nesting_depth(depth)?;
     // The raw (`#`-prefixed) form, not the stripped `line_comment` builtin
@@ -4510,6 +4569,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
                 depth + 1,
                 field_under_alias,
                 HeadFootRead::SkippedForMappingValue,
+                prune_silent,
             )?;
             if field.key_cursor.document_has_standalone_comments() {
                 let field_head = field.key_cursor.head_comment_raw();
@@ -4517,6 +4577,9 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
                 if !field_head.is_empty() || !field_foot.is_empty() {
                     *c.meta_mut() = c.meta().with_head_foot(field_head, field_foot);
                 }
+            }
+            if prune_silent {
+                c.collapse_if_silent();
             }
             map.push::<S>(key.clone(), v);
             // #6335: the entry this one replaces in the by-key tree is a shadow, whose own
@@ -4640,12 +4703,17 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
                 depth + 1,
                 child_under_alias,
                 HeadFootRead::Own,
+                prune_silent,
             )?;
-            // #4231: `- # note` before a value on the next line.
-            let c = match dash_comment {
+            // #4231: `- # note` before a value on the next line. Collapsed after it, which
+            // keys on the tree lining up with its value.
+            let mut c = match dash_comment {
                 Some(comment) if !child_under_alias => attach_dash_comment(c, &v, comment),
                 _ => c,
             };
+            if prune_silent {
+                c.collapse_if_silent();
+            }
             items.push(v);
             comment_items.push(c);
             last_elem = Some(elem_cursor);
@@ -49530,6 +49598,82 @@ mod tests {
             result.into_owned::<JqSemantics>().unwrap().unwrap(),
             OwnedValue::String(String::new().into())
         );
+    }
+
+    /// #6880: a node collapses to the empty tree only when nothing in it says anything: an own
+    /// comment, a style, an anchor, a head line or a key's comment each keep it, and so does a
+    /// child that has not been collapsed itself (the builder collapses bottom-up).
+    #[test]
+    fn test_comment_tree_collapses_a_node_only_when_nothing_in_it_says_anything_6880() {
+        let silent = CommentTree::empty;
+        let commented = || {
+            CommentTree::leaf(NodeMeta::from_comment_and_style(
+                Some("# c".to_string()),
+                "",
+            ))
+        };
+        let styled = || CommentTree::leaf(NodeMeta::from_comment_and_style(None, "double"));
+        let object = |fields: Vec<(&str, CommentTree)>, keys: IndexMap<String, KeyMeta>| {
+            CommentTree::object(
+                NodeMeta::empty(),
+                fields
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect(),
+                keys,
+            )
+        };
+        let is_leaf = |tree: &CommentTree| matches!(tree, CommentTree::Leaf(_));
+
+        // A leaf is its own answer.
+        assert!(silent().collapse_if_silent());
+        assert!(!commented().collapse_if_silent());
+        assert!(!styled().collapse_if_silent());
+
+        // Silent children: the node is one word.
+        let mut array = CommentTree::array(NodeMeta::empty(), vec![silent(), silent()]);
+        assert!(array.collapse_if_silent());
+        assert!(is_leaf(&array));
+        let mut map = object(vec![("a", silent()), ("b", silent())], IndexMap::new());
+        assert!(map.collapse_if_silent());
+        assert!(is_leaf(&map));
+
+        // One child that says something keeps the node and all its children.
+        let mut array = CommentTree::array(NodeMeta::empty(), vec![silent(), commented()]);
+        assert!(!array.collapse_if_silent());
+        assert_eq!(array.at_index(1).own(), Some("# c"));
+        let mut map = object(vec![("a", silent()), ("b", styled())], IndexMap::new());
+        assert!(!map.collapse_if_silent());
+        assert_eq!(map.field("b").style(), "double");
+
+        // A container's own metadata, and a key's.
+        let mut own = CommentTree::array(
+            NodeMeta::from_comment_and_style(None, "flow"),
+            vec![silent()],
+        );
+        assert!(!own.collapse_if_silent());
+        assert_eq!(own.style(), "flow");
+        let mut keyed = IndexMap::new();
+        keyed.insert(
+            "a".to_string(),
+            KeyMeta {
+                comment: Some("# k".to_string()),
+                ..KeyMeta::default()
+            },
+        );
+        let mut with_key_comment = object(vec![("a", silent())], keyed);
+        assert!(!with_key_comment.collapse_if_silent());
+        assert_eq!(with_key_comment.key_comment("a"), Some("# k"));
+
+        // The check is one level deep: a silent child container that was not collapsed first is
+        // taken for one that says something, so the parent is kept (the builder collapses
+        // bottom-up, so it never meets this).
+        let mut nested = CommentTree::array(
+            NodeMeta::empty(),
+            vec![object(vec![("a", silent())], IndexMap::new())],
+        );
+        assert!(!nested.collapse_if_silent());
+        assert!(matches!(nested.at_index(0), CommentTree::Object(..)));
     }
 
     /// `to_owned_with_comments` reads the raw (`#`-and-all) form via
