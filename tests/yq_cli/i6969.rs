@@ -215,6 +215,49 @@ const ROWS: &[(&str, &str, &str)] = &[
     ("md", ".x / .y | file_index", "0\n0\n0\n0\n"),
     ("md", ".x * .y | document_index", "0\n0\n1\n1\n"),
     ("md", ".x * .y | file_index", "0\n0\n0\n0\n"),
+    // A left operand that builds a fresh node (a literal, `length`) has no origin: all `0`.
+    ("two", "10 + .x | document_index", "0\n0\n0\n"),
+    ("two", "10 + .x | file_index", "0\n0\n0\n"),
+    (
+        "two",
+        "\"a\" + \"b\" | document_index",
+        "0\n0\n0\n0\n0\n0\n0\n0\n0\n",
+    ),
+    (
+        "two",
+        "\"a\" + \"b\" | file_index",
+        "0\n0\n0\n0\n0\n0\n0\n0\n0\n",
+    ),
+    (
+        "two",
+        "1 + 2 | document_index",
+        "0\n0\n0\n0\n0\n0\n0\n0\n0\n",
+    ),
+    ("two", "1 + 2 | file_index", "0\n0\n0\n0\n0\n0\n0\n0\n0\n"),
+    (
+        "two",
+        "length + 1 | document_index",
+        "0\n0\n0\n0\n0\n0\n0\n0\n0\n",
+    ),
+    (
+        "two",
+        "length + 1 | file_index",
+        "0\n0\n0\n0\n0\n0\n0\n0\n0\n",
+    ),
+    (
+        "two",
+        ".x + 1 + 2 | document_index",
+        "0\n0\n0\n0\n0\n0\n0\n0\n0\n",
+    ),
+    (
+        "two",
+        ".x + 1 + 2 | file_index",
+        "0\n0\n0\n0\n0\n0\n0\n0\n0\n",
+    ),
+    ("two", "select(.x == 1) + 5 | document_index", "0\n0\n0\n"),
+    ("two", "select(.x == 1) + 5 | file_index", "0\n0\n0\n"),
+    ("two", "(.x) + 1 | document_index", "0\n0\n0\n"),
+    ("two", "(.x) + 1 | file_index", "0\n0\n0\n"),
 ];
 
 fn file(text: &str) -> Result<NamedTempFile> {

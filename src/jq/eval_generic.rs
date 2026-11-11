@@ -22579,6 +22579,30 @@ fn yq_context_item<V: DocumentValue, S: EvalSemantics>(
     ))
 }
 
+/// Whether the nodes `operand` produces carry the origin of the entry they were made from, as yq's
+/// `.`, `.name`, `select`, `{...}` and arithmetic do and a literal or a builtin such as `length`
+/// does not (`10 + .x | document_index` is `0` for every document, #6969). A union counts only when
+/// every branch does: the origin is decided per operand here, where yq decides it per node.
+fn yq_operand_keeps_origin(operand: &Expr) -> bool {
+    match unwrap_paren(operand) {
+        Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Slice { .. }
+        | Expr::ArrayKey(_)
+        | Expr::Iterate
+        | Expr::IndexExpr { .. }
+        | Expr::SliceExpr { .. }
+        | Expr::Object(_)
+        | Expr::Builtin(Builtin::Select(_)) => true,
+        Expr::Arithmetic { left, .. } => yq_operand_keeps_origin(left),
+        Expr::Optional(inner) => yq_operand_keeps_origin(inner),
+        Expr::Pipe(stages) => stages.last().is_some_and(yq_operand_keeps_origin),
+        Expr::Comma(branches) => branches.iter().all(yq_operand_keeps_origin),
+        _ => false,
+    }
+}
+
 /// Does this pipe have a stage that is a union (`,`)?
 ///
 /// A stage that is itself a (parenthesized) pipe counts, because `L | (X | Y)`
@@ -23294,10 +23318,15 @@ fn cross_together<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cur: &core::cell::Cell<YqContextTag>,
 ) -> Result<Vec<YqContextItem<V>>, Flow> {
-    // The left operand, whose origin an arithmetic result keeps (#6969).
+    // The left operand, whose origin an arithmetic result keeps (#6969): only when it is a node
+    // that has one, and only when its outputs reach the pairing as they are produced (an operand
+    // the settled strategy collects first would leave the last output's origin for every pairing).
     let (left_expr, keeps_left_origin) = match stage {
         Expr::Compare { left, .. } => (&**left, false),
-        Expr::Arithmetic { left, .. } => (&**left, true),
+        Expr::Arithmetic { left, right, .. } => (
+            &**left,
+            yq_operand_keeps_origin(left) && !settles_both(left, right),
+        ),
         // Closed by `yq_list_stage` (see the match below).
         _ => unreachable!("yq_list_stage selects only Compare/Arithmetic as a binary stage"),
     };
