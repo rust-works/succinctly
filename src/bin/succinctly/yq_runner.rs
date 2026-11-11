@@ -1979,7 +1979,7 @@ fn apply_front_matter(
         return Ok((raw_bytes, resolved_format, None));
     };
     // yq splits any input: one without a complete front matter is read as yq reads it (#6910), so
-    // there is no refusal here and `name` stays for the callers' own errors.
+    // there is no refusal here and the source's name is not needed.
     let _ = name;
     let fm = front_matter::split_front_matter(&raw_bytes);
     // A front matter with no text is yq's empty document, read as an empty input is (#6910).
@@ -14029,9 +14029,8 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
 
                 let mut buf_writer = BufWriter::new(&mut output_buffer);
 
-                // `--front-matter=process` opens its own leading `---` fence
-                // here; the body's closing fence + body text are appended
-                // after `buf_writer` is dropped, below.
+                // `--front-matter=process`: the opening `---` is part of the text read, and the
+                // closing line + body are appended after `buf_writer` is dropped, below (#6910).
 
                 // halt/halt_error (#791): tracks real per-document output
                 // only, separately from the speculative `---`/fence bytes
