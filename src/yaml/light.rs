@@ -6925,13 +6925,17 @@ impl<'a> YamlString<'a> {
         line_indent
     }
 
-    /// Check if the given position is on a document-start line (begins with a `---` marker).
-    /// This allows zero-indented block scalars per YAML spec.
+    /// Check if the block-scalar header at `pos` is the document's own node: on a line that begins
+    /// with a `---` marker, with nothing between the marker and the header but node properties
+    /// (`--- >`, `--- !!str |`, `--- &a >`). That is what allows a zero-indented block scalar per
+    /// YAML spec.
     ///
     /// A marker is `---` followed by white space, a line break or the end of the text, as
     /// `Parser::marker_prefix` has it. A key that merely starts with `---` (`----: >`, `---a: >`)
     /// is no marker: reading it as one lets the empty scalar's content sit at column 0 and swallows
-    /// the entries below it (#6976).
+    /// the entries below it (#6976). A header that follows a key, a `- ` or a flow key on the marker
+    /// line (`--- x: >`, `--- - >`, `--- [a]: >`) belongs to that node, not to the document, and
+    /// is no better off (#6978).
     fn is_document_start_line(text: &[u8], pos: usize) -> bool {
         // Find start of line
         let mut line_start = pos;
@@ -6947,8 +6951,20 @@ impl<'a> YamlString<'a> {
 
         // Check for "---", then for what ends a marker: the module's one terminator set, which the
         // parser's `marker_prefix` is pinned to as well.
-        text.get(check_pos..check_pos + 3) == Some(b"---")
-            && crate::yaml::is_seq_indicator_next(text.get(check_pos + 3).copied())
+        let after_marker = check_pos + 3;
+        text.get(check_pos..after_marker) == Some(b"---")
+            && crate::yaml::is_seq_indicator_next(text.get(after_marker).copied())
+            && Self::only_node_properties(text.get(after_marker..pos).unwrap_or_default())
+    }
+
+    /// Whether `between` (the text from a `---` marker to a block-scalar header, on one line) holds
+    /// only blanks and node properties: tags (`!!str`, `!<tag:yaml.org,2002:str>`) and anchors
+    /// (`&a`). A word that ends in `:` is a key, so the header after it is that key's value.
+    fn only_node_properties(between: &[u8]) -> bool {
+        between
+            .split(|&b| b == b' ' || b == b'\t')
+            .filter(|word| !word.is_empty())
+            .all(|word| matches!(word[0], b'!' | b'&') && word.last() != Some(&b':'))
     }
 
     /// Detect content indentation from first non-empty line.
@@ -12091,24 +12107,54 @@ mod tests {
 
     /// #6976: a document-start line is a `---` marker, not any line that begins with `---`: a key
     /// such as `----` or `---a` is no marker, and its block scalar may not sit at column 0.
+    /// #6978: nor is a header that follows a key, a `- ` or a flow key on a real marker line.
     #[test]
     fn a_key_starting_with_three_dashes_is_not_a_document_start_line_6976() {
-        let is = |text: &str| YamlString::is_document_start_line(text.as_bytes(), 0);
+        // The header is the last `>` or `|` of the line, as `block_content_indent` is handed it.
+        let is = |text: &str| {
+            let bytes = text.as_bytes();
+            let header = bytes
+                .iter()
+                .rposition(|&b| matches!(b, b'>' | b'|'))
+                .unwrap_or(0);
+            YamlString::is_document_start_line(bytes, header)
+        };
         for marker in [
             "--- >",
             "--- |-",
             "---\t>",
-            "---\n",
-            "---",
             "  --- >",
             "--- >\r\n",
+            "--- !!str >",
+            "--- &a >",
+            "--- &a !!str  |",
+            "--- !<tag:yaml.org,2002:str> >",
+            "---\t&a\t!t >",
         ] {
             assert!(is(marker), "{marker:?} is a marker line");
         }
+        // A marker with no header: the position is the marker's own.
+        assert!(YamlString::is_document_start_line(b"---\n", 0));
+        assert!(YamlString::is_document_start_line(b"---", 0));
         for key in [
             "----: >", "---a: >", "---: >", "--: >", "-- >", "- >", "a: >",
         ] {
             assert!(!is(key), "{key:?} is no marker line");
+        }
+        for after_marker in [
+            "--- x: >",
+            "--- x: |",
+            "--- - >",
+            "--- &a x: >",
+            "--- !!str x: >",
+            "--- [a]: >",
+            "--- ? x: >",
+            "--- !x: >",
+        ] {
+            assert!(
+                !is(after_marker),
+                "{after_marker:?}: the header belongs to a node on the marker line"
+            );
         }
         // The line the position is on decides, not the first line of the text.
         assert!(!YamlString::is_document_start_line(b"---\n----: >", 10));
