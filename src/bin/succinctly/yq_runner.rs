@@ -9405,17 +9405,6 @@ fn write_pending_separator<W: Write>(
     Ok(())
 }
 
-/// Go's `strconv` text for a computed non-finite float: `+Inf`, `-Inf`, `NaN` (#6867).
-fn go_non_finite_text(f: f64) -> &'static str {
-    if f.is_nan() {
-        "NaN"
-    } else if f.is_sign_negative() {
-        "-Inf"
-    } else {
-        "+Inf"
-    }
-}
-
 fn output_value<W: Write>(
     writer: &mut W,
     value: &OwnedValue,
@@ -9453,7 +9442,7 @@ fn output_value<W: Write>(
             if let OwnedValue::Float(f) = value {
                 if !f.is_finite() {
                     write_pending_separator(writer, separator, terminator_from_config(config))?;
-                    write!(writer, "{}", go_non_finite_text(*f))?;
+                    write!(writer, "{}", OwnedValue::go_non_finite_float_text(*f))?;
                     write_terminator(writer, config)?;
                     return Ok(());
                 }

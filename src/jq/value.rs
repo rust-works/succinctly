@@ -4287,6 +4287,18 @@ impl OwnedValue {
         )
     }
 
+    /// Go's `strconv` text for a computed non-finite float: `+Inf`, `-Inf`, `NaN` (#6867).
+    #[must_use]
+    pub fn go_non_finite_float_text(f: f64) -> &'static str {
+        if f.is_nan() {
+            "NaN"
+        } else if f.is_sign_negative() {
+            "-Inf"
+        } else {
+            "+Inf"
+        }
+    }
+
     /// The error real yq's JSON encoder raises for the first non-finite number this value holds,
     /// in the order it writes them, or `None` if there is none (#6867, #6887).
     ///
@@ -4302,20 +4314,11 @@ impl OwnedValue {
     #[must_use]
     pub fn yq_non_finite_json_error(&self, sort_keys: bool) -> Option<String> {
         const WRAP: &str = "json: error calling MarshalJSON for type *yqlib.CandidateNode: ";
-        fn go_non_finite_text(f: f64) -> &'static str {
-            if f.is_nan() {
-                "NaN"
-            } else if f.is_sign_negative() {
-                "-Inf"
-            } else {
-                "+Inf"
-            }
-        }
         fn cause(value: &OwnedValue) -> Option<String> {
             match value {
                 OwnedValue::Float(f) if !f.is_finite() => Some(format!(
                     "json: unsupported value: {}",
-                    go_non_finite_text(*f)
+                    OwnedValue::go_non_finite_float_text(*f)
                 )),
                 OwnedValue::NumberLiteral(_, literal)
                     if crate::yaml::NONFINITE_LITERALS.contains(&&**literal) =>
@@ -4333,15 +4336,16 @@ impl OwnedValue {
                 OwnedValue::Array(items) => {
                     items.iter().find_map(|v| walk(v, sort_keys, depth + 1))
                 }
-                OwnedValue::Object(map) => {
+                OwnedValue::Object(map) if sort_keys => {
                     let mut entries: Vec<_> = map.occurrences().collect();
-                    if sort_keys {
-                        entries.sort_by(|a, b| a.0.cmp(b.0));
-                    }
+                    entries.sort_by(|a, b| a.0.cmp(b.0));
                     entries
                         .into_iter()
                         .find_map(|(_, v)| walk(v, sort_keys, depth + 1))
                 }
+                OwnedValue::Object(map) => map
+                    .occurrences()
+                    .find_map(|(_, v)| walk(v, sort_keys, depth + 1)),
                 _ => cause(value).map(|c| (c, depth)),
             }
         }

@@ -14747,9 +14747,7 @@ fn text_stage_text<S: EvalSemantics>(stage: &Expr, input: &OwnedValue) -> Option
             Some(owned_value_to_json::<S>(input))
         }
         // (yq's encoder refuses a non-finite number, #6887: the full route raises it.)
-        Expr::Format(FormatType::Json)
-            if S::TAG != EvalTag::Yq || input.yq_non_finite_json_error(false).is_none() =>
-        {
+        Expr::Format(FormatType::Json) if yq_json_refusal::<S>(input).is_none() => {
             Some(owned_value_to_json::<S>(input))
         }
         Expr::Builtin(Builtin::ToString) | Expr::Format(FormatType::Text) => {
@@ -17468,9 +17466,13 @@ pub(crate) fn yq_non_finite_operand_error(
             OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)
         )
     };
+    // Every spelling is four to five bytes and starts with a dot or a sign, so an ordinary number
+    // (`5`, `1.5`, `0x10`) is turned away before the scan of the twelve.
     let non_finite_text = |v: &OwnedValue| match v {
         OwnedValue::NumberLiteral(_, literal)
-            if crate::yaml::nonfinite_literal_index(literal).is_some() =>
+            if literal.len() >= 4
+                && matches!(literal.as_bytes()[0], b'.' | b'+' | b'-')
+                && crate::yaml::nonfinite_literal_index(literal).is_some() =>
         {
             Some(literal.clone())
         }
@@ -22204,7 +22206,10 @@ pub(crate) fn yq_extremum_index<T: core::borrow::Borrow<OwnedValue>>(
             ) => {
                 // #6887: yq reads each number's text with `strconv.ParseFloat`, the later element's
                 // first (`[.a, .c] | min` over `.inf` and `.nan` names the `.nan`).
-                if let Some(error) = yq_non_finite_operand_error(element, pick) {
+                // A hex or octal integer fails the same way against a float (`[1.5, 0x10] | max`).
+                if let Some(error) = yq_non_finite_operand_error(element, pick)
+                    .or_else(|| yq_float_parse_refusal::<YqSemantics>(pick, element))
+                {
                     return Err(error);
                 }
                 compare_values::<YqSemantics>(pick, element)
@@ -25257,6 +25262,16 @@ pub fn nonfinite_literal_display(f: f64, literal: &str) -> &str {
     }
 }
 
+/// yq's JSON encoder refuses a non-finite number (#6887): the error a `to_json`, `tojson` or `@json`
+/// over `value` raises, `None` for a value it can write and always in jq mode. The one place the
+/// yq-mode gate and the check meet, so a stringify site cannot have the one without the other.
+fn yq_json_refusal<S: EvalSemantics>(value: &OwnedValue) -> Option<EvalError> {
+    if S::TAG != EvalTag::Yq {
+        return None;
+    }
+    value.yq_non_finite_json_error(false).map(EvalError::new)
+}
+
 /// `to_json_yq()` in yq mode, `to_json()` in jq mode (#1030) -- the single
 /// definition every "stringify a whole value as JSON" call site routes
 /// through, instead of each one re-deriving the fork (#106's "duplicated
@@ -25493,11 +25508,9 @@ fn format_text<S: EvalSemantics>(value: &OwnedValue) -> Result<String, EvalError
 
 /// @json - Format as JSON
 fn format_json<S: EvalSemantics>(value: &OwnedValue) -> Result<String, EvalError> {
-    // yq's JSON encoder refuses a non-finite number (#6887); `to_json_yq` only has the text.
-    if S::TAG == EvalTag::Yq {
-        if let Some(message) = value.yq_non_finite_json_error(false) {
-            return Err(EvalError::new(message));
-        }
+    // `to_json_yq` only has the text (#6887).
+    if let Some(error) = yq_json_refusal::<S>(value) {
+        return Err(error);
     }
     Ok(owned_value_to_json::<S>(value))
 }
@@ -27386,9 +27399,8 @@ fn builtin_tojson<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let owned = to_owned_or_suppress!(&value, optional);
     // #6158: yq's `tojson` is `to_json`: indented, with a line break of its own.
     if S::TAG == EvalTag::Yq {
-        // #6887: yq's JSON encoder refuses a non-finite number.
-        if let Some(message) = owned.yq_non_finite_json_error(false) {
-            return suppress_or_raise(EvalError::new(message), optional);
+        if let Some(error) = yq_json_refusal::<S>(&owned) {
+            return suppress_or_raise(error, optional);
         }
         return QueryResult::Owned(OwnedValue::String(
             super::stream::owned_value_to_yq_json_string(&owned, 2).into(),
