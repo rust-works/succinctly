@@ -36,7 +36,8 @@ pub struct Entry {
     /// entry for another OS is neither expected nor called stale here.
     pub platform: Option<String>,
     /// Whether the difference shows depends on the host: its speed (a reference that
-    /// finishes a probe inside the deadline on a fast machine and not on a slow one), or
+    /// finishes a probe inside the deadline on a fast machine and not on a slow one), its
+    /// address-space footprint (a probe that sits just under a `ulimit -v` cap, #7009), or
     /// the locales it has installed (a probe under `de_DE` falls back to `C` on a host
     /// without it): the entry is expected wherever the difference shows, but is not
     /// called stale where it does not.
