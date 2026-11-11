@@ -1175,6 +1175,9 @@ pub enum OutputFormat {
     /// TSV of an array, as `@tsv` writes it (#6850)
     #[value(name = "tsv", alias = "t")]
     Tsv,
+    /// Lua table literal (#6924)
+    #[value(name = "lua", alias = "l")]
+    Lua,
     /// Base64 of a string, as `@base64` writes it, with no line break (#6850)
     #[value(name = "base64")]
     Base64,
@@ -1331,6 +1334,22 @@ pub struct YqCommand {
     /// The field separator of `-o=csv`, one byte (#6922)
     #[arg(long = "csv-separator", value_name = "CHAR", default_value = ",")]
     pub csv_separator: String,
+
+    /// Text before the table of `-o=lua`; `\n`, `\r`, `\t`, `\\`, `\'` and `\"` are read (#6924)
+    #[arg(long = "lua-prefix", value_name = "PREFIX", default_value = "return ")]
+    pub lua_prefix: String,
+
+    /// Text after the table of `-o=lua`, escapes as for `--lua-prefix` (#6924)
+    #[arg(long = "lua-suffix", value_name = "SUFFIX", default_value = ";\\n")]
+    pub lua_suffix: String,
+
+    /// Write the top-level keys of `-o=lua` as global assignments (#6924)
+    #[arg(long = "lua-globals", overrides_with = "lua_globals")]
+    pub lua_globals: bool,
+
+    /// Write a string key that is a Lua name unquoted in `-o=lua` (#6924)
+    #[arg(long = "lua-unquoted", overrides_with = "lua_unquoted")]
+    pub lua_unquoted: bool,
 
     /// Separator between the parts of a variable name for `-o=shell` (#6850)
     #[arg(

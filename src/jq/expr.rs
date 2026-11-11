@@ -3338,12 +3338,27 @@ pub enum YqOutputEncoder {
     Shell(String),
     /// `-o=csv`, with `--csv-separator`
     Csv(char),
+    /// `-o=lua`, with the four `--lua-*` options
+    Lua(Box<LuaOptions>),
     /// `-o=tsv`
     Tsv,
     /// `-o=base64`: a string only, and no line end
     Base64,
     /// `-o=uri`: a string only, and no line end
     Uri,
+}
+
+/// The `--lua-*` options of `-o=lua` (#6924), see [`YqOutputEncoder::Lua`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LuaOptions {
+    /// `--lua-prefix`, escapes already read (default `return `)
+    pub prefix: String,
+    /// `--lua-suffix`, escapes already read (default `;` and a line break)
+    pub suffix: String,
+    /// `--lua-unquoted`: `{foo = "bar"}` for a key that is a Lua name
+    pub unquoted: bool,
+    /// `--lua-globals`: one assignment per top-level key and no table around them
+    pub globals: bool,
 }
 
 /// The unary libm builtins jq exposes beyond the trigonometric/exponential
