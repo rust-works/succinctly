@@ -1178,6 +1178,9 @@ pub enum OutputFormat {
     /// Lua table literal (#6924)
     #[value(name = "lua", alias = "l")]
     Lua,
+    /// KYAML, YAML's flow subset with explicit commas (#6924)
+    #[value(name = "kyaml", alias = "ky")]
+    Kyaml,
     /// TOML tables and arrays of tables (#6924)
     #[value(name = "toml")]
     Toml,

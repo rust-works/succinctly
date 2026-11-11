@@ -7608,7 +7608,8 @@ The `@props` and `@csv` operators ignore those flags here, where yq applies them
 `-o=lua` is read as well, with `--lua-prefix`, `--lua-suffix`, `--lua-globals` and `--lua-unquoted` (#6924); where it differs from yq is in its own section below.
 `-o=ini` is read as well (#6924), as yq's go-ini encoder writes it: it agrees with yq v4.53.3 on 3,200 random JSON documents and on YAML input except for a null written `~` (see the list below).
 `-o=toml` is read as well (#6924); where it differs from yq is in its own section below.
-The other formats yq lists (`kyaml`, `xml`, `hcl`) and every input format but YAML and JSON are still refused at the flag.
+`-o=kyaml` is read as well (#6924); where it differs from yq is in its own section below.
+The other formats yq lists (`xml`, `hcl`) and every input format but YAML and JSON are still refused at the flag.
 Seven rows differ from yq v4.53.3, each pinned out of `tests/yq_cli/i6850.rs`:
 
 - A comment in a `props` document is not written.
@@ -7647,3 +7648,13 @@ The encoder runs over the value model, which keeps no comment, node style or sou
 - The YAML 1.1 integers `1_000` and `0b11` are strings here (see the YAML 1.1 section above), so they are quoted, where yq writes them bare.
 - A timestamp (`2001-01-01`) and a `!!binary` scalar are quoted strings, where yq writes their text bare.
 - yq's inline-table hint exists only for TOML input, which `succinctly yq` does not read.
+
+### `-o=kyaml` — comments and an opening `---` are not read (#6924)
+
+`-o=kyaml` is a port of yq's KYAML encoder and agrees with yq v4.53.3 on 3,500 random JSON documents under `-I0`, `-I1`, `-I4` and `-N`, and on multi-document input, where the `---` between documents is printed as for YAML.
+The encoder runs over the value model, so on a YAML input these still differ:
+
+- A head, line or foot comment is dropped, where yq writes it (`a: 1, # c`).
+- An input whose first document opens with `---` prints that `---` first in yq (it keeps the document's leading separator as leading content), and here it does not.
+- The YAML 1.1 integer `1_000` is a string here (see the YAML 1.1 section above), so it is quoted, where yq writes it bare.
+- With `-0`, the separator between documents is `\n---` here and `---` in yq, the existing difference of the `-0` multi-document section above.

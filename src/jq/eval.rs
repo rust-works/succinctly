@@ -26904,6 +26904,7 @@ fn format_yq_output<S: EvalSemantics>(
         YqOutputEncoder::Lua(options) => format_lua(value, options),
         YqOutputEncoder::Ini => format_ini(value),
         YqOutputEncoder::Toml => format_toml(value),
+        YqOutputEncoder::Kyaml(indent) => Ok(format_kyaml(value, *indent)),
         YqOutputEncoder::Tsv => format_yq_csv::<S>(value, '\t', true),
         YqOutputEncoder::Base64 => match value {
             OwnedValue::String(_) => format_base64::<S>(value, false),
@@ -27340,6 +27341,86 @@ fn format_toml(value: &OwnedValue) -> Result<String, EvalError> {
         }
     }
     Ok(toml.out)
+}
+
+/// yq's `-o=kyaml` encoder (#6924): YAML's flow subset, one entry per line with a trailing comma, `{}` and
+/// `[]` for an empty container, `-I` spaces of indent per level. A key is bare when it matches
+/// `^[A-Za-z_][A-Za-z0-9_-]*$` and double-quoted otherwise; `null` and booleans are lower case, numbers their
+/// text and everything else a double-quoted string, escaping `\`, `"`, line break, CR, tab and the other
+/// control characters below U+0020 as `\uXXXX`. A root scalar is written the same way, quoted. Comments are
+/// not written. The result has no final line break: the printer adds it, so the `---` between documents
+/// starts a line as it does for YAML.
+fn format_kyaml(value: &OwnedValue, indent: usize) -> String {
+    fn quote(text: &str) -> String {
+        let mut out = string_with_capacity(text.len() + 2);
+        out.push('"');
+        for c in text.chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04X}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+    fn key(raw: &str) -> String {
+        let mut chars = raw.chars();
+        let bare = chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        if bare {
+            raw.to_string()
+        } else {
+            quote(raw)
+        }
+    }
+    fn scalar(value: &OwnedValue) -> String {
+        match value {
+            OwnedValue::String(s) => quote(s),
+            OwnedValue::Null => "null".to_string(),
+            other => props_value_to_string(other, false),
+        }
+    }
+    fn node(out: &mut String, value: &OwnedValue, indent: usize, level: usize, depth: usize) {
+        assert_value_tree_depth(depth);
+        let pad = |out: &mut String, columns: usize| out.extend(core::iter::repeat_n(' ', columns));
+        match value {
+            OwnedValue::Object(entries) if entries.is_empty() => out.push_str("{}"),
+            OwnedValue::Object(entries) => {
+                out.push_str("{\n");
+                for (name, entry) in entries {
+                    pad(out, level + indent);
+                    out.push_str(&key(name));
+                    out.push_str(": ");
+                    node(out, entry, indent, level + indent, depth + 1);
+                    out.push_str(",\n");
+                }
+                pad(out, level);
+                out.push('}');
+            }
+            OwnedValue::Array(items) if items.is_empty() => out.push_str("[]"),
+            OwnedValue::Array(items) => {
+                out.push_str("[\n");
+                for item in items {
+                    pad(out, level + indent);
+                    node(out, item, indent, level + indent, depth + 1);
+                    out.push_str(",\n");
+                }
+                pad(out, level);
+                out.push(']');
+            }
+            other => out.push_str(&scalar(other)),
+        }
+    }
+    let mut out = String::new();
+    node(&mut out, value, indent, 0, 0);
+    out
 }
 
 /// yq's `-o=ini` encoder (#6924), over go-ini: the root's scalars are the default section (written first, with
