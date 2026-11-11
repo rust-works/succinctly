@@ -4183,6 +4183,9 @@ Every row of the issue is pinned against yq v4.53.3 in `tests/yq_cli/i5863.rs`, 
   A literal operand has no key in yq either, so those rows agree exactly.
   Only the message differs; the error and the exit status are the same.
 - A quoted date times a number (`"2026-01-01T00:00:00Z" * 2`) is yq's string repetition and raises here, since the text stands in for the tag, as above.
+- A quoted string that reads as a date is named `!!timestamp` in the arithmetic errors above, where yq names it `!!str`, for the same reason: `.i - "2001-01-01T00:00:00Z"` is `!!int cannot be added to !!timestamp` here and `!!int cannot be added to !!str` in yq, and `.l - "2001-01-01T00:00:00Z"` is `!!timestamp () cannot be subtracted from !!seq` against `!!str ()`.
+  The same holds for `+`, `/` and `%` (#6904 review).
+  Only the message differs; the error and the exit status are the same.
 - `tz("Europe")` and `tz("zone.tab")` (a directory and a file that is not a zone) raise a different message here (`is a directory`, `malformed time zone information`) from yq's.
 - Go matches a zone abbreviation read by a layout's `MST` against every zone the local zone has ever used; here only the zones in effect at the date and half a year either side are asked, which covers standard and daylight time.
 - `with_dtf("2006")` and `format_datetime` with no argument are parse errors in succinctly's wording, not yq's (`must provide a date time format string and an expression, ...`, `'format_datetime' expects 1 arg but received none`).
