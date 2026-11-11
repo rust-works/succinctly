@@ -7294,7 +7294,13 @@ fn apply_meta_assign_writes(
                         *node_value = OwnedValue::String(plain.into());
                     }
                 }
-                node.meta_mut().style = style;
+                // #6909: go-yaml quotes a string whose plain spelling it reads as another type (a
+                // timestamp, `1_000`), so clearing the style of a quoted one keeps its quotes.
+                let keeps_quotes = style.is_empty()
+                    && matches!(node.meta().style, "double" | "single")
+                    && matches!(&*node_value, OwnedValue::String(text)
+                        if go_yaml_resolved_tag(text) != "!!str");
+                node.meta_mut().style = if keeps_quotes { "double" } else { style };
             }
             MetaEffect::Anchor(name) => {
                 node.meta_mut().anchor = name.clone().map(AnchorMark::Declares);
