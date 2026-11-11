@@ -769,7 +769,12 @@ fn stdin_section(s: &mut String, file_rows: &[PerfRow], stdin_rows: &[PerfRow]) 
          after the other and not interleaved with each other, and each is gated on output identity \
          like every other row. A ratio is stdin ÷ file, so above 1.00x the pipe is slower \
          (or larger); a ratio over {STDIN_MATERIAL:.2}x is marked `>`. Memory is peak RSS and private \
-         memory of separate untimed runs, as above.\n"
+         memory of separate untimed runs, as above. A gap on a large compact input is mostly the \
+         pipe, not the evaluator: succinctly reads stdin to its end before it starts, so the time to \
+         move the bytes through a pipe is added to its run instead of overlapped with it, and the \
+         faster a query, the larger that is as a ratio (#6914 measured 100 MB into `cat` at 39 ms on \
+         the 7950X, against a 36 ms stdin gap on `users_field`). A `>` on a 1 MB row whose neighbours \
+         run the other way is the run's noise.\n"
     );
     if pairs.is_empty() {
         let _ = writeln!(
