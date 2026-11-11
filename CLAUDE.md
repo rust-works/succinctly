@@ -463,6 +463,7 @@ Geomean speedup over jq-1.7.1 (its time over `succinctly jq`'s; below 1.00x jq i
 | [Apple M4 Pro](docs/compare/jq-macos-aarch64.md)                       | `a336e8ec5` |   0.65x | 1.58x | 3.01x |  4.24x |    2.33x |    37 of 221 |
 <!-- /compare:jq-summary -->
 
+Which tool to pick for which workload, with the report rows behind each claim and a test that fails when one stops holding: [docs/guides/choosing-jq.md](docs/guides/choosing-jq.md).
 The lead over jq grows with input size, and jq is faster at startup and on small inputs (the per-query tables in
 [docs/benchmarks/jq.md](docs/benchmarks/jq.md) say which queries lose and by how much). The M1 Max and Neoverse
 sections there predate the #5336 re-run and the interleaved timing, so quote the table above, not them.

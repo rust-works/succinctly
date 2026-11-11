@@ -1,0 +1,158 @@
+# Choosing between jq and `succinctly jq`
+
+[Home](../../) > [Docs](../) > [Guides](./) > Choosing between jq and `succinctly jq`
+
+`succinctly jq` is faster than jq 1.7.1 on most large inputs, and slower on a few shapes that are common. The single
+number in the README (a geomean over every timed row) hides that, because it counts 50 `identity` and `identity_compact`
+rows of 221, over documents of several shapes, which is `succinctly jq`'s strongest case. This page says where each tool is the better
+choice, and ties every claim to the rows of the committed comparison reports that back it:
+
+- [Linux x86_64, AMD Ryzen 9 7950X](../compare/jq-linux-x86_64.md)
+- [macOS aarch64, Apple M4 Pro](../compare/jq-macos-aarch64.md)
+
+Speedup is jq 1.7.1's time over `succinctly jq`'s, so below `1.00x` jq is faster. Memory ratios are `succinctly jq`'s peak
+RSS over jq's. Both come from interleaved, output-gated runs: a row is timed only where the two tools print the same
+bytes. The figures are medians on the two machines named above, and memory-bound effects do not port between
+architectures, so each claim below is checked on both.
+
+Each claim carries an HTML comment marker naming it (`claim:` and an id). [`tests/jq_guidance_claims.rs`](../../tests/jq_guidance_claims.rs)
+reads the two committed reports, checks each claim against its stated threshold, and fails when a report is
+regenerated and a claim stops holding: change the claim, or the advice, in the same change.
+
+## The short version
+
+| Your workload                                                  | Use                                          | Why                                                                               |
+|----------------------------------------------------------------|----------------------------------------------|-----------------------------------------------------------------------------------|
+| One document of 1 MB or more: filter, reformat, pretty-print   | `succinctly jq`                              | 2x to 15x faster, in a fraction of jq's memory                                    |
+| `first`, `limit`, `.[0]` of a large document                   | `succinctly jq`                              | stops reading early: 5x to 7x at 100 MB                                           |
+| Regex or case mapping over large strings                       | `succinctly jq`                              | up to 52x                                                                         |
+| Many short invocations, or documents under about 100 KB        | jq                                           | startup is jq's (0.67x to 0.93x); no gain on most small documents                 |
+| A stream of many values (NDJSON, `--seq`)                      | depends                                      | faster for `.`, same speed for most filters, but the whole file is held in memory |
+| `--seq` output, or `input` / `inputs` taken once and abandoned | jq                                           | `succinctly jq` is slower                                                         |
+| Strict RFC 8259 input                                          | either, with `--validate` on `succinctly jq` | neither is strict by default                                                      |
+| Features new in jq 1.8                                         | jq 1.8                                       | `succinctly jq` follows 1.7.1                                                     |
+| Binary size                                                    | jq                                           | 11x to 22x smaller                                                                |
+
+## By category
+
+The geomean of the speedup over every timed row of a group (all input sizes), per platform. The grouping is the one the
+test uses, by query name, so a reader can recompute it from the report. The groups cover most rows and not all of them
+(the slurp, raw-file and `tojson` round-trip rows are in none).
+
+<!-- claim: category-pass-through -->
+<!-- claim: category-navigation -->
+<!-- claim: category-early-exit -->
+<!-- claim: category-transforms -->
+<!-- claim: category-streams -->
+<!-- claim: category-small-inputs -->
+
+| Group                         | Queries                                                                                            | x86_64 (7950X) | aarch64 (M4 Pro) |
+|-------------------------------|----------------------------------------------------------------------------------------------------|----------------|------------------|
+| Pass-through and reformatting | `identity`, `identity_compact`                                                                     | 2.96x          | 4.09x            |
+| Field access and navigation   | `users_field`, `users_length`, `users_names`, `users_to_entries`, `wide_keys`, `users_three_files` | 4.13x          | 3.51x            |
+| Early exit                    | `users_first_early_exit`, `users_limit_early_exit`                                                 | 4.88x          | 4.10x            |
+| Transforms                    | maps, sorts, groups, reduce, regex, paths, walk, numbers, strings, wide and nested objects         | 2.22x          | 2.24x            |
+| Streams (NDJSON, `--seq`)     | `ndjson_*`, `seq_*`                                                                                | 1.46x          | 1.76x            |
+| Startup-bound                 | `startup`, `args_many`, `corpus_*`                                                                 | 1.11x          | 0.89x            |
+
+The all-rows geomean of [`docs/compare/jq.md`](../compare/jq.md) averages all of these rows, the 50 `identity` rows
+among them. It is a fair summary of the benchmark and a poor prediction of an arbitrary workload.
+
+## Use `succinctly jq` when
+
+### The input is one document of 1 MB or more
+
+<!-- claim: pass-through-large -->
+<!-- claim: navigation-large -->
+
+`identity_compact` (`-c .`) on the `users` document runs 8.5x faster at 100 MB on the 7950X and 14.7x on the M4 Pro;
+pretty-printed `.` runs 2.5x and 4.5x. A field read (`users_field`) is 6.5x and 5.7x at 100 MB. The lead grows with the
+input, from about 2x to 3x at 1 MB. Rows: `identity`, `identity_compact`, `users_field`, `users_length` in section D of
+each report.
+
+<!-- claim: memory-single-document -->
+
+A single large document also needs far less memory: `users_field` at 100 MB peaks at 0.16x of jq's resident set on the
+7950X and 0.15x on the M4 Pro (96 MB against 614 MB on the 7950X). Rows: `users_field`, section E.
+
+### Only the start of the document is needed
+
+<!-- claim: early-exit-large -->
+
+`first(...)` and `limit(n; ...)` over a 100 MB document are 6.0x and 7.3x faster on the 7950X, and 6.7x and 6.8x on the
+M4 Pro. Rows: `users_first_early_exit`, `users_limit_early_exit`.
+
+### The work is a regex or a case mapping over long strings
+
+<!-- claim: strings-upcase -->
+<!-- claim: regex-gsub-large -->
+
+`strings_upcase` (`ascii_upcase`) is 37x to 47x faster on the 7950X and 32x to 52x on the M4 Pro across 1 MB to 100 MB.
+Regex over large strings is where jq can fail outright: `regex-gsub-large` times out on jq and completes on
+`succinctly jq` (the robustness section of each report).
+
+## Use jq when
+
+### The invocation is short
+
+<!-- claim: startup -->
+
+The `startup` row (`jq -n 1`) is 0.93x on the 7950X and 0.67x on the M4 Pro: jq starts faster. The `corpus_*` rows, real
+documents of a few KB to 100 KB, run from 0.81x to 2.5x on the 7950X (jq is faster on the object-heavy ones: `corpus_tabular_group`
+is 0.81x) and from 0.63x to 3.0x on the M4 Pro (`corpus_tabular_group` is 0.72x, and mostly the pretty-printed ones, with `corpus_geojson_points`,
+favour `succinctly jq`). A shell loop that starts the tool a thousand times pays that difference a thousand times.
+
+### The input is a long stream of small values
+
+<!-- claim: stream-memory -->
+
+For NDJSON and `--seq` input, `succinctly jq` holds the file in memory while jq holds one value. At 100 MB,
+`ndjson_identity` peaks at 41.8x of jq's resident set on the 7950X and 47.9x on the M4 Pro (about 128 MB against 3 MB);
+the slope is about 1.2 MB per MB of input, so a multi-gigabyte log needs about as much memory as the file. Rows:
+`ndjson_identity`, `ndjson_field`, `ndjson_select`, `ndjson_inputs_reduce`, `seq_identity`, section E. The cause and the
+design that would remove it are in [#6913](https://github.com/rust-works/succinctly/issues/6913) and
+[#6920](https://github.com/rust-works/succinctly/issues/6920). `succinctly jq` is still the faster of the two on most of
+those rows (1.05x to 3.5x on the 7950X and 1.2x to 7.1x on the M4 Pro for the five named, at 100 MB), so this is a memory
+trade and not a speed one.
+
+<!-- claim: stream-abandon -->
+
+Two stream shapes are slower: taking the first `input` and abandoning the rest (`ndjson_inputs_first` is 0.76x and 0.61x
+at 100 MB), and `--seq` output
+(`users_seq_output` is 0.61x and 0.63x at 10 MB).
+
+### The program needs a jq 1.8 feature
+
+<!-- claim: jq-1-8 -->
+
+`succinctly jq` follows jq 1.7.1. Against the tests of jq 1.8.2, 475 of 550 `jq.test` programs agree (75 do not), among
+them `add/1`, `trimstr` and `trim`; 20 of 20 `uri.test` and 9 of 10 `base64.test` agree. Against 1.7.1 itself it
+agrees on every one of 447 `jq.test` programs. Rows: the secondary differential section of each report.
+
+### Binary size matters
+
+<!-- claim: binary-size -->
+
+`succinctly jq` is 28.5 MB on Linux and 23.2 MB on macOS; jq 1.7.1 is 2.7 MB and 1.1 MB (about 11x and 22x).
+
+## Neither is strict by default
+
+<!-- claim: validation -->
+
+Of the 188 `n_` cases of JSONTestSuite (documents that must be rejected), jq 1.7.1 accepts 25 and `succinctly jq`
+accepts 39. `succinctly jq --validate` rejects all 188, which is the setting to use when the input is untrusted and
+exact RFC 8259 behaviour matters. Section C of each report.
+
+## What this page does not cover
+
+- Inputs of 1 GB or more: the largest timed input is 100 MB. A tier for streaming and early-exit rows at 1 GB is tracked
+  in [#6915](https://github.com/rust-works/succinctly/issues/6915), and may change the advice for piped and very large
+  inputs.
+- Piped stdin: the reports have a section for it (D/E, piped stdin against a file argument). `succinctly jq` reads
+  stdin to its end before it starts, so a pipe costs it a little more than a file (up to about 1.3x on `users_field` at 100 MB),
+  and the speedup on stdin is a little smaller than the file figure.
+- Machines other than the two named. A larger or smaller cache, a different allocator, or slower storage changes the
+  memory-bound rows in particular.
+
+Reproduce the figures with `succinctly dev compare jq --full`; see
+[comparison/jq/README.md](../../comparison/jq/README.md).
