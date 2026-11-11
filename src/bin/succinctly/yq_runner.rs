@@ -2775,6 +2775,7 @@ fn needs_dom_fallback(
         && ((sort_keys && index.has_aliases())
             || sorts_a_mapping(expr, index, bytes)
             || reorders_a_flow_sequence(expr, index, bytes)
+            || maps_a_flow_collection(expr, index, bytes)
             || (is_array_of_nodes(expr) && index.has_aliases()))
 }
 
@@ -2802,6 +2803,24 @@ fn reorders_a_sequence(expr: &Expr) -> bool {
 /// `sort`, `sort_by`, `reverse`, `unique` or `unique_by`: the navigation (`None` at the root) and
 /// the reorder; `None` for any other shape (#6877).
 fn split_reorder_read(expr: &Expr) -> Option<(Option<Expr>, Expr)> {
+    split_static_nav_then(expr, reorders_a_sequence)
+}
+
+/// `expr` as `NAV | map(f)` for a static navigation `NAV` (none for the document itself): the
+/// navigation (`None` at the root) and the `map`; `None` for any other shape (#6986).
+fn split_map_read(expr: &Expr) -> Option<(Option<Expr>, Expr)> {
+    split_static_nav_then(expr, |last| {
+        matches!(last, Expr::Builtin(Builtin::Map(_)))
+    })
+}
+
+/// `expr` as `NAV | LAST` for a static navigation `NAV` (none for the document itself) and a last
+/// stage `is_last` accepts: the navigation (`None` at the root) and that stage; `None` for any
+/// other shape. The one parse [`split_reorder_read`] (#6877) and [`split_map_read`] (#6986) share.
+fn split_static_nav_then(
+    expr: &Expr,
+    is_last: impl Fn(&Expr) -> bool,
+) -> Option<(Option<Expr>, Expr)> {
     let mut stages = Vec::new();
     flatten_plain_pipe(expr, &mut stages);
     let (last, nav) = stages.split_last()?;
@@ -2809,7 +2828,7 @@ fn split_reorder_read(expr: &Expr) -> Option<(Option<Expr>, Expr)> {
     while let Expr::Paren(inner) = last {
         last = inner;
     }
-    if !reorders_a_sequence(last) {
+    if !is_last(last) {
         return None;
     }
     // `. | sort` is `sort`: an identity stage in front of the navigation moves nothing.
@@ -2833,6 +2852,17 @@ fn flow_sequence_target<'a, W: AsRef<[u64]> + Clone>(
     nav: Option<&Expr>,
     cursor: YamlCursor<'a, W>,
 ) -> Option<YamlCursor<'a, W>> {
+    flow_collection_target(nav, cursor)
+        .filter(|target| matches!(target.value(), YamlValue::Sequence(_)))
+}
+
+/// The node `nav` reaches from `cursor` (`cursor` itself for none), when it is a flow-style
+/// sequence or mapping: what [`flow_sequence_target`] narrows to a sequence, and the node whose
+/// style a `map` over it takes (#6986).
+fn flow_collection_target<'a, W: AsRef<[u64]> + Clone>(
+    nav: Option<&Expr>,
+    cursor: YamlCursor<'a, W>,
+) -> Option<YamlCursor<'a, W>> {
     let target = match nav {
         None => cursor,
         Some(nav) => match eval_with_cursor_using::<YqSemantics, _>(nav, cursor) {
@@ -2840,7 +2870,9 @@ fn flow_sequence_target<'a, W: AsRef<[u64]> + Clone>(
             _ => return None,
         },
     };
-    (matches!(target.value(), YamlValue::Sequence(_)) && target.style() == "flow").then_some(target)
+    (matches!(target.value(), YamlValue::Sequence(_) | YamlValue::Mapping(_))
+        && target.style() == "flow")
+        .then_some(target)
 }
 
 /// The write form of a read that reorders a flow-style sequence (#6877): `NAV | sort` is
@@ -2875,17 +2907,61 @@ fn reorders_a_flow_sequence(expr: &Expr, index: &YamlIndex, bytes: &[u8]) -> boo
     let Some((nav, _)) = split_reorder_read(expr) else {
         return false;
     };
+    any_document(index, bytes, |doc| {
+        flow_sequence_target(nav.as_ref(), doc).is_some()
+    })
+}
+
+/// Whether `expr` is `NAV | map(f)` ([`split_map_read`]) over a flow-style sequence or mapping in
+/// some document of `bytes`: the YAML output of it takes the DOM route, which gives the result the
+/// node's flow style ([`restyle_flow_map_result`]). The streamers write the mapped items as a block
+/// sequence (#6986).
+fn maps_a_flow_collection(expr: &Expr, index: &YamlIndex, bytes: &[u8]) -> bool {
+    let Some((nav, _)) = split_map_read(expr) else {
+        return false;
+    };
+    any_document(index, bytes, |doc| {
+        flow_collection_target(nav.as_ref(), doc).is_some()
+    })
+}
+
+/// Whether `test` holds for some document of `bytes`.
+fn any_document(
+    index: &YamlIndex,
+    bytes: &[u8],
+    test: impl Fn(YamlCursor<'_, Vec<u64>>) -> bool,
+) -> bool {
     let root = index.root(bytes);
     let YamlValue::Sequence(mut docs) = root.value() else {
         return false;
     };
     while let Some((doc, rest)) = docs.uncons_cursor() {
-        if flow_sequence_target(nav.as_ref(), doc).is_some() {
+        if test(doc) {
             return true;
         }
         docs = rest;
     }
     false
+}
+
+/// Give the one array `results` holds the flow style of the node a `NAV | map(f)` maps, when that
+/// node is a flow-style sequence or mapping, and nothing else of that node: yq's `map` builds a
+/// new sequence that copies the style of the node it maps, not its comments or anchor (#6986).
+/// The items keep the trees the evaluation gave them.
+fn restyle_flow_map_result<W: AsRef<[u64]> + Clone>(
+    expr: &Expr,
+    cursor: YamlCursor<'_, W>,
+    results: &mut [ResultWithComments],
+) {
+    let [(OwnedValue::Array(_), tree)] = results else {
+        return;
+    };
+    let Some((nav, _)) = split_map_read(expr) else {
+        return;
+    };
+    if flow_collection_target(nav.as_ref(), cursor).is_some() {
+        tree.set_meta(NodeMeta::empty().with_style("flow"));
+    }
 }
 
 /// Whether `expr` is a `sort`/`sort_by` of a mapping in some document of `bytes`, which the M2
@@ -8902,6 +8978,13 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
                     }
                 }
             }
+        }
+    }
+
+    // #6986: a `map` over a flow-style node prints in flow, whatever its body, as in yq.
+    if need_comments {
+        if let Ok(results) = &mut docs {
+            restyle_flow_map_result(expr, cursor, results);
         }
     }
 
