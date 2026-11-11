@@ -12,7 +12,7 @@
 
 use serde_json::Value;
 
-const PLATFORMS: [&str; 2] = ["linux-x86_64", "macos-aarch64"];
+const PLATFORMS: [&str; 3] = ["linux-aarch64", "linux-x86_64", "macos-aarch64"];
 
 fn report(platform: &str) -> Value {
     let path = format!(
@@ -205,9 +205,9 @@ const CLAIMS: &[Claim] = &[
         );
         matching < total && matching / total > 0.8 && primary["total"] == primary["matching"]
     }),
-    // 11x to 22x: more than ten times the size of jq 1.7.1.
+    // 9x to 22x: more than eight times the size of jq 1.7.1 (the Neoverse-V2 build is 9.4x).
     ("binary-size", |r| {
-        binary_bytes(r, "succinctly jq") > 10.0 * binary_bytes(r, "jq-1.7.1")
+        binary_bytes(r, "succinctly jq") > 8.0 * binary_bytes(r, "jq-1.7.1")
     }),
     // Of the `n_` cases (documents that must be rejected): `succinctly jq` accepts more than jq by default
     // (the guide says 39 against 25 of 188) and none with `--validate`.
@@ -227,7 +227,7 @@ const CLAIMS: &[Claim] = &[
 ];
 
 #[test]
-fn every_claim_of_the_guide_holds_on_both_platforms_6916() {
+fn every_claim_of_the_guide_holds_on_every_platform_6916() {
     let reports: Vec<(&str, Value)> = PLATFORMS.iter().map(|p| (*p, report(p))).collect();
     let mut failed = Vec::new();
     for (id, holds) in CLAIMS {
@@ -296,7 +296,7 @@ fn the_category_table_matches_the_reports_6916() {
             2 + PLATFORMS.len() + 2,
             "the category table row for {name} needs a name, a queries cell and one figure per platform"
         );
-        // | name | queries | x86_64 | aarch64 |
+        // | name | queries | Neoverse-V2 | x86_64 | M4 Pro |
         for (cell, report) in cells[3..3 + PLATFORMS.len()].iter().zip(&reports) {
             let printed: f64 = cell.trim_end_matches('x').parse().expect("a figure");
             let measured = geomean(report, select);

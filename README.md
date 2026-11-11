@@ -178,6 +178,17 @@ See [docs/benchmarks/rust-parsers.md](docs/benchmarks/rust-parsers.md) for detai
 Comparison of `succinctly jq .` vs `jq .` for formatting/printing JSON files.
 
 <!-- compare:jq-identity -->
+#### ARM Neoverse-V2 (10 MB files, jq-1.7.1)
+
+| Pattern           | jq-1.7.1 | succinctly | Speedup | jq-1.7.1 Mem | succ Mem | Mem Ratio |
+|-------------------|----------|------------|---------|--------------|----------|-----------|
+| **strings**       |  310.7ms |     25.0ms |  12.4x† |        14 MB |    27 MB |     1.93x |
+| **nested**        |  343.0ms |     34.4ms |  10.0x† |        22 MB |    30 MB |     1.33x |
+| **comprehensive** |  614.7ms |    131.1ms |   4.7x† |       149 MB |    37 MB |     0.25x |
+| **numbers**       |  344.5ms |     81.3ms |   4.2x† |        87 MB |    32 MB |     0.37x |
+| **wide**          |  602.4ms |    151.8ms |   4.0x† |       143 MB |    41 MB |     0.29x |
+| **users**         |  348.3ms |     96.5ms |   3.6x† |        68 MB |    27 MB |     0.39x |
+
 #### AMD Ryzen 9 7950X 16-Core Processor (10 MB files, jq-1.7.1)
 
 | Pattern           | jq-1.7.1 | succinctly | Speedup | jq-1.7.1 Mem | succ Mem | Mem Ratio |
