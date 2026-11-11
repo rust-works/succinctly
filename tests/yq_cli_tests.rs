@@ -20268,13 +20268,13 @@ mod tostring_container_1130 {
         Ok(())
     }
 
-    /// Known gap, pinned so a change is deliberate: nested flow style needs per-node style data (#739, #865).
-    /// yq prints "\"a:\\n  - 1\\n  - x: 2\\nb: [1, 2]\\nc:\\n  d: 1\"" here.
+    /// #6901 closed the gap #1130 pinned here: a document node is written with the writer the CLI
+    /// prints it with, so a flow collection nested in a block one keeps its flow style, as yq's does.
     #[test]
-    fn a_flow_mapping_nested_in_a_block_one_prints_block_gap_1130() -> Result<()> {
+    fn a_flow_mapping_nested_in_a_block_one_keeps_flow_6901() -> Result<()> {
         assert_eq!(
             yq(".|tostring", SOURCE, &["-o=json"])?,
-            "\"a:\\n  - 1\\n  - x: 2\\nb:\\n  - 1\\n  - 2\\nc:\\n  d: 1\"\n"
+            "\"a:\\n  - 1\\n  - x: 2\\nb: [1, 2]\\nc:\\n  d: 1\"\n"
         );
         Ok(())
     }
@@ -61570,16 +61570,11 @@ mod yaml_format_block_style_1183 {
     /// yq's answer beside it, so closing one fails loudly here.
     #[test]
     fn recorded_gaps_1183() -> Result<()> {
-        // An `OwnedValue` carries no source style (#739, #865): a
-        // flow-sourced container comes out block, where yq keeps flow
-        // (`{b: 1}\n`, `[1, 2]\n`).
-        check_on(
-            "a: {b: 1}\nc: [1, 2]\n",
-            &[
-                (".a | @yaml", r#""b: 1\n""#),
-                (".c | @yaml", r#""- 1\n- 2\n""#),
-            ],
-        )?;
+        // An `OwnedValue` carries no source style (#739, #865): a container the filter
+        // builds comes out block, where yq keeps the flow style of a node it copies
+        // (`[.a] | @yaml` is `- {b: 1}\n`). A document node keeps its style since #6901
+        // (`tests/yq_cli/i6901.rs`).
+        check_on("a: {b: 1}\n", &[("[.a] | @yaml", r#""- b: 1\n""#)])?;
         check_on(
             "null\n",
             &[
