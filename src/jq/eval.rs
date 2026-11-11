@@ -26739,8 +26739,9 @@ fn format_props_recursive(value: &OwnedValue, prefix: String, out: &mut String, 
 /// yq's `-o=<format>` encoders (#6850): the whole result as that format, line ends included, so the
 /// caller prints it with none of its own.
 ///
-/// `props`, `shell`, `csv` and `tsv` end every line (`csv` and `tsv` write nothing for `[]`). `base64` and `uri` write no line break and take a string only (`@base64` and `@uri`
-/// stringify other values first; the encoders refuse them, naming the tag).
+/// `props`, `shell`, `csv` and `tsv` end every line (`csv` and `tsv` write nothing for `[]`).
+/// `base64` and `uri` write no line break and take a string only (`@base64` and `@uri` stringify other
+/// values first; the encoders refuse them, naming the tag).
 fn format_yq_output<S: EvalSemantics>(
     encoder: &YqOutputEncoder,
     value: &OwnedValue,
@@ -26750,26 +26751,29 @@ fn format_yq_output<S: EvalSemantics>(
         YqOutputEncoder::Shell(separator) => Ok(format_shell_variables(value, separator)),
         YqOutputEncoder::Csv => format_yq_csv::<S>(value, ',', true),
         YqOutputEncoder::Tsv => format_yq_csv::<S>(value, '\t', true),
-        YqOutputEncoder::Base64 | YqOutputEncoder::Uri => {
-            if !matches!(value, OwnedValue::String(_)) {
-                let tag = owned_yaml_type_tag(value);
-                return Err(EvalError::new(
-                    if matches!(encoder, YqOutputEncoder::Base64) {
-                        format!("cannot encode {tag} as base64, can only operate on strings")
-                    } else {
-                        format!(
-                        "cannot encode {tag} as URI, can only operate on strings. Please first pipe \
-                         through another encoding operator to convert the value to a string"
-                    )
-                    },
-                ));
-            }
-            if matches!(encoder, YqOutputEncoder::Base64) {
-                format_base64::<S>(value, false)
-            } else {
-                format_uri::<S>(value, false)
-            }
-        }
+        YqOutputEncoder::Base64 => match value {
+            OwnedValue::String(_) => format_base64::<S>(value, false),
+            other => Err(yq_encoder_needs_a_string(other, "base64")),
+        },
+        YqOutputEncoder::Uri => match value {
+            OwnedValue::String(_) => format_uri::<S>(value, false),
+            other => Err(yq_encoder_needs_a_string(other, "URI")),
+        },
+    }
+}
+
+/// What `-o=base64` and `-o=uri` say of a value that is not a string, naming its tag (#6850).
+fn yq_encoder_needs_a_string(value: &OwnedValue, format: &str) -> EvalError {
+    let tag = owned_yaml_type_tag(value);
+    if format == "URI" {
+        EvalError::new(format!(
+            "cannot encode {tag} as URI, can only operate on strings. Please first pipe through \
+             another encoding operator to convert the value to a string"
+        ))
+    } else {
+        EvalError::new(format!(
+            "cannot encode {tag} as {format}, can only operate on strings"
+        ))
     }
 }
 

@@ -11620,22 +11620,20 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     // encoder, printed raw. The program is wrapped below, once it is parsed; from here on the run
     // is a YAML-output run with `-r`.
     let output_encoder = match args.output_format {
-        OutputFormat::Props => Some((YqOutputEncoder::Props, true)),
-        OutputFormat::Shell => Some((
-            YqOutputEncoder::Shell(args.shell_key_separator.clone()),
-            true,
-        )),
-        OutputFormat::Csv => Some((YqOutputEncoder::Csv, true)),
-        OutputFormat::Tsv => Some((YqOutputEncoder::Tsv, true)),
-        OutputFormat::Base64 => Some((YqOutputEncoder::Base64, true)),
-        OutputFormat::Uri => Some((YqOutputEncoder::Uri, true)),
+        OutputFormat::Props => Some(YqOutputEncoder::Props),
+        OutputFormat::Shell => Some(YqOutputEncoder::Shell(args.shell_key_separator.clone())),
+        OutputFormat::Csv => Some(YqOutputEncoder::Csv),
+        OutputFormat::Tsv => Some(YqOutputEncoder::Tsv),
+        OutputFormat::Base64 => Some(YqOutputEncoder::Base64),
+        OutputFormat::Uri => Some(YqOutputEncoder::Uri),
         OutputFormat::Yaml | OutputFormat::Json | OutputFormat::Auto => None,
     };
-    if let Some((_, joins)) = &output_encoder {
+    if output_encoder.is_some() {
+        // Every encoder writes its own line ends (or none), so nothing is added after a result.
         args.output_format = OutputFormat::Yaml;
         args.raw_output = true;
         args.no_doc = true;
-        args.output_encoder_joins = *joins;
+        args.output_encoder_joins = true;
     }
 
     // Handle --version
@@ -11825,7 +11823,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         }
     }
 
-    if let Some((format, _)) = output_encoder {
+    if let Some(format) = output_encoder {
         program.expr =
             Expr::Pipe(vec![program.expr, Expr::Format(FormatType::YqOutput(format))].into());
     }
