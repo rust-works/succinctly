@@ -69,36 +69,51 @@ fn classify(line: &[u8]) -> Line {
     // follows the blanks cannot make the line a bare `---` (the first case below) unless it
     // starts with white space of Unicode that RE2's `\s` does not name, which takes the full
     // path.
-    let mut ws = 0;
-    while line.get(ws).copied().is_some_and(is_re2_space) {
-        ws += 1;
-    }
-    if line[ws..].starts_with(b"---") && line.get(ws + 3).copied().is_some_and(is_re2_space) {
-        let mut end = ws + 3;
-        while line.get(end).copied().is_some_and(is_re2_space) {
-            end += 1;
-        }
+    let marker = leading_marker(line);
+    if let Some((ws, end)) = marker {
         if end < line.len() && !starts_with_unicode_whitespace(&line[end..]) {
             return Line::MarkerWithText { ws, end };
         }
     }
+    #[cfg(test)]
+    FULL_CLASSIFICATIONS.with(|bytes| bytes.set(bytes.get() + line.len()));
     // Go trims by Unicode white space, which is `char::is_whitespace`. Once per line.
     let text = String::from_utf8_lossy(line);
     let trimmed = text.trim();
     if trimmed == "---" {
         return Line::Separator;
     }
-    if line[ws..].starts_with(b"---") && line.get(ws + 3).copied().is_some_and(is_re2_space) {
-        let mut end = ws + 3;
-        while line.get(end).copied().is_some_and(is_re2_space) {
-            end += 1;
-        }
+    if let Some((ws, end)) = marker {
         return Line::MarkerWithText { ws, end };
     }
+    let ws = line.iter().take_while(|&&b| is_re2_space(b)).count();
     if line[ws..].starts_with(b"#") || line[ws..].starts_with(b"%YAML") || trimmed.is_empty() {
         return Line::Header;
     }
     Line::Content
+}
+
+/// `^\s*---\s+` on the line (RE2's `\s`): the bytes of white space before the marker and the offset
+/// where the white space after it ends, where the remainder starts.
+fn leading_marker(line: &[u8]) -> Option<(usize, usize)> {
+    let ws = line.iter().take_while(|&&b| is_re2_space(b)).count();
+    if !line[ws..].starts_with(b"---") || !line.get(ws + 3).copied().is_some_and(is_re2_space) {
+        return None;
+    }
+    let end = ws
+        + 3
+        + line[ws + 3..]
+            .iter()
+            .take_while(|&&b| is_re2_space(b))
+            .count();
+    Some((ws, end))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The bytes [`classify`] has read in full (the lossy conversion and trim) on this thread: what
+    /// a run of markers on one line must not make grow with the run (#6963).
+    static FULL_CLASSIFICATIONS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
 /// Whether the first character of `bytes` is Unicode white space (`char::is_whitespace`, which
@@ -303,11 +318,12 @@ mod tests {
     }
 
     /// #6963: `cuts` answers what the copying implementation answered, for every input of up to
-    /// six of the pieces a header line is made of: markers, ASCII and Unicode white space, both
-    /// kinds of break, a comment, a directive, content, and an invalid byte.
+    /// five of the pieces a header line is made of: markers, white space RE2 names and white space
+    /// only Unicode does (U+00A0, U+0085, U+3000, a vertical tab), both kinds of break, a comment,
+    /// a directive, content, and an invalid byte.
     #[test]
     fn cuts_agree_with_the_copying_implementation_on_every_short_header_6963() {
-        let pieces: [&[u8]; 10] = [
+        let pieces: [&[u8]; 13] = [
             b"---",
             b" ",
             b"\t",
@@ -317,6 +333,9 @@ mod tests {
             b"#",
             b"%YAML",
             "\u{a0}".as_bytes(),
+            "\u{85}".as_bytes(),
+            "\u{3000}".as_bytes(),
+            b"\x0b",
             b"\xff",
         ];
         let mut inputs = 0usize;
@@ -340,30 +359,30 @@ mod tests {
         }
         walk(&pieces, &mut stack, 0, &mut inputs);
         assert_eq!(
-            inputs, 111_111,
-            "1 + 10 + 10^2 + 10^3 + 10^4 + 10^5 sequences"
+            inputs, 402_234,
+            "1 + 13 + 13^2 + 13^3 + 13^4 + 13^5 sequences"
         );
     }
 
-    /// #6963: a run of markers on one line costs the same per marker at any length. A run of
-    /// 100,000 was 8 s to read when each marker copied the rest of the line; a count of the work
-    /// would not see it, so this bounds it with time generously: the quadratic form takes minutes
-    /// here, the linear one milliseconds.
+    /// #6963: a run of markers on one line reads nothing in full per marker. The quadratic form
+    /// converted and trimmed the rest of the line for every marker (about 40 GB of bytes at this
+    /// size, minutes); this counts the bytes [`classify`] reads in full, which stay the length of
+    /// the last line, not the run.
     #[test]
     fn a_long_run_of_markers_on_one_line_stays_linear_6963() {
-        let mut text = "--- ".repeat(200_000).into_bytes();
-        text.extend_from_slice(b"a\n");
-        let started = std::time::Instant::now();
-        let glued = glue_after_leading_marker_text(&text).expect("the markers are cut");
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(10),
-            "{:?} for {} markers",
-            started.elapsed(),
-            200_000
-        );
-        // The first marker stays; every later one is cut with the blanks after it, and so is the
-        // break the run never had to lose.
-        assert_eq!(glued, b"--- a\n");
+        for markers in [1_000_usize, 100_000] {
+            let mut text = "--- ".repeat(markers).into_bytes();
+            text.extend_from_slice(b"a\n");
+            FULL_CLASSIFICATIONS.with(|bytes| bytes.set(0));
+            let glued = glue_after_leading_marker_text(&text).expect("the markers are cut");
+            // The first marker stays; every later one is cut with the blanks after it.
+            assert_eq!(glued, b"--- a\n", "{markers} markers");
+            let read_in_full = FULL_CLASSIFICATIONS.with(core::cell::Cell::get);
+            assert!(
+                read_in_full < 100,
+                "{markers} markers read {read_in_full} bytes in full"
+            );
+        }
     }
 
     #[test]
