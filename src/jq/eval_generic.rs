@@ -4282,10 +4282,10 @@ pub fn to_owned_with_comments<V: DocumentValue, S: EvalSemantics>(
 
 /// [`to_owned_with_comments`], with one word for each subtree that says nothing (#6880).
 ///
-/// A container whose nodes have no comment, style, anchor, tag or spelling is held as the empty
-/// tree instead of a node per node of it, collapsed as the walk finishes it. Every read of the
-/// tree answers the same ([`CommentTree::collapse_if_silent`]); a caller that writes into the
-/// tree by position, or matches it by shape, wants [`to_owned_with_comments`].
+/// A collection whose nodes have no comment, style, anchor, tag or spelling is held as one word,
+/// [`CommentTree::Silent`], instead of a node per node of it, collapsed as the walk finishes it.
+/// Every read of the tree answers the same; a caller that writes into the tree by position, or
+/// matches it by shape, wants [`to_owned_with_comments`].
 pub fn to_owned_with_comments_pruned<V: DocumentValue, S: EvalSemantics>(
     value: &V,
     cursor: Option<&V::Cursor>,

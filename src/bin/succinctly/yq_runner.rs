@@ -9217,7 +9217,7 @@ fn head_comment_first_member(tree: &mut CommentTree, value: &OwnedValue, comment
             (SilentKind::Object, OwnedValue::Object(members)) => match members.keys().next() {
                 Some(key) => CommentTree::object(
                     NodeMeta::empty(),
-                    IndexMap::from([(key.to_string(), CommentTree::empty())]),
+                    IndexMap::from([(key.clone(), CommentTree::empty())]),
                     IndexMap::new(),
                 ),
                 None => CommentTree::empty(),
