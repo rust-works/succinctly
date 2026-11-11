@@ -30,7 +30,7 @@ use succinctly::jq::{
     nesting_depth_exceeded_message, nonfinite_display_string, nonfinite_literal_display,
     sync_aliased_paths, sync_merged_members, AssignOp, Builtin, DefScope, EvalError, Expr,
     FormatType, Literal, LuaOptions, MetaSlot, NumberRepr, ObjectKey, ObjectMap, OwnedValue,
-    QueryResult, YqOutputEncoder, YqSemantics,
+    QueryResult, XmlOptions, YqOutputEncoder, YqSemantics,
 };
 use succinctly::json::light::JsonCursor;
 use succinctly::json::validate;
@@ -11873,6 +11873,13 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         OutputFormat::Ini => Some(YqOutputEncoder::Ini),
         OutputFormat::Toml => Some(YqOutputEncoder::Toml),
         OutputFormat::Kyaml => Some(YqOutputEncoder::Kyaml(usize::from(args.indent))),
+        OutputFormat::Xml => Some(YqOutputEncoder::Xml(Box::new(XmlOptions {
+            indent: usize::from(args.indent),
+            attribute_prefix: args.xml_attribute_prefix.clone(),
+            content_name: args.xml_content_name.clone(),
+            proc_inst_prefix: args.xml_proc_inst_prefix.clone(),
+            directive_name: args.xml_directive_name.clone(),
+        }))),
         OutputFormat::Yaml | OutputFormat::Json | OutputFormat::Auto => None,
     };
     if output_encoder.is_some() {

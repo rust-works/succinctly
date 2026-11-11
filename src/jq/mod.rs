@@ -133,6 +133,7 @@ pub mod share_stats;
 mod value;
 pub mod walk;
 mod yq_datetime;
+mod yq_xml;
 
 pub use error::{BinOp, Control, ErrorKind, EvalError, EvalErrorPayload};
 pub(crate) use eval::last_as_reduce;
@@ -180,7 +181,7 @@ pub use expr::{
     FuncDefBound, FuncDefData, Import, Include, Libm1, Libm2, Libm3, Literal, LuaOptions,
     MergeFlags, MetaObject, MetaSlot, MetaValue, ModuleMeta, NumberKey, ObjectEntry, ObjectKey,
     Param, Pattern, PatternEntry, PipeStages, Program, SharedArg, SliceBoundKey, StringPart,
-    YqOutputEncoder,
+    XmlOptions, YqOutputEncoder,
 };
 pub use lazy::JqValue;
 // #5497: jq's parse-depth limit, applied by the CLI's document routes.

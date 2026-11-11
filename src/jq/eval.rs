@@ -26919,6 +26919,7 @@ fn format_yq_output<S: EvalSemantics>(
         YqOutputEncoder::Ini => format_ini(value),
         YqOutputEncoder::Toml => format_toml(value),
         YqOutputEncoder::Kyaml(indent) => Ok(format_kyaml(value, *indent)),
+        YqOutputEncoder::Xml(options) => super::yq_xml::format_xml(value, options),
         YqOutputEncoder::Tsv => format_yq_csv::<S>(value, '\t', true),
         YqOutputEncoder::Base64 => format_base64::<S>(value, false),
         YqOutputEncoder::Uri => format_uri::<S>(value, false),
@@ -27692,7 +27693,7 @@ fn props_escape(text: &str, is_key: bool) -> String {
 
 /// Convert a scalar value to its properties string representation; `escape` applies [`props_escape`] to a
 /// string (a keyed value does, a top-level scalar does not).
-fn props_value_to_string(value: &OwnedValue, escape: bool) -> String {
+pub(super) fn props_value_to_string(value: &OwnedValue, escape: bool) -> String {
     match value {
         OwnedValue::Null => "null".to_string(),
         OwnedValue::Bool(true) => "true".to_string(),

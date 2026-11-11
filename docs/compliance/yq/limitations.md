@@ -7646,7 +7646,8 @@ The `@props` and `@csv` operators ignore those flags here, where yq applies them
 `-o=ini` is read as well (#6924), as yq's go-ini encoder writes it: it agrees with yq v4.53.3 on 3,200 random JSON documents and on YAML input except for a null written `~` (see the list below).
 `-o=toml` is read as well (#6924); where it differs from yq is in its own section below.
 `-o=kyaml` is read as well (#6924); where it differs from yq is in its own section below.
-The other formats yq lists (`xml`, `hcl`) and every input format but YAML, JSON, `base64` and `uri` (see the `-p base64|uri` section below) are still refused at the flag.
+`-o=xml` is read as well (#6924), with `--xml-attribute-prefix`, `--xml-content-name`, `--xml-proc-inst-prefix` and `--xml-directive-name`; where it differs from yq is in its own section below.
+The other formats yq lists (`hcl`) and every input format but YAML, JSON, `base64` and `uri` (see the `-p base64|uri` section below) are still refused at the flag.
 Seven rows differ from yq v4.53.3, each pinned out of `tests/yq_cli/i6850.rs`:
 
 - A comment in a `props` document is not written.
@@ -7715,3 +7716,13 @@ Two rows differ:
   The U+FFFD is substituted before the filter runs, so `length`, which counts bytes in both tools, counts three for it where yq counts the one byte (`printf 'a%FFb' | yq -p uri -o json length` is `3` in yq and `5` here), as it already did for a `-p json` string.
   yq prints the raw bytes for a document that is the string itself (`printf /w== | yq -p base64 .` writes the byte `0xff`) and refuses a nested one with `yaml: cannot marshal invalid UTF-8 data as !!str`.
 - `--front-matter` with an explicit `-p base64` or `-p uri` is refused (`--front-matter and --input-format base64 are incompatible`), as `-p json` is, where yq decodes the extracted front matter.
+
+### `-o=xml` — comments, a source spelling and an empty document are not read (#6924)
+
+`-o=xml` is a port of yq's XML encoder over Go's `encoding/xml` printer (its indentation state, its text and attribute escapes, the refusals of a start tag with no name, of an attribute that is not a scalar, of a processing instruction with a bad target or a `?>` and of a malformed directive) and agrees with yq v4.53.3 on 5,000 random JSON documents.
+It runs over the value model, which keeps no comment or source spelling, so on a YAML input these still differ:
+
+- A head, line or foot comment is dropped, where yq writes it as an XML comment (`<!-- c -->`, `<a>1<!-- l --></a>`).
+- A null written `~` is `null` and a boolean written `True` is `true`, where yq writes the source text.
+- An empty document, which yq prints as nothing, is `null` here (#5721).
+- A `-p`/`-o` input format of `xml` is still refused, so `--xml-strict-mode`, `--xml-keep-namespace`, `--xml-raw-token`, `--xml-skip-directives` and `--xml-skip-proc-inst` have nothing to act on.

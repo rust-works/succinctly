@@ -1178,6 +1178,9 @@ pub enum OutputFormat {
     /// Lua table literal (#6924)
     #[value(name = "lua", alias = "l")]
     Lua,
+    /// XML elements, attributes and text (#6924)
+    #[value(name = "xml", alias = "x")]
+    Xml,
     /// KYAML, YAML's flow subset with explicit commas (#6924)
     #[value(name = "kyaml", alias = "ky")]
     Kyaml,
@@ -1365,6 +1368,38 @@ pub struct YqCommand {
     /// Write a string key that is a Lua name unquoted in `-o=lua` (#6924)
     #[arg(long = "lua-unquoted", overrides_with = "lua_unquoted")]
     pub lua_unquoted: bool,
+
+    /// Prefix of a key that is an attribute in `-o=xml` (#6924)
+    #[arg(
+        long = "xml-attribute-prefix",
+        value_name = "PREFIX",
+        default_value = "+@"
+    )]
+    pub xml_attribute_prefix: String,
+
+    /// Key that holds an element's text in `-o=xml` (#6924)
+    #[arg(
+        long = "xml-content-name",
+        value_name = "NAME",
+        default_value = "+content"
+    )]
+    pub xml_content_name: String,
+
+    /// Prefix of a key that is a processing instruction in `-o=xml` (#6924)
+    #[arg(
+        long = "xml-proc-inst-prefix",
+        value_name = "PREFIX",
+        default_value = "+p_"
+    )]
+    pub xml_proc_inst_prefix: String,
+
+    /// Key that holds a directive in `-o=xml` (#6924)
+    #[arg(
+        long = "xml-directive-name",
+        value_name = "NAME",
+        default_value = "+directive"
+    )]
+    pub xml_directive_name: String,
 
     /// Separator between the parts of a variable name for `-o=shell` (#6850)
     #[arg(

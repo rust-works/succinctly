@@ -412,7 +412,7 @@ succinctly yq '.users[]' input.yaml
 
 ### Output Options
 
-- `-o, --output-format <FORMAT>`: Output format: `auto` (default), `yaml`, `json`, `props`, `shell`, `csv`, `tsv`, `base64`, `uri`, `lua`, `ini`, `toml`, `kyaml` (the last ten as yq writes them, see the yq limitations page; #6850)
+- `-o, --output-format <FORMAT>`: Output format: `auto` (default), `yaml`, `json`, `props`, `shell`, `csv`, `tsv`, `base64`, `uri`, `lua`, `ini`, `toml`, `kyaml`, `xml` (the last eleven as yq writes them, see the yq limitations page; #6850)
 - `--properties-separator <SEP>`, `--properties-array-brackets`, `--csv-separator <CHAR>`, `--shell-key-separator <SEP>`, `--lua-prefix`, `--lua-suffix`, `--lua-globals`, `--lua-unquoted`: options of the `props`, `csv`, `shell` and `lua` output formats (#6922, #6924)
 - `-I, --indent <N>`: Indent level (0 for compact output, default: 2)
 - `-r, --unwrapScalar`: Output raw strings without quotes (default for YAML)
