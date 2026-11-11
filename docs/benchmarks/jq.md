@@ -38,7 +38,7 @@ For detailed architectural documentation, see [Semi-Indexing Architecture](../ar
 
 Benchmarks measure:
 - **Wall time**: Total elapsed time
-- **Peak memory**: Maximum resident set size (RSS). On a file of many top-level values (NDJSON) succinctly's grows with the input (about 1.0 to 1.2 times the file) where jq's stays at a few MB, so the memory ratios of the `ndjson_*` rows grow with the size and jq is the tool for a file too large to hold: [#6913](https://github.com/rust-works/succinctly/issues/6913), measured in [jq limitations](../compliance/jq/limitations.md#peak-memory-on-a-stream-of-many-values-grows-with-the-input-6913)
+- **Peak memory**: Maximum resident set size (RSS). On a file of many top-level values (NDJSON) succinctly's grows with the input (about 1.0 to 1.2 times the file for `ndjson_identity`, `ndjson_field`, `ndjson_select`, `ndjson_inputs_reduce` and `ndjson_raw_lines`; `ndjson_inputs_first` is flat) where jq's stays at a few MB, so the memory ratios of those rows grow with the size and jq is the tool for a file too large to hold: [#6913](https://github.com/rust-works/succinctly/issues/6913), measured in [jq limitations](../compliance/jq/limitations.md#peak-memory-on-a-stream-of-many-values-grows-with-the-input-6913)
 - **Output correctness**: MD5 hash comparison ensures identical output
 
 Run with:

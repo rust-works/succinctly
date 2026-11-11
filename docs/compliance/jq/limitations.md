@@ -7277,7 +7277,8 @@ The endless-stream rows were measured on `main` @ 89a900ccc against `/usr/bin/jq
 
 On a file of many top-level values (NDJSON), `succinctly jq`'s peak memory grows linearly with the file, where jq 1.7.1's stays at a few MB whatever the size.
 This is a known limitation, not supported at this stage: it is outside the three reasons ADR-0018 permits a divergence for, so it is a deferred gap and not a deliberate behaviour.
-It is the same cause as the stdin limitation above, and it needs the same design (what releases consumed text, given that a fault is worded by re-reading it), so it is not fixed here.
+It shares its blocker with the stdin limitation above (what releases consumed text, given that a fault is worded by re-reading it), so it needs a design of its own and is not fixed here.
+The figures below are for files; stdin was not measured, and neither were the slurp shapes (`-s`, `-R -s`), where jq holds the input too.
 At 100 MB succinctly is still faster than jq on every row below except `first(inputs)`, on both machines ([docs/compare/jq.md](../../compare/jq.md)): this is a memory trade, not a speed one.
 The `--seq` and `--stream` routes were not measured for this entry.
 For a log too large to hold in memory, use jq, or split the file and run each part (`split -l`).
@@ -7308,7 +7309,7 @@ Apple M4 Pro, aarch64:
 | `-n 'first(inputs)\|.id'`                 |   6.2 |    6.3 |     6.3 |
 
 Each machine generated its own files, and the 1 MiB file is byte-identical to the one generated elsewhere.
-jq 1.7.1's figure at 100 MB is 2.7 to 3.2 MB in the committed [docs/compare/](../../compare/jq.md) reports, and the `main` @ 968a5fa84 runs there put succinctly at 112 to 128 MiB, which these runs reproduce.
+jq 1.7.1's peak at 100 MiB is 2.6 to 3.2 MiB in the committed [docs/compare/](../../compare/jq.md) reports, and the `main` @ 968a5fa84 runs there put succinctly at 109 to 128 MiB on the five rows that grow, which these runs match to within 5%.
 
 What holds the memory, from the slope between 10 and 100 MiB (MiB of peak per MiB of input) and from the code:
 
@@ -7316,6 +7317,7 @@ What holds the memory, from the slope between 10 and 100 MiB (MiB of peak per Mi
   `-n` programs that read `input`/`inputs` and `-R` slope at 1.00 on both machines.
   The lone-source lazy route ([#6451](https://github.com/rust-works/succinctly/issues/6451)) reads only the first 256 KiB before the program starts, which is why `first(inputs)` is flat, but `read_lazy_rest` drains the rest of the file into the same buffer when the scan gets past it, and `LazyJsonInputs::text` is dropped only with the source's last document.
   The documents are converted one at a time and dropped, and the output is written as it goes, so neither the values nor the results are retained.
+  Its `spans` are one chunk's (at most 512 KiB of text; `lazy_scan_on` clears them before each scan), so they add nothing that scales: the slope is the text alone.
 - **A span per document, about 0.15 per MiB more, on the plain route.**
   `-c .`, `.name` and `select` slope at 1.15 to 1.17.
   That route calls `split_json_values` over the whole file before its loop, which returns a `Vec<(usize, usize)>` of every document's byte range: 16 bytes for each of the 993,416 records, 15.2 MiB.
