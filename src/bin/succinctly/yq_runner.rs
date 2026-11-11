@@ -2809,9 +2809,7 @@ fn split_reorder_read(expr: &Expr) -> Option<(Option<Expr>, Expr)> {
 /// `expr` as `NAV | map(f)` for a static navigation `NAV` (none for the document itself): the
 /// navigation (`None` at the root) and the `map`; `None` for any other shape (#6986).
 fn split_map_read(expr: &Expr) -> Option<(Option<Expr>, Expr)> {
-    split_static_nav_then(expr, |last| {
-        matches!(last, Expr::Builtin(Builtin::Map(_)))
-    })
+    split_static_nav_then(expr, |last| matches!(last, Expr::Builtin(Builtin::Map(_))))
 }
 
 /// `expr` as `NAV | LAST` for a static navigation `NAV` (none for the document itself) and a last
@@ -2870,8 +2868,10 @@ fn flow_collection_target<'a, W: AsRef<[u64]> + Clone>(
             _ => return None,
         },
     };
-    (matches!(target.value(), YamlValue::Sequence(_) | YamlValue::Mapping(_))
-        && target.style() == "flow")
+    (matches!(
+        target.value(),
+        YamlValue::Sequence(_) | YamlValue::Mapping(_)
+    ) && target.style() == "flow")
         .then_some(target)
 }
 
