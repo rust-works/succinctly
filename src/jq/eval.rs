@@ -98593,7 +98593,8 @@ pub(crate) fn each_range_batches(
 /// . + $by) elif $by < 0 then ... else empty end`, and two number literals compare exactly as
 /// decimals there: a step literal too small for a double (`1e-1000`, `-1e-400`) is not zero, and
 /// the first `$from < $upto`, the one comparison of two literals before `+ $by` computes, can
-/// differ from the doubles' when they tie (`range(0; 1e-1000; 1)` is `[0]`). jq mode only; `range/1`
+/// differ from the doubles' when they tie (`range(0; 1e-1000; 1)` is `[0]`), unless both are
+/// integers, which the `i64` walk compares exactly already. jq mode only; `range/1`
 /// and `range/2` are jq's C opcode, which compares doubles, and yq's numbers are doubles.
 pub(crate) fn range_reads_literals<S: EvalSemantics>(
     from: &OwnedValue,
@@ -98610,7 +98611,16 @@ pub(crate) fn range_reads_literals<S: EvalSemantics>(
             && a.as_f64() == b.as_f64()
             && jq_numeric_cmp(a, b) != Some(Ordering::Equal)
     };
-    double_ties(step, &definition_zero::<S>()) || double_ties(from, to)
+    // Two integers keep the exact `i64` walk, which already compares them exactly (and past
+    // `2^53` keeps every value, the recorded #2131 divergence from jq's doubles).
+    let both_ints = matches!(
+        (from, to),
+        (
+            OwnedValue::NumberLiteral(NumberRepr::Int(_), _),
+            OwnedValue::NumberLiteral(NumberRepr::Int(_), _)
+        )
+    );
+    double_ties(step, &definition_zero::<S>()) || (!both_ints && double_ties(from, to))
 }
 
 pub(crate) fn range_values_generic<S: EvalSemantics>(
@@ -167833,6 +167843,12 @@ mod tests {
         assert!(!range_reads_literals::<JqSemantics>(
             &int(0),
             &int(3),
+            &int(1)
+        ));
+        // Two integers whose doubles tie stay on the exact `i64` walk (#2131).
+        assert!(!range_reads_literals::<JqSemantics>(
+            &int(1_700_000_000_000_000_000),
+            &int(1_700_000_000_000_000_001),
             &int(1)
         ));
         assert!(!range_reads_literals::<JqSemantics>(
