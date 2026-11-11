@@ -2815,6 +2815,11 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     ///
     /// Pass `Some(&resolved)` when a prior [`Self::value`] call already
     /// produced it, or `None` only once that non-alias proof holds.
+    ///
+    /// The non-specific tag (`!`, `!<!>`, [`is_non_specific_tag`]) is no tag here: it names no kind,
+    /// so yq reads the node as untagged and drops the `!` from its output (#6948). Every reader and
+    /// every writer of a node's explicit tag goes through this, so a node marked only by it is the
+    /// node without the mark.
     #[inline]
     pub(crate) fn explicit_tag_at(&self, known_value: Option<&YamlValue<'a, W>>) -> Option<&str> {
         if let Some(YamlValue::Alias { target, .. }) = known_value {
@@ -2826,9 +2831,13 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             // the elided lifetime resolves to `'a`, matching every other
             // `Alias` arm in this file that recurses via the cursor itself
             // rather than a getter call on it.
-            return (*target).and_then(|t| t.index.get_tag(t.bp_pos));
+            return (*target)
+                .and_then(|t| t.index.get_tag(t.bp_pos))
+                .filter(|tag| !is_non_specific_tag(tag));
         }
-        self.index.get_tag(self.bp_pos)
+        self.index
+            .get_tag(self.bp_pos)
+            .filter(|tag| !is_non_specific_tag(tag))
     }
 
     /// Get the raw byte range of this node's *first* trailing same-line
