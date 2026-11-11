@@ -82,3 +82,10 @@ corpus_tabular_group	-c	group_by(.peak_hour)|map({h:.[0].peak_hour,n:length})	co
 corpus_pretty_numbers	-	[..|numbers]|length	corpus-pretty	1mb
 corpus_pretty_paths	-	[paths]|length	corpus-pretty	1mb
 corpus_pretty_tostream	-	[tostream]|length	corpus-pretty	1mb
+# Piped stdin (#6914): the same program as the row named before _stdin, with its input written to a pipe on stdin instead of named as a file argument.
+identity_stdin	@stdin	.	users,wide	100mb
+identity_compact_stdin	-c @stdin	.	users,wide	100mb
+users_field_stdin	-c @stdin	.users[0]	users	100mb
+users_map_select_stdin	-c @stdin	[.users[]|select(.score>500)]|length	users	100mb
+ndjson_field_stdin	-r @stdin	.name	ndjson	100mb
+ndjson_inputs_reduce_stdin	-n @stdin	reduce inputs as $u (0;.+$u.score)	ndjson	100mb

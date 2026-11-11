@@ -217,6 +217,11 @@ pub struct Results {
     pub sweeps: Vec<sweep::Run>,
     /// D and E, one row per query × input.
     pub perf: Vec<perf::PerfRow>,
+    /// D and E, the rows that feed their input through a pipe on stdin (`@stdin`, #6914), kept
+    /// out of `perf` so no headline figure over the file route moves. Each pairs with the
+    /// `perf` row of its query id minus `_stdin` on the same input.
+    #[serde(default)]
+    pub perf_stdin: Vec<perf::PerfRow>,
     pub perf_note: Option<String>,
     /// F.
     pub robust: Vec<robust::Row>,
@@ -760,7 +765,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
             status: "implemented (nesting, recursion, generators, regex, large values, SIGPIPE, memory limits)",
         });
     }
-    let (mut perf_rows, mut perf_note) = (vec![], None);
+    let (mut perf_rows, mut perf_stdin_rows, mut perf_note) = (vec![], vec![], None);
     if want(Dimension::Performance) {
         run_suites.push("perf".into());
         let inputs_dir = root.join("data/compare/inputs");
@@ -831,13 +836,18 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
             if row.gate == perf::Gate::Differs {
                 observed.insert(format!("perf:{}@{}", row.query, row.input));
             }
-            perf_rows.push(row);
+            if query.stdin {
+                perf_stdin_rows.push(row);
+            } else {
+                perf_rows.push(row);
+            }
         }
         if valgrind.is_some() {
             // A valgrind that could not run the tools must not read as a clean run with no table.
             let (mut wanted, mut got) = (0, 0);
             for r in perf_rows
                 .iter()
+                .chain(&perf_stdin_rows)
                 .filter(|r| r.gate == perf::Gate::Match && r.tools.len() > 1)
                 .filter(|r| r.tier == "1mb" || r.tier == "startup")
             {
@@ -976,6 +986,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         robust: robust_rows,
         operational: operational_info,
         perf: perf_rows,
+        perf_stdin: perf_stdin_rows,
         perf_note,
         known_divergences: known,
         ledger: ledger_outcome,
