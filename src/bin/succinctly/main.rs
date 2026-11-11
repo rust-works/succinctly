@@ -1313,6 +1313,25 @@ pub struct YqCommand {
     #[arg(skip)]
     pub output_encoder_joins: bool,
 
+    /// Separator between a key and its value for `-o=props` (#6922)
+    #[arg(
+        long = "properties-separator",
+        value_name = "SEPARATOR",
+        default_value = " = "
+    )]
+    pub properties_separator: String,
+
+    /// Write `a[0]` rather than `a.0` for an array element in `-o=props` (#6922)
+    #[arg(
+        long = "properties-array-brackets",
+        overrides_with = "properties_array_brackets"
+    )]
+    pub properties_array_brackets: bool,
+
+    /// The field separator of `-o=csv`, one byte (#6922)
+    #[arg(long = "csv-separator", value_name = "CHAR", default_value = ",")]
+    pub csv_separator: String,
+
     /// Separator between the parts of a variable name for `-o=shell` (#6850)
     #[arg(
         long = "shell-key-separator",

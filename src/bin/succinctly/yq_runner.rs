@@ -11619,10 +11619,22 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     // #6850: `-o=props|shell|csv|tsv|base64|uri` is the run's results through that format's
     // encoder, printed raw. The program is wrapped below, once it is parsed; from here on the run
     // is a YAML-output run with `-r`.
+    // yq reads the separator as a Go `char`: one byte, checked while it parses the flags (#6922).
+    let csv_separator = match args.csv_separator.as_bytes() {
+        [byte] => char::from(*byte),
+        other => anyhow::bail!(
+            "invalid argument \"{0}\" for \"--csv-separator\" flag: [{0}] is not a valid character. Must be length 1 was {1}",
+            args.csv_separator,
+            other.len()
+        ),
+    };
     let output_encoder = match args.output_format {
-        OutputFormat::Props => Some(YqOutputEncoder::Props),
+        OutputFormat::Props => Some(YqOutputEncoder::Props {
+            separator: args.properties_separator.clone(),
+            array_brackets: args.properties_array_brackets,
+        }),
         OutputFormat::Shell => Some(YqOutputEncoder::Shell(args.shell_key_separator.clone())),
-        OutputFormat::Csv => Some(YqOutputEncoder::Csv),
+        OutputFormat::Csv => Some(YqOutputEncoder::Csv(csv_separator)),
         OutputFormat::Tsv => Some(YqOutputEncoder::Tsv),
         OutputFormat::Base64 => Some(YqOutputEncoder::Base64),
         OutputFormat::Uri => Some(YqOutputEncoder::Uri),
