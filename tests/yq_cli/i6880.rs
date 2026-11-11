@@ -3,7 +3,7 @@
 //!
 //! The rows cover what the saving must not change: `-P` placing a flow collection's trailing
 //! comment on the next item (the held comment goes to that item's first member, which a
-//! collapsed subtree has to grow back), a kind-changed item taking it too, writes over documents
+//! collapsed subtree has to grow back), writes over documents
 //! with and without a comment, quoting or `- # note` beside the silent parts, and the writes
 //! that need the tree by position (a plain `=` from a read, an alias, a metadata write, a tag
 //! write), which keep the full tree.
@@ -77,30 +77,6 @@ fn test_a_flow_comment_held_for_a_silent_block_item_is_kept_under_p_6880() -> Re
             &["-P"],
             ".[2] = 3",
             "- - 1\n  - 2\n- # ec\n  a:\n    - 1\n    - 2\n  b: 2\n- 3\n",
-        ),
-    ])
-}
-
-#[test]
-fn test_a_kind_changed_item_takes_the_held_flow_comment_6880() -> Result<()> {
-    assert_yq_rows(&[
-        (
-            "- [1, 2] # ec\n- 5\n",
-            &["-P"],
-            ".[1] = {\"a\": 1}",
-            "- - 1\n  - 2\n- # ec\n  a: 1\n",
-        ),
-        (
-            "- [1, 2] # ec\n- 5\n",
-            &["-P"],
-            ".[1] = [7]",
-            "- - 1\n  - 2\n- # ec\n  - 7\n",
-        ),
-        (
-            "- [1, 2] # ec\n- 5\n",
-            &["-P"],
-            ".[1] = {\"a\": {\"b\": 1}}",
-            "- - 1\n  - 2\n- # ec\n  a:\n    b: 1\n",
         ),
     ])
 }

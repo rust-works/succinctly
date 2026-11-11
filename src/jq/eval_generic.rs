@@ -3551,6 +3551,24 @@ pub enum CommentTree {
     /// nothing at all (a sibling key follows, or EOF) - see
     /// [`Self::key_comment_if_value_absent`].
     Object(MetaBox, ChildMap, KeyMap),
+    /// A collection none of whose nodes says anything (no comment, style, anchor, tag, spelling
+    /// or key metadata, #6880), in one word: what the dense `Array`/`Object` tree of such a
+    /// subtree would read as, without a node for each node of it. Every read answers as that
+    /// tree does ([`Self::field`] and [`Self::at_index`] give the empty tree, [`Self::meta`] the
+    /// empty metadata, a pass that matches `Array` or `Object` finds no member), and a write
+    /// into it first gives it the childless tree it stands for ([`Self::materialize`]). Unlike a
+    /// `Leaf` over a collection, which a write that changed a node's kind leaves, it is the
+    /// collection's own tree, so the sites that treat the two differently can tell them apart.
+    Silent(SilentKind),
+}
+
+/// What kind of collection a [`CommentTree::Silent`] stands for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SilentKind {
+    /// A sequence: `CommentTree::Array` with no node of its own to say anything.
+    Array,
+    /// A mapping: `CommentTree::Object` with no node of its own to say anything.
+    Object,
 }
 
 /// A node's [`NodeMeta`] as [`CommentTree`] stores it: one word, and no allocation, for the
@@ -3919,35 +3937,42 @@ impl CommentTree {
         Self::Leaf(MetaBox::empty())
     }
 
-    /// Replace this tree by the one-word [`Self::empty`] when it says nothing (#6880). The builder
-    /// calls this on each child as soon as it is finished, so a subtree with nothing to carry is
-    /// never held. A node is silent when it has no comment, style, anchor, head or foot line, tag
-    /// or spelling, no key metadata, and every child is already the empty leaf; a silent child
-    /// that was not collapsed first counts as one that says something, which only costs the
+    /// Replace a collection that says nothing by the one-word [`Self::Silent`] (#6880). The
+    /// builder calls this on each child as soon as it is finished, so a subtree with nothing to
+    /// carry is never held. A collection is silent when it has no comment, style, anchor, head or
+    /// foot line, tag or spelling, no key metadata, and every child is already silent; a silent
+    /// child that was not collapsed first counts as one that says something, which only costs the
     /// saving.
     ///
-    /// The empty tree answers every read as the silent subtree did ([`Self::field`] and
-    /// [`Self::at_index`] fall back to it, [`Self::meta`] is the empty metadata). What it cannot
-    /// stand in for is a tree something is written into by position, or one that is matched by
-    /// its shape (`Object`, `Array`): see the gate in `yq_runner.rs`.
+    /// The silent tree answers every read as the dense one did, and a write into it gives it
+    /// the childless tree it stands for ([`Self::materialize`]). A tree that is matched by its
+    /// shape (`Object`, `Array`) sees no member in it: see the gate in `yq_runner.rs`.
     fn collapse_if_silent(&mut self) {
-        let silent = match self {
-            Self::Leaf(_) => return,
-            Self::Array(meta, items) => meta.is_empty() && items.iter().all(Self::is_silent_leaf),
+        let kind = match self {
+            Self::Leaf(_) | Self::Silent(_) => return,
+            Self::Array(meta, items) => {
+                (meta.is_empty() && items.iter().all(Self::is_silent)).then_some(SilentKind::Array)
+            }
             Self::Object(meta, fields, keys) => {
-                meta.is_empty() && keys.is_empty() && fields.values().all(Self::is_silent_leaf)
+                (meta.is_empty() && keys.is_empty() && fields.values().all(Self::is_silent))
+                    .then_some(SilentKind::Object)
             }
         };
-        if silent {
-            *self = Self::empty();
+        if let Some(kind) = kind {
+            *self = Self::Silent(kind);
         }
     }
 
-    /// Whether this is a leaf that says nothing: what a scalar with no comment, style, anchor, tag
-    /// or spelling is, and what a collapsed silent subtree is held as (#6880). The one definition
-    /// the builder's collapse and the write's reconcile shortcut both use.
-    pub fn is_silent_leaf(&self) -> bool {
-        matches!(self, Self::Leaf(meta) if meta.is_empty())
+    /// Whether this node says nothing and has nothing below it that does: a leaf with no
+    /// metadata (what a scalar with no comment, style, anchor, tag or spelling is) or a
+    /// collapsed [`Self::Silent`] collection (#6880). The one definition the builder's collapse
+    /// uses, a node is silent only when every child already is.
+    pub fn is_silent(&self) -> bool {
+        match self {
+            Self::Leaf(meta) => meta.is_empty(),
+            Self::Silent(_) => true,
+            Self::Array(..) | Self::Object(..) => false,
+        }
     }
 
     /// A node with no children and `meta` for its own metadata.
@@ -3971,8 +3996,22 @@ impl CommentTree {
 
     /// Replace this node's own metadata (an unboxed slot when it says nothing).
     pub fn set_meta(&mut self, meta: NodeMeta) {
+        self.materialize();
         match self {
             Self::Leaf(m) | Self::Array(m, _) | Self::Object(m, _, _) => m.set(meta),
+            Self::Silent(_) => unreachable!("materialize replaced the silent tree"),
+        }
+    }
+
+    /// Give a [`Self::Silent`] collection the childless tree it stands for, for a caller that
+    /// writes into the tree. A no-op for every other node.
+    pub fn materialize(&mut self) {
+        match self {
+            Self::Silent(SilentKind::Array) => *self = Self::Array(MetaBox::empty(), Vec::new()),
+            Self::Silent(SilentKind::Object) => {
+                *self = Self::Object(MetaBox::empty(), Box::default(), KeyMap::default());
+            }
+            _ => {}
         }
     }
 
@@ -3980,6 +4019,7 @@ impl CommentTree {
     pub fn meta(&self) -> &NodeMeta {
         match self {
             Self::Leaf(m) | Self::Array(m, _) | Self::Object(m, _, _) => m,
+            Self::Silent(_) => &EMPTY_NODE_META,
         }
     }
 
@@ -3991,16 +4031,20 @@ impl CommentTree {
     /// The guard unboxes the node's slot again if the write left it saying nothing, so a node
     /// stays a one-word slot unless it has something to say (#6815).
     pub fn meta_mut(&mut self) -> MetaMut<'_> {
+        self.materialize();
         match self {
             Self::Leaf(m) | Self::Array(m, _) | Self::Object(m, _, _) => MetaMut(m),
+            Self::Silent(_) => unreachable!("materialize replaced the silent tree"),
         }
     }
 
     /// The slot this node's own metadata sits in, to see whether it is boxed.
     #[cfg(test)]
     fn meta_slot(&self) -> &MetaBox {
+        static EMPTY_SLOT: MetaBox = MetaBox::empty();
         match self {
             Self::Leaf(m) | Self::Array(m, _) | Self::Object(m, _, _) => m,
+            Self::Silent(_) => &EMPTY_SLOT,
         }
     }
 
@@ -4010,6 +4054,7 @@ impl CommentTree {
             Self::Leaf(m) | Self::Array(m, _) | Self::Object(m, _, _) => core::mem::take(m)
                 .0
                 .map_or_else(NodeMeta::empty, |boxed| *boxed),
+            Self::Silent(_) => NodeMeta::empty(),
         }
     }
 
@@ -4121,6 +4166,7 @@ impl CommentTree {
     /// container written on the lines below, so the comment is not an absent-value one. A no-op
     /// for a node that is not an `Object`.
     pub fn set_key_comment(&mut self, key: &str, comment: String) {
+        self.materialize();
         if let Self::Object(_, _, keys) = self {
             let meta = keys.entry_or_default(key.to_string());
             meta.comment = Some(comment);
@@ -4271,9 +4317,6 @@ fn to_owned_with_comments_impl<V: DocumentValue, S: EvalSemantics>(
         HeadFootRead::Own,
         silent,
     )?;
-    if silent == SilentSubtrees::Collapse {
-        comments.collapse_if_silent();
-    }
     if let Some(c) = cursor {
         let is_collection = matches!(v, OwnedValue::Object(_) | OwnedValue::Array(_));
         let is_document_root = DocumentCursor::is_document_content(c);
@@ -4293,6 +4336,10 @@ fn to_owned_with_comments_impl<V: DocumentValue, S: EvalSemantics>(
                     .with_preamble(Some(normalized_preamble(preamble)));
             }
         }
+    }
+    // After the root's own comments and preamble are in, which keep it from being silent.
+    if silent == SilentSubtrees::Collapse {
+        comments.collapse_if_silent();
     }
     Ok((v, comments))
 }
@@ -49639,27 +49686,37 @@ mod tests {
                 keys,
             )
         };
-        let is_leaf = |tree: &CommentTree| matches!(tree, CommentTree::Leaf(_));
+        let is_silent = |tree: &CommentTree| matches!(tree, CommentTree::Silent(_));
 
-        // A leaf is its own answer.
-        assert!(silent().collapse_if_silent());
-        assert!(!commented().collapse_if_silent());
-        assert!(!styled().collapse_if_silent());
+        // A leaf is its own answer: it is silent, or says something, and stays a leaf.
+        for mut leaf in [silent(), commented(), styled()] {
+            leaf.collapse_if_silent();
+            assert!(matches!(leaf, CommentTree::Leaf(_)));
+        }
+        assert!(silent().is_silent());
+        assert!(!commented().is_silent());
+        assert!(!styled().is_silent());
 
         // Silent children: the node is one word.
         let mut array = CommentTree::array(NodeMeta::empty(), vec![silent(), silent()]);
-        assert!(array.collapse_if_silent());
-        assert!(is_leaf(&array));
+        array.collapse_if_silent();
+        assert!(matches!(array, CommentTree::Silent(SilentKind::Array)));
         let mut map = object(vec![("a", silent()), ("b", silent())], IndexMap::new());
-        assert!(map.collapse_if_silent());
-        assert!(is_leaf(&map));
+        map.collapse_if_silent();
+        assert!(matches!(map, CommentTree::Silent(SilentKind::Object)));
+        // A silent child is silent, so a parent of silent collections is too.
+        let mut nested = CommentTree::array(NodeMeta::empty(), vec![array, map]);
+        nested.collapse_if_silent();
+        assert!(is_silent(&nested));
 
         // One child that says something keeps the node and all its children.
         let mut array = CommentTree::array(NodeMeta::empty(), vec![silent(), commented()]);
-        assert!(!array.collapse_if_silent());
+        array.collapse_if_silent();
+        assert!(matches!(array, CommentTree::Array(..)));
         assert_eq!(array.at_index(1).own(), Some("# c"));
         let mut map = object(vec![("a", silent()), ("b", styled())], IndexMap::new());
-        assert!(!map.collapse_if_silent());
+        map.collapse_if_silent();
+        assert!(matches!(map, CommentTree::Object(..)));
         assert_eq!(map.field("b").style(), "double");
 
         // A container's own metadata, and a key's.
@@ -49667,7 +49724,8 @@ mod tests {
             NodeMeta::from_comment_and_style(None, "flow"),
             vec![silent()],
         );
-        assert!(!own.collapse_if_silent());
+        own.collapse_if_silent();
+        assert!(matches!(own, CommentTree::Array(..)));
         assert_eq!(own.style(), "flow");
         let mut keyed = IndexMap::new();
         keyed.insert(
@@ -49678,18 +49736,31 @@ mod tests {
             },
         );
         let mut with_key_comment = object(vec![("a", silent())], keyed);
-        assert!(!with_key_comment.collapse_if_silent());
+        with_key_comment.collapse_if_silent();
+        assert!(matches!(with_key_comment, CommentTree::Object(..)));
         assert_eq!(with_key_comment.key_comment("a"), Some("# k"));
 
-        // The check is one level deep: a silent child container that was not collapsed first is
+        // The check is one level deep: a silent child collection that was not collapsed first is
         // taken for one that says something, so the parent is kept (the builder collapses
         // bottom-up, so it never meets this).
-        let mut nested = CommentTree::array(
+        let mut one_level = CommentTree::array(
             NodeMeta::empty(),
             vec![object(vec![("a", silent())], IndexMap::new())],
         );
-        assert!(!nested.collapse_if_silent());
-        assert!(matches!(nested.at_index(0), CommentTree::Object(..)));
+        one_level.collapse_if_silent();
+        assert!(matches!(one_level.at_index(0), CommentTree::Object(..)));
+
+        // A silent collection reads as the dense one did, and a write into it unfolds it.
+        let mut quiet = CommentTree::Silent(SilentKind::Object);
+        assert!(quiet.field("a").meta().is_empty());
+        assert!(quiet.key_comment("a").is_none());
+        quiet.set_key_comment("a", "# k".to_string());
+        assert_eq!(quiet.key_comment("a"), Some("# k"));
+        let mut quiet = CommentTree::Silent(SilentKind::Array);
+        assert!(matches!(quiet.at_index(3), CommentTree::Leaf(_)));
+        quiet.meta_mut().comment = Some("# own".to_string());
+        assert!(matches!(quiet, CommentTree::Array(..)));
+        assert_eq!(quiet.own(), Some("# own"));
     }
 
     /// `to_owned_with_comments` reads the raw (`#`-and-all) form via

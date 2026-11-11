@@ -163,13 +163,13 @@ both.
   the tree lining up with its value), and `reconcile_presentation` returns the empty tree for a container
   whose pristine tree is empty instead of walking it. Every read of the tree (`field`, `at_index`, `meta`,
   the key map) answers the same, so output is byte-identical (7,728 baseline-against-branch runs over 56
-  filters, 15 documents and 8 generated ones, six flag sets: no difference, and the review's `-P` sweep, below). The saving is withheld where
+  filters, 15 documents and 8 generated ones, six flag sets: no difference, and the review's `-P` sweep, below, which found one). The saving is withheld where
   something reads the tree by position or by shape: a document with an alias, a metadata write (`style =`,
   `head_comment =`, `tag =`), and a plain `=` whose right side is not a literal, which copies a source
   subtree's presentation. `-P` also reads it: it hands a flow collection's trailing comment to the next
-  item's first member, and a collapsed item has none, so `head_comment_first_member` grows the one node
-  that holds it (review of #6944 found the comment lost without it; an item a write had changed the kind
-  of lost it on `main` too, where yq keeps it). Interleaved release A/B against `main` @ `3d532c317`, `.zzz = 1` with `-o yaml`
+  item's first member, so a collapsed collection is its own variant (`CommentTree::Silent`, not a `Leaf`, which
+  is what a write that changed a node's kind leaves) and `head_comment_first_member` grows the one node that
+  holds the comment, as the full tree has it (review of #6944 found the comment lost without it). Interleaved release A/B against `main` @ `3d532c317`, `.zzz = 1` with `-o yaml`
   unless noted, peak RSS (MiB; median of 3, of 5 at 20 MiB on the M4 Pro) and the median of 5 wall times:
 
   | peak RSS (MiB) / time (s)        | 7950X before | 7950X after | M4 Pro before | M4 Pro after |
