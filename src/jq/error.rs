@@ -1075,6 +1075,12 @@ impl EvalError {
         Self::new(format!("illegal base64 data at input byte {pos}"))
     }
 
+    /// `unexpected EOF`: Go's base64 stream decoder ended one to three characters into a quantum,
+    /// which yq's `@base64d` answers for a line break inside the text (#6997).
+    pub fn base64_unexpected_eof() -> Self {
+        Self::new(String::from("unexpected EOF"))
+    }
+
     /// `invalid URL escape "<escape>"` (#1138).
     ///
     /// Raised by yq mode's `@urid` when a `%` isn't immediately followed by two

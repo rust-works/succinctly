@@ -6836,7 +6836,7 @@ follows each one in its own mode. The behavioural axis is `EvalSemantics`
 |---|---|---|
 | Bare 2-arg `sub(re; s)` | first match only (`"aaa"` → `"Xaa"`) | **every** match (`"aaa"` → `"XXX"`) |
 | `@uri`/`@base64`/`@html` on a container | JSON-encodes first (`[1,2]` → `"%5B1%2C2%5D"`) | errors, as real yq does (`@html` is not a yq format; it parses only under `--jq-extensions`, #5444) |
-| `@base64d` on malformed/misplaced padding | truncates at the first `=`, decodes the rest (`"===="` → `""`) | validates padding placement in place, rejects anything else (`"===="` → error) |
+| `@base64d` on malformed/misplaced padding | truncates at the first `=`, decodes the rest (`"===="` → `""`) | yq's base64 decoder, over Go's stream decoder: misplaced padding is refused (`"===="` → error), and a line break inside the text is `unexpected EOF` (#6997) |
 | `keys` | sorted | document order (yq's `keys` *is* `keys_unsorted`) |
 | Integer overflow | converts to float | wraps |
 | Division by zero | errors | infinity |
