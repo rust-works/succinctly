@@ -21,6 +21,7 @@ const ACCEPTED: &[(&str, &str)] = &[
     ("? \"x\"#c\n: 1\n", "{\"x\":1}\n"),
     ("a: \"x\"#\n", "{\"a\":\"x\"}\n"),
     ("a: \"x\"# c d\nb: \"y\"#e\n", "{\"a\":\"x\",\"b\":\"y\"}\n"),
+    // yq reads the whole line after `"k"` as its comment, so the document is the bare scalar `"k"`.
     ("\"k\"#c: 1\n", "\"k\"\n"),
     ("- \"a\"#c\n- \"b\"#d\n", "[\"a\",\"b\"]\n"),
     ("a:\n  - \"x\"#c\n  - y\n", "{\"a\":[\"x\",\"y\"]}\n"),
@@ -32,6 +33,22 @@ const ACCEPTED: &[(&str, &str)] = &[
     ("a: say \"hi\"#c\n", "{\"a\":\"say \\\"hi\\\"#c\"}\n"),
     ("a: it's#c\n", "{\"a\":\"it's#c\"}\n"),
     ("a: \"x\"\t#c\n", "{\"a\":\"x\"}\n"),
+    // Own-line values, a CRLF file, several documents and nested items.
+    ("a:\n  \"x\"#c\nb: 1\n", "{\"a\":\"x\",\"b\":1}\n"),
+    ("? a\n: \"x\"#c\n", "{\"a\":\"x\"}\n"),
+    (
+        "a:\n  - \"x\"#c\n    #d\n  - y\n",
+        "{\"a\":[\"x\",\"y\"]}\n",
+    ),
+    ("a: \"x\"#c", "{\"a\":\"x\"}\n"),
+    ("a: \"x\"#c\r\nb: 1\r\n", "{\"a\":\"x\",\"b\":1}\n"),
+    (
+        "a: \"x\"#c\n---\nb: \"y\"#d\n",
+        "{\"a\":\"x\"}\n{\"b\":\"y\"}\n",
+    ),
+    ("- - \"x\"#c\n", "[[\"x\"]]\n"),
+    ("a: {b: \"x\"#c\n}\n", "{\"a\":{\"b\":\"x\"}}\n"),
+    ("a: \"x\"\n#c\n", "{\"a\":\"x\"}\n"),
 ];
 
 /// Refused by yq.

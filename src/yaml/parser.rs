@@ -6875,6 +6875,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         self.reject_content_after_scalar(true)
     }
 
+    /// The one definition of both checks: what follows a scalar on its line is blanks and a
+    /// comment, or an error. `quoted` is whether the scalar that ends at the cursor was quoted, in
+    /// which case its closing quote is the byte before the cursor and a `#` right after it is a
+    /// comment; a plain scalar's own bytes run to the cursor, and a `#` it touches is content.
     fn reject_content_after_scalar(&self, quoted: bool) -> Result<(), YamlError> {
         // The common case: the scalar ends the line.
         match self.peek() {
