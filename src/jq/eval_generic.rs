@@ -22041,7 +22041,7 @@ fn eval_yq_empty_context_pipe<S: EvalSemantics, V: DocumentValue>(
         if context_seen {
             continue;
         }
-        let mut stages = Vec::with_capacity(exprs.len() - at);
+        let mut stages = vec_with_capacity(exprs.len() - at);
         stages.push(head);
         stages.extend(exprs[at + 1..].iter().cloned());
         return eval_each_generic::<S, V>(&Expr::pipe(stages), value, optional, cursor, sink);
@@ -22733,7 +22733,6 @@ fn eval_yq_context_pipe<S: EvalSemantics, V: DocumentValue>(
                 stopped_or_escaped => return stopped_or_escaped,
             }
         }
-        drop(counting);
         if produced {
             return Flow::Exhausted;
         }
@@ -22826,7 +22825,7 @@ fn reemit_over_empty_context_list<S: EvalSemantics, V: DocumentValue>(
         if !empty {
             continue;
         }
-        let mut reemitted: Vec<Expr> = Vec::with_capacity(stages.len() - at);
+        let mut reemitted: Vec<Expr> = vec_with_capacity(stages.len() - at);
         reemitted.push(head);
         reemitted.extend(stages[at + 1..].iter().cloned());
         // The stage reads no input, so any node stands in for it.
