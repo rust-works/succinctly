@@ -1,7 +1,8 @@
 //! #7004: `strftime`, `strflocaltime`, `todate` and `todateiso8601` format a number through the array
 //! `gmtime`/`localtime` return, as jq does, whose seconds slot is `tm_sec + (t - floor(t))` read back
-//! as an integer. Just below zero that sum rounds to `1.0` (`-1e-17 - (-1)`), so jq prints second
-//! `01`, where the truncated timestamp's own second is `00`. Every row was captured from jq 1.7.1
+//! as an integer. For a negative timestamp a hair below a whole second that sum rounds up to the next
+//! integer: `-1e-17` prints second `01` where its truncated second is `00`, and `-1.0000000000000002`
+//! prints `23:59:60`. Every row was captured from jq 1.7.1
 //! on macOS under the zone it names.
 
 use std::process::Command;
@@ -164,6 +165,103 @@ const ROWS: &[(&str, &str, &str, &str)] = &[
         "-1e-17",
         "strftime(\"%S %T\")",
         "\"01 00:00:01\"\n",
+    ),
+    // A hair below a whole second further from zero rounds up as well, to second `60` below `-1`.
+    (
+        "UTC",
+        "-1.0000000000000002",
+        "todate",
+        "\"1969-12-31T23:59:60Z\"\n",
+    ),
+    (
+        "UTC",
+        "-1.0000000000000002",
+        "strftime(\"%S %T %s\")",
+        "\"60 23:59:60 0\"\n",
+    ),
+    (
+        "UTC",
+        "-1.0000000000000002",
+        "strflocaltime(\"%S %T\")",
+        "\"60 23:59:60\"\n",
+    ),
+    (
+        "UTC",
+        "-2.0000000000000004",
+        "todate",
+        "\"1969-12-31T23:59:59Z\"\n",
+    ),
+    (
+        "UTC",
+        "-2.0000000000000004",
+        "strftime(\"%S %T %s\")",
+        "\"59 23:59:59 -1\"\n",
+    ),
+    (
+        "UTC",
+        "-2.0000000000000004",
+        "strflocaltime(\"%S %T\")",
+        "\"59 23:59:59\"\n",
+    ),
+    (
+        "UTC",
+        "-27.000000000000004",
+        "todate",
+        "\"1969-12-31T23:59:34Z\"\n",
+    ),
+    (
+        "UTC",
+        "-27.000000000000004",
+        "strftime(\"%S %T %s\")",
+        "\"34 23:59:34 -26\"\n",
+    ),
+    (
+        "UTC",
+        "-27.000000000000004",
+        "strflocaltime(\"%S %T\")",
+        "\"34 23:59:34\"\n",
+    ),
+    (
+        "UTC",
+        "-61.00000000000001",
+        "todate",
+        "\"1969-12-31T23:58:59Z\"\n",
+    ),
+    (
+        "UTC",
+        "-61.00000000000001",
+        "strftime(\"%S %T %s\")",
+        "\"59 23:58:59 -61\"\n",
+    ),
+    (
+        "UTC",
+        "-61.00000000000001",
+        "strflocaltime(\"%S %T\")",
+        "\"59 23:58:59\"\n",
+    ),
+    (
+        "EST5EDT",
+        "-1.0000000000000002",
+        "strflocaltime(\"%S %T\")",
+        "\"60 18:59:60\"\n",
+    ),
+    (
+        "EST5EDT",
+        "-2.0000000000000004",
+        "strflocaltime(\"%S %T\")",
+        "\"59 18:59:59\"\n",
+    ),
+    (
+        "EST5EDT",
+        "-27.000000000000004",
+        "strflocaltime(\"%S %T\")",
+        "\"34 18:59:34\"\n",
+    ),
+    (
+        "EST5EDT",
+        "-61.00000000000001",
+        "strflocaltime(\"%S %T\")",
+        "\"59 18:58:59\"\n",
     ),
 ];
 
