@@ -25758,11 +25758,9 @@ fn format_json<S: EvalSemantics>(value: &OwnedValue) -> Result<String, EvalError
 /// `tostring`/`@json` do (`[1,2] | @uri` => `"%5B1%2C2%5D"`, confirmed
 /// against real jq 1.7.1, #1096).
 ///
-/// yq diverges here and keeps rejecting a container outright for all
-/// three of these formats ("cannot encode !!seq as URI/base64...",
-/// confirmed against real yq v4.53.3) -- `None` on that branch lets each
-/// caller's own existing type-error fallback fire unchanged, matching
-/// yq's pre-#1096 behavior exactly.
+/// yq mode returns `None` for a container. Only `@html` (a jq-only format, behind
+/// `--jq-extensions`) still reaches that arm there: `format_uri` and `format_base64`
+/// refuse every non-string first in yq mode ([`encoder_input_text`], #6980).
 ///
 /// One definition instead of a hand-copy per caller, per this file's own
 /// #106 lesson (see [`owned_value_to_json`]'s doc comment, which this
@@ -25788,10 +25786,22 @@ fn stringify_for_format<S: EvalSemantics>(value: &OwnedValue) -> Option<String> 
     })
 }
 
+/// The text `@uri` and `@base64` encode. jq stringifies any other value first (`42 | @uri` is
+/// `"42"`, a container its JSON text, #1096); yq encodes a string only, and refuses anything else by
+/// its tag with the wording of `-o=uri` / `-o=base64`, as it does for a document node (#5836, #6980).
+fn encoder_input_text<S: EvalSemantics>(
+    value: &OwnedValue,
+    yq_format: &str,
+) -> Result<String, EvalError> {
+    match value {
+        OwnedValue::String(s) => Ok(s.to_string()),
+        _ if S::TAG == EvalTag::Yq => Err(yq_encoder_needs_a_string(value, yq_format)),
+        _ => Ok(stringify_for_format::<S>(value).expect("jq mode stringifies every value")),
+    }
+}
+
 fn format_uri<S: EvalSemantics>(value: &OwnedValue, _optional: bool) -> Result<String, EvalError> {
-    // jq converts non-strings to strings first (e.g., 42 | @uri => "42")
-    let s = stringify_for_format::<S>(value)
-        .ok_or_else(|| EvalError::type_error("string", value.type_name()))?;
+    let s = encoder_input_text::<S>(value, "URI")?;
 
     // Byte-oriented rather than char-oriented: percent-encoding acts on raw
     // bytes anyway, and every safe byte is ASCII, so a multi-byte character's
@@ -25902,9 +25912,8 @@ fn owned_string_from_decoded_bytes<S: EvalSemantics>(bytes: Vec<u8>) -> String {
 /// [`yq_stringify_scalar_or_empty`]), reads `+` as a space, raises `invalid URL escape "..."` and
 /// replaces bytes that are not valid UTF-8 with U+FFFD, so yq mode keeps all four. Note real yq's
 /// `@uri` *encode* direction does not share this behavior -- it errors on a non-string scalar
-/// rather than stringifying it (`42 | @uri` errors in real yq); [`format_uri`]'s own unconditional
-/// stringification (in both jq and yq mode) is a separate, pre-existing divergence from real yq,
-/// not touched here.
+/// rather than stringifying it (`42 | @uri` errors in real yq), which [`format_uri`] follows in
+/// yq mode (#6980).
 ///
 /// The percent-decoded bytes of a yq run that turn out to be invalid UTF-8 go through
 /// [`owned_string_from_decoded_bytes`], whose substitution rule is per-mode
@@ -26261,26 +26270,9 @@ fn format_dsv<S: EvalSemantics>(
 /// @base64 - Base64 encode (simple implementation without external crate)
 fn format_base64<S: EvalSemantics>(
     value: &OwnedValue,
-    optional: bool,
+    _optional: bool,
 ) -> Result<String, EvalError> {
-    // jq converts non-strings to strings first, same as `@uri`/`@html`
-    // (including JSON-encoding a container in jq mode, #1096).
-    let s = match stringify_for_format::<S>(value) {
-        Some(s) => s,
-        // Mirrors every sibling format's own `_ if optional =>
-        // Ok(String::new())` arm (`format_tsv`/`format_dsv`/`format_csv`
-        // above) for consistency, but is very likely
-        // unreachable dead code post-#693 for the same reason those are:
-        // `Expr::Optional` now forces the inner evaluation's ambient
-        // `optional` to `false` and catches the resulting `Error` itself,
-        // rather than letting a builtin's own internal `optional` flag see
-        // `true` (see `test_isvalid_reaches_every_builtins_own_optional_guard`'s
-        // doc comment). Confirmed via `cargo llvm-cov`: all four sibling
-        // arms are equally uncovered on this branch, so this one matching
-        // them isn't a new gap.
-        None if optional => return Ok(String::new()),
-        None => return Err(EvalError::type_error("string", value.type_name())),
-    };
+    let s = encoder_input_text::<S>(value, "base64")?;
 
     // Simple base64 encoding
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -26744,11 +26736,7 @@ fn format_sh<S: EvalSemantics>(value: &OwnedValue, _optional: bool) -> Result<St
         return match value {
             OwnedValue::String(s) => Ok(yq_shell_quote(s)),
             // #5836: yq refuses with its `@uri` wording, as the document route does.
-            _ => Err(EvalError::new(format!(
-                "cannot encode {} as URI, can only operate on strings. Please first pipe through \
-                 another encoding operator to convert the value to a string",
-                owned_yaml_type_tag(value)
-            ))),
+            _ => Err(yq_encoder_needs_a_string(value, "URI")),
         };
     }
 
@@ -26888,8 +26876,8 @@ fn format_props_recursive(
 /// caller prints it with none of its own.
 ///
 /// `props`, `shell`, `csv` and `tsv` end every line (`csv` and `tsv` write nothing for `[]`).
-/// `base64` and `uri` write no line break and take a string only (`@base64` and `@uri` stringify other
-/// values first; the encoders refuse them, naming the tag).
+/// `base64` and `uri` write no line break and take a string only, refusing any other value by its tag
+/// as `@base64` and `@uri` do in yq mode (#6980).
 fn format_yq_output<S: EvalSemantics>(
     encoder: &YqOutputEncoder,
     value: &OwnedValue,
@@ -26906,14 +26894,8 @@ fn format_yq_output<S: EvalSemantics>(
         YqOutputEncoder::Toml => format_toml(value),
         YqOutputEncoder::Kyaml(indent) => Ok(format_kyaml(value, *indent)),
         YqOutputEncoder::Tsv => format_yq_csv::<S>(value, '\t', true),
-        YqOutputEncoder::Base64 => match value {
-            OwnedValue::String(_) => format_base64::<S>(value, false),
-            other => Err(yq_encoder_needs_a_string(other, "base64")),
-        },
-        YqOutputEncoder::Uri => match value {
-            OwnedValue::String(_) => format_uri::<S>(value, false),
-            other => Err(yq_encoder_needs_a_string(other, "URI")),
-        },
+        YqOutputEncoder::Base64 => format_base64::<S>(value, false),
+        YqOutputEncoder::Uri => format_uri::<S>(value, false),
     }
 }
 
