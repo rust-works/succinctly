@@ -324,3 +324,64 @@ fn front_matter_with_a_string_format_is_refused_6925() -> Result<()> {
     );
     Ok(())
 }
+
+/// Review of #6925: the format comes from the first *input* file, which under `--from-file` is the
+/// first positional argument, and Go's `filepath.Ext` gives a name that starts with its only dot
+/// that whole name (`.base64`, `.json`). yq v4.53.3 decodes both.
+#[test]
+fn the_format_comes_from_the_first_input_file_as_go_names_its_extension_6925() -> Result<()> {
+    let dir = TempDir::new()?;
+    let program = write_file(&dir, "prog.yq", b".")?;
+    let a = write_file(&dir, "a.base64", b"aGk=")?;
+    let dotted = write_file(&dir, ".base64", b"aGk=")?;
+    let dotted_json = write_file(&dir, ".json", b"{\"a\":1}")?;
+    let program = program.display().to_string();
+    // Under `--from-file` the filter's slot holds the first input file.
+    let a_name = a.display().to_string();
+    assert_eq!(
+        run_yq_files(&a_name, &[], &["-o", "json", "--from-file", &program])?.0,
+        "\"hi\"\n"
+    );
+    assert_eq!(
+        run_yq_files(".", &[&dotted], &["-o", "json"])?.0,
+        "\"hi\"\n"
+    );
+    assert_eq!(
+        run_yq_files(".", &[&dotted_json], &[])?.0,
+        "{\n  \"a\": 1\n}\n"
+    );
+    // `--front-matter` on a file picked by its extension reads its front matter as YAML, as for a
+    // `*.json` file, and is not refused. yq prints `aGk=` too (without the final line break: its
+    // pass-through of a file with no front matter, which this change does not touch).
+    let (out, err, code) = run_yq_files(".", &[&a], &["--front-matter", "process"])?;
+    assert_eq!((out.trim_end(), err.as_str(), code), ("aGk=", "", 0));
+    Ok(())
+}
+
+/// `-R` (a succinctly extension) reads raw lines whatever `-p` says, on every route.
+#[test]
+fn raw_input_ignores_a_string_format_6925() -> Result<()> {
+    let (out, _, code) = run_yq_stdin_with_stderr(".", "aGk=", &["-R", "-p", "base64"])?;
+    assert_eq!((out.as_str(), code), ("aGk=\n", 0));
+    // The helper puts the filter last, so it is the `-` here.
+    let (out, _, code) = run_yq_stdin_with_stderr("-", "aGk=", &["-R", "-p", "base64", "."])?;
+    assert_eq!((out.as_str(), code), ("aGk=\n", 0));
+    Ok(())
+}
+
+/// yq-mode `@urid` and `-p uri` share one `url.QueryUnescape`, whose bad-escape message Go-quotes
+/// its bytes: a control character is `\x01`, not Rust's `\u{1}` (yq v4.53.3).
+#[test]
+fn urid_quotes_a_bad_escape_as_go_does_6925() -> Result<()> {
+    let (_, err, code) = run_yq_stdin_with_stderr("@urid", "\"x%\\u0001\"", &["-p", "json"])?;
+    assert_eq!(
+        (err.trim_end(), code),
+        (r#"Error: invalid URL escape "%\x01""#, 1)
+    );
+    let (_, err, code) = run_yq_stdin_bytes_with_stderr(".", b"x%\x7f", &["-p", "uri"])?;
+    assert_eq!(
+        (err.trim_end(), code),
+        (r#"Error: bad file '-': invalid URL escape "%\x7f""#, 1)
+    );
+    Ok(())
+}

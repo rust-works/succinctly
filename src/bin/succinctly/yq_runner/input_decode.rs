@@ -83,55 +83,10 @@ fn json_string(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// `url.QueryUnescape` (Go's `unescape` in `encodeQueryComponent` mode): `%XX` is that byte and `+`
-/// a space. The escapes are checked before anything is decoded; the first bad one is the error,
-/// quoted as `strconv.Quote` writes its first three bytes (`invalid URL escape "%zz"`).
+/// `url.QueryUnescape` of the whole input, the definition yq-mode `@urid` uses too (`+` is a
+/// space, `invalid URL escape "%zz"`).
 fn decode_uri(raw: &[u8]) -> Result<Vec<u8>, String> {
-    let mut i = 0;
-    while i < raw.len() {
-        if raw[i] == b'%' {
-            if i + 2 >= raw.len()
-                || !raw[i + 1].is_ascii_hexdigit()
-                || !raw[i + 2].is_ascii_hexdigit()
-            {
-                let bad = &raw[i..raw.len().min(i + 3)];
-                return Err(format!(
-                    "invalid URL escape {}",
-                    succinctly::jq::go_quote_bytes(bad)
-                ));
-            }
-            i += 3;
-        } else {
-            i += 1;
-        }
-    }
-    let mut out = Vec::with_capacity(raw.len());
-    let mut i = 0;
-    while i < raw.len() {
-        match raw[i] {
-            b'%' => {
-                out.push(hex_value(raw[i + 1]) << 4 | hex_value(raw[i + 2]));
-                i += 3;
-            }
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            byte => {
-                out.push(byte);
-                i += 1;
-            }
-        }
-    }
-    Ok(out)
-}
-
-fn hex_value(digit: u8) -> u8 {
-    match digit {
-        b'0'..=b'9' => digit - b'0',
-        b'a'..=b'f' => digit - b'a' + 10,
-        _ => digit - b'A' + 10,
-    }
+    succinctly::jq::go_query_unescape(raw).map_err(|e| e.to_string())
 }
 
 /// Why Go's base64 stream stopped.
@@ -162,12 +117,8 @@ impl StreamEnd {
 /// from its chunk's start, and padding that ends one chunk is accepted with more data after it.
 /// [`GoBase64Stream`] reproduces the chunking, which follows the sizes `bytes.Buffer` grows to.
 fn decode_base64(raw: &[u8]) -> Result<Vec<u8>, String> {
-    let mut src = go_trim_space(raw).to_vec();
-    let short = src.len() % 4;
-    if short > 0 {
-        src.resize(src.len() + 4 - short, b'=');
-    }
-    let mut stream = GoBase64Stream::new(&src);
+    let src = go_trim_space(raw);
+    let mut stream = GoBase64Stream::new(src, (4 - src.len() % 4) % 4);
     // `bytes.Buffer.ReadFrom`: before each read, grow so at least `MinRead` (512) bytes are free,
     // then offer the decoder the whole free capacity.
     let mut out = Vec::new();
@@ -209,7 +160,10 @@ fn go_round_up_size(size: usize) -> usize {
 /// Go's `base64.NewDecoder(base64.StdEncoding, strings.NewReader(src))`: a `newlineFilteringReader`
 /// over the string, and the decoder's 1024-byte buffer of input not yet decoded.
 struct GoBase64Stream<'a> {
+    /// The trimmed input; the `=` padding after it is not copied.
     src: &'a [u8],
+    /// The length of the padded string the reader reads.
+    len: usize,
     /// The `strings.Reader`'s offset.
     pos: usize,
     /// Input read but not decoded: what is left of a chunk that was not a whole number of quanta.
@@ -224,9 +178,10 @@ struct GoBase64Stream<'a> {
 }
 
 impl<'a> GoBase64Stream<'a> {
-    fn new(src: &'a [u8]) -> Self {
+    fn new(src: &'a [u8], padding: usize) -> Self {
         Self {
             src,
+            len: src.len() + padding,
             pos: 0,
             buf: [0; 1024],
             nbuf: 0,
@@ -241,13 +196,14 @@ impl<'a> GoBase64Stream<'a> {
     /// how many bytes it kept; a read at the end of the string is `io.EOF` with none.
     fn filtered_read(&mut self, from: usize, to: usize) -> usize {
         loop {
-            if self.pos >= self.src.len() {
+            if self.pos >= self.len {
                 self.read_eof = true;
                 return 0;
             }
-            let take = (to - from).min(self.src.len() - self.pos);
+            let take = (to - from).min(self.len - self.pos);
             let mut kept = from;
-            for &byte in &self.src[self.pos..self.pos + take] {
+            for at in self.pos..self.pos + take {
+                let byte = self.src.get(at).copied().unwrap_or(b'=');
                 if byte != b'\r' && byte != b'\n' {
                     self.buf[kept] = byte;
                     kept += 1;
@@ -285,15 +241,15 @@ impl<'a> GoBase64Stream<'a> {
             return Err(end);
         }
         let chunk = self.nbuf / 4 * 4;
-        let (decoded, corrupt) = go_decode(&self.buf[..chunk]);
-        if chunk / 4 * 3 > room {
+        let corrupt = if chunk / 4 * 3 > room {
             // Decoded into the decoder's own buffer; `p` takes what fits, the rest waits.
-            self.pending = decoded;
+            let corrupt = go_decode(&self.buf[..chunk], &mut self.pending);
             let n = room.min(self.pending.len());
             out.extend(self.pending.drain(..n));
+            corrupt
         } else {
-            out.extend_from_slice(&decoded);
-        }
+            go_decode(&self.buf[..chunk], out)
+        };
         self.buf.copy_within(chunk..self.nbuf, 0);
         self.nbuf -= chunk;
         if let Some(at) = corrupt {
@@ -317,30 +273,24 @@ fn base64_digit(byte: u8) -> Option<u8> {
     }
 }
 
-/// `base64.StdEncoding.Decode` of one chunk: the bytes it wrote and, for malformed input, the
-/// offset `CorruptInputError` names.
-fn go_decode(src: &[u8]) -> (Vec<u8>, Option<usize>) {
-    let mut out = Vec::with_capacity(src.len() / 4 * 3);
+/// `base64.StdEncoding.Decode` of one chunk, appending the bytes it writes to `out`; for malformed
+/// input, the offset `CorruptInputError` names.
+fn go_decode(src: &[u8], out: &mut Vec<u8>) -> Option<usize> {
     let mut si = 0;
     while si < src.len() {
-        let (next, corrupt) = go_decode_quantum(src, si, &mut out);
+        let (next, corrupt) = go_decode_quantum(src, si, out);
         si = next;
         if corrupt.is_some() {
-            return (out, corrupt);
+            return corrupt;
         }
     }
-    (out, None)
+    None
 }
 
-/// `Encoding.decodeQuantum`: up to four digits from `src[si..]` (skipping line breaks, which the
-/// filtering reader has already removed), padding included, appended to `out` as up to three bytes.
+/// `Encoding.decodeQuantum`: up to four digits from `src[si..]`, padding included, appended to `out`
+/// as up to three bytes. Go's also skips `\r` and `\n`; the filtering reader has removed them from
+/// every chunk, so that is left out here.
 fn go_decode_quantum(src: &[u8], mut si: usize, out: &mut Vec<u8>) -> (usize, Option<usize>) {
-    let skip_line_breaks = |mut at: usize| {
-        while at < src.len() && (src[at] == b'\n' || src[at] == b'\r') {
-            at += 1;
-        }
-        at
-    };
     let mut digits = [0u8; 4];
     let mut len = 4;
     let mut trailing = None;
@@ -360,9 +310,6 @@ fn go_decode_quantum(src: &[u8], mut si: usize, out: &mut Vec<u8>) -> (usize, Op
             j += 1;
             continue;
         }
-        if byte == b'\n' || byte == b'\r' {
-            continue;
-        }
         if byte != b'=' {
             return (si, Some(si - 1));
         }
@@ -371,7 +318,6 @@ fn go_decode_quantum(src: &[u8], mut si: usize, out: &mut Vec<u8>) -> (usize, Op
             0 | 1 => return (si, Some(si - 1)),
             // "==" is expected; the first "=" is consumed.
             2 => {
-                si = skip_line_breaks(si);
                 if si == src.len() {
                     return (si, Some(src.len()));
                 }
@@ -382,7 +328,6 @@ fn go_decode_quantum(src: &[u8], mut si: usize, out: &mut Vec<u8>) -> (usize, Op
             }
             _ => {}
         }
-        si = skip_line_breaks(si);
         if si < src.len() {
             // Data after the padding.
             trailing = Some(si);

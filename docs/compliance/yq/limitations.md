@@ -7689,12 +7689,13 @@ A JSON string and yq's decoded node evaluate and print alike: they agree with yq
 Padding that ends a chunk is accepted with data after it, as in yq, so the answer for a long input with `=` in the middle depends on where it falls.
 `-p uri` is Go's `url.QueryUnescape`: `+` is a space, a trailing line break stays, and a bad escape is `invalid URL escape "%zz"`.
 An empty input, and a second `-` that finds stdin drained, is the empty string, a document, where an empty YAML or JSON input has none.
-Under `-p auto` a first file named `*.base64` or `*.uri` (in any case) picks that format for every file of the run and, with `-o auto`, prints in it too, as yq does; an explicit `-p` prints YAML.
-The extension is lowercased and its aliases are read for JSON as well, so `a.JSON` and `a.j` are JSON input and output.
+Under `-p auto` the first input file named `*.base64` or `*.uri` (in any case, and under `--from-file` too) picks that format for every file of the run and, with `-o auto`, prints in it too, as yq does; an explicit `-p` prints YAML.
+The extension is Go's `filepath.Ext`, lowercased, and its aliases are read for JSON as well, so `a.JSON`, `a.j` and a file named `.json` are JSON input and output.
+`-R` reads raw lines whatever `-p` says, and `--front-matter` on a file picked by its extension reads its front matter as YAML, as for a `*.json` file.
 
 Two rows differ:
 
 - Decoded bytes that are not UTF-8 meet the `-p json` handling above (#1616): `-o json` writes each as U+FFFD, as yq does, and YAML output stops with `invalid UTF-8 in string`.
   The U+FFFD is substituted before the filter runs, so `length`, which counts bytes in both tools, counts three for it where yq counts the one byte (`printf 'a%FFb' | yq -p uri -o json length` is `3` in yq and `5` here), as it already did for a `-p json` string.
   yq prints the raw bytes for a document that is the string itself (`printf /w== | yq -p base64 .` writes the byte `0xff`) and refuses a nested one with `yaml: cannot marshal invalid UTF-8 data as !!str`.
-- `--front-matter` with `-p base64` or `-p uri` is refused (`--front-matter and --input-format base64 are incompatible`), as `-p json` is, where yq decodes the extracted front matter.
+- `--front-matter` with an explicit `-p base64` or `-p uri` is refused (`--front-matter and --input-format base64 are incompatible`), as `-p json` is, where yq decodes the extracted front matter.

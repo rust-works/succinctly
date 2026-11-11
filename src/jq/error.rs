@@ -420,85 +420,12 @@ fn describe_with(tag: EvalTag, value: &OwnedValue) -> String {
     )
 }
 
-/// Go-`%q`-style raw-byte quoting for [`EvalError::urid_invalid_escape`]
-/// (#1216) -- unlike [`dump_truncated`]/[`describe`] above, this quotes
-/// arbitrary bytes that may not even be valid UTF-8, so it can't reuse
-/// `Debug` on a `&str` directly the way those do.
-///
-/// Walks `raw` left to right: a maximal run of complete, valid UTF-8
-/// characters is quoted via Rust's own `Debug` escaping (stripping the
-/// `Debug`-added surrounding quotes, since the caller wraps the whole
-/// result once) -- already confirmed to match real yq's Go-style quoting
-/// for embedded `"`/`\`/control characters exactly. Any byte that isn't
-/// part of a complete valid character (a genuinely invalid byte, or a
-/// multi-byte sequence truncated by running out of input) renders as
-/// `\xHH`, one escape per raw byte -- matching real yq's own behavior for
-/// a `%`-escape this close to the end of the input to leave a multi-byte
-/// character split mid-sequence (verified live: a 3-byte character
-/// truncated to its first two bytes by `@urid`'s 2-trailing-byte error
-/// window renders as `\xe4\xb8`, not the whole character and not a lossy
-/// replacement).
+/// Go-`%q`-style raw-byte quoting for [`EvalError::urid_invalid_escape`] (#1216): `strconv.Quote`
+/// over bytes that may not be UTF-8, each byte of a bad or truncated sequence as `\xHH`. One
+/// definition with the `-p uri` input format's error (#6925): it used to quote a valid character
+/// with Rust's `Debug`, which writes a control character as `\u{1}` where Go writes `\x01`.
 fn quote_bytes_go_style(raw: &[u8]) -> String {
-    let mut out = String::with_capacity(raw.len() + 2);
-    out.push('"');
-    let mut i = 0;
-    while i < raw.len() {
-        match core::str::from_utf8(&raw[i..]) {
-            // The rest of `raw` is entirely valid UTF-8 -- quote it all at
-            // once and stop.
-            Ok(s) => {
-                push_debug_escaped(&mut out, s);
-                break;
-            }
-            Err(e) => {
-                let valid_len = e.valid_up_to();
-                if valid_len > 0 {
-                    // `valid_up_to()` always lands on a char boundary, so
-                    // this slice is guaranteed valid UTF-8.
-                    let s = core::str::from_utf8(&raw[i..i + valid_len])
-                        .expect("valid_up_to() guarantees this prefix is valid UTF-8");
-                    push_debug_escaped(&mut out, s);
-                    i += valid_len;
-                }
-                // `error_len()` is `Some(n)` for n genuinely invalid bytes
-                // at this position (escape exactly those and keep
-                // scanning), or `None` when the remaining bytes are a
-                // valid *prefix* of some multi-byte character that simply
-                // ran out of input -- the truncated-character case this
-                // function exists for -- in which case every remaining
-                // byte is escaped and there's nothing left to scan.
-                match e.error_len() {
-                    Some(n) => {
-                        for b in &raw[i..i + n] {
-                            out.push_str(&format!("\\x{b:02x}"));
-                        }
-                        i += n;
-                    }
-                    None => {
-                        for b in &raw[i..] {
-                            out.push_str(&format!("\\x{b:02x}"));
-                        }
-                        i = raw.len();
-                    }
-                }
-            }
-        }
-    }
-    out.push('"');
-    out
-}
-
-/// Append `s`'s `Debug`-escaped contents to `out`, without the surrounding
-/// quotes `Debug` adds (the caller supplies its own, once, around the
-/// whole message) -- shared by [`quote_bytes_go_style`]'s two call sites
-/// (the all-valid fast path and the valid-prefix-before-a-truncation
-/// case) so they can't independently drift on how the strip is done.
-fn push_debug_escaped(out: &mut String, s: &str) {
-    let debug = format!("{s:?}");
-    // `Debug` on `&str` always wraps in a literal, single-byte `"` at each
-    // end, so trimming exactly one byte off each side can't split a
-    // multi-byte escape sequence it emitted in between.
-    out.push_str(&debug[1..debug.len() - 1]);
+    super::eval::go_quote_bytes(raw)
 }
 
 /// The binary operators jq names in arithmetic error messages.
@@ -2441,6 +2368,16 @@ mod tests {
         assert_eq!(quote_bytes_go_style(br#"%"y"#), r#""%\"y""#);
         assert_eq!(quote_bytes_go_style(br"%\y"), r#""%\\y""#);
         assert_eq!(quote_bytes_go_style(b"%\ty"), r#""%\ty""#);
+    }
+
+    /// #6925: a control character or one Go does not print is written as Go writes it, as yq v4.53.3
+    /// does for `@urid` (`"%\x01"`, `"%\x7f"`, `"%\u00ad"`), not as Rust's `Debug` does.
+    #[test]
+    fn quote_bytes_go_style_escapes_control_characters_as_go_does_6925() {
+        assert_eq!(quote_bytes_go_style(b"%\x01"), r#""%\x01""#);
+        assert_eq!(quote_bytes_go_style(b"%\x7f"), r#""%\x7f""#);
+        assert_eq!(quote_bytes_go_style("%\u{ad}".as_bytes()), r#""%\u00ad""#);
+        assert_eq!(quote_bytes_go_style(b"%\x00"), r#""%\x00""#);
     }
 
     #[test]

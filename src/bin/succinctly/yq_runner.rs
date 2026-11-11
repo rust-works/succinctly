@@ -889,7 +889,8 @@ fn resolve_output_format(output_format: OutputFormat, input_format: InputFormat)
     match input_format {
         InputFormat::Json => OutputFormat::Json,
         InputFormat::Yaml | InputFormat::Auto => OutputFormat::Yaml,
-        // Never reached: `run_yq_inner` resolves `-o auto` before it reads them as JSON (#6925).
+        // Not reached: `run_yq_inner` resolves `-o auto` and reads a string format as JSON before
+        // anything asks (#6925); answered as `-o auto` would for it.
         InputFormat::Base64 => OutputFormat::Base64,
         InputFormat::Uri => OutputFormat::Uri,
     }
@@ -1944,10 +1945,12 @@ fn detect_format_from_path(path: &Path) -> InputFormat {
     }
 }
 
-/// yq's `FormatStringFromFilename` (#6925): the text after the last `.` of the name's final
-/// component, lowercased, when there is any.
+/// yq's `FormatStringFromFilename` (#6925): Go's `filepath.Ext`, the text after the last `.` of
+/// the name's final component (a name that starts with its only dot included: `.json` is `json`),
+/// lowercased, when there is any.
 fn lowercase_extension(file: &str) -> Option<String> {
-    let extension = Path::new(file).extension()?.to_str()?;
+    let name = file.rsplit(std::path::is_separator).next()?;
+    let (_, extension) = name.rsplit_once('.')?;
     (!extension.is_empty()).then(|| extension.to_lowercase())
 }
 
@@ -11799,7 +11802,15 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     // `-p base64` / `-p uri`, or a first file named `*.base64` / `*.uri` under `-p auto` (#6925): each
     // input is decoded to one string and read as the JSON string holding it, so from here on the run
     // is a `-p json` run. A file picked by its extension prints in the same format (`-o auto`).
-    let string_format = StringInput::for_run(args.input_format, &args.files);
+    // `-R` (a succinctly extension) reads raw lines whatever `-p` says, and `--front-matter` keeps
+    // reading a file's front matter as YAML unless the format was asked for, as for a `*.json` file.
+    let string_format = if args.raw_input
+        || (args.front_matter.is_some() && args.input_format == InputFormat::Auto)
+    {
+        None
+    } else {
+        StringInput::for_run(args.input_format, &get_input_files(&args))
+    };
     STRING_INPUT.store(
         StringInput::code(string_format),
         std::sync::atomic::Ordering::SeqCst,
@@ -11807,7 +11818,8 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     if args.output_format == OutputFormat::Auto {
         let nothing_to_match = args.null_input || args.raw_input || args.front_matter.is_some();
         let json_input = args.input_format == InputFormat::Auto
-            && resolve_run_input_format(InputFormat::Auto, &args.files) == InputFormat::Json;
+            && resolve_run_input_format(InputFormat::Auto, &get_input_files(&args))
+                == InputFormat::Json;
         let by_extension = args.input_format == InputFormat::Auto && !nothing_to_match;
         args.output_format = match string_format {
             Some(StringInput::Base64) if by_extension => OutputFormat::Base64,

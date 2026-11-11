@@ -25918,6 +25918,11 @@ fn format_urid<S: EvalSemantics>(value: &OwnedValue, _optional: bool) -> Result<
         _ => stringify_for_format::<S>(value).unwrap_or_default().into(),
     };
 
+    if !jq {
+        return Ok(owned_string_from_decoded_bytes::<S>(go_query_unescape(
+            s.as_bytes(),
+        )?));
+    }
     // Byte-oriented, not char-oriented (#1123): a non-ASCII byte pushed
     // individually via `as char` mis-encodes as its own Latin-1 codepoint
     // instead of surviving as part of the original multi-byte UTF-8
@@ -25942,38 +25947,59 @@ fn format_urid<S: EvalSemantics>(value: &OwnedValue, _optional: bool) -> Result<
                 }
             }
             // Malformed escape (#6726): jq 1.8.2 names the whole input.
-            if jq {
-                return Err(EvalError::urid_not_a_valid_uri_encoding(&s));
-            }
-            // Malformed escape (#1138): real yq errors rather than
-            // silently passing the `%` through, quoting `%` plus
-            // whatever 0, 1, or 2 bytes actually follow it (up to end of
-            // string) -- a raw byte slice, not widened to the next full
-            // character (#1216): `EvalError::urid_invalid_escape` now
-            // takes `&[u8]` and hex-escapes any byte that's part of a
-            // truncated multi-byte character itself, matching real yq's
-            // own raw-byte quoting exactly instead of only approximating
-            // it.
-            let end = (i + 3).min(bytes.len());
-            return Err(EvalError::urid_invalid_escape(&bytes[i..end]));
+            return Err(EvalError::urid_not_a_valid_uri_encoding(&s));
         }
-        // #4204: yq's `@urid` is `url.QueryUnescape`, which reads `+` as a space.
-        // jq's `@urid` leaves it literal.
-        if bytes[i] == b'+' && S::TAG == EvalTag::Yq {
-            result.push(b' ');
-            i += 1;
-            continue;
-        }
-        // Not a percent sign at all, just copy the byte
+        // jq's `@urid` leaves `+` literal (yq's reads it as a space, #4204).
         result.push(bytes[i]);
         i += 1;
     }
-    if jq {
-        // #6726: jq 1.8.2 raises on bytes that are not valid UTF-8 (an overlong form, a surrogate,
-        // a lone `%E4`) instead of substituting U+FFFD.
-        return String::from_utf8(result).map_err(|_| EvalError::urid_not_a_valid_uri_encoding(&s));
+    // #6726: jq 1.8.2 raises on bytes that are not valid UTF-8 (an overlong form, a surrogate,
+    // a lone `%E4`) instead of substituting U+FFFD.
+    String::from_utf8(result).map_err(|_| EvalError::urid_not_a_valid_uri_encoding(&s))
+}
+
+/// Go's `url.QueryUnescape` over bytes: yq's `@urid` (#4204) and its `-p uri` input format (#6925).
+/// `%XX` is that byte and `+` a space; the escapes are checked before anything is decoded, and the
+/// first bad one is `invalid URL escape` with the `%` and up to two bytes after it, a raw byte slice
+/// Go-quoted (#1138, #1216).
+#[doc(hidden)]
+pub fn go_query_unescape(bytes: &[u8]) -> Result<Vec<u8>, EvalError> {
+    let hex = |byte: u8| (byte as char).to_digit(16).map(|digit| digit as u8);
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() || hex(bytes[i + 1]).is_none() || hex(bytes[i + 2]).is_none() {
+                let end = (i + 3).min(bytes.len());
+                return Err(EvalError::urid_invalid_escape(&bytes[i..end]));
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
     }
-    Ok(owned_string_from_decoded_bytes::<S>(result))
+    let mut out = vec_with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match (
+            bytes[i],
+            bytes.get(i + 1).copied().and_then(hex),
+            bytes.get(i + 2).copied().and_then(hex),
+        ) {
+            (b'%', Some(high), Some(low)) => {
+                out.push(high << 4 | low);
+                i += 3;
+            }
+            (b'+', _, _) => {
+                out.push(b' ');
+                i += 1;
+            }
+            (byte, _, _) => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Quote a CSV/DSV string field: wrap in `"..."`, doubling inner `"`.
@@ -27119,13 +27145,17 @@ fn format_lua(value: &OwnedValue, options: &LuaOptions) -> Result<String, EvalEr
 /// is, `\a \b \f \n \r \t \v`, `\xNN` for another control character below U+0080, `\uNNNN` and `\UNNNNNNNN`
 /// for the rest (#6924).
 fn go_quote(text: &str) -> String {
-    go_quote_bytes(text.as_bytes())
+    let mut out = string_with_capacity(text.len() + 2);
+    out.push('"');
+    push_go_quoted(&mut out, text);
+    out.push('"');
+    out
 }
 
 /// `go_quote` over bytes that need not be UTF-8, as Go's `strconv.Quote` reads a string: each byte that
 /// does not begin a valid sequence is `\xNN` on its own (Go decodes it as a `utf8.RuneError` of width
-/// one). yq's `-p uri` quotes the three bytes of a bad escape this way (`invalid URL escape "%\xc3"`,
-/// #6925).
+/// one). yq's `url.QueryUnescape` quotes the three bytes of a bad escape this way, in `@urid` and
+/// `-p uri` alike (`invalid URL escape "%\xc3"`, `"%\x01"`; #1216, #6925).
 #[doc(hidden)]
 pub fn go_quote_bytes(bytes: &[u8]) -> String {
     let mut out = string_with_capacity(bytes.len() + 2);
@@ -27140,24 +27170,10 @@ pub fn go_quote_bytes(bytes: &[u8]) -> String {
                     .unwrap_or_else(|| rest.len() - e.valid_up_to()),
             ),
         };
-        let valid = core::str::from_utf8(&rest[..valid_len]).unwrap_or_default();
-        for c in valid.chars() {
-            match c {
-                '"' => out.push_str("\\\""),
-                '\\' => out.push_str("\\\\"),
-                '\u{7}' => out.push_str("\\a"),
-                '\u{8}' => out.push_str("\\b"),
-                '\u{c}' => out.push_str("\\f"),
-                '\n' => out.push_str("\\n"),
-                '\r' => out.push_str("\\r"),
-                '\t' => out.push_str("\\t"),
-                '\u{b}' => out.push_str("\\v"),
-                c if super::go_print::is_print(c) => out.push(c),
-                c if (c as u32) < 0x80 => out.push_str(&format!("\\x{:02x}", c as u32)),
-                c if (c as u32) < 0x10000 => out.push_str(&format!("\\u{:04x}", c as u32)),
-                c => out.push_str(&format!("\\U{:08x}", c as u32)),
-            }
-        }
+        push_go_quoted(
+            &mut out,
+            core::str::from_utf8(&rest[..valid_len]).unwrap_or_default(),
+        );
         // Every byte after a bad sequence's first is a continuation byte, which no sequence starts with.
         for &byte in &rest[valid_len..valid_len + invalid_len] {
             out.push_str(&format!("\\x{byte:02x}"));
@@ -27166,6 +27182,27 @@ pub fn go_quote_bytes(bytes: &[u8]) -> String {
     }
     out.push('"');
     out
+}
+
+/// The inside of [`go_quote`]'s literal for `text`, appended to `out`.
+fn push_go_quoted(out: &mut String, text: &str) {
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{7}' => out.push_str("\\a"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{b}' => out.push_str("\\v"),
+            c if super::go_print::is_print(c) => out.push(c),
+            c if (c as u32) < 0x80 => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c if (c as u32) < 0x10000 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push_str(&format!("\\U{:08x}", c as u32)),
+        }
+    }
 }
 
 /// yq's `-o=toml` encoder (#6924), a port of its `tomlEncoder`: a root mapping's attributes (scalars and arrays
