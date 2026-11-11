@@ -3313,6 +3313,18 @@ pub enum FormatType {
     /// format, line ends included. Not an `@name` (the `@` operators differ for some values, and
     /// real yq has no `@shell`), so the parser never builds it; the yq runner wraps a program in it.
     YqOutput(YqOutputEncoder),
+    /// yq's `@props` / `to_props` under `--properties-separator` (empty means the default ` = `)
+    /// or `--properties-array-brackets` (#6922): yq applies those flags to the operator as well as
+    /// to `-o=props`. Never parsed; the yq runner substitutes it for [`FormatType::Props`] when a
+    /// flag is given.
+    YqProps {
+        separator: String,
+        array_brackets: bool,
+    },
+    /// yq's `@csv` / `to_csv` under `--csv-separator` (#6922), substituted for
+    /// [`FormatType::Csv`] by the yq runner as [`FormatType::YqProps`] is. `@tsv` keeps its tab,
+    /// as in yq.
+    YqCsv(char),
     /// #3357: a format name the parser didn't recognize, jq mode only.
     /// jq's own grammar accepts any `@name` token at parse time and defers
     /// the "is this a real format" check to when the format is actually

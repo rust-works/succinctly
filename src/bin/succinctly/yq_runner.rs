@@ -8086,6 +8086,17 @@ fn split_leading_static_nav_map_key(expr: &Expr) -> Option<(Expr, Expr)> {
     is_key_stage(body).then(|| (pipe_of(&nav), last.clone()))
 }
 
+/// `expr` with every `@props` / `to_props` as `props` and every `@csv` / `to_csv` as `csv`, where
+/// each is given (#6922): the flagged encoders the `--properties-*` and `--csv-separator` flags ask
+/// for. The text an `eval` reads is parsed later and keeps the defaults.
+fn with_flagged_formats(expr: &Expr, props: Option<&FormatType>, csv: Option<&FormatType>) -> Expr {
+    match (expr, props, csv) {
+        (Expr::Format(FormatType::Props), Some(props), _) => Expr::Format(props.clone()),
+        (Expr::Format(FormatType::Csv), _, Some(csv)) => Expr::Format(csv.clone()),
+        _ => jq::walk::map_subexprs(expr, &mut |e| with_flagged_formats(e, props, csv)),
+    }
+}
+
 /// `NAV | [.[] | key]` as `[NAV | .[] | key]` for a static navigation `NAV` (#5450): the same
 /// listing, with the navigation inside the array, where the cursor reaches the key nodes and they
 /// keep the quoting, `~` spelling and anchor they were written with (`[.a[] | key]` already does).
@@ -12098,6 +12109,17 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         if let Some(folded) = fold_nav_into_key_array(&program.expr) {
             program.expr = folded;
         }
+    }
+
+    // #6922: yq's `@props` and `@csv` operators read the same flags as `-o=props` and `-o=csv`.
+    let props_flagged = args.properties_separator != " = " || args.properties_array_brackets;
+    if props_flagged || csv_separator != ',' {
+        let props = props_flagged.then(|| FormatType::YqProps {
+            separator: args.properties_separator.clone(),
+            array_brackets: args.properties_array_brackets,
+        });
+        let csv = (csv_separator != ',').then_some(FormatType::YqCsv(csv_separator));
+        program.expr = with_flagged_formats(&program.expr, props.as_ref(), csv.as_ref());
     }
 
     if let Some(format) = output_encoder {

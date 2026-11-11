@@ -25705,6 +25705,11 @@ pub(crate) fn format_owned<S: EvalSemantics>(
         FormatType::Urid => format_urid::<S>(owned, optional),
         FormatType::Yaml => format_yaml(owned),
         FormatType::Props => format_props(owned),
+        FormatType::YqProps {
+            separator,
+            array_brackets,
+        } => Ok(format_props_with(owned, separator, *array_brackets)),
+        FormatType::YqCsv(comma) => format_yq_csv::<S>(owned, *comma, false),
         FormatType::YqOutput(encoder) => {
             let text = format_yq_output::<S>(encoder, owned)
                 .map_err(|e| EvalError::output_encoder(e.message))?;
