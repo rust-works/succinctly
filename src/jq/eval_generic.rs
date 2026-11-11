@@ -3556,7 +3556,7 @@ pub enum CommentTree {
     /// subtree would read as, without a node for each node of it. Every read answers as that
     /// tree does ([`Self::field`] and [`Self::at_index`] give the empty tree, [`Self::meta`] the
     /// empty metadata, a pass that matches `Array` or `Object` finds no member), and a write
-    /// into it first gives it the childless tree it stands for ([`Self::materialize`]). Unlike a
+    /// into it first gives it the childless tree it stands for. Unlike a
     /// `Leaf` over a collection, which a write that changed a node's kind leaves, it is the
     /// collection's own tree, so the sites that treat the two differently can tell them apart.
     ///
@@ -3951,7 +3951,7 @@ impl CommentTree {
     /// saving.
     ///
     /// The silent tree answers every read as the dense one did, and a write into it gives it
-    /// the childless tree it stands for ([`Self::materialize`]). A tree that is matched by its
+    /// the childless tree it stands for. A tree that is matched by its
     /// shape (`Object`, `Array`) sees no member in it: see the gate in `yq_runner.rs`.
     fn collapse_if_silent(&mut self) {
         let kind = match self {
