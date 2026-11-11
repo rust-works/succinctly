@@ -17706,13 +17706,27 @@ fn yq_timestamp_refusal(
     if matches!(op, ArithOp::Mul(_)) && left_timestamp && right.is_null() {
         return Some(Ok(left.clone()));
     }
+    Some(Err(EvalError::new(yq_mul_div_mod_message(op, left, right))))
+}
+
+/// Whether `value` is a sequence or a mapping, the kinds yq's arithmetic errors name with a key.
+fn is_container(value: &OwnedValue) -> bool {
+    matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_))
+}
+
+/// yq's wording for `*`, `/` and `%` over two kinds that do not combine (`cannot multiply !!int
+/// with !!seq`, `!!float cannot be divided by !!null`, `!!int cannot modulo by !!str`), shared by
+/// the timestamp refusal above and [`arith_type_error`] (#6904).
+///
+/// `/` and `%` write each operand's key in parentheses after its tag when the left operand is a
+/// container or `null`, or the right one is a container (`!!map (m) cannot be divided by !!int
+/// (i)`); a value here carries no key, so both are `()` (the limitations page records it).
+fn yq_mul_div_mod_message(op: ArithOp, left: &OwnedValue, right: &OwnedValue) -> String {
     let (left_tag, right_tag) = (yq_operand_tag(left), yq_operand_tag(right));
-    let message = match op {
+    match op {
         ArithOp::Mul(_) => format!("cannot multiply {left_tag} with {right_tag}"),
         _ => {
-            let container =
-                |value: &OwnedValue| matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_));
-            let keyed = left.is_null() || container(left) || container(right);
+            let keyed = left.is_null() || is_container(left) || is_container(right);
             let (left_key, right_key) = if keyed { (" ()", " ()") } else { ("", "") };
             let verb = if matches!(op, ArithOp::Div) {
                 "cannot be divided by"
@@ -17721,8 +17735,50 @@ fn yq_timestamp_refusal(
             };
             format!("{left_tag}{left_key} {verb} {right_tag}{right_key}")
         }
-    };
-    Some(Err(EvalError::new(message)))
+    }
+}
+
+/// The error for an arithmetic operator over two kinds it does not combine: jq's
+/// ([`EvalError::binary_op`]) in jq mode, yq's own wording in yq mode (#6904).
+///
+/// yq words the refusal from the operands' tags, not their values, and with its own
+/// inconsistencies, reproduced bug for bug (captured against v4.53.3 over every kind pair):
+///
+/// - `+` over two scalars is `!!int cannot be added to !!bool`; with a container on either side it
+///   is `!!seq () cannot be added to a !!float ()`, the right operand first, each with its key.
+/// - `-` over two scalars is `!!int cannot be added to !!str` (`addition`, not `subtraction`);
+///   with a sequence on the left or a container on the right it is `!!int () cannot be subtracted
+///   from !!seq`, the right operand first and keyed, the left bare; a mapping on the left is
+///   `maps not yet supported for subtraction`. (A string on the left is
+///   [`yq_timestamp_arith`]'s, and `null` on the left subtracts as the identity.)
+/// - `*`, `/` and `%` are [`yq_mul_div_mod_message`]'s.
+///
+/// A key is `()` because a value carries none (recorded in `docs/compliance/yq/limitations.md`).
+fn arith_type_error<S: EvalSemantics>(
+    left: &OwnedValue,
+    right: &OwnedValue,
+    op: BinOp,
+) -> EvalError {
+    if S::TAG != EvalTag::Yq {
+        return EvalError::binary_op(left, right, op);
+    }
+    let (left_tag, right_tag) = (yq_operand_tag(left), yq_operand_tag(right));
+    EvalError::new(match op {
+        BinOp::Add if is_container(left) || is_container(right) => {
+            format!("{right_tag} () cannot be added to a {left_tag} ()")
+        }
+        BinOp::Add => format!("{left_tag} cannot be added to {right_tag}"),
+        BinOp::Subtract if matches!(left, OwnedValue::Object(_)) => {
+            "maps not yet supported for subtraction".to_string()
+        }
+        BinOp::Subtract if matches!(left, OwnedValue::Array(_)) || is_container(right) => {
+            format!("{right_tag} () cannot be subtracted from {left_tag}")
+        }
+        BinOp::Subtract => format!("{left_tag} cannot be added to {right_tag}"),
+        BinOp::Multiply => yq_mul_div_mod_message(ArithOp::Mul(MergeFlags::default()), left, right),
+        BinOp::Divide => yq_mul_div_mod_message(ArithOp::Div, left, right),
+        BinOp::Modulo => yq_mul_div_mod_message(ArithOp::Mod, left, right),
+    })
 }
 
 /// [`arith_combine`] for operands that carry no hex or octal spelling.
@@ -18083,7 +18139,7 @@ pub(crate) fn arith_add<S: EvalSemantics>(
         // source spelling survives into the error message too (#1199: it
         // previously didn't, since the old single catch-all arm collapsed
         // both operands before ever building the error).
-        (left, right) => Err(EvalError::binary_op(&left, &right, BinOp::Add)),
+        (left, right) => Err(arith_type_error::<S>(&left, &right, BinOp::Add)),
     }
 }
 
@@ -18158,7 +18214,7 @@ fn arith_sub<S: EvalSemantics>(
         // Type mismatch -- `left`/`right` are still the *original*,
         // uncollapsed operands here, so a `NumberLiteral` operand's source
         // spelling survives into the error message too (#1199).
-        (left, right) => Err(EvalError::binary_op(&left, &right, BinOp::Subtract)),
+        (left, right) => Err(arith_type_error::<S>(&left, &right, BinOp::Subtract)),
     }
 }
 
@@ -18367,6 +18423,7 @@ pub(super) fn arith_mul<S: EvalSemantics>(
                 signed_number_repr::<S>(&left),
                 signed_number_repr::<S>(&right),
             );
+            let string_on_left = matches!(left, OwnedValue::String(_));
             match (left, right, l_num, r_num) {
                 // jq converts to float on overflow, yq wraps
                 (_, _, Some(NumberRepr::Int(a)), Some(NumberRepr::Int(b))) => {
@@ -18413,7 +18470,11 @@ pub(super) fn arith_mul<S: EvalSemantics>(
                     if S::TAG == EvalTag::Yq {
                         if let NumberRepr::Float(f) = n_repr {
                             if !f.is_finite() || f.fract() != 0.0 {
-                                return Err(EvalError::new("cannot multiply !!str with !!float"));
+                                return Err(EvalError::new(if string_on_left {
+                                    "cannot multiply !!str with !!float"
+                                } else {
+                                    "cannot multiply !!float with !!str"
+                                }));
                             }
                         }
                     }
@@ -18489,7 +18550,7 @@ pub(super) fn arith_mul<S: EvalSemantics>(
                 // `r_num`, and the `String` arms above bind a *different*
                 // shape), so they're still the original, uncollapsed
                 // operands here.
-                (left, right, _, _) => Err(EvalError::binary_op(&left, &right, BinOp::Multiply)),
+                (left, right, _, _) => Err(arith_type_error::<S>(&left, &right, BinOp::Multiply)),
             }
         }
     }
@@ -18766,7 +18827,7 @@ fn arith_div<S: EvalSemantics>(
             (OwnedValue::String(s), OwnedValue::String(sep)) => {
                 Ok(OwnedValue::array_from(split_string(&s, &sep)))
             }
-            (left, right) => Err(EvalError::binary_op(&left, &right, BinOp::Divide)),
+            (left, right) => Err(arith_type_error::<S>(&left, &right, BinOp::Divide)),
         },
     }
 }
@@ -18830,7 +18891,7 @@ fn arith_mod<S: EvalSemantics>(
         (Some(NumberRepr::Float(a)), Some(NumberRepr::Int(b))) => {
             mod_floats::<S>(a, int_to_f64::<S>(b), &left, &right)
         }
-        _ => Err(EvalError::binary_op(&left, &right, BinOp::Modulo)),
+        _ => Err(arith_type_error::<S>(&left, &right, BinOp::Modulo)),
     }
 }
 
@@ -159612,7 +159673,7 @@ mod tests {
         for filter in [".b[0:1] *= 5", ".b[0:1].c *= 9"] {
             yq_query!(br#"{"c":0}"#, filter,
                 QueryResult::Error(e) => {
-                    assert!(e.message.contains("cannot be multiplied"), "[{filter}] {}", e.message);
+                    assert!(e.message.contains("cannot multiply"), "[{filter}] {}", e.message);
                 }
             );
         }
