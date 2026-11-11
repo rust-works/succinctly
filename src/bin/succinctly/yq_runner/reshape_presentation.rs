@@ -14,7 +14,9 @@ use succinctly::jq::document::{
 use succinctly::jq::eval_generic::{
     to_owned_with_comments, AnchorMark, KeyMeta, LazyElem, KEY_STYLE_STRING,
 };
-use succinctly::jq::{ArithOp, Builtin, EvalError, MetaSlot, ObjectKey, MAX_VALUE_TREE_DEPTH};
+use succinctly::jq::{
+    ArithOp, Builtin, EvalError, MergeFlags, MetaSlot, ObjectKey, MAX_VALUE_TREE_DEPTH,
+};
 use succinctly::jq::{EvalSemantics, YqSemantics};
 
 /// Whether yq's key listing folds a repeated key into one (it does not: both are listed).
@@ -124,11 +126,35 @@ fn sort_key_filter(f: &Expr) -> bool {
     }
 }
 
-/// Whether `op` is one whose result tree is built by [`merge_tree`]: not a `*` with a merge flag
-/// (`*+`, `*?`, `*n`, `*d`, `*c`), whose merge rules it does not follow.
+/// Whether `op` is one whose result tree is built by [`merge_tree`]: `+`, a plain `*`, and a `*`
+/// with exactly one of the merge flags `+`, `?`, `n` or `d` (#6900), whose rules it follows. A
+/// combination of flags and `c` (clobber custom tags) are not, and keep the route that carries no
+/// presentation.
 fn plain_op(op: &ArithOp) -> bool {
-    !matches!(op, ArithOp::Mul(flags) if flags.append_arrays || flags.only_existing
-        || flags.only_new || flags.deep_merge_arrays || flags.clobber_tags)
+    match op {
+        ArithOp::Mul(flags) => {
+            !flags.clobber_tags
+                && [
+                    flags.append_arrays,
+                    flags.only_existing,
+                    flags.only_new,
+                    flags.deep_merge_arrays,
+                ]
+                .into_iter()
+                .filter(|set| *set)
+                .count()
+                    <= 1
+        }
+        _ => true,
+    }
+}
+
+/// The merge flags of `op`: those of a `*`, none for anything else.
+fn merge_flags(op: &ArithOp) -> MergeFlags {
+    match op {
+        ArithOp::Mul(flags) => *flags,
+        _ => MergeFlags::default(),
+    }
 }
 
 /// Whether `expr` replays a `pick`. The replay reads the presentation of the whole document, where
@@ -496,7 +522,14 @@ fn entry_pair<C: DocumentCursor>(e: &Expr, root: &C, depth: usize) -> Option<Res
                 // `null + x` is `x`, node and all.
                 r.1.clone()
             } else if matches!(op, ArithOp::Add | ArithOp::Mul(_)) {
-                merge_tree(&l, &r, &result, matches!(op, ArithOp::Mul(_)), depth + 1)?
+                merge_tree(
+                    &l,
+                    &r,
+                    &result,
+                    matches!(op, ArithOp::Mul(_)),
+                    merge_flags(op),
+                    depth + 1,
+                )?
             } else if matches!(result, OwnedValue::Array(_) | OwnedValue::Object(_)) {
                 CommentTree::empty()
             } else {
@@ -979,7 +1012,14 @@ fn trace_at_depth(
             let r = next(right, input)?;
             let result = evaluated(expr, value)?;
             let meta = if matches!(op, ArithOp::Add | ArithOp::Mul(_)) {
-                merge_tree(&l, &r, &result, matches!(op, ArithOp::Mul(_)), depth + 1)?
+                merge_tree(
+                    &l,
+                    &r,
+                    &result,
+                    matches!(op, ArithOp::Mul(_)),
+                    merge_flags(op),
+                    depth + 1,
+                )?
             } else {
                 CommentTree::empty()
             };
@@ -1251,6 +1291,7 @@ fn merge_tree(
     right: &ResultWithComments,
     result: &OwnedValue,
     deep: bool,
+    flags: MergeFlags,
     depth: usize,
 ) -> Option<CommentTree> {
     if depth >= MAX_VALUE_TREE_DEPTH {
@@ -1259,12 +1300,74 @@ fn merge_tree(
     let (lv, lt) = left;
     let (rv, rt) = right;
     if let (OwnedValue::Array(l), OwnedValue::Array(r)) = (lv, rv) {
-        if !deep {
+        // An empty left array is no node to keep: `*`, `*+` and `*d` answer the right one as it is
+        // (`[]` merged with `[1]` prints a block sequence in yq, not the `[]`'s flow style).
+        if deep && l.is_empty() && !flags.only_new && !flags.only_existing {
+            return (result == rv).then(|| rt.clone());
+        }
+        if !deep || flags.append_arrays {
+            // `+`, and `*+` (#6900): the result is the left items and then the right ones. They append
+            // to the left node, which keeps its `&anchor`; a merge that replaces or rebuilds one does not.
+            let OwnedValue::Array(out) = result else {
+                return None;
+            };
+            if out.len() != l.len() + r.len() {
+                return None;
+            }
             let children = (0..l.len())
                 .map(|i| lt.at_index(i).clone())
                 .chain((0..r.len()).map(|i| rt.at_index(i).clone()))
                 .collect();
             return Some(CommentTree::array(lt.meta().clone(), children));
+        }
+        if flags.deep_merge_arrays {
+            // `*d` (#6900): the arrays merge by index, an element on both sides merging as the
+            // values do and an element on one side keeping its own presentation.
+            let OwnedValue::Array(out) = result else {
+                return None;
+            };
+            if out.len() != l.len().max(r.len()) {
+                return None;
+            }
+            let mut children = Vec::with_capacity(out.len());
+            for (i, value) in out.iter().enumerate() {
+                children.push(match (l.get(i), r.get(i)) {
+                    (Some(lvalue), Some(rvalue)) => merge_tree(
+                        &(lvalue.clone(), lt.at_index(i).clone()),
+                        &(rvalue.clone(), rt.at_index(i).clone()),
+                        value,
+                        true,
+                        flags,
+                        depth + 1,
+                    )?,
+                    (Some(_), None) => lt.at_index(i).clone(),
+                    (None, Some(_)) => rt.at_index(i).clone(),
+                    (None, None) => return None,
+                });
+            }
+            return Some(CommentTree::array(
+                lt.meta().without_declared_anchor(),
+                children,
+            ));
+        }
+        // `*n` keeps the left array that is there: its tree, and no replay when the result is not
+        // that array. `*?` replaces it as `*` does, below.
+        if flags.only_new {
+            return (result == lv).then(|| lt.clone());
+        }
+        // An array the merge replaces keeps the left node's own presentation (a flow style, a
+        // comment) around the right items, whose presentation they bring along.
+        if result == rv {
+            let children = (0..r.len()).map(|i| rt.at_index(i).clone()).collect();
+            return Some(CommentTree::array(
+                lt.meta().without_declared_anchor(),
+                children,
+            ));
+        }
+        // A `*?` result that is not the right array is not modelled; a plain `*` keeps the right
+        // tree below, as it did before the flags were followed.
+        if flags.only_existing {
+            return None;
         }
     }
     if let (OwnedValue::Object(l), OwnedValue::Object(r), OwnedValue::Object(out)) =
@@ -1281,6 +1384,7 @@ fn merge_tree(
                     &(rvalue.clone(), rt.field(key).clone()),
                     value,
                     true,
+                    flags,
                     depth + 1,
                 )?,
                 (_, Some(_)) => rt.field(key).clone(),
@@ -1304,11 +1408,18 @@ fn merge_tree(
                 keys.insert(key.clone(), meta);
             }
         }
-        Some(CommentTree::object(lt.meta().clone(), fields, keys))
+        Some(CommentTree::object(
+            lt.meta().without_declared_anchor(),
+            fields,
+            keys,
+        ))
     } else if !matches!(lv, OwnedValue::Array(_) | OwnedValue::Object(_))
         && !matches!(rv, OwnedValue::Array(_) | OwnedValue::Object(_))
     {
         Some(CommentTree::leaf(lt.meta().clone()))
+    } else if flags.only_new && *lv != OwnedValue::Null {
+        // `*n` (#6900): a left value that is there stays, whatever the right one is.
+        Some(lt.clone())
     } else {
         // Replaced arrays take the RHS children, unlike recursive mapping
         // merges. Kind changes likewise have no left child provenance.
@@ -1328,7 +1439,8 @@ mod tests {
             "with_entries(.value = now)",
             "to_entries | map(.value = env(HOME))",
             "to_entries | map(error(\"stop\"))",
-            ".a *+ .b",
+            ".a *+d .b",
+            ".a *c .b",
         ] {
             let expr =
                 succinctly::jq::parse_with_mode(filter, succinctly::jq::ParserMode::Yq).unwrap();
