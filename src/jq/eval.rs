@@ -1155,6 +1155,13 @@ pub(crate) mod yq_single_target {
     }
 }
 
+/// What [`resolve_write_target`] answers: the resolved paths or the escape, and the document yq
+/// leaves where creation answered instead.
+type ResolvedWriteTarget = (
+    Result<Vec<Expr>, (Vec<Expr>, EvalEscape)>,
+    Option<FilteredCreation>,
+);
+
 /// Resolves the paths a yq write targets in `doc`, and where that raised only because a missing
 /// path's `null` was iterated (#6902), the document yq leaves instead (`zz: []` added).
 ///
@@ -1169,10 +1176,7 @@ fn resolve_write_target<S: EvalSemantics>(
     path_expr: &Expr,
     doc: &OwnedValue,
     create: bool,
-) -> (
-    Result<Vec<Expr>, (Vec<Expr>, EvalEscape)>,
-    Option<FilteredCreation>,
-) {
+) -> ResolvedWriteTarget {
     let first = resolve_dynamic_indexes::<S>(path_expr, doc, false);
     if first.is_ok()
         || !create
