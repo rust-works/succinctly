@@ -1578,9 +1578,27 @@ const SPELLING_TOKEN_SUFFIX: &str = NONFINITE_LITERAL_TOKEN_SUFFIX;
 /// malformed number.
 #[must_use]
 pub(crate) fn spelling_token(text: &str) -> String {
+    encode_spelling('6', text)
+}
+
+/// [`spelling_token`] for a spelling that was written as an **integer** and that the text alone
+/// reads as a float: `5` for the leading digit, then the same bytes (#6927).
+///
+/// A zero-padded `08` or `09` is the integer 8 of an explicit `!!int 08` and the float 8.0 of a
+/// plain one, and both carry the same text; the reader that decodes the text (`08` is a float,
+/// #6866) cannot tell them apart. The leading `5` keeps this apart from every other token
+/// family (`6` spelling, `7` document non-finite, `8`/`9` computed non-finite), so a decode
+/// knows the kind without a second look at the text. Only a yq spelled integer is written under
+/// it, and only one the text would misread.
+#[must_use]
+pub(crate) fn int_spelling_token(text: &str) -> String {
+    encode_spelling('5', text)
+}
+
+fn encode_spelling(lead: char, text: &str) -> String {
     use core::fmt::Write;
     let mut token = String::with_capacity(1 + text.len() * 3 + SPELLING_TOKEN_SUFFIX.len());
-    token.push('6');
+    token.push(lead);
     for byte in text.bytes() {
         // Infallible: writing to a `String`.
         let _ = write!(token, "{byte:03}");
@@ -1597,8 +1615,18 @@ pub(crate) fn spelling_token(text: &str) -> String {
 /// token of a decode agree and a near-miss is never half-read.
 #[must_use]
 pub(crate) fn parse_spelling_token(bytes: &[u8]) -> Option<String> {
+    decode_spelling(b"6", bytes)
+}
+
+/// Decodes an [`int_spelling_token`] to its text, `None` for anything else.
+#[must_use]
+pub(crate) fn parse_int_spelling_token(bytes: &[u8]) -> Option<String> {
+    decode_spelling(b"5", bytes)
+}
+
+fn decode_spelling(lead: &[u8], bytes: &[u8]) -> Option<String> {
     let digits = bytes
-        .strip_prefix(b"6")?
+        .strip_prefix(lead)?
         .strip_suffix(SPELLING_TOKEN_SUFFIX.as_bytes())?;
     if digits.len() % 3 != 0 || !digits.iter().all(u8::is_ascii_digit) {
         return None;
@@ -1760,6 +1788,42 @@ mod tests {
     // ========================================================================
     // computed-float token tests (#2902)
     // ========================================================================
+
+    /// #6927: the integer's spelling token round-trips like the plain one, decodes only under
+    /// its own leading digit, and is no number to `str::parse`.
+    #[test]
+    fn int_spelling_token_is_its_own_family_6927() {
+        for text in ["08", "09", "0018", "-09"] {
+            let token = int_spelling_token(text);
+            assert!(token.starts_with('5'), "{token}");
+            assert!(token.parse::<f64>().is_err() && token.parse::<i64>().is_err());
+            assert_eq!(
+                parse_int_spelling_token(token.as_bytes()).as_deref(),
+                Some(text)
+            );
+            // Neither family decodes the other's token.
+            assert_eq!(parse_spelling_token(token.as_bytes()), None, "{token}");
+            assert_eq!(
+                parse_int_spelling_token(spelling_token(text).as_bytes()),
+                None
+            );
+        }
+        assert_eq!(int_spelling_token("08"), "5048056e999e999");
+        // No other family's decoder reads it, and it reads none of theirs.
+        let token = int_spelling_token("08");
+        assert_eq!(parse_nonfinite_literal_token(token.as_bytes()), None);
+        assert_eq!(parse_computed_float_token(token.as_bytes()), None);
+        assert_eq!(parse_computed_int_token(token.as_bytes()), None);
+        for other in [
+            "9e999e999",
+            "8e999e999",
+            "7e999e999",
+            &nonfinite_literal_token(0),
+            &computed_float_token(1.5),
+        ] {
+            assert_eq!(parse_int_spelling_token(other.as_bytes()), None, "{other}");
+        }
+    }
 
     /// Load-bearing for #2902, the same way
     /// `test_nan_sentinel_is_unparseable_as_a_real_number` is for #472: the

@@ -3580,6 +3580,14 @@ impl OwnedValue {
         // #2802: a scalar the bridge carried under its spelling token reads as that text, never
         // as the token's digits. Only a yq spelled integer is written under it so far, and
         // `from_number_literal` keeps its spelling in yq mode.
+        if let Some(spelling) = n.bridge_int_spelling() {
+            // #6927: an integer the text alone reads as a float (`!!int 08`) crossed under the
+            // integer's own token.
+            if let Some(i) = crate::yaml::spelled_int_value(&spelling) {
+                return Self::spelled_int::<S>(i, spelling.into());
+            }
+            return Self::from_number_literal::<S>(&spelling);
+        }
         if let Some(spelling) = n.bridge_spelling() {
             return Self::from_number_literal::<S>(&spelling);
         }
@@ -4756,6 +4764,12 @@ impl OwnedValue {
             // routes in jq's number model but reads them as yq, so that model only keeps what its
             // own reader already reads back as itself (the lenient `007`, but not a `+5`, whose
             // sign the reader peels).
+            // #6927: a zero-padded `08` is an integer here and a float to the text alone.
+            Self::NumberLiteral(NumberRepr::Int(_), literal)
+                if S::TAG == EvalTag::Yq && crate::yaml::is_zero_padded_with_8_or_9(literal) =>
+            {
+                out.push_str(&crate::json::validate::int_spelling_token(literal));
+            }
             Self::NumberLiteral(NumberRepr::Int(_), literal)
                 if crate::yaml::is_spelled_int(literal)
                     && (S::TAG == EvalTag::Yq
