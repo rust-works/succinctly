@@ -8283,10 +8283,11 @@ fn top_level_comma_branches(expr: &Expr) -> Option<Vec<&Expr>> {
     Some(out)
 }
 
-/// The largest document a `pick` replays the presentation of (#5003). The replay converts the
-/// whole document with its comments, where the plain route reads only what is picked: on a 10 MB
-/// document that was 2.7x the time and 3x the memory for the same output. Past this size `pick`
-/// prints its result without the comments and styles of the nodes it kept, as it did before.
+/// The largest document a `pick` or an `omit` replays the presentation of (#5003, #6906). The
+/// replay converts the whole document with its comments, where the plain route reads only what is
+/// picked: on a 10 MB document that was 2.7x the time and 3x the memory for the same output. Past
+/// this size they print their result without the comments and styles of the nodes they kept, as
+/// they did before.
 const PICK_REPLAY_MAX_BYTES: usize = 1 << 20;
 
 /// Evaluate a jq expression directly on a YAML cursor.
