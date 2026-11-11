@@ -506,9 +506,10 @@ use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
 
 use super::expr::{
     retention_scope, ArithOp, ArithSettleMemo, AssignOp, BindOrigin, BoundBody, Builtin, CompareOp,
-    Expr, FormatType, FuncDefBound, FuncDefData, Libm1, Libm2, Libm3, Literal, MergeFlags,
-    MetaSlot, NumberKey, ObjectEntry, ObjectKey, Origin, Param, Pattern, PatternEntry, PipeStages,
-    SharedArg, SliceBoundKey, StageClass, StringPart, TailPlan, Tracked, YqOutputEncoder,
+    Expr, FormatType, FuncDefBound, FuncDefData, Libm1, Libm2, Libm3, Literal, LuaOptions,
+    MergeFlags, MetaSlot, NumberKey, ObjectEntry, ObjectKey, Origin, Param, Pattern, PatternEntry,
+    PipeStages, SharedArg, SliceBoundKey, StageClass, StringPart, TailPlan, Tracked,
+    YqOutputEncoder,
 };
 #[cfg(test)]
 use super::value::SharableString;
@@ -26855,6 +26856,7 @@ fn format_yq_output<S: EvalSemantics>(
         } => Ok(format_props_with(value, separator, *array_brackets)),
         YqOutputEncoder::Shell(separator) => Ok(format_shell_variables(value, separator)),
         YqOutputEncoder::Csv(comma) => format_yq_csv::<S>(value, *comma, true),
+        YqOutputEncoder::Lua(options) => format_lua(value, options),
         YqOutputEncoder::Tsv => format_yq_csv::<S>(value, '\t', true),
         YqOutputEncoder::Base64 => match value {
             OwnedValue::String(_) => format_base64::<S>(value, false),
@@ -26880,6 +26882,187 @@ fn yq_encoder_needs_a_string(value: &OwnedValue, format: &str) -> EvalError {
             "cannot encode {tag} as {format}, can only operate on strings"
         ))
     }
+}
+
+/// yq's `-o=lua` encoder (#6924): a table literal, one tab of indent per level, every entry ending in `,`
+/// (an array element) or `;` (a map entry). A string is double-quoted with yq's escape table (control
+/// characters as `\a \b \t \n \v \f \r` or three decimal digits, `"` `'` `\` and DEL escaped); `null` is
+/// `nil`; a boolean is lower case; a `0o` integer is decimal; `.inf`, `-.inf` and `.nan` are `(1/0)`,
+/// `(-1/0)` and `(0/0)`; any other number is its own text. Left out because the value model has no
+/// source style or key tag: a literal, folded or flow string (yq writes a long bracket), a single-quoted
+/// one (yq keeps its quote) and a non-string key (yq writes `[1] =`).
+fn format_lua(value: &OwnedValue, options: &LuaOptions) -> Result<String, EvalError> {
+    struct Lua<'a> {
+        out: String,
+        indent: usize,
+        options: &'a LuaOptions,
+    }
+    fn needs_quoting(name: &str) -> bool {
+        if matches!(
+            name,
+            "do" | "and"
+                | "else"
+                | "break"
+                | "if"
+                | "end"
+                | "goto"
+                | "false"
+                | "in"
+                | "for"
+                | "then"
+                | "local"
+                | "or"
+                | "nil"
+                | "true"
+                | "until"
+                | "elseif"
+                | "function"
+                | "not"
+                | "repeat"
+                | "return"
+                | "while"
+        ) {
+            return true;
+        }
+        name.chars()
+            .enumerate()
+            .any(|(i, c)| !(c.is_ascii_alphabetic() || c == '_' || (i > 0 && c.is_ascii_digit())))
+    }
+    impl Lua<'_> {
+        fn indent(&mut self) {
+            self.out.push('\n');
+            for _ in 0..self.indent {
+                self.out.push('\t');
+            }
+        }
+        fn string(&mut self, text: &str) {
+            self.out.push('"');
+            for c in text.chars() {
+                match c {
+                    '\u{7}' => self.out.push_str("\\a"),
+                    '\u{8}' => self.out.push_str("\\b"),
+                    '\t' => self.out.push_str("\\t"),
+                    '\n' => self.out.push_str("\\n"),
+                    '\u{b}' => self.out.push_str("\\v"),
+                    '\u{c}' => self.out.push_str("\\f"),
+                    '\r' => self.out.push_str("\\r"),
+                    '"' => self.out.push_str("\\\""),
+                    '\'' => self.out.push_str("\\'"),
+                    '\\' => self.out.push_str("\\\\"),
+                    c if (c as u32) < 32 || c as u32 == 127 => {
+                        self.out.push_str(&format!("\\{:03}", c as u32));
+                    }
+                    c => self.out.push(c),
+                }
+            }
+            self.out.push('"');
+        }
+        fn scalar(&mut self, value: &OwnedValue) {
+            match value {
+                OwnedValue::Null => self.out.push_str("nil"),
+                OwnedValue::Bool(b) => self.out.push_str(if *b { "true" } else { "false" }),
+                OwnedValue::String(s) => self.string(s),
+                OwnedValue::Float(f) if f.is_nan() => self.out.push_str("(0/0)"),
+                OwnedValue::Float(f) if f.is_infinite() => {
+                    self.out.push_str(if *f < 0.0 { "(-1/0)" } else { "(1/0)" });
+                }
+                OwnedValue::NumberLiteral(NumberRepr::Float(f), literal)
+                    if f.is_nan() || f.is_infinite() =>
+                {
+                    let lower = literal.to_lowercase();
+                    self.out.push_str(match lower.as_str() {
+                        ".inf" | "+.inf" => "(1/0)",
+                        "-.inf" => "(-1/0)",
+                        ".nan" => "(0/0)",
+                        _ => literal,
+                    });
+                }
+                OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _) => {
+                    let text = props_value_to_string(value, false).to_lowercase();
+                    match text
+                        .strip_prefix("0o")
+                        .map(|rest| i64::from_str_radix(rest, 8))
+                    {
+                        Some(Ok(octal)) => self.out.push_str(&octal.to_string()),
+                        _ => self.out.push_str(&text),
+                    }
+                }
+                other => self.out.push_str(&props_value_to_string(other, false)),
+            }
+        }
+        fn any(&mut self, value: &OwnedValue, depth: usize) {
+            assert_value_tree_depth(depth);
+            match value {
+                OwnedValue::Array(items) => {
+                    self.out.push('{');
+                    self.indent += 1;
+                    for item in items.iter() {
+                        self.indent();
+                        self.any(item, depth + 1);
+                        self.out.push(',');
+                    }
+                    self.indent -= 1;
+                    if !items.is_empty() {
+                        self.indent();
+                    }
+                    self.out.push('}');
+                }
+                OwnedValue::Object(entries) => self.map(entries, false, depth),
+                scalar => self.scalar(scalar),
+            }
+        }
+        fn map(&mut self, entries: &ObjectMap, global: bool, depth: usize) {
+            if !global {
+                self.out.push('{');
+                self.indent += 1;
+            }
+            for (i, (key, value)) in entries.iter().enumerate() {
+                if !global || i > 0 {
+                    self.indent();
+                }
+                if (self.options.unquoted || global) && !needs_quoting(key) {
+                    self.out.push_str(key);
+                    self.out.push_str(" = ");
+                } else {
+                    if global {
+                        self.out.push_str("_ENV");
+                    }
+                    self.out.push('[');
+                    self.string(key);
+                    self.out.push_str("] = ");
+                }
+                self.any(value, depth + 1);
+                self.out.push(';');
+            }
+            if global {
+                self.out.push('\n');
+                return;
+            }
+            self.indent -= 1;
+            if !entries.is_empty() {
+                self.indent();
+            }
+            self.out.push('}');
+        }
+    }
+    let mut lua = Lua {
+        out: String::new(),
+        indent: 0,
+        options,
+    };
+    if options.globals {
+        let OwnedValue::Object(entries) = value else {
+            return Err(EvalError::new(
+                "--lua-global requires a top level MappingNode".to_string(),
+            ));
+        };
+        lua.map(entries, true, 0);
+        return Ok(lua.out);
+    }
+    lua.out.push_str(&options.prefix);
+    lua.any(value, 0);
+    lua.out.push_str(&options.suffix);
+    Ok(lua.out)
 }
 
 /// yq's `-o=shell` encoder (#6850): one `name=value` line per scalar, comments dropped.

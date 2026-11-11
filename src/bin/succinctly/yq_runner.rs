@@ -28,8 +28,8 @@ use succinctly::jq::{
     self, alias_identity, assert_value_tree_depth, is_alias_sensitive_assign,
     nesting_depth_exceeded_message, nonfinite_display_string, nonfinite_literal_display,
     sync_aliased_paths, sync_merged_members, AssignOp, Builtin, DefScope, EvalError, Expr,
-    FormatType, Literal, MetaSlot, NumberRepr, ObjectKey, ObjectMap, OwnedValue, QueryResult,
-    YqOutputEncoder, YqSemantics,
+    FormatType, Literal, LuaOptions, MetaSlot, NumberRepr, ObjectKey, ObjectMap, OwnedValue,
+    QueryResult, YqOutputEncoder, YqSemantics,
 };
 use succinctly::json::light::JsonCursor;
 use succinctly::json::validate;
@@ -11590,6 +11590,33 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     }
 }
 
+/// The escapes yq reads in `--lua-prefix` and `--lua-suffix` (#6924): `\n`, `\r`, `\t`, `\\`, `\'` and `\"`.
+/// Any other backslash stays.
+fn unescape_lua_option(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            let read = match chars.peek() {
+                Some('n') => Some('\n'),
+                Some('r') => Some('\r'),
+                Some('t') => Some('\t'),
+                Some('\\') => Some('\\'),
+                Some('\'') => Some('\''),
+                Some('"') => Some('"'),
+                _ => None,
+            };
+            if let Some(read) = read {
+                chars.next();
+                out.push(read);
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     // `-j` is real yq's deprecated `--tojson` (#1731): cobra prints the warning while parsing
     // flags, so before everything else (`--version` included), and the alias is applied after
@@ -11638,6 +11665,12 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         OutputFormat::Tsv => Some(YqOutputEncoder::Tsv),
         OutputFormat::Base64 => Some(YqOutputEncoder::Base64),
         OutputFormat::Uri => Some(YqOutputEncoder::Uri),
+        OutputFormat::Lua => Some(YqOutputEncoder::Lua(Box::new(LuaOptions {
+            prefix: unescape_lua_option(&args.lua_prefix),
+            suffix: unescape_lua_option(&args.lua_suffix),
+            unquoted: args.lua_unquoted,
+            globals: args.lua_globals,
+        }))),
         OutputFormat::Yaml | OutputFormat::Json | OutputFormat::Auto => None,
     };
     if output_encoder.is_some() {

@@ -7540,7 +7540,8 @@ When an update (`|=`, `map_values`) fails on several nodes, yq reports the last 
 `-o=props`, `-o=shell`, `-o=csv`, `-o=tsv`, `-o=base64` and `-o=uri` (and the short names `p`, `s`, `c`, `t`) run the filter and write each result through that format's encoder, with no `---` between documents.
 `--shell-key-separator`, `--properties-separator`, `--properties-array-brackets` and `--csv-separator` are read (#6922); `--csv-separator` takes one ASCII byte (yq's `char` takes any single byte, so a lone byte above 0x7f, which cannot be an argument here, is refused), and `-o=tsv` ignores it, as yq does.
 The `@props` and `@csv` operators ignore those flags here, where yq applies them to the operators too.
-The other formats yq lists (`kyaml`, `xml`, `toml`, `hcl`, `lua`, `ini`) and every input format but YAML and JSON are still refused at the flag.
+`-o=lua` is read as well, with `--lua-prefix`, `--lua-suffix`, `--lua-globals` and `--lua-unquoted` (#6924); where it differs from yq is in its own section below.
+The other formats yq lists (`kyaml`, `xml`, `toml`, `hcl`, `ini`) and every input format but YAML and JSON are still refused at the flag.
 Six rows differ from yq v4.53.3, each pinned out of `tests/yq_cli/i6850.rs`:
 
 - A comment in a `props` document is not written.
@@ -7553,3 +7554,15 @@ Six rows differ from yq v4.53.3, each pinned out of `tests/yq_cli/i6850.rs`:
 - A `shell` key with an accented letter loses it (`é` is dropped), where yq decomposes it first and keeps the `e`.
 - `-o=csv` and `-o=tsv` with `-0` write each result's row here and a bare NUL in yq: yq's CSV writer is not flushed before the NUL, so the row is lost.
   Writing it matches nothing yq can be asked to read back (rule 4(b)).
+
+### `-o=lua` — a value's source style, a key's type and a comment are not read (#6924)
+
+`-o=lua` writes a table literal as yq's Lua encoder does (tab indent, `,` after an array element and `;` after a map entry, yq's string escapes, `nil`, `(1/0)`, `(-1/0)` and `(0/0)`, a `0o` integer in decimal), and agrees with yq v4.53.3 on 2,400 random JSON documents (under six combinations of the four options).
+The encoder runs over the value model, which keeps no node style, key tag or comment, so on a YAML input these still differ:
+
+- A literal (`|`) or folded (`>`) string is written `"l1\nl2\n"`, where yq writes a long bracket (`[[`, a line break, the text, `]]`).
+  A single-quoted string is written double-quoted, where yq keeps its single quotes.
+- A key that is not a string (`1: a`, `true: b`) is written `["1"] = "a"`, where yq writes `[1] = "a"` (its tag survives).
+- A comment is dropped, where yq writes a line comment as ` -- text` after the entry.
+- A timestamp (`2001-01-01`) and `!!binary` are written as strings, where yq stops with `lua encoder NYI -- !!timestamp`.
+- The YAML 1.1 integer spellings `1_000`, `0b11` and `0XfF` are strings here (see the YAML 1.1 section above), so they are quoted, where yq writes them bare.
