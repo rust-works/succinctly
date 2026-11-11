@@ -1109,8 +1109,9 @@ pub(crate) mod yq_delete_context {
     }
 }
 
-/// Whether the `del()` being resolved is one plain path (#6892), so no sibling can need the `null`
-/// placeholder a missing key reads as. The path resolver's `.[]` over
+/// Whether the `del()` being resolved is one plain path (#6892), or a write retried by
+/// [`resolve_write_target`] (#6902), so no sibling can need the `null` placeholder a missing key
+/// reads as. The path resolver's `.[]` over
 /// `null` raises for the sake of that fallback (see `resolve_iterate_sink`); a lone target has no
 /// such sibling, and yq's `.[]` over a missing or null node yields no target, so the raise is the
 /// divergence. Ambient for the reason [`yq_delete_context`] is. `std` only.
@@ -1152,6 +1153,44 @@ pub(crate) mod yq_single_target {
     pub(crate) fn enter(_single: bool) -> Guard {
         Guard
     }
+}
+
+/// Resolves the paths a yq write targets in `doc`, and where that raised only because a missing
+/// path's `null` was iterated (#6902), the document yq leaves instead (`zz: []` added).
+///
+/// The write is resolved as before. Only if that raised, and the target is one plain path with no
+/// iteration after a `select` (no sibling can need the `null` placeholder, as for the lone `del()`
+/// target of #6892; yq creates a step under each node a select passed, which the creation walk has
+/// no step for), it is resolved again with the iterate over `null` yielding nothing, and the result
+/// is taken only if nothing matched *and* [`yq_filtered_target_creation`] can write what yq creates:
+/// otherwise the original error stands, so a write is never silently dropped. `create` is `false`
+/// for a caller that must not create (`sort_keys(f)`).
+fn resolve_write_target<S: EvalSemantics>(
+    path_expr: &Expr,
+    doc: &OwnedValue,
+    create: bool,
+) -> (
+    Result<Vec<Expr>, (Vec<Expr>, EvalEscape)>,
+    Option<FilteredCreation>,
+) {
+    let first = resolve_dynamic_indexes::<S>(path_expr, doc, false);
+    if first.is_ok()
+        || !create
+        || S::TAG != EvalTag::Yq
+        || !write_target_is_one_path(path_expr)
+        || iterates_after_select(path_expr)
+    {
+        return (first, None);
+    }
+    let guard = yq_single_target::enter(true);
+    let retried = resolve_dynamic_indexes::<S>(path_expr, doc, false);
+    drop(guard);
+    if matches!(&retried, Ok(paths) if paths.is_empty()) {
+        if let Some(created) = yq_filtered_target_creation::<S>(path_expr, doc) {
+            return (retried, Some(created));
+        }
+    }
+    (first, None)
 }
 
 /// Whether an iteration follows a `select` in the pipe `expr` (#6902): `(NAV | select(..)).x[]`.
@@ -45018,12 +45057,15 @@ fn yq_assign_noop_check<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `NotChecked` on that (unreachable) `Err` arm just means the caller
     // re-derives from scratch. A dynamic one evaluates here, once, and its
     // failure is what yq reports first (#1412).
-    // #6902: one plain target has no sibling for the `null` a missing key reads as to stand in
-    // for, so the iterate over it yields no branch, as the lone `del()` target does (#6892); the
-    // creation walk below then adds the steps yq creates (`zz: []`).
-    let single_write = write_target_is_one_path(path_expr) && !iterates_after_select(path_expr);
-    let _single = yq_single_target::enter(single_write);
-    let mut paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false) {
+    let (resolved, created) = resolve_write_target::<S>(path_expr, &pristine, true);
+    // #6902: nothing matched past a missing path, and yq still created the steps it walked.
+    if let Some(created) = created {
+        return Ok(YqAssignNoopCheck::Skip(match created {
+            FilteredCreation::Unchanged => pristine,
+            FilteredCreation::Created(doc) => doc,
+        }));
+    }
+    let mut paths = match resolved {
         Ok(paths) => paths,
         Err((_, escape)) if needs_path_prepass(path_expr) => {
             return Ok(YqAssignNoopCheck::Failed(escape))
@@ -45635,12 +45677,11 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // an outer `(.[-5] |= 9)?` needs exactly that swallowed. `update_path` is
     // always entered with `false` below; any `?` it still sees came from an
     // `Expr::Optional` node inside `path_expr` itself.
-    // #6902: one plain target resolves to nothing over a missing path instead of raising, as in
-    // `yq_assign_noop_check`; the steps yq creates while walking it are written below.
-    let single_write = write_target_is_one_path(path_expr) && !iterates_after_select(path_expr);
-    let single = yq_single_target::enter(single_write);
-    let resolved = resolve_dynamic_indexes::<S>(path_expr, &result, false);
-    drop(single);
+    // #6902: `sort_keys(f)` (`skip_absent_paths`) never creates what it walks.
+    let (resolved, created) = resolve_write_target::<S>(path_expr, &result, !skip_absent_paths);
+    if let Some(FilteredCreation::Created(doc)) = created {
+        return QueryResult::Owned(doc);
+    }
     let mut paths = match resolved {
         Ok(paths) => paths,
         // `?` swallows only a genuine error; a halt always escapes — see the
@@ -45648,13 +45689,6 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err((_, EvalEscape::Error(_))) if optional => return QueryResult::None,
         Err((_, escape)) => return escape.into(),
     };
-    if paths.is_empty() && S::TAG == EvalTag::Yq && single_write {
-        if let Some(FilteredCreation::Created(doc)) =
-            yq_filtered_target_creation::<S>(path_expr, &result)
-        {
-            return QueryResult::Owned(doc);
-        }
-    }
     // #2855: drop any resolved path that doesn't already exist, before the
     // write loop below ever runs -- only `sort_keys(f)` sets this (see
     // `eval_update_no_vivify`'s own doc comment for why). Checked only up
@@ -58068,7 +58102,8 @@ fn resolve_iterate_sink<'a, S: EvalSemantics>(
             ResolveFlow::Exhausted
         }
         // #6892: a `null` too, for the only target of a `del()`: `del(.zz[] | select(.n == 1))`
-        // over a document without `zz` leaves it as it is, as yq does.
+        // over a document without `zz` leaves it as it is, as yq does (and, #6902, for a write
+        // `resolve_write_target` retries).
         OwnedValue::Null if S::TAG == EvalTag::Yq && yq_single_target::active() => {
             ResolveFlow::Exhausted
         }

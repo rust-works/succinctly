@@ -4777,7 +4777,7 @@ There is no sibling for a placeholder to stand in for, so the resolver yields no
 Over a stored `null` yq also turns it into `[]` (`a: ~` becomes `a: []`), which this does not.
 With a comma (`del(.zz[] | select(.n == 1), .kind)`) the raise stays.
 A field write through the same path (`(.zz[] | select(.n == 1)).x = 5`, and `|=`, `+=`, `-=`) adds the `zz: []` yq adds instead of raising (#6902).
-The write raises where a comma names a second target (`(.zz[] | select(.n == 1), .kind).x = 5`) and where an iteration follows the select (`(.zz[] | select(.n == 1)).x[] = 5`, where yq creates `x: []` under each node the select passed).
+The write raises where a comma names a second target (`(.zz[] | select(.n == 1), .kind).x = 5`), where an iteration follows the select (`(.zz[] | select(.n == 1)).x[] = 5`, where yq creates `x: []` under each node the select passed), in a document with an anchor or alias, and under `sort_keys(f)`, which never creates what it walks (yq leaves the document as it is).
 
 ### A slice keeps an explicit `!!str`/`!!int` tag, but not `!!binary` or an alias ([#4328](https://github.com/rust-works/succinctly/issues/4328))
 

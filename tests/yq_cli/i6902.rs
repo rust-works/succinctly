@@ -106,6 +106,31 @@ const ROWS: &[(&str, &str, &str)] = &[
         "(.zz[] | select(.n == 3)).x |= 5",
         "zz:\n  - n: 1\n  - n: 2\nk: 1\n",
     ),
+    (
+        "kind: Service\nspec:\n  type: x\n",
+        "(.zz[] | select(.n == 1)).x[0] = 5",
+        "kind: Service\nspec:\n  type: x\nzz: []\n",
+    ),
+    (
+        "kind: Service\nspec:\n  type: x\n",
+        "(.zz[] | select(.n == 1)).x | .y = 5",
+        "",
+    ),
+    (
+        "kind: Service # c\nspec:\n  type: x # d\n",
+        "(.zz[] | select(.n == 1)).x = 5",
+        "kind: Service # c\nspec:\n  type: x # d\nzz: []\n",
+    ),
+    (
+        "kind: Service\n---\nkind: Deployment\nzz:\n  - n: 1\n",
+        "(.zz[] | select(.n == 1)).x = 5",
+        "kind: Service\nzz: []\n---\nkind: Deployment\nzz:\n  - n: 1\n    x: 5\n",
+    ),
+    (
+        "kind: Service\n---\nkind: Deployment\nzz:\n  - n: 1\n",
+        "(.zz[] | select(.n == 1)).x |= 5",
+        "kind: Service\nzz: []\n---\nkind: Deployment\nzz:\n  - n: 1\n    x: 5\n",
+    ),
 ];
 
 #[test]
@@ -119,9 +144,9 @@ fn test_write_through_select_over_a_missing_path_creates_it_6902() -> Result<()>
 }
 
 /// What still raises, pinned so a change to it is a decision: a comma among the targets (the `null`
-/// a missing key reads as can stand for a sibling's write), and an iteration after the select
-/// (`.x[]`, where yq creates `x: []` under each node the select passed). Each row is `(document,
-/// filter, yq's stdout)`.
+/// a missing key reads as can stand for a sibling's write), an iteration after the select (`.x[]`,
+/// where yq creates `x: []` under each node the select passed), a document with an anchor, and
+/// `sort_keys(f)`. Each row is `(document, filter, yq's stdout)`.
 #[test]
 fn test_the_comma_and_iterate_after_select_forms_stay_recorded_6902() -> Result<()> {
     let svc = "kind: Service\nspec:\n  type: x\n";
@@ -135,6 +160,19 @@ fn test_the_comma_and_iterate_after_select_forms_stay_recorded_6902() -> Result<
             svc,
             "(.zz[] | select(.n == 1)).x[] = 5",
             "kind: Service\nspec:\n  type: x\nzz: []\n",
+        ),
+        // A document with an anchor: the creation walk steps aside for the alias table, and the
+        // raise stands rather than the write being dropped.
+        (
+            "base: &b\n  q: 1\nref: *b\n",
+            "(.zz[] | select(.n == 1)).x = 5",
+            "base: &b\n  q: 1\nref: *b\nzz: []\n",
+        ),
+        // `sort_keys(f)` never creates what it walks, where yq leaves the document as it is.
+        (
+            svc,
+            "sort_keys((.zz[] | select(.n == 1)).x)",
+            "kind: Service\nspec:\n  type: x\n",
         ),
     ];
     for (doc, filter, yq) in rows {

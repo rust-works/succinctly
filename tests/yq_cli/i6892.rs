@@ -38,7 +38,8 @@ fn test_del_through_select_over_a_missing_path_leaves_the_document_6892() -> Res
 /// What still differs, pinned so a change to it is a decision (each yq answer is v4.53.3's): a
 /// `del()` with a comma still raises for the sake of the placeholder rule `resolve_iterate_sink`
 /// documents; over a stored `null` the delete is a no-op here where yq turns the `null` into `[]`.
-/// (The field write through the same path was a row here until #6902.) Each row is `(document, filter, this build's stdout, its exit code, yq's stdout)`.
+/// (The field write through the same path was a row here until #6902.) Each row is `(document,
+/// filter, this build's stdout, its exit code, yq's stdout)`.
 #[test]
 fn test_the_comma_write_and_stored_null_forms_stay_recorded_6892() -> Result<()> {
     let svc = "kind: Service\nspec:\n  type: x\n";
