@@ -37031,7 +37031,8 @@ fn test_yq_base64d_tolerates_only_leading_and_trailing_newlines_1135() -> Result
     assert_eq!(out.trim(), r#""A""#);
 
     // A newline splitting a quantum mid-way, or between two otherwise
-    // complete quanta, is rejected -- not skipped.
+    // complete quanta, is rejected: yq skips it only after padding by the
+    // length with it, which leaves a short quantum (`unexpected EOF`, #6997).
     let (_out, _stderr, code) = run_yq_stdin_with_stderr("@base64d", "\"Q\\nQ==\"", &[])?;
     assert_ne!(code, 0, "embedded newline mid-quantum should be rejected");
 

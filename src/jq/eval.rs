@@ -26490,20 +26490,38 @@ fn format_base64d<S: EvalSemantics>(
     //   from the character-validity check happening before it can ever
     //   accumulate as "1 pending", not as a separate case).
     //
-    // This issue originally described a "CR/LF skipped anywhere" rule too,
-    // but that turned out (on closer live verification) to be nothing more
-    // than this function's own yq-mode `.trim()` step above already
-    // stripping a *leading or trailing* run of whitespace before this code
-    // ever runs -- a `\n` genuinely embedded between real characters is
-    // rejected here like any other invalid byte, matching the oracle
-    // (`"Q\nQ==" | @base64d` errors in real yq even though the same
-    // characters minus the `\n` decode cleanly). Exact byte offsets are
+    // A leading or trailing run of whitespace is trimmed above. A `\r` or
+    // `\n` between real characters is skipped, but only after yq has padded
+    // the text by its length with the breaks, which leaves a short final
+    // quantum (`"Q\nQ==" | @base64d` is `unexpected EOF` in real yq even
+    // though the same characters minus the `\n` decode cleanly, #6997). Exact byte offsets are
     // matched wherever the rules above pin them down; Go's own internal
     // streaming-decoder accounting isn't chased past that (per this
     // issue's own recommendation) -- only the accept/reject verdict and
     // any decoded bytes need to match beyond what's stated above.
     if S::TAG == EvalTag::Yq {
-        let bytes = trimmed.as_bytes();
+        // #6997: a line break inside the text. yq pads the text to a multiple of four by its
+        // length *with* the breaks, and Go's decoder then skips every `\r` and `\n` and reads
+        // four characters at a time, so what is left past the last whole quantum is `unexpected
+        // EOF` once the quanta before it decode. (`"aGVs\nbG8="` is `unexpected EOF`; a break
+        // before or after the text is trimmed above, and `"aGk=\naGk="` still fails at byte 4.)
+        let unbroken: Vec<u8>;
+        let mut short_tail = false;
+        let bytes: &[u8] = if trimmed.contains(['\r', '\n']) {
+            let padding = (4 - trimmed.len() % 4) % 4;
+            let mut text: Vec<u8> = trimmed
+                .bytes()
+                .filter(|b| !matches!(b, b'\r' | b'\n'))
+                .collect();
+            text.extend(core::iter::repeat(b'=').take(padding));
+            let whole = text.len() - text.len() % 4;
+            short_tail = whole < text.len();
+            text.truncate(whole);
+            unbroken = text;
+            &unbroken
+        } else {
+            trimmed.as_bytes()
+        };
         let mut result = Vec::new();
         let mut quantum: Vec<u8> = vec_with_capacity(4);
         let mut finished = false;
@@ -26551,6 +26569,9 @@ fn format_base64d<S: EvalSemantics>(
             2 | 3 => push_decoded_group(&mut result, &quantum),
             1 => return Err(EvalError::base64_illegal_data(i)),
             _ => unreachable!("a full quantum always flushes before the loop can exit here"),
+        }
+        if short_tail {
+            return Err(EvalError::new("unexpected EOF"));
         }
 
         return Ok(owned_string_from_decoded_bytes::<S>(result));

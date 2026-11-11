@@ -2195,19 +2195,17 @@ every CLI-reachable case: `Expr`, `Builtin`, `eval`, and `YqSemantics` are publi
 directly and evaluate it with `YqSemantics`, bypassing the parser (and any CLI flag) entirely
 — deleting the check would reopen #723's bug for that surface specifically.
 
-### `load`, `load_str` and `load_base64`: five rows still differ ([#6985](https://github.com/rust-works/succinctly/issues/6985))
+### `load`, `load_str` and `load_base64`: four rows still differ ([#6985](https://github.com/rust-works/succinctly/issues/6985))
 
 The loaders read their file name as yq does: the argument's first output, a scalar by its text, and `filename expression returned nil` when the argument has no output.
 A read failure is worded as Go words it (`failed to load nope: open nope: no such file or directory`, `read adir: is a directory`), and a file that does not parse is `failed to load F: bad file 'F': ...`.
-Five rows differ:
+Four rows differ:
 
 - **A literal `null` name.**
   yq opens the file `null` (`load_str(null)` is `open null: no such file or directory`), and an absent key (`load_str(.zz)`) is `filename expression returned nil`.
   An absent key reads as `null` here, so both are the nil refusal: the absent key is the common case.
 - **Bytes that are not valid UTF-8 in `load_str`.**
   yq keeps the raw byte, which its JSON encoder escapes as `\ufffd`; this substitutes U+FFFD on the read, so the string is the same and `-o=json` prints the character itself (the rule of the `-p json` section above).
-- **A line break inside `load_base64`'s text.**
-  yq's decoder answers `unexpected EOF` for `aGVs` / `bG8=`, where this says `illegal base64 data at input byte 4`: the same gap as `@base64d`, which `load_base64` decodes with ([#6997](https://github.com/rust-works/succinctly/issues/6997)).
 - **The reason a file does not parse.**
   After `bad file 'F': ` yq gives go-yaml's message (`yaml: while parsing a flow sequence at <unknown position>`), and this gives its own parser's (`unexpected end of input: flow sequence`).
 - **A `.json` name holding YAML.**
