@@ -71,6 +71,24 @@ const ROWS: &[(Option<&str>, &str, &str)] = &[
     ),
     (None, "[range(0; 1e-1000; 1)] | .[0] | . == 0", "true\n"),
     (None, "[range(1e-1000; 2; 1)]", "[1E-1000,1]\n"),
+    // The path interpreter's `range/3` reads the step the same way.
+    (
+        None,
+        "[limit(2; path(range(0; 1; 1e-1000) as $x | .a))]",
+        "[[\"a\"],[\"a\"]]\n",
+    ),
+    (
+        None,
+        "[limit(2; path(range(0; 1; \"-1e-400\" | tonumber) as $x | .a))]",
+        "[]\n",
+    ),
+    // A walk over numbers keeps the numeric walk's cap (2^24), not the 100,000 of one over
+    // values that grow.
+    (
+        None,
+        "[limit(150000; range(0; 1; 1e-1000))] | length",
+        "150000\n",
+    ),
 ];
 
 /// `(input, filter, message)`: jq raises, and so does `succinctly jq`, with jq's message.

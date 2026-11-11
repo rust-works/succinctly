@@ -45,11 +45,11 @@ use indexmap::IndexMap;
 use super::c_builtin_identity::{array_index, binop_keeps, format_keeps_input, kept, Kept};
 use super::error::{dump_truncated_with, Control, EvalError};
 use super::eval::{
-    apply_compare_op, arith_combine, arith_negate, compare_values, is_tree_descending_f,
-    native_stack_exhausted, owned_to_string, range_max_exceeded_error, recurse_max_items,
-    recurse_node_cost, recurse_value_size, EvalTag, JqSemantics, LoopCounters, QueryResult,
-    MAX_EMPTY_REPEAT_ROUNDS, MAX_EVAL_FRAMES, MAX_LOOP_ROUNDS, MAX_RANGE, MAX_RANGE_TOTAL,
-    REPEAT_WIDTH_BUDGET,
+    apply_compare_op, arith_combine, arith_negate, compare_values, definition_zero_for,
+    is_tree_descending_f, native_stack_exhausted, owned_to_string, range_max_exceeded_error,
+    recurse_max_items, recurse_node_cost, recurse_value_size, EvalTag, JqSemantics, LoopCounters,
+    QueryResult, MAX_EMPTY_REPEAT_ROUNDS, MAX_EVAL_FRAMES, MAX_LOOP_ROUNDS, MAX_RANGE,
+    MAX_RANGE_TOTAL, REPEAT_WIDTH_BUDGET,
 };
 use super::expr::{
     ArithOp, Builtin, CompareOp, Expr, Literal, MergeFlags, NumberKey, ObjectKey, Param, Pattern,
@@ -2394,7 +2394,8 @@ impl<'e> Interp<'e> {
         self.eval(init, env, input.clone(), reg.sub(), &mut |start, _| {
             self.eval(upto, env, input.clone(), reg.sub(), &mut |end, _| {
                 self.eval(by, env, input.clone(), reg.sub(), &mut |step, _| {
-                    let zero = OwnedValue::Int(0);
+                    // #6993: jq's `$by > 0` compares with a literal `0`.
+                    let zero = definition_zero_for::<JqSemantics>(&step);
                     let cmp = |op: CompareOp, a: &OwnedValue, b: &OwnedValue| {
                         apply_compare_op::<JqSemantics>(op, a, b)
                     };

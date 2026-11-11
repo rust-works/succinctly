@@ -9231,19 +9231,22 @@ fn float_count_against_zero<S: EvalSemantics>(
     f: f64,
 ) -> Option<core::cmp::Ordering> {
     if S::TAG == EvalTag::Jq && f == 0.0 && matches!(value, OwnedValue::NumberLiteral(..)) {
-        return jq_numeric_cmp(value, &definition_zero::<S>());
+        return jq_numeric_cmp(value, &definition_zero_for::<S>(value));
     }
     f.partial_cmp(&0.0)
 }
 
-/// The `0` jq's own definitions compare an argument with: `. < 0` in `abs`, `$x < 0` and `$x != 0`
-/// in `flatten`, `$by > 0` and `$by < 0` in `range/3` (#6983, #6993), for [`compare_values`]. In jq
-/// mode it is a number literal, so a literal argument compares with it exactly, as jq compares two
-/// literals (`1e-1000` is above it although its double is `0.0`); a bare `Int(0)` is a computed
-/// number, against which a literal compares as a double. yq's numbers are doubles, so yq mode keeps
-/// `Int(0)`.
-pub(crate) fn definition_zero<S: EvalSemantics>() -> OwnedValue {
-    if S::TAG == EvalTag::Jq {
+/// The `0` to compare `value` with where jq's own definitions compare an argument with a literal
+/// `0`: `. < 0` in `abs`, `$x < 0` and `$x != 0` in `flatten`, `$by > 0` and `$by < 0` in `range/3`
+/// (#6983, #6993). Two number literals compare exactly as decimals in jq, so a literal whose double
+/// is `±0.0` but which is not zero (`1e-1000`, `-1e-400`) gets a literal `0`, against which
+/// [`compare_values`] reads its text; every other value compares with a literal `0` as it does with a
+/// bare `Int(0)`, which is free to build, so it gets that. yq's numbers are doubles: always `Int(0)`.
+pub(crate) fn definition_zero_for<S: EvalSemantics>(value: &OwnedValue) -> OwnedValue {
+    if S::TAG == EvalTag::Jq
+        && matches!(value, OwnedValue::NumberLiteral(..))
+        && value.as_f64() == Some(0.0)
+    {
         OwnedValue::NumberLiteral(NumberRepr::Int(0), "0".into())
     } else {
         OwnedValue::Int(0)
@@ -10778,9 +10781,8 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     from_literal: Option<&OwnedValue>|
      -> Demand {
         match (range_num(from), range_num(to), range_num(step)) {
-            // #6993: a literal the doubles cannot stand for goes to the generic walk.
             (Ok(from_val), Ok(to_val), Ok(step_val))
-                if implicit_step || !range_reads_literals::<S>(from, to, step) =>
+                if range_takes_numeric_walk::<S>(implicit_step, from, to, step) =>
             {
                 // #5292: handed over a batch at a time, each drained into `sink`
                 // before the next is built.
@@ -10808,7 +10810,8 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     }
                 }
             }
-            // #3409: at least one operand isn't a plain number -- only
+            // #3409: at least one operand isn't a plain number, or (#6993) is a
+            // literal the numeric walk's doubles cannot stand for -- only
             // reachable from range/3 (see this closure's own doc comment).
             // Real jq's range/3 desugar never type-checks from/to/step
             // itself; only the `+` that advances to the next value can
@@ -24108,7 +24111,7 @@ fn flatten_owned_at_depth<S: EvalSemantics>(
             // #6993: jq's `0` is a literal, so a depth of `1e-1000` is not it; its `$x - 1` is a
             // computed `-1`, which is never `0` either, so that depth flattens every level.
             OwnedValue::Array(inner)
-                if compare_values::<S>(&depth, &definition_zero::<S>())
+                if compare_values::<S>(&depth, &definition_zero_for::<S>(&depth))
                     != core::cmp::Ordering::Equal =>
             {
                 let next_depth = arith_sub::<S>(depth.clone(), OwnedValue::Int(1))?;
@@ -24163,7 +24166,7 @@ fn builtin_flatten_depth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 ref other
                     if S::TAG == EvalTag::Jq
                         // #6993: jq's `0` is a literal, so `-1e-400` is below it.
-                        && compare_values::<S>(other, &definition_zero::<S>())
+                        && compare_values::<S>(other, &definition_zero_for::<S>(other))
                             == core::cmp::Ordering::Less =>
                 {
                     return QueryResult::Error(EvalError::new(
@@ -98532,6 +98535,55 @@ pub(crate) fn each_range_batches(
     }
 }
 
+/// Whether jq's `range($from; $upto; $by)` reads a literal the numeric walk ([`each_range_batches`],
+/// over [`RangeNum`] doubles) cannot (#6993), so [`range_values_generic`], which compares with
+/// [`compare_values`], must answer it. jq's definition is `if $by > 0 then $from | while(. < $upto;
+/// . + $by) elif $by < 0 then ... else empty end`, and two number literals compare exactly as
+/// decimals there: a step literal too small for a double (`1e-1000`, `-1e-400`) is not zero, and
+/// the first `$from < $upto`, the one comparison of two literals before `+ $by` computes, can
+/// differ from the doubles' when they tie (`range(0; 1e-1000; 1)` is `[0]`), unless both are
+/// integers, which the `i64` walk compares exactly already. jq mode only; `range/1`
+/// and `range/2` are jq's C opcode, which compares doubles, and yq's numbers are doubles.
+/// Whether `range(from; to; step)` (`implicit_step` for `range/1` and `range/2`) takes the numeric
+/// walk ([`each_range_batches`]) rather than [`range_values_generic`], once [`range_num`] has found all
+/// three operands numbers: unless one is a literal the walk's doubles cannot stand for
+/// ([`range_reads_literals`], #6993). The one definition both evaluators' `range` arms read.
+pub(crate) fn range_takes_numeric_walk<S: EvalSemantics>(
+    implicit_step: bool,
+    from: &OwnedValue,
+    to: &OwnedValue,
+    step: &OwnedValue,
+) -> bool {
+    implicit_step || !range_reads_literals::<S>(from, to, step)
+}
+
+pub(crate) fn range_reads_literals<S: EvalSemantics>(
+    from: &OwnedValue,
+    to: &OwnedValue,
+    step: &OwnedValue,
+) -> bool {
+    use core::cmp::Ordering;
+    if S::TAG != EvalTag::Jq {
+        return false;
+    }
+    let double_ties = |a: &OwnedValue, b: &OwnedValue| {
+        matches!(a, OwnedValue::NumberLiteral(..))
+            && matches!(b, OwnedValue::NumberLiteral(..))
+            && a.as_f64() == b.as_f64()
+            && jq_numeric_cmp(a, b) != Some(Ordering::Equal)
+    };
+    // Two integers keep the exact `i64` walk, which already compares them exactly (and past
+    // `2^53` keeps every value, the recorded #2131 divergence from jq's doubles).
+    let both_ints = matches!(
+        (from, to),
+        (
+            OwnedValue::NumberLiteral(NumberRepr::Int(_), _),
+            OwnedValue::NumberLiteral(NumberRepr::Int(_), _)
+        )
+    );
+    double_ties(step, &definition_zero_for::<S>(step)) || (!both_ints && double_ties(from, to))
+}
+
 /// `range/3`'s fallback once at least one of `from`/`to`/`step` fails
 /// [`range_num`] (#3409) -- shared by [`each_range`] and
 /// `eval_generic::each_range_generic` so this has exactly one
@@ -98587,42 +98639,6 @@ pub(crate) fn each_range_batches(
 /// here: `first(range([]; {}; [1]) | select(length == n))` was quadratic
 /// because the owned-value bridge serialized each emitted array to evaluate
 /// the `select`, see [`owned_select_door`].
-/// Whether jq's `range($from; $upto; $by)` reads a literal the numeric walk ([`each_range_batches`],
-/// over [`RangeNum`] doubles) cannot (#6993), so [`range_values_generic`], which compares with
-/// [`compare_values`], must answer it. jq's definition is `if $by > 0 then $from | while(. < $upto;
-/// . + $by) elif $by < 0 then ... else empty end`, and two number literals compare exactly as
-/// decimals there: a step literal too small for a double (`1e-1000`, `-1e-400`) is not zero, and
-/// the first `$from < $upto`, the one comparison of two literals before `+ $by` computes, can
-/// differ from the doubles' when they tie (`range(0; 1e-1000; 1)` is `[0]`), unless both are
-/// integers, which the `i64` walk compares exactly already. jq mode only; `range/1`
-/// and `range/2` are jq's C opcode, which compares doubles, and yq's numbers are doubles.
-pub(crate) fn range_reads_literals<S: EvalSemantics>(
-    from: &OwnedValue,
-    to: &OwnedValue,
-    step: &OwnedValue,
-) -> bool {
-    use core::cmp::Ordering;
-    if S::TAG != EvalTag::Jq {
-        return false;
-    }
-    let double_ties = |a: &OwnedValue, b: &OwnedValue| {
-        matches!(a, OwnedValue::NumberLiteral(..))
-            && matches!(b, OwnedValue::NumberLiteral(..))
-            && a.as_f64() == b.as_f64()
-            && jq_numeric_cmp(a, b) != Some(Ordering::Equal)
-    };
-    // Two integers keep the exact `i64` walk, which already compares them exactly (and past
-    // `2^53` keeps every value, the recorded #2131 divergence from jq's doubles).
-    let both_ints = matches!(
-        (from, to),
-        (
-            OwnedValue::NumberLiteral(NumberRepr::Int(_), _),
-            OwnedValue::NumberLiteral(NumberRepr::Int(_), _)
-        )
-    );
-    double_ties(step, &definition_zero::<S>()) || (!both_ints && double_ties(from, to))
-}
-
 pub(crate) fn range_values_generic<S: EvalSemantics>(
     from: OwnedValue,
     to: &OwnedValue,
@@ -98632,7 +98648,7 @@ pub(crate) fn range_values_generic<S: EvalSemantics>(
     use core::cmp::Ordering;
 
     // #6993: jq's `$by > 0` compares with a literal `0`, so a step of `1e-1000` is positive.
-    let ascending = match compare_values::<S>(step, &definition_zero::<S>()) {
+    let ascending = match compare_values::<S>(step, &definition_zero_for::<S>(step)) {
         Ordering::Greater => true,
         Ordering::Less => false,
         // `$by` compares equal to 0 under jq's total order (a bare number
@@ -98650,6 +98666,14 @@ pub(crate) fn range_values_generic<S: EvalSemantics>(
         }
     };
 
+    // A walk over three numbers (#6993: a literal the numeric walk's doubles cannot stand for)
+    // copies nothing that grows, so it keeps the numeric walk's cap.
+    let is_number = |v: &OwnedValue| range_num(v).is_ok();
+    let cap = if is_number(&from) && is_number(to) && is_number(step) {
+        MAX_RANGE_TOTAL
+    } else {
+        MAX_RANGE
+    };
     let mut current = from;
     let mut count: usize = 0;
     loop {
@@ -98661,7 +98685,7 @@ pub(crate) fn range_values_generic<S: EvalSemantics>(
         }
         count += 1;
         let next = arith_add::<S>(current, step.clone())?;
-        if count >= MAX_RANGE {
+        if count >= cap {
             return if continues(&next, to) {
                 Err(range_max_exceeded_error())
             } else {
@@ -111073,7 +111097,8 @@ fn builtin_abs<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let owned = to_owned_or_suppress!(&value, optional);
     // jq's `abs` is `if . < 0 then -. else . end` with a literal `0` (#6983): `-1e-400 | abs` is
     // `-(-1e-400)`, a computed `0`, although its double is `-0.0`.
-    let sorts_below_zero = apply_compare_op::<S>(CompareOp::Lt, &owned, &definition_zero::<S>());
+    let sorts_below_zero =
+        apply_compare_op::<S>(CompareOp::Lt, &owned, &definition_zero_for::<S>(&owned));
     if sorts_below_zero {
         match arith_negate::<S>(owned) {
             Ok(v) => QueryResult::Owned(v),
@@ -167866,10 +167891,17 @@ mod tests {
             &int(1),
             &tiny
         ));
-        assert_eq!(definition_zero::<YqSemantics>(), OwnedValue::Int(0));
+        assert_eq!(
+            definition_zero_for::<YqSemantics>(&tiny),
+            OwnedValue::Int(0)
+        );
         assert!(matches!(
-            definition_zero::<JqSemantics>(),
+            definition_zero_for::<JqSemantics>(&tiny),
             OwnedValue::NumberLiteral(NumberRepr::Int(0), _)
+        ));
+        assert!(matches!(
+            definition_zero_for::<JqSemantics>(&lit(0.5, "0.5")),
+            OwnedValue::Int(0)
         ));
     }
 
