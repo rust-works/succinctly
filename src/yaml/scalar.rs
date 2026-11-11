@@ -813,8 +813,9 @@ pub(super) fn preservable_float_literal_text(s: &str) -> Option<String> {
     is_preservable_float_literal(&normalized).then_some(normalized)
 }
 
-/// Whether emitting `text` as a plain YAML scalar would lose its
-/// float-ness, so a `!!float` tag is needed to keep the value's type stable
+/// Whether emitting `text` as a plain YAML scalar would lose its float-ness.
+///
+/// A `!!float` tag is then needed to keep the value's type stable
 /// across a round trip: `format_float_yq_yaml_nested` (`light.rs`) asks it to
 /// decide whether nested YAML output must precede a computed float with
 /// `!!float ` (#1090).
