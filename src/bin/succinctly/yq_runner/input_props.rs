@@ -29,11 +29,15 @@ use succinctly::yaml::{
 /// with the message a yq-mode write past its own bound prints.
 const MAX_SEQUENCE_ELEMENTS: usize = 1 << 24;
 
-/// The most bytes the `${key}` expansion check may produce. magiconair expands every value once
+/// The most segments one key's path may have: 10,000. The YAML text of a path that deep is some
+/// 100 MB (each line is indented by its depth), which is still read; a deeper one is refused.
+const MAX_PATH_SEGMENTS: usize = 10_000;
+
+/// The most bytes the `${key}` expansion check may substitute in. magiconair expands every value once
 /// at load time only to find a malformed or circular reference (yq never reads the expansions),
 /// and a chain of values that each repeat the next one twice doubles the work per link, so this
 /// bounds the check rather than let a small file run without end.
-const MAX_EXPANSION_BYTES: usize = 1 << 28;
+const MAX_EXPANSION_BYTES: usize = 1 << 24;
 
 /// `raw` as the YAML text of the document yq decodes it to, or yq's message for a file that does
 /// not load (printed after `bad file '<name>': `). An empty input holds no document, which is the
@@ -50,12 +54,18 @@ pub(super) fn transcode(raw: &[u8], array_brackets: bool) -> Result<Vec<u8>, Str
     for key in &properties.keys {
         apply_property(&mut root, &properties, key, array_brackets, &mut budget)?;
     }
-    let mut out = String::new();
+    let mut out = Out {
+        text: String::new(),
+        skip_indent: false,
+    };
     match &root {
-        Node::Map(entries) if !entries.is_empty() => render_map(&mut out, entries, ""),
-        _ => out.push_str("{}\n"),
+        Node::Map(entries) if !entries.is_empty() => {
+            let spaces = STEP.repeat(budget.deepest_path + 2);
+            render_map(&mut out, entries, &spaces, 0)?;
+        }
+        _ => out.text.push_str("{}\n"),
     }
-    Ok(out.into_bytes())
+    Ok(out.text.into_bytes())
 }
 
 /// The input as Go's `utf8.DecodeRuneInString` steps through it: every byte that does not start
@@ -468,8 +478,11 @@ impl Properties {
             let expanded = expanded?;
             let end = key_start + key_len + 1;
             s = format!("{}{expanded}{}", &s[..start], &s[end..]);
+            // Charged for what the substitution adds (and one for the substitution itself, so
+            // a chain of empty values that doubles at each link is bounded too), not for the
+            // text around it.
             *budget = budget
-                .checked_sub(s.len())
+                .checked_sub(expanded.len() + 1)
                 .ok_or_else(|| String::from("properties: ${...} expansion too large to check"))?;
         }
     }
@@ -483,40 +496,98 @@ fn go_getenv(name: &str) -> String {
     std::env::var_os(name).map_or_else(String::new, |value| value.to_string_lossy().into_owned())
 }
 
-/// `fmt.Errorf(format)` with no arguments: `%%` is `%`, and any other verb (its flags, width and
-/// precision dropped) is `%!v(MISSING)`; a `%` with no verb after it is `%!(NOVERB)`.
+/// `fmt.Errorf(format)` with no arguments, as `doPrintf` writes it: `%%` is `%`, any other verb
+/// (its flags, width and precision dropped) is `%!v(MISSING)`, or `%!v(BADINDEX)` after an
+/// argument index (`%[1]d`), a `*` width or precision adds `%!(BADWIDTH)` / `%!(BADPREC)`, and a
+/// `%` with no verb after it is `%!(NOVERB)`.
 fn go_format_without_arguments(format: &str) -> String {
+    let f = format.as_bytes();
+    let end = f.len();
     let mut out = String::with_capacity(format.len());
-    let mut chars = format.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '%' {
-            out.push(c);
+    let mut i = 0;
+    while i < end {
+        let literal = i;
+        while i < end && f[i] != b'%' {
+            i += 1;
+        }
+        out.push_str(&format[literal..i]);
+        if i >= end {
+            break;
+        }
+        i += 1;
+        while i < end && matches!(f[i], b'#' | b'0' | b'+' | b'-' | b' ') {
+            i += 1;
+        }
+        let mut good = true;
+        let indexed = go_arg_number(f, &mut i, &mut good);
+        let mut after_index = if i < end && f[i] == b'*' {
+            i += 1;
+            out.push_str("%!(BADWIDTH)");
+            false
+        } else {
+            let digits = i;
+            while i < end && f[i].is_ascii_digit() {
+                i += 1;
+            }
+            if indexed && i > digits {
+                good = false;
+            }
+            indexed
+        };
+        if i + 1 < end && f[i] == b'.' {
+            i += 1;
+            if after_index {
+                good = false;
+            }
+            after_index = go_arg_number(f, &mut i, &mut good);
+            if i < end && f[i] == b'*' {
+                i += 1;
+                out.push_str("%!(BADPREC)");
+                after_index = false;
+            } else {
+                while i < end && f[i].is_ascii_digit() {
+                    i += 1;
+                }
+            }
+        }
+        if !after_index {
+            go_arg_number(f, &mut i, &mut good);
+        }
+        let Some(verb) = format[i..].chars().next() else {
+            out.push_str("%!(NOVERB)");
+            break;
+        };
+        i += verb.len_utf8();
+        if verb == '%' {
+            out.push('%');
             continue;
         }
-        while chars.next_if(|c| "+-# 0".contains(*c)).is_some() {}
-        if chars.next_if_eq(&'*').is_some() {
-            out.push_str("%!(BADWIDTH)");
-        } else {
-            while chars.next_if(char::is_ascii_digit).is_some() {}
-        }
-        if chars.next_if_eq(&'.').is_some() {
-            if chars.next_if_eq(&'*').is_some() {
-                out.push_str("%!(BADPREC)");
-            } else {
-                while chars.next_if(char::is_ascii_digit).is_some() {}
-            }
-        }
-        match chars.next() {
-            None => out.push_str("%!(NOVERB)"),
-            Some('%') => out.push('%'),
-            Some(verb) => {
-                out.push_str("%!");
-                out.push(verb);
-                out.push_str("(MISSING)");
-            }
-        }
+        out.push_str("%!");
+        out.push(verb);
+        out.push_str(if good { "(MISSING)" } else { "(BADINDEX)" });
     }
     out
+}
+
+/// `argNumber` with no arguments: a `[n]` at `i` is stepped over (only its `[` when it is not
+/// `[digits]`), and since no argument has index `n` the verb is bad. Whether a well-formed index
+/// was found is returned.
+fn go_arg_number(f: &[u8], i: &mut usize, good: &mut bool) -> bool {
+    if f.get(*i) != Some(&b'[') {
+        return false;
+    }
+    *good = false;
+    let rest = &f[*i..];
+    if rest.len() < 3 {
+        *i += 1;
+        return false;
+    }
+    let Some(close) = rest.iter().position(|&b| b == b']') else {
+        *i += 1;
+        return false;
+    };
+    *i += close + 1;
+    close > 1 && rest[1..close].iter().all(u8::is_ascii_digit)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -572,6 +643,8 @@ enum Write<'a> {
 #[derive(Default)]
 struct Budget {
     sequence_elements: usize,
+    /// The most segments of any key's path, which bounds the document's depth.
+    deepest_path: usize,
 }
 
 /// `parsePropKey`.
@@ -621,6 +694,12 @@ fn apply_property(
     budget: &mut Budget,
 ) -> Result<(), String> {
     let path = property_path(key, array_brackets);
+    if path.len() > MAX_PATH_SEGMENTS {
+        return Err(format!(
+            "properties: key with more than {MAX_PATH_SEGMENTS} segments"
+        ));
+    }
+    budget.deepest_path = budget.deepest_path.max(path.len());
     if let Some(lines) = properties.comments.get(key) {
         let joined = lines.join("\n");
         let comment = if joined.is_empty() {
@@ -767,13 +846,19 @@ fn traverse(node: &mut Node, segment: &Segment, budget: &mut Budget) -> Result<V
             let len = items.len();
             if let Ok(target) = usize::try_from(index) {
                 if target >= len {
-                    budget.sequence_elements += target - len + 1;
-                    if budget.sequence_elements > MAX_SEQUENCE_ELEMENTS {
+                    // Checked before anything is counted, so a refused growth (whose error a
+                    // comment's assignment may swallow) leaves the budget as it was.
+                    let total = budget
+                        .sequence_elements
+                        .checked_add(target - len + 1)
+                        .filter(|&total| total <= MAX_SEQUENCE_ELEMENTS);
+                    let Some(total) = total else {
                         return Err(format!(
                             "Cannot grow array to {} elements",
                             target as u64 + 1
                         ));
-                    }
+                    };
+                    budget.sequence_elements = total;
                     items.resize_with(target + 1, || SeqItem {
                         comment: Box::default(),
                         value: Node::Null,
@@ -860,78 +945,120 @@ fn go_parse_int_error(s: &str) -> String {
 
 const STEP: &str = "  ";
 
-fn render_map(out: &mut String, entries: &[Entry], indent: &str) {
+/// The most text the rendered document may take: 1 GiB. A key of `n` segments writes `n` lines
+/// indented by up to `2n` spaces, so a short file of deep keys asks for gigabytes of text, which
+/// yq only builds if it prints the document; this refuses such a file instead.
+const MAX_RENDERED_BYTES: usize = 1 << 30;
+
+/// The rendered text, and whether the next line's indent is already written: a collection after a
+/// `- ` or an explicit key's `: ` starts on that line.
+struct Out {
+    text: String,
+    skip_indent: bool,
+}
+
+impl Out {
+    fn indent(&mut self, indent: &str) {
+        if self.skip_indent {
+            self.skip_indent = false;
+        } else {
+            self.text.push_str(indent);
+        }
+    }
+
+    fn check_size(&self) -> Result<(), String> {
+        if self.text.len() > MAX_RENDERED_BYTES {
+            return Err(String::from(
+                "properties: the document is too large to read (over 1 GiB as YAML)",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// `entries` at `depth`; `spaces` is long enough for one level past the deepest node, so every
+/// indent is a slice of it.
+fn render_map(out: &mut Out, entries: &[Entry], spaces: &str, depth: usize) -> Result<(), String> {
+    let indent = &spaces[..STEP.len() * depth];
+    let child = &spaces[..STEP.len() * (depth + 1)];
     for entry in entries {
         render_comment(out, &entry.comment, indent);
-        let child = format!("{indent}{STEP}");
+        out.indent(indent);
         if go_yaml_key_is_simple(&entry.key) {
-            out.push_str(indent);
-            out.push_str(&string_scalar(&entry.key, &child, true));
-            out.push(':');
+            out.text.push_str(&string_scalar(&entry.key, child, true));
+            out.text.push(':');
             match &entry.value {
                 Node::Map(children) if !children.is_empty() => {
-                    out.push('\n');
-                    render_map(out, children, &child);
+                    out.text.push('\n');
+                    render_map(out, children, spaces, depth + 1)?;
                 }
                 Node::Seq(children) if !children.is_empty() => {
-                    out.push('\n');
-                    render_seq(out, children, &child);
+                    out.text.push('\n');
+                    render_seq(out, children, spaces, depth + 1)?;
                 }
                 value => {
-                    out.push(' ');
-                    render_inline(out, value, indent);
+                    out.text.push(' ');
+                    render_inline(out, value, child);
                 }
             }
         } else {
             // go-yaml's `? ` explicit key, for a key with a line break or over 128 bytes.
-            out.push_str(indent);
-            out.push_str("? ");
-            out.push_str(
-                &go_yaml_explicit_key_scalar(&entry.key, &child, STEP.len())
-                    .unwrap_or_else(|| string_scalar(&entry.key, &child, true)),
+            out.text.push_str("? ");
+            out.text.push_str(
+                &go_yaml_explicit_key_scalar(&entry.key, child, STEP.len())
+                    .unwrap_or_else(|| string_scalar(&entry.key, child, true)),
             );
-            out.push('\n');
-            out.push_str(indent);
-            out.push_str(": ");
-            render_compact(out, &entry.value, indent);
+            out.text.push('\n');
+            out.text.push_str(indent);
+            out.text.push_str(": ");
+            render_compact(out, &entry.value, spaces, depth)?;
         }
+        out.check_size()?;
     }
+    Ok(())
 }
 
-fn render_seq(out: &mut String, items: &[SeqItem], indent: &str) {
+fn render_seq(out: &mut Out, items: &[SeqItem], spaces: &str, depth: usize) -> Result<(), String> {
+    let indent = &spaces[..STEP.len() * depth];
     for item in items {
         render_comment(out, &item.comment, indent);
-        out.push_str(indent);
-        out.push_str("- ");
-        render_compact(out, &item.value, indent);
+        out.indent(indent);
+        out.text.push_str("- ");
+        render_compact(out, &item.value, spaces, depth)?;
+        out.check_size()?;
     }
+    Ok(())
 }
 
-/// A node written after a `- ` or an explicit key's `: ` at `indent`: a non-empty collection
-/// starts on the same line, its first line's indent replaced by the indicator.
-fn render_compact(out: &mut String, value: &Node, indent: &str) {
-    let child = format!("{indent}{STEP}");
-    let mut nested = String::new();
+/// A node written after a `- ` or an explicit key's `: ` at `depth`: a non-empty collection
+/// starts on the same line, one level deeper.
+fn render_compact(out: &mut Out, value: &Node, spaces: &str, depth: usize) -> Result<(), String> {
     match value {
-        Node::Map(children) if !children.is_empty() => render_map(&mut nested, children, &child),
-        Node::Seq(children) if !children.is_empty() => render_seq(&mut nested, children, &child),
+        Node::Map(children) if !children.is_empty() => {
+            out.skip_indent = true;
+            render_map(out, children, spaces, depth + 1)
+        }
+        Node::Seq(children) if !children.is_empty() => {
+            out.skip_indent = true;
+            render_seq(out, children, spaces, depth + 1)
+        }
         value => {
-            render_inline(out, value, indent);
-            return;
+            render_inline(out, value, &spaces[..STEP.len() * (depth + 1)]);
+            Ok(())
         }
     }
-    out.push_str(&nested[child.len()..]);
 }
 
-/// A scalar, or an empty collection, written in place, with its line break.
-fn render_inline(out: &mut String, value: &Node, indent: &str) {
+/// A scalar, or an empty collection, written in place, with its line break; `block_indent` is the
+/// indent of a literal block's lines.
+fn render_inline(out: &mut Out, value: &Node, block_indent: &str) {
     match value {
-        Node::Null => out.push_str("null"),
-        Node::Str(s) => out.push_str(&string_scalar(s, &format!("{indent}{STEP}"), false)),
-        Node::Map(_) => out.push_str("{}"),
-        Node::Seq(_) => out.push_str("[]"),
+        Node::Null => out.text.push_str("null"),
+        Node::Str(s) => out.text.push_str(&string_scalar(s, block_indent, false)),
+        Node::Map(_) => out.text.push_str("{}"),
+        Node::Seq(_) => out.text.push_str("[]"),
     }
-    out.push('\n');
+    out.text.push('\n');
 }
 
 /// `s` as go-yaml writes a string with no style of its own; `block_indent` is the indent of a
@@ -944,23 +1071,24 @@ fn string_scalar(s: &str, block_indent: &str, is_key: bool) -> String {
 
 /// A head comment as go-yaml writes it: each line `# ` and the text, or the text as it is when it
 /// already starts with `#`, and an empty line as a blank one; a final line break ends the last
-/// line rather than adding one.
-fn render_comment(out: &mut String, comment: &str, indent: &str) {
+/// line rather than adding one. The first line is never empty (it starts `# `), so a pending
+/// compact indent is always taken by a written line.
+fn render_comment(out: &mut Out, comment: &str, indent: &str) {
     if comment.is_empty() {
         return;
     }
     let comment = comment.strip_suffix('\n').unwrap_or(comment);
     for line in comment.split('\n') {
         if line.is_empty() {
-            out.push('\n');
+            out.text.push('\n');
             continue;
         }
-        out.push_str(indent);
+        out.indent(indent);
         if !line.starts_with('#') {
-            out.push_str("# ");
+            out.text.push_str("# ");
         }
-        out.push_str(line);
-        out.push('\n');
+        out.text.push_str(line);
+        out.text.push('\n');
     }
 }
 
@@ -1027,6 +1155,60 @@ mod tests {
         assert_eq!(
             yaml("a=${b}\nb=${a}%d").unwrap_err(),
             "circular reference in:\na=${b}\nb=${a}%!d(MISSING)\n"
+        );
+    }
+
+    #[test]
+    fn go_format_argument_indexes_are_bad_6925_review() {
+        for (input, message) in [
+            ("=%[1]d", r#"properties: Line 1: "%!d(BADINDEX)""#),
+            (
+                "=%-*.*[2]x",
+                r#"properties: Line 1: "%!(BADWIDTH)%!(BADPREC)%!x(BADINDEX)""#,
+            ),
+            ("=%[1", r#"properties: Line 1: "%!"(BADINDEX)"#),
+            ("=%.", r#"properties: Line 1: "%!"(MISSING)"#),
+        ] {
+            assert_eq!(yaml(input).unwrap_err(), message, "{input:?}");
+        }
+    }
+
+    /// Review of #6925: a refused growth, whose error a comment swallows, counts nothing, and an
+    /// index past `usize` is refused rather than wrapping the count.
+    #[test]
+    fn a_refused_growth_leaves_the_budget_alone_6925_review() {
+        assert_eq!(
+            yaml("e.0=a\n# c\ne.0x1000001=b\nf.1=c\n").unwrap(),
+            "e:\n  - a\nf:\n  - null\n  - c\n"
+        );
+        assert_eq!(
+            yaml("e.0=a\n# c\ne.0x7fffffffffffffff=b\n# c\ne.0x3fffffffffffffff=b\ne.0x4000000000000005=z\n")
+                .unwrap_err(),
+            "Cannot grow array to 4611686018427387910 elements"
+        );
+    }
+
+    /// Review of #6925: the expansion check is charged for what it substitutes in, so many
+    /// references to an empty value are read, and a key is refused past its segment bound.
+    #[test]
+    fn expansion_and_depth_bounds_6925_review() {
+        let many = format!("e=\nv={}", "${e}".repeat(30_000));
+        assert_eq!(
+            yaml(&many).unwrap(),
+            "e: \"\"\nv: ${e}".to_string() + &"${e}".repeat(29_999) + "\n"
+        );
+        let deep = format!("{}=1", vec!["a"; MAX_PATH_SEGMENTS + 1].join("."));
+        assert_eq!(
+            yaml(&deep).unwrap_err(),
+            "properties: key with more than 10000 segments"
+        );
+        let doubling: String = (0..40)
+            .map(|i| format!("k{i}=${{k{}}}${{k{}}}\n", i + 1, i + 1))
+            .collect::<String>()
+            + &format!("k40={}\n", "x".repeat(1024));
+        assert_eq!(
+            yaml(&doubling).unwrap_err(),
+            "properties: ${...} expansion too large to check"
         );
     }
 

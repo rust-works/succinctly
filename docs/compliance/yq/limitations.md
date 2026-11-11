@@ -7758,8 +7758,13 @@ These rows differ:
 - Blank lines that end a comment block are dropped, and two or more inside one are one, as yq itself reads the YAML it prints for them; yq's props decoder keeps them in the node.
 - A key with a line break is printed in double quotes (`"a\nb": x`), where yq prints the `? |-` explicit-key form; that is how a YAML input's `? |-` key prints here too.
 - `--front-matter` with an explicit `-p props` is refused, where yq decodes the front matter as props; on a file picked by its extension the front matter is read as YAML.
-- An index that would pad the sequences of one document past 2^24 elements is refused (`Cannot grow array to N elements`), where yq allocates some 545 bytes for every padded `null` until it runs out of memory, and the `${key}` check stops past 256 MiB of expanded text, where yq would expand a chain that doubles at each link without end.
+- An index that would pad the sequences of one document past 2^24 elements is refused (`Cannot grow array to N elements`), where yq allocates some 545 bytes for every padded `null` until it runs out of memory, and the `${key}` check stops once it has substituted 16 MiB, where yq would expand a chain that doubles at each link without end.
 - `-o props` writes no comment, as for any input (the `-o props` section above).
+- The first property's comment opens the YAML text, so it is read as the document's head comment, where yq assigns it to that key: `del(.a)` on `# top` / `a=1` keeps `# top` here and drops it in yq, and `. | head_comment` is `top` here and empty in yq.
+- A key printed in the `? ` explicit-key form (over 128 bytes) whose value is a mapping loses the comment above that mapping's first key.
+- A key glob that a comment renames into two keys spelled alike (`abc=1`, `abd=2`, `# c`, `ab*=9`) prints as yq does, but a lookup reads both keys here (`.["ab*"]` is `9` in yq and `9` twice here), where yq matches one key per spelling.
+- A comment holding U+0085, U+2028 or U+2029 is written as one line; go-yaml's emitter breaks the line there.
+- A sequence nested directly in a sequence more than 128 deep (`0.0.0...=x`) stops with the YAML reader's `nesting depth exceeds limit of 128`, and a key of more than 10,000 segments, or a document whose YAML text passes 1 GiB, is refused; yq reads all three, since it never writes the text.
 
 ### `-o=xml` — comments, a source spelling and an empty document are not read (#6924)
 
