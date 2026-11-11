@@ -84,6 +84,9 @@ mod eval;
 pub mod eval_generic;
 mod expr;
 mod glob;
+mod go_base64;
+#[doc(hidden)]
+pub use go_base64::{go_base64_decode, GoBase64Error};
 mod go_print;
 #[cfg(feature = "regex")]
 mod go_regex;

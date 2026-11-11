@@ -1057,22 +1057,12 @@ impl EvalError {
         Self::new(format!("{} is not valid base64 data", describe(value)))
     }
 
-    /// `illegal base64 data at input byte N` (#1146).
-    ///
-    /// Raised by `@base64d` (yq mode only) for *any* decode failure --
-    /// invalid character or a too-short trailing group alike. Unlike jq's
-    /// two-message split ([`Self::base64_invalid_data`]/
-    /// [`Self::base64_trailing_byte`]), real yq (v4.53.3, live-verified)
-    /// uses one uniform, byte-position-based message for every base64
-    /// decode error, with no jq analogue -- hence [`Self::new`] directly,
-    /// following this module's own convention for jq-less wording. `pos`
-    /// is a 0-indexed byte offset into the string actually fed to the
-    /// decoder (post leading/trailing-whitespace trim, since yq trims
-    /// before decoding) -- confirmed live: an input with 2 leading spaces
-    /// reports the identical position as the same input with none, so the
-    /// position is relative to the *trimmed* string, not the original.
-    pub fn base64_illegal_data(pos: usize) -> Self {
-        Self::new(format!("illegal base64 data at input byte {pos}"))
+    /// yq's `@base64d` refusal (#1146, #6997): Go's base64 decoder's own message,
+    /// `illegal base64 data at input byte N` or `unexpected EOF` (see
+    /// [`super::go_base64::GoBase64Error`] for what `N` counts). Unlike jq's two-message split
+    /// ([`Self::base64_invalid_data`]/[`Self::base64_trailing_byte`]), it names no value.
+    pub fn go_base64(error: super::go_base64::GoBase64Error) -> Self {
+        Self::new(format!("{error}"))
     }
 
     /// `invalid URL escape "<escape>"` (#1138).
