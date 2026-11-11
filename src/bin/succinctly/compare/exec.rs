@@ -149,7 +149,7 @@ struct Ended<O> {
 
 /// Spawn `tool` with the fixed environment, feed it `stdin`, hand its stdout to `read_out` on its
 /// own thread, and kill it at `deadline`.
-fn run_with<O: Send + 'static>(
+fn run_with<O: Default + Send + 'static>(
     tool: &Tool,
     args: &[String],
     stdin: impl AsRef<[u8]>,
@@ -157,10 +157,7 @@ fn run_with<O: Send + 'static>(
     deadline: Duration,
     env: &[(String, String)],
     read_out: impl FnOnce(std::process::ChildStdout) -> O + Send + 'static,
-) -> Result<Ended<O>>
-where
-    O: Default,
-{
+) -> Result<Ended<O>> {
     let mut child = Command::new(&tool.program)
         .args(&tool.prefix)
         .args(args)

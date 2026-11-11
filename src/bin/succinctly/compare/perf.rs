@@ -328,7 +328,7 @@ pub struct RunEnd {
 
 impl RunEnd {
     fn of(e: &ExecDigest) -> Self {
-        RunEnd {
+        Self {
             exit: e.exit,
             signal: e.signal,
             timed_out: e.timed_out,
@@ -336,7 +336,7 @@ impl RunEnd {
     }
 
     fn of_status(status: &std::process::ExitStatus) -> Self {
-        RunEnd {
+        Self {
             exit: status.code(),
             signal: signal_of(status),
             timed_out: false,
@@ -1768,9 +1768,8 @@ mod tests {
     #[test]
     fn a_tool_killed_on_a_huge_row_is_an_incomplete_row_with_its_signal() {
         let (dir, q, input) = huge_setup("huge-killed");
-        let (subject, reference) = (sh("sub", "kill -9 $$"), sh("ref", "echo ok"));
         let row = run_row_over(
-            &[subject, reference],
+            &[sh("sub", "kill -9 $$"), sh("ref", "echo ok")],
             &q,
             Some(&input),
             &dir,
