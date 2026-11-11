@@ -3,8 +3,8 @@
 [Home](../../) > [Docs](../) > [Guides](./) > Choosing between jq and `succinctly jq`
 
 `succinctly jq` is faster than jq 1.7.1 on most large inputs, and slower on a few shapes that are common. The single
-number in the README (a geomean over every timed row) hides that, because 50 of the 221 timed rows are `identity` or
-`identity_compact` over documents of several shapes, which is `succinctly jq`'s strongest case. This page says where each tool is the better
+number in the README (a geomean over every timed row) hides that, because it counts 50 `identity` and `identity_compact`
+rows of 221, over documents of several shapes, which is `succinctly jq`'s strongest case. This page says where each tool is the better
 choice, and ties every claim to the rows of the committed comparison reports that back it:
 
 - [Linux x86_64, AMD Ryzen 9 7950X](../compare/jq-linux-x86_64.md)
@@ -26,7 +26,7 @@ regenerated and a claim stops holding: change the claim, or the advice, in the s
 | One document of 1 MB or more: filter, reformat, pretty-print   | `succinctly jq`                              | 2x to 15x faster, in a fraction of jq's memory                                    |
 | `first`, `limit`, `.[0]` of a large document                   | `succinctly jq`                              | stops reading early: 5x to 7x at 100 MB                                           |
 | Regex or case mapping over large strings                       | `succinctly jq`                              | up to 52x                                                                         |
-| Many short invocations, or documents under about 100 KB        | jq                                           | process startup is jq's; no measurable gain                                       |
+| Many short invocations, or documents under about 100 KB        | jq                                           | startup is jq's (0.67x to 0.93x); no gain on most small documents                 |
 | A stream of many values (NDJSON, `--seq`)                      | depends                                      | faster for `.`, same speed for most filters, but the whole file is held in memory |
 | `--seq` output, or `input` / `inputs` taken once and abandoned | jq                                           | `succinctly jq` is slower                                                         |
 | Strict RFC 8259 input                                          | either, with `--validate` on `succinctly jq` | neither is strict by default                                                      |
@@ -36,7 +36,8 @@ regenerated and a claim stops holding: change the claim, or the advice, in the s
 ## By category
 
 The geomean of the speedup over every timed row of a group (all input sizes), per platform. The grouping is the one the
-test uses, by query name, so a reader can recompute it from the report.
+test uses, by query name, so a reader can recompute it from the report. The groups cover most rows and not all of them
+(the slurp, raw-file and `tojson` round-trip rows are in none).
 
 <!-- claim: category-pass-through -->
 <!-- claim: category-navigation -->
@@ -84,6 +85,7 @@ M4 Pro. Rows: `users_first_early_exit`, `users_limit_early_exit`.
 ### The work is a regex or a case mapping over long strings
 
 <!-- claim: strings-upcase -->
+<!-- claim: regex-gsub-large -->
 
 `strings_upcase` (`ascii_upcase`) is 37x to 47x faster on the 7950X and 32x to 52x on the M4 Pro across 1 MB to 100 MB.
 Regex over large strings is where jq can fail outright: `regex-gsub-large` times out on jq and completes on
@@ -96,8 +98,9 @@ Regex over large strings is where jq can fail outright: `regex-gsub-large` times
 <!-- claim: startup -->
 
 The `startup` row (`jq -n 1`) is 0.93x on the 7950X and 0.67x on the M4 Pro: jq starts faster. The `corpus_*` rows, real
-documents of a few KB to 100 KB, are a wash on the 7950X (0.81x to 2.5x) and in jq's favour on the M4 Pro (`corpus_tabular_group` is
-0.81x on the 7950X and 0.72x). A shell loop that starts the tool a thousand times pays that difference a thousand times.
+documents of a few KB to 100 KB, run from 0.81x to 2.5x on the 7950X (jq is faster on the object-heavy ones: `corpus_tabular_group`
+is 0.81x) and from 0.63x to 3.0x on the M4 Pro (`corpus_tabular_group` is 0.72x, and mostly the pretty-printed ones, with `corpus_geojson_points`,
+favour `succinctly jq`). A shell loop that starts the tool a thousand times pays that difference a thousand times.
 
 ### The input is a long stream of small values
 

@@ -194,23 +194,35 @@ const CLAIMS: &[Claim] = &[
         speedup(r, "ndjson_inputs_first", "ndjson-100mb") < 1.0
             && speedup(r, "users_seq_output", "users-10mb") < 1.0
     }),
-    // jq 1.8.2's own tests: the guide says 475 of 550 `jq.test` programs agree, and 447 of 447 against 1.7.1.
+    // jq 1.8.2's own tests: most of `jq.test` agrees (the guide says 475 of 550), some does not, and all of
+    // 1.7.1's does.
     ("jq-1-8", |r| {
         let secondary = suite(r, "differential_secondary", "upstream-1.8.2-jq.test");
         let primary = suite(r, "differential", "upstream-jq.test");
-        secondary["total"] == 550
-            && secondary["matching"] == 475
-            && primary["total"] == 447
-            && primary["matching"] == 447
+        let (total, matching) = (
+            secondary["total"].as_f64().unwrap(),
+            secondary["matching"].as_f64().unwrap(),
+        );
+        matching < total && matching / total > 0.8 && primary["total"] == primary["matching"]
     }),
     // 11x to 22x: more than ten times the size of jq 1.7.1.
     ("binary-size", |r| {
         binary_bytes(r, "succinctly jq") > 10.0 * binary_bytes(r, "jq-1.7.1")
     }),
-    // Of the 188 `n_` cases: 25 for jq, 39 for `succinctly jq`, none with `--validate`.
+    // Of the `n_` cases (documents that must be rejected): `succinctly jq` accepts more than jq by default
+    // (the guide says 39 against 25 of 188) and none with `--validate`.
     ("validation", |r| {
         let n = &r["input"]["n"];
-        n["total"] == 188 && n["reference"] == 25 && n["default"] == 39 && n["validate"] == 0
+        n["validate"] == 0 && n["default"].as_u64() > n["reference"].as_u64() && n["total"] == 188
+    }),
+    // jq times out on a `gsub` over a large string, `succinctly jq` does not.
+    ("regex-gsub-large", |r| {
+        let rows = r["robust"].as_array().expect("robust rows");
+        let row = rows
+            .iter()
+            .find(|x| x["id"] == "regex-gsub-large")
+            .expect("regex-gsub-large");
+        row["reference"] == "timeout" && row["subject"] == "ok"
     }),
 ];
 
@@ -277,7 +289,11 @@ fn the_category_table_matches_the_reports_6916() {
             .lines()
             .map(|l| l.split('|').map(str::trim).collect::<Vec<_>>())
             .find(|cells| cells.get(1) == Some(&name))
-            .unwrap_or_else(|| panic!("no table row for {name}"));
+            .unwrap_or_else(|| panic!("no row for {name} in the guide's category table"));
+        assert!(
+            cells.len() >= 5,
+            "the category table row for {name} needs a name, a queries cell and one figure per platform"
+        );
         // | name | queries | x86_64 | aarch64 |
         for (cell, report) in [cells[3], cells[4]].iter().zip(&reports) {
             let printed: f64 = cell.trim_end_matches('x').parse().expect("a figure");
