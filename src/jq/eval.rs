@@ -17709,6 +17709,11 @@ fn yq_timestamp_refusal(
     Some(Err(EvalError::new(yq_mul_div_mod_message(op, left, right))))
 }
 
+/// Whether `value` is a sequence or a mapping, the kinds yq's arithmetic errors name with a key.
+fn is_container(value: &OwnedValue) -> bool {
+    matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_))
+}
+
 /// yq's wording for `*`, `/` and `%` over two kinds that do not combine (`cannot multiply !!int
 /// with !!seq`, `!!float cannot be divided by !!null`, `!!int cannot modulo by !!str`), shared by
 /// the timestamp refusal above and [`arith_type_error`] (#6904).
@@ -17721,9 +17726,7 @@ fn yq_mul_div_mod_message(op: ArithOp, left: &OwnedValue, right: &OwnedValue) ->
     match op {
         ArithOp::Mul(_) => format!("cannot multiply {left_tag} with {right_tag}"),
         _ => {
-            let container =
-                |value: &OwnedValue| matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_));
-            let keyed = left.is_null() || container(left) || container(right);
+            let keyed = left.is_null() || is_container(left) || is_container(right);
             let (left_key, right_key) = if keyed { (" ()", " ()") } else { ("", "") };
             let verb = if matches!(op, ArithOp::Div) {
                 "cannot be divided by"
@@ -17759,18 +17762,16 @@ fn arith_type_error<S: EvalSemantics>(
     if S::TAG != EvalTag::Yq {
         return EvalError::binary_op(left, right, op);
     }
-    let container =
-        |value: &OwnedValue| matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_));
     let (left_tag, right_tag) = (yq_operand_tag(left), yq_operand_tag(right));
     EvalError::new(match op {
-        BinOp::Add if container(left) || container(right) => {
+        BinOp::Add if is_container(left) || is_container(right) => {
             format!("{right_tag} () cannot be added to a {left_tag} ()")
         }
         BinOp::Add => format!("{left_tag} cannot be added to {right_tag}"),
         BinOp::Subtract if matches!(left, OwnedValue::Object(_)) => {
             "maps not yet supported for subtraction".to_string()
         }
-        BinOp::Subtract if matches!(left, OwnedValue::Array(_)) || container(right) => {
+        BinOp::Subtract if matches!(left, OwnedValue::Array(_)) || is_container(right) => {
             format!("{right_tag} () cannot be subtracted from {left_tag}")
         }
         BinOp::Subtract => format!("{left_tag} cannot be added to {right_tag}"),

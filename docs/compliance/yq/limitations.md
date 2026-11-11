@@ -4178,7 +4178,7 @@ Every row of the issue is pinned against yq v4.53.3 in `tests/yq_cli/i5863.rs`, 
 - An arithmetic operator over two kinds that do not combine words its error as yq does since #6904, in yq mode (`!!float cannot be added to !!null`, `!!seq () cannot be added to a !!float (f)`, `cannot multiply !!int with !!seq`, `!!float cannot be divided by !!null`, `!!int cannot modulo by !!str`, and yq's `-` over two scalars, `!!int cannot be added to !!str`, as it prints it).
   jq mode keeps jq's `number (1.5) and null (null) cannot be added`.
   A key yq writes in parentheses after a tag is `()` here whenever the operand is a container or the other operand of a container (`+`, `-`, `/`, `%`): a value carries no key, so `.f + .l` is `!!seq () cannot be added to a !!float ()` where yq says `!!seq (l) ... !!float (f)`.
-  A computed or literal operand has no key in yq either, so those rows agree exactly.
+  A literal operand has no key in yq either, so those rows agree exactly.
   Only the message differs; the error and the exit status are the same.
 - A quoted date times a number (`"2026-01-01T00:00:00Z" * 2`) is yq's string repetition and raises here, since the text stands in for the tag, as above.
 - `tz("Europe")` and `tz("zone.tab")` (a directory and a file that is not a zone) raise a different message here (`is a directory`, `malformed time zone information`) from yq's.
@@ -6455,7 +6455,7 @@ $ echo $?
   | `{"a": 1, "b"}`, `{"z": (1,2), 5}`               | `CollectObject: mismatching node sizes` error   |
   | `[[{"k":1}]] as $a \| {$a}`                     | `k: 1`                                          |
   | `[{"k":1}] as $a \| {$a}`                       | `1`                                             |
-  | `[{"k":1}] as $a \| {"z": 0, $a}`               | error (`{z: 0} * 1` cannot be multiplied)       |
+  | `[{"k":1}] as $a \| {"z": 0, $a}`               | error (`cannot multiply !!map with !!int`)      |
 
   yq evaluates every entry before combining any, so an error inside one entry aborts the whole
   construction with no prefix, unlike jq's streaming fan-out.
@@ -6528,9 +6528,9 @@ Residual divergences remain, all in cases yq itself reaches through its node mod
   group with a `:` at its own level is tried (a parenthesised key, a slice and a string are not),
   and a failed attempt parses the text again, so a parse draws on a budget of 256 attempts; past
   it a group is parsed as the parenthesised expression it is.
-- **The `*` error text.** The error a failed multiply raises is succinctly's usual
-  `object (...) and number (1) cannot be multiplied`, not yq's `cannot multiply !!map with
-  !!int`; the exit status agrees (a message-only divergence shared with every other `*`).
+- **The `*` error text.** The error a failed multiply raises is yq's `cannot multiply !!map with
+  !!int` (#6904), the same as every other `*`; it was succinctly's `object (...) and number (1)
+  cannot be multiplied` until then.
 
 ### `envsubst` ([#4872](https://github.com/rust-works/succinctly/issues/4872))
 
@@ -6551,8 +6551,8 @@ commas, `select(f) | ...`, a navigation in front of an assignment, and a binding
 (`.b as $v | .z = $v`, whose source is evaluated and whose body contributes its changes). A
 value-producing stage is evaluated and its value discarded, as in yq, so its *error* counts
 (`#4327`): `{"a":{"b":1}} | with(.a; . + 1)` fails in yq (`!!int () cannot be added to a !!map
-(a)`) and here (`object ({"b":1}) and number (1) cannot be added`; the wording is the general
-arithmetic-error difference, not specific to `with`). A third or later argument is accepted and
+(a)`) and here (`!!int () cannot be added to a !!map ()`; the key in parentheses is the general
+arithmetic-error difference recorded above, not specific to `with`). A third or later argument is accepted and
 ignored, with only the path evaluated, and the input comes back untouched, as yq does
 (`with(.a; . = 1; 2)`). Still different: a stage after a discarded value-producing stage is not
 evaluated (yq runs it on the discarded value); `(.b = 2) as $x | .c = $x` (a binding whose
