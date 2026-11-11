@@ -3919,30 +3919,35 @@ impl CommentTree {
         Self::Leaf(MetaBox::empty())
     }
 
-    /// Replace this tree by the one-word [`Self::empty`] when it says nothing, and return whether
-    /// it did (#6880). The builder calls this on each child as soon as it is finished, so a
-    /// subtree with nothing to carry is never held: a node is silent when it has no comment,
-    /// style, anchor, head or foot line, tag or spelling, no key metadata, and every child is
-    /// already the empty leaf. A silent child that was not collapsed first counts as one that
-    /// says something, which only costs the saving.
+    /// Replace this tree by the one-word [`Self::empty`] when it says nothing (#6880). The builder
+    /// calls this on each child as soon as it is finished, so a subtree with nothing to carry is
+    /// never held. A node is silent when it has no comment, style, anchor, head or foot line, tag
+    /// or spelling, no key metadata, and every child is already the empty leaf; a silent child
+    /// that was not collapsed first counts as one that says something, which only costs the
+    /// saving.
     ///
     /// The empty tree answers every read as the silent subtree did ([`Self::field`] and
     /// [`Self::at_index`] fall back to it, [`Self::meta`] is the empty metadata). What it cannot
     /// stand in for is a tree something is written into by position, or one that is matched by
     /// its shape (`Object`, `Array`): see the gate in `yq_runner.rs`.
-    pub fn collapse_if_silent(&mut self) -> bool {
-        let is_silent_leaf = |tree: &Self| matches!(tree, Self::Leaf(meta) if meta.is_empty());
+    fn collapse_if_silent(&mut self) {
         let silent = match self {
-            Self::Leaf(meta) => return meta.is_empty(),
-            Self::Array(meta, items) => meta.is_empty() && items.iter().all(is_silent_leaf),
+            Self::Leaf(_) => return,
+            Self::Array(meta, items) => meta.is_empty() && items.iter().all(Self::is_silent_leaf),
             Self::Object(meta, fields, keys) => {
-                meta.is_empty() && keys.is_empty() && fields.values().all(is_silent_leaf)
+                meta.is_empty() && keys.is_empty() && fields.values().all(Self::is_silent_leaf)
             }
         };
         if silent {
             *self = Self::empty();
         }
-        silent
+    }
+
+    /// Whether this is a leaf that says nothing: what a scalar with no comment, style, anchor, tag
+    /// or spelling is, and what a collapsed silent subtree is held as (#6880). The one definition
+    /// the builder's collapse and the write's reconcile shortcut both use.
+    pub fn is_silent_leaf(&self) -> bool {
+        matches!(self, Self::Leaf(meta) if meta.is_empty())
     }
 
     /// A node with no children and `meta` for its own metadata.
@@ -4226,7 +4231,7 @@ pub fn to_owned_with_comments<V: DocumentValue, S: EvalSemantics>(
     value: &V,
     cursor: Option<&V::Cursor>,
 ) -> Result<(OwnedValue, CommentTree), EvalError> {
-    to_owned_with_comments_impl::<_, S>(value, cursor, false)
+    to_owned_with_comments_impl::<_, S>(value, cursor, SilentSubtrees::Keep)
 }
 
 /// [`to_owned_with_comments`], with one word for each subtree that says nothing (#6880).
@@ -4239,13 +4244,24 @@ pub fn to_owned_with_comments_pruned<V: DocumentValue, S: EvalSemantics>(
     value: &V,
     cursor: Option<&V::Cursor>,
 ) -> Result<(OwnedValue, CommentTree), EvalError> {
-    to_owned_with_comments_impl::<_, S>(value, cursor, true)
+    to_owned_with_comments_impl::<_, S>(value, cursor, SilentSubtrees::Collapse)
+}
+
+/// Whether [`to_owned_with_comments_at_depth`] holds the empty tree for a subtree that says
+/// nothing instead of a node per node of it (#6880). An enum rather than a `bool`, next to
+/// `under_alias`, so the two cannot be transposed at a call site and still compile.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SilentSubtrees {
+    /// A node for every node of the document.
+    Keep,
+    /// The empty tree for each subtree that says nothing, collapsed as the walk finishes it.
+    Collapse,
 }
 
 fn to_owned_with_comments_impl<V: DocumentValue, S: EvalSemantics>(
     value: &V,
     cursor: Option<&V::Cursor>,
-    prune_silent: bool,
+    silent: SilentSubtrees,
 ) -> Result<(OwnedValue, CommentTree), EvalError> {
     let (v, mut comments) = to_owned_with_comments_at_depth::<_, S>(
         value,
@@ -4253,9 +4269,9 @@ fn to_owned_with_comments_impl<V: DocumentValue, S: EvalSemantics>(
         0,
         false,
         HeadFootRead::Own,
-        prune_silent,
+        silent,
     )?;
-    if prune_silent {
+    if silent == SilentSubtrees::Collapse {
         comments.collapse_if_silent();
     }
     if let Some(c) = cursor {
@@ -4414,9 +4430,9 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
     depth: usize,
     under_alias: bool,
     head_foot_read: HeadFootRead,
-    // Collapse each child's tree to the empty one when it says nothing (#6880), after the
-    // comments that belong to it have been attached.
-    prune_silent: bool,
+    // Whether each child's tree is collapsed to the empty one when it says nothing (#6880),
+    // after the comments that belong to it have been attached.
+    silent: SilentSubtrees,
 ) -> Result<(OwnedValue, CommentTree), EvalError> {
     guard_nesting_depth(depth)?;
     // The raw (`#`-prefixed) form, not the stripped `line_comment` builtin
@@ -4569,7 +4585,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
                 depth + 1,
                 field_under_alias,
                 HeadFootRead::SkippedForMappingValue,
-                prune_silent,
+                silent,
             )?;
             if field.key_cursor.document_has_standalone_comments() {
                 let field_head = field.key_cursor.head_comment_raw();
@@ -4578,7 +4594,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
                     *c.meta_mut() = c.meta().with_head_foot(field_head, field_foot);
                 }
             }
-            if prune_silent {
+            if silent == SilentSubtrees::Collapse {
                 c.collapse_if_silent();
             }
             map.push::<S>(key.clone(), v);
@@ -4703,7 +4719,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
                 depth + 1,
                 child_under_alias,
                 HeadFootRead::Own,
-                prune_silent,
+                silent,
             )?;
             // #4231: `- # note` before a value on the next line. Collapsed after it, which
             // keys on the tree lining up with its value.
@@ -4711,7 +4727,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
                 Some(comment) if !child_under_alias => attach_dash_comment(c, &v, comment),
                 _ => c,
             };
-            if prune_silent {
+            if silent == SilentSubtrees::Collapse {
                 c.collapse_if_silent();
             }
             items.push(v);
