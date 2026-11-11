@@ -612,7 +612,8 @@ fn row_ratio(x: &PerfRow, v: Option<f64>) -> String {
 }
 
 fn perf_sections(s: &mut String, r: &Results) {
-    if r.perf.is_empty() {
+    // A run of only stdin rows (`--query _stdin`) has an empty `perf`, and still reports.
+    if r.perf.is_empty() && r.perf_stdin.is_empty() {
         return;
     }
     let _ = writeln!(
@@ -710,7 +711,13 @@ fn perf_sections(s: &mut String, r: &Results) {
         );
     }
     memory_section(s, &timed);
-    instruction_section(s, &timed);
+    // The stdin rows' instruction counts (`--cachegrind`) are listed beside the file rows'.
+    let counted: Vec<&PerfRow> = timed
+        .iter()
+        .copied()
+        .chain(r.perf_stdin.iter().filter(|x| x.speedup_primary.is_some()))
+        .collect();
+    instruction_section(s, &counted);
     stdin_section(s, &r.perf, &r.perf_stdin);
 }
 
@@ -765,7 +772,11 @@ fn stdin_section(s: &mut String, file_rows: &[PerfRow], stdin_rows: &[PerfRow]) 
          memory of separate untimed runs, as above.\n"
     );
     if pairs.is_empty() {
-        let _ = writeln!(s, "No stdin row was timed in this run.\n");
+        let _ = writeln!(
+            s,
+            "No stdin row could be set beside a timed file row in this run (its output differed, or the \
+             file row it pairs with was not run).\n"
+        );
         return;
     }
     let _ = writeln!(
@@ -811,11 +822,12 @@ fn stdin_section(s: &mut String, file_rows: &[PerfRow], stdin_rows: &[PerfRow]) 
     );
     let kb = |v: Option<u64>| v.map_or_else(|| "n/a".into(), |v| v.to_string());
     for (f, x) in &pairs {
-        for (i, name) in [(1, "jq 1.7.1"), (0, "succinctly")] {
+        for i in [1, 0] {
             let (Some(a), Some(b)) = (f.tools.get(i), x.tools.get(i)) else {
                 continue;
             };
             let r = |v: Option<u64>, w: Option<u64>| over(v.map(|v| v as f64), w.map(|w| w as f64));
+            let name = &a.tool;
             let _ = writeln!(
                 s,
                 "| {} | {} | {name} | {} | {} | {} | {} | {} | {} |",
@@ -1482,7 +1494,7 @@ mod tests {
         );
         assert!(
             s.contains(
-                "| identity | users-10mb | jq 1.7.1 | 1500 | 1500 | 1.00x | 1200 | 1200 | 1.00x |"
+                "| identity | users-10mb | jq | 1500 | 1500 | 1.00x | 1200 | 1200 | 1.00x |"
             ),
             "{s}"
         );
@@ -1494,7 +1506,7 @@ mod tests {
         // A stdin row with no file twin is not listed, and a run with none says so.
         let mut s = String::new();
         stdin_section(&mut s, &[], &[timed_row("x_stdin", "i", 1.0, vec![])]);
-        assert!(s.contains("No stdin row was timed in this run."), "{s}");
+        assert!(s.contains("No stdin row could be set beside"), "{s}");
         let mut s = String::new();
         stdin_section(&mut s, &[], &[]);
         assert!(s.is_empty(), "no stdin rows, no section: {s}");

@@ -144,6 +144,13 @@ pub fn parse_queries(text: &str) -> Result<Vec<PerfQuery>> {
                 );
             }
         }
+        if c[0].ends_with(STDIN_SUFFIX) && !flags.contains(&STDIN_FLAG) {
+            bail!(
+                "perf query line {}: `{}` ends with `{STDIN_SUFFIX}`, which names a `{STDIN_FLAG}` row, and has no `{STDIN_FLAG}`",
+                n + 1,
+                c[0]
+            );
+        }
         if flags.contains(&INPUT_FLAG) && flags.iter().any(|f| f.starts_with(FILES_FLAG_PREFIX)) {
             bail!(
                 "perf query line {}: `{INPUT_FLAG}` names the file once, so `{FILES_FLAG_PREFIX}N` has nothing to repeat",
@@ -951,6 +958,10 @@ mod tests {
         assert!(
             parse_queries("a\t@stdin\t.\tusers\t1mb\n").is_err(),
             "the id ends with _stdin, so the report can find the file row"
+        );
+        assert!(
+            parse_queries("a_stdin\t-c\t.\tusers\t1mb\n").is_err(),
+            "a _stdin id without the flag would be a file row the report never pairs"
         );
     }
 
