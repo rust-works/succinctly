@@ -6952,19 +6952,15 @@ impl<'a> YamlString<'a> {
         // Check for "---", then for what ends a marker: the module's one terminator set, which the
         // parser's `marker_prefix` is pinned to as well.
         let after_marker = check_pos + 3;
+        let between = text.get(after_marker..pos).unwrap_or_default();
         text.get(check_pos..after_marker) == Some(b"---")
             && crate::yaml::is_seq_indicator_next(text.get(after_marker).copied())
-            && Self::only_node_properties(text.get(after_marker..pos).unwrap_or_default())
-    }
-
-    /// Whether `between` (the text from a `---` marker to a block-scalar header, on one line) holds
-    /// only blanks and node properties: tags (`!!str`, `!<tag:yaml.org,2002:str>`) and anchors
-    /// (`&a`). A word that ends in `:` is a key, so the header after it is that key's value.
-    fn only_node_properties(between: &[u8]) -> bool {
-        between
-            .split(|&b| b == b' ' || b == b'\t')
-            .filter(|word| !word.is_empty())
-            .all(|word| matches!(word[0], b'!' | b'&') && word.last() != Some(&b':'))
+            && crate::yaml::parser::only_node_properties(between)
+            // `only_node_properties` sets a trailing ` #` comment aside; a header after one is
+            // inside the comment, not a header.
+            && !between
+                .windows(2)
+                .any(|pair| matches!(pair[0], b' ' | b'\t') && pair[1] == b'#')
     }
 
     /// Detect content indentation from first non-empty line.
@@ -12154,6 +12150,13 @@ mod tests {
             assert!(
                 !is(after_marker),
                 "{after_marker:?}: the header belongs to a node on the marker line"
+            );
+        }
+        // A `>` or `|` inside a trailing comment is no header, whatever precedes the comment.
+        for in_comment in ["--- # c >", "--- &a # c |", "---\t#>"] {
+            assert!(
+                !is(in_comment),
+                "{in_comment:?}: the header is in a comment"
             );
         }
         // The line the position is on decides, not the first line of the text.
