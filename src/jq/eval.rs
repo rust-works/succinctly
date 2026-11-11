@@ -17634,28 +17634,16 @@ fn yq_timestamp_arith<S: EvalSemantics>(
             return yq_timestamp_refusal(op, left, right)
         }
     };
-    let OwnedValue::String(left) = left else {
+    let OwnedValue::String(left_text) = left else {
         return None;
     };
     let Some(right_text) = yq_scalar_text::<S>(right) else {
         if !subtract {
             return None;
         }
-        let left_tag = if super::yq_datetime::is_timestamp(left) {
-            "!!timestamp"
-        } else {
-            "!!str"
-        };
-        let right_tag = if matches!(right, OwnedValue::Array(_)) {
-            "!!seq"
-        } else {
-            "!!map"
-        };
-        return Some(Err(EvalError::new(format!(
-            "{right_tag} () cannot be subtracted from {left_tag}"
-        ))));
+        return Some(Err(yq_kind_refusal(ArithOp::Sub, left, right)));
     };
-    match super::yq_datetime::add_duration(left, &right_text, subtract) {
+    match super::yq_datetime::add_duration(left_text, &right_text, subtract) {
         Some(result) => Some(
             result
                 .map(|text| OwnedValue::String(text.into()))

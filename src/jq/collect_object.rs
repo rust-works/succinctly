@@ -290,10 +290,6 @@ mod tests {
             UnionEntry::Bare(alloc::vec![array(&[array(&[int(1)])])]),
         ])
         .unwrap_err();
-        assert!(
-            err.to_string() == "cannot multiply !!map with !!int",
-            "{}",
-            err.to_string()
-        );
+        assert_eq!(err.to_string(), "cannot multiply !!map with !!int");
     }
 }

@@ -4148,6 +4148,8 @@ jq mode keeps jq's wording.
 yq writes the key of each keyed operand (`l`, `f`, an index inside a sequence); the evaluator does not know a node's key, so `succinctly yq` writes `()` there, as it already did for `-` on a string (#5863) and for a timestamp (#5930).
 The message is otherwise yq's, and the exit code (1) is the same.
 
+A quoted string that reads as a date (`"2001-01-01T00:00:00Z"`) is named `!!timestamp` here, as for `*`, `/` and `%` since #5930, and `!!str` in yq (`.i - "2001-01-01T00:00:00Z"` is `!!int cannot be added to !!timestamp` here and `!!int cannot be added to !!str` there), because `OwnedValue` has no timestamp kind and the tag is decided from the text.
+
 ### Datetime operators: date arithmetic, `format_datetime`, `tz` and `with_dtf` -- resolved ([#5863](https://github.com/rust-works/succinctly/issues/5863)); a quoted date and the timestamp tag remain
 
 yq keeps a timestamp as text tagged `!!timestamp`.
@@ -6473,7 +6475,7 @@ $ echo $?
   | `{"a": 1, "b"}`, `{"z": (1,2), 5}`               | `CollectObject: mismatching node sizes` error   |
   | `[[{"k":1}]] as $a \| {$a}`                     | `k: 1`                                          |
   | `[{"k":1}] as $a \| {$a}`                       | `1`                                             |
-  | `[{"k":1}] as $a \| {"z": 0, $a}`               | error (`{z: 0} * 1` cannot be multiplied)       |
+  | `[{"k":1}] as $a \| {"z": 0, $a}`               | error (`cannot multiply !!map with !!int`)      |
 
   yq evaluates every entry before combining any, so an error inside one entry aborts the whole
   construction with no prefix, unlike jq's streaming fan-out.
@@ -6546,9 +6548,6 @@ Residual divergences remain, all in cases yq itself reaches through its node mod
   group with a `:` at its own level is tried (a parenthesised key, a slice and a string are not),
   and a failed attempt parses the text again, so a parse draws on a budget of 256 attempts; past
   it a group is parsed as the parenthesised expression it is.
-- **The `*` error text.** The error a failed multiply raises is succinctly's usual
-  `object (...) and number (1) cannot be multiplied`, not yq's `cannot multiply !!map with
-  !!int`; the exit status agrees (a message-only divergence shared with every other `*`).
 
 ### `envsubst` ([#4872](https://github.com/rust-works/succinctly/issues/4872))
 
@@ -6569,8 +6568,8 @@ commas, `select(f) | ...`, a navigation in front of an assignment, and a binding
 (`.b as $v | .z = $v`, whose source is evaluated and whose body contributes its changes). A
 value-producing stage is evaluated and its value discarded, as in yq, so its *error* counts
 (`#4327`): `{"a":{"b":1}} | with(.a; . + 1)` fails in yq (`!!int () cannot be added to a !!map
-(a)`) and here (`object ({"b":1}) and number (1) cannot be added`; the wording is the general
-arithmetic-error difference, not specific to `with`). A third or later argument is accepted and
+(a)`) and here (`!!int () cannot be added to a !!map ()`; the key is the one difference left, see the
+arithmetic errors section, not specific to `with`). A third or later argument is accepted and
 ignored, with only the path evaluated, and the input comes back untouched, as yq does
 (`with(.a; . = 1; 2)`). Still different: a stage after a discarded value-producing stage is not
 evaluated (yq runs it on the discarded value); `(.b = 2) as $x | .c = $x` (a binding whose
