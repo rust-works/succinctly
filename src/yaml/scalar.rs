@@ -675,7 +675,7 @@ pub(crate) fn underscored_float_value(raw: &str) -> Option<f64> {
     }
 }
 
-/// Whether `raw` is an underscored float text ([`underscored_float_value`]): the one test the
+/// Whether `raw` is an underscored float text (`underscored_float_value`): the one test the
 /// writers ask before they keep it as text or tag it (#6958).
 #[must_use]
 pub fn is_underscored_float(raw: &str) -> bool {
