@@ -136408,6 +136408,31 @@ mod tests {
         }
     }
 
+    /// #6982 on the library's eager route (`binary_fanout_each`), which the CLI does not take: an
+    /// empty left operand of `*` / `-` leaves an erroring right one unevaluated, and `+` still
+    /// evaluates it (yq v4.53.3).
+    #[test]
+    fn eager_route_empty_left_skips_the_right_operand_6982() {
+        for program in [
+            r#".[] * error("x")"#,
+            r#".[] - error("x")"#,
+            r#".[] *+ error("x")"#,
+        ] {
+            let index = JsonIndex::build(b"[]");
+            let expr = parse_with_mode_and_extensions(program, ParserMode::Yq, true).unwrap();
+            let result = eval_full::<Vec<u64>, YqSemantics>(&expr, index.root(b"[]"));
+            assert!(matches!(result, QueryResult::None), "{program}: {result:?}");
+        }
+        let index = JsonIndex::build(b"[]");
+        let expr =
+            parse_with_mode_and_extensions(r#".[] + error("x")"#, ParserMode::Yq, true).unwrap();
+        let result = eval_full::<Vec<u64>, YqSemantics>(&expr, index.root(b"[]"));
+        assert!(
+            matches!(result, QueryResult::Error(ref e) if e.message == "x"),
+            "{result:?}"
+        );
+    }
+
     /// #2374: the family's shared definition itself, pinned once rather
     /// than only through each of its call sites' own regression tests.
     ///
