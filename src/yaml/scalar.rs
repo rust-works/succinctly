@@ -683,8 +683,13 @@ fn has_non_json_float_marker(raw: &str) -> bool {
 /// `-0` is the integer zero of an expression literal (`-0`, `.a |= -0`, a JSON-sourced `-0`):
 /// yq keeps its text for `tostring` and YAML output, and its JSON encoder prints `0` (#6051). A
 /// YAML document's `-0` is a float, which never reaches this function as that text.
+///
+/// The text alone is ambiguous for a zero-padded `8`/`9` (`08`): this reads it as the integer
+/// (`8`). A caller that holds the literal's number asks [`yq_json_number_text_for`] (#6899).
 #[must_use]
 pub fn yq_json_number_text(raw: &str) -> Option<String> {
+    // The text alone reads a zero-padded `08` as the integer 8; ask `yq_json_number_text_for`
+    // with the literal's number wherever it is known (#6899).
     yq_json_number_text_for(raw, false)
 }
 

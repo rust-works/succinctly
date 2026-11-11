@@ -221,6 +221,16 @@ pub enum NumberRepr {
     Float(f64),
 }
 
+impl NumberRepr {
+    /// Whether this is the float repr: the one definition the JSON writers ask with, since the
+    /// same literal text (`08`) is a float from a YAML document and an integer under `!!int`
+    /// (#6899).
+    #[must_use]
+    pub fn is_float(&self) -> bool {
+        matches!(self, Self::Float(_))
+    }
+}
+
 /// Try `i64` first, fall back to `f64` -- the one definition of "how does a
 /// number string decide between the two representations," shared by
 /// [`OwnedValue::from_number_literal_boxed`], [`OwnedValue::from_number_bytes`],
@@ -4505,7 +4515,7 @@ impl OwnedValue {
                 out.push_str(infinite_fmt(f.is_sign_negative()));
             }
             Self::NumberLiteral(repr, literal) => {
-                finite_literal(out, literal, matches!(repr, NumberRepr::Float(_)));
+                finite_literal(out, literal, repr.is_float());
             }
             Self::String(s) => {
                 out.push('"');
@@ -4616,7 +4626,7 @@ impl OwnedValue {
             // assuming finiteness, and yq's `real_output_finite_literal`
             // echoes raw text verbatim regardless of the parsed value.
             Self::NumberLiteral(repr, literal) => {
-                finite_literal(literal.as_bytes(), matches!(repr, NumberRepr::Float(_)))
+                finite_literal(literal.as_bytes(), repr.is_float())
             }
             Self::String(s) => format!("\"{}\"", escape_json_body(write_json_body_jq, s)),
             Self::Array(arr) => {

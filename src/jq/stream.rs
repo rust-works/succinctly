@@ -622,10 +622,7 @@ fn stream_owned_value_json_with_at_depth<W: core::fmt::Write>(
             NumberRepr::Float(f) if f.is_infinite() => {
                 out.write_str(&infinite_literal(literal.as_bytes()))
             }
-            _ => out.write_str(&finite_literal(
-                literal.as_bytes(),
-                matches!(repr, NumberRepr::Float(_)),
-            )),
+            _ => out.write_str(&finite_literal(literal.as_bytes(), repr.is_float())),
         },
         OwnedValue::String(s) => stream_json_string(out, s, escape),
         OwnedValue::Array(arr) => {
