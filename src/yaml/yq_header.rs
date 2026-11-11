@@ -63,15 +63,30 @@ enum Line {
 }
 
 fn classify(line: &[u8]) -> Line {
+    // A marker with text after it is settled from the bytes around the marker alone (#6963): a
+    // line of `--- --- --- ... a` is one such line per marker, each the rest of the one before, so
+    // reading all of it for every marker (the trim below) made the run quadratic. The text that
+    // follows the blanks cannot make the line a bare `---` (the first case below) unless it
+    // starts with white space of Unicode that RE2's `\s` does not name, which takes the full
+    // path.
+    let mut ws = 0;
+    while line.get(ws).copied().is_some_and(is_re2_space) {
+        ws += 1;
+    }
+    if line[ws..].starts_with(b"---") && line.get(ws + 3).copied().is_some_and(is_re2_space) {
+        let mut end = ws + 3;
+        while line.get(end).copied().is_some_and(is_re2_space) {
+            end += 1;
+        }
+        if end < line.len() && !starts_with_unicode_whitespace(&line[end..]) {
+            return Line::MarkerWithText { ws, end };
+        }
+    }
     // Go trims by Unicode white space, which is `char::is_whitespace`. Once per line.
     let text = String::from_utf8_lossy(line);
     let trimmed = text.trim();
     if trimmed == "---" {
         return Line::Separator;
-    }
-    let mut ws = 0;
-    while line.get(ws).copied().is_some_and(is_re2_space) {
-        ws += 1;
     }
     if line[ws..].starts_with(b"---") && line.get(ws + 3).copied().is_some_and(is_re2_space) {
         let mut end = ws + 3;
@@ -86,20 +101,32 @@ fn classify(line: &[u8]) -> Line {
     Line::Content
 }
 
+/// Whether the first character of `bytes` is Unicode white space (`char::is_whitespace`, which
+/// is what Go's trim uses). An invalid byte sequence reads as U+FFFD, which is not.
+fn starts_with_unicode_whitespace(bytes: &[u8]) -> bool {
+    String::from_utf8_lossy(&bytes[..bytes.len().min(4)])
+        .chars()
+        .next()
+        .is_some_and(char::is_whitespace)
+}
+
 /// The spans of `text` that yq's stream no longer holds, in no particular order and possibly
 /// overlapping: the lost line breaks (a `\n` or a `\r\n`), the blanks before the first marker,
 /// and the later markers of a pushed-back line.
 fn cuts(text: &[u8]) -> Vec<core::ops::Range<usize>> {
     let mut cuts = Vec::new();
-    // The unread input is `pending` (whose bytes sit at `pending_at` in `text`, not always
-    // contiguously: a cut break lies between two pieces) followed by `text[pos..]`.
+    // The unread input is `line[from..]` (the pushed-back remainder of a marker line, followed by
+    // the physical line read after it), whose bytes sit at `at[from..]` in `text` (not always
+    // contiguously: a cut break lies between two pieces), followed by `text[pos..]`. A marker
+    // moves `from` past itself instead of copying the remainder out (#6963).
     let mut pos = 0;
-    let mut pending: Vec<u8> = Vec::new();
-    let mut pending_at: Vec<usize> = Vec::new();
+    let mut line: Vec<u8> = Vec::new();
+    let mut at: Vec<usize> = Vec::new();
+    let mut from = 0;
     let mut kept_marker = false;
     loop {
         let rest = &text[pos..];
-        if pending.is_empty() && rest.is_empty() {
+        if from == line.len() && rest.is_empty() {
             break;
         }
         // `ReadString('\n')` on the unread input.
@@ -107,14 +134,17 @@ fn cuts(text: &[u8]) -> Vec<core::ops::Range<usize>> {
             Some(nl) => (&rest[..nl], Some(pos + nl)),
             None => (rest, None),
         };
-        let merged = !pending.is_empty();
-        let mut line = core::mem::take(&mut pending);
-        let mut at = core::mem::take(&mut pending_at);
+        let merged = from < line.len();
+        if !merged {
+            line.clear();
+            at.clear();
+            from = 0;
+        }
         line.extend_from_slice(physical);
         at.extend(pos..pos + physical.len());
         // The `\r` of a `\r\n` is the last byte of the physical part (the pending part never ends
         // in one: a remainder is cut from a line whose `\r\n` was already taken off).
-        let break_start = if break_at.is_some() && line.last() == Some(&b'\r') {
+        let break_start = if break_at.is_some() && line[from..].last() == Some(&b'\r') {
             line.pop();
             at.pop();
             break_at.map(|nl| nl - 1)
@@ -122,8 +152,10 @@ fn cuts(text: &[u8]) -> Vec<core::ops::Range<usize>> {
             break_at
         };
         pos += physical.len() + usize::from(break_at.is_some());
-        match classify(&line) {
-            Line::Separator | Line::Header => {}
+        match classify(&line[from..]) {
+            Line::Separator | Line::Header => {
+                from = line.len();
+            }
             Line::MarkerWithText { ws, end } => {
                 // A break with nothing after it glues nothing on: it stays, as the bytes read
                 // the same either way.
@@ -134,16 +166,15 @@ fn cuts(text: &[u8]) -> Vec<core::ops::Range<usize>> {
                 }
                 if merged || kept_marker {
                     // A marker the pushed-back text starts with: yq strips it too.
-                    cuts.push(at[0]..at[end - 1] + 1);
+                    cuts.push(at[from]..at[from + end - 1] + 1);
                 } else {
                     // The first marker stays; the blanks before it are not in yq's stream.
                     kept_marker = true;
                     if ws > 0 {
-                        cuts.push(at[0]..at[ws - 1] + 1);
+                        cuts.push(at[from]..at[from + ws - 1] + 1);
                     }
                 }
-                pending = line.split_off(end);
-                pending_at = at.split_off(end);
+                from += end;
             }
             Line::Content => break,
         }
@@ -187,6 +218,152 @@ mod tests {
             Some(bytes) => String::from_utf8(bytes).unwrap(),
             None => text.to_owned(),
         }
+    }
+
+    /// The implementation before #6963, kept as the reference [`cuts`] must agree with: it copied
+    /// the pushed-back remainder out of the line for every marker, which made a run of markers on
+    /// one line quadratic.
+    fn cuts_reference(text: &[u8]) -> Vec<core::ops::Range<usize>> {
+        fn classify_reference(line: &[u8]) -> Line {
+            let text = String::from_utf8_lossy(line);
+            let trimmed = text.trim();
+            if trimmed == "---" {
+                return Line::Separator;
+            }
+            let mut ws = 0;
+            while line.get(ws).copied().is_some_and(is_re2_space) {
+                ws += 1;
+            }
+            if line[ws..].starts_with(b"---") && line.get(ws + 3).copied().is_some_and(is_re2_space)
+            {
+                let mut end = ws + 3;
+                while line.get(end).copied().is_some_and(is_re2_space) {
+                    end += 1;
+                }
+                return Line::MarkerWithText { ws, end };
+            }
+            if line[ws..].starts_with(b"#")
+                || line[ws..].starts_with(b"%YAML")
+                || trimmed.is_empty()
+            {
+                return Line::Header;
+            }
+            Line::Content
+        }
+        let mut cuts = Vec::new();
+        let mut pos = 0;
+        let mut pending: Vec<u8> = Vec::new();
+        let mut pending_at: Vec<usize> = Vec::new();
+        let mut kept_marker = false;
+        loop {
+            let rest = &text[pos..];
+            if pending.is_empty() && rest.is_empty() {
+                break;
+            }
+            let (physical, break_at) = match rest.iter().position(|&b| b == b'\n') {
+                Some(nl) => (&rest[..nl], Some(pos + nl)),
+                None => (rest, None),
+            };
+            let merged = !pending.is_empty();
+            let mut line = core::mem::take(&mut pending);
+            let mut at = core::mem::take(&mut pending_at);
+            line.extend_from_slice(physical);
+            at.extend(pos..pos + physical.len());
+            let break_start = if break_at.is_some() && line.last() == Some(&b'\r') {
+                line.pop();
+                at.pop();
+                break_at.map(|nl| nl - 1)
+            } else {
+                break_at
+            };
+            pos += physical.len() + usize::from(break_at.is_some());
+            match classify_reference(&line) {
+                Line::Separator | Line::Header => {}
+                Line::MarkerWithText { ws, end } => {
+                    if let (Some(start), Some(nl)) = (break_start, break_at) {
+                        if nl + 1 < text.len() {
+                            cuts.push(start..nl + 1);
+                        }
+                    }
+                    if merged || kept_marker {
+                        cuts.push(at[0]..at[end - 1] + 1);
+                    } else {
+                        kept_marker = true;
+                        if ws > 0 {
+                            cuts.push(at[0]..at[ws - 1] + 1);
+                        }
+                    }
+                    pending = line.split_off(end);
+                    pending_at = at.split_off(end);
+                }
+                Line::Content => break,
+            }
+        }
+        cuts
+    }
+
+    /// #6963: `cuts` answers what the copying implementation answered, for every input of up to
+    /// six of the pieces a header line is made of: markers, ASCII and Unicode white space, both
+    /// kinds of break, a comment, a directive, content, and an invalid byte.
+    #[test]
+    fn cuts_agree_with_the_copying_implementation_on_every_short_header_6963() {
+        let pieces: [&[u8]; 10] = [
+            b"---",
+            b" ",
+            b"\t",
+            b"\n",
+            b"\r\n",
+            b"a",
+            b"#",
+            b"%YAML",
+            "\u{a0}".as_bytes(),
+            b"\xff",
+        ];
+        let mut inputs = 0usize;
+        let mut stack: Vec<usize> = Vec::new();
+        // Every sequence of 0..=5 pieces, depth-first.
+        fn walk(pieces: &[&[u8]], stack: &mut Vec<usize>, depth: usize, inputs: &mut usize) {
+            let text: Vec<u8> = stack
+                .iter()
+                .flat_map(|&i| pieces[i].iter().copied())
+                .collect();
+            assert_eq!(cuts(&text), cuts_reference(&text), "input: {text:?}");
+            *inputs += 1;
+            if depth == 5 {
+                return;
+            }
+            for i in 0..pieces.len() {
+                stack.push(i);
+                walk(pieces, stack, depth + 1, inputs);
+                stack.pop();
+            }
+        }
+        walk(&pieces, &mut stack, 0, &mut inputs);
+        assert_eq!(
+            inputs, 111_111,
+            "1 + 10 + 10^2 + 10^3 + 10^4 + 10^5 sequences"
+        );
+    }
+
+    /// #6963: a run of markers on one line costs the same per marker at any length. A run of
+    /// 100,000 was 8 s to read when each marker copied the rest of the line; a count of the work
+    /// would not see it, so this bounds it with time generously: the quadratic form takes minutes
+    /// here, the linear one milliseconds.
+    #[test]
+    fn a_long_run_of_markers_on_one_line_stays_linear_6963() {
+        let mut text = "--- ".repeat(200_000).into_bytes();
+        text.extend_from_slice(b"a\n");
+        let started = std::time::Instant::now();
+        let glued = glue_after_leading_marker_text(&text).expect("the markers are cut");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?} for {} markers",
+            started.elapsed(),
+            200_000
+        );
+        // The first marker stays; every later one is cut with the blanks after it, and so is the
+        // break the run never had to lose.
+        assert_eq!(glued, b"--- a\n");
     }
 
     #[test]
