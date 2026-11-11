@@ -6458,7 +6458,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.claim_floated_comment_for_key();
                 self.write_bp_open();
                 self.parse_double_quoted()?;
-                self.reject_content_after_inline_value()?;
+                self.reject_content_after_quoted_value()?;
                 self.set_bp_text_end(self.pos);
                 self.write_bp_close();
                 self.explicit_key_node_closed = true;
@@ -6468,7 +6468,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.claim_floated_comment_for_key();
                 self.write_bp_open();
                 self.parse_single_quoted()?;
-                self.reject_content_after_inline_value()?;
+                self.reject_content_after_quoted_value()?;
                 self.set_bp_text_end(self.pos);
                 self.write_bp_close();
                 self.explicit_key_node_closed = true;
@@ -6774,7 +6774,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.set_ib();
                 self.write_bp_open();
                 self.parse_double_quoted()?;
-                self.reject_content_after_inline_value()?;
+                self.reject_content_after_quoted_value()?;
                 self.reject_deeper_line_after_value()?;
                 self.set_bp_text_end(self.pos);
                 self.write_bp_close();
@@ -6789,7 +6789,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.set_ib();
                 self.write_bp_open();
                 self.parse_single_quoted()?;
-                self.reject_content_after_inline_value()?;
+                self.reject_content_after_quoted_value()?;
                 self.reject_deeper_line_after_value()?;
                 self.set_bp_text_end(self.pos);
                 self.write_bp_close();
@@ -6847,9 +6847,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 end
             }
         };
-        self.reject_content_after_inline_value()?;
         if quoted {
+            self.reject_content_after_quoted_value()?;
             self.reject_deeper_line_after_value()?;
+        } else {
+            self.reject_content_after_inline_value()?;
         }
         Ok(end)
     }
@@ -6863,6 +6865,17 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// rule (`a: "x" y: z`), as do the second line of a multi-line plain
     /// scalar and a trailing `:` (`a: b:`).
     fn reject_content_after_inline_value(&self) -> Result<(), YamlError> {
+        self.reject_content_after_scalar(false)
+    }
+
+    /// [`Self::reject_content_after_inline_value`] for a quoted scalar. The closing quote ends the
+    /// scalar, so a `#` that touches it starts a comment, as it does in yq (`a: "x"#c`, #6968); after
+    /// a plain scalar the same `#` is content (`a: x#c` is `x#c`).
+    fn reject_content_after_quoted_value(&self) -> Result<(), YamlError> {
+        self.reject_content_after_scalar(true)
+    }
+
+    fn reject_content_after_scalar(&self, quoted: bool) -> Result<(), YamlError> {
         // The common case: the scalar ends the line.
         match self.peek() {
             None => return Ok(()),
@@ -6880,8 +6893,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         match self.input.get(i) {
             None => Ok(()),
             Some(&b) if Self::is_break(b) => Ok(()),
-            // A comment, which only counts after a blank.
-            Some(b'#') if i > self.pos || Self::is_inline_whitespace(self.input[self.pos - 1]) => {
+            // A comment, which only counts after a blank, or straight after a closing quote.
+            Some(b'#')
+                if quoted
+                    || i > self.pos
+                    || Self::is_inline_whitespace(self.input[self.pos - 1]) =>
+            {
                 Ok(())
             }
             Some(_) => {
@@ -6916,7 +6933,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.set_ib();
                 self.write_bp_open();
                 self.parse_double_quoted()?;
-                self.reject_content_after_inline_value()?;
+                self.reject_content_after_quoted_value()?;
                 self.reject_deeper_line_after_value()?;
                 self.set_bp_text_end(self.pos);
                 self.write_bp_close();
@@ -6934,7 +6951,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.set_ib();
                 self.write_bp_open();
                 self.parse_single_quoted()?;
-                self.reject_content_after_inline_value()?;
+                self.reject_content_after_quoted_value()?;
                 self.reject_deeper_line_after_value()?;
                 self.set_bp_text_end(self.pos);
                 self.write_bp_close();
