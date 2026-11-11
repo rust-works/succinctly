@@ -739,6 +739,27 @@ Not covered here:
   A `!` on a key is gone from the key too, so `! 1: v` has the key `1` in `keys` (it was the string `"1"`), as in yq.
 - A document that is only `!` prints nothing under `-o=yaml`, as `!!null` does, where yq prints a blank line (the empty-document output of #5721). It printed the blank line before #6942, because the node was the empty string.
 
+### A zero-padded float across a write, and an underscored number under `!!int` or `!!float` (#6938)
+
+A zero-padded `08` or `09` is a float of a YAML document, because go-yaml tries the leading `0` as octal and falls back to `ParseFloat` (#6866).
+After any write the document is rebuilt, and that value crossed the rebuild as a spelling that `tag`, `type` and the integer readers took for the integer 8: `.zz = 1 | .p | tag` and `| type` over `p: 08` were `!!int`, where yq says `!!float` (the value itself, `.p` and `.p + 1`, was already the float `8.0` and `9.0`).
+Both are `!!float` now, as is the same value through a construction (`[.p] | .[0] | tag`); `010` (an octal integer) and an explicit `!!int 08` stay `!!int`.
+
+yq drops every `_` of a tag-forced number before it reads it (`parseInt64`), so `!!int 1_000` is `1000`, `!!int 0_8` is `8`, `!!int 0x1_f` is `31` and `!!int 1__0` is `10`, wherever the `_` sits.
+`!!float` takes an `_` only between two digits (Go's `ParseFloat`): `!!float 1_0.5` is `10.5` and `!!float 1_0e1_0` is `1e11`, while `1__0`, `_1`, `1_` and `0x_1f` are refused.
+This read all of them as the string.
+A plain `1_000` is still the string here, the recorded input-spec divergence above.
+
+```console
+$ printf 'd: !!int 1_000\n' | yq -o=json -I0 '.d + 1'                   # 1001
+$ printf 'd: !!int 1_000\n' | succinctly yq -o json -I0 '.d + 1'         # 1001   ("1_0001" before #6938)
+```
+
+Not covered here:
+- A form yq cannot encode (`!!int 0b1_0`, `!!int 1_0.5`, `!!int 9_223_372_036_854_775_808`, `!!float 0x1_f`) is an error in yq's JSON encoder and an arithmetic error; this reads it as the string, as it does `!!int abc`.
+  A prefixed integer under `!!float` (`!!float 0x1_2`, `!!float 0o1_7`) is the float `18.0`/`15.0` here, as `!!float 0x12` already was, where yq's float parser refuses it.
+- `tostring` and YAML output of an underscored `!!float` print the number (`!!float 1_0.5` is `10.5`), where yq echoes the text (`1_0.5`): the spelled-float machinery (`is_spelled_float`) has no underscore form yet ([#6958](https://github.com/rust-works/succinctly/issues/6958)). An underscored `!!int` keeps its text.
+
 ### A scalar under an unknown `!!` tag is its text (#6299)
 
 yq reads a plain scalar under a tag of the secondary handle that names no core type as its text: `a: !!foo 1` is the string `"1"`, and so are `!!binary 1`, `!!set 1`, `!!seq 1` and `!!str: 1`, where the `:` belongs to the tag.

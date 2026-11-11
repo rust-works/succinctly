@@ -3269,7 +3269,17 @@ impl<'a> JsonNumber<'a> {
     /// text; `None` for any other span and for a spelling that is no integer (#2802).
     #[inline]
     pub(crate) fn bridge_spelled_int(&self) -> Option<i64> {
-        crate::yaml::spelled_int_value(&self.bridge_spelling()?)
+        // The integer token first: an explicit `!!int 08` is an integer whatever its text.
+        if let Some(spelling) = self.bridge_int_spelling() {
+            return crate::yaml::spelled_int_value(&spelling);
+        }
+        let spelling = self.bridge_spelling()?;
+        // #6938: a zero-padded `08` that crossed as a plain spelling is a *float* of a YAML
+        // document (#6866), so no integer. Read as one, `.zz = 1 | .p | tag` said `!!int`.
+        if crate::yaml::is_zero_padded_with_8_or_9(&spelling) {
+            return None;
+        }
+        crate::yaml::spelled_int_value(&spelling)
     }
 
     /// The value this span stands for if it is one of the reindex bridge's

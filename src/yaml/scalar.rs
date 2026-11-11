@@ -869,11 +869,27 @@ pub fn resolve_tagged(text: &str, tag: &str) -> Option<ResolvedScalar> {
         ))),
         "!!int" => Some(match resolve_plain(text) {
             ResolvedScalar::Int(n) => ResolvedScalar::Int(n),
+            // #6938: yq's `parseInt64` drops every `_` before it reads the number, so
+            // `!!int 1_000` is 1000, `!!int 0_8` is 8 and `!!int 1__0` is 10; wherever the `_` sits.
+            // The one definition of that grammar is `spelled_int_value`, which spelled-integer
+            // text already goes through.
+            _ if text.contains('_') => {
+                spelled_int_value(text).map_or(ResolvedScalar::Str, ResolvedScalar::Int)
+            }
             _ => ResolvedScalar::Str,
         }),
         "!!float" => Some(match resolve_plain(text) {
             ResolvedScalar::Float(f) => ResolvedScalar::Float(f),
             ResolvedScalar::Int(n) => ResolvedScalar::Float(n as f64),
+            // #6938: Go's `ParseFloat` takes an `_` only between two digits (`!!float 1_0.5` is
+            // 10.5, `1__0`, `_1` and `1_` are refused), so a misplaced one stays the text.
+            _ if text.contains('_') && underscores_sit_between_digits(text) => {
+                match resolve_plain(&text.replace('_', "")) {
+                    ResolvedScalar::Float(f) => ResolvedScalar::Float(f),
+                    ResolvedScalar::Int(n) => ResolvedScalar::Float(n as f64),
+                    _ => ResolvedScalar::Str,
+                }
+            }
             _ => ResolvedScalar::Str,
         }),
         // #6291: a node with an explicit tag and no value is the empty string whatever the tag
@@ -891,6 +907,18 @@ pub fn resolve_tagged(text: &str, tag: &str) -> Option<ResolvedScalar> {
         _ if tag.len() > 2 && tag.starts_with("!!") => Some(ResolvedScalar::Str),
         _ => None,
     }
+}
+
+/// Whether every `_` in `text` has an ASCII digit on both sides, the placement Go's `ParseFloat`
+/// accepts (#6938).
+fn underscores_sit_between_digits(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.iter().enumerate().all(|(i, &b)| {
+        b != b'_'
+            || (i > 0
+                && bytes[i - 1].is_ascii_digit()
+                && bytes.get(i + 1).is_some_and(u8::is_ascii_digit))
+    })
 }
 
 /// Returns true if a plain scalar could resolve to null or bool at all.
@@ -984,6 +1012,64 @@ mod tests {
         }
         for tag in ["!!str", "!foo", "!<!foo>", "!!", "!!null"] {
             assert!(!is_non_specific_tag(tag), "{tag}");
+        }
+    }
+
+    /// #6938: yq drops every `_` of a tag-forced number before it reads it. `!!int` takes the
+    /// underscores wherever they sit; `!!float` only between two digits (Go's `ParseFloat`).
+    #[test]
+    fn a_tagged_number_drops_its_underscores_6938() {
+        for (text, int) in [
+            ("1_000", Some(1000)),
+            ("0_8", Some(8)),
+            ("0_7", Some(7)),
+            ("-0_8", Some(-8)),
+            ("+1_0", Some(10)),
+            ("1__0", Some(10)),
+            ("_1", Some(1)),
+            ("1_", Some(1)),
+            ("0x1_f", Some(31)),
+            ("0x_1f", Some(31)),
+            ("0o1_7", Some(15)),
+            // Not an integer once the underscores are gone: the text, as for `!!int abc`.
+            ("1_2x", None),
+            ("1_0.5", None),
+            ("1_0e1_0", None),
+            ("0b1_0", None),
+            ("_", None),
+        ] {
+            let expected = int.map_or(Str, Int);
+            assert_eq!(
+                resolve_tagged(text, "!!int"),
+                Some(expected),
+                "!!int {text}"
+            );
+        }
+        for (text, float) in [
+            ("1_000", Some(1000.0)),
+            ("0_8", Some(8.0)),
+            ("-0_8", Some(-8.0)),
+            ("1_0.5", Some(10.5)),
+            ("1_0e1_0", Some(1e11)),
+            ("1e1_0", Some(1e10)),
+            (".5_5", Some(0.55)),
+            // Digit-separated underscores around text that is no number stay the text.
+            ("1_2x", None),
+            ("1_2.3.4", None),
+            // A `_` that is not between two digits is refused for a float.
+            ("1__0", None),
+            ("_1", None),
+            ("1_", None),
+            ("1_.5", None),
+            ("0x_1f", None),
+            ("1._5", None),
+        ] {
+            let expected = float.map_or(Str, Float);
+            assert_eq!(
+                resolve_tagged(text, "!!float"),
+                Some(expected),
+                "!!float {text}"
+            );
         }
     }
 
