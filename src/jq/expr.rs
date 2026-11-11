@@ -3309,6 +3309,10 @@ pub enum FormatType {
     /// yq's `to_yaml(N)` (#4206): `@yaml` with `N` as the indent. `to_yaml` itself is plain
     /// [`FormatType::Yaml`].
     YqYaml(usize),
+    /// yq's `-o=props|shell|csv|tsv|base64|uri` encoders (#6850): a whole result written as that
+    /// format, line ends included. Not an `@name` (the `@` operators differ for some values, and
+    /// real yq has no `@shell`), so the parser never builds it; the yq runner wraps a program in it.
+    YqOutput(YqOutputEncoder),
     /// #3357: a format name the parser didn't recognize, jq mode only.
     /// jq's own grammar accepts any `@name` token at parse time and defers
     /// the "is this a real format" check to when the format is actually
@@ -3319,6 +3323,23 @@ pub enum FormatType {
     /// variant. Carries the name (without the leading `@`) so
     /// `format_owned` can raise jq's exact message.
     Unknown(String),
+}
+
+/// The encoder of `-o=<format>` in `succinctly yq` (#6850), see [`FormatType::YqOutput`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum YqOutputEncoder {
+    /// `-o=props`
+    Props,
+    /// `-o=shell`, with the `--shell-key-separator` between the parts of a name
+    Shell(String),
+    /// `-o=csv`
+    Csv,
+    /// `-o=tsv`
+    Tsv,
+    /// `-o=base64`: a string only, and no line end
+    Base64,
+    /// `-o=uri`: a string only, and no line end
+    Uri,
 }
 
 /// The unary libm builtins jq exposes beyond the trigonometric/exponential

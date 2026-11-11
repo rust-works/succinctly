@@ -175,7 +175,7 @@ pub use expr::{
     ArithOp, ArithSettleMemo, AssignOp, BoundBody, Builtin, CompareOp, Expr, FormatType,
     FuncDefBound, FuncDefData, Import, Include, Libm1, Libm2, Libm3, Literal, MergeFlags,
     MetaObject, MetaSlot, MetaValue, ModuleMeta, NumberKey, ObjectEntry, ObjectKey, Param, Pattern,
-    PatternEntry, PipeStages, Program, SharedArg, SliceBoundKey, StringPart,
+    PatternEntry, PipeStages, Program, SharedArg, SliceBoundKey, StringPart, YqOutputEncoder,
 };
 pub use lazy::JqValue;
 // #5497: jq's parse-depth limit, applied by the CLI's document routes.

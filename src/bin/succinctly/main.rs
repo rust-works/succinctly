@@ -1163,6 +1163,24 @@ pub enum OutputFormat {
     /// Auto-detect based on input
     #[value(name = "auto", alias = "a")]
     Auto,
+    /// Java properties output (`a.b = c`), as `@props` writes it (#6850)
+    #[value(name = "props", alias = "p")]
+    Props,
+    /// Shell variable assignments (`a_b=c`) (#6850)
+    #[value(name = "shell", alias = "s")]
+    Shell,
+    /// CSV of an array, as `@csv` writes it (#6850)
+    #[value(name = "csv", alias = "c")]
+    Csv,
+    /// TSV of an array, as `@tsv` writes it (#6850)
+    #[value(name = "tsv", alias = "t")]
+    Tsv,
+    /// Base64 of a string, as `@base64` writes it, with no line break (#6850)
+    #[value(name = "base64")]
+    Base64,
+    /// URI percent-encoding of a string, as `@uri` writes it, with no line break (#6850)
+    #[value(name = "uri")]
+    Uri,
 }
 
 /// Input format for yq command
@@ -1274,8 +1292,8 @@ pub struct YqCommand {
     pub front_matter: Option<FrontMatterMode>,
 
     // === Output Options ===
-    /// Output format type [yaml, json, auto] (default: auto, which is the input's own format:
-    /// a `.json` file prints JSON, anything else YAML, #6703)
+    /// Output format type [yaml, json, props, shell, csv, tsv, base64, uri, auto] (default: auto,
+    /// which is the input's own format: a `.json` file prints JSON, anything else YAML, #6703)
     #[arg(short = 'o', long, value_name = "FORMAT", default_value = "auto")]
     pub output_format: OutputFormat,
 
@@ -1290,6 +1308,18 @@ pub struct YqCommand {
     /// (join output) is `succinctly jq`'s, not this (#1731).
     #[arg(short = 'j', long = "tojson", overrides_with = "tojson")]
     pub tojson: bool,
+
+    /// Set by the yq runner when `-o` names an encoder that writes its own line ends (#6850).
+    #[arg(skip)]
+    pub output_encoder_joins: bool,
+
+    /// Separator between the parts of a variable name for `-o=shell` (#6850)
+    #[arg(
+        long = "shell-key-separator",
+        value_name = "SEPARATOR",
+        default_value = "_"
+    )]
+    pub shell_key_separator: String,
 
     /// Use NUL char to separate values instead of newline
     #[arg(short = '0', long = "nul-output", overrides_with = "nul_output")]
