@@ -37,9 +37,8 @@ fn test_del_through_select_over_a_missing_path_leaves_the_document_6892() -> Res
 
 /// What still differs, pinned so a change to it is a decision (each yq answer is v4.53.3's): a
 /// `del()` with a comma still raises for the sake of the placeholder rule `resolve_iterate_sink`
-/// documents, and a field write through the same path (`(.zz[] | select(.n == 1)).x = 5`) raises
-/// where yq adds `zz: []`; over a stored `null` the delete is a no-op here where yq turns the `null`
-/// into `[]`. Each row is `(document, filter, this build's stdout, its exit code, yq's stdout)`.
+/// documents; over a stored `null` the delete is a no-op here where yq turns the `null` into `[]`.
+/// (The field write through the same path was a row here until #6902.) Each row is `(document, filter, this build's stdout, its exit code, yq's stdout)`.
 #[test]
 fn test_the_comma_write_and_stored_null_forms_stay_recorded_6892() -> Result<()> {
     let svc = "kind: Service\nspec:\n  type: x\n";
@@ -50,13 +49,6 @@ fn test_the_comma_write_and_stored_null_forms_stay_recorded_6892() -> Result<()>
             "",
             1,
             "spec:\n  type: x\n",
-        ),
-        (
-            svc,
-            "(.zz[] | select(.n == 1)).x = 5",
-            "",
-            1,
-            "kind: Service\nspec:\n  type: x\nzz: []\n",
         ),
         (
             "a: ~\nb: 1\n",

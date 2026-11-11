@@ -1115,7 +1115,7 @@ pub(crate) mod yq_delete_context {
 /// such sibling, and yq's `.[]` over a missing or null node yields no target, so the raise is the
 /// divergence. Ambient for the reason [`yq_delete_context`] is. `std` only.
 #[cfg(feature = "std")]
-pub(crate) mod yq_single_del_target {
+pub(crate) mod yq_single_target {
     use std::cell::Cell;
 
     thread_local! {
@@ -1142,7 +1142,7 @@ pub(crate) mod yq_single_del_target {
 }
 
 #[cfg(not(feature = "std"))]
-pub(crate) mod yq_single_del_target {
+pub(crate) mod yq_single_target {
     pub(crate) fn active() -> bool {
         false
     }
@@ -1154,12 +1154,31 @@ pub(crate) mod yq_single_del_target {
     }
 }
 
-/// Whether a `del()` target is one plain path (#6892): navigation (`.a`, `.[0]`, `.[]`, a slice),
-/// `select(f)`, parentheses, `?` and pipes of them, and nothing that can name a second target (a
-/// comma, `//`, `if`, a binding, a fold). The only targets for which the resolver may yield nothing
-/// over a `null`, since no sibling can need its placeholder; every other shape keeps the raise, so
-/// a wrapper added later does not become "single" by default.
-fn del_target_is_one_path(expr: &Expr) -> bool {
+/// Whether an iteration follows a `select` in the pipe `expr` (#6902): `(NAV | select(..)).x[]`.
+/// yq creates the `x: []` the iteration reaches under each node the select passed, which the
+/// resolver has no step for, so a write target like that keeps the raise.
+fn iterates_after_select(expr: &Expr) -> bool {
+    fn walk(expr: &Expr, seen_select: &mut bool) -> bool {
+        match expr {
+            Expr::Builtin(Builtin::Select(_)) => {
+                *seen_select = true;
+                false
+            }
+            Expr::Iterate => *seen_select,
+            Expr::Paren(inner) | Expr::Optional(inner) => walk(inner, seen_select),
+            Expr::Pipe(stages) => stages.iter().any(|stage| walk(stage, seen_select)),
+            _ => false,
+        }
+    }
+    walk(expr, &mut false)
+}
+
+/// Whether a `del()` or assignment target is one plain path (#6892, #6902): navigation (`.a`,
+/// `.[0]`, `.[]`, a slice), `select(f)`, parentheses, `?` and pipes of them, and nothing that can
+/// name a second target (a comma, `//`, `if`, a binding, a fold). The only targets for which the
+/// resolver may yield nothing over a `null`, since no sibling can need its placeholder; every other
+/// shape keeps the raise, so a wrapper added later does not become "single" by default.
+fn write_target_is_one_path(expr: &Expr) -> bool {
     match expr {
         Expr::Identity
         | Expr::Field(_)
@@ -1168,8 +1187,8 @@ fn del_target_is_one_path(expr: &Expr) -> bool {
         | Expr::Iterate
         | Expr::Slice { .. }
         | Expr::Builtin(Builtin::Select(_)) => true,
-        Expr::Paren(inner) | Expr::Optional(inner) => del_target_is_one_path(inner),
-        Expr::Pipe(stages) => stages.iter().all(del_target_is_one_path),
+        Expr::Paren(inner) | Expr::Optional(inner) => write_target_is_one_path(inner),
+        Expr::Pipe(stages) => stages.iter().all(write_target_is_one_path),
         _ => false,
     }
 }
@@ -44863,10 +44882,19 @@ fn yq_filtered_target_creation<S: EvalSemantics>(
         .iter()
         .position(|stage| matches!(**stage, Expr::Builtin(Builtin::Select(_))))?;
     let (nav, filters) = stages.split_at(split);
+    // #6902: what follows the first `select` is never walked, since nothing passed it, so a field,
+    // an index or an iteration there (`(NAV | select(..)).x`) is as good as another `select`.
     if nav.is_empty()
-        || !filters
-            .iter()
-            .all(|stage| matches!(**stage, Expr::Builtin(Builtin::Select(_))))
+        || !filters.iter().all(|stage| {
+            matches!(
+                **stage,
+                Expr::Builtin(Builtin::Select(_))
+                    | Expr::Field(_)
+                    | Expr::Index { key: None, .. }
+                    | Expr::Slice { .. }
+                    | Expr::Iterate
+            )
+        })
     {
         return None;
     }
@@ -44912,6 +44940,11 @@ fn yq_filtered_target_creation<S: EvalSemantics>(
                 }
                 (Expr::Iterate, Slot::Found(OwnedValue::Object(map))) => {
                     next.extend(map.values().map(Slot::Found));
+                }
+                // #6902: yq turns the missing or `null` step an iteration reaches into `[]`
+                // and iterates nothing; the write below creates it the same way.
+                (Expr::Iterate, Slot::Missing | Slot::Found(OwnedValue::Null)) => {
+                    creates = true;
                 }
                 _ => return None,
             }
@@ -44985,6 +45018,11 @@ fn yq_assign_noop_check<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `NotChecked` on that (unreachable) `Err` arm just means the caller
     // re-derives from scratch. A dynamic one evaluates here, once, and its
     // failure is what yq reports first (#1412).
+    // #6902: one plain target has no sibling for the `null` a missing key reads as to stand in
+    // for, so the iterate over it yields no branch, as the lone `del()` target does (#6892); the
+    // creation walk below then adds the steps yq creates (`zz: []`).
+    let single_write = write_target_is_one_path(path_expr) && !iterates_after_select(path_expr);
+    let _single = yq_single_target::enter(single_write);
     let mut paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false) {
         Ok(paths) => paths,
         Err((_, escape)) if needs_path_prepass(path_expr) => {
@@ -45597,13 +45635,26 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // an outer `(.[-5] |= 9)?` needs exactly that swallowed. `update_path` is
     // always entered with `false` below; any `?` it still sees came from an
     // `Expr::Optional` node inside `path_expr` itself.
-    let mut paths = match resolve_dynamic_indexes::<S>(path_expr, &result, false) {
+    // #6902: one plain target resolves to nothing over a missing path instead of raising, as in
+    // `yq_assign_noop_check`; the steps yq creates while walking it are written below.
+    let single_write = write_target_is_one_path(path_expr) && !iterates_after_select(path_expr);
+    let single = yq_single_target::enter(single_write);
+    let resolved = resolve_dynamic_indexes::<S>(path_expr, &result, false);
+    drop(single);
+    let mut paths = match resolved {
         Ok(paths) => paths,
         // `?` swallows only a genuine error; a halt always escapes — see the
         // matching comment in `eval_assign` (#791).
         Err((_, EvalEscape::Error(_))) if optional => return QueryResult::None,
         Err((_, escape)) => return escape.into(),
     };
+    if paths.is_empty() && S::TAG == EvalTag::Yq && single_write {
+        if let Some(FilteredCreation::Created(doc)) =
+            yq_filtered_target_creation::<S>(path_expr, &result)
+        {
+            return QueryResult::Owned(doc);
+        }
+    }
     // #2855: drop any resolved path that doesn't already exist, before the
     // write loop below ever runs -- only `sort_keys(f)` sets this (see
     // `eval_update_no_vivify`'s own doc comment for why). Checked only up
@@ -58018,7 +58069,7 @@ fn resolve_iterate_sink<'a, S: EvalSemantics>(
         }
         // #6892: a `null` too, for the only target of a `del()`: `del(.zz[] | select(.n == 1))`
         // over a document without `zz` leaves it as it is, as yq does.
-        OwnedValue::Null if S::TAG == EvalTag::Yq && yq_single_del_target::active() => {
+        OwnedValue::Null if S::TAG == EvalTag::Yq && yq_single_target::active() => {
             ResolveFlow::Exhausted
         }
         other => ResolveFlow::Escaped(EvalError::cannot_iterate_with(S::TAG, other).into()),
@@ -86282,7 +86333,7 @@ fn resolve_del_path_branches<'a, S: EvalSemantics>(
     // #4461: a slice bound's count error waits for a target that is in the document.
     let _deleting = (S::TAG == EvalTag::Yq).then(yq_delete_context::enter);
     let _single =
-        (S::TAG == EvalTag::Yq).then(|| yq_single_del_target::enter(del_target_is_one_path(expr)));
+        (S::TAG == EvalTag::Yq).then(|| yq_single_target::enter(write_target_is_one_path(expr)));
     let untracked = if S::TAG == EvalTag::Yq {
         Untracked::KeepInOrder
     } else {
