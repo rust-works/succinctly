@@ -30,6 +30,17 @@ const ACCEPTED: &[(&str, &str)] = &[
     ("a: b\t\n", "{\"a\":\"b\"}\n"),
     ("[1]\t\n", "[1]\n"),
     ("a: {x: 1}\t\n", "{\"a\":{\"x\":1}}\n"),
+    ("a: \"b\"\t\r\n", "{\"a\":\"b\"}\n"),
+    ("\"a\"\t\r\n", "\"a\"\n"),
+    ("--- \"a\"\t\n", "\"a\"\n"),
+    ("---\n\"a\"\t\n---\n", "\"a\"\nnull\n"),
+    ("\"a\"\t\n...\n", "\"a\"\n"),
+    ("--- \"a\"\t\n\t\n", "\"a\"\n"),
+    ("- &a \"x\"\t\n- *a\t\n", "[\"x\",\"x\"]\n"),
+    ("? k: v\t\n", "{\"\":null}\n"),
+    ("- ? a\t\n", "[{\"a\":null}]\n"),
+    ("\"a\"\t:\n", "{\"a\":null}\n"),
+    ("\"a\"\t: 1\n", "{\"a\":1}\n"),
 ];
 
 /// Refused by yq (a tab that starts a line, or content after the tab).
@@ -42,6 +53,15 @@ const REFUSED: &[&str] = &[
     "\"a\"\tb\n",
     "- \"a\"\t- b\n",
     "\"a\"\n \t\n",
+    "\"a\"\r\n\t\r\n",
+    "a: \"b\"\r\n\t\r\n",
+    "\"a\"\tb: 1\n",
+    "\"a\"\t- b\n",
+    "\"a\"\t? k\n",
+    "\"a\"\t\n\t\n",
+    "a: \"b\"\t\n  \t\n",
+    "? \"a\"\t\n  : 1\n",
+    "[ \"a\" ]\t\n\t\n",
 ];
 
 #[test]

@@ -3059,7 +3059,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     offset: next_pos,
                 });
             }
-            // Tab after spaces is start of content, indent count is correct
+            // Tab after spaces, or mid-line: separation or content, indent count is correct
         }
         Ok(count)
     }
@@ -3079,8 +3079,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// just past their closing delimiter, so the main loop can re-derive an "indent"
     /// from a mid-line cursor. A tab in the middle of a line is never indentation.
     ///
-    /// Only reachable with `indent >= 1`: `count_indent` already returns
-    /// `Err(TabIndentation)` for a tab at column 0, so `Ok(0)` implies no tab here.
+    /// `count_indent` returns `Err(TabIndentation)` for a tab at column 0 of a *line*, so an
+    /// `Ok(0)` with a tab at the cursor is a mid-line entry (#6937), which the `line_start` test
+    /// above rules out.
     #[inline]
     fn tab_indents_block_structure(&self, line_start: usize) -> bool {
         self.peek() == Some(b'\t')
