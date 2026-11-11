@@ -690,7 +690,11 @@ at all. The justification is the spec target, which is why the case belongs here
 A zero-padded decimal that holds an `8` or a `9` (`08`, `0018`, `-09`) is a `!!float` in yq, and here since [#6866](https://github.com/rust-works/succinctly/issues/6866).
 go-yaml tries a leading `0` as octal, which those digits break, and falls back to the float, so `a: 08` is `8.0` in JSON and keeps its spelling elsewhere.
 `007`, `0755` and `010` stay integers in both.
-Not matched: `tojson` and `@json` of such a scalar print `8` where yq prints `8.0`.
+Its JSON is `8.0` on every route since [#6899](https://github.com/rust-works/succinctly/issues/6899): a value that is bound, copied, merged, written through or rebuilt (`. as $x | $x`, `. * .`, `.zz = 1`, `with_entries`) and `tojson`/`@json` of it.
+The owned value holds the literal `08` as a float, and the JSON writers ask for the text of a literal by its number, since the same text is the integer `8` under an explicit `!!int` tag.
+Not matched: an explicit `!!int 08` (`k: !!int 08`) loses its integer on the routes that rebuild the document through the reindex bridge (`.k = .k`, `.zz = 1`, `with_entries(.)`) and in `tojson`.
+There it is `8.0` in JSON where yq prints `8`, because the bridge's spelling token carries the text `08` and not the number it was the literal of.
+Its `tag` is still `!!int`, and `tostring` and the YAML output keep `08`.
 
 ### A tag with no value is the empty string, except `!!int` and `!!float` (#6291)
 

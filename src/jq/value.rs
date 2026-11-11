@@ -914,7 +914,7 @@ fn input_bridge_literal_text(raw: &[u8]) -> String {
 /// back unchanged ([`is_jq_canonical_number`]) is copied as it is, so the printer allocates no
 /// `String` per number. It takes the literal as the `str` a `NumberLiteral` already holds, so
 /// nothing re-validates its UTF-8.
-fn push_number_jq_compat(out: &mut String, literal: &str) {
+fn push_number_jq_compat(out: &mut String, literal: &str, _is_float: bool) {
     if is_jq_canonical_number(literal.as_bytes()) {
         out.push_str(literal);
     } else {
@@ -925,7 +925,7 @@ fn push_number_jq_compat(out: &mut String, literal: &str) {
 /// [`input_bridge_literal_text`], appended to `out` (#5594). A canonical literal has no exponent,
 /// so it is never the overflow the bridge respells, and is copied as [`push_number_jq_compat`]
 /// copies it.
-fn push_input_bridge_literal_text(out: &mut String, literal: &str) {
+fn push_input_bridge_literal_text(out: &mut String, literal: &str, _is_float: bool) {
     if is_jq_canonical_number(literal.as_bytes()) {
         out.push_str(literal);
     } else {
@@ -4436,7 +4436,7 @@ impl OwnedValue {
         &self,
         depth: usize,
         jq_printer: bool,
-        finite_literal: fn(&mut String, &str),
+        finite_literal: fn(&mut String, &str, bool),
         float_fmt: fn(f64) -> String,
         infinite_fmt: fn(bool) -> &'static str,
         nan_fmt: fn(&mut String, f64),
@@ -4468,7 +4468,7 @@ impl OwnedValue {
         out: &mut String,
         depth: usize,
         jq_printer: bool,
-        finite_literal: fn(&mut String, &str),
+        finite_literal: fn(&mut String, &str, bool),
         float_fmt: fn(f64) -> String,
         infinite_fmt: fn(bool) -> &'static str,
         nan_fmt: fn(&mut String, f64),
@@ -4504,7 +4504,9 @@ impl OwnedValue {
             {
                 out.push_str(infinite_fmt(f.is_sign_negative()));
             }
-            Self::NumberLiteral(_, literal) => finite_literal(out, literal),
+            Self::NumberLiteral(repr, literal) => {
+                finite_literal(out, literal, matches!(repr, NumberRepr::Float(_)));
+            }
             Self::String(s) => {
                 out.push('"');
                 let _ = write_json_body_jq(out, s);
@@ -4559,7 +4561,7 @@ impl OwnedValue {
         &self,
         depth: usize,
         jq_printer: bool,
-        finite_literal: fn(&[u8]) -> String,
+        finite_literal: fn(&[u8], bool) -> String,
         float_fmt: fn(f64) -> String,
         infinite_fmt: fn(bool) -> &'static str,
         nan_fmt: fn(f64) -> String,
@@ -4613,7 +4615,9 @@ impl OwnedValue {
             // input via `format_overflow_literal_mantissa` rather than
             // assuming finiteness, and yq's `real_output_finite_literal`
             // echoes raw text verbatim regardless of the parsed value.
-            Self::NumberLiteral(_, literal) => finite_literal(literal.as_bytes()),
+            Self::NumberLiteral(repr, literal) => {
+                finite_literal(literal.as_bytes(), matches!(repr, NumberRepr::Float(_)))
+            }
             Self::String(s) => format!("\"{}\"", escape_json_body(write_json_body_jq, s)),
             Self::Array(arr) => {
                 let elements: Vec<String> = arr
@@ -11172,6 +11176,36 @@ mod tests {
         }
     }
 
+    /// #6899: yq's JSON text for the text `08` depends on the number it is the literal of: the float
+    /// a YAML document wrote (`8.0`, #6866) or the integer an explicit `!!int` forced (`8`). Every
+    /// writer a yq JSON caller reaches asks with the repr, and the other conventions ignore it.
+    #[test]
+    fn yq_json_text_of_a_zero_padded_literal_follows_its_repr_6899() {
+        let float = OwnedValue::NumberLiteral(NumberRepr::Float(8.0), "08".into());
+        let int = OwnedValue::NumberLiteral(NumberRepr::Int(8), "08".into());
+        let negative = OwnedValue::NumberLiteral(NumberRepr::Float(-9.0), "-09".into());
+        let wide = OwnedValue::NumberLiteral(NumberRepr::Float(18.0), "0018".into());
+        let kept = OwnedValue::NumberLiteral(NumberRepr::Int(7), "007".into());
+        for (value, want) in [
+            (&float, "8.0"),
+            (&int, "8"),
+            (&negative, "-9.0"),
+            (&wide, "18.0"),
+            (&kept, "7"),
+        ] {
+            assert_eq!(value.to_json_yq(), want, "{value:?}");
+            assert_eq!(
+                crate::jq::stream::owned_value_to_yq_json_string(value, 0),
+                want,
+                "{value:?}"
+            );
+        }
+        // Every other convention keeps what it did: the spelling, or jq's reformatting of it.
+        assert_eq!(crate::jq::stream::real_output_finite_literal(b"08"), "08");
+        assert_eq!(float.to_json_jq_preserve(), "08");
+        assert_eq!(int.to_json_jq_preserve(), "08");
+    }
+
     /// #5549: the printer's text is written in one pass now; it must be the bytes the nested
     /// per-node form wrote, under each of the four conventions its callers pass (jq's printer,
     /// the input bridge, `--preserve-input`, yq), for every kind of leaf, for the depth marker
@@ -11183,8 +11217,8 @@ mod tests {
     fn printer_text_matches_the_nested_form_5549() {
         type Convention = (
             bool,
-            fn(&[u8]) -> String,
-            fn(&mut String, &str),
+            fn(&[u8], bool) -> String,
+            fn(&mut String, &str, bool),
             fn(f64) -> String,
             fn(bool) -> &'static str,
             fn(f64) -> String,
@@ -11193,7 +11227,7 @@ mod tests {
         let conventions: [Convention; 4] = [
             (
                 true,
-                format_number_jq_compat,
+                |raw, _| format_number_jq_compat(raw),
                 push_number_jq_compat,
                 jq_bare_float_display,
                 infinite_float_preview_text,
@@ -11202,7 +11236,7 @@ mod tests {
             ),
             (
                 false,
-                input_bridge_literal_text,
+                |raw, _| input_bridge_literal_text(raw),
                 push_input_bridge_literal_text,
                 jq_bare_float_display,
                 overflow_literal_text,
@@ -11211,7 +11245,7 @@ mod tests {
             ),
             (
                 true,
-                crate::jq::stream::real_output_finite_literal,
+                |raw, _| crate::jq::stream::real_output_finite_literal(raw),
                 crate::jq::stream::push_real_output_finite_literal,
                 jq_bare_float_display,
                 infinite_float_preview_text,
@@ -11248,6 +11282,9 @@ mod tests {
             literal("1e400"),
             literal("0.0000001"),
             literal("100000000000000000000"),
+            // #6899: the same text as a float (`08`, a document) and as an integer (`!!int 08`).
+            OwnedValue::NumberLiteral(NumberRepr::Float(8.0), "08".into()),
+            OwnedValue::NumberLiteral(NumberRepr::Int(8), "08".into()),
             // #5594: spellings the appending jq formatter copies (canonical) and ones it has to
             // hand to the formatter (a leading zero or `+`, no integer part, an exponent).
             literal("-12"),
@@ -11318,7 +11355,7 @@ mod tests {
                     over.to_json_nested_at_depth(
                         0,
                         false,
-                        format_number_jq_compat,
+                        |raw, _| format_number_jq_compat(raw),
                         jq_bare_float_display,
                         infinite_float_preview_text,
                         printed_nan,

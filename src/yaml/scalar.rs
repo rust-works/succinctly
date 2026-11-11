@@ -685,6 +685,22 @@ fn has_non_json_float_marker(raw: &str) -> bool {
 /// YAML document's `-0` is a float, which never reaches this function as that text.
 #[must_use]
 pub fn yq_json_number_text(raw: &str) -> Option<String> {
+    yq_json_number_text_for(raw, false)
+}
+
+/// [`yq_json_number_text`] for a literal whose number is known to be a float (`is_float`) or an
+/// integer (#6899).
+///
+/// The text alone cannot say. `08` is the float yq's JSON encoder writes as `8.0` when a YAML
+/// document wrote it (go-yaml tries a leading `0` as octal, an `8` or `9` breaks it, #6866), and
+/// the integer `8` when an explicit `!!int` tag forced it. Both are owned values holding the
+/// text `08`, as a `NumberLiteral` of a float and of an integer, and the decimal parse of
+/// [`spelled_int_json_text`] reads both as 8.
+#[must_use]
+pub fn yq_json_number_text_for(raw: &str, is_float: bool) -> Option<String> {
+    if is_float && is_zero_padded_with_8_or_9(raw) {
+        return spelled_float_json_text(raw);
+    }
     overflowed_int_json_text(raw)
         .or_else(|| spelled_int_json_text(raw))
         .or_else(|| spelled_float_json_text(raw))
@@ -1333,6 +1349,43 @@ mod tests {
         assert!(!is_preservable_float_literal(
             "123456789012345678901234567890"
         ));
+    }
+
+    /// #6899: `08` is the float `8.0` for a literal of a float and the integer `8` for a literal of
+    /// an integer, and no other text depends on which.
+    #[test]
+    fn yq_json_number_text_for_splits_a_zero_padded_8_or_9_by_its_repr_6899() {
+        for (raw, float, int) in [
+            ("08", "8.0", "8"),
+            ("09", "9.0", "9"),
+            ("-09", "-9.0", "-9"),
+            ("+08", "8.0", "8"),
+            ("0018", "18.0", "18"),
+            ("00000000000000000000000008", "8.0", "8"),
+        ] {
+            assert_eq!(
+                yq_json_number_text_for(raw, true).as_deref(),
+                Some(float),
+                "{raw}"
+            );
+            assert_eq!(
+                yq_json_number_text_for(raw, false).as_deref(),
+                Some(int),
+                "{raw}"
+            );
+            // The text-only form is the integer's.
+            assert_eq!(yq_json_number_text(raw).as_deref(), Some(int), "{raw}");
+        }
+        // Text that is not a zero-padded 8-or-9 reads the same either way.
+        for raw in [
+            "007", "0755", "+5", "0x1f", "2.0", "+1.0", "1.", "-0", "42", "1e3",
+        ] {
+            assert_eq!(
+                yq_json_number_text_for(raw, true),
+                yq_json_number_text_for(raw, false),
+                "{raw}"
+            );
+        }
     }
 
     /// #2802, #1356: only text yq's `parseInt64` reads that is not the canonical decimal is a

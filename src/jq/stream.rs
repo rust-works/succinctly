@@ -321,7 +321,7 @@ pub(crate) fn real_output_finite_literal(raw: &[u8]) -> String {
 
 /// [`real_output_finite_literal`], appended to `out` with no `String` of its own: the form
 /// `OwnedValue`'s printer takes, from the `str` a `NumberLiteral` holds (#5594).
-pub(crate) fn push_real_output_finite_literal(out: &mut String, literal: &str) {
+pub(crate) fn push_real_output_finite_literal(out: &mut String, literal: &str, _is_float: bool) {
     out.push_str(literal);
 }
 
@@ -332,20 +332,20 @@ pub(crate) fn push_real_output_finite_literal(out: &mut String, literal: &str) {
 /// (`tostring`, YAML output) but is encoded as the double it parsed
 /// (`100000000000000000000.0`) by its JSON encoder, which is the spelling the
 /// bare `Float` printed before the digits were kept.
-pub(crate) fn yq_json_finite_literal(raw: &[u8]) -> String {
+pub(crate) fn yq_json_finite_literal(raw: &[u8], is_float: bool) -> String {
     // Lossy, as `real_output_finite_literal` is: a replacement character is no digit, so text
     // that was not UTF-8 is never respelled and is echoed as that function echoes it.
     let mut out = String::new();
-    push_yq_json_finite_literal(&mut out, &String::from_utf8_lossy(raw));
+    push_yq_json_finite_literal(&mut out, &String::from_utf8_lossy(raw), is_float);
     out
 }
 
 /// [`yq_json_finite_literal`], appended to `out`, and the one definition of its rule (#5594):
 /// only the respelled wide integer allocates.
-pub(crate) fn push_yq_json_finite_literal(out: &mut String, literal: &str) {
-    match crate::yaml::yq_json_number_text(literal) {
+pub(crate) fn push_yq_json_finite_literal(out: &mut String, literal: &str, is_float: bool) {
+    match crate::yaml::yq_json_number_text_for(literal, is_float) {
         Some(text) => out.push_str(&text),
-        None => push_real_output_finite_literal(out, literal),
+        None => push_real_output_finite_literal(out, literal, is_float),
     }
 }
 
@@ -414,7 +414,7 @@ pub fn stream_owned_value_json_jq<W: core::fmt::Write>(
         jq_bare_float_display,
         |negative| infinite_float_preview_text(negative).to_string(),
         preview_infinite_literal,
-        format_number_for_preview,
+        |raw, _| format_number_for_preview(raw),
         true,
     )
 }
@@ -456,7 +456,7 @@ pub(crate) fn stream_owned_value_json_jq_preserve_input<W: core::fmt::Write>(
         jq_bare_float_display,
         jq_output_infinite_float,
         real_output_finite_literal,
-        real_output_finite_literal,
+        |raw, _| real_output_finite_literal(raw),
         true,
     )
 }
@@ -495,7 +495,7 @@ pub(crate) fn stream_owned_value_json_jq_output<W: core::fmt::Write>(
         jq_bare_float_display,
         jq_output_infinite_float,
         format_number_jq_compat,
-        format_number_jq_compat,
+        |raw, _| format_number_jq_compat(raw),
         true,
     )
 }
@@ -556,7 +556,7 @@ fn stream_owned_value_json_with<W: core::fmt::Write>(
     float_fmt: fn(f64) -> String,
     infinite_float: fn(bool) -> String,
     infinite_literal: fn(&[u8]) -> String,
-    finite_literal: fn(&[u8]) -> String,
+    finite_literal: fn(&[u8], bool) -> String,
     jq_printer: bool,
 ) -> core::fmt::Result {
     stream_owned_value_json_with_at_depth(
@@ -594,7 +594,7 @@ fn stream_owned_value_json_with_at_depth<W: core::fmt::Write>(
     float_fmt: fn(f64) -> String,
     infinite_float: fn(bool) -> String,
     infinite_literal: fn(&[u8]) -> String,
-    finite_literal: fn(&[u8]) -> String,
+    finite_literal: fn(&[u8], bool) -> String,
     jq_printer: bool,
     depth: usize,
 ) -> core::fmt::Result {
@@ -622,7 +622,10 @@ fn stream_owned_value_json_with_at_depth<W: core::fmt::Write>(
             NumberRepr::Float(f) if f.is_infinite() => {
                 out.write_str(&infinite_literal(literal.as_bytes()))
             }
-            _ => out.write_str(&finite_literal(literal.as_bytes())),
+            _ => out.write_str(&finite_literal(
+                literal.as_bytes(),
+                matches!(repr, NumberRepr::Float(_)),
+            )),
         },
         OwnedValue::String(s) => stream_json_string(out, s, escape),
         OwnedValue::Array(arr) => {
@@ -750,7 +753,7 @@ fn write_object_entries<'a, W: core::fmt::Write>(
     float_fmt: fn(f64) -> String,
     infinite_float: fn(bool) -> String,
     infinite_literal: fn(&[u8]) -> String,
-    finite_literal: fn(&[u8]) -> String,
+    finite_literal: fn(&[u8], bool) -> String,
     jq_printer: bool,
     depth: usize,
 ) -> core::fmt::Result {
