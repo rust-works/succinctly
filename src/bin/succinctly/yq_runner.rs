@@ -6252,15 +6252,42 @@ fn selects_by_node_metadata(target: &Expr) -> bool {
     !ends_in_slot(target)
         && (jq::walk::uses_cursor_metadata_builtins(target)
             || jq::walk::any_subexpr(target, &mut |e| {
-                // #6895: `tag` answers the node's own tag (`!Ref`) on the cursor and the core tag of
-                // its value (`!!str`) on the owned document.
                 matches!(
                     e,
-                    Expr::Builtin(
-                        Builtin::Kind | Builtin::Tag | Builtin::FileIndex | Builtin::Filename
-                    )
+                    Expr::Builtin(Builtin::Kind | Builtin::FileIndex | Builtin::Filename)
                 )
             }))
+}
+
+/// Whether a write's left side reads `tag` only to compare it with the tag of a node that holds no
+/// nodes (#6895): the node's own tag (`!Ref`) is what yq compares, and the owned document answers the
+/// core tag of its value (`!!str`), which selects a custom-tagged scalar wrongly. Resolving on the
+/// cursor writes literal paths, which targets that nest (`select(tag == "!!map")` renaming every
+/// level) cannot take, so a comparison with `!!map` or `!!seq`, and any other read of `tag`, keeps the
+/// owned route. The caller also asks for a document that has an explicit tag.
+fn selects_by_tag(target: &Expr) -> bool {
+    let mut tag_reads = 0usize;
+    let mut scalar_compares = 0usize;
+    jq::walk::any_subexpr(target, &mut |e| {
+        match e {
+            Expr::Builtin(Builtin::Tag) => tag_reads += 1,
+            Expr::Compare { left, right, .. } => {
+                let literal = match (left.as_ref(), right.as_ref()) {
+                    (Expr::Builtin(Builtin::Tag), Expr::Literal(Literal::String(tag)))
+                    | (Expr::Literal(Literal::String(tag)), Expr::Builtin(Builtin::Tag)) => {
+                        Some(tag.as_ref())
+                    }
+                    _ => None,
+                };
+                if literal.is_some_and(|tag: &str| !matches!(tag, "!!map" | "!!seq")) {
+                    scalar_compares += 1;
+                }
+            }
+            _ => {}
+        }
+        false
+    });
+    tag_reads > 0 && tag_reads == scalar_compares
 }
 
 /// `expr` with the left side of its write (or the argument of its `del`) replaced by what
@@ -6355,7 +6382,9 @@ fn resolve_metadata_write_targets<W: AsRef<[u64]> + Clone>(
         other => (other, None),
     };
     let rewritten = retarget_write(write, &mut |target| {
-        if !selects_by_node_metadata(target) {
+        if !selects_by_node_metadata(target)
+            && !(selects_by_tag(target) && cursor.index().has_explicit_tags())
+        {
             return None;
         }
         let query = Expr::Pipe(vec![target.clone(), Expr::Builtin(Builtin::PathNoArg)].into());
