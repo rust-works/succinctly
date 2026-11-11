@@ -11790,14 +11790,18 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         }))),
         OutputFormat::Ini => Some(YqOutputEncoder::Ini),
         OutputFormat::Toml => Some(YqOutputEncoder::Toml),
+        OutputFormat::Kyaml => Some(YqOutputEncoder::Kyaml(usize::from(args.indent))),
         OutputFormat::Yaml | OutputFormat::Json | OutputFormat::Auto => None,
     };
     if output_encoder.is_some() {
-        // Every encoder writes its own line ends (or none), so nothing is added after a result.
+        // Every encoder but KYAML's writes its own line ends (or none), so nothing is added after a result.
+        // KYAML leaves the line end to the printer and keeps YAML's `---` between documents, which `-N`
+        // removes as it does for YAML.
+        let kyaml = args.output_format == OutputFormat::Kyaml;
+        args.no_doc = args.no_doc || !kyaml;
+        args.output_encoder_joins = !kyaml;
         args.output_format = OutputFormat::Yaml;
         args.raw_output = true;
-        args.no_doc = true;
-        args.output_encoder_joins = true;
     }
 
     // Handle --version
