@@ -7657,4 +7657,5 @@ The encoder runs over the value model, so on a YAML input these still differ:
 - A head, line or foot comment is dropped, where yq writes it (`a: 1, # c`).
 - An input whose first document opens with `---` prints that `---` first in yq (it keeps the document's leading separator as leading content), and here it does not.
 - The YAML 1.1 integer `1_000` is a string here (see the YAML 1.1 section above), so it is quoted, where yq writes it bare.
+- `-C` colours the output in yq (`-o=kyaml` and `-o=toml` have colour printers of their own) and does nothing here.
 - With `-0`, the separator between documents is `\n---` here and `---` in yq, the existing difference of the `-0` multi-document section above.

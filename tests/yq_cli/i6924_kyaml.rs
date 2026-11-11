@@ -56,3 +56,45 @@ fn kyaml_short_name_6924() -> Result<()> {
     assert_eq!(one, other);
     Ok(())
 }
+
+/// (filter, input, yq's stdout, yq's exit status): several results, keys that read as other types, escapes.
+const FILTER_ROWS: &[(&str, &str, &str, i32)] = &[
+    (".a, .b", "a: 1\nb: [2]\n", "1\n[\n  2,\n]\n", 0),
+    (
+        ".[]",
+        "[{a: 1}, {b: 2}, 3]\n",
+        "{\n  a: 1,\n}\n{\n  b: 2,\n}\n3\n",
+        0,
+    ),
+    (
+        ".a, .b",
+        "a: 1\nb: [2]\n---\na: 3\nb: 4\n",
+        "1\n[\n  2,\n]\n---\n3\n4\n",
+        0,
+    ),
+    (
+        "{\"null\": 1, \"true\": 2, \"yes\": 3, \"123\": 4}",
+        "a: 1\n",
+        "{\n  null: 1,\n  true: 2,\n  yes: 3,\n  \"123\": 4,\n}\n",
+        0,
+    ),
+    (
+        "\"x\\u001b\\u001f\"",
+        "a: 1\n",
+        "\"x\\\\u001b\\\\u001f\"\n",
+        0,
+    ),
+];
+
+#[test]
+fn kyaml_filter_rows_match_yq_6924() -> Result<()> {
+    for (filter, input, expected, code) in FILTER_ROWS {
+        let (stdout, status) = run_yq_stdin(filter, input, &["-o=kyaml"])?;
+        assert_eq!(
+            (stdout.as_str(), status),
+            (*expected, *code),
+            "-o=kyaml {filter:?} over {input:?}"
+        );
+    }
+    Ok(())
+}
