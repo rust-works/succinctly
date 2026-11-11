@@ -1,5 +1,6 @@
 //! #6880: a write holds no presentation tree for the parts of a document that say nothing, and
-//! gives the same output without it. Every row was captured from yq v4.53.3 (`yq`, YAML output).
+//! gives the same output without it. Every row was captured from yq v4.53.3 (`yq`, YAML output),
+//! except the last test, which pins what `succinctly yq` prints for a write it refuses (#2796).
 //!
 //! The rows cover what the saving must not change: `-P` placing a flow collection's trailing
 //! comment on the next item (the held comment goes to that item's first member, which a

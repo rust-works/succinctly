@@ -192,7 +192,8 @@ both.
   record collapses, which is the shape this does not help. The M4 Pro's peak RSS is noisy for `nested`
   (the same binary read 267-271 or 365-378 MiB at 20 MiB, and 1145 to 1553 at 100 MiB): macOS keeps freed
   pages resident until the kernel purges them, so read the 7950X column, whose runs agree to a MiB, for the
-  size of the saving. The first version collapsed the finished tree in a pass, which freed millions of cold
+  size of the saving. With `-P` the 100 MiB `users` write takes 11.30 s to 8.52 s on the 7950X (-24.6%) and 7.01 s
+  to 6.02 s on the M4 Pro (-14.1%). The first version collapsed the finished tree in a pass, which freed millions of cold
   nodes and made the 100 MiB `users` write 30% *slower* on the 7950X (10.38 s to 13.43 s, measured before the table above) while saving the
   same memory; collapsing a child as it is finished frees it while it is still in cache. The M4 Pro carried other
   sessions' load while it was timed (a load average of 1-2), so its times are interleaved ratios, not

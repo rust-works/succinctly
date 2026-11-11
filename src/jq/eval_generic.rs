@@ -3559,6 +3559,12 @@ pub enum CommentTree {
     /// into it first gives it the childless tree it stands for ([`Self::materialize`]). Unlike a
     /// `Leaf` over a collection, which a write that changed a node's kind leaves, it is the
     /// collection's own tree, so the sites that treat the two differently can tell them apart.
+    ///
+    /// What it is not is a tree to write into by position: once unfolded it is a collection with
+    /// no members, where the full tree had one node per member, so a pass that indexes members
+    /// (the comment setters, a negative index counted from the end) would find none. The caller
+    /// that asks for the collapsed form ([`to_owned_with_comments_pruned`]) decides that nothing
+    /// of the kind runs over the tree; `yq_runner.rs` gates it on the expression.
     Silent(SilentKind),
 }
 
@@ -3967,7 +3973,7 @@ impl CommentTree {
     /// metadata (what a scalar with no comment, style, anchor, tag or spelling is) or a
     /// collapsed [`Self::Silent`] collection (#6880). The one definition the builder's collapse
     /// uses, a node is silent only when every child already is.
-    pub fn is_silent(&self) -> bool {
+    fn is_silent(&self) -> bool {
         match self {
             Self::Leaf(meta) => meta.is_empty(),
             Self::Silent(_) => true,
@@ -4005,7 +4011,7 @@ impl CommentTree {
 
     /// Give a [`Self::Silent`] collection the childless tree it stands for, for a caller that
     /// writes into the tree. A no-op for every other node.
-    pub fn materialize(&mut self) {
+    fn materialize(&mut self) {
         match self {
             Self::Silent(SilentKind::Array) => *self = Self::Array(MetaBox::empty(), Vec::new()),
             Self::Silent(SilentKind::Object) => {
@@ -4166,7 +4172,9 @@ impl CommentTree {
     /// container written on the lines below, so the comment is not an absent-value one. A no-op
     /// for a node that is not an `Object`.
     pub fn set_key_comment(&mut self, key: &str, comment: String) {
-        self.materialize();
+        if let Self::Silent(SilentKind::Object) = self {
+            self.materialize();
+        }
         if let Self::Object(_, _, keys) = self {
             let meta = keys.entry_or_default(key.to_string());
             meta.comment = Some(comment);

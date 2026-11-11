@@ -4082,7 +4082,8 @@ fn assign_reads_tree_by_shape(expr: &Expr) -> bool {
         })
 }
 
-/// [`assert_value_tree_depth`] for every node of `value`, `depth` being the level of its root: what [`reconcile_presentation_at_depth`] would have checked on the way down, for the
+/// [`assert_value_tree_depth`] for every node of `value`, `depth` being the level of its root:
+/// what [`reconcile_presentation_at_depth`] would have checked on the way down, for the
 /// walk it skips over a pristine tree that says nothing (#6880). Allocates nothing.
 fn assert_value_depth_below(value: &OwnedValue, depth: usize) {
     assert_value_tree_depth(depth);
@@ -5729,27 +5730,16 @@ fn copied_container_takes_style(
     source: &CommentTree,
     old: Option<&CommentTree>,
 ) -> bool {
+    // A `Silent` tree never reaches a plain assignment's copy: the snapshot is not collapsed
+    // for one (`assign_reads_tree_by_shape`).
     let kind = match copy {
-        CommentTree::Array(..) | CommentTree::Silent(SilentKind::Array) => "!!seq",
-        CommentTree::Object(..) | CommentTree::Silent(SilentKind::Object) => "!!map",
-        CommentTree::Leaf(_) => return false,
+        CommentTree::Array(..) => "!!seq",
+        CommentTree::Object(..) => "!!map",
+        CommentTree::Leaf(_) | CommentTree::Silent(_) => return false,
     };
-    // A silent collection is one with members (a block collection is never empty).
     let non_empty_of_kind = |old: &CommentTree| match (old, copy) {
         (CommentTree::Array(_, items), CommentTree::Array(..)) => !items.is_empty(),
         (CommentTree::Object(_, fields, _), CommentTree::Object(..)) => !fields.is_empty(),
-        (
-            CommentTree::Silent(SilentKind::Array),
-            CommentTree::Array(..) | CommentTree::Silent(SilentKind::Array),
-        )
-        | (
-            CommentTree::Silent(SilentKind::Object),
-            CommentTree::Object(..) | CommentTree::Silent(SilentKind::Object),
-        ) => true,
-        (CommentTree::Array(_, items), CommentTree::Silent(SilentKind::Array)) => !items.is_empty(),
-        (CommentTree::Object(_, fields, _), CommentTree::Silent(SilentKind::Object)) => {
-            !fields.is_empty()
-        }
         _ => false,
     };
     match old {
@@ -5774,10 +5764,6 @@ fn copied_container_tag(
 
 /// Drop every anchor declaration and alias mark at or under `node`.
 fn strip_anchor_marks(node: &mut CommentTree) {
-    // A silent collection holds no anchor anywhere, and writing into it would unfold it.
-    if let CommentTree::Silent(_) = node {
-        return;
-    }
     node.meta_mut().anchor = None;
     match node {
         CommentTree::Leaf(_) | CommentTree::Silent(_) => {}
@@ -8441,15 +8427,19 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
     // reads or writes the tree by position or by shape: an alias mark is matched against it, a
     // metadata write (`style =`, `head_comment =`, `tag =`, ...) places something into it, and a
     // plain assignment from a read copies a source subtree's presentation.
-    let prune_silent_subtrees = !has_aliases
-        && count_meta_assigns(expr) == 0
-        && !writes_tag(expr)
-        && !assign_reads_tree_by_shape(expr);
+    // The gate is read only when the snapshot is taken: a read, or a run with no use for
+    // comments, does not walk the expression for it.
+    let prune_silent_subtrees = || {
+        !has_aliases
+            && count_meta_assigns(expr) == 0
+            && !writes_tag(expr)
+            && !assign_reads_tree_by_shape(expr)
+    };
     let presentation_sync_ctx = match ((need_comments || writes_tag(expr))
         && is_alias_sensitive_assign(expr))
     .then(|| match pristine_override {
         Some(sub) => Ok(sub),
-        None if prune_silent_subtrees => {
+        None if prune_silent_subtrees() => {
             to_owned_with_comments_pruned::<_, YqSemantics>(&cursor.value(), Some(&cursor))
         }
         None => to_owned_with_comments::<_, YqSemantics>(&cursor.value(), Some(&cursor)),
@@ -15891,16 +15881,22 @@ mod tests {
         // Writes that keep every container's kind: the same value, a key added and a key
         // removed, an array grown and shrunk.
         let config = block_yaml_config();
-        for written in [
-            b"a:\n  b:\n    - 1\n    - 2\n  c: x\nd:\n  - e: 1\n  - e: 2\nf: 3\n".as_slice(),
-            b"a:\n  b:\n    - 1\n    - 2\n    - 3\n  z: 9\nd:\n  - e: 1\nf: 3\ng:\n  h: 1\n"
-                .as_slice(),
+        for (written, silent_d) in [
+            (
+                b"a:\n  b:\n    - 1\n    - 2\n  c: x\nd:\n  - e: 1\n  - e: 2\nf: 3\n".as_slice(),
+                true,
+            ),
+            (
+                b"a:\n  b:\n    - 1\n    - 2\n    - 3\n  z: 9\nd:\n  - e: 1\nf: 3\ng:\n  h: 1\n"
+                    .as_slice(),
+                true,
+            ),
         ] {
             let (result, _) = pristine_of(written);
             let dense_out = reconcile_presentation(&value, &dense, &result, &[]);
             let pruned_out = reconcile_presentation(&value, &pruned, &result, &[]);
             // The silent part of the result is one word where the dense walk built its nodes.
-            if written.starts_with(b"a:\n  b:\n    - 1\n    - 2\n  c: x\nd:\n  - e: 1\n  - e: 2") {
+            if silent_d {
                 assert!(matches!(dense_out.field("d"), CommentTree::Array(..)));
                 assert!(matches!(pruned_out.field("d"), CommentTree::Silent(_)));
             }

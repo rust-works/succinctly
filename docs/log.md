@@ -7,7 +7,7 @@ Tracks updates to the knowledge wiki pages in `docs/`.
 **Sources ingested:**
 - `src/jq/eval_generic.rs` (`CommentTree::collapse_if_silent`, `to_owned_with_comments_pruned`) and
   `src/bin/succinctly/yq_runner.rs` (`reconcile_presentation_at_depth`, the snapshot's gate): interleaved
-  release A/B against `main` @ `3d532c317` on a Ryzen 9 7950X and an Apple M4 Pro, peak RSS and wall time
+  release A/B against `main` @ `13def7c58` on a Ryzen 9 7950X and an Apple M4 Pro, peak RSS and wall time
   at 20 and 100 MiB over `users`, `comprehensive`, `nested` and the shapes that cannot collapse
 
 **Pages updated:**

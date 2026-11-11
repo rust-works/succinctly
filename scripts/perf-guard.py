@@ -587,7 +587,7 @@ QUERY_THRESHOLDS = {
     "users_del_bound_select": 30.0,
     "users_assign_scores": 30.0,
     "users_update_select": 30.0,
-    "users_yq_del_select": 30.0,
+    "users_yq_del_select": 15.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
