@@ -732,7 +732,11 @@ $ printf 'a: !\nb: 1\n' | succinctly yq -o json -I0 .        # {"a":null,"b":1} 
 ```
 
 Not covered here:
-- The YAML output of these nodes since [#6948](https://github.com/rust-works/succinctly/issues/6948): yq drops the `!` it reads (`a: !` prints `a:`, `a: ! x` prints `a: x`), and so does this, on every route (the cursor writers and the node's tag in a written document), because the cursor reports the non-specific tag as no tag. A string written into such a node therefore reads back as itself (`.x = "12"` over `x: !` is `x: "12"`, `.x = ""` over `x: ! a` is `x: ""`), and a write that fills the null prints `a: N`.
+- The YAML output of these nodes, since [#6948](https://github.com/rust-works/succinctly/issues/6948).
+  yq drops the `!` it reads (`a: !` prints `a:`, `a: ! x` prints `a: x`), and so does this, on every route.
+  The cursor reports the non-specific tag as no tag, so the cursor writers and the tag of a written document agree.
+  A string written into such a node therefore reads back as itself (`.x = "12"` over `x: !` is `x: "12"`, `.x = ""` over `x: ! a` is `x: ""`), and a write that fills the null prints `a: N`.
+  A `!` on a key is gone from the key too, so `! 1: v` has the key `1` in `keys` (it was the string `"1"`), as in yq.
 - A document that is only `!` prints nothing under `-o=yaml`, as `!!null` does, where yq prints a blank line (the empty-document output of #5721). It printed the blank line before #6942, because the node was the empty string.
 
 ### A scalar under an unknown `!!` tag is its text (#6299)

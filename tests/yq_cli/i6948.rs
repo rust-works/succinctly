@@ -26,7 +26,6 @@ const ROWS: &[(&str, &str, &str)] = &[
     ("a: ! x\n", ".a", "x\n"),
     ("a: ! x\n", ". as $x | $x", "a: x\n"),
     ("a: ! x\nb: 1\n", ".b = 2", "a: x\nb: 2\n"),
-    ("a: ! x\n", "-P", "a: x\n"),
     ("a: ! x\n", "[.a]", "- x\n"),
     ("a: &r ! x\nb: *r\n", ".", "a: &r x\nb: *r\n"),
     ("a: ! x # c\n", ".", "a: x # c\n"),
@@ -53,6 +52,18 @@ const ROWS: &[(&str, &str, &str)] = &[
     ("a: ! x\n", "line", "1\n"),
     ("--- ! x\n", ".", "---\nx\n"),
     ("! x\n", ".", "x\n"),
+    ("? ! 1\n: v\n", ".", "1: v\n"),
+    ("! 1: v\n", ".", "1: v\n"),
+    ("! 1: v\n", "keys", "- 1\n"),
+    ("! true: v\n", "keys", "- true\n"),
+    ("! null: v\n", "keys", "- null\n"),
+    ("! 1: v\n", ".1", "v\n"),
+    ("? ! 1\n: v\n", "to_entries", "- key: 1\n  value: v\n"),
+    ("[! a, ! , ! 1]\n", ".", "[a, '', 1]\n"),
+    ("{! a: ! b}\n", ".", "{a: b}\n"),
+    ("a: &r ! x\nb: *r\n", ".b = \"y\"", "a: &r x\nb: y\n"),
+    ("a: ! x\n---\nb: ! y\n", ".", "a: x\n---\nb: y\n"),
+    ("! 1: v\n", ". | keys | .[0] | type", "!!int\n"),
 ];
 
 #[test]
@@ -72,5 +83,14 @@ fn a_specific_tag_is_still_written_6948() -> Result<()> {
     let (stdout, code) = run_yq_stdin(".", doc, &[])?;
     assert_eq!(code, 0);
     assert_eq!(stdout, "a: x\nb: !custom y\nc: !!str z\n");
+    Ok(())
+}
+
+/// `-P` forces the DOM route, which writes the node's tag from its presentation record.
+#[test]
+fn the_dom_route_drops_it_too_6948() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(".", "a: ! x\nb: ! [1]\n", &["-P"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "a: x\nb:\n  - 1\n");
     Ok(())
 }
