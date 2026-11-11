@@ -6382,9 +6382,8 @@ fn resolve_metadata_write_targets<W: AsRef<[u64]> + Clone>(
         other => (other, None),
     };
     let rewritten = retarget_write(write, &mut |target| {
-        if !selects_by_node_metadata(target)
-            && !(selects_by_tag(target) && cursor.index().has_explicit_tags())
-        {
+        let by_tag = || selects_by_tag(target) && cursor.index().has_explicit_tags();
+        if !(selects_by_node_metadata(target) || by_tag()) {
             return None;
         }
         let query = Expr::Pipe(vec![target.clone(), Expr::Builtin(Builtin::PathNoArg)].into());
