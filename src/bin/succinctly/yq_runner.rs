@@ -11709,8 +11709,9 @@ fn get_input_files(args: &YqCommand) -> Vec<String> {
     // because the filter comes from a file instead of command line
     let mut files = Vec::new();
 
-    if args.from_file.is_some() {
-        // When --from-file is used, the first positional arg (if any) is an input file
+    if args.from_file.is_some() || args.expression.is_some() {
+        // When --from-file or --expression (#7025) is used, the first positional arg (if any) is an
+        // input file
         if let Some(ref first_file) = args.filter {
             files.push(first_file.clone());
         }
@@ -11895,6 +11896,21 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         args.output_format = OutputFormat::Json;
     }
 
+    // #7025: `--split-exp-file` is `--split-exp` read from a file. It wins over `--split-exp`, and an
+    // empty file means no split at all (`--split-exp-file empty --split-exp X` prints normally), as in
+    // yq v4.53.3.
+    if let Some(path) = args.split_exp_file.take() {
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read split expression file: {}", path.display()))?;
+        args.split_exp = (!text.is_empty()).then_some(text);
+    }
+
+    // #7025: `--security-disable-env-ops` and `--security-disable-file-ops`, for the whole run.
+    let _security_scope = jq::enter_security_scope(
+        args.security_disable_env_ops,
+        args.security_disable_file_ops,
+    );
+
     // yq's `-o` defaults to `auto` (#6703): the run's own input format, picked once from the first
     // file's extension (#4394). A `.json` file prints JSON; standard input, `.yaml`, `.yml` and any
     // other name print YAML. There is nothing to match under `-n`, `-R` or `--front-matter`, and an
@@ -12010,6 +12026,13 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             text.replace("\r\n", "\n")
         } else {
             text
+        }
+    } else if let Some(ref expression) = args.expression {
+        // #7025: `--expression` is the filter, and an empty one is the identity, as in yq.
+        if expression.is_empty() {
+            ".".to_string()
+        } else {
+            expression.clone()
         }
     } else {
         args.filter.clone().unwrap_or_else(|| ".".to_string())

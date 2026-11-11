@@ -1309,7 +1309,9 @@ pub struct YqCommand {
     /// (e.g. Markdown). `extract` evaluates the expression against just the
     /// front matter and discards the body; `process` re-emits the
     /// transformed front matter followed by the untouched body.
-    #[arg(long = "front-matter", value_name = "MODE")]
+    ///
+    /// `-f` is yq's short spelling (#7025).
+    #[arg(short = 'f', long = "front-matter", value_name = "MODE")]
     pub front_matter: Option<FrontMatterMode>,
 
     // === Output Options ===
@@ -1478,6 +1480,41 @@ pub struct YqCommand {
     /// Read filter from file instead of command line
     #[arg(long = "from-file", value_name = "FILE")]
     pub from_file: Option<PathBuf>,
+
+    /// Take the filter from this flag, so every positional argument is an input file
+    /// (yq's `--expression`, for a filter that looks like a file name, #7025).
+    ///
+    /// `--from-file` wins over it, in either order, as in yq.
+    #[arg(long = "expression", value_name = "EXPR")]
+    pub expression: Option<String>,
+
+    /// Read the `--split-exp` expression from a file (yq's `--split-exp-file`, #7025).
+    ///
+    /// It wins over `--split-exp`, and an empty file means no split at all, as in yq.
+    #[arg(long = "split-exp-file", value_name = "FILE")]
+    pub split_exp_file: Option<PathBuf>,
+
+    // === Security ===
+    /// Refuse `env()`, `strenv()` and `envsubst` (yq's `--security-disable-env-ops`, #7025)
+    #[arg(
+        long = "security-disable-env-ops",
+        overrides_with = "security_disable_env_ops"
+    )]
+    pub security_disable_env_ops: bool,
+
+    /// Refuse `load()`, `load_str()` and `load_base64()` (yq's `--security-disable-file-ops`,
+    /// #7025). Reading the input files, `-i` and `--split-exp` still work, as in yq.
+    #[arg(
+        long = "security-disable-file-ops",
+        overrides_with = "security_disable_file_ops"
+    )]
+    pub security_disable_file_ops: bool,
+
+    // === Diagnostics ===
+    /// Accepted for yq's `-v`/`--verbose`; the debug log yq writes to stderr is not produced
+    /// (#7025). Standard output is unchanged either way.
+    #[arg(short = 'v', long, overrides_with = "verbose")]
+    pub verbose: bool,
 
     // === Variables ===
     /// Set $name to the string value

@@ -9981,6 +9981,77 @@ pub(crate) fn filename_of_file(file: i64) -> String {
         .unwrap_or_default()
 }
 
+/// yq's `--security-disable-env-ops` and `--security-disable-file-ops` (#7025): the run's refusal
+/// of the operators that read the environment (`env`, `strenv`, `envsubst`) or a file (`load`,
+/// `load_str`, `load_base64`). `std` only, like [`file_names`]: there is no thread-local without it,
+/// and a `no_std` embedding has no environment or file for the operators to read either.
+#[cfg(any(feature = "std", test))]
+mod security {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// `(env ops disabled, file ops disabled)`.
+        static CURRENT: Cell<(bool, bool)> = const { Cell::new((false, false)) };
+    }
+
+    pub(crate) fn env_ops_disabled() -> bool {
+        CURRENT.with(|c| c.get().0)
+    }
+
+    pub(crate) fn file_ops_disabled() -> bool {
+        CURRENT.with(|c| c.get().1)
+    }
+
+    /// Restores the previous setting when dropped.
+    pub struct Guard((bool, bool));
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            CURRENT.with(|c| c.set(self.0));
+        }
+    }
+
+    pub(crate) fn enter(env_ops: bool, file_ops: bool) -> Guard {
+        Guard(CURRENT.with(|c| c.replace((env_ops, file_ops))))
+    }
+}
+
+#[cfg(not(any(feature = "std", test)))]
+mod security {
+    pub(crate) fn env_ops_disabled() -> bool {
+        false
+    }
+
+    pub(crate) fn file_ops_disabled() -> bool {
+        false
+    }
+
+    pub struct Guard;
+
+    pub(crate) fn enter(_env_ops: bool, _file_ops: bool) -> Guard {
+        Guard
+    }
+}
+
+/// Refuse the environment operators (`true`) and the file operators (`true`) until the returned
+/// guard is dropped (#7025).
+pub(crate) fn enter_security(env_ops: bool, file_ops: bool) -> SecurityGuard {
+    security::enter(env_ops, file_ops)
+}
+
+/// The RAII guard [`enter_security`] returns.
+pub(crate) type SecurityGuard = security::Guard;
+
+/// The refusal of an environment operator under `--security-disable-env-ops`, if one is in force.
+pub(crate) fn env_ops_refusal() -> Option<&'static str> {
+    security::env_ops_disabled().then_some("env operations have been disabled")
+}
+
+/// The refusal of a file operator under `--security-disable-file-ops`, if one is in force.
+pub(crate) fn file_ops_refusal() -> Option<&'static str> {
+    security::file_ops_disabled().then_some("file operations have been disabled")
+}
+
 /// One step of the path from a document's root to a node (#4646).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SourcePathStep {

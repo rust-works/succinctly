@@ -850,6 +850,12 @@ same kind of thing as the rest of this table — extra, off by default.
 | `--no-doc`            | Omit document separators (`---`)              |
 | `--tab`               | Use tabs for indentation (write-only — see [Known Limitations](#known-limitations)) |
 | `--split-exp EXPR`    | Split output into one file per result (below) |
+| `--split-exp-file F`  | `--split-exp` with the expression read from `F` (#7025) |
+| `--expression EXPR`   | The filter, so every positional is an input file (#7025) |
+| `-f, --front-matter M` | `extract` or `process` a `---`-fenced header (below) |
+| `--security-disable-env-ops` | Refuse `env()`, `strenv()` and `envsubst` (#7025) |
+| `--security-disable-file-ops` | Refuse `load()`, `load_str()` and `load_base64()` (#7025) |
+| `-v, --verbose`       | Accepted; no debug log is written (#7025)     |
 | `-S, --sort-keys`     | Sort mapping keys in output (succinctly extension — real yq has no such flag) |
 
 ### `--front-matter`
