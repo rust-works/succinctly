@@ -1272,14 +1272,14 @@ fn omit_pair(keys: &Expr, input: &ResultWithComments) -> Option<ResultWithCommen
             let mut kept = IndexMap::new();
             let mut fields = IndexMap::new();
             let mut key_metas = IndexMap::new();
-            for (key, member) in members.iter() {
+            for (key, member) in members {
                 if listed.contains(&key.as_str()) {
                     continue;
                 }
-                kept.insert(key.to_string(), member.clone());
-                fields.insert(key.to_string(), tree.field(key).clone());
+                kept.insert(key.clone(), member.clone());
+                fields.insert(key.clone(), tree.field(key).clone());
                 if let Some(meta) = tree.key_meta(key) {
-                    key_metas.insert(key.to_string(), meta.clone());
+                    key_metas.insert(key.clone(), meta.clone());
                 }
             }
             Some((
