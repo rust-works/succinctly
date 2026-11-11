@@ -4130,7 +4130,7 @@ fn reconcile_presentation_at_depth(
                     }
                 }
             }
-            CommentTree::Object(own_meta, fields, key_comments)
+            CommentTree::object(own_meta, fields, key_comments)
         }
         (OwnedValue::Array(p_items), OwnedValue::Array(r_items)) => {
             let own_meta = grown_container_meta(
@@ -4157,7 +4157,7 @@ fn reconcile_presentation_at_depth(
                     }
                 })
                 .collect();
-            CommentTree::Array(own_meta, items)
+            CommentTree::array(own_meta, items)
         }
         // A kind change (container <-> scalar, or Object <-> Array) is a
         // fresh node with no presentation memory of its own -- except an
@@ -4308,7 +4308,7 @@ fn kind_changed_leaf(
             pristine_tree.meta(),
         ),
     };
-    CommentTree::Leaf(meta)
+    CommentTree::leaf(meta)
 }
 
 /// The tree for a scalar a write may have changed (see [`written_scalar_meta`]); out of
@@ -4320,7 +4320,7 @@ fn written_scalar_leaf(
     pristine_value: &OwnedValue,
     result_value: &OwnedValue,
 ) -> CommentTree {
-    CommentTree::Leaf(written_scalar_meta(
+    CommentTree::leaf(written_scalar_meta(
         pristine_tree.meta(),
         !same_scalar(pristine_value, result_value),
         // A closed literal written right here (`.a = true`) brings its own text, even
@@ -5316,7 +5316,7 @@ fn copy_alias_marks(src: &CommentTree, dst: &mut CommentTree) {
             }
         }
         CommentTree::Object(_, fields, _) => {
-            for (key, field) in fields {
+            for (key, field) in fields.iter() {
                 if contains_alias_mark(field) {
                     if let Some(child) =
                         comment_tree_at_path_or_create_mut(dst, &[TreeStep::Key(key.as_str())])
@@ -7062,19 +7062,19 @@ fn comment_tree_at_path_or_create_mut<'t>(
     let mut node = tree;
     for step in steps {
         if let CommentTree::Leaf(_) = node {
-            let meta = core::mem::take(node.meta_mut());
+            let meta = node.take_meta();
             *node = match step {
-                TreeStep::Key(_) => CommentTree::Object(meta, IndexMap::new(), IndexMap::new()),
-                TreeStep::Index(_) => CommentTree::Array(meta, Vec::new()),
+                TreeStep::Key(_) => CommentTree::object(meta, IndexMap::new(), IndexMap::new()),
+                TreeStep::Index(_) => CommentTree::array(meta, Vec::new()),
             };
         }
         node = match (node, step) {
             (CommentTree::Object(_, fields, _), TreeStep::Key(k)) => fields
                 .entry((*k).to_string())
-                .or_insert_with(|| CommentTree::Leaf(NodeMeta::empty())),
+                .or_insert_with(CommentTree::empty),
             (CommentTree::Array(_, items), TreeStep::Index(i)) => {
                 if items.len() <= *i {
-                    items.resize_with(*i + 1, || CommentTree::Leaf(NodeMeta::empty()));
+                    items.resize_with(*i + 1, CommentTree::empty);
                 }
                 &mut items[*i]
             }
@@ -8156,7 +8156,7 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
             // A navigated-away scalar keeps only its own trailing comment (#852): no style, no
             // anchor, and none of the standalone head/foot comments around it.
             if !matches!(nv, OwnedValue::Object(_) | OwnedValue::Array(_)) {
-                sub = CommentTree::Leaf(NodeMeta::from_comment_and_style(
+                sub = CommentTree::leaf(NodeMeta::from_comment_and_style(
                     sub.own().map(str::to_string),
                     "",
                 ));
@@ -8786,7 +8786,7 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
                 // an empty value, #3028) is part of the node, not its style: yq prints it
                 // back for a bare result too (`.a` on `a:` is an empty line, #2875).
                 let spelling = comments.meta().spelling().map(str::to_string);
-                *comments = CommentTree::Leaf(
+                *comments = CommentTree::leaf(
                     NodeMeta::from_comment_and_style(comments.own().map(str::to_string), "")
                         .with_spelling(spelling)
                         .with_head_foot_of(head, Vec::new(), &source)
@@ -9126,7 +9126,7 @@ fn strip_presentation_style_at_depth(
                 OwnedValue::Array(items) if items.is_empty() && tree.style() == "flow" => "flow",
                 _ => "",
             };
-            CommentTree::Leaf(strip_core_tag(meta.with_style(style), None))
+            CommentTree::leaf(strip_core_tag(meta.with_style(style), None))
         }
         CommentTree::Array(meta, items) => {
             let elements = match value {
@@ -9140,7 +9140,7 @@ fn strip_presentation_style_at_depth(
             } else {
                 ""
             };
-            CommentTree::Array(
+            CommentTree::array(
                 strip_core_tag(meta.with_style(style), Some("!!seq")),
                 items
                     .iter()
@@ -9162,7 +9162,7 @@ fn strip_presentation_style_at_depth(
             } else {
                 ""
             };
-            CommentTree::Object(
+            CommentTree::object(
                 strip_core_tag(meta.with_style(style), Some("!!map")),
                 fields
                     .iter()
@@ -10866,7 +10866,7 @@ fn emit_tagged_scalar(
             } else {
                 comments.style()
             };
-            let bare = CommentTree::Leaf(comments.meta().with_tag(None).with_style(style));
+            let bare = CommentTree::leaf(comments.meta().with_tag(None).with_style(style));
             let text =
                 emit_yaml_value_at_depth(value, &bare, config, indent, in_flow, depth, indent);
             // The explicit tag replaces the `!!float` a nested whole float adds itself, and the
@@ -14480,13 +14480,13 @@ mod tests {
             obj.push_occurrence(key.to_string(), value);
         }
         let leaves = |count: usize| {
-            let spelled = CommentTree::Leaf(NodeMeta::empty().with_spelling(Some(String::new())));
+            let spelled = CommentTree::leaf(NodeMeta::empty().with_spelling(Some(String::new())));
             IndexMap::from([("a".to_string(), vec![spelled; count])])
         };
         let tree_with = |count: usize| {
             let mut keys = IndexMap::new();
             succinctly::jq::eval_generic::KeyMeta::record_shadows(&mut keys, leaves(count));
-            CommentTree::Object(NodeMeta::empty(), IndexMap::new(), keys)
+            CommentTree::object(NodeMeta::empty(), IndexMap::new(), keys)
         };
         let numbered = |tree: &CommentTree, sort_keys: bool| -> Vec<(String, bool, usize)> {
             ObjectEntries::of(&obj, tree, sort_keys)
@@ -15228,14 +15228,14 @@ mod tests {
         let mut obj_comments = IndexMap::new();
         obj_comments.insert(
             "k".to_string(),
-            CommentTree::Leaf(NodeMeta::from_comment_and_style(
+            CommentTree::leaf(NodeMeta::from_comment_and_style(
                 Some("# k trailing".to_string()),
                 "",
             )),
         );
-        let comments = CommentTree::Array(
+        let comments = CommentTree::array(
             NodeMeta::empty(),
-            vec![CommentTree::Object(
+            vec![CommentTree::object(
                 NodeMeta::from_comment_and_style(Some("# obj trailing".to_string()), ""),
                 obj_comments,
                 IndexMap::new(),
@@ -16221,7 +16221,7 @@ mod tests {
     fn linear_comment_tree_nest(depth: usize) -> CommentTree {
         let mut t = CommentTree::empty();
         for _ in 0..depth {
-            t = CommentTree::Array(NodeMeta::empty(), vec![t]);
+            t = CommentTree::array(NodeMeta::empty(), vec![t]);
         }
         t
     }
@@ -16242,7 +16242,7 @@ mod tests {
         }
 
         let leaf =
-            |style: &'static str| CommentTree::Leaf(NodeMeta::from_comment_and_style(None, style));
+            |style: &'static str| CommentTree::leaf(NodeMeta::from_comment_and_style(None, style));
         let string = |s: &str| OwnedValue::String(s.to_string().into());
         let style_of = |value: &OwnedValue, style: &'static str| {
             strip_presentation_style(value, &leaf(style)).style()
@@ -16258,7 +16258,7 @@ mod tests {
         assert_eq!(style_of(&string("yes"), ""), "");
         assert_eq!(style_of(&OwnedValue::Int(1), "double"), "");
         // A value that does not match the tree's shape is read as `null`.
-        let mismatched = CommentTree::Array(
+        let mismatched = CommentTree::array(
             NodeMeta::from_comment_and_style(None, "flow"),
             vec![leaf("double")],
         );
@@ -16280,7 +16280,7 @@ mod tests {
             "a".to_string(),
             succinctly::jq::eval_generic::KeyMeta::new(None, false, "double").unwrap(),
         );
-        let tree = CommentTree::Object(NodeMeta::empty(), fields, keys);
+        let tree = CommentTree::object(NodeMeta::empty(), fields, keys);
         let value = OwnedValue::Object(
             IndexMap::from([
                 ("on".to_string(), OwnedValue::Int(1)),

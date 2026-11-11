@@ -3266,6 +3266,18 @@ impl NodeMeta {
         }
     }
 
+    /// Whether this says nothing about its node: the one definition [`MetaBox`] unboxes on (#6815).
+    pub const fn is_empty(&self) -> bool {
+        // Destructured, so a field added to `NodeMeta` and left out here does not compile.
+        let Self {
+            comment,
+            style,
+            anchor,
+            head_foot_comment,
+        } = self;
+        comment.is_none() && style.is_empty() && anchor.is_none() && head_foot_comment.is_none()
+    }
+
     /// The comment/style pair read straight off a live cursor, with no
     /// anchor mark or head/foot comments — the shape every caller predating
     /// #763 built.
@@ -3511,11 +3523,11 @@ impl NodeMeta {
 #[derive(Debug, Clone)]
 pub enum CommentTree {
     /// A scalar (or any node with no comment-bearing children).
-    Leaf(NodeMeta),
+    Leaf(MetaBox),
     /// An array: this node's own metadata (e.g. the comment in
     /// `a: [1,2] # c`, which trails the whole array, not an element) plus
     /// one subtree per element in order.
-    Array(NodeMeta, Vec<Self>),
+    Array(MetaBox, Vec<Self>),
     /// An object: this node's own metadata, one subtree per field (keyed
     /// the same as the parallel `OwnedValue::Object`), plus one key-scoped
     /// comment per field for a comment trailing the *key's* own line when
@@ -3525,7 +3537,146 @@ pub enum CommentTree {
     /// alongside each comment is whether the deferred value materialized as
     /// nothing at all (a sibling key follows, or EOF) - see
     /// [`Self::key_comment_if_value_absent`].
-    Object(NodeMeta, IndexMap<String, Self>, IndexMap<String, KeyMeta>),
+    Object(MetaBox, ChildMap, KeyMap),
+}
+
+/// A node's [`NodeMeta`] as [`CommentTree`] stores it: one word, and no allocation, for the
+/// overwhelmingly common node with nothing to say (#6815).
+///
+/// A `NodeMeta` is 80 bytes whether or not the node has a comment, a style, an anchor or a head
+/// or foot line, and a tree holds one per node of the document, so the slot boxes it only when
+/// it says something. It reads as a `NodeMeta` through `Deref` (the empty one when unboxed). It is
+/// written through [`CommentTree::meta_mut`], whose guard unboxes the slot again if the write left
+/// it empty, so a slot is boxed exactly when it says something.
+#[derive(Debug, Clone, Default)]
+pub struct MetaBox(Option<Box<NodeMeta>>);
+
+/// What an unboxed [`MetaBox`] reads as.
+static EMPTY_NODE_META: NodeMeta = NodeMeta::empty();
+
+impl MetaBox {
+    /// The slot with nothing to say.
+    pub const fn empty() -> Self {
+        Self(None)
+    }
+
+    /// Replace the node's metadata, unboxing it when it says nothing.
+    pub fn set(&mut self, meta: NodeMeta) {
+        *self = Self::from(meta);
+    }
+
+    /// Unbox a slot whose metadata says nothing.
+    fn unbox_if_empty(&mut self) {
+        if self.0.as_deref().is_some_and(NodeMeta::is_empty) {
+            self.0 = None;
+        }
+    }
+}
+
+impl From<NodeMeta> for MetaBox {
+    fn from(meta: NodeMeta) -> Self {
+        if meta.is_empty() {
+            Self(None)
+        } else {
+            Self(Some(Box::new(meta)))
+        }
+    }
+}
+
+impl core::ops::Deref for MetaBox {
+    type Target = NodeMeta;
+
+    fn deref(&self) -> &NodeMeta {
+        self.0.as_deref().unwrap_or(&EMPTY_NODE_META)
+    }
+}
+
+/// A node's metadata, mutably (see [`CommentTree::meta_mut`]).
+///
+/// It boxes an unboxed slot when it is first written through, and unboxes the slot again when it
+/// is dropped if the metadata is empty by then, so a write that clears the last thing a node says
+/// (or only tests and leaves it) does not leave an 80-byte box behind (#6815).
+pub struct MetaMut<'a>(&'a mut MetaBox);
+
+impl core::ops::Deref for MetaMut<'_> {
+    type Target = NodeMeta;
+
+    fn deref(&self) -> &NodeMeta {
+        self.0
+    }
+}
+
+impl core::ops::DerefMut for MetaMut<'_> {
+    fn deref_mut(&mut self) -> &mut NodeMeta {
+        self.0 .0.get_or_insert_with(|| Box::new(NodeMeta::empty()))
+    }
+}
+
+impl Drop for MetaMut<'_> {
+    fn drop(&mut self) {
+        self.0.unbox_if_empty();
+    }
+}
+
+/// The subtree of every field of an object node, in the value's key order, behind one pointer so
+/// that an object node does not carry the map's handle inline (#6815).
+pub type ChildMap = Box<IndexMap<String, CommentTree>>;
+
+/// The per-key metadata of an object node: a [`KeyMeta`] for each key that has something to say.
+///
+/// The map is allocated on the first entry: most objects have no such key, and the map's handle is
+/// nine words (#6815). This offers the subset of the `IndexMap` API the tree's callers use.
+#[derive(Debug, Clone, Default)]
+pub struct KeyMap(Option<Box<IndexMap<String, KeyMeta>>>);
+
+impl From<IndexMap<String, KeyMeta>> for KeyMap {
+    fn from(map: IndexMap<String, KeyMeta>) -> Self {
+        if map.is_empty() {
+            Self(None)
+        } else {
+            Self(Some(Box::new(map)))
+        }
+    }
+}
+
+impl KeyMap {
+    /// The entry for `key`, if it has one.
+    pub fn get(&self, key: &str) -> Option<&KeyMeta> {
+        self.0.as_deref().and_then(|map| map.get(key))
+    }
+
+    /// The entry for `key`, mutably, if it has one.
+    pub fn get_mut(&mut self, key: &str) -> Option<&mut KeyMeta> {
+        self.0.as_deref_mut().and_then(|map| map.get_mut(key))
+    }
+
+    /// Whether no key has an entry.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// How many keys have an entry.
+    pub fn len(&self) -> usize {
+        self.0.as_deref().map_or(0, IndexMap::len)
+    }
+
+    /// The entry for `key`, creating a default one when it has none.
+    pub fn entry_or_default(&mut self, key: String) -> &mut KeyMeta {
+        self.0
+            .get_or_insert_with(Default::default)
+            .entry(key)
+            .or_default()
+    }
+
+    /// Every key's entry, in the order the keys were added.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &KeyMeta)> {
+        self.0.as_deref().into_iter().flat_map(IndexMap::iter)
+    }
+
+    /// Every entry, in the order the keys were added.
+    pub fn values(&self) -> impl Iterator<Item = &KeyMeta> {
+        self.0.as_deref().into_iter().flat_map(IndexMap::values)
+    }
 }
 
 /// How a mapping *key* was written in the source: the key-side counterpart of
@@ -3670,7 +3821,7 @@ impl KeyMeta {
     pub fn shadow_leaf(earlier: &CommentTree) -> CommentTree {
         match earlier.meta().spelling() {
             Some(spelling) => {
-                CommentTree::Leaf(NodeMeta::empty().with_spelling(Some(spelling.to_string())))
+                CommentTree::leaf(NodeMeta::empty().with_spelling(Some(spelling.to_string())))
             }
             None => CommentTree::empty(),
         }
@@ -3752,7 +3903,33 @@ impl CommentTree {
     /// children — used where a caller has no cursor at all (metadata-less
     /// by construction, e.g. a computed value).
     pub const fn empty() -> Self {
-        Self::Leaf(NodeMeta::empty())
+        Self::Leaf(MetaBox::empty())
+    }
+
+    /// A node with no children and `meta` for its own metadata.
+    pub fn leaf(meta: NodeMeta) -> Self {
+        Self::Leaf(meta.into())
+    }
+
+    /// An array node: `meta` and one subtree per element.
+    pub fn array(meta: NodeMeta, items: Vec<Self>) -> Self {
+        Self::Array(meta.into(), items)
+    }
+
+    /// An object node: `meta`, one subtree per field and the per-key metadata.
+    pub fn object(
+        meta: NodeMeta,
+        fields: IndexMap<String, Self>,
+        keys: IndexMap<String, KeyMeta>,
+    ) -> Self {
+        Self::Object(meta.into(), Box::new(fields), keys.into())
+    }
+
+    /// Replace this node's own metadata (an unboxed slot when it says nothing).
+    pub fn set_meta(&mut self, meta: NodeMeta) {
+        match self {
+            Self::Leaf(m) | Self::Array(m, _) | Self::Object(m, _, _) => m.set(meta),
+        }
     }
 
     /// This node's own presentation metadata.
@@ -3766,9 +3943,29 @@ impl CommentTree {
     /// post-evaluation passes in `yq_runner.rs` that clear one slot
     /// (`-P`'s style strip, #763's soundness gate) without rebuilding the
     /// surrounding tree.
-    pub fn meta_mut(&mut self) -> &mut NodeMeta {
+    ///
+    /// The guard unboxes the node's slot again if the write left it saying nothing, so a node
+    /// stays a one-word slot unless it has something to say (#6815).
+    pub fn meta_mut(&mut self) -> MetaMut<'_> {
+        match self {
+            Self::Leaf(m) | Self::Array(m, _) | Self::Object(m, _, _) => MetaMut(m),
+        }
+    }
+
+    /// The slot this node's own metadata sits in, to see whether it is boxed.
+    #[cfg(test)]
+    fn meta_slot(&self) -> &MetaBox {
         match self {
             Self::Leaf(m) | Self::Array(m, _) | Self::Object(m, _, _) => m,
+        }
+    }
+
+    /// Take this node's own metadata, leaving it with none.
+    pub fn take_meta(&mut self) -> NodeMeta {
+        match self {
+            Self::Leaf(m) | Self::Array(m, _) | Self::Object(m, _, _) => core::mem::take(m)
+                .0
+                .map_or_else(NodeMeta::empty, |boxed| *boxed),
         }
     }
 
@@ -3881,7 +4078,7 @@ impl CommentTree {
     /// for a node that is not an `Object`.
     pub fn set_key_comment(&mut self, key: &str, comment: String) {
         if let Self::Object(_, _, keys) = self {
-            let meta = keys.entry(key.to_string()).or_default();
+            let meta = keys.entry_or_default(key.to_string());
             meta.comment = Some(comment);
             meta.value_absent = false;
         }
@@ -3961,7 +4158,7 @@ impl CommentTree {
 /// can't be borrowed as `'static` from inside a generic method call
 /// argument like `Option::unwrap_or`) — used by [`CommentTree::at_index`]/
 /// [`CommentTree::field`] wherever there's no comment data to return.
-static EMPTY_COMMENT_TREE: CommentTree = CommentTree::Leaf(NodeMeta::empty());
+static EMPTY_COMMENT_TREE: CommentTree = CommentTree::empty();
 
 /// Convert a `DocumentValue` to an `OwnedValue` alongside a parallel [`CommentTree`].
 ///
@@ -4404,7 +4601,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
         KeyMeta::record_shadows(&mut key_comment_map, shadow_leaves);
         Ok((
             OwnedValue::Object(map.finish()),
-            CommentTree::Object(own_meta, comment_map, key_comment_map),
+            CommentTree::object(own_meta, comment_map, key_comment_map),
         ))
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();
@@ -4446,7 +4643,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
         tail_gap_ok(cursor, last_elem.as_ref(), b']')?;
         Ok((
             OwnedValue::array_from(items),
-            CommentTree::Array(own_meta, comment_items),
+            CommentTree::array(own_meta, comment_items),
         ))
     } else {
         // #1982: unlike the container arms above (where `cursor` is only
@@ -4478,7 +4675,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
             }
             _ => own_meta,
         };
-        Ok((owned, CommentTree::Leaf(own_meta)))
+        Ok((owned, CommentTree::leaf(own_meta)))
     }
 }
 
@@ -55151,13 +55348,109 @@ mod tests {
         assert_eq!(comments.meta().preamble(), None);
     }
 
+    /// #6815: a tree node is four words, not the 224 bytes the widest variant once made every
+    /// node. The tree holds one node per node of the document, so a write with YAML output pays
+    /// this width twice over (the pristine tree and the reconciled one).
+    #[test]
+    fn test_comment_tree_node_stays_narrow_6815() {
+        use core::mem::size_of;
+        assert_eq!(size_of::<MetaBox>(), size_of::<usize>());
+        assert_eq!(size_of::<KeyMap>(), size_of::<usize>());
+        assert_eq!(size_of::<ChildMap>(), size_of::<usize>());
+        assert_eq!(size_of::<CommentTree>(), 4 * size_of::<usize>());
+    }
+
+    /// #6815: a slot is boxed exactly when it says something, whichever way it was written.
+    #[test]
+    fn test_meta_box_is_boxed_only_when_the_node_says_something_6815() {
+        let unboxed = |tree: &CommentTree| matches!(tree.meta_slot(), MetaBox(None));
+        // Every field `NodeMeta::is_empty` looks at earns the slot a box on its own.
+        let says = [
+            NodeMeta::from_comment_and_style(Some("# c".to_string()), ""),
+            NodeMeta::from_comment_and_style(None, "flow"),
+            NodeMeta::empty_with_anchor(Some(AnchorMark::Declares("a".to_string()))),
+            NodeMeta::empty().with_head_foot(vec!["# h".to_string()], Vec::new()),
+            NodeMeta::empty().with_head_foot(Vec::new(), vec!["# f".to_string()]),
+            NodeMeta::empty().with_tag(Some("!Ref".to_string())),
+            NodeMeta::empty().with_spelling(Some(String::new())),
+            NodeMeta::empty().with_preamble(Some("---".to_string())),
+        ];
+        for meta in says {
+            assert!(!meta.is_empty(), "{meta:?}");
+            assert!(!unboxed(&CommentTree::leaf(meta)));
+        }
+        assert!(NodeMeta::empty().is_empty());
+        assert!(unboxed(&CommentTree::empty()));
+        assert!(unboxed(&CommentTree::leaf(NodeMeta::empty())));
+        assert!(unboxed(&CommentTree::array(NodeMeta::empty(), Vec::new())));
+        assert!(unboxed(&CommentTree::object(
+            NodeMeta::empty(),
+            IndexMap::new(),
+            IndexMap::new()
+        )));
+
+        // Writing through the guard boxes the slot, and clearing the last thing unboxes it again.
+        let mut node = CommentTree::empty();
+        node.meta_mut().comment = Some("# c".to_string());
+        assert_eq!(node.own(), Some("# c"));
+        assert!(!unboxed(&node));
+        node.meta_mut().comment = None;
+        assert_eq!(node.own(), None);
+        assert!(unboxed(&node));
+        // Reading through the guard, or assigning an empty meta, leaves no box behind.
+        let _ = node.meta_mut().anchor.is_none();
+        assert!(unboxed(&node));
+        *node.meta_mut() = NodeMeta::empty();
+        assert!(unboxed(&node));
+        // `set_meta` and `take_meta` keep the same rule.
+        node.set_meta(NodeMeta::from_comment_and_style(
+            Some("# d".to_string()),
+            "",
+        ));
+        assert!(!unboxed(&node));
+        assert_eq!(node.take_meta().comment.as_deref(), Some("# d"));
+        assert!(unboxed(&node));
+        node.set_meta(NodeMeta::from_comment_and_style(
+            Some("# e".to_string()),
+            "",
+        ));
+        node.set_meta(NodeMeta::empty());
+        assert!(unboxed(&node));
+    }
+
+    /// #6815: the per-key map exists only once a key has an entry.
+    #[test]
+    fn test_key_map_allocates_on_the_first_entry_6815() {
+        let mut keys = KeyMap::from(IndexMap::new());
+        assert!(keys.is_empty());
+        assert_eq!(keys.len(), 0);
+        assert!(keys.get("a").is_none());
+        assert!(keys.get_mut("a").is_none());
+        assert_eq!(keys.iter().count(), 0);
+        assert_eq!(keys.values().count(), 0);
+        keys.entry_or_default("b".to_string());
+        keys.entry_or_default("a".to_string());
+        assert_eq!(keys.len(), 2);
+        assert!(!keys.is_empty());
+        assert!(keys.get("a").is_some());
+        assert!(keys.get_mut("b").is_some());
+        assert_eq!(
+            keys.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            ["b", "a"]
+        );
+        assert_eq!(keys.values().count(), 2);
+        let mut map = IndexMap::new();
+        map.insert("k".to_string(), KeyMeta::default());
+        assert_eq!(KeyMap::from(map).len(), 1);
+    }
+
     /// #6335: a repeated key's earlier entries keep their spelling, in document order, only when
     /// one of them was spelled non-canonically; the entry survives a write and a missing ordinal
     /// falls back to the empty tree.
     #[test]
     fn test_key_meta_shadow_spellings_6335() {
         let spelled =
-            |text: &str| CommentTree::Leaf(NodeMeta::empty().with_spelling(Some(text.to_string())));
+            |text: &str| CommentTree::leaf(NodeMeta::empty().with_spelling(Some(text.to_string())));
         let plain = CommentTree::empty();
         assert!(KeyMeta::with_shadows(None, false, "", None, None, None, Vec::new()).is_none());
 
@@ -55170,7 +55463,7 @@ mod tests {
         assert!(keys.is_empty());
 
         // `a:` then `a: ~` then `a: 2`: both earlier entries are shadows, in order.
-        let first = CommentTree::Leaf(NodeMeta::empty().with_spelling(Some(String::new())));
+        let first = CommentTree::leaf(NodeMeta::empty().with_spelling(Some(String::new())));
         let second = spelled("~");
         KeyMeta::record_shadows(
             &mut keys,
@@ -55179,7 +55472,7 @@ mod tests {
                 vec![KeyMeta::shadow_leaf(&first), KeyMeta::shadow_leaf(&second)],
             )]),
         );
-        let tree = CommentTree::Object(NodeMeta::empty(), IndexMap::new(), keys);
+        let tree = CommentTree::object(NodeMeta::empty(), IndexMap::new(), keys);
         assert_eq!(tree.shadow_field("a", 0).meta().spelling(), Some(""));
         assert_eq!(tree.shadow_field("a", 1).meta().spelling(), Some("~"));
         assert_eq!(tree.shadow_field("a", 2).meta().spelling(), None);

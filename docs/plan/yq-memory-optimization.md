@@ -92,7 +92,7 @@ both.
 | M4, streaming JSON      | **Done**, as the printer      | #6814 | `to_json` already writes into one buffer; `format_json_impl` (`output.rs`) still does not: 42-51% of the live heap at a whole-document write, about 11% for a result-shaped print |
 | M5, lazy `IndexMap`     | **Not pursued**               | -     | At most 6-9% of peak RSS (table above); touches the `Deref` contract of `ObjectMapOf`                                                                                             |
 | M6, key interning       | **Not pursued**               | -     | At most 15% (7950X) / 8% (M4 Pro) of peak RSS on record-shaped input, 3-6% on unique-key shapes; changes the key type of every object                                             |
-| (new) presentation tree | **Implement**                 | #6815 | 58% of the live heap at a YAML-output write; that write is 3.3-3.9x the JSON-output write (3.7-3.9x on the 7950X, 3.3x on the M4 Pro)                                             |
+| (new) presentation tree | **Narrowed**, #6815           | #6815 | 58% of the live heap at a YAML-output write; that write is 3.3-3.9x the JSON-output write (3.7-3.9x on the 7950X, 3.3x on the M4 Pro)                                             |
 
 - **M1** is the largest term that a query-shaped workload hits and the only one with an existing
   implementation in the same binary (`jq` mode). Streaming needs the evaluator to hand results out one
@@ -122,6 +122,41 @@ both.
   record's `OwnedValue`), comment-free nodes included, and `reconcile_presentation` builds a second
   one beside the pristine tree. That is why `-o yaml` writes cost 27-60 MiB of RSS per MiB of input,
   and why the M1-M6 figures above (all `-o json`) understate the YAML cost.
+- **The presentation tree's width landed as #6815.** A `CommentTree` node is 32 bytes, from 224: its
+  `NodeMeta` (80 bytes) sits behind a one-word `MetaBox` that boxes it only when the node says something
+  (the `meta_mut` guard unboxes it again if a write leaves it empty), an
+  object's field map behind a one-word `ChildMap`, and its per-key metadata behind a `KeyMap` that
+  allocates on its first entry. Output is byte-identical on every row below. Interleaved A/B on `main`
+  @ `5c9222a76` against the merged code, release builds, peak RSS (median of 5 at 20 MiB, of 3 at 100
+  MiB) and the fastest wall time, `.zzz = 1` with `-o yaml` unless noted:
+
+  | peak RSS (MiB) / time (s)         | 7950X before |  7950X after | M4 Pro before | M4 Pro after |
+  |-----------------------------------|-------------:|-------------:|--------------:|-------------:|
+  | `users` 20 MiB                    |   996 / 2.30 |   594 / 2.02 |   1008 / 1.34 |   612 / 1.27 |
+  | `users` 20 MiB, `-P`              |  1320 / 2.62 |   716 / 2.21 |   1286 / 1.47 |   705 / 1.37 |
+  | `users` 20 MiB, `del(.users[0])`  |   996 / 2.29 |   634 / 2.03 |   1094 / 1.36 |   612 / 1.29 |
+  | `users` 20 MiB, `.zzz = .users`   |  1648 / 3.08 |   842 / 2.57 |   1643 / 1.81 |   852 / 1.66 |
+  | `users` 100 MiB                   | 4902 / 11.79 | 2897 / 10.11 |   5036 / 6.61 |  2886 / 6.29 |
+  | `navigation` 100 MiB (`.[0].zzz`) | 5714 / 13.37 | 3317 / 11.94 |   5965 / 6.88 |  3274 / 6.36 |
+  | `comprehensive` 100 MiB           |  3747 / 9.55 |  2092 / 8.20 |   3852 / 5.71 |  2106 / 5.31 |
+  | `nested` 100 MiB                  |  2818 / 8.02 |  1627 / 7.23 |   2789 / 4.49 |  1633 / 4.20 |
+
+  That is 36-49% less peak RSS and 5-17% less time. The controls do not move: the JSON-output write
+  (1060 MiB on the 7950X before and after) and the `.` fast path (261 and 262 MiB). The 20 MiB `users`
+  query `.users[] | {"name": .name, "age": .age, "city": .city}` with `-o yaml`, whose results carry a
+  tree, falls 156 to 134 MiB (7950X) and 175 to 139 MiB (M4 Pro). Other shapes at 5 MiB with
+  `.zzz = 1` and `-o yaml` (7950X, one run each): `flow` 550 to 290, `mixed` 217 to 118, `sequences` 240
+  to 109, `strings` 157 to 96, `anchors` 605 to 438, `unicode` 155 to 122, `block-scalars` 48 to 47 and
+  `config` 15 to 16 (nothing to save: a scalar carries no tree, or the document is under a kilobyte), so
+  the 36-49% above is for records and nested documents, not every shape. DHAT on the
+  20 MiB `users` write (7950X) reads 436.1 MiB live at the peak, from 864.6. What remains is four
+  62 MiB blocks (the document materialized as `OwnedValue` twice, once by `to_owned_with_comments` and
+  once by the assignment's target resolution, plus a pristine and a reconciled tree), each tree also
+  paying 12 MiB for its hash tables and 10 MiB for the object boxes. The pristine tree cannot be
+  consumed as the reconciled one is built (several results reconcile against it, and a later pass reads
+  it), and collapsing a subtree that says nothing into one leaf changes what the comment setters
+  (`head_comment =` and its relatives, which index a node's members by position) find, so neither is
+  part of this change: the second copy of the document is #6879 and the two trees are #6880.
 
 ## Problem Statement
 
