@@ -32,10 +32,42 @@ pub fn get_cpu_info() -> String {
                     }
                 }
             }
+            // An Arm Linux kernel prints no `model name`: name the core from its MIDR
+            // fields instead of reporting "Unknown CPU" (#6873).
+            if let Some(name) = arm_core_name(&content) {
+                return name;
+            }
         }
     }
 
     "Unknown CPU".to_string()
+}
+
+/// The name of the first Arm core in a `/proc/cpuinfo` dump that has no `model name`
+/// line (every aarch64 Linux kernel): `ARM Neoverse-V2` for implementer `0x41`, part
+/// `0xd4f`. The parts are the `ARM_CPU_PART_NEOVERSE_*` values of the kernel's
+/// `arch/arm64/include/asm/cputype.h`; a core not in that list is named by its two
+/// fields, so the report still says which CPU it ran on. `None` when the dump has no
+/// Arm implementer and part, as on x86.
+#[cfg(any(target_os = "linux", test))]
+fn arm_core_name(cpuinfo: &str) -> Option<String> {
+    let field = |key: &str| {
+        cpuinfo.lines().find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            (k.trim() == key).then(|| v.trim().to_ascii_lowercase())
+        })
+    };
+    let (implementer, part) = (field("CPU implementer")?, field("CPU part")?);
+    let core = match (implementer.as_str(), part.as_str()) {
+        ("0x41", "0xd0c") => "Neoverse-N1",
+        ("0x41", "0xd40") => "Neoverse-V1",
+        ("0x41", "0xd49") => "Neoverse-N2",
+        ("0x41", "0xd4f") => "Neoverse-V2",
+        ("0x41", "0xd84") => "Neoverse-V3",
+        ("0x41", "0xd8e") => "Neoverse-N3",
+        _ => return Some(format!("Arm core (implementer {implementer}, part {part})")),
+    };
+    Some(format!("ARM {core}"))
 }
 
 /// Get OS version information.
@@ -346,5 +378,54 @@ mod tests {
     fn test_get_cpu_info() {
         let cpu = get_cpu_info();
         assert!(!cpu.is_empty(), "{cpu:?}");
+    }
+
+    /// The head of `/proc/cpuinfo` on an AWS Graviton 4 (c8g.large) instance: no
+    /// `model name`, a tab before the colon on most keys and none on `CPU architecture`.
+    const GRAVITON4: &str = "processor\t: 0\nBogoMIPS\t: 2000.00\n\
+        Features\t: fp asimd evtstrm aes sve sve2\nCPU implementer\t: 0x41\n\
+        CPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0xd4f\nCPU revision\t: 1\n\n\
+        processor\t: 1\nCPU implementer\t: 0x41\nCPU part\t: 0xd4f\n";
+
+    #[test]
+    fn a_graviton4_is_named_from_its_midr_fields_6873() {
+        assert_eq!(arm_core_name(GRAVITON4).as_deref(), Some("ARM Neoverse-V2"));
+    }
+
+    #[test]
+    fn each_neoverse_part_has_its_own_name_6873() {
+        let name =
+            |part: &str| arm_core_name(&format!("CPU implementer\t: 0x41\nCPU part\t: {part}\n"));
+        assert_eq!(name("0xd0c").as_deref(), Some("ARM Neoverse-N1"));
+        assert_eq!(name("0xd40").as_deref(), Some("ARM Neoverse-V1"));
+        assert_eq!(name("0xd49").as_deref(), Some("ARM Neoverse-N2"));
+        assert_eq!(name("0xd4f").as_deref(), Some("ARM Neoverse-V2"));
+        assert_eq!(name("0xd84").as_deref(), Some("ARM Neoverse-V3"));
+        assert_eq!(name("0xd8e").as_deref(), Some("ARM Neoverse-N3"));
+        // The kernel prints the part in lower case, but a hand-edited dump may not.
+        assert_eq!(name("0xD4F").as_deref(), Some("ARM Neoverse-V2"));
+    }
+
+    #[test]
+    fn an_unlisted_arm_core_is_named_by_its_fields_6873() {
+        let dump = "CPU implementer\t: 0x41\nCPU part\t: 0xd0b\n";
+        assert_eq!(
+            arm_core_name(dump).as_deref(),
+            Some("Arm core (implementer 0x41, part 0xd0b)")
+        );
+        let other = "CPU implementer\t: 0x51\nCPU part\t: 0xd4f\n";
+        assert_eq!(
+            arm_core_name(other).as_deref(),
+            Some("Arm core (implementer 0x51, part 0xd4f)"),
+            "part 0xd4f is Neoverse-V2 only under implementer 0x41"
+        );
+    }
+
+    #[test]
+    fn a_dump_without_the_arm_fields_names_no_core_6873() {
+        assert_eq!(arm_core_name("model name\t: AMD Ryzen 9 7950X\n"), None);
+        assert_eq!(arm_core_name("CPU implementer\t: 0x41\n"), None);
+        assert_eq!(arm_core_name("CPU part\t: 0xd4f\n"), None);
+        assert_eq!(arm_core_name(""), None);
     }
 }
