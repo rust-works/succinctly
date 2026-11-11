@@ -83,14 +83,15 @@ use super::eval::{
     substitute_deferred_var, substitute_vars, suppresses, tonumber_from_str, tostring_owned,
     tostring_owned_styled, try_compare_op, try_handler_root, vec_with_capacity,
     yq_absent_key_read_is_empty, yq_assign_rhs_document, yq_bool_null_key_into_null, yq_dedup_key,
-    yq_empty_context_reemit, yq_empty_operand_output, yq_field_index_on_scalar_is_empty,
-    yq_first_of_each_key, yq_index_key_is_numeric, yq_literal_index_text, yq_mapping_index_text,
-    yq_negative_index_check, yq_negative_index_error, yq_numeric_index_on_object_is_null,
-    yq_object_key_stringify, yq_read_only_context, yq_scalar_text, yq_sort_by, yq_stage_can_reemit,
-    yq_stage_can_reemit_in, BinaryFanoutRules, ComputedSliceBound, Control, Demand, EmptyOperandOp,
-    EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail, QueryResult, RangeEnd,
-    RangeNum, Reentry, RestPipe, RestTail, RootWitness, SliceTargetKind, StashedEscape,
-    StashedVerdict, YqSemantics, DEFERRED_BIND_UNRESOLVED, MAX_RANGE_TOTAL,
+    yq_empty_context_reemit, yq_empty_left_skips_right, yq_empty_operand_output,
+    yq_field_index_on_scalar_is_empty, yq_first_of_each_key, yq_index_key_is_numeric,
+    yq_literal_index_text, yq_mapping_index_text, yq_negative_index_check, yq_negative_index_error,
+    yq_numeric_index_on_object_is_null, yq_object_key_stringify, yq_read_only_context,
+    yq_scalar_text, yq_sort_by, yq_stage_can_reemit, yq_stage_can_reemit_in, BinaryFanoutRules,
+    ComputedSliceBound, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
+    JqSemantics, LimitN, PathTrail, QueryResult, RangeEnd, RangeNum, Reentry, RestPipe, RestTail,
+    RootWitness, SliceTargetKind, StashedEscape, StashedVerdict, YqSemantics,
+    DEFERRED_BIND_UNRESOLVED, MAX_RANGE_TOTAL,
 };
 use super::eval::{owned_slot_mut, static_path_steps, StepKey};
 #[cfg(test)]
@@ -24013,7 +24014,11 @@ fn binary_fanout_each_generic_with<V: DocumentValue, S: EvalSemantics>(
         // #2460 (yq mode only): the *outer* operand produced nothing, so the
         // loop never ran and the inner one was never evaluated at all --
         // drive it once here so `1 + key` and `key + 1` stay symmetric the
-        // way real yq is. Mirrors `eval::empty_outer_operand_pass`.
+        // way real yq is. Mirrors `eval::empty_outer_operand_pass`, and skips the inner operand
+        // where yq does (#6982); `left_major` states that the empty outer operand is the left one.
+        if rules.left_major && yq_empty_left_skips_right(op) {
+            return Flow::Exhausted;
+        }
         return empty_outer_operand_pass_generic::<V, S>(&each_operand, inner_expr, op, sink);
     }
     abort.unwrap_or(outer)

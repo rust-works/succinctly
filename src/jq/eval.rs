@@ -542,6 +542,18 @@ pub(crate) enum EmptyOperandOp {
     Boolean,
 }
 
+/// Whether yq never evaluates the right operand of `op` when its left operand produced nothing
+/// (#6982): `-`, `*` (every merge-flag form), `/` and `%`, the operators [`yq_empty_operand_output`]
+/// answers with nothing whatever the other operand is. So an erroring right side is silent there
+/// (`.[] * error("x")` on `[]` prints nothing in yq v4.53.3), where `+` and the comparisons, which
+/// answer from the other operand's value, evaluate it (`.[] + error("x")` raises in yq too).
+pub(crate) fn yq_empty_left_skips_right(op: EmptyOperandOp) -> bool {
+    matches!(
+        op,
+        EmptyOperandOp::Arith(ArithOp::Sub | ArithOp::Mul(_) | ArithOp::Div | ArithOp::Mod)
+    )
+}
+
 /// **The one definition of yq's binary-operator rule for an operand that
 /// produced zero outputs** (#2460), consulted by both evaluators: the
 /// generic/cursor route (`eval_generic::binary_fanout_each_generic`) and the
@@ -559,7 +571,9 @@ pub(crate) enum EmptyOperandOp {
 /// | op                | one empty operand              | both empty |
 /// |-------------------|--------------------------------|------------|
 /// | `+`               | the other operand, verbatim    | nothing    |
-/// | `-` `*` `/` `%`   | nothing                        | nothing    |
+/// | `-` `*` `/` `%`   | nothing (and an empty left     | nothing    |
+/// |                   | leaves the right unevaluated,  |            |
+/// |                   | [`yq_empty_left_skips_right`]) |            |
 /// | `==`              | `true` iff the other is `null` | `true`     |
 /// | `!=`              | mirror of `==`                 | `false`    |
 /// | `<` `>`           | `false`                        | `false`    |
@@ -602,9 +616,14 @@ pub(crate) fn yq_empty_operand_output(
     // `==`/`!=` and is what flips `<=`/`>=` to `true` -- the two rows the
     // single-empty rule cannot derive (inconsistency 3 above).
     let other_is_null = matches!(other, None | Some(OwnedValue::Null));
+    // The operators that answer nothing are named once, by the predicate that also skips their
+    // right operand (#6982).
+    if yq_empty_left_skips_right(op) {
+        return None;
+    }
     match op {
         EmptyOperandOp::Arith(ArithOp::Add) => other.cloned(),
-        EmptyOperandOp::Arith(ArithOp::Sub | ArithOp::Mul(_) | ArithOp::Div | ArithOp::Mod) => None,
+        EmptyOperandOp::Arith(_) => unreachable!("yq_empty_left_skips_right names the rest"), // patchcov: coverage tolerate-line reason="unreachable: every arithmetic operator but + returned above"
         EmptyOperandOp::Compare(CompareOp::Eq) => Some(OwnedValue::Bool(other_is_null)),
         EmptyOperandOp::Compare(CompareOp::Ne) => Some(OwnedValue::Bool(!other_is_null)),
         EmptyOperandOp::Compare(CompareOp::Lt | CompareOp::Gt) => Some(OwnedValue::Bool(false)),
@@ -16888,8 +16907,9 @@ fn binary_fanout_each_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // operand per right output; yq re-evaluates the *right* one per left
     // output (`doCrossFunc`, `pkg/yqlib/operators.go:113-138`). Only the
     // nesting swaps -- `combine` still receives (left, right) either way, and
-    // #2460's empty-operand rule is symmetric in the two, so it needs no
-    // second spelling here.
+    // #2460's empty-operand table is symmetric in the two, so it needs no
+    // second spelling here. Skipping the inner operand is not: yq skips the
+    // right one only, when the left is empty (#6982, below).
     let (outer_expr, inner_expr) = if rules.left_major {
         (left, right)
     } else {
@@ -17073,7 +17093,12 @@ fn binary_fanout_each_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #2460 (yq mode only): the *outer* operand produced nothing, so the
         // loop above never ran and the inner one was never evaluated at all.
         // Drive it once here and answer each of its outputs from the same
-        // table -- and, if it is empty too, answer the both-empty row once.
+        // table -- and, if it is empty too, answer the both-empty row once. Unless the table
+        // answers nothing for every value, when yq never evaluates it (#6982); `left_major`
+        // states that the empty outer operand is the left one, which is what yq's rule needs.
+        if rules.left_major && yq_empty_left_skips_right(op) {
+            return Flow::Exhausted;
+        }
         return empty_outer_operand_pass::<_, S>(&each_operand, inner_expr, op, sink);
     }
     abort.unwrap_or(outer)
@@ -136432,6 +136457,74 @@ mod tests {
         // are describing.
         assert_eq!(jq.empty.is_some(), jq.left_major);
         assert_eq!(yq.empty.is_some(), yq.left_major);
+    }
+
+    /// #6982: the right operand is skipped exactly where the empty-operand table answers nothing
+    /// whatever the right side holds, so skipping it can change nothing but an error it would
+    /// raise. One table, one predicate, checked against each other here.
+    #[test]
+    fn empty_left_skips_right_exactly_where_the_table_answers_nothing_6982() {
+        let ops = [
+            EmptyOperandOp::Arith(ArithOp::Add),
+            EmptyOperandOp::Arith(ArithOp::Sub),
+            EmptyOperandOp::Arith(ArithOp::Mul(MergeFlags::default())),
+            EmptyOperandOp::Arith(ArithOp::Mul(MergeFlags {
+                append_arrays: true,
+                deep_merge_arrays: true,
+                ..MergeFlags::default()
+            })),
+            EmptyOperandOp::Arith(ArithOp::Div),
+            EmptyOperandOp::Arith(ArithOp::Mod),
+            EmptyOperandOp::Compare(CompareOp::Eq),
+            EmptyOperandOp::Compare(CompareOp::Ne),
+            EmptyOperandOp::Compare(CompareOp::Lt),
+            EmptyOperandOp::Compare(CompareOp::Le),
+            EmptyOperandOp::Compare(CompareOp::Gt),
+            EmptyOperandOp::Compare(CompareOp::Ge),
+            EmptyOperandOp::Boolean,
+        ];
+        let others = [
+            None,
+            Some(OwnedValue::Null),
+            Some(OwnedValue::Bool(false)),
+            Some(OwnedValue::Int(1)),
+            Some(OwnedValue::from("a".to_string())),
+            Some(OwnedValue::array_from(vec![OwnedValue::Int(1)])),
+            Some(OwnedValue::Object(IndexMap::new().into())),
+        ];
+        for op in ops {
+            let answers_nothing = others
+                .iter()
+                .all(|other| yq_empty_operand_output(op, other.as_ref()).is_none());
+            assert_eq!(yq_empty_left_skips_right(op), answers_nothing, "{op:?}");
+        }
+    }
+
+    /// #6982 on the library's eager route (`binary_fanout_each`), which the CLI does not take: an
+    /// empty left operand of `*` / `-` leaves an erroring right one unevaluated, and `+` still
+    /// evaluates it (yq v4.53.3).
+    #[test]
+    fn eager_route_empty_left_skips_the_right_operand_6982() {
+        for program in [
+            r#".[] * error("x")"#,
+            r#".[] - error("x")"#,
+            r#".[] / error("x")"#,
+            r#".[] % error("x")"#,
+            r#".[] *+ error("x")"#,
+        ] {
+            let index = JsonIndex::build(b"[]");
+            let expr = parse_with_mode_and_extensions(program, ParserMode::Yq, true).unwrap();
+            let result = eval_full::<Vec<u64>, YqSemantics>(&expr, index.root(b"[]"));
+            assert!(matches!(result, QueryResult::None), "{program}: {result:?}");
+        }
+        let index = JsonIndex::build(b"[]");
+        let expr =
+            parse_with_mode_and_extensions(r#".[] + error("x")"#, ParserMode::Yq, true).unwrap();
+        let result = eval_full::<Vec<u64>, YqSemantics>(&expr, index.root(b"[]"));
+        assert!(
+            matches!(result, QueryResult::Error(ref e) if e.message == "x"),
+            "{result:?}"
+        );
     }
 
     /// #2374: the family's shared definition itself, pinned once rather
