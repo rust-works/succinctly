@@ -27118,7 +27118,7 @@ fn format_lua(value: &OwnedValue, options: &LuaOptions) -> Result<String, EvalEr
 /// is, `\a \b \f \n \r \t \v`, `\xNN` for another control character below U+0080, `\uNNNN` and `\UNNNNNNNN`
 /// for the rest (#6924).
 fn go_quote(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 2);
+    let mut out = string_with_capacity(text.len() + 2);
     out.push('"');
     for c in text.chars() {
         match c {
