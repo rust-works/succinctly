@@ -25789,6 +25789,11 @@ fn stringify_for_format<S: EvalSemantics>(value: &OwnedValue) -> Option<String> 
 }
 
 fn format_uri<S: EvalSemantics>(value: &OwnedValue, _optional: bool) -> Result<String, EvalError> {
+    // yq encodes a string only: a value the filter computes is refused as a document node is
+    // (#5836), with the wording `-o=uri` uses (#6980).
+    if S::TAG == EvalTag::Yq && !matches!(value, OwnedValue::String(_)) {
+        return Err(yq_encoder_needs_a_string(value, "URI"));
+    }
     // jq converts non-strings to strings first (e.g., 42 | @uri => "42")
     let s = stringify_for_format::<S>(value)
         .ok_or_else(|| EvalError::type_error("string", value.type_name()))?;
@@ -25902,9 +25907,8 @@ fn owned_string_from_decoded_bytes<S: EvalSemantics>(bytes: Vec<u8>) -> String {
 /// [`yq_stringify_scalar_or_empty`]), reads `+` as a space, raises `invalid URL escape "..."` and
 /// replaces bytes that are not valid UTF-8 with U+FFFD, so yq mode keeps all four. Note real yq's
 /// `@uri` *encode* direction does not share this behavior -- it errors on a non-string scalar
-/// rather than stringifying it (`42 | @uri` errors in real yq); [`format_uri`]'s own unconditional
-/// stringification (in both jq and yq mode) is a separate, pre-existing divergence from real yq,
-/// not touched here.
+/// rather than stringifying it (`42 | @uri` errors in real yq), which [`format_uri`] follows in
+/// yq mode (#6980).
 ///
 /// The percent-decoded bytes of a yq run that turn out to be invalid UTF-8 go through
 /// [`owned_string_from_decoded_bytes`], whose substitution rule is per-mode
@@ -26263,6 +26267,10 @@ fn format_base64<S: EvalSemantics>(
     value: &OwnedValue,
     optional: bool,
 ) -> Result<String, EvalError> {
+    // yq encodes a string only, as `format_uri` explains (#6980).
+    if S::TAG == EvalTag::Yq && !matches!(value, OwnedValue::String(_)) {
+        return Err(yq_encoder_needs_a_string(value, "base64"));
+    }
     // jq converts non-strings to strings first, same as `@uri`/`@html`
     // (including JSON-encoding a container in jq mode, #1096).
     let s = match stringify_for_format::<S>(value) {
