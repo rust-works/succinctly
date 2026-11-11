@@ -2802,13 +2802,13 @@ fn reorders_a_sequence(expr: &Expr) -> bool {
 /// `expr` as `NAV | REORDER` for a static navigation `NAV` (none for the document itself) and a
 /// `sort`, `sort_by`, `reverse`, `unique` or `unique_by`: the navigation (`None` at the root) and
 /// the reorder; `None` for any other shape (#6877).
-fn split_reorder_read(expr: &Expr) -> Option<(Option<Expr>, Expr)> {
+fn split_reorder_read(expr: &Expr) -> Option<(Option<Expr>, &Expr)> {
     split_static_nav_then(expr, reorders_a_sequence)
 }
 
 /// `expr` as `NAV | map(f)` for a static navigation `NAV` (none for the document itself): the
 /// navigation (`None` at the root) and the `map`; `None` for any other shape (#6986).
-fn split_map_read(expr: &Expr) -> Option<(Option<Expr>, Expr)> {
+fn split_map_read(expr: &Expr) -> Option<(Option<Expr>, &Expr)> {
     split_static_nav_then(expr, |last| matches!(last, Expr::Builtin(Builtin::Map(_))))
 }
 
@@ -2818,29 +2818,17 @@ fn split_map_read(expr: &Expr) -> Option<(Option<Expr>, Expr)> {
 fn split_static_nav_then(
     expr: &Expr,
     is_last: impl Fn(&Expr) -> bool,
-) -> Option<(Option<Expr>, Expr)> {
-    let mut stages = Vec::new();
-    flatten_plain_pipe(expr, &mut stages);
-    let (last, nav) = stages.split_last()?;
-    let mut last = *last;
-    while let Expr::Paren(inner) = last {
-        last = inner;
-    }
+) -> Option<(Option<Expr>, &Expr)> {
+    let (mut nav, last) = split_last_stage(expr)?;
     if !is_last(last) {
         return None;
     }
     // `. | sort` is `sort`: an identity stage in front of the navigation moves nothing.
-    let nav: Vec<&Expr> = nav
-        .iter()
-        .copied()
-        .filter(|stage| !matches!(stage, Expr::Identity))
-        .collect();
+    nav.retain(|stage| !matches!(stage, Expr::Identity));
     if nav.is_empty() {
-        return Some((None, last.clone()));
+        return Some((None, last));
     }
-    nav.iter()
-        .all(|stage| static_nav_steps(stage).is_some_and(|steps| !steps.is_empty()))
-        .then(|| (Some(pipe_of(&nav)), last.clone()))
+    all_static_nav(&nav).then(|| (Some(pipe_of(&nav)), last))
 }
 
 /// The node `nav` reaches from `cursor` (`cursor` itself for none), when it is a flow-style
@@ -2891,7 +2879,7 @@ fn reorder_read_as_write<W: AsRef<[u64]> + Clone>(
         vec![
             Expr::Update {
                 path: Box::new(path.clone()),
-                filter: Box::new(reorder),
+                filter: Box::new(reorder.clone()),
             },
             path,
         ]
@@ -8128,21 +8116,26 @@ fn is_key_stage(expr: &Expr) -> bool {
 /// `expr` as a non-empty static navigation followed by one last stage (parentheses removed),
 /// the shape both key-listing routes of #5450 start from; `None` for any other.
 fn split_static_nav_then_last(expr: &Expr) -> Option<(Vec<&Expr>, &Expr)> {
+    split_last_stage(expr).filter(|(nav, _)| !nav.is_empty() && all_static_nav(nav))
+}
+
+/// `expr`'s plain-pipe stages before its last one, and the last one with its parentheses taken
+/// off: the split [`split_static_nav_then_last`] and [`split_static_nav_then`] (#6986) share.
+fn split_last_stage(expr: &Expr) -> Option<(Vec<&Expr>, &Expr)> {
     let mut stages = Vec::new();
     flatten_plain_pipe(expr, &mut stages);
-    let (last, nav) = stages.split_last()?;
-    if nav.is_empty()
-        || !nav
-            .iter()
-            .all(|stage| static_nav_steps(stage).is_some_and(|steps| !steps.is_empty()))
-    {
-        return None;
-    }
-    let mut last = *last;
+    let mut last = stages.pop()?;
     while let Expr::Paren(inner) = last {
         last = inner;
     }
-    Some((nav.to_vec(), last))
+    Some((stages, last))
+}
+
+/// Whether every one of `stages` is a static navigation of at least one step.
+fn all_static_nav(stages: &[&Expr]) -> bool {
+    stages
+        .iter()
+        .all(|stage| static_nav_steps(stage).is_some_and(|steps| !steps.is_empty()))
 }
 
 /// `expr` as a *static navigation* followed by `map(key)`, split into the navigation and the
