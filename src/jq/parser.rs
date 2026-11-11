@@ -11030,11 +11030,14 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// What yq mode refuses about a compound assignment `left OP= ...`, `op_pos` being where `OP=`
-    /// starts. One fallible call per operator branch of the recursive assignment parser, and no
-    /// more: every `?` there is a `Result<(), ParseError>` slot in a frame that deeply nested
-    /// `def`s multiply (`write_shape_gate_is_not_exponential_in_def_nesting_2091` runs 41 levels
-    /// in a 2 MiB test thread, and a second call site tipped it over on Linux ARM64, #6981).
+    /// What yq mode refuses about a compound assignment `left OP= ...`, called with the cursor on
+    /// the operator (before it is consumed), so it reads the operator off the parser itself.
+    ///
+    /// The recursive assignment parser makes one fallible call per operator branch and passes it
+    /// nothing: every extra argument, local or `?` there is a slot in a frame that deeply nested
+    /// `def`s multiply (`write_shape_gate_is_not_exponential_in_def_nesting_2091` runs 41 levels in
+    /// a 2 MiB test thread, and two added `?` calls overflowed it on Linux ARM64 and under
+    /// coverage instrumentation, #6981).
     ///
     /// - `/=`, `%=` and `//=` are jq's: yq has no such operator and reads `/`, `%` or `//` with a
     ///   missing operand (`'/' expects 2 args but there is 1`), so without `--jq-extensions` they
@@ -11042,14 +11045,15 @@ impl<'a> Parser<'a> {
     /// - An operator assignment (`+=`, `-=`, `*=`, `//=`, ...) to a `(PATH | key)` target is
     ///   refused out loud, as a silent no-op was the answer before key writes existed (#6089).
     ///   `=` and `|=` rename the key ([`Self::assign_or_rename_key`]).
-    fn refuse_operator_assign(
-        &self,
-        left: &Expr,
-        op: &str,
-        op_pos: usize,
-    ) -> Result<(), ParseError> {
-        if matches!(op, "/=" | "%=" | "//=") {
-            self.reject_unless_jq_extensions_surface(op, op_pos, "operators")?;
+    fn refuse_operator_assign(&self, left: &Expr) -> Result<(), ParseError> {
+        let op = match (self.peek_str(3), self.peek_str(2)) {
+            ("//=", _) => "//=",
+            (_, "/=") => "/=",
+            (_, "%=") => "%=",
+            _ => "",
+        };
+        if !op.is_empty() {
+            self.reject_unless_jq_extensions_surface(op, self.pos, "operators")?;
         }
         if self.mode == ParserMode::Yq && left.key_node_prefix().is_some() {
             return Err(ParseError::new(
@@ -11120,7 +11124,6 @@ impl<'a> Parser<'a> {
         // Check for assignment operators
         let peek2 = self.peek_str(2);
         let peek3 = self.peek_str(3);
-        let op_pos = self.pos;
 
         // Check for |= (update)
         if peek2 == "|=" {
@@ -11138,11 +11141,11 @@ impl<'a> Parser<'a> {
 
         // Check for //= (alternative assignment)
         if peek3 == "//=" {
+            self.refuse_operator_assign(&left)?;
             self.next(); // /
             self.next(); // /
             self.next(); // =
             self.skip_ws();
-            self.refuse_operator_assign(&left, "//=", op_pos)?;
             let value = self.parse_assignment_operand()?;
             return Ok(Expr::AlternativeAssign {
                 path: Box::new(Self::fold_sum_or_merge_key(left)),
@@ -11155,6 +11158,7 @@ impl<'a> Parser<'a> {
         // (e.g. *=+d). Flags come after '=', never before it — `.a *+= .b`
         // is not the append-merge-assign spelling in real yq either.
         if peek2 == "*=" {
+            self.refuse_operator_assign(&left)?;
             self.next(); // *
             self.next(); // =
             let flags = if self.mode == ParserMode::Yq {
@@ -11163,7 +11167,6 @@ impl<'a> Parser<'a> {
                 MergeFlags::default()
             };
             self.skip_ws();
-            self.refuse_operator_assign(&left, "*=", op_pos)?;
             let value = self.parse_assignment_operand()?;
             return Ok(Expr::CompoundAssign {
                 op: AssignOp::Mul(flags),
@@ -11184,15 +11187,10 @@ impl<'a> Parser<'a> {
             };
 
             if let Some(op) = assign_op {
+                self.refuse_operator_assign(&left)?;
                 self.next(); // op char
                 self.next(); // =
                 self.skip_ws();
-                let name = match op {
-                    AssignOp::Div => "/=",
-                    AssignOp::Mod => "%=",
-                    _ => "+=",
-                };
-                self.refuse_operator_assign(&left, name, op_pos)?;
                 let value = self.parse_assignment_operand()?;
                 return Ok(Expr::CompoundAssign {
                     op,
