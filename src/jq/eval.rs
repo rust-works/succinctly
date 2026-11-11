@@ -27119,24 +27119,49 @@ fn format_lua(value: &OwnedValue, options: &LuaOptions) -> Result<String, EvalEr
 /// is, `\a \b \f \n \r \t \v`, `\xNN` for another control character below U+0080, `\uNNNN` and `\UNNNNNNNN`
 /// for the rest (#6924).
 fn go_quote(text: &str) -> String {
-    let mut out = string_with_capacity(text.len() + 2);
+    go_quote_bytes(text.as_bytes())
+}
+
+/// `go_quote` over bytes that need not be UTF-8, as Go's `strconv.Quote` reads a string: each byte that
+/// does not begin a valid sequence is `\xNN` on its own (Go decodes it as a `utf8.RuneError` of width
+/// one). yq's `-p uri` quotes the three bytes of a bad escape this way (`invalid URL escape "%\xc3"`,
+/// #6925).
+#[doc(hidden)]
+pub fn go_quote_bytes(bytes: &[u8]) -> String {
+    let mut out = string_with_capacity(bytes.len() + 2);
     out.push('"');
-    for c in text.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\u{7}' => out.push_str("\\a"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{b}' => out.push_str("\\v"),
-            c if super::go_print::is_print(c) => out.push(c),
-            c if (c as u32) < 0x80 => out.push_str(&format!("\\x{:02x}", c as u32)),
-            c if (c as u32) < 0x10000 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push_str(&format!("\\U{:08x}", c as u32)),
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let (valid_len, invalid_len) = match core::str::from_utf8(rest) {
+            Ok(_) => (rest.len(), 0),
+            Err(e) => (
+                e.valid_up_to(),
+                e.error_len().unwrap_or(rest.len() - e.valid_up_to()),
+            ),
+        };
+        let valid = core::str::from_utf8(&rest[..valid_len]).unwrap_or_default();
+        for c in valid.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\u{7}' => out.push_str("\\a"),
+                '\u{8}' => out.push_str("\\b"),
+                '\u{c}' => out.push_str("\\f"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                '\u{b}' => out.push_str("\\v"),
+                c if super::go_print::is_print(c) => out.push(c),
+                c if (c as u32) < 0x80 => out.push_str(&format!("\\x{:02x}", c as u32)),
+                c if (c as u32) < 0x10000 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push_str(&format!("\\U{:08x}", c as u32)),
+            }
         }
+        // Every byte after a bad sequence's first is a continuation byte, which no sequence starts with.
+        for &byte in &rest[valid_len..valid_len + invalid_len] {
+            out.push_str(&format!("\\x{byte:02x}"));
+        }
+        rest = &rest[valid_len + invalid_len..];
     }
     out.push('"');
     out

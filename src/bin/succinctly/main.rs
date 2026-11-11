@@ -1208,6 +1208,12 @@ pub enum InputFormat {
     /// JSON input
     #[value(name = "json", alias = "j")]
     Json,
+    /// Base64: the whole input decoded to one string, as yq's decoder reads it (#6925)
+    #[value(name = "base64")]
+    Base64,
+    /// URI percent-encoding: the whole input unescaped to one string, `+` a space (#6925)
+    #[value(name = "uri")]
+    Uri,
 }
 
 /// Front matter handling mode for `--front-matter`
@@ -1287,7 +1293,7 @@ pub struct YqCommand {
     #[arg(long, overrides_with = "jq_extensions")]
     pub jq_extensions: bool,
 
-    /// Input format type [auto, yaml, json] (default: auto)
+    /// Input format type [auto, yaml, json, base64, uri] (default: auto)
     #[arg(
         short = 'p',
         long = "input-format",
