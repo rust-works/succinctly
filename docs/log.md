@@ -2,6 +2,18 @@
 
 Tracks updates to the knowledge wiki pages in `docs/`.
 
+## 2026-11-11 — A write holds no tree for the parts of a document that say nothing (issue #6880)
+
+**Sources ingested:**
+- `src/jq/eval_generic.rs` (`CommentTree::collapse_if_silent`, `to_owned_with_comments_pruned`) and
+  `src/bin/succinctly/yq_runner.rs` (`reconcile_presentation_at_depth`, the snapshot's gate): interleaved
+  release A/B against `main` @ `13def7c58` on a Ryzen 9 7950X and an Apple M4 Pro, peak RSS and wall time
+  at 20 and 100 MiB over `users`, `comprehensive`, `nested` and the shapes that cannot collapse
+
+**Pages updated:**
+- [plan/yq-memory-optimization.md](plan/yq-memory-optimization.md) — "The two trees shrank as #6880": the
+  rule, the gate, the measurements and the first version's 30% slowdown on the 7950X
+
 ## 2026-11-10 — The yq memory plan's unlanded phases are decided (issue #5865)
 
 **Sources ingested:**

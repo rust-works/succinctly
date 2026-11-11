@@ -157,6 +157,47 @@ both.
   it), and collapsing a subtree that says nothing into one leaf changes what the comment setters
   (`head_comment =` and its relatives, which index a node's members by position) find, so neither is
   part of this change: the second copy of the document is #6879 and the two trees are #6880.
+- **The two trees shrank as #6880.** A subtree that says nothing (no comment, quoting, flow style, anchor,
+  tag or spelling on any node of it) is held as one word, `CommentTree::Silent`: the snapshot's walk
+  collapses a child as soon as it is finished, after the comments that belong to it are attached
+  (`- # note` keys on the tree lining up with its value), and `reconcile_presentation` returns it for a
+  collection whose pristine tree is already one instead of walking it. Every read of the tree (`field`,
+  `at_index`, `meta`, the key map) answers as the full tree did, and a write into it unfolds it, so the
+  output is byte-identical: 7,728 baseline-against-branch runs over 56 filters, 15 documents and 8
+  generated ones and six flag sets, and 16,200 runs of a structural fuzz aimed at `-P` and flow comments
+  beside silent block items, all without a difference. The saving is withheld where something reads the
+  tree by position or by shape: a document with an alias, a metadata write (`style =`, `head_comment =`,
+  `tag =`), and a plain `=` whose right side is not a literal, which copies a source subtree's
+  presentation. `-P` reads it too, and is why the collapsed collection is a variant of its own and not a
+  `Leaf` (what a write that changed a node's kind leaves): `-P` hands a flow collection's trailing comment
+  to the next item's first member, and `head_comment_first_member` grows the one node that holds it, as
+  the full tree has it. A `Leaf` there is left alone, as before, which a first version that grew every
+  `Leaf` got wrong in 10 of 16,200 fuzz runs (found by classifying its differences against yq).
+  Interleaved release A/B against `main` @ `13def7c58`, `.zzz = 1` with `-o yaml` unless noted, peak RSS
+  (MiB; median of 3, of 5 at 20 MiB on the M4 Pro) and the median of 5 wall times:
+
+  | peak RSS (MiB) / time (s)        | 7950X before | 7950X after | M4 Pro before | M4 Pro after |
+  |----------------------------------|-------------:|------------:|--------------:|-------------:|
+  | `users` 20 MiB                   |          595 |         366 |           629 |          388 |
+  | `users` 20 MiB, `-P`             |          718 |         365 |           730 |          393 |
+  | `users` 20 MiB, `del(.users[0])` |          635 |         506 |           612 |          454 |
+  | `users` 20 MiB, `\|= "X"`        |          596 |         365 |           611 |          387 |
+  | `users` 100 MiB                  | 2899 / 10.32 | 1760 / 8.52 |   3061 / 6.58 |  1966 / 6.04 |
+  | `comprehensive` 100 MiB          |  2093 / 8.31 | 1454 / 7.29 |   2094 / 5.44 |  1507 / 4.95 |
+  | `nested` 100 MiB                 |  1628 / 7.12 | 1041 / 6.43 |   1630 / 4.24 |  1154 / 3.63 |
+
+  Controls: the `.` fast path, the JSON-output write, `anchors`, `flow`, `strings` and `sequences` at 20 MiB
+  do not move on the 7950X beyond the 5 MiB that two builds of the same source differ by (-0.3% to -5%), nor
+  does a plain `=` copy (`.c = .users[0]`). `navigation` saves 3%: every record holds a quoted timestamp, so no
+  record collapses, which is the shape this does not help. The M4 Pro's peak RSS is noisy for `nested`
+  (the same binary read 267-271 or 365-378 MiB at 20 MiB, and 1145 to 1553 at 100 MiB): macOS keeps freed
+  pages resident until the kernel purges them, so read the 7950X column, whose runs agree to a MiB, for the
+  size of the saving. With `-P` the 100 MiB `users` write takes 11.30 s to 8.52 s on the 7950X (-24.6%) and 7.01 s
+  to 6.02 s on the M4 Pro (-14.1%). The first version collapsed the finished tree in a pass, which freed millions of cold
+  nodes and made the 100 MiB `users` write 30% *slower* on the 7950X (10.38 s to 13.43 s, measured before the table above) while saving the
+  same memory; collapsing a child as it is finished frees it while it is still in cache. The M4 Pro carried other
+  sessions' load while it was timed (a load average of 1-2), so its times are interleaved ratios, not
+  quiet-box figures. What remains of the 20 MiB `users` write is the document as `OwnedValue` twice (#6879).
 
 ## Problem Statement
 

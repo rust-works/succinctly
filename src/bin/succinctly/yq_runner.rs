@@ -20,8 +20,9 @@ use succinctly::jq::escape::AsciiEscapeWriter;
 use succinctly::jq::eval_generic::{
     check_nesting_depth, depth_guard_panic_message, eval_with_cursor_using,
     to_owned as generic_to_owned, to_owned_cursor as generic_to_owned_cursor,
-    to_owned_with_comments, to_owned_yaml_cursor, validate_cursor, AnchorMark, CommentTree,
-    GenericResult, LazyElem, NodeMeta, ObjectBuilder, KEY_STYLE_STRING, VALUE_STYLE_STRING,
+    to_owned_with_comments, to_owned_with_comments_pruned, to_owned_yaml_cursor, validate_cursor,
+    AnchorMark, CommentTree, GenericResult, LazyElem, NodeMeta, ObjectBuilder, SilentKind,
+    KEY_STYLE_STRING, VALUE_STYLE_STRING,
 };
 use succinctly::jq::stream::StreamFailure;
 use succinctly::jq::{
@@ -4068,6 +4069,35 @@ fn reconcile_presentation(
     reconcile_presentation_at_depth(pristine_value, pristine_tree, result_value, &relative, 0)
 }
 
+/// Whether a plain `=` chain in `expr` has a stage whose right side is not a closed literal
+/// (#6880): `propagate_assign_copied_presentation` and `propagate_assign_spellings` then read the
+/// source node's subtree of the tree by path and shape (`.c = .a`, `.c = (.a // 0)`), so a
+/// subtree collapsed to the empty tree is not the same input to them. A write of a literal
+/// (`.zzz = 1`, `.a = {"b": 2}`) and every other kind of write (`|=`, `+=`, `del()`, ...) read
+/// no source.
+fn assign_reads_tree_by_shape(expr: &Expr) -> bool {
+    is_plain_assign_chain(expr)
+        && collect_assign_chain(expr).map_or(true, |stages| {
+            !stages.iter().all(|(_, value)| is_closed_literal(value))
+        })
+}
+
+/// [`assert_value_tree_depth`] for every node of `value`, `depth` being the level of its root:
+/// what [`reconcile_presentation_at_depth`] would have checked on the way down, for the
+/// walk it skips over a pristine tree that says nothing (#6880). Allocates nothing.
+fn assert_value_depth_below(value: &OwnedValue, depth: usize) {
+    assert_value_tree_depth(depth);
+    match value {
+        OwnedValue::Object(members) => members
+            .values()
+            .for_each(|v| assert_value_depth_below(v, depth + 1)),
+        OwnedValue::Array(items) => items
+            .iter()
+            .for_each(|v| assert_value_depth_below(v, depth + 1)),
+        _ => {}
+    }
+}
+
 /// Panics past `succinctly::jq::MAX_VALUE_TREE_DEPTH` levels of nesting
 /// (#1005) — see that constant's own doc comment for why. `result_value` is
 /// the evaluated filter output, which can be constructed via `reduce`/
@@ -4080,6 +4110,25 @@ fn reconcile_presentation_at_depth(
     depth: usize,
 ) -> CommentTree {
     assert_value_tree_depth(depth);
+    // #6880: a collection whose pristine tree is `Silent` has nothing to carry across a write
+    // that leaves it a collection of the same kind. Every arm below reads the pristine
+    // tree only through `meta()`, `field()`, `at_index()` and the key map, which are all empty
+    // for it, and writes metadata out of what it read, so each node they would build is empty
+    // too. Skipping the walk is the same answer without a second tree the size of the document.
+    // A kind change goes on to its own arm, which can keep a mark of the pristine node. (A
+    // `Leaf` over a collection, which a write that changed a node's kind leaves, is not this:
+    // it takes the arms below, as it did before.)
+    if let CommentTree::Silent(_) = pristine_tree {
+        let kept = match (pristine_value, result_value) {
+            (OwnedValue::Object(_), OwnedValue::Object(_)) => Some(SilentKind::Object),
+            (OwnedValue::Array(_), OwnedValue::Array(_)) => Some(SilentKind::Array),
+            _ => None,
+        };
+        if let Some(kind) = kept {
+            assert_value_depth_below(result_value, depth);
+            return CommentTree::Silent(kind);
+        }
+    }
     match (pristine_value, result_value) {
         (OwnedValue::Object(p_fields), OwnedValue::Object(r_fields)) => {
             let own_meta = grown_container_meta(
@@ -5291,7 +5340,7 @@ fn static_nav_targets(expr: &Expr) -> Option<Vec<Vec<TreeStep<'_>>>> {
 fn contains_alias_mark(node: &CommentTree) -> bool {
     node.alias_name().is_some()
         || match node {
-            CommentTree::Leaf(_) => false,
+            CommentTree::Leaf(_) | CommentTree::Silent(_) => false,
             CommentTree::Array(_, items) => items.iter().any(contains_alias_mark),
             CommentTree::Object(_, fields, _) => fields.values().any(contains_alias_mark),
         }
@@ -5304,7 +5353,7 @@ fn clear_alias_marks(node: &mut CommentTree) {
         node.meta_mut().anchor = None;
     }
     match node {
-        CommentTree::Leaf(_) => {}
+        CommentTree::Leaf(_) | CommentTree::Silent(_) => {}
         CommentTree::Array(_, items) => items.iter_mut().for_each(clear_alias_marks),
         CommentTree::Object(_, fields, _) => fields.values_mut().for_each(clear_alias_marks),
     }
@@ -5318,7 +5367,7 @@ fn copy_alias_marks(src: &CommentTree, dst: &mut CommentTree) {
         dst.meta_mut().anchor = src.anchor_mark().cloned();
     }
     match src {
-        CommentTree::Leaf(_) => {}
+        CommentTree::Leaf(_) | CommentTree::Silent(_) => {}
         CommentTree::Array(_, items) => {
             for (i, item) in items.iter().enumerate() {
                 if contains_alias_mark(item) {
@@ -5681,10 +5730,12 @@ fn copied_container_takes_style(
     source: &CommentTree,
     old: Option<&CommentTree>,
 ) -> bool {
+    // A `Silent` tree never reaches a plain assignment's copy: the snapshot is not collapsed
+    // for one (`assign_reads_tree_by_shape`).
     let kind = match copy {
         CommentTree::Array(..) => "!!seq",
         CommentTree::Object(..) => "!!map",
-        CommentTree::Leaf(_) => return false,
+        CommentTree::Leaf(_) | CommentTree::Silent(_) => return false,
     };
     let non_empty_of_kind = |old: &CommentTree| match (old, copy) {
         (CommentTree::Array(_, items), CommentTree::Array(..)) => !items.is_empty(),
@@ -5715,7 +5766,7 @@ fn copied_container_tag(
 fn strip_anchor_marks(node: &mut CommentTree) {
     node.meta_mut().anchor = None;
     match node {
-        CommentTree::Leaf(_) => {}
+        CommentTree::Leaf(_) | CommentTree::Silent(_) => {}
         CommentTree::Array(_, items) => items.iter_mut().for_each(strip_anchor_marks),
         CommentTree::Object(_, fields, _) => fields.values_mut().for_each(strip_anchor_marks),
     }
@@ -7612,7 +7663,7 @@ fn apply_set_entry(
         let first = match &mut *members[index] {
             CommentTree::Object(_, fields, _) => first_key.and_then(|key| fields.get_mut(key)),
             CommentTree::Array(_, items) => items.first_mut(),
-            CommentTree::Leaf(_) => None,
+            CommentTree::Leaf(_) | CommentTree::Silent(_) => None,
         };
         let Some(first) = first else {
             return Err(set_entry_unsupported(
@@ -8366,10 +8417,31 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
     // and only when the caller can use the result at all (`need_comments`).
     // `no_comments` below reconciles this against each result document once
     // evaluation finishes.
+    //
+    // #6880: a subtree of the pristine tree that says nothing (no comment, quoting, flow style,
+    // anchor, tag or spelling on any node of it) is one node per node of the subtree for no
+    // information: 85 MiB at 20 MiB of `users`, and `reconcile_presentation` builds a second
+    // tree of the same size from it. The walk holds the one-word empty tree for each such
+    // subtree as it finishes it, which every read answers the same, and
+    // `reconcile_presentation` turns into an empty result without a walk. Not when something
+    // reads or writes the tree by position or by shape: an alias mark is matched against it, a
+    // metadata write (`style =`, `head_comment =`, `tag =`, ...) places something into it, and a
+    // plain assignment from a read copies a source subtree's presentation.
+    // The gate is read only when the snapshot is taken: a read, or a run with no use for
+    // comments, does not walk the expression for it.
+    let prune_silent_subtrees = || {
+        !has_aliases
+            && count_meta_assigns(expr) == 0
+            && !writes_tag(expr)
+            && !assign_reads_tree_by_shape(expr)
+    };
     let presentation_sync_ctx = match ((need_comments || writes_tag(expr))
         && is_alias_sensitive_assign(expr))
     .then(|| match pristine_override {
         Some(sub) => Ok(sub),
+        None if prune_silent_subtrees() => {
+            to_owned_with_comments_pruned::<_, YqSemantics>(&cursor.value(), Some(&cursor))
+        }
         None => to_owned_with_comments::<_, YqSemantics>(&cursor.value(), Some(&cursor)),
     }) {
         Some(snapshot) => {
@@ -9123,6 +9195,26 @@ fn defer_flow_line_comments_at(
 /// Prepend `comment` to the head comment of the first member of the non-empty collection `value`
 /// (`tree` is its tree), where the writer renders the comment on a collection item's dash line.
 fn head_comment_first_member(tree: &mut CommentTree, value: &OwnedValue, comment: String) {
+    // A collapsed collection (#6880) stands for a tree whose first member says nothing: it gets
+    // just the node that holds the comment, as that member does in the full tree. (A `Leaf` over
+    // a collection, which a write that changed a node's kind leaves, has no first member and is
+    // left as it was.)
+    if let CommentTree::Silent(kind) = tree {
+        *tree = match (kind, value) {
+            (SilentKind::Array, OwnedValue::Array(_)) => {
+                CommentTree::array(NodeMeta::empty(), vec![CommentTree::empty()])
+            }
+            (SilentKind::Object, OwnedValue::Object(members)) => match members.keys().next() {
+                Some(key) => CommentTree::object(
+                    NodeMeta::empty(),
+                    IndexMap::from([(key.clone(), CommentTree::empty())]),
+                    IndexMap::new(),
+                ),
+                None => CommentTree::empty(),
+            },
+            _ => CommentTree::empty(),
+        };
+    }
     let first = match (tree, value) {
         (CommentTree::Array(_, items), OwnedValue::Array(_)) => items.first_mut(),
         (CommentTree::Object(_, fields, _), OwnedValue::Object(members)) => members
@@ -9211,6 +9303,8 @@ fn strip_presentation_style_at_depth(
         _ => "",
     };
     match tree {
+        // Nothing in it has a style to strip or a tag to drop.
+        CommentTree::Silent(kind) => CommentTree::Silent(*kind),
         CommentTree::Leaf(meta) => {
             let style = match value {
                 OwnedValue::String(text) => kept_quote(text, tree.style()),
@@ -15754,6 +15848,147 @@ mod tests {
         }
     }
 
+    /// The pristine tree and value of a one-document YAML text, as `evaluate_yaml_cursor_core`
+    /// snapshots them before a write; `silent` holds the empty tree for each subtree that says
+    /// nothing, as the snapshot does when nothing reads the tree by position or by shape (#6880).
+    fn snapshot_of(yaml: &[u8], collapse_silent: bool) -> (OwnedValue, CommentTree) {
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+        let YamlValue::Sequence(docs) = root.value() else {
+            panic!("expected a document sequence");
+        };
+        let (doc, _) = docs.uncons_cursor().expect("one document");
+        let built = if collapse_silent {
+            to_owned_with_comments_pruned::<_, YqSemantics>(&doc.value(), Some(&doc))
+        } else {
+            to_owned_with_comments::<_, YqSemantics>(&doc.value(), Some(&doc))
+        };
+        built.unwrap()
+    }
+
+    fn pristine_of(yaml: &[u8]) -> (OwnedValue, CommentTree) {
+        snapshot_of(yaml, false)
+    }
+
+    fn pristine_pruned_of(yaml: &[u8]) -> (OwnedValue, CommentTree) {
+        snapshot_of(yaml, true)
+    }
+
+    /// A block-style YAML `OutputConfig` for the tests that emit a value.
+    fn block_yaml_config() -> OutputConfig {
+        OutputConfig {
+            output_format: OutputFormat::Yaml,
+            compact: false,
+            raw_output: false,
+            nul_output: false,
+            join_output: false,
+            ascii_output: false,
+            sort_keys: false,
+            no_doc: false,
+            indent_str: "  ".to_string(),
+            use_color: false,
+            json_sourced_floats: false,
+        }
+    }
+
+    /// #6880: the pruned snapshot is the dense one with each silent subtree held as the empty
+    /// tree, and `reconcile_presentation` over it answers what it answers over the dense one,
+    /// for a write that keeps every container's kind (the shortcut) and for one that changes a
+    /// kind (which takes its own arm).
+    #[test]
+    fn reconcile_over_a_pruned_pristine_tree_matches_the_dense_one_6880() {
+        let text =
+            b"# head\na:\n  b:\n    - 1\n    - 2\n  c: x # kept\nd:\n  - e: 1\n  - e: 2\nf: 3\n";
+        let (value, dense) = pristine_of(text);
+        let (pruned_value, pruned) = pristine_pruned_of(text);
+        assert_eq!(value, pruned_value);
+        assert!(
+            matches!(dense.field("d"), CommentTree::Array(..)),
+            "the dense tree holds a node for each node of the document"
+        );
+        assert!(
+            matches!(pruned.field("d"), CommentTree::Silent(SilentKind::Array)),
+            "a silent subtree is one word"
+        );
+        assert_eq!(pruned.field("a").field("c").own(), Some("# kept"));
+        assert_eq!(pruned.own(), dense.own());
+        // Writes that keep every container's kind: the same value, a key added and a key
+        // removed, an array grown and shrunk.
+        let config = block_yaml_config();
+        for (written, silent_d) in [
+            (
+                b"a:\n  b:\n    - 1\n    - 2\n  c: x\nd:\n  - e: 1\n  - e: 2\nf: 3\n".as_slice(),
+                true,
+            ),
+            (
+                b"a:\n  b:\n    - 1\n    - 2\n    - 3\n  z: 9\nd:\n  - e: 1\nf: 3\ng:\n  h: 1\n"
+                    .as_slice(),
+                true,
+            ),
+        ] {
+            let (result, _) = pristine_of(written);
+            let dense_out = reconcile_presentation(&value, &dense, &result, &[]);
+            let pruned_out = reconcile_presentation(&value, &pruned, &result, &[]);
+            // The silent part of the result is one word where the dense walk built its nodes.
+            if silent_d {
+                assert!(matches!(dense_out.field("d"), CommentTree::Array(..)));
+                assert!(matches!(pruned_out.field("d"), CommentTree::Silent(_)));
+            }
+            // Emitted the same: every node reads the same through the tree's accessors.
+            let dense_text = emit_yaml_value(&result, &dense_out, &config, "", false);
+            let pruned_text = emit_yaml_value(&result, &pruned_out, &config, "", false);
+            assert_eq!(dense_text, pruned_text);
+        }
+        // A scalar written over a container (the kind changes) goes through the kind-change arm
+        // either way, and answers the same.
+        let scalar = OwnedValue::Int(1);
+        let dense_out = reconcile_presentation(&value, &dense, &scalar, &[]);
+        let pruned_out = reconcile_presentation(&value, &pruned, &scalar, &[]);
+        assert_eq!(format!("{dense_out:?}"), format!("{pruned_out:?}"));
+    }
+
+    /// #6880: the snapshot collapses only for a write that reads the tree by neither position nor
+    /// shape: a literal or computed `=`, `|=`, `+=` and `del` do; a plain `=` from a read copies a
+    /// source subtree's presentation and does not.
+    #[test]
+    fn assign_reads_tree_by_shape_names_the_plain_copies_only_6880() {
+        let reads = |filter: &str| {
+            let expr = jq::parse_with_mode(filter, jq::ParserMode::Yq).unwrap();
+            assign_reads_tree_by_shape(&expr)
+        };
+        for filter in [".zzz = 1", ".a = {\"b\": [1]}", ".a.b = \"x\" | .c = 2"] {
+            assert!(!reads(filter), "{filter} copies no source");
+        }
+        for filter in [
+            ".c = .a",
+            ".c = .a.x",
+            ".c = (.b // 0)",
+            ".a = 1 | .c = .a",
+            ".c = .a + 1",
+        ] {
+            assert!(reads(filter), "{filter} may copy a source");
+        }
+        for filter in [".a |= . + 1", ".a += 1", "del(.a)", ".a.b |= \"x\"", "."] {
+            assert!(!reads(filter), "{filter} is not a plain assignment");
+        }
+    }
+
+    /// #6880: a comment above an array element's dash lands on the first member of the mapping
+    /// the element holds, which the tree has to line up with its value for, so a `- # note`
+    /// element is never collapsed before it is attached.
+    #[test]
+    fn a_dash_comment_keeps_its_element_in_the_pruned_tree_6880() {
+        let (_, pruned) = pristine_pruned_of(b"- # note\n  a: 1\n  b: 2\n- c: 3\n");
+        assert!(
+            matches!(pruned.at_index(0), CommentTree::Object(..)),
+            "the commented element keeps its nodes"
+        );
+        assert!(
+            matches!(pruned.at_index(1), CommentTree::Silent(SilentKind::Object)),
+            "the silent element beside it is one word"
+        );
+    }
+
     /// `depth` levels of single-element array nesting: `[[[...[Null]...]]]`.
     fn linear_array_nest(depth: usize) -> OwnedValue {
         let mut v = OwnedValue::Null;
@@ -15777,11 +16012,13 @@ mod tests {
         use succinctly::jq::MAX_VALUE_TREE_DEPTH;
 
         let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
-        let _ = reconcile_presentation(&under, &CommentTree::empty(), &under, &[]);
+        let under_tree = styled_comment_tree_nest(MAX_VALUE_TREE_DEPTH - 1);
+        let _ = reconcile_presentation(&under, &under_tree, &under, &[]);
 
         let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+        let over_tree = styled_comment_tree_nest(MAX_VALUE_TREE_DEPTH);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            reconcile_presentation(&over, &CommentTree::empty(), &over, &[])
+            reconcile_presentation(&over, &over_tree, &over, &[])
         }));
         assert!(
             result.is_err(),
@@ -15885,15 +16122,38 @@ mod tests {
             use succinctly::jq::MAX_VALUE_TREE_DEPTH;
             // Past the constant, well inside the floor: both walks answer.
             let past = linear_array_nest(MAX_VALUE_TREE_DEPTH + 600);
+            let past_tree = styled_comment_tree_nest(MAX_VALUE_TREE_DEPTH + 600);
             let answered = depth_guard_message_of(|| {
-                let _ = reconcile_presentation(&past, &CommentTree::empty(), &past, &[]);
+                let _ = reconcile_presentation(&past, &past_tree, &past, &[]);
+                let _ = reconcile_presentation(
+                    &past,
+                    &CommentTree::Silent(SilentKind::Array),
+                    &past,
+                    &[],
+                );
                 let _ = emit_yaml_value(&past, &CommentTree::empty(), &config, "", false);
             });
             assert_eq!(answered, None, "the walks stop at the constant");
-            // Far past what 32 MiB (half the stack) can hold at any frame size.
+            // Far past what 32 MiB (half the stack) can hold at any frame size. The dense arms
+            // spend a few KiB a level, so a tree that says something at every level of 100,000
+            // reaches the floor; over a silent tree the shortcut's own walk has to, at 2,000,000.
+            let deep = linear_array_nest(100_000);
+            let deep_tree = styled_comment_tree_nest(100_000);
+            let dense = depth_guard_message_of(|| {
+                let _ = reconcile_presentation(&deep, &deep_tree, &deep, &[]);
+            });
+            assert_eq!(
+                dense.as_deref(),
+                Some(succinctly::jq::STACK_FLOOR_NESTING_MESSAGE)
+            );
             let far = linear_array_nest(2_000_000);
             let reconcile = depth_guard_message_of(|| {
-                let _ = reconcile_presentation(&far, &CommentTree::empty(), &far, &[]);
+                let _ = reconcile_presentation(
+                    &far,
+                    &CommentTree::Silent(SilentKind::Array),
+                    &far,
+                    &[],
+                );
             });
             let emit = depth_guard_message_of(|| {
                 let _ = emit_yaml_value(&far, &CommentTree::empty(), &config, "", false);
@@ -16333,6 +16593,17 @@ mod tests {
             to_owned_canonicalizing_numbers_at_depth(&cursor.value(), &cursor, 0).unwrap(),
             expected
         );
+    }
+
+    /// [`linear_comment_tree_nest`] where every level says something (a flow style), so
+    /// `reconcile_presentation` takes its dense arms down the whole nest and not the shortcut over
+    /// a silent tree (#6880): the walk whose recursive frame the depth guards bound.
+    fn styled_comment_tree_nest(depth: usize) -> CommentTree {
+        let mut t = CommentTree::empty();
+        for _ in 0..depth {
+            t = CommentTree::array(NodeMeta::from_comment_and_style(None, "flow"), vec![t]);
+        }
+        t
     }
 
     /// `depth` levels of single-child `CommentTree::Array` nesting, mirroring
