@@ -22,6 +22,12 @@ type Row = (
     i32,
 );
 
+/// The error line of `stderr`: a run with `RUST_BACKTRACE` set (the coverage job) adds anyhow's
+/// backtrace after it.
+fn error_line(stderr: &str) -> &str {
+    stderr.lines().next().unwrap_or("")
+}
+
 const ROWS: &[Row] = &[
     ("base64", "aGVsbG8=", &[], ".", "hello\n", "", 0),
     (
@@ -159,7 +165,7 @@ fn string_input_formats_match_yq_on_stdin_6925() -> Result<()> {
         let (out, err, status) = run_yq_stdin_with_stderr(filter, input, &args)?;
         let row = format!("-p {format} {extra:?} {filter:?} on {input:?}");
         assert_eq!(out, stdout, "stdout of {row}");
-        assert_eq!(err.trim_end(), stderr, "stderr of {row}");
+        assert_eq!(error_line(&err), stderr, "stderr of {row}");
         assert_eq!(status, code, "exit status of {row}");
     }
     Ok(())
@@ -200,7 +206,7 @@ fn base64_reads_the_input_in_go_stream_chunks_6925() -> Result<()> {
         &["-p", "base64"],
     )?;
     assert_eq!(
-        (err.trim_end(), code),
+        (error_line(&err), code),
         (
             "Error: bad file '-': illegal base64 data at input byte 404",
             1
@@ -210,7 +216,7 @@ fn base64_reads_the_input_in_go_stream_chunks_6925() -> Result<()> {
     long[5000] = b'!';
     let (_, err, code) = run_yq_stdin_bytes_with_stderr("length", &long, &["-p", "base64"])?;
     assert_eq!(
-        (err.trim_end(), code),
+        (error_line(&err), code),
         (
             "Error: bad file '-': illegal base64 data at input byte 564",
             1
@@ -273,7 +279,7 @@ fn string_input_format_by_extension_and_per_file_6925() -> Result<()> {
     let (out, err, code) = run_yq_files(".", &[&txt, &bad], &["-p", "base64"])?;
     assert_eq!((out.as_str(), code), ("yo\n", 1));
     assert_eq!(
-        err.trim_end(),
+        error_line(&err),
         format!(
             "Error: bad file '{}': illegal base64 data at input byte 3",
             bad.display()
@@ -316,7 +322,7 @@ fn front_matter_with_a_string_format_is_refused_6925() -> Result<()> {
     let (_, err, code) =
         run_yq_stdin_with_stderr(".", "aGk=", &["-p", "uri", "--front-matter=extract"])?;
     assert_eq!(
-        (err.trim_end(), code),
+        (error_line(&err), code),
         (
             "Error: --front-matter and --input-format uri are incompatible",
             1
@@ -375,12 +381,12 @@ fn raw_input_ignores_a_string_format_6925() -> Result<()> {
 fn urid_quotes_a_bad_escape_as_go_does_6925() -> Result<()> {
     let (_, err, code) = run_yq_stdin_with_stderr("@urid", "\"x%\\u0001\"", &["-p", "json"])?;
     assert_eq!(
-        (err.trim_end(), code),
+        (error_line(&err), code),
         (r#"Error: invalid URL escape "%\x01""#, 1)
     );
     let (_, err, code) = run_yq_stdin_bytes_with_stderr(".", b"x%\x7f", &["-p", "uri"])?;
     assert_eq!(
-        (err.trim_end(), code),
+        (error_line(&err), code),
         (r#"Error: bad file '-': invalid URL escape "%\x7f""#, 1)
     );
     Ok(())
