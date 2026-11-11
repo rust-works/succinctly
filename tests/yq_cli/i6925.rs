@@ -2,7 +2,8 @@
 //! as yq's decoder does and then reads it as `-p json` reads a JSON string. Every answer was captured
 //! from yq v4.53.3 (its `-p` deprecation warning on stderr left out). The rows that still differ are in
 //! `docs/compliance/yq/limitations.md` (`-p base64|uri`): YAML output of decoded bytes that are not
-//! UTF-8, and `--front-matter`.
+//! UTF-8, and `--front-matter`. `-p props`, which reads a properties file as the YAML yq prints for it,
+//! is at the end.
 
 use std::io::Write;
 
@@ -435,6 +436,142 @@ fn urid_quotes_a_bad_escape_as_go_does_6925() -> Result<()> {
     assert_eq!(
         (error_line(&err), code),
         (r#"Error: bad file '-': invalid URL escape "%\x7f""#, 1)
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// `-p props` (#6925): magiconair/properties as yq's `decoder_properties.go` builds its nodes. Each
+// row was captured from yq v4.53.3 on stdin; the rows that still differ (comments under `-o props`,
+// blank lines ending a comment, explicit `? ` keys, the quoting a write keeps) are in
+// `docs/compliance/yq/limitations.md` (`-p props`).
+// ---------------------------------------------------------------------------------------------
+
+/// (stdin, extra args, filter, yq's stdout, yq's first stderr line, yq's exit status).
+type PropsRow = (
+    &'static str,
+    &'static [&'static str],
+    &'static str,
+    &'static str,
+    &'static str,
+    i32,
+);
+
+#[rustfmt::skip]
+const PROPS_ROWS: &[PropsRow] = &[
+    ("# top\na=1\nb.c=true\nb.d = hello world\n# about e\ne.0=x\ne.1=\nf: ~\ng=${a}\n", &[], ".", "# top\na: \"1\"\nb:\n  c: \"true\"\n  d: hello world\ne:\n  # about e\n  - x\n  - \"\"\nf: \"~\"\ng: ${a}\n", "", 0),
+    ("# top\na=1\nb.c=true\n# about e\ne.0=x\n", &["-o", "json"], ".", "{\n  \"a\": \"1\",\n  \"b\": {\n    \"c\": \"true\"\n  },\n  \"e\": [\n    \"x\"\n  ]\n}\n", "", 0),
+    ("a=1\na.b=2\n", &[], ".", "a: \"1\"\n", "", 0),
+    ("a.b=2\na=1\n", &[], ".", "a: \"1\"\n", "", 0),
+    ("e.1=y\ne.0=x\n", &[], ".", "e:\n  - x\n  - y\n", "", 0),
+    ("e.3=x\n", &[], ".", "e:\n  - null\n  - null\n  - null\n  - x\n", "", 0),
+    ("e.+1=x\ne.01=y\n", &[], ".", "e:\n  - null\n  - y\n", "", 0),
+    ("0.a=x\n+1=y\n", &[], ".", "\"0\":\n  a: x\n\"1\": y\n", "", 0),
+    ("a.b=y\na.0=x\n", &[], ".", "a:\n  b: y\n  \"0\": x\n", "", 0),
+    ("a..b=x\n.c=y\nd.=z\n", &[], ".", "a:\n  \"\":\n    b: x\n\"\":\n  c: y\nd:\n  \"\": z\n", "", 0),
+    ("abc=1\nabd=2\nab*=9\nx*=3\n", &[], ".", "abc: \"9\"\nabd: \"9\"\nx*: \"3\"\n", "", 0),
+    ("abc=1\n# c\nab*=9\n", &[], ".", "# c\nab*: \"9\"\n", "", 0),
+    ("e.[]=z\n", &[], ".", "e: null\n", "", 0),
+    ("e.0=x\ne.0x1=y\ne.1_0=z\n", &["-o", "json", "-I", "0"], ".", "{\"e\":[\"x\",\"y\",null,null,null,null,null,null,null,null,\"z\"]}\n", "", 0),
+    ("e.0=x\ne.-1=y\n", &[], ".", "e:\n  - y\n", "", 0),
+    ("a.0=x\n# c\na.b=y\nz=1\n", &[], ".", "a:\n  - x\nz: \"1\"\n", "", 0),
+    ("# c1\n#  c2  \n! c3\na=1\n# tail", &[], ".", "# c1\n# c2  \n# c3\na: \"1\"\n", "", 0),
+    ("# a\n##x\n#  # y\na=1\n", &[], ".", "# a\n#x\n# y\na: \"1\"\n", "", 0),
+    ("# c\nb.c=x\n# d\ne.0.0=q\n", &[], ".", "b:\n  # c\n  c: x\ne:\n  - # d\n    - q\n", "", 0),
+    ("e.0.a=x\n# c\ne.0.b=y\ne.1.0=q\n", &[], ".", "e:\n  - a: x\n    # c\n    b: y\n  - - q\n", "", 0),
+    ("# c1\na=1\n# c2\na=2\n# c3\nb.c=1\nb=2\n", &[], ".", "# c2\na: \"2\"\nb: \"2\"\n", "", 0),
+    ("x\ny = 2\nk v w\nk2:v\n key3 = \\ lead\n", &[], ".", "x: \"\"\ny: \"2\"\nk: v w\nk2: v\nkey3: ' lead'\n", "", 0),
+    ("k=v\\\n   cont\nm=multi\\nline\nt=\\u00e9\\u0000\\t\n", &[], ".", "k: vcont\nm: |-\n  multi\n  line\nt: \"\u{e9}\\0\\t\"\n", "", 0),
+    ("a=1\r\nb=x\\\r\n  c\r\n", &[], ".", "a: \"1\"\nb: x\nc: \"\"\n", "", 0),
+    ("<<=x\n*a=&b\n!t=x\n---=1\n", &[], ".", "\"<<\": x\n'*a': '&b'\n# t=x\n'---': \"1\"\n", "", 0),
+    ("true=yes\nnull=~\nk=0x1f\nl=1_000\nm=2001-12-14\nn=a: b\n", &[], ".", "\"true\": yes\n\"null\": \"~\"\nk: \"0x1f\"\nl: \"1_000\"\nm: \"2001-12-14\"\nn: 'a: b'\n", "", 0),
+    ("\n\n", &[], ".", "{}\n", "", 0),
+    ("#only\n", &["-o", "json"], ".", "{}\n", "", 0),
+    ("", &["-o", "json"], ".", "null\n", "", 0),
+    ("e[0]=x\ne[1][0]=y\nf[a]=z\n0[1]=r\n", &["--properties-array-brackets"], ".", "e:\n  - x\n  - - y\nf[a]: z\n\"0\":\n  - null\n  - r\n", "", 0),
+    ("e[0]=x\n", &[], ".", "e[0]: x\n", "", 0),
+    ("a.b=1\nc=2\n", &[], ".a.b", "1\n", "", 0),
+    ("a.b=1\nc=2\n", &[], ".a | keys", "- b\n", "", 0),
+    ("a.b=1\n", &[], ".a.b | tag", "!!str\n", "", 0),
+    ("a=1\n", &["-o", "props"], ". | .b = \"2\"", "a = 1\nb = 2\n", "", 0),
+    ("a.0=x\na.b=y\n", &[], ".", "", "Error: bad file '-': cannot index array with 'b' (strconv.ParseInt: parsing \"b\": invalid syntax)", 1),
+    ("e.-1=x\n", &[], ".", "", "Error: bad file '-': index [-1] out of range, array size is 0", 1),
+    ("e.0=x\ne.a_b=y\n", &[], ".", "", "Error: bad file '-': cannot index array with 'a_b' (strconv.ParseInt: parsing \"ab\": invalid syntax)", 1),
+    ("e.0=x\ne.0xzz=y\n", &[], ".", "", "Error: bad file '-': cannot index array with '0xzz' (strconv.ParseInt: parsing \"zz\": invalid syntax)", 1),
+    ("e.0=x\ne.99999999999999999999=y\n", &[], ".", "", "Error: bad file '-': cannot index array with '99999999999999999999' (strconv.ParseInt: parsing \"99999999999999999999\": value out of range)", 1),
+    ("k=\\u0041\\x\\", &[], ".", "", "Error: bad file '-': properties: Line 1: premature EOF", 1),
+    ("k=\\u00zz\n", &[], ".", "", "Error: bad file '-': properties: Line 1: invalid unicode literal", 1),
+    ("a=1\nb=2\n\n=3\n", &[], ".", "", "Error: bad file '-': properties: Line 4: \"3\"", 1),
+    ("=50%\n", &[], ".", "", "Error: bad file '-': properties: Line 1: \"50%!\"(MISSING)", 1),
+    ("=a%sb%5.2fz%%\n", &[], ".", "", "Error: bad file '-': properties: Line 1: \"a%!s(MISSING)b%!f(MISSING)z\"...", 1),
+    ("=abcdefghijklmnop\n", &[], ".", "", "Error: bad file '-': properties: Line 1: \"abcdefghij\"...", 1),
+    ("a=${b\n", &[], ".", "", "Error: bad file '-': malformed expression", 1),
+    ("a=${b}\nb=${a}%d\n", &[], ".", "", "Error: bad file '-': circular reference in:", 1),
+];
+
+#[test]
+fn props_input_matches_yq_on_stdin_6925() -> Result<()> {
+    for &(input, extra, filter, stdout, stderr, code) in PROPS_ROWS {
+        let mut args = vec!["-p", "props"];
+        args.extend_from_slice(extra);
+        let (out, err, status) = run_yq_stdin_with_stderr(filter, input, &args)?;
+        let row = format!("-p props {extra:?} {filter:?} on {input:?}");
+        assert_eq!(out, stdout, "stdout of {row}");
+        assert_eq!(error_line(&err), stderr, "stderr of {row}");
+        assert_eq!(status, code, "exit status of {row}");
+    }
+    Ok(())
+}
+
+/// `*.properties`, `*.props` and `*.p` (any case) are props both ways under `-p auto`; an empty
+/// file holds no document; `-i` writes the output format back.
+#[test]
+fn props_by_extension_and_inplace_6925() -> Result<()> {
+    let dir = TempDir::new()?;
+    let a = write_file(&dir, "a.properties", b"a.b=1\ne.0=x\n")?;
+    let b = write_file(&dir, "b.P", b"k=v\n")?;
+    let empty = write_file(&dir, "c.props", b"")?;
+    let txt = write_file(&dir, "d.txt", b"a.b=1\n")?;
+    assert_eq!(
+        run_yq_files(".", &[&a], &[])?,
+        ("a.b = 1\ne.0 = x\n".into(), String::new(), 0)
+    );
+    assert_eq!(
+        run_yq_files(".", &[&b, &empty, &a], &[])?,
+        ("k = v\na.b = 1\ne.0 = x\n".into(), String::new(), 0)
+    );
+    assert_eq!(
+        run_yq_files(".", &[&empty], &["-o", "json"])?,
+        ("null\n".into(), String::new(), 0)
+    );
+    run_yq_files(".a.b = \"2\"", &[&a], &["-i"])?;
+    assert_eq!(std::fs::read(&a)?, b"a.b = 2\ne.0 = x\n");
+    run_yq_files(".a.b = \"2\"", &[&txt], &["-p", "props", "-i"])?;
+    assert_eq!(std::fs::read(&txt)?, b"a:\n  b: \"2\"\n");
+    Ok(())
+}
+
+/// Recorded divergences: `--front-matter` with `-p props` is refused (yq decodes the front matter
+/// as props), and an index that would pad a sequence past 2^24 elements is refused where yq
+/// allocates a node for every padded `null` until it runs out of memory.
+#[test]
+fn props_refusals_6925() -> Result<()> {
+    let (_, err, code) =
+        run_yq_stdin_with_stderr(".", "a=1\n", &["-p", "props", "--front-matter=process"])?;
+    assert_eq!(
+        (error_line(&err), code),
+        (
+            "Error: --front-matter and --input-format props are incompatible",
+            1
+        )
+    );
+    let (_, err, code) = run_yq_stdin_with_stderr(".", "e.16777216=x\n", &["-p", "props"])?;
+    assert_eq!(
+        (error_line(&err), code),
+        (
+            "Error: bad file '-': Cannot grow array to 16777217 elements",
+            1
+        )
     );
     Ok(())
 }

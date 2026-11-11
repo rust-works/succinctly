@@ -159,6 +159,12 @@ pub use eval::{eval_full, eval_owned_scalar_fast, eval_reindexed_document, with_
 // #6925: Go's `strconv.Quote` and `url.QueryUnescape` over bytes, for the CLI's `-p uri`.
 #[doc(hidden)]
 pub use eval::{go_query_unescape, go_quote_bytes};
+// #6925: yq's key glob and `parseInt`, for the CLI's `-p props` decoder, which follows the paths
+// yq's traversal does.
+#[doc(hidden)]
+pub use eval::yq_parse_int64;
+#[doc(hidden)]
+pub use glob::yq_match_key;
 // #6560: the CLI's switch for reading `$ENV` once; `std` only, like the `thread_local!` behind it.
 #[cfg(feature = "std")]
 pub use eval::snapshot_environment;

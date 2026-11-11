@@ -1217,6 +1217,10 @@ pub enum InputFormat {
     /// URI percent-encoding: the whole input unescaped to one string, `+` a space (#6925)
     #[value(name = "uri")]
     Uri,
+    /// Java properties (`a.b = c`), as yq's decoder reads them: each key a path, each value a
+    /// string, comments kept (#6925)
+    #[value(name = "props", alias = "p", alias = "properties")]
+    Props,
 }
 
 /// Front matter handling mode for `--front-matter`
@@ -1296,7 +1300,7 @@ pub struct YqCommand {
     #[arg(long, overrides_with = "jq_extensions")]
     pub jq_extensions: bool,
 
-    /// Input format type [auto, yaml, json, base64, uri] (default: auto)
+    /// Input format type [auto, yaml, json, props, base64, uri] (default: auto)
     #[arg(
         short = 'p',
         long = "input-format",

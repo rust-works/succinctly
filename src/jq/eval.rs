@@ -28006,7 +28006,9 @@ fn tonumber_from_str_yq(s: &str) -> Result<OwnedValue, EvalError> {
     )))
 }
 
-/// Port of yq's `parseInt64` (`pkg/yqlib/lib.go`, v4.53.3): strip *every*
+/// yq's `parseInt64`: `s` as an `i64`, in the bases and spellings yq accepts.
+///
+/// Port of `pkg/yqlib/lib.go` (v4.53.3): strip *every*
 /// underscore unconditionally (no positional check, unlike the float
 /// grammar below), then accept a `0x`/`0X` (hex) or `0o` (octal, lowercase
 /// only) prefix -- checked against the string as a whole, so a sign before
@@ -28015,7 +28017,7 @@ fn tonumber_from_str_yq(s: &str) -> Result<OwnedValue, EvalError> {
 /// decimal otherwise. `i64::from_str_radix`/`str::parse::<i64>` both accept
 /// a sign *after* where the prefix (if any) was stripped, matching Go's
 /// `strconv.ParseInt`.
-pub(crate) fn yq_parse_int64(s: &str) -> Option<i64> {
+pub fn yq_parse_int64(s: &str) -> Option<i64> {
     if s.is_empty() {
         return None;
     }
