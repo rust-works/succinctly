@@ -1808,8 +1808,6 @@ mod tests {
     // computed-float token tests (#2902)
     // ========================================================================
 
-    /// #6927: the integer's spelling token round-trips like the plain one, decodes only under
-    /// its own leading digit, and is no number to `str::parse`.
     /// #6958: a float whose text reads as an integer crosses under its own token family, apart
     /// from the plain spelling (`6`) and the integer's (`5`).
     #[test]
@@ -1835,6 +1833,8 @@ mod tests {
         assert_eq!(float_spelling_token("1_000"), "4049095048048048e999e999");
     }
 
+    /// #6927: the integer's spelling token round-trips like the plain one, decodes only under
+    /// its own leading digit, and is no number to `str::parse`.
     #[test]
     fn int_spelling_token_is_its_own_family_6927() {
         for text in ["08", "09", "0018", "-09"] {

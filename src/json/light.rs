@@ -3270,7 +3270,7 @@ impl<'a> JsonNumber<'a> {
     #[inline]
     pub(crate) fn bridge_spelled_int(&self) -> Option<i64> {
         // #6958: a float whose text reads as an integer (`!!float 1_000`) is no integer.
-        if self.bridge_float_spelling().is_some() {
+        if self.raw_bytes().first() == Some(&b'4') && self.bridge_float_spelling().is_some() {
             return None;
         }
         // The integer token first: an explicit `!!int 08` is an integer whatever its text.
@@ -3491,12 +3491,11 @@ impl<'a> JsonNumber<'a> {
                 .or_else(|| self.bridge_spelled_int().map(|n| n as f64))
                 .or_else(|| {
                     let spelling = self.bridge_spelling()?;
-                    crate::yaml::is_spelled_float(&spelling)
-                        .then(|| {
-                            crate::yaml::underscored_float_value(&spelling)
-                                .or_else(|| spelling.parse::<f64>().ok())
-                        })
-                        .flatten()
+                    crate::yaml::underscored_float_value(&spelling).or_else(|| {
+                        crate::yaml::is_spelled_float(&spelling)
+                            .then(|| spelling.parse::<f64>().ok())
+                            .flatten()
+                    })
                 })
                 .or_else(|| crate::json::validate::jq_special_number(bytes))
                 .ok_or(JsonError::InvalidNumber)

@@ -10371,7 +10371,7 @@ fn emit_yaml_value_at_depth(
         // number, so anywhere nested it carries the `!!float` tag, as yq's encoder writes it.
         OwnedValue::NumberLiteral(NumberRepr::Float(_), literal)
             if depth > 0
-                && literal.contains('_')
+                && succinctly::yaml::is_underscored_float(literal)
                 && succinctly::yaml::needs_explicit_float_tag_in_yaml(literal) =>
         {
             format!("!!float {literal}")

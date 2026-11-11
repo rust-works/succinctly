@@ -4788,7 +4788,7 @@ impl OwnedValue {
             // #6958: an underscored float (`!!float 1_0.5`, `1_000`) crosses under the float token:
             // its text alone reads as an integer, or as no number at all.
             Self::NumberLiteral(NumberRepr::Float(_), literal)
-                if literal.contains('_') && crate::yaml::is_spelled_float(literal) =>
+                if crate::yaml::is_underscored_float(literal) =>
             {
                 out.push_str(&crate::json::validate::float_spelling_token(literal));
             }

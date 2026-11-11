@@ -297,7 +297,6 @@ pub use light::{
     YamlCursor, YamlElements, YamlField, YamlFields, YamlNumber, YamlString, YamlValue,
 };
 pub use locate::{locate_offset, locate_offset_detailed, LocateResult};
-pub use scalar::needs_explicit_float_tag_in_yaml;
 #[doc(hidden)]
 pub use scalar::overflowed_int_json_text;
 pub use scalar::whole_float_as_int;
@@ -312,6 +311,7 @@ pub(crate) use scalar::{
     is_overflowed_int_literal, is_zero_padded_with_8_or_9, nonfinite_literal_index,
     nonfinite_literal_value,
 };
+pub use scalar::{is_underscored_float, needs_explicit_float_tag_in_yaml};
 pub use scalar::{resolve_plain, resolve_plain_sourced, resolve_tagged, ResolvedScalar};
 pub(crate) use scalar::{spelled_int_value, underscored_float_value};
 pub use yq_header::glue_after_leading_marker_text;

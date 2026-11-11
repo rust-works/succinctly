@@ -675,6 +675,13 @@ pub(crate) fn underscored_float_value(raw: &str) -> Option<f64> {
     }
 }
 
+/// Whether `raw` is an underscored float text ([`underscored_float_value`]): the one test the
+/// writers ask before they keep it as text or tag it (#6958).
+#[must_use]
+pub fn is_underscored_float(raw: &str) -> bool {
+    underscored_float_value(raw).is_some()
+}
+
 /// Whether `raw` is a float spelled other than as JSON number syntax ([`spelled_float_json_text`]).
 #[must_use]
 pub fn is_spelled_float(raw: &str) -> bool {
@@ -828,6 +835,7 @@ pub(super) fn preservable_float_literal_text(s: &str) -> Option<String> {
 /// this crate writes. A YAML document's `-0` reads back as a float, so a
 /// computed negative zero is emitted bare, as real yq does, rather than as
 /// `!!float -0` (#3445).
+#[doc(hidden)]
 #[must_use]
 pub fn needs_explicit_float_tag_in_yaml(text: &str) -> bool {
     !matches!(resolve_plain_sourced(text, false), ResolvedScalar::Float(_))
