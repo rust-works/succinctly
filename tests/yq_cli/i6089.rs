@@ -409,7 +409,13 @@ fn test_key_operator_assignment_is_refused_6089() -> Result<()> {
         r#"(.a.x | key) *= "z""#,
         r#"(.a.x | key) //= "z""#,
     ] {
-        let (stdout, stderr, code) = crate::run_yq_stdin_with_stderr(filter, "a: {x: 1}\n", &[])?;
+        // `//=` is not yq's operator, so it needs the flag to reach this refusal (#6981).
+        let args: &[&str] = if filter.contains("//=") {
+            &["--jq-extensions"]
+        } else {
+            &[]
+        };
+        let (stdout, stderr, code) = crate::run_yq_stdin_with_stderr(filter, "a: {x: 1}\n", args)?;
         assert_ne!(code, 0, "{filter}: stdout={stdout:?}");
         assert!(
             stderr.contains("(PATH | key) can only be assigned with = or |="),

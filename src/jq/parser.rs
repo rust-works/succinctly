@@ -2695,6 +2695,23 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// The compound assignments yq has no operator for (`/=`, `%=`, `//=`) are jq's, so yq mode
+    /// refuses them unless `--jq-extensions` is on (#6981), as it does a jq-only builtin: yq reads
+    /// `.a /= 2` as `/` with a missing operand and stops (`'/' expects 2 args but there is 1`).
+    /// `+=`, `-=`, `*=` and `|=` are yq's own. Called with the cursor on the operator.
+    fn reject_jq_only_assignment_unless_jq_extensions(&self, op: &str) -> Result<(), ParseError> {
+        if self.mode == ParserMode::Yq && !self.jq_extensions {
+            return Err(ParseError::new(
+                format!(
+                    "\"{op}\" is not part of yq's syntax; pass --jq-extensions to enable \
+                     succinctly's jq-compatible operators"
+                ),
+                self.pos,
+            ));
+        }
+        Ok(())
+    }
+
     /// Unlike [`reject_unless_jq_extensions`], `--jq-extensions` never
     /// rescues this rejection: `input`/`inputs`/`input_line_number` (#1507)
     /// need real per-document driver-loop coordination yq mode's
@@ -11108,6 +11125,7 @@ impl<'a> Parser<'a> {
 
         // Check for //= (alternative assignment)
         if peek3 == "//=" {
+            self.reject_jq_only_assignment_unless_jq_extensions("//=")?;
             self.next(); // /
             self.next(); // /
             self.next(); // =
@@ -11154,6 +11172,9 @@ impl<'a> Parser<'a> {
             };
 
             if let Some(op) = assign_op {
+                if matches!(op, AssignOp::Div | AssignOp::Mod) {
+                    self.reject_jq_only_assignment_unless_jq_extensions(peek2)?;
+                }
                 self.next(); // op char
                 self.next(); // =
                 self.skip_ws();
@@ -14183,8 +14204,8 @@ mod tests {
                     if is_assignment(left) && matches!(right.as_ref(), Expr::Literal(_))),
                 "jq: `{source}`: {jq:?}"
             );
-            // yq: the assignment's value is the `//`.
-            let yq = parse_with_mode(source, ParserMode::Yq).unwrap();
+            // yq: the assignment's value is the `//`. `//=` is jq's, so it needs the flag (#6981).
+            let yq = parse_with_mode_and_extensions(source, ParserMode::Yq, true).unwrap();
             assert!(
                 matches!(&yq, Expr::Assign { value, .. }
                     | Expr::CompoundAssign { value, .. }
@@ -14211,6 +14232,50 @@ mod tests {
             matches!(&jq, Expr::Alternative(left, _) if matches!(left.as_ref(), Expr::AlternativeAssign { .. })),
             "{jq:?}"
         );
+    }
+
+    /// #6981: yq has no `/=`, `%=` or `//=` (it reads `/`, `%` or `//` with a missing operand and
+    /// stops), so yq mode refuses them unless `--jq-extensions` is on; jq mode always accepts
+    /// them. `+=`, `-=`, `*=` and `|=` are yq's own and need no flag.
+    #[test]
+    fn compound_assignments_yq_lacks_are_gated_6981() {
+        for op in ["/=", "%=", "//="] {
+            let source = format!(".a {op} 2");
+            let err = parse_with_mode(&source, ParserMode::Yq)
+                .expect_err("yq mode without the flag must refuse the operator");
+            assert!(
+                err.message
+                    .contains(&format!("\"{op}\" is not part of yq's syntax"))
+                    && err.message.contains("--jq-extensions"),
+                "{op}: {err:?}"
+            );
+            assert_eq!(err.position, 3, "{op}: the error is at the operator");
+            assert!(
+                matches!(
+                    parse_with_mode_and_extensions(&source, ParserMode::Yq, true),
+                    Ok(Expr::CompoundAssign { .. } | Expr::AlternativeAssign { .. })
+                ),
+                "{op}: --jq-extensions accepts it"
+            );
+            assert!(
+                parse_with_mode(&source, ParserMode::Jq).is_ok(),
+                "{op}: jq mode accepts it"
+            );
+        }
+        for op in ["+=", "-=", "*=", "|="] {
+            let source = format!(".a {op} 2");
+            assert!(
+                parse_with_mode(&source, ParserMode::Yq).is_ok(),
+                "{op}: yq's own operator needs no flag"
+            );
+        }
+        // The operators as arithmetic are yq's, and so is `//`.
+        for source in [".a / 2", ".a % 2", ".a // 2", ".a /2", ".a|=.//2"] {
+            assert!(
+                parse_with_mode(source, ParserMode::Yq).is_ok(),
+                "{source}: arithmetic is not an assignment"
+            );
+        }
     }
 
     /// #5298: an interpolated or formatted string is an object key, and with no value it is

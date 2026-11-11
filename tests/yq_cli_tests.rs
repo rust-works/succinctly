@@ -31313,7 +31313,7 @@ fn test_slice_assign_scalar_noop_with_optional_suffix_1101() -> Result<()> {
 /// yq has no `//=` syntax at all to verify against directly.
 #[test]
 fn test_slice_alternative_assign_scalar_is_noop_1101() -> Result<()> {
-    let (out, code) = run_yq_stdin(".[0:1] //= 99", "5", &["-o", "json"])?;
+    let (out, code) = run_yq_stdin(".[0:1] //= 99", "5", &["-o", "json", "--jq-extensions"])?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "5");
     Ok(())
@@ -31962,8 +31962,13 @@ fn test_yq_scalar_target_noop_discards_rhs_1233() -> Result<()> {
     // (`=` via `eval_assign`, the rest via `collect_rhs_outputs` since
     // #1778 -- `eval_rhs_once` at the time this test was written).
     for op in ["=", "+=", "-=", "*=", "//="] {
+        // `//=` is not yq's operator, so it needs the flag (#6981).
+        let mut args = vec!["-o", "json"];
+        if op == "//=" {
+            args.push("--jq-extensions");
+        }
         let (out, err, code) =
-            run_yq_stdin_with_stderr(&format!(".a {op} error(\"boom\")"), "5\n", &["-o", "json"])?;
+            run_yq_stdin_with_stderr(&format!(".a {op} error(\"boom\")"), "5\n", &args)?;
         assert_eq!(code, 0, "op={op} err={err}");
         assert_eq!(out.trim(), "5", "op={op}");
     }
@@ -32042,11 +32047,13 @@ fn test_yq_scalar_target_noop_discards_rhs_1233() -> Result<()> {
 #[test]
 fn test_yq_scalar_target_noop_pre_last_component_1232() -> Result<()> {
     for op in ["=", "+=", "-=", "*=", "//="] {
-        let (out, err, code) = run_yq_stdin_with_stderr(
-            &format!(".a.b.c {op} error(\"boom\")"),
-            "a: 5\n",
-            &["-o", "json", "-I0"],
-        )?;
+        // `//=` is not yq's operator, so it needs the flag (#6981).
+        let mut args = vec!["-o", "json", "-I0"];
+        if op == "//=" {
+            args.push("--jq-extensions");
+        }
+        let (out, err, code) =
+            run_yq_stdin_with_stderr(&format!(".a.b.c {op} error(\"boom\")"), "a: 5\n", &args)?;
         assert_eq!(code, 0, "op={op} err={err}");
         assert_eq!(out.trim(), r#"{"a":5}"#, "op={op}");
     }
@@ -32757,17 +32764,29 @@ fn test_yq_untracked_branch_via_try_catch_noop_1764() -> Result<()> {
 /// an external-compat claim.
 #[test]
 fn test_yq_untracked_comma_branch_extension_compound_assign_noop_1764() -> Result<()> {
-    let (out, code) = run_yq_stdin("(.a, 1) /= 2", "a: 4\nb: 2\n", &["-o=json", "-I=0"])?;
+    let (out, code) = run_yq_stdin(
+        "(.a, 1) /= 2",
+        "a: 4\nb: 2\n",
+        &["-o=json", "-I=0", "--jq-extensions"],
+    )?;
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(&out)?;
     assert_eq!(v, serde_json::json!({"a": 2.0, "b": 2}));
 
-    let (out, code) = run_yq_stdin("(.a, 1) %= 3", "a: 4\nb: 2\n", &["-o=json", "-I=0"])?;
+    let (out, code) = run_yq_stdin(
+        "(.a, 1) %= 3",
+        "a: 4\nb: 2\n",
+        &["-o=json", "-I=0", "--jq-extensions"],
+    )?;
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(&out)?;
     assert_eq!(v, serde_json::json!({"a": 1, "b": 2}));
 
-    let (out, code) = run_yq_stdin("(.a, 1) //= 5", "a: null\nb: 2\n", &["-o=json", "-I=0"])?;
+    let (out, code) = run_yq_stdin(
+        "(.a, 1) //= 5",
+        "a: null\nb: 2\n",
+        &["-o=json", "-I=0", "--jq-extensions"],
+    )?;
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(&out)?;
     assert_eq!(v, serde_json::json!({"a": 5, "b": 2}));
@@ -38620,7 +38639,12 @@ fn test_yq_terminal_iterate_with_nothing_to_write_skips_rhs_1921() -> Result<()>
 fn test_yq_nonterminal_iterate_null_target_skips_rhs_compound_operators_1857() -> Result<()> {
     for op in ["+=", "-=", "*=", "/=", "%=", "//="] {
         let filter = format!(".a[].b {op} error(\"boom\")");
-        let (out, err, code) = run_yq_stdin_with_stderr(&filter, "a: null\n", &["-o", "json"])?;
+        // `/=`, `%=` and `//=` are not yq's operators, so they need the flag (#6981).
+        let mut args = vec!["-o", "json"];
+        if matches!(op, "/=" | "%=" | "//=") {
+            args.push("--jq-extensions");
+        }
+        let (out, err, code) = run_yq_stdin_with_stderr(&filter, "a: null\n", &args)?;
         assert_eq!(code, 0, "op={op:?} err={err}");
         assert_eq!(out.trim(), "{\n  \"a\": []\n}", "op={op:?}");
     }

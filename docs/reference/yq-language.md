@@ -788,6 +788,7 @@ surface (#1512):
 | `def name: body;`, `label $out`, `break $out`        | Function definitions, labelled break (#4808)  |
 | `while(c; f)`, `until(c; f)`, `repeat(f)`            | Loop generators (#4808)                       |
 | `recurse`, `recurse(f)`, `recurse(f; cond)`, `recurse_down` | Recursive descent; yq has `..` (#4808)        |
+| `/=`, `%=`, `//=`                                    | Compound assignments: yq has no such operator (#6981) |
 | `empty`, `halt`, `halt_error`, `halt_error(n)`, `stderr` | No output / exit / stderr (#4808)             |
 | `values`, `nulls`, `booleans`, `numbers`, `strings`, `arrays`, `objects`, `iterables`, `scalars`, `normals`, `finites` | Type selectors; yq has `select(tag == ...)` (#4808) |
 | `isnull`, `isboolean`, `isnumber`, `isstring`, `isarray`, `isobject`, `isvalid(f)` | Type tests (#4808)                            |
