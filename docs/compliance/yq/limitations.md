@@ -718,6 +718,22 @@ Not covered here:
 - `!!bool` compared with a string. yq compares a scalar's text, so an empty `!!bool` equals `""` and `!!bool yes` equals `"yes"`, where this compares the boolean ([#6292](https://github.com/rust-works/succinctly/issues/6292)).
 - A value-less tag in a flow collection (`[!!str]`, `{a: !!str}`), which yq refuses and this reads as `[""]` ([#6293](https://github.com/rust-works/succinctly/issues/6293)).
 
+### A lone `!` on an empty node is null (#6942)
+
+The non-specific tag `!` decides no kind, so on a node with no value it is the empty plain scalar, a null, in yq: `a: !`, `- !`, `{a: ! , b: 1}` and a whole document of `!` are `null` in JSON output, a comparison with `null`, `tag` and `type`.
+Every other tag with no value is the empty string (#6291 above).
+This reads it that way (`resolve_tagged` answers no kind for an empty `!`, and `value_of_empty_node` leaves a `!` node null), where it answered `""` before.
+A `!` with a value is unchanged: `a: ! 12` is the number `12` and `a: ! x` the string `x`, in both tools.
+
+```console
+$ printf 'a: !\nb: 1\n' | yq -o=json -I0 .                  # {"a":null,"b":1}
+$ printf 'a: !\nb: 1\n' | succinctly yq -o json -I0 .        # {"a":null,"b":1}   ({"a":"","b":1} before #6942)
+```
+
+Not covered here:
+- The YAML output of these nodes. yq drops the `!` it reads (`a: !` prints `a:`, `a: ! x` prints `a: x`); this prints it back (`a: !`, `a: ! x`), and a write that fills the null keeps it (`(.. | select(. == null)) |= "N"` over `a: !` is `a: ! N` here and `a: N` in yq).
+- A document that is only `!` prints nothing under `-o=yaml`, as `!!null` does, where yq prints a blank line (the empty-document output of #5721). It printed the blank line before #6942, because the node was the empty string.
+
 ### A scalar under an unknown `!!` tag is its text (#6299)
 
 yq reads a plain scalar under a tag of the secondary handle that names no core type as its text: `a: !!foo 1` is the string `"1"`, and so are `!!binary 1`, `!!set 1`, `!!seq 1` and `!!str: 1`, where the `:` belongs to the tag.

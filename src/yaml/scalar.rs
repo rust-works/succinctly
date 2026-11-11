@@ -869,6 +869,9 @@ pub fn resolve_tagged(text: &str, tag: &str) -> Option<ResolvedScalar> {
         // (`!!seq`, `!!map`, `!!binary`, `!!timestamp`, `!custom`), as in yq: the tag decides the
         // kind, so the empty text is not a null. `!!null` and the tags above answer for
         // themselves; a tag with text goes on being read as that text.
+        // The non-specific tag `!` is no tag that decides a kind (#6942): yq reads the empty
+        // plain scalar it marks as null, as it does untagged, so it falls to the arm below.
+        "!" if text.is_empty() => None,
         _ if text.is_empty() => Some(ResolvedScalar::Str),
         // #6299: and a plain scalar under any other tag of the secondary handle (`!!binary`,
         // `!!set`, `!!foo`, and `!!str:`, whose `:` belongs to the tag) is its text, not what the
@@ -954,6 +957,16 @@ mod tests {
         assert_eq!(resolve_tagged("", "!!bool"), Some(Bool(false)));
         assert_eq!(resolve_tagged("", "!!int"), Some(Str));
         assert_eq!(resolve_tagged("", "!!float"), Some(Str));
+    }
+
+    /// #6942: the non-specific tag `!` decides no kind, so on an empty scalar it resolves like no
+    /// tag at all (`None`: the caller reads the empty plain scalar, a null), where every tag above
+    /// answers the empty string. A `!` with text stays what it was, the text's own type.
+    #[test]
+    fn a_lone_bang_on_an_empty_scalar_decides_no_kind_6942() {
+        assert_eq!(resolve_tagged("", "!"), None);
+        assert_eq!(resolve_tagged("x", "!"), None);
+        assert_eq!(resolve_tagged("12", "!"), None);
     }
 
     /// #6299: a plain scalar under a tag of the secondary handle that is not a core type is its

@@ -485,7 +485,8 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     #[cold]
     fn value_of_empty_node(&self) -> YamlValue<'a, W> {
         match self.index.get_tag(self.bp_pos) {
-            Some(tag) if tag != "!!null" => YamlValue::String(YamlString::Unquoted {
+            // A lone `!` decides no kind: it is the untagged empty node, a null (#6942).
+            Some(tag) if tag != "!!null" && tag != "!" => YamlValue::String(YamlString::Unquoted {
                 text: self.text,
                 start: self.text.len(),
                 end: self.text.len(),
