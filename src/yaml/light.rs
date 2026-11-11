@@ -6954,17 +6954,9 @@ impl<'a> YamlString<'a> {
         let after_marker = check_pos + 3;
         text.get(check_pos..after_marker) == Some(b"---")
             && crate::yaml::is_seq_indicator_next(text.get(after_marker).copied())
-            && Self::only_node_properties(text.get(after_marker..pos).unwrap_or_default())
-    }
-
-    /// Whether `between` (the text from a `---` marker to a block-scalar header, on one line) holds
-    /// only blanks and node properties: tags (`!!str`, `!<tag:yaml.org,2002:str>`) and anchors
-    /// (`&a`). A word that ends in `:` is a key, so the header after it is that key's value.
-    fn only_node_properties(between: &[u8]) -> bool {
-        between
-            .split(|&b| b == b' ' || b == b'\t')
-            .filter(|word| !word.is_empty())
-            .all(|word| matches!(word[0], b'!' | b'&') && word.last() != Some(&b':'))
+            && crate::yaml::parser::only_node_properties(
+                text.get(after_marker..pos).unwrap_or_default(),
+            )
     }
 
     /// Detect content indentation from first non-empty line.
