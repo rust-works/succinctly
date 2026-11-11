@@ -6252,9 +6252,13 @@ fn selects_by_node_metadata(target: &Expr) -> bool {
     !ends_in_slot(target)
         && (jq::walk::uses_cursor_metadata_builtins(target)
             || jq::walk::any_subexpr(target, &mut |e| {
+                // #6895: `tag` answers the node's own tag (`!Ref`) on the cursor and the core tag of
+                // its value (`!!str`) on the owned document.
                 matches!(
                     e,
-                    Expr::Builtin(Builtin::Kind | Builtin::FileIndex | Builtin::Filename)
+                    Expr::Builtin(
+                        Builtin::Kind | Builtin::Tag | Builtin::FileIndex | Builtin::Filename
+                    )
                 )
             }))
 }
