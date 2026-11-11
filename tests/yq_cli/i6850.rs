@@ -2,9 +2,9 @@
 //! (each one is the results of the filter through that format's encoder, printed raw). Every answer
 //! was captured from yq v4.53.3; a row is kept only when both agree on stdout and the exit status.
 //! Left out because they still differ: a comment in a `props` document (yq writes it as `# ...`), a
-//! null written `~` (yq echoes the spelling, #2802), an encoder failing after earlier results were
-//! printed (yq printed them), `-e` (the exit status reads the encoded text) and an accented
-//! `shell` key (yq decomposes it first). See `docs/compliance/yq/limitations.md`.
+//! null written `~` (yq echoes the spelling, #2802), an encoder failing after the earlier results of a
+//! top-level comma were produced (yq printed them; #6923 keeps them for every other shape) and an
+//! accented `shell` key (yq decomposes it first). See `docs/compliance/yq/limitations.md`.
 
 use anyhow::Result;
 

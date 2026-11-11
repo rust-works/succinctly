@@ -109,6 +109,9 @@ pub enum ErrorKind {
     /// See [`EvalError::is_update_collapse`] -- an internal signal, never
     /// user-visible (#3663).
     UpdateCollapse,
+    /// See [`EvalError::is_output_encoder`] -- raised by the `-o=<format>` encoder stage (#6923),
+    /// which yq runs while it prints, so the results before it are still printed.
+    OutputEncoder,
 }
 
 /// A stream terminator: what ended a sequence of outputs when it wasn't
@@ -1197,6 +1200,18 @@ impl EvalError {
     /// Never reaches the user -- `eval_update_impl` catches it at each path.
     pub(crate) fn update_collapse() -> Self {
         Self::with_kind("update collapsed", ErrorKind::UpdateCollapse)
+    }
+
+    /// An `-o=<format>` encoder refusing a result (#6923), tagged so the yq runner keeps the
+    /// results printed before it: yq runs its encoders while it prints each result, where an error
+    /// raised by the program itself prints nothing.
+    pub(crate) fn output_encoder(message: impl Into<String>) -> Self {
+        Self::with_kind(message, ErrorKind::OutputEncoder)
+    }
+
+    /// Whether this is an `-o=<format>` encoder's refusal (#6923).
+    pub fn is_output_encoder(&self) -> bool {
+        matches!(self.value, EvalErrorPayload::Kind(ErrorKind::OutputEncoder))
     }
 
     /// Whether this is the internal update-collapse signal (#3663).

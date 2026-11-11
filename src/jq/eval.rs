@@ -25705,7 +25705,12 @@ pub(crate) fn format_owned<S: EvalSemantics>(
         FormatType::Urid => format_urid::<S>(owned, optional),
         FormatType::Yaml => format_yaml(owned),
         FormatType::Props => format_props(owned),
-        FormatType::YqOutput(encoder) => format_yq_output::<S>(encoder, owned),
+        FormatType::YqOutput(encoder) => {
+            let text = format_yq_output::<S>(encoder, owned)
+                .map_err(|e| EvalError::output_encoder(e.message))?;
+            note_output_encoder_result(owned);
+            Ok(text)
+        }
         FormatType::YqJson(indent) => {
             // #6887: yq's JSON encoder refuses a non-finite number.
             if let Some(message) = owned.yq_non_finite_json_error(false) {
@@ -26829,6 +26834,41 @@ fn format_props_recursive(
             // else: a scalar whose joined key is empty (`{"":"v"}`) writes nothing in yq, not even a line
         }
     }
+}
+
+/// Whether any result an `-o=<format>` encoder encoded was neither `null` nor `false`, and `None`
+/// when no encoder ran since [`reset_output_encoder_truthy`] (#6923).
+///
+/// `-e` reads the value the filter produced, not the encoded text (`-o=props '.zz'` encodes `null`
+/// to the line `null`, which is truthy as text): the encoder is the last stage of the program, so it
+/// records here what it was given. A process-wide cell, not a `thread_local!`: the evaluator may
+/// run on a worker thread with a larger native stack (ADR-0025) while the CLI reads the answer on
+/// its own.
+pub fn output_encoder_saw_truthy() -> Option<bool> {
+    match ENCODER_TRUTHY.load(core::sync::atomic::Ordering::Relaxed) {
+        ENCODER_TRUTHY_SEEN_FALSY => Some(false),
+        ENCODER_TRUTHY_SEEN_TRUTHY => Some(true),
+        _ => None,
+    }
+}
+
+/// Forget what [`output_encoder_saw_truthy`] holds, at the start of a run (#6923).
+pub fn reset_output_encoder_truthy() {
+    ENCODER_TRUTHY.store(0, core::sync::atomic::Ordering::Relaxed);
+}
+
+const ENCODER_TRUTHY_SEEN_FALSY: u8 = 1;
+const ENCODER_TRUTHY_SEEN_TRUTHY: u8 = 2;
+static ENCODER_TRUTHY: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Record that an encoder encoded `value` (#6923).
+fn note_output_encoder_result(value: &OwnedValue) {
+    let state = if matches!(value, OwnedValue::Null | OwnedValue::Bool(false)) {
+        ENCODER_TRUTHY_SEEN_FALSY
+    } else {
+        ENCODER_TRUTHY_SEEN_TRUTHY
+    };
+    ENCODER_TRUTHY.fetch_max(state, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// yq's `-o=<format>` encoders (#6850): the whole result as that format, line ends included, so the
