@@ -232,7 +232,8 @@ fn signed_and_tagged_zero_padded_floats_print_as_floats_on_the_dom_routes_6899()
     Ok(())
 }
 
-/// An explicit `!!int 08` is the integer 8 in yq. These routes keep it.
+/// An explicit `!!int 08` is the integer 8 in yq. Every route keeps it, those that rebuild the
+/// document through the reindex bridge too (#6927).
 const INT_DOC: &str = "k: !!int 08\n";
 
 const INT_ROWS: &[(&str, &str)] = &[
@@ -243,38 +244,22 @@ const INT_ROWS: &[(&str, &str)] = &[
     ("{\"x\": .k}", "{\"x\":8}\n"),
     (".k | tag", "\"!!int\"\n"),
     (".k | tostring", "\"08\"\n"),
+    (".zz = 1", "{\"k\":8,\"zz\":1}\n"),
+    (".k = .k", "{\"k\":8}\n"),
+    ("with_entries(.)", "{\"k\":8}\n"),
+    (".k | tojson", "\"8\\n\"\n"),
+    (".zz = 1 | .k | tag", "\"!!int\"\n"),
+    (".zz = 1 | .k | tostring", "\"08\"\n"),
+    (".zz = 1 | .k | length", "2\n"),
+    (".zz = 1 | .k + 1", "9\n"),
 ];
 
 #[test]
-fn an_explicit_int_08_keeps_its_integer_on_the_routes_that_do_not_cross_the_bridge_6899(
-) -> Result<()> {
+fn an_explicit_int_08_keeps_its_integer_on_every_route_6899() -> Result<()> {
     for (filter, want) in INT_ROWS {
         let (out, code) = run_yq_stdin(filter, INT_DOC, &["-o=json", "-I0"])?;
         assert_eq!(code, 0, "{filter}");
         assert_eq!(out, *want, "{filter}");
-    }
-    Ok(())
-}
-
-/// #6927: across the reindex bridge the integer becomes the float, and these print `8.0` where yq prints
-/// the `yq` column. Delete this test, and the limitations entry, when #6927 lands.
-const BRIDGE_ROWS: &[(&str, &str, &str)] = &[
-    (".zz = 1", "{\"k\":8,\"zz\":1}\n", "{\"k\":8.0,\"zz\":1}\n"),
-    (".k = .k", "{\"k\":8}\n", "{\"k\":8.0}\n"),
-    ("with_entries(.)", "{\"k\":8}\n", "{\"k\":8.0}\n"),
-    (".k | tojson", "\"8\\n\"\n", "\"8.0\\n\"\n"),
-];
-
-#[test]
-fn an_explicit_int_08_becomes_a_float_across_the_bridge_until_6927() -> Result<()> {
-    for (filter, yq, here) in BRIDGE_ROWS {
-        let (out, code) = run_yq_stdin(filter, INT_DOC, &["-o=json", "-I0"])?;
-        assert_eq!(code, 0, "{filter}");
-        assert_eq!(out, *here, "{filter}");
-        assert_ne!(
-            out, *yq,
-            "{filter}: matches yq now, so #6927 is fixed; delete this pin"
-        );
     }
     Ok(())
 }
