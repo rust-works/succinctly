@@ -7725,4 +7725,5 @@ It runs over the value model, which keeps no comment or source spelling, so on a
 - A head, line or foot comment is dropped, where yq writes it as an XML comment (`<!-- c -->`, `<a>1<!-- l --></a>`).
 - A null written `~` is `null` and a boolean written `True` is `true`, where yq writes the source text.
 - An empty document, which yq prints as nothing, is `null` here (#5721).
+- A processing-instruction target is checked with an approximation of Go's XML name tables (Unicode letters, digits, `-`, `.`, the middle dot and the common combining marks), so a character the tables treat differently is accepted or refused here and not in yq.
 - A `-p`/`-o` input format of `xml` is still refused, so `--xml-strict-mode`, `--xml-keep-namespace`, `--xml-raw-token`, `--xml-skip-directives` and `--xml-skip-proc-inst` have nothing to act on.

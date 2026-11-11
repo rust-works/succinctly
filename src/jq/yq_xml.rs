@@ -150,15 +150,25 @@ fn in_character_range(c: char) -> bool {
     matches!(c as u32, 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF)
 }
 
-/// Go's `isNameString`: a letter or `_` or `:` first, then those and digits, `-` and `.`; any non-ASCII
-/// character is taken as a letter.
+/// Go's `isNameString`, approximated: a letter or `_` or `:` first, then those and digits, `-`, `.` and the
+/// combining marks and middle dot XML allows. Go reads the XML 1.0 name tables; a character they accept
+/// and Unicode's `Alphabetic` does not (or the reverse) is the gap.
 fn is_name(name: &str) -> bool {
     let mut chars = name.chars();
     let first = chars
         .next()
-        .is_some_and(|c| c.is_alphabetic() || c == '_' || c == ':' || !c.is_ascii());
+        .is_some_and(|c| c.is_alphabetic() || c == '_' || c == ':');
     first
-        && chars.all(|c| c.is_alphanumeric() || matches!(c, '_' | ':' | '-' | '.') || !c.is_ascii())
+        && chars.all(|c| {
+            c.is_alphanumeric()
+                || matches!(c, '_' | ':' | '-' | '.' | '\u{B7}')
+                || (!c.is_ascii() && is_combining_mark(c))
+        })
+}
+
+/// The combining-mark blocks XML 1.0 lists among a name's later characters.
+fn is_combining_mark(c: char) -> bool {
+    matches!(c as u32, 0x300..=0x36F | 0x483..=0x486 | 0x591..=0x5C4 | 0x64B..=0x652 | 0x900..=0x903 | 0x93C..=0x94D | 0x20D0..=0x20E1 | 0x203F..=0x2040)
 }
 
 /// Go's `isValidDirective`: balanced `<` `>`, closed quotes and comments.
@@ -177,7 +187,7 @@ fn is_valid_directive(directive: &str) -> bool {
         } else if c == b'\'' || c == b'"' {
             quote = c;
         } else if c == b'<' {
-            if i + 4 < bytes.len() && &bytes[i..i + 4] == b"<!--" {
+            if i + 4 <= bytes.len() && &bytes[i..i + 4] == b"<!--" {
                 comment = true;
             } else {
                 depth += 1;

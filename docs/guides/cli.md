@@ -414,6 +414,7 @@ succinctly yq '.users[]' input.yaml
 
 - `-o, --output-format <FORMAT>`: Output format: `auto` (default), `yaml`, `json`, `props`, `shell`, `csv`, `tsv`, `base64`, `uri`, `lua`, `ini`, `toml`, `kyaml`, `xml` (the last eleven as yq writes them, see the yq limitations page; #6850)
 - `--properties-separator <SEP>`, `--properties-array-brackets`, `--csv-separator <CHAR>`, `--shell-key-separator <SEP>`, `--lua-prefix`, `--lua-suffix`, `--lua-globals`, `--lua-unquoted`: options of the `props`, `csv`, `shell` and `lua` output formats (#6922, #6924)
+- `--xml-attribute-prefix <PREFIX>` (default `+@`), `--xml-content-name <NAME>` (`+content`), `--xml-proc-inst-prefix <PREFIX>` (`+p_`), `--xml-directive-name <NAME>` (`+directive`): which keys of a value `-o=xml` writes as attributes, text, processing instructions and directives (#6924); `-I` is the indent
 - `-I, --indent <N>`: Indent level (0 for compact output, default: 2)
 - `-r, --unwrapScalar`: Output raw strings without quotes (default for YAML)
 - `-j, --tojson`: Deprecated alias for `-o=json`, as in real yq; prints `Flag --tojson has been deprecated, please use -o=json instead` to stderr and wins over `-o` in either order. Unlike jq's `-j`, it does not join output (there is no yq join-output flag; `--join-output` is rejected as in real yq)
