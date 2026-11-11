@@ -3030,6 +3030,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
     }
 
+    /// Whether the cursor is at the start of a line: the start of the input, or just past a break.
+    ///
+    /// The scanners for a quoted scalar, a flow collection and an alias stop just past their
+    /// closing delimiter, so the main loop can be entered mid-line (#6937).
+    #[inline]
+    fn at_line_start(&self) -> bool {
+        self.pos == 0 || Self::is_break(self.input[self.pos - 1])
+    }
+
     /// Count leading spaces (indentation) at start of a line.
     fn count_indent(&self) -> Result<usize, YamlError> {
         // Use SIMD-accelerated space counting
@@ -3041,13 +3050,16 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // Tab after spaces - check context
             // If we haven't seen any spaces and hit a tab at start of line,
             // that's tab indentation (error). But tab after spaces is content.
-            if count == 0 {
+            // #6937: only at the start of a line. The quoted-scalar and alias scanners stop just
+            // past their delimiter, and a tab there (`a: "b"⇥`) is separation before the line break
+            // or a comment, which yq reads.
+            if count == 0 && self.at_line_start() {
                 return Err(YamlError::TabIndentation {
                     line: self.current_line(),
                     offset: next_pos,
                 });
             }
-            // Tab after spaces is start of content, indent count is correct
+            // Tab after spaces, or mid-line: separation or content, indent count is correct
         }
         Ok(count)
     }
@@ -3067,8 +3079,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// just past their closing delimiter, so the main loop can re-derive an "indent"
     /// from a mid-line cursor. A tab in the middle of a line is never indentation.
     ///
-    /// Only reachable with `indent >= 1`: `count_indent` already returns
-    /// `Err(TabIndentation)` for a tab at column 0, so `Ok(0)` implies no tab here.
+    /// `count_indent` returns `Err(TabIndentation)` for a tab at column 0 of a *line*, so an
+    /// `Ok(0)` with a tab at the cursor is a mid-line entry (#6937), which the `line_start` test
+    /// above rules out.
     #[inline]
     fn tab_indents_block_structure(&self, line_start: usize) -> bool {
         self.peek() == Some(b'\t')
@@ -3145,8 +3158,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// past an empty value or key and would otherwise take the line as its blank prefix (#6295: `a:` /
     /// ` ⇥` is refused by yq, and was read as `{"a": null}`; `?` / ` ⇥` / `  a` as `{"a": null}` too).
     fn reject_tab_only_line_at_cursor(&self) -> Result<(), YamlError> {
-        let at_line_start = self.pos == 0 || Self::is_break(self.input[self.pos - 1]);
-        if at_line_start && self.tab_only_line_is_refused(self.pos) {
+        if self.at_line_start() && self.tab_only_line_is_refused(self.pos) {
             return Err(YamlError::TabIndentation {
                 line: self.current_line(),
                 offset: self.pos,
@@ -10211,6 +10223,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
         // Skip to content
         let line_start = self.pos;
+        let entered_at_line_start = self.at_line_start();
         self.advance_by(indent);
 
         // A tab *after* the leading spaces is indentation — and so illegal — only when
@@ -10225,7 +10238,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
 
         // The cursor is past the line's spaces: only a line whose next byte is the tab can be the one.
-        if self.peek() == Some(b'\t') && self.tab_only_line_is_refused(line_start) {
+        // A tab after a closing quote or an alias is no line of its own (#6937).
+        if entered_at_line_start
+            && self.peek() == Some(b'\t')
+            && self.tab_only_line_is_refused(line_start)
+        {
             return Err(YamlError::TabIndentation {
                 line: self.current_line(),
                 offset: self.pos,
