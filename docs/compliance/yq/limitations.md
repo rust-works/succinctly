@@ -5466,8 +5466,8 @@ ruled out), even though real yq supports every one of them:
   a bare last entry is that entry's and stays (`a: 1\n# oldfoot` + `. foot_comment = "x"`
   prints both), while one after a last entry that carries a line comment is the root's own
   and is replaced, exactly as yq's parser attaches them. A scalar root takes none of it (`42`
-  stays `42`); a comment block before the first document's `---` marker is kept by a root
-  head write where yq drops it with the marker, and a head, foot or `comments` write on a
+  stays `42`); a root head write replaces the first document's `---` marker and the comments
+  around it, as yq does ([#6903](https://github.com/rust-works/succinctly/issues/6903): `... comments = ""` strips them), and a head, foot or `comments` write on a
   route that keeps no comments of its own (a comma, a constructed value, a bind) is refused
   rather than printed without it. Only a write whose every candidate is the root: `.. head_comment = "x"` visits
   every node and still raises. Checked by 11 `meta_assign_root_*_2796` goldens, the

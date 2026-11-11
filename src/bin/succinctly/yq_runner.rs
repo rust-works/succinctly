@@ -7176,6 +7176,9 @@ fn apply_meta_assign_writes(
             }
         }
         if let MetaEffect::Clear { head, line, foot } = write.effect {
+            if head && write.path.is_empty() && !write.on_key {
+                clear_first_entry_head_after_marker(tree, node_value);
+            }
             apply_clear(write, &steps, tree, head, line, foot);
             continue;
         }
@@ -7249,10 +7252,22 @@ fn apply_meta_assign_writes(
         if let MetaEffect::SetRoot { head, foot, line } = &write.effect {
             // A scalar root prints no head or foot of its own through a write (yq: `42` stays `42`).
             if matches!(node_value, OwnedValue::Object(_) | OwnedValue::Array(_)) {
+                if head.is_some() {
+                    clear_first_entry_head_after_marker(tree, node_value);
+                }
+                let Some(node) = comment_tree_at_path_or_create_mut(tree, &steps) else {
+                    continue;
+                };
                 let meta = node.meta();
                 let new_head = head.clone().unwrap_or_else(|| meta.head_comment().to_vec());
                 let new_foot = foot.clone().unwrap_or_else(|| meta.foot_comment().to_vec());
-                *node.meta_mut() = meta.with_head_foot(new_head, new_foot);
+                let written = meta.with_head_foot(new_head, new_foot);
+                // #6903: a head written to the root replaces the document's preamble, `---` too.
+                *node.meta_mut() = if head.is_some() {
+                    written.with_preamble(None)
+                } else {
+                    written
+                };
                 if line.is_some() && !defers_to_own_block(node_value, node) {
                     node.meta_mut().comment.clone_from(line);
                 }
@@ -7762,6 +7777,25 @@ fn apply_clear(
     }
 }
 
+/// #6903: the comments a first document writes after its `---` marker are its first entry's head in
+/// the comment tree, and yq's head comment of the root. A write to the root's head replaces them
+/// with the marker, so they go too; a document with no marker has nothing here.
+fn clear_first_entry_head_after_marker(tree: &mut CommentTree, root: &OwnedValue) {
+    if tree.meta().preamble().is_none() {
+        return;
+    }
+    let first = match root {
+        OwnedValue::Object(object) => object.keys().next().map(|key| TreeStep::Key(key.as_str())),
+        OwnedValue::Array(items) if !items.is_empty() => Some(TreeStep::Index(0)),
+        _ => None,
+    };
+    if let Some(first) = first {
+        if let Some(entry) = comment_tree_at_path_or_create_mut(tree, &[first]) {
+            clear_head_foot(entry, true, false);
+        }
+    }
+}
+
 /// Drop the standalone head and/or foot lines of `node`, keeping everything else.
 fn clear_head_foot(node: &mut CommentTree, head: bool, foot: bool) {
     let meta = node.meta();
@@ -7775,7 +7809,15 @@ fn clear_head_foot(node: &mut CommentTree, head: bool, foot: bool) {
     } else {
         meta.foot_comment().to_vec()
     };
-    *node.meta_mut() = meta.with_head_foot(kept_head, kept_foot);
+    // #6903: a first document's `---` marker and the comments around it are yq's head comment of
+    // its root, so a write to the head replaces them, marker included.
+    let written = if head {
+        meta.with_head_foot(kept_head, kept_foot)
+            .with_preamble(None)
+    } else {
+        meta.with_head_foot(kept_head, kept_foot)
+    };
+    *node.meta_mut() = written;
 }
 
 /// The top-level pipe stages of `expr`, looking through a parenthesised pipe only.
