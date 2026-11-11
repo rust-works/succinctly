@@ -9219,7 +9219,26 @@ fn ceil_positive_float_to_usize(f: f64) -> usize {
     f.ceil() as usize
 }
 
-pub(crate) fn classify_limit_n(n_value: OwnedValue) -> LimitN {
+/// How jq's `limit`/`nth` see a float count `f` against `0` (#6983): `$n > 0`, `$n == 0` and
+/// `$n < 0` are jq comparisons, and two number literals compare exactly as decimals
+/// ([`jq_numeric_cmp`]), so a literal too small for a double (`1e-1000`, `-1e-400`) is above or
+/// below `0` although its double is `±0.0`. Only that case reads the text; every other float
+/// answers by its double, NaN (neither above, below nor equal) included. yq has no literal
+/// comparison (its numbers are doubles, and its parser keeps `-1e-400` a literal where jq's negates
+/// `1e-400`), so a yq count always answers by its double.
+fn float_count_against_zero<S: EvalSemantics>(
+    value: &OwnedValue,
+    f: f64,
+) -> Option<core::cmp::Ordering> {
+    if S::TAG == EvalTag::Jq && f == 0.0 && matches!(value, OwnedValue::NumberLiteral(..)) {
+        let zero = OwnedValue::NumberLiteral(NumberRepr::Int(0), "0".into());
+        return jq_numeric_cmp(value, &zero);
+    }
+    f.partial_cmp(&0.0)
+}
+
+pub(crate) fn classify_limit_n<S: EvalSemantics>(n_value: OwnedValue) -> LimitN {
+    use core::cmp::Ordering;
     match n_value {
         OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _) if i >= 0 => {
             LimitN::Take(i as usize)
@@ -9234,13 +9253,14 @@ pub(crate) fn classify_limit_n(n_value: OwnedValue) -> LimitN {
         // branch as a negative `$n` (#1825 -- confirmed live against jq
         // 1.7.1: `limit(nan; 1,2,3)` passes everything through, same as
         // `limit(-1; 1,2,3)`).
+        // A literal too small for a double is not zero (#6983): `1e-1000` takes one output, as
+        // any count in `(0, 1]` does, and `-1e-400` is unlimited.
         OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => {
-            if f > 0.0 {
-                LimitN::Take(ceil_positive_float_to_usize(f))
-            } else if f == 0.0 {
-                LimitN::Take(0)
-            } else {
-                LimitN::Unlimited
+            match float_count_against_zero::<S>(&n_value, f) {
+                Some(Ordering::Greater) if f == 0.0 => LimitN::Take(1),
+                Some(Ordering::Greater) => LimitN::Take(ceil_positive_float_to_usize(f)),
+                Some(Ordering::Equal) => LimitN::Take(0),
+                _ => LimitN::Unlimited,
             }
         }
         // A string, array or object sorts above every number, so `$n > 0`
@@ -9268,7 +9288,7 @@ pub(crate) fn classify_limit_n(n_value: OwnedValue) -> LimitN {
 /// `Int`/`NumberLiteral(Int)` directly (rather than converting to `f64`
 /// first) matters because an integer past `f64`'s 53-bit mantissa would
 /// otherwise be rounded on its way to `usize`.
-pub(crate) fn classify_nth_n(n_owned: OwnedValue) -> Result<usize, EvalError> {
+pub(crate) fn classify_nth_n<S: EvalSemantics>(n_owned: OwnedValue) -> Result<usize, EvalError> {
     match n_owned {
         OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _) if i >= 0 => {
             Ok(i as usize)
@@ -9284,7 +9304,11 @@ pub(crate) fn classify_nth_n(n_owned: OwnedValue) -> Result<usize, EvalError> {
             // elif $n == 0 ... else` falls to the unlimited-passthrough
             // `else` for a NaN `$n + 1`, so `last` never terminates and jq
             // raises before ever reaching that -- rejects it (#1825).
-            if f.is_nan() || f < 0.0 {
+            // A literal too small for a double is below `0` when it is negative (#6983):
+            // `nth(-1e-400; g)` raises in jq although its double is `-0.0`.
+            if f.is_nan()
+                || float_count_against_zero::<S>(&n_owned, f) == Some(core::cmp::Ordering::Less)
+            {
                 return Err(EvalError::new("nth doesn't support negative indices"));
             }
             // jq's `nth($n; g)` takes `ceil($n + 1)` outputs of `g` and
@@ -9414,7 +9438,7 @@ fn each_limit_with_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
-    let n = match classify_limit_n(n_value) {
+    let n = match classify_limit_n::<S>(n_value) {
         LimitN::Unlimited => return eval_each::<W, S>(expr, value, optional, sink),
         // #3486: raised on `expr`'s first output, as jq's `foreach` does.
         LimitN::Raise(error) => {
@@ -9834,7 +9858,7 @@ fn each_nth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
     fanout_arg_each::<W, S, _>(n_expr, value.clone(), optional, |n_owned| {
-        let n = match classify_nth_n(n_owned) {
+        let n = match classify_nth_n::<S>(n_owned) {
             Ok(n) => n,
             Err(e) => return Flow::Escaped(Control::Error(e)),
         };
@@ -59328,7 +59352,7 @@ fn resolve_limit_sink<'a, S: EvalSemantics>(
     // the count -- `path(limit(([1] as $q ?// $b | $q); .a))` is `["a"]` in jq
     // 1.7.1. This collected the whole count generator first.
     resolve_value_fork_stream::<S>(n_expr, value, trackable, false, |n_value| {
-        match classify_limit_n(n_value) {
+        match classify_limit_n::<S>(n_value) {
             LimitN::Unlimited => {
                 resolve_node_sink::<S>(expr, value, trackable, snapshot, frame, keep, sink)
             }
@@ -59397,7 +59421,7 @@ fn resolve_nth_sink<'a, S: EvalSemantics>(
 ) -> ResolveFlow {
     let (n_values, escape) = eval_owned_multi_keep_partial::<S>(n_expr, value);
     for n_value in n_values {
-        let n = match classify_nth_n(n_value) {
+        let n = match classify_nth_n::<S>(n_value) {
             Ok(n) => n,
             Err(e) => return ResolveFlow::Escaped(e.into()),
         };
@@ -70201,7 +70225,7 @@ fn source_always_reaches_destructure(source: &Expr, passing: &[Expr]) -> bool {
                 )
         }
         Expr::Limit { n, .. } => !matches!(unwrap_paren(n), Expr::Literal(lit)
-            if literal_to_owned(lit).as_f64().is_some_and(|n| n >= 1.0)),
+            if count_literal_number(lit).is_some_and(|n| n >= 1.0)),
         // #4655: a bind whose source always emits runs its body (`(1,2) as $q | $x as P`).
         Expr::As { expr, .. } | Expr::AsPattern { expr, .. } => !always_emits(expr),
         Expr::Foreach { .. } | Expr::Label { .. } => true,
@@ -70767,9 +70791,21 @@ fn wrapped_marker(e: &Expr) -> Option<&Rc<Tracked>> {
 /// A `limit` count that is a literal number (#4514), as [`update_navigates_within`] reads one.
 fn limit_literal_count(n: &Expr) -> Option<f64> {
     match unwrap_paren(n) {
-        Expr::Literal(lit) => literal_to_owned(lit).as_f64(),
+        Expr::Literal(lit) => count_literal_number(lit),
         _ => None,
     }
+}
+
+/// A program literal's number for the count analyses ([`limit_literal_count`], [`constant_number`],
+/// [`source_always_reaches_destructure`]'s `limit` arm), or `None` when its double does not stand for it: a non-zero
+/// literal too small for a double (`1e-1000`), which jq's `limit`/`nth` compare as a literal
+/// ([`float_count_against_zero`]) and these analyses would read as `0` (#6983). Their fast paths then
+/// decline, and [`classify_limit_n`] answers in the mode's own model. (jq's parser writes `-1e-400` as
+/// the negation of `1e-400`, a computed zero; yq's keeps it a literal, which yq reads as a double.)
+fn count_literal_number(lit: &Literal) -> Option<f64> {
+    let value = literal_to_owned(lit);
+    let f = value.as_f64()?;
+    (float_count_against_zero::<JqSemantics>(&value, f) == f.partial_cmp(&0.0)).then_some(f)
 }
 
 /// A number built from numeric literals under `+`, `-`, `*`, `/`, `%` and unary minus (`1 + 0`, `0 / 1`,
@@ -70783,7 +70819,7 @@ fn constant_number(e: &Expr) -> Option<f64> {
 /// [`constant_number`] with `dot` the number `.` holds, which a pipe's head sets for its tail.
 fn constant_number_at(e: &Expr, dot: Option<f64>) -> Option<f64> {
     match unwrap_paren(e) {
-        Expr::Literal(_) => limit_literal_count(e),
+        Expr::Literal(lit) => count_literal_number(lit),
         Expr::Identity => dot,
         Expr::Pipe(stages) => stages
             .iter()
@@ -96696,7 +96732,7 @@ fn limit_with_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     //
     // Uses main's `classify_limit_n`, shared with `resolve_limit_sink`,
     // in place of the inline match this commit first duplicated.
-    let (n, raise) = match classify_limit_n(n_value) {
+    let (n, raise) = match classify_limit_n::<S>(n_value) {
         LimitN::Unlimited => return eval_single::<W, S>(expr, value, optional),
         // #3486: jq's `foreach` raises this on `expr`'s first output, so pull one
         // and raise (below); evaluating `expr` to completion first would fire the
@@ -96898,7 +96934,7 @@ fn eval_nth_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // hand-copied classification left to rot here would silently
             // reintroduce #1825's bugs the moment anything ever does
             // construct one.
-            let n = match classify_nth_n(n_value) {
+            let n = match classify_nth_n::<S>(n_value) {
                 Ok(n) => n,
                 Err(e) => return QueryResult::Error(e),
             };
@@ -109980,7 +110016,7 @@ fn builtin_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Real yq has no `limit` (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
         |n_owned| {
-            let (n, raise) = match classify_limit_n(n_owned) {
+            let (n, raise) = match classify_limit_n::<S>(n_owned) {
                 LimitN::Unlimited => {
                     return eval_single::<W, S>(expr, value.clone(), optional);
                 }
@@ -110141,7 +110177,7 @@ fn builtin_nth_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Real yq has no `nth` (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
         |n_owned| {
-            let n = match classify_nth_n(n_owned) {
+            let n = match classify_nth_n::<S>(n_owned) {
                 Ok(n) => n,
                 Err(e) => return QueryResult::Error(e),
             };
@@ -110979,7 +111015,15 @@ fn builtin_abs<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     let owned = to_owned_or_suppress!(&value, optional);
-    let sorts_below_zero = apply_compare_op::<S>(CompareOp::Lt, &owned, &OwnedValue::Int(0));
+    // jq's `abs` is `if . < 0 then -. else . end` with a literal `0`, so a literal operand compares
+    // exactly (#6983): `-1e-400 | abs` is `-(-1e-400)`, a computed `0`, although its double is
+    // `-0.0`. A bare `Int(0)` is a computed number, against which a literal compares as a double.
+    let zero = if S::TAG == EvalTag::Jq {
+        OwnedValue::NumberLiteral(NumberRepr::Int(0), "0".into())
+    } else {
+        OwnedValue::Int(0)
+    };
+    let sorts_below_zero = apply_compare_op::<S>(CompareOp::Lt, &owned, &zero);
     if sorts_below_zero {
         match arith_negate::<S>(owned) {
             Ok(v) => QueryResult::Owned(v),
@@ -167675,7 +167719,7 @@ mod tests {
                 "object ({}) and number (1) cannot be subtracted",
             ),
         ] {
-            let LimitN::Raise(error) = classify_limit_n(count) else {
+            let LimitN::Raise(error) = classify_limit_n::<JqSemantics>(count) else {
                 panic!("expected LimitN::Raise");
             };
             assert_eq!(error.message, message);
@@ -167689,15 +167733,15 @@ mod tests {
         }
         // The controls that never reach the subtraction.
         assert!(matches!(
-            classify_limit_n(OwnedValue::Null),
+            classify_limit_n::<JqSemantics>(OwnedValue::Null),
             LimitN::Unlimited
         ));
         assert!(matches!(
-            classify_limit_n(OwnedValue::Bool(true)),
+            classify_limit_n::<JqSemantics>(OwnedValue::Bool(true)),
             LimitN::Unlimited
         ));
         assert!(matches!(
-            classify_limit_n(OwnedValue::Int(2)),
+            classify_limit_n::<JqSemantics>(OwnedValue::Int(2)),
             LimitN::Take(2)
         ));
     }
@@ -167715,9 +167759,64 @@ mod tests {
         // any input short of `usize::MAX` elements, so a `builtin_limit`
         // level test would not actually distinguish the two.
         let n = OwnedValue::NumberLiteral(NumberRepr::Int(-1), "-1".into());
-        match classify_limit_n(n) {
+        match classify_limit_n::<JqSemantics>(n) {
             LimitN::Unlimited => {}
             other => panic!("expected LimitN::Unlimited, got {other:?}"),
+        }
+    }
+
+    /// #6983: a float literal whose double is `±0.0` is classified by its text, as jq's literal
+    /// comparisons read it, and the count analyses decline it rather than read it as `0`.
+    #[test]
+    fn a_count_literal_whose_double_is_zero_is_classified_by_its_text_6983() {
+        let literal =
+            |f: f64, text: &str| OwnedValue::NumberLiteral(NumberRepr::Float(f), text.into());
+        for (n, take) in [
+            (literal(0.0, "1e-1000"), Some(1)),
+            (literal(-0.0, "-1e-400"), None),
+            (literal(0.0, "0e5"), Some(0)),
+            (literal(-0.0, "-0.000e-3"), Some(0)),
+            (OwnedValue::Float(0.0), Some(0)),
+            (OwnedValue::Float(-0.0), Some(0)),
+        ] {
+            let got = match classify_limit_n::<JqSemantics>(n.clone()) {
+                LimitN::Take(k) => Some(k),
+                LimitN::Unlimited => None,
+                LimitN::Raise(e) => panic!("{n:?}: unexpected raise {e:?}"),
+            };
+            assert_eq!(got, take, "{n:?}");
+        }
+        assert!(classify_nth_n::<JqSemantics>(literal(-0.0, "-1e-400")).is_err());
+        assert_eq!(
+            classify_nth_n::<JqSemantics>(literal(0.0, "1e-1000")).ok(),
+            Some(0)
+        );
+        assert_eq!(
+            classify_nth_n::<JqSemantics>(literal(-0.0, "-0e0")).ok(),
+            Some(0)
+        );
+        // yq reads a count by its double, so its literal `-1e-400` is a zero.
+        assert!(matches!(
+            classify_limit_n::<YqSemantics>(literal(-0.0, "-1e-400")),
+            LimitN::Take(0)
+        ));
+        assert_eq!(
+            classify_nth_n::<YqSemantics>(literal(-0.0, "-1e-400")).ok(),
+            Some(0)
+        );
+
+        for (text, folded) in [
+            ("1e-1000", None),
+            ("-1e-400", None),
+            ("0e5", Some(0.0)),
+            ("2", Some(2.0)),
+        ] {
+            let count = parse(&format!("limit({text}; 1)")).unwrap();
+            let Expr::Limit { n, .. } = count else {
+                panic!("{text}: not a limit: {count:?}");
+            };
+            assert_eq!(limit_literal_count(&n), folded, "{text}");
+            assert_eq!(constant_number(&n), folded, "{text}");
         }
     }
 

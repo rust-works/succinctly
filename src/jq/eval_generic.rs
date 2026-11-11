@@ -20402,7 +20402,7 @@ fn each_limit_with_n_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
-    let n = match classify_limit_n(n_value) {
+    let n = match classify_limit_n::<S>(n_value) {
         LimitN::Unlimited => return eval_each_generic::<S, V>(expr, value, optional, cursor, sink),
         // #3486: raised on `expr`'s first output, as jq's `foreach` does.
         LimitN::Raise(error) => {
@@ -20637,7 +20637,7 @@ fn each_nth_generic<S: EvalSemantics, V: DocumentValue>(
     }
 
     fanout_arg_each_generic::<S, V, _>(n_expr, value.clone(), optional, cursor, |n_value| {
-        let n = match classify_nth_n(n_value) {
+        let n = match classify_nth_n::<S>(n_value) {
             Ok(n) => n,
             Err(e) => return Flow::Escaped(Control::Error(e)),
         };
@@ -25753,7 +25753,7 @@ fn limit_with_n_generic<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
-    let (n, raise) = match classify_limit_n(n_value) {
+    let (n, raise) = match classify_limit_n::<S>(n_value) {
         LimitN::Unlimited => {
             return eval_single::<S, V>(expr, value, optional, cursor);
         }
@@ -25881,7 +25881,7 @@ fn nth_with_n_generic<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
-    let n = match classify_nth_n(n_value) {
+    let n = match classify_nth_n::<S>(n_value) {
         Ok(n) => n,
         Err(e) => return GenericResult::Error(e),
     };
@@ -32146,7 +32146,7 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             let flow = path_context_component_flow::<S, V>(n, pos, &mut |n_value| {
                 walk_error.begin();
                 let _scope = was_read_only.then(yq_read_only_context::enter);
-                let take = match classify_limit_n(n_value) {
+                let take = match classify_limit_n::<S>(n_value) {
                     LimitN::Unlimited => None,
                     LimitN::Take(n) => Some(n),
                     // #3486: jq raises this on `expr`'s first output; this walk
@@ -43337,10 +43337,10 @@ impl OutputWindow {
     };
 
     /// `limit(n; body)` for the count `n_value`.
-    fn limit(n_value: OwnedValue) -> Result<Self, EvalError> {
+    fn limit<S: EvalSemantics>(n_value: OwnedValue) -> Result<Self, EvalError> {
         Ok(Self {
             skip: 0,
-            take: match classify_limit_n(n_value) {
+            take: match classify_limit_n::<S>(n_value) {
                 LimitN::Unlimited => None,
                 LimitN::Take(n) => Some(n),
                 // #3486: see `path_context_step`'s `Expr::Limit` arm.
@@ -43359,9 +43359,9 @@ impl OutputWindow {
 
     /// `nth(n; body)` for the index `n_value`: the one output after `n`
     /// dropped ones, and none at all when the body has fewer.
-    fn nth(n_value: OwnedValue) -> Result<Self, EvalError> {
+    fn nth<S: EvalSemantics>(n_value: OwnedValue) -> Result<Self, EvalError> {
         Ok(Self {
-            skip: classify_nth_n(n_value)?,
+            skip: classify_nth_n::<S>(n_value)?,
             take: Some(1),
         })
     }
@@ -44010,9 +44010,9 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
         | Expr::Builtin(Builtin::Skip(n, expr) | Builtin::NthStream(n, expr)) => {
             let window_of: fn(OwnedValue) -> Result<OutputWindow, EvalError> =
                 match strip_parens(stage) {
-                    Expr::Limit { .. } => OutputWindow::limit,
+                    Expr::Limit { .. } => OutputWindow::limit::<S>,
                     Expr::Builtin(Builtin::Skip(..)) => OutputWindow::skip,
-                    Expr::Builtin(Builtin::NthStream(..)) => OutputWindow::nth,
+                    Expr::Builtin(Builtin::NthStream(..)) => OutputWindow::nth::<S>,
                     _ => unreachable!("the arm's pattern admits `limit`, `skip` and `nth` only"), // patchcov: coverage tolerate-line reason="unreachable: the arm's or-pattern admits Expr::Limit, Builtin::Skip and Builtin::NthStream only, and each has its own arm above (#3610)"
                 };
             let escaped = core::cell::RefCell::new(None);
