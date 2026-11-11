@@ -108,6 +108,26 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// The sha256 of a file, read in pieces: a 1 GB input is not held in memory to be hashed (#6915).
+pub fn sha256_file(path: &std::path::Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
 impl Manifest {
     /// Parse manifest text; returns the manifest and the sha256 of its bytes.
     pub fn parse(text: &str) -> Result<(Self, String)> {

@@ -1,7 +1,7 @@
-# id	flags (space-separated, - for none)	filter	shapes (comma-separated; none = no input file)	max tier (1mb|10mb|100mb)
+# id	flags (space-separated, - for none)	filter	shapes (comma-separated; none = no input file)	max tier (1mb|10mb|100mb|1gb; 1gb runs only under --huge, #6915)
 startup	-n	1	none	1mb
-identity	-	.	users,numbers,strings,wide,nested,comprehensive,corpus-charts,corpus-npm,corpus-graph,corpus-openapi,corpus-geojson,corpus-tabular,corpus-pretty	100mb
-identity_compact	-c	.	users,numbers,strings,wide,nested,comprehensive,corpus-charts,corpus-npm,corpus-graph,corpus-openapi,corpus-geojson,corpus-tabular,corpus-pretty	100mb
+identity	-	.	users,numbers,strings,wide,nested,comprehensive,corpus-charts,corpus-npm,corpus-graph,corpus-openapi,corpus-geojson,corpus-tabular,corpus-pretty	1gb
+identity_compact	-c	.	users,numbers,strings,wide,nested,comprehensive,corpus-charts,corpus-npm,corpus-graph,corpus-openapi,corpus-geojson,corpus-tabular,corpus-pretty	1gb
 users_field	-c	.users[0]	users	100mb
 users_length	-	[.users[]]|length	users	100mb
 users_names	-r	.users[].name	users	100mb
@@ -14,7 +14,7 @@ users_to_entries	-c	[.users[0]|to_entries[]|.key]	users	100mb
 users_csv	-r	.users[]|[.id,.name,.email]|@csv	users	100mb
 users_regex	-	[.users[].email|select(test("user1"))]|length	users	10mb
 users_ascii_downcase	-	[.users[]|.name|ascii_downcase]|length	users	100mb
-users_first_early_exit	-	first(.users[])|.id	users	100mb
+users_first_early_exit	-	first(.users[])|.id	users	1gb
 users_limit_early_exit	-c	[limit(3;.users[])|.id]	users	100mb
 users_assign_update	-c	.users[0].name="x"|.users|length	users	10mb
 users_del	-c	del(.users[0])|.users|length	users	10mb
@@ -42,12 +42,12 @@ comprehensive_paths	-	[paths]|length	comprehensive	10mb
 comprehensive_tostream	-	[tostream]|length	comprehensive	10mb
 comprehensive_numbers	-	[..|numbers]|length	comprehensive	10mb
 ndjson_identity	-c	.	ndjson	100mb
-ndjson_field	-r	.name	ndjson	100mb
+ndjson_field	-r	.name	ndjson	1gb
 ndjson_select	-c	select(.score>500)|.id	ndjson	100mb
 ndjson_tsv	-r	[.id,.name,.score]|@tsv	ndjson	100mb
 ndjson_slurp	-s -c	map(.score)|add	ndjson	10mb
-ndjson_inputs_reduce	-n	reduce inputs as $u (0;.+$u.score)	ndjson	100mb
-ndjson_inputs_first	-n	first(inputs)|.id	ndjson	100mb
+ndjson_inputs_reduce	-n	reduce inputs as $u (0;.+$u.score)	ndjson	1gb
+ndjson_inputs_first	-n	first(inputs)|.id	ndjson	1gb
 ndjson_raw_lines	-R	length	ndjson	100mb
 ndjson_raw_fromjson	-R	fromjson|.id	ndjson	10mb
 ndjson_raw_slurp	-sR	length	ndjson	100mb

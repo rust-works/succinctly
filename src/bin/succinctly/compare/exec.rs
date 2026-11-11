@@ -3,6 +3,7 @@
 use super::harness::Tool;
 use anyhow::{Context, Result};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -17,6 +18,9 @@ pub const PERF_DEADLINE: Duration = Duration::from_secs(900);
 pub struct Exec {
     /// `None` when killed by a signal or by the deadline.
     pub exit: Option<i32>,
+    /// The signal that killed the process (`9` for an out-of-memory kill), `None` for a normal
+    /// exit, the deadline's kill and platforms without signals (#6915).
+    pub signal: Option<i32>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub timed_out: bool,
@@ -48,6 +52,17 @@ pub fn exec_env(
     exec_with(tool, args, stdin, cwd, DEADLINE, env)
 }
 
+/// The signal that ended a process, where the platform has them.
+#[cfg(unix)]
+pub fn signal_of(status: &std::process::ExitStatus) -> Option<i32> {
+    std::os::unix::process::ExitStatusExt::signal(status)
+}
+
+#[cfg(not(unix))]
+pub fn signal_of(_: &std::process::ExitStatus) -> Option<i32> {
+    None
+}
+
 pub fn exec_within(
     tool: &Tool,
     args: &[String],
@@ -67,6 +82,82 @@ pub fn exec_with(
     deadline: Duration,
     env: &[(String, String)],
 ) -> Result<Exec> {
+    let ended = run_with(tool, args, stdin, cwd, deadline, env, |mut out| {
+        let mut v = vec![];
+        let _ = out.read_to_end(&mut v);
+        v
+    })?;
+    Ok(Exec {
+        exit: ended.exit,
+        signal: ended.signal,
+        stdout: ended.stdout,
+        stderr: ended.stderr,
+        timed_out: ended.timed_out,
+    })
+}
+
+/// How a run ended and the sha256 of what it printed, hashed as it was written instead of held:
+/// the output gate of a 1 GB `identity` row would otherwise buffer more than 1 GB of it, in a
+/// process that an out-of-memory killer may then choose over the tool (#6915).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecDigest {
+    pub exit: Option<i32>,
+    pub signal: Option<i32>,
+    pub timed_out: bool,
+    pub stdout_sha256: String,
+}
+
+/// [`exec_within`] for a caller that compares output by hash alone.
+pub fn exec_digest(
+    tool: &Tool,
+    args: &[String],
+    stdin: impl AsRef<[u8]>,
+    cwd: &Path,
+    deadline: Duration,
+) -> Result<ExecDigest> {
+    let ended = run_with(tool, args, stdin, cwd, deadline, &[], |mut out| {
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 1 << 16];
+        while let Ok(n) = out.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    })?;
+    Ok(ExecDigest {
+        exit: ended.exit,
+        signal: ended.signal,
+        timed_out: ended.timed_out,
+        stdout_sha256: ended.stdout,
+    })
+}
+
+/// One finished run: its status, its stderr, and whatever `run_with`'s reader made of stdout.
+struct Ended<O> {
+    exit: Option<i32>,
+    signal: Option<i32>,
+    timed_out: bool,
+    stdout: O,
+    stderr: Vec<u8>,
+}
+
+/// Spawn `tool` with the fixed environment, feed it `stdin`, hand its stdout to `read_out` on its
+/// own thread, and kill it at `deadline`.
+fn run_with<O: Default + Send + 'static>(
+    tool: &Tool,
+    args: &[String],
+    stdin: impl AsRef<[u8]>,
+    cwd: &Path,
+    deadline: Duration,
+    env: &[(String, String)],
+    read_out: impl FnOnce(std::process::ChildStdout) -> O + Send + 'static,
+) -> Result<Ended<O>> {
     let mut child = Command::new(&tool.program)
         .args(&tool.prefix)
         .args(args)
@@ -94,35 +185,32 @@ pub fn exec_with(
     let writer = std::thread::spawn(move || {
         let _ = sin.write_all(&input);
     });
-    let (mut so, mut se) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
-    let ro = std::thread::spawn(move || {
-        let mut v = vec![];
-        let _ = so.read_to_end(&mut v);
-        v
-    });
+    let (so, mut se) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
+    let ro = std::thread::spawn(move || read_out(so));
     let re = std::thread::spawn(move || {
         let mut v = vec![];
         let _ = se.read_to_end(&mut v);
         v
     });
     let start = Instant::now();
-    let (status, timed_out) = loop {
+    let (status, signal, timed_out) = loop {
         if let Some(s) = child.try_wait()? {
-            break (s.code(), false);
+            break (s.code(), signal_of(&s), false);
         }
         if start.elapsed() > deadline {
             let _ = child.kill();
             let _ = child.wait();
-            break (None, true);
+            break (None, None, true);
         }
         std::thread::sleep(Duration::from_millis(1));
     };
     let _ = writer.join();
-    Ok(Exec {
+    Ok(Ended {
         exit: status,
+        signal,
+        timed_out,
         stdout: ro.join().unwrap_or_default(),
         stderr: re.join().unwrap_or_default(),
-        timed_out,
     })
 }
 
@@ -204,6 +292,35 @@ mod tests {
         }
         let e = exec(&sh, &[], "", Path::new(".")).unwrap();
         assert_eq!(e.stdout, b"unset|unset|unset|unset\n");
+    }
+
+    /// The digest of a run is the sha256 of what it printed, read in pieces smaller than the
+    /// output, with the status and the signal; a deadline kill has no status.
+    #[test]
+    fn a_digest_run_hashes_output_larger_than_its_read_buffer() {
+        let big = sh("head -c 300000 /dev/zero | tr '\\0' 'a'; exit 3");
+        let d = exec_digest(&big, &[], "", Path::new("."), DEADLINE).unwrap();
+        let held = exec(&big, &[], "", Path::new(".")).unwrap();
+        assert_eq!(d.exit, Some(3));
+        assert_eq!(held.stdout.len(), 300_000);
+        assert_eq!(
+            d.stdout_sha256,
+            super::super::manifest::sha256_hex(&held.stdout)
+        );
+        #[cfg(unix)]
+        {
+            let killed = exec_digest(&sh("kill -9 $$"), &[], "", Path::new("."), DEADLINE).unwrap();
+            assert_eq!((killed.exit, killed.signal), (None, Some(9)));
+        }
+        let slow = exec_digest(
+            &sh("sleep 5"),
+            &[],
+            "",
+            Path::new("."),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        assert!(slow.timed_out && slow.exit.is_none());
     }
 
     #[test]

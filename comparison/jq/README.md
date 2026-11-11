@@ -30,7 +30,7 @@ reported as a correctness row and gets no timing; the command exits 1 on it.
 | `fixtures/`           | working directory of the CLI probes (`-f`, `-L`, ...)    |
 | `vendor/jq-1.7.1/`    | B: jq's own test files (MIT), sha256-pinned in the manifest |
 | `vendor/jq-1.8.2/`    | B2: jq 1.8.2's own test files, run against 1.8.2 alone and reported apart (informational, never a ledger entry) |
-| `queries/perf.tsv`    | D/E: id, flags, filter, shapes, max tier; `@INPUT@` in the flags is the input file's name (`--slurpfile d @INPUT@`), `@files=N` passes it `N` times, `@stdin` pipes it on stdin (#6914) |
+| `queries/perf.tsv`    | D/E: id, flags, filter, shapes, max tier (`1mb`, `10mb`, `100mb`, or `1gb` for `--huge`); `@INPUT@` in the flags is the input file's name (`--slurpfile d @INPUT@`), `@files=N` passes it `N` times, `@stdin` pipes it on stdin (#6914) |
 | `probes/robust.tsv`   | F: nesting, recursion, generators, regex, big values, SIGPIPE, `ulimit -v` (`ulimit-v:<KiB>` wrap); `@gen:` builds large stdin |
 | `divergences/`        | ledger of known differences, one file per entry (`<suite>/<probe>.toml`, see its README); the run fails on drift |
 
@@ -51,8 +51,19 @@ The performance shapes beyond one large document are `ndjson` (one small record 
 A query whose flags carry `@stdin` passes no file: the harness reads the input once and writes it to the tool's standard input through a pipe (`Stdio::piped()`, so the tool sees a FIFO, never a redirected regular file), in the output gate, the timed runs, the peak-memory runs and the cachegrind run alike (#6914). Its id is the file query's with `_stdin` after it (`identity_stdin` runs the program of `identity`; a test checks the two agree), and its rows go to `perf_stdin` in `results.json`, not `perf`, so no headline geomean over the file route moves. The report's "Piped stdin vs file argument" section sets each stdin row beside its file twin (time and memory, per tool, a ratio over 1.25x marked). The writer is a thread feeding from memory, not a real producer: it measures the pipe route of each tool, without a network or a slow upstream.
 Dimensions D and E time every query on the pinned generated inputs (`[[input]]`, regenerated into `data/compare/inputs/`
 and checked against their sha256) against jq 1.7.1 and 1.8.2, interleaved, gated on output identity; `--control` times jq
-against itself to show the noise floor, and `--full` adds the 10 MB and 100 MB tiers.
+against itself to show the noise floor, `--full` adds the 10 MB and 100 MB tiers, and `--full --huge` a 1 GB tier for a few rows.
 `--cachegrind` (Linux with `valgrind` installed; an error elsewhere) also runs each tool once per row under `valgrind --tool=cachegrind --cache-sim=no` and reports `I refs` beside the times (#5552). An instruction count does not move with machine load, so it is a noise-free second signal, and the report marks a row where it and the wall-clock put succinctly on opposite sides of jq (both more than 5% from a tie): the two can disagree, and a start-up-bound row on a small file does. Only rows up to 1 MB are counted, since cachegrind runs ~50x slower, and only succinctly and jq 1.7.1; valgrind emulates a CPU without AVX-512, so the instruction count can describe a different code path than the timed run on a machine that has it. CI passes the flag on both Linux runners.
+`--full --huge` adds a 1 GB tier (#6915, the streaming and early-exit item of #5409's dimension E): the six rows whose `perf.tsv` cap is `1gb` (`identity`, `identity_compact`, `users_first_early_exit`, `ndjson_field`, `ndjson_inputs_reduce`, `ndjson_inputs_first`) on `users-1gb` (1,097,976,224 bytes; the users generator writes about 0.73 of the size it is asked for, so the manifest asks for `1500mb`) and `ndjson-1gb` (1,073,741,867 bytes), both sha256-pinned.
+Above 100 MB both tools fit in RAM on the bench machines, so a memory difference that is a ratio at 100 MB can be pass/fail here, and the rows exist to show which: `jq` holding ≈3 MB on NDJSON where succinctly holds a multiple of the input (#6913), and whether the single-document `identity` ratio keeps growing past 100 MB.
+The tier is opt-in because a row costs minutes per tool (about an hour on top of `--full`), and needs RAM: jq holds a single 1 GB document as a DOM, which is many times its size, so run it where that fits, or under a memory-cap watchdog (macOS cannot `ulimit -v`).
+Its rows go to `perf_huge` in `results.json` and to their own report section, never to `perf`, so no headline geomean or tier column moves.
+Each tool runs three timed repetitions (its gating run is the warm-up) and one untimed memory run, and records how it ended: `exit`, the `signal` that killed it (9 is the out-of-memory kill) or `timed_out` past the 900 s deadline.
+A tool that is killed or times out makes the row `incomplete`: untimed, with its exit status and the peak memory it reached listed, instead of aborting the run (a smaller tier still aborts on a deadline).
+A refusal (the tools exit differently) stays a correctness row, `output differs`, and still lists each tool's exit status.
+An incomplete row where only succinctly failed is reported as a divergence like any output difference, so the run exits 1 unless it is ledgered as `perf:<query>@<input>`.
+`--write-docs` takes a `--full --huge` run like any complete one, so each platform's committed json carries the rows.
+Until a platform has had such a run, its committed report has no 1 GB section.
+
 A row whose slowest tool runs over 15 ms is topped up to 21 repetitions (within 30 s of extra timed runs per row) and, once it has them, its
 ratios are of each tool's fastest run, marked † in the report, because run-to-run noise moves the median of a figure that
 long (#5581). A row with a CV above 5% is marked, and its ratio is not a finding on its own.

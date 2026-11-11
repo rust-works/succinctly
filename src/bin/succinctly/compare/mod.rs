@@ -87,6 +87,13 @@ pub struct CompareJqArgs {
     #[arg(long)]
     full: bool,
 
+    /// Performance: add the 1 GB tier (#6915) to a `--full` run: the rows `perf.tsv` caps at `1gb`
+    /// (streaming and early-exit queries, where memory is pass/fail), each tool run once with
+    /// its exit status, signal and peak memory recorded. Adds roughly an hour; never part of
+    /// `--quick` or a plain `--full`
+    #[arg(long, requires = "full")]
+    huge: bool,
+
     /// Output directory (default: data/compare/<run_id>)
     #[arg(long)]
     out: Option<PathBuf>,
@@ -222,6 +229,11 @@ pub struct Results {
     /// `perf` row of its query id minus `_stdin` on the same input.
     #[serde(default)]
     pub perf_stdin: Vec<perf::PerfRow>,
+    /// D and E at the opt-in 1 GB tier (`--huge`, #6915), kept out of `perf` like the stdin rows:
+    /// a figure from one run of each tool must not move a headline geomean. Each row records how
+    /// every tool ended, so a kill, a refusal or a deadline is a result.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub perf_huge: Vec<perf::PerfRow>,
     pub perf_note: Option<String>,
     /// F.
     pub robust: Vec<robust::Row>,
@@ -765,11 +777,16 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
             status: "implemented (nesting, recursion, generators, regex, large values, SIGPIPE, memory limits)",
         });
     }
-    let (mut perf_rows, mut perf_stdin_rows, mut perf_note) = (vec![], vec![], None);
+    let (mut perf_rows, mut perf_stdin_rows, mut perf_huge_rows, mut perf_note) =
+        (vec![], vec![], vec![], None);
     if want(Dimension::Performance) {
         run_suites.push("perf".into());
         let inputs_dir = root.join("data/compare/inputs");
-        let top = if args.full { "100mb" } else { "1mb" };
+        let top = match (args.full, args.huge) {
+            (true, true) => perf::HUGE_TIER,
+            (true, false) => "100mb",
+            _ => "1mb",
+        };
         let q = std::fs::read_to_string(root.join(&manifest.perf.queries))?;
         let mut queries = perf::parse_queries(&q)?;
         if let Some(f) = &args.query {
@@ -822,8 +839,10 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
             }
             let big = input.is_some_and(|i| i.tier == "100mb");
             let mid = input.is_some_and(|i| i.tier == "10mb");
+            let huge = input.is_some_and(|i| i.tier == perf::HUGE_TIER);
             let n = match (args.full, big, mid) {
                 (false, ..) => 3,
+                _ if huge => perf::HUGE_REPS,
                 (true, true, _) => 3,
                 (true, _, true) => 9,
                 _ => 21,
@@ -833,10 +852,12 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
                 .as_deref()
                 .filter(|_| input.map_or(true, |i| i.tier == "1mb"));
             let row = perf::run_row_with(&tools, query, *input, &inputs_dir, n, counted)?;
-            if row.gate == perf::Gate::Differs {
+            if row.gate == perf::Gate::Differs || row.subject_unfinished_alone() {
                 observed.insert(format!("perf:{}@{}", row.query, row.input));
             }
-            if query.stdin {
+            if row.tier == perf::HUGE_TIER {
+                perf_huge_rows.push(row);
+            } else if query.stdin {
                 perf_stdin_rows.push(row);
             } else {
                 perf_rows.push(row);
@@ -953,8 +974,9 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         schema_version: SCHEMA_VERSION,
         run_id,
         command: format!(
-            "./target/release/succinctly dev compare jq {}{}{}{}{}",
+            "./target/release/succinctly dev compare jq {}{}{}{}{}{}",
             if args.full { "--full" } else { "--quick" },
+            if args.huge { " --huge" } else { "" },
             if args.control { " --control" } else { "" },
             if args.cachegrind { " --cachegrind" } else { "" },
             if args.build_time { " --build-time" } else { "" },
@@ -987,6 +1009,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         operational: operational_info,
         perf: perf_rows,
         perf_stdin: perf_stdin_rows,
+        perf_huge: perf_huge_rows,
         perf_note,
         known_divergences: known,
         ledger: ledger_outcome,
