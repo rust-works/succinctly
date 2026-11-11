@@ -4287,46 +4287,6 @@ impl OwnedValue {
         )
     }
 
-    /// The yq-mode sibling of [`to_json`](Self::to_json) (#1030): identical
-    /// except a finite `NumberLiteral` echoes its document-sourced spelling
-    /// verbatim rather than being reformatted per jq's own rules -- real yq
-    /// preserves scientific-notation literals byte-for-byte regardless of
-    /// magnitude or query shape (#1008, confirmed empirically against the
-    /// pinned oracle). Used by `@json`'s yq-mode branch and by string
-    /// interpolation's container arm (`owned_to_string`), both of which need
-    /// this same literal-preserving JSON text, not [`to_json`](Self::to_json)'s
-    /// jq-normalized one.
-    ///
-    /// A plain `Float` takes yq's computed-float spelling (`format_float_yq`):
-    /// a whole number keeps its decimal point (#953 -- unlike jq, which
-    /// happily prints `1.0` as `1` in JSON, matching real jq's own `tojson`,
-    /// yq must not: `1.0` and `1` are different YAML types, and dropping the
-    /// point on a round trip changes it, #169's own reasoning), and a
-    /// magnitude past yq's threshold goes scientific (`(1e10*2) | tojson`
-    /// is `2e+10` in real yq). The threshold used to be unreachable from
-    /// here -- `tojson` reached this function only after a reindex round
-    /// trip that had already baked the computed value into a `NumberLiteral`
-    /// spelled `2e+10`, which the literal arm then echoed -- and became
-    /// load-bearing once #2902 made that round trip hand back a bare `Float`.
-    /// The i64-overflow decimal integer scalar this used to spell out in
-    /// full (`resolve_plain` classifies it `!!float`; real yq's `-o json`
-    /// gives `100...0.0`, not `1e+20`, confirmed live) still does, because
-    /// #2438 records it as a `NumberLiteral` at the document boundary
-    /// ([`from_document_float`](Self::from_document_float)) and the literal
-    /// arm echoes that.
-    ///
-    /// #2874 deliberately left this family *outside* a
-    /// [`JsonConvention`](crate::jq::document::JsonConvention)-keyed
-    /// mapping, even though the three variants line up with the three
-    /// wrappers by name: [`to_json_at_depth`](Self::to_json_at_depth)
-    /// hardcodes `write_json_body_jq` escaping for all three, so this
-    /// function is really "`Preserve` numbers + **jq** escaping", which
-    /// `JsonConvention::Preserve` does not mean
-    /// (`uses_jq_escape_table()` is `false` there). Keying the family on the
-    /// enum would assert an equivalence that does not hold. Whether yq mode
-    /// *should* escape `@json`/interpolation output through yq's own table
-    /// here is a real, separate question with its own oracle probe to run
-    /// against yq v4.53.3 -- not something to decide by refactor.
     /// The error real yq's JSON encoder raises for the first non-finite number this value holds,
     /// in the order it writes them, or `None` if there is none (#6867, #6887).
     ///
@@ -4389,6 +4349,46 @@ impl OwnedValue {
         Some(format!("{}{cause}", WRAP.repeat(depth + 1)))
     }
 
+    /// The yq-mode sibling of [`to_json`](Self::to_json) (#1030): identical
+    /// except a finite `NumberLiteral` echoes its document-sourced spelling
+    /// verbatim rather than being reformatted per jq's own rules -- real yq
+    /// preserves scientific-notation literals byte-for-byte regardless of
+    /// magnitude or query shape (#1008, confirmed empirically against the
+    /// pinned oracle). Used by `@json`'s yq-mode branch and by string
+    /// interpolation's container arm (`owned_to_string`), both of which need
+    /// this same literal-preserving JSON text, not [`to_json`](Self::to_json)'s
+    /// jq-normalized one.
+    ///
+    /// A plain `Float` takes yq's computed-float spelling (`format_float_yq`):
+    /// a whole number keeps its decimal point (#953 -- unlike jq, which
+    /// happily prints `1.0` as `1` in JSON, matching real jq's own `tojson`,
+    /// yq must not: `1.0` and `1` are different YAML types, and dropping the
+    /// point on a round trip changes it, #169's own reasoning), and a
+    /// magnitude past yq's threshold goes scientific (`(1e10*2) | tojson`
+    /// is `2e+10` in real yq). The threshold used to be unreachable from
+    /// here -- `tojson` reached this function only after a reindex round
+    /// trip that had already baked the computed value into a `NumberLiteral`
+    /// spelled `2e+10`, which the literal arm then echoed -- and became
+    /// load-bearing once #2902 made that round trip hand back a bare `Float`.
+    /// The i64-overflow decimal integer scalar this used to spell out in
+    /// full (`resolve_plain` classifies it `!!float`; real yq's `-o json`
+    /// gives `100...0.0`, not `1e+20`, confirmed live) still does, because
+    /// #2438 records it as a `NumberLiteral` at the document boundary
+    /// ([`from_document_float`](Self::from_document_float)) and the literal
+    /// arm echoes that.
+    ///
+    /// #2874 deliberately left this family *outside* a
+    /// [`JsonConvention`](crate::jq::document::JsonConvention)-keyed
+    /// mapping, even though the three variants line up with the three
+    /// wrappers by name: [`to_json_at_depth`](Self::to_json_at_depth)
+    /// hardcodes `write_json_body_jq` escaping for all three, so this
+    /// function is really "`Preserve` numbers + **jq** escaping", which
+    /// `JsonConvention::Preserve` does not mean
+    /// (`uses_jq_escape_table()` is `false` there). Keying the family on the
+    /// enum would assert an equivalence that does not hold. Whether yq mode
+    /// *should* escape `@json`/interpolation output through yq's own table
+    /// here is a real, separate question with its own oracle probe to run
+    /// against yq v4.53.3 -- not something to decide by refactor.
     pub(crate) fn to_json_yq(&self) -> String {
         self.to_json_at_depth(
             0,
