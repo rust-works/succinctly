@@ -6945,12 +6945,10 @@ impl<'a> YamlString<'a> {
             check_pos += 1;
         }
 
-        // Check for "---", then for what ends a marker
+        // Check for "---", then for what ends a marker: the module's one terminator set, which the
+        // parser's `marker_prefix` is pinned to as well.
         text.get(check_pos..check_pos + 3) == Some(b"---")
-            && matches!(
-                text.get(check_pos + 3),
-                None | Some(b' ' | b'\t' | b'\n' | b'\r')
-            )
+            && crate::yaml::is_seq_indicator_next(text.get(check_pos + 3).copied())
     }
 
     /// Detect content indentation from first non-empty line.

@@ -21,6 +21,23 @@ const ROWS: &[(&str, &str)] = &[
     // Chomping: `+` keeps the one break, `-` and clip keep nothing.
     ("----: >+\n\nb: 1\n", "{\"----\":\"\\n\",\"b\":1}\n"),
     ("----: >-\n\nb: 1\n", "{\"----\":\"\",\"b\":1}\n"),
+    // Explicit indentation indicator, a header comment, CRLF and several blank lines.
+    ("----: >2\n\nb: 1\n", "{\"----\":\"\",\"b\":1}\n"),
+    ("----: >2-\n\nb: 1\n", "{\"----\":\"\",\"b\":1}\n"),
+    ("----: > # c\n\nb: 1\n", "{\"----\":\"\",\"b\":1}\n"),
+    ("----: >\r\n\r\nb: 1\r\n", "{\"----\":\"\",\"b\":1}\n"),
+    ("----: >\n\n\n\nb: 1\n", "{\"----\":\"\",\"b\":1}\n"),
+    // A property on the header, and after a head comment.
+    ("---a: !!str >\n\nb: 1\n", "{\"---a\":\"\",\"b\":1}\n"),
+    ("---a: &x >\n\nb: 1\n", "{\"---a\":\"\",\"b\":1}\n"),
+    ("# c\n----: >\n\nb: 1\n", "{\"----\":\"\",\"b\":1}\n"),
+    // Several documents: a real marker line, then keys that start with `---` in each.
+    (
+        "---\n----: >\n\nb: 1\n---\n---a: |\n\nc: 2\n",
+        "{\"----\":\"\",\"b\":1}\n{\"---a\":\"\",\"c\":2}\n",
+    ),
+    // A real `--- >` marker line keeps its meaning: its scalar is the document.
+    ("----: x\n--- >\n  y\n", "{\"----\":\"x\"}\n\"y\\n\"\n"),
     // A scalar with content is unchanged.
     ("----: >\n  x\n\nb: 1\n", "{\"----\":\"x\\n\",\"b\":1}\n"),
     // Nested, and keys that never agreed.
