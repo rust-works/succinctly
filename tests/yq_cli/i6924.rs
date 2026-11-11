@@ -30,6 +30,10 @@ const ROWS: &[(&[&str], &str, &str, i32)] = &[
     (&["--lua-prefix=local x = ", "--lua-suffix=\\n-- end\\n"], "a: 1\n", "local x = {\n\t[\"a\"] = 1;\n}\n-- end\n", 0),
     (&["--lua-prefix=a\\tb\\\\c\\'d\\\"e\\x", "--lua-suffix=;"], "[1]\n", "a\tb\\c'd\"e\\x{\n\t1,\n};", 0),
     (&["--lua-unquoted", "--lua-prefix=", "--lua-suffix="], "a: 1\n", "{\n\ta = 1;\n}", 0),
+    (&["--lua-globals", "--lua-prefix=X", "--lua-suffix=Y"], "a: 1\n", "a = 1;\n", 0),
+    (&["--lua-prefix=\\x41\\0\\"], "[1]\n", "\\x41\\0\\{\n\t1,\n};\n", 0),
+    (&["--lua-globals"], "---\na: 1\n---\nb: 2\n", "a = 1;\nb = 2;\n", 0),
+    (&["--lua-unquoted"], "é: 1\nA1: 2\n_ENV: 3\n", "return {\n\t[\"é\"] = 1;\n\tA1 = 2;\n\t_ENV = 3;\n};\n", 0),
 ];
 
 #[test]

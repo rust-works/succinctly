@@ -7550,7 +7550,7 @@ Six rows differ from yq v4.53.3, each pinned out of `tests/yq_cli/i6850.rs`:
 - An encoder that fails after earlier results printed leaves nothing on stdout here, where yq printed those results first: `printf 'a: x\nb: [1]\nc: {d: e}\n' | yq -o=csv '.[]'` prints `x` and `1` in yq.
   The error line and the exit status are the same.
   The failure is raised while the filter runs, because the encoder is the filter's last stage, and the filter's results are only printed when it finishes.
-- `-e` reads the encoded text, which is never null or false, so it exits 0 where yq exits 1 for a null or false result.
+- `-e` (with any `-o` encoder, `lua` included) reads the encoded text, which is never null or false, so it exits 0 where yq exits 1 for a null or false result.
 - A `shell` key with an accented letter loses it (`é` is dropped), where yq decomposes it first and keeps the `e`.
 - `-o=csv` and `-o=tsv` with `-0` write each result's row here and a bare NUL in yq: yq's CSV writer is not flushed before the NUL, so the row is lost.
   Writing it matches nothing yq can be asked to read back (rule 4(b)).
@@ -7565,4 +7565,4 @@ The encoder runs over the value model, which keeps no node style, key tag or com
 - A key that is not a string (`1: a`, `true: b`) is written `["1"] = "a"`, where yq writes `[1] = "a"` (its tag survives).
 - A comment is dropped, where yq writes a line comment as ` -- text` after the entry.
 - A timestamp (`2001-01-01`) and `!!binary` are written as strings, where yq stops with `lua encoder NYI -- !!timestamp`.
-- The YAML 1.1 integer spellings `1_000`, `0b11` and `0XfF` are strings here (see the YAML 1.1 section above), so they are quoted, where yq writes them bare.
+- The integer spellings `-0o17` and `0O17` and the YAML 1.1 ones `1_000`, `0b11` and `0XfF` are strings here (see the YAML 1.1 section above), so they are quoted, where yq writes them bare.

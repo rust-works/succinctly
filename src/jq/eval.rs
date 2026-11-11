@@ -26996,7 +26996,7 @@ fn format_lua(value: &OwnedValue, options: &LuaOptions) -> Result<String, EvalEr
                 OwnedValue::Array(items) => {
                     self.out.push('{');
                     self.indent += 1;
-                    for item in items.iter() {
+                    for item in items {
                         self.indent();
                         self.any(item, depth + 1);
                         self.out.push(',');
