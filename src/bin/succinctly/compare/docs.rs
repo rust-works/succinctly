@@ -15,6 +15,9 @@ pub const SUMMARY_DOC: &str = "CLAUDE.md";
 /// The doc whose `compare:jq-identity` block [`identity_block`] renders, relative to the root.
 pub const README_DOC: &str = "README.md";
 
+/// The doc whose `compare:jq-categories` block [`categories_block`] renders, relative to the root.
+pub const GUIDE_DOC: &str = "docs/guides/choosing-jq.md";
+
 /// Replace the text between `<!-- compare:<id> -->` and `<!-- /compare:<id> -->`
 /// with `body`, which ends up on the lines between the two markers.
 pub fn patch_block(doc: &str, id: &str, body: &str) -> Result<String> {
@@ -440,6 +443,116 @@ pub fn summary_block(runs: &[(String, Value)]) -> String {
     s
 }
 
+/// A group of timed queries the guide ([`GUIDE_DOC`]) reports a geomean for (#6916): its name, the
+/// queries it holds as the guide words them, and the test that picks a query name.
+type QueryGroup = (&'static str, &'static str, fn(&str) -> bool);
+
+const TRANSFORM_PREFIXES: [&str; 21] = [
+    "users_map",
+    "users_sort",
+    "users_group",
+    "users_unique",
+    "users_reduce",
+    "users_csv",
+    "users_regex",
+    "users_ascii",
+    "users_assign",
+    "users_del",
+    "users_paths",
+    "users_tojson",
+    "users_walk",
+    "numbers_",
+    "strings_",
+    "wide_to",
+    "wide_map",
+    "wide_add",
+    "wide_with",
+    "nested_",
+    "comprehensive_",
+];
+
+/// The groups of the guide's table, by query name. The groups cover most timed rows and not all of
+/// them: the slurp, raw-file and three-file rows are in none.
+const QUERY_GROUPS: [QueryGroup; 6] = [
+    (
+        "Pass-through and reformatting",
+        "`identity`, `identity_compact`",
+        |q| matches!(q, "identity" | "identity_compact"),
+    ),
+    (
+        "Field access and navigation",
+        "`users_field`, `users_length`, `users_names`, `users_to_entries`, `wide_keys`, `users_three_files`",
+        |q| {
+            matches!(
+                q,
+                "users_field"
+                    | "users_length"
+                    | "users_names"
+                    | "users_to_entries"
+                    | "wide_keys"
+                    | "users_three_files"
+            )
+        },
+    ),
+    (
+        "Early exit",
+        "`users_first_early_exit`, `users_limit_early_exit`",
+        |q| matches!(q, "users_first_early_exit" | "users_limit_early_exit"),
+    ),
+    (
+        "Transforms",
+        "maps, sorts, groups, reduce, regex, paths, walk, numbers, strings, wide and nested objects",
+        |q| TRANSFORM_PREFIXES.iter().any(|prefix| q.starts_with(prefix)),
+    ),
+    (
+        "Streams (NDJSON, `--seq`)",
+        "`ndjson_*`, `seq_*`",
+        |q| q.starts_with("ndjson_") || q.starts_with("seq_"),
+    ),
+    (
+        "Startup-bound",
+        "`startup`, `args_many`, `corpus_*`",
+        |q| matches!(q, "startup" | "args_many") || q.starts_with("corpus_"),
+    ),
+];
+
+/// The per-group geomean speedups [`GUIDE_DOC`] quotes: one row per group, one column per committed
+/// platform run, built from the committed `docs/compare/jq-<platform>.json` files alone (#6916).
+pub fn categories_block(runs: &[(String, Value)]) -> String {
+    let mut header: Vec<String> = vec!["Group".into(), "Queries".into()];
+    header.extend(runs.iter().map(|(p, v)| {
+        format!(
+            "[{}](../compare/jq-{p}.md)",
+            v["env"]["system"]["cpu"].as_str().unwrap_or("?")
+        )
+    }));
+    let rows: Vec<Vec<String>> = QUERY_GROUPS
+        .iter()
+        .map(|(name, queries, keep)| {
+            let mut row = vec![(*name).to_string(), (*queries).to_string()];
+            row.extend(runs.iter().map(|(_, v)| {
+                let xs: Vec<f64> = v["perf"]
+                    .as_array()
+                    .map_or(&[][..], Vec::as_slice)
+                    .iter()
+                    .filter(|r| keep(r["query"].as_str().unwrap_or("")))
+                    .filter_map(|r| r["speedup_primary"].as_f64())
+                    .collect();
+                geomean(&xs).map_or_else(|| "n/a".into(), |g| format!("{g:.2}x"))
+            }));
+            row
+        })
+        .collect();
+    let header: Vec<&str> = header.iter().map(String::as_str).collect();
+    table(&header, &rows, 2)
+}
+
+/// [`GUIDE_DOC`] with its `compare:jq-categories` block regenerated from every run.
+pub fn patch_guide(doc: &str, runs: &[(String, Value)]) -> Result<String> {
+    patch_block(doc, "jq-categories", &categories_block(runs))
+        .map_err(|e| anyhow::anyhow!("{GUIDE_DOC}: {e} (the block holds the by-category table)"))
+}
+
 /// [`SUMMARY_DOC`] with its `compare:jq-summary` block regenerated from every run.
 pub fn patch_summary(doc: &str, runs: &[(String, Value)]) -> Result<String> {
     patch_block(doc, "jq-summary", &summary_block(runs)).map_err(|e| {
@@ -785,6 +898,50 @@ mod tests {
             "{SUMMARY_DOC}'s jq summary does not quote docs/compare/jq-<platform>.json: \
              regenerate it with `succinctly dev compare jq --render-docs`, never by hand"
         );
+    }
+
+    #[test]
+    fn guide_doc_quotes_the_committed_results() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let runs = committed_runs(&root.join("docs/compare"), None).unwrap();
+        assert_ne!(runs.len(), 0, "no committed run in docs/compare");
+        let doc = std::fs::read_to_string(root.join(GUIDE_DOC)).unwrap();
+        assert!(
+            patch_guide(&doc, &runs).unwrap() == doc,
+            "{GUIDE_DOC}'s by-category table does not quote docs/compare/jq-<platform>.json: \
+             regenerate it with `succinctly dev compare jq --render-docs`, never by hand"
+        );
+    }
+
+    #[test]
+    fn patch_guide_replaces_only_the_marked_block() {
+        let runs = vec![("p".to_string(), run())];
+        let doc = "a\n<!-- compare:jq-categories -->\nold\n<!-- /compare:jq-categories -->\nz\n";
+        let once = patch_guide(doc, &runs).unwrap();
+        assert!(
+            once.starts_with("a\n<!-- compare:jq-categories -->\n")
+                && once.ends_with("<!-- /compare:jq-categories -->\nz\n")
+        );
+        assert!(!once.contains("old"));
+        assert_eq!(patch_guide(&once, &runs).unwrap(), once, "not a fixpoint");
+        assert!(patch_guide("no markers\n", &runs).is_err());
+    }
+
+    #[test]
+    fn a_group_holds_no_query_another_group_holds() {
+        // The test of one group is a name list or a prefix: a query in two would be counted twice.
+        for row in committed_runs(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/compare"),
+            None,
+        )
+        .unwrap()
+        .iter()
+        .flat_map(|(_, v)| v["perf"].as_array().cloned().unwrap_or_default())
+        {
+            let q = row["query"].as_str().unwrap();
+            let holding = QUERY_GROUPS.iter().filter(|(_, _, keep)| keep(q)).count();
+            assert!(holding <= 1, "{q} is in {holding} groups");
+        }
     }
 
     fn identity_row(input: &str, tier: &str, jq: f64, us: f64) -> Value {

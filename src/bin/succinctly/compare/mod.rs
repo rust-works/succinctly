@@ -1187,6 +1187,8 @@ fn write_docs(root: &std::path::Path, results: &Results, args: &CompareJqArgs) -
     let summary_doc = docs::patch_summary(&std::fs::read_to_string(&summary)?, &runs)?;
     let readme = root.join(docs::README_DOC);
     let readme_doc = docs::patch_readme(&std::fs::read_to_string(&readme)?, &runs)?;
+    let guide = root.join(docs::GUIDE_DOC);
+    let guide_doc = docs::patch_guide(&std::fs::read_to_string(&guide)?, &runs)?;
     std::fs::write(
         dir.join(format!("jq-{p}.md")),
         docs::sanitize(
@@ -1199,11 +1201,13 @@ fn write_docs(root: &std::path::Path, results: &Results, args: &CompareJqArgs) -
     std::fs::write(&bench, bench_doc)?;
     std::fs::write(&summary, summary_doc)?;
     std::fs::write(&readme, readme_doc)?;
+    std::fs::write(&guide, guide_doc)?;
     println!(
-        "wrote docs/compare/jq-{p}.md, jq-{p}.json, jq.md, {}, {} and {}",
+        "wrote docs/compare/jq-{p}.md, jq-{p}.json, jq.md, {}, {}, {} and {}",
         docs::BENCHMARKS_DOC,
         docs::SUMMARY_DOC,
-        docs::README_DOC
+        docs::README_DOC,
+        docs::GUIDE_DOC
     );
     Ok(())
 }
@@ -1218,15 +1222,19 @@ fn render_docs(root: &std::path::Path) -> Result<()> {
     let summary_doc = docs::patch_summary(&std::fs::read_to_string(&summary)?, &runs)?;
     let readme = root.join(docs::README_DOC);
     let readme_doc = docs::patch_readme(&std::fs::read_to_string(&readme)?, &runs)?;
+    let guide = root.join(docs::GUIDE_DOC);
+    let guide_doc = docs::patch_guide(&std::fs::read_to_string(&guide)?, &runs)?;
     std::fs::write(dir.join("jq.md"), docs::index(&runs))?;
     std::fs::write(&bench, bench_doc)?;
     std::fs::write(&summary, summary_doc)?;
     std::fs::write(&readme, readme_doc)?;
+    std::fs::write(&guide, guide_doc)?;
     println!(
-        "rendered docs/compare/jq.md, {}, {} and {} from {} committed run(s)",
+        "rendered docs/compare/jq.md, {}, {}, {} and {} from {} committed run(s)",
         docs::BENCHMARKS_DOC,
         docs::SUMMARY_DOC,
         docs::README_DOC,
+        docs::GUIDE_DOC,
         runs.len()
     );
     Ok(())
