@@ -100,16 +100,6 @@ enum StreamEnd {
     Corrupt(usize),
 }
 
-impl StreamEnd {
-    fn message(self) -> String {
-        match self {
-            Self::Eof => String::new(),
-            Self::UnexpectedEof => "unexpected EOF".to_owned(),
-            Self::Corrupt(at) => format!("illegal base64 data at input byte {at}"),
-        }
-    }
-}
-
 /// yq's `-p base64`: the input with Go's `strings.TrimSpace` applied, padded with `=` to a multiple
 /// of four bytes (counting any line break inside it), read through `base64.NewDecoder` by a
 /// `bytes.Buffer`. Go's stream decoder hands each chunk of the input to `Encoding.Decode` on its
@@ -133,7 +123,10 @@ fn decode_base64(raw: &[u8]) -> Result<Vec<u8>, String> {
         match stream.read(&mut out, free) {
             Ok(()) => {}
             Err(StreamEnd::Eof) => return Ok(out),
-            Err(end) => return Err(end.message()),
+            Err(StreamEnd::UnexpectedEof) => return Err("unexpected EOF".to_owned()),
+            Err(StreamEnd::Corrupt(at)) => {
+                return Err(format!("illegal base64 data at input byte {at}"))
+            }
         }
     }
 }
@@ -159,6 +152,10 @@ fn go_round_up_size(size: usize) -> usize {
 
 /// Go's `base64.NewDecoder(base64.StdEncoding, strings.NewReader(src))`: a `newlineFilteringReader`
 /// over the string, and the decoder's 1024-byte buffer of input not yet decoded.
+///
+/// Two parts of Go's decoder are left out because `bytes.Buffer` never reaches them: the output a
+/// read decodes past `len(p)` (a refill offers at most `len(p) / 3 * 4` bytes, which decode to at
+/// most `len(p)`), and a read after an error (`ReadFrom` stops at the first).
 struct GoBase64Stream<'a> {
     /// The trimmed input; the `=` padding after it is not copied.
     src: &'a [u8],
@@ -171,10 +168,6 @@ struct GoBase64Stream<'a> {
     nbuf: usize,
     /// The reader has answered `io.EOF`.
     read_eof: bool,
-    /// Decoded bytes that did not fit the last read's `p`.
-    pending: Vec<u8>,
-    /// The error every later read answers.
-    end: Option<StreamEnd>,
 }
 
 impl<'a> GoBase64Stream<'a> {
@@ -186,8 +179,6 @@ impl<'a> GoBase64Stream<'a> {
             buf: [0; 1024],
             nbuf: 0,
             read_eof: false,
-            pending: Vec::new(),
-            end: None,
         }
     }
 
@@ -218,46 +209,21 @@ impl<'a> GoBase64Stream<'a> {
 
     /// `decoder.Read` with a `p` of `room` bytes, appending what it decodes to `out`.
     fn read(&mut self, out: &mut Vec<u8>, room: usize) -> Result<(), StreamEnd> {
-        if !self.pending.is_empty() {
-            let n = room.min(self.pending.len());
-            out.extend(self.pending.drain(..n));
-            return Ok(());
-        }
-        if let Some(end) = self.end {
-            return Err(end);
-        }
         // Refill to at least one quantum, offering up to `len(p) / 3 * 4` bytes (4 to 1024).
         while self.nbuf < 4 && !self.read_eof {
             let want = (room / 3 * 4).clamp(4, self.buf.len());
             self.nbuf += self.filtered_read(self.nbuf, want);
         }
-        if self.nbuf < 4 {
-            let end = if self.nbuf > 0 {
-                StreamEnd::UnexpectedEof
-            } else {
-                StreamEnd::Eof
-            };
-            self.end = Some(end);
-            return Err(end);
+        match self.nbuf {
+            0 => return Err(StreamEnd::Eof),
+            1..=3 => return Err(StreamEnd::UnexpectedEof),
+            _ => {}
         }
         let chunk = self.nbuf / 4 * 4;
-        let corrupt = if chunk / 4 * 3 > room {
-            // Decoded into the decoder's own buffer; `p` takes what fits, the rest waits.
-            let corrupt = go_decode(&self.buf[..chunk], &mut self.pending);
-            let n = room.min(self.pending.len());
-            out.extend(self.pending.drain(..n));
-            corrupt
-        } else {
-            go_decode(&self.buf[..chunk], out)
-        };
+        let corrupt = go_decode(&self.buf[..chunk], out);
         self.buf.copy_within(chunk..self.nbuf, 0);
         self.nbuf -= chunk;
-        if let Some(at) = corrupt {
-            let end = StreamEnd::Corrupt(at);
-            self.end = Some(end);
-            return Err(end);
-        }
-        Ok(())
+        corrupt.map_or(Ok(()), |at| Err(StreamEnd::Corrupt(at)))
     }
 }
 
@@ -288,22 +254,18 @@ fn go_decode(src: &[u8], out: &mut Vec<u8>) -> Option<usize> {
 }
 
 /// `Encoding.decodeQuantum`: up to four digits from `src[si..]`, padding included, appended to `out`
-/// as up to three bytes. Go's also skips `\r` and `\n`; the filtering reader has removed them from
-/// every chunk, so that is left out here.
+/// as up to three bytes. Go's also skips `\r` and `\n`, which the filtering reader has removed from
+/// every chunk, and so never meets the end of a chunk inside a quantum: a chunk is whole quanta.
 fn go_decode_quantum(src: &[u8], mut si: usize, out: &mut Vec<u8>) -> (usize, Option<usize>) {
     let mut digits = [0u8; 4];
     let mut len = 4;
     let mut trailing = None;
     let mut j = 0;
     while j < 4 {
-        if si == src.len() {
-            if j == 0 {
-                return (si, None);
-            }
-            // A partial quantum at the end: the standard encoding requires padding.
-            return (si, Some(si - j));
-        }
-        let byte = src[si];
+        // Go's answer for a quantum the chunk ends inside, which a whole-quanta chunk never has.
+        let Some(&byte) = src.get(si) else {
+            return (si, Some(si - j)); // patchcov: coverage tolerate-line reason="unreachable: a chunk is whole quanta with its line breaks removed, so it never ends inside one; kept as Go's answer (#6925)"
+        };
         si += 1;
         if let Some(digit) = base64_digit(byte) {
             digits[j] = digit;
@@ -319,7 +281,7 @@ fn go_decode_quantum(src: &[u8], mut si: usize, out: &mut Vec<u8>) -> (usize, Op
             // "==" is expected; the first "=" is consumed.
             2 => {
                 if si == src.len() {
-                    return (si, Some(src.len()));
+                    return (si, Some(src.len())); // patchcov: coverage tolerate-line reason="unreachable: the first `=` of `==` is at most the third byte of a whole quantum, so a byte follows it; kept as Go's answer (#6925)"
                 }
                 if src[si] != b'=' {
                     return (si, Some(si - 1));

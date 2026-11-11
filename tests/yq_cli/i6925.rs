@@ -155,6 +155,43 @@ const ROWS: &[Row] = &[
         1,
     ),
     ("uri", "x%C3%A9", &["-o", "json"], ".", "\"xé\"\n", "", 0),
+    (
+        "base64",
+        "YSJiXGMNCWQ=",
+        &["-o", "json"],
+        ".",
+        "\"a\\\"b\\\\c\\r\\td\"\n",
+        "",
+        0,
+    ),
+    ("base64", "Pj4+", &["-o", "json"], ".", "\">>>\"\n", "", 0),
+    (
+        "base64",
+        "====",
+        &[],
+        ".",
+        "",
+        "Error: bad file '-': illegal base64 data at input byte 0",
+        1,
+    ),
+    (
+        "base64",
+        "Q===",
+        &[],
+        ".",
+        "",
+        "Error: bad file '-': illegal base64 data at input byte 1",
+        1,
+    ),
+    (
+        "base64",
+        "QQ=Q",
+        &[],
+        ".",
+        "",
+        "Error: bad file '-': illegal base64 data at input byte 2",
+        1,
+    ),
 ];
 
 #[test]
@@ -178,6 +215,16 @@ fn decoded_bytes_that_are_not_utf8_take_the_json_route_6925() -> Result<()> {
     let (out, _, code) =
         run_yq_stdin_bytes_with_stderr(".", b"/w==", &["-p", "base64", "-o", "json"])?;
     assert_eq!((out.as_str(), code), ("\"\u{fffd}\"\n", 0));
+    // A leading byte that is not UTF-8 is not white space to Go's `TrimSpace`, so it is data.
+    let (_, err, code) =
+        run_yq_stdin_bytes_with_stderr(".", b"\xffaGk=", &["-p", "base64", "-o", "json"])?;
+    assert_eq!(
+        (error_line(&err), code),
+        (
+            "Error: bad file '-': illegal base64 data at input byte 0",
+            1
+        )
+    );
     let (out, err, code) = run_yq_stdin_bytes_with_stderr(".", b"a%FF", &["-p", "uri"])?;
     assert_eq!((out.as_str(), code), ("", 1));
     assert!(err.contains("invalid UTF-8"), "{err}");
