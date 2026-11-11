@@ -27259,6 +27259,8 @@ fn format_toml(value: &OwnedValue) -> Result<String, EvalError> {
         }
         fn separate(&mut self, path: &[&str], entries: &ObjectMap, depth: usize) {
             assert_value_tree_depth(depth);
+            // Not `is_attribute`: yq's `encodeSeparateMapping` does not count a `null` as an attribute, while
+            // its `isTomlAttribute` (the root's partition) does -- two predicates in yq, ported as they are.
             let has_attrs = entries.values().any(|value| match value {
                 OwnedValue::Null | OwnedValue::Object(_) => false,
                 OwnedValue::Array(items) => !is_tables(items),

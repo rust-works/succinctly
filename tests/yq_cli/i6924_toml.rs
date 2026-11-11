@@ -85,6 +85,8 @@ const ROWS: &[(&str, &str, i32)] = &[
     ("---\na: 1\n---\nb: 2\n", "a = 1\nb = 2\n", 0),
     ("\"\": 1\n", " = 1\n", 0),
     ("\"\": {x: 1}\n", "[]\nx = 1\n", 0),
+    ("\"a\\nb\"\n", "a\nb\n", 0),
+    ("\"q\\\"r\"\n", "q\"r\n", 0),
 ];
 
 #[test]
@@ -97,5 +99,13 @@ fn toml_rows_match_yq_6924() -> Result<()> {
             "-o=toml over {input:?}"
         );
     }
+    Ok(())
+}
+
+/// A computed number is its own text (`+Inf`, `NaN`), as yq writes it (v4.53.3).
+#[test]
+fn toml_computed_non_finite_numbers_6924() -> Result<()> {
+    let (stdout, status) = run_yq_stdin("{\"a\": 1 / 0, \"b\": [0 / 0]}", "a: 1\n", &["-o=toml"])?;
+    assert_eq!((stdout.as_str(), status), ("a = +Inf\nb = [NaN]\n", 0));
     Ok(())
 }
