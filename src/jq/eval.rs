@@ -26976,7 +26976,7 @@ fn format_lua(value: &OwnedValue, options: &LuaOptions) -> Result<String, EvalEr
                         ".inf" | "+.inf" => "(1/0)",
                         "-.inf" => "(-1/0)",
                         ".nan" => "(0/0)",
-                        _ => literal,
+                        _ => literal, // patchcov: coverage tolerate-line reason="unreachable: a non-finite NumberLiteral is one of the .inf/.nan spellings matched above, the resolver builds no other"
                     });
                 }
                 OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _) => {
