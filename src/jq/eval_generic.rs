@@ -6049,6 +6049,54 @@ fn owned_from_standard_json_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
     })
 }
 
+/// The text yq's `to_yaml`, `@yaml` and `tostring` make of a *container or alias that is a
+/// document node* (#6901): the node as it was written -- flow collections kept flow, a trailing comment
+/// kept -- rather than the canonical block rendering of its value. It is the YAML writer the CLI
+/// prints that same node with (`DocumentCursor::stream_yaml_as_document`), so the string cannot
+/// drift from the output.
+///
+/// `None` when the node has no text to render (a computed value, a plain scalar -- which prints
+/// the same either way -- or a cursor over a format that has no YAML writer), and the caller keeps
+/// the owned rendering. The text carries no final line break, as that writer leaves none.
+fn yq_node_yaml_text<S: EvalSemantics, C: DocumentCursor>(
+    cursor: Option<&C>,
+    owned: &OwnedValue,
+    indent: usize,
+) -> Option<String> {
+    if S::TAG != EvalTag::Yq {
+        return None;
+    }
+    let cursor = cursor?;
+    // An alias node is encoded as the reference it is (`*x`), whatever it points at.
+    if let Some(name) = cursor.alias() {
+        return Some(format!("*{name}"));
+    }
+    if !matches!(owned, OwnedValue::Array(_) | OwnedValue::Object(_)) {
+        return None;
+    }
+    let mut text = String::new();
+    // A node that is not a document's content (a sequence item) carries its own standalone head
+    // and foot comments, which the document writer leaves to the document (a navigated result
+    // prints without them); the node encoded alone prints them.
+    let own_lines = !cursor.is_document_content();
+    if own_lines {
+        for line in cursor.head_comment_raw() {
+            text.push_str(&line);
+            text.push('\n');
+        }
+    }
+    cursor
+        .stream_yaml_as_document(&mut text, IndentSpec::spaces(indent), false)
+        .ok()?;
+    if own_lines {
+        for line in cursor.foot_comment_raw() {
+            text.push('\n');
+            text.push_str(&line);
+        }
+    }
+    Some(text)
+}
+
 /// Apply a format to an owned value and wrap it as a `GenericResult`.
 fn format_result<S: EvalSemantics, V: DocumentValue>(
     format_type: &FormatType,
@@ -16070,6 +16118,29 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                     &owned_or_suppress!(to_owned_with_cursor::<_, S>(&value, cursor), optional),
                     optional,
                 ),
+            }
+        }
+        // #6901: yq's `to_yaml` and `@yaml` encode a document node as it was written (flow style,
+        // a trailing comment), not as the canonical block text of its value.
+        Expr::Format(format_type @ (FormatType::Yaml | FormatType::YqYaml(_)))
+            if S::TAG == EvalTag::Yq =>
+        {
+            let owned = owned_or_suppress!(to_owned_with_cursor::<_, S>(&value, cursor), optional);
+            // `to_yaml(N)` takes the indent as yq's encoder reads it (`0` is four, `1` is two);
+            // past the width the cursor writer models (go-yaml clamps there) the owned text stays.
+            let indent = match format_type {
+                FormatType::YqYaml(0) => 4,
+                FormatType::YqYaml(1) => 2,
+                FormatType::YqYaml(n) => *n,
+                _ => 2,
+            };
+            match yq_node_yaml_text::<S, _>(cursor.as_ref(), &owned, indent).filter(|_| indent <= 9)
+            {
+                Some(mut text) => {
+                    text.push('\n');
+                    GenericResult::Owned(OwnedValue::String(text.into()))
+                }
+                None => format_result::<S, _>(format_type, &owned, optional),
             }
         }
         Expr::Format(format_type) => format_result::<S, _>(
@@ -38777,9 +38848,21 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
             // reachable defensive-consistency class as the rest of this
             // lineage.
             let owned = owned_or_suppress!(to_owned_with_cursor::<_, S>(&value, cursor), optional);
-            // #1130: a container the source wrote in flow style stringifies in flow style.
-            let flow = cursor.is_some_and(|c| c.style() == "flow");
-            GenericResult::Owned(tostring_owned_styled::<S>(owned, flow))
+            // #6901: yq's `tostring` of a document node is the node as it was written, its trailing
+            // comment included; a block node's nested flow collections stay flow.
+            match yq_node_yaml_text::<S, _>(cursor.as_ref(), &owned, 2) {
+                Some(mut text) => {
+                    if text.ends_with('\n') {
+                        text.pop();
+                    }
+                    GenericResult::Owned(OwnedValue::String(text.into()))
+                }
+                None => {
+                    // #1130: a container the source wrote in flow style stringifies in flow style.
+                    let flow = cursor.is_some_and(|c| c.style() == "flow");
+                    GenericResult::Owned(tostring_owned_styled::<S>(owned, flow))
+                }
+            }
         }
 
         Builtin::ToNumber => {

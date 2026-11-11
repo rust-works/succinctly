@@ -6567,7 +6567,7 @@ A write wrapped in `//` (`with(.a; del(.x) // 1)`, `with(.a; (.z = 1) // 2)`) is
 minimal-validation trade-off of semi-indexing, not specific to the builtin).
 
 `to_yaml` is the `@yaml` encoder, so it has `@yaml`'s gaps (a multi-line string is double-quoted,
-not a literal block; a flow-sourced container is block; see the `@yaml` table below), and
+not a literal block; a container the filter builds is block; see the `@yaml` table below), and
 `to_json` of a string holding a backslash-`u` escape in a filter literal differs because filter
 literals are unescaped here (`"\u0001"`) where yq keeps the backslash. `to_json`/`to_yaml` print
 the same bytes as `@json`/`@yaml` plus yq's indent and trailing line break; `tojson` is
@@ -6630,15 +6630,13 @@ scalar or container -- with a newline of its own; `succinctly yq` reads `tojson`
 the one trailing line break chomped (`[1, 2] | tostring` is `"- 1\n- 2"`, `[1.0 * 3]` is
 `"- !!float 3"`), through the CLI's own writer, so the two cannot drift. A container read from
 a node the source wrote in flow style (`b: [1, 2]`) stays flow (`"[1, 2]"`). jq mode is
-unchanged: it JSON-encodes. Not matched:
+unchanged: it JSON-encodes.
+Since [#6901](https://github.com/rust-works/succinctly/issues/6901) a container that is a document node is encoded with its own presentation: a flow container nested in a block one stays flow, and the quote style, trailing comments and the `*a` of an alias the source carried survive into the text.
+Not matched:
 
-- a flow container *nested* in a block one prints block (`.` on `a: ...\nb: [1, 2]`): an
-  `OwnedValue` carries no per-node style (#739, #865);
 - `-I4` is ignored (yq indents the text by the flag; ours is always two spaces);
-- a container rebuilt by `with_entries` or read under `--eval-all` takes the block style
-  whatever its source;
-- quote style, comments, anchors and aliases the source carried do not survive into the text
-  (`c: ["x: y", 'z']` gives `['x: y', z]`, `y: *a` gives the anchored sequence, not `*a`);
+- a container the filter builds, rebuilt by `with_entries`, behind a write or read under `--eval-all`
+  takes the block style whatever its source, and carries none of the comments, quotes or aliases;
 - a string with a line break is double-quoted (`"l1\nl2\n"`) where yq writes a literal block
   (`|`), the CLI writer's own rendering of a built value.
 
@@ -7275,16 +7273,19 @@ assignment's right-hand side (`.z = (.b | kind)`, `.[] |= kind`), a value built 
 (`{"k": .b} | .k | kind`), and `--eval-all`/`-s`/`-i`. Separately, `..` still descends
 into a `!!null`-tagged collection, where yq stops at the `scalar` (`[.. | kind]` has one more element).
 
-## `@yaml` of a flow-sourced container, a multi-line string, or a root computed float ([#1183](https://github.com/rust-works/succinctly/issues/1183))
+## `@yaml` of a container the filter builds, a multi-line string, or a root computed float ([#1183](https://github.com/rust-works/succinctly/issues/1183))
 
-`@yaml` runs the same owned-value YAML streamer as the CLI's own output, so it inherits that
+`@yaml` of a value runs the same owned-value YAML streamer as the CLI's own output, so it inherits that
 streamer's known gaps; each is pinned in `recorded_gaps_1183` (`tests/yq_cli_tests.rs`).
+`@yaml`, `to_yaml` and `tostring` of a container that is a document node are the exception since [#6901](https://github.com/rust-works/succinctly/issues/6901): they encode the node as it was written, with the writer the CLI prints that node with.
+A flow collection stays flow, a nested one inside a block node too, a trailing comment stays, a sequence item keeps its own head and foot comment lines, and an alias node is `*name`.
+That is pinned by `tests/yq_cli/i6901.rs`.
+What is left is a value with no node to read: `[.a] | to_yaml` over `a: {b: 1}` is `- b: 1` here and `- {b: 1}` in yq, and so is a node behind a write (`.z = 1 | .a | to_yaml`), one read back out of a constructor (`{"k": .a} | .k | to_yaml`) and one behind `with_entries`.
 Captured live (v4.53.3):
 
 | filter                         | real yq           | succinctly yq | why                                                                                                                     |
 |--------------------------------|-------------------|---------------|-------------------------------------------------------------------------------------------------------------------------|
-| `a: {b: 1}` then `.a \| @yaml` | `{b: 1}\n`        | `b: 1\n`      | an owned value carries no source style (#739, #865)                                                                     |
-| `a: [1, 2]` then `.a \| @yaml` | `[1, 2]\n`        | `- 1\n- 2\n`  | same                                                                                                                    |
+| `a: {b: 1}` then `[.a] \| @yaml` | `- {b: 1}\n`      | `- b: 1\n`    | an owned value carries no source style (#739, #865)                                                                     |
 | `"x\ny" \| @yaml`              | `\|-\n  x\n  y\n` | `"x\ny"\n`    | a line break is double-quoted, not a literal block (the computed-value streamer; #3587 closed the JSON route)           |
 | `2.0*1 \| @yaml`               | `!!float 2\n`     | `2\n`         | yq tags a computed float but not a document-sourced `!!float 2` (the #1090 test); an owned float cannot tell them apart |
 
