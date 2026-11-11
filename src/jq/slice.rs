@@ -222,11 +222,14 @@ fn bound(slot: Option<&OwnedValue>) -> Result<Option<f64>, EvalError> {
 /// *rounded* value's sign — this function's own shape before #3396 — breaks
 /// for an end bound in `(-1, 0)`: `ceil(-0.5)` is `-0.0`, which is not
 /// negative, so the fold that should have turned it into `len` never runs
-/// and it clamps to `0` instead. A start bound was never affected by this,
-/// since `floor` commutes with an integer offset regardless of which order
-/// runs (`floor(x + len) == floor(x) + len`); `ceil` has the identical
-/// identity, but the old code never reached it because it decided whether
-/// to fold from the wrong (post-rounding) value in the first place.
+/// and it clamps to `0` instead. A start bound was not affected by *that*,
+/// since `floor(x + len) == floor(x) + len` for real numbers (`ceil` has the
+/// identical identity). It is a property of real numbers, though, not of the
+/// rounded double sum jq computes: `-1e-66 + 5` is exactly `5.0`, so folding
+/// first and rounding second is the only order that agrees with jq for either
+/// bound (#6984). That is why a computed bound keeps its double
+/// ([`SliceBound`]) until the length is known, rather than being floored or
+/// ceiled up front.
 ///
 /// Written over `f64` so that a bound too large for a `usize` saturates at
 /// `len` instead of wrapping: `[1,2,3] | .[1:1e100]` is `[2,3]`, and a NaN
