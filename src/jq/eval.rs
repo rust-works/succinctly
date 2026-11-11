@@ -25706,8 +25706,10 @@ pub(crate) fn format_owned<S: EvalSemantics>(
         FormatType::Yaml => format_yaml(owned),
         FormatType::Props => format_props(owned),
         FormatType::YqOutput(encoder) => {
+            let text = format_yq_output::<S>(encoder, owned)
+                .map_err(|e| EvalError::output_encoder(e.message))?;
             note_output_encoder_result(owned);
-            format_yq_output::<S>(encoder, owned).map_err(|e| EvalError::output_encoder(e.message))
+            Ok(text)
         }
         FormatType::YqJson(indent) => {
             // #6887: yq's JSON encoder refuses a non-finite number.
@@ -26834,36 +26836,40 @@ fn format_props_recursive(
     }
 }
 
-/// Whether any result an `-o=<format>` encoder was handed was neither `null` nor `false`, and
-/// `None` when no encoder ran (#6923).
+/// Whether any result an `-o=<format>` encoder encoded was neither `null` nor `false`, and `None`
+/// when no encoder ran since [`reset_output_encoder_truthy`] (#6923).
 ///
 /// `-e` reads the value the filter produced, not the encoded text (`-o=props '.zz'` encodes `null`
 /// to the line `null`, which is truthy as text): the encoder is the last stage of the program, so it
-/// records here what it was given. `std` only, like the other `thread_local!`s of this file.
-#[cfg(feature = "std")]
+/// records here what it was given. A process-wide cell, not a `thread_local!`: the evaluator may
+/// run on a worker thread with a larger native stack (ADR-0025) while the CLI reads the answer on
+/// its own.
 pub fn output_encoder_saw_truthy() -> Option<bool> {
-    ENCODER_TRUTHY.with(std::cell::Cell::get)
+    match ENCODER_TRUTHY.load(core::sync::atomic::Ordering::Relaxed) {
+        ENCODER_TRUTHY_SEEN_FALSY => Some(false),
+        ENCODER_TRUTHY_SEEN_TRUTHY => Some(true),
+        _ => None,
+    }
 }
 
-/// `no_std` has no `thread_local!` to record into (#6923).
-#[cfg(not(feature = "std"))]
-pub fn output_encoder_saw_truthy() -> Option<bool> {
-    None
+/// Forget what [`output_encoder_saw_truthy`] holds, at the start of a run (#6923).
+pub fn reset_output_encoder_truthy() {
+    ENCODER_TRUTHY.store(0, core::sync::atomic::Ordering::Relaxed);
 }
 
-#[cfg(feature = "std")]
-thread_local! {
-    static ENCODER_TRUTHY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
+const ENCODER_TRUTHY_SEEN_FALSY: u8 = 1;
+const ENCODER_TRUTHY_SEEN_TRUTHY: u8 = 2;
+static ENCODER_TRUTHY: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
-#[cfg(feature = "std")]
+/// Record that an encoder encoded `value` (#6923).
 fn note_output_encoder_result(value: &OwnedValue) {
-    let truthy = !matches!(value, OwnedValue::Null | OwnedValue::Bool(false));
-    ENCODER_TRUTHY.with(|seen| seen.set(Some(seen.get().unwrap_or(false) || truthy)));
+    let state = if matches!(value, OwnedValue::Null | OwnedValue::Bool(false)) {
+        ENCODER_TRUTHY_SEEN_FALSY
+    } else {
+        ENCODER_TRUTHY_SEEN_TRUTHY
+    };
+    ENCODER_TRUTHY.fetch_max(state, core::sync::atomic::Ordering::Relaxed);
 }
-
-#[cfg(not(feature = "std"))]
-fn note_output_encoder_result(_value: &OwnedValue) {}
 
 /// yq's `-o=<format>` encoders (#6850): the whole result as that format, line ends included, so the
 /// caller prints it with none of its own.

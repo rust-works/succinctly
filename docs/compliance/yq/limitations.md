@@ -7672,7 +7672,8 @@ Six rows differ from yq v4.53.3, each pinned out of `tests/yq_cli/i6850.rs`:
   yq writes a head and a line comment as `# ...` lines above the key, and the `@props` filter has the same gap.
 - A null written `~` (or `!!null ""`) prints `null` with every encoder, `ini` included, where yq echoes the spelling (`c = ~`, `c='~'`, `a = `, #2802).
 - An encoder that fails after earlier results printed still prints those results first, as yq does (#6923): `printf 'a: x\nb: [1]\nc: {d: e}\n' | yq -o=csv '.[]'` prints `x` and `1`, then the error, exit 1.
-  A top-level comma (`.a, .b`) still prints nothing before the error, and the error line is written when it is raised, before the earlier results are flushed, so the two streams interleave differently on a terminal.
+  A top-level comma (`.a, .b`) still prints nothing before the error, and the error line is written when it is raised, so the two streams can interleave differently on a terminal.
+  The results are kept on the plain, `--eval-all` and `-n` routes; the other input routes were not checked.
   An error the program itself raises still prints nothing, in both tools.
 - A `shell` key with an accented letter loses it (`é` is dropped), where yq decomposes it first and keeps the `e`.
 - A `<<` whose value is a literal mapping, not an alias, is merged into its mapping by the encoders, where yq leaves it a plain key that props, shell, ini and lua skip: `printf 'a: 1\n<<: {b: 2, a: 5}\n' | yq -o=props .` is `a = 1` in yq and `a = 5`, `b = 2` here.

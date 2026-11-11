@@ -81,7 +81,7 @@ fn an_error_the_program_raises_still_prints_nothing_6923() -> Result<()> {
 fn exit_status_reads_the_value_not_the_encoded_text_6923() -> Result<()> {
     // (filter, yq's exit code with `-e -o=<format>`) over `a: 1` / `b: false`.
     for (filter, expected) in [(".zz", 1), (".a", 0), (".b", 1), ("false", 1), ("[]", 0)] {
-        for format in ["csv", "props"] {
+        for format in ["csv", "props", "lua"] {
             let (_, _, code) = run_yq_split(filter, "a: 1\nb: false\n", &["-e", "-o", format])?;
             assert_eq!(code, expected, "-e -o={format} {filter}");
         }

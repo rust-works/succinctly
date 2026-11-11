@@ -11895,6 +11895,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         OutputFormat::Yaml | OutputFormat::Json | OutputFormat::Auto => None,
     };
     if output_encoder.is_some() {
+        jq::reset_output_encoder_truthy(); // #6923
         // Every encoder but KYAML's writes its own line ends (or none), so nothing is added after a result.
         // KYAML leaves the line end to the printer and keeps YAML's `---` between documents, which `-N`
         // removes as it does for YAML.
