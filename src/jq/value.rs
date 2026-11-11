@@ -4327,6 +4327,68 @@ impl OwnedValue {
     /// *should* escape `@json`/interpolation output through yq's own table
     /// here is a real, separate question with its own oracle probe to run
     /// against yq v4.53.3 -- not something to decide by refactor.
+    /// The error real yq's JSON encoder raises for the first non-finite number this value holds,
+    /// in the order it writes them, or `None` if there is none (#6867, #6887).
+    ///
+    /// yq wraps the failure once per node on the way up, the number's own node included, so the
+    /// `json: error calling MarshalJSON ...` prefix repeats `depth + 1` times (`1 / 0` once,
+    /// `[1 / 0]` twice, `{"a": [0 / 0]}` three times; v4.53.3). A computed number fails in
+    /// `encoding/json` (`json: unsupported value: +Inf`); a document `.inf`/`.nan` scalar fails
+    /// earlier, parsing its own text (`strconv.ParseFloat: parsing ".inf": invalid syntax`).
+    ///
+    /// The one definition: the CLI's `-o=json` writer, `to_json` and `@json` all answer from it, and
+    /// `to_json_yq` itself stays the infallible text for the paths that only stringify.
+    /// `sort_keys` is the order the writer visits a mapping's entries in.
+    #[must_use]
+    pub fn yq_non_finite_json_error(&self, sort_keys: bool) -> Option<String> {
+        const WRAP: &str = "json: error calling MarshalJSON for type *yqlib.CandidateNode: ";
+        fn go_non_finite_text(f: f64) -> &'static str {
+            if f.is_nan() {
+                "NaN"
+            } else if f.is_sign_negative() {
+                "-Inf"
+            } else {
+                "+Inf"
+            }
+        }
+        fn cause(value: &OwnedValue) -> Option<String> {
+            match value {
+                OwnedValue::Float(f) if !f.is_finite() => Some(format!(
+                    "json: unsupported value: {}",
+                    go_non_finite_text(*f)
+                )),
+                OwnedValue::NumberLiteral(_, literal)
+                    if crate::yaml::NONFINITE_LITERALS.contains(&&**literal) =>
+                {
+                    Some(format!(
+                        "strconv.ParseFloat: parsing \"{literal}\": invalid syntax"
+                    ))
+                }
+                _ => None,
+            }
+        }
+        fn walk(value: &OwnedValue, sort_keys: bool, depth: usize) -> Option<(String, usize)> {
+            assert_value_tree_depth(depth);
+            match value {
+                OwnedValue::Array(items) => {
+                    items.iter().find_map(|v| walk(v, sort_keys, depth + 1))
+                }
+                OwnedValue::Object(map) => {
+                    let mut entries: Vec<_> = map.occurrences().collect();
+                    if sort_keys {
+                        entries.sort_by(|a, b| a.0.cmp(b.0));
+                    }
+                    entries
+                        .into_iter()
+                        .find_map(|(_, v)| walk(v, sort_keys, depth + 1))
+                }
+                _ => cause(value).map(|c| (c, depth)),
+            }
+        }
+        let (cause, depth) = walk(self, sort_keys, 0)?;
+        Some(format!("{}{cause}", WRAP.repeat(depth + 1)))
+    }
+
     pub(crate) fn to_json_yq(&self) -> String {
         self.to_json_at_depth(
             0,
