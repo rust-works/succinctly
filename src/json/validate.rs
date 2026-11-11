@@ -1595,6 +1595,19 @@ pub(crate) fn int_spelling_token(text: &str) -> String {
     encode_spelling('5', text)
 }
 
+/// [`spelling_token`] for a spelling that was written as a **float** and that the text alone
+/// reads as an integer: `4` for the leading digit, then the same bytes (#6958).
+///
+/// An underscored `1_000` is the integer 1000 of `!!int 1_000` and the float 1000.0 of
+/// `!!float 1_000`, with the same text; the reader that decodes the text (`1_000` is an integer)
+/// cannot tell them apart, the counterpart of [`int_spelling_token`]. The leading `4` keeps it
+/// apart from every other family (`5` integer spelling, `6` spelling, `7` document non-finite,
+/// `8`/`9` computed non-finite). Only an underscored yq float is written under it.
+#[must_use]
+pub(crate) fn float_spelling_token(text: &str) -> String {
+    encode_spelling('4', text)
+}
+
 fn encode_spelling(lead: char, text: &str) -> String {
     use core::fmt::Write;
     let mut token = String::with_capacity(1 + text.len() * 3 + SPELLING_TOKEN_SUFFIX.len());
@@ -1622,6 +1635,12 @@ pub(crate) fn parse_spelling_token(bytes: &[u8]) -> Option<String> {
 #[must_use]
 pub(crate) fn parse_int_spelling_token(bytes: &[u8]) -> Option<String> {
     decode_spelling(b"5", bytes)
+}
+
+/// Decodes a [`float_spelling_token`] to its text, `None` for anything else.
+#[must_use]
+pub(crate) fn parse_float_spelling_token(bytes: &[u8]) -> Option<String> {
+    decode_spelling(b"4", bytes)
 }
 
 fn decode_spelling(lead: &[u8], bytes: &[u8]) -> Option<String> {
@@ -1788,6 +1807,31 @@ mod tests {
     // ========================================================================
     // computed-float token tests (#2902)
     // ========================================================================
+
+    /// #6958: a float whose text reads as an integer crosses under its own token family, apart
+    /// from the plain spelling (`6`) and the integer's (`5`).
+    #[test]
+    fn float_spelling_token_is_its_own_family_6958() {
+        for text in ["1_000", "1_0.5", "0_8", "1_0e1_0"] {
+            let token = float_spelling_token(text);
+            assert!(token.starts_with('4'), "{token}");
+            assert_eq!(
+                parse_float_spelling_token(token.as_bytes()).as_deref(),
+                Some(text)
+            );
+            assert_eq!(parse_spelling_token(token.as_bytes()), None, "{token}");
+            assert_eq!(parse_int_spelling_token(token.as_bytes()), None, "{token}");
+            assert_eq!(
+                parse_float_spelling_token(spelling_token(text).as_bytes()),
+                None
+            );
+            assert_eq!(
+                parse_float_spelling_token(int_spelling_token(text).as_bytes()),
+                None
+            );
+        }
+        assert_eq!(float_spelling_token("1_000"), "4049095048048048e999e999");
+    }
 
     /// #6927: the integer's spelling token round-trips like the plain one, decodes only under
     /// its own leading digit, and is no number to `str::parse`.

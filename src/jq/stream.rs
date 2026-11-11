@@ -1085,6 +1085,17 @@ fn stream_owned_value_yaml_at_depth<W: core::fmt::Write>(
             out.write_str("!!int ")?;
             out.write_str(literal)
         }
+        // #6958: an underscored float echoes its text, and the text alone reads back as an integer
+        // or as a string, so it carries its tag, as yq's encoder writes it (`a: !!float 1_0.5`). At
+        // the root too, unlike the DOM writer: this is `to_yaml`'s, whose string carries the tag in
+        // yq (`"!!float 1_0.5\n"` under JSON output).
+        OwnedValue::NumberLiteral(NumberRepr::Float(_), literal)
+            if crate::yaml::is_underscored_float(literal)
+                && crate::yaml::needs_explicit_float_tag_in_yaml(literal) =>
+        {
+            out.write_str("!!float ")?;
+            out.write_str(literal)
+        }
         OwnedValue::NumberLiteral(_, literal) => {
             // Echo verbatim (#1008), matching this function's JSON sibling
             // (`stream_owned_value_json`'s `finite_literal` hook) -- this

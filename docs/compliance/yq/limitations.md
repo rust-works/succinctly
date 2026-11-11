@@ -758,7 +758,7 @@ $ printf 'd: !!int 1_000\n' | succinctly yq -o json -I0 '.d + 1'         # 1001 
 Not covered here:
 - A form yq cannot encode (`!!int 0b1_0`, `!!int 1_0.5`, `!!int 9_223_372_036_854_775_808`, `!!float 0x1_f`) is an error in yq's JSON encoder and an arithmetic error; this reads it as the string, as it does `!!int abc`.
   A prefixed integer under `!!float` (`!!float 0x1_2`, `!!float 0o1_7`) is the float `18.0`/`15.0` here, as `!!float 0x12` already was, where yq's float parser refuses it.
-- `tostring` and YAML output of an underscored `!!float` print the number (`!!float 1_0.5` is `10.5`), where yq echoes the text (`1_0.5`): the spelled-float machinery (`is_spelled_float`) has no underscore form yet ([#6958](https://github.com/rust-works/succinctly/issues/6958)). An underscored `!!int` keeps its text.
+- An underscored `!!float` (`!!float 1_0.5`, `1_000`, `1_0e1_0`) keeps its text through `tostring`, YAML output, a copy and the JSON writers (`1000.0`), as an underscored `!!int` does (#6958). Three residuals: `-P` over a document that holds one keeps the `!!float` tag, where yq strips it (`a: 1_0.5`); `to_yaml` of one prints the tag under YAML output (`!!float 1_0.5`), where yq prints the text alone (JSON output agrees: `"!!float 1_0.5\n"`); and an untagged `a: 1_0.5` is the string `1_0.5` here, where yq reads the float 10.5 (the recorded input-spec divergence for underscored numbers).
 
 ### A scalar under an unknown `!!` tag is its text (#6299)
 

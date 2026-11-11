@@ -3269,6 +3269,10 @@ impl<'a> JsonNumber<'a> {
     /// text; `None` for any other span and for a spelling that is no integer (#2802).
     #[inline]
     pub(crate) fn bridge_spelled_int(&self) -> Option<i64> {
+        // #6958: a float whose text reads as an integer (`!!float 1_000`) is no integer.
+        if self.raw_bytes().first() == Some(&b'4') && self.bridge_float_spelling().is_some() {
+            return None;
+        }
         // The integer token first: an explicit `!!int 08` is an integer whatever its text.
         if let Some(spelling) = self.bridge_int_spelling() {
             return crate::yaml::spelled_int_value(&spelling);
@@ -3336,6 +3340,18 @@ impl<'a> JsonNumber<'a> {
         let bytes = self.raw_bytes();
         crate::json::validate::parse_spelling_token(bytes)
             .or_else(|| crate::json::validate::parse_int_spelling_token(bytes))
+            .or_else(|| crate::json::validate::parse_float_spelling_token(bytes))
+    }
+
+    /// The text of a float the bridge carried under its own token because the text alone reads
+    /// as an integer (an underscored `!!float 1_000`, #6958); `None` for any other span. Asked
+    /// before [`bridge_spelling`](Self::bridge_spelling), which answers the same text for it.
+    #[inline]
+    pub(crate) fn bridge_float_spelling(&self) -> Option<String> {
+        if !self.bridge {
+            return None;
+        }
+        crate::json::validate::parse_float_spelling_token(self.raw_bytes())
     }
 
     /// The text of an integer the bridge carried under its own token because the text alone
@@ -3475,9 +3491,11 @@ impl<'a> JsonNumber<'a> {
                 .or_else(|| self.bridge_spelled_int().map(|n| n as f64))
                 .or_else(|| {
                     let spelling = self.bridge_spelling()?;
-                    crate::yaml::is_spelled_float(&spelling)
-                        .then(|| spelling.parse::<f64>().ok())
-                        .flatten()
+                    crate::yaml::underscored_float_value(&spelling).or_else(|| {
+                        crate::yaml::is_spelled_float(&spelling)
+                            .then(|| spelling.parse::<f64>().ok())
+                            .flatten()
+                    })
                 })
                 .or_else(|| crate::json::validate::jq_special_number(bytes))
                 .ok_or(JsonError::InvalidNumber)
