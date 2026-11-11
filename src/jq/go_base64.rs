@@ -285,7 +285,6 @@ fn last_char(bytes: &[u8]) -> Option<char> {
     chars.next().is_none().then_some(c)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
