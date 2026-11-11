@@ -59,3 +59,17 @@ fn yq_empty_left_operand_skips_the_right_one_6982() -> Result<()> {
     assert_eq!((stdout.as_str(), code), ("false\n", 0));
     Ok(())
 }
+
+/// jq evaluates the right operand first, so an empty left side never hides its error (jq 1.7.1).
+#[test]
+fn jq_empty_left_operand_still_raises_the_right_one_6982() -> Result<()> {
+    for filter in [
+        ".[] * error(\"x\")",
+        ".[] - error(\"x\")",
+        ".[] / error(\"x\")",
+    ] {
+        let (stdout, code) = crate::run_jq_stdin(filter, "[]", &["-c"])?;
+        assert_eq!((stdout.as_str(), code), ("", 5), "{filter}");
+    }
+    Ok(())
+}

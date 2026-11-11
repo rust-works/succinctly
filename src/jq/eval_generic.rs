@@ -24015,7 +24015,7 @@ fn binary_fanout_each_generic_with<V: DocumentValue, S: EvalSemantics>(
         // loop never ran and the inner one was never evaluated at all --
         // drive it once here so `1 + key` and `key + 1` stay symmetric the
         // way real yq is. Mirrors `eval::empty_outer_operand_pass`, and skips the inner operand
-        // where yq does (#6982).
+        // where yq does (#6982); `left_major` states that the empty outer operand is the left one.
         if rules.left_major && yq_empty_left_skips_right(op) {
             return Flow::Exhausted;
         }

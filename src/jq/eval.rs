@@ -571,7 +571,9 @@ pub(crate) fn yq_empty_left_skips_right(op: EmptyOperandOp) -> bool {
 /// | op                | one empty operand              | both empty |
 /// |-------------------|--------------------------------|------------|
 /// | `+`               | the other operand, verbatim    | nothing    |
-/// | `-` `*` `/` `%`   | nothing                        | nothing    |
+/// | `-` `*` `/` `%`   | nothing (and an empty left     | nothing    |
+/// |                   | leaves the right unevaluated,  |            |
+/// |                   | [`yq_empty_left_skips_right`]) |            |
 /// | `==`              | `true` iff the other is `null` | `true`     |
 /// | `!=`              | mirror of `==`                 | `false`    |
 /// | `<` `>`           | `false`                        | `false`    |
@@ -614,9 +616,14 @@ pub(crate) fn yq_empty_operand_output(
     // `==`/`!=` and is what flips `<=`/`>=` to `true` -- the two rows the
     // single-empty rule cannot derive (inconsistency 3 above).
     let other_is_null = matches!(other, None | Some(OwnedValue::Null));
+    // The operators that answer nothing are named once, by the predicate that also skips their
+    // right operand (#6982).
+    if yq_empty_left_skips_right(op) {
+        return None;
+    }
     match op {
         EmptyOperandOp::Arith(ArithOp::Add) => other.cloned(),
-        EmptyOperandOp::Arith(ArithOp::Sub | ArithOp::Mul(_) | ArithOp::Div | ArithOp::Mod) => None,
+        EmptyOperandOp::Arith(_) => unreachable!("yq_empty_left_skips_right names the rest"), // patchcov: coverage tolerate-line reason="unreachable: every arithmetic operator but + returned above"
         EmptyOperandOp::Compare(CompareOp::Eq) => Some(OwnedValue::Bool(other_is_null)),
         EmptyOperandOp::Compare(CompareOp::Ne) => Some(OwnedValue::Bool(!other_is_null)),
         EmptyOperandOp::Compare(CompareOp::Lt | CompareOp::Gt) => Some(OwnedValue::Bool(false)),
@@ -16881,8 +16888,9 @@ fn binary_fanout_each_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // operand per right output; yq re-evaluates the *right* one per left
     // output (`doCrossFunc`, `pkg/yqlib/operators.go:113-138`). Only the
     // nesting swaps -- `combine` still receives (left, right) either way, and
-    // #2460's empty-operand rule is symmetric in the two, so it needs no
-    // second spelling here.
+    // #2460's empty-operand table is symmetric in the two, so it needs no
+    // second spelling here. Skipping the inner operand is not: yq skips the
+    // right one only, when the left is empty (#6982, below).
     let (outer_expr, inner_expr) = if rules.left_major {
         (left, right)
     } else {
@@ -17067,7 +17075,8 @@ fn binary_fanout_each_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // loop above never ran and the inner one was never evaluated at all.
         // Drive it once here and answer each of its outputs from the same
         // table -- and, if it is empty too, answer the both-empty row once. Unless the table
-        // answers nothing for every value, when yq never evaluates it (#6982).
+        // answers nothing for every value, when yq never evaluates it (#6982); `left_major`
+        // states that the empty outer operand is the left one, which is what yq's rule needs.
         if rules.left_major && yq_empty_left_skips_right(op) {
             return Flow::Exhausted;
         }
@@ -136384,6 +136393,11 @@ mod tests {
             EmptyOperandOp::Arith(ArithOp::Add),
             EmptyOperandOp::Arith(ArithOp::Sub),
             EmptyOperandOp::Arith(ArithOp::Mul(MergeFlags::default())),
+            EmptyOperandOp::Arith(ArithOp::Mul(MergeFlags {
+                append_arrays: true,
+                deep_merge_arrays: true,
+                ..MergeFlags::default()
+            })),
             EmptyOperandOp::Arith(ArithOp::Div),
             EmptyOperandOp::Arith(ArithOp::Mod),
             EmptyOperandOp::Compare(CompareOp::Eq),
@@ -136397,8 +136411,11 @@ mod tests {
         let others = [
             None,
             Some(OwnedValue::Null),
+            Some(OwnedValue::Bool(false)),
             Some(OwnedValue::Int(1)),
             Some(OwnedValue::from("a".to_string())),
+            Some(OwnedValue::array_from(vec![OwnedValue::Int(1)])),
+            Some(OwnedValue::Object(IndexMap::new().into())),
         ];
         for op in ops {
             let answers_nothing = others
@@ -136416,6 +136433,8 @@ mod tests {
         for program in [
             r#".[] * error("x")"#,
             r#".[] - error("x")"#,
+            r#".[] / error("x")"#,
+            r#".[] % error("x")"#,
             r#".[] *+ error("x")"#,
         ] {
             let index = JsonIndex::build(b"[]");
