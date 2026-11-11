@@ -32,6 +32,8 @@ use succinctly::json::JsonIndex;
 
 use super::m2_gate::can_use_m2_streaming;
 use super::{JqCommand, OnError};
+
+mod window;
 use crate::output::{
     self, escape_json_string, escape_json_string_ascii, exit_codes, flush_then_err, ColorScheme,
     DiagStyle, ErrorSink, InputLocation, JsonFormatOpts, LoudFlushWriter, StreamFault, Terminator,
@@ -5223,17 +5225,28 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     if can_use_lazy_path && !args.null_input {
         // Lazy path: read files as raw bytes and process directly
         // This preserves original number formatting like "4e4"
+        // #6920: a lone regular file is read a window at a time, so the run holds a window of it
+        // where it held the whole file; the loop below then has one buffer, empty, for that file
+        // and is handed its windows.
+        let mut windowed: Option<window::WindowedFile> = None;
         let (files, mut raw_inputs, failures) = match seq_plain.take() {
             Some(prepared) => prepared,
-            None => {
-                let files = get_input_files(&args);
-                if files.is_empty() {
-                    (files, vec![read_stdin_bytes()?], Vec::new())
-                } else {
-                    read_input_files(&files, false)
+            None => match windowed_plain_file(&args) {
+                Some((path, reader)) => {
+                    windowed = Some(reader);
+                    (vec![path], vec![Vec::new()], Vec::new())
                 }
-            }
+                None => {
+                    let files = get_input_files(&args);
+                    if files.is_empty() {
+                        (files, vec![read_stdin_bytes()?], Vec::new())
+                    } else {
+                        read_input_files(&files, false)
+                    }
+                }
+            },
         };
+        let windowed_run = windowed.is_some();
         // A slurp reads every file in the one fetch that meets the first failure, so it
         // reports them all up front and cuts nothing. Otherwise jq reports a file when its
         // reader gets there, which the loop below does too (#5472).
@@ -5363,6 +5376,11 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             originals
         });
         sink.set_stream_fault(match slurped {
+            // #6920: the text before a window is gone, so the fault is read again from the file.
+            None if windowed_run => {
+                let files = files.clone();
+                StreamFault::new(move || reread_stream_fault(&files))
+            }
             None => {
                 let raw_inputs = std::rc::Rc::clone(&raw_inputs);
                 let originals = std::rc::Rc::clone(&originals);
@@ -5391,7 +5409,34 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         // file's lines as #4305 left them (#4316).
         let seams_align = seams.is_empty() || seams.len() == raw_inputs.len();
         debug_assert!(slurped.is_some() || seams_align);
-        'files: for (idx, raw) in raw_inputs.iter().enumerate() {
+        let mut whole_files = raw_inputs.iter().enumerate();
+        'files: loop {
+            // The next file's text, or for a windowed file its next window with the documents the
+            // window holds (#6920): the splitter already ran over it, and `lines_before` line
+            // breaks and `window_substituted` come with it.
+            let (idx, raw, window_split, lines_before, window_substituted) = match windowed.as_mut()
+            {
+                Some(reader) => match reader.next_window() {
+                    Ok(Some(next)) => (
+                        0,
+                        next.raw,
+                        Some((next.values, next.split_error)),
+                        next.lines_before,
+                        next.substituted,
+                    ),
+                    Ok(None) => break,
+                    Err(error) => {
+                        // A file that failed part-way ends there: jq reports it and exits 2 (#5498).
+                        eprintln!("jq: error: {}", strerror_only(&error));
+                        INPUT_READ_FAILED.with(|failed| failed.set(true));
+                        break;
+                    }
+                },
+                None => match whole_files.next() {
+                    Some((idx, raw)) => (idx, raw.as_slice(), None, 0, false),
+                    None => break,
+                },
+            };
             // The files that would not open before this one, reported now: jq's reader meets
             // them as it moves on to this file (#5472).
             while let Some((_, e)) = failures.get(next_failure).filter(|(at, _)| *at <= idx) {
@@ -5442,6 +5487,8 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             // over the entire input for nothing.
             let (mut values, split_error) = if slurped.is_some() {
                 (vec![(0, raw.len())], None)
+            } else if let Some(split) = window_split {
+                split
             } else {
                 split_json_values(raw)
             };
@@ -5492,7 +5539,8 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     }
                 }),
                 seam.clone(),
-            );
+            )
+            .with_lines_before(lines_before);
             let tail_locator = ValueLocator::new(b"", value_tail.as_deref(), Some(0), Seam::NONE);
             for (start, end) in values {
                 if !finished.next_input(args.on_error, &mut sink, &mut had_output, &mut last_output)
@@ -5551,16 +5599,37 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 };
                 if let Some(message) =
                     jq::jq_input_depth_fault(json_bytes, index.bp(), source, || {
-                        jq_stream_position(&raw_inputs, idx, start)
+                        if windowed_run {
+                            // The window starts at a line start, `lines_before` breaks in.
+                            let origin = StreamOrigin::ALONE.file;
+                            let at = if lines_before > 0 {
+                                (origin.0 + lines_before, 0)
+                            } else {
+                                origin
+                            };
+                            advance_position(at, &raw[..start])
+                        } else {
+                            jq_stream_position(&raw_inputs, idx, start)
+                        }
                     })
                 {
                     // #6465: that position and column are counted over the substituted text; where
                     // the substitution changed the stream, jq's parser read the originals.
-                    let message = originals
-                        .iter()
-                        .any(Option::is_some)
-                        .then(|| jq::jq_stream_fault(parser_chunks(&raw_inputs, &originals), 1, 0))
-                        .flatten()
+                    let reworded = if windowed_run {
+                        // #6920: the file read again, where a window was substituted.
+                        window_substituted
+                            .then(|| reread_stream_fault(&files))
+                            .flatten()
+                    } else {
+                        originals
+                            .iter()
+                            .any(Option::is_some)
+                            .then(|| {
+                                jq::jq_stream_fault(parser_chunks(&raw_inputs, &originals), 1, 0)
+                            })
+                            .flatten()
+                    };
+                    let message = reworded
                         .filter(|read| jq::is_jq_depth_fault(read))
                         .unwrap_or(message);
                     // #6628: a slurp joined the documents, so the position is that of the files
@@ -5833,9 +5902,12 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 // #5555: jq's parser names the first fault of its input, whether it is the depth
                 // limit or not, and a value the splitter delimits can hold one ahead of the
                 // splitter's.
-                if let Some(message) =
+                if let Some(message) = if windowed_run {
+                    // #6920: the stream's first fault, from the file read again.
+                    reread_stream_fault(&files)
+                } else {
                     jq::jq_stream_fault(parser_chunks(&raw_inputs, &originals), 1, 0)
-                {
+                } {
                     // #6476: a text that ends inside a value is a fault jq's parser meets at the end
                     // of the last file's bytes, after its reader has moved on to the files that
                     // would not open, so it reports them first and the run exits 2 with them.
@@ -5850,7 +5922,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 // patchcov: coverage tolerate reason="defensive: the splitter stops only at a fault jq's parser also meets, so `jq_stream_fault` names one; kept so a disagreement between them prints the old line placement rather than none (#5555)"
                 let at = InputLocation::at(
                     filename.as_deref(),
-                    parse_error_line(raw, offset, seam, false),
+                    parse_error_line_after(raw, offset, seam, false, lines_before),
                 );
                 sink.report(DiagStyle::Jq, &EvalError::new("Invalid JSON text"), &at);
                 run_stopped = true;
@@ -11070,6 +11142,32 @@ fn read_input_files(
     (opened, raws, failures)
 }
 
+/// The lone regular file the plain route reads a window at a time (#6920), opened, or `None` for a
+/// run that is not one: stdin, a pipe or a directory, several files, a file too small to be worth
+/// it, and every flag that has the route read the stream whole (`--slurp`, `--validate`, `--seq`).
+/// A file that does not open here is left to the route that reports it.
+fn windowed_plain_file(args: &JqCommand) -> Option<(PathBuf, window::WindowedFile)> {
+    if args.slurp || args.validate || args.seq || args.null_input {
+        return None;
+    }
+    let files = get_input_files(args);
+    let [path] = files.as_slice() else {
+        return None;
+    };
+    if is_stdin_dash(path) {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() < window::min_windowed_file_bytes() {
+        return None;
+    }
+    Some((
+        path.clone(),
+        window::WindowedFile::new(file, window::window_bytes(), split_json_values),
+    ))
+}
+
 /// Report every failure in `failures`, and note that the run must now exit 2.
 fn report_open_failures(failures: &[(usize, InputFileOpenError)], open_failed: &mut bool) {
     for (_, e) in failures {
@@ -11306,6 +11404,15 @@ impl<'a> LineCounter<'a> {
             next_newline: None,
             seam,
         }
+    }
+
+    /// A counter over a window of a file whose text starts at a line start, with `lines` line
+    /// breaks before it (#6920): the lines it names are the file's.
+    fn set_lines_before(&mut self, lines: usize) {
+        debug_assert!(
+            self.pos == self.seam.base.min(self.bytes.len()) && self.newlines_before_pos == 0
+        );
+        self.newlines_before_pos = lines;
     }
 
     /// Where this counter is in its text, kept without a borrow of it between calls (#5661).
@@ -11567,6 +11674,12 @@ impl<'a> ValueLocator<'a> {
         }
     }
 
+    /// This locator over a window of a file, with `lines` line breaks before the window (#6920).
+    fn with_lines_before(self, lines: usize) -> Self {
+        self.counter.borrow_mut().set_lines_before(lines);
+        self
+    }
+
     /// The location of the value whose exclusive end offset is `end`.
     fn at(&self, end: usize) -> InputLocation {
         let line = match self.slurp_eof {
@@ -11647,7 +11760,20 @@ fn line_at(bytes: &[u8], end: usize) -> usize {
 ///
 /// `seam` is what [`stitch_json_file_seams`] did to `bytes` ([`LineCounter::at_seam`], #4316).
 fn parse_error_line(bytes: &[u8], start: usize, seam: Seam, stream: bool) -> usize {
-    LineCounter::at_seam(bytes, seam).line_at_read_of(parse_error_detection(bytes, start, stream))
+    parse_error_line_after(bytes, start, seam, stream, 0)
+}
+
+/// [`parse_error_line`] for a window of a file with `lines_before` line breaks before it (#6920).
+fn parse_error_line_after(
+    bytes: &[u8],
+    start: usize,
+    seam: Seam,
+    stream: bool,
+    lines_before: usize,
+) -> usize {
+    let mut counter = LineCounter::at_seam(bytes, seam);
+    counter.set_lines_before(lines_before);
+    counter.line_at_read_of(parse_error_detection(bytes, start, stream))
 }
 
 /// The fault in the malformed value starting at `start`, as jq meets it
