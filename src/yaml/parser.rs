@@ -6622,7 +6622,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             return Err(self
                 .err_unexpected_char(self.pos + 1, "found character that cannot start any token"));
         }
-        self.parse_explicit_key(self.current_column())?;
+        // The one recursion from an explicit key back into one: charged like a flow collection is,
+        // or `? ? ? ...` (and `? ? - ` and `- ? `) grew the call stack with the input and aborted the
+        // process past a million indicators, after a quadratic parse (#6956). yq stops at 10,000.
+        self.enter_nested()?;
+        let result = self.parse_explicit_key(self.current_column());
+        self.nesting_depth -= 1;
+        result?;
         if let Some(owner_depth) = outer_owner_depth {
             self.wait_behind_pending_explicit_key(owner_depth, false);
         }

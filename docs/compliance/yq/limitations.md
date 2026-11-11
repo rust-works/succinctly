@@ -808,6 +808,15 @@ On the sequence `- a`, `- "bad\x"`, `- 3`, `- 4`, `.[:1]` is `["a"]` (`-o=json`)
 The structure of the sequence is still checked as before.
 The reasoning, the table and the pin are in [jq limitations § A slice of an array validates only the elements it keeps](../jq/limitations.md#a-slice-of-an-array-validates-only-the-elements-it-keeps-6231); the yq rows are in `tests/yq_cli/i6231.rs`.
 
+### Nested explicit keys past 128 levels are refused ([#6956](https://github.com/rust-works/succinctly/issues/6956))
+
+A run of explicit-key indicators (`? ? ? a`, `- ? - ? a`) is a key whose key is a key, and each level is a call of the parser.
+yq reads up to 10,000 levels and stops past them (`exceeded max depth of 10000`).
+This parser charged no depth for the recursion, so a few hundred thousand indicators aborted the process with a stack overflow.
+It charges the same limit as a flow collection now: past 128 levels the run stops with `nesting depth exceeds limit of 128` and exit status 1.
+That is rule 4(c) of the divergence rule, where matching yq would take the host process down.
+A document with 129 to 10,000 nested explicit keys is read by yq and refused here; no real document has them.
+
 ### An explicit `?` key next to a block sequence — rejected when the key has content (#1104), the bare `?` shape is the key (#6370)
 
 Real yq reads a block sequence at a mapping's indent as the implicit value of an ordinary
