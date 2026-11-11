@@ -44041,7 +44041,7 @@ fn standard_json_slice_len<W: Clone + AsRef<[u64]>>(target: &StandardJson<'_, W>
     match target {
         StandardJson::Array(elements) => array_index::len_checked_memoized(elements).ok(),
         StandardJson::String(s) => s.as_str().ok().map(|text| text.chars().count()),
-        _ => None,
+        _ => None, // patchcov: coverage tolerate-line reason="unreachable: only an array or a string target asks for the length, because a bound keeps its double in jq mode only, where the target's kind is ruled on first; yq resolves every kind as sliceable but refuses a fractional bound before it gets here"
     }
 }
 
@@ -44050,7 +44050,7 @@ pub(crate) fn owned_slice_len(target: &OwnedValue) -> Option<usize> {
     match target {
         OwnedValue::Array(items) => Some(items.len()),
         OwnedValue::String(s) => Some(s.chars().count()),
-        _ => None,
+        _ => None, // patchcov: coverage tolerate-line reason="unreachable: same as standard_json_slice_len, an owned target that is neither array nor string never asks for a length"
     }
 }
 
@@ -85848,13 +85848,10 @@ fn fused_slice_index_branch<'a, S: EvalSemantics>(
         resolve_navigable_slice_bounds::<S>(SliceTargetKind::Sliceable, &s.bound, &e.bound).ok()?;
     // #6984: the position reads the bounds folded against the length, as `parse_slice` does; the
     // component keeps the rounded integers and the bounds' own spelling.
-    let (folded_start, folded_end) = resolve_computed_slice_bounds_for::<S>(
-        SliceTargetKind::Sliceable,
-        &s.bound,
-        &e.bound,
-        || Some(items.len()),
-    )
-    .ok()?;
+    // Both bounds are `Ok` here, or the resolve above would have declined.
+    let given = |bound: &ComputedSliceBound| bound.as_ref().ok().copied().flatten();
+    let (folded_start, folded_end) =
+        fold_bounds(given(&s.bound), given(&e.bound), || Some(items.len()));
     let value = match fused_slice_index_position(folded_start, folded_end, items.len(), *idx) {
         Some(position) => match &branch.value {
             // Borrowed from the document at its own lifetime, not cloned out of it.

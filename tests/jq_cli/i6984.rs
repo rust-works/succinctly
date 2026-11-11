@@ -136,3 +136,25 @@ fn a_negative_fractional_slice_bound_is_added_to_the_length_before_it_is_rounded
     }
     Ok(())
 }
+
+/// The bridge routes (`--slurp`, `-n`) slice an owned target rather than a cursor into the document.
+#[test]
+fn the_owned_slice_routes_fold_the_bound_too_6984() -> Result<()> {
+    let rows: &[(&[&str], Option<&str>, &str)] = &[
+        (
+            &["-c", "--slurp", ".[0] as $n | [[1,2,3,4,5], \"abcde\"] | [.[0][$n:], .[1][$n:], .[0][:$n], .[1][:$n]]"],
+            Some("-1e-66"),
+            "[[],\"\",[1,2,3,4,5],\"abcde\"]\n",
+        ),
+        (
+            &["-nc", "(-1.0000000000000002) as $n | [[1,2,3,4,5], \"abcde\"] | [.[0][$n:], .[1][$n:], .[0][:$n], .[1][:$n]]"],
+            None,
+            "[[5],\"e\",[1,2,3,4],\"abcd\"]\n",
+        ),
+    ];
+    for &(args, input, want) in rows {
+        let (stdout, stderr, code) = run_jq_full(args, input)?;
+        assert_eq!((stdout.as_str(), code), (want, 0), "{args:?}: {stderr}");
+    }
+    Ok(())
+}
