@@ -45,9 +45,8 @@ fn same_as_stdin(bytes: &[u8], args: &[&str]) -> Result<(String, String, i32)> {
     let (stdin, stdin_status) = spawn_jq(args, Some(bytes))?;
     let file_err = String::from_utf8_lossy(&file.stderr).replace(&name, "<stdin>");
     let stdin_err = String::from_utf8_lossy(&stdin.stderr).into_owned();
-    assert_eq!(
+    assert!(
         file.stdout == stdin.stdout,
-        true,
         "{args:?}: stdout differs ({} and {} bytes)",
         file.stdout.len(),
         stdin.stdout.len()
@@ -168,7 +167,7 @@ fn a_bom_and_bytes_that_are_not_utf8_read_as_they_do_whole_6920() -> Result<()> 
             .windows(format!("\"user {line}\"").len())
             .position(|w| w == format!("\"user {line}\"").as_bytes())
             .unwrap();
-        let mut patched = bytes[..at + 1].to_vec();
+        let mut patched = bytes[..=at].to_vec();
         patched.extend_from_slice(patch);
         patched.extend_from_slice(&bytes[at + 1..]);
         bytes = patched;
