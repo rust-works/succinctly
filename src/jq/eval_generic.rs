@@ -3318,6 +3318,19 @@ impl NodeMeta {
         }
     }
 
+    /// This node's own metadata without the `&anchor` it declares, everything else (comment,
+    /// style, head/foot comments, an `*alias` mark) kept as-is: yq's merge copies the left
+    /// container, which is no longer the node the anchor named (#6900).
+    pub fn without_declared_anchor(&self) -> Self {
+        match self.anchor {
+            Some(AnchorMark::Declares(_)) => Self {
+                anchor: None,
+                ..self.clone()
+            },
+            _ => self.clone(),
+        }
+    }
+
     /// This node's own metadata with `style` replaced, everything else
     /// (comment, anchor, head/foot comments) kept as-is. Used by issue
     /// #705's `-P` gate (`yq_runner.rs`'s `strip_presentation_style_at_depth`)
