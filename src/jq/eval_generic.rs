@@ -10434,6 +10434,10 @@ pub(crate) fn resolve_path_context_at<S: EvalSemantics>(
 pub(crate) struct NodeOrigin {
     pub(crate) file: usize,
     pub(crate) document: Option<usize>,
+    /// The document number for a node that has no cursor of its own (#6950): what a write left
+    /// of the document, or an absent key. Read only after `document` and the node's cursor, so
+    /// a node a cursor still places (a `load()`ed one) keeps its own number.
+    pub(crate) document_fallback: Option<usize>,
     /// The document was decoded from JSON, so `line` and `column` answer `0`
     /// as in yq (#4544) rather than reading the position of the bridge text
     /// `--eval-all` reindexes it into.
@@ -10530,7 +10534,7 @@ pub(crate) type NodeOriginGuard = node_origin::Guard;
 pub(crate) fn enter_document_in_origin(document: usize) -> Option<NodeOriginGuard> {
     let origin = node_origin::current()?;
     Some(enter_node_origin(NodeOrigin {
-        document: Some(document),
+        document_fallback: Some(document),
         ..origin
     }))
 }
@@ -10548,6 +10552,13 @@ fn ambient_json_sourced() -> bool {
 /// installed at a time.
 pub(crate) fn ambient_file_index() -> Option<i64> {
     node_origin::current().and_then(|o| i64::try_from(o.file).ok())
+}
+
+/// `document_index` for a node with no cursor: the number [`enter_document_in_origin`] left (#6950).
+pub(crate) fn ambient_document_fallback() -> Option<i64> {
+    node_origin::current()
+        .and_then(|o| o.document_fallback)
+        .and_then(|d| i64::try_from(d).ok())
 }
 
 /// `document_index` from the ambient node origin, if one is installed and
@@ -37451,8 +37462,12 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
             // `--eval-all` reindexes each input document into its own
             // throwaway single-document JSON index, whose own
             // `document_index()` is 0 for every one of them.
-            let doc_index = ambient_document_index()
-                .unwrap_or_else(|| cursor.and_then(|c| c.document_index()).unwrap_or(0) as i64);
+            let doc_index = ambient_document_index().unwrap_or_else(|| {
+                cursor
+                    .and_then(|c| c.document_index().map(|d| d as i64))
+                    .or_else(ambient_document_fallback)
+                    .unwrap_or(0)
+            });
             GenericResult::Owned(OwnedValue::Int(doc_index))
         }
 

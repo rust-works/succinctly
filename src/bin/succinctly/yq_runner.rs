@@ -8113,9 +8113,15 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
 ) -> Result<Vec<ResultWithComments>> {
     // #6950: a write materializes the document, and the cursor that answers `document_index` is
     // gone with it; yq stamps the number on the node, so it is carried as the ambient origin's.
-    let _document_scope = cursor
-        .document_index()
-        .and_then(jq::enter_document_index_scope);
+    // Only a filter that reads it pays for the number: finding it builds the stream's table of
+    // document starts (#4871), which a plain read of a large stream otherwise never needs.
+    let _document_scope = jq::walk::contains_builtin(expr, |b| matches!(b, Builtin::DocumentIndex))
+        .then(|| {
+            cursor
+                .document_index()
+                .and_then(jq::enter_document_index_scope)
+        })
+        .flatten();
     evaluate_yaml_cursor_in_document(cursor, expr, sink, need_comments, strip_style, sort_keys)
 }
 

@@ -92,3 +92,41 @@ fn a_json_stream_keeps_its_document_numbers_through_a_write_6950() -> Result<()>
     assert_eq!(stdout, "0\n1\n");
     Ok(())
 }
+
+/// `--doc N` selects by the stream's global number; the node it reads keeps the number it has in
+/// its file, which is the same here.
+#[test]
+fn doc_selects_by_the_global_number_and_a_write_keeps_it_6950() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(".x = 5 | document_index", STREAM, &["--doc", "1"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "1\n");
+    Ok(())
+}
+
+/// `-i` rewrites each document in place, and a filter after the write still finds the second one.
+#[test]
+fn inplace_keeps_the_document_number_through_a_write_6950() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    write!(file, "x: 1\n---\nx: 2\n")?;
+    let (_, stderr, code) = run_yq_files(
+        ".x = 9 | select(document_index == 1) | .z = 3",
+        &[file.path()],
+        &["-i"],
+    )?;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(std::fs::read_to_string(file.path())?, "x: 9\nz: 3\n");
+    Ok(())
+}
+
+/// Where succinctly answers differently from yq (`0`), recorded in
+/// `docs/compliance/yq/limitations.md`: a node the filter builds, and a `load()`ed one, answer
+/// the document being evaluated.
+#[test]
+fn a_built_node_answers_the_document_being_evaluated_6950() -> Result<()> {
+    for filter in ["[.x] | document_index", "\"s\" | document_index"] {
+        let (stdout, code) = run_yq_stdin(filter, STREAM, &["-o=json", "-I0"])?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(stdout, "0\n1\n", "{filter}");
+    }
+    Ok(())
+}
