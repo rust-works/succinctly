@@ -7663,7 +7663,7 @@ When an update (`|=`, `map_values`) fails on several nodes, yq reports the last 
 
 `-o=props`, `-o=shell`, `-o=csv`, `-o=tsv`, `-o=base64` and `-o=uri` (and the short names `p`, `s`, `c`, `t`) run the filter and write each result through that format's encoder, with no `---` between documents.
 `--shell-key-separator`, `--properties-separator`, `--properties-array-brackets` and `--csv-separator` are read (#6922); `--csv-separator` takes one ASCII byte (yq's `char` takes any single byte, so a lone byte above 0x7f, which cannot be an argument here, is refused), and `-o=tsv` ignores it, as yq does.
-The `@props` / `to_props` and `@csv` / `to_csv` operators read the same flags, as in yq, except in the text an `eval` reads: `eval(".x | @csv")` writes `,` under `--csv-separator=';'`, where yq writes `;` (#6922).
+The `@props` / `to_props` and `@csv` / `to_csv` operators read the same flags, as in yq, wherever they are parsed (the program, the text an `eval` reads, a `--split-exp` expression), and so does `format("csv")` under `--jq-extensions` (#6922).
 `-o=lua` is read as well, with `--lua-prefix`, `--lua-suffix`, `--lua-globals` and `--lua-unquoted` (#6924); where it differs from yq is in its own section below.
 `-o=ini` is read as well (#6924), as yq's go-ini encoder writes it: it agrees with yq v4.53.3 on 3,200 random JSON documents and on YAML input except for a null written `~` (see the list below).
 `-o=toml` is read as well (#6924); where it differs from yq is in its own section below.
