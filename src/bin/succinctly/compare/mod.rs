@@ -852,14 +852,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
                 .as_deref()
                 .filter(|_| input.map_or(true, |i| i.tier == "1mb"));
             let row = perf::run_row_with(&tools, query, *input, &inputs_dir, n, counted)?;
-            // A row of the 1 GB tier where a tool was killed or hit the deadline is a divergence
-            // only when it is succinctly that did not finish and the reference did (an
-            // out-of-memory kill of jq says nothing about succinctly).
-            let subject_failed_alone = row.gate == perf::Gate::Incomplete
-                && row.tools.len() > 1
-                && row.tools[0].end.as_ref().is_some_and(|e| e.killed())
-                && row.tools[1].end.as_ref().is_some_and(|e| !e.killed());
-            if row.gate == perf::Gate::Differs || subject_failed_alone {
+            if row.gate == perf::Gate::Differs || row.subject_unfinished_alone() {
                 observed.insert(format!("perf:{}@{}", row.query, row.input));
             }
             if row.tier == perf::HUGE_TIER {

@@ -10,9 +10,9 @@
 //! the mapped executable, so a 24 MiB binary reads several MiB above a 2.5 MiB one
 //! with the same heap (#5578). Private memory (anonymous pages only) is read beside it.
 
-use super::exec::{exec_within, PERF_DEADLINE};
+use super::exec::{exec_digest, signal_of, ExecDigest, PERF_DEADLINE};
 use super::harness::{stats, Stats, Tool};
-use super::manifest::sha256_hex;
+use super::manifest::{sha256_file, sha256_hex};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
@@ -283,7 +283,7 @@ pub fn ensure_input(
             bail!("generating {} failed", spec.id);
         }
     }
-    let got = sha256_hex(&std::fs::read(&path)?);
+    let got = sha256_file(&path)?;
     if got != spec.sha256 {
         bail!(
             "{} has sha256 {got}, the manifest pins {} ({}; \
@@ -327,11 +327,19 @@ pub struct RunEnd {
 }
 
 impl RunEnd {
-    fn of(e: &super::exec::Exec) -> Self {
+    fn of(e: &ExecDigest) -> Self {
         RunEnd {
             exit: e.exit,
             signal: e.signal,
             timed_out: e.timed_out,
+        }
+    }
+
+    fn of_status(status: &std::process::ExitStatus) -> Self {
+        RunEnd {
+            exit: status.code(),
+            signal: signal_of(status),
+            timed_out: false,
         }
     }
 
@@ -396,6 +404,18 @@ pub struct PerfRow {
     /// peak memory as a multiple of the input (#6915).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_bytes: Option<u64>,
+}
+
+impl PerfRow {
+    /// A row where succinctly was killed or hit the deadline and the reference finished: unlike
+    /// an out-of-memory kill of jq, it says something about succinctly, so it is a divergence
+    /// like an output difference (#6915). One definition, for the run's verdict and the report.
+    pub fn subject_unfinished_alone(&self) -> bool {
+        self.gate == Gate::Incomplete
+            && self.tools.len() > 1
+            && self.tools[0].end.as_ref().is_some_and(RunEnd::killed)
+            && self.tools[1].end.as_ref().is_some_and(|e| !e.killed())
+    }
 }
 
 /// The command line of one run: the flags, the filter, then the input file. `@INPUT@` in
@@ -467,6 +487,17 @@ fn with_feed<T>(child: &mut Child, feed: Option<&[u8]>, f: impl FnOnce(&mut Chil
 }
 
 fn time_once(tool: &Tool, args: &[String], cwd: &Path, feed: Option<&[u8]>) -> Result<f64> {
+    time_once_ended(tool, args, cwd, feed).map(|(ms, _)| ms)
+}
+
+/// [`time_once`], also how the run ended: on a 1 GB row a tool the memory pressure of a later
+/// repetition kills must not leave a truncated time that reads as a sample (#6915).
+fn time_once_ended(
+    tool: &Tool,
+    args: &[String],
+    cwd: &Path,
+    feed: Option<&[u8]>,
+) -> Result<(f64, Option<RunEnd>)> {
     let start = Instant::now();
     let mut child = configure(&mut Command::new(&tool.program), tool, args, cwd)
         .stdin(stdin_for(feed))
@@ -476,8 +507,7 @@ fn time_once(tool: &Tool, args: &[String], cwd: &Path, feed: Option<&[u8]>) -> R
         .with_context(|| format!("spawning {}", tool.name))?;
     let status = with_feed(&mut child, feed, Child::wait);
     let ms = start.elapsed().as_secs_f64() * 1e3;
-    let _ = status;
-    Ok(ms)
+    Ok((ms, status.ok().as_ref().map(RunEnd::of_status)))
 }
 
 /// Peak resident set size in KiB from `/usr/bin/time`'s report (`-l` on macOS, `-v` on Linux).
@@ -746,7 +776,7 @@ fn ir_once(
 }
 
 /// A tool's entry on a row that was not timed: how its gate run ended and the peak memory of one
-/// untimed run (#6915).
+/// untimed run, none for a tool that ran past the deadline (#6915).
 fn untimed_result(
     tool: &Tool,
     args: &[String],
@@ -754,7 +784,15 @@ fn untimed_result(
     feed: Option<&[u8]>,
     end: &RunEnd,
 ) -> ToolResult {
-    let mem = mem_once(tool, args, cwd, feed);
+    // A tool that ran past the deadline is not run again, unbounded, for its memory.
+    let mem = if end.timed_out {
+        MemSample {
+            rss_kb: None,
+            private_kb: None,
+        }
+    } else {
+        mem_once(tool, args, cwd, feed)
+    };
     ToolResult {
         tool: tool.name.clone(),
         stats: None,
@@ -835,14 +873,14 @@ fn run_row_bounded(
         _ => None,
     };
     let feed = fed.as_deref();
-    // The opt-in 1 GB tier records how each tool ended and times one run where a smaller tier
-    // times several (#6915).
+    // The opt-in 1 GB tier records how each tool ended and checks that every timed run ended the
+    // same way (#6915).
     let huge = input.is_some_and(|i| i.tier == HUGE_TIER);
     // Output-identity gate: hash each tool's stdout, compare with its exit status.
     let mut digest = vec![];
-    let mut ends = vec![];
+    let mut ends: Vec<RunEnd> = vec![];
     for t in tools {
-        let e = exec_within(t, &args, feed.unwrap_or_default(), inputs_dir, deadline)?;
+        let e = exec_digest(t, &args, feed.unwrap_or_default(), inputs_dir, deadline)?;
         // Past the deadline a smaller row has nothing to say and aborts the run; a 1 GB row is
         // the one where a slow tool is the finding, so it is recorded.
         if e.timed_out && !huge {
@@ -855,7 +893,7 @@ fn run_row_bounded(
             );
         }
         ends.push(RunEnd::of(&e));
-        digest.push((e.exit, sha256_hex(&e.stdout)));
+        digest.push((e.exit, e.stdout_sha256));
     }
     let gate_of = |i: usize| {
         if huge && (ends[0].killed() || ends[i].killed()) {
@@ -892,8 +930,6 @@ fn run_row_bounded(
             .and_then(|f| std::fs::metadata(inputs_dir.join(f)).ok())
             .map(|m| m.len());
     }
-    // How many untimed runs each memory figure is the median of.
-    let mem_runs = if huge { 1 } else { 3 };
     if gate == Gate::Incomplete || (huge && gate == Gate::Differs) {
         // No timing either way, but on a 1 GB row what each tool did is the finding: the peak
         // memory a killed tool reached, or the exit status of one that refused (#6915).
@@ -906,6 +942,14 @@ fn run_row_bounded(
     if gate == Gate::Differs || reps == 0 {
         return Ok(row);
     }
+    // A secondary reference that did not finish the gate run is not run three more times: it
+    // gets an untimed entry after the timed ones, and `gate_secondary` says why it has no ratio.
+    let all_tools = tools;
+    let tools = if huge && gate_secondary == Some(Gate::Incomplete) {
+        &tools[..2]
+    } else {
+        tools
+    };
     let mut samples: Vec<Vec<f64>> = vec![vec![]; tools.len()];
     // One untimed warm-up of each, then rotate the starting tool every repetition. A 1 GB row's
     // gate run has read the file into the page cache already, and a second run of a tool that
@@ -917,19 +961,36 @@ fn run_row_bounded(
     }
     let mut rep = 0;
     let mut total = reps;
-    while rep < total {
+    // A 1 GB run that ends differently from the gate's (a kill under memory pressure that the
+    // gate run did not meet) voids the row's timings.
+    let mut drifted = false;
+    'reps: while rep < total {
         for k in 0..tools.len() {
             let i = (rep + k) % tools.len();
-            samples[i].push(time_once(&tools[i], &args, inputs_dir, feed)?);
+            let (ms, end) = time_once_ended(&tools[i], &args, inputs_dir, feed)?;
+            if let Some(e) = end.filter(|e| huge && *e != ends[i]) {
+                ends[i] = e;
+                drifted = true;
+                break 'reps;
+            }
+            samples[i].push(ms);
         }
         rep += 1;
         if rep == reps {
             total += extra_reps_over(&samples, reps, slow_ms);
         }
     }
+    if drifted {
+        row.gate = Gate::Incomplete;
+        for (i, t) in all_tools.iter().enumerate() {
+            row.tools
+                .push(untimed_result(t, &args, inputs_dir, feed, &ends[i]));
+        }
+        return Ok(row);
+    }
     row.reps = total;
     for (i, t) in tools.iter().enumerate() {
-        let mem: Vec<MemSample> = (0..mem_runs)
+        let mem: Vec<MemSample> = (0..3)
             .map(|_| mem_once(t, &args, inputs_dir, feed))
             .collect();
         let rss = median_u64(mem.iter().filter_map(|m| m.rss_kb).collect());
@@ -971,6 +1032,15 @@ fn run_row_bounded(
         (Some(s), Some(r)) if r > 0 => Some(s as f64 / r as f64),
         _ => None,
     };
+    if all_tools.len() > tools.len() {
+        row.tools.push(untimed_result(
+            &all_tools[2],
+            &args,
+            inputs_dir,
+            feed,
+            &ends[2],
+        ));
+    }
     row.rss_ratio_primary = ratio(row.tools[0].peak_rss_kb, row.tools[1].peak_rss_kb);
     row.private_ratio_primary = ratio(row.tools[0].private_kb, row.tools[1].private_kb);
     row.ir_ratio_primary = ratio(row.tools[0].instructions, row.tools[1].instructions);
@@ -1798,6 +1868,123 @@ mod tests {
             .map(|t| t.end.as_ref().unwrap().exit)
             .collect();
         assert_eq!(exits, [Some(5), Some(0)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A tool the gate run saw finish, but that is killed in a later timed repetition, voids the
+    /// row: a truncated run must not enter the samples as a time (#6915).
+    #[cfg(unix)]
+    #[test]
+    fn a_tool_killed_in_a_timed_repetition_of_a_huge_row_makes_it_incomplete() {
+        let (dir, q, input) = huge_setup("huge-drift");
+        // The gate run is call 0; the third call onwards is killed.
+        let flaky = sh(
+            "flaky",
+            "n=$(cat count 2>/dev/null || echo 0); echo $((n+1)) > count; [ \"$n\" -ge 2 ] && kill -9 $$; echo ok",
+        );
+        let row = run_row_over(
+            &[flaky, sh("ref", "echo ok")],
+            &q,
+            Some(&input),
+            &dir,
+            3,
+            None,
+            f64::MAX,
+        )
+        .unwrap();
+        assert_eq!(row.gate, Gate::Incomplete);
+        assert!(row.speedup_primary.is_none() && row.tools.iter().all(|t| t.stats.is_none()));
+        assert_eq!(row.tools[0].end.as_ref().unwrap().signal, Some(9));
+        assert!(row.subject_unfinished_alone());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A secondary reference killed at the gate is not timed three more times, and the row keeps
+    /// its primary comparison; it is listed untimed with its signal.
+    #[cfg(unix)]
+    #[test]
+    fn a_secondary_killed_on_a_huge_row_is_listed_untimed_and_the_primary_row_still_times() {
+        let (dir, q, input) = huge_setup("huge-secondary");
+        let (a, b) = (sh("sub", "echo ok"), sh("ref", "echo ok"));
+        let row = run_row_over(
+            &[a, b, sh("sec", "kill -9 $$")],
+            &q,
+            Some(&input),
+            &dir,
+            3,
+            None,
+            f64::MAX,
+        )
+        .unwrap();
+        assert_eq!(
+            (row.gate, row.gate_secondary),
+            (Gate::Match, Some(Gate::Incomplete))
+        );
+        assert!(row.speedup_primary.is_some() && row.speedup_secondary.is_none());
+        assert_eq!(row.tools.len(), 3);
+        assert!(row.tools[0].stats.is_some() && row.tools[1].stats.is_some());
+        assert!(row.tools[2].stats.is_none());
+        assert_eq!(row.tools[2].end.as_ref().unwrap().signal, Some(9));
+        assert!(
+            !row.subject_unfinished_alone(),
+            "the row itself is complete"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A subject that did not finish is a divergence only when the reference did.
+    #[test]
+    fn only_a_subject_that_alone_did_not_finish_is_a_divergence() {
+        let end = |exit, signal| {
+            Some(RunEnd {
+                exit,
+                signal,
+                timed_out: false,
+            })
+        };
+        let tool = |end| ToolResult {
+            tool: "t".into(),
+            stats: None,
+            cv_pct: None,
+            peak_rss_kb: None,
+            private_kb: None,
+            instructions: None,
+            end,
+        };
+        let row = |s, r| PerfRow {
+            query: "q".into(),
+            input: "i".into(),
+            tier: "1gb".into(),
+            gate: Gate::Incomplete,
+            gate_secondary: None,
+            tools: vec![tool(s), tool(r)],
+            reps: 0,
+            speedup_primary: None,
+            ratio_from_min: false,
+            speedup_secondary: None,
+            secondary_over_primary: None,
+            rss_ratio_primary: None,
+            private_ratio_primary: None,
+            ir_ratio_primary: None,
+            noisy: false,
+            input_bytes: None,
+        };
+        assert!(row(end(None, Some(9)), end(Some(0), None)).subject_unfinished_alone());
+        assert!(!row(end(Some(0), None), end(None, Some(9))).subject_unfinished_alone());
+        assert!(!row(end(None, Some(9)), end(None, Some(9))).subject_unfinished_alone());
+        let mut complete = row(end(Some(0), None), end(Some(0), None));
+        complete.gate = Gate::Match;
+        assert!(!complete.subject_unfinished_alone());
+    }
+
+    /// An input is hashed in pieces, and the hash is the one of the whole file.
+    #[test]
+    fn a_file_hashed_in_pieces_has_the_hash_of_its_bytes() {
+        let dir = scratch("sha-file");
+        let bytes: Vec<u8> = (0..3_000_017u32).map(|i| (i % 253) as u8).collect();
+        std::fs::write(dir.join("f"), &bytes).unwrap();
+        assert_eq!(sha256_file(&dir.join("f")).unwrap(), sha256_hex(&bytes));
+        assert!(sha256_file(&dir.join("absent")).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

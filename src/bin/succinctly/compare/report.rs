@@ -640,12 +640,12 @@ fn perf_sections(s: &mut String, r: &Results) {
         .iter()
         .chain(&r.perf_stdin)
         .chain(&r.perf_huge)
-        .filter(|x| x.gate == Gate::Differs)
+        .filter(|x| x.gate == Gate::Differs || x.subject_unfinished_alone())
         .collect();
     if !wrong.is_empty() {
         let _ = writeln!(
             s,
-            "**Correctness rows (output differs from the primary reference; untimed):**\n"
+            "**Correctness rows (output differs from the primary reference, or succinctly was killed or timed out where the reference finished; untimed):**\n"
         );
         for x in &wrong {
             let _ = writeln!(
@@ -760,13 +760,11 @@ fn huge_section(s: &mut String, file_rows: &[PerfRow], rows: &[PerfRow]) {
          that is a ratio at 100 MB can be pass/fail here. These rows are the streaming and early-exit \
          queries (and `identity`), run on generated inputs of about 1 GB with a fixed seed, and are kept \
          out of every figure above. Each tool is timed {} times, interleaved (its first, gating \
-         run is the warm-up), with one untimed run for memory, so a time here is a median of {} \
-         and a memory figure a single run. A tool that is killed by a signal or runs past the \
+         run is the warm-up), and its memory is the median of three untimed runs, as above. A tool that is killed by a signal or runs past the \
          {} s deadline has no time: its exit status or signal and the peak memory it reached are \
-         the result. `RSS ÷ input` is peak RSS over the input file's size; private memory is read as \
+         the result, from one untimed run (none for a tool past the deadline). `RSS ÷ input` is peak RSS over the input file's size; private memory is read as \
          in the table above. The 100 MB columns are the same query on the 100 MB input of the same \
          shape, from this run when it has one.\n",
-        perf::HUGE_REPS,
         perf::HUGE_REPS,
         super::exec::PERF_DEADLINE.as_secs()
     );
@@ -788,10 +786,11 @@ fn huge_section(s: &mut String, file_rows: &[PerfRow], rows: &[PerfRow]) {
                     .iter()
                     .find(|f| f.query == x.query && f.input == id)
             });
-        let outcome = match x.gate {
-            Gate::Match => "match",
-            Gate::Differs => "output differs",
-            Gate::Incomplete => "incomplete",
+        let outcome = match (x.gate, x.gate_secondary) {
+            (Gate::Match, Some(Gate::Incomplete)) => "match (jq 1.8.2 incomplete)",
+            (Gate::Match, _) => "match",
+            (Gate::Differs, _) => "output differs",
+            (Gate::Incomplete, _) => "incomplete",
         };
         let _ = writeln!(
             s,
