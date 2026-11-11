@@ -594,6 +594,18 @@ pub(crate) enum EmptyOperandOp {
 ///    read produces zero outputs *before* reaching this table, and a
 ///    comparison operand -- which is not read-only -- still sees the real
 ///    `null` node.
+/// Whether yq never evaluates the right operand of `op` when its left operand produced nothing
+/// (#6982): `-`, `*` (every merge-flag form), `/` and `%`, the operators [`yq_empty_operand_output`]
+/// answers with nothing whatever the other operand is. So an erroring right side is silent there
+/// (`.[] * error("x")` on `[]` prints nothing in yq v4.53.3), where `+` and the comparisons, which
+/// answer from the other operand's value, evaluate it (`.[] + error("x")` raises in yq too).
+pub(crate) fn yq_empty_left_skips_right(op: EmptyOperandOp) -> bool {
+    matches!(
+        op,
+        EmptyOperandOp::Arith(ArithOp::Sub | ArithOp::Mul(_) | ArithOp::Div | ArithOp::Mod)
+    )
+}
+
 pub(crate) fn yq_empty_operand_output(
     op: EmptyOperandOp,
     other: Option<&OwnedValue>,
@@ -17054,7 +17066,11 @@ fn binary_fanout_each_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #2460 (yq mode only): the *outer* operand produced nothing, so the
         // loop above never ran and the inner one was never evaluated at all.
         // Drive it once here and answer each of its outputs from the same
-        // table -- and, if it is empty too, answer the both-empty row once.
+        // table -- and, if it is empty too, answer the both-empty row once. Unless the table
+        // answers nothing for every value, when yq never evaluates it (#6982).
+        if rules.left_major && yq_empty_left_skips_right(op) {
+            return Flow::Exhausted;
+        }
         return empty_outer_operand_pass::<_, S>(&each_operand, inner_expr, op, sink);
     }
     abort.unwrap_or(outer)
@@ -136357,6 +136373,39 @@ mod tests {
         // are describing.
         assert_eq!(jq.empty.is_some(), jq.left_major);
         assert_eq!(yq.empty.is_some(), yq.left_major);
+    }
+
+    /// #6982: the right operand is skipped exactly where the empty-operand table answers nothing
+    /// whatever the right side holds, so skipping it can change nothing but an error it would
+    /// raise. One table, one predicate, checked against each other here.
+    #[test]
+    fn empty_left_skips_right_exactly_where_the_table_answers_nothing_6982() {
+        let ops = [
+            EmptyOperandOp::Arith(ArithOp::Add),
+            EmptyOperandOp::Arith(ArithOp::Sub),
+            EmptyOperandOp::Arith(ArithOp::Mul(MergeFlags::default())),
+            EmptyOperandOp::Arith(ArithOp::Div),
+            EmptyOperandOp::Arith(ArithOp::Mod),
+            EmptyOperandOp::Compare(CompareOp::Eq),
+            EmptyOperandOp::Compare(CompareOp::Ne),
+            EmptyOperandOp::Compare(CompareOp::Lt),
+            EmptyOperandOp::Compare(CompareOp::Le),
+            EmptyOperandOp::Compare(CompareOp::Gt),
+            EmptyOperandOp::Compare(CompareOp::Ge),
+            EmptyOperandOp::Boolean,
+        ];
+        let others = [
+            None,
+            Some(OwnedValue::Null),
+            Some(OwnedValue::Int(1)),
+            Some(OwnedValue::from("a".to_string())),
+        ];
+        for op in ops {
+            let answers_nothing = others
+                .iter()
+                .all(|other| yq_empty_operand_output(op, other.as_ref()).is_none());
+            assert_eq!(yq_empty_left_skips_right(op), answers_nothing, "{op:?}");
+        }
     }
 
     /// #2374: the family's shared definition itself, pinned once rather
