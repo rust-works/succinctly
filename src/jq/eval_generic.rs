@@ -10573,6 +10573,10 @@ pub(crate) fn resolve_path_context_at<S: EvalSemantics>(
 pub(crate) struct NodeOrigin {
     pub(crate) file: usize,
     pub(crate) document: Option<usize>,
+    /// The document number for a node that has no cursor of its own (#6950): what a write left
+    /// of the document, or an absent key. Read only after `document` and the node's cursor, so
+    /// a node a cursor still places (a `load()`ed one) keeps its own number.
+    pub(crate) document_fallback: Option<usize>,
     /// The document was decoded from JSON, so `line` and `column` answer `0`
     /// as in yq (#4544) rather than reading the position of the bridge text
     /// `--eval-all` reindexes it into.
@@ -10655,6 +10659,25 @@ pub(crate) fn enter_node_origin(origin: NodeOrigin) -> NodeOriginGuard {
 /// The RAII guard [`enter_node_origin`] returns.
 pub(crate) type NodeOriginGuard = node_origin::Guard;
 
+/// Narrow the ambient node origin to document `document` of its file, until the returned guard is
+/// dropped (#6950).
+///
+/// The ordinary multi-file path installs one origin per *file*, with no document number, because
+/// the cursor of a document it reads answers `document_index` itself. A write or a computed value
+/// has no cursor, so `document_index` after one fell back to `0` for every document of a
+/// multi-document file, where yq stamps the number on the node when it decodes it. The caller
+/// that evaluates one document installs this around it.
+///
+/// `None` (and nothing installed) when no origin is ambient: a slurped run (`-s`) and the
+/// synthesized empty document have no file, and so no document of one either.
+pub(crate) fn enter_document_in_origin(document: usize) -> Option<NodeOriginGuard> {
+    let origin = node_origin::current()?;
+    Some(enter_node_origin(NodeOrigin {
+        document_fallback: Some(document),
+        ..origin
+    }))
+}
+
 /// Whether the ambient node origin is a document decoded from JSON (#4544).
 fn ambient_json_sourced() -> bool {
     node_origin::current().is_some_and(|origin| origin.json_sourced)
@@ -10668,6 +10691,13 @@ fn ambient_json_sourced() -> bool {
 /// installed at a time.
 pub(crate) fn ambient_file_index() -> Option<i64> {
     node_origin::current().and_then(|o| i64::try_from(o.file).ok())
+}
+
+/// `document_index` for a node with no cursor: the number [`enter_document_in_origin`] left (#6950).
+pub(crate) fn ambient_document_fallback() -> Option<i64> {
+    node_origin::current()
+        .and_then(|o| o.document_fallback)
+        .and_then(|d| i64::try_from(d).ok())
 }
 
 /// `document_index` from the ambient node origin, if one is installed and
@@ -37571,8 +37601,12 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
             // `--eval-all` reindexes each input document into its own
             // throwaway single-document JSON index, whose own
             // `document_index()` is 0 for every one of them.
-            let doc_index = ambient_document_index()
-                .unwrap_or_else(|| cursor.and_then(|c| c.document_index()).unwrap_or(0) as i64);
+            let doc_index = ambient_document_index().unwrap_or_else(|| {
+                cursor
+                    .and_then(|c| c.document_index().map(|d| d as i64))
+                    .or_else(ambient_document_fallback)
+                    .unwrap_or(0)
+            });
             GenericResult::Owned(OwnedValue::Int(doc_index))
         }
 

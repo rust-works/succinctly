@@ -1190,10 +1190,18 @@ filename]' f1.yaml`), where succinctly names the file being read, or `""` under 
 
 `file_index` has the same shape (`yq ea '1 | fileIndex'` is `0` for every file, succinctly's is the
 file's own). Closing it needs the per-node provenance the `---` section names, tracked on
-[#2427](https://github.com/rust-works/succinctly/issues/2427). A metadata assignment (`.x
+[#2427](https://github.com/rust-works/succinctly/issues/2427).
+A metadata assignment (`.x
 line_comment = filename`) is refused with the `document_index/file_index/filename` error rather
 than resolved once against the first document, so a multi-file run never stamps every file with
 the first one's name — yq answers each file's own name there.
+
+`document_index` follows the same rule since #6950, for a node that has no cursor of its own.
+It answers the document the evaluation is in.
+That is what a node a write produced keeps in yq (`.x = 5 | document_index` is `0` then `1` over a two-document file), and so does an absent key (`.zz | document_index`).
+It is not what a node the filter builds has: `[.x] | document_index`, `"s" | document_index`, `to_entries | .[0] | document_index` and `with_entries(.) | document_index` are `0` in yq, and the number of the document here.
+A `load()`ed document is the same gap from the other side: `load("f2.yaml") | document_index` is `0` in yq, and the number of the document being read here.
+A node a cursor still places keeps its own number.
 
 ### `. as $x | [$x]` under `--eval-all` collects one copy per document, not one per binding (#2427)
 

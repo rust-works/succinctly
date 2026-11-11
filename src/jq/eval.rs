@@ -45266,9 +45266,26 @@ pub fn enter_file_index_scope(file_index: usize) -> FileIndexScope {
             // The ordinary path's cursor answers `document_index` from the
             // YAML index itself, so only the file number is missing there.
             document: None,
+            document_fallback: None,
             json_sourced: false,
         },
     ))
+}
+
+/// Make `document_index`/`documentIndex`/`di` answer `document` for a node that has no cursor of
+/// its own, until the returned guard is dropped, keeping the file number the ambient scope already
+/// holds (#6950).
+///
+/// Real yq stamps the document number on each node as it decodes it, so the number survives a
+/// write; succinctly's owned values carry none, and the cursor that answers it is gone once a
+/// write has materialized the document. A node a cursor still places keeps the cursor's number.
+/// The yq CLI installs this around the evaluation of each document (`evaluate_yaml_cursor`) of a
+/// filter that reads `document_index`. `None` (nothing installed) where no file scope is ambient,
+/// as under `-s`, where there is one array and no document of a file, and for the synthesized
+/// empty document: the number stays `0` there, which is yq's answer for both.
+#[must_use = "the scope ends when the guard is dropped"]
+pub fn enter_document_index_scope(document: usize) -> Option<FileIndexScope> {
+    super::eval_generic::enter_document_in_origin(document).map(FileIndexScope)
 }
 
 /// Make `line`/`column` of a node read under `--eval-all` answer the position in the source text
@@ -45369,6 +45386,7 @@ pub fn eval_documents_together<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             origin: NodeOrigin {
                 file: *file,
                 document: Some(*document),
+                document_fallback: None,
                 json_sourced: *json_sourced,
             },
         })
@@ -112695,7 +112713,9 @@ fn builtin_document_index<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
     // and `--eval-all` installs an ambient node origin per input document
     // (#2427) because its throwaway per-document JSON indexes each answer 0.
     QueryResult::Owned(OwnedValue::Int(
-        super::eval_generic::ambient_document_index().unwrap_or(0),
+        super::eval_generic::ambient_document_index()
+            .or_else(super::eval_generic::ambient_document_fallback)
+            .unwrap_or(0),
     ))
 }
 
