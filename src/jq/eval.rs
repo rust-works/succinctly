@@ -9219,7 +9219,21 @@ fn ceil_positive_float_to_usize(f: f64) -> usize {
     f.ceil() as usize
 }
 
+/// How jq's `limit`/`nth` see a float count `f` against `0` (#6983): `$n > 0`, `$n == 0` and
+/// `$n < 0` are jq comparisons, and two number literals compare exactly as decimals
+/// ([`jq_numeric_cmp`]), so a literal too small for a double (`1e-1000`, `-1e-400`) is above or
+/// below `0` although its double is `±0.0`. Only that case reads the text; every other float
+/// answers by its double, NaN (neither above, below nor equal) included.
+fn float_count_against_zero(value: &OwnedValue, f: f64) -> Option<core::cmp::Ordering> {
+    if f == 0.0 && matches!(value, OwnedValue::NumberLiteral(..)) {
+        let zero = OwnedValue::NumberLiteral(NumberRepr::Int(0), "0".into());
+        return jq_numeric_cmp(value, &zero);
+    }
+    f.partial_cmp(&0.0)
+}
+
 pub(crate) fn classify_limit_n(n_value: OwnedValue) -> LimitN {
+    use core::cmp::Ordering;
     match n_value {
         OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _) if i >= 0 => {
             LimitN::Take(i as usize)
@@ -9234,13 +9248,14 @@ pub(crate) fn classify_limit_n(n_value: OwnedValue) -> LimitN {
         // branch as a negative `$n` (#1825 -- confirmed live against jq
         // 1.7.1: `limit(nan; 1,2,3)` passes everything through, same as
         // `limit(-1; 1,2,3)`).
+        // A literal too small for a double is not zero (#6983): `1e-1000` takes one output, as
+        // any count in `(0, 1]` does, and `-1e-400` is unlimited.
         OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => {
-            if f > 0.0 {
-                LimitN::Take(ceil_positive_float_to_usize(f))
-            } else if f == 0.0 {
-                LimitN::Take(0)
-            } else {
-                LimitN::Unlimited
+            match float_count_against_zero(&n_value, f) {
+                Some(Ordering::Greater) if f == 0.0 => LimitN::Take(1),
+                Some(Ordering::Greater) => LimitN::Take(ceil_positive_float_to_usize(f)),
+                Some(Ordering::Equal) => LimitN::Take(0),
+                _ => LimitN::Unlimited,
             }
         }
         // A string, array or object sorts above every number, so `$n > 0`
@@ -9284,7 +9299,11 @@ pub(crate) fn classify_nth_n(n_owned: OwnedValue) -> Result<usize, EvalError> {
             // elif $n == 0 ... else` falls to the unlimited-passthrough
             // `else` for a NaN `$n + 1`, so `last` never terminates and jq
             // raises before ever reaching that -- rejects it (#1825).
-            if f.is_nan() || f < 0.0 {
+            // A literal too small for a double is below `0` when it is negative (#6983):
+            // `nth(-1e-400; g)` raises in jq although its double is `-0.0`.
+            if f.is_nan()
+                || float_count_against_zero(&n_owned, f) == Some(core::cmp::Ordering::Less)
+            {
                 return Err(EvalError::new("nth doesn't support negative indices"));
             }
             // jq's `nth($n; g)` takes `ceil($n + 1)` outputs of `g` and
@@ -70722,9 +70741,19 @@ fn wrapped_marker(e: &Expr) -> Option<&Rc<Tracked>> {
 /// A `limit` count that is a literal number (#4514), as [`update_navigates_within`] reads one.
 fn limit_literal_count(n: &Expr) -> Option<f64> {
     match unwrap_paren(n) {
-        Expr::Literal(lit) => literal_to_owned(lit).as_f64(),
+        Expr::Literal(lit) => count_literal_number(lit),
         _ => None,
     }
+}
+
+/// A program literal's number for the count analyses ([`limit_literal_count`], [`constant_number`]), or
+/// `None` when its double does not stand for it: a non-zero literal too small for a double (`1e-1000`,
+/// `-1e-400`), which jq's `limit`/`nth` compare as a literal ([`float_count_against_zero`]) and these
+/// analyses would read as `0` (#6983). Their fast paths then decline, and [`classify_limit_n`] answers.
+fn count_literal_number(lit: &Literal) -> Option<f64> {
+    let value = literal_to_owned(lit);
+    let f = value.as_f64()?;
+    (float_count_against_zero(&value, f) == f.partial_cmp(&0.0)).then_some(f)
 }
 
 /// A number built from numeric literals under `+`, `-`, `*`, `/`, `%` and unary minus (`1 + 0`, `0 / 1`,
@@ -70738,7 +70767,7 @@ fn constant_number(e: &Expr) -> Option<f64> {
 /// [`constant_number`] with `dot` the number `.` holds, which a pipe's head sets for its tail.
 fn constant_number_at(e: &Expr, dot: Option<f64>) -> Option<f64> {
     match unwrap_paren(e) {
-        Expr::Literal(_) => limit_literal_count(e),
+        Expr::Literal(lit) => count_literal_number(lit),
         Expr::Identity => dot,
         Expr::Pipe(stages) => stages
             .iter()
@@ -167673,6 +167702,46 @@ mod tests {
         match classify_limit_n(n) {
             LimitN::Unlimited => {}
             other => panic!("expected LimitN::Unlimited, got {other:?}"),
+        }
+    }
+
+    /// #6983: a float literal whose double is `±0.0` is classified by its text, as jq's literal
+    /// comparisons read it, and the count analyses decline it rather than read it as `0`.
+    #[test]
+    fn a_count_literal_whose_double_is_zero_is_classified_by_its_text_6983() {
+        let literal =
+            |f: f64, text: &str| OwnedValue::NumberLiteral(NumberRepr::Float(f), text.into());
+        for (n, take) in [
+            (literal(0.0, "1e-1000"), Some(1)),
+            (literal(-0.0, "-1e-400"), None),
+            (literal(0.0, "0e5"), Some(0)),
+            (literal(-0.0, "-0.000e-3"), Some(0)),
+            (OwnedValue::Float(0.0), Some(0)),
+            (OwnedValue::Float(-0.0), Some(0)),
+        ] {
+            let got = match classify_limit_n(n.clone()) {
+                LimitN::Take(k) => Some(k),
+                LimitN::Unlimited => None,
+                LimitN::Raise(e) => panic!("{n:?}: unexpected raise {e:?}"),
+            };
+            assert_eq!(got, take, "{n:?}");
+        }
+        assert!(classify_nth_n(literal(-0.0, "-1e-400")).is_err());
+        assert_eq!(classify_nth_n(literal(0.0, "1e-1000")).ok(), Some(0));
+        assert_eq!(classify_nth_n(literal(-0.0, "-0e0")).ok(), Some(0));
+
+        for (text, folded) in [
+            ("1e-1000", None),
+            ("-1e-400", None),
+            ("0e5", Some(0.0)),
+            ("2", Some(2.0)),
+        ] {
+            let count = parse(&format!("limit({text}; 1)")).unwrap();
+            let Expr::Limit { n, .. } = count else {
+                panic!("{text}: not a limit: {count:?}");
+            };
+            assert_eq!(limit_literal_count(&n), folded, "{text}");
+            assert_eq!(constant_number(&n), folded, "{text}");
         }
     }
 
