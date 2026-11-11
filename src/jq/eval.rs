@@ -258,12 +258,15 @@ pub trait EvalSemantics: Copy + Default {
     /// but it agrees with `S = JqSemantics`'s value here by construction
     /// (jq-only binary, jq-only behavior).
     ///
-    /// If false (yq), plain `String::from_utf8_lossy` (WHATWG's rule, one
-    /// U+FFFD per byte) is used instead -- yq has no oracle-matching rule
-    /// to switch to here: real yq (backed by Go) passes invalid-UTF-8
-    /// bytes through unchanged, which Rust's `String` cannot represent at
-    /// all, so this is the closest available approximation, not a verified
-    /// oracle match.
+    /// If false (yq), each byte that is not part of a valid sequence becomes
+    /// one U+FFFD (`substitute_invalid_utf8_per_byte`, Go's count, #7000).
+    /// Real yq keeps the invalid bytes as they are, which Rust's `String`
+    /// cannot hold, and its JSON encoder then writes one U+FFFD per such
+    /// byte (`encoding/json`), so `-o json` agrees: `"4oI=" | @base64d`
+    /// (`e2 82`) is two U+FFFD in both, where `String::from_utf8_lossy`
+    /// (the WHATWG maximal-subpart rule this used before) wrote one. A
+    /// byte count (`length`) and YAML output, where yq prints the raw
+    /// bytes, still differ.
     ///
     /// `substitute_invalid_utf8_jq_style` also matches jq's separate
     /// end-of-buffer drop quirk (#1717) at this function's own granularity
@@ -25917,7 +25920,11 @@ fn owned_string_from_decoded_bytes<S: EvalSemantics>(bytes: Vec<u8>) -> String {
         if S::UTF8_LOSSY_USES_JQ_MAXIMAL_SUBPART_RULE {
             crate::text::utf8::substitute_invalid_utf8_jq_style(e.as_bytes())
         } else {
-            String::from_utf8_lossy(e.as_bytes()).into_owned()
+            // The substituted bytes are valid UTF-8, so this never falls back.
+            String::from_utf8(crate::text::utf8::substitute_invalid_utf8_per_byte(
+                e.as_bytes(),
+            ))
+            .unwrap_or_default()
         }
     })
 }
@@ -142892,6 +142899,13 @@ mod tests {
         yq_query!(br#""4ICA""#, "@base64d",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "\u{FFFD}\u{FFFD}\u{FFFD}");
+            }
+        );
+        // #7000: a truncated sequence (`e2 82`) is one U+FFFD per byte, as yq's JSON encoder
+        // writes it; the maximal-subpart rule this used before gave one.
+        yq_query!(br#""4oI=""#, "@base64d",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "\u{FFFD}\u{FFFD}");
             }
         );
     }
