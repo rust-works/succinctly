@@ -45651,9 +45651,10 @@ pub fn enter_file_names_scope(names: Vec<String>) -> FileNamesScope {
 /// The scope [`enter_file_names_scope`] opens; dropping it closes the scope.
 pub struct FileNamesScope(#[allow(dead_code)] super::eval_generic::FileNamesGuard);
 
-/// Refuse the environment operators (`env(..)`, `strenv(..)`, `envsubst`) when `disable_env_ops`,
-/// and the file operators (`load`, `load_str`, `load_base64`) when `disable_file_ops`, for every
-/// evaluation until the returned guard is dropped (#7025): yq's `--security-disable-env-ops` and
+/// Refuse the environment and file operators until the returned guard is dropped (#7025).
+///
+/// `disable_env_ops` refuses `env(..)`, `strenv(..)` and `envsubst`, and `disable_file_ops` refuses
+/// `load`, `load_str` and `load_base64`: yq's `--security-disable-env-ops` and
 /// `--security-disable-file-ops`.
 ///
 /// The refusal is raised when the operator runs, as an error named `env operations have been
