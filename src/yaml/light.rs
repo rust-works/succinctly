@@ -3241,8 +3241,27 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                     "flow"
                 }
             }
+            // #6891: the single `k: v` pair of a flow sequence (`[cron: "40 1 * * *"]`) is a mapping
+            // of its own that begins at its key; yq reports it as flow, as it does `{k: v}`.
+            _ if self.is_container() && self.is_flow_sequence_element() => "flow",
             _ => "",
         }
+    }
+
+    /// Whether this node's parent is a flow sequence (`[...]`) that holds it as an element.
+    fn is_flow_sequence_element(&self) -> bool {
+        let Some(parent) = self.parent() else {
+            return false;
+        };
+        let Some(pos) = parent.text_position() else {
+            return false;
+        };
+        let pos = if matches!(parent.text.get(pos), Some(b'&' | b'!')) {
+            parent.skip_properties_and_whitespace(pos)
+        } else {
+            pos
+        };
+        parent.is_container() && parent.text.get(pos) == Some(&b'[')
     }
 
     /// Get the YAML type tag for this node.
