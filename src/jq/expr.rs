@@ -3348,6 +3348,8 @@ pub enum YqOutputEncoder {
     Toml,
     /// `-o=kyaml`, with `-I` as the indent
     Kyaml(usize),
+    /// `-o=xml`, with `-I` and the `--xml-*` options
+    Xml(Box<XmlOptions>),
     /// `-o=base64`: a string only, and no line end
     Base64,
     /// `-o=uri`: a string only, and no line end
@@ -3365,6 +3367,21 @@ pub struct LuaOptions {
     pub unquoted: bool,
     /// `--lua-globals`: one assignment per top-level key and no table around them
     pub globals: bool,
+}
+
+/// The `--xml-*` options and `-I` of `-o=xml` (#6924), see [`YqOutputEncoder::Xml`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XmlOptions {
+    /// `-I`: spaces per level
+    pub indent: usize,
+    /// `--xml-attribute-prefix` (default `+@`)
+    pub attribute_prefix: String,
+    /// `--xml-content-name` (default `+content`)
+    pub content_name: String,
+    /// `--xml-proc-inst-prefix` (default `+p_`)
+    pub proc_inst_prefix: String,
+    /// `--xml-directive-name` (default `+directive`)
+    pub directive_name: String,
 }
 
 /// The unary libm builtins jq exposes beyond the trigonometric/exponential
