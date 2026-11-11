@@ -953,14 +953,21 @@ pub(crate) fn owned_value_to_yaml_format(value: &OwnedValue) -> String {
     out
 }
 
-/// [`owned_value_to_yaml_format`] with yq's `to_yaml(N)` indent (#4206). yq's encoder reads `0`
-/// as four spaces and `1` as two, then takes `N` as written.
-pub(crate) fn owned_value_to_yaml_format_indented(value: &OwnedValue, indent: usize) -> String {
-    let width = match indent {
+/// The width yq's `to_yaml(N)` encoder reads an indent of `N` as: `0` is four spaces and `1` is two
+/// (#4206), any other `N` as written. One definition for the owned writer and for the node writer
+/// (#6901), which must agree on it.
+pub(crate) fn yq_to_yaml_indent_width(indent: usize) -> usize {
+    match indent {
         0 => 4,
         1 => 2,
         n => n,
-    };
+    }
+}
+
+/// [`owned_value_to_yaml_format`] with yq's `to_yaml(N)` indent (#4206). yq's encoder reads `0`
+/// as four spaces and `1` as two, then takes `N` as written.
+pub(crate) fn owned_value_to_yaml_format_indented(value: &OwnedValue, indent: usize) -> String {
+    let width = yq_to_yaml_indent_width(indent);
     let mut out = String::new();
     let written = match value {
         OwnedValue::String(s) => stream_yaml_string(&mut out, s),

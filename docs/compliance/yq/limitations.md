@@ -7280,14 +7280,14 @@ streamer's known gaps; each is pinned in `recorded_gaps_1183` (`tests/yq_cli_tes
 `@yaml`, `to_yaml` and `tostring` of a container that is a document node are the exception since [#6901](https://github.com/rust-works/succinctly/issues/6901): they encode the node as it was written, with the writer the CLI prints that node with.
 A flow collection stays flow, a nested one inside a block node too, a trailing comment stays, a sequence item keeps its own head and foot comment lines, and an alias node is `*name`.
 That is pinned by `tests/yq_cli/i6901.rs`.
-What is left is a value with no node to read: `[.a] | to_yaml` over `a: {b: 1}` is `- b: 1` here and `- {b: 1}` in yq, and so is a node behind a write (`.z = 1 | .a | to_yaml`), one read back out of a constructor (`{"k": .a} | .k | to_yaml`) and one behind `with_entries`.
+What is left is a value with no node to read: `[.a] | to_yaml` over `a: {b: 1}` is `- b: 1` here and `- {b: 1}` in yq, and so is a node behind a write (`.z = 1 | .a | to_yaml`), one read back out of a constructor (`{"k": .a} | .k | to_yaml`), and one behind `with_entries`, `sort`, `reverse`, `unique`, `pick` or an array `+`, which yq reorders or copies in place and so leaves in its source style.
 Captured live (v4.53.3):
 
-| filter                         | real yq           | succinctly yq | why                                                                                                                     |
-|--------------------------------|-------------------|---------------|-------------------------------------------------------------------------------------------------------------------------|
+| filter                           | real yq           | succinctly yq | why                                                                                                                     |
+|----------------------------------|-------------------|---------------|-------------------------------------------------------------------------------------------------------------------------|
 | `a: {b: 1}` then `[.a] \| @yaml` | `- {b: 1}\n`      | `- b: 1\n`    | an owned value carries no source style (#739, #865)                                                                     |
-| `"x\ny" \| @yaml`              | `\|-\n  x\n  y\n` | `"x\ny"\n`    | a line break is double-quoted, not a literal block (the computed-value streamer; #3587 closed the JSON route)           |
-| `2.0*1 \| @yaml`               | `!!float 2\n`     | `2\n`         | yq tags a computed float but not a document-sourced `!!float 2` (the #1090 test); an owned float cannot tell them apart |
+| `"x\ny" \| @yaml`                | `\|-\n  x\n  y\n` | `"x\ny"\n`    | a line break is double-quoted, not a literal block (the computed-value streamer; #3587 closed the JSON route)           |
+| `2.0*1 \| @yaml`                 | `!!float 2\n`     | `2\n`         | yq tags a computed float but not a document-sourced `!!float 2` (the #1090 test); an owned float cannot tell them apart |
 
 ## A write that selects by node metadata, only where the document is the write's input ([#5479](https://github.com/rust-works/succinctly/issues/5479))
 

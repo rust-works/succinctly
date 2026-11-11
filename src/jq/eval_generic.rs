@@ -16126,16 +16126,18 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             if S::TAG == EvalTag::Yq =>
         {
             let owned = owned_or_suppress!(to_owned_with_cursor::<_, S>(&value, cursor), optional);
-            // `to_yaml(N)` takes the indent as yq's encoder reads it (`0` is four, `1` is two);
-            // past the width the cursor writer models (go-yaml clamps there) the owned text stays.
+            // `to_yaml(N)` takes the indent as yq's encoder reads it; past the width the cursor
+            // writer models (go-yaml clamps there) the owned text stays.
             let indent = match format_type {
-                FormatType::YqYaml(0) => 4,
-                FormatType::YqYaml(1) => 2,
-                FormatType::YqYaml(n) => *n,
+                FormatType::YqYaml(n) => crate::jq::stream::yq_to_yaml_indent_width(*n),
                 _ => 2,
             };
-            match yq_node_yaml_text::<S, _>(cursor.as_ref(), &owned, indent).filter(|_| indent <= 9)
-            {
+            let node_text = if indent <= 9 {
+                yq_node_yaml_text::<S, _>(cursor.as_ref(), &owned, indent)
+            } else {
+                None
+            };
+            match node_text {
                 Some(mut text) => {
                     text.push('\n');
                     GenericResult::Owned(OwnedValue::String(text.into()))
