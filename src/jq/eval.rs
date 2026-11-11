@@ -26061,7 +26061,7 @@ fn format_yq_csv<S: EvalSemantics>(
     }
     fn record<F: AsRef<str>>(out: &mut String, fields: &[F], comma: char) -> Result<(), EvalError> {
         // Go's `csv.Writer` refuses these delimiters at its first write.
-        if matches!(comma, '"' | '\r' | '\n' | '\u{fffd}') {
+        if matches!(comma, '\0' | '"' | '\r' | '\n') {
             return Err(EvalError::new(
                 "csv: invalid field or comment delimiter".to_string(),
             ));

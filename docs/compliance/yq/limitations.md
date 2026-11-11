@@ -7538,7 +7538,7 @@ When an update (`|=`, `map_values`) fails on several nodes, yq reports the last 
 ### `-o props|shell|csv|tsv|base64|uri` — the first slice of yq's output formats; six rows still differ ([#6850](https://github.com/rust-works/succinctly/issues/6850))
 
 `-o=props`, `-o=shell`, `-o=csv`, `-o=tsv`, `-o=base64` and `-o=uri` (and the short names `p`, `s`, `c`, `t`) run the filter and write each result through that format's encoder, with no `---` between documents.
-`--shell-key-separator`, `--properties-separator`, `--properties-array-brackets` and `--csv-separator` are read (#6922); `--csv-separator` takes one byte, as yq's `char` does, and `-o=tsv` ignores it, as yq does.
+`--shell-key-separator`, `--properties-separator`, `--properties-array-brackets` and `--csv-separator` are read (#6922); `--csv-separator` takes one ASCII byte (yq's `char` takes any single byte, so a lone byte above 0x7f, which cannot be an argument here, is refused), and `-o=tsv` ignores it, as yq does.
 The `@props` and `@csv` operators ignore those flags here, where yq applies them to the operators too.
 The other formats yq lists (`kyaml`, `xml`, `toml`, `hcl`, `lua`, `ini`) and every input format but YAML and JSON are still refused at the flag.
 Six rows differ from yq v4.53.3, each pinned out of `tests/yq_cli/i6850.rs`:

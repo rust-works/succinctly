@@ -105,13 +105,36 @@ const ROWS: &[(&str, &[&str], &str, &str, i32)] = &[
         "a\tb;c\n",
         0,
     ),
+    (
+        "props",
+        &["--properties-array-brackets"],
+        "[[a, b], [c]]\n",
+        "0[0] = a\n0[1] = b\n1[0] = c\n",
+        0,
+    ),
+    ("csv", &["--csv-separator=\r"], "[{a: 1}]\n", "", 0),
+    ("csv", &["--csv-separator=\r"], "[a]\n", "", 1),
+    (
+        "csv",
+        &["--csv-separator=;"],
+        "[\";\", \"a\\nb\", \"x\\\"y\"]\n",
+        "\";\";\"a\nb\";\"x\"\"y\"\n",
+        0,
+    ),
+    (
+        "props",
+        &["--properties-separator=\t"],
+        "a: 1\n",
+        "a\t1\n",
+        0,
+    ),
 ];
 
 #[test]
 fn encoder_flag_rows_match_yq_6922() -> Result<()> {
     for (format, flags, input, expected, code) in ROWS {
         let mut args = vec![format!("-o={format}")];
-        args.extend(flags.iter().map(|flag| flag.to_string()));
+        args.extend(flags.iter().map(|flag| (*flag).to_string()));
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let (stdout, status) = run_yq_stdin(".", input, &args)?;
         assert_eq!(
