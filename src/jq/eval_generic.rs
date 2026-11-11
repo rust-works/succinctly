@@ -22579,6 +22579,30 @@ fn yq_context_item<V: DocumentValue, S: EvalSemantics>(
     ))
 }
 
+/// Whether the nodes `operand` produces carry the origin of the entry they were made from, as yq's
+/// `.`, `.name`, `select`, `{...}` and arithmetic do and a literal or a builtin such as `length`
+/// does not (`10 + .x | document_index` is `0` for every document, #6969). A union counts only when
+/// every branch does: the origin is decided per operand here, where yq decides it per node.
+fn yq_operand_keeps_origin(operand: &Expr) -> bool {
+    match unwrap_paren(operand) {
+        Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Slice { .. }
+        | Expr::ArrayKey(_)
+        | Expr::Iterate
+        | Expr::IndexExpr { .. }
+        | Expr::SliceExpr { .. }
+        | Expr::Object(_)
+        | Expr::Builtin(Builtin::Select(_)) => true,
+        Expr::Arithmetic { left, .. } => yq_operand_keeps_origin(left),
+        Expr::Optional(inner) => yq_operand_keeps_origin(inner),
+        Expr::Pipe(stages) => stages.last().is_some_and(yq_operand_keeps_origin),
+        Expr::Comma(branches) => branches.iter().all(yq_operand_keeps_origin),
+        _ => false,
+    }
+}
+
 /// Does this pipe have a stage that is a union (`,`)?
 ///
 /// A stage that is itself a (parenthesized) pipe counts, because `L | (X | Y)`
@@ -23294,24 +23318,62 @@ fn cross_together<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cur: &core::cell::Cell<YqContextTag>,
 ) -> Result<Vec<YqContextItem<V>>, Flow> {
+    // The left operand, whose origin an arithmetic result keeps (#6969): only when it is a node
+    // that has one, and only when its outputs reach the pairing as they are produced (an operand
+    // the settled strategy collects first would leave the last output's origin for every pairing).
+    let (left_expr, keeps_left_origin) = match stage {
+        Expr::Compare { left, .. } => (&**left, false),
+        Expr::Arithmetic { left, right, .. } => (
+            &**left,
+            yq_operand_keeps_origin(left) && !settles_both(left, right),
+        ),
+        // Closed by `yq_list_stage` (see the match below).
+        // patchcov: coverage tolerate reason="unreachable: `yq_list_stage` routes only Compare and Arithmetic here, the same arm the match below closes (#2549)"
+        _ => unreachable!("yq_list_stage selects only Compare/Arithmetic as a binary stage"),
+        // patchcov: coverage end
+    };
+    // The origin of the left operand's entry that is being paired: the left operand is the outer
+    // loop in yq mode, and the walk makes its entry's origin ambient for the run, so it is read as
+    // each output arrives. (`cur` is not: the right operand's walk that follows each output moves
+    // it on before the entry's next output arrives.)
+    let left_origin: core::cell::Cell<Option<NodeOrigin>> = core::cell::Cell::new(None);
     let each_operand = |operand: &Expr, operand_sink: &mut dyn Sink<V>| {
         let mut flat: Vec<Expr> = Vec::new();
         yq_flatten_pipe_stages(core::slice::from_ref(operand), &mut flat);
-        eval_yq_context_pipe::<S, V>(&flat, context, false, cur, operand_sink)
+        if keeps_left_origin && core::ptr::eq(operand, left_expr) {
+            let budget = operand_sink.budget();
+            let mut noting = forward_budget(budget, |item: GenericItem<V>| -> Demand {
+                left_origin.set(node_origin::current());
+                operand_sink.push(item)
+            });
+            eval_yq_context_pipe::<S, V>(&flat, context, false, cur, &mut noting)
+        } else {
+            eval_yq_context_pipe::<S, V>(&flat, context, false, cur, operand_sink)
+        }
     };
     let mut produced: Vec<YqContextItem<V>> = Vec::new();
     let mut stray: Option<Control> = None;
-    // Every pairing is a value the operator computed, so it carries neither
-    // `EvaluateTogether` nor an origin -- `. + {"z": 9} | [.]` is one array
-    // per result, matching real yq.
-    let mut collect =
-        |item: GenericItem<V>| match yq_context_item::<_, S>(item, YqContextTag::default()) {
+    // A pairing is a value the operator computed, so it does not carry `EvaluateTogether`:
+    // `. + {"z": 9} | [.]` is one array per result, matching real yq. An arithmetic result does
+    // keep where its left operand was read (`. * {"z": 1} | document_index` is each document's
+    // own), and a comparison's boolean is a node of its own with no origin (#6969).
+    let mut collect = |item: GenericItem<V>| {
+        let tag = YqContextTag {
+            together: false,
+            origin: if keeps_left_origin {
+                left_origin.get()
+            } else {
+                None
+            },
+        };
+        match yq_context_item::<_, S>(item, tag) {
             Ok(entry) => {
                 produced.push(entry);
                 Demand::Continue
             }
             Err(control) => stop_with_escape(&mut stray, control),
-        };
+        }
+    };
     let flow = match stage {
         Expr::Compare { op, left, right } => binary_fanout_each_generic::<V, S>(
             each_operand,

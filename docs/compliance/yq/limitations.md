@@ -1245,6 +1245,22 @@ $ succinctly yq --eval-all -o=json -I0 '. as $x | [$x]' f1.yaml f2.yaml
 `. as $d | $d` (no collect in the body) agrees, as does every other row of #2427's own
 capture table.
 
+### An arithmetic result keeps its left operand's origin under `--eval-all` ([#6969](https://github.com/rust-works/succinctly/issues/6969))
+
+A result of `+`, `-`, `*`, `/` or `%` is read from where its left operand was, as in yq: `yq ea '. * {"z":1} | document_index' md.yaml` over two documents is `0 0 1 1`, and `file_index` and `filename` follow the same way.
+Each result had no origin, so they were all `0` (and `""`).
+A constructed left operand takes the origin of the context entry it was built for (`{"z":1} * .` is `0 0 1 1` too), and a number built from a read keeps it (`.x + 1`).
+A left operand that builds a fresh node, a literal or a builtin such as `length`, has none: `10 + .x | document_index` is `0` for every document in yq and here.
+A comparison's boolean has none here, as before; yq keeps the left read's for `.x == 1` (`0 0 1 1`) and gives `. == .` none ([#6973](https://github.com/rust-works/succinctly/issues/6973)).
+
+Not covered here ([#6973](https://github.com/rust-works/succinctly/issues/6973)):
+- A map merge or concat keeps `EvaluateTogether` in yq (it copies its left operand), so `. * {"z":1} | [.]` is one array of every result there and one array per result here.
+  A scalar result is a fresh node in both.
+- A later arithmetic stage crosses the whole list of results in yq: `(. * {"z":1}) | . + {"w":2}` is 16 results over two documents and 4 here.
+- A union as the left operand that mixes reads and literals (`(.x, 7) + (10,20)`): yq gives each node its own origin, and this decides it per operand, so the reads lose theirs (as before #6969).
+- `line` of a computed result is `0` here; yq keeps its left operand's line.
+- `. as $d | $d * {"z":1}` is four results in yq and two here.
+
 ### `SRC as $x ireduce (INIT; UPDATE)` and `{}` under `--eval-all` read the whole document list ([#2427](https://github.com/rust-works/succinctly/issues/2427))
 
 `--eval-all` folds every document of every file, as yq's `reduceOperator` does: it reads SRC and INIT against the whole list, then folds each source node into each accumulator.
