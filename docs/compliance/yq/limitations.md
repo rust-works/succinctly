@@ -137,8 +137,8 @@ The redirect runs wherever a write goes through `evaluate_yaml_cursor` — stdou
 evaluates the collected documents through the owned-value route, which has no redirect, no
 comments and no style, so a filter that reads the document *list* (`[.]`, `,`, `.a = .b`,
 `|= . + 1`, a builtin, a variable) still writes `b` positionally and drops the marks. A filter
-that only navigates (`.`, `.a.b`, `.[0]`, `.[]`, `..`) or writes a literal (`.b.p = 9`, `.a //= 7`,
-`.n += 1`, `del(.a)`) takes the plain per-document route instead and keeps all of it
+that only navigates (`.`, `.a.b`, `.[0]`, `.[]`, `..`) or writes a literal (`.b.p = 9`,
+`.n += 1`, `del(.a)`, and `.a //= 7` under `--jq-extensions`) takes the plain per-document route instead and keeps all of it
 ([#4380](https://github.com/rust-works/succinctly/issues/4380); the gate is
 `eval_all_matches_per_document` in `m2_gate.rs`). The rerouted run first evaluates the list
 the old way, so the bridge's refusals (nesting depth, colliding keys, stray commas), a later
@@ -2397,6 +2397,7 @@ Not reproduced:
   Both write nothing here, where yq writes to the matching nodes.
 - **`+=`, `-=`, `*=` and `//=` on a `(PATH | key)` target are a parse error.**
   yq accepts `+=` (`(.a.x | key) += "z"` is `xz`) and errors for the others.
+  Without `--jq-extensions`, `//=` is refused earlier still, as an operator yq lacks (#6981), and the key-target refusal is the one with the flag.
   They used to be a silent no-op, which discarded the write (ADR-0018 rule 4(b)); a refusal keeps the write from vanishing.
 - **A rename through an alias** (`a: &r {x: 1}` / `b: *r`, `(.b.x | key) = "z"`) renames only the copy under `b`, and prints it as a mapping, where yq renames the anchor's node (`a: &r {z: 1}` / `b: *r`).
 
@@ -2756,9 +2757,12 @@ b: 2' | succinctly yq '(.a, 1) = 5'   # matches, was: Error: Invalid path expres
 (Real yq has no `/=`/`%=`/`//=` syntax at all — confirmed live, `'/'`/`'%'`/`'//'` all
 report "expects 2 args but there is 1" rather than being recognized as compound-assign
 operators, the same "no real yq syntax to check against" gap already recorded elsewhere in
-this file. succinctly's own support for those three forms is a pre-existing, unrelated
-extension-surface question — they parse and inherit this same skip in yq mode, but that is
-not itself a divergence claim, since there is nothing in real yq to diverge from.)
+this file.
+succinctly refuses those three forms in yq mode unless `--jq-extensions` is passed, as it does a
+jq-only builtin ([#6981](https://github.com/rust-works/succinctly/issues/6981)): the error names
+the flag where yq's reads `'/' expects 2 args but there is 1`.
+With the flag they parse and inherit this same skip, which is not itself a divergence claim,
+since there is nothing in real yq to diverge from.)
 
 Confirmed position-independent (untracked first, middle, or last; all-branches-untracked;
 a computed value from an arbitrary expression rather than a bare literal) — every case gives
@@ -3236,9 +3240,9 @@ predating #1430's yq-mode scope for `=`. Fixed in
 `eval_rhs_once` with `collect_rhs_outputs`/`eval_update_multi`, mirroring `eval_assign`'s
 own #392/#1430 shape: jq mode forks, yq mode collapses to the last output on a clean
 completion, gated on `S::TAG == EvalTag::Yq` — and, as for `=` above, an RHS that itself
-errors partway through aborts with no document (#1779). `/=`/`%=`/`//=` have no real yq
-syntax at all (confirmed live, `'/'`/`'//'` expect 2 args but there is 1), so their yq-mode "take the last value" answer is judged by internal
-consistency with `|=` rather than an external-compat claim.
+errors partway through aborts with no document (#1779).
+`/=`/`%=`/`//=` have no real yq syntax at all (confirmed live, `'/'`/`'//'` expect 2 args but there is 1).
+They are refused in yq mode without `--jq-extensions` (#6981), and with it their yq-mode "take the last value" answer is judged by internal consistency with `|=` rather than an external-compat claim.
 
 ### `-o=auto` on a genuinely mixed-format multi-source run doesn't match per-element
 

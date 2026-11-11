@@ -2683,11 +2683,23 @@ impl<'a> Parser<'a> {
     /// point at the keyword's own start, matching every other gated name's
     /// convention, instead of wherever the lookahead left `self.pos`.
     fn reject_unless_jq_extensions_at(&self, name: &str, pos: usize) -> Result<(), ParseError> {
+        self.reject_unless_jq_extensions_surface(name, pos, "builtin surface")
+    }
+
+    /// The one definition of the `--jq-extensions` gate: yq mode without the flag refuses `name`
+    /// at `pos`, with the kind of surface the flag opts back into (`builtin surface`, `operators`)
+    /// in the message. Every gated construct goes through here.
+    fn reject_unless_jq_extensions_surface(
+        &self,
+        name: &str,
+        pos: usize,
+        surface: &str,
+    ) -> Result<(), ParseError> {
         if self.mode == ParserMode::Yq && !self.jq_extensions {
             return Err(ParseError::new(
                 format!(
                     "\"{name}\" is not part of yq's syntax; pass --jq-extensions to enable \
-                     succinctly's jq-compatible builtin surface"
+                     succinctly's jq-compatible {surface}"
                 ),
                 pos,
             ));
@@ -11018,10 +11030,31 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// yq mode: an operator assignment (`+=`, `-=`, `*=`, `//=`, ...) to a `(PATH | key)` target
-    /// is refused out loud, as a silent no-op was the answer before key writes existed (#6089).
-    /// `=` and `|=` rename the key ([`Self::assign_or_rename_key`]).
-    fn refuse_key_operator_assign(&self, left: &Expr) -> Result<(), ParseError> {
+    /// What yq mode refuses about a compound assignment `left OP= ...`, called with the cursor on
+    /// the operator (before it is consumed), so it reads the operator off the parser itself.
+    ///
+    /// The recursive assignment parser makes one fallible call per operator branch and passes it
+    /// nothing: every extra argument, local or `?` there is a slot in a frame that deeply nested
+    /// `def`s multiply (`write_shape_gate_is_not_exponential_in_def_nesting_2091` runs 41 levels in
+    /// a 2 MiB test thread, and two added `?` calls overflowed it on Linux ARM64 and under
+    /// coverage instrumentation, #6981).
+    ///
+    /// - `/=`, `%=` and `//=` are jq's: yq has no such operator and reads `/`, `%` or `//` with a
+    ///   missing operand (`'/' expects 2 args but there is 1`), so without `--jq-extensions` they
+    ///   are refused as a jq-only builtin is (#6981). `+=`, `-=`, `*=` and `|=` are yq's own.
+    /// - An operator assignment (`+=`, `-=`, `*=`, `//=`, ...) to a `(PATH | key)` target is
+    ///   refused out loud, as a silent no-op was the answer before key writes existed (#6089).
+    ///   `=` and `|=` rename the key ([`Self::assign_or_rename_key`]).
+    fn refuse_operator_assign(&self, left: &Expr) -> Result<(), ParseError> {
+        let op = match (self.peek_str(3), self.peek_str(2)) {
+            ("//=", _) => "//=",
+            (_, "/=") => "/=",
+            (_, "%=") => "%=",
+            _ => "",
+        };
+        if !op.is_empty() {
+            self.reject_unless_jq_extensions_surface(op, self.pos, "operators")?;
+        }
         if self.mode == ParserMode::Yq && left.key_node_prefix().is_some() {
             return Err(ParseError::new(
                 "(PATH | key) can only be assigned with = or |= (#6089)",
@@ -11108,11 +11141,11 @@ impl<'a> Parser<'a> {
 
         // Check for //= (alternative assignment)
         if peek3 == "//=" {
+            self.refuse_operator_assign(&left)?;
             self.next(); // /
             self.next(); // /
             self.next(); // =
             self.skip_ws();
-            self.refuse_key_operator_assign(&left)?;
             let value = self.parse_assignment_operand()?;
             return Ok(Expr::AlternativeAssign {
                 path: Box::new(Self::fold_sum_or_merge_key(left)),
@@ -11125,6 +11158,7 @@ impl<'a> Parser<'a> {
         // (e.g. *=+d). Flags come after '=', never before it — `.a *+= .b`
         // is not the append-merge-assign spelling in real yq either.
         if peek2 == "*=" {
+            self.refuse_operator_assign(&left)?;
             self.next(); // *
             self.next(); // =
             let flags = if self.mode == ParserMode::Yq {
@@ -11133,7 +11167,6 @@ impl<'a> Parser<'a> {
                 MergeFlags::default()
             };
             self.skip_ws();
-            self.refuse_key_operator_assign(&left)?;
             let value = self.parse_assignment_operand()?;
             return Ok(Expr::CompoundAssign {
                 op: AssignOp::Mul(flags),
@@ -11154,10 +11187,10 @@ impl<'a> Parser<'a> {
             };
 
             if let Some(op) = assign_op {
+                self.refuse_operator_assign(&left)?;
                 self.next(); // op char
                 self.next(); // =
                 self.skip_ws();
-                self.refuse_key_operator_assign(&left)?;
                 let value = self.parse_assignment_operand()?;
                 return Ok(Expr::CompoundAssign {
                     op,
@@ -14183,8 +14216,8 @@ mod tests {
                     if is_assignment(left) && matches!(right.as_ref(), Expr::Literal(_))),
                 "jq: `{source}`: {jq:?}"
             );
-            // yq: the assignment's value is the `//`.
-            let yq = parse_with_mode(source, ParserMode::Yq).unwrap();
+            // yq: the assignment's value is the `//`. `//=` is jq's, so it needs the flag (#6981).
+            let yq = parse_with_mode_and_extensions(source, ParserMode::Yq, true).unwrap();
             assert!(
                 matches!(&yq, Expr::Assign { value, .. }
                     | Expr::CompoundAssign { value, .. }
@@ -14211,6 +14244,50 @@ mod tests {
             matches!(&jq, Expr::Alternative(left, _) if matches!(left.as_ref(), Expr::AlternativeAssign { .. })),
             "{jq:?}"
         );
+    }
+
+    /// #6981: yq has no `/=`, `%=` or `//=` (it reads `/`, `%` or `//` with a missing operand and
+    /// stops), so yq mode refuses them unless `--jq-extensions` is on; jq mode always accepts
+    /// them. `+=`, `-=`, `*=` and `|=` are yq's own and need no flag.
+    #[test]
+    fn compound_assignments_yq_lacks_are_gated_6981() {
+        for op in ["/=", "%=", "//="] {
+            let source = format!(".a {op} 2");
+            let err = parse_with_mode(&source, ParserMode::Yq)
+                .expect_err("yq mode without the flag must refuse the operator");
+            assert!(
+                err.message
+                    .contains(&format!("\"{op}\" is not part of yq's syntax"))
+                    && err.message.contains("--jq-extensions"),
+                "{op}: {err:?}"
+            );
+            assert_eq!(err.position, 3, "{op}: the error is at the operator");
+            assert!(
+                matches!(
+                    parse_with_mode_and_extensions(&source, ParserMode::Yq, true),
+                    Ok(Expr::CompoundAssign { .. } | Expr::AlternativeAssign { .. })
+                ),
+                "{op}: --jq-extensions accepts it"
+            );
+            assert!(
+                parse_with_mode(&source, ParserMode::Jq).is_ok(),
+                "{op}: jq mode accepts it"
+            );
+        }
+        for op in ["+=", "-=", "*=", "|="] {
+            let source = format!(".a {op} 2");
+            assert!(
+                parse_with_mode(&source, ParserMode::Yq).is_ok(),
+                "{op}: yq's own operator needs no flag"
+            );
+        }
+        // The operators as arithmetic are yq's, and so is `//`.
+        for source in [".a / 2", ".a % 2", ".a // 2", ".a /2", ".a|=.//2"] {
+            assert!(
+                parse_with_mode(source, ParserMode::Yq).is_ok(),
+                "{source}: arithmetic is not an assignment"
+            );
+        }
     }
 
     /// #5298: an interpolated or formatted string is an object key, and with no value it is

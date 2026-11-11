@@ -18,7 +18,13 @@ fn test_yq_compound_store_of_a_container_operand_is_unchanged_5761() -> Result<(
         (".a *=+ [9]", "a: [1, 9]\nm: {x: 1}\n"),
         (r#".m += {"y": [1]}"#, "a: [1]\nm: {x: 1, y: [1]}\n"),
     ] {
-        let (stdout, code) = run_yq_stdin(filter, DOC, &[])?;
+        // `//=` is not yq's operator, so it needs the flag (#6981).
+        let args: &[&str] = if filter.contains("//=") {
+            &["--jq-extensions"]
+        } else {
+            &[]
+        };
+        let (stdout, code) = run_yq_stdin(filter, DOC, args)?;
         assert_eq!((stdout.as_str(), code), (expected, 0), "{filter}");
     }
     Ok(())

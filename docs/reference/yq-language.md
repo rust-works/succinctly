@@ -59,7 +59,7 @@ Most of the [jq Language Reference](jq-language.md) works with yq, but real yq's
 - Control flow through yq's own forms (`select`, `//`, `with`); `if`/`then`/`else`, `try`/`catch`, `reduce`, `foreach` and `label` need `--jq-extensions`
 - User-defined functions (`def name: body;`) need `--jq-extensions`
 - Variable binding (`as $var`)
-- Assignment operators (`=`, `|=`, `+=`, etc.)
+- Assignment operators (`=`, `|=`, `+=`, `-=`, `*=`); `/=`, `%=` and `//=` need `--jq-extensions`, as yq has no such operators (#6981)
 - Format strings (`@json`, `@csv`, `@base64`, etc.)
 
 ### Object construction follows yq's grammar, not jq's (#2783)
@@ -788,6 +788,7 @@ surface (#1512):
 | `def name: body;`, `label $out`, `break $out`        | Function definitions, labelled break (#4808)  |
 | `while(c; f)`, `until(c; f)`, `repeat(f)`            | Loop generators (#4808)                       |
 | `recurse`, `recurse(f)`, `recurse(f; cond)`, `recurse_down` | Recursive descent; yq has `..` (#4808)        |
+| `/=`, `%=`, `//=`                                    | Compound assignments (operators, not builtins; #6981) |
 | `empty`, `halt`, `halt_error`, `halt_error(n)`, `stderr` | No output / exit / stderr (#4808)             |
 | `values`, `nulls`, `booleans`, `numbers`, `strings`, `arrays`, `objects`, `iterables`, `scalars`, `normals`, `finites` | Type selectors; yq has `select(tag == ...)` (#4808) |
 | `isnull`, `isboolean`, `isnumber`, `isstring`, `isarray`, `isobject`, `isvalid(f)` | Type tests (#4808)                            |

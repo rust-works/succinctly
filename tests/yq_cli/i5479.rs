@@ -184,8 +184,13 @@ fn test_metadata_write_with_no_match_leaves_the_document_alone_5479() -> Result<
 
 #[test]
 fn test_alternative_assignment_selecting_by_metadata_5479() -> Result<()> {
-    // yq v4.53.3 has no `//=`; this is succinctly's operator reaching the same resolution.
-    let (out, code) = run_yq_stdin("(.[] | select(line > 1)) //= 7", "a: 1\nb:\nc: 3\n", &[])?;
+    // yq v4.53.3 has no `//=`, so it needs `--jq-extensions` (#6981); this is succinctly's operator
+    // reaching the same resolution.
+    let (out, code) = run_yq_stdin(
+        "(.[] | select(line > 1)) //= 7",
+        "a: 1\nb:\nc: 3\n",
+        &["--jq-extensions"],
+    )?;
     assert_eq!((out.as_str(), code), ("a: 1\nb: 7\nc: 3\n", 0));
     Ok(())
 }
