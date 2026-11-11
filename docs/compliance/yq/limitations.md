@@ -1251,7 +1251,7 @@ A result of `+`, `-`, `*`, `/` or `%` is read from where its left operand was, a
 Each result had no origin, so they were all `0` (and `""`).
 A constructed left operand takes the origin of the context entry it was built for (`{"z":1} * .` is `0 0 1 1` too), and a number built from a read keeps it (`.x + 1`).
 A left operand that builds a fresh node, a literal or a builtin such as `length`, has none: `10 + .x | document_index` is `0` for every document in yq and here.
-A comparison's boolean is a node of its own with no origin, as before.
+A comparison's boolean has none here, as before; yq keeps the left read's for `.x == 1` (`0 0 1 1`) and gives `. == .` none ([#6973](https://github.com/rust-works/succinctly/issues/6973)).
 
 Not covered here ([#6973](https://github.com/rust-works/succinctly/issues/6973)):
 - A map merge or concat keeps `EvaluateTogether` in yq (it copies its left operand), so `. * {"z":1} | [.]` is one array of every result there and one array per result here.

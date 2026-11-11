@@ -23331,8 +23331,9 @@ fn cross_together<S: EvalSemantics, V: DocumentValue>(
         _ => unreachable!("yq_list_stage selects only Compare/Arithmetic as a binary stage"),
     };
     // The origin of the left operand's entry that is being paired: the left operand is the outer
-    // loop in yq mode, so the entry it came from is the one `cur` names when each of its
-    // outputs arrives, and the right operand's evaluation that follows moves `cur` on.
+    // loop in yq mode, and the walk makes its entry's origin ambient for the run, so it is read as
+    // each output arrives. (`cur` is not: the right operand's walk that follows each output moves
+    // it on before the entry's next output arrives.)
     let left_origin: core::cell::Cell<Option<NodeOrigin>> = core::cell::Cell::new(None);
     let each_operand = |operand: &Expr, operand_sink: &mut dyn Sink<V>| {
         let mut flat: Vec<Expr> = Vec::new();
@@ -23340,7 +23341,7 @@ fn cross_together<S: EvalSemantics, V: DocumentValue>(
         if keeps_left_origin && core::ptr::eq(operand, left_expr) {
             let budget = operand_sink.budget();
             let mut noting = forward_budget(budget, |item: GenericItem<V>| -> Demand {
-                left_origin.set(cur.get().origin);
+                left_origin.set(node_origin::current());
                 operand_sink.push(item)
             });
             eval_yq_context_pipe::<S, V>(&flat, context, false, cur, &mut noting)
