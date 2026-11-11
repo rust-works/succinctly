@@ -3502,6 +3502,17 @@ impl Libm3 {
     pub const ALL: [(&'static str, Self); 1] = [("fma", Self::Fma)];
 }
 
+/// What `load(file)` makes of the file's bytes (#6985).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadKind {
+    /// `load`: the YAML (or, for a `.json` name, JSON) document it holds.
+    Document,
+    /// yq's `load_str` (`strload`, `loadstr`): the bytes as a string.
+    Text,
+    /// yq's `load_base64`: the bytes decoded as base64, as `@base64d` decodes a string.
+    Base64,
+}
+
 /// Builtin functions supported by jq.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Builtin {
@@ -4122,8 +4133,9 @@ pub enum Builtin {
     // Phase 22: File operations (yq)
     /// `load(file)` - load external YAML/JSON file and return its parsed content
     /// Input: load("config.yaml") -> {parsed content}
-    /// Supports both YAML and JSON files (auto-detected by extension)
-    Load(Box<Expr>),
+    /// Supports both YAML and JSON files (auto-detected by extension). yq's `load_str` and
+    /// `load_base64` read the file as text instead (#6985), [`LoadKind`].
+    Load(Box<Expr>, LoadKind),
 
     // Phase 23: Position-based navigation (succinctly extension)
     /// `at_offset(n)` - jump to node at byte offset n (0-indexed)

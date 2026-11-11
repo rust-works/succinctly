@@ -271,7 +271,7 @@ pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
         | Builtin::Tz(e)
         | Builtin::FormatDatetime(e)
         | Builtin::EvalExpr(e)
-        | Builtin::Load(e)
+        | Builtin::Load(e, _)
         | Builtin::AtOffset(e) => BuiltinKids::One(e),
         // `Option<Box<Expr>>`, not `Box<Expr>` -- #2855's `None` case (a
         // bare `sort_keys`/`sort_keys()` call with no usable argument) has
@@ -599,7 +599,7 @@ pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr)
         Builtin::Tz(e) => Builtin::Tz(Box::new(f(e))),
         Builtin::FormatDatetime(e) => Builtin::FormatDatetime(Box::new(f(e))),
         Builtin::EvalExpr(e) => Builtin::EvalExpr(Box::new(f(e))),
-        Builtin::Load(e) => Builtin::Load(Box::new(f(e))),
+        Builtin::Load(e, kind) => Builtin::Load(Box::new(f(e)), *kind),
         Builtin::AtOffset(e) => Builtin::AtOffset(Box::new(f(e))),
 
         // --- Two sub-expressions (21) --------------------------------------
@@ -1930,7 +1930,7 @@ fn stage_escapes_own_input(expr: &Expr) -> bool {
             | Builtin::Tz(_)
             | Builtin::FormatDatetime(_)
             | Builtin::WithDtf(_, _)
-            | Builtin::Load(_) => false,
+            | Builtin::Load(..) => false,
         },
         // Each node's own input is rebound. Child expressions are inspected
         // by this same any_subexpr walk, including resolved function bodies,
@@ -2309,7 +2309,7 @@ fn node_reads_ambient(node: &Expr) -> bool {
             | Builtin::FormatDatetime(_)
             | Builtin::WithDtf(_, _)
             | Builtin::EvalExpr(_)
-            | Builtin::Load(_)
+            | Builtin::Load(..)
             | Builtin::AtOffset(_)
             | Builtin::AtPosition(_, _) => true,
         },
