@@ -95,3 +95,31 @@ fn a_multi_line_flow_key_prints_back_as_yq_does_6949() -> Result<()> {
     }
     Ok(())
 }
+
+/// A long run of blanks inside a flow key, or ending one, is scanned once. The blank arm of each key
+/// scanner re-entered at every blank of the run and scanned the rest of it again, so 320,000 blanks
+/// took 18 seconds in an implicit key and 23 in an explicit one; the bound is far above the linear
+/// cost (a few milliseconds) and far below the square.
+#[test]
+fn a_long_run_of_blanks_in_a_flow_key_is_scanned_once_6949() -> Result<()> {
+    let blanks = " ".repeat(320_000);
+    let docs = [
+        format!("{{a{blanks}b}}\n"),
+        format!("{{a{blanks}\n b}}\n"),
+        format!("{{? a{blanks}b}}\n"),
+        format!("{{? a{blanks}\n b}}\n"),
+        format!("{{a{blanks}:b}}\n"),
+    ];
+    for doc in &docs {
+        let started = std::time::Instant::now();
+        let (_, code) = run_yq_stdin(".", doc, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "{:?}", &doc[..8]);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}: {:?}",
+            &doc[..8],
+            started.elapsed()
+        );
+    }
+    Ok(())
+}

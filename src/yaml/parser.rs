@@ -7395,7 +7395,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         if !self.parse_flow_key()? {
             // A complex key (a nested flow container) opened its own BP nodes
             // and carries its own end; recording one here would clobber the
-            // innermost of them (#332).
+            // innermost of them (#332). An unquoted key recorded its own, short
+            // of the cursor when blanks or breaks trail it (#6941).
             self.set_bp_text_end(self.pos);
         }
         self.write_bp_close();
@@ -8074,7 +8075,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             } else if !self.parse_flow_key()? {
                 // A complex key (a nested flow container) opened its own BP nodes and
                 // carries its own end; recording one here would clobber the innermost of
-                // them (#332).
+                // them (#332). An unquoted key recorded its own, short of the cursor when
+                // blanks or breaks trail it (#6941).
                 self.set_bp_text_end(self.pos);
             }
             self.write_bp_close();
@@ -8286,11 +8288,14 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                         self.input[at] == b':'
                             && Self::is_ws_break_or_eoi(self.input.get(at + 1).copied())
                     };
+                    // Each continuing arm below moves to the end of the blank run in one step: the
+                    // arm then re-entered at every blank of it and scanned the rest of the run again,
+                    // so a long run of blanks cost the square of its length.
                     while lookahead < self.input.len() {
                         match self.input[lookahead] {
                             b' ' | b'\t' => lookahead += 1,
                             b':' if !colon_ends_key(lookahead) => {
-                                self.advance();
+                                self.pos = lookahead;
                                 break;
                             }
                             b':' | b',' | b'}' | b']' => {
@@ -8302,12 +8307,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                                 // the key is the `\n`/`\r` arm's to say, so walk on to it. Ending
                                 // the key here refused `{a ` / ` b}` where yq reads `"a b"` (#6949);
                                 // the explicit-key scanner does the same (#402).
-                                self.advance();
+                                self.pos = lookahead;
                                 break;
                             }
                             _ => {
                                 // Continue with the key
-                                self.advance();
+                                self.pos = lookahead;
                                 break;
                             }
                         }
@@ -8737,8 +8742,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                                     // Whitespace before `: ` - stop here
                                     break;
                                 }
-                                // Colon not followed by space - continue with the key
-                                self.advance();
+                                // Colon not followed by space - continue with the key. The
+                                // cursor goes to the end of the blank run in one step; one blank
+                                // at a time re-scanned the run from each of them (#6949).
+                                self.pos = lookahead;
                             }
                             b',' | b'}' | b']' => {
                                 // Whitespace before delimiter - stop here
@@ -8751,7 +8758,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                                 // continues the key. Stopping here instead made a space
                                 // before the break abort the parse — `[? k \n  x : v]`
                                 // errored while `[? k\n  x : v]` was fine (#402).
-                                self.advance();
+                                self.pos = lookahead;
                             }
                         }
                     } else {
@@ -8762,8 +8769,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             }
         }
 
-        // Trim trailing whitespace; a run of line breaks before the `:` is not content either (#6855).
-        // Return absolute end position
+        // The key ends before the blanks and line breaks that trail it, whatever stopped the scan
+        // (the `:`, a `,`, a closer or a comment), #6855, #6941. Return absolute end position.
         Ok(self.trim_flow_plain_end(start))
     }
 
