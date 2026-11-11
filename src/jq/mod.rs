@@ -152,6 +152,9 @@ pub use eval::{
 };
 #[doc(hidden)]
 pub use eval::{eval_full, eval_owned_scalar_fast, eval_reindexed_document, with_stderr_muted};
+// #6925: Go's `strconv.Quote` and `url.QueryUnescape` over bytes, for the CLI's `-p uri`.
+#[doc(hidden)]
+pub use eval::{go_query_unescape, go_quote_bytes};
 // #6560: the CLI's switch for reading `$ENV` once; `std` only, like the `thread_local!` behind it.
 #[cfg(feature = "std")]
 pub use eval::snapshot_environment;
