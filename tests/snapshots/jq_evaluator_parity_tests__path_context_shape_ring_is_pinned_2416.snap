@@ -1241,7 +1241,7 @@ expression: rendered
   jq  .a.zz | [key, path]
    => []
   yq  .a.zz | [key, path]
-   => []
+   => [[]]
 {"a":1,"a":2,"d":[10,20]}
   jq  .a.zz | (key, path)
    => []
@@ -1301,7 +1301,7 @@ expression: rendered
   jq  .a.zz.yy | [path, parent]
    => []
   yq  .a.zz.yy | [path, parent]
-   => []
+   => [[]]
 {"a":1,"a":2,"d":[10,20]}
   jq  .a? | key
    => ["a"]
@@ -1376,7 +1376,7 @@ expression: rendered
   jq  .a.zz? | [path, parent]
    => []
   yq  .a.zz? | [path, parent]
-   => []
+   => [[]]
 {"a":1,"a":2,"d":[10,20]}
   jq  .d[9]? | key
    => [9]
@@ -1491,7 +1491,7 @@ expression: rendered
   jq  .a[("z"+"z")] | [key, path]
    => []
   yq  .a[("z"+"z")] | [key, path]
-   => []
+   => [[]]
 {"a":1,"a":2,"d":[10,20]}
   jq  .a[("b"+"")] | key | tostring
    => []
@@ -2361,7 +2361,7 @@ expression: rendered
   jq  .a? | [key, path]
    => []
   yq  .a? | [key, path]
-   => []
+   => [[]]
 [{"k":1},{"k":2}]
   jq  .a? | (key, path)
    => []

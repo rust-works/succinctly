@@ -1789,6 +1789,20 @@ fn has_flat_empty_object(expr: &Expr) -> bool {
     }
 }
 
+/// Whether a pipe in `expr` has a stage after its first that yq answers once over an empty context
+/// list (#6943, [`yq_stage_can_reemit`](super::eval::yq_stage_can_reemit)): `select(c) | "x"` is `"x"`
+/// when `c` holds for no member, where each member's own run of it would answer nothing. Looks
+/// through parentheses and nested pipes as [`has_flat_union`] does.
+fn has_flat_reemit_stage(expr: &Expr) -> bool {
+    match expr {
+        Expr::Paren(inner) => has_flat_reemit_stage(inner),
+        Expr::Pipe(stages) => stages.iter().enumerate().any(|(at, stage)| {
+            (at > 0 && super::eval::yq_stage_can_reemit(stage)) || has_flat_reemit_stage(stage)
+        }),
+        _ => false,
+    }
+}
+
 /// Whether `stage` is a bare `$name`, or a pipe or parenthesised pipe that starts with one
 /// (`$v`, `($v)`, `$v | keys`, `$v.a`). `$ENV` and `$ARGS` are not variables of yq's.
 fn yq_stage_head_var(stage: &Expr) -> bool {
@@ -2013,6 +2027,7 @@ fn yq_map_union_body_over_the_list(call: Expr, var_stage_once: bool) -> Expr {
     };
     let owned_by_the_list = has_flat_union(body)
         || has_flat_empty_object(body)
+        || has_flat_reemit_stage(body)
         || (var_stage_once && has_flat_var_stage(body));
     if !owned_by_the_list {
         return call;
