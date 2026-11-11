@@ -542,6 +542,18 @@ pub(crate) enum EmptyOperandOp {
     Boolean,
 }
 
+/// Whether yq never evaluates the right operand of `op` when its left operand produced nothing
+/// (#6982): `-`, `*` (every merge-flag form), `/` and `%`, the operators [`yq_empty_operand_output`]
+/// answers with nothing whatever the other operand is. So an erroring right side is silent there
+/// (`.[] * error("x")` on `[]` prints nothing in yq v4.53.3), where `+` and the comparisons, which
+/// answer from the other operand's value, evaluate it (`.[] + error("x")` raises in yq too).
+pub(crate) fn yq_empty_left_skips_right(op: EmptyOperandOp) -> bool {
+    matches!(
+        op,
+        EmptyOperandOp::Arith(ArithOp::Sub | ArithOp::Mul(_) | ArithOp::Div | ArithOp::Mod)
+    )
+}
+
 /// **The one definition of yq's binary-operator rule for an operand that
 /// produced zero outputs** (#2460), consulted by both evaluators: the
 /// generic/cursor route (`eval_generic::binary_fanout_each_generic`) and the
@@ -594,18 +606,6 @@ pub(crate) enum EmptyOperandOp {
 ///    read produces zero outputs *before* reaching this table, and a
 ///    comparison operand -- which is not read-only -- still sees the real
 ///    `null` node.
-/// Whether yq never evaluates the right operand of `op` when its left operand produced nothing
-/// (#6982): `-`, `*` (every merge-flag form), `/` and `%`, the operators [`yq_empty_operand_output`]
-/// answers with nothing whatever the other operand is. So an erroring right side is silent there
-/// (`.[] * error("x")` on `[]` prints nothing in yq v4.53.3), where `+` and the comparisons, which
-/// answer from the other operand's value, evaluate it (`.[] + error("x")` raises in yq too).
-pub(crate) fn yq_empty_left_skips_right(op: EmptyOperandOp) -> bool {
-    matches!(
-        op,
-        EmptyOperandOp::Arith(ArithOp::Sub | ArithOp::Mul(_) | ArithOp::Div | ArithOp::Mod)
-    )
-}
-
 pub(crate) fn yq_empty_operand_output(
     op: EmptyOperandOp,
     other: Option<&OwnedValue>,
