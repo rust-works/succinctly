@@ -798,6 +798,16 @@ pub(crate) fn needs_explicit_float_tag_in_yaml(text: &str) -> bool {
     !matches!(resolve_plain_sourced(text, false), ResolvedScalar::Float(_))
 }
 
+/// Whether `tag` is the non-specific tag, `!` or its verbatim spelling `!<!>` (#6942).
+///
+/// It names no kind, so yq reads the node it marks as it would untagged: an empty plain scalar is
+/// a null (`a: !` is `{"a":null}`), a value keeps its natural type (`a: ! 12` is the number `12`),
+/// and `tag` answers the natural tag (`!!int`), not `!`. One definition for every site that asks.
+#[must_use]
+pub fn is_non_specific_tag(tag: &str) -> bool {
+    matches!(tag, "!" | "!<!>")
+}
+
 /// Force-resolves a scalar's value under an explicit YAML tag.
 ///
 /// Handles the 5 core-schema tags (`!!str`, `!!null`, `!!bool`, `!!int`,
@@ -809,7 +819,8 @@ pub(crate) fn needs_explicit_float_tag_in_yaml(text: &str) -> bool {
 /// plain scalar, `Str` for quoted/block). Two cases answer
 /// [`Str`](ResolvedScalar::Str) for every other tag: the empty text (#6291),
 /// because a tag with no value is the empty string whatever the tag, and not
-/// the null `resolve_plain("")` would be; and a tag of the secondary handle
+/// the null `resolve_plain("")` would be (but the non-specific tag, [`is_non_specific_tag`], decides
+/// no kind and is `None` there, #6942); and a tag of the secondary handle
 /// (`!!binary`, `!!set`, `!!foo`, `!!str:`) on any scalar (#6299), which is its
 /// text in yq whatever the text would resolve to untagged. (The function sees
 /// the text and the tag, not the quoting, so it says `Str` for a quoted scalar
@@ -869,6 +880,9 @@ pub fn resolve_tagged(text: &str, tag: &str) -> Option<ResolvedScalar> {
         // (`!!seq`, `!!map`, `!!binary`, `!!timestamp`, `!custom`), as in yq: the tag decides the
         // kind, so the empty text is not a null. `!!null` and the tags above answer for
         // themselves; a tag with text goes on being read as that text.
+        // The non-specific tag `!` is no tag that decides a kind (#6942): yq reads the empty
+        // plain scalar it marks as null, as it does untagged, so it answers no override.
+        _ if is_non_specific_tag(tag) && text.is_empty() => None,
         _ if text.is_empty() => Some(ResolvedScalar::Str),
         // #6299: and a plain scalar under any other tag of the secondary handle (`!!binary`,
         // `!!set`, `!!foo`, and `!!str:`, whose `:` belongs to the tag) is its text, not what the
@@ -954,6 +968,23 @@ mod tests {
         assert_eq!(resolve_tagged("", "!!bool"), Some(Bool(false)));
         assert_eq!(resolve_tagged("", "!!int"), Some(Str));
         assert_eq!(resolve_tagged("", "!!float"), Some(Str));
+    }
+
+    /// #6942: the non-specific tag decides no kind, so on an empty scalar it resolves like no tag at
+    /// all (`None`: the caller reads the empty plain scalar, a null), where every tag above answers
+    /// the empty string. Both spellings of it do (`!` and the verbatim `!<!>`). With text it was
+    /// already no override (the text's own type), and stays so.
+    #[test]
+    fn the_non_specific_tag_on_an_empty_scalar_decides_no_kind_6942() {
+        for tag in ["!", "!<!>"] {
+            assert!(is_non_specific_tag(tag), "{tag}");
+            assert_eq!(resolve_tagged("", tag), None, "{tag}");
+            assert_eq!(resolve_tagged("x", tag), None, "{tag}");
+            assert_eq!(resolve_tagged("12", tag), None, "{tag}");
+        }
+        for tag in ["!!str", "!foo", "!<!foo>", "!!", "!!null"] {
+            assert!(!is_non_specific_tag(tag), "{tag}");
+        }
     }
 
     /// #6299: a plain scalar under a tag of the secondary handle that is not a core type is its

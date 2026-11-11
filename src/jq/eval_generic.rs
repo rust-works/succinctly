@@ -3053,7 +3053,10 @@ fn yq_type_tag<V: DocumentValue>(value: &V, cursor: Option<V::Cursor>) -> String
         // `!!null`, `! [a]` is `!!seq`. Reporting it as `!` was already wrong
         // for plain navigation (`.[0] | tag`); a selector that hands the node
         // on (#3690) made it visible one step further.
-        if let Some(tag) = c.explicit_tag().filter(|tag| *tag != "!") {
+        if let Some(tag) = c
+            .explicit_tag()
+            .filter(|tag| !crate::yaml::is_non_specific_tag(tag))
+        {
             // A verbatim tag is reported as what it spells, a core one in its `!!` form
             // (`!<tag:yaml.org,2002:binary>` is `!!binary`, `!<!foo>` is `!foo`), as yq reports it
             // (#5836).
@@ -3097,7 +3100,10 @@ fn yq_slices_to_empty_sequence<C: DocumentCursor, V: DocumentValue>(cursor: &C, 
     if cursor.is_alias() {
         return true;
     }
-    match cursor.explicit_tag().filter(|tag| *tag != "!") {
+    match cursor
+        .explicit_tag()
+        .filter(|tag| !crate::yaml::is_non_specific_tag(tag))
+    {
         Some(tag) => {
             let core = tag
                 .strip_prefix("!!")

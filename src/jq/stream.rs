@@ -1326,7 +1326,10 @@ fn stream_yaml_key_node<W: core::fmt::Write, C: DocumentCursor>(
         false
     };
     // yq drops the non-specific `!` (`! z` is `- z`).
-    match cursor.explicit_tag_of_non_alias().filter(|tag| *tag != "!") {
+    match cursor
+        .explicit_tag_of_non_alias()
+        .filter(|tag| !crate::yaml::is_non_specific_tag(tag))
+    {
         Some(tag) => {
             if after_property {
                 out.write_char(' ')?;

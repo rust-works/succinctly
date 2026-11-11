@@ -790,7 +790,9 @@ fn trace_at_depth(
                         // And its explicit tag (`!foo q`, #5469), as the `keys` writers give it.
                         let mut key_meta =
                             NodeMeta::from_comment_and_style(None, tree.key_style(key)).with_tag(
-                                tree.key_tag(key).filter(|t| *t != "!").map(str::to_string),
+                                tree.key_tag(key)
+                                    .filter(|t| !succinctly::yaml::is_non_specific_tag(t))
+                                    .map(str::to_string),
                             );
                         key_meta.anchor = tree
                             .key_anchor(key)

@@ -32,9 +32,10 @@ use super::flow_layout::{flow_continuation, render_flow, FlowItem};
 use super::index::YamlIndex;
 use super::line_break::{blank_line_between, is_line_break, line_break_len};
 use super::scalar::{
-    could_be_null_or_bool, is_overflowed_int_literal, is_preservable_float_literal, is_spelled_int,
-    is_zero_padded_with_8_or_9, preservable_float_literal_text, resolve_plain,
-    resolve_plain_sourced, resolve_tagged, whole_float_as_int, ResolvedScalar,
+    could_be_null_or_bool, is_non_specific_tag, is_overflowed_int_literal,
+    is_preservable_float_literal, is_spelled_int, is_zero_padded_with_8_or_9,
+    preservable_float_literal_text, resolve_plain, resolve_plain_sourced, resolve_tagged,
+    whole_float_as_int, ResolvedScalar,
 };
 use super::{starts_inline_seq_entry, starts_seq_entry};
 use crate::text::stream_region::{RegionGuard, StreamRegion};
@@ -479,19 +480,22 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     ///
     /// A null, unless an explicit tag other than `!!null` decides the kind (#6291): then the empty
     /// string, as for the same node followed by another line (`resolve_tagged`'s empty-text rule).
+    /// The non-specific tag (`!`, [`is_non_specific_tag`]) decides no kind and stays null (#6942).
     /// Two shapes reach here: a tag with nothing after it (`!!str` as the whole document, or the
     /// last value of the text), and the sentinel for an explicit key without a value (`? key`),
     /// which is no tagged node and so stays null (pinned in `tests/yq_cli/i6291.rs`).
     #[cold]
     fn value_of_empty_node(&self) -> YamlValue<'a, W> {
         match self.index.get_tag(self.bp_pos) {
-            Some(tag) if tag != "!!null" => YamlValue::String(YamlString::Unquoted {
-                text: self.text,
-                start: self.text.len(),
-                end: self.text.len(),
-                base_indent: 0,
-                json_sourced: self.index.canonicalize_numbers(),
-            }),
+            Some(tag) if tag != "!!null" && !is_non_specific_tag(tag) => {
+                YamlValue::String(YamlString::Unquoted {
+                    text: self.text,
+                    start: self.text.len(),
+                    end: self.text.len(),
+                    base_indent: 0,
+                    json_sourced: self.index.canonicalize_numbers(),
+                })
+            }
             _ => YamlValue::Null,
         }
     }

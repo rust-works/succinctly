@@ -696,6 +696,8 @@ An explicit `!!int 08` is the integer 8 on those routes too since [#6927](https:
 
 ### A tag with no value is the empty string, except `!!int` and `!!float` (#6291)
 
+The one tag that is not the empty string is the non-specific `!`, a null ([#6942](#a-lone--on-an-empty-node-is-null-6942)).
+
 A node that carries an explicit tag and no value (`k: !!seq`, `- !custom`, `--- !!str`) is the empty string in yq's JSON output and in a comparison with `""`.
 The tag decides the kind, so the empty text is not a null: `!!bool` is `false`, and only `!!null` is `null`.
 This reads it that way for every tag (`resolve_tagged`, and `value_of_empty_node` where the tag is the last thing in the text), where it used to answer `null` for every tag but `!!str` and `!!bool`.
@@ -715,6 +717,25 @@ Not covered here:
   Before this change `.k + 1` answered `1`, from a null, so it was wrong in another way.
 - `!!bool` compared with a string. yq compares a scalar's text, so an empty `!!bool` equals `""` and `!!bool yes` equals `"yes"`, where this compares the boolean ([#6292](https://github.com/rust-works/succinctly/issues/6292)).
 - A value-less tag in a flow collection (`[!!str]`, `{a: !!str}`), which yq refuses and this reads as `[""]` ([#6293](https://github.com/rust-works/succinctly/issues/6293)).
+
+### A lone `!` on an empty node is null (#6942)
+
+The non-specific tag `!` (and its verbatim spelling `!<!>`) decides no kind, so on a node with no value it is the empty plain scalar, a null, in yq: `a: !`, `- !`, `{a: ! , b: 1}` and a whole document of `!` are `null` in JSON output, a comparison with `null`, `tag` and `type`.
+Every other tag with no value is the empty string (#6291 above).
+This reads it that way (`resolve_tagged` answers no kind for an empty `!`, and `value_of_empty_node` leaves a `!` node null; `is_non_specific_tag` is the one definition of the tag), where it answered `""` before.
+A `!` with a value is unchanged: `a: ! 12` is the number `12` and `a: ! x` the string `x`, in both tools.
+`tag` answers the natural tag for a `!<!>` with a value (`!!int` for `a: !<!> 12`), as it already did for `!`; it answered `!` before.
+
+```console
+$ printf 'a: !\nb: 1\n' | yq -o=json -I0 .                  # {"a":null,"b":1}
+$ printf 'a: !\nb: 1\n' | succinctly yq -o json -I0 .        # {"a":null,"b":1}   ({"a":"","b":1} before #6942)
+```
+
+Not covered here:
+- The YAML output of these nodes. yq drops the `!` it reads (`a: !` prints `a:`, `a: ! x` prints `a: x`); this prints it back (`a: !`, `a: ! x`), and a write that fills the null keeps it (`(.. | select(. == null)) |= "N"` over `a: !` is `a: ! N` here and `a: N` in yq).
+  Because the `!` stays, a string written into such a node can read back as another value: `.x = "12"` over `x: !` prints `x: ! 12` (yq `x: "12"`), which both tools read as the number `12`, and `.x = ""` prints `x: !`, which now reads back as null in both tools (it read back as `""` here before #6942; yq prints `x: ""`).
+  The same happens over `x: ! a`, before and after this change.
+- A document that is only `!` prints nothing under `-o=yaml`, as `!!null` does, where yq prints a blank line (the empty-document output of #5721). It printed the blank line before #6942, because the node was the empty string.
 
 ### A scalar under an unknown `!!` tag is its text (#6299)
 
