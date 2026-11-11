@@ -10,6 +10,7 @@ Practical how-to documentation for using and developing succinctly.
 |-------|-------------|
 | [API Guide](api.md) | Using the library in your Rust projects |
 | [CLI Guide](cli.md) | Command-line tool (jq/yq replacement) |
+| [Choosing between jq and `succinctly jq`](choosing-jq.md) | Where each tool is the better choice, with the report rows behind every claim |
 
 ## Developer Guides
 
