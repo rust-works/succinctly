@@ -1109,6 +1109,71 @@ pub(crate) mod yq_delete_context {
     }
 }
 
+/// Whether the `del()` being resolved is one plain path (#6892), so no sibling can need the `null`
+/// placeholder a missing key reads as. The path resolver's `.[]` over
+/// `null` raises for the sake of that fallback (see `resolve_iterate_sink`); a lone target has no
+/// such sibling, and yq's `.[]` over a missing or null node yields no target, so the raise is the
+/// divergence. Ambient for the reason [`yq_delete_context`] is. `std` only.
+#[cfg(feature = "std")]
+pub(crate) mod yq_single_del_target {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ACTIVE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn active() -> bool {
+        ACTIVE.with(Cell::get)
+    }
+
+    /// Restores the previous state on drop.
+    #[must_use]
+    pub(crate) struct Guard(bool);
+
+    pub(crate) fn enter(single: bool) -> Guard {
+        Guard(ACTIVE.with(|c| c.replace(single)))
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ACTIVE.with(|c| c.set(self.0));
+        }
+    }
+}
+
+#[cfg(not(feature = "std"))]
+pub(crate) mod yq_single_del_target {
+    pub(crate) fn active() -> bool {
+        false
+    }
+
+    pub(crate) struct Guard;
+
+    pub(crate) fn enter(_single: bool) -> Guard {
+        Guard
+    }
+}
+
+/// Whether a `del()` target is one plain path (#6892): navigation (`.a`, `.[0]`, `.[]`, a slice),
+/// `select(f)`, parentheses, `?` and pipes of them, and nothing that can name a second target (a
+/// comma, `//`, `if`, a binding, a fold). The only targets for which the resolver may yield nothing
+/// over a `null`, since no sibling can need its placeholder; every other shape keeps the raise, so
+/// a wrapper added later does not become "single" by default.
+fn del_target_is_one_path(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::IndexExpr { .. }
+        | Expr::Iterate
+        | Expr::Slice { .. }
+        | Expr::Builtin(Builtin::Select(_)) => true,
+        Expr::Paren(inner) | Expr::Optional(inner) => del_target_is_one_path(inner),
+        Expr::Pipe(stages) => stages.iter().all(del_target_is_one_path),
+        _ => false,
+    }
+}
+
 /// A mapping member that a `<<` merge brought in, named by where its node really lives (#6785).
 ///
 /// yq models a merged member as the *source's* node, so a write through the merging mapping
@@ -57951,6 +58016,11 @@ fn resolve_iterate_sink<'a, S: EvalSemantics>(
         other if S::TAG == EvalTag::Yq && !matches!(other, OwnedValue::Null) => {
             ResolveFlow::Exhausted
         }
+        // #6892: a `null` too, for the only target of a `del()`: `del(.zz[] | select(.n == 1))`
+        // over a document without `zz` leaves it as it is, as yq does.
+        OwnedValue::Null if S::TAG == EvalTag::Yq && yq_single_del_target::active() => {
+            ResolveFlow::Exhausted
+        }
         other => ResolveFlow::Escaped(EvalError::cannot_iterate_with(S::TAG, other).into()),
     }
 }
@@ -86211,6 +86281,8 @@ fn resolve_del_path_branches<'a, S: EvalSemantics>(
     }
     // #4461: a slice bound's count error waits for a target that is in the document.
     let _deleting = (S::TAG == EvalTag::Yq).then(yq_delete_context::enter);
+    let _single =
+        (S::TAG == EvalTag::Yq).then(|| yq_single_del_target::enter(del_target_is_one_path(expr)));
     let untracked = if S::TAG == EvalTag::Yq {
         Untracked::KeepInOrder
     } else {
