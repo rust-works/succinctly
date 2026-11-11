@@ -62,7 +62,7 @@ fn the_refusal_holds_in_every_position_an_assignment_can_be_in_6981() -> Result<
 #[test]
 fn inplace_refuses_before_writing_6981() -> Result<()> {
     let mut file = NamedTempFile::new()?;
-    write!(file, "a: 4\n")?;
+    writeln!(file, "a: 4")?;
     let (_, stderr, code) = run_yq_files(".a /= 2", &[file.path()], &["-i"])?;
     assert_ne!(code, 0);
     assert!(stderr.contains("--jq-extensions"), "{stderr:?}");
