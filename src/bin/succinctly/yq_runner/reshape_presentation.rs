@@ -610,10 +610,28 @@ fn construct<C: DocumentCursor>(expr: &Expr, root: &C, depth: usize) -> Option<R
     }
 }
 
+/// Whether every `omit` in `expr` runs on the document itself: the whole filter, or the first stage
+/// of its pipe (#6906). The replay hands `omit` the tree of its input, and for a node below the root
+/// that tree carries the document's trailing comment, which yq does not print there
+/// (`.b | omit(["x"])` over a document with a foot comment); the plain route is right for those.
+fn omit_is_rooted(expr: &Expr) -> bool {
+    let holds_omit = |e: &Expr| {
+        succinctly::jq::walk::any_subexpr(e, &mut |e| matches!(e, Expr::Builtin(Builtin::Omit(_))))
+    };
+    match expr {
+        Expr::Builtin(Builtin::Omit(_)) => true,
+        Expr::Paren(inner) => omit_is_rooted(inner),
+        Expr::Pipe(parts) => parts
+            .split_first()
+            .is_some_and(|(first, rest)| omit_is_rooted(first) && !rest.iter().any(holds_omit)),
+        other => !holds_omit(other),
+    }
+}
+
 /// Skip ordinary navigation and writes, whose existing paths already carry
 /// metadata. A supported full expression must contain an actual reshape.
 pub(super) fn needed(expr: &Expr) -> bool {
-    if !supported(expr) {
+    if !supported(expr) || !omit_is_rooted(expr) {
         return false;
     }
     match expr {
@@ -1262,18 +1280,18 @@ fn omit_pair(keys: &Expr, input: &ResultWithComments) -> Option<ResultWithCommen
     };
     match value {
         OwnedValue::Object(members) => {
-            let mut listed = Vec::with_capacity(keys.len());
+            let mut listed = std::collections::BTreeSet::new();
             for key in &keys {
                 // A key that is not a string matches no member (the evaluator skips it too).
                 if let OwnedValue::String(key) = key {
-                    listed.push(key.as_ref());
+                    listed.insert(key.as_ref());
                 }
             }
             let mut kept = IndexMap::new();
             let mut fields = IndexMap::new();
             let mut key_metas = IndexMap::new();
             for (key, member) in members {
-                if listed.contains(&key.as_str()) {
+                if listed.contains(key.as_str()) {
                     continue;
                 }
                 kept.insert(key.clone(), member.clone());
@@ -1288,7 +1306,7 @@ fn omit_pair(keys: &Expr, input: &ResultWithComments) -> Option<ResultWithCommen
             ))
         }
         OwnedValue::Array(items) => {
-            let mut listed = Vec::with_capacity(keys.len());
+            let mut listed = std::collections::BTreeSet::new();
             for index in &keys {
                 // Only a non-negative integer removes anything: a negative index does not wrap and
                 // a string or float key matches nothing (#4257).
@@ -1296,7 +1314,7 @@ fn omit_pair(keys: &Expr, input: &ResultWithComments) -> Option<ResultWithCommen
                 | OwnedValue::NumberLiteral(NumberRepr::Int(index), _) = index
                 {
                     if let Ok(index) = usize::try_from(*index) {
-                        listed.push(index);
+                        listed.insert(index);
                     }
                 }
             }

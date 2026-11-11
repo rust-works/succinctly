@@ -7118,7 +7118,10 @@ Values are right in all three; only the comments and styles of the elements diff
 A comment after a block scalar's `|`/`>` indicator stays on the header line in the places the value is
 written where it stands: `.`, `-P`, and a write that leaves the scalar alone or replaces it.
 A plain copy (`.b = .a`), `pick` and `omit` keep it since [#5257](https://github.com/rust-works/succinctly/issues/5257), [#5003](https://github.com/rust-works/succinctly/issues/5003) and [#6906](https://github.com/rust-works/succinctly/issues/6906): `omit(["a"])` prints the rest of the document with its comments, flow style and quoting, as `pick` does.
-A key of the wrong kind for the node (`omit(["a"])` over a sequence, `omit([0])` over a mapping) matches nothing and the node comes through whole, as in yq.
+A key of the wrong kind for the node (`omit(["a"])` over a sequence, `omit([0])` over a mapping with string keys) matches nothing and the node comes through whole, as in yq.
+Only an `omit` that runs on the document itself (the whole filter, or the first stage of its pipe) keeps the presentation: `.b | omit(["x"])` and a document over 1 MiB print the plain block YAML, as before.
+Still divergent: a head comment after a `---` marker goes with the first key when that key is omitted (`---` / `# head` / `a: 1` / `b: 2` with `omit(["a"])`), where yq keeps it with the document; `pick` does the same.
+Still divergent: yq reads an integer key as the text of a mapping key (`1: a` / `2: b` with `omit([1])` is `2: b`), which `omit` and `pick` here match only for a string key.
 A copy made through a variable (`. as $v | {"z": $v}`), a recursive merge over it (`. *d {"a": "n"}`) and a slice (`.[0:1]`) carry no such comment, where yq keeps it ([#5003](https://github.com/rust-works/succinctly/issues/5003)).
 
 `pick` copies the document's nodes, so what it keeps is printed as written: trailing comments, flow style, quoting, anchors, tags, a key's own quoting and comment, and the document's head comment.
