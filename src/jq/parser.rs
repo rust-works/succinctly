@@ -2683,11 +2683,23 @@ impl<'a> Parser<'a> {
     /// point at the keyword's own start, matching every other gated name's
     /// convention, instead of wherever the lookahead left `self.pos`.
     fn reject_unless_jq_extensions_at(&self, name: &str, pos: usize) -> Result<(), ParseError> {
+        self.reject_unless_jq_extensions_surface(name, pos, "builtin surface")
+    }
+
+    /// The one definition of the `--jq-extensions` gate: yq mode without the flag refuses `name`
+    /// at `pos`, with the kind of surface the flag opts back into (`builtin surface`, `operators`)
+    /// in the message. Every gated construct goes through here.
+    fn reject_unless_jq_extensions_surface(
+        &self,
+        name: &str,
+        pos: usize,
+        surface: &str,
+    ) -> Result<(), ParseError> {
         if self.mode == ParserMode::Yq && !self.jq_extensions {
             return Err(ParseError::new(
                 format!(
                     "\"{name}\" is not part of yq's syntax; pass --jq-extensions to enable \
-                     succinctly's jq-compatible builtin surface"
+                     succinctly's jq-compatible {surface}"
                 ),
                 pos,
             ));
@@ -2700,16 +2712,7 @@ impl<'a> Parser<'a> {
     /// `.a /= 2` as `/` with a missing operand and stops (`'/' expects 2 args but there is 1`).
     /// `+=`, `-=`, `*=` and `|=` are yq's own. Called with the cursor on the operator.
     fn reject_jq_only_assignment_unless_jq_extensions(&self, op: &str) -> Result<(), ParseError> {
-        if self.mode == ParserMode::Yq && !self.jq_extensions {
-            return Err(ParseError::new(
-                format!(
-                    "\"{op}\" is not part of yq's syntax; pass --jq-extensions to enable \
-                     succinctly's jq-compatible operators"
-                ),
-                self.pos,
-            ));
-        }
-        Ok(())
+        self.reject_unless_jq_extensions_surface(op, self.pos, "operators")
     }
 
     /// Unlike [`reject_unless_jq_extensions`], `--jq-extensions` never

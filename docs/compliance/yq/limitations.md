@@ -138,7 +138,7 @@ evaluates the collected documents through the owned-value route, which has no re
 comments and no style, so a filter that reads the document *list* (`[.]`, `,`, `.a = .b`,
 `|= . + 1`, a builtin, a variable) still writes `b` positionally and drops the marks. A filter
 that only navigates (`.`, `.a.b`, `.[0]`, `.[]`, `..`) or writes a literal (`.b.p = 9`,
-`.n += 1`, `del(.a)`) takes the plain per-document route instead and keeps all of it
+`.n += 1`, `del(.a)`, and `.a //= 7` under `--jq-extensions`) takes the plain per-document route instead and keeps all of it
 ([#4380](https://github.com/rust-works/succinctly/issues/4380); the gate is
 `eval_all_matches_per_document` in `m2_gate.rs`). The rerouted run first evaluates the list
 the old way, so the bridge's refusals (nesting depth, colliding keys, stray commas), a later
@@ -2398,6 +2398,7 @@ Not reproduced:
   Both write nothing here, where yq writes to the matching nodes.
 - **`+=`, `-=`, `*=` and `//=` on a `(PATH | key)` target are a parse error.**
   yq accepts `+=` (`(.a.x | key) += "z"` is `xz`) and errors for the others.
+  Without `--jq-extensions`, `//=` is refused earlier still, as an operator yq lacks (#6981), and the key-target refusal is the one with the flag.
   They used to be a silent no-op, which discarded the write (ADR-0018 rule 4(b)); a refusal keeps the write from vanishing.
 - **A rename through an alias** (`a: &r {x: 1}` / `b: *r`, `(.b.x | key) = "z"`) renames only the copy under `b`, and prints it as a mapping, where yq renames the anchor's node (`a: &r {z: 1}` / `b: *r`).
 

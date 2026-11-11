@@ -6,9 +6,12 @@
 //! The refusals are captured from yq v4.53.3 (`a: 4`); the answers with the flag are this tool's
 //! own, since there is no yq answer to match.
 
-use anyhow::Result;
+use std::io::Write;
 
-use crate::{run_jq_stdin, run_yq_stdin, run_yq_stdin_with_stderr};
+use anyhow::Result;
+use tempfile::NamedTempFile;
+
+use crate::{run_jq_stdin, run_yq_files, run_yq_stdin, run_yq_stdin_with_stderr};
 
 const GATED: &[(&str, &str)] = &[(".a /= 2", "/="), (".a %= 2", "%="), (".a //= 3", "//=")];
 
@@ -24,6 +27,50 @@ fn the_compound_assignments_yq_lacks_are_refused_without_the_flag_6981() -> Resu
             "{filter}: {err:?}"
         );
     }
+    Ok(())
+}
+
+/// The gate sits in the assignment parser, so it has to hold wherever an assignment can: after a
+/// pipe, in a parenthesised or comma target, under `with`, nested, behind a path, and on the
+/// `--eval-all`, `-P` and `--inplace` routes. yq refuses every one of these filters.
+#[test]
+fn the_refusal_holds_in_every_position_an_assignment_can_be_in_6981() -> Result<()> {
+    for filter in [
+        ".a /= 2 | .b",
+        ".b = 1 | .a %= 2",
+        "(.a, .b) //= 3",
+        "(.a /= 2)",
+        "with(.a; . /= 2)",
+        ".a.b //= 3",
+        ".[\"a\"] %= 3",
+        "[.a] | .[0] /= 2",
+        ".c = (.a //= 3)",
+    ] {
+        for args in [&["-o=json", "-I=0"][..], &["-P"], &["--eval-all"]] {
+            let (out, err, code) = run_yq_stdin_with_stderr(filter, "a: 4\n", args)?;
+            assert_ne!(code, 0, "{filter} {args:?}: stdout={out:?}");
+            assert!(
+                err.contains("is not part of yq's syntax") && err.contains("--jq-extensions"),
+                "{filter} {args:?}: {err:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `--inplace` refuses before it touches the file.
+#[test]
+fn inplace_refuses_before_writing_6981() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    write!(file, "a: 4\n")?;
+    let (_, stderr, code) = run_yq_files(".a /= 2", &[file.path()], &["-i"])?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("--jq-extensions"), "{stderr:?}");
+    assert_eq!(std::fs::read(file.path())?, b"a: 4\n");
+    // With the flag the write goes through.
+    let (_, stderr, code) = run_yq_files(".a %= 3", &[file.path()], &["-i", "--jq-extensions"])?;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(std::fs::read(file.path())?, b"a: 1\n");
     Ok(())
 }
 
