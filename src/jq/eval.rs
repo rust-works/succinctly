@@ -106767,12 +106767,21 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 None => Some(secs),
                 Some(zone) => secs.checked_add(zone.offset_secs),
             };
-            let t = ok_or_result::<W, _>(
+            let mut t = ok_or_result::<W, _>(
                 shifted
                     .ok_or_else(EvalError::datetime_out_of_range)
                     .and_then(broken_down_time_from_unix_secs),
                 optional,
             )?;
+            // #7004: jq formats a number through the array `gmtime`/`localtime` returns, whose
+            // seconds slot is `tm_sec + (t - floor(t))` ([`broken_down_seconds`]), read back as an
+            // `int` (`jv2tm`). Just below zero that sum rounds to `1.0` (`-1e-17 - (-1)`), so jq
+            // prints second `01` where the truncated timestamp's own second is `00`. A NaN
+            // timestamp keeps the second it has, as jq's does.
+            let seconds = broken_down_seconds(t.second, timestamp);
+            if seconds.is_finite() {
+                t.second = seconds as i64;
+            }
             Ok((t, zone))
         }
         // #1820: `scalar_decode_failure` first, same shape as
