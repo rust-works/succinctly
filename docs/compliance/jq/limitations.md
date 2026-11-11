@@ -7273,6 +7273,69 @@ A caller that pipes a producer that does not end has to bound it (`head -c`, `ti
 
 The endless-stream rows were measured on `main` @ 89a900ccc against `/usr/bin/jq` 1.7.1, and the held-open table again on c44d34dd4 with the same times; both are behaviour probes that do not depend on the machine.
 
+## Peak memory on a stream of many values grows with the input (#6913)
+
+On a file of many top-level values (NDJSON), `succinctly jq`'s peak memory grows linearly with the file, where jq 1.7.1's stays at a few MB whatever the size.
+This is a known limitation, not supported at this stage: it is outside the three reasons ADR-0018 permits a divergence for, so it is a deferred gap and not a deliberate behaviour.
+It shares its blocker with the stdin limitation above (what releases consumed text, given that a fault is worded by re-reading it), so it needs a design of its own and is not fixed here.
+The figures below are for files; stdin was not measured, and neither were the slurp shapes (`-s`, `-R -s`), where jq holds the input too.
+At 100 MB succinctly is still faster than jq on every row below except `first(inputs)`, on both machines ([docs/compare/jq.md](../../compare/jq.md)): this is a memory trade, not a speed one.
+The `--seq` and `--stream` routes were not measured for this entry.
+For a log too large to hold in memory, use jq, or split the file and run each part (`split -l`).
+
+Peak resident set size of `succinctly jq ARGS FILE`, in MiB, over `json generate <size> -p ndjson` (about 105 bytes to a record, 993,416 records at 100 MiB).
+Each figure is `wait4`'s `ru_maxrss` for one run under a 2 GiB cap, on `main` @ 3fee4b116 built with `--features cli`, measured on `terminus` and `johns-mac-mini` and not on a laptop.
+
+AMD Ryzen 9 7950X, x86_64:
+
+| query                                     | 1 MiB | 10 MiB | 100 MiB |
+|-------------------------------------------|------:|-------:|--------:|
+| `-c .` (`ndjson_identity`)                |   9.4 |   20.2 |   123.4 |
+| `-r .name` (`ndjson_field`)               |  10.0 |   20.5 |   123.6 |
+| `-c 'select(.score>500)\|.id'`            |  11.7 |   21.9 |   125.9 |
+| `-n 'reduce inputs as $u (0;.+$u.score)'` |  13.2 |   21.8 |   111.9 |
+| `-R length` (`ndjson_raw_lines`)          |   9.5 |   18.4 |   108.1 |
+| `-n 'first(inputs)\|.id'`                 |  12.0 |   11.9 |    11.7 |
+
+Apple M4 Pro, aarch64:
+
+| query                                     | 1 MiB | 10 MiB | 100 MiB |
+|-------------------------------------------|------:|-------:|--------:|
+| `-c .` (`ndjson_identity`)                |   6.2 |   16.7 |   122.2 |
+| `-r .name` (`ndjson_field`)               |   6.4 |   16.9 |   122.4 |
+| `-c 'select(.score>500)\|.id'`            |   7.1 |   17.6 |   123.2 |
+| `-n 'reduce inputs as $u (0;.+$u.score)'` |   8.1 |   17.2 |   107.3 |
+| `-R length` (`ndjson_raw_lines`)          |   6.0 |   15.1 |   105.1 |
+| `-n 'first(inputs)\|.id'`                 |   6.2 |    6.3 |     6.3 |
+
+Each machine generated its own files, and the 1 MiB file is byte-identical to the one generated elsewhere.
+jq 1.7.1's peak at 100 MiB is 2.6 to 3.2 MiB in the committed [docs/compare/](../../compare/jq.md) reports, and the `main` @ 968a5fa84 runs there put succinctly at 109 to 128 MiB on the five rows that grow, which these runs match to within 5%.
+
+What holds the memory, from the slope between 10 and 100 MiB (MiB of peak per MiB of input) and from the code:
+
+- **The whole text, 1.00 per MiB, on every route that reads the file.**
+  `-n` programs that read `input`/`inputs` and `-R` slope at 1.00 on both machines.
+  The lone-source lazy route ([#6451](https://github.com/rust-works/succinctly/issues/6451)) reads only the first 256 KiB before the program starts, which is why `first(inputs)` is flat, but `read_lazy_rest` drains the rest of the file into the same buffer when the scan gets past it, and `LazyJsonInputs::text` is dropped only with the source's last document.
+  The documents are converted one at a time and dropped, and the output is written as it goes, so neither the values nor the results are retained.
+  Its `spans` are one chunk's (at most 512 KiB of text; `lazy_scan_on` clears them before each scan), so they add nothing that scales: the slope is the text alone.
+- **A span per document, about 0.15 per MiB more, on the plain route.**
+  `-c .`, `.name` and `select` slope at 1.15 to 1.17.
+  That route calls `split_json_values` over the whole file before its loop, which returns a `Vec<(usize, usize)>` of every document's byte range: 16 bytes for each of the 993,416 records, 15.2 MiB.
+  The same 100 MiB cut into 9,935 documents (100 records to an array) peaked at 108.7 MiB (x86_64) and 105.3 MiB (aarch64) for `-c .`, against 123.4 and 122.2 for the one-record-per-line file: the 14.7 and 16.9 MiB between them is the span vector, and what is left is the text.
+- **A constant part of 6 to 12 MiB**, which `first(inputs)` shows at every size: it reads only the front of the file.
+
+What keeps it from being constant is not the read itself.
+Each of these needs the text before the point being read, or a count over all of it:
+
+- A fault is worded by re-reading the whole stream (`StreamFault`, `jq_stream_fault(parser_chunks(...))`).
+- Line numbers resume a `LineCounter` over the text, and a file's start is counted over all of the file before it (`advance_position`).
+- The end of the stream (`EofTail::of_clean_source`) is read off the text.
+- A fault hands the stream to the eager reader at the end of the last good document (`read_json_tail`), which reads from the text.
+
+A windowed route has to carry each of those as a running summary of the dropped prefix (newlines so far, the position, the last bytes), and has to re-read a regular file from disk for a fault, as the slurp route already does (`reread_stream_fault`).
+Stdin cannot be re-read, so its fault wording needs the bytes kept or a worded-as-it-goes parser.
+Dropping the span vector alone would take about 0.15 per MiB off the plain route and would not make it constant.
+
 ## Nesting depth (#5497)
 
 [#5497](https://github.com/rust-works/succinctly/issues/5497) decided each row under ADR-0018.
