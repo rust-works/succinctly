@@ -26856,10 +26856,11 @@ pub fn output_encoder_saw_truthy() -> Option<bool> {
     }
 }
 
-/// yq's `--properties-separator`, `--properties-array-brackets` and `--csv-separator`, which yq
-/// reads for the `@props` / `to_props` and `@csv` / `to_csv` operators as well as for `-o=props`
-/// and `-o=csv` (#6922): every `@props` and `@csv` a yq-mode program runs uses them, including one
-/// in the text an `eval` reads or in `format("csv")`. `@tsv` keeps its tab, as in yq.
+/// yq's `--properties-separator`, `--properties-array-brackets` and `--csv-separator` (#6922).
+///
+/// yq reads them for the `@props` / `to_props` and `@csv` / `to_csv` operators as well as for
+/// `-o=props` and `-o=csv`: every `@props` and `@csv` a yq-mode program runs uses them, including
+/// one in the text an `eval` reads or in `format("csv")`. `@tsv` keeps its tab, as in yq.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct YqEncoderPrefs {
     /// Between a key and its value; empty means yq's default ` = `.
@@ -26880,8 +26881,9 @@ impl Default for YqEncoderPrefs {
     }
 }
 
-/// Set the [`YqEncoderPrefs`] every later yq-mode `@props` and `@csv` uses, for the whole process
-/// (#6922). The CLI calls it once, from the flags. A process-wide setting, as yq's own
+/// Set the [`YqEncoderPrefs`] every later yq-mode `@props` and `@csv` uses (#6922).
+///
+/// The CLI calls it once, from the flags. A process-wide setting, as yq's own
 /// `ConfiguredPropertiesPreferences` and `ConfiguredCsvPreferences` are, and not a
 /// `thread_local!`: the evaluator may run on a worker thread with a larger native stack
 /// (ADR-0025). Without `std` the defaults always apply.
