@@ -25760,7 +25760,7 @@ fn format_json<S: EvalSemantics>(value: &OwnedValue) -> Result<String, EvalError
 ///
 /// yq mode returns `None` for a container. Only `@html` (a jq-only format, behind
 /// `--jq-extensions`) still reaches that arm there: `format_uri` and `format_base64`
-/// refuse every non-string first in yq mode, naming its tag as yq does (#6980).
+/// refuse every non-string first in yq mode ([`encoder_input_text`], #6980).
 ///
 /// One definition instead of a hand-copy per caller, per this file's own
 /// #106 lesson (see [`owned_value_to_json`]'s doc comment, which this
@@ -25786,15 +25786,22 @@ fn stringify_for_format<S: EvalSemantics>(value: &OwnedValue) -> Option<String> 
     })
 }
 
-fn format_uri<S: EvalSemantics>(value: &OwnedValue, _optional: bool) -> Result<String, EvalError> {
-    // yq encodes a string only: a value the filter computes is refused as a document node is
-    // (#5836), with the wording `-o=uri` uses (#6980).
-    if S::TAG == EvalTag::Yq && !matches!(value, OwnedValue::String(_)) {
-        return Err(yq_encoder_needs_a_string(value, "URI"));
+/// The text `@uri` and `@base64` encode. jq stringifies any other value first (`42 | @uri` is
+/// `"42"`, a container its JSON text, #1096); yq encodes a string only, and refuses anything else by
+/// its tag with the wording of `-o=uri` / `-o=base64`, as it does for a document node (#5836, #6980).
+fn encoder_input_text<S: EvalSemantics>(
+    value: &OwnedValue,
+    yq_format: &str,
+) -> Result<String, EvalError> {
+    match value {
+        OwnedValue::String(s) => Ok(s.to_string()),
+        _ if S::TAG == EvalTag::Yq => Err(yq_encoder_needs_a_string(value, yq_format)),
+        _ => Ok(stringify_for_format::<S>(value).expect("jq mode stringifies every value")),
     }
-    // jq converts non-strings to strings first (e.g., 42 | @uri => "42")
-    let s = stringify_for_format::<S>(value)
-        .ok_or_else(|| EvalError::type_error("string", value.type_name()))?;
+}
+
+fn format_uri<S: EvalSemantics>(value: &OwnedValue, _optional: bool) -> Result<String, EvalError> {
+    let s = encoder_input_text::<S>(value, "URI")?;
 
     // Byte-oriented rather than char-oriented: percent-encoding acts on raw
     // bytes anyway, and every safe byte is ASCII, so a multi-byte character's
@@ -26263,30 +26270,9 @@ fn format_dsv<S: EvalSemantics>(
 /// @base64 - Base64 encode (simple implementation without external crate)
 fn format_base64<S: EvalSemantics>(
     value: &OwnedValue,
-    optional: bool,
+    _optional: bool,
 ) -> Result<String, EvalError> {
-    // yq encodes a string only, as `format_uri` explains (#6980).
-    if S::TAG == EvalTag::Yq && !matches!(value, OwnedValue::String(_)) {
-        return Err(yq_encoder_needs_a_string(value, "base64"));
-    }
-    // jq converts non-strings to strings first, same as `@uri`/`@html`
-    // (including JSON-encoding a container in jq mode, #1096).
-    let s = match stringify_for_format::<S>(value) {
-        Some(s) => s,
-        // Mirrors every sibling format's own `_ if optional =>
-        // Ok(String::new())` arm (`format_tsv`/`format_dsv`/`format_csv`
-        // above) for consistency, but is very likely
-        // unreachable dead code post-#693 for the same reason those are:
-        // `Expr::Optional` now forces the inner evaluation's ambient
-        // `optional` to `false` and catches the resulting `Error` itself,
-        // rather than letting a builtin's own internal `optional` flag see
-        // `true` (see `test_isvalid_reaches_every_builtins_own_optional_guard`'s
-        // doc comment). Confirmed via `cargo llvm-cov`: all four sibling
-        // arms are equally uncovered on this branch, so this one matching
-        // them isn't a new gap.
-        None if optional => return Ok(String::new()),
-        None => return Err(EvalError::type_error("string", value.type_name())),
-    };
+    let s = encoder_input_text::<S>(value, "base64")?;
 
     // Simple base64 encoding
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
