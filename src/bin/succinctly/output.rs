@@ -1062,7 +1062,8 @@ fn scalar_json_text(value: &OwnedValue, opts: &JsonFormatOpts) -> String {
                         // #1129: but an integer past `i64` is encoded as the
                         // double yq parsed, where its text is what `tostring`
                         // and YAML output echo.
-                        _ => succinctly::yaml::yq_json_number_text(literal)
+                        // #6899: the float `08` is `8.0`, the `!!int 08` is `8`: the repr tells.
+                        _ => succinctly::yaml::yq_json_number_text_for(literal, repr.is_float())
                             .unwrap_or_else(|| literal.to_string()),
                     },
                     // jq's default: `format_number_jq_compat`'s reformatting,

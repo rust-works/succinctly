@@ -305,7 +305,7 @@ pub use scalar::whole_float_as_int;
 pub use scalar::NONFINITE_LITERALS;
 pub use scalar::{
     int_text_reads_back_as_string, is_signed_prefixed_int_text, is_spelled_float, is_spelled_int,
-    spelled_float_json_text, spelled_int_json_text, yq_json_number_text,
+    spelled_float_json_text, spelled_int_json_text, yq_json_number_text, yq_json_number_text_for,
 };
 pub(crate) use scalar::{
     is_overflowed_int_literal, is_zero_padded_with_8_or_9, nonfinite_literal_index,
