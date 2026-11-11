@@ -24478,7 +24478,10 @@ fn test_front_matter_process_empty_filter_no_spurious_blank_line_1701() -> Resul
         &["--jq-extensions", "--front-matter", "process", "-0"],
     )?;
     assert_eq!(code, 0);
-    assert_eq!(output, "---\n---\nbody one\n");
+    // No document is written, so no opening `---` is echoed either: yq writes the front matter's own
+    // opening line as the header of the document it prints (#6910); `empty` is not a yq builtin, so
+    // this row is the header rule applied, not a capture.
+    assert_eq!(output, "---\nbody one\n");
     Ok(())
 }
 
@@ -24509,23 +24512,29 @@ fn test_front_matter_extract_rejects_inplace() -> Result<()> {
     Ok(())
 }
 
+/// yq reads an input with no front matter as all front matter (#6910): `just: yaml` has no `---` and no
+/// body, and `.just` is `yaml`, not an error.
 #[test]
-fn test_front_matter_no_fence_errors() -> Result<()> {
-    let (_output, _stderr, code) =
-        run_yq_stdin_with_stderr(".", "just: yaml\n", &["--front-matter", "extract"])?;
-    assert_ne!(code, 0);
+fn test_front_matter_no_fence_is_all_front_matter_6910() -> Result<()> {
+    let (output, stderr, code) =
+        run_yq_stdin_with_stderr(".just", "just: yaml\n", &["--front-matter", "extract"])?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(output, "yaml\n");
     Ok(())
 }
 
+/// An unterminated front matter is all front matter too: here it is not one YAML document, which yq
+/// refuses as a YAML error (it was this tool's own `unterminated` error before #6910).
 #[test]
-fn test_front_matter_unterminated_errors() -> Result<()> {
-    let (_output, stderr, code) = run_yq_stdin_with_stderr(
+fn test_front_matter_unterminated_is_read_as_yaml_6910() -> Result<()> {
+    let (output, stderr, code) = run_yq_stdin_with_stderr(
         ".",
         "---\ntitle: foo\nno closing fence\n",
         &["--front-matter", "extract"],
     )?;
     assert_ne!(code, 0);
-    assert!(stderr.contains("unterminated"), "stderr: {stderr}");
+    assert_eq!(output, "");
+    assert!(!stderr.contains("unterminated"), "stderr: {stderr}");
     Ok(())
 }
 
@@ -24670,7 +24679,8 @@ fn test_front_matter_process_preserves_crlf_line_endings() -> Result<()> {
         &["--front-matter", "process"],
     )?;
     assert_eq!(code, 0, "stderr: {stderr}");
-    assert_eq!(output, "---\ntitle: X\n---\r\nBody\r\ntext\r\n");
+    // The opening `---` is the input's own line, CRLF and all (captured from yq v4.53.3, #6910).
+    assert_eq!(output, "---\r\ntitle: X\n---\r\nBody\r\ntext\r\n");
     Ok(())
 }
 
