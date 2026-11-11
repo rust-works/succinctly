@@ -106767,12 +106767,22 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 None => Some(secs),
                 Some(zone) => secs.checked_add(zone.offset_secs),
             };
-            let t = ok_or_result::<W, _>(
+            let mut t = ok_or_result::<W, _>(
                 shifted
                     .ok_or_else(EvalError::datetime_out_of_range)
                     .and_then(broken_down_time_from_unix_secs),
                 optional,
             )?;
+            // #7004: jq formats a number through the array `gmtime`/`localtime` returns, whose
+            // seconds slot is `tm_sec + (t - floor(t))` ([`broken_down_seconds`]), read back as an
+            // `int` (`jv2tm`). For a negative timestamp a hair below a whole second that sum rounds
+            // up to the next integer: `-1e-17` is second `01` where its truncated second is `00`,
+            // and `-1.0000000000000002` is `59 + 0.9999999999999998`, so second `60`
+            // (`23:59:60`), both as in jq. A NaN timestamp keeps the second it has, as jq's does
+            // (an infinite one was refused as out of range above).
+            if !timestamp.is_nan() {
+                t.second = jq_tm_field(broken_down_seconds(t.second, timestamp) as i64);
+            }
             Ok((t, zone))
         }
         // #1820: `scalar_decode_failure` first, same shape as
