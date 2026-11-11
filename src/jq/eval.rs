@@ -5052,6 +5052,51 @@ pub(crate) fn yq_empty_context_reemit(expr: &Expr) -> Option<Expr> {
     }
 }
 
+/// Whether [`yq_empty_context_reemit`] *may* answer `Some` for `expr`: the cheap, allocation-free
+/// test the pipe entry asks before it builds anything (#6943), which runs on every yq-mode pipe.
+///
+/// Never `false` where the rewrite exists, and `true` for a few shapes it then declines (an object
+/// key that is not a literal): a `true` costs one lazy count of the stage before it, a `false`
+/// would lose the rule. `test_yq_stage_can_reemit_covers_the_rewrite_6943` holds the two together.
+pub(crate) fn yq_stage_can_reemit(expr: &Expr) -> bool {
+    yq_stage_can_reemit_in(expr, true)
+}
+
+/// [`yq_stage_can_reemit`], where `arrays` says whether a collection `[...]` counts. It always
+/// re-emits (`[]`, whatever its body), and it is the most common stage a pipe has after its
+/// head (`.users | [.[]]`), so a caller that must not disturb the routes that build those lazily
+/// asks without it and handles an empty answer afterwards.
+pub(crate) fn yq_stage_can_reemit_in(expr: &Expr, arrays: bool) -> bool {
+    match super::eval_generic::strip_parens(expr) {
+        Expr::Literal(_) => true,
+        Expr::Array(_) => arrays,
+        Expr::Object(entries) => entries.iter().all(|entry| {
+            !matches!(entry.key, ObjectKey::Bare)
+                && match &entry.key {
+                    ObjectKey::Expr(key) => yq_stage_can_reemit_in(key, arrays),
+                    _ => true,
+                }
+                && yq_stage_can_reemit_in(&entry.value, arrays)
+        }),
+        Expr::Comma(branches) => branches
+            .iter()
+            .any(|branch| yq_stage_can_reemit_in(branch, arrays)),
+        Expr::Negate(operand) => yq_stage_can_reemit_in(operand, arrays),
+        Expr::Error(Some(message)) => yq_stage_can_reemit_in(message, arrays),
+        Expr::Arithmetic { left, right, .. } | Expr::Compare { left, right, .. } => {
+            yq_stage_can_reemit_in(left, arrays) && yq_stage_can_reemit_in(right, arrays)
+        }
+        Expr::And(left, right) | Expr::Or(left, right) => {
+            yq_stage_can_reemit_in(left, arrays) && yq_stage_can_reemit_in(right, arrays)
+        }
+        Expr::Alternative(left, _) => yq_stage_can_reemit_in(left, arrays),
+        Expr::Pipe(stages) => stages
+            .iter()
+            .any(|stage| yq_stage_can_reemit_in(stage, arrays)),
+        _ => false,
+    }
+}
+
 /// The operands of a binary operator under [`yq_empty_context_reemit`]: both
 /// must re-emit. An operand that reads its input is empty against an empty
 /// context, but what yq then does is not one rule -- `1 == .b` is `false`
@@ -40594,6 +40639,13 @@ impl<'p> RestTail<'p> {
             stages: owner,
             owner: Some(owner),
         }
+    }
+
+    /// Whether these are all the stages of the pipe that owns them: the pipe as written, not a
+    /// rest a driver derived from it for one value of an earlier stage (#6943).
+    pub(crate) fn is_whole(self) -> bool {
+        self.owner
+            .is_some_and(|owner| owner.len() == self.stages.len())
     }
 
     /// A slice nothing keeps copies for.
@@ -126631,6 +126683,66 @@ mod tests {
         for src in [".", ".b", "length", "select(true)", "tostring", "keys"] {
             assert_eq!(reemit(src), None, "`{src}`");
         }
+    }
+
+    /// #6943: the allocation-free test the pipe entry asks never says `false` where the rewrite
+    /// exists (a `true` for a shape the rewrite then declines is fine: it costs one count), and the
+    /// no-array form leaves out only a collection.
+    #[test]
+    fn test_yq_stage_can_reemit_covers_the_rewrite_6943() {
+        let corpus = [
+            "1",
+            "\"s\"",
+            "-1",
+            "null",
+            "[1, 2]",
+            "[]",
+            "{}",
+            "{\"q\": 1}",
+            "{\"q\": [1]}",
+            "{\"q\": .b}",
+            "{\"k\": 1, \"j\": .}",
+            "{(1): 2}",
+            "{(.b): 1}",
+            "(1, .b)",
+            "(.b, .c)",
+            "1 + 1",
+            "1 + .b",
+            ".b + 1",
+            "1 == 1",
+            "1 // 3",
+            ". // 3",
+            "1 // .b",
+            "1 and true",
+            ".a and true",
+            "error(\"x\")",
+            "error(\"x\" + \"y\")",
+            "error(.q)",
+            "error",
+            ".a | true | not",
+            "[1] | length",
+            ".a | length | 7",
+            ".b | .c",
+            ".",
+            ".b",
+            "length",
+            "select(true)",
+            "tostring",
+            "keys",
+            "(1 | . + 1)",
+            "map(1)",
+            "[.[] | 1]",
+        ];
+        for src in corpus {
+            let expr = crate::jq::parse_with_mode(src, ParserMode::Yq).unwrap();
+            if yq_empty_context_reemit(&expr).is_some() {
+                assert!(yq_stage_can_reemit(&expr), "`{src}` re-emits");
+            }
+        }
+        // The one stage the no-array form leaves out.
+        let array = crate::jq::parse_with_mode("[.[]]", ParserMode::Yq).unwrap();
+        assert!(yq_stage_can_reemit(&array));
+        assert!(!yq_stage_can_reemit_in(&array, false));
     }
 
     /// #1755 (now against `collect_rhs_outputs`, #1778's replacement for

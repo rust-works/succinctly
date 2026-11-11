@@ -86,11 +86,11 @@ use super::eval::{
     yq_empty_context_reemit, yq_empty_operand_output, yq_field_index_on_scalar_is_empty,
     yq_first_of_each_key, yq_index_key_is_numeric, yq_literal_index_text, yq_mapping_index_text,
     yq_negative_index_check, yq_negative_index_error, yq_numeric_index_on_object_is_null,
-    yq_object_key_stringify, yq_read_only_context, yq_scalar_text, yq_sort_by, BinaryFanoutRules,
-    ComputedSliceBound, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
-    JqSemantics, LimitN, PathTrail, QueryResult, RangeEnd, RangeNum, Reentry, RestPipe, RestTail,
-    RootWitness, SliceTargetKind, StashedEscape, StashedVerdict, YqSemantics,
-    DEFERRED_BIND_UNRESOLVED, MAX_RANGE_TOTAL,
+    yq_object_key_stringify, yq_read_only_context, yq_scalar_text, yq_sort_by, yq_stage_can_reemit,
+    yq_stage_can_reemit_in, BinaryFanoutRules, ComputedSliceBound, Control, Demand, EmptyOperandOp,
+    EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail, QueryResult, RangeEnd,
+    RangeNum, Reentry, RestPipe, RestTail, RootWitness, SliceTargetKind, StashedEscape,
+    StashedVerdict, YqSemantics, DEFERRED_BIND_UNRESOLVED, MAX_RANGE_TOTAL,
 };
 use super::eval::{owned_slot_mut, static_path_steps, StepKey};
 #[cfg(test)]
@@ -15321,6 +15321,12 @@ impl<'a> PipeWhole<'a> {
         }
     }
 
+    /// Whether `exprs` are all the stages of the pipe this was given: the pipe as written, not a
+    /// sub-slice a driver took for one cursor element (#6943).
+    fn is_whole(&self, exprs: &[Expr]) -> bool {
+        matches!(self.given, Some(Expr::Pipe(stages)) if core::ptr::eq(stages.as_slice(), exprs))
+    }
+
     /// The pipe over `exprs`, which must be the stages this was made for.
     fn get(&self, exprs: &[Expr]) -> &Expr {
         self.given.unwrap_or_else(|| {
@@ -15339,6 +15345,56 @@ impl<'a> PipeWhole<'a> {
 /// that answers several cursors no longer deep-clones the rest of the pipe
 /// once per evaluation (#3502), nor once per cursor element.
 fn eval_single_pipe<S: EvalSemantics, V: DocumentValue>(
+    exprs: &[Expr],
+    whole: &PipeWhole<'_>,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+) -> GenericResult<V> {
+    // #6943: a pipe with a stage that yq answers once over an empty context list is the sink
+    // route's (it counts), as the union walk is. A collection `[...]` is the stage most pipes
+    // have and the routes below build it lazily, so for that one the answer is asked for only when
+    // it came back empty. Both only for the pipe as written: a sub-slice is one cursor element's.
+    if whole.is_whole(exprs) {
+        if yq_reemit_stage::<S>(exprs).is_some_and(|at| {
+            exprs[at..]
+                .iter()
+                .any(|stage| yq_stage_can_reemit_in(stage, false))
+        }) {
+            return collect_each_generic::<S, V>(whole.get(exprs), value, optional, cursor);
+        }
+        let result = eval_single_pipe_stages::<S, V>(exprs, whole, value.clone(), optional, cursor);
+        if yq_reemit_stage::<S>(exprs).is_some() && generic_result_is_empty(&result) {
+            return collect_each_generic::<S, V>(whole.get(exprs), value, optional, cursor);
+        }
+        return result;
+    }
+    eval_single_pipe_stages::<S, V>(exprs, whole, value, optional, cursor)
+}
+
+/// Whether `result` holds no value and no failure.
+fn generic_result_is_empty<V: DocumentValue>(result: &GenericResult<V>) -> bool {
+    // Exhaustive, as `produces_output` is: the next variant that can be empty has to be placed.
+    match result {
+        GenericResult::None => true,
+        GenericResult::Many(items) => items.is_empty(),
+        GenericResult::ManyCursor(items) => items.is_empty(),
+        GenericResult::ManyOwned(items) => items.is_empty(),
+        GenericResult::One(_)
+        | GenericResult::OneCursor(_)
+        | GenericResult::LazyKeys { .. }
+        | GenericResult::LazyIndexRange(_)
+        | GenericResult::LazySeq(_)
+        | GenericResult::LazyObject(_)
+        | GenericResult::Error(_)
+        | GenericResult::Owned(_)
+        | GenericResult::Break(_)
+        | GenericResult::Halt(_)
+        | GenericResult::Partial(..) => false,
+    }
+}
+
+fn eval_single_pipe_stages<S: EvalSemantics, V: DocumentValue>(
     exprs: &[Expr],
     whole: &PipeWhole<'_>,
     value: V,
@@ -21849,6 +21905,191 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
+    // #6943: a stage that builds a node of its own re-emits once when the stage before it matched
+    // nothing. Only the pipe as written is asked, not a rest a driver derived for one value of an
+    // earlier stage: the emptiness is the whole context list's.
+    if tail.is_whole() && !take_reemit_suppression() {
+        if let Some(at) = yq_reemit_stage::<S>(tail.stages()) {
+            // A pipe nested as a stage (`.[] | (select(c) | 1)`) is the same evaluation as the
+            // flat one in yq (its `|` only hands a node list on), so the emptiness is asked of the
+            // flat stages, not of the inner pipe once per node.
+            if tail
+                .stages()
+                .iter()
+                .any(|stage| matches!(unwrap_paren(stage), Expr::Pipe(_)))
+            {
+                let mut flat: Vec<Expr> = Vec::new();
+                yq_flatten_pipe_stages(tail.stages(), &mut flat);
+                return match yq_reemit_stage::<S>(&flat) {
+                    Some(at) => eval_yq_empty_context_pipe::<S, V>(
+                        RestTail::unowned(&flat),
+                        None,
+                        at,
+                        value,
+                        optional,
+                        cursor,
+                        sink,
+                    ),
+                    None => eval_each_pipe_generic_stages::<S, V>(
+                        RestTail::unowned(&flat),
+                        None,
+                        value,
+                        optional,
+                        cursor,
+                        sink,
+                    ),
+                };
+            }
+            return eval_yq_empty_context_pipe::<S, V>(
+                tail, needs_path, at, value, optional, cursor, sink,
+            );
+        }
+    }
+    eval_each_pipe_generic_stages::<S, V>(tail, needs_path, value, optional, cursor, sink)
+}
+
+#[cfg(feature = "std")]
+thread_local! {
+    /// Set while the context-list walk runs the rest of a pipe it owns for one entry of its list
+    /// (#6943): that rest is one entry's, and the emptiness the re-emitting stage asks about is the
+    /// whole list's, which the walk answers itself ([`reemit_over_empty_context_list`]).
+    static REEMIT_SUPPRESSED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Asks the walk's hand-off ([`REEMIT_SUPPRESSED`]), and clears it: the first pipe entry that sees
+/// it is the walk's rest. Always `false` without `std`, which has no `thread_local!`.
+fn take_reemit_suppression() -> bool {
+    #[cfg(feature = "std")]
+    {
+        REEMIT_SUPPRESSED.with(|flag| flag.replace(false))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        false
+    }
+}
+
+/// Raises the hand-off for the run it lives across and clears it however that run ends, so a flag
+/// the rest pipe never took cannot reach an unrelated pipe.
+struct ReemitSuppressed;
+
+impl ReemitSuppressed {
+    fn raise(on: bool) -> Option<Self> {
+        #[cfg(feature = "std")]
+        if on {
+            REEMIT_SUPPRESSED.with(|flag| flag.set(true));
+            return Some(Self);
+        }
+        let _ = on;
+        None
+    }
+}
+
+impl Drop for ReemitSuppressed {
+    fn drop(&mut self) {
+        #[cfg(feature = "std")]
+        REEMIT_SUPPRESSED.with(|flag| flag.set(false));
+    }
+}
+
+/// The first stage of a yq-mode pipe after its head that may re-emit over an empty context
+/// (#6943), `None` for jq mode and for a pipe with none. Allocation-free: it runs on every yq pipe.
+fn yq_reemit_stage<S: EvalSemantics>(stages: &[Expr]) -> Option<usize> {
+    if S::TAG != EvalTag::Yq {
+        return None;
+    }
+    (1..stages.len()).find(|&i| yq_stage_can_reemit(&stages[i]))
+}
+
+/// [`eval_each_pipe_generic`] for a pipe whose stage `first_at` (and later ones) may re-emit over
+/// an empty context (#6943): the ordinary pipe, with its outputs counted, and when it answered
+/// nothing, the pipe with the first such stage whose input context was empty replaced by what yq
+/// emits for it ([`yq_empty_context_reemit`]).
+///
+/// The ordinary route runs untouched, so a pipe with outputs pays a counter and nothing else; the
+/// stages before a candidate are run a second time only when the whole pipe was empty, to tell a
+/// context that was empty from one that a later stage emptied (`.a[] | select(false) | 1` and
+/// `.d[] | 1 | select(false)` are different answers). The rewritten pipe is evaluated through the
+/// same entry, so a stage after the re-emitted one can re-emit in its turn
+/// (`.d[] | select(false) | 1 | select(false) | 2`).
+fn eval_yq_empty_context_pipe<S: EvalSemantics, V: DocumentValue>(
+    tail: RestTail<'_>,
+    needs_path: Option<bool>,
+    first_at: usize,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    let exprs = tail.stages();
+    let mut produced = false;
+    let outer_budget = sink.budget();
+    let flow = {
+        let mut counting = forward_budget(outer_budget, |item: GenericItem<V>| -> Demand {
+            produced = true;
+            sink.push(item)
+        });
+        eval_each_pipe_generic_stages::<S, V>(
+            tail,
+            needs_path,
+            value.clone(),
+            optional,
+            cursor,
+            &mut counting,
+        )
+    };
+    if produced || !matches!(flow, Flow::Exhausted) {
+        return flow;
+    }
+    for at in first_at..exprs.len() {
+        if !yq_stage_can_reemit(&exprs[at]) {
+            continue;
+        }
+        let Some(head) = yq_empty_context_reemit(&exprs[at]) else {
+            continue;
+        };
+        // Did the context reaching stage `at` hold anything?
+        let mut context_seen = false;
+        let before = {
+            let mut seen = |_item: GenericItem<V>| -> Demand {
+                context_seen = true;
+                Demand::Stop
+            };
+            if at == 1 {
+                eval_each_generic::<S, V>(&exprs[0], value.clone(), optional, cursor, &mut seen)
+            } else {
+                eval_each_pipe_generic_stages::<S, V>(
+                    RestTail::unowned(&exprs[..at]),
+                    None,
+                    value.clone(),
+                    optional,
+                    cursor,
+                    &mut seen,
+                )
+            }
+        };
+        if !matches!(before, Flow::Exhausted | Flow::Stopped { .. }) {
+            return flow;
+        }
+        if context_seen {
+            continue;
+        }
+        let mut stages = vec_with_capacity(exprs.len() - at);
+        stages.push(head);
+        stages.extend(exprs[at + 1..].iter().cloned());
+        return eval_each_generic::<S, V>(&Expr::pipe(stages), value, optional, cursor, sink);
+    }
+    flow
+}
+
+fn eval_each_pipe_generic_stages<S: EvalSemantics, V: DocumentValue>(
+    tail: RestTail<'_>,
+    needs_path: Option<bool>,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
     let exprs = tail.stages();
     // #2451 rule 1: in yq mode a pipe with a union in it is evaluated over a
     // whole context list, branch-major, by `eval_yq_context_pipe` -- ahead of
@@ -22491,6 +22732,13 @@ fn eval_yq_context_pipe<S: EvalSemantics, V: DocumentValue>(
         // own gate consults the same function, so a declined pipe takes the
         // path-context routes rather than looping back here.
         let preserves = stages.iter().all(yq_stage_preserves_node);
+        // #6943: whether anything came out, for the stage that re-emits over an empty list.
+        let mut produced = false;
+        let budget = sink.budget();
+        let mut counting = forward_budget(budget, |item: GenericItem<V>| -> Demand {
+            produced = true;
+            sink.push(item)
+        });
         // The stages run once per entry, so one `RestPipe` drives them all: it
         // keeps the owned copy of the whole rest, which each entry would
         // otherwise build for itself. A slice nothing owns also copies the rest
@@ -22509,12 +22757,20 @@ fn eval_yq_context_pipe<S: EvalSemantics, V: DocumentValue>(
                 together: item.tag.together && preserves,
                 origin: item.tag.origin,
             });
-            match run_yq_stages_over_item::<S, V>(&mut rest, item, optional, sink) {
+            // A rest of the pipe the walk owns is one entry's (see `REEMIT_SUPPRESSED`).
+            let flow = {
+                let _handed_off = ReemitSuppressed::raise(owner.is_some());
+                run_yq_stages_over_item::<S, V>(&mut rest, item, optional, &mut counting)
+            };
+            match flow {
                 Flow::Exhausted => {}
                 stopped_or_escaped => return stopped_or_escaped,
             }
         }
-        return Flow::Exhausted;
+        if produced {
+            return Flow::Exhausted;
+        }
+        return reemit_over_empty_context_list::<S, V>(stages, inputs, optional, cur, sink);
     };
 
     let context = if at == 0 {
@@ -22570,6 +22826,50 @@ fn eval_yq_context_pipe<S: EvalSemantics, V: DocumentValue>(
     };
 
     eval_yq_context_pipe::<S, V>(rest, &produced, optional, cur, sink)
+}
+
+/// A pipe over a context list that answered nothing: the first stage that builds a node of its own
+/// and whose input list was empty emits it once (#6943, [`yq_empty_context_reemit`]), and the
+/// stages after it run on that node. `.a[] | 1` over `a: []` is `1` in yq; so is
+/// `.d[] | select(false) | 1` and a literal branch of a union over the empty list.
+///
+/// Only asked when the whole pipe produced nothing, so a pipe with outputs pays nothing for it.
+fn reemit_over_empty_context_list<S: EvalSemantics, V: DocumentValue>(
+    stages: &[Expr],
+    inputs: &[YqContextItem<V>],
+    optional: bool,
+    cur: &core::cell::Cell<YqContextTag>,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    for at in 0..stages.len() {
+        if !yq_stage_can_reemit(&stages[at]) {
+            continue;
+        }
+        let Some(head) = yq_empty_context_reemit(&stages[at]) else {
+            continue;
+        };
+        let empty = if at == 0 {
+            inputs.is_empty()
+        } else {
+            match collect_yq_context::<S, V>(&stages[..at], inputs, optional, cur) {
+                Ok(context) => context.is_empty(),
+                Err(control) => return Flow::Escaped(control),
+            }
+        };
+        if !empty {
+            continue;
+        }
+        let mut reemitted: Vec<Expr> = vec_with_capacity(stages.len() - at);
+        reemitted.push(head);
+        reemitted.extend(stages[at + 1..].iter().cloned());
+        // The stage reads no input, so any node stands in for it.
+        let stand_in = [YqContextItem::new(
+            YqContextNode::Owned(OwnedValue::Null),
+            YqContextTag::default(),
+        )];
+        return eval_yq_context_pipe::<S, V>(&reemitted, &stand_in, optional, cur, sink);
+    }
+    Flow::Exhausted
 }
 
 /// `[E]` over a context list whose entries all carry `EvaluateTogether`:

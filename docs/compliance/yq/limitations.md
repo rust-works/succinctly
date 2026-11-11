@@ -1230,7 +1230,8 @@ Five things still differ, each in yq v4.53.3 against `succinctly yq`:
   `.x | map({})` over a flow sequence prints `[{}]` in YAML in yq (the result keeps its source's flow style) and `- {}` here ([#6801](https://github.com/rust-works/succinctly/issues/6801)).
 - **A constant over an empty context.**
   yq answers a literal from a context that holds no node (`yq ea 'select(fi == 9) | 0'` is `0`, and `select(fi == 9) | . as $i ireduce (0; . + 1)` is `0`).
-  Only `{}` does here, so a fold whose INIT is another constant and whose source filter selects no document prints nothing ([#6801](https://github.com/rust-works/succinctly/issues/6801)).
+  A literal, a constructor and an operator over literals do here since [#6943](https://github.com/rust-works/succinctly/issues/6943), in a pipe and in `--eval-all`'s list (see "A pipe's empty context list" below).
+  A fold whose INIT is another constant and whose source filter selects no document is `0` in both.
 - **A read of an absent position.**
   `.b as $i ireduce ([]; . + [$i | key])` reads `"b"` for every document in yq, where a document without `b` is a `null` node that still has a place.
   Here that `null` has no position, so `key` and `parent` of it answer nothing and `path` answers `[]`.
@@ -3766,6 +3767,27 @@ prints `1`, `null` (it prints `null`, `1`, `null` for `(.zz, .[]?)` with no `//`
 25 rows of that grid that still differ are all this (`.a.b // .a`, `(.a // .b) = 5` on a
 document with no `a`, ...) plus an unrelated `map` over a mapping; and `del((.a, .b) // .zz)`, where
 yq deletes the key it just created and loses `a` as well (`{"c":2}`; here `{"a":null,"c":2}`).
+
+### A pipe's empty context list — a stage that builds a node emits once (#6943)
+
+The rule of the next section is not only an operand's.
+In a pipe, a stage that builds a node of its own (a literal, a constructor, an operator over literals, `error("x")`, a union of them) is emitted once when the stage before it matched nothing: `.a[] | 1` over `a: []` is `1` in yq, and so is `select(false) | 1`, `.zz[] | "x"` and `.c.b | {"k": 1}`.
+It is the list that is empty, not a node: `.d[] | select(false) | 1` is one `1` however many members `d` has, and `.d[] | 1 | select(false)` is nothing because the `1` was emitted.
+The first such stage whose input list is empty is the one that emits, and the stages after it run on what it emitted, so a later stage that follows another empty one emits in its turn (`.d[] | select(false) | 1 | select(false) | 2` is `2`).
+A union is evaluated over the empty list branch by branch (`.a[] | (1, 2)` is `1`, `2`), and `map(f)` is `[.[] | f]` to the rule, so `map(select(false) | 1)` is `[1]`.
+`succinctly jq` is unchanged: jq's pipe loops zero times over an empty stage.
+
+It is answered where the pipe is evaluated: the sink route counts what the pipe emitted and, when that is nothing, asks which stage's input was empty (the stages before it run once more, only then).
+A pipe with outputs pays a counter and nothing else, and the lazy and cursor routes keep their results.
+Pinned by `tests/yq_cli/i6943.rs`, whose rows were captured from yq v4.53.3.
+
+Not matched: the right side of a write (`.x = (.a[] | 1)` is `x: 1` in yq and `x: null` here), the body of `map_values` and of `|=` (`.d[] |= (select(false) | 1)`), and a source that is a computed list (`.d | to_entries | map(select(false) | 1)` is `[1]` in yq and `[]` here).
+A collection `[...]` after a stage whose input list is empty is `[]` in yq and is answered here only when the whole pipe was empty.
+A pipe nested in an object or a call (`{"k": (select(false) | [1])}`) is asked once per node, as before.
+A literal bound to a variable (`.a[] | 1 as $x | $x` is `1` in yq and nothing here) is not a re-emitting stage.
+Under `--eval-all`, an alternative whose left side is a pipe that re-emits is still evaluated per document: `(.a[] | 1) // 9` over `a: []` and `a: [1]` is `1`, `1` here and `1` in yq.
+The library built without `std` has no hand-off between the context-list walk and the rest of a pipe it owns, so there the walk asks the question once per entry of its list.
+A pipe whose answer is empty is evaluated up to three times (the route, the count and the probe of the stages before the re-emitting one, then the rewritten pipe), which a pipe with outputs never pays.
 
 ### An operand's evaluation context — a context-free stage re-emits against an empty context (#2540, #2588)
 
