@@ -871,10 +871,11 @@ pub fn resolve_tagged(text: &str, tag: &str) -> Option<ResolvedScalar> {
             ResolvedScalar::Int(n) => ResolvedScalar::Int(n),
             // #6938: yq's `parseInt64` drops every `_` before it reads the number, so
             // `!!int 1_000` is 1000, `!!int 0_8` is 8 and `!!int 1__0` is 10; wherever the `_` sits.
-            _ if text.contains('_') => match resolve_plain(&text.replace('_', "")) {
-                ResolvedScalar::Int(n) => ResolvedScalar::Int(n),
-                _ => ResolvedScalar::Str,
-            },
+            // The one definition of that grammar is `spelled_int_value`, which spelled-integer
+            // text already goes through.
+            _ if text.contains('_') => {
+                spelled_int_value(text).map_or(ResolvedScalar::Str, ResolvedScalar::Int)
+            }
             _ => ResolvedScalar::Str,
         }),
         "!!float" => Some(match resolve_plain(text) {

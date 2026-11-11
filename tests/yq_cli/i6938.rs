@@ -11,7 +11,8 @@
 //! Every row is a live yq v4.53.3 capture (`-o=json -I0`), kept only where both agree. Left out: a
 //! malformed form yq fails on in its JSON encoder (`!!int 0b1_0`, `!!int 1_0.5`), which this reads as
 //! the string (the recorded divergence for `!!int abc`), and `tostring` of an underscored `!!float`,
-//! which yq echoes as written and this prints as the number (`docs/compliance/yq/limitations.md`).
+//! which yq echoes as written and this prints as the number (`docs/compliance/yq/limitations.md`,
+//! #6958).
 
 use anyhow::Result;
 

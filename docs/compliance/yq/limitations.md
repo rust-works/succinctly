@@ -755,7 +755,8 @@ $ printf 'd: !!int 1_000\n' | succinctly yq -o json -I0 '.d + 1'         # 1001 
 
 Not covered here:
 - A form yq cannot encode (`!!int 0b1_0`, `!!int 1_0.5`, `!!int 9_223_372_036_854_775_808`, `!!float 0x1_f`) is an error in yq's JSON encoder and an arithmetic error; this reads it as the string, as it does `!!int abc`.
-- `tostring` and YAML output of an underscored `!!float` print the number (`!!float 1_0.5` is `10.5`), where yq echoes the text (`1_0.5`). An underscored `!!int` keeps its text.
+  A prefixed integer under `!!float` (`!!float 0x1_2`, `!!float 0o1_7`) is the float `18.0`/`15.0` here, as `!!float 0x12` already was, where yq's float parser refuses it.
+- `tostring` and YAML output of an underscored `!!float` print the number (`!!float 1_0.5` is `10.5`), where yq echoes the text (`1_0.5`): the spelled-float machinery (`is_spelled_float`) has no underscore form yet ([#6958](https://github.com/rust-works/succinctly/issues/6958)). An underscored `!!int` keeps its text.
 
 ### A scalar under an unknown `!!` tag is its text (#6299)
 
