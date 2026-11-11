@@ -11089,6 +11089,25 @@ and the `jq-linux-arm64` release binaries):
   The instants tried from `1000000000000` (year 33658) to `100000000000000` (year 3170843) agree on all three.
   The cause was not traced; glibc is the odd one out, the macOS jq and this implementation agreeing at `1000000000000000`.
 
+### `strftime("%s")` is the timestamp itself, where jq 1.7.1 shifts it by the zone's standard offset (#7014)
+
+jq 1.7.1 turns `strftime`'s UTC fields back into seconds for `%s` with the C library's *local* `mktime`, so away from UTC it prints a different instant from the input.
+`strftime` and `gmtime | strftime` agree with each other, and every other specifier is unaffected:
+
+| `TZ`               | input        | jq 1.7.1 (macOS and glibc) | jq 1.8.2 and succinctly |
+|--------------------|--------------|----------------------------|-------------------------|
+| `UTC`              | `1700000000` | `"1700000000"`             | `"1700000000"`          |
+| `EST5EDT`          | `0`          | `"18000"`                  | `"0"`                   |
+| `America/New_York` | `1720000000` | `"1720018000"`             | `"1720000000"`          |
+| `Asia/Kolkata`     | `1720000000` | `"1719980200"`             | `"1720000000"`          |
+
+The shift is the zone's *standard* offset even for a daylight-time instant (`1720000000` is in July, yet `America/New_York` moves it five hours, not four), because jq's broken-down time says daylight time is not in effect.
+The macOS and glibc builds of jq 1.7.1 print the same strings for every row above and for `0` and `1700000000` in each zone (`/usr/bin/jq` on macOS, `jq-1.7.1` on Ubuntu x86_64).
+This is the reading [#3054's entry](#strflocaltimes-z-z-and-s-are-the-zones-own-where-jq-171s-are-not-3054) takes for `strflocaltime`'s `%s`: an ADR-0018 rule 4 divergence ("matching would corrupt data"), since the string jq 1.7.1 prints names an instant offset from the one it was given, and jq 1.8.2 prints the input as succinctly does.
+That reading is likewise for the ADR's owners to confirm.
+`%s` of a time before 1900 is `-1` in both, by the `timegm` rule above.
+`tests/jq_cli/i7014.rs` pins the answers in the table under each `TZ`.
+
 ### `strftime`/`strflocaltime` localize through the C library where there is one (#5754)
 
 jq calls `setlocale(LC_ALL, "")`, so `strftime` and `strflocaltime` follow `LC_ALL`, `LC_TIME` and `LANG`.

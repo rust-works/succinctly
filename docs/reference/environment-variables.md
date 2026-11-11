@@ -127,6 +127,9 @@ the name.
 `strflocaltime`'s `%z`, `%Z` and `%s` are the zone's own for the instant, which is not what jq 1.7.1
 prints in daylight time; see
 [limitations.md](../compliance/jq/limitations.md#strflocaltimes-z-z-and-s-are-the-zones-own-where-jq-171s-are-not-3054).
+`strftime("%s")` ignores `TZ` and prints the timestamp itself, where jq 1.7.1 shifts it by the
+zone's standard offset; see
+[limitations.md](../compliance/jq/limitations.md#strftimes-is-the-timestamp-itself-where-jq-171-shifts-it-by-the-zones-standard-offset-7014).
 
 **Windows** does not use the system zone: the released binary reads only a POSIX offset string
 (`EST5`, `UTC-9`) with no daylight-time rule, and everything else is UTC (a name with a digit or a
