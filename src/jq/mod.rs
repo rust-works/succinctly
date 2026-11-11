@@ -176,6 +176,8 @@ pub use eval::{
 // `input_queue_is_active` exists under both gates (a `const fn` returning
 // `false` without `std`), so `eval_generic` can consult it unconditionally.
 pub use eval::input_queue_is_active;
+// #6923: what `-e` reads under an `-o=<format>` encoder.
+pub use eval::output_encoder_saw_truthy;
 // #3046: the CLI facts `input_filename`/`get_search_list`/`get_jq_origin`/
 // `get_prog_origin` read.
 pub use eval::cli_context;

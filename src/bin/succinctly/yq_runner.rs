@@ -3153,6 +3153,12 @@ fn query_result_to_owned_values(
         // outright `Error`/`Break` already is (#2392). `Halt` is the one
         // control that keeps its prefix (jq's own `halt` contract, #791/
         // #1897), so it stays its own arm below.
+        // An `-o=<format>` encoder runs while yq prints, so the results before the one it
+        // refuses are printed (#6923).
+        QueryResult::Partial(vs, jq::Control::Error(e)) if e.is_output_encoder() => {
+            sink.report(DiagStyle::Yq, &e, &no_location());
+            vs
+        }
         QueryResult::Error(e) | QueryResult::Partial(_, jq::Control::Error(e)) => {
             sink.report(DiagStyle::Yq, &e, &no_location());
             vec![]
@@ -8806,6 +8812,12 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
             // outright `Error`/`Break` already is (#2392). `Halt` is the one
             // control that keeps its prefix (jq's own `halt` contract, #791/
             // #1897), so it stays its own arm below.
+            // An `-o=<format>` encoder runs while yq prints, so the results before the one it
+            // refuses are printed (#6923).
+            GenericResult::Partial(vs, jq::Control::Error(e)) if e.is_output_encoder() => {
+                sink.report(DiagStyle::Yq, &e, &no_location());
+                Ok(vs.into_iter().map(no_comments).collect())
+            }
             GenericResult::Error(e) | GenericResult::Partial(_, jq::Control::Error(e)) => {
                 sink.report(DiagStyle::Yq, &e, &no_location());
                 Ok(vec![])
@@ -14781,6 +14793,10 @@ fn run_exit_code(sink: &ErrorSink, exit_status: bool, any_truthy: bool) -> i32 {
     if sink.hit() {
         return DiagStyle::Yq.error_exit_code();
     }
+
+    // #6923: under an `-o=<format>` encoder every result is text, so `-e` reads the value the
+    // encoder was handed instead.
+    let any_truthy = jq::output_encoder_saw_truthy().unwrap_or(any_truthy);
 
     // yq compat: empty output and all-falsy output are the same failure,
     // reported on stderr with a fixed message and exit 1.

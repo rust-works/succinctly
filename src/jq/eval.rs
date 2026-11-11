@@ -25705,7 +25705,10 @@ pub(crate) fn format_owned<S: EvalSemantics>(
         FormatType::Urid => format_urid::<S>(owned, optional),
         FormatType::Yaml => format_yaml(owned),
         FormatType::Props => format_props(owned),
-        FormatType::YqOutput(encoder) => format_yq_output::<S>(encoder, owned),
+        FormatType::YqOutput(encoder) => {
+            note_output_encoder_result(owned);
+            format_yq_output::<S>(encoder, owned).map_err(|e| EvalError::output_encoder(e.message))
+        }
         FormatType::YqJson(indent) => {
             // #6887: yq's JSON encoder refuses a non-finite number.
             if let Some(message) = owned.yq_non_finite_json_error(false) {
@@ -26830,6 +26833,37 @@ fn format_props_recursive(
         }
     }
 }
+
+/// Whether any result an `-o=<format>` encoder was handed was neither `null` nor `false`, and
+/// `None` when no encoder ran (#6923).
+///
+/// `-e` reads the value the filter produced, not the encoded text (`-o=props '.zz'` encodes `null`
+/// to the line `null`, which is truthy as text): the encoder is the last stage of the program, so it
+/// records here what it was given. `std` only, like the other `thread_local!`s of this file.
+#[cfg(feature = "std")]
+pub fn output_encoder_saw_truthy() -> Option<bool> {
+    ENCODER_TRUTHY.with(std::cell::Cell::get)
+}
+
+/// `no_std` has no `thread_local!` to record into (#6923).
+#[cfg(not(feature = "std"))]
+pub fn output_encoder_saw_truthy() -> Option<bool> {
+    None
+}
+
+#[cfg(feature = "std")]
+thread_local! {
+    static ENCODER_TRUTHY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(feature = "std")]
+fn note_output_encoder_result(value: &OwnedValue) {
+    let truthy = !matches!(value, OwnedValue::Null | OwnedValue::Bool(false));
+    ENCODER_TRUTHY.with(|seen| seen.set(Some(seen.get().unwrap_or(false) || truthy)));
+}
+
+#[cfg(not(feature = "std"))]
+fn note_output_encoder_result(_value: &OwnedValue) {}
 
 /// yq's `-o=<format>` encoders (#6850): the whole result as that format, line ends included, so the
 /// caller prints it with none of its own.
