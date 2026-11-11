@@ -11676,9 +11676,11 @@ fn test_yaml_flow_key_comment_requires_preceding_whitespace() -> Result<()> {
         let (stdout, stderr, exit_code) = run_yq_stdin_with_stderr(".", input, &[])?;
         assert_eq!(exit_code, 1, "{name}: expected clean error exit: {stderr}");
         assert_eq!(stdout, "", "{name}: nothing should reach stdout");
+        // #6941: the comment ends the key and runs to the end of the line, so the closer is never read;
+        // `{a # b` / `}` is the key `a` with no value (an accepted entry), and this one is unterminated.
         assert!(
-            stderr.contains("key without value"),
-            "{name}: stderr should name the missing value: {stderr}"
+            stderr.contains("after key in flow mapping"),
+            "{name}: stderr should name the unterminated mapping: {stderr}"
         );
     }
     Ok(())
@@ -11738,9 +11740,10 @@ fn test_yaml_explicit_flow_key_comment_requires_preceding_whitespace() -> Result
     let (stdout, stderr, exit_code) = run_yq_stdin_with_stderr(".", "{? a # b : c}\n", &[])?;
     assert_eq!(exit_code, 1, "expected clean error exit: {stderr}");
     assert_eq!(stdout, "", "nothing should reach stdout");
+    // #6941: as above, the comment ends the key and the mapping is unterminated.
     assert!(
-        stderr.contains("key without value"),
-        "stderr should name the missing value: {stderr}"
+        stderr.contains("after key in flow mapping"),
+        "stderr should name the unterminated mapping: {stderr}"
     );
     Ok(())
 }
