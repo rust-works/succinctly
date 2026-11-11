@@ -24613,7 +24613,10 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
                     from_literal: Option<&OwnedValue>|
      -> Demand {
         match (range_num(from), range_num(to), range_num(step)) {
-            (Ok(from_val), Ok(to_val), Ok(step_val)) => {
+            // #6993: a literal the doubles cannot stand for goes to the generic walk.
+            (Ok(from_val), Ok(to_val), Ok(step_val))
+                if implicit_step || !crate::jq::eval::range_reads_literals::<S>(from, to, step) =>
+            {
                 // #5292: handed over a batch at a time, as `each_range` does.
                 let end = each_range_batches(
                     from_val,
