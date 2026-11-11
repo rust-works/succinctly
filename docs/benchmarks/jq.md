@@ -467,6 +467,11 @@ The `users_mix` query set (`succinctly dev bench jq --patterns users --queries u
 **Date**: 2026-01-29
 **Method**: `bench run jq_bench`, measured before #5409 made it interleave (all of jq's runs, then all of succinctly's, against the `jq` named above). Historical: no `dev compare jq` run exists for this platform, so it has no generated *Harness comparison* block.
 
+## Harness comparison (`dev compare jq`)
+
+<!-- compare:jq-linux-aarch64 -->
+<!-- /compare:jq-linux-aarch64 -->
+
 ## Summary - Comprehensive Pattern
 
 | Size       | succinctly | jq       | Speedup  | succ Mem | jq Mem  | Mem Ratio |
