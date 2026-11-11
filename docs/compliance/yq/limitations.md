@@ -3763,6 +3763,10 @@ Pinned by `tests/yq_cli/i6943.rs`, whose rows were captured from yq v4.53.3.
 Not matched: the right side of a write (`.x = (.a[] | 1)` is `x: 1` in yq and `x: null` here), the body of `map_values` and of `|=` (`.d[] |= (select(false) | 1)`), and a source that is a computed list (`.d | to_entries | map(select(false) | 1)` is `[1]` in yq and `[]` here).
 A collection `[...]` after a stage whose input list is empty is `[]` in yq and is answered here only when the whole pipe was empty.
 A pipe nested in an object or a call (`{"k": (select(false) | [1])}`) is asked once per node, as before.
+A literal bound to a variable (`.a[] | 1 as $x | $x` is `1` in yq and nothing here) is not a re-emitting stage.
+Under `--eval-all`, an alternative whose left side is a pipe that re-emits is still evaluated per document: `(.a[] | 1) // 9` over `a: []` and `a: [1]` is `1`, `1` here and `1` in yq.
+The library built without `std` has no hand-off between the context-list walk and the rest of a pipe it owns, so there the walk asks the question once per entry of its list.
+A pipe whose answer is empty is evaluated up to three times (the route, the count and the probe of the stages before the re-emitting one, then the rewritten pipe), which a pipe with outputs never pays.
 
 ### An operand's evaluation context — a context-free stage re-emits against an empty context (#2540, #2588)
 

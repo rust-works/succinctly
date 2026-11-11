@@ -2045,10 +2045,17 @@ fn yq_map_union_body_over_the_list(call: Expr, var_stage_once: bool) -> Expr {
         ])),
         right: Box::new(Expr::Literal(Literal::Int(0))),
     };
+    // A body that is a pipe is spliced flat: the stages of `[.[] | (a | b)]` and `[.[] | a | b]` are
+    // one evaluation in yq, and the walk and the empty-list rule (#6943) read the flat stages.
+    let mut stages = vec![Expr::Iterate];
+    match super::eval::unwrap_paren(body) {
+        Expr::Pipe(inner) => stages.extend(inner.iter().cloned()),
+        _ => stages.push((**body).clone()),
+    }
     let over_the_list = Expr::array(if var_stage_once {
-        yq_var_stage_once(vec![Expr::Iterate, (**body).clone()])
+        yq_var_stage_once(stages)
     } else {
-        Expr::pipe(vec![Expr::Iterate, (**body).clone()])
+        Expr::pipe(stages)
     });
     Expr::pipe(vec![
         Expr::If {

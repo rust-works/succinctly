@@ -99,3 +99,23 @@ fn the_rule_holds_for_eval_all_and_json_input_6943() -> Result<()> {
     }
     Ok(())
 }
+
+/// `map(f)` is `[.[] | f]` to the rule, whatever `f` ends in, and a source of several members is one
+/// list, not one per member.
+#[test]
+fn a_map_body_over_a_list_of_several_members_re_emits_once_6943() -> Result<()> {
+    const THREE: &str = "d: [{x: 1}, {x: 2}, {x: 3}]\n";
+    for (filter, expected) in [
+        (".d | map(select(false) | [1])", "[[]]\n"),
+        (".d | map(select(.x > 9) | [1] | length)", "[0]\n"),
+        (".d | map(select(false) | 1)", "[1]\n"),
+        (".d | map(select(.x == 2) | 5)", "[5]\n"),
+        (".d | map(select(true) | [1])", "[[1],[1],[1]]\n"),
+        (".d | map(.x | . + 1)", "[2,3,4]\n"),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, THREE, &["-o=json", "-I0"])?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(stdout, expected, "{filter}");
+    }
+    Ok(())
+}

@@ -15368,12 +15368,23 @@ fn eval_single_pipe<S: EvalSemantics, V: DocumentValue>(
 
 /// Whether `result` holds no value and no failure.
 fn generic_result_is_empty<V: DocumentValue>(result: &GenericResult<V>) -> bool {
+    // Exhaustive, as `produces_output` is: the next variant that can be empty has to be placed.
     match result {
         GenericResult::None => true,
         GenericResult::Many(items) => items.is_empty(),
         GenericResult::ManyCursor(items) => items.is_empty(),
         GenericResult::ManyOwned(items) => items.is_empty(),
-        _ => false,
+        GenericResult::One(_)
+        | GenericResult::OneCursor(_)
+        | GenericResult::LazyKeys { .. }
+        | GenericResult::LazyIndexRange(_)
+        | GenericResult::LazySeq(_)
+        | GenericResult::LazyObject(_)
+        | GenericResult::Error(_)
+        | GenericResult::Owned(_)
+        | GenericResult::Break(_)
+        | GenericResult::Halt(_)
+        | GenericResult::Partial(..) => false,
     }
 }
 
@@ -21952,11 +21963,27 @@ fn take_reemit_suppression() -> bool {
     }
 }
 
-fn suppress_reemit_for_next_pipe(on: bool) {
-    #[cfg(feature = "std")]
-    REEMIT_SUPPRESSED.with(|flag| flag.set(on));
-    #[cfg(not(feature = "std"))]
-    let _ = on;
+/// Raises the hand-off for the run it lives across and clears it however that run ends, so a flag
+/// the rest pipe never took cannot reach an unrelated pipe.
+struct ReemitSuppressed;
+
+impl ReemitSuppressed {
+    fn raise(on: bool) -> Option<Self> {
+        #[cfg(feature = "std")]
+        if on {
+            REEMIT_SUPPRESSED.with(|flag| flag.set(true));
+            return Some(Self);
+        }
+        let _ = on;
+        None
+    }
+}
+
+impl Drop for ReemitSuppressed {
+    fn drop(&mut self) {
+        #[cfg(feature = "std")]
+        REEMIT_SUPPRESSED.with(|flag| flag.set(false));
+    }
 }
 
 /// The first stage of a yq-mode pipe after its head that may re-emit over an empty context
@@ -22725,9 +22752,10 @@ fn eval_yq_context_pipe<S: EvalSemantics, V: DocumentValue>(
                 origin: item.tag.origin,
             });
             // A rest of the pipe the walk owns is one entry's (see `REEMIT_SUPPRESSED`).
-            suppress_reemit_for_next_pipe(owner.is_some());
-            let flow = run_yq_stages_over_item::<S, V>(&mut rest, item, optional, &mut counting);
-            suppress_reemit_for_next_pipe(false);
+            let flow = {
+                let _handed_off = ReemitSuppressed::raise(owner.is_some());
+                run_yq_stages_over_item::<S, V>(&mut rest, item, optional, &mut counting)
+            };
             match flow {
                 Flow::Exhausted => {}
                 stopped_or_escaped => return stopped_or_escaped,
