@@ -144,14 +144,14 @@ fn test_raw_json_output_prints_the_spelling_2802() -> Result<()> {
 
 /// A message names the number a spelled integer is (`number (31)`), not a mangled text
 /// (`x1f`, from reading its `0` as a leading zero); yq words these errors differently, so only
-/// the value is pinned.
+/// the value is pinned. An arithmetic error names the tag instead (#6904), so `.a - "x"` has no
+/// number to name and is pinned in yq's own words below.
 #[test]
 fn test_error_previews_name_the_number_2802() -> Result<()> {
-    for (filter, number) in [
-        (r#".a - "x""#, "31"),
-        (".a | keys", "31"),
-        (".b | keys", "15"),
-    ] {
+    let (_, stderr, code) = crate::run_yq_stdin_with_stderr(r#".a - "x""#, DOC, &[])?;
+    assert_eq!(code, 1, "{stderr}");
+    assert_eq!(stderr.trim_end(), "Error: !!int cannot be added to !!str");
+    for (filter, number) in [(".a | keys", "31"), (".b | keys", "15")] {
         let (_, stderr, code) = crate::run_yq_stdin_with_stderr(filter, DOC, &[])?;
         assert_eq!(code, 1, "{filter}");
         assert!(

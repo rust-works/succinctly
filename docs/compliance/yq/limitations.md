@@ -4125,6 +4125,29 @@ Two integers compare as integers, and a decimal spelling (`007`, `+5`, `1e3`) pa
 - A signed prefixed integer (`-0x10`), `1_000` and `0b101` read as strings here, so they raise the kind error instead of comparing or raising `ParseFloat`.
 - `sort`, `min` and `max` over an array holding a prefixed integer and a float use their own comparators here: yq's `min`/`max` raise the same `ParseFloat` error, and its `sort` panics with it, where this orders them by value.
 
+### Arithmetic over kinds that do not combine: the error names tags, but not keys -- resolved ([#6904](https://github.com/rust-works/succinctly/issues/6904)); the key remains
+
+yq words the error of `+`, `-`, `*`, `/` and `%` over two kinds that do not combine from the operands' tags, where `succinctly yq` raised jq's type-and-value wording (`number (1.5) and null (null) cannot be added`).
+The wording was captured from yq v4.53.3 over all seven kinds (`!!int`, `!!float`, `!!str`, `!!bool`, `!!null`, `!!seq`, `!!map`), both operand orders, and is `eval::yq_kind_refusal`, shared by the last arm of every `arith_*` and by the timestamp refusal above:
+
+| operator  | operands                              | yq 4.53.3                                                                         |
+|-----------|---------------------------------------|-----------------------------------------------------------------------------------|
+| `+`       | two scalars (`.f + .n`)               | `!!float cannot be added to !!null`                                               |
+| `+`       | a container on either side            | `!!seq (l) cannot be added to a !!float (f)` (right operand first, both keyed)    |
+| `-`       | two scalars (`.f - .s`)               | `!!float cannot be added to !!str` (`-` falls through to `+`'s wording)           |
+| `-`       | a container on either side            | `!!map (m) cannot be subtracted from !!float` (right operand keyed, left not)     |
+| `-`       | a mapping on the left                 | `maps not yet supported for subtraction`                                          |
+| `*`       | any pair                              | `cannot multiply !!float with !!str` (left operand first, never keyed)            |
+| `/`, `%`  | two scalars                           | `!!float cannot be divided by !!null`, `!!int cannot modulo by !!str`             |
+| `/`, `%`  | `null` on the left or a container     | `!!null (n) cannot be divided by !!float (f)`: both tags keyed                    |
+
+`*` also named a fractional string-repeat count the wrong way round (`2.5 * "ab"` was `cannot multiply !!str with !!float`); it now follows the written order.
+jq mode keeps jq's wording.
+
+**Not reproduced:** the key in parentheses.
+yq writes the key of each keyed operand (`l`, `f`, an index inside a sequence); the evaluator does not know a node's key, so `succinctly yq` writes `()` there, as it already did for `-` on a string (#5863) and for a timestamp (#5930).
+The message is otherwise yq's, and the exit code (1) is the same.
+
 ### Datetime operators: date arithmetic, `format_datetime`, `tz` and `with_dtf` -- resolved ([#5863](https://github.com/rust-works/succinctly/issues/5863)); a quoted date and the timestamp tag remain
 
 yq keeps a timestamp as text tagged `!!timestamp`.

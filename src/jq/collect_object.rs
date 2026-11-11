@@ -291,7 +291,7 @@ mod tests {
         ])
         .unwrap_err();
         assert!(
-            err.to_string().contains("cannot be multiplied"),
+            err.to_string() == "cannot multiply !!map with !!int",
             "{}",
             err.to_string()
         );
