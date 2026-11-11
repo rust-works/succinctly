@@ -41,9 +41,9 @@ use super::eval::{
 use super::eval_generic::is_empty_object_literal;
 use super::expr::{
     ArithOp, ArithSettleMemo, AssignOp, Builtin, CompareOp, Expr, FormatType, FuncDefBound, Import,
-    Include, Libm1, Libm2, Libm3, Literal, MergeFlags, MetaObject, MetaSlot, MetaValue, ModuleMeta,
-    NumberKey, ObjectEntry, ObjectKey, Param, Pattern, PatternEntry, Program, SliceBoundKey,
-    StringPart,
+    Include, Libm1, Libm2, Libm3, Literal, LoadKind, MergeFlags, MetaObject, MetaSlot, MetaValue,
+    ModuleMeta, NumberKey, ObjectEntry, ObjectKey, Param, Pattern, PatternEntry, Program,
+    SliceBoundKey, StringPart,
 };
 use super::value::{parse_i64_or_f64_in, NumberRepr, OwnedValue};
 use super::walk::{any_subexpr, map_subexprs};
@@ -5273,6 +5273,14 @@ impl<'a> Parser<'a> {
                 {
                     // #4206: yq's `to_json` / `to_yaml`, each with an optional literal indent.
                     self.parse_yq_to_text_operator()
+                } else if let Some((name, format)) = self.yq_encoder_operator() {
+                    // #6985: yq's operator spellings of the `@csv`, `@tsv` and `@props` encoders.
+                    self.consume_keyword(name);
+                    self.zero_arity_or_wrong_arity_call(
+                        keyword_start,
+                        Some(name),
+                        Expr::Format(format),
+                    )
                 } else if self.mode == ParserMode::Yq
                     && self.matches_keyword("root")
                     && !self.shadowable_defs.contains("root")
@@ -5897,6 +5905,31 @@ impl<'a> Parser<'a> {
     /// yq's `to_json` / `to_json(N)` and `to_yaml` / `to_yaml(N)` (#4206). `N` must be a
     /// non-negative integer literal: yq's parser rejects any other argument (`to_json(.a)`,
     /// `to_json(2+2)`, `to_json(-1)`) as `bad expression`.
+    /// yq's operator spelling of an `@` encoder at the cursor (`to_csv` / `tocsv`, `to_tsv` /
+    /// `totsv`, `to_props` / `toprops`, #6985), with the format it names: yq mode only, and not when
+    /// the program defines the name.
+    fn yq_encoder_operator(&self) -> Option<(&'static str, FormatType)> {
+        if self.mode != ParserMode::Yq {
+            return None;
+        }
+        let found = if self.matches_keyword("to_csv") {
+            ("to_csv", FormatType::Csv)
+        } else if self.matches_keyword("tocsv") {
+            ("tocsv", FormatType::Csv)
+        } else if self.matches_keyword("to_tsv") {
+            ("to_tsv", FormatType::Tsv)
+        } else if self.matches_keyword("totsv") {
+            ("totsv", FormatType::Tsv)
+        } else if self.matches_keyword("to_props") {
+            ("to_props", FormatType::Props)
+        } else if self.matches_keyword("toprops") {
+            ("toprops", FormatType::Props)
+        } else {
+            return None;
+        };
+        (!self.shadowable_defs.contains(found.0)).then_some(found)
+    }
+
     fn parse_yq_to_text_operator(&mut self) -> Result<Expr, ParseError> {
         let json = self.matches_keyword("to_json") || self.matches_keyword("tojson");
         self.consume_keyword(if self.matches_keyword("to_json") {
@@ -9962,7 +9995,29 @@ impl<'a> Parser<'a> {
             self.consume_keyword("load");
             return Ok(self
                 .parse_required_single_arg(keyword_start)?
-                .map(|file_expr| Builtin::Load(Box::new(file_expr))));
+                .map(|file_expr| Builtin::Load(Box::new(file_expr), LoadKind::Document)));
+        }
+        // #6985: yq's text loaders, `load_str` (also `strload`, `loadstr`) and `load_base64`. Not jq
+        // names, so a jq-mode program may define them.
+        if self.mode == ParserMode::Yq {
+            let loader = if self.matches_keyword("load_str") {
+                Some(("load_str", LoadKind::Text))
+            } else if self.matches_keyword("strload") {
+                Some(("strload", LoadKind::Text))
+            } else if self.matches_keyword("loadstr") {
+                Some(("loadstr", LoadKind::Text))
+            } else if self.matches_keyword("load_base64") {
+                Some(("load_base64", LoadKind::Base64))
+            } else {
+                None
+            };
+            if let Some((name, kind)) = loader {
+                let keyword_start = self.pos;
+                self.consume_keyword(name);
+                return Ok(self
+                    .parse_required_single_arg(keyword_start)?
+                    .map(|file_expr| Builtin::Load(Box::new(file_expr), kind)));
+            }
         }
 
         // Phase 23: Position-based navigation (succinctly extension)
@@ -16782,6 +16837,9 @@ mod tests {
             "line",
             "line_comment",
             "load",
+            "load_base64",
+            "load_str",
+            "loadstr",
             "map",
             "map_values",
             "match",
@@ -16808,16 +16866,23 @@ mod tests {
             "split",
             "split_doc",
             "strenv",
+            "strload",
             "style",
             "sub",
             "tag",
             "test",
+            "to_csv",
             "to_entries",
             "to_json",
             "to_number",
+            "to_props",
             "to_string",
+            "to_tsv",
             "to_unix",
             "to_yaml",
+            "tocsv",
+            "toprops",
+            "totsv",
             "toyaml",
             "tojson",
             "tonumber",

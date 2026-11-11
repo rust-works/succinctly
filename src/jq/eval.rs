@@ -506,9 +506,9 @@ use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
 
 use super::expr::{
     retention_scope, ArithOp, ArithSettleMemo, AssignOp, BindOrigin, BoundBody, Builtin, CompareOp,
-    Expr, FormatType, FuncDefBound, FuncDefData, Libm1, Libm2, Libm3, Literal, LuaOptions,
-    MergeFlags, MetaSlot, NumberKey, ObjectEntry, ObjectKey, Origin, Param, Pattern, PatternEntry,
-    PipeStages, SharedArg, SliceBoundKey, StageClass, StringPart, TailPlan, Tracked,
+    Expr, FormatType, FuncDefBound, FuncDefData, Libm1, Libm2, Libm3, Literal, LoadKind,
+    LuaOptions, MergeFlags, MetaSlot, NumberKey, ObjectEntry, ObjectKey, Origin, Param, Pattern,
+    PatternEntry, PipeStages, SharedArg, SliceBoundKey, StageClass, StringPart, TailPlan, Tracked,
     YqOutputEncoder,
 };
 #[cfg(test)]
@@ -20738,7 +20738,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::EvalExpr(expr) => builtin_eval_expr::<W, S>(expr, value, optional),
 
         // Phase 22: File operations (yq)
-        Builtin::Load(file_expr) => builtin_load::<W, S>(file_expr, value, optional),
+        Builtin::Load(file_expr, kind) => builtin_load::<W, S>(file_expr, *kind, value, optional),
 
         // Phase 23: Position-based navigation (succinctly extension)
         // These require cursor context - handled in eval_generic.rs
@@ -47756,7 +47756,7 @@ fn builtin_yields_at_most_one_value(builtin: &Builtin) -> bool {
         | Builtin::Limit(_, _)
         | Builtin::Line
         | Builtin::LineComment
-        | Builtin::Load(_)
+        | Builtin::Load(..)
         | Builtin::Localtime
         | Builtin::Log
         | Builtin::Log10
@@ -109278,130 +109278,207 @@ fn resolve_eval_expr_sink<'a, S: EvalSemantics>(
 
 // Phase 22: File operations (yq)
 
-/// Builtin: load(file) - load external YAML/JSON file and return its parsed content
+/// Builtin: load(file) - load external YAML/JSON file and return its parsed content, or with
+/// yq's `load_str` / `load_base64` the file's text ([`LoadKind`], #6985).
 /// This function is only available with the "std" feature enabled.
+///
+/// yq reads the name from the argument's *first* output only, as the text of a scalar (`load(1)`
+/// opens the file `1`, a container is the empty name), and an argument with no output, or `null`
+/// (an absent key reads as `null` here), is `filename expression returned nil`; an argument that
+/// raised reports that alone. jq mode fans out over every output and takes a string only.
 #[cfg(feature = "std")]
 fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     file_expr: &Expr,
+    kind: LoadKind,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    use std::path::Path;
-
+    if S::TAG == EvalTag::Yq {
+        let (names, trailing) =
+            stream_outputs::<_, S>(eval_single::<W, S>(file_expr, value, optional));
+        if let Some(control) = trailing {
+            return partial(Vec::new(), control);
+        }
+        let filename = match names.into_iter().next() {
+            None | Some(OwnedValue::Null) => {
+                return QueryResult::Error(EvalError::new("filename expression returned nil"))
+            }
+            Some(OwnedValue::String(s)) => s.to_string(),
+            Some(other) => yq_stringify_scalar_or_empty::<S>(&other),
+        };
+        return load_file::<W, S>(&filename, kind, optional);
+    }
     fanout_arg::<W, S, _>(
         file_expr,
         value,
         optional,
-        // Real yq has no `load` in the jq-language sense reachable here; this
-        // is a succinctly extension either way, so jq's fan-out is unopposed.
+        // `load` is a succinctly extension in jq mode, so jq's fan-out is unopposed.
         ArgFanout::All,
-        |filename_owned| {
-            let filename = match filename_owned {
-                OwnedValue::String(s) => s,
-                _ if optional => return QueryResult::None,
-                _ => return QueryResult::Error(EvalError::type_error("string", "load filename")),
-            };
-
-            // Read the file contents
-            let file_bytes = match std::fs::read(&*filename) {
-                Ok(bytes) => bytes,
-                Err(_) if optional => {
-                    // In optional mode, return null for file errors
-                    return QueryResult::None;
-                }
-                Err(e) => {
-                    return QueryResult::Error(EvalError::new(format!(
-                        "load: failed to read file '{filename}': {e}"
-                    )));
-                }
-            };
-
-            // Detect format from file extension
-            let path = Path::new(filename.as_str());
-            let is_json = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
-
-            let result = if is_json {
-                // Parse as JSON
-                let index = crate::json::JsonIndex::build(&file_bytes);
-                let cursor = index.root(&file_bytes);
-                // #1755: to_owned, not to_owned_lossy -- an undecodable
-                // value in the loaded file must raise, not silently
-                // become "".
-                match to_owned::<S, _>(&cursor.value()) {
-                    Ok(v) => QueryResult::Owned(v),
-                    Err(e) => suppress_or_raise(e, optional),
-                }
-            } else {
-                // Parse as YAML (default). #5356: past a UTF-8 byte-order mark at the front, as
-                // yq reads a YAML file; a JSON file with one is refused above, as in yq.
-                let file_bytes: &[u8] = file_bytes
-                    .strip_prefix(b"\xEF\xBB\xBF")
-                    .unwrap_or(&file_bytes);
-                match crate::yaml::YamlIndex::build(file_bytes) {
-                    Ok(index) => {
-                        let root = index.root(file_bytes);
-                        // YAML documents are wrapped in a sequence at the root
-                        match root.value() {
-                            crate::yaml::YamlValue::Sequence(mut docs) => {
-                                // If single document, return it directly; otherwise return array
-                                let mut doc_values = Vec::new();
-                                while let Some((doc_cursor, rest)) = docs.uncons_cursor() {
-                                    let loaded = super::eval_generic::to_owned_yaml_cursor::<S, _>(
-                                        &doc_cursor,
-                                    );
-                                    match loaded {
-                                        Ok(v) => doc_values.push(v),
-                                        // #1620: a decode failure is never
-                                        // suppressed, `optional` or not --
-                                        // which `suppress_or_raise` states
-                                        // rather than assumes. #2334 routed
-                                        // this to match the JSON branch above,
-                                        // in the same function, on the same
-                                        // error class; the outcome is
-                                        // unchanged either way.
-                                        Err(e) => return suppress_or_raise(e, optional),
-                                    }
-                                    docs = rest;
-                                }
-                                if doc_values.len() == 1 {
-                                    QueryResult::Owned(doc_values.into_iter().next().unwrap())
-                                } else {
-                                    QueryResult::Owned(OwnedValue::array_from(doc_values))
-                                }
-                            }
-                            // Documents are always wrapped in a virtual root sequence,
-                            // so this is defensive; `root` itself is this single
-                            // document's cursor either way.
-                            _ => {
-                                let loaded = // patchcov: coverage tolerate-line reason="unreachable: YamlIndex::root always wraps the documents in a virtual root sequence, so the arm above takes every input (#2664)"
-                                    super::eval_generic::to_owned_yaml_cursor::<S, _>(&root); // patchcov: coverage tolerate-line reason="unreachable: the same defensive arm as the line above (#2664)"
-                                match loaded {
-                                    Ok(v) => QueryResult::Owned(v),
-                                    // Same #1620 routing as the sequence arm
-                                    // just above (#2334).
-                                    Err(e) => suppress_or_raise(e, optional),
-                                }
-                            }
-                        }
-                    }
-                    Err(_) if optional => QueryResult::None,
-                    Err(e) => QueryResult::Error(EvalError::new(format!(
-                        "load: failed to parse YAML file '{filename}': {e}"
-                    ))),
-                }
-            };
-            result
+        |filename_owned| match filename_owned {
+            OwnedValue::String(s) => load_file::<W, S>(&s, kind, optional),
+            _ if optional => QueryResult::None,
+            _ => QueryResult::Error(EvalError::type_error("string", "load filename")),
         },
     )
+}
+
+/// yq's (Go's) wording of a failed read of `name`: `open <name>: no such file or directory`, or
+/// `read <name>: is a directory` for a directory, which opens and fails on the read.
+#[cfg(feature = "std")]
+fn go_read_error(name: &str, error: &std::io::Error) -> String {
+    /// `EISDIR` on Linux and macOS (`ErrorKind::IsADirectory` needs a newer Rust than the crate's).
+    const EISDIR: i32 = 21;
+    let full = error.to_string();
+    let message = full
+        .rsplit_once(" (os error ")
+        .map_or(full.as_str(), |(m, _)| m);
+    let mut chars = message.chars();
+    let message: String = match chars.next() {
+        Some(first) => first.to_lowercase().chain(chars).collect(),
+        None => String::new(),
+    };
+    let op = if error.raw_os_error() == Some(EISDIR) {
+        "read"
+    } else {
+        "open"
+    };
+    format!("{op} {name}: {message}")
+}
+
+/// One file of [`builtin_load`], read as `kind` says.
+#[cfg(feature = "std")]
+fn load_file<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    filename: &str,
+    kind: LoadKind,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    use std::path::Path;
+    let yq = S::TAG == EvalTag::Yq;
+    // Read the file contents
+    let file_bytes = match std::fs::read(filename) {
+        Ok(bytes) => bytes,
+        Err(_) if optional => {
+            // In optional mode, return null for file errors
+            return QueryResult::None;
+        }
+        Err(e) if yq => {
+            return QueryResult::Error(EvalError::new(format!(
+                "failed to load {filename}: {}",
+                go_read_error(filename, &e)
+            )));
+        }
+        Err(e) => {
+            return QueryResult::Error(EvalError::new(format!(
+                "load: failed to read file '{filename}': {e}"
+            )));
+        }
+    };
+
+    match kind {
+        LoadKind::Document => {}
+        // The bytes as they are, a byte-order mark included, as yq reads them.
+        LoadKind::Text => {
+            return QueryResult::Owned(OwnedValue::from(owned_string_from_decoded_bytes::<S>(
+                file_bytes,
+            )))
+        }
+        // yq decodes the file as `@base64d` decodes a string (#6985).
+        LoadKind::Base64 => {
+            let text = OwnedValue::from(owned_string_from_decoded_bytes::<S>(file_bytes));
+            return match format_base64d::<S>(&text, false) {
+                Ok(decoded) => QueryResult::Owned(OwnedValue::from(decoded)),
+                Err(e) => QueryResult::Error(EvalError::new(format!(
+                    "failed to load {filename}: bad file '{filename}': {}",
+                    e.message
+                ))),
+            };
+        }
+    }
+
+    // Detect format from file extension
+    let path = Path::new(filename);
+    let is_json = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+
+    let result = if is_json {
+        // Parse as JSON
+        let index = crate::json::JsonIndex::build(&file_bytes);
+        let cursor = index.root(&file_bytes);
+        // #1755: to_owned, not to_owned_lossy -- an undecodable
+        // value in the loaded file must raise, not silently
+        // become "".
+        match to_owned::<S, _>(&cursor.value()) {
+            Ok(v) => QueryResult::Owned(v),
+            Err(e) => suppress_or_raise(e, optional),
+        }
+    } else {
+        // Parse as YAML (default). #5356: past a UTF-8 byte-order mark at the front, as
+        // yq reads a YAML file; a JSON file with one is refused above, as in yq.
+        let file_bytes: &[u8] = file_bytes
+            .strip_prefix(b"\xEF\xBB\xBF")
+            .unwrap_or(&file_bytes);
+        match crate::yaml::YamlIndex::build(file_bytes) {
+            Ok(index) => {
+                let root = index.root(file_bytes);
+                // YAML documents are wrapped in a sequence at the root
+                match root.value() {
+                    crate::yaml::YamlValue::Sequence(mut docs) => {
+                        // If single document, return it directly; otherwise return array
+                        let mut doc_values = Vec::new();
+                        while let Some((doc_cursor, rest)) = docs.uncons_cursor() {
+                            let loaded =
+                                super::eval_generic::to_owned_yaml_cursor::<S, _>(&doc_cursor);
+                            match loaded {
+                                Ok(v) => doc_values.push(v),
+                                // #1620: a decode failure is never
+                                // suppressed, `optional` or not --
+                                // which `suppress_or_raise` states
+                                // rather than assumes. #2334 routed
+                                // this to match the JSON branch above,
+                                // in the same function, on the same
+                                // error class; the outcome is
+                                // unchanged either way.
+                                Err(e) => return suppress_or_raise(e, optional),
+                            }
+                            docs = rest;
+                        }
+                        if doc_values.len() == 1 {
+                            QueryResult::Owned(doc_values.into_iter().next().unwrap())
+                        } else {
+                            QueryResult::Owned(OwnedValue::array_from(doc_values))
+                        }
+                    }
+                    // Documents are always wrapped in a virtual root sequence,
+                    // so this is defensive; `root` itself is this single
+                    // document's cursor either way.
+                    _ => {
+                        let loaded = // patchcov: coverage tolerate-line reason="unreachable: YamlIndex::root always wraps the documents in a virtual root sequence, so the arm above takes every input (#2664)"
+                            super::eval_generic::to_owned_yaml_cursor::<S, _>(&root); // patchcov: coverage tolerate-line reason="unreachable: the same defensive arm as the line above (#2664)"
+                        match loaded {
+                            Ok(v) => QueryResult::Owned(v),
+                            // Same #1620 routing as the sequence arm
+                            // just above (#2334).
+                            Err(e) => suppress_or_raise(e, optional),
+                        }
+                    }
+                }
+            }
+            Err(_) if optional => QueryResult::None,
+            Err(e) => QueryResult::Error(EvalError::new(format!(
+                "load: failed to parse YAML file '{filename}': {e}"
+            ))),
+        }
+    };
+    result
 }
 
 /// Builtin: load(file) - stub for no_std builds (returns error)
 #[cfg(not(feature = "std"))]
 fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     _file_expr: &Expr,
+    _kind: LoadKind,
     _value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {

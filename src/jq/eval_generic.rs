@@ -40516,7 +40516,7 @@ fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
             | Builtin::EnvObject(_)
             | Builtin::EnvVar(_)
             | Builtin::StrEnv(_)
-            | Builtin::Load(_)
+            | Builtin::Load(..)
             | Builtin::Pivot
             | Builtin::Input
             | Builtin::Inputs
