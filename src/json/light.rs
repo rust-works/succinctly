@@ -3328,11 +3328,15 @@ impl<'a> JsonNumber<'a> {
             .or_else(|| crate::json::validate::parse_int_spelling_token(bytes))
     }
 
-    /// Whether [`bridge_spelling`](Self::bridge_spelling)'s text was written as an integer the
-    /// text alone would read as a float (a zero-padded `08`, #6927).
+    /// The text of an integer the bridge carried under its own token because the text alone
+    /// reads as a float (a zero-padded `08`, #6927); `None` for any other span. Asked before
+    /// [`bridge_spelling`](Self::bridge_spelling), which answers the same text for it.
     #[inline]
-    pub(crate) fn bridge_spelling_is_int(&self) -> bool {
-        self.bridge && crate::json::validate::parse_int_spelling_token(self.raw_bytes()).is_some()
+    pub(crate) fn bridge_int_spelling(&self) -> Option<String> {
+        if !self.bridge {
+            return None;
+        }
+        crate::json::validate::parse_int_spelling_token(self.raw_bytes())
     }
 
     /// The address of the token's first byte in the document text: the

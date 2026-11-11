@@ -263,3 +263,41 @@ fn an_explicit_int_08_keeps_its_integer_on_every_route_6899() -> Result<()> {
     }
     Ok(())
 }
+
+/// #6927: the signed and padded spellings of an explicit `!!int` cross the bridge as integers, and the
+/// plain `08` beside them stays the float. Every row was captured from yq v4.53.3.
+const PADDED_DOC: &str = "a: !!int -09\nb: !!int +08\nc: !!int 0018\ne: !!int 09\np: 08\n";
+
+const PADDED_ROWS: &[(&str, &str)] = &[
+    (
+        ".zz = 1",
+        "{\"a\":-9,\"b\":8,\"c\":18,\"e\":9,\"p\":8.0,\"zz\":1}\n",
+    ),
+    (
+        "with_entries(.)",
+        "{\"a\":-9,\"b\":8,\"c\":18,\"e\":9,\"p\":8.0}\n",
+    ),
+    (". * .", "{\"a\":-9,\"b\":8,\"c\":18,\"e\":9,\"p\":8.0}\n"),
+    (
+        "[.[] | tojson]",
+        "[\"-9\\n\",\"8\\n\",\"18\\n\",\"9\\n\",\"8.0\\n\"]\n",
+    ),
+    (".zz = 1 | .p | tojson", "\"8.0\\n\"\n"),
+    (".zz = 1 | .a + 1", "-8\n"),
+];
+
+#[test]
+fn signed_and_padded_explicit_ints_cross_the_bridge_as_integers_6927() -> Result<()> {
+    for (filter, want) in PADDED_ROWS {
+        let (out, code) = run_yq_stdin(filter, PADDED_DOC, &["-o=json", "-I0"])?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(out, *want, "{filter}");
+    }
+    let (out, code) = run_yq_stdin(".zz = 1", PADDED_DOC, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        out,
+        "a: !!int -09\nb: !!int +08\nc: !!int 0018\ne: !!int 09\np: 08\nzz: 1\n"
+    );
+    Ok(())
+}

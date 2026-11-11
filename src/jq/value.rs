@@ -3580,14 +3580,15 @@ impl OwnedValue {
         // #2802: a scalar the bridge carried under its spelling token reads as that text, never
         // as the token's digits. Only a yq spelled integer is written under it so far, and
         // `from_number_literal` keeps its spelling in yq mode.
-        if let Some(spelling) = n.bridge_spelling() {
+        if let Some(spelling) = n.bridge_int_spelling() {
             // #6927: an integer the text alone reads as a float (`!!int 08`) crossed under the
             // integer's own token.
-            if n.bridge_spelling_is_int() {
-                if let Some(i) = crate::yaml::spelled_int_value(&spelling) {
-                    return Self::spelled_int::<S>(i, spelling.into());
-                }
+            if let Some(i) = crate::yaml::spelled_int_value(&spelling) {
+                return Self::spelled_int::<S>(i, spelling.into());
             }
+            return Self::from_number_literal::<S>(&spelling);
+        }
+        if let Some(spelling) = n.bridge_spelling() {
             return Self::from_number_literal::<S>(&spelling);
         }
         // #6275: a computed integer comes back as the bare `Int` it was.

@@ -1809,6 +1809,20 @@ mod tests {
             );
         }
         assert_eq!(int_spelling_token("08"), "5048056e999e999");
+        // No other family's decoder reads it, and it reads none of theirs.
+        let token = int_spelling_token("08");
+        assert_eq!(parse_nonfinite_literal_token(token.as_bytes()), None);
+        assert_eq!(parse_computed_float_token(token.as_bytes()), None);
+        assert_eq!(parse_computed_int_token(token.as_bytes()), None);
+        for other in [
+            "9e999e999",
+            "8e999e999",
+            "7e999e999",
+            &nonfinite_literal_token(0),
+            &computed_float_token(1.5),
+        ] {
+            assert_eq!(parse_int_spelling_token(other.as_bytes()), None, "{other}");
+        }
     }
 
     /// Load-bearing for #2902, the same way
