@@ -19657,6 +19657,52 @@ mod tests {
         );
     }
 
+    /// #6920: the plain route reads a window at a time only for one regular file big enough to be
+    /// worth it, on a run that reads the stream in order. The file here is sparse, so only its size is
+    /// read: every other shape takes the route that reads the file whole.
+    #[test]
+    fn windowed_plain_file_takes_only_a_lone_regular_file_6920() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = |name: &str, len: u64| {
+            let path = dir.path().join(name);
+            std::fs::File::create(&path)
+                .and_then(|f| f.set_len(len))
+                .expect("a sparse file");
+            path.to_string_lossy().into_owned()
+        };
+        let big = file("big.json", window::min_windowed_file_bytes());
+        let also_big = file("also-big.json", window::min_windowed_file_bytes() * 2);
+        let small = file("small.json", window::min_windowed_file_bytes() - 1);
+        let directory = dir.path().to_string_lossy().into_owned();
+        let missing = dir
+            .path()
+            .join("missing.json")
+            .to_string_lossy()
+            .into_owned();
+        let takes = |argv: &[&str]| {
+            let cmd = JqCommand::try_parse_from(argv.iter().copied()).unwrap();
+            windowed_plain_file(&cmd).is_some()
+        };
+        assert!(takes(&["jq", ".", &big]));
+        assert!(takes(&["jq", "-c", "select(.a)", &big]));
+        assert!(takes(&["jq", "-e", "--tab", "-S", ".a", &big]));
+        // Not one regular file big enough.
+        assert!(!takes(&["jq", ".", &small]));
+        assert!(!takes(&["jq", ".", &directory]));
+        assert!(!takes(&["jq", ".", &missing]));
+        assert!(!takes(&["jq", "."]));
+        assert!(!takes(&["jq", ".", "-"]));
+        assert!(!takes(&["jq", ".", &big, &also_big]));
+        // A run that reads the stream whole or otherwise.
+        for flags in [&["-s"][..], &["--validate"], &["--seq"], &["-n"]] {
+            let mut argv = vec!["jq"];
+            argv.extend(flags);
+            argv.extend([".", big.as_str()]);
+            assert!(!takes(&argv), "{flags:?}");
+        }
+    }
+
     /// #6451: [`lone_lazy_read`] admits only what the lone source's branch of [`get_inputs`] takes
     /// the lazy route on: a front is started on for no run flag that would read the source another
     /// way, and every flag that leaves the read alone reads the same with and without one.
