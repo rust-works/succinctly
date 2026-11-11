@@ -72,6 +72,8 @@ const ANSWERED: &[(&str, &str)] = &[
     ("load_str(\"bom.txt\")", "\"\u{feff}hi\"\n"),
     ("load_str(1)", "\"x\"\n"),
     ("load_base64(\"b64.txt\")", "\"hi\"\n"),
+    ("loadbase64(\"b64.txt\")", "\"hi\"\n"),
+    ("str_load(\"s.txt\")", "\"hi\\nthere\\n\"\n"),
     ("load_base64(\"b64nl.txt\")", "\"hello world\"\n"),
     ("[load(\"s.txt\", \"b64.txt\")]", "[\"hi there\"]\n"),
     ("load(1)", "\"x\"\n"),
@@ -167,6 +169,22 @@ fn jq_mode_has_no_yq_loaders_or_encoder_spellings_6985() -> Result<()> {
     for filter in ["load_str(\"s.txt\")", "[1] | to_csv", "1 | toprops"] {
         let (_, code) = run_jq_stdin(filter, "null", &["-c"])?;
         assert_eq!(code, 3, "{filter}: not defined in jq mode");
+    }
+    Ok(())
+}
+
+/// A file `load` cannot parse is a bad file, named as yq names it; the reason after the prefix is
+/// this parser's own (recorded in `docs/compliance/yq/limitations.md`).
+#[test]
+fn yq_load_names_a_file_that_does_not_parse_6985() -> Result<()> {
+    let dir = fixture()?;
+    std::fs::write(dir.path().join("bad.yaml"), "a: [1\n")?;
+    std::fs::write(dir.path().join("bad.json"), "{\"a\": 1")?;
+    for name in ["bad.yaml", "bad.json"] {
+        let (stdout, stderr, code) = yq_in(&dir, &format!("load(\"{name}\")"), &[])?;
+        assert_eq!((stdout.as_str(), code), ("", 1), "{name}: {stderr}");
+        let prefix = format!("Error: failed to load {name}: bad file '{name}': ");
+        assert!(stderr.starts_with(&prefix), "{name}: {stderr}");
     }
     Ok(())
 }

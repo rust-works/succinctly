@@ -109326,8 +109326,12 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// `read <name>: is a directory` for a directory, which opens and fails on the read.
 #[cfg(feature = "std")]
 fn go_read_error(name: &str, error: &std::io::Error) -> String {
-    /// `EISDIR` on Linux and macOS (`ErrorKind::IsADirectory` needs a newer Rust than the crate's).
-    const EISDIR: i32 = 21;
+    /// `EISDIR` on Linux and macOS (`ErrorKind::IsADirectory` needs a newer Rust than the crate's);
+    /// elsewhere no errno is taken for a directory, and the read is worded as an open.
+    #[cfg(unix)]
+    const EISDIR: Option<i32> = Some(21);
+    #[cfg(not(unix))]
+    const EISDIR: Option<i32> = None;
     let full = error.to_string();
     let message = full
         .rsplit_once(" (os error ")
@@ -109337,7 +109341,7 @@ fn go_read_error(name: &str, error: &std::io::Error) -> String {
         Some(first) => first.to_lowercase().chain(chars).collect(),
         None => String::new(),
     };
-    let op = if error.raw_os_error() == Some(EISDIR) {
+    let op = if EISDIR.is_some() && error.raw_os_error() == EISDIR {
         "read"
     } else {
         "open"
@@ -109466,12 +109470,26 @@ fn load_file<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
             }
             Err(_) if optional => QueryResult::None,
+            // yq mode words it below, as a bad file.
+            Err(e) if yq => QueryResult::Error(EvalError::new(e.to_string())),
             Err(e) => QueryResult::Error(EvalError::new(format!(
                 "load: failed to parse YAML file '{filename}': {e}"
             ))),
         }
     };
-    result
+    match result {
+        // yq names the file of a document it cannot read (#6985). The parser's own message after
+        // the prefix is ours, not go-yaml's. The error keeps its kind: a decode failure still
+        // cannot be suppressed.
+        QueryResult::Error(mut e) if yq => {
+            e.message = format!(
+                "failed to load {filename}: bad file '{filename}': {}",
+                e.message
+            );
+            QueryResult::Error(e)
+        }
+        other => other,
+    }
 }
 
 /// Builtin: load(file) - stub for no_std builds (returns error)

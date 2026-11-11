@@ -1729,6 +1729,12 @@ const YQ_SPELLINGS: &[(&str, &[&str])] = &[
         "array_to_map",
         &["array_tomap", "arrayto_map", "arraytomap"],
     ),
+    // #6985: `to_?csv`, `to_?tsv`, `to_?props`, `load_?str|str_?load` and `load_?base64`.
+    ("to_csv", &["tocsv"]),
+    ("to_tsv", &["totsv"]),
+    ("to_props", &["toprops"]),
+    ("load_str", &["loadstr", "str_load", "strload"]),
+    ("load_base64", &["loadbase64"]),
 ];
 
 /// The other spellings of `keyword` in yq mode: none for most.
@@ -5902,9 +5908,6 @@ impl<'a> Parser<'a> {
         Ok(Expr::Array(Box::new(body)))
     }
 
-    /// yq's `to_json` / `to_json(N)` and `to_yaml` / `to_yaml(N)` (#4206). `N` must be a
-    /// non-negative integer literal: yq's parser rejects any other argument (`to_json(.a)`,
-    /// `to_json(2+2)`, `to_json(-1)`) as `bad expression`.
     /// yq's operator spelling of an `@` encoder at the cursor (`to_csv` / `tocsv`, `to_tsv` /
     /// `totsv`, `to_props` / `toprops`, #6985), with the format it names: yq mode only, and not when
     /// the program defines the name.
@@ -5914,22 +5917,19 @@ impl<'a> Parser<'a> {
         }
         let found = if self.matches_keyword("to_csv") {
             ("to_csv", FormatType::Csv)
-        } else if self.matches_keyword("tocsv") {
-            ("tocsv", FormatType::Csv)
         } else if self.matches_keyword("to_tsv") {
             ("to_tsv", FormatType::Tsv)
-        } else if self.matches_keyword("totsv") {
-            ("totsv", FormatType::Tsv)
         } else if self.matches_keyword("to_props") {
             ("to_props", FormatType::Props)
-        } else if self.matches_keyword("toprops") {
-            ("toprops", FormatType::Props)
         } else {
             return None;
         };
         (!self.shadowable_defs.contains(found.0)).then_some(found)
     }
 
+    /// yq's `to_json` / `to_json(N)` and `to_yaml` / `to_yaml(N)` (#4206). `N` must be a
+    /// non-negative integer literal: yq's parser rejects any other argument (`to_json(.a)`,
+    /// `to_json(2+2)`, `to_json(-1)`) as `bad expression`.
     fn parse_yq_to_text_operator(&mut self) -> Result<Expr, ParseError> {
         let json = self.matches_keyword("to_json") || self.matches_keyword("tojson");
         self.consume_keyword(if self.matches_keyword("to_json") {
@@ -9997,15 +9997,11 @@ impl<'a> Parser<'a> {
                 .parse_required_single_arg(keyword_start)?
                 .map(|file_expr| Builtin::Load(Box::new(file_expr), LoadKind::Document)));
         }
-        // #6985: yq's text loaders, `load_str` (also `strload`, `loadstr`) and `load_base64`. Not jq
-        // names, so a jq-mode program may define them.
+        // #6985: yq's text loaders, `load_str` and `load_base64` (their other spellings are in
+        // `YQ_SPELLINGS`). Not jq names, so a jq-mode program may define them.
         if self.mode == ParserMode::Yq {
             let loader = if self.matches_keyword("load_str") {
                 Some(("load_str", LoadKind::Text))
-            } else if self.matches_keyword("strload") {
-                Some(("strload", LoadKind::Text))
-            } else if self.matches_keyword("loadstr") {
-                Some(("loadstr", LoadKind::Text))
             } else if self.matches_keyword("load_base64") {
                 Some(("load_base64", LoadKind::Base64))
             } else {
@@ -16839,7 +16835,6 @@ mod tests {
             "load",
             "load_base64",
             "load_str",
-            "loadstr",
             "map",
             "map_values",
             "match",
@@ -16866,7 +16861,6 @@ mod tests {
             "split",
             "split_doc",
             "strenv",
-            "strload",
             "style",
             "sub",
             "tag",
@@ -16880,9 +16874,6 @@ mod tests {
             "to_tsv",
             "to_unix",
             "to_yaml",
-            "tocsv",
-            "toprops",
-            "totsv",
             "toyaml",
             "tojson",
             "tonumber",

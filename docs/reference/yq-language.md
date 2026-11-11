@@ -395,7 +395,7 @@ succinctly yq --jq-extensions --eval-all '[.] | reduce .[] as $item ({}; . * $it
 | `shuffle`           | Randomly shuffle array elements                       | `[1,2,3] \| shuffle`            |
 | `pivot`             | Transpose arrays/objects (SQL-style)                  | `[[1,2],[3,4]] \| pivot`        |
 | `load(file)`        | Load external YAML/JSON file                          | `load("config.yaml")`           |
-| `load_str(file)`    | The file's text, unparsed (also `strload`, `loadstr`) | `load_str("notes.txt")`         |
+| `load_str(file)`    | The file's text, unparsed                             | `load_str("notes.txt")`         |
 | `load_base64(file)` | The file's text, base64-decoded                       | `load_base64("key.b64")`        |
 | `parent`            | Return parent node                                    | `.. \| select(.name) \| parent` |
 | `parent(n)`         | Return nth parent node                                | `parent(2)`                     |
@@ -407,7 +407,7 @@ succinctly yq --jq-extensions --eval-all '[.] | reduce .[] as $item ({}; . * $it
 
 `succinctly yq` accepts the other spellings of an operator that yq's lexer does (#6078): `lineComment`, `headComment` and `footComment`; `documentIndex`; `fileName`/`file_name` and `fileindex`; `splitDoc`; `mapvalues`, `groupby`, `sortby`, `uniqueby` and `sortkeys`; `toentries`/`toEntries`, `fromentries`/`fromEntries` and `withentries`/`withEntries`; `fromunix` and `tounix`; and the spellings of `array_to_map` without one or both underscores. They are yq mode only: `succinctly jq 'groupby(.)'` is an undefined function.
 
-`load`, `load_str` and `load_base64` read the file name as yq does (#6985): from the argument's first output only, a scalar by its text (`load(1)` opens the file `1`, a container is the empty name), and an argument with no output or `null` is `filename expression returned nil`. A file that cannot be read is `failed to load <name>: open <name>: no such file or directory` (`read <name>: is a directory` for a directory). `load_str` keeps the bytes as they are, a byte-order mark included; `load_base64` decodes them as `@base64d` decodes a string. `load_str`, `strload`, `loadstr` and `load_base64` are yq mode only.
+`load`, `load_str` and `load_base64` read the file name as yq does (#6985): from the argument's first output only, a scalar by its text (`load(1)` opens the file `1`, a container is the empty name), and an argument with no output or `null` is `filename expression returned nil`. A file that cannot be read is `failed to load <name>: open <name>: no such file or directory` (`read <name>: is a directory` for a directory). `load_str` (also spelled `loadstr`, `str_load` and `strload`) keeps the bytes as they are, a byte-order mark included; `load_base64` (`loadbase64`) decodes them as `@base64d` decodes a string. The loaders other than `load` are yq mode only. A file that does not parse is `failed to load <name>: bad file '<name>': ...`.
 
 ```bash
 # Remove keys from object
