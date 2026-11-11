@@ -222,11 +222,14 @@ fn bound(slot: Option<&OwnedValue>) -> Result<Option<f64>, EvalError> {
 /// *rounded* value's sign — this function's own shape before #3396 — breaks
 /// for an end bound in `(-1, 0)`: `ceil(-0.5)` is `-0.0`, which is not
 /// negative, so the fold that should have turned it into `len` never runs
-/// and it clamps to `0` instead. A start bound was never affected by this,
-/// since `floor` commutes with an integer offset regardless of which order
-/// runs (`floor(x + len) == floor(x) + len`); `ceil` has the identical
-/// identity, but the old code never reached it because it decided whether
-/// to fold from the wrong (post-rounding) value in the first place.
+/// and it clamps to `0` instead. A start bound was not affected by *that*,
+/// since `floor(x + len) == floor(x) + len` for real numbers (`ceil` has the
+/// identical identity). It is a property of real numbers, though, not of the
+/// rounded double sum jq computes: `-1e-66 + 5` is exactly `5.0`, so folding
+/// first and rounding second is the only order that agrees with jq for either
+/// bound (#6984). That is why a computed bound keeps its double
+/// ([`SliceBound`]) until the length is known, rather than being floored or
+/// ceiled up front.
 ///
 /// Written over `f64` so that a bound too large for a `usize` saturates at
 /// `len` instead of wrapping: `[1,2,3] | .[1:1e100]` is `[2,3]`, and a NaN
@@ -246,6 +249,96 @@ fn clamp(bound: f64, len: usize, round: fn(f64) -> f64) -> usize {
         len
     } else {
         rounded as usize
+    }
+}
+
+/// One computed slice bound as the pull site hands it to the slice step, before any length is
+/// known (#6984).
+///
+/// `rounded` is the bound rounded the way a literal one is (floor for a start, ceil for an end,
+/// #3404's past-the-end for an end in `(-1, 0)`): what every route that navigates by an integer
+/// reads, and the whole answer for any bound that is not negative with a fractional part.
+///
+/// A negative bound *with* a fractional part also keeps its double, because jq folds it against
+/// the length in double arithmetic before it rounds (`parse_slice`: `dstart += len`, then
+/// `floor`). `floor(f + len) == floor(f) + len` holds for real numbers but not for the rounded
+/// sum: `-1e-66 + 5` is exactly `5.0`, so `[1,2,3,4,5] | .[-1e-66:]` is `[]`, and
+/// `-1.0000000000000002 + 5` is `4.0`, so its start is `4`, not `3`. Which one the sum lands on
+/// depends on the length, so it cannot be settled here: [`SliceBound::folded`] does it where the
+/// target is in hand.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SliceBound {
+    rounded: i64,
+    fraction: Option<f64>,
+}
+
+impl SliceBound {
+    /// A bound that is its own integer: nothing to fold.
+    pub(crate) const fn int(rounded: i64) -> Self {
+        Self {
+            rounded,
+            fraction: None,
+        }
+    }
+
+    /// The bound `source` rounds to `rounded`, keeping `source` when the length can change the
+    /// rounding: a finite negative number with a fractional part. An integer folds exactly
+    /// (`-3.0 + len`), and NaN and the infinities clamp the same way whatever the length.
+    pub(crate) fn new(rounded: i64, source: f64) -> Self {
+        let folds = source.is_finite() && source < 0.0 && source.fract() != 0.0;
+        Self {
+            rounded,
+            fraction: folds.then_some(source),
+        }
+    }
+
+    /// The integer a route that never folds against a length navigates with.
+    pub(crate) const fn rounded(self) -> i64 {
+        self.rounded
+    }
+
+    /// Whether the length decides this bound's rounding.
+    pub(crate) const fn has_fraction(self) -> bool {
+        self.fraction.is_some()
+    }
+
+    /// The bound against a container of `len` elements, as [`clamp`] folds it: a non-negative
+    /// integer in `0..=len` for a bound that kept its double, the rounded integer otherwise
+    /// (which every consumer folds and clamps itself).
+    pub(crate) fn folded(self, len: usize, round: fn(f64) -> f64) -> i64 {
+        match self.fraction {
+            Some(f) => clamp(f, len, round) as i64,
+            None => self.rounded,
+        }
+    }
+}
+
+impl From<i64> for SliceBound {
+    fn from(rounded: i64) -> Self {
+        Self::int(rounded)
+    }
+}
+
+/// A `(start, end)` pair of computed bounds as integers against the target they slice (#6984).
+///
+/// `len` is asked for only when a bound kept its double, so a slice by integers never counts the
+/// target. `None` from it (a count that failed) leaves the rounded integers, which the slice
+/// then meets the same failure on.
+pub(crate) fn fold_bounds(
+    start: Option<SliceBound>,
+    end: Option<SliceBound>,
+    len: impl FnOnce() -> Option<usize>,
+) -> (Option<i64>, Option<i64>) {
+    let plain = || (start.map(SliceBound::rounded), end.map(SliceBound::rounded));
+    if !(start.is_some_and(SliceBound::has_fraction) || end.is_some_and(SliceBound::has_fraction)) {
+        return plain();
+    }
+    match len() {
+        Some(len) => (
+            start.map(|b| b.folded(len, f64::floor)),
+            end.map(|b| b.folded(len, f64::ceil)),
+        ),
+        None => plain(),
     }
 }
 
@@ -512,5 +605,73 @@ mod tests {
     #[test]
     fn slice_str_counts_characters_not_bytes() {
         assert_eq!(slice_str("héllo", 1..3), "él");
+    }
+
+    /// #6984: a negative bound with a fractional part is added to the length in double arithmetic
+    /// before it is rounded, so which integer it is depends on the length.
+    #[test]
+    fn a_negative_fractional_bound_folds_against_the_length_before_rounding_6984() {
+        // `-1e-66 + 5` is exactly `5.0`: the start is the length, not `floor(-1e-66) + 5`.
+        let tiny = SliceBound::new(-1, -1e-66);
+        assert!(tiny.has_fraction());
+        assert_eq!(tiny.rounded(), -1);
+        assert_eq!(tiny.folded(5, f64::floor), 5);
+        // A fraction the sum keeps rounds as the integer fold does.
+        let half = SliceBound::new(-1, -0.5);
+        assert_eq!(half.folded(5, f64::floor), 4);
+        assert_eq!(half.folded(5, f64::ceil), 5);
+        // `-0.9999999999999999 + 5` is `4.0`, not `4.0000000000000001`, so an end of it is 4.
+        let near_one = SliceBound::new(i64::MAX, -0.999_999_999_999_999_9);
+        assert_eq!(near_one.folded(5, f64::ceil), 4);
+        // The same start is the length against a long array and one less against a short one.
+        let ten_pow_minus_ten = SliceBound::new(-1, -1e-10);
+        assert_eq!(ten_pow_minus_ten.folded(5, f64::floor), 4);
+        assert_eq!(ten_pow_minus_ten.folded(1_000_000, f64::floor), 999_999);
+        assert_eq!(
+            SliceBound::new(-1, -5e-11).folded(1_000_000, f64::floor),
+            1_000_000
+        );
+        // Past the front it clamps to 0 rather than staying negative.
+        assert_eq!(SliceBound::new(-11, -10.5).folded(5, f64::floor), 0);
+    }
+
+    /// #6984: only a finite negative number with a fractional part keeps its double.
+    #[test]
+    fn only_a_finite_negative_fraction_keeps_its_double_6984() {
+        for source in [
+            -3.0,
+            -0.0,
+            0.5,
+            1.5,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -1e300,
+        ] {
+            assert!(!SliceBound::new(7, source).has_fraction(), "{source}");
+            assert_eq!(SliceBound::new(7, source).folded(5, f64::floor), 7);
+        }
+        assert!(SliceBound::new(7, -1e-300).has_fraction());
+        assert_eq!(SliceBound::from(3), SliceBound::int(3));
+    }
+
+    /// #6984: `fold_bounds` counts the target only when a bound needs it, and a failed count
+    /// leaves the rounded integers.
+    #[test]
+    fn fold_bounds_asks_for_the_length_only_when_a_bound_needs_it_6984() {
+        let plain = Some(SliceBound::int(2));
+        let fractional = Some(SliceBound::new(-1, -1e-66));
+        let never = || -> Option<usize> { panic!("the length was not needed") };
+        assert_eq!(fold_bounds(None, None, never), (None, None));
+        assert_eq!(fold_bounds(plain, plain, never), (Some(2), Some(2)));
+        assert_eq!(
+            fold_bounds(fractional, plain, || Some(5)),
+            (Some(5), Some(2))
+        );
+        assert_eq!(
+            fold_bounds(plain, fractional, || Some(5)),
+            (Some(2), Some(5))
+        );
+        assert_eq!(fold_bounds(fractional, plain, || None), (Some(-1), Some(2)));
     }
 }
