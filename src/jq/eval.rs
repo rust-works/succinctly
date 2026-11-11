@@ -26059,7 +26059,13 @@ fn format_yq_csv<S: EvalSemantics>(
             yq_csv_tag(v)
         ))
     }
-    fn record<F: AsRef<str>>(out: &mut String, fields: &[F], comma: char) {
+    fn record<F: AsRef<str>>(out: &mut String, fields: &[F], comma: char) -> Result<(), EvalError> {
+        // Go's `csv.Writer` refuses these delimiters at its first write.
+        if matches!(comma, '"' | '\r' | '\n' | '\u{fffd}') {
+            return Err(EvalError::new(
+                "csv: invalid field or comment delimiter".to_string(),
+            ));
+        }
         for (i, field) in fields.iter().enumerate() {
             if i > 0 {
                 out.push(comma);
@@ -26067,6 +26073,7 @@ fn format_yq_csv<S: EvalSemantics>(
             out.push_str(&yq_csv_field(field.as_ref(), comma));
         }
         out.push('\n');
+        Ok(())
     }
     let items = match value {
         OwnedValue::Array(items) => items,
@@ -26088,7 +26095,11 @@ fn format_yq_csv<S: EvalSemantics>(
         None => {}
         Some(OwnedValue::Object(header)) => {
             let keys: Vec<&String> = header.keys().collect();
-            record(&mut out, &keys, comma);
+            // yq's object branch drops the writer's refusal of the delimiter (it returns nil), so the
+            // result is empty, not an error.
+            if record(&mut out, &keys, comma).is_err() {
+                return Ok(String::new());
+            }
             for (i, item) in items.iter().enumerate() {
                 let OwnedValue::Object(row) = item else {
                     return Err(EvalError::new(format!(
@@ -26103,7 +26114,7 @@ fn format_yq_csv<S: EvalSemantics>(
                         Some(v) => fields.push(scalar::<S>(v).ok_or_else(|| not_scalars(at, v))?),
                     }
                 }
-                record(&mut out, &fields, comma);
+                record(&mut out, &fields, comma)?;
             }
         }
         Some(OwnedValue::Array(_)) => {
@@ -26115,7 +26126,7 @@ fn format_yq_csv<S: EvalSemantics>(
                 for (at, v) in row.iter().enumerate() {
                     fields.push(scalar::<S>(v).ok_or_else(|| not_scalars(at, v))?);
                 }
-                record(&mut out, &fields, comma);
+                record(&mut out, &fields, comma)?;
             }
         }
         Some(_) => {
@@ -26123,7 +26134,7 @@ fn format_yq_csv<S: EvalSemantics>(
             for (at, v) in items.iter().enumerate() {
                 fields.push(scalar::<S>(v).ok_or_else(|| not_scalars(at, v))?);
             }
-            record(&mut out, &fields, comma);
+            record(&mut out, &fields, comma)?;
         }
     }
     if !line_ends {
@@ -26745,9 +26756,31 @@ fn format_yaml(value: &OwnedValue) -> Result<String, EvalError> {
 /// writes it (#1076); a value with no lines (`{}`, `[]`) is the empty string. `@yaml` ends
 /// the same way (#1183).
 fn format_props(value: &OwnedValue) -> Result<String, EvalError> {
+    Ok(format_props_with(value, " = ", false))
+}
+
+/// [`format_props`] with `--properties-separator` between a key and its value (an empty one is yq's
+/// default ` = `) and, with `--properties-array-brackets`, `a[0]` for an array element below the
+/// root where it writes `a.0` (#6922).
+fn format_props_with(value: &OwnedValue, separator: &str, array_brackets: bool) -> String {
+    let separator = if separator.is_empty() {
+        " = "
+    } else {
+        separator
+    };
     let mut out = String::new();
-    format_props_recursive(value, String::new(), &mut out, 0);
-    Ok(out)
+    let style = PropsStyle {
+        separator,
+        array_brackets,
+    };
+    format_props_recursive(value, String::new(), &mut out, 0, &style);
+    out
+}
+
+/// What [`format_props_with`] varies.
+struct PropsStyle<'a> {
+    separator: &'a str,
+    array_brackets: bool,
 }
 
 /// Recursively format a value into Java properties lines, each written with its newline.
@@ -26757,7 +26790,13 @@ fn format_props(value: &OwnedValue) -> Result<String, EvalError> {
 /// (`format_json_impl`, guarded by #1015), this one had no guard at all;
 /// reachable on a value constructed via `reduce`/`foreach`/etc. with no
 /// adversarial document involved.
-fn format_props_recursive(value: &OwnedValue, prefix: String, out: &mut String, depth: usize) {
+fn format_props_recursive(
+    value: &OwnedValue,
+    prefix: String,
+    out: &mut String,
+    depth: usize,
+    style: &PropsStyle<'_>,
+) {
     assert_value_tree_depth(depth);
     match value {
         OwnedValue::Object(obj) => {
@@ -26767,17 +26806,19 @@ fn format_props_recursive(value: &OwnedValue, prefix: String, out: &mut String, 
                 } else {
                     format!("{prefix}.{key}")
                 };
-                format_props_recursive(val, new_prefix, out, depth + 1);
+                format_props_recursive(val, new_prefix, out, depth + 1, style);
             }
         }
         OwnedValue::Array(arr) => {
             for (idx, val) in arr.iter().enumerate() {
                 let new_prefix = if prefix.is_empty() {
                     format!("{idx}")
+                } else if style.array_brackets {
+                    format!("{prefix}[{idx}]")
                 } else {
                     format!("{prefix}.{idx}")
                 };
-                format_props_recursive(val, new_prefix, out, depth + 1);
+                format_props_recursive(val, new_prefix, out, depth + 1, style);
             }
         }
         _ => {
@@ -26788,7 +26829,7 @@ fn format_props_recursive(value: &OwnedValue, prefix: String, out: &mut String, 
                 out.push('\n');
             } else if !prefix.is_empty() {
                 out.push_str(&props_escape(&prefix, true));
-                out.push_str(" = ");
+                out.push_str(style.separator);
                 out.push_str(&props_value_to_string(value, true));
                 out.push('\n');
             }
@@ -26808,9 +26849,12 @@ fn format_yq_output<S: EvalSemantics>(
     value: &OwnedValue,
 ) -> Result<String, EvalError> {
     match encoder {
-        YqOutputEncoder::Props => format_props(value),
+        YqOutputEncoder::Props {
+            separator,
+            array_brackets,
+        } => Ok(format_props_with(value, separator, *array_brackets)),
         YqOutputEncoder::Shell(separator) => Ok(format_shell_variables(value, separator)),
-        YqOutputEncoder::Csv => format_yq_csv::<S>(value, ',', true),
+        YqOutputEncoder::Csv(comma) => format_yq_csv::<S>(value, *comma, true),
         YqOutputEncoder::Tsv => format_yq_csv::<S>(value, '\t', true),
         YqOutputEncoder::Base64 => match value {
             OwnedValue::String(_) => format_base64::<S>(value, false),

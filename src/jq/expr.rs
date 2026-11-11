@@ -3328,12 +3328,16 @@ pub enum FormatType {
 /// The encoder of `-o=<format>` in `succinctly yq` (#6850), see [`FormatType::YqOutput`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum YqOutputEncoder {
-    /// `-o=props`
-    Props,
+    /// `-o=props`, with `--properties-separator` (empty means the default ` = `) and
+    /// `--properties-array-brackets`
+    Props {
+        separator: String,
+        array_brackets: bool,
+    },
     /// `-o=shell`, with the `--shell-key-separator` between the parts of a name
     Shell(String),
-    /// `-o=csv`
-    Csv,
+    /// `-o=csv`, with `--csv-separator`
+    Csv(char),
     /// `-o=tsv`
     Tsv,
     /// `-o=base64`: a string only, and no line end
