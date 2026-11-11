@@ -109333,14 +109333,15 @@ fn go_read_error(name: &str, error: &std::io::Error) -> String {
     #[cfg(not(unix))]
     const EISDIR: Option<i32> = None;
     let full = error.to_string();
-    let message = full
+    let mut message = full
         .rsplit_once(" (os error ")
-        .map_or(full.as_str(), |(m, _)| m);
-    let mut chars = message.chars();
-    let message: String = match chars.next() {
-        Some(first) => first.to_lowercase().chain(chars).collect(),
-        None => String::new(),
-    };
+        .map_or(full.as_str(), |(m, _)| m)
+        .to_string();
+    // Go's own messages are lower case (`no such file or directory`); an OS message opens with an
+    // ASCII capital, and `get_mut` leaves any other first character alone.
+    if let Some(first) = message.get_mut(..1) {
+        first.make_ascii_lowercase();
+    }
     let op = if EISDIR.is_some() && error.raw_os_error() == EISDIR {
         "read"
     } else {

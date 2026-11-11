@@ -188,3 +188,21 @@ fn yq_load_names_a_file_that_does_not_parse_6985() -> Result<()> {
     }
     Ok(())
 }
+
+/// jq mode keeps `load`'s own wording for a file that does not parse.
+#[test]
+fn jq_load_keeps_its_wording_for_a_file_that_does_not_parse_6985() -> Result<()> {
+    let dir = fixture()?;
+    std::fs::write(dir.path().join("bad.yaml"), "a: [1\n")?;
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .current_dir(dir.path())
+        .args(["jq", "-n", "load(\"bad.yaml\")"])
+        .output()?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(output.status.code(), Some(5), "{stderr}");
+    assert!(
+        stderr.contains("load: failed to parse YAML file 'bad.yaml': "),
+        "{stderr}"
+    );
+    Ok(())
+}
