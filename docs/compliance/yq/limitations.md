@@ -811,11 +811,13 @@ The reasoning, the table and the pin are in [jq limitations § A slice of an arr
 ### Nested explicit keys past 128 levels are refused ([#6956](https://github.com/rust-works/succinctly/issues/6956))
 
 A run of explicit-key indicators (`? ? ? a`, `- ? - ? a`) is a key whose key is a key, and each level is a call of the parser.
-yq reads up to 10,000 levels and stops past them (`exceeded max depth of 10000`).
-This parser charged no depth for the recursion, so a few hundred thousand indicators aborted the process with a stack overflow.
-It charges the same limit as a flow collection now: past 128 levels the run stops with `nesting depth exceeds limit of 128` and exit status 1.
+yq reads up to 10,000 levels and stops past them (`exceeded max depth of 10000`, captured from v4.53.3).
+This parser charged no depth for the recursion, so a few hundred thousand indicators took minutes and about 1.5 million aborted the process with a stack overflow.
+It charges the limit a flow collection does now: 129 `? ` indicators in a row are read, the 130th stops the run with `nesting depth exceeds limit of 128` and exit status 1, and `- ? ` runs stop at the 129th.
 That is rule 4(c) of the divergence rule, where matching yq would take the host process down.
-A document with 129 to 10,000 nested explicit keys is read by yq and refused here; no real document has them.
+The budget is the parser's, shared by explicit keys and flow collections, so a key nested 70 levels in explicit keys whose own content is a flow collection nested 70 levels is refused where yq reads it.
+It applies to every entry point of the parser: `succinctly jq` over YAML input and the library's `YamlIndex` refuse the same documents.
+A document with 130 to 10,000 nested explicit keys is read by yq and refused here; no real document has them.
 
 ### An explicit `?` key next to a block sequence — rejected when the key has content (#1104), the bare `?` shape is the key (#6370)
 

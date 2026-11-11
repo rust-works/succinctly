@@ -48,14 +48,33 @@ fn nested_explicit_keys_read_as_yq_reads_them_6956() -> Result<()> {
         let (_, code) = run_yq_stdin(".", doc, &["-o=json", "-I=0"])?;
         assert_ne!(code, 0, "{doc:?}");
     }
-    // Deep, but within the limit and within yq's: 100 levels read as yq reads them.
-    let (out, code) = run_yq_stdin(
-        ".",
-        &format!("{}a\n", "? ".repeat(100)),
-        &["-o=json", "-I=0"],
-    )?;
-    assert_eq!(code, 0);
-    assert_eq!(out, "{\"\":null}\n");
+    // Deep, but within the limit and within yq's: read as yq reads them, up to the last level
+    // the limit admits and not past it.
+    for (unit, reads, refused_at, want) in [
+        ("? ", 129, 130, "{\"\":null}\n"),
+        ("- ? ", 128, 129, "[{\"\":null}]\n"),
+    ] {
+        let (out, code) = run_yq_stdin(
+            ".",
+            &format!("{}a\n", unit.repeat(reads)),
+            &["-o=json", "-I=0"],
+        )?;
+        assert_eq!(code, 0, "{unit:?} x {reads}");
+        assert_eq!(out, want, "{unit:?} x {reads}");
+        let (_, err, code) = run_yq_stdin_with_stderr(
+            ".",
+            &format!("{}a\n", unit.repeat(refused_at)),
+            &["-o=json", "-I=0"],
+        )?;
+        assert_eq!(code, 1, "{unit:?} x {refused_at}");
+        assert!(err.contains("nesting depth exceeds limit of 128"), "{err}");
+    }
+    // The 128 budget is shared with flow collections: 70 explicit-key levels whose content is a
+    // flow sequence 70 deep is read by yq and refused here.
+    let mixed = format!("{}{}{}\n", "? ".repeat(70), "[".repeat(70), "]".repeat(70));
+    let (_, err, code) = run_yq_stdin_with_stderr(".", &mixed, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 1);
+    assert!(err.contains("nesting depth exceeds limit of 128"), "{err}");
     Ok(())
 }
 
@@ -83,7 +102,7 @@ fn a_run_of_nested_explicit_keys_past_the_limit_is_refused_cleanly_6956() -> Res
             &doc[..8]
         );
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(8),
+            started.elapsed() < std::time::Duration::from_secs(3),
             "{:?}: {:?}",
             &doc[..8],
             started.elapsed()
