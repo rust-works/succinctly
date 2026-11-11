@@ -40523,7 +40523,7 @@ fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
             // input, which the identity route does not follow; `eval(".a") | key` prints nothing
             // (it is `"a"` in yq v4.53.3), as the other computed stages do. A write through
             // `eval` is resolved in path position and lands.
-            Builtin::EvalExpr(_) => Detaches,
+            Builtin::EvalExpr(..) => Detaches,
             Builtin::Now
             | Builtin::Env
             | Builtin::EnvObject(_)

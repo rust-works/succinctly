@@ -4127,8 +4127,9 @@ pub enum Builtin {
 
     /// `eval(expr)` (yq, #6081) - each string `expr` yields is parsed as a yq expression and
     /// evaluated against the current node; a node that is not a scalar has no text and is the
-    /// empty expression, which is the node itself
-    EvalExpr(Box<Expr>),
+    /// empty expression, which is the node itself. The flag is the run's `--jq-extensions`
+    /// (#7012): the parsed text is read with the same opt-in as the program that holds the call
+    EvalExpr(Box<Expr>, bool),
 
     // Phase 22: File operations (yq)
     /// `load(file)` - load external YAML/JSON file and return its parsed content
