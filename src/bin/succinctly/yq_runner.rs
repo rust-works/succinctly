@@ -9479,62 +9479,6 @@ fn write_pending_separator<W: Write>(
     Ok(())
 }
 
-/// Go's `strconv` text for a computed non-finite float: `+Inf`, `-Inf`, `NaN` (#6867).
-fn go_non_finite_text(f: f64) -> &'static str {
-    if f.is_nan() {
-        "NaN"
-    } else if f.is_sign_negative() {
-        "-Inf"
-    } else {
-        "+Inf"
-    }
-}
-
-/// The error real yq's JSON encoder raises for the first non-finite number `value` holds, in the
-/// order it writes them, or `None` if there is none (#6867).
-///
-/// yq wraps the failure once per node on the way up, the number's own node included, so the
-/// `json: error calling MarshalJSON ...` prefix repeats `depth + 1` times (`1 / 0` once,
-/// `[1 / 0]` twice, `{"a": [0 / 0]}` three times; v4.53.3). A computed number fails in
-/// `encoding/json` (`json: unsupported value: +Inf`); a document `.inf`/`.nan` scalar fails
-/// earlier, parsing its own text (`strconv.ParseFloat: parsing ".inf": invalid syntax`).
-fn non_finite_json_error(value: &OwnedValue, sort_keys: bool) -> Option<String> {
-    const WRAP: &str = "json: error calling MarshalJSON for type *yqlib.CandidateNode: ";
-    fn cause(value: &OwnedValue) -> Option<String> {
-        match value {
-            OwnedValue::Float(f) if !f.is_finite() => Some(format!(
-                "json: unsupported value: {}",
-                go_non_finite_text(*f)
-            )),
-            OwnedValue::NumberLiteral(_, literal)
-                if succinctly::yaml::NONFINITE_LITERALS.contains(&&**literal) =>
-            {
-                Some(format!(
-                    "strconv.ParseFloat: parsing \"{literal}\": invalid syntax"
-                ))
-            }
-            _ => None,
-        }
-    }
-    fn walk(value: &OwnedValue, sort_keys: bool, depth: usize) -> Option<(String, usize)> {
-        match value {
-            OwnedValue::Array(items) => items.iter().find_map(|v| walk(v, sort_keys, depth + 1)),
-            OwnedValue::Object(map) => {
-                let mut entries: Vec<_> = map.occurrences().collect();
-                if sort_keys {
-                    entries.sort_by(|a, b| a.0.cmp(b.0));
-                }
-                entries
-                    .into_iter()
-                    .find_map(|(_, v)| walk(v, sort_keys, depth + 1))
-            }
-            _ => cause(value).map(|c| (c, depth)),
-        }
-    }
-    let (cause, depth) = walk(value, sort_keys, 0)?;
-    Some(format!("{}{cause}", WRAP.repeat(depth + 1)))
-}
-
 fn output_value<W: Write>(
     writer: &mut W,
     value: &OwnedValue,
@@ -9572,7 +9516,7 @@ fn output_value<W: Write>(
             if let OwnedValue::Float(f) = value {
                 if !f.is_finite() {
                     write_pending_separator(writer, separator, terminator_from_config(config))?;
-                    write!(writer, "{}", go_non_finite_text(*f))?;
+                    write!(writer, "{}", OwnedValue::go_non_finite_float_text(*f))?;
                     write_terminator(writer, config)?;
                     return Ok(());
                 }
@@ -9806,7 +9750,7 @@ fn output_value<W: Write>(
     // A flag the walk cannot explain (a query literal like `1e400` under `--input-format json`,
     // #1498) keeps the `null` it was written with.
     if output::take_non_finite_json_write() {
-        if let Some(message) = non_finite_json_error(value, config.sort_keys) {
+        if let Some(message) = value.yq_non_finite_json_error(config.sort_keys) {
             anyhow::bail!(message);
         }
     }

@@ -14811,7 +14811,10 @@ fn text_stage_text<S: EvalSemantics>(stage: &Expr, input: &OwnedValue) -> Option
         Expr::Builtin(Builtin::ToJson) if S::TAG != EvalTag::Yq => {
             Some(owned_value_to_json::<S>(input))
         }
-        Expr::Format(FormatType::Json) => Some(owned_value_to_json::<S>(input)),
+        // (yq's encoder refuses a non-finite number, #6887: the full route raises it.)
+        Expr::Format(FormatType::Json) if yq_json_refusal::<S>(input).is_none() => {
+            Some(owned_value_to_json::<S>(input))
+        }
         Expr::Builtin(Builtin::ToString) | Expr::Format(FormatType::Text) => {
             Some(tostring_text::<S>(input, false))
         }
@@ -17493,6 +17496,9 @@ pub(crate) fn arith_combine<S: EvalSemantics>(
     right: OwnedValue,
 ) -> Result<OwnedValue, EvalError> {
     if S::TAG == EvalTag::Yq {
+        if let Some(error) = yq_non_finite_operand_error(&left, &right) {
+            return Err(error);
+        }
         if let Some(result) = yq_timestamp_arith::<S>(op, &left, &right) {
             return result;
         }
@@ -17501,6 +17507,49 @@ pub(crate) fn arith_combine<S: EvalSemantics>(
         }
     }
     arith_combine_plain::<S>(op, left, right)
+}
+
+/// yq's failure on a document `.inf`, `-.inf`, `.nan` (any of [`NONFINITE_LITERALS`]) used as a
+/// number (#6887): it reads each operand's text with Go's `strconv.ParseFloat`, which has no such
+/// spelling, so `.a + 1`, `1 / .a` and `.a > 1` on `a: .inf` are `strconv.ParseFloat: parsing
+/// ".inf": invalid syntax`, naming the left operand when both fail. A computed infinity
+/// (`1 / 0`) is a float and does not fail here; neither does `==`, a string or `null` on the other
+/// side (those keep their own rules), nor an operand that is not a document scalar.
+///
+/// A hex or octal integer on the left fails first, naming itself ([`yq_prefixed_int_arith`] and
+/// [`yq_float_parse_refusal`]), so it is left to them. `None` when neither operand is one, or the
+/// two are not both numbers.
+///
+/// [`NONFINITE_LITERALS`]: crate::yaml::NONFINITE_LITERALS
+pub(crate) fn yq_non_finite_operand_error(
+    left: &OwnedValue,
+    right: &OwnedValue,
+) -> Option<EvalError> {
+    let is_number = |v: &OwnedValue| {
+        matches!(
+            v,
+            OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)
+        )
+    };
+    // Every spelling is four to five bytes and starts with a dot or a sign, so an ordinary number
+    // (`5`, `1.5`, `0x10`) is turned away before the scan of the twelve.
+    let non_finite_text = |v: &OwnedValue| match v {
+        OwnedValue::NumberLiteral(_, literal)
+            if literal.len() >= 4
+                && matches!(literal.as_bytes()[0], b'.' | b'+' | b'-')
+                && crate::yaml::nonfinite_literal_index(literal).is_some() =>
+        {
+            Some(literal.clone())
+        }
+        _ => None,
+    };
+    if !is_number(left) || !is_number(right) || yq_int_base(left).is_some() {
+        return None;
+    }
+    let named = non_finite_text(left).or_else(|| non_finite_text(right))?;
+    Some(EvalError::new(format!(
+        "strconv.ParseFloat: parsing \"{named}\": invalid syntax"
+    )))
 }
 
 /// yq's date arithmetic (#5863): a timestamp on the left of `+` or `-` adds or subtracts the
@@ -18942,7 +18991,9 @@ pub(crate) fn yq_ordering_refusal<S: EvalSemantics>(
     match (left, right) {
         (OwnedValue::Null, _) | (_, OwnedValue::Null) => None,
         (OwnedValue::String(_), OwnedValue::String(_)) => None,
-        (l, r) if is_number(l) && is_number(r) => yq_float_parse_refusal::<S>(l, r),
+        (l, r) if is_number(l) && is_number(r) => {
+            yq_non_finite_operand_error(l, r).or_else(|| yq_float_parse_refusal::<S>(l, r))
+        }
         _ => Some(EvalError::new(format!(
             "{} not yet supported for comparison",
             yq_extremum_tag(left)
@@ -22217,7 +22268,17 @@ pub(crate) fn yq_extremum_index<T: core::borrow::Borrow<OwnedValue>>(
             (
                 OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..),
                 OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..),
-            ) => compare_values::<YqSemantics>(pick, element),
+            ) => {
+                // #6887: yq reads each number's text with `strconv.ParseFloat`, the later element's
+                // first (`[.a, .c] | min` over `.inf` and `.nan` names the `.nan`).
+                // A hex or octal integer fails the same way against a float (`[1.5, 0x10] | max`).
+                if let Some(error) = yq_non_finite_operand_error(element, pick)
+                    .or_else(|| yq_float_parse_refusal::<YqSemantics>(pick, element))
+                {
+                    return Err(error);
+                }
+                compare_values::<YqSemantics>(pick, element)
+            }
             // A boolean, or two kinds that do not compare.
             _ => return Err(refused(element)),
         };
@@ -25266,6 +25327,16 @@ pub fn nonfinite_literal_display(f: f64, literal: &str) -> &str {
     }
 }
 
+/// yq's JSON encoder refuses a non-finite number (#6887): the error a `to_json`, `tojson` or `@json`
+/// over `value` raises, `None` for a value it can write and always in jq mode. The one place the
+/// yq-mode gate and the check meet, so a stringify site cannot have the one without the other.
+fn yq_json_refusal<S: EvalSemantics>(value: &OwnedValue) -> Option<EvalError> {
+    if S::TAG != EvalTag::Yq {
+        return None;
+    }
+    value.yq_non_finite_json_error(false).map(EvalError::new)
+}
+
 /// `to_json_yq()` in yq mode, `to_json()` in jq mode (#1030) -- the single
 /// definition every "stringify a whole value as JSON" call site routes
 /// through, instead of each one re-deriving the fork (#106's "duplicated
@@ -25392,6 +25463,10 @@ pub(crate) fn format_owned<S: EvalSemantics>(
         FormatType::Yaml => format_yaml(owned),
         FormatType::Props => format_props(owned),
         FormatType::YqJson(indent) => {
+            // #6887: yq's JSON encoder refuses a non-finite number.
+            if let Some(message) = owned.yq_non_finite_json_error(false) {
+                return Err(EvalError::new(message));
+            }
             Ok(super::stream::owned_value_to_yq_json_string(owned, *indent))
         }
         FormatType::YqYaml(indent) => Ok(super::stream::owned_value_to_yaml_format_indented(
@@ -25498,6 +25573,10 @@ fn format_text<S: EvalSemantics>(value: &OwnedValue) -> Result<String, EvalError
 
 /// @json - Format as JSON
 fn format_json<S: EvalSemantics>(value: &OwnedValue) -> Result<String, EvalError> {
+    // `to_json_yq` only has the text (#6887).
+    if let Some(error) = yq_json_refusal::<S>(value) {
+        return Err(error);
+    }
     Ok(owned_value_to_json::<S>(value))
 }
 
@@ -27385,6 +27464,9 @@ fn builtin_tojson<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let owned = to_owned_or_suppress!(&value, optional);
     // #6158: yq's `tojson` is `to_json`: indented, with a line break of its own.
     if S::TAG == EvalTag::Yq {
+        if let Some(error) = yq_json_refusal::<S>(&owned) {
+            return suppress_or_raise(error, optional);
+        }
         return QueryResult::Owned(OwnedValue::String(
             super::stream::owned_value_to_yq_json_string(&owned, 2).into(),
         ));

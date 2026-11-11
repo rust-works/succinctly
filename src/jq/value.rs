@@ -4287,6 +4287,72 @@ impl OwnedValue {
         )
     }
 
+    /// Go's `strconv` text for a computed non-finite float: `+Inf`, `-Inf`, `NaN` (#6867).
+    #[must_use]
+    pub fn go_non_finite_float_text(f: f64) -> &'static str {
+        if f.is_nan() {
+            "NaN"
+        } else if f.is_sign_negative() {
+            "-Inf"
+        } else {
+            "+Inf"
+        }
+    }
+
+    /// The error real yq's JSON encoder raises for the first non-finite number this value holds,
+    /// in the order it writes them, or `None` if there is none (#6867, #6887).
+    ///
+    /// yq wraps the failure once per node on the way up, the number's own node included, so the
+    /// `json: error calling MarshalJSON ...` prefix repeats `depth + 1` times (`1 / 0` once,
+    /// `[1 / 0]` twice, `{"a": [0 / 0]}` three times; v4.53.3). A computed number fails in
+    /// `encoding/json` (`json: unsupported value: +Inf`); a document `.inf`/`.nan` scalar fails
+    /// earlier, parsing its own text (`strconv.ParseFloat: parsing ".inf": invalid syntax`).
+    ///
+    /// The one definition: the CLI's `-o=json` writer, `to_json` and `@json` all answer from it, and
+    /// `to_json_yq` itself stays the infallible text for the paths that only stringify.
+    /// `sort_keys` is the order the writer visits a mapping's entries in.
+    #[must_use]
+    pub fn yq_non_finite_json_error(&self, sort_keys: bool) -> Option<String> {
+        const WRAP: &str = "json: error calling MarshalJSON for type *yqlib.CandidateNode: ";
+        fn cause(value: &OwnedValue) -> Option<String> {
+            match value {
+                OwnedValue::Float(f) if !f.is_finite() => Some(format!(
+                    "json: unsupported value: {}",
+                    OwnedValue::go_non_finite_float_text(*f)
+                )),
+                OwnedValue::NumberLiteral(_, literal)
+                    if crate::yaml::NONFINITE_LITERALS.contains(&&**literal) =>
+                {
+                    Some(format!(
+                        "strconv.ParseFloat: parsing \"{literal}\": invalid syntax"
+                    ))
+                }
+                _ => None,
+            }
+        }
+        fn walk(value: &OwnedValue, sort_keys: bool, depth: usize) -> Option<(String, usize)> {
+            assert_value_tree_depth(depth);
+            match value {
+                OwnedValue::Array(items) => {
+                    items.iter().find_map(|v| walk(v, sort_keys, depth + 1))
+                }
+                OwnedValue::Object(map) if sort_keys => {
+                    let mut entries: Vec<_> = map.occurrences().collect();
+                    entries.sort_by(|a, b| a.0.cmp(b.0));
+                    entries
+                        .into_iter()
+                        .find_map(|(_, v)| walk(v, sort_keys, depth + 1))
+                }
+                OwnedValue::Object(map) => map
+                    .occurrences()
+                    .find_map(|(_, v)| walk(v, sort_keys, depth + 1)),
+                _ => cause(value).map(|c| (c, depth)),
+            }
+        }
+        let (cause, depth) = walk(self, sort_keys, 0)?;
+        Some(format!("{}{cause}", WRAP.repeat(depth + 1)))
+    }
+
     /// The yq-mode sibling of [`to_json`](Self::to_json) (#1030): identical
     /// except a finite `NumberLiteral` echoes its document-sourced spelling
     /// verbatim rather than being reformatted per jq's own rules -- real yq
@@ -10607,6 +10673,35 @@ mod tests {
     /// `to_json`/`==` must each independently refuse to recurse past the
     /// same limit rather than overflow the stack.
     ///
+    /// #6887: the marshal error names the first non-finite number in the order the writer visits
+    /// the entries (a sorted write visits them by key), with one wrap per node down to it.
+    #[test]
+    fn yq_non_finite_json_error_follows_the_writers_order_6887() {
+        let wrap = "json: error calling MarshalJSON for type *yqlib.CandidateNode: ";
+        let object = OwnedValue::object_from([
+            ("b".to_string(), OwnedValue::Float(f64::INFINITY)),
+            (
+                "a".to_string(),
+                OwnedValue::array_from(vec![OwnedValue::Float(f64::NAN)]),
+            ),
+        ]);
+        // Insertion order meets `b` first, one level down: two wraps.
+        assert_eq!(
+            object.yq_non_finite_json_error(false),
+            Some(format!("{wrap}{wrap}json: unsupported value: +Inf"))
+        );
+        // A sorted write meets `a` first, two levels down: three wraps.
+        assert_eq!(
+            object.yq_non_finite_json_error(true),
+            Some(format!("{wrap}{wrap}{wrap}json: unsupported value: NaN"))
+        );
+        assert_eq!(OwnedValue::Int(1).yq_non_finite_json_error(true), None);
+        assert_eq!(
+            OwnedValue::go_non_finite_float_text(f64::NEG_INFINITY),
+            "-Inf"
+        );
+    }
+
     /// Since #5497 jq's writer stops at jq's own print depth, writing the marker there, so
     /// `to_json` never recurses as far as the limit; yq's writer prints the whole value and
     /// keeps the guard.

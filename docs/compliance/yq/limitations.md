@@ -5918,9 +5918,11 @@ position and then by length, as `sort_by(.a, .b)` is in yq. jq mode is untouched
 **Not reproduced**:
 
 - **NaN and the infinities.** yq **panics** (`strconv.ParseFloat: parsing ".nan": invalid
-  syntax`, a Go runtime panic) when a number comparison reaches a `.nan` or `.inf`. This build
+  syntax`, a Go runtime panic) when a sort reaches a document `.nan` or `.inf`. This build
   orders NaN before every other number and the infinities by value, rather than crash (the
-  ADR-0018 exception for output that would take the process down).
+  ADR-0018 exception for output that would take the process down). The ordering operators and
+  `min`/`max` raise yq's own error for such a scalar instead of ordering it
+  ([#6887](https://github.com/rust-works/succinctly/issues/6887), below).
 - **A literal `{}` in the filter** sorts as the text `{}` in yq (its literal node carries that
   text) and as the empty text of any other mapping here: `[.z, {}, .b] | sort` puts the literal
   last in yq. An empty mapping read from a document sorts as empty text in both.
@@ -7496,6 +7498,11 @@ The results before the failing one are whole in both, and the run stops there, a
 The route that evaluates a result first (a computed number, `-P`) writes nothing of it, as yq does.
 Buffering each streamed result to match would give up the constant-memory write that route exists for, the same trade as the decode failures above.
 The exit code and the error line are identical either way, so a caller that checks the status sees the failure, and it is pinned by `tests/yq_cli/i6867.rs`.
-Two neighbours are not covered ([#6887](https://github.com/rust-works/succinctly/issues/6887)).
-The `to_json` and `@json` operators still write `null` for a non-finite float, where yq fails with the same marshal error (`.a | to_json` over `a: .inf`, `[1 / 0] | @json`): they stringify through `to_json_yq`, not the `-o=json` writer.
-Arithmetic on a document `.inf` (`.a + 1`, `.a * 2`) fails in yq while it computes (`strconv.ParseFloat: parsing ".inf": invalid syntax`, in every output format), where `succinctly yq` computes `+Inf`, so under `-o=json` it fails with the encoder's `+Inf` message instead.
+`to_json`, `to_json(N)`, `tojson` and `@json` fail the same way ([#6887](https://github.com/rust-works/succinctly/issues/6887)).
+They raise the marshal error with the wrap count of the value they are given: `.a | to_json` over `a: .inf` has one wrap, `[.a] | to_json` two, `[1 / 0] | @json` two.
+A document `.inf`/`.nan` used as a number fails in yq while it computes, in every output format, because yq reads each operand's text with `strconv.ParseFloat`.
+`+`, `-`, `*`, `/` and `%`, the ordering operators `<`, `<=`, `>` and `>=` (in an assignment too), and `min`/`max` over two numbers one of which is such a scalar raise `strconv.ParseFloat: parsing ".inf": invalid syntax`.
+`succinctly yq` raises it too, naming the left operand when both fail, and a hex or octal integer on the left names itself first, as it does for `0x10 + 1.5`.
+`==`, `!=`, `//`, a string or `null` on the other side, `length`, and a computed infinity (`1 / 0`) are unchanged, and `[.a] | max` has no comparison to make.
+When an update (`|=`, `map_values`) fails on several nodes, yq reports the last node's text and `succinctly yq` the first: over `a: .inf` and `b: -.inf`, `map_values(. + 1)` names `"-.inf"` in yq and `".inf"` here.
+`sort` and `sort_by` over such a scalar panic in yq with a Go stack trace, and order it here (see the NaN and infinities entry in the sort section).
