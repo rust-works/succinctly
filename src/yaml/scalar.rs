@@ -1032,6 +1032,7 @@ mod tests {
             ("0x_1f", Some(31)),
             ("0o1_7", Some(15)),
             // Not an integer once the underscores are gone: the text, as for `!!int abc`.
+            ("1_2x", None),
             ("1_0.5", None),
             ("1_0e1_0", None),
             ("0b1_0", None),
@@ -1052,6 +1053,9 @@ mod tests {
             ("1_0e1_0", Some(1e11)),
             ("1e1_0", Some(1e10)),
             (".5_5", Some(0.55)),
+            // Digit-separated underscores around text that is no number stay the text.
+            ("1_2x", None),
+            ("1_2.3.4", None),
             // A `_` that is not between two digits is refused for a float.
             ("1__0", None),
             ("_1", None),
