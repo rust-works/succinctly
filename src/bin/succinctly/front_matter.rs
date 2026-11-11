@@ -136,7 +136,8 @@ mod tests {
     /// before the closing line and keeps its opening `---`, the body starts with the closing line.
     #[test]
     fn splits_as_yq_does() {
-        let rows: &[(&[u8], &[u8], Option<&[u8]>)] = &[
+        type Row<'a> = (&'a [u8], &'a [u8], Option<&'a [u8]>);
+        let rows: &[Row] = &[
             (
                 b"---\ntitle: foo\n---\n# Body\n",
                 b"---\ntitle: foo\n",
