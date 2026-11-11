@@ -45271,6 +45271,19 @@ pub fn enter_file_index_scope(file_index: usize) -> FileIndexScope {
     ))
 }
 
+/// Make `document_index`/`documentIndex`/`di` answer `document` for every evaluation until the
+/// returned guard is dropped, keeping the file number the ambient scope already holds (#6950).
+///
+/// Real yq stamps the document number on each node as it decodes it, so the number survives a
+/// write; succinctly's owned values carry none, and the cursor that answers it is gone once a
+/// write has materialized the document. The CLI's per-document loops install this around each
+/// document's evaluation. `None` (nothing installed) where no file scope is ambient, as under
+/// `-s`, where there is one array and no document of a file.
+#[must_use = "the scope ends when the guard is dropped"]
+pub fn enter_document_index_scope(document: usize) -> Option<FileIndexScope> {
+    super::eval_generic::enter_document_in_origin(document).map(FileIndexScope)
+}
+
 /// Make `line`/`column` of a node read under `--eval-all` answer the position in the source text
 /// `resolver` names, until the returned guard is dropped (#4646).
 ///

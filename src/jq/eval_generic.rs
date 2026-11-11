@@ -10516,6 +10516,25 @@ pub(crate) fn enter_node_origin(origin: NodeOrigin) -> NodeOriginGuard {
 /// The RAII guard [`enter_node_origin`] returns.
 pub(crate) type NodeOriginGuard = node_origin::Guard;
 
+/// Narrow the ambient node origin to document `document` of its file, until the returned guard is
+/// dropped (#6950).
+///
+/// The ordinary multi-file path installs one origin per *file*, with no document number, because
+/// the cursor of a document it reads answers `document_index` itself. A write or a computed value
+/// has no cursor, so `document_index` after one fell back to `0` for every document of a
+/// multi-document file, where yq stamps the number on the node when it decodes it. The caller
+/// that evaluates one document installs this around it.
+///
+/// `None` (and nothing installed) when no origin is ambient: a slurped run (`-s`) and the
+/// synthesized empty document have no file, and so no document of one either.
+pub(crate) fn enter_document_in_origin(document: usize) -> Option<NodeOriginGuard> {
+    let origin = node_origin::current()?;
+    Some(enter_node_origin(NodeOrigin {
+        document: Some(document),
+        ..origin
+    }))
+}
+
 /// Whether the ambient node origin is a document decoded from JSON (#4544).
 fn ambient_json_sourced() -> bool {
     node_origin::current().is_some_and(|origin| origin.json_sourced)
