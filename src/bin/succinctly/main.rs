@@ -1178,6 +1178,9 @@ pub enum OutputFormat {
     /// Lua table literal (#6924)
     #[value(name = "lua", alias = "l")]
     Lua,
+    /// INI, sections and their scalars (#6924)
+    #[value(name = "ini", alias = "i")]
+    Ini,
     /// Base64 of a string, as `@base64` writes it, with no line break (#6850)
     #[value(name = "base64")]
     Base64,

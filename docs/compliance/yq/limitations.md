@@ -7563,7 +7563,8 @@ When an update (`|=`, `map_values`) fails on several nodes, yq reports the last 
 `--shell-key-separator`, `--properties-separator`, `--properties-array-brackets` and `--csv-separator` are read (#6922); `--csv-separator` takes one ASCII byte (yq's `char` takes any single byte, so a lone byte above 0x7f, which cannot be an argument here, is refused), and `-o=tsv` ignores it, as yq does.
 The `@props` and `@csv` operators ignore those flags here, where yq applies them to the operators too.
 `-o=lua` is read as well, with `--lua-prefix`, `--lua-suffix`, `--lua-globals` and `--lua-unquoted` (#6924); where it differs from yq is in its own section below.
-The other formats yq lists (`kyaml`, `xml`, `toml`, `hcl`, `ini`) and every input format but YAML and JSON are still refused at the flag.
+`-o=ini` is read as well (#6924), as yq's go-ini encoder writes it: it agrees with yq v4.53.3 on 3,200 random JSON documents and on YAML input except for a null written `~` (see above).
+The other formats yq lists (`kyaml`, `xml`, `toml`, `hcl`) and every input format but YAML and JSON are still refused at the flag.
 Six rows differ from yq v4.53.3, each pinned out of `tests/yq_cli/i6850.rs`:
 
 - A comment in a `props` document is not written.

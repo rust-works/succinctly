@@ -3342,6 +3342,8 @@ pub enum YqOutputEncoder {
     Lua(Box<LuaOptions>),
     /// `-o=tsv`
     Tsv,
+    /// `-o=ini`
+    Ini,
     /// `-o=base64`: a string only, and no line end
     Base64,
     /// `-o=uri`: a string only, and no line end

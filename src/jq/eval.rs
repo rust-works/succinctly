@@ -26857,6 +26857,7 @@ fn format_yq_output<S: EvalSemantics>(
         YqOutputEncoder::Shell(separator) => Ok(format_shell_variables(value, separator)),
         YqOutputEncoder::Csv(comma) => format_yq_csv::<S>(value, *comma, true),
         YqOutputEncoder::Lua(options) => format_lua(value, options),
+        YqOutputEncoder::Ini => format_ini(value),
         YqOutputEncoder::Tsv => format_yq_csv::<S>(value, '\t', true),
         YqOutputEncoder::Base64 => match value {
             OwnedValue::String(_) => format_base64::<S>(value, false),
@@ -27065,6 +27066,124 @@ fn format_lua(value: &OwnedValue, options: &LuaOptions) -> Result<String, EvalEr
     lua.any(value, 0);
     lua.out.push_str(&options.suffix);
     Ok(lua.out)
+}
+
+/// yq's `-o=ini` encoder (#6924), over go-ini: the root's scalars are the default section (written first, with
+/// no header), each mapping a `[section]` of its scalars, and everything else (an array, a mapping inside a
+/// section) is dropped. A section follows a blank line once anything is written. Keys of a section are
+/// padded to the longest quoted key (in bytes) before ` = `. A key holding `"`, `=` or `:` is wrapped in
+/// backticks, otherwise one holding a backtick in triple quotes; a value holding a line break or backtick is
+/// wrapped in triple quotes, otherwise one holding `#` or `;` in backticks, otherwise one with leading or
+/// trailing white space in double quotes. An empty key or section name is an error. A root scalar is its text;
+/// any other root that is not a mapping is an error. The section named `DEFAULT` is the default section, a key
+/// written twice keeps its first place and takes the last value. Captured from yq v4.53.3.
+fn format_ini(value: &OwnedValue) -> Result<String, EvalError> {
+    type Keys = Vec<(String, String)>;
+    fn text(value: &OwnedValue) -> String {
+        props_value_to_string(value, false)
+    }
+    fn quoted_key(key: &str) -> String {
+        if key.contains(['"', '=', ':']) {
+            format!("`{key}`")
+        } else if key.contains('`') {
+            format!("\"\"\"{key}\"\"\"")
+        } else {
+            key.to_string()
+        }
+    }
+    fn quoted_value(value: &str) -> String {
+        if value.contains(['\n', '`']) {
+            format!("\"\"\"{value}\"\"\"")
+        } else if value.contains(['#', ';']) {
+            format!("`{value}`")
+        } else if value.trim().len() != value.len() {
+            format!("\"{value}\"")
+        } else {
+            value.to_string()
+        }
+    }
+    fn section(out: &mut String, keys: &Keys) {
+        let names: Vec<String> = keys.iter().map(|(key, _)| quoted_key(key)).collect();
+        let width = names.iter().map(String::len).max().unwrap_or(0);
+        for (name, (_, value)) in names.iter().zip(keys) {
+            out.push_str(name);
+            for _ in name.len()..width {
+                out.push(' ');
+            }
+            out.push_str(" = ");
+            out.push_str(&quoted_value(value));
+            out.push('\n');
+        }
+    }
+    let entries = match value {
+        OwnedValue::Object(entries) => entries,
+        OwnedValue::Array(_) => {
+            return Err(EvalError::new(
+                "INI encoder supports only MappingNode at the root level, got 1".to_string(),
+            ))
+        }
+        scalar => return Ok(format!("{}\n", text(scalar))),
+    };
+    // A key written twice keeps its first place and takes the last value (go-ini's `NewKey`).
+    fn put(keys: &mut Keys, key: &str, value: String) {
+        match keys.iter_mut().find(|(name, _)| name == key) {
+            Some(existing) => existing.1 = value,
+            None => keys.push((key.to_string(), value)),
+        }
+    }
+    let mut default: Keys = Vec::new();
+    let mut sections: Vec<(String, Keys)> = Vec::new();
+    for (key, value) in entries {
+        match value {
+            OwnedValue::Object(inner) => {
+                if key.is_empty() {
+                    return Err(EvalError::new("empty section name".to_string()));
+                }
+                // The section named `DEFAULT` is the default section itself.
+                let mut keys: Keys = Vec::new();
+                let target = if key == "DEFAULT" {
+                    &mut default
+                } else {
+                    &mut keys
+                };
+                for (inner_key, inner_value) in inner {
+                    if matches!(inner_value, OwnedValue::Array(_) | OwnedValue::Object(_)) {
+                        continue;
+                    }
+                    if inner_key.is_empty() {
+                        return Err(EvalError::new(
+                            "error creating new key: empty key name".to_string(),
+                        ));
+                    }
+                    put(target, inner_key, text(inner_value));
+                }
+                if key != "DEFAULT" {
+                    sections.push((key.clone(), keys));
+                }
+            }
+            OwnedValue::Array(_) => {}
+            scalar => {
+                if key.is_empty() {
+                    return Err(EvalError::new(
+                        "error creating new key: empty key name".to_string(),
+                    ));
+                }
+                put(&mut default, key, text(scalar));
+            }
+        }
+    }
+    let mut out = String::new();
+    section(&mut out, &default);
+    for (name, keys) in &sections {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push('[');
+        out.push_str(name);
+        out.push_str("]\n");
+        section(&mut out, keys);
+    }
+    Ok(out)
 }
 
 /// yq's `-o=shell` encoder (#6850): one `name=value` line per scalar, comments dropped.
