@@ -34,6 +34,7 @@ const ROWS: &[(&[&str], &str, &str, i32)] = &[
     (&["--lua-prefix=\\x41\\0\\"], "[1]\n", "\\x41\\0\\{\n\t1,\n};\n", 0),
     (&["--lua-globals"], "---\na: 1\n---\nb: 2\n", "a = 1;\nb = 2;\n", 0),
     (&["--lua-unquoted"], "é: 1\nA1: 2\n_ENV: 3\n", "return {\n\t[\"é\"] = 1;\n\tA1 = 2;\n\t_ENV = 3;\n};\n", 0),
+    (&["--lua-prefix=a\\rb"], "[1]\n", "a\rb{\n\t1,\n};\n", 0),
 ];
 
 #[test]
@@ -56,5 +57,19 @@ fn lua_short_name_6924() -> Result<()> {
     let one = run_yq_stdin(".", "a: 1\n", &["-o=l"])?;
     let other = run_yq_stdin(".", "a: 1\n", &["-o=lua"])?;
     assert_eq!(one, other);
+    Ok(())
+}
+
+/// A computed number is its own text, where a document's `.inf` is `(1/0)` (yq v4.53.3).
+#[test]
+fn lua_computed_non_finite_numbers_6924() -> Result<()> {
+    for (filter, expected) in [
+        ("1 / 0", "return +Inf;\n"),
+        ("0 / 0", "return NaN;\n"),
+        ("[1 / 0]", "return {\n\t+Inf,\n};\n"),
+    ] {
+        let (stdout, status) = run_yq_stdin(filter, "a: 1\n", &["-o=lua"])?;
+        assert_eq!((stdout.as_str(), status), (expected, 0), "{filter}");
+    }
     Ok(())
 }

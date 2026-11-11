@@ -26887,8 +26887,8 @@ fn yq_encoder_needs_a_string(value: &OwnedValue, format: &str) -> EvalError {
 /// yq's `-o=lua` encoder (#6924): a table literal, one tab of indent per level, every entry ending in `,`
 /// (an array element) or `;` (a map entry). A string is double-quoted with yq's escape table (control
 /// characters as `\a \b \t \n \v \f \r` or three decimal digits, `"` `'` `\` and DEL escaped); `null` is
-/// `nil`; a boolean is lower case; a `0o` integer is decimal; `.inf`, `-.inf` and `.nan` are `(1/0)`,
-/// `(-1/0)` and `(0/0)`; any other number is its own text. Left out because the value model has no
+/// `nil`; a boolean is lower case; a `0o` integer is decimal; a document's `.inf`, `-.inf` and `.nan` are `(1/0)`,
+/// `(-1/0)` and `(0/0)` (a computed infinity is `+Inf`, `-Inf`, `NaN`); any other number is its own text. Left out because the value model has no
 /// source style or key tag: a literal, folded or flow string (yq writes a long bracket), a single-quoted
 /// one (yq keeps its quote) and a non-string key (yq writes `[1] =`).
 fn format_lua(value: &OwnedValue, options: &LuaOptions) -> Result<String, EvalError> {
@@ -26962,9 +26962,11 @@ fn format_lua(value: &OwnedValue, options: &LuaOptions) -> Result<String, EvalEr
                 OwnedValue::Null => self.out.push_str("nil"),
                 OwnedValue::Bool(b) => self.out.push_str(if *b { "true" } else { "false" }),
                 OwnedValue::String(s) => self.string(s),
-                OwnedValue::Float(f) if f.is_nan() => self.out.push_str("(0/0)"),
-                OwnedValue::Float(f) if f.is_infinite() => {
-                    self.out.push_str(if *f < 0.0 { "(-1/0)" } else { "(1/0)" });
+                // A computed number is its own text (`+Inf`, `-Inf`, `NaN`); only a document's `.inf` and
+                // `.nan` spellings become Lua expressions.
+                OwnedValue::Float(f) if !f.is_finite() => {
+                    self.out
+                        .push_str(nonfinite_display_string::<YqSemantics>(*f));
                 }
                 OwnedValue::NumberLiteral(NumberRepr::Float(f), literal)
                     if f.is_nan() || f.is_infinite() =>
