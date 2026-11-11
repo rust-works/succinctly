@@ -612,7 +612,8 @@ fn row_ratio(x: &PerfRow, v: Option<f64>) -> String {
 }
 
 fn perf_sections(s: &mut String, r: &Results) {
-    if r.perf.is_empty() {
+    // A run of only stdin rows (`--query _stdin`) has an empty `perf`, and still reports.
+    if r.perf.is_empty() && r.perf_stdin.is_empty() {
         return;
     }
     let _ = writeln!(
@@ -634,7 +635,12 @@ fn perf_sections(s: &mut String, r: &Results) {
         perf::SLOW_ROW_REPS,
         r.perf_note.as_deref().map_or(String::new(), |n| format!(" ({n}.)"))
     );
-    let wrong: Vec<&PerfRow> = r.perf.iter().filter(|x| x.gate == Gate::Differs).collect();
+    let wrong: Vec<&PerfRow> = r
+        .perf
+        .iter()
+        .chain(&r.perf_stdin)
+        .filter(|x| x.gate == Gate::Differs)
+        .collect();
     if !wrong.is_empty() {
         let _ = writeln!(
             s,
@@ -705,7 +711,143 @@ fn perf_sections(s: &mut String, r: &Results) {
         );
     }
     memory_section(s, &timed);
-    instruction_section(s, &timed);
+    // The stdin rows' instruction counts (`--cachegrind`) are listed beside the file rows'.
+    let counted: Vec<&PerfRow> = timed
+        .iter()
+        .copied()
+        .chain(r.perf_stdin.iter().filter(|x| x.speedup_primary.is_some()))
+        .collect();
+    instruction_section(s, &counted);
+    stdin_section(s, &r.perf, &r.perf_stdin);
+}
+
+/// A stdin row is flagged when its time or memory is over this multiple of the file route's.
+pub const STDIN_MATERIAL: f64 = 1.25;
+
+/// One tool's median time, in ms, from a row.
+fn median_of(x: &PerfRow, i: usize) -> Option<f64> {
+    Some(x.tools.get(i)?.stats.as_ref()?.median_ms)
+}
+
+/// `stdin ÷ file`, `None` when either is missing or the file figure is zero.
+fn over(stdin: Option<f64>, file: Option<f64>) -> Option<f64> {
+    match (stdin, file) {
+        (Some(a), Some(b)) if b > 0.0 => Some(a / b),
+        _ => None,
+    }
+}
+
+/// The side-by-side of the file route and the piped-stdin route (#6914): every timed `perf_stdin`
+/// row beside the `perf` row it shares a program and an input with. Only rows whose outputs
+/// matched the reference were timed, so a stdin row missing here is listed under the correctness
+/// rows above.
+fn stdin_section(s: &mut String, file_rows: &[PerfRow], stdin_rows: &[PerfRow]) {
+    let pairs: Vec<(&PerfRow, &PerfRow)> = stdin_rows
+        .iter()
+        .filter(|x| x.speedup_primary.is_some())
+        .filter_map(|x| {
+            let twin = x.query.strip_suffix(perf::STDIN_SUFFIX)?;
+            let file = file_rows
+                .iter()
+                .find(|f| f.query == twin && f.input == x.input && f.speedup_primary.is_some())?;
+            Some((file, x))
+        })
+        .collect();
+    if stdin_rows.is_empty() {
+        return;
+    }
+    let _ = writeln!(s, "\n## D/E. Piped stdin vs file argument\n");
+    let _ = writeln!(
+        s,
+        "Each `*_stdin` query runs the program of the query before the suffix, with its input written \
+         to a pipe on stdin by the harness (read once into memory, then written from a thread, so there \
+         is no network and no slow producer) instead of named as a file argument. Whether the pipe changes \
+         what a tool costs is what the table measures: succinctly reads a file and stdin through \
+         different code (the evaluator's generic route), and the file-route figures above say nothing \
+         about it. Figures are medians of repetitions interleaved across the \
+         tools within a row; the file row and its stdin row are separate rows of one run, timed one \
+         after the other and not interleaved with each other, and each is gated on output identity \
+         like every other row. A ratio is stdin ÷ file, so above 1.00x the pipe is slower \
+         (or larger); a ratio over {STDIN_MATERIAL:.2}x is marked `>`. Memory is peak RSS and private \
+         memory of separate untimed runs, as above. A gap on a large compact input is mostly the \
+         pipe, not the evaluator: succinctly reads stdin to its end before it starts, so the time to \
+         move the bytes through a pipe is added to its run instead of overlapped with it, and the \
+         faster a query, the larger that is as a ratio (#6914 measured 100 MB into `cat` at 39 ms on \
+         the 7950X, against a 36 ms stdin gap on `users_field`). A `>` on a 1 MB row whose neighbours \
+         run the other way is the run's noise.\n"
+    );
+    if pairs.is_empty() {
+        let _ = writeln!(
+            s,
+            "No stdin row could be set beside a timed file row in this run (its output differed, or the \
+             file row it pairs with was not run).\n"
+        );
+        return;
+    }
+    let _ = writeln!(
+        s,
+        "| Query | Input | jq 1.7.1 file | jq 1.7.1 stdin | jq stdin ÷ file | succinctly file | succinctly stdin | succinctly stdin ÷ file | speedup, file | speedup, stdin |"
+    );
+    let _ = writeln!(
+        s,
+        "|-------|-------|---------------|----------------|-----------------|-----------------|------------------|-------------------------|---------------|----------------|"
+    );
+    let ms = |v: Option<f64>| v.map_or_else(|| "n/a".into(), |v| format!("{v:.1}"));
+    let mark = |v: Option<f64>| {
+        let flag = if v.is_some_and(|v| v > STDIN_MATERIAL) {
+            "> "
+        } else {
+            ""
+        };
+        format!("{flag}{}", ratio(v))
+    };
+    for (f, x) in &pairs {
+        let _ = writeln!(
+            s,
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            f.query,
+            f.input,
+            ms(median_of(f, 1)),
+            ms(median_of(x, 1)),
+            mark(over(median_of(x, 1), median_of(f, 1))),
+            ms(median_of(f, 0)),
+            ms(median_of(x, 0)),
+            mark(over(median_of(x, 0), median_of(f, 0))),
+            ratio(f.speedup_primary),
+            ratio(x.speedup_primary)
+        );
+    }
+    let _ = writeln!(
+        s,
+        "\n| Query | Input | Tool | RSS file | RSS stdin | RSS stdin ÷ file | private file | private stdin | private stdin ÷ file |"
+    );
+    let _ = writeln!(
+        s,
+        "|-------|-------|------|----------|-----------|------------------|--------------|---------------|----------------------|"
+    );
+    let kb = |v: Option<u64>| v.map_or_else(|| "n/a".into(), |v| v.to_string());
+    for (f, x) in &pairs {
+        for i in [1, 0] {
+            let (Some(a), Some(b)) = (f.tools.get(i), x.tools.get(i)) else {
+                continue;
+            };
+            let r = |v: Option<u64>, w: Option<u64>| over(v.map(|v| v as f64), w.map(|w| w as f64));
+            let name = &a.tool;
+            let _ = writeln!(
+                s,
+                "| {} | {} | {name} | {} | {} | {} | {} | {} | {} |",
+                f.query,
+                f.input,
+                kb(a.peak_rss_kb),
+                kb(b.peak_rss_kb),
+                mark(r(b.peak_rss_kb, a.peak_rss_kb)),
+                kb(a.private_kb),
+                kb(b.private_kb),
+                mark(r(b.private_kb, a.private_kb)),
+            );
+        }
+    }
+    s.push('\n');
 }
 
 /// Whether the instruction count and the wall-clock put succinctly on opposite sides of jq
@@ -1290,6 +1432,89 @@ mod tests {
             s.contains("| startup | none | 3008 | 10128 | 3.37x | 840 | 896 | 1.07x |"),
             "{s}"
         );
+    }
+
+    fn timed(name: &str, median: f64, rss: u64, private: u64) -> ToolResult {
+        ToolResult {
+            stats: Some(crate::compare::harness::Stats {
+                n: 3,
+                min_ms: median,
+                median_ms: median,
+                mad_ms: 0.0,
+            }),
+            ..tool(name, Some(rss), Some(private))
+        }
+    }
+
+    fn timed_row(query: &str, input: &str, speedup: f64, tools: Vec<ToolResult>) -> PerfRow {
+        PerfRow {
+            query: query.into(),
+            input: input.into(),
+            speedup_primary: Some(speedup),
+            ..row(tools, None, None)
+        }
+    }
+
+    /// The stdin table pairs each `_stdin` row with its file twin on the same input, marks a
+    /// ratio over the material line, and says so when no stdin row was timed (#6914).
+    #[test]
+    fn the_stdin_table_sets_each_row_beside_its_file_twin_and_marks_material_gaps() {
+        let file = timed_row(
+            "identity",
+            "users-10mb",
+            2.0,
+            vec![
+                timed("succinctly", 10.0, 2000, 1000),
+                timed("jq", 20.0, 1500, 1200),
+            ],
+        );
+        let piped = timed_row(
+            "identity_stdin",
+            "users-10mb",
+            1.0,
+            vec![
+                timed("succinctly", 15.0, 2000, 3000),
+                timed("jq", 15.0, 1500, 1200),
+            ],
+        );
+        let other = timed_row(
+            "identity",
+            "wide-10mb",
+            2.0,
+            vec![timed("succinctly", 1.0, 1, 1), timed("jq", 1.0, 1, 1)],
+        );
+        let mut s = String::new();
+        stdin_section(&mut s, &[other, file], &[piped]);
+        // jq's stdin time is 0.75x its file time, succinctly's 1.50x (marked), speedups 2.00x/1.00x.
+        assert!(
+            s.contains(
+                "| identity | users-10mb | 20.0 | 15.0 | 0.75x | 10.0 | 15.0 | > 1.50x | 2.00x | 1.00x |"
+            ),
+            "{s}"
+        );
+        // Private memory tripled for succinctly (marked); RSS did not move.
+        assert!(
+            s.contains("| identity | users-10mb | succinctly | 2000 | 2000 | 1.00x | 1000 | 3000 | > 3.00x |"),
+            "{s}"
+        );
+        assert!(
+            s.contains(
+                "| identity | users-10mb | jq | 1500 | 1500 | 1.00x | 1200 | 1200 | 1.00x |"
+            ),
+            "{s}"
+        );
+        assert!(
+            !s.contains("wide-10mb"),
+            "an unpaired file row is not listed: {s}"
+        );
+
+        // A stdin row with no file twin is not listed, and a run with none says so.
+        let mut s = String::new();
+        stdin_section(&mut s, &[], &[timed_row("x_stdin", "i", 1.0, vec![])]);
+        assert!(s.contains("No stdin row could be set beside"), "{s}");
+        let mut s = String::new();
+        stdin_section(&mut s, &[], &[]);
+        assert!(s.is_empty(), "no stdin rows, no section: {s}");
     }
 
     #[test]

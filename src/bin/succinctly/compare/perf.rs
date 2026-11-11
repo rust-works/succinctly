@@ -15,8 +15,9 @@ use super::harness::{stats, Stats, Tool};
 use super::manifest::sha256_hex;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::Instant;
 
 /// A row whose slowest tool has a median above this many milliseconds is long
@@ -61,7 +62,17 @@ pub struct PerfQuery {
     /// Shapes the query applies to; `none` runs it with no input file.
     pub shapes: Vec<String>,
     pub max_tier: String,
+    /// The input is written to a pipe on the tool's stdin instead of named as a file
+    /// argument (`@stdin`, #6914).
+    pub stdin: bool,
 }
+
+/// The pseudo-flag that feeds the input through a pipe on stdin: the row's file is read once
+/// and written to the tool's standard input, which is a pipe and never a redirected regular
+/// file (a tool can tell the two apart, #6914). No file argument is passed.
+pub const STDIN_FLAG: &str = "@stdin";
+/// A stdin row's id ends with this, after its file-route twin's id.
+pub const STDIN_SUFFIX: &str = "_stdin";
 
 /// A flag that stands for the input file's name, where an option takes one
 /// (`--slurpfile d @INPUT@`). A query that uses it passes the file only there.
@@ -110,6 +121,36 @@ pub fn parse_queries(text: &str) -> Result<Vec<PerfQuery>> {
                 n + 1
             );
         }
+        if flags.contains(&STDIN_FLAG) {
+            if shapes.contains(&"none") {
+                bail!(
+                    "perf query line {}: `{STDIN_FLAG}` feeds an input file, and shape `none` has none",
+                    n + 1
+                );
+            }
+            if flags
+                .iter()
+                .any(|f| *f == INPUT_FLAG || f.starts_with(FILES_FLAG_PREFIX))
+            {
+                bail!(
+                    "perf query line {}: `{STDIN_FLAG}` passes no file argument, so `{INPUT_FLAG}` and `{FILES_FLAG_PREFIX}N` have nothing to name",
+                    n + 1
+                );
+            }
+            if !c[0].ends_with(STDIN_SUFFIX) {
+                bail!(
+                    "perf query line {}: a `{STDIN_FLAG}` row's id ends with `{STDIN_SUFFIX}`, after its file-route twin's",
+                    n + 1
+                );
+            }
+        }
+        if c[0].ends_with(STDIN_SUFFIX) && !flags.contains(&STDIN_FLAG) {
+            bail!(
+                "perf query line {}: `{}` ends with `{STDIN_SUFFIX}`, which names a `{STDIN_FLAG}` row, and has no `{STDIN_FLAG}`",
+                n + 1,
+                c[0]
+            );
+        }
         if flags.contains(&INPUT_FLAG) && flags.iter().any(|f| f.starts_with(FILES_FLAG_PREFIX)) {
             bail!(
                 "perf query line {}: `{INPUT_FLAG}` names the file once, so `{FILES_FLAG_PREFIX}N` has nothing to repeat",
@@ -121,11 +162,15 @@ pub fn parse_queries(text: &str) -> Result<Vec<PerfQuery>> {
             flags: if c[1] == "-" {
                 vec![]
             } else {
-                c[1].split(' ').map(String::from).collect()
+                c[1].split(' ')
+                    .filter(|f| *f != STDIN_FLAG)
+                    .map(String::from)
+                    .collect()
             },
             filter: c[2].into(),
             shapes: c[3].split(',').map(String::from).collect(),
             max_tier: c[4].into(),
+            stdin: flags.contains(&STDIN_FLAG),
         });
     }
     Ok(out)
@@ -307,7 +352,7 @@ pub struct PerfRow {
 
 /// The command line of one run: the flags, the filter, then the input file. `@INPUT@` in
 /// the flags is the file's name at that position, and then it is not appended again;
-/// `@files=N` appends it `N` times.
+/// `@files=N` appends it `N` times; `@stdin` appends nothing (the input is piped).
 fn args_for(q: &PerfQuery, file: Option<&str>) -> Vec<String> {
     let mut a = vec![];
     let mut named = false;
@@ -323,7 +368,8 @@ fn args_for(q: &PerfQuery, file: Option<&str>) -> Vec<String> {
         }
     }
     a.push(q.filter.clone());
-    if !named {
+    // A stdin row passes the input on the pipe, not as an argument.
+    if !named && !q.stdin {
         for _ in 0..copies {
             a.extend(file.map(String::from));
         }
@@ -344,16 +390,43 @@ fn configure<'a>(
         .current_dir(cwd)
         .env("TZ", "UTC")
         .env("LC_ALL", "C")
-        .stdin(Stdio::null())
 }
 
-fn time_once(tool: &Tool, args: &[String], cwd: &Path) -> Result<f64> {
+/// The stdin of a run: a pipe when the row feeds its input (see [`with_feed`]), else nothing.
+fn stdin_for(feed: Option<&[u8]>) -> Stdio {
+    if feed.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    }
+}
+
+/// Run `f` on `child` while `feed` is written to its piped stdin on another thread, so a
+/// tool that reads its input as it goes and one that slurps it all see the same pipe a
+/// producer (`curl`, `kubectl`) would give them (#6914). The pipe is closed when the bytes
+/// are written, and a tool that stops reading (`first`, `limit`) ends the write on `EPIPE`,
+/// which is ignored. Without a `feed` this is just `f(child)`.
+fn with_feed<T>(child: &mut Child, feed: Option<&[u8]>, f: impl FnOnce(&mut Child) -> T) -> T {
+    let sin = child.stdin.take();
+    std::thread::scope(|s| {
+        if let (Some(mut sin), Some(bytes)) = (sin, feed) {
+            s.spawn(move || {
+                let _ = sin.write_all(bytes);
+            });
+        }
+        f(child)
+    })
+}
+
+fn time_once(tool: &Tool, args: &[String], cwd: &Path, feed: Option<&[u8]>) -> Result<f64> {
     let start = Instant::now();
-    let status = configure(&mut Command::new(&tool.program), tool, args, cwd)
+    let mut child = configure(&mut Command::new(&tool.program), tool, args, cwd)
+        .stdin(stdin_for(feed))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .spawn()
         .with_context(|| format!("spawning {}", tool.name))?;
+    let status = with_feed(&mut child, feed, Child::wait);
     let ms = start.elapsed().as_secs_f64() * 1e3;
     let _ = status;
     Ok(ms)
@@ -399,16 +472,22 @@ struct MemSample {
     private_kb: Option<u64>,
 }
 
-fn mem_once(tool: &Tool, args: &[String], cwd: &Path) -> MemSample {
-    let report = time_report(tool, args, cwd);
+fn mem_once(tool: &Tool, args: &[String], cwd: &Path, feed: Option<&[u8]>) -> MemSample {
+    let report = time_report(tool, args, cwd, feed);
     MemSample {
         rss_kb: report.as_deref().and_then(parse_rss_kb),
-        private_kb: private_once(tool, args, cwd, report.as_deref()),
+        private_kb: private_once(tool, args, cwd, feed, report.as_deref()),
     }
 }
 
 #[cfg(target_os = "macos")]
-fn private_once(_: &Tool, _: &[String], _: &Path, report: Option<&str>) -> Option<u64> {
+fn private_once(
+    _: &Tool,
+    _: &[String],
+    _: &Path,
+    _: Option<&[u8]>,
+    report: Option<&str>,
+) -> Option<u64> {
     report.and_then(parse_footprint_kb)
 }
 
@@ -418,54 +497,78 @@ fn private_once(_: &Tool, _: &[String], _: &Path, report: Option<&str>) -> Optio
 /// `spawn` returns only once the child has called `exec`, so the first sample is the
 /// tool's own address space and never a copy of this process's.
 #[cfg(target_os = "linux")]
-fn private_once(tool: &Tool, args: &[String], cwd: &Path, _: Option<&str>) -> Option<u64> {
+fn private_once(
+    tool: &Tool,
+    args: &[String],
+    cwd: &Path,
+    feed: Option<&[u8]>,
+    _: Option<&str>,
+) -> Option<u64> {
     let mut child = configure(&mut Command::new(&tool.program), tool, args, cwd)
+        .stdin(stdin_for(feed))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
     let path = format!("/proc/{}/status", child.id());
     let start = Instant::now();
-    let mut best = None;
-    while matches!(child.try_wait(), Ok(None)) {
-        if start.elapsed() > PERF_DEADLINE {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
+    with_feed(&mut child, feed, |child| {
+        let mut best = None;
+        while matches!(child.try_wait(), Ok(None)) {
+            if start.elapsed() > PERF_DEADLINE {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            if let Some(kb) = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|t| parse_rss_anon_kb(&t))
+            {
+                best = best.max(Some(kb));
+            }
+            std::thread::sleep(std::time::Duration::from_micros(100));
         }
-        if let Some(kb) = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|t| parse_rss_anon_kb(&t))
-        {
-            best = best.max(Some(kb));
-        }
-        std::thread::sleep(std::time::Duration::from_micros(100));
-    }
-    best
+        best
+    })
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn private_once(_: &Tool, _: &[String], _: &Path, _: Option<&str>) -> Option<u64> {
+fn private_once(
+    _: &Tool,
+    _: &[String],
+    _: &Path,
+    _: Option<&[u8]>,
+    _: Option<&str>,
+) -> Option<u64> {
     None
 }
 
 /// `/usr/bin/time`'s report (`-l` on macOS, `-v` on Linux) for one untimed run.
-fn time_report(tool: &Tool, args: &[String], cwd: &Path) -> Option<String> {
+fn time_report(tool: &Tool, args: &[String], cwd: &Path, feed: Option<&[u8]>) -> Option<String> {
     let flag = if cfg!(target_os = "macos") {
         "-l"
     } else {
         "-v"
     };
-    let out = configure(
+    let mut child = configure(
         Command::new("/usr/bin/time").arg(flag).arg(&tool.program),
         tool,
         args,
         cwd,
     )
+    .stdin(stdin_for(feed))
     .stdout(Stdio::null())
-    .output()
+    .stderr(Stdio::piped())
+    .spawn()
     .ok()?;
-    Some(String::from_utf8_lossy(&out.stderr).into_owned())
+    let mut err = child.stderr.take()?;
+    let report = with_feed(&mut child, feed, |c| {
+        let mut buf = vec![];
+        let _ = err.read_to_end(&mut buf);
+        let _ = c.wait();
+        buf
+    });
+    Some(String::from_utf8_lossy(&report).into_owned())
 }
 
 fn cv_pct(samples: &[f64]) -> f64 {
@@ -539,7 +642,13 @@ const IR_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
 /// non-zero still has a valid count (valgrind passes its status through, and the output gate
 /// has already matched it to the reference's), so the count is whatever the log holds: `None`
 /// when valgrind could not run the tool at all, or ran past [`IR_DEADLINE`].
-fn ir_once(valgrind: &Path, tool: &Tool, args: &[String], cwd: &Path) -> Option<u64> {
+fn ir_once(
+    valgrind: &Path,
+    tool: &Tool,
+    args: &[String],
+    cwd: &Path,
+    feed: Option<&[u8]>,
+) -> Option<u64> {
     let name: String = tool
         .name
         .chars()
@@ -561,13 +670,13 @@ fn ir_once(valgrind: &Path, tool: &Tool, args: &[String], cwd: &Path) -> Option<
         .current_dir(cwd)
         .env("TZ", "UTC")
         .env("LC_ALL", "C")
-        .stdin(Stdio::null())
+        .stdin(stdin_for(feed))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
     let start = Instant::now();
-    let finished = loop {
+    let finished = with_feed(&mut child, feed, |child| loop {
         match child.try_wait() {
             Ok(Some(_)) => break true,
             Ok(None) if start.elapsed() < IR_DEADLINE => {
@@ -579,7 +688,7 @@ fn ir_once(valgrind: &Path, tool: &Tool, args: &[String], cwd: &Path) -> Option<
                 break false;
             }
         }
-    };
+    });
     let count = std::fs::read_to_string(&log)
         .ok()
         .and_then(|t| parse_ir(&t))
@@ -624,10 +733,24 @@ fn run_row_over(
 ) -> Result<PerfRow> {
     let file = input.map(|i| format!("{}.json", i.id));
     let args = args_for(q, file.as_deref());
+    // A stdin row reads its input once and pipes it into every run, the gate's included.
+    let fed: Option<Vec<u8>> = match (q.stdin, &file) {
+        (true, Some(f)) => {
+            Some(std::fs::read(inputs_dir.join(f)).with_context(|| format!("reading {f}"))?)
+        }
+        _ => None,
+    };
+    let feed = fed.as_deref();
     // Output-identity gate: hash each tool's stdout, compare with its exit status.
     let mut digest = vec![];
     for t in tools {
-        let e = exec_within(t, &args, "", inputs_dir, PERF_DEADLINE)?;
+        let e = exec_within(
+            t,
+            &args,
+            feed.unwrap_or_default(),
+            inputs_dir,
+            PERF_DEADLINE,
+        )?;
         if e.timed_out {
             bail!(
                 "{} did not finish `{}` on {:?} within {:?}",
@@ -671,14 +794,14 @@ fn run_row_over(
     let mut samples: Vec<Vec<f64>> = vec![vec![]; tools.len()];
     // One untimed warm-up of each, then rotate the starting tool every repetition.
     for t in tools {
-        time_once(t, &args, inputs_dir)?;
+        time_once(t, &args, inputs_dir, feed)?;
     }
     let mut rep = 0;
     let mut total = reps;
     while rep < total {
         for k in 0..tools.len() {
             let i = (rep + k) % tools.len();
-            samples[i].push(time_once(&tools[i], &args, inputs_dir)?);
+            samples[i].push(time_once(&tools[i], &args, inputs_dir, feed)?);
         }
         rep += 1;
         if rep == reps {
@@ -687,7 +810,9 @@ fn run_row_over(
     }
     row.reps = total;
     for (i, t) in tools.iter().enumerate() {
-        let mem: Vec<MemSample> = (0..3).map(|_| mem_once(t, &args, inputs_dir)).collect();
+        let mem: Vec<MemSample> = (0..3)
+            .map(|_| mem_once(t, &args, inputs_dir, feed))
+            .collect();
         let rss = median_u64(mem.iter().filter_map(|m| m.rss_kb).collect());
         let private = median_u64(mem.iter().filter_map(|m| m.private_kb).collect());
         row.tools.push(ToolResult {
@@ -699,7 +824,7 @@ fn run_row_over(
             // The secondary reference is not counted: nothing reports it.
             instructions: valgrind
                 .filter(|_| i < 2)
-                .and_then(|v| ir_once(v, t, &args, inputs_dir)),
+                .and_then(|v| ir_once(v, t, &args, inputs_dir, feed)),
         });
     }
     row.noisy = row.tools.iter().any(|t| t.cv_pct.is_some_and(|c| c > 5.0));
@@ -805,6 +930,70 @@ mod tests {
         assert!(parse_queries("a\t@files=x\t.\tusers\t1mb\n").is_err());
         assert!(parse_queries("a\t@files=16\t.\tusers\t1mb\n").is_ok());
         assert!(parse_queries("a\t-n @INPUT@ @files=2\t.\tusers\t1mb\n").is_err());
+    }
+
+    #[test]
+    fn stdin_is_a_pseudo_flag_that_drops_the_file_argument() {
+        let q = parse_queries("a_stdin\t-c @stdin\t.\tusers\t1mb\n").unwrap();
+        assert!(q[0].stdin);
+        assert_eq!(
+            q[0].flags,
+            ["-c"],
+            "the pseudo-flag is not passed to the tool"
+        );
+        assert_eq!(args_for(&q[0], Some("u.json")), ["-c", "."]);
+        // Alone, it leaves no flags at all.
+        let q = parse_queries("a_stdin\t@stdin\t.\tusers\t1mb\n").unwrap();
+        assert_eq!(args_for(&q[0], Some("u.json")), ["."]);
+        // A file row is not a stdin row.
+        let q = parse_queries("a\t-c\t.\tusers\t1mb\n").unwrap();
+        assert!(!q[0].stdin);
+    }
+
+    #[test]
+    fn a_stdin_row_must_have_an_input_to_pipe_and_name_its_twin() {
+        assert!(parse_queries("a_stdin\t-n @stdin\t1\tnone\t1mb\n").is_err());
+        assert!(parse_queries("a_stdin\t@stdin @INPUT@\t.\tusers\t1mb\n").is_err());
+        assert!(parse_queries("a_stdin\t@stdin @files=2\t.\tusers\t1mb\n").is_err());
+        assert!(
+            parse_queries("a\t@stdin\t.\tusers\t1mb\n").is_err(),
+            "the id ends with _stdin, so the report can find the file row"
+        );
+        assert!(
+            parse_queries("a_stdin\t-c\t.\tusers\t1mb\n").is_err(),
+            "a _stdin id without the flag would be a file row the report never pairs"
+        );
+    }
+
+    /// Every stdin row has a file-route twin with the same flags, filter, shapes and cap, or the
+    /// side-by-side table compares two different programs.
+    #[test]
+    fn every_checked_in_stdin_row_has_a_file_twin_that_runs_the_same_program() {
+        let qs = parse_queries(include_str!("../../../../comparison/jq/queries/perf.tsv")).unwrap();
+        let piped: Vec<&PerfQuery> = qs.iter().filter(|q| q.stdin).collect();
+        assert!(piped.len() >= 6, "the issue's six rows");
+        for p in piped {
+            let twin_id = p.id.strip_suffix(STDIN_SUFFIX).unwrap();
+            let twin = qs
+                .iter()
+                .find(|q| q.id == twin_id)
+                .unwrap_or_else(|| panic!("{} has no file twin {twin_id}", p.id));
+            assert!(!twin.stdin);
+            assert_eq!(
+                (&twin.flags, &twin.filter),
+                (&p.flags, &p.filter),
+                "{}",
+                p.id
+            );
+            for shape in &p.shapes {
+                assert!(twin.shapes.contains(shape), "{twin_id} lacks shape {shape}");
+            }
+            assert!(
+                tier_rank(&p.max_tier) <= tier_rank(&twin.max_tier),
+                "{} runs a tier its twin does not",
+                p.id
+            );
+        }
     }
 
     #[test]
@@ -933,7 +1122,7 @@ mod tests {
         let counted = |valgrind: &Path| {
             let mut got = None;
             for _ in 0..100 {
-                got = ir_once(valgrind, &tool, &[], &dir);
+                got = ir_once(valgrind, &tool, &[], &dir, None);
                 if got.is_some() {
                     break;
                 }
@@ -953,8 +1142,8 @@ mod tests {
         );
         assert_eq!(counted(&failing), Some(42));
         let silent = stub("silent", "exit 0");
-        assert_eq!(ir_once(&silent, &tool, &[], &dir), None);
-        assert_eq!(ir_once(&dir.join("absent"), &tool, &[], &dir), None);
+        assert_eq!(ir_once(&silent, &tool, &[], &dir, None), None);
+        assert_eq!(ir_once(&dir.join("absent"), &tool, &[], &dir, None), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1040,7 +1229,7 @@ mod tests {
             "import time; b = bytearray(64 * 1024 * 1024); b[::4096] = b'x' * len(b[::4096]); time.sleep(0.5)"
                 .to_string(),
         ];
-        let kb = private_once(&tool, &args, Path::new("."), None).expect("sampled");
+        let kb = private_once(&tool, &args, Path::new("."), None, None).expect("sampled");
         assert!(kb >= 60 * 1024, "{kb} KiB");
     }
 
@@ -1101,6 +1290,91 @@ mod tests {
         assert_eq!(row.reps, 3);
         assert!(!row.ratio_from_min, "a fast row keeps the median ratio");
         assert!(row.tools.iter().all(|t| t.stats.as_ref().unwrap().n == 3));
+    }
+
+    /// The bytes arrive whole through the pipe, however much the pipe buffer holds (a pipe holds
+    /// 64 KiB on Linux, so 1 MiB needs the writer to run beside the reader), and a tool that
+    /// never reads does not hang the writer.
+    #[cfg(unix)]
+    #[test]
+    fn a_fed_run_delivers_every_byte_and_a_tool_that_stops_reading_does_not_hang() {
+        let dir = scratch("feed");
+        let bytes: Vec<u8> = (0..1_048_576u32).map(|i| (i % 251) as u8).collect();
+        let out = dir.join("got");
+        let cat = sh("cat", "cat > \"$1\"");
+        time_once(
+            &cat,
+            &[out.display().to_string()],
+            &dir,
+            Some(bytes.as_slice()),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), bytes);
+        // The untimed memory run reads it too: `/usr/bin/time` passes its stdin on.
+        std::fs::remove_file(&out).unwrap();
+        let report = time_report(
+            &cat,
+            &[out.display().to_string()],
+            &dir,
+            Some(bytes.as_slice()),
+        );
+        assert!(report.is_some());
+        assert_eq!(std::fs::read(&out).unwrap(), bytes);
+        let quitter = sh("true", ":");
+        time_once(&quitter, &[], &dir, Some(bytes.as_slice())).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stdin row's every run, the gate's included, gives the tool a pipe and the whole input:
+    /// a tool that finds a regular file or a short read on fd 0 records it in a marker file.
+    #[cfg(unix)]
+    #[test]
+    fn a_stdin_row_pipes_the_input_through_every_kind_of_run() {
+        let dir = scratch("stdin-row");
+        let input = b"{\"users\":[1,2,3]}\n".repeat(50_000);
+        std::fs::write(dir.join("u.json"), &input).unwrap();
+        let marker = dir.join("marker");
+        let script = format!(
+            "[ -p /dev/stdin ] || echo notpipe >> {m}; n=$(wc -c); [ \"$n\" -eq {len} ] || echo short >> {m}; echo \"$n\"",
+            m = marker.display(),
+            len = input.len()
+        );
+        let tool = sh("t", &script);
+        let q = parse_queries("t_stdin\t@stdin\tx\tusers\t1mb\n")
+            .unwrap()
+            .remove(0);
+        let row = run_row_over(
+            &[tool.clone(), tool],
+            &q,
+            Some(&spec("u", "users", "1mb")),
+            &dir,
+            3,
+            None,
+            f64::MAX,
+        )
+        .unwrap();
+        assert_eq!(row.gate, Gate::Match);
+        assert!(row.speedup_primary.is_some());
+        assert!(
+            !marker.exists(),
+            "{}",
+            std::fs::read_to_string(&marker).unwrap_or_default()
+        );
+        // The same row as a file row names the file and pipes nothing.
+        let file_q = parse_queries("t\t-\tx\tusers\t1mb\n").unwrap().remove(0);
+        let sniff = sh("t", "[ -p /dev/stdin ] && echo piped; echo \"$2\"");
+        let row = run_row_over(
+            &[sniff.clone(), sniff],
+            &file_q,
+            Some(&spec("u", "users", "1mb")),
+            &dir,
+            1,
+            None,
+            f64::MAX,
+        )
+        .unwrap();
+        assert_eq!(row.gate, Gate::Match);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The injected threshold is the only thing that decides: the same timings are fast over one
