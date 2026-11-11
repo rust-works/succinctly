@@ -157,6 +157,39 @@ both.
   it), and collapsing a subtree that says nothing into one leaf changes what the comment setters
   (`head_comment =` and its relatives, which index a node's members by position) find, so neither is
   part of this change: the second copy of the document is #6879 and the two trees are #6880.
+- **The two trees shrank as #6880.** A subtree that says nothing (no comment, quoting, flow style, anchor,
+  tag or spelling on any node of it) is held as the one-word empty tree: the snapshot's walk collapses a
+  child as soon as it is finished, after the comments that belong to it are attached (`- # note` keys on
+  the tree lining up with its value), and `reconcile_presentation` returns the empty tree for a container
+  whose pristine tree is empty instead of walking it. Every read of the tree (`field`, `at_index`, `meta`,
+  the key map) answers the same, so output is byte-identical (7,728 baseline-against-branch runs over 56
+  filters, 15 documents and 8 generated ones, six flag sets: no difference). The saving is withheld where
+  something reads the tree by position or by shape: a document with an alias, a metadata write (`style =`,
+  `head_comment =`, `tag =`), and a plain `=` whose right side is not a literal, which copies a source
+  subtree's presentation. Interleaved release A/B against `main` @ `3d532c317`, `.zzz = 1` with `-o yaml`
+  unless noted, peak RSS (MiB; median of 3, of 5 at 20 MiB on the M4 Pro) and the median of 5 wall times:
+
+  | peak RSS (MiB) / time (s)        | 7950X before | 7950X after | M4 Pro before | M4 Pro after |
+  |----------------------------------|-------------:|------------:|--------------:|-------------:|
+  | `users` 20 MiB                   |          595 |         365 |           607 |          385 |
+  | `users` 20 MiB, `-P`             |          718 |         366 |           705 |          385 |
+  | `users` 20 MiB, `del(.users[0])` |          635 |         506 |           597 |          454 |
+  | `users` 20 MiB, `\|= "X"`        |          596 |         366 |           586 |          384 |
+  | `users` 100 MiB                  | 2899 / 10.38 | 1760 / 8.46 |   2939 / 7.05 |  1955 / 6.44 |
+  | `comprehensive` 100 MiB          |  2093 / 8.40 | 1453 / 7.26 |   2021 / 6.17 |  1510 / 5.36 |
+  | `nested` 100 MiB                 |  1629 / 7.26 | 1047 / 6.39 |   1583 / 4.97 |  1155 / 4.00 |
+
+  Controls: the `.` fast path, the JSON-output write, `anchors`, `flow`, `strings` and `sequences` at 20 MiB
+  do not move on the 7950X beyond the 5 MiB that two builds of the same source differ by (-0.3% to -5%), nor
+  does a plain `=` copy (`.c = .users[0]`). `navigation` saves 3%: every record holds a quoted timestamp, so no
+  record collapses, which is the shape this does not help. The M4 Pro's peak RSS is noisy for `nested`
+  (the same binary read 267-271 or 365-378 MiB at 20 MiB, and 1155 to 1552 at 100 MiB): macOS keeps freed
+  pages resident until the kernel purges them, so read the 7950X column, whose runs agree to a MiB, for the
+  size of the saving. The first version collapsed the finished tree in a pass, which freed millions of cold
+  nodes and made the 100 MiB `users` write 30% *slower* on the 7950X (10.38 s to 13.43 s) while saving the
+  same memory; collapsing a child as it is finished frees it while it is still in cache. The M4 Pro was
+  under other load while it was timed (a load average of 4-5), so its times are interleaved ratios, not
+  quiet-box figures. What remains of the 20 MiB `users` write is the document as `OwnedValue` twice (#6879).
 
 ## Problem Statement
 
