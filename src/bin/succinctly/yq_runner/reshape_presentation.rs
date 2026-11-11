@@ -44,7 +44,7 @@ pub(super) fn supported(expr: &Expr) -> bool {
         Expr::Builtin(Builtin::Sort | Builtin::Flatten | Builtin::Pivot) => true,
         Expr::Builtin(Builtin::FlattenDepth(depth)) => is_closed_literal(depth),
         // Paths given as a literal; one built from the document is for the plain route.
-        Expr::Builtin(Builtin::Pick(paths)) => is_closed_literal(paths),
+        Expr::Builtin(Builtin::Pick(paths) | Builtin::Omit(paths)) => is_closed_literal(paths),
         Expr::Assign { path, value } => static_path(path) && supported(value),
         // #6089: a key rename, whose target is a path and whose new name is a supported expression.
         Expr::MetaAssign {
@@ -131,11 +131,12 @@ fn plain_op(op: &ArithOp) -> bool {
         || flags.only_new || flags.deep_merge_arrays || flags.clobber_tags)
 }
 
-/// Whether `expr` replays a `pick`. The replay reads the presentation of the whole document, where
-/// the plain route reads what is picked, so the caller bounds it by the document's size (#5003).
+/// Whether `expr` replays a `pick` or an `omit`. The replay reads the presentation of the whole
+/// document, where the plain route reads what is kept, so the caller bounds it by the document's
+/// size (#5003, #6906).
 pub(super) fn contains_pick(expr: &Expr) -> bool {
     match expr {
-        Expr::Builtin(Builtin::Pick(_)) => true,
+        Expr::Builtin(Builtin::Pick(_) | Builtin::Omit(_)) => true,
         Expr::Paren(inner) => contains_pick(inner),
         Expr::Pipe(parts) => parts.iter().any(contains_pick),
         _ => false,
@@ -870,6 +871,8 @@ fn trace_at_depth(
         // #5003: a picked entry is the document's own node, key and all: its comments, style,
         // anchor and tag come with it, as do the document's head comment and the key's.
         Expr::Builtin(Builtin::Pick(keys)) => pick_pair(keys, input),
+        // #6906: what `omit` keeps is the document's own nodes too, the complement of a pick.
+        Expr::Builtin(Builtin::Omit(keys)) => omit_pair(keys, input),
         Expr::Builtin(Builtin::WithEntries(f)) => {
             let entries = next(&Expr::Builtin(Builtin::ToEntries), input)?;
             let mapped = next(&Expr::Builtin(Builtin::Map(f.clone())), &entries)?;
@@ -1239,6 +1242,75 @@ fn pick_pair(keys: &Expr, input: &ResultWithComments) -> Option<ResultWithCommen
             }
             Some((
                 OwnedValue::Array(picked.into_iter().collect()),
+                CommentTree::array(tree.meta().clone(), children),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// `omit(KEYS)` over `input`: every member whose key is not listed, or every item of a sequence
+/// whose index is not (#6906). What stays is the document's own node, key and all, as for
+/// [`pick_pair`]: its comments, style, anchor and tag come with it, and so do the document's head
+/// comment and the keys'. Anything but a list of string keys over a mapping, or of non-negative
+/// integers over a sequence, is the plain route's; so is a value that differs from the
+/// authoritative result, which the caller checks.
+fn omit_pair(keys: &Expr, input: &ResultWithComments) -> Option<ResultWithComments> {
+    let (value, tree) = input;
+    let OwnedValue::Array(keys) = evaluated(keys, &OwnedValue::Null)? else {
+        return None;
+    };
+    match value {
+        OwnedValue::Object(members) => {
+            let mut listed = Vec::with_capacity(keys.len());
+            for key in &keys {
+                // A key that is not a string matches no member (the evaluator skips it too).
+                if let OwnedValue::String(key) = key {
+                    listed.push(key.as_ref());
+                }
+            }
+            let mut kept = IndexMap::new();
+            let mut fields = IndexMap::new();
+            let mut key_metas = IndexMap::new();
+            for (key, member) in members.iter() {
+                if listed.contains(&key.as_str()) {
+                    continue;
+                }
+                kept.insert(key.to_string(), member.clone());
+                fields.insert(key.to_string(), tree.field(key).clone());
+                if let Some(meta) = tree.key_meta(key) {
+                    key_metas.insert(key.to_string(), meta.clone());
+                }
+            }
+            Some((
+                OwnedValue::Object(kept.into()),
+                CommentTree::object(tree.meta().clone(), fields, key_metas),
+            ))
+        }
+        OwnedValue::Array(items) => {
+            let mut listed = Vec::with_capacity(keys.len());
+            for index in &keys {
+                // Only a non-negative integer removes anything: a negative index does not wrap and
+                // a string or float key matches nothing (#4257).
+                if let OwnedValue::Int(index)
+                | OwnedValue::NumberLiteral(NumberRepr::Int(index), _) = index
+                {
+                    if let Ok(index) = usize::try_from(*index) {
+                        listed.push(index);
+                    }
+                }
+            }
+            let mut kept = Vec::new();
+            let mut children = Vec::new();
+            for (index, item) in items.iter().enumerate() {
+                if listed.contains(&index) {
+                    continue;
+                }
+                kept.push(item.clone());
+                children.push(tree.at_index(index).clone());
+            }
+            Some((
+                OwnedValue::Array(kept.into_iter().collect()),
                 CommentTree::array(tree.meta().clone(), children),
             ))
         }

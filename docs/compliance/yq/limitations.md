@@ -7117,7 +7117,8 @@ Values are right in all three; only the comments and styles of the elements diff
 
 A comment after a block scalar's `|`/`>` indicator stays on the header line in the places the value is
 written where it stands: `.`, `-P`, and a write that leaves the scalar alone or replaces it.
-A plain copy (`.b = .a`) and `pick` keep it since [#5257](https://github.com/rust-works/succinctly/issues/5257) and [#5003](https://github.com/rust-works/succinctly/issues/5003).
+A plain copy (`.b = .a`), `pick` and `omit` keep it since [#5257](https://github.com/rust-works/succinctly/issues/5257), [#5003](https://github.com/rust-works/succinctly/issues/5003) and [#6906](https://github.com/rust-works/succinctly/issues/6906): `omit(["a"])` prints the rest of the document with its comments, flow style and quoting, as `pick` does.
+A key of the wrong kind for the node (`omit(["a"])` over a sequence, `omit([0])` over a mapping) matches nothing and the node comes through whole, as in yq.
 A copy made through a variable (`. as $v | {"z": $v}`), a recursive merge over it (`. *d {"a": "n"}`) and a slice (`.[0:1]`) carry no such comment, where yq keeps it ([#5003](https://github.com/rust-works/succinctly/issues/5003)).
 
 `pick` copies the document's nodes, so what it keeps is printed as written: trailing comments, flow style, quoting, anchors, tags, a key's own quoting and comment, and the document's head comment.
