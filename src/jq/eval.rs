@@ -27283,9 +27283,7 @@ fn format_toml(value: &OwnedValue) -> Result<String, EvalError> {
                         self.blank_line();
                         self.array_of_tables(path, name, items, depth);
                     }
-                    // patchcov: coverage tolerate-start reason="unreachable: a mapping holding an array that is not an array of tables has an attribute, so it took the has_attrs branch above; yq's encodeSeparateMapping keeps the same dead arm"
-                    OwnedValue::Array(items) => self.array_attribute(name, items),
-                    // patchcov: coverage tolerate-end
+                    OwnedValue::Array(items) => self.array_attribute(name, items), // patchcov: coverage tolerate-line reason="unreachable: a mapping holding an array that is not an array of tables has an attribute, so it took the has_attrs branch above; yq's encodeSeparateMapping keeps the same dead arm"
                     scalar => self.attribute(name, scalar),
                 }
             }
