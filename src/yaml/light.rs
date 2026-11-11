@@ -6925,8 +6925,13 @@ impl<'a> YamlString<'a> {
         line_indent
     }
 
-    /// Check if the given position is on a document-start line (begins with ---).
+    /// Check if the given position is on a document-start line (begins with a `---` marker).
     /// This allows zero-indented block scalars per YAML spec.
+    ///
+    /// A marker is `---` followed by white space, a line break or the end of the text, as
+    /// `Parser::marker_prefix` has it. A key that merely starts with `---` (`----: >`, `---a: >`)
+    /// is no marker: reading it as one lets the empty scalar's content sit at column 0 and swallows
+    /// the entries below it (#6976).
     fn is_document_start_line(text: &[u8], pos: usize) -> bool {
         // Find start of line
         let mut line_start = pos;
@@ -6940,16 +6945,12 @@ impl<'a> YamlString<'a> {
             check_pos += 1;
         }
 
-        // Check for "---"
-        if check_pos + 2 < text.len()
-            && text[check_pos] == b'-'
-            && text[check_pos + 1] == b'-'
-            && text[check_pos + 2] == b'-'
-        {
-            return true;
-        }
-
-        false
+        // Check for "---", then for what ends a marker
+        text.get(check_pos..check_pos + 3) == Some(b"---")
+            && matches!(
+                text.get(check_pos + 3),
+                None | Some(b' ' | b'\t' | b'\n' | b'\r')
+            )
     }
 
     /// Detect content indentation from first non-empty line.
@@ -12089,6 +12090,32 @@ fn looks_like_yaml_number(s: &str) -> bool {
 mod tests {
     use super::*;
     use crate::yaml::{YamlError, YamlIndex};
+
+    /// #6976: a document-start line is a `---` marker, not any line that begins with `---`: a key
+    /// such as `----` or `---a` is no marker, and its block scalar may not sit at column 0.
+    #[test]
+    fn a_key_starting_with_three_dashes_is_not_a_document_start_line_6976() {
+        let is = |text: &str| YamlString::is_document_start_line(text.as_bytes(), 0);
+        for marker in [
+            "--- >",
+            "--- |-",
+            "---\t>",
+            "---\n",
+            "---",
+            "  --- >",
+            "--- >\r\n",
+        ] {
+            assert!(is(marker), "{marker:?} is a marker line");
+        }
+        for key in [
+            "----: >", "---a: >", "---: >", "--: >", "-- >", "- >", "a: >",
+        ] {
+            assert!(!is(key), "{key:?} is no marker line");
+        }
+        // The line the position is on decides, not the first line of the text.
+        assert!(!YamlString::is_document_start_line(b"---\n----: >", 10));
+        assert!(YamlString::is_document_start_line(b"a: 1\n--- >", 9));
+    }
 
     /// #6067: the writers that transcode a double-quoted body to JSON, and the one that streams it,
     /// hand a body to [`decode_double_quoted`] when it holds a break they do not fold
