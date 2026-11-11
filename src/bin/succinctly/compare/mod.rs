@@ -11,6 +11,7 @@
 //! the secondary reference), G (CLI flags) and the succinctly-only surface,
 //! checked against the `divergences/` ledger.
 
+mod categories;
 mod cli;
 mod docs;
 mod env;

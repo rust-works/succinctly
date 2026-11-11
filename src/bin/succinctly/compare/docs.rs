@@ -90,7 +90,7 @@ pub fn sanitize(text: &str, root: &std::path::Path) -> String {
         .replace(&plain.replace('\\', "\\\\"), "<repo>")
 }
 
-fn geomean(xs: &[f64]) -> Option<f64> {
+pub(super) fn geomean(xs: &[f64]) -> Option<f64> {
     (!xs.is_empty()).then(|| (xs.iter().map(|x| x.ln()).sum::<f64>() / xs.len() as f64).exp())
 }
 
@@ -156,7 +156,7 @@ pub fn index(rows: &[(String, Value)]) -> String {
 
 /// A markdown table padded to fixed column widths; columns from `right` on are
 /// right-aligned (the numbers).
-fn table(header: &[&str], rows: &[Vec<String>], right: usize) -> String {
+pub(super) fn table(header: &[&str], rows: &[Vec<String>], right: usize) -> String {
     let width = |i: usize| {
         rows.iter()
             .map(|r| r[i].chars().count())
@@ -437,6 +437,16 @@ pub fn summary_block(runs: &[(String, Value)]) -> String {
         &cells,
         2,
     ));
+    let _ = write!(
+        s,
+        "\nThe same geomeans per kind of query, because the all-rows figure above counts every \
+         `identity` row over every input shape, which is the strongest case for `succinctly jq`. \
+         The groups are those of [docs/guides/choosing-jq.md](docs/guides/choosing-jq.md), which \
+         says which tool to pick for which workload; a group does not cover every row, so the \
+         last two lines are the whole. Each cell also says on how many of its rows jq is \
+         faster.\n\n{}",
+        super::categories::table_for(runs)
+    );
     s
 }
 
@@ -749,7 +759,7 @@ mod tests {
             "{b}"
         );
         // 1 MB is geomean(2, 8) = 4; 100 MB has no row; all four timed rows: (0.5*2*8*3)^(1/4).
-        let row = b.lines().last().unwrap();
+        let row = b.lines().find(|l| l.contains("[Test CPU]")).unwrap();
         assert!(
             row.contains("0.50x") && row.contains("4.00x") && row.contains("3.00x"),
             "{row}"
