@@ -2195,19 +2195,18 @@ every CLI-reachable case: `Expr`, `Builtin`, `eval`, and `YqSemantics` are publi
 directly and evaluate it with `YqSemantics`, bypassing the parser (and any CLI flag) entirely
 — deleting the check would reopen #723's bug for that surface specifically.
 
-### `load`, `load_str` and `load_base64`: five rows still differ ([#6985](https://github.com/rust-works/succinctly/issues/6985))
+### `load`, `load_str` and `load_base64`: four rows still differ ([#6985](https://github.com/rust-works/succinctly/issues/6985))
 
 The loaders read their file name as yq does: the argument's first output, a scalar by its text, and `filename expression returned nil` when the argument has no output.
 A read failure is worded as Go words it (`failed to load nope: open nope: no such file or directory`, `read adir: is a directory`), and a file that does not parse is `failed to load F: bad file 'F': ...`.
-Five rows differ:
+Four rows differ:
 
 - **A literal `null` name.**
   yq opens the file `null` (`load_str(null)` is `open null: no such file or directory`), and an absent key (`load_str(.zz)`) is `filename expression returned nil`.
   An absent key reads as `null` here, so both are the nil refusal: the absent key is the common case.
 - **Bytes that are not valid UTF-8 in `load_str`.**
-  yq keeps the raw byte, which its JSON encoder escapes as `\ufffd`; this substitutes U+FFFD on the read, so the string is the same and `-o=json` prints the character itself (the rule of the `-p json` section above).
-- **A line break inside `load_base64`'s text.**
-  yq's decoder answers `unexpected EOF` for `aGVs` / `bG8=`, where this says `illegal base64 data at input byte 4`: the same gap as `@base64d`, which `load_base64` decodes with ([#6997](https://github.com/rust-works/succinctly/issues/6997)).
+  yq keeps the raw bytes, which its JSON encoder writes as one `\ufffd` each; this substitutes one U+FFFD per byte on the read (#7000), so the string is the same under `-o=json` and the character is printed itself (the rule of the `-p json` section above).
+  `length` and YAML output differ as for `@base64d` (see "Decoded bytes that are not UTF-8" below).
 - **The reason a file does not parse.**
   After `bad file 'F': ` yq gives go-yaml's message (`yaml: while parsing a flow sequence at <unknown position>`), and this gives its own parser's (`unexpected end of input: flow sequence`).
 - **A `.json` name holding YAML.**
@@ -7746,3 +7745,14 @@ It runs over the value model, which keeps no comment or source spelling, so on a
 - An empty document, which yq prints as nothing, is `null` here (#5721).
 - A processing-instruction target is checked with an approximation of Go's XML name tables (Unicode letters, digits, `-`, `.`, the middle dot and the common combining marks), so a character the tables treat differently is accepted or refused here and not in yq.
 - A `-p`/`-o` input format of `xml` is still refused, so `--xml-strict-mode`, `--xml-keep-namespace`, `--xml-raw-token`, `--xml-skip-directives` and `--xml-skip-proc-inst` have nothing to act on.
+
+### Decoded bytes that are not UTF-8 (`@base64d`, `@urid`, `load_str`): `length` and YAML output differ ([#7000](https://github.com/rust-works/succinctly/issues/7000))
+
+yq keeps the bytes `@base64d`, `@urid` and `load_str` decode as they are, and its JSON encoder writes one U+FFFD for each byte that is not part of a valid sequence (Go's `encoding/json`).
+A string here holds UTF-8 only, so each such byte becomes one U+FFFD when it is decoded (`substitute_invalid_utf8_per_byte`, the count of the `-p json` reader, #1616), and `-o json` agrees with yq (`"4oI=" | @base64d`, the bytes `e2 82`, is two U+FFFD in both; an `@base64d` fuzz over 500 random binary payloads agrees on every one).
+Two things still differ, because yq has the raw bytes and this has the substitutes:
+
+- `length` counts bytes in both tools, so each substitute counts three where yq counts one (`"4oI=" | @base64d | length` is `2` in yq and `6` here).
+- YAML output prints the substitutes, where yq prints the raw bytes for a document that is the string itself and refuses a nested one with `yaml: cannot marshal invalid UTF-8 data as !!str`.
+
+Matching either needs a string that can hold bytes that are not UTF-8, or the substitution moved to the JSON encoder, as the `-p json` reader does with `-o json` only.

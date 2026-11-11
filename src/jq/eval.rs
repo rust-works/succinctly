@@ -246,8 +246,8 @@ pub trait EvalSemantics: Copy + Default {
     /// diverge from.
     const SELECT_EMITS_ONCE_IF_ANY_TRUTHY: bool;
 
-    /// If true (jq), `@base64d`/`@urid`'s own lossy-decode arm (#1719, the
-    /// sole reader of this const -- see `owned_string_from_decoded_bytes`)
+    /// If true (jq), the lossy-decode arm of `@base64d`/`@urid`/`load_str`
+    /// (#1719, the sole reader of this const -- see `owned_string_from_decoded_bytes`)
     /// uses jq's maximal-subpart rule: a structurally-valid overlong/
     /// surrogate/out-of-range 3-/4-byte lead collapses to a single U+FFFD,
     /// live-verified against jq 1.7.1 (`\xe0\x80\x80` -> one U+FFFD, not
@@ -25908,23 +25908,25 @@ fn yq_stringify_scalar_or_empty<S: EvalSemantics>(value: &OwnedValue) -> String 
 /// invalid case -- avoiding the second full-buffer copy
 /// `String::from_utf8_lossy(&bytes).into_owned()` always pays even when
 /// `bytes` was valid all along (the common case for both callers below).
-/// Shared by `format_urid`/`format_base64d` (#1123) so the "always lossy,
-/// never error on bad UTF-8" decode policy has one definition instead of
-/// two independently-copy-pasted tails.
+/// Shared by `format_urid`/`format_base64d` (#1123) and `load_str`/`load_base64`
+/// (#6985) so the "always lossy, never error on bad UTF-8" decode policy has
+/// one definition.
 ///
-/// Which lossy substitution rule the invalid-UTF-8 arm uses is per-mode,
-/// and neither is a verified oracle match on every input -- see
+/// Which lossy substitution rule the invalid-UTF-8 arm uses is per-mode: jq's
+/// maximal-subpart rule, or yq's one U+FFFD per byte, which matches yq's JSON
+/// output but not its `length` or YAML output (#7000) -- see
 /// `EvalSemantics::UTF8_LOSSY_USES_JQ_MAXIMAL_SUBPART_RULE` (#1719).
 fn owned_string_from_decoded_bytes<S: EvalSemantics>(bytes: Vec<u8>) -> String {
     String::from_utf8(bytes).unwrap_or_else(|e| {
         if S::UTF8_LOSSY_USES_JQ_MAXIMAL_SUBPART_RULE {
             crate::text::utf8::substitute_invalid_utf8_jq_style(e.as_bytes())
         } else {
-            // The substituted bytes are valid UTF-8, so this never falls back.
+            // The substitution is valid UTF-8; were it ever not, the lossy rule keeps the text
+            // rather than dropping it.
             String::from_utf8(crate::text::utf8::substitute_invalid_utf8_per_byte(
                 e.as_bytes(),
             ))
-            .unwrap_or_default()
+            .unwrap_or_else(|still| String::from_utf8_lossy(still.as_bytes()).into_owned())
         }
     })
 }
@@ -142890,12 +142892,11 @@ mod tests {
 
     #[test]
     fn test_format_base64d_yq_mode_keeps_per_byte_lossy_1719() {
-        // Sibling of the jq-mode test above: #1719 only switched jq mode's
-        // substitution rule. yq mode has no oracle-matching rule to switch
-        // to (real yq passes invalid-UTF-8 bytes through unchanged, which
-        // Rust's `String` can't represent), so it must keep emitting one
-        // U+FFFD per byte here -- pinned so a future refactor collapsing
-        // the `S::TAG` branch can't silently apply jq's rule to yq too.
+        // Sibling of the jq-mode test above: #1719 switched only jq mode's
+        // substitution rule. yq mode writes one U+FFFD per invalid byte,
+        // the count yq's JSON encoder writes for the raw bytes it keeps
+        // (#7000) -- pinned so a refactor collapsing the `S::TAG` branch
+        // cannot apply jq's rule, or the maximal-subpart one, to yq.
         yq_query!(br#""4ICA""#, "@base64d",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "\u{FFFD}\u{FFFD}\u{FFFD}");
