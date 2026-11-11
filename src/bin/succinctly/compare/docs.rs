@@ -928,6 +928,27 @@ mod tests {
     }
 
     #[test]
+    fn every_group_has_timed_rows_in_every_committed_run() {
+        // A renamed or removed query would otherwise print `n/a` into the guide and pass.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for (platform, v) in committed_runs(&root.join("docs/compare"), None).unwrap() {
+            let queries: Vec<String> = v["perf"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|r| r["speedup_primary"].as_f64().is_some())
+                .map(|r| r["query"].as_str().unwrap().to_string())
+                .collect();
+            for (name, _, keep) in QUERY_GROUPS {
+                assert!(
+                    queries.iter().any(|q| keep(q)),
+                    "{name} holds no timed row of {platform}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_group_holds_no_query_another_group_holds() {
         // The test of one group is a name list or a prefix: a query in two would be counted twice.
         for row in committed_runs(
