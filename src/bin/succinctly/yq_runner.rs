@@ -1978,10 +1978,19 @@ fn apply_front_matter(
     let Some(mode) = front_matter else {
         return Ok((raw_bytes, resolved_format, None));
     };
-    let fm =
-        front_matter::split_front_matter(&raw_bytes).map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
-    let body = (mode == FrontMatterMode::Process).then(|| fm.body.to_vec());
-    Ok((fm.yaml.to_vec(), InputFormat::Yaml, body))
+    // yq splits any input: one without a complete front matter is read as yq reads it (#6910), so
+    // there is no refusal here and `name` stays for the callers' own errors.
+    let _ = name;
+    let fm = front_matter::split_front_matter(&raw_bytes);
+    // A front matter with no text is yq's empty document, read as an empty input is (#6910).
+    let yaml = if fm.yaml.is_empty() {
+        b"\n".to_vec()
+    } else {
+        fm.yaml.to_vec()
+    };
+    // `process` carries the closing line and the body (`None`: nothing closes the front matter).
+    let tail = (mode == FrontMatterMode::Process).then(|| fm.body.map(<[u8]>::to_vec));
+    Ok((yaml, InputFormat::Yaml, tail.map(Option::unwrap_or_default)))
 }
 
 /// One gathered input source: its bytes, resolved format, (only under
@@ -14023,9 +14032,6 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 // `--front-matter=process` opens its own leading `---` fence
                 // here; the body's closing fence + body text are appended
                 // after `buf_writer` is dropped, below.
-                if front_matter_body.is_some() {
-                    writeln!(buf_writer, "---")?;
-                }
 
                 // halt/halt_error (#791): tracks real per-document output
                 // only, separately from the speculative `---`/fence bytes
@@ -14116,7 +14122,8 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 any_real_output
             };
 
-            if let Some(body) = &front_matter_body {
+            // An empty body is a front matter that nothing closes: the closing line is never empty.
+            if let Some(body) = front_matter_body.as_ref().filter(|body| !body.is_empty()) {
                 // #1701 code review round 4: same fix as every other `---`
                 // writer -- but gated on `any_real_output`, not applied
                 // unconditionally: `output_buffer` at this point holds only
@@ -14133,8 +14140,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                         terminator_from_config(&output_config),
                     )?;
                 }
-                output_buffer.extend_from_slice(b"---");
-                output_buffer.extend_from_slice(front_matter::body_line_ending(body));
+                // The body starts with the closing line, written as the input had it (#6910).
                 output_buffer.extend_from_slice(body);
             }
 
@@ -14328,9 +14334,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 &args,
                 output_basis_format(&args, &input_files, source_format),
             );
-            if front_matter_body.is_some() {
-                writeln!(writer, "---")?;
-            }
+
             // Tracks "did this file's own document loop write any real
             // output" (#1701 code review round 4), separately from
             // `any_yaml_doc_output` above (invocation-wide, drives the
@@ -14422,7 +14426,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                     any_output_this_file = true;
                 }
             }
-            if let Some(body) = front_matter_body {
+            if let Some(body) = front_matter_body.filter(|body| !body.is_empty()) {
                 let line_ending = front_matter::body_line_ending(body);
                 // #1701 code review round 4: same fix as the `--inplace`
                 // path's closing fence -- gated on whether this file's
@@ -14436,14 +14440,15 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                         terminator_from_config(&file_output_config),
                     )?;
                 }
-                writer.write_all(b"---")?;
-                writer.write_all(line_ending)?;
+                // The body starts with the closing line, written as the input had it (#6910).
                 writer.write_all(body)?;
                 // A body with no trailing line break would otherwise run
                 // straight into the next file's opening fence (or whatever
                 // follows), corrupting the stream -- ensure one separates
-                // them, matching this body's own line-ending convention.
-                if !body.is_empty() && !body.ends_with(b"\n") {
+                // them, matching this body's own line-ending convention. The
+                // last file's own text is left as it was, as yq leaves it
+                // (#6910).
+                if file_idx + 1 < input_sources.len() && !body.ends_with(b"\n") {
                     writer.write_all(line_ending)?;
                 }
             }

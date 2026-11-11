@@ -648,6 +648,18 @@ These shapes still differ from yq after a mark, each captured from v4.53.3:
 - `%YAML 1.2` as the first line is an error in yq (`found incompatible YAML document`), and is read here.
 - A text with only a comment prints a blank line on the streaming routes, as in yq, and still prints the comment (or, for a write, keeps it above the result) on the DOM routes.
 
+### `--front-matter` splits as yq does; four rows still differ (#6910)
+
+The front matter is the text up to the first line that starts with `---` at column 0, after the input's own leading `---` line (blanks around it allowed); that line starts the body, which `process` writes back as it was.
+An input with no front matter, an unterminated one, a commented or indented opening line, and a `...` (which closes nothing) are read as yq reads them, where they were refused with `no front matter found` or `unterminated front matter`.
+The opening `---` is the front matter's own line, written back as the input had it (CRLF included) when the result is the front matter document.
+
+Still different:
+- a scalar read of a front matter that has an opening `---` (`--front-matter process '.a'` over `---` / `a: 1` / `---` / `body`): yq prints `1` / `---` / `body`, with no `---` before the `1`, and this prints one;
+- a filter that fails: yq prints nothing, and the closing line and the body are still written here;
+- a write over an empty input (`.a = "N"` over nothing): a blank line before `a: N`;
+- a front matter that is not one YAML document (`---` / `a: 1` / `...` / `body`): yq prints the first document and then fails, this fails at once.
+
 ### YAML 1.1 legacy numeric forms
 
 succinctly resolves plain scalars per the YAML **1.2** core schema
@@ -7078,8 +7090,7 @@ prints a bare `-` / `a:`, `line` is `1` where yq has `0`, and `@yaml` is `null` 
 A result that is a document with no content (`# c`, an empty input) is written once, with no blank line after it, by `select`, `(.)` and `..` as by `.`.
 Under `-0` the NUL replaces the line break the header ends in (`# c<NUL>`, and a lone NUL over an empty input), as in yq; with `--colors` a comment's span keeps its break, as yq's does.
 `--eval-all` over an empty input still differs: `select(true)` prints `null` for a blank line, and `.a, filename` writes a `---` between its results.
-Not covered: `--front-matter` on an empty input keeps its
-`no front matter found` error (yq prints `null`); `-` cannot be known to be empty before it is read, so an
+Not covered: `-` cannot be known to be empty before it is read, so an
 empty stdin mixed with empty files reads nothing at all; and `-i` over several files edits the file each
 document came from, where yq writes the result into the first file. A file holding only comments, `---` or a line
 break is a document and is read as one. A write to a comment-only file prints the write without the comment,

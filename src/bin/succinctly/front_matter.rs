@@ -4,49 +4,20 @@
 //! body content, matching real yq's front-matter convention (e.g. Markdown
 //! files with a YAML header).
 
-use std::fmt;
-
 use succinctly::text::line_break::line_break_len;
 
-/// The result of successfully splitting front matter from an input.
+/// The result of splitting front matter from an input.
 #[derive(Debug)]
 pub struct FrontMatter<'a> {
-    /// The YAML content between the opening and closing fence (exclusive).
+    /// The YAML text before the closing line, or all of it when nothing closes it: the opening
+    /// `---` line is part of it, since yq reads it as the header of the stream it evaluates, and
+    /// writes it back as it was when the result is that document.
     pub yaml: &'a [u8],
-    /// Everything after the closing fence line; empty if the input ends
-    /// immediately after the fence.
-    pub body: &'a [u8],
+    /// The closing line and everything after it (the closing line is the body's own first line, which
+    /// `--front-matter=process` writes back as it was), or `None` when no line closes the front
+    /// matter and there is no body.
+    pub body: Option<&'a [u8]>,
 }
-
-/// Errors produced when splitting front matter out of an input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FrontMatterError {
-    /// The input doesn't start with a `---` fence line.
-    NoFrontMatter,
-    /// A `---` fence was found but never closed with a matching `---`/`...`.
-    UnterminatedFrontMatter,
-}
-
-impl fmt::Display for FrontMatterError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NoFrontMatter => {
-                write!(
-                    f,
-                    "no front matter found (input must start with a `---` line)"
-                )
-            }
-            Self::UnterminatedFrontMatter => {
-                write!(
-                    f,
-                    "unterminated front matter (missing closing `---` or `...`)"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for FrontMatterError {}
 
 /// A leading UTF-8 BOM, if present, sits before the `---` fence rather than
 /// inside it -- common in Markdown files saved by Windows editors.
@@ -66,33 +37,31 @@ pub(crate) fn leading_bom_len(bytes: &[u8]) -> usize {
     }
 }
 
-/// Split `input` into its YAML front matter and trailing body.
+/// Split `input` into its YAML front matter and trailing body, as yq v4.53.3 does (#6910).
 ///
-/// The input must start with a line that is exactly `---` (trailing
-/// whitespace/`\r` ignored, and a leading UTF-8 BOM skipped). The front
-/// matter ends at the next line that is exactly `---` or `...` (mirroring
-/// YAML's own end-of-document marker). Everything after that line is
-/// returned as the body, unparsed.
-pub fn split_front_matter(input: &[u8]) -> Result<FrontMatter<'_>, FrontMatterError> {
+/// A first line that is `---` (blanks and a `\r` around it ignored, and a leading UTF-8 BOM
+/// skipped) opens the front matter. The front matter ends at the next line that
+/// starts with `---` at column 0 (`---`, `---  `, `--- # c`, `---x`, `----`), which is the body's first
+/// line; an indented `---` and a `...` close nothing. A first line that is not a fence is the front
+/// matter's own (`# c` / `---` / `a: 1` is the front matter `# c`), and an input with no closing line is
+/// all front matter and has no body, so there is no input this refuses.
+pub fn split_front_matter(input: &[u8]) -> FrontMatter<'_> {
     let input = input.strip_prefix(UTF8_BOM).unwrap_or(input);
     let mut lines = LineScanner::new(input);
-
-    let first = lines.next().ok_or(FrontMatterError::NoFrontMatter)?;
-    if !is_fence_line(first.content) {
-        return Err(FrontMatterError::NoFrontMatter);
-    }
-
-    let yaml_start = first.end;
-    loop {
-        let line = lines
-            .next()
-            .ok_or(FrontMatterError::UnterminatedFrontMatter)?;
-        if is_fence_line(line.content) || is_end_marker(line.content) {
-            return Ok(FrontMatter {
-                yaml: &input[yaml_start..line.start],
-                body: &input[line.end..],
-            });
+    // The first line is the front matter's own, whatever it is: it opens the front matter when it is
+    // a fence, and closes nothing when it starts with `---` and is not one.
+    lines.next();
+    for line in lines {
+        if line.content.starts_with(b"---") {
+            return FrontMatter {
+                yaml: &input[..line.start],
+                body: Some(&input[line.start..]),
+            };
         }
+    }
+    FrontMatter {
+        yaml: input,
+        body: None,
     }
 }
 
@@ -113,29 +82,11 @@ pub(crate) fn body_line_ending(body: &[u8]) -> &'static [u8] {
     b"\n"
 }
 
-fn is_fence_line(content: &[u8]) -> bool {
-    trim_trailing_ws(content) == b"---"
-}
-
-fn is_end_marker(content: &[u8]) -> bool {
-    trim_trailing_ws(content) == b"..."
-}
-
-fn trim_trailing_ws(content: &[u8]) -> &[u8] {
-    let end = content
-        .iter()
-        .rposition(|b| !matches!(b, b' ' | b'\t' | b'\r'))
-        .map_or(0, |i| i + 1);
-    &content[..end]
-}
-
 struct Line<'a> {
     /// Line content, excluding the line terminator.
     content: &'a [u8],
     /// Offset of `content`'s first byte.
     start: usize,
-    /// Offset right after the line terminator (or end of input).
-    end: usize,
 }
 
 struct LineScanner<'a> {
@@ -161,12 +112,10 @@ impl<'a> Iterator for LineScanner<'a> {
         while i < self.input.len() {
             let len = line_break_len(self.input, i);
             if len > 0 {
-                let end = i + len;
-                self.pos = end;
+                self.pos = i + len;
                 return Some(Line {
                     content: &self.input[start..i],
                     start,
-                    end,
                 });
             }
             i += 1;
@@ -175,7 +124,6 @@ impl<'a> Iterator for LineScanner<'a> {
         Some(Line {
             content: &self.input[start..],
             start,
-            end: self.input.len(),
         })
     }
 }
@@ -184,111 +132,101 @@ impl<'a> Iterator for LineScanner<'a> {
 mod tests {
     use super::*;
 
+    /// (input, front matter text, body) as yq v4.53.3 splits them (#6910): the front matter is the text
+    /// before the closing line and keeps its opening `---`, the body starts with the closing line.
     #[test]
-    fn no_leading_fence_errors() {
-        let err = split_front_matter(b"title: foo\nbody text\n").unwrap_err();
-        assert_eq!(err, FrontMatterError::NoFrontMatter);
-    }
-
-    #[test]
-    fn empty_input_errors() {
-        let err = split_front_matter(b"").unwrap_err();
-        assert_eq!(err, FrontMatterError::NoFrontMatter);
-    }
-
-    #[test]
-    fn basic_dash_terminator() {
-        let fm = split_front_matter(b"---\ntitle: foo\n---\n# Body\n").unwrap();
-        assert_eq!(fm.yaml, b"title: foo\n");
-        assert_eq!(fm.body, b"# Body\n");
-    }
-
-    #[test]
-    fn dots_terminator() {
-        let fm = split_front_matter(b"---\ntitle: foo\n...\nBody text\n").unwrap();
-        assert_eq!(fm.yaml, b"title: foo\n");
-        assert_eq!(fm.body, b"Body text\n");
-    }
-
-    #[test]
-    fn empty_body_at_eof() {
-        let fm = split_front_matter(b"---\ntitle: foo\n---\n").unwrap();
-        assert_eq!(fm.yaml, b"title: foo\n");
-        assert_eq!(fm.body, b"");
-    }
-
-    #[test]
-    fn empty_body_at_eof_no_trailing_newline() {
-        let fm = split_front_matter(b"---\ntitle: foo\n---").unwrap();
-        assert_eq!(fm.yaml, b"title: foo\n");
-        assert_eq!(fm.body, b"");
-    }
-
-    #[test]
-    fn empty_front_matter_block() {
-        let fm = split_front_matter(b"---\n---\nBody\n").unwrap();
-        assert_eq!(fm.yaml, b"");
-        assert_eq!(fm.body, b"Body\n");
-    }
-
-    #[test]
-    fn unterminated_errors() {
-        let err = split_front_matter(b"---\ntitle: foo\nno closing fence\n").unwrap_err();
-        assert_eq!(err, FrontMatterError::UnterminatedFrontMatter);
-    }
-
-    #[test]
-    fn opening_fence_only_no_newline_is_unterminated() {
-        let err = split_front_matter(b"---").unwrap_err();
-        assert_eq!(err, FrontMatterError::UnterminatedFrontMatter);
-    }
-
-    #[test]
-    fn crlf_line_endings() {
-        let fm = split_front_matter(b"---\r\ntitle: foo\r\n---\r\nBody\r\n").unwrap();
-        assert_eq!(fm.yaml, b"title: foo\r\n");
-        assert_eq!(fm.body, b"Body\r\n");
-    }
-
-    #[test]
-    fn bare_cr_line_endings() {
-        // Classic-Mac (`\r`-only) line endings: a `\n`-only scan would run
-        // straight past every break and collapse the whole input into one
-        // "line", the same failure class #324 fixed for the YAML parser.
-        let fm = split_front_matter(b"---\rtitle: foo\r---\rBody\r").unwrap();
-        assert_eq!(fm.yaml, b"title: foo\r");
-        assert_eq!(fm.body, b"Body\r");
-    }
-
-    #[test]
-    fn leading_utf8_bom_is_skipped() {
-        let fm = split_front_matter(b"\xEF\xBB\xBF---\ntitle: foo\n---\nBody\n").unwrap();
-        assert_eq!(fm.yaml, b"title: foo\n");
-        assert_eq!(fm.body, b"Body\n");
-    }
-
-    #[test]
-    fn multiple_yaml_lines_preserved_verbatim() {
-        let fm = split_front_matter(b"---\ntitle: foo\ntags: [a, b]\n---\nBody\n").unwrap();
-        assert_eq!(fm.yaml, b"title: foo\ntags: [a, b]\n");
-        assert_eq!(fm.body, b"Body\n");
-    }
-
-    #[test]
-    fn trailing_whitespace_on_fence_lines_tolerated() {
-        let fm = split_front_matter(b"---   \ntitle: foo\n---\t\nBody\n").unwrap();
-        assert_eq!(fm.yaml, b"title: foo\n");
-        assert_eq!(fm.body, b"Body\n");
-    }
-
-    #[test]
-    fn indented_dashes_are_not_fences() {
-        // YAML document markers must start at column 0; an indented `---`
-        // inside the front matter (e.g. a nested key) must not be mistaken
-        // for the closing fence.
-        let fm = split_front_matter(b"---\nkey:\n  ---\n---\nBody\n").unwrap();
-        assert_eq!(fm.yaml, b"key:\n  ---\n");
-        assert_eq!(fm.body, b"Body\n");
+    fn splits_as_yq_does() {
+        let rows: &[(&[u8], &[u8], Option<&[u8]>)] = &[
+            (
+                b"---\ntitle: foo\n---\n# Body\n",
+                b"---\ntitle: foo\n",
+                Some(b"---\n# Body\n"),
+            ),
+            // An empty body at the end of the input, with and without the line break.
+            (
+                b"---\ntitle: foo\n---\n",
+                b"---\ntitle: foo\n",
+                Some(b"---\n"),
+            ),
+            (b"---\ntitle: foo\n---", b"---\ntitle: foo\n", Some(b"---")),
+            // An empty front matter block.
+            (b"---\n---\nBody\n", b"---\n", Some(b"---\nBody\n")),
+            // `...` closes nothing: it is part of the front matter, and the input has no body.
+            (
+                b"---\ntitle: foo\n...\nBody text\n",
+                b"---\ntitle: foo\n...\nBody text\n",
+                None,
+            ),
+            // No closing line: all front matter, no body.
+            (
+                b"---\ntitle: foo\nno closing fence\n",
+                b"---\ntitle: foo\nno closing fence\n",
+                None,
+            ),
+            (b"---", b"---", None),
+            (b"---\n", b"---\n", None),
+            // No opening fence: the first line is the front matter's own.
+            (b"title: foo\nbody text\n", b"title: foo\nbody text\n", None),
+            (b"", b"", None),
+            (
+                b"# c\n---\na: 1\n---\nbody\n",
+                b"# c\n",
+                Some(b"---\na: 1\n---\nbody\n"),
+            ),
+            (
+                b"\n---\na: 1\n---\nbody\n",
+                b"\n",
+                Some(b"---\na: 1\n---\nbody\n"),
+            ),
+            // The closing line only has to start with `---` at column 0 and is kept as it was written.
+            (
+                b" ---\na: 1\n---  \nbody\n",
+                b" ---\na: 1\n",
+                Some(b"---  \nbody\n"),
+            ),
+            (
+                b"---\na: 1\n--- # c\nbody\n",
+                b"---\na: 1\n",
+                Some(b"--- # c\nbody\n"),
+            ),
+            (
+                b"---\na: 1\n----\nbody\n",
+                b"---\na: 1\n",
+                Some(b"----\nbody\n"),
+            ),
+            // An indented `---` closes nothing.
+            (
+                b"---\nkey:\n  ---\n---\nBody\n",
+                b"---\nkey:\n  ---\n",
+                Some(b"---\nBody\n"),
+            ),
+            // CRLF and `\r`-only line endings.
+            (
+                b"---\r\ntitle: foo\r\n---\r\nBody\r\n",
+                b"---\r\ntitle: foo\r\n",
+                Some(b"---\r\nBody\r\n"),
+            ),
+            (
+                b"---\rtitle: foo\r---\rBody\r",
+                b"---\rtitle: foo\r",
+                Some(b"---\rBody\r"),
+            ),
+            // A UTF-8 BOM before the fence is dropped.
+            (
+                b"\xEF\xBB\xBF---\nt: 1\n---\nB\n",
+                b"---\nt: 1\n",
+                Some(b"---\nB\n"),
+            ),
+        ];
+        for &(input, yaml, body) in rows {
+            let fm = split_front_matter(input);
+            assert_eq!(
+                (fm.yaml, fm.body),
+                (yaml, body),
+                "{:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
     }
 
     #[test]
