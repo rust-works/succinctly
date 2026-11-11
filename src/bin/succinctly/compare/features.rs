@@ -242,6 +242,7 @@ mod tests {
     fn e(exit: i32, out: &str, err: &str) -> Exec {
         Exec {
             exit: Some(exit),
+            signal: None,
             stdout: out.into(),
             stderr: err.into(),
             timed_out: false,

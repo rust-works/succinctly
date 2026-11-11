@@ -32,7 +32,14 @@ pub const SLOW_ROW_REPS: usize = 21;
 pub const SLOW_ROW_EXTRA_BUDGET_MS: f64 = 30_000.0;
 
 /// Tiers in ascending size; a query's `max_tier` caps how far up it runs.
-pub const TIERS: &[&str] = &["1mb", "10mb", "100mb"];
+pub const TIERS: &[&str] = &["1mb", "10mb", "100mb", HUGE_TIER];
+
+/// The opt-in tier above 100 MB (`--huge`, #6915). Its rows are kept apart from the headline
+/// ones (`Results::perf_huge`), time and measure one run where a smaller tier takes several, and
+/// record how each tool ended, so a kill or a deadline is a result and not a missing row.
+pub const HUGE_TIER: &str = "1gb";
+/// Timed repetitions of a [`HUGE_TIER`] row, as at 100 MB: a repetition is a minute or more.
+pub const HUGE_REPS: usize = 3;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct InputSpec {
@@ -299,6 +306,39 @@ pub fn ensure_input(
 pub enum Gate {
     Match,
     Differs,
+    /// A tool was killed by a signal or ran past the deadline on a [`HUGE_TIER`] row, so there is
+    /// no output to compare. Its exit status and peak memory are recorded, and it is no timing
+    /// row (#6915).
+    Incomplete,
+}
+
+/// How one tool's gate run ended, recorded for a [`HUGE_TIER`] row (#6915): an out-of-memory
+/// kill, a crash and a refusal are results there, not a hole in the table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunEnd {
+    /// The exit status; `None` when a signal or the deadline ended the run.
+    pub exit: Option<i32>,
+    /// The signal that killed it (`9`: the kernel's out-of-memory kill, or macOS's jetsam).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+    /// It ran past the deadline and was killed by the harness.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub timed_out: bool,
+}
+
+impl RunEnd {
+    fn of(e: &super::exec::Exec) -> Self {
+        RunEnd {
+            exit: e.exit,
+            signal: e.signal,
+            timed_out: e.timed_out,
+        }
+    }
+
+    /// No exit status to compare: a signal or the deadline ended it.
+    pub fn killed(&self) -> bool {
+        self.signal.is_some() || self.timed_out
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -317,6 +357,10 @@ pub struct ToolResult {
     /// count that machine load cannot move, beside the wall-clock. `None` without
     /// `--cachegrind`, on a row too large to run under valgrind, or where valgrind failed.
     pub instructions: Option<u64>,
+    /// How the gate run ended. Recorded on [`HUGE_TIER`] rows only, so every other row serializes
+    /// as it always has.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<RunEnd>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -348,6 +392,10 @@ pub struct PerfRow {
     pub ir_ratio_primary: Option<f64>,
     /// Any tool's CV exceeds 5%.
     pub noisy: bool,
+    /// The input file's size in bytes, recorded on [`HUGE_TIER`] rows so the report can state
+    /// peak memory as a multiple of the input (#6915).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_bytes: Option<u64>,
 }
 
 /// The command line of one run: the flags, the filter, then the input file. `@INPUT@` in
@@ -697,6 +745,27 @@ fn ir_once(
     count
 }
 
+/// A tool's entry on a row that was not timed: how its gate run ended and the peak memory of one
+/// untimed run (#6915).
+fn untimed_result(
+    tool: &Tool,
+    args: &[String],
+    cwd: &Path,
+    feed: Option<&[u8]>,
+    end: &RunEnd,
+) -> ToolResult {
+    let mem = mem_once(tool, args, cwd, feed);
+    ToolResult {
+        tool: tool.name.clone(),
+        stats: None,
+        cv_pct: None,
+        peak_rss_kb: mem.rss_kb,
+        private_kb: mem.private_kb,
+        instructions: None,
+        end: Some(end.clone()),
+    }
+}
+
 /// Run one row. `tools[0]` is the subject, `tools[1]` the primary reference,
 /// `tools[2]` (optional) the secondary.
 pub fn run_row(
@@ -731,6 +800,31 @@ fn run_row_over(
     valgrind: Option<&Path>,
     slow_ms: f64,
 ) -> Result<PerfRow> {
+    run_row_bounded(
+        tools,
+        q,
+        input,
+        inputs_dir,
+        reps,
+        valgrind,
+        slow_ms,
+        PERF_DEADLINE,
+    )
+}
+
+/// [`run_row_over`] with the gate's deadline of the caller's choosing: a test cannot wait out
+/// [`PERF_DEADLINE`] to see a run recorded as having exceeded it (#6915).
+#[allow(clippy::too_many_arguments)]
+fn run_row_bounded(
+    tools: &[Tool],
+    q: &PerfQuery,
+    input: Option<&InputSpec>,
+    inputs_dir: &Path,
+    reps: usize,
+    valgrind: Option<&Path>,
+    slow_ms: f64,
+    deadline: std::time::Duration,
+) -> Result<PerfRow> {
     let file = input.map(|i| format!("{}.json", i.id));
     let args = args_for(q, file.as_deref());
     // A stdin row reads its input once and pipes it into every run, the gate's included.
@@ -741,29 +835,32 @@ fn run_row_over(
         _ => None,
     };
     let feed = fed.as_deref();
+    // The opt-in 1 GB tier records how each tool ended and times one run where a smaller tier
+    // times several (#6915).
+    let huge = input.is_some_and(|i| i.tier == HUGE_TIER);
     // Output-identity gate: hash each tool's stdout, compare with its exit status.
     let mut digest = vec![];
+    let mut ends = vec![];
     for t in tools {
-        let e = exec_within(
-            t,
-            &args,
-            feed.unwrap_or_default(),
-            inputs_dir,
-            PERF_DEADLINE,
-        )?;
-        if e.timed_out {
+        let e = exec_within(t, &args, feed.unwrap_or_default(), inputs_dir, deadline)?;
+        // Past the deadline a smaller row has nothing to say and aborts the run; a 1 GB row is
+        // the one where a slow tool is the finding, so it is recorded.
+        if e.timed_out && !huge {
             bail!(
                 "{} did not finish `{}` on {:?} within {:?}",
                 t.name,
                 q.id,
                 file,
-                PERF_DEADLINE
+                deadline
             );
         }
+        ends.push(RunEnd::of(&e));
         digest.push((e.exit, sha256_hex(&e.stdout)));
     }
     let gate_of = |i: usize| {
-        if digest[i] == digest[0] {
+        if huge && (ends[0].killed() || ends[i].killed()) {
+            Gate::Incomplete
+        } else if digest[i] == digest[0] {
             Gate::Match
         } else {
             Gate::Differs
@@ -787,14 +884,36 @@ fn run_row_over(
         private_ratio_primary: None,
         ir_ratio_primary: None,
         noisy: false,
+        input_bytes: None,
     };
+    if huge {
+        row.input_bytes = file
+            .as_ref()
+            .and_then(|f| std::fs::metadata(inputs_dir.join(f)).ok())
+            .map(|m| m.len());
+    }
+    // How many untimed runs each memory figure is the median of.
+    let mem_runs = if huge { 1 } else { 3 };
+    if gate == Gate::Incomplete || (huge && gate == Gate::Differs) {
+        // No timing either way, but on a 1 GB row what each tool did is the finding: the peak
+        // memory a killed tool reached, or the exit status of one that refused (#6915).
+        for (i, t) in tools.iter().enumerate() {
+            row.tools
+                .push(untimed_result(t, &args, inputs_dir, feed, &ends[i]));
+        }
+        return Ok(row);
+    }
     if gate == Gate::Differs || reps == 0 {
         return Ok(row);
     }
     let mut samples: Vec<Vec<f64>> = vec![vec![]; tools.len()];
-    // One untimed warm-up of each, then rotate the starting tool every repetition.
-    for t in tools {
-        time_once(t, &args, inputs_dir, feed)?;
+    // One untimed warm-up of each, then rotate the starting tool every repetition. A 1 GB row's
+    // gate run has read the file into the page cache already, and a second run of a tool that
+    // takes minutes is not worth its cost.
+    if !huge {
+        for t in tools {
+            time_once(t, &args, inputs_dir, feed)?;
+        }
     }
     let mut rep = 0;
     let mut total = reps;
@@ -810,7 +929,7 @@ fn run_row_over(
     }
     row.reps = total;
     for (i, t) in tools.iter().enumerate() {
-        let mem: Vec<MemSample> = (0..3)
+        let mem: Vec<MemSample> = (0..mem_runs)
             .map(|_| mem_once(t, &args, inputs_dir, feed))
             .collect();
         let rss = median_u64(mem.iter().filter_map(|m| m.rss_kb).collect());
@@ -825,6 +944,7 @@ fn run_row_over(
             instructions: valgrind
                 .filter(|_| i < 2)
                 .and_then(|v| ir_once(v, t, &args, inputs_dir, feed)),
+            end: huge.then(|| ends[i].clone()),
         });
     }
     row.noisy = row.tools.iter().any(|t| t.cv_pct.is_some_and(|c| c > 5.0));
@@ -1448,5 +1568,236 @@ mod tests {
                 && row.speedup_secondary.is_none()
                 && row.secondary_over_primary.is_none()
         );
+    }
+
+    /// The opt-in tier is reached only by naming it: a `1gb` cap does not make a row run under
+    /// `--full`'s `100mb` top (#6915).
+    #[test]
+    fn the_one_gigabyte_tier_runs_only_when_it_is_the_top_tier() {
+        let qs = parse_queries("a\t-\t.\tusers\t1gb\nb\t-\t.\tusers\t100mb\n").unwrap();
+        let inputs = [
+            spec("u100", "users", "100mb"),
+            spec("u1g", "users", HUGE_TIER),
+        ];
+        let ids = |top: &str| -> Vec<String> {
+            plan(&qs, &inputs, top)
+                .iter()
+                .map(|(q, i)| format!("{}@{}", q.id, i.map_or("none", |i| i.id.as_str())))
+                .collect()
+        };
+        assert_eq!(ids("100mb"), ["a@u100", "b@u100"]);
+        assert_eq!(ids(HUGE_TIER), ["a@u100", "a@u1g", "b@u100"]);
+        assert!(parse_queries("a\t-\t.\tusers\t1tb\n").is_err());
+    }
+
+    /// The six rows #6915 names are the ones capped at `1gb`, and each has a `1gb` input to run
+    /// on: a row capped there with no input would run nothing and say nothing.
+    #[test]
+    fn the_checked_in_one_gigabyte_rows_are_the_six_the_issue_names_and_each_has_an_input() {
+        let qs = parse_queries(include_str!("../../../../comparison/jq/queries/perf.tsv")).unwrap();
+        let (m, _) = super::super::manifest::Manifest::parse(include_str!(
+            "../../../../comparison/jq/manifest.toml"
+        ))
+        .unwrap();
+        let mut capped: Vec<&str> = qs
+            .iter()
+            .filter(|q| q.max_tier == HUGE_TIER)
+            .map(|q| q.id.as_str())
+            .collect();
+        capped.sort_unstable();
+        assert_eq!(
+            capped,
+            [
+                "identity",
+                "identity_compact",
+                "ndjson_field",
+                "ndjson_inputs_first",
+                "ndjson_inputs_reduce",
+                "users_first_early_exit"
+            ]
+        );
+        let planned = plan(&qs, &m.inputs, HUGE_TIER);
+        for id in &capped {
+            assert!(
+                planned
+                    .iter()
+                    .any(|(q, i)| q.id == *id && i.is_some_and(|i| i.tier == HUGE_TIER)),
+                "{id} has no 1gb input"
+            );
+        }
+        // And nothing else reaches it: a plain `--full` plans no 1gb row.
+        assert!(plan(&qs, &m.inputs, "100mb")
+            .iter()
+            .all(|(_, i)| i.map_or(true, |i| i.tier != HUGE_TIER)));
+        for i in m.inputs.iter().filter(|i| i.tier == HUGE_TIER) {
+            assert_eq!(i.sha256.len(), 64, "{} is pinned", i.id);
+        }
+    }
+
+    fn huge_setup(name: &str) -> (PathBuf, PerfQuery, InputSpec) {
+        let dir = scratch(name);
+        std::fs::write(dir.join("u.json"), b"{\"users\":[]}\n").unwrap();
+        let q = parse_queries("q\t-\tx\tusers\t1gb\n").unwrap().remove(0);
+        (dir, q, spec("u", "users", HUGE_TIER))
+    }
+
+    /// A 1 GB row that runs cleanly is timed like any other, and records how each tool ended
+    /// and how big the input was; a smaller row records neither, so its json is unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn a_clean_huge_row_records_exit_status_and_input_size_and_a_small_row_does_not() {
+        let (dir, q, input) = huge_setup("huge-clean");
+        let t = sh("t", "echo ok");
+        let row = run_row_over(
+            &[t.clone(), t.clone()],
+            &q,
+            Some(&input),
+            &dir,
+            3,
+            None,
+            f64::MAX,
+        )
+        .unwrap();
+        assert_eq!(row.gate, Gate::Match);
+        assert_eq!(row.input_bytes, Some(13));
+        let clean = RunEnd {
+            exit: Some(0),
+            signal: None,
+            timed_out: false,
+        };
+        for tr in &row.tools {
+            assert_eq!(tr.end.as_ref(), Some(&clean));
+            assert_eq!(tr.stats.as_ref().unwrap().n, 3, "three timed runs");
+        }
+        // The same program on a 1 MB input leaves both fields out of the json.
+        let small = run_row_over(
+            &[t.clone(), t],
+            &q,
+            Some(&spec("u", "users", "1mb")),
+            &dir,
+            3,
+            None,
+            f64::MAX,
+        )
+        .unwrap();
+        assert!(small.input_bytes.is_none() && small.tools.iter().all(|t| t.end.is_none()));
+        let json = serde_json::to_value(&small).unwrap();
+        assert!(json.get("input_bytes").is_none());
+        assert!(json["tools"][0].get("end").is_none());
+        // And a clean end omits its optional keys.
+        assert_eq!(
+            serde_json::to_value(&clean).unwrap(),
+            serde_json::json!({"exit": 0})
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A subject the kernel killed is a result on a 1 GB row: the row is `Incomplete`, untimed,
+    /// with the signal, the reference's clean exit and a peak-memory entry for each tool.
+    #[cfg(unix)]
+    #[test]
+    fn a_tool_killed_on_a_huge_row_is_an_incomplete_row_with_its_signal() {
+        let (dir, q, input) = huge_setup("huge-killed");
+        let (subject, reference) = (sh("sub", "kill -9 $$"), sh("ref", "echo ok"));
+        let row = run_row_over(
+            &[subject, reference],
+            &q,
+            Some(&input),
+            &dir,
+            3,
+            None,
+            f64::MAX,
+        )
+        .unwrap();
+        assert_eq!(row.gate, Gate::Incomplete);
+        assert!(row.speedup_primary.is_none() && row.reps == 0);
+        assert_eq!(row.tools.len(), 2, "both tools are listed");
+        let (s, r) = (
+            row.tools[0].end.as_ref().unwrap(),
+            row.tools[1].end.as_ref().unwrap(),
+        );
+        assert_eq!((s.signal, s.exit, s.killed()), (Some(9), None, true));
+        assert_eq!((r.signal, r.exit, r.killed()), (None, Some(0), false));
+        assert!(row.tools.iter().all(|t| t.stats.is_none()));
+        // The same kill on a 1 MB row is an output difference, as it always was.
+        let small = run_row_over(
+            &[sh("sub", "kill -9 $$"), sh("ref", "echo ok")],
+            &q,
+            Some(&spec("u", "users", "1mb")),
+            &dir,
+            3,
+            None,
+            f64::MAX,
+        )
+        .unwrap();
+        assert_eq!(small.gate, Gate::Differs);
+        assert!(small.tools.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 1 GB tool past the deadline is recorded as having run past it, where a smaller row's
+    /// deadline still aborts the run.
+    #[cfg(unix)]
+    #[test]
+    fn a_huge_row_records_a_deadline_where_a_small_row_aborts() {
+        let (dir, q, input) = huge_setup("huge-deadline");
+        let slow = || sh("slow", "sleep 5");
+        let ok = || sh("ref", "echo ok");
+        let short = std::time::Duration::from_millis(200);
+        let row = run_row_bounded(
+            &[slow(), ok()],
+            &q,
+            Some(&input),
+            &dir,
+            3,
+            None,
+            f64::MAX,
+            short,
+        )
+        .unwrap();
+        assert_eq!(row.gate, Gate::Incomplete);
+        let end = row.tools[0].end.as_ref().unwrap();
+        assert!(end.timed_out && end.killed() && end.exit.is_none());
+        let err = run_row_bounded(
+            &[slow(), ok()],
+            &q,
+            Some(&spec("u", "users", "1mb")),
+            &dir,
+            3,
+            None,
+            f64::MAX,
+            short,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("did not finish"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A refusal is a result too: both tools finished but exited differently, so the row stays a
+    /// correctness row, and on a 1 GB row it still lists each tool's exit status.
+    #[cfg(unix)]
+    #[test]
+    fn a_refusal_on_a_huge_row_keeps_its_exit_status() {
+        let (dir, q, input) = huge_setup("huge-refusal");
+        let row = run_row_over(
+            &[sh("sub", "exit 5"), sh("ref", "echo ok")],
+            &q,
+            Some(&input),
+            &dir,
+            3,
+            None,
+            f64::MAX,
+        )
+        .unwrap();
+        assert_eq!(row.gate, Gate::Differs);
+        assert!(row.speedup_primary.is_none());
+        let exits: Vec<Option<i32>> = row
+            .tools
+            .iter()
+            .map(|t| t.end.as_ref().unwrap().exit)
+            .collect();
+        assert_eq!(exits, [Some(5), Some(0)]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -17,6 +17,9 @@ pub const PERF_DEADLINE: Duration = Duration::from_secs(900);
 pub struct Exec {
     /// `None` when killed by a signal or by the deadline.
     pub exit: Option<i32>,
+    /// The signal that killed the process (`9` for an out-of-memory kill), `None` for a normal
+    /// exit, the deadline's kill and platforms without signals (#6915).
+    pub signal: Option<i32>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub timed_out: bool,
@@ -46,6 +49,17 @@ pub fn exec_env(
     env: &[(String, String)],
 ) -> Result<Exec> {
     exec_with(tool, args, stdin, cwd, DEADLINE, env)
+}
+
+/// The signal that ended a process, where the platform has them.
+#[cfg(unix)]
+pub fn signal_of(status: &std::process::ExitStatus) -> Option<i32> {
+    std::os::unix::process::ExitStatusExt::signal(status)
+}
+
+#[cfg(not(unix))]
+pub fn signal_of(_: &std::process::ExitStatus) -> Option<i32> {
+    None
 }
 
 pub fn exec_within(
@@ -106,20 +120,21 @@ pub fn exec_with(
         v
     });
     let start = Instant::now();
-    let (status, timed_out) = loop {
+    let (status, signal, timed_out) = loop {
         if let Some(s) = child.try_wait()? {
-            break (s.code(), false);
+            break (s.code(), signal_of(&s), false);
         }
         if start.elapsed() > deadline {
             let _ = child.kill();
             let _ = child.wait();
-            break (None, true);
+            break (None, None, true);
         }
         std::thread::sleep(Duration::from_millis(1));
     };
     let _ = writer.join();
     Ok(Exec {
         exit: status,
+        signal,
         stdout: ro.join().unwrap_or_default(),
         stderr: re.join().unwrap_or_default(),
         timed_out,

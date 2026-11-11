@@ -197,6 +197,7 @@ mod tests {
     fn e(exit: Option<i32>, err: &str, timed_out: bool) -> Exec {
         Exec {
             exit,
+            signal: None,
             stdout: vec![],
             stderr: err.into(),
             timed_out,

@@ -613,7 +613,7 @@ fn row_ratio(x: &PerfRow, v: Option<f64>) -> String {
 
 fn perf_sections(s: &mut String, r: &Results) {
     // A run of only stdin rows (`--query _stdin`) has an empty `perf`, and still reports.
-    if r.perf.is_empty() && r.perf_stdin.is_empty() {
+    if r.perf.is_empty() && r.perf_stdin.is_empty() && r.perf_huge.is_empty() {
         return;
     }
     let _ = writeln!(
@@ -639,6 +639,7 @@ fn perf_sections(s: &mut String, r: &Results) {
         .perf
         .iter()
         .chain(&r.perf_stdin)
+        .chain(&r.perf_huge)
         .filter(|x| x.gate == Gate::Differs)
         .collect();
     if !wrong.is_empty() {
@@ -719,6 +720,129 @@ fn perf_sections(s: &mut String, r: &Results) {
         .collect();
     instruction_section(s, &counted);
     stdin_section(s, &r.perf, &r.perf_stdin);
+    huge_section(s, &r.perf, &r.perf_huge);
+}
+
+/// `kb` KiB as MiB, for a table cell.
+fn mib(kb: Option<u64>) -> String {
+    kb.map_or_else(|| "n/a".into(), |v| format!("{:.1}", v as f64 / 1024.0))
+}
+
+/// How a tool's gate run ended, as a table cell (#6915).
+fn ended(end: Option<&perf::RunEnd>) -> String {
+    let Some(e) = end else {
+        return "n/a".into();
+    };
+    if e.timed_out {
+        "deadline".into()
+    } else if let Some(sig) = e.signal {
+        match sig {
+            9 => "killed (SIGKILL)".into(),
+            _ => format!("killed (signal {sig})"),
+        }
+    } else {
+        e.exit.map_or_else(|| "n/a".into(), |c| format!("exit {c}"))
+    }
+}
+
+/// The 1 GB tier (`--huge`, #6915): per row, how each tool ended, its time, and its peak memory as
+/// a multiple of the input, with the same query's 100 MB figures beside it so the growth with size
+/// is visible. A tool that was killed or ran past the deadline has no time, and its peak memory is
+/// what it reached.
+fn huge_section(s: &mut String, file_rows: &[PerfRow], rows: &[PerfRow]) {
+    if rows.is_empty() {
+        return;
+    }
+    let _ = writeln!(s, "\n## D/E. 1 GB tier (`--huge`)\n");
+    let _ = writeln!(
+        s,
+        "Above 100 MB both tools fit in RAM on the machines this is run on, so a memory difference \
+         that is a ratio at 100 MB can be pass/fail here. These rows are the streaming and early-exit \
+         queries (and `identity`), run on generated inputs of about 1 GB with a fixed seed, and are kept \
+         out of every figure above. Each tool is timed {} times, interleaved (its first, gating \
+         run is the warm-up), with one untimed run for memory, so a time here is a median of {} \
+         and a memory figure a single run. A tool that is killed by a signal or runs past the \
+         {} s deadline has no time: its exit status or signal and the peak memory it reached are \
+         the result. `RSS ÷ input` is peak RSS over the input file's size; private memory is read as \
+         in the table above. The 100 MB columns are the same query on the 100 MB input of the same \
+         shape, from this run when it has one.\n",
+        perf::HUGE_REPS,
+        perf::HUGE_REPS,
+        super::exec::PERF_DEADLINE.as_secs()
+    );
+    let _ = writeln!(
+        s,
+        "| Query | Input | Outcome | speedup vs 1.7.1 | at 100 MB | RSS ratio | at 100 MB | private ratio | at 100 MB |"
+    );
+    let _ = writeln!(
+        s,
+        "|-------|-------|---------|------------------|-----------|-----------|-----------|---------------|-----------|"
+    );
+    for x in rows {
+        let twin = x
+            .input
+            .strip_suffix(&format!("-{}", perf::HUGE_TIER))
+            .and_then(|shape| {
+                let id = format!("{shape}-100mb");
+                file_rows
+                    .iter()
+                    .find(|f| f.query == x.query && f.input == id)
+            });
+        let outcome = match x.gate {
+            Gate::Match => "match",
+            Gate::Differs => "output differs",
+            Gate::Incomplete => "incomplete",
+        };
+        let _ = writeln!(
+            s,
+            "| {} | {} | {outcome} | {} | {} | {} | {} | {} | {} |",
+            x.query,
+            x.input,
+            row_ratio(x, x.speedup_primary),
+            twin.map_or_else(|| "n/a".into(), |t| row_ratio(t, t.speedup_primary)),
+            ratio(x.rss_ratio_primary),
+            twin.map_or_else(|| "n/a".into(), |t| ratio(t.rss_ratio_primary)),
+            ratio(x.private_ratio_primary),
+            twin.map_or_else(|| "n/a".into(), |t| ratio(t.private_ratio_primary)),
+        );
+    }
+    let _ = writeln!(
+        s,
+        "\n| Query | Input | Input MiB | Tool | Ended | median ms | min ms | RSS MiB | RSS ÷ input | private MiB | private ÷ input |"
+    );
+    let _ = writeln!(
+        s,
+        "|-------|-------|-----------|------|-------|-----------|--------|---------|-------------|-------------|-----------------|"
+    );
+    for x in rows {
+        let input_kb = x.input_bytes.map(|b| b / 1024);
+        let per_input = |v: Option<u64>| match (v, input_kb) {
+            (Some(v), Some(i)) if i > 0 => format!("{:.2}x", v as f64 / i as f64),
+            _ => "n/a".into(),
+        };
+        for t in &x.tools {
+            let _ = writeln!(
+                s,
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                x.query,
+                x.input,
+                mib(input_kb),
+                t.tool,
+                ended(t.end.as_ref()),
+                t.stats
+                    .as_ref()
+                    .map_or_else(|| "n/a".into(), |st| format!("{:.0}", st.median_ms)),
+                t.stats
+                    .as_ref()
+                    .map_or_else(|| "n/a".into(), |st| format!("{:.0}", st.min_ms)),
+                mib(t.peak_rss_kb),
+                per_input(t.peak_rss_kb),
+                mib(t.private_kb),
+                per_input(t.private_kb),
+            );
+        }
+    }
+    s.push('\n');
 }
 
 /// A stdin row is flagged when its time or memory is over this multiple of the file route's.
@@ -1350,6 +1474,7 @@ mod tests {
             peak_rss_kb: rss,
             private_kb: private,
             instructions: None,
+            end: None,
         }
     }
 
@@ -1370,6 +1495,7 @@ mod tests {
             private_ratio_primary: private,
             ir_ratio_primary: None,
             noisy: false,
+            input_bytes: None,
         }
     }
 
@@ -1515,6 +1641,103 @@ mod tests {
         let mut s = String::new();
         stdin_section(&mut s, &[], &[]);
         assert!(s.is_empty(), "no stdin rows, no section: {s}");
+    }
+
+    /// The 1 GB section lists each tool's end state and its memory as a multiple of the input, sets
+    /// a row beside the 100 MB row of its shape, shows a killed tool's signal and the memory it
+    /// reached, and is absent from a run without `--huge` (#6915).
+    #[test]
+    fn the_huge_section_shows_how_each_tool_ended_and_memory_per_input_byte() {
+        let ended = |t: ToolResult, exit: Option<i32>, signal: Option<i32>| ToolResult {
+            end: Some(perf::RunEnd {
+                exit,
+                signal,
+                timed_out: false,
+            }),
+            ..t
+        };
+        let hundred = PerfRow {
+            rss_ratio_primary: Some(1.5),
+            private_ratio_primary: Some(1.25),
+            ..timed_row(
+                "ndjson_field",
+                "ndjson-100mb",
+                4.0,
+                vec![timed("succinctly", 1.0, 1, 1), timed("jq", 4.0, 1, 1)],
+            )
+        };
+        // A 1 GiB input: succinctly peaked at 1.25 GiB, jq at 3 MiB.
+        let big = PerfRow {
+            tier: "1gb".into(),
+            input_bytes: Some(1 << 30),
+            rss_ratio_primary: Some(427.0),
+            private_ratio_primary: Some(400.0),
+            ..timed_row(
+                "ndjson_field",
+                "ndjson-1gb",
+                2.5,
+                vec![
+                    ended(
+                        timed("succinctly", 800.0, 1_310_720, 1_300_000),
+                        Some(0),
+                        None,
+                    ),
+                    ended(timed("jq", 2000.0, 3072, 2048), Some(0), None),
+                ],
+            )
+        };
+        let killed = PerfRow {
+            gate: Gate::Incomplete,
+            speedup_primary: None,
+            tier: "1gb".into(),
+            input_bytes: Some(1 << 30),
+            ..timed_row(
+                "identity",
+                "users-1gb",
+                1.0,
+                vec![
+                    ended(tool("succinctly", Some(2_097_152), None), None, Some(9)),
+                    ended(tool("jq", Some(9_437_184), None), Some(0), None),
+                ],
+            )
+        };
+        let mut s = String::new();
+        huge_section(&mut s, &[hundred], &[big, killed]);
+        // Speedup 2.50x against 4.00x at 100 MB, RSS ratio 427x against 1.50x.
+        assert!(
+            s.contains("| ndjson_field | ndjson-1gb | match | 2.50x | 4.00x | 427.00x | 1.50x | 400.00x | 1.25x |"),
+            "{s}"
+        );
+        // succinctly's peak was 1.25x the input, jq's 0.00x; both exited 0.
+        assert!(
+            s.contains("| ndjson_field | ndjson-1gb | 1024.0 | succinctly | exit 0 | 800 | 800 | 1280.0 | 1.25x |"),
+            "{s}"
+        );
+        assert!(
+            s.contains("| jq | exit 0 | 2000 | 2000 | 3.0 | 0.00x |"),
+            "{s}"
+        );
+        // A killed tool has its signal, no time, and the memory it reached (2 GiB: 2.00x).
+        assert!(s.contains("| identity | users-1gb | incomplete |"), "{s}");
+        assert!(
+            s.contains(
+                "| succinctly | killed (SIGKILL) | n/a | n/a | 2048.0 | 2.00x | n/a | n/a |"
+            ),
+            "{s}"
+        );
+        assert!(
+            s.contains("| jq | exit 0 | n/a | n/a | 9216.0 | 9.00x |"),
+            "{s}"
+        );
+        // No 100 MB twin for `identity`: n/a, not a made-up figure.
+        assert!(
+            s.contains("| identity | users-1gb | incomplete | n/a | n/a |"),
+            "{s}"
+        );
+
+        let mut none = String::new();
+        huge_section(&mut none, &[], &[]);
+        assert!(none.is_empty(), "no huge rows, no section: {none}");
     }
 
     #[test]
