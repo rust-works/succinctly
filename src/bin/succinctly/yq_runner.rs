@@ -2775,7 +2775,7 @@ fn needs_dom_fallback(
         && ((sort_keys && index.has_aliases())
             || sorts_a_mapping(expr, index, bytes)
             || reorders_a_flow_sequence(expr, index, bytes)
-            || (index.has_comments() && maps_a_flow_collection(expr, index, bytes))
+            || maps_a_commented_flow_collection(expr, index, bytes)
             || (is_array_of_nodes(expr) && index.has_aliases()))
 }
 
@@ -2912,17 +2912,21 @@ fn reorders_a_flow_sequence(expr: &Expr, index: &YamlIndex, bytes: &[u8]) -> boo
     })
 }
 
-/// Whether `expr` is `NAV | map(f)` ([`split_map_read`]) over a flow-style sequence or mapping in
-/// some document of `bytes` (#6986). The streamers write such a result in flow, but without the
-/// layout a comment between its items needs, so a document with comments takes the DOM route for
-/// it, which gives the result the node's flow style ([`restyle_flow_map_result`]) and lays its
-/// items' comments out; one without (any JSON input) keeps the streamers, several times faster.
-fn maps_a_flow_collection(expr: &Expr, index: &YamlIndex, bytes: &[u8]) -> bool {
+/// Whether `expr` is `NAV | map(f)` ([`split_map_read`]) over a flow-style sequence or mapping
+/// with a comment inside it, in some document of `bytes` (#6986). The streamers write such a
+/// result in flow, but without the layout a comment between its items needs, so it takes the DOM
+/// route, which gives the result the node's flow style ([`restyle_flow_map_result`]) and lays the
+/// comments out. Every other flow node keeps the streamers, several times faster on a large one;
+/// a comment elsewhere in the document, or the node's own (which yq does not keep), does not count.
+fn maps_a_commented_flow_collection(expr: &Expr, index: &YamlIndex, bytes: &[u8]) -> bool {
+    if !index.has_comments() {
+        return false;
+    }
     let Some((nav, _)) = split_map_read(expr) else {
         return false;
     };
     any_document(index, bytes, |doc| {
-        flow_collection_target(nav.as_ref(), doc).is_some()
+        flow_collection_target(nav.as_ref(), doc).is_some_and(|target| target.has_comment_below())
     })
 }
 

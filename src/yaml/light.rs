@@ -3388,6 +3388,14 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         self.index
     }
 
+    /// Whether a node below this one, at any depth, has a comment (a line, head or foot comment);
+    /// this node's own do not count (#6986).
+    #[inline]
+    #[must_use]
+    pub fn has_comment_below(&self) -> bool {
+        self.index.has_comment_below(self.bp_pos)
+    }
+
     /// Get a reference to the underlying YAML text.
     #[inline]
     pub fn text(&self) -> &'a [u8] {

@@ -1,8 +1,9 @@
 //! #6986: yq's `map(f)` builds a sequence that takes the style of the node it maps, and nothing
 //! else of it: over a flow-style sequence or mapping the result prints in flow, whatever `f` is,
-//! without the node's comment or anchor. The streamers write it in flow; a document with comments
-//! takes the DOM route, which gives the result the style there. A later block document is not a
-//! flow element of the document stream when the first document opens with `[`.
+//! without the node's comment or anchor. The streamers write it in flow; a node with a comment inside
+//! it takes the DOM route, which lays that comment out and gives the result the style there. A later
+//! block document is not a flow element of the document stream when the first document opens with
+//! `[`.
 //!
 //! Every expected output is captured from yq v4.53.3.
 
@@ -32,13 +33,24 @@ const STREAMED: &[(&str, &str, &str)] = &[
     (".b | map(. == 1)", "a: &x [1, 2]\nb: *x\n", "- true\n- false\n"),
 ];
 
-/// `(filter, document, yq's output)` over a document with a comment: the DOM route.
-const DOM: &[(&str, &str, &str)] = &[
+/// `(filter, document, yq's output)` with a comment on the node or elsewhere in the document, which
+/// keeps the streamers.
+const COMMENT_OUTSIDE: &[(&str, &str, &str)] = &[
+    (".a | map(.)", "# head\na: [1, 2]\n", "[1, 2]\n"),
     (".a | map(.)", "a: [1, \"b\", c] # lc\n", "[1, \"b\", c]\n"),
     (".a | map(.)", "# c\na: [1, 2] # lc\n", "[1, 2]\n"),
     (".a | map(. + 1)", "a: [1, 2] # lc\n", "[2, 3]\n"),
     ("map(. == 1)", "# head\n[1, 2] # lc\n", "[true, false]\n"),
+];
+
+/// `(filter, document, yq's output)` with a comment inside the node: the DOM route.
+const COMMENT_INSIDE: &[(&str, &str, &str)] = &[
     ("map(.)", "[1, # one\n 2]\n", "[1, # one\n  2]\n"),
+    (".a | map(. == 1)", "a: [1, # one\n  2]\n", "[true, false]\n"),
+    (".a | map(.)", "a: [[1, # c\n  2], 3]\n", "[[1, # c\n    2], 3]\n"),
+    (".a | map(.)", "a: {x: 1, # c\n  y: 2}\n", "[1, # c\n  2]\n"),
+    (".b | map(.)", "# c\na: [1, 2]\nb: [3, # d\n  4]\n", "[3, # d\n  4]\n"),
+    (".a | map(.)", "a: [\n  # head of 1\n  1,\n  2\n]\n", "[\n  # head of 1\n  1, 2]\n"),
 ];
 
 /// `(filter, document, yq's output)`: a block-style node keeps a block result.
@@ -63,7 +75,8 @@ fn assert_rows(rows: &[(&str, &str, &str)], args: &[&str]) -> Result<()> {
 #[test]
 fn map_over_a_flow_node_prints_in_flow_6986() -> Result<()> {
     assert_rows(STREAMED, &[])?;
-    assert_rows(DOM, &[])?;
+    assert_rows(COMMENT_OUTSIDE, &[])?;
+    assert_rows(COMMENT_INSIDE, &[])?;
     assert_rows(BLOCK, &[])
 }
 
@@ -71,7 +84,8 @@ fn map_over_a_flow_node_prints_in_flow_6986() -> Result<()> {
 #[test]
 fn map_over_a_flow_node_prints_in_flow_on_the_dom_route_6986() -> Result<()> {
     assert_rows(STREAMED, &["--arg", "z", "1"])?;
-    assert_rows(DOM, &["--arg", "z", "1"])?;
+    assert_rows(COMMENT_OUTSIDE, &["--arg", "z", "1"])?;
+    assert_rows(COMMENT_INSIDE, &["--arg", "z", "1"])?;
     assert_rows(BLOCK, &["--arg", "z", "1"])
 }
 
