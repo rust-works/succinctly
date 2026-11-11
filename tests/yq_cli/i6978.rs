@@ -21,7 +21,15 @@ const ROWS: &[(&str, &str)] = &[
     // A property before the key, a sequence item and a flow key.
     ("--- &a x: >\n\nb: 1\n", "{\"x\":\"\",\"b\":1}\n"),
     ("--- !!str x: >\n\nb: 1\n", "{\"x\":\"\",\"b\":1}\n"),
+    // `&a:` is an anchor on an empty key, so the header after it is that key's value.
+    ("--- &a: >\n\nb: 1\n", "{\"\":\"\",\"b\":1}\n"),
     ("--- - >\n\n- b\n", "[\"\",\"b\"]\n"),
+    ("---\tx: >\n\nb: 1\n", "{\"x\":\"\",\"b\":1}\n"),
+    ("---\t&a\tx: >\n\nb: 1\n", "{\"x\":\"\",\"b\":1}\n"),
+    (
+        "--- !<tag:yaml.org,2002:str> x: >\n\nb: 1\n",
+        "{\"x\":\"\",\"b\":1}\n",
+    ),
     ("--- [a]: >\n\nb: 1\n", "{\"\":\"\",\"b\":1}\n"),
     // The scalar has content: unchanged.
     ("--- x: >\n\n  y\nb: 1\n", "{\"x\":\"y\\n\",\"b\":1}\n"),
