@@ -230,3 +230,18 @@ fn test_a_dash_comment_element_keeps_its_nodes_6880() -> Result<()> {
         ),
     ])
 }
+
+/// A metadata write places its comment into the tree by position, so the document keeps the full
+/// tree: with the silent parts collapsed it printed `a: 1` and lost the `# hello` it prints today
+/// before the refusal (#2796: only the clearing form of `head_comment =` is supported).
+#[test]
+fn test_a_head_comment_write_over_a_stream_still_prints_what_it_printed_6880() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        ".a head_comment=\"hello\"",
+        "a: 1\n---\nb:\n  c: 2\n---\n# c\nd: 3\n",
+        &[],
+    )?;
+    assert_eq!(code, 1);
+    assert_eq!(out, "a: 1\n# hello\n");
+    Ok(())
+}

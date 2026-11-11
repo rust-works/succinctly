@@ -564,6 +564,12 @@ DEFAULT_THRESHOLD = 5.0
 # byte-identical). Lower it to 10.0 once `main` carries the change and the row reads ~0% against a
 # merge-base that includes it.
 #
+# `users_yq_del_select` (#6880) carries an override of the same one-off kind: the write's snapshot
+# of the document holds one empty tree for each subtree that says nothing instead of a node per node
+# of it, and the result's tree is not built over it, so this yq-mode write row does less work (-10.9%
+# x86_64 / -11.6% ARM64-Linux against the PR's own merge-base, outputs byte-identical). Remove it once
+# `main` carries the change and the row reads ~0% against a merge-base that includes it.
+#
 # `seq_name_bad_last` (#6619) carries a TIGHTER threshold than the default (3.0 against 5.0), the one
 # override here that is not a loosening. #6594 (#6500) converts each record as the queue is read
 # instead of materializing every record first, and what that saves is mostly peak memory (1.1 GB
@@ -581,6 +587,7 @@ QUERY_THRESHOLDS = {
     "users_del_bound_select": 30.0,
     "users_assign_scores": 30.0,
     "users_update_select": 30.0,
+    "users_yq_del_select": 30.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant

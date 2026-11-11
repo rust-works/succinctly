@@ -15878,6 +15878,11 @@ mod tests {
             let (result, _) = pristine_of(written);
             let dense_out = reconcile_presentation(&value, &dense, &result, &[]);
             let pruned_out = reconcile_presentation(&value, &pruned, &result, &[]);
+            // The silent part of the result is one word where the dense walk built its nodes.
+            if written.starts_with(b"a:\n  b:\n    - 1\n    - 2\n  c: x\nd:\n  - e: 1\n  - e: 2") {
+                assert!(matches!(dense_out.field("d"), CommentTree::Array(..)));
+                assert!(pruned_out.field("d").is_silent_leaf());
+            }
             // Emitted the same: every node reads the same through the tree's accessors.
             let dense_text = emit_yaml_value(&result, &dense_out, &config, "", false);
             let pruned_text = emit_yaml_value(&result, &pruned_out, &config, "", false);
@@ -15889,6 +15894,32 @@ mod tests {
         let dense_out = reconcile_presentation(&value, &dense, &scalar, &[]);
         let pruned_out = reconcile_presentation(&value, &pruned, &scalar, &[]);
         assert_eq!(format!("{dense_out:?}"), format!("{pruned_out:?}"));
+    }
+
+    /// #6880: the snapshot collapses only for a write that reads the tree by neither position nor
+    /// shape: a literal or computed `=`, `|=`, `+=` and `del` do; a plain `=` from a read copies a
+    /// source subtree's presentation and does not.
+    #[test]
+    fn assign_reads_tree_by_shape_names_the_plain_copies_only_6880() {
+        let reads = |filter: &str| {
+            let expr = jq::parse_with_mode(filter, jq::ParserMode::Yq).unwrap();
+            assign_reads_tree_by_shape(&expr)
+        };
+        for filter in [".zzz = 1", ".a = {\"b\": [1]}", ".a.b = \"x\" | .c = 2"] {
+            assert!(!reads(filter), "{filter} copies no source");
+        }
+        for filter in [
+            ".c = .a",
+            ".c = .a.x",
+            ".c = (.b // 0)",
+            ".a = 1 | .c = .a",
+            ".c = .a + 1",
+        ] {
+            assert!(reads(filter), "{filter} may copy a source");
+        }
+        for filter in [".a |= . + 1", ".a += 1", "del(.a)", ".a.b |= \"x\"", "."] {
+            assert!(!reads(filter), "{filter} is not a plain assignment");
+        }
     }
 
     /// #6880: a comment above an array element's dash lands on the first member of the mapping
