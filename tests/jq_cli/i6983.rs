@@ -39,6 +39,20 @@ const ROWS: &[(Option<&str>, &str, &str)] = &[
     (Some("{\"n\":-1e-400}"), "[limit(.n; 1, 2)]", "[1,2]\n"),
     (Some("[1e-1000]"), "[limit(.[0]; 1, 2)]", "[1]\n"),
     (Some("1e-1000"), "[nth(.; 1, 2, 3)]", "[1]\n"),
+    // jq's parser writes `-1e-400` as the negation of `1e-400`: a computed zero.
+    (None, "[limit(-1e-400; 1, 2)]", "[]\n"),
+    (None, "[nth(-1e-400; 1, 2)]", "[1]\n"),
+    // `abs` is `if . < 0 then -. else . end` with a literal `0`: `-1e-400` is below it and its
+    // negation is a computed zero, which `limit` and `nth` read as zero.
+    (Some("{\"n\":-1e-400}"), ".n | abs", "0\n"),
+    (Some("{\"n\":-1e-400}"), ".n | abs < 0", "false\n"),
+    (Some("{\"n\":-1e-400}"), "[limit(.n | abs; 1, 2)]", "[]\n"),
+    (Some("{\"n\":-1e-400}"), "[nth(.n | abs; 1, 2)]", "[1]\n"),
+    (Some("-1e-400"), "[., abs]", "[-1E-400,0]\n"),
+    (Some("1e-1000"), "abs", "1E-1000\n"),
+    (Some("-0"), "abs", "-0\n"),
+    (Some("-2"), "abs", "2\n"),
+    (None, "-1e-400 | abs", "-0\n"),
     // Controls: a literal that is zero, and a subnormal a double holds.
     (Some("0.000e9"), "[limit(.; 1, 2, 3)]", "[]\n"),
     (Some("-0e-3"), "[limit(.; 1, 2, 3)]", "[]\n"),
