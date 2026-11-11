@@ -23328,7 +23328,9 @@ fn cross_together<S: EvalSemantics, V: DocumentValue>(
             yq_operand_keeps_origin(left) && !settles_both(left, right),
         ),
         // Closed by `yq_list_stage` (see the match below).
+        // patchcov: coverage tolerate reason="unreachable: `yq_list_stage` routes only Compare and Arithmetic here, the same arm the match below closes (#2549)"
         _ => unreachable!("yq_list_stage selects only Compare/Arithmetic as a binary stage"),
+        // patchcov: coverage end
     };
     // The origin of the left operand's entry that is being paired: the left operand is the outer
     // loop in yq mode, and the walk makes its entry's origin ambient for the run, so it is read as
