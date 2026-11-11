@@ -7570,6 +7570,10 @@ These differ:
   yq reads an absent key as no node (`eval(.zz)` prints nothing) and the node `null` as the expression `null` (`eval(null)` is `null`), and this tells the two apart only by the value, so both give nothing.
 - **yq repeats `eval`'s outputs when the context holds several nodes.**
   `.c[] | eval(". * 2")` on `c: [1, 2]` is `2 4 2 4 2 4 2 4` in yq and `2 4` here, since `eval` is run once per node.
+- **`--jq-extensions` reaches the text `eval` runs ([#7012](https://github.com/rust-works/succinctly/issues/7012)).**
+  The text is read with the same opt-in as the program that holds the call, so a name yq's lexer rejects (`paths`, `limit`) is a parse error in it by default, as in yq, and runs under the flag.
+  `succinctly yq --jq-extensions 'eval("paths")'` prints the paths, where yq refuses `paths` in both positions.
+  This is an extension (ADR-0018 rule 5), off by default, and a nested `eval` carries the flag on.
 - **Expressions nest 32 deep.**
   A stored expression that evaluates itself (`s: "eval(.s)"`) runs yq out of stack, and stops here with `eval: expressions nest more than 32 deep` (ADR-0018 rule 4, a crash).
 - **The text of the error for an expression that does not parse differs.**

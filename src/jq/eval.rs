@@ -20806,7 +20806,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::WithDtf(layout, body) => builtin_with_dtf::<W, S>(layout, body, value, optional),
 
         // #6081: yq's `eval`.
-        Builtin::EvalExpr(expr) => builtin_eval_expr::<W, S>(expr, value, optional),
+        Builtin::EvalExpr(expr, ext) => builtin_eval_expr::<W, S>(expr, *ext, value, optional),
 
         // Phase 22: File operations (yq)
         Builtin::Load(file_expr, kind) => builtin_load::<W, S>(file_expr, *kind, value, optional),
@@ -47829,7 +47829,7 @@ fn builtin_yields_at_most_one_value(builtin: &Builtin) -> bool {
         | Builtin::Tz(_)
         | Builtin::FormatDatetime(_)
         | Builtin::WithDtf(_, _)
-        | Builtin::EvalExpr(_)
+        | Builtin::EvalExpr(..)
         | Builtin::Unique
         | Builtin::UniqueBy(_)
         | Builtin::UpperIn(_)
@@ -60388,8 +60388,8 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             resolve_skip_sink::<S>(n, expr, value, trackable, snapshot, frame, keep, sink)
         }
         // #6081: `eval(s)` names the paths the expression `s` reads names.
-        Expr::Builtin(Builtin::EvalExpr(arg)) => {
-            resolve_eval_expr_sink::<S>(arg, value, trackable, snapshot, frame, keep, sink)
+        Expr::Builtin(Builtin::EvalExpr(arg, ext)) => {
+            resolve_eval_expr_sink::<S>(arg, *ext, value, trackable, snapshot, frame, keep, sink)
         }
         // #5863: `with_dtf(layout; f)` names the paths `f` names, so a write through it lands
         // (`with_dtf("2006"; .a) = 5` writes `.a` in yq v4.53.3).
@@ -109241,8 +109241,14 @@ fn with_eval_depth<T>(body: impl FnOnce() -> T) -> Result<T, EvalError> {
 
 /// The expression yq's `eval` reads from one output of its argument: a scalar's text (`null` is
 /// `null`), and nothing for a container, which is the empty expression, that is the node itself.
+///
+/// `jq_extensions` is the run's `--jq-extensions`, carried by the `eval` call that was parsed
+/// under it (#7012): the text gets the same opt-in back into jq's surface as the program does.
 #[cfg(feature = "std")]
-fn parse_eval_text<S: EvalSemantics>(text: &OwnedValue) -> Result<Expr, EvalError> {
+fn parse_eval_text<S: EvalSemantics>(
+    text: &OwnedValue,
+    jq_extensions: bool,
+) -> Result<Expr, EvalError> {
     let text = yq_scalar_text::<S>(text)
         .map(Cow::into_owned)
         .unwrap_or_default();
@@ -109254,14 +109260,19 @@ fn parse_eval_text<S: EvalSemantics>(text: &OwnedValue) -> Result<Expr, EvalErro
     if blank {
         return Ok(Expr::Identity);
     }
-    super::parser::parse_with_mode(&text, super::parser::ParserMode::Yq)
-        .map_err(|_| EvalError::new("bad expression, please check expression syntax"))
+    super::parser::parse_with_mode_and_extensions(
+        &text,
+        super::parser::ParserMode::Yq,
+        jq_extensions,
+    )
+    .map_err(|_| EvalError::new("bad expression, please check expression syntax"))
 }
 
 /// Builtin: `eval(expr)` (yq, #6081): every output of `expr` is read as a yq expression and
 /// evaluated against this node, in order.
 fn builtin_eval_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     arg: &Expr,
+    jq_extensions: bool,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
@@ -109279,7 +109290,7 @@ fn builtin_eval_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             if text.is_null() {
                 continue;
             }
-            match parse_eval_text::<S>(text) {
+            match parse_eval_text::<S>(text, jq_extensions) {
                 Ok(parsed) => exprs.push(parsed),
                 Err(e) => return suppress_or_raise(e, optional),
             }
@@ -109293,15 +109304,17 @@ fn builtin_eval_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
     #[cfg(not(feature = "std"))]
     {
-        let _ = (arg, value);
+        let _ = (arg, jq_extensions, value);
         suppress_or_raise(EvalError::new("eval requires the std feature"), optional)
     }
 }
 
 /// The path-position twin of [`builtin_eval_expr`]: the paths the evaluated expressions name,
 /// so a write or `del` through `eval(".a")` lands (`eval(".a") = 5` writes `.a` in yq v4.53.3).
+#[allow(clippy::too_many_arguments)] // STYLE-0004: the sibling `resolve_*_sink` shape plus the call's `--jq-extensions`, threaded straight to `parse_eval_text`
 fn resolve_eval_expr_sink<'a, S: EvalSemantics>(
     arg: &Expr,
+    jq_extensions: bool,
     value: &'a OwnedValue,
     trackable: bool,
     snapshot: &Snapshot,
@@ -109320,7 +109333,7 @@ fn resolve_eval_expr_sink<'a, S: EvalSemantics>(
             if text.is_null() {
                 continue;
             }
-            let parsed = match parse_eval_text::<S>(text) {
+            let parsed = match parse_eval_text::<S>(text, jq_extensions) {
                 Ok(parsed) => parsed,
                 Err(e) => return ResolveFlow::Escaped(e.into()),
             };
@@ -109338,7 +109351,16 @@ fn resolve_eval_expr_sink<'a, S: EvalSemantics>(
     }
     #[cfg(not(feature = "std"))]
     {
-        let _ = (arg, value, trackable, snapshot, frame, keep, sink);
+        let _ = (
+            arg,
+            jq_extensions,
+            value,
+            trackable,
+            snapshot,
+            frame,
+            keep,
+            sink,
+        );
         ResolveFlow::Escaped(EvalError::new("eval requires the std feature").into())
     }
 }

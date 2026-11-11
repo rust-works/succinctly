@@ -9986,7 +9986,7 @@ impl<'a> Parser<'a> {
             self.consume_keyword("eval");
             return Ok(self
                 .parse_required_single_arg(keyword_start)?
-                .map(|expr| Builtin::EvalExpr(Box::new(expr))));
+                .map(|expr| Builtin::EvalExpr(Box::new(expr), self.jq_extensions)));
         }
 
         // Phase 22: File operations (yq)

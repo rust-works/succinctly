@@ -726,7 +726,9 @@ builtins have no yq token at all, confirmed live against yq v4.53.3. Rather
 than silently accepting broader syntax than the reference it's meant to
 match, `succinctly yq` rejects them too by default (a parse error naming
 `--jq-extensions`); passing the flag opts back into the jq-compatible
-surface (#1512):
+surface (#1512).
+The flag also reaches the text `eval(...)` runs (#7012), so `eval("paths")` is a parse error
+by default and runs with the flag:
 
 | Builtin                                              | Description                                   |
 |------------------------------------------------------|-----------------------------------------------|
