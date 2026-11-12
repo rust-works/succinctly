@@ -1362,8 +1362,23 @@ pub struct YqCommand {
     )]
     pub output_format: OutputFormat,
 
-    /// Unwrap scalar values, print without quotes (default for YAML)
-    #[arg(short = 'r', long = "unwrapScalar", overrides_with = "raw_output")]
+    /// Unwrap scalar values, print without quotes. Takes its value after `=` like yq's other
+    /// boolean flags; not given, it is true for YAML and properties output and false for the rest
+    /// (#7093)
+    #[arg(
+        short = 'r',
+        long = "unwrapScalar",
+        overrides_with = "unwrap_scalar",
+        value_parser = parse_go_bool,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true"
+    )]
+    pub unwrap_scalar: Option<bool>,
+
+    /// `--unwrapScalar` given as true, which the output routes read as `-r` (set from
+    /// `unwrap_scalar` when the run starts)
+    #[arg(skip)]
     pub raw_output: bool,
 
     /// (deprecated) Output as JSON, same as `-o=json`

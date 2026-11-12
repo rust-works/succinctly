@@ -3333,9 +3333,12 @@ pub enum YqOutputEncoder {
     Props {
         separator: String,
         array_brackets: bool,
+        /// `--unwrapScalar`: false quotes a value with a space in it (#7093)
+        unwrap: bool,
     },
-    /// `-o=shell`, with the `--shell-key-separator` between the parts of a name
-    Shell(String),
+    /// `-o=shell`, with the `--shell-key-separator` between the parts of a name and whether
+    /// `--unwrapScalar` writes a value unquoted (#7093)
+    Shell(String, bool),
     /// `-o=csv`, with `--csv-separator`
     Csv(char),
     /// `-o=lua`, with the four `--lua-*` options

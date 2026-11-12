@@ -12338,6 +12338,17 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         std::sync::atomic::Ordering::SeqCst,
     );
 
+    // `--unwrapScalar` as yq resolves it (#7093): its own value when given, else true for YAML and
+    // properties output and false for every other. `raw_output` is the "given as true" the output
+    // routes read; a `false` that names the default is the default, and the one that is not (YAML,
+    // where a top-level scalar then prints as a node with its style and comments) is recorded in
+    // limitations.md.
+    let unwrap_scalar = args.unwrap_scalar.unwrap_or(matches!(
+        args.output_format,
+        OutputFormat::Yaml | OutputFormat::Props
+    ));
+    args.raw_output = args.unwrap_scalar == Some(true);
+
     // #6850: `-o=props|shell|csv|tsv|base64|uri` is the run's results through that format's
     // encoder, printed raw. The program is wrapped below, once it is parsed; from here on the run
     // is a YAML-output run with `-r`.
@@ -12356,14 +12367,19 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         properties_separator: args.properties_separator.clone(),
         properties_array_brackets: args.properties_array_brackets,
         csv_separator,
+        unwrap_scalar,
     });
 
     let output_encoder = match args.output_format {
         OutputFormat::Props => Some(YqOutputEncoder::Props {
             separator: args.properties_separator.clone(),
             array_brackets: args.properties_array_brackets,
+            unwrap: unwrap_scalar,
         }),
-        OutputFormat::Shell => Some(YqOutputEncoder::Shell(args.shell_key_separator.clone())),
+        OutputFormat::Shell => Some(YqOutputEncoder::Shell(
+            args.shell_key_separator.clone(),
+            unwrap_scalar,
+        )),
         OutputFormat::Csv => Some(YqOutputEncoder::Csv(csv_separator)),
         OutputFormat::Tsv => Some(YqOutputEncoder::Tsv),
         OutputFormat::Base64 => Some(YqOutputEncoder::Base64),
