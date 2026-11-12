@@ -169,9 +169,10 @@ fn a_bom_and_bytes_that_are_not_utf8_read_as_they_do_whole_6920() -> Result<()> 
         (25_000, b"\xe2\x82"),
         (40_000, b"\xc3"),
     ] {
+        let needle = format!("\"user {line}\"").into_bytes();
         let at = bytes
-            .windows(format!("\"user {line}\"").len())
-            .position(|w| w == format!("\"user {line}\"").as_bytes())
+            .windows(needle.len())
+            .position(|w| w == needle.as_slice())
             .unwrap();
         let mut patched = bytes[..=at].to_vec();
         patched.extend_from_slice(patch);

@@ -16,8 +16,8 @@
 //!   only has to be told how many line breaks were dropped ([`Window::lines_before`]).
 //! - **A document that does not scan is not yet a fault.** Short of the end of the file the text
 //!   after it may be what it lacks, so it is kept, the file read on (to eight windows, and then to the
-//!   end of the file, so the scans that fail to find a document's end cover nine windows at most)
-//!   and the scan tried again. The
+//!   end of the file, so the scans that fail to find a document's end cover nine windows at most,
+//!   and a document that never ends is read to the end of the file once) and the scan tried again. The
 //!   exception is a fault no further byte can change: one at a byte no container or string starts at
 //!   (a stray `}`, a bad literal), which sits in a text that ends at a line break and so is whole.
 //!   That one is reported at once; the rest are reported at the end of the file, where the splitter's
@@ -203,7 +203,9 @@ impl WindowedFile {
                 return Ok(Some(Window {
                     raw: &self.buf[..self.validated],
                     values,
-                    split_error: split_error.filter(|_| last),
+                    // A text cut short by a read that failed is no malformed document: the failure
+                    // is what the caller reports, after the last window.
+                    split_error: split_error.filter(|_| last && self.read_error.is_none()),
                     lines_before: self.lines_before,
                     #[cfg(test)]
                     offset: self.offset,
@@ -495,6 +497,20 @@ mod tests {
     }
 
     const BLOCKS: &[usize] = &[1, 2, 3, 5, 8, 13, 64, 4096];
+
+    /// A read that fails part-way through a document is an I/O failure, not a malformed document:
+    /// the cut text goes out without a fault, and the error follows the last window.
+    #[test]
+    fn a_failed_read_is_no_malformed_document() {
+        let mut reader = open(b"{\"a\":1}\n{\"a\":", 1000);
+        reader.read_more(1000);
+        reader.read_error = Some(io::Error::other("injected"));
+        let window = reader.next_window().expect("window").expect("a window");
+        assert_eq!(window.values, vec![(0, 7)]);
+        assert_eq!(window.split_error, None);
+        assert!(reader.next_window().is_err(), "then the read's error");
+        assert!(reader.next_window().expect("and then done").is_none());
+    }
 
     #[test]
     fn last_line_break_agrees_with_rposition() {

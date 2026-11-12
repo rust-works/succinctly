@@ -7348,7 +7348,8 @@ The route judges the path by `stat` and opens nothing it declines: a named pipe 
 A window is about 1 MiB and ends at a line break, so the read that completes each document, and with it jq's line for the document, is inside it.
 The text a window has run is dropped before the next is read, from the start of the line its last document ended on, and only the number of line breaks dropped is carried.
 Only the bytes a read adds are searched for a line break, and a read that finds none asks for twice as much, so a file with few of them is read in a linear amount of work.
-A document that does not scan before the end of the file is not yet a fault, since the text after it may be what it lacks: it is read on to eight windows, and then to the end of the file, so the scans that fail to find its end cover nine windows at most.
+A document that does not scan before the end of the file is not yet a fault, since the text after it may be what it lacks: it is read on to eight windows, and then to the end of the file.
+The scans that fail to find the end of a document that has one cover nine windows at most; a document that never ends is read to the end of the file once.
 A fault at a byte no container or string starts at (a stray `}`, a bad literal) is reported where it is, since no later byte can change it; every other fault is reported at the end of the file, where the splitter's answer is the whole-file route's.
 A file that is one document, or has one bigger than eight windows, is therefore read whole, as before, and its memory is unchanged (a 73 MiB one-line document peaks at 98.3 MiB before and 95.4 after, a pretty-printed 140 MiB one at 215.2 and 212.1, on x86_64).
 Invalid UTF-8 is substituted a window at a time, which equals substituting the file because a window is whole lines and a JSON string holds no line break.
@@ -7380,7 +7381,9 @@ Time, from `scripts/ab-cli.py` (interleaved, 11 repetitions, `-c`, output and ex
 - **aarch64:** every NDJSON row at 1, 5, 10 and 100 MiB reads within −2.8% to +1.6%, inside the control's −3.7% to +0.7%: neutral.
 - **One document** (a 73 MiB single line and a pretty-printed 140 MiB one, which no window can help): +0.2% to +1.4% on x86_64 and +0.1% to +1.8% on aarch64, against controls within ±1%.
   A first version searched a file with few line breaks again after every read and read the single line 3.7 times slower, and doubling a document's read doubled its scan (+9% to +13% on the pretty-printed one); both are fixed, and the tests count the bytes searched and read.
-- **Below 4 MiB** the file is read whole as before. The 1 MiB rows read +0.3% to +7.2% on x86_64 in the last run (+1.4% to +5.4% in earlier ones) and −0.6% to +1.8% on aarch64; cachegrind counts +59,053 instructions in 108 to 204 million (+0.03% to +0.055%) there, a constant that is not the 0.3 ms the x86_64 time moved, so that is where the code landed in the binary.
+- **Below 4 MiB** the file is read whole as before.
+  The 1 MiB rows read +0.3% to +7.2% on x86_64 in the last run (+1.4% to +5.4% in earlier ones) and −0.6% to +1.8% on aarch64.
+  cachegrind counts +59,053 instructions in 108 to 204 million (+0.03% to +0.055%) there, a constant that is not the 0.3 ms the x86_64 time moved, so that is where the code landed in the binary.
 
 What the windowed route does not cover, and which still hold the input:
 

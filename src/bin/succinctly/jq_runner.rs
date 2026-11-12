@@ -32,12 +32,12 @@ use succinctly::json::JsonIndex;
 
 use super::m2_gate::can_use_m2_streaming;
 use super::{JqCommand, OnError};
-
-mod window;
 use crate::output::{
     self, escape_json_string, escape_json_string_ascii, exit_codes, flush_then_err, ColorScheme,
     DiagStyle, ErrorSink, InputLocation, JsonFormatOpts, LoudFlushWriter, StreamFault, Terminator,
 };
+
+mod window;
 
 /// One word taken by `--args` (a string) or `--jsonargs` (JSON text), kept
 /// in the order the command line gave it (#3412).
@@ -5376,20 +5376,20 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         } else {
             originals
         });
-        sink.set_stream_fault(match slurped {
+        sink.set_stream_fault(match (&slurped, &reread) {
             // #6920: the text before a window is gone, so the fault is read again from the file.
-            None if reread.is_some() => {
-                let reread = reread.clone().expect("checked");
+            (None, Some(reread)) => {
+                let reread = std::rc::Rc::clone(reread);
                 StreamFault::new(move || reread.stream_fault())
             }
-            None => {
+            (None, None) => {
                 let raw_inputs = std::rc::Rc::clone(&raw_inputs);
                 let originals = std::rc::Rc::clone(&originals);
                 StreamFault::new(move || {
                     jq::jq_stream_fault(parser_chunks(&raw_inputs, &originals), 1, 0)
                 })
             }
-            Some(_) => {
+            (Some(_), _) => {
                 let files = files.clone();
                 StreamFault::new(move || reread_stream_fault(&files))
             }
@@ -5600,12 +5600,11 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     jq::jq_input_depth_fault(json_bytes, index.bp(), source, || {
                         if reread.is_some() {
                             // The window starts at a line start, `lines_before` breaks in.
-                            let origin = StreamOrigin::ALONE.file;
-                            let at = if lines_before > 0 {
-                                (origin.0 + lines_before, 0)
-                            } else {
-                                origin
-                            };
+                            let (line, column) = StreamOrigin::ALONE.file;
+                            let at = (
+                                line + lines_before,
+                                if lines_before > 0 { 0 } else { column },
+                            );
                             advance_position(at, &raw[..start])
                         } else {
                             jq_stream_position(&raw_inputs, idx, start)
@@ -11145,6 +11144,28 @@ fn report_input_read_failure(error: &std::io::Error) {
     INPUT_READ_FAILED.with(|failed| failed.set(true));
 }
 
+/// Whether `meta` is the file standard input is open on, which a path names as `/dev/stdin`, a
+/// symlink to it or `/dev/fd/0`. The run would read it again from its start, where a stdin that
+/// something has already read from (or that shares its offset with the path, as on macOS) is
+/// somewhere else, and the fault's wording would cover bytes the run never read.
+#[cfg(unix)]
+fn names_stdin(meta: &std::fs::Metadata) -> bool {
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::MetadataExt;
+    std::io::stdin()
+        .as_fd()
+        .try_clone_to_owned()
+        .ok()
+        .map(std::fs::File::from)
+        .and_then(|stdin| stdin.metadata().ok())
+        .is_some_and(|stdin| stdin.dev() == meta.dev() && stdin.ino() == meta.ino())
+}
+
+#[cfg(not(unix))]
+fn names_stdin(_: &std::fs::Metadata) -> bool {
+    false
+}
+
 /// The lone regular file the plain route reads a window at a time (#6920), opened, and the means
 /// to read it again for a fault's wording; or `None` for a run that is not one: stdin, a pipe or a
 /// directory, several files, a file too small to be worth it, and every flag that has the route read
@@ -11153,8 +11174,9 @@ fn report_input_read_failure(error: &std::io::Error) {
 ///
 /// The path is judged by `stat`, which opens nothing: opening a named pipe (`<(cmd)`, `mkfifo`)
 /// pairs with its writer, and a handle dropped on the way to another route would take the
-/// writer's bytes with it. A path in `/dev` is left alone too: `/dev/stdin` and `/dev/fd/N` name a
-/// descriptor the run already holds, and opening them again shares its offset on some systems.
+/// writer's bytes with it. A path that names a descriptor the run already holds (`/dev/stdin`,
+/// `/dev/fd/N`) is left alone too: the file it opens may share an offset with the descriptor on
+/// some systems, so it is not read from its start, and the fault is worded from its start.
 fn windowed_plain_file(
     args: &JqCommand,
 ) -> Option<(PathBuf, window::WindowedFile, std::rc::Rc<window::Reread>)> {
@@ -11165,11 +11187,11 @@ fn windowed_plain_file(
     let [path] = files.as_slice() else {
         return None;
     };
-    if is_stdin_dash(path) || path.starts_with("/dev") {
+    if is_stdin_dash(path) || path.starts_with("/dev/fd/") {
         return None;
     }
     let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() || meta.len() < window::MIN_WINDOWED_FILE_BYTES {
+    if !meta.is_file() || meta.len() < window::MIN_WINDOWED_FILE_BYTES || names_stdin(&meta) {
         return None;
     }
     let file = std::fs::File::open(path).ok()?;
