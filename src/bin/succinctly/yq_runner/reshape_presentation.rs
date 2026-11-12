@@ -1462,6 +1462,37 @@ fn merge_tree(
             return None;
         }
     }
+    // #7070: a scalar appended to a sequence (`.a + "z"`, `.a += 5`) takes the quote style of the
+    // sequence's first element, as yq copies that node's `Style` onto the new one: `['x']` and `"z"`
+    // is `['x', 'z']` and `[x, 'y']` and `"z"` is `[x, 'y', z]`. Another style (a block scalar, a
+    // flow collection) is not copied. yq also quotes a number or a boolean this way (`['x', '5']`),
+    // which the leaf renderer does not do for a non-string value: recorded in the limitations page.
+    if let (OwnedValue::Array(l), OwnedValue::Array(out)) = (lv, result) {
+        if !deep
+            && !l.is_empty()
+            && out.len() == l.len() + 1
+            && !matches!(
+                rv,
+                OwnedValue::Array(_) | OwnedValue::Object(_) | OwnedValue::Null
+            )
+        {
+            let style = lt.at_index(0).style();
+            // The scalar keeps what it carries (an anchor, a comment) and takes the quote style; the
+            // copied `Style` overwrites yq's tagged-style bit too, so an explicit tag is not kept.
+            let appended = if matches!(style, "" | "flow" | "single" | "double") {
+                // A flow style means nothing to a scalar, which is then plain.
+                let style = if style == "flow" { "" } else { style };
+                CommentTree::leaf(rt.meta().with_style(style).with_tag(None))
+            } else {
+                rt.clone()
+            };
+            let children = (0..l.len())
+                .map(|i| lt.at_index(i).clone())
+                .chain(core::iter::once(appended))
+                .collect();
+            return Some(CommentTree::array(lt.meta().clone(), children));
+        }
+    }
     if let (OwnedValue::Object(l), OwnedValue::Object(r), OwnedValue::Object(out)) =
         (lv, rv, result)
     {
