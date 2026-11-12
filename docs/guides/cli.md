@@ -420,7 +420,7 @@ succinctly yq '.users[]' input.yaml
 - `-j, --tojson`: Deprecated alias for `-o=json`, as in real yq; prints `Flag --tojson has been deprecated, please use -o=json instead` to stderr and wins over `-o` in either order. Unlike jq's `-j`, it does not join output (there is no yq join-output flag; `--join-output` is rejected as in real yq)
 - `-0, --nul-output`: Use NUL char to separate values instead of newline
 - `-S, --sort-keys`: Sort keys of each object on output
-- `-C, --colors`: Force colorized output
+- `-C, --colors`: Force colorized output. Beats `-M` and `NO_COLOR` whichever comes last, as yq's does (#7051)
 - `-M, --no-colors`: Disable colorized output
 - `-N, --no-doc`: Don't print document separators (`---`)
 - `-P, --prettyPrint`: Pretty print, expand flow styles to block style

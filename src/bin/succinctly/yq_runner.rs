@@ -937,7 +937,12 @@ impl OutputConfig {
     fn from_args(args: &YqCommand) -> Self {
         // Shares the jq runner's precedence, documented on `resolve_color`.
         let use_color = crate::env_config::resolve_color(
-            crate::env_config::ColorChoice::from_flags(args.monochrome_output, args.color_output),
+            // #7051: yq's `-C` (`forceColor`) beats `-M` (`forceNoColor`) whatever their order; the
+            // shared choice lets `-M` win, as jq's flags do.
+            crate::env_config::ColorChoice::from_flags(
+                args.monochrome_output && !args.color_output,
+                args.color_output,
+            ),
             crate::env_config::no_color_from_env(),
             std::io::stdout().is_terminal(),
         );
