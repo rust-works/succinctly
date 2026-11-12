@@ -122,6 +122,7 @@ mod regex_blocks;
 #[doc(hidden)]
 pub mod path_mode;
 pub mod resolve;
+mod shell_nfkd;
 mod slice;
 #[doc(hidden)]
 pub use slice::literal_slice_range;
