@@ -9,7 +9,7 @@
 use anyhow::Result;
 use tempfile::TempDir;
 
-use crate::run_yq_stdin_with_stderr;
+use crate::{run_yq_files, run_yq_stdin_with_stderr};
 
 /// `(flags, input, suffix of the name, the files written)`.
 type Row = (
@@ -238,5 +238,54 @@ fn split_exp_appends_the_output_formats_extension_to_a_name_without_one_7028() -
             "{flags:?} {suffix:?}: {stderr}"
         );
     }
+    Ok(())
+}
+
+/// yq names every file of a run by one format, the one its first input file resolves to (`a.json b.yaml`
+/// writes `.json`, and fails on the YAML file; `b.yaml a.json` writes `.yml` for both).
+#[test]
+fn split_exp_extension_follows_the_first_input_file_7028() -> Result<()> {
+    let rows: &[(&[&str], &[&str], &[&str])] = &[
+        (&["a.json"], &[], &["x1.json"]),
+        (&["a.json"], &["-o=yaml"], &["x1.yml"]),
+        (&["a.json"], &["-p=json"], &["x1.yml"]),
+        (&["a.json"], &["-p=json", "-o=json"], &["x1.json"]),
+        (&["b.yaml"], &[], &["x2.yml"]),
+        (&["b.yaml", "a.json"], &[], &["x1.yml", "x2.yml"]),
+    ];
+    for &(files, flags, want) in rows {
+        let dir = TempDir::new()?;
+        std::fs::write(dir.path().join("a.json"), "{\"a\":1}\n")?;
+        std::fs::write(dir.path().join("b.yaml"), "a: 2\n")?;
+        let paths: Vec<_> = files.iter().map(|f| dir.path().join(f)).collect();
+        let paths: Vec<&std::path::Path> = paths.iter().map(std::path::PathBuf::as_path).collect();
+        let out = dir.path().join("out");
+        std::fs::create_dir(&out)?;
+        let pattern = format!("\"{}/\" + \"x\" + (.a|tostring)", out.display());
+        let mut args: Vec<&str> = flags.to_vec();
+        args.extend(["--split-exp", &pattern]);
+        let (stdout, stderr, code) = run_yq_files(".", &paths, &args)?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            ("", 0),
+            "{files:?} {flags:?}: {stderr}"
+        );
+        let mut names: Vec<String> = std::fs::read_dir(&out)?
+            .map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect::<std::io::Result<_>>()?;
+        names.sort();
+        assert_eq!(names, want, "{files:?} {flags:?}");
+    }
+    Ok(())
+}
+
+/// An empty name gets the extension alone: yq writes `.yml`.
+#[test]
+fn split_exp_an_empty_name_is_the_extension_alone_7028() -> Result<()> {
+    let dir = TempDir::new()?;
+    let pattern = format!("\"{}/\" + \"\"", dir.path().display());
+    let (_, stderr, code) = run_yq_stdin_with_stderr(".", "a: 1\n", &["--split-exp", &pattern])?;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(std::fs::read_to_string(dir.path().join(".yml"))?, "a: 1\n");
     Ok(())
 }

@@ -4741,7 +4741,19 @@ fn split_exp_extension(format: OutputFormat) -> &'static str {
     match format {
         OutputFormat::Json => "json",
         OutputFormat::Props => "properties",
-        _ => "yml",
+        // Listed, not a wildcard, so a new format has to choose its extension here.
+        OutputFormat::Yaml
+        | OutputFormat::Auto
+        | OutputFormat::Shell
+        | OutputFormat::Csv
+        | OutputFormat::Tsv
+        | OutputFormat::Lua
+        | OutputFormat::Xml
+        | OutputFormat::Kyaml
+        | OutputFormat::Toml
+        | OutputFormat::Ini
+        | OutputFormat::Base64
+        | OutputFormat::Uri => "yml",
     }
 }
 
