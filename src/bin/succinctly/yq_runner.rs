@@ -4742,6 +4742,11 @@ fn split_exp_directory(path: &str) -> std::path::PathBuf {
 /// (less the umask) on Unix. A component that exists and is not a directory is an error (#7029).
 fn create_split_exp_directories(path: &str) -> Result<()> {
     let dir = split_exp_directory(path);
+    // The directory of a bare name is the working one: nothing to make, and a run that splits into it
+    // would otherwise ask the OS once per result.
+    if dir == std::path::Path::new(".") {
+        return Ok(());
+    }
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]

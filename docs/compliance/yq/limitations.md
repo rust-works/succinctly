@@ -7788,9 +7788,11 @@ Matching either needs a string that can hold bytes that are not UTF-8, or the su
 `tests/yq_cli/i7029.rs` pins the rows captured from yq v4.53.3.
 The name is the first value the expression produces, read as its scalar text, with the output format's extension appended when the name has none ([#7028](https://github.com/rust-works/succinctly/issues/7028)).
 
-- **A name read from a source `~` is `null.yml`, where yq writes `~.yml`.**
-  The source spelling of a null is not kept ([#2802](https://github.com/rust-works/succinctly/issues/2802)).
-  A number keeps its spelling (`0x10.yml`, `007.yml`), as does a quoted string.
+- **A name read from a source `~`, `NULL` or `True` is `null.yml` or `true.yml`, where yq writes `~.yml`, `NULL.yml` and `True.yml`.**
+  The source spelling of a null or a boolean is not kept ([#2802](https://github.com/rust-works/succinctly/issues/2802)).
+  A number keeps its spelling (`0x10.yml`, `007.yml`, `1e3.yml`, `1.50`), as does a quoted string.
+- **A number literal such as `0.1e1` in the expression is accepted, where yq's lexer refuses it** (`bad split document expression`).
+  The same literal is accepted in the main filter, so this is the expression grammar and not the naming.
 - **A directory that cannot be made or a name that cannot be written is worded differently.**
   yq says `Error: mkdir blocker: not a directory`; this says `failed to create --split-exp directory: blocker`, with the cause.
   Both exit 1 and write nothing.

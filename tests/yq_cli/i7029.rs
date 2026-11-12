@@ -189,3 +189,37 @@ fn split_exp_creates_directories_with_mode_0750_7029() -> Result<()> {
     }
     Ok(())
 }
+
+/// An absolute name makes its directories wherever they are, and a leading `..` is kept by the lexical
+/// clean (`../out/x` from `inner` is `out/x` beside it): the directory `Dir` names is the one made.
+#[test]
+fn split_exp_makes_the_directories_of_an_absolute_and_a_parent_relative_name_7029() -> Result<()> {
+    let root = TempDir::new()?;
+    let inner = root.path().join("inner");
+    std::fs::create_dir(&inner)?;
+    std::fs::write(inner.join("f.yaml"), "a: 1\n")?;
+    let absolute = format!("\"{}/abs/deep/x\"", root.path().display());
+    for expr in [absolute.as_str(), "\"../out/x\""] {
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .current_dir(&inner)
+            .args(["yq", "--split-exp", expr, ".", "f.yaml"])
+            .stdin(Stdio::null())
+            .output()?;
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{expr}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("abs/deep/x.yml"))?,
+        "a: 1\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("out/x.yml"))?,
+        "a: 1\n"
+    );
+    assert!(!inner.join("out").exists());
+    Ok(())
+}
