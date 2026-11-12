@@ -25704,10 +25704,13 @@ pub(crate) fn format_owned<S: EvalSemantics>(
         FormatType::Sh => format_sh::<S>(owned, optional),
         FormatType::Urid => format_urid::<S>(owned, optional),
         FormatType::Yaml => format_yaml(owned),
-        FormatType::Props if S::TAG == EvalTag::Yq => {
-            let (separator, array_brackets) = yq_encoder_prefs::props();
-            Ok(format_props_with(owned, &separator, array_brackets))
-        }
+        FormatType::Props if S::TAG == EvalTag::Yq => Ok(yq_encoder_prefs::with(|prefs| {
+            format_props_with(
+                owned,
+                &prefs.properties_separator,
+                prefs.properties_array_brackets,
+            )
+        })),
         FormatType::Props => format_props(owned),
         FormatType::YqOutput(encoder) => {
             let text = format_yq_output::<S>(encoder, owned)
@@ -26316,7 +26319,7 @@ fn format_yq_csv<S: EvalSemantics>(
 /// @csv - CSV format (for arrays)
 fn format_csv<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
     if S::TAG == EvalTag::Yq {
-        return format_yq_csv::<S>(value, yq_encoder_prefs::csv_separator(), false);
+        return format_yq_csv::<S>(value, yq_encoder_prefs::with(|p| p.csv_separator), false);
     }
     match value {
         OwnedValue::Array(arr) => {
@@ -26887,51 +26890,48 @@ impl Default for YqEncoderPrefs {
 /// `ConfiguredPropertiesPreferences` and `ConfiguredCsvPreferences` are, and not a
 /// `thread_local!`: the evaluator may run on a worker thread with a larger native stack
 /// (ADR-0025). Without `std` the defaults always apply.
-pub fn set_yq_encoder_prefs(prefs: YqEncoderPrefs) {
+pub fn set_yq_encoder_prefs(mut prefs: YqEncoderPrefs) {
+    // An empty `--properties-separator` is yq's default, so it is stored as the default.
+    if prefs.properties_separator.is_empty() {
+        prefs.properties_separator = YqEncoderPrefs::default().properties_separator;
+    }
     #[cfg(feature = "std")]
     {
-        let mut slot = yq_encoder_prefs::PREFS
+        let is_default = prefs == YqEncoderPrefs::default();
+        *yq_encoder_prefs::PREFS
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *slot = (prefs != YqEncoderPrefs::default()).then_some(prefs);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = (!is_default).then_some(prefs);
+        yq_encoder_prefs::SET.store(!is_default, core::sync::atomic::Ordering::Release);
     }
     #[cfg(not(feature = "std"))]
     let _ = prefs;
 }
 
-/// The reads behind [`set_yq_encoder_prefs`].
+/// The reads behind [`set_yq_encoder_prefs`]. Until a run sets a flag no lock is taken.
 mod yq_encoder_prefs {
+    use super::YqEncoderPrefs;
+
     #[cfg(feature = "std")]
-    pub(super) static PREFS: std::sync::RwLock<Option<super::YqEncoderPrefs>> =
+    pub(super) static PREFS: std::sync::RwLock<Option<YqEncoderPrefs>> =
         std::sync::RwLock::new(None);
+    /// Whether [`PREFS`] holds anything but the defaults.
+    #[cfg(feature = "std")]
+    pub(super) static SET: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
 
-    /// `@props`'s separator and bracket setting.
-    pub(super) fn props() -> (alloc::string::String, bool) {
+    /// `f` of the prefs in effect.
+    pub(super) fn with<T>(f: impl FnOnce(&YqEncoderPrefs) -> T) -> T {
         #[cfg(feature = "std")]
-        if let Some(prefs) = PREFS
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-        {
-            return (
-                prefs.properties_separator.clone(),
-                prefs.properties_array_brackets,
-            );
+        if SET.load(core::sync::atomic::Ordering::Acquire) {
+            if let Some(prefs) = PREFS
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+            {
+                return f(prefs);
+            }
         }
-        (alloc::string::String::from(" = "), false)
-    }
-
-    /// `@csv`'s field separator.
-    pub(super) fn csv_separator() -> char {
-        #[cfg(feature = "std")]
-        if let Some(prefs) = PREFS
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-        {
-            return prefs.csv_separator;
-        }
-        ','
+        f(&YqEncoderPrefs::default())
     }
 }
 
