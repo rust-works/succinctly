@@ -9846,6 +9846,9 @@ thread_local! {
     /// the clean kind it serves (#5674): stdin can be read once, and the materializing route
     /// reads it through [`read_stdin_bytes`].
     static STDIN_PUSHBACK: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    /// The read of stdin that failed before the probe of a pipe saw 4 MiB (#7024): the route that reads
+    /// stdin whole reports it, as it would have had it made the read itself.
+    static STDIN_PUSHBACK_ERROR: RefCell<Option<std::io::Error>> = const { RefCell::new(None) };
     /// A source the stream reader was reading failed part-way (#5498): jq reports it and exits 2.
     static INPUT_READ_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Where the first input that would not open was among the ones that did, as the queue's
@@ -10951,6 +10954,9 @@ fn bom_to_skip(head: &[u8], look_for_bom: &mut bool) -> usize {
 /// Read stdin to bytes.
 fn read_stdin_bytes() -> Result<Vec<u8>> {
     if let Some(bytes) = STDIN_PUSHBACK.with(|slot| slot.borrow_mut().take()) {
+        if let Some(error) = STDIN_PUSHBACK_ERROR.with(|slot| slot.borrow_mut().take()) {
+            return Err(anyhow::Error::new(error).context("Failed to read from stdin"));
+        }
         return Ok(bytes);
     }
     let mut buf = Vec::new();
@@ -11520,10 +11526,11 @@ fn windowed_stdin_pipe() -> Option<WindowedSource> {
 #[cfg(unix)]
 fn windowed_pipe(file: std::fs::File, min: u64) -> Option<WindowedSource> {
     let mut front = Vec::new();
-    // A read that fails is the stream's end, and is reported after the documents before it, as a read
-    // that fails further on is.
+    // A read that fails past the minimum is the stream's end, reported after the documents before it as
+    // one further on is; one that fails sooner is the whole route's to report, as it was.
     let error = (&file).take(min).read_to_end(&mut front).err();
-    if error.is_none() && (front.len() as u64) < min {
+    if (front.len() as u64) < min {
+        STDIN_PUSHBACK_ERROR.with(|slot| *slot.borrow_mut() = error);
         STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = Some(front));
         return None;
     }
@@ -20763,6 +20770,22 @@ mod tests {
             false
         )
         .is_none());
+    }
+
+    /// #7024: a read the probe of a pipe made that failed before 4 MiB is the whole route's to report,
+    /// as it would have reported it had it made the read itself.
+    #[test]
+    fn a_probe_that_failed_short_is_reported_by_the_whole_route_7024() {
+        STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = Some(b"1\n".to_vec()));
+        STDIN_PUSHBACK_ERROR.with(|slot| {
+            *slot.borrow_mut() = Some(std::io::Error::new(std::io::ErrorKind::Other, "gone"));
+        });
+        let error = read_stdin_bytes().expect_err("the read failed");
+        assert!(
+            format!("{error:#}").contains("Failed to read from stdin: gone"),
+            "{error:#}"
+        );
+        assert!(STDIN_PUSHBACK_ERROR.with(|slot| slot.borrow().is_none()));
     }
 
     /// #7024: a pipe is windowed once a first read finds 4 MiB in it; one that ends sooner hands what

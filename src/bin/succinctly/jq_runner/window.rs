@@ -84,6 +84,12 @@ fn blank_rs_bytes(bytes: &mut [u8]) {
     }
 }
 
+/// Whether a document starting with `byte` is a container or string, which jq's parser has read once
+/// its last byte is (a number or literal waits on the byte after it).
+fn opens_container_or_string(byte: u8) -> bool {
+    matches!(byte, b'{' | b'[' | b'"')
+}
+
 /// A document span within a window's text: `(start, end)`, `end` exclusive.
 pub(super) type Span = (usize, usize);
 
@@ -137,6 +143,7 @@ pub(super) struct Place {
 }
 
 impl Place {
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) fn alone() -> Self {
         Self {
             index: 0,
@@ -169,9 +176,9 @@ struct SubstitutedRegion {
     edits: Vec<SubstitutionEdit>,
     /// `raw - text` after the region.
     delta_after: i64,
-    /// The bytes the region was read as, kept for a stream that cannot be read again ([`Certifier`]);
+    /// The bytes each of `edits` replaced, kept for a stream that cannot be read again ([`Certifier`]);
     /// empty otherwise.
-    raw: Vec<u8>,
+    raw_edits: Vec<Vec<u8>>,
 }
 
 impl RawMap {
@@ -187,7 +194,7 @@ impl RawMap {
         raw_len: usize,
         text_len: usize,
         edits: Vec<SubstitutionEdit>,
-        raw: Vec<u8>,
+        raw_edits: Vec<Vec<u8>>,
     ) {
         let delta = self.delta_before_end();
         let raw_start = usize::try_from(text_start as i64 + delta).unwrap_or(0);
@@ -196,7 +203,7 @@ impl RawMap {
             raw_start,
             edits,
             delta_after: delta + raw_len as i64 - text_len as i64,
-            raw,
+            raw_edits,
         });
     }
 
@@ -299,6 +306,9 @@ pub(super) struct WindowedFile {
     break_search_bytes: usize,
     #[cfg(test)]
     bytes_read: u64,
+    /// How many reads by jq's parser certifying the windows took.
+    #[cfg(test)]
+    exact_reads: std::cell::Cell<usize>,
 }
 
 impl WindowedFile {
@@ -348,6 +358,8 @@ impl WindowedFile {
             break_search_bytes: 0,
             #[cfg(test)]
             bytes_read: 0,
+            #[cfg(test)]
+            exact_reads: std::cell::Cell::new(0),
         }
     }
 
@@ -416,14 +428,14 @@ impl WindowedFile {
             // A fault before the end of the file is only one when no byte that follows can change
             // it: where no container or string starts, in a text that ends at a line break (a bare
             // token is bounded by it). Otherwise the document may only lack its text.
-            let definitive = split_error
-                .is_some_and(|at| !self.eof && !matches!(self.buf[at], b'{' | b'[' | b'"'));
+            let definitive =
+                split_error.is_some_and(|at| !self.eof && !opens_container_or_string(self.buf[at]));
             let pending = split_error.is_some() && !self.eof && !definitive;
             // The last document before a fault that may still move is a number or literal whose
             // completion the fault's own byte could be, so it waits to be seen with what follows.
             if pending {
                 if let Some(&(start, _)) = values.last() {
-                    if !matches!(self.buf[start], b'{' | b'[' | b'"') {
+                    if !opens_container_or_string(self.buf[start]) {
                         values.pop();
                     }
                 }
@@ -599,8 +611,12 @@ impl WindowedFile {
                 }
             }
         }
-        // jq's parser skips a BOM at the start of its input (#5291), as the whole-file route does;
-        // with fewer than three bytes read it cannot be told from the start of another character.
+        self.skip_front_bom();
+    }
+
+    /// jq's parser skips a BOM at the start of its input (#5291), as the whole-file route does; with
+    /// fewer than three bytes read it cannot be told from the start of another character.
+    fn skip_front_bom(&mut self) {
         if !self.started && (self.buf.len() >= 3 || self.eof) {
             self.started = true;
             let bom = crate::front_matter::leading_bom_len(&self.buf);
@@ -673,13 +689,17 @@ impl WindowedFile {
                     self.carry_raw = region[..self.carry_raw_len.min(region.len())].to_vec();
                 }
             }
-            let raw = if self.certifier.is_some() {
-                region.to_vec()
+            // Only the bytes each edit replaced: the rest of the region reads as its text.
+            let raw_edits = if self.certifier.is_some() {
+                edits
+                    .iter()
+                    .map(|edit| region[edit.raw.clone()].to_vec())
+                    .collect()
             } else {
                 Vec::new()
             };
             self.raw_map
-                .push(text_start, raw_len, text.len(), edits, raw);
+                .push(text_start, raw_len, text.len(), edits, raw_edits);
         }
         let new_end = self.validated + text.len();
         self.buf.splice(self.validated..end, text);
@@ -722,6 +742,7 @@ impl WindowedFile {
     /// A pipe on standard input, from what a first read of it took (`front`, which ended in `error` if
     /// that read failed): its length is not known, it cannot be read again, and its windows are
     /// certified as they are handed out, their first fault kept in `seen` ([`Certifier`], #7024).
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) fn from_pipe(
         file: Rc<File>,
         front: Vec<u8>,
@@ -738,6 +759,8 @@ impl WindowedFile {
         if let Some(error) = error {
             this.read_error = Some(error);
             this.eof = true;
+            // No read follows to skip it.
+            this.skip_front_bom();
         }
         this
     }
@@ -755,40 +778,23 @@ impl WindowedFile {
         let mut resume = certifier.resume.max(self.offset) - self.offset;
         let mut fault = None;
         for &(start, end) in values {
-            let doc = &self.buf[start..end];
-            let bare = !matches!(doc.first(), Some(b'{' | b'[' | b'"'));
-            let certified = succinctly::json::validate::Validator::new(doc)
+            let certified = succinctly::json::validate::Validator::new(&self.buf[start..end])
                 .with_max_depth(CERTIFIED_DEPTH)
                 .validate()
                 .is_ok();
             if certified {
-                resume = if bare { start } else { end };
+                resume = self.boundary_after(start, end);
                 continue;
             }
-            // A container or string ends where the parser is at a boundary again, unless it holds the
-            // fault; a number or literal is read with the byte that ends it, so with the rest.
-            if !bare {
-                match self.read_from(resume, end) {
-                    Err(message) => {
-                        fault = Some(message);
-                        break;
-                    }
-                    Ok(true) => {
-                        resume = end;
-                        continue;
-                    }
-                    // patchcov: coverage tolerate-line reason="defensive: the splitter ends a container or string where jq's parser closes it; read on to the window's end should they ever disagree"
-                    Ok(false) => {}
-                }
-            }
+            // One read by jq's parser, from the last boundary to the end of the window, covers this
+            // document and every one after it, so a window costs one such read at most whatever it
+            // holds (a stream of `NaN`s is read at the parser's speed, not once a document).
             match self.read_from(resume, self.validated) {
                 Err(message) => fault = Some(message),
                 Ok(_) => {
-                    // Every document the window gives is read without a fault; the last one's boundary
-                    // is where the next window goes on from.
-                    let &(start, end) = values.last().unwrap_or(&(start, end));
-                    let bare = !matches!(self.buf.get(start), Some(b'{' | b'[' | b'"'));
-                    resume = if bare { start } else { end };
+                    if let Some(&(start, end)) = values.last() {
+                        resume = self.boundary_after(start, end);
+                    }
                 }
             }
             break;
@@ -805,9 +811,22 @@ impl WindowedFile {
         }
     }
 
+    /// Where jq's parser stands at a boundary once the document at `start..end` is read: after it for a
+    /// container or string, and at its start for a number or literal, whose bytes the parser holds
+    /// until the byte that ends it.
+    fn boundary_after(&self, start: usize, end: usize) -> usize {
+        if opens_container_or_string(self.buf[start]) {
+            end
+        } else {
+            start
+        }
+    }
+
     /// jq's parser over the text from `from` to `to`, as read, from the position it has at `from`: the
     /// fault it meets, or whether it ends at a boundary between top-level values.
     fn read_from(&self, from: usize, to: usize) -> Result<bool, String> {
+        #[cfg(test)]
+        self.exact_reads.set(self.exact_reads.get() + 1);
         let (line, column) = self.position(from);
         succinctly::jq::jq_stream_prefix_fault([self.as_read(from, to)], line, column)
     }
@@ -827,52 +846,51 @@ impl WindowedFile {
     /// jq's position at `at` in the text: its line, and the bytes before `at` on that line as read
     /// (where an invalid byte was substituted, the bytes it replaced).
     fn position(&self, at: usize) -> (usize, usize) {
-        let before = &self.buf[..at];
-        let newlines = count_newlines(before);
-        let (line_start, column) = match before.iter().rposition(|&b| b == b'\n') {
-            Some(at) => (at + 1, 0),
-            None => (0, self.origin.1),
+        let (line, column) = advance_position(self.origin, &self.buf[..at]);
+        let line_start = if line == self.origin.0 {
+            0
+        } else {
+            at - column
         };
         let raw = |at: usize| self.raw_map.raw_of(self.offset + at);
-        (self.origin.0 + newlines, column + raw(at) - raw(line_start))
+        (
+            line,
+            column - (at - line_start) + (raw(at) - raw(line_start)),
+        )
     }
 
     /// The text from `from` to `to` as it was read: the substituted regions in it given back as the
     /// bytes they replaced.
     fn as_read(&self, from: usize, to: usize) -> std::borrow::Cow<'_, [u8]> {
-        let (mut at, end) = (self.offset + from, self.offset + to);
-        if !self.raw_map.changes_from(at) {
+        if !self.raw_map.changes_from(self.offset + from) {
             return std::borrow::Cow::Borrowed(&self.buf[from..to]);
         }
-        let text = |from: usize, to: usize| &self.buf[from - self.offset..to - self.offset];
         let mut bytes = Vec::with_capacity(to - from);
-        for region in &self.raw_map.regions {
-            if region.text.end <= at {
-                continue;
-            }
-            if at >= end {
-                break;
-            }
-            if at < region.text.start {
-                let upto = region.text.start.min(end);
-                bytes.extend_from_slice(text(at, upto));
-                at = upto;
-                if at >= end {
-                    break;
+        let mut at = from;
+        'regions: for region in &self.raw_map.regions {
+            for (edit, raw) in region.edits.iter().zip(&region.raw_edits) {
+                // Absolute, since the front of a region can be dropped already; a replacement holds no
+                // line break, so one that ends past a dropped line start begins after it.
+                let end = region.text.start + edit.text.end;
+                if end <= self.offset + at {
+                    continue;
                 }
+                let start = region.text.start + edit.text.start - self.offset;
+                let end = end - self.offset;
+                // An offset inside a replacement is where the bytes it replaced start, so a range that
+                // starts inside one holds them and one that ends inside one does not.
+                if end > to {
+                    break 'regions;
+                }
+                if start > at {
+                    bytes.extend_from_slice(&self.buf[at..start]);
+                }
+                bytes.extend_from_slice(raw);
+                at = end;
             }
-            let upto = region.text.end.min(end);
-            let raw_from = original_offset(&region.edits, at - region.text.start);
-            let raw_to = if upto == region.text.end {
-                region.raw.len()
-            } else {
-                original_offset(&region.edits, upto - region.text.start)
-            };
-            bytes.extend_from_slice(&region.raw[raw_from..raw_to]);
-            at = upto;
         }
-        if at < end {
-            bytes.extend_from_slice(text(at, end));
+        if at < to {
+            bytes.extend_from_slice(&self.buf[at..to]);
         }
         std::borrow::Cow::Owned(bytes)
     }
@@ -945,6 +963,7 @@ impl WindowedFiles {
     }
 
     /// A pipe on standard input ([`WindowedFile::from_pipe`], #7024): the stream's one source.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) fn pipe(
         file: Rc<File>,
         front: Vec<u8>,
@@ -1249,6 +1268,7 @@ impl Reread {
 
     /// A stream that cannot be read again, whose reader keeps its first fault in `seen` as it reads
     /// ([`WindowedFile::from_pipe`], #7024).
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) fn seen(seen: SeenFault) -> Self {
         Self {
             sources: Vec::new(),
@@ -2733,6 +2753,67 @@ mod pipe_tests {
         );
     }
 
+    /// A window costs jq's parser one read at most, however many of its documents the validator turns
+    /// down: a stream of `NaN`s (jq reads them; the validator does not) is read once, not once a document.
+    #[test]
+    fn documents_the_validator_turns_down_cost_one_read_a_window_7024() {
+        let mut text = "{\"v\":NaN}\n".repeat(5_000).into_bytes();
+        text.extend_from_slice(b"{\"x\":");
+        let mut file = tempfile::tempfile().expect("a temp file");
+        file.write_all(&text).expect("written");
+        file.rewind().expect("rewound");
+        let seen = SeenFault::default();
+        let mut reader =
+            WindowedFile::from_pipe(Rc::new(file), Vec::new(), None, 4_096, Rc::clone(&seen));
+        let mut windows = 0;
+        while reader.next_window().expect("reads").is_some() {
+            windows += 1;
+        }
+        assert!(windows > 5, "{windows}");
+        assert!(
+            reader.exact_reads.get() <= windows,
+            "{} reads, {windows} windows",
+            reader.exact_reads.get()
+        );
+        assert_eq!(
+            *seen.borrow(),
+            succinctly::jq::jq_stream_fault([&text[..]], 1, 0)
+        );
+    }
+
+    /// Bytes that are not UTF-8 in a region whose front a window has dropped are given back as read, and
+    /// a fault after them is placed in the bytes as read.
+    #[test]
+    fn a_region_whose_front_is_dropped_reads_as_it_was_read_7024() {
+        let mut text = Vec::new();
+        for i in 0..400 {
+            text.extend_from_slice(format!("{{\"i\":{i},\"s\":\"").as_bytes());
+            text.extend_from_slice(b"\xff\xfe");
+            text.extend_from_slice(b"\"}\n");
+        }
+        text.extend_from_slice(b"[\xff,1 2]\n");
+        for &block in &[64usize, 1_000, 1 << 20] {
+            assert_same(&text, block);
+        }
+    }
+
+    /// A probe that fails after a BOM: the BOM is skipped as a read would skip it, and the documents
+    /// before the failure are run.
+    #[test]
+    fn a_failed_first_read_still_skips_the_bom_7024() {
+        let file = tempfile::tempfile().expect("a temp file");
+        let mut reader = WindowedFile::from_pipe(
+            Rc::new(file),
+            b"\xEF\xBB\xBF1\n2\n".to_vec(),
+            Some(io::Error::new(io::ErrorKind::Other, "gone")),
+            16,
+            SeenFault::default(),
+        );
+        let window = reader.next_window().expect("the bytes before it");
+        assert_eq!(window.map(|w| w.values.len()), Some(2));
+        assert!(reader.next_window().is_err());
+    }
+
     /// A probe that failed: the bytes before the failure are run, and the failure is returned after them.
     #[test]
     fn a_failed_first_read_is_returned_after_its_bytes_7024() {
@@ -2740,7 +2821,7 @@ mod pipe_tests {
         let mut reader = WindowedFile::from_pipe(
             Rc::new(file),
             b"1\n2\n".to_vec(),
-            Some(io::Error::other("gone")),
+            Some(io::Error::new(io::ErrorKind::Other, "gone")),
             16,
             SeenFault::default(),
         );

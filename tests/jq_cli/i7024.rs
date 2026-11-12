@@ -2,8 +2,8 @@
 //! is (#6920): it can be read again by position for a fault's wording, which a pipe cannot. Every row is
 //! what the same bytes give on a pipe: stdout, stderr and exit status, and the file here starts at an
 //! offset when the shell or a parent has read part of it already. A pipe of 4 MiB or more is windowed
-//! too since #7024's pipe slice, and words its fault as it reads instead (`i7024_pipe.rs` checks it
-//! against the whole-file route), so the two sides here are the two ways a window words a fault.
+//! too since #7024's pipe slice (`i7024_pipe.rs`), so the pipe here is named `/dev/stdin`, which keeps
+//! it on the whole-file route.
 //!
 //! A terminal and a stdin under 4 MiB take the route they always did.
 
@@ -53,10 +53,17 @@ fn with_stdin_file(args: &[&str], bytes: &[u8], offset: u64) -> Result<(Vec<u8>,
     ))
 }
 
-/// The same bytes (from `offset`) on a pipe.
+/// The same bytes (from `offset`) on a pipe, read whole: named as `/dev/stdin`, which the windowed routes
+/// decline (it names a descriptor the run already holds), so this side is the whole-file route's and not a
+/// second window. A pipe on standard input is windowed itself since #7024's pipe slice. The name is read
+/// back as the one a stdin has, `<stdin>`, in a diagnostic and in `input_filename`.
 fn with_stdin_pipe(args: &[&str], bytes: &[u8], offset: usize) -> Result<(Vec<u8>, Vec<u8>, i32)> {
-    let (output, status) = spawn_jq(args, Some(&bytes[offset..]))?;
-    Ok((output.stdout, output.stderr, status))
+    let mut whole = args.to_vec();
+    whole.push("/dev/stdin");
+    let (output, status) = spawn_jq(&whole, Some(&bytes[offset..]))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).replace("/dev/stdin", "<stdin>");
+    let stderr = String::from_utf8_lossy(&output.stderr).replace("/dev/stdin", "<stdin>");
+    Ok((stdout.into_bytes(), stderr.into_bytes(), status))
 }
 
 fn same(args: &[&str], bytes: &[u8], offset: usize) -> Result<(String, String, i32)> {
