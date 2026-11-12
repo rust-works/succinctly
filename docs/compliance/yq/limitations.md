@@ -7748,7 +7748,7 @@ Two rows differ:
   yq prints the raw bytes for a document that is the string itself (`printf /w== | yq -p base64 .` writes the byte `0xff`) and refuses a nested one with `yaml: cannot marshal invalid UTF-8 data as !!str`.
 - `--front-matter` with an explicit `-p base64` or `-p uri` is refused (`--front-matter and --input-format base64 are incompatible`), as `-p json` is, where yq decodes the extracted front matter.
 
-### `-p props` — read as the YAML yq prints for the file; a write keeps the quoting, and blank comment lines, `? |-` keys and collection tags differ ([#6925](https://github.com/rust-works/succinctly/issues/6925))
+### `-p props` — read as the YAML yq prints for the file; a write keeps the quoting, and blank comment lines and collection tags differ ([#6925](https://github.com/rust-works/succinctly/issues/6925))
 
 `-p props` (alias `p`, `properties`) loads each input with a port of magiconair/properties v1.8.10, the library yq's decoder uses, and builds yq's nodes from it with a port of the traversal yq assigns through, then writes them as the YAML text yq prints for them; the run reads that text as `-p yaml`, so every route after the read is the YAML one.
 The loader is magiconair's: `=`, `:` or white space between key and value, `#` and `!` comments at the start of a line, `\` escapes and line continuations, a comment that ends the file with no line break dropped, and its errors (`properties: Line 4: "3"` for a value with no key, `premature EOF`, `invalid unicode literal`), each passed through Go's `fmt.Errorf` as yq's is, so a `%` in it reads as a verb (`"50%!"(MISSING)`).
@@ -7765,7 +7765,6 @@ These rows differ:
   `style` reads `double` for such a value, and `literal` for a multi-line one, where yq reads an empty style.
 - A mapping or sequence the decoder made has an empty tag in yq (`.a | tag` on `a.b=1` is empty, and `type` too); here it is `!!map` or `!!seq`.
 - Blank lines that end a comment block are dropped, and two or more inside one are one, as yq itself reads the YAML it prints for them; yq's props decoder keeps them in the node.
-- A key with a line break is printed in double quotes (`"a\nb": x`), where yq prints the `? |-` explicit-key form; that is how a YAML input's `? |-` key prints here too.
 - `--front-matter` with an explicit `-p props` is refused, where yq decodes the front matter as props; on a file picked by its extension the front matter is read as YAML.
 - An index that would pad the sequences of one document past 2^24 elements is refused (`Cannot grow array to N elements`), where yq allocates some 545 bytes for every padded `null` until it runs out of memory, and the `${key}` check stops once it has substituted 16 MiB, where yq would expand a chain that doubles at each link without end.
 - `-o props` writes no comment, as for any input (the `-o props` section above).
@@ -7842,3 +7841,16 @@ The name is the first value the expression produces, read as its scalar text, wi
   yq prints `yq (https://github.com/mikefarah/yq/) version v4.53.3`.
 - **`ea -i` and `ea -f` are refused.**
   yq accepts both (`ea -i '.k = 1' a.yaml b.yaml` writes every result into the first file), and `succinctly yq` stops with `--eval-all and --inplace are incompatible` or `--eval-all and --front-matter are incompatible` ([#7042](https://github.com/rust-works/succinctly/issues/7042)).
+
+## A key written as a literal block scalar (`? |-`) is written back as yq does; a folded one is not ([#7032](https://github.com/rust-works/succinctly/issues/7032))
+
+yq keeps the style of a key node.
+A literal block key with a line break or over 128 bytes is an explicit key (`? |-` / `  a` / `  b` / `: v`, with the anchor and tag it carries), and one short line is double-quoted.
+`tests/yq_cli/i7032.rs` pins the rows captured from yq v4.53.3, under `-I` 1, 3 and 4 and `-P`.
+These still differ:
+
+- **A folded block key (`? >`) is not kept.**
+  yq writes `? >` / `  a b` / `` / `: 1` for the key `"a b\n"` and `"a b": 1` for the one-line key `a b`; this writes `"a b\n": 1` and `a b: 1`.
+- **`keys`, `to_entries` and the other reads of a key node print it without the style.**
+  yq prints `- |-` / `  a` / `  b` for `keys` over the key above, where this prints `- "a\nb"` ([#5450](https://github.com/rust-works/succinctly/issues/5450)).
+- **`-P` over an anchored literal key writes `? &k "a\nb"`**, where yq keeps `? &k |-`.
