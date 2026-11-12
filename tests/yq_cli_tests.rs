@@ -21177,7 +21177,7 @@ mod meta_assign_798 {
     /// also visits mapping keys) is a comment write's target, and with `style`/`anchor` it is
     /// refused rather than applied to the wrong node. As a value it is the walk (#7069).
     #[test]
-    fn clearing_forms_write_and_dots_is_a_comment_target_only() {
+    fn clearing_forms_write_and_dots_as_a_comment_target_refuses_style_and_anchor() {
         let doc = "# h\na: 1 # l\n# m\nb: 2\n";
         let (out, code) = run_yq_stdin("... comments = \"\"", doc, &[]).unwrap();
         assert_eq!((out.as_str(), code), ("a: 1\nb: 2\n", 0));

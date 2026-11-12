@@ -227,12 +227,6 @@ enum PathStep {
     Computed(Expr),
 }
 
-/// Attach a parsed bracket to the postfix chain built so far.
-///
-/// A dynamic key captures the chain as its `target`, because the key is
-/// evaluated against the chain's *input* — `.a[.k]` reads `.k` from the chain
-/// input, not from `.a`. A dynamic slice bound is the same rule applied to
-/// `.a[.k1:.k2]`.
 /// yq's `...` read as a value (#7069): the node, then for a mapping each key before its value (a key is a
 /// string node and has no children) and for a sequence each element, depth first. `[...] | length` is 7 over
 /// `a:` / `  b: x` / `  c: y`, where `[..] | length` is 4. Spelled with `recurse`, which yq's own syntax does not
@@ -248,6 +242,12 @@ fn recursive_descent_with_keys_walk(at: usize) -> Result<Expr, ParseError> {
         .map_err(|error| ParseError::new(format!("`...`: {error}"), at))
 }
 
+/// Attach a parsed bracket to the postfix chain built so far.
+///
+/// A dynamic key captures the chain as its `target`, because the key is
+/// evaluated against the chain's *input* — `.a[.k]` reads `.k` from the chain
+/// input, not from `.a`. A dynamic slice bound is the same rule applied to
+/// `.a[.k1:.k2]`.
 fn push_bracket(chain: &mut Vec<Expr>, bracket: Bracket) {
     match bracket {
         Bracket::Static(expr) => chain.push(expr),
