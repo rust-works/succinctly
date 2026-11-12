@@ -65,3 +65,34 @@ fn a_retyped_key_still_matches_by_value_7043() -> Result<()> {
     assert_eq!(run("[.[] | key | head_comment]", doc)?, r#"["","c"]"#);
     Ok(())
 }
+
+/// The owned-identity pipe (`| tostring | key`, `. as $v | key`) decides the same thing as
+/// `select(true) | key` in a second place, and a quoted key is a `!!str` node whatever it spells.
+#[test]
+fn every_route_to_key_keeps_the_node_7043() -> Result<()> {
+    let doc = "x:\n  # c\n  n1: 1\n  # d\n  \"no\": 2\n  # e\n  \"1\": 3\n  # f\n  a1: 4\n";
+    for (filter, expected) in [
+        (
+            "[.x[] | tostring | key | head_comment]",
+            r#"["c","d","e","f"]"#,
+        ),
+        (
+            "[.x[] | select(true) | key | head_comment]",
+            r#"["c","d","e","f"]"#,
+        ),
+        ("[.x[] | tostring | key | line]", "[3,5,7,9]"),
+        (
+            r#"[.x[] | select(key == "n1") | key | head_comment]"#,
+            r#"["c"]"#,
+        ),
+        (
+            "[.x[] | select(true) | key | style]",
+            r#"["","double","double",""]"#,
+        ),
+        (".x.n1 | . as $v | key | head_comment", r#""c""#),
+        (".x.n1 | tostring | key | head_comment", r#""c""#),
+    ] {
+        assert_eq!(run(filter, doc)?, expected, "{filter}");
+    }
+    Ok(())
+}

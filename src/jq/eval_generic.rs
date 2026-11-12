@@ -35404,6 +35404,30 @@ fn yq_path_component<C: DocumentCursor>(display: Cow<'_, str>, key_cursor: &C) -
     OwnedValue::String(display.into_owned().into())
 }
 
+/// Whether `key` / `path` may hand on the key *node* of a string-keyed member whose spelling
+/// begins like a null, bool or number ([`key_spelling_may_retype`]) and
+/// [`key_node_spells`] accepted: the one decision `eval_builtin`'s `Builtin::Key` arm and the
+/// owned-identity pipe's copy of it both make (#7043).
+///
+/// A typed key that [`key_owned_value`] keeps typed (`1`, `true`, `null`) stays a node. A
+/// `String` answer is two cases: a spelling the ladder retypes but `OwnedValue` cannot keep
+/// (`01`, `~`, `True`), which must not reach a later consumer as a node, since the node would
+/// retype again (#2785); and a spelling that merely begins like one (`n1`, `t1`, `.a`), which
+/// the node also reads as a string, so its comments, line and style stay readable.
+fn string_key_node_survives<S: EvalSemantics, C: DocumentCursor>(
+    key_cursor: &C,
+) -> Result<bool, EvalError> {
+    Ok(
+        match key_owned_value::<_, _, S>(&key_cursor.value(), key_cursor)? {
+            None => false,
+            Some(OwnedValue::String(_)) => {
+                matches!(to_owned_cursor::<S, _>(key_cursor)?, OwnedValue::String(_))
+            }
+            Some(_) => true,
+        },
+    )
+}
+
 /// Whether the key node `kc` is an untagged scalar whose raw spelling is
 /// exactly `expected` -- a plain string, or a typed key whose text
 /// [`to_owned_at_depth`]'s ladder will retype downstream (#2785).
@@ -39803,24 +39827,9 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                     GenericResult::OneCursor(key_cursor)
                 }
                 OwnedValue::String(s) if key_node_spells(&key_cursor, &key_cursor.value(), s) => {
-                    match key_owned_value::<_, _, S>(&key_cursor.value(), &key_cursor) {
-                        // A string answer is two cases: a spelling the ladder retypes but
-                        // `OwnedValue` cannot keep (`01`, `~`, `True`), which must not reach
-                        // a later consumer as a node; and a spelling that merely begins like
-                        // one (`n1`, `t1`, `.a`), which the node reads as the same string.
-                        // Only the second keeps its node, so `head_comment`, `line` and the
-                        // rest read the key's own metadata (#7043).
-                        Ok(Some(OwnedValue::String(_))) => {
-                            // STYLE-0012: a failure is this arm's `GenericResult::Error`, as
-                            // `key_owned_value`'s is just above; the caller applies `optional`.
-                            match to_owned_cursor::<S, _>(&key_cursor) {
-                                Ok(OwnedValue::String(_)) => GenericResult::OneCursor(key_cursor),
-                                Ok(_) => GenericResult::Owned(OwnedValue::String(s.clone())),
-                                Err(e) => GenericResult::Error(e),
-                            }
-                        }
-                        Ok(None) => GenericResult::Owned(OwnedValue::String(s.clone())),
-                        Ok(Some(_)) => GenericResult::OneCursor(key_cursor),
+                    match string_key_node_survives::<S, _>(&key_cursor) {
+                        Ok(true) => GenericResult::OneCursor(key_cursor),
+                        Ok(false) => GenericResult::Owned(OwnedValue::String(s.clone())),
                         Err(e) => GenericResult::Error(e),
                     }
                 }
@@ -44032,9 +44041,9 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                         OwnedValue::String(s)
                             if key_node_spells(&key_cursor, &key_cursor.value(), s) =>
                         {
-                            match key_owned_value::<_, _, S>(&key_cursor.value(), &key_cursor) {
-                                Ok(Some(OwnedValue::String(_)) | None) => None,
-                                Ok(Some(_)) => Some(key_cursor),
+                            match string_key_node_survives::<S, _>(&key_cursor) {
+                                Ok(true) => Some(key_cursor),
+                                Ok(false) => None,
                                 Err(e) => return Flow::Escaped(Control::Error(e)),
                             }
                         }
