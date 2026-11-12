@@ -763,3 +763,72 @@ fn ini_by_extension_and_inplace_6925() -> Result<()> {
     assert_eq!(std::fs::read(&a)?, b"[s]\nk = v\nn = 2\n");
     Ok(())
 }
+
+// -p kyaml: the YAML reader. Every answer is yq v4.53.3's.
+#[rustfmt::skip]
+const KYAML_ROWS: &[Row] = &[
+    ("kyaml", "a: 1\nb: [x, y]\nc: {d: e}\n", &["-o", "yaml"], ".", "a: 1\nb: [x, y]\nc: {d: e}\n", "", 0),
+    ("kyaml", "{a: 1, b: [x, y,],}\n", &["-o", "json", "-I0"], ".", "{\"a\":1,\"b\":[\"x\",\"y\"]}\n", "", 0),
+    ("kyaml", "{\n  a: 1,\n  b: [\n    \"x\",\n  ],\n}\n", &["-o", "json", "-I0"], ".b[0]", "\"x\"\n", "", 0),
+    ("kyaml", "a: 1\n---\nb: 2\n", &["-o", "json", "-I0"], ".", "{\"a\":1}\n{\"b\":2}\n", "", 0),
+    ("kyaml", "- 1\n- [2]\n", &["-o", "kyaml"], ".", "[\n  1,\n  [\n    2,\n  ],\n]\n", "", 0),
+];
+
+#[test]
+fn kyaml_input_matches_yq_on_stdin_6925() -> Result<()> {
+    for &(format, input, extra, filter, stdout, stderr, code) in KYAML_ROWS {
+        let mut args = vec!["-p", format];
+        args.extend_from_slice(extra);
+        let (out, err, status) = run_yq_stdin_with_stderr(filter, input, &args)?;
+        let row = format!("-p {format} {extra:?} {filter:?} on {input:?}");
+        assert_eq!(out, stdout, "stdout of {row}");
+        assert_eq!(error_line(&err), stderr, "stderr of {row}");
+        assert_eq!(status, code, "exit status of {row}");
+    }
+    Ok(())
+}
+
+/// `*.kyaml` and `*.ky` (any case) are read as YAML and print as KYAML under `-p auto`; `-i`
+/// writes KYAML back.
+#[test]
+fn kyaml_by_extension_and_inplace_6925() -> Result<()> {
+    let dir = TempDir::new()?;
+    let a = write_file(&dir, "a.kyaml", b"a: 1\nb: [x, y]\n")?;
+    let b = write_file(&dir, "b.KY", b"{c: 3,}\n")?;
+    let plain = write_file(&dir, "c.yaml", b"d: 4\n")?;
+    assert_eq!(
+        run_yq_files(".", &[&a], &[])?,
+        (
+            "{\n  a: 1,\n  b: [\n    \"x\",\n    \"y\",\n  ],\n}\n".into(),
+            String::new(),
+            0
+        )
+    );
+    assert_eq!(
+        run_yq_files(".c", &[&b, &plain], &["-o", "json"])?,
+        ("3\nnull\n".into(), String::new(), 0)
+    );
+    run_yq_files(".a = 2", &[&a], &["-i"])?;
+    assert_eq!(
+        std::fs::read(&a)?,
+        b"{\n  a: 2,\n  b: [\n    \"x\",\n    \"y\",\n  ],\n}\n"
+    );
+    Ok(())
+}
+
+/// An explicit `-p kyaml` (or `ky`) prints YAML under `-o auto`, where the extension prints
+/// KYAML, and `--front-matter` is accepted with it: it is the YAML reader, as in yq.
+#[test]
+fn explicit_kyaml_prints_yaml_and_accepts_front_matter_6925() -> Result<()> {
+    let dir = TempDir::new()?;
+    let md = write_file(&dir, "f.md", b"---\na: 1\n---\nbody\n")?;
+    assert_eq!(
+        run_yq_stdin_with_stderr(".", "{a: 1,}\n", &["-p", "ky"])?,
+        ("{a: 1}\n".into(), String::new(), 0)
+    );
+    assert_eq!(
+        run_yq_files(".", &[&md], &["-p", "ky", "--front-matter", "extract"])?,
+        ("---\na: 1\n".into(), String::new(), 0)
+    );
+    Ok(())
+}
