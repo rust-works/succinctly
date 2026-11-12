@@ -7878,7 +7878,7 @@ In jq mode (`env(VAR)` is succinctly's extension there) the argument stays an id
 
 yq copies the first element's `Style` onto a scalar that `+` appends to a sequence: `a: ['x']` with `.a + "z"` is `['x', 'z']`, `[x, 'y']` is `[x, 'y', z]`, and a block sequence stays a block sequence.
 A construction does the same (`.a + "z"`, `[.a + "z"]`, `{"k": (.a + "z")}`); it used to lose the sequence's flow style and every quote.
-`tests/yq_cli/i7070_append_style.rs` pins 60 rows captured from yq v4.53.3.
+`tests/yq_cli/i7070_append_style.rs` pins 165 rows captured from yq v4.53.3, among them an appended scalar that carries an anchor, a comment, a tag or a block style.
 These still differ:
 
 - **A write: `.a += "z"`, `.a = .a + "z"` and `.a |= . + "z"`** print the appended scalar plain (`['dog', cat]`) where yq copies the quote (`['dog', 'cat']`).
