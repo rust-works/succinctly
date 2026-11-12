@@ -7828,3 +7828,15 @@ The name is the first value the expression produces, read as its scalar text, wi
   yq says `Error: mkdir blocker: not a directory`; this says `failed to create --split-exp directory: blocker`, with the cause.
   Both exit 1 and write nothing.
 - **A name read from the encoded text under `-o=props` and the other encoder formats** is still wrong ([#7036](https://github.com/rust-works/succinctly/issues/7036)).
+
+## yq's `eval` and `eval-all` subcommands are accepted; its other subcommands and `--version` text are not ([#7040](https://github.com/rust-works/succinctly/issues/7040))
+
+`succinctly yq e`, `eval`, `ea` and `eval-all` behave as yq's, and `tests/yq_cli/i7040.rs` pins the rows captured from yq v4.53.3.
+`--eval-all` stays as succinctly's own spelling of `ea`; yq has no such flag (`Error: unknown flag: --eval-all`), so `e --eval-all` is accepted here.
+
+- **`help`, `completion` and `man` are not subcommands here.**
+  `succinctly yq help` reads `help` as the expression and says `help/0 is not defined`, where yq prints its usage.
+- **`--version` prints this crate's own name and version.**
+  yq prints `yq (https://github.com/mikefarah/yq/) version v4.53.3`.
+- **`ea -i` and `ea -f` are refused.**
+  yq accepts both (`ea -i '.k = 1' a.yaml b.yaml` writes every result into the first file), and `succinctly yq` stops with `--eval-all and --inplace are incompatible` or `--eval-all and --front-matter are incompatible` ([#7042](https://github.com/rust-works/succinctly/issues/7042)).
