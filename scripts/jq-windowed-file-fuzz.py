@@ -21,10 +21,16 @@ prove nothing, so a case that comes out shorter is a bug of the generator and st
 
 Usage:
     cargo build --release --features cli,simd,regex,serde
-    scripts/jq-windowed-file-fuzz.py [--bin PATH] [-n N] [--seed S] [--work DIR] [--programs K]
-Each case takes about 0.2 s with a release build. Exit 1 on any difference; the stream that differed is kept
-in `--work` as `windowed-fuzz-<seed>-<case>.json`, and the case is printed with the mutations applied.
-`--work` defaults to a temporary directory; a debug build is several times slower per case.
+    scripts/jq-windowed-file-fuzz.py [--bin PATH] [-n N] [--seed S] [--work DIR] [--cap-mb MB]
+Each case takes about 0.2 s with a release build. Exit 1 on any difference (a timeout, a crash of the
+script's own and a run that exceeds `--cap-mb` of address space count as one); the stream that differed is
+kept in `--work` as `windowed-fuzz-<seed>-<case>.json`, and the case is printed with the mutations applied,
+in the order they were applied (a later one can move an earlier one's position). `--work` defaults to a
+temporary directory; a debug build is several times slower per case.
+
+`--cap-mb` (default 8000) is an `RLIMIT_AS` on each run, which Linux enforces. macOS does not, so there
+run the script under `.ai/scratch/memcap.py --cap-mb 24000 --` (the standing rule for every run of
+succinctly).
 """
 import argparse
 import os
@@ -35,6 +41,7 @@ import tempfile
 import time
 
 MIN_BYTES = 4 * 1024 * 1024
+TIMED_OUT = b"<timed out after 300s>"
 
 # The programs: identity (the raw-bytes fast path), a field read, a scalar pass-through, a select, a walk,
 # an exit-status filter and a field length. Each is "plain": none reads `input`.
@@ -87,6 +94,15 @@ def document(rng, i):
     return '{"id":%d,"name":"user %d"}' % (i, i)
 
 
+def big_document(rng):
+    """A document bigger than a window (1 MiB): a window cannot hold it, so the reader has to read on."""
+    if rng.random() < 0.5:
+        count = rng.randrange(180_000, 400_000)
+        return "[" + ",".join(str(n) for n in range(count)) + "]"
+    count = rng.randrange(8_000, 25_000)
+    return "{\n" + ",\n".join('  "k%d": [%d, "v%d", {"n": %d}]' % (n, n, n, n) for n in range(count)) + "\n}"
+
+
 def mutate(rng, data, notes):
     for _ in range(rng.choice([0, 0, 0, 1, 1, 2])):
         kind = rng.choice(MUTATIONS)
@@ -134,7 +150,13 @@ def build(rng):
         size += len(piece)
         i += 1
     notes = []
-    data = mutate(rng, b"".join(parts), notes)
+    data = b"".join(parts)
+    if rng.random() < 0.3:  # one document bigger than a window, at a line start
+        at = rng.randrange(len(data))
+        at = data.rfind(b"\n", 0, at) + 1
+        data = data[:at] + big_document(rng).encode() + separator + data[at:]
+        notes.append("big_document@%d" % at)
+    data = mutate(rng, data, notes)
     if rng.random() < 0.15:
         data = b"\xef\xbb\xbf" + data
         notes.append("bom_front")
@@ -144,8 +166,24 @@ def build(rng):
     return data, notes
 
 
-def run(binary, args, stdin=None):
-    done = subprocess.run([binary, "jq"] + args, stdin=stdin, capture_output=True, timeout=300)
+def cap(megabytes):
+    """A `preexec_fn` that limits a run's address space (Linux enforces it; macOS does not)."""
+    def limit():
+        try:
+            import resource
+            resource.setrlimit(resource.RLIMIT_AS, (megabytes << 20, megabytes << 20))
+        except (ImportError, ValueError, OSError):
+            pass
+    return limit
+
+
+def run(binary, args, megabytes, stdin=None):
+    """stdout, stderr and the exit status of one run; a run that hangs is reported as one that did."""
+    try:
+        done = subprocess.run([binary, "jq"] + args, stdin=stdin, capture_output=True, timeout=300,
+                              preexec_fn=cap(megabytes))
+    except subprocess.TimeoutExpired:
+        return b"", TIMED_OUT, -9
     return done.stdout, done.stderr, done.returncode
 
 
@@ -155,10 +193,11 @@ def main():
     parser.add_argument("-n", type=int, default=200, help="how many cases")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--work", default=None, help="a directory for the streams (default: a temporary one)")
+    parser.add_argument("--cap-mb", type=int, default=8000, help="RLIMIT_AS of each run, in MiB (Linux)")
     args = parser.parse_args()
     if not os.path.exists(args.bin):
         sys.exit("no binary at %s: build with `cargo build --release --features cli,simd,regex,serde`" % args.bin)
-    work = args.work or tempfile.mkdtemp(prefix="windowed-fuzz-")
+    work = os.path.abspath(args.work or tempfile.mkdtemp(prefix="windowed-fuzz-"))
     os.makedirs(work, exist_ok=True)
     rng = random.Random(args.seed)
     path = os.path.join(work, "windowed-fuzz-%d.json" % args.seed)
@@ -170,11 +209,21 @@ def main():
         with open(path, "wb") as handle:
             handle.write(data)
         program = rng.choice(PROGRAMS)
-        windowed = run(args.bin, program + [path])
-        with open(path, "rb") as handle:
-            whole = run(args.bin, program, stdin=handle)
+        try:
+            windowed = run(args.bin, program + [path], args.cap_mb)
+            with open(path, "rb") as handle:
+                whole = run(args.bin, program, args.cap_mb, stdin=handle)
+        except OSError as error:  # the binary could not be run at all: keep the stream and say so
+            differences += 1
+            kept = os.path.join(work, "windowed-fuzz-%d-%d.json" % (args.seed, case))
+            with open(kept, "wb") as handle:
+                handle.write(data)
+            print("DIFFERENCE case=%d program=%s mutations=%s: could not run: %s kept=%s"
+                  % (case, program, notes, error, kept))
+            continue
         windowed_err = windowed[1].replace(path.encode(), b"<stdin>")
-        if (windowed[0], windowed_err, windowed[2]) != (whole[0], whole[1], whole[2]):
+        hung = TIMED_OUT in (windowed[1], whole[1])
+        if hung or (windowed[0], windowed_err, windowed[2]) != (whole[0], whole[1], whole[2]):
             differences += 1
             kept = os.path.join(work, "windowed-fuzz-%d-%d.json" % (args.seed, case))
             with open(kept, "wb") as handle:
