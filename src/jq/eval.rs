@@ -19572,11 +19572,11 @@ pub(crate) fn yq_sort_by<T, S: EvalSemantics>(items: &mut [T], keys: impl Fn(&T)
                     if let Some(instant) = super::yq_datetime::instant_of(text) {
                         flag = YQ_TIMESTAMP;
                         if instants.is_empty() {
-                            instants.resize_with(items.len(), Vec::new);
+                            instants = (0..items.len()).map(|_| Vec::new()).collect();
                         }
                         let row = &mut instants[at_item];
-                        if row.len() <= at {
-                            row.resize(at + 1, None);
+                        while row.len() <= at {
+                            row.push(None);
                         }
                         row[at] = Some(instant);
                     }
