@@ -118,6 +118,12 @@ const ROWS: &[(&str, &str, &str)] = &[
         "with(.k; .nope as $v | .y = ($v | tostring))",
         "k: {x: [1, 2], e: [], s: 5, y: null} # c\n",
     ),
+    // operands after the write: the left operand is truthy again, so they are not reached
+    (
+        "b: 1\n",
+        "(.a // (.a = 0) // .y // .z) += 1",
+        "b: 1\na: 1\n",
+    ),
 ];
 
 /// The write leaves the left operand falsy, so the target is the document, and adding `1` to a
@@ -127,6 +133,7 @@ const ERROR_ROWS: &[(&str, &str)] = &[
     ("b: camel\n", "(.a // (.a = null)) += 1"),
     ("b: camel\n", "(.a // (.z += 1)) += 1"),
     ("b: camel\n", "(.a // ((.a // .c) = 0)) += 1"),
+    ("b: 1\n", "(.a // (.c = 0) // .y // .z) += 1"),
 ];
 
 /// Recorded divergences (`docs/compliance/yq/limitations.md`): a target whose last operand does not
