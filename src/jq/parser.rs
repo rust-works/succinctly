@@ -607,30 +607,12 @@ fn with_update_effect(update: &Expr) -> Expr {
         // yq binds each value in turn and the writes of each land on the same node, so the last
         // value's write wins and `+=` accumulates (`with(.k; .x[] as $v | .y += $v)` over `x: [1,
         // 2]` is `y: 3`, #7068): a `reduce`, not a binding whose first output is kept.
-        // A source with one value or none is the binding itself, which reads them as yq does: no
-        // value still runs the writes once (`.x[] as $v | .y = $v` over `x: []` writes `y: null`,
-        // and `.[$v] = 1` every key), and an absent key is not a `null` (`.nope as $v | .y = ($v |
-        // tostring)` writes `y: null`). Only several values take the `reduce`.
-        Expr::As { expr, var, body } => Expr::If {
-            cond: Box::new(Expr::Compare {
-                op: CompareOp::Lt,
-                left: Box::new(Expr::pipe(vec![
-                    Expr::Array(expr.clone()),
-                    Expr::Builtin(Builtin::Length),
-                ])),
-                right: Box::new(Expr::Literal(Literal::Int(2))),
-            }),
-            then_branch: Box::new(Expr::As {
-                expr: expr.clone(),
-                var: var.clone(),
-                body: Box::new(with_update_effect(body)),
-            }),
-            else_branch: Box::new(Expr::Reduce {
-                input: expr.clone(),
-                patterns: vec![Pattern::Var(var.clone())],
-                init: Box::new(Expr::Identity),
-                update: Box::new(with_update_effect(body)),
-            }),
+        // `SRC as $v | rest`: the binding is kept, and `rest` contributes its changes (`.b as $v |
+        // .z = $v` writes `z`); SRC itself is evaluated, so its errors still count.
+        Expr::As { expr, var, body } => Expr::As {
+            expr: expr.clone(),
+            var: var.clone(),
+            body: Box::new(with_update_effect(body)),
         },
         discarded => with_discarded_stage(discarded),
     }
@@ -847,10 +829,24 @@ fn yq_alternative_target(target: &Expr) -> Option<(Expr, Expr)> {
             ])
         },
     );
+    // The document is the target once every left operand is falsy, unless the write left it falsy
+    // too, when the operands after the write decide (`. // REST`).
+    let after_write = operands[lefts + 1..]
+        .iter()
+        .rev()
+        .fold(None, |rest: Option<Expr>, operand| {
+            Some(match rest {
+                None => (*operand).clone(),
+                Some(rest) => Expr::Alternative(Box::new((*operand).clone()), Box::new(rest)),
+            })
+        })
+        .map_or(Expr::Identity, |rest| {
+            Expr::Alternative(Box::new(Expr::Identity), Box::new(rest))
+        });
     let target = operands[..lefts]
         .iter()
         .rev()
-        .fold(Expr::Identity, |otherwise, left| Expr::If {
+        .fold(after_write, |otherwise, left| Expr::If {
             cond: Box::new(first(left)),
             then_branch: Box::new((*left).clone()),
             else_branch: Box::new(otherwise),
