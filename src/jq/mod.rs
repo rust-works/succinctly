@@ -210,7 +210,7 @@ pub use parser::{
     parse_program, parse_program_with_extra_shadowable_defs,
     parse_program_with_extra_shadowable_defs_all, parse_program_with_mode,
     parse_program_with_mode_and_extensions, parse_with_mode, parse_with_mode_and_extensions,
-    BreakSite, CallSite, DefSite, ParseError, ParserMode, VarSite,
+    set_yq_string_interpolation, BreakSite, CallSite, DefSite, ParseError, ParserMode, VarSite,
 };
 pub use resolve::{
     call_arity, resolve_all, resolve_all_jq, resolve_func_calls, resolve_func_calls_all, ModuleDef,

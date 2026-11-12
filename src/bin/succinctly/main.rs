@@ -862,6 +862,18 @@ struct GenerateYamlSuite {
 /// requirement, unlike this three-way mutual group.
 const JQ_OUTPUT_FORMAT_FLAGS: &[&str] = &["compact_output", "tab", "indent"];
 
+/// A boolean flag's value as Go's `strconv.ParseBool` reads it, which is what yq's flags use
+/// (#7025): `1`, `t`, `T`, `true`, `TRUE`, `True` and the same for false.
+fn parse_go_bool(text: &str) -> Result<bool, String> {
+    match text {
+        "1" | "t" | "T" | "true" | "TRUE" | "True" => Ok(true),
+        "0" | "f" | "F" | "false" | "FALSE" | "False" => Ok(false),
+        _ => Err(format!(
+            "strconv.ParseBool: parsing {text:?}: invalid syntax"
+        )),
+    }
+}
+
 /// `--indent`'s value as jq 1.7.1 reads it (#6017): C's `atoi`, which is `(int)strtol(text, 0, 10)`.
 /// Leading white space and one sign are skipped, the digits that follow are read and anything after
 /// them is ignored, so `" 2"` and `"3x"` are 2 and 3 and text that starts with anything else (`""`,
@@ -1564,8 +1576,32 @@ pub struct YqCommand {
     // === Diagnostics ===
     /// Accepted for yq's `-v`/`--verbose`; the debug log yq writes to stderr is not produced
     /// (#7025). Standard output is unchanged either way.
-    #[arg(short = 'v', long, overrides_with = "verbose")]
+    #[arg(
+        short = 'v',
+        long,
+        overrides_with = "verbose",
+        value_parser = parse_go_bool,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value = "false"
+    )]
     pub verbose: bool,
+
+    /// Whether a string literal reads `\(expr)` as an interpolation (yq's
+    /// `--string-interpolation`, default true, #7025). `--string-interpolation=false` keeps
+    /// `\(` as text, in the program and in an `eval(..)` text alike. Like every boolean flag of
+    /// yq's, it takes its value after `=` only (`--string-interpolation false` is a file name).
+    #[arg(
+        long = "string-interpolation",
+        overrides_with = "string_interpolation",
+        value_parser = parse_go_bool,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value = "true"
+    )]
+    pub string_interpolation: bool,
 
     // === Variables ===
     /// Set $name to the string value
