@@ -1573,6 +1573,22 @@ pub struct YqCommand {
     )]
     pub security_disable_file_ops: bool,
 
+    /// yq's `-c`/`--yaml-compact-seq-indent`: a block sequence under a mapping key is not
+    /// indented past the key by a whole step, but by the step less two columns (`-I 2`: the items
+    /// sit at the key's column, `-I 4`: two columns in). YAML output only; JSON is unchanged
+    /// (#7025). Like every boolean flag of yq's it takes its value after `=` only.
+    #[arg(
+        short = 'c',
+        long = "yaml-compact-seq-indent",
+        overrides_with = "yaml_compact_seq_indent",
+        value_parser = parse_go_bool,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value = "false"
+    )]
+    pub yaml_compact_seq_indent: bool,
+
     // === Diagnostics ===
     /// Accepted for yq's `-v`/`--verbose`; the debug log yq writes to stderr is not produced
     /// (#7025). Standard output is unchanged either way.
