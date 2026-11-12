@@ -3779,10 +3779,12 @@ pub const KEY_STYLE_STRING: &str = "string";
 /// `<<`) has to be told from a plain scalar of that type, which stays bare.
 pub const VALUE_STYLE_STRING: &str = "string";
 
-/// Whether `style` is a quoted string's: `"single"`, `"double"`, or [`VALUE_STYLE_STRING`] /
-/// [`KEY_STYLE_STRING`], the marker for a string whose quoting is not kept but whose type is
-/// (`-P` sets it when it strips the quotes, and a `-p props` transcode seeds it, #7031). The one
-/// test every consumer of a node's quoting makes, so the marker reads as quoted everywhere.
+/// Whether `style` is a quoted string's (#7031).
+///
+/// That is `"single"`, `"double"`, or [`VALUE_STYLE_STRING`] / [`KEY_STYLE_STRING`], the marker for
+/// a string whose quoting is not kept but whose type is (`-P` sets it when it strips the quotes,
+/// and a `-p props` transcode seeds it). The one test every consumer of a node's quoting makes, so
+/// the marker reads as quoted everywhere.
 #[must_use]
 pub fn is_quoted_string_style(style: &str) -> bool {
     matches!(style, "single" | "double") || style == VALUE_STYLE_STRING
