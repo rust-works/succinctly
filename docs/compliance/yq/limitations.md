@@ -3851,9 +3851,15 @@ In path position (`((.a, .b) // .c) = 9`, `del((.a, .b) // .c)`) the rule is the
 One residual is *not* about `//`: yq's key lookup **auto-creates** a missing key in the tree it
 is reading, so `.zz // .[]?` on `{"a":1}` iterates a document that now holds `zz: null` and
 prints `1`, `null` (it prints `null`, `1`, `null` for `(.zz, .[]?)` with no `//` at all). The
-25 rows of that grid that still differ are all this (`.a.b // .a`, `(.a // .b) = 5` on a
-document with no `a`, ...) plus an unrelated `map` over a mapping; and `del((.a, .b) // .zz)`, where
+25 rows of that grid that still differed were all this (`.a.b // .a`, `(.a // .b) = 5` on a
+document with no `a`, which #7068 has since resolved, ...) plus an unrelated `map` over a mapping; and `del((.a, .b) // .zz)`, where
 yq deletes the key it just created and loses `a` as well (`{"c":2}`; here `{"a":null,"c":2}`).
+
+An update whose target is a `//` creates the left operands as yq does since #7068, when they each name one node by fixed steps (`.a`, `.a.b`, `.l[3]`): `(.a // .z) += 1` leaves `a: null` beside `z: 1`, and a chain creates every left operand it reaches (`(.a // .z // .y) = 1`).
+A write in the right operand, yq's update-or-create idiom, is applied to the document the update works on, and the left operand is then tested again: `(.a // (.a = 0)) += 1` creates `a: 1`, and `(.a // (.c.d = 0)) += 1` adds `1` to the document, the error yq raises.
+The parser writes such an update as `(L |= .) | ([L] | .[0] | not | not) as $t | select($t) |= (L op= V) | select($t | not) |= ...`, so comments, anchors and flow style are kept as for any write (`yq_alternative_target_update`).
+A left operand that names several nodes (`(.[] // .z) = 1`) keeps the path resolver's reading, which agrees with yq on the rows measured.
+In value position the write is not seen by the left operand: `.a // (.a = 5)` is the document with `a: 5` here and `5` in yq, which reads `.a` again after the write; yq does so only where its context is editable (a pipe stage), and `(.a // (.a = 0)) * 2` multiplies the document in both.
 
 ### A pipe's empty context list — a stage that builds a node emits once (#6943)
 
