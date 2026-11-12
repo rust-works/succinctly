@@ -3379,10 +3379,10 @@ mod tests {
             if arg.is_positional() || !takes_one_value || !sets {
                 continue;
             }
-            let flag = match arg.get_long() {
-                Some(long) => format!("--{long}"),
-                None => format!("-{}", arg.get_short().expect("a flag has a name")),
-            };
+            let flag = format!(
+                "--{}",
+                arg.get_long().expect("a yq value flag has a long name")
+            );
             // Two different values the argument's own parser accepts, so the only error left is a
             // refused repeat and the value kept shows which occurrence won.
             let possible: Vec<String> = arg
@@ -3395,9 +3395,13 @@ mod tests {
                 _ => ("1".to_string(), "2".to_string()),
             };
             let argv = ["yq", &flag, &first, &flag, &last];
-            let matches = cmd.clone().try_get_matches_from(argv).unwrap_or_else(|e| {
-                panic!("repeating {flag} is refused (give it overrides_with): {e}")
-            });
+            let parsed = cmd.clone().try_get_matches_from(argv);
+            assert!(
+                parsed.is_ok(),
+                "repeating {flag} is refused (give it overrides_with): {:?}",
+                parsed.as_ref().err()
+            );
+            let matches = parsed.expect("checked above");
             let kept: Vec<_> = matches
                 .get_raw(arg.get_id().as_str())
                 .expect("the flag was given")
