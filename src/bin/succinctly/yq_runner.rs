@@ -12475,6 +12475,10 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     if let Err(unresolved) = jq::resolve_func_calls(&mut program.expr) {
         anyhow::bail!("{unresolved}");
     }
+    // #7019: read before the #5450 fold below, which moves a navigation inside an array, and before
+    // the `-o` encoder is piped on.
+    let results_have_no_document =
+        crate::yq_result_document::results_have_no_document(&program.expr);
     // #5450: `.a | [.[] | key]` is `[.a[] | key]`, whose key nodes keep their presentation. Not under
     // `--eval-all`, where an array collects every document's results into one (#4380).
     if !args.eval_all {
@@ -12522,7 +12526,10 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         .transpose()?;
 
     // Output configuration
-    let output_config = OutputConfig::from_args(&args);
+    let mut output_config = OutputConfig::from_args(&args);
+    // #7019: yq writes `---` only between results whose document index differs, and a result built
+    // from a document's root or from nothing has index 0, as every other one of its kind does.
+    output_config.no_doc |= results_have_no_document;
 
     // Set up output
     let stdout = std::io::stdout();
