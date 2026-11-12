@@ -435,4 +435,41 @@ mod tests {
             .join()
             .expect("classified");
     }
+
+    /// `try` parses under `--jq-extensions` only; without a `catch` its results are its body's.
+    #[test]
+    fn try_without_catch_is_its_body_7019() {
+        let classify = |filter: &str| {
+            let mut program =
+                jq::parse_program_with_mode_and_extensions(filter, jq::ParserMode::Yq, true)
+                    .expect("filter parses");
+            jq::resolve_func_calls(&mut program.expr).expect("calls resolve");
+            results_have_no_document(&program.expr)
+        };
+        assert!(classify("try \"x\""));
+        assert!(!classify("try .a"));
+        assert!(!classify("try \"x\" catch ."));
+    }
+
+    /// A spent budget answers "not known", so the filter keeps its separators.
+    #[test]
+    fn a_spent_budget_keeps_the_separators_7019() {
+        let program =
+            jq::parse_program_with_mode_and_extensions("\"x\"", jq::ParserMode::Yq, false)
+                .expect("filter parses");
+        let spent = core::cell::Cell::new(0);
+        let cx = Cx {
+            scope: None,
+            budget: &spent,
+        };
+        assert_eq!(result_node(&program.expr, ROOT, cx), None);
+        assert!(!fresh_regardless(&program.expr, cx));
+        let ample = core::cell::Cell::new(BUDGET);
+        let cx = Cx {
+            scope: None,
+            budget: &ample,
+        };
+        assert_eq!(result_node(&program.expr, ROOT, cx), Some(FRESH));
+        assert!(fresh_regardless(&program.expr, cx));
+    }
 }
