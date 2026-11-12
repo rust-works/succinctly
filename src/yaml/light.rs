@@ -8520,7 +8520,9 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
 
     fn head_comment_raw_outside_header(&self) -> Vec<String> {
         let header_end = self.header_end();
+        // After a byte-order mark yq sets no header aside (#6762), so the node keeps its comment.
         if header_end > 0
+            && !self.index.after_bom()
             && matches!(self.index.get_head_comments(self.bp_pos).first(),
                 Some(&(start, _)) if (start as usize) < header_end)
         {

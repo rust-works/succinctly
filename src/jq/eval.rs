@@ -26841,15 +26841,15 @@ pub(crate) fn yq_props_format_style(format_type: &FormatType) -> Option<(String,
 
 /// yq's props text of `value`, a document node whose comments are `comments` (path to comment, as
 /// [`format_props_styled`] reads them), after the document's `leading` comment block when the node
-/// is the first document's content (#6922). `format_type` is one [`yq_props_format_style`] answers.
+/// is the first document's content (#6922). `format_type` is one [`yq_props_format_style`] answers,
+/// with `style` what it answers.
 pub(crate) fn format_yq_props_commented(
     format_type: &FormatType,
+    (separator, array_brackets): (String, bool),
     value: &OwnedValue,
     comments: &BTreeMap<String, String>,
     leading: &str,
 ) -> String {
-    let (separator, array_brackets) =
-        yq_props_format_style(format_type).unwrap_or_else(|| (String::from(" = "), false));
     let mut text = String::from(leading);
     text.push_str(&format_props_styled(
         value,

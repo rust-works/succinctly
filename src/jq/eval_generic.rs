@@ -6198,15 +6198,6 @@ fn owned_from_standard_json_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
     })
 }
 
-/// The text yq's `to_yaml`, `@yaml` and `tostring` make of a *container or alias that is a
-/// document node* (#6901): the node as it was written -- flow collections kept flow, a trailing comment
-/// kept -- rather than the canonical block rendering of its value. It is the YAML writer the CLI
-/// prints that same node with (`DocumentCursor::stream_yaml_as_document`), so the string cannot
-/// drift from the output.
-///
-/// `None` when the node has no text to render (a computed value, a plain scalar -- which prints
-/// the same either way -- or a cursor over a format that has no YAML writer), and the caller keeps
-/// the owned rendering. The text carries no final line break, as that writer leaves none.
 /// The comment yq's properties encoder writes above each scalar below `cursor`, by property path
 /// (unescaped, as the encoder builds it), into `out` (#6922). A mapping entry's comment is its key's
 /// head and line comment and then its value's; a sequence item's is its own. yq strips the first `#`
@@ -6236,6 +6227,20 @@ fn collect_props_comments<C: DocumentCursor>(
             text.push_str(strip_hash(&line));
         }
     }
+    // Only a comment is kept: a property without one writes nothing above it, and a large document
+    // with one comment then holds one entry, not one per scalar. A later property on the same path
+    // replaces the comment, as yq's `SetComments` does, whatever it holds.
+    fn insert_comment(
+        out: &mut alloc::collections::BTreeMap<String, String>,
+        path: String,
+        comment: String,
+    ) {
+        if comment.is_empty() {
+            out.remove(&path);
+        } else {
+            out.insert(path, comment);
+        }
+    }
     fn is_container<V: DocumentValue>(value: &V) -> bool {
         value.as_object().is_some() || value.as_array().is_some()
     }
@@ -6244,6 +6249,8 @@ fn collect_props_comments<C: DocumentCursor>(
         let mut head = head;
         while let Some((field, rest)) = fields.uncons() {
             fields = rest;
+            // Taken first: a key with no text still owns the dash comment, which goes nowhere then.
+            let dash = head.take();
             let Some(key) = field.key_str() else {
                 continue;
             };
@@ -6252,9 +6259,6 @@ fn collect_props_comments<C: DocumentCursor>(
             } else {
                 format!("{prefix}.{key}")
             };
-            let mut comment = String::new();
-            own_comment(&field.key_cursor, head.take(), &mut comment);
-            own_comment(&field.value_cursor, None, &mut comment);
             if is_container(&field.value_cursor.value()) {
                 collect_props_comments(
                     &field.value_cursor,
@@ -6265,7 +6269,10 @@ fn collect_props_comments<C: DocumentCursor>(
                     depth + 1,
                 );
             } else {
-                out.insert(path, comment);
+                let mut comment = String::new();
+                own_comment(&field.key_cursor, dash, &mut comment);
+                own_comment(&field.value_cursor, None, &mut comment);
+                insert_comment(out, path, comment);
             }
         }
     } else if let Some(mut elements) = value.as_array() {
@@ -6293,12 +6300,21 @@ fn collect_props_comments<C: DocumentCursor>(
             } else {
                 let mut comment = String::new();
                 own_comment(&element, own_head, &mut comment);
-                out.insert(path, comment);
+                insert_comment(out, path, comment);
             }
         }
     }
 }
 
+/// The text yq's `to_yaml`, `@yaml` and `tostring` make of a *container or alias that is a
+/// document node* (#6901): the node as it was written -- flow collections kept flow, a trailing comment
+/// kept -- rather than the canonical block rendering of its value. It is the YAML writer the CLI
+/// prints that same node with (`DocumentCursor::stream_yaml_as_document`), so the string cannot
+/// drift from the output.
+///
+/// `None` when the node has no text to render (a computed value, a plain scalar -- which prints
+/// the same either way -- or a cursor over a format that has no YAML writer), and the caller keeps
+/// the owned rendering. The text carries no final line break, as that writer leaves none.
 fn yq_node_yaml_text<S: EvalSemantics, C: DocumentCursor>(
     cursor: Option<&C>,
     owned: &OwnedValue,
@@ -16552,16 +16568,14 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         {
             let owned = owned_or_suppress!(to_owned_with_cursor::<_, S>(&value, cursor), optional);
             let mut comments = alloc::collections::BTreeMap::new();
-            let leading = match cursor.as_ref() {
-                Some(c) => {
-                    let array_brackets = yq_props_format_style(format_type).is_some_and(|(_, b)| b);
-                    collect_props_comments(c, "", None, array_brackets, &mut comments, 0);
-                    c.props_leading_content().unwrap_or_default()
-                }
-                None => String::new(),
-            };
+            let style = yq_props_format_style(format_type).unwrap_or_default();
+            // The guard holds a cursor.
+            let leading = cursor.as_ref().map_or_else(String::new, |c| {
+                collect_props_comments(c, "", None, style.1, &mut comments, 0);
+                c.props_leading_content().unwrap_or_default()
+            });
             GenericResult::Owned(OwnedValue::String(
-                format_yq_props_commented(format_type, &owned, &comments, &leading).into(),
+                format_yq_props_commented(format_type, style, &owned, &comments, &leading).into(),
             ))
         }
         Expr::Format(format_type) => format_result::<S, _>(
