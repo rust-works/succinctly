@@ -39804,9 +39804,20 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 }
                 OwnedValue::String(s) if key_node_spells(&key_cursor, &key_cursor.value(), s) => {
                     match key_owned_value::<_, _, S>(&key_cursor.value(), &key_cursor) {
-                        Ok(Some(OwnedValue::String(_)) | None) => {
-                            GenericResult::Owned(OwnedValue::String(s.clone()))
+                        // A string answer is two cases: a spelling the ladder retypes but
+                        // `OwnedValue` cannot keep (`01`, `~`, `True`), which must not reach
+                        // a later consumer as a node; and a spelling that merely begins like
+                        // one (`n1`, `t1`, `.a`), which the node reads as the same string.
+                        // Only the second keeps its node, so `head_comment`, `line` and the
+                        // rest read the key's own metadata (#7043).
+                        Ok(Some(OwnedValue::String(_))) => {
+                            match to_owned_cursor::<S, _>(&key_cursor) {
+                                Ok(OwnedValue::String(_)) => GenericResult::OneCursor(key_cursor),
+                                Ok(_) => GenericResult::Owned(OwnedValue::String(s.clone())),
+                                Err(e) => GenericResult::Error(e),
+                            }
                         }
+                        Ok(None) => GenericResult::Owned(OwnedValue::String(s.clone())),
                         Ok(Some(_)) => GenericResult::OneCursor(key_cursor),
                         Err(e) => GenericResult::Error(e),
                     }
