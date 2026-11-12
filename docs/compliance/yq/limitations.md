@@ -7845,6 +7845,16 @@ These rows differ:
 - `--front-matter` with an explicit `-p ini` is refused (`--front-matter and --input-format ini are incompatible`), as `-p json` is, where yq decodes the front matter as INI.
 - A document whose text passes the YAML reader's limits is refused, where yq builds the nodes without writing the text.
 
+### `--unwrapScalar=false` with `-o=yaml` — a top-level scalar prints as its value, not as a node ([#7093](https://github.com/rust-works/succinctly/issues/7093))
+
+`-r` / `--unwrapScalar` takes its value after `=` (`--unwrapScalar=false`, `-r=true`), and the value yq resolves is its own when given and else true for `-o=yaml` and `-o=props` and false for every other format.
+It decides whether `-o=shell` writes a value unquoted, whether `-o=props` and `@props` put a value with a space in it in Go's `%q` quotes, and whether a top-level scalar of the JSON, KYAML and other encoders is written raw; `@props` follows it for every output format, so `-o=json '{"a":"x y"} | @props'` quotes `x y` as yq does.
+These agree with yq v4.53.3 on 95 flag, format and filter combinations (`tests/yq_cli/i7093.rs`).
+One row differs:
+
+- `-o=yaml --unwrapScalar=false` prints a top-level scalar result as its value, where yq prints the node the YAML encoder writes: `.q` on `q: "a b"` is `"a b"` in yq and `a b` here, a string that needs quotes is quoted, a block scalar keeps its `|` header, and a comment on the scalar is kept (`x # c`).
+  A document, mapping or sequence is unaffected.
+
 ### `-p kyaml` — read as YAML, as yq reads it ([#6925](https://github.com/rust-works/succinctly/issues/6925))
 
 `-p kyaml` (alias `ky`) reads each input with the YAML reader, which is what yq's KYAML decoder is, so KYAML (YAML's flow subset with explicit commas) and block YAML both load and every route after the read is the `-p yaml` one.
