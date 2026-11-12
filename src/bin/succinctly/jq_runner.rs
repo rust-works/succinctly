@@ -7009,16 +7009,21 @@ fn read_inputs(
 
     // #7023: `-R` over a lone regular file reads its lines a window at a time, as the plain route
     // reads its documents. Anything the gate turns down is read whole below.
-    if let Some((file, len, eof_tail)) = lone_raw_windowed_file(args, track_eof, &files) {
-        let mut windows = window::LineWindows::new(file, len, lazy_window_bytes());
+    if let Some((file, len)) = lone_raw_windowed_file(args, &files) {
+        let mut windows =
+            window::LineWindows::new(Box::new(file), Some(len), lazy_window_bytes(), Vec::new());
         let first = windows
-            .next_window(report_input_read_failure)
+            .next_window(None, report_input_read_failure)
             .map(raw_window_text)
             .unwrap_or_default();
         opened.clone_from(&files);
         let mut locations =
             InputLocations::new(files.iter().map(|p| Some(input_display_name(p))).collect());
-        locations.eof_tail = eof_tail;
+        // How the stream ends is settled when the producer gets there, from the lines it counted.
+        locations.eof_tail = track_eof.then_some(EofTail {
+            newlines: 0,
+            unknown: true,
+        });
         LAZY_RAW_INPUTS.with(|slot| *slot.borrow_mut() = Some(vec![(0, first)]));
         LAZY_RAW_WINDOWS.with(|slot| *slot.borrow_mut() = Some(windows));
         return Ok(Ok((Vec::new(), locations, None, Vec::new())));
@@ -8130,11 +8135,7 @@ fn read_inputs(
                     // same way, so it sees corrected content at unchanged
                     // line boundaries. Slurp mode (`-s`) keeps whole-buffer
                     // substitution below, matching real jq there too.
-                    e.into_bytes()
-                        .split(|&b| b == b'\n')
-                        .map(succinctly::text::utf8::substitute_invalid_utf8_jq_style)
-                        .collect::<Vec<_>>()
-                        .join("\n")
+                    substitute_raw_lines(e.into_bytes())
                 } else if args.input_dsv.is_none() && !args.raw_input {
                     // #1743: JSON-shaped input (plain documents, `--slurp`
                     // and `--seq` alike) gets jq's own per-JSON-string
@@ -11228,19 +11229,12 @@ thread_local! {
     static LAZY_RAW_MIN_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
-/// The lone regular file `-R` reads a window at a time (#7023), opened, with its length and, for a
-/// program that reads `input`, how its stream ends (#4303), counted in a pass over the file that
-/// holds one block; or `None` for a run that is not one. `-R` is a line reader, so it needs no more
-/// of the text before a line than the number of line breaks, which the producer keeps as it goes,
-/// and a stream of lines has no fault to word: every flag that has the route read the stream whole
-/// (`--slurp`, `--validate`, DSV), and every shape the plain route's gate turns down (stdin, a pipe
-/// or directory, several files, a file too small to be worth it), keeps the route that reads it whole.
-/// The path is judged by `stat`, which opens nothing, as [`windowed_plain_file`] judges it.
-fn lone_raw_windowed_file(
-    args: &JqCommand,
-    track_eof: bool,
-    files: &[PathBuf],
-) -> Option<(std::fs::File, u64, Option<EofTail>)> {
+/// The lone regular file `-R` reads a window at a time (#7023), opened, with its length; or `None` for
+/// a run that is not one. `-R` is a line reader, so it needs no more of the text before a line than
+/// the number of line breaks, which the producer keeps as it goes, and a stream of lines has no fault
+/// to word: every flag that has the route read the stream whole (`--slurp`, `--validate`, DSV), and
+/// every shape [`lone_regular_file`] turns down, keeps the route that reads it whole.
+fn lone_raw_windowed_file(args: &JqCommand, files: &[PathBuf]) -> Option<(std::fs::File, u64)> {
     if !args.raw_input
         || args.slurp
         || args.stream
@@ -11252,48 +11246,9 @@ fn lone_raw_windowed_file(
     {
         return None;
     }
-    let [path] = files else {
-        return None;
-    };
-    if is_stdin_dash(path) || path.starts_with("/dev/fd/") {
-        return None;
-    }
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() || meta.len() < raw_window_min_bytes() || names_stdin(&meta) {
-        return None;
-    }
-    let eof_tail = if track_eof {
-        Some(raw_eof_tail(path)?)
-    } else {
-        None
-    };
+    let (path, meta) = lone_regular_file(files, raw_window_min_bytes())?;
     let file = std::fs::File::open(path).ok()?;
-    Some((file, meta.len(), eof_tail))
-}
-
-/// How a `-R` stream ends ([`EofTail::of`] with `raw`), for a file counted a block at a time: its
-/// line breaks, and whether bytes follow the last (a last line without one completes at the end).
-/// `None` when the file cannot be read, which the route that reads it whole then reports.
-fn raw_eof_tail(path: &Path) -> Option<EofTail> {
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut block = vec![0u8; window::WINDOW_BYTES];
-    let mut newlines = 0usize;
-    let mut last = None;
-    loop {
-        match file.read(&mut block) {
-            Ok(0) => break,
-            Ok(read) => {
-                newlines += count_newlines(&block[..read]);
-                last = Some(block[read - 1]);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return None,
-        }
-    }
-    Some(EofTail {
-        newlines: u32::try_from(newlines).unwrap_or(u32::MAX),
-        unknown: last.is_some_and(|byte| byte != b'\n'),
-    })
+    Some((file, meta.len()))
 }
 
 /// The lone regular file the plain route reads a window at a time (#6920), opened, and the means
@@ -11314,16 +11269,7 @@ fn windowed_plain_file(
         return None;
     }
     let files = get_input_files(args);
-    let [path] = files.as_slice() else {
-        return None;
-    };
-    if is_stdin_dash(path) || path.starts_with("/dev/fd/") {
-        return None;
-    }
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() || meta.len() < window::MIN_WINDOWED_FILE_BYTES || names_stdin(&meta) {
-        return None;
-    }
+    let (path, meta) = lone_regular_file(&files, window::MIN_WINDOWED_FILE_BYTES)?;
     let file = std::fs::File::open(path).ok()?;
     let reread = window::Reread::new(&file, meta.len(), path.clone()).ok()?;
     Some((
@@ -11331,6 +11277,24 @@ fn windowed_plain_file(
         window::WindowedFile::new(file, meta.len(), window::WINDOW_BYTES),
         std::rc::Rc::new(reread),
     ))
+}
+
+/// The one regular file of at least `min_len` bytes that `files` names, with its `stat`: the shape
+/// every route that reads a file a window at a time takes (#6920, #7023), judged in one place. Not
+/// stdin, a descriptor the run already holds, a pipe or directory, several files or a small file.
+/// The path is judged by `stat`, which opens nothing: opening a named pipe pairs with its writer, and
+/// a handle dropped on the way to another route would take the writer's bytes with it. A path that
+/// names a descriptor the run already holds (`/dev/stdin`, `/dev/fd/N`) is left alone too: the file it
+/// opens may share an offset with the descriptor on some systems, so it is not read from its start.
+fn lone_regular_file(files: &[PathBuf], min_len: u64) -> Option<(&PathBuf, std::fs::Metadata)> {
+    let [path] = files else {
+        return None;
+    };
+    if is_stdin_dash(path) || path.starts_with("/dev/fd/") {
+        return None;
+    }
+    let meta = std::fs::metadata(path).ok()?;
+    (meta.is_file() && meta.len() >= min_len && !names_stdin(&meta)).then_some((path, meta))
 }
 
 /// Report every failure in `failures`, and note that the run must now exit 2.
@@ -12764,11 +12728,10 @@ impl DroppedText {
     }
 }
 
-/// What is left to read of a lone source the lazy route started on the front of (#6451).
+/// What is left to read of a lone source the lazy route started on the front of (#6451): a window at
+/// a time (#7023), with the bytes read after the front's last whole character carried on.
 struct LazyRest {
-    reader: Box<dyn std::io::Read>,
-    /// The bytes read after the text that do not make a whole character yet.
-    pending: Vec<u8>,
+    windows: window::LineWindows,
 }
 
 /// How much of a lone source [`lone_lazy_start`] reads before the program starts: room for the
@@ -12901,8 +12864,16 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
                 return Ok(LoneStart::Lazy {
                     text,
                     spans: chunk.spans,
-                    rest: LazyRest { reader, pending },
-                })
+                    rest: LazyRest {
+                        windows: window::LineWindows::new(
+                            reader,
+                            // A file's length is known; stdin ends at a short read.
+                            (!from_stdin).then(|| (capacity - front) as u64),
+                            lazy_window_bytes(),
+                            pending,
+                        ),
+                    },
+                });
             }
             // patchcov: coverage tolerate reason="unreachable: the bytes were validated above"
             Err(e) => {
@@ -12970,94 +12941,76 @@ fn read_lazy_window(lazy: &mut LazyJsonInputs, more: &mut LazyMore, want: usize)
     };
     #[cfg(test)]
     LAZY_WINDOWS_READ.with(|n| n.set((n.get().0 + 1, n.get().1)));
-    let mut fresh = std::mem::take(&mut rest.pending);
-    let mut eof = false;
-    let mut ask = want.max(1);
-    // The read ends at a line break: a block that has none is read on, doubling.
-    let cut = loop {
-        let before = fresh.len();
-        match rest
-            .reader
-            .by_ref()
-            .take(ask as u64)
-            .read_to_end(&mut fresh)
-        {
-            Ok(read) if read < ask => eof = true,
-            Ok(_) => {}
-            Err(error) => {
-                // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
-                // A source that failed part-way ends there: jq reports it and exits 2 (#5498).
-                report_input_read_failure(&error);
-                eof = true;
-                // patchcov: coverage end
-            }
-        }
-        if eof {
-            break fresh.len();
-        }
-        if let Some(at) = fresh[before..].iter().rposition(|&b| b == b'\n') {
-            break before + at + 1;
-        }
-        ask = ask.saturating_mul(2);
+    let Some(fresh) = rest
+        .windows
+        .next_window(Some(want), report_input_read_failure)
+    else {
+        return WindowRead::Eof;
     };
-    let mut carried = fresh.split_off(cut);
-    match std::str::from_utf8(&fresh) {
-        Ok(new) => {
-            std::rc::Rc::make_mut(&mut lazy.text).push_str(new);
-            if eof {
-                WindowRead::Eof
-            } else {
-                rest.pending = std::mem::take(&mut carried);
-                more.rest = Some(rest);
-                WindowRead::More
+    let Ok(new) = std::str::from_utf8(&fresh) else {
+        // Not UTF-8: the rest of the source, and all of it from here, is bytes as read.
+        let mut original = std::mem::take(std::rc::Rc::make_mut(&mut lazy.text)).into_bytes();
+        original.extend_from_slice(&fresh);
+        original.extend(rest.windows.take_rest(report_input_read_failure));
+        // The strict scan reads the stream from the first document not read: the text before is
+        // blanked, as it may begin inside the last document a window dropped the front of.
+        more.recorded_tail = Some(more.dropped.count_in(EofTail::of(
+            &[blank_consumed(&original, more).as_slice()],
+            false,
+            &more.seams,
+            false,
+        )));
+        let (text, edits) =
+            succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document_mapped(&original);
+        debug_assert!(
+            edits
+                .first()
+                .map_or(true, |edit| edit.raw.start >= more.scanned_to
+                    && edit.text.start >= more.scanned_to),
+            "the substitution leaves the text already scanned as it was"
+        );
+        let len = original.len();
+        lazy.seam = std::mem::take(&mut lazy.seam).after_substitution(len, &edits);
+        more.seams = std::mem::take(&mut more.seams)
+            .into_iter()
+            .map(|seam| seam.after_substitution(len, &edits))
+            .collect();
+        more.lossy = Some(LossySource::new(original, edits));
+        *std::rc::Rc::make_mut(&mut lazy.text) = text;
+        return WindowRead::Eof;
+    };
+    std::rc::Rc::make_mut(&mut lazy.text).push_str(new);
+    if rest.windows.finished() {
+        WindowRead::Eof
+    } else {
+        more.rest = Some(rest);
+        WindowRead::More
+    }
+}
+
+/// `bytes`, the text a lone source read in windows holds, with what comes before the first document
+/// not yet read blanked out when the front of the text has been dropped (#7023): a window starts at
+/// the line the last document read ended on, which may be inside it (`2]` of `[1,\n2]`), and the
+/// strict scan that settles how the stream ends would read that as a fault. Offsets and line
+/// breaks are unchanged.
+fn blank_consumed(bytes: &[u8], more: &LazyMore) -> Vec<u8> {
+    let mut blanked = bytes.to_vec();
+    if more.dropped.bytes > 0 {
+        // The line breaks stay: the end of the stream counts them, and where its last line starts.
+        let upto = more.scanned_to.min(blanked.len());
+        for byte in &mut blanked[..upto] {
+            if *byte != b'\n' {
+                *byte = b' ';
             }
-        }
-        Err(_) => {
-            // Not UTF-8: the rest of the source, and all of it from here, is bytes as read.
-            if !eof {
-                fresh.append(&mut carried);
-                if let Err(error) = rest.reader.read_to_end(&mut fresh) {
-                    // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
-                    report_input_read_failure(&error);
-                    // patchcov: coverage end
-                }
-            }
-            let mut original = std::mem::take(std::rc::Rc::make_mut(&mut lazy.text)).into_bytes();
-            original.append(&mut fresh);
-            more.recorded_tail = Some(more.dropped.count_in(EofTail::of(
-                &[original.as_slice()],
-                false,
-                &more.seams,
-                false,
-            )));
-            let (text, edits) =
-                succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document_mapped(
-                    &original,
-                );
-            debug_assert!(
-                edits
-                    .first()
-                    .map_or(true, |edit| edit.raw.start >= more.scanned_to
-                        && edit.text.start >= more.scanned_to),
-                "the substitution leaves the text already scanned as it was"
-            );
-            let len = original.len();
-            lazy.seam = std::mem::take(&mut lazy.seam).after_substitution(len, &edits);
-            more.seams = std::mem::take(&mut more.seams)
-                .into_iter()
-                .map(|seam| seam.after_substitution(len, &edits))
-                .collect();
-            more.lossy = Some(LossySource::new(original, edits));
-            *std::rc::Rc::make_mut(&mut lazy.text) = text;
-            WindowRead::Eof
         }
     }
+    blanked
 }
 
 /// Reads what is left of the source, for a fault: the eager reader that takes the stream from the end
 /// of the last good document reads the stream to its end (#7023).
 fn read_lazy_rest(lazy: &mut LazyJsonInputs, more: &mut LazyMore) {
-    while read_lazy_window(lazy, more, LAZY_WINDOW_BYTES) == WindowRead::More {}
+    while read_lazy_window(lazy, more, lazy_window_bytes()) == WindowRead::More {}
 }
 
 /// Drops the text of a lone source that the documents handed out are over (#7023): up to the start of
@@ -13495,8 +13448,12 @@ fn lazy_scan_on(
                 } // patchcov: coverage end
             }
             *exhausted = settled(more.recorded_tail.unwrap_or_else(|| {
-                more.dropped
-                    .count_in(EofTail::of(&[text.as_bytes()], false, &more.seams, false))
+                more.dropped.count_in(EofTail::of(
+                    &[blank_consumed(text.as_bytes(), &more).as_slice()],
+                    false,
+                    &more.seams,
+                    false,
+                ))
             }));
         }
     }
@@ -13651,6 +13608,9 @@ fn lazy_raw_producer_windowed(
     exhausted: Option<(u32, u32)>,
 ) -> jq::InputProducer {
     let mut files = files;
+    // A file read in windows is not counted before the program starts: the end of the stream is the
+    // newlines the producer has counted when it gets there, and `<unknown>` if the last line has none.
+    let windowed = rest.is_some();
     let mut rest = rest;
     let last = files.len().saturating_sub(1);
     // The file being read and the offset in it, the newlines of that file read so far (a line's
@@ -13659,6 +13619,7 @@ fn lazy_raw_producer_windowed(
     let (mut file, mut at) = (0usize, 0usize);
     let mut newlines = 0u32;
     let mut open = String::new();
+    let mut ended_open = false;
     Box::new(move || {
         while file < files.len() {
             let (tag, text) = &files[file];
@@ -13679,7 +13640,7 @@ fn lazy_raw_producer_windowed(
             if file == last {
                 if let Some(next) = rest
                     .as_mut()
-                    .and_then(|windows| windows.next_window(report_input_read_failure))
+                    .and_then(|windows| windows.next_window(None, report_input_read_failure))
                 {
                     files[file].1 = raw_window_text(next);
                     at = 0;
@@ -13694,28 +13655,38 @@ fn lazy_raw_producer_windowed(
             newlines = 0;
         }
         if open.is_empty() {
-            return jq::ProducedInput::End(exhausted);
+            return jq::ProducedInput::End(if windowed {
+                files
+                    .get(last)
+                    .map(|(tag, _)| *tag)
+                    .zip(Some(newlines))
+                    .filter(|_| !ended_open)
+            } else {
+                exhausted
+            });
         }
         // A final line without a newline: the last file's, on that file's last line.
         let line = std::mem::take(&mut open);
         file = files.len();
+        ended_open = true;
         jq::ProducedInput::Document(OwnedValue::String(line.into()), files[last].0, newlines)
     })
 }
 
-/// The text of a window of `-R`'s lines: each line has jq's substitution of any byte that is not
-/// UTF-8, as [`get_inputs`] makes it for a file read whole (#1742). A window is whole lines, so the
-/// lines are the file's.
+/// `-R`'s lines with jq's substitution of any byte that is not UTF-8 (#1742): per line, since jq's
+/// end-of-buffer fixup (#1717) is relative to each line's end. Splitting on `\n` first is safe amid
+/// invalid UTF-8, as 0x0A is never part of a multi-byte sequence, and joining restores the layout.
+fn substitute_raw_lines(bytes: Vec<u8>) -> String {
+    bytes
+        .split(|&b| b == b'\n')
+        .map(succinctly::text::utf8::substitute_invalid_utf8_jq_style)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The text of a window of `-R`'s lines (a window is whole lines, so the lines are the file's).
 fn raw_window_text(bytes: Vec<u8>) -> String {
-    match String::from_utf8(bytes) {
-        Ok(text) => text,
-        Err(e) => e
-            .into_bytes()
-            .split(|&b| b == b'\n')
-            .map(succinctly::text::utf8::substitute_invalid_utf8_jq_style)
-            .collect::<Vec<_>>()
-            .join("\n"),
-    }
+    String::from_utf8(bytes).unwrap_or_else(|e| substitute_raw_lines(e.into_bytes()))
 }
 
 /// Leaves a stream's lazy documents for the call site that seeds the `input` queue, which takes them.
@@ -20281,6 +20252,66 @@ mod tests {
             argv.extend(flags);
             argv.extend([".", big.as_str()]);
             assert!(!takes(&argv), "{flags:?}");
+        }
+    }
+
+    /// #7023: `-R` reads a window at a time only for one regular file big enough to be worth it, on a
+    /// run that reads the lines in order, and the plain route's gate agrees on which files those are.
+    #[test]
+    fn lone_raw_windowed_file_takes_only_a_lone_regular_file_7023() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = |name: &str, len: u64| {
+            let path = dir.path().join(name);
+            std::fs::File::create(&path)
+                .and_then(|f| f.set_len(len))
+                .expect("a sparse file");
+            path.to_string_lossy().into_owned()
+        };
+        let big = file("big.txt", window::MIN_WINDOWED_FILE_BYTES);
+        let small = file("small.txt", window::MIN_WINDOWED_FILE_BYTES - 1);
+        let directory = dir.path().to_string_lossy().into_owned();
+        let missing = dir
+            .path()
+            .join("missing.txt")
+            .to_string_lossy()
+            .into_owned();
+        let takes = |argv: &[&str]| {
+            let cmd = JqCommand::try_parse_from(argv.iter().copied()).unwrap();
+            lone_raw_windowed_file(&cmd, &get_input_files(&cmd)).is_some()
+        };
+        assert!(takes(&["jq", "-R", ".", &big]));
+        assert!(takes(&["jq", "-nR", "inputs", &big]));
+        assert!(takes(&["jq", "-R", "--arg", "a", "1", "length", &big]));
+        // Not one regular file big enough, as the plain route's gate judges it.
+        for shape in [&small, &directory, &missing, "-", "/dev/stdin", "/dev/fd/0"] {
+            assert!(!takes(&["jq", "-R", ".", shape]), "{shape}");
+        }
+        assert!(!takes(&["jq", "-R", "."]));
+        assert!(!takes(&["jq", "-R", ".", &big, &big]));
+        // A run that is not `-R`, or reads the stream another way.
+        assert!(!takes(&["jq", ".", &big]));
+        for flags in [
+            &["-s"][..],
+            &["--validate"],
+            &["--stream"],
+            &["--stream-errors"],
+            &["--seq"],
+        ] {
+            let mut argv = vec!["jq", "-R"];
+            argv.extend(flags);
+            argv.extend([".", big.as_str()]);
+            assert!(!takes(&argv), "{flags:?}");
+        }
+        // The two gates judge a file the same way.
+        for shape in [&big, &small, &directory, &missing] {
+            let cmd = JqCommand::try_parse_from(["jq", ".", shape.as_str()]).unwrap();
+            let raw = JqCommand::try_parse_from(["jq", "-R", ".", shape.as_str()]).unwrap();
+            assert_eq!(
+                windowed_plain_file(&cmd).is_some(),
+                lone_raw_windowed_file(&raw, &get_input_files(&raw)).is_some(),
+                "{shape}"
+            );
         }
     }
 
