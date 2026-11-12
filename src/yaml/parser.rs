@@ -1532,10 +1532,34 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             && self.current_type == Some(NodeType::SequenceItem)
             && self.pending_block.column > next_column
             // yq drops the block before a flow collection item, which succinctly does not reproduce.
-            && !self.input[self.pos.min(self.input.len())..]
-                .iter()
-                .find(|&&b| !matches!(b, b' ' | b'\t'))
-                .is_some_and(|&b| matches!(b, b'[' | b'{'))
+            && !self.opens_flow_collection(self.pos)
+    }
+
+    /// The pending head lines that start at or before `pos`: the run's head, since lines are
+    /// recorded in order (#7044).
+    fn pending_lines_above(&self, pos: usize) -> usize {
+        self.pending_head_lines
+            .partition_point(|&(start, _)| start as usize <= pos)
+    }
+
+    /// Whether the first node from `from` on is a flow collection, or a block sequence whose first
+    /// items open one (`- [1]`, `- - {a: 1}`): yq drops a comment block it would make that node's
+    /// foot (#5053, #7044). Blank lines, indentation and `- ` indicators are passed over; a key
+    /// written as a flow collection (`[1]: 2`) reads as one too.
+    fn opens_flow_collection(&self, from: usize) -> bool {
+        let mut at = from.min(self.input.len());
+        loop {
+            match self.input.get(at) {
+                Some(b' ' | b'\t' | b'\n' | b'\r') => at += 1,
+                Some(b'-')
+                    if matches!(self.input.get(at + 1), Some(b' ' | b'\t' | b'\n' | b'\r')) =>
+                {
+                    at += 1;
+                }
+                Some(b'[' | b'{') => return true,
+                _ => return false,
+            }
+        }
     }
 
     /// Hand the pending block to the first key of the item opening now, keeping the blank lines between its
@@ -4926,7 +4950,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
         // Check what follows
         if self.at_line_end() {
-            self.defer_item_value_to_later_lines(indent, had_property, wrapper_bp, None);
+            self.defer_item_value_to_later_lines(indent, had_property, wrapper_bp);
             return Ok(());
         }
 
@@ -5056,7 +5080,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// and only what follows the blank line its head (`- 1` / `-` / `  # c` / blank / `  n1: 1` is
     /// `.[1].n1`'s key's foot `c`, printed below `n1: 1`; with `  # d` between the blank line and
     /// `n1: 1`, `d` is its head). Measured against yq v4.53.3, which reads it this way only after a
-    /// node has opened earlier in the document and when the dash line has no comment of its own
+    /// node has opened earlier in the stream (this document or an earlier one, a null item included)
+    /// and when the dash line has no comment of its own
     /// (both checked by the caller); a blank line between the dash and the block keeps the whole run
     /// the head. Before a flow collection yq drops the block, which this does not reproduce: the
     /// block stays the collection's head, as for the run [`Self::defers_foot_to_next_item`] places.
@@ -5066,11 +5091,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// by the count taken before the lookahead, which a block the lookahead settles leaves stale.
     fn defer_first_block_below_bare_dash(&mut self, dash_line_end: usize) {
         // The pending lines below the dash: the run's tail, since lines are recorded in order.
-        let below = self
-            .pending_head_lines
-            .iter()
-            .position(|&(start, _)| start as usize > dash_line_end)
-            .unwrap_or(self.pending_head_lines.len());
+        let below = self.pending_lines_above(dash_line_end);
         let lines = &self.pending_head_lines[below..];
         let Some(&(first_start, _)) = lines.first() else {
             return;
@@ -5084,7 +5105,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             .iter()
             .position(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
             .map_or(self.input.len(), |offset| last_end + offset);
-        if matches!(self.input.get(content), Some(b'[' | b'{')) {
+        if self.opens_flow_collection(last_end) {
             return;
         }
         let gap = (0..lines.len()).find(|&i| {
@@ -5107,17 +5128,18 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// `indent` is the `-`'s column, `wrapper_bp` the item wrapper's own bp. `had_property` is
     /// whether properties follow the dash on its line: an ordinary item passes it, the first item
     /// of an explicit key's sequence passes `false` (properties there are read by its own #6570
-    /// branch, so only a dash alone on its line reaches this). `lines_above_dash` is how many
-    /// pending head lines were above the dash, when the caller's lookahead has already recorded
-    /// the lines below it (#6593); `None` counts them here, before this routine's own lookahead.
+    /// branch, so only a dash alone on its line reaches this).
+    ///
+    /// Both callers reach here at the end of the dash line, so the pending head lines above the
+    /// dash are told from those a lookahead recorded below it by position (`dash_line_end`), not by
+    /// a count taken before the lookahead, which goes stale when it settles a block (#7044; the
+    /// count was #6593's).
     fn defer_item_value_to_later_lines(
         &mut self,
         indent: usize,
         had_property: bool,
         wrapper_bp: usize,
-        lines_above_dash: Option<usize>,
     ) {
-        // Both callers reach here at the end of the dash line, before any lookahead moves on (#7044).
         let dash_line_end = self.pos;
         // A trailing comment here belongs to this item's own deferred
         // value, not to the item's dash line (#784, same shape as
@@ -5152,7 +5174,6 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // the deferred value and belong to its first node
             // (`-\n  # c\n  - x\n` heads `.[0][0]`, measured), so only
             // the lines already pending here are this value's own head.
-            let above_dash = lines_above_dash.unwrap_or(self.pending_head_lines.len());
             let value_is_null = self
                 .next_line_settles_value_is_null(indent)
                 .unwrap_or_else(|| self.following_value_is_null(indent));
@@ -5161,7 +5182,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             let empty_property_item =
                 !value_is_null && self.next_line_is_properties_of_a_null_value(indent);
             if value_is_null || empty_property_item {
-                if empty_property_item && self.pending_head_lines.len() > above_dash {
+                if empty_property_item
+                    && self.pending_head_lines.len() > self.pending_lines_above(dash_line_end)
+                {
                     // Comment lines between the dash and the properties go forward with
                     // the rest, as the dash line's own comment does below: yq heads
                     // whatever opens next with them, not placing them by the column they
@@ -5181,22 +5204,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // document's head (`-\n# c\n`, measured).
                 self.saw_head_foot_node = true;
             } else {
-                // Once a node has opened before this item, in this document or an earlier one, a
-                // first block below the dash may be the value's foot (#7044).
+                // Once a node has opened before this item, in this document or an earlier one (a
+                // null item included), a first block below the dash may be the value's foot (#7044).
                 let follows_a_node = self.last_head_foot_bp.is_some()
+                    || self.saw_head_foot_node
                     || self.document_boundary_fallback_bp.is_some();
                 if trailing.is_none() && follows_a_node {
                     self.defer_first_block_below_bare_dash(dash_line_end);
                 }
-                // The lines above the dash, told by position: the count taken before the lookahead
-                // goes stale when the lookahead settles a block (a blank line after it resolves it
-                // backwards), and then counted a line below the dash as one above it (#7044).
-                let above_dash = above_dash.min(
-                    self.pending_head_lines
-                        .iter()
-                        .take_while(|&&(start, _)| start as usize <= dash_line_end)
-                        .count(),
-                );
+                let above_dash = self.pending_lines_above(dash_line_end);
                 let below_dash = self.pending_head_lines.split_off(above_dash);
                 self.attach_deferred_item_value_at(self.bp_pos, indent);
                 self.pending_head_lines = below_dash;
@@ -6354,19 +6370,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // an ordinary item uses.
                 if self.at_line_end() {
                     // #6593: this lookahead records the comment lines below the dash as pending,
-                    // as the routine's own does, so the routine is told how many lines were above
-                    // the dash before it: the rest head the value's first node, not its container.
-                    let above_dash = self.pending_head_lines.len();
+                    // as the routine's own does; the routine tells them from the lines above the
+                    // dash by position: the rest head the value's first node, not its container.
                     let value_is_null = self
                         .next_line_settles_value_is_null(seq_indent)
                         .unwrap_or_else(|| self.following_value_is_null(seq_indent));
                     if !value_is_null {
-                        self.defer_item_value_to_later_lines(
-                            seq_indent,
-                            false,
-                            item_wrapper_bp,
-                            Some(above_dash),
-                        );
+                        self.defer_item_value_to_later_lines(seq_indent, false, item_wrapper_bp);
                         value_on_a_later_line = true;
                     }
                 }
