@@ -7859,15 +7859,23 @@ These rows differ:
 - `--front-matter` with an explicit `-p ini` is refused (`--front-matter and --input-format ini are incompatible`), as `-p json` is, where yq decodes the front matter as INI.
 - A document whose text passes the YAML reader's limits is refused, where yq builds the nodes without writing the text.
 
-### `--unwrapScalar=false` with `-o=yaml` — a top-level scalar prints as its value, not as a node ([#7093](https://github.com/rust-works/succinctly/issues/7093))
+### `--unwrapScalar=false` with `-o=yaml` — a scalar result prints as a node, with these differences ([#7093](https://github.com/rust-works/succinctly/issues/7093))
 
 `-r` / `--unwrapScalar` takes its value after `=` (`--unwrapScalar=false`, `-r=true`), and the value yq resolves is its own when given and else true for `-o=yaml` and `-o=props` and false for every other format.
-It decides whether `-o=shell` writes a value unquoted, whether `-o=props` and `@props` put a value with a space in it in Go's `%q` quotes, and whether a top-level scalar of the JSON, KYAML and other encoders is written raw; `@props` follows it for every output format, so `-o=json '{"a":"x y"} | @props'` quotes `x y` as yq does.
-These agree with yq v4.53.3 on 95 flag, format and filter combinations (`tests/yq_cli/i7093.rs`).
-One row differs:
+It decides whether `-o=shell` writes a value unquoted, whether `-o=props` and `@props` put a value with a space in it in Go's `%q` quotes, and whether a string result of the JSON and KYAML encoders is written raw; `@props` follows it for every output format, so `-o=json '{"a":"x y"} | @props'` quotes `x y` as yq does.
+With `=false`, `-o=yaml` prints a scalar result as the node it is: its source style (`"a b"`, `'it''s'`, a block scalar as `|` with its text two spaces in), its `&anchor`, its line comment (`x # c`), and a quote where its text asks for one (`""`, `"12"`, `"true"`).
+A computed string has no style and prints plain.
+A document, mapping or sequence is unaffected.
+This needs the streaming routes off and the bare-scalar style strip skipped, so it is one process-wide switch set from the flags.
+`tests/yq_cli/i7093.rs` and `tests/yq_cli/i7093_yaml.rs` pin the rows captured from yq v4.53.3; a sweep of 22 filters over 11 formats and 7 spellings of the flag over a clean input differs only for `-o=lua` over a multi-line string (a long bracket in yq, #6924).
 
-- `-o=yaml --unwrapScalar=false` prints a top-level scalar result as its value, where yq prints the node the YAML encoder writes: `.q` on `q: "a b"` is `"a b"` in yq and `a b` here, a string that needs quotes is quoted, a block scalar keeps its `|` header, and a comment on the scalar is kept (`x # c`).
-  A document, mapping or sequence is unaffected.
+Still different under `=false`:
+
+- **An alias result** is `*x` in yq (`.b` on `b: *x`, unreadable without its anchor) and the value here, the soundness rule of ADR-0017.
+- **A value reached through `to_entries`** (`to_entries | .[0].value`) loses its style, quotes and line comment, which a scalar that is navigated to keeps: the entries replay places only what a mapping or sequence holds.
+  A folded scalar (`>`) reached that way prints as `|`.
+- **A comma of two different scalars under `-P`** (`.a, .b` on `a: "@at"` / `b: "- dash"`) writes the first in double quotes in yq (`"@at"`, then `'- dash'`) and in single quotes here; the same scalar twice, and `.[]`, agree.
+- **`-0` over several documents** writes `\n---` between them, as for every other YAML output.
 
 ### `-p kyaml` — read as YAML, as yq reads it ([#6925](https://github.com/rust-works/succinctly/issues/6925))
 
