@@ -157,8 +157,14 @@ impl WindowedFile {
             self.validate_lines();
             if !self.eof && self.validated == before && !first {
                 // No line break came with that read: the next asks for twice as much, so a file with
-                // few of them is read in a linear amount of work.
-                grow = grow.saturating_mul(2);
+                // few of them is read in a linear amount of work, and once that is several windows
+                // (it is one long document, or a file of one line) for all of what is left, as
+                // the whole-file route reads it.
+                grow = if grow >= 4 * WINDOW_BYTES {
+                    usize::try_from(self.remaining).unwrap_or(usize::MAX)
+                } else {
+                    grow.saturating_mul(2)
+                };
                 continue;
             }
             first = false;
@@ -283,7 +289,7 @@ impl WindowedFile {
             {
                 self.break_search_bytes += self.buf.len() - from;
             }
-            match self.buf[from..].iter().rposition(|&b| b == b'\n') {
+            match last_line_break(&self.buf[from..]) {
                 Some(at) => from + at + 1,
                 None => {
                     self.no_break_from = self.buf.len();
@@ -306,6 +312,30 @@ impl WindowedFile {
         self.validated = new_end;
         self.substituted = true;
     }
+}
+
+/// The index of the last line break in `bytes`. Fixed-width chunks with an OR fold rather than
+/// `rposition`, so the search over a long run with none is a vector compare per 64 bytes
+/// (see [`super::count_newlines`] for the same shape): a one-line file is searched once, whole.
+fn last_line_break(bytes: &[u8]) -> Option<usize> {
+    const WIDTH: usize = 64;
+    let tail = bytes.len() % WIDTH;
+    let body = bytes.len() - tail;
+    if let Some(at) = bytes[body..].iter().rposition(|&b| b == b'\n') {
+        return Some(body + at);
+    }
+    let mut end = body;
+    while end >= WIDTH {
+        let chunk = &bytes[end - WIDTH..end];
+        if chunk.iter().fold(0u8, |any, &b| any | u8::from(b == b'\n')) != 0 {
+            return chunk
+                .iter()
+                .rposition(|&b| b == b'\n')
+                .map(|at| end - WIDTH + at);
+        }
+        end -= WIDTH;
+    }
+    None
 }
 
 /// The file read again, for the wording of a fault: through a duplicate of the handle the run reads
@@ -453,6 +483,37 @@ mod tests {
     }
 
     const BLOCKS: &[usize] = &[1, 2, 3, 5, 8, 13, 64, 4096];
+
+    #[test]
+    fn last_line_break_agrees_with_rposition() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for len in [0usize, 1, 63, 64, 65, 127, 128, 129, 1000] {
+            for density in [0u64, 1, 5, 50, 1000] {
+                for _ in 0..20 {
+                    let bytes: Vec<u8> = (0..len)
+                        .map(|_| {
+                            if density > 0 && next() % density == 0 {
+                                b'\n'
+                            } else {
+                                b'a' + (next() % 26) as u8
+                            }
+                        })
+                        .collect();
+                    assert_eq!(
+                        last_line_break(&bytes),
+                        bytes.iter().rposition(|&b| b == b'\n'),
+                        "{len} bytes, break density 1 in {density}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn windows_give_the_whole_files_documents_and_lines() {
