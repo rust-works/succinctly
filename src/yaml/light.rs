@@ -10163,40 +10163,32 @@ fn write_yaml_block_field_key<W: AsRef<[u64]>, Out: core::fmt::Write>(
     }
     // #7032: a key written as a literal block scalar (`? |-`) cannot stand as a simple key, so yq
     // writes it as the explicit key it came as when its text has a line break or is longer than
-    // 128 bytes, with the anchor and tag it carries, and double-quoted when it is one short line.
+    // 128 bytes, and double-quoted when it is one short line, with the anchor and tag it carries
+    // either way.
     if let YamlValue::String(s @ YamlString::BlockLiteral { .. }) = field.key() {
         if let Ok(decoded) = s.as_str() {
-            let own_key = field.key_cursor();
-            let anchor = own_key.anchor();
-            let tag = own_key.explicit_tag_at(None);
             if go_yaml_key_is_simple(&decoded) {
-                if anchor.is_none() && tag.is_none() {
-                    write_go_yaml_double_quoted(out, &decoded)?;
-                    return Ok(false);
+                let own_key = field.key_cursor();
+                if let Some(anchor) = own_key.anchor() {
+                    out.write_char('&')?;
+                    out.write_str(anchor)?;
+                    out.write_char(' ')?;
                 }
-            } else {
-                let child_indent = deeper_yaml_indent(indent, indent_spaces, unit);
-                // The key keeps its literal style, also when it is only too long to be simple.
-                if let Some(scalar) =
-                    go_yaml_block_scalar(&decoded, false, &child_indent, indent_spaces).or_else(
-                        || go_yaml_explicit_key_scalar(&decoded, &child_indent, indent_spaces),
-                    )
-                {
-                    out.write_str("? ")?;
-                    if let Some(anchor) = anchor {
-                        out.write_char('&')?;
-                        out.write_str(anchor)?;
-                        out.write_char(' ')?;
-                    }
-                    if let Some(tag) = tag {
-                        out.write_str(tag)?;
-                        out.write_char(' ')?;
-                    }
-                    out.write_str(&scalar)?;
-                    out.write_char('\n')?;
-                    out.write_str(indent)?;
-                    return Ok(true);
+                if let Some(tag) = own_key.explicit_tag_at(None) {
+                    out.write_str(tag)?;
+                    out.write_char(' ')?;
                 }
+                write_go_yaml_double_quoted(out, &decoded)?;
+                return Ok(false);
+            }
+            let child_indent = deeper_yaml_indent(indent, indent_spaces, unit);
+            // The key keeps its literal style, also when it is only too long to be simple.
+            if let Some(scalar) =
+                go_yaml_block_scalar(&decoded, false, &child_indent, indent_spaces)
+                    .or_else(|| go_yaml_explicit_key_scalar(&decoded, &child_indent, indent_spaces))
+            {
+                write_explicit_scalar_key(out, field, &scalar, indent)?;
+                return Ok(true);
             }
         }
     }
