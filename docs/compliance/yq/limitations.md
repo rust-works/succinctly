@@ -7708,7 +7708,7 @@ Six rows differ from yq v4.53.3, each pinned out of `tests/yq_cli/i6850.rs`:
   A top-level comma (`.a, .b`) still prints nothing before the error, and the error line is written when it is raised, so the two streams can interleave differently on a terminal.
   The results are kept on the plain, `--eval-all` and `-n` routes; the other input routes were not checked.
   An error the program itself raises still prints nothing, in both tools.
-- A `shell` key with an accented letter loses it (`é` is dropped), where yq decomposes it first and keeps the `e`.
+- The NFKD table behind a `shell` key is Unicode 15.0.0's, the version of yq v4.53.3's `golang.org/x/text`: a character added by a later Unicode release with an ASCII decomposition loses its letters here where a newer yq keeps them.
 - A `<<` whose value is a literal mapping, not an alias, is merged into its mapping by the encoders, where yq leaves it a plain key that props, shell, ini and lua skip: `printf 'a: 1\n<<: {b: 2, a: 5}\n' | yq -o=props .` is `a = 1` in yq and `a = 5`, `b = 2` here.
   An alias (`<<: *anchor`) is merged by both, and `-o=json` agrees (the owned route; see #5521 for the same family).
 - `-o=csv` and `-o=tsv` with `-0` write each result's row here and a bare NUL in yq: yq's CSV writer is not flushed before the NUL, so the row is lost.

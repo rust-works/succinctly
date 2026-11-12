@@ -27843,24 +27843,31 @@ fn format_ini(value: &OwnedValue) -> Result<String, EvalError> {
 
 /// yq's `-o=shell` encoder (#6850): one `name=value` line per scalar, comments dropped.
 ///
-/// A key is reduced to a shell variable name one component at a time: a character outside `[A-Za-z0-9_]` becomes
-/// `_` and a non-ASCII or control character is dropped (yq decomposes with NFKD first, so `é` keeps its `e` there
-/// and is lost here). The root component gets a leading `_` unless it starts with a letter or `_`, which is also
-/// what an empty root key becomes. A root scalar is named `value`. A value is written as it is when it holds
-/// only `[A-Za-z0-9_]` and single-quoted otherwise, a `'` inside written `'"'"'`. Captured from yq v4.53.3.
+/// A key is reduced to a shell variable name one component at a time.
+/// A character outside `[A-Za-z0-9_]` becomes `_`, and a control character is dropped.
+/// A non-ASCII one is decomposed with NFKD first, as yq does, so `é` keeps its `e` and `ﬁ` is `fi`
+/// (the table is `shell_nfkd`, #7092).
+/// The root component gets a leading `_` unless it starts with a letter or `_`, which is also what
+/// an empty root key becomes.
+/// A root scalar is named `value`.
+/// A value is written as it is when it holds only `[A-Za-z0-9_]` and single-quoted otherwise, a `'`
+/// inside written `'"'"'`.
+/// Captured from yq v4.53.3.
 fn format_shell_variables(value: &OwnedValue, separator: &str) -> String {
     fn component(raw: &str) -> String {
-        raw.chars()
-            .filter_map(|c| {
-                if c.is_ascii_alphanumeric() || c == '_' {
-                    Some(c)
-                } else if (c as u32) < 32 || (c as u32) > 126 {
-                    None
-                } else {
-                    Some('_')
-                }
-            })
-            .collect()
+        let mut out = string_with_capacity(raw.len());
+        for c in raw.chars() {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                out.push(c);
+            } else if (c as u32) < 32 {
+                // A control character is dropped.
+            } else if (c as u32) <= 126 {
+                out.push('_');
+            } else {
+                super::shell_nfkd::ascii_of_nfkd(c, &mut out);
+            }
+        }
+        out
     }
     fn append(path: &str, raw: &str, separator: &str) -> String {
         let key = component(raw);
