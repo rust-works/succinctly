@@ -4732,19 +4732,20 @@ fn write_split_result(
     let write_failure = || format!("failed to write --split-exp output file: {filename}");
 
     // #7036: the result is encoded here, once its name is known. yq opens the file before it encodes,
-    // so a result the encoder refuses (`-o=csv` over a mapping) leaves an empty file behind and the
-    // error is reported as usual.
+    // so a result the encoder refuses (`-o=csv` over a mapping) leaves an empty file behind (written
+    // below, only for that case) and the error is reported as usual.
     let encoded;
     let (content, content_comments) = match &files.encoder {
         None => (result, comments),
         Some(encoder) => {
-            std::fs::write(&filename, b"").with_context(write_failure)?;
             let errors_before_encode = sink.program_error_count();
             encoded = evaluate_input(result, encoder, sink)?;
             match encoded.as_slice() {
                 [text @ OwnedValue::String(_)] => (text, &CommentTree::empty()),
-                // The refusal was reported by `evaluate_input` through `sink`; yq writes no later file.
+                // The refusal was reported by `evaluate_input` through `sink`. The file yq had already
+                // opened is left empty, and under its stop-at-the-first-error rule no later one is written.
                 _ => {
+                    std::fs::write(&filename, b"").with_context(write_failure)?;
                     files.run_ended = sink.ends_run_since(errors_before_encode);
                     return Ok(());
                 }
