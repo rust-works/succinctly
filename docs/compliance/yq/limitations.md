@@ -7887,6 +7887,28 @@ Two things still differ, because yq has the raw bytes and this has the substitut
 
 Matching either needs a string that can hold bytes that are not UTF-8, or the substitution moved to the JSON encoder, as the `-p json` reader does with `-o json` only.
 
+## `-r` / `--unwrapScalar` takes an optional boolean, and its default depends on the format ([#7093](https://github.com/rust-works/succinctly/issues/7093))
+
+`-r=BOOL` and `--unwrapScalar=BOOL` take Go's boolean spellings (`1 t T true TRUE True`, `0 f F false FALSE False`) after an `=`; the next word is the filter, as in yq, and a value that is not one is refused as yq refuses it (`Error: invalid argument "maybe" for "-r, --unwrapScalar" flag: strconv.ParseBool: parsing "maybe": invalid syntax`, exit 1).
+The flag's default is true for `yaml` and `props` and false for every other output format, which is why `-r` changed nothing for the first two and `=false` changes nothing for the others, and `tests/yq_cli/i7093.rs` pins 1,840 rows from yq v4.53.3:
+
+- **True** (`-r`, `--unwrapScalar`, `=true`): `-o=json` and `-o=kyaml` print a string result as its own text; `-o=shell` leaves every string unquoted, in a collection too (`name=Mike Wazowski`, `value=it's`).
+  A number, a boolean, `null`, and a collection with its strings inside it print as they do without it.
+- **False for `-o=yaml`**: a scalar result is printed as the node it is, with its own style (`"a b"`, `'it''s'`, a block scalar as `|` with its text two spaces in), its `&anchor`, its line comment (`x # c`) and a quote where the text asks for one (`""`, `"12"`, `"true"`).
+  A string that is computed has no style and prints plain, quoted only where YAML needs it.
+- **False for `-o=props`**: a value that holds a space is Go-quoted (`%q`) and then escaped as every property is (`name = "Mike Wazowski"`, `a = "x\\"y z"`); a bare scalar result and a value without a space print as before.
+  The `@props` and `to_props` operators follow the flag too.
+
+Still different:
+
+- **A flag value that is empty (`-r=`)** is `unknown shorthand flag: '=' in -=` in yq and an invalid empty boolean here; both exit 1.
+- **An alias result under `=false`** is `*x` in yq (`.b` on `b: *x`, unreadable without its anchor) and the value here, the soundness rule of ADR-0017.
+- **A value reached through `to_entries`** (`to_entries | .[0].value`) loses its style, quotes and line comment here under `=false`, which a scalar that is navigated to keeps: the entries replay places only what a mapping or sequence holds.
+  The same holds for a folded scalar (`>`), which prints as `|`.
+- **`-P` with `=false` over a comma of two different scalars** (`.a, .b` on `a: "@at"` / `b: "- dash"`) writes the first in double quotes in yq (`"@at"`, then `'- dash'`) and in single quotes here; the same scalar twice, and `.[]`, agree.
+- **`-0` over several documents** writes `\n---` between them, as for every other YAML output (the `-0` section above).
+- **`-o=lua`** writes a multi-line string as `"..\n.."` where yq writes a long bracket `[[ .. ]]`, with or without the flag (#6924).
+
 ## The argument-level flags of [#7025](https://github.com/rust-works/succinctly/issues/7025) answer as yq does, with these differences
 
 `--expression`, `--split-exp-file`, `-f`, `-v`/`--verbose`, `--security-disable-env-ops`, `--security-disable-file-ops`, `--string-interpolation` and `-c`/`--yaml-compact-seq-indent` are yq's, and `tests/yq_cli/i7025.rs`, `tests/yq_cli/i7025_string_interpolation.rs` and `tests/yq_cli/i7025_compact_seq_indent.rs` pin the rows captured from yq v4.53.3.

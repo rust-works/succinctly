@@ -1533,6 +1533,9 @@ static PROPS_ARRAY_BRACKETS: std::sync::atomic::AtomicBool =
 /// `--csv-separator` (a byte), `--csv-auto-parse` and `--tsv-auto-parse`, which `-p csv` and
 /// `-p tsv` read (#6925).
 static CSV_SEPARATOR: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(b',');
+/// `--unwrapScalar=false` over YAML output (#7093): a scalar result is printed as the node it is, with its
+/// own style and comments, where yq's default unwraps it to its bare text. Set once from the flags.
+static WRAP_SCALARS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CSV_AUTO_PARSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static TSV_AUTO_PARSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
@@ -9378,9 +9381,12 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
     // rebuild unchanged. The *foot* is dropped unconditionally instead,
     // root included (`# h\n42\n# f\n` prints `# h\n42`, live-verified) --
     // real yq's own asymmetry, not a succinctly gap.
+    // #7093: not for `--unwrapScalar=false`, where the scalar is a node and keeps them.
+    let unwrap_bare_scalars = !WRAP_SCALARS.load(std::sync::atomic::Ordering::SeqCst);
     if let Ok(docs) = &mut docs {
         for (value, comments) in docs.iter_mut() {
-            if !matches!(value, OwnedValue::Object(_) | OwnedValue::Array(_)) {
+            if unwrap_bare_scalars && !matches!(value, OwnedValue::Object(_) | OwnedValue::Array(_))
+            {
                 let head = comments.meta().head_comment().to_vec();
                 let source = comments.meta().clone();
                 // The first document's `---` marker survives too (#4086).
@@ -10111,7 +10117,12 @@ fn output_value<W: Write>(
         // yq prints `*x` for both — and cannot read either back
         // (`unknown anchor 'x' referenced`). Making the streaming path
         // agree with this one is issue #1350.
-        let body = if let OwnedValue::String(s) = value {
+        // #7093: `--unwrapScalar=false` prints a string as the node it is (quoted where its style or its text
+        // asks for it, a block scalar for a line break), like any other scalar.
+        let body = if let (OwnedValue::String(s), false) = (
+            value,
+            WRAP_SCALARS.load(std::sync::atomic::Ordering::SeqCst),
+        ) {
             String::clone(s)
         } else {
             // A root anchor is written only for a container, matching
@@ -10120,21 +10131,37 @@ fn output_value<W: Write>(
             // `test_yaml_bare_scalar_anchor_dropped_on_query_result_712`),
             // and `evaluate_yaml_cursor`'s root-scalar pass has already
             // cleared the mark for that case anyway.
-            let rendered = emit_yaml_value(value, comments, config, "", false);
+            // #7093: a string printed as a node (`--unwrapScalar=false`) has its block content one step in,
+            // where the container it would sit in is none.
+            let root_indent = if matches!(value, OwnedValue::String(_)) {
+                config.indent_str.as_str()
+            } else {
+                ""
+            };
+            let rendered = emit_yaml_value(value, comments, config, root_indent, false);
             // `style = "tagged"` (#4066) puts its `!!map`/`!!seq` on the header line
             // too, after any anchor (`&x !!map`).
             let anchor = comments
                 .declared_anchor()
                 .filter(|_| matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)));
             let tag = block_container_tag(value, comments);
-            match (anchor, tag.as_deref()) {
-                (None, None) => rendered,
-                // A flow container keeps its anchor on its own line (a tag is only
-                // ever on a block container).
-                (Some(anchor), None) if is_flow_safe(value, comments) => {
-                    format!("&{anchor} {rendered}")
+            // #7093: a scalar printed as a node keeps its own `&anchor`, which is on its line.
+            let scalar_anchor = comments.declared_anchor().filter(|_| {
+                WRAP_SCALARS.load(std::sync::atomic::Ordering::SeqCst)
+                    && !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_))
+            });
+            if let Some(anchor) = scalar_anchor {
+                format!("&{anchor} {rendered}")
+            } else {
+                match (anchor, tag.as_deref()) {
+                    (None, None) => rendered,
+                    // A flow container keeps its anchor on its own line (a tag is only
+                    // ever on a block container).
+                    (Some(anchor), None) if is_flow_safe(value, comments) => {
+                        format!("&{anchor} {rendered}")
+                    }
+                    _ => format!("{}\n{rendered}", block_header(anchor, tag.as_deref())),
                 }
-                _ => format!("{}\n{rendered}", block_header(anchor, tag.as_deref())),
             }
         };
         // A root's own standalone head comment (#798 PR2, #2795 PR B) has no
@@ -10224,6 +10251,13 @@ fn output_value<W: Write>(
             let trailing =
                 append_foot_comment_lines(String::new(), comments.meta().foot_comment(), "").0;
             (with_own_comment, trailing)
+        } else if WRAP_SCALARS.load(std::sync::atomic::Ordering::SeqCst) {
+            // #7093: a scalar printed as a node keeps its line comment (`x # c`); its foot comment, as
+            // for any scalar root, is still not printed.
+            (
+                format!("{body}{}", trailing_comment_suffix(comments, "")),
+                String::new(),
+            )
         } else {
             (body, String::new())
         };
@@ -10250,7 +10284,8 @@ fn output_value<W: Write>(
         if config.use_color {
             // No boundary here -- `write_terminator` below writes directly
             // to `writer`, after the colored text (#1708).
-            let bare_scalar = !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_));
+            let bare_scalar = !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_))
+                && !WRAP_SCALARS.load(std::sync::atomic::Ordering::SeqCst);
             write!(
                 writer,
                 "{}",
@@ -12240,6 +12275,19 @@ fn unescape_lua_option(text: &str) -> String {
 }
 
 fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
+    // #7093: the printer's `-r` is the flag's value when it is true: json (and the encoders) print a
+    // string unquoted for it and quoted otherwise, and yaml and props unwrap by default.
+    // yq reads the value as a Go boolean while it parses the flags, and says so in cobra's words.
+    if let Some(text) = &args.unwrap_scalar_text {
+        args.unwrap_scalar = Some(match text.as_str() {
+            "1" | "t" | "T" | "true" | "TRUE" | "True" => true,
+            "0" | "f" | "F" | "false" | "FALSE" | "False" => false,
+            _ => anyhow::bail!(
+                "invalid argument \"{text}\" for \"-r, --unwrapScalar\" flag: strconv.ParseBool: parsing \"{text}\": invalid syntax"
+            ),
+        });
+    }
+    args.raw_output = args.unwrap_scalar == Some(true);
     // #7025: yq's `--string-interpolation` is a process-wide setting of its lexer.
     succinctly::jq::set_yq_string_interpolation(args.string_interpolation);
 
@@ -12355,6 +12403,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     jq::set_yq_encoder_prefs(jq::YqEncoderPrefs {
         properties_separator: args.properties_separator.clone(),
         properties_array_brackets: args.properties_array_brackets,
+        properties_unwrap_scalar: args.unwrap_scalar != Some(false),
         csv_separator,
     });
 
@@ -12362,8 +12411,12 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         OutputFormat::Props => Some(YqOutputEncoder::Props {
             separator: args.properties_separator.clone(),
             array_brackets: args.properties_array_brackets,
+            unwrap_scalar: args.unwrap_scalar != Some(false),
         }),
-        OutputFormat::Shell => Some(YqOutputEncoder::Shell(args.shell_key_separator.clone())),
+        OutputFormat::Shell => Some(YqOutputEncoder::Shell(
+            args.shell_key_separator.clone(),
+            args.unwrap_scalar == Some(true),
+        )),
         OutputFormat::Csv => Some(YqOutputEncoder::Csv(csv_separator)),
         OutputFormat::Tsv => Some(YqOutputEncoder::Tsv),
         OutputFormat::Base64 => Some(YqOutputEncoder::Base64),
@@ -12376,7 +12429,10 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         }))),
         OutputFormat::Ini => Some(YqOutputEncoder::Ini),
         OutputFormat::Toml => Some(YqOutputEncoder::Toml),
-        OutputFormat::Kyaml => Some(YqOutputEncoder::Kyaml(usize::from(args.indent))),
+        OutputFormat::Kyaml => Some(YqOutputEncoder::Kyaml(
+            usize::from(args.indent),
+            args.unwrap_scalar == Some(true),
+        )),
         OutputFormat::Xml => Some(YqOutputEncoder::Xml(Box::new(XmlOptions {
             indent: usize::from(args.indent),
             attribute_prefix: args.xml_attribute_prefix.clone(),
@@ -12386,6 +12442,13 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         }))),
         OutputFormat::Yaml | OutputFormat::Json | OutputFormat::Auto => None,
     };
+    // #7093: YAML output with `--unwrapScalar=false` prints a scalar result as a node.
+    WRAP_SCALARS.store(
+        args.unwrap_scalar == Some(false)
+            && output_encoder.is_none()
+            && args.output_format == OutputFormat::Yaml,
+        std::sync::atomic::Ordering::SeqCst,
+    );
     // #7028: `--split-exp` names its files by the format the user asked for, which the rewrite to a
     // YAML-output run below hides for every encoder format.
     let split_exp_format = args.output_format;
@@ -12924,7 +12987,9 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     // sequence indented by less than a whole step, so a `-c` run builds the document where the
     // same filter streams it. The name says what the gate was written for; this is the second
     // flag that keeps a run off the streamers.
-    let can_stream_pretty_or_colored = !args.pretty_print && !args.yaml_compact_seq_indent;
+    let can_stream_pretty_or_colored = !args.pretty_print
+        && !args.yaml_compact_seq_indent
+        && !WRAP_SCALARS.load(std::sync::atomic::Ordering::SeqCst);
     // `--ascii-output` no longer appears here (#1700). It used to gate the
     // whole disjunction (#1693) because no M2 JSON streamer could escape
     // non-ASCII, leaving the DOM path (`output_value`) as the only correct

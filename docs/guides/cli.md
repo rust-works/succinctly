@@ -416,7 +416,7 @@ succinctly yq '.users[]' input.yaml
 - `--properties-separator <SEP>`, `--properties-array-brackets`, `--csv-separator <CHAR>`, `--shell-key-separator <SEP>`, `--lua-prefix`, `--lua-suffix`, `--lua-globals`, `--lua-unquoted`: options of the `props`, `csv`, `shell` and `lua` output formats (#6922, #6924); the props and csv ones also apply to the `@props` and `@csv` operators
 - `--xml-attribute-prefix <PREFIX>` (default `+@`), `--xml-content-name <NAME>` (`+content`), `--xml-proc-inst-prefix <PREFIX>` (`+p_`), `--xml-directive-name <NAME>` (`+directive`): which keys of a value `-o=xml` writes as attributes, text, processing instructions and directives (#6924); `-I` is the indent
 - `-I, --indent <N>`: Indent level (0 for compact output, default: 2)
-- `-r, --unwrapScalar`: Output raw strings without quotes (default for YAML)
+- `-r, --unwrapScalar[=BOOL]`: Output raw strings without quotes (default true for YAML and props, false for the other formats; `-r=false` prints a YAML scalar as a node; #7093)
 - `-j, --tojson`: Deprecated alias for `-o=json`, as in real yq; prints `Flag --tojson has been deprecated, please use -o=json instead` to stderr and wins over `-o` in either order. Unlike jq's `-j`, it does not join output (there is no yq join-output flag; `--join-output` is rejected as in real yq)
 - `-0, --nul-output`: Use NUL char to separate values instead of newline
 - `-S, --sort-keys`: Sort keys of each object on output

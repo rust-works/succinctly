@@ -3333,9 +3333,12 @@ pub enum YqOutputEncoder {
     Props {
         separator: String,
         array_brackets: bool,
+        /// `-r` / `--unwrapScalar` (#7093): false Go-quotes a string that holds a space
+        unwrap_scalar: bool,
     },
-    /// `-o=shell`, with the `--shell-key-separator` between the parts of a name
-    Shell(String),
+    /// `-o=shell`, with the `--shell-key-separator` between the parts of a name, and whether `-r` /
+    /// `--unwrapScalar` leaves a string unquoted (#7093)
+    Shell(String, bool),
     /// `-o=csv`, with `--csv-separator`
     Csv(char),
     /// `-o=lua`, with the four `--lua-*` options
@@ -3346,8 +3349,9 @@ pub enum YqOutputEncoder {
     Ini,
     /// `-o=toml`
     Toml,
-    /// `-o=kyaml`, with `-I` as the indent
-    Kyaml(usize),
+    /// `-o=kyaml`, with `-I` as the indent, and whether `-r` / `--unwrapScalar` prints a string result
+    /// as its own text (#7093)
+    Kyaml(usize, bool),
     /// `-o=xml`, with `-I` and the `--xml-*` options
     Xml(Box<XmlOptions>),
     /// `-o=base64`: a string only, and no line end

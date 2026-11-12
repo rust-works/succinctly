@@ -842,7 +842,7 @@ same kind of thing as the rest of this table — extra, off by default.
 
 | Flag                  | Description                                   |
 |-----------------------|-----------------------------------------------|
-| `-r, --unwrapScalar`  | Output raw strings without quotes             |
+| `-r, --unwrapScalar[=BOOL]` | Print a string result without quotes: default true for `yaml` and `props`, false for the other output formats; `=false` prints a YAML scalar as a node (style, anchor, line comment) and quotes a props value that holds a space |
 | `-I, --indent N`      | Indent level (0 = compact for JSON, 4 spaces for YAML, #2606) |
 | `-o, --output-format` | Output format: `auto` (default), `yaml`, `json`, `props`, `shell`, `csv`, `tsv`, `base64`, `uri`, `lua`, `ini`, `toml`, `kyaml`, `xml` |
 | `-i, --inplace`       | Update file in place                          |

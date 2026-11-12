@@ -25831,6 +25831,7 @@ pub(crate) fn format_owned<S: EvalSemantics>(
                 owned,
                 &prefs.properties_separator,
                 prefs.properties_array_brackets,
+                prefs.properties_unwrap_scalar,
             )
         })),
         FormatType::Props => format_props(owned),
@@ -26883,14 +26884,19 @@ fn format_yaml(value: &OwnedValue) -> Result<String, EvalError> {
 /// writes it (#1076); a value with no lines (`{}`, `[]`) is the empty string. `@yaml` ends
 /// the same way (#1183).
 fn format_props(value: &OwnedValue) -> Result<String, EvalError> {
-    Ok(format_props_with(value, " = ", false))
+    Ok(format_props_with(value, " = ", false, true))
 }
 
 /// [`format_props`] with `--properties-separator` between a key and its value (an empty one is yq's
 /// default ` = `) and, with `--properties-array-brackets`, `a[0]` for an array element below the
 /// root where it writes `a.0` (#6922).
-fn format_props_with(value: &OwnedValue, separator: &str, array_brackets: bool) -> String {
-    format_props_styled(value, separator, array_brackets, None)
+fn format_props_with(
+    value: &OwnedValue,
+    separator: &str,
+    array_brackets: bool,
+    unwrap_scalar: bool,
+) -> String {
+    format_props_styled(value, separator, array_brackets, unwrap_scalar, None)
 }
 
 /// [`format_props_with`] writing each property's comment lines above it, from `comments` (each
@@ -26899,6 +26905,7 @@ fn format_props_styled(
     value: &OwnedValue,
     separator: &str,
     array_brackets: bool,
+    unwrap_scalar: bool,
     comments: Option<&BTreeMap<String, String>>,
 ) -> String {
     let separator = if separator.is_empty() {
@@ -26910,6 +26917,7 @@ fn format_props_styled(
     let style = PropsStyle {
         separator,
         array_brackets,
+        unwrap_scalar,
         comments,
     };
     format_props_recursive(value, String::new(), &mut out, 0, &style);
@@ -26920,6 +26928,8 @@ fn format_props_styled(
 struct PropsStyle<'a> {
     separator: &'a str,
     array_brackets: bool,
+    /// `--unwrapScalar` (#7093): false writes a string that holds a space as Go's `%q` does.
+    unwrap_scalar: bool,
     comments: Option<&'a BTreeMap<String, String>>,
 }
 
@@ -26940,21 +26950,23 @@ fn write_props_comment(comment: &str, out: &mut String) {
     }
 }
 
-/// The separator and bracket setting `format_type` writes props with, in yq mode: `@props` /
+/// The separator, bracket and unwrap setting `format_type` writes props with, in yq mode: `@props` /
 /// `to_props` read the run's [`YqEncoderPrefs`], `-o=props` its own encoder's. `None` for any other
 /// format.
-pub(crate) fn yq_props_format_style(format_type: &FormatType) -> Option<(String, bool)> {
+pub(crate) fn yq_props_format_style(format_type: &FormatType) -> Option<(String, bool, bool)> {
     match format_type {
         FormatType::Props => Some(yq_encoder_prefs::with(|prefs| {
             (
                 prefs.properties_separator.clone(),
                 prefs.properties_array_brackets,
+                prefs.properties_unwrap_scalar,
             )
         })),
         FormatType::YqOutput(YqOutputEncoder::Props {
             separator,
             array_brackets,
-        }) => Some((separator.clone(), *array_brackets)),
+            unwrap_scalar,
+        }) => Some((separator.clone(), *array_brackets, *unwrap_scalar)),
         _ => None,
     }
 }
@@ -26965,7 +26977,7 @@ pub(crate) fn yq_props_format_style(format_type: &FormatType) -> Option<(String,
 /// with `style` what it answers.
 pub(crate) fn format_yq_props_commented(
     format_type: &FormatType,
-    (separator, array_brackets): (String, bool),
+    (separator, array_brackets, unwrap_scalar): (String, bool, bool),
     value: &OwnedValue,
     comments: &BTreeMap<String, String>,
     leading: &str,
@@ -26975,6 +26987,7 @@ pub(crate) fn format_yq_props_commented(
         value,
         &separator,
         array_brackets,
+        unwrap_scalar,
         Some(comments),
     ));
     if matches!(format_type, FormatType::YqOutput(_)) {
@@ -27033,7 +27046,14 @@ fn format_props_recursive(
                 }
                 out.push_str(&props_escape(&prefix, true));
                 out.push_str(style.separator);
-                out.push_str(&props_value_to_string(value, true));
+                match value {
+                    // #7093: unwrapped, a string that holds a space is Go-quoted before the properties
+                    // writer escapes it, as yq's encoder does with `%q`.
+                    OwnedValue::String(text) if !style.unwrap_scalar && text.contains(' ') => {
+                        out.push_str(&props_escape(&go_quote(text), false));
+                    }
+                    _ => out.push_str(&props_value_to_string(value, true)),
+                }
                 out.push('\n');
             }
             // else: a scalar whose joined key is empty (`{"":"v"}`) writes nothing in yq, not even a line
@@ -27068,6 +27088,8 @@ pub struct YqEncoderPrefs {
     pub properties_separator: String,
     /// `a[0]` rather than `a.0` for an array element below the root.
     pub properties_array_brackets: bool,
+    /// `--unwrapScalar` (#7093): false writes a string that holds a space in Go quotes.
+    pub properties_unwrap_scalar: bool,
     /// The field separator of `@csv`.
     pub csv_separator: char,
 }
@@ -27077,6 +27099,7 @@ impl Default for YqEncoderPrefs {
         Self {
             properties_separator: String::from(" = "),
             properties_array_brackets: false,
+            properties_unwrap_scalar: true,
             csv_separator: ',',
         }
     }
@@ -27166,13 +27189,29 @@ fn format_yq_output<S: EvalSemantics>(
         YqOutputEncoder::Props {
             separator,
             array_brackets,
-        } => Ok(format_props_with(value, separator, *array_brackets)),
-        YqOutputEncoder::Shell(separator) => Ok(format_shell_variables(value, separator)),
+            unwrap_scalar,
+        } => Ok(format_props_with(
+            value,
+            separator,
+            *array_brackets,
+            *unwrap_scalar,
+        )),
+        YqOutputEncoder::Shell(separator, unwrap) => {
+            Ok(format_shell_variables(value, separator, *unwrap))
+        }
         YqOutputEncoder::Csv(comma) => format_yq_csv::<S>(value, *comma, true),
         YqOutputEncoder::Lua(options) => format_lua(value, options),
         YqOutputEncoder::Ini => format_ini(value),
         YqOutputEncoder::Toml => format_toml(value),
-        YqOutputEncoder::Kyaml(indent) => Ok(format_kyaml(value, *indent)),
+        // #7093: unwrapped, a string result is its own text, as for `-o=json -r`; a collection, and
+        // every other scalar, print as they do wrapped.
+        YqOutputEncoder::Kyaml(_, true) if matches!(value, OwnedValue::String(_)) => {
+            Ok(match value {
+                OwnedValue::String(text) => text.to_string(),
+                _ => unreachable!("the guard names a string"),
+            })
+        }
+        YqOutputEncoder::Kyaml(indent, _) => Ok(format_kyaml(value, *indent)),
         YqOutputEncoder::Xml(options) => super::yq_xml::format_xml(value, options),
         YqOutputEncoder::Tsv => format_yq_csv::<S>(value, '\t', true),
         YqOutputEncoder::Base64 => format_base64::<S>(value, false),
@@ -27853,7 +27892,7 @@ fn format_ini(value: &OwnedValue) -> Result<String, EvalError> {
 /// A value is written as it is when it holds only `[A-Za-z0-9_]` and single-quoted otherwise, a `'`
 /// inside written `'"'"'`.
 /// Captured from yq v4.53.3.
-fn format_shell_variables(value: &OwnedValue, separator: &str) -> String {
+fn format_shell_variables(value: &OwnedValue, separator: &str, unwrap: bool) -> String {
     fn component(raw: &str) -> String {
         let mut out = string_with_capacity(raw.len());
         for c in raw.chars() {
@@ -27888,7 +27927,14 @@ fn format_shell_variables(value: &OwnedValue, separator: &str) -> String {
             format!("'{}'", text.replace('\'', "'\"'\"'"))
         }
     }
-    fn walk(value: &OwnedValue, path: &str, separator: &str, out: &mut String, depth: usize) {
+    fn walk(
+        value: &OwnedValue,
+        path: &str,
+        separator: &str,
+        unwrap: bool,
+        out: &mut String,
+        depth: usize,
+    ) {
         assert_value_tree_depth(depth);
         match value {
             OwnedValue::Object(obj) => {
@@ -27897,6 +27943,7 @@ fn format_shell_variables(value: &OwnedValue, separator: &str) -> String {
                         val,
                         &append(path, key, separator),
                         separator,
+                        unwrap,
                         out,
                         depth + 1,
                     );
@@ -27908,6 +27955,7 @@ fn format_shell_variables(value: &OwnedValue, separator: &str) -> String {
                         val,
                         &append(path, &idx.to_string(), separator),
                         separator,
+                        unwrap,
                         out,
                         depth + 1,
                     );
@@ -27917,13 +27965,19 @@ fn format_shell_variables(value: &OwnedValue, separator: &str) -> String {
                 let name = if path.is_empty() { "value" } else { path };
                 out.push_str(name);
                 out.push('=');
-                out.push_str(&quote(&props_value_to_string(scalar, false)));
+                let text = props_value_to_string(scalar, false);
+                // #7093: unwrapped (`-r`), a string is written as it is, quotes and all.
+                if unwrap && matches!(scalar, OwnedValue::String(_)) {
+                    out.push_str(&text);
+                } else {
+                    out.push_str(&quote(&text));
+                }
                 out.push('\n');
             }
         }
     }
     let mut out = String::new();
-    walk(value, "", separator, &mut out, 0);
+    walk(value, "", separator, unwrap, &mut out, 0);
     out
 }
 

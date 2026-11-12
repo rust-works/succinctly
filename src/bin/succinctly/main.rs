@@ -1362,8 +1362,27 @@ pub struct YqCommand {
     )]
     pub output_format: OutputFormat,
 
-    /// Unwrap scalar values, print without quotes (default for YAML)
-    #[arg(short = 'r', long = "unwrapScalar", overrides_with = "raw_output")]
+    /// Unwrap scalar values, print without quotes (default true for yaml and props, false for the
+    /// other formats): `-r`, `--unwrapScalar`, or either with `=BOOL` (#7093)
+    ///
+    /// Read as text so that a bad value is refused in yq's own words (see the yq runner).
+    #[arg(
+        short = 'r',
+        long = "unwrapScalar",
+        value_name = "BOOL",
+        overrides_with = "unwrap_scalar_text",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true"
+    )]
+    pub unwrap_scalar_text: Option<String>,
+
+    /// The value of the flag above once the yq runner has read it as a Go boolean (#7093)
+    #[arg(skip)]
+    pub unwrap_scalar: Option<bool>,
+
+    /// What the printer reads of the flag above: set by the yq runner (#7093)
+    #[arg(skip)]
     pub raw_output: bool,
 
     /// (deprecated) Output as JSON, same as `-o=json`
