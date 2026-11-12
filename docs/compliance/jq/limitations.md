@@ -7278,9 +7278,9 @@ The endless-stream rows were measured on `main` @ 89a900ccc against `/usr/bin/jq
 On a file of many top-level values (NDJSON), `succinctly jq`'s peak memory grew linearly with the file, where jq 1.7.1's stays at a few MB whatever the size.
 Since [#6920](https://github.com/rust-works/succinctly/issues/6920) it no longer does for a plain filter (`-c .`, `-r .name`, `select(...)`: no `-n`, no `input`) over regular files of 4 MiB or more between them (one, or up to 64 named on the command line, which are read as the one stream jq reads, or one redirected onto standard input, `jq … < file`, [#7024](https://github.com/rust-works/succinctly/issues/7024)), which are read a window at a time (below).
 Since [#7023](https://github.com/rust-works/succinctly/issues/7023) it no longer does for a program that calls `input`/`inputs` over one regular file or standard input (the lazy route), nor for `-R` over one regular file of 4 MiB or more.
-Every other route that reads the input still holds all of it: `--seq`, `--input-dsv`, `--stream-errors`, standard input that is a pipe or a terminal (for the plain filter) or any standard input (for `-R`).
+Every other route that reads the input still holds all of it: `--seq`, `--input-dsv`, `--stream-errors`, standard input that is a pipe or a terminal (for the plain filter) or any standard input (for `-R`), and `-R` and the programs that call `input`/`inputs` over several files (`-R length a b` peaks at 30.7 MiB against 12.7 for one file, `reduce inputs` at 32.8 against 14.6, on two 11 MB files).
 That is a known limitation, not supported at this stage: it is outside the three reasons ADR-0018 permits a divergence for, so it is a deferred gap and not a deliberate behaviour.
-It is tracked in [#7024](https://github.com/rust-works/succinctly/issues/7024) (the plain filter over a pipe on standard input, and over more than 64 files or a list with a path that is not a regular file).
+It is tracked in [#7024](https://github.com/rust-works/succinctly/issues/7024) (the plain filter over a pipe on standard input, and over more than 64 files or a list with a path that is not a regular file; `-R` and `input`/`inputs` over several files; `-R` over standard input).
 The tables below were measured before #6920 and #7023 and show every row as it was; the rows they fixed are the first five of each (`first(inputs)` was flat already).
 The slurp shapes (`-s`, `-R -s`) are not a gap: jq holds the input too, and succinctly's peak is 223 MiB for `-s length` at 100 MiB on x86_64 where jq's is 850 (and 208 for `-R -s length` against jq's 183).
 Standard input under a pipe-fed plain filter or `-R` (a redirected regular file under a plain filter has been windowed since #7024), and `--seq`, grow as the file route did (124 and 108 MiB at 100 MiB on x86_64), two files held both (224 MiB) until #7024, and `--stream` is flat (8.5 MiB).
@@ -7389,7 +7389,8 @@ The tail is handed on as the bytes that were read, so a character or a run of in
 Only the front of the stream may start with a BOM; the BOM at the front of a later file is a byte of the stream.
 A window never drops part of the tail that opens a file, so a document that spans files is held from its start, as a document bigger than a window is.
 The first fault is worded by reading every file again as one stream, by position, through a duplicate of each handle (which is why the files are held open, and why there is a limit of 64), and a depth refusal names its position in the stream of all the files.
-A list with a path that is not a regular file (a pipe, `-`, a directory, `/dev/stdin`, `/dev/fd/N`), one that does not open, or more than 64 files takes the route that reads the files whole and reports what it finds.
+A list with a path that is not a regular file (a pipe, `-`, a directory, `/dev/stdin`, `/dev/fd/N`), one that does not open, one that is also the run's standard output or error (`jq . a b 1<>b`: output landing in a file the next window is read from), or more than 64 files takes the route that reads the files whole and reports what it finds.
+A file whose `stat` size is 0 (an empty file, or one of the `/proc` kind that reports 0 and has content) is read to its end, as `std::fs::read` reads it.
 A file is read as it was when opened, so a run whose output is appended to its input ends, and a read that fails runs the documents before the failure and then reports it.
 
 Peak resident set size at 100 MiB (993,416 records), in MiB:
@@ -7420,7 +7421,7 @@ Time, from `scripts/ab-cli.py` (interleaved, 11 repetitions, `-c`, output and ex
 
 What the windowed route does not cover, and which still hold the input:
 
-- a pipe or a terminal on standard input (a fault cannot be worded by reading them again), more than 64 files, and a list of files with a path that is not a regular file or does not open: #7024;
+- a pipe or a terminal on standard input (a fault cannot be worded by reading them again), more than 64 files, and a list of files with a path that is not a regular file, that does not open, or that is the run's own standard output or error: #7024;
 - programs that call `input`/`inputs` (with or without `-n`), `-R`, `--seq`, `--input-dsv` and `--stream-errors`, which have their own readers: #7023;
 - `-s` and `--validate`, which read the stream whole by design.
 

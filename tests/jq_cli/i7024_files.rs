@@ -63,6 +63,8 @@ fn finish(output: std::process::Output, names: &[String], descriptors: &[usize])
 
 /// The files as paths (the windowed route), and as descriptors (the route that reads them whole).
 fn both(args: &[&str], files: &[Vec<u8>]) -> Result<(Run, Run)> {
+    // Descriptors 3 to 9: `sh` takes a longer number as an operand, and `/dev/fd/3` is a prefix of `/dev/fd/30`.
+    assert!(files.len() <= 7, "at most seven files");
     let dir = tempfile::tempdir()?;
     let mut paths = Vec::new();
     for (n, bytes) in files.iter().enumerate() {
@@ -127,15 +129,17 @@ fn same(args: &[&str], files: &[Vec<u8>]) -> Result<Run> {
     Ok(windowed)
 }
 
+/// Programs that stay on the route (`input_line_number`, `input` and the like take another), and say
+/// nothing on stderr.
 const PROGRAMS: &[&[&str]] = &[
     &["-c", "."],
-    &[
-        "-c",
-        "select(.id % 5003 == 0) | [input_filename, input_line_number, .id]",
-    ],
+    &["-c", "select(.id % 5003 == 0) | [input_filename, .id]"],
     &["-r", "select(.id % 9973 == 0) | .name"],
     &["-c", "[.. | numbers] | length"],
 ];
+
+/// A runtime error names the line its document was read on, in its file: `(at <file N>:LINE)`.
+const ERROR_PROGRAM: &[&str] = &["-c", "select(.id % 4001 == 0) | error(\"boom\")"];
 
 #[test]
 fn files_cut_at_line_starts_read_as_one_stream_7024() -> Result<()> {
@@ -151,11 +155,23 @@ fn files_cut_at_line_starts_read_as_one_stream_7024() -> Result<()> {
         assert!(!out.is_empty(), "{args:?}");
     }
     // Which file each document was read in, and its line there.
+    // (The exit status is that of the last document, as jq's is: the same either way.)
+    let (out, err, _) = same(ERROR_PROGRAM, &files)?;
+    assert_eq!(out, "");
+    assert!(
+        err.starts_with("jq: error (at <file 0>:1): boom\n"),
+        "{err}"
+    );
+    assert!(err.contains("(at <file 1>:"), "{err}");
+    assert!(err.contains("(at <file 2>:"), "{err}");
     let (out, _, _) = same(
-        &["-c", "select(.id == 0 or .id == 30000 or .id == 59999) | [input_filename, input_line_number, .id]"],
+        &[
+            "-c",
+            "select(.id == 0 or .id == 30000 or .id == 59999) | [input_filename, .id]",
+        ],
         &files,
     )?;
-    assert!(out.starts_with("[\"<file 0>\",1,0]\n"), "{out}");
+    assert!(out.starts_with("[\"<file 0>\",0]\n"), "{out}");
     assert!(out.contains("\"<file 1>\""), "{out}");
     assert!(out.ends_with(",59999]\n"), "{out}");
     Ok(())
@@ -186,17 +202,22 @@ fn a_document_open_where_a_file_ends_continues_in_the_next_7024() -> Result<()> 
             let (_, err, status) = same(args, &files)?;
             assert_eq!((err.as_str(), status), ("", 0), "{args:?} at {at}");
         }
+        // The error names the same lines either way.
+        let (_, err, _) = same(ERROR_PROGRAM, &files)?;
+        assert!(err.starts_with("jq: error (at <file "), "at {at}: {err}");
     }
     // The values completed in the second file are that file's: its name and its lines.
     let at = mid(b"\"user 20000\"", 5);
-    let (out, _, _) = same(
-        &[
-            "-c",
-            "select(.id == 20000) | [input_filename, input_line_number, .name]",
-        ],
+    let (_, err, _) = same(
+        &["-c", "select(.id == 20000) | error(\"x\")"],
         &cut(&bytes, &[at]),
     )?;
-    assert_eq!(out, "[\"<file 1>\",1,\"user 20000\"]\n");
+    assert_eq!(err, "jq: error (at <file 1>:1): x\n");
+    let (out, _, _) = same(
+        &["-c", "select(.id == 20000) | [input_filename, .name]"],
+        &cut(&bytes, &[at]),
+    )?;
+    assert_eq!(out, "[\"<file 1>\",\"user 20000\"]\n");
     // A document across three files, the middle one holding none of its own.
     let files = cut(&bytes, &[at, at + 3]);
     let (out, _, _) = same(&["-c", "select(.id == 20000) | input_filename"], &files)?;
@@ -328,5 +349,86 @@ fn files_that_are_empty_or_hold_only_white_space_read_as_the_rest_do_7024() -> R
     let mut cut_off = bytes.clone();
     cut_off.extend_from_slice(b"12");
     same(&["-c", "."], &[cut_off, Vec::new()])?;
+    Ok(())
+}
+
+/// jq reads a line 4095 bytes at a time and names the line a document's read ends on: the open tail of
+/// one file, long and with a line break in it, finished by a document at the front of the next, puts the
+/// reads of the next file's first line at offsets that only the seam knows.
+#[test]
+fn the_reads_of_a_files_first_line_are_counted_from_where_the_carry_ends_7024() -> Result<()> {
+    let mut first = join(&lines(45_000));
+    first.extend_from_slice(b"[\n");
+    first.extend(std::iter::repeat_n(*b"1,", 2045).flatten());
+    let mut second = b"1] 7 [\n".to_vec();
+    second.extend(std::iter::repeat_n(*b"1\n", 400_000).flatten());
+    second.extend_from_slice(b"]\n");
+    second.extend(join(&lines(5_000)));
+    let program = &[
+        "-c",
+        "if type == \"number\" then error(\"n\") else empty end",
+    ][..];
+    let (_, err, _) = same(program, &[first, second])?;
+    assert!(err.starts_with("jq: error (at <file 1>:1): n\n"), "{err}");
+    Ok(())
+}
+
+/// An input that is also the run's output is read whole, as before: output landing in a file the next
+/// window is read from would be read as input, or overwrite what was not yet read.
+#[test]
+fn a_file_that_is_also_the_output_is_read_whole_7024() -> Result<()> {
+    let big = join(&lines(LINES));
+    let small = join(&lines(10));
+    let dir = tempfile::tempdir()?;
+    let (a, b) = (dir.path().join("a.json"), dir.path().join("b.json"));
+    std::fs::write(&a, &big)?;
+    std::fs::write(&b, &small)?;
+    // `1<>b.json` opens the second file read-write as standard output.
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg("exec \"$0\" jq -c . \"$1\" \"$2\" 1<>\"$2\"")
+        .arg(env!("CARGO_BIN_EXE_succinctly"))
+        .arg(&a)
+        .arg(&b)
+        .output()?;
+    assert!(output.status.success(), "{:?}", output.status);
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    // What the whole-file route writes into b.json: all of a's records, then b's.
+    let written = std::fs::read(&b)?;
+    let want_lines = lines(LINES).len() + 10;
+    assert_eq!(written.iter().filter(|&&c| c == b'\n').count(), want_lines);
+    Ok(())
+}
+
+/// A regular file whose `stat` size is 0 and which has content (the `/proc` kind) is read to its end,
+/// as `std::fs::read` reads it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_file_whose_size_is_not_known_is_read_to_its_end_7024() -> Result<()> {
+    let proc_file = "/proc/sys/vm/swappiness";
+    let Ok(value) = std::fs::read_to_string(proc_file) else {
+        return Ok(()); // no procfs here
+    };
+    let big = join(&lines(LINES));
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("big.json");
+    std::fs::write(&path, &big)?;
+    for files in [
+        [path.to_str().unwrap(), proc_file],
+        [proc_file, path.to_str().unwrap()],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["jq", "-c", "."])
+            .args(files)
+            .output()?;
+        assert!(output.status.success(), "{files:?}: {:?}", output.status);
+        let text = String::from_utf8_lossy(&output.stdout);
+        let value = value.trim();
+        assert!(
+            text.starts_with(&format!("{value}\n")) || text.ends_with(&format!("\n{value}\n")),
+            "{files:?}: the pseudo-file's {value} is missing"
+        );
+        assert_eq!(text.lines().count(), LINES + 1, "{files:?}");
+    }
     Ok(())
 }

@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Differential fuzz of the windowed plain route of `succinctly jq` against its whole-file route (#6920, #7048).
+"""Differential fuzz of the windowed plain route of `succinctly jq` against its whole-file route (#6920, #7048, #7024).
 
-A plain filter (no `-n`, nothing that reads `input`) over one regular file of 4 MiB or more is read a
-window at a time (`WindowedFile`, `src/bin/succinctly/jq_runner/window.rs`); the same bytes on stdin are
-read whole. Each case here builds a random stream of 4.3 to 7.5 MiB, runs one random program over it both
-ways, and compares stdout, stderr (the file's name replaced by `<stdin>`) and the exit status. The two routes
-are one implementation of jq's answer, so any difference is a bug in the window.
+A plain filter (no `-n`, nothing that reads `input`) over regular files of 4 MiB or more between them is read a
+window at a time (`WindowedFiles`, `src/bin/succinctly/jq_runner/window.rs`); the same files given as `/dev/fd/N`
+(which the route declines) are read whole. Each case here builds a random stream of 4.3 to 7.5 MiB, cuts it into
+`--files` files at random bytes (anywhere in a token as often as not, so a document is open where a file ends),
+runs one random program over the files both ways, and compares stdout, stderr (the files' names replaced by
+`<file N>`) and the exit status. The two routes are one implementation of jq's answer, so any difference is a
+bug in the window. A regular file on standard input is windowed too since #7059, so it is no longer the whole-file
+side. The programs avoid `input_line_number` and `input`, which leave the route: the line a document was read on
+shows in the `(at <file N>:LINE)` of a runtime error.
 
 The streams mix the shapes that decide where a window ends: documents of every kind, pretty-printed ones that
 span lines, two on a line with no separator, blank lines, CRLF and ` \\n` separators, a document bigger than a
@@ -15,22 +19,16 @@ middle, a lone CR, trailing garbage, a document cut off, no final line break, a 
 surrogate, a raw control character in a string. A BOM at the front and a run of blank lines at the front are
 added to some.
 
-With `--files K` (K of 2 or more, #7024) each stream is cut into K files at random bytes, anywhere in a token
-as often as not, and the files are read as one stream: windowed as paths, and whole as `/dev/fd/N` (the route
-declines a descriptor path). The programs then include `input_filename` and `input_line_number`, which say
-which file each document was read in and on which of its lines, and the cut files of a case are kept
-together as `windowed-fuzz-<seed>-<case>-<n>.json`. Names are replaced by `<file N>` before the comparison.
-
 This is not a comparison with jq: both sides are `succinctly jq`. For that, `scripts/jq-grammar-fuzz.py`
 and `succinctly dev compare jq` are the tools. A stream under 4 MiB would be read whole on both sides and
 prove nothing, so a case that comes out shorter is a bug of the generator and stops the run.
 
 Usage:
     cargo build --release --features cli,simd,regex,serde
-    scripts/jq-windowed-file-fuzz.py [--bin PATH] [-n N] [--seed S] [--work DIR] [--cap-mb MB]
+    scripts/jq-windowed-file-fuzz.py [--bin PATH] [-n N] [--seed S] [--work DIR] [--files K] [--cap-mb MB]
 Each case takes about 0.2 s with a release build. Exit 1 on any difference (a timeout, a crash of the
 script's own and a run that exceeds `--cap-mb` of address space count as one); the stream that differed is
-kept in `--work` as `windowed-fuzz-<seed>-<case>.json`, and the case is printed with the mutations applied,
+kept in `--work` as `windowed-fuzz-<seed>-<case>-<file>.json` (one per file), and the case is printed with the mutations applied,
 in the order they were applied (a later one can move an earlier one's position). `--work` defaults to a
 temporary directory; a debug build is several times slower per case.
 
@@ -41,6 +39,7 @@ succinctly).
 import argparse
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -62,10 +61,11 @@ PROGRAMS = [
     ["-c", ".name | length"],
 ]
 
-# With several files (#7024) what each document was read in is part of the answer.
+# With several files (#7024) which file each document was read in, and on which line, is part of the answer.
 FILE_PROGRAMS = [
-    ["-c", "[input_filename, input_line_number, (.id? // .n? // .)]"],
-    ["-c", "[input_filename, (.. | numbers)] | length"],
+    ["-c", '[input_filename, (.id? // .n? // .)]'],
+    ["-c", 'select((.id? // 0) % 4001 == 0) | error("e")'],
+    ["-c", "[input_filename, ([.. | numbers] | length)]"],
     ["-r", "input_filename"],
 ]
 
@@ -219,10 +219,10 @@ def cut_into_files(rng, data, count):
 
 def named(output, names, descriptors):
     """`output` with each file's path, or its `/dev/fd/N`, replaced by `<file N>`."""
-    for n, (name, fd) in enumerate(zip(names, descriptors)):
+    for n, name in enumerate(names):
         output = output.replace(name.encode(), b"<file %d>" % n)
-        output = output.replace(b"/dev/fd/%d" % fd, b"<file %d>" % n)
-    return output
+    by_fd = {fd: n for n, fd in enumerate(descriptors)}
+    return re.sub(rb"/dev/fd/(\d+)", lambda m: b"<file %d>" % by_fd.get(int(m.group(1)), -1), output)
 
 
 def run_files(args, rng, data, case, program, work, seed):
@@ -257,48 +257,24 @@ def main():
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--work", default=None, help="a directory for the streams (default: a temporary one)")
     parser.add_argument("--files", type=int, default=1,
-                        help="cut each stream into this many files read as one stream (#7024)")
+                        help="cut each stream into this many files, 1 to 64, read as one stream (#7024)")
     parser.add_argument("--cap-mb", type=int, default=8000, help="RLIMIT_AS of each run, in MiB (Linux)")
     args = parser.parse_args()
+    if not 1 <= args.files <= 64:
+        sys.exit("--files is 1 to 64: the route holds at most 64 files open and takes no more")
     if not os.path.exists(args.bin):
         sys.exit("no binary at %s: build with `cargo build --release --features cli,simd,regex,serde`" % args.bin)
     work = os.path.abspath(args.work or tempfile.mkdtemp(prefix="windowed-fuzz-"))
     os.makedirs(work, exist_ok=True)
     rng = random.Random(args.seed)
-    path = os.path.join(work, "windowed-fuzz-%d.json" % args.seed)
     differences, started = 0, time.time()
     for case in range(args.n):
         data, notes = build(rng)
         if len(data) < MIN_BYTES:
             sys.exit("generator bug: case %d is %d bytes, under the windowed route's minimum" % (case, len(data)))
-        if args.files > 1:
-            program = rng.choice(PROGRAMS + FILE_PROGRAMS * 2)
-            windowed, whole, names, sizes = run_files(args, rng, data, case, program, work, args.seed)
-            hung = TIMED_OUT in (windowed[1], whole[1])
-            if hung or windowed != whole:
-                differences += 1
-                kept = [os.path.join(work, "windowed-fuzz-%d-%d-%d.json" % (args.seed, case, n))
-                        for n in range(len(names))]
-                for source, target in zip(names, kept):
-                    shutil.copyfile(source, target)
-                first = next(
-                    (at for at, (a, b) in enumerate(zip(windowed[0], whole[0])) if a != b),
-                    min(len(windowed[0]), len(whole[0])),
-                )
-                print("DIFFERENCE case=%d program=%s mutations=%s sizes=%s exit=%d/%d stdout_differs_at=%s kept=%s"
-                      % (case, program, notes, sizes, windowed[2], whole[2],
-                         first if windowed[0] != whole[0] else "-", kept))
-                if windowed[1] != whole[1]:
-                    print("  files:", windowed[1][:300])
-                    print("  fds  :", whole[1][:300])
-            continue
-        program = rng.choice(PROGRAMS)
-        with open(path, "wb") as handle:
-            handle.write(data)
+        program = rng.choice(PROGRAMS + FILE_PROGRAMS * 2)
         try:
-            windowed = run(args.bin, program + [path], args.cap_mb)
-            with open(path, "rb") as handle:
-                whole = run(args.bin, program, args.cap_mb, stdin=handle)
+            windowed, whole, names, sizes = run_files(args, rng, data, case, program, work, args.seed)
         except OSError as error:  # the binary could not be run at all: keep the stream and say so
             differences += 1
             kept = os.path.join(work, "windowed-fuzz-%d-%d.json" % (args.seed, case))
@@ -307,25 +283,23 @@ def main():
             print("DIFFERENCE case=%d program=%s mutations=%s: could not run: %s kept=%s"
                   % (case, program, notes, error, kept))
             continue
-        windowed_err = windowed[1].replace(path.encode(), b"<stdin>")
         hung = TIMED_OUT in (windowed[1], whole[1])
-        if hung or (windowed[0], windowed_err, windowed[2]) != (whole[0], whole[1], whole[2]):
+        if hung or windowed != whole:
             differences += 1
-            kept = os.path.join(work, "windowed-fuzz-%d-%d.json" % (args.seed, case))
-            with open(kept, "wb") as handle:
-                handle.write(data)
+            kept = [os.path.join(work, "windowed-fuzz-%d-%d-%d.json" % (args.seed, case, n))
+                    for n in range(len(names))]
+            for source, target in zip(names, kept):
+                shutil.copyfile(source, target)
             first = next(
                 (at for at, (a, b) in enumerate(zip(windowed[0], whole[0])) if a != b),
                 min(len(windowed[0]), len(whole[0])),
             )
-            print(
-                "DIFFERENCE case=%d program=%s mutations=%s size=%d exit=%d/%d stdout_differs_at=%s kept=%s"
-                % (case, program, notes, len(data), windowed[2], whole[2],
-                   first if windowed[0] != whole[0] else "-", kept)
-            )
-            if windowed_err != whole[1]:
-                print("  file :", windowed_err[:300])
-                print("  stdin:", whole[1][:300])
+            print("DIFFERENCE case=%d program=%s mutations=%s sizes=%s exit=%d/%d stdout_differs_at=%s kept=%s"
+                  % (case, program, notes, sizes, windowed[2], whole[2],
+                     first if windowed[0] != whole[0] else "-", kept))
+            if windowed[1] != whole[1]:
+                print("  files:", windowed[1][:300])
+                print("  fds  :", whole[1][:300])
     print("%d cases, %d differences, seed %d, %.0fs" % (args.n, differences, args.seed, time.time() - started))
     sys.exit(1 if differences else 0)
 

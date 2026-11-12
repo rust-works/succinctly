@@ -1,10 +1,11 @@
-//! A lone regular file read a window at a time for the plain `succinctly jq` route (#6920).
+//! Regular files read a window at a time for the plain `succinctly jq` route (#6920, #7024).
 //!
 //! The plain route (`jq -c .`, `jq .name`, `jq 'select(...)'`: no `-n`, nothing that reads `input`)
 //! used to read its file whole, split every document into a span (16 bytes a record) and run the
 //! program over borrowed slices of that one buffer, so its peak memory grew with the file where jq's
 //! stays at a few MiB. [`WindowedFile`] hands the same loop the same documents, a window of them at a
-//! time, and drops the text it has run before reading on.
+//! time, and drops the text it has run before reading on; [`WindowedFiles`] reads several files as the one
+//! stream jq reads them as.
 //!
 //! What makes a window safe to drop and the loop unchanged:
 //!
@@ -25,7 +26,9 @@
 //! - **Invalid UTF-8 is substituted a window at a time.** A window is a whole number of lines, and a
 //!   JSON string holds no line break, so the substitution of one window is the substitution of the
 //!   file's lines in it. (A text where a string does hold one, a backslash before a line break, is not
-//!   JSON jq reads, and its substitution can differ at a window's edge.)
+//!   JSON jq reads, and its substitution can differ at a window's edge.) A token open where a file ends
+//!   is not substituted until it is joined to the next file's bytes, which is the open tail handed on
+//!   (below).
 //! - **A file with few line breaks is not read twice.** Only the bytes a read adds are searched for a
 //!   break, and a read that finds none asks for twice as much, so a one-line file is read in a linear
 //!   amount of work, as whole, and gains nothing.
@@ -34,17 +37,26 @@
 //! window: [`Reread`] reads the file again through a duplicate of the open handle, a chunk at a time
 //! and by position, on the error path only. A file renamed, replaced or appended to meanwhile
 //! is worded from the bytes the run read.
+//!
+//! **Several files** (#7024) are the stream jq reads them as, one after another: a token still open where
+//! a file ends (a truncated container or string, a number or keyword the next byte delimits) continues at
+//! the front of the next, and the whole-file route moves it there by [`SeamStitcher`] and records what it
+//! moved in a [`Seam`] that its line counting reads (#4305, #4316). The windowed route cuts that open tail
+//! off the end of a file's last window the same way and starts the next file's text with it, as the bytes
+//! that were read (their substitution is of the two files' bytes together), and gives each window the
+//! seam the whole-file route would have had for the file. What the carry on the front asks of the
+//! window: nothing is dropped that is only part of it, because the seam describes the front of the
+//! text, and jq's reads of the file's first line are counted from where the carry ends.
 
 use std::fs::File;
 use std::io::{self, Read};
 use std::ops::Range;
 use std::path::PathBuf;
 
-use succinctly::jq::utf8_document::SubstitutionEdit;
+use succinctly::jq::utf8_document::{original_offset, SubstitutionEdit};
 
 use super::{
-    advance_position, bare_token_at_end, count_newlines, split_json_values, token_runs_to_end,
-    Seam, SeamStitcher,
+    advance_position, count_newlines, open_tail_after_split, split_json_values, Seam, SeamStitcher,
 };
 
 /// How much of the file one window reads, and so about how much memory the route holds besides a
@@ -192,16 +204,7 @@ impl RawMap {
                 break;
             }
             if at < r.text.end {
-                let rel = at - r.text.start;
-                let before = r.edits.partition_point(|e| e.text.end <= rel);
-                return r.raw_start
-                    + match r.edits.get(before) {
-                        Some(e) if e.text.start <= rel => e.raw.start,
-                        _ => match before.checked_sub(1).map(|i| &r.edits[i]) {
-                            Some(e) => rel - e.text.end + e.raw.end,
-                            None => rel,
-                        },
-                    };
+                return r.raw_start + original_offset(&r.edits, at - r.text.start);
             }
             delta = r.delta_after;
         }
@@ -216,6 +219,9 @@ pub(super) struct WindowedFile {
     /// file that grows meanwhile is read as it was, as `std::fs::read` read it, so a run whose
     /// output is appended to its input ends.
     remaining: u64,
+    /// The length is not known (`stat` said 0, as it does of an empty file and of a file of the `/proc`
+    /// kind that is not): the file is read to its end, as `std::fs::read` reads it.
+    unknown_len: bool,
     /// How much a read adds.
     block: usize,
     /// The text: `buf[..validated]` is valid UTF-8 ending at a line break (or the end of the file),
@@ -254,8 +260,8 @@ pub(super) struct WindowedFile {
     /// The carry as it was read, and its length once that is dropped, to give the open tail on.
     carry_raw: Vec<u8>,
     carry_raw_len: usize,
-    /// How much the file holds, from its start.
-    total: u64,
+    /// How much has been read from the file.
+    file_read: u64,
     /// Where the substitution changed the text, kept for a file that hands a tail on.
     raw_map: RawMap,
     track_raw: bool,
@@ -282,15 +288,12 @@ impl WindowedFile {
         let track_raw = place.hold_tail || carry_len > 0;
         Self {
             file,
-            remaining: len,
+            remaining: if len == 0 { u64::MAX } else { len },
+            unknown_len: len == 0,
             block: block.max(1),
             // The carry is on the front, unread as text: its lines are not searched for a break,
             // so the first region the text is judged in covers all of it.
-            carry_raw: if place.hold_tail && carry_len > 0 {
-                place.carry.clone()
-            } else {
-                Vec::new()
-            },
+            carry_raw: Vec::new(),
             buf: place.carry,
             validated: 0,
             no_break_from: carry_len,
@@ -308,7 +311,7 @@ impl WindowedFile {
             seam_raw: place.seam.clone(),
             seam: place.seam,
             carry_raw_len: carry_len,
-            total: len,
+            file_read: 0,
             raw_map: RawMap::default(),
             track_raw,
             origin: place.origin,
@@ -354,7 +357,7 @@ impl WindowedFile {
                 // (it is one long document, or a file of one line) for all of what is left, as
                 // the whole-file route reads it.
                 grow = if grow >= 4 * WINDOW_BYTES {
-                    usize::try_from(self.remaining).unwrap_or(usize::MAX)
+                    self.rest()
                 } else {
                     grow.saturating_mul(2)
                 };
@@ -374,11 +377,9 @@ impl WindowedFile {
             if self.eof && self.hold_tail && self.read_error.is_none() {
                 // What `open_tail_start` finds of a file's text, from the split this scan made.
                 let text = &self.buf[..self.validated];
-                let open = match split_error {
-                    Some(at) => token_runs_to_end(&text[at..]).then_some(at),
-                    None => bare_token_at_end(text, values.last().copied()),
-                };
-                if let Some(start) = open {
+                if let Some(start) =
+                    open_tail_after_split(text, split_error, values.last().copied())
+                {
                     values.retain(|&(_, end)| end <= start);
                     split_error = None;
                     tail_start = Some(start);
@@ -420,7 +421,8 @@ impl WindowedFile {
                     seam.moved_len = moved.moved_len;
                     seam.moved_newline = moved.moved_newline;
                 }
-                if last {
+                // Where the next file starts in the stream: nothing else reads it.
+                if last && self.hold_tail {
                     self.end_origin = advance_position(self.origin, &self.buf[..text_end]);
                 }
                 return Ok(Some(Window {
@@ -447,7 +449,7 @@ impl WindowedFile {
             if pending {
                 let lookahead = self.block.saturating_mul(LOOKAHEAD_WINDOWS);
                 grow = if self.buf.len() >= lookahead {
-                    usize::try_from(self.remaining).unwrap_or(usize::MAX)
+                    self.rest()
                 } else {
                     lookahead - self.buf.len()
                 };
@@ -462,18 +464,24 @@ impl WindowedFile {
     /// their end, and counts the line breaks it held.
     ///
     /// The carry on the front is the open tail of the previous file, which the first document of this
-    /// one is made of, so it is run before anything is dropped: a drop that reaches into it takes the
-    /// seam that describes it along, and the lines of the carry are not the file's (#4316).
+    /// one is made of. Nothing that is only part of it is dropped: its seam describes the front of the
+    /// text, and jq's reads of the file's first line (up to 4095 bytes each) are counted from where the
+    /// carry ends (#4316), so a seam kept over a text that no longer starts with the carry would
+    /// count them from the wrong byte. Once the drop reaches past it the seam goes with it, and the
+    /// lines of the carry are not the file's.
     fn drop_consumed(&mut self) {
         let consumed = self.consumed.min(self.buf.len());
-        let line_start = self.buf[..consumed]
+        let mut line_start = self.buf[..consumed]
             .iter()
             .rposition(|&b| b == b'\n')
             .map_or(0, |at| at + 1);
+        let base = self.seam.base;
+        if line_start < base {
+            line_start = 0;
+        }
         if line_start > 0 {
-            let base = self.seam.base;
             let dropped = count_newlines(&self.buf[..line_start]);
-            self.lines_before += dropped - count_newlines(&self.buf[..line_start.min(base)]);
+            self.lines_before += dropped - count_newlines(&self.buf[..base]);
             self.origin = (self.origin.0 + dropped, 0);
             self.offset += line_start;
             self.buf.drain(..line_start);
@@ -492,7 +500,7 @@ impl WindowedFile {
 
     /// The bytes of the open tail of the file from `start` in the text, as they were read, which is
     /// what the next file's text is judged with (the substitution is of the two together).
-    fn raw_tail(&self, start: usize) -> Vec<u8> {
+    fn raw_tail(&mut self, start: usize) -> Vec<u8> {
         let at = self.offset + start;
         if !self.raw_map.changes_from(at) {
             return self.buf[start..self.validated].to_vec();
@@ -500,11 +508,33 @@ impl WindowedFile {
         let raw_at = self.raw_map.raw_of(at);
         let mut tail = Vec::new();
         if raw_at < self.carry_raw_len {
-            tail.extend_from_slice(self.carry_raw.get(raw_at..).unwrap_or(&[]));
+            // The carry as read: kept when its front was substituted, and otherwise it is the text.
+            let carry = if self.carry_raw.is_empty() {
+                &self.buf[..self.carry_raw_len.min(self.buf.len())]
+            } else {
+                self.carry_raw.as_slice()
+            };
+            tail.extend_from_slice(carry.get(raw_at..).unwrap_or(&[]));
         }
         let from = raw_at.saturating_sub(self.carry_raw_len) as u64;
-        tail.extend(read_range(&self.file, from, self.total));
+        match read_range(&self.file, from, self.file_read) {
+            Ok(bytes) => tail.extend(bytes),
+            // The tail is cut short: the run ends at this failure, which is reported after the window.
+            Err(error) => {
+                self.read_error.get_or_insert(error);
+            }
+        }
         tail
+    }
+
+    /// All that is left of the file, for a read that wants it in one go (the file's length is not known:
+    /// a few windows).
+    fn rest(&self) -> usize {
+        if self.unknown_len {
+            4 * WINDOW_BYTES
+        } else {
+            usize::try_from(self.remaining).unwrap_or(usize::MAX)
+        }
     }
 
     /// Reads up to `n` more bytes; a short read, or the length the file had, is the end of the file,
@@ -520,6 +550,7 @@ impl WindowedFile {
             match self.file.by_ref().take(n as u64).read_to_end(&mut self.buf) {
                 Ok(read) => {
                     self.remaining -= read as u64;
+                    self.file_read += read as u64;
                     #[cfg(test)]
                     {
                         self.bytes_read += read as u64;
@@ -593,6 +624,10 @@ impl WindowedFile {
             if self.validated == 0 && self.seam.base > 0 {
                 self.seam = std::mem::replace(&mut self.seam, Seam::NONE)
                     .after_substitution(raw_len, &edits);
+                // The carry as read, for a tail that starts inside it and goes on to the next file.
+                if self.hold_tail {
+                    self.carry_raw = region[..self.carry_raw_len.min(region.len())].to_vec();
+                }
             }
             self.raw_map.push(text_start, raw_len, text.len(), edits);
         }
@@ -603,26 +638,28 @@ impl WindowedFile {
     }
 }
 
-/// The bytes of `file` from `from` to `to`, read by position: whatever cannot be read is left out.
+/// The bytes of `file` from `from` to `to`, read by position: a file that gives out early is short.
 #[cfg(unix)]
-fn read_range(file: &File, from: u64, to: u64) -> Vec<u8> {
+fn read_range(file: &File, from: u64, to: u64) -> io::Result<Vec<u8>> {
     use std::os::unix::fs::FileExt;
     let mut bytes = vec![0u8; usize::try_from(to.saturating_sub(from)).unwrap_or(0)];
     let mut filled = 0;
     while filled < bytes.len() {
         match file.read_at(&mut bytes[filled..], from + filled as u64) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
             Ok(read) => filled += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
         }
     }
     bytes.truncate(filled);
-    bytes
+    Ok(bytes)
 }
 
 /// The several-files route is Unix only: the tail of a file is read again by position.
 #[cfg(not(unix))]
-fn read_range(_file: &File, _from: u64, _to: u64) -> Vec<u8> {
-    Vec::new()
+fn read_range(_file: &File, _from: u64, _to: u64) -> io::Result<Vec<u8>> {
+    Ok(Vec::new())
 }
 
 /// Several regular files read as the one stream jq reads them as (#7024): each a window at a time, and
@@ -919,7 +956,8 @@ impl Reread {
                 Ok(RereadSource {
                     file: file.try_clone()?,
                     start: 0,
-                    len,
+                    // A length of 0 is not known to be (`WindowedFile`): read to the end.
+                    len: if len == 0 { u64::MAX } else { len },
                 })
             })
             .collect::<io::Result<_>>()?;
@@ -952,8 +990,13 @@ impl Reread {
             let want = (current.len - at).min(REREAD_CHUNK) as usize;
             let mut chunk = vec![0u8; want];
             return match current.file.read_at(&mut chunk, current.start + at) {
-                // A file that gives out early leaves the rest of the stream unread.
-                Ok(0) => None,
+                // A file that gives out early is over, as it is to the run's reader, and the next
+                // one follows.
+                Ok(0) => {
+                    source += 1;
+                    at = 0;
+                    continue;
+                }
                 Ok(read) => {
                     chunk.truncate(read);
                     if at_front {
@@ -1736,6 +1779,32 @@ mod stream_tests {
         }
     }
 
+    /// jq reads a line 4095 bytes at a time, and the line a document ends on is the count through the end
+    /// of the read that completes it: a carry of more than that with a line break in it, and a document
+    /// that finishes it a few bytes into the next file, put the later reads at offsets that only the carry's
+    /// seam knows (#4316, #7024). Dropping the carry's first line, and the seam with it, moved them.
+    #[test]
+    fn a_long_carry_keeps_the_reads_of_the_first_line_aligned_7024() {
+        let mut first = b"1\n[\n".to_vec();
+        first.extend(std::iter::repeat_n(*b"1,", 2045).flatten());
+        let mut second = b"1] 7 [\n".to_vec();
+        second.extend(std::iter::repeat_n(*b"1\n", 40).flatten());
+        second.extend_from_slice(b"]\n8\n");
+        let files = [first, second];
+        for &block in BLOCKS {
+            assert_same(&files, block);
+        }
+        // The same with the line of the open document longer than two reads.
+        let mut first = b"[\n".to_vec();
+        first.extend(std::iter::repeat_n(*b"1,", 5000).flatten());
+        let mut second = b"1] 7 [\n".to_vec();
+        second.extend(std::iter::repeat_n(*b"1\n", 40).flatten());
+        second.extend_from_slice(b"]\n8\n");
+        for &block in BLOCKS {
+            assert_same(&[first.clone(), second.clone()], block);
+        }
+    }
+
     /// Every way to cut a stream into two or three files, and several block sizes.
     #[test]
     fn a_stream_cut_anywhere_reads_as_the_whole_file_route_reads_it() {
@@ -1849,5 +1918,45 @@ mod stream_tests {
             seen.push((index, window.substituted));
         }
         assert_eq!(seen, vec![(0, true), (1, true)]);
+    }
+
+    fn temp_file(bytes: &[u8]) -> File {
+        let mut file = tempfile::tempfile().expect("a temp file");
+        file.write_all(bytes).expect("written");
+        file.rewind().expect("rewound");
+        file
+    }
+
+    /// A length of 0 is not known to be (`stat` says it of a `/proc` file that has content): the file is
+    /// read to its end, and a file that holds less than it was said to is over at its end.
+    #[test]
+    fn a_length_that_is_not_known_or_not_true_is_read_to_the_end_7024() {
+        let mut reader = WindowedFiles::new(
+            vec![
+                (temp_file(b"1\n2\n"), 0),
+                (temp_file(b"3\n"), 0),
+                (temp_file(b"4\n5\n"), 100),
+            ],
+            4096,
+        );
+        let mut seen = Vec::new();
+        while let Some((index, window)) = reader.next_window().expect("reads") {
+            for &(start, end) in &window.values {
+                seen.push((index, window.raw[start..end].to_vec()));
+            }
+        }
+        let want: Vec<(usize, Vec<u8>)> = [(0, "1"), (0, "2"), (1, "3"), (2, "4"), (2, "5")]
+            .iter()
+            .map(|&(index, text)| (index, text.as_bytes().to_vec()))
+            .collect();
+        assert_eq!(seen, want);
+        // The second read of the stream, for a fault's wording, goes on to the next file when one gives out
+        // early, and reads the one of unknown length to its end.
+        let (a, b, c) = (temp_file(b"1\n"), temp_file(b"2\n"), temp_file(b"}\n"));
+        let reread = Reread::new_many(&[(&a, 100), (&b, 0), (&c, 2)]).expect("dup");
+        assert_eq!(
+            reread.stream_fault().as_deref(),
+            Some("Unmatched '}' at line 3, column 1")
+        );
     }
 }

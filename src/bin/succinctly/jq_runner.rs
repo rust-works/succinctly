@@ -5225,9 +5225,9 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     if can_use_lazy_path && !args.null_input {
         // Lazy path: read files as raw bytes and process directly
         // This preserves original number formatting like "4e4"
-        // #6920: a lone regular file is read a window at a time, so the run holds a window of it
-        // where it held the whole file; the loop below then has one buffer, empty, for that file
-        // and is handed its windows.
+        // #6920: regular files are read a window at a time (#7024: several, as the one stream jq reads),
+        // so the run holds a window of them where it held the whole files; the loop below then has an
+        // empty buffer for each file and is handed their windows.
         let mut windowed: Option<window::WindowedFiles> = None;
         let mut reread: Option<std::rc::Rc<window::Reread>> = None;
         let (files, mut raw_inputs, failures) = match seq_plain.take() {
@@ -9340,12 +9340,7 @@ impl EofTail {
         let Some(bytes) = sources.iter().rev().find(|bytes| !bytes.is_empty()) else {
             return false;
         };
-        split_json_values(bytes)
-            .0
-            .last()
-            .is_some_and(|&(start, end)| {
-                end == bytes.len() && !matches!(bytes[start], b'"' | b'[' | b'{')
-            })
+        bare_token_at_end(bytes, split_json_values(bytes).0.last().copied()).is_some()
     }
 }
 
@@ -9780,14 +9775,7 @@ impl LossySource {
 
     /// The offset in the original of `at` in the text; inside an edit, where its bytes start.
     fn original_offset(&self, at: usize) -> usize {
-        let before = self.edits.partition_point(|edit| edit.text.end <= at);
-        match self.edits.get(before) {
-            Some(edit) if edit.text.start <= at => edit.raw.start,
-            _ => match before.checked_sub(1).map(|i| &self.edits[i]) {
-                Some(edit) => at - edit.text.end + edit.raw.end,
-                None => at,
-            },
-        }
+        succinctly::jq::utf8_document::original_offset(&self.edits, at)
     }
 
     /// The original's bytes for `range` of the text.
@@ -11202,14 +11190,33 @@ fn report_input_read_failure(error: &std::io::Error) {
 #[cfg(unix)]
 fn names_stdin(meta: &std::fs::Metadata) -> bool {
     use std::os::fd::AsFd;
+    names_descriptor(std::io::stdin().as_fd(), meta)
+}
+
+/// Whether `meta` is the file descriptor `fd` is open on.
+#[cfg(unix)]
+fn names_descriptor(fd: std::os::fd::BorrowedFd<'_>, meta: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
-    std::io::stdin()
-        .as_fd()
-        .try_clone_to_owned()
+    fd.try_clone_to_owned()
         .ok()
         .map(std::fs::File::from)
-        .and_then(|stdin| stdin.metadata().ok())
-        .is_some_and(|stdin| stdin.dev() == meta.dev() && stdin.ino() == meta.ino())
+        .and_then(|held| held.metadata().ok())
+        .is_some_and(|held| held.dev() == meta.dev() && held.ino() == meta.ino())
+}
+
+/// Whether `meta` is a file the run writes its output or errors to (`jq . f 1<>f`, `>> f`): the windows
+/// are read a few at a time while the output is written, so output landing in the file would be read, or
+/// would overwrite bytes not yet read, where the whole-file route had read all of it first (#7024).
+#[cfg(unix)]
+fn names_output(meta: &std::fs::Metadata) -> bool {
+    use std::os::fd::AsFd;
+    names_descriptor(std::io::stdout().as_fd(), meta)
+        || names_descriptor(std::io::stderr().as_fd(), meta)
+}
+
+#[cfg(not(unix))]
+fn names_output(_: &std::fs::Metadata) -> bool {
+    false
 }
 
 #[cfg(not(unix))]
@@ -11254,12 +11261,13 @@ fn lone_raw_windowed_file(args: &JqCommand, files: &[PathBuf]) -> Option<(std::f
     Some((file, meta.len()))
 }
 
-/// The lone regular file the plain route reads a window at a time (#6920), opened, and the means
-/// to read it again for a fault's wording, with the file list the run then has (the path, or none for a
+/// The regular files the plain route reads a window at a time (#6920), opened, and the means to read
+/// them again for a fault's wording, with the file list the run then has (the paths, or none for a
 /// standard input that is a regular file, #7024); or `None` for a run that is not one: a pipe, a
-/// directory or a terminal, several files, a file too small to be worth it, and every flag that has the
-/// route read the stream whole (`--slurp`, `--validate`, `--seq`). A file that does not open here is left
-/// to the route that reports it.
+/// directory or a terminal, a list with a path that is not a regular file, files too small between them
+/// to be worth it (a lone file of 4 MiB, or [`windowed_regular_files`]'s several), and every flag that has
+/// the route read the stream whole (`--slurp`, `--validate`, `--seq`). A file that does not open here is
+/// left to the route that reports it.
 ///
 /// The path is judged by `stat`, which opens nothing: opening a named pipe (`<(cmd)`, `mkfifo`)
 /// pairs with its writer, and a handle dropped on the way to another route would take the
@@ -11310,16 +11318,24 @@ fn windowed_regular_files(
     if files.len() > MAX_WINDOWED_FILES {
         return None;
     }
-    let mut opened = Vec::with_capacity(files.len());
+    // Every path is judged by `stat` before any is opened: a list of small files is turned down
+    // without the cost of opening them.
     let mut total = 0u64;
     for path in files {
-        let meta = regular_file(path)?;
-        let file = std::fs::File::open(path).ok()?;
-        total = total.checked_add(meta.len())?;
-        opened.push((file, meta.len()));
+        total = total.checked_add(regular_file(path)?.len())?;
     }
     if total < window::MIN_WINDOWED_FILE_BYTES {
         return None;
+    }
+    let mut opened = Vec::with_capacity(files.len());
+    for path in files {
+        let file = std::fs::File::open(path).ok()?;
+        // What was opened, not what the path named a moment ago.
+        let meta = file.metadata().ok()?;
+        if !meta.is_file() || names_stdin(&meta) || names_output(&meta) {
+            return None;
+        }
+        opened.push((file, meta.len()));
     }
     let handles: Vec<(&std::fs::File, u64)> =
         opened.iter().map(|(file, len)| (file, *len)).collect();
@@ -11337,16 +11353,17 @@ fn windowed_regular_files(
     None
 }
 
-/// What `path` is if it is a regular file the run may read from its start: judged by `stat`, which opens
-/// nothing (opening a named pipe pairs with its writer, and a handle dropped on the way to another route
-/// would take the writer's bytes with it); not standard input, nor a path that names a descriptor the run
-/// already holds (`/dev/stdin`, `/dev/fd/N`), which may share an offset with it.
+/// What `path` is if it is a regular file: judged by `stat`, which opens nothing (opening a named pipe
+/// pairs with its writer, and a handle dropped on the way to another route would take the writer's bytes
+/// with it); not standard input, nor a path that names a descriptor the run already holds (`/dev/stdin`,
+/// `/dev/fd/N`), which may share an offset with it. Whether it is one of the run's own descriptors
+/// ([`names_stdin`], [`names_output`]) is left to the caller, which asks once it has a reason to open it.
 fn regular_file(path: &PathBuf) -> Option<std::fs::Metadata> {
     if is_stdin_dash(path) || path.starts_with("/dev/fd/") {
         return None;
     }
     let meta = std::fs::metadata(path).ok()?;
-    (meta.is_file() && !names_stdin(&meta)).then_some(meta)
+    meta.is_file().then_some(meta)
 }
 
 /// The one regular file of at least `min_len` bytes that `files` names, with its `stat`: the shape
@@ -11361,7 +11378,7 @@ fn lone_regular_file(files: &[PathBuf], min_len: u64) -> Option<(&PathBuf, std::
         return None;
     };
     let meta = regular_file(path)?;
-    (meta.len() >= min_len).then_some((path, meta))
+    (meta.len() >= min_len && !names_stdin(&meta) && !names_output(&meta)).then_some((path, meta))
 }
 
 /// Standard input when it is a regular file of 4 MiB or more left to read (`jq … < file`, #7024),
@@ -11372,7 +11389,6 @@ fn lone_regular_file(files: &[PathBuf], min_len: u64) -> Option<(&PathBuf, std::
 #[cfg(unix)]
 fn windowed_stdin_file() -> Option<(window::WindowedFiles, std::rc::Rc<window::Reread>)> {
     use std::os::fd::AsFd;
-    use std::os::unix::fs::MetadataExt;
     if STDIN_PUSHBACK.with(|slot| slot.borrow().is_some()) {
         return None;
     }
@@ -11380,14 +11396,7 @@ fn windowed_stdin_file() -> Option<(window::WindowedFiles, std::rc::Rc<window::R
     // The windows are read a few at a time while the output is written, so a stdin that is also an
     // output (`jq . <> f >&0`) would have its writes land where the next read comes from, and its
     // bytes overwritten while still being read: the whole-file route had read all of it first.
-    let input = file.metadata().ok()?;
-    let is_input = |fd: std::os::fd::BorrowedFd<'_>| {
-        fd.try_clone_to_owned()
-            .ok()
-            .and_then(|fd| std::fs::File::from(fd).metadata().ok())
-            .is_some_and(|m| m.dev() == input.dev() && m.ino() == input.ino())
-    };
-    let shares_output = is_input(std::io::stdout().as_fd()) || is_input(std::io::stderr().as_fd());
+    let shares_output = names_output(&file.metadata().ok()?);
     windowed_regular_stdin(file, shares_output)
 }
 
@@ -12467,34 +12476,40 @@ fn open_tail_start(raw: &[u8], resumes: bool, seam: Seam, stream: bool) -> Optio
         } else {
             split_json_values(&raw[offset..])
         };
-        match split {
-            // The splitter gave up at `start`: a truncated token runs into the end of the
-            // file; anything else is a malformed byte, after which jq resumes.
-            (_, Some(start)) => {
-                let start = offset + start;
-                if token_runs_to_end(&raw[start..]) {
-                    return Some(start);
-                }
-                if !resumes {
-                    return None;
-                }
-                let (_, _, resume) = meet_fault(&mut faults, raw, start, stream);
-                if resume >= raw.len() {
-                    return None;
-                }
-                offset = resume;
-            }
-            // Every token is whole, but a bare number or keyword at the very end is only
-            // delimited by the next byte.
-            (spans, None) => {
-                return bare_token_at_end(
-                    raw,
-                    spans
-                        .last()
-                        .map(|&(start, end)| (offset + start, offset + end)),
-                )
-            }
+        let fault = split.1.map(|at| offset + at);
+        let last = split
+            .0
+            .last()
+            .map(|&(start, end)| (offset + start, offset + end));
+        if let Some(start) = open_tail_after_split(raw, fault, last) {
+            return Some(start);
         }
+        // Whole, or malformed at a byte no later file can repair, after which jq resumes.
+        let Some(start) = fault.filter(|_| resumes) else {
+            return None;
+        };
+        let (_, _, resume) = meet_fault(&mut faults, raw, start, stream);
+        if resume >= raw.len() {
+            return None;
+        }
+        offset = resume;
+    }
+}
+
+/// Where the open tail of `raw` starts, given how the splitter ended on it: at `fault`, its first
+/// malformed byte, when that is a token the end of the file cuts off (a truncated token runs into the
+/// end of the file; anything else is a malformed byte); and when every token is whole (`fault` is
+/// `None`), at the bare number or keyword at the very end, which only the next byte delimits. `last` is
+/// the span of the last value. Shared with the windowed route, which makes the same cut at the end of
+/// a file (#7024).
+fn open_tail_after_split(
+    raw: &[u8],
+    fault: Option<usize>,
+    last: Option<(usize, usize)>,
+) -> Option<usize> {
+    match fault {
+        Some(start) => token_runs_to_end(&raw[start..]).then_some(start),
+        None => bare_token_at_end(raw, last),
     }
 }
 
@@ -20384,7 +20399,7 @@ mod tests {
     /// worth it, on a run that reads the stream in order. The file here is sparse, so only its size is
     /// read: every other shape takes the route that reads the file whole.
     #[test]
-    fn windowed_plain_file_takes_only_a_lone_regular_file_6920() {
+    fn windowed_plain_file_takes_only_regular_files_big_enough_6920_7024() {
         use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
         let file = |name: &str, len: u64| {

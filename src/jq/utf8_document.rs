@@ -115,6 +115,21 @@ pub struct SubstitutionEdit {
     pub text: Range<usize>,
 }
 
+/// The offset in the document of `at` in the text the substitution made of it.
+///
+/// `edits` are the ones that made the text ([`substitute_invalid_utf8_jq_document_mapped`]). An offset
+/// inside a replacement is where the bytes it replaced start.
+pub fn original_offset(edits: &[SubstitutionEdit], at: usize) -> usize {
+    let before = edits.partition_point(|edit| edit.text.end <= at);
+    match edits.get(before) {
+        Some(edit) if edit.text.start <= at => edit.raw.start,
+        _ => match before.checked_sub(1).map(|i| &edits[i]) {
+            Some(edit) => at - edit.text.end + edit.raw.end,
+            None => at,
+        },
+    }
+}
+
 /// [`substitute_invalid_utf8_jq_document`], with every place it changed the document, in order
 /// (#5975).
 ///
