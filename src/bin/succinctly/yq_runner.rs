@@ -11773,6 +11773,42 @@ fn contains_split_doc(expr: &Expr) -> bool {
     jq::walk::contains_builtin(expr, |b| matches!(b, Builtin::SplitDoc))
 }
 
+/// Whether yq reads `path` as a file when it decides what its first positional argument is: it
+/// exists (a symlink is followed) and is not a directory (`maybeFile`, `cmd/utils.go`).
+fn names_a_file(path: &str) -> bool {
+    std::fs::metadata(path).is_ok_and(|meta| !meta.is_dir())
+}
+
+/// yq's `processArgs` (#7027): which positional arguments are the expression and which are files.
+///
+/// With neither `--expression` nor `--from-file`, the first positional is looked up on the file
+/// system, because yq lets the expression be left out:
+///
+/// - a name that ends in `.yq` and is a file holds the expression (`yq x.yq d.yaml`);
+/// - `-` and any other file are inputs, and the expression is `.` (`yq d.yaml`);
+/// - anything else, including a directory, is the expression.
+///
+/// An empty `--expression` is no `--expression`, as in yq.
+fn resolve_positionals(args: &mut YqCommand) {
+    if args.expression.as_deref() == Some("") {
+        args.expression = None;
+    }
+    if args.from_file.is_some() || args.expression.is_some() {
+        return;
+    }
+    let Some(first) = args.filter.clone() else {
+        return;
+    };
+    if first.ends_with(".yq") && names_a_file(&first) {
+        // The rest are inputs: `from_file` makes the next positional the first of them.
+        args.from_file = Some(std::path::PathBuf::from(first));
+        args.filter = (!args.files.is_empty()).then(|| args.files.remove(0));
+    } else if first == "-" || names_a_file(&first) {
+        // An empty expression is `.`, and every positional is a file.
+        args.expression = Some(String::new());
+    }
+}
+
 /// Get input files from arguments.
 fn get_input_files(args: &YqCommand) -> Vec<String> {
     // When --from-file is used, the 'filter' field becomes the first input file
@@ -11975,6 +12011,9 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         args.split_exp = (!text.is_empty()).then_some(text);
     }
 
+    // #7027: what the first positional is, before anything reads `filter` or `files`.
+    resolve_positionals(&mut args);
+
     // #7025: `--security-disable-env-ops` and `--security-disable-file-ops`, for the whole run.
     let _security_scope = jq::enter_security_scope(
         args.security_disable_env_ops,
@@ -12120,6 +12159,11 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
 
     // Get input files (with --from-file, the filter positional is an input file)
     let input_files = get_input_files(&args);
+
+    // #7027: yq refuses files beside `-n` (`yq -n . d.yaml`), where this ignored them.
+    if args.null_input && !input_files.is_empty() {
+        anyhow::bail!("cannot pass files in when using null-input flag");
+    }
 
     // #2648: `filename` reads the file's name as it was given on the command
     // line; with no file argument the input is stdin, which real yq names `-`.
