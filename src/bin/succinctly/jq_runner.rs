@@ -5213,14 +5213,27 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         && !args.stream // the program reads tostream events, not documents (#4397)
         && !args.stream_errors // ... read by jq's own streaming parser (#5474)
         && !program_reads_inputs; // not `uses_input_builtins`: a clean `--seq` stream has no fault to queue (#6147)
-    let mut seq_plain: Option<PreparedInputs> =
-        if args.seq && lazy_route_open && !args.validate && !args.null_input {
-            seq_plain_json_inputs(&args)?
-        } else {
-            None
-        };
+
+    // #7082: a lone regular file of RFC 7464's own framing is read a window at a time, as the plain
+    // route reads its file (#6920), so the run holds a window where it held the file.
+    let mut seq_windowed = if args.seq && lazy_route_open {
+        windowed_seq_file(&args)
+    } else {
+        None
+    };
+    let mut seq_plain: Option<PreparedInputs> = if args.seq
+        && lazy_route_open
+        && seq_windowed.is_none()
+        && !args.validate
+        && !args.null_input
+    {
+        seq_plain_json_inputs(&args)?
+    } else {
+        None
+    };
     // `--seq` input otherwise parses differently.
-    let can_use_lazy_path = lazy_route_open && (!args.seq || seq_plain.is_some());
+    let can_use_lazy_path =
+        lazy_route_open && (!args.seq || seq_plain.is_some() || seq_windowed.is_some());
 
     if can_use_lazy_path && !args.null_input {
         // Lazy path: read files as raw bytes and process directly
@@ -5232,7 +5245,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         let mut reread: Option<std::rc::Rc<window::Reread>> = None;
         let (files, mut raw_inputs, failures) = match seq_plain.take() {
             Some(prepared) => prepared,
-            None => match windowed_plain_file(&args) {
+            None => match seq_windowed.take().or_else(|| windowed_plain_file(&args)) {
                 Some((files, reader, again)) => {
                     windowed = Some(reader);
                     reread = Some(again);
@@ -11262,6 +11275,32 @@ fn lone_raw_windowed_file(args: &JqCommand, files: &[PathBuf]) -> Option<(std::f
     Some((file, meta.len()))
 }
 
+/// The lone regular file a `--seq` stream is read from a window at a time (#7082), in the shape
+/// [`windowed_plain_file`] gives, with each RS byte read as a space; or `None` for a run that is not one.
+///
+/// What the whole-file route does for a stream that is "clean" (see [`seq_plain_json_inputs`]) is blank
+/// its RS bytes and read it as plain JSON, so this does the same a window at a time, and only for the
+/// streams [`window::Reread::is_plain_seq_records`] can vouch for without holding the file: those of
+/// RFC 7464's own framing, every record `RS value LF`. Any other stream, whatever it holds (a fault, a
+/// truncated tail, records the strict validator turns down), is left to the route that walks it
+/// whole, with the text untouched: the prepass reads the file by position and moves nothing. A
+/// `--slurp` run holds every value anyway, and `--validate` and `-n` are other routes.
+fn windowed_seq_file(args: &JqCommand) -> Option<WindowedSource> {
+    if args.slurp || args.validate || args.null_input || lazy_route_forced_off() {
+        return None;
+    }
+    // The prepass vouches for one stream, so it is not asked of several files, which it would open.
+    if get_input_files(args).len() > 1 {
+        return None;
+    }
+    let (files, reader, reread) = windowed_source(args)?;
+    if !reread.is_plain_seq_records() {
+        return None;
+    }
+    reread.blank_rs();
+    Some((files, reader.blanking_rs(), reread))
+}
+
 /// The regular files the plain route reads a window at a time (#6920), opened, and the means to read
 /// them again for a fault's wording, with the file list the run then has (the paths, or none for a
 /// standard input that is a regular file, #7024); or `None` for a run that is not one: a pipe, a
@@ -11275,16 +11314,25 @@ fn lone_raw_windowed_file(args: &JqCommand, files: &[PathBuf]) -> Option<(std::f
 /// writer's bytes with it. A path that names a descriptor the run already holds (`/dev/stdin`,
 /// `/dev/fd/N`) is left alone too: the file it opens may share an offset with the descriptor on
 /// some systems, so it is not read from its start, and the fault is worded from its start.
-fn windowed_plain_file(
-    args: &JqCommand,
-) -> Option<(
-    Vec<PathBuf>,
-    window::WindowedFiles,
-    std::rc::Rc<window::Reread>,
-)> {
+fn windowed_plain_file(args: &JqCommand) -> Option<WindowedSource> {
     if args.slurp || args.validate || args.seq || args.null_input {
         return None;
     }
+    windowed_source(args)
+}
+
+/// What a route that reads its source a window at a time is handed: the file list the run then has,
+/// the reader, and the means to read the stream again for a fault's wording.
+type WindowedSource = (
+    Vec<PathBuf>,
+    window::WindowedFiles,
+    std::rc::Rc<window::Reread>,
+);
+
+/// The source [`windowed_plain_file`] and [`windowed_seq_file`] read a window at a time, once their own
+/// flags have let the run through: a regular file of 4 MiB or more named on the command line, several
+/// regular files, or standard input when it is one (#7024).
+fn windowed_source(args: &JqCommand) -> Option<WindowedSource> {
     let files = get_input_files(args);
     if files.is_empty() {
         let (reader, reread) = windowed_stdin_file()?;
@@ -20473,6 +20521,98 @@ mod tests {
         }
     }
 
+    /// #7082: `--seq` reads a window at a time only for one regular file of RFC 7464's own framing that is
+    /// big enough to be worth it, on a run that reads the records in order. Anything else, whatever is wrong
+    /// with it, is left to the route that walks the stream whole.
+    #[test]
+    fn windowed_seq_file_takes_only_framed_streams_7082() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut records = Vec::new();
+        let mut n = 0;
+        while records.len() < window::MIN_WINDOWED_FILE_BYTES as usize {
+            records.push(0x1e);
+            records.extend_from_slice(
+                format!("{{\"n\":{n},\"pad\":\"{}\"}}\n", "x".repeat(60)).as_bytes(),
+            );
+            n += 1;
+        }
+        let write = |name: &str, bytes: &[u8]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).expect("written");
+            path.to_string_lossy().into_owned()
+        };
+        let good = write("good.seq", &records);
+        let takes = |argv: &[&str]| {
+            let cmd = JqCommand::try_parse_from(argv.iter().copied()).unwrap();
+            windowed_seq_file(&cmd).is_some()
+        };
+        assert!(takes(&["jq", "--seq", ".", &good]));
+        assert!(takes(&["jq", "--seq", "-c", "select(.n > 3)", &good]));
+        // Not a framed stream: each of these needs the walk of jq's reader, or has a fault.
+        let mut cut = records.clone();
+        cut.pop();
+        let mut leading = b"x".to_vec();
+        leading.extend(&records);
+        let mut bad_middle = records.clone();
+        let mid = bad_middle.len() / 2;
+        let at = bad_middle[mid..].iter().position(|&b| b == b'{').unwrap() + mid;
+        bad_middle[at] = b'}';
+        let mut rs_inside = records.clone();
+        let at = rs_inside.iter().position(|&b| b == b'\n').unwrap();
+        rs_inside[at] = 0x1e;
+        let mut bom = b"\xef\xbb\xbf".to_vec();
+        bom.extend(&records);
+        let mut invalid = records.clone();
+        invalid[100] = 0xff;
+        // A last record that is not a document, found by the probe of the end before the pass.
+        let mut bad_last = records.clone();
+        bad_last.extend_from_slice(b"\x1e{\"n\":}\n");
+        // ... and bytes that are not UTF-8 in the last record, which the validator turns down too.
+        let mut invalid_last = records.clone();
+        invalid_last.extend_from_slice(b"\x1e\"\xff\"\n");
+        for (name, bytes) in [
+            ("cut", cut),
+            ("leading", leading),
+            ("bad_middle", bad_middle),
+            ("rs_inside", rs_inside),
+            ("bom", bom),
+            ("invalid", invalid),
+            ("bad_last", bad_last),
+            ("invalid_last", invalid_last),
+            (
+                "plain",
+                records
+                    .iter()
+                    .map(|&b| if b == 0x1e { b' ' } else { b })
+                    .collect(),
+            ),
+            ("empty_tail", {
+                let mut v = records.clone();
+                v.push(0x1e);
+                v
+            }),
+        ] {
+            let path = write(name, &bytes);
+            assert!(!takes(&["jq", "--seq", ".", &path]), "{name}");
+        }
+        // The size and shape gates are the plain route's.
+        let small = write("small.seq", &records[..1000]);
+        assert!(!takes(&["jq", "--seq", ".", &small]));
+        assert!(!takes(&["jq", "--seq", ".", &good, &good]));
+        assert!(!takes(&["jq", "--seq", ".", "/dev/stdin"]));
+        // The runs that read the stream whole or otherwise.
+        for flags in [&["-s"][..], &["--validate"], &["-n"]] {
+            let mut argv = vec!["jq", "--seq"];
+            argv.extend(flags);
+            argv.extend([".", good.as_str()]);
+            assert!(!takes(&argv), "{flags:?}");
+        }
+        // The plain route does not take a `--seq` stream, nor this one a plain stream's gate.
+        let plain = JqCommand::try_parse_from(["jq", "--seq", ".", good.as_str()]).unwrap();
+        assert!(windowed_plain_file(&plain).is_none());
+    }
+
     /// #7023: `-R` reads a window at a time only for one regular file big enough to be worth it, on a
     /// run that reads the lines in order, and the plain route's gate agrees on which files those are.
     #[test]
@@ -27180,6 +27320,85 @@ mod plain_record_sequence_tests {
                 "{name}: no unsound stream in {cases} cases, so the test cannot fail without it"
             );
         }
+    }
+
+    /// What [`plain_record_sequence`] was before #7082 made it a run of [`PlainRecords`], kept as the
+    /// reference the checker is held to.
+    fn reference_plain_record_sequence(raw: &[u8], guards: PlainGuards) -> bool {
+        use succinctly::json::validate::validate;
+        if guards.starts_on_rs && raw.first() != Some(&ASCII_RS) {
+            return false;
+        }
+        if guards.ends_on_newline && raw.last() != Some(&b'\n') {
+            return false;
+        }
+        let record_ok = |record: &[u8]| {
+            (!guards.record_ends_on_newline || record.last() == Some(&b'\n'))
+                && validate(record).is_ok()
+        };
+        let last = raw.rsplit(|&b| b == ASCII_RS).next().unwrap_or(raw);
+        if !record_ok(last) {
+            return false;
+        }
+        let mut records = raw.split(|&b| b == ASCII_RS);
+        if raw.first() == Some(&ASCII_RS) {
+            records.next();
+        }
+        let mut any = false;
+        for record in records {
+            if !record_ok(record) {
+                return false;
+            }
+            any = true;
+        }
+        any
+    }
+
+    /// #7082: the checker the windowed route runs a chunk at a time gives the verdict of the whole-slice
+    /// one it replaced, for every stream, every set of guards and every way of cutting the stream.
+    #[test]
+    fn the_record_check_gives_one_verdict_however_the_stream_is_cut_7082() {
+        use crate::jq_seq_reader::PlainRecords;
+        let all = PlainGuards::ALL;
+        let none = PlainGuards {
+            starts_on_rs: false,
+            ends_on_newline: false,
+            record_ends_on_newline: false,
+        };
+        let mut rng = Rng(0x7082_7082_7082_7082);
+        let mut accepted = 0;
+        for _ in 0..(cases() / 10).max(2_000) {
+            let raw = stream(&mut rng);
+            let shown = String::from_utf8_lossy(&raw).into_owned();
+            for guards in [all, none] {
+                let want = reference_plain_record_sequence(&raw, guards);
+                assert_eq!(plain_record_sequence(&raw, guards), want, "whole {shown:?}");
+                accepted += usize::from(want);
+                // The windowed route has no separate UTF-8 gate: the records that pass are valid
+                // UTF-8 whole.
+                assert!(
+                    !want || std::str::from_utf8(&raw).is_ok(),
+                    "vouched for bytes that are not UTF-8: {shown:?}"
+                );
+                for cut in [1usize, 2, 3, 5, 8, 13, 64, 1 + rng.below(40)] {
+                    let mut check = PlainRecords::new(guards);
+                    let mut alive = true;
+                    for piece in raw.chunks(cut) {
+                        // An empty piece says nothing.
+                        alive = check.feed(&[]) && check.feed(piece);
+                        if !alive {
+                            break;
+                        }
+                    }
+                    assert_eq!(
+                        alive && check.finish_with(&[]),
+                        want,
+                        "cut every {cut} bytes: {shown:?}"
+                    );
+                }
+            }
+        }
+        assert!(accepted > 100, "only {accepted} streams were accepted");
     }
 
     /// Under `-s` the values are wrapped in one array, a level more than the deepest has, so a stream

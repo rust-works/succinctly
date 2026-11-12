@@ -71,6 +71,9 @@ pub(super) const MIN_WINDOWED_FILE_BYTES: u64 = 4 * WINDOW_BYTES as u64;
 /// How many windows a document that does not fit in one is read on to before the rest of the file is.
 const LOOKAHEAD_WINDOWS: usize = 8;
 
+/// The record separator of a `--seq` stream.
+const RS: u8 = 0x1e;
+
 /// A document span within a window's text: `(start, end)`, `end` exclusive.
 pub(super) type Span = (usize, usize);
 
@@ -248,6 +251,9 @@ pub(super) struct WindowedFile {
     substituted: bool,
     /// The last window was handed out.
     done: bool,
+    /// Each RS byte (`0x1e`) of the text is read as a space (a `--seq` stream, #7082): nothing moves,
+    /// so every offset and line is where it was.
+    blank_rs: bool,
     /// A read failed: the bytes read before it are run, and the error is returned after them.
     read_error: Option<io::Error>,
     /// The file's place in the stream it is one of (#7024).
@@ -308,6 +314,7 @@ impl WindowedFile {
             started: !place.strip_bom,
             substituted: place.substituted,
             done: false,
+            blank_rs: false,
             read_error: None,
             index: place.index,
             hold_tail: place.hold_tail,
@@ -324,6 +331,14 @@ impl WindowedFile {
             #[cfg(test)]
             bytes_read: 0,
         }
+    }
+
+    /// The same reader with each RS byte of the text read as a space (#7082): the plain JSON stream a
+    /// clean `--seq` stream is. (The run's readers are [`WindowedFiles`], which set the flag themselves.)
+    #[cfg(test)]
+    pub(super) fn blanking_rs(mut self) -> Self {
+        self.blank_rs = true;
+        self
     }
 
     /// The next window, or `None` when the file is done. A read that failed is returned here, after
@@ -604,11 +619,25 @@ impl WindowedFile {
         if end == self.validated {
             return;
         }
-        let region = &self.buf[self.validated..end];
-        if succinctly::text::utf8::validate_utf8(region).is_ok() {
+        let from = self.validated;
+        if succinctly::text::utf8::validate_utf8(&self.buf[from..end]).is_ok() {
             self.validated = end;
-            return;
+        } else {
+            self.substitute_region(end);
         }
+        if self.blank_rs {
+            for b in &mut self.buf[from..self.validated] {
+                if *b == RS {
+                    *b = b' ';
+                }
+            }
+        }
+    }
+
+    /// Substitutes the invalid UTF-8 of the region from `validated` to `end`, as the whole-file route
+    /// does, and moves `validated` past it.
+    fn substitute_region(&mut self, end: usize) {
+        let region = &self.buf[self.validated..end];
         let raw_len = region.len();
         let (text, edits) = if self.track_raw {
             let (text, edits) =
@@ -688,6 +717,8 @@ pub(super) struct WindowedFiles {
     next_index: usize,
     /// An invalid byte was substituted in a file already done.
     substituted: bool,
+    /// Each RS byte of the text is read as a space (a `--seq` stream, #7082).
+    blank_rs: bool,
 }
 
 impl WindowedFiles {
@@ -702,7 +733,14 @@ impl WindowedFiles {
             only_empty: true,
             next_index: 0,
             substituted: false,
+            blank_rs: false,
         }
+    }
+
+    /// The same reading each RS byte as a space (#7082): the plain JSON stream a clean `--seq` stream is.
+    pub(super) fn blanking_rs(mut self) -> Self {
+        self.blank_rs = true;
+        self
     }
 
     /// The next window and the position of its file among the files, or `None` when the last file is
@@ -753,7 +791,9 @@ impl WindowedFiles {
                         origin: self.end_origin,
                         substituted: self.substituted,
                     };
-                    self.current = Some(WindowedFile::in_stream(file, len, self.block, place));
+                    let mut opened = WindowedFile::in_stream(file, len, self.block, place);
+                    opened.blank_rs = self.blank_rs;
+                    self.current = Some(opened);
                 }
             }
         }
@@ -931,6 +971,10 @@ pub(super) struct Reread {
     /// For a target that cannot read by position.
     #[cfg_attr(unix, allow(dead_code))]
     path: PathBuf,
+    /// Each RS byte is read as a space, as the run reads a `--seq` stream (#7082): set once the
+    /// prepass has vouched for the stream, after the reread is shared with the run.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    blank_rs: std::cell::Cell<bool>,
 }
 
 struct RereadSource {
@@ -947,6 +991,23 @@ struct RereadSource {
 /// How much of the file a chunk of the second read holds.
 const REREAD_CHUNK: u64 = 1 << 20;
 
+/// The most of one record the `--seq` prepass holds before it turns the stream down (#7082): a record
+/// that big has the whole-file route, which holds it too, and a stream that opens an RS and never closes
+/// it (NDJSON with one RS at its front) is not read into memory to be told it is not records.
+#[cfg(unix)]
+const MAX_PENDING_RECORD: usize = 64 << 20;
+
+/// How much of the end of the file the `--seq` prepass reads first, to check the last record: a stream
+/// that fails does so most often at its end, and the check then costs this, not a pass over the file.
+#[cfg(unix)]
+const TAIL_PROBE: u64 = 256 << 10;
+
+/// How much of the file a chunk of the `--seq` prepass holds (#7082): small enough that the buffer comes
+/// from the heap and is not a mapping that is freed, which glibc answers by raising the size it maps
+/// from, so that the window buffers after it were carved from a heap that fragments (+6 MiB at 100 MiB).
+#[cfg(unix)]
+const PREPASS_CHUNK: usize = 64 << 10;
+
 impl Reread {
     pub(super) fn new(file: &File, start: u64, len: u64, path: PathBuf) -> io::Result<Self> {
         Ok(Self {
@@ -956,6 +1017,7 @@ impl Reread {
                 len,
             }],
             path,
+            blank_rs: std::cell::Cell::new(false),
         })
     }
 
@@ -973,7 +1035,13 @@ impl Reread {
         Self {
             sources,
             path: PathBuf::new(),
+            blank_rs: std::cell::Cell::new(false),
         }
+    }
+
+    /// From now on the stream is read with each RS byte as a space (#7082).
+    pub(super) fn blank_rs(&self) {
+        self.blank_rs.set(true);
     }
 
     /// jq's parse error for the stream the file holds, or `None` when jq's parser reads it all or the
@@ -1012,6 +1080,13 @@ impl Reread {
                         at_front = false;
                         chunk.drain(..crate::front_matter::leading_bom_len(&chunk));
                     }
+                    if self.blank_rs.get() {
+                        for b in &mut chunk {
+                            if *b == RS {
+                                *b = b' ';
+                            }
+                        }
+                    }
                     at += read as u64;
                     Some(chunk)
                 }
@@ -1023,6 +1098,70 @@ impl Reread {
         });
         let fault = succinctly::jq::jq_stream_fault(chunks, 1, 0);
         (!failed.get()).then_some(fault).flatten()
+    }
+
+    /// Whether the file is a `--seq` stream that is nothing but plain records (#7082): RFC 7464's own
+    /// framing, which [`crate::jq_seq_reader::plain_record_sequence`] vouches for over a text held
+    /// whole and this does a chunk at a time, by the same checker. So the run may read it as the plain
+    /// JSON stream it is with each RS blanked. `false` is no verdict on the stream (a read that
+    /// failed, or one the walk of jq's reader has to decide), and the whole-file route takes it.
+    ///
+    /// The memory is a chunk and the biggest record. The first and last bytes are asked of first, so a
+    /// stream that is not framed at all is turned down by two reads, not by a pass over it.
+    #[cfg(unix)]
+    pub(super) fn is_plain_seq_records(&self) -> bool {
+        use crate::jq_seq_reader::{PlainGuards, PlainRecords};
+        use std::os::unix::fs::FileExt;
+        let guards = PlainGuards::ALL;
+        // One source: a stream of several files is not this route's.
+        let [source] = self.sources.as_slice() else {
+            return false;
+        };
+        let (file, start, len) = (&*source.file, source.start, source.len);
+        let byte_at = |at: u64| {
+            let mut one = [0u8];
+            match file.read_at(&mut one, start + at) {
+                Ok(1) => Some(one[0]),
+                _ => None,
+            }
+        };
+        if len == 0 || byte_at(0) != Some(RS) || byte_at(len - 1) != Some(b'\n') {
+            return false;
+        }
+        // The last record first, when an RS is near enough the end to hold it: the verdict does not
+        // depend on the order, and a record that fails is most often the last (a write cut short).
+        let probe = len.min(TAIL_PROBE);
+        let mut tail = vec![0u8; probe as usize];
+        if file.read_exact_at(&mut tail, start + len - probe).is_err() {
+            return false; // patchcov: coverage tolerate-line reason="untestable: a read that fails right after the last byte was read"
+        }
+        if let Some(rs) = tail.iter().rposition(|&b| b == RS) {
+            if !PlainRecords::record_ok(&tail[rs + 1..], guards) {
+                return false;
+            }
+        }
+        drop(tail);
+        let mut check = PlainRecords::new(guards);
+        let mut chunk = vec![0u8; PREPASS_CHUNK];
+        let mut at = 0u64;
+        while at < len {
+            let want = (len - at).min(PREPASS_CHUNK as u64) as usize;
+            match file.read_at(&mut chunk[..want], start + at) {
+                Ok(read) if read > 0 => {
+                    at += read as u64;
+                    if !check.feed(&chunk[..read]) || check.pending_len() > MAX_PENDING_RECORD {
+                        return false;
+                    }
+                }
+                _ => return false, // patchcov: coverage tolerate-line reason="untestable: a file that shrinks or a read that fails between the passes"
+            }
+        }
+        check.finish_with(&[])
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn is_plain_seq_records(&self) -> bool {
+        false
     }
 
     #[cfg(not(unix))]
@@ -1207,6 +1346,82 @@ mod tests {
                 assert_same(text, block);
             }
         }
+    }
+
+    /// #7082: a window of a `--seq` stream reads each RS as a space, whatever the window, and nothing
+    /// else moves: the documents and lines are those of the stream with its RS bytes blanked.
+    #[test]
+    fn rs_bytes_read_as_spaces_and_nothing_moves_7082() {
+        let mut text = Vec::new();
+        for n in 0..300 {
+            text.push(0x1e);
+            text.extend_from_slice(format!("{{\"n\":{n}}}\n").as_bytes());
+        }
+        let blanked: Vec<u8> = text
+            .iter()
+            .map(|&b| if b == 0x1e { b' ' } else { b })
+            .collect();
+        let want = whole(&blanked);
+        for &block in BLOCKS {
+            let mut reader = open(&text, block).blanking_rs();
+            let (mut spans, mut seen) = (Vec::new(), Vec::new());
+            while let Some(window) = reader.next_window().expect("reads") {
+                assert!(!window.raw.contains(&0x1e), "block {block}");
+                for &(s, e) in &window.values {
+                    spans.push((window.offset + s, window.offset + e));
+                    seen.push(window.raw[s..e].to_vec());
+                }
+            }
+            assert_eq!(spans, want.spans, "block {block}");
+            assert_eq!(seen.len(), 300);
+            assert_eq!(seen[7], b"{\"n\":7}", "block {block}");
+        }
+    }
+
+    /// #7082: the prepass holds no more than a bounded part of a record. One that is longer is turned
+    /// down, though it is a record, and the whole-file route reads it; a stream that opens an RS and
+    /// never closes it is not read into memory to be told so.
+    #[cfg(unix)]
+    #[test]
+    fn the_seq_prepass_turns_down_a_record_it_would_hold_whole_7082() {
+        let framed = |spaces: usize| {
+            let mut text = vec![0x1e];
+            text.extend(std::iter::repeat_n(b' ', spaces));
+            text.extend_from_slice(b"{}\n");
+            let mut file = tempfile::tempfile().expect("a temp file");
+            file.write_all(&text).expect("written");
+            let len = text.len() as u64;
+            Reread::new(&file, 0, len, PathBuf::new()).expect("a reread")
+        };
+        assert!(framed(1 << 20).is_plain_seq_records());
+        assert!(framed(MAX_PENDING_RECORD - 1000).is_plain_seq_records());
+        assert!(!framed(MAX_PENDING_RECORD + 1000).is_plain_seq_records());
+    }
+
+    /// #7082: a fault in a `--seq` stream is worded over the stream the run read, RS bytes as spaces, and a
+    /// file shorter than it was when opened is no stream of records.
+    #[cfg(unix)]
+    #[test]
+    fn the_reread_words_a_seq_stream_with_its_rs_as_spaces_7082() {
+        let text = b"\x1e{\"a\":1}\n\x1e}\n";
+        let reread = |len: u64| {
+            let mut file = tempfile::tempfile().expect("a temp file");
+            file.write_all(text).expect("written");
+            Reread::new(&file, 0, len, PathBuf::new()).expect("a reread")
+        };
+        let plain = reread(text.len() as u64);
+        let seq = reread(text.len() as u64);
+        seq.blank_rs();
+        let blanked: Vec<u8> = text
+            .iter()
+            .map(|&b| if b == 0x1e { b' ' } else { b })
+            .collect();
+        let want = succinctly::jq::jq_stream_fault(std::iter::once(blanked), 1, 0);
+        assert!(want.is_some(), "the stray `}}` is a fault");
+        assert_eq!(seq.stream_fault(), want);
+        assert_ne!(plain.stream_fault(), want, "the RS bytes are not JSON");
+        // A file that is shorter than the length it had when it was opened.
+        assert!(!reread(text.len() as u64 + 10).is_plain_seq_records());
     }
 
     #[test]

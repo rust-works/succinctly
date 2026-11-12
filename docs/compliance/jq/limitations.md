@@ -7278,12 +7278,13 @@ The endless-stream rows were measured on `main` @ 89a900ccc against `/usr/bin/jq
 On a file of many top-level values (NDJSON), `succinctly jq`'s peak memory grew linearly with the file, where jq 1.7.1's stays at a few MB whatever the size.
 Since [#6920](https://github.com/rust-works/succinctly/issues/6920) it no longer does for a plain filter (`-c .`, `-r .name`, `select(...)`: no `-n`, no `input`) over regular files of 4 MiB or more between them (one, or up to 32 named on the command line, which are read as the one stream jq reads, or one redirected onto standard input, `jq … < file`, [#7024](https://github.com/rust-works/succinctly/issues/7024)), which are read a window at a time (below).
 Since [#7023](https://github.com/rust-works/succinctly/issues/7023) it no longer does for a program that calls `input`/`inputs` over one regular file or standard input (the lazy route), nor for `-R` over one regular file of 4 MiB or more.
-Every other route that reads the input still holds all of it: `--seq`, `--input-dsv`, `--stream-errors`, standard input that is a pipe or a terminal (for the plain filter) or any standard input (for `-R`), and `-R` and the programs that call `input`/`inputs` over several files (`-R length a b` peaks at 30.7 MiB against 12.7 for one file, `reduce inputs` at 32.8 against 14.6, on two 11 MB files).
+Since [#7082](https://github.com/rust-works/succinctly/issues/7082) it no longer does for `--seq` over one regular file (or a redirected one) of 4 MiB or more whose stream is RFC 7464's own framing, every record `RS value LF` (below).
+Every other route that reads the input still holds all of it: `--seq` over a pipe, several files or a stream that is not that framing, `--input-dsv`, `--stream-errors`, standard input that is a pipe or a terminal (for the plain filter) or any standard input (for `-R`), and `-R` and the programs that call `input`/`inputs` over several files (`-R length a b` peaks at 30.7 MiB against 12.7 for one file, `reduce inputs` at 32.8 against 14.6, on two 11 MB files).
 That is a known limitation, not supported at this stage: it is outside the three reasons ADR-0018 permits a divergence for, so it is a deferred gap and not a deliberate behaviour.
 It is tracked in [#7024](https://github.com/rust-works/succinctly/issues/7024) (the plain filter over a pipe on standard input, and over more than 32 files or a list with a path that is not a regular file; `-R` and `input`/`inputs` over several files; `-R` over standard input).
 The tables below were measured before #6920 and #7023 and show every row as it was; the rows they fixed are the first five of each (`first(inputs)` was flat already).
 The slurp shapes (`-s`, `-R -s`) are not a gap: jq holds the input too, and succinctly's peak is 223 MiB for `-s length` at 100 MiB on x86_64 where jq's is 850 (and 208 for `-R -s length` against jq's 183).
-Standard input under a pipe-fed plain filter or `-R` (a redirected regular file under a plain filter has been windowed since #7024), and `--seq`, grow as the file route did (124 and 108 MiB at 100 MiB on x86_64), two files held both (224 MiB) until #7024, and `--stream` is flat (8.5 MiB).
+Standard input under a pipe-fed plain filter or `-R` (a redirected regular file under a plain filter has been windowed since #7024), and `--seq` over anything but a regular file of RFC 7464 records (#7082), grow as the file route did (124 and 108 MiB at 100 MiB on x86_64), two files held both (224 MiB) until #7024, and `--stream` is flat (8.5 MiB).
 At 100 MB succinctly is still faster than jq on every row below except `first(inputs)`, on both machines ([docs/compare/jq.md](../../compare/jq.md)): this is a memory trade, not a speed one.
 For a log too large to hold in memory that a fixed route does not cover, use jq, or split the file and run each part (`split -l`).
 
@@ -7334,7 +7335,7 @@ jq 1.7.1's peak at 100 MiB is 2.6 to 3.2 MiB in the committed [docs/compare/](..
 
 What holds the memory, from the slope between 10 and 100 MiB (MiB of peak per MiB of input) and from the code:
 
-- **The whole text, 1.00 per MiB, on every route that reads the file** (the plain route over a regular file has not since #6920, nor the `input`/`inputs` route and `-R` since #7023).
+- **The whole text, 1.00 per MiB, on every route that reads the file** (the plain route over a regular file has not since #6920, nor the `input`/`inputs` route and `-R` since #7023, nor `--seq` over a regular file of RFC 7464 records since #7082).
   `-n` programs that read `input`/`inputs` and `-R` sloped at 1.00 on both machines.
   The lone-source lazy route ([#6451](https://github.com/rust-works/succinctly/issues/6451)) reads only the first 256 KiB before the program starts, which is why `first(inputs)` is flat, and `read_lazy_rest` drained the rest of the file into the same buffer when the scan got past it, where `LazyJsonInputs::text` was dropped only with the source's last document.
   The documents are converted one at a time and dropped, and the output is written as it goes, so neither the values nor the results are retained.
@@ -7454,8 +7455,41 @@ Time, from an interleaved driver (the two binaries alternate within each repetit
 What the windowed route does not cover, and which still hold the input:
 
 - a pipe or a terminal on standard input (a fault cannot be worded by reading them again), more than 32 files, and a list of files with a path that is not a regular file, that does not open, or that is the run's own standard output or error: #7024;
-- programs that call `input`/`inputs` (with or without `-n`), `-R`, `--seq`, `--input-dsv` and `--stream-errors`, which have their own readers: #7023;
+- programs that call `input`/`inputs` (with or without `-n`), `-R`, `--input-dsv` and `--stream-errors`, which have their own readers: #7023; and `--seq` over a pipe, several files or a stream that is not RFC 7464's own framing, and `--seq -s` (the whole-file route's by design; a `--seq` pipe is #7024's stdin question);
 - `-s` and `--validate`, which read the stream whole by design.
+
+### `--seq` over a regular file of RFC 7464 records is windowed (#7082)
+
+`--seq` over one regular file of 4 MiB or more, named or redirected onto standard input, with no `--slurp`, `--validate` or `-n`, and a stream that is RFC 7464's own framing (every record `RS value LF`, with the value one RFC 8259 document), is read in the windows of the plain route above, with each RS byte read as a space.
+That is what the whole-file route did to a clean stream already (`seq_plain_json_inputs`, #5674: with its RS bytes blanked the text is a plain JSON stream with every offset and line where it was), done a window at a time, so the records, the lines (`input_line_number`, `(at file:N)`) and the output are the whole-file route's.
+What it cannot do a window at a time is decide that the stream is clean, which the whole-file route does over all of the text first, so a prepass reads the file once by position (`Reread::is_plain_seq_records`, a 64 KiB chunk at a time, through a duplicate of the handle, which moves nothing) and feeds `PlainRecords`.
+`PlainRecords` is the only definition of the framing: `plain_record_sequence`, which the whole-file route asks of a text it holds, is that checker run over one piece (#6501), and a test holds the two to each other over every way of cutting a stream.
+Its verdict is the one #6501 proved sound against the walk of jq's reader: bytes before the first RS, a stream that does not end on a line feed, a record that does not end on one, an empty record, a record the strict validator turns down (`nan`, a leading zero, a depth over its limit) and bytes that are not UTF-8 all decline.
+The first and last bytes are asked of first, so a stream that is not framed at all (NDJSON under `--seq`, which jq reads as one abandoned text) is declined by two reads, and the record after the last RS is checked before the pass when one is in the last 256 KiB, as the whole-file check reads its last record first: a stream that fails at its end costs two reads and a record.
+A stream that is rejected in the middle costs the prepass the part of the file before the bad record, which the whole-file route's own check reads up to as well, and then the whole-file route.
+A record the prepass would hold more than 64 MiB of turns the stream down, though it is a record: the whole-file route reads it, holding it too, and a stream that opens an RS and never closes it (NDJSON with one RS at its front) is not read into memory to be told it is not records.
+A declined stream, whatever is wrong with it, takes the route it always took, with the text untouched: the prepass reads by position, so standard input is still whole for the route that reads it.
+Memory is a window, a prepass chunk and the biggest record (up to 64 MiB), so a record bigger than a window is held whole, as a document of the plain route is.
+A file changed between the prepass and the read is read as it is at the read, with its RS bytes blanked and no second check, as the plain route's reads are of the file as it is: text that is not framed reads as the plain JSON stream it looks like.
+
+Peak resident set size at 100 MiB (993,416 records, 105,851,071 bytes with an RS before each), in MiB, `--seq -c .` over a file:
+
+| machine           | before | after |
+|-------------------|-------:|------:|
+| AMD Ryzen 9 7950X |  126.0 |  10.4 |
+| Apple M4 Pro      |  123.4 |   6.7 |
+
+The x86_64 figures are `/usr/bin/time -f %M` on `terminus` (126.0 before and 10.4 after for `-c .`, 126.4 and 10.4 for `-r .name`; at 10 MiB 21.5 and 10.4, flat), the aarch64 ones `/usr/bin/time -l` on `johns-mac-mini` (123.4 and 6.7 at 100 MiB, 16.9 and 6.7 at 10 MiB), medians of 5, release builds with `--features cli`, base `main` @ `8e55c18b2`.
+jq 1.7.1's peak on the same file is 2.3 MiB.
+The output of every row is byte-identical to the base binary's, on a file, `< file` and a pipe, and to jq 1.7.1's for the identity, `.name`, `select` and `input_line_number` rows.
+
+Time, interleaved (11 repetitions, a control run of the base beside the real one, output and exit status gated, an idle `terminus` and a `johns-mac-mini` that had a browser and an editor open):
+
+- **x86_64:** `-c .` reads −6.1% at 100 MiB and −4.9% at 10 MiB, `-r .name` −4.4% and −3.5%, against a control of −0.2% to −0.1%.
+- **aarch64:** `-c .` reads +1.4% at 100 MiB and +2.5% at 10 MiB, `-r .name` +0.4% and −0.0%, against a control of +0.9% and −1.6%: neutral to slightly slower, the prepass being a pass over the file the whole-file route had made as its own check.
+- **Below 4 MiB** the file is read whole as before: 1 MiB rows read −1.2% to −2.4% (x86_64) and −0.1% to −0.4% (aarch64), a gap of a few tenths of a millisecond.
+
+It was checked against the base binary over 1,680 runs of 210 random 4 to 7 MiB streams (pretty-printed and compact records, a 2 MB record, `\r\n` and blank-line endings, a truncated tail, a stray or doubled RS, a BOM, a NUL, invalid UTF-8, a flipped byte), each under four of seven programs on a file and as `< file`: no difference in stdout, stderr or exit status.
 
 ## Nesting depth (#5497)
 
