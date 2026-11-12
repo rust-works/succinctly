@@ -15,8 +15,9 @@
 //! - **What is kept starts at a line start**, so the next window's counter starts at line start 0 and
 //!   only has to be told how many line breaks were dropped ([`Window::lines_before`]).
 //! - **A document that does not scan is not yet a fault.** Short of the end of the file the text
-//!   after it may be what it lacks, so it is kept, the file read on (twice as much each time, so a
-//!   document of any size is found in a linear amount of reading) and the scan tried again. The
+//!   after it may be what it lacks, so it is kept, the file read on (to eight windows, and then to the
+//!   end of the file, so the scans that fail to find a document's end cover nine windows at most)
+//!   and the scan tried again. The
 //!   exception is a fault no further byte can change: one at a byte no container or string starts at
 //!   (a stray `}`, a bad literal), which sits in a text that ends at a line break and so is whole.
 //!   That one is reported at once; the rest are reported at the end of the file, where the splitter's
@@ -47,6 +48,9 @@ pub(super) const WINDOW_BYTES: usize = 1 << 20;
 /// The smallest file the route reads a window at a time: below this it is not worth the second
 /// route, and the file is read whole as before.
 pub(super) const MIN_WINDOWED_FILE_BYTES: u64 = 4 * WINDOW_BYTES as u64;
+
+/// How many windows a document that does not fit in one is read on to before the rest of the file is.
+const LOOKAHEAD_WINDOWS: usize = 8;
 
 /// A document span within a window's text: `(start, end)`, `end` exclusive.
 pub(super) type Span = (usize, usize);
@@ -209,9 +213,17 @@ impl WindowedFile {
                 }));
             }
             // Nothing to run, and the file goes on: white space is dropped, and a document that did
-            // not scan is read on, each time twice what is held.
+            // not scan is read on. The scan of an incomplete document is lost, so doubling costs
+            // two scans of a document in all: a document bigger than a window is read on to eight
+            // windows once, and past that, which is a file that is one document or has a very big
+            // one, for the rest of the file, as the whole-file route reads it.
             if pending {
-                grow = grow.saturating_mul(2).max(self.buf.len());
+                let lookahead = self.block.saturating_mul(LOOKAHEAD_WINDOWS);
+                grow = if self.buf.len() >= lookahead {
+                    usize::try_from(self.remaining).unwrap_or(usize::MAX)
+                } else {
+                    lookahead - self.buf.len()
+                };
             } else {
                 self.consumed = self.validated;
                 self.drop_consumed();
