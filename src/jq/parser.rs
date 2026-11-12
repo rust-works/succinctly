@@ -227,6 +227,21 @@ enum PathStep {
     Computed(Expr),
 }
 
+/// yq's `...` read as a value (#7069): the node, then for a mapping each key before its value (a key is a
+/// string node and has no children) and for a sequence each element, depth first. `[...] | length` is 7 over
+/// `a:` / `  b: x` / `  c: y`, where `[..] | length` is 4. Spelled with `recurse`, which yq's own syntax does not
+/// have (the text is read as jq, whose `type` answers yq's tags when the run is a yq one), so it takes a
+/// position's value as `..` does, and the key nodes are the strings of `to_entries`: what a key node carries
+/// beyond its text (a style, a comment, its path) is not there, and a value that is an alias is walked into
+/// where yq stops.
+fn recursive_descent_with_keys_walk(at: usize) -> Result<Expr, ParseError> {
+    const WALK: &str = "recurse(if type == \"!!map\" then (to_entries[] | .key, .value) \
+                        elif type == \"!!seq\" then .[] else empty end)";
+    parse_with_mode(WALK, ParserMode::Jq)
+        .map(|walk| Expr::Paren(Box::new(walk)))
+        .map_err(|error| ParseError::new(format!("`...`: {error}"), at))
+}
+
 /// Attach a parsed bracket to the postfix chain built so far.
 ///
 /// A dynamic key captures the chain as its `target`, because the key is
@@ -5025,21 +5040,18 @@ impl<'a> Parser<'a> {
                 if self.peek() == Some('.') {
                     let start = self.pos;
                     self.next();
-                    // yq's `...` (#2796) is `..` that also visits mapping keys. Only a metadata
-                    // assignment can use the key nodes, so it parses only as that target
-                    // (`... comments = ""`); anywhere else it stays the parse error it was.
+                    // yq's `...` (#2796) is `..` that also visits mapping keys. A metadata assignment
+                    // can use the key nodes (`... comments = ""`), so it parses as that target. Anywhere
+                    // else it is the walk itself (#7069): the node, then each mapping key before its value
+                    // and each sequence element, so `[...] | length` counts the keys too.
                     if self.mode == ParserMode::Yq && self.peek() == Some('.') {
                         self.next();
                         self.skip_ws();
+                        self.last_primary_is_term = true;
                         if self.peeks_meta_op_keyword_then_assign() {
-                            self.last_primary_is_term = true;
                             return Ok(Expr::RecursiveDescentWithKeys);
                         }
-                        return Err(ParseError::new(
-                            "`...` is only supported as the target of a metadata assignment \
-                             (`... comments = \"\"`)",
-                            start.saturating_sub(1),
-                        ));
+                        return recursive_descent_with_keys_walk(start.saturating_sub(1));
                     }
                     // jq reads a suffix after `..` as a postfix on the term (`..[0]?`, `..[]?`,
                     // `.. .a`), which yq's lexer rejects (#5248), so only jq mode takes it.

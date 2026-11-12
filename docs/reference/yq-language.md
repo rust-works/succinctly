@@ -52,7 +52,7 @@ below.
 
 Most of the [jq Language Reference](jq-language.md) works with yq, but real yq's lexer rejects much of it, so the jq-only names need `--jq-extensions` (see [Gated jq Builtins](#gated-jq-builtins---jq-extensions)). These work by default:
 
-- Path expressions (`.foo`, `.[0]`, `.[]`, `..`)
+- Path expressions (`.foo`, `.[0]`, `.[]`, `..`), and `...`, the walk of `..` that also yields each mapping key before its value (`[...] | length` is 7 over `a:` / `  b: x` / `  c: y`, where `[..] | length` is 4; #7069, [limits](../compliance/yq/limitations.md))
 - Operators (arithmetic, comparison, boolean, pipe, comma)
 - Array/object operations (`keys`, `sort`, `group_by`, etc.)
 - String functions (`split`, `join`, `test`, `match`, etc.)

@@ -5692,8 +5692,9 @@ ruled out), even though real yq supports every one of them:
   item, the ones after the last entry to the document root. `...` clears the key nodes'
   too; `..` and a path address values only, so `.a head_comment = ""` leaves the `# mid`
   above `b:` alone and `.. head_comment = ""` clears the root's and the sequence items'
-  lines. `...` parses only as that target (`...` alone stays a parse error) and refuses
-  `style`/`anchor`, whose key-node forms are not modelled. Checked against pinned v4.53.3 by
+  lines. `...` as a target takes the comment slots only and refuses
+  `style`/`anchor`, whose key-node forms are not modelled; as a value it is the walk of #7069 (below).
+  Checked against pinned v4.53.3 by
   the `meta_assign_clear_*_2796` goldens and a differential fuzz of ~5,900 clearing
   operations over random commented documents (none differed). Text of newlines alone
   (`head_comment = "\n"`) is a text, not the clearing form: yq writes blank comment lines for
@@ -5705,6 +5706,14 @@ ruled out), even though real yq supports every one of them:
   top-level outputs such as `(.a comments = ""), 1`) ignores a comment write as it always has.
   A comment after a sequence item's dash (`- # c\n  k: 1`) is lost on any DOM write here, a
   gap that predates this and that the fuzz skips.
+
+- **`...` as a value is the walk** ([#7069](https://github.com/rust-works/succinctly/issues/7069), `tests/yq_cli/i7069.rs`): the node, then each mapping key before its value and each sequence element, depth first, so `[...] | length` is 7 over `a:` / `  b: thing` / `  c: something` where `[..] | length` is 4, and `... | select(tag == "!!str")` names the keys too.
+  It was a parse error outside a metadata assignment.
+  Checked against pinned v4.53.3 on 32 rows over a mapping, a nested one and a sequence (`[...]`, `[... | tag]`, `map(...)`, `.a | [...]`, `select` and `length` over it).
+  A key is a string here and nothing more: `[... | key]`, `[... | path]` and `[... | line]` over the nodes answer `[]`, empty paths and line 0 where yq answers each node's own (`[... | path]` is `[[], ["a"], ["a"], ["a", "b"], ...]`, `[... | line]` the lines of the nodes), and a key's style, tag and comment are not there.
+  A key keeps the type of its spelling in yq and is a string here (`1: a` is the int `1` and `true: b` the bool there, `"1"` and `"true"` here), and a `<<` merge key is walked as its members here, where yq walks the `!!merge` key and the alias.
+  A value that is an alias is walked into, where yq stops at it (`b: *x` over `a: &x {p: 1}` is 9 nodes here and 7 in yq), as `..` does (#4223).
+  `(... | select(...)) |= f` is refused (`Invalid path expression`): the walk is not a path expression, and yq writes through it.
 - **`style` of a tagged node** is `"tagged"` when only the tag styles it and `"<unknown>"` when it also has quotes, a block scalar or a flow collection ([#6881](https://github.com/rust-works/succinctly/issues/6881)), as in yq.
   Over an owned value (`with_entries(.value |= style)`) there is no node to read, and the getter answers `""` as it did for an untagged one.
   A tagged mapping key read through `to_entries` is the same (yq `"tagged"`, here `""`).
