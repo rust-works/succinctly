@@ -3275,6 +3275,7 @@ impl<'a> Parser<'a> {
         // `--jq-extensions` a slot may hold a string literal, so the text's end is not known up front.
         let interpolations_closed = self.mode != ParserMode::Yq
             || self.jq_extensions
+            || !yq_string_interpolation()
             || yq_string_interpolations_are_closed(&self.input[self.pos..]);
 
         loop {
@@ -3288,8 +3289,10 @@ impl<'a> Parser<'a> {
                 }
                 Some('\\') => {
                     // #7063: yq reads a run of backslashes before `(` by its own rule, not left to
-                    // right: see `yq_backslash_run_starts_interpolation`.
-                    if self.mode == ParserMode::Yq {
+                    // right: see `yq_backslash_run_starts_interpolation`. With
+                    // `--string-interpolation=false` (#7025) a `\(` is never a start, and that flag has
+                    // its own reading of the run below.
+                    if self.mode == ParserMode::Yq && yq_string_interpolation() {
                         let run = self.input[self.pos..]
                             .bytes()
                             .take_while(|&b| b == b'\\')
