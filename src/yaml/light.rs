@@ -3288,8 +3288,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         // meaningful for JSON-sourced *output*'s number canonicalization
         // sibling, `canonicalize_numbers` -- this only suppresses the style
         // string itself.
-        // #7031: a `-p props` transcode's nodes have no style in yq either.
-        if self.index.canonicalize_numbers() || self.index.style_less() {
+        if self.index.canonicalize_numbers() {
             return "";
         }
         let Some(text_pos) = self.text_position() else {
@@ -8736,6 +8735,10 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     #[inline]
     fn is_first_document_content(&self) -> bool {
         self.bp_pos == FIRST_DOCUMENT_BP && YamlCursor::is_document_content(self)
+    }
+
+    fn style_less(&self) -> bool {
+        self.index.style_less()
     }
 
     fn document_has_comments(&self) -> bool {

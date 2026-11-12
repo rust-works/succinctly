@@ -38,3 +38,52 @@ fn props_input_nodes_have_no_style_7031() -> Result<()> {
     }
     Ok(())
 }
+
+/// Quoting decides the tag: the dates and `<<` stay strings, and a write quotes them again as yq's
+/// encoder does (`a: "2001-12-14"`, `"<<": "1x"`), where the plain `1x` goes bare.
+const QUOTED_INPUT: &str = "a=2001-12-14\nm=2001-12-14T21:59:43Z\nn=1\n<<=1\nc=hello\n";
+
+const QUOTED_ROWS: &[(&str, &[&str], &str)] = &[
+    (
+        "[.a, .m, .n, .c] | map(tag)",
+        &["-o", "json", "-I0"],
+        "[\"!!str\",\"!!str\",\"!!str\",\"!!str\"]\n",
+    ),
+    (".a | downcase", &["-o", "yaml"], "2001-12-14\n"),
+    (
+        ".z = 1",
+        &["-o", "yaml"],
+        "a: \"2001-12-14\"\nm: \"2001-12-14T21:59:43Z\"\nn: \"1\"\n\"<<\": \"1\"\nc: hello\nz: 1\n",
+    ),
+    (
+        ".n |= . + \"x\"",
+        &["-o", "yaml"],
+        "a: \"2001-12-14\"\nm: \"2001-12-14T21:59:43Z\"\nn: 1x\n\"<<\": \"1\"\nc: hello\n",
+    ),
+    ("keys", &["-o", "yaml"], "- a\n- m\n- n\n- \"<<\"\n- c\n"),
+    (
+        ".[\"<<\"] |= . + \"x\"",
+        &["-o", "yaml"],
+        "a: \"2001-12-14\"\nm: \"2001-12-14T21:59:43Z\"\nn: \"1\"\n\"<<\": 1x\nc: hello\n",
+    ),
+    (
+        "sort_keys(.)",
+        &["-o", "yaml"],
+        "\"<<\": \"1\"\na: \"2001-12-14\"\nc: hello\nm: \"2001-12-14T21:59:43Z\"\nn: \"1\"\n",
+    ),
+];
+
+#[test]
+fn props_input_quoting_still_decides_the_tag_7031() -> Result<()> {
+    for (filter, flags, expected) in QUOTED_ROWS {
+        let mut args = vec!["-p", "props"];
+        args.extend_from_slice(flags);
+        let (stdout, status) = run_yq_stdin(filter, QUOTED_INPUT, &args)?;
+        assert_eq!(
+            (stdout.as_str(), status),
+            (*expected, 0),
+            "{flags:?} {filter}"
+        );
+    }
+    Ok(())
+}

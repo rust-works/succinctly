@@ -450,8 +450,9 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     /// Marks this index's text as a transcode of a format whose nodes have no style (#7031): the
     /// YAML text `-p props` reads a properties file as. yq's properties decoder makes every value a
     /// style-less node, so its encoder picks the quoting at print time, where the text records the
-    /// quoting the transcode chose (`a: "1"`). Every node's `style` then reads `""`, so a write
-    /// prints its result as yq's encoder would. Call once right after `build`.
+    /// quoting the transcode chose (`a: "1"`). The `style` builtin then reads `""` and a write keeps
+    /// no style, so it prints its result as yq's encoder would; the text's quoting still decides
+    /// each scalar's tag. Call once right after `build`.
     pub fn mark_style_less(&mut self) {
         self.style_less = true;
     }

@@ -4489,6 +4489,21 @@ fn member_is_copy_of_source<C: DocumentCursor>(parent: &C, start: usize, end: us
 /// reference this document's writer still needs to resolve or drop on its
 /// own merits, e.g. `cfg: *base` nested inside an expanded `env: *env`
 /// copy must still round-trip as `*base`, not inline `base`'s value.
+/// The style the DOM write route keeps for `cursor`'s node: its own, or for a node with no style of
+/// its own ([`DocumentCursor::style_less`], a `-p props` transcode, #7031) none, except that a quoted
+/// string becomes `string` (the `-P` marker [`VALUE_STYLE_STRING`], or [`KEY_STYLE_STRING`] for a
+/// key) so the writer quotes it again only where yq's encoder would (`2001-12-14`, `<<`).
+fn kept_style<C: DocumentCursor>(cursor: &C, string: &'static str) -> &'static str {
+    let style = cursor.style();
+    if !cursor.style_less() {
+        return style;
+    }
+    match style {
+        "single" | "double" => string,
+        _ => "",
+    }
+}
+
 fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
     value: &V,
     cursor: Option<&V::Cursor>,
@@ -4503,7 +4518,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
     // The raw (`#`-prefixed) form, not the stripped `line_comment` builtin
     // getter: the write path re-emits this verbatim after one space.
     let own_comment = cursor.and_then(DocumentCursor::line_comment_raw);
-    let own_style = cursor.map_or("", DocumentCursor::style);
+    let own_style = cursor.map_or("", |c| kept_style(c, VALUE_STYLE_STRING));
     // `&anchor`/`*alias` (#763). Checked alias-first: `anchor()` already
     // returns `None` on an alias node, so the order can't actually
     // mis-classify, but it states the precedence the writer relies on --
@@ -4732,7 +4747,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
             let key_style = if key_alias.is_some() {
                 field.key_cursor.alias_target_style()
             } else {
-                field.key_cursor.style()
+                kept_style(&field.key_cursor, KEY_STYLE_STRING)
             };
             if let Some(meta) = KeyMeta::with_alias(
                 key_comment,
@@ -43766,7 +43781,8 @@ fn owned_identity_after_prefetch(
 /// matches its `Style` flag bits one value at a time and the combination matches none. The
 /// cursor's own `style()` stays the style without the tag: the writers echo it.
 fn node_style_getter<C: DocumentCursor>(cursor: &C) -> &'static str {
-    let style = cursor.style();
+    // #7031: a `-p props` node has no style in yq.
+    let style = if cursor.style_less() { "" } else { cursor.style() };
     // `!<!>` is the verbatim spelling of the non-specific `!`.
     match cursor
         .explicit_tag_of_non_alias()
