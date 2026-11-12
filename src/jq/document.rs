@@ -920,6 +920,15 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         self.head_comment_raw()
     }
 
+    /// Whether yq's head comment of this node ends in a line break that
+    /// [`head_comment_raw`](Self::head_comment_raw) does not show (#7034): blank lines between an
+    /// indented node and its comment block, which yq's YAML writer does not print but its comment
+    /// text holds (`head_comment` is `"#c1\n"`, and `-o=props` writes a `# ` line for it). `false`
+    /// for formats with no comments.
+    fn head_comment_ends_in_break(&self) -> bool {
+        false
+    }
+
     /// Whether this cursor's *document* declares any `*name` alias at all.
     ///
     /// A whole-document property, not a property of this node, and O(1) --

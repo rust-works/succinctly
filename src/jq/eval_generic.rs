@@ -6222,7 +6222,12 @@ fn collect_props_comments<C: DocumentCursor>(
             .into_iter()
             .chain(node.head_comment_raw_outside_header())
             .collect::<Vec<_>>();
-        text.push_str(strip_hash(&head.join("\n")));
+        let mut joined = head.join("\n");
+        // #7034: yq's head comment holds the line break a blank line leaves under it.
+        if !joined.is_empty() && node.head_comment_ends_in_break() {
+            joined.push('\n');
+        }
+        text.push_str(strip_hash(&joined));
         if let Some(line) = node.line_comment_raw() {
             text.push_str(strip_hash(&line));
         }
