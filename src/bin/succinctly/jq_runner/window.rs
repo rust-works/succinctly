@@ -495,7 +495,10 @@ impl LineWindows {
 /// by, so what it names is what the run read, whatever happened to the path since (#6920).
 pub(super) struct Reread {
     file: File,
-    /// How much of the file the run could read: its length when it was opened.
+    /// Where the stream starts in the file: 0 for a file named on the command line, and for a standard
+    /// input that is a regular file the offset it was at, since the bytes before it were never the run's.
+    start: u64,
+    /// How much of the file the run could read from `start`: what was left of it when it was opened.
     len: u64,
     /// For a target that cannot read by position.
     #[cfg_attr(unix, allow(dead_code))]
@@ -506,9 +509,10 @@ pub(super) struct Reread {
 const REREAD_CHUNK: u64 = 1 << 20;
 
 impl Reread {
-    pub(super) fn new(file: &File, len: u64, path: PathBuf) -> io::Result<Self> {
+    pub(super) fn new(file: &File, start: u64, len: u64, path: PathBuf) -> io::Result<Self> {
         Ok(Self {
             file: file.try_clone()?,
+            start,
             len,
             path,
         })
@@ -528,7 +532,7 @@ impl Reread {
             }
             let want = (self.len - at).min(REREAD_CHUNK) as usize;
             let mut chunk = vec![0u8; want];
-            match self.file.read_at(&mut chunk, at) {
+            match self.file.read_at(&mut chunk, self.start + at) {
                 Ok(0) => None,
                 Ok(read) => {
                     chunk.truncate(read);
@@ -550,7 +554,7 @@ impl Reread {
 
     #[cfg(not(unix))]
     pub(super) fn stream_fault(&self) -> Option<String> {
-        let _ = (&self.file, self.len, REREAD_CHUNK);
+        let _ = (&self.file, self.start, self.len, REREAD_CHUNK);
         super::reread_stream_fault(std::slice::from_ref(&self.path))
     }
 }
@@ -1018,7 +1022,7 @@ mod tests {
         std::fs::write(&path, b"{\"a\":1}\n{\"a\":2}\n}\n{\"a\":3}\n").expect("written");
         let file = File::open(&path).expect("opens");
         let len = file.metadata().expect("metadata").len();
-        let reread = Reread::new(&file, len, path.clone()).expect("dup");
+        let reread = Reread::new(&file, 0, len, path.clone()).expect("dup");
         let want = "Unmatched '}' at line 3, column 1";
         assert_eq!(reread.stream_fault().as_deref(), Some(want));
         // Rotated: another file at the path, and the old one deleted.
@@ -1030,7 +1034,7 @@ mod tests {
         let bom = dir.path().join("bom.json");
         std::fs::write(&bom, b"\xef\xbb\xbf1\n}\n").expect("written");
         let file = File::open(&bom).expect("opens");
-        let reread = Reread::new(&file, 7, bom).expect("dup");
+        let reread = Reread::new(&file, 0, 7, bom).expect("dup");
         assert_eq!(
             reread.stream_fault().as_deref(),
             Some("Unmatched '}' at line 2, column 1")

@@ -118,8 +118,9 @@ about 1.0 MB per MB of input, so a multi-gigabyte log read that way needs about 
 A plain filter over one regular file (`ndjson_identity`, `ndjson_field`, `ndjson_select`, `ndjson_tsv`: no `-n`, no
 `input`, no `-s`) holds one 1 MiB window of it since [#6920](https://github.com/rust-works/succinctly/issues/6920), about
 10 MB at 100 MB on the 7950X and 13 MB (the machine's floor) on the M4 Pro, flat from 10 MB. The committed reports predate
-that change and still show the 41.8x to 48.0x it replaced, until they are regenerated. The same filters over standard
-input or several files hold the whole input as before ([#7023](https://github.com/rust-works/succinctly/issues/7023) and
+that change and still show the 41.8x to 48.0x it replaced, until they are regenerated. The same filters over a regular file
+redirected onto standard input (`jq … < file`, [#7024](https://github.com/rust-works/succinctly/issues/7024)) take the same route. The
+same filters over a pipe or several files hold the whole input as before ([#7023](https://github.com/rust-works/succinctly/issues/7023) and
 [#7024](https://github.com/rust-works/succinctly/issues/7024) track the rest; the cause is in
 [#6913](https://github.com/rust-works/succinctly/issues/6913)). `succinctly jq` is still the faster of the two on most of
 those rows (1.05x to 3.5x on the 7950X and 1.2x to 7.1x on the M4 Pro for the five named, at 100 MB), so this is a memory
