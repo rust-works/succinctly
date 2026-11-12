@@ -6201,13 +6201,12 @@ fn owned_from_standard_json_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
 /// The comment yq's properties encoder writes above each scalar below `cursor`, by property path
 /// (unescaped, as the encoder builds it), into `out` (#6922). A mapping entry's comment is its key's
 /// head and line comment and then its value's; a sequence item's is its own. yq strips the first `#`
-/// of each and joins them with nothing between, so `# h` above `a: 1 # c` is ` h c`. `head` is the
-/// comment after a bare `-` whose item is this mapping, which yq gives the first key. A container's
-/// own comments name no property, so yq drops them.
+/// of each and joins them with nothing between, so `# h` above `a: 1 # c` is ` h c`. The head is
+/// [`DocumentCursor::head_comment_yq_raw`], which carries the comment after a bare `-` and the
+/// break a blank line leaves (#7034). A container's own comments name no property, so yq drops them.
 fn collect_props_comments<C: DocumentCursor>(
     cursor: &C,
     prefix: &str,
-    head: Option<String>,
     array_brackets: bool,
     out: &mut alloc::collections::BTreeMap<String, String>,
     depth: usize,
@@ -6216,18 +6215,8 @@ fn collect_props_comments<C: DocumentCursor>(
     fn strip_hash(comment: &str) -> &str {
         comment.strip_prefix('#').unwrap_or(comment)
     }
-    fn own_comment<C: DocumentCursor>(node: &C, dash: Option<String>, text: &mut String) {
-        // The comment after a bare `-` is the first line of its first key's head.
-        let head = dash
-            .into_iter()
-            .chain(node.head_comment_raw_outside_header())
-            .collect::<Vec<_>>();
-        let mut joined = head.join("\n");
-        // #7034: yq's head comment holds the line break a blank line leaves under it.
-        if !joined.is_empty() && node.head_comment_ends_in_break() {
-            joined.push('\n');
-        }
-        text.push_str(strip_hash(&joined));
+    fn own_comment<C: DocumentCursor>(node: &C, text: &mut String) {
+        text.push_str(strip_hash(&node.head_comment_yq_raw().join("\n")));
         if let Some(line) = node.line_comment_raw() {
             text.push_str(strip_hash(&line));
         }
@@ -6251,11 +6240,8 @@ fn collect_props_comments<C: DocumentCursor>(
     }
     let value = cursor.value();
     if let Some(mut fields) = value.as_object() {
-        let mut head = head;
         while let Some((field, rest)) = fields.uncons() {
             fields = rest;
-            // Taken first: a key with no text still owns the dash comment, which goes nowhere then.
-            let dash = head.take();
             let Some(key) = field.key_str() else {
                 continue;
             };
@@ -6265,29 +6251,17 @@ fn collect_props_comments<C: DocumentCursor>(
                 format!("{prefix}.{key}")
             };
             if is_container(&field.value_cursor.value()) {
-                collect_props_comments(
-                    &field.value_cursor,
-                    &path,
-                    None,
-                    array_brackets,
-                    out,
-                    depth + 1,
-                );
+                collect_props_comments(&field.value_cursor, &path, array_brackets, out, depth + 1);
             } else {
                 let mut comment = String::new();
-                own_comment(&field.key_cursor, dash, &mut comment);
-                own_comment(&field.value_cursor, None, &mut comment);
+                own_comment(&field.key_cursor, &mut comment);
+                own_comment(&field.value_cursor, &mut comment);
                 insert_comment(out, path, comment);
             }
         }
     } else if let Some(mut elements) = value.as_array() {
-        let mut head = head;
         let mut index = 0usize;
-        loop {
-            let dash = elements.first_dash_comment();
-            let Some((element, rest)) = elements.uncons_cursor() else {
-                break;
-            };
+        while let Some((element, rest)) = elements.uncons_cursor() {
             elements = rest;
             let path = if prefix.is_empty() {
                 format!("{index}")
@@ -6297,14 +6271,11 @@ fn collect_props_comments<C: DocumentCursor>(
                 format!("{prefix}.{index}")
             };
             index += 1;
-            // The comment after the bare `-` of the item this sequence is goes to its first element
-            // when that is a scalar, and goes no deeper (yq drops it above a nested container).
-            let own_head = head.take();
             if is_container(&element.value()) {
-                collect_props_comments(&element, &path, dash, array_brackets, out, depth + 1);
+                collect_props_comments(&element, &path, array_brackets, out, depth + 1);
             } else {
                 let mut comment = String::new();
-                own_comment(&element, own_head, &mut comment);
+                own_comment(&element, &mut comment);
                 insert_comment(out, path, comment);
             }
         }
@@ -16576,7 +16547,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             let style = yq_props_format_style(format_type).unwrap_or_default();
             // The guard holds a cursor.
             let leading = cursor.as_ref().map_or_else(String::new, |c| {
-                collect_props_comments(c, "", None, style.1, &mut comments, 0);
+                collect_props_comments(c, "", style.1, &mut comments, 0);
                 c.props_leading_content().unwrap_or_default()
             });
             GenericResult::Owned(OwnedValue::String(

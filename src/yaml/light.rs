@@ -581,26 +581,32 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         (owner.bp_pos != 0 && owner.is_container()).then_some(wrapper)
     }
 
+    /// The span of the comment on the bare `-` of the sequence item this node is the value of, when
+    /// it sits on the dash line ahead of the value (`- # m` / `  a: 1`): the comment yq moves off the
+    /// dash (#4256, #7034). `None` for every other node, a same-line `- x # c` included.
+    fn dash_line_comment_span(&self) -> Option<(usize, usize)> {
+        let wrapper = self.parent()?;
+        if wrapper.bp_pos == 0 || wrapper.resolve_bare_seq_item().bp_pos != self.bp_pos {
+            return None;
+        }
+        let &(start, end) = self.index.get_line_comments(wrapper.bp_pos).first()?;
+        ((start as usize) < self.text_position()?).then_some((start as usize, end as usize))
+    }
+
     /// The comment on the bare `-` of an item whose block mapping or sequence value has this node as
     /// its first key or element (#7034), `#` and all, with the byte offset its text ends at: yq makes
     /// it that first child's head comment (`- # m` / `  a: 1` is `.[0].a | key | head_comment` =
     /// `"m"`), where the item itself has none. A flow value and a scalar value take the comment as
     /// their own head instead ([`Self::dash_comment_of_scalar_item`]). `None` for every other node.
-    fn dash_comment_of_first_child(&self) -> Option<(String, usize)> {
-        // One flag on a document without a comment.
-        if !self.index.has_comments() {
-            return None;
-        }
+    fn dash_comment_of_first_child(&self) -> Option<(&str, usize)> {
         let parent = self.parent()?;
         // A sequence element stands under its item wrapper; a mapping key right under the mapping.
-        let (container, first) = if parent.bp_pos != 0
-            && self.index.is_seq_item(self.text, parent.bp_pos)
-            && parent.resolve_bare_seq_item().bp_pos == self.bp_pos
-        {
-            let sequence = parent.parent()?;
-            (sequence, sequence.first_child()?.bp_pos == parent.bp_pos)
-        } else {
-            (parent, parent.first_child()?.bp_pos == self.bp_pos)
+        let (container, first) = match self.sequence_item_wrapper_of_value() {
+            Some(wrapper) => {
+                let sequence = wrapper.parent()?;
+                (sequence, sequence.first_child()?.bp_pos == wrapper.bp_pos)
+            }
+            None => (parent, parent.first_child()?.bp_pos == self.bp_pos),
         };
         if !first
             || container.bp_pos == 0
@@ -609,54 +615,37 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         {
             return None;
         }
-        let wrapper = container.parent()?;
-        if wrapper.resolve_bare_seq_item().bp_pos != container.bp_pos {
-            return None;
-        }
-        let &(start, end) = self.index.get_line_comments(wrapper.bp_pos).first()?;
-        // The comment sits on the dash line, before the value it heads.
-        if (start as usize) >= container.text_position()? {
-            return None;
-        }
-        let raw = core::str::from_utf8(&self.text[start as usize..end as usize]).ok()?;
-        Some((raw.to_string(), end as usize))
+        let (start, end) = container.dash_line_comment_span()?;
+        Some((core::str::from_utf8(&self.text[start..end]).ok()?, end))
     }
 
-    /// Whether yq's head comment of this node ends in a line break (#7034): the node is indented (a
-    /// node at column 0 keeps the blank lines themselves, #4093) and one or more blank lines lie
-    /// between its comment block -- its own head lines, or else the dash comment
-    /// [`Self::dash_comment_of_first_child`] gives it -- and the node. yq's YAML writer prints no
-    /// blank line there, so this is the comment's text only.
-    fn head_comment_ends_in_break(&self) -> bool {
-        if !self.index.has_comments() {
-            return false;
-        }
-        // A sequence element is measured from its `-`, which stands between the comment and the
-        // value (`# c` / `` / `- v` has a blank line; `# c` / `-` / `  - v` has none).
-        let pos = match self.parent() {
-            Some(wrapper)
-                if wrapper.bp_pos != 0
-                    && self.index.is_seq_item(self.text, wrapper.bp_pos)
-                    && wrapper.resolve_bare_seq_item().bp_pos == self.bp_pos =>
-            {
-                wrapper.text_position()
-            }
-            _ => self.text_position(),
-        };
-        let Some(pos) = pos else {
+    /// The `-` wrapper of the sequence item this node is the value of, else `None`.
+    fn sequence_item_wrapper_of_value(&self) -> Option<Self> {
+        let wrapper = self.parent()?;
+        (wrapper.bp_pos != 0
+            && self.index.is_seq_item(self.text, wrapper.bp_pos)
+            && wrapper.resolve_bare_seq_item().bp_pos == self.bp_pos)
+            .then_some(wrapper)
+    }
+
+    /// Whether yq's head comment of this node, whose comment block ends at `block_end`, ends in a
+    /// line break (#7034): one or more blank lines, and nothing else, lie between the block and the
+    /// node. A sequence element is measured to its `-` when the block lies above the dash (`# c` /
+    /// `` / `- v` has a blank line; `# c` / `-` / `  - v` has none), and to its value when the block
+    /// follows the dash (`- # c` / `` / `  v`). yq's YAML writer prints no blank line there, so this
+    /// is the comment's text only, which the caller adds unless its lines already end in a blank
+    /// entry (a node at column 0 keeps the blank lines themselves, #4093).
+    fn head_comment_break_after(&self, block_end: usize) -> bool {
+        let Some(own) = self.text_position() else {
             return false;
         };
-        if pos == 0 || self.text.get(pos - 1) == Some(&b'\n') {
-            return false;
-        }
-        let block_end = match self.index.get_head_comments(self.bp_pos).last() {
-            Some(&(_, end)) => end as usize,
-            None => match self.dash_comment_of_first_child() {
-                Some((_, end)) => end,
-                None => return false,
-            },
+        let pos = match self
+            .sequence_item_wrapper_of_value()
+            .and_then(|wrapper| wrapper.text_position())
+        {
+            Some(dash) if block_end <= dash => dash,
+            _ => own,
         };
-        // Only blank lines in between: a bare `-` line there (`# c` / `-` / `  - 1`) is not one.
         block_end < pos
             && self.text[block_end..pos]
                 .iter()
@@ -2990,7 +2979,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// as the item's line comment (the wrapper and a scalar value share one node), but it sits
     /// *before* the value, which is where yq reads a head comment from; an ordinary trailing
     /// comment (`- value # c`) follows the value and stays a line comment.
-    fn dash_comment_of_scalar_item(&self) -> Option<(usize, &str)> {
+    fn dash_comment_of_scalar_item(&self) -> Option<(usize, usize, &str)> {
         // The cheapest test first: almost no item's wrapper holds a comment.
         let wrapper = self.parent()?;
         let &(start, end) = self.index.get_line_comments(wrapper.bp_pos).first()?;
@@ -3008,7 +2997,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             return None;
         }
         let raw = core::str::from_utf8(&self.text[start as usize..end as usize]).ok()?;
-        Some((start as usize, raw.strip_prefix("# ").unwrap_or(raw)))
+        Some((start as usize, end as usize, raw))
     }
 
     /// The standalone `#` comment lines directly above this node — its
@@ -8367,6 +8356,149 @@ impl<W: AsRef<[u64]>> YamlCursor<'_, W> {
     }
 }
 
+impl<W: AsRef<[u64]> + Clone> YamlCursor<'_, W> {
+    /// yq's head comment of this node as lines (#6772, #4268, #7034): `raw` keeps each line as
+    /// written, `#` and all, and leaves out a block yq reads as the first document's header, which
+    /// is what yq's properties encoder reads ([`DocumentCursor::head_comment_yq_raw`]); otherwise
+    /// each line loses a leading `# `, and a header block is the document's, as the `head_comment`
+    /// builtin answers ([`DocumentCursor::head_comment`]).
+    fn head_comment_lines(&self, raw: bool) -> Vec<String> {
+        // #6772: yq's head comment is the text above the node with its blank lines kept (an interior
+        // one, and the ones between the block and a node at column 0), which the raw lines carry as
+        // empty entries; and a first document's comment above a leading `---` is one text with the
+        // comment under it.
+        let header_end = self.header_end();
+        let ranges = self.index.get_head_comments(self.bp_pos);
+        let strip = |line: String| {
+            if raw {
+                return line;
+            }
+            match line.strip_prefix("# ") {
+                Some(rest) => rest.to_string(),
+                None => line,
+            }
+        };
+        let header_lines: Option<Vec<String>> = if raw {
+            // The properties encoder prints the header ahead of the first property, and the node
+            // keeps none of it. After a byte-order mark yq sets no header aside (#6762).
+            (header_end > 0
+                && !self.index.after_bom()
+                && matches!(ranges.first(), Some(&(start, _)) if (start as usize) < header_end))
+            .then(Vec::new)
+        } else {
+            let in_header = header_end > 0
+                && (self.is_first_document_content()
+                    || matches!(ranges.first(), Some(&(first_start, _)) if (first_start as usize) < header_end));
+            // The block belongs to the document: the first key the comment under the marker was
+            // indexed on has none of its own (`.a | key | head_comment` is `""` in yq).
+            if in_header && header_has_marker(&self.text[..header_end]) {
+                if self.is_first_document_content() {
+                    header_head_lines(
+                        &self.text[..header_end],
+                        self.index.synthesized_empty(),
+                        true,
+                    )
+                    .map(|lines| lines.into_iter().map(strip).collect())
+                } else {
+                    Some(Vec::new())
+                }
+            } else {
+                None
+            }
+        };
+        let from_header = header_lines.is_some();
+        let mut lines: Vec<String> = match header_lines {
+            Some(lines) => lines,
+            None => <Self as DocumentCursor>::head_comment_raw(self)
+                .into_iter()
+                .map(strip)
+                .collect(),
+        };
+        // Where the comment block ends, for the break below.
+        let mut block_end = if from_header {
+            None
+        } else {
+            ranges.last().map(|&(_, end)| end as usize)
+        };
+        // The blank entries after the block stand for blank lines between it and the node. A
+        // floated comment (`- # c` before the key, #1079) has other lines there (`!!str`, the next
+        // dash), which are not blanks.
+        if let (false, Some(&(_, last_end)), Some(pos)) =
+            (from_header, ranges.last(), self.text_position())
+        {
+            let between = self.text.get(last_end as usize..pos).unwrap_or_default();
+            if between.iter().any(|b| !b.is_ascii_whitespace()) {
+                while lines.last().is_some_and(String::is_empty) {
+                    lines.pop();
+                }
+            }
+        }
+        // #4268: a scalar item's `- # c` comment is the scalar's head comment in yq, after any
+        // standalone block above the dash. A head that is itself a floated dash comment of an
+        // absent item before this one (`- # c1` / `- # c2` / `  x`, #1079) is yq's whole answer.
+        let floated = ranges.iter().any(|&(start, _)| {
+            let line_start = self.text[..start as usize]
+                .iter()
+                .rposition(|&b| b == b'\n')
+                .map_or(0, |i| i + 1);
+            self.text[line_start..start as usize]
+                .iter()
+                .any(|b| !matches!(b, b' ' | b'\t'))
+        });
+        if !floated {
+            if let Some((start, end, comment)) = self.dash_comment_of_scalar_item() {
+                // After the standalone block above the dash, before the own-line lines below it
+                // (`- # c` / `  # f` / `  z` is `c` then `f`): by position in the text.
+                let before = ranges
+                    .iter()
+                    .filter(|&&(at, _)| (at as usize) < start)
+                    .count();
+                // `lines` holds blank entries between the comment lines, which `before` (a count of
+                // comment ranges) does not: the dash comment goes after that many comment lines.
+                let mut at = 0;
+                let mut seen = 0;
+                if before > 0 {
+                    for (i, line) in lines.iter().enumerate() {
+                        if !line.is_empty() {
+                            seen += 1;
+                            if seen == before {
+                                at = i + 1;
+                                break;
+                            }
+                        }
+                    }
+                    if seen < before {
+                        at = lines.len();
+                    }
+                }
+                lines.insert(at, strip(comment.to_string()));
+                block_end = Some(block_end.map_or(end, |own| own.max(end)));
+            }
+        }
+        if !from_header {
+            // #7034: the comment after the bare `-` of the item this node's container is the value
+            // of is this first child's head, ahead of its own lines.
+            if let Some((dash, dash_end)) = self.dash_comment_of_first_child() {
+                // One empty line stands for the blank lines between it and the node's own block,
+                // however many there are (`- # d` / `` / `` / `  # c` / `  a: 1` is `d\n\nc`).
+                if let Some(&(own_start, _)) = ranges.first() {
+                    if blank_lines_between(self.text, dash_end, own_start as usize) > 0 {
+                        lines.insert(0, String::new());
+                    }
+                }
+                lines.insert(0, strip(dash.to_string()));
+                block_end = Some(block_end.map_or(dash_end, |own| own.max(dash_end)));
+            }
+            if block_end.is_some_and(|end| self.head_comment_break_after(end))
+                && lines.last().is_some_and(|line| !line.is_empty())
+            {
+                lines.push(String::new());
+            }
+        }
+        lines
+    }
+}
+
 impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     type Value = YamlValue<'a, W>;
 
@@ -8601,19 +8733,6 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
             || self.header_end() > 0
     }
 
-    fn head_comment_raw_outside_header(&self) -> Vec<String> {
-        let header_end = self.header_end();
-        // After a byte-order mark yq sets no header aside (#6762), so the node keeps its comment.
-        if header_end > 0
-            && !self.index.after_bom()
-            && matches!(self.index.get_head_comments(self.bp_pos).first(),
-                Some(&(start, _)) if (start as usize) < header_end)
-        {
-            return Vec::new();
-        }
-        DocumentCursor::head_comment_raw(self)
-    }
-
     fn props_leading_content(&self) -> Option<String> {
         // After a byte-order mark yq sets no header aside (#6762).
         if !self.is_first_document_content() || self.index.after_bom() {
@@ -8785,132 +8904,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
 
     #[inline]
     fn head_comment(&self) -> Vec<String> {
-        // #6772: yq's head comment is the text above the node with its blank lines kept (an interior
-        // one, and the ones between the block and a node at column 0), which the raw lines carry as
-        // empty entries; and a first document's comment above a leading `---` is one text with the
-        // comment under it.
-        let header_end = self.header_end();
-        let in_header = header_end > 0
-            && (self.is_first_document_content()
-                || matches!(
-                    self.index.get_head_comments(self.bp_pos).first(),
-                    Some(&(first_start, _)) if (first_start as usize) < header_end
-                ));
-        let strip = |line: String| match line.strip_prefix("# ") {
-            Some(rest) => rest.to_string(),
-            None => line,
-        };
-        // The block belongs to the document: the first key the comment under the marker was
-        // indexed on has none of its own (`.a | key | head_comment` is `""` in yq).
-        let header_lines: Option<Vec<String>> =
-            if in_header && header_has_marker(&self.text[..header_end]) {
-                if self.is_first_document_content() {
-                    header_head_lines(
-                        &self.text[..header_end],
-                        self.index.synthesized_empty(),
-                        true,
-                    )
-                    .map(|lines| lines.into_iter().map(strip).collect())
-                } else {
-                    Some(Vec::new())
-                }
-            } else {
-                None
-            };
-        let from_header = header_lines.is_some();
-        let mut lines: Vec<String> = match header_lines {
-            Some(lines) => lines,
-            None => <Self as DocumentCursor>::head_comment_raw(self)
-                .into_iter()
-                .map(strip)
-                .collect(),
-        };
-        // The blank entries after the block stand for blank lines between it and the node. A
-        // floated comment (`- # c` before the key, #1079) has other lines there (`!!str`, the next
-        // dash), which are not blanks.
-        if let (false, Some(&(_, last_end)), Some(pos)) = (
-            from_header,
-            self.index.get_head_comments(self.bp_pos).last(),
-            self.text_position(),
-        ) {
-            let between = self.text.get(last_end as usize..pos).unwrap_or_default();
-            if between.iter().any(|b| !b.is_ascii_whitespace()) {
-                while lines.last().is_some_and(String::is_empty) {
-                    lines.pop();
-                }
-            }
-        }
-        // #4268: a scalar item's `- # c` comment is the scalar's head comment in yq, after any
-        // standalone block above the dash. A head that is itself a floated dash comment of an
-        // absent item before this one (`- # c1` / `- # c2` / `  x`, #1079) is yq's whole answer.
-        let floated = self
-            .index
-            .get_head_comments(self.bp_pos)
-            .iter()
-            .any(|&(start, _)| {
-                let line_start = self.text[..start as usize]
-                    .iter()
-                    .rposition(|&b| b == b'\n')
-                    .map_or(0, |i| i + 1);
-                self.text[line_start..start as usize]
-                    .iter()
-                    .any(|b| !matches!(b, b' ' | b'\t'))
-            });
-        if !floated {
-            if let Some((start, comment)) = self.dash_comment_of_scalar_item() {
-                // After the standalone block above the dash, before the own-line lines below it
-                // (`- # c` / `  # f` / `  z` is `c` then `f`): by position in the text.
-                let before = self
-                    .index
-                    .get_head_comments(self.bp_pos)
-                    .iter()
-                    .filter(|&&(at, _)| (at as usize) < start)
-                    .count();
-                // `lines` holds blank entries between the comment lines, which `before` (a count of
-                // comment ranges) does not: the dash comment goes after that many comment lines.
-                let mut at = 0;
-                let mut seen = 0;
-                if before > 0 {
-                    for (i, line) in lines.iter().enumerate() {
-                        if !line.is_empty() {
-                            seen += 1;
-                            if seen == before {
-                                at = i + 1;
-                                break;
-                            }
-                        }
-                    }
-                    if seen < before {
-                        at = lines.len();
-                    }
-                }
-                lines.insert(at, comment.to_string());
-            }
-        }
-        if !from_header {
-            // #7034: the comment after the bare `-` of the item this node's container is the value
-            // of is this first child's head, ahead of its own lines.
-            if let Some((dash, dash_end)) = self.dash_comment_of_first_child() {
-                // One empty line stands for the blank lines between it and the node's own block,
-                // however many there are (`- # d` / `` / `` / `  # c` / `  a: 1` is `d\n\nc`).
-                if let Some(&(own_start, _)) = self.index.get_head_comments(self.bp_pos).first() {
-                    if blank_lines_between(self.text, dash_end, own_start as usize) > 0 {
-                        lines.insert(0, String::new());
-                    }
-                }
-                lines.insert(0, strip(dash));
-            }
-            if YamlCursor::head_comment_ends_in_break(self)
-                && lines.last().is_some_and(|line| !line.is_empty())
-            {
-                lines.push(String::new());
-            }
-        }
-        lines
+        YamlCursor::head_comment_lines(self, false)
     }
 
-    fn head_comment_ends_in_break(&self) -> bool {
-        YamlCursor::head_comment_ends_in_break(self)
+    fn head_comment_yq_raw(&self) -> Vec<String> {
+        YamlCursor::head_comment_lines(self, true)
     }
 
     #[inline]
