@@ -952,16 +952,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         // Fast path: check if current line has any flow markers at all.
         // If no [ or { on this line, and we're not continuing from a previous line's
         // flow context, we can skip the expensive scan.
-        let mut has_flow_marker_on_line = false;
-        for i in line_start..pos {
-            match self.text[i] {
-                b'[' | b'{' => {
-                    has_flow_marker_on_line = true;
-                    break;
-                }
-                _ => {}
-            }
-        }
+        let has_flow_marker_on_line = self.text[line_start..pos]
+            .iter()
+            .any(|&b| matches!(b, b'[' | b'{'));
 
         // If no flow markers on this line, check if we need to look back.
         // A multiline flow context would have a flow marker on a previous line.
@@ -969,13 +962,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             // Quick check: scan back at most 256 bytes for any [ or {
             // If there are no flow openers in the recent context, we're not in flow.
             let quick_start = line_start.saturating_sub(256);
-            let mut found_opener = false;
-            for i in quick_start..line_start {
-                if matches!(self.text[i], b'[' | b'{') {
-                    found_opener = true;
-                    break;
-                }
-            }
+            let found_opener = self.text[quick_start..line_start]
+                .iter()
+                .any(|&b| matches!(b, b'[' | b'{'));
             if !found_opener {
                 return false;
             }
