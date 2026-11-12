@@ -11814,6 +11814,23 @@ fn contains_split_doc(expr: &Expr) -> bool {
     jq::walk::contains_builtin(expr, |b| matches!(b, Builtin::SplitDoc))
 }
 
+/// yq's `eval` (`e`) and `eval-all` (`ea`) subcommands (#7040).
+///
+/// cobra takes the first positional argument as the subcommand when it names one, wherever the
+/// flags stand around it (`yq -n e 1`, `yq e -n 2`), and only the first (`yq .a e d.yaml` reads
+/// `e` as a file). `eval` is the root command's own behaviour, so the word is dropped; `eval-all`
+/// also evaluates once over every document, as `--eval-all` does. The word is case-sensitive.
+fn resolve_subcommand(args: &mut YqCommand) {
+    let all_at_once = match args.filter.as_deref() {
+        Some("e" | "eval") => false,
+        Some("ea" | "eval-all") => true,
+        _ => return,
+    };
+    args.eval_all |= all_at_once;
+    // The next positional is the expression, or the first file when there is none to take.
+    args.filter = (!args.files.is_empty()).then(|| args.files.remove(0));
+}
+
 /// Whether yq reads `path` as a file when it decides what its first positional argument is: it
 /// exists (a symlink is followed) and is not a directory (`maybeFile`, `cmd/utils.go`).
 fn names_a_file(path: &str) -> bool {
@@ -12052,7 +12069,9 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         args.split_exp = (!text.is_empty()).then_some(text);
     }
 
-    // #7027: what the first positional is, before anything reads `filter` or `files`.
+    // #7040: the `eval` and `eval-all` subcommands, then #7027: what the first positional is,
+    // before anything reads `filter` or `files`.
+    resolve_subcommand(&mut args);
     resolve_positionals(&mut args);
 
     // #7025: `--security-disable-env-ops` and `--security-disable-file-ops`, for the whole run.
