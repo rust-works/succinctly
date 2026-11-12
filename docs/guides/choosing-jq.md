@@ -21,17 +21,17 @@ regenerated and a claim stops holding: change the claim, or the advice, in the s
 
 ## The short version
 
-| Your workload                                                  | Use                                          | Why                                                                               |
-|----------------------------------------------------------------|----------------------------------------------|-----------------------------------------------------------------------------------|
-| One document of 1 MB or more: filter, reformat, pretty-print   | `succinctly jq`                              | 2x to 15x faster, in a fraction of jq's memory                                    |
-| `first`, `limit`, `.[0]` of a large document                   | `succinctly jq`                              | stops reading early: 5x to 7x at 100 MB                                           |
-| Regex or case mapping over large strings                       | `succinctly jq`                              | up to 52x                                                                         |
-| Many short invocations, or documents under about 100 KB        | jq                                           | startup is jq's (0.67x to 0.93x); no gain on most small documents                 |
-| A stream of many values (NDJSON, `--seq`)                      | depends                                      | faster for `.`, same speed for most filters, but the whole file is held in memory |
-| `--seq` output, or `input` / `inputs` taken once and abandoned | jq                                           | `succinctly jq` is slower                                                         |
-| Strict RFC 8259 input                                          | either, with `--validate` on `succinctly jq` | neither is strict by default                                                      |
-| Features new in jq 1.8                                         | jq 1.8                                       | `succinctly jq` follows 1.7.1                                                     |
-| Binary size                                                    | jq                                           | 9x to 22x smaller                                                                 |
+| Your workload                                                  | Use                                          | Why                                                                                                      |
+|----------------------------------------------------------------|----------------------------------------------|----------------------------------------------------------------------------------------------------------|
+| One document of 1 MB or more: filter, reformat, pretty-print   | `succinctly jq`                              | 2x to 15x faster, in a fraction of jq's memory                                                           |
+| `first`, `limit`, `.[0]` of a large document                   | `succinctly jq`                              | stops reading early: 5x to 7x at 100 MB                                                                  |
+| Regex or case mapping over large strings                       | `succinctly jq`                              | up to 52x                                                                                                |
+| Many short invocations, or documents under about 100 KB        | jq                                           | startup is jq's (0.67x to 0.93x); no gain on most small documents                                        |
+| A stream of many values (NDJSON, `--seq`)                      | depends                                      | faster for `.`, same speed for most filters; holds a window of a file for a plain filter, else all of it |
+| `--seq` output, or `input` / `inputs` taken once and abandoned | jq                                           | `succinctly jq` is slower                                                                                |
+| Strict RFC 8259 input                                          | either, with `--validate` on `succinctly jq` | neither is strict by default                                                                             |
+| Features new in jq 1.8                                         | jq 1.8                                       | `succinctly jq` follows 1.7.1                                                                            |
+| Binary size                                                    | jq                                           | 9x to 22x smaller                                                                                        |
 
 ## By category
 
@@ -109,12 +109,19 @@ favour `succinctly jq`). A shell loop that starts the tool a thousand times pays
 
 <!-- claim: stream-memory -->
 
-For NDJSON and `--seq` input, `succinctly jq` holds the file in memory while jq holds one value. At 100 MB,
-`ndjson_identity` peaks at 41.8x of jq's resident set on the 7950X and 47.9x on the M4 Pro (about 128 MB against 3 MB);
-the slope is about 1.2 MB per MB of input, so a multi-gigabyte log needs about as much memory as the file. Rows:
-`ndjson_identity`, `ndjson_field`, `ndjson_select`, `ndjson_inputs_reduce`, `seq_identity`, section E. The cause and the
-design that would remove it are in [#6913](https://github.com/rust-works/succinctly/issues/6913) and
-[#6920](https://github.com/rust-works/succinctly/issues/6920). `succinctly jq` is still the faster of the two on most of
+For `--seq` input, programs that read `input`/`inputs`, `-R`, standard input and several files, `succinctly jq` holds the
+whole input in memory while jq holds one value. At 100 MB, `ndjson_inputs_reduce` peaks at 37.4x of jq's resident set on
+the 7950X and 42.8x on the M4 Pro, and `seq_identity` at 42.1x and 47.9x (about 105 to 112 MB against 3 MB); the slope is
+about 1.0 MB per MB of input, so a multi-gigabyte log read that way needs about as much memory as the file. Rows:
+`ndjson_inputs_reduce`, `ndjson_raw_lines`, `seq_identity`, section E.
+
+A plain filter over one regular file (`ndjson_identity`, `ndjson_field`, `ndjson_select`, `ndjson_tsv`: no `-n`, no
+`input`, no `-s`) holds one 1 MiB window of it since [#6920](https://github.com/rust-works/succinctly/issues/6920), about
+10 MB at 100 MB on the 7950X and 13 MB (the machine's floor) on the M4 Pro, flat from 10 MB. The committed reports predate
+that change and still show the 41.8x to 48.0x it replaced, until they are regenerated. The same filters over standard
+input or several files hold the whole input as before ([#7023](https://github.com/rust-works/succinctly/issues/7023) and
+[#7024](https://github.com/rust-works/succinctly/issues/7024) track the rest; the cause is in
+[#6913](https://github.com/rust-works/succinctly/issues/6913)). `succinctly jq` is still the faster of the two on most of
 those rows (1.05x to 3.5x on the 7950X and 1.2x to 7.1x on the M4 Pro for the five named, at 100 MB), so this is a memory
 trade and not a speed one.
 

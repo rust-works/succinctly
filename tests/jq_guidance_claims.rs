@@ -177,13 +177,14 @@ const CLAIMS: &[Claim] = &[
         speedup(r, "startup", "none") < 1.0
             && speedup(r, "corpus_tabular_group", "corpus-tabular") < 1.0
     }),
-    // A stream is held whole: more than 30x jq's resident set at 100 MB, for every stream row named.
+    // A stream read through `input`/`inputs`, `-R` or `--seq` is held whole: more than 30x jq's resident
+    // set at 100 MB, for every such row named. The plain rows (`ndjson_identity`, `ndjson_field`,
+    // `ndjson_select`, `ndjson_tsv`) are not named: a regular file is read a window at a time since #6920,
+    // so their ratio falls to a few times jq's when the reports are regenerated.
     ("stream-memory", |r| {
         [
-            ("ndjson_identity", "ndjson-100mb"),
-            ("ndjson_field", "ndjson-100mb"),
-            ("ndjson_select", "ndjson-100mb"),
             ("ndjson_inputs_reduce", "ndjson-100mb"),
+            ("ndjson_raw_lines", "ndjson-100mb"),
             ("seq_identity", "jsonseq-100mb"),
         ]
         .iter()
