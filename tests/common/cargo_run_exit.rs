@@ -165,14 +165,13 @@ pub fn succinctly_bin() -> &'static str {
 /// and which carries no information once the child has been waited on
 /// (#2057; see the match at the end of the body).
 ///
-/// Ordering invariant: this write runs to completion (blocking on a full
-/// pipe buffer) *before* `wait_with_output()`'s own concurrent
-/// stdout/stderr draining starts, which is the classic double-pipe
-/// deadlock shape if the child fills its stdout/stderr buffer while
-/// waiting on stdin. Currently safe only because every binary this helper
-/// spawns reads stdin to completion before writing any output, and the
-/// small inputs/outputs these tests use never fill an OS pipe buffer
-/// either way -- not an invariant this function enforces itself.
+/// The write runs on its own thread while `wait_with_output()` drains
+/// stdout and stderr (#7024): a child that writes output while it is still
+/// reading its input (`succinctly jq` over a pipe of 4 MiB or more, which
+/// reads it a window at a time, as jq does) would otherwise fill its stdout
+/// pipe and wait on it while this write waited on a full stdin pipe -- the
+/// double-pipe deadlock. Writing first was safe only while every binary
+/// this helper spawns read stdin to its end before writing anything.
 ///
 /// Extracted (#2016 code review) from [`spawn_with_signal_retry`]'s own
 /// loop body so a caller that can't use that function's whole spawn+retry
@@ -185,13 +184,23 @@ pub fn write_stdin_then_wait(
     mut child: std::process::Child,
     stdin_input: Option<&[u8]>,
 ) -> Result<std::process::Output> {
-    let write_result: std::io::Result<()> =
-        if let (Some(input), Some(mut sin)) = (stdin_input, child.stdin.take()) {
-            use std::io::Write;
-            sin.write_all(input)
-        } else {
-            Ok(())
-        };
+    let stdin = child.stdin.take();
+    let (write_result, waited): (std::io::Result<()>, _) = std::thread::scope(|scope| {
+        let writer = scope.spawn(move || {
+            if let (Some(input), Some(mut sin)) = (stdin_input, stdin) {
+                use std::io::Write;
+                sin.write_all(input)
+            } else {
+                Ok(())
+            }
+            // `sin` is dropped here, so the child sees the end of its input.
+        });
+        let waited = child.wait_with_output();
+        let write_result = writer
+            .join()
+            .unwrap_or_else(|_| Err(std::io::Error::other("the stdin writer panicked")));
+        (write_result, waited)
+    });
     // Prefer the write error's own diagnostic over `wait_with_output`'s
     // (#1891 code review): on the rare double failure -- the child is
     // also reaped or killed by something else (an OOM kill, another
@@ -199,7 +208,7 @@ pub fn write_stdin_then_wait(
     // above) between the write failing and this wait running --
     // `wait_with_output` erroring first would otherwise mask *why* the
     // write itself failed with a more generic wait/I-O error.
-    let output = match child.wait_with_output() {
+    let output = match waited {
         Ok(output) => output,
         Err(wait_err) => {
             return Err(match write_result {
