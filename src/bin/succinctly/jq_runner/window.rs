@@ -422,6 +422,7 @@ impl LineWindows {
                 ask.min(usize::try_from(left).unwrap_or(usize::MAX))
             });
             let before = bytes.len();
+            // patchcov: coverage tolerate reason="untestable: an allocation that fails"
             if bytes.try_reserve(n).is_err() {
                 self.fail(
                     &mut bytes,
@@ -430,6 +431,7 @@ impl LineWindows {
                 );
                 continue;
             }
+            // patchcov: coverage end
             match self.reader.by_ref().take(n as u64).read_to_end(&mut bytes) {
                 // A short read is the end: a source of unknown length, or a file that shrank.
                 Ok(read) if read < n => self.eof = true,
@@ -461,7 +463,9 @@ impl LineWindows {
         let mut bytes = std::mem::take(&mut self.carried);
         if !self.eof {
             if let Err(error) = self.reader.read_to_end(&mut bytes) {
+                // patchcov: coverage tolerate reason="untestable: a read that fails after the source opened"
                 on_error(&error);
+                // patchcov: coverage end
             }
             self.eof = true;
         }

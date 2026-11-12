@@ -9513,6 +9513,7 @@ impl InputLocations {
                 self.push(src, line_counter.read_end_line(end));
             }
         } else {
+            // patchcov: coverage tolerate-line reason="unreachable: the reader's ends are one per value (kept for the callers whose counts differ)"
             let line = lines_before + content_lines(raw.get(seam.base..).unwrap_or(raw));
             for _ in 0..values {
                 self.push(src, line);
@@ -12937,7 +12938,7 @@ enum WindowRead {
 /// the substitution is made over the bytes whole, and the source is not read in windows after it.
 fn read_lazy_window(lazy: &mut LazyJsonInputs, more: &mut LazyMore, want: usize) -> WindowRead {
     let Some(mut rest) = more.rest.take() else {
-        return WindowRead::Eof;
+        return WindowRead::Eof; // patchcov: coverage tolerate-line reason="unreachable: the callers read a window only while `rest` is set"
     };
     #[cfg(test)]
     LAZY_WINDOWS_READ.with(|n| n.set((n.get().0 + 1, n.get().1)));
@@ -12945,7 +12946,7 @@ fn read_lazy_window(lazy: &mut LazyJsonInputs, more: &mut LazyMore, want: usize)
         .windows
         .next_window(Some(want), report_input_read_failure)
     else {
-        return WindowRead::Eof;
+        return WindowRead::Eof; // patchcov: coverage tolerate-line reason="untestable: a file that shrank to its front while the run read it"
     };
     let Ok(new) = std::str::from_utf8(&fresh) else {
         // Not UTF-8: the rest of the source, and all of it from here, is bytes as read.
@@ -13022,7 +13023,7 @@ fn slide_lazy_window(
     lines: &mut Option<LinePlace>,
 ) {
     let Some(place) = lines.as_ref() else {
-        return;
+        return; // patchcov: coverage tolerate-line reason="unreachable: the producer has read a document, and so counted its line, before it asks for more"
     };
     // Cheap to keep a little: dropping moves what is left, so it waits for a block's worth.
     let drop = place.line_start().min(more.scanned_to);
