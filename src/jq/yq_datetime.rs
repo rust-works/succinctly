@@ -112,6 +112,31 @@ fn custom_datetime(text: &str) -> Option<String> {
         .then_some(layout)
 }
 
+/// Whether `text` is worth asking [`is_timestamp`] about: under the default layouts a timestamp
+/// starts with a four-digit year and a `-` (`2006-01-02`, at least ten bytes), and only a custom
+/// layout, which can start with anything, widens that. A hot path (a sort of strings) asks this
+/// first to skip a parse that cannot succeed.
+pub(crate) fn could_be_timestamp(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    context::ever_custom()
+        || (bytes.len() >= 10 && bytes[..4].iter().all(u8::is_ascii_digit) && bytes[4] == b'-')
+}
+
+/// The instant `text` reads as, under the layouts [`compare_instants`] reads it by, for a caller
+/// that compares one text many times (a sort) and parses it once.
+pub(crate) fn instant_of(text: &str) -> Option<Instant> {
+    let layout = match go_time::yq_datetime(text) {
+        Some(instant) => match custom_layout() {
+            None => return Some(instant),
+            Some(layout) => layout,
+        },
+        None => custom_datetime(text)?,
+    };
+    go_time::yq_parse_datetime(&layout, text, &GoLocal)
+        .ok()
+        .map(|time| time.instant())
+}
+
 /// Whether yq's `+`, `-` and ordering comparisons treat `text` as a timestamp: it reads under
 /// RFC 3339 or `2006-01-02` (standing for the `!!timestamp` tag), or under the custom layout.
 pub(crate) fn is_timestamp(text: &str) -> bool {

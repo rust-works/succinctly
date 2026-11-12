@@ -6030,7 +6030,7 @@ untouched. The key is `tostring`'s text, so `==` and `unique` agree about a numb
 Pinned by `dedup_builtins_key_on_text_in_first_occurrence_order_2799` (`tests/yq_cli_tests.rs`)
 and the `dedup_text_keys_2799`/`dedup_containers_2799` goldens.
 
-### `sort`/`sort_by` follow yq's comparator and Go's stable sort -- resolved ([#2799](https://github.com/rust-works/succinctly/issues/2799)); timestamps, a literal `{}` and NaN remain
+### `sort`/`sort_by` follow yq's comparator and Go's stable sort -- resolved ([#2799](https://github.com/rust-works/succinctly/issues/2799)); a literal `{}` and NaN remain
 
 Real yq's `sort` and `sort_by` are not jq's total order. `sortableNodeArray.compare`
 (`pkg/yqlib/operator_sort.go`, v4.53.3) decides in this order, and the first rule that applies
@@ -6074,10 +6074,11 @@ position and then by length, as `sort_by(.a, .b)` is in yq. jq mode is untouched
 - **A literal `{}` in the filter** sorts as the text `{}` in yq (its literal node carries that
   text) and as the empty text of any other mapping here: `[.z, {}, .b] | sort` puts the literal
   last in yq. An empty mapping read from a document sorts as empty text in both.
-- **Timestamps.** yq compares two `!!timestamp` nodes as times; `OwnedValue` has no timestamp
-  type, so `sort` compares them by text (equal for an ISO date, different for other layouts).
-  The ordering operators read a timestamp-shaped string as a time (see the comparison section,
-  [#5651](https://github.com/rust-works/succinctly/issues/5651)); `sort` does not.
+- **Timestamps are read from the text, not from a tag** ([#7058](https://github.com/rust-works/succinctly/issues/7058)).
+  yq compares two `!!timestamp` nodes as times, in `sort`, `sort_by`, `min` and `max`; `OwnedValue` has no timestamp type, so two strings that both read as one (`2006-01-02` or RFC 3339, or the layout `with_dtf` set) compare as instants, as the ordering operators already did ([#5651](https://github.com/rust-works/succinctly/issues/5651)).
+  A date that was quoted in the document is `!!str` to yq and compares as text there, where it is read as a time here ([#7057](https://github.com/rust-works/succinctly/issues/7057)); the two agree unless the layouts or offsets differ.
+  A sort that mixes timestamps with other strings or numbers is not a total preorder, so it goes through the Go-ported stable sort, as the other mixed arrays do.
+  In `min` and `max` a timestamp element reads the running pick as a time too: a pick that is no timestamp raises the error reading it as one gives (`[plain, 2001-12-14] | min`), and a timestamp pick against a string that is none is refused with `!!str not yet supported for comparison`.
 - **An absent key in a `sort_by` key filter** is no output, as in yq ([#4054](https://github.com/rust-works/succinctly/issues/4054),
   [#4387](https://github.com/rust-works/succinctly/issues/4387)). yq evaluates the key through `ReadOnlyClone`,
   so an element lacking the key has a shorter key list (`[]` for `.k`, `[9]` for `.x, .y`) rather than one

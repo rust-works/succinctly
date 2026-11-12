@@ -19437,7 +19437,9 @@ pub(crate) fn jq_max_by<T>(
 /// It is **not a strict weak order** (an integer against a string compares by text, two integers
 /// numerically), so the answer for a mixed-type array depends on the algorithm: yq runs Go's
 /// `sort.Stable`, ported in `go_sort.rs`, and the callers use it. Timestamps (a `!!timestamp`
-/// pair compares as times) are not typed by `OwnedValue`, so they compare by text.
+/// pair compares as times) are not typed by `OwnedValue`: two strings that both read as one
+/// (`yq_datetime::is_timestamp`, under the default layout or `with_dtf`'s) compare as instants
+/// (#7058), and every other string compares by text.
 ///
 /// Divergence, recorded in `docs/compliance/yq/limitations.md`: yq **panics** on a NaN or an
 /// infinity here (`strconv.ParseFloat: parsing ".nan"`), and this orders NaN before every other
@@ -19445,6 +19447,7 @@ pub(crate) fn jq_max_by<T>(
 pub(crate) fn yq_compare_values<S: EvalSemantics>(
     left: &OwnedValue,
     right: &OwnedValue,
+    times: Option<(super::go_time::Instant, super::go_time::Instant)>,
 ) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     match (left.is_null(), right.is_null()) {
@@ -19464,6 +19467,13 @@ pub(crate) fn yq_compare_values<S: EvalSemantics>(
     }
     if let (Some(a), Some(b)) = (yq_sort_float(left), yq_sort_float(right)) {
         return super::value::cmp_f64(a, b);
+    }
+    // #7058: two timestamps compare as times, the layout `with_dtf` set included. The text rule
+    // above stands in for the tag, as in `+` (#7057); a pair that is not both readable falls to text.
+    // `times` is the instants of two strings that both read as timestamps, parsed once by the
+    // sort, so a sort of other strings never pays for a parse.
+    if let Some((a, b)) = times {
+        return a.cmp(&b);
     }
     yq_sort_text::<S>(left).cmp(&yq_sort_text::<S>(right))
 }
@@ -19502,6 +19512,9 @@ const YQ_TEXT: u8 = 32;
 /// An integer whose difference with another can wrap `i64` (|n| >= 2^62): `int(lhs - rhs)`
 /// then flips sign, so no ordering of it is transitive.
 const YQ_INT_HUGE: u8 = 64;
+/// A string that reads as a timestamp (#7058): two of them compare as times, and against any
+/// other text or a number the comparison is by text, so the mix is not a total preorder.
+const YQ_TIMESTAMP: u8 = 128;
 
 fn yq_sort_flag(value: &OwnedValue) -> u8 {
     match value {
@@ -19534,6 +19547,7 @@ fn yq_sort_is_total(flags: u8) -> bool {
     let numbers = YQ_INT_EXACT | YQ_INT_WIDE | YQ_FLOAT;
     flags & YQ_INT_HUGE == 0
         && !(flags & numbers != 0 && flags & YQ_TEXT != 0)
+        && !(flags & YQ_TIMESTAMP != 0 && flags & (YQ_TEXT | numbers) != 0)
         && !(flags & YQ_FLOAT != 0 && flags & YQ_INT_WIDE != 0)
 }
 
@@ -19547,30 +19561,105 @@ fn yq_sort_is_total(flags: u8) -> bool {
 /// yq runs.
 pub(crate) fn yq_sort_by<T, S: EvalSemantics>(items: &mut [T], keys: impl Fn(&T) -> &[OwnedValue]) {
     let mut flags: Vec<u8> = Vec::new();
-    for item in items.iter() {
+    // #7058: the instant of every key that reads as a timestamp, read once here, so the kind flag
+    // below and the comparison agree on which keys are timestamps. Empty until one is found.
+    let mut instants: Vec<Vec<Option<super::go_time::Instant>>> = Vec::new();
+    for (at_item, item) in items.iter().enumerate() {
         for (at, key) in keys(item).iter().enumerate() {
+            let mut flag = yq_sort_flag(key);
+            if let OwnedValue::String(text) = key {
+                if super::yq_datetime::could_be_timestamp(text) {
+                    if let Some(instant) = super::yq_datetime::instant_of(text) {
+                        flag = YQ_TIMESTAMP;
+                        if instants.is_empty() {
+                            instants = (0..items.len()).map(|_| Vec::new()).collect();
+                        }
+                        let row = &mut instants[at_item];
+                        while row.len() <= at {
+                            row.push(None);
+                        }
+                        row[at] = Some(instant);
+                    }
+                }
+            }
             match flags.get_mut(at) {
-                Some(seen) => *seen |= yq_sort_flag(key),
-                None => flags.push(yq_sort_flag(key)),
+                Some(seen) => *seen |= flag,
+                None => flags.push(flag),
             }
         }
     }
-    let compare = |a: &T, b: &T| yq_compare_key_arrays::<S>(keys(a), keys(b));
-    if flags.iter().all(|&position| yq_sort_is_total(position)) {
+    let total = flags.iter().all(|&position| yq_sort_is_total(position));
+    if !instants.is_empty() {
+        yq_sort_by_instants::<T, S>(items, &keys, &instants, total);
+        return;
+    }
+    let compare = |a: &T, b: &T| yq_compare_key_arrays::<S>(keys(a), keys(b), &[], &[]);
+    if total {
         items.sort_by(compare);
     } else {
         super::go_sort::stable_sort_by(items, compare);
     }
 }
 
+/// [`yq_sort_by`] for keys of which some read as timestamps (#7058): the indices are sorted by the
+/// instants the caller read, and `items` is permuted to match, so a comparison costs no parse.
+fn yq_sort_by_instants<T, S: EvalSemantics>(
+    items: &mut [T],
+    keys: &impl Fn(&T) -> &[OwnedValue],
+    instants: &[Vec<Option<super::go_time::Instant>>],
+    total: bool,
+) {
+    let mut order: Vec<usize> = (0..items.len()).collect();
+    {
+        let sorted: &[T] = items;
+        let compare = |&a: &usize, &b: &usize| {
+            yq_compare_key_arrays::<S>(
+                keys(&sorted[a]),
+                keys(&sorted[b]),
+                &instants[a],
+                &instants[b],
+            )
+        };
+        if total {
+            order.sort_by(compare);
+        } else {
+            super::go_sort::stable_sort_by(&mut order, compare);
+        }
+    }
+    // `items[i]` becomes the old `items[order[i]]`, following each cycle of the permutation.
+    let mut placed = vec![false; order.len()];
+    for start in 0..order.len() {
+        if placed[start] {
+            continue;
+        }
+        let mut at = start;
+        while order[at] != start {
+            items.swap(at, order[at]);
+            placed[at] = true;
+            at = order[at];
+        }
+        placed[at] = true;
+    }
+}
+
 /// [`yq_compare_values`] over two `[f]` sort keys, lexicographically and then by length -- the
-/// yq-mode twin of [`compare_key_arrays`].
+/// yq-mode twin of [`compare_key_arrays`]. `a_times` and `b_times` are the keys' instants where
+/// the sort read them (empty for a sort with no timestamp).
 pub(crate) fn yq_compare_key_arrays<S: EvalSemantics>(
     a: &[OwnedValue],
     b: &[OwnedValue],
+    a_times: &[Option<super::go_time::Instant>],
+    b_times: &[Option<super::go_time::Instant>],
 ) -> core::cmp::Ordering {
-    for (x, y) in a.iter().zip(b.iter()) {
-        match yq_compare_values::<S>(x, y) {
+    for (at, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        let times = match (
+            a_times.get(at).copied().flatten(),
+            b_times.get(at).copied().flatten(),
+        ) {
+            (Some(p), Some(q)) => Some((p, q)),
+            _ => None,
+        };
+        match yq_compare_values::<S>(x, y, times) {
             core::cmp::Ordering::Equal => continue,
             other => return other,
         }
@@ -22499,12 +22588,45 @@ pub(crate) fn yq_extremum_index<T: core::borrow::Borrow<OwnedValue>>(
                     yq_extremum_tag(element),
                 )))
             }
+            // #7058: a `null` pick against a timestamp is read as a time and refused.
+            (OwnedValue::Null, OwnedValue::String(b)) if super::yq_datetime::is_timestamp(b) => {
+                return Err(EvalError::new(
+                    super::go_time::yq_datetime_error("null").unwrap_or_default(),
+                ));
+            }
             // A `null` on either side takes no part: the pick stays.
             (OwnedValue::Null, _) | (_, OwnedValue::Null) => continue,
             _ => {}
         }
         let ordering = match (pick, element) {
-            (OwnedValue::String(a), OwnedValue::String(b)) => a.as_bytes().cmp(b.as_bytes()),
+            // #7058: a timestamp element reads both as times: the instants compare, and a pick
+            // that is no timestamp raises the error reading it as one gives (`[plain, 2001-12-14]`).
+            // A timestamp pick against a string that is none is refused with that string's tag.
+            // Two other strings compare bytewise.
+            (OwnedValue::String(a), OwnedValue::String(b)) => {
+                if super::yq_datetime::is_timestamp(b) {
+                    match super::yq_datetime::compare_instants(a, b) {
+                        Some(Ok((a, b))) => a.cmp(&b),
+                        Some(Err(message)) => return Err(EvalError::new(message)),
+                        None => {
+                            return Err(EvalError::new(
+                                super::go_time::yq_datetime_error(a).unwrap_or_default(),
+                            ))
+                        }
+                    }
+                } else if super::yq_datetime::is_timestamp(a) {
+                    return Err(refused(element));
+                } else {
+                    a.as_bytes().cmp(b.as_bytes())
+                }
+            }
+            // A number, or a boolean, against a timestamp element is read as a time too.
+            (_, OwnedValue::String(b)) if super::yq_datetime::is_timestamp(b) => {
+                let text = yq_scalar_text::<YqSemantics>(pick).unwrap_or_default();
+                return Err(EvalError::new(
+                    super::go_time::yq_datetime_error(&text).unwrap_or_default(),
+                ));
+            }
             (
                 OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..),
                 OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..),
