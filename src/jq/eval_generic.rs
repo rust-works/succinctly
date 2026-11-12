@@ -39811,6 +39811,8 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                         // Only the second keeps its node, so `head_comment`, `line` and the
                         // rest read the key's own metadata (#7043).
                         Ok(Some(OwnedValue::String(_))) => {
+                            // STYLE-0012: a failure is this arm's `GenericResult::Error`, as
+                            // `key_owned_value`'s is just above; the caller applies `optional`.
                             match to_owned_cursor::<S, _>(&key_cursor) {
                                 Ok(OwnedValue::String(_)) => GenericResult::OneCursor(key_cursor),
                                 Ok(_) => GenericResult::Owned(OwnedValue::String(s.clone())),
