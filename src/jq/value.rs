@@ -12227,10 +12227,7 @@ mod array_window_tests_6659 {
     fn values(items: &[OwnedValue]) -> Vec<i64> {
         items
             .iter()
-            .map(|v| match v {
-                OwnedValue::Int(n) => *n,
-                other => panic!("not an integer: {other:?}"),
-            })
+            .map(|v| v.as_i64().expect("an integer"))
             .collect()
     }
 
@@ -12443,6 +12440,29 @@ mod array_window_tests_6659 {
         assert_eq!(alloc::format!("{:?}", a.slice(3..4)), "[Int(3)]");
     }
 
+    #[test]
+    fn a_cut_of_a_shared_window_is_its_slice() {
+        let a = ints(0..5);
+        let mut b = a.clone();
+        b.cut(1..3);
+        assert_eq!(values(&b), [1, 2]);
+        assert!(
+            b.ptr_eq(&a.slice(1..3)),
+            "a view on the shared storage, as `slice` makes it"
+        );
+        assert_eq!(
+            values(&a),
+            [0, 1, 2, 3, 4],
+            "the other handle keeps its window"
+        );
+    }
+
+    #[test]
+    fn the_vec_guard_prints_as_its_elements() {
+        let mut a = ints(1..3);
+        assert_eq!(alloc::format!("{:?}", a.make_vec()), "[Int(1), Int(2)]");
+    }
+
     /// An element that counts its drops, so a window's teardown is seen to release every element
     /// of its storage, in or out of the window, exactly once.
     #[derive(Clone)]
@@ -12520,11 +12540,9 @@ mod array_window_tests_6659 {
         }));
         assert!(caught.is_err());
         assert!(lent.start + lent.len() <= lent.inner.len());
-        // Defuse what is left before it drops.
+        // Defuse what is left before it drops. `cut`'s bomb went off in its own `truncate`, and
+        // what is left of its storage (elements 0..4) holds none.
         for bomb in lent.make_vec().iter_mut() {
-            bomb.0 = false;
-        }
-        for bomb in cut.make_vec().iter_mut() {
             bomb.0 = false;
         }
     }
@@ -12544,10 +12562,8 @@ mod array_window_tests_6659 {
     /// `OwnedValue`'s identity reads the window: `shares_storage_with` and `jq_identical`.
     #[test]
     fn owned_value_identity_reads_the_window() {
-        let a = OwnedValue::Array(ints(0..4));
-        let OwnedValue::Array(items) = &a else {
-            unreachable!()
-        };
+        let items = ints(0..4);
+        let a = OwnedValue::Array(items.clone());
         let one = OwnedValue::Array(items.slice(1..3));
         let two = OwnedValue::Array(items.slice(1..3));
         let other = OwnedValue::Array(items.slice(1..4));

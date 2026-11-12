@@ -129,3 +129,70 @@ fn a_write_through_a_slice_does_not_reach_the_array_it_was_cut_from() -> Result<
     }
     Ok(())
 }
+
+/// `succinctly jq ARGS` over `input` on standard input: stdout and stderr together, trimmed.
+fn jq_doc(filter: &str, input: &str) -> Result<String> {
+    let (stdout, stderr, _code) = crate::run_jq_full(&["-c", filter], Some(input))?;
+    Ok(format!("{}{}", stdout.trim_end(), stderr.trim_end()))
+}
+
+/// A `def` tail loop settles its `if` condition from a built value's tree when it can (the
+/// `length > 10` of the loops above), and every other condition keeps the evaluator's route: one
+/// the pure grammar answers with an error, one over the document itself, one that yields nothing,
+/// and one that raises through that route. Outputs are jq 1.7.1's.
+#[test]
+fn a_def_tail_loops_condition_answers_as_jq_on_every_route() -> Result<()> {
+    // A built value whose condition raises in the pure grammar.
+    let (stdout, stderr, code) = crate::run_jq_full(
+        &[
+            "-nc",
+            "[range(3)] | def f: if .a > 1 then .[1:] | f else length end; f",
+        ],
+        None,
+    )?;
+    assert_eq!((stdout.as_str(), code), ("", 5));
+    assert!(
+        stderr.contains(r#"Cannot index array with string "a""#),
+        "{stderr}"
+    );
+    // A condition that yields nothing ends the loop with no output.
+    for filter in [
+        "[range(3)] | def f: if (length | select(. > 5)) then .[1:] | f else length end; f",
+        "[range(3)] | def f: if (.[0] | select(. > 5)) then .[1:] | f else length end; f",
+    ] {
+        assert_eq!(jq_n(filter)?, "", "{filter}");
+    }
+    // Over the document: the condition reads a document node.
+    assert_eq!(
+        jq_doc(
+            "def f: if .a then .a | f else . end; f",
+            r#"{"a":{"a":null}}"#
+        )?,
+        r#"{"a":null}"#
+    );
+    // Over the document, a condition that raises.
+    let out = jq_doc("def f: if .a.b then .a | f else . end; f", r#"{"a":1}"#)?;
+    assert!(
+        out.contains(r#"Cannot index number with string "b""#),
+        "{out}"
+    );
+    Ok(())
+}
+
+/// `del()`'s walk over a target that is not an array refuses as jq does, before anything pads.
+#[test]
+fn a_delete_through_an_index_of_a_non_array_raises_as_jq() -> Result<()> {
+    for (filter, want) in [
+        (
+            r#"{"a":{"x":1}} | try del(.a[0].b) catch ."#,
+            r#""Cannot index object with number""#,
+        ),
+        (
+            r#"{"a":"s"} | try del(.a[0]) catch ."#,
+            r#""Cannot index string with number""#,
+        ),
+    ] {
+        assert_eq!(jq_n(filter)?, want, "{filter}");
+    }
+    Ok(())
+}

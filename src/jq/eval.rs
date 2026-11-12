@@ -184666,3 +184666,135 @@ mod trailing_newline_route_tests_6488 {
         assert!(!pattern_may_match_newline(r"[\w_]$"));
     }
 }
+
+/// The routes #6659 rewrote to read an owned array's window (ADR-0029), and the `def` tail loop's
+/// condition over a document: each pinned at the function it touches, since no CLI program reaches
+/// them on the route that ships (the CLI evaluates a document through `eval_generic`).
+#[cfg(test)]
+mod array_window_routes_6659 {
+    use super::*;
+    use crate::jq::parse;
+    use crate::json::light::JsonIndex;
+
+    fn ints(values: &[i64]) -> OwnedValue {
+        OwnedValue::array_from(values.iter().copied().map(OwnedValue::Int).collect())
+    }
+
+    /// `eval_full` over a document, as `succinctly::jq::eval` runs it: the outputs, compact, and
+    /// the error that ended the run.
+    fn run(json: &[u8], filter: &str) -> (Vec<String>, Option<String>) {
+        let index = JsonIndex::build(json);
+        let expr = parse(filter).unwrap();
+        let result = eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(json));
+        let error = match &result {
+            QueryResult::Error(e) => Some(e.to_string()),
+            _ => None,
+        };
+        let values = result
+            .collect_owned::<JqSemantics>()
+            .iter()
+            .map(OwnedValue::to_json)
+            .collect();
+        (values, error)
+    }
+
+    /// `get_value_at_path` re-slices a slice component, as the slice that made the path did.
+    #[test]
+    fn a_path_through_a_slice_reads_the_sliced_element() {
+        let doc = ints(&[10, 20, 30]);
+        let slice = OwnedValue::object_from([
+            ("start".to_string(), OwnedValue::Int(1)),
+            ("end".to_string(), OwnedValue::Int(3)),
+        ]);
+        assert_eq!(
+            get_value_at_path(&doc, &[slice.clone(), OwnedValue::Int(0)]),
+            Some(OwnedValue::Int(20))
+        );
+        assert_eq!(get_value_at_path(&doc, &[slice]), Some(ints(&[20, 30])));
+    }
+
+    /// `del()`'s vivify walk pads a `null` or a short array, and declines anything else.
+    #[test]
+    fn the_delete_walk_pads_an_array_and_declines_anything_else() {
+        let mut object = OwnedValue::object_from([("x".to_string(), OwnedValue::Int(1))]);
+        assert!(vivify_position(&mut object, 0).is_none());
+        let mut null = OwnedValue::Null;
+        assert_eq!(
+            vivify_position(&mut null, 2).cloned(),
+            Some(OwnedValue::Null)
+        );
+        assert_eq!(null, OwnedValue::array_from(vec![OwnedValue::Null; 3]));
+        let mut short = ints(&[1]);
+        assert_eq!(
+            vivify_position(&mut short, 1).cloned(),
+            Some(OwnedValue::Null)
+        );
+        assert_eq!(
+            short,
+            OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Null])
+        );
+    }
+
+    /// yq pads an array out to the highest plain index of a batch before deleting (#4749):
+    /// `del(.[5], .[7])` on three elements, through the window's `Vec`.
+    #[test]
+    fn a_yq_batch_of_indices_pads_the_array_first() {
+        let (five, seven) = (OwnedValue::Int(5), OwnedValue::Int(7));
+        let out = delete_keys(ints(&[1, 2, 3]), &[&five, &seven], true).unwrap();
+        let null = OwnedValue::Null;
+        assert_eq!(
+            out,
+            OwnedValue::array_from(vec![
+                OwnedValue::Int(1),
+                OwnedValue::Int(2),
+                OwnedValue::Int(3),
+                null.clone(),
+                null.clone(),
+                null,
+            ])
+        );
+    }
+
+    /// A `def` tail loop over the document reads its condition from the document node, and a
+    /// condition that yields nothing or raises ends the loop as jq ends it.
+    #[test]
+    fn a_tail_loops_condition_over_the_document_answers_as_jq() {
+        let def = "def f: if .a then .a | f else . end; f";
+        assert_eq!(
+            run(br#"{"a":{"a":null}}"#, def),
+            (vec![r#"{"a":null}"#.into()], None)
+        );
+        let empty = "def f: if (.a | select(. > 5)) then .a | f else . end; f";
+        assert_eq!(run(br#"{"a":1}"#, empty), (vec![], None));
+        let (values, error) = run(br#"{"a":1}"#, "def f: if .a.b then .a | f else . end; f");
+        assert_eq!(values, Vec::<String>::new());
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|e| e.contains("Cannot index number")),
+            "{error:?}"
+        );
+    }
+
+    /// The pure grammar settles a value the loop built, including a condition it answers with an
+    /// error (`.a` of an array), which ends the loop with jq's message: the first round reads the
+    /// document's `{"a":0}`, the second the array `[.]` built from it.
+    #[test]
+    fn a_tail_loops_condition_over_a_built_value_raises_as_jq() {
+        let (values, error) = run(br#"{"a":0}"#, "def f: if .a > 1 then . else [.] | f end; f");
+        assert_eq!(values, Vec::<String>::new());
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|e| e.contains(r#"Cannot index array with string "a""#)),
+            "{error:?}"
+        );
+        assert_eq!(
+            run(
+                b"null",
+                "[range(30)] | def f: if length > 10 then .[1:] | f else length end; f"
+            ),
+            (vec!["10".into()], None)
+        );
+    }
+}
