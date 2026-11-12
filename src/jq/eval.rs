@@ -27910,6 +27910,18 @@ pub(crate) fn tostring_text<S: EvalSemantics>(value: &OwnedValue, flow: bool) ->
     owned_to_string::<S>(value)
 }
 
+/// The text yq names a `--split-exp` file after for a value its name expression produced (#7029):
+/// the node's scalar value, as `tostring` renders it (`1`, `true`, `null`, a float without a
+/// trailing `.0`, a number or string as the source spelled it), and nothing for a mapping or a
+/// sequence, which have no scalar value. Public for the CLI, which cannot reach [`tostring_text`].
+#[doc(hidden)]
+pub fn yq_node_scalar_text(value: &OwnedValue) -> String {
+    match value {
+        OwnedValue::Array(_) | OwnedValue::Object(_) => String::new(),
+        scalar => tostring_text::<YqSemantics>(scalar, false),
+    }
+}
+
 /// Builtin: tonumber - convert string to number
 fn builtin_tonumber<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,

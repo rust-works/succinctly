@@ -183,6 +183,8 @@ pub use eval::{
 // `input_queue_is_active` exists under both gates (a `const fn` returning
 // `false` without `std`), so `eval_generic` can consult it unconditionally.
 pub use eval::input_queue_is_active;
+// #7029: the text a `--split-exp` file is named after.
+pub use eval::yq_node_scalar_text;
 // #6923: what `-e` reads under an `-o=<format>` encoder.
 pub use eval::{output_encoder_saw_truthy, reset_output_encoder_truthy};
 pub use eval::{set_yq_encoder_prefs, YqEncoderPrefs};
