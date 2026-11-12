@@ -1,3 +1,4 @@
 platform = "linux"
 category = "reference-crash"
-reason = "Under `ulimit -v` 64 MiB, 300000-key object: the reference jq 1.7.1 aborts; succinctly answers, on an evaluation stack sized to the cap (#5634)."
+reason = "Under `ulimit -v` 64 MiB, 300000-key object: the reference jq 1.7.1 aborts on x86_64 Linux; succinctly answers, on an evaluation stack sized to the cap (#5634). Whether jq aborts depends on the host's address-space footprint, not its architecture: the object needs most of the 64 MiB, so jq answers on Linux aarch64 (Neoverse-V2) yet aborts there too under a slightly lower cap (about 60000 KiB, measured with Ubuntu 24.04's jq 1.7). The entry is volatile so that a host where jq fits is not called stale (#7009)."
+volatile = true
