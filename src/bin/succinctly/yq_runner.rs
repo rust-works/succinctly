@@ -4631,12 +4631,14 @@ impl SplitFiles {
 }
 
 /// Evaluate `split_expr` against `result` with `$index` bound to
-/// `output_index`, expect exactly one string back, and write `result`
-/// (serialized through `output_config`, color forced off, matching
-/// `--inplace`) to that path.
+/// `output_index`, name the file after the first value it produces as yq does
+/// (see below), and write `result` (serialized through `output_config`, color
+/// forced off, matching `--inplace`) to that path.
 ///
-/// Non-string, empty, or multi-value split-expression results are reported
-/// through `sink` — the same "continue, exit 1 at the end" convention used
+/// The name is the first value's scalar text (#7029): a string as it is, a number,
+/// boolean or `null` as it prints, and nothing for a mapping, a sequence or no value, as
+/// yq v4.53.3 does; later values are ignored. An error the expression raises is
+/// reported through `sink` — the same "continue, exit 1 at the end" convention used
 /// for other uncaught evaluation errors in this file — rather than aborting
 /// the run outright.
 fn write_split_result(
@@ -4675,49 +4677,19 @@ fn write_split_result(
         return Ok(());
     }
 
-    let filename = match filename_results.as_slice() {
-        [OwnedValue::String(s)] => s.clone(),
-        // `evaluate_input` already reported the underlying error (e.g. an
-        // undefined variable, or an explicit `error(...)`) via `sink`.
-        // `report_count()` (not `hit()`, which is sticky for the whole run)
-        // is what lets this tell "this call just reported" from "some
-        // earlier result already tripped the sink" -- otherwise every
-        // result after the first real error in the run double-reports here
-        // (#715 follow-up).
-        [] if sink.report_count() > reports_before => return Ok(()),
-        [] => {
-            sink.report(
-                DiagStyle::Yq,
-                &EvalError::new(format!(
-                    "--split-exp expression produced no output for result #{output_index}"
-                )),
-                &no_location(),
-            );
-            return Ok(());
-        }
-        [other] => {
-            sink.report(
-                DiagStyle::Yq,
-                &EvalError::new(format!(
-                    "--split-exp expression must evaluate to a string, got {} for result #{output_index}",
-                    other.type_name()
-                )),
-                &no_location(),
-            );
-            return Ok(());
-        }
-        many => {
-            sink.report(
-                DiagStyle::Yq,
-                &EvalError::new(format!(
-                    "--split-exp expression must evaluate to exactly one string, got {} results for result #{output_index}",
-                    many.len()
-                )),
-                &no_location(),
-            );
-            return Ok(());
-        }
-    };
+    // #7029: yq names the file after the *first* value the expression produced, as that node's scalar
+    // text: a number, a boolean or `null` is spelled as it prints (`1.yml`, `null.yml`), and a mapping,
+    // a sequence or no value at all is an empty name (`.yml`). Later values are ignored. What yq does
+    // not do is refuse any of them, so none is an error here either; an error the expression itself
+    // raised was reported by `evaluate_input` (`report_count()` is what tells this call's apart from
+    // an earlier result's, #715 follow-up).
+    if filename_results.is_empty() && sink.report_count() > reports_before {
+        return Ok(());
+    }
+    let filename = filename_results
+        .first()
+        .map(jq::yq_node_scalar_text)
+        .unwrap_or_default();
 
     // #7028: yq names the file `<expression result>.<extension>` unless the result already ends in one.
     let filename = split_exp_file_name(&filename, files.name_format);
@@ -4730,8 +4702,53 @@ fn write_split_result(
     no_color_config.use_color = false;
     output_value(&mut buf, result, comments, &no_color_config, None)?;
 
+    // #7029: yq's help says "The necessary directories will be created".
+    create_split_exp_directories(&filename)?;
     std::fs::write(&filename, &buf)
         .with_context(|| format!("failed to write --split-exp output file: {filename}"))
+}
+
+/// The directory yq creates for a `--split-exp` file (#7029): Go's `filepath.Dir`, which is
+/// the path with its last element removed and the rest *lexically cleaned* (`.` and empty elements
+/// dropped, `x/..` folded away), `.` when nothing is left. So `d/../x.yml` has the directory `.`, nothing
+/// is created, and the write fails on the missing `d` as yq's does.
+fn split_exp_directory(path: &str) -> std::path::PathBuf {
+    use std::path::{Component, Path, PathBuf};
+    let mut cleaned: Vec<Component<'_>> = Vec::new();
+    let parent = Path::new(path).parent().unwrap_or_else(|| Path::new(""));
+    for component in parent.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match cleaned.last() {
+                Some(Component::Normal(_)) => {
+                    cleaned.pop();
+                }
+                // `/..` is `/`, and a leading `..` stays.
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => cleaned.push(component),
+            },
+            other => cleaned.push(other),
+        }
+    }
+    let dir: PathBuf = cleaned.iter().collect();
+    if dir.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        dir
+    }
+}
+
+/// `os.MkdirAll(filepath.Dir(path), 0750)`: every missing directory of the file's path, with mode `0750`
+/// (less the umask) on Unix. A component that exists and is not a directory is an error (#7029).
+fn create_split_exp_directories(path: &str) -> Result<()> {
+    let dir = split_exp_directory(path);
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o750);
+    builder
+        .create(&dir)
+        .with_context(|| format!("failed to create --split-exp directory: {}", dir.display()))
 }
 
 /// The extension yq (v4.53.3) appends to a `--split-exp` file name for `format` (#7028): `json` and

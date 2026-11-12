@@ -7782,3 +7782,16 @@ Matching either needs a string that can hold bytes that are not UTF-8, or the su
 - **A missing `--split-exp-file` is worded differently.**
   yq says `Error: open nope.exp: no such file or directory`; this says `failed to read split expression file: nope.exp`, with the cause.
   Both exit 1 and write nothing.
+
+## `--split-exp` names a file as yq does ([#7029](https://github.com/rust-works/succinctly/issues/7029)), with these differences
+
+`tests/yq_cli/i7029.rs` pins the rows captured from yq v4.53.3.
+The name is the first value the expression produces, read as its scalar text, with the output format's extension appended when the name has none ([#7028](https://github.com/rust-works/succinctly/issues/7028)).
+
+- **A name read from a source `~` is `null.yml`, where yq writes `~.yml`.**
+  The source spelling of a null is not kept ([#2802](https://github.com/rust-works/succinctly/issues/2802)).
+  A number keeps its spelling (`0x10.yml`, `007.yml`), as does a quoted string.
+- **A directory that cannot be made or a name that cannot be written is worded differently.**
+  yq says `Error: mkdir blocker: not a directory`; this says `failed to create --split-exp directory: blocker`, with the cause.
+  Both exit 1 and write nothing.
+- **A name read from the encoded text under `-o=props` and the other encoder formats** is still wrong ([#7036](https://github.com/rust-works/succinctly/issues/7036)).

@@ -24888,18 +24888,6 @@ fn test_split_exp_writes_one_file_per_result_by_index() -> Result<()> {
 }
 
 #[test]
-fn test_split_exp_non_string_result_errors() -> Result<()> {
-    let (_stdout, stderr, code) =
-        run_yq_split(".[]", "[1, 2]", &["--split-exp", "$index", "-p", "json"])?;
-    assert_ne!(code, 0);
-    assert!(
-        stderr.contains("must evaluate to a string"),
-        "stderr: {stderr}"
-    );
-    Ok(())
-}
-
-#[test]
 fn test_split_exp_dot_is_bound_to_result() -> Result<()> {
     let dir = TempDir::new()?;
     let pattern = format!("\"{}/\" + .name + \".yml\"", dir.path().display());
@@ -25143,43 +25131,40 @@ fn test_split_exp_with_identity_filter_not_bypassed_by_m2() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_split_exp_empty_result_errors() -> Result<()> {
-    let (_stdout, stderr, code) =
-        run_yq_split(".", "a: 1\n", &["--jq-extensions", "--split-exp", "empty"])?;
-    assert_ne!(code, 0);
-    assert!(stderr.contains("produced no output"), "stderr: {stderr}");
-    Ok(())
+/// A `--split-exp` name whose directory cannot be made: a regular file stands where a directory is
+/// needed (#7029, which creates missing directories as yq does; a path like `/nonexistent-dir` would
+/// make one under the root instead). Keep `_dir` alive for the test.
+struct BlockedSplitPath {
+    _dir: TempDir,
+    pattern: String,
 }
 
-#[test]
-fn test_split_exp_many_results_errors() -> Result<()> {
-    let (_stdout, stderr, code) = run_yq_split(".", "a: 1\n", &["--split-exp", "$index, 1"])?;
-    assert_ne!(code, 0);
-    assert!(
-        stderr.contains("exactly one string") && stderr.contains("2 results"),
-        "stderr: {stderr}"
-    );
-    Ok(())
+fn blocked_split_path() -> Result<BlockedSplitPath> {
+    let dir = TempDir::new()?;
+    let file = dir.path().join("blocker");
+    std::fs::write(&file, "")?;
+    let pattern = format!("\"{}/out.yml\"", file.display());
+    Ok(BlockedSplitPath { _dir: dir, pattern })
 }
 
-/// Regression coverage for `write_split_result`'s own `std::fs::write`
+/// Regression coverage for `write_split_result`'s own directory-creation
 /// failure path (distinct from the filename-evaluation error paths above):
-/// a directory that doesn't exist makes the actual file write fail, which
+/// a directory that cannot be created makes the file write impossible, which
 /// must surface as a normal CLI error rather than a panic, across all three
 /// input-gathering branches (`-n`/null-input, YAML, JSON).
 #[test]
 fn test_split_exp_write_failure_reports_error_null_input() -> Result<()> {
+    let blocker = blocked_split_path()?;
     let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
         .arg("yq")
-        .args(["-n", "--split-exp", "\"/nonexistent-dir-715/out.yml\""])
+        .args(["-n", "--split-exp", &blocker.pattern])
         .arg("1")
         .stdin(Stdio::null())
         .output()?;
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
-        stderr.contains("failed to write --split-exp output file"),
+        stderr.contains("failed to create --split-exp directory"),
         "stderr: {stderr}"
     );
     Ok(())
@@ -25187,14 +25172,11 @@ fn test_split_exp_write_failure_reports_error_null_input() -> Result<()> {
 
 #[test]
 fn test_split_exp_write_failure_reports_error_yaml_input() -> Result<()> {
-    let (_stdout, stderr, code) = run_yq_split(
-        ".",
-        "a: 1\n",
-        &["--split-exp", "\"/nonexistent-dir-715/out.yml\""],
-    )?;
+    let blocker = blocked_split_path()?;
+    let (_stdout, stderr, code) = run_yq_split(".", "a: 1\n", &["--split-exp", &blocker.pattern])?;
     assert_ne!(code, 0);
     assert!(
-        stderr.contains("failed to write --split-exp output file"),
+        stderr.contains("failed to create --split-exp directory"),
         "stderr: {stderr}"
     );
     Ok(())
@@ -25202,19 +25184,15 @@ fn test_split_exp_write_failure_reports_error_yaml_input() -> Result<()> {
 
 #[test]
 fn test_split_exp_write_failure_reports_error_json_input() -> Result<()> {
+    let blocker = blocked_split_path()?;
     let (_stdout, stderr, code) = run_yq_split(
         ".",
         "{\"a\":1}",
-        &[
-            "--split-exp",
-            "\"/nonexistent-dir-715/out.yml\"",
-            "-p",
-            "json",
-        ],
+        &["--split-exp", &blocker.pattern, "-p", "json"],
     )?;
     assert_ne!(code, 0);
     assert!(
-        stderr.contains("failed to write --split-exp output file"),
+        stderr.contains("failed to create --split-exp directory"),
         "stderr: {stderr}"
     );
     Ok(())
