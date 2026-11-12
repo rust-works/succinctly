@@ -170969,23 +170969,30 @@ mod tests {
 
     /// #1021: `walk_impl` (backs `walk(f)`) had no depth guard at all
     /// before this issue.
+    ///
+    /// On the CLI's stack, as [`on_big_stack_3997`] runs its walk: `walk_impl` recurses once per
+    /// level of the 384-deep nest, and a coverage build's frame for it outgrew a test thread's
+    /// 2 MiB on an aarch64 Linux runner once #6659 widened the array handle it binds.
     #[test]
+    #[cfg(feature = "std")]
     fn walk_impl_panics_past_nesting_depth_limit_1021() {
-        use crate::jq::value::MAX_VALUE_TREE_DEPTH;
+        on_big_stack_3997(|| {
+            use crate::jq::value::MAX_VALUE_TREE_DEPTH;
 
-        let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
-        let (vals, control) = walk_impl::<JqSemantics>(&Expr::Identity, under, false);
-        assert!(control.is_none());
-        assert_eq!(vals.len(), 1);
+            let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
+            let (vals, control) = walk_impl::<JqSemantics>(&Expr::Identity, under, false);
+            assert!(control.is_none());
+            assert_eq!(vals.len(), 1);
 
-        let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            walk_impl::<JqSemantics>(&Expr::Identity, over, false)
-        }));
-        assert!(
-            result.is_err(),
-            "walk_impl should panic at MAX_VALUE_TREE_DEPTH"
-        );
+            let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                walk_impl::<JqSemantics>(&Expr::Identity, over, false)
+            }));
+            assert!(
+                result.is_err(),
+                "walk_impl should panic at MAX_VALUE_TREE_DEPTH"
+            );
+        });
     }
 
     /// #1023: `finish_recurse_walk` locks in `builtin_recurse_f`/
