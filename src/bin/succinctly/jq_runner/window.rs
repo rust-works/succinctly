@@ -74,6 +74,15 @@ const LOOKAHEAD_WINDOWS: usize = 8;
 /// The record separator of a `--seq` stream.
 const RS: u8 = 0x1e;
 
+/// Reads each RS byte of `bytes` as a space (#7082).
+fn blank_rs_bytes(bytes: &mut [u8]) {
+    for b in bytes {
+        if *b == RS {
+            *b = b' ';
+        }
+    }
+}
+
 /// A document span within a window's text: `(start, end)`, `end` exclusive.
 pub(super) type Span = (usize, usize);
 
@@ -331,14 +340,6 @@ impl WindowedFile {
             #[cfg(test)]
             bytes_read: 0,
         }
-    }
-
-    /// The same reader with each RS byte of the text read as a space (#7082): the plain JSON stream a
-    /// clean `--seq` stream is. (The run's readers are [`WindowedFiles`], which set the flag themselves.)
-    #[cfg(test)]
-    pub(super) fn blanking_rs(mut self) -> Self {
-        self.blank_rs = true;
-        self
     }
 
     /// The next window, or `None` when the file is done. A read that failed is returned here, after
@@ -626,11 +627,7 @@ impl WindowedFile {
             self.substitute_region(end);
         }
         if self.blank_rs {
-            for b in &mut self.buf[from..self.validated] {
-                if *b == RS {
-                    *b = b' ';
-                }
-            }
+            blank_rs_bytes(&mut self.buf[from..self.validated]);
         }
     }
 
@@ -1081,11 +1078,7 @@ impl Reread {
                         chunk.drain(..crate::front_matter::leading_bom_len(&chunk));
                     }
                     if self.blank_rs.get() {
-                        for b in &mut chunk {
-                            if *b == RS {
-                                *b = b' ';
-                            }
-                        }
+                        blank_rs_bytes(&mut chunk);
                     }
                     at += read as u64;
                     Some(chunk)
@@ -1363,9 +1356,14 @@ mod tests {
             .collect();
         let want = whole(&blanked);
         for &block in BLOCKS {
-            let mut reader = open(&text, block).blanking_rs();
+            // The reader the run uses, which opens each file's `WindowedFile` itself.
+            let mut file = tempfile::tempfile().expect("a temp file");
+            file.write_all(&text).expect("written");
+            file.rewind().expect("rewound");
+            let mut reader =
+                WindowedFiles::new(vec![(Rc::new(file), text.len() as u64)], block).blanking_rs();
             let (mut spans, mut seen) = (Vec::new(), Vec::new());
-            while let Some(window) = reader.next_window().expect("reads") {
+            while let Some((_, window)) = reader.next_window().expect("reads") {
                 assert!(!window.raw.contains(&0x1e), "block {block}");
                 for &(s, e) in &window.values {
                     spans.push((window.offset + s, window.offset + e));
