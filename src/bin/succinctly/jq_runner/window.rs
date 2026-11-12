@@ -742,7 +742,7 @@ mod tests {
             .next_window()
             .expect("the held bytes first")
             .expect("a window");
-        assert!(window.values.is_empty());
+        assert_eq!(window.values, Vec::<Span>::new());
         assert!(reader.next_window().is_err(), "then the read's error");
         assert!(reader.next_window().expect("and then done").is_none());
     }
