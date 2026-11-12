@@ -5233,10 +5233,10 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         let (files, mut raw_inputs, failures) = match seq_plain.take() {
             Some(prepared) => prepared,
             None => match windowed_plain_file(&args) {
-                Some((path, reader, again)) => {
+                Some((files, reader, again)) => {
                     windowed = Some(reader);
                     reread = Some(again);
-                    (vec![path], vec![Vec::new()], Vec::new())
+                    (files, vec![Vec::new()], Vec::new())
                 }
                 None => {
                     let files = get_input_files(&args);
@@ -11253,10 +11253,11 @@ fn lone_raw_windowed_file(args: &JqCommand, files: &[PathBuf]) -> Option<(std::f
 }
 
 /// The lone regular file the plain route reads a window at a time (#6920), opened, and the means
-/// to read it again for a fault's wording; or `None` for a run that is not one: stdin, a pipe or a
-/// directory, several files, a file too small to be worth it, and every flag that has the route read
-/// the stream whole (`--slurp`, `--validate`, `--seq`). A file that does not open here is left to the
-/// route that reports it.
+/// to read it again for a fault's wording, with the file list the run then has (the path, or none for a
+/// standard input that is a regular file, #7024); or `None` for a run that is not one: a pipe, a
+/// directory or a terminal, several files, a file too small to be worth it, and every flag that has the
+/// route read the stream whole (`--slurp`, `--validate`, `--seq`). A file that does not open here is left
+/// to the route that reports it.
 ///
 /// The path is judged by `stat`, which opens nothing: opening a named pipe (`<(cmd)`, `mkfifo`)
 /// pairs with its writer, and a handle dropped on the way to another route would take the
@@ -11265,16 +11266,24 @@ fn lone_raw_windowed_file(args: &JqCommand, files: &[PathBuf]) -> Option<(std::f
 /// some systems, so it is not read from its start, and the fault is worded from its start.
 fn windowed_plain_file(
     args: &JqCommand,
-) -> Option<(PathBuf, window::WindowedFile, std::rc::Rc<window::Reread>)> {
+) -> Option<(
+    Vec<PathBuf>,
+    window::WindowedFile,
+    std::rc::Rc<window::Reread>,
+)> {
     if args.slurp || args.validate || args.seq || args.null_input {
         return None;
     }
     let files = get_input_files(args);
+    if files.is_empty() {
+        let (reader, reread) = windowed_stdin_file()?;
+        return Some((files, reader, reread));
+    }
     let (path, meta) = lone_regular_file(&files, window::MIN_WINDOWED_FILE_BYTES)?;
     let file = std::fs::File::open(path).ok()?;
-    let reread = window::Reread::new(&file, meta.len(), path.clone()).ok()?;
+    let reread = window::Reread::new(&file, 0, meta.len(), path.clone()).ok()?;
     Some((
-        path.clone(),
+        files,
         window::WindowedFile::new(file, meta.len(), window::WINDOW_BYTES),
         std::rc::Rc::new(reread),
     ))
@@ -11296,6 +11305,66 @@ fn lone_regular_file(files: &[PathBuf], min_len: u64) -> Option<(&PathBuf, std::
     }
     let meta = std::fs::metadata(path).ok()?;
     (meta.is_file() && meta.len() >= min_len && !names_stdin(&meta)).then_some((path, meta))
+}
+
+/// Standard input when it is a regular file of 4 MiB or more left to read (`jq … < file`, #7024),
+/// read by a duplicate of descriptor 0 from the offset it is at: the stream is what is left of the file
+/// from there, and the fault's second read is by position over the same bytes, which a pipe cannot give.
+/// A terminal, a pipe, a device and a stdin something has already read from (its bytes are held for the
+/// route that reads them whole, [`STDIN_PUSHBACK`]) are left to that route.
+#[cfg(unix)]
+fn windowed_stdin_file() -> Option<(window::WindowedFile, std::rc::Rc<window::Reread>)> {
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::MetadataExt;
+    if STDIN_PUSHBACK.with(|slot| slot.borrow().is_some()) {
+        return None;
+    }
+    let file = std::fs::File::from(std::io::stdin().as_fd().try_clone_to_owned().ok()?);
+    // The windows are read a few at a time while the output is written, so a stdin that is also an
+    // output (`jq . <> f >&0`) would have its writes land where the next read comes from, and its
+    // bytes overwritten while still being read: the whole-file route had read all of it first.
+    let input = file.metadata().ok()?;
+    let is_input = |fd: std::os::fd::BorrowedFd<'_>| {
+        fd.try_clone_to_owned()
+            .ok()
+            .and_then(|fd| std::fs::File::from(fd).metadata().ok())
+            .is_some_and(|m| m.dev() == input.dev() && m.ino() == input.ino())
+    };
+    let shares_output = is_input(std::io::stdout().as_fd()) || is_input(std::io::stderr().as_fd());
+    windowed_regular_stdin(file, shares_output)
+}
+
+/// [`windowed_stdin_file`] over a handle on descriptor 0 (its half that does not read the process's own
+/// descriptors): `None` for anything but a regular file with 4 MiB or more left from the offset the handle
+/// is at, or one the run also writes to.
+#[cfg(unix)]
+fn windowed_regular_stdin(
+    mut file: std::fs::File,
+    shares_output: bool,
+) -> Option<(window::WindowedFile, std::rc::Rc<window::Reread>)> {
+    use std::io::Seek;
+    if shares_output {
+        return None;
+    }
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let start = file.stream_position().ok()?;
+    let len = meta.len().checked_sub(start)?;
+    if len < window::MIN_WINDOWED_FILE_BYTES {
+        return None;
+    }
+    let reread = window::Reread::new(&file, start, len, PathBuf::new()).ok()?;
+    Some((
+        window::WindowedFile::new(file, len, window::WINDOW_BYTES),
+        std::rc::Rc::new(reread),
+    ))
+}
+
+#[cfg(not(unix))]
+fn windowed_stdin_file() -> Option<(window::WindowedFile, std::rc::Rc<window::Reread>)> {
+    None
 }
 
 /// Report every failure in `failures`, and note that the run must now exit 2.
@@ -20240,7 +20309,8 @@ mod tests {
         assert!(!takes(&["jq", ".", &small]));
         assert!(!takes(&["jq", ".", &directory]));
         assert!(!takes(&["jq", ".", &missing]));
-        assert!(!takes(&["jq", "."]));
+        // (No path at all reads standard input, which is the test process's own: see
+        // `windowed_regular_stdin_takes_only_a_big_regular_file_7024`.)
         assert!(!takes(&["jq", ".", "-"]));
         assert!(!takes(&["jq", ".", &big, &also_big]));
         // A descriptor the run already holds, named by path: opening it again shares its offset on
@@ -20314,6 +20384,37 @@ mod tests {
                 "{shape}"
             );
         }
+    }
+
+    /// #7024: a standard input is windowed only when it is a regular file with 4 MiB or more left from its
+    /// offset that the run does not also write to.
+    #[cfg(unix)]
+    #[test]
+    fn windowed_regular_stdin_takes_only_a_big_regular_file_7024() {
+        use std::io::{Seek, SeekFrom, Write};
+        let min = window::MIN_WINDOWED_FILE_BYTES;
+        let at = |len: u64, offset: u64| {
+            let mut file = tempfile::tempfile().expect("tempfile");
+            file.set_len(len).expect("set_len");
+            file.seek(SeekFrom::Start(offset)).expect("seek");
+            file
+        };
+        assert!(windowed_regular_stdin(at(min, 0), false).is_some());
+        assert!(windowed_regular_stdin(at(min * 2, min), false).is_some());
+        // Under 4 MiB, or under it from the offset, or an offset past the end.
+        assert!(windowed_regular_stdin(at(min - 1, 0), false).is_none());
+        assert!(windowed_regular_stdin(at(min * 2, min + 1), false).is_none());
+        assert!(windowed_regular_stdin(at(10, 20), false).is_none());
+        // A file the run writes to as well.
+        assert!(windowed_regular_stdin(at(min, 0), true).is_none());
+        // A pipe is not a file.
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        writer.write_all(b"{}").expect("write");
+        assert!(windowed_regular_stdin(
+            std::fs::File::from(std::os::fd::OwnedFd::from(reader)),
+            false
+        )
+        .is_none());
     }
 
     /// #6451: [`lone_lazy_read`] admits only what the lone source's branch of [`get_inputs`] takes
