@@ -352,6 +352,145 @@ fn last_line_break(bytes: &[u8]) -> Option<usize> {
     None
 }
 
+/// A source read as whole lines, a window at a time (#7023): `-R`'s file, and the rest of a lone source
+/// the lazy `inputs` route started on the front of. A line is no more than a line break away from its
+/// end, so there is nothing to scan and nothing to carry across a window but the bytes after its last
+/// line break: the caller turns each window's lines into text and drops the window, and the memory held
+/// is a window and one line, not the source.
+pub(super) struct LineWindows {
+    reader: Box<dyn Read>,
+    /// How much of the source is left to read: a regular file's length when it was opened, less what
+    /// was read (a file that grows meanwhile is read as it was); `None` for one of unknown length,
+    /// which ends at a short read.
+    remaining: Option<u64>,
+    /// How much a read adds.
+    block: usize,
+    /// The bytes read after the last line break of the last window: the front of the next.
+    carried: Vec<u8>,
+    /// Nothing more is read: the end of the source, a read that failed, or the length it had.
+    eof: bool,
+}
+
+impl LineWindows {
+    /// `reader` is read from where it stands, up to `len` bytes if that is known; `carried` are bytes
+    /// already read from it, which come before them.
+    pub(super) fn new(
+        reader: Box<dyn Read>,
+        len: Option<u64>,
+        block: usize,
+        carried: Vec<u8>,
+    ) -> Self {
+        Self {
+            reader,
+            remaining: len,
+            block: block.max(1),
+            carried,
+            eof: false,
+        }
+    }
+
+    /// Whether the last window is the last: no byte is left to read or carried.
+    pub(super) fn finished(&self) -> bool {
+        self.eof && self.carried.is_empty()
+    }
+
+    /// The next window of at least `want` bytes (the size of a block when `None`): bytes that end at a
+    /// line break, or at the end of the source for the last, whose final line then has none. `None`
+    /// after the last. A read that fails ends the source there and is handed to `on_error`, once; the
+    /// line it cut is dropped, as no one knows its end.
+    pub(super) fn next_window(
+        &mut self,
+        want: Option<usize>,
+        on_error: impl FnOnce(&io::Error),
+    ) -> Option<Vec<u8>> {
+        let mut bytes = std::mem::take(&mut self.carried);
+        let mut ask = want.unwrap_or(self.block).max(1);
+        let mut on_error = Some(on_error);
+        loop {
+            if !self.eof {
+                let n = self.remaining.map_or(ask, |left| {
+                    ask.min(usize::try_from(left).unwrap_or(usize::MAX))
+                });
+                if n == 0 {
+                    self.eof = true;
+                }
+            }
+            if self.eof {
+                return (!bytes.is_empty()).then_some(bytes);
+            }
+            let n = self.remaining.map_or(ask, |left| {
+                ask.min(usize::try_from(left).unwrap_or(usize::MAX))
+            });
+            let before = bytes.len();
+            // patchcov: coverage tolerate reason="untestable: an allocation that fails"
+            if bytes.try_reserve(n).is_err() {
+                self.fail(
+                    &mut bytes,
+                    &mut on_error,
+                    &io::Error::from(io::ErrorKind::OutOfMemory),
+                );
+                continue;
+            }
+            // patchcov: coverage end
+            match self.reader.by_ref().take(n as u64).read_to_end(&mut bytes) {
+                // A short read is the end: a source of unknown length, or a file that shrank.
+                Ok(read) if read < n => self.eof = true,
+                Ok(read) => {
+                    if let Some(left) = self.remaining.as_mut() {
+                        *left -= read as u64;
+                        self.eof = *left == 0;
+                    }
+                }
+                Err(error) => {
+                    self.fail(&mut bytes, &mut on_error, &error);
+                    continue;
+                }
+            }
+            if !self.eof {
+                if let Some(at) = last_line_break(&bytes[before..]) {
+                    self.carried = bytes.split_off(before + at + 1);
+                    return Some(bytes);
+                }
+                // No line break in what was read: a long line, read on twice as far.
+                ask = ask.saturating_mul(2);
+            }
+        }
+    }
+
+    /// The rest of the source, from the bytes carried on: for a text that is not UTF-8, which is
+    /// substituted whole.
+    pub(super) fn take_rest(&mut self, on_error: impl FnOnce(&io::Error)) -> Vec<u8> {
+        let mut bytes = std::mem::take(&mut self.carried);
+        if !self.eof {
+            if let Err(error) = self.reader.read_to_end(&mut bytes) {
+                // patchcov: coverage tolerate reason="untestable: a read that fails after the source opened"
+                on_error(&error);
+                // patchcov: coverage end
+            }
+            self.eof = true;
+        }
+        bytes
+    }
+
+    /// A read failed: the source ends here, with the lines before the failure.
+    fn fail(
+        &mut self,
+        bytes: &mut Vec<u8>,
+        on_error: &mut Option<impl FnOnce(&io::Error)>,
+        error: &io::Error,
+    ) {
+        self.eof = true;
+        if let Some(report) = on_error.take() {
+            report(error);
+        }
+        let kept = bytes
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |at| at + 1);
+        bytes.truncate(kept);
+    }
+}
+
 /// The file read again, for the wording of a fault: through a duplicate of the handle the run reads
 /// by, so what it names is what the run read, whatever happened to the path since (#6920).
 pub(super) struct Reread {
@@ -760,6 +899,101 @@ mod tests {
 
     /// A read that fails is returned after the window the bytes before it make.
     #[cfg(unix)]
+    /// A reader that gives its bytes, then fails.
+    struct Failing(io::Cursor<Vec<u8>>);
+
+    impl Read for Failing {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.0.read(buf)? {
+                0 => Err(io::Error::other("boom")),
+                n => Ok(n),
+            }
+        }
+    }
+
+    /// #7023: the windows of a source are its lines, whole, in order, for any block and any length.
+    #[test]
+    fn line_windows_hand_out_the_sources_lines_whole() {
+        let texts: [&[u8]; 6] = [
+            b"",
+            b"a",
+            b"a\n",
+            b"\n\n\n",
+            b"one\ntwo\n\nthree",
+            b"a long line with no break at all, then\nshort\n",
+        ];
+        for text in texts {
+            for block in [1, 2, 3, 7, 64] {
+                for known in [true, false] {
+                    let mut windows = LineWindows::new(
+                        Box::new(io::Cursor::new(text.to_vec())),
+                        known.then_some(text.len() as u64),
+                        block,
+                        Vec::new(),
+                    );
+                    let mut all = Vec::new();
+                    while let Some(window) = windows.next_window(None, |_| panic!("no error")) {
+                        assert_ne!(window.len(), 0);
+                        let ends_at_break = window.last() == Some(&b'\n');
+                        all.extend_from_slice(&window);
+                        // Every window but the last ends at a line break.
+                        assert!(ends_at_break || windows.finished(), "{text:?} {block}");
+                    }
+                    assert_eq!(all, text, "{text:?} block {block} known {known}");
+                    assert!(windows.finished());
+                }
+            }
+        }
+    }
+
+    /// #7023: bytes carried in come first, `take_rest` is everything left, and a file that is
+    /// shorter than it was ends at what it held.
+    #[test]
+    fn line_windows_carry_and_take_the_rest() {
+        let mut windows = LineWindows::new(
+            Box::new(io::Cursor::new(b"cd\nef\ngh".to_vec())),
+            None,
+            2,
+            b"ab".to_vec(),
+        );
+        // The first read has no line break, so the second asks for twice as much.
+        assert_eq!(
+            windows.next_window(None, |_| ()),
+            Some(b"abcd\nef\n".to_vec())
+        );
+        assert!(!windows.finished());
+        assert_eq!(windows.take_rest(|_| ()), b"gh".to_vec());
+        assert!(windows.finished());
+        let mut shrunk = LineWindows::new(
+            Box::new(io::Cursor::new(b"x\ny\n".to_vec())),
+            Some(99),
+            3,
+            Vec::new(),
+        );
+        assert_eq!(shrunk.next_window(None, |_| ()), Some(b"x\n".to_vec()));
+        assert_eq!(shrunk.next_window(None, |_| ()), Some(b"y\n".to_vec()));
+        assert_eq!(shrunk.next_window(None, |_| ()), None);
+        assert!(shrunk.finished());
+    }
+
+    /// #7023: a read that fails ends the source with the lines before it, and the line it cut is not
+    /// handed out as if it were whole; the failure is reported once.
+    #[test]
+    fn line_windows_drop_the_line_a_failed_read_cut() {
+        let mut windows = LineWindows::new(
+            Box::new(Failing(io::Cursor::new(b"a\nb\ncut".to_vec()))),
+            None,
+            64,
+            Vec::new(),
+        );
+        let mut reported = 0;
+        let first = windows.next_window(None, |_| reported += 1);
+        assert_eq!(first, Some(b"a\nb\n".to_vec()));
+        assert_eq!(reported, 1);
+        assert_eq!(windows.next_window(None, |_| reported += 1), None);
+        assert_eq!(reported, 1);
+    }
+
     #[test]
     fn a_failed_read_is_reported_after_the_documents_before_it() {
         // A directory opens and fails to read: no bytes, and the error comes after the one window.

@@ -7277,13 +7277,13 @@ The endless-stream rows were measured on `main` @ 89a900ccc against `/usr/bin/jq
 
 On a file of many top-level values (NDJSON), `succinctly jq`'s peak memory grew linearly with the file, where jq 1.7.1's stays at a few MB whatever the size.
 Since [#6920](https://github.com/rust-works/succinctly/issues/6920) it no longer does for a plain filter (`-c .`, `-r .name`, `select(...)`: no `-n`, no `input`) over one regular file of 4 MiB or more, which is read a window at a time (below).
-Every other route that reads the input still holds all of it: programs that call `input`/`inputs`, `-R`, `--seq`, `--input-dsv`, `--stream-errors`, standard input, a pipe and several files.
+Since [#7023](https://github.com/rust-works/succinctly/issues/7023) it no longer does for a program that calls `input`/`inputs` over one regular file or standard input (the lazy route), nor for `-R` over one regular file of 4 MiB or more.
+Every other route that reads the input still holds all of it: `--seq`, `--input-dsv`, `--stream-errors`, standard input (for the plain filter and for `-R`), a pipe and several files.
 That is a known limitation, not supported at this stage: it is outside the three reasons ADR-0018 permits a divergence for, so it is a deferred gap and not a deliberate behaviour.
-It is tracked in [#7023](https://github.com/rust-works/succinctly/issues/7023) (the `inputs` and `-R` readers) and [#7024](https://github.com/rust-works/succinctly/issues/7024) (standard input and several files).
-The second shares its blocker with the stdin limitation above: what releases consumed text, given that a fault is worded by re-reading it, when the stream cannot be read again.
-The tables below were measured before #6920 and show every row as it was; the rows it fixed are the first three of each.
+It is tracked in [#7024](https://github.com/rust-works/succinctly/issues/7024) (standard input and several files).
+The tables below were measured before #6920 and #7023 and show every row as it was; the rows they fixed are the first five of each (`first(inputs)` was flat already).
 The slurp shapes (`-s`, `-R -s`) are not a gap: jq holds the input too, and succinctly's peak is 223 MiB for `-s length` at 100 MiB on x86_64 where jq's is 850 (and 208 for `-R -s length` against jq's 183).
-Standard input and `--seq` grow as the file route did (124 and 108 MiB at 100 MiB on x86_64), two files hold both (224 MiB), and `--stream` is flat (8.5 MiB).
+Standard input under a plain filter or `-R`, and `--seq`, grow as the file route did (124 and 108 MiB at 100 MiB on x86_64), two files hold both (224 MiB), and `--stream` is flat (8.5 MiB).
 At 100 MB succinctly is still faster than jq on every row below except `first(inputs)`, on both machines ([docs/compare/jq.md](../../compare/jq.md)): this is a memory trade, not a speed one.
 For a log too large to hold in memory that a fixed route does not cover, use jq, or split the file and run each part (`split -l`).
 
@@ -7312,16 +7312,38 @@ Apple M4 Pro, aarch64:
 | `-R length` (`ndjson_raw_lines`)          |   6.0 |   15.1 |   105.1 |
 | `-n 'first(inputs)\|.id'`                 |   6.2 |    6.3 |     6.3 |
 
+Since [#7023](https://github.com/rust-works/succinctly/issues/7023), peak resident set size in MiB of the rows it fixed, base `main` @ dcfa1da7e against the change, each from `/usr/bin/time` for one run under a 4 GiB cap on `terminus` and `johns-mac-mini`, over the same kind of files (`json generate <size> -p ndjson`):
+
+| query                                                 | x86_64 10 MiB | x86_64 100 MiB | aarch64 10 MiB | aarch64 100 MiB |
+|-------------------------------------------------------|--------------:|---------------:|---------------:|----------------:|
+| `-n 'reduce inputs as $x (0;.+$x.score)'` before      |          25.4 |          115.2 |           17.3 |           107.4 |
+| `-n 'reduce inputs as $x (0;.+$x.score)'` after       |          15.9 |           14.9 |           11.3 |            11.3 |
+| `-R 'select(length>9999)\|length'` before             |          22.2 |          112.2 |           15.4 |           105.4 |
+| `-R 'select(length>9999)\|length'` after              |          13.1 |           12.0 |            9.5 |            10.5 |
+| `-nR 'reduce inputs as $l (0;.+($l\|length))'` before |          24.8 |          114.8 |           16.7 |           106.6 |
+| `-nR 'reduce inputs as $l (0;.+($l\|length))'` after  |          15.5 |           14.4 |           11.6 |            10.7 |
+
+Output is identical on every row.
+Time, interleaved (`scripts/ab-cli.py`, 9 repetitions, the boxes idle but for one core on the M4 Pro, control against itself within 3%): at 100 MiB on the 7950X `reduce inputs` is 2.7% faster, `-R` with a filter 6.0% faster and `-nR` with `reduce inputs` 54% faster, and on the M4 Pro 0.4% slower, 2.0% faster and 60% faster; at 10 MiB 1.5% slower, 1.7% faster and 50% faster (7950X), and 0.8%, 3.1% and 57% faster (M4 Pro).
+At 1 MiB, where the whole file is one window and the change only adds a copy of it, `reduce inputs` is 5.3% slower on the 7950X (0.5 ms of 10.4) and 1.0% slower on the M4 Pro.
+The 50% to 60% on `-nR` is the whole-file route's cost that the window does not pay; it was not attributed further.
+`first(inputs)` reads 6% to 7% slower on the 7950X at every size (1.3 to 1.4 ms, a fixed 0.1 ms), where its control read up to 5.7% by itself.
+
 Each machine generated its own files, and the 1 MiB file is byte-identical to the one generated elsewhere.
 jq 1.7.1's peak at 100 MiB is 2.6 to 3.2 MiB in the committed [docs/compare/](../../compare/jq.md) reports, and the `main` @ 968a5fa84 runs there put succinctly at 109 to 128 MiB on the five rows that grow, which these runs match to within 5%.
 
 What holds the memory, from the slope between 10 and 100 MiB (MiB of peak per MiB of input) and from the code:
 
-- **The whole text, 1.00 per MiB, on every route that reads the file** (the plain route over a regular file has not since #6920).
-  `-n` programs that read `input`/`inputs` and `-R` slope at 1.00 on both machines.
-  The lone-source lazy route ([#6451](https://github.com/rust-works/succinctly/issues/6451)) reads only the first 256 KiB before the program starts, which is why `first(inputs)` is flat, but `read_lazy_rest` drains the rest of the file into the same buffer when the scan gets past it, and `LazyJsonInputs::text` is dropped only with the source's last document.
+- **The whole text, 1.00 per MiB, on every route that reads the file** (the plain route over a regular file has not since #6920, nor the `input`/`inputs` route and `-R` since #7023).
+  `-n` programs that read `input`/`inputs` and `-R` sloped at 1.00 on both machines.
+  The lone-source lazy route ([#6451](https://github.com/rust-works/succinctly/issues/6451)) reads only the first 256 KiB before the program starts, which is why `first(inputs)` is flat, and `read_lazy_rest` drained the rest of the file into the same buffer when the scan got past it, where `LazyJsonInputs::text` was dropped only with the source's last document.
   The documents are converted one at a time and dropped, and the output is written as it goes, so neither the values nor the results are retained.
-  Its `spans` are one chunk's (at most 512 KiB of text; `lazy_scan_on` clears them before each scan), so they add nothing that scales: the slope is the text alone.
+  Its `spans` are one chunk's (at most 512 KiB of text; `lazy_scan_on` clears them before each scan), so they add nothing that scales: the slope was the text alone.
+  Since #7023 that route reads the rest a window at a time (`LineWindows`, about 1 MiB, each ending at a line break) and drops the text the documents read are over, up to the line the producer's line counter stands in (`slide_lazy_window`).
+  What the four readers that needed text from before the point being read take instead: the line breaks dropped (`DroppedText`) are added to the end of the stream and to the lines a fault is counted from (`TailContext::lines_before`), the last document is kept as its first byte and its end (`LazyMore::last_span`), the position of the window in jq's input is its line, column 0, and a fault, or a byte that is not UTF-8, reads the rest of the source and from there the route is the whole-text one.
+  A fault is worded from the end of the last good document by the eager reader, which never needed the text before it, so the file is not read again and standard input is windowed as a file is.
+  `-R` reads whole lines in windows the same way, and settles the end of the stream from the lines its producer counted.
+  A container or string left open at a window's end (the splitter found no end to it) reads the source on, twice as far each time, so a stream whose last document never closes is read to its end once, as it was before.
 - **A span per document, about 0.15 per MiB more, on the plain route (fixed for a regular file by #6920).**
   `-c .`, `.name` and `select` sloped at 1.15 to 1.17.
   That route called `split_json_values` over the whole file before its loop, which returns a `Vec<(usize, usize)>` of every document's byte range: 16 bytes for each of the 993,416 records, 15.2 MiB.
