@@ -26804,12 +26804,10 @@ struct PropsStyle<'a> {
 /// Write the comment yq's properties writer puts above a property (#6922): its lines, each after a
 /// `#`, once a newline inside the text has had a space put after it (yq's
 /// `strings.ReplaceAll(comments, "\n", "\n ")`), and a blank line first unless nothing has been
-/// written yet. A comment of empty lines writes nothing (`magiconair/properties` skips it).
+/// written yet. `magiconair/properties` skips a comment whose every line is empty, which only the
+/// empty comment is once the spaces are in, and the walk keeps no empty comment.
 fn write_props_comment(comment: &str, out: &mut String) {
     let spaced = comment.replace('\n', "\n ");
-    if spaced.split('\n').all(str::is_empty) {
-        return;
-    }
     if !out.is_empty() {
         out.push('\n');
     }
@@ -143667,6 +143665,16 @@ mod tests {
                 assert_eq!(s, "-.inf\n");
             }
         );
+    }
+
+    #[test]
+    fn props_comment_lines_take_a_hash_and_a_space_after_each_break_6922() {
+        // yq's `strings.ReplaceAll(comments, "\n", "\n ")`: a lone break is the lines `` and ` `.
+        let mut out = String::new();
+        write_props_comment(" c", &mut out);
+        assert_eq!(out, "# c\n", "no blank line before the first");
+        write_props_comment("\n", &mut out);
+        assert_eq!(out, "# c\n\n#\n# \n");
     }
 
     #[test]

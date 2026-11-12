@@ -332,6 +332,8 @@ fn split_exp_reads_the_csv_separator_6922() -> Result<()> {
 /// it, and the first document's leading comments above the first property. Captured from yq
 /// v4.53.3.
 const COMMENT_ROWS: &[(&str, &[&str], &str)] = &[
+    ("a:\n  - 1 # c\n  - [2, 3] # d\n", &["--properties-array-brackets", "-o=props", "."], "# c\na[0] = 1\na[1][0] = 2\na[1][1] = 3\n"),
+    ("? [k]\n: v # c\nb: 1 # bc\n", &["-o=props", "."], "# bc\nb = 1\n"),
     ("# doc head\n\n# a head\na: 1 # a line\nb: # b key line\n  # x head\n  - x # x line\n  - y\nc:\n  d: \"p q\" # d line\n  # e head\n  e: 2\n", &["-o=props", "."], "# doc head\n\n# a head\n# a line\na = 1\n\n# x head x line\nb.0 = x\nb.1 = y\n\n# d line\nc.d = p q\n\n# e head\nc.e = 2\n"),
     ("# doc head\n\n# a head\na: 1 # a line\nc:\n  d: \"p q\" # d line\n  # e head\n  e: 2\n", &["-o=props", ".c"], "# d line\nd = p q\n\n# e head\ne = 2\n"),
     ("k: v\n# l1\n#l2\n#   l3\na: 1 #x\n", &["-o=props", "."], "k = v\n\n# l1\n# #l2\n# #   l3x\na = 1\n"),

@@ -5187,6 +5187,18 @@ mod object_keys_repeat_tests {
 
     /// #5519: JSON converts an object member by member; YAML does not, so a fold over a YAML
     /// document (reached through `succinctly jq`) keeps the whole conversion.
+    /// #6922: JSON has no comments, so the props encoder's comment walk never runs over it, and
+    /// these defaults answer as for a document without any.
+    #[test]
+    fn json_has_no_props_comments_6922() {
+        let json = br#"{"a": [1]}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        assert!(!root.document_has_comments());
+        assert_eq!(root.props_leading_content(), None);
+        assert_eq!(root.head_comment_raw_outside_header(), Vec::<String>::new());
+    }
+
     #[test]
     fn json_projects_object_members_5519() {
         use crate::yaml::YamlIndex;
