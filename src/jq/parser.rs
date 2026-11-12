@@ -2799,6 +2799,26 @@ impl<'a> Parser<'a> {
         self.pos += keyword.len();
     }
 
+    /// The argument of yq's `env(..)` and `strenv(..)` (#7070): yq's lexer reads the raw text up to
+    /// the first `)` as the variable name (`env("NAME")` names a variable with the quotes in it,
+    /// `strenv(a;b)` one called `a;b`, `strenv( X )` one with the blanks), and an empty argument is
+    /// invalid. Called just after the `(`; consumes the closing `)`.
+    fn parse_yq_env_name(&mut self) -> Result<String, ParseError> {
+        let start = self.pos;
+        while let Some(c) = self.peek() {
+            if c == ')' {
+                break;
+            }
+            self.next();
+        }
+        let name = self.input[start..self.pos].to_string();
+        if name.is_empty() {
+            return Err(ParseError::new("expected identifier, found ')'", start));
+        }
+        self.expect(')')?;
+        Ok(name)
+    }
+
     /// Parse an identifier (field name or keyword).
     fn parse_ident(&mut self) -> Result<String, ParseError> {
         let start = self.pos;
@@ -9450,6 +9470,9 @@ impl<'a> Parser<'a> {
             // Check for env(VAR) syntax - yq style
             if self.peek() == Some('(') {
                 self.next(); // consume '('
+                if self.mode == ParserMode::Yq {
+                    return Ok(Some(Builtin::EnvObject(self.parse_yq_env_name()?)));
+                }
                 self.skip_ws();
                 // Parse identifier (unquoted variable name). Real jq's own
                 // `env` builtin is arity-0 only, so `env(<anything>)` --
@@ -9517,6 +9540,9 @@ impl<'a> Parser<'a> {
                 return early;
             }
             self.next();
+            if self.mode == ParserMode::Yq {
+                return Ok(Some(Builtin::StrEnv(self.parse_yq_env_name()?)));
+            }
             self.skip_ws();
             // #2807: `strenv`'s argument is a bare identifier, not an
             // `Expr`, so there is nothing to hand
@@ -9529,7 +9555,7 @@ impl<'a> Parser<'a> {
             // as everywhere else in this family -- `strenv` is a real yq
             // builtin there, and real yq's own leniency for these shapes
             // (both answer `""` in v4.53.3) is a separate, pre-existing
-            // divergence.
+            // divergence -- closed in yq mode by #7070, which reads the raw text up to `)`.
             //
             // **Empty parens are excluded** (review): a rewind hands
             // `strenv()` to `parse_func_call_or_error`, which reads it as a

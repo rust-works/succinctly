@@ -5009,10 +5009,13 @@ fn test_yq_mode_wrong_arity_checkpoints_unaffected_by_2391() -> Result<()> {
     );
     assert_eq!(code, 1, "stderr: {stderr}");
 
+    // #7070: yq's lexer takes everything up to the `)` as `env`'s variable name, so a `;` is part
+    // of the name (`FOO;BAR`, unset) and the parse succeeds; the checkpoint this once pinned is
+    // jq mode's now.
     let (out, stderr, code) = run_yq_stdin_with_stderr("env(FOO;BAR)", "a: 1\n", &[])?;
     assert_eq!(out, "", "stderr: {stderr}");
     assert!(
-        stderr.contains("parse error: parse error at position 7: expected ')', found ';'"),
+        stderr.contains("value for env variable 'FOO;BAR' not provided in env()"),
         "stderr: {stderr}"
     );
     assert_eq!(code, 1, "stderr: {stderr}");
