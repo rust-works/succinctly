@@ -1576,7 +1576,8 @@ pub struct YqCommand {
     /// yq's `-c`/`--yaml-compact-seq-indent`: a block sequence under a mapping key is not
     /// indented past the key by a whole step, but by the step less two columns (`-I 2`: the items
     /// sit at the key's column, `-I 4`: two columns in). YAML output only; JSON is unchanged
-    /// (#7025). Like every boolean flag of yq's it takes its value after `=` only.
+    /// (#7025). Like every boolean flag of yq's it takes its value after `=` only. Not jq's `-c`
+    /// (`--compact-output`): it does not compact anything.
     #[arg(
         short = 'c',
         long = "yaml-compact-seq-indent",

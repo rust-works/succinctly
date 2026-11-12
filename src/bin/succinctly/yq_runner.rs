@@ -10971,10 +10971,12 @@ fn emit_yaml_value_at_depth(
                         // key is at (measured against yq at `-I 2`, 3, 4 and 6 over ten nestings
                         // of mappings and sequences).
                         let val_indent = compact_child_indent(indent, &config.indent_str);
-                        let val_indent = if config.compact_seq_indent
+                        // `--tab` is succinctly's own flag (yq has none), so there is nothing to
+                        // compare a compact tab layout with: it stays as it was.
+                        let compact_here = config.compact_seq_indent
                             && !config.indent_str.starts_with('\t')
-                            && matches!(v, OwnedValue::Array(a) if !a.is_empty())
-                        {
+                            && matches!(v, OwnedValue::Array(a) if !a.is_empty());
+                        let val_indent = if compact_here {
                             val_indent[..val_indent.len().saturating_sub(2)].to_string()
                         } else {
                             val_indent
@@ -11155,15 +11157,15 @@ fn emit_yaml_value_at_depth(
                         // #7025 (`-c` at `-I 2`): the foot comment of the sequence's last item is
                         // written at the key's own column, where yq puts a blank line before the
                         // next entry, as it does after an entry's own foot.
-                        let compact_foot = config.compact_seq_indent
+                        let compact_foot = compact_here
                             && val_indent.len() == indent.len()
-                            && matches!(v, OwnedValue::Array(a) if !a.is_empty()
-                                && field_comments.style() != "flow"
-                                && !field_comments
-                                    .at_index(a.len() - 1)
-                                    .meta()
-                                    .foot_comment()
-                                    .is_empty());
+                            && matches!(v, OwnedValue::Array(a)
+                                if field_comments.style() != "flow"
+                                    && !field_comments
+                                        .at_index(a.len() - 1)
+                                        .meta()
+                                        .foot_comment()
+                                        .is_empty());
                         (rendered, had_foot || compact_foot)
                     })
                     .collect();
@@ -12813,7 +12815,9 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     // rather than falling back to the DOM/IndexMap path that would collapse
     // duplicate mapping keys (#442, #748, #809).
     // `-c` (#7025) is written by the DOM emitter alone: none of the cursor streamers knows a
-    // sequence indented by less than a whole step.
+    // sequence indented by less than a whole step, so a `-c` run builds the document where the
+    // same filter streams it. The name says what the gate was written for; this is the second
+    // flag that keeps a run off the streamers.
     let can_stream_pretty_or_colored = !args.pretty_print && !args.yaml_compact_seq_indent;
     // `--ascii-output` no longer appears here (#1700). It used to gate the
     // whole disjunction (#1693) because no M2 JSON streamer could escape

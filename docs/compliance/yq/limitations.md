@@ -7799,8 +7799,8 @@ Matching either needs a string that can hold bytes that are not UTF-8, or the su
 
 ## The argument-level flags of [#7025](https://github.com/rust-works/succinctly/issues/7025) answer as yq does, with these differences
 
-`--expression`, `--split-exp-file`, `-f`, `-v`/`--verbose`, `--security-disable-env-ops`, `--security-disable-file-ops` and `--string-interpolation` are yq's, and `tests/yq_cli/i7025.rs` and `tests/yq_cli/i7025_string_interpolation.rs` pin the rows captured from yq v4.53.3.
-[#7025](https://github.com/rust-works/succinctly/issues/7025) stays open for `--security-enable-system-operator` and `system`, `-c`, `--header-preprocess=false`, `--yaml-fix-merge-anchor-to-spec` and `--debug-node-info`.
+`--expression`, `--split-exp-file`, `-f`, `-v`/`--verbose`, `--security-disable-env-ops`, `--security-disable-file-ops`, `--string-interpolation` and `-c`/`--yaml-compact-seq-indent` are yq's, and `tests/yq_cli/i7025.rs`, `tests/yq_cli/i7025_string_interpolation.rs` and `tests/yq_cli/i7025_compact_seq_indent.rs` pin the rows captured from yq v4.53.3.
+[#7025](https://github.com/rust-works/succinctly/issues/7025) stays open for `--security-enable-system-operator` and `system`, `--header-preprocess=false`, `--yaml-fix-merge-anchor-to-spec` and `--debug-node-info`.
 
 - **`--security-disable-env-ops` and `--security-disable-file-ops` refuse an operator when it runs, where yq refuses it when its handler is called.**
   `select(false) | strenv(X)`, `.zz[] | strenv(X)` and `.a | select(. == 2) | strenv(X)` fail with `env operations have been disabled` in yq, because the handler is called with an empty context.
@@ -7817,6 +7817,15 @@ Matching either needs a string that can hold bytes that are not UTF-8, or the su
 - **`--string-interpolation=false` is one setting for the whole run, as in yq.**
   A `\(` in a string literal stays the two characters, in the program and in an `eval(..)` text, and the backslash pair in front of a `(` is left alone (`"\\(1)"` is two backslashes).
   A string inside an interpolation slot is a lexer error in yq whatever the flag says, and here too.
+- **`-c` writes the whole run through the emitter that keeps comments, anchors and styles, so a large input does not stream.**
+  The cursor streamers do not know a sequence indented by less than a whole step, so a `-c` run takes the route `-P` takes (`can_stream_pretty_or_colored`) and builds the document, where the same filter without it streams it.
+  The cost is memory and time in proportion to the document; it has not been measured.
+  What that route writes differently from the streamers (the merge key `<<` listed as its merged members, an explicit `? key`) is the route's own and shows under `-c` too.
+  Over 588 YAML files of the repository at `-I 2`, 3, 4 and 6 no difference comes from the flag itself.
+- **`-c` is yq's flag, which is `--compact-output` in `succinctly jq`.**
+  `syq -c` changes the indent of block sequences, and does not compact JSON output (`-o json` ignores it, as in yq).
+- **`--tab` with `-c` is not compacted.**
+  yq has no `--tab`, so there is no reference for it.
 - **A missing `--split-exp-file` is worded differently.**
   yq says `Error: open nope.exp: no such file or directory`; this says `failed to read split expression file: nope.exp`, with the cause.
   Both exit 1 and write nothing.
