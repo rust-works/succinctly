@@ -618,7 +618,8 @@ fn with_update_effect(update: &Expr) -> Expr {
         Expr::Comma(items) => Expr::pipe(items.iter().map(with_update_effect).collect()),
         Expr::Pipe(stages) => with_update_pipe_effect(stages),
         // `SRC as $v | rest`: the binding is kept, and `rest` contributes its changes (`.b as $v |
-        // .z = $v` writes `z`); SRC itself is evaluated, so its errors still count.
+        // .z = $v` writes `z`); SRC itself is evaluated, so its errors still count. Only the first
+        // value's writes are kept, where yq keeps each value's (#7094).
         Expr::As { expr, var, body } => Expr::As {
             expr: expr.clone(),
             var: var.clone(),
@@ -677,7 +678,9 @@ fn update_body_effect(body: &Expr) -> Option<Expr> {
     }
 }
 
-/// Whether `expr` answers the node it runs on, once its in-place writes are done: `.`, an
+/// Whether `expr` answers the node it runs on, once its in-place writes are done (the first output
+/// `|=` keeps, so unlike [`is_with_write_expr`] it admits `.` and reads only a comma's first
+/// branch): `.`, an
 /// assignment or a delete, alone or in a group, a pipe or behind a binding. `allow_empty` also
 /// admits `select`, which answers nothing when it fails.
 fn answers_the_node(expr: &Expr, allow_empty: bool) -> bool {
@@ -750,6 +753,108 @@ fn with_update_pipe_effect(stages: &[Expr]) -> Expr {
     }
 }
 
+/// Whether `expr` names one node by fixed steps (`.a`, `.a.b`, `.l[3]`, an optional `.a?`, in
+/// parentheses or not): the left operands of a
+/// `//` target that [`yq_alternative_target`] creates and tests.
+fn is_single_static_path(expr: &Expr) -> bool {
+    match expr {
+        Expr::Field(_) | Expr::Index { .. } => true,
+        Expr::Paren(inner) | Expr::Optional(inner) => is_single_static_path(inner),
+        Expr::Pipe(stages) => !stages.is_empty() && stages.iter().all(is_single_static_path),
+        _ => false,
+    }
+}
+
+/// The operands of a `//` chain in order, `(a // b) // c` and `a // (b // c)` alike: which
+/// operand a target names does not depend on the grouping.
+fn alternative_operands<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
+    match expr {
+        Expr::Paren(inner) => alternative_operands(inner, out),
+        Expr::Alternative(left, right) => {
+            alternative_operands(left, out);
+            alternative_operands(right, out);
+        }
+        operand => out.push(operand),
+    }
+}
+
+/// yq's update-or-create idiom (#7068): an update whose target is a `//` chain of operands that
+/// each name one node by fixed steps (`.a`, `.a.b`, `.l[3]`), ending in an operand that writes
+/// (`(.a // (.a = 0)) += 1`). The answer is the writes to make first and the target to update
+/// after them, so the update's own value is written once; `None` for any other target.
+///
+/// yq evaluates the target in the document the update writes to: reading `L` creates it as `null`
+/// when it is absent, `L`'s node is the target when it is truthy, and otherwise the next operand
+/// is evaluated in that same document, so the write changes `L`'s node, which `//` then tests
+/// again: the target is `L`'s node if it is truthy now, and the document otherwise (an
+/// assignment's value). So the idiom creates `a: 1`, and `(.a // (.c.d = 0)) += 1` adds `1` to
+/// the document, an error. Measured against yq v4.53.3.
+///
+/// The writes are, for each `L` in turn, `(L |= .) | ([L] | .[0] | not | not) as $t |
+/// select($t | not) |= NEXT`, ending in the last operand's writes: `L |= .` creates `L`, the next
+/// operand runs only while every `L` before it is falsy (`[L] | .[0]` reads an `L` that yields
+/// nothing, `.a.b` through a scalar `a`, as `null`), and the conditional writes are
+/// `with(select(..); ..)`, which keep comments and style where an `if` would not. The target is
+/// `if L0 then L0 elif L1 then L1 ... else . end`. A chain that ends in anything else (`(.a // .z)
+/// = 1`) keeps the path resolver's reading, which does not create `a`: see `limitations.md`.
+fn yq_alternative_target(target: &Expr) -> Option<(Expr, Expr)> {
+    let mut operands = Vec::new();
+    alternative_operands(target, &mut operands);
+    let lefts = operands
+        .iter()
+        .take(operands.len() - 1)
+        .take_while(|operand| is_single_static_path(operand))
+        .count();
+    if lefts == 0 || !is_with_write_expr(operands[lefts]) {
+        return None;
+    }
+    // `[L] | .[0]`: an `L` that yields nothing is falsy, as `null` is.
+    let first = |left: &Expr| Expr::pipe(vec![Expr::Array(Box::new(left.clone())), Expr::index(0)]);
+    let writes = operands[..lefts].iter().enumerate().rev().fold(
+        with_update_effect(operands[lefts]),
+        |next, (depth, left)| {
+            // The variable's name cannot be written in a filter.
+            let var = format!("// left {depth}");
+            Expr::pipe(vec![
+                Expr::Update {
+                    path: Box::new((*left).clone()),
+                    filter: Box::new(Expr::Identity),
+                },
+                Expr::As {
+                    expr: Box::new(Expr::pipe(vec![first(left), Expr::Not, Expr::Not])),
+                    var: var.clone(),
+                    body: Box::new(Expr::Update {
+                        path: Box::new(Expr::Builtin(Builtin::Select(Box::new(Expr::pipe(vec![
+                            Expr::Var(var),
+                            Expr::Not,
+                        ]))))),
+                        filter: Box::new(next),
+                    }),
+                },
+            ])
+        },
+    );
+    // The document is the target once every left operand is falsy, unless the write left it falsy
+    // too, when the operands after the write decide (`. // REST`).
+    let after_write = operands[lefts + 1..]
+        .iter()
+        .rev()
+        .map(|operand| (*operand).clone())
+        .reduce(|rest, operand| Expr::alternative(operand, rest))
+        .map_or(Expr::Identity, |rest| {
+            Expr::alternative(Expr::Identity, rest)
+        });
+    let target = operands[..lefts]
+        .iter()
+        .rev()
+        .fold(after_write, |otherwise, left| Expr::If {
+            cond: Box::new(first(left)),
+            then_branch: Box::new((*left).clone()),
+            else_branch: Box::new(otherwise),
+        });
+    Some((writes, target))
+}
+
 /// Whether `expr` only walks to nodes of the document (`.b`, `.[0]`, `.[]`, `.a.b`, `.a?`).
 fn is_navigation_expr(expr: &Expr) -> bool {
     match expr {
@@ -762,7 +867,9 @@ fn is_navigation_expr(expr: &Expr) -> bool {
 }
 
 /// Whether `expr` is an in-place write of a `with` update: an assignment (`=`, `|=`, `op=`, `//=`)
-/// or a delete (`del`, `delpaths`, #6840), alone or comma'd or piped with others. Not
+/// or a delete (`del`, `delpaths`, #6840), alone or comma'd or piped with others, or behind a
+/// binding (#7068). It reads every branch of a comma, where [`answers_the_node`] reads the first.
+/// Not
 /// `eval::is_assignment_expr`, whose answer serves the evaluator's own analyses and so has to
 /// stay what they need.
 fn is_with_write_expr(expr: &Expr) -> bool {
@@ -774,6 +881,9 @@ fn is_with_write_expr(expr: &Expr) -> bool {
         // #6840: `del` and `delpaths` write in place like an assignment (see `with_update_effect`).
         Expr::Builtin(Builtin::Del(_) | Builtin::DelPaths(_)) => true,
         Expr::Paren(inner) => is_with_write_expr(inner),
+        // A binding around writes writes in place (`(.x as $v | .y = $v) | .z = 2` writes `y`
+        // and `z`, as yq does; #7068's rewritten `//` updates are such bindings).
+        Expr::As { body, .. } => is_with_write_expr(body),
         Expr::Comma(items) => !items.is_empty() && items.iter().all(is_with_write_expr),
         Expr::Pipe(stages) => !stages.is_empty() && stages.iter().all(is_with_write_expr),
         _ => false,
@@ -11149,16 +11259,43 @@ impl<'a> Parser<'a> {
                 is_update,
             };
         }
-        if is_update {
-            Expr::Update {
-                path: Box::new(target),
-                filter: Box::new(value),
+        let build = |path: Expr, value: Expr| {
+            if is_update {
+                Expr::Update {
+                    path: Box::new(path),
+                    filter: Box::new(value),
+                }
+            } else {
+                Expr::Assign {
+                    path: Box::new(path),
+                    value: Box::new(value),
+                }
             }
-        } else {
-            Expr::Assign {
-                path: Box::new(target),
-                value: Box::new(value),
-            }
+        };
+        match (self.mode == ParserMode::Yq)
+            .then(|| yq_alternative_target(&target))
+            .flatten()
+        {
+            Some((writes, target)) => Expr::pipe(vec![writes, build(target, value)]),
+            None => build(target, value),
+        }
+    }
+
+    /// An `op=` update of `left` (`+=`, `*=`, ...), with yq's update-or-create idiom read as yq does
+    /// (#7068).
+    fn compound_assign(&self, op: AssignOp, left: Expr, value: Expr) -> Expr {
+        let target = Self::fold_sum_or_merge_key(left);
+        let build = |path: Expr| Expr::CompoundAssign {
+            op,
+            path: Box::new(path),
+            value: Box::new(value),
+        };
+        match (self.mode == ParserMode::Yq)
+            .then(|| yq_alternative_target(&target))
+            .flatten()
+        {
+            Some((writes, target)) => Expr::pipe(vec![writes, build(target)]),
+            None => build(target),
         }
     }
 
@@ -11239,11 +11376,7 @@ impl<'a> Parser<'a> {
             };
             self.skip_ws();
             let value = self.parse_assignment_operand()?;
-            return Ok(Expr::CompoundAssign {
-                op: AssignOp::Mul(flags),
-                path: Box::new(Self::fold_sum_or_merge_key(left)),
-                value: Box::new(value),
-            });
+            return Ok(self.compound_assign(AssignOp::Mul(flags), left, value));
         }
 
         // Check for compound assignments: +=, -=, /=, %=
@@ -11263,11 +11396,7 @@ impl<'a> Parser<'a> {
                 self.next(); // =
                 self.skip_ws();
                 let value = self.parse_assignment_operand()?;
-                return Ok(Expr::CompoundAssign {
-                    op,
-                    path: Box::new(Self::fold_sum_or_merge_key(left)),
-                    value: Box::new(value),
-                });
+                return Ok(self.compound_assign(op, left, value));
             }
         }
 

@@ -3861,6 +3861,20 @@ prints `1`, `null` (it prints `null`, `1`, `null` for `(.zz, .[]?)` with no `//`
 document with no `a`, ...) plus an unrelated `map` over a mapping; and `del((.a, .b) // .zz)`, where
 yq deletes the key it just created and loses `a` as well (`{"c":2}`; here `{"a":null,"c":2}`).
 
+yq's update-or-create idiom (`alternative-default-value.md`) is read as yq reads it since #7068: an update whose target is a `//` chain of operands that each name one node by fixed steps (`.a`, `.a.b`, `.l[3]`), ending in an operand that writes, applies that write to the document the update works on and then tests the left operands again.
+`(.a // (.a = 0)) += 1` creates `a: 1`, and `(.a // (.c.d = 0)) += 1` adds `1` to the document, the error yq raises.
+The parser writes it as the writes, `(L |= .) | ([L] | .[0] | not | not) as $t | select($t | not) |= NEXT` for each left operand, followed by the update of `if L0 then L0 elif ... else . end`, so the update's value is written once and comments, anchors and flow style are kept as for any write (`yq_alternative_target`).
+Still differing:
+
+- A chain that ends in anything but a write does not create its left operands: `(.a // .z) += 1` leaves `a: null` beside `z: 1` in yq, and only `z: 1` here; `(.a // "x") = 1` writes `a: null` in yq and nothing here.
+- A `//` inside a larger target (`(.a // (.a = 0)).y = 1`, `((.a // .z) | .y) = 1`) keeps the path resolver's reading.
+- In value position the write is not seen by the left operand: `.a // (.a = 5)` is the document with `a: 5` here and `5` in yq, which reads `.a` again after the write; yq does so only where its context is editable (a pipe stage), and `(.a // (.a = 0)) * 2` multiplies the document in both.
+  An idiom bound as a value (`((.a // (.a = 0)) += 1) as $v | $v`) is the updated document here, where yq, reading the binding's source in a read-only context, raises the error of adding `1` to the document.
+- A comma behind a binding in the last operand (`(.a // (.x as $v | .a = 0, .b = 1)) += 1`) targets the left node once here; yq gets it twice, one for each output of the comma, and adds `1` twice (`a: 2`).
+- A binding over several values in the last operand (`(.a // (.x[] as $v | .a = $v)) += 10` over `x: [1, 2]`) writes the first value and targets the left node once (`a: 11`); yq writes each value and targets the node once per value (`a: 22`).
+- A last operand that makes the document `null` (`(.a // (. = null) // .z) += 1`) is followed here to the operands after it (`z: 1`), where yq adds `1` to the null document, an error.
+- `with(PATH; SRC as $v | WRITES)` over a source of several values keeps the writes of the first value, where yq applies the writes of each value in turn to the same node (`with(.k; .x[] as $v | .y += $v)` over `x: [1, 2]` is `y: 1` here, `y: 3` in yq); a binding at the head of such a pipe (`(SRC as $v | WRITE) | WRITE`) keeps its writes since #7068, where they were discarded (#7094).
+
 ### A pipe's empty context list — a stage that builds a node emits once (#6943)
 
 The rule of the next section is not only an operand's.
