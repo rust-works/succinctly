@@ -1532,7 +1532,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             && self.current_type == Some(NodeType::SequenceItem)
             && self.pending_block.column > next_column
             // yq drops the block before a flow collection item, which succinctly does not reproduce.
-            && !self.opens_flow_collection(self.pos)
+            && !self.opens_flow_collection(self.pos, false)
     }
 
     /// The pending head lines that start at or before `pos`: the run's head, since lines are
@@ -1542,19 +1542,24 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             .partition_point(|&(start, _)| start as usize <= pos)
     }
 
-    /// Whether the first node from `from` on is a flow collection, or a block sequence whose first
-    /// items open one (`- [1]`, `- - {a: 1}`): yq drops a comment block it would make that node's
-    /// foot (#5053, #7044). Blank lines, indentation and `- ` indicators are passed over; a key
-    /// written as a flow collection (`[1]: 2`) reads as one too.
-    fn opens_flow_collection(&self, from: usize) -> bool {
+    /// Whether the next node from `from` on is a flow collection (`[` or `{`): yq drops a comment
+    /// block it would make that node's foot (#5053, #7044). Indentation is passed over. With
+    /// `past_lines`, so are line breaks, `- ` indicators and node properties (`&x`, `!!seq`), so a
+    /// value written on a later line, a sequence whose first item is a flow collection (`- [1]`), a
+    /// propertied one (`&x [1]`) and a key written as one (`[1]: 2`) all read as one; without it the
+    /// byte after the indentation decides, as #5053's next-item check has always read it.
+    fn opens_flow_collection(&self, from: usize, past_lines: bool) -> bool {
+        let separates = |b: Option<&u8>| matches!(b, None | Some(b' ' | b'\t' | b'\n' | b'\r'));
         let mut at = from.min(self.input.len());
         loop {
             match self.input.get(at) {
-                Some(b' ' | b'\t' | b'\n' | b'\r') => at += 1,
-                Some(b'-')
-                    if matches!(self.input.get(at + 1), Some(b' ' | b'\t' | b'\n' | b'\r')) =>
-                {
-                    at += 1;
+                Some(b' ' | b'\t') => at += 1,
+                Some(b'\n' | b'\r') if past_lines => at += 1,
+                Some(b'-') if past_lines && separates(self.input.get(at + 1)) => at += 1,
+                Some(b'&' | b'!') if past_lines => {
+                    while !separates(self.input.get(at)) {
+                        at += 1;
+                    }
                 }
                 Some(b'[' | b'{') => return true,
                 _ => return false,
@@ -5100,14 +5105,14 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             return;
         }
         let last_end = lines[lines.len() - 1].1 as usize;
+        if self.opens_flow_collection(last_end, true) {
+            return;
+        }
         // The value's first byte: past the blank lines and indentation after the last comment line.
         let content = self.input[last_end..]
             .iter()
             .position(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
             .map_or(self.input.len(), |offset| last_end + offset);
-        if self.opens_flow_collection(last_end) {
-            return;
-        }
         let gap = (0..lines.len()).find(|&i| {
             let next_start = lines
                 .get(i + 1)
@@ -5173,7 +5178,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // this dash and the following content. Those sit *inside*
             // the deferred value and belong to its first node
             // (`-\n  # c\n  - x\n` heads `.[0][0]`, measured), so only
-            // the lines already pending here are this value's own head.
+            // the lines already pending here are this value's own head --
+            // except a first block a blank line follows, which is that
+            // node's foot (#7044, `defer_first_block_below_bare_dash`).
             let value_is_null = self
                 .next_line_settles_value_is_null(indent)
                 .unwrap_or_else(|| self.following_value_is_null(indent));
@@ -5205,10 +5212,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.saw_head_foot_node = true;
             } else {
                 // Once a node has opened before this item, in this document or an earlier one (a
-                // null item included), a first block below the dash may be the value's foot (#7044).
-                let follows_a_node = self.last_head_foot_bp.is_some()
-                    || self.saw_head_foot_node
-                    || self.document_boundary_fallback_bp.is_some();
+                // null item included), a first block below the dash may be the value's foot
+                // (#7044). `saw_head_foot_node` is that, stream-wide: it is set wherever a node opens
+                // and never reset.
+                let follows_a_node = self.saw_head_foot_node;
                 if trailing.is_none() && follows_a_node {
                     self.defer_first_block_below_bare_dash(dash_line_end);
                 }

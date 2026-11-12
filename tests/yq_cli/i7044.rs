@@ -82,3 +82,48 @@ fn a_block_and_a_blank_line_below_a_bare_dash_is_the_values_foot_7044() -> Resul
     }
     Ok(())
 }
+
+/// Before a flow collection yq drops the block, which is not reproduced: the block stays the first
+/// node's head, as before #7044 (`docs/compliance/yq/limitations.md`). (document, succinctly's
+/// `-o=json -I0` of [`COMMENTS`]; yq's answer is in each comment.)
+const FLOW_RESIDUAL_ROWS: &[(&str, &str)] = &[
+    // a flow sequence: yq drops the block ("[[\"\",\"\"],[\"\",\"\"],[\"\",\"\"],[\"\",\"\"],[]]")
+    (
+        "- 1\n-\n  # c\n\n  [1]\n",
+        "[[\"\",\"\"],[\"\",\"\"],[\"c\\n\",\"\"],[\"\",\"\"],[]]\n",
+    ),
+    // a flow mapping: yq drops the block ("[[\"\",\"\"],[\"\",\"\"],[\"\",\"\"],[\"\",\"\"],[\"\",\"\"]]")
+    (
+        "- 1\n-\n  # c\n\n  {a: 1}\n",
+        "[[\"\",\"\"],[\"\",\"\"],[\"c\\n\",\"\"],[\"\",\"\"],[\"\",\"\"]]\n",
+    ),
+    // a sequence whose first item is one: yq drops the block ("[[\"\",\"\"],[\"\",\"\"],[\"\",\"\"],[\"\",\"\"],[\"\",\"\"],[]]")
+    (
+        "- 1\n-\n  # c\n\n  - [1]\n",
+        "[[\"\",\"\"],[\"\",\"\"],[\"\",\"\"],[\"c\\n\",\"\"],[\"\",\"\"],[]]\n",
+    ),
+    // an anchored one: yq drops the block ("[[\"\",\"\"],[\"\",\"\"],[\"\",\"\"],[\"\",\"\"],[]]")
+    (
+        "- 1\n-\n  # c\n\n  &x [1]\n",
+        "[[\"\",\"\"],[\"\",\"\"],[\"c\",\"\"],[\"\",\"\"],[]]\n",
+    ),
+    // a tagged one: yq drops the block ("[[\"\",\"\"],[\"\",\"\"],[\"\",\"\"],[\"\",\"\"],[\"\",\"\"]]")
+    (
+        "- 1\n-\n  # c\n\n  !!map {a: 1}\n",
+        "[[\"\",\"\"],[\"\",\"\"],[\"c\",\"\"],[\"\",\"\"],[\"\",\"\"]]\n",
+    ),
+    // a key written as one: yq drops the block ("[[\"\",\"\"],[\"\",\"\"],[\"\",\"\"],[\"\",\"\"],[\"\",\"\"]]")
+    (
+        "- 1\n-\n  # c\n\n  [1]: 2\n",
+        "[[\"\",\"\"],[\"\",\"\"],[\"\",\"\"],[\"\",\"\"],[\"c\\n\",\"\"]]\n",
+    ),
+];
+
+#[test]
+fn a_block_before_a_flow_collection_stays_its_head_7044() -> Result<()> {
+    for (document, comments) in FLOW_RESIDUAL_ROWS {
+        let (stdout, status) = run_yq_stdin(COMMENTS, document, &["-o=json", "-I0"])?;
+        assert_eq!((stdout.as_str(), status), (*comments, 0), "{document:?}");
+    }
+    Ok(())
+}
