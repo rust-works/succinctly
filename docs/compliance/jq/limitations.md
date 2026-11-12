@@ -7276,14 +7276,14 @@ The endless-stream rows were measured on `main` @ 89a900ccc against `/usr/bin/jq
 ## Peak memory on a stream of many values grows with the input (#6913)
 
 On a file of many top-level values (NDJSON), `succinctly jq`'s peak memory grew linearly with the file, where jq 1.7.1's stays at a few MB whatever the size.
-Since [#6920](https://github.com/rust-works/succinctly/issues/6920) it no longer does for a plain filter (`-c .`, `-r .name`, `select(...)`: no `-n`, no `input`) over one regular file of 4 MiB or more, named on the command line or redirected onto standard input (`jq … < file`, [#7024](https://github.com/rust-works/succinctly/issues/7024)), which is read a window at a time (below).
+Since [#6920](https://github.com/rust-works/succinctly/issues/6920) it no longer does for a plain filter (`-c .`, `-r .name`, `select(...)`: no `-n`, no `input`) over regular files of 4 MiB or more between them (one, or up to 32 named on the command line, which are read as the one stream jq reads, or one redirected onto standard input, `jq … < file`, [#7024](https://github.com/rust-works/succinctly/issues/7024)), which are read a window at a time (below).
 Since [#7023](https://github.com/rust-works/succinctly/issues/7023) it no longer does for a program that calls `input`/`inputs` over one regular file or standard input (the lazy route), nor for `-R` over one regular file of 4 MiB or more.
-Every other route that reads the input still holds all of it: `--seq`, `--input-dsv`, `--stream-errors`, standard input that is a pipe or a terminal (for the plain filter) or any standard input (for `-R`), and several files.
+Every other route that reads the input still holds all of it: `--seq`, `--input-dsv`, `--stream-errors`, standard input that is a pipe or a terminal (for the plain filter) or any standard input (for `-R`), and `-R` and the programs that call `input`/`inputs` over several files (`-R length a b` peaks at 30.7 MiB against 12.7 for one file, `reduce inputs` at 32.8 against 14.6, on two 11 MB files).
 That is a known limitation, not supported at this stage: it is outside the three reasons ADR-0018 permits a divergence for, so it is a deferred gap and not a deliberate behaviour.
-It is tracked in [#7024](https://github.com/rust-works/succinctly/issues/7024) (`-R` and the plain filter over a pipe on standard input, and several files).
+It is tracked in [#7024](https://github.com/rust-works/succinctly/issues/7024) (the plain filter over a pipe on standard input, and over more than 32 files or a list with a path that is not a regular file; `-R` and `input`/`inputs` over several files; `-R` over standard input).
 The tables below were measured before #6920 and #7023 and show every row as it was; the rows they fixed are the first five of each (`first(inputs)` was flat already).
 The slurp shapes (`-s`, `-R -s`) are not a gap: jq holds the input too, and succinctly's peak is 223 MiB for `-s length` at 100 MiB on x86_64 where jq's is 850 (and 208 for `-R -s length` against jq's 183).
-Standard input under a pipe-fed plain filter or `-R` (a redirected regular file under a plain filter has been windowed since #7024), and `--seq`, grow as the file route did (124 and 108 MiB at 100 MiB on x86_64), two files hold both (224 MiB), and `--stream` is flat (8.5 MiB).
+Standard input under a pipe-fed plain filter or `-R` (a redirected regular file under a plain filter has been windowed since #7024), and `--seq`, grow as the file route did (124 and 108 MiB at 100 MiB on x86_64), two files held both (224 MiB) until #7024, and `--stream` is flat (8.5 MiB).
 At 100 MB succinctly is still faster than jq on every row below except `first(inputs)`, on both machines ([docs/compare/jq.md](../../compare/jq.md)): this is a memory trade, not a speed one.
 For a log too large to hold in memory that a fixed route does not cover, use jq, or split the file and run each part (`split -l`).
 
@@ -7348,7 +7348,7 @@ What holds the memory, from the slope between 10 and 100 MiB (MiB of peak per Mi
   `-c .`, `.name` and `select` sloped at 1.15 to 1.17.
   That route called `split_json_values` over the whole file before its loop, which returns a `Vec<(usize, usize)>` of every document's byte range: 16 bytes for each of the 993,416 records, 15.2 MiB.
   The same 100 MiB cut into 9,935 documents (100 records to an array) peaked at 108.7 MiB (x86_64) and 105.3 MiB (aarch64) for `-c .`, against 123.4 and 122.2 for the one-record-per-line file: the 14.7 and 16.9 MiB between them is the span vector, and what is left is the text.
-  Stdin and several files still read the text whole and split it whole.
+  A pipe on standard input still reads the text whole and splits it whole.
 - **A constant part of 6 to 12 MiB**, which `first(inputs)` shows at every size: it reads only the front of the file.
 
 What keeps it from being constant is not the read itself.
@@ -7382,6 +7382,17 @@ A depth refusal names the position from the window's line count; where a window 
 Standard input that is a regular file (`jq … < file`, a here-file, a descriptor a parent opened) takes the same route from its current offset: what a shell or parent has read already is not part of the stream, as on a pipe, and a fault is worded from a duplicate of descriptor 0 read by position.
 A pipe, a terminal, a standard input under 4 MiB and one the run also writes to (`jq . <> f >&0`: its output would land where the next window is read from) read whole as before, and so does a path that names the stdin descriptor a second time.
 The windows are read from descriptor 0's own offset, so a run that stops early (`first(...)`, `-e`) leaves it where its last window ended, as jq does, where the whole-file route always left it at the end of the file.
+Several regular files (up to 32 of them, 4 MiB or more between them) are read the same way, as the one stream jq reads them as, each a window at a time and in turn (`WindowedFiles`, #7024).
+A token still open where a file ends continues at the front of the next, as jq's stream has it (#4305).
+The route cuts that open tail off the end of the file, hands it on, and records what it moved in the `Seam` the whole-file route records, computed by the same code (`SeamStitcher`), so the file a value is read in (`input_filename`, the file a diagnostic names), its line there and the line of the first fault are the whole-file route's.
+The tail is handed on as the bytes that were read, so a character or a run of invalid bytes that a file's end cuts is substituted once the two files' bytes are joined, as the whole-file route substitutes them.
+Only the front of the stream may start with a BOM; the BOM at the front of a later file is a byte of the stream.
+A window never drops part of the tail that opens a file, so a document that spans files is held from its start, as a document bigger than a window is.
+The first fault is worded by reading every file again as one stream, by position, through the handles the run reads by (which is why the files are held open, and why there is a limit of 32), and a depth refusal names its position in the stream of all the files.
+A process's descriptor table starts at 64 slots, and doubling it waits for an RCU grace period when the process has a second thread, 35 ms for each doubling on the 7950X's Linux, which more than doubled a 10 MiB run over 64 files: 32 files and the standard descriptors stay under it.
+A read that fails part-way through one of the files (an I/O error) runs the documents before the failure, reports `jq: error: <strerror>` and ends the run there with exit 2, as the lone file's does, where the whole-file route reports that file as one that could not be opened and runs the others; jq's own main loop stops fetching input once a read has failed, but the failure needs a read that fails, which no test here can make.
+A list with a path that is not a regular file (a pipe, `-`, a directory, `/dev/stdin`, `/dev/fd/N`), one that does not open, one that is also the run's standard output or error (`jq . a b 1<>b`: output landing in a file the next window is read from), or more than 32 files takes the route that reads the files whole and reports what it finds.
+A file whose `stat` size is 0 (an empty file, or one of the `/proc` kind that reports 0 and has content) is read to its end, as `std::fs::read` reads it.
 A file is read as it was when opened, so a run whose output is appended to its input ends, and a read that fails runs the documents before the failure and then reports it.
 
 Peak resident set size at 100 MiB (993,416 records), in MiB:
@@ -7410,9 +7421,39 @@ Time, from `scripts/ab-cli.py` (interleaved, 11 repetitions, `-c`, output and ex
   The 1 MiB rows read +0.3% to +7.2% on x86_64 in the last run (+1.4% to +5.4% in earlier ones) and −0.6% to +1.8% on aarch64.
   cachegrind counts +59,053 instructions in 108 to 204 million (+0.03% to +0.055%) there, a constant that is not the 0.3 ms the x86_64 time moved, so that is where the code landed in the binary.
 
+Several files (#7024), peak resident set size in MiB for `-c .` at 100 MiB of NDJSON (993,416 records), `/usr/bin/time` (`-f %M` on the 7950X, `-l` on the M4 Pro, whose figures are the process's own and so below the 13 MiB floor the `wait4` figures above give):
+
+| machine           | files                                  | before | after |
+|-------------------|----------------------------------------|-------:|------:|
+| AMD Ryzen 9 7950X | one file (the route of #6920)          |   10.8 |  10.0 |
+| AMD Ryzen 9 7950X | the same 100 MiB file twice            |  225.4 |  10.2 |
+| AMD Ryzen 9 7950X | two halves, cut at a line start        |  117.4 |  10.2 |
+| AMD Ryzen 9 7950X | four files, cut inside a record        |  113.1 |  10.2 |
+| AMD Ryzen 9 7950X | 32 files                               |  110.0 |  10.1 |
+| Apple M4 Pro      | one file (the route of #6920)          |    6.6 |   6.7 |
+| Apple M4 Pro      | the same 100 MiB file twice            |  255.0 |   6.7 |
+| Apple M4 Pro      | two halves, cut at a line start        |  131.2 |   6.8 |
+| Apple M4 Pro      | four files, cut inside a record        |  119.4 |   7.8 |
+| Apple M4 Pro      | 32 files                               |  106.8 |   7.8 |
+
+The same file twice is flat from 10 MiB to 100 MiB: 31.1, 117.5 and 225.4 before and 10.1, 10.2 and 10.2 after on the 7950X (26.9, 131.2 and 255.0 before and 6.7 throughout on the M4 Pro), and `.name` and `select(.score>50)` over it read 225.9 and 227.1 before and 10.7 and 11.8 after.
+Both are release builds with `--features cli` of `main` @ `8f2175b5c` and the same plus #7024, on `terminus` and `johns-mac-mini`, each checked for a running benchmark first.
+
+Time, from an interleaved driver (the two binaries alternate within each repetition, 5 to 15 repetitions, medians, the output of every run gated on identity), against a control (the baseline binary against a copy of itself) that read −0.5% to +0.7% on x86_64 and −0.7% to +0.4% on aarch64:
+
+- **x86_64:** at 100 MiB, the same file twice reads −9.1% (`.`), −9.9% (`.name`) and −7.9% (`select`); two halves −10.3%, four files −12.2% and 32 files −11.6%; at 10 MiB −8.0% to −10.2%.
+- **aarch64:** at 100 MiB, the same file twice reads −1.8%, −1.9% and −1.5%; two halves −2.5%, four files −5.5% and 32 files −4.2%.
+- **One file** (not this change's route) reads −3.2% to −5.8% on x86_64 and +0.1% to +0.6% on aarch64 (15 repetitions at 100 MiB); the x86_64 movement is not explained by the change and is quoted as measured.
+- **One document** that no window can help: a 120 MB single line reads −6.4% on x86_64 and +1.6% on aarch64, and a pretty-printed 60 MB one −5.4% and 0.0%.
+  A first version counted the position at the end of every file's last window to seed the next, which a lone file never reads, and read the single line +13% slower; it is counted only when a file follows.
+- **A document that spans files** (a 12.5 MiB pretty-printed array cut at 15 byte offsets into 16 files) is held whole as a document bigger than a window is: 137.8 MiB before and 38.0 after on x86_64, 232.9 and 127.2 on aarch64, and −29.3% and −19.1% in time.
+- **64 files** of 10 MiB in all read 0.09 s against the whole-file route's 0.05 on the 7950X, because the descriptor table doubled at 64 slots: it waits for an RCU grace period when the process has a second thread, 35 ms for each doubling.
+  The second read of the stream now shares the reader's descriptor instead of duplicating it, and a list is capped at 32 files, which leaves the table alone (32 files of 10 MiB read −10.2%).
+- **Correctness**, from `scripts/jq-windowed-file-fuzz.py --files K` (random streams of 4.3 to 7.5 MiB cut at random bytes into K files, compared with the same files given as `/dev/fd/N`, which the route declines): 1,800 cases for K = 1, 2, 5, 12 and 32 on the 7950X and 250 for K = 3 and 9 on the M4 Pro, no difference.
+
 What the windowed route does not cover, and which still hold the input:
 
-- a pipe or a terminal on standard input (a fault cannot be worded by reading them again), and several files (the seams between them): #7024;
+- a pipe or a terminal on standard input (a fault cannot be worded by reading them again), more than 32 files, and a list of files with a path that is not a regular file, that does not open, or that is the run's own standard output or error: #7024;
 - programs that call `input`/`inputs` (with or without `-n`), `-R`, `--seq`, `--input-dsv` and `--stream-errors`, which have their own readers: #7023;
 - `-s` and `--validate`, which read the stream whole by design.
 
