@@ -604,10 +604,33 @@ fn with_update_effect(update: &Expr) -> Expr {
         Expr::Pipe(stages) => with_update_pipe_effect(stages),
         // `SRC as $v | rest`: the binding is kept, and `rest` contributes its changes (`.b as $v |
         // .z = $v` writes `z`); SRC itself is evaluated, so its errors still count.
-        Expr::As { expr, var, body } => Expr::As {
-            expr: expr.clone(),
-            var: var.clone(),
-            body: Box::new(with_update_effect(body)),
+        // yq binds each value in turn and the writes of each land on the same node, so the last
+        // value's write wins and `+=` accumulates (`with(.k; .x[] as $v | .y += $v)` over `x: [1,
+        // 2]` is `y: 3`, #7068): a `reduce`, not a binding whose first output is kept.
+        // A source with one value or none is the binding itself, which reads them as yq does: no
+        // value still runs the writes once (`.x[] as $v | .y = $v` over `x: []` writes `y: null`,
+        // and `.[$v] = 1` every key), and an absent key is not a `null` (`.nope as $v | .y = ($v |
+        // tostring)` writes `y: null`). Only several values take the `reduce`.
+        Expr::As { expr, var, body } => Expr::If {
+            cond: Box::new(Expr::Compare {
+                op: CompareOp::Lt,
+                left: Box::new(Expr::pipe(vec![
+                    Expr::Array(expr.clone()),
+                    Expr::Builtin(Builtin::Length),
+                ])),
+                right: Box::new(Expr::Literal(Literal::Int(2))),
+            }),
+            then_branch: Box::new(Expr::As {
+                expr: expr.clone(),
+                var: var.clone(),
+                body: Box::new(with_update_effect(body)),
+            }),
+            else_branch: Box::new(Expr::Reduce {
+                input: expr.clone(),
+                patterns: vec![Pattern::Var(var.clone())],
+                init: Box::new(Expr::Identity),
+                update: Box::new(with_update_effect(body)),
+            }),
         },
         discarded => with_discarded_stage(discarded),
     }
@@ -721,9 +744,7 @@ fn with_update_pipe_effect(stages: &[Expr]) -> Expr {
             stages.extend_from_slice(rest);
             with_update_pipe_effect(&stages)
         }
-        // A write, or a binding around one (`(.x as $v | .y = $v) | .z = 2` writes `y` and `z`, as
-        // yq does; #7068's rewritten `//` updates are such bindings).
-        head if writes_in_place(head) => Expr::pipe(vec![
+        head if is_with_write_expr(head) => Expr::pipe(vec![
             with_update_effect(head),
             with_update_pipe_effect(rest),
         ]),
@@ -742,7 +763,7 @@ fn with_update_pipe_effect(stages: &[Expr]) -> Expr {
 fn is_single_static_path(expr: &Expr) -> bool {
     match expr {
         Expr::Field(_) | Expr::Index { .. } => true,
-        Expr::Paren(inner) => is_single_static_path(inner),
+        Expr::Paren(inner) | Expr::Optional(inner) => is_single_static_path(inner),
         Expr::Pipe(stages) => !stages.is_empty() && stages.iter().all(is_single_static_path),
         _ => false,
     }
@@ -758,29 +779,6 @@ fn alternative_operands<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
             alternative_operands(right, out);
         }
         operand => out.push(operand),
-    }
-}
-
-/// Whether `expr` changes the node it runs on in place and answers it: an assignment or delete, or a
-/// group, comma, pipe or binding of them, a rewritten `//` update included. The writes a `//`
-/// target's last operand makes in yq's update-or-create idiom ([`yq_alternative_target`]).
-fn writes_in_place(expr: &Expr) -> bool {
-    match expr {
-        Expr::Paren(inner) => writes_in_place(inner),
-        Expr::Comma(items) => !items.is_empty() && items.iter().all(writes_in_place),
-        Expr::Pipe(stages) => !stages.is_empty() && stages.iter().all(writes_in_place),
-        Expr::As { body, .. } => writes_in_place(body),
-        write => is_with_write_expr(write),
-    }
-}
-
-/// The in-place change [`writes_in_place`] names, as one expression: a comma applies each part in
-/// turn, as yq's shared document does.
-fn in_place_effect(expr: &Expr) -> Expr {
-    match expr {
-        Expr::Paren(inner) => in_place_effect(inner),
-        Expr::Comma(items) => Expr::pipe(items.iter().map(in_place_effect).collect()),
-        write => write.clone(),
     }
 }
 
@@ -820,13 +818,13 @@ fn yq_alternative_target(target: &Expr) -> Option<(Expr, Expr)> {
         .take(operands.len() - 1)
         .take_while(|operand| is_single_static_path(operand))
         .count();
-    if lefts == 0 || !writes_in_place(operands[lefts]) {
+    if lefts == 0 || !is_with_write_expr(operands[lefts]) {
         return None;
     }
     // `[L] | .[0]`: an `L` that yields nothing is falsy, as `null` is.
     let first = |left: &Expr| Expr::pipe(vec![Expr::Array(Box::new(left.clone())), Expr::index(0)]);
     let writes = operands[..lefts].iter().enumerate().rev().fold(
-        in_place_effect(operands[lefts]),
+        with_update_effect(operands[lefts]),
         |next, (depth, left)| {
             // The variable's name cannot be written in a filter.
             let var = format!("// left {depth}");
@@ -884,6 +882,9 @@ fn is_with_write_expr(expr: &Expr) -> bool {
         // #6840: `del` and `delpaths` write in place like an assignment (see `with_update_effect`).
         Expr::Builtin(Builtin::Del(_) | Builtin::DelPaths(_)) => true,
         Expr::Paren(inner) => is_with_write_expr(inner),
+        // A binding around writes writes in place (`(.x as $v | .y = $v) | .z = 2` writes `y`
+        // and `z`, as yq does; #7068's rewritten `//` updates are such bindings).
+        Expr::As { body, .. } => is_with_write_expr(body),
         Expr::Comma(items) => !items.is_empty() && items.iter().all(is_with_write_expr),
         Expr::Pipe(stages) => !stages.is_empty() && stages.iter().all(is_with_write_expr),
         _ => false,

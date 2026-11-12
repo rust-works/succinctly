@@ -102,6 +102,37 @@ const ROWS: &[(&str, &str, &str)] = &[
         "with(.k; (.x as $v | .y = $v) | .z = 2)",
         "k: {x: 5, y: 5, z: 2}\n",
     ),
+    (
+        "b: camel\n",
+        "(.a // (.a = 0 | (.b = 1, .c = 2))) += 1",
+        "b: 1\na: 1\nc: 2\n",
+    ),
+    ("b: 1\n", "(.a? // (.a = 0)) += 1", "b: 1\na: 1\n"),
+    (
+        "k: {x: [1, 2], e: [], s: 5} # c\n",
+        "with(.k; .x[] as $v | .y = $v)",
+        "k: {x: [1, 2], e: [], s: 5, y: 2} # c\n",
+    ),
+    (
+        "k: {x: [1, 2], e: [], s: 5} # c\n",
+        "with(.k; (.x[] as $v | .y += $v) | .z = 2)",
+        "k: {x: [1, 2], e: [], s: 5, y: 3, z: 2} # c\n",
+    ),
+    (
+        "k: {x: [1, 2], e: [], s: 5} # c\n",
+        "with(.k; .e[] as $v | .y = $v)",
+        "k: {x: [1, 2], e: [], s: 5, y: null} # c\n",
+    ),
+    (
+        "k: {x: [1, 2], e: [], s: 5} # c\n",
+        "with(.k; .nope as $v | .y = ($v | tostring))",
+        "k: {x: [1, 2], e: [], s: 5, y: null} # c\n",
+    ),
+    (
+        "k: {x: [1, 2], e: [], s: 5} # c\n",
+        "with(.k; .x[] as $v | .y = $v, .w = 1)",
+        "k: {x: [1, 2], e: [], s: 5, y: 2, w: 1} # c\n",
+    ),
 ];
 
 /// The write leaves the left operand falsy, so the target is the document, and adding `1` to a
@@ -114,8 +145,9 @@ const ERROR_ROWS: &[(&str, &str)] = &[
 ];
 
 /// Recorded divergences (`docs/compliance/yq/limitations.md`): a target whose last operand does not
-/// write does not create the left operand (yq leaves `a: null`), and in value position the write is
-/// not seen by the left operand. (input, filter, succinctly's stdout; yq's is in the comment.)
+/// write does not create the left operand (yq leaves `a: null`), in value position the write is not
+/// seen by the left operand, a comma behind a binding in the last operand targets the left node
+/// once (twice in yq), and a binding over several absent keys reads them as `null`. (input, filter, succinctly's stdout; yq's is in the comment.)
 const RESIDUAL_ROWS: &[(&str, &str, &str)] = &[
     // yq: "b: camel\na: null\nz: 1\n"
     ("b: camel\n", "(.a // .z) += 1", "b: camel\nz: 1\n"),
@@ -125,6 +157,18 @@ const RESIDUAL_ROWS: &[(&str, &str, &str)] = &[
     ("b: camel\n", "(.a // .z // .y) = 1", "b: camel\ny: 1\n"),
     // yq: "5\n"
     ("b: camel\n", ".a // (.a = 5)", "b: camel\na: 5\n"),
+    // yq: "x: 1\na: 2\nb: 1\n"
+    (
+        "x: 1\n",
+        "(.a // (.x as $v | .a = 0, .b = 1)) += 1",
+        "x: 1\na: 1\nb: 1\n",
+    ),
+    // yq: "k:\n  y: null\n"
+    (
+        "k: null\n",
+        "with(.k; (.s, .s) as $v | .y = ($v | tostring))",
+        "k:\n  y: \"null\"\n",
+    ),
 ];
 
 #[test]
