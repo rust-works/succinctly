@@ -4635,16 +4635,27 @@ fn is_custom_tag(tag: &str) -> bool {
 /// when one is written twice, and the output format the run was asked for, which decides the extension
 /// yq appends to a name that has none. `OutputConfig` cannot say the latter, since an encoder format
 /// (`-o=props` and the rest) runs as a YAML-output run over the encoded text.
+///
+/// It also holds the output encoder of the run, if there is one (#7036): without `--split-exp` the
+/// program is wrapped in it, so every result is the encoded text, but a name expression has to read the
+/// result itself (`-o=props -s '.a'` names the file after `.a`, not after `a = 1`). A split run leaves
+/// the program unwrapped and encodes each result here, after its name is known.
 struct SplitFiles {
     written: std::collections::HashSet<String>,
     name_format: OutputFormat,
+    encoder: Option<Expr>,
+    /// Set when the encoder refused a result and yq's stop-at-the-first-error rule ends the run
+    /// (#2810, #7036): the loops stop writing. An error in the name expression never sets it.
+    run_ended: bool,
 }
 
 impl SplitFiles {
-    fn new(name_format: OutputFormat) -> Self {
+    fn new(name_format: OutputFormat, encoder: Option<Expr>) -> Self {
         Self {
             written: std::collections::HashSet::new(),
             name_format,
+            encoder,
+            run_ended: false,
         }
     }
 }
@@ -4716,15 +4727,36 @@ fn write_split_result(
         eprintln!("Warning: --split-exp path '{filename}' written more than once; overwriting");
     }
 
+    // #7029: yq's help says "The necessary directories will be created".
+    create_split_exp_directories(&filename)?;
+    let write_failure = || format!("failed to write --split-exp output file: {filename}");
+
+    // #7036: the result is encoded here, once its name is known. yq opens the file before it encodes,
+    // so a result the encoder refuses (`-o=csv` over a mapping) leaves an empty file behind and the
+    // error is reported as usual.
+    let encoded;
+    let (content, content_comments) = match &files.encoder {
+        None => (result, comments),
+        Some(encoder) => {
+            std::fs::write(&filename, b"").with_context(write_failure)?;
+            let errors_before_encode = sink.program_error_count();
+            encoded = evaluate_input(result, encoder, sink)?;
+            match encoded.as_slice() {
+                [text @ OwnedValue::String(_)] => (text, &CommentTree::empty()),
+                // The refusal was reported by `evaluate_input` through `sink`; yq writes no later file.
+                _ => {
+                    files.run_ended = sink.ends_run_since(errors_before_encode);
+                    return Ok(());
+                }
+            }
+        }
+    };
+
     let mut buf = Vec::new();
     let mut no_color_config = output_config.clone();
     no_color_config.use_color = false;
-    output_value(&mut buf, result, comments, &no_color_config, None)?;
-
-    // #7029: yq's help says "The necessary directories will be created".
-    create_split_exp_directories(&filename)?;
-    std::fs::write(&filename, &buf)
-        .with_context(|| format!("failed to write --split-exp output file: {filename}"))
+    output_value(&mut buf, content, content_comments, &no_color_config, None)?;
+    std::fs::write(&filename, &buf).with_context(write_failure)
 }
 
 /// The directory yq creates for a `--split-exp` file (#7029): Go's `filepath.Dir`, which is
@@ -12391,9 +12423,15 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         }
     }
 
+    // #7036: `--split-exp` encodes each result after naming it, in `write_split_result`.
+    let mut split_encoder: Option<Expr> = None;
     if let Some(format) = output_encoder {
-        program.expr =
-            Expr::Pipe(vec![program.expr, Expr::Format(FormatType::YqOutput(format))].into());
+        let encode = Expr::Format(FormatType::YqOutput(format));
+        if args.split_exp.is_some() {
+            split_encoder = Some(encode);
+        } else {
+            program.expr = Expr::Pipe(vec![program.expr, encode].into());
+        }
     }
 
     // Parse the --split-exp expression, if given, once up front, applying
@@ -13832,7 +13870,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         // here; the input-gathering below otherwise mirrors the standard
         // path at the bottom of this function.
         let mut output_index: i64 = 0;
-        let mut written_split_files = SplitFiles::new(split_exp_format);
+        let mut written_split_files = SplitFiles::new(split_exp_format, split_encoder.clone());
 
         if args.null_input {
             let results = evaluate_input(&OwnedValue::Null, &program.expr, &mut sink)?;
@@ -13860,6 +13898,10 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                     &mut sink,
                 )?;
                 output_index += 1;
+                // #7036: see the `'files` loop below.
+                if written_split_files.run_ended {
+                    break;
+                }
                 // halt/halt_error (#791) outranks writing any further split
                 // files, but only once introduced during this batch.
                 if !halted_before_batch && sink.halted().is_some() {
@@ -13966,6 +14008,12 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                             &mut sink,
                         )?;
                         output_index += 1;
+                        // #7036: the result is encoded while it is written, so an error the encoder
+                        // raises ends the run here as one the program raised does (#2810): yq opens
+                        // the file, fails on it and writes no later one.
+                        if written_split_files.run_ended {
+                            break 'files;
+                        }
                         // halt/halt_error (#791) outranks writing any
                         // further split files or evaluating any
                         // further documents/inputs/files.

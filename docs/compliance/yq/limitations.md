@@ -7827,7 +7827,8 @@ The name is the first value the expression produces, read as its scalar text, wi
 - **A directory that cannot be made or a name that cannot be written is worded differently.**
   yq says `Error: mkdir blocker: not a directory`; this says `failed to create --split-exp directory: blocker`, with the cause.
   Both exit 1 and write nothing.
-- **A name read from the encoded text under `-o=props` and the other encoder formats** is still wrong ([#7036](https://github.com/rust-works/succinctly/issues/7036)).
+- **The second and later files of `-o=yaml` and `-o=kyaml` start with `---` in yq**, where here no file does (a YAML printer shared by every result writes the document separator before each after the first).
+  An encoder format's files agree: `-o=props`, `-o=xml`, `-o=csv` and the rest are named by the result and hold only the encoding ([#7036](https://github.com/rust-works/succinctly/issues/7036)).
 
 ## yq's `eval` and `eval-all` subcommands are accepted; its other subcommands and `--version` text are not ([#7040](https://github.com/rust-works/succinctly/issues/7040))
 
