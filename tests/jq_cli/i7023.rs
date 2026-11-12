@@ -224,7 +224,8 @@ fn raw_lines_with_bytes_that_are_not_utf8_are_substituted_a_line_at_a_time_7023(
             .windows(needle.len())
             .position(|w| w == needle.as_slice())
             .unwrap();
-        bytes.splice(at + 1..at + 1, [0xffu8, 0xfe]);
+        bytes.insert(at + 1, 0xfe);
+        bytes.insert(at + 1, 0xff);
     }
     let (out, err, status) = run(&bytes, &["-R", "select(contains(\"\u{fffd}\")) | .[0:30]"])?;
     assert_eq!(status, 0, "{err:?}");
