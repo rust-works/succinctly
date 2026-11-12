@@ -194,8 +194,9 @@ fn test_5507_split_exp_writes_the_files_after_an_error_only_under_continue() -> 
             run_yq_stdin_with_stderr(FILTER, input, &["--split-exp", &pattern, flag])?;
         assert_eq!((code, errors(&err)), (1, 1), "{flag}: {err}");
         for n in ["1", "2"] {
-            let path = dir.path().join(format!("out_{n}"));
-            assert_eq!(path.exists(), written.contains(&n), "{flag} out_{n}");
+            // yq appends `.yml` to a name without an extension (#7028).
+            let path = dir.path().join(format!("out_{n}.yml"));
+            assert_eq!(path.exists(), written.contains(&n), "{flag} out_{n}.yml");
         }
     }
     Ok(())
