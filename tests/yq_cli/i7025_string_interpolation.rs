@@ -12,148 +12,148 @@ use crate::run_yq_stdin;
 /// (flag, program, yq's stdout).
 const ROWS: &[(&str, &str, &str)] = &[
     (
-        r###"--string-interpolation=false"###,
-        r###""x\(1 + 2)y""###,
-        r###"x\(1 + 2)y
-"###,
+        r"--string-interpolation=false",
+        r#""x\(1 + 2)y""#,
+        r"x\(1 + 2)y
+",
     ),
     (
-        r###"--string-interpolation=false"###,
-        r###""\(1)""###,
-        r###"\(1)
-"###,
+        r"--string-interpolation=false",
+        r#""\(1)""#,
+        r"\(1)
+",
     ),
     (
-        r###"--string-interpolation=false"###,
-        r###""\\(1)""###,
-        r###"\\(1)
-"###,
+        r"--string-interpolation=false",
+        r#""\\(1)""#,
+        r"\\(1)
+",
     ),
     (
-        r###"--string-interpolation=false"###,
-        r###""\\\(1)""###,
-        r###"\\(1)
-"###,
+        r"--string-interpolation=false",
+        r#""\\\(1)""#,
+        r"\\(1)
+",
     ),
     (
-        r###"--string-interpolation=false"###,
-        r###""\\\\(1)""###,
-        r###"\\\(1)
-"###,
+        r"--string-interpolation=false",
+        r#""\\\\(1)""#,
+        r"\\\(1)
+",
     ),
     (
-        r###"--string-interpolation=false"###,
-        r###""a\\\\\(1)b""###,
-        r###"a\\\(1)b
-"###,
+        r"--string-interpolation=false",
+        r#""a\\\\\(1)b""#,
+        r"a\\\(1)b
+",
     ),
     (
-        r###"--string-interpolation=false"###,
-        r###""\\\\\\(1)""###,
-        r###"\\\\(1)
-"###,
+        r"--string-interpolation=false",
+        r#""\\\\\\(1)""#,
+        r"\\\\(1)
+",
     ),
     (
-        r###"--string-interpolation=false"###,
-        r###""\(1)\(2)""###,
-        r###"\(1)\(2)
-"###,
+        r"--string-interpolation=false",
+        r#""\(1)\(2)""#,
+        r"\(1)\(2)
+",
     ),
     (
-        r###"--string-interpolation=false"###,
-        r###""a\nb\(1)\tc\"d""###,
-        r###"a
+        r"--string-interpolation=false",
+        r#""a\nb\(1)\tc\"d""#,
+        r#"a
 b\(1)	c"d
-"###,
+"#,
     ),
     (
-        r###"--string-interpolation=false"###,
-        r###""\(1)" | length"###,
-        r###"4
-"###,
+        r"--string-interpolation=false",
+        r#""\(1)" | length"#,
+        r"4
+",
     ),
     (
-        r###"--string-interpolation=false"###,
-        r###""\(1 + 2)" == "3""###,
-        r###"false
-"###,
+        r"--string-interpolation=false",
+        r#""\(1 + 2)" == "3""#,
+        r"false
+",
     ),
     (
-        r###"--string-interpolation=false"###,
-        r###"{"a\(1)": 2}"###,
-        r###"a\(1): 2
-"###,
+        r"--string-interpolation=false",
+        r#"{"a\(1)": 2}"#,
+        r"a\(1): 2
+",
     ),
     (
-        r###"--string-interpolation=false"###,
-        r###""é\(1)\u00e9""###,
-        r###"é\(1)\u00e9
-"###,
+        r"--string-interpolation=false",
+        r#""é\(1)\u00e9""#,
+        r"é\(1)\u00e9
+",
     ),
     (
-        r###"--string-interpolation=false"###,
-        r###""a" + "\(1)""###,
-        r###"a\(1)
-"###,
+        r"--string-interpolation=false",
+        r#""a" + "\(1)""#,
+        r"a\(1)
+",
     ),
     (
-        r###"--string-interpolation=false"###,
-        r###"[1, "\(1)"]"###,
-        r###"- 1
+        r"--string-interpolation=false",
+        r#"[1, "\(1)"]"#,
+        r"- 1
 - \(1)
-"###,
+",
     ),
     (
-        r###"--string-interpolation=false"###,
-        r###"eval("\"x\\(1)\"")"###,
-        r###"x\\(1)
-"###,
+        r"--string-interpolation=false",
+        r#"eval("\"x\\(1)\"")"#,
+        r"x\\(1)
+",
     ),
     (
-        r###"--string-interpolation=false"###,
-        r###""abc\(""###,
-        r###"abc\(
-"###,
+        r"--string-interpolation=false",
+        r#""abc\(""#,
+        r"abc\(
+",
     ),
     (
-        r###"--string-interpolation=true"###,
-        r###""x\(1 + 2)y""###,
-        r###"x3y
-"###,
+        r"--string-interpolation=true",
+        r#""x\(1 + 2)y""#,
+        r"x3y
+",
     ),
     (
-        r###"--string-interpolation=0"###,
-        r###""x\(1 + 2)y""###,
-        r###"x\(1 + 2)y
-"###,
+        r"--string-interpolation=0",
+        r#""x\(1 + 2)y""#,
+        r"x\(1 + 2)y
+",
     ),
     (
-        r###"--string-interpolation=F"###,
-        r###""x\(1 + 2)y""###,
-        r###"x\(1 + 2)y
-"###,
+        r"--string-interpolation=F",
+        r#""x\(1 + 2)y""#,
+        r"x\(1 + 2)y
+",
     ),
     (
-        r###"--string-interpolation=T"###,
-        r###""x\(1 + 2)y""###,
-        r###"x3y
-"###,
+        r"--string-interpolation=T",
+        r#""x\(1 + 2)y""#,
+        r"x3y
+",
     ),
     (
-        r###""###,
-        r###""x\(1 + 2)y""###,
-        r###"x3y
-"###,
+        r"",
+        r#""x\(1 + 2)y""#,
+        r"x3y
+",
     ),
 ];
 
 #[test]
 fn the_flag_decides_whether_a_backslash_paren_interpolates_7025() -> Result<()> {
     for &(flag, program, expected) in ROWS {
-        let args: Vec<&str> = ["-n"]
-            .into_iter()
-            .chain((!flag.is_empty()).then_some(flag))
-            .collect();
+        let mut args = vec!["-n"];
+        if !flag.is_empty() {
+            args.push(flag);
+        }
         let (out, code) = run_yq_stdin(program, "", &args)?;
         assert_eq!((out.as_str(), code), (expected, 0), "{flag} {program}");
     }
