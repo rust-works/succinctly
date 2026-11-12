@@ -9231,6 +9231,26 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
         }
     }
 
+    // #7081: what yq prints before the document (the comments above it and an explicit `---`, and the
+    // root's head comment) comes with the result of an entries operator over the whole document,
+    // whether or not the replay above could place the rest of its comments.
+    // Not after a byte-order mark, where yq reads the comments above the first node as that node's
+    // (#6762, #7084): their place in an entries result is the first entry's (#7089).
+    if need_comments
+        && !cursor.index().after_bom()
+        && reshape_presentation::carries_document_leading(expr)
+    {
+        if let Ok(results) = &mut docs {
+            if results.len() == 1 {
+                if let Ok((_, root)) =
+                    to_owned_with_comments_pruned::<_, YqSemantics>(&cursor.value(), Some(&cursor))
+                {
+                    reshape_presentation::carry_document_leading(&mut results[0].1, &root);
+                }
+            }
+        }
+    }
+
     // #6986: a `map` over a flow-style node prints in flow, whatever its body, as in yq.
     if need_comments {
         if let Ok(results) = &mut docs {

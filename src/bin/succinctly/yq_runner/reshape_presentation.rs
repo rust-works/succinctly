@@ -697,6 +697,36 @@ pub(super) fn trace(expr: &Expr, input: &ResultWithComments) -> Option<ResultWit
     trace_at_depth(expr, input, 0)
 }
 
+/// Whether `expr` is an entries operator applied to the whole document: `to_entries`, `from_entries`,
+/// `with_entries(f)`, or `to_entries | from_entries` with nothing between them (#7081). yq builds the
+/// result of each with `CreateReplacementWithComments`, which gives it what the document had before
+/// its first node: the comments above it and an explicit `---` (its leading content), and the head
+/// comment of its root. A `map` between the two builds a new sequence and drops them (#6674), and a
+/// step into the document first (`.a | to_entries`) makes it the node's, which has no leading content.
+pub(super) fn carries_document_leading(expr: &Expr) -> bool {
+    match expr {
+        Expr::Paren(inner) => carries_document_leading(inner),
+        Expr::Builtin(Builtin::ToEntries | Builtin::FromEntries | Builtin::WithEntries(_)) => true,
+        Expr::Pipe(parts) => matches!(
+            parts.as_slice(),
+            [
+                Expr::Builtin(Builtin::ToEntries),
+                Expr::Builtin(Builtin::FromEntries)
+            ]
+        ),
+        _ => false,
+    }
+}
+
+/// Puts the head comment of the document `root` and the marker and comments before it on `rebuilt`,
+/// the root of an entries operator's result (#7081).
+pub(super) fn carry_document_leading(rebuilt: &mut CommentTree, root: &CommentTree) {
+    restore_head(rebuilt, root);
+    *rebuilt.meta_mut() = rebuilt
+        .meta()
+        .with_preamble(root.meta().preamble().map(str::to_string));
+}
+
 fn trace_at_depth(
     expr: &Expr,
     input: &ResultWithComments,

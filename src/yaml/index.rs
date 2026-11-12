@@ -494,7 +494,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
 
     /// Whether the text was built by [`Self::build_yq_after_bom`].
     #[inline]
-    pub(crate) fn after_bom(&self) -> bool {
+    pub fn after_bom(&self) -> bool {
         self.after_bom
     }
 
