@@ -898,6 +898,28 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         false
     }
 
+    /// Whether the document holds a comment anywhere -- a line, head or foot comment, or a
+    /// header line yq reads as one -- so a writer that would look for comments node by node can
+    /// skip the walk on a document without any (#6922). `false` for formats with no comments.
+    fn document_has_comments(&self) -> bool {
+        false
+    }
+
+    /// The first document's leading block (the comment, blank and `---` lines before its content)
+    /// as yq's properties encoder prints it ahead of the first property: verbatim, without its
+    /// `---` lines (#6922). `None` for any cursor but the first document's content, and for
+    /// formats with no such header.
+    fn props_leading_content(&self) -> Option<String> {
+        None
+    }
+
+    /// [`head_comment_raw`](Self::head_comment_raw), except that a head comment yq reads as part
+    /// of the first document's header (it is printed with that header, and the node keeps none)
+    /// is empty (#6922).
+    fn head_comment_raw_outside_header(&self) -> Vec<String> {
+        self.head_comment_raw()
+    }
+
     /// Whether this cursor's *document* declares any `*name` alias at all.
     ///
     /// A whole-document property, not a property of this node, and O(1) --

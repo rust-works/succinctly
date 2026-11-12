@@ -7676,8 +7676,10 @@ The `@props` / `to_props` and `@csv` / `to_csv` operators read the same flags, a
 The other formats yq lists (`hcl`) and every input format but YAML, JSON, `base64` and `uri` (see the `-p base64|uri` section below) are still refused at the flag.
 Six rows differ from yq v4.53.3, each pinned out of `tests/yq_cli/i6850.rs`:
 
-- A comment in a `props` document is not written.
-  yq writes a head and a line comment as `# ...` lines above the key, and the `@props` filter has the same gap.
+- A comment of a value the filter builds or writes is not written by `-o=props` or `@props` (`{"z": .a}`, `.a = 5`), where yq keeps the node's comment: the encoder reads comments from the document, as `to_yaml` does (#6933).
+  A value read from the document gets them as yq writes them (#6922): above each property, its key's head and line comment and then its value's, each with its first `#` dropped and nothing between them (`# h` over `a: 1 # c` is `# h c`), after a blank line unless it is the first; the comment after a bare `-` goes to the item's first key, or to its first element if that is a scalar; a mapping's or sequence's own comment is dropped; and the first document's leading comment block comes first when the result is that document.
+  Where succinctly attributes a comment to a different node than yq does, which `head_comment` and `line_comment` show too, the property gets it as succinctly attributes it: a head comment followed by a blank line ends in a line break in yq (it prints one more `# ` line), and so on.
+  Results of two documents are separated by `---` here and not in yq (#7019 has the same family).
 - A null written `~` (or `!!null ""`) prints `null` with every encoder, `ini` included, where yq echoes the spelling (`c = ~`, `c='~'`, `a = `, #2802).
 - An encoder that fails after earlier results printed still prints those results first, as yq does (#6923): `printf 'a: x\nb: [1]\nc: {d: e}\n' | yq -o=csv '.[]'` prints `x` and `1`, then the error, exit 1.
   A top-level comma (`.a, .b`) still prints nothing before the error, and the error line is written when it is raised, so the two streams can interleave differently on a terminal.
