@@ -27205,13 +27205,10 @@ fn format_yq_output<S: EvalSemantics>(
         YqOutputEncoder::Toml => format_toml(value),
         // #7093: unwrapped, a string result is its own text, as for `-o=json -r`; a collection, and
         // every other scalar, print as they do wrapped.
-        YqOutputEncoder::Kyaml(_, true) if matches!(value, OwnedValue::String(_)) => {
-            Ok(match value {
-                OwnedValue::String(text) => text.to_string(),
-                _ => unreachable!("the guard names a string"),
-            })
-        }
-        YqOutputEncoder::Kyaml(indent, _) => Ok(format_kyaml(value, *indent)),
+        YqOutputEncoder::Kyaml(indent, unwrap) => match value {
+            OwnedValue::String(text) if *unwrap => Ok(text.to_string()),
+            _ => Ok(format_kyaml(value, *indent)),
+        },
         YqOutputEncoder::Xml(options) => super::yq_xml::format_xml(value, options),
         YqOutputEncoder::Tsv => format_yq_csv::<S>(value, '\t', true),
         YqOutputEncoder::Base64 => format_base64::<S>(value, false),
