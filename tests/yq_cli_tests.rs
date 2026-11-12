@@ -70036,7 +70036,8 @@ fn test_deep_block_yaml_in_a_split_exp_stream_writes_the_rest_1817() -> Result<(
         written.push(std::fs::read_to_string(entry?.path())?);
     }
     written.sort();
-    assert_eq!(written, ["a: 1\n", "b: 2\n"]);
+    // #7053: `b` is a later document of the run, so its file starts with the separator, as yq's does.
+    assert_eq!(written, ["---\nb: 2\n", "a: 1\n"]);
     Ok(())
 }
 
