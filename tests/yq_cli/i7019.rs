@@ -41,6 +41,14 @@ const FRESH_ROWS: &[(&str, &str)] = &[
     (". as $x | \"x\"", "x\nx\nx\n"),
     ("\"x\", 1", "x\n1\nx\n1\nx\n1\n"),
     ("[.a] | map(. + 1)", "- 2\n- 3\n- 4\n"),
+    ("{}", "{}\n{}\n{}\n"),
+    ("1 // .a", "1\n1\n1\n"),
+    ("false // \"x\"", "x\nx\nx\n"),
+    ("\"x\" as $y | $y", "x\nx\nx\n"),
+    ("[.a] as $x | $x", "- 1\n- 2\n- 3\n"),
+    (".a as $x | $x | \"y\"", "y\ny\ny\n"),
+    ("del(.a) | \"x\"", "x\nx\nx\n"),
+    ("(.a // 1) | \"x\"", "x\nx\nx\n"),
 ];
 
 const DOCUMENT_ROWS: &[(&str, &str)] = &[
@@ -140,6 +148,18 @@ fn nul_output_separates_only_document_results_7019() -> Result<()> {
         let (stdout, status) = run_yq_stdin(filter, INPUT, &["-0"])?;
         assert_eq!((stdout.as_str(), status), (expected, 0), "{filter}");
     }
+    Ok(())
+}
+
+/// `-i` keeps the separators where yq drops them: yq's `2`/`2`/`2` would read back as the one
+/// string `2 2 2` (a recorded divergence).
+#[test]
+fn inplace_keeps_the_documents_apart_7019() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    write!(file, "{INPUT}")?;
+    let (_, _, status) = run_yq_files("length", &[file.path()], &["-i"])?;
+    assert_eq!(status, 0);
+    assert_eq!(std::fs::read_to_string(file.path())?, "2\n---\n2\n---\n2\n");
     Ok(())
 }
 

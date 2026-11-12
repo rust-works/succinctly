@@ -12536,7 +12536,10 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     let mut output_config = OutputConfig::from_args(&args);
     // #7019: yq writes `---` only between results whose document index differs, and a result built
     // from a document's root or from nothing has index 0, as every other one of its kind does.
-    output_config.no_doc |= results_have_no_document;
+    // `-i` keeps the separators: without them a file of several documents is rewritten as one
+    // (`length` over three becomes `3 3 3`, one string, when read back), which loses the documents
+    // (ADR-0018: matching would corrupt the file; recorded in limitations.md).
+    output_config.no_doc |= results_have_no_document && !args.inplace;
 
     // Set up output
     let stdout = std::io::stdout();

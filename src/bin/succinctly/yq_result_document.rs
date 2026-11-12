@@ -21,7 +21,7 @@
 //! within one document (`.a, "x"`, `..`), are not modelled; they are recorded in
 //! `docs/compliance/yq/limitations.md`.
 
-use succinctly::jq::{Builtin, Expr, FormatType, Literal};
+use succinctly::jq::{self, Builtin, Expr, FormatType, Literal};
 
 /// The two facts about a yq node that decide the document index of what is built from it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,8 +46,15 @@ const FRESH: Node = Node {
 
 /// Whether every result `expr` yields over a document has yq's document index 0, so that yq writes
 /// no `---` between them.
+///
+/// A filter with `split_doc` anywhere is never one: that operator gives each result a document of
+/// its own, and its separators are written by `SplitDocState`, which `no_doc` would silence.
 pub(crate) fn results_have_no_document(expr: &Expr) -> bool {
-    matches!(result_node(expr, ROOT), Some(node) if !node.document)
+    !jq::walk::contains_builtin(expr, |b| matches!(b, Builtin::SplitDoc))
+        && matches!(
+            result_node(expr, ROOT, Cx { scope: None, budget: &core::cell::Cell::new(BUDGET) }),
+            Some(node) if !node.document
+        )
 }
 
 /// What `CreateReplacement` builds from `input`: its parent, and through it its document, or a
@@ -79,7 +86,8 @@ fn either(a: Node, b: Node) -> Option<Node> {
 }
 
 /// Whether `expr` yields exactly one result over any input: a literal, `.`, or a field or index
-/// step (an absent one is `null`), alone or in a pipe of them.
+/// step (an absent one is `null`), alone or in a pipe of them. Narrower than the evaluator's own
+/// single-value predicates on purpose: it is asked of the filter's text, before any value exists.
 fn yields_one(expr: &Expr) -> bool {
     match expr {
         Expr::Literal(_) | Expr::Identity | Expr::Field(_) | Expr::Index { .. } => true,
@@ -89,65 +97,189 @@ fn yields_one(expr: &Expr) -> bool {
     }
 }
 
+/// The `$name`s bound around a subexpression, each with the node its value has (`None` where that
+/// is not known).
+struct Scope<'a> {
+    name: &'a str,
+    node: Option<Node>,
+    outer: Option<&'a Self>,
+}
+
+fn lookup(scope: Option<&Scope<'_>>, name: &str) -> Option<Node> {
+    let mut scope = scope;
+    while let Some(binding) = scope {
+        if binding.name == name {
+            return binding.node;
+        }
+        scope = binding.outer;
+    }
+    None
+}
+
+/// The classification's state: the `$name`s in scope, and a work budget, so that a filter of
+/// deeply nested pipes is given up on (and keeps its separators) rather than walked without bound.
+#[derive(Clone, Copy)]
+struct Cx<'a> {
+    scope: Option<&'a Scope<'a>>,
+    budget: &'a core::cell::Cell<u32>,
+}
+
+impl<'a> Cx<'a> {
+    /// Takes one step from the budget, or answers `false` when it is spent.
+    fn step(self) -> bool {
+        let left = self.budget.get();
+        self.budget.set(left.saturating_sub(1));
+        left > 0
+    }
+
+    fn with(self, scope: &'a Scope<'a>) -> Self {
+        Cx {
+            scope: Some(scope),
+            budget: self.budget,
+        }
+    }
+}
+
+/// Steps one classification may take; a filter needing more keeps its separators.
+const BUDGET: u32 = 10_000;
+
+/// Whether `stage` builds results with no document whatever node it is handed (a literal, `keys`,
+/// interpolation), so what came before it in a pipe does not matter.
+fn fresh_regardless(stage: &Expr, cx: Cx<'_>) -> bool {
+    if !cx.step() {
+        return false;
+    }
+    match stage {
+        Expr::Literal(_) | Expr::StringInterpolation(_) => true,
+        Expr::Object(entries) => entries.is_empty(),
+        Expr::Builtin(Builtin::Keys | Builtin::KeysUnsorted | Builtin::WithEntries(_)) => true,
+        Expr::Paren(inner) => fresh_regardless(inner, cx),
+        Expr::Comma(items) => items.iter().all(|item| fresh_regardless(item, cx)),
+        Expr::Alternative(left, _) => {
+            matches!(left.as_ref(), Expr::Literal(literal) if truthy_literal(literal))
+        }
+        // After the last stage that is fresh whatever its input, the rest runs over a fresh node.
+        Expr::Pipe(stages) => match stages.iter().rposition(|stage| fresh_regardless(stage, cx)) {
+            Some(last) => matches!(
+                pipe_node(&stages[last + 1..], FRESH, cx),
+                Some(node) if !node.document
+            ),
+            None => false,
+        },
+        // The source's node is not known without an input, so `$var` reads as unknown here.
+        Expr::As { var, body, .. } => {
+            let bound = Scope {
+                name: var,
+                node: None,
+                outer: cx.scope,
+            };
+            fresh_regardless(body, cx.with(&bound))
+        }
+        Expr::Var(name) => matches!(lookup(cx.scope, name), Some(node) if !node.document),
+        _ => false,
+    }
+}
+
+/// The node of what a pipe's `stages` yield over `input`.
+fn pipe_node(stages: &[Expr], input: Node, cx: Cx<'_>) -> Option<Node> {
+    // Not a `try_fold`: an unknown stage does not end the walk, since a later stage that is fresh
+    // whatever its input still decides.
+    let mut node = Some(input);
+    for stage in stages {
+        node = if fresh_regardless(stage, cx) {
+            Some(FRESH)
+        } else {
+            node.and_then(|node| result_node(stage, node, cx))
+        };
+    }
+    node
+}
+
+/// Whether a literal is truthy in yq: anything but `null` and `false`.
+fn truthy_literal(literal: &Literal) -> bool {
+    !matches!(literal, Literal::Null | Literal::Bool(false))
+}
+
 /// The node of every result `expr` yields over a node `input`, or `None` where it is not known (or
 /// differs between results).
-fn result_node(expr: &Expr, input: Node) -> Option<Node> {
+fn result_node(expr: &Expr, input: Node, cx: Cx<'_>) -> Option<Node> {
+    if !cx.step() {
+        return None;
+    }
     match expr {
         Expr::Identity => Some(input),
-        Expr::Paren(inner) | Expr::Optional(inner) => result_node(inner, input),
+        Expr::Paren(inner) | Expr::Optional(inner) => result_node(inner, input, cx),
         Expr::Field(_) | Expr::Index { .. } | Expr::Iterate => Some(child(input)),
-        Expr::IndexExpr { target, .. } => result_node(target, input).map(child),
-        Expr::Pipe(stages) => stages
-            .iter()
-            .try_fold(input, |node, stage| result_node(stage, node)),
+        Expr::IndexExpr { target, .. } => result_node(target, input, cx).map(child),
+        // A stage that builds fresh results over any input decides alone, so an unknown stage
+        // before it does not matter (`del(.a) | "x"`).
+        Expr::Pipe(stages) => pipe_node(stages, input, cx),
         Expr::Comma(items) => {
-            let mut nodes = items.iter().map(|item| result_node(item, input));
+            let mut nodes = items.iter().map(|item| result_node(item, input, cx));
             let first = nodes.next()??;
             nodes.try_fold(first, |acc, node| either(acc, node?))
         }
+        // `{}` is a literal in yq; any other `{...}` takes its input's document.
         Expr::Literal(_) => Some(FRESH),
-        Expr::Array(_) | Expr::Not => Some(replacement(input)),
-        // Interpolation builds a new string node whatever its input.
-        Expr::StringInterpolation(_) => Some(FRESH),
+        Expr::Object(entries) if entries.is_empty() => Some(FRESH),
         Expr::Object(_) => Some(Node {
             document: input.document,
             parent: false,
         }),
+        Expr::Array(_) | Expr::Not => Some(replacement(input)),
+        // Interpolation builds a new string node whatever its input.
+        Expr::StringInterpolation(_) => Some(FRESH),
         // A comparison and `and`/`or` build their boolean as a replacement of the left operand
         // (`createBooleanCandidate(lhs)`), or of the right one where the left yields nothing, so a
         // left operand that always yields one result decides.
         Expr::Compare { left, right, .. } | Expr::And(left, right) | Expr::Or(left, right) => {
-            let left_node = replacement(result_node(left, input)?);
+            let left_node = replacement(result_node(left, input, cx)?);
             if yields_one(left) {
                 Some(left_node)
             } else {
-                either(left_node, replacement(result_node(right, input)?))
+                either(left_node, replacement(result_node(right, input, cx)?))
             }
         }
         // Arithmetic copies the right operand where the left is null and the left one otherwise, so a
-        // left literal that is not `null` decides; elsewhere both must agree. `//` is its left
-        // operand where that is truthy, which depends on the values.
+        // left literal that is not `null` decides; elsewhere both must agree.
         Expr::Arithmetic { left, right, .. } => match left.as_ref() {
             Expr::Literal(literal) if !matches!(literal, Literal::Null) => Some(FRESH),
-            _ => either(result_node(left, input)?, result_node(right, input)?),
+            _ => either(
+                result_node(left, input, cx)?,
+                result_node(right, input, cx)?,
+            ),
         },
-        Expr::Alternative(left, right) => {
-            either(result_node(left, input)?, result_node(right, input)?)
-        }
+        // `//` is its left operand where that is truthy and its right one otherwise: a literal on
+        // the left decides which; elsewhere both must agree.
+        Expr::Alternative(left, right) => match left.as_ref() {
+            Expr::Literal(literal) if truthy_literal(literal) => Some(FRESH),
+            Expr::Literal(_) => result_node(right, input, cx),
+            _ => either(
+                result_node(left, input, cx)?,
+                result_node(right, input, cx)?,
+            ),
+        },
         Expr::If {
             then_branch,
             else_branch,
             ..
         } => either(
-            result_node(then_branch, input)?,
-            result_node(else_branch, input)?,
+            result_node(then_branch, input, cx)?,
+            result_node(else_branch, input, cx)?,
         ),
-        Expr::Try { expr, catch: None } => result_node(expr, input),
-        // The body runs over the input; a `$name` it reads is not modelled (`Var` is unknown).
-        Expr::As { body, .. } => result_node(body, input),
+        Expr::Try { expr, catch: None } => result_node(expr, input, cx),
+        // The body runs over the input, with `$var` bound to the source's results.
+        Expr::As { expr, var, body } => {
+            let bound = Scope {
+                name: var,
+                node: result_node(expr, input, cx),
+                outer: cx.scope,
+            };
+            result_node(body, input, cx.with(&bound))
+        }
+        Expr::Var(name) => lookup(cx.scope, name),
         Expr::Format(
-            FormatType::Text
-            | FormatType::Json
+            FormatType::Json
             | FormatType::Yaml
             | FormatType::Props
             | FormatType::YqJson(_)
@@ -192,7 +324,6 @@ fn builtin_node(builtin: &Builtin, input: Node) -> Option<Node> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use succinctly::jq;
 
     fn fresh(filter: &str) -> bool {
         let mut program =
@@ -232,6 +363,15 @@ mod tests {
             "\"x\" and .a",
             "\"x\" + .s",
             "2 * .n",
+            "{}",
+            "1 // .a",
+            "false // \"x\"",
+            "\"x\" as $y | $y",
+            "[.a] as $x | $x",
+            ".a as $x | $x | \"y\"",
+            "del(.a) | \"x\"",
+            "(.a // 1) | \"x\"",
+            "sort_keys(.) | keys",
         ] {
             assert!(fresh(filter), "{filter}");
         }
@@ -258,9 +398,41 @@ mod tests {
             "sort_keys(.)",
             "split_doc | \"x\"",
             ". as $x | $x",
-            "del(.a) | \"x\"",
+            ".a as $x | $x",
+            ".a as $x | \"y\" | $x",
+            "false // .a",
+            "(.[] | split_doc) as $x | \"x\"",
+            "{\"a\": 1}",
         ] {
             assert!(!fresh(filter), "{filter}");
         }
+    }
+
+    /// Nested pipes each ask whether a stage is fresh before classifying it; the budget keeps a
+    /// deep filter (up to the parser's nesting limit of 256) from taking time exponential in its
+    /// depth, and only gives up (keeping the separators) once spent. On a thread of its own because
+    /// parsing that depth needs more than a test thread's stack in a debug build.
+    #[test]
+    fn a_deeply_nested_filter_is_classified_in_bounded_work_7019() {
+        std::thread::Builder::new()
+            .stack_size(256 << 20)
+            .spawn(|| {
+                let deep = |stage: &str| {
+                    format!(
+                        "{}\"x\"{}",
+                        format!("({stage} | ").repeat(250),
+                        ")".repeat(250)
+                    )
+                };
+                let started = std::time::Instant::now();
+                for stage in [".a", "del(.a)", ". as $v | $v"] {
+                    let _ = fresh(&deep(stage));
+                }
+                assert!(started.elapsed() < std::time::Duration::from_secs(5));
+                assert!(fresh(&deep(".a")));
+            })
+            .expect("spawn")
+            .join()
+            .expect("classified");
     }
 }
