@@ -131,14 +131,13 @@ fn null_input_refuses_files_7027() -> Result<()> {
     let dir = workdir()?;
     for args in [&["-n", ".", "d.yaml"][..], &["-n", "d.yaml"]] {
         let got = run(dir.path(), args, "")?;
-        assert_eq!(
-            (got.stdout.as_str(), got.stderr.as_str(), got.code),
-            (
-                "",
-                "Error: cannot pass files in when using null-input flag\n",
-                1
-            ),
-            "{args:?}"
+        // A CI run sets `RUST_BACKTRACE`, and anyhow then appends one after the error line.
+        assert_eq!((got.stdout.as_str(), got.code), ("", 1), "{args:?}");
+        assert!(
+            got.stderr
+                .starts_with("Error: cannot pass files in when using null-input flag\n"),
+            "{args:?}: {}",
+            got.stderr
         );
     }
     Ok(())
