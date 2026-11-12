@@ -179,6 +179,7 @@ pub use eval::{
 pub use eval::input_queue_is_active;
 // #6923: what `-e` reads under an `-o=<format>` encoder.
 pub use eval::{output_encoder_saw_truthy, reset_output_encoder_truthy};
+pub use eval::{set_yq_encoder_prefs, YqEncoderPrefs};
 // #3046: the CLI facts `input_filename`/`get_search_list`/`get_jq_origin`/
 // `get_prog_origin` read.
 pub use eval::cli_context;

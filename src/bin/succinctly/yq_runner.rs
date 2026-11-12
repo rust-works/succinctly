@@ -11963,6 +11963,13 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             other.len()
         ),
     };
+    // #6922: yq's `@props` and `@csv` operators read the same flags as `-o=props` and `-o=csv`.
+    jq::set_yq_encoder_prefs(jq::YqEncoderPrefs {
+        properties_separator: args.properties_separator.clone(),
+        properties_array_brackets: args.properties_array_brackets,
+        csv_separator,
+    });
+
     let output_encoder = match args.output_format {
         OutputFormat::Props => Some(YqOutputEncoder::Props {
             separator: args.properties_separator.clone(),

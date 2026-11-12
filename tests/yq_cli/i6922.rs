@@ -1,7 +1,8 @@
 //! The flags of `-o props` and `-o csv`: `--properties-separator`, `--properties-array-brackets`
 //! and `--csv-separator` (#6922, a follow-up to the `-o` encoders of #6850). Every answer was captured
 //! from yq v4.53.3; a row is kept only when both agree on stdout and the exit status. The `@props`
-//! and `@csv` operators ignore the flags here, where yq applies them (see the limitations page).
+//! / `to_props` and `@csv` / `to_csv` operators read the same flags, as in yq, wherever they are
+//! parsed: in the program, in the text an `eval` reads and in a `--split-exp` expression.
 
 use anyhow::Result;
 
@@ -163,5 +164,166 @@ fn csv_separator_must_be_one_byte_6922() -> Result<()> {
             "{separator:?}: {stderr}"
         );
     }
+    Ok(())
+}
+
+/// (filter, flags, yq's stdout, yq's exit status), over [`OPERATOR_INPUT`].
+const OPERATOR_ROWS: &[(&str, &[&str], &str, i32)] = &[
+    (".x | @csv", &["--csv-separator=;"], "1;\"a;b\"\n", 0),
+    (".x | to_csv", &["--csv-separator=;"], "1;\"a;b\"\n", 0),
+    (
+        "[{\"a\": 1, \"b\": \"x;y\"}] | @csv",
+        &["--csv-separator=;"],
+        "a;b\n1;\"x;y\"\n",
+        0,
+    ),
+    (".x | @tsv", &["--csv-separator=;"], "1\ta;b\n", 0),
+    (".x | @csv", &["--csv-separator=\""], "", 1),
+    (
+        ".y = (.x | @csv) | .y",
+        &["--csv-separator=|"],
+        "1|a;b\n",
+        0,
+    ),
+    (
+        ".m | @props",
+        &["--properties-separator=:"],
+        "k.0:1\nk.1.j:2\ns\\ p:v w\n\n",
+        0,
+    ),
+    (
+        ".m | to_props",
+        &["--properties-array-brackets"],
+        "k[0] = 1\nk[1].j = 2\ns\\ p = v w\n\n",
+        0,
+    ),
+    (
+        ".m | @props",
+        &["--properties-separator=:", "--properties-array-brackets"],
+        "k[0]:1\nk[1].j:2\ns\\ p:v w\n\n",
+        0,
+    ),
+    (
+        ".m |= @props | .m",
+        &["--properties-array-brackets"],
+        "k[0] = 1\nk[1].j = 2\ns\\ p = v w\n\n",
+        0,
+    ),
+    (
+        "\"a b\" | @props",
+        &["--properties-separator=:"],
+        "a b\n\n",
+        0,
+    ),
+    (".x | @csv", &["--properties-separator=:"], "1,a;b\n", 0),
+    (
+        ".m | @props",
+        &["--csv-separator=;"],
+        "k.0 = 1\nk.1.j = 2\ns\\ p = v w\n\n",
+        0,
+    ),
+    (
+        ".m | @props",
+        &["-o=props", "--properties-separator=:"],
+        "k.0:1\nk.1.j:2\ns\\ p:v w\n\n",
+        0,
+    ),
+];
+
+const OPERATOR_INPUT: &str = "x: [1, \"a;b\"]\nm: {k: [1, {j: 2}], \"s p\": v w}\n";
+
+#[test]
+fn the_operators_read_the_encoder_flags_6922() -> Result<()> {
+    for (filter, flags, expected, code) in OPERATOR_ROWS {
+        let (stdout, status) = run_yq_stdin(filter, OPERATOR_INPUT, flags)?;
+        assert_eq!(
+            (stdout.as_str(), status),
+            (*expected, *code),
+            "{flags:?} {filter}"
+        );
+    }
+    Ok(())
+}
+
+/// A refused `--csv-separator` fails the operator with yq's message from Go's `csv.Writer`.
+#[test]
+fn the_csv_operator_refuses_a_quote_separator_6922() -> Result<()> {
+    let (stdout, stderr, status) =
+        run_yq_stdin_with_stderr(".x | @csv", OPERATOR_INPUT, &["--csv-separator=\""])?;
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), status),
+        ("", "Error: csv: invalid field or comment delimiter\n", 1)
+    );
+    Ok(())
+}
+
+/// The text `eval` parses reads the flags too, as in yq: the setting belongs to the run, not to
+/// the program text it was parsed with.
+#[test]
+fn eval_text_reads_the_encoder_flags_6922() -> Result<()> {
+    for (filter, flag, expected) in [
+        ("eval(\".x | @csv\")", "--csv-separator=;", "1;\"a;b\"\n"),
+        (
+            "eval(\".m | @props\")",
+            "--properties-separator=:",
+            "k.0:1\nk.1.j:2\ns\\ p:v w\n\n",
+        ),
+    ] {
+        let (stdout, status) = run_yq_stdin(filter, OPERATOR_INPUT, &[flag])?;
+        assert_eq!((stdout.as_str(), status), (expected, 0), "{flag} {filter}");
+    }
+    Ok(())
+}
+
+/// `format("csv")` (a jq builtin, behind `--jq-extensions`) is `@csv`, so it reads the flag too.
+#[test]
+fn format_csv_reads_the_csv_separator_6922() -> Result<()> {
+    let (stdout, status) = run_yq_stdin(
+        ".x | format(\"csv\")",
+        OPERATOR_INPUT,
+        &["--jq-extensions", "--csv-separator=;"],
+    )?;
+    assert_eq!((stdout.as_str(), status), ("1;\"a;b\"\n", 0));
+    Ok(())
+}
+
+/// A `--split-exp` expression is parsed apart from the program and reads the flag as well: yq names
+/// the files `1;2.yml` and `3;4.yml`. The names are compared without the extension, which yq adds and
+/// `succinctly yq` does not (a separate difference). `--split-exp` is long-only here, since `-s` is
+/// `--slurp` (#715).
+#[test]
+fn split_exp_reads_the_csv_separator_6922() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    std::fs::write(dir.path().join("rows.yaml"), "- [1, 2]\n- [3, 4]\n")?;
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .args([
+            "yq",
+            "--csv-separator=;",
+            "--split-exp",
+            ". | @csv",
+            ".[]",
+            "rows.yaml",
+        ])
+        .current_dir(dir.path())
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut names: Vec<String> = std::fs::read_dir(dir.path())?
+        .map(|entry| {
+            entry.map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                match name.strip_suffix(".yml") {
+                    Some(stem) => stem.to_string(),
+                    None => name,
+                }
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    names.sort();
+    assert_eq!(names, ["1;2", "3;4", "rows.yaml"]);
     Ok(())
 }
