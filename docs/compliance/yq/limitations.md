@@ -7855,3 +7855,15 @@ These still differ:
 - **`keys`, `to_entries` and the other reads of a key node print it without the style.**
   yq prints `- |-` / `  a` / `  b` for `keys` over the key above, where this prints `- "a\nb"` ([#5450](https://github.com/rust-works/succinctly/issues/5450)).
 - **`-P` over an anchored literal key writes `? &k "a\nb"`**, where yq keeps `? &k |-`.
+
+## `env(..)` and `strenv(..)` take the raw text up to the `)` as the variable name, as yq's lexer does ([#7070](https://github.com/rust-works/succinctly/issues/7070))
+
+`strenv("NAME")` looks up a variable called `"NAME"` with the quotes in it, as yq v4.53.3 does (the docs' own `yq -n 'strenv("MYENV")'` finds none and prints an empty line), `strenv( X )` one called ` X `, `strenv(a;b)` one called `a;b`, and `strenv(.a)` one called `.a`.
+`env("NAME")` raises `value for env variable '"NAME"' not provided in env()` for the same reason.
+`tests/yq_cli/i7070.rs` pins 19 rows captured from yq.
+In jq mode (`env(VAR)` is succinctly's extension there) the argument stays an identifier.
+
+- **`strenv (X)` with a blank before the `(` is accepted here.**
+  yq's lexer refuses it (`invalid input text "strenv (PLAIN)"`).
+- **The wording of the errors differs.**
+  An empty argument (`strenv()`, `env()`) and an extra `)` (`strenv(a(b))`) fail in both; yq says `invalid input text "strenv()"` and `bad expression, got close brackets without matching opening bracket`, this says `parse error ... expected identifier, found ')'` and `unexpected character ')'`.
