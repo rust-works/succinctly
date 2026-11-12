@@ -603,12 +603,8 @@ fn with_update_effect(update: &Expr) -> Expr {
         Expr::Comma(items) => Expr::pipe(items.iter().map(with_update_effect).collect()),
         Expr::Pipe(stages) => with_update_pipe_effect(stages),
         // `SRC as $v | rest`: the binding is kept, and `rest` contributes its changes (`.b as $v |
-        // .z = $v` writes `z`); SRC itself is evaluated, so its errors still count.
-        // yq binds each value in turn and the writes of each land on the same node, so the last
-        // value's write wins and `+=` accumulates (`with(.k; .x[] as $v | .y += $v)` over `x: [1,
-        // 2]` is `y: 3`, #7068): a `reduce`, not a binding whose first output is kept.
-        // `SRC as $v | rest`: the binding is kept, and `rest` contributes its changes (`.b as $v |
-        // .z = $v` writes `z`); SRC itself is evaluated, so its errors still count.
+        // .z = $v` writes `z`); SRC itself is evaluated, so its errors still count. Only the first
+        // value's writes are kept, where yq keeps each value's (#7094).
         Expr::As { expr, var, body } => Expr::As {
             expr: expr.clone(),
             var: var.clone(),
@@ -667,7 +663,9 @@ fn update_body_effect(body: &Expr) -> Option<Expr> {
     }
 }
 
-/// Whether `expr` answers the node it runs on, once its in-place writes are done: `.`, an
+/// Whether `expr` answers the node it runs on, once its in-place writes are done (the first output
+/// `|=` keeps, so unlike [`is_with_write_expr`] it admits `.` and reads only a comma's first
+/// branch): `.`, an
 /// assignment or a delete, alone or in a group, a pipe or behind a binding. `allow_empty` also
 /// admits `select`, which answers nothing when it fails.
 fn answers_the_node(expr: &Expr, allow_empty: bool) -> bool {
@@ -740,7 +738,8 @@ fn with_update_pipe_effect(stages: &[Expr]) -> Expr {
     }
 }
 
-/// Whether `expr` names one node by fixed steps (`.a`, `.a.b`, `.l[3]`): the left operands of a
+/// Whether `expr` names one node by fixed steps (`.a`, `.a.b`, `.l[3]`, an optional `.a?`, in
+/// parentheses or not): the left operands of a
 /// `//` target that [`yq_alternative_target`] creates and tests.
 fn is_single_static_path(expr: &Expr) -> bool {
     match expr {
@@ -761,15 +760,6 @@ fn alternative_operands<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
             alternative_operands(right, out);
         }
         operand => out.push(operand),
-    }
-}
-
-/// [`yq_alternative_target`] in yq mode, and `None` in jq mode.
-fn yq_alternative_update_parts(mode: ParserMode, target: &Expr) -> Option<(Expr, Expr)> {
-    if mode == ParserMode::Yq {
-        yq_alternative_target(target)
-    } else {
-        None
     }
 }
 
@@ -834,14 +824,10 @@ fn yq_alternative_target(target: &Expr) -> Option<(Expr, Expr)> {
     let after_write = operands[lefts + 1..]
         .iter()
         .rev()
-        .fold(None, |rest: Option<Expr>, operand| {
-            Some(match rest {
-                None => (*operand).clone(),
-                Some(rest) => Expr::Alternative(Box::new((*operand).clone()), Box::new(rest)),
-            })
-        })
+        .map(|operand| (*operand).clone())
+        .reduce(|rest, operand| Expr::alternative(operand, rest))
         .map_or(Expr::Identity, |rest| {
-            Expr::Alternative(Box::new(Expr::Identity), Box::new(rest))
+            Expr::alternative(Expr::Identity, rest)
         });
     let target = operands[..lefts]
         .iter()
@@ -866,7 +852,9 @@ fn is_navigation_expr(expr: &Expr) -> bool {
 }
 
 /// Whether `expr` is an in-place write of a `with` update: an assignment (`=`, `|=`, `op=`, `//=`)
-/// or a delete (`del`, `delpaths`, #6840), alone or comma'd or piped with others. Not
+/// or a delete (`del`, `delpaths`, #6840), alone or comma'd or piped with others, or behind a
+/// binding (#7068). It reads every branch of a comma, where [`answers_the_node`] reads the first.
+/// Not
 /// `eval::is_assignment_expr`, whose answer serves the evaluator's own analyses and so has to
 /// stay what they need.
 fn is_with_write_expr(expr: &Expr) -> bool {
@@ -11272,7 +11260,10 @@ impl<'a> Parser<'a> {
                 }
             }
         };
-        match yq_alternative_update_parts(self.mode, &target) {
+        match (self.mode == ParserMode::Yq)
+            .then(|| yq_alternative_target(&target))
+            .flatten()
+        {
             Some((writes, target)) => Expr::pipe(vec![writes, build(target, value)]),
             None => build(target, value),
         }
@@ -11287,7 +11278,10 @@ impl<'a> Parser<'a> {
             path: Box::new(path),
             value: Box::new(value),
         };
-        match yq_alternative_update_parts(self.mode, &target) {
+        match (self.mode == ParserMode::Yq)
+            .then(|| yq_alternative_target(&target))
+            .flatten()
+        {
             Some((writes, target)) => Expr::pipe(vec![writes, build(target)]),
             None => build(target),
         }

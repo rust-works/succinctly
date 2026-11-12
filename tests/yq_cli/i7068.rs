@@ -213,8 +213,11 @@ fn a_nested_idiom_parses_in_bounded_memory_7068() -> Result<()> {
     for _ in 0..8 {
         filter = format!("(.a // .b // .c // .d // .e // .f // (.g = 0)) |= ({filter})");
     }
+    let started = std::time::Instant::now();
     let (stdout, status) = run_yq_stdin(&filter, "b: 1\n", &[])?;
     assert_eq!((stdout.as_str(), status), ("b: 1\na: null\n", 0));
+    // A copy per operand took seconds and gigabytes at this depth; linear growth takes milliseconds.
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
     Ok(())
 }
 
@@ -223,6 +226,7 @@ fn a_nested_idiom_parses_in_bounded_memory_7068() -> Result<()> {
 /// more than 3 GB to parse at about twenty levels).
 #[test]
 fn a_nested_last_operand_and_chained_bindings_parse_in_bounded_memory_7068() -> Result<()> {
+    let started = std::time::Instant::now();
     let mut filter = String::from("(.z = 0)");
     for depth in 0..22 {
         filter = format!("((.a{depth} // {filter}) += 1)");
@@ -235,5 +239,7 @@ fn a_nested_last_operand_and_chained_bindings_parse_in_bounded_memory_7068() -> 
     let filter = format!("with(.k; {} | .y = 1)", bindings.join(" | "));
     let (stdout, status) = run_yq_stdin(&filter, "k: {x: 1}\n", &[])?;
     assert_eq!((stdout.as_str(), status), ("k: {x: 1, y: 1}\n", 0));
+    // Doubling the body at each binding took gigabytes; linear growth takes milliseconds.
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
     Ok(())
 }
