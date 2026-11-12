@@ -5430,10 +5430,11 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                             Some((next.seam, next.origin)),
                         ),
                         Ok(None) => break,
+                        // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
                         Err(error) => {
                             report_input_read_failure(&error);
                             break;
-                        }
+                        } // patchcov: coverage end
                     },
                     None => match whole_files.next() {
                         Some((idx, raw)) => (idx, raw.as_slice(), None, 0, false, None),

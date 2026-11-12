@@ -523,9 +523,10 @@ impl WindowedFile {
         match read_range(&self.file, from, self.file_read) {
             Ok(bytes) => tail.extend(bytes),
             // The tail is cut short: the run ends at this failure, which is reported after the window.
+            // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
             Err(error) => {
                 self.read_error.get_or_insert(error);
-            }
+            } // patchcov: coverage end
         }
         tail
     }
@@ -649,10 +650,12 @@ fn read_range(file: &File, from: u64, to: u64) -> io::Result<Vec<u8>> {
     let mut filled = 0;
     while filled < bytes.len() {
         match file.read_at(&mut bytes[filled..], from + filled as u64) {
-            Ok(0) => break,
-            Ok(read) => filled += read,
+            Ok(read) if read > 0 => filled += read,
+            // patchcov: coverage tolerate reason="untestable: a file that shrank while the run read it, and a read that fails"
+            Ok(_) => break,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
+            // patchcov: coverage end
         }
     }
     bytes.truncate(filled);
@@ -708,13 +711,13 @@ impl WindowedFiles {
         if !self.reach_a_file_with_windows_left()? {
             return Ok(None);
         }
-        let Some(current) = self.current.as_mut() else {
-            return Ok(None);
-        };
-        let index = current.index;
-        current
-            .next_window_with(&mut self.stitcher)
-            .map(|window| window.map(|window| (index, window)))
+        let stitcher = &mut self.stitcher;
+        self.current.as_mut().map_or(Ok(None), |current| {
+            let index = current.index;
+            current
+                .next_window_with(stitcher)
+                .map(|window| window.map(|window| (index, window)))
+        })
     }
 
     /// Leaves `current` a file whose last window has not been handed out, moving on from the one that
@@ -1984,5 +1987,47 @@ mod stream_tests {
             reread.stream_fault().as_deref(),
             Some("Unmatched '}' at line 3, column 1")
         );
+    }
+
+    /// A file with no line break to cut a window at (one long document) is read on for all of what is left
+    /// in one go, once the reads that asked for twice as much are 4 MiB: for a file whose length is known the
+    /// rest of it, and for one whose length is not a few windows at a time.
+    #[test]
+    fn one_long_line_is_read_on_whether_or_not_the_length_is_known_7024() {
+        let mut text = b"[1".to_vec();
+        text.extend(std::iter::repeat_n(*b",1", 4_500_000).flatten());
+        text.extend_from_slice(b"]\n");
+        for len in [text.len() as u64, 0] {
+            let mut reader = WindowedFiles::new(vec![(Rc::new(temp_file(&text)), len)], 1 << 16);
+            let mut documents = Vec::new();
+            while let Some((_, window)) = reader.next_window().expect("reads") {
+                documents.extend(window.values.iter().map(|&(start, end)| end - start));
+            }
+            assert_eq!(documents, vec![text.len() - 1], "length {len}");
+        }
+    }
+
+    /// A read that failed is returned after its file's last window, so the documents before it are run, and
+    /// the files after it are not reached by the caller that stops there.
+    #[test]
+    fn a_failed_read_is_returned_after_the_files_last_window_7024() {
+        let mut reader = WindowedFiles::new(
+            vec![
+                (Rc::new(temp_file(b"1\n")), 2),
+                (Rc::new(temp_file(b"2\n")), 2),
+            ],
+            4096,
+        );
+        assert!(reader.reach_a_file_with_windows_left().expect("opens"));
+        reader.current.as_mut().expect("a file").read_error = Some(io::Error::other("injected"));
+        let (index, window) = reader.next_window().expect("reads").expect("a window");
+        assert_eq!((index, window.values.len()), (0, 1));
+        let Err(error) = reader.next_window() else {
+            panic!("the failure follows the last window");
+        };
+        assert_eq!(error.to_string(), "injected");
+        let (index, window) = reader.next_window().expect("reads").expect("a window");
+        assert_eq!((index, window.values.len()), (1, 1));
+        assert!(reader.next_window().expect("done").is_none());
     }
 }
