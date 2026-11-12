@@ -7476,18 +7476,18 @@ Peak resident set size at 100 MiB (993,416 records, 105,851,071 bytes with an RS
 
 | machine           | before | after |
 |-------------------|-------:|------:|
-| AMD Ryzen 9 7950X |  126.0 |  10.4 |
-| Apple M4 Pro      |  123.4 |   6.7 |
+| AMD Ryzen 9 7950X |  125.9 |  11.2 |
+| Apple M4 Pro      |  123.5 |   6.8 |
 
-The x86_64 figures are `/usr/bin/time -f %M` on `terminus` (126.0 before and 10.4 after for `-c .`, 126.4 and 10.4 for `-r .name`; at 10 MiB 21.5 and 10.4, flat), the aarch64 ones `/usr/bin/time -l` on `johns-mac-mini` (123.4 and 6.7 at 100 MiB, 16.9 and 6.7 at 10 MiB), medians of 5, release builds with `--features cli`, base `main` @ `8e55c18b2`.
+The x86_64 figures are `/usr/bin/time -f %M` on `terminus` (at 10 MiB 21.7 and 11.2, flat), the aarch64 ones `/usr/bin/time -l` on `johns-mac-mini` (at 10 MiB 17.0 and 6.8), medians of 5, release builds with `--features cli`, base `main` @ `0b39b94ae` (which has the several-files route, #7024).
 jq 1.7.1's peak on the same file is 2.3 MiB.
 The output of every row is byte-identical to the base binary's, on a file, `< file` and a pipe, and to jq 1.7.1's for the identity, `.name`, `select` and `input_line_number` rows.
 
-Time, interleaved (11 repetitions, a control run of the base beside the real one, output and exit status gated, an idle `terminus` and a `johns-mac-mini` that had a browser and an editor open):
+Time, interleaved (11 repetitions, a control run of the base beside the real one, output and exit status gated, an idle `terminus` and a `johns-mac-mini` that carried a load of 2 to 3 from other work):
 
-- **x86_64:** `-c .` reads −6.1% at 100 MiB and −4.9% at 10 MiB, `-r .name` −4.4% and −3.5%, against a control of −0.2% to −0.1%.
-- **aarch64:** `-c .` reads +1.4% at 100 MiB and +2.5% at 10 MiB, `-r .name` +0.4% and −0.0%, against a control of +0.9% and −1.6%: neutral to slightly slower, the prepass being a pass over the file the whole-file route had made as its own check.
-- **Below 4 MiB** the file is read whole as before: 1 MiB rows read −1.2% to −2.4% (x86_64) and −0.1% to −0.4% (aarch64), a gap of a few tenths of a millisecond.
+- **x86_64:** `-c .` reads −6.0% at 100 MiB and −4.1% at 10 MiB, `-r .name` −4.7% and −3.2%, against a control of −0.5% and +0.6%.
+- **aarch64:** `-c .` reads −1.3% at 100 MiB and +0.4% at 10 MiB, `-r .name` −0.8% and −2.0%, against a control of +0.6% and +3.8%: neutral, the prepass being a pass over the file that the whole-file route made as its own check.
+- **Below 4 MiB** the route is not taken: the 1 MiB rows read +0.2% and +0.8% (x86_64) and +2.9% and −3.6% (aarch64), a few tenths of a millisecond.
 
 It was checked against the base binary over 1,680 runs of 210 random 4 to 7 MiB streams (pretty-printed and compact records, a 2 MB record, `\r\n` and blank-line endings, a truncated tail, a stray or doubled RS, a BOM, a NUL, invalid UTF-8, a flipped byte), each under four of seven programs on a file and as `< file`: no difference in stdout, stderr or exit status.
 
