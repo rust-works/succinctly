@@ -1422,6 +1422,24 @@ mod tests {
         assert!(!reread(text.len() as u64 + 10).is_plain_seq_records());
     }
 
+    /// #7082: the prepass vouches for one stream of one source: several files, which the run's gate
+    /// leaves to the route that reads them whole, are never records to it.
+    #[cfg(unix)]
+    #[test]
+    fn the_seq_prepass_vouches_for_one_source_only_7082() {
+        let text = b"\x1e{\"a\":1}\n";
+        let open = || {
+            let mut file = tempfile::tempfile().expect("a temp file");
+            file.write_all(text).expect("written");
+            Rc::new(file)
+        };
+        let len = text.len() as u64;
+        assert!(Reread::new(&open(), 0, len, PathBuf::new())
+            .expect("a reread")
+            .is_plain_seq_records());
+        assert!(!Reread::new_many(&[(open(), len), (open(), len)]).is_plain_seq_records());
+    }
+
     #[test]
     fn a_leading_bom_is_skipped_and_a_later_one_is_not() {
         let mut text = b"\xef\xbb\xbf".to_vec();
