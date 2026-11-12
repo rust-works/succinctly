@@ -43782,7 +43782,11 @@ fn owned_identity_after_prefetch(
 /// cursor's own `style()` stays the style without the tag: the writers echo it.
 fn node_style_getter<C: DocumentCursor>(cursor: &C) -> &'static str {
     // #7031: a `-p props` node has no style in yq.
-    let style = if cursor.style_less() { "" } else { cursor.style() };
+    let style = if cursor.style_less() {
+        ""
+    } else {
+        cursor.style()
+    };
     // `!<!>` is the verbatim spelling of the non-specific `!`.
     match cursor
         .explicit_tag_of_non_alias()
