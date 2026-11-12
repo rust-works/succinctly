@@ -721,7 +721,9 @@ fn with_update_pipe_effect(stages: &[Expr]) -> Expr {
             stages.extend_from_slice(rest);
             with_update_pipe_effect(&stages)
         }
-        head if is_with_write_expr(head) => Expr::pipe(vec![
+        // A write, or a binding around one (`(.x as $v | .y = $v) | .z = 2` writes `y` and `z`, as
+        // yq does; #7068's rewritten `//` updates are such bindings).
+        head if writes_in_place(head) => Expr::pipe(vec![
             with_update_effect(head),
             with_update_pipe_effect(rest),
         ]),
@@ -736,7 +738,7 @@ fn with_update_pipe_effect(stages: &[Expr]) -> Expr {
 }
 
 /// Whether `expr` names one node by fixed steps (`.a`, `.a.b`, `.l[3]`): the left operands of a
-/// `//` target that [`yq_alternative_target_update`] creates and tests.
+/// `//` target that [`yq_alternative_target`] creates and tests.
 fn is_single_static_path(expr: &Expr) -> bool {
     match expr {
         Expr::Field(_) | Expr::Index { .. } => true,
@@ -759,26 +761,58 @@ fn alternative_operands<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
     }
 }
 
-/// yq's update of a `//` target (#7068), `(L // R) op= V`, as an expression the evaluator already
-/// reads the way yq does, or `None` when `target` is not a `//` whose first operand is one node by
-/// fixed steps. `make` builds the update for a given target.
+/// Whether `expr` changes the node it runs on in place and answers it: an assignment or delete, or a
+/// group, comma, pipe or binding of them, a rewritten `//` update included. The writes a `//`
+/// target's last operand makes in yq's update-or-create idiom ([`yq_alternative_target`]).
+fn writes_in_place(expr: &Expr) -> bool {
+    match expr {
+        Expr::Paren(inner) => writes_in_place(inner),
+        Expr::Comma(items) => !items.is_empty() && items.iter().all(writes_in_place),
+        Expr::Pipe(stages) => !stages.is_empty() && stages.iter().all(writes_in_place),
+        Expr::As { body, .. } => writes_in_place(body),
+        write => is_with_write_expr(write),
+    }
+}
+
+/// The in-place change [`writes_in_place`] names, as one expression: a comma applies each part in
+/// turn, as yq's shared document does.
+fn in_place_effect(expr: &Expr) -> Expr {
+    match expr {
+        Expr::Paren(inner) => in_place_effect(inner),
+        Expr::Comma(items) => Expr::pipe(items.iter().map(in_place_effect).collect()),
+        write => write.clone(),
+    }
+}
+
+/// [`yq_alternative_target`] in yq mode, and `None` in jq mode.
+fn yq_alternative_update_parts(mode: ParserMode, target: &Expr) -> Option<(Expr, Expr)> {
+    if mode == ParserMode::Yq {
+        yq_alternative_target(target)
+    } else {
+        None
+    }
+}
+
+/// yq's update-or-create idiom (#7068): an update whose target is a `//` chain of operands that
+/// each name one node by fixed steps (`.a`, `.a.b`, `.l[3]`), ending in an operand that writes
+/// (`(.a // (.a = 0)) += 1`). The answer is the writes to make first and the target to update
+/// after them, so the update's own value is written once; `None` for any other target.
 ///
 /// yq evaluates the target in the document the update writes to: reading `L` creates it as `null`
-/// when it is absent, `L`'s node is the target when it is truthy, and otherwise `R` is evaluated
-/// in the same document, so a write in `R` (`.a = 0`) changes `L`'s node, which `//` then tests
-/// again: the target is `L`'s node if it is truthy now, and the document otherwise (`R`'s value,
-/// which an assignment is). So `(.a // (.a = 0)) += 1` creates `a: 1`, `(.a // .z) += 1` leaves
-/// `a: null` beside `z: 1`, and `(.a // (.c.d = 0)) += 1` adds `1` to the document, an error.
-/// Measured against yq v4.53.3.
+/// when it is absent, `L`'s node is the target when it is truthy, and otherwise the next operand
+/// is evaluated in that same document, so the write changes `L`'s node, which `//` then tests
+/// again: the target is `L`'s node if it is truthy now, and the document otherwise (an
+/// assignment's value). So the idiom creates `a: 1`, and `(.a // (.c.d = 0)) += 1` adds `1` to
+/// the document, an error. Measured against yq v4.53.3.
 ///
-/// Each leading operand that names one node (`L0 // L1 // ...`) becomes `(L |= .) | ([L] | .[0] |
-/// not | not) as $t | select($t) |= (L op= V) | select($t | not) |= ELSE`: `L |= .` creates it, and the
-/// two conditional writes are `with(select(..); ..)`, which keep the document's comments and
-/// style where an `if` would not. A tail that writes is its in-place effect
-/// ([`with_update_effect`]) followed by the same tests on the changed document, ending in
-/// `. op= V`; any other tail is the original update, which the path resolver now reads with every
-/// left operand `null`.
-fn yq_alternative_target_update(target: &Expr, make: &dyn Fn(Expr) -> Expr) -> Option<Expr> {
+/// The writes are, for each `L` in turn, `(L |= .) | ([L] | .[0] | not | not) as $t |
+/// select($t | not) |= NEXT`, ending in the last operand's writes: `L |= .` creates `L`, the next
+/// operand runs only while every `L` before it is falsy (`[L] | .[0]` reads an `L` that yields
+/// nothing, `.a.b` through a scalar `a`, as `null`), and the conditional writes are
+/// `with(select(..); ..)`, which keep comments and style where an `if` would not. The target is
+/// `if L0 then L0 elif L1 then L1 ... else . end`. A chain that ends in anything else (`(.a // .z)
+/// = 1`) keeps the path resolver's reading, which does not create `a`: see `limitations.md`.
+fn yq_alternative_target(target: &Expr) -> Option<(Expr, Expr)> {
     let mut operands = Vec::new();
     alternative_operands(target, &mut operands);
     let lefts = operands
@@ -786,63 +820,44 @@ fn yq_alternative_target_update(target: &Expr, make: &dyn Fn(Expr) -> Expr) -> O
         .take(operands.len() - 1)
         .take_while(|operand| is_single_static_path(operand))
         .count();
-    if lefts == 0 {
+    if lefts == 0 || !writes_in_place(operands[lefts]) {
         return None;
     }
-    // `L`'s node is the target when it is truthy, else `otherwise` is applied, both as writes to the
-    // node the update runs on. The variable's name cannot be written in a filter.
-    let either = |depth: usize, left: &Expr, otherwise: Expr| {
-        let var = format!("// left {depth}");
-        let when = |cond: Expr, write: Expr| Expr::Update {
-            path: Box::new(Expr::Builtin(Builtin::Select(Box::new(cond)))),
-            filter: Box::new(write),
-        };
-        Expr::As {
-            // `[L] | .[0]`: a left operand that yields nothing (`.a.b` through a scalar `a`) is
-            // falsy to `//`, as `null` is, where `L | ...` would bind nothing and write nothing.
-            expr: Box::new(Expr::pipe(vec![
-                Expr::Array(Box::new(left.clone())),
-                Expr::index(0),
-                Expr::Not,
-                Expr::Not,
-            ])),
-            var: var.clone(),
-            body: Box::new(Expr::pipe(vec![
-                when(Expr::Var(var.clone()), make(left.clone())),
-                when(Expr::pipe(vec![Expr::Var(var), Expr::Not]), otherwise),
-            ])),
-        }
-    };
-    // A write past the left operands is reached only when they are all falsy; it answers the
-    // document, which is truthy, so nothing after it is evaluated.
-    let tail = match operands[lefts] {
-        write if is_with_write_expr(write) => {
-            let retest = operands[..lefts]
-                .iter()
-                .enumerate()
-                .rev()
-                .fold(make(Expr::Identity), |els, (depth, left)| {
-                    either(lefts + depth, left, els)
-                });
-            Expr::pipe(vec![with_update_effect(write), retest])
-        }
-        _ => make(target.clone()),
-    };
-    Some(
-        operands[..lefts]
-            .iter()
-            .enumerate()
-            .rev()
-            .fold(tail, |els, (depth, left)| {
-                Expr::pipe(vec![
-                    Expr::Update {
-                        path: Box::new((*left).clone()),
-                        filter: Box::new(Expr::Identity),
-                    },
-                    either(depth, left, els),
-                ])
-            }),
-    )
+    // `[L] | .[0]`: an `L` that yields nothing is falsy, as `null` is.
+    let first = |left: &Expr| Expr::pipe(vec![Expr::Array(Box::new(left.clone())), Expr::index(0)]);
+    let writes = operands[..lefts].iter().enumerate().rev().fold(
+        in_place_effect(operands[lefts]),
+        |next, (depth, left)| {
+            // The variable's name cannot be written in a filter.
+            let var = format!("// left {depth}");
+            Expr::pipe(vec![
+                Expr::Update {
+                    path: Box::new((*left).clone()),
+                    filter: Box::new(Expr::Identity),
+                },
+                Expr::As {
+                    expr: Box::new(Expr::pipe(vec![first(left), Expr::Not, Expr::Not])),
+                    var: var.clone(),
+                    body: Box::new(Expr::Update {
+                        path: Box::new(Expr::Builtin(Builtin::Select(Box::new(Expr::pipe(vec![
+                            Expr::Var(var),
+                            Expr::Not,
+                        ]))))),
+                        filter: Box::new(next),
+                    }),
+                },
+            ])
+        },
+    );
+    let target = operands[..lefts]
+        .iter()
+        .rev()
+        .fold(Expr::Identity, |otherwise, left| Expr::If {
+            cond: Box::new(first(left)),
+            then_branch: Box::new((*left).clone()),
+            else_branch: Box::new(otherwise),
+        });
+    Some((writes, target))
 }
 
 /// Whether `expr` only walks to nodes of the document (`.b`, `.[0]`, `.[]`, `.a.b`, `.a?`).
@@ -11247,42 +11262,38 @@ impl<'a> Parser<'a> {
                 is_update,
             };
         }
-        let make = |path: Expr| {
+        let build = |path: Expr, value: Expr| {
             if is_update {
                 Expr::Update {
                     path: Box::new(path),
-                    filter: Box::new(value.clone()),
+                    filter: Box::new(value),
                 }
             } else {
                 Expr::Assign {
                     path: Box::new(path),
-                    value: Box::new(value.clone()),
+                    value: Box::new(value),
                 }
             }
         };
-        if self.mode == ParserMode::Yq {
-            if let Some(update) = yq_alternative_target_update(&target, &make) {
-                return update;
-            }
+        match yq_alternative_update_parts(self.mode, &target) {
+            Some((writes, target)) => Expr::pipe(vec![writes, build(target, value)]),
+            None => build(target, value),
         }
-        make(target)
     }
 
-    /// An `op=` update of `left` (`+=`, `*=`, ...), through [`yq_alternative_target_update`] in yq
-    /// mode (#7068).
+    /// An `op=` update of `left` (`+=`, `*=`, ...), with yq's update-or-create idiom read as yq does
+    /// (#7068).
     fn compound_assign(&self, op: AssignOp, left: Expr, value: Expr) -> Expr {
         let target = Self::fold_sum_or_merge_key(left);
-        let make = |path: Expr| Expr::CompoundAssign {
+        let build = |path: Expr| Expr::CompoundAssign {
             op,
             path: Box::new(path),
-            value: Box::new(value.clone()),
+            value: Box::new(value),
         };
-        if self.mode == ParserMode::Yq {
-            if let Some(update) = yq_alternative_target_update(&target, &make) {
-                return update;
-            }
+        match yq_alternative_update_parts(self.mode, &target) {
+            Some((writes, target)) => Expr::pipe(vec![writes, build(target)]),
+            None => build(target),
         }
-        make(target)
     }
 
     /// Parse assignment expressions: `path = value`, `path |= filter`, `path += value`, etc.
