@@ -815,3 +815,20 @@ fn kyaml_by_extension_and_inplace_6925() -> Result<()> {
     );
     Ok(())
 }
+
+/// An explicit `-p kyaml` (or `ky`) prints YAML under `-o auto`, where the extension prints
+/// KYAML, and `--front-matter` is accepted with it: it is the YAML reader, as in yq.
+#[test]
+fn explicit_kyaml_prints_yaml_and_accepts_front_matter_6925() -> Result<()> {
+    let dir = TempDir::new()?;
+    let md = write_file(&dir, "f.md", b"---\na: 1\n---\nbody\n")?;
+    assert_eq!(
+        run_yq_stdin_with_stderr(".", "{a: 1,}\n", &["-p", "ky"])?,
+        ("a: 1\n".into(), String::new(), 0)
+    );
+    assert_eq!(
+        run_yq_files(".", &[&md], &["-p", "ky", "--front-matter", "extract"])?,
+        ("a: 1\n".into(), String::new(), 0)
+    );
+    Ok(())
+}
