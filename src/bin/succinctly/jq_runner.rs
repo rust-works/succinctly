@@ -11298,14 +11298,20 @@ fn windowed_plain_file(
     let reread = window::Reread::new(&file, 0, meta.len(), path.clone()).ok()?;
     Some((
         files,
-        window::WindowedFiles::new(vec![(file, meta.len())], window::WINDOW_BYTES),
+        window::WindowedFiles::new(
+            vec![(std::rc::Rc::new(file), meta.len())],
+            window::WINDOW_BYTES,
+        ),
         std::rc::Rc::new(reread),
     ))
 }
 
 /// How many files the several-files route holds open: each is kept by the second read that words a
-/// fault, which reads them all again, and a process has only so many descriptors.
-const MAX_WINDOWED_FILES: usize = 64;
+/// fault, which reads them all again, and a process has only so many descriptors. A process's descriptor
+/// table starts at 64 slots and doubling it waits for an RCU grace period (35 ms on the 7950X's Linux, for
+/// each doubling) when the process has a thread besides, so a list that took the table past 64 added more
+/// than the whole of a 10 MiB run: 32 files and the standard ones stay under it.
+const MAX_WINDOWED_FILES: usize = 32;
 
 /// Several regular files, 4 MiB or more between them, read a window at a time as the one stream jq reads
 /// them as (#7024). Each is judged as the lone file is ([`regular_file`]), and one that is not, one that
@@ -11335,11 +11341,9 @@ fn windowed_regular_files(
         if !meta.is_file() || names_stdin(&meta) || names_output(&meta) {
             return None;
         }
-        opened.push((file, meta.len()));
+        opened.push((std::rc::Rc::new(file), meta.len()));
     }
-    let handles: Vec<(&std::fs::File, u64)> =
-        opened.iter().map(|(file, len)| (file, *len)).collect();
-    let reread = window::Reread::new_many(&handles).ok()?;
+    let reread = window::Reread::new_many(&opened);
     Some((
         window::WindowedFiles::new(opened, window::WINDOW_BYTES),
         std::rc::Rc::new(reread),
@@ -11423,7 +11427,7 @@ fn windowed_regular_stdin(
     }
     let reread = window::Reread::new(&file, start, len, PathBuf::new()).ok()?;
     Some((
-        window::WindowedFiles::new(vec![(file, len)], window::WINDOW_BYTES),
+        window::WindowedFiles::new(vec![(std::rc::Rc::new(file), len)], window::WINDOW_BYTES),
         std::rc::Rc::new(reread),
     ))
 }
@@ -12485,9 +12489,7 @@ fn open_tail_start(raw: &[u8], resumes: bool, seam: Seam, stream: bool) -> Optio
             return Some(start);
         }
         // Whole, or malformed at a byte no later file can repair, after which jq resumes.
-        let Some(start) = fault.filter(|_| resumes) else {
-            return None;
-        };
+        let start = fault.filter(|_| resumes)?;
         let (_, _, resume) = meet_fault(&mut faults, raw, start, stream);
         if resume >= raw.len() {
             return None;

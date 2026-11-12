@@ -52,6 +52,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::ops::Range;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use succinctly::jq::utf8_document::{original_offset, SubstitutionEdit};
 
@@ -214,7 +215,9 @@ impl RawMap {
 
 /// A regular file read in windows; see the module's doc.
 pub(super) struct WindowedFile {
-    file: File,
+    /// Shared with the second read of the stream, which reads by position and so leaves this one's place
+    /// alone: a descriptor each, not two.
+    file: Rc<File>,
     /// How much of the file is left to read: its length when it was opened, less what was read. A
     /// file that grows meanwhile is read as it was, as `std::fs::read` read it, so a run whose
     /// output is appended to its input ends.
@@ -279,11 +282,11 @@ impl WindowedFile {
     /// `file` is read from its start, up to `len` bytes.
     #[cfg(test)]
     pub(super) fn new(file: File, len: u64, block: usize) -> Self {
-        Self::in_stream(file, len, block, Place::alone())
+        Self::in_stream(Rc::new(file), len, block, Place::alone())
     }
 
     /// `file`, one of several read as one stream (#7024).
-    pub(super) fn in_stream(file: File, len: u64, block: usize, place: Place) -> Self {
+    pub(super) fn in_stream(file: Rc<File>, len: u64, block: usize, place: Place) -> Self {
         let carry_len = place.carry.len();
         let track_raw = place.hold_tail || carry_len > 0;
         Self {
@@ -547,7 +550,7 @@ impl WindowedFile {
             self.read_error = Some(io::Error::from(io::ErrorKind::OutOfMemory));
             self.eof = true;
         } else {
-            match self.file.by_ref().take(n as u64).read_to_end(&mut self.buf) {
+            match (&*self.file).take(n as u64).read_to_end(&mut self.buf) {
                 Ok(read) => {
                     self.remaining -= read as u64;
                     self.file_read += read as u64;
@@ -668,7 +671,7 @@ fn read_range(_file: &File, _from: u64, _to: u64) -> io::Result<Vec<u8>> {
 /// names for it are the whole-file route's.
 pub(super) struct WindowedFiles {
     /// The files not yet reached, each with how much of it the run reads.
-    pending: std::vec::IntoIter<(File, u64)>,
+    pending: std::vec::IntoIter<(Rc<File>, u64)>,
     count: usize,
     block: usize,
     current: Option<WindowedFile>,
@@ -682,7 +685,7 @@ pub(super) struct WindowedFiles {
 }
 
 impl WindowedFiles {
-    pub(super) fn new(files: Vec<(File, u64)>, block: usize) -> Self {
+    pub(super) fn new(files: Vec<(Rc<File>, u64)>, block: usize) -> Self {
         Self {
             count: files.len(),
             pending: files.into_iter(),
@@ -923,7 +926,7 @@ pub(super) struct Reread {
 }
 
 struct RereadSource {
-    file: File,
+    file: Rc<File>,
     /// Where the stream starts in the file: 0 for a file named on the command line, and for a standard
     /// input that is a regular file the offset it was at, since the bytes before it were never the run's.
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -940,7 +943,7 @@ impl Reread {
     pub(super) fn new(file: &File, start: u64, len: u64, path: PathBuf) -> io::Result<Self> {
         Ok(Self {
             sources: vec![RereadSource {
-                file: file.try_clone()?,
+                file: Rc::new(file.try_clone()?),
                 start,
                 len,
             }],
@@ -949,22 +952,20 @@ impl Reread {
     }
 
     /// Several files, each from its start, `len` bytes of it.
-    pub(super) fn new_many(files: &[(&File, u64)]) -> io::Result<Self> {
+    pub(super) fn new_many(files: &[(Rc<File>, u64)]) -> Self {
         let sources = files
             .iter()
-            .map(|&(file, len)| {
-                Ok(RereadSource {
-                    file: file.try_clone()?,
-                    start: 0,
-                    // A length of 0 is not known to be (`WindowedFile`): read to the end.
-                    len: if len == 0 { u64::MAX } else { len },
-                })
+            .map(|(file, len)| RereadSource {
+                file: Rc::clone(file),
+                start: 0,
+                // A length of 0 is not known to be (`WindowedFile`): read to the end.
+                len: if *len == 0 { u64::MAX } else { *len },
             })
-            .collect::<io::Result<_>>()?;
-        Ok(Self {
+            .collect();
+        Self {
             sources,
             path: PathBuf::new(),
-        })
+        }
     }
 
     /// jq's parse error for the stream the file holds, or `None` when jq's parser reads it all or the
@@ -1635,13 +1636,13 @@ mod stream_tests {
     }
 
     fn windowed_route(files: &[Vec<u8>], block: usize) -> (Run, usize) {
-        let handles: Vec<(File, u64)> = files
+        let handles: Vec<(Rc<File>, u64)> = files
             .iter()
             .map(|bytes| {
                 let mut file = tempfile::tempfile().expect("a temp file");
                 file.write_all(bytes).expect("written");
                 file.rewind().expect("rewound");
-                (file, bytes.len() as u64)
+                (Rc::new(file), bytes.len() as u64)
             })
             .collect();
         let mut reader = WindowedFiles::new(handles, block);
@@ -1903,13 +1904,13 @@ mod stream_tests {
     #[test]
     fn a_substitution_in_an_earlier_file_is_remembered_7024() {
         let files = [b"{\"a\":\"\xff\"}\n1".to_vec(), b"\n2\n".to_vec()];
-        let handles: Vec<(File, u64)> = files
+        let handles: Vec<(Rc<File>, u64)> = files
             .iter()
             .map(|bytes| {
                 let mut file = tempfile::tempfile().expect("a temp file");
                 file.write_all(bytes).expect("written");
                 file.rewind().expect("rewound");
-                (file, bytes.len() as u64)
+                (Rc::new(file), bytes.len() as u64)
             })
             .collect();
         let mut reader = WindowedFiles::new(handles, 4096);
@@ -1933,9 +1934,9 @@ mod stream_tests {
     fn a_length_that_is_not_known_or_not_true_is_read_to_the_end_7024() {
         let mut reader = WindowedFiles::new(
             vec![
-                (temp_file(b"1\n2\n"), 0),
-                (temp_file(b"3\n"), 0),
-                (temp_file(b"4\n5\n"), 100),
+                (Rc::new(temp_file(b"1\n2\n")), 0),
+                (Rc::new(temp_file(b"3\n")), 0),
+                (Rc::new(temp_file(b"4\n5\n")), 100),
             ],
             4096,
         );
@@ -1952,8 +1953,12 @@ mod stream_tests {
         assert_eq!(seen, want);
         // The second read of the stream, for a fault's wording, goes on to the next file when one gives out
         // early, and reads the one of unknown length to its end.
-        let (a, b, c) = (temp_file(b"1\n"), temp_file(b"2\n"), temp_file(b"}\n"));
-        let reread = Reread::new_many(&[(&a, 100), (&b, 0), (&c, 2)]).expect("dup");
+        let (a, b, c) = (
+            Rc::new(temp_file(b"1\n")),
+            Rc::new(temp_file(b"2\n")),
+            Rc::new(temp_file(b"}\n")),
+        );
+        let reread = Reread::new_many(&[(a, 100), (b, 0), (c, 2)]);
         assert_eq!(
             reread.stream_fault().as_deref(),
             Some("Unmatched '}' at line 3, column 1")

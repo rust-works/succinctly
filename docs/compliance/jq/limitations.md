@@ -7276,11 +7276,11 @@ The endless-stream rows were measured on `main` @ 89a900ccc against `/usr/bin/jq
 ## Peak memory on a stream of many values grows with the input (#6913)
 
 On a file of many top-level values (NDJSON), `succinctly jq`'s peak memory grew linearly with the file, where jq 1.7.1's stays at a few MB whatever the size.
-Since [#6920](https://github.com/rust-works/succinctly/issues/6920) it no longer does for a plain filter (`-c .`, `-r .name`, `select(...)`: no `-n`, no `input`) over regular files of 4 MiB or more between them (one, or up to 64 named on the command line, which are read as the one stream jq reads, or one redirected onto standard input, `jq … < file`, [#7024](https://github.com/rust-works/succinctly/issues/7024)), which are read a window at a time (below).
+Since [#6920](https://github.com/rust-works/succinctly/issues/6920) it no longer does for a plain filter (`-c .`, `-r .name`, `select(...)`: no `-n`, no `input`) over regular files of 4 MiB or more between them (one, or up to 32 named on the command line, which are read as the one stream jq reads, or one redirected onto standard input, `jq … < file`, [#7024](https://github.com/rust-works/succinctly/issues/7024)), which are read a window at a time (below).
 Since [#7023](https://github.com/rust-works/succinctly/issues/7023) it no longer does for a program that calls `input`/`inputs` over one regular file or standard input (the lazy route), nor for `-R` over one regular file of 4 MiB or more.
 Every other route that reads the input still holds all of it: `--seq`, `--input-dsv`, `--stream-errors`, standard input that is a pipe or a terminal (for the plain filter) or any standard input (for `-R`), and `-R` and the programs that call `input`/`inputs` over several files (`-R length a b` peaks at 30.7 MiB against 12.7 for one file, `reduce inputs` at 32.8 against 14.6, on two 11 MB files).
 That is a known limitation, not supported at this stage: it is outside the three reasons ADR-0018 permits a divergence for, so it is a deferred gap and not a deliberate behaviour.
-It is tracked in [#7024](https://github.com/rust-works/succinctly/issues/7024) (the plain filter over a pipe on standard input, and over more than 64 files or a list with a path that is not a regular file; `-R` and `input`/`inputs` over several files; `-R` over standard input).
+It is tracked in [#7024](https://github.com/rust-works/succinctly/issues/7024) (the plain filter over a pipe on standard input, and over more than 32 files or a list with a path that is not a regular file; `-R` and `input`/`inputs` over several files; `-R` over standard input).
 The tables below were measured before #6920 and #7023 and show every row as it was; the rows they fixed are the first five of each (`first(inputs)` was flat already).
 The slurp shapes (`-s`, `-R -s`) are not a gap: jq holds the input too, and succinctly's peak is 223 MiB for `-s length` at 100 MiB on x86_64 where jq's is 850 (and 208 for `-R -s length` against jq's 183).
 Standard input under a pipe-fed plain filter or `-R` (a redirected regular file under a plain filter has been windowed since #7024), and `--seq`, grow as the file route did (124 and 108 MiB at 100 MiB on x86_64), two files held both (224 MiB) until #7024, and `--stream` is flat (8.5 MiB).
@@ -7382,14 +7382,15 @@ A depth refusal names the position from the window's line count; where a window 
 Standard input that is a regular file (`jq … < file`, a here-file, a descriptor a parent opened) takes the same route from its current offset: what a shell or parent has read already is not part of the stream, as on a pipe, and a fault is worded from a duplicate of descriptor 0 read by position.
 A pipe, a terminal, a standard input under 4 MiB and one the run also writes to (`jq . <> f >&0`: its output would land where the next window is read from) read whole as before, and so does a path that names the stdin descriptor a second time.
 The windows are read from descriptor 0's own offset, so a run that stops early (`first(...)`, `-e`) leaves it where its last window ended, as jq does, where the whole-file route always left it at the end of the file.
-Several regular files (up to 64 of them, 4 MiB or more between them) are read the same way, as the one stream jq reads them as, each a window at a time and in turn (`WindowedFiles`, #7024).
+Several regular files (up to 32 of them, 4 MiB or more between them) are read the same way, as the one stream jq reads them as, each a window at a time and in turn (`WindowedFiles`, #7024).
 A token still open where a file ends continues at the front of the next, as jq's stream has it (#4305).
 The route cuts that open tail off the end of the file, hands it on, and records what it moved in the `Seam` the whole-file route records, computed by the same code (`SeamStitcher`), so the file a value is read in (`input_filename`, the file a diagnostic names), its line there and the line of the first fault are the whole-file route's.
 The tail is handed on as the bytes that were read, so a character or a run of invalid bytes that a file's end cuts is substituted once the two files' bytes are joined, as the whole-file route substitutes them.
 Only the front of the stream may start with a BOM; the BOM at the front of a later file is a byte of the stream.
 A window never drops part of the tail that opens a file, so a document that spans files is held from its start, as a document bigger than a window is.
-The first fault is worded by reading every file again as one stream, by position, through a duplicate of each handle (which is why the files are held open, and why there is a limit of 64), and a depth refusal names its position in the stream of all the files.
-A list with a path that is not a regular file (a pipe, `-`, a directory, `/dev/stdin`, `/dev/fd/N`), one that does not open, one that is also the run's standard output or error (`jq . a b 1<>b`: output landing in a file the next window is read from), or more than 64 files takes the route that reads the files whole and reports what it finds.
+The first fault is worded by reading every file again as one stream, by position, through the handles the run reads by (which is why the files are held open, and why there is a limit of 32), and a depth refusal names its position in the stream of all the files.
+A process's descriptor table starts at 64 slots, and doubling it waits for an RCU grace period when the process has a second thread, 35 ms for each doubling on the 7950X's Linux, which more than doubled a 10 MiB run over 64 files: 32 files and the standard descriptors stay under it.
+A list with a path that is not a regular file (a pipe, `-`, a directory, `/dev/stdin`, `/dev/fd/N`), one that does not open, one that is also the run's standard output or error (`jq . a b 1<>b`: output landing in a file the next window is read from), or more than 32 files takes the route that reads the files whole and reports what it finds.
 A file whose `stat` size is 0 (an empty file, or one of the `/proc` kind that reports 0 and has content) is read to its end, as `std::fs::read` reads it.
 A file is read as it was when opened, so a run whose output is appended to its input ends, and a read that fails runs the documents before the failure and then reports it.
 
@@ -7421,7 +7422,7 @@ Time, from `scripts/ab-cli.py` (interleaved, 11 repetitions, `-c`, output and ex
 
 What the windowed route does not cover, and which still hold the input:
 
-- a pipe or a terminal on standard input (a fault cannot be worded by reading them again), more than 64 files, and a list of files with a path that is not a regular file, that does not open, or that is the run's own standard output or error: #7024;
+- a pipe or a terminal on standard input (a fault cannot be worded by reading them again), more than 32 files, and a list of files with a path that is not a regular file, that does not open, or that is the run's own standard output or error: #7024;
 - programs that call `input`/`inputs` (with or without `-n`), `-R`, `--seq`, `--input-dsv` and `--stream-errors`, which have their own readers: #7023;
 - `-s` and `--validate`, which read the stream whole by design.
 
