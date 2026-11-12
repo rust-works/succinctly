@@ -93,6 +93,7 @@ use super::eval::{
     Reentry, RestPipe, RestTail, RootWitness, SliceTargetKind, StashedEscape, StashedVerdict,
     YqSemantics, DEFERRED_BIND_UNRESOLVED, MAX_RANGE_TOTAL,
 };
+use super::eval::{format_yq_props_commented, yq_props_format_style};
 use super::eval::{owned_slot_mut, static_path_steps, StepKey};
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -6195,6 +6196,114 @@ fn owned_from_standard_json_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
         // instead of raising, unlike real jq).
         StandardJson::Error(msg) => return Err(EvalError::decode_failure(*msg)),
     })
+}
+
+/// The comment yq's properties encoder writes above each scalar below `cursor`, by property path
+/// (unescaped, as the encoder builds it), into `out` (#6922). A mapping entry's comment is its key's
+/// head and line comment and then its value's; a sequence item's is its own. yq strips the first `#`
+/// of each and joins them with nothing between, so `# h` above `a: 1 # c` is ` h c`. `head` is the
+/// comment after a bare `-` whose item is this mapping, which yq gives the first key. A container's
+/// own comments name no property, so yq drops them.
+fn collect_props_comments<C: DocumentCursor>(
+    cursor: &C,
+    prefix: &str,
+    head: Option<String>,
+    array_brackets: bool,
+    out: &mut alloc::collections::BTreeMap<String, String>,
+    depth: usize,
+) {
+    super::value::assert_value_tree_depth(depth);
+    fn strip_hash(comment: &str) -> &str {
+        comment.strip_prefix('#').unwrap_or(comment)
+    }
+    fn own_comment<C: DocumentCursor>(node: &C, dash: Option<String>, text: &mut String) {
+        // The comment after a bare `-` is the first line of its first key's head.
+        let head = dash
+            .into_iter()
+            .chain(node.head_comment_raw_outside_header())
+            .collect::<Vec<_>>();
+        text.push_str(strip_hash(&head.join("\n")));
+        if let Some(line) = node.line_comment_raw() {
+            text.push_str(strip_hash(&line));
+        }
+    }
+    // Only a comment is kept: a property without one writes nothing above it, and a large document
+    // with one comment then holds one entry, not one per scalar. A later property on the same path
+    // replaces the comment, as yq's `SetComments` does, whatever it holds.
+    fn insert_comment(
+        out: &mut alloc::collections::BTreeMap<String, String>,
+        path: String,
+        comment: String,
+    ) {
+        if comment.is_empty() {
+            out.remove(&path);
+        } else {
+            out.insert(path, comment);
+        }
+    }
+    fn is_container<V: DocumentValue>(value: &V) -> bool {
+        value.as_object().is_some() || value.as_array().is_some()
+    }
+    let value = cursor.value();
+    if let Some(mut fields) = value.as_object() {
+        let mut head = head;
+        while let Some((field, rest)) = fields.uncons() {
+            fields = rest;
+            // Taken first: a key with no text still owns the dash comment, which goes nowhere then.
+            let dash = head.take();
+            let Some(key) = field.key_str() else {
+                continue;
+            };
+            let path = if prefix.is_empty() {
+                key.into_owned()
+            } else {
+                format!("{prefix}.{key}")
+            };
+            if is_container(&field.value_cursor.value()) {
+                collect_props_comments(
+                    &field.value_cursor,
+                    &path,
+                    None,
+                    array_brackets,
+                    out,
+                    depth + 1,
+                );
+            } else {
+                let mut comment = String::new();
+                own_comment(&field.key_cursor, dash, &mut comment);
+                own_comment(&field.value_cursor, None, &mut comment);
+                insert_comment(out, path, comment);
+            }
+        }
+    } else if let Some(mut elements) = value.as_array() {
+        let mut head = head;
+        let mut index = 0usize;
+        loop {
+            let dash = elements.first_dash_comment();
+            let Some((element, rest)) = elements.uncons_cursor() else {
+                break;
+            };
+            elements = rest;
+            let path = if prefix.is_empty() {
+                format!("{index}")
+            } else if array_brackets {
+                format!("{prefix}[{index}]")
+            } else {
+                format!("{prefix}.{index}")
+            };
+            index += 1;
+            // The comment after the bare `-` of the item this sequence is goes to its first element
+            // when that is a scalar, and goes no deeper (yq drops it above a nested container).
+            let own_head = head.take();
+            if is_container(&element.value()) {
+                collect_props_comments(&element, &path, dash, array_brackets, out, depth + 1);
+            } else {
+                let mut comment = String::new();
+                own_comment(&element, own_head, &mut comment);
+                insert_comment(out, path, comment);
+            }
+        }
+    }
 }
 
 /// The text yq's `to_yaml`, `@yaml` and `tostring` make of a *container or alias that is a
@@ -16449,6 +16558,25 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 }
                 None => format_result::<S, _>(format_type, &owned, optional),
             }
+        }
+        // #6922: yq's properties encoder writes each property's comments above it, and the first
+        // document's leading comments above the first one, read from the nodes the value came from.
+        Expr::Format(format_type)
+            if S::TAG == EvalTag::Yq
+                && cursor.is_some_and(|c| c.document_has_comments())
+                && yq_props_format_style(format_type).is_some() =>
+        {
+            let owned = owned_or_suppress!(to_owned_with_cursor::<_, S>(&value, cursor), optional);
+            let mut comments = alloc::collections::BTreeMap::new();
+            let style = yq_props_format_style(format_type).unwrap_or_default();
+            // The guard holds a cursor.
+            let leading = cursor.as_ref().map_or_else(String::new, |c| {
+                collect_props_comments(c, "", None, style.1, &mut comments, 0);
+                c.props_leading_content().unwrap_or_default()
+            });
+            GenericResult::Owned(OwnedValue::String(
+                format_yq_props_commented(format_type, style, &owned, &comments, &leading).into(),
+            ))
         }
         Expr::Format(format_type) => format_result::<S, _>(
             format_type,

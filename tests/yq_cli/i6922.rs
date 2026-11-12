@@ -327,3 +327,40 @@ fn split_exp_reads_the_csv_separator_6922() -> Result<()> {
     assert_eq!(names, ["1;2", "3;4", "rows.yaml"]);
     Ok(())
 }
+
+/// (input, arguments, yq's stdout): `-o=props` and `@props` write each property's comments above
+/// it, and the first document's leading comments above the first property. Captured from yq
+/// v4.53.3.
+const COMMENT_ROWS: &[(&str, &[&str], &str)] = &[
+    ("a:\n  - 1 # c\n  - [2, 3] # d\n", &["--properties-array-brackets", "-o=props", "."], "# c\na[0] = 1\na[1][0] = 2\na[1][1] = 3\n"),
+    ("? [k]\n: v # c\nb: 1 # bc\n", &["-o=props", "."], "# bc\nb = 1\n"),
+    ("# doc head\n\n# a head\na: 1 # a line\nb: # b key line\n  # x head\n  - x # x line\n  - y\nc:\n  d: \"p q\" # d line\n  # e head\n  e: 2\n", &["-o=props", "."], "# doc head\n\n# a head\n# a line\na = 1\n\n# x head x line\nb.0 = x\nb.1 = y\n\n# d line\nc.d = p q\n\n# e head\nc.e = 2\n"),
+    ("# doc head\n\n# a head\na: 1 # a line\nc:\n  d: \"p q\" # d line\n  # e head\n  e: 2\n", &["-o=props", ".c"], "# d line\nd = p q\n\n# e head\ne = 2\n"),
+    ("k: v\n# l1\n#l2\n#   l3\na: 1 #x\n", &["-o=props", "."], "k = v\n\n# l1\n# #l2\n# #   l3x\na = 1\n"),
+    ("s:\n  - p: 1 # pl\n    # q head\n    q: 2\n  - # item head\n    r: 3\n", &["-o=props", "."], "# pl\ns.0.p = 1\n\n# q head\ns.0.q = 2\n\n# item head\ns.1.r = 3\n"),
+    ("s:\n  - p: 1 # pl\n  - # item head\n    r: 3\n", &["--properties-array-brackets", "-o=props", ".s"], "# pl\n0.p = 1\n\n# item head\n1.r = 3\n"),
+    ("- # d\n  - v\n- # e\n  - - 1\n", &["-o=props", "."], "# d\n0.0 = v\n1.0.0 = 1\n"),
+    ("- #2\n  #1\n  c: 3.5\n", &["-o=props", "."], "#2\n# #1\n0.c = 3.5\n"),
+    ("al: &an 5 # anchor line\nref: *an # alias line\ne: {} # empty line\n", &["-o=props", "."], "# anchor line\nal = 5\n\n# alias line\nref = 5\n"),
+    ("a: {b: 1} # dropped\n", &["-o=props", "."], "a.b = 1\n"),
+    ("---\n# after the marker\nn: 1\n", &["-o=props", "."], "# after the marker\nn = 1\n"),
+    ("\n---\nn: 1\n", &["-o=props", "."], "\nn = 1\n"),
+    ("# lead\na: 1 # one\n", &["@props"], "# lead\n# one\na = 1\n\n"),
+    ("# lead\na: 1 # one\n", &["--properties-separator=:", "@props"], "# lead\n# one\na:1\n\n"),
+    ("# lead\na: 1\nb: 2 # two\n", &["-o=props", ".b"], "2\n"),
+    ("a: 1 # one\n", &["{\"a\": 1} | @props"], "a = 1\n\n"),
+];
+
+#[test]
+fn props_writes_each_propertys_comments_6922() -> Result<()> {
+    for (input, args, expected) in COMMENT_ROWS {
+        let (filter, flags) = args.split_last().expect("a filter");
+        let (stdout, status) = run_yq_stdin(filter, input, flags)?;
+        assert_eq!(
+            (stdout.as_str(), status),
+            (*expected, 0),
+            "{args:?} over {input:?}"
+        );
+    }
+    Ok(())
+}

@@ -26768,6 +26768,17 @@ fn format_props(value: &OwnedValue) -> Result<String, EvalError> {
 /// default ` = `) and, with `--properties-array-brackets`, `a[0]` for an array element below the
 /// root where it writes `a.0` (#6922).
 fn format_props_with(value: &OwnedValue, separator: &str, array_brackets: bool) -> String {
+    format_props_styled(value, separator, array_brackets, None)
+}
+
+/// [`format_props_with`] writing each property's comment lines above it, from `comments` (each
+/// property's path, unescaped, to its comment text), as yq's encoder does (#6922).
+fn format_props_styled(
+    value: &OwnedValue,
+    separator: &str,
+    array_brackets: bool,
+    comments: Option<&BTreeMap<String, String>>,
+) -> String {
     let separator = if separator.is_empty() {
         " = "
     } else {
@@ -26777,6 +26788,7 @@ fn format_props_with(value: &OwnedValue, separator: &str, array_brackets: bool) 
     let style = PropsStyle {
         separator,
         array_brackets,
+        comments,
     };
     format_props_recursive(value, String::new(), &mut out, 0, &style);
     out
@@ -26786,6 +26798,67 @@ fn format_props_with(value: &OwnedValue, separator: &str, array_brackets: bool) 
 struct PropsStyle<'a> {
     separator: &'a str,
     array_brackets: bool,
+    comments: Option<&'a BTreeMap<String, String>>,
+}
+
+/// Write the comment yq's properties writer puts above a property (#6922): its lines, each after a
+/// `#`, once a newline inside the text has had a space put after it (yq's
+/// `strings.ReplaceAll(comments, "\n", "\n ")`), and a blank line first unless nothing has been
+/// written yet. `magiconair/properties` skips a comment whose every line is empty, which only the
+/// empty comment is once the spaces are in, and the walk keeps no empty comment.
+fn write_props_comment(comment: &str, out: &mut String) {
+    let spaced = comment.replace('\n', "\n ");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    for line in spaced.split('\n') {
+        out.push('#');
+        out.push_str(line);
+        out.push('\n');
+    }
+}
+
+/// The separator and bracket setting `format_type` writes props with, in yq mode: `@props` /
+/// `to_props` read the run's [`YqEncoderPrefs`], `-o=props` its own encoder's. `None` for any other
+/// format.
+pub(crate) fn yq_props_format_style(format_type: &FormatType) -> Option<(String, bool)> {
+    match format_type {
+        FormatType::Props => Some(yq_encoder_prefs::with(|prefs| {
+            (
+                prefs.properties_separator.clone(),
+                prefs.properties_array_brackets,
+            )
+        })),
+        FormatType::YqOutput(YqOutputEncoder::Props {
+            separator,
+            array_brackets,
+        }) => Some((separator.clone(), *array_brackets)),
+        _ => None,
+    }
+}
+
+/// yq's props text of `value`, a document node whose comments are `comments` (path to comment, as
+/// [`format_props_styled`] reads them), after the document's `leading` comment block when the node
+/// is the first document's content (#6922). `format_type` is one [`yq_props_format_style`] answers,
+/// with `style` what it answers.
+pub(crate) fn format_yq_props_commented(
+    format_type: &FormatType,
+    (separator, array_brackets): (String, bool),
+    value: &OwnedValue,
+    comments: &BTreeMap<String, String>,
+    leading: &str,
+) -> String {
+    let mut text = String::from(leading);
+    text.push_str(&format_props_styled(
+        value,
+        &separator,
+        array_brackets,
+        Some(comments),
+    ));
+    if matches!(format_type, FormatType::YqOutput(_)) {
+        note_output_encoder_result(value);
+    }
+    text
 }
 
 /// Recursively format a value into Java properties lines, each written with its newline.
@@ -26833,6 +26906,9 @@ fn format_props_recursive(
                 out.push_str(&props_value_to_string(value, false));
                 out.push('\n');
             } else if !prefix.is_empty() {
+                if let Some(comment) = style.comments.and_then(|comments| comments.get(&prefix)) {
+                    write_props_comment(comment, out);
+                }
                 out.push_str(&props_escape(&prefix, true));
                 out.push_str(style.separator);
                 out.push_str(&props_value_to_string(value, true));
@@ -143591,6 +143667,16 @@ mod tests {
                 assert_eq!(s, "-.inf\n");
             }
         );
+    }
+
+    #[test]
+    fn props_comment_lines_take_a_hash_and_a_space_after_each_break_6922() {
+        // yq's `strings.ReplaceAll(comments, "\n", "\n ")`: a lone break is the lines `` and ` `.
+        let mut out = String::new();
+        write_props_comment(" c", &mut out);
+        assert_eq!(out, "# c\n", "no blank line before the first");
+        write_props_comment("\n", &mut out);
+        assert_eq!(out, "# c\n\n#\n# \n");
     }
 
     #[test]

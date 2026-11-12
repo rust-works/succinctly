@@ -8512,6 +8512,35 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
         self.bp_pos == FIRST_DOCUMENT_BP && YamlCursor::is_document_content(self)
     }
 
+    fn document_has_comments(&self) -> bool {
+        self.index.has_comments()
+            || self.document_has_standalone_comments()
+            || self.header_end() > 0
+    }
+
+    fn head_comment_raw_outside_header(&self) -> Vec<String> {
+        let header_end = self.header_end();
+        // After a byte-order mark yq sets no header aside (#6762), so the node keeps its comment.
+        if header_end > 0
+            && !self.index.after_bom()
+            && matches!(self.index.get_head_comments(self.bp_pos).first(),
+                Some(&(start, _)) if (start as usize) < header_end)
+        {
+            return Vec::new();
+        }
+        DocumentCursor::head_comment_raw(self)
+    }
+
+    fn props_leading_content(&self) -> Option<String> {
+        // After a byte-order mark yq sets no header aside (#6762).
+        if !self.is_first_document_content() || self.index.after_bom() {
+            return None;
+        }
+        let mut out = String::new();
+        write_yq_header_with_markers(&mut out, self.text, self.index, false).ok()?;
+        Some(out)
+    }
+
     #[inline]
     fn document_has_aliases(&self) -> bool {
         self.index.has_aliases()
@@ -11002,8 +11031,18 @@ fn write_yq_header<W: AsRef<[u64]>, Out: core::fmt::Write>(
     text: &[u8],
     index: &YamlIndex<W>,
 ) -> core::fmt::Result {
+    write_yq_header_with_markers(out, text, index, index.header_doc_markers())
+}
+
+/// [`write_yq_header`] with its `---` lines kept or dropped as `doc_markers` says, whatever the
+/// index's own setting: the properties encoder writes no document separator (#6922).
+fn write_yq_header_with_markers<W: AsRef<[u64]>, Out: core::fmt::Write>(
+    out: &mut Out,
+    text: &[u8],
+    index: &YamlIndex<W>,
+    doc_markers: bool,
+) -> core::fmt::Result {
     let (end, cut_marker) = index.yq_header(|| yq_header_len(text));
-    let doc_markers = index.header_doc_markers();
     let Ok(header) = core::str::from_utf8(&text[..end]) else {
         return Ok(());
     };
