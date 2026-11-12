@@ -746,6 +746,9 @@ struct Parser<'a, const HAS_CR: bool> {
     /// "more of the head" (`only_yq_header_lines_since` is never true). `---` / `---` / `x` is then
     /// a null document and `x`, as in the spec.
     yq_no_head: bool,
+    /// [`Self::first_document_marker_leads`]'s answer, found on first use: it is asked once for every block a
+    /// blank line detaches before the first node.
+    first_document_marker: core::cell::Cell<Option<bool>>,
 }
 
 impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
@@ -830,6 +833,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             documents_started: 0,
             leading_run_from: 0,
             yq_no_head: false,
+            first_document_marker: core::cell::Cell::new(None),
             #[cfg(debug_assertions)]
             wrapper_slots: Vec::with_capacity(estimated_opens),
             #[cfg(debug_assertions)]
@@ -1405,6 +1409,16 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // pinned yq v4.53.3: `a: 1\n---\n# mid\n\nb: 2\n` puts `mid`
                 // on the first document's own foot, not `.b`'s head, #798).
                 self.drain_pending_into_foot(old_root);
+                return;
+            } else if self.yq_no_head
+                && next.is_some()
+                && self.documents_started == 1
+                && !self.saw_head_foot_node
+                && !self.first_document_marker_leads()
+            {
+                // Behind a byte-order mark: a block a blank line detaches from the first node is the head of
+                // the document node (#7084).
+                self.drain_pending_into_document_head();
                 return;
             } else if let Some((_, next_column)) = next {
                 // A blank line after the run's second block changes nothing: it is still the foot of the key
@@ -2094,7 +2108,59 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             self.drain_pending_into_foot(prev);
         } else if let Some(old_root) = self.document_boundary_fallback_bp {
             self.drain_pending_into_foot(old_root);
+        } else if self.yq_no_head && !self.saw_head_foot_node && !self.first_document_marker_leads()
+        {
+            self.drain_pending_into_document_head();
         }
+    }
+
+    /// Behind a byte-order mark yq sets no header aside (#6762), so a block above the first node that a
+    /// blank line detaches from what follows is the head of the document node itself, the one go-yaml
+    /// keeps for the comments above a document's content (#7084: `# l1` / blank / `# l2` / `a: 1` is `l1`
+    /// on `.` and `l2` on `.a`'s key). A first document that starts at a `---` marker has no such node
+    /// to give them to: its blocks go forward to the first node.
+    fn drain_pending_into_document_head(&mut self) {
+        // Before the first document starts its root is the bp it is about to take: the one after the
+        // virtual root sequence's, which a comment above the first line is read before (bp 0).
+        let root = if self.documents_started == 0 {
+            self.bp_pos.max(1)
+        } else {
+            self.document_start_bp_pos
+        };
+        let pending = &mut self.pending_head_lines;
+        self.comments.entry(root).or_default().head.append(pending);
+    }
+
+    /// Whether the text starts with a `---` marker once its comments, blank lines and `%` directive lines are
+    /// skipped: the first document is then an explicit one (see [`Self::drain_pending_into_document_head`]).
+    fn first_document_marker_leads(&self) -> bool {
+        if let Some(known) = self.first_document_marker.get() {
+            return known;
+        }
+        let mut leads = false;
+        let mut at = 0;
+        while at < self.input.len() {
+            let line_end = self.input[at..]
+                .iter()
+                .position(|&b| Self::is_break(b))
+                .map_or(self.input.len(), |n| at + n);
+            let line = &self.input[at..line_end];
+            let content = line
+                .iter()
+                .position(|&b| !matches!(b, b' ' | b'\t'))
+                .map(|n| &line[n..]);
+            match content {
+                None => {}
+                Some(rest) if matches!(rest.first(), Some(b'#' | b'%')) => {}
+                Some(rest) => {
+                    leads = line.first() != Some(&b' ') && Self::marker_prefix(rest, b"---");
+                    break;
+                }
+            }
+            at = line_end + 1;
+        }
+        self.first_document_marker.set(Some(leads));
+        leads
     }
 
     /// Hook for "a node that can own a standalone comment just opened at
@@ -3859,7 +3925,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // a block still pending here may belong to the *closing* document
         // instead (see [`Self::flush_pending_head_lines_at_boundary`]).
         let root_bp = self.document_start_bp_pos;
-        self.flush_pending_head_lines_at_boundary(Some((root_bp, 0)), old_root_bp);
+        // Except behind a byte-order mark: yq sets no header aside there (#6762), so the block at the
+        // top of the first document is the first node's by the ordinary rules, which the node that
+        // opens next applies (#7084).
+        if !(self.yq_no_head && self.documents_started == 1) {
+            self.flush_pending_head_lines_at_boundary(Some((root_bp, 0)), old_root_bp);
+        }
         self.last_head_foot_bp = None;
         // #1079: `block_passed_absent_item` belongs to whichever document set
         // it. `flush_pending_head_lines_at_boundary` above already clears it
