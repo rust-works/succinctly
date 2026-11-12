@@ -7798,8 +7798,8 @@ Matching either needs a string that can hold bytes that are not UTF-8, or the su
 
 ## The argument-level flags of [#7025](https://github.com/rust-works/succinctly/issues/7025) answer as yq does, with these differences
 
-`--expression`, `--split-exp-file`, `-f`, `-v`/`--verbose`, `--security-disable-env-ops` and `--security-disable-file-ops` are yq's, and `tests/yq_cli/i7025.rs` pins the rows captured from yq v4.53.3.
-[#7025](https://github.com/rust-works/succinctly/issues/7025) stays open for `--string-interpolation`, `--security-enable-system-operator` and `system`, `-c`, `--header-preprocess=false`, `--yaml-fix-merge-anchor-to-spec` and `--debug-node-info`.
+`--expression`, `--split-exp-file`, `-f`, `-v`/`--verbose`, `--security-disable-env-ops`, `--security-disable-file-ops` and `--string-interpolation` are yq's, and `tests/yq_cli/i7025.rs` and `tests/yq_cli/i7025_string_interpolation.rs` pin the rows captured from yq v4.53.3.
+[#7025](https://github.com/rust-works/succinctly/issues/7025) stays open for `--security-enable-system-operator` and `system`, `-c`, `--header-preprocess=false`, `--yaml-fix-merge-anchor-to-spec` and `--debug-node-info`.
 
 - **`--security-disable-env-ops` and `--security-disable-file-ops` refuse an operator when it runs, where yq refuses it when its handler is called.**
   `select(false) | strenv(X)`, `.zz[] | strenv(X)` and `.a | select(. == 2) | strenv(X)` fail with `env operations have been disabled` in yq, because the handler is called with an empty context.
@@ -7809,7 +7809,13 @@ Matching either needs a string that can hold bytes that are not UTF-8, or the su
   Under `--jq-extensions`, `$ENV`, `env` and `env.X` read the environment, and `--security-disable-env-ops` refuses them with the same message.
 - **`-v` writes no debug log.**
   yq writes `time=... level=DEBUG ...` lines to stderr; standard output is the same either way.
-  `--verbose=false` is refused here (a flag takes no value) and accepted by yq.
+  `--verbose=false` is accepted, as in yq, in the spellings of Go's `strconv.ParseBool`.
+- **A boolean flag's value that is not a boolean exits 2 here and 1 in yq.**
+  `--string-interpolation=maybe` and `--verbose=zz` are refused at the flag in both, and neither writes output.
+  yq says `invalid argument "maybe" for "--string-interpolation" flag: strconv.ParseBool: parsing "maybe": invalid syntax` and prints its usage; this says the same cause in clap's wording, and exits 2 like every other flag clap refuses (`-p badformat`).
+- **`--string-interpolation=false` is one setting for the whole run, as in yq.**
+  A `\(` in a string literal stays the two characters, in the program and in an `eval(..)` text, and the backslash pair in front of a `(` is left alone (`"\\(1)"` is two backslashes).
+  A string inside an interpolation slot is a lexer error in yq whatever the flag says, and here too.
 - **A missing `--split-exp-file` is worded differently.**
   yq says `Error: open nope.exp: no such file or directory`; this says `failed to read split expression file: nope.exp`, with the cause.
   Both exit 1 and write nothing.

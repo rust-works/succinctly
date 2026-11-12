@@ -443,7 +443,8 @@ succinctly yq '.users[]' input.yaml
 - `--split-exp-file <FILE>`: Read the `--split-exp` expression from `FILE`. It wins over `--split-exp`, and an empty file means no split
 - `--security-disable-env-ops`: Refuse `env()`, `strenv()` and `envsubst` with `env operations have been disabled`
 - `--security-disable-file-ops`: Refuse `load()`, `load_str()` and `load_base64()` with `file operations have been disabled`. Reading the input files, `-i` and `--split-exp` still work
-- `-v, --verbose`: Accepted for yq's flag; the debug log yq writes to stderr is not produced
+- `-v, --verbose`: Accepted for yq's flag; the debug log yq writes to stderr is not produced. Like every boolean flag it takes a value after `=` only (`--verbose=false`)
+- `--string-interpolation[=BOOL]`: `--string-interpolation=false` keeps `\(expr)` in a string literal as text, in the program and in `eval(..)` text alike. The default is true
 
 `yq eval` (`e`) and `yq eval-all` (`ea`) are accepted as yq's subcommands (#7040): the word is dropped, and `eval-all` also evaluates once over every document, as `--eval-all` does (`succinctly yq e '.a' f.yaml`, `succinctly yq ea 'select(fi == 1)' a.yaml b.yaml`). Only the first positional is a subcommand, whichever side of it the flags stand.
 

@@ -331,6 +331,22 @@ const MAX_PATTERN_COMPUTED_KEYS: usize = 4096;
 /// brackets or parentheses stay guarded through the bracket's own depth unit.
 const MAX_EXPR_DEPTH: usize = 256;
 
+/// yq's `--string-interpolation` (#7025): whether a string literal reads `\(expr)` as an
+/// interpolation. Process-wide, as yq's own setting is, so an `eval(..)` text and every other
+/// parse in the run read the same one. Only `ParserMode::Yq` consults it.
+static YQ_STRING_INTERPOLATION: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+/// Set yq's `--string-interpolation` for every later parse in this process (#7025). With `false`
+/// a `\(` in a yq-mode string literal is the two characters, not the start of an interpolation.
+pub fn set_yq_string_interpolation(on: bool) {
+    YQ_STRING_INTERPOLATION.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn yq_string_interpolation() -> bool {
+    YQ_STRING_INTERPOLATION.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Nesting levels one step of yq's precedence-40 chain (`==`, `=`, `|=` ...) is charged, since it
 /// recurses ([`Parser::parse_yq_forty_group_operand`]).
 const YQ_FORTY_GROUP_WEIGHT: usize = 16;
@@ -3037,6 +3053,23 @@ impl<'a> Parser<'a> {
                     self.next();
                     // #4916: yq reads a short list of escapes and keeps any other backslash as text.
                     if self.mode == ParserMode::Yq {
+                        // #7025: `--string-interpolation=false` keeps `\(` as text. yq leaves the
+                        // backslash pair in front of a `(` alone (`\\(` stays two characters), so
+                        // that pair is not read as an escape here either.
+                        if !yq_string_interpolation() {
+                            if self.peek() == Some('(') {
+                                self.next();
+                                current_literal.push_str("\\(");
+                                continue;
+                            }
+                            if self.peek() == Some('\\')
+                                && self.input.as_bytes().get(self.pos + 1) == Some(&b'(')
+                            {
+                                self.next();
+                                current_literal.push_str("\\\\");
+                                continue;
+                            }
+                        }
                         if let Some(c) = self.peek().filter(|&c| c != '(') {
                             self.next();
                             push_yq_string_escape(&mut current_literal, c);

@@ -856,6 +856,7 @@ same kind of thing as the rest of this table — extra, off by default.
 | `--security-disable-env-ops` | Refuse `env()`, `strenv()` and `envsubst` (#7025) |
 | `--security-disable-file-ops` | Refuse `load()`, `load_str()` and `load_base64()` (#7025) |
 | `-v, --verbose`       | Accepted; no debug log is written (#7025)     |
+| `--string-interpolation[=BOOL]` | `=false` keeps `\(` in a string literal as text (default true, #7025) |
 | `-S, --sort-keys`     | Sort mapping keys in output (succinctly extension — real yq has no such flag) |
 
 ### `--front-matter`
