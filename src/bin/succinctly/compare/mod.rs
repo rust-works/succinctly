@@ -323,6 +323,15 @@ fn find_valgrind() -> Result<PathBuf> {
     Ok(PathBuf::from("valgrind"))
 }
 
+impl CompareJqArgs {
+    /// Whether this run covers less than the whole report (a dimension, a query, the control
+    /// column, or only `--verify`'s re-measured rows). `write_docs` refuses such a run, and the
+    /// corpus guard in [`run`] leaves it to that refusal: one definition for both (#7077).
+    fn is_subset(&self) -> bool {
+        !self.dimension.is_empty() || self.control || self.query.is_some() || self.verify.is_some()
+    }
+}
+
 fn repo_root() -> Result<PathBuf> {
     let out = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
@@ -371,14 +380,12 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
     // would be accepted as the platform's report with a different row count. A subset run is
     // refused by `write_docs` for being a subset, and a run that does not write docs keeps
     // the note.
-    if args.write_docs
-        && args.dimension.is_empty()
-        && !args.control
-        && args.query.is_none()
-        && args.verify.is_none()
-    {
-        let queries =
-            perf::parse_queries(&std::fs::read_to_string(root.join(&manifest.perf.queries))?)?;
+    if args.write_docs && !args.is_subset() {
+        let path = root.join(&manifest.perf.queries);
+        let queries = perf::parse_queries(
+            &std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?,
+        )?;
         perf::require_corpus(
             &root,
             &queries,
@@ -1182,7 +1189,7 @@ fn write_docs(root: &std::path::Path, results: &Results, args: &CompareJqArgs) -
             results.env.invalid_reasons.join("; ")
         );
     }
-    if !args.dimension.is_empty() || args.control || args.query.is_some() || args.verify.is_some() {
+    if args.is_subset() {
         bail!("--write-docs needs a complete run: no --dimension, --query, --control or --verify");
     }
     let dir = root.join("docs/compare");
@@ -1267,5 +1274,37 @@ mod ledger_only_tests {
         assert!(!reference_version_ok("jq-1.8.1", "1.7.1", true));
         assert!(!reference_version_ok("jq-1.7.10", "1.7.1", true));
         assert!(!reference_version_ok("jq-1.7", "1.7.1", true));
+    }
+}
+
+#[cfg(test)]
+mod subset_tests {
+    use super::CompareJqArgs;
+    use clap::Parser;
+
+    fn parse(flags: &[&str]) -> CompareJqArgs {
+        CompareJqArgs::try_parse_from(std::iter::once("jq").chain(flags.iter().copied())).unwrap()
+    }
+
+    /// The run `write_docs` accepts and the corpus guard checks is the same one (#7077): a
+    /// complete run is not a subset, whatever its size flags, and each of the four ways to
+    /// narrow a run makes it one.
+    #[test]
+    fn only_a_run_naming_a_dimension_query_control_or_verify_is_a_subset() {
+        for complete in [
+            &["--full", "--write-docs"][..],
+            &["--full", "--huge", "--write-docs"],
+            &["--quick"],
+        ] {
+            assert!(!parse(complete).is_subset(), "{complete:?}");
+        }
+        for subset in [
+            &["--dimension", "performance"][..],
+            &["--query", "identity"],
+            &["--control"],
+            &["--verify", "x.json"],
+        ] {
+            assert!(parse(subset).is_subset(), "{subset:?}");
+        }
     }
 }
