@@ -18,7 +18,7 @@ use succinctly::jq::document::{
 };
 use succinctly::jq::escape::AsciiEscapeWriter;
 use succinctly::jq::eval_generic::{
-    check_nesting_depth, depth_guard_panic_message, eval_with_cursor_using,
+    check_nesting_depth, depth_guard_panic_message, eval_with_cursor_using, is_quoted_string_style,
     to_owned as generic_to_owned, to_owned_cursor as generic_to_owned_cursor,
     to_owned_with_comments, to_owned_with_comments_pruned, to_owned_yaml_cursor, validate_cursor,
     AnchorMark, CommentTree, GenericResult, LazyElem, NodeMeta, ObjectBuilder, SilentKind,
@@ -7677,7 +7677,7 @@ fn apply_meta_assign_writes(
                 // #6909: go-yaml quotes a string whose plain spelling it reads as another type (a
                 // timestamp, `1_000`), so clearing the style of a quoted one keeps its quotes.
                 let keeps_quotes = style.is_empty()
-                    && matches!(node.meta().style, "double" | "single")
+                    && is_quoted_string_style(node.meta().style)
                     && matches!(&*node_value, OwnedValue::String(text)
                         if go_yaml_resolved_tag(text) != "!!str");
                 node.meta_mut().style = if keeps_quotes { "double" } else { style };
@@ -7772,7 +7772,8 @@ fn apply_tag(tag: &str, value: &mut OwnedValue, node: &mut CommentTree) {
                 OwnedValue::String(s) => Some(s.to_string()),
                 other => spelled.or_else(|| plain_scalar_text(other)),
             };
-            let quoted = matches!(current.style, "double" | "single" | "literal" | "folded");
+            let quoted = is_quoted_string_style(current.style)
+                || matches!(current.style, "literal" | "folded");
             let resolved = text.as_deref().map_or("!!str", go_yaml_resolved_tag);
             if tag == "!!str" {
                 if let Some(text) = text {
@@ -9652,9 +9653,17 @@ fn strip_presentation_style_at_depth(
     // A quoted string keeps its quoting when yq's encoder would (a YAML 1.1 bool spelling), and
     // is otherwise remembered as a string, so a spelling that reads back as a timestamp or a
     // number once plain is quoted rather than echoed bare (#3614).
+    // A `-p props` string already carries the marker (#7031); it is quoted as `"double"` where a
+    // quote is kept.
     let kept_quote = |text: &str, style: &'static str| match style {
-        "single" | "double" if is_yaml_11_bool_word(text) => style,
-        "single" | "double" => VALUE_STYLE_STRING,
+        s if is_quoted_string_style(s) && is_yaml_11_bool_word(text) => {
+            if s == VALUE_STYLE_STRING {
+                "double"
+            } else {
+                s
+            }
+        }
+        s if is_quoted_string_style(s) => VALUE_STYLE_STRING,
         _ => "",
     };
     match tree {

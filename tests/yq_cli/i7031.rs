@@ -39,11 +39,37 @@ fn props_input_nodes_have_no_style_7031() -> Result<()> {
     Ok(())
 }
 
-/// Quoting decides the tag: the dates and `<<` stay strings, and a write quotes them again as yq's
-/// encoder does (`a: "2001-12-14"`, `"<<": "1x"`), where the plain `1x` goes bare.
+/// Quoting decides the tag: the dates and `<<` stay strings, and a write, `-P` and `style=""` quote
+/// them again as yq's encoder does (`a: "2001-12-14"`, `"<<": "1x"`), where the plain `1x` goes bare.
 const QUOTED_INPUT: &str = "a=2001-12-14\nm=2001-12-14T21:59:43Z\nn=1\n<<=1\nc=hello\n";
 
 const QUOTED_ROWS: &[(&str, &[&str], &str)] = &[
+    (
+        ".",
+        &["-P"],
+        "a: \"2001-12-14\"\nm: \"2001-12-14T21:59:43Z\"\nn: \"1\"\n\"<<\": \"1\"\nc: hello\n",
+    ),
+    ("keys", &["-P"], "- a\n- m\n- n\n- \"<<\"\n- c\n"),
+    (
+        ".z = 1",
+        &["-P"],
+        "a: \"2001-12-14\"\nm: \"2001-12-14T21:59:43Z\"\nn: \"1\"\n\"<<\": \"1\"\nc: hello\nz: 1\n",
+    ),
+    (
+        ".a style=\"\"",
+        &["-o", "yaml"],
+        "a: \"2001-12-14\"\nm: \"2001-12-14T21:59:43Z\"\nn: \"1\"\n\"<<\": \"1\"\nc: hello\n",
+    ),
+    (
+        ".[] style=\"\"",
+        &["-o", "yaml"],
+        "a: \"2001-12-14\"\nm: \"2001-12-14T21:59:43Z\"\nn: \"1\"\n\"<<\": \"1\"\nc: hello\n",
+    ),
+    (
+        ".n tag = \"!!str\"",
+        &["-o", "yaml"],
+        "a: \"2001-12-14\"\nm: \"2001-12-14T21:59:43Z\"\nn: \"1\"\n\"<<\": \"1\"\nc: hello\n",
+    ),
     (
         "[.a, .m, .n, .c] | map(tag)",
         &["-o", "json", "-I0"],

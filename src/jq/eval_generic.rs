@@ -3771,12 +3771,22 @@ pub struct KeyMeta {
 /// (`yq -P` keeps `"1": 3`, where a plain key `1: 3` is an integer).
 pub const KEY_STYLE_STRING: &str = "string";
 
-/// The value style for a string whose quoting `-P` stripped (#3614).
+/// The value style for a string whose quoting `-P` stripped (#3614), or whose `-p props` transcode
+/// recorded a quoting yq's node does not have (#7031).
 ///
 /// The same fact [`KEY_STYLE_STRING`] records for a key. The tree does not hold the text, so a
 /// string a YAML document would read as another type once plain (`2001-12-14`, `1_000`, `0b11`,
 /// `<<`) has to be told from a plain scalar of that type, which stays bare.
 pub const VALUE_STYLE_STRING: &str = "string";
+
+/// Whether `style` is a quoted string's: `"single"`, `"double"`, or [`VALUE_STYLE_STRING`] /
+/// [`KEY_STYLE_STRING`], the marker for a string whose quoting is not kept but whose type is
+/// (`-P` sets it when it strips the quotes, and a `-p props` transcode seeds it, #7031). The one
+/// test every consumer of a node's quoting makes, so the marker reads as quoted everywhere.
+#[must_use]
+pub fn is_quoted_string_style(style: &str) -> bool {
+    matches!(style, "single" | "double") || style == VALUE_STYLE_STRING
+}
 
 impl KeyMeta {
     /// A key with a trailing comment and/or a quoted style, or `None` for a
@@ -3904,9 +3914,9 @@ impl KeyMeta {
         )
     }
 
-    /// Whether the source quoted this key (`"single"` or `"double"`), not yet stripped by `-P`.
+    /// Whether the source quoted this key ([`is_quoted_string_style`]).
     pub fn is_quoted(&self) -> bool {
-        matches!(self.style, "single" | "double")
+        is_quoted_string_style(self.style)
     }
 
     /// Whether the key was written behind an explicit `!!str` (#4088).
@@ -4474,21 +4484,6 @@ fn member_is_copy_of_source<C: DocumentCursor>(parent: &C, start: usize, end: us
     }
 }
 
-/// `under_alias`: whether some ancestor on the path from the root is itself
-/// an alias node -- i.e. whether the node currently being converted was
-/// only reached by resolving through a `YamlValue::Alias` to its target's
-/// own fields, rather than by walking the document's real tree shape.
-///
-/// Exists for #2500: `value.as_object()`/`as_array()` resolve straight
-/// through an alias to its target, so converting an alias node walks the
-/// *target*'s cursors for its children -- including any `&name` the target
-/// declares. Recording that declaration here would duplicate the one
-/// already recorded when the target's own (non-alias) position was
-/// converted, so a `Declares` mark found `under_alias` is dropped below.
-/// An `Aliases` mark found the same way is kept -- it's a genuine
-/// reference this document's writer still needs to resolve or drop on its
-/// own merits, e.g. `cfg: *base` nested inside an expanded `env: *env`
-/// copy must still round-trip as `*base`, not inline `base`'s value.
 /// The style the DOM write route keeps for `cursor`'s node: its own, or for a node with no style of
 /// its own ([`DocumentCursor::style_less`], a `-p props` transcode, #7031) none, except that a quoted
 /// string becomes `string` (the `-P` marker [`VALUE_STYLE_STRING`], or [`KEY_STYLE_STRING`] for a
@@ -4504,6 +4499,21 @@ fn kept_style<C: DocumentCursor>(cursor: &C, string: &'static str) -> &'static s
     }
 }
 
+/// `under_alias`: whether some ancestor on the path from the root is itself
+/// an alias node -- i.e. whether the node currently being converted was
+/// only reached by resolving through a `YamlValue::Alias` to its target's
+/// own fields, rather than by walking the document's real tree shape.
+///
+/// Exists for #2500: `value.as_object()`/`as_array()` resolve straight
+/// through an alias to its target, so converting an alias node walks the
+/// *target*'s cursors for its children -- including any `&name` the target
+/// declares. Recording that declaration here would duplicate the one
+/// already recorded when the target's own (non-alias) position was
+/// converted, so a `Declares` mark found `under_alias` is dropped below.
+/// An `Aliases` mark found the same way is kept -- it's a genuine
+/// reference this document's writer still needs to resolve or drop on its
+/// own merits, e.g. `cfg: *base` nested inside an expanded `env: *env`
+/// copy must still round-trip as `*base`, not inline `base`'s value.
 fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
     value: &V,
     cursor: Option<&V::Cursor>,
