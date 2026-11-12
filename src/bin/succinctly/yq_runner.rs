@@ -4779,19 +4779,19 @@ fn write_split_result(
     let mut buf = Vec::new();
     let mut no_color_config = output_config.clone();
     no_color_config.use_color = false;
-    // JSON has no document separator; every encoder but kyaml is `--no-doc` (see `run_yq`).
-    let separator = (first_in_doc && no_color_config.output_format == OutputFormat::Yaml)
-        .then_some(DocSeparatorArgs {
-            doc_streamed: &mut files.doc_streamed,
-            no_doc: no_color_config.no_doc,
-        });
-    output_value(
-        &mut buf,
-        content,
-        content_comments,
-        &no_color_config,
-        separator,
-    )?;
+    // The separator opens a file that is not the run's first, so the byte before it is no document's
+    // end and `-0`'s terminator is not to be guarded. JSON has no separator; every encoder but kyaml
+    // is `--no-doc` (see `run_yq`).
+    if first_in_doc && no_color_config.output_format == OutputFormat::Yaml {
+        emit_yaml_doc_separator(
+            &mut buf,
+            &mut files.doc_streamed,
+            true,
+            no_color_config.no_doc,
+            Terminator::Newline,
+        )?;
+    }
+    output_value(&mut buf, content, content_comments, &no_color_config, None)?;
     std::fs::write(&filename, &buf).with_context(write_failure)
 }
 

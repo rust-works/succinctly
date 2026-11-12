@@ -46,6 +46,66 @@ const ROWS: &[Row] = &[
             ("n3.yml", "---\na: 3\n"),
         ],
     ),
+    // Several results from several documents: the separator is before each document's first.
+    (
+        &["- 1\n- 2\n---\n- 3\n- 4\n---\n- 5\n"],
+        "\"n\"+(.|tostring)",
+        ".[]",
+        &[],
+        &[
+            ("n1.yml", "1\n"),
+            ("n2.yml", "2\n"),
+            ("n3.yml", "---\n3\n"),
+            ("n4.yml", "4\n"),
+            ("n5.yml", "---\n5\n"),
+        ],
+    ),
+    // A raw scalar result carries it too, and `-0`'s terminator does not guard it: each file starts
+    // fresh, so no line break is put before the `---`.
+    (
+        &["x\n---\ny\n---\nz\n"],
+        "\"s\"+.",
+        ".",
+        &["-r"],
+        &[
+            ("sx.yml", "x\n"),
+            ("sy.yml", "---\ny\n"),
+            ("sz.yml", "---\nz\n"),
+        ],
+    ),
+    (
+        &["x\n---\ny\n---\nz\n"],
+        "\"s\"+.",
+        ".",
+        &["-0"],
+        &[
+            ("sx.yml", "x\0"),
+            ("sy.yml", "---\ny\0"),
+            ("sz.yml", "---\nz\0"),
+        ],
+    ),
+    // The other encoders have none either.
+    (
+        &["[1, 2]\n---\n[3, 4]\n"],
+        "\"c\"+(.[0]|tostring)",
+        ".",
+        &["-o=csv"],
+        &[("c1.yml", "1,2\n"), ("c3.yml", "3,4\n")],
+    ),
+    (
+        &["[1, 2]\n---\n[3, 4]\n"],
+        "\"c\"+(.[0]|tostring)",
+        ".",
+        &["-o=tsv"],
+        &[("c1.yml", "1\t2\n"), ("c3.yml", "3\t4\n")],
+    ),
+    (
+        &["a: 1\n---\na: 2\n"],
+        N,
+        ".",
+        &["-o=toml"],
+        &[("n1.yml", "a = 1\n"), ("n2.yml", "a = 2\n")],
+    ),
     // A second input file is a new document too.
     (
         &["a: 1\n", "a: 2\n"],
