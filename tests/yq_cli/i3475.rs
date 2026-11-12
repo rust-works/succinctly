@@ -186,10 +186,11 @@ fn test_a_failing_file_among_several_writes_no_separator_3475() -> Result<()> {
     assert_eq!(run(&["f1.yaml", "f2.yaml"])?, ("- [1]\n".to_string(), 1));
     assert_eq!(run(&["f1.yaml", "f3.yaml"])?, ("- [1]\n".to_string(), 1));
     // The run goes on past a failing file, as for any other query, and the failed one leaves no
-    // empty document between the others.
+    // empty document between the others. `[.a]` builds a node with no document, so no `---`
+    // separates the two either, as in yq over `f1.yaml f4.yaml` (#7019).
     assert_eq!(
         run(&["f1.yaml", "f3.yaml", "f4.yaml"])?,
-        ("- [1]\n---\n- [3]\n".to_string(), 1)
+        ("- [1]\n- [3]\n".to_string(), 1)
     );
     Ok(())
 }
@@ -197,10 +198,11 @@ fn test_a_failing_file_among_several_writes_no_separator_3475() -> Result<()> {
 #[test]
 fn test_multi_value_json_with_yaml_output_keeps_its_spelling_3475() -> Result<()> {
     // Two top-level JSON values are two documents. Each is JSON-sourced, so `1.50` is `1.5` and
-    // `2e2` is `200`, as for any other query.
+    // `2e2` is `200`, as for any other query. `[.a]` builds a node with no document, so yq writes
+    // no `---` between the two (#7019).
     let doc = "{\"a\":1.50,\"b\":[1e2]}\n{\"a\":2e2,\"b\":[]}\n";
     let (out, code) = run_yq_stdin("[.a]", doc, &["-p=json"])?;
-    assert_eq!((out.as_str(), code), ("- 1.5\n---\n- 200\n", 0));
+    assert_eq!((out.as_str(), code), ("- 1.5\n- 200\n", 0));
     Ok(())
 }
 

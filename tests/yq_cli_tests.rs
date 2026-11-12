@@ -8070,15 +8070,12 @@ fn test_inplace_multi_doc_field_navigation() -> Result<()> {
 /// Expected value's leading `---` removed by #1493's review (this DOM
 /// branch had the same "leading separator before the first document" bug
 /// the standard/stdout path's own `any_yaml_doc_output` fix addresses).
-/// The *between*-results separator this test still asserts is itself a
-/// known, narrower divergence from real yq for this specific case: live
+/// The *between*-results separator matches real yq since #7019: live
 /// oracle output for `length` on this exact input is `2\n1\n`, with no
 /// separator between the two scalar results at all (`yq -i '.' ` on the
 /// same file, by contrast, does insert one between the two full-document
-/// results -- real yq's separator convention differs by whether a result
-/// is a per-document container vs. a computed scalar, a much narrower
-/// question outside this issue's own scope of "does -o=auto match the
-/// input format").
+/// results): a replacement of a document's root has no document index,
+/// so yq's printer sees no new document begin (#7019).
 #[test]
 fn test_inplace_non_m2_filter_still_works() -> Result<()> {
     let mut input_file = NamedTempFile::new()?;
@@ -8094,7 +8091,7 @@ fn test_inplace_non_m2_filter_still_works() -> Result<()> {
 
     assert!(output.status.success());
     let rewritten = std::fs::read_to_string(input_file.path())?;
-    assert_eq!(rewritten, "2\n---\n1\n");
+    assert_eq!(rewritten, "2\n1\n");
     Ok(())
 }
 
@@ -26886,7 +26883,8 @@ fn test_eval_all_file_index_in_if_then_else() -> Result<()> {
         &["--jq-extensions", "--eval-all"],
     )?;
     assert_eq!(code, 0);
-    assert_eq!(stdout, "from-f1\n---\nfrom-f2\n");
+    // A literal has no document, so no `---` separates the two (#7019).
+    assert_eq!(stdout, "from-f1\nfrom-f2\n");
     Ok(())
 }
 
