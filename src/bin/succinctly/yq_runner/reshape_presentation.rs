@@ -697,6 +697,47 @@ pub(super) fn trace(expr: &Expr, input: &ResultWithComments) -> Option<ResultWit
     trace_at_depth(expr, input, 0)
 }
 
+/// Whether `expr` is an entries operator applied to the whole document: `to_entries`, `from_entries`,
+/// `with_entries(f)`, or `to_entries | from_entries` with nothing between them (#7081). yq builds the
+/// result of each with `CreateReplacementWithComments`, which gives it what the document had before
+/// its first node: the comments above it and an explicit `---` (its leading content), and the head
+/// comment of its root. A `map` between the two builds a new sequence and drops them (#6674), and a
+/// step into the document first (`.a | to_entries`) makes it the node's, which has no leading content.
+pub(super) fn carries_document_leading(expr: &Expr) -> bool {
+    // The stages of the query, looking through parentheses and pipes, and past the identity (`. | to_entries`,
+    // `to_entries | .`), which is the same document.
+    fn stages<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
+        match expr {
+            Expr::Paren(inner) => stages(inner, out),
+            Expr::Pipe(parts) => parts.iter().for_each(|part| stages(part, out)),
+            Expr::Identity => {}
+            other => out.push(other),
+        }
+    }
+    let mut parts = Vec::new();
+    stages(expr, &mut parts);
+    matches!(
+        parts.as_slice(),
+        [Expr::Builtin(
+            Builtin::ToEntries | Builtin::FromEntries | Builtin::WithEntries(_)
+        )] | [
+            Expr::Builtin(Builtin::ToEntries),
+            Expr::Builtin(Builtin::FromEntries)
+        ]
+    )
+}
+
+/// Puts the head comment of the document `root` and the marker and comments before it on `rebuilt`,
+/// the root of an entries operator's result (#7081).
+pub(super) fn carry_document_leading(rebuilt: &mut CommentTree, root: &CommentTree) {
+    // The result's own foot stays: a replay may have placed one on it.
+    let foot = rebuilt.meta().foot_comment().to_vec();
+    *rebuilt.meta_mut() = rebuilt
+        .meta()
+        .with_head_foot_of(root.meta().head_comment().to_vec(), foot, root.meta())
+        .with_preamble(root.meta().preamble().map(str::to_string));
+}
+
 fn trace_at_depth(
     expr: &Expr,
     input: &ResultWithComments,

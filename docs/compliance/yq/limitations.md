@@ -1359,6 +1359,12 @@ What is still different, each a place that has not been taught the entries (an e
   A `*` with one merge flag (`*+`, `*d`, `*n` or `*?`) keeps the left document's comments, flow style and key spellings, as yq does (#6900); an array the merge replaces keeps the left node's own style around the right items.
   `map(select(c))` and `with_entries(select(c))` keep each surviving item as written since #6674, for a test `c` of field reads, literals, comparisons and `and`/`or`/`not`; another test, a test that fails on one item (`.value.c` over a scalar entry), a filter other than `select` in the same position, `select` over a sequence written in flow style at the document root (`[1, 2]` prints as a block here), a `# header` comment before a `---`, and `with_entries` over a sequence (whose keys are integers) still take the plain route.
   yq keeps a document's head comment on its first key: `with_entries` keeps it whatever its filter drops, and the written-out `to_entries | map(select(...)) | from_entries` drops it with the first entry, as yq does.
+  The entries operators over the whole document (`to_entries`, `from_entries`, `with_entries(f)`, and `to_entries | from_entries` with nothing between the two) give their result what yq reads before the document: the comments above it, an explicit `---` and the root's head comment (#7081), as yq's `CreateReplacementWithComments` does, where `keys`, `length`, `pick` and `[.]` build theirs without.
+  The carry is for the document as the filter's first stage: a step into it (`.a | to_entries`), a `map` between the two operators and an alias-sensitive write are not it.
+  What is carried is the comment block above the first `---` (or above the document where there is none), blank lines between them included: 2,485 random inputs of that shape, over five operators and five flag sets, print as yq prints them.
+  A comment after the `---` is the root's head comment in yq and the first entry's here, so it prints inside the first entry; one indented by blanks (`   # c`) is printed as written by yq and without the blanks here; and a root that is `{}` or `[]` loses the comments after its `---`.
+  Still different, each a separate presentation rule: a source that starts with a byte-order mark (yq makes the comments the first node's, so they print inside the first entry, #7089), a `%YAML` directive before the `---`, `--eval-all` (which drops every comment, #4380), `-o=kyaml` (the section below), and the same result through a construction (`{"x": .} | .x`, `[., .] | .[0]`) or from a scalar document (`map_values`, `omit`, `@yaml`, `to_yaml`), where yq keeps the leading content too.
+  Over several documents `to_entries | from_entries` prints the `---` between them, where yq prints the first and none after it (`to_entries` and `with_entries` agree).
   An anchor a `select` drops while an alias to it stays prints the alias in yq (`b: *x`, unreadable without its anchor) and the alias's value here, the soundness rule of ADR-0017.
   An empty value inside a flow mapping (`{a: , b: 2}`) is `''` in yq and `null` here for every entry, repeated key or not.
 - The other `IndexMap` builders that have not been converted.
@@ -7738,7 +7744,7 @@ The encoder runs over the value model, which keeps no comment, node style or sou
 The encoder runs over the value model, so on a YAML input these still differ:
 
 - A head, line or foot comment is dropped, where yq writes it (`a: 1, # c`).
-- An input whose first document opens with `---` prints that `---` first in yq (it keeps the document's leading separator as leading content), and here it does not.
+- An input whose first document opens with `---` prints that `---` first in yq (it keeps the document's leading separator as leading content), and here it does not; the same goes for the comments above it, and for the result of `to_entries`, `from_entries` and `with_entries`, which carry them in YAML output since #7081.
 - The YAML 1.1 integer `1_000` is a string here (see the YAML 1.1 section above), so it is quoted, where yq writes it bare.
 - `-C` colours the output in yq (`-o=kyaml` and `-o=toml` have colour printers of their own) and does nothing here.
 - With `-0`, the separator between documents is `\n---` here and `---` in yq, the existing difference of the `-0` multi-document section above.
