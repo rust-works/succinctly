@@ -6288,10 +6288,11 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             > = match raw_lines {
                 Some(files) => {
                     // #6480: a last line with no newline is read at a last file that did not open.
+                    let windows = LAZY_RAW_WINDOWS.with(|slot| slot.borrow_mut().take());
                     let mut lines = last_item_at(
                         locations.last_value_end(),
                         None,
-                        lazy_raw_producer(files, None),
+                        lazy_raw_producer_windowed(files, windows, None),
                     );
                     let locations = &locations;
                     Box::new(std::iter::from_fn(move || match lines() {
@@ -6925,6 +6926,7 @@ fn read_inputs(
     // this read's (#5857): the call site that seeds the queue takes the first slot it finds.
     LAZY_JSON_INPUTS.with(|slot| *slot.borrow_mut() = None);
     LAZY_RAW_INPUTS.with(|slot| *slot.borrow_mut() = None);
+    LAZY_RAW_WINDOWS.with(|slot| *slot.borrow_mut() = None);
     LAZY_STREAM_INPUTS.with(|slot| *slot.borrow_mut() = None);
     LAZY_SEQ_INPUTS.with(|slot| *slot.borrow_mut() = None);
     defer_open_failures(Vec::new(), false);
@@ -7005,6 +7007,23 @@ fn read_inputs(
         return Ok(Ok((Vec::new(), locations, None, Vec::new())));
     }
 
+    // #7023: `-R` over a lone regular file reads its lines a window at a time, as the plain route
+    // reads its documents. Anything the gate turns down is read whole below.
+    if let Some((file, len, eof_tail)) = lone_raw_windowed_file(args, track_eof, &files) {
+        let mut windows = window::LineWindows::new(file, len, lazy_window_bytes());
+        let first = windows
+            .next_window(report_input_read_failure)
+            .map(raw_window_text)
+            .unwrap_or_default();
+        opened.clone_from(&files);
+        let mut locations =
+            InputLocations::new(files.iter().map(|p| Some(input_display_name(p))).collect());
+        locations.eof_tail = eof_tail;
+        LAZY_RAW_INPUTS.with(|slot| *slot.borrow_mut() = Some(vec![(0, first)]));
+        LAZY_RAW_WINDOWS.with(|slot| *slot.borrow_mut() = Some(windows));
+        return Ok(Ok((Vec::new(), locations, None, Vec::new())));
+    }
+
     // #6451: a lone source the lazy route reads starts on the front of it, so the first document
     // does not wait for the whole file to be read and checked; the rest is read when the scan gets
     // there. A source the route turns down on that front is read whole here and goes on below.
@@ -7031,6 +7050,7 @@ fn read_inputs(
                     last_span: None,
                     recorded_tail: None,
                     rest: Some(rest),
+                    dropped: DroppedText::default(),
                 };
                 defer_lazy_start(std::rc::Rc::new(text), spans, 0, Seam::NONE, Some(more));
                 // One source, which opened.
@@ -8382,6 +8402,7 @@ fn read_inputs(
                         last_span: None,
                         recorded_tail: None,
                         rest: None,
+                        dropped: DroppedText::default(),
                     });
                     defer_lazy_start(
                         std::rc::Rc::new(raw),
@@ -8488,6 +8509,7 @@ fn read_inputs(
                             LazyChunk {
                                 spans: Vec::new(),
                                 end: ChunkEnd::Fault,
+                                open_tail: false,
                             }
                         } else {
                             lazy_json_scan_chunk(&raw, 0, lazy_chunk_budget(0))
@@ -8511,6 +8533,7 @@ fn read_inputs(
                                 last_span: None,
                                 recorded_tail,
                                 rest: None,
+                                dropped: DroppedText::default(),
                             });
                             if recorded_tail.is_none() {
                                 debug_assert_eq!(seam, Seam::NONE, "a lone source is unstitched");
@@ -8566,6 +8589,7 @@ fn read_inputs(
                         seam: &seam,
                         lossy,
                         ends_stream: pos == last && !unopened_tail,
+                        lines_before: 0,
                     };
                     let file_end = match read_json_tail(
                         &raw,
@@ -9288,11 +9312,19 @@ impl EofTail {
     /// `base` is how many of the source's first bytes were moved onto it from an earlier file
     /// (#4316, #5857): they are not part of its reads or its lines.
     fn of_clean_source(bytes: &[u8], spans: &[(usize, usize)], base: usize) -> Self {
+        let last = spans.last().map(|&(start, end)| (bytes[start], end));
+        Self::of_clean_text(bytes, last, base)
+    }
+
+    /// [`of_clean_source`](Self::of_clean_source) for the stream's last document given as its first
+    /// byte and where it ends in `bytes`, which a text read in windows keeps in place of its start
+    /// (#7023). `bytes` starts at a line start, so the answer is the whole text's but for the line
+    /// breaks before it, which [`DroppedText::count_in`] adds.
+    fn of_clean_text(bytes: &[u8], last: Option<(u8, usize)>, base: usize) -> Self {
         let base = base.min(bytes.len());
         let final_read = Self::final_read_start(bytes, base);
-        let unknown = spans
-            .last()
-            .is_some_and(|&(start, end)| Self::completes_at(bytes, start, end) >= final_read);
+        let unknown =
+            last.is_some_and(|(first, end)| Self::completes_at_byte(first, end) >= final_read);
         Self {
             newlines: count_newlines(&bytes[base..]) as u32,
             unknown,
@@ -9459,13 +9491,28 @@ impl InputLocations {
         ends: &[usize],
         values: usize,
     ) {
+        self.extend_from_ends_after(src, raw, seam, ends, values, 0);
+    }
+
+    /// [`extend_from_ends`](Self::extend_from_ends) over a `raw` that is the file from a line start
+    /// on, with `lines_before` line breaks ahead of it (#7023).
+    fn extend_from_ends_after(
+        &mut self,
+        src: usize,
+        raw: &str,
+        seam: Seam,
+        ends: &[usize],
+        values: usize,
+        lines_before: usize,
+    ) {
         if ends.len() == values {
             let mut line_counter = LineCounter::at_seam(raw.as_bytes(), seam);
+            line_counter.set_lines_before(lines_before);
             for &end in ends {
                 self.push(src, line_counter.read_end_line(end));
             }
         } else {
-            let line = content_lines(raw.get(seam.base..).unwrap_or(raw));
+            let line = lines_before + content_lines(raw.get(seam.base..).unwrap_or(raw));
             for _ in 0..values {
                 self.push(src, line);
             }
@@ -11166,6 +11213,89 @@ fn names_stdin(_: &std::fs::Metadata) -> bool {
     false
 }
 
+/// The smallest file `-R` reads a window at a time (#7023): below it the file is read whole as before.
+fn raw_window_min_bytes() -> u64 {
+    #[cfg(test)]
+    if let Some(bytes) = LAZY_RAW_MIN_OVERRIDE.with(std::cell::Cell::get) {
+        return bytes;
+    }
+    window::MIN_WINDOWED_FILE_BYTES
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: [`raw_window_min_bytes`] in its place, so a short file is read in windows.
+    static LAZY_RAW_MIN_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// The lone regular file `-R` reads a window at a time (#7023), opened, with its length and, for a
+/// program that reads `input`, how its stream ends (#4303), counted in a pass over the file that
+/// holds one block; or `None` for a run that is not one. `-R` is a line reader, so it needs no more
+/// of the text before a line than the number of line breaks, which the producer keeps as it goes,
+/// and a stream of lines has no fault to word: every flag that has the route read the stream whole
+/// (`--slurp`, `--validate`, DSV), and every shape the plain route's gate turns down (stdin, a pipe
+/// or directory, several files, a file too small to be worth it), keeps the route that reads it whole.
+/// The path is judged by `stat`, which opens nothing, as [`windowed_plain_file`] judges it.
+fn lone_raw_windowed_file(
+    args: &JqCommand,
+    track_eof: bool,
+    files: &[PathBuf],
+) -> Option<(std::fs::File, u64, Option<EofTail>)> {
+    if !args.raw_input
+        || args.slurp
+        || args.stream
+        || args.stream_errors
+        || args.seq
+        || args.input_dsv.is_some()
+        || args.validate
+        || lazy_route_forced_off()
+    {
+        return None;
+    }
+    let [path] = files else {
+        return None;
+    };
+    if is_stdin_dash(path) || path.starts_with("/dev/fd/") {
+        return None;
+    }
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() < raw_window_min_bytes() || names_stdin(&meta) {
+        return None;
+    }
+    let eof_tail = if track_eof {
+        Some(raw_eof_tail(path)?)
+    } else {
+        None
+    };
+    let file = std::fs::File::open(path).ok()?;
+    Some((file, meta.len(), eof_tail))
+}
+
+/// How a `-R` stream ends ([`EofTail::of`] with `raw`), for a file counted a block at a time: its
+/// line breaks, and whether bytes follow the last (a last line without one completes at the end).
+/// `None` when the file cannot be read, which the route that reads it whole then reports.
+fn raw_eof_tail(path: &Path) -> Option<EofTail> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut block = vec![0u8; window::WINDOW_BYTES];
+    let mut newlines = 0usize;
+    let mut last = None;
+    loop {
+        match file.read(&mut block) {
+            Ok(0) => break,
+            Ok(read) => {
+                newlines += count_newlines(&block[..read]);
+                last = Some(block[read - 1]);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    Some(EofTail {
+        newlines: u32::try_from(newlines).unwrap_or(u32::MAX),
+        unknown: last.is_some_and(|byte| byte != b'\n'),
+    })
+}
+
 /// The lone regular file the plain route reads a window at a time (#6920), opened, and the means
 /// to read it again for a fault's wording; or `None` for a run that is not one: stdin, a pipe or a
 /// directory, several files, a file too small to be worth it, and every flag that has the route read
@@ -11418,6 +11548,31 @@ struct LinePlace {
     line_start: usize,
     next_newline: Option<usize>,
     seam: Seam,
+}
+
+impl LinePlace {
+    /// Where the line holding the counter's position starts: what a text read in windows may drop
+    /// up to without losing a count (#7023).
+    fn line_start(&self) -> usize {
+        self.line_start
+    }
+
+    /// This place once the first `dropped` bytes of its text are gone, which must be no more than
+    /// [`line_start`](Self::line_start): the line breaks counted so far stay counted, and every
+    /// offset moves back. A cached next newline keeps its meaning; the text is only ever appended
+    /// to at a line break, so a newline found at the end of the text was no end of the file.
+    fn after_dropping(mut self, dropped: usize) -> Self {
+        debug_assert!(dropped <= self.line_start && dropped <= self.pos);
+        self.pos -= dropped;
+        self.line_start -= dropped;
+        self.next_newline = self.next_newline.map(|at| at.saturating_sub(dropped));
+        self
+    }
+
+    /// The line breaks before the counter's position.
+    fn newlines_before(&self) -> usize {
+        self.newlines_before_pos
+    }
 }
 
 impl<'a> LineCounter<'a> {
@@ -12336,6 +12491,9 @@ struct TailContext<'a> {
     /// The stream ends in this source's last byte: it is the last file and no file after it
     /// failed to open (#6004).
     ends_stream: bool,
+    /// How many line breaks came before the text, which a lone source read in windows has dropped
+    /// the front of (#7023); `file_start` is then where the text starts, not the file.
+    lines_before: usize,
 }
 
 /// The eager reader of a JSON text from byte `offset` on (#4311): the documents it holds, each ending
@@ -12352,6 +12510,7 @@ fn read_json_tail(
     resumed_errors: &mut Vec<(usize, TrailingParseError)>,
 ) -> Result<Option<(usize, usize)>> {
     let mut faults = LineCounter::at_seam(raw.as_bytes(), cx.seam.clone());
+    faults.set_lines_before(cx.lines_before);
     // #5923: where jq's parser stands at the start of each segment. The first is
     // where the file starts; after a fault it is where the fault left the parser,
     // since jq drops the rest of the read and never counts it.
@@ -12558,8 +12717,10 @@ struct LazyMore {
     last_source: u32,
     /// The bytes jq read, where the text is a substitution of them (#5964).
     lossy: Option<LossySource>,
-    /// The last document of a chunk already read, which is all the end of the stream is read off.
-    last_span: Option<(usize, usize)>,
+    /// The last document of a chunk already read, which is all the end of the stream is read off:
+    /// its first byte, and where it ends in the text. (Not its start: a window drops text before a
+    /// document that starts on an earlier line is over, #7023.)
+    last_span: Option<(u8, usize)>,
     /// The end of the stream where [`get_inputs`] recorded it before the scan, for a stream that is
     /// not UTF-8 (the one case whose seam the substitution moves); else it is read off the spans
     /// when the scan reaches the end.
@@ -12567,6 +12728,40 @@ struct LazyMore {
     /// The source's bytes after the text, not read yet: a lone source starts on the front of it
     /// (#6451), and the rest is read when the scan gets past that ([`read_lazy_rest`]).
     rest: Option<LazyRest>,
+    /// The text before the window `text` holds, which a lone source read a window at a time has
+    /// dropped (#7023): nothing for a source whose text is whole.
+    dropped: DroppedText,
+}
+
+/// The text a lone source read in windows has dropped from the front of `LazyJsonInputs::text`
+/// (#7023). A window starts at a line start, so the two counts are all the dropped text is to
+/// anything that reads the text from its front: the lines before it, and where it is in jq's input.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DroppedText {
+    /// How many bytes came before the window.
+    bytes: usize,
+    /// How many line breaks came before the window.
+    newlines: usize,
+}
+
+impl DroppedText {
+    /// Where the window starts in jq's input, given where the file does (#5497): at a line start.
+    fn window_start(self, file_start: (usize, usize)) -> (usize, usize) {
+        if self.bytes == 0 {
+            file_start
+        } else {
+            (file_start.0 + self.newlines, 0)
+        }
+    }
+
+    /// `tail` with the line breaks of the dropped text added: the end of the stream counts them.
+    fn count_in(self, tail: EofTail) -> EofTail {
+        EofTail {
+            newlines: u32::try_from(self.newlines)
+                .map_or(u32::MAX, |dropped| tail.newlines.saturating_add(dropped)),
+            ..tail
+        }
+    }
 }
 
 /// What is left to read of a lone source the lazy route started on the front of (#6451).
@@ -12727,31 +12922,114 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
     }
 }
 
-/// Reads the rest of a lone source the lazy route started on the front of (#6451), when the scan
-/// needs the text after the front. A source that turns out not to be UTF-8 becomes jq's
-/// substitution of its bytes, with the end of the stream recorded from the bytes as read, exactly
-/// as [`get_inputs`] makes such a stream up front: the text before the front's end is UTF-8 and
-/// ends between documents, so the substitution leaves it, and the documents already read, as they
-/// were.
-fn read_lazy_rest(lazy: &mut LazyJsonInputs, more: &mut LazyMore, mut rest: LazyRest) {
-    let mut bytes = std::mem::take(std::rc::Rc::make_mut(&mut lazy.text)).into_bytes();
-    bytes.append(&mut rest.pending);
-    if let Err(error) = rest.reader.read_to_end(&mut bytes) {
-        // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
-        // A source that failed part-way ends there: jq reports it and exits 2 (#5498).
-        report_input_read_failure(&error);
-        // patchcov: coverage end
+/// How much of a lone source the lazy route reads at a time once it is past the front (#7023): the
+/// text it holds is about this much past the documents it has handed out, and a chunk of the scan
+/// ([`LAZY_CHUNK_MAX_BYTES`]) fits in it.
+const LAZY_WINDOW_BYTES: usize = 1 << 20;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: [`LAZY_WINDOW_BYTES`] in its place, so a short stream is read in several windows.
+    static LAZY_WINDOW_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Test-only: the windows [`read_lazy_window`] read, and the bytes [`slide_lazy_window`] dropped.
+    static LAZY_WINDOWS_READ: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    /// Test-only: the most text a lone source held when [`lazy_scan_on`] scanned it.
+    static LAZY_TEXT_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn lazy_window_bytes() -> usize {
+    #[cfg(test)]
+    if let Some(bytes) = LAZY_WINDOW_OVERRIDE.with(std::cell::Cell::get) {
+        return bytes;
     }
-    let text = match String::from_utf8(bytes) {
-        Ok(text) => text,
-        Err(e) => {
-            let original = e.into_bytes();
-            more.recorded_tail = Some(EofTail::of(
+    LAZY_WINDOW_BYTES
+}
+
+/// What [`read_lazy_window`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowRead {
+    /// The text grew by whole lines and the source goes on.
+    More,
+    /// The text now holds the end of the source, which is all of it from the window on.
+    Eof,
+}
+
+/// Reads the next window of a lone source the lazy route started on the front of (#6451, #7023) onto
+/// the end of its text: at least `want` bytes, and up to a line break, or to the end of the source.
+/// A window that is no more than whole lines is what lets the text before it go ([`slide_lazy_window`]):
+/// the line breaks the count needs after a document are in the text, and a line is never split.
+///
+/// A source that turns out not to be UTF-8 becomes jq's substitution of its bytes from the window
+/// on, with the end of the stream recorded from the bytes as read, exactly as [`get_inputs`] makes
+/// such a stream up front: the text before is UTF-8 and ends between documents, so the substitution
+/// leaves it, and the documents already read, as they were. The rest of the source is read then, as
+/// the substitution is made over the bytes whole, and the source is not read in windows after it.
+fn read_lazy_window(lazy: &mut LazyJsonInputs, more: &mut LazyMore, want: usize) -> WindowRead {
+    let Some(mut rest) = more.rest.take() else {
+        return WindowRead::Eof;
+    };
+    #[cfg(test)]
+    LAZY_WINDOWS_READ.with(|n| n.set((n.get().0 + 1, n.get().1)));
+    let mut fresh = std::mem::take(&mut rest.pending);
+    let mut eof = false;
+    let mut ask = want.max(1);
+    // The read ends at a line break: a block that has none is read on, doubling.
+    let cut = loop {
+        let before = fresh.len();
+        match rest
+            .reader
+            .by_ref()
+            .take(ask as u64)
+            .read_to_end(&mut fresh)
+        {
+            Ok(read) if read < ask => eof = true,
+            Ok(_) => {}
+            Err(error) => {
+                // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
+                // A source that failed part-way ends there: jq reports it and exits 2 (#5498).
+                report_input_read_failure(&error);
+                eof = true;
+                // patchcov: coverage end
+            }
+        }
+        if eof {
+            break fresh.len();
+        }
+        if let Some(at) = fresh[before..].iter().rposition(|&b| b == b'\n') {
+            break before + at + 1;
+        }
+        ask = ask.saturating_mul(2);
+    };
+    let mut carried = fresh.split_off(cut);
+    match std::str::from_utf8(&fresh) {
+        Ok(new) => {
+            std::rc::Rc::make_mut(&mut lazy.text).push_str(new);
+            if eof {
+                WindowRead::Eof
+            } else {
+                rest.pending = std::mem::take(&mut carried);
+                more.rest = Some(rest);
+                WindowRead::More
+            }
+        }
+        Err(_) => {
+            // Not UTF-8: the rest of the source, and all of it from here, is bytes as read.
+            if !eof {
+                fresh.append(&mut carried);
+                if let Err(error) = rest.reader.read_to_end(&mut fresh) {
+                    // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
+                    report_input_read_failure(&error);
+                    // patchcov: coverage end
+                }
+            }
+            let mut original = std::mem::take(std::rc::Rc::make_mut(&mut lazy.text)).into_bytes();
+            original.append(&mut fresh);
+            more.recorded_tail = Some(more.dropped.count_in(EofTail::of(
                 &[original.as_slice()],
                 false,
                 &more.seams,
                 false,
-            ));
+            )));
             let (text, edits) =
                 succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document_mapped(
                     &original,
@@ -12770,10 +13048,47 @@ fn read_lazy_rest(lazy: &mut LazyJsonInputs, more: &mut LazyMore, mut rest: Lazy
                 .map(|seam| seam.after_substitution(len, &edits))
                 .collect();
             more.lossy = Some(LossySource::new(original, edits));
-            text
+            *std::rc::Rc::make_mut(&mut lazy.text) = text;
+            WindowRead::Eof
         }
+    }
+}
+
+/// Reads what is left of the source, for a fault: the eager reader that takes the stream from the end
+/// of the last good document reads the stream to its end (#7023).
+fn read_lazy_rest(lazy: &mut LazyJsonInputs, more: &mut LazyMore) {
+    while read_lazy_window(lazy, more, LAZY_WINDOW_BYTES) == WindowRead::More {}
+}
+
+/// Drops the text of a lone source that the documents handed out are over (#7023): up to the start of
+/// the line the producer's counter stands in, which keeps every count the next documents need. The
+/// counter is moved with the text; the line breaks and bytes dropped are kept in `more`.
+fn slide_lazy_window(
+    lazy: &mut LazyJsonInputs,
+    more: &mut LazyMore,
+    lines: &mut Option<LinePlace>,
+) {
+    let Some(place) = lines.as_ref() else {
+        return;
     };
-    *std::rc::Rc::make_mut(&mut lazy.text) = text;
+    // Cheap to keep a little: dropping moves what is left, so it waits for a block's worth.
+    let drop = place.line_start().min(more.scanned_to);
+    if drop == 0 || drop < lazy_window_bytes() / 4 || drop >= more.scanned_to {
+        return;
+    }
+    #[cfg(test)]
+    LAZY_WINDOWS_READ.with(|n| n.set((n.get().0, n.get().1 + drop)));
+    // Every line break before the counter's line start is before its position, and counted.
+    more.dropped = DroppedText {
+        bytes: more.dropped.bytes + drop,
+        newlines: place.newlines_before(),
+    };
+    std::rc::Rc::make_mut(&mut lazy.text).drain(..drop);
+    more.scanned_to -= drop;
+    more.last_span = more
+        .last_span
+        .map(|(first, end)| (first, end.saturating_sub(drop)));
+    *lines = lines.take().map(|place| place.after_dropping(drop));
 }
 
 /// The first chunk of a lazy stream covers about this much text, and each chunk after it twice the
@@ -12933,7 +13248,8 @@ fn lazy_json_producer_then(
             if cursor.next < lazy.spans.len() {
                 break;
             }
-            let handed_off = lazy_scan_on(lazy, later, &mut tail, &mut exhausted);
+            let handed_off =
+                lazy_scan_on(lazy, later, &mut tail, &mut exhausted, &mut cursor.lines);
             // The documents read are forgotten, so the spans held are a chunk's, not the stream's.
             cursor.next = 0;
             cursor.batch = None;
@@ -13026,23 +13342,70 @@ fn pop_finished_source(sources: &mut std::collections::VecDeque<LazyJsonInputs>)
 /// stream's: the next file reads on from it, and a fault, or a number or literal this file ends in
 /// (the next file's first byte may go on with it, #4305), hands this file's rest and every later
 /// file to the eager reader ([`hand_off_later_sources`]). Answers whether it did.
+///
+/// `lines` is the producer's line counter, where it stands in `lazy.text`. A lone source read in
+/// windows (#7023) has the text the documents read are over dropped before the next window is read,
+/// and the counter is moved with it.
 fn lazy_scan_on(
     lazy: &mut LazyJsonInputs,
     later: &mut [LazyJsonInputs],
     tail: &mut Box<dyn Iterator<Item = jq::ProducedInput>>,
     exhausted: &mut Option<(u32, u32)>,
+    lines: &mut Option<LinePlace>,
 ) -> bool {
     let Some(mut more) = lazy.more.take() else {
         lazy.spans.clear();
         return false;
     };
-    more.last_span = lazy.spans.last().copied().or(more.last_span);
-    lazy.spans.clear();
-    // #6451: the text after the front of a lone source is read when the scan gets to it.
-    if let Some(rest) = more.rest.take() {
-        read_lazy_rest(lazy, &mut more, rest);
+    if let Some(&(start, end)) = lazy.spans.last() {
+        more.last_span = Some((lazy.text.as_bytes()[start], end));
     }
-    let chunk = lazy_json_scan_chunk(&lazy.text, more.scanned_to, lazy_chunk_budget(more.chunks));
+    lazy.spans.clear();
+    // #6451, #7023: the text after the front of a lone source is read a window at a time, when the
+    // scan gets to it, and the text before the documents read goes.
+    if more.rest.is_some() {
+        slide_lazy_window(lazy, &mut more, lines);
+    }
+    let mut chunk;
+    let mut read_on = false;
+    loop {
+        if more.rest.is_some() {
+            let ahead = lazy.text.len() - more.scanned_to;
+            // The front of a source ends where its read did, mid-line: a scan reads the line
+            // breaks after a document to count its line, so the text ends at one.
+            if read_on || ahead < lazy_window_bytes() || !lazy.text.ends_with('\n') {
+                // Twice what is held past the documents when a document did not fit (it is read
+                // to the end of the source once the scan has had to ask for several windows).
+                let want = if read_on {
+                    ahead.max(lazy_window_bytes())
+                } else {
+                    lazy_window_bytes()
+                };
+                read_lazy_window(lazy, &mut more, want);
+            }
+        }
+        #[cfg(test)]
+        LAZY_TEXT_PEAK.with(|n| n.set(n.get().max(lazy.text.len())));
+        chunk = lazy_json_scan_chunk(&lazy.text, more.scanned_to, lazy_chunk_budget(more.chunks));
+        if more.rest.is_none() {
+            break;
+        }
+        // The text goes on: the end of what was read is no end of the stream, and a container or
+        // string open at it may be finished by the next window.
+        match chunk.end {
+            ChunkEnd::Done if chunk.spans.is_empty() => read_on = true,
+            ChunkEnd::Done => {
+                chunk.end = ChunkEnd::More;
+                break;
+            }
+            ChunkEnd::Fault if chunk.open_tail => read_on = true,
+            ChunkEnd::More | ChunkEnd::Fault => break,
+        }
+    }
+    // A fault hands the stream to the eager reader, which reads it to its end.
+    if chunk.end == ChunkEnd::Fault && more.rest.is_some() {
+        read_lazy_rest(lazy, &mut more);
+    }
     more.chunks += 1;
     #[cfg(test)]
     LAZY_CHUNKS_SCANNED.with(|n| {
@@ -13080,26 +13443,29 @@ fn lazy_scan_on(
         // The next file reads on from the end of this one.
         ChunkEnd::Done if !later.is_empty() => {}
         ChunkEnd::Done => {
-            let last = lazy.spans.last().copied().or(more.last_span);
+            let bytes = lazy.text.as_bytes();
+            let last = lazy
+                .spans
+                .last()
+                .map(|&(start, end)| (bytes[start], end))
+                .or(more.last_span);
             *exhausted = settled(more.recorded_tail.unwrap_or_else(|| {
                 // A lone file has no seam; the last of several starts its lines after the bytes
                 // the stitch moved onto it (#6450).
-                EofTail::of_clean_source(
-                    lazy.text.as_bytes(),
-                    last.as_ref().map_or(&[][..], std::slice::from_ref),
-                    lazy.seam.base,
-                )
+                more.dropped
+                    .count_in(EofTail::of_clean_text(bytes, last, lazy.seam.base))
             }));
         }
         ChunkEnd::Fault => {
             let text = lazy.text.as_str();
             let cx = TailContext {
                 stream: false,
-                file_start: lazy.file_start,
+                file_start: more.dropped.window_start(lazy.file_start),
                 src: lazy.source as usize,
                 seam: &lazy.seam,
                 lossy: more.lossy.as_ref(),
                 ends_stream: lazy.ends_stream,
+                lines_before: more.dropped.newlines,
             };
             let (mut values, mut ends, mut errors) = (Vec::new(), Vec::new(), Vec::new());
             match read_json_tail(text, end_of_last, &cx, &mut values, &mut ends, &mut errors) {
@@ -13108,12 +13474,13 @@ fn lazy_scan_on(
                     // documents: it is the only source, or the last of several whose earlier ones
                     // have all been read (#6450), and it was clean when it was deferred.
                     let mut locations = InputLocations::new(Vec::new());
-                    locations.extend_from_ends(
+                    locations.extend_from_ends_after(
                         lazy.source as usize,
                         text,
                         lazy.seam.clone(),
                         &ends,
                         values.len(),
+                        more.dropped.newlines,
                     );
                     // #6678: as in `hand_off_later_sources`.
                     note_fault_ends(errors.iter().map(|(_, fault)| &fault.error.message));
@@ -13127,10 +13494,10 @@ fn lazy_scan_on(
                     )));
                 } // patchcov: coverage end
             }
-            *exhausted = settled(
-                more.recorded_tail
-                    .unwrap_or_else(|| EofTail::of(&[text.as_bytes()], false, &more.seams, false)),
-            );
+            *exhausted = settled(more.recorded_tail.unwrap_or_else(|| {
+                more.dropped
+                    .count_in(EofTail::of(&[text.as_bytes()], false, &more.seams, false))
+            }));
         }
     }
     false
@@ -13200,6 +13567,7 @@ fn hand_off_later_sources(
             // Every file is UTF-8 on this route, so none is a substitution.
             lossy: None,
             ends_stream: pos == last && ends_stream,
+            lines_before: 0,
         };
         let before = values.len();
         let mut ends = Vec::new();
@@ -13265,11 +13633,25 @@ impl Default for LazyCursor {
 /// at that file's count of newlines before it, and a final line without one in the last file, at
 /// that file's own length. `files` are each source's tag and text; the end of the stream is
 /// `exhausted`.
+#[cfg(test)]
 fn lazy_raw_producer(
     files: Vec<(u32, String)>,
     exhausted: Option<(u32, u32)>,
 ) -> jq::InputProducer {
+    lazy_raw_producer_windowed(files, None, exhausted)
+}
+
+/// [`lazy_raw_producer`] for a lone file read a window at a time (#7023): `files` holds its first
+/// window as its text, and `rest` reads the windows after it, each when the lines of the one before
+/// are over. A window ends at a line break, so a line is never split by one, and the text of a window
+/// is dropped when the next is read.
+fn lazy_raw_producer_windowed(
+    files: Vec<(u32, String)>,
+    rest: Option<window::LineWindows>,
+    exhausted: Option<(u32, u32)>,
+) -> jq::InputProducer {
     let mut files = files;
+    let mut rest = rest;
     let last = files.len().saturating_sub(1);
     // The file being read and the offset in it, the newlines of that file read so far (a line's
     // number is the count at its own newline, and a final line without one is on the file's
@@ -13293,7 +13675,16 @@ fn lazy_raw_producer(
                 );
             }
             open.push_str(&text[at..]);
+            // The next window of a file read in windows: the text before it is dropped.
             if file == last {
+                if let Some(next) = rest
+                    .as_mut()
+                    .and_then(|windows| windows.next_window(report_input_read_failure))
+                {
+                    files[file].1 = raw_window_text(next);
+                    at = 0;
+                    continue;
+                }
                 break;
             }
             // Past the file: its text is no longer needed.
@@ -13310,6 +13701,21 @@ fn lazy_raw_producer(
         file = files.len();
         jq::ProducedInput::Document(OwnedValue::String(line.into()), files[last].0, newlines)
     })
+}
+
+/// The text of a window of `-R`'s lines: each line has jq's substitution of any byte that is not
+/// UTF-8, as [`get_inputs`] makes it for a file read whole (#1742). A window is whole lines, so the
+/// lines are the file's.
+fn raw_window_text(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(e) => e
+            .into_bytes()
+            .split(|&b| b == b'\n')
+            .map(succinctly::text::utf8::substitute_invalid_utf8_jq_style)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
 }
 
 /// Leaves a stream's lazy documents for the call site that seeds the `input` queue, which takes them.
@@ -13407,12 +13813,13 @@ fn seed_input_queue(
         // #5857: `-R`'s lines, converted as the program reads them. There is no parse error to
         // queue behind them, and `inputs` is empty.
         debug_assert!(inputs.is_empty() && trailing_error.is_none() && resumed_errors.is_empty());
+        let windows = LAZY_RAW_WINDOWS.with(|slot| slot.borrow_mut().take());
         jq::seed_remaining_inputs_from(end_producer_at(
             locations.unopened_end(),
             last_item_at(
                 locations.last_value_end(),
                 None,
-                lazy_raw_producer(files, locations.exhausted(slurp)),
+                lazy_raw_producer_windowed(files, windows, locations.exhausted(slurp)),
             ),
         ));
         locations.count_reads_past_end(slurp);
@@ -13756,6 +14163,10 @@ thread_local! {
     /// Set by [`get_inputs`] for `-R` (#5857): each file's source tag and text, in order, which the
     /// call site that seeds the `input` queue takes.
     static LAZY_RAW_INPUTS: std::cell::RefCell<Option<Vec<(u32, String)>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Set by [`get_inputs`] with [`LAZY_RAW_INPUTS`] for a lone file read a window at a time
+    /// (#7023): the windows after the first, which the producer of the lines reads as it goes.
+    static LAZY_RAW_WINDOWS: std::cell::RefCell<Option<window::LineWindows>> =
         const { std::cell::RefCell::new(None) };
     /// Set by [`get_inputs`] for a `--seq` stream (#6500): its records, converted as the program
     /// reads them, which the call site that seeds the `input` queue takes.
@@ -14244,6 +14655,9 @@ enum ChunkEnd {
 struct LazyChunk {
     spans: Vec<(usize, usize)>,
     end: ChunkEnd,
+    /// The fault is only that the text ends inside a container or string: more text may complete it
+    /// (#7023). A text read in windows reads on and scans again; the whole text has nothing to read.
+    open_tail: bool,
 }
 
 /// [`lazy_json_scan`] a piece at a time (#5856): the documents of `raw` from byte `from`, a
@@ -14259,6 +14673,7 @@ fn lazy_json_scan_chunk(raw: &str, from: usize, budget: usize) -> LazyChunk {
     let none = LazyChunk {
         spans: Vec::new(),
         end: ChunkEnd::Fault,
+        open_tail: false,
     };
     if from == 0 && (raw.starts_with('\u{feff}') || raw.trim().is_empty()) {
         return none;
@@ -14269,6 +14684,8 @@ fn lazy_json_scan_chunk(raw: &str, from: usize, budget: usize) -> LazyChunk {
     #[cfg(test)]
     LAZY_BYTES_SCANNED.with(|n| n.set(n.get() + spans.last().map_or(0, |&(_, end)| end - from)));
     let mut fault = split_error.is_some();
+    // The splitter's fault is at a container or string that the text does not finish.
+    let mut open_tail = split_error.is_some_and(|at| matches!(bytes[at], b'{' | b'[' | b'"'));
     // Where the two parsers stop agreeing on a document's end, the stream stops being lazy.
     if let (Some(&(first, _)), Some(&(_, last))) = (spans.first(), spans.last()) {
         let mut stream = serde_json::Deserializer::from_str(&raw[first..last])
@@ -14282,6 +14699,7 @@ fn lazy_json_scan_chunk(raw: &str, from: usize, budget: usize) -> LazyChunk {
             .count();
         if agreed < spans.len() {
             fault = true;
+            open_tail = false;
             spans.truncate(agreed);
         }
     }
@@ -14295,6 +14713,7 @@ fn lazy_json_scan_chunk(raw: &str, from: usize, budget: usize) -> LazyChunk {
         .count();
     if shallow < spans.len() {
         fault = true;
+        open_tail = false;
         spans.truncate(shallow);
     }
     if fault {
@@ -14319,7 +14738,11 @@ fn lazy_json_scan_chunk(raw: &str, from: usize, budget: usize) -> LazyChunk {
     } else {
         ChunkEnd::Done
     };
-    LazyChunk { spans, end }
+    LazyChunk {
+        spans,
+        end,
+        open_tail: open_tail && fault,
+    }
 }
 
 /// [`find_json_values`] without discarding what it found before a failure:
@@ -19690,6 +20113,91 @@ mod tests {
         );
     }
 
+    /// #7023: a lone source read a window at a time hands out what one read whole does: every
+    /// document and error `input` pops and the `(at ...)` marker after each, through and past the end,
+    /// for streams with a fault, a byte that is not UTF-8, a document across lines or a character cut
+    /// at every position, over every front and window length. The pin can fail: it does with the
+    /// counter not moved with the text that is dropped, with the dropped lines not counted in the end
+    /// of the stream, and with a scan that stopped at a window's end taken for the stream's.
+    #[test]
+    fn a_lone_source_read_in_windows_reads_as_one_read_whole_7023() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let observe = |bytes: &[u8], front: Option<usize>, window: Option<usize>| {
+            LAZY_PREFIX_OVERRIDE.with(|c| c.set(front));
+            LAZY_WINDOW_OVERRIDE.with(|c| c.set(window));
+            let seen = observe_inputs(dir.path(), &[bytes], false, Some(8));
+            LAZY_PREFIX_OVERRIDE.with(|c| c.set(None));
+            LAZY_WINDOW_OVERRIDE.with(|c| c.set(None));
+            seen.0
+        };
+        let clean: &[u8] = b"{\"a\":\"\xc3\xa9\"} [1,\n2]\n\"\xe2\x82\xac\" 3\n{\"b\":\n[]} true\n\n\n7\n[\"x\"]\n";
+        let inserts: [&[u8]; 6] = [
+            b"}",
+            b"\xff",
+            b"\"\xc3(\" ",
+            b"\xef\xbb\xbf",
+            b"007 ",
+            b"\"x",
+        ];
+        let mut streams: Vec<Vec<u8>> = vec![clean.to_vec(), clean[..clean.len() - 1].to_vec()];
+        for insert in inserts {
+            for at in 0..=clean.len() {
+                streams.push([&clean[..at], insert, &clean[at..]].concat());
+            }
+        }
+        let slid = LAZY_WINDOWS_READ.with(std::cell::Cell::get);
+        for stream in &streams {
+            let whole = observe(stream, None, None);
+            for front in [1, 6, 13, 21] {
+                if front >= stream.len() {
+                    continue;
+                }
+                for window in [1, 4, 9, 40] {
+                    assert_eq!(
+                        observe(stream, Some(front), Some(window)),
+                        whole,
+                        "front {front} window {window} of {:?}",
+                        String::from_utf8_lossy(stream)
+                    );
+                }
+            }
+        }
+        let (windows, dropped) = LAZY_WINDOWS_READ.with(std::cell::Cell::get);
+        assert!(
+            windows > slid.0 + streams.len() && dropped > slid.1,
+            "the windows were read and the text before them dropped: {windows} {dropped}"
+        );
+    }
+
+    /// #7023: the text a lone source holds is a window past the documents handed out, not the file.
+    #[test]
+    fn a_lone_source_read_in_windows_holds_a_window_of_text_7023() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut stream = Vec::new();
+        for n in 0..30_000 {
+            stream.extend_from_slice(
+                format!("{{\"n\":{n},\"pad\":\"xxxxxxxxxxxxxxxxxxxxxxxx\"}}\n").as_bytes(),
+            );
+        }
+        let whole = {
+            LAZY_ROUTE_OFF.with(|f| f.set(true));
+            let seen = observe_inputs(dir.path(), &[&stream], true, None).0;
+            LAZY_ROUTE_OFF.with(|f| f.set(false));
+            seen
+        };
+        LAZY_WINDOW_OVERRIDE.with(|c| c.set(Some(64 << 10)));
+        LAZY_TEXT_PEAK.with(|n| n.set(0));
+        let windowed = observe_inputs(dir.path(), &[&stream], false, None).0;
+        LAZY_WINDOW_OVERRIDE.with(|c| c.set(None));
+        let peak = LAZY_TEXT_PEAK.with(std::cell::Cell::get);
+        assert_eq!(windowed, whole);
+        assert!(
+            peak < stream.len() / 3,
+            "the text held peaked at {peak} of {} bytes",
+            stream.len()
+        );
+    }
+
     /// #6920: the gate judges a path by `stat` and opens nothing it declines. A named pipe (what
     /// `<(cmd)` is on some systems) pairs a reader with its writer when it is opened, and a handle opened
     /// and dropped on the way to the route that reads it would take the writer's bytes with it.
@@ -20527,6 +21035,55 @@ mod tests {
         assert_eq!(
             lazy_streams, checked,
             "every `-R` stream takes the lazy route"
+        );
+    }
+
+    /// #7023: `-R` over a lone regular file read a window at a time hands out what one read whole
+    /// does: every line `input` pops, the `(at ...)` location after each, and the end marker through
+    /// and past it, for streams with empty lines, CRLF, a byte that is not UTF-8 and a last line with
+    /// no line break, at every window length. The pin can fail: it does with a window that ends
+    /// inside a line, with a line number restarted by a window, and with the end of the stream read
+    /// off the last window's text and not the file's.
+    #[test]
+    fn raw_lines_read_in_windows_read_as_one_read_whole_7023() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pieces: [&[u8]; 8] = [
+            b"a",
+            b"",
+            b"bc",
+            b"\n",
+            b"\r\n",
+            b"\xc3\xa9",
+            b"\xff",
+            b"\n\n",
+        ];
+        let mut streams: Vec<Vec<u8>> = Vec::new();
+        for a in pieces {
+            for b in pieces {
+                for c in pieces {
+                    streams.push([a, b, c, b"\nlast"].concat());
+                    streams.push([a, b, c, b"\n"].concat());
+                    streams.push([a, b, c].concat());
+                }
+            }
+        }
+        let mut windowed_runs = 0;
+        for stream in &streams {
+            let (whole, _) = observe_inputs_with(dir.path(), &[stream], &["-R"], false, None);
+            for window in [1, 2, 3, 5, 64] {
+                LAZY_RAW_MIN_OVERRIDE.with(|c| c.set(Some(0)));
+                LAZY_WINDOW_OVERRIDE.with(|c| c.set(Some(window)));
+                let (windowed, files) =
+                    observe_inputs_with(dir.path(), &[stream], &["-R"], false, None);
+                LAZY_RAW_MIN_OVERRIDE.with(|c| c.set(None));
+                LAZY_WINDOW_OVERRIDE.with(|c| c.set(None));
+                assert_eq!(windowed, whole, "window {window} of {stream:?}");
+                windowed_runs += usize::from(files > 0);
+            }
+        }
+        assert!(
+            windowed_runs > 5 * streams.len() / 2,
+            "{windowed_runs} runs"
         );
     }
 

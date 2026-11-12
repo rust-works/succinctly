@@ -352,6 +352,77 @@ fn last_line_break(bytes: &[u8]) -> Option<usize> {
     None
 }
 
+/// A regular file read as whole lines, a window at a time, for `-R` (#7023). A line is no more than a
+/// line break away from its end, so there is nothing to scan and nothing to carry across a window
+/// but the bytes after its last line break: the caller turns each window's lines into strings and
+/// drops the window, and the memory held is a window and one line, not the file.
+pub(super) struct LineWindows {
+    file: File,
+    /// How much of the file is left to read: its length when it was opened, less what was read.
+    remaining: u64,
+    /// How much a read adds.
+    block: usize,
+    /// The bytes read after the last line break of the last window: the front of the next.
+    carried: Vec<u8>,
+    /// A read failed: the lines before it were handed out, and the failure is reported once.
+    failed: bool,
+}
+
+impl LineWindows {
+    /// `file` is read from its start, up to `len` bytes.
+    pub(super) fn new(file: File, len: u64, block: usize) -> Self {
+        Self {
+            file,
+            remaining: len,
+            block: block.max(1),
+            carried: Vec::new(),
+            failed: false,
+        }
+    }
+
+    /// The next window: bytes that end at a line break, or at the end of the file for the last, whose
+    /// final line then has none. `None` after the last. A read that fails ends the file there and is
+    /// handed to `on_error`, once, with the lines read before it handed out first.
+    pub(super) fn next_window(&mut self, on_error: impl FnOnce(&io::Error)) -> Option<Vec<u8>> {
+        let mut bytes = std::mem::take(&mut self.carried);
+        let mut ask = self.block;
+        let mut on_error = Some(on_error);
+        loop {
+            let want = usize::try_from(self.remaining).map_or(ask, |left| ask.min(left));
+            if want == 0 || self.failed {
+                return (!bytes.is_empty()).then_some(bytes);
+            }
+            let before = bytes.len();
+            if bytes.try_reserve(want).is_err() {
+                self.failed = true;
+                if let Some(report) = on_error.take() {
+                    report(&io::Error::from(io::ErrorKind::OutOfMemory));
+                }
+                continue;
+            }
+            match self.file.by_ref().take(want as u64).read_to_end(&mut bytes) {
+                // A file that shrank meanwhile ends at what it held.
+                Ok(read) if read < want => self.remaining = 0,
+                Ok(read) => self.remaining -= read as u64,
+                Err(error) => {
+                    self.failed = true;
+                    if let Some(report) = on_error.take() {
+                        report(&error);
+                    }
+                }
+            }
+            if self.remaining > 0 && !self.failed {
+                if let Some(at) = last_line_break(&bytes[before..]) {
+                    self.carried = bytes.split_off(before + at + 1);
+                    return Some(bytes);
+                }
+                // No line break in what was read: a long line, read on twice as far.
+                ask = ask.saturating_mul(2);
+            }
+        }
+    }
+}
+
 /// The file read again, for the wording of a fault: through a duplicate of the handle the run reads
 /// by, so what it names is what the run read, whatever happened to the path since (#6920).
 pub(super) struct Reread {
