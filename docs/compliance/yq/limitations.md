@@ -7678,7 +7678,7 @@ A document `.inf`/`.nan` used as a number fails in yq while it computes, in ever
 When an update (`|=`, `map_values`) fails on several nodes, yq reports the last node's text and `succinctly yq` the first: over `a: .inf` and `b: -.inf`, `map_values(. + 1)` names `"-.inf"` in yq and `".inf"` here.
 `sort` and `sort_by` over such a scalar panic in yq with a Go stack trace, and order it here (see the NaN and infinities entry in the sort section).
 
-### `-o props|shell|csv|tsv|base64|uri` — the first slice of yq's output formats; five rows still differ ([#6850](https://github.com/rust-works/succinctly/issues/6850))
+### `-o props|shell|csv|tsv|base64|uri` — the first slice of yq's output formats; six rows still differ ([#6850](https://github.com/rust-works/succinctly/issues/6850))
 
 `-o=props`, `-o=shell`, `-o=csv`, `-o=tsv`, `-o=base64` and `-o=uri` (and the short names `p`, `s`, `c`, `t`) run the filter and write each result through that format's encoder, with no `---` between documents.
 `--shell-key-separator`, `--properties-separator`, `--properties-array-brackets` and `--csv-separator` are read (#6922); `--csv-separator` takes one ASCII byte (yq's `char` takes any single byte, so a lone byte above 0x7f, which cannot be an argument here, is refused), and `-o=tsv` ignores it, as yq does.
@@ -7689,7 +7689,7 @@ The `@props` / `to_props` and `@csv` / `to_csv` operators read the same flags, a
 `-o=kyaml` is read as well (#6924); where it differs from yq is in its own section below.
 `-o=xml` is read as well (#6924), with `--xml-attribute-prefix`, `--xml-content-name`, `--xml-proc-inst-prefix` and `--xml-directive-name`; where it differs from yq is in its own section below.
 The other formats yq lists (`hcl`) and every input format but YAML, JSON, `kyaml`, `props`, `csv`, `tsv`, `ini`, `base64` and `uri` (see the `-p kyaml`, `-p base64|uri`, `-p props`, `-p csv|tsv` and `-p ini` sections below) are still refused at the flag.
-Five rows differ from yq v4.53.3, each pinned out of `tests/yq_cli/i6850.rs`:
+Six rows differ from yq v4.53.3, each pinned out of `tests/yq_cli/i6850.rs`:
 
 - A comment of a value the filter builds or writes is not written by `-o=props` or `@props` (`{"z": .a}`, `.a = 5`), where yq keeps the node's comment: the encoder reads comments from the document, as `to_yaml` does (#6933).
   A value read from the document gets them as yq writes them (#6922): above each property, its key's head and line comment and then its value's, each with its first `#` dropped and nothing between them (`# h` over `a: 1 # c` is `# h c`), after a blank line unless it is the first; the comment after a bare `-` goes to the item's first key, or to its first element if that is a scalar; a mapping's or sequence's own comment is dropped; and the first document's leading comment block comes first when the result is that document.
@@ -7702,6 +7702,7 @@ Five rows differ from yq v4.53.3, each pinned out of `tests/yq_cli/i6850.rs`:
   A top-level comma (`.a, .b`) still prints nothing before the error, and the error line is written when it is raised, so the two streams can interleave differently on a terminal.
   The results are kept on the plain, `--eval-all` and `-n` routes; the other input routes were not checked.
   An error the program itself raises still prints nothing, in both tools.
+- The NFKD table behind a `shell` key is Unicode 15.0.0's, the version of yq v4.53.3's `golang.org/x/text`: a character added by a later Unicode release with an ASCII decomposition loses its letters here where a newer yq keeps them.
 - A `<<` whose value is a literal mapping, not an alias, is merged into its mapping by the encoders, where yq leaves it a plain key that props, shell, ini and lua skip: `printf 'a: 1\n<<: {b: 2, a: 5}\n' | yq -o=props .` is `a = 1` in yq and `a = 5`, `b = 2` here.
   An alias (`<<: *anchor`) is merged by both, and `-o=json` agrees (the owned route; see #5521 for the same family).
 - `-o=csv` and `-o=tsv` with `-0` write each result's row here and a bare NUL in yq: yq's CSV writer is not flushed before the NUL, so the row is lost.

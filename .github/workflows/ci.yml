@@ -794,6 +794,10 @@ jobs:
       - name: ab-cli.py self-tests
         run: python3 scripts/test_ab_cli.py -v
 
+      # #7092: the committed NFKD table behind `-o=shell` keys against Python's own Unicode data.
+      - name: shell NFKD table self-test
+        run: python3 scripts/test_gen_shell_nfkd.py -v
+
       # #3893: the same shape for the path-register sweep's process runner: children
       # are `cat`/`yes`/a Python one-liner, no build and no jq. It pins that an
       # operand infinite on some input is killed at an output or memory cap and
