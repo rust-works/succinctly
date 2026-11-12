@@ -25,7 +25,7 @@
 /// A pattern with no `*`/`?` at all is compared as plain bytes without
 /// entering the matcher, so the common string-against-string `==` stays a
 /// single `memcmp`.
-pub(crate) fn yq_match_key(name: &str, pattern: &str) -> bool {
+pub fn yq_match_key(name: &str, pattern: &str) -> bool {
     if pattern.is_empty() {
         return name.is_empty();
     }

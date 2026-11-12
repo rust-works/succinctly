@@ -55,8 +55,9 @@ use crate::output::{
 
 mod go_yaml_color;
 mod input_decode;
+mod input_props;
 use go_yaml_color::YamlColorizer;
-use input_decode::StringInput;
+use input_decode::TranscodedInput;
 use succinctly::text::stream_region::{current_region, StreamRegion};
 mod reshape_presentation;
 mod source_positions;
@@ -893,6 +894,7 @@ fn resolve_output_format(output_format: OutputFormat, input_format: InputFormat)
         // anything asks (#6925); answered as `-o auto` would for it.
         InputFormat::Base64 => OutputFormat::Base64,
         InputFormat::Uri => OutputFormat::Uri,
+        InputFormat::Props => OutputFormat::Props,
     }
 }
 
@@ -1442,9 +1444,11 @@ fn output_basis_format(
 /// not read whole); otherwise nothing in it but, at most, a byte-order mark (#5356), which is not
 /// data, so a file of only that is as empty as a zero-byte one.
 fn input_file_holds_no_document_bytes(file: &str, format: InputFormat) -> bool {
-    // An empty input decodes to the empty string, which is a document (#6925).
-    if string_input().is_some() {
-        return false;
+    // An empty input decodes to the empty string, which is a document; a props file is decoded
+    // whole, so only an empty one holds no document, a byte-order mark being a key (#6925).
+    if let Some(format) = transcoded_input() {
+        return !format.empty_is_document()
+            && std::fs::metadata(file).is_ok_and(|m| m.is_file() && m.len() == 0);
     }
     let Ok(metadata) = std::fs::metadata(file) else {
         return false;
@@ -1482,25 +1486,39 @@ fn read_stdin() -> Result<Vec<u8>> {
     std::io::stdin()
         .read_to_end(&mut buffer)
         .context("failed to read from stdin")?;
-    decode_string_input(buffer, "-")
+    decode_transcoded_input(buffer, "-")
 }
 
-/// The run's string input format (#6925), set once by [`run_yq_inner`]: `-p base64` / `-p uri`
-/// read every input through yq's decoder and then as the JSON string holding the result.
-static STRING_INPUT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// The run's transcoded input format (#6925), set once by [`run_yq_inner`]: `-p base64` / `-p uri`
+/// read every input through yq's decoder and then as the JSON string holding the result, and
+/// `-p props` as the YAML text of the document yq decodes.
+static TRANSCODED_INPUT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-fn string_input() -> Option<StringInput> {
-    StringInput::from_code(STRING_INPUT.load(std::sync::atomic::Ordering::SeqCst))
+fn transcoded_input() -> Option<TranscodedInput> {
+    TranscodedInput::from_code(TRANSCODED_INPUT.load(std::sync::atomic::Ordering::SeqCst))
 }
 
-/// `raw`, read from the input yq names `name` (`-` for stdin), as the run reads it: under a string
-/// input format the JSON string it decodes to, or yq's `bad file '<name>': ...` when it does not
-/// decode (#6925). Every other run reads the bytes as they are.
-fn decode_string_input(raw: Vec<u8>, name: &str) -> Result<Vec<u8>> {
-    match string_input() {
+/// `--properties-array-brackets`, which yq's properties decoder reads as well as its encoder
+/// (`name[0]` is a name and an index, #6925).
+static PROPS_ARRAY_BRACKETS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether an empty input reads as a document: under a string format it is the empty string.
+fn empty_input_is_transcoded_document() -> bool {
+    transcoded_input().is_some_and(TranscodedInput::empty_is_document)
+}
+
+/// `raw`, read from the input yq names `name` (`-` for stdin), as the run reads it: under a
+/// transcoded input format the text it decodes to, or yq's `bad file '<name>': ...` when it does
+/// not decode (#6925). Every other run reads the bytes as they are.
+fn decode_transcoded_input(raw: Vec<u8>, name: &str) -> Result<Vec<u8>> {
+    match transcoded_input() {
         None => Ok(raw),
         Some(format) => format
-            .transcode(&raw)
+            .transcode(
+                &raw,
+                PROPS_ARRAY_BRACKETS.load(std::sync::atomic::Ordering::SeqCst),
+            )
             .map_err(|message| anyhow::anyhow!("bad file '{name}': {message}")),
     }
 }
@@ -1532,7 +1550,7 @@ fn is_stdin_file_argument(path: &Path) -> bool {
 /// the empty string, a document (#6925).
 fn is_drained_stdin_file_argument(path: &Path) -> bool {
     is_stdin_file_argument(path)
-        && string_input().is_none()
+        && !empty_input_is_transcoded_document()
         && STDIN_FILE_ARGUMENT_READ.load(std::sync::atomic::Ordering::SeqCst)
 }
 
@@ -1548,7 +1566,7 @@ fn gathered_file_indices(input_files: &[String], format: InputFormat) -> Vec<usi
     let mut indices = Vec::with_capacity(input_files.len());
     for (index, file) in input_files.iter().enumerate() {
         if is_stdin_file_argument(Path::new(file)) {
-            if seen_stdin && string_input().is_none() {
+            if seen_stdin && !empty_input_is_transcoded_document() {
                 continue;
             }
             seen_stdin = true;
@@ -1569,7 +1587,7 @@ fn gathered_file_indices(input_files: &[String], format: InputFormat) -> Vec<usi
 /// source (`yq '.' - -` prints one document).
 fn read_stdin_file_argument() -> Result<Vec<u8>> {
     if STDIN_FILE_ARGUMENT_READ.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return decode_string_input(Vec::new(), "-");
+        return decode_transcoded_input(Vec::new(), "-");
     }
     read_stdin()
 }
@@ -1581,7 +1599,7 @@ fn read_file(path: &Path) -> Result<Vec<u8>> {
     }
     let raw =
         std::fs::read(path).with_context(|| format!("failed to read file: {}", path.display()))?;
-    decode_string_input(raw, &path.display().to_string())
+    decode_transcoded_input(raw, &path.display().to_string())
 }
 
 /// Substitutes invalid UTF-8 in a `-p json` document when the output is JSON
@@ -1936,8 +1954,8 @@ fn print_yaml_validation_error(
 
 /// Detect input format from file extension. yq lowercases the extension and matches it against the
 /// format names and their aliases (`a.JSON` and `a.j` are JSON, #6925); every other one, and a name
-/// with none, is YAML here. The string formats (`a.base64`, `a.uri`) are decided before this is
-/// asked ([`StringInput::for_run`]), and the run then reads as JSON.
+/// with none, is YAML here. The transcoded formats (`a.base64`, `a.uri`, `a.properties`) are decided
+/// before this is asked ([`TranscodedInput::for_run`]), and the run then reads as JSON or YAML.
 fn detect_format_from_path(path: &Path) -> InputFormat {
     match lowercase_extension(&path.to_string_lossy()).as_deref() {
         Some("json" | "j") => InputFormat::Json,
@@ -2519,14 +2537,15 @@ fn parse_json_input_from_cursor<W: AsRef<[u64]> + Clone>(
 /// Parse input bytes according to the specified format.
 fn parse_input(bytes: &[u8], format: InputFormat, after_bom: bool) -> Result<Vec<OwnedValue>> {
     match format {
-        // A string format's bytes are the JSON string they decoded to (#6925).
+        // A string format's bytes are the JSON string they decoded to (#6925); a props file's are
+        // YAML by now, and are not read here.
         InputFormat::Json | InputFormat::Base64 | InputFormat::Uri => {
             parse_json_values(bytes, |value| {
                 let index = JsonIndex::build(value);
                 parse_json_input_from_cursor(&index.root(value))
             })
         }
-        InputFormat::Yaml | InputFormat::Auto => {
+        InputFormat::Yaml | InputFormat::Auto | InputFormat::Props => {
             // Parse as YAML (Auto defaults to YAML when no extension hint)
             let mut index = build_yq_source(bytes, after_bom)
                 .map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
@@ -12028,7 +12047,9 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     // still resolves it per source for a caller that builds one from an unresolved `Auto`.
     // `-p base64` / `-p uri`, or a first file named `*.base64` / `*.uri` under `-p auto` (#6925): each
     // input is decoded to one string and read as the JSON string holding it, so from here on the run
-    // is a `-p json` run. A file picked by its extension prints in the same format (`-o auto`).
+    // is a `-p json` run. `-p props` (or `*.properties`, `*.props`, `*.p`) reads each input as the
+    // YAML text of its document, a `-p yaml` run. A file picked by its extension prints in the same
+    // format (`-o auto`).
     // `-R` (a succinctly extension) reads raw lines whatever `-p` says, and `--front-matter` keeps
     // reading a file's front matter as YAML unless the format was asked for, as for a `*.json` file.
     let string_format = if args.raw_input
@@ -12036,10 +12057,10 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     {
         None
     } else {
-        StringInput::for_run(args.input_format, &get_input_files(&args))
+        TranscodedInput::for_run(args.input_format, &get_input_files(&args))
     };
-    STRING_INPUT.store(
-        StringInput::code(string_format),
+    TRANSCODED_INPUT.store(
+        TranscodedInput::code(string_format),
         std::sync::atomic::Ordering::SeqCst,
     );
     if args.output_format == OutputFormat::Auto {
@@ -12049,16 +12070,21 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 == InputFormat::Json;
         let by_extension = args.input_format == InputFormat::Auto && !nothing_to_match;
         args.output_format = match string_format {
-            Some(StringInput::Base64) if by_extension => OutputFormat::Base64,
-            Some(StringInput::Uri) if by_extension => OutputFormat::Uri,
+            Some(TranscodedInput::Base64) if by_extension => OutputFormat::Base64,
+            Some(TranscodedInput::Uri) if by_extension => OutputFormat::Uri,
+            Some(TranscodedInput::Props) if by_extension => OutputFormat::Props,
             Some(_) => OutputFormat::Yaml,
             None if json_input && !nothing_to_match => OutputFormat::Json,
             None => OutputFormat::Yaml,
         };
     }
-    if string_format.is_some() {
-        args.input_format = InputFormat::Json;
+    if let Some(format) = string_format {
+        args.input_format = format.reads_as();
     }
+    PROPS_ARRAY_BRACKETS.store(
+        args.properties_array_brackets,
+        std::sync::atomic::Ordering::SeqCst,
+    );
 
     // #6850: `-o=props|shell|csv|tsv|base64|uri` is the run's results through that format's
     // encoder, printed raw. The program is wrapped below, once it is parsed; from here on the run
@@ -12193,17 +12219,13 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         if args.raw_input {
             anyhow::bail!("--front-matter and --raw-input are incompatible");
         }
-        if args.input_format == InputFormat::Json {
+        if args.input_format == InputFormat::Json || string_format.is_some() {
             // Front matter is YAML by definition (the `---`-fenced header),
             // so `apply_front_matter` always forces `InputFormat::Yaml` once
             // a mode is set -- reject an explicit, contradictory
             // `--input-format json` instead of silently overriding it. A
-            // string format is read as JSON by now and is named as given (#6925).
-            let given = match string_format {
-                Some(StringInput::Base64) => "base64",
-                Some(StringInput::Uri) => "uri",
-                None => "json",
-            };
+            // transcoded format is read as JSON or YAML by now and is named as given (#6925).
+            let given = string_format.map_or("json", TranscodedInput::name);
             anyhow::bail!("--front-matter and --input-format {given} are incompatible");
         }
         if args.front_matter == Some(FrontMatterMode::Extract) && args.inplace {

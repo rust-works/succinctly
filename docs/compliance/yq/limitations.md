@@ -7673,7 +7673,7 @@ The `@props` / `to_props` and `@csv` / `to_csv` operators read the same flags, a
 `-o=toml` is read as well (#6924); where it differs from yq is in its own section below.
 `-o=kyaml` is read as well (#6924); where it differs from yq is in its own section below.
 `-o=xml` is read as well (#6924), with `--xml-attribute-prefix`, `--xml-content-name`, `--xml-proc-inst-prefix` and `--xml-directive-name`; where it differs from yq is in its own section below.
-The other formats yq lists (`hcl`) and every input format but YAML, JSON, `base64` and `uri` (see the `-p base64|uri` section below) are still refused at the flag.
+The other formats yq lists (`hcl`) and every input format but YAML, JSON, `props`, `base64` and `uri` (see the `-p base64|uri` and `-p props` sections below) are still refused at the flag.
 Six rows differ from yq v4.53.3, each pinned out of `tests/yq_cli/i6850.rs`:
 
 - A comment in a `props` document is not written.
@@ -7742,6 +7742,33 @@ Two rows differ:
   The U+FFFD is substituted before the filter runs, so `length`, which counts bytes in both tools, counts three for it where yq counts the one byte (`printf 'a%FFb' | yq -p uri -o json length` is `3` in yq and `5` here), as it already did for a `-p json` string.
   yq prints the raw bytes for a document that is the string itself (`printf /w== | yq -p base64 .` writes the byte `0xff`) and refuses a nested one with `yaml: cannot marshal invalid UTF-8 data as !!str`.
 - `--front-matter` with an explicit `-p base64` or `-p uri` is refused (`--front-matter and --input-format base64 are incompatible`), as `-p json` is, where yq decodes the extracted front matter.
+
+### `-p props` — read as the YAML yq prints for the file; a write keeps the quoting, and blank comment lines, `? |-` keys and collection tags differ ([#6925](https://github.com/rust-works/succinctly/issues/6925))
+
+`-p props` (alias `p`, `properties`) loads each input with a port of magiconair/properties v1.8.10, the library yq's decoder uses, and builds yq's nodes from it with a port of the traversal yq assigns through, then writes them as the YAML text yq prints for them; the run reads that text as `-p yaml`, so every route after the read is the YAML one.
+The loader is magiconair's: `=`, `:` or white space between key and value, `#` and `!` comments at the start of a line, `\` escapes and line continuations, a comment that ends the file with no line break dropped, and its errors (`properties: Line 4: "3"` for a value with no key, `premature EOF`, `invalid unicode literal`), each passed through Go's `fmt.Errorf` as yq's is, so a `%` in it reads as a verb (`"50%!"(MISSING)`).
+Every value is checked for `${key}` expansion as magiconair does at load time (`malformed expression`, `circular reference in:`, `expansion too deep`) and then kept unexpanded; of several bad values yq names one in Go's random map order, and this names the first in the file.
+A key is split on `.` into a path: a segment that is an `int32` indexes a sequence, a `null` becomes a mapping or a sequence by the segment that first indexes it, a segment is a key glob (`ab*` matches every key it fits and, with a comment, renames them), a string is never indexed into (`a=1` then `a.b=2` keeps `a: "1"`), an index on an existing sequence is read by yq's `parseInt` (`0x1`, `1_0`), and `--properties-array-brackets` reads `name[0]` as a name and an index.
+A comment is assigned to the key (or the sequence element) the path ends at, and a comment that cannot be assigned skips its property silently, as yq's `return nil` does.
+An empty input has no document; a file holding only comments or blank lines is `{}`.
+Under `-p auto` a first input file named `*.properties`, `*.props` or `*.p` (any case) reads and, with `-o auto`, prints as props.
+These agree with yq v4.53.3 on 120 crafted files under `-o yaml`, `-o json`, `--properties-array-brackets` and three filters, and on 1,600 random files under `-o yaml` and `-o json`, apart from the rows below (`tests/yq_cli/i6925.rs` pins a sample).
+
+These rows differ:
+
+- yq's nodes have no style, so a write keeps the quoting yq's encoder chose for a value only when the new value needs it; the text read here records that quoting, and a write keeps it (`a=1` with `.a |= . + "x"` prints `a: 1x` in yq and `a: "1x"` here).
+  `style` reads `double` for such a value, and `literal` for a multi-line one, where yq reads an empty style.
+- A mapping or sequence the decoder made has an empty tag in yq (`.a | tag` on `a.b=1` is empty, and `type` too); here it is `!!map` or `!!seq`.
+- Blank lines that end a comment block are dropped, and two or more inside one are one, as yq itself reads the YAML it prints for them; yq's props decoder keeps them in the node.
+- A key with a line break is printed in double quotes (`"a\nb": x`), where yq prints the `? |-` explicit-key form; that is how a YAML input's `? |-` key prints here too.
+- `--front-matter` with an explicit `-p props` is refused, where yq decodes the front matter as props; on a file picked by its extension the front matter is read as YAML.
+- An index that would pad the sequences of one document past 2^24 elements is refused (`Cannot grow array to N elements`), where yq allocates some 545 bytes for every padded `null` until it runs out of memory, and the `${key}` check stops once it has substituted 16 MiB, where yq would expand a chain that doubles at each link without end.
+- `-o props` writes no comment, as for any input (the `-o props` section above).
+- The first property's comment opens the YAML text, so it is read as the document's head comment, where yq assigns it to that key: `del(.a)` on `# top` / `a=1` keeps `# top` here and drops it in yq, and `. | head_comment` is `top` here and empty in yq.
+- A key printed in the `? ` explicit-key form (over 128 bytes) whose value is a mapping loses the comment above that mapping's first key.
+- A key glob that a comment renames into two keys spelled alike (`abc=1`, `abd=2`, `# c`, `ab*=9`) prints as yq does, but a lookup reads both keys here (`.["ab*"]` is `9` in yq and `9` twice here), where yq matches one key per spelling.
+- A comment holding U+0085, U+2028 or U+2029 is written as one line; go-yaml's emitter breaks the line there.
+- A sequence nested directly in a sequence more than 128 deep (`0.0.0...=x`) stops with the YAML reader's `nesting depth exceeds limit of 128`, and a key of more than 10,000 segments, or a document whose YAML text passes 1 GiB, is refused; yq reads all three, since it never writes the text.
 
 ### `-o=xml` — comments, a source spelling and an empty document are not read (#6924)
 
