@@ -25057,6 +25057,9 @@ fn test_split_exp_duplicate_filename_warns_and_overwrites() -> Result<()> {
 /// double-reported with a spurious extra "produced no output" message
 /// (#715 follow-up). Fixed via `report_count()`, which can be compared
 /// per-call regardless of earlier hits.
+///
+/// An error the name expression raises ends the run by default (#7065, as yq's does), so the later
+/// errors and files are seen under `--on-error=continue`.
 #[test]
 fn test_split_exp_reports_each_error_exactly_once() -> Result<()> {
     let dir = TempDir::new()?;
@@ -25067,7 +25070,14 @@ fn test_split_exp_reports_each_error_exactly_once() -> Result<()> {
     let (_stdout, stderr, code) = run_yq_split(
         ".[]",
         "[1, 2, 3]",
-        &["--jq-extensions", "--split-exp", &pattern, "-p", "json"],
+        &[
+            "--jq-extensions",
+            "--on-error=continue",
+            "--split-exp",
+            &pattern,
+            "-p",
+            "json",
+        ],
     )?;
     assert_ne!(code, 0);
     let error_lines: Vec<&str> = stderr.lines().filter(|l| l.starts_with("Error:")).collect();
@@ -25080,6 +25090,21 @@ fn test_split_exp_reports_each_error_exactly_once() -> Result<()> {
         std::fs::read_to_string(dir.path().join("f3.yml"))?.trim(),
         "3"
     );
+    // By default the first error ends the run: one report, and no file after it (#7065).
+    let fresh = TempDir::new()?;
+    let pattern = format!(
+        "if . == 1 then error(\"boom1\") elif . == 2 then error(\"boom2\") else \"{}/f3.yml\" end",
+        fresh.path().display()
+    );
+    let (_stdout, stderr, code) = run_yq_split(
+        ".[]",
+        "[1, 2, 3]",
+        &["--jq-extensions", "--split-exp", &pattern, "-p", "json"],
+    )?;
+    assert_ne!(code, 0);
+    let error_lines: Vec<&str> = stderr.lines().filter(|l| l.starts_with("Error:")).collect();
+    assert_eq!(error_lines, vec!["Error: boom1"], "stderr: {stderr}");
+    assert!(!fresh.path().join("f3.yml").exists());
     Ok(())
 }
 
