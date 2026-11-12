@@ -1244,6 +1244,9 @@ pub enum InputFormat {
     /// root, every value a string (#6925)
     #[value(name = "ini", alias = "i")]
     Ini,
+    /// KYAML, which yq reads with its YAML decoder and prints, by extension, as KYAML (#6925)
+    #[value(name = "kyaml", alias = "ky")]
+    Kyaml,
 }
 
 /// Front matter handling mode for `--front-matter`
@@ -1323,7 +1326,7 @@ pub struct YqCommand {
     #[arg(long, overrides_with = "jq_extensions")]
     pub jq_extensions: bool,
 
-    /// Input format type [auto, yaml, json, props, csv, tsv, ini, base64, uri] (default: auto)
+    /// Input format type [auto, yaml, json, props, csv, tsv, ini, kyaml, base64, uri] (default: auto)
     #[arg(
         short = 'p',
         long = "input-format",

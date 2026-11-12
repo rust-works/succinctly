@@ -7686,7 +7686,7 @@ The `@props` / `to_props` and `@csv` / `to_csv` operators read the same flags, a
 `-o=toml` is read as well (#6924); where it differs from yq is in its own section below.
 `-o=kyaml` is read as well (#6924); where it differs from yq is in its own section below.
 `-o=xml` is read as well (#6924), with `--xml-attribute-prefix`, `--xml-content-name`, `--xml-proc-inst-prefix` and `--xml-directive-name`; where it differs from yq is in its own section below.
-The other formats yq lists (`hcl`) and every input format but YAML, JSON, `props`, `csv`, `tsv`, `ini`, `base64` and `uri` (see the `-p base64|uri`, `-p props`, `-p csv|tsv` and `-p ini` sections below) are still refused at the flag.
+The other formats yq lists (`hcl`) and every input format but YAML, JSON, `kyaml`, `props`, `csv`, `tsv`, `ini`, `base64` and `uri` (see the `-p kyaml`, `-p base64|uri`, `-p props`, `-p csv|tsv` and `-p ini` sections below) are still refused at the flag.
 Six rows differ from yq v4.53.3, each pinned out of `tests/yq_cli/i6850.rs`:
 
 - A comment of a value the filter builds or writes is not written by `-o=props` or `@props` (`{"z": .a}`, `.a = 5`), where yq keeps the node's comment: the encoder reads comments from the document, as `to_yaml` does (#6933).
@@ -7827,6 +7827,12 @@ These rows differ:
 - A value whose `%(name)s` expansion grows past 16 MiB is refused (`the value of key "a" expands past 16777216 bytes`), where go-ini expands a chain of values that each repeat the next twice (`a=%(b)s%(b)s`, `b=%(a)s%(a)s`) until it runs out of memory.
 - `--front-matter` with an explicit `-p ini` is refused (`--front-matter and --input-format ini are incompatible`), as `-p json` is, where yq decodes the front matter as INI.
 - A document whose text passes the YAML reader's limits is refused, where yq builds the nodes without writing the text.
+
+### `-p kyaml` — read as YAML, as yq reads it ([#6925](https://github.com/rust-works/succinctly/issues/6925))
+
+`-p kyaml` (alias `ky`) reads each input with the YAML reader, which is what yq's KYAML decoder is, so KYAML (YAML's flow subset with explicit commas) and block YAML both load and every route after the read is the `-p yaml` one.
+Under `-p auto` a first input file named `*.kyaml` or `*.ky` (any case) reads as YAML and, with `-o auto`, prints as KYAML, and `-i` writes KYAML back.
+`-o=kyaml` itself is under `-o=kyaml` above: its comment and `---` rows apply to KYAML read back as well, since a comment in the input is dropped by the KYAML printer here and kept by yq.
 
 ### `-o=xml` — comments, a source spelling and an empty document are not read (#6924)
 

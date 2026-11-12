@@ -67,7 +67,7 @@ impl TranscodedInput {
                 Some("ini" | "i") => Some(Self::Ini),
                 _ => None,
             },
-            InputFormat::Yaml | InputFormat::Json => None,
+            InputFormat::Yaml | InputFormat::Json | InputFormat::Kyaml => None,
         }
     }
 

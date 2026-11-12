@@ -891,7 +891,7 @@ fn resolve_output_format(output_format: OutputFormat, input_format: InputFormat)
     }
     match input_format {
         InputFormat::Json => OutputFormat::Json,
-        InputFormat::Yaml | InputFormat::Auto => OutputFormat::Yaml,
+        InputFormat::Yaml | InputFormat::Auto | InputFormat::Kyaml => OutputFormat::Yaml,
         // Not reached: `run_yq_inner` resolves `-o auto` and reads a string format as JSON before
         // anything asks (#6925); answered as `-o auto` would for it.
         InputFormat::Base64 => OutputFormat::Base64,
@@ -2596,7 +2596,8 @@ fn parse_input(bytes: &[u8], format: InputFormat, after_bom: bool) -> Result<Vec
         | InputFormat::Props
         | InputFormat::Csv
         | InputFormat::Tsv
-        | InputFormat::Ini => {
+        | InputFormat::Ini
+        | InputFormat::Kyaml => {
             // Parse as YAML (Auto defaults to YAML when no extension hint)
             let mut index = build_yq_source(bytes, after_bom)
                 .map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
@@ -12271,6 +12272,12 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             && resolve_run_input_format(InputFormat::Auto, &get_input_files(&args))
                 == InputFormat::Json;
         let by_extension = args.input_format == InputFormat::Auto && !nothing_to_match;
+        // `*.kyaml` and `*.ky` are read as YAML and printed as KYAML (#6925).
+        let kyaml_input = by_extension
+            && get_input_files(&args)
+                .first()
+                .and_then(|file| lowercase_extension(file))
+                .is_some_and(|extension| matches!(extension.as_str(), "kyaml" | "ky"));
         args.output_format = match string_format {
             Some(TranscodedInput::Base64) if by_extension => OutputFormat::Base64,
             Some(TranscodedInput::Uri) if by_extension => OutputFormat::Uri,
@@ -12280,8 +12287,13 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             Some(TranscodedInput::Ini) if by_extension => OutputFormat::Ini,
             Some(_) => OutputFormat::Yaml,
             None if json_input && !nothing_to_match => OutputFormat::Json,
+            None if kyaml_input => OutputFormat::Kyaml,
             None => OutputFormat::Yaml,
         };
+    }
+    // KYAML is YAML to the reader: every route below is the `-p yaml` one.
+    if args.input_format == InputFormat::Kyaml {
+        args.input_format = InputFormat::Yaml;
     }
     if let Some(format) = string_format {
         args.input_format = format.reads_as();
