@@ -428,3 +428,19 @@ fn a_backslash_run_before_a_paren_and_an_unclosed_interpolation_read_as_yq_does_
     }
     Ok(())
 }
+
+/// A string that never closes is the parser's own error, with or without a slot in it, and not an
+/// unclosed interpolation: yq refuses all three as well.
+#[test]
+fn an_unterminated_string_is_refused_7063() -> Result<()> {
+    for program in ["\"abc", "\"\\(1) abc", "\"abc\\\\"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["yq", "-n", program])
+            .stdin(Stdio::null())
+            .output()?;
+        assert_eq!(output.status.code(), Some(1), "{program}");
+        assert!(output.stdout.is_empty(), "{program}");
+        assert!(!output.stderr.is_empty(), "{program}");
+    }
+    Ok(())
+}
