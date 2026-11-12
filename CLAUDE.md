@@ -460,21 +460,21 @@ Geomean speedup over jq-1.7.1 (its time over `succinctly jq`'s; below 1.00x jq i
 | CPU                                                                    | Commit      | Startup |  1 MB | 10 MB | 100 MB | All rows | jq faster on |
 |------------------------------------------------------------------------|-------------|---------|-------|-------|--------|----------|--------------|
 | [ARM Neoverse-V2](docs/compare/jq-linux-aarch64.md)                    | `027745e`   |   0.91x | 1.89x | 2.78x |  3.67x |    2.41x |    37 of 221 |
-| [AMD Ryzen 9 7950X 16-Core Processor](docs/compare/jq-linux-x86_64.md) | `a336e8ec5` |   0.89x | 1.68x | 2.55x |  3.17x |    2.16x |    30 of 221 |
-| [Apple M4 Pro](docs/compare/jq-macos-aarch64.md)                       | `a336e8ec5` |   0.65x | 1.58x | 3.01x |  4.24x |    2.33x |    37 of 221 |
+| [AMD Ryzen 9 7950X 16-Core Processor](docs/compare/jq-linux-x86_64.md) | `f056da9c6` |   0.95x | 1.74x | 2.54x |  3.23x |    2.20x |    26 of 221 |
+| [Apple M4 Pro](docs/compare/jq-macos-aarch64.md)                       | `f056da9c6` |   0.60x | 1.53x | 3.00x |  4.22x |    2.29x |    39 of 221 |
 
 The same geomeans per kind of query, because the all-rows figure above counts every `identity` row over every input shape, which is the strongest case for `succinctly jq`. The groups are those of [docs/guides/choosing-jq.md](docs/guides/choosing-jq.md), which says which tool to pick for which workload; a group does not cover every row, so the last two lines are the whole. Each cell also says on how many of its rows jq is faster.
 
 | Group                         | ARM Neoverse-V2 (linux-aarch64) | AMD Ryzen 9 7950X 16-Core Processor (linux-x86_64) |   Apple M4 Pro (macos-aarch64) |
 |-------------------------------|---------------------------------|----------------------------------------------------|--------------------------------|
-| Pass-through and reformatting |    4.57x (jq faster on 3 of 50) |                       2.96x (jq faster on 4 of 50) |   4.09x (jq faster on 8 of 50) |
-| Field access and navigation   |    4.37x (jq faster on 0 of 17) |                       4.13x (jq faster on 0 of 17) |   3.51x (jq faster on 0 of 17) |
-| Early exit                    |     5.93x (jq faster on 0 of 6) |                        4.88x (jq faster on 0 of 6) |    4.10x (jq faster on 0 of 6) |
-| Transforms                    |    2.22x (jq faster on 3 of 70) |                       2.22x (jq faster on 3 of 70) |   2.24x (jq faster on 5 of 70) |
-| Streams (NDJSON, `--seq`)     |   1.46x (jq faster on 17 of 46) |                       1.46x (jq faster on 9 of 46) |   1.76x (jq faster on 5 of 46) |
-| Startup-bound                 |   1.15x (jq faster on 10 of 21) |                      1.11x (jq faster on 12 of 21) |  0.89x (jq faster on 17 of 21) |
-| All rows without pass-through |  2.00x (jq faster on 34 of 171) |                     1.97x (jq faster on 26 of 171) | 1.98x (jq faster on 29 of 171) |
-| All rows                      |  2.41x (jq faster on 37 of 221) |                     2.16x (jq faster on 30 of 221) | 2.33x (jq faster on 37 of 221) |
+| Pass-through and reformatting |    4.57x (jq faster on 3 of 50) |                       3.01x (jq faster on 3 of 50) |  4.04x (jq faster on 10 of 50) |
+| Field access and navigation   |    4.37x (jq faster on 0 of 17) |                       4.25x (jq faster on 0 of 17) |   3.47x (jq faster on 0 of 17) |
+| Early exit                    |     5.93x (jq faster on 0 of 6) |                        5.07x (jq faster on 0 of 6) |    3.89x (jq faster on 0 of 6) |
+| Transforms                    |    2.22x (jq faster on 3 of 70) |                       2.22x (jq faster on 3 of 70) |   2.21x (jq faster on 5 of 70) |
+| Streams (NDJSON, `--seq`)     |   1.46x (jq faster on 17 of 46) |                       1.49x (jq faster on 9 of 46) |   1.73x (jq faster on 5 of 46) |
+| Startup-bound                 |   1.15x (jq faster on 10 of 21) |                       1.18x (jq faster on 9 of 21) |  0.84x (jq faster on 17 of 21) |
+| All rows without pass-through |  2.00x (jq faster on 34 of 171) |                     2.01x (jq faster on 23 of 171) | 1.94x (jq faster on 29 of 171) |
+| All rows                      |  2.41x (jq faster on 37 of 221) |                     2.20x (jq faster on 26 of 221) | 2.29x (jq faster on 39 of 221) |
 <!-- /compare:jq-summary -->
 
 Which tool to pick for which workload, with the report rows behind each claim and a test that fails when one stops holding: [docs/guides/choosing-jq.md](docs/guides/choosing-jq.md).
