@@ -1233,6 +1233,13 @@ pub enum InputFormat {
     /// string, comments kept (#6925)
     #[value(name = "props", alias = "p", alias = "properties")]
     Props,
+    /// Comma-separated values: a record is a mapping of the header's names, a cell a snippet of
+    /// YAML (#6925)
+    #[value(name = "csv", alias = "c")]
+    Csv,
+    /// Tab-separated values, read as `csv` is with a tab for its separator (#6925)
+    #[value(name = "tsv", alias = "t")]
+    Tsv,
 }
 
 /// Front matter handling mode for `--front-matter`
@@ -1312,7 +1319,7 @@ pub struct YqCommand {
     #[arg(long, overrides_with = "jq_extensions")]
     pub jq_extensions: bool,
 
-    /// Input format type [auto, yaml, json, props, base64, uri] (default: auto)
+    /// Input format type [auto, yaml, json, props, csv, tsv, base64, uri] (default: auto)
     #[arg(
         short = 'p',
         long = "input-format",
@@ -1380,7 +1387,7 @@ pub struct YqCommand {
     )]
     pub properties_array_brackets: bool,
 
-    /// The field separator of `-o=csv`, one byte (#6922)
+    /// The field separator of `-p csv` and `-o=csv`, one byte (#6922, #6925)
     #[arg(
         long = "csv-separator",
         value_name = "CHAR",
@@ -1388,6 +1395,32 @@ pub struct YqCommand {
         overrides_with = "csv_separator"
     )]
     pub csv_separator: String,
+
+    /// Whether `-p csv` reads a cell as a snippet of YAML, as yq's `--csv-auto-parse` (default
+    /// true); false reads it as a plain scalar (#6925)
+    #[arg(
+        long = "csv-auto-parse",
+        overrides_with = "csv_auto_parse",
+        value_parser = parse_go_bool,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value = "true"
+    )]
+    pub csv_auto_parse: bool,
+
+    /// Whether `-p tsv` reads a cell as a snippet of YAML, as yq's `--tsv-auto-parse` (default
+    /// true) (#6925)
+    #[arg(
+        long = "tsv-auto-parse",
+        overrides_with = "tsv_auto_parse",
+        value_parser = parse_go_bool,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value = "true"
+    )]
+    pub tsv_auto_parse: bool,
 
     /// Text before the table of `-o=lua`; `\n`, `\r`, `\t`, `\\`, `\'` and `\"` are read (#6924)
     #[arg(

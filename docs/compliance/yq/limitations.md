@@ -7674,7 +7674,7 @@ The `@props` / `to_props` and `@csv` / `to_csv` operators read the same flags, a
 `-o=toml` is read as well (#6924); where it differs from yq is in its own section below.
 `-o=kyaml` is read as well (#6924); where it differs from yq is in its own section below.
 `-o=xml` is read as well (#6924), with `--xml-attribute-prefix`, `--xml-content-name`, `--xml-proc-inst-prefix` and `--xml-directive-name`; where it differs from yq is in its own section below.
-The other formats yq lists (`hcl`) and every input format but YAML, JSON, `props`, `base64` and `uri` (see the `-p base64|uri` and `-p props` sections below) are still refused at the flag.
+The other formats yq lists (`hcl`) and every input format but YAML, JSON, `props`, `csv`, `tsv`, `base64` and `uri` (see the `-p base64|uri`, `-p props` and `-p csv|tsv` sections below) are still refused at the flag.
 Six rows differ from yq v4.53.3, each pinned out of `tests/yq_cli/i6850.rs`:
 
 - A comment of a value the filter builds or writes is not written by `-o=props` or `@props` (`{"z": .a}`, `.a = 5`), where yq keeps the node's comment: the encoder reads comments from the document, as `to_yaml` does (#6933).
@@ -7773,6 +7773,29 @@ These rows differ:
 - A key glob that a comment renames into two keys spelled alike (`abc=1`, `abd=2`, `# c`, `ab*=9`) prints as yq does, but a lookup reads both keys here (`.["ab*"]` is `9` in yq and `9` twice here), where yq matches one key per spelling.
 - A comment holding U+0085, U+2028 or U+2029 is written as one line; go-yaml's emitter breaks the line there.
 - A sequence nested directly in a sequence more than 128 deep (`0.0.0...=x`) stops with the YAML reader's `nesting depth exceeds limit of 128`, and a key of more than 10,000 segments, or a document whose YAML text passes 1 GiB, is refused; yq reads all three, since it never writes the text.
+
+### `-p csv` and `-p tsv` — a cell go-yaml rejects, a marker in a cell and a comment around a scalar differ ([#6925](https://github.com/rust-works/succinctly/issues/6925))
+
+`-p csv` (alias `c`) and `-p tsv` (alias `t`) read each input with a port of Go's `encoding/csv` reader, the one yq's decoder uses, and write the nodes yq makes of its records as YAML text; the run reads that text as `-p yaml`, so every route after the read is the YAML one.
+The first record is the header and every later record is a mapping from the header's names to its cells, so a document is a sequence of mappings; a header alone is `[]` and an input with no record is `null`.
+The reader is Go's with its defaults: the separator is `--csv-separator` (a tab for TSV, which ignores it), blank lines are skipped, a quote is only allowed in a quoted field, a record must have the header's field count, a `\r\n` is a `\n` even inside a quoted field, and a byte-order mark is dropped.
+Its errors are Go's, with the line and column Go counts, behind `bad file '<name>': ` (`parse error on line 2, column 6: extraneous or missing " in quoted-field`, `bare " in non-quoted-field`, `record on line 2: wrong number of fields`).
+A header repeated becomes a key repeated, as in yq.
+A cell is a snippet of YAML under the default `--csv-auto-parse` / `--tsv-auto-parse`, as yq's `parseSnippet` reads it: a snippet that is a string (go-yaml's typing of a plain scalar, so `yes`, `007` is an integer and a date is a timestamp; a quoted, tagged-`!!str` or aliased one is a string), that is not YAML, or that holds more than one document stays the cell's own text, `'x'` and `a # c` with their quote and comment, while any other node is the node the snippet makes (`5 # c` the integer `5`, `0x1f` and `1_000` integers that keep their spelling, `[1,2]` a sequence, `a: b` a mapping, `&a 5` an anchored integer, a bare `!` a null).
+`--csv-auto-parse=false` reads a cell as a plain scalar of its text instead.
+Under `-p auto` a first input file named `*.csv` or `*.tsv` (or `*.c`, `*.t`, any case) reads and, with `-o auto`, prints as a table, and `-i` writes the table's format back.
+These agree with yq v4.53.3 on 6,500 random tables under `-o yaml`, `-o json`, `--csv-auto-parse=false` and `-p tsv`, and on 7,000 random byte strings (every error of the reader agreed, with its line and column), apart from the rows below (`tests/yq_cli/i6925.rs` pins a sample).
+
+These rows differ:
+
+- A cell go-yaml rejects but this YAML reader accepts is a node here and a string in yq: a block sequence item or key opened by a plain scalar that starts with `]` (`- ]x`), and a line that starts with a tab used as indentation (` \t1` is the integer `1` here, the string ` \t1` in yq).
+- A U+FEFF inside a cell, where go-yaml skips one at the start of a line, and a lone `\r` in a place YAML does not allow a line break, read differently.
+- A cell that opens with `---` or carries a `%YAML` directive is read as one document here (or a string); yq leaks its own `# $yqDocSeparator$` marker into the node, which is not reproduced.
+- A comment before or after a scalar cell (`# c` / `5`, `5` / `# c`) is dropped here, where yq keeps it as a comment of the node, and a cell with a leading line break keeps no trailing blank.
+- A header that needs the `? ` explicit-key form (it holds a line break or is over 128 bytes) loses a comment-only or blank cell's comment: `? |-` / `  : # c` prints `:` here.
+- `--front-matter` with an explicit `-p csv` or `-p tsv` is refused (`--front-matter and --input-format csv are incompatible`), as `-p json` is, where yq decodes the front matter as a table.
+- A number that go-yaml types as an integer or float but this YAML reader does not (`1_000`, `0b1`, an integer past 2^63) prints as yq prints it under `-o yaml` and differs under `-o json`, the same difference as for a YAML input.
+- yq's warning that `-o auto` defaults to YAML when `-p csv` is explicit is not written.
 
 ### `-o=xml` — comments, a source spelling and an empty document are not read (#6924)
 

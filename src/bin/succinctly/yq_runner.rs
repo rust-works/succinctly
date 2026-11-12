@@ -54,10 +54,11 @@ use crate::output::{
 };
 
 mod go_yaml_color;
+mod input_csv;
 mod input_decode;
 mod input_props;
 use go_yaml_color::YamlColorizer;
-use input_decode::TranscodedInput;
+use input_decode::{TranscodeOptions, TranscodedInput};
 use succinctly::text::stream_region::{current_region, StreamRegion};
 mod reshape_presentation;
 mod source_positions;
@@ -895,6 +896,8 @@ fn resolve_output_format(output_format: OutputFormat, input_format: InputFormat)
         InputFormat::Base64 => OutputFormat::Base64,
         InputFormat::Uri => OutputFormat::Uri,
         InputFormat::Props => OutputFormat::Props,
+        InputFormat::Csv => OutputFormat::Csv,
+        InputFormat::Tsv => OutputFormat::Tsv,
     }
 }
 
@@ -1518,6 +1521,12 @@ fn transcoded_input() -> Option<TranscodedInput> {
 static PROPS_ARRAY_BRACKETS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// `--csv-separator` (a byte), `--csv-auto-parse` and `--tsv-auto-parse`, which `-p csv` and
+/// `-p tsv` read (#6925).
+static CSV_SEPARATOR: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(b',');
+static CSV_AUTO_PARSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static TSV_AUTO_PARSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 /// Whether an empty input reads as a document: under a string format it is the empty string.
 fn empty_input_is_transcoded_document() -> bool {
     transcoded_input().is_some_and(TranscodedInput::empty_is_document)
@@ -1532,7 +1541,14 @@ fn decode_transcoded_input(raw: Vec<u8>, name: &str) -> Result<Vec<u8>> {
         Some(format) => format
             .transcode(
                 &raw,
-                PROPS_ARRAY_BRACKETS.load(std::sync::atomic::Ordering::SeqCst),
+                &TranscodeOptions {
+                    array_brackets: PROPS_ARRAY_BRACKETS.load(std::sync::atomic::Ordering::SeqCst),
+                    csv_separator: char::from(
+                        CSV_SEPARATOR.load(std::sync::atomic::Ordering::SeqCst),
+                    ),
+                    csv_auto_parse: CSV_AUTO_PARSE.load(std::sync::atomic::Ordering::SeqCst),
+                    tsv_auto_parse: TSV_AUTO_PARSE.load(std::sync::atomic::Ordering::SeqCst),
+                },
             )
             .map_err(|message| anyhow::anyhow!("bad file '{name}': {message}")),
     }
@@ -2560,7 +2576,11 @@ fn parse_input(bytes: &[u8], format: InputFormat, after_bom: bool) -> Result<Vec
                 parse_json_input_from_cursor(&index.root(value))
             })
         }
-        InputFormat::Yaml | InputFormat::Auto | InputFormat::Props => {
+        InputFormat::Yaml
+        | InputFormat::Auto
+        | InputFormat::Props
+        | InputFormat::Csv
+        | InputFormat::Tsv => {
             // Parse as YAML (Auto defaults to YAML when no extension hint)
             let mut index = build_yq_source(bytes, after_bom)
                 .map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
@@ -12239,6 +12259,8 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             Some(TranscodedInput::Base64) if by_extension => OutputFormat::Base64,
             Some(TranscodedInput::Uri) if by_extension => OutputFormat::Uri,
             Some(TranscodedInput::Props) if by_extension => OutputFormat::Props,
+            Some(TranscodedInput::Csv) if by_extension => OutputFormat::Csv,
+            Some(TranscodedInput::Tsv) if by_extension => OutputFormat::Tsv,
             Some(_) => OutputFormat::Yaml,
             None if json_input && !nothing_to_match => OutputFormat::Json,
             None => OutputFormat::Yaml,
@@ -12251,6 +12273,12 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         args.properties_array_brackets,
         std::sync::atomic::Ordering::SeqCst,
     );
+    // A separator that is not one byte is refused below, before anything is read.
+    if let [byte] = args.csv_separator.as_bytes() {
+        CSV_SEPARATOR.store(*byte, std::sync::atomic::Ordering::SeqCst);
+    }
+    CSV_AUTO_PARSE.store(args.csv_auto_parse, std::sync::atomic::Ordering::SeqCst);
+    TSV_AUTO_PARSE.store(args.tsv_auto_parse, std::sync::atomic::Ordering::SeqCst);
 
     // #6850: `-o=props|shell|csv|tsv|base64|uri` is the run's results through that format's
     // encoder, printed raw. The program is wrapped below, once it is parsed; from here on the run
