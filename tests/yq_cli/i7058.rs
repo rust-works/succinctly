@@ -57,8 +57,7 @@ const ROWS: &[(&str, &str, &str, &str, i32)] = &[
 #[test]
 fn timestamps_sort_and_extremum_by_instant_as_yq_does_7058() -> Result<()> {
     for (document, filter, stdout, stderr, code) in ROWS {
-        let (out, err, got) =
-            run_yq_stdin_with_stderr(filter, document, &["-o=json", "-I=0"])?;
+        let (out, err, got) = run_yq_stdin_with_stderr(filter, document, &["-o=json", "-I=0"])?;
         assert_eq!(
             (out.as_str(), err.as_str(), got),
             (*stdout, *stderr, *code),
