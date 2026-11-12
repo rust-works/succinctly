@@ -585,6 +585,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// it sits on the dash line ahead of the value (`- # m` / `  a: 1`): the comment yq moves off the
     /// dash (#4256, #7034). `None` for every other node, a same-line `- x # c` included.
     fn dash_line_comment_span(&self) -> Option<(usize, usize)> {
+        if !self.index.has_comments() {
+            return None;
+        }
         let wrapper = self.parent()?;
         if wrapper.bp_pos == 0 || wrapper.resolve_bare_seq_item().bp_pos != self.bp_pos {
             return None;
@@ -599,6 +602,10 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// `"m"`), where the item itself has none. A flow value and a scalar value take the comment as
     /// their own head instead ([`Self::dash_comment_of_scalar_item`]). `None` for every other node.
     fn dash_comment_of_first_child(&self) -> Option<(&str, usize)> {
+        // One flag on a document without a comment, which is what keeps this off its profile.
+        if !self.index.has_comments() {
+            return None;
+        }
         let parent = self.parent()?;
         // A sequence element stands under its item wrapper; a mapping key right under the mapping.
         let (container, first) = match self.sequence_item_wrapper_of_value() {
@@ -8436,44 +8443,47 @@ impl<W: AsRef<[u64]> + Clone> YamlCursor<'_, W> {
         // #4268: a scalar item's `- # c` comment is the scalar's head comment in yq, after any
         // standalone block above the dash. A head that is itself a floated dash comment of an
         // absent item before this one (`- # c1` / `- # c2` / `  x`, #1079) is yq's whole answer.
-        let floated = ranges.iter().any(|&(start, _)| {
-            let line_start = self.text[..start as usize]
-                .iter()
-                .rposition(|&b| b == b'\n')
-                .map_or(0, |i| i + 1);
-            self.text[line_start..start as usize]
-                .iter()
-                .any(|b| !matches!(b, b' ' | b'\t'))
-        });
-        if !floated {
-            if let Some((start, end, comment)) = self.dash_comment_of_scalar_item() {
-                // After the standalone block above the dash, before the own-line lines below it
-                // (`- # c` / `  # f` / `  z` is `c` then `f`): by position in the text.
-                let before = ranges
+        // Asked only once there is a dash comment, the rare case.
+        let floated = || {
+            ranges.iter().any(|&(start, _)| {
+                let line_start = self.text[..start as usize]
                     .iter()
-                    .filter(|&&(at, _)| (at as usize) < start)
-                    .count();
-                // `lines` holds blank entries between the comment lines, which `before` (a count of
-                // comment ranges) does not: the dash comment goes after that many comment lines.
-                let mut at = 0;
-                let mut seen = 0;
-                if before > 0 {
-                    for (i, line) in lines.iter().enumerate() {
-                        if !line.is_empty() {
-                            seen += 1;
-                            if seen == before {
-                                at = i + 1;
-                                break;
-                            }
+                    .rposition(|&b| b == b'\n')
+                    .map_or(0, |i| i + 1);
+                self.text[line_start..start as usize]
+                    .iter()
+                    .any(|b| !matches!(b, b' ' | b'\t'))
+            })
+        };
+        if let Some((start, end, comment)) =
+            self.dash_comment_of_scalar_item().filter(|_| !floated())
+        {
+            // After the standalone block above the dash, before the own-line lines below it
+            // (`- # c` / `  # f` / `  z` is `c` then `f`): by position in the text.
+            let before = ranges
+                .iter()
+                .filter(|&&(at, _)| (at as usize) < start)
+                .count();
+            // `lines` holds blank entries between the comment lines, which `before` (a count of
+            // comment ranges) does not: the dash comment goes after that many comment lines.
+            let mut at = 0;
+            let mut seen = 0;
+            if before > 0 {
+                for (i, line) in lines.iter().enumerate() {
+                    if !line.is_empty() {
+                        seen += 1;
+                        if seen == before {
+                            at = i + 1;
+                            break;
                         }
                     }
-                    if seen < before {
-                        at = lines.len();
-                    }
                 }
-                lines.insert(at, strip(comment.to_string()));
-                block_end = Some(block_end.map_or(end, |own| own.max(end)));
+                if seen < before {
+                    at = lines.len();
+                }
             }
+            lines.insert(at, strip(comment.to_string()));
+            block_end = Some(block_end.map_or(end, |own| own.max(end)));
         }
         if !from_header {
             // #7034: the comment after the bare `-` of the item this node's container is the value

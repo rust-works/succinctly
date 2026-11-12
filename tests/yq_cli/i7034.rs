@@ -102,6 +102,7 @@ const HEAD_ROWS: &[(&str, &str, &str)] = &[
 ];
 
 const PROPS_ROWS: &[(&str, &str)] = &[
+    ("a:\n  #c1\n\n  n1: 3.5 # lc\n", "#c1\n#  lc\na.n1 = 3.5\n"),
     ("a:\n  #c1\n\n  n1: 3.5\n", "#c1\n# \na.n1 = 3.5\n"),
     (
         "- # multi\n\n  - two words\n  - d\n",
