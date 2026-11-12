@@ -913,10 +913,13 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         None
     }
 
-    /// [`head_comment_raw`](Self::head_comment_raw), except that a head comment yq reads as part
-    /// of the first document's header (it is printed with that header, and the node keeps none)
-    /// is empty (#6922).
-    fn head_comment_raw_outside_header(&self) -> Vec<String> {
+    /// This node's head comment as yq's properties encoder reads it (#6922, #7034): one entry per
+    /// line, `#` and all, with the comment after a bare `-` the node is the first child of, an empty
+    /// entry for the blank lines between that and its own block, an empty last entry for the line
+    /// break blank lines leave under the block, and nothing for a block the first document's header
+    /// holds (printed with the header). [`head_comment_raw`](Self::head_comment_raw) for formats
+    /// without those shapes.
+    fn head_comment_yq_raw(&self) -> Vec<String> {
         self.head_comment_raw()
     }
 
@@ -5196,7 +5199,7 @@ mod object_keys_repeat_tests {
         let root = index.root(json);
         assert!(!root.document_has_comments());
         assert_eq!(root.props_leading_content(), None);
-        assert_eq!(root.head_comment_raw_outside_header(), Vec::<String>::new());
+        assert_eq!(root.head_comment_yq_raw(), Vec::<String>::new());
     }
 
     #[test]

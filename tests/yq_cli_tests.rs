@@ -19830,13 +19830,11 @@ mod standalone_comment_attribution_2811 {
             assert_eq!(code, 0, "{input:?}");
             assert_eq!(out, "0\n", "{input:?}: some non-root node took the foot");
         }
-        // Forward past a blank line: yq's *text* for these three keeps the
-        // blank as a trailing `\n` (`c3\n`) -- a getter-text difference
-        // outside this issue, tracked with #2795's emitter work; the slot
-        // is what is pinned here.
+        // Forward past a blank line: yq's text keeps the blank as a trailing
+        // `\n` (`c3\n`), as succinctly's does since #7034.
         assert_slots(
             "- 1 # c1\n# c3\n\n- 2\n",
-            &[(".[1] | head_comment", "c3"), (".[0] | foot_comment", "")],
+            &[(".[1] | head_comment", "c3\n"), (".[0] | foot_comment", "")],
         )?;
         assert_slots(
             "a: \"x\"\n# f\n\nb: 2\n",
