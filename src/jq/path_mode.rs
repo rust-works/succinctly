@@ -137,12 +137,6 @@ fn truthy(value: &OwnedValue) -> bool {
     !matches!(value, OwnedValue::Null | OwnedValue::Bool(false))
 }
 
-/// The address of an array's storage: stable for as long as a handle on it is
-/// alive, which the slice-view tables guarantee by holding one.
-fn storage_addr(items: &ArrayVec) -> usize {
-    core::ptr::addr_of!(**items) as usize
-}
-
 /// A persistent path prefix: a fork shares its parent for free.
 #[derive(Clone, Default)]
 struct PathList(Option<Rc<(Self, OwnedValue, usize)>>);
@@ -936,13 +930,6 @@ pub struct Interp<'e> {
     /// The `def` bodies [`Self::pure`] and [`Self::single`] are looking inside right
     /// now, by address, so a definition that reaches itself is seen as it is (#5263).
     def_walk: RefCell<Vec<usize>>,
-    /// Array slices as `jvp_array_slice` makes them: a view (`offset`, `size`)
-    /// into the root allocation. Keyed by `(root, offset, size)`, so equal
-    /// slices of one array are one value; each view maps back to its root
-    /// and offset, so a slice of a slice lands on the same key. Both hold
-    /// the root, so a compared address is never reused.
-    slices: RefCell<BTreeMap<(usize, usize, usize), ArrayVec>>,
-    slice_roots: RefCell<BTreeMap<usize, (ArrayVec, usize)>>,
 }
 
 /// How a run ended.
@@ -1354,8 +1341,6 @@ impl<'e> Interp<'e> {
             next_label: Cell::new(0),
             depth: Cell::new(0),
             def_walk: RefCell::new(Vec::new()),
-            slices: RefCell::new(BTreeMap::new()),
-            slice_roots: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -1773,6 +1758,9 @@ impl<'e> Interp<'e> {
     /// `jv_get`, natively for the shapes whose result keeps its identity, and
     /// through the existing evaluator for the rest (array-of-indices keys, and
     /// every error), whose results are fresh.
+    // Reads no interpreter state since #6659 (a slice is the array's own window, not a view this
+    // interpreter memoizes), but stays a method beside the other `jv_*` instructions it serves.
+    #[allow(clippy::unused_self)]
     fn jv_get(&self, container: &OwnedValue, key: &OwnedValue) -> Result<OwnedValue, Raise> {
         match (container, key) {
             (OwnedValue::Object(map), OwnedValue::String(k)) => {
@@ -1797,7 +1785,10 @@ impl<'e> Interp<'e> {
                 if slice_bounds(items.len(), bounds).is_some() =>
             {
                 let (start, end) = slice_bounds(items.len(), bounds).unwrap_or_default();
-                Ok(self.array_slice(items, start, end))
+                // `jvp_array_slice`: an owned array is jq's window since #6659, so its own
+                // `slice` is the one definition of the rule (an empty range is a fresh `[]`, the
+                // whole array is the array, a range from offset 65,536 is copied).
+                Ok(OwnedValue::Array(items.slice(start..end)))
             }
             _ => {
                 let expr = Expr::IndexExpr {
@@ -1815,45 +1806,6 @@ impl<'e> Interp<'e> {
                     .ok_or_else(|| unsupported("jv_get answered nothing")) // patchcov: coverage tolerate-line reason="defensive: the delegated `.[$k]` answers exactly one value or an error"
             }
         }
-    }
-
-    /// `jvp_array_slice`: an empty slice is a fresh `[]`; the whole root is the
-    /// root itself; any other range is the one view of that range, unless it
-    /// starts 65,536 or more elements into the root, where jq copies it.
-    fn array_slice(&self, items: &ArrayVec, start: usize, end: usize) -> OwnedValue {
-        if start == end {
-            return OwnedValue::Array(ArrayVec::new());
-        }
-        self.array_view(items, start, end)
-    }
-
-    /// [`Self::array_slice`]'s non-empty range, as a view of its root.
-    fn array_view(&self, items: &ArrayVec, start: usize, end: usize) -> OwnedValue {
-        let (root, offset) = self
-            .slice_roots
-            .borrow()
-            .get(&storage_addr(items))
-            .cloned()
-            .unwrap_or_else(|| (items.clone(), 0));
-        let (offset, size) = (offset + start, end - start);
-        if offset == 0 && size == root.len() {
-            return OwnedValue::Array(root);
-        }
-        // A `jv`'s `offset` is 16 bits: past it `jvp_array_slice` copies the
-        // range into a new array of the same elements, which is fresh.
-        if offset >= 1 << 16 {
-            return OwnedValue::Array(root[offset..offset + size].to_vec().into());
-        }
-        let key = (storage_addr(&root), offset, size);
-        if let Some(view) = self.slices.borrow().get(&key) {
-            return OwnedValue::Array(view.clone());
-        }
-        let view: ArrayVec = root[offset..offset + size].to_vec().into();
-        self.slices.borrow_mut().insert(key, view.clone());
-        self.slice_roots
-            .borrow_mut()
-            .insert(storage_addr(&view), (root, offset));
-        OwnedValue::Array(view)
     }
 
     /// `EACH`/`EACH_OPT`: `path_intact` on the container (raising either

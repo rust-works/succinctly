@@ -40144,7 +40144,7 @@ enum NodeShape {
 impl NodeShape {
     fn of_owned(value: &OwnedValue) -> Self {
         match (value.as_array(), value.as_object()) {
-            (Some(items), _) if items.is_empty() => Self::EmptySequence,
+            (Some([]), _) => Self::EmptySequence,
             (_, Some(fields)) if fields.is_empty() => Self::EmptyMapping,
             (_, Some(_)) => Self::Mapping,
             _ => Self::Other,

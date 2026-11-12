@@ -513,7 +513,7 @@ mod tests {
                     // (both routes print it alike), and a failure prints nothing.
                     GenericResult::Owned(OwnedValue::Array(items)) => {
                         assert!(
-                            items.is_empty() || matches!(items.as_slice(), [OwnedValue::Null]),
+                            items.is_empty() || matches!(&items[..], [OwnedValue::Null]),
                             "{shape} over {doc:?}: {items:?}"
                         );
                     }

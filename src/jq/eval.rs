@@ -14546,18 +14546,14 @@ pub(crate) fn try_eval_owned_step<S: EvalSemantics>(expr: &Expr, state: OwnedVal
     // `.[1:]` as a fold's UPDATE (#5274): a slice with literal bounds of an array or a string
     // is a plain cut of the owned value, which shares its elements. Through the bridge each
     // step wrote the whole state out as JSON and indexed it again. An array this step owns
-    // outright is cut in place (a `memmove`, no element touched); any other is cut into a new
-    // one. jq mode, and an error is the bridge's to report.
+    // outright is cut in place: its window moves, and the cut-off head is compacted away only
+    // once it outgrows the kept part (`ArrayVec::cut`, #6659), so no element is copied. Any
+    // other is cut into a new value. jq mode, and an error is the bridge's to report.
     if let (EvalTag::Jq, Expr::Slice { start, end, .. }) = (S::TAG, unwrap_paren(expr)) {
         match state {
             OwnedValue::Array(mut items) if !items.is_shared() => {
                 let range = literal_array_slice_range(items.len(), *start, *end);
-                items.truncate(range.end);
-                items.drain(..range.start);
-                // The kept part does not keep the buffer it was cut from alive.
-                if items.capacity() > 2 * items.len() + 16 {
-                    items.shrink_to_fit();
-                }
+                items.cut(range);
                 return OwnedStep::Handled(Ok(OwnedValue::Array(items)));
             }
             OwnedValue::Array(_) | OwnedValue::String(_) => {
@@ -18191,7 +18187,7 @@ pub(crate) fn arith_add<S: EvalSemantics>(
         // `null` arm above) a `NumberLiteral` operand must keep its own
         // source spelling here too (#1143).
         (OwnedValue::Array(mut a), b) if S::ARRAY_PLUS_APPENDS => {
-            a.push(b);
+            a.make_vec().push(b);
             Ok(OwnedValue::Array(a))
         }
         // Numeric addition -- only once both operands are confirmed numeric
@@ -30402,7 +30398,7 @@ pub(crate) fn getpath_walk_owned_segments<'a, W: Clone + AsRef<[u64]>, S: EvalSe
                     Err(_) if optional => return QueryResult::None,
                     Err(e) => return e.into(),
                 };
-                current = Cow::Owned(OwnedValue::Array(arr[range].to_vec().into()));
+                current = Cow::Owned(OwnedValue::Array(arr.slice(range)));
             }
             (OwnedValue::String(s), OwnedValue::Object(desc)) => {
                 let range = match SliceBounds::from_descriptor(desc) {
@@ -45291,8 +45287,10 @@ pub(crate) fn slice_owned_value(
 ) -> Result<Option<OwnedValue>, EvalError> {
     match target {
         OwnedValue::Array(items) => {
+            // A view on the same storage, as jq's slice is (#6659): a refcount bump, not a
+            // copy of the range.
             let range = literal_array_slice_range(items.len(), start, end);
-            Ok(Some(OwnedValue::Array(items[range].to_vec().into())))
+            Ok(Some(OwnedValue::Array(items.slice(range))))
         }
         OwnedValue::Null => Ok(Some(OwnedValue::Null)),
         OwnedValue::String(s) => {
@@ -49456,14 +49454,10 @@ fn autovivify_array(root: &mut OwnedValue) {
 /// `optional`/`here` flag at any call site; only `set_path`'s
 /// `Expr::Optional` arm ever needs to tell it apart from a suppressible
 /// error, via [`EvalError::is_write_time_application_error`] (#498, #1303).
-fn write_index(
-    arr: &mut Vec<OwnedValue>,
-    idx: i64,
-    yq_mode: bool,
-) -> Result<&mut OwnedValue, EvalError> {
+fn write_index(arr: &mut ArrayVec, idx: i64, yq_mode: bool) -> Result<&mut OwnedValue, EvalError> {
     let actual_idx = resolve_setpath_index(&OwnedValue::Int(idx), arr.len(), yq_mode)?;
     if actual_idx >= arr.len() {
-        pad_with_nulls(arr, actual_idx)?;
+        pad_with_nulls(&mut arr.make_vec(), actual_idx)?;
     }
     Ok(&mut arr[actual_idx])
 }
@@ -50177,7 +50171,7 @@ fn set_path_steps<S: EvalSemantics>(
                 // length rather than removing a single slot -- and does
                 // nothing at all when the slot already existed.
                 if stranded && arr.len() > original_len {
-                    arr.truncate(original_len);
+                    arr.make_vec().truncate(original_len);
                     if root_was_null && arr.is_empty() {
                         *root = OwnedValue::Null;
                     }
@@ -50693,13 +50687,13 @@ fn through_slice<E: From<EvalError>>(
                 if defer_delete {
                     return Ok(false);
                 }
-                arr.splice(range, core::iter::empty());
+                arr.make_vec().splice(range, core::iter::empty());
                 return Ok(true);
             }
             let OwnedValue::Array(items) = sub else {
                 return Err(EvalError::slice_assign_non_array().into());
             };
-            arr.splice(range, items);
+            arr.make_vec().splice(range, items);
             // Always `true` past this point, even when `!terminal_write`
             // and `wrote` was `false`: `root` here is already a real Array
             // (this arm only matches an existing one, never a freshly
@@ -51353,7 +51347,7 @@ fn finish_deferred_update_deletes<S: EvalSemantics>(
     let paths: Vec<&[OwnedValue]> = paths
         .iter()
         .map(|path| match path {
-            OwnedValue::Array(parts) => parts.as_slice(),
+            OwnedValue::Array(parts) => &**parts,
             _ => unreachable!("deferred delete paths are arrays"),
         })
         .collect();
@@ -51630,7 +51624,7 @@ fn update_path_with_deletes<S: EvalSemantics>(
                                 match kept {
                                     Some(original) => arr[actual_idx] = original,
                                     None => {
-                                        arr.remove(actual_idx);
+                                        arr.make_vec().remove(actual_idx);
                                     }
                                 }
                             }
@@ -51740,8 +51734,7 @@ fn update_path_with_deletes<S: EvalSemantics>(
                         // in place, since a `Vec::remove` per dropped
                         // element would be quadratic.
                         let mut retained = vec_with_capacity(arr.len());
-                        for (index, mut elem) in core::mem::take(&mut **arr).into_iter().enumerate()
-                        {
+                        for (index, mut elem) in core::mem::take(arr).into_iter().enumerate() {
                             let child = pos.map(|pos| pos.child(OwnedValue::Int(index as i64)));
                             if update_path::<S>(
                                 &mut elem,
@@ -51754,7 +51747,7 @@ fn update_path_with_deletes<S: EvalSemantics>(
                                 retained.push(elem);
                             }
                         }
-                        **arr = retained;
+                        *arr = retained.into();
                     }
                     Ok(true)
                 }
@@ -52535,9 +52528,9 @@ fn wrap_fresh(steps: &[Expr], value: OwnedValue, yq_mode: bool) -> Result<OwnedV
                 OwnedValue::Object(map.into())
             }
             Expr::Index { idx, .. } => {
-                let mut arr = Vec::new();
+                let mut arr = ArrayVec::new();
                 *write_index(&mut arr, *idx, yq_mode)? = value;
-                OwnedValue::array_from(arr)
+                OwnedValue::Array(arr)
             }
             // `fresh_run_len` only ever collects `Field`/`Index` components.
             // #2549: closed by construction, not by a predicate -- the caller
@@ -69470,7 +69463,7 @@ fn node_below(root: &OwnedValue, components: &[&Expr]) -> Option<OwnedValue> {
             }
             (OwnedValue::Array(items), Expr::Slice { start, end, .. }) => {
                 let range = SliceBounds::from_literals(*start, *end).resolve(items.len());
-                OwnedValue::array_from(items[range].to_vec())
+                OwnedValue::Array(items.slice(range))
             }
             (OwnedValue::String(text), Expr::Slice { start, end, .. }) => {
                 let range = SliceBounds::from_literals(*start, *end).resolve(text.chars().count());
@@ -100734,7 +100727,7 @@ fn get_value_at_path(value: &OwnedValue, path: &[OwnedValue]) -> Option<OwnedVal
         // mode.
         (OwnedValue::Object(desc), OwnedValue::Array(arr)) => {
             let bounds = SliceBounds::from_descriptor(desc).ok()?;
-            let sliced = OwnedValue::Array(arr[bounds.resolve(arr.len())].to_vec().into()); // patchcov: coverage tolerate-line reason="pre-existing zero-hit line; #2999 changed only how its array payload is constructed"
+            let sliced = OwnedValue::Array(arr.slice(bounds.resolve(arr.len()))); // patchcov: coverage tolerate-line reason="pre-existing zero-hit line; #2999 and #6659 changed only how its array payload is constructed"
             get_value_at_path(&sliced, &path[1..])
         }
         (OwnedValue::Object(desc), OwnedValue::String(s)) => {
@@ -101077,7 +101070,7 @@ fn set_value_at_path_impl<S: EvalSemantics, const YQ_SETPATH: bool>(
             }
             let index = resolve_setpath_index(key, arr.len(), S::TAG == EvalTag::Yq)?;
             if index >= arr.len() {
-                pad_with_nulls(&mut arr, index)?;
+                pad_with_nulls(&mut arr.make_vec(), index)?;
             }
             let old = core::mem::replace(&mut arr[index], OwnedValue::Null);
             arr[index] = set_value_at_path_impl::<S, YQ_SETPATH>(old, rest, new_val)?;
@@ -101167,7 +101160,7 @@ fn set_value_at_path_impl<S: EvalSemantics, const YQ_SETPATH: bool>(
             else {
                 return Err(EvalError::slice_assign_non_array());
             };
-            arr.splice(range, items);
+            arr.make_vec().splice(range, items);
             Ok(OwnedValue::Array(arr))
         }
         // #3506: jq's `setpath` finds a subarray-search key where it wanted an
@@ -101457,7 +101450,7 @@ fn setpath_write<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics, const YQ_SETPATH
     };
     // #1351: `setpath(["b","p"]; 9)` through an alias lands on the
     // shared node, like `.b.p = 9`.
-    alias_identity::redirect_concrete_path(&mut path, &owned);
+    alias_identity::redirect_concrete_path(&mut path.make_vec(), &owned);
     let pre = alias_identity::active().then(|| owned.clone());
     match set_value_at_path_impl::<S, YQ_SETPATH>(owned, &path, new_val) {
         Ok(mut result) => {
@@ -101659,7 +101652,7 @@ fn delete_paths_under<S: EvalSemantics>(
                 let OwnedValue::Array(items) = delete_paths_sorted::<S>(sub, paths, start)? else {
                     unreachable!("deleting from an array yields an array")
                 };
-                arr.splice(range, items);
+                arr.make_vec().splice(range, items);
                 Ok(OwnedValue::Array(arr))
             }
             OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
@@ -101686,7 +101679,7 @@ fn delete_paths_under<S: EvalSemantics>(
                         arr[index] = delete_paths_sorted::<S>(old, paths, start)?;
                     }
                     DeleteIndexResolution::PositiveOutOfRange(index) if yq_mode => {
-                        pad_with_nulls(&mut arr, index)?;
+                        pad_with_nulls(&mut arr.make_vec(), index)?;
                         arr[index] = delete_paths_sorted::<S>(OwnedValue::Null, paths, start)?;
                     }
                     DeleteIndexResolution::PositiveOutOfRange(_) | DeleteIndexResolution::Skip => {}
@@ -101950,7 +101943,7 @@ fn delete_keys(
             // keeps the old behaviour.
             if yq_mode && keys.len() > 1 {
                 if let Some(highest) = highest_plain_index(keys) {
-                    extend_array_with_nulls_for_delete(&mut arr, highest)?;
+                    extend_array_with_nulls_for_delete(&mut arr.make_vec(), highest)?;
                 }
             }
             let mut indices: Vec<usize> = vec_with_capacity(keys.len());
@@ -102013,14 +102006,14 @@ fn delete_keys(
             // `Vec::remove` per key would be quadratic, and `delpaths` is
             // precisely how a filter deletes many elements at once.
             let (mut index, mut cursor) = (0usize, 0usize);
-            arr.retain(|_| {
+            arr.make_vec().retain(|_| {
                 let doomed = cursor < indices.len() && indices[cursor] == index;
                 cursor += usize::from(doomed);
                 index += 1;
                 !doomed
             });
             if let Some(target_len) = single_key_oob_target {
-                extend_array_with_nulls_for_delete(&mut arr, target_len)?;
+                extend_array_with_nulls_for_delete(&mut arr.make_vec(), target_len)?;
             }
             Ok(OwnedValue::Array(arr))
         }
@@ -103293,7 +103286,7 @@ fn delete_trie_array(
                             *target = delete_trie_apply(old, trie, child, yq_mode)?;
                         }
                         DeleteIndexResolution::PositiveOutOfRange(index) if yq_mode => {
-                            pad_with_nulls(arr, index)?;
+                            pad_with_nulls(&mut arr.make_vec(), index)?;
                             let target = &mut arr[index];
                             let old = core::mem::replace(target, OwnedValue::Null);
                             *target = delete_trie_apply(old, trie, child, yq_mode)?;
@@ -103321,7 +103314,7 @@ fn delete_trie_array(
                     else {
                         unreachable!("deleting from an array yields an array")
                     };
-                    arr.splice(range, items);
+                    arr.make_vec().splice(range, items);
                 }
             }
         }
@@ -103330,7 +103323,7 @@ fn delete_trie_array(
     // #4749: yq deletes a batch of plain indices in its own order -- see
     // [`yq_delete_index_sequence`] -- so it replaces the `delete_keys` batch below.
     if let (Some(steps), OwnedValue::Array(arr)) = (&sequence, &mut value) {
-        yq_delete_index_sequence(arr, steps)?;
+        yq_delete_index_sequence(&mut arr.make_vec(), steps)?;
         return Ok(value);
     }
     // Terminal indices go through `delete_keys`, which silently drops an
@@ -104178,11 +104171,14 @@ fn vivify_position(node: &mut OwnedValue, idx: i64) -> Option<&mut OwnedValue> {
     if matches!(node, OwnedValue::Null) && (0..=BRACKET_PAD_LIMIT).contains(&idx) {
         *node = OwnedValue::array_from(vec![OwnedValue::Null; idx as usize + 1]);
     }
-    let items = node.as_array_mut()?;
-    if (0..=BRACKET_PAD_LIMIT).contains(&idx) {
+    let OwnedValue::Array(items) = node else {
+        return None;
+    };
+    if (0..=BRACKET_PAD_LIMIT).contains(&idx) && items.len() <= idx as usize {
         // At most `BRACKET_PAD_LIMIT` elements, so a push loop (no infallible `resize`, #1670).
-        while items.len() <= idx as usize {
-            items.push(OwnedValue::Null);
+        let mut vec = items.make_vec();
+        while vec.len() <= idx as usize {
+            vec.push(OwnedValue::Null);
         }
     }
     let resolved = if idx < 0 {
@@ -104251,7 +104247,7 @@ fn vivify_apply(
                     }
                 }
                 OwnedValue::Array(_) => {
-                    if let Some(items) = node.as_array_mut() {
+                    if let OwnedValue::Array(items) = node {
                         for child in items.iter_mut() {
                             vivify_apply(rest, then, child, state);
                         }
@@ -104353,7 +104349,7 @@ fn vivify_recurse(
     if depth >= VIVIFY_RECURSE_DEPTH {
         return;
     }
-    if let Some(items) = node.as_array_mut() {
+    if let OwnedValue::Array(items) = node {
         for child in items.iter_mut().take(positions) {
             vivify_recurse(rest, then, child, state, depth + 1);
         }
@@ -104968,10 +104964,10 @@ fn delete_at_path(
                     let exact = index_component_value(*idx, number_key.as_ref());
                     match resolve_dels_index(&exact, arr.len(), yq_mode) {
                         DeleteIndexResolution::InRange(actual_idx) => {
-                            arr.remove(actual_idx);
+                            arr.make_vec().remove(actual_idx);
                         }
                         DeleteIndexResolution::PositiveOutOfRange(target_len) if yq_mode => {
-                            extend_array_with_nulls_for_delete(arr, target_len)?;
+                            extend_array_with_nulls_for_delete(&mut arr.make_vec(), target_len)?;
                         }
                         // An out-of-range index names nothing to delete — jq's
                         // delpaths silently skips it, `?` or not (#477).
@@ -105024,7 +105020,7 @@ fn delete_at_path(
             }
             match root {
                 OwnedValue::Array(arr) => {
-                    arr.clear();
+                    arr.make_vec().clear();
                     Ok(())
                 }
                 OwnedValue::Object(map) => {
@@ -105073,7 +105069,7 @@ fn delete_at_path(
         Expr::Slice { start, end, .. } => match root {
             OwnedValue::Array(arr) => {
                 let range = SliceBounds::from_literals(*start, *end).resolve(arr.len());
-                arr.drain(range);
+                arr.make_vec().drain(range);
                 Ok(())
             }
             // `null` has no elements to drop, so jq leaves it alone.
@@ -105397,7 +105393,7 @@ fn delete_path_steps(
                         // one. Confirmed live (yq v4.53.3): `[1,2] |
                         // del(.[5].a)` is `[1,2,null,null,null,null]`.
                         DeleteIndexResolution::PositiveOutOfRange(index) if yq_mode => {
-                            pad_with_nulls(arr, index)?;
+                            pad_with_nulls(&mut arr.make_vec(), index)?;
                             // The freshly padded slot is `null`; whatever
                             // `rest` does with it next (including `.[]`
                             // vivifying it to `[]`, #2323) is handled
@@ -105557,7 +105553,7 @@ fn delete_path_steps(
                             }
                         }
                         for i in remove_indices.into_iter().rev() {
-                            arr.remove(i);
+                            arr.make_vec().remove(i);
                         }
                         Ok(())
                     }
@@ -110114,7 +110110,7 @@ fn jq_slice_from(value: &OwnedValue, depth: &OwnedValue) -> Result<OwnedValue, E
     let start = if start < 0.0 { start + len_f } else { start };
     let start = start.clamp(0.0, len_f) as usize;
     Ok(match value {
-        OwnedValue::Array(items) => OwnedValue::array_from(items[start..].to_vec()),
+        OwnedValue::Array(items) => OwnedValue::Array(items.slice(start..items.len())),
         OwnedValue::String(s) => {
             OwnedValue::String(s.chars().skip(start).collect::<String>().into())
         }
@@ -110921,7 +110917,7 @@ fn delpaths_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     if let Some(doc) = &delpaths_pre {
         for path in &mut paths {
             if let OwnedValue::Array(path) = path {
-                alias_identity::redirect_concrete_path(path, doc);
+                alias_identity::redirect_concrete_path(&mut path.make_vec(), doc);
             }
         }
     }
@@ -110974,7 +110970,7 @@ fn delpaths_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // real yq reports whichever type-mismatched component it reaches first
     // when several paths/components each qualify.
     let mut rejected_component_tag: Option<&'static str> = None;
-    paths.retain(|path| match path {
+    paths.make_vec().retain(|path| match path {
         OwnedValue::Array(components) => {
             let keeps = !components
                 .iter()
@@ -111035,7 +111031,7 @@ fn delpaths_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let paths: Vec<&[OwnedValue]> = paths
         .iter()
         .filter_map(|path| match path {
-            OwnedValue::Array(components) => Some(components.as_slice()),
+            OwnedValue::Array(components) => Some(&**components),
             _ => None,
         })
         .collect();
@@ -111139,7 +111135,7 @@ pub(crate) fn delpaths_jq_prepare(paths: OwnedValue) -> Result<ArrayVec, EvalErr
         return Err(EvalError::path_must_be_array_not(bad.type_name()));
     }
     // Every path is an array by now (checked above).
-    paths.retain(|path| {
+    paths.make_vec().retain(|path| {
         !matches!(path, OwnedValue::Array(components)
             if components.iter().any(|key| matches!(key, OwnedValue::Float(f) if f.is_nan())))
     });
@@ -111155,10 +111151,7 @@ pub(crate) fn delpaths_jq_apply(
     paths: &ArrayVec,
 ) -> Result<OwnedValue, EvalError> {
     // `delpaths_jq_prepare` left only arrays.
-    let paths: Vec<&[OwnedValue]> = paths
-        .iter()
-        .filter_map(|path| path.as_array().map(Vec::as_slice))
-        .collect();
+    let paths: Vec<&[OwnedValue]> = paths.iter().filter_map(|path| path.as_array()).collect();
     match paths.first() {
         None => Ok(value),
         Some([]) => Ok(OwnedValue::Null),
@@ -119173,7 +119166,8 @@ mod tests {
             other => panic!("expected an array: {other:?}"),
         };
 
-        // Unique: the same buffer, shorter.
+        // Unique: the same buffer, its window moved past the two cut-off elements (#6659): no
+        // element is copied or moved.
         let unique = numbers(0..8);
         let before = ptr(&unique);
         let expr = parse(".[2:-1]").unwrap();
@@ -119181,7 +119175,11 @@ mod tests {
             panic!("a slice of a unique array must be taken");
         };
         assert_eq!(cut, numbers(2..7));
-        assert_eq!(ptr(&cut), before, "the unique array was copied");
+        assert_eq!(
+            ptr(&cut),
+            before.wrapping_add(2),
+            "the unique array was copied"
+        );
 
         // Shared: the other handle keeps its elements.
         let shared = numbers(0..8);
