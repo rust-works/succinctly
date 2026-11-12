@@ -1305,7 +1305,8 @@ pub struct YqCommand {
         short = 'p',
         long = "input-format",
         value_name = "FORMAT",
-        default_value = "auto"
+        default_value = "auto",
+        overrides_with = "input_format"
     )]
     pub input_format: InputFormat,
 
@@ -1315,13 +1316,24 @@ pub struct YqCommand {
     /// transformed front matter followed by the untouched body.
     ///
     /// `-f` is yq's short spelling (#7025).
-    #[arg(short = 'f', long = "front-matter", value_name = "MODE")]
+    #[arg(
+        short = 'f',
+        long = "front-matter",
+        value_name = "MODE",
+        overrides_with = "front_matter"
+    )]
     pub front_matter: Option<FrontMatterMode>,
 
     // === Output Options ===
     /// Output format type [yaml, json, props, shell, csv, tsv, base64, uri, auto] (default: auto,
     /// which is the input's own format: a `.json` file prints JSON, anything else YAML, #6703)
-    #[arg(short = 'o', long, value_name = "FORMAT", default_value = "auto")]
+    #[arg(
+        short = 'o',
+        long,
+        value_name = "FORMAT",
+        default_value = "auto",
+        overrides_with = "output_format"
+    )]
     pub output_format: OutputFormat,
 
     /// Unwrap scalar values, print without quotes (default for YAML)
@@ -1344,7 +1356,8 @@ pub struct YqCommand {
     #[arg(
         long = "properties-separator",
         value_name = "SEPARATOR",
-        default_value = " = "
+        default_value = " = ",
+        overrides_with = "properties_separator"
     )]
     pub properties_separator: String,
 
@@ -1356,15 +1369,30 @@ pub struct YqCommand {
     pub properties_array_brackets: bool,
 
     /// The field separator of `-o=csv`, one byte (#6922)
-    #[arg(long = "csv-separator", value_name = "CHAR", default_value = ",")]
+    #[arg(
+        long = "csv-separator",
+        value_name = "CHAR",
+        default_value = ",",
+        overrides_with = "csv_separator"
+    )]
     pub csv_separator: String,
 
     /// Text before the table of `-o=lua`; `\n`, `\r`, `\t`, `\\`, `\'` and `\"` are read (#6924)
-    #[arg(long = "lua-prefix", value_name = "PREFIX", default_value = "return ")]
+    #[arg(
+        long = "lua-prefix",
+        value_name = "PREFIX",
+        default_value = "return ",
+        overrides_with = "lua_prefix"
+    )]
     pub lua_prefix: String,
 
     /// Text after the table of `-o=lua`, escapes as for `--lua-prefix` (#6924)
-    #[arg(long = "lua-suffix", value_name = "SUFFIX", default_value = ";\\n")]
+    #[arg(
+        long = "lua-suffix",
+        value_name = "SUFFIX",
+        default_value = ";\\n",
+        overrides_with = "lua_suffix"
+    )]
     pub lua_suffix: String,
 
     /// Write the top-level keys of `-o=lua` as global assignments (#6924)
@@ -1379,7 +1407,8 @@ pub struct YqCommand {
     #[arg(
         long = "xml-attribute-prefix",
         value_name = "PREFIX",
-        default_value = "+@"
+        default_value = "+@",
+        overrides_with = "xml_attribute_prefix"
     )]
     pub xml_attribute_prefix: String,
 
@@ -1387,7 +1416,8 @@ pub struct YqCommand {
     #[arg(
         long = "xml-content-name",
         value_name = "NAME",
-        default_value = "+content"
+        default_value = "+content",
+        overrides_with = "xml_content_name"
     )]
     pub xml_content_name: String,
 
@@ -1395,7 +1425,8 @@ pub struct YqCommand {
     #[arg(
         long = "xml-proc-inst-prefix",
         value_name = "PREFIX",
-        default_value = "+p_"
+        default_value = "+p_",
+        overrides_with = "xml_proc_inst_prefix"
     )]
     pub xml_proc_inst_prefix: String,
 
@@ -1403,7 +1434,8 @@ pub struct YqCommand {
     #[arg(
         long = "xml-directive-name",
         value_name = "NAME",
-        default_value = "+directive"
+        default_value = "+directive",
+        overrides_with = "xml_directive_name"
     )]
     pub xml_directive_name: String,
 
@@ -1411,7 +1443,8 @@ pub struct YqCommand {
     #[arg(
         long = "shell-key-separator",
         value_name = "SEPARATOR",
-        default_value = "_"
+        default_value = "_",
+        overrides_with = "shell_key_separator"
     )]
     pub shell_key_separator: String,
 
@@ -1440,7 +1473,7 @@ pub struct YqCommand {
     pub no_doc: bool,
 
     /// Select specific document by 0-based index from multi-document stream
-    #[arg(long = "doc", value_name = "N")]
+    #[arg(long = "doc", value_name = "N", overrides_with = "document")]
     pub document: Option<usize>,
 
     /// Pretty print, expand flow styles to block style (currently a no-op:
@@ -1462,7 +1495,13 @@ pub struct YqCommand {
     /// jq's own real limit), real yq accepts any non-negative width for
     /// JSON output -- unbounded above, only clamped for YAML (see
     /// `IndentSpec::for_yaml`) -- so this has no upper-bound range.
-    #[arg(short = 'I', long, value_name = "N", default_value = "2")]
+    #[arg(
+        short = 'I',
+        long,
+        value_name = "N",
+        default_value = "2",
+        overrides_with = "indent"
+    )]
     pub indent: u8,
 
     /// Update the file in place
@@ -1477,25 +1516,33 @@ pub struct YqCommand {
     ///
     /// Deliberately long-only, unlike real yq's `-s`/`--split-exp`:
     /// succinctly's `-s` is already `--slurp` (#715).
-    #[arg(long = "split-exp", value_name = "EXPR")]
+    #[arg(long = "split-exp", value_name = "EXPR", overrides_with = "split_exp")]
     pub split_exp: Option<String>,
 
     // === Program Input ===
     /// Read filter from file instead of command line
-    #[arg(long = "from-file", value_name = "FILE")]
+    #[arg(long = "from-file", value_name = "FILE", overrides_with = "from_file")]
     pub from_file: Option<PathBuf>,
 
     /// Take the filter from this flag, so every positional argument is an input file
     /// (yq's `--expression`, for a filter that looks like a file name, #7025).
     ///
     /// `--from-file` wins over it, in either order, as in yq.
-    #[arg(long = "expression", value_name = "EXPR")]
+    #[arg(
+        long = "expression",
+        value_name = "EXPR",
+        overrides_with = "expression"
+    )]
     pub expression: Option<String>,
 
     /// Read the `--split-exp` expression from a file (yq's `--split-exp-file`, #7025).
     ///
     /// It wins over `--split-exp`, and an empty file means no split at all, as in yq.
-    #[arg(long = "split-exp-file", value_name = "FILE")]
+    #[arg(
+        long = "split-exp-file",
+        value_name = "FILE",
+        overrides_with = "split_exp_file"
+    )]
     pub split_exp_file: Option<PathBuf>,
 
     // === Security ===
@@ -3309,6 +3356,66 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #7051: yq's flags are Go `pflag` ones, so a repeated value flag takes the last value
+    /// (`yq -o json -o yaml .` prints YAML), where a clap argument refuses a second occurrence unless
+    /// it overrides itself. Introspects the live `YqCommand`, so a new value flag that forgets
+    /// `overrides_with` fails here instead of reintroducing the refusal for that one flag. The
+    /// `Append` flags (`--arg`, `--argjson`) are repeatable by design and skipped.
+    #[test]
+    fn test_every_single_value_yq_flag_takes_its_last_occurrence_7051() {
+        use clap::CommandFactory;
+
+        let mut cmd = YqCommand::command();
+        // `get_num_args` is unset until the command is built.
+        cmd.build();
+        let mut checked = 0;
+        for arg in cmd.get_arguments() {
+            let takes_one_value = arg
+                .get_num_args()
+                .is_some_and(|range| range.min_values() == 1 && range.max_values() == 1);
+            let sets = matches!(arg.get_action(), clap::ArgAction::Set);
+            if arg.is_positional() || !takes_one_value || !sets {
+                continue;
+            }
+            let flag = format!(
+                "--{}",
+                arg.get_long().expect("a yq value flag has a long name")
+            );
+            // Two different values the argument's own parser accepts, so the only error left is a
+            // refused repeat and the value kept shows which occurrence won.
+            let possible: Vec<String> = arg
+                .get_possible_values()
+                .iter()
+                .map(|v| v.get_name().to_string())
+                .collect();
+            let (first, last) = match possible.as_slice() {
+                [a, .., b] => (a.clone(), b.clone()),
+                _ => ("1".to_string(), "2".to_string()),
+            };
+            let argv = ["yq", &flag, &first, &flag, &last];
+            let parsed = cmd.clone().try_get_matches_from(argv);
+            assert!(
+                parsed.is_ok(),
+                "repeating {flag} is refused (give it overrides_with): {:?}",
+                parsed.as_ref().err()
+            );
+            let matches = parsed.expect("checked above");
+            let kept: Vec<_> = matches
+                .get_raw(arg.get_id().as_str())
+                .expect("the flag was given")
+                .collect();
+            assert_eq!(kept, [last.as_str()], "{flag} keeps its first occurrence");
+            checked += 1;
+        }
+        // Only the single-value flags that set their field are matched: a flag declared with
+        // `Append`, a delimiter or a `num_args` range is not covered here. There are nineteen today;
+        // an introspection that matched none would pass vacuously.
+        assert!(
+            checked >= 15,
+            "only {checked} single-value flags were checked"
+        );
     }
 
     /// Sibling guardrail for #1203: `-L` takes exactly one value *per

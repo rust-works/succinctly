@@ -50,6 +50,12 @@ impl ColorChoice {
             Self::Auto
         }
     }
+
+    /// [`Self::from_flags`] for `succinctly yq` (#7051): yq's `-C` (`forceColor`) beats `-M`
+    /// (`forceNoColor`) whichever comes last, where jq's `-M` wins.
+    pub fn from_flags_force_color_wins(monochrome: bool, force_color: bool) -> Self {
+        Self::from_flags(monochrome && !force_color, force_color)
+    }
 }
 
 /// Resolve whether to colorize output, in jq's precedence order:
@@ -136,5 +142,26 @@ mod tests {
         assert_eq!(ColorChoice::from_flags(true, false), ColorChoice::Never);
         // -M wins over -C if both are somehow set.
         assert_eq!(ColorChoice::from_flags(true, true), ColorChoice::Never);
+    }
+
+    /// #7051: yq's `-C` beats `-M`; every other combination is the shared choice.
+    #[test]
+    fn force_color_wins_maps_each_flag_combination() {
+        assert_eq!(
+            ColorChoice::from_flags_force_color_wins(false, false),
+            ColorChoice::Auto
+        );
+        assert_eq!(
+            ColorChoice::from_flags_force_color_wins(false, true),
+            ColorChoice::Always
+        );
+        assert_eq!(
+            ColorChoice::from_flags_force_color_wins(true, false),
+            ColorChoice::Never
+        );
+        assert_eq!(
+            ColorChoice::from_flags_force_color_wins(true, true),
+            ColorChoice::Always
+        );
     }
 }
