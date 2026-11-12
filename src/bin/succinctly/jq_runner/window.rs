@@ -678,8 +678,11 @@ pub(super) struct WindowedFiles {
     stitcher: SeamStitcher,
     /// Where the files read so far end in jq's input.
     end_origin: (usize, usize),
-    /// Every file so far was empty, so a BOM may still be at the front of the stream.
+    /// Every file so far held no bytes (as read, not as `stat` said: a `/proc` file is 0 and has some),
+    /// so a BOM may still be at the front of the stream.
     only_empty: bool,
+    /// The position of the next file to open.
+    next_index: usize,
     /// An invalid byte was substituted in a file already done.
     substituted: bool,
 }
@@ -694,6 +697,7 @@ impl WindowedFiles {
             stitcher: SeamStitcher::default(),
             end_origin: (1, 0),
             only_empty: true,
+            next_index: 0,
             substituted: false,
         }
     }
@@ -721,6 +725,7 @@ impl WindowedFiles {
                 Some(current) if current.done => {
                     self.end_origin = current.end_origin;
                     self.substituted |= current.substituted;
+                    self.only_empty &= current.file_read == 0;
                     let error = current.read_error.take();
                     self.current = None;
                     if let Some(error) = error {
@@ -732,7 +737,8 @@ impl WindowedFiles {
                     let Some((file, len)) = self.pending.next() else {
                         return Ok(false);
                     };
-                    let index = self.count - self.pending.len() - 1;
+                    let index = self.next_index;
+                    self.next_index += 1;
                     let mut seam = Seam::NONE;
                     let carry = self.stitcher.take_carry(&mut seam);
                     let place = Place {
@@ -744,7 +750,6 @@ impl WindowedFiles {
                         origin: self.end_origin,
                         substituted: self.substituted,
                     };
-                    self.only_empty &= len == 0;
                     self.current = Some(WindowedFile::in_stream(file, len, self.block, place));
                 }
             }
@@ -1951,6 +1956,22 @@ mod stream_tests {
             .map(|&(index, text)| (index, text.as_bytes().to_vec()))
             .collect();
         assert_eq!(seen, want);
+        // A file whose `stat` length is 0 and which has bytes is not an empty one: a BOM at the front of
+        // the next is a byte of the stream, not the front of it.
+        let mut reader = WindowedFiles::new(
+            vec![
+                (Rc::new(temp_file(b"1\n")), 0),
+                (Rc::new(temp_file(b"\xef\xbb\xbf2\n")), 5),
+            ],
+            4096,
+        );
+        let mut faulted = None;
+        while let Some((index, window)) = reader.next_window().expect("reads") {
+            if window.split_error.is_some() {
+                faulted = Some(index);
+            }
+        }
+        assert_eq!(faulted, Some(1));
         // The second read of the stream, for a fault's wording, goes on to the next file when one gives out
         // early, and reads the one of unknown length to its end.
         let (a, b, c) = (

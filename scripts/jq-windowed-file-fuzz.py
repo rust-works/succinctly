@@ -9,7 +9,8 @@ runs one random program over the files both ways, and compares stdout, stderr (t
 `<file N>`) and the exit status. The two routes are one implementation of jq's answer, so any difference is a
 bug in the window. A regular file on standard input is windowed too since #7059, so it is no longer the whole-file
 side. The programs avoid `input_line_number` and `input`, which leave the route: the line a document was read on
-shows in the `(at <file N>:LINE)` of a runtime error.
+shows in the `(at <file N>:LINE)` of a runtime error. (The seeds of #7048's runs do not reproduce: the generator
+now cuts the stream into files and picks among more programs.)
 
 The streams mix the shapes that decide where a window ends: documents of every kind, pretty-printed ones that
 span lines, two on a line with no separator, blank lines, CRLF and ` \\n` separators, a document bigger than a
