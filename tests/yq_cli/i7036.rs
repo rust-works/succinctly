@@ -6,8 +6,7 @@
 //! (`-o=csv` over a mapping) leaves an empty file and ends the run with exit 1. Every row was captured from
 //! yq v4.53.3 (`-s EXPR . f.yaml`): its file names, their contents and its exit code.
 //!
-//! Not covered, because it differs for a reason of its own: yq starts the second and later files of
-//! `-o=yaml` and `-o=kyaml` with `---`.
+//! The `---` yq starts the second and later files of `-o=yaml` and `-o=kyaml` with is #7053's.
 
 use std::process::{Command, Stdio};
 

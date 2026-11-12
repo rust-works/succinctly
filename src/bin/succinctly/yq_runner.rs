@@ -4647,6 +4647,10 @@ struct SplitFiles {
     /// Set when the encoder refused a result and yq's stop-at-the-first-error rule ends the run
     /// (#2810, #7036): the loops stop writing. An error in the name expression never sets it.
     run_ended: bool,
+    /// Whether an earlier result of the run has been written (#7053). yq writes every file through
+    /// one printer, which keeps its "document already printed" state across them: the first result
+    /// of a document after the run's first is written with the `---` separator, as it is on stdout.
+    doc_streamed: bool,
 }
 
 impl SplitFiles {
@@ -4656,8 +4660,18 @@ impl SplitFiles {
             name_format,
             encoder,
             run_ended: false,
+            doc_streamed: false,
         }
     }
+}
+
+/// Where a result stands in a `--split-exp` run (#7053).
+#[derive(Clone, Copy)]
+struct SplitPosition {
+    /// Its zero-based output index, which `$index` is bound to.
+    output_index: i64,
+    /// The first result its document produced.
+    first_in_doc: bool,
 }
 
 /// Evaluate `split_expr` against `result` with `$index` bound to
@@ -4671,15 +4685,24 @@ impl SplitFiles {
 /// reported through `sink` — the same "continue, exit 1 at the end" convention used
 /// for other uncaught evaluation errors in this file — rather than aborting
 /// the run outright.
+///
+/// `at.first_in_doc` says `result` is the first its document produced (#7053): only then does the
+/// printer's document separator come before it (never before the run's first result, never under
+/// `--no-doc`, and only for the encodings that write one), where two results of one document are
+/// written back to back as they are on stdout (#2486).
 fn write_split_result(
     result: &OwnedValue,
     comments: &CommentTree,
     split_expr: &Expr,
-    output_index: i64,
+    at: SplitPosition,
     output_config: &OutputConfig,
     files: &mut SplitFiles,
     sink: &mut ErrorSink,
 ) -> Result<()> {
+    let SplitPosition {
+        output_index,
+        first_in_doc,
+    } = at;
     let index_val = OwnedValue::Int(output_index);
     let per_result_expr = jq::substitute_vars(split_expr, [("index", &index_val)]);
 
@@ -4756,7 +4779,19 @@ fn write_split_result(
     let mut buf = Vec::new();
     let mut no_color_config = output_config.clone();
     no_color_config.use_color = false;
-    output_value(&mut buf, content, content_comments, &no_color_config, None)?;
+    // JSON has no document separator; every encoder but kyaml is `--no-doc` (see `run_yq`).
+    let separator = (first_in_doc && no_color_config.output_format == OutputFormat::Yaml)
+        .then_some(DocSeparatorArgs {
+            doc_streamed: &mut files.doc_streamed,
+            no_doc: no_color_config.no_doc,
+        });
+    output_value(
+        &mut buf,
+        content,
+        content_comments,
+        &no_color_config,
+        separator,
+    )?;
     std::fs::write(&filename, &buf).with_context(write_failure)
 }
 
@@ -13887,13 +13922,17 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             // own `-o=auto` here still defaults to Yaml (confirmed live),
             // matching `Self::for_source`'s own "nothing to match" arm.
             let null_input_output_config = output_config.for_source(&args, InputFormat::Yaml);
-            for result in &results {
+            for (at, result) in results.iter().enumerate() {
                 any_truthy |= !matches!(result, OwnedValue::Null | OwnedValue::Bool(false));
+                // #7053: the results of a null input are one document's.
                 write_split_result(
                     result,
                     &CommentTree::empty(),
                     split_expr,
-                    output_index,
+                    SplitPosition {
+                        output_index,
+                        first_in_doc: at == 0,
+                    },
                     &null_input_output_config,
                     &mut written_split_files,
                     &mut sink,
@@ -13997,13 +14036,16 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                     // own split-filename evaluation) should stop the
                     // loop early (#791).
                     let halted_before_batch = sink.halted().is_some();
-                    for (result, comments) in &results {
+                    for (at, (result, comments)) in results.iter().enumerate() {
                         any_truthy |= !matches!(result, OwnedValue::Null | OwnedValue::Bool(false));
                         write_split_result(
                             result,
                             comments,
                             split_expr,
-                            output_index,
+                            SplitPosition {
+                                output_index,
+                                first_in_doc: at == 0,
+                            },
                             &file_output_config,
                             &mut written_split_files,
                             &mut sink,
