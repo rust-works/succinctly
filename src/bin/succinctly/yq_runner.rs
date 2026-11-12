@@ -9194,6 +9194,7 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
     // The allowlist excludes effects and context-sensitive expressions.
     // The generic evaluator owns semantics, including typed/duplicate keys;
     // a mismatching trace must not supply a guessed tree.
+    let mut document_tree: Option<CommentTree> = None;
     if need_comments && reshape_presentation::navigation_construction(expr) {
         // #865: a construction of plain reads is replayed from the nodes it names.
         if let Ok(results) = &mut docs {
@@ -9218,33 +9219,41 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
             if results.len() == 1
                 && matches!(results[0].0, OwnedValue::Array(_) | OwnedValue::Object(_))
             {
-                let reshaped =
-                    to_owned_with_comments::<_, YqSemantics>(&cursor.value(), Some(&cursor))
-                        .ok()
-                        .and_then(|input| reshape_presentation::trace(expr, &input));
+                let input =
+                    to_owned_with_comments::<_, YqSemantics>(&cursor.value(), Some(&cursor)).ok();
+                let reshaped = input
+                    .as_ref()
+                    .and_then(|input| reshape_presentation::trace(expr, input));
                 if let Some((traced, tree)) = reshaped {
                     if results[0].0 == traced {
                         results[0].1 = tree;
                     }
                 }
+                // #7081: the document's own tree, for what yq prints before it, is the one just read.
+                document_tree = input.map(|(_, tree)| tree);
             }
         }
     }
 
     // #7081: what yq prints before the document (the comments above it and an explicit `---`, and the
     // root's head comment) comes with the result of an entries operator over the whole document,
-    // whether or not the replay above could place the rest of its comments.
-    // Not after a byte-order mark, where yq reads the comments above the first node as that node's
-    // (#6762, #7084): their place in an entries result is the first entry's (#7089).
+    // whether or not the replay above could place the rest of its comments. Not after a byte-order
+    // mark, where yq reads the comments above the first node as that node's (#6762, #7084): their
+    // place in an entries result is the first entry's (#7089).
     if need_comments
         && !cursor.index().after_bom()
         && reshape_presentation::carries_document_leading(expr)
     {
         if let Ok(results) = &mut docs {
-            if results.len() == 1 {
-                if let Ok((_, root)) =
+            if results.len() == 1
+                && matches!(results[0].0, OwnedValue::Array(_) | OwnedValue::Object(_))
+            {
+                let root = document_tree.take().or_else(|| {
                     to_owned_with_comments_pruned::<_, YqSemantics>(&cursor.value(), Some(&cursor))
-                {
+                        .ok()
+                        .map(|(_, tree)| tree)
+                });
+                if let Some(root) = root {
                     reshape_presentation::carry_document_leading(&mut results[0].1, &root);
                 }
             }
