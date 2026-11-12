@@ -33,12 +33,7 @@ fn run(bad: usize, flags: &[&str]) -> Result<(i32, usize, Vec<String>)> {
         .current_dir(dir.path())
         .arg("yq")
         .args(flags)
-        .args([
-            "--split-exp",
-            "\"n\"+(.a|tonumber|tostring)",
-            ".",
-            "f.yaml",
-        ])
+        .args(["--split-exp", "\"n\"+(.a|tonumber|tostring)", ".", "f.yaml"])
         .stdin(Stdio::null())
         .output()?;
     let stderr = String::from_utf8_lossy(&output.stderr);
