@@ -47,6 +47,12 @@ fn a_loop_that_peels_the_front_of_a_built_array_is_linear() -> Result<()> {
             "[100000,99999,99998]",
         ),
         ("[range(20000)] | [.[1:][]] | add", "199990000"),
+        // A queue: the append writes into the view in place, as `jvp_array_write` does, so the
+        // head is not compacted every round.
+        (
+            "[range(20000)] | reduce range(20000) as $i (.; .[1:] | . + [$i]) | [length, .[0], .[-1]]",
+            "[20000,0,19999]",
+        ),
     ];
     for (filter, want) in rows {
         assert_eq!(jq_n(filter)?, want, "{filter}");
@@ -75,6 +81,17 @@ fn a_slice_of_a_built_array_has_jqs_identity() -> Result<()> {
         (
             "[range(65536)] + [nan] | .[1:][65535:] == .[1:][65535:]",
             "false",
+        ),
+        // A fold's in-place cut moves the offset as jq's slice does: after 65,000 cuts a view
+        // 535 further on is still a view, one 536 further on crosses 65,536 and is a copy.
+        (
+            "[range(70000)] + [nan] | reduce range(65000) as $i (.; .[1:]) | . as $s | [$s[536:] == $s[536:], $s[535:] == $s[535:]]",
+            "[false,true]",
+        ),
+        // Past the copy the offset counts from 0 again, as the copy's does.
+        (
+            "[range(70000)] + [nan] | reduce range(66000) as $i (.; .[1:]) | . as $s | $s[3990:] == $s[3990:]",
+            "true",
         ),
         // A path through a bound slice of a built document.
         (
