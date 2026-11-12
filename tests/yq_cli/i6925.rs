@@ -686,6 +686,9 @@ fn csv_and_tsv_by_extension_and_inplace_6925() -> Result<()> {
 // -p ini: go-ini's reader (sections, comments, quotes, continuation, `%(name)s`). Every answer is yq v4.53.3's.
 #[rustfmt::skip]
 const INI_ROWS: &[Row] = &[
+    ("ini", "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk=1\n[kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk]\nx=2\n[.a]\ny=%(zz)s\n[q.r]\nz=%(zz)s\n", &["-o", "yaml"], ".", "? kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk\n: \"1\"\n? kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk\n: x: \"2\"\n.a:\n  y: '%(zz)s'\nq.r:\n  z: '%(zz)s'\n", "", 0),
+    ("ini", "a=1\nb=%(a)x %(c)s %(a)s\n", &["-o", "json", "-I0"], ".", "{\"a\":\"1\",\"b\":\"%(a)x %(c)s %(a)s\"}\n", "", 0),
+    ("ini", "[.a]\nx=1\n[b]\ny=%(x)s\n[.b.c]\nz=%(x)s\n", &["-o", "json", "-I0"], ".", "{\".a\":{\"x\":\"1\"},\"b\":{\"y\":\"%(x)s\"},\".b.c\":{\"z\":\"%(x)s\"}}\n", "", 0),
     ("ini", "[sec]\nk = v\nn = 1\n; c\n[other]\nx=y\n", &["-o", "yaml"], ".", "sec:\n  k: v\n  n: \"1\"\nother:\n  x: y\n", "", 0),
     ("ini", "[sec]\nk = v\nn = 1\n", &["-o", "json", "-I0"], ".", "{\"sec\":{\"k\":\"v\",\"n\":\"1\"}}\n", "", 0),
     ("ini", "top=1\n[s]\na=b\n", &["-o", "yaml"], ".", "top: \"1\"\ns:\n  a: b\n", "", 0),
