@@ -15052,6 +15052,39 @@ mod tests {
         }
     }
 
+    /// #7029: the directory a `--split-exp` file is made in is Go's `filepath.Dir` of the name: its last
+    /// element dropped and the rest cleaned lexically (`.` and `x/..` folded, `..` above the root
+    /// dropped, a leading `..` kept), `.` when nothing is left.
+    #[cfg(unix)]
+    #[test]
+    fn test_split_exp_directory_is_the_lexically_cleaned_parent_7029() {
+        for (name, want) in [
+            ("x.yml", "."),
+            ("./x.yml", "."),
+            ("d/x.yml", "d"),
+            ("a//b/x.yml", "a/b"),
+            ("a/./b/x.yml", "a/b"),
+            ("a/b/../c/x.yml", "a/c"),
+            ("a/../x.yml", "."),
+            ("d/../x.yml", "."),
+            ("../x.yml", ".."),
+            ("../../out/x.yml", "../../out"),
+            ("a/../../x.yml", ".."),
+            ("/x.yml", "/"),
+            ("/a/x.yml", "/a"),
+            ("/../x.yml", "/"),
+            ("/a/../../x.yml", "/"),
+            ("d/.yml", "d"),
+            ("d/x/.yml", "d/x"),
+        ] {
+            assert_eq!(
+                split_exp_directory(name),
+                std::path::PathBuf::from(want),
+                "{name}"
+            );
+        }
+    }
+
     /// #7028: the extension follows the resolved output format, `json` and `properties` for those two
     /// encoders and `yml` for every other.
     #[test]
