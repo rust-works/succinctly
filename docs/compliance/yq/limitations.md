@@ -7749,7 +7749,7 @@ Two rows differ:
   yq prints the raw bytes for a document that is the string itself (`printf /w== | yq -p base64 .` writes the byte `0xff`) and refuses a nested one with `yaml: cannot marshal invalid UTF-8 data as !!str`.
 - `--front-matter` with an explicit `-p base64` or `-p uri` is refused (`--front-matter and --input-format base64 are incompatible`), as `-p json` is, where yq decodes the extracted front matter.
 
-### `-p props` — read as the YAML yq prints for the file; a write keeps the quoting, and blank comment lines and collection tags differ ([#6925](https://github.com/rust-works/succinctly/issues/6925))
+### `-p props` — read as the YAML yq prints for the file; blank comment lines and collection tags differ ([#6925](https://github.com/rust-works/succinctly/issues/6925))
 
 `-p props` (alias `p`, `properties`) loads each input with a port of magiconair/properties v1.8.10, the library yq's decoder uses, and builds yq's nodes from it with a port of the traversal yq assigns through, then writes them as the YAML text yq prints for them; the run reads that text as `-p yaml`, so every route after the read is the YAML one.
 The loader is magiconair's: `=`, `:` or white space between key and value, `#` and `!` comments at the start of a line, `\` escapes and line continuations, a comment that ends the file with no line break dropped, and its errors (`properties: Line 4: "3"` for a value with no key, `premature EOF`, `invalid unicode literal`), each passed through Go's `fmt.Errorf` as yq's is, so a `%` in it reads as a verb (`"50%!"(MISSING)`).
@@ -7758,12 +7758,11 @@ A key is split on `.` into a path: a segment that is an `int32` indexes a sequen
 A comment is assigned to the key (or the sequence element) the path ends at, and a comment that cannot be assigned skips its property silently, as yq's `return nil` does.
 An empty input has no document; a file holding only comments or blank lines is `{}`.
 Under `-p auto` a first input file named `*.properties`, `*.props` or `*.p` (any case) reads and, with `-o auto`, prints as props.
+yq's nodes have no style, and the text read here is marked to have none either (#7031), so a write prints its result with the quoting yq's encoder picks (`a=1` with `.a |= . + "x"` prints `a: 1x`) and `style` reads `""`, while the text's quoting still decides the tag (a date and a `<<` key stay strings).
 These agree with yq v4.53.3 on 120 crafted files under `-o yaml`, `-o json`, `--properties-array-brackets` and three filters, and on 1,600 random files under `-o yaml` and `-o json`, apart from the rows below (`tests/yq_cli/i6925.rs` pins a sample).
 
 These rows differ:
 
-- yq's nodes have no style, so a write keeps the quoting yq's encoder chose for a value only when the new value needs it; the text read here records that quoting, and a write keeps it (`a=1` with `.a |= . + "x"` prints `a: 1x` in yq and `a: "1x"` here).
-  `style` reads `double` for such a value, and `literal` for a multi-line one, where yq reads an empty style.
 - A mapping or sequence the decoder made has an empty tag in yq (`.a | tag` on `a.b=1` is empty, and `type` too); here it is `!!map` or `!!seq`.
 - Blank lines that end a comment block are dropped, and two or more inside one are one, as yq itself reads the YAML it prints for them; yq's props decoder keeps them in the node.
 - `--front-matter` with an explicit `-p props` is refused, where yq decodes the front matter as props; on a file picked by its extension the front matter is read as YAML.

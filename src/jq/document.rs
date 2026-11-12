@@ -913,6 +913,14 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         None
     }
 
+    /// Whether this node's text is a transcode of a format whose nodes carry no style (#7031): the
+    /// YAML a `-p props` run reads a properties file as. [`style`](Self::style) still reads the
+    /// text (a quoted `"2001-12-14"` must stay a string), but the style yq reports and a writer
+    /// keeps is none: yq's encoder picks the quoting at print time.
+    fn style_less(&self) -> bool {
+        false
+    }
+
     /// This node's head comment as yq's properties encoder reads it (#6922, #7034): one entry per
     /// line, `#` and all, with the comment after a bare `-` the node is the first child of, an empty
     /// entry for the blank lines between that and its own block, an empty last entry for the line

@@ -3771,12 +3771,24 @@ pub struct KeyMeta {
 /// (`yq -P` keeps `"1": 3`, where a plain key `1: 3` is an integer).
 pub const KEY_STYLE_STRING: &str = "string";
 
-/// The value style for a string whose quoting `-P` stripped (#3614).
+/// The value style for a string whose quoting `-P` stripped (#3614), or whose `-p props` transcode
+/// recorded a quoting yq's node does not have (#7031).
 ///
 /// The same fact [`KEY_STYLE_STRING`] records for a key. The tree does not hold the text, so a
 /// string a YAML document would read as another type once plain (`2001-12-14`, `1_000`, `0b11`,
 /// `<<`) has to be told from a plain scalar of that type, which stays bare.
 pub const VALUE_STYLE_STRING: &str = "string";
+
+/// Whether `style` is a quoted string's (#7031).
+///
+/// That is `"single"`, `"double"`, or [`VALUE_STYLE_STRING`] / [`KEY_STYLE_STRING`], the marker for
+/// a string whose quoting is not kept but whose type is (`-P` sets it when it strips the quotes,
+/// and a `-p props` transcode seeds it). The one test every consumer of a node's quoting makes, so
+/// the marker reads as quoted everywhere.
+#[must_use]
+pub fn is_quoted_string_style(style: &str) -> bool {
+    matches!(style, "single" | "double") || style == VALUE_STYLE_STRING
+}
 
 impl KeyMeta {
     /// A key with a trailing comment and/or a quoted style, or `None` for a
@@ -3904,9 +3916,9 @@ impl KeyMeta {
         )
     }
 
-    /// Whether the source quoted this key (`"single"` or `"double"`), not yet stripped by `-P`.
+    /// Whether the source quoted this key ([`is_quoted_string_style`]).
     pub fn is_quoted(&self) -> bool {
-        matches!(self.style, "single" | "double")
+        is_quoted_string_style(self.style)
     }
 
     /// Whether the key was written behind an explicit `!!str` (#4088).
@@ -4474,6 +4486,21 @@ fn member_is_copy_of_source<C: DocumentCursor>(parent: &C, start: usize, end: us
     }
 }
 
+/// The style the DOM write route keeps for `cursor`'s node: its own, or for a node with no style of
+/// its own ([`DocumentCursor::style_less`], a `-p props` transcode, #7031) none, except that a quoted
+/// string becomes `string` (the `-P` marker [`VALUE_STYLE_STRING`], or [`KEY_STYLE_STRING`] for a
+/// key) so the writer quotes it again only where yq's encoder would (`2001-12-14`, `<<`).
+fn kept_style<C: DocumentCursor>(cursor: &C, string: &'static str) -> &'static str {
+    let style = cursor.style();
+    if !cursor.style_less() {
+        return style;
+    }
+    match style {
+        "single" | "double" => string,
+        _ => "",
+    }
+}
+
 /// `under_alias`: whether some ancestor on the path from the root is itself
 /// an alias node -- i.e. whether the node currently being converted was
 /// only reached by resolving through a `YamlValue::Alias` to its target's
@@ -4503,7 +4530,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
     // The raw (`#`-prefixed) form, not the stripped `line_comment` builtin
     // getter: the write path re-emits this verbatim after one space.
     let own_comment = cursor.and_then(DocumentCursor::line_comment_raw);
-    let own_style = cursor.map_or("", DocumentCursor::style);
+    let own_style = cursor.map_or("", |c| kept_style(c, VALUE_STYLE_STRING));
     // `&anchor`/`*alias` (#763). Checked alias-first: `anchor()` already
     // returns `None` on an alias node, so the order can't actually
     // mis-classify, but it states the precedence the writer relies on --
@@ -4732,7 +4759,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
             let key_style = if key_alias.is_some() {
                 field.key_cursor.alias_target_style()
             } else {
-                field.key_cursor.style()
+                kept_style(&field.key_cursor, KEY_STYLE_STRING)
             };
             if let Some(meta) = KeyMeta::with_alias(
                 key_comment,
@@ -43766,7 +43793,12 @@ fn owned_identity_after_prefetch(
 /// matches its `Style` flag bits one value at a time and the combination matches none. The
 /// cursor's own `style()` stays the style without the tag: the writers echo it.
 fn node_style_getter<C: DocumentCursor>(cursor: &C) -> &'static str {
-    let style = cursor.style();
+    // #7031: a `-p props` node has no style in yq.
+    let style = if cursor.style_less() {
+        ""
+    } else {
+        cursor.style()
+    };
     // `!<!>` is the verbatim spelling of the non-specific `!`.
     match cursor
         .explicit_tag_of_non_alias()

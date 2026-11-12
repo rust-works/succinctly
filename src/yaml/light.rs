@@ -8737,6 +8737,10 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
         self.bp_pos == FIRST_DOCUMENT_BP && YamlCursor::is_document_content(self)
     }
 
+    fn style_less(&self) -> bool {
+        self.index.style_less()
+    }
+
     fn document_has_comments(&self) -> bool {
         self.index.has_comments()
             || self.document_has_standalone_comments()
