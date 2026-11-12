@@ -7816,7 +7816,8 @@ These agree with yq v4.53.3 on 4,200 random files under `-o yaml`, `-o json` and
 
 These rows differ:
 
-- A byte that is not UTF-8 is U+FFFD here, so `length` counts it as three bytes; yq keeps the byte.
+- A byte that is not UTF-8 is U+FFFD here, so `length` counts it as three bytes and a go-ini error that quotes the line holding it shows U+FFFD; yq keeps the byte.
+- A value whose `%(name)s` expansion grows past 16 MiB is refused (`the value of key "a" expands past 16777216 bytes`), where go-ini expands a chain of values that each repeat the next twice (`a=%(b)s%(b)s`, `b=%(a)s%(a)s`) until it runs out of memory.
 - `--front-matter` with an explicit `-p ini` is refused (`--front-matter and --input-format ini are incompatible`), as `-p json` is, where yq decodes the front matter as INI.
 - A document whose text passes the YAML reader's limits is refused, where yq builds the nodes without writing the text.
 

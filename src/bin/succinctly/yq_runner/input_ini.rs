@@ -15,6 +15,8 @@
 //! every key and value a string. The text is written as yq's YAML encoder writes it and the run
 //! reads it as `-p yaml`.
 
+use std::collections::HashMap;
+
 use succinctly::jq::go_quote_bytes;
 use succinctly::yaml::{go_yaml_explicit_key_scalar, go_yaml_key_is_simple};
 
@@ -26,6 +28,9 @@ const DEFAULT_SECTION: &str = "DEFAULT";
 /// One level of indentation in the text written.
 const STEP: &str = "  ";
 
+/// The most bytes one value may grow to while its `%(name)s` references are expanded: 16 MiB.
+const MAX_EXPANSION_BYTES: usize = 1 << 24;
+
 /// go-ini's `depthValues`: how many `%(name)s` references one value expands.
 const DEPTH_VALUES: usize = 99;
 
@@ -36,7 +41,7 @@ pub(super) fn transcode(raw: &[u8], preserve_quotes: bool) -> Result<Vec<u8>, St
     let text = String::from_utf8_lossy(raw);
     let file =
         parse(&text, preserve_quotes).map_err(|e| format!("failed to parse INI content: {e}"))?;
-    Ok(render(&file).into_bytes())
+    Ok(render(&file)?.into_bytes())
 }
 
 /// `Parser.BOM`: a UTF-16 byte-order mark or a UTF-8 one at the start is dropped.
@@ -56,11 +61,13 @@ struct Section {
     name: String,
     /// The keys in the order they first appeared, with their last value.
     keys: Vec<(String, String)>,
+    /// Where each key sits in `keys`.
+    index: HashMap<String, usize>,
 }
 
 impl Section {
     fn position(&self, name: &str) -> Option<usize> {
-        self.keys.iter().position(|(key, _)| key == name)
+        self.index.get(name).copied()
     }
 }
 
@@ -68,6 +75,8 @@ impl Section {
 struct File {
     /// The sections in the order they first appeared; the first is `DEFAULT`.
     sections: Vec<Section>,
+    /// Where each section sits in `sections`.
+    index: HashMap<String, usize>,
 }
 
 impl File {
@@ -92,8 +101,9 @@ impl File {
         }
         self.sections.push(Section {
             name: name.to_string(),
-            keys: Vec::new(),
+            ..Section::default()
         });
+        self.index.insert(name.to_string(), self.sections.len() - 1);
         Ok(self.sections.len() - 1)
     }
 
@@ -105,7 +115,10 @@ impl File {
         let section = &mut self.sections[section];
         match section.position(name) {
             Some(at) => section.keys[at].1 = value,
-            None => section.keys.push((name.to_string(), value)),
+            None => {
+                section.index.insert(name.to_string(), section.keys.len());
+                section.keys.push((name.to_string(), value));
+            }
         }
         Ok(())
     }
@@ -127,13 +140,15 @@ impl File {
         None
     }
 
-    /// `Key.String()`: the value with its `%(name)s` references expanded.
-    fn value_of(&self, section: usize, key: usize) -> String {
-        let value = self.sections[section].keys[key].1.clone();
-        if !value.contains('%') {
-            return value;
+    /// `Key.String()`: the value with its `%(name)s` references expanded. A value that grows past
+    /// [`MAX_EXPANSION_BYTES`] is refused: go-ini expands a chain of values that each repeat the
+    /// next twice until it runs out of memory.
+    fn value_of(&self, section: usize, key: usize) -> Result<String, String> {
+        let raw = &self.sections[section].keys[key].1;
+        if !raw.contains('%') {
+            return Ok(raw.clone());
         }
-        let mut value = value;
+        let mut value = raw.clone();
         for _ in 0..DEPTH_VALUES {
             let Some((start, end)) = find_reference(&value) else {
                 break;
@@ -143,17 +158,20 @@ impl File {
             let mut found = self.get_key(section, option);
             if found.is_none() || found == Some((section, key)) {
                 found = self.get_key(0, option);
-                if found.is_none() {
-                    break;
-                }
             }
             let Some((found_section, found_key)) = found else {
                 break;
             };
             let replacement = &self.sections[found_section].keys[found_key].1;
             value = value.replace(&reference, replacement);
+            if value.len() > MAX_EXPANSION_BYTES {
+                return Err(format!(
+                    "the value of key {} expands past {MAX_EXPANSION_BYTES} bytes",
+                    go_quote(&self.sections[section].keys[key].0)
+                ));
+            }
         }
-        value
+        Ok(value)
     }
 }
 
@@ -385,32 +403,38 @@ fn key_line(out: &mut String, name: &str, depth: usize) {
     }
 }
 
-fn render_entries(out: &mut String, file: &File, section: usize, depth: usize) {
+fn render_entries(
+    out: &mut String,
+    file: &File,
+    section: usize,
+    depth: usize,
+) -> Result<(), String> {
     let child = STEP.repeat(depth + 1);
     for (key, (name, _)) in file.sections[section].keys.iter().enumerate() {
         key_line(out, name, depth);
         out.push(' ');
-        out.push_str(&string_scalar(&file.value_of(section, key), &child));
+        out.push_str(&string_scalar(&file.value_of(section, key)?, &child));
         out.push('\n');
     }
+    Ok(())
 }
 
-fn render(file: &File) -> String {
+fn render(file: &File) -> Result<String, String> {
     let mut out = String::new();
-    render_entries(&mut out, file, 0, 0);
+    render_entries(&mut out, file, 0, 0)?;
     for (at, section) in file.sections.iter().enumerate().skip(1) {
         key_line(&mut out, &section.name, 0);
         if section.keys.is_empty() {
             out.push_str(" {}\n");
         } else {
             out.push('\n');
-            render_entries(&mut out, file, at, 1);
+            render_entries(&mut out, file, at, 1)?;
         }
     }
     if out.is_empty() {
         out.push_str("{}\n");
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -483,5 +507,11 @@ mod tests {
             err("a=\"\"\"\nx"),
             "failed to parse INI content: missing closing key quote from \"\\\"\\\"\\\"\\n\" to \"x\""
         );
+    }
+
+    #[test]
+    fn an_expansion_that_doubles_per_pass_is_refused() {
+        let message = err("a=%(b)s%(b)s\nb=%(a)s%(a)s\n[s]\nc=%(a)s\n");
+        assert!(message.contains("expands past 16777216 bytes"), "{message}");
     }
 }
