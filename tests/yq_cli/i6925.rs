@@ -682,3 +682,84 @@ fn csv_and_tsv_by_extension_and_inplace_6925() -> Result<()> {
     assert_eq!(std::fs::read(&b)?, b"name\tage\nCara\t2\n");
     Ok(())
 }
+
+// -p ini: go-ini's reader (sections, comments, quotes, continuation, `%(name)s`). Every answer is yq v4.53.3's.
+#[rustfmt::skip]
+const INI_ROWS: &[Row] = &[
+    ("ini", "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk=1\n[kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk]\nx=2\n[.a]\ny=%(zz)s\n[q.r]\nz=%(zz)s\n", &["-o", "yaml"], ".", "? kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk\n: \"1\"\n? kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk\n: x: \"2\"\n.a:\n  y: '%(zz)s'\nq.r:\n  z: '%(zz)s'\n", "", 0),
+    ("ini", "a=1\nb=%(a)x %(c)s %(a)s\n", &["-o", "json", "-I0"], ".", "{\"a\":\"1\",\"b\":\"%(a)x %(c)s %(a)s\"}\n", "", 0),
+    ("ini", "[.a]\nx=1\n[b]\ny=%(x)s\n[.b.c]\nz=%(x)s\n", &["-o", "json", "-I0"], ".", "{\".a\":{\"x\":\"1\"},\"b\":{\"y\":\"%(x)s\"},\".b.c\":{\"z\":\"%(x)s\"}}\n", "", 0),
+    ("ini", "[sec]\nk = v\nn = 1\n; c\n[other]\nx=y\n", &["-o", "yaml"], ".", "sec:\n  k: v\n  n: \"1\"\nother:\n  x: y\n", "", 0),
+    ("ini", "[sec]\nk = v\nn = 1\n", &["-o", "json", "-I0"], ".", "{\"sec\":{\"k\":\"v\",\"n\":\"1\"}}\n", "", 0),
+    ("ini", "top=1\n[s]\na=b\n", &["-o", "yaml"], ".", "top: \"1\"\ns:\n  a: b\n", "", 0),
+    ("ini", "[DEFAULT]\nk=1\n[s]\nj=2\n[DEFAULT]\nm=3\n", &["-o", "yaml"], ".", "k: \"1\"\nm: \"3\"\ns:\n  j: \"2\"\n", "", 0),
+    ("ini", "# head\n[s] ; trail\n; c\na = b # x\nc: d\nd = e ; y\nf = g#h\n", &["-o", "yaml"], ".", "s:\n  a: b\n  c: d\n  d: e\n  f: g\n", "", 0),
+    ("ini", "a = \"q w\" \nb = `raw`\nc = 's'\nd = \"a\" b\ne = \"a\"\"b\"\nf = ''\n", &["-o", "yaml"], ".", "a: q w\nb: raw\nc: s\nd: '\"a\" b'\ne: '\"a\"\"b\"'\nf: \"\"\n", "", 0),
+    ("ini", "a = 1\\\n  2\\\n  3\nb = x\\\n\nc = y\n", &["-o", "yaml"], ".", "a: \"123\"\nb: x\nc: y\n", "", 0),
+    ("ini", "a = \"\"\"\nl1\nl2\n\"\"\"\nb = `x\ny` tail\nc = \"\"\"one\"\"\"\n", &["-o", "yaml"], ".", "a: |\n\n  l1\n  l2\nb: |-\n  x\n  y\nc: one\n", "", 0),
+    ("ini", "[a.b]\nx=1\n[a]\ny=2\n[a.b.c]\nz=3\n", &["-o", "yaml"], ".", "a.b:\n  x: \"1\"\na:\n  y: \"2\"\na.b.c:\n  z: \"3\"\n", "", 0),
+    ("ini", "[s]\nk=1\nk=2\nj=3\n[s]\nm=4\n", &["-o", "yaml"], ".", "s:\n  k: \"2\"\n  j: \"3\"\n  m: \"4\"\n", "", 0),
+    ("ini", "a=b=c\nd:e:f\ng = h : i\n", &["-o", "yaml"], ".", "a: b=c\nd: e:f\ng: 'h : i'\n", "", 0),
+    ("ini", "  a  =  b  \n\t[ s p ]\nk=v\n", &["-o", "yaml"], ".", "a: b\n' s p ':\n  k: v\n", "", 0),
+    ("ini", "[s]\n\n\n[t]\n", &["-o", "yaml"], ".", "s: {}\nt: {}\n", "", 0),
+    ("ini", "", &["-o", "yaml"], ".", "{}\n", "", 0),
+    ("ini", "# only a comment\n", &["-o", "json", "-I0"], ".", "{}\n", "", 0),
+    ("ini", "﻿a=1\n", &["-o", "json", "-I0"], ".", "{\"a\":\"1\"}\n", "", 0),
+    ("ini", "a=1\r\n[s]\r\nb=2\r\n", &["-o", "json", "-I0"], ".", "{\"a\":\"1\",\"s\":{\"b\":\"2\"}}\n", "", 0),
+    ("ini", "a = yes\nb = true\nc = 0x1\nd = null\ne =\nf = ~\n", &["-o", "yaml"], ".", "a: yes\nb: \"true\"\nc: \"0x1\"\nd: \"null\"\ne: \"\"\nf: \"~\"\n", "", 0),
+    ("ini", "-=a\n-=b\n[s]\n-=c\n-=d\n", &["-o", "json", "-I0"], ".", "{\"#1\":\"a\",\"#2\":\"b\",\"s\":{\"#1\":\"c\",\"#2\":\"d\"}}\n", "", 0),
+    ("ini", "\"q k\" = 1\n`b k`: 2\n\"\"\"t k\"\"\" = 3\n", &["-o", "json", "-I0"], ".", "{\"q k\":\"1\",\"b k\":\"2\",\"t k\":\"3\"}\n", "", 0),
+    ("ini", "d=D\n[a]\nx=1\n[a.b]\ny=%(x)s-%(d)s-%(zz)s\nz=%(y)s\nself=%(self)s\n", &["-o", "json", "-I0"], ".", "{\"d\":\"D\",\"a\":{\"x\":\"1\"},\"a.b\":{\"y\":\"1-D-%(zz)s\",\"z\":\"1-D-%(zz)s\",\"self\":\"%(self)s\"}}\n", "", 0),
+    ("ini", "a=50%\nb=%(a)s%(a)s\nc=%(a\n", &["-o", "json", "-I0"], ".", "{\"a\":\"50%\",\"b\":\"50%50%\",\"c\":\"%(a\"}\n", "", 0),
+    ("ini", "k\n", &["-o", "json", "-I0"], ".", "", "Error: bad file '-': failed to parse INI content: key-value delimiter not found: k", 1),
+    ("ini", "[s\nk=1\n", &["-o", "json", "-I0"], ".", "", "Error: bad file '-': failed to parse INI content: unclosed section: [s", 1),
+    ("ini", "=v\n", &["-o", "json", "-I0"], ".", "", "Error: bad file '-': failed to parse INI content: empty key name: =v", 1),
+    ("ini", "[]\n", &["-o", "json", "-I0"], ".", "", "Error: bad file '-': failed to parse INI content: empty section name", 1),
+    ("ini", "\"\" = v\n", &["-o", "json", "-I0"], ".", "", "Error: bad file '-': failed to parse INI content: error creating new key: empty key name", 1),
+    ("ini", "\"k = v\n", &["-o", "json", "-I0"], ".", "", "Error: bad file '-': failed to parse INI content: missing closing key quote: \"k = v", 1),
+    ("ini", "a = \"\"\"\nx", &["-o", "json", "-I0"], ".", "", "Error: bad file '-': failed to parse INI content: missing closing key quote from \"\\\"\\\"\\\"\\n\" to \"x\"", 1),
+    ("ini", "a = `x\nb = 1\n", &["-o", "json", "-I0"], ".", "", "Error: bad file '-': failed to parse INI content: missing closing key quote from \"`x\\n\" to \"\"", 1),
+    ("ini", "a = \"v\"\nb = 'w'\nc = \"x\" y\n", &["-o", "json", "-I0", "--ini-preserve-quotes"], ".", "{\"a\":\"\\\"v\\\"\",\"b\":\"'w'\",\"c\":\"\\\"x\\\" y\"}\n", "", 0),
+    ("ini", "[s]\nk = v\n", &["-o", "json", "-I0"], ".s.k", "\"v\"\n", "", 0),
+    ("ini", "a = 1\n[s]\nb = 2\n", &["-o", "json", "-I0"], "[.. | select(tag == \"!!str\")] | length", "2\n", "", 0),
+    ("ini", "a = é\nb = 日本\n", &["-o", "json", "-I0"], ".", "{\"a\":\"é\",\"b\":\"日本\"}\n", "", 0),
+];
+
+#[test]
+fn ini_input_matches_yq_on_stdin_6925() -> Result<()> {
+    for &(format, input, extra, filter, stdout, stderr, code) in INI_ROWS {
+        let mut args = vec!["-p", format];
+        args.extend_from_slice(extra);
+        let (out, err, status) = run_yq_stdin_with_stderr(filter, input, &args)?;
+        let row = format!("-p {format} {extra:?} {filter:?} on {input:?}");
+        assert_eq!(out, stdout, "stdout of {row}");
+        assert_eq!(error_line(&err), stderr, "stderr of {row}");
+        assert_eq!(status, code, "exit status of {row}");
+    }
+    Ok(())
+}
+
+/// `*.ini` and `*.i` (any case) are INI both ways under `-p auto`; an empty file is `{}`; `-i`
+/// writes the output format back.
+#[test]
+fn ini_by_extension_and_inplace_6925() -> Result<()> {
+    let dir = TempDir::new()?;
+    let a = write_file(&dir, "a.ini", b"[s]\nk = \"v\"\nn=1\n")?;
+    let b = write_file(&dir, "b.I", b"x=y\n")?;
+    let empty = write_file(&dir, "c.ini", b"")?;
+    assert_eq!(
+        run_yq_files(".s.k", &[&a], &["-o", "json"])?,
+        ("\"v\"\n".into(), String::new(), 0)
+    );
+    assert_eq!(
+        run_yq_files(".", &[&b, &a], &[])?,
+        ("x = y\n[s]\nk = v\nn = 1\n".into(), String::new(), 0)
+    );
+    assert_eq!(
+        run_yq_files(".", &[&empty], &["-o", "json"])?,
+        ("{}\n".into(), String::new(), 0)
+    );
+    run_yq_files(".s.n = \"2\"", &[&a], &["-i"])?;
+    assert_eq!(std::fs::read(&a)?, b"[s]\nk = v\nn = 2\n");
+    Ok(())
+}

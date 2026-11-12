@@ -7686,7 +7686,7 @@ The `@props` / `to_props` and `@csv` / `to_csv` operators read the same flags, a
 `-o=toml` is read as well (#6924); where it differs from yq is in its own section below.
 `-o=kyaml` is read as well (#6924); where it differs from yq is in its own section below.
 `-o=xml` is read as well (#6924), with `--xml-attribute-prefix`, `--xml-content-name`, `--xml-proc-inst-prefix` and `--xml-directive-name`; where it differs from yq is in its own section below.
-The other formats yq lists (`hcl`) and every input format but YAML, JSON, `props`, `csv`, `tsv`, `base64` and `uri` (see the `-p base64|uri`, `-p props` and `-p csv|tsv` sections below) are still refused at the flag.
+The other formats yq lists (`hcl`) and every input format but YAML, JSON, `props`, `csv`, `tsv`, `ini`, `base64` and `uri` (see the `-p base64|uri`, `-p props`, `-p csv|tsv` and `-p ini` sections below) are still refused at the flag.
 Six rows differ from yq v4.53.3, each pinned out of `tests/yq_cli/i6850.rs`:
 
 - A comment of a value the filter builds or writes is not written by `-o=props` or `@props` (`{"z": .a}`, `.a = 5`), where yq keeps the node's comment: the encoder reads comments from the document, as `to_yaml` does (#6933).
@@ -7808,6 +7808,25 @@ These rows differ:
 - `--front-matter` with an explicit `-p csv` or `-p tsv` is refused (`--front-matter and --input-format csv are incompatible`), as `-p json` is, where yq decodes the front matter as a table.
 - A number that go-yaml types as an integer or float but this YAML reader does not (`1_000`, `0b1`, an integer past 2^63) prints as yq prints it under `-o yaml` and differs under `-o json`, the same difference as for a YAML input.
 - yq's warning that `-o auto` defaults to YAML when `-p csv` is explicit is not written.
+
+### `-p ini` — a byte that is not UTF-8 and `--front-matter` differ ([#6925](https://github.com/rust-works/succinctly/issues/6925))
+
+`-p ini` (alias `i`) loads each input with a port of go-ini v1.67.0's reader, the library yq's decoder uses with its default options, and writes the nodes yq makes of the file as YAML text; the run reads that text as `-p yaml`, so every route after the read is the YAML one.
+A line is a comment (`#`, `;`), a section (`[name]` up to the line's last `]`, the name untrimmed) or a key (`name = value` or `name : value`, the name optionally in `"`, `"""` or backticks, a `-` an auto-numbered `#1`, `#2`, ...).
+A value ends at the first `#` or `;`, loses one pair of surrounding `'` or `"` (kept under `--ini-preserve-quotes`), goes on over lines while it ends in `\`, and runs over lines when it opens with `"""` or a backtick; a value left unclosed at the end of the input is go-ini's `missing closing key quote from ... to ...`, quoted as Go's `%q` writes it.
+A key written twice keeps its first place and its last value, a section written twice is one section, and the keys before the first section belong to `DEFAULT`, which is the document's root, followed by one mapping per other section (an empty one is `{}`); every key and value is a string.
+`%(name)s` in a value is expanded from the key's section, its parent sections (`a.b` has `a`) and `DEFAULT`, as go-ini's `Key.String()` does, up to 99 times.
+The errors are go-ini's behind `bad file '<name>': failed to parse INI content: ` (`key-value delimiter not found: k`, `unclosed section: [s`, `empty key name: =v`, `empty section name`).
+An empty input is `{}`.
+Under `-p auto` a first input file named `*.ini` or `*.i` (any case) reads and, with `-o auto`, prints as INI, and `-i` writes it back.
+These agree with yq v4.53.3 on 4,200 random files under `-o yaml`, `-o json` and `--ini-preserve-quotes` (`tests/yq_cli/i6925.rs` pins a sample).
+
+These rows differ:
+
+- A byte that is not UTF-8 is U+FFFD here, so `length` counts it as three bytes and a go-ini error that quotes the line holding it shows U+FFFD; yq keeps the byte.
+- A value whose `%(name)s` expansion grows past 16 MiB is refused (`the value of key "a" expands past 16777216 bytes`), where go-ini expands a chain of values that each repeat the next twice (`a=%(b)s%(b)s`, `b=%(a)s%(a)s`) until it runs out of memory.
+- `--front-matter` with an explicit `-p ini` is refused (`--front-matter and --input-format ini are incompatible`), as `-p json` is, where yq decodes the front matter as INI.
+- A document whose text passes the YAML reader's limits is refused, where yq builds the nodes without writing the text.
 
 ### `-o=xml` — comments, a source spelling and an empty document are not read (#6924)
 

@@ -361,7 +361,7 @@ fn classify(text: &str, auto_parse: bool) -> Cell {
 /// `s` as go-yaml writes a string with no style of its own; `block_indent` is the indent of a
 /// literal block's lines. A header's name is a node of its own and is written like a value: `1`
 /// is `"1"`, as it is in yq's output.
-fn string_scalar(s: &str, block_indent: &str) -> String {
+pub(super) fn string_scalar(s: &str, block_indent: &str) -> String {
     go_yaml_dom_scalar(s, false, false, false)
         .or_else(|| go_yaml_multiline_scalar(s, block_indent, STEP.len()))
         .unwrap_or_else(|| succinctly::yaml::go_yaml_double_quoted_scalar(s))

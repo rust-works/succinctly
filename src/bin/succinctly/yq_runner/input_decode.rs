@@ -26,6 +26,8 @@ pub(super) enum TranscodedInput {
     Csv,
     /// The same decoder with a tab for its separator and `--tsv-auto-parse` for its cells.
     Tsv,
+    /// `decoder_ini.go`: go-ini, a mapping of the `DEFAULT` section's keys and one per section.
+    Ini,
 }
 
 /// The flags a transcoder reads besides the input.
@@ -39,6 +41,8 @@ pub(super) struct TranscodeOptions {
     pub csv_auto_parse: bool,
     /// `--tsv-auto-parse`, the same for `-p tsv`.
     pub tsv_auto_parse: bool,
+    /// `--ini-preserve-quotes`: a value keeps the quotes that surround it.
+    pub ini_preserve_quotes: bool,
 }
 
 impl TranscodedInput {
@@ -53,12 +57,14 @@ impl TranscodedInput {
             InputFormat::Props => Some(Self::Props),
             InputFormat::Csv => Some(Self::Csv),
             InputFormat::Tsv => Some(Self::Tsv),
+            InputFormat::Ini => Some(Self::Ini),
             InputFormat::Auto => match super::lowercase_extension(files.first()?).as_deref() {
                 Some("base64") => Some(Self::Base64),
                 Some("uri") => Some(Self::Uri),
                 Some("props" | "p" | "properties") => Some(Self::Props),
                 Some("csv" | "c") => Some(Self::Csv),
                 Some("tsv" | "t") => Some(Self::Tsv),
+                Some("ini" | "i") => Some(Self::Ini),
                 _ => None,
             },
             InputFormat::Yaml | InputFormat::Json => None,
@@ -69,7 +75,7 @@ impl TranscodedInput {
     pub(super) fn reads_as(self) -> InputFormat {
         match self {
             Self::Base64 | Self::Uri => InputFormat::Json,
-            Self::Props | Self::Csv | Self::Tsv => InputFormat::Yaml,
+            Self::Props | Self::Csv | Self::Tsv | Self::Ini => InputFormat::Yaml,
         }
     }
 
@@ -81,6 +87,7 @@ impl TranscodedInput {
             Self::Props => "props",
             Self::Csv => "csv",
             Self::Tsv => "tsv",
+            Self::Ini => "ini",
         }
     }
 
@@ -88,7 +95,7 @@ impl TranscodedInput {
     /// a table, where yq's properties decoder reads no document from an empty input (`io.EOF`).
     pub(super) fn empty_is_document(self) -> bool {
         match self {
-            Self::Base64 | Self::Uri | Self::Csv | Self::Tsv => true,
+            Self::Base64 | Self::Uri | Self::Csv | Self::Tsv | Self::Ini => true,
             Self::Props => false,
         }
     }
@@ -102,6 +109,7 @@ impl TranscodedInput {
             Some(Self::Props) => 3,
             Some(Self::Csv) => 4,
             Some(Self::Tsv) => 5,
+            Some(Self::Ini) => 6,
         }
     }
 
@@ -112,6 +120,7 @@ impl TranscodedInput {
             3 => Some(Self::Props),
             4 => Some(Self::Csv),
             5 => Some(Self::Tsv),
+            6 => Some(Self::Ini),
             _ => None,
         }
     }
@@ -136,6 +145,7 @@ impl TranscodedInput {
                 )
             }
             Self::Tsv => return super::input_csv::transcode(raw, '\t', options.tsv_auto_parse),
+            Self::Ini => return super::input_ini::transcode(raw, options.ini_preserve_quotes),
         };
         Ok(json_string(&decoded))
     }
