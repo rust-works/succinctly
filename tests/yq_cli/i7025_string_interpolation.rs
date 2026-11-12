@@ -215,3 +215,59 @@ fn a_value_that_is_not_a_boolean_is_refused_7025() -> Result<()> {
     }
     Ok(())
 }
+
+/// An object key and an index are strings too, and non-ASCII text before the run changes nothing.
+#[test]
+fn keys_indexes_and_multibyte_text_read_the_same_rule_7025() -> Result<()> {
+    for (program, expected) in [
+        (
+            r#"{"a\\(1)": 2}"#,
+            r#"a\\(1): 2
+"#,
+        ),
+        (
+            r#"{"a\\\(1)": 2}"#,
+            r#"a\\(1): 2
+"#,
+        ),
+        (
+            r#"{"é\\(1)": 2}"#,
+            r#"é\\(1): 2
+"#,
+        ),
+        (
+            r#""é\\(1)""#,
+            r#"é\\(1)
+"#,
+        ),
+        (
+            r#".a["k\\(1)"]"#,
+            r#"null
+"#,
+        ),
+        (
+            r#"[{"k\\(1)": 1}] | .[0]["k\\(1)"]"#,
+            r#"1
+"#,
+        ),
+        (
+            r#""💥\\(1)x\\\(2)""#,
+            r#"💥\\(1)x\\(2)
+"#,
+        ),
+    ] {
+        let (out, code) = run_yq_stdin(program, "", &["-n", "--string-interpolation=false"])?;
+        assert_eq!((out.as_str(), code), (expected, 0), "{program}");
+    }
+    Ok(())
+}
+
+/// `-v` clustered with other short flags is still the boolean it was (`-vP` is `-v -P`).
+#[test]
+fn verbose_clusters_with_other_short_flags_7025() -> Result<()> {
+    for flag in ["-vP", "-Pv", "-vN"] {
+        let (out, code) = run_yq_stdin(".a", "a: 1\n", &[flag])?;
+        assert_eq!((out.as_str(), code), ("1\n", 0), "{flag}");
+    }
+    Ok(())
+}
