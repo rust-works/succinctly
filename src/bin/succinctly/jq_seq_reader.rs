@@ -475,34 +475,120 @@ impl PlainGuards {
 /// Not complete on purpose: a stream with a blank line between records, a record that is not
 /// RFC 8259 (`nan`, a leading zero) or one jq reads with a warning keeps the walk.
 pub(crate) fn plain_record_sequence(raw: &[u8], guards: PlainGuards) -> bool {
-    use succinctly::json::validate::validate;
     if guards.starts_on_rs && raw.first() != Some(&ASCII_RS) {
         return false;
     }
     if guards.ends_on_newline && raw.last() != Some(&b'\n') {
         return false;
     }
-    let record_ok = |record: &[u8]| {
-        (!guards.record_ends_on_newline || record.last() == Some(&b'\n'))
-            && validate(record).is_ok()
-    };
     // The record after the last RS (the whole stream when it holds none).
     let last = raw.rsplit(|&b| b == ASCII_RS).next().unwrap_or(raw);
-    if !record_ok(last) {
+    if !PlainRecords::record_ok(last, guards) {
         return false;
     }
-    let mut records = raw.split(|&b| b == ASCII_RS);
-    if raw.first() == Some(&ASCII_RS) {
-        records.next();
-    }
-    let mut any = false;
-    for record in records {
-        if !record_ok(record) {
-            return false;
+    PlainRecords::new(guards).finish_with(raw)
+}
+
+/// [`plain_record_sequence`] over a stream fed in pieces (#7082): the same verdict for the same
+/// bytes however they are cut, which a test holds it to, with the memory of the biggest record
+/// and not of the stream. It is the only definition of the framing: the whole-slice function above
+/// is this checker run over one piece.
+pub(crate) struct PlainRecords {
+    guards: PlainGuards,
+    /// The bytes of the record in progress that earlier pieces held.
+    record: Vec<u8>,
+    /// The first byte of the stream has been seen.
+    started: bool,
+    /// An RS has been seen: the record in progress is the one it opened.
+    opened: bool,
+    /// How many records were checked and found plain.
+    records: usize,
+    /// The last byte fed.
+    last: Option<u8>,
+}
+
+impl PlainRecords {
+    pub(crate) fn new(guards: PlainGuards) -> Self {
+        Self {
+            guards,
+            record: Vec::new(),
+            started: false,
+            opened: false,
+            records: 0,
+            last: None,
         }
-        any = true;
     }
-    any
+
+    /// One record's verdict: ends on a newline when the guard says so, and is one RFC 8259 document.
+    /// The validator takes only valid UTF-8 (in a string, and nothing but ASCII outside one), so a
+    /// stream of records that pass is valid UTF-8 whole: an RS is a character of its own, which no
+    /// multi-byte sequence holds. A test holds the checker to that.
+    pub(crate) fn record_ok(record: &[u8], guards: PlainGuards) -> bool {
+        (!guards.record_ends_on_newline || record.last() == Some(&b'\n'))
+            && succinctly::json::validate::validate(record).is_ok()
+    }
+
+    /// How many bytes of the record in progress earlier pieces held.
+    pub(crate) fn pending_len(&self) -> usize {
+        self.record.len()
+    }
+
+    /// The next piece of the stream. `false` means the stream is not plain, whatever follows.
+    pub(crate) fn feed(&mut self, piece: &[u8]) -> bool {
+        self.step(piece, false)
+    }
+
+    /// The last piece of the stream (possibly empty): whether the whole stream was plain.
+    pub(crate) fn finish_with(mut self, piece: &[u8]) -> bool {
+        self.step(piece, true) && self.records > 0
+    }
+
+    fn step(&mut self, piece: &[u8], is_last: bool) -> bool {
+        if piece.is_empty() && !is_last {
+            return true;
+        }
+        if !self.started && !piece.is_empty() {
+            self.started = true;
+            if self.guards.starts_on_rs && piece[0] != ASCII_RS {
+                return false;
+            }
+        }
+        if let Some(&last) = piece.last() {
+            self.last = Some(last);
+        }
+        let mut from = 0;
+        while let Some(at) = piece[from..].iter().position(|&b| b == ASCII_RS) {
+            let at = from + at;
+            // The record this RS ends. A stream that starts on its first RS has nothing before it:
+            // no record, where bytes before it are one (the `starts_on_rs` guard turns those down).
+            let nothing_before = !self.opened && self.record.is_empty() && at == 0;
+            if !nothing_before && !self.close(&piece[from..at]) {
+                return false;
+            }
+            self.opened = true;
+            from = at + 1;
+        }
+        let rest = &piece[from..];
+        if !is_last {
+            self.record.extend_from_slice(rest);
+            return true;
+        }
+        // The record after the last RS, which is the whole stream when it holds none.
+        (!self.guards.ends_on_newline || self.last == Some(b'\n')) && self.close(rest)
+    }
+
+    /// The record that `tail` ends, with what earlier pieces held of it.
+    fn close(&mut self, tail: &[u8]) -> bool {
+        let ok = if self.record.is_empty() {
+            Self::record_ok(tail, self.guards)
+        } else {
+            self.record.extend_from_slice(tail);
+            Self::record_ok(&self.record, self.guards)
+        };
+        self.record.clear();
+        self.records += usize::from(ok);
+        ok
+    }
 }
 
 /// What follows the last of the files a walk reads (#6588): a file that did not open means jq's
