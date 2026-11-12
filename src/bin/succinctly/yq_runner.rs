@@ -4612,6 +4612,24 @@ fn is_custom_tag(tag: &str) -> bool {
     !tag.starts_with("!!")
 }
 
+/// What a `--split-exp` run knows about the files it names (#7028): the paths written so far, to warn
+/// when one is written twice, and the output format the run was asked for, which decides the extension
+/// yq appends to a name that has none. `OutputConfig` cannot say the latter, since an encoder format
+/// (`-o=props` and the rest) runs as a YAML-output run over the encoded text.
+struct SplitFiles {
+    written: std::collections::HashSet<String>,
+    name_format: OutputFormat,
+}
+
+impl SplitFiles {
+    fn new(name_format: OutputFormat) -> Self {
+        Self {
+            written: std::collections::HashSet::new(),
+            name_format,
+        }
+    }
+}
+
 /// Evaluate `split_expr` against `result` with `$index` bound to
 /// `output_index`, expect exactly one string back, and write `result`
 /// (serialized through `output_config`, color forced off, matching
@@ -4627,7 +4645,7 @@ fn write_split_result(
     split_expr: &Expr,
     output_index: i64,
     output_config: &OutputConfig,
-    written_files: &mut std::collections::HashSet<String>,
+    files: &mut SplitFiles,
     sink: &mut ErrorSink,
 ) -> Result<()> {
     let index_val = OwnedValue::Int(output_index);
@@ -4701,7 +4719,9 @@ fn write_split_result(
         }
     };
 
-    if !written_files.insert(filename.to_string()) {
+    // #7028: yq names the file `<expression result>.<extension>` unless the result already ends in one.
+    let filename = split_exp_file_name(&filename, files.name_format);
+    if !files.written.insert(filename.clone()) {
         eprintln!("Warning: --split-exp path '{filename}' written more than once; overwriting");
     }
 
@@ -4710,8 +4730,58 @@ fn write_split_result(
     no_color_config.use_color = false;
     output_value(&mut buf, result, comments, &no_color_config, None)?;
 
-    std::fs::write(&*filename, &buf)
+    std::fs::write(&filename, &buf)
         .with_context(|| format!("failed to write --split-exp output file: {filename}"))
+}
+
+/// The extension yq (v4.53.3) appends to a `--split-exp` file name for `format` (#7028): `json` and
+/// `properties` for those two encoders, `yml` for every other, `xml`, `toml`, `csv` and `lua` among
+/// them (captured per `-o`, not inferred).
+fn split_exp_extension(format: OutputFormat) -> &'static str {
+    match format {
+        OutputFormat::Json => "json",
+        OutputFormat::Props => "properties",
+        // Listed, not a wildcard, so a new format has to choose its extension here.
+        OutputFormat::Yaml
+        | OutputFormat::Auto
+        | OutputFormat::Shell
+        | OutputFormat::Csv
+        | OutputFormat::Tsv
+        | OutputFormat::Lua
+        | OutputFormat::Xml
+        | OutputFormat::Kyaml
+        | OutputFormat::Toml
+        | OutputFormat::Ini
+        | OutputFormat::Base64
+        | OutputFormat::Uri => "yml",
+    }
+}
+
+/// Whether `name` already ends in an extension in the sense yq tests: a `.` followed by one or more
+/// ASCII letters or digits at the very end, `\.[a-zA-Z0-9]+$` (#7028). Not `Path::extension`: a name
+/// that ends in `.`, in `.a-b` or in a non-ASCII letter has none, and `x.1`, `x.tar.gz` and `x.YML` do.
+fn split_exp_name_has_extension(name: &str) -> bool {
+    let tail = name
+        .bytes()
+        .rev()
+        .take_while(u8::is_ascii_alphanumeric)
+        .count();
+    // A name that is all letters and digits (`x1`) has no byte before its tail.
+    tail > 0
+        && name
+            .len()
+            .checked_sub(tail + 1)
+            .is_some_and(|dot| name.as_bytes()[dot] == b'.')
+}
+
+/// The path `--split-exp` writes for the expression's `name`: `name` itself when it already ends in an
+/// extension, else `name.<extension of the output format>` (#7028).
+fn split_exp_file_name(name: &str, format: OutputFormat) -> String {
+    if split_exp_name_has_extension(name) {
+        name.to_owned()
+    } else {
+        format!("{name}.{}", split_exp_extension(format))
+    }
 }
 
 /// One step of a path into a paired `OwnedValue`/[`CommentTree`] tree, used
@@ -11998,6 +12068,9 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         }))),
         OutputFormat::Yaml | OutputFormat::Json | OutputFormat::Auto => None,
     };
+    // #7028: `--split-exp` names its files by the format the user asked for, which the rewrite to a
+    // YAML-output run below hides for every encoder format.
+    let split_exp_format = args.output_format;
     if output_encoder.is_some() {
         // Every encoder but KYAML's writes its own line ends (or none), so nothing is added after a result.
         // KYAML leaves the line end to the printer and keeps YAML's `---` between documents, which `-N`
@@ -13652,8 +13725,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         // here; the input-gathering below otherwise mirrors the standard
         // path at the bottom of this function.
         let mut output_index: i64 = 0;
-        let mut written_split_files: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut written_split_files = SplitFiles::new(split_exp_format);
 
         if args.null_input {
             let results = evaluate_input(&OwnedValue::Null, &program.expr, &mut sink)?;
@@ -14940,6 +15012,51 @@ fn run_exit_code(sink: &ErrorSink, exit_status: bool, any_truthy: bool) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #7028: yq's test for "the name already has an extension" is `\.[a-zA-Z0-9]+$`, not
+    /// `Path::extension`; the rows are the shapes that tell the two apart, captured from yq v4.53.3.
+    #[test]
+    fn test_split_exp_name_extension_is_a_dot_then_ascii_letters_or_digits_at_the_end_7028() {
+        for kept in [
+            "x.txt", "x.yml", "x.YML", "x.1", "x.A1b2", "x.tar.gz", "x..yml", "a/b.c", ".h1",
+        ] {
+            assert!(split_exp_name_has_extension(kept), "{kept}");
+        }
+        for appended in [
+            "", ".", "x", "x1", "0", "x.", "x.txt.", "x.a-b", "x.a_b", "x.a b", "x.\u{e9}", "x.$",
+            "x/.a-b", "\u{e9}",
+        ] {
+            assert!(!split_exp_name_has_extension(appended), "{appended:?}");
+        }
+    }
+
+    /// #7028: the extension follows the resolved output format, `json` and `properties` for those two
+    /// encoders and `yml` for every other.
+    #[test]
+    fn test_split_exp_file_name_appends_the_formats_extension_7028() {
+        use OutputFormat::*;
+        for (format, want) in [
+            (Yaml, "x1.yml"),
+            (Json, "x1.json"),
+            (Props, "x1.properties"),
+            (Auto, "x1.yml"),
+            (Shell, "x1.yml"),
+            (Csv, "x1.yml"),
+            (Tsv, "x1.yml"),
+            (Lua, "x1.yml"),
+            (Xml, "x1.yml"),
+            (Kyaml, "x1.yml"),
+            (Toml, "x1.yml"),
+            (Ini, "x1.yml"),
+            (Base64, "x1.yml"),
+            (Uri, "x1.yml"),
+        ] {
+            assert_eq!(split_exp_file_name("x1", format), want, "{format:?}");
+        }
+        assert_eq!(split_exp_file_name("x1.txt", Json), "x1.txt");
+        assert_eq!(split_exp_file_name("x1.", Json), "x1..json");
+        assert_eq!(split_exp_file_name("", Yaml), ".yml");
+    }
 
     /// #6335: the writer numbers a repeated key's earlier entries by position among that key's
     /// shadows (also under a sort, which is stable), numbers nothing when the tree kept no

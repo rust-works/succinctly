@@ -888,6 +888,8 @@ succinctly yq --split-exp '"out_" + ($index|tostring) + ".yml"' '.[]' data.yaml
 succinctly yq --split-exp '.name + ".yml"' '.[]' data.yaml
 ```
 
+A name that has no extension gets the output format's: `.json` for `-o=json`, `.properties` for `-o=props` and `.yml` for every other format, `-o=xml`, `-o=toml`, `-o=lua` and `-o=csv` included, as yq v4.53.3 does (#7028). "Has an extension" is yq's own test, a `.` followed by one or more ASCII letters or digits at the very end of the name, so `x.txt`, `x.1`, `x.tar.gz` and `x.YML` are kept, while `x.`, `x.a-b` and `x.é` get one (`x..yml`, `x.a-b.yml`). The format is the one the run resolves to: JSON input read without `-o` writes `.json` files, `-p=json` without `-o` and stdin write `.yml`.
+
 **Deliberately long-only**, unlike real yq's `-s`/`--split-exp`: succinctly's `-s` is already `--slurp`. A non-string result errors; a duplicate filename overwrites with a warning. Incompatible with `--slurp`, `--inplace`, and `--front-matter`; `--raw-input` is not yet supported.
 
 ### Variables
