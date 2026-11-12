@@ -7789,6 +7789,7 @@ These agree with yq v4.53.3 on 6,500 random tables under `-o yaml`, `-o json`, `
 These rows differ:
 
 - A cell go-yaml rejects but this YAML reader accepts is a node here and a string in yq: a block sequence item or key opened by a plain scalar that starts with `]` (`- ]x`), and a line that starts with a tab used as indentation (` \t1` is the integer `1` here, the string ` \t1` in yq).
+- A byte that is not UTF-8 in a cell or a header is U+FFFD here, so `length` counts it as three bytes; yq keeps the byte (`length` 1), escapes it as `\\ufffd` under `-o json` and refuses it under `-o yaml` (`cannot marshal invalid UTF-8 data as !!str`).
 - A U+FEFF inside a cell, where go-yaml skips one at the start of a line, and a lone `\r` in a place YAML does not allow a line break, read differently.
 - A cell that opens with `---` or carries a `%YAML` directive is read as one document here (or a string); yq leaks its own `# $yqDocSeparator$` marker into the node, which is not reproduced.
 - A comment before or after a scalar cell (`# c` / `5`, `5` / `# c`) is dropped here, where yq keeps it as a comment of the node, and a cell with a leading line break keeps no trailing blank.

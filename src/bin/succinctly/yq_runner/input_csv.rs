@@ -34,11 +34,12 @@ pub(super) fn transcode(raw: &[u8], separator: char, auto_parse: bool) -> Result
     let Some(header) = records.next() else {
         return Ok(b"null\n".to_vec());
     };
+    let keys: Vec<String> = header.iter().map(|name| key_text(name)).collect();
     let mut out = String::new();
     let mut rows = 0usize;
     for record in records {
         rows += 1;
-        write_row(&mut out, &header, &record, auto_parse);
+        write_row(&mut out, &keys, &record, auto_parse);
     }
     if rows == 0 {
         return Ok(b"[]\n".to_vec());
@@ -251,6 +252,21 @@ enum Cell {
     Collection(String),
 }
 
+/// `s` without the blanks YAML trims from a plain scalar: spaces and tabs only (`str::trim` also
+/// strips U+00A0 and the other Unicode white space, which go-yaml keeps).
+fn yaml_trim(s: &str) -> &str {
+    s.trim_matches([' ', '\t'])
+}
+
+/// Whether `text` is a plain scalar the YAML parser need not see: ASCII letters, digits, `_` and
+/// single spaces between words, so no indicator, comment, tag, anchor or line break can be in it.
+fn is_simple_plain(text: &str) -> bool {
+    text.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b' ')
+        && !text.starts_with(' ')
+        && !text.ends_with(' ')
+}
+
 fn classify(text: &str, auto_parse: bool) -> Cell {
     if text.is_empty() {
         return Cell::Empty;
@@ -262,10 +278,17 @@ fn classify(text: &str, auto_parse: bool) -> Cell {
             Cell::Scalar(text.to_string())
         };
     }
+    if is_simple_plain(text) {
+        return if go_yaml_resolved_tag(text) == "!!str" {
+            Cell::Str(text.to_string())
+        } else {
+            Cell::Scalar(text.to_string())
+        };
+    }
     // A tag with nothing to tag: a bare `!` is a null, any other (`!!`, `!!str`, `!x`) a string.
     // go-yaml reads a lone `\r` as a line break, as the snippet is read here; a string keeps it.
     let norm = text.replace('\r', "\n");
-    let bare = norm.trim();
+    let bare = yaml_trim(&norm);
     if bare.starts_with('!') && !bare.contains(char::is_whitespace) {
         return if bare == "!" {
             Cell::Scalar(bare.to_string())
@@ -283,9 +306,9 @@ fn classify(text: &str, auto_parse: bool) -> Cell {
     };
     let Some((root, rest)) = documents.uncons_cursor() else {
         // Nothing but comments, or nothing at all: a null, which keeps the text of the comment.
-        return Cell::Scalar(norm.trim().to_string());
+        return Cell::Scalar(yaml_trim(&norm).to_string());
     };
-    if norm.trim().is_empty() {
+    if yaml_trim(&norm).is_empty() {
         // Blanks only: a null whose comment is the blanks, which yq writes behind its `# `.
         return Cell::Scalar(format!("# {norm}"));
     }
@@ -294,7 +317,7 @@ fn classify(text: &str, auto_parse: bool) -> Cell {
     }
     match root.value() {
         YamlValue::Mapping(_) | YamlValue::Sequence(_) => Cell::Collection(norm),
-        YamlValue::Null => Cell::Scalar(norm.trim().to_string()),
+        YamlValue::Null => Cell::Scalar(yaml_trim(&norm).to_string()),
         YamlValue::String(s) => {
             let explicit = root.explicit_tag();
             let unquoted = s.is_unquoted();
@@ -303,7 +326,9 @@ fn classify(text: &str, auto_parse: bool) -> Cell {
                 (Some(tag), _) => tag == "!!str",
                 // A plain scalar is typed as go-yaml's `resolve` types it (a date is a timestamp
                 // and `1_000` an integer); a quoted one is a string.
-                (None, Some(value)) if unquoted => go_yaml_resolved_tag(value.trim()) == "!!str",
+                (None, Some(value)) if unquoted => {
+                    go_yaml_resolved_tag(yaml_trim(value)) == "!!str"
+                }
                 (None, _) => true,
             };
             if is_str {
@@ -320,7 +345,7 @@ fn classify(text: &str, auto_parse: bool) -> Cell {
                 scalar.push(' ');
             }
             match value {
-                Some(value) if unquoted => scalar.push_str(value.trim()),
+                Some(value) if unquoted => scalar.push_str(yaml_trim(&value)),
                 _ => scalar.push_str(&String::from_utf8_lossy(s.raw_bytes())),
             }
             Cell::Scalar(scalar)
@@ -358,26 +383,27 @@ fn hang(text: &str, indent: &str) -> String {
 }
 
 /// One record as an item of the document's sequence.
-fn write_row(out: &mut String, header: &[Vec<u8>], record: &[Vec<u8>], auto_parse: bool) {
+/// A header's name as the text that opens its entry, colon included: `name:` or the `? ` form.
+fn key_text(name: &[u8]) -> String {
     let child = STEP.repeat(2);
-    for (n, (name, cell)) in header.iter().zip(record).enumerate() {
+    let name = String::from_utf8_lossy(name);
+    if go_yaml_key_is_simple(&name) {
+        format!("{}:", string_scalar(&name, &child))
+    } else {
+        // go-yaml's `? ` explicit key, for a key with a line break or over 128 bytes.
+        let key = go_yaml_explicit_key_scalar(&name, &child, STEP.len())
+            .unwrap_or_else(|| string_scalar(&name, &child));
+        format!("? {key}\n{STEP}:")
+    }
+}
+
+/// One record as an item of the document's sequence; `keys` are the header's [`key_text`]s.
+fn write_row(out: &mut String, keys: &[String], record: &[Vec<u8>], auto_parse: bool) {
+    let child = STEP.repeat(2);
+    for (n, (key, cell)) in keys.iter().zip(record).enumerate() {
         out.push_str(if n == 0 { "- " } else { STEP });
-        let name = String::from_utf8_lossy(name);
+        out.push_str(key);
         let cell = String::from_utf8_lossy(cell);
-        if go_yaml_key_is_simple(&name) {
-            out.push_str(&string_scalar(&name, &child));
-            out.push(':');
-        } else {
-            // go-yaml's `? ` explicit key, for a key with a line break or over 128 bytes.
-            out.push_str("? ");
-            out.push_str(
-                &go_yaml_explicit_key_scalar(&name, &child, STEP.len())
-                    .unwrap_or_else(|| string_scalar(&name, &child)),
-            );
-            out.push('\n');
-            out.push_str(STEP);
-            out.push(':');
-        }
         match classify(&cell, auto_parse) {
             Cell::Empty => {}
             Cell::Str(s) => {

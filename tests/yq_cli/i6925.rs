@@ -626,6 +626,7 @@ const CSV_ROWS: &[Row] = &[
     ("csv", "k\n1\n01\n0x1f\n[1]\na: b\nyes\n2001-01-01\n true\n", &["-o", "json", "-I0", "--csv-auto-parse=false"], ".", "[{\"k\":1},{\"k\":1},{\"k\":31},{\"k\":\"[1]\"},{\"k\":\"a: b\"},{\"k\":\"yes\"},{\"k\":\"2001-01-01\"},{\"k\":\" true\"}]\n", "", 0),
     ("csv", "k\n1\n01\n0x1f\n[1]\na: b\nyes\n2001-01-01\n true\n", &["-o", "yaml", "--csv-auto-parse=false"], ".", "- k: 1\n- k: 01\n- k: 0x1f\n- k: '[1]'\n- k: 'a: b'\n- k: yes\n- k: 2001-01-01\n- k: ' true'\n", "", 0),
     ("csv", "a,b\n1,2\n", &["-o", "json", "-I0", "--tsv-auto-parse=false"], ".", "[{\"a\":1,\"b\":2}]\n", "", 0),
+    ("csv", "k\n\u{a0}5\n5\u{a0}\ntrue\u{a0}\n", &["-o", "json", "-I0"], ".", "[{\"k\":\"\u{a0}5\"},{\"k\":\"5\u{a0}\"},{\"k\":\"true\u{a0}\"}]\n", "", 0),
     ("tsv", "name\tage\nAlice\t30\n\"q\tr\"\t[1]\n", &["-o", "json", "-I0"], ".", "[{\"name\":\"Alice\",\"age\":30},{\"name\":\"q\\tr\",\"age\":[1]}]\n", "", 0),
     ("tsv", "name\tage\nAlice\t30\n\"q\tr\"\t[1]\n", &["-o", "json", "-I0", "--tsv-auto-parse=false"], ".", "[{\"name\":\"Alice\",\"age\":30},{\"name\":\"q\\tr\",\"age\":\"[1]\"}]\n", "", 0),
     ("tsv", "a,b\tc\n1,2\t3\n", &["-o", "yaml"], ".", "- a,b: 1,2\n  c: 3\n", "", 0),

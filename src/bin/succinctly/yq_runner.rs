@@ -12273,10 +12273,6 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         args.properties_array_brackets,
         std::sync::atomic::Ordering::SeqCst,
     );
-    // A separator that is not one byte is refused below, before anything is read.
-    if let [byte] = args.csv_separator.as_bytes() {
-        CSV_SEPARATOR.store(*byte, std::sync::atomic::Ordering::SeqCst);
-    }
     CSV_AUTO_PARSE.store(args.csv_auto_parse, std::sync::atomic::Ordering::SeqCst);
     TSV_AUTO_PARSE.store(args.tsv_auto_parse, std::sync::atomic::Ordering::SeqCst);
 
@@ -12292,7 +12288,8 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             other.len()
         ),
     };
-    // #6922: yq's `@props` and `@csv` operators read the same flags as `-o=props` and `-o=csv`.
+    CSV_SEPARATOR.store(csv_separator as u8, std::sync::atomic::Ordering::SeqCst); // #6925
+                                                                                   // #6922: yq's `@props` and `@csv` operators read the same flags as `-o=props` and `-o=csv`.
     jq::set_yq_encoder_prefs(jq::YqEncoderPrefs {
         properties_separator: args.properties_separator.clone(),
         properties_array_brackets: args.properties_array_brackets,
