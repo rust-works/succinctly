@@ -7764,3 +7764,21 @@ Two things still differ, because yq has the raw bytes and this has the substitut
 - YAML output prints the substitutes, where yq prints the raw bytes for a document that is the string itself and refuses a nested one with `yaml: cannot marshal invalid UTF-8 data as !!str`.
 
 Matching either needs a string that can hold bytes that are not UTF-8, or the substitution moved to the JSON encoder, as the `-p json` reader does with `-o json` only.
+
+## The argument-level flags of [#7025](https://github.com/rust-works/succinctly/issues/7025) answer as yq does, with these differences
+
+`--expression`, `--split-exp-file`, `-f`, `-v`/`--verbose`, `--security-disable-env-ops` and `--security-disable-file-ops` are yq's, and `tests/yq_cli/i7025.rs` pins the rows captured from yq v4.53.3.
+[#7025](https://github.com/rust-works/succinctly/issues/7025) stays open for `--string-interpolation`, `--security-enable-system-operator` and `system`, `-c`, `--header-preprocess=false`, `--yaml-fix-merge-anchor-to-spec` and `--debug-node-info`.
+
+- **`--security-disable-env-ops` and `--security-disable-file-ops` refuse an operator when it runs, where yq refuses it when its handler is called.**
+  `select(false) | strenv(X)`, `.zz[] | strenv(X)` and `.a | select(. == 2) | strenv(X)` fail with `env operations have been disabled` in yq, because the handler is called with an empty context.
+  Here they print nothing and exit 0, since no value reaches the operator and nothing reads the environment.
+  The operators that yq does not call (`.a // strenv(X)` with a truthy `.a`, `map(strenv(X))` over an empty list, `with(select(false); strenv(X))`) agree.
+- **The env flag also refuses the environment readers yq has no token for.**
+  Under `--jq-extensions`, `$ENV`, `env` and `env.X` read the environment, and `--security-disable-env-ops` refuses them with the same message.
+- **`-v` writes no debug log.**
+  yq writes `time=... level=DEBUG ...` lines to stderr; standard output is the same either way.
+  `--verbose=false` is refused here (a flag takes no value) and accepted by yq.
+- **A missing `--split-exp-file` is worded differently.**
+  yq says `Error: open nope.exp: no such file or directory`; this says `failed to read split expression file: nope.exp`, with the cause.
+  Both exit 1 and write nothing.

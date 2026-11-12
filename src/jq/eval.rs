@@ -28460,6 +28460,9 @@ fn builtin_envsubst<W: Clone + AsRef<[u64]>>(
     flags: super::envsubst::EnvsubstFlags,
     optional: bool,
 ) -> QueryResult<'_, W> {
+    if let Some(refusal) = super::eval_generic::env_ops_refusal() {
+        return QueryResult::Error(EvalError::new(refusal));
+    }
     let text = match &value {
         StandardJson::String(s) => match s.as_str() {
             Ok(cow) => cow.into_owned(),
@@ -45711,6 +45714,30 @@ pub fn enter_file_names_scope(names: Vec<String>) -> FileNamesScope {
 
 /// The scope [`enter_file_names_scope`] opens; dropping it closes the scope.
 pub struct FileNamesScope(#[allow(dead_code)] super::eval_generic::FileNamesGuard);
+
+/// Refuse the environment and file operators until the returned guard is dropped (#7025).
+///
+/// `disable_env_ops` refuses `env(..)`, `strenv(..)` and `envsubst`, and `disable_file_ops` refuses
+/// `load`, `load_str` and `load_base64`: yq's `--security-disable-env-ops` and
+/// `--security-disable-file-ops`.
+///
+/// The refusal is raised when the operator runs, as an error named `env operations have been
+/// disabled` or `file operations have been disabled`, and `?` does not swallow it. yq also raises
+/// it for an operator no node reaches (`select(false) | strenv(X)`), which this does not.
+///
+/// The setting belongs to the calling thread, as the file-names table does: the CLI evaluates on
+/// one thread, and a caller that moves evaluation to another must enter the scope there, or the
+/// operators run unrefused.
+#[must_use = "the scope ends when the guard is dropped"]
+pub fn enter_security_scope(disable_env_ops: bool, disable_file_ops: bool) -> SecurityScope {
+    SecurityScope(super::eval_generic::enter_security(
+        disable_env_ops,
+        disable_file_ops,
+    ))
+}
+
+/// The scope [`enter_security_scope`] opens; dropping it closes the scope.
+pub struct SecurityScope(#[allow(dead_code)] super::eval_generic::SecurityGuard);
 
 /// The scope [`enter_file_index_scope`] opens; dropping it closes the scope.
 pub struct FileIndexScope(#[allow(dead_code)] super::eval_generic::NodeOriginGuard);
@@ -109514,6 +109541,9 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    if let Some(refusal) = super::eval_generic::file_ops_refusal() {
+        return QueryResult::Error(EvalError::new(refusal));
+    }
     if S::TAG == EvalTag::Yq {
         let (names, trailing) =
             stream_outputs::<_, S>(eval_single::<W, S>(file_expr, value, optional));
@@ -112229,6 +112259,9 @@ fn environment_object_in(snapshot: bool) -> OwnedValue {
 /// $ENV expression - returns object of all environment variables
 #[cfg(feature = "std")]
 fn eval_env<'a, W: Clone + AsRef<[u64]>>(_optional: bool) -> QueryResult<'a, W> {
+    if let Some(refusal) = super::eval_generic::env_ops_refusal() {
+        return QueryResult::Error(EvalError::new(refusal));
+    }
     QueryResult::Owned(environment_object())
 }
 
@@ -112259,6 +112292,9 @@ fn builtin_env<W: Clone + AsRef<[u64]>>(
     _value: StandardJson<'_, W>,
     _optional: bool,
 ) -> QueryResult<'_, W> {
+    if let Some(refusal) = super::eval_generic::env_ops_refusal() {
+        return QueryResult::Error(EvalError::new(refusal));
+    }
     QueryResult::Owned(environment_object())
 }
 
@@ -112278,6 +112314,9 @@ fn builtin_envvar<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    if let Some(refusal) = super::eval_generic::env_ops_refusal() {
+        return QueryResult::Error(EvalError::new(refusal));
+    }
     // Evaluate the expression to get the variable name
     //
     // #1820: to_owned, not to_owned_lossy -- `value` (`.`, the binding
@@ -112354,6 +112393,9 @@ fn builtin_env_object<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     name: &str,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    if let Some(refusal) = super::eval_generic::env_ops_refusal() {
+        return QueryResult::Error(EvalError::new(refusal));
+    }
     match std::env::var(name) {
         Ok(val) if S::TAG == EvalTag::Yq => {
             if val.is_empty() {
@@ -112396,6 +112438,9 @@ fn builtin_strenv<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     name: &str,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    if let Some(refusal) = super::eval_generic::env_ops_refusal() {
+        return QueryResult::Error(EvalError::new(refusal));
+    }
     match std::env::var(name) {
         Ok(val) => QueryResult::Owned(OwnedValue::String(val.into())),
         Err(std::env::VarError::NotPresent) if S::TAG == EvalTag::Yq => {
