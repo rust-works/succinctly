@@ -167409,33 +167409,44 @@ mod tests {
     /// value walker, the path walker and a write through it; the same chain with
     /// 9,000 elements (9,301 nodes) is under it. Both are run fully native and
     /// fully queued.
+    ///
+    /// On the CLI's stack, as [`on_big_stack_3997`] runs its walk: the write over the 300-deep
+    /// chain (the `|=` row, in the fully queued run as much as the native one) recurses once per
+    /// level, and a debug build's frame for it takes about 1.9 MB of a test thread's 2 MiB before
+    /// #6659 and just over it after, where every arm that binds an array pays its wider handle on
+    /// an aarch64 Linux runner. The overrides are thread-locals, so the whole body runs there.
     #[test]
+    #[cfg(feature = "std")]
     fn recurse_cap_in_the_queued_walk_5378() {
-        let _cap = recurse_cap_override::scoped(10_000);
-        for levels in [0, u32::MAX] {
-            for walk in [
-                "[recurse(.[]? | .; true)] | length",
-                "[path(recurse(.[]? | .; true))] | length",
-                r#"(recurse(.[]? | .; true) | select(type == "number")) |= . + 1"#,
-            ] {
-                let filter = format!("reduce range(300) as $i ([range(10001)]; [.]) | {walk}");
-                let (values, end) = recurse_native_levels_override::with(levels, || {
-                    outputs_and_end(b"null", &filter)
-                });
-                assert!(values.is_empty(), "`{filter}` ({levels}): {values:?}");
-                assert!(
-                    end.contains("maximum nodes exceeded"),
-                    "`{filter}` ({levels}): {end}"
+        on_big_stack_3997(|| {
+            let _cap = recurse_cap_override::scoped(10_000);
+            for levels in [0, u32::MAX] {
+                for walk in [
+                    "[recurse(.[]? | .; true)] | length",
+                    "[path(recurse(.[]? | .; true))] | length",
+                    r#"(recurse(.[]? | .; true) | select(type == "number")) |= . + 1"#,
+                ] {
+                    let filter = format!("reduce range(300) as $i ([range(10001)]; [.]) | {walk}");
+                    let (values, end) = recurse_native_levels_override::with(levels, || {
+                        outputs_and_end(b"null", &filter)
+                    });
+                    assert!(values.is_empty(), "`{filter}` ({levels}): {values:?}");
+                    assert!(
+                        end.contains("maximum nodes exceeded"),
+                        "`{filter}` ({levels}): {end}"
+                    );
+                }
+                let under =
+                    "reduce range(300) as $i ([range(9000)]; [.]) | [recurse(.[]? | .; true)] | length";
+                assert_eq!(
+                    recurse_native_levels_override::with(levels, || outputs_and_end(
+                        b"null", under
+                    )),
+                    (vec!["9301".to_string()], String::new()),
+                    "({levels} native levels)"
                 );
             }
-            let under =
-                "reduce range(300) as $i ([range(9000)]; [.]) | [recurse(.[]? | .; true)] | length";
-            assert_eq!(
-                recurse_native_levels_override::with(levels, || outputs_and_end(b"null", under)),
-                (vec!["9301".to_string()], String::new()),
-                "({levels} native levels)"
-            );
-        }
+        });
     }
 
     /// #5378: a node of a capped walk also costs by its own size, so a node that
