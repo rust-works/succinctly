@@ -6,7 +6,10 @@ use crate::run_yq_stdin;
 
 /// (key, yq's `-o=shell` name for it, with the value `1`).
 const ROWS: &[(&str, &str)] = &[
-    ("effort_expeñded_tò_preserve_accented_latin_letters", "effort_expended_to_preserve_accented_latin_letters"),
+    (
+        "effort_expeñded_tò_preserve_accented_latin_letters",
+        "effort_expended_to_preserve_accented_latin_letters",
+    ),
     ("é", "e"),
     ("ñandú", "nandu"),
     ("straße", "strae"),
