@@ -111,6 +111,9 @@ pub struct YamlIndex<W = Vec<u64>> {
     ///
     /// Also read by [`Self::may_have_merge_keys`]: a JSON-sourced index has no merge key (#3600).
     canonicalize_numbers: bool,
+    /// The text is a transcode of a format whose nodes carry no style (#7031): `-p props`, whose
+    /// values yq quotes only as its encoder needs. See [`Self::mark_style_less`].
+    style_less: bool,
     /// Whether the leading header the first document re-emits verbatim
     /// (#2795; `YamlCursor::stream_yaml_as_document`) keeps its `---`
     /// lines. On by default; real yq's `-N` drops them along with every
@@ -288,6 +291,7 @@ impl YamlIndex<Vec<u64>> {
             comments: semi.comments,
             lines: OnceCell::new(),
             canonicalize_numbers: false,
+            style_less: false,
             header_doc_markers: true,
             merge_rendering_aliases_only: false,
             synthesized_empty: false,
@@ -369,6 +373,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             has_line_comments: false,
             lines: OnceCell::new(),
             canonicalize_numbers: false,
+            style_less: false,
             header_doc_markers: true,
             merge_rendering_aliases_only: false,
             synthesized_empty: false,
@@ -440,6 +445,21 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     /// streaming through any [`YamlCursor`] derived from it.
     pub fn mark_json_sourced(&mut self) {
         self.canonicalize_numbers = true;
+    }
+
+    /// Marks this index's text as a transcode of a format whose nodes have no style (#7031): the
+    /// YAML text `-p props` reads a properties file as. yq's properties decoder makes every value a
+    /// style-less node, so its encoder picks the quoting at print time, where the text records the
+    /// quoting the transcode chose (`a: "1"`). Every node's `style` then reads `""`, so a write
+    /// prints its result as yq's encoder would. Call once right after `build`.
+    pub fn mark_style_less(&mut self) {
+        self.style_less = true;
+    }
+
+    /// Whether [`Self::mark_style_less`] was called on this index.
+    #[inline]
+    pub(crate) fn style_less(&self) -> bool {
+        self.style_less
     }
 
     /// Whether [`Self::mark_json_sourced`] was called on this index.

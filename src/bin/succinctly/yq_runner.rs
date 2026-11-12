@@ -1307,11 +1307,17 @@ fn build_yq_source(
     bytes: &[u8],
     had_bom: bool,
 ) -> Result<YamlIndex<Vec<u64>>, succinctly::yaml::YamlError> {
-    if had_bom {
+    let mut index = if had_bom {
         YamlIndex::build_yq_after_bom(bytes)
     } else {
         YamlIndex::build_yq(bytes)
+    }?;
+    // #7031: the text a `-p props` run reads records the quoting its transcode chose, where yq's
+    // properties nodes have none.
+    if transcoded_input() == Some(TranscodedInput::Props) {
+        index.mark_style_less();
     }
+    Ok(index)
 }
 
 /// `bytes` and `had_bom` for a source the streaming routes index (#5357). With no header, a text
