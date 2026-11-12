@@ -1462,6 +1462,32 @@ fn merge_tree(
             return None;
         }
     }
+    // #7070: a scalar appended to a sequence (`.a + "z"`, `.a += 5`) takes the quote style of the
+    // sequence's first element, as yq copies that node's `Style` onto the new one: `['x']` and `"z"`
+    // is `['x', 'z']`, `[x, 'y']` and `"z"` is `[x, 'y', z]`, `['x']` and `5` is `['x', '5']`.
+    // Another style (a block scalar, a flow collection) is not copied.
+    if let (OwnedValue::Array(l), OwnedValue::Array(out)) = (lv, result) {
+        if !deep
+            && !l.is_empty()
+            && out.len() == l.len() + 1
+            && !matches!(
+                rv,
+                OwnedValue::Array(_) | OwnedValue::Object(_) | OwnedValue::Null
+            )
+        {
+            let style = lt.at_index(0).style();
+            let appended = if matches!(style, "single" | "double") {
+                CommentTree::leaf(NodeMeta::from_comment_and_style(None, style))
+            } else {
+                rt.clone()
+            };
+            let children = (0..l.len())
+                .map(|i| lt.at_index(i).clone())
+                .chain(core::iter::once(appended))
+                .collect();
+            return Some(CommentTree::array(lt.meta().clone(), children));
+        }
+    }
     if let (OwnedValue::Object(l), OwnedValue::Object(r), OwnedValue::Object(out)) =
         (lv, rv, result)
     {
