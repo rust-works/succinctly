@@ -912,6 +912,9 @@ struct OutputConfig {
     sort_keys: bool,
     no_doc: bool,
     indent_str: String,
+    /// `-c`: a block sequence under a mapping key is indented by the step less two columns
+    /// (#7025).
+    compact_seq_indent: bool,
     use_color: bool,
     /// A JSON-sourced float never keeps a decimal point in output,
     /// computed or not, `-o=json` or `-o=yaml`, compact or pretty (#978,
@@ -975,6 +978,7 @@ impl OutputConfig {
             sort_keys: args.sort_keys,
             no_doc: args.no_doc,
             indent_str,
+            compact_seq_indent: args.yaml_compact_seq_indent,
             use_color,
             json_sourced_floats: false,
         }
@@ -1044,6 +1048,7 @@ impl OutputConfig {
             sort_keys: self.sort_keys,
             no_doc: self.no_doc,
             indent_str: Self::compute_indent_str(args, output_format),
+            compact_seq_indent: self.compact_seq_indent,
             use_color: self.use_color,
             json_sourced_floats: input_format == InputFormat::Json,
         }
@@ -10969,7 +10974,22 @@ fn emit_yaml_value_at_depth(
                         let kc = key_comments_of(comments, *live);
                         // #1485/#1881: rounded up from the field's own
                         // column -- see `compact_child_indent`.
+                        //
+                        // #7025 (`-c`): a block sequence under a key sits two columns left of
+                        // where the default puts it: at that column less two, whatever column the
+                        // key is at (measured against yq at `-I 2`, 3, 4 and 6 over ten nestings
+                        // of mappings and sequences).
                         let val_indent = compact_child_indent(indent, &config.indent_str);
+                        // `--tab` is succinctly's own flag (yq has none), so there is nothing to
+                        // compare a compact tab layout with: it stays as it was.
+                        let compact_here = config.compact_seq_indent
+                            && !config.indent_str.starts_with('\t')
+                            && matches!(v, OwnedValue::Array(a) if !a.is_empty());
+                        let val_indent = if compact_here {
+                            val_indent[..val_indent.len().saturating_sub(2)].to_string()
+                        } else {
+                            val_indent
+                        };
                         // #3587: a key go-yaml cannot write as a simple key (a line break, over
                         // 128 bytes) is `? key` and the `:` on a line of its own at the
                         // mapping's column. A key with no style, anchor or tag of its own (JSON
@@ -11138,11 +11158,24 @@ fn emit_yaml_value_at_depth(
                             field_comments.meta().head_comment(),
                             indent,
                         );
-                        append_foot_comment_lines(
+                        let (rendered, had_foot) = append_foot_comment_lines(
                             rendered,
                             field_comments.meta().foot_comment(),
                             indent,
-                        )
+                        );
+                        // #7025 (`-c` at `-I 2`): the foot comment of the sequence's last item is
+                        // written at the key's own column, where yq puts a blank line before the
+                        // next entry, as it does after an entry's own foot.
+                        let compact_foot = compact_here
+                            && val_indent.len() == indent.len()
+                            && matches!(v, OwnedValue::Array(a)
+                                if field_comments.style() != "flow"
+                                    && !field_comments
+                                        .at_index(a.len() - 1)
+                                        .meta()
+                                        .foot_comment()
+                                        .is_empty());
+                        (rendered, had_foot || compact_foot)
                     })
                     .collect();
                 join_block_entries(items)
@@ -12790,7 +12823,11 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     // `colorize_yaml`/`colorize_json` re-lexers as it is written (#808),
     // rather than falling back to the DOM/IndexMap path that would collapse
     // duplicate mapping keys (#442, #748, #809).
-    let can_stream_pretty_or_colored = !args.pretty_print;
+    // `-c` (#7025) is written by the DOM emitter alone: none of the cursor streamers knows a
+    // sequence indented by less than a whole step, so a `-c` run builds the document where the
+    // same filter streams it. The name says what the gate was written for; this is the second
+    // flag that keeps a run off the streamers.
+    let can_stream_pretty_or_colored = !args.pretty_print && !args.yaml_compact_seq_indent;
     // `--ascii-output` no longer appears here (#1700). It used to gate the
     // whole disjunction (#1693) because no M2 JSON streamer could escape
     // non-ASCII, leaving the DOM path (`output_value`) as the only correct
@@ -15951,6 +15988,7 @@ mod tests {
             sort_keys: false,
             no_doc: false,
             indent_str: String::new(),
+            compact_seq_indent: false,
             use_color: false,
             json_sourced_floats: false,
         };
@@ -16068,6 +16106,7 @@ mod tests {
             sort_keys: false,
             no_doc: false,
             indent_str: "  ".to_string(),
+            compact_seq_indent: false,
             use_color: false,
             json_sourced_floats: false,
         };
@@ -16526,6 +16565,7 @@ mod tests {
             sort_keys: false,
             no_doc: false,
             indent_str: "  ".to_string(),
+            compact_seq_indent: false,
             use_color: false,
             json_sourced_floats: false,
         }
@@ -16697,6 +16737,7 @@ mod tests {
             sort_keys: false,
             no_doc: false,
             indent_str: String::new(),
+            compact_seq_indent: false,
             use_color: false,
             json_sourced_floats: false,
         };
@@ -16754,6 +16795,7 @@ mod tests {
             sort_keys: false,
             no_doc: false,
             indent_str: String::new(),
+            compact_seq_indent: false,
             use_color: false,
             json_sourced_floats: false,
         };
@@ -18066,6 +18108,7 @@ mod tests {
             sort_keys: false,
             no_doc: false,
             indent_str: "  ".to_string(),
+            compact_seq_indent: false,
             use_color: false,
             json_sourced_floats: false,
         };
