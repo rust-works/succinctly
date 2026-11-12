@@ -7420,6 +7420,36 @@ Time, from `scripts/ab-cli.py` (interleaved, 11 repetitions, `-c`, output and ex
   The 1 MiB rows read +0.3% to +7.2% on x86_64 in the last run (+1.4% to +5.4% in earlier ones) and −0.6% to +1.8% on aarch64.
   cachegrind counts +59,053 instructions in 108 to 204 million (+0.03% to +0.055%) there, a constant that is not the 0.3 ms the x86_64 time moved, so that is where the code landed in the binary.
 
+Several files (#7024), peak resident set size in MiB for `-c .` at 100 MiB of NDJSON (993,416 records), `/usr/bin/time` (`-f %M` on the 7950X, `-l` on the M4 Pro, whose figures are the process's own and so below the 13 MiB floor the `wait4` figures above give):
+
+| machine           | files                                  | before | after |
+|-------------------|----------------------------------------|-------:|------:|
+| AMD Ryzen 9 7950X | one file (the route of #6920)          |   10.8 |  10.0 |
+| AMD Ryzen 9 7950X | the same 100 MiB file twice            |  225.4 |  10.2 |
+| AMD Ryzen 9 7950X | two halves, cut at a line start        |  117.4 |  10.2 |
+| AMD Ryzen 9 7950X | four files, cut inside a record        |  113.1 |  10.2 |
+| AMD Ryzen 9 7950X | 32 files                               |  110.0 |  10.1 |
+| Apple M4 Pro      | one file (the route of #6920)          |    6.6 |   6.7 |
+| Apple M4 Pro      | the same 100 MiB file twice            |  255.0 |   6.7 |
+| Apple M4 Pro      | two halves, cut at a line start        |  131.2 |   6.8 |
+| Apple M4 Pro      | four files, cut inside a record        |  119.4 |   7.8 |
+| Apple M4 Pro      | 32 files                               |  106.8 |   7.8 |
+
+The same file twice is flat from 10 MiB to 100 MiB: 31.1, 117.5 and 225.4 before and 10.1, 10.2 and 10.2 after on the 7950X (26.9, 131.2 and 255.0 before and 6.7 throughout on the M4 Pro), and `.name` and `select(.score>50)` over it read 225.9 and 227.1 before and 10.7 and 11.8 after.
+Both are release builds with `--features cli` of `main` @ `8f2175b5c` and the same plus #7024, on `terminus` and `johns-mac-mini`, each checked for a running benchmark first.
+
+Time, from an interleaved driver (the two binaries alternate within each repetition, 5 to 15 repetitions, medians, the output of every run gated on identity), against a control (the baseline binary against a copy of itself) that read −0.5% to +0.7% on x86_64 and −0.7% to +0.4% on aarch64:
+
+- **x86_64:** at 100 MiB, the same file twice reads −9.1% (`.`), −9.9% (`.name`) and −7.9% (`select`); two halves −10.3%, four files −12.2% and 32 files −11.6%; at 10 MiB −8.0% to −10.2%.
+- **aarch64:** at 100 MiB, the same file twice reads −1.8%, −1.9% and −1.5%; two halves −2.5%, four files −5.5% and 32 files −4.2%.
+- **One file** (not this change's route) reads −3.2% to −5.8% on x86_64 and +0.1% to +0.6% on aarch64 (15 repetitions at 100 MiB); the x86_64 movement is not explained by the change and is quoted as measured.
+- **One document** that no window can help: a 120 MB single line reads −6.4% on x86_64 and +1.6% on aarch64, and a pretty-printed 60 MB one −5.4% and 0.0%.
+  A first version counted the position at the end of every file's last window to seed the next, which a lone file never reads, and read the single line +13% slower; it is counted only when a file follows.
+- **A document that spans files** (a 12.5 MiB pretty-printed array cut at 15 byte offsets into 16 files) is held whole as a document bigger than a window is: 137.8 MiB before and 38.0 after on x86_64, 232.9 and 127.2 on aarch64, and −29.3% and −19.1% in time.
+- **64 files** of 10 MiB in all read 0.09 s against the whole-file route's 0.05 on the 7950X, because the descriptor table doubled at 64 slots: it waits for an RCU grace period when the process has a second thread, 35 ms for each doubling.
+  The second read of the stream now shares the reader's descriptor instead of duplicating it, and a list is capped at 32 files, which leaves the table alone (32 files of 10 MiB read −10.2%).
+- **Correctness**, from `scripts/jq-windowed-file-fuzz.py --files K` (random streams of 4.3 to 7.5 MiB cut at random bytes into K files, compared with the same files given as `/dev/fd/N`, which the route declines): 1,800 cases for K = 1, 2, 5, 12 and 32 on the 7950X and 250 for K = 3 and 9 on the M4 Pro, no difference.
+
 What the windowed route does not cover, and which still hold the input:
 
 - a pipe or a terminal on standard input (a fault cannot be worded by reading them again), more than 32 files, and a list of files with a path that is not a regular file, that does not open, or that is the run's own standard output or error: #7024;
