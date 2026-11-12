@@ -116661,17 +116661,30 @@ fn tail_step<'e, 'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 cond,
                 then_branch,
                 else_branch,
-            } if stage_settles(cond, jq) => match tail_one::<W, S>(cond, cur, optional) {
-                Ok(Some(c)) => {
-                    let truthy = match &c {
-                        TailValue::Borrowed(v) => json_is_truthy(v),
-                        TailValue::Owned(v) => v.is_truthy(),
-                    };
-                    expr = if truthy { then_branch } else { else_branch };
-                }
-                Ok(None) => return Tail::Done(Flow::Exhausted),
-                Err(flow) => return Tail::Done(flow),
-            },
+            } if stage_settles(cond, jq) => {
+                // A condition over a value the loop built is settled from its tree when the
+                // pure grammar can (`length > 10`), as an `until`/`while` condition is (#3697):
+                // through the bridge each round wrote the whole state out as JSON and indexed it
+                // to read one count, so `def f: if length > 10 then .[1:] | f else . end` was
+                // quadratic (#6659). A verdict is a boolean and carries no node; a condition the
+                // grammar declines, and a `?`-suppressed one, keeps the evaluator's route. jq
+                // mode: a yq condition reads an absent key by its own rules (#6130).
+                let verdict = match cur {
+                    TailValue::Owned(v) if jq => owned_cond_verdict::<S>(cond, v, optional),
+                    _ => None,
+                };
+                let truthy = match verdict {
+                    Some(Ok(truthy)) => truthy,
+                    Some(Err(error)) => return Tail::Done(Flow::Escaped(Control::Error(error))),
+                    None => match tail_one::<W, S>(cond, cur, optional) {
+                        Ok(Some(TailValue::Borrowed(v))) => json_is_truthy(&v),
+                        Ok(Some(TailValue::Owned(v))) => v.is_truthy(),
+                        Ok(None) => return Tail::Done(Flow::Exhausted),
+                        Err(flow) => return Tail::Done(flow),
+                    },
+                };
+                expr = if truthy { then_branch } else { else_branch };
+            }
             // `src as $x | body`: the body is rebuilt with the one value of `src` in
             // place of `$x`, and the walk goes on in it over the same input. A node of
             // the document is bound as `each_as` binds it, with its origin and its
