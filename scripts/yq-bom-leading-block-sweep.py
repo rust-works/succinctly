@@ -13,7 +13,8 @@ the pinned `yq` and through `succinctly yq`: 4,320 runs, a few minutes.
 With a second binary (a build of `main`) each difference is classed: `fixed` (base differed, TARGET matches),
 `REGRESSION` (base matched, TARGET differs: the line that fails the run), `both` (neither matches, and they
 differ from each other) and `unchanged`. `SHOW=n` prints the first n differences (default 40). Exit 1 on a
-regression. Standard library only; run under `.ai/scratch/memcap.py` like any other run of succinctly.
+regression. Standard library only. Every run is of a few lines of text, so memory is not at risk, but a
+hung one is cut off after 30 s; run it under `.ai/scratch/memcap.py --cap-mb 4000 --` like any other run of succinctly.
 """
 import itertools, os, subprocess, sys, tempfile
 BIN = sys.argv[1]
@@ -24,7 +25,11 @@ PIECES = {"C": "# c%d\n", "B": "\n", "M": "---\n"}
 BODIES = {"map": "a: 1\n", "map1": "a: 1 # one\n", "nested": "a:\n  b: 1\n", "seq": "- 1\n", "scalar": "5\n", "flow": "{a: 1}\n"}
 TAILS = {"": "", "doc2": "---\n# t1\n\n# t2\nb: 2\n", "footc": "# f1\n"}
 def run(cmd, path):
-    p = subprocess.run(cmd + [path], capture_output=True, timeout=30)
+    """stdout, the start of stderr and the exit status; a run that hangs is reported as one that did."""
+    try:
+        p = subprocess.run(cmd + [path], capture_output=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return b"<timed out after 30s>", -9
     return p.stdout + b"|" + p.stderr[:200], p.returncode
 total = diff = 0
 counts = {}
@@ -42,7 +47,8 @@ with tempfile.TemporaryDirectory() as d:
             for bname, body in BODIES.items():
                 for tname, tail in TAILS.items():
                     text = "\ufeff".encode() + (lead + body + tail).encode()
-                    open(path, "wb").write(text)
+                    with open(path, "wb") as handle:
+                        handle.write(text)
                     for label, args in (("F", ["-o=json", "-I0", F]), ("dot", ["."]), ("props", ["-o=props", "."])):
                         a = run([YQ] + args, path); b = run([BIN, "yq"] + args, path)
                         total += 1

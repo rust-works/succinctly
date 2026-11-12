@@ -183,6 +183,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             self.text,
             self.index.get_head_comments(bp),
             self.header_end(),
+            self.index.after_bom(),
         )
     }
 
@@ -674,7 +675,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         for line in gap.split(|&b| b == b'\n') {
             let blank = line.iter().all(|b| matches!(b, b' ' | b'\t' | b'\r'));
             if !blank {
-                if marker.is_some() || !line.starts_with(b"---") {
+                if marker.is_some() || !is_marker_line(line) {
                     return false;
                 }
                 marker = Some(at);
@@ -8992,7 +8993,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
                 return lines;
             }
         }
-        let mut lines = head_comment_lines_with_blanks(self.text, ranges);
+        let mut lines = head_comment_lines_with_blanks(self.text, ranges, self.index.after_bom());
         // #4093: the blank lines between the block and a node at column 0 are kept by
         // yq (an indented node drops them, and so does a block that itself follows a
         // blank line: yq then reads it as the previous node's foot), and are the block's
@@ -10924,6 +10925,45 @@ fn header_head_lines(header: &[u8], synthesized: bool, force: bool) -> Option<Ve
     Some(out)
 }
 
+/// Whether `line`, without its line break, is a `---` document marker: the three dashes, then nothing or a
+/// blank (as the parser reads one, `Parser::marker_prefix`).
+fn is_marker_line(line: &[u8]) -> bool {
+    line.starts_with(b"---") && matches!(line.get(3), None | Some(b' ' | b'\t' | b'\r'))
+}
+
+/// Whether a line of `text` is a `---` marker.
+fn text_has_marker_line(text: &[u8]) -> bool {
+    text.split(|&b| b == b'\n').any(is_marker_line)
+}
+
+/// [`blank_line_between`] for two lines of one head comment. With `cut_at_marker` (the text is behind a
+/// byte-order mark, #7084) the gap is cut where a `---` marker line starts: the block above the first
+/// document's marker and the one under it are one head there, and yq drops the blank lines after the
+/// marker where it keeps those before it.
+fn blank_line_between_head_lines(text: &[u8], from: usize, to: usize, cut_at_marker: bool) -> bool {
+    let mut upto = to;
+    let mut at = from;
+    while cut_at_marker && at < to {
+        let Some(offset) = text[at..to].iter().position(|&b| b == b'\n') else {
+            break;
+        };
+        let line = at + offset + 1;
+        if line >= to {
+            break;
+        }
+        let line_end = text[line..to]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(to, |n| line + n);
+        if is_marker_line(&text[line..line_end]) {
+            upto = line;
+            break;
+        }
+        at = line;
+    }
+    blank_line_between(text, from, upto)
+}
+
 /// Build a node's standalone head comment lines as owned strings, inserting
 /// an empty (`""`) entry wherever [`blank_line_between`] finds a blank line
 /// separating two lines of the block -- the DOM route's own analogue of
@@ -10943,42 +10983,11 @@ fn header_head_lines(header: &[u8], synthesized: bool, force: bool) -> Option<Ve
 /// streaming-only, a separate documented gap), so it has nothing to skip --
 /// every head line, including the first document's leading block, goes
 /// through this same structured path.
-/// Whether a line of `text` is a `---` marker.
-fn text_has_marker_line(text: &[u8]) -> bool {
-    text.split(|&b| b == b'\n').any(|line| {
-        line.starts_with(b"---") && line[3..].iter().all(|b| matches!(b, b' ' | b'\t' | b'\r'))
-    })
-}
-
-/// [`blank_line_between`] for two lines of one head comment, with the gap cut where a `---` marker line
-/// starts (#7084): behind a byte-order mark the block above the first document's marker and the one under
-/// it are one head, and yq drops the blank lines after the marker where it keeps those before it.
-fn blank_line_between_head_lines(text: &[u8], from: usize, to: usize) -> bool {
-    let mut upto = to;
-    let mut at = from;
-    while at < to {
-        let Some(offset) = text[at..to].iter().position(|&b| b == b'\n') else {
-            break;
-        };
-        let line = at + offset + 1;
-        if line >= to {
-            break;
-        }
-        if text[line..to].starts_with(b"---")
-            && matches!(
-                text.get(line + 3),
-                None | Some(b'\n' | b'\r' | b' ' | b'\t')
-            )
-        {
-            upto = line;
-            break;
-        }
-        at = line;
-    }
-    blank_line_between(text, from, upto)
-}
-
-fn head_comment_lines_with_blanks(text: &[u8], ranges: &[(u32, u32)]) -> Vec<String> {
+fn head_comment_lines_with_blanks(
+    text: &[u8],
+    ranges: &[(u32, u32)],
+    cut_at_marker: bool,
+) -> Vec<String> {
     let mut out = Vec::with_capacity(ranges.len());
     let mut prev_end: Option<usize> = None;
     for &(start, end) in ranges {
@@ -10994,7 +11003,7 @@ fn head_comment_lines_with_blanks(text: &[u8], ranges: &[(u32, u32)]) -> Vec<Str
             continue;
         };
         if let Some(pe) = prev_end {
-            if blank_line_between_head_lines(text, pe, start) {
+            if blank_line_between_head_lines(text, pe, start, cut_at_marker) {
                 out.push(String::new());
             }
         }
@@ -11023,6 +11032,7 @@ fn write_head_comment_lines<Out: core::fmt::Write>(
     text: &[u8],
     ranges: &[(u32, u32)],
     skip_before: usize,
+    cut_at_marker: bool,
 ) -> core::fmt::Result {
     let mut prev_end: Option<usize> = None;
     for &(start, end) in ranges {
@@ -11049,7 +11059,7 @@ fn write_head_comment_lines<Out: core::fmt::Write>(
             continue;
         };
         if let Some(prev_end) = prev_end {
-            if blank_line_between_head_lines(text, prev_end, start) {
+            if blank_line_between_head_lines(text, prev_end, start, cut_at_marker) {
                 out.write_char('\n')?;
             }
             out.write_str(indent)?;
@@ -20426,6 +20436,27 @@ plain: hello
                 "# lead\r\n# \r\n---\r\na: 1"
             );
             assert_eq!(stream(b"# lead\r\ra: 1\r"), "# lead\r\ra: 1");
+        }
+
+        /// #7084: behind a byte-order mark the gap between two lines of one head is cut at a `---` marker
+        /// line, so the blank lines after the marker are not counted and the ones before it are; text with
+        /// no mark keeps them all.
+        #[test]
+        fn blank_line_between_head_lines_cuts_the_gap_at_a_marker_7084() {
+            let text = b"# a\n---\n\n# b\n";
+            let (from, to) = (3, 10);
+            assert!(!blank_line_between_head_lines(text, from, to, true));
+            assert!(blank_line_between_head_lines(text, from, to, false));
+            let before = b"# a\n\n---\n# b\n";
+            assert!(blank_line_between_head_lines(before, 3, 11, true));
+            assert!(blank_line_between_head_lines(before, 3, 11, false));
+            // `----`, `---x` and an indented marker are not markers.
+            let near = b"# a\n----\n\n# b\n";
+            assert!(blank_line_between_head_lines(near, 3, 11, true));
+            assert!(is_marker_line(b"---"));
+            assert!(is_marker_line(b"--- # c"));
+            assert!(!is_marker_line(b"---x"));
+            assert!(!is_marker_line(b" ---"));
         }
 
         #[test]

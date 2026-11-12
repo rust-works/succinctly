@@ -746,6 +746,9 @@ struct Parser<'a, const HAS_CR: bool> {
     /// "more of the head" (`only_yq_header_lines_since` is never true). `---` / `---` / `x` is then
     /// a null document and `x`, as in the spec.
     yq_no_head: bool,
+    /// [`Self::first_document_marker_leads`]'s answer, found on first use: it is asked once for every block a
+    /// blank line detaches before the first node.
+    first_document_marker: core::cell::Cell<Option<bool>>,
 }
 
 impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
@@ -830,6 +833,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             documents_started: 0,
             leading_run_from: 0,
             yq_no_head: false,
+            first_document_marker: core::cell::Cell::new(None),
             #[cfg(debug_assertions)]
             wrapper_slots: Vec::with_capacity(estimated_opens),
             #[cfg(debug_assertions)]
@@ -2127,9 +2131,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         self.comments.entry(root).or_default().head.append(pending);
     }
 
-    /// Whether the text starts with a `---` marker once its comments and blank lines are skipped: the first
-    /// document is then an explicit one (see [`Self::drain_pending_into_document_head`]).
+    /// Whether the text starts with a `---` marker once its comments, blank lines and `%` directive lines are
+    /// skipped: the first document is then an explicit one (see [`Self::drain_pending_into_document_head`]).
     fn first_document_marker_leads(&self) -> bool {
+        if let Some(known) = self.first_document_marker.get() {
+            return known;
+        }
+        let mut leads = false;
         let mut at = 0;
         while at < self.input.len() {
             let line_end = self.input[at..]
@@ -2143,14 +2151,16 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 .map(|n| &line[n..]);
             match content {
                 None => {}
-                Some(rest) if rest.first() == Some(&b'#') => {}
+                Some(rest) if matches!(rest.first(), Some(b'#' | b'%')) => {}
                 Some(rest) => {
-                    return line.first() != Some(&b' ') && Self::marker_prefix(rest, b"---")
+                    leads = line.first() != Some(&b' ') && Self::marker_prefix(rest, b"---");
+                    break;
                 }
             }
             at = line_end + 1;
         }
-        false
+        self.first_document_marker.set(Some(leads));
+        leads
     }
 
     /// Hook for "a node that can own a standalone comment just opened at
