@@ -1,9 +1,11 @@
 //! #7024: standard input that is a regular file (`jq … < file`) is read a window at a time like a path
 //! is (#6920): it can be read again by position for a fault's wording, which a pipe cannot. Every row is
-//! what the same bytes give on a pipe, which the whole-file route reads: stdout, stderr and exit status,
-//! and the file here starts at an offset when the shell or a parent has read part of it already.
+//! what the same bytes give on a pipe: stdout, stderr and exit status, and the file here starts at an
+//! offset when the shell or a parent has read part of it already. A pipe of 4 MiB or more is windowed
+//! too since #7024's pipe slice, and words its fault as it reads instead (`i7024_pipe.rs` checks it
+//! against the whole-file route), so the two sides here are the two ways a window words a fault.
 //!
-//! A pipe, a terminal and a stdin under 4 MiB take the route they always did.
+//! A terminal and a stdin under 4 MiB take the route they always did.
 
 #![cfg(unix)]
 

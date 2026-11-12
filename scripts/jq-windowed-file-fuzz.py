@@ -9,7 +9,9 @@ runs one random program over the files both ways, and compares stdout, stderr (t
 `<file N>`) and the exit status. The two routes are one implementation of jq's answer, so any difference is a
 bug in the window. A regular file on standard input is windowed too since #7059, so it is no longer the whole-file
 side. The programs avoid `input_line_number` and `input`, which leave the route: the line a document was read on
-shows in the `(at <file N>:LINE)` of a runtime error. (The seeds of #7048's runs do not reproduce: the generator
+shows in the `(at <file N>:LINE)` of a runtime error. `--pipe` feeds each stream on a pipe on standard input
+instead, which is windowed too (#7024) and words its first fault as it reads, against the same pipe
+named `/dev/stdin`, which is read whole. (The seeds of #7048's runs do not reproduce: the generator
 now cuts the stream into files and picks among more programs.)
 
 The streams mix the shapes that decide where a window ends: documents of every kind, pretty-printed ones that
@@ -26,7 +28,7 @@ prove nothing, so a case that comes out shorter is a bug of the generator and st
 
 Usage:
     cargo build --release --features cli,simd,regex,serde
-    scripts/jq-windowed-file-fuzz.py [--bin PATH] [-n N] [--seed S] [--work DIR] [--files K] [--cap-mb MB]
+    scripts/jq-windowed-file-fuzz.py [--bin PATH] [-n N] [--seed S] [--work DIR] [--files K | --pipe] [--cap-mb MB]
 Each case takes about 0.2 s with a release build. Exit 1 on any difference (a timeout, a crash of the
 script's own and a run that exceeds `--cap-mb` of address space count as one); the stream that differed is
 kept in `--work` as `windowed-fuzz-<seed>-<case>-<file>.json` (one per file), and the case is printed with the mutations applied,
@@ -192,11 +194,12 @@ def cap(megabytes):
     return limit
 
 
-def run(binary, args, megabytes, stdin=None, pass_fds=()):
-    """stdout, stderr and the exit status of one run; a run that hangs is reported as one that did."""
+def run(binary, args, megabytes, stdin=None, pass_fds=(), feed=None):
+    """stdout, stderr and the exit status of one run, with `feed` written to it on a pipe if given; a run
+    that hangs is reported as one that did."""
     try:
-        done = subprocess.run([binary, "jq"] + args, stdin=stdin, capture_output=True, timeout=300,
-                              preexec_fn=cap(megabytes), pass_fds=pass_fds)
+        done = subprocess.run([binary, "jq"] + args, stdin=stdin, input=feed, capture_output=True,
+                              timeout=300, preexec_fn=cap(megabytes), pass_fds=pass_fds)
     except subprocess.TimeoutExpired:
         return b"", TIMED_OUT, -9
     return done.stdout, done.stderr, done.returncode
@@ -251,6 +254,15 @@ def run_files(args, rng, data, case, program, work, seed):
     return windowed, whole, names, [len(piece) for piece in pieces]
 
 
+def run_pipe(args, data, program):
+    """One case on a pipe (#7024): windowed (the pipe on standard input) and whole (the same pipe named
+    `/dev/stdin`, which the windowed routes decline), compared."""
+    windowed = run(args.bin, program, args.cap_mb, feed=data)
+    whole = run(args.bin, program + ["/dev/stdin"], args.cap_mb, feed=data)
+    whole = tuple(part.replace(b"/dev/stdin", b"<stdin>") if isinstance(part, bytes) else part for part in whole)
+    return windowed, whole, ["<stdin>"], [len(data)]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--bin", default="target/release/succinctly", help="the succinctly binary")
@@ -260,7 +272,11 @@ def main():
     parser.add_argument("--files", type=int, default=1,
                         help="cut each stream into this many files, 1 to 32, read as one stream (#7024)")
     parser.add_argument("--cap-mb", type=int, default=8000, help="RLIMIT_AS of each run, in MiB (Linux)")
+    parser.add_argument("--pipe", action="store_true",
+                        help="feed each stream on a pipe on standard input instead (#7024); one file only")
     args = parser.parse_args()
+    if args.pipe and args.files != 1:
+        sys.exit("--pipe is one stream: give no --files")
     if not 1 <= args.files <= 32:
         sys.exit("--files is 1 to 32: the route holds at most 32 files open and takes no more")
     if not os.path.exists(args.bin):
@@ -273,9 +289,13 @@ def main():
         data, notes = build(rng)
         if len(data) < MIN_BYTES:
             sys.exit("generator bug: case %d is %d bytes, under the windowed route's minimum" % (case, len(data)))
-        program = rng.choice(PROGRAMS + FILE_PROGRAMS * 2)
+        # A pipe has no file name, and `/dev/stdin` has one: `input_filename` would tell them apart.
+        program = rng.choice(PROGRAMS if args.pipe else PROGRAMS + FILE_PROGRAMS * 2)
         try:
-            windowed, whole, names, sizes = run_files(args, rng, data, case, program, work, args.seed)
+            if args.pipe:
+                windowed, whole, names, sizes = run_pipe(args, data, program)
+            else:
+                windowed, whole, names, sizes = run_files(args, rng, data, case, program, work, args.seed)
         except OSError as error:  # the binary could not be run at all: keep the stream and say so
             differences += 1
             kept = os.path.join(work, "windowed-fuzz-%d-%d.json" % (args.seed, case))
@@ -289,8 +309,12 @@ def main():
             differences += 1
             kept = [os.path.join(work, "windowed-fuzz-%d-%d-%d.json" % (args.seed, case, n))
                     for n in range(len(names))]
-            for source, target in zip(names, kept):
-                shutil.copyfile(source, target)
+            if args.pipe:
+                with open(kept[0], "wb") as handle:
+                    handle.write(data)
+            else:
+                for source, target in zip(names, kept):
+                    shutil.copyfile(source, target)
             first = next(
                 (at for at, (a, b) in enumerate(zip(windowed[0], whole[0])) if a != b),
                 min(len(windowed[0]), len(whole[0])),

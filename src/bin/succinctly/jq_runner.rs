@@ -11318,7 +11318,14 @@ fn windowed_plain_file(args: &JqCommand) -> Option<WindowedSource> {
     if args.slurp || args.validate || args.seq || args.null_input {
         return None;
     }
-    windowed_source(args)
+    windowed_source(args).or_else(|| {
+        // #7024: a pipe on standard input, which only this route reads a window at a time: the `--seq`
+        // prepass reads its file by position, which a pipe cannot be.
+        get_input_files(args)
+            .is_empty()
+            .then(windowed_stdin_pipe)
+            .flatten()
+    })
 }
 
 /// What a route that reads its source a window at a time is handed: the file list the run then has,
@@ -11483,6 +11490,60 @@ fn windowed_regular_stdin(
 
 #[cfg(not(unix))]
 fn windowed_stdin_file() -> Option<(window::WindowedFiles, std::rc::Rc<window::Reread>)> {
+    None
+}
+
+/// Standard input when it is a pipe (or a socket) that holds 4 MiB or more (#7024), read a window at a
+/// time. Its length is not known, so the first 4 MiB are read to find out: a pipe that ends sooner hands
+/// what it held to the route that reads it whole ([`STDIN_PUSHBACK`]), as if it had read it itself. It
+/// cannot be read again for a fault's wording, so its windows are certified as they are read and the
+/// first fault is kept ([`window::WindowedFile::from_pipe`]). A terminal is left to the route that reads
+/// it whole (it is typed into, and seldom holds 4 MiB), and so are a device, a stdin something has read
+/// from already, and one the run also writes to.
+#[cfg(unix)]
+fn windowed_stdin_pipe() -> Option<WindowedSource> {
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::FileTypeExt;
+    if STDIN_PUSHBACK.with(|slot| slot.borrow().is_some()) {
+        return None;
+    }
+    let file = std::fs::File::from(std::io::stdin().as_fd().try_clone_to_owned().ok()?);
+    let meta = file.metadata().ok()?;
+    let kind = meta.file_type();
+    if !(kind.is_fifo() || kind.is_socket()) || names_output(&meta) {
+        return None;
+    }
+    windowed_pipe(file, window::MIN_WINDOWED_FILE_BYTES)
+}
+
+/// [`windowed_stdin_pipe`] over a pipe it has judged, which is windowed once it holds `min` bytes.
+#[cfg(unix)]
+fn windowed_pipe(file: std::fs::File, min: u64) -> Option<WindowedSource> {
+    let mut front = Vec::new();
+    // A read that fails is the stream's end, and is reported after the documents before it, as a read
+    // that fails further on is.
+    let error = (&file).take(min).read_to_end(&mut front).err();
+    if error.is_none() && (front.len() as u64) < min {
+        STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = Some(front));
+        return None;
+    }
+    let seen = window::SeenFault::default();
+    let reader = window::WindowedFiles::pipe(
+        std::rc::Rc::new(file),
+        front,
+        error,
+        window::WINDOW_BYTES,
+        std::rc::Rc::clone(&seen),
+    );
+    Some((
+        Vec::new(),
+        reader,
+        std::rc::Rc::new(window::Reread::seen(seen)),
+    ))
+}
+
+#[cfg(not(unix))]
+fn windowed_stdin_pipe() -> Option<WindowedSource> {
     None
 }
 
@@ -20702,6 +20763,36 @@ mod tests {
             false
         )
         .is_none());
+    }
+
+    /// #7024: a pipe is windowed once a first read finds 4 MiB in it; one that ends sooner hands what
+    /// it held to the route that reads it whole, as if that route had read it.
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_is_windowed_only_once_it_holds_the_minimum_7024() {
+        use std::io::Write;
+        let piped = |bytes: &[u8]| {
+            let (reader, mut writer) = std::io::pipe().expect("pipe");
+            writer.write_all(bytes).expect("write");
+            drop(writer);
+            std::fs::File::from(std::os::fd::OwnedFd::from(reader))
+        };
+        STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = None);
+        assert!(windowed_pipe(piped(b"1 2 3\n"), 64).is_none());
+        assert_eq!(
+            STDIN_PUSHBACK.with(|slot| slot.borrow_mut().take()),
+            Some(b"1 2 3\n".to_vec())
+        );
+        let stream = b"{\"a\":1}\n".repeat(20);
+        let (files, mut reader, reread) = windowed_pipe(piped(&stream), 64).expect("windowed");
+        assert!(files.is_empty());
+        assert!(STDIN_PUSHBACK.with(|slot| slot.borrow().is_none()));
+        let mut count = 0;
+        while let Some((_, window)) = reader.next_window().expect("reads") {
+            count += window.values.len();
+        }
+        assert_eq!(count, 20);
+        assert_eq!(reread.stream_fault(), None);
     }
 
     /// #6451: [`lone_lazy_read`] admits only what the lone source's branch of [`get_inputs`] takes

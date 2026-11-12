@@ -575,6 +575,37 @@ pub fn jq_stream_fault_end<B: AsRef<[u8]>>(
     }
 }
 
+/// jq's parser reading `chunks` from `(line, column)` without reaching the end of the text (#7024): the
+/// first fault it meets in them (worded as [`jq_stream_fault`] words it), or whether it stands at a
+/// boundary between top-level values once they are read (no container, string, token or value
+/// pending), where a parser started afresh would go on exactly as this one does.
+///
+/// For a reader that words a stream's first fault without holding the stream: what it has read up to
+/// such a boundary leaves nothing in jq's parser but its position.
+#[doc(hidden)]
+pub fn jq_stream_prefix_fault<B: AsRef<[u8]>>(
+    chunks: impl IntoIterator<Item = B>,
+    line: usize,
+    column: usize,
+) -> Result<bool, String> {
+    let mut parser = Parser::new(line, column, JQ_MAX_PARSING_DEPTH);
+    parser.multi = true;
+    for chunk in chunks {
+        for &byte in chunk.as_ref() {
+            if let Err(Stop::Fault(fault)) = parser.feed(byte) {
+                return Err(format!(
+                    "{fault} at line {}, column {}",
+                    parser.line, parser.column
+                ));
+            }
+        }
+    }
+    Ok(parser.string_state == 0
+        && parser.token.is_empty()
+        && parser.stack.is_empty()
+        && parser.next.is_none())
+}
+
 /// The index of the chunk jq's parser is reading when it meets the first fault of the stream the
 /// `chunks` make, and whether that fault is at the end of the text (`... at EOF`), or `None` when
 /// it reads every value (#6485). A fault at the end is the last chunk's, since the parser is
@@ -681,6 +712,102 @@ pub fn jq_input_depth_fault<W: AsRef<[u64]>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #7024: the prefix reader stops at the first fault, worded as the whole-stream reader words it,
+    /// and otherwise says whether it ends between top-level values.
+    #[test]
+    fn the_prefix_reader_words_the_fault_and_knows_a_boundary_7024() {
+        let at = |text: &str| jq_stream_prefix_fault([text.as_bytes()], 1, 0);
+        assert_eq!(at("{\"a\":1} [2]"), Ok(true));
+        assert_eq!(at("{\"a\":1}\n"), Ok(true));
+        assert_eq!(at("\"s\""), Ok(true));
+        // A bare token waits for the byte that ends it, and an open container or string for the rest.
+        assert_eq!(at("12"), Ok(false));
+        assert_eq!(at("12 "), Ok(true));
+        assert_eq!(at("[1,"), Ok(false));
+        assert_eq!(at("\"ab"), Ok(false));
+        // A fault is the whole-stream reader's, at the same place; the end of the text is not one.
+        for text in ["[1 2]", "{\"a\" 1}\n", "1\n2]", "tru "] {
+            assert_eq!(
+                at(text).err(),
+                jq_stream_fault([text.as_bytes()], 1, 0),
+                "{text:?}"
+            );
+        }
+        assert_eq!(at("{\"a\":"), Ok(false));
+        assert!(jq_stream_fault([b"{\"a\":"], 1, 0).is_some());
+        // The position it starts from is the one the message names from.
+        assert_eq!(
+            jq_stream_prefix_fault([b"]"], 7, 3),
+            Err(String::from("Unmatched ']' at line 7, column 4"))
+        );
+    }
+
+    /// #7024: a document the strict validator accepts (its depth capped at 127, since an object costs
+    /// jq's parser two slots and it refuses at 256) is one jq's parser reads without a fault. The
+    /// windowed reader of a pipe certifies the documents it drops by this, and words the stream's
+    /// first fault from the bytes as read only where the validator turns one down.
+    #[test]
+    fn what_the_strict_validator_accepts_jq_reads_7024() {
+        use crate::json::validate::Validator;
+        let seeds: &[&[u8]] = &[
+            br#"{"a":[1,2.5e-3,-0,true,false,null],"b":{"c":"d\u00e9\ud83d\ude00\n\"\\\/"}}"#,
+            br#"[[],{},"",0,1E+2,0.0]"#,
+            br#""\ud800\udc00""#,
+            b"123",
+            b"-1.5",
+            "\"\u{fffd}\u{e9}\"".as_bytes(),
+        ];
+        let alphabet: &[u8] =
+            b"{}[]:,\"\\/ubnrtfe+-.0123456789adEtrulsx \t\r\n\x00\x01\x1f\x7f\xc3\xa9\xef\xbf\xbd\xff";
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let accepted = |doc: &[u8]| Validator::new(doc).with_max_depth(127).validate().is_ok();
+        let check = |doc: &[u8]| {
+            if accepted(doc) {
+                let text = [doc, b"\n"].concat();
+                assert_eq!(
+                    jq_stream_fault([text.as_slice()], 1, 0),
+                    None,
+                    "{:?}",
+                    String::from_utf8_lossy(doc)
+                );
+            }
+        };
+        let mut kept = 0;
+        for round in 0..60_000 {
+            let mut doc = seeds[round % seeds.len()].to_vec();
+            for _ in 0..1 + next() % 4 {
+                let at = (next() as usize) % (doc.len() + 1);
+                let byte = alphabet[(next() as usize) % alphabet.len()];
+                match next() % 3 {
+                    0 => doc.insert(at, byte),
+                    1 if at < doc.len() => {
+                        doc.remove(at);
+                    }
+                    _ if at < doc.len() => doc[at] = byte,
+                    _ => doc.push(byte),
+                }
+            }
+            kept += usize::from(accepted(&doc));
+            check(&doc);
+        }
+        // The mutations keep enough documents valid for the check to mean something.
+        assert!(kept > 1_000, "{kept}");
+        // Depth: 127 is the cap, at which 127 nested objects (254 slots) still parse.
+        for depth in [126, 127, 128, 200] {
+            let objects = format!("{}1{}", "{\"k\":".repeat(depth), "}".repeat(depth));
+            let arrays = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+            check(objects.as_bytes());
+            check(arrays.as_bytes());
+            assert_eq!(accepted(objects.as_bytes()), depth <= 127, "{depth}");
+        }
+    }
 
     /// #5804: a text that opens with part of the BOM and then departs from it is `Malformed BOM`
     /// (every U+F000..=U+FFFF character starts `EF`, and U+FEC0 is `EF BB 80`); a whole BOM is
