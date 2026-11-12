@@ -129,12 +129,13 @@ fn test_comment_before_a_blank_line_heads_the_first_child_4996() -> Result<()> {
     Ok(())
 }
 
-/// The comment is the first child key's head, not the parent's foot.
+/// The comment is the first child key's head, not the parent's foot. Its text ends in the line
+/// break the blank line leaves (`"a\n"`, printed `a` and two line ends), as in yq (#7034).
 #[test]
 fn test_comment_before_a_blank_line_is_the_first_childs_head_comment_4996() -> Result<()> {
     let doc = "m:\n  # a\n\n  k: 1\nz: 2\n";
     for (filter, expected) in [
-        (".m.k | key | head_comment", "a\n"),
+        (".m.k | key | head_comment", "a\n\n"),
         (".m | key | foot_comment", "\n"),
     ] {
         let (stdout, code) = run_yq_stdin(filter, doc, &[])?;
