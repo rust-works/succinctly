@@ -580,3 +580,105 @@ fn props_refusals_6925() -> Result<()> {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------------------------
+// -p csv and -p tsv: Go's encoding/csv, each cell a snippet of YAML. Every answer is yq v4.53.3's.
+// ---------------------------------------------------------------------------------------------
+
+/// (format, stdin, extra args, filter, yq's stdout, yq's first stderr line, yq's exit status).
+#[rustfmt::skip]
+const CSV_ROWS: &[Row] = &[
+    ("csv", "name,age\nAlice,30\nBob,0x1f\n", &["-o", "yaml"], ".", "- name: Alice\n  age: 30\n- name: Bob\n  age: 0x1f\n", "", 0),
+    ("csv", "name,age\nAlice,30\nBob,25\n", &["-o", "json", "-I0"], ".", "[{\"name\":\"Alice\",\"age\":30},{\"name\":\"Bob\",\"age\":25}]\n", "", 0),
+    ("csv", "name,age\nAlice,30\nBob,25\n", &["-o", "yaml"], ".[1].name", "Bob\n", "", 0),
+    ("csv", "name,age\nAlice,30\nBob,25\n", &["-o", "yaml"], "length", "2\n", "", 0),
+    ("csv", "a,b\n", &["-o", "json", "-I0"], ".", "[]\n", "", 0),
+    ("csv", "", &["-o", "json", "-I0"], ".", "null\n", "", 0),
+    ("csv", "\n\n", &["-o", "json", "-I0"], ".", "null\n", "", 0),
+    ("csv", "a\n\n\n1\n\n2", &["-o", "json", "-I0"], ".", "[{\"a\":1},{\"a\":2}]\n", "", 0),
+    ("csv", "a,b\r\n\"x\r\ny\",2\r\n", &["-o", "json", "-I0"], ".", "[{\"a\":\"x\\ny\",\"b\":2}]\n", "", 0),
+    ("csv", "a,a\n1,2\n", &["-o", "json", "-I0"], ".", "[{\"a\":1,\"a\":2}]\n", "", 0),
+    ("csv", "1,2\n3,4\n", &["-o", "yaml"], ".", "- \"1\": 3\n  \"2\": 4\n", "", 0),
+    ("csv", ",\n1,2\n", &["-o", "yaml"], ".", "- \"\": 1\n  \"\": 2\n", "", 0),
+    ("csv", "a,b\n,\n", &["-o", "json", "-I0"], ".", "[{\"a\":null,\"b\":null}]\n", "", 0),
+    ("csv", "﻿a,b\n1,2\n", &["-o", "json", "-I0"], ".", "[{\"a\":1,\"b\":2}]\n", "", 0),
+    ("csv", "a,b\n1\n", &["-o", "json", "-I0"], ".", "", "Error: bad file '-': record on line 2: wrong number of fields", 1),
+    ("csv", "a,b\n1,2,3\n", &["-o", "json", "-I0"], ".", "", "Error: bad file '-': record on line 2: wrong number of fields", 1),
+    ("csv", "a,b\n1,\"x\n", &["-o", "json", "-I0"], ".", "", "Error: bad file '-': parse error on line 2, column 6: extraneous or missing \" in quoted-field", 1),
+    ("csv", "a,b\n1,x\"y\n", &["-o", "json", "-I0"], ".", "", "Error: bad file '-': parse error on line 2, column 4: bare \" in non-quoted-field", 1),
+    ("csv", "a,b\n\"1\"x,2\n", &["-o", "json", "-I0"], ".", "", "Error: bad file '-': parse error on line 2, column 3: extraneous or missing \" in quoted-field", 1),
+    ("csv", "a,b\n\"1\",\"two\"\nthree,\"fo\"\"ur\"\n", &["-o", "json", "-I0"], ".", "[{\"a\":1,\"b\":\"two\"},{\"a\":\"three\",\"b\":\"fo\\\"ur\"}]\n", "", 0),
+    ("csv", "k\n[1,2]\n{a: 1}\na: b\n- x\n\"- a\n- b\"\n", &["-o", "yaml"], ".", "", "Error: bad file '-': record on line 2: wrong number of fields", 1),
+    ("csv", "k\n5 # c\n#\n!\n<<\n~\nnull\nTrue\n", &["-o", "yaml"], ".", "- k: 5\n- k: #\n- k:\n- k: !!merge <<\n- k: ~\n- k: null\n- k: True\n", "", 0),
+    ("csv", "k\n1e3\n.5\n1.\n+5\n007\n0o17\n1_000\n0x1f\n", &["-o", "yaml"], ".", "- k: 1e3\n- k: .5\n- k: 1.\n- k: +5\n- k: 007\n- k: 0o17\n- k: 1_000\n- k: 0x1f\n", "", 0),
+    ("csv", "k\n'x'\n\"\"\"x\"\"\"\n!!str 5\n&a x\n*a\na # c\n| x\n%x\nyes\non\ny\n", &["-o", "yaml"], ".", "- k: '''x'''\n- k: '\"x\"'\n- k: '!!str 5'\n- k: '&a x'\n- k: '*a'\n- k: 'a # c'\n- k: '| x'\n- k: '%x'\n- k: yes\n- k: on\n- k: y\n", "", 0),
+    ("csv", "k\n 1\n2 \n x \n", &["-o", "json", "-I0"], ".", "[{\"k\":1},{\"k\":2},{\"k\":\" x \"}]\n", "", 0),
+    ("csv", "k\n&a 5\n!!int 5\n!foo 5\n!!null x\n&a [1]\n!!seq [1]\n", &["-o", "yaml"], ".", "- k: &a 5\n- k: !!int 5\n- k: !foo 5\n- k: !!null x\n- k: &a [1]\n- k: !!seq [1]\n", "", 0),
+    ("csv", "k\n2001-01-01\n2001-01-01T00:00:00Z\n1:30\n12e\n", &["-o", "yaml"], ".", "- k: 2001-01-01\n- k: 2001-01-01T00:00:00Z\n- k: 1:30\n- k: 12e\n", "", 0),
+    ("csv", "k\nline1\nline2\n\"line1\nline2\"\n\"x\n\"\n\"a: 1\nb: 2\"\n", &["-o", "yaml"], ".", "- k: line1\n- k: line2\n- k: |-\n    line1\n    line2\n- k: |\n    x\n- k:\n    a: 1\n    b: 2\n", "", 0),
+    ("csv", "k\n\"{a: [1, {b: 2}]}\"\n\"[a, 'b', \"\"c\"\"]\"\n\"a: 'b'\nc: \"\"d\"\"\"\n", &["-o", "yaml"], ".", "- k: {a: [1, {b: 2}]}\n- k: [a, 'b', \"c\"]\n- k:\n    a: 'b'\n    c: \"d\"\n", "", 0),
+    ("csv", "k\n\"k: # c\n  v\"\n\"- a\n- b # c\"\n\"foo: &x 1\nbar: *x\"\n", &["-o", "yaml"], ".", "- k:\n    k: v # c\n- k:\n    - a\n    - b # c\n- k:\n    foo: &x 1\n    bar: *x\n", "", 0),
+    ("csv", "1,x y,\"a\nb\"\n1,2,3\n", &["-o", "yaml"], ".", "- \"1\": 1\n  x y: 2\n  ? |-\n    a\n    b\n  : 3\n", "", 0),
+    ("csv", "1,[x],k:\n!!,!,-\n", &["-o", "yaml"], ".", "- \"1\": '!!'\n  '[x]':\n  'k:':\n    -\n", "", 0),
+    ("csv", "a,b\n1,[1]\n", &["-o", "json", "-I0"], "[.[] | .b]", "[[1]]\n", "", 0),
+    ("csv", "a;b\n1;\"x;y\"\n", &["-o", "json", "-I0", "--csv-separator", ";"], ".", "[{\"a\":1,\"b\":\"x;y\"}]\n", "", 0),
+    ("csv", "a,b\n1,[1]\n  2, true\n", &["-o", "json", "-I0", "--csv-auto-parse=false"], ".", "[{\"a\":1,\"b\":\"[1]\"},{\"a\":\"  2\",\"b\":\" true\"}]\n", "", 0),
+    ("csv", "k\n1\n01\n0x1f\n[1]\na: b\nyes\n2001-01-01\n true\n", &["-o", "json", "-I0", "--csv-auto-parse=false"], ".", "[{\"k\":1},{\"k\":1},{\"k\":31},{\"k\":\"[1]\"},{\"k\":\"a: b\"},{\"k\":\"yes\"},{\"k\":\"2001-01-01\"},{\"k\":\" true\"}]\n", "", 0),
+    ("csv", "k\n1\n01\n0x1f\n[1]\na: b\nyes\n2001-01-01\n true\n", &["-o", "yaml", "--csv-auto-parse=false"], ".", "- k: 1\n- k: 01\n- k: 0x1f\n- k: '[1]'\n- k: 'a: b'\n- k: yes\n- k: 2001-01-01\n- k: ' true'\n", "", 0),
+    ("csv", "a,b\n1,2\n", &["-o", "json", "-I0", "--tsv-auto-parse=false"], ".", "[{\"a\":1,\"b\":2}]\n", "", 0),
+    ("csv", "k\n\u{a0}5\n5\u{a0}\ntrue\u{a0}\n", &["-o", "json", "-I0"], ".", "[{\"k\":\"\u{a0}5\"},{\"k\":\"5\u{a0}\"},{\"k\":\"true\u{a0}\"}]\n", "", 0),
+    ("tsv", "name\tage\nAlice\t30\n\"q\tr\"\t[1]\n", &["-o", "json", "-I0"], ".", "[{\"name\":\"Alice\",\"age\":30},{\"name\":\"q\\tr\",\"age\":[1]}]\n", "", 0),
+    ("tsv", "name\tage\nAlice\t30\n\"q\tr\"\t[1]\n", &["-o", "json", "-I0", "--tsv-auto-parse=false"], ".", "[{\"name\":\"Alice\",\"age\":30},{\"name\":\"q\\tr\",\"age\":\"[1]\"}]\n", "", 0),
+    ("tsv", "a,b\tc\n1,2\t3\n", &["-o", "yaml"], ".", "- a,b: 1,2\n  c: 3\n", "", 0),
+    ("tsv", "a\tb\n1\n", &["-o", "json", "-I0"], ".", "", "Error: bad file '-': record on line 2: wrong number of fields", 1),
+    ("tsv", "a\tb\n1\t\"x\n", &["-o", "json", "-I0"], ".", "", "Error: bad file '-': parse error on line 2, column 6: extraneous or missing \" in quoted-field", 1),
+    ("tsv", "a\tb\n1,2\t3\n", &["-o", "json", "-I0", "--csv-separator", ";"], ".", "[{\"a\":\"1,2\",\"b\":3}]\n", "", 0),
+];
+
+#[test]
+fn csv_and_tsv_input_match_yq_on_stdin_6925() -> Result<()> {
+    for &(format, input, extra, filter, stdout, stderr, code) in CSV_ROWS {
+        let mut args = vec!["-p", format];
+        args.extend_from_slice(extra);
+        let (out, err, status) = run_yq_stdin_with_stderr(filter, input, &args)?;
+        let row = format!("-p {format} {extra:?} {filter:?} on {input:?}");
+        assert_eq!(out, stdout, "stdout of {row}");
+        assert_eq!(error_line(&err), stderr, "stderr of {row}");
+        assert_eq!(status, code, "exit status of {row}");
+    }
+    Ok(())
+}
+
+/// `*.csv` and `*.tsv` (and the aliases `c`, `t`, any case) are tables both ways under `-p auto`;
+/// an empty file is `null`; `-i` writes the output format back, which is the table's.
+#[test]
+fn csv_and_tsv_by_extension_and_inplace_6925() -> Result<()> {
+    let dir = TempDir::new()?;
+    let a = write_file(&dir, "a.csv", b"name,age\nAlice,30\nBob,25\n")?;
+    let b = write_file(&dir, "b.TSV", b"name\tage\nCara\t1\n")?;
+    let c = write_file(&dir, "c.c", b"k\n[1]\n")?;
+    let empty = write_file(&dir, "d.csv", b"")?;
+    assert_eq!(
+        run_yq_files(".[0].age", &[&a], &["-o", "json"])?,
+        ("30\n".into(), String::new(), 0)
+    );
+    // The first file's format reads every file, as in yq (#4394): `a.csv` read as a TSV has one
+    // column.
+    assert_eq!(
+        run_yq_files(".[0].age", &[&b, &a], &["-o", "json"])?,
+        ("1\nnull\n".into(), String::new(), 0)
+    );
+    assert_eq!(
+        run_yq_files(".[0].k", &[&c], &["-o", "json", "-I0"])?,
+        ("[1]\n".into(), String::new(), 0)
+    );
+    assert_eq!(
+        run_yq_files(".", &[&empty], &["-o", "json"])?,
+        ("null\n".into(), String::new(), 0)
+    );
+    run_yq_files(".[0].age = 31", &[&a], &["-i"])?;
+    assert_eq!(std::fs::read(&a)?, b"name,age\nAlice,31\nBob,25\n");
+    run_yq_files(".[0].age = 2", &[&b], &["-i"])?;
+    assert_eq!(std::fs::read(&b)?, b"name\tage\nCara\t2\n");
+    Ok(())
+}
