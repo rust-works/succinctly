@@ -1240,6 +1240,10 @@ pub enum InputFormat {
     /// Tab-separated values, read as `csv` is with a tab for its separator (#6925)
     #[value(name = "tsv", alias = "t")]
     Tsv,
+    /// INI as go-ini reads it: a mapping per section, the keys before the first section at the
+    /// root, every value a string (#6925)
+    #[value(name = "ini", alias = "i")]
+    Ini,
 }
 
 /// Front matter handling mode for `--front-matter`
@@ -1319,7 +1323,7 @@ pub struct YqCommand {
     #[arg(long, overrides_with = "jq_extensions")]
     pub jq_extensions: bool,
 
-    /// Input format type [auto, yaml, json, props, csv, tsv, base64, uri] (default: auto)
+    /// Input format type [auto, yaml, json, props, csv, tsv, ini, base64, uri] (default: auto)
     #[arg(
         short = 'p',
         long = "input-format",
@@ -1421,6 +1425,11 @@ pub struct YqCommand {
         default_value = "true"
     )]
     pub tsv_auto_parse: bool,
+
+    /// Keep the quotes that surround an INI value when `-p ini` reads it, as yq's
+    /// `--ini-preserve-quotes` (#6925)
+    #[arg(long = "ini-preserve-quotes", overrides_with = "ini_preserve_quotes")]
+    pub ini_preserve_quotes: bool,
 
     /// Text before the table of `-o=lua`; `\n`, `\r`, `\t`, `\\`, `\'` and `\"` are read (#6924)
     #[arg(

@@ -56,6 +56,7 @@ use crate::output::{
 mod go_yaml_color;
 mod input_csv;
 mod input_decode;
+mod input_ini;
 mod input_props;
 use go_yaml_color::YamlColorizer;
 use input_decode::{TranscodeOptions, TranscodedInput};
@@ -898,6 +899,7 @@ fn resolve_output_format(output_format: OutputFormat, input_format: InputFormat)
         InputFormat::Props => OutputFormat::Props,
         InputFormat::Csv => OutputFormat::Csv,
         InputFormat::Tsv => OutputFormat::Tsv,
+        InputFormat::Ini => OutputFormat::Ini,
     }
 }
 
@@ -1534,6 +1536,10 @@ static CSV_SEPARATOR: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8:
 static CSV_AUTO_PARSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static TSV_AUTO_PARSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
+/// `--ini-preserve-quotes`, which `-p ini` reads (#6925).
+static INI_PRESERVE_QUOTES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Whether an empty input reads as a document: under a string format it is the empty string.
 fn empty_input_is_transcoded_document() -> bool {
     transcoded_input().is_some_and(TranscodedInput::empty_is_document)
@@ -1555,6 +1561,8 @@ fn decode_transcoded_input(raw: Vec<u8>, name: &str) -> Result<Vec<u8>> {
                     ),
                     csv_auto_parse: CSV_AUTO_PARSE.load(std::sync::atomic::Ordering::SeqCst),
                     tsv_auto_parse: TSV_AUTO_PARSE.load(std::sync::atomic::Ordering::SeqCst),
+                    ini_preserve_quotes: INI_PRESERVE_QUOTES
+                        .load(std::sync::atomic::Ordering::SeqCst),
                 },
             )
             .map_err(|message| anyhow::anyhow!("bad file '{name}': {message}")),
@@ -2587,7 +2595,8 @@ fn parse_input(bytes: &[u8], format: InputFormat, after_bom: bool) -> Result<Vec
         | InputFormat::Auto
         | InputFormat::Props
         | InputFormat::Csv
-        | InputFormat::Tsv => {
+        | InputFormat::Tsv
+        | InputFormat::Ini => {
             // Parse as YAML (Auto defaults to YAML when no extension hint)
             let mut index = build_yq_source(bytes, after_bom)
                 .map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
@@ -12268,6 +12277,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             Some(TranscodedInput::Props) if by_extension => OutputFormat::Props,
             Some(TranscodedInput::Csv) if by_extension => OutputFormat::Csv,
             Some(TranscodedInput::Tsv) if by_extension => OutputFormat::Tsv,
+            Some(TranscodedInput::Ini) if by_extension => OutputFormat::Ini,
             Some(_) => OutputFormat::Yaml,
             None if json_input && !nothing_to_match => OutputFormat::Json,
             None => OutputFormat::Yaml,
@@ -12282,6 +12292,10 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     );
     CSV_AUTO_PARSE.store(args.csv_auto_parse, std::sync::atomic::Ordering::SeqCst);
     TSV_AUTO_PARSE.store(args.tsv_auto_parse, std::sync::atomic::Ordering::SeqCst);
+    INI_PRESERVE_QUOTES.store(
+        args.ini_preserve_quotes,
+        std::sync::atomic::Ordering::SeqCst,
+    );
 
     // #6850: `-o=props|shell|csv|tsv|base64|uri` is the run's results through that format's
     // encoder, printed raw. The program is wrapped below, once it is parsed; from here on the run
