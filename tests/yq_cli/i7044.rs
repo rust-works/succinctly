@@ -32,6 +32,8 @@ const FOOT_ROWS: &[(&str, &str, &str)] = &[
     ("a: 1\n---\n-\n  # c\n\n  n1: 1\n", "a: 1\n---\n- n1: 1\n  # c\n", "[[\"\",\"\"],[\"\",\"\"],[\"\",\"\"]]\n[[\"\",\"\"],[\"\",\"\"],[\"\",\"\"],[\"\",\"c\"]]\n"),
     // CRLF
     ("- 1\r\n-\r\n  # c\r\n\r\n  n1: 1\r\n", "- 1\n- n1: 1\n  # c\n", "[[\"\",\"\"],[\"\",\"\"],[\"\",\"\"],[\"\",\"\"],[\"\",\"c\"]]\n"),
+    // a block above the dash that a blank line settles, then two blocks below it
+    ("- 1\n# e9\n\n-\n  # c\n\n  # d\n  k0: 1\n", "- 1\n# e9\n\n- # d\n  k0: 1\n  # c\n", "[[\"\",\"\"],[\"\",\"e9\"],[\"\",\"\"],[\"\",\"\"],[\"d\",\"c\"]]\n"),
 ];
 
 /// Shapes where the block stays the head, in yq and here.
@@ -59,6 +61,12 @@ const HEAD_ROWS: &[(&str, &str, &str)] = &[
         "- 1\n-\n\n  # c\n\n  n1: 1\n",
         "- 1\n- # c\n  n1: 1\n",
         "[[\"\",\"\"],[\"\",\"\"],[\"\",\"\"],[\"\",\"\"],[\"c\\n\",\"\"]]\n",
+    ),
+    // a block above the dash, then one adjacent to the value
+    (
+        "- 1\n# e9\n\n-\n  # d\n  k0: 1\n",
+        "- 1\n# e9\n\n- # d\n  k0: 1\n",
+        "[[\"\",\"\"],[\"\",\"e9\"],[\"\",\"\"],[\"\",\"\"],[\"d\",\"\"]]\n",
     ),
 ];
 

@@ -6399,6 +6399,7 @@ Divergences, each classified by `scripts/yq-comment-oracle-fuzz.py`:
   `- 1` / `-` / `  # c` / blank / `  n1: 1` is `.[1].n1 | key | foot_comment`, printed `- n1: 1` / `  # c`; a block after the blank line is the key's head, and a blank line above the block, a comment on the dash line, or nothing before the item keeps the whole run the head.
   succinctly reproduces this, on every route (`Parser::defer_first_block_below_bare_dash`).
   Not reproduced: a flow collection value, before which yq drops the block (it stays the collection's head here, as for the run `defers_foot_to_next_item` places), and a dash line that holds the value's properties (`- !t` / `  # c` / blank / `  n1: 1`), where the block stays `n1`'s head.
+  After a flow item's own foot and a blank line (`- [1]` / `# e9` / blank / `-` / `  # d1` / blank / `  k0: 1`), yq prints no blank line before the next item and succinctly prints one; it did before #7044 as well.
 - **A CRLF after a standalone comment line is a blank line to yq's scanner** (go-yaml reads the `\r` as one break and the `\n` as a blank line of its own), so yq prints a blank line after every standalone comment of a CRLF file that the source never had (#5053).
   `a: 1\r\n# mid\r\nb: 2\r\n` prints `a: 1\n# mid\n\nb: 2\n`, and a block of comments gets a blank line between its lines (`# c1\n\n# c2`).
   succinctly reproduces this, the same placement included: the lone `# mid` is the foot of `a`, not the head of `b`, as it is in yq (`.a | key | foot_comment`).

@@ -5062,15 +5062,23 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// block stays the collection's head, as for the run [`Self::defers_foot_to_next_item`] places.
     ///
     /// The block goes to [`Self::deferred_foot_lines`], which the first key's or scalar's hook
-    /// claims.
-    fn defer_first_block_below_bare_dash(&mut self, below_dash: &mut Vec<(u32, u32)>) {
-        let Some(&(first_start, _)) = below_dash.first() else {
+    /// claims. Lines are told apart from those above the dash by position (`dash_line_end`), not
+    /// by the count taken before the lookahead, which a block the lookahead settles leaves stale.
+    fn defer_first_block_below_bare_dash(&mut self, dash_line_end: usize) {
+        // The pending lines below the dash: the run's tail, since lines are recorded in order.
+        let below = self
+            .pending_head_lines
+            .iter()
+            .position(|&(start, _)| start as usize > dash_line_end)
+            .unwrap_or(self.pending_head_lines.len());
+        let lines = &self.pending_head_lines[below..];
+        let Some(&(first_start, _)) = lines.first() else {
             return;
         };
-        if self.blank_line_between(self.pos, first_start as usize) {
+        if self.blank_line_between(dash_line_end, first_start as usize) {
             return;
         }
-        let last_end = below_dash[below_dash.len() - 1].1 as usize;
+        let last_end = lines[lines.len() - 1].1 as usize;
         // The value's first byte: past the blank lines and indentation after the last comment line.
         let content = self.input[last_end..]
             .iter()
@@ -5079,14 +5087,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         if matches!(self.input.get(content), Some(b'[' | b'{')) {
             return;
         }
-        let gap = (0..below_dash.len()).find(|&i| {
-            let next_start = below_dash
+        let gap = (0..lines.len()).find(|&i| {
+            let next_start = lines
                 .get(i + 1)
                 .map_or(content, |&(start, _)| start as usize);
-            self.blank_line_between(below_dash[i].1 as usize, next_start)
+            self.blank_line_between(lines[i].1 as usize, next_start)
         });
         if let Some(last) = gap {
-            self.deferred_foot_lines.extend(below_dash.drain(..=last));
+            let block = self.pending_head_lines.drain(below..=below + last);
+            self.deferred_foot_lines.extend(block);
         }
     }
 
@@ -5108,6 +5117,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         wrapper_bp: usize,
         lines_above_dash: Option<usize>,
     ) {
+        // Both callers reach here at the end of the dash line, before any lookahead moves on (#7044).
+        let dash_line_end = self.pos;
         // A trailing comment here belongs to this item's own deferred
         // value, not to the item's dash line (#784, same shape as
         // `parse_mapping_entry`'s anchor case). A property-prefixed
@@ -5170,17 +5181,24 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // document's head (`-\n# c\n`, measured).
                 self.saw_head_foot_node = true;
             } else {
-                // The lookahead can also have *settled* the block (a
-                // blank line after it resolves it backwards), so clamp.
-                let above_dash = above_dash.min(self.pending_head_lines.len());
-                let mut below_dash = self.pending_head_lines.split_off(above_dash);
-                // Whether a node opened before this item, in this document or an earlier one (#7044).
+                // Once a node has opened before this item, in this document or an earlier one, a
+                // first block below the dash may be the value's foot (#7044).
                 let follows_a_node = self.last_head_foot_bp.is_some()
                     || self.document_boundary_fallback_bp.is_some();
-                self.attach_deferred_item_value_at(self.bp_pos, indent);
                 if trailing.is_none() && follows_a_node {
-                    self.defer_first_block_below_bare_dash(&mut below_dash);
+                    self.defer_first_block_below_bare_dash(dash_line_end);
                 }
+                // The lines above the dash, told by position: the count taken before the lookahead
+                // goes stale when the lookahead settles a block (a blank line after it resolves it
+                // backwards), and then counted a line below the dash as one above it (#7044).
+                let above_dash = above_dash.min(
+                    self.pending_head_lines
+                        .iter()
+                        .take_while(|&&(start, _)| start as usize <= dash_line_end)
+                        .count(),
+                );
+                let below_dash = self.pending_head_lines.split_off(above_dash);
+                self.attach_deferred_item_value_at(self.bp_pos, indent);
                 self.pending_head_lines = below_dash;
                 if let Some(range) = trailing {
                     self.push_line_comment(wrapper_bp, range);
