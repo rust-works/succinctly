@@ -2324,10 +2324,10 @@ pub struct ArrayOf<V: Teardown> {
     ///
     /// Invariant, on which [`Deref`]'s unchecked slice relies:
     /// `start + len <= inner.len()`. Everything that changes `inner`'s
-    /// length restores it before control returns to safe code that could
-    /// read the window: [`make_vec`](Self::make_vec) zeroes the window
-    /// before it lends the `Vec` out, so a guard leaked with `mem::forget`
-    /// leaves an empty window, never a dangling one.
+    /// length zeroes the window first and sets it again after, so neither a
+    /// destructor that panics part-way through a `truncate` or `drain` nor a
+    /// [`make_vec`](Self::make_vec) guard leaked with `mem::forget` can
+    /// leave a dangling window: at worst an empty one.
     len: usize,
 }
 
@@ -2346,6 +2346,18 @@ type ArrayInnerOf<V> = ManuallyDrop<Rc<Vec<V>>>;
 /// more into its array's storage into a new array (#5103). A copy is a fresh
 /// node to `jv_identical`, which is why [`ArrayOf::slice`] copies here too.
 pub(crate) const JQ_SLICE_OFFSET_LIMIT: usize = 1 << 16;
+
+/// The bounds check [`ArrayOf::slice`] and [`ArrayOf::cut`] make before
+/// building a window that [`Deref`] reads unchecked: a hard `assert!`, so a
+/// bad range panics in every build rather than reading past the `Vec`.
+#[inline]
+#[track_caller]
+fn assert_window_range(range: &core::ops::Range<usize>, len: usize) {
+    assert!(
+        range.start <= range.end && range.end <= len,
+        "array window range {range:?} out of bounds for length {len}"
+    );
+}
 
 impl<V: Teardown> ArrayOf<V> {
     /// An empty array.
@@ -2399,12 +2411,13 @@ impl<V: Teardown> ArrayOf<V> {
     /// the window are this storage's too, and are taken apart with the rest.
     fn detach_into(&mut self, work: &mut Vec<V>) {
         if let Some((vec, start, len)) = self.unique_parts() {
+            // Zeroed first: a child's release can run a destructor.
+            *start = 0;
+            *len = 0;
             for child in vec.iter_mut() {
                 child.detach(work);
             }
             vec.clear();
-            *start = 0;
-            *len = 0;
         }
     }
 }
@@ -2424,8 +2437,8 @@ impl<V: Teardown + Clone> ArrayOf<V> {
     #[must_use]
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     pub fn slice(&self, range: core::ops::Range<usize>) -> Self {
-        debug_assert!(range.start <= range.end);
-        debug_assert!(range.end <= self.len);
+        // A hard check: the window this builds is read unchecked.
+        assert_window_range(&range, self.len);
         if range.start == range.end {
             return Self::new();
         }
@@ -2445,15 +2458,21 @@ impl<V: Teardown + Clone> ArrayOf<V> {
 
     /// Narrow this array to `range` of its window in place: the fold step's
     /// cut (#5274). A handle that owns its storage alone moves its window
-    /// and drops the cut-off tail, without copying a kept element; once the
-    /// cut-off head outgrows what is kept it is compacted away, so a loop
-    /// that peels one element per step moves each element O(1) times in all
-    /// and the kept part never holds more than about three times its own
-    /// size alive. A shared handle takes [`slice`](Self::slice) instead.
+    /// and drops the cut-off tail at once, without copying a kept element,
+    /// as `jvp_array_slice` moves an offset; once the offset would reach
+    /// 65,536 (`JQ_SLICE_OFFSET_LIMIT`), where jq copies the range into a new array,
+    /// the cut-off head is compacted away instead and the offset starts again
+    /// from 0, as the copy's does. A loop that peels one element per step
+    /// therefore moves each element at most once per 65,536 cuts, and keeps
+    /// fewer than 65,536 cut-off elements alive. A shared handle takes
+    /// [`slice`](Self::slice) instead.
+    ///
+    /// # Panics
+    ///
+    /// If `range` is not within the window (`start <= end <= len`).
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     pub fn cut(&mut self, range: core::ops::Range<usize>) {
-        debug_assert!(range.start <= range.end);
-        debug_assert!(range.end <= self.len);
+        assert_window_range(&range, self.len);
         if range.start == range.end {
             *self = Self::new();
             return;
@@ -2464,16 +2483,30 @@ impl<V: Teardown + Clone> ArrayOf<V> {
         };
         let new_start = *start + range.start;
         let new_len = range.end - range.start;
+        // Zeroed while elements are dropped (see `len`'s invariant).
+        *start = 0;
+        *len = 0;
         vec.truncate(new_start + new_len);
-        *start = new_start;
-        *len = new_len;
-        if new_start > 2 * new_len + 16 {
+        if new_start >= JQ_SLICE_OFFSET_LIMIT {
             vec.drain(..new_start);
-            *start = 0;
             if vec.capacity() > 2 * vec.len() + 16 {
                 vec.shrink_to_fit();
             }
+        } else {
+            *start = new_start;
         }
+        *len = new_len;
+    }
+
+    /// Append `value` to the window, in place when this handle owns its
+    /// storage alone: the window keeps its offset and grows by one, as
+    /// `jvp_array_write` appends to an unshared view. Anything past the
+    /// window in a unique `Vec` is dropped first; a shared window is copied
+    /// out as [`make_vec`](Self::make_vec) would.
+    #[inline]
+    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
+    pub fn push(&mut self, value: V) {
+        self.extend(core::iter::once(value));
     }
 
     /// The `Vec` itself, for a write that changes the array's length or
@@ -2488,13 +2521,15 @@ impl<V: Teardown + Clone> ArrayOf<V> {
         self.own_storage();
         let Self { inner, start, len } = self;
         let vec = Rc::get_mut(inner).expect("own_storage leaves this handle unique");
-        if *start > 0 || *len < vec.len() {
-            vec.truncate(*start + *len);
-            vec.drain(..*start);
-            *start = 0;
-        }
-        // Zeroed while the `Vec` is lent out (see `len`'s invariant).
+        let window = *start..*start + *len;
+        // Zeroed before any element is dropped, and while the `Vec` is lent
+        // out (see `len`'s invariant).
+        *start = 0;
         *len = 0;
+        if window.start > 0 || window.end < vec.len() {
+            vec.truncate(window.end);
+            vec.drain(..window.start);
+        }
         ArrayVecMut { vec, len }
     }
 
@@ -2825,7 +2860,19 @@ impl<V: Teardown + Clone> Extend<V> for ArrayOf<V> {
     #[inline]
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     fn extend<I: IntoIterator<Item = V>>(&mut self, iter: I) {
-        self.make_vec().extend(iter);
+        // An append keeps the window's offset (`jvp_array_write` on an
+        // unshared view): a loop that peels the front and pushes the back
+        // never compacts the head, which `make_vec` would on every round.
+        self.own_storage();
+        let Self { inner, start, len } = self;
+        let vec = Rc::get_mut(inner).expect("own_storage leaves this handle unique");
+        let (offset, kept) = (*start, *len);
+        // Zeroed while the tail past the window is dropped and while `iter`
+        // runs (see `len`'s invariant); `offset <= vec.len()` throughout.
+        *len = 0;
+        vec.truncate(offset + kept);
+        vec.extend(iter);
+        *len = vec.len() - offset;
     }
 }
 
@@ -12290,30 +12337,76 @@ mod array_window_tests_6659 {
     }
 
     #[test]
-    fn a_fold_of_unique_cuts_bounds_the_storage_it_keeps_alive() {
-        let mut a = ints(0..10_000);
+    fn a_fold_of_unique_cuts_moves_its_offset_as_jq_does() {
+        let len = JQ_SLICE_OFFSET_LIMIT as i64 + 4_464;
+        let mut a = ints(0..len);
+        let storage = Rc::as_ptr(&a.inner);
         let mut compactions = 0;
         while a.len() > 10 {
             a.cut(1..a.len());
-            assert!(
-                a.inner.len() <= 3 * a.len() + 17,
-                "{} stored for a window of {}",
-                a.inner.len(),
-                a.len()
-            );
+            // Never more than jq's 16-bit offset of cut-off elements kept alive, and the tail
+            // past the window is dropped at once.
+            assert!(a.start < JQ_SLICE_OFFSET_LIMIT);
+            assert_eq!(a.inner.len(), a.start + a.len());
             if a.start == 0 {
                 compactions += 1;
             }
         }
-        assert_eq!(values(&a), (9_990..10_000).collect::<Vec<_>>());
-        // Compaction is geometric: a handful of times over 10,000 cuts, not once per cut.
-        assert!(
-            (1..20).contains(&compactions),
-            "compacted {compactions} times"
+        assert_eq!(values(&a), (len - 10..len).collect::<Vec<_>>());
+        // One compaction, where jq's offset reached 65,536 and `jvp_array_slice` copied; after
+        // it the offset counts from 0 again, as the copy's does.
+        assert_eq!(compactions, 1);
+        assert_eq!(a.start, len as usize - 10 - JQ_SLICE_OFFSET_LIMIT);
+        assert_eq!(
+            Rc::as_ptr(&a.inner),
+            storage,
+            "compacted in place, not copied"
         );
         // Cutting to nothing gives a fresh `[]`.
         a.cut(3..3);
         assert!(a.is_empty() && a.inner.is_empty());
+    }
+
+    #[test]
+    fn an_append_to_a_unique_window_keeps_its_offset() {
+        let mut a = ints(0..6);
+        a.cut(2..3);
+        let storage = Rc::as_ptr(&a.inner);
+        a.push(OwnedValue::Int(9));
+        a.extend([OwnedValue::Int(10), OwnedValue::Int(11)]);
+        assert_eq!(values(&a), [2, 9, 10, 11]);
+        assert_eq!(
+            (a.start, a.len),
+            (2, 4),
+            "`jvp_array_write` appends to the view in place"
+        );
+        assert_eq!(Rc::as_ptr(&a.inner), storage);
+        // A queue (peel the front, push the back) never compacts before jq's offset limit.
+        for i in 0..1_000 {
+            a.cut(1..a.len());
+            a.push(OwnedValue::Int(100 + i));
+        }
+        assert_eq!(a.len(), 4);
+        assert_eq!(a.start, 1_002);
+        assert_eq!(Rc::as_ptr(&a.inner), storage);
+        // An append to a shared window copies the window out and leaves the other handle alone.
+        let b = a.clone();
+        a.push(OwnedValue::Int(-1));
+        assert_eq!(a.len(), 5);
+        assert_eq!(b.len(), 4);
+        assert!(!a.ptr_eq(&b));
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn a_slice_past_the_window_panics_in_every_build() {
+        let _ = ints(0..3).slice(1..4);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn a_cut_past_the_window_panics_in_every_build() {
+        ints(0..3).cut(2..4);
     }
 
     #[test]
@@ -12391,6 +12484,49 @@ mod array_window_tests_6659 {
         );
         drop(kept);
         assert_eq!(dropped.get(), 10);
+    }
+
+    /// An element whose destructor panics: a window being cut, compacted or lent out must not be
+    /// left pointing past its `Vec` when that panic is caught.
+    #[derive(Clone)]
+    struct Bomb(bool);
+
+    impl Drop for Bomb {
+        fn drop(&mut self) {
+            if self.0 && !std::thread::panicking() {
+                panic!("bomb");
+            }
+        }
+    }
+
+    impl Teardown for Bomb {}
+
+    #[test]
+    fn a_destructor_that_panics_mid_cut_leaves_a_readable_window() {
+        let build = || -> ArrayOf<Bomb> { (0..10).map(|i| Bomb(i == 8)).collect() };
+        let mut cut = build();
+        let caught = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| cut.cut(1..4)));
+        assert!(caught.is_err());
+        assert!(
+            cut.len() <= cut.inner.len(),
+            "the window stays inside its storage"
+        );
+        let _ = cut.iter().count();
+
+        let mut lent = build();
+        lent.cut(0..9);
+        let caught = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
+            lent.make_vec().truncate(2);
+        }));
+        assert!(caught.is_err());
+        assert!(lent.start + lent.len() <= lent.inner.len());
+        // Defuse what is left before it drops.
+        for bomb in lent.make_vec().iter_mut() {
+            bomb.0 = false;
+        }
+        for bomb in cut.make_vec().iter_mut() {
+            bomb.0 = false;
+        }
     }
 
     /// The window is the width of `OwnedValue::String`'s payload, so `OwnedValue` stays 32 (pinned

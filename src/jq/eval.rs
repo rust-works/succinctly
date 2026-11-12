@@ -18187,7 +18187,7 @@ pub(crate) fn arith_add<S: EvalSemantics>(
         // `null` arm above) a `NumberLiteral` operand must keep its own
         // source spelling here too (#1143).
         (OwnedValue::Array(mut a), b) if S::ARRAY_PLUS_APPENDS => {
-            a.make_vec().push(b);
+            a.push(b);
             Ok(OwnedValue::Array(a))
         }
         // Numeric addition -- only once both operands are confirmed numeric
@@ -45288,7 +45288,7 @@ pub(crate) fn slice_owned_value(
     match target {
         OwnedValue::Array(items) => {
             // A view on the same storage, as jq's slice is (#6659): a refcount bump, not a
-            // copy of the range.
+            // copy of the range, and the array itself for the whole range (#5487).
             let range = literal_array_slice_range(items.len(), start, end);
             Ok(Some(OwnedValue::Array(items.slice(range))))
         }
@@ -45337,19 +45337,9 @@ pub(crate) fn slice_owned_value_read<S: EvalSemantics>(
     if let (EvalTag::Yq, OwnedValue::Object(map)) = (S::TAG, target) {
         return Ok(Some(slice_object_as_yq_children(map, start, end)));
     }
-    // jq mode: a slice naming every element of a non-empty array is that array, not a copy
-    // (`jv_slice(a, 0, len)` hands `a` back), as the cursor-backed `Expr::Slice` arm already
-    // answers (#3306). The copy `slice_owned_value` makes loses the node's identity, so
-    // `[nan] as $a | ($a | .[0:] | .) == $a` was `false` where jq says `true` (#5487).
-    if S::TAG != EvalTag::Yq {
-        if let OwnedValue::Array(items) = target {
-            if !items.is_empty()
-                && SliceBounds::from_literals(start, end).is_full_range(items.len())
-            {
-                return Ok(Some(target.clone()));
-            }
-        }
-    }
+    // A slice naming every element of a non-empty array is that array, not a copy
+    // (`jv_slice(a, 0, len)` hands `a` back, #3306, #5487): `ArrayVec::slice` answers it, with
+    // the rest of `jvp_array_slice`'s rules, in `slice_owned_value`.
     slice_owned_value(target, start, end, optional)
 }
 
