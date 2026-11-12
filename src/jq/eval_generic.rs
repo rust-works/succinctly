@@ -16552,12 +16552,14 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         {
             let owned = owned_or_suppress!(to_owned_with_cursor::<_, S>(&value, cursor), optional);
             let mut comments = alloc::collections::BTreeMap::new();
-            let mut leading = String::new();
-            if let Some(c) = cursor.as_ref() {
-                let array_brackets = yq_props_format_style(format_type).is_some_and(|(_, b)| b);
-                collect_props_comments(c, "", None, array_brackets, &mut comments, 0);
-                leading = c.props_leading_content().unwrap_or_default();
-            }
+            let leading = match cursor.as_ref() {
+                Some(c) => {
+                    let array_brackets = yq_props_format_style(format_type).is_some_and(|(_, b)| b);
+                    collect_props_comments(c, "", None, array_brackets, &mut comments, 0);
+                    c.props_leading_content().unwrap_or_default()
+                }
+                None => String::new(),
+            };
             GenericResult::Owned(OwnedValue::String(
                 format_yq_props_commented(format_type, &owned, &comments, &leading).into(),
             ))
