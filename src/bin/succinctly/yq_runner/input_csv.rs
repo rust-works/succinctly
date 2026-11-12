@@ -512,4 +512,32 @@ mod tests {
         assert_eq!(classify("[1]", false), Cell::Str("[1]".into()));
         assert_eq!(classify("yes", false), Cell::Str("yes".into()));
     }
+
+    #[test]
+    fn a_parse_error_names_the_line_the_record_started_on() {
+        assert_eq!(
+            err("\"a\nb\"x,y\n"),
+            "record on line 1; parse error on line 2, column 2: extraneous or missing \" in quoted-field"
+        );
+        assert_eq!(
+            err("a\n\"x\ny\n"),
+            "record on line 2; parse error on line 3, column 3: extraneous or missing \" in quoted-field"
+        );
+    }
+
+    #[test]
+    fn a_lone_cr_ends_the_last_line_and_a_quote_cannot_be_the_separator() {
+        assert_eq!(yaml("a\n1\r"), "- a: 1\n");
+        let message = transcode(b"a\n1\n", '"', true).unwrap_err();
+        assert_eq!(message, "csv: invalid field or comment delimiter");
+    }
+
+    #[test]
+    fn blanks_several_documents_and_an_alias_are_read_as_yq_reads_them() {
+        let cell = |text: &str| classify(text, true);
+        assert_eq!(cell(" "), Cell::Scalar("#  ".into()));
+        assert_eq!(cell("a\n---\nb"), Cell::Str("a\n---\nb".into()));
+        assert_eq!(cell("*a"), Cell::Str("*a".into()));
+        assert_eq!(cell("!!int \"5\""), Cell::Scalar("!!int \"5\"".into()));
+    }
 }
