@@ -21174,8 +21174,8 @@ mod meta_assign_798 {
     }
 
     /// The clearing form of the comment slots writes (#2796), and `...` (recursive descent that
-    /// also visits mapping keys) is accepted as the target of a comment write only: anywhere
-    /// else, and with `style`/`anchor`, it is refused rather than applied to the wrong node.
+    /// also visits mapping keys) is a comment write's target, and with `style`/`anchor` it is
+    /// refused rather than applied to the wrong node. As a value it is the walk (#7069).
     #[test]
     fn clearing_forms_write_and_dots_is_a_comment_target_only() {
         let doc = "# h\na: 1 # l\n# m\nb: 2\n";
@@ -21184,10 +21184,6 @@ mod meta_assign_798 {
         let (out, code) = run_yq_stdin(".. comments = \"\"", doc, &[]).unwrap();
         assert_eq!((out.as_str(), code), ("a: 1\n# m\nb: 2\n", 0));
         for (filter, needle) in [
-            (
-                "...",
-                "only supported as the target of a metadata assignment",
-            ),
             (
                 "... style = \"double\"",
                 "only supported with the comment slots",
