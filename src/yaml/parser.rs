@@ -5051,6 +5051,45 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         Ok(())
     }
 
+    /// The comment lines between a bare `-` and its value on a later line, when a blank line follows
+    /// their first block (#7044): yq makes that block the *foot* of the value's first key or scalar,
+    /// and only what follows the blank line its head (`- 1` / `-` / `  # c` / blank / `  n1: 1` is
+    /// `.[1].n1`'s key's foot `c`, printed below `n1: 1`; with `  # d` between the blank line and
+    /// `n1: 1`, `d` is its head). Measured against yq v4.53.3, which reads it this way only after a
+    /// node has opened earlier in the document and when the dash line has no comment of its own
+    /// (both checked by the caller); a blank line between the dash and the block keeps the whole run
+    /// the head. Before a flow collection yq drops the block, which this does not reproduce: the
+    /// block stays the collection's head, as for the run [`Self::defers_foot_to_next_item`] places.
+    ///
+    /// The block goes to [`Self::deferred_foot_lines`], which the first key's or scalar's hook
+    /// claims.
+    fn defer_first_block_below_bare_dash(&mut self, below_dash: &mut Vec<(u32, u32)>) {
+        let Some(&(first_start, _)) = below_dash.first() else {
+            return;
+        };
+        if self.blank_line_between(self.pos, first_start as usize) {
+            return;
+        }
+        let last_end = below_dash[below_dash.len() - 1].1 as usize;
+        // The value's first byte: past the blank lines and indentation after the last comment line.
+        let content = self.input[last_end..]
+            .iter()
+            .position(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+            .map_or(self.input.len(), |offset| last_end + offset);
+        if matches!(self.input.get(content), Some(b'[' | b'{')) {
+            return;
+        }
+        let gap = (0..below_dash.len()).find(|&i| {
+            let next_start = below_dash
+                .get(i + 1)
+                .map_or(content, |&(start, _)| start as usize);
+            self.blank_line_between(below_dash[i].1 as usize, next_start)
+        });
+        if let Some(last) = gap {
+            self.deferred_foot_lines.extend(below_dash.drain(..=last));
+        }
+    }
+
     /// A sequence item whose value stands on the lines below its `-` (or below the properties
     /// after it): settle where the line comment, the comments between and a null value go, and
     /// leave the item open for the main loop to read the value into. The one copy of this, shared
@@ -5134,8 +5173,14 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // The lookahead can also have *settled* the block (a
                 // blank line after it resolves it backwards), so clamp.
                 let above_dash = above_dash.min(self.pending_head_lines.len());
-                let below_dash = self.pending_head_lines.split_off(above_dash);
+                let mut below_dash = self.pending_head_lines.split_off(above_dash);
+                // Whether a node opened before this item, in this document or an earlier one (#7044).
+                let follows_a_node = self.last_head_foot_bp.is_some()
+                    || self.document_boundary_fallback_bp.is_some();
                 self.attach_deferred_item_value_at(self.bp_pos, indent);
+                if trailing.is_none() && follows_a_node {
+                    self.defer_first_block_below_bare_dash(&mut below_dash);
+                }
                 self.pending_head_lines = below_dash;
                 if let Some(range) = trailing {
                     self.push_line_comment(wrapper_bp, range);
