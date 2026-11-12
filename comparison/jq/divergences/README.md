@@ -28,7 +28,7 @@ The file holds the other fields, with no `[[divergence]]` header and no `id`:
 | `reason`   | what differs and why                                                                          |
 | `issue`    | optional tracking issue. A branch that references a `to-triage` entry's issue deletes the entry in the same change (`scripts/ledger_refs.py`, #5585); one that only mentions it says `[ledger keeps #N]` on its own line in a commit message |
 | `platform` | optional `std::env::consts::OS` the entry was observed on; other OSes neither expect nor call it stale |
-| `volatile` | optional `true`: whether the difference shows depends on the host, on its speed (a probe the reference finishes inside the 10 s deadline on a fast machine only), on its address-space footprint (`robust:mem-limit-64m-wide` sits just under a `ulimit -v` cap, so jq aborts on x86_64 Linux and fits on aarch64 Linux, #7009) or on which locales it has installed (`locale-strptime-ampm-de-de`: a host with `de_DE` matches, one without falls back to `C` and differs); expected where it shows, not stale where it does not |
+| `volatile` | optional `true`: whether the difference shows depends on the host, on its speed (a probe the reference finishes inside the 10 s deadline on a fast machine only), on its address-space footprint (a probe just under a `ulimit -v` cap) or on which locales it has installed (`locale-strptime-ampm-de-de`: a host with `de_DE` matches, one without falls back to `C` and differs); expected where it shows, not stale where it does not |
 
 Write each field as a basic `"..."` string (or `true`), one per line: `scripts/ledger_refs.py` reads
 `category` and `issue` by pattern, not with a TOML parser.
