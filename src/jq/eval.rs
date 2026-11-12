@@ -50,7 +50,7 @@ use super::key_index;
 use super::local_zone::{self, LocalZone};
 use super::locale_time;
 use super::math;
-use super::slice::{self, SliceBounds};
+use super::slice::{self, fold_bounds, SliceBound, SliceBounds};
 use super::tail_call::{
     bind_next, body_is_reusable, pipe_settles_before_last, stage_settles, tail_def, tail_reachable,
     Tail, TailRounds,
@@ -20806,7 +20806,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::WithDtf(layout, body) => builtin_with_dtf::<W, S>(layout, body, value, optional),
 
         // #6081: yq's `eval`.
-        Builtin::EvalExpr(expr) => builtin_eval_expr::<W, S>(expr, value, optional),
+        Builtin::EvalExpr(expr, ext) => builtin_eval_expr::<W, S>(expr, *ext, value, optional),
 
         // Phase 22: File operations (yq)
         Builtin::Load(file_expr, kind) => builtin_load::<W, S>(file_expr, *kind, value, optional),
@@ -25704,8 +25704,20 @@ pub(crate) fn format_owned<S: EvalSemantics>(
         FormatType::Sh => format_sh::<S>(owned, optional),
         FormatType::Urid => format_urid::<S>(owned, optional),
         FormatType::Yaml => format_yaml(owned),
+        FormatType::Props if S::TAG == EvalTag::Yq => Ok(yq_encoder_prefs::with(|prefs| {
+            format_props_with(
+                owned,
+                &prefs.properties_separator,
+                prefs.properties_array_brackets,
+            )
+        })),
         FormatType::Props => format_props(owned),
-        FormatType::YqOutput(encoder) => format_yq_output::<S>(encoder, owned),
+        FormatType::YqOutput(encoder) => {
+            let text = format_yq_output::<S>(encoder, owned)
+                .map_err(|e| EvalError::output_encoder(e.message))?;
+            note_output_encoder_result(owned);
+            Ok(text)
+        }
         FormatType::YqJson(indent) => {
             // #6887: yq's JSON encoder refuses a non-finite number.
             if let Some(message) = owned.yq_non_finite_json_error(false) {
@@ -26307,7 +26319,7 @@ fn format_yq_csv<S: EvalSemantics>(
 /// @csv - CSV format (for arrays)
 fn format_csv<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
     if S::TAG == EvalTag::Yq {
-        return format_yq_csv::<S>(value, ',', false);
+        return format_yq_csv::<S>(value, yq_encoder_prefs::with(|p| p.csv_separator), false);
     }
     match value {
         OwnedValue::Array(arr) => {
@@ -26829,6 +26841,117 @@ fn format_props_recursive(
             // else: a scalar whose joined key is empty (`{"":"v"}`) writes nothing in yq, not even a line
         }
     }
+}
+
+/// Whether any result an `-o=<format>` encoder encoded was neither `null` nor `false`, and `None`
+/// when no encoder ran since [`reset_output_encoder_truthy`] (#6923).
+///
+/// `-e` reads the value the filter produced, not the encoded text (`-o=props '.zz'` encodes `null`
+/// to the line `null`, which is truthy as text): the encoder is the last stage of the program, so it
+/// records here what it was given. A process-wide cell, not a `thread_local!`: the evaluator may
+/// run on a worker thread with a larger native stack (ADR-0025) while the CLI reads the answer on
+/// its own.
+pub fn output_encoder_saw_truthy() -> Option<bool> {
+    match ENCODER_TRUTHY.load(core::sync::atomic::Ordering::Relaxed) {
+        ENCODER_TRUTHY_SEEN_FALSY => Some(false),
+        ENCODER_TRUTHY_SEEN_TRUTHY => Some(true),
+        _ => None,
+    }
+}
+
+/// yq's `--properties-separator`, `--properties-array-brackets` and `--csv-separator` (#6922).
+///
+/// yq reads them for the `@props` / `to_props` and `@csv` / `to_csv` operators as well as for
+/// `-o=props` and `-o=csv`: every `@props` and `@csv` a yq-mode program runs uses them, including
+/// one in the text an `eval` reads or in `format("csv")`. `@tsv` keeps its tab, as in yq.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct YqEncoderPrefs {
+    /// Between a key and its value; empty means yq's default ` = `.
+    pub properties_separator: String,
+    /// `a[0]` rather than `a.0` for an array element below the root.
+    pub properties_array_brackets: bool,
+    /// The field separator of `@csv`.
+    pub csv_separator: char,
+}
+
+impl Default for YqEncoderPrefs {
+    fn default() -> Self {
+        Self {
+            properties_separator: String::from(" = "),
+            properties_array_brackets: false,
+            csv_separator: ',',
+        }
+    }
+}
+
+/// Set the [`YqEncoderPrefs`] every later yq-mode `@props` and `@csv` uses (#6922).
+///
+/// The CLI calls it once, from the flags. A process-wide setting, as yq's own
+/// `ConfiguredPropertiesPreferences` and `ConfiguredCsvPreferences` are, and not a
+/// `thread_local!`: the evaluator may run on a worker thread with a larger native stack
+/// (ADR-0025). Without `std` the defaults always apply.
+pub fn set_yq_encoder_prefs(mut prefs: YqEncoderPrefs) {
+    // An empty `--properties-separator` is yq's default, so it is stored as the default.
+    if prefs.properties_separator.is_empty() {
+        prefs.properties_separator = YqEncoderPrefs::default().properties_separator;
+    }
+    #[cfg(feature = "std")]
+    {
+        let is_default = prefs == YqEncoderPrefs::default();
+        *yq_encoder_prefs::PREFS
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = (!is_default).then_some(prefs);
+        yq_encoder_prefs::SET.store(!is_default, core::sync::atomic::Ordering::Release);
+    }
+    #[cfg(not(feature = "std"))]
+    let _ = prefs;
+}
+
+/// The reads behind [`set_yq_encoder_prefs`]. Until a run sets a flag no lock is taken.
+mod yq_encoder_prefs {
+    use super::YqEncoderPrefs;
+
+    #[cfg(feature = "std")]
+    pub(super) static PREFS: std::sync::RwLock<Option<YqEncoderPrefs>> =
+        std::sync::RwLock::new(None);
+    /// Whether [`PREFS`] holds anything but the defaults.
+    #[cfg(feature = "std")]
+    pub(super) static SET: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
+    /// `f` of the prefs in effect.
+    pub(super) fn with<T>(f: impl FnOnce(&YqEncoderPrefs) -> T) -> T {
+        #[cfg(feature = "std")]
+        if SET.load(core::sync::atomic::Ordering::Acquire) {
+            if let Some(prefs) = PREFS
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+            {
+                return f(prefs);
+            }
+        }
+        f(&YqEncoderPrefs::default())
+    }
+}
+
+/// Forget what [`output_encoder_saw_truthy`] holds, at the start of a run (#6923).
+pub fn reset_output_encoder_truthy() {
+    ENCODER_TRUTHY.store(0, core::sync::atomic::Ordering::Relaxed);
+}
+
+const ENCODER_TRUTHY_SEEN_FALSY: u8 = 1;
+const ENCODER_TRUTHY_SEEN_TRUTHY: u8 = 2;
+static ENCODER_TRUTHY: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Record that an encoder encoded `value` (#6923).
+fn note_output_encoder_result(value: &OwnedValue) {
+    let state = if matches!(value, OwnedValue::Null | OwnedValue::Bool(false)) {
+        ENCODER_TRUTHY_SEEN_FALSY
+    } else {
+        ENCODER_TRUTHY_SEEN_TRUTHY
+    };
+    ENCODER_TRUTHY.fetch_max(state, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// yq's `-o=<format>` encoders (#6850): the whole result as that format, line ends included, so the
@@ -28422,6 +28545,9 @@ fn builtin_envsubst<W: Clone + AsRef<[u64]>>(
     flags: super::envsubst::EnvsubstFlags,
     optional: bool,
 ) -> QueryResult<'_, W> {
+    if let Some(refusal) = super::eval_generic::env_ops_refusal() {
+        return QueryResult::Error(EvalError::new(refusal));
+    }
     let text = match &value {
         StandardJson::String(s) => match s.as_str() {
             Ok(cow) => cow.into_owned(),
@@ -41961,7 +42087,9 @@ fn index_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         OwnedValue::Object(desc) if S::TAG != EvalTag::Yq => {
             let (start, end) = descriptor_slice_bounds(desc);
             let kind = SliceTargetKind::of_type_name(type_name(&target));
-            match resolve_computed_slice_bounds::<S>(kind, &start, &end) {
+            match resolve_computed_slice_bounds_for::<S>(kind, &start, &end, || {
+                standard_json_slice_len(&target)
+            }) {
                 Ok((start, end)) => {
                     let slice = Expr::Slice {
                         start,
@@ -43583,7 +43711,9 @@ fn slice_pair<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     // `slice_owned_value_read_computed`, honouring
                     // `optional` the same way.
                     let kind = SliceTargetKind::of_type_name(type_name(t));
-                    let (s, e) = match resolve_computed_slice_bounds::<S>(kind, s, e) {
+                    let (s, e) = match resolve_computed_slice_bounds_for::<S>(kind, s, e, || {
+                        standard_json_slice_len(t)
+                    }) {
                         Ok(bounds) => bounds,
                         Err(_) if optional => continue,
                         Err(err) => escape!(Control::Error(err)),
@@ -43693,7 +43823,7 @@ fn slice_pair<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// literal one does (`SliceBounds::resolve` re-applies the same floor/ceil
 /// to whatever `Expr::Slice` carries, so rounding here first is transparent
 /// to it -- see `slice.rs`'s doc comment -- except for an end in `(-1, 0)`,
-/// which [`owned_bound_to_i64`] carries as past-the-end, #3404). A missing
+/// which [`owned_bound_to_slice_bound`] carries as past-the-end, #3404). A missing
 /// bound (`None`) is a single open side (`Ok(None)`) -- not an empty stream.
 ///
 /// The successor of the eager `eval_slice_bound` this file carried until
@@ -43826,30 +43956,36 @@ fn pull_slice_bound<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// `NumberKey`, which `slice_bound_component_value` reads before the `i64`.
 /// A floored start never takes this arm: `floor` of a negative number is
 /// never zero.
-pub(crate) fn owned_bound_to_i64(
+///
+/// The answer is a [`SliceBound`] since #6984: the integer described above, plus the bound's own
+/// double when it is negative with a fractional part, because the length decides how that one
+/// rounds (see [`SliceBound`]). A route that never folds against a length reads
+/// [`SliceBound::rounded`].
+pub(crate) fn owned_bound_to_slice_bound(
     v: &OwnedValue,
     round: fn(f64) -> f64,
-) -> Result<Option<i64>, EvalError> {
+) -> Result<Option<SliceBound>, EvalError> {
     Ok(SliceBounds::resolved_bound(v)?.map(|f| {
         let rounded = round(f);
         // A NaN *end* is the length (#5231, `parse_slice`'s `dend = len`), the same
         // past-the-end answer as above; a NaN start is `0`, which `as i64` gives.
-        if (f < 0.0 && rounded == 0.0) || (f.is_nan() && rounds_up(round)) {
+        let rounded = if (f < 0.0 && rounded == 0.0) || (f.is_nan() && rounds_up(round)) {
             i64::MAX
         } else {
             rounded as i64
-        }
+        };
+        SliceBound::new(rounded, f)
     }))
 }
 
 /// Whether `round` is the ceiling an end bound takes rather than the floor a start bound takes: the
-/// callers of [`owned_bound_to_i64`] pass `f64::ceil` for an end and `f64::floor` for a start, and
+/// callers of [`owned_bound_to_slice_bound`] pass `f64::ceil` for an end and `f64::floor` for a start, and
 /// nothing else, so `ceil(0.5)` is `1` where `floor(0.5)` is `0` (#5231).
 fn rounds_up(round: fn(f64) -> f64) -> bool {
     round(0.5) > 0.5
 }
 
-/// [`owned_bound_to_i64`] under the mode's own bound grammar (#3415).
+/// [`owned_bound_to_slice_bound`] under the mode's own bound grammar (#3415).
 ///
 /// Real yq hands every bound's scalar text to `strconv.ParseInt`, so a bound
 /// that is not integer-shaped is refused -- whatever the target, and `?` does
@@ -43864,11 +44000,11 @@ fn rounds_up(round: fn(f64) -> f64) -> bool {
 pub(crate) fn owned_bound_to_i64_for<S: EvalSemantics>(
     v: &OwnedValue,
     round: fn(f64) -> f64,
-) -> Result<Option<i64>, EvalError> {
+) -> ComputedSliceBound {
     if S::TAG == EvalTag::Yq && yq_slice_bound_not_integral(v) {
         return Err(EvalError::slice_indices_not_integers());
     }
-    owned_bound_to_i64(v, round)
+    owned_bound_to_slice_bound(v, round)
 }
 
 /// Whether a computed float is text `strconv.ParseInt` refuses: not finite, fractional, or of the
@@ -43935,7 +44071,7 @@ fn descriptor_bound_sides(desc: &IndexMap<String, OwnedValue>) -> (PathSliceBoun
 }
 
 /// One computed slice bound as `E[S:T]` carries it from the bound generator
-/// to the slice step (#2546): [`owned_bound_to_i64`]'s answer for the value
+/// to the slice step (#2546): [`owned_bound_to_slice_bound`]'s answer for the value
 /// the generator produced, with a *failed* classification carried rather
 /// than raised.
 ///
@@ -43959,7 +44095,7 @@ fn descriptor_bound_sides(desc: &IndexMap<String, OwnedValue>) -> (PathSliceBoun
 /// helpers (`each_slice_bound`, `each_slice_bound_generic`,
 /// `drive_slice_bound`) raise a failed classification before any bound
 /// reaches the slice step, and this type only ever holds `Ok` there.
-pub(crate) type ComputedSliceBound = Result<Option<i64>, EvalError>;
+pub(crate) type ComputedSliceBound = Result<Option<SliceBound>, EvalError>;
 
 /// The three target kinds jq's `INDEX` opcode tells apart before it reads a
 /// slice descriptor's bounds (#2546) -- see [`ComputedSliceBound`].
@@ -44001,11 +44137,16 @@ impl SliceTargetKind<'_> {
 /// the pull site (see [`ComputedSliceBound`]), so both bounds are `Ok` here
 /// and today's eager, target-blind shape is preserved unchanged. The one `Err` a yq bound can
 /// carry, the count error (#2056), is raised by the pair loop before it gets here.
+///
+/// The bounds come back as [`SliceBound`]s, not integers (#6984): a negative bound with a
+/// fractional part is folded against the length, which only the caller holding the target
+/// knows ([`resolve_computed_slice_bounds_for`] for a caller that has the length,
+/// [`resolve_navigable_slice_bounds`] for one that navigates by the rounded integer).
 pub(crate) fn resolve_computed_slice_bounds<S: EvalSemantics>(
     kind: SliceTargetKind<'_>,
     start: &ComputedSliceBound,
     end: &ComputedSliceBound,
-) -> Result<(Option<i64>, Option<i64>), EvalError> {
+) -> Result<(Option<SliceBound>, Option<SliceBound>), EvalError> {
     let kind = if S::TAG == EvalTag::Yq {
         SliceTargetKind::Sliceable
     } else {
@@ -44014,8 +44155,55 @@ pub(crate) fn resolve_computed_slice_bounds<S: EvalSemantics>(
     match kind {
         SliceTargetKind::Null => Ok((None, None)),
         SliceTargetKind::Other(name) => Err(EvalError::cannot_index_with_type(name, "object")),
-        SliceTargetKind::Sliceable => Ok((start.clone()?, end.clone()?)),
+        SliceTargetKind::Sliceable => Ok((
+            *start.as_ref().map_err(Clone::clone)?,
+            *end.as_ref().map_err(Clone::clone)?,
+        )),
     }
+}
+
+/// The length a computed slice folds a bound with a fractional part against (#6984): an array's
+/// element count or a string's character count, `None` for any other target or when the count
+/// itself fails (the slice then meets the same failure, and raises it).
+fn standard_json_slice_len<W: Clone + AsRef<[u64]>>(target: &StandardJson<'_, W>) -> Option<usize> {
+    match target {
+        StandardJson::Array(elements) => array_index::len_checked_memoized(elements).ok(),
+        StandardJson::String(s) => s.as_str().ok().map(|text| text.chars().count()),
+        _ => None, // patchcov: coverage tolerate-line reason="unreachable: only an array or a string target asks for the length, because a bound keeps its double in jq mode only, where the target's kind is ruled on first; yq resolves every kind as sliceable but refuses a fractional bound before it gets here"
+    }
+}
+
+/// [`standard_json_slice_len`] for an owned target.
+pub(crate) fn owned_slice_len(target: &OwnedValue) -> Option<usize> {
+    match target {
+        OwnedValue::Array(items) => Some(items.len()),
+        OwnedValue::String(s) => Some(s.chars().count()),
+        _ => None, // patchcov: coverage tolerate-line reason="unreachable: same as standard_json_slice_len, an owned target that is neither array nor string never asks for a length"
+    }
+}
+
+/// [`resolve_computed_slice_bounds`] folded against the target's length (#6984), the integers
+/// `slice_owned_value_read` and `slice_one_generic` take. `len` is asked for only when a bound
+/// kept its double, and only for a target the bounds apply to.
+pub(crate) fn resolve_computed_slice_bounds_for<S: EvalSemantics>(
+    kind: SliceTargetKind<'_>,
+    start: &ComputedSliceBound,
+    end: &ComputedSliceBound,
+    len: impl FnOnce() -> Option<usize>,
+) -> Result<(Option<i64>, Option<i64>), EvalError> {
+    let (s, e) = resolve_computed_slice_bounds::<S>(kind, start, end)?;
+    Ok(fold_bounds(s, e, len))
+}
+
+/// [`resolve_computed_slice_bounds`] for a route that navigates by the rounded integer and
+/// reads the bound's own spelling from its key where the double matters (path mode, #6984).
+pub(crate) fn resolve_navigable_slice_bounds<S: EvalSemantics>(
+    kind: SliceTargetKind<'_>,
+    start: &ComputedSliceBound,
+    end: &ComputedSliceBound,
+) -> Result<(Option<i64>, Option<i64>), EvalError> {
+    let (s, e) = resolve_computed_slice_bounds::<S>(kind, start, end)?;
+    Ok((s.map(SliceBound::rounded), e.map(SliceBound::rounded)))
 }
 
 /// [`slice_owned_value_read`] for a pair of [`ComputedSliceBound`]s (#2546):
@@ -44030,7 +44218,9 @@ pub(crate) fn slice_owned_value_read_computed<S: EvalSemantics>(
     optional: bool,
 ) -> Result<Option<OwnedValue>, EvalError> {
     let kind = SliceTargetKind::of_type_name(owned_type_name(target));
-    let (s, e) = match resolve_computed_slice_bounds::<S>(kind, start, end) {
+    let (s, e) = match resolve_computed_slice_bounds_for::<S>(kind, start, end, || {
+        owned_slice_len(target)
+    }) {
         Ok(bounds) => bounds,
         Err(_) if optional => return Ok(None),
         Err(e) => return Err(e),
@@ -45609,6 +45799,30 @@ pub fn enter_file_names_scope(names: Vec<String>) -> FileNamesScope {
 
 /// The scope [`enter_file_names_scope`] opens; dropping it closes the scope.
 pub struct FileNamesScope(#[allow(dead_code)] super::eval_generic::FileNamesGuard);
+
+/// Refuse the environment and file operators until the returned guard is dropped (#7025).
+///
+/// `disable_env_ops` refuses `env(..)`, `strenv(..)` and `envsubst`, and `disable_file_ops` refuses
+/// `load`, `load_str` and `load_base64`: yq's `--security-disable-env-ops` and
+/// `--security-disable-file-ops`.
+///
+/// The refusal is raised when the operator runs, as an error named `env operations have been
+/// disabled` or `file operations have been disabled`, and `?` does not swallow it. yq also raises
+/// it for an operator no node reaches (`select(false) | strenv(X)`), which this does not.
+///
+/// The setting belongs to the calling thread, as the file-names table does: the CLI evaluates on
+/// one thread, and a caller that moves evaluation to another must enter the scope there, or the
+/// operators run unrefused.
+#[must_use = "the scope ends when the guard is dropped"]
+pub fn enter_security_scope(disable_env_ops: bool, disable_file_ops: bool) -> SecurityScope {
+    SecurityScope(super::eval_generic::enter_security(
+        disable_env_ops,
+        disable_file_ops,
+    ))
+}
+
+/// The scope [`enter_security_scope`] opens; dropping it closes the scope.
+pub struct SecurityScope(#[allow(dead_code)] super::eval_generic::SecurityGuard);
 
 /// The scope [`enter_file_index_scope`] opens; dropping it closes the scope.
 pub struct FileIndexScope(#[allow(dead_code)] super::eval_generic::NodeOriginGuard);
@@ -47831,7 +48045,7 @@ fn builtin_yields_at_most_one_value(builtin: &Builtin) -> bool {
         | Builtin::Tz(_)
         | Builtin::FormatDatetime(_)
         | Builtin::WithDtf(_, _)
-        | Builtin::EvalExpr(_)
+        | Builtin::EvalExpr(..)
         | Builtin::Unique
         | Builtin::UniqueBy(_)
         | Builtin::UpperIn(_)
@@ -54487,7 +54701,7 @@ fn descriptor_path_component<S: EvalSemantics>(
     let (s, e) = descriptor_bound_sides(desc);
     let (start, end) = match SliceTargetKind::of_type_name(owned_type_name(container)) {
         SliceTargetKind::Null => (s.navigable(), e.navigable()),
-        kind => resolve_computed_slice_bounds::<S>(kind, &s.bound, &e.bound)?,
+        kind => resolve_navigable_slice_bounds::<S>(kind, &s.bound, &e.bound)?,
     };
     let canonical = desc.len() == 2
         && desc.get_index(0).is_some_and(|(k, _)| k == "start")
@@ -54559,7 +54773,7 @@ fn number_key_for(v: &OwnedValue) -> Option<NumberKey> {
 ///
 /// [`Expr::Slice`] carries each bound's key as an independent optional
 /// field, so this returns just the key half; the caller pairs it with the
-/// bound's own already-resolved `i64` (from [`owned_bound_to_i64`]) when
+/// bound's own already-resolved `i64` (from [`owned_bound_to_slice_bound`]) when
 /// constructing the path component.
 fn numeric_slice_bound_key(v: &OwnedValue) -> Option<NumberKey> {
     number_key_for(v)
@@ -60390,8 +60604,8 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             resolve_skip_sink::<S>(n, expr, value, trackable, snapshot, frame, keep, sink)
         }
         // #6081: `eval(s)` names the paths the expression `s` reads names.
-        Expr::Builtin(Builtin::EvalExpr(arg)) => {
-            resolve_eval_expr_sink::<S>(arg, value, trackable, snapshot, frame, keep, sink)
+        Expr::Builtin(Builtin::EvalExpr(arg, ext)) => {
+            resolve_eval_expr_sink::<S>(arg, *ext, value, trackable, snapshot, frame, keep, sink)
         }
         // #5863: `with_dtf(layout; f)` names the paths `f` names, so a write through it lands
         // (`with_dtf("2006"; .a) = 5` writes `.a` in yq v4.53.3).
@@ -84862,7 +85076,7 @@ fn resolve_slice_expr_sink<'a, S: EvalSemantics>(
                 // consulted for this kind: it is the *non*-null rule
                 // (#2546), and it raises.
                 SliceTargetKind::Null => (s.navigable(), e.navigable()),
-                kind => match resolve_computed_slice_bounds::<S>(kind, &s.bound, &e.bound) {
+                kind => match resolve_navigable_slice_bounds::<S>(kind, &s.bound, &e.bound) {
                     Ok(bounds) => bounds,
                     Err(_) if optional => continue,
                     Err(err) => escape!(err.into()),
@@ -85093,7 +85307,7 @@ struct PathSliceBound {
     /// replaces (#2853): those two were provably exclusive.
     /// [`numeric_slice_bound_key`] answers `Some` only for a `Float`/
     /// `NumberLiteral`, and the value was kept only when
-    /// [`owned_bound_to_i64`] failed, which happens only for a *non*-number
+    /// [`owned_bound_to_slice_bound`] failed, which happens only for a *non*-number
     /// -- so no bound could ever have had both, and the `unreachable!()` the
     /// old rendering needed for "failed, but nothing kept" went with them.
     ///
@@ -85117,7 +85331,7 @@ impl PathSliceBound {
     /// Classify one value the generator produced (#2546), keeping the value
     /// itself only if the classification failed.
     fn classify(raw: OwnedValue, round: fn(f64) -> f64) -> Self {
-        let bound = owned_bound_to_i64(&raw, round);
+        let bound = owned_bound_to_slice_bound(&raw, round);
         let key = if bound.is_err() {
             Some(SliceBoundKey::Raw(Box::new(raw)))
         } else {
@@ -85128,7 +85342,12 @@ impl PathSliceBound {
 
     /// The `i64` this bound navigates with, if it has one.
     fn navigable(&self) -> Option<i64> {
-        self.bound.as_ref().ok().copied().flatten()
+        self.bound
+            .as_ref()
+            .ok()
+            .copied()
+            .flatten()
+            .map(SliceBound::rounded)
     }
 
     /// What this bound renders as in a `{"start":s,"end":e}` descriptor --
@@ -85144,7 +85363,7 @@ impl PathSliceBound {
 ///
 /// Mirrors [`each_slice_bound`] (read mode): a missing bound is a single
 /// open side -- not an empty stream, and a resolved number is rounded the
-/// way [`owned_bound_to_i64`] documents.
+/// way [`owned_bound_to_slice_bound`] documents.
 ///
 /// Pairs each bound with [`numeric_slice_bound_key`]'s answer for the same
 /// value (#1326) -- a genuinely *dynamic* bound (`.[$a:$b]`, `.[(1+1):]`)
@@ -85778,8 +85997,14 @@ fn fused_slice_index_branch<'a, S: EvalSemantics>(
     };
     let (s, e) = (bound(start, f64::floor)?, bound(end, f64::ceil)?);
     let (start, end) =
-        resolve_computed_slice_bounds::<S>(SliceTargetKind::Sliceable, &s.bound, &e.bound).ok()?;
-    let value = match fused_slice_index_position(start, end, items.len(), *idx) {
+        resolve_navigable_slice_bounds::<S>(SliceTargetKind::Sliceable, &s.bound, &e.bound).ok()?;
+    // #6984: the position reads the bounds folded against the length, as `parse_slice` does; the
+    // component keeps the rounded integers and the bounds' own spelling.
+    // Both bounds are `Ok` here, or the resolve above would have declined.
+    let given = |bound: &ComputedSliceBound| bound.as_ref().ok().copied().flatten();
+    let (folded_start, folded_end) =
+        fold_bounds(given(&s.bound), given(&e.bound), || Some(items.len()));
+    let value = match fused_slice_index_position(folded_start, folded_end, items.len(), *idx) {
         Some(position) => match &branch.value {
             // Borrowed from the document at its own lifetime, not cloned out of it.
             Cow::Borrowed(OwnedValue::Array(items)) => Cow::Borrowed(items.get(position)?),
@@ -103020,7 +103245,14 @@ fn fold_root_slice_bounds<S: EvalSemantics>(branch: &Expr, root: &OwnedValue) ->
         if escape.is_some() || !number {
             return Err(());
         }
-        owned_bound_to_i64_for::<S>(value, round).map_err(|_| ())
+        // #6984: a bound with a fractional part below zero is folded against the length of the
+        // slice's target, which this rewrite to an integer-bounded `Expr::Slice` cannot carry:
+        // the branch is left to the resolver, which can.
+        match owned_bound_to_i64_for::<S>(value, round) {
+            Ok(Some(b)) if b.has_fraction() => Err(()),
+            Ok(b) => Ok(b.map(SliceBound::rounded)),
+            Err(_) => Err(()),
+        }
     }
     match branch {
         Expr::Identity | Expr::Slice { .. } => Some(branch.clone()),
@@ -109253,8 +109485,14 @@ fn with_eval_depth<T>(body: impl FnOnce() -> T) -> Result<T, EvalError> {
 
 /// The expression yq's `eval` reads from one output of its argument: a scalar's text (`null` is
 /// `null`), and nothing for a container, which is the empty expression, that is the node itself.
+///
+/// `jq_extensions` is the run's `--jq-extensions`, carried by the `eval` call that was parsed
+/// under it (#7012): the text gets the same opt-in back into jq's surface as the program does.
 #[cfg(feature = "std")]
-fn parse_eval_text<S: EvalSemantics>(text: &OwnedValue) -> Result<Expr, EvalError> {
+fn parse_eval_text<S: EvalSemantics>(
+    text: &OwnedValue,
+    jq_extensions: bool,
+) -> Result<Expr, EvalError> {
     let text = yq_scalar_text::<S>(text)
         .map(Cow::into_owned)
         .unwrap_or_default();
@@ -109266,14 +109504,19 @@ fn parse_eval_text<S: EvalSemantics>(text: &OwnedValue) -> Result<Expr, EvalErro
     if blank {
         return Ok(Expr::Identity);
     }
-    super::parser::parse_with_mode(&text, super::parser::ParserMode::Yq)
-        .map_err(|_| EvalError::new("bad expression, please check expression syntax"))
+    super::parser::parse_with_mode_and_extensions(
+        &text,
+        super::parser::ParserMode::Yq,
+        jq_extensions,
+    )
+    .map_err(|_| EvalError::new("bad expression, please check expression syntax"))
 }
 
 /// Builtin: `eval(expr)` (yq, #6081): every output of `expr` is read as a yq expression and
 /// evaluated against this node, in order.
 fn builtin_eval_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     arg: &Expr,
+    jq_extensions: bool,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
@@ -109291,7 +109534,7 @@ fn builtin_eval_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             if text.is_null() {
                 continue;
             }
-            match parse_eval_text::<S>(text) {
+            match parse_eval_text::<S>(text, jq_extensions) {
                 Ok(parsed) => exprs.push(parsed),
                 Err(e) => return suppress_or_raise(e, optional),
             }
@@ -109305,15 +109548,17 @@ fn builtin_eval_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
     #[cfg(not(feature = "std"))]
     {
-        let _ = (arg, value);
+        let _ = (arg, jq_extensions, value);
         suppress_or_raise(EvalError::new("eval requires the std feature"), optional)
     }
 }
 
 /// The path-position twin of [`builtin_eval_expr`]: the paths the evaluated expressions name,
 /// so a write or `del` through `eval(".a")` lands (`eval(".a") = 5` writes `.a` in yq v4.53.3).
+#[allow(clippy::too_many_arguments)] // STYLE-0004: the sibling `resolve_*_sink` shape plus the call's `--jq-extensions`, threaded straight to `parse_eval_text`
 fn resolve_eval_expr_sink<'a, S: EvalSemantics>(
     arg: &Expr,
+    jq_extensions: bool,
     value: &'a OwnedValue,
     trackable: bool,
     snapshot: &Snapshot,
@@ -109332,7 +109577,7 @@ fn resolve_eval_expr_sink<'a, S: EvalSemantics>(
             if text.is_null() {
                 continue;
             }
-            let parsed = match parse_eval_text::<S>(text) {
+            let parsed = match parse_eval_text::<S>(text, jq_extensions) {
                 Ok(parsed) => parsed,
                 Err(e) => return ResolveFlow::Escaped(e.into()),
             };
@@ -109350,7 +109595,16 @@ fn resolve_eval_expr_sink<'a, S: EvalSemantics>(
     }
     #[cfg(not(feature = "std"))]
     {
-        let _ = (arg, value, trackable, snapshot, frame, keep, sink);
+        let _ = (
+            arg,
+            jq_extensions,
+            value,
+            trackable,
+            snapshot,
+            frame,
+            keep,
+            sink,
+        );
         ResolveFlow::Escaped(EvalError::new("eval requires the std feature").into())
     }
 }
@@ -109372,6 +109626,9 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    if let Some(refusal) = super::eval_generic::file_ops_refusal() {
+        return QueryResult::Error(EvalError::new(refusal));
+    }
     if S::TAG == EvalTag::Yq {
         let (names, trailing) =
             stream_outputs::<_, S>(eval_single::<W, S>(file_expr, value, optional));
@@ -112087,6 +112344,9 @@ fn environment_object_in(snapshot: bool) -> OwnedValue {
 /// $ENV expression - returns object of all environment variables
 #[cfg(feature = "std")]
 fn eval_env<'a, W: Clone + AsRef<[u64]>>(_optional: bool) -> QueryResult<'a, W> {
+    if let Some(refusal) = super::eval_generic::env_ops_refusal() {
+        return QueryResult::Error(EvalError::new(refusal));
+    }
     QueryResult::Owned(environment_object())
 }
 
@@ -112117,6 +112377,9 @@ fn builtin_env<W: Clone + AsRef<[u64]>>(
     _value: StandardJson<'_, W>,
     _optional: bool,
 ) -> QueryResult<'_, W> {
+    if let Some(refusal) = super::eval_generic::env_ops_refusal() {
+        return QueryResult::Error(EvalError::new(refusal));
+    }
     QueryResult::Owned(environment_object())
 }
 
@@ -112136,6 +112399,9 @@ fn builtin_envvar<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    if let Some(refusal) = super::eval_generic::env_ops_refusal() {
+        return QueryResult::Error(EvalError::new(refusal));
+    }
     // Evaluate the expression to get the variable name
     //
     // #1820: to_owned, not to_owned_lossy -- `value` (`.`, the binding
@@ -112212,6 +112478,9 @@ fn builtin_env_object<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     name: &str,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    if let Some(refusal) = super::eval_generic::env_ops_refusal() {
+        return QueryResult::Error(EvalError::new(refusal));
+    }
     match std::env::var(name) {
         Ok(val) if S::TAG == EvalTag::Yq => {
             if val.is_empty() {
@@ -112254,6 +112523,9 @@ fn builtin_strenv<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     name: &str,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    if let Some(refusal) = super::eval_generic::env_ops_refusal() {
+        return QueryResult::Error(EvalError::new(refusal));
+    }
     match std::env::var(name) {
         Ok(val) => QueryResult::Owned(OwnedValue::String(val.into())),
         Err(std::env::VarError::NotPresent) if S::TAG == EvalTag::Yq => {
@@ -137496,9 +137768,9 @@ mod tests {
     /// against yq v4.53.3: prints only `Error: y` (no output, no type
     /// error about "x"). This pins the accidental interaction the
     /// generator-escape gate has with the (now-fixed, #2372)
-    /// `owned_bound_to_i64` conversion step: with the prefix discarded
+    /// `owned_bound_to_slice_bound` conversion step: with the prefix discarded
     /// before conversion ever runs on it in yq mode, `"x"` never reaches
-    /// `owned_bound_to_i64` at all, so `error("y")` -- the bound
+    /// `owned_bound_to_slice_bound` at all, so `error("y")` -- the bound
     /// generator's own escape -- is what surfaces, matching real yq
     /// exactly. jq mode is unaffected by this yq-only gate either way, and
     /// (as of #2372) no longer has an underlying conversion-prefix bug to
@@ -159019,8 +159291,16 @@ mod tests {
     /// never rounds a negative number to zero.
     #[test]
     fn owned_bound_to_i64_end_in_open_unit_interval_is_past_the_end_3404() {
-        let end = |f: f64| owned_bound_to_i64(&OwnedValue::Float(f), f64::ceil).unwrap();
-        let start = |f: f64| owned_bound_to_i64(&OwnedValue::Float(f), f64::floor).unwrap();
+        let end = |f: f64| {
+            owned_bound_to_slice_bound(&OwnedValue::Float(f), f64::ceil)
+                .unwrap()
+                .map(SliceBound::rounded)
+        };
+        let start = |f: f64| {
+            owned_bound_to_slice_bound(&OwnedValue::Float(f), f64::floor)
+                .unwrap()
+                .map(SliceBound::rounded)
+        };
 
         assert_eq!(end(-0.5), Some(i64::MAX));
         assert_eq!(end(-0.999), Some(i64::MAX));
@@ -159037,6 +159317,35 @@ mod tests {
         assert_eq!(bounds.resolve(0), 0..0);
         assert!(bounds.is_full_range(4));
         assert_eq!(bounds.resolve_object_children(2), 0..4);
+    }
+
+    /// #6984: the length a fractional bound folds against is an array's element count or a
+    /// string's character count, and nothing else's -- for a cursor into the document and for
+    /// an owned value alike.
+    #[test]
+    fn the_length_a_slice_bound_folds_against_is_elements_or_characters_6984() {
+        let len_in_document = |json: &[u8]| {
+            let index = crate::json::JsonIndex::build(json);
+            let root = index.root(json);
+            standard_json_slice_len(&root.value())
+        };
+        assert_eq!(len_in_document(b"[1,2,3]"), Some(3));
+        assert_eq!(len_in_document(b"[]"), Some(0));
+        assert_eq!(
+            len_in_document("\"h\u{e9}llo\u{1f600}\"".as_bytes()),
+            Some(6)
+        );
+        assert_eq!(len_in_document(b"null"), None);
+        assert_eq!(len_in_document(b"{\"a\":1}"), None);
+
+        let array = OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+        assert_eq!(owned_slice_len(&array), Some(2));
+        assert_eq!(
+            owned_slice_len(&OwnedValue::String("h\u{e9}llo".into())),
+            Some(5)
+        );
+        assert_eq!(owned_slice_len(&OwnedValue::Null), None);
+        assert_eq!(owned_slice_len(&OwnedValue::Int(3)), None);
     }
 
     /// #499: `eval_slice_expr` (plain reads, no `=`/`|=`/`path()`/`del()`)
@@ -159059,7 +159368,7 @@ mod tests {
         let bad: ComputedSliceBound = Err(EvalError::new(
             "Array/string slice indices must be integers",
         ));
-        let ok: ComputedSliceBound = Ok(Some(1));
+        let ok: ComputedSliceBound = Ok(Some(SliceBound::int(1)));
 
         assert_eq!(
             SliceTargetKind::of_type_name("array"),
@@ -159114,7 +159423,7 @@ mod tests {
                 &ok,
                 &Ok(None)
             ),
-            Ok((Some(1), None))
+            Ok((Some(SliceBound::int(1)), None))
         );
 
         // yq: the kind is never consulted -- a mapping target with good
@@ -159126,7 +159435,7 @@ mod tests {
                 &ok,
                 &ok
             ),
-            Ok((Some(1), Some(1)))
+            Ok((Some(SliceBound::int(1)), Some(SliceBound::int(1))))
         );
         assert_eq!(
             resolve_computed_slice_bounds::<YqSemantics>(SliceTargetKind::Null, &bad, &ok)

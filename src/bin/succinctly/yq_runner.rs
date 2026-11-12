@@ -2794,6 +2794,7 @@ fn needs_dom_fallback(
         && ((sort_keys && index.has_aliases())
             || sorts_a_mapping(expr, index, bytes)
             || reorders_a_flow_sequence(expr, index, bytes)
+            || maps_a_commented_flow_collection(expr, index, bytes)
             || (is_array_of_nodes(expr) && index.has_aliases()))
 }
 
@@ -2820,35 +2821,50 @@ fn reorders_a_sequence(expr: &Expr) -> bool {
 /// `expr` as `NAV | REORDER` for a static navigation `NAV` (none for the document itself) and a
 /// `sort`, `sort_by`, `reverse`, `unique` or `unique_by`: the navigation (`None` at the root) and
 /// the reorder; `None` for any other shape (#6877).
-fn split_reorder_read(expr: &Expr) -> Option<(Option<Expr>, Expr)> {
-    let mut stages = Vec::new();
-    flatten_plain_pipe(expr, &mut stages);
-    let (last, nav) = stages.split_last()?;
-    let mut last = *last;
-    while let Expr::Paren(inner) = last {
-        last = inner;
-    }
-    if !reorders_a_sequence(last) {
+fn split_reorder_read(expr: &Expr) -> Option<(Option<Expr>, &Expr)> {
+    split_static_nav_then(expr, reorders_a_sequence)
+}
+
+/// `expr` as `NAV | map(f)` for a static navigation `NAV` (none for the document itself): the
+/// navigation (`None` at the root) and the `map`; `None` for any other shape (#6986).
+fn split_map_read(expr: &Expr) -> Option<(Option<Expr>, &Expr)> {
+    split_static_nav_then(expr, |last| matches!(last, Expr::Builtin(Builtin::Map(_))))
+}
+
+/// `expr` as `NAV | LAST` for a static navigation `NAV` (none for the document itself) and a last
+/// stage `is_last` accepts: the navigation (`None` at the root) and that stage; `None` for any
+/// other shape. The one parse [`split_reorder_read`] (#6877) and [`split_map_read`] (#6986) share.
+fn split_static_nav_then(
+    expr: &Expr,
+    is_last: impl Fn(&Expr) -> bool,
+) -> Option<(Option<Expr>, &Expr)> {
+    let (mut nav, last) = split_last_stage(expr)?;
+    if !is_last(last) {
         return None;
     }
     // `. | sort` is `sort`: an identity stage in front of the navigation moves nothing.
-    let nav: Vec<&Expr> = nav
-        .iter()
-        .copied()
-        .filter(|stage| !matches!(stage, Expr::Identity))
-        .collect();
+    nav.retain(|stage| !matches!(stage, Expr::Identity));
     if nav.is_empty() {
-        return Some((None, last.clone()));
+        return Some((None, last));
     }
-    nav.iter()
-        .all(|stage| static_nav_steps(stage).is_some_and(|steps| !steps.is_empty()))
-        .then(|| (Some(pipe_of(&nav)), last.clone()))
+    all_static_nav(&nav).then(|| (Some(pipe_of(&nav)), last))
 }
 
 /// The node `nav` reaches from `cursor` (`cursor` itself for none), when it is a flow-style
 /// sequence: the one definition of "the target of a reorder that keeps its presentation" that
 /// [`reorder_read_as_write`] and [`reorders_a_flow_sequence`] share (#6877).
 fn flow_sequence_target<'a, W: AsRef<[u64]> + Clone>(
+    nav: Option<&Expr>,
+    cursor: YamlCursor<'a, W>,
+) -> Option<YamlCursor<'a, W>> {
+    flow_collection_target(nav, cursor)
+        .filter(|target| matches!(target.value(), YamlValue::Sequence(_)))
+}
+
+/// The node `nav` reaches from `cursor` (`cursor` itself for none), when it is a flow-style
+/// sequence or mapping: what [`flow_sequence_target`] narrows to a sequence, and the node whose
+/// style a `map` over it takes (#6986).
+fn flow_collection_target<'a, W: AsRef<[u64]> + Clone>(
     nav: Option<&Expr>,
     cursor: YamlCursor<'a, W>,
 ) -> Option<YamlCursor<'a, W>> {
@@ -2859,7 +2875,11 @@ fn flow_sequence_target<'a, W: AsRef<[u64]> + Clone>(
             _ => return None,
         },
     };
-    (matches!(target.value(), YamlValue::Sequence(_)) && target.style() == "flow").then_some(target)
+    (matches!(
+        target.value(),
+        YamlValue::Sequence(_) | YamlValue::Mapping(_)
+    ) && target.style() == "flow")
+        .then_some(target)
 }
 
 /// The write form of a read that reorders a flow-style sequence (#6877): `NAV | sort` is
@@ -2878,7 +2898,7 @@ fn reorder_read_as_write<W: AsRef<[u64]> + Clone>(
         vec![
             Expr::Update {
                 path: Box::new(path.clone()),
-                filter: Box::new(reorder),
+                filter: Box::new(reorder.clone()),
             },
             path,
         ]
@@ -2894,17 +2914,66 @@ fn reorders_a_flow_sequence(expr: &Expr, index: &YamlIndex, bytes: &[u8]) -> boo
     let Some((nav, _)) = split_reorder_read(expr) else {
         return false;
     };
+    any_document(index, bytes, |doc| {
+        flow_sequence_target(nav.as_ref(), doc).is_some()
+    })
+}
+
+/// Whether `expr` is `NAV | map(f)` ([`split_map_read`]) over a flow-style sequence or mapping
+/// with a comment inside it, in some document of `bytes` (#6986). The streamers write such a
+/// result in flow, but without the layout a comment between its items needs, so it takes the DOM
+/// route, which gives the result the node's flow style ([`restyle_flow_map_result`]) and lays the
+/// comments out. Every other flow node keeps the streamers, several times faster on a large one;
+/// a comment elsewhere in the document, or the node's own (which yq does not keep), does not count.
+fn maps_a_commented_flow_collection(expr: &Expr, index: &YamlIndex, bytes: &[u8]) -> bool {
+    if !index.has_comments() {
+        return false;
+    }
+    let Some((nav, _)) = split_map_read(expr) else {
+        return false;
+    };
+    any_document(index, bytes, |doc| {
+        flow_collection_target(nav.as_ref(), doc).is_some_and(|target| target.has_comment_below())
+    })
+}
+
+/// Whether `test` holds for some document of `bytes`.
+fn any_document(
+    index: &YamlIndex,
+    bytes: &[u8],
+    test: impl Fn(YamlCursor<'_, Vec<u64>>) -> bool,
+) -> bool {
     let root = index.root(bytes);
     let YamlValue::Sequence(mut docs) = root.value() else {
         return false;
     };
     while let Some((doc, rest)) = docs.uncons_cursor() {
-        if flow_sequence_target(nav.as_ref(), doc).is_some() {
+        if test(doc) {
             return true;
         }
         docs = rest;
     }
     false
+}
+
+/// Give the one array `results` holds the flow style of the node a `NAV | map(f)` maps, when that
+/// node is a flow-style sequence or mapping, and nothing else of that node: yq's `map` builds a
+/// new sequence that copies the style of the node it maps, not its comments or anchor (#6986).
+/// The items keep the trees the evaluation gave them.
+fn restyle_flow_map_result<W: AsRef<[u64]> + Clone>(
+    expr: &Expr,
+    cursor: YamlCursor<'_, W>,
+    results: &mut [ResultWithComments],
+) {
+    let [(OwnedValue::Array(_), tree)] = results else {
+        return;
+    };
+    let Some((nav, _)) = split_map_read(expr) else {
+        return;
+    };
+    if flow_collection_target(nav.as_ref(), cursor).is_some() {
+        tree.set_meta(NodeMeta::empty().with_style("flow"));
+    }
 }
 
 /// Whether `expr` is a `sort`/`sort_by` of a mapping in some document of `bytes`, which the M2
@@ -3172,6 +3241,12 @@ fn query_result_to_owned_values(
         // outright `Error`/`Break` already is (#2392). `Halt` is the one
         // control that keeps its prefix (jq's own `halt` contract, #791/
         // #1897), so it stays its own arm below.
+        // An `-o=<format>` encoder runs while yq prints, so the results before the one it
+        // refuses are printed (#6923).
+        QueryResult::Partial(vs, jq::Control::Error(e)) if e.is_output_encoder() => {
+            sink.report(DiagStyle::Yq, &e, &no_location());
+            vs
+        }
         QueryResult::Error(e) | QueryResult::Partial(_, jq::Control::Error(e)) => {
             sink.report(DiagStyle::Yq, &e, &no_location());
             vec![]
@@ -4556,6 +4631,24 @@ fn is_custom_tag(tag: &str) -> bool {
     !tag.starts_with("!!")
 }
 
+/// What a `--split-exp` run knows about the files it names (#7028): the paths written so far, to warn
+/// when one is written twice, and the output format the run was asked for, which decides the extension
+/// yq appends to a name that has none. `OutputConfig` cannot say the latter, since an encoder format
+/// (`-o=props` and the rest) runs as a YAML-output run over the encoded text.
+struct SplitFiles {
+    written: std::collections::HashSet<String>,
+    name_format: OutputFormat,
+}
+
+impl SplitFiles {
+    fn new(name_format: OutputFormat) -> Self {
+        Self {
+            written: std::collections::HashSet::new(),
+            name_format,
+        }
+    }
+}
+
 /// Evaluate `split_expr` against `result` with `$index` bound to
 /// `output_index`, expect exactly one string back, and write `result`
 /// (serialized through `output_config`, color forced off, matching
@@ -4571,7 +4664,7 @@ fn write_split_result(
     split_expr: &Expr,
     output_index: i64,
     output_config: &OutputConfig,
-    written_files: &mut std::collections::HashSet<String>,
+    files: &mut SplitFiles,
     sink: &mut ErrorSink,
 ) -> Result<()> {
     let index_val = OwnedValue::Int(output_index);
@@ -4645,7 +4738,9 @@ fn write_split_result(
         }
     };
 
-    if !written_files.insert(filename.to_string()) {
+    // #7028: yq names the file `<expression result>.<extension>` unless the result already ends in one.
+    let filename = split_exp_file_name(&filename, files.name_format);
+    if !files.written.insert(filename.clone()) {
         eprintln!("Warning: --split-exp path '{filename}' written more than once; overwriting");
     }
 
@@ -4654,8 +4749,58 @@ fn write_split_result(
     no_color_config.use_color = false;
     output_value(&mut buf, result, comments, &no_color_config, None)?;
 
-    std::fs::write(&*filename, &buf)
+    std::fs::write(&filename, &buf)
         .with_context(|| format!("failed to write --split-exp output file: {filename}"))
+}
+
+/// The extension yq (v4.53.3) appends to a `--split-exp` file name for `format` (#7028): `json` and
+/// `properties` for those two encoders, `yml` for every other, `xml`, `toml`, `csv` and `lua` among
+/// them (captured per `-o`, not inferred).
+fn split_exp_extension(format: OutputFormat) -> &'static str {
+    match format {
+        OutputFormat::Json => "json",
+        OutputFormat::Props => "properties",
+        // Listed, not a wildcard, so a new format has to choose its extension here.
+        OutputFormat::Yaml
+        | OutputFormat::Auto
+        | OutputFormat::Shell
+        | OutputFormat::Csv
+        | OutputFormat::Tsv
+        | OutputFormat::Lua
+        | OutputFormat::Xml
+        | OutputFormat::Kyaml
+        | OutputFormat::Toml
+        | OutputFormat::Ini
+        | OutputFormat::Base64
+        | OutputFormat::Uri => "yml",
+    }
+}
+
+/// Whether `name` already ends in an extension in the sense yq tests: a `.` followed by one or more
+/// ASCII letters or digits at the very end, `\.[a-zA-Z0-9]+$` (#7028). Not `Path::extension`: a name
+/// that ends in `.`, in `.a-b` or in a non-ASCII letter has none, and `x.1`, `x.tar.gz` and `x.YML` do.
+fn split_exp_name_has_extension(name: &str) -> bool {
+    let tail = name
+        .bytes()
+        .rev()
+        .take_while(u8::is_ascii_alphanumeric)
+        .count();
+    // A name that is all letters and digits (`x1`) has no byte before its tail.
+    tail > 0
+        && name
+            .len()
+            .checked_sub(tail + 1)
+            .is_some_and(|dot| name.as_bytes()[dot] == b'.')
+}
+
+/// The path `--split-exp` writes for the expression's `name`: `name` itself when it already ends in an
+/// extension, else `name.<extension of the output format>` (#7028).
+fn split_exp_file_name(name: &str, format: OutputFormat) -> String {
+    if split_exp_name_has_extension(name) {
+        name.to_owned()
+    } else {
+        format!("{name}.{}", split_exp_extension(format))
+    }
 }
 
 /// One step of a path into a paired `OwnedValue`/[`CommentTree`] tree, used
@@ -8066,21 +8211,26 @@ fn is_key_stage(expr: &Expr) -> bool {
 /// `expr` as a non-empty static navigation followed by one last stage (parentheses removed),
 /// the shape both key-listing routes of #5450 start from; `None` for any other.
 fn split_static_nav_then_last(expr: &Expr) -> Option<(Vec<&Expr>, &Expr)> {
+    split_last_stage(expr).filter(|(nav, _)| !nav.is_empty() && all_static_nav(nav))
+}
+
+/// `expr`'s plain-pipe stages before its last one, and the last one with its parentheses taken
+/// off: the split [`split_static_nav_then_last`] and [`split_static_nav_then`] (#6986) share.
+fn split_last_stage(expr: &Expr) -> Option<(Vec<&Expr>, &Expr)> {
     let mut stages = Vec::new();
     flatten_plain_pipe(expr, &mut stages);
-    let (last, nav) = stages.split_last()?;
-    if nav.is_empty()
-        || !nav
-            .iter()
-            .all(|stage| static_nav_steps(stage).is_some_and(|steps| !steps.is_empty()))
-    {
-        return None;
-    }
-    let mut last = *last;
+    let mut last = stages.pop()?;
     while let Expr::Paren(inner) = last {
         last = inner;
     }
-    Some((nav.to_vec(), last))
+    Some((stages, last))
+}
+
+/// Whether every one of `stages` is a static navigation of at least one step.
+fn all_static_nav(stages: &[&Expr]) -> bool {
+    stages
+        .iter()
+        .all(|stage| static_nav_steps(stage).is_some_and(|steps| !steps.is_empty()))
 }
 
 /// `expr` as a *static navigation* followed by `map(key)`, split into the navigation and the
@@ -8825,6 +8975,12 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
             // outright `Error`/`Break` already is (#2392). `Halt` is the one
             // control that keeps its prefix (jq's own `halt` contract, #791/
             // #1897), so it stays its own arm below.
+            // An `-o=<format>` encoder runs while yq prints, so the results before the one it
+            // refuses are printed (#6923).
+            GenericResult::Partial(vs, jq::Control::Error(e)) if e.is_output_encoder() => {
+                sink.report(DiagStyle::Yq, &e, &no_location());
+                Ok(vs.into_iter().map(no_comments).collect())
+            }
             GenericResult::Error(e) | GenericResult::Partial(_, jq::Control::Error(e)) => {
                 sink.report(DiagStyle::Yq, &e, &no_location());
                 Ok(vec![])
@@ -8921,6 +9077,13 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
                     }
                 }
             }
+        }
+    }
+
+    // #6986: a `map` over a flow-style node prints in flow, whatever its body, as in yq.
+    if need_comments {
+        if let Ok(results) = &mut docs {
+            restyle_flow_map_result(expr, cursor, results);
         }
     }
 
@@ -11635,8 +11798,9 @@ fn get_input_files(args: &YqCommand) -> Vec<String> {
     // because the filter comes from a file instead of command line
     let mut files = Vec::new();
 
-    if args.from_file.is_some() {
-        // When --from-file is used, the first positional arg (if any) is an input file
+    if args.from_file.is_some() || args.expression.is_some() {
+        // When --from-file or --expression (#7025) is used, the first positional arg (if any) is an
+        // input file
         if let Some(ref first_file) = args.filter {
             files.push(first_file.clone());
         }
@@ -11821,6 +11985,21 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         args.output_format = OutputFormat::Json;
     }
 
+    // #7025: `--split-exp-file` is `--split-exp` read from a file. It wins over `--split-exp`, and an
+    // empty file means no split at all (`--split-exp-file empty --split-exp X` prints normally), as in
+    // yq v4.53.3.
+    if let Some(path) = args.split_exp_file.take() {
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read split expression file: {}", path.display()))?;
+        args.split_exp = (!text.is_empty()).then_some(text);
+    }
+
+    // #7025: `--security-disable-env-ops` and `--security-disable-file-ops`, for the whole run.
+    let _security_scope = jq::enter_security_scope(
+        args.security_disable_env_ops,
+        args.security_disable_file_ops,
+    );
+
     // yq's `-o` defaults to `auto` (#6703): the run's own input format, picked once from the first
     // file's extension (#4394). A `.json` file prints JSON; standard input, `.yaml`, `.yml` and any
     // other name print YAML. There is nothing to match under `-n`, `-R` or `--front-matter`, and an
@@ -11880,6 +12059,13 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             other.len()
         ),
     };
+    // #6922: yq's `@props` and `@csv` operators read the same flags as `-o=props` and `-o=csv`.
+    jq::set_yq_encoder_prefs(jq::YqEncoderPrefs {
+        properties_separator: args.properties_separator.clone(),
+        properties_array_brackets: args.properties_array_brackets,
+        csv_separator,
+    });
+
     let output_encoder = match args.output_format {
         OutputFormat::Props => Some(YqOutputEncoder::Props {
             separator: args.properties_separator.clone(),
@@ -11908,10 +12094,15 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         }))),
         OutputFormat::Yaml | OutputFormat::Json | OutputFormat::Auto => None,
     };
+    // #7028: `--split-exp` names its files by the format the user asked for, which the rewrite to a
+    // YAML-output run below hides for every encoder format.
+    let split_exp_format = args.output_format;
     if output_encoder.is_some() {
         // Every encoder but KYAML's writes its own line ends (or none), so nothing is added after a result.
         // KYAML leaves the line end to the printer and keeps YAML's `---` between documents, which `-N`
         // removes as it does for YAML.
+        // #6923: `-e` reads the value each encode saw, so start from a clean cell.
+        jq::reset_output_encoder_truthy();
         let kyaml = args.output_format == OutputFormat::Kyaml;
         args.no_doc = args.no_doc || !kyaml;
         args.output_encoder_joins = !kyaml;
@@ -11941,6 +12132,13 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             text.replace("\r\n", "\n")
         } else {
             text
+        }
+    } else if let Some(ref expression) = args.expression {
+        // #7025: `--expression` is the filter, and an empty one is the identity, as in yq.
+        if expression.is_empty() {
+            ".".to_string()
+        } else {
+            expression.clone()
         }
     } else {
         args.filter.clone().unwrap_or_else(|| ".".to_string())
@@ -12304,6 +12502,9 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     // comma, each as a query of its own (a node keeps what its cursor carries), else the query.
     let stream_branches: Vec<&Expr> = comma_branches.unwrap_or_else(|| vec![&program.expr]);
     let reorders_root_sequence = reorders_a_sequence(&program.expr);
+    // #6986: the navigation in front of a `NAV | map(f)`, whose result prints in flow when the node
+    // it maps is a flow-style one.
+    let map_read_nav = split_map_read(&program.expr).map(|(nav, _)| nav);
     // #2276 code review (found live against this exact binary, on top of
     // #2262): `any_input_is_json` -- the same run-wide boolean #978
     // introduced and #996 later removed from `is_m2_streamable` above --
@@ -12768,6 +12969,19 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                         // comment block above it, which the items' streaming has no node to read.
                         let reordered_head =
                             reorders_root_sequence && matches!(result, GenericResult::LazySeq(_));
+                        // #6986: a `map` over a flow-style node is written in flow, as yq writes
+                        // it: width 0 is the streamers' flow layout (`IndentSpec::is_compact`).
+                        let result_indent = if matches!(result, GenericResult::LazySeq(_))
+                            && map_read_nav.as_ref().is_some_and(|nav| {
+                                flow_collection_target(nav.as_ref(), $cursor).is_some()
+                            }) {
+                            IndentSpec {
+                                width: 0,
+                                unit: yaml_indent.unit,
+                            }
+                        } else {
+                            yaml_indent
+                        };
                         let stats = stream_maybe_colored(
                             $writer,
                             $use_color,
@@ -12783,7 +12997,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                                 result
                                     .stream_yaml_terminating::<_, YqSemantics>(
                                         out,
-                                        yaml_indent,
+                                        result_indent,
                                         sort_keys,
                                         // #5721: a header-only document's own line break ends
                                         // it; a NUL replaces that break.
@@ -13533,8 +13747,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         // here; the input-gathering below otherwise mirrors the standard
         // path at the bottom of this function.
         let mut output_index: i64 = 0;
-        let mut written_split_files: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut written_split_files = SplitFiles::new(split_exp_format);
 
         if args.null_input {
             let results = evaluate_input(&OwnedValue::Null, &program.expr, &mut sink)?;
@@ -14804,6 +15017,10 @@ fn run_exit_code(sink: &ErrorSink, exit_status: bool, any_truthy: bool) -> i32 {
         return DiagStyle::Yq.error_exit_code();
     }
 
+    // #6923: under an `-o=<format>` encoder every result is text, so `-e` reads the value the
+    // encoder was handed instead.
+    let any_truthy = jq::output_encoder_saw_truthy().unwrap_or(any_truthy);
+
     // yq compat: empty output and all-falsy output are the same failure,
     // reported on stderr with a fixed message and exit 1.
     if exit_status && !any_truthy {
@@ -14817,6 +15034,51 @@ fn run_exit_code(sink: &ErrorSink, exit_status: bool, any_truthy: bool) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #7028: yq's test for "the name already has an extension" is `\.[a-zA-Z0-9]+$`, not
+    /// `Path::extension`; the rows are the shapes that tell the two apart, captured from yq v4.53.3.
+    #[test]
+    fn test_split_exp_name_extension_is_a_dot_then_ascii_letters_or_digits_at_the_end_7028() {
+        for kept in [
+            "x.txt", "x.yml", "x.YML", "x.1", "x.A1b2", "x.tar.gz", "x..yml", "a/b.c", ".h1",
+        ] {
+            assert!(split_exp_name_has_extension(kept), "{kept}");
+        }
+        for appended in [
+            "", ".", "x", "x1", "0", "x.", "x.txt.", "x.a-b", "x.a_b", "x.a b", "x.\u{e9}", "x.$",
+            "x/.a-b", "\u{e9}",
+        ] {
+            assert!(!split_exp_name_has_extension(appended), "{appended:?}");
+        }
+    }
+
+    /// #7028: the extension follows the resolved output format, `json` and `properties` for those two
+    /// encoders and `yml` for every other.
+    #[test]
+    fn test_split_exp_file_name_appends_the_formats_extension_7028() {
+        use OutputFormat::*;
+        for (format, want) in [
+            (Yaml, "x1.yml"),
+            (Json, "x1.json"),
+            (Props, "x1.properties"),
+            (Auto, "x1.yml"),
+            (Shell, "x1.yml"),
+            (Csv, "x1.yml"),
+            (Tsv, "x1.yml"),
+            (Lua, "x1.yml"),
+            (Xml, "x1.yml"),
+            (Kyaml, "x1.yml"),
+            (Toml, "x1.yml"),
+            (Ini, "x1.yml"),
+            (Base64, "x1.yml"),
+            (Uri, "x1.yml"),
+        ] {
+            assert_eq!(split_exp_file_name("x1", format), want, "{format:?}");
+        }
+        assert_eq!(split_exp_file_name("x1.txt", Json), "x1.txt");
+        assert_eq!(split_exp_file_name("x1.", Json), "x1..json");
+        assert_eq!(split_exp_file_name("", Yaml), ".yml");
+    }
 
     /// #6335: the writer numbers a repeated key's earlier entries by position among that key's
     /// shadows (also under a sort, which is stable), numbers nothing when the tree kept no

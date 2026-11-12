@@ -3266,6 +3266,12 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         let Some(parent) = self.parent() else {
             return false;
         };
+        // A document's parent is the virtual sequence of documents, whose text position is the
+        // first document's: when that one opens with `[`, a later block document is no flow
+        // element (#6986).
+        if parent.bp_pos == 0 {
+            return false;
+        }
         let Some(pos) = parent.text_position() else {
             return false;
         };
@@ -3380,6 +3386,14 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     #[inline]
     pub fn index(&self) -> &YamlIndex<W> {
         self.index
+    }
+
+    /// Whether a node below this one, at any depth, has a comment (a line, head or foot comment);
+    /// this node's own do not count (#6986).
+    #[inline]
+    #[must_use]
+    pub fn has_comment_below(&self) -> bool {
+        self.index.has_comment_below(self.bp_pos)
     }
 
     /// Get a reference to the underlying YAML text.

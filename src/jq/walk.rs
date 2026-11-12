@@ -270,7 +270,7 @@ pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
         | Builtin::CombinationsN(e)
         | Builtin::Tz(e)
         | Builtin::FormatDatetime(e)
-        | Builtin::EvalExpr(e)
+        | Builtin::EvalExpr(e, _)
         | Builtin::Load(e, _)
         | Builtin::AtOffset(e) => BuiltinKids::One(e),
         // `Option<Box<Expr>>`, not `Box<Expr>` -- #2855's `None` case (a
@@ -598,7 +598,7 @@ pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr)
         Builtin::CombinationsN(e) => Builtin::CombinationsN(Box::new(f(e))),
         Builtin::Tz(e) => Builtin::Tz(Box::new(f(e))),
         Builtin::FormatDatetime(e) => Builtin::FormatDatetime(Box::new(f(e))),
-        Builtin::EvalExpr(e) => Builtin::EvalExpr(Box::new(f(e))),
+        Builtin::EvalExpr(e, ext) => Builtin::EvalExpr(Box::new(f(e)), *ext),
         Builtin::Load(e, kind) => Builtin::Load(Box::new(f(e)), *kind),
         Builtin::AtOffset(e) => Builtin::AtOffset(Box::new(f(e))),
 
@@ -1722,7 +1722,7 @@ fn stage_escapes_own_input(expr: &Expr) -> bool {
             | Builtin::GetJqOrigin
             | Builtin::GetProgOrigin
             // #6081: an expression read from data may read anything, `.` and `$ENV` included.
-            | Builtin::EvalExpr(_)
+            | Builtin::EvalExpr(..)
             | Builtin::AtOffset(_)
             | Builtin::AtPosition(_, _) => true,
 
@@ -2308,7 +2308,7 @@ fn node_reads_ambient(node: &Expr) -> bool {
             | Builtin::Tz(_)
             | Builtin::FormatDatetime(_)
             | Builtin::WithDtf(_, _)
-            | Builtin::EvalExpr(_)
+            | Builtin::EvalExpr(..)
             | Builtin::Load(..)
             | Builtin::AtOffset(_)
             | Builtin::AtPosition(_, _) => true,

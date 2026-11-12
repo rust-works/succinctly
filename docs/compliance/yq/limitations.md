@@ -7574,6 +7574,10 @@ These differ:
   yq reads an absent key as no node (`eval(.zz)` prints nothing) and the node `null` as the expression `null` (`eval(null)` is `null`), and this tells the two apart only by the value, so both give nothing.
 - **yq repeats `eval`'s outputs when the context holds several nodes.**
   `.c[] | eval(". * 2")` on `c: [1, 2]` is `2 4 2 4 2 4 2 4` in yq and `2 4` here, since `eval` is run once per node.
+- **`--jq-extensions` reaches the text `eval` runs ([#7012](https://github.com/rust-works/succinctly/issues/7012)).**
+  The text is read with the same opt-in as the program that holds the call, so a name yq's lexer rejects (`paths`, `limit`) is a parse error in it by default, as in yq, and runs under the flag.
+  `succinctly yq --jq-extensions 'eval("paths")'` prints the paths, where yq refuses `paths` in both positions.
+  This is an extension (ADR-0018 rule 5), off by default, and a nested `eval` carries the flag on.
 - **Expressions nest 32 deep.**
   A stored expression that evaluates itself (`s: "eval(.s)"`) runs yq out of stack, and stops here with `eval: expressions nest more than 32 deep` (ADR-0018 rule 4, a crash).
 - **The text of the error for an expression that does not parse differs.**
@@ -7659,26 +7663,26 @@ A document `.inf`/`.nan` used as a number fails in yq while it computes, in ever
 When an update (`|=`, `map_values`) fails on several nodes, yq reports the last node's text and `succinctly yq` the first: over `a: .inf` and `b: -.inf`, `map_values(. + 1)` names `"-.inf"` in yq and `".inf"` here.
 `sort` and `sort_by` over such a scalar panic in yq with a Go stack trace, and order it here (see the NaN and infinities entry in the sort section).
 
-### `-o props|shell|csv|tsv|base64|uri` — the first slice of yq's output formats; seven rows still differ ([#6850](https://github.com/rust-works/succinctly/issues/6850))
+### `-o props|shell|csv|tsv|base64|uri` — the first slice of yq's output formats; six rows still differ ([#6850](https://github.com/rust-works/succinctly/issues/6850))
 
 `-o=props`, `-o=shell`, `-o=csv`, `-o=tsv`, `-o=base64` and `-o=uri` (and the short names `p`, `s`, `c`, `t`) run the filter and write each result through that format's encoder, with no `---` between documents.
 `--shell-key-separator`, `--properties-separator`, `--properties-array-brackets` and `--csv-separator` are read (#6922); `--csv-separator` takes one ASCII byte (yq's `char` takes any single byte, so a lone byte above 0x7f, which cannot be an argument here, is refused), and `-o=tsv` ignores it, as yq does.
-The `@props` and `@csv` operators ignore those flags here, where yq applies them to the operators too.
+The `@props` / `to_props` and `@csv` / `to_csv` operators read the same flags, as in yq, wherever they are parsed (the program, the text an `eval` reads, a `--split-exp` expression), and so does `format("csv")` under `--jq-extensions` (#6922).
 `-o=lua` is read as well, with `--lua-prefix`, `--lua-suffix`, `--lua-globals` and `--lua-unquoted` (#6924); where it differs from yq is in its own section below.
 `-o=ini` is read as well (#6924), as yq's go-ini encoder writes it: it agrees with yq v4.53.3 on 3,200 random JSON documents and on YAML input except for a null written `~` (see the list below).
 `-o=toml` is read as well (#6924); where it differs from yq is in its own section below.
 `-o=kyaml` is read as well (#6924); where it differs from yq is in its own section below.
 `-o=xml` is read as well (#6924), with `--xml-attribute-prefix`, `--xml-content-name`, `--xml-proc-inst-prefix` and `--xml-directive-name`; where it differs from yq is in its own section below.
 The other formats yq lists (`hcl`) and every input format but YAML, JSON, `props`, `base64` and `uri` (see the `-p base64|uri` and `-p props` sections below) are still refused at the flag.
-Seven rows differ from yq v4.53.3, each pinned out of `tests/yq_cli/i6850.rs`:
+Six rows differ from yq v4.53.3, each pinned out of `tests/yq_cli/i6850.rs`:
 
 - A comment in a `props` document is not written.
   yq writes a head and a line comment as `# ...` lines above the key, and the `@props` filter has the same gap.
 - A null written `~` (or `!!null ""`) prints `null` with every encoder, `ini` included, where yq echoes the spelling (`c = ~`, `c='~'`, `a = `, #2802).
-- An encoder that fails after earlier results printed leaves nothing on stdout here, where yq printed those results first: `printf 'a: x\nb: [1]\nc: {d: e}\n' | yq -o=csv '.[]'` prints `x` and `1` in yq.
-  The error line and the exit status are the same.
-  The failure is raised while the filter runs, because the encoder is the filter's last stage, and the filter's results are only printed when it finishes.
-- `-e` (with any `-o` encoder, `lua` included) reads the encoded text, which is never null or false, so it exits 0 where yq exits 1 for a null or false result.
+- An encoder that fails after earlier results printed still prints those results first, as yq does (#6923): `printf 'a: x\nb: [1]\nc: {d: e}\n' | yq -o=csv '.[]'` prints `x` and `1`, then the error, exit 1.
+  A top-level comma (`.a, .b`) still prints nothing before the error, and the error line is written when it is raised, so the two streams can interleave differently on a terminal.
+  The results are kept on the plain, `--eval-all` and `-n` routes; the other input routes were not checked.
+  An error the program itself raises still prints nothing, in both tools.
 - A `shell` key with an accented letter loses it (`é` is dropped), where yq decomposes it first and keeps the `e`.
 - A `<<` whose value is a literal mapping, not an alias, is merged into its mapping by the encoders, where yq leaves it a plain key that props, shell, ini and lua skip: `printf 'a: 1\n<<: {b: 2, a: 5}\n' | yq -o=props .` is `a = 1` in yq and `a = 5`, `b = 2` here.
   An alias (`<<: *anchor`) is merged by both, and `-o=json` agrees (the owned route; see #5521 for the same family).
@@ -7787,3 +7791,21 @@ Two things still differ, because yq has the raw bytes and this has the substitut
 - YAML output prints the substitutes, where yq prints the raw bytes for a document that is the string itself and refuses a nested one with `yaml: cannot marshal invalid UTF-8 data as !!str`.
 
 Matching either needs a string that can hold bytes that are not UTF-8, or the substitution moved to the JSON encoder, as the `-p json` reader does with `-o json` only.
+
+## The argument-level flags of [#7025](https://github.com/rust-works/succinctly/issues/7025) answer as yq does, with these differences
+
+`--expression`, `--split-exp-file`, `-f`, `-v`/`--verbose`, `--security-disable-env-ops` and `--security-disable-file-ops` are yq's, and `tests/yq_cli/i7025.rs` pins the rows captured from yq v4.53.3.
+[#7025](https://github.com/rust-works/succinctly/issues/7025) stays open for `--string-interpolation`, `--security-enable-system-operator` and `system`, `-c`, `--header-preprocess=false`, `--yaml-fix-merge-anchor-to-spec` and `--debug-node-info`.
+
+- **`--security-disable-env-ops` and `--security-disable-file-ops` refuse an operator when it runs, where yq refuses it when its handler is called.**
+  `select(false) | strenv(X)`, `.zz[] | strenv(X)` and `.a | select(. == 2) | strenv(X)` fail with `env operations have been disabled` in yq, because the handler is called with an empty context.
+  Here they print nothing and exit 0, since no value reaches the operator and nothing reads the environment.
+  The operators that yq does not call (`.a // strenv(X)` with a truthy `.a`, `map(strenv(X))` over an empty list, `with(select(false); strenv(X))`) agree.
+- **The env flag also refuses the environment readers yq has no token for.**
+  Under `--jq-extensions`, `$ENV`, `env` and `env.X` read the environment, and `--security-disable-env-ops` refuses them with the same message.
+- **`-v` writes no debug log.**
+  yq writes `time=... level=DEBUG ...` lines to stderr; standard output is the same either way.
+  `--verbose=false` is refused here (a flag takes no value) and accepted by yq.
+- **A missing `--split-exp-file` is worded differently.**
+  yq says `Error: open nope.exp: no such file or directory`; this says `failed to read split expression file: nope.exp`, with the cause.
+  Both exit 1 and write nothing.

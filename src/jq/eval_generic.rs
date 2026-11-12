@@ -75,23 +75,23 @@ use super::eval::{
     pattern_alternatives_var_names, pipe_holds_bind, pipe_needs_path_context,
     prefer_pending_control, probe_def_call, range_from_literal_override, range_max_exceeded_error,
     range_num, reads_parent, recurse_walk_flow, reduce_forks, reroot_for_reentry, reroot_markers,
-    resolve_computed_slice_bounds, resume_from_escape, reverse_length_is_empty, select_emits,
-    settle_then_replay, settles_before_consumer, settles_both, shared_arg_depth_refusal,
-    slice_component_value, slice_object_as_yq_children, slice_owned_value_read_computed,
-    sort_like_jq, stop_with_downstream, stop_with_error, stop_with_escape,
-    streams_escaped_generator_prefix, streams_unbounded, substitute_bound_var_from,
-    substitute_deferred_var, substitute_vars, suppresses, tonumber_from_str, tostring_owned,
-    tostring_owned_styled, try_compare_op, try_handler_root, vec_with_capacity,
-    yq_absent_key_read_is_empty, yq_assign_rhs_document, yq_bool_null_key_into_null, yq_dedup_key,
-    yq_empty_context_reemit, yq_empty_left_skips_right, yq_empty_operand_output,
-    yq_field_index_on_scalar_is_empty, yq_first_of_each_key, yq_index_key_is_numeric,
-    yq_literal_index_text, yq_mapping_index_text, yq_negative_index_check, yq_negative_index_error,
-    yq_numeric_index_on_object_is_null, yq_object_key_stringify, yq_read_only_context,
-    yq_scalar_text, yq_sort_by, yq_stage_can_reemit, yq_stage_can_reemit_in, BinaryFanoutRules,
-    ComputedSliceBound, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
-    JqSemantics, LimitN, PathTrail, QueryResult, RangeEnd, RangeNum, Reentry, RestPipe, RestTail,
-    RootWitness, SliceTargetKind, StashedEscape, StashedVerdict, YqSemantics,
-    DEFERRED_BIND_UNRESOLVED, MAX_RANGE_TOTAL,
+    resolve_computed_slice_bounds, resolve_computed_slice_bounds_for, resume_from_escape,
+    reverse_length_is_empty, select_emits, settle_then_replay, settles_before_consumer,
+    settles_both, shared_arg_depth_refusal, slice_component_value, slice_object_as_yq_children,
+    slice_owned_value_read_computed, sort_like_jq, stop_with_downstream, stop_with_error,
+    stop_with_escape, streams_escaped_generator_prefix, streams_unbounded,
+    substitute_bound_var_from, substitute_deferred_var, substitute_vars, suppresses,
+    tonumber_from_str, tostring_owned, tostring_owned_styled, try_compare_op, try_handler_root,
+    vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
+    yq_bool_null_key_into_null, yq_dedup_key, yq_empty_context_reemit, yq_empty_left_skips_right,
+    yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_first_of_each_key,
+    yq_index_key_is_numeric, yq_literal_index_text, yq_mapping_index_text, yq_negative_index_check,
+    yq_negative_index_error, yq_numeric_index_on_object_is_null, yq_object_key_stringify,
+    yq_read_only_context, yq_scalar_text, yq_sort_by, yq_stage_can_reemit, yq_stage_can_reemit_in,
+    BinaryFanoutRules, ComputedSliceBound, Control, Demand, EmptyOperandOp, EvalError,
+    EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail, QueryResult, RangeEnd, RangeNum,
+    Reentry, RestPipe, RestTail, RootWitness, SliceTargetKind, StashedEscape, StashedVerdict,
+    YqSemantics, DEFERRED_BIND_UNRESOLVED, MAX_RANGE_TOTAL,
 };
 use super::eval::{owned_slot_mut, static_path_steps, StepKey};
 #[cfg(test)]
@@ -102,7 +102,9 @@ use super::expr::{
     StringPart,
 };
 use super::path_mode::Route;
-use super::slice::{literal_component_from_values, slice_str, SliceBounds};
+use super::slice::{
+    fold_bounds, literal_component_from_values, slice_str, SliceBound, SliceBounds,
+};
 use super::tail_call::{
     bind_next, body_is_reusable, pipe_settles_before_last, stage_settles, tail_def, tail_reachable,
     Tail, TailRounds,
@@ -9979,6 +9981,77 @@ pub(crate) fn filename_of_file(file: i64) -> String {
         .ok()
         .and_then(file_names::name)
         .unwrap_or_default()
+}
+
+/// yq's `--security-disable-env-ops` and `--security-disable-file-ops` (#7025): the run's refusal
+/// of the operators that read the environment (`env`, `strenv`, `envsubst`) or a file (`load`,
+/// `load_str`, `load_base64`). `std` only, like [`file_names`]: there is no thread-local without it,
+/// and a `no_std` embedding has no environment or file for the operators to read either.
+#[cfg(any(feature = "std", test))]
+mod security {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// `(env ops disabled, file ops disabled)`.
+        static CURRENT: Cell<(bool, bool)> = const { Cell::new((false, false)) };
+    }
+
+    pub(crate) fn env_ops_disabled() -> bool {
+        CURRENT.with(|c| c.get().0)
+    }
+
+    pub(crate) fn file_ops_disabled() -> bool {
+        CURRENT.with(|c| c.get().1)
+    }
+
+    /// Restores the previous setting when dropped.
+    pub struct Guard((bool, bool));
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            CURRENT.with(|c| c.set(self.0));
+        }
+    }
+
+    pub(crate) fn enter(env_ops: bool, file_ops: bool) -> Guard {
+        Guard(CURRENT.with(|c| c.replace((env_ops, file_ops))))
+    }
+}
+
+#[cfg(not(any(feature = "std", test)))]
+mod security {
+    pub(crate) fn env_ops_disabled() -> bool {
+        false
+    }
+
+    pub(crate) fn file_ops_disabled() -> bool {
+        false
+    }
+
+    pub struct Guard;
+
+    pub(crate) fn enter(_env_ops: bool, _file_ops: bool) -> Guard {
+        Guard
+    }
+}
+
+/// Refuse the environment operators (`true`) and the file operators (`true`) until the returned
+/// guard is dropped (#7025).
+pub(crate) fn enter_security(env_ops: bool, file_ops: bool) -> SecurityGuard {
+    security::enter(env_ops, file_ops)
+}
+
+/// The RAII guard [`enter_security`] returns.
+pub(crate) type SecurityGuard = security::Guard;
+
+/// The refusal of an environment operator under `--security-disable-env-ops`, if one is in force.
+pub(crate) fn env_ops_refusal() -> Option<&'static str> {
+    security::env_ops_disabled().then_some("env operations have been disabled")
+}
+
+/// The refusal of a file operator under `--security-disable-file-ops`, if one is in force.
+pub(crate) fn file_ops_refusal() -> Option<&'static str> {
+    security::file_ops_disabled().then_some("file operations have been disabled")
 }
 
 /// One step of the path from a document's root to a node (#4646).
@@ -27819,7 +27892,15 @@ fn slice_one_generic_computed<S: EvalSemantics, V: DocumentValue>(
         return GenericResult::Error(err);
     }
     let kind = SliceTargetKind::of_type_name(target.type_name());
-    let (s, e) = match resolve_computed_slice_bounds::<S>(kind, start, end) {
+    // #6984: a bound with a fractional part below zero folds against the target's length, an
+    // array's element count (the memoized count the slice itself reads) or a string's characters.
+    let (s, e) = match resolve_computed_slice_bounds_for::<S>(kind, start, end, || {
+        if let Some(elements) = target.as_array() {
+            crate::jq::array_index::len_checked_memoized(&elements).ok()
+        } else {
+            target.as_str().map(|text| text.chars().count())
+        }
+    }) {
         Ok(bounds) => bounds,
         Err(_) if optional => return GenericResult::None,
         Err(e) => return GenericResult::Error(e),
@@ -28102,8 +28183,13 @@ pub(crate) fn eval_owned_fused_slice_read<S: EvalSemantics>(
         }
     };
     let (start, end) = (bound(start, f64::floor)?, bound(end, f64::ceil)?);
-    let (start, end) =
-        resolve_computed_slice_bounds::<S>(SliceTargetKind::Sliceable, &start, &end).ok()?;
+    let (start, end) = crate::jq::eval::resolve_computed_slice_bounds_for::<S>(
+        SliceTargetKind::Sliceable,
+        &start,
+        &end,
+        || Some(items.len()),
+    )
+    .ok()?;
     let range = SliceBounds::from_literals(start, end).resolve(items.len());
     Some(match fused_slice_landing::<S>(read, &range)? {
         SliceLanding::Value(owned) => owned,
@@ -28165,9 +28251,14 @@ fn fused_slice_window<S: EvalSemantics, V: DocumentValue>(
             let end = single_slice_bound::<S, V>(end, value, cursor, f64::ceil)?;
             resolve_computed_slice_bounds::<S>(SliceTargetKind::Sliceable, &start, &end).ok()?
         }
-        None => literal_bounds,
+        None => (
+            literal_bounds.0.map(SliceBound::int),
+            literal_bounds.1.map(SliceBound::int),
+        ),
     };
     let len = crate::jq::array_index::len_checked_memoized(&elements).ok()?;
+    // #6984: a bound with a fractional part below zero folds against `len`, as `parse_slice` does.
+    let (start, end) = fold_bounds(start, end, || Some(len));
     // #6257: the walk above sees no gap in an array with no element (`[,]`, #2594), which the
     // ordinary route checks and raises; an empty array has nothing to fuse.
     if len == 0 {
@@ -40523,7 +40614,7 @@ fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
             // input, which the identity route does not follow; `eval(".a") | key` prints nothing
             // (it is `"a"` in yq v4.53.3), as the other computed stages do. A write through
             // `eval` is resolved in path position and lands.
-            Builtin::EvalExpr(_) => Detaches,
+            Builtin::EvalExpr(..) => Detaches,
             Builtin::Now
             | Builtin::Env
             | Builtin::EnvObject(_)
@@ -52855,10 +52946,10 @@ mod tests {
             let bound = src.map(|s| Box::new(crate::jq::parse(s).unwrap()));
             single_slice_bound::<JqSemantics, _>(&bound, root.value(), Some(root), round)
         };
-        assert!(matches!(pull(Some("2"), f64::floor), Some(Ok(Some(2)))));
+        assert!(matches!(pull(Some("2"), f64::floor), Some(Ok(Some(b))) if b.rounded() == 2));
         // a fractional bound is rounded the way a literal one is: down for a start, up for an end
-        assert!(matches!(pull(Some("1.5"), f64::floor), Some(Ok(Some(1)))));
-        assert!(matches!(pull(Some("1.5"), f64::ceil), Some(Ok(Some(2)))));
+        assert!(matches!(pull(Some("1.5"), f64::floor), Some(Ok(Some(b))) if b.rounded() == 1));
+        assert!(matches!(pull(Some("1.5"), f64::ceil), Some(Ok(Some(b))) if b.rounded() == 2));
         // an open side is one value too
         assert!(matches!(pull(None, f64::floor), Some(Ok(None))));
         assert!(pull(Some("(1,2)"), f64::floor).is_none());

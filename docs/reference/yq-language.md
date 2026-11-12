@@ -797,6 +797,9 @@ surface (#1512):
 | `ltrim`, `rtrim`, `utf8bytelength`                   | Trim / byte length (#4808)                    |
 | `toboolean`, `tojsonstream`, `fromjsonstream`, `builtins`, `modulemeta` | Remaining jq-only names (#4808)               |
 
+The flag also reaches the text `eval(...)` runs (#7012): `eval("paths")` is a parse error by
+default and runs with the flag.
+
 The flag also enables jq's generic postfix `?` after an expression such as
 `length?` or `(.x)?` (#3378). Default yq accepts optional navigation on
 fields and brackets (`.x?`, `.[0]?`), as in real yq. `.?` is optional access
@@ -847,6 +850,12 @@ same kind of thing as the rest of this table — extra, off by default.
 | `--no-doc`            | Omit document separators (`---`)              |
 | `--tab`               | Use tabs for indentation (write-only — see [Known Limitations](#known-limitations)) |
 | `--split-exp EXPR`    | Split output into one file per result (below) |
+| `--split-exp-file F`  | `--split-exp` with the expression read from `F` (#7025) |
+| `--expression EXPR`   | The filter, so every positional is an input file (#7025) |
+| `-f, --front-matter M` | `extract` or `process` a `---`-fenced header (below) |
+| `--security-disable-env-ops` | Refuse `env()`, `strenv()` and `envsubst` (#7025) |
+| `--security-disable-file-ops` | Refuse `load()`, `load_str()` and `load_base64()` (#7025) |
+| `-v, --verbose`       | Accepted; no debug log is written (#7025)     |
 | `-S, --sort-keys`     | Sort mapping keys in output (succinctly extension — real yq has no such flag) |
 
 ### `--front-matter`
@@ -878,6 +887,8 @@ succinctly yq --split-exp '"out_" + ($index|tostring) + ".yml"' '.[]' data.yaml
 # Named by a field of the result itself
 succinctly yq --split-exp '.name + ".yml"' '.[]' data.yaml
 ```
+
+A name that has no extension gets the output format's: `.json` for `-o=json`, `.properties` for `-o=props` and `.yml` for every other format, `-o=xml`, `-o=toml`, `-o=lua` and `-o=csv` included, as yq v4.53.3 does (#7028). "Has an extension" is yq's own test, a `.` followed by one or more ASCII letters or digits at the very end of the name, so `x.txt`, `x.1`, `x.tar.gz` and `x.YML` are kept, while `x.`, `x.a-b` and `x.é` get one (`x..yml`, `x.a-b.yml`). The format is the one the run resolves to: JSON input read without `-o` writes `.json` files, `-p=json` without `-o` and stdin write `.yml`.
 
 **Deliberately long-only**, unlike real yq's `-s`/`--split-exp`: succinctly's `-s` is already `--slurp`. A non-string result errors; a duplicate filename overwrites with a warning. Incompatible with `--slurp`, `--inplace`, and `--front-matter`; `--raw-input` is not yet supported.
 

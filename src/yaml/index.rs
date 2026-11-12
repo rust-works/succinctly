@@ -792,6 +792,16 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         !self.comments.is_empty()
     }
 
+    /// Whether a node strictly inside the subtree that opens at `bp_pos` has a comment recorded (a
+    /// line, head or foot comment), not counting the node's own: a range read of the comment table,
+    /// whose keys are the nodes' open positions (#6986).
+    #[must_use]
+    pub fn has_comment_below(&self, bp_pos: usize) -> bool {
+        self.bp()
+            .find_close(bp_pos)
+            .is_some_and(|close| self.comments.range(bp_pos + 1..close).next().is_some())
+    }
+
     /// Whether any node carries a trailing same-line comment (#6737): `false` is a proof that no
     /// comment is written after a value on its line, so a writer may end a literal block on the
     /// value's last line. Settled when the index is built, so a caller may ask it for every scalar.
