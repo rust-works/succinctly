@@ -23,10 +23,10 @@ use std::string::ToString;
 
 use super::block_unicode::{any_break_len, decode_block_unicode, unicode_break_len};
 use super::encode_style::{
-    flow_plain_needs_single_quotes, go_yaml_explicit_key_scalar, go_yaml_key_is_simple,
-    go_yaml_multiline_scalar, go_yaml_single_quoted_line_feed, go_yaml_unicode_separator_scalar,
-    has_unwritable_char, has_unwritable_char_in_block, write_go_yaml_double_quoted,
-    write_go_yaml_single_quoted, write_go_yaml_string,
+    flow_plain_needs_single_quotes, go_yaml_block_scalar, go_yaml_explicit_key_scalar,
+    go_yaml_key_is_simple, go_yaml_multiline_scalar, go_yaml_single_quoted_line_feed,
+    go_yaml_unicode_separator_scalar, has_unwritable_char, has_unwritable_char_in_block,
+    write_go_yaml_double_quoted, write_go_yaml_single_quoted, write_go_yaml_string,
 };
 use super::flow_layout::{flow_continuation, render_flow, FlowItem};
 use super::index::YamlIndex;
@@ -10161,6 +10161,45 @@ fn write_yaml_block_field_key<W: AsRef<[u64]>, Out: core::fmt::Write>(
             }
         }
     }
+    // #7032: a key written as a literal block scalar (`? |-`) cannot stand as a simple key, so yq
+    // writes it as the explicit key it came as when its text has a line break or is longer than
+    // 128 bytes, with the anchor and tag it carries, and double-quoted when it is one short line.
+    if let YamlValue::String(s @ YamlString::BlockLiteral { .. }) = field.key() {
+        if let Ok(decoded) = s.as_str() {
+            let own_key = field.key_cursor();
+            let anchor = own_key.anchor();
+            let tag = own_key.explicit_tag_at(None);
+            if go_yaml_key_is_simple(&decoded) {
+                if anchor.is_none() && tag.is_none() {
+                    write_go_yaml_double_quoted(out, &decoded)?;
+                    return Ok(false);
+                }
+            } else {
+                let child_indent = deeper_yaml_indent(indent, indent_spaces, unit);
+                // The key keeps its literal style, also when it is only too long to be simple.
+                if let Some(scalar) =
+                    go_yaml_block_scalar(&decoded, false, &child_indent, indent_spaces).or_else(
+                        || go_yaml_explicit_key_scalar(&decoded, &child_indent, indent_spaces),
+                    )
+                {
+                    out.write_str("? ")?;
+                    if let Some(anchor) = anchor {
+                        out.write_char('&')?;
+                        out.write_str(anchor)?;
+                        out.write_char(' ')?;
+                    }
+                    if let Some(tag) = tag {
+                        out.write_str(tag)?;
+                        out.write_char(' ')?;
+                    }
+                    out.write_str(&scalar)?;
+                    out.write_char('\n')?;
+                    out.write_str(indent)?;
+                    return Ok(true);
+                }
+            }
+        }
+    }
     write_yaml_field_key(out, field, false)?;
     Ok(false)
 }
@@ -10271,7 +10310,10 @@ fn write_yaml_block_field_key_checked<W: AsRef<[u64]>, Out: core::fmt::Write>(
                     raw.len() > 128 || raw.contains(&b'\\')
                 }
             };
+            // (#7032: a literal block key keeps its block style, which `write_yaml_block_field_key`
+            // writes.)
             if long
+                && !matches!(s, YamlString::BlockLiteral { .. })
                 && s.as_str()
                     .is_ok_and(|decoded| !go_yaml_key_is_simple(&decoded))
             {
