@@ -3326,6 +3326,7 @@ mod yaml_pattern_registry;
 mod yaml_validate;
 mod yq_bench;
 mod yq_locate;
+mod yq_result_document;
 mod yq_runner;
 use generators::generate_json;
 

@@ -910,7 +910,12 @@ struct OutputConfig {
     join_output: bool,
     ascii_output: bool,
     sort_keys: bool,
+    /// No `---` between results: `-N`, or a filter whose results yq builds with no document
+    /// (#7019).
     no_doc: bool,
+    /// `-N` itself, which also drops the `---` lines of a document's preamble (#2795). Apart from
+    /// `no_doc` because a filter of fresh results keeps them, as yq does (#7019 review).
+    no_doc_flag: bool,
     indent_str: String,
     /// `-c`: a block sequence under a mapping key is indented by the step less two columns
     /// (#7025).
@@ -977,6 +982,7 @@ impl OutputConfig {
             ascii_output: args.ascii_output,
             sort_keys: args.sort_keys,
             no_doc: args.no_doc,
+            no_doc_flag: args.no_doc,
             indent_str,
             compact_seq_indent: args.yaml_compact_seq_indent,
             use_color,
@@ -1047,6 +1053,7 @@ impl OutputConfig {
             ascii_output: self.ascii_output,
             sort_keys: self.sort_keys,
             no_doc: self.no_doc,
+            no_doc_flag: self.no_doc_flag,
             indent_str: Self::compute_indent_str(args, output_format),
             compact_seq_indent: self.compact_seq_indent,
             use_color: self.use_color,
@@ -10093,7 +10100,7 @@ fn output_value<W: Write>(
         // written by the filter is part of the document's text, and colored with it.
         let leading = match comments.meta().preamble() {
             Some(preamble) => {
-                let preamble: String = if config.no_doc {
+                let preamble: String = if config.no_doc_flag {
                     preamble
                         .split_inclusive('\n')
                         .filter(|line| line.trim_end_matches(['\n', '\r', ' ', '\t']) != "---")
@@ -12508,6 +12515,10 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     if let Err(unresolved) = jq::resolve_func_calls(&mut program.expr) {
         anyhow::bail!("{unresolved}");
     }
+    // #7019: read before the #5450 fold below, which moves a navigation inside an array, and before
+    // the `-o` encoder is piped on.
+    let results_have_no_document =
+        crate::yq_result_document::results_have_no_document(&program.expr);
     // #5450: `.a | [.[] | key]` is `[.a[] | key]`, whose key nodes keep their presentation. Not under
     // `--eval-all`, where an array collects every document's results into one (#4380).
     if !args.eval_all {
@@ -12555,7 +12566,13 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         .transpose()?;
 
     // Output configuration
-    let output_config = OutputConfig::from_args(&args);
+    let mut output_config = OutputConfig::from_args(&args);
+    // #7019: yq writes `---` only between results whose document index differs, and a result built
+    // from a document's root or from nothing has index 0, as every other one of its kind does.
+    // `-i` keeps the separators: without them a file of several documents is rewritten as one
+    // (`length` over three becomes `3 3 3`, one string, when read back), which loses the documents
+    // (ADR-0018: matching would corrupt the file; recorded in limitations.md).
+    output_config.no_doc |= results_have_no_document && !args.inplace;
 
     // Set up output
     let stdout = std::io::stdout();
@@ -15987,6 +16004,7 @@ mod tests {
             ascii_output: false,
             sort_keys: false,
             no_doc: false,
+            no_doc_flag: false,
             indent_str: String::new(),
             compact_seq_indent: false,
             use_color: false,
@@ -16105,6 +16123,7 @@ mod tests {
             ascii_output: false,
             sort_keys: false,
             no_doc: false,
+            no_doc_flag: false,
             indent_str: "  ".to_string(),
             compact_seq_indent: false,
             use_color: false,
@@ -16564,6 +16583,7 @@ mod tests {
             ascii_output: false,
             sort_keys: false,
             no_doc: false,
+            no_doc_flag: false,
             indent_str: "  ".to_string(),
             compact_seq_indent: false,
             use_color: false,
@@ -16736,6 +16756,7 @@ mod tests {
             ascii_output: false,
             sort_keys: false,
             no_doc: false,
+            no_doc_flag: false,
             indent_str: String::new(),
             compact_seq_indent: false,
             use_color: false,
@@ -16794,6 +16815,7 @@ mod tests {
             ascii_output: false,
             sort_keys: false,
             no_doc: false,
+            no_doc_flag: false,
             indent_str: String::new(),
             compact_seq_indent: false,
             use_color: false,
@@ -18107,6 +18129,7 @@ mod tests {
             ascii_output: false,
             sort_keys: false,
             no_doc: false,
+            no_doc_flag: false,
             indent_str: "  ".to_string(),
             compact_seq_indent: false,
             use_color: false,

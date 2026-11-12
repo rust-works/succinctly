@@ -1164,27 +1164,32 @@ test). Two things follow that succinctly does not reproduce:
    `tostring`, `to_entries`, `map`, `[...]`, `has`, `path`, `key`, `parent`, `line`,
    `column`, `filename`, `file_index`, `document_index` and every literal do not.
 
-succinctly's values carry no such field, and there is no unifying rule to derive one from —
-so it writes `---` between successive results whenever the output is YAML and there is more
-than one. That agrees with real yq for every filter in group (2)'s first list and for
-one-document-per-file input, and diverges for the second list. Live-verified against
-v4.53.3 on `f1.yaml` (`a: 1`, `name: first`) and `f2.yaml` (`b: 2`, `name: second`):
+succinctly's values carry no such field.
+It writes `---` before each document's first result when the output is YAML, which agrees with real yq for every filter in group (2)'s first list and for one-document-per-file input.
+For a filter every one of whose results yq builds with no document it writes none (#7019): `yq_result_document.rs` reads that from the filter, stage by stage, from yq's rule for each operator (a navigation step keeps its input's document, a replacement of a document's root and a literal have none, `{...}` keeps its input's).
+That covers literals, `[...]`, `length`, `has`, `contains`, `tostring`, `to_json`, `to_yaml`, `@json`, `@yaml`, `@props`, `to_entries`, `not`, `key`, `anchor`, `tag`, `type`, `style`, `kind`, `line`, `column`, `path`, `file_index`, `document_index` and `filename` over a document's root; `keys`, `with_entries` and interpolation over any input, which build a new node; `{}`, which yq reads as a literal; a comparison, `and` or `or` whose left operand always yields one result of that kind (yq builds the boolean from the left operand); arithmetic whose left operand is a literal other than `null`; `//` whose left operand is a literal (the left one when it is truthy, else the right one); a `$name` bound to one of those; and any pipe whose last such stage builds one over whatever it is handed (`del(.a) | "x"`).
+`.a | length` keeps `.a`'s document, as in yq.
+The run's `---` lines go and a document's own leading `---` stays, as in yq.
+`-i` keeps the separators, a divergence (ADR-0018: matching would corrupt the file): without them yq rewrites a file of several documents as one, so `yq -i length` over three documents writes `3`, `3`, `3`, which reads back as the one string `3 3 3`, and `with_entries(.)` joins their keys into one mapping.
+Live-verified against v4.53.3 on `f1.yaml` (`a: 1`, `name: first`) and `f2.yaml` (`b: 2`, `name: second`):
 
 ```bash
 $ yq '.'      f1.yaml f2.yaml    # a: 1 / name: first / --- / b: 2 / name: second   (agrees)
-$ yq 'length' f1.yaml f2.yaml    # 2 / 2
-$ succinctly yq 'length' f1.yaml f2.yaml           # 2 / --- / 2
-$ yq 'file_index' f1.yaml f2.yaml                  # 0 / 1
-$ succinctly yq 'file_index' f1.yaml f2.yaml       # 0 / --- / 1
+$ yq 'length' f1.yaml f2.yaml    # 2 / 2                                             (agrees)
 $ yq '.name, .name' f1.yaml f2.yaml   # first / first / --- / second / --- / second
 $ succinctly yq '.name, .name' f1.yaml f2.yaml     # first / first / --- / second / second
 ```
 
-Same on the `--eval-all` path, which since #2427 also produces one result per document:
-`yq ea 'file_index' f1.yaml f2.yaml` prints `0` and `1` with no separator where succinctly
-writes one between them. Closing this needs per-node file/document provenance threaded from
-the evaluator to the printer, plus yq's own per-operator table for which operators set it —
-tracked on [#2427](https://github.com/rust-works/succinctly/issues/2427).
+Every other filter keeps the separator before each document's first result.
+Where yq's index differs between the results of one filter, or depends on the values, that differs:
+
+- `map` over a document's node copies an empty input (which keeps the document) and builds a fresh sequence from any other, so `.l | map(.)` over `l: [1, 2]` / `---` / `l: [3]` / `---` / `l: []` is `[1, 2]` / `[3]` / `---` / `[]` in yq, and here every result is separated.
+- A comma whose branches differ (`.a, "x"`) or `..` (whose first result is the root) separates within a document in yq (`2` / `---` / `x` in the second document), and here only before a document's first result.
+- `//` whose left operand is not a literal is that operand where it is truthy and its right one otherwise, so `.z // "x"` with no `.z` has no document in yq and is separated here; arithmetic whose left operand is null copies its right one (`.z + 1`), and a comparison whose left operand yields nothing builds from its right one, the same way.
+- Any stage outside the list above (`del`, `sort_keys`, `select` after a construction it cannot see through, `$x`, `reduce`, ...) keeps the separator, whatever yq builds there.
+- yq never updates the file index it compares against (point 1), so every result from a file other than the first printed result's is separated, both of `.name, .name`'s second-file results above included; here only a document's first result is.
+
+Closing those needs per-node document provenance threaded from the evaluator to the printer, tracked on [#2427](https://github.com/rust-works/succinctly/issues/2427).
 
 ### `filename` and `file_index` are read from the evaluation context, not from the node (#2648)
 
@@ -7681,7 +7686,6 @@ Six rows differ from yq v4.53.3, each pinned out of `tests/yq_cli/i6850.rs`:
   A value read from the document gets them as yq writes them (#6922): above each property, its key's head and line comment and then its value's, each with its first `#` dropped and nothing between them (`# h` over `a: 1 # c` is `# h c`), after a blank line unless it is the first; the comment after a bare `-` goes to the item's first key, or to its first element if that is a scalar; a mapping's or sequence's own comment is dropped; and the first document's leading comment block comes first when the result is that document.
   Where succinctly attributes a comment to a different node than yq does, which `head_comment` and `line_comment` show too, the property gets it as succinctly attributes it (the comment after a bare `-` and the line break a blank line leaves under a head comment agree since #7034; a byte-order mark's first comment, which yq gives the first key, and a block above the first key of a later bare `-` item, which yq reads as that key's foot, still differ, #7044).
   `head_comment` reads both from the document node, so a key read inside parentheses, after a `select` or under a non-YAML `-o` loses them (#7043), and after a write (`.[0].b = 2 | .[0].a | key | head_comment` over `- # m` / `  a: 1` is `""`, yq `"m"`), under `--eval-all` and on a built value they are not there (#7034).
-  Results of two documents are separated by `---` here and not in yq (#7019 has the same family).
   `@props` in the text an `eval` reads, or on the right of an assignment (`.x = (. | @props)`), writes no comment either: that evaluation holds the value without the document node.
   Two keys whose paths join to the same property (`a.b: 1` beside `a: {b: 2}`) write two lines here, each with the later key's comment, where yq writes the property once, with the later value and comment.
 - A null written `~` (or `!!null ""`) prints `null` with every encoder, `ini` included, where yq echoes the spelling (`c = ~`, `c='~'`, `a = `, #2802).
