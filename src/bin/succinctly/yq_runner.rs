@@ -4648,8 +4648,8 @@ struct SplitFiles {
     written: std::collections::HashSet<String>,
     name_format: OutputFormat,
     encoder: Option<Expr>,
-    /// Set when the encoder refused a result and yq's stop-at-the-first-error rule ends the run
-    /// (#2810, #7036): the loops stop writing. An error in the name expression never sets it.
+    /// Set when the encoder refused a result, or the name expression raised an error, and yq's
+    /// stop-at-the-first-error rule ends the run (#2810, #7036, #7065): the loops stop writing.
     run_ended: bool,
     /// Whether an earlier result of the run has been written (#7053). yq writes every file through
     /// one printer, which keeps its "document already printed" state across them: the first result
@@ -4721,7 +4721,15 @@ fn write_split_result(
     let halted_before = sink.halted().is_some();
 
     let reports_before = sink.report_count();
+    let program_errors_before = sink.program_error_count();
     let filename_results = evaluate_input(result, &per_result_expr, sink)?;
+
+    // #7065: an error the name expression raises ends the run as one the program raises does
+    // (#2810): yq has written the files before it and writes none after it.
+    if sink.ends_run_since(program_errors_before) {
+        files.run_ended = true;
+        return Ok(());
+    }
 
     // halt/halt_error (#791) inside *this* split expression: not a
     // diagnostic (no `report_count` bump), so an empty result must be
