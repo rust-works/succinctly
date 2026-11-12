@@ -910,7 +910,12 @@ struct OutputConfig {
     join_output: bool,
     ascii_output: bool,
     sort_keys: bool,
+    /// No `---` between results: `-N`, or a filter whose results yq builds with no document
+    /// (#7019).
     no_doc: bool,
+    /// `-N` itself, which also drops the `---` lines of a document's preamble (#2795). Apart from
+    /// `no_doc` because a filter of fresh results keeps them, as yq does (#7019 review).
+    no_doc_flag: bool,
     indent_str: String,
     use_color: bool,
     /// A JSON-sourced float never keeps a decimal point in output,
@@ -974,6 +979,7 @@ impl OutputConfig {
             ascii_output: args.ascii_output,
             sort_keys: args.sort_keys,
             no_doc: args.no_doc,
+            no_doc_flag: args.no_doc,
             indent_str,
             use_color,
             json_sourced_floats: false,
@@ -1043,6 +1049,7 @@ impl OutputConfig {
             ascii_output: self.ascii_output,
             sort_keys: self.sort_keys,
             no_doc: self.no_doc,
+            no_doc_flag: self.no_doc_flag,
             indent_str: Self::compute_indent_str(args, output_format),
             use_color: self.use_color,
             json_sourced_floats: input_format == InputFormat::Json,
@@ -10088,7 +10095,7 @@ fn output_value<W: Write>(
         // written by the filter is part of the document's text, and colored with it.
         let leading = match comments.meta().preamble() {
             Some(preamble) => {
-                let preamble: String = if config.no_doc {
+                let preamble: String = if config.no_doc_flag {
                     preamble
                         .split_inclusive('\n')
                         .filter(|line| line.trim_end_matches(['\n', '\r', ' ', '\t']) != "---")
@@ -15957,6 +15964,7 @@ mod tests {
             ascii_output: false,
             sort_keys: false,
             no_doc: false,
+            no_doc_flag: false,
             indent_str: String::new(),
             use_color: false,
             json_sourced_floats: false,
@@ -16074,6 +16082,7 @@ mod tests {
             ascii_output: false,
             sort_keys: false,
             no_doc: false,
+            no_doc_flag: false,
             indent_str: "  ".to_string(),
             use_color: false,
             json_sourced_floats: false,
@@ -16532,6 +16541,7 @@ mod tests {
             ascii_output: false,
             sort_keys: false,
             no_doc: false,
+            no_doc_flag: false,
             indent_str: "  ".to_string(),
             use_color: false,
             json_sourced_floats: false,
@@ -16703,6 +16713,7 @@ mod tests {
             ascii_output: false,
             sort_keys: false,
             no_doc: false,
+            no_doc_flag: false,
             indent_str: String::new(),
             use_color: false,
             json_sourced_floats: false,
@@ -16760,6 +16771,7 @@ mod tests {
             ascii_output: false,
             sort_keys: false,
             no_doc: false,
+            no_doc_flag: false,
             indent_str: String::new(),
             use_color: false,
             json_sourced_floats: false,
@@ -18072,6 +18084,7 @@ mod tests {
             ascii_output: false,
             sort_keys: false,
             no_doc: false,
+            no_doc_flag: false,
             indent_str: "  ".to_string(),
             use_color: false,
             json_sourced_floats: false,

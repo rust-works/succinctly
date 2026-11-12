@@ -1167,7 +1167,10 @@ test). Two things follow that succinctly does not reproduce:
 succinctly's values carry no such field.
 It writes `---` before each document's first result when the output is YAML, which agrees with real yq for every filter in group (2)'s first list and for one-document-per-file input.
 For a filter every one of whose results yq builds with no document it writes none (#7019): `yq_result_document.rs` reads that from the filter, stage by stage, from yq's rule for each operator (a navigation step keeps its input's document, a replacement of a document's root and a literal have none, `{...}` keeps its input's).
-That covers literals, `[...]`, `length`, `keys`, `tag`, `type`, `has`, `contains`, `tostring`, `to_json`, `to_yaml`, `@json`, `@yaml`, `@props`, interpolation, `to_entries`, `with_entries`, `not`, `key`, `anchor`, `style`, `kind`, `line`, `column`, `path`, `file_index`, `document_index` and `filename` over a document's root, and a comparison, `//` or arithmetic whose operands are both of that kind; `.a | length` keeps `.a`'s document, as in yq.
+That covers literals, `[...]`, `length`, `has`, `contains`, `tostring`, `to_json`, `to_yaml`, `@json`, `@yaml`, `@props`, `to_entries`, `not`, `key`, `anchor`, `tag`, `type`, `style`, `kind`, `line`, `column`, `path`, `file_index`, `document_index` and `filename` over a document's root; `keys`, `with_entries` and interpolation over any input, which build a new node; a comparison, `and` or `or` whose left operand always yields one result of that kind (yq builds the boolean from the left operand); and arithmetic whose left operand is a literal other than `null`.
+`.a | length` keeps `.a`'s document, as in yq.
+The run's `---` lines go and a document's own leading `---` stays, as in yq.
+Under `-i` that rewrites a multi-document file as yq does, as one document when the results are mappings (`with_entries(.)` joins their keys into one mapping that repeats them): both tools read that file back, so it is yq's output kept rather than refused.
 Live-verified against v4.53.3 on `f1.yaml` (`a: 1`, `name: first`) and `f2.yaml` (`b: 2`, `name: second`):
 
 ```bash
@@ -1177,11 +1180,13 @@ $ yq '.name, .name' f1.yaml f2.yaml   # first / first / --- / second / --- / sec
 $ succinctly yq '.name, .name' f1.yaml f2.yaml     # first / first / --- / second / second
 ```
 
-Four shapes still differ:
+Every other filter keeps the separator before each document's first result.
+Where yq's index differs between the results of one filter, or depends on the values, that differs:
 
 - `map` over a document's node copies an empty input (which keeps the document) and builds a fresh sequence from any other, so `.l | map(.)` over `l: [1, 2]` / `---` / `l: [3]` / `---` / `l: []` is `[1, 2]` / `[3]` / `---` / `[]` in yq, and here every result is separated.
 - A comma whose branches differ (`.a, "x"`) or `..` (whose first result is the root) separates within a document in yq (`2` / `---` / `x` in the second document), and here only before a document's first result.
-- Arithmetic whose left operand is null returns a copy of its right one, so `.z + 1` with no `.z` has no document in yq and is separated here.
+- `//` is its left operand where that is truthy and its right one otherwise, so `.z // "x"` with no `.z` has no document in yq and is separated here; arithmetic whose left operand is null copies its right one (`.z + 1`), and a comparison whose left operand yields nothing builds from its right one, the same way.
+- Any stage outside the list above (`del`, `sort_keys`, `select` after a construction it cannot see through, `$x`, `reduce`, ...) keeps the separator, whatever yq builds there.
 - yq never updates the file index it compares against (point 1), so every result from a file other than the first printed result's is separated, both of `.name, .name`'s second-file results above included; here only a document's first result is.
 
 Closing those needs per-node document provenance threaded from the evaluator to the printer, tracked on [#2427](https://github.com/rust-works/succinctly/issues/2427).

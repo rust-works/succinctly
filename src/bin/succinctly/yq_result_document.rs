@@ -21,7 +21,7 @@
 //! within one document (`.a, "x"`, `..`), are not modelled; they are recorded in
 //! `docs/compliance/yq/limitations.md`.
 
-use succinctly::jq::{Builtin, Expr, FormatType};
+use succinctly::jq::{Builtin, Expr, FormatType, Literal};
 
 /// The two facts about a yq node that decide the document index of what is built from it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,6 +78,17 @@ fn either(a: Node, b: Node) -> Option<Node> {
     }
 }
 
+/// Whether `expr` yields exactly one result over any input: a literal, `.`, or a field or index
+/// step (an absent one is `null`), alone or in a pipe of them.
+fn yields_one(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) | Expr::Identity | Expr::Field(_) | Expr::Index { .. } => true,
+        Expr::Paren(inner) => yields_one(inner),
+        Expr::Pipe(stages) => stages.iter().all(yields_one),
+        _ => false,
+    }
+}
+
 /// The node of every result `expr` yields over a node `input`, or `None` where it is not known (or
 /// differs between results).
 fn result_node(expr: &Expr, input: Node) -> Option<Node> {
@@ -95,21 +106,32 @@ fn result_node(expr: &Expr, input: Node) -> Option<Node> {
             nodes.try_fold(first, |acc, node| either(acc, node?))
         }
         Expr::Literal(_) => Some(FRESH),
-        Expr::Array(_) | Expr::StringInterpolation(_) | Expr::Not => Some(replacement(input)),
+        Expr::Array(_) | Expr::Not => Some(replacement(input)),
+        // Interpolation builds a new string node whatever its input.
+        Expr::StringInterpolation(_) => Some(FRESH),
         Expr::Object(_) => Some(Node {
             document: input.document,
             parent: false,
         }),
-        // A comparison, `and`/`or`, an arithmetic result and `//` are built from (or are) one of
-        // their operands, which one depending on the values, so they are known only where both
-        // operands' replacements agree.
+        // A comparison and `and`/`or` build their boolean as a replacement of the left operand
+        // (`createBooleanCandidate(lhs)`), or of the right one where the left yields nothing, so a
+        // left operand that always yields one result decides.
         Expr::Compare { left, right, .. } | Expr::And(left, right) | Expr::Or(left, right) => {
-            either(
-                replacement(result_node(left, input)?),
-                replacement(result_node(right, input)?),
-            )
+            let left_node = replacement(result_node(left, input)?);
+            if yields_one(left) {
+                Some(left_node)
+            } else {
+                either(left_node, replacement(result_node(right, input)?))
+            }
         }
-        Expr::Arithmetic { left, right, .. } | Expr::Alternative(left, right) => {
+        // Arithmetic copies the right operand where the left is null and the left one otherwise, so a
+        // left literal that is not `null` decides; elsewhere both must agree. `//` is its left
+        // operand where that is truthy, which depends on the values.
+        Expr::Arithmetic { left, right, .. } => match left.as_ref() {
+            Expr::Literal(literal) if !matches!(literal, Literal::Null) => Some(FRESH),
+            _ => either(result_node(left, input)?, result_node(right, input)?),
+        },
+        Expr::Alternative(left, right) => {
             either(result_node(left, input)?, result_node(right, input)?)
         }
         Expr::If {
@@ -123,17 +145,14 @@ fn result_node(expr: &Expr, input: Node) -> Option<Node> {
         Expr::Try { expr, catch: None } => result_node(expr, input),
         // The body runs over the input; a `$name` it reads is not modelled (`Var` is unknown).
         Expr::As { body, .. } => result_node(body, input),
-        Expr::Format(format) => match format {
+        Expr::Format(
             FormatType::Text
             | FormatType::Json
             | FormatType::Yaml
             | FormatType::Props
             | FormatType::YqJson(_)
-            | FormatType::YqYaml(_) => Some(replacement(input)),
-            // `-o`'s encoder, piped after the filter: it encodes each result as it is.
-            FormatType::YqOutput(_) => Some(input),
-            _ => None,
-        },
+            | FormatType::YqYaml(_),
+        ) => Some(replacement(input)),
         Expr::Builtin(builtin) => builtin_node(builtin, input),
         _ => None,
     }
@@ -141,14 +160,13 @@ fn result_node(expr: &Expr, input: Node) -> Option<Node> {
 
 fn builtin_node(builtin: &Builtin, input: Node) -> Option<Node> {
     match builtin {
-        // yq mode parses `keys` as `KeysUnsorted` (document order).
+        // `keys` (which yq mode parses as `KeysUnsorted`, document order) and `with_entries` build
+        // a new collection whatever their input.
+        Builtin::Keys | Builtin::KeysUnsorted | Builtin::WithEntries(_) => Some(FRESH),
         Builtin::Length
-        | Builtin::Keys
-        | Builtin::KeysUnsorted
         | Builtin::Has(_)
         | Builtin::Contains(_)
         | Builtin::ToEntries
-        | Builtin::WithEntries(_)
         | Builtin::ToString
         | Builtin::ToJson
         | Builtin::Type
@@ -177,8 +195,11 @@ mod tests {
     use succinctly::jq;
 
     fn fresh(filter: &str) -> bool {
-        let program = jq::parse_program_with_mode_and_extensions(filter, jq::ParserMode::Yq, false)
-            .expect("filter parses");
+        let mut program =
+            jq::parse_program_with_mode_and_extensions(filter, jq::ParserMode::Yq, false)
+                .expect("filter parses");
+        // As `run_yq` does before it classifies.
+        jq::resolve_func_calls(&mut program.expr).expect("calls resolve");
         results_have_no_document(&program.expr)
     }
 
@@ -204,6 +225,13 @@ mod tests {
             ". as $x | \"x\"",
             "file_index",
             "document_index",
+            ".a | keys",
+            ".a | with_entries(.)",
+            ".a | \"\\(.)\"",
+            "1 == .n",
+            "\"x\" and .a",
+            "\"x\" + .s",
+            "2 * .n",
         ] {
             assert!(fresh(filter), "{filter}");
         }
@@ -220,6 +248,9 @@ mod tests {
             ".a + 1",
             ".a | document_index",
             ".a == 1",
+            "null + .a",
+            ".[] == 1",
+            ".z // \"x\"",
             ".a // 1",
             "map(.)",
             ".a, \"x\"",

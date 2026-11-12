@@ -71,6 +71,54 @@ const RESIDUAL_ROWS: &[(&str, &str)] = &[
     (".a, \"x\"", "1\nx\n---\n2\nx\n---\n3\nx\n"),
 ];
 
+const CHILD_INPUT: &str = "a: {x: 1, y: [1]}\nn: 2\ns: ab\n---\na: {x: 2, y: [2]}\nn: 3\ns: cd\n";
+
+/// Over a child: `keys`, `with_entries` and interpolation build a new node whatever their input;
+/// a comparison or `and`/`or` builds from its left operand, and arithmetic from a non-null left
+/// literal. (filter, yq's stdout over [`CHILD_INPUT`]).
+const CHILD_ROWS: &[(&str, &str)] = &[
+    (".a | keys", "- x\n- y\n- x\n- y\n"),
+    (".a | with_entries(.)", "x: 1\ny: [1]\nx: 2\ny: [2]\n"),
+    (".a | \"\\(.)\"", "{x: 1, y: [1]}\n{x: 2, y: [2]}\n"),
+    ("1 == .n", "false\nfalse\n"),
+    ("\"x\" and .a", "true\ntrue\n"),
+    ("true or .a", "true\ntrue\n"),
+    ("\"x\" + .s", "xab\nxcd\n"),
+    ("2 * .n", "4\n6\n"),
+    (".n == 1", "false\n---\nfalse\n"),
+    (".a | length", "2\n---\n2\n"),
+];
+
+/// A document's own leading `---` stays where the run's separators go (input, filter, yq's stdout).
+const PREAMBLE_ROWS: &[(&str, &str, &str)] = &[
+    ("# c\n---\na: 1\n", "[.][]", "# c\n---\na: 1\n"),
+    ("# c\n---\na: 1\n", "[.] | .[0]", "# c\n---\na: 1\n"),
+    ("---\na: 1\n---\na: 2\n", "[.][]", "---\na: 1\na: 2\n"),
+    ("---\na: 1\n---\na: 2\n", "[.] | .[0]", "---\na: 1\na: 2\n"),
+];
+
+#[test]
+fn results_built_over_a_child_or_from_the_left_operand_7019() -> Result<()> {
+    for (filter, expected) in CHILD_ROWS {
+        let (stdout, status) = run_yq_stdin(filter, CHILD_INPUT, &[])?;
+        assert_eq!((stdout.as_str(), status), (*expected, 0), "{filter}");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_documents_leading_separator_stays_7019() -> Result<()> {
+    for (input, filter, expected) in PREAMBLE_ROWS {
+        let (stdout, status) = run_yq_stdin(filter, input, &[])?;
+        assert_eq!(
+            (stdout.as_str(), status),
+            (*expected, 0),
+            "{input:?} {filter}"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn results_built_with_no_document_print_no_separator_7019() -> Result<()> {
     for (filter, expected) in FRESH_ROWS.iter().chain(DOCUMENT_ROWS).chain(RESIDUAL_ROWS) {
