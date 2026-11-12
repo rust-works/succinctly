@@ -113,3 +113,24 @@ fn props_input_quoting_still_decides_the_tag_7031() -> Result<()> {
     }
     Ok(())
 }
+
+/// A props value spelled as a bool stays quoted under `-P` (`true`, `False`), and one spelled as a
+/// YAML 1.1 bool (`yes`) stays plain, both as in yq.
+const BOOL_INPUT: &str = "a=true\nb=False\nc=yes\n";
+
+const BOOL_ROWS: &[(&str, &str)] = &[
+    (".", "a: \"true\"\nb: \"False\"\nc: yes\n"),
+    (".z = 1", "a: \"true\"\nb: \"False\"\nc: yes\nz: 1\n"),
+    (".a style=\"\"", "a: \"true\"\nb: \"False\"\nc: yes\n"),
+    ("keys", "- a\n- b\n- c\n"),
+];
+
+#[test]
+fn props_input_bool_spellings_under_pretty_print_7031() -> Result<()> {
+    for (filter, expected) in BOOL_ROWS {
+        let (stdout, status) =
+            run_yq_stdin(filter, BOOL_INPUT, &["-p", "props", "-o", "yaml", "-P"])?;
+        assert_eq!((stdout.as_str(), status), (*expected, 0), "{filter}");
+    }
+    Ok(())
+}

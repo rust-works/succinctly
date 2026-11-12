@@ -9653,16 +9653,10 @@ fn strip_presentation_style_at_depth(
     // A quoted string keeps its quoting when yq's encoder would (a YAML 1.1 bool spelling), and
     // is otherwise remembered as a string, so a spelling that reads back as a timestamp or a
     // number once plain is quoted rather than echoed bare (#3614).
-    // A `-p props` string already carries the marker (#7031); it is quoted as `"double"` where a
-    // quote is kept.
+    // A `-p props` string already carries the marker (#7031), and keeps it: yq's props transcode
+    // prints a YAML 1.1 bool spelling plain, so no marked string is one.
     let kept_quote = |text: &str, style: &'static str| match style {
-        s if is_quoted_string_style(s) && is_yaml_11_bool_word(text) => {
-            if s == VALUE_STYLE_STRING {
-                "double"
-            } else {
-                s
-            }
-        }
+        "single" | "double" if is_yaml_11_bool_word(text) => style,
         s if is_quoted_string_style(s) => VALUE_STYLE_STRING,
         _ => "",
     };
