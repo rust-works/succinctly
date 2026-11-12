@@ -19531,12 +19531,6 @@ fn yq_sort_flag(value: &OwnedValue) -> u8 {
             }
         }
         OwnedValue::Float(_) | OwnedValue::NumberLiteral(NumberRepr::Float(..), _) => YQ_FLOAT,
-        OwnedValue::String(text)
-            if super::yq_datetime::could_be_timestamp(text)
-                && super::yq_datetime::is_timestamp(text) =>
-        {
-            YQ_TIMESTAMP
-        }
         OwnedValue::String(_) | OwnedValue::Array(_) | OwnedValue::Object(_) => YQ_TEXT,
     }
 }
@@ -19567,18 +19561,36 @@ fn yq_sort_is_total(flags: u8) -> bool {
 /// yq runs.
 pub(crate) fn yq_sort_by<T, S: EvalSemantics>(items: &mut [T], keys: impl Fn(&T) -> &[OwnedValue]) {
     let mut flags: Vec<u8> = Vec::new();
-    for item in items.iter() {
+    // #7058: the instant of every key that reads as a timestamp, read once here, so the kind flag
+    // below and the comparison agree on which keys are timestamps. Empty until one is found.
+    let mut instants: Vec<Vec<Option<super::go_time::Instant>>> = Vec::new();
+    for (at_item, item) in items.iter().enumerate() {
         for (at, key) in keys(item).iter().enumerate() {
+            let mut flag = yq_sort_flag(key);
+            if let OwnedValue::String(text) = key {
+                if super::yq_datetime::could_be_timestamp(text) {
+                    if let Some(instant) = super::yq_datetime::instant_of(text) {
+                        flag = YQ_TIMESTAMP;
+                        if instants.is_empty() {
+                            instants.resize_with(items.len(), Vec::new);
+                        }
+                        let row = &mut instants[at_item];
+                        if row.len() <= at {
+                            row.resize(at + 1, None);
+                        }
+                        row[at] = Some(instant);
+                    }
+                }
+            }
             match flags.get_mut(at) {
-                Some(seen) => *seen |= yq_sort_flag(key),
-                None => flags.push(yq_sort_flag(key)),
+                Some(seen) => *seen |= flag,
+                None => flags.push(flag),
             }
         }
     }
     let total = flags.iter().all(|&position| yq_sort_is_total(position));
-    // #7058: a key that reads as a timestamp compares as a time, parsed once per key.
-    if flags.iter().any(|&position| position & YQ_TIMESTAMP != 0) {
-        yq_sort_by_instants::<T, S>(items, &keys, total);
+    if !instants.is_empty() {
+        yq_sort_by_instants::<T, S>(items, &keys, &instants, total);
         return;
     }
     let compare = |a: &T, b: &T| yq_compare_key_arrays::<S>(keys(a), keys(b), &[], &[]);
@@ -19589,28 +19601,14 @@ pub(crate) fn yq_sort_by<T, S: EvalSemantics>(items: &mut [T], keys: impl Fn(&T)
     }
 }
 
-/// [`yq_sort_by`] for keys of which some read as timestamps (#7058): each key's instant is read
-/// once, the indices are sorted by them, and `items` is permuted to match, so a comparison costs
-/// no parse.
+/// [`yq_sort_by`] for keys of which some read as timestamps (#7058): the indices are sorted by the
+/// instants the caller read, and `items` is permuted to match, so a comparison costs no parse.
 fn yq_sort_by_instants<T, S: EvalSemantics>(
     items: &mut [T],
     keys: &impl Fn(&T) -> &[OwnedValue],
+    instants: &[Vec<Option<super::go_time::Instant>>],
     total: bool,
 ) {
-    let instants: Vec<Vec<Option<super::go_time::Instant>>> = items
-        .iter()
-        .map(|item| {
-            keys(item)
-                .iter()
-                .map(|key| match key {
-                    OwnedValue::String(text) if super::yq_datetime::could_be_timestamp(text) => {
-                        super::yq_datetime::instant_of(text)
-                    }
-                    _ => None,
-                })
-                .collect()
-        })
-        .collect();
     let mut order: Vec<usize> = (0..items.len()).collect();
     {
         let sorted: &[T] = items;
