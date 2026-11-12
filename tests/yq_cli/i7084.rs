@@ -70,6 +70,9 @@ const ROWS: &[(&str, &str, &str)] = &[
         "[\"l1\",\"\",[],[\"l2\",\"\"]]\n",
     ),
     ("# l1\n\n- 1\n", "F", "[\"l1\",\"\",[],[\"\",\"\"]]\n"),
+    // A tag or an anchor on its own line between the block and the node leaves the rule alone.
+    ("# c\n\n&x\na: 1\n", "F", "[\"c\",\"\",[\"\",\"\"],[]]\n"),
+    ("# c\n\n!!map\na: 1\n", "F", "[\"c\",\"\",[\"\",\"\"],[]]\n"),
     // Under an explicit marker the blocks go forward together, blank lines kept; one above the marker
     // keeps the line break a blank line leaves under it.
     (
