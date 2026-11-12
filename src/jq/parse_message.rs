@@ -782,7 +782,7 @@ mod tests {
         let mut kept = 0;
         for round in 0..60_000 {
             let mut doc = seeds[round % seeds.len()].to_vec();
-            for _ in 0..1 + next() % 4 {
+            for _ in 0..=(next() % 4) {
                 let at = (next() as usize) % (doc.len() + 1);
                 let byte = alphabet[(next() as usize) % alphabet.len()];
                 match next() % 3 {

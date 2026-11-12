@@ -196,9 +196,12 @@ pub fn write_stdin_then_wait(
             // `sin` is dropped here, so the child sees the end of its input.
         });
         let waited = child.wait_with_output();
-        let write_result = writer
-            .join()
-            .unwrap_or_else(|_| Err(std::io::Error::other("the stdin writer panicked")));
+        let write_result = writer.join().unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "the stdin writer panicked",
+            ))
+        });
         (write_result, waited)
     });
     // Prefer the write error's own diagnostic over `wait_with_output`'s

@@ -20785,7 +20785,7 @@ mod tests {
         );
         let stream = b"{\"a\":1}\n".repeat(20);
         let (files, mut reader, reread) = windowed_pipe(piped(&stream), 64).expect("windowed");
-        assert!(files.is_empty());
+        assert_eq!(files.len(), 0);
         assert!(STDIN_PUSHBACK.with(|slot| slot.borrow().is_none()));
         let mut count = 0;
         while let Some((_, window)) = reader.next_window().expect("reads") {
