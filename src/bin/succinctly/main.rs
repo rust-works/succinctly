@@ -3383,18 +3383,31 @@ mod tests {
                 Some(long) => format!("--{long}"),
                 None => format!("-{}", arg.get_short().expect("a flag has a name")),
             };
-            // A value the argument's own parser accepts, so the only error left is a refused repeat.
-            let value = arg
+            // Two different values the argument's own parser accepts, so the only error left is a
+            // refused repeat and the value kept shows which occurrence won.
+            let possible: Vec<String> = arg
                 .get_possible_values()
-                .first()
-                .map_or_else(|| "1".to_string(), |v| v.get_name().to_string());
-            let argv = ["yq", &flag, &value, &flag, &value];
-            if let Err(e) = cmd.clone().try_get_matches_from(argv) {
-                panic!("repeating {flag} is refused (give it overrides_with): {e}");
-            }
+                .iter()
+                .map(|v| v.get_name().to_string())
+                .collect();
+            let (first, last) = match possible.as_slice() {
+                [a, .., b] => (a.clone(), b.clone()),
+                _ => ("1".to_string(), "2".to_string()),
+            };
+            let argv = ["yq", &flag, &first, &flag, &last];
+            let matches = cmd.clone().try_get_matches_from(argv).unwrap_or_else(|e| {
+                panic!("repeating {flag} is refused (give it overrides_with): {e}")
+            });
+            let kept: Vec<_> = matches
+                .get_raw(arg.get_id().as_str())
+                .expect("the flag was given")
+                .collect();
+            assert_eq!(kept, [last.as_str()], "{flag} keeps its first occurrence");
             checked += 1;
         }
-        // There are nineteen today; an introspection that matched none would pass vacuously.
+        // Only the single-value flags that set their field are matched: a flag declared with
+        // `Append`, a delimiter or a `num_args` range is not covered here. There are nineteen today;
+        // an introspection that matched none would pass vacuously.
         assert!(
             checked >= 15,
             "only {checked} single-value flags were checked"
