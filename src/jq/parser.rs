@@ -540,6 +540,93 @@ fn push_yq_string_escape(out: &mut String, c: char) {
     }
 }
 
+/// How many backslashes yq's lexer keeps for a run of `n` before a character that is not `(`, or
+/// before a `(` it does not read as an interpolation (#7063): `ceil(n / 4)`, as if the run were
+/// collapsed pair by pair twice (`\\` to `\`, once by the lexer and once again when the string is
+/// read), captured against yq v4.53.3 for n = 0..14.
+fn yq_backslashes_kept(n: usize) -> usize {
+    n.div_ceil(4)
+}
+
+/// How many backslashes yq keeps for a run of `n` (at least one) before a `(` in a string with an unclosed
+/// interpolation, which makes it skip them all (#7063): `n / 2 + 1`, a run that would have started an
+/// interpolation and one that would not alike (n = 1..13 keep 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, live against
+/// yq v4.53.3, in a string with another run before it and in one with another after it).
+fn yq_backslashes_kept_in_a_string_that_skips_interpolation(n: usize) -> usize {
+    n / 2 + 1
+}
+
+/// Whether yq's lexer reads a run of `n` (at least one) backslashes before `(` as the start of an
+/// interpolation, `\(`: when `n / 2` is even (#7063). A single backslash does, a pair does not,
+/// three do not, four do, and so on (n = 1, 4, 5, 8, 9 interpolate; 0, 2, 3, 6, 7 do not, live against
+/// yq v4.53.3, with the same answer after a prefix, before a suffix and for a second slot).
+fn yq_backslash_run_starts_interpolation(n: usize) -> bool {
+    n >= 1 && (n / 2) % 2 == 0
+}
+
+/// Whether every interpolation of the yq string literal whose text starts at `rest` (just past its
+/// opening quote) is closed (#7063).
+///
+/// yq reads a string up to the first `"` that is not escaped, then looks in that text for `\(`: if
+/// any one has no matching `)` (counting nested parentheses, up to the end of the text), yq warns
+/// `unclosed interpolation string, skipping interpolation` and uses the string **as written**, so
+/// the closed interpolations before it stay text too (`"\(1)\("` is `\(1)\(`, not `1\(`). A string
+/// that never ends is the parser's own error, not an unclosed interpolation.
+fn yq_string_interpolations_are_closed(rest: &str) -> bool {
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => return true,
+            b'\\' => {
+                let run_start = i;
+                while i < bytes.len() && bytes[i] == b'\\' {
+                    i += 1;
+                }
+                let run = i - run_start;
+                match bytes.get(i) {
+                    Some(b'(') if yq_backslash_run_starts_interpolation(run) => {
+                        let mut depth = 1usize;
+                        let mut j = i + 1;
+                        while j < bytes.len() && bytes[j] != b'"' {
+                            match bytes[j] {
+                                // A backslash takes the character after it with it, so `\"` does not end the slot.
+                                b'\\' => j += 1,
+                                b'(' => depth += 1,
+                                b')' => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            j += 1;
+                        }
+                        if depth != 0 {
+                            // The slot ended at a `"`. When a term follows it directly (`"\("x")"`) that
+                            // is a string literal inside a slot, jq syntax that yq's lexer rejects, so the
+                            // string is not read as text here: the slot is parsed and refused (#5452).
+                            let after = rest.get(j + 1..).unwrap_or("").trim_start();
+                            let juxtaposed = bytes.get(j) == Some(&b'"')
+                                && after.chars().next().is_some_and(|c| {
+                                    c.is_alphanumeric() || matches!(c, '_' | '$' | '"')
+                                });
+                            return juxtaposed || bytes.get(j).is_none();
+                        }
+                        i = j + 1;
+                    }
+                    // An odd run escapes the quote after it.
+                    Some(b'"') if run % 2 == 1 => i += 1,
+                    _ => {}
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    true
+}
+
 /// `text` with the redundant leading zeros of its integer part dropped (`007.50` is `7.50`,
 /// `-00e1` is `-0e1`, `00` is `0`), or `None` when it has none (#5615).
 fn strip_redundant_leading_zeros(text: &str) -> Option<String> {
@@ -3184,6 +3271,11 @@ impl<'a> Parser<'a> {
         self.expect('"')?;
         let mut parts: Vec<StringPart> = Vec::new();
         let mut current_literal = String::new();
+        // #7063: an unclosed `\(` makes yq skip every interpolation of its string. With
+        // `--jq-extensions` a slot may hold a string literal, so the text's end is not known up front.
+        let interpolations_closed = self.mode != ParserMode::Yq
+            || self.jq_extensions
+            || yq_string_interpolations_are_closed(&self.input[self.pos..]);
 
         loop {
             match self.peek() {
@@ -3195,6 +3287,35 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 Some('\\') => {
+                    // #7063: yq reads a run of backslashes before `(` by its own rule, not left to
+                    // right: see `yq_backslash_run_starts_interpolation`.
+                    if self.mode == ParserMode::Yq {
+                        let run = self.input[self.pos..]
+                            .bytes()
+                            .take_while(|&b| b == b'\\')
+                            .count();
+                        if self.input[self.pos + run..].starts_with('(') {
+                            for _ in 0..run {
+                                self.next();
+                            }
+                            self.next();
+                            let starts = yq_backslash_run_starts_interpolation(run);
+                            if interpolations_closed && starts {
+                                current_literal.extend(core::iter::repeat('\\').take(run / 4));
+                                self.parse_interpolation_slot(&mut parts, &mut current_literal)?;
+                            } else {
+                                // Text: the run and the `(` stay, by the count yq keeps (#7063).
+                                let kept = if interpolations_closed {
+                                    yq_backslashes_kept(run)
+                                } else {
+                                    yq_backslashes_kept_in_a_string_that_skips_interpolation(run)
+                                };
+                                current_literal.extend(core::iter::repeat('\\').take(kept));
+                                current_literal.push('(');
+                            }
+                            continue;
+                        }
+                    }
                     self.next();
                     // #4916: yq reads a short list of escapes and keeps any other backslash as text.
                     if self.mode == ParserMode::Yq {
@@ -3225,31 +3346,7 @@ impl<'a> Parser<'a> {
                         // String interpolation: \(expr)
                         Some('(') => {
                             self.next();
-                            // Save current literal if any
-                            if !current_literal.is_empty() {
-                                parts.push(StringPart::Literal(core::mem::take(
-                                    &mut current_literal,
-                                )));
-                            }
-                            // Parse the expression inside \(...)
-                            self.interp_depth += 1;
-                            let expr = self.parse_expr();
-                            self.interp_depth -= 1;
-                            let expr = expr?;
-                            self.skip_ws();
-                            self.expect(')')?;
-                            // #6092: yq writes a mapping or sequence into a string as its YAML text, in
-                            // the style the node was written in, which is what its `to_string` makes
-                            // (`I {an: apple}`), where jq's interpolation is `tostring`'s JSON text. A
-                            // scalar reads the same either way. Spelled as the pipe the format prefix
-                            // makes (`@base64 "\(.)"`), so the slot's cursor reaches `to_string` and
-                            // its flow style is seen; yq has no format-prefixed string to clash with.
-                            let expr = if self.mode == ParserMode::Yq {
-                                Expr::Pipe(vec![expr, Expr::Builtin(Builtin::ToString)].into())
-                            } else {
-                                expr
-                            };
-                            parts.push(StringPart::Expr(Box::new(expr)));
+                            self.parse_interpolation_slot(&mut parts, &mut current_literal)?;
                         }
                         Some('"') => {
                             self.next();
@@ -3317,6 +3414,39 @@ impl<'a> Parser<'a> {
         }
 
         Ok(Expr::StringInterpolation(parts))
+    }
+
+    /// The slot of a string interpolation, `\(expr)`, with the `\(` already read: the literal so far
+    /// becomes a part, then `expr` and its `)` (#7063 shares it between both ways of reaching a slot).
+    fn parse_interpolation_slot(
+        &mut self,
+        parts: &mut Vec<StringPart>,
+        current_literal: &mut String,
+    ) -> Result<(), ParseError> {
+        // Save current literal if any
+        if !current_literal.is_empty() {
+            parts.push(StringPart::Literal(core::mem::take(current_literal)));
+        }
+        // Parse the expression inside \(...)
+        self.interp_depth += 1;
+        let expr = self.parse_expr();
+        self.interp_depth -= 1;
+        let expr = expr?;
+        self.skip_ws();
+        self.expect(')')?;
+        // #6092: yq writes a mapping or sequence into a string as its YAML text, in
+        // the style the node was written in, which is what its `to_string` makes
+        // (`I {an: apple}`), where jq's interpolation is `tostring`'s JSON text. A
+        // scalar reads the same either way. Spelled as the pipe the format prefix
+        // makes (`@base64 "\(.)"`), so the slot's cursor reaches `to_string` and
+        // its flow style is seen; yq has no format-prefixed string to clash with.
+        let expr = if self.mode == ParserMode::Yq {
+            Expr::Pipe(vec![expr, Expr::Builtin(Builtin::ToString)].into())
+        } else {
+            expr
+        };
+        parts.push(StringPart::Expr(Box::new(expr)));
+        Ok(())
     }
 
     /// The quoted step of a dotted path, `."key"`, as jq's grammar reads it: `Term '.' String`, an

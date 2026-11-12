@@ -2379,8 +2379,7 @@ $ succinctly yq -n -o=json '"\u0041"'       # "\\u0041"   (was "A")
 
 The same table applies to object keys, bracket steps (`.x["a\tb"]`) and every other string literal, with one exception: the quoted name of a *dotted* path step (`.x."a\tb"`) is read raw, escapes included, up to the next `"`, so it selects the key `a\tb` (a backslash and a `t`) and `.x."a\"` is the key `a\`. A document's own
 double-quoted scalars are a different lexer (YAML, see above) and are unchanged. Pinned by
-`tests/yq_cli/i4916.rs` (147 rows captured from yq v4.53.3). Still different: a run of backslashes ahead of `\(` (yq alternates between a literal `\(` and an interpolation as the run grows: `"x\\(1)y"` is the text `x\(1)y`, `"x\\\\(1)y"` is `x\1y`; here every pair decodes first), a `\(` that never closes
-(`"a\(b"` is the text `a\(b` in yq, a parse error here), a `\"` inside an interpolation's expression
+`tests/yq_cli/i4916.rs` (147 rows captured from yq v4.53.3). Still different: a `\"` inside an interpolation's expression
 (`"\(\"a\")"`),
 the regex dialect (read as Go's since [#5388](https://github.com/rust-works/succinctly/issues/5388), see "Regex patterns are read as Go's `regexp` reads them" below)
 and a string-literal `@format` (`@base64 "x\q"`, where both refuse with different wording).
@@ -7985,3 +7984,15 @@ These still differ:
 - **A number or a boolean** appended (`.a + 5`, `+= true`) prints bare here and quoted by yq (`['x', '5']`, `['x', 'true']`): yq's copied style turns the scalar into a quoted string.
 - **A right side that is a variable or an assignment's value** (`.a as $x | [$x + "z"]`, `.c = (.a + "z")`) loses the sequence's presentation, as it did before.
 - **`.a + null`** and **`[] + ["z"]`** print a block sequence where yq keeps the left sequence's flow style.
+
+## A run of backslashes before `\(` and an unclosed `\(` are read as yq reads them ([#7063](https://github.com/rust-works/succinctly/issues/7063)), with these differences
+
+`tests/yq_cli/i7063.rs` pins the rows captured from yq v4.53.3; the rule is in its header.
+yq does not pair backslashes left to right: of `n` backslashes before `(`, an interpolation starts when `n / 2` is even, and a string with an unclosed `\(` is read as written, interpolations that did close included.
+
+- **yq's warning for an unclosed `\(` is not printed.**
+  yq writes `level=WARN msg="unclosed interpolation string, skipping interpolation"` to stderr and exits 0; this prints the same text on stdout and nothing on stderr.
+- **A run of three or more backslashes before a character that is not `(` still pairs left to right.**
+  yq keeps `ceil(n / 4)` of them in a string that has no unclosed interpolation (`"a\\\x"` is `a\x` in yq with three backslashes, `a\\x` here), and `ceil(n / 2)` in a string that has one.
+- **An empty slot, `"\()"`, is the empty string in yq and a parse error here.**
+- **With `--jq-extensions` a string with an unclosed `\(` is still a parse error**, because a slot may hold a string literal there and the end of the text is not known up front.
