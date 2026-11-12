@@ -210,6 +210,59 @@ pub fn plan<'a>(
     rows
 }
 
+/// The top tier a run times: `--full --huge` reaches the huge tier, `--full` 100 MB, a quick run 1 MB.
+pub fn top_tier(full: bool, huge: bool) -> &'static str {
+    match (full, huge) {
+        (true, true) => HUGE_TIER,
+        (true, false) => "100mb",
+        _ => "1mb",
+    }
+}
+
+/// One planned row: a query on an input (`None` for a query that reads none).
+pub type PlannedRow<'a> = (&'a PerfQuery, Option<&'a InputSpec>);
+
+/// The planned rows of a run split into those that can run here and those dropped because
+/// their fetched corpus file is not on this machine (`scripts/sync-bench-corpus.sh`).
+/// One definition for the run, which notes what it dropped, and for the `--write-docs` guard.
+pub fn split_available<'a>(
+    root: &Path,
+    queries: &'a [PerfQuery],
+    inputs: &'a [InputSpec],
+    top_tier: &str,
+) -> (Vec<PlannedRow<'a>>, Vec<PlannedRow<'a>>) {
+    plan(queries, inputs, top_tier)
+        .into_iter()
+        // `map_or(true, ..)`: the crate's MSRV predates `Option::is_none_or`.
+        .partition(|(_, i)| i.map_or(true, |i| available(root, i)))
+}
+
+/// Refuse a run whose plan would drop corpus rows. `--write-docs` commits the run as the
+/// platform's report, and a report with fewer rows shifts every geomean and count in it
+/// without a trace in the exit status (#7077, #6872).
+pub fn require_corpus(
+    root: &Path,
+    queries: &[PerfQuery],
+    inputs: &[InputSpec],
+    top_tier: &str,
+) -> Result<()> {
+    let (_, dropped) = split_available(root, queries, inputs, top_tier);
+    let missing: std::collections::BTreeSet<String> = dropped
+        .iter()
+        .filter_map(|(_, i)| *i)
+        .map(|i| format!("{} ({})", i.id, i.corpus.as_deref().unwrap_or_default()))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "--write-docs refused before measuring anything: {} perf row(s) would be dropped because \
+         corpus file(s) are not on this machine: {} (run scripts/sync-bench-corpus.sh to fetch them)",
+        dropped.len(),
+        missing.into_iter().collect::<Vec<_>>().join(", ")
+    )
+}
+
 /// Where a corpus file may be: the vendored seed first, then the copy
 /// `scripts/sync-bench-corpus.sh` fetches (a file too large to commit).
 fn corpus_candidates(root: &Path, file: &str) -> [PathBuf; 2] {
@@ -1620,6 +1673,55 @@ mod tests {
                 && row.speedup_secondary.is_some()
                 && row.secondary_over_primary.is_some()
         );
+    }
+
+    /// `--write-docs` is refused when the plan would drop a fetched-corpus row, naming the file
+    /// and the script that fetches it, while the plan a plain run uses still drops the row and
+    /// keeps going (#7077). A generated input and a `none` row never count as missing.
+    #[test]
+    fn write_docs_refuses_a_plan_that_drops_corpus_rows_and_a_plain_run_keeps_the_note() {
+        let root = scratch("require-corpus");
+        let qs = parse_queries("a\t-\t.\tcorpus-c\t1mb\ns\t-\t.\tnone\t1mb\n").unwrap();
+        let inputs = [corpus_spec("json/x/a.json", b"{}\n")];
+
+        let err = require_corpus(&root, &qs, &inputs, "1mb")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("before measuring anything"), "{err}");
+        assert!(err.contains("json/x/a.json"), "{err}");
+        assert!(err.contains("1 perf row(s)"), "{err}");
+        assert!(err.contains("scripts/sync-bench-corpus.sh"), "{err}");
+
+        // The plan the run itself times: the corpus row is dropped, the `none` row stays.
+        let (planned, dropped) = split_available(&root, &qs, &inputs, "1mb");
+        assert_eq!(
+            (planned.len(), dropped.len()),
+            (1, 1),
+            "a run without --write-docs still drops the row and goes on"
+        );
+        assert_eq!(dropped[0].0.id, "a");
+
+        // A row above the top tier is not planned, so its missing file is not this run's.
+        let big = [InputSpec {
+            tier: "100mb".into(),
+            ..corpus_spec("json/x/a.json", b"{}\n")
+        }];
+        assert!(require_corpus(&root, &qs, &big, "1mb").is_ok());
+
+        // Once the file is on the machine the same plan is accepted and drops nothing.
+        let fetched = root.join("data/bench/corpus/json/x");
+        std::fs::create_dir_all(&fetched).unwrap();
+        std::fs::write(fetched.join("a.json"), b"{}\n").unwrap();
+        assert!(require_corpus(&root, &qs, &inputs, "1mb").is_ok());
+        assert!(split_available(&root, &qs, &inputs, "1mb").1.is_empty());
+    }
+
+    #[test]
+    fn the_top_tier_follows_full_and_huge() {
+        assert_eq!(top_tier(false, false), "1mb");
+        assert_eq!(top_tier(false, true), "1mb");
+        assert_eq!(top_tier(true, false), "100mb");
+        assert_eq!(top_tier(true, true), HUGE_TIER);
     }
 
     /// A reference that prints differently from the other reference gets no

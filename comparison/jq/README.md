@@ -91,6 +91,7 @@ cargo build --release --features cli,simd,regex,serde --target-dir target/subjec
 `--write-docs` writes `docs/compare/jq-<platform>.{md,json}` and the index `docs/compare/jq.md`, and regenerates the `<!-- compare:jq-<platform> -->` block of `docs/benchmarks/jq.md` from that json.
 A platform's first run needs the two markers added at the top of its section there.
 The section's `**CPU**:` line must name the run's CPU (two machines can share a platform), and `--write-docs` checks that before it measures anything.
+`--write-docs` likewise refuses, before measuring anything, a run whose plan would drop the rows of a fetched corpus file (`scripts/sync-bench-corpus.sh` downloads them into `data/bench/corpus/`): the report would have fewer rows and shifted geomeans (#7077). A run without `--write-docs` keeps the `perf_note` and runs on.
 `--render-docs` measures nothing: it re-renders the index and every block from the committed jsons, after a change to how they are rendered.
 Both also regenerate the `<!-- compare:jq-summary -->` block of `CLAUDE.md` (one row per committed run: the geomean speedup of each size tier), from every committed json.
 And the `<!-- compare:jq-identity -->` block of `README.md` (one table per committed run: the `identity` query on each 10 MB input, with peak memory, #6871). A test in `src/bin/succinctly/compare/docs.rs` fails when either of those two, or the `docs/benchmarks/jq.md` blocks, is edited by hand.

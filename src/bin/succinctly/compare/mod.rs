@@ -367,6 +367,25 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
     }
     let (manifest, manifest_sha256) = Manifest::load(&root)?;
     let primary = manifest.primary().clone();
+    // Also before measuring anything (#7077): a complete run that dropped fetched-corpus rows
+    // would be accepted as the platform's report with a different row count. A subset run is
+    // refused by `write_docs` for being a subset, and a run that does not write docs keeps
+    // the note.
+    if args.write_docs
+        && args.dimension.is_empty()
+        && !args.control
+        && args.query.is_none()
+        && args.verify.is_none()
+    {
+        let queries =
+            perf::parse_queries(&std::fs::read_to_string(root.join(&manifest.perf.queries))?)?;
+        perf::require_corpus(
+            &root,
+            &queries,
+            &manifest.inputs,
+            perf::top_tier(args.full, args.huge),
+        )?;
+    }
 
     let mut jq = args
         .jq
@@ -783,11 +802,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
     if want(Dimension::Performance) {
         run_suites.push("perf".into());
         let inputs_dir = root.join("data/compare/inputs");
-        let top = match (args.full, args.huge) {
-            (true, true) => perf::HUGE_TIER,
-            (true, false) => "100mb",
-            _ => "1mb",
-        };
+        let top = perf::top_tier(args.full, args.huge);
         let q = std::fs::read_to_string(root.join(&manifest.perf.queries))?;
         let mut queries = perf::parse_queries(&q)?;
         if let Some(f) = &args.query {
@@ -798,10 +813,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         }
         // A fetched corpus file that is not on this machine drops its rows, and says so (only the
         // rows this run would have timed).
-        let (planned, dropped): (Vec<_>, Vec<_>) = perf::plan(&queries, &manifest.inputs, top)
-            .into_iter()
-            // `map_or(true, ..)`: the crate's MSRV predates `Option::is_none_or`.
-            .partition(|(_, i)| i.map_or(true, |i| perf::available(&root, i)));
+        let (planned, dropped) = perf::split_available(&root, &queries, &manifest.inputs, top);
         let missing: std::collections::BTreeSet<&str> = dropped
             .iter()
             .filter_map(|(_, i)| i.map(|i| i.id.as_str()))
