@@ -108,3 +108,23 @@ fn an_empty_env_argument_is_refused_7070() -> Result<()> {
     }
     Ok(())
 }
+
+/// jq mode keeps the identifier: `env(VAR)` is succinctly's extension there, and a second
+/// argument is jq's `env/2 is not defined` (the checkpoint `env(FOO;BAR)` once pinned for yq).
+#[test]
+fn jq_mode_env_still_takes_an_identifier_7070() -> Result<()> {
+    for filter in ["env(FOO;BAR)", "strenv(FOO;BAR)"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["jq", "-n", filter])
+            .stdin(Stdio::null())
+            .output()?;
+        let stderr = String::from_utf8(output.stderr)?;
+        assert_eq!(output.status.code(), Some(3), "{filter}: {stderr}");
+        let name = filter.split('(').next().unwrap_or(filter);
+        assert!(
+            stderr.contains(&format!("{name}/2 is not defined")),
+            "{filter}: {stderr}"
+        );
+    }
+    Ok(())
+}

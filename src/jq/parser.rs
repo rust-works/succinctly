@@ -2783,7 +2783,6 @@ impl<'a> Parser<'a> {
         self.pos += keyword.len();
     }
 
-    /// Parse an identifier (field name or keyword).
     /// The argument of yq's `env(..)` and `strenv(..)` (#7070): yq's lexer reads the raw text up to
     /// the first `)` as the variable name (`env("NAME")` names a variable with the quotes in it,
     /// `strenv(a;b)` one called `a;b`, `strenv( X )` one with the blanks), and an empty argument is
@@ -2804,6 +2803,7 @@ impl<'a> Parser<'a> {
         Ok(name)
     }
 
+    /// Parse an identifier (field name or keyword).
     fn parse_ident(&mut self) -> Result<String, ParseError> {
         let start = self.pos;
 
