@@ -929,7 +929,7 @@ mod tests {
                     );
                     let mut all = Vec::new();
                     while let Some(window) = windows.next_window(None, |_| panic!("no error")) {
-                        assert!(!window.is_empty());
+                        assert_ne!(window.len(), 0);
                         let ends_at_break = window.last() == Some(&b'\n');
                         all.extend_from_slice(&window);
                         // Every window but the last ends at a line break.
