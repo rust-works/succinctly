@@ -5229,11 +5229,13 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         // where it held the whole file; the loop below then has one buffer, empty, for that file
         // and is handed its windows.
         let mut windowed: Option<window::WindowedFile> = None;
+        let mut reread: Option<std::rc::Rc<window::Reread>> = None;
         let (files, mut raw_inputs, failures) = match seq_plain.take() {
             Some(prepared) => prepared,
             None => match windowed_plain_file(&args) {
-                Some((path, reader)) => {
+                Some((path, reader, again)) => {
                     windowed = Some(reader);
+                    reread = Some(again);
                     (vec![path], vec![Vec::new()], Vec::new())
                 }
                 None => {
@@ -5246,7 +5248,6 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 }
             },
         };
-        let windowed_run = windowed.is_some();
         // A slurp reads every file in the one fetch that meets the first failure, so it
         // reports them all up front and cuts nothing. Otherwise jq reports a file when its
         // reader gets there, which the loop below does too (#5472).
@@ -5377,9 +5378,9 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         });
         sink.set_stream_fault(match slurped {
             // #6920: the text before a window is gone, so the fault is read again from the file.
-            None if windowed_run => {
-                let files = files.clone();
-                StreamFault::new(move || reread_stream_fault(&files))
+            None if reread.is_some() => {
+                let reread = reread.clone().expect("checked");
+                StreamFault::new(move || reread.stream_fault())
             }
             None => {
                 let raw_inputs = std::rc::Rc::clone(&raw_inputs);
@@ -5426,9 +5427,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     ),
                     Ok(None) => break,
                     Err(error) => {
-                        // A file that failed part-way ends there: jq reports it and exits 2 (#5498).
-                        eprintln!("jq: error: {}", strerror_only(&error));
-                        INPUT_READ_FAILED.with(|failed| failed.set(true));
+                        report_input_read_failure(&error);
                         break;
                     }
                 },
@@ -5599,7 +5598,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 };
                 if let Some(message) =
                     jq::jq_input_depth_fault(json_bytes, index.bp(), source, || {
-                        if windowed_run {
+                        if reread.is_some() {
                             // The window starts at a line start, `lines_before` breaks in.
                             let origin = StreamOrigin::ALONE.file;
                             let at = if lines_before > 0 {
@@ -5615,11 +5614,9 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 {
                     // #6465: that position and column are counted over the substituted text; where
                     // the substitution changed the stream, jq's parser read the originals.
-                    let reworded = if windowed_run {
+                    let reworded = if let Some(reread) = &reread {
                         // #6920: the file read again, where a window was substituted.
-                        window_substituted
-                            .then(|| reread_stream_fault(&files))
-                            .flatten()
+                        window_substituted.then(|| reread.stream_fault()).flatten()
                     } else {
                         originals
                             .iter()
@@ -5902,9 +5899,9 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 // #5555: jq's parser names the first fault of its input, whether it is the depth
                 // limit or not, and a value the splitter delimits can hold one ahead of the
                 // splitter's.
-                if let Some(message) = if windowed_run {
+                if let Some(message) = if let Some(reread) = &reread {
                     // #6920: the stream's first fault, from the file read again.
-                    reread_stream_fault(&files)
+                    reread.stream_fault()
                 } else {
                     jq::jq_stream_fault(parser_chunks(&raw_inputs, &originals), 1, 0)
                 } {
@@ -11142,11 +11139,25 @@ fn read_input_files(
     (opened, raws, failures)
 }
 
-/// The lone regular file the plain route reads a window at a time (#6920), opened, or `None` for a
-/// run that is not one: stdin, a pipe or a directory, several files, a file too small to be worth
-/// it, and every flag that has the route read the stream whole (`--slurp`, `--validate`, `--seq`).
-/// A file that does not open here is left to the route that reports it.
-fn windowed_plain_file(args: &JqCommand) -> Option<(PathBuf, window::WindowedFile)> {
+/// A source that failed part-way ends there: jq reports it and exits 2 (#5498).
+fn report_input_read_failure(error: &std::io::Error) {
+    eprintln!("jq: error: {}", strerror_only(error));
+    INPUT_READ_FAILED.with(|failed| failed.set(true));
+}
+
+/// The lone regular file the plain route reads a window at a time (#6920), opened, and the means
+/// to read it again for a fault's wording; or `None` for a run that is not one: stdin, a pipe or a
+/// directory, several files, a file too small to be worth it, and every flag that has the route read
+/// the stream whole (`--slurp`, `--validate`, `--seq`). A file that does not open here is left to the
+/// route that reports it.
+///
+/// The path is judged by `stat`, which opens nothing: opening a named pipe (`<(cmd)`, `mkfifo`)
+/// pairs with its writer, and a handle dropped on the way to another route would take the
+/// writer's bytes with it. A path in `/dev` is left alone too: `/dev/stdin` and `/dev/fd/N` name a
+/// descriptor the run already holds, and opening them again shares its offset on some systems.
+fn windowed_plain_file(
+    args: &JqCommand,
+) -> Option<(PathBuf, window::WindowedFile, std::rc::Rc<window::Reread>)> {
     if args.slurp || args.validate || args.seq || args.null_input {
         return None;
     }
@@ -11154,17 +11165,19 @@ fn windowed_plain_file(args: &JqCommand) -> Option<(PathBuf, window::WindowedFil
     let [path] = files.as_slice() else {
         return None;
     };
-    if is_stdin_dash(path) {
+    if is_stdin_dash(path) || path.starts_with("/dev") {
+        return None;
+    }
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() < window::MIN_WINDOWED_FILE_BYTES {
         return None;
     }
     let file = std::fs::File::open(path).ok()?;
-    let meta = file.metadata().ok()?;
-    if !meta.is_file() || meta.len() < window::min_windowed_file_bytes() {
-        return None;
-    }
+    let reread = window::Reread::new(&file, meta.len(), path.clone()).ok()?;
     Some((
         path.clone(),
-        window::WindowedFile::new(file, window::window_bytes(), split_json_values),
+        window::WindowedFile::new(file, meta.len(), window::WINDOW_BYTES),
+        std::rc::Rc::new(reread),
     ))
 }
 
@@ -12704,8 +12717,7 @@ fn read_lazy_rest(lazy: &mut LazyJsonInputs, more: &mut LazyMore, mut rest: Lazy
     if let Err(error) = rest.reader.read_to_end(&mut bytes) {
         // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
         // A source that failed part-way ends there: jq reports it and exits 2 (#5498).
-        eprintln!("jq: error: {}", strerror_only(&error));
-        INPUT_READ_FAILED.with(|failed| failed.set(true));
+        report_input_read_failure(&error);
         // patchcov: coverage end
     }
     let text = match String::from_utf8(bytes) {
@@ -13700,8 +13712,7 @@ fn stream_reader_producer(lazy: LazyStreamInputs) -> jq::InputProducer {
         None => {
             // A source that failed part-way ended there: jq reports it and exits 2 (#5498).
             if let Some(error) = reader.take_error() {
-                eprintln!("jq: error: {}", strerror_only(&error));
-                INPUT_READ_FAILED.with(|failed| failed.set(true));
+                report_input_read_failure(&error);
             }
             jq::ProducedInput::End(
                 reader
@@ -19657,6 +19668,42 @@ mod tests {
         );
     }
 
+    /// #6920: the gate judges a path by `stat` and opens nothing it declines. A named pipe (what
+    /// `<(cmd)` is on some systems) pairs a reader with its writer when it is opened, and a handle opened
+    /// and dropped on the way to the route that reads it would take the writer's bytes with it.
+    #[cfg(unix)]
+    #[test]
+    fn the_gate_does_not_open_a_named_pipe_6920() {
+        use clap::Parser;
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fifo = dir.path().join("pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success());
+        let writer_path = fifo.clone();
+        let writer = std::thread::spawn(move || std::fs::write(&writer_path, b"{\"a\":1}\n"));
+        // Let the writer reach its open, which blocks until a reader opens the pipe.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let cmd =
+            JqCommand::try_parse_from(["jq", ".", fifo.to_str().expect("utf-8 path")]).unwrap();
+        assert!(windowed_plain_file(&cmd).is_none());
+        // The writer is still waiting for its reader: the first open after the gate gets its bytes.
+        let (sender, receiver) = mpsc::channel();
+        let reader_path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(std::fs::read(&reader_path));
+        });
+        let got = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the writer's bytes were not taken by the gate")
+            .expect("reads");
+        assert_eq!(got, b"{\"a\":1}\n");
+        writer.join().expect("writer").expect("written");
+    }
+
     /// #6920: the plain route reads a window at a time only for one regular file big enough to be
     /// worth it, on a run that reads the stream in order. The file here is sparse, so only its size is
     /// read: every other shape takes the route that reads the file whole.
@@ -19671,9 +19718,9 @@ mod tests {
                 .expect("a sparse file");
             path.to_string_lossy().into_owned()
         };
-        let big = file("big.json", window::min_windowed_file_bytes());
-        let also_big = file("also-big.json", window::min_windowed_file_bytes() * 2);
-        let small = file("small.json", window::min_windowed_file_bytes() - 1);
+        let big = file("big.json", window::MIN_WINDOWED_FILE_BYTES);
+        let also_big = file("also-big.json", window::MIN_WINDOWED_FILE_BYTES * 2);
+        let small = file("small.json", window::MIN_WINDOWED_FILE_BYTES - 1);
         let directory = dir.path().to_string_lossy().into_owned();
         let missing = dir
             .path()
@@ -19694,6 +19741,10 @@ mod tests {
         assert!(!takes(&["jq", "."]));
         assert!(!takes(&["jq", ".", "-"]));
         assert!(!takes(&["jq", ".", &big, &also_big]));
+        // A descriptor the run already holds, named by path: opening it again shares its offset on
+        // some systems, and the fault's second read would find the end of the file.
+        assert!(!takes(&["jq", ".", "/dev/stdin"]));
+        assert!(!takes(&["jq", ".", "/dev/fd/0"]));
         // A run that reads the stream whole or otherwise.
         for flags in [&["-s"][..], &["--validate"], &["--seq"], &["-n"]] {
             let mut argv = vec!["jq"];
