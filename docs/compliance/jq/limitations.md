@@ -7276,15 +7276,15 @@ The endless-stream rows were measured on `main` @ 89a900ccc against `/usr/bin/jq
 ## Peak memory on a stream of many values grows with the input (#6913)
 
 On a file of many top-level values (NDJSON), `succinctly jq`'s peak memory grew linearly with the file, where jq 1.7.1's stays at a few MB whatever the size.
-Since [#6920](https://github.com/rust-works/succinctly/issues/6920) it no longer does for a plain filter (`-c .`, `-r .name`, `select(...)`: no `-n`, no `input`) over regular files of 4 MiB or more between them (one, or up to 32 named on the command line, which are read as the one stream jq reads, or one redirected onto standard input, `jq … < file`, [#7024](https://github.com/rust-works/succinctly/issues/7024)), which are read a window at a time (below).
+Since [#6920](https://github.com/rust-works/succinctly/issues/6920) it no longer does for a plain filter (`-c .`, `-r .name`, `select(...)`: no `-n`, no `input`) over regular files of 4 MiB or more between them (one, or up to 32 named on the command line, which are read as the one stream jq reads, or one redirected onto standard input, `jq … < file`, [#7024](https://github.com/rust-works/succinctly/issues/7024)), and for one over a pipe on standard input that holds 4 MiB or more (`cat log | jq -c .`, #7024), which are read a window at a time (below).
 Since [#7023](https://github.com/rust-works/succinctly/issues/7023) it no longer does for a program that calls `input`/`inputs` over one regular file or standard input (the lazy route), nor for `-R` over one regular file of 4 MiB or more.
 Since [#7082](https://github.com/rust-works/succinctly/issues/7082) it no longer does for `--seq` over one regular file (or a redirected one) of 4 MiB or more whose stream is RFC 7464's own framing, every record `RS value LF` (below).
-Every other route that reads the input still holds all of it: `--seq` over a pipe, several files or a stream that is not that framing, `--input-dsv`, `--stream-errors`, standard input that is a pipe or a terminal (for the plain filter) or any standard input (for `-R`), and `-R` and the programs that call `input`/`inputs` over several files (`-R length a b` peaks at 30.7 MiB against 12.7 for one file, `reduce inputs` at 32.8 against 14.6, on two 11 MB files).
+Every other route that reads the input still holds all of it: `--seq` over a pipe, several files or a stream that is not that framing, `--input-dsv`, `--stream-errors`, standard input that is a terminal or a pipe under 4 MiB (for the plain filter) or any standard input (for `-R`), and `-R` and the programs that call `input`/`inputs` over several files (`-R length a b` peaks at 30.7 MiB against 12.7 for one file, `reduce inputs` at 32.8 against 14.6, on two 11 MB files).
 That is a known limitation, not supported at this stage: it is outside the three reasons ADR-0018 permits a divergence for, so it is a deferred gap and not a deliberate behaviour.
-It is tracked in [#7024](https://github.com/rust-works/succinctly/issues/7024) (the plain filter over a pipe on standard input, and over more than 32 files or a list with a path that is not a regular file; `-R` and `input`/`inputs` over several files; `-R` over standard input).
+It is tracked in [#7024](https://github.com/rust-works/succinctly/issues/7024) (the plain filter over more than 32 files or a list with a path that is not a regular file; `-R` and `input`/`inputs` over several files; `-R` over standard input).
 The tables below were measured before #6920 and #7023 and show every row as it was; the rows they fixed are the first five of each (`first(inputs)` was flat already).
 The slurp shapes (`-s`, `-R -s`) are not a gap: jq holds the input too, and succinctly's peak is 223 MiB for `-s length` at 100 MiB on x86_64 where jq's is 850 (and 208 for `-R -s length` against jq's 183).
-Standard input under a pipe-fed plain filter or `-R` (a redirected regular file under a plain filter has been windowed since #7024), and `--seq` over anything but a regular file of RFC 7464 records (#7082), grow as the file route did (124 and 108 MiB at 100 MiB on x86_64), two files held both (224 MiB) until #7024, and `--stream` is flat (8.5 MiB).
+Standard input under `-R` (a redirected regular file and a pipe of 4 MiB or more under a plain filter have been windowed since #7024), and `--seq` over anything but a regular file of RFC 7464 records (#7082), grow as the file route did (124 and 108 MiB at 100 MiB on x86_64), two files held both (224 MiB) until #7024, and `--stream` is flat (8.5 MiB).
 At 100 MB succinctly is still faster than jq on every row below except `first(inputs)`, on both machines ([docs/compare/jq.md](../../compare/jq.md)): this is a memory trade, not a speed one.
 For a log too large to hold in memory that a fixed route does not cover, use jq, or split the file and run each part (`split -l`).
 
@@ -7349,7 +7349,7 @@ What holds the memory, from the slope between 10 and 100 MiB (MiB of peak per Mi
   `-c .`, `.name` and `select` sloped at 1.15 to 1.17.
   That route called `split_json_values` over the whole file before its loop, which returns a `Vec<(usize, usize)>` of every document's byte range: 16 bytes for each of the 993,416 records, 15.2 MiB.
   The same 100 MiB cut into 9,935 documents (100 records to an array) peaked at 108.7 MiB (x86_64) and 105.3 MiB (aarch64) for `-c .`, against 123.4 and 122.2 for the one-record-per-line file: the 14.7 and 16.9 MiB between them is the span vector, and what is left is the text.
-  A pipe on standard input still reads the text whole and splits it whole.
+  A pipe on standard input of 4 MiB or more no longer does since #7024 (below); a shorter one reads the text whole and splits it whole.
 - **A constant part of 6 to 12 MiB**, which `first(inputs)` shows at every size: it reads only the front of the file.
 
 What keeps it from being constant is not the read itself.
@@ -7362,6 +7362,7 @@ Each of these needs the text before the point being read, or a count over all of
 
 A windowed route has to carry each of those as a running summary of the dropped prefix (newlines so far, the position, the last bytes), and has to re-read a regular file from disk for a fault, as the slurp route already does (`reread_stream_fault`).
 Stdin cannot be re-read, so its fault wording needs the bytes kept or a worded-as-it-goes parser.
+Since #7024 a pipe's windows are certified as they are read, which is the second of those, cheapened (below).
 Dropping the span vector alone would take about 0.15 per MiB off the plain route and would not make it constant.
 
 ### The plain route over a regular file is windowed (#6920, #7024)
@@ -7381,7 +7382,17 @@ The stream's first fault is worded by reading the file again (`Reread`): a chunk
 A file renamed, replaced or appended to meanwhile is worded from the bytes the run read, and the wording's memory is a chunk, not the file.
 A depth refusal names the position from the window's line count; where a window was substituted it is worded from the file read again, as the whole-file route words it from the originals.
 Standard input that is a regular file (`jq … < file`, a here-file, a descriptor a parent opened) takes the same route from its current offset: what a shell or parent has read already is not part of the stream, as on a pipe, and a fault is worded from a duplicate of descriptor 0 read by position.
-A pipe, a terminal, a standard input under 4 MiB and one the run also writes to (`jq . <> f >&0`: its output would land where the next window is read from) read whole as before, and so does a path that names the stdin descriptor a second time.
+A terminal, a standard input under 4 MiB and one the run also writes to (`jq . <> f >&0`: its output would land where the next window is read from) read whole as before, and so does a path that names the stdin descriptor a second time.
+A pipe (or a socket) on standard input that holds 4 MiB or more is read a window at a time too (#7024).
+Its length is not known, so the first 4 MiB are read to learn it: a pipe that ends sooner hands what it held to the route that reads it whole, as if that route had read it.
+It cannot be read again for the fault's wording, so its windows are certified before they are handed out, and the first fault is kept (`Certifier`, `src/bin/succinctly/jq_runner/window.rs`).
+A document the strict validator accepts, with its nesting capped at 127 (an object costs jq's parser two places, and it refuses at 256), is one jq's parser reads without a fault, which a test pins over 60,000 mutated documents; after it the parser holds nothing but its position, or a number's or literal's own bytes.
+A document the validator turns down (`nan`, `01`, a deep one, a malformed one, bytes that are not UTF-8 outside a string) is read by jq's parser itself, from the last boundary and over the bytes as read, which a window keeps for its substituted regions while it holds them.
+The fault that read meets is the stream's first, since everything before it is certified, and so is a fault after the last document at the end of the stream.
+So a fault is worded as the whole stream words it even where it is in a document a filter never read and the window that held it is gone (`.name` over `{"name":1,"b":[1 2]}`, and a document cut off at the end, names line 1 as jq does).
+The rejected designs were wording the fault from the text still held (it names a later fault than jq where an earlier, dropped document held one, which ADR-0018's order does not permit for memory), writing the dropped text to a temporary file to read again (standard input, which can hold secrets, would land on disk), and jq's parser over every byte (it runs at about a quarter of the validator's speed).
+A run that stops early (a `halt`, a fault in the middle of the stream) leaves the rest of the pipe unread, as jq does, where the whole-file route had drained it first.
+Its time against the whole-file route has not been measured on terminus or johns-mac-mini yet.
 The windows are read from descriptor 0's own offset, so a run that stops early (`first(...)`, `-e`) leaves it where its last window ended, as jq does, where the whole-file route always left it at the end of the file.
 Several regular files (up to 32 of them, 4 MiB or more between them) are read the same way, as the one stream jq reads them as, each a window at a time and in turn (`WindowedFiles`, #7024).
 A token still open where a file ends continues at the front of the next, as jq's stream has it (#4305).
@@ -7454,7 +7465,7 @@ Time, from an interleaved driver (the two binaries alternate within each repetit
 
 What the windowed route does not cover, and which still hold the input:
 
-- a pipe or a terminal on standard input (a fault cannot be worded by reading them again), more than 32 files, and a list of files with a path that is not a regular file, that does not open, or that is the run's own standard output or error: #7024;
+- a terminal on standard input, a pipe under 4 MiB, more than 32 files, and a list of files with a path that is not a regular file, that does not open, or that is the run's own standard output or error: #7024;
 - programs that call `input`/`inputs` (with or without `-n`), `-R`, `--input-dsv` and `--stream-errors`, which have their own readers: #7023; and `--seq` over a pipe, several files or a stream that is not RFC 7464's own framing, and `--seq -s` (the whole-file route's by design; a `--seq` pipe is #7024's stdin question);
 - `-s` and `--validate`, which read the stream whole by design.
 
