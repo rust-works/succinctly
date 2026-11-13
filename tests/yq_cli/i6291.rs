@@ -8,7 +8,7 @@
 
 use anyhow::Result;
 
-use crate::run_yq_stdin;
+use crate::{run_yq_stdin, run_yq_stdin_with_stderr};
 
 /// (document, filter, expected stdout).
 const ROWS: &[(&str, &str, &str)] = &[
@@ -122,15 +122,20 @@ fn a_tag_with_no_value_is_the_empty_string_whatever_the_tag_6291() -> Result<()>
     Ok(())
 }
 
-/// `!!int` and `!!float` with no value: yq's JSON encoder fails (`strconv.ParseInt: parsing ""`), and this
-/// reads the empty string, as it does `!!int abc` (the loader absorbs what it cannot read).
+/// `!!int` with no value: yq's JSON encoder fails (`strconv.ParseInt: parsing ""`), and this reads
+/// the empty string, as it does `!!int abc` (the loader absorbs what it cannot read). `!!float` with
+/// no value fails here as it does in yq (`strconv.ParseFloat: parsing ""`, #7115).
 #[test]
-fn a_valueless_int_or_float_tag_reads_the_empty_string_6291() -> Result<()> {
-    for tag in ["!!int", "!!float"] {
-        let document = format!("k: {tag}\nj: 1\n");
-        let (stdout, code) = run_yq_stdin(".", &document, &["-o", "json", "-I0"])?;
-        assert_eq!(stdout, "{\"k\":\"\",\"j\":1}\n", "{tag}");
-        assert_eq!(code, 0, "{tag}");
-    }
+fn a_valueless_int_tag_reads_the_empty_string_6291() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(".", "k: !!int\nj: 1\n", &["-o", "json", "-I0"])?;
+    assert_eq!(stdout, "{\"k\":\"\",\"j\":1}\n");
+    assert_eq!(code, 0);
+    let (_, stderr, code) =
+        run_yq_stdin_with_stderr(".", "k: !!float\nj: 1\n", &["-o", "json", "-I0"])?;
+    assert_eq!(
+        stderr.lines().next().unwrap_or(""),
+        "Error: json: error calling MarshalJSON for type *yqlib.CandidateNode: json: error calling MarshalJSON for type *yqlib.CandidateNode: strconv.ParseFloat: parsing \"\": invalid syntax"
+    );
+    assert_eq!(code, 1);
     Ok(())
 }

@@ -710,7 +710,8 @@ $ printf 'k: !!seq\nj: 1\n' | succinctly yq -o json -I0 .        # {"k":"","j":1
 ```
 
 `!!int` and `!!float` with no value are a yq encoder failure in JSON output (`json: error calling MarshalJSON ...: strconv.ParseInt: parsing "": invalid syntax`, and `strconv.ParseFloat` for `!!float`), and `yq '.k + 1'` fails the same way.
-This answers the empty string for both, as it does for `!!int abc`: the loader absorbs what it cannot read instead of reproducing a Go crash.
+This answers the empty string for `!!int`, as it does for `!!int abc`: the loader absorbs what it cannot read instead of reproducing a Go crash.
+The streamed `-o=json` writer fails for `!!float` with no value as yq does (#7115).
 
 Not covered here:
 - An operator that reads the node's tag on one of these.
