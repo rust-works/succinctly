@@ -7288,7 +7288,11 @@ fn read_inputs(
         // #6663: a JSON text that faults counts as ending cleanly too. Where its last token
         // completes is then the fault's to place along with the failures around it: the reads that
         // meet each fault go on past it, and the up-front route would stop at the first.
-        let ends_cleanly = raw_lines_read_whole
+        // #7176: with no file that failed to open there is nothing to place (`all` over no failure is
+        // true below), and `json_text_faults` is a walk of jq's parser model over every byte of
+        // every file, so it is not asked.
+        let ends_cleanly = failures.is_empty()
+            || raw_lines_read_whole
             || !seq_fault_ends_of_stream.is_empty()
             || seq_readers_place_reads
             || json_text_faults(&raws, args)
@@ -7352,7 +7356,10 @@ fn read_inputs(
         {
             // The `--seq` readers place their own faults: the JSON text's fault is not theirs.
             // A JSON text's fault; DSV reads no JSON, so none ends its text (#6585).
-            let fault_ends_text = args.input_dsv.is_none()
+            // #7176: where the text's fault is only matters to a failure it places, so a run with no
+            // failure does not walk the files for it.
+            let fault_ends_text = !failures.is_empty()
+                && args.input_dsv.is_none()
                 && !seq_readers_place_reads
                 && matches!(first_stream_fault(&raws), Some((_, true)));
             defer_open_failures(failures, fault_ends_text);
