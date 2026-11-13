@@ -16190,6 +16190,12 @@ fn owned_assign_new_value<S: EvalSemantics>(
             && yq_fold_step_active()
             && matches!(expr, Expr::Assign { .. })
             && matches!(&rhs, OwnedAssignRhs::Value(value) if !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_))))
+        // #7108: `|= . + N` (or another operator) of a number by a number, the arithmetic `+=` makes.
+        && !(matches!(yq_shape, YqWrite::PlainField)
+            && yq_fold_step_active()
+            && matches!(expr, Expr::Update { .. })
+            && old.is_number()
+            && matches!(&rhs, OwnedAssignRhs::Combine(_, right) if right.is_number()))
     {
         return None;
     }
