@@ -3236,6 +3236,34 @@ mod stream_tests {
         }
     }
 
+    /// A file of a long list that `-R` reads is opened when it is first read (#7024): one that will not
+    /// open reads as no bytes, however often it is read, and its failure is noted once.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_read_when_reached_that_will_not_open_reads_as_none_and_is_noted_once_7024() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let present = dir.path().join("present.txt");
+        std::fs::write(&present, b"one\ntwo\n").expect("written");
+        let mut seen = String::new();
+        let mut reader = OpenWhenRead::new(present, 3, false);
+        reader.read_to_string(&mut seen).expect("reads");
+        assert_eq!(seen, "one\ntwo\n");
+        let missing = dir.path().join("missing.txt");
+        super::super::PENDING_OPEN_FAILURES.with(|pending| pending.borrow_mut().clear());
+        let mut reader = OpenWhenRead::new(missing, 7, true);
+        let mut buf = [0u8; 16];
+        assert_eq!(reader.read(&mut buf).expect("reads as empty"), 0);
+        assert_eq!(reader.read(&mut buf).expect("still empty"), 0);
+        let noted = super::super::PENDING_OPEN_FAILURES.with(|pending| pending.borrow().len());
+        assert_eq!(noted, 1, "the failure is noted once");
+        // A directory opens on Unix and fails at its first read: it is noted too.
+        let mut reader = OpenWhenRead::new(dir.path().to_path_buf(), 8, true);
+        assert_eq!(reader.read(&mut buf).expect("reads as empty"), 0);
+        let noted = super::super::PENDING_OPEN_FAILURES.with(|pending| pending.borrow().len());
+        assert_eq!(noted, 2);
+        super::super::PENDING_OPEN_FAILURES.with(|pending| pending.borrow_mut().clear());
+    }
+
     /// The second read of files opened by path words the stream's first fault as jq's parser does over
     /// the files joined, opening each in turn, and names the file the fault lies in, which is as far as
     /// jq's reader goes; it reads each file as the run read it, so a file the run read as no bytes is

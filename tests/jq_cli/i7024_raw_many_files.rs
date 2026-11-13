@@ -363,3 +363,37 @@ fn a_path_that_changes_before_the_run_reaches_it_is_read_as_jq_reads_it_7024() -
     );
     Ok(())
 }
+
+/// A file of the list that is also the run's output is read whole, as before: output landing in a file
+/// the run opens later would be read as its input.
+#[test]
+fn a_file_of_a_long_list_that_is_also_the_output_is_read_whole_7024() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let paths: Vec<std::path::PathBuf> = (0..FILES)
+        .map(|n| dir.path().join(format!("f{n:02}.txt")))
+        .collect();
+    for (n, path) in paths.iter().enumerate() {
+        let bytes = match n {
+            0 => text(60_000),
+            n => format!("line {n}\n").into_bytes(),
+        };
+        std::fs::write(path, bytes)?;
+    }
+    // `1<>$OUT` opens file 20 read-write as standard output.
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg("exec \"$0\" jq -R length \"$@\" 1<>\"$OUT\"")
+        .arg(env!("CARGO_BIN_EXE_succinctly"))
+        .args(&paths)
+        .env("OUT", &paths[20])
+        .output()?;
+    assert!(output.status.success(), "{:?}", output.status);
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    // What the whole-file route writes into file 20: the length of every line of every file.
+    let written = std::fs::read(&paths[20])?;
+    assert_eq!(
+        written.iter().filter(|&&c| c == b'\n').count(),
+        60_000 + FILES - 1
+    );
+    Ok(())
+}
