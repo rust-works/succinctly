@@ -1236,14 +1236,27 @@ impl NamedFile {
         }
     }
 
-    /// The file opened again, if it is still the file judged.
+    /// The file opened again, if it is still the file judged. The error names the path as jq's
+    /// `Could not open` does, since the run reports it with no file of its own.
     fn reopen(&self) -> io::Result<File> {
-        let file = File::open(&self.path)?;
+        let named = |kind: io::ErrorKind, why: String| {
+            io::Error::new(
+                kind,
+                format!("Could not open {}: {why}", self.path.display()),
+            )
+        };
+        let file = File::open(&self.path).map_err(|error| {
+            let why = error.to_string();
+            let why = why
+                .rsplit_once(" (os error ")
+                .map_or(why.as_str(), |(why, _)| why);
+            named(error.kind(), why.to_string())
+        })?;
         if FileIdentity::of(&file.metadata()?) != self.identity {
-            return Err(io::Error::other(format!(
-                "{}: replaced while the run was reading the files before it",
-                self.path.display()
-            )));
+            return Err(named(
+                io::ErrorKind::Other,
+                "replaced since the run began".to_string(),
+            ));
         }
         Ok(file)
     }
@@ -3092,9 +3105,15 @@ mod stream_tests {
             let Err(error) = reader.next_window() else {
                 panic!("the second file fails");
             };
-            if replace {
-                assert!(error.to_string().contains("replaced"), "{error}");
-            }
+            let why = if replace {
+                "replaced since the run began"
+            } else {
+                "No such file or directory"
+            };
+            assert_eq!(
+                error.to_string(),
+                format!("Could not open {}: {why}", path.display())
+            );
         }
     }
 }
