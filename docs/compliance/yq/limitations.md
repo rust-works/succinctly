@@ -7454,6 +7454,21 @@ assignment's right-hand side (`.z = (.b | kind)`, `.[] |= kind`), a value built 
 (`{"k": .b} | .k | kind`), and `--eval-all`/`-s`/`-i`. Separately, `..` still descends
 into a `!!null`-tagged collection, where yq stops at the `scalar` (`[.. | kind]` has one more element).
 
+## `length`, a slice and `keys` of an alias ([#7111](https://github.com/rust-works/succinctly/issues/7111)); the rest of an alias node's own content is a residual
+
+An unexploded alias is a node of its own kind in yq, with no content.
+Indexing, iteration and a field read through it to the anchored value, but `length` answers `0`, a slice answers `[]` and `keys` is refused (`cannot get keys of , keys only works for maps and arrays`), whether the anchor holds a sequence, a mapping or a scalar.
+`succinctly yq` follows that where the value is still read from the document: `.c | length`, `.c[0:1]`, `.c | .[1:]`, `.n | keys`, `[.c] | .[0] | length`, `.c as $v | $v | length`, `.c | select(length == 0)`, `[.[] | length]`, `map(length)` and `.. | length` over the root.
+`explode(.)` leaves no alias and the anchor's own position is not one, so both keep answering from the value, as in yq.
+`tests/yq_cli/i7111.rs` pins 62 rows captured from yq v4.53.3 and 7 refusals, on a sequence, a mapping, a scalar, an empty sequence and an alias inside a sequence.
+These still read the anchored value here, where yq reads the alias node:
+- a copy of the alias that the filter makes: the right side of an assignment (`.d = (.c | length)` is `2` here and `0` in yq, `.d = .c[0:1]` is `[5]` and `[]`), `.c |= length`, `to_entries | map(.value | length)`, `map_values(length)`, `[.c, .n] | map(length)` and `{"k": .c} | .k | length`;
+- a paren-grouped pipe on the alias, `.c | (.[0:1] | length)` (`1` here, `0` in yq);
+- `--eval-all` / `ea` (and `--slurp`), which evaluate on owned values: `.c | length` is `2` here and `0` in yq, while the slice (`[]`) agrees;
+- the wording of the `keys` refusal: `null (null) has no keys` here, `cannot get keys of , keys only works for maps and arrays` in yq (both exit 1);
+- `del(.c[0:1])`, where yq removes the alias position and this removes from the shared sequence;
+- every other operator that reads the alias node's own content, which yq refuses or answers from the anchor's name: `first`, `sort`, `reverse`, `unique`, `flatten`, `to_entries`, `with_entries`, `any`, `all`, `join`, `contains`, `pick` and `has` on an alias to a collection, and on an alias to a scalar `upcase`, `downcase`, `trim`, `test`, `split` and `sub` (`.t | upcase` is `"Z"` in yq when `t: *z` and `z: &z hello`: the anchor's name, not its value).
+
 ## `@yaml` of a container the filter builds, a multi-line string, or a root computed float ([#1183](https://github.com/rust-works/succinctly/issues/1183))
 
 `@yaml` of a value runs the same owned-value YAML streamer as the CLI's own output, so it inherits that

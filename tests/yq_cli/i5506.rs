@@ -109,7 +109,8 @@ fn test_recurse_cond_of_the_gained_builtins_over_an_alias_ladder_completes_5506(
                 &format!(".root | first(recurse(.[]?; {cond})) | length"),
                 &doc
             )?,
-            "2",
+            // `.root` is an alias, whose `length` is 0 in yq (#7111).
+            "0",
             "`{cond}`"
         );
     }

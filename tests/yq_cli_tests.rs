@@ -57885,9 +57885,10 @@ fn test_recurse_structural_descent_over_alias_fanout_completes_3719() -> Result<
     doc.push_str("root: *a26\n");
 
     for (filter, want) in [
-        (".root | first(recurse(.[]?)) | length", "2"),
-        (".root | first(recurse) | length", "2"),
-        (".root | first(..) | length", "2"),
+        // `.root` is an alias, and yq answers `length` of an alias node with 0 (#7111).
+        (".root | first(recurse(.[]?)) | length", "0"),
+        (".root | first(recurse) | length", "0"),
+        (".root | first(..) | length", "0"),
         // `.root` is itself an alias, and yq's `..` yields an alias node and stops there
         // (#4214): one node, where the target's children used to be walked as well. The
         // anchor holding two aliases is three nodes, the same stop one level down.
@@ -58623,9 +58624,10 @@ fn test_alternative_no_longer_raises_through_a_container_alias_2476() -> Result<
     // The alias position: the walk stops at the alias, so the array is
     // truthy and answers for itself. This is the row that changed (exit 1
     // before, exit 0 now).
+    // `length` of the alias node itself is 0 in yq (#7111).
     let (stdout, stderr, code) = run_yq_stdin_with_stderr(".b | (. // 1) | length", doc, &[])?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
-    assert_eq!(stdout.trim(), "1", "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), "0", "stderr: {stderr:?}");
 
     // Visiting the anchor itself still raises.
     let (_, stderr, code) = run_yq_stdin_with_stderr(".a | (. // 1)", doc, &[])?;
@@ -63924,15 +63926,20 @@ fn test_any_all_cond_isvalid_loops_over_alias_fanout_complete_2658() -> Result<(
     }
 
     for (filter, want) in [
-        (".a24 | any(length == 2)", "true"),
-        (".a24 | all(length == 2)", "true"),
+        // The elements are aliases, and yq answers `length` of an alias node with 0 (#7111), so
+        // `length == 0` holds for every element and `length == 2` for none.
+        (".a24 | any(length == 0)", "true"),
+        (".a24 | all(length == 0)", "true"),
+        (".a24 | any(length == 2)", "false"),
+        (".a24 | all(length == 2)", "false"),
         (".a24 | any(length == 3)", "false"),
         (".a24 | isvalid(.[0])", "true"),
         (".a24 | isvalid(.x)", "false"),
         (".a24 | until(true; .) | length", "2"),
         (".a24 | [while(false; .)] | length", "0"),
-        (".a24 | until(length == 1; .[0]) | .[0]", "1"),
-        (".a24 | [while(length == 2; .[0])] | length", "24"),
+        // The loops that navigate stop on the leaf's tag: an alias node has no `!!int` tag.
+        (".a24 | until(type == \"!!int\"; .[0])", "1"),
+        (".a24 | [while(type != \"!!int\"; .[0])] | length", "25"),
         (".a24 | [limit(3; while(true; .[0]))] | length", "3"),
     ] {
         let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, &doc, &["--jq-extensions"])?;
@@ -63998,7 +64005,9 @@ fn test_yq_any_all_cond_isvalid_loops_keep_eager_answers_2658() -> Result<()> {
         ("a: &x [1, 2]\nb: *x\n", ".b | any(. == 2)", "true"),
         (
             "a: &x [1, 2]\nb: *x\n",
-            ".b | until(length == 1; .[1:])",
+            // The anchor: an alias answers `length` 0 and slices to `[]` (#7111), so a loop
+            // that ends on its length would never end there.
+            ".a | until(length == 1; .[1:])",
             "- 2",
         ),
         (
@@ -64123,7 +64132,8 @@ fn test_getpath_navigated_index_flat_over_alias_fanout_2641() -> Result<()> {
     )?;
     let elapsed = start.elapsed();
     assert_eq!(code, 0, "stderr: {stderr:?}");
-    assert_eq!(stdout.trim(), "2");
+    // `items[0]` is an alias, whose `length` is 0 in yq (#7111).
+    assert_eq!(stdout.trim(), "0");
     assert!(
         elapsed < std::time::Duration::from_secs(15),
         "a navigated getpath index over a 30-level alias fan-out took {elapsed:?} \

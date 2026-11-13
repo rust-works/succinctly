@@ -15959,6 +15959,25 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // a real position instead of falling to the `One`->`None` default.
         Expr::Identity => cursor.map_or(GenericResult::One(value), GenericResult::OneCursor),
 
+        // #7111 (yq mode): `length`, a slice and `keys` read an unexploded alias node's own kind and
+        // content, which is empty, where indexing, iteration and a field read through it to the
+        // anchored value. So `c: *x` over `x: &x [5, 6]` has `.c | length` 0, `.c[0:1]` an empty
+        // sequence, and `.c | keys` an error, while `.c[0]` is 5 and `.c | .[]` yields 5 and 6.
+        // `explode(.)` has no alias left to read, and the anchor's own position is not an alias.
+        Expr::Slice { .. }
+        | Expr::Builtin(Builtin::Length | Builtin::Keys | Builtin::KeysUnsorted)
+            if S::TAG == EvalTag::Yq
+                && cursor
+                    .as_ref()
+                    .is_some_and(|c| c.document_has_aliases() && c.is_alias()) =>
+        {
+            match expr {
+                Expr::Builtin(Builtin::Length) => GenericResult::Owned(OwnedValue::Int(0)),
+                Expr::Slice { .. } => GenericResult::Owned(OwnedValue::array()),
+                _ => GenericResult::Error(EvalError::has_no_keys(&OwnedValue::Null)),
+            }
+        }
+
         // #3306 (jq mode only): a slice naming every element of a non-empty
         // array is jq's own `jv_identical` to that array, so it is handled
         // exactly like `Expr::Identity` just above -- most importantly,

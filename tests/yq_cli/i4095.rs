@@ -418,9 +418,10 @@ fn test_recurse_cond_over_alias_fanout_completes_4095() -> Result<()> {
     }
     doc.push_str("root: *a26\n");
 
+    // `.root` is an alias, and yq answers `length` of an alias node with 0 (#7111).
     for (filter, want) in [
-        (".root | first(recurse(.[]?; true)) | length", "2"),
-        (".root | first(..) | length", "2"),
+        (".root | first(recurse(.[]?; true)) | length", "0"),
+        (".root | first(..) | length", "0"),
         (".a26 | [recurse(.[]?; true)] | length", "3"),
         (".a26 | [..] | length", "3"),
         (
