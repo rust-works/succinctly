@@ -216,9 +216,10 @@ impl Encoder<'_> {
             && !name.starts_with(&options.proc_inst_prefix)
     }
 
-    fn scalar_text(value: &OwnedValue) -> String {
+    fn scalar_text(&self, value: &OwnedValue) -> String {
         match value {
             OwnedValue::Array(_) | OwnedValue::Object(_) => String::new(),
+            OwnedValue::Null if self.options.empty_null => String::new(),
             other => super::eval::props_value_to_string(other, false),
         }
     }
@@ -235,7 +236,7 @@ impl Encoder<'_> {
             }
             scalar => {
                 self.printer.start(name, &[])?;
-                self.printer.text(&Self::scalar_text(scalar));
+                self.printer.text(&self.scalar_text(scalar));
                 self.printer.end(name);
                 Ok(())
             }
@@ -259,7 +260,7 @@ impl Encoder<'_> {
                     }
                     scalar => attributes.push((
                         key.replacen(&self.options.attribute_prefix, "", 1),
-                        Self::scalar_text(scalar),
+                        self.scalar_text(scalar),
                     )),
                 }
             }
@@ -269,11 +270,11 @@ impl Encoder<'_> {
             if key.starts_with(&self.options.proc_inst_prefix) {
                 let target = key.replacen(&self.options.proc_inst_prefix, "", 1);
                 self.printer
-                    .proc_inst(&target, &Self::scalar_text(value), false)?;
+                    .proc_inst(&target, &self.scalar_text(value), false)?;
             } else if *key == self.options.directive_name {
-                self.printer.directive(&Self::scalar_text(value))?;
+                self.printer.directive(&self.scalar_text(value))?;
             } else if *key == self.options.content_name {
-                self.printer.text(&Self::scalar_text(value));
+                self.printer.text(&self.scalar_text(value));
             } else if !self.is_attribute(key) {
                 self.element(key, value, depth + 1)?;
             }
@@ -305,7 +306,7 @@ pub(crate) fn format_xml(value: &OwnedValue, options: &XmlOptions) -> Result<Str
         }
         scalar => {
             let mut out = String::new();
-            escape(&mut out, &Encoder::scalar_text(scalar), false);
+            escape(&mut out, &encoder.scalar_text(scalar), false);
             return Ok(out);
         }
     };
@@ -314,9 +315,8 @@ pub(crate) fn format_xml(value: &OwnedValue, options: &XmlOptions) -> Result<Str
     let mut first = true;
     for (key, value) in entries {
         if *key == declaration {
-            encoder
-                .printer
-                .proc_inst("xml", &Encoder::scalar_text(value), first)?;
+            let text = encoder.scalar_text(value);
+            encoder.printer.proc_inst("xml", &text, first)?;
             encoder.printer.out.push('\n');
             first = false;
         }
@@ -327,12 +327,12 @@ pub(crate) fn format_xml(value: &OwnedValue, options: &XmlOptions) -> Result<Str
         }
         if key.starts_with(&options.proc_inst_prefix) {
             let target = key.replacen(&options.proc_inst_prefix, "", 1);
-            encoder
-                .printer
-                .proc_inst(&target, &Encoder::scalar_text(value), false)?;
+            let text = encoder.scalar_text(value);
+            encoder.printer.proc_inst(&target, &text, false)?;
             encoder.printer.out.push('\n');
         } else if *key == options.directive_name {
-            encoder.printer.directive(&Encoder::scalar_text(value))?;
+            let text = encoder.scalar_text(value);
+            encoder.printer.directive(&text)?;
             encoder.printer.out.push('\n');
         } else {
             encoder.element(key, value, 0)?;

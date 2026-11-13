@@ -3386,6 +3386,9 @@ pub struct XmlOptions {
     pub proc_inst_prefix: String,
     /// `--xml-directive-name` (default `+directive`)
     pub directive_name: String,
+    /// A `null` is written as empty text, not `null`. Set when the run read `-p xml`, where an
+    /// empty element is a `null` that yq prints as the empty string it was made with (#6925).
+    pub empty_null: bool,
 }
 
 /// The unary libm builtins jq exposes beyond the trigonometric/exponential

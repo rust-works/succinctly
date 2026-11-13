@@ -28,11 +28,15 @@ pub(super) enum TranscodedInput {
     Tsv,
     /// `decoder_ini.go`: go-ini, a mapping of the `DEFAULT` section's keys and one per section.
     Ini,
+    /// `decoder_xml.go`: Go's `encoding/xml`, an element a mapping of its attributes and children.
+    Xml,
 }
 
 /// The flags a transcoder reads besides the input.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct TranscodeOptions {
+pub(super) struct TranscodeOptions<'a> {
+    /// The flags of `-p xml`.
+    pub xml: Option<&'a super::input_xml::XmlOptions>,
     /// `--properties-array-brackets`, which yq's properties decoder reads as well as its encoder.
     pub array_brackets: bool,
     /// `--csv-separator`, the field separator of `-p csv`.
@@ -58,6 +62,7 @@ impl TranscodedInput {
             InputFormat::Csv => Some(Self::Csv),
             InputFormat::Tsv => Some(Self::Tsv),
             InputFormat::Ini => Some(Self::Ini),
+            InputFormat::Xml => Some(Self::Xml),
             InputFormat::Auto => match super::lowercase_extension(files.first()?).as_deref() {
                 Some("base64") => Some(Self::Base64),
                 Some("uri") => Some(Self::Uri),
@@ -65,6 +70,7 @@ impl TranscodedInput {
                 Some("csv" | "c") => Some(Self::Csv),
                 Some("tsv" | "t") => Some(Self::Tsv),
                 Some("ini" | "i") => Some(Self::Ini),
+                Some("xml" | "x") => Some(Self::Xml),
                 _ => None,
             },
             InputFormat::Yaml | InputFormat::Json | InputFormat::Kyaml => None,
@@ -75,7 +81,7 @@ impl TranscodedInput {
     pub(super) fn reads_as(self) -> InputFormat {
         match self {
             Self::Base64 | Self::Uri => InputFormat::Json,
-            Self::Props | Self::Csv | Self::Tsv | Self::Ini => InputFormat::Yaml,
+            Self::Props | Self::Csv | Self::Tsv | Self::Ini | Self::Xml => InputFormat::Yaml,
         }
     }
 
@@ -88,6 +94,7 @@ impl TranscodedInput {
             Self::Csv => "csv",
             Self::Tsv => "tsv",
             Self::Ini => "ini",
+            Self::Xml => "xml",
         }
     }
 
@@ -95,7 +102,7 @@ impl TranscodedInput {
     /// a table, where yq's properties decoder reads no document from an empty input (`io.EOF`).
     pub(super) fn empty_is_document(self) -> bool {
         match self {
-            Self::Base64 | Self::Uri | Self::Csv | Self::Tsv | Self::Ini => true,
+            Self::Base64 | Self::Uri | Self::Csv | Self::Tsv | Self::Ini | Self::Xml => true,
             Self::Props => false,
         }
     }
@@ -110,6 +117,7 @@ impl TranscodedInput {
             Some(Self::Csv) => 4,
             Some(Self::Tsv) => 5,
             Some(Self::Ini) => 6,
+            Some(Self::Xml) => 7,
         }
     }
 
@@ -121,6 +129,7 @@ impl TranscodedInput {
             4 => Some(Self::Csv),
             5 => Some(Self::Tsv),
             6 => Some(Self::Ini),
+            7 => Some(Self::Xml),
             _ => None,
         }
     }
@@ -131,7 +140,7 @@ impl TranscodedInput {
     pub(super) fn transcode(
         self,
         raw: &[u8],
-        options: &TranscodeOptions,
+        options: &TranscodeOptions<'_>,
     ) -> Result<Vec<u8>, String> {
         let decoded = match self {
             Self::Base64 => succinctly::jq::go_base64_decode(raw).map_err(|e| e.to_string())?,
@@ -146,6 +155,17 @@ impl TranscodedInput {
             }
             Self::Tsv => return super::input_csv::transcode(raw, '\t', options.tsv_auto_parse),
             Self::Ini => return super::input_ini::transcode(raw, options.ini_preserve_quotes),
+            Self::Xml => {
+                let defaults;
+                let xml = match options.xml {
+                    Some(xml) => xml,
+                    None => {
+                        defaults = super::input_xml::XmlOptions::default();
+                        &defaults
+                    }
+                };
+                return super::input_xml::transcode(raw, xml);
+            }
         };
         Ok(json_string(&decoded))
     }

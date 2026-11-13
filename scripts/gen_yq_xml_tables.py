@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""Generate src/bin/succinctly/yq_runner/input_xml_tables.rs for `-p xml` (#6925).
+
+yq's XML decoder is Go's `encoding/xml`, and three of its decisions are tables:
+
+* `first` and `second`, the XML 1.0 name-start and name characters (`isName`), copied from
+  `$GOROOT/src/encoding/xml/xml.go`;
+* `unicode.IsGraphic(r) && !unicode.IsSpace(r)`, the characters `trimNonGraphic` in yq's
+  `decoder_xml.go` keeps at the ends of a text node, as ranges computed by Go itself;
+* the decode tables of the single-byte encodings `charset.NewReaderLabel` opens for a declared
+  `encoding` (`iso-8859-1` and `us-ascii` are Windows-1252, as in the WHATWG list), with their labels.
+
+Usage (Go and a module cache holding golang.org/x/text v0.37.0, the version yq v4.53.3 pins, are needed for the last two;
+run it with GOFLAGS=-mod=mod, plus GOPROXY=off when the cache is local):
+    python3 -I scripts/gen_yq_xml_tables.py "$(go env GOROOT)" \\
+        "$GOPATH/pkg/mod/golang.org/x/text@v0.37.0/encoding/htmlindex" > src/bin/succinctly/yq_runner/input_xml_tables.rs
+"""
+import os, re, subprocess, sys, tempfile
+
+GO_PROGRAM = r"""
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"os"
+	"unicode"
+
+	"golang.org/x/text/encoding/charmap"
+	"golang.org/x/text/encoding/htmlindex"
+)
+
+func main() {
+	in := false
+	var start rune
+	for r := rune(0); r <= 0x10FFFF; r++ {
+		ok := unicode.IsGraphic(r) && !unicode.IsSpace(r)
+		if ok && !in {
+			start, in = r, true
+		}
+		if !ok && in {
+			fmt.Printf("G %d %d\n", start, r-1)
+			in = false
+		}
+	}
+	if in {
+		fmt.Printf("G %d %d\n", start, 0x10FFFF)
+	}
+	seen := map[string]bool{}
+	sc := bufio.NewScanner(os.Stdin)
+	for sc.Scan() {
+		label := sc.Text()
+		e, err := htmlindex.Get(label)
+		if err != nil {
+			panic(err)
+		}
+		name, _ := htmlindex.Name(e)
+		cm, single := e.(*charmap.Charmap)
+		if name == "iso-8859-8-i" {
+			// htmlindex wraps ISO-8859-8 for the visual-order name; the bytes decode alike.
+			cm, single = charmap.ISO8859_8, true
+		}
+		kind := "U"
+		if name == "utf-8" {
+			kind = "8"
+		} else if single {
+			kind = "S"
+		}
+		fmt.Printf("L %s %s %s\n", kind, name, label)
+		if kind == "S" && !seen[name] {
+			seen[name] = true
+			dec := cm.NewDecoder()
+			for b := 0; b <= 0xFF; b++ {
+				s, err := dec.String(string([]byte{byte(b)}))
+				if err != nil || len([]rune(s)) != 1 {
+					panic(fmt.Sprintf("%s byte %x: %q %v", name, b, s, err))
+				}
+				if b < 0x80 && []rune(s)[0] != rune(b) {
+					panic(fmt.Sprintf("%s is not an ASCII superset at %x", name, b))
+				}
+				if b >= 0x80 {
+					fmt.Printf("T %s %d %d\n", name, b, []rune(s)[0])
+				}
+			}
+		}
+	}
+}
+"""
+
+
+def go_table(src, name):
+    i = src.index("var %s = &unicode.RangeTable{" % name)
+    j = src.index("\n}\n", i)
+    body = src[i:j]
+    out = []
+    for lo, hi, stride in re.findall(r"\{(0x[0-9A-Fa-f]+),\s*(0x[0-9A-Fa-f]+),\s*(\d+)\}", body):
+        lo, hi, stride = int(lo, 16), int(hi, 16), int(stride)
+        out.append((lo, hi, stride))
+    return out
+
+
+def rust_ranges(name, doc, rows, ty):
+    lines = ["/// %s" % doc, "pub(super) static %s: &[%s] = &[" % (name, ty)]
+    per_line = 4
+    for k in range(0, len(rows), per_line):
+        chunk = ", ".join(fmt(r) for r in rows[k:k + per_line])
+        lines.append("    %s," % chunk)
+    lines.append("];")
+    return "\n".join(lines)
+
+
+def fmt(r):
+    if len(r) == 3:
+        return "(0x%X, 0x%X, %d)" % r
+    return "(0x%X, 0x%X)" % r
+
+
+def main():
+    goroot = sys.argv[1]
+    htmlindex = sys.argv[2]  # .../golang.org/x/text@v0.37.0/encoding/htmlindex
+    src = open(os.path.join(goroot, "src/encoding/xml/xml.go")).read()
+    first, second = go_table(src, "first"), go_table(src, "second")
+    tables_go = open(os.path.join(htmlindex, "tables.go")).read()
+    labels = re.findall(r'^\t"([^"]+)":\s+\w+,$', tables_go, re.M)
+    with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, "main.go"), "w").write(GO_PROGRAM)
+        env = dict(os.environ)
+        subprocess.run(["go", "mod", "init", "gen"], cwd=d, env=env, check=True, capture_output=True)
+        subprocess.run(["go", "get", "golang.org/x/text@v0.37.0"], cwd=d, env=env, check=True, capture_output=True)
+        out = subprocess.run(["go", "run", "."], cwd=d, env=env, check=True, capture_output=True, text=True,
+                             input="\n".join(labels) + "\n").stdout
+    graphic, utf8_labels, single_labels, tables = [], [], [], {}
+    for line in out.splitlines():
+        parts = line.split()
+        if parts[0] == "G":
+            graphic.append((int(parts[1]), int(parts[2])))
+        elif parts[0] == "L":
+            _, kind, name, label = parts
+            if kind == "8":
+                utf8_labels.append(label)
+            elif kind == "S":
+                single_labels.append((label, name))
+        elif parts[0] == "T":
+            tables.setdefault(parts[1], {})[int(parts[2])] = int(parts[3])
+    names = list(tables)
+    index = {name: n for n, name in enumerate(names)}
+    print("// @generated by scripts/gen_yq_xml_tables.py from the Go standard library and golang.org/x/text; do not edit.")
+    print("//!")
+    print("//! The tables `-p xml` reads (see `input_xml`): Go's `encoding/xml` name characters, the")
+    print("//! graphic characters yq's `trimNonGraphic` keeps, and the decode tables of the single-byte")
+    print("//! encodings `golang.org/x/net/html/charset` opens for a declared `encoding`.")
+    print()
+    print(rust_ranges("NAME_FIRST", "Go's `first` table: `(lo, hi, stride)` ranges of XML name-start characters.", first, "(u32, u32, u32)"))
+    print()
+    print(rust_ranges("NAME_SECOND", "Go's `second` table: `(lo, hi, stride)` ranges of the other XML name characters.", second, "(u32, u32, u32)"))
+    print()
+    print(rust_ranges("GRAPHIC_NOT_SPACE", "`(lo, hi)` ranges of the characters for which Go's `unicode.IsGraphic` holds and `unicode.IsSpace` does not (Go %s)." % subprocess.run(["go", "version"], capture_output=True, text=True).stdout.split()[2], graphic, "(u32, u32)"))
+    print()
+    print("/// The labels `htmlindex` maps to UTF-8.")
+    print("pub(super) static UTF8_LABELS: &[&str] = &[")
+    for label in utf8_labels:
+        print('    "%s",' % label)
+    print("];")
+    print()
+    print("/// Each label `htmlindex` maps to a single-byte encoding, with the index in `SINGLE_BYTE_TABLES`.")
+    print("pub(super) static SINGLE_BYTE_LABELS: &[(&str, usize)] = &[")
+    for label, name in single_labels:
+        print('    ("%s", %d),' % (label, index[name]))
+    print("];")
+    print()
+    print("/// The code point each single-byte encoding decodes the byte `0x80 + index` to, in the order of")
+    print("/// %s." % ", ".join(names))
+    print("pub(super) static SINGLE_BYTE_TABLES: &[[u16; 128]] = &[")
+    for name in names:
+        t = tables[name]
+        assert sorted(t) == list(range(0x80, 0x100)) and all(c <= 0xFFFF for c in t.values())
+        print("    // %s" % name)
+        print("    [")
+        for k in range(0x80, 0x100, 8):
+            print("        " + ", ".join("0x%04X" % t[b] for b in range(k, k + 8)) + ",")
+        print("    ],")
+    print("];")
+
+
+main()
