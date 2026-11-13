@@ -713,16 +713,17 @@ impl WindowedFile {
 /// back at the next window and the copies of the text stay at two (#7106).
 const CERTIFIER_WINDOWS_IN_FLIGHT: usize = 2;
 
-/// A window of more than this is certified on the filter's own thread, over the buffer itself: the first
-/// window, which is the probe's 4 MiB or more, and any that holds a document bigger than a window or
-/// two. A copy of one would add its size to the peak memory of a run whose point is to hold less (a
-/// 175 MB one-line array read 395 MB with the copy and 222 MB without, #7106), and the one window
-/// the probe makes costs the filter a few milliseconds once.
-const CERTIFIER_COPY_LIMIT: usize = 2 * WINDOW_BYTES;
+/// A window of more than this is certified on the filter's own thread, over the buffer itself: it holds a
+/// document bigger than a few windows, and a copy of it would add its size to the peak memory of a run
+/// whose point is to hold less (a 175 MB one-line array read 395 MB with the copy and 222 MB without,
+/// #7106). The probe's first window of 4 MiB or more is under it and is copied: certifying it here
+/// instead saves 4 MiB of peak memory and costs the first window of a pipe of 10 MiB 4 to 10% of its
+/// run (measured on terminus and the mini).
+const CERTIFIER_COPY_LIMIT: usize = 8 * WINDOW_BYTES;
 
-/// A buffer the certifying thread hands back is kept for the next window only up to the size of the
-/// biggest window it is given ([`CERTIFIER_COPY_LIMIT`]), so one that grew past it is not held for the run.
-const CERTIFIER_KEEP_BYTES: usize = CERTIFIER_COPY_LIMIT;
+/// A buffer the certifying thread hands back is kept for the next window only up to this size, about two
+/// windows, so the probe's copy and one that grew with a document are not held for the run.
+const CERTIFIER_KEEP_BYTES: usize = 2 * WINDOW_BYTES;
 
 /// The first fault of a stream that cannot be read again, where it has been found: shared by the thread
 /// that finds it ([`Certifier`]) and the [`Reread`] that words it.
