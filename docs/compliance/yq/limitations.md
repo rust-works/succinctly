@@ -1343,7 +1343,8 @@ A result of `+`, `-`, `*`, `/` or `%` is read from where its left operand was, a
 Each result had no origin, so they were all `0` (and `""`).
 A constructed left operand takes the origin of the context entry it was built for (`{"z":1} * .` is `0 0 1 1` too), and a number built from a read keeps it (`.x + 1`).
 A left operand that builds a fresh node, a literal or a builtin such as `length`, has none: `10 + .x | document_index` is `0` for every document in yq and here.
-A comparison's boolean is made from the left node in yq (`createBooleanCandidate`), so it keeps where a left *read* was (`.x == 1 | document_index` is `0 0 1 1`, and `file_index` follows), and has none when the left node is one of the list's own (`. == . | document_index` is all `0`); so do `!=` and the orderings, since #6973. A union left operand that mixes reads and literals is the one shape left (below).
+A comparison's boolean is made from the left node in yq (`createBooleanCandidate`), so it keeps where a left *read* was (`.x == 1 | document_index` is `0 0 1 1`, and `file_index` follows), and has none when the left node is one of the list's own (`. == . | document_index` is all `0`); so do `!=` and the orderings, since #6973.
+A union left operand that mixes reads and literals is the one shape left (below).
 
 An arithmetic result keeps `EvaluateTogether` too, since #6973: yq's result is a copy of its left node (`lhs.Copy()`), so a left operand that is the list's own node passes its flag on, whatever the result is (a map merge, an array concat or a sum: `. * {"z":1} | [.]` and `. + 1 | [.]` are one array of every result), and a following binary stage crosses the whole list of results (`(. * {"z":1}) | . + {"w":2}` is 16 results over two documents).
 A left operand that navigated or built its node has none (`.x + 1 | [.]` and `{"q":1} + . | [.]` are one array per result), and a comparison's boolean is a node of its own.
