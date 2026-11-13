@@ -8019,7 +8019,12 @@ These still differ:
 `tests/yq_cli/i7063.rs` pins the rows captured from yq v4.53.3; the rule is in its header.
 yq does not pair backslashes left to right: of `n` backslashes before `(`, an interpolation starts when `n / 2` is even, and a string with an unclosed `\(` is read as written, interpolations that did close included.
 
+Inside a slot every `(` is an open (a nested `\(` too: `"\(z\(1)"` is unclosed), and a `)` is a close unless the backslash run before it, collapsed once (`ceil(n / 2)`), is odd (`\)` and `\\)` do not close, `\\\)` does) ([#7105](https://github.com/rust-works/succinctly/issues/7105), `tests/yq_cli/i7105.rs`).
+
 - **yq's warning for an unclosed `\(` is not printed.**
   yq writes `level=WARN msg="unclosed interpolation string, skipping interpolation"` to stderr and exits 0; this prints the same text on stdout and nothing on stderr.
 - **An empty slot, `"\()"`, is the empty string in yq and a parse error here.**
+- **A slot that does not parse, followed by an unclosed `\(`, is a refusal in yq and text here** (`"\( + )\("`, `"\(1\))\("`).
+  yq compiles the slots in order and refuses the first that is not an expression before it reaches the unclosed one; this decides that the string is unclosed first and reads it as written.
+  A sweep of 28,663 strings over `\(`, `(`, `)`, `\)`, `\\`, `1` and ` + ` (up to five tokens, alone and after a `\(`) left 591 that differ from yq, all of this shape; before #7105 it was 2,176, and 1,585 were this issue's.
 - **With `--jq-extensions` a string with an unclosed `\(` is still a parse error**, because a slot may hold a string literal there and the end of the text is not known up front.
