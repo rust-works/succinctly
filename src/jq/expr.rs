@@ -3518,6 +3518,26 @@ pub enum LoadKind {
     Text,
     /// yq's `load_base64`: the bytes decoded as base64, as `@base64d` decodes a string.
     Base64,
+    /// yq's `load_props`: the file read as `-p props` reads it (#6998).
+    Props,
+    /// yq's `load_xml`: the file read as `-p xml` reads it (#6998).
+    Xml,
+}
+
+/// yq's codec operators over a string (#6998): the decoder of `-p props|csv|tsv|xml` applied to
+/// the string, or the XML encoder of `-o xml`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextCodec {
+    /// `from_props`
+    FromProps,
+    /// `from_csv`
+    FromCsv,
+    /// `from_tsv`
+    FromTsv,
+    /// `from_xml`
+    FromXml,
+    /// `to_xml`
+    ToXml,
 }
 
 /// Builtin functions supported by jq.
@@ -3697,6 +3717,8 @@ pub enum Builtin {
     /// yq's `from_json` and `from_yaml` (#4206): the string's first YAML document, as a value.
     /// A non-string passes through unchanged. Yq mode only.
     FromYaml,
+    /// yq's `from_props`, `from_csv`, `from_tsv`, `from_xml` and `to_xml` (#6998). Yq mode only.
+    TextCodec(TextCodec),
     /// yq's `envsubst` and `envsubst(nu, ne, ff)` (#4872): `$VAR`, `${VAR}` and `${VAR:-d}` in a
     /// string replaced by the environment. Yq mode only.
     Envsubst(super::envsubst::EnvsubstFlags),

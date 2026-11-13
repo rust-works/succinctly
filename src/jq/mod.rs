@@ -188,7 +188,7 @@ pub use eval::input_queue_is_active;
 pub use eval::yq_node_scalar_text;
 // #6923: what `-e` reads under an `-o=<format>` encoder.
 pub use eval::{output_encoder_saw_truthy, reset_output_encoder_truthy};
-pub use eval::{set_yq_encoder_prefs, YqEncoderPrefs};
+pub use eval::{set_yq_encoder_prefs, set_yq_text_decoder, YqEncoderPrefs, YqTextDecoder};
 // #3046: the CLI facts `input_filename`/`get_search_list`/`get_jq_origin`/
 // `get_prog_origin` read.
 pub use eval::cli_context;
@@ -197,7 +197,7 @@ pub use expr::{
     FuncDefBound, FuncDefData, Import, Include, Libm1, Libm2, Libm3, Literal, LoadKind, LuaOptions,
     MergeFlags, MetaObject, MetaSlot, MetaValue, ModuleMeta, NumberKey, ObjectEntry, ObjectKey,
     Param, Pattern, PatternEntry, PipeStages, Program, SharedArg, SliceBoundKey, StringPart,
-    XmlOptions, YqOutputEncoder,
+    TextCodec, XmlOptions, YqOutputEncoder,
 };
 pub use lazy::JqValue;
 // #5497: jq's parse-depth limit, applied by the CLI's document routes.

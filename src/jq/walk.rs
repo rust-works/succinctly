@@ -112,6 +112,7 @@ pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
         | Builtin::ToJson
         | Builtin::FromJson
         | Builtin::FromYaml
+        | Builtin::TextCodec(_)
         | Builtin::Envsubst(_)
         | Builtin::Explode
         | Builtin::Implode
@@ -433,6 +434,7 @@ pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr)
         | Builtin::ToJson
         | Builtin::FromJson
         | Builtin::FromYaml
+        | Builtin::TextCodec(_)
         | Builtin::Envsubst(_)
         | Builtin::Explode
         | Builtin::Implode
@@ -1804,6 +1806,7 @@ fn stage_escapes_own_input(expr: &Expr) -> bool {
             | Builtin::ToJson
             | Builtin::FromJson
             | Builtin::FromYaml
+            | Builtin::TextCodec(_)
             | Builtin::Envsubst(_)
             | Builtin::Explode
             | Builtin::Implode
@@ -2163,6 +2166,7 @@ fn node_reads_ambient(node: &Expr) -> bool {
             | Builtin::ToJson
             | Builtin::FromJson
             | Builtin::FromYaml
+            | Builtin::TextCodec(_)
             | Builtin::Envsubst(_)
             | Builtin::Explode
             | Builtin::Implode

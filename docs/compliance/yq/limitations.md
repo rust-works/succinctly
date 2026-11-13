@@ -7896,6 +7896,17 @@ These rows differ:
 - `--front-matter` with an explicit `-p xml` is refused (`--front-matter and --input-format xml are incompatible`), where yq decodes the front matter as XML.
 - yq's warning that `-o auto` defaults to YAML when `-p xml` is explicit is not written.
 
+### `from_props`, `from_csv`, `from_tsv`, `from_xml`, `to_xml`, `load_props` and `load_xml` — a round trip keeps its trailing newline ([#6998](https://github.com/rust-works/succinctly/issues/6998))
+
+The operators are the decoders and encoder of `-p props|csv|tsv|xml` and `-o xml` applied to a string or a file, so they carry those formats' rows (`-p xml`, `-o=xml`, `-p props`, `-p csv and -p tsv`).
+Every row of `tests/yq_cli/i6998.rs` was captured from yq v4.53.3.
+What differs:
+
+- yq's encode operators remove the trailing line break when the same path was decoded earlier in the pipe from text that had none (`"<a>1</a>" | from_xml | to_xml` is `<a>1</a>`, `"a: 1" | from_yaml | to_yaml` is `a: 1`), and this keeps it (`<a>1</a>\n`).
+  The rule is yq's `encodeOperator`, over every codec pair, and it is not implemented for `from_yaml` and `from_json` either.
+- A `to_xml` result of a `null` from `from_xml` is `<a>null</a>`, where yq's empty node writes `<a></a>`; `-o xml` of a run that read `-p xml` writes the empty element (`-p xml`, above).
+- `load_csv` and `load_tsv` are not yq operators and stay undefined.
+
 ### `--unwrapScalar=false` with `-o=yaml` — a scalar result prints as a node, with these differences ([#7093](https://github.com/rust-works/succinctly/issues/7093))
 
 `-r` / `--unwrapScalar` takes its value after `=` (`--unwrapScalar=false`, `-r=true`), and the value yq resolves is its own when given and else true for `-o=yaml` and `-o=props` and false for every other format.
