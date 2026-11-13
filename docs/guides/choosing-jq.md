@@ -163,8 +163,8 @@ exact RFC 8259 behaviour matters. Section C of each report.
 - Piped stdin: the reports have a section for it (D/E, piped stdin against a file argument). `succinctly jq` reads
   stdin to its end before it starts, so a pipe costs it a little more than a file (up to about 1.3x on `users_field` at 100 MB),
   and the speedup on stdin is a little smaller than the file figure. The reports predate #7024, since which a plain filter
-  reads a pipe of 4 MiB or more a window at a time: in 21 to 23 MiB on a 7950X and about 18 MiB on an M4 Pro at 100 MiB
-  (from 123 to 129 MiB), and 2% to 5% faster than it read that pipe before (measured in
+  reads a pipe of 4 MiB or more a window at a time: in 23 to 26 MiB on a 7950X and about 19 MiB on an M4 Pro at 100 MiB
+  (from 123 to 127 MiB), and 2% to 6% faster than it read that pipe before (measured in
   [jq limitations](../compliance/jq/limitations.md), #7024, #7106).
 - Machines other than the two named. A larger or smaller cache, a different allocator, or slower storage changes the
   memory-bound rows in particular.
