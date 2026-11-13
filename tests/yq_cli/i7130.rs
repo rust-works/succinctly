@@ -11,7 +11,7 @@ use crate::run_yq_stdin;
 
 #[test]
 fn a_colon_inside_a_tag_before_a_block_scalar_header_reads_as_yq() -> Result<()> {
-    let rows: [(&str, &str, Option<&str>); 14] = [
+    let rows: [(&str, &str, Option<&str>); 17] = [
         (
             "- !<tag:yaml.org,2002:str> |2\n   lead\n- x\n",
             "[\" lead\\n\",\"x\"]\n",
@@ -81,6 +81,21 @@ fn a_colon_inside_a_tag_before_a_block_scalar_header_reads_as_yq() -> Result<()>
             "- k: !!str |2\n    lead\n  j: 1\n",
             "[{\"k\":\"lead\\n\",\"j\":1}]\n",
             Some("- k: !!str |\n    lead\n  j: 1\n"),
+        ),
+        (
+            "- &a k: |2\n    lead\n  j: 1\n",
+            "[{\"k\":\"lead\\n\",\"j\":1}]\n",
+            Some("- &a k: |\n    lead\n  j: 1\n"),
+        ),
+        (
+            "- \"a: !x\": |2\n    lead\n  j: 1\n",
+            "[{\"a: !x\":\"lead\\n\",\"j\":1}]\n",
+            Some("- \"a: !x\": |\n    lead\n  j: 1\n"),
+        ),
+        (
+            "- 'a:b': |2\n    lead\n  j: 1\n",
+            "[{\"a:b\":\"lead\\n\",\"j\":1}]\n",
+            Some("- 'a:b': |\n    lead\n  j: 1\n"),
         ),
     ];
     for (input, json, yaml) in rows {
