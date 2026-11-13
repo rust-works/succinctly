@@ -274,7 +274,8 @@ def run_files(args, rng, data, case, program, work, seed):
 def run_stdin_file(args, rng, data, program, work, seed):
     """One `-R` case on a regular file on standard input (#7024): windowed (the file, from an offset) and
     whole (the bytes from there on a pipe named `/dev/stdin`), compared."""
-    offset = 0 if rng.random() < 0.6 else rng.randrange(len(data) - MIN_BYTES)
+    # Any offset that leaves the minimum to read, so the windowed side stays windowed.
+    offset = 0 if rng.random() < 0.6 else rng.randrange(len(data) - MIN_BYTES + 1)
     name = os.path.join(work, "windowed-fuzz-%d-stdin.json" % seed)
     with open(name, "wb") as handle:
         handle.write(data)
@@ -360,12 +361,12 @@ def main():
                 (at for at, (a, b) in enumerate(zip(windowed[0], whole[0])) if a != b),
                 min(len(windowed[0]), len(whole[0])),
             )
-            print("DIFFERENCE case=%d program=%s mutations=%s sizes=%s exit=%d/%d stdout_differs_at=%s kept=%s"
-                  % (case, program, notes, sizes, windowed[2], whole[2],
+            print("DIFFERENCE case=%d program=%s mutations=%s sources=%s sizes=%s exit=%d/%d stdout_differs_at=%s kept=%s"
+                  % (case, program, notes, names, sizes, windowed[2], whole[2],
                      first if windowed[0] != whole[0] else "-", kept))
             if windowed[1] != whole[1]:
-                print("  files:", windowed[1][:300])
-                print("  fds  :", whole[1][:300])
+                print("  windowed:", windowed[1][:300])
+                print("  whole   :", whole[1][:300])
     print("%d cases, %d differences, seed %d, %.0fs" % (args.n, differences, args.seed, time.time() - started))
     sys.exit(1 if differences else 0)
 
