@@ -148,7 +148,11 @@ The gate claims no worse than the owned-value route, not a byte-for-byte match: 
 doubles every result of `.[0]` over a stream of arrays and separates the results of `.[]`
 across files its own way, neither of which either route reproduces. The plain route also
 keeps a written-into empty `{}`/`[]` in flow style where yq switches to block
-(`{}` | `.a = 5` is `{a: 5}`, yq `a: 5`), so a rerouted `ea` inherits that. A multi-document stream applies the redirect and the
+(`{}` | `.a = 5` is `{a: 5}`, yq `a: 5`), so a rerouted `ea` inherits that.
+The file-merge idioms (`. as $item ireduce ({}; . * $item)`, `select(fi == 0) * select(fi == 1)`, and the same with `+`, `*+` or a different order of the files) are not a navigation or a literal write, but keep every document's comments too ([#4380](https://github.com/rust-works/succinctly/issues/4380)): the evaluator's result is the one printed, and a replay of the merge over the documents' comment trees (`trace_eval_all_merge`, with yq's `UpdateAttributesFrom` rule that the right node's head, foot and line comment replace the left's where it has one) supplies the comments, used only when the replay's value is the evaluator's.
+The first file's header leads the result, a later file's header (no blank line between it and the first node) is that node's head comment, and the style is the owned route's (block, quotes only where the text needs them): yq keeps the left node's flow and quote style and takes the right's where the left has none, so a merge of flow collections or quoted strings still differs, as before.
+Not replayed, and printed as before without comments: a source with an anchor or an alias, a later file whose header a blank line detaches from the first node, a source with several documents or that is not YAML, a filter that is not one of these shapes (`[., .]`, `.a = .b`, a builtin, a variable), and the `*n`, `*?` and `*d` merges.
+Where yq moves a comment (a scalar's line comment, when a container replaces the scalar, lands on the next key in yq) the comment stays on its own node here. A multi-document stream applies the redirect and the
 anchor marks to every document, on stdout and under `--inplace` alike
 ([#2520](https://github.com/rust-works/succinctly/issues/2520): the report that it reached the
 last document only no longer reproduces; pinned by the `yaml_multidoc_alias_*_2520` goldens and
@@ -7591,7 +7595,7 @@ That is a divergence under the rule that `succinctly yq` never emits YAML it can
 - Aliasing the declaring node (`.a alias = "x"` over `a: &x 1`) leaves no declaration, so every alias of it, the node itself included, prints the value.
 - `-o json` prints `null` in yq for an alias node the setter made (it has no target) and the node's value here.
 - A bare scalar result keeps no mark, so `.b alias = "x" | .b` is `*x` in yq and `1` here, as for any bare scalar alias (see the soundness section above); the same holds for the document root, `. alias = "x"`.
-- `--eval-all` evaluates through the owned-value route, which writes no metadata: `alias =` is a no-op there, as `anchor =` is (the route keeps no anchors at all, #4380).
+- `--eval-all` evaluates through the owned-value route, which writes no metadata: `alias =` is a no-op there, as `anchor =` is (the route keeps no anchors at all, #4380; a merge of files keeps their comments, above).
 - A document whose anchor is aliased elsewhere keeps yq's other alias: `.a alias = "x"` over `a: &y 1` / `b: *y` is `a: *x` / `b: *y` in yq, and `a: 1` / `b: 1` here, the declaration being gone.
 - A later write does not clear the mark where it leaves the value alone: `.c alias = "x" | .c = 1` is `c: 1` in yq and `c: *x` here, since `1` is still the anchor's value.
 
