@@ -23975,6 +23975,13 @@ fn cross_together<S: EvalSemantics, V: DocumentValue>(
     // each output arrives. (`cur` is not: the right operand's walk that follows each output moves
     // it on before the entry's next output arrives.)
     let left_origin: core::cell::Cell<Option<NodeOrigin>> = core::cell::Cell::new(None);
+    let read_only_operands = matches!(
+        stage,
+        Expr::Compare {
+            op: CompareOp::Ne,
+            ..
+        }
+    );
     let each_operand = |operand: &Expr, operand_sink: &mut dyn Sink<V>| {
         let mut flat: Vec<Expr> = Vec::new();
         yq_flatten_pipe_stages(core::slice::from_ref(operand), &mut flat);
@@ -23985,6 +23992,18 @@ fn cross_together<S: EvalSemantics, V: DocumentValue>(
                 operand_sink.push(item)
             });
             eval_yq_context_pipe::<S, V>(&flat, context, false, cur, &mut noting)
+        } else if read_only_operands {
+            // #7179: `notEqualsOperator` reads both operands through `ReadOnlyClone`, so a key that
+            // finds nothing is no node (`==` and the orderings read it as `null`). The pairing runs
+            // on this stack, inside the operand's own call, and must not inherit the scope.
+            let previous = yq_read_only_context::active();
+            let _read_only = yq_read_only_context::enter();
+            let budget = operand_sink.budget();
+            let mut outside = forward_budget(budget, |item: GenericItem<V>| -> Demand {
+                let _pairing_scope = yq_read_only_context::restore(previous);
+                operand_sink.push(item)
+            });
+            eval_yq_context_pipe::<S, V>(&flat, context, false, cur, &mut outside)
         } else {
             eval_yq_context_pipe::<S, V>(&flat, context, false, cur, operand_sink)
         }
