@@ -339,7 +339,13 @@ fn a_path_that_changes_before_the_run_reaches_it_is_read_as_jq_reads_it_7024() -
     if !readable {
         let (windowed, whole) = changed_while_running(Change::MiddleUnreadable, &["-R", "."])?;
         assert!(windowed.1.contains("Permission denied"), "{}", windowed.1);
-        let gone = (windowed.0, windowed.1.replace("Permission denied", "No such file or directory"), windowed.2);
+        let gone = (
+            windowed.0,
+            windowed
+                .1
+                .replace("Permission denied", "No such file or directory"),
+            windowed.2,
+        );
         assert_eq!(gone, whole, "an unreadable file");
     }
     // The cases say what they are meant to: a file that did not open is reported, and the run
