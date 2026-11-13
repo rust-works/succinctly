@@ -5220,7 +5220,8 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         && !program_reads_inputs; // not `uses_input_builtins`: a clean `--seq` stream has no fault to queue (#6147)
 
     // #7082: a lone regular file of RFC 7464's own framing is read a window at a time, as the plain
-    // route reads its file (#6920), so the run holds a window where it held the file.
+    // route reads its file (#6920), so the run holds a window where it held the file; #7164: a pipe
+    // too, up to its first record that is not that framing.
     let mut seq_windowed = if args.seq && lazy_route_open {
         windowed_seq_file(&args)
     } else {
@@ -11548,7 +11549,8 @@ fn raw_windowed_pipe(file: std::fs::File, min: u64) -> Option<RawWindowed> {
 }
 
 /// The lone regular file a `--seq` stream is read from a window at a time (#7082), in the shape
-/// [`windowed_plain_file`] gives, with each RS byte read as a space; or `None` for a run that is not one.
+/// [`windowed_plain_file`] gives, with each RS byte read as a space, or the pipe on standard input
+/// ([`windowed_seq_pipe`], #7164); or `None` for a run that is not one.
 ///
 /// What the whole-file route does for a stream that is "clean" (see [`seq_plain_json_inputs`]) is blank
 /// its RS bytes and read it as plain JSON, so this does the same a window at a time, and only for the
@@ -11595,8 +11597,8 @@ fn windowed_plain_file(args: &JqCommand) -> Option<WindowedSource> {
         return None;
     }
     windowed_source(args).or_else(|| {
-        // #7024: a pipe on standard input, which only this route reads a window at a time: the `--seq`
-        // prepass reads its file by position, which a pipe cannot be.
+        // #7024: a pipe on standard input, read a window at a time with its first fault kept as it is
+        // read (`--seq` over a pipe is [`windowed_seq_pipe`]'s, #7164).
         get_input_files(args)
             .is_empty()
             .then(windowed_stdin_pipe)
