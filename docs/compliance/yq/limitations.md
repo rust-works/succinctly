@@ -7709,6 +7709,8 @@ A document `.inf`/`.nan` used as a number fails in yq while it computes, in ever
 `==`, `!=`, `//`, a string or `null` on the other side, `length`, and a computed infinity (`1 / 0`) are unchanged, and `[.a] | max` has no comparison to make.
 When an update (`|=`, `map_values`) fails on several nodes, yq reports the last node's text and `succinctly yq` the first: over `a: .inf` and `b: -.inf`, `map_values(. + 1)` names `"-.inf"` in yq and `".inf"` here.
 `sort` and `sort_by` over such a scalar panic in yq with a Go stack trace, and order it here (see the NaN and infinities entry in the sort section).
+A scalar forced to `!!float` whose text `strconv.ParseFloat` reads as non-finite fails in the streamed `-o=json` writer as well (#7115): `!!float inf`, `infinity` and `Inf` are `json: unsupported value: +Inf` (`-Inf` with a minus sign), `nan` in any case is `NaN`, a signed `nan` is `ParseFloat`'s syntax error and `1e999` its range error, each wrapped once per node as above.
+The routes that evaluate a result first (`-P`, a write) and the arithmetic and comparison operators still treat the text as a string, so `!!float inf` there is the string `"inf"` where yq computes with `+Inf`, and a hexadecimal float (`!!float 0x1p4`) is written as its text where yq writes `16.0`; `tests/yq_cli/i7115.rs` pins the writer rows.
 
 ### `-o props|shell|csv|tsv|base64|uri` — the first slice of yq's output formats; six rows still differ ([#6850](https://github.com/rust-works/succinctly/issues/6850))
 

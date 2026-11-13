@@ -2530,6 +2530,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 // resolve entirely.
                 if let Some(explicit) = self.explicit_tag_at(None) {
                     if let Ok(str_val) = s.as_str() {
+                        if explicit == "!!float" {
+                            reject_tagged_non_finite_float(&str_val)?;
+                        }
                         if let Some(resolved) = resolve_tagged(&str_val, explicit) {
                             reject_non_finite_json_scalar(resolved, &str_val)?;
                             return Ok(stream_resolved_scalar_as_json(
@@ -4964,6 +4967,9 @@ fn stream_yaml_string_to_json<Out: core::fmt::Write>(
 const MARSHAL_FAILURE_WRAP: &str =
     "json: error calling MarshalJSON for type *yqlib.CandidateNode: ";
 
+/// The start of `encoding/json`'s refusal of a non-finite number (#7115).
+const UNSUPPORTED_VALUE_FAILURE: &str = "json: unsupported value: ";
+
 /// The start of the failure itself, before the scalar's text.
 const PARSE_FLOAT_FAILURE: &str = "strconv.ParseFloat: parsing ";
 
@@ -4987,6 +4993,44 @@ fn reject_non_finite_json_scalar(
     }
 }
 
+/// The failure yq's JSON encoder raises for a scalar forced to `!!float` whose text Go's
+/// `strconv.ParseFloat` reads as a non-finite number (#7115): `ParseFloat` takes `inf`, `infinity`
+/// and `nan` in any case, `inf` and `infinity` with a sign, so `!!float inf` is `+Inf` and
+/// `encoding/json` refuses it (`json: unsupported value: +Inf`, `-Inf`, `NaN`). A signed `nan`
+/// is a syntax error of `ParseFloat` itself, as `.inf` is (#6867), and a decimal past the range of a double is its range error. The text of any other scalar is
+/// not read here: a finite one writes as the number it resolves to.
+///
+/// Called only for the explicit `!!float` tag, so a scalar of any other kind pays nothing.
+#[cold]
+#[inline(never)]
+fn reject_tagged_non_finite_float(text: &str) -> Result<(), StreamFailure> {
+    let (sign, rest) = match text.as_bytes().first() {
+        Some(b'+') => ("+", &text[1..]),
+        Some(b'-') => ("-", &text[1..]),
+        _ => ("", text),
+    };
+    let lower = rest.to_ascii_lowercase();
+    let message = match lower.as_str() {
+        "inf" | "infinity" => alloc::format!(
+            "json: unsupported value: {}Inf",
+            if sign == "-" { "-" } else { "+" }
+        ),
+        "nan" if sign.is_empty() => "json: unsupported value: NaN".into(),
+        "nan" => alloc::format!("{PARSE_FLOAT_FAILURE}\"{text}\": invalid syntax"),
+        // A decimal number past the range of a double: `ParseFloat` returns `±Inf` with its
+        // range error (`1e999`), where `resolve_tagged` leaves the text a string.
+        _ if text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'+' | b'-'))
+            && text.parse::<f64>().is_ok_and(f64::is_infinite) =>
+        {
+            alloc::format!("{PARSE_FLOAT_FAILURE}\"{text}\": value out of range")
+        }
+        _ => return Ok(()),
+    };
+    Err(StreamFailure::Decode(EvalError::decode_failure(message)))
+}
+
 /// Adds one level of yq's marshal-failure wrap to a [`reject_non_finite_json_scalar`] failure as
 /// it passes up through a node, the scalar's own included (#6867); any other failure passes
 /// unchanged.
@@ -4995,7 +5039,8 @@ fn wrap_non_finite_marshal_failure(failure: StreamFailure) -> StreamFailure {
     match failure {
         StreamFailure::Decode(e)
             if e.message.starts_with(MARSHAL_FAILURE_WRAP)
-                || e.message.starts_with(PARSE_FLOAT_FAILURE) =>
+                || e.message.starts_with(PARSE_FLOAT_FAILURE)
+                || e.message.starts_with(UNSUPPORTED_VALUE_FAILURE) =>
         {
             StreamFailure::Decode(EvalError::decode_failure(format!(
                 "{MARSHAL_FAILURE_WRAP}{}",
