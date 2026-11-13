@@ -7844,10 +7844,16 @@ The first record is the header and every later record is a mapping from the head
 The reader is Go's with its defaults: the separator is `--csv-separator` (a tab for TSV, which ignores it), blank lines are skipped, a quote is only allowed in a quoted field, a record must have the header's field count, a `\r\n` is a `\n` even inside a quoted field, and a byte-order mark is dropped.
 Its errors are Go's, with the line and column Go counts, behind `bad file '<name>': ` (`parse error on line 2, column 6: extraneous or missing " in quoted-field`, `bare " in non-quoted-field`, `record on line 2: wrong number of fields`).
 A header repeated becomes a key repeated, as in yq.
-A cell is a snippet of YAML under the default `--csv-auto-parse` / `--tsv-auto-parse`, as yq's `parseSnippet` reads it: a snippet that is a string (go-yaml's typing of a plain scalar, so `yes`, `007` is an integer and a date is a timestamp; a quoted, tagged-`!!str` or aliased one is a string), that is not YAML, or that holds more than one document stays the cell's own text, `'x'` and `a # c` with their quote and comment, while any other node is the node the snippet makes (`5 # c` the integer `5`, `0x1f` and `1_000` integers that keep their spelling, `[1,2]` a sequence, `a: b` a mapping, `&a 5` an anchored integer, a bare `!` a null).
+A cell is a snippet of YAML under the default `--csv-auto-parse` / `--tsv-auto-parse`, as yq's `parseSnippet` reads it: a snippet that is a string (go-yaml's typing of a plain scalar, so `yes`, `007` is an integer and a date is a timestamp; a quoted, tagged-`!!str` or aliased one is a string), or that is not YAML, stays the cell's own text, `'x'` and `a # c` with their quote and comment, while any other node is the node the snippet makes (`5 # c` the integer `5`, `0x1f` and `1_000` integers that keep their spelling, `[1,2]` a sequence, `a: b` a mapping, `&a 5` an anchored integer, a bare `!` a null).
 `--csv-auto-parse=false` reads a cell as a plain scalar of its text instead.
 Under `-p auto` a first input file named `*.csv` or `*.tsv` (or `*.c`, `*.t`, any case) reads and, with `-o auto`, prints as a table, and `-i` writes the table's format back.
 These agree with yq v4.53.3 on 6,500 random tables under `-o yaml`, `-o json`, `--csv-auto-parse=false` and `-p tsv`, and on 7,000 random byte strings (every error of the reader agreed, with its line and column), apart from the rows below (`tests/yq_cli/i6925.rs` pins a sample).
+
+A snippet is read as its **first document only**, as yq's `decoder.Decode()` reads it ([#7136](https://github.com/rust-works/succinctly/issues/7136), `tests/yq_cli/i7136.rs`).
+A later document is never read, so `a: 1` / `---` / `b: 2` is `{"a":1}` and `5` / `---` / `1` is `5`, and a first document that is a string keeps the whole text (`x` / `---` / `y`).
+A snippet that opens with a flow collection is that collection when text follows it (`[1-4];[5-8];9` is `["1-4"]`, `[a, b] x` is `["a","b"]`), since the parser never reads past the node.
+go-yaml's scanner reads two tokens after the node, and a token that fails to scan is yq's error, which leaves the cell its text: a `-` or `?` indicator that does not start a line, an unterminated quote, `@`, a backtick, `%`, a block scalar header followed by text, an anchor or alias name followed by a bracket.
+A document marker with nothing in it is a null (`---`, `---` / `---`, `# c` / `---`).
 
 These rows differ:
 
@@ -7859,6 +7865,7 @@ These rows differ:
 - A header that needs the `? ` explicit-key form (it holds a line break or is over 128 bytes) loses a comment-only or blank cell's comment: `? |-` / `  : # c` prints `:` here.
 - `--front-matter` with an explicit `-p csv` or `-p tsv` is refused (`--front-matter and --input-format csv are incompatible`), as `-p json` is, where yq decodes the front matter as a table.
 - A number that go-yaml types as an integer or float but this YAML reader does not (`1_000`, `0b1`, an integer past 2^63) prints as yq prints it under `-o yaml` and differs under `-o json`, the same difference as for a YAML input.
+- A cell that is a flow collection used as a key (`[1]: v`, `{a: 1} : v`) is refused here, where yq reads a mapping with an empty key; and random cells built from brackets, indicators, tags and markers (5,050 of them) still differ from yq in 339, about a fifth of them cells that this reader accepts as a first node where go-yaml's scanner refuses a third token or an odd first node (`[1]}!t %`, `{a: 1}*a]*a{`, `? ,` / `---`).
 - yq's warning that `-o auto` defaults to YAML when `-p csv` is explicit is not written.
 
 ### `-p ini` — a byte that is not UTF-8 and `--front-matter` differ ([#6925](https://github.com/rust-works/succinctly/issues/6925))

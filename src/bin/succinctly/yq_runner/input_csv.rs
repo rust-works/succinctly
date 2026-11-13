@@ -267,6 +267,274 @@ fn is_simple_plain(text: &str) -> bool {
         && !text.ends_with(' ')
 }
 
+/// The text of the first YAML document of `text` (#7136): yq's `parseSnippet` decodes one document and
+/// never reads what follows it, so a `---` or `...` line after the document's content ends the cell.
+/// A marker before any content opens the document and is kept.
+fn first_document(text: &str) -> &str {
+    let mut seen_content = false;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let bare = line.trim_end_matches(['\n', ' ', '\t']);
+        let is_marker = |m: &str| {
+            bare == m
+                || (bare.len() > m.len()
+                    && bare.starts_with(m)
+                    && matches!(bare.as_bytes()[m.len()], b' ' | b'\t'))
+        };
+        if is_marker("---") || is_marker("...") {
+            if seen_content {
+                return &text[..offset];
+            }
+            // `--- text` puts content on the marker line.
+            let after = bare[3..].trim_start_matches([' ', '\t']);
+            if bare.starts_with("---") && !after.is_empty() && !after.starts_with('#') {
+                seen_content = true;
+            }
+        } else if !bare.trim_start().is_empty()
+            && !bare.trim_start().starts_with('#')
+            && !bare.starts_with('%')
+        {
+            seen_content = true;
+        }
+        offset += line.len();
+    }
+    text
+}
+
+/// Whether `text` opens with a flow collection (#7136), after comment lines and node properties
+/// (`&anchor`, `!tag`).
+fn opens_with_flow_collection(text: &str) -> bool {
+    let mut rest = text;
+    loop {
+        rest = rest.trim_start_matches([' ', '\t', '\n']);
+        if rest.starts_with('#') {
+            rest = rest.find('\n').map_or("", |at| &rest[at..]);
+        } else if rest.starts_with(['&', '!']) {
+            rest = rest.find([' ', '\t', '\n']).map_or("", |at| &rest[at..]);
+        } else {
+            return rest.starts_with(['[', '{']);
+        }
+    }
+}
+
+/// Whether go-yaml's scanner can read what follows a complete first node (#7136). The parser peeks at
+/// the token after the node to see whether the document ended, and the scanner is a token ahead of
+/// it (the node's own candidate simple key is only settled once the next token is read), so the first
+/// two tokens after the node are scanned: a flow collection counts as one, with everything inside it.
+/// A token that fails to scan is yq's error, and the cell stays its text. A plain scalar, a bracket,
+/// a comma, a comment and a document marker scan; a `-` or `?` indicator that does not start a line,
+/// an unterminated quote, `@`, a backtick, `%`, a block scalar header followed by text, and an anchor
+/// or alias name followed by a character that cannot end it do not.
+fn token_after_the_first_node_scans(rest: &str, starts_a_line: bool) -> bool {
+    let bytes = rest.as_bytes();
+    let mut at = 0;
+    // After a flow collection the text starts on the node's own line; after a document it starts a line.
+    let mut line_start = starts_a_line;
+    for _ in 0..2 {
+        loop {
+            match bytes.get(at) {
+                Some(b' ' | b'\t' | b'\r') => at += 1,
+                Some(b'\n') => {
+                    line_start = true;
+                    at += 1;
+                }
+                Some(b'#') => {
+                    while bytes.get(at).is_some_and(|&b| b != b'\n') {
+                        at += 1;
+                    }
+                }
+                _ => break,
+            }
+        }
+        let Some(&c) = bytes.get(at) else {
+            return true;
+        };
+        let at_marker = line_start
+            && (bytes[at..].starts_with(b"---") || bytes[at..].starts_with(b"..."))
+            && blank_or_end(bytes.get(at + 3));
+        let token_start_is_line_start = line_start;
+        line_start = false;
+        if at_marker {
+            at += 3;
+            continue;
+        }
+        match c {
+            b'-' | b'?' if blank_or_end(bytes.get(at + 1)) => {
+                if !token_start_is_line_start {
+                    return false;
+                }
+                at += 1;
+            }
+            b'@' | b'`' => return false,
+            b'%' => return false,
+            b'\'' | b'"' => match skip_quoted(bytes, at) {
+                Some(end) => at = end,
+                None => return false,
+            },
+            b'[' | b'{' => match skip_flow_collection(bytes, at) {
+                Some(end) => at = end,
+                None => return false,
+            },
+            b']' | b'}' | b',' | b':' => at += 1,
+            b'|' | b'>' => {
+                at += 1;
+                while bytes
+                    .get(at)
+                    .is_some_and(|b| b.is_ascii_digit() || matches!(b, b'+' | b'-'))
+                {
+                    at += 1;
+                }
+                while bytes
+                    .get(at)
+                    .is_some_and(|b| matches!(b, b' ' | b'\t' | b'\r'))
+                {
+                    at += 1;
+                }
+                // The block's own lines follow: nothing more to scan.
+                return bytes.get(at).map_or(true, |b| matches!(b, b'\n' | b'#'));
+            }
+            b'&' | b'*' => {
+                let start = at + 1;
+                at = start;
+                while bytes
+                    .get(at)
+                    .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+                {
+                    at += 1;
+                }
+                if at == start
+                    || !(blank_or_end(bytes.get(at))
+                        || matches!(
+                            bytes[at],
+                            b'?' | b':' | b',' | b']' | b'}' | b'%' | b'@' | b'`'
+                        ))
+                {
+                    return false;
+                }
+            }
+            b'!' => {
+                while bytes.get(at).is_some_and(|b| {
+                    !matches!(
+                        b,
+                        b' ' | b'\t' | b'\r' | b'\n' | b',' | b'[' | b']' | b'{' | b'}'
+                    )
+                }) {
+                    at += 1;
+                }
+            }
+            _ => at = skip_plain_scalar(bytes, at),
+        }
+    }
+    true
+}
+
+fn blank_or_end(byte: Option<&u8>) -> bool {
+    byte.map_or(true, |b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+}
+
+/// The end of the quoted scalar that opens at `start`, which may run over lines; `None` if it never
+/// closes.
+fn skip_quoted(bytes: &[u8], start: usize) -> Option<usize> {
+    let quote = bytes[start];
+    let mut at = start + 1;
+    loop {
+        match bytes.get(at)? {
+            b'\\' if quote == b'"' => at += 2,
+            b'\'' if quote == b'\'' && bytes.get(at + 1) == Some(&b'\'') => at += 2,
+            &b if b == quote => return Some(at + 1),
+            _ => at += 1,
+        }
+    }
+}
+
+/// The end of the flow collection that opens at `start`, scanning what is inside it; `None` for a
+/// scanner error inside (an unterminated quote). One that never closes ends at the text's end.
+fn skip_flow_collection(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut at = start;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'[' | b'{' => {
+                depth += 1;
+                at += 1;
+            }
+            b']' | b'}' => {
+                depth -= 1;
+                at += 1;
+                if depth == 0 {
+                    return Some(at);
+                }
+            }
+            b'\'' | b'"' => at = skip_quoted(bytes, at)?,
+            b'@' | b'`' | b'%' => return None,
+            b'#' if at > 0 && matches!(bytes[at - 1], b' ' | b'\t' | b'\n') => {
+                while bytes.get(at).is_some_and(|&b| b != b'\n') {
+                    at += 1;
+                }
+            }
+            _ => at += 1,
+        }
+    }
+    Some(bytes.len())
+}
+
+/// The end of the plain scalar at `start`: up to ` #`, a `: ` or `:` at the end of a line, or a line
+/// that opens with a document marker; a later line continues it.
+fn skip_plain_scalar(bytes: &[u8], start: usize) -> usize {
+    let mut at = start;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'#' if at > start && matches!(bytes[at - 1], b' ' | b'\t') => return at,
+            b':' if blank_or_end(bytes.get(at + 1)) => return at,
+            b'\n' => {
+                let next = &bytes[at + 1..];
+                let marker = (next.starts_with(b"---") || next.starts_with(b"..."))
+                    && blank_or_end(next.get(3));
+                let rest_blank = next
+                    .iter()
+                    .take_while(|&&b| b != b'\n')
+                    .all(|b| matches!(b, b' ' | b'\t' | b'\r'));
+                if marker || rest_blank || next.first() == Some(&b'#') {
+                    return at;
+                }
+                at += 1;
+            }
+            _ => at += 1,
+        }
+    }
+    at
+}
+
+/// How many closing brackets [`flow_collection_prefix`] tries before it gives up.
+const FLOW_PREFIX_ATTEMPTS: usize = 512;
+
+/// The prefix of `text` that is its first complete flow collection (#7136): `[1-4];[5-8];9` is read by
+/// yq as `[1-4]`, since its decoder returns the first node of the document and never reads the rest.
+/// The first `]` or `}` that leaves a prefix the YAML reader accepts as one flow collection ends it;
+/// a closer inside a nested collection or a quoted string leaves a prefix that does not parse.
+fn flow_collection_prefix(text: &str) -> Option<&str> {
+    if !opens_with_flow_collection(text) {
+        return None;
+    }
+    let prefix = text
+        .match_indices([']', '}'])
+        .take(FLOW_PREFIX_ATTEMPTS)
+        .map(|(at, _)| &text[..=at])
+        .find(|prefix| {
+            YamlIndex::build_yq(prefix.as_bytes()).is_ok_and(|index| {
+                matches!(
+                    index.root(prefix.as_bytes()).value(),
+                    YamlValue::Sequence(documents)
+                        if documents.uncons_cursor().is_some_and(|(root, rest)| {
+                            rest.uncons_cursor().is_none()
+                                && matches!(root.value(), YamlValue::Mapping(_) | YamlValue::Sequence(_))
+                        })
+                )
+            })
+        })?;
+    token_after_the_first_node_scans(&text[prefix.len()..], false).then_some(prefix)
+}
+
 fn classify(text: &str, auto_parse: bool) -> Cell {
     if text.is_empty() {
         return Cell::Empty;
@@ -297,6 +565,20 @@ fn classify(text: &str, auto_parse: bool) -> Cell {
         };
     }
     let Ok(index) = YamlIndex::build_yq(norm.as_bytes()) else {
+        // #7136: yq decodes the first node and never reads what follows a complete flow collection.
+        if let Some(prefix) = flow_collection_prefix(&norm) {
+            return Cell::Collection(prefix.to_string());
+        }
+        // A later document the reader refuses (`1` / `...` / `2`) is never read by yq either: the
+        // first document is the cell, and a string one keeps the whole text.
+        let first = first_document(&norm);
+        if first.len() < norm.len() && token_after_the_first_node_scans(&norm[first.len()..], true)
+        {
+            return match classify(first, auto_parse) {
+                Cell::Str(_) => Cell::Str(text.to_string()),
+                other => other,
+            };
+        }
         return Cell::Str(text.to_string());
     };
     // The documents sit in a virtual root sequence; a snippet is one of them, and one that holds
@@ -305,6 +587,13 @@ fn classify(text: &str, auto_parse: bool) -> Cell {
         return Cell::Str(text.to_string());
     };
     let Some((root, rest)) = documents.uncons_cursor() else {
+        // Document markers and blanks only: yq's null, with no text.
+        if norm
+            .lines()
+            .all(|line| matches!(line.trim(), "" | "---" | "..."))
+        {
+            return Cell::Empty;
+        }
         // Nothing but comments, or nothing at all: a null, which keeps the text of the comment.
         return Cell::Scalar(yaml_trim(&norm).to_string());
     };
@@ -312,11 +601,28 @@ fn classify(text: &str, auto_parse: bool) -> Cell {
         // Blanks only: a null whose comment is the blanks, which yq writes behind its `# `.
         return Cell::Scalar(format!("# {norm}"));
     }
-    if rest.uncons_cursor().is_some() {
+    // #7136: yq decodes one document, so a later one is never read: the first one is the cell. A first
+    // document that is a string keeps the whole text, as below.
+    let later_documents = rest.uncons_cursor().is_some();
+    // What follows the first document must still scan, as it does after a flow collection.
+    let first = first_document(&norm);
+    if first.len() < norm.len() && !token_after_the_first_node_scans(&norm[first.len()..], true) {
         return Cell::Str(text.to_string());
     }
     match root.value() {
-        YamlValue::Mapping(_) | YamlValue::Sequence(_) => Cell::Collection(norm),
+        // A document that is null and written with a marker is yq's null with no text; a comment-only
+        // cell with no marker keeps the comment's text.
+        YamlValue::Null
+            if later_documents
+                || norm.lines().any(|line| {
+                    matches!(line.trim_end(), "---" | "...") || line.starts_with("--- #")
+                }) =>
+        {
+            Cell::Empty
+        }
+        YamlValue::Mapping(_) | YamlValue::Sequence(_) => {
+            Cell::Collection(first_document(&norm).to_string())
+        }
         YamlValue::Null => Cell::Scalar(yaml_trim(&norm).to_string()),
         YamlValue::String(s) => {
             let explicit = root.explicit_tag();
