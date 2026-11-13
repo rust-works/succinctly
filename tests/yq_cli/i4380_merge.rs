@@ -95,7 +95,7 @@ fn merging_three_documents_keeps_the_comments_of_each_4380() -> Result<()> {
             Ok(path)
         })
         .collect::<Result<_>>()?;
-    let refs: Vec<&std::path::Path> = paths.iter().map(|p| p.as_path()).collect();
+    let refs: Vec<&std::path::Path> = paths.iter().map(std::path::PathBuf::as_path).collect();
     let (stdout, stderr, status) = run_yq_files(
         ". as $item ireduce ({}; . * $item )",
         &refs,

@@ -1628,7 +1628,7 @@ fn assigned_comments(left: &NodeMeta, right: &NodeMeta) -> NodeMeta {
     };
     let mut meta = left.with_head_foot_of(head_from.head_comment().to_vec(), foot, head_from);
     if right.comment.as_deref().is_some_and(|c| !c.is_empty()) {
-        meta.comment = right.comment.clone();
+        meta.comment.clone_from(&right.comment);
     }
     meta
 }
@@ -1644,7 +1644,7 @@ fn with_assigned_comments(mut tree: CommentTree, left: &NodeMeta, right: &NodeMe
         &assigned,
     );
     let mut meta = meta;
-    meta.comment = assigned.comment.clone();
+    meta.comment.clone_from(&assigned.comment);
     *tree.meta_mut() = meta;
     tree
 }
