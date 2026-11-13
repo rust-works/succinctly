@@ -11540,7 +11540,7 @@ fn windowed_pipe(file: std::fs::File, min: u64) -> Option<WindowedSource> {
         front,
         error,
         window::WINDOW_BYTES,
-        std::rc::Rc::clone(&seen),
+        seen.clone(),
     );
     Some((
         Vec::new(),
