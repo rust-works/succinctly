@@ -169,3 +169,122 @@ fn a_bom_at_the_front_and_text_that_is_not_utf8_read_as_the_files_joined_7024() 
     same(&[".s // empty"], &files)?;
     Ok(())
 }
+
+/// What changes at the paths of a long list while the run is in its first file.
+#[derive(Clone, Copy, Debug)]
+enum Change {
+    /// File 20 removed: the tail of file 19 continues in file 21.
+    MiddleGone,
+    /// File 20 replaced by a directory, which jq reports as `Is a directory`.
+    MiddleDirectory,
+    /// File 21 replaced by another file, which is read as it now is.
+    MiddleReplaced,
+    /// The last file removed, with a number open at the end of the file before it.
+    LastGone,
+    /// File 30 removed, after a fault in file 20 that ends the run first.
+    GoneAfterAFault,
+}
+
+/// 40 files, the first big enough that the run is still in it when its output fills the pipe; the
+/// change is made while the run waits to write, and the run is then drained. The answer is what the
+/// files give afterwards on the route that reads them whole, which a missing path or a directory
+/// sends a run to: the run met each change when its reader got there, as jq's does.
+fn changed_while_running(change: Change, args: &[&str]) -> Result<(Run, Run)> {
+    use std::io::Read;
+    let dir = tempfile::tempdir()?;
+    let paths: Vec<std::path::PathBuf> = (0..FILES)
+        .map(|n| dir.path().join(format!("f{n:02}.json")))
+        .collect();
+    for (n, path) in paths.iter().enumerate() {
+        let bytes = match n {
+            0 => text(80_000),
+            19 => b"{\"k\":19}\n12".to_vec(),
+            20 if matches!(change, Change::GoneAfterAFault) => b"{\"k\":20} }\n".to_vec(),
+            21 => b"34\n{\"k\":21}\n".to_vec(),
+            38 => b"{\"k\":38}\n77".to_vec(),
+            n => format!("{{\"k\":{n}}}\n").into_bytes(),
+        };
+        std::fs::write(path, bytes)?;
+    }
+    let bin = env!("CARGO_BIN_EXE_succinctly");
+    let mut child = Command::new(bin)
+        .arg("jq")
+        .args(args)
+        .args(&paths)
+        .env("LC_ALL", "C")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let mut stdout = child.stdout.take().expect("piped");
+    let mut first = vec![0u8; 4096];
+    stdout.read_exact(&mut first)?;
+    match change {
+        Change::MiddleGone => std::fs::remove_file(&paths[20])?,
+        Change::MiddleDirectory => {
+            std::fs::remove_file(&paths[20])?;
+            std::fs::create_dir(&paths[20])?;
+        }
+        Change::MiddleReplaced => {
+            let other = dir.path().join("other.json");
+            std::fs::write(&other, b"56\n{\"new\":21}\n")?;
+            std::fs::rename(&other, &paths[21])?;
+        }
+        Change::LastGone => std::fs::remove_file(&paths[FILES - 1])?,
+        Change::GoneAfterAFault => std::fs::remove_file(&paths[30])?,
+    }
+    let mut rest = Vec::new();
+    stdout.read_to_end(&mut rest)?;
+    let mut stderr = Vec::new();
+    child
+        .stderr
+        .take()
+        .expect("piped")
+        .read_to_end(&mut stderr)?;
+    let status = child.wait()?;
+    first.extend(rest);
+    let windowed = (
+        String::from_utf8_lossy(&first).into_owned(),
+        String::from_utf8_lossy(&stderr).into_owned(),
+        status.code().unwrap_or(-1),
+    );
+    let whole = Command::new(bin)
+        .arg("jq")
+        .args(args)
+        .args(&paths)
+        .env("LC_ALL", "C")
+        .output()?;
+    let whole = (
+        String::from_utf8_lossy(&whole.stdout).into_owned(),
+        String::from_utf8_lossy(&whole.stderr).into_owned(),
+        whole.status.code().unwrap_or(-1),
+    );
+    Ok((windowed, whole))
+}
+
+#[test]
+fn a_path_that_changes_before_the_run_reaches_it_is_read_as_jq_reads_it_7024() -> Result<()> {
+    for change in [
+        Change::MiddleGone,
+        Change::MiddleDirectory,
+        Change::MiddleReplaced,
+        Change::LastGone,
+        Change::GoneAfterAFault,
+    ] {
+        for args in [&["-c", "."][..], &["-c", "[input_filename, .]"]] {
+            let (windowed, whole) = changed_while_running(change, args)?;
+            assert_eq!(windowed, whole, "{change:?} {args:?}");
+        }
+    }
+    // The cases say what they are meant to: a file that did not open is reported, and the run
+    // ends after the value the tail before it makes.
+    let (run, _) = changed_while_running(Change::MiddleGone, &["-c", "."])?;
+    assert!(run.1.contains("Could not open file"), "{}", run.1);
+    assert_eq!((run.0.lines().last(), run.2), (Some("1234"), 2));
+    let (run, _) = changed_while_running(Change::GoneAfterAFault, &["-c", "."])?;
+    assert!(
+        !run.1.contains("Could not open"),
+        "the reader stops at the fault: {}",
+        run.1
+    );
+    Ok(())
+}

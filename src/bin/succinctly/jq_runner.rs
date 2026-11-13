@@ -5243,7 +5243,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         // empty buffer for each file and is handed their windows.
         let mut windowed: Option<window::WindowedFiles> = None;
         let mut reread: Option<std::rc::Rc<window::Reread>> = None;
-        let (files, mut raw_inputs, failures) = match seq_plain.take() {
+        let (files, mut raw_inputs, mut failures) = match seq_plain.take() {
             Some(prepared) => prepared,
             None => match seq_windowed.take().or_else(|| windowed_plain_file(&args)) {
                 Some((files, reader, again)) => {
@@ -5267,7 +5267,10 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         // A slurp reads every file in the one fetch that meets the first failure, so it
         // reports them all up front and cuts nothing. Otherwise jq reports a file when its
         // reader gets there, which the loop below does too (#5472).
-        let stop_at = failures.first().map(|(at, _)| *at).filter(|_| !args.slurp);
+        let mut stop_at = failures.first().map(|(at, _)| *at).filter(|_| !args.slurp);
+        // #7024: the files of a long list that did not open when the windowed reader reached them,
+        // until the run is past them.
+        let mut noted: Vec<(usize, InputFileOpenError)> = Vec::new();
         if args.slurp {
             report_open_failures(
                 open_failures_reached(&failures, &raw_inputs, &args, false),
@@ -5433,7 +5436,9 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             // breaks and `window_substituted` come with it.
             let (idx, raw, window_split, lines_before, window_substituted, window_place) =
                 match windowed.as_mut() {
-                    Some(reader) => match reader.next_window() {
+                    Some(reader) => match reader.next_window_noting(&mut |at, failure| {
+                        noted.push((at, failure));
+                    }) {
                         Ok(Some((idx, next))) => (
                             idx,
                             next.raw,
@@ -5454,6 +5459,26 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                         None => break,
                     },
                 };
+            // #7024: a file of a long list that did not open when the windowed reader reached it is
+            // one jq's reader meets once the run is past it, as a file the whole-file route could not
+            // open is: up to this window's file, and, for a window that ends in a fault, only before
+            // the file the fault lies in, since the reader read on for the document's end and jq's
+            // stops at the fault. Once met, it is reported below and the run ends after the next
+            // value (`stop_at`).
+            if !noted.is_empty() {
+                let fault_at = match (&window_split, &reread) {
+                    (Some((_, Some(_))), Some(reread)) => reread.fault_source(),
+                    _ => None,
+                };
+                let met = noted
+                    .iter()
+                    .take_while(|(at, _)| *at <= idx && fault_at.is_none_or(|fault| *at < fault))
+                    .count();
+                for (at, failure) in noted.drain(..met) {
+                    stop_at.get_or_insert(at);
+                    failures.push((at, failure));
+                }
+            }
             // The files that would not open before this one, reported now: jq's reader meets
             // them as it moves on to this file (#5472).
             while let Some((_, e)) = failures.get(next_failure).filter(|(at, _)| *at <= idx) {
@@ -5945,6 +5970,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         // Past the last file that opened: the ones that would not open after it, which jq's
         // reader meets when it asks for more and finds none -- unless the run had stopped.
         if !run_stopped {
+            failures.append(&mut noted);
             report_open_failures(&failures[next_failure..], &mut open_failed);
         }
         // #6004: the fault a slurped stream ended in, after the array it holds.
@@ -11474,14 +11500,14 @@ fn windowed_regular_files(
     };
     if files.len() > MAX_WINDOWED_FILES {
         // Each file is closed once judged, so the descriptors held stay a few.
-        let named = files
-            .iter()
-            .map(|path| judge(path).map(|(_, meta)| window::NamedFile::judged(path.clone(), &meta)))
-            .collect::<Option<Vec<_>>>()?;
-        let reread = window::Reread::new_named(&named);
+        let mut named = Vec::with_capacity(files.len());
+        for path in files {
+            judge(path)?;
+            named.push(std::rc::Rc::new(window::NamedFile::new(path.clone())));
+        }
         return Some((
-            window::WindowedFiles::named(named, window::WINDOW_BYTES),
-            std::rc::Rc::new(reread),
+            window::WindowedFiles::named(&named, window::WINDOW_BYTES),
+            std::rc::Rc::new(window::Reread::new_named(&named)),
         ));
     }
     let mut opened = Vec::with_capacity(files.len());
