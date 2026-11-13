@@ -124,6 +124,22 @@ const ROWS: &[(&str, &str, &str)] = &[
         "(.a // (.a = 0) // .y // .z) += 1",
         "b: 1\na: 1\n",
     ),
+    // #7094: a binding over several values in `with` writes each value in turn.
+    (
+        "k: {x: [1, 2], e: [], s: 5} # c\n",
+        "with(.k; .x[] as $v | .y = $v)",
+        "k: {x: [1, 2], e: [], s: 5, y: 2} # c\n",
+    ),
+    (
+        "k: {x: [1, 2], e: [], s: 5} # c\n",
+        "with(.k; (.x[] as $v | .y += $v) | .z = 2)",
+        "k: {x: [1, 2], e: [], s: 5, y: 3, z: 2} # c\n",
+    ),
+    (
+        "k: {x: [1, 2], e: [], s: 5} # c\n",
+        "with(.k; .x[] as $v | .y = $v, .w = 1)",
+        "k: {x: [1, 2], e: [], s: 5, y: 2, w: 1} # c\n",
+    ),
 ];
 
 /// The write leaves the left operand falsy, so the target is the document, and adding `1` to a
@@ -139,9 +155,9 @@ const ERROR_ROWS: &[(&str, &str)] = &[
 /// Recorded divergences (`docs/compliance/yq/limitations.md`): a target whose last operand does not
 /// write does not create the left operand (yq leaves `a: null`), in value position the write is not
 /// seen by the left operand, a comma behind a binding in the last operand targets the left node
-/// once (twice in yq), so does a binding over several values there, a write that makes the document
-/// `null` is not followed to the next operand, and `with`'s binding over several values keeps the first
-/// value's writes (yq keeps each value's). (input, filter, succinctly's stdout; yq's is in the comment.)
+/// once (twice in yq), so does a binding over several values there (which writes each value since
+/// #7094), and a write that makes the document `null` is not followed to the next operand. (input,
+/// filter, succinctly's stdout; yq's is in the comment.)
 const RESIDUAL_ROWS: &[(&str, &str, &str)] = &[
     // yq: "b: camel\na: null\nz: 1\n"
     ("b: camel\n", "(.a // .z) += 1", "b: camel\nz: 1\n"),
@@ -163,25 +179,7 @@ const RESIDUAL_ROWS: &[(&str, &str, &str)] = &[
     (
         "b: 1\nx: [1, 2]\n",
         "(.a // (.x[] as $v | .a = $v)) += 10",
-        "b: 1\nx: [1, 2]\na: 11\n",
-    ),
-    // yq: "k: {x: [1, 2], e: [], s: 5, y: 2} # c\n"
-    (
-        "k: {x: [1, 2], e: [], s: 5} # c\n",
-        "with(.k; .x[] as $v | .y = $v)",
-        "k: {x: [1, 2], e: [], s: 5, y: 1} # c\n",
-    ),
-    // yq: "k: {x: [1, 2], e: [], s: 5, y: 3, z: 2} # c\n"
-    (
-        "k: {x: [1, 2], e: [], s: 5} # c\n",
-        "with(.k; (.x[] as $v | .y += $v) | .z = 2)",
-        "k: {x: [1, 2], e: [], s: 5, y: 1, z: 2} # c\n",
-    ),
-    // yq: "k: {x: [1, 2], e: [], s: 5, y: 2, w: 1} # c\n"
-    (
-        "k: {x: [1, 2], e: [], s: 5} # c\n",
-        "with(.k; .x[] as $v | .y = $v, .w = 1)",
-        "k: {x: [1, 2], e: [], s: 5, y: 1, w: 1} # c\n",
+        "b: 1\nx: [1, 2]\na: 12\n",
     ),
 ];
 
