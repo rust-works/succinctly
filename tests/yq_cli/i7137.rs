@@ -289,3 +289,33 @@ fn eval_all_assignment_targets_noop_multiple_and_nested_7137() -> Result<()> {
     }
     Ok(())
 }
+
+/// A right side that raises for a document with a target ends the run with its message, and so does
+/// a left side that cannot be walked (`.a[-5]` over a two-element array); nothing is printed.
+#[test]
+fn eval_all_assignment_errors_end_the_run_7137() -> Result<()> {
+    for (filter, message) in [
+        (r#".k = error("x")"#, "Error: x"),
+        (r#".k += error("x")"#, "Error: x"),
+        (r#".k = (.b | error("y"))"#, "Error: y"),
+        (
+            ".a[-5] = fi",
+            "Error: index [-5] out of range, array size is 2",
+        ),
+        (
+            ".a[-5] += fi",
+            "Error: index [-5] out of range, array size is 2",
+        ),
+    ] {
+        let dir = TempDir::new()?;
+        let paths = files(&dir, "multi")?;
+        let refs: Vec<&std::path::Path> = paths.iter().map(std::path::PathBuf::as_path).collect();
+        let (stdout, stderr, status) = run_yq_files(filter, &refs, &["ea", "-o=json", "-I=0"])?;
+        assert_eq!(
+            (stdout.as_str(), stderr.lines().next().unwrap_or(""), status),
+            ("", message, 1),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
