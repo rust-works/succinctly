@@ -1441,6 +1441,8 @@ pub(super) struct OpenWhenRead {
     file: Option<File>,
     /// The file did not open: it reads as no bytes.
     failed: bool,
+    /// Where the stream starts in the file once it is open: past a byte-order mark jq skips.
+    start: u64,
 }
 
 impl OpenWhenRead {
@@ -1451,7 +1453,14 @@ impl OpenWhenRead {
             last,
             file: None,
             failed: false,
+            start: 0,
         }
+    }
+
+    /// The same, reading from byte `start` of the file (#7197).
+    pub(super) fn from_byte(mut self, start: u64) -> Self {
+        self.start = start;
+        self
     }
 }
 
@@ -1462,8 +1471,13 @@ impl Read for OpenWhenRead {
         }
         let file = match self.file.as_mut() {
             Some(file) => file,
-            None => match open_not_a_directory(&self.path) {
-                Ok((file, _)) => self.file.insert(file),
+            None => match open_not_a_directory(&self.path).and_then(|(mut file, _)| {
+                if self.start > 0 {
+                    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(self.start))?;
+                }
+                Ok(file)
+            }) {
+                Ok(file) => self.file.insert(file),
                 Err(error) => {
                     self.failed = true;
                     super::note_raw_open_failure(&self.path, self.at, &error, self.last);
