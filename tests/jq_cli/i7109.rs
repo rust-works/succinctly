@@ -52,10 +52,7 @@ fn a_slice_plus_a_closed_operand_as_a_fold_update_matches_jq() -> Result<()> {
             r#""abcdef" | reduce range(3) as $i (.; .[1:] + "x")"#,
             r#""defxxx""#,
         ),
-        (
-            r"null | reduce range(3) as $i (.; .[1:] + [$i])",
-            r"[2]",
-        ),
+        (r"null | reduce range(3) as $i (.; .[1:] + [$i])", r"[2]"),
         (
             r"{} | try (reduce range(2) as $i (.; .[1:] + [$i])) catch .",
             r#""Cannot index object with object""#,
@@ -72,10 +69,7 @@ fn a_slice_plus_a_closed_operand_as_a_fold_update_matches_jq() -> Result<()> {
             r"[1,2,3] | reduce range(3) as $i (.; .[1:] + [$i + 1])",
             r"[1,2,3]",
         ),
-        (
-            r"[1,2,3] | [.[1:] + [4], .[2:] + [5]]",
-            r"[[2,3,4],[3,5]]",
-        ),
+        (r"[1,2,3] | [.[1:] + [4], .[2:] + [5]]", r"[[2,3,4],[3,5]]"),
         (
             r"[range(5)] | reduce range(3) as $i (.; (.[1:]) + [$i])",
             r"[3,4,0,1,2]",
