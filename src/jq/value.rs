@@ -2276,158 +2276,12 @@ pub trait Teardown: Sized {
     }
 }
 
-/// The copy-on-write bookkeeping [`ObjectMapOf`] and [`ArrayOf`] share,
-/// generated once so the two wrappers cannot drift apart in the part that
-/// matters: `new`/`with_capacity`, `is_shared`, the by-value unwrap (move
-/// when unique, clone-and-record when shared), and the traits whose body is
-/// the same for any wrapped container -- `Default`, `Clone` (a refcount
-/// bump), `PartialEq`, a transparent `Debug`, `Deref`, `DerefMut` (the
-/// copy-on-write point, `Rc::make_mut`) and `From<target>`. Everything whose
-/// shape depends on the container -- iteration, `Extend`, `FromIterator` --
-/// stays written out per wrapper below.
-macro_rules! shared_container {
-    (
-        $wrapper:ident, $inner:ident, target = $target:ty,
-        into = $into:ident, on_write = $on_write:ident, on_unwrap = $on_unwrap:ident,
-    ) => {
-        impl<V: Teardown> $wrapper<V> {
-            /// An empty container.
-            #[inline]
-            pub fn new() -> Self {
-                Self::from(<$target>::new())
-            }
-
-            /// An empty container with room for `capacity` entries.
-            #[inline]
-            pub fn with_capacity(capacity: usize) -> Self {
-                Self::from(<$target>::with_capacity(capacity))
-            }
-
-            /// Whether `self` and `other` are two handles on the *same*
-            /// storage -- the pointer identity real jq's `jv_identical`
-            /// has for arrays and objects, which the embed table (#2889)
-            /// reads to recognize a container that is still some document
-            /// node's own unmodified value.
-            ///
-            /// Sound as an identity test precisely because a write through
-            /// either handle copies first ([`DerefMut`], `Rc::make_mut`):
-            /// while the answer is `true`, neither handle has been written
-            /// through since they were split.
-            #[inline]
-            pub fn ptr_eq(&self, other: &Self) -> bool {
-                Rc::ptr_eq(&self.0, &other.0)
-            }
-
-            /// Whether another handle currently shares this storage, i.e.
-            /// whether the next write through this handle will copy it.
-            #[inline]
-            pub fn is_shared(&self) -> bool {
-                Rc::strong_count(&self.0) > 1
-            }
-        }
-
-        impl<V: Teardown + Clone> $wrapper<V> {
-            /// Consume the wrapper, yielding the container it wraps -- by move
-            /// when this handle was the last one, by copy otherwise.
-            #[inline]
-            #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
-            pub fn $into(mut self) -> $target {
-                match Rc::get_mut(&mut self.0) {
-                    Some(inner) => core::mem::take(inner),
-                    None => {
-                        note_forced_copy!($on_unwrap);
-                        (**self.0).clone()
-                    }
-                }
-            }
-        }
-
-        // Hand-written rather than derived: a derive would put a `V: Default`
-        // / `V: Clone` bound on the *container*, but an empty or cloned one
-        // needs nothing of its value type beyond what the clone itself needs.
-        // `OwnedValue` has no `Default` at all, so `#[derive(Default)]` would
-        // not even compile here.
-        impl<V: Teardown> Default for $wrapper<V> {
-            #[inline]
-            fn default() -> Self {
-                Self::new()
-            }
-        }
-
-        /// A refcount bump: the copy is deferred to the first write through
-        /// either handle.
-        impl<V: Teardown + Clone> Clone for $wrapper<V> {
-            #[inline]
-            fn clone(&self) -> Self {
-                Self(self.0.clone())
-            }
-        }
-
-        impl<V: Teardown + PartialEq> PartialEq for $wrapper<V> {
-            #[inline]
-            fn eq(&self, other: &Self) -> bool {
-                **self == **other
-            }
-        }
-
-        /// Transparent, so `{:?}` on an `OwnedValue` prints the bare
-        /// container exactly as it did before the wrapper existed. A derived
-        /// `Debug` would print the wrapper's name -- a cosmetic but real
-        /// change to what a downstream `println!("{:?}", value)` shows, for a
-        /// type whose whole purpose is to be invisible.
-        impl<V: Teardown + core::fmt::Debug> core::fmt::Debug for $wrapper<V> {
-            #[inline]
-            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-                core::fmt::Debug::fmt(&**self, f)
-            }
-        }
-
-        impl<V: Teardown> Deref for $wrapper<V> {
-            type Target = $target;
-
-            #[inline]
-            fn deref(&self) -> &Self::Target {
-                &self.0
-            }
-        }
-
-        /// The copy-on-write point: a shared container is cloned here, once,
-        /// before the caller's write reaches it. `V: Clone` is what
-        /// `Rc::make_mut` needs and is the only bound the sharing adds
-        /// anywhere.
-        impl<V: Teardown + Clone> DerefMut for $wrapper<V> {
-            #[inline]
-            #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
-            fn deref_mut(&mut self) -> &mut Self::Target {
-                if Rc::strong_count(&self.0) > 1 {
-                    note_forced_copy!($on_write);
-                }
-                Rc::make_mut(&mut self.0)
-            }
-        }
-
-        impl<V: Teardown> From<$target> for $wrapper<V> {
-            #[inline]
-            fn from(inner: $target) -> Self {
-                Self(ManuallyDrop::new(Rc::new(inner)))
-            }
-        }
-
-        impl<V: Teardown + Clone> From<$wrapper<V>> for $target {
-            #[inline]
-            #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
-            fn from(wrapper: $wrapper<V>) -> Self {
-                wrapper.$into()
-            }
-        }
-    };
-}
-
 /// [`OwnedValue::Object`]'s backing store: [`ObjectMapOf`] over `OwnedValue`.
 pub type ObjectMap = ObjectMapOf<OwnedValue>;
 
-/// The backing store for an array-valued enum arm: a `Vec<V>` held behind a
-/// single refcounted pointer (#2999), the array twin of [`ObjectMapOf`].
+/// The backing store for an array-valued enum arm: a window over a `Vec<V>`
+/// held behind a single refcounted pointer (#2999, #6659), the array twin of
+/// [`ObjectMapOf`].
 ///
 /// Before #2999 `OwnedValue::Array` held its `Vec` inline (24 bytes, never
 /// the widest arm, so no width was at stake). Sharing is the entire reason
@@ -2438,17 +2292,44 @@ pub type ObjectMap = ObjectMapOf<OwnedValue>;
 /// the one `Vec` -- 32 bytes per element, and for nested containers a
 /// refcount bump each, never their contents.
 ///
+/// **A window, as jq's `jv` is (#6659, ADR-0029).** The handle names the
+/// elements `start..start + len` of the shared `Vec`, so a slice `.[a:b]` is a
+/// refcount bump ([`slice`](Self::slice)), not a copy of the range. Before
+/// this, a loop peeling one element per step (`def f: .[1:] | f`, `while`,
+/// `recurse`) copied the tail on every step and ran in quadratic time and
+/// memory where jq is linear. jq's `jv` carries the same `offset`/`size`
+/// pair, and [`slice`](Self::slice) follows `jvp_array_slice`'s rules
+/// exactly, because [`ptr_eq`](Self::ptr_eq) is `jv_identical` and the embed
+/// table and the resolver read it.
+///
 /// The cost is one extra allocation (the `Rc` header plus the `Vec` header)
 /// and one pointer chase per array, including an empty `[]` that used to be
 /// free on the heap. Arrays of many small arrays are where that shows;
-/// #2999's measurements put a number on it.
+/// #2999's measurements put a number on it. The window adds two words to the
+/// handle (24 bytes, the width of `OwnedValue::String`'s payload, so
+/// `OwnedValue` stays 32) and nothing to the heap.
 ///
-/// Same transparency contract as [`ObjectMapOf`]: [`Deref`] to the `Vec`,
-/// [`DerefMut`] as the copy-on-write point, all three [`IntoIterator`]
-/// forms, [`From`]/[`FromIterator`]/[`Extend`], and a `Debug` that prints the
-/// bare `Vec`. Only *construction* from a bare `Vec` needs `.into()` (or
-/// [`OwnedValue::array_from`]).
-pub struct ArrayOf<V: Teardown>(ArrayInnerOf<V>);
+/// Same transparency contract as [`ObjectMapOf`] for reads: [`Deref`] to the
+/// window's elements (a `[V]`), all three [`IntoIterator`] forms,
+/// [`From`]/[`FromIterator`]/[`Extend`], and a `Debug` that prints the bare
+/// elements. A write that keeps the length writes through [`DerefMut`] (a
+/// `&mut [V]`); one that grows, shrinks or reorders the `Vec` itself goes
+/// through [`make_vec`](Self::make_vec). Only *construction* from a bare
+/// `Vec` needs `.into()` (or [`OwnedValue::array_from`]).
+pub struct ArrayOf<V: Teardown> {
+    inner: ArrayInnerOf<V>,
+    /// Index in `inner` of the window's first element.
+    start: usize,
+    /// How many elements the window holds.
+    ///
+    /// Invariant, on which [`Deref`]'s unchecked slice relies:
+    /// `start + len <= inner.len()`. Everything that changes `inner`'s
+    /// length zeroes the window first and sets it again after, so neither a
+    /// destructor that panics part-way through a `truncate` or `drain` nor a
+    /// [`make_vec`](Self::make_vec) guard leaked with `mem::forget` can
+    /// leave a dangling window: at worst an empty one.
+    len: usize,
+}
 
 /// [`OwnedValue::Array`]'s backing store: [`ArrayOf`] over `OwnedValue`.
 /// (Unrelated to the `arrayvec` crate.)
@@ -2460,28 +2341,363 @@ pub type ArrayVec = ArrayOf<OwnedValue>;
 /// level of `drop_depth`'s count (#5868).
 type ArrayInnerOf<V> = ManuallyDrop<Rc<Vec<V>>>;
 
-shared_container! {
-    ArrayOf, ArrayInnerOf, target = Vec<V>,
-    into = into_vec, on_write = ArrayMakeMut, on_unwrap = ArrayUnwrap,
+/// The offset at which jq stops making a slice a view: `jv.offset` is 16
+/// bits, so `jvp_array_slice` copies a range starting this many elements or
+/// more into its array's storage into a new array (#5103). A copy is a fresh
+/// node to `jv_identical`, which is why [`ArrayOf::slice`] copies here too.
+pub(crate) const JQ_SLICE_OFFSET_LIMIT: usize = 1 << 16;
+
+/// The bounds check [`ArrayOf::slice`] and [`ArrayOf::cut`] make before
+/// building a window that [`Deref`] reads unchecked: a hard `assert!`, so a
+/// bad range panics in every build rather than reading past the `Vec`.
+#[inline]
+#[track_caller]
+fn assert_window_range(range: &core::ops::Range<usize>, len: usize) {
+    assert!(
+        range.start <= range.end && range.end <= len,
+        "array window range {range:?} out of bounds for length {len}"
+    );
 }
 
 impl<V: Teardown> ArrayOf<V> {
-    /// The elements, if this handle owns them alone.
+    /// An empty array.
     #[inline]
-    fn unique_vec(&mut self) -> Option<&mut Vec<V>> {
-        Rc::get_mut(&mut self.0)
+    pub fn new() -> Self {
+        Self::from(Vec::new())
+    }
+
+    /// An empty array with room for `capacity` elements.
+    #[inline]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self::from(Vec::with_capacity(capacity))
+    }
+
+    /// Whether `self` and `other` are two handles on the *same* node --
+    /// real jq's `jv_identical` for arrays, which compares the storage
+    /// pointer, the offset and the size. The embed table (#2889) reads it to
+    /// recognize a container that is still some document node's own
+    /// unmodified value, and `jq_identical` short-circuits `==` on it.
+    ///
+    /// Two windows on one `Vec` are the same node only when they name the
+    /// same range: `.[0:2]` taken twice is one node, as in jq, and `.[1:]`
+    /// is not the array it was cut from.
+    ///
+    /// Sound as an identity test precisely because a write through either
+    /// handle copies first ([`DerefMut`], [`make_vec`](Self::make_vec)):
+    /// while the answer is `true`, neither handle has been written through
+    /// since they were split.
+    #[inline]
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.inner, &other.inner) && self.start == other.start && self.len == other.len
+    }
+
+    /// Whether another handle currently shares this storage, i.e. whether
+    /// the next write through this handle will copy it.
+    #[inline]
+    pub fn is_shared(&self) -> bool {
+        Rc::strong_count(&self.inner) > 1
+    }
+
+    /// The `Vec` and the window, if this handle owns the storage alone.
+    #[inline]
+    fn unique_parts(&mut self) -> Option<(&mut Vec<V>, &mut usize, &mut usize)> {
+        let Self { inner, start, len } = self;
+        Rc::get_mut(inner).map(|vec| (vec, start, len))
     }
 
     /// [`Teardown::detach`] every element, if this handle owns them alone,
     /// then drop what is left (scalars and empty containers, none of which
-    /// recurses), so the array's own `Drop` finds it empty.
+    /// recurses), so the array's own `Drop` finds it empty. Elements outside
+    /// the window are this storage's too, and are taken apart with the rest.
     fn detach_into(&mut self, work: &mut Vec<V>) {
-        if let Some(vec) = self.unique_vec() {
+        if let Some((vec, start, len)) = self.unique_parts() {
+            // Zeroed first: a child's release can run a destructor.
+            *start = 0;
+            *len = 0;
             for child in vec.iter_mut() {
                 child.detach(work);
             }
             vec.clear();
         }
+    }
+}
+
+impl<V: Teardown + Clone> ArrayOf<V> {
+    /// The elements `range` of this window (positions relative to the
+    /// window, already resolved and clamped by the caller), as jq's
+    /// `jvp_array_slice` makes them:
+    ///
+    /// - an empty range is a fresh `[]`, never a view (`jv_array()`);
+    /// - the whole window is this array itself, the same node;
+    /// - a range starting 65,536 (`JQ_SLICE_OFFSET_LIMIT`) or more elements into
+    ///   the storage is copied into a new array, a fresh node;
+    /// - any other range is a view on the same storage: a refcount bump.
+    ///
+    /// The elements are shared either way; only the copy's spine is new.
+    #[must_use]
+    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
+    pub fn slice(&self, range: core::ops::Range<usize>) -> Self {
+        // A hard check: the window this builds is read unchecked.
+        assert_window_range(&range, self.len);
+        if range.start == range.end {
+            return Self::new();
+        }
+        if range.start == 0 && range.end == self.len {
+            return self.clone();
+        }
+        let start = self.start + range.start;
+        if start >= JQ_SLICE_OFFSET_LIMIT {
+            return Self::from(self[range].to_vec());
+        }
+        Self {
+            inner: ManuallyDrop::new(Rc::clone(&self.inner)),
+            start,
+            len: range.end - range.start,
+        }
+    }
+
+    /// Narrow this array to `range` of its window in place: the fold step's
+    /// cut (#5274). A handle that owns its storage alone moves its window
+    /// and drops the cut-off tail at once, without copying a kept element,
+    /// as `jvp_array_slice` moves an offset; once the offset would reach
+    /// 65,536 (`JQ_SLICE_OFFSET_LIMIT`), where jq copies the range into a new array,
+    /// the cut-off head is compacted away instead and the offset starts again
+    /// from 0, as the copy's does. A loop that peels one element per step
+    /// therefore moves each element at most once per 65,536 cuts, and keeps
+    /// fewer than 65,536 cut-off elements alive. A shared handle takes
+    /// [`slice`](Self::slice) instead.
+    ///
+    /// # Panics
+    ///
+    /// If `range` is not within the window (`start <= end <= len`).
+    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
+    pub fn cut(&mut self, range: core::ops::Range<usize>) {
+        assert_window_range(&range, self.len);
+        if range.start == range.end {
+            *self = Self::new();
+            return;
+        }
+        let Some((vec, start, len)) = self.unique_parts() else {
+            *self = self.slice(range);
+            return;
+        };
+        let new_start = *start + range.start;
+        let new_len = range.end - range.start;
+        // Zeroed while elements are dropped (see `len`'s invariant).
+        *start = 0;
+        *len = 0;
+        vec.truncate(new_start + new_len);
+        if new_start >= JQ_SLICE_OFFSET_LIMIT {
+            vec.drain(..new_start);
+            if vec.capacity() > 2 * vec.len() + 16 {
+                vec.shrink_to_fit();
+            }
+        } else {
+            *start = new_start;
+        }
+        *len = new_len;
+    }
+
+    /// Append `value` to the window, in place when this handle owns its
+    /// storage alone: the window keeps its offset and grows by one, as
+    /// `jvp_array_write` appends to an unshared view. Anything past the
+    /// window in a unique `Vec` is dropped first; a shared window is copied
+    /// out as [`make_vec`](Self::make_vec) would.
+    #[inline]
+    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
+    pub fn push(&mut self, value: V) {
+        self.extend(core::iter::once(value));
+    }
+
+    /// The `Vec` itself, for a write that changes the array's length or
+    /// order (`push`, `truncate`, `splice`, `retain`, ...). A shared handle
+    /// copies its window into storage of its own first (the copy-on-write
+    /// point, recorded like [`DerefMut`]'s); a unique one compacts its
+    /// window to the whole `Vec` in place. The returned guard writes the
+    /// `Vec`'s new length back into the window when it drops.
+    #[inline]
+    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
+    pub fn make_vec(&mut self) -> ArrayVecMut<'_, V> {
+        self.own_storage();
+        let Self { inner, start, len } = self;
+        let vec = Rc::get_mut(inner).expect("own_storage leaves this handle unique");
+        let window = *start..*start + *len;
+        // Zeroed before any element is dropped, and while the `Vec` is lent
+        // out (see `len`'s invariant).
+        *start = 0;
+        *len = 0;
+        if window.start > 0 || window.end < vec.len() {
+            vec.truncate(window.end);
+            vec.drain(..window.start);
+        }
+        ArrayVecMut { vec, len }
+    }
+
+    /// Make this handle the only one on its storage, copying its window out
+    /// of a shared `Vec` (and nothing outside it) if another handle shares
+    /// it.
+    #[inline]
+    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
+    fn own_storage(&mut self) {
+        if Rc::strong_count(&self.inner) > 1 {
+            note_forced_copy!(ArrayMakeMut);
+            *self = Self::from(self[..].to_vec());
+        }
+    }
+
+    /// Consume the wrapper, yielding the window's elements as a `Vec` -- by
+    /// move when this handle was the last one, by copy otherwise.
+    #[inline]
+    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
+    pub fn into_vec(mut self) -> Vec<V> {
+        let window = self.start..self.start + self.len;
+        match self.unique_parts() {
+            Some((vec, start, len)) => {
+                *start = 0;
+                *len = 0;
+                let mut vec = core::mem::take(vec);
+                vec.truncate(window.end);
+                vec.drain(..window.start);
+                vec
+            }
+            None => {
+                note_forced_copy!(ArrayUnwrap);
+                self.inner[window].to_vec()
+            }
+        }
+    }
+}
+
+/// [`ArrayOf::make_vec`]'s loan of the `Vec`: derefs to it, and puts its
+/// length back into the window when it drops.
+pub struct ArrayVecMut<'a, V> {
+    vec: &'a mut Vec<V>,
+    len: &'a mut usize,
+}
+
+impl<V> Deref for ArrayVecMut<'_, V> {
+    type Target = Vec<V>;
+
+    #[inline]
+    fn deref(&self) -> &Vec<V> {
+        self.vec
+    }
+}
+
+impl<V> DerefMut for ArrayVecMut<'_, V> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Vec<V> {
+        self.vec
+    }
+}
+
+/// Transparent, as [`ArrayOf`]'s is: the `Vec`'s elements.
+impl<V: core::fmt::Debug> core::fmt::Debug for ArrayVecMut<'_, V> {
+    #[inline]
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Debug::fmt(&**self.vec, f)
+    }
+}
+
+impl<V> Drop for ArrayVecMut<'_, V> {
+    #[inline]
+    fn drop(&mut self) {
+        *self.len = self.vec.len();
+    }
+}
+
+// Hand-written rather than derived: a derive would put a `V: Default` /
+// `V: Clone` bound on the *container*, but an empty or cloned one needs
+// nothing of its value type beyond what the clone itself needs.
+// `OwnedValue` has no `Default` at all, so `#[derive(Default)]` would not
+// even compile here.
+impl<V: Teardown> Default for ArrayOf<V> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A refcount bump: the copy is deferred to the first write through either
+/// handle. The clone is the same node ([`ArrayOf::ptr_eq`]).
+impl<V: Teardown + Clone> Clone for ArrayOf<V> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            start: self.start,
+            len: self.len,
+        }
+    }
+}
+
+impl<V: Teardown + PartialEq> PartialEq for ArrayOf<V> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+/// Transparent, so `{:?}` on an `OwnedValue` prints the bare elements exactly
+/// as it did before the wrapper existed. A derived `Debug` would print the
+/// wrapper's name and its window -- a cosmetic but real change to what a
+/// downstream `println!("{:?}", value)` shows, for a type whose whole purpose
+/// is to be invisible.
+impl<V: Teardown + core::fmt::Debug> core::fmt::Debug for ArrayOf<V> {
+    #[inline]
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl<V: Teardown> Deref for ArrayOf<V> {
+    type Target = [V];
+
+    #[inline]
+    #[allow(unsafe_code)] // the window's bounds check, on every array read (#6659)
+    fn deref(&self) -> &[V] {
+        // SAFETY: `start + len <= inner.len()` is the window's invariant
+        // (see `len`): every change to the `Vec`'s length restores it before
+        // the window can be read again.
+        unsafe { self.inner.get_unchecked(self.start..self.start + self.len) }
+    }
+}
+
+/// The copy-on-write point for a write that keeps the length: a shared
+/// array's window (and only the window) is copied here, once, before the
+/// caller's write reaches it; a unique one is written in place, window and
+/// all. `V: Clone` is what the copy needs and is the only bound the sharing
+/// adds anywhere.
+impl<V: Teardown + Clone> DerefMut for ArrayOf<V> {
+    #[inline]
+    #[allow(unsafe_code)] // as `Deref`'s
+    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
+    fn deref_mut(&mut self) -> &mut [V] {
+        self.own_storage();
+        let (start, len) = (self.start, self.len);
+        let vec = Rc::get_mut(&mut self.inner).expect("own_storage leaves this handle unique");
+        // SAFETY: as `Deref`'s.
+        unsafe { vec.get_unchecked_mut(start..start + len) }
+    }
+}
+
+impl<V: Teardown> From<Vec<V>> for ArrayOf<V> {
+    #[inline]
+    fn from(inner: Vec<V>) -> Self {
+        let len = inner.len();
+        Self {
+            inner: ManuallyDrop::new(Rc::new(inner)),
+            start: 0,
+            len,
+        }
+    }
+}
+
+impl<V: Teardown + Clone> From<ArrayOf<V>> for Vec<V> {
+    #[inline]
+    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
+    fn from(wrapper: ArrayOf<V>) -> Self {
+        wrapper.into_vec()
     }
 }
 
@@ -2507,26 +2723,26 @@ impl<V: Teardown> Drop for ArrayOf<V> {
     fn drop(&mut self) {
         // Releasing the last handle (no `Weak` is ever made) drops the
         // elements: the only release that can recurse.
-        if V::ITERATIVE && Rc::strong_count(&self.0) == 1 && !self.0.is_empty() {
+        if V::ITERATIVE && Rc::strong_count(&self.inner) == 1 && !self.inner.is_empty() {
             #[cfg(feature = "std")]
             {
                 if let Some(_level) = drop_depth::enter() {
                     // SAFETY: the field is not used again: `drop` returns
                     // here, and nothing else releases it.
-                    unsafe { ManuallyDrop::drop(&mut self.0) };
+                    unsafe { ManuallyDrop::drop(&mut self.inner) };
                     return;
                 }
                 self.tear_down_cold();
             }
             #[cfg(not(feature = "std"))]
-            if self.0.iter().any(V::is_nonempty_container) {
+            if self.inner.iter().any(V::is_nonempty_container) {
                 self.tear_down_cold();
             }
         }
         // SAFETY: as above; the one release on every path that did not
         // return early (a shared or empty array, one torn down past the
         // limit, or an element type without the teardown).
-        unsafe { ManuallyDrop::drop(&mut self.0) };
+        unsafe { ManuallyDrop::drop(&mut self.inner) };
     }
 }
 
@@ -2622,14 +2838,14 @@ pub(crate) fn tear_down<V: Teardown>(mut work: Vec<V>) {
 impl<V: Teardown + PartialEq> PartialEq<Vec<V>> for ArrayOf<V> {
     #[inline]
     fn eq(&self, other: &Vec<V>) -> bool {
-        **self == *other
+        **self == **other
     }
 }
 
 impl<V: Teardown + PartialEq> PartialEq<ArrayOf<V>> for Vec<V> {
     #[inline]
     fn eq(&self, other: &ArrayOf<V>) -> bool {
-        *self == **other
+        **self == **other
     }
 }
 
@@ -2644,7 +2860,19 @@ impl<V: Teardown + Clone> Extend<V> for ArrayOf<V> {
     #[inline]
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     fn extend<I: IntoIterator<Item = V>>(&mut self, iter: I) {
-        (**self).extend(iter);
+        // An append keeps the window's offset (`jvp_array_write` on an
+        // unshared view): a loop that peels the front and pushes the back
+        // never compacts the head, which `make_vec` would on every round.
+        self.own_storage();
+        let Self { inner, start, len } = self;
+        let vec = Rc::get_mut(inner).expect("own_storage leaves this handle unique");
+        let (offset, kept) = (*start, *len);
+        // Zeroed while the tail past the window is dropped and while `iter`
+        // runs (see `len`'s invariant); `offset <= vec.len()` throughout.
+        *len = 0;
+        vec.truncate(offset + kept);
+        vec.extend(iter);
+        *len = vec.len() - offset;
     }
 }
 
@@ -2720,16 +2948,26 @@ impl<V: Teardown + Clone> IntoIterator for ArrayOf<V> {
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     fn into_iter(self) -> Self::IntoIter {
         let mut this = self;
-        match Rc::get_mut(&mut this.0) {
-            Some(vec) => ArrayIntoIter::Owned(core::mem::take(vec).into_iter()),
+        let window = this.start..this.start + this.len;
+        match this.unique_parts() {
+            Some((vec, start, len)) => {
+                *start = 0;
+                *len = 0;
+                let mut vec = core::mem::take(vec);
+                vec.truncate(window.end);
+                let mut iter = vec.into_iter();
+                if window.start > 0 {
+                    // Drops the elements before the window, in order.
+                    iter.nth(window.start - 1);
+                }
+                ArrayIntoIter::Owned(iter)
+            }
             None => {
                 note_forced_copy!(ArrayUnwrap);
-                let shared = Rc::clone(&this.0);
-                let end = shared.len();
                 ArrayIntoIter::Shared {
-                    vec: shared,
-                    next: 0,
-                    end,
+                    vec: Rc::clone(&this.inner),
+                    next: window.start,
+                    end: window.end,
                 }
             }
         }
@@ -2742,7 +2980,7 @@ impl<'a, V: Teardown> IntoIterator for &'a ArrayOf<V> {
 
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
-        self.0.iter()
+        self.iter()
     }
 }
 
@@ -3696,7 +3934,7 @@ impl OwnedValue {
                 if f.is_nan() {
                     *value = OwnedValue::fresh_nan_instance(f.is_sign_negative());
                 }
-            } else if let Some(items) = value.as_array_mut() {
+            } else if let OwnedValue::Array(items) = value {
                 items.iter_mut().for_each(refresh);
             } else if let Some(fields) = value.as_object_mut() {
                 fields.values_mut().for_each(refresh);
@@ -4103,8 +4341,9 @@ impl OwnedValue {
         }
     }
 
-    /// Convert to an array reference, if possible.
-    pub fn as_array(&self) -> Option<&Vec<Self>> {
+    /// Convert to an array reference, if possible: the array's elements
+    /// (a window on its storage since #6659, so a slice, not a `Vec`).
+    pub fn as_array(&self) -> Option<&[Self]> {
         match self {
             Self::Array(arr) => Some(arr),
             _ => None,
@@ -4114,11 +4353,13 @@ impl OwnedValue {
     /// Convert to a mutable array reference, if possible.
     ///
     /// A copy-on-write point (#2999): on a shared array this is where the
-    /// copy happens, attributed to this method's caller.
+    /// copy happens, attributed to this method's caller. The guard derefs to
+    /// the array's own `Vec` and writes its length back into the array's
+    /// window when it drops ([`ArrayOf::make_vec`]).
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
-    pub fn as_array_mut(&mut self) -> Option<&mut Vec<Self>> {
+    pub fn as_array_mut(&mut self) -> Option<ArrayVecMut<'_, Self>> {
         match self {
-            Self::Array(arr) => Some(&mut **arr),
+            Self::Array(arr) => Some(arr.make_vec()),
             _ => None,
         }
     }
@@ -6814,7 +7055,8 @@ mod tests {
     /// bytes (16 since #1344 added the side list for a repeated key's earlier
     /// entries, still under `NumberLiteral`'s 32). #2999 put `Array` behind a pointer as well (24 -> 8), which
     /// changes nothing here -- `NumberLiteral` was already the widest arm --
-    /// and is asserted so the shape stays documented.
+    /// and is asserted so the shape stays documented; #6659 added the window's
+    /// start and length (8 -> 24), still no wider than `String`'s payload.
     /// Same 64-bit gate as the crate's other exact-size pins (`EvalError`,
     /// `Expr`): 32-bit targets shrink the pointer-sized fields.
     #[test]
@@ -6835,10 +7077,13 @@ mod tests {
             "ObjectMap must stay two pointers wide -- narrow enough that Object is not \
              OwnedValue's widest arm again, and with the map as the only heap block"
         );
+        // The storage pointer and the window's start and length (#6659, ADR-0029): three words,
+        // the width of `String`'s payload (`SharableString`, 24), which already sits beside
+        // `NumberRepr`'s niche, so the window costs `OwnedValue` nothing (the 32 above).
         assert_eq!(
             core::mem::size_of::<ArrayVec>(),
-            core::mem::size_of::<usize>(),
-            "ArrayVec must stay one pointer wide (#2999)"
+            3 * core::mem::size_of::<usize>(),
+            "ArrayVec must stay a pointer and a window wide (#2999, #6659)"
         );
     }
 
@@ -6938,9 +7183,10 @@ mod tests {
         assert_eq!(items[0], OwnedValue::Int(1));
         assert_eq!(items.first(), Some(&OwnedValue::Int(1)));
 
-        // DerefMut (write side) and Extend.
+        // make_vec (a write that changes the length), DerefMut (one that
+        // keeps it) and Extend.
         let mut items = items;
-        items.push(OwnedValue::Int(3));
+        items.make_vec().push(OwnedValue::Int(3));
         items.extend([OwnedValue::Int(4)]);
         assert_eq!(items.len(), 4);
         if let Some(v) = items.get_mut(0) {
@@ -6977,20 +7223,24 @@ mod tests {
         // Constructors.
         assert!(ArrayVec::new().is_empty());
         assert!(ArrayVec::default().is_empty());
-        let sized = ArrayVec::with_capacity(8);
+        let mut sized = ArrayVec::with_capacity(8);
         assert!(sized.is_empty());
-        assert!(sized.capacity() >= 8);
+        assert!(sized.make_vec().capacity() >= 8);
     }
 
-    /// `as_array`/`as_array_mut` keep returning a bare `&Vec` (#2999's
-    /// public-API promise, the same one #3000 made for objects).
+    /// `as_array` hands out the elements and `as_array_mut` a guard that
+    /// derefs to the array's own `Vec` (#2999's public-API promise, narrowed
+    /// by #6659's window: the read side is a slice now, and the write side
+    /// still pushes like a `Vec`).
     #[test]
-    fn as_array_accessors_still_hand_out_a_bare_vec_2999() {
+    fn as_array_accessors_hand_out_the_elements_and_the_vec_6659() {
         let mut value = OwnedValue::array_from(vec![OwnedValue::Int(1)]);
-        let read: &Vec<OwnedValue> = value.as_array().unwrap();
+        let read: &[OwnedValue] = value.as_array().unwrap();
         assert_eq!(read.len(), 1);
-        let write: &mut Vec<OwnedValue> = value.as_array_mut().unwrap();
-        write.push(OwnedValue::Int(2));
+        let mut write = value.as_array_mut().unwrap();
+        let vec: &mut Vec<OwnedValue> = &mut write;
+        vec.push(OwnedValue::Int(2));
+        drop(write);
         assert_eq!(value.as_array().unwrap().len(), 2);
         assert!(OwnedValue::Null.as_array().is_none());
         assert!(OwnedValue::Null.as_array_mut().is_none());
@@ -7141,7 +7391,7 @@ mod tests {
         );
         let mut written = doc.clone();
         let ((), recorded) = share_stats::measure(|| {
-            let items = written.as_array_mut().unwrap();
+            let mut items = written.as_array_mut().unwrap();
             let first = items[0].as_object_mut().unwrap();
             first.insert("a".to_string(), OwnedValue::Int(-1));
         });
@@ -7483,14 +7733,14 @@ mod tests {
     #[test]
     fn test_as_array_and_mut() {
         let mut v = OwnedValue::array_from(vec![OwnedValue::Int(1)]);
-        assert_eq!(v.as_array(), Some(&vec![OwnedValue::Int(1)]));
+        assert_eq!(v.as_array(), Some(&[OwnedValue::Int(1)][..]));
         v.as_array_mut().unwrap().push(OwnedValue::Int(2));
         assert_eq!(
             v,
             OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)])
         );
         assert_eq!(OwnedValue::Null.as_array(), None);
-        assert_eq!(OwnedValue::Null.as_array_mut(), None);
+        assert!(OwnedValue::Null.as_array_mut().is_none());
     }
 
     #[test]
@@ -11958,5 +12208,367 @@ mod tests {
         }
         drop(OwnedValue::array());
         drop(OwnedValue::Object(ObjectMap::new()));
+    }
+}
+
+/// [`ArrayOf`] as a window on shared storage (#6659, ADR-0029): `slice` follows
+/// `jvp_array_slice`, `ptr_eq` is `jv_identical`, and every way of changing or consuming a window
+/// keeps its elements and its invariant.
+#[cfg(test)]
+mod array_window_tests_6659 {
+    use super::*;
+    use alloc::vec;
+    use core::cell::Cell;
+
+    fn ints(range: core::ops::Range<i64>) -> ArrayVec {
+        range.map(OwnedValue::Int).collect()
+    }
+
+    fn values(items: &[OwnedValue]) -> Vec<i64> {
+        items
+            .iter()
+            .map(|v| v.as_i64().expect("an integer"))
+            .collect()
+    }
+
+    #[test]
+    fn a_slice_is_a_view_and_its_identity_is_jqs() {
+        let a = ints(0..5);
+        let s = a.slice(1..3);
+        assert_eq!(values(&s), [1, 2]);
+        assert!(
+            a.is_shared(),
+            "a view shares the storage, it does not copy it"
+        );
+        // `jv_identical`: the same range of the same storage is one node, any other is not.
+        assert!(s.ptr_eq(&a.slice(1..3)));
+        assert!(!s.ptr_eq(&a.slice(1..4)));
+        assert!(!s.ptr_eq(&a.slice(0..2)));
+        assert!(!s.ptr_eq(&a));
+        // The whole window is the array itself; an empty range is a fresh `[]`.
+        assert!(a.slice(0..5).ptr_eq(&a));
+        assert!(s.slice(0..2).ptr_eq(&s));
+        let empty = a.slice(2..2);
+        assert!(empty.is_empty());
+        assert!(!empty.ptr_eq(&a.slice(2..2)));
+        // A slice of a slice is the view of the combined range.
+        assert!(s.slice(1..2).ptr_eq(&a.slice(2..3)));
+        assert_eq!(values(&s.slice(1..2)), [2]);
+    }
+
+    #[test]
+    fn a_range_starting_past_jqs_16_bit_offset_is_a_fresh_copy() {
+        let len = JQ_SLICE_OFFSET_LIMIT as i64 + 10;
+        let a = ints(0..len);
+        let below = JQ_SLICE_OFFSET_LIMIT - 1;
+        let view = a.slice(below..a.len());
+        assert!(
+            view.ptr_eq(&a.slice(below..a.len())),
+            "offset 65,535 is still a view"
+        );
+        let at = a.slice(JQ_SLICE_OFFSET_LIMIT..a.len());
+        assert_eq!(values(&at), (len - 10..len).collect::<Vec<_>>());
+        assert!(
+            !at.ptr_eq(&a.slice(JQ_SLICE_OFFSET_LIMIT..a.len())),
+            "jq copies a range at offset 65,536, so each is its own node"
+        );
+        // The offset accumulates over a slice of a slice, as `jv.offset` does.
+        let stepped = a.slice(1..a.len()).slice(below..a.len() - 1);
+        assert!(!stepped.ptr_eq(&a.slice(JQ_SLICE_OFFSET_LIMIT..a.len())));
+        assert_eq!(values(&stepped), values(&at));
+        // The copy starts its own storage: a view of it is a view again.
+        assert!(at.slice(1..3).ptr_eq(&at.slice(1..3)));
+    }
+
+    #[test]
+    fn a_write_through_a_shared_window_copies_only_the_window() {
+        let a = ints(0..1000);
+        let mut s = a.slice(10..12);
+        s[0] = OwnedValue::Int(-1);
+        assert_eq!(values(&s), [-1, 11]);
+        assert_eq!(
+            values(&a[10..12]),
+            [10, 11],
+            "the shared storage is untouched"
+        );
+        assert!(!a.is_shared() && !s.is_shared());
+        assert!(
+            s.make_vec().capacity() < 1000,
+            "the copy holds the window, not the storage"
+        );
+    }
+
+    #[test]
+    fn a_write_through_a_unique_window_stays_in_place() {
+        let mut a = ints(0..5);
+        a.cut(1..4);
+        let storage = Rc::as_ptr(&a.inner);
+        a[0] = OwnedValue::Int(-1);
+        assert_eq!(values(&a), [-1, 2, 3]);
+        assert_eq!(Rc::as_ptr(&a.inner), storage);
+        assert_eq!((a.start, a.len), (1, 3));
+    }
+
+    #[test]
+    fn make_vec_compacts_the_window_and_writes_the_new_length_back() {
+        let mut a = ints(0..6);
+        a.cut(2..5);
+        {
+            let mut vec = a.make_vec();
+            assert_eq!(values(&vec), [2, 3, 4]);
+            vec.push(OwnedValue::Int(9));
+            vec.remove(0);
+        }
+        assert_eq!(values(&a), [3, 4, 9]);
+        assert_eq!((a.start, a.len), (0, 3));
+        // A shared window is copied out, and the other handle keeps its own.
+        let b = a.slice(1..3);
+        let mut c = b.clone();
+        c.make_vec().push(OwnedValue::Int(10));
+        assert_eq!(values(&c), [4, 9, 10]);
+        assert_eq!(values(&b), [4, 9]);
+        // A guard leaked mid-write leaves an empty window, never a dangling one.
+        let mut d = ints(0..3);
+        core::mem::forget(d.make_vec());
+        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn a_fold_of_unique_cuts_moves_its_offset_as_jq_does() {
+        let len = JQ_SLICE_OFFSET_LIMIT as i64 + 4_464;
+        let mut a = ints(0..len);
+        let storage = Rc::as_ptr(&a.inner);
+        let mut compactions = 0;
+        while a.len() > 10 {
+            a.cut(1..a.len());
+            // Never more than jq's 16-bit offset of cut-off elements kept alive, and the tail
+            // past the window is dropped at once.
+            assert!(a.start < JQ_SLICE_OFFSET_LIMIT);
+            assert_eq!(a.inner.len(), a.start + a.len());
+            if a.start == 0 {
+                compactions += 1;
+            }
+        }
+        assert_eq!(values(&a), (len - 10..len).collect::<Vec<_>>());
+        // One compaction, where jq's offset reached 65,536 and `jvp_array_slice` copied; after
+        // it the offset counts from 0 again, as the copy's does.
+        assert_eq!(compactions, 1);
+        assert_eq!(a.start, len as usize - 10 - JQ_SLICE_OFFSET_LIMIT);
+        assert_eq!(
+            Rc::as_ptr(&a.inner),
+            storage,
+            "compacted in place, not copied"
+        );
+        // Cutting to nothing gives a fresh `[]`.
+        a.cut(3..3);
+        assert!(a.is_empty() && a.inner.is_empty());
+    }
+
+    #[test]
+    fn an_append_to_a_unique_window_keeps_its_offset() {
+        let mut a = ints(0..6);
+        a.cut(2..3);
+        let storage = Rc::as_ptr(&a.inner);
+        a.push(OwnedValue::Int(9));
+        a.extend([OwnedValue::Int(10), OwnedValue::Int(11)]);
+        assert_eq!(values(&a), [2, 9, 10, 11]);
+        assert_eq!(
+            (a.start, a.len),
+            (2, 4),
+            "`jvp_array_write` appends to the view in place"
+        );
+        assert_eq!(Rc::as_ptr(&a.inner), storage);
+        // A queue (peel the front, push the back) never compacts before jq's offset limit.
+        for i in 0..1_000 {
+            a.cut(1..a.len());
+            a.push(OwnedValue::Int(100 + i));
+        }
+        assert_eq!(a.len(), 4);
+        assert_eq!(a.start, 1_002);
+        assert_eq!(Rc::as_ptr(&a.inner), storage);
+        // An append to a shared window copies the window out and leaves the other handle alone.
+        let b = a.clone();
+        a.push(OwnedValue::Int(-1));
+        assert_eq!(a.len(), 5);
+        assert_eq!(b.len(), 4);
+        assert!(!a.ptr_eq(&b));
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn a_slice_past_the_window_panics_in_every_build() {
+        let _ = ints(0..3).slice(1..4);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn a_cut_past_the_window_panics_in_every_build() {
+        ints(0..3).cut(2..4);
+    }
+
+    #[test]
+    fn every_way_out_of_a_window_yields_exactly_its_elements() {
+        let shared = ints(0..8);
+        let window = shared.slice(2..6);
+        assert_eq!(values(&window.clone().into_vec()), [2, 3, 4, 5]);
+        assert_eq!(
+            values(&window.clone().into_iter().collect::<Vec<_>>()),
+            [2, 3, 4, 5]
+        );
+        assert_eq!(
+            values(&window.clone().into_iter().rev().collect::<Vec<_>>()),
+            [5, 4, 3, 2]
+        );
+        assert_eq!(window.clone().into_iter().len(), 4);
+        assert_eq!(
+            values(&(&window).into_iter().cloned().collect::<Vec<_>>()),
+            [2, 3, 4, 5]
+        );
+        drop(shared);
+        // Now unique: by move, still exactly the window.
+        let mut unique = window;
+        unique.cut(1..4);
+        assert_eq!(values(&unique.clone().into_vec()), [3, 4, 5]);
+        assert_eq!(values(&unique.into_iter().collect::<Vec<_>>()), [3, 4, 5]);
+        // Equality, `Debug` and `Vec` comparison read the window only.
+        let a = ints(0..4);
+        assert_eq!(
+            a.slice(1..3),
+            ArrayVec::from(vec![OwnedValue::Int(1), OwnedValue::Int(2)])
+        );
+        assert_eq!(a.slice(1..3), vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+        assert_eq!(alloc::format!("{:?}", a.slice(3..4)), "[Int(3)]");
+    }
+
+    #[test]
+    fn a_cut_of_a_shared_window_is_its_slice() {
+        let a = ints(0..5);
+        let mut b = a.clone();
+        b.cut(1..3);
+        assert_eq!(values(&b), [1, 2]);
+        assert!(
+            b.ptr_eq(&a.slice(1..3)),
+            "a view on the shared storage, as `slice` makes it"
+        );
+        assert_eq!(
+            values(&a),
+            [0, 1, 2, 3, 4],
+            "the other handle keeps its window"
+        );
+    }
+
+    #[test]
+    fn the_vec_guard_prints_as_its_elements() {
+        let mut a = ints(1..3);
+        assert_eq!(alloc::format!("{:?}", a.make_vec()), "[Int(1), Int(2)]");
+    }
+
+    /// An element that counts its drops, so a window's teardown is seen to release every element
+    /// of its storage, in or out of the window, exactly once.
+    #[derive(Clone)]
+    struct Counted(Rc<Cell<usize>>);
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    impl Teardown for Counted {}
+
+    #[test]
+    fn dropping_a_window_releases_every_element_of_its_storage_once() {
+        let dropped = Rc::new(Cell::new(0));
+        let make = || -> ArrayOf<Counted> { (0..10).map(|_| Counted(dropped.clone())).collect() };
+
+        let mut unique = make();
+        unique.cut(3..7);
+        assert_eq!(
+            dropped.get(),
+            3,
+            "a unique cut drops the tail it cuts off at once"
+        );
+        drop(unique);
+        assert_eq!(dropped.get(), 10);
+
+        dropped.set(0);
+        let storage = make();
+        let view = storage.slice(2..4);
+        drop(storage);
+        assert_eq!(dropped.get(), 0, "the view keeps the storage alive");
+        let kept: Vec<Counted> = view.into_iter().collect();
+        assert_eq!(
+            dropped.get(),
+            8,
+            "consuming the last handle releases the rest"
+        );
+        drop(kept);
+        assert_eq!(dropped.get(), 10);
+    }
+
+    /// An element whose destructor panics: a window being cut, compacted or lent out must not be
+    /// left pointing past its `Vec` when that panic is caught.
+    #[derive(Clone)]
+    struct Bomb(bool);
+
+    impl Drop for Bomb {
+        fn drop(&mut self) {
+            if self.0 && !std::thread::panicking() {
+                panic!("bomb");
+            }
+        }
+    }
+
+    impl Teardown for Bomb {}
+
+    #[test]
+    fn a_destructor_that_panics_mid_cut_leaves_a_readable_window() {
+        let build = || -> ArrayOf<Bomb> { (0..10).map(|i| Bomb(i == 8)).collect() };
+        let mut cut = build();
+        let caught = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| cut.cut(1..4)));
+        assert!(caught.is_err());
+        assert!(
+            cut.len() <= cut.inner.len(),
+            "the window stays inside its storage"
+        );
+        let _ = cut.iter().count();
+
+        let mut lent = build();
+        lent.cut(0..9);
+        let caught = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
+            lent.make_vec().truncate(2);
+        }));
+        assert!(caught.is_err());
+        assert!(lent.start + lent.len() <= lent.inner.len());
+        // Defuse what is left before it drops. `cut`'s bomb went off in its own `truncate`, and
+        // what is left of its storage (elements 0..4) holds none.
+        for bomb in lent.make_vec().iter_mut() {
+            bomb.0 = false;
+        }
+    }
+
+    /// The window is the width of `OwnedValue::String`'s payload, so `OwnedValue` stays 32 (pinned
+    /// in `owned_value_is_32_bytes_because_its_containers_are_one_pointer_3000`).
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn the_window_is_three_words() {
+        assert_eq!(
+            core::mem::size_of::<ArrayVec>(),
+            3 * core::mem::size_of::<usize>()
+        );
+        assert_eq!(core::mem::size_of::<OwnedValue>(), 32);
+    }
+
+    /// `OwnedValue`'s identity reads the window: `shares_storage_with` and `jq_identical`.
+    #[test]
+    fn owned_value_identity_reads_the_window() {
+        let items = ints(0..4);
+        let a = OwnedValue::Array(items.clone());
+        let one = OwnedValue::Array(items.slice(1..3));
+        let two = OwnedValue::Array(items.slice(1..3));
+        let other = OwnedValue::Array(items.slice(1..4));
+        assert!(one.shares_storage_with(&two));
+        assert!(!one.shares_storage_with(&other));
+        assert!(!one.shares_storage_with(&a));
     }
 }

@@ -55,6 +55,7 @@ by Michael Nygard.
 | [ADR-0026](adr-0026.md) | ✅ Accepted | 2026-10-25 | Carry jq's Path Register, Not Infer It (#5223)                |
 | [ADR-0027](adr-0027.md) | ✅ Accepted | 2026-10-28 | Keep a Repeated Key's Earlier Entries Beside the Map (#1344)  |
 | [ADR-0028](adr-0028.md) | 🟡 Proposed | 2026-11-10 | Carry Null and Bool Spellings in OwnedValue (#2802)           |
+| [ADR-0029](adr-0029.md) | 🟡 Proposed | 2026-11-12 | An Owned Array Is a Window on Shared Storage (#6659)          |
 
 The inventory is maintained by the [`update-adr-inventory`](../../.claude/skills/update-adr-inventory/SKILL.md)
 skill, which scans `adr-*.md` for the title and status and derives the date from git history.
