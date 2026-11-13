@@ -131655,9 +131655,16 @@ mod tests {
                 "{value:?}"
             );
         }
-        // #7132 review: a container element shares its storage with the array, which a live #2889
-        // embed table witnesses, so with a binding in scope that read is the evaluator's; a scalar
-        // element is still answered, and with the table gone the container is too.
+    }
+
+    /// #7132 review: a container element `eval_owned_fused_slice_read` reads shares its storage
+    /// with the array, which a live #2889 embed table witnesses, so with a binding in scope that read
+    /// is the evaluator's, as for the `first`/`last`/`nth` and slice doors; a scalar element is still
+    /// answered, and with the table gone the container is too. `std` only: without it there is no
+    /// table to make live.
+    #[cfg(feature = "std")]
+    #[test]
+    fn eval_owned_fused_slice_read_leaves_a_container_to_a_live_embed_table_7132() {
         let nested = OwnedValue::array_from(vec![
             OwnedValue::array_from(vec![OwnedValue::Int(1)]),
             OwnedValue::Int(2),
