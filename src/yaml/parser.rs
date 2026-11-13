@@ -1420,6 +1420,22 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // the document node (#7084).
                 self.drain_pending_into_document_head();
                 return;
+            } else if self.yq_no_head
+                && next.is_some()
+                && self.documents_started == 1
+                && !self.saw_head_foot_node
+                && self.first_document_marker_leads()
+                && self.pending_head_lines_below_first_marker()
+            {
+                // Behind a byte-order mark, the block under the first `---` that a blank line detaches
+                // from the first node is that node's foot, where the block above the marker stays its
+                // head (#7089: `# c1` / `---` / `# c2` / blank / `a: 1` is `c1` on `.a`'s key's head
+                // and `c2` on its foot). Before a flow collection yq drops it.
+                self.defer_pending_below_first_marker_to_foot();
+                if self.pending_head_lines.is_empty() {
+                    return;
+                }
+                // What is left is above the marker: the first node's head, below.
             } else if let Some((_, next_column)) = next {
                 // A blank line after the run's second block changes nothing: it is still the foot of the key
                 // that owns the blocks the first one closed (#5053).
@@ -2112,6 +2128,65 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         {
             self.drain_pending_into_document_head();
         }
+    }
+
+    /// The start of the first `---` marker line, once the comments, blank lines and `%` directive lines
+    /// above it are skipped (see [`Self::first_document_marker_leads`], which asks whether there is one).
+    fn first_marker_line_start(&self) -> Option<usize> {
+        let mut at = 0;
+        while at < self.input.len() {
+            let line_end = self.input[at..]
+                .iter()
+                .position(|&b| Self::is_break(b))
+                .map_or(self.input.len(), |n| at + n);
+            let line = &self.input[at..line_end];
+            let content = line
+                .iter()
+                .position(|&b| !matches!(b, b' ' | b'\t'))
+                .map(|n| &line[n..]);
+            match content {
+                None => {}
+                Some(rest) if matches!(rest.first(), Some(b'#' | b'%')) => {}
+                Some(rest) => {
+                    return (line.first() != Some(&b' ') && Self::marker_prefix(rest, b"---"))
+                        .then_some(at);
+                }
+            }
+            at = line_end + 1;
+        }
+        None
+    }
+
+    /// Whether any pending head line sits below the first `---` marker, and something (a comment or a
+    /// blank line) stands above it (#7089): a marker at the very start leaves yq the block as the head.
+    fn pending_head_lines_below_first_marker(&self) -> bool {
+        self.first_marker_line_start().is_some_and(|marker| {
+            marker > 0
+                && self
+                    .pending_head_lines
+                    .last()
+                    .is_some_and(|&(start, _)| start as usize > marker)
+        })
+    }
+
+    /// Move the pending lines below the first `---` marker to the foot of the first key, item or scalar
+    /// (#7089), keeping the blank lines between them, or drop them when a flow collection opens next, as
+    /// yq does (see [`Self::opens_flow_collection`]). The lines above the marker stay pending.
+    fn defer_pending_below_first_marker_to_foot(&mut self) {
+        let Some(marker) = self.first_marker_line_start() else {
+            return; // patchcov: coverage tolerate-line reason="unreachable: the caller checked pending_head_lines_below_first_marker, which needs a marker (#7089)"
+        };
+        let above = self
+            .pending_head_lines
+            .partition_point(|&(start, _)| (start as usize) < marker);
+        let below = self.pending_head_lines.split_off(above);
+        if self.opens_flow_collection(self.pos, false) {
+            return;
+        }
+        let kept = std::mem::replace(&mut self.pending_head_lines, below);
+        self.mark_blank_runs_in_pending();
+        self.deferred_foot_lines.append(&mut self.pending_head_lines);
+        self.pending_head_lines = kept;
     }
 
     /// Behind a byte-order mark yq sets no header aside (#6762), so a block above the first node that a
