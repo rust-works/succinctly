@@ -2145,10 +2145,11 @@ fn eval_all_documents(
 
 /// The document `load("name")` reads, with its presentation (#5439): the file as a later file of an
 /// `--eval-all` run is read, its header comments heading its first node. `None` for what is not replayed:
-/// a name that is not a YAML file, an anchor or an alias, a header a blank line detaches, or a file that
-/// does not read.
+/// a name that is not a YAML file, a header a blank line detaches, a comment on the `---` line, or a file
+/// that does not read. An anchor or an alias in the file is kept: the result's own soundness pass
+/// (`enforce_anchor_soundness`) drops a `*name` its document cannot resolve.
 fn load_document_pair(name: &str) -> Option<ResultWithComments> {
-    if name.ends_with(".json") {
+    if name.to_ascii_lowercase().ends_with(".json") {
         return None;
     }
     let bytes = std::fs::read(name).ok()?;

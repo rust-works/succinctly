@@ -699,8 +699,16 @@ pub(super) fn needed(expr: &Expr) -> bool {
         Expr::Pipe(parts) => parts.iter().any(needed),
         Expr::Paren(inner) => needed(inner),
         // #5439: `. *= load("f")` writes the merge back, and `.a = load("f")` the loaded node.
-        Expr::CompoundAssign { .. } => true,
-        Expr::Assign { value, .. } => matches!(**value, Expr::Builtin(Builtin::Load(..))),
+        Expr::CompoundAssign { value, .. } | Expr::Assign { value, .. } => is_load(value),
+        _ => false,
+    }
+}
+
+/// Whether `expr` is a `load(..)` (in parentheses or not).
+fn is_load(expr: &Expr) -> bool {
+    match expr {
+        Expr::Builtin(Builtin::Load(..)) => true,
+        Expr::Paren(inner) => is_load(inner),
         _ => false,
     }
 }
@@ -1382,10 +1390,18 @@ fn trace_at_depth(
             (evaluated(expr, value)? == result).then_some((result, tree))
         }
         // #5439: the node `load` read keeps its presentation where it is written.
-        Expr::Assign { path, value: rhs } if matches!(**rhs, Expr::Builtin(Builtin::Load(..))) => {
+        Expr::Assign { path, value: rhs } if is_load(rhs) => {
             let result = evaluated(expr, value)?;
-            let (_, loaded) = next(rhs, input)?;
+            let (loaded_value, loaded) = next(rhs, input)?;
             let names = field_chain(path)?;
+            // The node written is the one the replay read: not a file that changed between the reads.
+            let written = names.iter().try_fold(&result, |at, name| match at {
+                OwnedValue::Object(fields) => fields.get(name.as_str()),
+                _ => None,
+            })?;
+            if *written != loaded_value {
+                return None;
+            }
             let targets = collect_write_targets(expr)?;
             let base = if matches!(value, OwnedValue::Null) {
                 // A null input has no mapping to write into: the write makes one.
