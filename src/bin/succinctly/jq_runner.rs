@@ -11315,11 +11315,58 @@ fn names_stdin(meta: &std::fs::Metadata) -> bool {
 #[cfg(unix)]
 fn names_descriptor(fd: std::os::fd::BorrowedFd<'_>, meta: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
+    file_identity(fd) == Some((meta.dev(), meta.ino()))
+}
+
+/// The device and inode of the file the descriptor `fd` is open on.
+#[cfg(unix)]
+fn file_identity(fd: std::os::fd::BorrowedFd<'_>) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
     fd.try_clone_to_owned()
         .ok()
         .map(std::fs::File::from)
         .and_then(|held| held.metadata().ok())
-        .is_some_and(|held| held.dev() == meta.dev() && held.ino() == meta.ino())
+        .map(|held| (held.dev(), held.ino()))
+}
+
+/// The files the run's own descriptors are open on: standard input, output and error, which
+/// [`names_stdin`] and [`names_output`] ask of one file. A list of hundreds of files asks of each, and
+/// each such question duplicates a descriptor to read its `fstat` (three descriptors, so nine system
+/// calls a file, more than the rest of judging one), where this asks once ([`RunFiles::names`]).
+struct RunFiles(Vec<(u64, u64)>);
+
+impl RunFiles {
+    #[cfg(unix)]
+    fn new() -> Self {
+        use std::os::fd::AsFd;
+        Self(
+            [
+                file_identity(std::io::stdin().as_fd()),
+                file_identity(std::io::stdout().as_fd()),
+                file_identity(std::io::stderr().as_fd()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+        )
+    }
+
+    #[cfg(not(unix))]
+    fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    /// Whether `meta` is a file standard input, output or error is open on.
+    #[cfg(unix)]
+    fn names(&self, meta: &std::fs::Metadata) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        self.0.contains(&(meta.dev(), meta.ino()))
+    }
+
+    #[cfg(not(unix))]
+    fn names(&self, _: &std::fs::Metadata) -> bool {
+        false
+    }
 }
 
 /// Whether `meta` is a file the run writes its output or errors to (`jq . f 1<>f`, `>> f`): the windows
@@ -11651,11 +11698,12 @@ fn judge_regular_files(
     if total < min {
         return None;
     }
+    let run = RunFiles::new();
     for path in files {
         let file = std::fs::File::open(path).ok()?;
         // What was opened, not what the path named a moment ago.
         let meta = file.metadata().ok()?;
-        if !meta.is_file() || names_stdin(&meta) || names_output(&meta) {
+        if !meta.is_file() || run.names(&meta) {
             return None;
         }
         keep(path, file, meta);
