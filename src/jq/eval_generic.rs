@@ -6584,7 +6584,11 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
 
     // #3477, #5691: a count needs no index over the container it counts, nor a string's length
     // or prefix/suffix test the string written out and indexed again.
-    if let Some(count) = crate::jq::eval::eval_owned_count_door::<S>(expr, &owned) {
+    // #7132: and with it every other stage that answers one value off the tree (a key list, a
+    // comparison over a count, `first`/`last`/`nth`, a pipe of those, an `as`-bound count, an `if`
+    // over one): [`eval_owned_value_doors`](crate::jq::eval::eval_owned_value_doors) is the count
+    // door and its siblings, one call, so this frame keeps the one `Option<OwnedValue>` it had.
+    if let Some(count) = crate::jq::eval::eval_owned_value_doors::<S>(expr, &owned) {
         return GenericResult::Owned(count);
     }
 

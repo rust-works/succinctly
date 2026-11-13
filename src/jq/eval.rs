@@ -93503,7 +93503,11 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// suppression and its per-mode rules. The multi-output door (`.children[]?`) is the lazy twin's alone.
 /// A shape added to that list is added here too: `eval_owned_value_doors_agree_with_the_bridge_7132` is
 /// the pin.
-fn eval_owned_value_doors<S: EvalSemantics>(expr: &Expr, input: &OwnedValue) -> Option<OwnedValue> {
+#[inline(never)]
+pub(crate) fn eval_owned_value_doors<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
     eval_owned_value_door_stage::<S>(expr, input)
         .or_else(|| eval_owned_door_pipe::<S>(expr, input))
         .or_else(|| eval_owned_door_bind::<S>(expr, input))
