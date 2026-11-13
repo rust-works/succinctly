@@ -7018,16 +7018,34 @@ impl<'a> YamlString<'a> {
             if pos + 1 < text.len()
                 && (text[pos + 1] == b' ' || text[pos + 1] == b'\t' || text[pos + 1] == b'\n')
             {
+                // #7114: a compact nested sequence (`- - |2`) puts the header's parent at the
+                // innermost dash, whose column is what the content is measured against. Walk the
+                // chain of `- ` prefixes to it; one dash is the same column as before.
+                let mut dash = pos;
+                loop {
+                    let mut next = dash + 1;
+                    while next < indicator_pos && matches!(text[next], b' ' | b'\t') {
+                        next += 1;
+                    }
+                    let is_dash = next < indicator_pos
+                        && text[next] == b'-'
+                        && matches!(text.get(next + 1), Some(b' ' | b'\t' | b'\n' | b'\r'));
+                    if !is_dash {
+                        break;
+                    }
+                    dash = next;
+                }
+                let dash_indent = line_indent + (dash - pos);
                 // Check if there's a `:` between `-` and the indicator
-                // If so, it's `- key: |` and we should return line_indent + 2
-                // If not, it's `- |` and we should return line_indent
+                // If so, it's `- key: |` and we should return the dash's column + 2
+                // If not, it's `- |` and we should return the dash's column
                 let has_colon = text
-                    .get((pos + 2)..indicator_pos)
+                    .get((dash + 2)..indicator_pos)
                     .is_some_and(|slice| slice.contains(&b':'));
                 if has_colon {
-                    return line_indent + 2;
+                    return dash_indent + 2;
                 }
-                return line_indent;
+                return dash_indent;
             }
         }
 
