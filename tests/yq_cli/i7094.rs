@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 
-use crate::run_yq_stdin;
+use crate::{run_yq_stdin, run_yq_stdin_with_stderr};
 
 /// (input, filter, yq's stdout).
 const ROWS: &[(&str, &str, &str)] = &[
@@ -302,12 +302,12 @@ fn a_binding_over_several_values_writes_each_value_7094() -> Result<()> {
     Ok(())
 }
 
-/// The body of a binding is written once in the fold, so chained bindings over several values grow
-/// the parsed filter linearly (a draft that copied the body for the one-value case doubled it at
-/// each binding, and twenty took more than 3 GB to parse). One value per source keeps the run
-/// itself to one pass per binding.
+/// The body of a binding is written once in the fold, so chained bindings over a sequence grow the
+/// parsed filter linearly (a draft that copied the body for the one-value case doubled it at each
+/// binding, and twenty took more than 3 GB to parse). One value per source keeps the run itself to
+/// one pass per binding, so a doubling shows as the time it takes.
 #[test]
-fn chained_bindings_over_a_sequence_parse_in_bounded_memory_7094() -> Result<()> {
+fn chained_bindings_over_a_sequence_stay_linear_7094() -> Result<()> {
     let started = std::time::Instant::now();
     let bindings: Vec<String> = (0..20)
         .map(|i| format!(".x[] as $v{i} | .y += $v{i}"))
@@ -316,5 +316,29 @@ fn chained_bindings_over_a_sequence_parse_in_bounded_memory_7094() -> Result<()>
     let (stdout, status) = run_yq_stdin(&filter, "k: {x: [1]}\n", &[])?;
     assert_eq!((stdout.as_str(), status), ("k: {x: [1], y: 20}\n", 0));
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    Ok(())
+}
+
+/// The fold evaluates the source once, by the binding yq would run, whatever the number of values:
+/// a draft that re-read the source for the one-value case ran it twice (two `debug` lines, two reads
+/// of `input`).
+#[test]
+fn the_source_of_a_folded_binding_is_evaluated_once_7094() -> Result<()> {
+    for (input, expected_stdout, lines) in [
+        ("k: {x: [1]}\n", "k: {x: [1], y: 1}\n", 1),
+        ("k: {x: [1, 2]}\n", "k: {x: [1, 2], y: 2}\n", 2),
+    ] {
+        let (stdout, stderr, status) = run_yq_stdin_with_stderr(
+            "with(.k; (.x[] | debug) as $v | .y = $v)",
+            input,
+            &["--jq-extensions"],
+        )?;
+        assert_eq!((stdout.as_str(), status), (expected_stdout, 0), "{input:?}");
+        assert_eq!(
+            stderr.matches("DEBUG").count(),
+            lines,
+            "{input:?}: {stderr}"
+        );
+    }
     Ok(())
 }
