@@ -1261,6 +1261,26 @@ $ succinctly yq --eval-all -o=json -I0 '. as $x | [$x]' f1.yaml f2.yaml
 `. as $d | $d` (no collect in the body) agrees, as does every other row of #2427's own
 capture table.
 
+### `=` and `+=` read their right side once over the whole document list under `--eval-all` ([#7137](https://github.com/rust-works/succinctly/issues/7137))
+
+Real yq's `assignUpdateOperator` creates the left side's targets, evaluates the right side **once** against the context it was given, and applies that side's last output to every node.
+Under `ea` the context is every document of every file, so the right side sees the list: `yq ea '.k = fi' a1.yaml a2.yaml a3.yaml` is `k: 2` in all three documents (the last file's index), `.k = .k` writes the last document's own `k` into each, and `.k = [fi]` is `[0, 1, 2]` in each.
+`+=`, `-=`, `*=` read their right side the same way (`.k += fi` adds the last file's index to each `k`), while `|=` runs its filter once per node and is per document (`.k |= fi` is `0`, `1`, `2`).
+A right side that is a literal, or a mapping of literals, is the same either way and stays on the per-document route.
+`succinctly yq` evaluated the right side once per document, so every one of these printed each document's own value.
+A navigation in the right side reads the context read-only, so a document without the key contributes nothing: `.k = .c` over `a: 1` / `c: 3` / `e: 5` is `k: 3` in all three, not the last document's `null`.
+The right side is evaluated over the documents with the left side's targets already created, so `.k = keys` lists `k`, as in yq.
+The assignment hands back the nodes it wrote into, flag and origin intact, so `.k = fi | .m = fi` is `m: 2` and `.k = 1 | [.]` is one array of every document.
+131 rows over two sets of three files (117 of them differ from the previous release) are pinned against yq v4.53.3 in `tests/yq_cli/i7137.rs`.
+Without `--eval-all` each file is its own evaluation and the right side sees one document, in yq and here.
+
+Still different:
+- A right side that holds the list and is written into it, `.k = [.]`: yq's array holds the live nodes, so a later document's copy shows the earlier ones' new `k`.
+  Here each document gets a copy of the list as it was.
+- The separator between results of a filter that follows the assignment (`.k = 1 | length` is `2` three times with no `---` in yq): the document-index rule of [#7019](https://github.com/rust-works/succinctly/issues/7019).
+  `.k = 1 | . + {"z": 1}` is the nine results yq prints, in its order, with `---` between all of them where yq separates only the ones from different documents.
+- `select(fi == 0)` and `[.] | .[0] | fi` inside a right side without `--eval-all`: yq selects over the one document there and reads `0` for a node a collect built, where `succinctly yq` reads the document's own `fi`.
+
 ### An arithmetic result keeps its left operand's origin under `--eval-all` ([#6969](https://github.com/rust-works/succinctly/issues/6969))
 
 A result of `+`, `-`, `*`, `/` or `%` is read from where its left operand was, as in yq: `yq ea '. * {"z":1} | document_index' md.yaml` over two documents is `0 0 1 1`, and `file_index` and `filename` follow the same way.
