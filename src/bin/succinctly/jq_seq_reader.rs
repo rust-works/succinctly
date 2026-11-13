@@ -3237,7 +3237,7 @@ mod tests {
             "\x1e\"\\u0041\"\n",
         ];
         let mut text = String::new();
-        for _ in 0..1 + rng.below(5) {
+        for _ in 0..=rng.below(5) {
             if rng.below(3) == 0 {
                 text.push_str(&clean_record(rng));
             } else {
@@ -3275,9 +3275,7 @@ mod tests {
     fn a_resumed_walk_reads_the_rest_of_the_stream_as_the_whole_walk_7164() {
         let mut rng = Rng(0x7164_7164);
         for case in 0..4000 {
-            let records: String = (0..1 + rng.below(6))
-                .map(|_| clean_record(&mut rng))
-                .collect();
+            let records: String = (0..=rng.below(6)).map(|_| clean_record(&mut rng)).collect();
             let rest = tail(&mut rng);
             let whole = [records.as_bytes(), &rest].concat();
             let (whole_warnings, whole_values) = walked(&whole);
@@ -3301,9 +3299,7 @@ mod tests {
     fn the_token_byte_is_the_readers_own_7164() {
         let mut rng = Rng(0x1e1e_7164);
         for case in 0..4000 {
-            let records: String = (0..1 + rng.below(4))
-                .map(|_| clean_record(&mut rng))
-                .collect();
+            let records: String = (0..=rng.below(4)).map(|_| clean_record(&mut rng)).collect();
             let mut emit = |_: &str, _: usize| {};
             let mut reader = Reader::new(bom_prefix(&[]), &mut emit);
             reader.run(records.as_bytes(), 0, &[]);

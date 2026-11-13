@@ -20,7 +20,13 @@ lines has no fault, so these cases test where windows cut lines: invalid UTF-8, 
 very long lines and no final line break. `--inputs` runs programs that read `input`/`inputs` over `--files`
 files (2 to 32), which their own reader takes a window at a time, one file after another (#7024), against the
 same files as `/dev/fd/N`: those print `input_line_number`, `input_filename` and `$__loc__`, and read past
-faults. (The seeds of #7048's runs do not reproduce: the generator
+faults. `--pipe --seq` feeds a `--seq` stream on the pipe (#7164): mostly records of RFC 7464's own framing
+(`RS value LF`), which the route reads a window at a time, with a turn or two at a random record (often one by
+a window's end, the 4 MiB probe's or the stream's): a record jq's reader warns about, an RS with nothing in it,
+text before an RS, a value with two documents, a bare `n` after a token that left a `u` in jq's token buffer,
+a stream that ends without its line break. From the first turn on the route reads the stream whole, so these
+cases test that hand-over, against the same bytes on a pipe named `-` (`/dev/stdin` reads a `--seq` stream
+that starts with a BOM as no records). (The seeds of #7048's runs do not reproduce: the generator
 now cuts the stream into files and picks among more programs.)
 
 The streams mix the shapes that decide where a window ends: documents of every kind, pretty-printed ones that
@@ -37,7 +43,7 @@ prove nothing, so a case that comes out shorter is a bug of the generator and st
 
 Usage:
     cargo build --release --features cli,simd,regex,serde
-    scripts/jq-windowed-file-fuzz.py [--bin PATH] [-n N] [--seed S] [--work DIR] [--files K | --pipe] [--raw | --inputs] [--cap-mb MB]
+    scripts/jq-windowed-file-fuzz.py [--bin PATH] [-n N] [--seed S] [--work DIR] [--files K | --pipe] [--raw | --inputs | --seq] [--cap-mb MB]
 Each case takes about 0.2 s with a release build. Exit 1 on any difference (a timeout, a crash of the
 script's own and a run that exceeds `--cap-mb` of address space count as one); the stream that differed is
 kept in `--work` as `windowed-fuzz-<seed>-<case>-<file>.json` (one per file), and the case is printed with the mutations applied,
@@ -115,6 +121,27 @@ INPUTS_PROGRAMS = [
     ["-c", "[(.id? // .), (input | .id? // .)]"],
     ["-cn", 'inputs | select(.id? == 40001) | error("e")'],
     ["-n", "try ([inputs] | length) catch ."],
+]
+
+# `--seq` programs over a pipe (#7164): the raw-bytes fast path, a field read, the line a runtime error names, an
+# exit-status filter and a walk.
+SEQ_PROGRAMS = [
+    ["--seq", "-c", "."],
+    ["--seq", "-c", ".id?"],
+    ["--seq", "-c", 'if ((.id? // 0) | numbers) % 4001 == 7 then error("e") else empty end'],
+    ["--seq", "-e", "select(.id? == 12345) | .name?"],
+    ["--seq", "-r", "tojson"],
+    ["--seq", "-c", "[.. | numbers] | length"],
+]
+
+# What a `--seq` stream can turn at (#7164), each put at a record's start: records jq's reader warns about or
+# reads otherwise than as one value each, and clean records after which a bare `n` reads the stale byte.
+SEQ_TURNS = [
+    b"\x1en\n", b"\x1enul\n", b"\x1e[n]\n", b'\x1e{"a":1\n', b'\x1e"open\n', b"\x1e12.5", b"\x1e", b"\x1e\x1e",
+    b"junk\n", b"\n", b"\x1enan\n", b"\x1e1 2\n", b"\x1e[1,]\n", b"\x1e}\n", b'\x1e"\\u0041"\n\x1en\n',
+    b'\x1e["x\\u0075"]\n\x1en\n', b"\x1enull\n\x1en\n", b'\x1e"bad \xff"\n', b'\x1e"\\ud800"\n', b"\x1etrue",
+    b"\x1e1\x1e2\n", b"\x1e{}\r\n", b"\x1e{}{}\n", b"\x1e01\n", b'\x1e"a\tb"\n', b"\x1e" + b"[" * 200 + b"\n",
+    b"\xef\xbb\xbf\x1e1\n",
 ]
 
 MUTATIONS = [
@@ -228,6 +255,55 @@ def build(rng):
     return data, notes
 
 
+def seq_document(rng, i):
+    """One value of a `--seq` record: [`document`]'s, but almost never one that is not a single document (an
+    empty or blank one, two in one), which turns the stream where the turns below are meant to."""
+    while True:
+        text = document(rng, i)
+        single = text.strip() and "}{" not in text and "} {" not in text
+        if single or rng.random() < 0.002:
+            return text
+
+
+def build_seq(rng):
+    """A random `--seq` stream of at least MIN_BYTES (#7164), and the list of what was done to it."""
+    target = rng.randrange(MIN_BYTES + 150_000, 7_500_000)
+    parts, size, i = [], 0, 0
+    while size < target:
+        piece = b"\x1e" + seq_document(rng, i).encode() + b"\n"
+        parts.append(piece)
+        size += len(piece)
+        i += 1
+    notes = []
+    data = b"".join(parts)
+    if rng.random() < 0.2:  # a record bigger than a window, at a record's start
+        at = data.find(b"\x1e", rng.randrange(len(data)))
+        at = len(data) if at < 0 else at
+        data = data[:at] + b"\x1e" + big_document(rng).encode() + b"\n" + data[at:]
+        notes.append("big_record@%d" % at)
+    for _ in range(rng.choice([0, 1, 1, 1, 2, 3])):
+        turn = rng.choice(SEQ_TURNS)
+        where = rng.random()
+        if where < 0.3:  # by a window's end, or the probe's
+            mark = rng.choice([1, 2, 3, 4, 4, 5, 6]) << 20
+            pos = mark + rng.randrange(-300, 300)
+        elif where < 0.45:
+            pos = len(data)
+        elif where < 0.5:
+            pos = 0
+        else:
+            pos = rng.randrange(len(data))
+        pos = min(max(pos, 0), len(data))
+        start = data.find(b"\x1e", pos)
+        pos = len(data) if start < 0 else start
+        data = data[:pos] + turn + data[pos:]
+        notes.append("%r@%d" % (turn[:12], pos))
+    if rng.random() < 0.1:
+        data = data.rstrip(b"\n")
+        notes.append("no_final_newline")
+    return data, notes
+
+
 def cap(megabytes):
     """A `preexec_fn` that limits a run's address space (Linux enforces it; macOS does not)."""
     def limit():
@@ -319,9 +395,9 @@ def run_stdin_file(args, rng, data, program, work, seed):
 
 def run_pipe(args, data, program):
     """One case on a pipe (#7024): windowed (the pipe on standard input) and whole (the same pipe named
-    `/dev/stdin`, which the windowed routes decline), compared."""
+    `/dev/stdin`, or `-` under `--seq`, which the windowed routes decline), compared."""
     windowed = run(args.bin, program, args.cap_mb, feed=data)
-    whole = run(args.bin, program + ["/dev/stdin"], args.cap_mb, feed=data)
+    whole = run(args.bin, program + ["-" if args.seq else "/dev/stdin"], args.cap_mb, feed=data)
     whole = tuple(part.replace(b"/dev/stdin", b"<stdin>") if isinstance(part, bytes) else part for part in whole)
     return windowed, whole, ["<stdin>"], [len(data)]
 
@@ -340,6 +416,8 @@ def main():
                         help="feed each stream on a pipe on standard input instead (#7024); one file only")
     parser.add_argument("--raw", action="store_true",
                         help="run -R programs (#7024): on a pipe with --pipe, else as a regular file on standard input")
+    parser.add_argument("--seq", action="store_true",
+                        help="run --seq programs over --seq streams on a pipe (#7164); needs --pipe")
     parser.add_argument("--inputs", action="store_true",
                         help="run programs that read input/inputs over --files files, 2 to 32 (#7024)")
     args = parser.parse_args()
@@ -349,6 +427,8 @@ def main():
         sys.exit("--inputs reads several files: give --files 2 to 32")
     if args.inputs and (args.raw or args.pipe):
         sys.exit("--inputs is neither --raw nor --pipe")
+    if args.seq and (not args.pipe or args.raw or args.inputs):
+        sys.exit("--seq is a stream on a pipe: give --pipe, and neither --raw nor --inputs")
     if args.pipe and args.files != 1:
         sys.exit("--pipe is one stream: give no --files")
     if not 1 <= args.files <= 512:
@@ -360,11 +440,13 @@ def main():
     rng = random.Random(args.seed)
     differences, started = 0, time.time()
     for case in range(args.n):
-        data, notes = build(rng)
+        data, notes = build_seq(rng) if args.seq else build(rng)
         if len(data) < MIN_BYTES:
             sys.exit("generator bug: case %d is %d bytes, under the windowed route's minimum" % (case, len(data)))
         # A pipe has no file name, and `/dev/stdin` has one: `input_filename` would tell them apart.
-        if args.raw:
+        if args.seq:
+            program = rng.choice(SEQ_PROGRAMS)
+        elif args.raw:
             program = rng.choice(RAW_PROGRAMS + (RAW_FILE_PROGRAMS * 2 if args.files > 1 else []))
         elif args.inputs:
             program = rng.choice(INPUTS_PROGRAMS)

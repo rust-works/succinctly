@@ -72,7 +72,7 @@ fn a_clean_seq_pipe_reads_as_the_whole_stream_does_7164() -> Result<()> {
     for args in PROGRAMS {
         same(args, &clean)?;
     }
-    let (_, err, status) = same(&PROGRAMS[2], &clean)?;
+    let (_, err, status) = same(PROGRAMS[2], &clean)?;
     assert_eq!(
         (err.as_str(), status),
         ("jq: error (at <stdin>:30001): boom\n", 0)
@@ -104,7 +104,7 @@ fn a_seq_pipe_that_turns_is_read_on_as_the_whole_stream_7164() -> Result<()> {
         }
     }
     let stream = format!("{head}\x1e[1,]\n{rest}").into_bytes();
-    let (_, err, _) = same(&PROGRAMS[2], &stream)?;
+    let (_, err, _) = same(PROGRAMS[2], &stream)?;
     assert_eq!(
         err,
         "jq: ignoring parse error: Expected another array element at line 30001, column 5 (need RS to resync)\n\
@@ -160,7 +160,7 @@ fn a_seq_pipe_that_never_turns_plain_or_stops_first_7164() -> Result<()> {
     let clean = records(0..RECORDS);
     for front in ["\u{feff}", "x\n", "\n"] {
         let stream = format!("{front}{clean}").into_bytes();
-        same(&PROGRAMS[1], &stream)?;
+        same(PROGRAMS[1], &stream)?;
     }
     // The last value is in the windows, and the rest reads none.
     let stream = format!("{clean}\x1efalse\n\x1e{{\"a\"\n").into_bytes();
