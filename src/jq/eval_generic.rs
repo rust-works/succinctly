@@ -23293,6 +23293,11 @@ enum YqListStage {
     /// each other one emits every output of the right side over the whole list (the output itself
     /// when that yields none); a left side that yields nothing runs the right side once (#7173).
     Alternative,
+    /// `and` / `or` over inputs that all carry `EvaluateTogether`: real yq's `andOperator` and
+    /// `orOperator` (`operator_booleans.go`) are `crossFunctionWithPrefs` operators over a read-only
+    /// context, so both sides are read over the **whole** list and every left output is paired with
+    /// every right output, with a short circuit on the left (#7184).
+    Boolean,
 }
 
 /// Whether the walk takes an assignment's right side over the list (#7137): there is a slot to hand
@@ -23380,6 +23385,10 @@ fn yq_list_stage(stages: &[Expr], together: bool) -> Option<(usize, YqListStage)
                 }
                 _ if matches!(unwrap_paren(stage), Expr::Alternative(..)) => {
                     found = Some((i, YqListStage::Alternative));
+                    break;
+                }
+                _ if matches!(unwrap_paren(stage), Expr::And(..) | Expr::Or(..)) => {
+                    found = Some((i, YqListStage::Boolean));
                     break;
                 }
                 Expr::Assign { path, value } | Expr::CompoundAssign { path, value, .. }
@@ -23559,6 +23568,12 @@ fn eval_yq_context_pipe<S: EvalSemantics, V: DocumentValue>(
                 Err(flow) => return flow,
             }
         }
+        YqListStage::Boolean => {
+            match boolean_together::<S, V>(&stages[at], &context, optional, cur) {
+                Ok(items) => items,
+                Err(flow) => return flow,
+            }
+        }
         YqListStage::Assign => {
             match assign_together::<S, V>(&stages[at], &context, optional, cur) {
                 Ok(items) => items,
@@ -23573,6 +23588,80 @@ fn eval_yq_context_pipe<S: EvalSemantics, V: DocumentValue>(
     };
 
     eval_yq_context_pipe::<S, V>(rest, &produced, optional, cur, sink)
+}
+
+/// An operand of a list-stage operator (`//`, `and`, `or`) read over the whole context list: the
+/// operand's own stages through the context-list walk, under whatever read-only scope is active
+/// (#7173, #7184). One definition, so the operators cannot disagree about how a side is read.
+fn read_operand_over_list<S: EvalSemantics, V: DocumentValue>(
+    operand: &Expr,
+    context: &[YqContextItem<V>],
+    optional: bool,
+    cur: &core::cell::Cell<YqContextTag>,
+) -> Result<Vec<YqContextItem<V>>, Flow> {
+    let mut flat: Vec<Expr> = Vec::new();
+    yq_flatten_pipe_stages(core::slice::from_ref(operand), &mut flat);
+    collect_yq_context::<S, V>(&flat, context, optional, cur).map_err(Flow::Escaped)
+}
+
+/// `and` / `or` over a context list whose entries all carry `EvaluateTogether` (#7184): both
+/// operands are read over the **whole** list, read-only (an absent key is no node), as
+/// `crossFunctionWithPrefs` reads them over `context.ReadOnlyClone()`.
+///
+/// Each output of the left side is decided by `returnLHSWhen`: under `and` a falsy one is `false` and
+/// under `or` a truthy one is `true`, and the right side is not read for it; any other is paired with
+/// every output of the right side, each pairing the right output's truthiness. A right side with no
+/// output pairs `false` once (`CalcWhenEmpty`), and a left side with no output stands as one `null`:
+/// falsy, so `.zz and 1` is `false` once and `.zz or 1` is a `true` for each output of `1`. The right
+/// side does not depend on the left output, so it is read once, when the first left output needs it,
+/// and an error in it surfaces only then. The booleans are nodes of their own: no flag, no origin.
+fn boolean_together<S: EvalSemantics, V: DocumentValue>(
+    stage: &Expr,
+    context: &[YqContextItem<V>],
+    optional: bool,
+    cur: &core::cell::Cell<YqContextTag>,
+) -> Result<Vec<YqContextItem<V>>, Flow> {
+    let (is_and, left, right) = match unwrap_paren(stage) {
+        Expr::And(left, right) => (true, left, right),
+        Expr::Or(left, right) => (false, left, right),
+        // `yq_list_stage` matched exactly these two to pick `at`.
+        // patchcov: coverage tolerate reason="unreachable: yq_list_stage routes only And and Or here (#7184)"
+        _ => unreachable!("yq_list_stage selects only And/Or as a boolean stage"),
+        // patchcov: coverage end
+    };
+    let _read_only = yq_read_only_context::enter();
+    let over = |operand: &Expr| read_operand_over_list::<S, V>(operand, context, optional, cur);
+    let truthy = |item: &YqContextItem<V>| generic_item_is_truthy::<V>(&item.to_generic_item());
+    let lefts = over(left)?;
+    // A side with no output stands as one falsy `null`.
+    let decisions: Vec<bool> = if lefts.is_empty() {
+        vec![false]
+    } else {
+        lefts.iter().map(truthy).collect()
+    };
+    let boolean = |value: bool| {
+        YqContextItem::new(
+            YqContextNode::Owned(OwnedValue::Bool(value)),
+            YqContextTag::default(),
+        )
+    };
+    let mut rights: Option<Vec<bool>> = None;
+    let mut out: Vec<YqContextItem<V>> = Vec::new();
+    for left_truthy in decisions {
+        // `and` is decided by a falsy left, `or` by a truthy one.
+        if left_truthy != is_and {
+            out.push(boolean(left_truthy));
+            continue;
+        }
+        if rights.is_none() {
+            rights = Some(over(right)?.iter().map(truthy).collect());
+        }
+        match rights.as_deref().unwrap_or_default() {
+            [] => out.push(boolean(false)),
+            bits => out.extend(bits.iter().map(|&bit| boolean(bit))),
+        }
+    }
+    Ok(out)
 }
 
 /// `//` over a context list whose entries all carry `EvaluateTogether` (#7173): both operands are
@@ -23597,11 +23686,7 @@ fn alternative_together<S: EvalSemantics, V: DocumentValue>(
         unreachable!("yq_list_stage selects only an Alternative as an alternative stage")
         // patchcov: coverage end
     };
-    let over = |operand: &Expr| {
-        let mut flat: Vec<Expr> = Vec::new();
-        yq_flatten_pipe_stages(core::slice::from_ref(operand), &mut flat);
-        collect_yq_context::<S, V>(&flat, context, optional, cur).map_err(Flow::Escaped)
-    };
+    let over = |operand: &Expr| read_operand_over_list::<S, V>(operand, context, optional, cur);
     let lefts = over(left)?;
     if lefts.is_empty() {
         return over(right);

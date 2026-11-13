@@ -1270,6 +1270,16 @@ $ succinctly yq --eval-all -o=json -I0 '. as $x | [$x]' f1.yaml f2.yaml
 `. as $d | $d` (no collect in the body) agrees, as does every other row of #2427's own
 capture table.
 
+### `and` and `or` read both operands over the whole document list under `--eval-all` ([#7184](https://github.com/rust-works/succinctly/issues/7184))
+
+yq's `andOperator` and `orOperator` are `crossFunctionWithPrefs` operators over a read-only context, so under `EvaluateTogether` both sides are read over the list (an absent key is no node) and every left result is paired with every right result.
+A left result that decides (falsy under `and`, truthy under `or`) is the answer and the right side is not read for it; a left side with no output stands as one falsy `null`; a right side with no output pairs `false` once.
+So `(.k and .k)` over four documents of which three have `k` is nine `true`, `.zz and 1` is one `false` and `.zz or 1` is four `true`.
+The right side is read when the first undecided left result needs it, so an error in it is raised only then.
+The booleans are nodes of their own, with no flag and no origin.
+`succinctly yq` ran both per document.
+33 rows over three files and four documents are pinned against yq v4.53.3 in `tests/yq_cli/i7184.rs`.
+
 ### `//` reads both operands over the whole document list under `--eval-all` ([#7173](https://github.com/rust-works/succinctly/issues/7173))
 
 yq's `alternativeOperator` is a `crossFunctionWithPrefs` operator, so under `EvaluateTogether` it evaluates the left side over the list, keeps each truthy output, and for every other output emits all of the right side's outputs over the list (the output itself when the right side yields none); a left side with no output runs the right side once.
