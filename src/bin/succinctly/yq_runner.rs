@@ -5719,9 +5719,10 @@ fn propagate_compound_alias_mark(
 /// yq's `+` onto a non-empty sequence of a node that is not a sequence appends a copy that takes
 /// the quoting of the sequence's *first* element (`toNodes` in `operator_add.go`): `.a += "cat"` on
 /// `a: ['dog']` is `a: ['dog', 'cat']`, and `.g += 5` on a sequence of single-quoted strings writes
-/// `'5'` (#7070). A sequence on the right (`+= ["cat"]`) keeps its own elements' spelling, and an
-/// empty or absent target has no first element to copy. Only a scalar literal or a static read of a
-/// scalar is followed, and only a single or double quote is copied.
+/// `'5'` (#7070, not reproduced: the printer quotes strings only). A sequence on the right
+/// (`+= ["cat"]`) keeps its own elements' spelling, and an empty or absent target has no first
+/// element to copy. Only a string literal or a static read of a string is followed, and only a
+/// single or double quote is copied.
 fn propagate_compound_append_style(
     op: &AssignOp,
     path_expr: &Expr,
@@ -5749,12 +5750,17 @@ fn propagate_compound_append_style(
     if before.is_empty() || after.len() != before.len() + 1 {
         return;
     }
+    // A string only: the printer quotes strings, and yq's quoted number or boolean (`'5'`) is not
+    // reproduced (limitations.md).
+    let mut value_expr = value_expr;
+    while let Expr::Paren(inner) = value_expr {
+        value_expr = inner;
+    }
     let scalar_rhs = match value_expr {
-        Expr::Literal(Literal::Null) => false,
-        Expr::Literal(_) => true,
+        Expr::Literal(literal) => matches!(literal, Literal::String(_)),
         other => static_nav_steps(other)
             .and_then(|steps| owned_value_at(pristine_value, &meta_path_of(&steps)))
-            .is_some_and(|read| !matches!(read, OwnedValue::Array(_) | OwnedValue::Null)),
+            .is_some_and(|read| matches!(read, OwnedValue::String(_))),
     };
     if !scalar_rhs {
         return;

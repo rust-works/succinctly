@@ -33,6 +33,8 @@ const ROWS: &[(&str, &str)] = &[
     (".a += {\"k\":1}", "a: ['dog', {k: 1}]\nc: [\"p\"]\nd: [x, 'y']\ne: [\"p\", q]\nf: [q, \"p\"]\ng:\n  - 'x'\n  - \"y\"\nh:\n  - plain\n  - 'x'\ni: []\nj: ['dog', \"cat\"]\n"),
     (".a += [1]", "a: ['dog', 1]\nc: [\"p\"]\nd: [x, 'y']\ne: [\"p\", q]\nf: [q, \"p\"]\ng:\n  - 'x'\n  - \"y\"\nh:\n  - plain\n  - 'x'\ni: []\nj: ['dog', \"cat\"]\n"),
     (".j += \"z\" | .j[2]", "z\n"),
+    (".a += (\"cat\")", "a: ['dog', 'cat']\nc: [\"p\"]\nd: [x, 'y']\ne: [\"p\", q]\nf: [q, \"p\"]\ng:\n  - 'x'\n  - \"y\"\nh:\n  - plain\n  - 'x'\ni: []\nj: ['dog', \"cat\"]\n"),
+    (".c += ((\"q\"))", "a: ['dog']\nc: [\"p\", \"q\"]\nd: [x, 'y']\ne: [\"p\", q]\nf: [q, \"p\"]\ng:\n  - 'x'\n  - \"y\"\nh:\n  - plain\n  - 'x'\ni: []\nj: ['dog', \"cat\"]\n"),
 ];
 
 #[test]

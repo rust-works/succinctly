@@ -8237,7 +8237,8 @@ These still differ:
 - **A write: `.a = .a + "z"` and `.a |= . + "z"`** print the appended scalar plain (`['dog', cat]`) where yq copies the quote (`['dog', 'cat']`).
   The write route replays the presentation of the old document and the appended element has none.
   `.a += "z"` does copy it (`i7070_assign_style.rs`, 19 rows): a lone `+=` onto a static path, with a scalar literal or a static read of a scalar on the right, copies a single or double quote of the first element.
-  A comma of targets (`(.a, .c) += "z"`), a computed right side (`+= (.d | length)`) and a stage after the write (`.a += "z" | .a style=""`) still print it plain.
+  A comma of targets (`(.a, .c) += "z"`), a computed right side (`+= (.d | length)`), a second write in the same pipe (`.a += "x" | .a += "y"`, where only the first is followed) and a stage after the write (`.a += "z" | .a style=""`) still print it plain.
+  A right side that is a static read of an anchored node (`.a += .b` over `b: &x y`) gets the quote but not the `&x` that yq writes.
 - **A number or a boolean** appended (`.a + 5`, `+= true`) prints bare here and quoted by yq (`['x', '5']`, `['x', 'true']`): yq's copied style turns the scalar into a quoted string.
 - **A right side that is a variable or an assignment's value** (`.a as $x | [$x + "z"]`, `.c = (.a + "z")`) loses the sequence's presentation, as it did before.
 - **`.a + null`** and **`[] + ["z"]`** print a block sequence where yq keeps the left sequence's flow style.
