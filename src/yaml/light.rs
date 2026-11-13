@@ -2548,12 +2548,12 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 // failure. Checked on the source bytes first (a plain scalar of 18 bytes or more that
                 // opens with a digit, 18 for `0x8000000000000000`), ahead of the direct transcoding, which writes a `0x` spelling
                 // as the string it is here.
-                if matches!(s, YamlString::Unquoted { .. }) && !self.index.canonicalize_numbers() {
-                    let raw = s.raw_bytes();
-                    if raw.len() >= 18 && raw[0].is_ascii_digit() {
-                        if let Ok(text) = s.as_str() {
-                            reject_int_past_i64(&text)?;
-                        }
+                if matches!(s, YamlString::Unquoted { .. })
+                    && may_spell_a_large_integer(s.raw_bytes())
+                    && !self.index.canonicalize_numbers()
+                {
+                    if let Ok(text) = s.as_str() {
+                        reject_int_past_i64(&text)?;
                     }
                 }
                 // Direct transcoding optimization
@@ -5009,6 +5009,18 @@ fn reject_non_finite_json_scalar(
     }
 }
 
+/// The one prefilter of [`int_past_i64_failure`] (#7141): 18 bytes (`0x8000000000000000`), a digit first,
+/// and only the characters an unsigned integer spelling holds, so a timestamp or an id with a `-` or a
+/// `:` is ruled out on its bytes, before any text is decoded or copied.
+#[inline]
+fn may_spell_a_large_integer(bytes: &[u8]) -> bool {
+    bytes.len() >= 18
+        && bytes[0].is_ascii_digit()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_hexdigit() || matches!(b, b'_' | b'x' | b'X' | b'o' | b'O'))
+}
+
 /// The failure yq's JSON encoder raises for a plain scalar go-yaml types `!!int` that does not fit a
 /// signed 64-bit integer (#7141), or `None` for any other text.
 ///
@@ -5023,8 +5035,7 @@ fn reject_non_finite_json_scalar(
 #[cold]
 #[inline(never)]
 fn int_past_i64_failure(text: &str) -> Option<String> {
-    let bytes = text.as_bytes();
-    if bytes.len() < 18 || !bytes[0].is_ascii_digit() {
+    if !may_spell_a_large_integer(text.as_bytes()) {
         return None;
     }
     let plain: alloc::string::String = text.chars().filter(|&c| c != '_').collect();
