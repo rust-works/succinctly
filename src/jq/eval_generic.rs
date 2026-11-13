@@ -6479,10 +6479,12 @@ pub fn format_yq_encoder_from_tree<C: DocumentCursor>(
     }
     let meta = tree.meta();
     let mut leading = String::new();
-    if matches!(encoder, YqOutputEncoder::Xml(_))
-        && (meta.preamble().is_some() || meta.head_is_header())
+    if matches!(
+        encoder,
+        YqOutputEncoder::Xml(_) | YqOutputEncoder::Kyaml(..)
+    ) && (meta.preamble().is_some() || meta.head_is_header())
     {
-        leading = pristine.xml_leading_content().unwrap_or_default();
+        leading = pristine.yq_leading_content().unwrap_or_default();
         // What the header holds is not the node's own comment as well.
         comments.own.head.clear();
         // After an explicit `---` the tree holds the header's comments as the first node's head,
@@ -16821,7 +16823,9 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 || (EncoderComments::default(), String::new()),
                 |c| {
                     let leading = match encoder {
-                        YqOutputEncoder::Xml(_) => c.xml_leading_content().unwrap_or_default(),
+                        YqOutputEncoder::Xml(_) | YqOutputEncoder::Kyaml(..) => {
+                            c.yq_leading_content().unwrap_or_default()
+                        }
                         _ => String::new(),
                     };
                     (collect_encoder_comments(c, 0), leading)

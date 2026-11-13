@@ -3349,9 +3349,10 @@ pub enum YqOutputEncoder {
     Ini,
     /// `-o=toml`
     Toml,
-    /// `-o=kyaml`, with `-I` as the indent, and whether `-r` / `--unwrapScalar` prints a string result as
-    /// its own text (#7093)
-    Kyaml(usize, bool),
+    /// `-o=kyaml`, with `-I` as the indent, whether `-r` / `--unwrapScalar` prints a string result as
+    /// its own text (#7093), and whether the first document's leading `---` is written (`-N` says not,
+    /// #7158)
+    Kyaml(usize, bool, bool),
     /// `-o=xml`, with `-I` and the `--xml-*` options
     Xml(Box<XmlOptions>),
     /// `-o=base64`: a string only, and no line end

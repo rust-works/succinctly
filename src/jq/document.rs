@@ -915,7 +915,7 @@ pub trait DocumentCursor: Sized + Copy + Clone {
 
     /// The first document's leading block as yq's XML encoder reads it: verbatim, a `---` line as
     /// yq's own `$yqDocSeparator$` (#7117). `None` as [`props_leading_content`](Self::props_leading_content).
-    fn xml_leading_content(&self) -> Option<String> {
+    fn yq_leading_content(&self) -> Option<String> {
         None
     }
 
