@@ -8237,15 +8237,19 @@ In jq mode (`env(VAR)` is succinctly's extension there) the argument stays an id
 - **The wording of the errors differs.**
   An empty argument (`strenv()`, `env()`) and an extra `)` (`strenv(a(b))`) fail in both; yq says `invalid input text "strenv()"` and `bad expression, got close brackets without matching opening bracket`, this says `parse error ... expected identifier, found ')'` and `unexpected character ')'`.
 
-## A scalar appended to a sequence takes the first element's quote style in a construction, not yet in a write ([#7070](https://github.com/rust-works/succinctly/issues/7070))
+## A scalar appended to a sequence takes the first element's style, in a construction and in a write ([#7070](https://github.com/rust-works/succinctly/issues/7070))
 
 yq copies the first element's `Style` onto a scalar that `+` appends to a sequence: `a: ['x']` with `.a + "z"` is `['x', 'z']`, `[x, 'y']` is `[x, 'y', z]`, and a block sequence stays a block sequence.
 A construction does the same (`.a + "z"`, `[.a + "z"]`, `{"k": (.a + "z")}`); it used to lose the sequence's flow style and every quote.
 `tests/yq_cli/i7070_append_style.rs` pins 165 rows captured from yq v4.53.3, among them an appended scalar that carries an anchor, a comment, a tag or a block style.
+A write copies it too when it appends one string literal: `.a += "z"`, `.a |= . + "z"`, `.a = .a + "z"` and a pipe of such writes print `['dog', 'cat']` over `a: ['dog']`, `- "z"` under a double-quoted block sequence and `- |-` / `z` under a literal block (a single or double quote, a literal or a folded block are copied).
+`tests/yq_cli/i7070_write_append_style.rs` pins 231 rows of that.
 These still differ:
 
-- **A write: `.a += "z"`, `.a = .a + "z"` and `.a |= . + "z"`** print the appended scalar plain (`['dog', cat]`) where yq copies the quote (`['dog', 'cat']`).
-  The write route replays the presentation of the old document and the appended element has none.
+- **A write that does not append one string literal, or that the static write analysis does not take**: a comma target (`(.a, .b) += "z"`), a `style=` stage after the write (`.a += "z" | .a style=""`), and an empty flow sequence with `= .a + "z"` (`a: []` is `- z` in yq, `[z]` here) print the appended string plain.
+  The write route replays the presentation of the old document and the appended element has none, except where the write names a path and a string to append.
+- **A pipe that mixes an append with another change of the sequence's length**: `del(.a[0]) | .a += "z" | .a += "q"` and `.a += "z" | .a += ["w"]` print the appended strings plain where yq quotes them, and `.a += "z" | .a = ["p"]` quotes the `p` that yq leaves plain (as before).
+  The style is given to the elements past the old end only when every one of them came from a write that appends a string.
 - **A number or a boolean** appended (`.a + 5`, `+= true`) prints bare here and quoted by yq (`['x', '5']`, `['x', 'true']`): yq's copied style turns the scalar into a quoted string.
 - **A right side that is a variable or an assignment's value** (`.a as $x | [$x + "z"]`, `.c = (.a + "z")`) loses the sequence's presentation, as it did before.
 - **`.a + null`** and **`[] + ["z"]`** print a block sequence where yq keeps the left sequence's flow style.

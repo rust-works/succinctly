@@ -28,7 +28,7 @@ use succinctly::jq::stream::StreamFailure;
 use succinctly::jq::{
     self, alias_identity, assert_value_tree_depth, is_alias_sensitive_assign,
     nesting_depth_exceeded_message, nonfinite_display_string, nonfinite_literal_display,
-    sync_aliased_paths, sync_merged_members, AssignOp, Builtin, DefScope, EvalError, Expr,
+    sync_aliased_paths, sync_merged_members, ArithOp, AssignOp, Builtin, DefScope, EvalError, Expr,
     FormatType, Literal, LuaOptions, MetaSlot, NumberRepr, ObjectKey, ObjectMap, OwnedValue,
     QueryResult, XmlOptions, YqOutputEncoder, YqSemantics,
 };
@@ -3618,6 +3618,9 @@ struct WriteTarget {
     /// `del(.arr[0], .arr[2])` share a stage and name slots of the same array; a later stage's
     /// static index is read after every earlier `del` has renumbered it.
     stage: usize,
+    /// The write appends one string literal to the sequence at the path (`+= "z"`, `|= . + "z"`,
+    /// `= PATH + "z"`, #7070): yq copies the quote style of the sequence's first element onto it.
+    appends: bool,
 }
 
 /// Collect the [`PathStep`]s of a *static* navigation chain, returning
@@ -3713,6 +3716,19 @@ fn static_path_steps(expr: &Expr, out: &mut Vec<PathStep>) -> bool {
     }
 }
 
+/// `expr` without its enclosing parentheses.
+fn strip_parens(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Paren(inner) => strip_parens(inner),
+        other => other,
+    }
+}
+
+/// Whether `expr` is a string literal written in the filter (`"z"`), parentheses aside (#7070).
+fn is_string_literal(expr: &Expr) -> bool {
+    matches!(strip_parens(expr), Expr::Literal(Literal::String(_)))
+}
+
 /// Whether `expr` produces a value that reads nothing from the document, so
 /// every node in it is freshly constructed (#870).
 ///
@@ -3774,26 +3790,38 @@ fn collect_write_targets(expr: &Expr) -> Option<Vec<WriteTarget>> {
     }
 
     fn push(lhs: &Expr, kind: WriteKind, flags: (bool, bool), out: &mut Vec<WriteTarget>) -> bool {
+        push_appending(lhs, kind, flags, false, out)
+    }
+
+    /// [`push`] for a write that may append one string literal to the sequence at `lhs`.
+    fn push_appending(
+        lhs: &Expr,
+        kind: WriteKind,
+        flags: (bool, bool),
+        appends: bool,
+        out: &mut Vec<WriteTarget>,
+    ) -> bool {
         let stage = next_stage(out);
-        push_at(lhs, kind, flags, stage, out)
+        push_at(lhs, kind, flags, appends, stage, out)
     }
 
     fn push_at(
         lhs: &Expr,
         kind: WriteKind,
         (fresh, copies): (bool, bool),
+        appends: bool,
         stage: usize,
         out: &mut Vec<WriteTarget>,
     ) -> bool {
         match lhs {
-            Expr::Paren(inner) => push_at(inner, kind, (fresh, copies), stage, out),
+            Expr::Paren(inner) => push_at(inner, kind, (fresh, copies), appends, stage, out),
             // `del(.arr[0], .arr[2])` removes both, and each branch is a
             // path of its own — a generator is only valid on a `del`'s
             // left, never an assignment's, so this arm is gated on `Del`
             // rather than accepting `.a, .b = 1`.
             Expr::Comma(branches) if kind == WriteKind::Del => branches
                 .iter()
-                .all(|b| push_at(b, kind, (fresh, copies), stage, out)),
+                .all(|b| push_at(b, kind, (fresh, copies), appends, stage, out)),
             _ => {
                 let mut path = Vec::new();
                 if !static_path_steps(lhs, &mut path) {
@@ -3805,6 +3833,7 @@ fn collect_write_targets(expr: &Expr) -> Option<Vec<WriteTarget>> {
                     fresh,
                     copies,
                     stage,
+                    appends,
                 });
                 true
             }
@@ -3823,17 +3852,35 @@ fn collect_write_targets(expr: &Expr) -> Option<Vec<WriteTarget>> {
             // not closed is a `copies` write: the node it copies brings its presentation.
             Expr::Assign { path, value } => {
                 let closed = is_closed_literal(value);
-                push(path, WriteKind::Set, (closed, !closed), out)
+                // `.a = .a + "z"`: the right side reads the same path and adds a string literal.
+                let appends = matches!(
+                    strip_parens(value),
+                    Expr::Arithmetic { op: ArithOp::Add, left, right, .. }
+                        if strip_parens(left) == strip_parens(path) && is_string_literal(right)
+                );
+                push_appending(path, WriteKind::Set, (closed, !closed), appends, out)
             }
-            Expr::Update { path, filter } => push(
-                path,
-                WriteKind::Set,
-                (is_closed_literal(filter), false),
-                out,
-            ),
-            Expr::CompoundAssign { path, .. } | Expr::AlternativeAssign { path, .. } => {
-                push(path, WriteKind::Set, (false, false), out)
+            Expr::Update { path, filter } => {
+                // `.a |= . + "z"`.
+                let appends = matches!(
+                    strip_parens(filter),
+                    Expr::Arithmetic { op: ArithOp::Add, left, right, .. }
+                        if matches!(strip_parens(left), Expr::Identity) && is_string_literal(right)
+                );
+                push_appending(
+                    path,
+                    WriteKind::Set,
+                    (is_closed_literal(filter), false),
+                    appends,
+                    out,
+                )
             }
+            Expr::CompoundAssign { path, op, value } => {
+                // `.a += "z"`.
+                let appends = matches!(op, AssignOp::Add) && is_string_literal(value);
+                push_appending(path, WriteKind::Set, (false, false), appends, out)
+            }
+            Expr::AlternativeAssign { path, .. } => push(path, WriteKind::Set, (false, false), out),
             Expr::Builtin(Builtin::Del(inner)) => push(inner, WriteKind::Del, (false, false), out),
             // #2855: `sort_keys(f)` is a write (reorders `f`'s own mapping
             // entries in place) exactly like `|=`'s -- same `WriteKind::Set`,
@@ -3862,6 +3909,7 @@ fn collect_write_targets(expr: &Expr) -> Option<Vec<WriteTarget>> {
                     fresh: is_closed_literal(value),
                     copies: !is_closed_literal(value),
                     stage: next_stage(out),
+                    appends: false,
                 });
                 true
             }
@@ -3888,6 +3936,7 @@ fn collect_write_targets(expr: &Expr) -> Option<Vec<WriteTarget>> {
                     fresh: false,
                     copies: false,
                     stage: next_stage(out),
+                    appends: false,
                 });
                 true
             }
@@ -4106,7 +4155,7 @@ fn resolve_stage_order(out: Vec<WriteTarget>) -> Option<Vec<WriteTarget>> {
 /// A write path, relative to the node currently being reconciled, paired
 /// with what the write did there and whether its value was constructed
 /// outright (#870).
-type RelTarget<'t> = (&'t [PathStep], WriteKind, bool, bool);
+type RelTarget<'t> = (&'t [PathStep], WriteKind, bool, bool, bool);
 
 /// Turn a jq index (possibly negative) into a slot of a `len`-element
 /// container, matching `numeric_key_to_index`'s from-the-end convention.
@@ -4132,7 +4181,7 @@ fn key_deleted_here(targets: &[RelTarget<'_>], key: &str) -> bool {
 fn has_fresh_set_here(targets: &[RelTarget<'_>]) -> bool {
     targets
         .iter()
-        .any(|(steps, kind, fresh, _)| steps.is_empty() && *kind == WriteKind::Set && *fresh)
+        .any(|(steps, kind, fresh, ..)| steps.is_empty() && *kind == WriteKind::Set && *fresh)
 }
 
 /// Whether one of `targets` (already narrowed to a child) writes another node of the document at
@@ -4140,7 +4189,7 @@ fn has_fresh_set_here(targets: &[RelTarget<'_>]) -> bool {
 fn has_copy_here(targets: &[RelTarget<'_>]) -> bool {
     targets
         .iter()
-        .any(|(steps, kind, _, copies)| steps.is_empty() && *kind == WriteKind::Set && *copies)
+        .any(|(steps, kind, _, copies, _)| steps.is_empty() && *kind == WriteKind::Set && *copies)
 }
 
 /// Narrow `targets` to those descending through object key `key`, dropping
@@ -4148,10 +4197,14 @@ fn has_copy_here(targets: &[RelTarget<'_>]) -> bool {
 fn descend_key<'t>(targets: &[RelTarget<'t>], key: &str) -> Vec<RelTarget<'t>> {
     targets
         .iter()
-        .filter_map(|(steps, kind, fresh, copies)| match steps.split_first() {
-            Some((PathStep::Key(k), rest)) if k == key => Some((rest, *kind, *fresh, *copies)),
-            _ => None,
-        })
+        .filter_map(
+            |(steps, kind, fresh, copies, appends)| match steps.split_first() {
+                Some((PathStep::Key(k), rest)) if k == key => {
+                    Some((rest, *kind, *fresh, *copies, *appends))
+                }
+                _ => None,
+            },
+        )
         .collect()
 }
 
@@ -4160,12 +4213,14 @@ fn descend_key<'t>(targets: &[RelTarget<'t>], key: &str) -> Vec<RelTarget<'t>> {
 fn descend_index<'t>(targets: &[RelTarget<'t>], index: usize, len: usize) -> Vec<RelTarget<'t>> {
     targets
         .iter()
-        .filter_map(|(steps, kind, fresh, copies)| match steps.split_first() {
-            Some((PathStep::Index(n), rest)) if resolve_index(*n, len) == Some(index) => {
-                Some((rest, *kind, *fresh, *copies))
-            }
-            _ => None,
-        })
+        .filter_map(
+            |(steps, kind, fresh, copies, appends)| match steps.split_first() {
+                Some((PathStep::Index(n), rest)) if resolve_index(*n, len) == Some(index) => {
+                    Some((rest, *kind, *fresh, *copies, *appends))
+                }
+                _ => None,
+            },
+        )
         .collect()
 }
 
@@ -4188,7 +4243,7 @@ fn array_sources(
         .iter()
         .find(|(steps, kind, ..)| steps.is_empty() && *kind == WriteKind::Set);
 
-    if let Some((_, _, fresh, _)) = wholesale {
+    if let Some((_, _, fresh, ..)) = wholesale {
         // A closed literal built every element here, so none of them can
         // have inherited anything: `.arr = ["p","q"]` prints two bare
         // scalars in real yq even where the old slots were quoted and
@@ -4435,7 +4490,7 @@ fn reconcile_presentation(
 ) -> CommentTree {
     let relative: Vec<RelTarget<'_>> = targets
         .iter()
-        .map(|t| (t.path.as_slice(), t.kind, t.fresh, t.copies))
+        .map(|t| (t.path.as_slice(), t.kind, t.fresh, t.copies, t.appends))
         .collect();
     reconcile_presentation_at_depth(pristine_value, pristine_tree, result_value, &relative, 0)
 }
@@ -4575,6 +4630,27 @@ fn reconcile_presentation_at_depth(
             // #870: which pristine slot each result slot really came from —
             // identity unless a write at this node moved things.
             let sources = array_sources(p_items, r_items, targets);
+            // #7070: a string literal a write appends to the sequence takes the quote style of
+            // its first element, as yq copies that node's `Style` onto the new one: a single or
+            // double quote, or a literal or folded block (`|-` for a string with no final newline).
+            // Every write of the pipe that appended one accounts for one element past the old end.
+            let appenders = targets
+                .iter()
+                .filter(|(steps, kind, _, _, appends)| {
+                    steps.is_empty() && *kind == WriteKind::Set && *appends
+                })
+                .count();
+            // A closed literal written to the sequence first (`.a = ["p"] | .a += "z"`) has no quoted
+            // first element to copy: the pristine one is gone.
+            let appended_style = (appenders > 0
+                && !has_fresh_set_here(targets)
+                && !p_items.is_empty()
+                && r_items.len() == p_items.len() + appenders
+                && r_items[p_items.len()..]
+                    .iter()
+                    .all(|item| matches!(item, OwnedValue::String(_))))
+            .then(|| pristine_tree.at_index(0).style())
+            .filter(|style| matches!(*style, "single" | "double" | "literal" | "folded"));
             let items = r_items
                 .iter()
                 .enumerate()
@@ -4588,7 +4664,12 @@ fn reconcile_presentation_at_depth(
                             &child_targets,
                             depth + 1,
                         ),
-                        None => CommentTree::empty(),
+                        None => match appended_style {
+                            Some(style) if i >= p_items.len() => {
+                                CommentTree::leaf(NodeMeta::from_comment_and_style(None, style))
+                            }
+                            _ => CommentTree::empty(),
+                        },
                     }
                 })
                 .collect();
@@ -18140,7 +18221,7 @@ mod tests {
         let pristine = [OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3)];
         let result = [OwnedValue::Int(2), OwnedValue::Int(3), OwnedValue::Int(9)];
         let steps = [PathStep::Index(0)];
-        let targets = [(&steps[..], WriteKind::Del, false, false)];
+        let targets = [(&steps[..], WriteKind::Del, false, false, false)];
         assert_eq!(
             array_sources(&pristine, &result, &targets),
             vec![Some(0), Some(1), Some(2)]
