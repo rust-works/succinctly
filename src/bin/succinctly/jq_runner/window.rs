@@ -307,6 +307,9 @@ pub(super) struct WindowedFile {
     /// A stream that cannot be read again (a pipe on standard input): each window is certified before
     /// it is handed out, and its first fault kept ([`Certifier`], #7024).
     certifier: Option<Certifier>,
+    /// A `--seq` pipe (#7164): only its records that are RFC 7464's own framing are handed out, and the
+    /// stream from the first that is not is handed on ([`SeqGate`]).
+    seq_gate: Option<SeqGate>,
     #[cfg(test)]
     break_search_bytes: usize,
     #[cfg(test)]
@@ -356,6 +359,7 @@ impl WindowedFile {
             origin: place.origin,
             end_origin: place.origin,
             certifier: None,
+            seq_gate: None,
             #[cfg(test)]
             break_search_bytes: 0,
             #[cfg(test)]
@@ -532,6 +536,9 @@ impl WindowedFile {
             self.buf.drain(..line_start);
             self.validated -= line_start;
             self.no_break_from = self.no_break_from.saturating_sub(line_start);
+            if let Some(gate) = self.seq_gate.as_mut() {
+                gate.dropped(line_start);
+            }
             if base > 0 {
                 self.seam = Seam::NONE;
                 self.seam_raw = Seam::NONE;
@@ -631,7 +638,16 @@ impl WindowedFile {
     /// Moves `validated` to the last line break read, or to the end of the file once it is read,
     /// substituting any invalid UTF-8 on the way as the whole-file route does.
     fn validate_lines(&mut self) {
-        let end = if self.eof {
+        let gated = self
+            .seq_gate
+            .as_mut()
+            .map(|gate| gate.advance(&self.buf, self.eof));
+        let end = if let Some(step) = gated {
+            match step {
+                GateStep::Clean(end) => end,
+                GateStep::Unclean(at) => self.hand_on_seq_tail(at),
+            }
+        } else if self.eof {
             self.buf.len()
         } else {
             let from = self.validated.max(self.no_break_from);
@@ -932,7 +948,158 @@ fn start_worker(seen: &SeenFault) -> io::Result<Worker> {
     Ok(Worker { jobs, recycled })
 }
 
+/// What a `--seq` pipe hands on at its first record that is not RFC 7464's own framing (#7164): the
+/// windows before it were run, and the rest of the stream is the whole-stream route's.
+pub(super) struct SeqTail {
+    /// The stream from the RS that opens that record to its end, as read.
+    pub bytes: Vec<u8>,
+    /// The failure of a read of the pipe, which ended the stream there.
+    pub error: Option<io::Error>,
+    /// The line breaks before it, all in records already run: 0 when no record was clean, and the
+    /// stream is all of it.
+    pub lines: usize,
+    /// The byte the records before it left at index 1 of jq's token buffer
+    /// ([`crate::jq_seq_reader::token_byte_after`]).
+    pub token_byte: Option<u8>,
+}
+
+/// Where a `--seq` pipe leaves its [`SeqTail`] for the run, which takes it once the windows are out.
+pub(super) type SeqTailSlot = Rc<std::cell::RefCell<Option<SeqTail>>>;
+
+/// The certification of a `--seq` pipe's records (#7164), which decides what of the stream is read a window
+/// at a time. A pipe cannot be read twice, and its windows' output cannot be taken back, so unlike the
+/// regular file's prepass (#7082) the verdict comes as the windows are read: each record is checked when
+/// the RS after it (or the stream's end) is read, with the check [`crate::jq_seq_reader::PlainRecords`]
+/// makes of a whole stream, and a window gives the records up to the last checked one. At the first
+/// record that is not `RS value LF`, or one bigger than [`MAX_PENDING_RECORD`], the windows end before
+/// its RS and the rest of the stream is read and handed on ([`SeqTail`]), where jq's reader stands at a
+/// line start with nothing pending.
+struct SeqGate {
+    /// `buf[..checked]` is records that are each `RS value LF`; the record in progress opens at `checked`
+    /// (an RS), or the stream is all certified when it is the end of `buf`.
+    checked: usize,
+    /// Where the search for the RS that closes the record at `checked` goes on from.
+    search_from: usize,
+    /// The stream's first byte was an RS.
+    opened: bool,
+    /// What the records certified so far left at index 1 of jq's token buffer.
+    token_byte: Option<u8>,
+    slot: SeqTailSlot,
+}
+
+/// What [`SeqGate::advance`] found: how far the stream is certified, or where its first record that is not
+/// plain opens.
+enum GateStep {
+    Clean(usize),
+    Unclean(usize),
+}
+
+impl SeqGate {
+    #[cfg_attr(not(unix), allow(dead_code))]
+    fn new(slot: SeqTailSlot) -> Self {
+        Self {
+            checked: 0,
+            search_from: 0,
+            opened: false,
+            token_byte: None,
+            slot,
+        }
+    }
+
+    /// Checks the records of `buf` that are complete (the stream's last one too at `eof`).
+    fn advance(&mut self, buf: &[u8], eof: bool) -> GateStep {
+        use crate::jq_seq_reader::{PlainGuards, PlainRecords};
+        if !self.opened {
+            match buf.first() {
+                None if !eof => return GateStep::Clean(0),
+                Some(&RS) => {
+                    self.opened = true;
+                    self.search_from = 1;
+                }
+                // Bytes before the first RS (a BOM among them) are no record jq's reader reads.
+                _ => return GateStep::Unclean(0),
+            }
+        }
+        let from = self.checked;
+        let mut clean = true;
+        while self.checked < buf.len() {
+            let next = buf[self.search_from..].iter().position(|&b| b == RS);
+            let end = match next {
+                Some(at) => self.search_from + at,
+                None if eof => buf.len(),
+                None => {
+                    clean = buf.len() - self.checked <= MAX_PENDING_RECORD;
+                    self.search_from = buf.len();
+                    break;
+                }
+            };
+            if !PlainRecords::record_ok(&buf[self.checked + 1..end], PlainGuards::ALL) {
+                clean = false;
+                break;
+            }
+            self.checked = end;
+            self.search_from = end + 1;
+        }
+        if let Some(byte) = crate::jq_seq_reader::token_byte_after(&buf[from..self.checked]) {
+            self.token_byte = Some(byte);
+        }
+        if clean {
+            GateStep::Clean(self.checked)
+        } else {
+            GateStep::Unclean(self.checked)
+        }
+    }
+
+    /// `n` bytes were dropped from the front of the buffer, all before `checked`.
+    fn dropped(&mut self, n: usize) {
+        self.checked -= n;
+        self.search_from -= n;
+    }
+}
+
 impl WindowedFile {
+    /// A `--seq` pipe on standard input (#7164), from the front a first read of it took: only its records
+    /// that are `RS value LF` are handed out, each RS read as a space, and the stream from the first that
+    /// is not goes to `slot` ([`SeqGate`]). Nothing of the text is changed before it is certified, so the
+    /// tail is the bytes as read: no BOM is skipped (one is no record's start, and the gate hands it on).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(super) fn from_seq_pipe(
+        file: Rc<File>,
+        front: Vec<u8>,
+        block: usize,
+        slot: SeqTailSlot,
+    ) -> Self {
+        let mut this = Self::in_stream(file, 0, block, Place::alone());
+        this.file_read = front.len() as u64;
+        this.buf = front;
+        this.started = true;
+        this.blank_rs = true;
+        this.seq_gate = Some(SeqGate::new(slot));
+        this
+    }
+
+    /// Ends the text at `at`, where the gate found the first record that is not plain, reads the rest of
+    /// the pipe and hands it on; the end of the text.
+    fn hand_on_seq_tail(&mut self, at: usize) -> usize {
+        let mut bytes = self.buf.split_off(at);
+        let error = if self.eof {
+            self.read_error.take()
+        } else {
+            (&*self.file).read_to_end(&mut bytes).err()
+        };
+        self.eof = true;
+        let lines = self.lines_before + count_newlines(&self.buf);
+        if let Some(gate) = self.seq_gate.as_mut() {
+            *gate.slot.borrow_mut() = Some(SeqTail {
+                bytes,
+                error,
+                lines,
+                token_byte: gate.token_byte,
+            });
+        }
+        at
+    }
+
     /// A pipe on standard input, from what a first read of it took (`front`, which ended in `error` if
     /// that read failed): its length is not known, it cannot be read again, and its windows are
     /// certified as they are handed out, their first fault kept in `seen` ([`Certifier`], #7024).
@@ -1442,6 +1609,22 @@ impl WindowedFiles {
         this
     }
 
+    /// A `--seq` pipe on standard input ([`WindowedFile::from_seq_pipe`], #7164): the stream's one source,
+    /// its clean records read with each RS as a space and the rest handed on to `slot`.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(super) fn seq_pipe(
+        file: Rc<File>,
+        front: Vec<u8>,
+        block: usize,
+        slot: SeqTailSlot,
+    ) -> Self {
+        let mut this = Self::new(Vec::new(), block);
+        this.count = 1;
+        this.next_index = 1;
+        this.current = Some(WindowedFile::from_seq_pipe(file, front, block, slot));
+        this
+    }
+
     /// The same reading each RS byte as a space (#7082): the plain JSON stream a clean `--seq` stream is.
     pub(super) fn blanking_rs(mut self) -> Self {
         self.blank_rs = true;
@@ -1783,8 +1966,8 @@ const REREAD_CHUNK: u64 = 1 << 20;
 
 /// The most of one record the `--seq` prepass holds before it turns the stream down (#7082): a record
 /// that big has the whole-file route, which holds it too, and a stream that opens an RS and never closes
-/// it (NDJSON with one RS at its front) is not read into memory to be told it is not records.
-#[cfg(unix)]
+/// it (NDJSON with one RS at its front) is not read into memory to be told it is not records. A `--seq`
+/// pipe hands such a record on to that route too ([`SeqGate`], #7164).
 const MAX_PENDING_RECORD: usize = 64 << 20;
 
 /// How much of the end of the file the `--seq` prepass reads first, to check the last record: a stream

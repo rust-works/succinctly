@@ -5240,7 +5240,11 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     let can_use_lazy_path =
         lazy_route_open && (!args.seq || seq_plain.is_some() || seq_windowed.is_some());
 
-    if can_use_lazy_path && !args.null_input {
+    // #7164: a `--seq` pipe whose windows ended at a record that is not plain hands the rest of its
+    // stream to the materializing path below, which the run goes on to once they are out.
+    let mut seq_tail_handed_on = false;
+    let lazy_path_taken = can_use_lazy_path && !args.null_input;
+    if lazy_path_taken {
         // Lazy path: read files as raw bytes and process directly
         // This preserves original number formatting like "4e4"
         // #6920: regular files are read a window at a time (#7024: several, as the one stream jq reads),
@@ -5986,7 +5990,10 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             sink.report_parse_error(&message);
             return Ok(halt_exit_code(DiagStyle::Jq.error_exit_code(), open_failed));
         }
-    } else {
+        // A run that stopped reads no further, as jq's main loop does.
+        seq_tail_handed_on = !run_stopped && hand_on_seq_pipe_tail();
+    }
+    if !lazy_path_taken || seq_tail_handed_on {
         // The materializing path: reads every document up front into a
         // `Vec<OwnedValue>`, which is what the input-builtin queue below needs
         // to seed from and what `-R`/`--seq`/DSV input need in order to
@@ -11555,10 +11562,14 @@ fn windowed_seq_file(args: &JqCommand) -> Option<WindowedSource> {
         return None;
     }
     // The prepass vouches for one stream, so it is not asked of several files, which it would open.
-    if get_input_files(args).len() > 1 {
+    let files = get_input_files(args);
+    if files.len() > 1 {
         return None;
     }
-    let (files, reader, reread) = windowed_source(args)?;
+    let Some((files, reader, reread)) = windowed_source(args) else {
+        // #7164: a pipe on standard input, which cannot be read twice, is certified as it is read.
+        return files.is_empty().then(windowed_seq_pipe).flatten();
+    };
     if !reread.is_plain_seq_records() {
         return None;
     }
@@ -11901,6 +11912,58 @@ fn windowed_pipe(file: std::fs::File, min: u64) -> Option<WindowedSource> {
 #[cfg(not(unix))]
 fn windowed_stdin_pipe() -> Option<WindowedSource> {
     None
+}
+
+/// A pipe (or a socket) on standard input that holds 4 MiB or more of a `--seq` stream (#7164), read a
+/// window at a time while its records are RFC 7464's own framing ([`window::WindowedFiles::seq_pipe`]),
+/// each RS read as a space as [`windowed_seq_file`] reads a regular file. Its length is not known, so
+/// the first 4 MiB are read to learn it, and a pipe that ends sooner is the whole-stream route's
+/// ([`probe_stdin_pipe`]). The rest of a stream that turns out not to be plain is handed to that route
+/// once the windows before it are out ([`hand_on_seq_pipe_tail`]), so there is no fault to word here.
+#[cfg(unix)]
+fn windowed_seq_pipe() -> Option<WindowedSource> {
+    use std::os::unix::fs::FileTypeExt;
+    let (file, meta) = stdin_to_window()?;
+    let kind = meta.file_type();
+    if !(kind.is_fifo() || kind.is_socket()) {
+        return None;
+    }
+    let front = probe_stdin_pipe(&file, window::MIN_WINDOWED_FILE_BYTES)?;
+    let slot = window::SeqTailSlot::default();
+    SEQ_PIPE_TAIL.with(|tail| *tail.borrow_mut() = Some(std::rc::Rc::clone(&slot)));
+    Some((
+        Vec::new(),
+        window::WindowedFiles::seq_pipe(std::rc::Rc::new(file), front, window::WINDOW_BYTES, slot),
+        std::rc::Rc::new(window::Reread::seen(window::SeenFault::default())),
+    ))
+}
+
+#[cfg(not(unix))]
+fn windowed_seq_pipe() -> Option<WindowedSource> {
+    None
+}
+
+thread_local! {
+    /// Where the `--seq` pipe the run reads a window at a time leaves the rest of its stream (#7164).
+    static SEQ_PIPE_TAIL: RefCell<Option<window::SeqTailSlot>> = const { RefCell::new(None) };
+}
+
+/// Hands the rest of a `--seq` pipe whose windows ended at a record that is not plain (#7164) to the
+/// route that reads standard input whole, as the bytes it reads ([`STDIN_PUSHBACK`]), where jq's reader
+/// would stand after the records already run ([`crate::jq_seq_reader::resumed_stream`]); `true` when
+/// there was one.
+fn hand_on_seq_pipe_tail() -> bool {
+    let Some(tail) = SEQ_PIPE_TAIL
+        .with(|slot| slot.borrow_mut().take())
+        .and_then(|slot| slot.borrow_mut().take())
+    else {
+        return false;
+    };
+    crate::jq_seq_reader::seed_token_byte(tail.token_byte);
+    let stream = crate::jq_seq_reader::resumed_stream(tail.lines, tail.bytes);
+    STDIN_PUSHBACK_ERROR.with(|slot| *slot.borrow_mut() = tail.error);
+    STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = Some(stream));
+    true
 }
 
 /// Report every failure in `failures`, and note that the run must now exit 2.
