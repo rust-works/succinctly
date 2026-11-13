@@ -48,12 +48,16 @@
 //! window: nothing is dropped that is only part of it, because the seam describes the front of the
 //! text, and jq's reads of the file's first line are counted from where the carry ends.
 
-use std::cell::RefCell;
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::{self, Read};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use succinctly::jq::utf8_document::{original_offset, SubstitutionEdit};
 
@@ -160,7 +164,7 @@ impl Place {
 /// Where the invalid-UTF-8 substitution changed the text of a file that hands its open tail on, so
 /// that tail can be given to the next file as the bytes that were read (#7024): the substitution of
 /// the two files' bytes together is what the whole-file route made, and the text is not invertible.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct RawMap {
     /// The regions the substitution changed, in order, that are still in the buffer.
     regions: Vec<SubstitutedRegion>,
@@ -168,6 +172,7 @@ struct RawMap {
     delta_dropped: i64,
 }
 
+#[derive(Clone)]
 struct SubstitutedRegion {
     /// Its text and the bytes it was read as, absolute in the file's stream.
     text: Range<usize>,
@@ -306,9 +311,6 @@ pub(super) struct WindowedFile {
     break_search_bytes: usize,
     #[cfg(test)]
     bytes_read: u64,
-    /// How many reads by jq's parser certifying the windows took.
-    #[cfg(test)]
-    exact_reads: std::cell::Cell<usize>,
 }
 
 impl WindowedFile {
@@ -358,8 +360,6 @@ impl WindowedFile {
             break_search_bytes: 0,
             #[cfg(test)]
             bytes_read: 0,
-            #[cfg(test)]
-            exact_reads: std::cell::Cell::new(0),
         }
     }
 
@@ -708,9 +708,129 @@ impl WindowedFile {
     }
 }
 
-/// The first fault of a stream, where it has been found: shared by the reader that finds it
-/// ([`Certifier`]) and the [`Reread`] that words it.
-pub(super) type SeenFault = Rc<RefCell<Option<String>>>;
+/// How many windows may be waiting for the certifying thread (or in its hands) at once: the filter
+/// runs over window N while N and N - 1 are certified, so a thread that falls behind holds the filter
+/// back at the next window and the copies of the text stay at two (#7106).
+const CERTIFIER_WINDOWS_IN_FLIGHT: usize = 2;
+
+/// A window of more than this is certified on the filter's own thread, over the buffer itself: it holds a
+/// document bigger than a few windows, and a copy of it would add its size to the peak memory of a run
+/// whose point is to hold less (a 175 MB one-line array read 395 MB with the copy and 222 MB without,
+/// #7106). The probe's first window of 4 MiB or more is under it and is copied: certifying it here
+/// instead saves 4 MiB of peak memory and costs the first window of a pipe of 10 MiB 4 to 10% of its
+/// run (measured on terminus and the mini).
+const CERTIFIER_COPY_LIMIT: usize = 8 * WINDOW_BYTES;
+
+/// A buffer the certifying thread hands back is kept for the next window only up to this size, about two
+/// windows, so the probe's copy and one that grew with a document are not held for the run.
+const CERTIFIER_KEEP_BYTES: usize = 2 * WINDOW_BYTES;
+
+/// The first fault of a stream that cannot be read again, where it has been found: shared by the thread
+/// that finds it ([`Certifier`]) and the [`Reread`] that words it.
+///
+/// A window is certified while the filter runs over it (#7106), so a fault is read only once every
+/// window handed out has been: [`SeenFault::get`] waits for them, and what it returns is what the
+/// windows certified before the filter ran would have kept.
+#[derive(Clone, Default)]
+pub(super) struct SeenFault(Arc<SeenShared>);
+
+#[derive(Default)]
+struct SeenShared {
+    state: Mutex<SeenState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct SeenState {
+    /// Windows handed to the certifying thread that it has not finished.
+    in_flight: usize,
+    fault: Option<String>,
+    /// The certifying thread panicked, so what it found is not known.
+    panicked: bool,
+    /// Where jq's parser stands at a boundary in the stream (absolute, as `offset` counts): the end of
+    /// the last document certified, or the start of a number or literal, which the parser waits on the
+    /// next byte to read. Past it only white space has been dropped.
+    resume: usize,
+}
+
+impl SeenFault {
+    fn lock(&self) -> std::sync::MutexGuard<'_, SeenState> {
+        self.0.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The stream's first fault, once every window handed to the certifier has been certified.
+    pub(super) fn get(&self) -> Option<String> {
+        let state = self
+            .0
+            .changed
+            .wait_while(self.lock(), |state| state.in_flight > 0)
+            .unwrap_or_else(PoisonError::into_inner);
+        assert!(
+            !state.panicked,
+            "the thread that certifies the windows panicked"
+        ); // patchcov: coverage tolerate-line reason="defensive: the certifier's own code does not panic; kept so a bug there is not read as a stream without a fault"
+        state.fault.clone()
+    }
+
+    /// Whether a fault has been found so far, without waiting for the windows still being certified.
+    fn found(&self) -> bool {
+        self.lock().fault.is_some()
+    }
+
+    /// Takes a place for one more window, waiting while [`CERTIFIER_WINDOWS_IN_FLIGHT`] are taken.
+    fn begin(&self) {
+        let mut state = self
+            .0
+            .changed
+            .wait_while(self.lock(), |state| {
+                state.in_flight >= CERTIFIER_WINDOWS_IN_FLIGHT
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        state.in_flight += 1;
+    }
+
+    /// A window is certified: `fault` is the first of the stream if none was found before it, and
+    /// `resume` is where jq's parser stands after it (`None` where a window was given up, `panicked`).
+    fn finish(&self, fault: Option<String>, resume: Option<usize>, panicked: bool) {
+        let mut state = self.lock();
+        state.in_flight -= 1;
+        state.panicked |= panicked;
+        Self::store(&mut state, fault, resume);
+        drop(state);
+        self.0.changed.notify_all();
+    }
+
+    fn store(state: &mut SeenState, fault: Option<String>, resume: Option<usize>) {
+        if state.fault.is_none() {
+            state.fault = fault;
+        }
+        if let Some(resume) = resume {
+            state.resume = resume;
+        }
+    }
+
+    /// Where jq's parser stands after the windows certified so far.
+    fn resume(&self) -> usize {
+        self.lock().resume
+    }
+
+    /// Certifies a window on the calling thread, over the buffer itself (#7106): `certify` gets where
+    /// jq's parser stands, once every window in flight is certified, and the answer is kept as the
+    /// thread would have kept it.
+    fn certify_here(&self, certify: impl FnOnce(&mut usize) -> Option<String>) {
+        let state = self
+            .0
+            .changed
+            .wait_while(self.lock(), |state| state.in_flight > 0)
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut resume = state.resume;
+        // Not held while certifying: the filter's thread is the only one that hands the certifier a
+        // window, so none arrives meanwhile.
+        drop(state);
+        let fault = certify(&mut resume);
+        Self::store(&mut self.lock(), fault, Some(resume));
+    }
+}
 
 /// The deepest nesting the strict validator certifies a document at. jq's parser refuses a bracket
 /// when its stack holds [`succinctly::jq::JQ_MAX_PARSING_DEPTH`] entries, and an object takes two (its
@@ -723,19 +843,93 @@ const CERTIFIED_DEPTH: usize = 127;
 ///
 /// jq's parser words the stream's first fault, which can be in a document the run read past (a filter
 /// validates only what it reads, #2103) and the window has since dropped. Each document of a window is
-/// therefore certified before the window is handed out: one the strict validator accepts is one jq's
+/// therefore certified before the window is dropped: one the strict validator accepts is one jq's
 /// parser reads without a fault (`what_the_strict_validator_accepts_jq_reads_7024`), and what jq's
 /// parser holds after it is nothing but its position, or for a number or literal the token's own bytes.
 /// A document the validator turns down (a `nan`, a `01`, a deep one, a malformed one) is read by jq's
 /// parser itself, from the last boundary, over the bytes as read. The fault it meets, the first of the
 /// stream since everything before it is certified, is kept, and so is a fault after the last document
 /// at the end of the stream; every later window goes unchecked.
+///
+/// The verdict decides the wording of a fault and nothing the run prints, so the windows are certified
+/// on a thread of their own, over a copy of each, while the filter runs over the window (#7106): the
+/// thread starts with the first window, in a run that reads a pipe of 4 MiB or more, and a reader of
+/// the fault waits for it ([`SeenFault::get`]).
 struct Certifier {
     seen: SeenFault,
-    /// Where jq's parser stands at a boundary in the text (absolute, as `offset` counts): the end of the
-    /// last document certified, or the start of a number or literal, which the parser waits on the next
-    /// byte to read. Past it only white space has been dropped.
-    resume: usize,
+    /// The thread, started with the first window.
+    worker: Option<Worker>,
+    /// No thread could be started: every window is certified on the filter's own thread, as the one
+    /// over [`CERTIFIER_COPY_LIMIT`] is.
+    threadless: bool,
+    /// How many reads by jq's parser certifying the windows took.
+    #[cfg(test)]
+    exact_reads: Arc<AtomicUsize>,
+}
+
+/// The certifying thread's inbox, and the buffers it has finished with, to be filled again.
+struct Worker {
+    jobs: SyncSender<Job<'static>>,
+    recycled: Receiver<Vec<u8>>,
+}
+
+/// One window to certify: a copy of the text and what the certifier needs of the reader's state to word
+/// a fault from it.
+struct Job<'a> {
+    /// `buf[..validated]` of the window: a copy for the thread, the buffer itself for the filter's own.
+    text: Cow<'a, [u8]>,
+    /// The documents of the window, in `text`.
+    values: Vec<Span>,
+    /// The window is the last and ends in a fault.
+    fault_at_end: bool,
+    /// The bytes dropped from the front of the stream before `text`, and where `text` starts in jq's input.
+    offset: usize,
+    origin: (usize, usize),
+    /// The stream ends with the window.
+    eof: bool,
+    raw_map: Cow<'a, RawMap>,
+    #[cfg(test)]
+    exact_reads: Arc<AtomicUsize>,
+}
+
+/// The certifying thread: each window of `jobs` in order, the stream's first fault kept in `seen`.
+fn certify_windows(
+    jobs: &Receiver<Job<'static>>,
+    recycled: &SyncSender<Vec<u8>>,
+    seen: &SeenFault,
+) {
+    for mut job in jobs {
+        let mut resume = seen.resume();
+        let outcome = if seen.found() {
+            Ok(None)
+        } else {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.certify(&mut resume)))
+        };
+        let text = match std::mem::take(&mut job.text) {
+            Cow::Owned(mut text) if text.capacity() <= CERTIFIER_KEEP_BYTES => {
+                text.clear();
+                text
+            }
+            _ => Vec::new(),
+        };
+        // The reader may have gone: a buffer nobody wants is dropped.
+        let _ = recycled.send(text);
+        match outcome {
+            Ok(fault) => seen.finish(fault, Some(resume), false),
+            Err(_) => seen.finish(None, None, true), // patchcov: coverage tolerate-line reason="defensive: certify does not panic; kept so a bug in it is reported by SeenFault::get"
+        }
+    }
+}
+
+/// The thread that certifies the windows, and the channels to and from it.
+fn start_worker(seen: &SeenFault) -> io::Result<Worker> {
+    let (jobs, inbox) = sync_channel(CERTIFIER_WINDOWS_IN_FLIGHT);
+    let (outbox, recycled) = sync_channel(CERTIFIER_WINDOWS_IN_FLIGHT + 1);
+    let seen = seen.clone();
+    std::thread::Builder::new()
+        .name("certify-windows".into())
+        .spawn(move || certify_windows(&inbox, &outbox, &seen))?;
+    Ok(Worker { jobs, recycled })
 }
 
 impl WindowedFile {
@@ -755,7 +949,13 @@ impl WindowedFile {
         this.buf = front;
         // Where the substitution changed the text, so the bytes as read can be given to jq's parser.
         this.track_raw = true;
-        this.certifier = Some(Certifier { seen, resume: 0 });
+        this.certifier = Some(Certifier {
+            seen,
+            worker: None,
+            threadless: false,
+            #[cfg(test)]
+            exact_reads: Arc::default(),
+        });
         if let Some(error) = error {
             this.read_error = Some(error);
             this.eof = true;
@@ -766,56 +966,117 @@ impl WindowedFile {
     }
 
     /// Certifies `values`, the documents of the window about to be handed out (and the bytes after them,
-    /// when `fault_at_end`: the window is the last and ends in a fault), keeping the stream's first fault.
+    /// when `fault_at_end`: the window is the last and ends in a fault), and keeps the stream's first
+    /// fault. The window is handed to the thread that certifies them, over a copy, and waits only while
+    /// two others are in flight; one of more than [`CERTIFIER_COPY_LIMIT`], or any when no thread could
+    /// be started, is certified here, over the buffer itself.
     fn certify(&mut self, values: &[Span], fault_at_end: bool) {
-        let Some(certifier) = self.certifier.as_ref() else {
+        let Some(certifier) = self.certifier.as_mut() else {
             return;
         };
-        if certifier.seen.borrow().is_some() {
+        if certifier.seen.found() {
             return;
         }
+        let text = &self.buf[..self.validated];
+        if certifier.worker.is_none() && !certifier.threadless && text.len() <= CERTIFIER_COPY_LIMIT
+        {
+            match start_worker(&certifier.seen) {
+                Ok(worker) => certifier.worker = Some(worker),
+                Err(_) => certifier.threadless = true,
+            }
+        }
+        let Some(worker) = certifier
+            .worker
+            .as_ref()
+            .filter(|_| text.len() <= CERTIFIER_COPY_LIMIT)
+        else {
+            let job = Job {
+                text: Cow::Borrowed(text),
+                values: values.to_vec(),
+                fault_at_end,
+                offset: self.offset,
+                origin: self.origin,
+                eof: self.eof,
+                raw_map: Cow::Borrowed(&self.raw_map),
+                #[cfg(test)]
+                exact_reads: Arc::clone(&certifier.exact_reads),
+            };
+            certifier.seen.certify_here(|resume| job.certify(resume));
+            return;
+        };
+        // A place first, so the copies of the text are never more than two.
+        certifier.seen.begin();
+        // A buffer the thread has finished with, or a new one while fewer than three are in use.
+        let mut copy: Vec<u8> = worker.recycled.try_recv().unwrap_or_default();
+        copy.extend_from_slice(text);
+        let job = Job {
+            text: Cow::Owned(copy),
+            values: values.to_vec(),
+            fault_at_end,
+            offset: self.offset,
+            origin: self.origin,
+            eof: self.eof,
+            raw_map: Cow::Owned(self.raw_map.clone()),
+            #[cfg(test)]
+            exact_reads: Arc::clone(&certifier.exact_reads),
+        };
+        if worker.jobs.send(job).is_err() {
+            // The thread is gone, which only a panic outside its catch can do: give the place back and
+            // have the next reader of the fault say so.
+            certifier.seen.finish(None, None, true); // patchcov: coverage tolerate-line reason="defensive: the thread ends only when its sender is dropped, and a panic inside it is caught"
+        }
+    }
+
+    /// The reads by jq's parser the windows certified so far took.
+    #[cfg(test)]
+    fn exact_reads(&self) -> usize {
+        let certifier = self.certifier.as_ref().expect("a pipe");
+        certifier.seen.get();
+        certifier.exact_reads.load(Ordering::Relaxed)
+    }
+}
+
+impl Job<'_> {
+    /// Certifies the documents of the window, from where jq's parser stood at the end of the last:
+    /// the fault it meets, if it is the stream's first.
+    fn certify(&self, resume: &mut usize) -> Option<String> {
         // Only white space has been dropped past the boundary: the parser stands at the text's start.
-        let mut resume = certifier.resume.max(self.offset) - self.offset;
+        let mut at = (*resume).max(self.offset) - self.offset;
         let mut fault = None;
-        for &(start, end) in values {
-            let certified = succinctly::json::validate::Validator::new(&self.buf[start..end])
+        for &(start, end) in &self.values {
+            let certified = succinctly::json::validate::Validator::new(&self.text[start..end])
                 .with_max_depth(CERTIFIED_DEPTH)
                 .validate()
                 .is_ok();
             if certified {
-                resume = self.boundary_after(start, end);
+                at = self.boundary_after(start, end);
                 continue;
             }
             // One read by jq's parser, from the last boundary to the end of the window, covers this
             // document and every one after it, so a window costs one such read at most whatever it
             // holds (a stream of `NaN`s is read at the parser's speed, not once a document).
-            match self.read_from(resume, self.validated) {
+            match self.read_from(at, self.text.len()) {
                 Err(message) => fault = Some(message),
                 Ok(_) => {
-                    if let Some(&(start, end)) = values.last() {
-                        resume = self.boundary_after(start, end);
+                    if let Some(&(start, end)) = self.values.last() {
+                        at = self.boundary_after(start, end);
                     }
                 }
             }
             break;
         }
-        if fault.is_none() && fault_at_end {
-            fault = self.end_fault(resume);
+        if fault.is_none() && self.fault_at_end {
+            fault = self.end_fault(at);
         }
-        let offset = self.offset;
-        if let Some(certifier) = self.certifier.as_mut() {
-            certifier.resume = offset + resume;
-            if fault.is_some() {
-                *certifier.seen.borrow_mut() = fault;
-            }
-        }
+        *resume = self.offset + at;
+        fault
     }
 
     /// Where jq's parser stands at a boundary once the document at `start..end` is read: after it for a
     /// container or string, and at its start for a number or literal, whose bytes the parser holds
     /// until the byte that ends it.
     fn boundary_after(&self, start: usize, end: usize) -> usize {
-        if opens_container_or_string(self.buf[start]) {
+        if opens_container_or_string(self.text[start]) {
             end
         } else {
             start
@@ -826,7 +1087,7 @@ impl WindowedFile {
     /// fault it meets, or whether it ends at a boundary between top-level values.
     fn read_from(&self, from: usize, to: usize) -> Result<bool, String> {
         #[cfg(test)]
-        self.exact_reads.set(self.exact_reads.get() + 1);
+        self.exact_reads.fetch_add(1, Ordering::Relaxed);
         let (line, column) = self.position(from);
         succinctly::jq::jq_stream_prefix_fault([self.as_read(from, to)], line, column)
     }
@@ -835,7 +1096,7 @@ impl WindowedFile {
     /// stream, as the whole-stream reader words it (`... at EOF` included).
     fn end_fault(&self, from: usize) -> Option<String> {
         let (line, column) = self.position(from);
-        let bytes = self.as_read(from, self.validated);
+        let bytes = self.as_read(from, self.text.len());
         if self.eof {
             succinctly::jq::jq_stream_fault([bytes], line, column)
         } else {
@@ -846,7 +1107,7 @@ impl WindowedFile {
     /// jq's position at `at` in the text: its line, and the bytes before `at` on that line as read
     /// (where an invalid byte was substituted, the bytes it replaced).
     fn position(&self, at: usize) -> (usize, usize) {
-        let (line, column) = advance_position(self.origin, &self.buf[..at]);
+        let (line, column) = advance_position(self.origin, &self.text[..at]);
         let line_start = if line == self.origin.0 {
             0
         } else {
@@ -861,9 +1122,9 @@ impl WindowedFile {
 
     /// The text from `from` to `to` as it was read: the substituted regions in it given back as the
     /// bytes they replaced.
-    fn as_read(&self, from: usize, to: usize) -> std::borrow::Cow<'_, [u8]> {
+    fn as_read(&self, from: usize, to: usize) -> Cow<'_, [u8]> {
         if !self.raw_map.changes_from(self.offset + from) {
-            return std::borrow::Cow::Borrowed(&self.buf[from..to]);
+            return Cow::Borrowed(&self.text[from..to]);
         }
         let mut bytes = Vec::with_capacity(to - from);
         let mut at = from;
@@ -883,16 +1144,16 @@ impl WindowedFile {
                     break 'regions;
                 }
                 if start > at {
-                    bytes.extend_from_slice(&self.buf[at..start]);
+                    bytes.extend_from_slice(&self.text[at..start]);
                 }
                 bytes.extend_from_slice(raw);
                 at = end;
             }
         }
         if at < to {
-            bytes.extend_from_slice(&self.buf[at..to]);
+            bytes.extend_from_slice(&self.text[at..to]);
         }
-        std::borrow::Cow::Owned(bytes)
+        Cow::Owned(bytes)
     }
 }
 
@@ -1309,7 +1570,7 @@ impl Reread {
     pub(super) fn stream_fault(&self) -> Option<String> {
         use std::os::unix::fs::FileExt;
         if let Some(seen) = &self.seen {
-            return seen.borrow().clone();
+            return seen.get();
         }
         let failed = std::cell::Cell::new(false);
         let mut source = 0usize;
@@ -1424,7 +1685,7 @@ impl Reread {
     #[cfg(not(unix))]
     pub(super) fn stream_fault(&self) -> Option<String> {
         if let Some(seen) = &self.seen {
-            return seen.borrow().clone();
+            return seen.get();
         }
         let _ = (&self.sources, REREAD_CHUNK);
         super::reread_stream_fault(std::slice::from_ref(&self.path))
@@ -2581,7 +2842,7 @@ mod pipe_tests {
             text[..front].to_vec(),
             None,
             block,
-            Rc::clone(&seen),
+            seen.clone(),
         );
         let (run, peak) = drain(&mut reader);
         let fault = Reread::seen(seen).stream_fault();
@@ -2736,19 +2997,18 @@ mod pipe_tests {
         let mut front = vec![0u8; 100];
         file.read_exact(&mut front).expect("the front");
         let seen = SeenFault::default();
-        let mut windows =
-            WindowedFile::from_pipe(Rc::new(file), front, None, 4_096, Rc::clone(&seen));
+        let mut windows = WindowedFile::from_pipe(Rc::new(file), front, None, 4_096, seen.clone());
         let (run, peak) = drain(&mut windows);
         feeder.join().expect("the feeder");
         assert_eq!(run.docs.len(), 20_002);
         assert!(run.fault.is_some());
         assert!(peak < 16_384, "{peak}");
         assert_eq!(
-            seen.borrow().clone(),
+            seen.get(),
             succinctly::jq::jq_stream_fault([&text[..]], 1, 0)
         );
         assert_eq!(
-            seen.borrow().as_deref(),
+            seen.get().as_deref(),
             Some("Expected separator between values at line 2, column 10")
         );
     }
@@ -2764,19 +3024,171 @@ mod pipe_tests {
         file.rewind().expect("rewound");
         let seen = SeenFault::default();
         let mut reader =
-            WindowedFile::from_pipe(Rc::new(file), Vec::new(), None, 4_096, Rc::clone(&seen));
+            WindowedFile::from_pipe(Rc::new(file), Vec::new(), None, 4_096, seen.clone());
         let mut windows = 0;
         while reader.next_window().expect("reads").is_some() {
             windows += 1;
         }
         assert!(windows > 5, "{windows}");
         assert!(
-            reader.exact_reads.get() <= windows,
+            reader.exact_reads() <= windows,
             "{} reads, {windows} windows",
-            reader.exact_reads.get()
+            reader.exact_reads()
         );
         assert_eq!(
-            *seen.borrow(),
+            seen.get(),
+            succinctly::jq::jq_stream_fault([&text[..]], 1, 0)
+        );
+    }
+
+    /// A reader of the fault waits for the windows handed to the certifier: what it reads is what the
+    /// windows certified before the filter ran would have kept (#7106).
+    #[test]
+    fn the_fault_is_read_after_the_windows_in_flight_are_certified_7106() {
+        let seen = SeenFault::default();
+        seen.begin();
+        seen.begin();
+        let certifier = {
+            let seen = seen.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                seen.finish(Some("the first".into()), None, false);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                seen.finish(Some("a later one".into()), None, false);
+            })
+        };
+        // Both windows are certified by the time it answers, and the first fault is the stream's.
+        assert_eq!(seen.get().as_deref(), Some("the first"));
+        assert_eq!(seen.lock().in_flight, 0);
+        certifier.join().expect("the certifier");
+    }
+
+    /// A window waits for a place while two others are in flight, so the copies of the text stay at two.
+    #[test]
+    fn a_third_window_waits_for_one_of_two_in_flight_7106() {
+        let seen = SeenFault::default();
+        seen.begin();
+        seen.begin();
+        let certifier = {
+            let seen = seen.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                seen.finish(None, None, false);
+            })
+        };
+        seen.begin();
+        // Only after one of the two was certified: two are in flight again, not three.
+        assert_eq!(seen.lock().in_flight, CERTIFIER_WINDOWS_IN_FLIGHT);
+        certifier.join().expect("the certifier");
+    }
+
+    /// A certifier that panicked is not read as a stream without a fault.
+    #[test]
+    #[should_panic(expected = "certifies the windows panicked")]
+    fn a_certifier_that_panicked_is_not_a_stream_without_a_fault_7106() {
+        let seen = SeenFault::default();
+        seen.begin();
+        seen.finish(None, None, true);
+        seen.get();
+    }
+
+    /// Only a pipe starts the thread: a regular file's windows are not certified at all.
+    #[test]
+    fn a_regular_file_starts_no_certifier_7106() {
+        let text = "{\"a\":1}\n".repeat(2_000);
+        let mut file = tempfile::tempfile().expect("a temp file");
+        file.write_all(text.as_bytes()).expect("written");
+        file.rewind().expect("rewound");
+        let mut reader = WindowedFile::new(file, text.len() as u64, 4_096);
+        while reader.next_window().expect("reads").is_some() {}
+        assert!(reader.certifier.is_none());
+    }
+
+    /// A pipe starts one thread with its first window, and its windows reach it through two buffers that
+    /// are used again, however many there are.
+    #[test]
+    fn a_pipe_certifies_many_windows_on_one_thread_7106() {
+        let text = "{\"a\":1,\"b\":[1,2,3]}\n".repeat(40_000);
+        let mut file = tempfile::tempfile().expect("a temp file");
+        file.write_all(text.as_bytes()).expect("written");
+        file.rewind().expect("rewound");
+        let seen = SeenFault::default();
+        let mut reader =
+            WindowedFile::from_pipe(Rc::new(file), Vec::new(), None, 4_096, seen.clone());
+        let mut windows = 0;
+        let mut buffers = std::collections::HashSet::new();
+        while reader.next_window().expect("reads").is_some() {
+            windows += 1;
+        }
+        assert!(windows > 100, "{windows}");
+        assert_eq!(seen.get(), None);
+        assert_eq!(reader.exact_reads(), 0);
+        // The recycled buffers: only a few were ever made (each holds a window of 4 KiB or so).
+        let worker = reader
+            .certifier
+            .as_ref()
+            .and_then(|c| c.worker.as_ref())
+            .expect("started");
+        while let Ok(buffer) = worker.recycled.try_recv() {
+            buffers.insert(buffer.as_ptr() as usize);
+        }
+        assert!(
+            buffers.len() <= CERTIFIER_WINDOWS_IN_FLIGHT + 1,
+            "{}",
+            buffers.len()
+        );
+    }
+
+    /// A window over the copy limit (one document bigger than a few windows) is certified on the filter's
+    /// own thread, over the buffer, and a fault after it is worded as the whole stream words it.
+    #[test]
+    fn a_window_over_the_copy_limit_is_certified_without_a_copy_7106() {
+        let mut text = b"{\"a\":1}\n".to_vec();
+        text.push(b'[');
+        text.extend("1,".repeat(CERTIFIER_COPY_LIMIT).as_bytes());
+        text.extend_from_slice(b"2]\n{\"x\":");
+        // The whole stream is what the probe read, so the first window holds it all.
+        let file = tempfile::tempfile().expect("a temp file");
+        let seen = SeenFault::default();
+        let mut reader =
+            WindowedFile::from_pipe(Rc::new(file), text.clone(), None, 4_096, seen.clone());
+        while reader.next_window().expect("reads").is_some() {}
+        assert!(seen.get().is_some());
+        assert_eq!(
+            seen.get(),
+            succinctly::jq::jq_stream_fault([&text[..]], 1, 0)
+        );
+        // Certified here, over the buffer: no thread was started for it.
+        assert!(reader.certifier.as_ref().expect("a pipe").worker.is_none());
+    }
+
+    /// Where no thread could be started every window is certified on the filter's own thread, and the
+    /// answer is the one the thread gives (#7106).
+    #[test]
+    fn a_pipe_with_no_thread_certifies_as_the_thread_does_7106() {
+        let mut text = "{\"a\":1,\"b\":[1,2,3]}\n".repeat(3_000).into_bytes();
+        text.extend_from_slice(b"{\"v\":NaN}\n{\"w\":[1 2]}\n");
+        text.extend("{\"c\":2}\n".repeat(3_000).as_bytes());
+        let (mut faults, mut docs) = (Vec::new(), Vec::new());
+        for threadless in [false, true] {
+            let mut file = tempfile::tempfile().expect("a temp file");
+            file.write_all(&text).expect("written");
+            file.rewind().expect("rewound");
+            let seen = SeenFault::default();
+            let mut reader =
+                WindowedFile::from_pipe(Rc::new(file), Vec::new(), None, 4_096, seen.clone());
+            reader.certifier.as_mut().expect("a pipe").threadless = threadless;
+            let (run, _) = drain(&mut reader);
+            docs.push(run.docs.len());
+            let started = reader.certifier.as_ref().expect("a pipe").worker.is_some();
+            assert_eq!(started, !threadless);
+            faults.push(seen.get());
+        }
+        assert!(faults[0].is_some() && docs[0] > 3_000);
+        assert_eq!(docs[0], docs[1]);
+        assert_eq!(faults[0], faults[1]);
+        assert_eq!(
+            faults[0],
             succinctly::jq::jq_stream_fault([&text[..]], 1, 0)
         );
     }
