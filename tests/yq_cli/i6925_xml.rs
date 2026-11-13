@@ -262,3 +262,42 @@ fn xml_declared_charset_6925() -> Result<()> {
     assert_eq!(status, 1);
     Ok(())
 }
+
+/// The three switches take an explicit Go boolean after `=`, as yq's do.
+#[test]
+fn xml_switches_take_an_explicit_boolean_6925() -> Result<()> {
+    let input = "<?x y?><!DOCTYPE d><a b=c/>";
+    for (flags, expected) in [
+        (
+            &["--xml-skip-proc-inst=true"][..],
+            "{\"+directive\":\"DOCTYPE d\",\"a\":{\"+@b\":\"c\"}}\n",
+        ),
+        (
+            &["--xml-skip-proc-inst=false", "--xml-skip-directives=true"][..],
+            "{\"+p_x\":\"y\",\"a\":{\"+@b\":\"c\"}}\n",
+        ),
+        (
+            &["--xml-skip-directives=false"][..],
+            "{\"+p_x\":\"y\",\"+directive\":\"DOCTYPE d\",\"a\":{\"+@b\":\"c\"}}\n",
+        ),
+    ] {
+        let mut args = vec!["-p", "xml", "-o", "json", "-I0"];
+        args.extend_from_slice(flags);
+        let (out, err, status) = run_yq_stdin_with_stderr(".", input, &args)?;
+        assert_eq!(
+            (out.as_str(), error_line(&err), status),
+            (expected, "", 0),
+            "{flags:?}"
+        );
+    }
+    let (_, err, status) =
+        run_yq_stdin_with_stderr(".", input, &["-p", "xml", "--xml-strict-mode=false"])?;
+    assert_eq!((error_line(&err), status), ("", 0));
+    let (_, err, status) =
+        run_yq_stdin_with_stderr(".", input, &["-p", "xml", "--xml-strict-mode=true"])?;
+    assert_eq!(
+        (error_line(&err), status),
+        ("Error: bad file '-': XML syntax error on line 1: unquoted or missing attribute value in element", 1)
+    );
+    Ok(())
+}

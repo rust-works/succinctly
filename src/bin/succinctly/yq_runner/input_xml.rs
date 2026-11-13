@@ -80,6 +80,8 @@ impl Default for XmlOptions {
 #[derive(Default)]
 struct XNode {
     children: Vec<Kv>,
+    /// The position in `children` of each key (yq's `AddChild` searches the list).
+    index: std::collections::HashMap<String, usize>,
     head: String,
     foot: String,
     line: String,
@@ -119,12 +121,13 @@ impl Builder {
 
     /// `xmlNode.AddChild`: the value joins the entry for `key` when there is one.
     fn add_child(&mut self, node: usize, key: &str, child: usize) {
-        let children = &mut self.nodes[node].children;
-        if let Some(entry) = children.iter_mut().find(|kv| kv.key == key) {
-            entry.values.push(child);
+        let n = &mut self.nodes[node];
+        if let Some(&at) = n.index.get(key) {
+            n.children[at].values.push(child);
             return;
         }
-        children.push(Kv {
+        n.index.insert(key.to_string(), n.children.len());
+        n.children.push(Kv {
             key: key.to_string(),
             values: vec![child],
             foot: String::new(),
@@ -292,7 +295,7 @@ fn decode_xml(raw: &[u8], options: &XmlOptions) -> Result<(Builder, usize), Stri
                     let node = elements[cur].node;
                     b.add_text_child(
                         node,
-                        &options.directive_name.clone(),
+                        &options.directive_name,
                         String::from_utf8_lossy(&data).into_owned(),
                     );
                 }

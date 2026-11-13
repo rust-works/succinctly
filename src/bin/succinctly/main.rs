@@ -1506,16 +1506,40 @@ pub struct YqCommand {
     pub xml_raw_token: bool,
 
     /// Skip the directives (`<!DOCTYPE ...>`) when `-p xml` reads (#6925)
-    #[arg(long = "xml-skip-directives", overrides_with = "xml_skip_directives")]
+    #[arg(
+        long = "xml-skip-directives",
+        overrides_with = "xml_skip_directives",
+        value_parser = parse_go_bool,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value = "false"
+    )]
     pub xml_skip_directives: bool,
 
     /// Skip the processing instructions (`<?xml ...?>`) when `-p xml` reads (#6925)
-    #[arg(long = "xml-skip-proc-inst", overrides_with = "xml_skip_proc_inst")]
+    #[arg(
+        long = "xml-skip-proc-inst",
+        overrides_with = "xml_skip_proc_inst",
+        value_parser = parse_go_bool,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value = "false"
+    )]
     pub xml_skip_proc_inst: bool,
 
     /// Read `-p xml` as Go's strict decoder does: an unknown entity, an unquoted attribute value
     /// and a mismatched end tag are errors (#6925)
-    #[arg(long = "xml-strict-mode", overrides_with = "xml_strict_mode")]
+    #[arg(
+        long = "xml-strict-mode",
+        overrides_with = "xml_strict_mode",
+        value_parser = parse_go_bool,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value = "false"
+    )]
     pub xml_strict_mode: bool,
 
     /// Prefix of a key that is an attribute in `-o=xml` (#6924)
