@@ -6479,10 +6479,11 @@ pub fn format_yq_encoder_from_tree<C: DocumentCursor>(
     }
     let meta = tree.meta();
     let mut leading = String::new();
-    if yq_encoder_prints_leading_block(encoder)
-        && (meta.preamble().is_some() || meta.head_is_header())
-    {
-        leading = pristine.yq_leading_content().unwrap_or_default();
+    if meta.preamble().is_some() || meta.head_is_header() {
+        // Only some encoders print the block; none writes it as a comment of a node.
+        if yq_encoder_prints_leading_block(encoder) {
+            leading = pristine.yq_leading_content().unwrap_or_default();
+        }
         // What the header holds is not the node's own comment as well.
         comments.own.head.clear();
         // After an explicit `---` the tree holds the header's comments as the first node's head,

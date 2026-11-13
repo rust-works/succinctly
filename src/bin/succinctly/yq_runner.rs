@@ -12576,7 +12576,11 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             globals: args.lua_globals,
         }))),
         OutputFormat::Ini => Some(YqOutputEncoder::Ini),
-        OutputFormat::Toml => Some(YqOutputEncoder::Toml),
+        // A TOML file's comments are read into the YAML text a node can only hold as its key's or its first
+        // child's, where yq's encoder writes the value's: a run that read TOML writes none (#7160).
+        OutputFormat::Toml => Some(YqOutputEncoder::Toml(
+            string_format != Some(TranscodedInput::Toml),
+        )),
         OutputFormat::Kyaml => Some(YqOutputEncoder::Kyaml(
             usize::from(args.indent),
             args.unwrap_scalar == Some(true),

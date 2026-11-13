@@ -7814,17 +7814,20 @@ The encoder runs over the value model, which keeps no node style or key tag, so 
 - A timestamp (`2001-01-01`) and `!!binary` are written as strings, where yq stops with `lua encoder NYI -- !!timestamp`.
 - The integer spellings `-0o17` and `0O17` and the YAML 1.1 ones `1_000`, `0b11` and `0XfF` are strings here (see the YAML 1.1 section above), so they are quoted, where yq writes them bare.
 
-### `-o=toml` — comments and a value's source spelling are not read (#6924)
+### `-o=toml` — a rebuilt value and a TOML file lose their comments, and a value's source spelling is not read (#6924, #7160)
 
 `-o=toml` is a port of yq's TOML encoder (attributes before tables, `[a.b]` tables, `[[a]]` arrays of tables, inline tables inside arrays, Go `%q` strings) and agrees with yq v4.53.3 on 3,800 random JSON documents.
 Go's `%q` escapes every code point `unicode.IsPrint` rejects, and that set follows the Unicode version of the Go release that built yq, so `src/jq/go_print.rs` is generated from the pinned binary (`scripts/gen_go_print.py`) rather than from a Unicode table here.
-The encoder runs over the value model, which keeps no comment, node style or source spelling, so on a YAML input these still differ:
+Comments are written as yq's encoder writes them (#7160): the root mapping's head comment first, a table's head comment above its header, an attribute's head comment above it and its line comment after it (`a = 1  # l`), an array's the same, and an array whose elements have head comments in the multi-line form.
+A comment above a key is the key's, which yq's encoder does not read (it reads the value's), so a YAML document's comments above its keys are not written by either; no foot comment is.
+The comments are read from the node the result came from and, for a write (`=`, `del()`, `sort_keys`), from its presentation tree (as `-o=xml`, #7156), and agree with yq on random comment positions over twelve document shapes (300 documents for each of the read and four write filters) and on 255 rows over tables, arrays of tables and arrays.
+The encoder runs over the value model, which keeps no node style or source spelling, so on a YAML input these still differ:
 
-- A head, line or foot comment is dropped, where yq writes a head comment above its key and a line comment after the value (`a = 1  # l`).
+- A head, line or foot comment is dropped from a value the filter rebuilds where the YAML printer drops its comments too (`with_entries(.)`, `. * {..}`, #5521) and under `--eval-all` (#4380), where yq keeps the comments of the nodes it copies.
 - A boolean written `True`, `FALSE` or `yes` is `true` or `false`, where yq writes the source text.
 - The YAML 1.1 integers `1_000` and `0b11` are strings here (see the YAML 1.1 section above), so they are quoted, where yq writes them bare.
 - A timestamp (`2001-01-01`) and a `!!binary` scalar are quoted strings, where yq writes their text bare.
-- yq's inline-table hint is set only by its TOML decoder, and `-p toml` writes the nodes as YAML text that is read back, so a TOML file written back as TOML (`*.toml` under `-o auto`, `-i`) writes an inline table as a table and drops its comments (see `-p toml` below).
+- yq's inline-table hint is set only by its TOML decoder, and `-p toml` writes the nodes as YAML text that is read back, so a TOML file written back as TOML (`*.toml` under `-o auto`, `-i`) writes an inline table as a table and, for a run that read TOML, writes no comment (see `-p toml` below): yq's TOML decoder gives a comment to the value that follows it, which the YAML text the read produces can only hold as the key's or the first child's, so writing them would put them on the wrong node.
 
 ### `-o=kyaml` — a rebuilt value loses its comments (#6924, #7158)
 
