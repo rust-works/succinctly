@@ -276,7 +276,8 @@ fn a_stdin_not_open_for_reading_reads_as_empty_at_every_size_7024() -> Result<()
                 answer.0
             );
         }
-        assert_eq!(*status, Some(0), "{args:?}: {err}");
+        // jq reads such a descriptor as empty and exits 2 once the run is over (#7126).
+        assert_eq!(*status, Some(2), "{args:?}: {err}");
     }
     Ok(())
 }
