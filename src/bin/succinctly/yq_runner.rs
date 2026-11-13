@@ -4610,7 +4610,10 @@ fn reconcile_presentation_at_depth(
                     steps.is_empty() && *kind == WriteKind::Set && *appends
                 })
                 .count();
+            // A closed literal written to the sequence first (`.a = ["p"] | .a += "z"`) has no quoted
+            // first element to copy: the pristine one is gone.
             let appended_style = (appenders > 0
+                && !has_fresh_set_here(targets)
                 && !p_items.is_empty()
                 && r_items.len() == p_items.len() + appenders
                 && r_items[p_items.len()..]

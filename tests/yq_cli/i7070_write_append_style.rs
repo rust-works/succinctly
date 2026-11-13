@@ -235,3 +235,40 @@ fn a_string_a_write_appends_takes_the_first_elements_style_7070() -> Result<()> 
     }
     Ok(())
 }
+
+/// (document, filter, yq's output): a closed literal written to the sequence first, other writes in the pipe,
+/// nested and root targets, and appended strings that need quoting or block-scalar care.
+#[rustfmt::skip]
+const MIXED: &[(&str, &str, &str)] = &[
+    ("a: ['x']\n", ".a = [\"p\"] | .a += \"z\"", "a: [p, z]\n"),
+    ("a: ['x']\n", ".a[0] = \"k\" | .a += \"z\"", "a: ['k', 'z']\n"),
+    ("a: ['x']\n", ".a += \"z\" | .a[0] = \"k\"", "a: ['k', 'z']\n"),
+    ("x:\n  a: ['x']\n", ".x.a += \"z\"", "x:\n  a: ['x', 'z']\n"),
+    ("- ['x']\n- ['y']\n", ".[0] += \"z\"", "- ['x', 'z']\n- ['y']\n"),
+    ("['x', 'y']\n", ". += \"z\"", "['x', 'y', 'z']\n"),
+    ("['x', 'y']\n", ". |= . + \"z\"", "['x', 'y', 'z']\n"),
+    ("x:\n  y:\n    - \"u\"\n", ".x.y += \"z\"", "x:\n  y:\n    - \"u\"\n    - \"z\"\n"),
+    ("a:\n  - |-\n    blk\n  - y\n", ".a += \"\"", "a:\n  - |-\n    blk\n  - y\n  - \"\"\n"),
+    ("a:\n  - |-\n    blk\n  - y\n", ".a += \" lead\"", "a:\n  - |-\n    blk\n  - y\n  - |2-\n     lead\n"),
+    ("a:\n  - |-\n    blk\n  - y\n", ".a += \"trail \"", "a:\n  - |-\n    blk\n  - y\n  - \"trail \"\n"),
+    ("a:\n  - |-\n    blk\n  - y\n", ".a += \"two\\nlines\"", "a:\n  - |-\n    blk\n  - y\n  - |-\n    two\n    lines\n"),
+    ("a: ['x']\n", ".a += \"\"", "a: ['x', '']\n"),
+    ("a: ['x']\n", ".a += \"it's\"", "a: ['x', 'it''s']\n"),
+    ("a: [\"x\"]\n", ".a += \"q\\\"q\"", "a: [\"x\", \"q\\\"q\"]\n"),
+    ("a: [\"x\"]\n", ".a += \"tab\\t\"", "a: [\"x\", \"tab\\t\"]\n"),
+    ("a: ['x']\n", ".a += \"a: b\"", "a: ['x', 'a: b']\n"),
+    ("a: ['x']\n", ".a += \"#c\"", "a: ['x', '#c']\n"),
+    ("a: ['x']\n", ".a += \"~\"", "a: ['x', '~']\n"),
+    ("a: [\"x\"]\nb: [\"y\"]\n", ".a += \"z\" | .b += \"w\"", "a: [\"x\", \"z\"]\nb: [\"y\", \"w\"]\n"),
+    ("a: [\"x\"]\n", ".a += \"z\" | .a", "[\"x\", \"z\"]\n"),
+    ("a: [\"x\"]\n", "(.a += \"z\") | .a[1]", "z\n"),
+];
+
+#[test]
+fn an_appended_string_with_other_writes_and_odd_content_7070() -> Result<()> {
+    for &(document, filter, want) in MIXED {
+        let (out, code) = run_yq_stdin(filter, document, &[])?;
+        assert_eq!((out.as_str(), code), (want, 0), "{document:?} | {filter}");
+    }
+    Ok(())
+}
