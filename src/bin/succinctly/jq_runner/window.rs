@@ -713,14 +713,16 @@ impl WindowedFile {
 /// back at the next window and the copies of the text stay at two (#7106).
 const CERTIFIER_WINDOWS_IN_FLIGHT: usize = 2;
 
-/// A window of more than this is certified on the filter's own thread, over the buffer itself: it holds a
-/// document bigger than a few windows, and a copy of it would double the peak memory of a run whose
-/// point is to hold less (a 175 MB one-line array read 395 MB with the copy and 222 MB without, #7106).
-const CERTIFIER_COPY_LIMIT: usize = 8 * WINDOW_BYTES;
+/// A window of more than this is certified on the filter's own thread, over the buffer itself: the first
+/// window, which is the probe's 4 MiB or more, and any that holds a document bigger than a window or
+/// two. A copy of one would add its size to the peak memory of a run whose point is to hold less (a
+/// 175 MB one-line array read 395 MB with the copy and 222 MB without, #7106), and the one window
+/// the probe makes costs the filter a few milliseconds once.
+const CERTIFIER_COPY_LIMIT: usize = 2 * WINDOW_BYTES;
 
-/// A buffer the certifying thread hands back is kept for the next window only up to this size: the
-/// first window is the probe's 4 MiB or more, and no later one is as big as that unless a document is.
-const CERTIFIER_KEEP_BYTES: usize = 4 * WINDOW_BYTES;
+/// A buffer the certifying thread hands back is kept for the next window only up to the size of the
+/// biggest window it is given ([`CERTIFIER_COPY_LIMIT`]), so one that grew past it is not held for the run.
+const CERTIFIER_KEEP_BYTES: usize = CERTIFIER_COPY_LIMIT;
 
 /// The first fault of a stream that cannot be read again, where it has been found: shared by the thread
 /// that finds it ([`Certifier`]) and the [`Reread`] that words it.
@@ -815,16 +817,17 @@ impl SeenFault {
     /// jq's parser stands, once every window in flight is certified, and the answer is kept as the
     /// thread would have kept it.
     fn certify_here(&self, certify: impl FnOnce(&mut usize) -> Option<String>) {
-        let mut state = self
+        let state = self
             .0
             .changed
             .wait_while(self.lock(), |state| state.in_flight > 0)
             .unwrap_or_else(PoisonError::into_inner);
         let mut resume = state.resume;
-        // The lock is held: a thread that does not exist yet cannot be handed a window meanwhile, and
-        // the certifier is the only one that hands any.
+        // Not held while certifying: the filter's thread is the only one that hands the certifier a
+        // window, so none arrives meanwhile.
+        drop(state);
         let fault = certify(&mut resume);
-        Self::store(&mut state, fault, Some(resume));
+        Self::store(&mut self.lock(), fault, Some(resume));
     }
 }
 
