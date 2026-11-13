@@ -7463,6 +7463,8 @@ Indexing, iteration and a field read through it to the anchored value, but `leng
 These still read the anchored value here, where yq reads the alias node:
 - a copy of the alias that the filter makes: the right side of an assignment (`.d = (.c | length)` is `2` here and `0` in yq, `.d = .c[0:1]` is `[5]` and `[]`), `.c |= length`, `to_entries | map(.value | length)`, `map_values(length)`, `[.c, .n] | map(length)` and `{"k": .c} | .k | length`;
 - a paren-grouped pipe on the alias, `.c | (.[0:1] | length)` (`1` here, `0` in yq);
+- `--eval-all` / `ea` (and `--slurp`), which evaluate on owned values: `.c | length` is `2` here and `0` in yq, while the slice (`[]`) agrees;
+- the wording of the `keys` refusal: `null (null) has no keys` here, `cannot get keys of , keys only works for maps and arrays` in yq (both exit 1);
 - `del(.c[0:1])`, where yq removes the alias position and this removes from the shared sequence;
 - every other operator that reads the alias node's own content, which yq refuses or answers from the anchor's name: `first`, `sort`, `reverse`, `unique`, `flatten`, `to_entries`, `with_entries`, `any`, `all`, `join`, `contains`, `pick` and `has` on an alias to a collection, and on an alias to a scalar `upcase`, `downcase`, `trim`, `test`, `split` and `sub` (`.t | upcase` is `"Z"` in yq when `t: *z` and `z: &z hello`: the anchor's name, not its value).
 
