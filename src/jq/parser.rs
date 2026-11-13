@@ -705,14 +705,81 @@ fn with_update_effect(update: &Expr) -> Expr {
         Expr::Comma(items) => Expr::pipe(items.iter().map(with_update_effect).collect()),
         Expr::Pipe(stages) => with_update_pipe_effect(stages),
         // `SRC as $v | rest`: the binding is kept, and `rest` contributes its changes (`.b as $v |
-        // .z = $v` writes `z`); SRC itself is evaluated, so its errors still count. Only the first
-        // value's writes are kept, where yq keeps each value's (#7094).
-        Expr::As { expr, var, body } => Expr::As {
-            expr: expr.clone(),
-            var: var.clone(),
-            body: Box::new(with_update_effect(body)),
-        },
+        // .z = $v` writes `z`), once for each value of SRC (#7094); SRC itself is evaluated, so
+        // its errors still count.
+        Expr::As { expr, var, body } => with_binding_effect(expr, var, with_update_effect(body)),
         discarded => with_discarded_stage(discarded),
+    }
+}
+
+/// The variable [`with_binding_effect`] folds over. Its name cannot be written in a filter, so it
+/// shadows nothing a user wrote.
+const WITH_BINDING_VALUE: &str = "// with binding value";
+
+/// [`with_update_effect`] for `SRC as $v | rest`, given `rest`'s `effect` (#7094). yq binds each
+/// value of SRC in turn and every value's writes land on the same node, so `.x[] as $v | .y = $v`
+/// leaves the last value and `.y += $v` adds them all. That is a fold of `effect` over SRC's
+/// values:
+///
+/// ```text
+/// reduce ([SRC as $v | [$v]] | if length > 1 then .[] else null end) as $m
+///   (.; (if $m == null then SRC else $m[0] end) as $v | effect)
+/// ```
+///
+/// A source of one value or none folds once over the marker `null`, which binds from SRC itself,
+/// as before: yq binds *no value* for an empty source (`.[$v] = 1` then writes every key, and
+/// `[$v]` is `[]`, so the boxed list still has one entry), and a key the source does not find
+/// binds nothing rather than `null`, both of which a fold over plain values would lose. `effect`
+/// is written once, so chained bindings stay linear in size (copying it for the two cases doubled
+/// the filter at each `as`). A source that names at most one node by fixed steps keeps the plain
+/// binding.
+///
+/// The values are SRC's as the node stood before the first write. yq copies each bound node when
+/// its turn comes, so a write to a node a *later* value is bound to (`.x[] as $v | .x[1] = 9 |
+/// .y += [$v]`) is seen there and not here, and a boxed value loses its comment and tag (#5429):
+/// both are in `limitations.md`.
+fn with_binding_effect(source: &Expr, var: &str, effect: Expr) -> Expr {
+    let bind = |source: Expr, body: Expr| Expr::As {
+        expr: Box::new(source),
+        var: var.to_string(),
+        body: Box::new(body),
+    };
+    if matches!(source, Expr::Identity | Expr::Var(_) | Expr::Literal(_))
+        || is_single_static_path(source)
+    {
+        return bind(source.clone(), effect);
+    }
+    let marker = || Expr::Var(WITH_BINDING_VALUE.to_string());
+    let boxed = Expr::Array(Box::new(bind(
+        source.clone(),
+        Expr::Array(Box::new(Expr::Var(var.to_string()))),
+    )));
+    let values = Expr::pipe(vec![
+        boxed,
+        Expr::If {
+            cond: Box::new(Expr::Compare {
+                op: CompareOp::Gt,
+                left: Box::new(Expr::Builtin(Builtin::Length)),
+                right: Box::new(Expr::Literal(Literal::Int(1))),
+            }),
+            then_branch: Box::new(Expr::Iterate),
+            else_branch: Box::new(Expr::Literal(Literal::Null)),
+        },
+    ]);
+    let rebind = Expr::If {
+        cond: Box::new(Expr::Compare {
+            op: CompareOp::Eq,
+            left: Box::new(marker()),
+            right: Box::new(Expr::Literal(Literal::Null)),
+        }),
+        then_branch: Box::new(source.clone()),
+        else_branch: Box::new(Expr::pipe(vec![marker(), Expr::index(0)])),
+    };
+    Expr::Reduce {
+        input: Box::new(values),
+        patterns: vec![Pattern::Var(WITH_BINDING_VALUE.to_string())],
+        init: Box::new(Expr::Identity),
+        update: Box::new(bind(rebind, effect)),
     }
 }
 
@@ -744,6 +811,13 @@ fn update_body_effect(body: &Expr) -> Option<Expr> {
                     .map(|(stage, rewritten)| rewritten.unwrap_or_else(|| stage.clone()))
                     .collect(),
             ))
+        }
+        // A binding whose body answers the node writes once for each value of its source, as in
+        // `with` (#7094): `.k |= (.x[] as $v | .y += $v)` adds every value, and a `select` there
+        // skips a value rather than ending the update. A body that ends in a value (`.x[] as $v |
+        // $v`) keeps its first output.
+        Expr::As { body: inner, .. } if answers_the_node(inner, true) => {
+            Some(with_update_effect(body))
         }
         Expr::As { expr, var, body } => update_body_effect(body).map(|body| Expr::As {
             expr: expr.clone(),
