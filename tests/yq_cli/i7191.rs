@@ -33,6 +33,12 @@ const ROWS: &[(&str, &str)] = &[
     ("(.k and 1) | [.]", "[true]\n[true]\n[true]\n[true]\n[true]\n[true]\n[true]\n[true]\n[true]\n[true]\n[true]\n[true]\n"),
     ("(1, .k) or .l | fi", "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n"),
     ("((.k and 1) and .k) | fi", "0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n2\n2\n2\n2\n2\n2\n2\n2\n2\n2\n2\n2\n"),
+    ("(.k // 5) *d 0 | fi", "0\n0\n0\n0\n1\n1\n1\n1\n2\n2\n2\n2\n"),
+    ("(.a // 5) + 1 | fi", "0\n0\n0\n0\n"),
+    ("(.a // fi) + 1 | fi", "0\n0\n0\n0\n"),
+    ("(.k and (.zz | select(false))) | fi", "0\n1\n2\n"),
+    ("((.a, .k) | select(. > 0)) and 1 | fi", "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n"),
+    ("(.zz // .k) + 1 | fi", "0\n0\n0\n0\n1\n1\n1\n1\n2\n2\n2\n2\n"),
 ];
 
 #[test]

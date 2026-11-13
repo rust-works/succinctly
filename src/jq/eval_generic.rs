@@ -23050,7 +23050,7 @@ fn yq_context_item<V: DocumentValue, S: EvalSemantics>(
 }
 
 /// Whether the nodes `operand` produces carry the origin of the entry they were made from, as yq's
-/// `.`, `.name`, `select`, `{...}`, arithmetic, `and`/`or` and `//` (from their left node) do and a literal or a builtin such as `length`
+/// `.`, `.name`, `select`, `{...}`, arithmetic, `and`/`or` and `//` (taken from their left node, which is as much as an operand can say: a value the right side supplies has the right node's origin) do and a literal or a builtin such as `length`
 /// does not (`10 + .x | document_index` is `0` for every document, #6969). A union counts only when
 /// every branch does: the origin is decided per operand here, where yq decides it per node.
 fn yq_operand_keeps_origin(operand: &Expr) -> bool {
