@@ -21,84 +21,84 @@ fn jq_n(filter: &str) -> Result<String> {
 fn a_slice_plus_a_closed_operand_as_a_fold_update_matches_jq() -> Result<()> {
     let rows = [
         (
-            r#"[range(20000)] | reduce range(20000) as $i (.; .[1:] + [$i]) | [length, .[0], .[-1]]"#,
-            r#"[20000,0,19999]"#,
+            r"[range(20000)] | reduce range(20000) as $i (.; .[1:] + [$i]) | [length, .[0], .[-1]]",
+            r"[20000,0,19999]",
         ),
         (
-            r#"[range(20000)] | reduce range(20000) as $i (.; .[:-1] + [$i]) | [length, .[0], .[-1]]"#,
-            r#"[20000,0,19999]"#,
+            r"[range(20000)] | reduce range(20000) as $i (.; .[:-1] + [$i]) | [length, .[0], .[-1]]",
+            r"[20000,0,19999]",
         ),
         (
-            r#"[range(20000)] | reduce range(20000) as $i (.; .[1:] + [$i, $i]) | [length, .[0], .[-1]]"#,
-            r#"[40000,0,19999]"#,
+            r"[range(20000)] | reduce range(20000) as $i (.; .[1:] + [$i, $i]) | [length, .[0], .[-1]]",
+            r"[40000,0,19999]",
         ),
         (
-            r#"[range(20000)] | reduce range(20000) as $i (.; .[1:] - [$i]) | length"#,
-            r#"0"#,
+            r"[range(20000)] | reduce range(20000) as $i (.; .[1:] - [$i]) | length",
+            r"0",
         ),
         (
-            r#"[range(20000)] | [foreach range(5) as $i (.; .[1:] + [$i]; length)]"#,
-            r#"[20000,20000,20000,20000,20000]"#,
+            r"[range(20000)] | [foreach range(5) as $i (.; .[1:] + [$i]; length)]",
+            r"[20000,20000,20000,20000,20000]",
         ),
         (
-            r#"[range(20000)] | [limit(3; repeat(.[1:] + [0]) | .[0])]"#,
-            r#"[1,1,1]"#,
+            r"[range(20000)] | [limit(3; repeat(.[1:] + [0]) | .[0])]",
+            r"[1,1,1]",
         ),
         (
-            r#"[range(5)] | reduce range(3) as $i (.; .[2:4] + [$i])"#,
-            r#"[2]"#,
+            r"[range(5)] | reduce range(3) as $i (.; .[2:4] + [$i])",
+            r"[2]",
         ),
         (
             r#""abcdef" | reduce range(3) as $i (.; .[1:] + "x")"#,
             r#""defxxx""#,
         ),
         (
-            r#"null | reduce range(3) as $i (.; .[1:] + [$i])"#,
-            r#"[2]"#,
+            r"null | reduce range(3) as $i (.; .[1:] + [$i])",
+            r"[2]",
         ),
         (
-            r#"{} | try (reduce range(2) as $i (.; .[1:] + [$i])) catch ."#,
+            r"{} | try (reduce range(2) as $i (.; .[1:] + [$i])) catch .",
             r#""Cannot index object with object""#,
         ),
         (
-            r#"[1,2,3] | try (reduce range(2) as $i (.; .[1:] + $i)) catch ."#,
+            r"[1,2,3] | try (reduce range(2) as $i (.; .[1:] + $i)) catch .",
             r#""array ([2,3]) and number (0) cannot be added""#,
         ),
         (
-            r#"[1,2,3] | reduce range(3) as $i (.; .[1:] + (.[0:1]))"#,
-            r#"[1,2,3]"#,
+            r"[1,2,3] | reduce range(3) as $i (.; .[1:] + (.[0:1]))",
+            r"[1,2,3]",
         ),
         (
-            r#"[1,2,3] | reduce range(3) as $i (.; .[1:] + [$i + 1])"#,
-            r#"[1,2,3]"#,
+            r"[1,2,3] | reduce range(3) as $i (.; .[1:] + [$i + 1])",
+            r"[1,2,3]",
         ),
         (
-            r#"[1,2,3] | [.[1:] + [4], .[2:] + [5]]"#,
-            r#"[[2,3,4],[3,5]]"#,
+            r"[1,2,3] | [.[1:] + [4], .[2:] + [5]]",
+            r"[[2,3,4],[3,5]]",
         ),
         (
-            r#"[range(5)] | reduce range(3) as $i (.; (.[1:]) + [$i])"#,
-            r#"[3,4,0,1,2]"#,
+            r"[range(5)] | reduce range(3) as $i (.; (.[1:]) + [$i])",
+            r"[3,4,0,1,2]",
         ),
         (
-            r#"[range(5)] | reduce (1,2) as $i (.; .[$i:] + [$i])"#,
-            r#"[3,4,1,2]"#,
+            r"[range(5)] | reduce (1,2) as $i (.; .[$i:] + [$i])",
+            r"[3,4,1,2]",
         ),
         (
-            r#"[range(5)] | reduce range(3) as $i (.; .[1:] + [$i] | . + [9])"#,
-            r#"[3,4,0,9,1,9,2,9]"#,
+            r"[range(5)] | reduce range(3) as $i (.; .[1:] + [$i] | . + [9])",
+            r"[3,4,0,9,1,9,2,9]",
         ),
         (
-            r#"[range(5)] | first(foreach range(3) as $i (.; .[1:] + [$i]; select(length == 3)))"#,
-            r#""#,
+            r"[range(5)] | first(foreach range(3) as $i (.; .[1:] + [$i]; select(length == 3)))",
+            r"",
         ),
         (
-            r#"[range(5)] | reduce range(3) as $i (.; .[1:] + ([$i], [9]))"#,
-            r#"[3,4,9,9,9]"#,
+            r"[range(5)] | reduce range(3) as $i (.; .[1:] + ([$i], [9]))",
+            r"[3,4,9,9,9]",
         ),
         (
-            r#"[range(5)] | reduce range(3) as $i (.; .[1:] + [$i]?)"#,
-            r#"[3,4,0,1,2]"#,
+            r"[range(5)] | reduce range(3) as $i (.; .[1:] + [$i]?)",
+            r"[3,4,0,1,2]",
         ),
     ];
     for (filter, want) in rows {
