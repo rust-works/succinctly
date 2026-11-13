@@ -50,7 +50,7 @@ use super::{FrontMatterMode, InputFormat, OnError, OutputFormat, YqCommand};
 use crate::front_matter;
 use crate::output::{
     self, exit_codes, flush_then_err, ColorScheme, DiagStyle, ErrorSink, InputLocation,
-    JsonFormatOpts, LoudFlushWriter, Terminator,
+    JsonFormatOpts, LoudFlushWriter, OutSink, Terminator,
 };
 
 mod go_yaml_color;
@@ -12653,9 +12653,6 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 "--eval-all and --slurp are incompatible: both combine inputs into a single evaluation"
             );
         }
-        if args.inplace {
-            anyhow::bail!("--eval-all and --inplace are incompatible");
-        }
         if args.raw_input {
             anyhow::bail!("--eval-all and --raw-input are incompatible");
         }
@@ -12778,7 +12775,12 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
 
     // Set up output
     let stdout = std::io::stdout();
-    let mut writer = LoudFlushWriter::new(stdout.lock());
+    // `--eval-all --inplace` collects the results to write them to the first file (#7042).
+    let mut writer = LoudFlushWriter::new(if args.eval_all && args.inplace {
+        OutSink::Buffer(Vec::new())
+    } else {
+        OutSink::Stdout(stdout.lock())
+    });
 
     // yq --exit-status semantics: exit 1 unless some result is truthy.
     // Unlike jq (which inspects only the last output value), yq treats empty
@@ -12844,7 +12846,10 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     let mut eval_all_pregathered: Option<(Vec<GatheredSource>, Option<i32>)> = None;
     let mut eval_all_results: Option<Vec<OwnedValue>> = None;
     let mut eval_all_per_document = false;
+    // `-i` writes the one evaluation's results to the first file (#7042), so it never takes the
+    // per-document rewrite.
     if args.eval_all
+        && !args.inplace
         && !args.null_input
         && resolve_run_input_format(args.input_format, &input_files) == InputFormat::Yaml
         && eval_all_matches_per_document(&program.expr)
@@ -14179,6 +14184,23 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 &output_config,
                 separator,
             )?;
+        }
+        // #7042: `-i` with `--eval-all` writes the results of the one evaluation to the first file and
+        // leaves the others as they are, as yq does. A halt or a reported error keeps the file.
+        if args.inplace {
+            let Some(first) = input_files.first() else {
+                anyhow::bail!("--inplace requires at least one file argument");
+            };
+            if is_stdin_file_argument(Path::new(first)) {
+                anyhow::bail!(
+                    "write in place flag only applicable when giving an expression and at least one file"
+                );
+            }
+            let output = writer.take_buffered()?;
+            if sink.halted().is_none() {
+                std::fs::write(first, &output)
+                    .with_context(|| format!("failed to write to file: {first}"))?;
+            }
         }
     } else if let Some(split_expr) = split_expr.as_ref() {
         // Handle --split-exp: write each result to its own file (named by
