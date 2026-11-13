@@ -1294,6 +1294,19 @@ Still different, in the same family:
 - `fi` and `filename` after a collect without `--eval-all`: `[.] | .[0] | fi` is `0` for every file in yq and `[.] | filename` is empty, because the collected array and its elements are copies with no origin; the origin is ambient per evaluation here.
 - `.k = (select(fi == 1))` and `.k = (. | select(fi == 1))` write the document into itself in yq (`k: !!null` under the copy), `.k = (select(fi == 1) | line)` reads the line of the selected node, and `.k = (.. | select(fi == 1))` selects the descendants: each prints something else here.
 
+### `del`, `sort_keys`, `map_values`, `sort` and a metadata assignment keep the `--eval-all` flag ([#7175](https://github.com/rust-works/succinctly/issues/7175))
+
+yq's `deleteChildren`, `sort_keys`, `map_values` (an `|=` over the children), `sort` and the `style`/`anchor` assignments write into the nodes they are given and return that context, as its assignments do, so each node keeps its `EvaluateTogether` flag and its origin.
+`yq ea 'del(.k) | [.]' f1 f2 f3` is one array of every document, `del(.k) | . + {"z": 1} | length` crosses the list (`3 3 3 3 4 4 4 4 4 4 4 4 2 2 2 2`), and `del(.k) | [.k]` is `[]`, because a read in a collect over the list is read-only.
+`succinctly yq` collected each document alone after them.
+The assignments joined that rule in [#7137](https://github.com/rust-works/succinctly/issues/7137); these join it with the same list of stages (`yq_stage_writes_in_place`).
+28 rows over three files are pinned against yq v4.53.3 in `tests/yq_cli/i7175.rs`.
+
+Still different:
+- `. tag = "!!map"` under `--eval-all` is refused ([#2796](https://github.com/rust-works/succinctly/issues/2796)), where yq collects the list after it.
+- `pick`, `omit` and `explode` do not return their input in yq: their arguments are evaluated over the list and cross it (`pick(["k"])` prints `{"k":10,"k":10,"k":10,"k":10}`), a separate rule.
+- `del(.k) | .a // 7` and `del(.k) | . as $d | [$d]` follow the `//` rule of [#7173](https://github.com/rust-works/succinctly/issues/7173) and the variable rule of [#2427](https://github.com/rust-works/succinctly/issues/2427); `del(.k) | .z = [.]` writes the list into each document, where yq's array holds the live nodes (see #7137 above).
+
 ### An arithmetic result keeps its left operand's origin under `--eval-all` ([#6969](https://github.com/rust-works/succinctly/issues/6969))
 
 A result of `+`, `-`, `*`, `/` or `%` is read from where its left operand was, as in yq: `yq ea '. * {"z":1} | document_index' md.yaml` over two documents is `0 0 1 1`, and `file_index` and `filename` follow the same way.
