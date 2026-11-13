@@ -746,9 +746,9 @@ struct Parser<'a, const HAS_CR: bool> {
     /// "more of the head" (`only_yq_header_lines_since` is never true). `---` / `---` / `x` is then
     /// a null document and `x`, as in the spec.
     yq_no_head: bool,
-    /// [`Self::first_document_marker_leads`]'s answer, found on first use: it is asked once for every block a
+    /// [`Self::first_marker_line_start`]'s answer, found on first use: it is asked once for every block a
     /// blank line detaches before the first node.
-    first_document_marker: core::cell::Cell<Option<bool>>,
+    first_document_marker: core::cell::OnceCell<Option<usize>>,
 }
 
 impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
@@ -833,7 +833,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             documents_started: 0,
             leading_run_from: 0,
             yq_no_head: false,
-            first_document_marker: core::cell::Cell::new(None),
+            first_document_marker: core::cell::OnceCell::new(),
             #[cfg(debug_assertions)]
             wrapper_slots: Vec::with_capacity(estimated_opens),
             #[cfg(debug_assertions)]
@@ -1420,6 +1420,19 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // the document node (#7084).
                 self.drain_pending_into_document_head();
                 return;
+            } else if self.yq_no_head
+                && next.is_some()
+                && self.documents_started == 1
+                && !self.saw_head_foot_node
+                && self.take_block_under_first_marker_as_foot()
+            {
+                // Behind a byte-order mark, the block under the first `---` that a blank line detaches
+                // from the first node is that node's foot, where the block above the marker stays its
+                // head (#7089, see `take_block_under_first_marker_as_foot`).
+                if self.pending_head_lines.is_empty() {
+                    return;
+                }
+                // What is left is the node's head, below.
             } else if let Some((_, next_column)) = next {
                 // A blank line after the run's second block changes nothing: it is still the foot of the key
                 // that owns the blocks the first one closed (#5053).
@@ -2114,6 +2127,41 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
     }
 
+    /// Behind a byte-order mark, when the pending lines reach below the first `---` marker and something (a
+    /// comment or a blank line) stands above it, the first blank-separated block under the marker is the
+    /// foot of the first key, item or scalar (#7089: `# c1` / `---` / `# c2` / blank / `a: 1` is `c1` on
+    /// `.a`'s key's head and `c2` on its foot), with the blank lines inside it kept, or is dropped when a
+    /// flow collection opens next, as yq drops it (see [`Self::opens_flow_collection`]). What is above the
+    /// marker, and any block after the first under it, stays pending as the node's head. A marker at the
+    /// very start leaves yq the block as the head. Returns whether the rule applied; when it did not,
+    /// nothing was moved.
+    fn take_block_under_first_marker_as_foot(&mut self) -> bool {
+        let Some(marker) = self.first_marker_line_start().filter(|&at| at > 0) else {
+            return false;
+        };
+        if !self
+            .pending_head_lines
+            .last()
+            .is_some_and(|&(start, _)| start as usize > marker)
+        {
+            return false;
+        }
+        let above = self
+            .pending_head_lines
+            .partition_point(|&(start, _)| (start as usize) < marker);
+        let mut below = self.pending_head_lines.split_off(above);
+        // The first block ends where a blank line separates two of the lines.
+        let first_block = (1..below.len())
+            .find(|&at| self.blank_line_between(below[at - 1].1 as usize, below[at].0 as usize))
+            .unwrap_or(below.len());
+        let later = below.split_off(first_block);
+        self.pending_head_lines.extend(later);
+        if !self.opens_flow_collection(self.pos, false) {
+            self.deferred_foot_lines.append(&mut below);
+        }
+        true
+    }
+
     /// Behind a byte-order mark yq sets no header aside (#6762), so a block above the first node that a
     /// blank line detaches from what follows is the head of the document node itself, the one go-yaml
     /// keeps for the comments above a document's content (#7084: `# l1` / blank / `# l2` / `a: 1` is `l1`
@@ -2134,33 +2182,35 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// Whether the text starts with a `---` marker once its comments, blank lines and `%` directive lines are
     /// skipped: the first document is then an explicit one (see [`Self::drain_pending_into_document_head`]).
     fn first_document_marker_leads(&self) -> bool {
-        if let Some(known) = self.first_document_marker.get() {
-            return known;
-        }
-        let mut leads = false;
-        let mut at = 0;
-        while at < self.input.len() {
-            let line_end = self.input[at..]
-                .iter()
-                .position(|&b| Self::is_break(b))
-                .map_or(self.input.len(), |n| at + n);
-            let line = &self.input[at..line_end];
-            let content = line
-                .iter()
-                .position(|&b| !matches!(b, b' ' | b'\t'))
-                .map(|n| &line[n..]);
-            match content {
-                None => {}
-                Some(rest) if matches!(rest.first(), Some(b'#' | b'%')) => {}
-                Some(rest) => {
-                    leads = line.first() != Some(&b' ') && Self::marker_prefix(rest, b"---");
-                    break;
+        self.first_marker_line_start().is_some()
+    }
+
+    /// The start of that `---` marker line (see [`Self::first_document_marker_leads`]), if there is one.
+    fn first_marker_line_start(&self) -> Option<usize> {
+        *self.first_document_marker.get_or_init(|| {
+            let mut at = 0;
+            while at < self.input.len() {
+                let line_end = self.input[at..]
+                    .iter()
+                    .position(|&b| Self::is_break(b))
+                    .map_or(self.input.len(), |n| at + n);
+                let line = &self.input[at..line_end];
+                let content = line
+                    .iter()
+                    .position(|&b| !matches!(b, b' ' | b'\t'))
+                    .map(|n| &line[n..]);
+                match content {
+                    None => {}
+                    Some(rest) if matches!(rest.first(), Some(b'#' | b'%')) => {}
+                    Some(rest) => {
+                        return (line.first() != Some(&b' ') && Self::marker_prefix(rest, b"---"))
+                            .then_some(at);
+                    }
                 }
+                at = line_end + 1;
             }
-            at = line_end + 1;
-        }
-        self.first_document_marker.set(Some(leads));
-        leads
+            None
+        })
     }
 
     /// Hook for "a node that can own a standalone comment just opened at
