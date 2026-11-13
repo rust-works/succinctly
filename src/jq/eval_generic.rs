@@ -23050,7 +23050,7 @@ fn yq_context_item<V: DocumentValue, S: EvalSemantics>(
 }
 
 /// Whether the nodes `operand` produces carry the origin of the entry they were made from, as yq's
-/// `.`, `.name`, `select`, `{...}` and arithmetic do and a literal or a builtin such as `length`
+/// `.`, `.name`, `select`, `{...}`, arithmetic, `and`/`or` and `//` (from their left node) do and a literal or a builtin such as `length`
 /// does not (`10 + .x | document_index` is `0` for every document, #6969). A union counts only when
 /// every branch does: the origin is decided per operand here, where yq decides it per node.
 fn yq_operand_keeps_origin(operand: &Expr) -> bool {
@@ -23065,7 +23065,10 @@ fn yq_operand_keeps_origin(operand: &Expr) -> bool {
         | Expr::SliceExpr { .. }
         | Expr::Object(_)
         | Expr::Builtin(Builtin::Select(_)) => true,
-        Expr::Arithmetic { left, .. } => yq_operand_keeps_origin(left),
+        Expr::Arithmetic { left, .. }
+        | Expr::And(left, _)
+        | Expr::Or(left, _)
+        | Expr::Alternative(left, _) => yq_operand_keeps_origin(left),
         Expr::Optional(inner) => yq_operand_keeps_origin(inner),
         Expr::Pipe(stages) => stages.last().is_some_and(yq_operand_keeps_origin),
         Expr::Comma(branches) => branches.iter().all(yq_operand_keeps_origin),
@@ -23621,7 +23624,8 @@ fn read_operand_over_list<S: EvalSemantics, V: DocumentValue>(
 /// output pairs `false` once (`CalcWhenEmpty`), and a left side with no output stands as one `null`:
 /// falsy, so `.zz and 1` is `false` once and `.zz or 1` is a `true` for each output of `1`. The right
 /// side does not depend on the left output, so it is read once, when the first left output needs it,
-/// and an error in it surfaces only then. The booleans are nodes of their own: no flag, no origin.
+/// and an error in it surfaces only then. The booleans carry no flag, and the origin of their
+/// owner, the left node or (an empty left side) the right one (#7191).
 fn boolean_together<S: EvalSemantics, V: DocumentValue>(
     stage: &Expr,
     context: &[YqContextItem<V>],
@@ -23639,33 +23643,59 @@ fn boolean_together<S: EvalSemantics, V: DocumentValue>(
     let _read_only = yq_read_only_context::enter();
     let over = |operand: &Expr| read_operand_over_list::<S, V>(operand, context, optional, cur);
     let truthy = |item: &YqContextItem<V>| generic_item_is_truthy::<V>(&item.to_generic_item());
-    let lefts = over(left)?;
-    // A side with no output stands as one falsy `null`.
-    let decisions: Vec<bool> = if lefts.is_empty() {
-        vec![false]
-    } else {
-        lefts.iter().map(truthy).collect()
+    // The owner of a boolean is its left node, or the right one when the left side is empty
+    // (`getOwner`): the boolean keeps where that was read, unless it is a literal, a built node or
+    // one of the list's own (#7191).
+    let (left_reads, right_reads) = (
+        yq_operand_keeps_origin(left),
+        yq_operand_keeps_origin(right),
+    );
+    let origin_of = |item: &YqContextItem<V>, reads: bool| {
+        (reads && !item.tag.together)
+            .then_some(item.tag.origin)
+            .flatten()
     };
-    let boolean = |value: bool| {
+    let lefts = over(left)?;
+    // A side with no output stands as one falsy `null` with no owner.
+    let decisions: Vec<(bool, Option<NodeOrigin>)> = if lefts.is_empty() {
+        vec![(false, None)]
+    } else {
+        lefts
+            .iter()
+            .map(|item| (truthy(item), origin_of(item, left_reads)))
+            .collect()
+    };
+    let boolean = |value: bool, origin: Option<NodeOrigin>| {
         YqContextItem::new(
             YqContextNode::Owned(OwnedValue::Bool(value)),
-            YqContextTag::default(),
+            YqContextTag {
+                together: false,
+                origin,
+            },
         )
     };
-    let mut rights: Option<Vec<bool>> = None;
+    let no_left = lefts.is_empty();
+    let mut rights: Option<Vec<(bool, Option<NodeOrigin>)>> = None;
     let mut out: Vec<YqContextItem<V>> = Vec::new();
-    for left_truthy in decisions {
+    for (left_truthy, left_origin) in decisions {
         // `and` is decided by a falsy left, `or` by a truthy one.
         if left_truthy != is_and {
-            out.push(boolean(left_truthy));
+            out.push(boolean(left_truthy, left_origin));
             continue;
         }
         if rights.is_none() {
-            rights = Some(over(right)?.iter().map(truthy).collect());
+            rights = Some(
+                over(right)?
+                    .iter()
+                    .map(|item| (truthy(item), origin_of(item, right_reads)))
+                    .collect(),
+            );
         }
         match rights.as_deref().unwrap_or_default() {
-            [] => out.push(boolean(false)),
-            bits => out.extend(bits.iter().map(|&bit| boolean(bit))),
+            [] => out.push(boolean(false, left_origin)),
+            bits => out.extend(bits.iter().map(|&(bit, right_origin)| {
+                boolean(bit, if no_left { right_origin } else { left_origin })
+            })),
         }
     }
     Ok(out)

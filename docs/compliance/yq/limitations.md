@@ -1276,7 +1276,7 @@ yq's `andOperator` and `orOperator` are `crossFunctionWithPrefs` operators over 
 A left result that decides (falsy under `and`, truthy under `or`) is the answer and the right side is not read for it; a left side with no output stands as one falsy `null`; a right side with no output pairs `false` once.
 So `(.k and .k)` over four documents of which three have `k` is nine `true`, `.zz and 1` is one `false` and `.zz or 1` is four `true`.
 The right side is read when the first undecided left result needs it, so an error in it is raised only then.
-The booleans are nodes of their own, with no flag and no origin.
+The booleans carry no flag, and the origin of their owner, the left node or (an empty left side) the right one, as `createBooleanCandidate` gives it ([#7191](https://github.com/rust-works/succinctly/issues/7191)): `(.k and 1) | file_index` is each file's own index, and a literal or one of the list's own nodes as the owner gives none.
 `succinctly yq` ran both per document.
 33 rows over three files and four documents are pinned against yq v4.53.3 in `tests/yq_cli/i7184.rs`.
 
