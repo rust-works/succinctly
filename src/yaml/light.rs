@@ -7136,12 +7136,17 @@ impl<'a> YamlString<'a> {
                     dash = next;
                 }
                 let dash_indent = line_indent + (dash - pos);
-                // Check if there's a `:` between `-` and the indicator
-                // If so, it's `- key: |` and we should return the dash's column + 2
-                // If not, it's `- |` and we should return the dash's column
-                let has_colon = text
-                    .get((dash + 2)..indicator_pos)
-                    .is_some_and(|slice| slice.contains(&b':'));
+                // Whether a key's colon ends what stands between the `-` and the indicator, node
+                // properties aside (#7130): `- key: |` is the dash's column + 2, `- |` and
+                // `- !<tag:yaml.org,2002:str> |` (a `:` inside a tag is no key's) the dash's column.
+                let between = text.get((dash + 1)..indicator_pos).unwrap_or_default();
+                let between = between
+                    .iter()
+                    .position(|b| !matches!(b, b' ' | b'\t'))
+                    .map_or(&[][..], |at| &between[at..]);
+                let has_colon = crate::yaml::parser::line_ends_with_colon_before_comment(
+                    crate::yaml::parser::split_trailing_properties(between).0,
+                );
                 if has_colon {
                     return dash_indent + 2;
                 }
