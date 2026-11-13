@@ -591,6 +591,99 @@ impl PlainRecords {
     }
 }
 
+/// A stream that jq's reader walks as it walks `tail` read after `lines` line breaks of RFC 7464's own
+/// framing (#7164): a pipe is read a window at a time while its records are `RS value LF`, and the rest of
+/// it, from the first record that is not, is walked by the reader that reads a stream whole.
+///
+/// After such a record jq's reader stands at the start of a line, in `Normal` (an RS is a record of its
+/// own there, which in the final buffer ends the stream, #2998, where at the start of a stream it only
+/// opens one), with nothing pending, and its `fgets` chunks start afresh at the line break. So the
+/// bytes from there are read as they are read after an RS and `lines` line breaks, each a chunk of its
+/// own: every line, value, warning and drop rule comes out as in the whole stream, the column too (it
+/// is 0 at a line's start). Nothing before the tail yields a value or a warning. The one other state the
+/// reader carries over a clean record is the stale byte of its token buffer, which
+/// [`token_byte_after`] finds and [`seed_token_byte`] gives the walk.
+///
+/// `lines` of 0 is a tail that is the whole stream (no record was clean), read as it is.
+pub(crate) fn resumed_stream(lines: usize, tail: Vec<u8>) -> Vec<u8> {
+    if lines == 0 {
+        return tail;
+    }
+    let mut stream = Vec::with_capacity(1 + lines + tail.len());
+    stream.push(ASCII_RS);
+    stream.resize(1 + lines, b'\n');
+    stream.extend_from_slice(&tail);
+    stream
+}
+
+/// The byte jq's token buffer holds at index 1 once its reader has read `records`, a run of records
+/// that each are one RFC 8259 document (#7164), or `None` when they wrote none there (a buffer that
+/// never grew, or one only tokens of a byte or less filled). `check_literal` reads it for a bare `n`
+/// ([`Reader::token_buf`]), so it is all a reader resumed after them ([`resumed_stream`]) needs of the
+/// tokens before.
+///
+/// The last token that wrote index 1 decides, so the records are read from their end: a number writes
+/// its second byte, or the NUL jq ends a one-byte number with; a literal writes its second byte; a
+/// string of two bytes or more writes the second byte of the text it decodes to, or the second byte it
+/// held when that is one byte ([`decode_string_in_place`]). A string of a byte or less, white space,
+/// structure and RS write nothing there. A test holds this to the reader's own buffer.
+pub(crate) fn token_byte_after(records: &[u8]) -> Option<u8> {
+    let mut end = records.len();
+    while end > 0 {
+        let byte = records[end - 1];
+        if byte == b'"' {
+            // The quote that opens the string: one with an even run of backslashes before it.
+            let mut open = end - 1;
+            loop {
+                open = records[..open].iter().rposition(|&b| b == b'"')?;
+                let escapes = records[..open]
+                    .iter()
+                    .rev()
+                    .take_while(|&&b| b == b'\\')
+                    .count();
+                if escapes % 2 == 0 {
+                    break;
+                }
+            }
+            let text = &records[open + 1..end - 1];
+            if text.len() >= 2 {
+                let mut token = text.to_vec();
+                // The records are RFC 8259, so the decode does not fail.
+                let _ = decode_string_in_place(&mut token);
+                return Some(token[1]);
+            }
+            end = open;
+        } else if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'+' | b'.') {
+            let start = records[..end]
+                .iter()
+                .rposition(|&b| !(b.is_ascii_alphanumeric() || matches!(b, b'-' | b'+' | b'.')))
+                .map_or(0, |at| at + 1);
+            let token = &records[start..end];
+            return Some(match token {
+                [_] => 0,
+                [_, second, ..] => *second,
+                [] => unreachable!("the token holds the byte it was found by"),
+            });
+        } else {
+            end -= 1;
+        }
+    }
+    None
+}
+
+thread_local! {
+    /// The byte the token buffer of every reader made on this thread starts with at index 1
+    /// ([`seed_token_byte`]).
+    static SEEDED_TOKEN_BYTE: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+/// Starts the token buffer of every reader made on this thread from now on with `byte` at index 1
+/// (#7164): the walks of a [`resumed_stream`] read on from the records before its tail, whose last
+/// token left it there ([`token_byte_after`]). `None` starts them empty, as a stream's own start does.
+pub(crate) fn seed_token_byte(byte: Option<u8>) {
+    SEEDED_TOKEN_BYTE.with(|seed| seed.set(byte));
+}
+
 /// What follows the last of the files a walk reads (#6588): a file that did not open means jq's
 /// reader asks that file for more before it is at its end, so the refill that sets `is_last` is
 /// the empty one at the missing file, and the last opened file's last chunk is not the final
@@ -1150,7 +1243,10 @@ impl<'a> Reader<'a> {
                 St::WaitingForRs
             },
             stack: Vec::new(),
-            token_buf: Vec::new(),
+            // #7164: a resumed stream's reader has the byte the records before it left.
+            token_buf: SEEDED_TOKEN_BYTE
+                .with(std::cell::Cell::get)
+                .map_or_else(Vec::new, |byte| vec![0, byte]),
             token_len: 0,
             next: None,
             last_ch_was_ws: false,
@@ -3047,5 +3143,183 @@ mod tests {
         assert_warnings(b"garbage\x1e\"ok\"\n", &[]);
         assert_warnings(b"\x1e\"ok\"\n", &[]);
         assert_warnings(b"\x1e{\"a\": [1, 2]}\n", &[]);
+    }
+
+    /// A small xorshift, so the generated streams below are the same on every run.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
+        }
+
+        fn pick<'a>(&mut self, items: &[&'a str]) -> &'a str {
+            items[self.below(items.len())]
+        }
+    }
+
+    /// The tokens a clean record is made of: every kind that writes index 1 of jq's token buffer
+    /// and every kind that does not ([`token_byte_after`]).
+    const CLEAN_TOKENS: &[&str] = &[
+        "null",
+        "true",
+        "false",
+        "1",
+        "12",
+        "-3.5e2",
+        "\"\"",
+        "\"a\"",
+        "\"bus\"",
+        "\"\\u0041\"",
+        "\"x\\u0075\"",
+        "\"\\n\"",
+        "\"\\u00e9\"",
+        "\"q\\\"u\"",
+        "\"\\\\\"",
+        "{}",
+        "[]",
+    ];
+
+    /// One clean record, `RS value LF`, sometimes spanning lines.
+    fn clean_record(rng: &mut Rng) -> String {
+        let mut value = String::new();
+        let width = rng.below(4);
+        if width == 0 {
+            value.push_str(rng.pick(CLEAN_TOKENS));
+        } else if rng.below(2) == 0 {
+            value.push('[');
+            for i in 0..width {
+                if i > 0 {
+                    value.push_str(if rng.below(3) == 0 { ",\n " } else { "," });
+                }
+                value.push_str(rng.pick(CLEAN_TOKENS));
+            }
+            value.push(']');
+        } else {
+            value.push('{');
+            for i in 0..width {
+                if i > 0 {
+                    value.push(',');
+                }
+                value.push_str(rng.pick(&["\"k\"", "\"\"", "\"\\u0075\"", "\"nu\""]));
+                value.push(':');
+                value.push_str(rng.pick(CLEAN_TOKENS));
+            }
+            value.push('}');
+        }
+        format!("\x1e{value}\n")
+    }
+
+    /// The tail of a stream after its clean records: what a record that is not plain can hold, a bare
+    /// `n` most of all (it reads the stale byte), RS bytes where a reader is in the final buffer, and
+    /// clean records after them.
+    fn tail(rng: &mut Rng) -> Vec<u8> {
+        let pieces = [
+            "\x1en\n",
+            "\x1e[n]\n",
+            "\x1enul\n",
+            "\x1e1 2\n",
+            "\x1e{\"a\":1\n",
+            "\x1e\"open\n",
+            "\x1e12.5",
+            "\x1e",
+            "\x1e\x1e",
+            "garbage\n",
+            "\n\n",
+            "\x1enan\n",
+            "\x1e[1,]\n",
+            "\x1e}\n",
+            "\x1etrue",
+            " ",
+            "\x1e\"\\u0041\"\n",
+        ];
+        let mut text = String::new();
+        for _ in 0..1 + rng.below(5) {
+            if rng.below(3) == 0 {
+                text.push_str(&clean_record(rng));
+            } else {
+                text.push_str(rng.pick(&pieces));
+            }
+        }
+        text.into_bytes()
+    }
+
+    /// What a walk of one stream answers that a run shows: every warning, and each value's text
+    /// with the line jq names for it.
+    fn walked(stream: &[u8]) -> (Vec<String>, Vec<(String, usize)>) {
+        let sources = vec![(None, stream.to_vec())];
+        let mut warnings = Vec::new();
+        let walk = walk_stream(&sources, false, &mut |w| warnings.push(w.to_string()));
+        let values = walk
+            .values
+            .iter()
+            .zip(&walk.locations)
+            .map(|(&(start, end), &(_, line))| {
+                (
+                    String::from_utf8_lossy(&stream[start..end]).into_owned(),
+                    line,
+                )
+            })
+            .collect();
+        (warnings, values)
+    }
+
+    /// #7164: the rest of a stream after its clean records, walked as [`resumed_stream`] with the byte
+    /// [`token_byte_after`] finds, gives the warnings, values and lines that the walk of the whole stream
+    /// gives after those records. The streams hold every kind of token before a bare `n`, multi-line
+    /// records, and tails that reach the end-of-stream drop (#2998) and the EOF branch.
+    #[test]
+    fn a_resumed_walk_reads_the_rest_of_the_stream_as_the_whole_walk_7164() {
+        let mut rng = Rng(0x7164_7164);
+        for case in 0..4000 {
+            let records: String = (0..1 + rng.below(6))
+                .map(|_| clean_record(&mut rng))
+                .collect();
+            let rest = tail(&mut rng);
+            let whole = [records.as_bytes(), &rest].concat();
+            let (whole_warnings, whole_values) = walked(&whole);
+            let clean_values = walked(records.as_bytes()).1.len();
+            seed_token_byte(token_byte_after(records.as_bytes()));
+            let lines = records.bytes().filter(|&b| b == b'\n').count();
+            let resumed = walked(&resumed_stream(lines, rest.clone()));
+            seed_token_byte(None);
+            assert_eq!(
+                resumed,
+                (whole_warnings, whole_values[clean_values..].to_vec()),
+                "case {case}: {records:?} then {:?}",
+                String::from_utf8_lossy(&rest)
+            );
+        }
+    }
+
+    /// #7164: [`token_byte_after`] is the byte the reader's own buffer holds at index 1 once it has read
+    /// the records, whenever a token wrote there; when none did, the buffer holds nothing there or a 0.
+    #[test]
+    fn the_token_byte_is_the_readers_own_7164() {
+        let mut rng = Rng(0x1e1e_7164);
+        for case in 0..4000 {
+            let records: String = (0..1 + rng.below(4))
+                .map(|_| clean_record(&mut rng))
+                .collect();
+            let mut emit = |_: &str, _: usize| {};
+            let mut reader = Reader::new(bom_prefix(&[]), &mut emit);
+            reader.run(records.as_bytes(), 0, &[]);
+            let held = reader.token_buf.get(1).copied();
+            match token_byte_after(records.as_bytes()) {
+                Some(byte) => assert_eq!(held, Some(byte), "case {case}: {records:?}"),
+                None => assert!(matches!(held, None | Some(0)), "case {case}: {records:?}"),
+            }
+        }
+        // A string whose text decodes to one byte leaves the second byte it held.
+        assert_eq!(token_byte_after(b"\x1e\"\\u0041\"\n"), Some(b'u'));
+        assert_eq!(token_byte_after(b"\x1e[\"bus\",\"\"]\n"), Some(b'u'));
+        assert_eq!(token_byte_after(b"\x1enull\n\x1e{}\n"), Some(b'u'));
+        assert_eq!(token_byte_after(b"\x1e7\n"), Some(0));
+        assert_eq!(token_byte_after(b"\x1e[\"a\",{}]\n"), None);
+        assert_eq!(resumed_stream(0, b"\x1e1\n".to_vec()), b"\x1e1\n");
+        assert_eq!(resumed_stream(2, b"\x1e1\n".to_vec()), b"\x1e\n\n\x1e1\n");
     }
 }
