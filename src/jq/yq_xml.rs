@@ -5,12 +5,13 @@
 //! only), `+content` is the element's text, a key starting with `+p_` is a processing instruction and
 //! `+directive` a directive. The printer's indentation is Go's: a start tag opens a line one level deeper
 //! unless text follows it, which keeps `<a>1</a>` on one line. A comment is written where yq's encoder
-//! writes it when the caller has the nodes' comments ([`XmlComments`], #7117); the value model keeps none.
+//! writes it when the caller has the nodes' comments ([`EncoderComments`], #7117); the value model keeps none.
 
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use super::encoder_comments::{EncoderComments, EncoderNodeComments, NO_COMMENTS};
 use super::error::EvalError;
 use super::expr::XmlOptions;
 use super::value::{ObjectMap, OwnedValue};
@@ -216,54 +217,12 @@ fn is_valid_directive(directive: &str) -> bool {
     depth == 0 && quote == 0 && !comment
 }
 
-/// The head, line and foot comment of one node as yq's node holds it: `#` and all, the lines of a
-/// block joined with a line break (go-yaml's `HeadComment`, `LineComment`, `FootComment`).
-#[derive(Debug, Clone, Default)]
-pub(crate) struct XmlNodeComments {
-    pub head: String,
-    pub line: String,
-    pub foot: String,
-}
-
-/// What a node's members hold: a mapping's entries in order, or a sequence's items.
-#[derive(Debug, Clone, Default)]
-pub(crate) enum XmlMembers {
-    #[default]
-    None,
-    Map(Vec<XmlEntry>),
-    Seq(Vec<XmlComments>),
-}
-
-/// The comments of a node and of everything below it, in the shape of the value they came from.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct XmlComments {
-    pub own: XmlNodeComments,
-    pub members: XmlMembers,
-}
-
-/// A mapping entry: the key's own comments and the value's tree.
-#[derive(Debug, Clone)]
-pub(crate) struct XmlEntry {
-    pub key: String,
-    pub key_comments: XmlNodeComments,
-    pub value: XmlComments,
-}
-
-static NO_COMMENTS: XmlComments = XmlComments {
-    own: XmlNodeComments {
-        head: String::new(),
-        line: String::new(),
-        foot: String::new(),
-    },
-    members: XmlMembers::None,
-};
-
 /// yq's `headComment`, `lineComment` and `footComment`: the comment without its first `#`.
 fn without_first_hash(comment: &str) -> String {
     comment.replacen('#', "", 1)
 }
 
-fn head_and_line(node: &XmlNodeComments) -> String {
+fn head_and_line(node: &EncoderNodeComments) -> String {
     without_first_hash(&node.head) + &without_first_hash(&node.line)
 }
 
@@ -359,7 +318,7 @@ impl Encoder<'_> {
         &mut self,
         name: &str,
         value: &OwnedValue,
-        comments: &XmlComments,
+        comments: &EncoderComments,
         depth: usize,
     ) -> Result<(), EvalError> {
         super::value::assert_value_tree_depth(depth);
@@ -368,11 +327,7 @@ impl Encoder<'_> {
             OwnedValue::Array(items) => {
                 self.comment(&head_and_line(&comments.own))?;
                 for (index, item) in items.iter().enumerate() {
-                    let item_comments = match &comments.members {
-                        XmlMembers::Seq(seq) => seq.get(index).unwrap_or(&NO_COMMENTS),
-                        _ => &NO_COMMENTS,
-                    };
-                    self.element(name, item, item_comments, depth + 1)?;
+                    self.element(name, item, comments.item(index), depth + 1)?;
                 }
                 self.comment(&without_first_hash(&comments.own.foot))
             }
@@ -387,27 +342,12 @@ impl Encoder<'_> {
         }
     }
 
-    /// The comments of entry `index` of a mapping, if they are those of `key`.
-    fn entry<'c>(
-        comments: &'c XmlComments,
-        index: usize,
-        key: &str,
-    ) -> (&'c XmlNodeComments, &'c XmlComments) {
-        match &comments.members {
-            XmlMembers::Map(entries) => match entries.get(index) {
-                Some(entry) if entry.key == key => (&entry.key_comments, &entry.value),
-                _ => (&NO_COMMENTS.own, &NO_COMMENTS),
-            },
-            _ => (&NO_COMMENTS.own, &NO_COMMENTS),
-        }
-    }
-
     /// yq's `encodeMap`.
     fn map(
         &mut self,
         name: &str,
         entries: &ObjectMap,
-        comments: &XmlComments,
+        comments: &EncoderComments,
         depth: usize,
     ) -> Result<(), EvalError> {
         let mut attributes = Vec::new();
@@ -434,7 +374,7 @@ impl Encoder<'_> {
         self.printer.start(name, &attributes)?;
         self.comment(&without_first_hash(&comments.own.head))?;
         for (index, (key, value)) in entries.into_iter().enumerate() {
-            let (key_comments, value_comments) = Self::entry(comments, index, key);
+            let (key_comments, value_comments) = comments.entry(index, key);
             self.comment(&head_and_line(key_comments))?;
             if key.starts_with(&self.options.proc_inst_prefix) {
                 let target = key.replacen(&self.options.proc_inst_prefix, "", 1);
@@ -466,7 +406,7 @@ pub(crate) fn format_xml(value: &OwnedValue, options: &XmlOptions) -> Result<Str
 pub(crate) fn format_xml_commented(
     value: &OwnedValue,
     options: &XmlOptions,
-    comments: &XmlComments,
+    comments: &EncoderComments,
     leading: &str,
 ) -> Result<String, EvalError> {
     let indent = " ".repeat(options.indent);
@@ -511,7 +451,7 @@ pub(crate) fn format_xml_commented(
     };
     encoder.comment(&head_and_line(&comments.own))?;
     for (index, (key, value)) in entries.into_iter().enumerate() {
-        let (key_comments, value_comments) = Encoder::entry(comments, index, key);
+        let (key_comments, value_comments) = comments.entry(index, key);
         let key_comment = head_and_line(key_comments);
         encoder.comment(&key_comment)?;
         if !key_comment.is_empty() {
@@ -540,6 +480,7 @@ pub(crate) fn format_xml_commented(
 
 #[cfg(test)]
 mod tests {
+    use super::super::encoder_comments::{EncoderEntry, EncoderMembers};
     use super::*;
 
     /// yq's `encodeComment` on the text it is given (a comment already without its first `#`), as
@@ -578,17 +519,17 @@ mod tests {
             directive_name: "+directive".into(),
             empty_null: false,
         };
-        let comments = XmlComments {
-            own: XmlNodeComments::default(),
-            members: XmlMembers::Map(alloc::vec![XmlEntry {
+        let comments = EncoderComments {
+            own: EncoderNodeComments::default(),
+            members: EncoderMembers::Map(alloc::vec![EncoderEntry {
                 key: "a".into(),
-                key_comments: XmlNodeComments::default(),
-                value: XmlComments {
-                    own: XmlNodeComments {
+                key_comments: EncoderNodeComments::default(),
+                value: EncoderComments {
+                    own: EncoderNodeComments {
                         line: "# x --> y".into(),
-                        ..XmlNodeComments::default()
+                        ..EncoderNodeComments::default()
                     },
-                    members: XmlMembers::None,
+                    members: EncoderMembers::None,
                 },
             }]),
         };

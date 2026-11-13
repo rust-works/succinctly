@@ -8818,20 +8818,24 @@ fn top_level_comma_branches(expr: &Expr) -> Option<Vec<&Expr>> {
 /// they did before.
 const PICK_REPLAY_MAX_BYTES: usize = 1 << 20;
 
-/// The program and the `-o xml` encoder stage `run_yq` appended to it, if that is how `expr` ends (#7156).
-fn split_xml_encoder(expr: &Expr) -> Option<(Expr, &XmlOptions)> {
+/// The program and the encoder stage `run_yq` appended to it, if that is how `expr` ends and the encoder
+/// writes comments (`-o xml`, `-o lua`, #7156).
+fn split_comment_encoder(expr: &Expr) -> Option<(Expr, &YqOutputEncoder)> {
     let Expr::Pipe(stages) = expr else {
         return None;
     };
     let (last, prefix) = stages.split_last()?;
-    let Expr::Format(FormatType::YqOutput(YqOutputEncoder::Xml(options))) = last else {
+    let Expr::Format(FormatType::YqOutput(encoder)) = last else {
         return None;
     };
+    if !jq::yq_encoder_writes_comments(encoder) {
+        return None;
+    }
     let inner = match prefix {
         [only] => only.clone(),
         _ => Expr::Pipe(prefix.to_vec().into()),
     };
-    Some((inner, options))
+    Some((inner, encoder))
 }
 
 /// Evaluate a jq expression directly on a YAML cursor.
@@ -8860,7 +8864,7 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
     // comments, and each result is encoded with the tree it came with.
     // A plain read is not taken here: the encoder reads its comments off the cursor, which keeps a
     // detail the tree does not (the line break a blank line leaves under a head comment).
-    if let Some((inner, options)) = split_xml_encoder(expr).filter(|(inner, _)| {
+    if let Some((inner, encoder)) = split_comment_encoder(expr).filter(|(inner, _)| {
         pristine_override.is_none()
             && (is_alias_sensitive_assign(inner)
                 || reshape_presentation::needed(inner)
@@ -8877,7 +8881,7 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
         )?;
         let mut encoded = Vec::with_capacity(results.len());
         for (value, tree) in results {
-            match jq::format_yq_xml_from_tree(options, &value, &tree, &cursor) {
+            match jq::format_yq_encoder_from_tree(encoder, &value, &tree, &cursor) {
                 Ok(text) => encoded.push((OwnedValue::String(text.into()), CommentTree::empty())),
                 // The results before the one the encoder refuses are printed (#6923).
                 Err(e) => {

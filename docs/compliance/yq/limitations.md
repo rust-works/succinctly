@@ -7800,15 +7800,17 @@ Six rows differ from yq v4.53.3, each pinned out of `tests/yq_cli/i6850.rs`:
 - `-o=csv` and `-o=tsv` with `-0` write each result's row here and a bare NUL in yq: yq's CSV writer is not flushed before the NUL, so the row is lost.
   Writing it matches nothing yq can be asked to read back (rule 4(b)).
 
-### `-o=lua` — a value's source style, a key's type and a comment are not read (#6924)
+### `-o=lua` — a value's source style and a key's type are not read, and a rebuilt value loses its comments (#6924, #7159)
 
 `-o=lua` writes a table literal as yq's Lua encoder does (tab indent, `,` after an array element and `;` after a map entry, yq's string escapes, `nil`, `(1/0)`, `(-1/0)` and `(0/0)`, a `0o` integer in decimal), and agrees with yq v4.53.3 on 2,400 random JSON documents (under six combinations of the four options).
-The encoder runs over the value model, which keeps no node style, key tag or comment, so on a YAML input these still differ:
+A line comment is written as yq writes it (#7159): ` -- text` after the `;` of a mapping value, after the `,` of an array item, and after a key's `["k"] =` with a line break after it when the comment is on the key; a head or foot comment is written by neither.
+The comments are read from the node the result came from, and from the presentation tree for a write (`.a = 1`, `del(.a)`, `sort_keys(.)`, as for `-o=xml`, #7156), and agree with yq on random comment positions over twelve document shapes, read and written.
+The encoder runs over the value model, which keeps no node style or key tag, so on a YAML input these still differ:
 
 - A literal (`|`) or folded (`>`) string is written `"l1\nl2\n"`, where yq writes a long bracket (`[[`, a line break, the text, `]]`).
   A single-quoted string is written double-quoted, where yq keeps its single quotes.
 - A key that is not a string (`1: a`, `true: b`) is written `["1"] = "a"`, where yq writes `[1] = "a"` (its tag survives).
-- A comment is dropped, where yq writes a line comment as ` -- text` after the entry.
+- A line comment is dropped from a value the filter rebuilds where the YAML printer drops its comments too (`with_entries(.)`, `. * {..}`, #5521) and under `--eval-all` (#4380), where yq keeps the comments of the nodes it copies.
 - A timestamp (`2001-01-01`) and `!!binary` are written as strings, where yq stops with `lua encoder NYI -- !!timestamp`.
 - The integer spellings `-0o17` and `0O17` and the YAML 1.1 ones `1_000`, `0b11` and `0XfF` are strings here (see the YAML 1.1 section above), so they are quoted, where yq writes them bare.
 
