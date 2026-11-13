@@ -1083,6 +1083,84 @@ pub(crate) mod yq_read_only_context {
     }
 }
 
+/// The right side of a yq assignment, already evaluated over the whole `--eval-all` document list
+/// (#7137).
+///
+/// Real yq's `assignUpdateOperator` runs a plain `=`'s right side **once**, against the context the
+/// assignment received, and applies its last output to the left side of every node of that
+/// context. Under `ea` that context is the list of every document of every file, so
+/// `.k = fi` writes the last file's index into every document and `.k = .k` writes the last
+/// document's own `k` into all of them. The `+=`, `-=`, `*=`, `/=` and `%=` forms read their right
+/// side the same way (`.k += fi` adds the last file's index to each document's `k`); `|=` does not
+/// (it runs its filter once per node).
+///
+/// The list walk ([`crate::jq::eval_generic`]'s `assign_together`) evaluates the right side over the
+/// list and installs its outputs here around one document's write; [`collect_rhs_outputs`] takes
+/// them instead of evaluating the right side against that one document. The first read consumes
+/// them, and a read is always the installing assignment's own: the walk installs them around a
+/// single assignment stage, whose left side is resolved before its right side is read, and an
+/// assignment nested in the right side runs after the outer one has taken them. The right side is
+/// not compared with the installed one because the path-context rewrite
+/// (`path_context_resolve_constants`) has replaced a `file_index` in it by then.
+///
+/// `std` only, as [`yq_read_only_context`]: without a thread-local the walk installs nothing and
+/// the right side is evaluated per document, as before.
+#[cfg(feature = "std")]
+pub(crate) mod yq_together_rhs {
+    use super::OwnedValue;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static SLOT: RefCell<Option<Vec<OwnedValue>>> = const { RefCell::new(None) };
+    }
+
+    /// Puts the previous slot back on drop, so a call that has returned never leaks its outputs
+    /// into a sibling evaluation.
+    #[must_use]
+    pub(crate) struct Guard(Option<Vec<OwnedValue>>);
+
+    /// Install `outputs` as what the next assignment's right side yields, for the caller's scope.
+    pub(crate) fn enter(outputs: Vec<OwnedValue>) -> Guard {
+        Guard(SLOT.with(|slot| slot.borrow_mut().replace(outputs)))
+    }
+
+    /// The installed outputs; taking them empties the slot.
+    pub(crate) fn take() -> Option<Vec<OwnedValue>> {
+        SLOT.with(|slot| slot.borrow_mut().take())
+    }
+
+    /// Whether outputs are installed and not yet taken.
+    pub(crate) fn installed() -> bool {
+        SLOT.with(|slot| slot.borrow().is_some())
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            SLOT.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+}
+
+#[cfg(not(feature = "std"))]
+pub(crate) mod yq_together_rhs {
+    use super::OwnedValue;
+    use alloc::vec::Vec;
+
+    pub(crate) struct Guard;
+
+    pub(crate) fn enter(_outputs: Vec<OwnedValue>) -> Guard {
+        Guard
+    }
+
+    pub(crate) fn take() -> Option<Vec<OwnedValue>> {
+        None
+    }
+
+    pub(crate) fn installed() -> bool {
+        false
+    }
+}
+
 /// Whether the path walk now running resolves a `del()` target, for the current thread (#4461).
 ///
 /// A computed slice bound that yields not exactly one number is yq's count error, but yq raises it
@@ -15784,6 +15862,15 @@ fn owned_assign_step<S: EvalSemantics>(
     expr: &Expr,
     state: &mut OwnedValue,
 ) -> Option<Result<(), EvalError>> {
+    // #7137: the right side of this write was evaluated over the whole `--eval-all` list and is
+    // waiting for it ([`collect_rhs_outputs`] takes it); the closed operand read here would be the
+    // document's own.
+    if S::TAG == EvalTag::Yq
+        && matches!(expr, Expr::Assign { .. } | Expr::CompoundAssign { .. })
+        && yq_together_rhs::installed()
+    {
+        return None;
+    }
     let (path, rhs) = match expr {
         // #3944: a successful write leaves the state a container (the path
         // has at least one step), which is truthy, so `(A) // B` is `A`'s
@@ -47640,6 +47727,13 @@ fn collect_rhs_outputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `|=` never reaches here: `eval_update` evaluates its filter through
     // `update_path` instead, matching yq's own `SingleChildContext`, which
     // leaves `DontAutoCreate` alone. See `yq_read_only_context`.
+    // #7137: under `--eval-all` the list walk has already evaluated this right side over every
+    // document, which is what yq's `=` reads.
+    if S::TAG == EvalTag::Yq {
+        if let Some(outputs) = yq_together_rhs::take() {
+            return Ok((outputs, None));
+        }
+    }
     let _scope = S::READ_ONLY_ABSENT_KEY_IS_EMPTY.then(yq_read_only_context::enter);
     // #2481: `eval_owned_input` round-trips the working copy through a
     // throwaway document, so a node's own *position* (`line`/`column`/

@@ -88,10 +88,10 @@ use super::eval::{
     yq_index_key_is_numeric, yq_literal_index_text, yq_mapping_index_text, yq_negative_index_check,
     yq_negative_index_error, yq_numeric_index_on_object_is_null, yq_object_key_stringify,
     yq_read_only_context, yq_scalar_text, yq_sort_by, yq_stage_can_reemit, yq_stage_can_reemit_in,
-    BinaryFanoutRules, ComputedSliceBound, Control, Demand, EmptyOperandOp, EvalError,
-    EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail, QueryResult, RangeEnd, RangeNum,
-    Reentry, RestPipe, RestTail, RootWitness, SliceTargetKind, StashedEscape, StashedVerdict,
-    YqSemantics, DEFERRED_BIND_UNRESOLVED, MAX_RANGE_TOTAL,
+    yq_together_rhs, BinaryFanoutRules, ComputedSliceBound, Control, Demand, EmptyOperandOp,
+    EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail, QueryResult, RangeEnd,
+    RangeNum, Reentry, RestPipe, RestTail, RootWitness, SliceTargetKind, StashedEscape,
+    StashedVerdict, YqSemantics, DEFERRED_BIND_UNRESOLVED, MAX_RANGE_TOTAL,
 };
 use super::eval::{format_yq_props_commented, format_yq_xml_commented, yq_props_format_style};
 use super::eval::{owned_slot_mut, static_path_steps, StepKey};
@@ -22972,6 +22972,9 @@ fn yq_stage_preserves_node(stage: &Expr) -> bool {
     match unwrap_paren(stage) {
         Expr::Identity => true,
         Expr::Builtin(Builtin::Select(_)) => true,
+        // `assignUpdateOperator` and `updateAssign` write into the nodes they were given and hand
+        // the same context back (#7137: `.k = 1 | [.]` is one array over the whole list).
+        Expr::Assign { .. } | Expr::Update { .. } | Expr::CompoundAssign { .. } => true,
         Expr::Pipe(inner) => inner.iter().all(yq_stage_preserves_node),
         Expr::Comma(branches) => branches.iter().all(yq_stage_preserves_node),
         _ => false,
@@ -23091,6 +23094,45 @@ enum YqListStage {
     /// prints one per document), so `ireduce ({}; ...)` starts one fold and not
     /// one per document (#2427).
     EmptyObject,
+    /// A plain or compound assignment (`=`, `+=`, `-=`, `*=`, `/=`, `%=`) over inputs that all
+    /// carry `EvaluateTogether`: real yq's `assignUpdateOperator` evaluates the right side
+    /// **once** against the whole context and applies its last output to every node, so
+    /// `.k = fi` writes the last file's index into every document (#7137). A right side that is a
+    /// constant says nothing about the list and stays on the per-document route.
+    Assign,
+}
+
+/// Whether the walk takes an assignment's right side over the list (#7137): there is a slot to hand
+/// its outputs to (`std`, [`yq_together_rhs`]), it reads the list, and no assignment sits in the left
+/// side, where it would take the outputs meant for this one (the slot is the first
+/// `collect_rhs_outputs` to run inside the stage, and the left side is resolved before the right).
+fn assign_reads_the_list(path: &Expr, value: &Expr) -> bool {
+    cfg!(feature = "std")
+        && !assign_rhs_ignores_the_list(value)
+        && !crate::jq::walk::any_subexpr(path, &mut |e| {
+            matches!(
+                e,
+                Expr::Assign { .. }
+                    | Expr::Update { .. }
+                    | Expr::CompoundAssign { .. }
+                    | Expr::AlternativeAssign { .. }
+                    | Expr::MetaAssign { .. }
+            )
+        })
+}
+
+/// Whether an assignment's right side reads nothing of the context list, so evaluating it once
+/// over the list or once per document is the same answer: a scalar literal, or a mapping built from
+/// literal keys and such values. A collect is not one: `[1, 2]` under `ea` is `[E]` over every
+/// document, six elements for three (`.k = [1, 2]` writes `[1, 2, 1, 2, 1, 2]`, #7137).
+fn assign_rhs_ignores_the_list(value: &Expr) -> bool {
+    match unwrap_paren(value) {
+        Expr::Literal(_) => true,
+        Expr::Object(entries) => entries.iter().all(|entry| {
+            matches!(entry.key, ObjectKey::Literal(_)) && assign_rhs_ignores_the_list(&entry.value)
+        }),
+        _ => false,
+    }
 }
 
 /// Where the walk splits a flat pipe: the first stage it owns, or `None` when
@@ -23141,6 +23183,12 @@ fn yq_list_stage(stages: &[Expr], together: bool) -> Option<(usize, YqListStage)
                 }
                 Expr::Reduce { .. } => {
                     found = Some((i, YqListStage::Fold));
+                    break;
+                }
+                Expr::Assign { path, value } | Expr::CompoundAssign { path, value, .. }
+                    if assign_reads_the_list(path, value) =>
+                {
+                    found = Some((i, YqListStage::Assign));
                     break;
                 }
                 _ => {}
@@ -23308,6 +23356,12 @@ fn eval_yq_context_pipe<S: EvalSemantics, V: DocumentValue>(
             Ok(items) => items,
             Err(flow) => return flow,
         },
+        YqListStage::Assign => {
+            match assign_together::<S, V>(&stages[at], &context, optional, cur) {
+                Ok(items) => items,
+                Err(flow) => return flow,
+            }
+        }
         // A node real yq builds from scratch: no flag, no origin.
         YqListStage::EmptyObject => vec![YqContextItem::new(
             YqContextNode::Owned(OwnedValue::object_from([])),
@@ -23316,6 +23370,106 @@ fn eval_yq_context_pipe<S: EvalSemantics, V: DocumentValue>(
     };
 
     eval_yq_context_pipe::<S, V>(rest, &produced, optional, cur, sink)
+}
+
+/// `=` and the compound assignments over a context list whose entries all carry
+/// `EvaluateTogether`: the right side is evaluated **once** over the whole list and its last output
+/// is what every node's left side receives (#7137).
+///
+/// Real yq's `assignUpdateOperator` creates the left side's targets on the context first, then runs
+/// the right side through `crossFunction` against that one shared context, so `yq ea '.k = fi' f1 f2
+/// f3` is `k: 2` in all three documents, `.k = .k` is the last document's own `k` everywhere, and
+/// `.k = [.k]` is one array of the three. Navigation in that right side reads the context
+/// read-only, so a document without the key contributes nothing rather than `null`
+/// (`.k = .c` is the one document's `c`, not the last document's `null`).
+///
+/// The right side therefore runs here over the list of documents with their targets already
+/// created -- a `|= .` per document, which creates exactly what `=` does and leaves what exists --
+/// and each document then runs the ordinary assignment with those outputs standing in for its own
+/// right side ([`yq_together_rhs`]): zero outputs, the collapse to the last one and every error
+/// stay the ordinary assignment's own rules. The nodes come back with the flag and origin they had,
+/// because the operator returns the nodes it was given (`.k = 1 | [.]` is one array).
+fn assign_together<S: EvalSemantics, V: DocumentValue>(
+    stage: &Expr,
+    context: &[YqContextItem<V>],
+    optional: bool,
+    cur: &core::cell::Cell<YqContextTag>,
+) -> Result<Vec<YqContextItem<V>>, Flow> {
+    let (path, value) = match stage {
+        Expr::Assign { path, value } | Expr::CompoundAssign { path, value, .. } => {
+            (&**path, &**value)
+        }
+        // `yq_list_stage` matched exactly these two to pick `at`.
+        // patchcov: coverage tolerate reason="unreachable: yq_list_stage routes only Assign and CompoundAssign here (#7137)"
+        _ => unreachable!("yq_list_stage selects only Assign/CompoundAssign as an assign stage"),
+        // patchcov: coverage end
+    };
+    // The documents as the right side sees them: each with the left side's targets created.
+    let creating = Expr::Update {
+        path: Box::new(path.clone()),
+        filter: Box::new(Expr::Identity),
+    };
+    let mut targets_created: Vec<YqContextItem<V>> = vec_with_capacity(context.len());
+    for item in context {
+        let created = collect_yq_context::<S, V>(
+            core::slice::from_ref(&creating),
+            core::slice::from_ref(item),
+            optional,
+            cur,
+        );
+        targets_created.push(match created {
+            // A left side the creation walk cannot take is the assignment's own to report.
+            Ok(mut out) if out.len() == 1 => YqContextItem::new(out.remove(0).node, item.tag),
+            _ => item.clone(),
+        });
+    }
+    // A right side that fails is not raised here: yq never evaluates it for a document whose target
+    // is a no-op (`5 | .a = error("x")` is `5`), so the documents run their own right side, and
+    // the ones with a target raise.
+    let outputs: Option<Vec<OwnedValue>> = {
+        // `assignUpdateOperator` evaluates its right side through `ReadOnlyClone` (#2470).
+        let _read_only = yq_read_only_context::enter();
+        let mut flat: Vec<Expr> = Vec::new();
+        yq_flatten_pipe_stages(core::slice::from_ref(value), &mut flat);
+        collect_yq_context::<S, V>(&flat, &targets_created, optional, cur)
+            .ok()
+            .and_then(|items| {
+                items
+                    .into_iter()
+                    // Only the last output is applied (`normalize_rhs_values_for_fork`).
+                    // STYLE-0012: an output that cannot be read is a decode failure, which an
+                    // ambient `?` never silences (#1620, #1902): that one is raised per document.
+                    .map(|item| generic_item_into_owned::<_, S>(item.to_generic_item()))
+                    .collect::<Result<Vec<_>, _>>()
+                    .ok()
+            })
+            .map(|mut all| all.pop().into_iter().collect())
+    };
+    let mut written: Vec<YqContextItem<V>> = vec_with_capacity(context.len());
+    for item in context {
+        // Without the flag the entry cannot be picked as this stage again.
+        let alone = YqContextItem::new(
+            item.node.clone(),
+            YqContextTag {
+                together: false,
+                origin: item.tag.origin,
+            },
+        );
+        let _installed = outputs.clone().map(yq_together_rhs::enter);
+        let results = collect_yq_context::<S, V>(
+            core::slice::from_ref(stage),
+            core::slice::from_ref(&alone),
+            optional,
+            cur,
+        )
+        .map_err(Flow::Escaped)?;
+        written.extend(
+            results
+                .into_iter()
+                .map(|result| YqContextItem::new(result.node, item.tag)),
+        );
+    }
+    Ok(written)
 }
 
 /// A pipe over a context list that answered nothing: the first stage that builds a node of its own
@@ -35830,10 +35984,15 @@ fn step_can_yield_absent(expr: &Expr, incoming: bool) -> bool {
 
 /// [`step_can_yield_absent`] folded over a navigational head: whether the
 /// position the head *ends* on can be absent.
+///
+/// An assignment hands back the node it wrote into (#7137), so it is as absent as the node it was
+/// given: `.k = 1 | .m = fi` stands on the document, not on a missing key. (Only this fold says so:
+/// [`step_can_yield_absent`] answers for the navigation the path-context walks position on.)
 fn head_can_yield_absent(stages: &[Expr]) -> bool {
-    stages
-        .iter()
-        .fold(false, |acc, e| step_can_yield_absent(e, acc))
+    stages.iter().fold(false, |acc, e| match e {
+        Expr::Assign { .. } | Expr::Update { .. } | Expr::CompoundAssign { .. } => acc,
+        other => step_can_yield_absent(other, acc),
+    })
 }
 
 /// Whether any position the head passes *through* can be absent (spine
