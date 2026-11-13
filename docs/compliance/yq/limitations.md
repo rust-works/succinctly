@@ -1279,7 +1279,7 @@ Still different:
   Here each document gets a copy of the list as it was.
 - The separator between results of a filter that follows the assignment (`.k = 1 | length` is `2` three times with no `---` in yq): the document-index rule of [#7019](https://github.com/rust-works/succinctly/issues/7019).
   `.k = 1 | . + {"z": 1}` is the nine results yq prints, in its order, with `---` between all of them where yq separates only the ones from different documents.
-- `select(fi == 0)` and `[.] | .[0] | fi` inside a right side without `--eval-all`: yq selects over the one document there and reads `0` for a node a collect built, where `succinctly yq` reads the document's own `fi`.
+- `.k = (select(fi == 0) | fi)` and `[.] | .[0] | fi` without `--eval-all` ([#7154](https://github.com/rust-works/succinctly/issues/7154)): yq selects over the one document and reads `0` for a node a collect built, where `succinctly yq` writes the document's own `fi` for the first and reads it for the second.
 
 ### An arithmetic result keeps its left operand's origin under `--eval-all` ([#6969](https://github.com/rust-works/succinctly/issues/6969))
 
