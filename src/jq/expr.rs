@@ -4175,6 +4175,11 @@ pub enum Builtin {
     /// `load_base64` read the file as text instead (#6985), [`LoadKind`].
     Load(Box<Expr>, LoadKind),
 
+    /// yq's `system(command)` and `system(command; args)` (#7025): run a program with this node's YAML on
+    /// its standard input and answer its standard output (one trailing newline dropped) as a string.
+    /// Refused unless `--security-enable-system-operator` is given. yq mode only.
+    System(Box<Expr>, Option<Box<Expr>>),
+
     // Phase 23: Position-based navigation (succinctly extension)
     /// `at_offset(n)` - jump to node at byte offset n (0-indexed)
     /// Returns the value at the specified byte offset in the document.

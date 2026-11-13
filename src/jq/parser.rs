@@ -10535,6 +10535,37 @@ impl<'a> Parser<'a> {
             }
         }
 
+        // #7025: yq's `system(command)` and `system(command; args)`; not a jq name.
+        if self.mode == ParserMode::Yq
+            && self.matches_keyword("system")
+            && !self.shadowable_defs.contains("system")
+        {
+            let keyword_start = self.pos;
+            self.consume_keyword("system");
+            self.skip_ws();
+            if let Err(early) = self.expect_or_none('(', keyword_start) {
+                return early;
+            }
+            self.next();
+            self.skip_ws();
+            let command = self.parse_expr()?;
+            self.skip_ws();
+            let args = if self.peek() == Some(';') {
+                self.next();
+                self.skip_ws();
+                let args = self.parse_expr()?;
+                self.skip_ws();
+                Some(Box::new(args))
+            } else {
+                None
+            };
+            if self.peek() != Some(')') {
+                return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![command]);
+            }
+            self.next();
+            return Ok(Some(Builtin::System(Box::new(command), args)));
+        }
+
         // Phase 23: Position-based navigation (succinctly extension)
         // at_offset(n) - jump to node at byte offset n (0-indexed)
         if self.matches_keyword("at_offset") {
@@ -17472,6 +17503,7 @@ mod tests {
             "strenv",
             "style",
             "sub",
+            "system",
             "tag",
             "test",
             "to_csv",

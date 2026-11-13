@@ -859,6 +859,7 @@ same kind of thing as the rest of this table — extra, off by default.
 | `-f, --front-matter M` | `extract` or `process` a `---`-fenced header (below) |
 | `--security-disable-env-ops` | Refuse `env()`, `strenv()` and `envsubst` (#7025) |
 | `--security-disable-file-ops` | Refuse `load()`, `load_str()` and `load_base64()` (#7025) |
+| `--security-enable-system-operator` | Let `system(cmd)` and `system(cmd; args)` run a program (#7025) |
 | `-v, --verbose`       | Accepted; no debug log is written (#7025)     |
 | `-c, --yaml-compact-seq-indent[=BOOL]` | A block sequence under a key is two columns left of the default (`-I 2`: at the key's column); the run takes the comment-keeping emitter (#7025) |
 | `--string-interpolation[=BOOL]` | `=false` keeps `\(` in a string literal as text (default true, #7025) |

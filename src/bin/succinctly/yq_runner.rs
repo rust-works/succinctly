@@ -6773,6 +6773,13 @@ fn owned_value_at_mut<'v>(
 /// for `debug`, `stderr` and `halt_error` output, which is muted (#2709): do
 /// not use this for an evaluation whose side effects are the real ones.
 fn evaluate_input_quiet(input: &OwnedValue, expr: &jq::Expr) -> Option<Vec<OwnedValue>> {
+    // #7025: `system(..)` starts a program, and a probe is a run the real evaluation repeats: it is
+    // the real evaluation's alone (`.c = system("cmd")` runs `cmd` once, as yq does).
+    if jq::walk::any_subexpr(expr, &mut |e| {
+        matches!(e, jq::Expr::Builtin(jq::Builtin::System(..)))
+    }) {
+        return None;
+    }
     let doc = input
         .reindexed_without_provenance::<jq::JqSemantics>()
         .ok()
@@ -12616,6 +12623,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     let _security_scope = jq::enter_security_scope(
         args.security_disable_env_ops,
         args.security_disable_file_ops,
+        args.security_enable_system_operator,
     );
 
     // yq's `-o` defaults to `auto` (#6703): the run's own input format, picked once from the first

@@ -8142,8 +8142,16 @@ Matching either needs a string that can hold bytes that are not UTF-8, or the su
 ## The argument-level flags of [#7025](https://github.com/rust-works/succinctly/issues/7025) answer as yq does, with these differences
 
 `--expression`, `--split-exp-file`, `-f`, `-v`/`--verbose`, `--security-disable-env-ops`, `--security-disable-file-ops`, `--string-interpolation`, `-c`/`--yaml-compact-seq-indent` and `--header-preprocess` are yq's, and `tests/yq_cli/i7025.rs`, `tests/yq_cli/i7025_string_interpolation.rs`, `tests/yq_cli/i7025_compact_seq_indent.rs` and `tests/yq_cli/i7025_header_preprocess.rs` pin the rows captured from yq v4.53.3.
-[#7025](https://github.com/rust-works/succinctly/issues/7025) stays open for `--security-enable-system-operator` and `system`, `--yaml-fix-merge-anchor-to-spec` and `--debug-node-info`.
+[#7025](https://github.com/rust-works/succinctly/issues/7025) stays open for `--yaml-fix-merge-anchor-to-spec` and `--debug-node-info`.
+`--security-enable-system-operator` and `system(command)` / `system(command; args)` are yq's too (`tests/yq_cli/i7025_system_operator.rs`, 60 rows), with the differences listed below.
 
+- **`system(..)` runs a program only under `--security-enable-system-operator`; without it the operator is an error (`system operations are disabled, use --security-enable-system-operator to enable`), raised when it runs.**
+  The node is the program's standard input, written by this build's YAML writer: a flow sequence under a key (`b: [x, y]`) is a block sequence on that input, where yq keeps the flow style.
+  An empty or an over-long argument list is a parse error here with this build's wording (`system()` is `'system' expects 1 arg but received none` in yq; `system("a"; "b"; "c")` parses there as an operator whose argument list holds the rest).
+  A program's standard output is read as UTF-8 with U+FFFD for an invalid byte, where yq passes the bytes on; a signal is named for the ones that are alike on Linux and macOS (`killed`, `terminated`, `segmentation fault`, ...) and by number for the rest; a missing shebang interpreter is worded as a missing program.
+  A write probes nothing that holds a `system(..)`: `.c = system("cmd")` runs `cmd` once, as yq does.
+  A plain assignment to several targets (`(.a, .b) = system("cmd")`, `.[] = system("cmd")`) runs it once here, where yq runs it once per target.
+  `system` is yq mode only; `succinctly jq` does not have it.
 - **`--security-disable-env-ops` and `--security-disable-file-ops` refuse an operator when it runs, where yq refuses it when its handler is called.**
   `select(false) | strenv(X)`, `.zz[] | strenv(X)` and `.a | select(. == 2) | strenv(X)` fail with `env operations have been disabled` in yq, because the handler is called with an empty context.
   Here they print nothing and exit 0, since no value reaches the operator and nothing reads the environment.

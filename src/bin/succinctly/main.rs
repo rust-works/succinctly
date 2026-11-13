@@ -1703,6 +1703,14 @@ pub struct YqCommand {
     )]
     pub security_disable_file_ops: bool,
 
+    /// Let `system(command)` and `system(command; args)` run a program (yq's
+    /// `--security-enable-system-operator`, #7025). Without it the operator is an error.
+    #[arg(
+        long = "security-enable-system-operator",
+        overrides_with = "security_enable_system_operator"
+    )]
+    pub security_enable_system_operator: bool,
+
     /// yq's `-c`/`--yaml-compact-seq-indent`: a block sequence under a mapping key is not
     /// indented past the key by a whole step, but by the step less two columns (`-I 2`: the items
     /// sit at the key's column, `-I 4`: two columns in). YAML output only; JSON is unchanged
