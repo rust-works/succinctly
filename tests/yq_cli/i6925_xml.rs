@@ -176,11 +176,19 @@ fn xml_by_extension_and_inplace_6925() -> Result<()> {
     let b = write_file(&dir, "b.X", b"<d>1</d>")?;
     assert_eq!(
         run_yq_files(".a.b", &[&a], &["-o", "json", "-I0"])?,
-        ("{\"+content\":\"t\",\"+@x\":\"1\"}\n".into(), String::new(), 0)
+        (
+            "{\"+content\":\"t\",\"+@x\":\"1\"}\n".into(),
+            String::new(),
+            0
+        )
     );
     assert_eq!(
         run_yq_files(".", &[&a], &[])?,
-        ("<a>\n  <b x=\"1\">t</b>\n  <c></c>\n</a>\n".into(), String::new(), 0)
+        (
+            "<a>\n  <b x=\"1\">t</b>\n  <c></c>\n</a>\n".into(),
+            String::new(),
+            0
+        )
     );
     assert_eq!(
         run_yq_files(".", &[&b, &a], &["-o", "json", "-I0"])?,
@@ -205,10 +213,26 @@ fn xml_by_extension_and_inplace_6925() -> Result<()> {
 #[test]
 fn xml_declared_charset_6925() -> Result<()> {
     let dir = TempDir::new()?;
-    let latin = write_file(&dir, "l.xml", b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><a>caf\xe9 \xa4</a>")?;
-    let cyrillic = write_file(&dir, "c.xml", b"<?xml version=\"1.0\" encoding=\"windows-1251\"?><a>\xcf\xf0\xe8\xe2\xe5\xf2</a>")?;
-    let utf8 = write_file(&dir, "u.xml", b"<?xml version=\"1.0\" encoding=\"utf8\"?><a>x\xffy</a>")?;
-    let sjis = write_file(&dir, "s.xml", b"<?xml version=\"1.0\" encoding=\"shift_jis\"?><a/>")?;
+    let latin = write_file(
+        &dir,
+        "l.xml",
+        b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><a>caf\xe9 \xa4</a>",
+    )?;
+    let cyrillic = write_file(
+        &dir,
+        "c.xml",
+        b"<?xml version=\"1.0\" encoding=\"windows-1251\"?><a>\xcf\xf0\xe8\xe2\xe5\xf2</a>",
+    )?;
+    let utf8 = write_file(
+        &dir,
+        "u.xml",
+        b"<?xml version=\"1.0\" encoding=\"utf8\"?><a>x\xffy</a>",
+    )?;
+    let sjis = write_file(
+        &dir,
+        "s.xml",
+        b"<?xml version=\"1.0\" encoding=\"shift_jis\"?><a/>",
+    )?;
     let args = ["-o", "json", "-I0", ".a"];
     assert_eq!(
         run_yq_files(args[3], &[&latin], &args[..3])?,
@@ -216,7 +240,11 @@ fn xml_declared_charset_6925() -> Result<()> {
     );
     assert_eq!(
         run_yq_files(args[3], &[&cyrillic], &args[..3])?,
-        ("\"\u{41f}\u{440}\u{438}\u{432}\u{435}\u{442}\"\n".into(), String::new(), 0)
+        (
+            "\"\u{41f}\u{440}\u{438}\u{432}\u{435}\u{442}\"\n".into(),
+            String::new(),
+            0
+        )
     );
     assert_eq!(
         run_yq_files(args[3], &[&utf8], &args[..3])?,
