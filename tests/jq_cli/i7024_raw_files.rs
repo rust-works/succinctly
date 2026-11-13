@@ -16,7 +16,8 @@ use std::process::Command;
 
 use anyhow::Result;
 
-type Run = (String, String, i32);
+/// stdout, stderr and the exit status of a run (shared with `i7024_inputs_files`).
+pub(crate) type Run = (String, String, i32);
 
 fn finish(output: &std::process::Output) -> Run {
     (
@@ -69,7 +70,7 @@ fn whole(args: &[&str], paths: &[std::path::PathBuf]) -> Result<Run> {
 }
 
 /// `files` written out and run both ways; the two answers, which the caller compares.
-fn both(args: &[&str], files: &[Vec<u8>]) -> Result<(Run, Run)> {
+pub(crate) fn both(args: &[&str], files: &[Vec<u8>]) -> Result<(Run, Run)> {
     let dir = tempfile::tempdir()?;
     let mut paths = Vec::new();
     for (n, bytes) in files.iter().enumerate() {

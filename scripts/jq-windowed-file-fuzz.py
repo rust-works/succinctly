@@ -113,7 +113,7 @@ INPUTS_PROGRAMS = [
     ["-n", "reduce inputs as $x (0; . + 1)"],
     ["-cn", "[inputs | numbers] | length"],
     ["-c", "[(.id? // .), (input | .id? // .)]"],
-    ["-cn", 'inputs | select((.id? // 0) % 4001 == 0) | error("e")'],
+    ["-cn", 'inputs | select(.id? == 40001) | error("e")'],
     ["-n", "try ([inputs] | length) catch ."],
 ]
 
@@ -250,13 +250,15 @@ def run(binary, args, megabytes, stdin=None, pass_fds=(), feed=None):
     return done.stdout, done.stderr, done.returncode
 
 
-def cut_into_files(rng, data, count):
+def cut_into_files(rng, data, count, line_starts=0.25):
     """`data` cut at `count - 1` random bytes, in order. Most cuts fall anywhere (inside a token, a
-    string, a multi-byte character); some at a line start, and some leave a file empty."""
+    string, a multi-byte character); `line_starts` of them at a line start, and some leave a file empty.
+    `--inputs` cuts mostly at line starts: a cut inside a document hands the rest of the stream to the
+    eager reader, so the later files would never be read in windows."""
     cuts = []
     for _ in range(count - 1):
         at = rng.randrange(len(data) + 1)
-        if rng.random() < 0.25:
+        if rng.random() < line_starts:
             at = data.rfind(b"\n", 0, at) + 1
         if rng.random() < 0.1 and cuts:
             at = cuts[-1]
@@ -276,7 +278,7 @@ def named(output, names, descriptors):
 
 def run_files(args, rng, data, case, program, work, seed):
     """One case over several files: windowed (as paths) and whole (as descriptors), compared."""
-    pieces = cut_into_files(rng, data, args.files)
+    pieces = cut_into_files(rng, data, args.files, 0.75 if args.inputs else 0.25)
     names = []
     for n, piece in enumerate(pieces):
         name = os.path.join(work, "windowed-fuzz-%d-%d.json" % (seed, n))

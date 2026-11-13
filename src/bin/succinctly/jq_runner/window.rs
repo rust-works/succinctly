@@ -1688,12 +1688,17 @@ impl LineWindows {
         }
     }
 
-    /// The rest of the source, from the bytes carried on: for a text that is not UTF-8, which is
-    /// substituted whole.
+    /// The rest of the source, from the bytes carried on, up to the length it had when it was opened as
+    /// [`next_window`](Self::next_window) reads it: for a text that is not UTF-8, which is substituted
+    /// whole, and for the eager reader a fault hands the rest of several files to (#7024).
     pub(super) fn take_rest(&mut self, on_error: impl FnOnce(&io::Error)) -> Vec<u8> {
         let mut bytes = std::mem::take(&mut self.carried);
         if !self.eof {
-            if let Err(error) = self.reader.read_to_end(&mut bytes) {
+            let read = match self.remaining {
+                Some(left) => self.reader.by_ref().take(left).read_to_end(&mut bytes),
+                None => self.reader.read_to_end(&mut bytes),
+            };
+            if let Err(error) = read {
                 // patchcov: coverage tolerate reason="untestable: a read that fails after the source opened"
                 on_error(&error);
                 // patchcov: coverage end
@@ -3176,6 +3181,22 @@ mod stream_tests {
             reread.stream_fault().as_deref(),
             Some("Unmatched '}' at line 3, column 1")
         );
+    }
+
+    /// #7024: the rest a `LineWindows` hands over is what its windows would have read: up to the length
+    /// the source had when it was opened, not what was appended since.
+    #[test]
+    fn the_rest_stops_at_the_length_known_at_the_start_7024() {
+        let source = b"a\nb\nc\nappended later\n".to_vec();
+        let mut windows = LineWindows::new(
+            Box::new(std::io::Cursor::new(source)),
+            Some(6),
+            2,
+            Vec::new(),
+        );
+        assert_eq!(windows.next_window(None, |_| {}), Some(b"a\n".to_vec()));
+        assert_eq!(windows.take_rest(|_| {}), b"b\nc\n".to_vec());
+        assert!(windows.finished());
     }
 
     /// A file with no line break to cut a window at (one long document) is read on for all of what is left
