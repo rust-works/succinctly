@@ -55,7 +55,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use succinctly::jq::utf8_document::{original_offset, SubstitutionEdit};
@@ -780,6 +780,7 @@ impl SeenFault {
         if state.fault.is_none() {
             state.fault = fault;
         }
+        drop(state);
         self.0.changed.notify_all();
     }
 }
@@ -916,10 +917,8 @@ impl WindowedFile {
             certifier.worker = Some(Worker { jobs, recycled });
         }
         let worker = certifier.worker.as_ref().expect("started above");
-        let mut text = match worker.recycled.try_recv() {
-            Ok(text) => text,
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => Vec::new(),
-        };
+        // A buffer the thread has finished with, or a new one while fewer than three are in use.
+        let mut text: Vec<u8> = worker.recycled.try_recv().unwrap_or_default();
         text.extend_from_slice(&self.buf[..self.validated]);
         let job = Job {
             text,
@@ -935,7 +934,10 @@ impl WindowedFile {
         certifier.seen.begin();
         worker.jobs.send(job).map_err(|_| {
             // The thread is gone: it only ends when this sender does.
-            io::Error::other("the thread that certifies the windows ended") // patchcov: coverage tolerate-line reason="defensive: the thread ends only when its sender is dropped, and a panic inside it is caught"
+            io::Error::new(
+                io::ErrorKind::Other,
+                "the thread that certifies the windows ended",
+            ) // patchcov: coverage tolerate-line reason="defensive: the thread ends only when its sender is dropped, and a panic inside it is caught"
         })
     }
 
@@ -2950,6 +2952,104 @@ mod pipe_tests {
         assert_eq!(
             seen.get(),
             succinctly::jq::jq_stream_fault([&text[..]], 1, 0)
+        );
+    }
+
+    /// A reader of the fault waits for the windows handed to the certifier: what it reads is what the
+    /// windows certified before the filter ran would have kept (#7106).
+    #[test]
+    fn the_fault_is_read_after_the_windows_in_flight_are_certified_7106() {
+        let seen = SeenFault::default();
+        seen.begin();
+        seen.begin();
+        let certifier = {
+            let seen = seen.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                seen.finish(Some("the first".into()), false);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                seen.finish(Some("a later one".into()), false);
+            })
+        };
+        // Both windows are certified by the time it answers, and the first fault is the stream's.
+        assert_eq!(seen.get().as_deref(), Some("the first"));
+        assert_eq!(seen.lock().in_flight, 0);
+        certifier.join().expect("the certifier");
+    }
+
+    /// A window waits for a place while two others are in flight, so the copies of the text stay at two.
+    #[test]
+    fn a_third_window_waits_for_one_of_two_in_flight_7106() {
+        let seen = SeenFault::default();
+        seen.begin();
+        seen.begin();
+        let certifier = {
+            let seen = seen.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                seen.finish(None, false);
+            })
+        };
+        seen.begin();
+        // Only after one of the two was certified: two are in flight again, not three.
+        assert_eq!(seen.lock().in_flight, CERTIFIER_WINDOWS_IN_FLIGHT);
+        certifier.join().expect("the certifier");
+    }
+
+    /// A certifier that panicked is not read as a stream without a fault.
+    #[test]
+    #[should_panic(expected = "certifies the windows panicked")]
+    fn a_certifier_that_panicked_is_not_a_stream_without_a_fault_7106() {
+        let seen = SeenFault::default();
+        seen.begin();
+        seen.finish(None, true);
+        seen.get();
+    }
+
+    /// Only a pipe starts the thread: a regular file's windows are not certified at all.
+    #[test]
+    fn a_regular_file_starts_no_certifier_7106() {
+        let text = "{\"a\":1}\n".repeat(2_000);
+        let mut file = tempfile::tempfile().expect("a temp file");
+        file.write_all(text.as_bytes()).expect("written");
+        file.rewind().expect("rewound");
+        let mut reader = WindowedFile::new(file, text.len() as u64, 4_096);
+        while reader.next_window().expect("reads").is_some() {}
+        assert!(reader.certifier.is_none());
+    }
+
+    /// A pipe starts one thread with its first window, and its windows reach it through two buffers that
+    /// are used again, however many there are.
+    #[test]
+    fn a_pipe_certifies_many_windows_on_one_thread_7106() {
+        let text = "{\"a\":1,\"b\":[1,2,3]}\n".repeat(40_000);
+        let mut file = tempfile::tempfile().expect("a temp file");
+        file.write_all(text.as_bytes()).expect("written");
+        file.rewind().expect("rewound");
+        let seen = SeenFault::default();
+        let mut reader =
+            WindowedFile::from_pipe(Rc::new(file), Vec::new(), None, 4_096, seen.clone());
+        let mut windows = 0;
+        let mut buffers = std::collections::HashSet::new();
+        while reader.next_window().expect("reads").is_some() {
+            windows += 1;
+        }
+        assert!(windows > 100, "{windows}");
+        assert_eq!(seen.get(), None);
+        assert_eq!(reader.exact_reads(), 0);
+        // The recycled buffers: only a few were ever made (each holds a window of 4 KiB or so).
+        let worker = reader
+            .certifier
+            .as_ref()
+            .and_then(|c| c.worker.as_ref())
+            .expect("started");
+        while let Ok(buffer) = worker.recycled.try_recv() {
+            buffers.insert(buffer.as_ptr() as usize);
+        }
+        assert!(
+            buffers.len() <= CERTIFIER_WINDOWS_IN_FLIGHT + 1,
+            "{}",
+            buffers.len()
         );
     }
 
