@@ -8018,7 +8018,7 @@ The comment text goes through the two regular expressions of `encodeComment` and
 That agrees with yq v4.53.3 on 1,900 random YAML documents with comments in every position (twelve document shapes, `-I`, `-N`, filters that navigate) and on `-p xml -o xml` for the XML documents `scripts/yq-xml-input-sweep.py --only xml` generates, except where the input side differs (`-p xml`, above).
 The comments are read from the nodes the result came from, so these still differ on a YAML input:
 
-- A head, line or foot comment is dropped after a write (`.a = 1`, `-i`, so `succinctly yq -i '.a.d = "z"' pom.xml` strips the file's comments), and from a value the filter builds (`{"x": .a}`, `.a | to_xml`), where yq keeps the comments of the nodes it copies.
+- A head, line or foot comment is dropped after a write (`.a = 1`, `-i`, so `succinctly yq -i '.a.d = "z"' pom.xml` strips the file's comments), and from a value the filter builds (`{"x": .a}`, `.a | to_xml`, `sort_keys(.)`, `with_entries(.)`, `explode(.)`) and under `--eval-all`, where yq keeps the comments of the nodes it copies.
 - A comment block that a blank line splits (`# f`, a blank line, `# g` under a key) is one comment here, where yq makes the first the key's foot comment and the second the next key's head comment or the mapping's foot comment, so it writes two XML comments and this writes one (`<!-- f --><!-- g -->` against `<!-- f`, an empty line, `g -->`).
   The attribution is the one `head_comment` and `foot_comment` report (`.a | key | foot_comment`), so it is not special to XML.
 - A foot comment in a file with CRLF line ends keeps its line break in yq (`<!-- f`, a line break, `-->`), where it has none here.
