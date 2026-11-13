@@ -7372,7 +7372,8 @@ fn read_inputs(
             let reached = open_failures_reached(&failures, &raws, args, main_loop_only).len();
             // The first fault of a `-n` slurp's text, which decides how its reads place the
             // failures (#6671): the slurp hands them the fault and then the array.
-            let slurp_fault = (args.slurp && args.null_input)
+            // #7176: and only a failure it places makes it worth the walk.
+            let slurp_fault = (args.slurp && args.null_input && !failures.is_empty())
                 .then(|| first_stream_fault(&raws))
                 .flatten();
             let text_faults = slurp_fault.is_some();
