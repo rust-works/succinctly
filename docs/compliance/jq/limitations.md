@@ -7392,7 +7392,11 @@ The fault that read meets is the stream's first, since everything before it is c
 So a fault is worded as the whole stream words it even where it is in a document a filter never read and the window that held it is gone (`.name` over `{"name":1,"b":[1 2]}`, and a document cut off at the end, names line 1 as jq does).
 The rejected designs were wording the fault from the text still held (it names a later fault than jq where an earlier, dropped document held one, which ADR-0018's order does not permit for memory), writing the dropped text to a temporary file to read again (standard input, which can hold secrets, would land on disk), and jq's parser over every byte (it runs at about a quarter of the validator's speed).
 A run that stops early (a `halt`, a fault in the middle of the stream) leaves the rest of the pipe unread, as jq does, where the whole-file route had drained it first.
-Its time against the whole-file route has not been measured on terminus or johns-mac-mini yet.
+The route trades time for memory against the one that read a pipe whole, measured with the commit before it, a second build of that commit as an A/A control, and the route's own commit run interleaved (11 repetitions, output identical, NDJSON from `json generate -p ndjson`).
+At 100 MiB, peak RSS falls from 127 to 129 MiB to 18 to 20 MiB on terminus (Ryzen 9 7950X) and from 123 MiB to 12 or 13 MiB on johns-mac-mini (M4 Pro).
+The run is slower: `-c .` takes 649 ms against 589 ms (+10.1%) on terminus and 496 ms against 431 ms (+15.1%) on the mini, `-r .name` +7.6% and +12.1%, and `select(.score>50)` +3.3% and +8.0%, where the A/A control moved 1.2% at most.
+At 10 MiB the same rows read +4.7% to +10.6% on terminus and +8.6% to +17.5% on the mini, and a pipe of 1 MiB (read whole) and the windowed route over a regular file do not move.
+The extra time is the pipe route's alone, since the regular-file route in the same build is flat; that it is the certifier's pass over every byte is expected from the validator's throughput but was not measured apart.
 The windows are read from descriptor 0's own offset, so a run that stops early (`first(...)`, `-e`) leaves it where its last window ended, as jq does, where the whole-file route always left it at the end of the file.
 Several regular files (up to 32 of them, 4 MiB or more between them) are read the same way, as the one stream jq reads them as, each a window at a time and in turn (`WindowedFiles`, #7024).
 A token still open where a file ends continues at the front of the next, as jq's stream has it (#4305).
