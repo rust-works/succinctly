@@ -11544,16 +11544,27 @@ fn is_verbatim_tag(bytes: &[u8], start: usize) -> bool {
 /// is `!foo`); every other verbatim tag (`!<!>`, `!<foo>`, `!<tag:example.com,2000:t>`) and every
 /// shorthand tag is as written.
 fn yq_tag_spelling(tag: &str) -> String {
+    // The rest is written bare, so it must be one a shorthand tag can hold: no `!`, no flow
+    // indicator, no `%` escape (`!<!!str>` is the local tag `!!str`, not the core one).
+    let bare = |rest: &str| {
+        !rest.is_empty()
+            && !rest.bytes().any(|b| {
+                matches!(
+                    b,
+                    b'!' | b',' | b'[' | b']' | b'{' | b'}' | b'%' | b' ' | b'<' | b'>'
+                )
+            })
+    };
     if let Some(spelled) = tag
         .strip_prefix("!<")
         .and_then(|rest| rest.strip_suffix('>'))
     {
         if let Some(core) = spelled.strip_prefix("tag:yaml.org,2002:") {
-            if !core.is_empty() {
+            if bare(core) {
                 return alloc::format!("!!{core}");
             }
         } else if let Some(local) = spelled.strip_prefix('!') {
-            if !local.is_empty() {
+            if bare(local) {
                 return alloc::format!("!{local}");
             }
         }
@@ -13742,6 +13753,32 @@ mod tests {
             let docs = documents(doc.as_bytes());
             assert_eq!(docs.len(), 1, "{doc:?}");
             assert_eq!(docs[0].replace(' ', ""), json, "{doc:?}");
+        }
+    }
+
+    #[test]
+    fn a_verbatim_tag_is_spelled_as_yq_spells_it_7139() {
+        for (verbatim, spelled) in [
+            ("!<tag:yaml.org,2002:str>", "!!str"),
+            ("!<tag:yaml.org,2002:binary>", "!!binary"),
+            ("!<!foo>", "!foo"),
+            ("!<!a.b-c>", "!a.b-c"),
+            // Left as written: no name, a `!` inside, a flow indicator, an escape, another
+            // namespace, a shorthand.
+            ("!<tag:yaml.org,2002:>", "!<tag:yaml.org,2002:>"),
+            ("!<!>", "!<!>"),
+            ("!<!!str>", "!<!!str>"),
+            ("!<!e!foo>", "!<!e!foo>"),
+            ("!<!a,b>", "!<!a,b>"),
+            ("!<tag:yaml.org,2002:str,x>", "!<tag:yaml.org,2002:str,x>"),
+            ("!<tag:yaml.org,2002:a%20b>", "!<tag:yaml.org,2002:a%20b>"),
+            ("!<foo>", "!<foo>"),
+            ("!<tag:example.com,2000:t>", "!<tag:example.com,2000:t>"),
+            ("!!str", "!!str"),
+            ("!foo", "!foo"),
+            ("!", "!"),
+        ] {
+            assert_eq!(yq_tag_spelling(verbatim), spelled, "{verbatim}");
         }
     }
 }
