@@ -46645,6 +46645,61 @@ mod tests {
         assert!(reindex_count::get() > before, "yq mode skipped the bridge");
     }
 
+    /// #7132 part six: a comma of stages, the stream builtins over `.[]`, `$__loc__` and
+    /// `input_line_number` over a bound array the filter built are answered from it, with no
+    /// serialize-and-index (`reindex_count`). The pin can fail: each bridged once per call before
+    /// the many-valued door.
+    #[cfg(feature = "std")]
+    #[test]
+    fn streams_over_a_bound_array_are_not_bridged_7132() {
+        use crate::jq::value::reindex_count;
+
+        let json = b"null";
+        let index = JsonIndex::build(json);
+        for (filter, answer) in [
+            (
+                "[range(50)] as $a | [range(2) | $a | first, last]",
+                "[0,49,0,49]",
+            ),
+            (
+                "[range(50)] as $a | [range(2) | $a | .[0], .[1]]",
+                "[0,1,0,1]",
+            ),
+            ("[range(50)] as $a | [range(2) | $a | first(.[])]", "[0,0]"),
+            ("[range(50)] as $a | [range(2) | $a | last(.[])]", "[49,49]"),
+            ("[range(50)] as $a | [range(2) | $a | nth(3; .[])]", "[3,3]"),
+            (
+                "[range(50)] as $a | [range(2) | $a | limit(2; .[])]",
+                "[0,1,0,1]",
+            ),
+            (
+                "[range(50)] as $a | [range(2) | $a | isempty(.[])]",
+                "[false,false]",
+            ),
+            (
+                "[range(50)] as $a | [range(2) | $a | $__loc__]",
+                r#"[{"file":"<top-level>","line":1},{"file":"<top-level>","line":1}]"#,
+            ),
+            (
+                "[range(50)] as $a | [range(2) | $a | input_line_number]",
+                "[0,0]",
+            ),
+            (
+                "[range(50)] as $a | [range(2) as $i | $a | .[$i], .[$i + 1]]",
+                "[0,1,1,2]",
+            ),
+        ] {
+            let expr = crate::jq::parse(filter).unwrap();
+            let before = reindex_count::get();
+            let result = eval_using::<JqSemantics, _>(&expr, index.root(json).value())
+                .collect_owned::<JqSemantics>()
+                .unwrap();
+            assert_eq!(reindex_count::get() - before, 0, "{filter} bridged");
+            assert_eq!(result.len(), 1, "{filter}");
+            assert_eq!(result[0].to_json(), answer, "{filter}");
+        }
+    }
+
     /// #7132 part five: arithmetic, a comparison and `//` over reads of a bound array the filter
     /// built are answered from it, on the loop's route and the fold's, with no serialize-and-index
     /// (`reindex_count`) at all; the CLI cost pin's mechanism, counted rather than timed. The pin can

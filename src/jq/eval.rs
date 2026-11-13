@@ -131861,6 +131861,97 @@ mod tests {
     /// [`eval_owned_value_doors_past_tree`] for the rest, so whatever [`eval_owned_value_doors`]
     /// answers, the lazy twin answers too, with the same one value, in both modes. The pin for the two
     /// spellings of one list: a door added to the shared list and not to the lazy one fails here.
+    /// #7132: [`eval_owned_many_doors`] answers a comma and the stream builtins over `.[]` with the
+    /// values the bridge does, in order, over every kind of value, or declines; yq mode, a count
+    /// that is not an integer literal, `.[]` of a scalar and a branch nothing answers decline.
+    #[test]
+    fn eval_owned_many_doors_agree_with_the_bridge_7132() {
+        const SOURCES: &[&str] = &[
+            "first, last",
+            ".[0], .[1]",
+            "length, first",
+            "., length",
+            ".a, .b",
+            "1, 2",
+            "(first, last)",
+            "first, (.[1] + 1), length > 2",
+            ".[2:4], first",
+            "first(.[])",
+            "last(.[])",
+            "nth(0; .[])",
+            "nth(1; .[])",
+            "nth(9; .[])",
+            "limit(0; .[])",
+            "limit(1; .[])",
+            "limit(2; .[])",
+            "limit(-1; .[])",
+            "limit(9; .[])",
+            "isempty(.[])",
+            "first(.[]?)",
+            "last(.[]?)",
+            "nth(1; .[]?)",
+            "limit(1; .[]?)",
+            "isempty(.[]?)",
+            "first(.[]), last(.[])",
+            "limit(2; .[]), length",
+        ];
+        let mut answered = 0;
+        for value in &value_door_matrix_7132() {
+            for src in SOURCES {
+                let expr = parse(src).unwrap();
+                let Some(values) = eval_owned_many_doors::<JqSemantics>(&expr, value) else {
+                    continue;
+                };
+                answered += 1;
+                let bridge = debug_normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                    &expr, value, false,
+                ));
+                let fast = debug_normalize(owned_vec_to_result::<Vec<u64>>(values));
+                assert_eq!(fast, bridge, "{src:?} on {value:?}");
+                assert!(
+                    eval_owned_many_doors::<YqSemantics>(&expr, value).is_none(),
+                    "yq mode: {src:?}"
+                );
+            }
+        }
+        assert!(
+            answered > 150,
+            "the matrix must reach the doors: {answered}"
+        );
+        let array = OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+        for src in [
+            "nth(-1; .[])",
+            "nth(1.5; .[])",
+            "limit(1.5; .[])",
+            "limit(null; .[])",
+            "first(.[] | .)",
+            "first, .[]",
+            "first, error(\"x\")",
+            "first",
+        ] {
+            assert_eq!(
+                eval_owned_many_doors::<JqSemantics>(&parse(src).unwrap(), &array),
+                None,
+                "{src}"
+            );
+        }
+        for src in ["first(.[])", "limit(1; .[])", "isempty(.[])"] {
+            assert_eq!(
+                eval_owned_many_doors::<JqSemantics>(&parse(src).unwrap(), &OwnedValue::Int(5)),
+                None,
+                "{src} of a scalar raises"
+            );
+        }
+        // `limit(0; f)` never evaluates `f`, so it is empty over a scalar too.
+        assert_eq!(
+            eval_owned_many_doors::<JqSemantics>(
+                &parse("limit(0; .[])").unwrap(),
+                &OwnedValue::Int(5)
+            ),
+            Some(vec![])
+        );
+    }
+
     #[test]
     fn lazy_front_doors_answer_what_the_value_doors_answer_7132() {
         fn check<S: EvalSemantics>(expr: &Expr, value: &OwnedValue, src: &str) -> bool {
