@@ -748,7 +748,7 @@ struct Parser<'a, const HAS_CR: bool> {
     yq_no_head: bool,
     /// [`Self::first_marker_line_start`]'s answer, found on first use: it is asked once for every block a
     /// blank line detaches before the first node.
-    first_document_marker: core::cell::Cell<Option<Option<usize>>>,
+    first_document_marker: core::cell::OnceCell<Option<usize>>,
 }
 
 impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
@@ -833,7 +833,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             documents_started: 0,
             leading_run_from: 0,
             yq_no_head: false,
-            first_document_marker: core::cell::Cell::new(None),
+            first_document_marker: core::cell::OnceCell::new(),
             #[cfg(debug_assertions)]
             wrapper_slots: Vec::with_capacity(estimated_opens),
             #[cfg(debug_assertions)]
@@ -2187,35 +2187,30 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
     /// The start of that `---` marker line (see [`Self::first_document_marker_leads`]), if there is one.
     fn first_marker_line_start(&self) -> Option<usize> {
-        if let Some(known) = self.first_document_marker.get() {
-            return known;
-        }
-        let mut found = None;
-        let mut at = 0;
-        while at < self.input.len() {
-            let line_end = self.input[at..]
-                .iter()
-                .position(|&b| Self::is_break(b))
-                .map_or(self.input.len(), |n| at + n);
-            let line = &self.input[at..line_end];
-            let content = line
-                .iter()
-                .position(|&b| !matches!(b, b' ' | b'\t'))
-                .map(|n| &line[n..]);
-            match content {
-                None => {}
-                Some(rest) if matches!(rest.first(), Some(b'#' | b'%')) => {}
-                Some(rest) => {
-                    if line.first() != Some(&b' ') && Self::marker_prefix(rest, b"---") {
-                        found = Some(at);
+        *self.first_document_marker.get_or_init(|| {
+            let mut at = 0;
+            while at < self.input.len() {
+                let line_end = self.input[at..]
+                    .iter()
+                    .position(|&b| Self::is_break(b))
+                    .map_or(self.input.len(), |n| at + n);
+                let line = &self.input[at..line_end];
+                let content = line
+                    .iter()
+                    .position(|&b| !matches!(b, b' ' | b'\t'))
+                    .map(|n| &line[n..]);
+                match content {
+                    None => {}
+                    Some(rest) if matches!(rest.first(), Some(b'#' | b'%')) => {}
+                    Some(rest) => {
+                        return (line.first() != Some(&b' ') && Self::marker_prefix(rest, b"---"))
+                            .then_some(at);
                     }
-                    break;
                 }
+                at = line_end + 1;
             }
-            at = line_end + 1;
-        }
-        self.first_document_marker.set(Some(found));
-        found
+            None
+        })
     }
 
     /// Hook for "a node that can own a standalone comment just opened at
