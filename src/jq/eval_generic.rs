@@ -23138,13 +23138,34 @@ fn yq_stage_preserves_node(stage: &Expr) -> bool {
     match unwrap_paren(stage) {
         Expr::Identity => true,
         Expr::Builtin(Builtin::Select(_)) => true,
-        // `assignUpdateOperator` and `updateAssign` write into the nodes they were given and hand
-        // the same context back (#7137: `.k = 1 | [.]` is one array over the whole list).
-        Expr::Assign { .. } | Expr::Update { .. } | Expr::CompoundAssign { .. } => true,
+        other if yq_stage_writes_in_place(other) => true,
         Expr::Pipe(inner) => inner.iter().all(yq_stage_preserves_node),
         Expr::Comma(branches) => branches.iter().all(yq_stage_preserves_node),
         _ => false,
     }
+}
+
+/// Does `stage` write into the nodes it is given and hand the same context back?
+///
+/// yq's assignments (`assignUpdateOperator`, `updateAssign`), `deleteChildren`, `sort_keys`, `map_values`
+/// (an `|=` over the children), `sort` and the metadata assignments (`. style = "flow"`, `. anchor = "x"`)
+/// all return their context, so every node keeps its `EvaluateTogether` flag and origin: `.k = 1 | [.]` and
+/// `del(.k) | [.]` are one array over the whole list (#7137, #7175). Captured against yq v4.53.3.
+fn yq_stage_writes_in_place(stage: &Expr) -> bool {
+    matches!(
+        unwrap_paren(stage),
+        Expr::Assign { .. }
+            | Expr::Update { .. }
+            | Expr::CompoundAssign { .. }
+            | Expr::MetaAssign { .. }
+            | Expr::Builtin(
+                Builtin::Del(_)
+                    | Builtin::SortKeys(_)
+                    | Builtin::SortKeysOneLevel
+                    | Builtin::MapValues(_)
+                    | Builtin::Sort
+            )
+    )
 }
 
 /// Run `stages` over one context entry, honouring `sink`'s demand.
@@ -36155,9 +36176,12 @@ fn step_can_yield_absent(expr: &Expr, incoming: bool) -> bool {
 /// given: `.k = 1 | .m = fi` stands on the document, not on a missing key. (Only this fold says so:
 /// [`step_can_yield_absent`] answers for the navigation the path-context walks position on.)
 fn head_can_yield_absent(stages: &[Expr]) -> bool {
-    stages.iter().fold(false, |acc, e| match e {
-        Expr::Assign { .. } | Expr::Update { .. } | Expr::CompoundAssign { .. } => acc,
-        other => step_can_yield_absent(other, acc),
+    stages.iter().fold(false, |acc, e| {
+        if yq_stage_writes_in_place(e) {
+            acc
+        } else {
+            step_can_yield_absent(e, acc)
+        }
     })
 }
 
