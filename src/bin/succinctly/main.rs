@@ -2075,20 +2075,22 @@ fn hoist_options_before_positional_flags(args: Vec<String>, start: usize) -> Vec
 /// clap's own rejection after the fact instead of trying to configure it
 /// away. Every retry is itself verified by `try_parse_from`, never assumed
 /// correct from the candidate order alone.
-fn parse_allowing_negative_filter<P, I, T>(args: I) -> P
+fn parse_allowing_negative_filter<P, I, T>(
+    args: I,
+    parse: impl Fn(Vec<String>) -> Result<P, clap::Error>,
+) -> P
 where
-    P: Parser,
     I: IntoIterator<Item = T>,
     T: Into<String>,
 {
     let args: Vec<String> = args.into_iter().map(Into::into).collect();
-    match P::try_parse_from(args.iter().cloned()) {
+    match parse(args.clone()) {
         Ok(cmd) => cmd,
         Err(e) => {
             for idx in negative_filter_retry_candidates(&args, &e) {
                 let mut fixed = args.clone();
                 fixed.insert(idx, "--".to_string());
-                if let Ok(cmd) = P::try_parse_from(fixed) {
+                if let Ok(cmd) = parse(fixed) {
                     return cmd;
                 } // patchcov: coverage tolerate-line reason="llvm-cov line-attribution artifact, not unreachable: test_negative_filter_accepted_via_sjq_multicall_alias_3389's '-x' row demonstrably reaches the e.exit() two lines below (exit code 2, confirmed by that test passing), which this if-let's own closing brace sits directly above -- the brace itself is never credited a hit, the same class of artifact eval.rs's own tolerate list documents for other closing braces (#3389)"
             }
@@ -2117,15 +2119,13 @@ fn try_multicall() -> Result<Option<i32>> {
             let argv: Vec<String> = std::iter::once(name.to_string())
                 .chain(std::env::args().skip(1))
                 .collect();
-            let cmd: JqCommand =
-                parse_allowing_negative_filter(hoist_options_before_positional_flags(argv, 1));
-            Ok(Some(jq_runner::run_jq(cmd)?))
+            Ok(Some(jq_runner::run_jq(parse_jq(argv, None))?))
         }
         "syq" | "yq" => {
-            let cmd = YqCommand::parse_from(
-                std::iter::once(name.to_string()).chain(std::env::args().skip(1)),
-            );
-            Ok(Some(yq_runner::run_yq(cmd)?))
+            let argv: Vec<String> = std::iter::once(name.to_string())
+                .chain(std::env::args().skip(1))
+                .collect();
+            Ok(Some(yq_runner::run_yq(parse_yq(argv, None))?))
         }
         "sjq-locate" | "jq-locate" => {
             let cmd = jq_locate::JqLocateArgs::parse_from(
@@ -2316,40 +2316,63 @@ fn exit_after_run(exit_code: i32) -> ! {
     std::process::exit(exit_code)
 }
 
-/// [`Cli::parse`], plus the same `succinctly jq` retry
-/// [`parse_allowing_negative_filter`] gives the `sjq`/`jq` multicall path
-/// (#3389). Gated on `argv[1] == "jq"` (the `succinctly jq ...` spelling's
-/// subcommand token) rather than applying the retry to every subcommand:
-/// the retry only ever fires on a narrowly-shaped clap error already, but
-/// scoping it here too keeps `succinctly json`/`dsv`/`yaml`/`dev`/... error
-/// behavior provably untouched rather than merely unlikely to change.
-/// `succinctly yq` needs no equivalent gate on `"yq"` -- see
-/// `looks_like_negative_filter`'s own doc comment for why.
-fn parse_cli_allowing_negative_filter() -> Cli {
-    let mut args: Vec<String> = std::env::args().collect();
-    // `succinctly jq ...`: the jq options after the `jq` token get the same
-    // hoist the `sjq` path applies (#3447).
-    if args.get(1).map(String::as_str) == Some("jq") {
-        args = hoist_options_before_positional_flags(args, 2);
-    }
-    match Cli::try_parse_from(args.iter().cloned()) {
-        Ok(cli) => cli,
-        Err(e) => {
-            let scoped = args.get(1).map(String::as_str) == Some("jq");
-            let candidates = if scoped {
-                negative_filter_retry_candidates(&args, &e)
-            } else {
-                Vec::new()
-            };
-            for idx in candidates {
-                let mut fixed = args.clone();
-                fixed.insert(idx, "--".to_string());
-                if let Ok(cli) = Cli::try_parse_from(fixed) {
-                    return cli;
-                } // patchcov: coverage tolerate-line reason="llvm-cov line-attribution artifact, not unreachable: test_negative_filter_boundary_characters_3389's '-x'/'-n1'/'--bogus' rows demonstrably reach the e.exit() two lines below (exit code 2, confirmed by that test passing), which this if-let's own closing brace sits directly above -- the brace itself is never credited a hit, the same class of artifact eval.rs's own tolerate list documents for other closing braces (#3389)"
-            }
-            e.exit()
+/// What `succinctly jq --help` and `succinctly yq --help` say about themselves: the doc comments of
+/// [`Command::Jq`] and [`Command::Yq`], which the direct path of [`try_direct_subcommand`] has to repeat
+/// (`direct_subcommands_render_the_trees_help_7149` pins the rendered help to the tree's).
+const JQ_SUBCOMMAND_ABOUT: &str = "Command-line JSON processor (jq-compatible)";
+const YQ_SUBCOMMAND_ABOUT: &str = "Command-line YAML processor (jq-compatible syntax)";
+
+/// `argv` (program name first) parsed as `jq`, with the negative-filter retry and the option hoist
+/// (#3389, #3447), for the `sjq` multi-call path (`about` is `None`: its own text) and for
+/// `succinctly jq` (`about` is the one the tree shows, #7149).
+fn parse_jq(argv: Vec<String>, about: Option<&'static str>) -> JqCommand {
+    use clap::{CommandFactory, FromArgMatches};
+    parse_allowing_negative_filter(hoist_options_before_positional_flags(argv, 1), |args| {
+        let mut command = JqCommand::command();
+        if let Some(about) = about {
+            command = command.about(about);
         }
+        JqCommand::from_arg_matches(&command.try_get_matches_from(args)?)
+    })
+}
+
+/// `argv` (program name first) parsed as `yq`; see [`parse_jq`] for `about`.
+fn parse_yq(argv: Vec<String>, about: Option<&'static str>) -> YqCommand {
+    use clap::{CommandFactory, FromArgMatches};
+    let mut command = YqCommand::command();
+    if let Some(about) = about {
+        command = command.about(about);
+    }
+    let matches = command.get_matches_from(argv);
+    YqCommand::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())
+}
+
+/// `succinctly jq ...` and `succinctly yq ...` parse their own struct, as the `sjq`/`syq` multi-call
+/// path does, instead of the whole [`Cli`] tree (#7149): clap's derive builds the argument definitions
+/// of every subcommand before it matches one, which was 30% of the instructions of `jq -n 1` and
+/// 8% more to drop the tree at exit. The binary name is `succinctly jq` (`succinctly yq`), so the
+/// usage line and every clap error read as they did when the subcommand was matched in the tree.
+/// Everything else, a bare `succinctly`, a global flag before the subcommand and every other
+/// subcommand, goes through [`Cli`] unchanged.
+fn try_direct_subcommand() -> Result<Option<i32>> {
+    let mut args = std::env::args();
+    let argv0 = args.next().unwrap_or_default();
+    // clap names the binary by its argv[0]'s file name, so `<argv0> jq` reads as `jq` does in the tree.
+    let argv = |subcommand: &str| -> Vec<String> {
+        std::iter::once(format!("{argv0} {subcommand}"))
+            .chain(std::env::args().skip(2))
+            .collect()
+    };
+    match args.next().as_deref() {
+        Some("jq") => Ok(Some(jq_runner::run_jq(parse_jq(
+            argv("jq"),
+            Some(JQ_SUBCOMMAND_ABOUT),
+        ))?)),
+        Some("yq") => Ok(Some(yq_runner::run_yq(parse_yq(
+            argv("yq"),
+            Some(YQ_SUBCOMMAND_ABOUT),
+        ))?)),
+        _ => Ok(None),
     }
 }
 
@@ -2360,8 +2383,11 @@ fn run_main() -> Result<()> {
     if let Some(exit_code) = try_multicall()? {
         exit_after_run(exit_code);
     }
+    if let Some(exit_code) = try_direct_subcommand()? {
+        exit_after_run(exit_code);
+    }
 
-    let cli = parse_cli_allowing_negative_filter();
+    let cli = Cli::parse();
 
     match cli.command {
         Command::Jq(args) => {
@@ -3687,6 +3713,37 @@ mod tests {
             assert!(
                 !looks_like_negative_filter(option_like),
                 "{option_like:?} should read as an option"
+            );
+        }
+    }
+
+    /// #7149: `succinctly jq` and `succinctly yq` parse their own struct, and what they render (the short
+    /// and the long help, the usage line) is what the tree renders for the same subcommand.
+    #[test]
+    fn direct_subcommands_render_the_trees_help_7149() {
+        use clap::CommandFactory;
+        for (name, about, mut direct) in [
+            ("jq", JQ_SUBCOMMAND_ABOUT, JqCommand::command()),
+            ("yq", YQ_SUBCOMMAND_ABOUT, YqCommand::command()),
+        ] {
+            let mut tree = Cli::command().bin_name("succinctly");
+            tree.build();
+            let in_tree = tree.find_subcommand_mut(name).expect("a subcommand");
+            direct = direct.about(about).bin_name(format!("succinctly {name}"));
+            assert_eq!(
+                in_tree.render_help().to_string(),
+                direct.render_help().to_string(),
+                "{name}: short help"
+            );
+            assert_eq!(
+                in_tree.render_long_help().to_string(),
+                direct.render_long_help().to_string(),
+                "{name}: long help"
+            );
+            assert_eq!(
+                in_tree.render_usage().to_string(),
+                direct.render_usage().to_string(),
+                "{name}: usage"
             );
         }
     }
