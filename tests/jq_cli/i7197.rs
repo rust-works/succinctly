@@ -30,20 +30,6 @@ fn text(lines: usize) -> Vec<u8> {
         .collect()
 }
 
-/// `bytes` cut into `FILES` files of near the same size, each cut moved by a few bytes so that most
-/// fall inside a document.
-fn cut(bytes: &[u8]) -> Vec<Vec<u8>> {
-    let mut files = Vec::new();
-    let mut from = 0;
-    for n in 1..FILES {
-        let to = n * bytes.len() / FILES + n % 11;
-        files.push(bytes[from..to].to_vec());
-        from = to;
-    }
-    files.push(bytes[from..].to_vec());
-    files
-}
-
 type Run = (String, String, i32);
 
 /// The run over `paths` on the route that reads them whole: each path that names a file is given as a

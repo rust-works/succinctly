@@ -13664,7 +13664,7 @@ fn several_lazy_windowed_files_by_path(files: &[PathBuf]) -> Option<Vec<window::
                 // No length: the file is read to its end as it stands when the run gets to it, as jq's
                 // reader reads it, where the length a `stat` gave now may be another file's.
                 let reader =
-                    window::OpenWhenRead::new(path.clone(), at, at + 1 == count).from_byte(start);
+                    window::OpenWhenRead::new(path.clone(), at, at + 1 == count).starting_at(start);
                 window::LineWindows::new(Box::new(reader), None, lazy_window_bytes(), Vec::new())
             })
             .collect(),

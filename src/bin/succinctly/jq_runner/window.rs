@@ -1458,7 +1458,7 @@ impl OpenWhenRead {
     }
 
     /// The same, reading from byte `start` of the file (#7197).
-    pub(super) fn from_byte(mut self, start: u64) -> Self {
+    pub(super) fn starting_at(mut self, start: u64) -> Self {
         self.start = start;
         self
     }
