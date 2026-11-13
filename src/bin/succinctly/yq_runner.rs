@@ -18178,7 +18178,7 @@ mod tests {
         let pristine = [OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3)];
         let result = [OwnedValue::Int(2), OwnedValue::Int(3), OwnedValue::Int(9)];
         let steps = [PathStep::Index(0)];
-        let targets = [(&steps[..], WriteKind::Del, false, false)];
+        let targets = [(&steps[..], WriteKind::Del, false, false, false)];
         assert_eq!(
             array_sources(&pristine, &result, &targets),
             vec![Some(0), Some(1), Some(2)]
