@@ -2143,6 +2143,36 @@ fn eval_all_documents(
     Ok(all_docs)
 }
 
+/// The document `load("name")` reads, with its presentation (#5439): the file as a later file of an
+/// `--eval-all` run is read, its header comments heading its first node. `None` for what is not replayed:
+/// a name that is not a YAML file, a header a blank line detaches, a comment on the `---` line, or a file
+/// that does not read. An anchor or an alias in the file is kept: the result's own soundness pass
+/// (`enforce_anchor_soundness`) drops a `*name` its document cannot resolve.
+fn load_document_pair(name: &str) -> Option<ResultWithComments> {
+    if name.to_ascii_lowercase().ends_with(".json") {
+        return None;
+    }
+    let bytes = std::fs::read(name).ok()?;
+    // A comment on the `---` line is the first node's head comment to yq, which the tree below does
+    // not carry, so that file keeps the route that prints no comments.
+    let marker_comment = bytes
+        .split(|b| *b == b'\n')
+        .find(|line| !line.iter().all(u8::is_ascii_whitespace))
+        .is_some_and(|line| line.starts_with(b"---") && line.contains(&b'#'));
+    if header_is_detached(&bytes) || marker_comment {
+        return None;
+    }
+    let mut index = build_yq_source(&bytes, true).ok()?;
+    index.render_merges_through_aliases_only();
+    note_synthesized_empty(&mut index);
+    let root = index.root(&bytes);
+    let YamlValue::Sequence(docs) = root.value() else {
+        return None;
+    };
+    let (cursor, _) = docs.uncons_cursor()?;
+    to_owned_with_comments::<_, YqSemantics>(&cursor.value(), Some(&cursor)).ok()
+}
+
 /// Whether the comments at the start of `bytes` are separated from the first node by a blank line,
 /// which makes them the document's head comment and not that node's.
 fn header_is_detached(bytes: &[u8]) -> bool {
@@ -14595,13 +14625,23 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         let output_config = output_config.for_source(&args, InputFormat::Yaml);
         let mut split_doc_state = SplitDocState::new(has_split_doc);
         let results = evaluate_input(&OwnedValue::Null, &program.expr, &mut sink)?;
+        // #5439: a `load` over a null input still prints what the file it read looked like.
+        let null_tree = (results.len() == 1
+            && matches!(results[0], OwnedValue::Array(_) | OwnedValue::Object(_))
+            && reshape_presentation::needed(&program.expr))
+        .then(|| {
+            reshape_presentation::trace(&program.expr, &(OwnedValue::Null, CommentTree::empty()))
+        })
+        .flatten()
+        .filter(|(traced, _)| *traced == results[0])
+        .map(|(_, tree)| tree);
         for result in results {
             let split_separator = split_doc_state.write_separator(&mut writer, &output_config)?;
             any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
             output_value(
                 &mut writer,
                 &result,
-                &CommentTree::empty(),
+                null_tree.as_ref().unwrap_or(&CommentTree::empty()),
                 &output_config,
                 split_separator,
             )?;

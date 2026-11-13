@@ -158,6 +158,11 @@ anchor marks to every document, on stdout and under `--inplace` alike
 last document only no longer reproduces; pinned by the `yaml_multidoc_alias_*_2520` goldens and
 `test_inplace_write_through_alias_applies_to_every_document_2520`).
 
+A `load("f.yaml")` of a literal name keeps what the loaded file says about its nodes too ([#5439](https://github.com/rust-works/succinctly/issues/5439)): its comments, `&anchor`s, `!tag`s, quote style and flow style print as yq prints them.
+`load` itself, `. * load(..)`, `. + load(..)`, `. *= load(..)`, `. += load(..)`, `.a.b = load(..)` and navigation after it are replayed with the file's comment tree (`load_document_pair`), with a file input and under `-n`, and the replay is used only when its value is the evaluator's.
+Still the old output, with no comments: a file whose `---` line carries a comment (yq makes it the first node's head comment), a file whose header a blank line detaches, a `load` inside a construction (`{"a": load("f.yaml")}`, `[load("f.yaml")]`) or after a write (`load("f.yaml") | del(.a)`, `sort_keys`), a `.json` file, and a non-literal file name.
+Two differences remain where the replay does run: yq prints an anchored flow collection that a merge copies in block style, and keeps a blank line between a document's last block scalar and its foot comment.
+
 The same soundness gate also governs `.c = .b`-style plain assignments
 (split out of #1351 as [#2497](https://github.com/rust-works/succinctly/issues/2497)):
 `propagate_assign_alias_marks` copies an alias mark onto the assignment's target whenever the
@@ -5519,7 +5524,7 @@ Most filters that build a value out of document nodes keep the node's tag, as yq
 `map(.)`, `[.a]`, `[.a, .b]`, `{"k": .a}`, `to_entries`, `with_entries(.)` over a mapping, `sort`, `reverse`, `unique` and `. + []` over a sequence.
 So does a sequence built from nodes ([#5429](https://github.com/rust-works/succinctly/issues/5429)): `[.[]]`, `[.[] | select(...)]`, `[(.a, .b)]`, `[.a] + [.b]`, a literal-bound slice (`.[1:]`, `.a[:2]`), `flatten`, `flatten(n)` and `map_values(f)`, so `[.Outputs[]]` over a CloudFormation template prints `Value: !Ref Bucket`.
 A custom tag is still lost when the value leaves cursor tracking on one of the routes
-[#5429](https://github.com/rust-works/succinctly/issues/5429) still lists (a variable, `.a as $x | [$x]`; a further stage after a construction, `[.a] | .`; an iterating operand inside one, `[.a[].b] + [.c]`; a computed slice bound; `map_values(select(...))`), on `with_entries(.)` over a sequence, on most filters under `--eval-all` ([#4380](https://github.com/rust-works/succinctly/issues/4380)), and in a `load()`ed document.
+[#5429](https://github.com/rust-works/succinctly/issues/5429) still lists (a variable, `.a as $x | [$x]`; a further stage after a construction, `[.a] | .`; an iterating operand inside one, `[.a[].b] + [.c]`; a computed slice bound; `map_values(select(...))`), on `with_entries(.)` over a sequence, on most filters under `--eval-all` ([#4380](https://github.com/rust-works/succinctly/issues/4380)), and in a `load()`ed document that a construction wraps or a write follows ([#5439](https://github.com/rust-works/succinctly/issues/5439)).
 The tag is lost there together with the node's comment, anchor and quoting, because those routes keep none of a node's presentation.
 Input that is not YAML carries no tag to lose.
 This is not a regression from this fix: `tag`'s own prior, unconditional (non-cursor) implementation
