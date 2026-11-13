@@ -1287,7 +1287,8 @@ yq has no node after a `select` that drops it, so a read of the node emits nothi
 A literal stage re-emits over an empty context (`.k = (select(fi == 1) | 7)` is `k: 7` in all three, in yq and here), which is the difference between the two.
 `succinctly yq` resolved the read to a literal before the context was seen empty, so every file got its own index.
 The resolved `file_index` and `filename` are now a snapshot of the value, which is no literal, and the right side answers as yq does.
-30 rows over three files are pinned against yq v4.53.3 in `tests/yq_cli/i7154.rs`.
+`path` is resolved the same way (`.k = (select(fi == 1) | path)` is `k: null`, not `[]`).
+47 rows over two sets of files, plain and under `--eval-all`, are pinned against yq v4.53.3 in `tests/yq_cli/i7154.rs`.
 
 Still different, in the same family:
 - `fi` and `filename` after a collect without `--eval-all`: `[.] | .[0] | fi` is `0` for every file in yq and `[.] | filename` is empty, because the collected array and its elements are copies with no origin; the origin is ambient per evaluation here.
