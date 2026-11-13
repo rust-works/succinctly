@@ -93497,6 +93497,17 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// A shape added to that list is added here too: `eval_owned_value_doors_agree_with_the_bridge_7132` is
 /// the pin.
 fn eval_owned_value_doors<S: EvalSemantics>(expr: &Expr, input: &OwnedValue) -> Option<OwnedValue> {
+    eval_owned_value_door_stage::<S>(expr, input)
+        .or_else(|| eval_owned_door_pipe::<S>(expr, input))
+        .or_else(|| eval_owned_door_bind::<S>(expr, input))
+        .or_else(|| eval_owned_door_if::<S>(expr, input))
+}
+
+/// [`eval_owned_value_doors`]'s lone stages.
+fn eval_owned_value_door_stage<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
     eval_owned_count_door::<S>(expr, input)
         .or_else(|| eval_owned_map_projection::<S>(expr, input))
         .or_else(|| eval_owned_construct::<S>(expr, input))
@@ -93514,6 +93525,89 @@ fn eval_owned_value_doors<S: EvalSemantics>(expr: &Expr, input: &OwnedValue) -> 
                 _ => None,
             },
         )
+}
+
+/// A pipe of stages that each answer one value from the owned tree, the answer of one the input of the next
+/// (`length | tostring`, `has(0) | not`, `first | tostring`), for [`eval_owned_value_doors`] (#7132). Every
+/// stage must be answered, by a door or by `tostring` (the fast path's own arm), or the whole pipe is the
+/// bridge's: a stage that raises, fans out or reads a navigated subvalue never starts a partial answer.
+fn eval_owned_door_pipe<S: EvalSemantics>(expr: &Expr, input: &OwnedValue) -> Option<OwnedValue> {
+    let Expr::Pipe(stages) = unwrap_paren(expr) else {
+        return None;
+    };
+    let stages = skip_identity_stages(stages);
+    if stages.len() < 2 {
+        return None;
+    }
+    let mut current: Option<OwnedValue> = None;
+    for stage in stages {
+        let at = current.as_ref().unwrap_or(input);
+        let next = eval_owned_value_door_stage::<S>(stage, at).or_else(|| {
+            matches!(unwrap_paren(stage), Expr::Builtin(Builtin::ToString)).then(|| match at {
+                OwnedValue::String(_) => at.clone(),
+                _ => OwnedValue::String(tostring_text::<S>(at, false).into()),
+            })
+        })?;
+        current = Some(next);
+    }
+    current
+}
+
+/// `SOURCE as $v | BODY` whose `SOURCE` is a count the count door answers (`length as $n | $n + 1`),
+/// the count spliced into `BODY`, which is then a door answer or a closed value (#7132): the eager twin of
+/// the lazy `(.|length) as $n | body` door. jq mode only, like every substitution of a bound value.
+fn eval_owned_door_bind<S: EvalSemantics>(expr: &Expr, input: &OwnedValue) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    let Expr::As {
+        expr: source,
+        var,
+        body,
+    } = unwrap_paren(expr)
+    else {
+        return None;
+    };
+    let count = eval_owned_count_door::<S>(source, input)?;
+    if !matches!(count, OwnedValue::Int(_) | OwnedValue::Bool(_)) {
+        return None;
+    }
+    let body = substitute_var(body, var, &count);
+    eval_owned_value_doors::<S>(&body, input).or_else(|| eval_owned_closed::<S>(&body))
+}
+
+/// `if C then A else B end` whose `C` a door settles (`length > 5`) and whose chosen branch is a literal,
+/// `.`, a door answer or a closed value (#7132), as [`owned_if_step`] reads one for a fold. A condition
+/// that raises, fans out or reads a navigated value, and a branch that is none of those, is the bridge's.
+fn eval_owned_door_if<S: EvalSemantics>(expr: &Expr, input: &OwnedValue) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    let Expr::If {
+        cond,
+        then_branch,
+        else_branch,
+    } = unwrap_paren(expr)
+    else {
+        return None;
+    };
+    // Read as a truth value, as `select` and `until` read theirs: an operand, never an answer.
+    let Some(Ok(verdict)) = eval_owned_pure_in::<S>(cond, input, ResultPosition::Operand, true)
+    else {
+        return None;
+    };
+    let branch = if verdict.is_truthy() {
+        then_branch
+    } else {
+        else_branch
+    };
+    match unwrap_paren(branch) {
+        Expr::Identity => Some(input.clone()),
+        Expr::Literal(lit) => Some(literal_to_owned(lit)),
+        other => {
+            eval_owned_value_doors::<S>(other, input).or_else(|| eval_owned_closed::<S>(other))
+        }
+    }
 }
 
 /// `first`, `last` and `nth(n)` of an owned array or null, as the `.[0]`, `.[-1]` and
@@ -130416,6 +130510,22 @@ mod tests {
             "first == 1",
             "not",
             "[first]",
+            "length | tostring",
+            "has(0) | not",
+            "first | tostring",
+            "keys | length",
+            "length | . > 1",
+            "length as $n | $n",
+            "length as $n | $n + 1",
+            "length as $n | $n > 1",
+            "has(0) as $h | $h",
+            "if length > 1 then 1 else 0 end",
+            "if has(0) then first else last end",
+            "if length > 5 then \"big\" else . end",
+            "if first == 1 then 1 else 2 end",
+            "if length > 1 then error(\"x\") else 2 end",
+            "first | length",
+            "tostring | length",
         ];
         let mut answered = 0;
         for value in &values {
@@ -130438,7 +130548,7 @@ mod tests {
                 }
             }
         }
-        assert!(answered > 40, "the matrix must reach the doors: {answered}");
+        assert!(answered > 80, "the matrix must reach the doors: {answered}");
         // What a door must not take.
         let array = OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
         for src in ["nth(-1)", "nth(1.5)", "nth(1; .[])", "first(.[])"] {
