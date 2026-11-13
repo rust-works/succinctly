@@ -15761,6 +15761,10 @@ fn owned_assign_step<S: EvalSemantics>(
             if !is_owned_assign(body) {
                 return None;
             }
+            // yq mode only inside a running fold step (#7108): asked before anything is built.
+            if S::TAG != EvalTag::Jq && !yq_fold_step_active() {
+                return None;
+            }
             let bound = match closed_expr_to_owned::<S>(source) {
                 Some(bound) => bound,
                 None if S::TAG != EvalTag::Jq => owned_box_source::<S>(source)?,
@@ -92244,10 +92248,9 @@ fn owned_update_step_arith<S: EvalSemantics>(expr: &Expr, state: OwnedValue) -> 
     // #7108: a yq-mode fold's step may write a plain scalar `=` on the state it owns; the same step
     // run for a document write may not (its alias and presentation rules are the evaluator's).
     if S::TAG == EvalTag::Yq {
-        let outer = yq_fold_step_enter();
-        let step = owned_update_step_arith_inner::<S>(expr, state);
-        yq_fold_step_leave(outer);
-        return step;
+        // A guard, so a panic caught further up does not leave the mark set on this thread.
+        let _mark = YqFoldStepMark(yq_fold_step_enter());
+        return owned_update_step_arith_inner::<S>(expr, state);
     }
     owned_update_step_arith_inner::<S>(expr, state)
 }
@@ -92256,6 +92259,15 @@ fn owned_update_step_arith<S: EvalSemantics>(expr: &Expr, state: OwnedValue) -> 
 std::thread_local! {
     /// Whether a yq-mode fold's owned step is running ([`owned_update_step_arith`], #7108).
     static YQ_FOLD_STEP: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Restores the mark [`yq_fold_step_enter`] found when the step ends, or unwinds.
+struct YqFoldStepMark(bool);
+
+impl Drop for YqFoldStepMark {
+    fn drop(&mut self) {
+        yq_fold_step_leave(self.0);
+    }
 }
 
 /// Marks a yq fold step as running, and answers what the mark was.
