@@ -2182,13 +2182,14 @@ fn eval_all_documents_with_trees(
             .get(source_idx)
             .copied()
             .unwrap_or(source_idx);
-        // yq sets the comments above the first node aside as a header for the first file only: in a later
-        // one they are that node's head comment, as after a byte-order mark.
-        // An anchor or an alias is not followed through a merge here.
+        // An anchor or an alias is not followed through a merge here (a byte scan: an `&` or `*` in a
+        // string or a comment also keeps the old output).
         if bytes.contains(&b'&') || bytes.contains(&b'*') {
             return None;
         }
-        // A later file's detached header is its document's head comment, which is not modelled.
+        // yq sets the comments above the first node aside as a header for the first file only: in a later
+        // one they are that node's head comment, as after a byte-order mark. A later file's header that
+        // a blank line detaches is its document's head comment, which is not modelled.
         if source_idx > 0 && header_is_detached(bytes) {
             return None;
         }
@@ -14323,8 +14324,11 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         // #4380: a merge of the documents (`. as $x ireduce ({}; . * $x)`) keeps what each document
         // says about its nodes; the replay is used when it gives the value the evaluator gave.
         let merged_tree = (results.len() == 1 && args.document.is_none() && !args.null_input)
-            .then(|| eval_all_documents_with_trees(&input_sources, &input_files, args.input_format))
-            .flatten()
+            .then_some(())
+            .filter(|()| reshape_presentation::merge_idiom(&program.expr))
+            .and_then(|()| {
+                eval_all_documents_with_trees(&input_sources, &input_files, args.input_format)
+            })
             .and_then(|docs| reshape_presentation::trace_eval_all_merge(&program.expr, &docs))
             .filter(|(value, _)| *value == results[0])
             // The comments only: a merge keeps the left node's style and takes the right's in places that

@@ -727,7 +727,8 @@ pub(super) fn without_flow_collection_comments(tree: CommentTree) -> CommentTree
 /// whether or not a blank line follows them (yq sets only the first file's aside as a header, #4380).
 pub(super) fn header_to_first_key(value: &OwnedValue, tree: CommentTree) -> Option<CommentTree> {
     let (CommentTree::Object(meta, fields, keys), OwnedValue::Object(_)) = (&tree, value) else {
-        return Some(tree);
+        // A header over a sequence or a scalar is its first node's head too, which is not modelled.
+        return tree.meta().head_comment().is_empty().then_some(tree);
     };
     // A block that a blank line separates from the node is the document's head comment, not the node's: not
     // modelled, and told by the caller (`None`).
@@ -760,6 +761,18 @@ pub(super) fn header_to_first_key(value: &OwnedValue, tree: CommentTree) -> Opti
 pub(super) struct EaDocument {
     pub file: usize,
     pub pair: ResultWithComments,
+}
+
+/// Whether `expr` has the shape of a merge idiom [`trace_eval_all_merge`] follows, which the caller asks
+/// before it reads the documents a second time.
+pub(super) fn merge_idiom(expr: &Expr) -> bool {
+    match expr {
+        Expr::Paren(inner) => merge_idiom(inner),
+        Expr::Pipe(parts) if parts.len() == 1 => merge_idiom(&parts[0]),
+        Expr::Arithmetic { left, right, .. } => merge_idiom(left) && merge_idiom(right),
+        Expr::Builtin(Builtin::Select(_)) | Expr::Reduce { .. } => true,
+        _ => false,
+    }
 }
 
 /// `--eval-all`'s merge idioms with the presentation of every document they merge (#4380): `. as $x
