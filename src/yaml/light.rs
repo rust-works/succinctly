@@ -4994,41 +4994,96 @@ fn reject_non_finite_json_scalar(
 }
 
 /// The failure yq's JSON encoder raises for a scalar forced to `!!float` whose text Go's
-/// `strconv.ParseFloat` reads as a non-finite number (#7115): `ParseFloat` takes `inf`, `infinity`
-/// and `nan` in any case, `inf` and `infinity` with a sign, so `!!float inf` is `+Inf` and
-/// `encoding/json` refuses it (`json: unsupported value: +Inf`, `-Inf`, `NaN`). A signed `nan`
-/// is a syntax error of `ParseFloat` itself, as `.inf` is (#6867), and a decimal past the range of a double is its range error. The text of any other scalar is
-/// not read here: a finite one writes as the number it resolves to.
+/// `strconv.ParseFloat` does not read as a finite number (#7115), or `None` for text it does.
+///
+/// `ParseFloat` takes `inf`, `infinity` and `nan` in any case (`+Inf`/`-Inf` follow the sign, `NaN`
+/// has none), so `!!float inf` is `+Inf` and `encoding/json` refuses it (`json: unsupported value:
+/// +Inf`). A signed `nan`, an empty or non-numeric text (`abc`, `true`, `~`, ` inf`, a block scalar's
+/// trailing line break) and a hexadecimal, octal or binary integer (`0x10`) are its syntax error,
+/// as the plain `.inf` is (#6867), and a decimal past the range of a double (`1e999`) its range error.
+/// A decimal number is read by the grammar `ParseFloat` has (`1_0` is `10`, `.5`, `5.`, `1e3`); a
+/// hexadecimal float (`0x1p4`, yq `16.0`) is left to the writer, which prints its text.
 ///
 /// Called only for the explicit `!!float` tag, so a scalar of any other kind pays nothing.
 #[cold]
 #[inline(never)]
-fn reject_tagged_non_finite_float(text: &str) -> Result<(), StreamFailure> {
-    let (sign, rest) = match text.as_bytes().first() {
-        Some(b'+') => ("+", &text[1..]),
-        Some(b'-') => ("-", &text[1..]),
-        _ => ("", text),
+fn tagged_float_failure(text: &str) -> Option<String> {
+    // Go's `%q`: a line break or a control character is escaped.
+    let quoted = crate::jq::go_quote_bytes(text.as_bytes());
+    let syntax = || alloc::format!("{PARSE_FLOAT_FAILURE}{quoted}: invalid syntax");
+    let (negative, signed, rest) = match text.as_bytes().first() {
+        Some(b'+') => (false, true, &text[1..]),
+        Some(b'-') => (true, true, &text[1..]),
+        _ => (false, false, text),
     };
     let lower = rest.to_ascii_lowercase();
-    let message = match lower.as_str() {
-        "inf" | "infinity" => alloc::format!(
-            "json: unsupported value: {}Inf",
-            if sign == "-" { "-" } else { "+" }
-        ),
-        "nan" if sign.is_empty() => "json: unsupported value: NaN".into(),
-        "nan" => alloc::format!("{PARSE_FLOAT_FAILURE}\"{text}\": invalid syntax"),
-        // A decimal number past the range of a double: `ParseFloat` returns `±Inf` with its
-        // range error (`1e999`), where `resolve_tagged` leaves the text a string.
-        _ if text
-            .bytes()
-            .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'+' | b'-'))
-            && text.parse::<f64>().is_ok_and(f64::is_infinite) =>
-        {
-            alloc::format!("{PARSE_FLOAT_FAILURE}\"{text}\": value out of range")
+    match lower.as_str() {
+        "inf" | "infinity" => {
+            return Some(alloc::format!(
+                "{UNSUPPORTED_VALUE_FAILURE}{}Inf",
+                if negative { "-" } else { "+" }
+            ));
         }
-        _ => return Ok(()),
+        "nan" if !signed => return Some(alloc::format!("{UNSUPPORTED_VALUE_FAILURE}NaN")),
+        _ => {}
+    }
+    if let Some(prefixed) = lower.strip_prefix('0') {
+        if prefixed.starts_with(['x', 'o', 'b']) {
+            return if prefixed.starts_with('x') && prefixed.contains('p') {
+                None
+            } else {
+                Some(syntax())
+            };
+        }
+    }
+    // [digits][.digits][e[sign]digits], at least one digit before the exponent, an `_` only
+    // between two digits.
+    let bytes = lower.as_bytes();
+    let mut at = 0;
+    let digits = |at: &mut usize| {
+        let start = *at;
+        while *at < bytes.len()
+            && (bytes[*at].is_ascii_digit()
+                || (bytes[*at] == b'_'
+                    && *at > start
+                    && bytes.get(*at + 1).is_some_and(u8::is_ascii_digit)
+                    && bytes[*at - 1].is_ascii_digit()))
+        {
+            *at += 1;
+        }
+        *at - start
     };
-    Err(StreamFailure::Decode(EvalError::decode_failure(message)))
+    let mut mantissa = digits(&mut at);
+    if bytes.get(at) == Some(&b'.') {
+        at += 1;
+        mantissa += digits(&mut at);
+    }
+    let mut well_formed = mantissa > 0;
+    if well_formed && matches!(bytes.get(at), Some(b'e')) {
+        at += 1;
+        if matches!(bytes.get(at), Some(b'+' | b'-')) {
+            at += 1;
+        }
+        well_formed = digits(&mut at) > 0;
+    }
+    if !well_formed || at != bytes.len() {
+        return Some(syntax());
+    }
+    let cleaned: alloc::string::String = lower.chars().filter(|&c| c != '_').collect();
+    match cleaned.parse::<f64>() {
+        Ok(value) if value.is_infinite() => Some(alloc::format!(
+            "{PARSE_FLOAT_FAILURE}{quoted}: value out of range"
+        )),
+        _ => None,
+    }
+}
+
+/// [`tagged_float_failure`] as the writer's failure.
+fn reject_tagged_non_finite_float(text: &str) -> Result<(), StreamFailure> {
+    match tagged_float_failure(text) {
+        Some(message) => Err(StreamFailure::Decode(EvalError::decode_failure(message))),
+        None => Ok(()),
+    }
 }
 
 /// Adds one level of yq's marshal-failure wrap to a [`reject_non_finite_json_scalar`] failure as

@@ -759,7 +759,7 @@ $ printf 'd: !!int 1_000\n' | succinctly yq -o json -I0 '.d + 1'         # 1001 
 
 Not covered here:
 - A form yq cannot encode (`!!int 0b1_0`, `!!int 1_0.5`, `!!int 9_223_372_036_854_775_808`, `!!float 0x1_f`) is an error in yq's JSON encoder and an arithmetic error; this reads it as the string, as it does `!!int abc`.
-  A prefixed integer under `!!float` (`!!float 0x1_2`, `!!float 0o1_7`) is the float `18.0`/`15.0` here, as `!!float 0x12` already was, where yq's float parser refuses it.
+  A prefixed integer under `!!float` (`!!float 0x1_2`, `!!float 0o1_7`) is the float `18.0`/`15.0` here on the routes that compute, where yq's float parser refuses it; the streamed `-o=json` writer refuses `!!float 0x12` and `0o17` with `ParseFloat`'s syntax error as yq does (#7115).
 - An underscored `!!float` (`!!float 1_0.5`, `1_000`, `1_0e1_0`) keeps its text through `tostring`, YAML output, a copy and the JSON writers (`1000.0`), as an underscored `!!int` does (#6958). Three residuals: `-P` over a document that holds one keeps the `!!float` tag, where yq strips it (`a: 1_0.5`); `to_yaml` of one prints the tag under YAML output (`!!float 1_0.5`), where yq prints the text alone (JSON output agrees: `"!!float 1_0.5\n"`); and an untagged `a: 1_0.5` is the string `1_0.5` here, where yq reads the float 10.5 (the recorded input-spec divergence for underscored numbers).
 
 ### A scalar under an unknown `!!` tag is its text (#6299)
@@ -7709,7 +7709,7 @@ A document `.inf`/`.nan` used as a number fails in yq while it computes, in ever
 `==`, `!=`, `//`, a string or `null` on the other side, `length`, and a computed infinity (`1 / 0`) are unchanged, and `[.a] | max` has no comparison to make.
 When an update (`|=`, `map_values`) fails on several nodes, yq reports the last node's text and `succinctly yq` the first: over `a: .inf` and `b: -.inf`, `map_values(. + 1)` names `"-.inf"` in yq and `".inf"` here.
 `sort` and `sort_by` over such a scalar panic in yq with a Go stack trace, and order it here (see the NaN and infinities entry in the sort section).
-A scalar forced to `!!float` whose text `strconv.ParseFloat` reads as non-finite fails in the streamed `-o=json` writer as well (#7115): `!!float inf`, `infinity` and `Inf` are `json: unsupported value: +Inf` (`-Inf` with a minus sign), `nan` in any case is `NaN`, a signed `nan` is `ParseFloat`'s syntax error and `1e999` its range error, each wrapped once per node as above.
+A scalar forced to `!!float` whose text `strconv.ParseFloat` does not read as a finite number fails in the streamed `-o=json` writer as well (#7115): text it cannot read (`abc`, `~`, an empty one, a block scalar's line break, `0x10`, `0o7`, `0b11`) is `strconv.ParseFloat: parsing "abc": invalid syntax`, and `!!float inf`, `infinity` and `Inf` are `json: unsupported value: +Inf` (`-Inf` with a minus sign), `nan` in any case is `NaN`, a signed `nan` is `ParseFloat`'s syntax error and `1e999` its range error, each wrapped once per node as above.
 The routes that evaluate a result first (`-P`, a write) and the arithmetic and comparison operators still treat the text as a string, so `!!float inf` there is the string `"inf"` where yq computes with `+Inf`, and a hexadecimal float (`!!float 0x1p4`) is written as its text where yq writes `16.0`; `tests/yq_cli/i7115.rs` pins the writer rows.
 
 ### `-o props|shell|csv|tsv|base64|uri` — the first slice of yq's output formats; six rows still differ ([#6850](https://github.com/rust-works/succinctly/issues/6850))
