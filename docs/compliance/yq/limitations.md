@@ -7939,7 +7939,7 @@ These rows differ:
 - **A date-time's tag.** yq's node has none, so `.a | tag` prints an empty line; the text is a plain timestamp here, which is `!!timestamp`.
   The value, `-o json` and `-o yaml` agree.
 - **An infinity or NaN in JSON.** `a = inf`, `-inf`, `+inf` and `nan` print as `!!float inf` (and so on) under `-o yaml`, as yq prints them, but `-o json` writes the string here, where yq stops with `json: error calling MarshalJSON ...: json: unsupported value: +Inf`.
-  The same difference is there for `a: !!float inf` in a YAML input: the JSON writers here refuse a plain `.inf` as yq does and not a tag-forced one.
+  The same difference is there for `a: !!float inf` in a YAML input: the JSON writers here refuse a plain `.inf` as yq does and not a tag-forced one ([#7115](https://github.com/rust-works/succinctly/issues/7115)).
 - **An underscored number.** `1_000`, `1__0`, `0xDEAD_beef` and `1_0.5` are plain scalars in yq's output but strings to the YAML reader here (the recorded input-spec divergence for underscored numbers), so they are written with their tag (`!!int 1_000`, `!!float 1_0.5`) and read back as numbers; `-o json` and arithmetic agree (`.a + .b` is `1000 + 3735928559`), and `-o yaml` shows the tag.
 - **Where a comment is attributed.** The nodes are written as text and read back, so `head_comment`, `line_comment` and `foot_comment` show the YAML reader's attribution, not yq's: yq prints the head comment of a scalar value after its line (`b: x` then `# before b`), and the reader here attributes that line to the next key; the printed text agrees.
   A table's or an array element's head comment, and a scalar's line comment, agree.

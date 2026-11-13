@@ -2249,11 +2249,13 @@ mod tests {
 
     #[test]
     fn the_parser_names_its_errors_as_go_toml_does() {
-        assert_eq!(yaml("a = \n").unwrap_err(), "expected value, not eof");
+        assert_eq!(yaml("a = ").unwrap_err(), "expected value, not eof");
+        assert_eq!(yaml("a = \n").unwrap_err(), "incomplete number");
         assert_eq!(
-            yaml("a\n").unwrap_err(),
+            yaml("a").unwrap_err(),
             "expected = after a key, but the document ends there"
         );
+        assert_eq!(yaml("a\n").unwrap_err(), "expected character =");
         assert_eq!(
             yaml("a = 1 b = 2\n").unwrap_err(),
             "expected newline but got U+0062 'b'"
