@@ -92197,41 +92197,51 @@ fn owned_update_step_arith<S: EvalSemantics>(expr: &Expr, state: OwnedValue) -> 
                 done => done,
             }
         }
-        None if matches!(expr, Expr::Arithmetic { left, .. } if matches!(unwrap_paren(left), Expr::Slice { .. })) => {
-            owned_slice_arith_step::<S>(expr, state)
-        }
-        None => try_eval_owned_step::<S>(expr, state),
+        None => match expr {
+            // #7109: a slice with literal bounds plus a closed operand, jq mode. What it declines
+            // takes the route every other UPDATE of this shape took before.
+            Expr::Arithmetic {
+                op, left, right, ..
+            } if S::TAG == EvalTag::Jq && matches!(unwrap_paren(left), Expr::Slice { .. }) => {
+                match owned_slice_arith_step::<S>(*op, unwrap_paren(left), right, state) {
+                    OwnedStep::Declined(state) => try_eval_owned_step::<S>(expr, state),
+                    done => done,
+                }
+            }
+            _ => try_eval_owned_step::<S>(expr, state),
+        },
     }
 }
 
 /// `.[A:B] + <closed>` as a fold's UPDATE (#7109): a slice of the state with literal bounds,
 /// combined with a right operand that needs no input, as `.[1:] + [$i]` slides a queue. Through the
 /// bridge each step wrote the whole state out as JSON and indexed it again, which made the fold
-/// quadratic (41 s at 20,000 steps, where `.[1:] | . + [$i]` takes 0.14 s). The cut is the one
-/// [`try_eval_owned_step`] makes for a slice UPDATE, and the combine is the accumulator step's, so
-/// this is that pipe of two stages applied directly.
+/// quadratic (35-38 s at 20,000 steps on the M4 Pro and the 7950X, where `.[1:] | . + [$i]` takes
+/// 11 ms). The cut is the one [`try_eval_owned_step`] makes for a slice UPDATE, and the combine is
+/// the accumulator step's, so this is that pipe of two stages applied directly.
 ///
 /// jq evaluates the right operand first, so it is settled first here: one closed value, which
 /// cannot raise or yield a second, so the only error left is the cut's or the combine's, in the
-/// order the pipe raises them. A right operand that is not closed, or a cut the step declines
-/// (the #2889 embed table is live, a state that is not an array or a string), hands the untouched
-/// state back and the evaluator answers the whole expression. jq mode only, as the cut is.
+/// order the pipe raises them. A state that is not an array or a string (the cut declines it), or
+/// a right operand that is not closed, hands the untouched state back; the caller then asks
+/// [`try_eval_owned_step`] about the whole expression, as it did before this step existed.
 #[inline(never)]
-fn owned_slice_arith_step<S: EvalSemantics>(expr: &Expr, state: OwnedValue) -> OwnedStep {
-    let Expr::Arithmetic {
-        op, left, right, ..
-    } = expr
-    else {
-        return OwnedStep::Declined(state);
-    };
-    if S::TAG != EvalTag::Jq || super::eval_generic::embed_table_active() {
+fn owned_slice_arith_step<S: EvalSemantics>(
+    op: ArithOp,
+    slice: &Expr,
+    right: &Expr,
+    state: OwnedValue,
+) -> OwnedStep {
+    // The cut only takes these two; checking before the operand is built keeps a state it declines
+    // from paying for a value the evaluator then builds again.
+    if !matches!(state, OwnedValue::Array(_) | OwnedValue::String(_)) {
         return OwnedStep::Declined(state);
     }
-    let Some(rhs) = closed_expr_to_owned::<S>(right.as_ref()) else {
+    let Some(rhs) = closed_expr_to_owned::<S>(right) else {
         return OwnedStep::Declined(state);
     };
-    match try_eval_owned_step::<S>(unwrap_paren(left), state) {
-        OwnedStep::Handled(Ok(cut)) => OwnedStep::Handled(arith_combine::<S>(*op, cut, rhs)),
+    match try_eval_owned_step::<S>(slice, state) {
+        OwnedStep::Handled(Ok(cut)) => OwnedStep::Handled(arith_combine::<S>(op, cut, rhs)),
         done => done,
     }
 }

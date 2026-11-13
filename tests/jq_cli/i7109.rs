@@ -4,8 +4,9 @@
 //! JSON and indexed it again, so the fold was quadratic: 41 s at 20,000 steps against jq's 0.05 s.
 //!
 //! Every expected output here is jq 1.7.1's (`/usr/bin/jq -nc`). The long rows run at 20,000
-//! elements, which took tens of seconds before the change and take milliseconds now, so a
-//! regression to a per-step re-index shows as a slow test before it shows as a wrong answer.
+//! elements, which took tens of seconds before the change and take milliseconds now, and one runs
+//! at 100,000, where the per-step re-index takes about fifteen minutes: a regression shows as a
+//! test that does not finish before it shows as a wrong answer.
 
 use anyhow::Result;
 
@@ -20,6 +21,10 @@ fn jq_n(filter: &str) -> Result<String> {
 #[test]
 fn a_slice_plus_a_closed_operand_as_a_fold_update_matches_jq() -> Result<()> {
     let rows = [
+        (
+            r"[range(100000)] | reduce range(100000) as $i (.; .[1:] + [$i]) | [length, .[0], .[-1]]",
+            "[100000,0,99999]",
+        ),
         (
             r"[range(20000)] | reduce range(20000) as $i (.; .[1:] + [$i]) | [length, .[0], .[-1]]",
             r"[20000,0,19999]",
