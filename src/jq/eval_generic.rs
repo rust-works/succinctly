@@ -10317,8 +10317,8 @@ mod security {
     use std::cell::Cell;
 
     thread_local! {
-        /// `(env ops disabled, file ops disabled)`.
-        static CURRENT: Cell<(bool, bool)> = const { Cell::new((false, false)) };
+        /// `(env ops disabled, file ops disabled, system operator enabled)`.
+        static CURRENT: Cell<(bool, bool, bool)> = const { Cell::new((false, false, false)) };
     }
 
     pub(crate) fn env_ops_disabled() -> bool {
@@ -10329,8 +10329,12 @@ mod security {
         CURRENT.with(|c| c.get().1)
     }
 
+    pub(crate) fn system_ops_enabled() -> bool {
+        CURRENT.with(|c| c.get().2)
+    }
+
     /// Restores the previous setting when dropped.
-    pub struct Guard((bool, bool));
+    pub struct Guard((bool, bool, bool));
 
     impl Drop for Guard {
         fn drop(&mut self) {
@@ -10338,8 +10342,8 @@ mod security {
         }
     }
 
-    pub(crate) fn enter(env_ops: bool, file_ops: bool) -> Guard {
-        Guard(CURRENT.with(|c| c.replace((env_ops, file_ops))))
+    pub(crate) fn enter(env_ops: bool, file_ops: bool, system_ops: bool) -> Guard {
+        Guard(CURRENT.with(|c| c.replace((env_ops, file_ops, system_ops))))
     }
 }
 
@@ -10353,17 +10357,26 @@ mod security {
         false
     }
 
+    pub(crate) fn system_ops_enabled() -> bool {
+        false
+    }
+
     pub struct Guard;
 
-    pub(crate) fn enter(_env_ops: bool, _file_ops: bool) -> Guard {
+    pub(crate) fn enter(_env_ops: bool, _file_ops: bool, _system_ops: bool) -> Guard {
         Guard
     }
 }
 
 /// Refuse the environment operators (`true`) and the file operators (`true`) until the returned
 /// guard is dropped (#7025).
-pub(crate) fn enter_security(env_ops: bool, file_ops: bool) -> SecurityGuard {
-    security::enter(env_ops, file_ops)
+pub(crate) fn enter_security(env_ops: bool, file_ops: bool, system_ops: bool) -> SecurityGuard {
+    security::enter(env_ops, file_ops, system_ops)
+}
+
+/// Whether `--security-enable-system-operator` is in force: `system(..)` runs a program only then.
+pub(crate) fn system_ops_enabled() -> bool {
+    security::system_ops_enabled()
 }
 
 /// The RAII guard [`enter_security`] returns.
@@ -41417,6 +41430,7 @@ fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
             | Builtin::EnvVar(_)
             | Builtin::StrEnv(_)
             | Builtin::Load(..)
+            | Builtin::System(..)
             | Builtin::Pivot
             | Builtin::Input
             | Builtin::Inputs

@@ -12616,6 +12616,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     let _security_scope = jq::enter_security_scope(
         args.security_disable_env_ops,
         args.security_disable_file_ops,
+        args.security_enable_system_operator,
     );
 
     // yq's `-o` defaults to `auto` (#6703): the run's own input format, picked once from the first

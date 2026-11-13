@@ -21105,6 +21105,9 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         // Phase 22: File operations (yq)
         Builtin::Load(file_expr, kind) => builtin_load::<W, S>(file_expr, *kind, value, optional),
+        Builtin::System(command, args) => {
+            builtin_system::<W, S>(command, args.as_deref(), value, optional)
+        }
 
         // Phase 23: Position-based navigation (succinctly extension)
         // These require cursor context - handled in eval_generic.rs
@@ -46786,7 +46789,8 @@ pub struct FileNamesScope(#[allow(dead_code)] super::eval_generic::FileNamesGuar
 ///
 /// `disable_env_ops` refuses `env(..)`, `strenv(..)` and `envsubst`, and `disable_file_ops` refuses
 /// `load`, `load_str` and `load_base64`: yq's `--security-disable-env-ops` and
-/// `--security-disable-file-ops`.
+/// `--security-disable-file-ops`. `enable_system_ops` lets `system(..)` run a program, which it does
+/// not otherwise (`--security-enable-system-operator`).
 ///
 /// The refusal is raised when the operator runs, as an error named `env operations have been
 /// disabled` or `file operations have been disabled`, and `?` does not swallow it. yq also raises
@@ -46796,10 +46800,15 @@ pub struct FileNamesScope(#[allow(dead_code)] super::eval_generic::FileNamesGuar
 /// one thread, and a caller that moves evaluation to another must enter the scope there, or the
 /// operators run unrefused.
 #[must_use = "the scope ends when the guard is dropped"]
-pub fn enter_security_scope(disable_env_ops: bool, disable_file_ops: bool) -> SecurityScope {
+pub fn enter_security_scope(
+    disable_env_ops: bool,
+    disable_file_ops: bool,
+    enable_system_ops: bool,
+) -> SecurityScope {
     SecurityScope(super::eval_generic::enter_security(
         disable_env_ops,
         disable_file_ops,
+        enable_system_ops,
     ))
 }
 
@@ -48960,6 +48969,7 @@ fn builtin_yields_at_most_one_value(builtin: &Builtin) -> bool {
         | Builtin::Line
         | Builtin::LineComment
         | Builtin::Load(..)
+        | Builtin::System(..)
         | Builtin::Localtime
         | Builtin::Log
         | Builtin::Log10
@@ -110929,6 +110939,194 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             _ if optional => QueryResult::None,
             _ => QueryResult::Error(EvalError::type_error("string", "load filename")),
         },
+    )
+}
+
+/// Builtin: yq's `system(command)` and `system(command; args)` (#7025).
+///
+/// For each node it runs `command` (the first output of its expression, a non-empty string) with
+/// `args` (the first output of that expression: a non-null scalar, or a sequence of them) and the
+/// node as YAML on standard input, and answers the program's standard output as a string with one
+/// trailing `\n` (or `\r\n`) dropped. Nothing runs unless `--security-enable-system-operator` is
+/// given: without it the operator is an error, as in yq. The messages are yq's.
+#[cfg(feature = "std")]
+fn builtin_system<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    command_expr: &Expr,
+    args_expr: Option<&Expr>,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    if !super::eval_generic::system_ops_enabled() {
+        return QueryResult::Error(EvalError::new(
+            "system operations are disabled, use --security-enable-system-operator to enable",
+        ));
+    }
+    let first_output = |expr: &Expr| -> Result<Option<OwnedValue>, Control> {
+        let (outputs, trailing) =
+            stream_outputs::<_, S>(eval_single::<W, S>(expr, value.clone(), optional));
+        match trailing {
+            Some(control) => Err(control),
+            None => Ok(outputs.into_iter().next()),
+        }
+    };
+    let command = match first_output(command_expr) {
+        Err(control) => return partial(Vec::new(), control),
+        // An absent key reads as `null` here, and yields nothing in yq.
+        Ok(None | Some(OwnedValue::Null)) => {
+            return QueryResult::Error(EvalError::new(
+                "system operator: command expression returned no results",
+            ))
+        }
+        Ok(Some(OwnedValue::String(command))) if !command.is_empty() => command.to_string(),
+        Ok(Some(OwnedValue::String(_))) => {
+            return QueryResult::Error(EvalError::new(
+                "system operator: command must be a non-empty string",
+            ))
+        }
+        Ok(Some(_)) => {
+            return QueryResult::Error(EvalError::new(
+                "system operator: command must be a string scalar",
+            ))
+        }
+    };
+    // yq's node kinds, as its error text prints them: a sequence is 1, a mapping 2, a scalar 4.
+    let describe = |node: &OwnedValue| -> String {
+        let (kind, tag) = match node {
+            OwnedValue::Array(_) => (1, "!!seq"),
+            OwnedValue::Object(_) => (2, "!!map"),
+            OwnedValue::Null => (4, "!!null"),
+            OwnedValue::Bool(_) => (4, "!!bool"),
+            OwnedValue::String(_) => (4, "!!str"),
+            OwnedValue::Int(_) => (4, "!!int"),
+            _ => (4, "!!float"),
+        };
+        format!("kind={kind} tag={tag}")
+    };
+    let text = |scalar: &OwnedValue| match scalar {
+        OwnedValue::String(s) => s.to_string(),
+        other => yq_stringify_scalar_or_empty::<S>(other),
+    };
+    let mut args: Vec<String> = Vec::new();
+    if let Some(args_expr) = args_expr {
+        match first_output(args_expr) {
+            Err(control) => return partial(Vec::new(), control),
+            Ok(None | Some(OwnedValue::Null)) => {}
+            Ok(Some(OwnedValue::Array(items))) => {
+                for item in &items {
+                    if matches!(
+                        item,
+                        OwnedValue::Array(_) | OwnedValue::Object(_) | OwnedValue::Null
+                    ) {
+                        return QueryResult::Error(EvalError::new(format!(
+                            "system operator: argument must be a non-null scalar; got {}",
+                            describe(item)
+                        )));
+                    }
+                    args.push(text(item));
+                }
+            }
+            Ok(Some(object @ OwnedValue::Object(_))) => {
+                return QueryResult::Error(EvalError::new(format!(
+                    "system operator: args must be a non-null scalar or sequence of non-null scalars; got {}",
+                    describe(&object)
+                )))
+            }
+            Ok(Some(scalar)) => args.push(text(&scalar)),
+        }
+    }
+    let owned = to_owned_or_suppress!(&value, optional);
+    let stdin_text = match format_yaml(&owned) {
+        Ok(text) => text,
+        Err(e) => return suppress_or_raise(e, optional),
+    };
+    let failed = |reason: String, stderr: &str| -> QueryResult<'a, W> {
+        let stderr = stderr.trim();
+        QueryResult::Error(EvalError::new(if stderr.is_empty() {
+            format!("system command '{command}' failed: {reason}")
+        } else {
+            format!("system command '{command}' failed: {reason}\nstderr: {stderr}")
+        }))
+    };
+    let mut child = match Command::new(&command)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            // Go's wording: a bare name that is on no `PATH` entry, or a path that cannot be run.
+            let reason = match error.kind() {
+                std::io::ErrorKind::NotFound if !command.contains('/') => {
+                    format!("exec: \"{command}\": executable file not found in $PATH")
+                }
+                std::io::ErrorKind::NotFound => {
+                    format!("fork/exec {command}: no such file or directory")
+                }
+                std::io::ErrorKind::PermissionDenied => {
+                    format!("fork/exec {command}: permission denied")
+                }
+                _ => format!("fork/exec {command}: {error}"),
+            };
+            return failed(reason, "");
+        }
+    };
+    // The program may not read its input, or exit before it has: a failed write is not an error.
+    if let Some(mut stdin) = child.stdin.take() {
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(stdin_text.as_bytes());
+        });
+        let output = child.wait_with_output();
+        let _ = writer.join();
+        return match output {
+            Err(error) => failed(error.to_string(), ""),
+            Ok(output) if !output.status.success() => {
+                let reason = match output.status.code() {
+                    Some(code) => format!("exit status {code}"),
+                    None => {
+                        #[cfg(unix)]
+                        let signal = std::os::unix::process::ExitStatusExt::signal(&output.status);
+                        #[cfg(not(unix))]
+                        let signal: Option<i32> = None;
+                        match signal {
+                            Some(9) => "signal: killed".to_string(),
+                            Some(15) => "signal: terminated".to_string(),
+                            Some(n) => format!("signal: {n}"),
+                            None => "exit status -1".to_string(),
+                        }
+                    }
+                };
+                failed(reason, &String::from_utf8_lossy(&output.stderr))
+            }
+            Ok(output) => {
+                let mut result = String::from_utf8_lossy(&output.stdout).into_owned();
+                if result.ends_with("\r\n") {
+                    result.truncate(result.len() - 2);
+                } else if result.ends_with('\n') {
+                    result.truncate(result.len() - 1);
+                }
+                QueryResult::Owned(OwnedValue::String(result.into()))
+            }
+        };
+    }
+    failed("no standard input".to_string(), "")
+}
+
+/// Builtin: `system(..)` for a no_std build, which cannot start a program.
+#[cfg(not(feature = "std"))]
+fn builtin_system<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    _command_expr: &Expr,
+    _args_expr: Option<&Expr>,
+    _value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    suppress_or_raise(
+        EvalError::new("system() requires the 'std' feature to be enabled".to_string()),
+        optional,
     )
 }
 
