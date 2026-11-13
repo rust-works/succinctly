@@ -1680,6 +1680,22 @@ pub struct YqCommand {
     )]
     pub string_interpolation: bool,
 
+    /// Whether a YAML input's leading blank, comment, `%YAML` and `---` lines are slurped as a
+    /// header (yq's `--header-preprocess`, default true, #7025). `--header-preprocess=false`
+    /// reads the input as an ordinary stream: the leading comments are the first key's head
+    /// comment, an explicit first `---` is read and not echoed, and the break after a leading
+    /// `--- text` line is kept. Like every boolean flag of yq's, it takes its value after `=` only.
+    #[arg(
+        long = "header-preprocess",
+        overrides_with = "header_preprocess",
+        value_parser = parse_go_bool,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value = "true"
+    )]
+    pub header_preprocess: bool,
+
     // === Variables ===
     /// Set $name to the string value
     #[arg(long, value_names = ["NAME", "VALUE"], num_args = 2, action = clap::ArgAction::Append, allow_hyphen_values = true)]

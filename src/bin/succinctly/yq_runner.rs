@@ -1317,6 +1317,18 @@ fn holds_no_content(text: &[u8]) -> bool {
     true
 }
 
+/// Whether `text` is only blank lines and comments, with no `---` or `...` line (#7025): under
+/// `--header-preprocess=false` yq prints such an input back as it was, where one with a marker in
+/// it is the empty document, as after a byte-order mark.
+fn is_header_only(text: &[u8]) -> bool {
+    text.split(|&b| b == b'\n').all(|line| {
+        let end = line.iter().rposition(|&b| b != b' ').map_or(0, |at| at + 1);
+        let line = &line[..end];
+        let indent = line.iter().position(|&b| b != b' ').unwrap_or(line.len());
+        line.get(indent).map_or(true, |&b| b == b'#')
+    })
+}
+
 /// The index of a YAML source `succinctly yq` reads (#5357): `had_bom` is whether a byte-order mark
 /// was dropped from its front, which leaves yq no header to set aside (see
 /// [`YamlIndex::build_yq_after_bom`]).
@@ -1386,6 +1398,11 @@ fn empty_input_reads_as_flagged(
     glue_leading_marker: bool,
 ) -> Option<(Vec<u8>, InputFormat, bool, bool)> {
     let mut had_bom = false;
+    // #7025: `--header-preprocess=false` reads every YAML input as one with no header, the
+    // reading a byte-order mark gives (see below): no leading text is slurped, and no break
+    // after a leading `--- text` line is lost.
+    let header_off = !HEADER_PREPROCESS.load(std::sync::atomic::Ordering::Relaxed);
+    let glue_leading_marker = glue_leading_marker && !header_off;
     // #5356: yq reads past a UTF-8 byte-order mark at the front of a YAML stream, each file
     // being a stream of its own; it was becoming part of the first key. A JSON document with
     // one is `invalid character 'ï'` in yq, so JSON keeps its mark and is refused as before.
@@ -1396,8 +1413,9 @@ fn empty_input_reads_as_flagged(
         bytes.drain(..bom_len);
         had_bom = bom_len > 0;
         // #6276: the break after a leading `--- text` line is lost to yq's header slurp. Not under
-        // `--front-matter`, whose own extraction reads the input first and was not captured.
-        if !front_matter && glue_leading_marker {
+        // `--front-matter`, whose own extraction reads the input first and was not captured, and
+        // not after a byte-order mark, which leaves yq no header to slurp (`--- x` / `y` is `"x y"`).
+        if !front_matter && glue_leading_marker && !had_bom {
             if let Some(glued) = succinctly::yaml::glue_after_leading_marker_text(&bytes) {
                 bytes = glued;
             }
@@ -1414,7 +1432,9 @@ fn empty_input_reads_as_flagged(
     if !holds_no_document(&bytes, format) || front_matter {
         // Under `--front-matter` the extraction reads the input first, and a BOM there was not
         // captured: it keeps the header model it had.
-        return Some((bytes, format, false, had_bom && !front_matter));
+        let no_header =
+            had_bom || (header_off && format != InputFormat::Json && !is_header_only(&bytes));
+        return Some((bytes, format, false, no_header && !front_matter));
     }
     // `at == 0` first: it settles every input but the first without opening a file.
     (at == 0
@@ -12274,7 +12294,13 @@ fn unescape_lua_option(text: &str) -> String {
     out
 }
 
+/// yq's `--header-preprocess` (default true, #7025): whether the leading blank, comment, `%YAML`
+/// and `---` lines of a YAML input are slurped as a header. A process-wide setting, as yq's own is
+/// one of its decoder's preferences.
+static HEADER_PREPROCESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
+    HEADER_PREPROCESS.store(args.header_preprocess, std::sync::atomic::Ordering::Relaxed);
     // #7025: yq's `--string-interpolation` is a process-wide setting of its lexer.
     succinctly::jq::set_yq_string_interpolation(args.string_interpolation);
 

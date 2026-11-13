@@ -635,7 +635,7 @@ That covers stdin, files, `--eval-all`, `-i`, `load()`, and a file that holds on
 A mark that is not at the front of a file stays data, and a JSON document with a mark is refused, as in yq.
 `yq-locate` and `at_offset`/`at_position` count from the first byte after the mark.
 yq's default `--header-preprocess` looks for its leading blank, comment, `%YAML` and `---` lines at the first byte of the input, and a mark is not one of them.
-A BOM-prefixed file therefore has no header: yq decodes it as an ordinary stream, as `--header-preprocess=false` reads the same text (which this does not implement).
+A BOM-prefixed file therefore has no header: yq decodes it as an ordinary stream, as `--header-preprocess=false` reads the same text ([#7025](https://github.com/rust-works/succinctly/issues/7025): a text of only comments is the one place they part, below).
 The first document's explicit `---` is read, not echoed, so a file whose first line is `---` prints without it where the same file without the mark prints it.
 `---` / `---` / `x` is a null document and then `x`, blank lines and a comment's indent ahead of the first content are normalised away, and a text with no content is one empty document, a blank line.
 The streaming routes read it that way ([#5357](https://github.com/rust-works/succinctly/issues/5357), `tests/yq_cli/i5357.rs`): stdin and files, with `.`, `-N`, `-I=0`, `-o=json` and a path.
@@ -6388,7 +6388,7 @@ What the streaming route reproduces, all measured against pinned v4.53.3:
   a `---` marker — is re-emitted verbatim in front of the first document whenever the
   result is that document itself (`# lead\n\na: 1` keeps its blank; `---\na: 1` and
   `%YAML 1.2\n---\na: 1` keep their markers; `-N` drops the markers, as in yq; `.a` prints
-  no header). `--header-preprocess=false` itself is not implemented.
+  no header). `--header-preprocess=false` reads the input with no header at all ([#7025](https://github.com/rust-works/succinctly/issues/7025), below).
   The DOM route (`-P`, a write, `-i`) reproduces the header too (#2795 PR B, #4086, #5008), but through the first document's head comment lines and its preamble, not the raw byte range, so it differs in two ways.
   A `%YAML` line of the header is not printed back there (see #6408 above).
   And a result that is a new value built from the root (`map(. + 1)` over a sequence, `-P map(.)`) carries the header here and not in yq, as a header of comments does (the derived-from-root gap); `to_entries` drops it where yq keeps it.
@@ -6401,7 +6401,7 @@ What the streaming route reproduces, all measured against pinned v4.53.3:
   The loop runs over the head of the input only, so a marker after the first content line, a bare `---` line and a lone CR break are unaffected.
   Each file of a run is a stream of its own; under `--eval-all` only the first file's head is slurped.
   The input is indexed with that one break cut out and the marker kept (`yaml_runner/leading_marker.rs`), so the line numbers of the nodes after it are one lower, as in yq.
-  `--header-preprocess=false`, which reads `--- x` / `y` as `"x y"`, is not implemented.
+  `--header-preprocess=false` reads `--- x` / `y` as `"x y"` (#7025, below), and so does a byte-order mark in front of it.
   `load()` reads its file without the slurp, in yq and here.
   `--front-matter` input is not glued (its own extraction runs first and was not captured against yq).
   Blanks in front of the first marker and a second marker the pushed-back text starts with (`--- --- x`) are stripped as in yq.
@@ -7906,8 +7906,8 @@ Matching either needs a string that can hold bytes that are not UTF-8, or the su
 
 ## The argument-level flags of [#7025](https://github.com/rust-works/succinctly/issues/7025) answer as yq does, with these differences
 
-`--expression`, `--split-exp-file`, `-f`, `-v`/`--verbose`, `--security-disable-env-ops`, `--security-disable-file-ops`, `--string-interpolation` and `-c`/`--yaml-compact-seq-indent` are yq's, and `tests/yq_cli/i7025.rs`, `tests/yq_cli/i7025_string_interpolation.rs` and `tests/yq_cli/i7025_compact_seq_indent.rs` pin the rows captured from yq v4.53.3.
-[#7025](https://github.com/rust-works/succinctly/issues/7025) stays open for `--security-enable-system-operator` and `system`, `--header-preprocess=false`, `--yaml-fix-merge-anchor-to-spec` and `--debug-node-info`.
+`--expression`, `--split-exp-file`, `-f`, `-v`/`--verbose`, `--security-disable-env-ops`, `--security-disable-file-ops`, `--string-interpolation`, `-c`/`--yaml-compact-seq-indent` and `--header-preprocess` are yq's, and `tests/yq_cli/i7025.rs`, `tests/yq_cli/i7025_string_interpolation.rs`, `tests/yq_cli/i7025_compact_seq_indent.rs` and `tests/yq_cli/i7025_header_preprocess.rs` pin the rows captured from yq v4.53.3.
+[#7025](https://github.com/rust-works/succinctly/issues/7025) stays open for `--security-enable-system-operator` and `system`, `--yaml-fix-merge-anchor-to-spec` and `--debug-node-info`.
 
 - **`--security-disable-env-ops` and `--security-disable-file-ops` refuse an operator when it runs, where yq refuses it when its handler is called.**
   `select(false) | strenv(X)`, `.zz[] | strenv(X)` and `.a | select(. == 2) | strenv(X)` fail with `env operations have been disabled` in yq, because the handler is called with an empty context.
@@ -7933,6 +7933,16 @@ Matching either needs a string that can hold bytes that are not UTF-8, or the su
   `syq -c` changes the indent of block sequences, and does not compact JSON output (`-o json` ignores it, as in yq).
 - **`--tab` with `-c` is not compacted.**
   yq has no `--tab`, so there is no reference for it.
+- **`--header-preprocess=false` reads a YAML input with no header, the reading a byte-order mark gives, with the same shapes still differing.**
+  The leading comments are the first node's head comment (`# lead` / blank / `a: 1` prints `# lead` / `a: 1`, the blank line gone), a first `---` is read and not echoed, `%YAML 1.1` / `---` is read, and the break after a leading `--- text` line is kept (`--- x` / `y` is `"x y"`, where the default's glue gives `"xy"`).
+  A text of only blank lines and comments is printed back as it was, and one with a `---` in it is the empty document, a blank line.
+  Every row was captured from yq v4.53.3 (`tests/yq_cli/i7025_header_preprocess.rs`), and 10,360 generated runs (every leading block of up to three of `# c`, `---`, `%YAML 1.1`, `--- # c` and `--- x`, before a map, a sequence, two documents and a commented map, under `.`, `.a`, `-P`, `-N`, a write, `-o=json` and `head_comment`/`foot_comment`/`tag`/`line`) differ only in:
+  - a comment or text on a `---` line: `--- # c` / `a: 1` keeps `# c` as the first node's head comment in yq and drops it here, and `# c` / `--- x` / `y` drops the comment in yq and keeps it here (the shape listed under the byte-order mark above);
+  - `%YAML 1.1` or `1.2` with no `---` after it, an error in yq and read here;
+  - the `line` of a document with no content (`---` / `---` / `a: 1` is `[0,2]` in yq and `[0,3]` here).
+  A scalar or flow-collection document with two comment blocks, not in that sweep, differs as after a byte-order mark ([#7089](https://github.com/rust-works/succinctly/issues/7089)).
+  The flag is one setting for the run, so under `--eval-all` and with several files every input is read with no header, as yq does.
+  `--front-matter` keeps its own reading, and a JSON input has no header either way.
 - **A missing `--split-exp-file` is worded differently.**
   yq says `Error: open nope.exp: no such file or directory`; this says `failed to read split expression file: nope.exp`, with the cause.
   Both exit 1 and write nothing.

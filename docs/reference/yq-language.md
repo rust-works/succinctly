@@ -858,6 +858,7 @@ same kind of thing as the rest of this table — extra, off by default.
 | `-v, --verbose`       | Accepted; no debug log is written (#7025)     |
 | `-c, --yaml-compact-seq-indent[=BOOL]` | A block sequence under a key is two columns left of the default (`-I 2`: at the key's column); the run takes the comment-keeping emitter (#7025) |
 | `--string-interpolation[=BOOL]` | `=false` keeps `\(` in a string literal as text (default true, #7025) |
+| `--header-preprocess[=BOOL]` | `=false` reads a YAML input with no header: leading comments are the first node's head comment, a first `---` is not echoed (default true, #7025) |
 | `-S, --sort-keys`     | Sort mapping keys in output (succinctly extension — real yq has no such flag) |
 
 ### `--front-matter`
@@ -939,7 +940,7 @@ See [yq Remaining Work](../plan/yq-remaining.md) for the yq operators, encoders 
 ### Intentionally Not Implemented
 
 1. **XML/TOML input/output** - Out of scope (separate tools)
-2. **Comment preservation** - trailing (`# c`) comments, anchors, style and standalone head/foot comment lines all survive every YAML route now (the streaming route, `-P`, and a write like `.a = 5`/`del(.b)` -- #2795 PR A/B); `--header-preprocess=false` is not implemented (the default header slurping is), and the DOM route's verbatim header reproduction has known gaps -- see [limitations.md](../compliance/yq/limitations.md)
+2. **Comment preservation** - trailing (`# c`) comments, anchors, style and standalone head/foot comment lines all survive every YAML route now (the streaming route, `-P`, and a write like `.a = 5`/`del(.b)` -- #2795 PR A/B); `--header-preprocess=false` reads the input with no header (#7025), and the DOM route's verbatim header reproduction has known gaps -- see [limitations.md](../compliance/yq/limitations.md)
 3. **Schema validation** - Separate tool concern
 
 ### Partial Implementation Notes
