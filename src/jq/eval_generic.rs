@@ -6437,7 +6437,8 @@ fn restore_comment_breaks(comments: &mut XmlComments, pristine: &XmlComments) {
                 }
             }
         }
-        (XmlMembers::Seq(items), XmlMembers::Seq(originals)) => {
+        // Items are paired by position, which is the same node only while the write left their number alone.
+        (XmlMembers::Seq(items), XmlMembers::Seq(originals)) if items.len() == originals.len() => {
             for (item, original) in items.iter_mut().zip(originals) {
                 restore_comment_breaks(item, original);
             }

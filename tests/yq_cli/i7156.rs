@@ -76,6 +76,7 @@ const ROWS: &[Row] = &[
     (&[], "sort_keys(.)", "# h1\n\n# h2\n\nb: 2\na: 1 # l\n", "<!-- h1\n\nh2\n-->\n<a>1<!-- l --></a>\n<b>2</b>\n", "", 0),
     (&[], ".b = 3", "# lead\n\na: 1\n# f\nb: 2 # l\n# tail\n", "<!-- lead\n-->\n<a>1</a><!-- f -->\n\n<b>3<!-- l --></b><!-- tail -->\n", "", 0),
     (&[], "del(.a)", "# lead\n---\n# first\na: 1\nb: 2\n", "<!-- lead\n$yqDocSeparator$\nfirst -->\n<b>2</b>\n", "", 0),
+    (&[], ".b = 3", "a: 1 # a --> b\nb: 2\n", "", "Error: xml: EncodeToken of Comment containing --> marker", 1),
 ];
 
 #[test]

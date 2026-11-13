@@ -8818,18 +8818,6 @@ fn top_level_comma_branches(expr: &Expr) -> Option<Vec<&Expr>> {
 /// they did before.
 const PICK_REPLAY_MAX_BYTES: usize = 1 << 20;
 
-/// Evaluate a jq expression directly on a YAML cursor.
-///
-/// This uses the generic evaluator to preserve position metadata (line/column).
-/// Each result carries its parallel [`CommentTree`] (issue #710/#739) —
-/// real for `OneCursor`/`ManyCursor` (still-live cursor); for every other
-/// result (an already-materialized/computed value with no cursor of its
-/// own) it's [`reconcile_presentation`]'s output against the pristine
-/// document when `expr` is a shape-preserving write
-/// ([`is_alias_sensitive_assign`]) and the caller wants comments at all
-/// (`need_comments`). Supported pure reshapes instead get a traced side-tree
-/// (#3615); other computed values get [`CommentTree::empty`]. See
-/// [`CommentTree`]'s own doc comment for the provenance boundary.
 /// The program and the `-o xml` encoder stage `run_yq` appended to it, if that is how `expr` ends (#7156).
 fn split_xml_encoder(expr: &Expr) -> Option<(Expr, &XmlOptions)> {
     let Expr::Pipe(stages) = expr else {
@@ -8846,6 +8834,18 @@ fn split_xml_encoder(expr: &Expr) -> Option<(Expr, &XmlOptions)> {
     Some((inner, options))
 }
 
+/// Evaluate a jq expression directly on a YAML cursor.
+///
+/// This uses the generic evaluator to preserve position metadata (line/column).
+/// Each result carries its parallel [`CommentTree`] (issue #710/#739) —
+/// real for `OneCursor`/`ManyCursor` (still-live cursor); for every other
+/// result (an already-materialized/computed value with no cursor of its
+/// own) it's [`reconcile_presentation`]'s output against the pristine
+/// document when `expr` is a shape-preserving write
+/// ([`is_alias_sensitive_assign`]) and the caller wants comments at all
+/// (`need_comments`). Supported pure reshapes instead get a traced side-tree
+/// (#3615); other computed values get [`CommentTree::empty`]. See
+/// [`CommentTree`]'s own doc comment for the provenance boundary.
 fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
     cursor: YamlCursor<'_, W>,
     expr: &Expr,
@@ -8861,9 +8861,10 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
     // A plain read is not taken here: the encoder reads its comments off the cursor, which keeps a
     // detail the tree does not (the line break a blank line leaves under a head comment).
     if let Some((inner, options)) = split_xml_encoder(expr).filter(|(inner, _)| {
-        is_alias_sensitive_assign(inner)
-            || reshape_presentation::needed(inner)
-            || reshape_presentation::navigation_construction(inner)
+        pristine_override.is_none()
+            && (is_alias_sensitive_assign(inner)
+                || reshape_presentation::needed(inner)
+                || reshape_presentation::navigation_construction(inner))
     }) {
         let results = evaluate_yaml_cursor_core(
             cursor,
