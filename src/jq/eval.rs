@@ -27211,6 +27211,17 @@ pub fn yq_encoder_writes_comments(encoder: &YqOutputEncoder) -> bool {
     )
 }
 
+/// Whether yq's encoder for `-o=<format>` prints the first document's leading block itself (#7117, #7158).
+///
+/// That block is the comments and blank lines before the document, and a `---`: `format_yq_commented` is
+/// handed it for these encoders.
+pub fn yq_encoder_prints_leading_block(encoder: &YqOutputEncoder) -> bool {
+    matches!(
+        encoder,
+        YqOutputEncoder::Xml(_) | YqOutputEncoder::Kyaml(..)
+    )
+}
+
 /// yq's text of `value`, a document node whose comments are `comments`, for an encoder that writes them
 /// ([`yq_encoder_writes_comments`]), after the document's `leading` comment block when the node is the
 /// first document's content (#7117). The error is the output encoder's, as
@@ -27237,14 +27248,11 @@ pub(crate) fn format_yq_commented(
                 leading,
                 *separators,
             )),
-            _ if *unwrap => Ok(format_kyaml(value, *indent)),
-            _ => Ok(format_kyaml_commented(
-                value,
-                *indent,
-                comments,
-                leading,
-                *separators,
-            )),
+            _ => Ok(if *unwrap {
+                format_kyaml(value, *indent)
+            } else {
+                format_kyaml_commented(value, *indent, comments, leading, *separators)
+            }),
         },
         // The encoders that read no comment.
         other => return format_yq_output::<YqSemantics>(other, value),

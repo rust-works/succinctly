@@ -95,8 +95,8 @@ use super::eval::{
     StashedVerdict, YqSemantics, DEFERRED_BIND_UNRESOLVED, MAX_RANGE_TOTAL,
 };
 use super::eval::{
-    format_yq_commented, format_yq_props_commented, yq_encoder_writes_comments,
-    yq_props_format_style,
+    format_yq_commented, format_yq_props_commented, yq_encoder_prints_leading_block,
+    yq_encoder_writes_comments, yq_props_format_style,
 };
 use super::eval::{owned_slot_mut, static_path_steps, StepKey};
 #[cfg(test)]
@@ -6479,10 +6479,8 @@ pub fn format_yq_encoder_from_tree<C: DocumentCursor>(
     }
     let meta = tree.meta();
     let mut leading = String::new();
-    if matches!(
-        encoder,
-        YqOutputEncoder::Xml(_) | YqOutputEncoder::Kyaml(..)
-    ) && (meta.preamble().is_some() || meta.head_is_header())
+    if yq_encoder_prints_leading_block(encoder)
+        && (meta.preamble().is_some() || meta.head_is_header())
     {
         leading = pristine.yq_leading_content().unwrap_or_default();
         // What the header holds is not the node's own comment as well.
@@ -16822,11 +16820,10 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             let (comments, leading) = cursor.as_ref().map_or_else(
                 || (EncoderComments::default(), String::new()),
                 |c| {
-                    let leading = match encoder {
-                        YqOutputEncoder::Xml(_) | YqOutputEncoder::Kyaml(..) => {
-                            c.yq_leading_content().unwrap_or_default()
-                        }
-                        _ => String::new(),
+                    let leading = if yq_encoder_prints_leading_block(encoder) {
+                        c.yq_leading_content().unwrap_or_default()
+                    } else {
+                        String::new()
                     };
                     (collect_encoder_comments(c, 0), leading)
                 },
