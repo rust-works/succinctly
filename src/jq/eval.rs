@@ -16169,10 +16169,12 @@ enum YqWrite {
 }
 
 /// The value [`owned_assign_step`] writes, given the old value at its path,
-/// or `None` to decline. yq mode keeps only #3025's `.field op= <number>`
-/// shape (`yq_shape`: one field step into an object), since its `=`
-/// vivifies before the right side runs (#2481) and redirects through
-/// aliases (#1351).
+/// or `None` to decline. yq mode answers `.field op= <number>` (#3025: `yq_shape`, one field step
+/// into an object) anywhere, since its `=` vivifies before the right side runs (#2481) and
+/// redirects through aliases (#1351). While a yq fold step runs (#7108, [`yq_fold_step_active`])
+/// it also answers, on a plain field, a `|=` that combines a number with a number (the same
+/// arithmetic `op=` makes) and a plain `=` of a scalar: the state a fold owns has no aliases or
+/// presentation for those rules to act on.
 #[inline]
 fn owned_assign_new_value<S: EvalSemantics>(
     expr: &Expr,
@@ -16180,24 +16182,23 @@ fn owned_assign_new_value<S: EvalSemantics>(
     old: &OwnedValue,
     yq_shape: YqWrite,
 ) -> Option<OwnedValue> {
-    if S::TAG != EvalTag::Jq
-        && !(!matches!(yq_shape, YqWrite::Other)
-            && matches!(expr, Expr::CompoundAssign { .. })
-            && old.is_number()
-            && matches!(&rhs, OwnedAssignRhs::Combine(_, right) if right.is_number()))
-        // #7108: a plain `=` of a scalar onto a plain field of an object state.
-        && !(matches!(yq_shape, YqWrite::PlainField)
-            && yq_fold_step_active()
-            && matches!(expr, Expr::Assign { .. })
-            && matches!(&rhs, OwnedAssignRhs::Value(value) if !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_))))
-        // #7108: `|= . + N` (or another operator) of a number by a number, the arithmetic `+=` makes.
-        && !(matches!(yq_shape, YqWrite::PlainField)
-            && yq_fold_step_active()
-            && matches!(expr, Expr::Update { .. })
-            && old.is_number()
-            && matches!(&rhs, OwnedAssignRhs::Combine(_, right) if right.is_number()))
-    {
-        return None;
+    if S::TAG != EvalTag::Jq {
+        let numbers = old.is_number()
+            && matches!(&rhs, OwnedAssignRhs::Combine(_, right) if right.is_number());
+        let in_fold = matches!(yq_shape, YqWrite::PlainField) && yq_fold_step_active();
+        let answered = match expr {
+            Expr::CompoundAssign { .. } => !matches!(yq_shape, YqWrite::Other) && numbers,
+            Expr::Update { .. } => in_fold && numbers,
+            Expr::Assign { .. } => {
+                in_fold
+                    && matches!(&rhs, OwnedAssignRhs::Value(value)
+                        if !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)))
+            }
+            _ => false,
+        };
+        if !answered {
+            return None;
+        }
     }
     match rhs {
         OwnedAssignRhs::Value(value) => Some(value),

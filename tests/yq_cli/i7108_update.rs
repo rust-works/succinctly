@@ -54,6 +54,22 @@ const ROWS: &[Row] = &[
     ("k:\n  x: [1, 2, 3]\n  y: 1\n", &["-o", "json", "-I0"], "with(.k; .x[] as $v | .y |= . + $v)", "{\"k\":{\"x\":[1,2,3],\"y\":7}}\n", "", 0),
     ("k:\n  x: [1, 2, 3]\n  y: 1\n", &[], ".k.y |= . + 1", "k:\n  x: [1, 2, 3]\n  y: 2\n", "", 0),
     ("k:\n  x: [1, 2, 3]\n  y: 1\n", &["-o", "json", "-I0"], ".k.y |= . + 1", "{\"k\":{\"x\":[1,2,3],\"y\":2}}\n", "", 0),
+    ("k:\n  x: [1, 2]\n  y: &a 1\n  z: *a\n", &[], ".k |= (.x[] as $v ireduce (.; .y |= . + $v))", "k:\n  x: [1, 2]\n  y: &a 4\n  z: *a\n", "", 0),
+    ("k:\n  x: [1, 2]\n  y: &a 1\n  z: *a\n", &["-o", "json", "-I0"], ".k |= (.x[] as $v ireduce (.; .y |= . + $v))", "{\"k\":{\"x\":[1,2],\"y\":4,\"z\":4}}\n", "", 0),
+    ("k:\n  x: [1, 2]\n  y: &a 1\n  z: *a\n", &[], "with(.k; .x[] as $v | .y |= . + $v)", "k:\n  x: [1, 2]\n  y: &a 4\n  z: *a\n", "", 0),
+    ("k:\n  x: [1, 2]\n  y: &a 1\n  z: *a\n", &["-o", "json", "-I0"], "with(.k; .x[] as $v | .y |= . + $v)", "{\"k\":{\"x\":[1,2],\"y\":4,\"z\":4}}\n", "", 0),
+    ("k:\n  x: [0, 2]\n  y: 7\n", &[], ".k |= (.x[] as $v ireduce (.; .y |= . / $v))", "k:\n  x: [0, 2]\n  y: !!float +Inf\n", "", 0),
+    ("k:\n  x: [0, 2]\n  y: 7\n", &["-o", "json", "-I0"], ".k |= (.x[] as $v ireduce (.; .y |= . / $v))", "", "Error: json: error calling MarshalJSON for type *yqlib.CandidateNode: json: error calling MarshalJSON for type *yqlib.CandidateNode: json: error calling MarshalJSON for type *yqlib.CandidateNode: json: unsupported value: +Inf", 1),
+    ("k:\n  x: [0, 2]\n  y: 7\n", &[], ".k |= (.x[] as $v ireduce (.; .y |= . % $v))", "", "Error: cannot modulo by 0", 1),
+    ("k:\n  x: [0, 2]\n  y: 7\n", &["-o", "json", "-I0"], ".k |= (.x[] as $v ireduce (.; .y |= . % $v))", "", "Error: cannot modulo by 0", 1),
+    ("k:\n  x: [-1]\n  y: -9223372036854775808\n", &[], ".k |= (.x[] as $v ireduce (.; .y |= . / $v))", "k:\n  x: [-1]\n  y: 9.223372036854776e+18\n", "", 0),
+    ("k:\n  x: [-1]\n  y: -9223372036854775808\n", &["-o", "json", "-I0"], ".k |= (.x[] as $v ireduce (.; .y |= . / $v))", "{\"k\":{\"x\":[-1],\"y\":9.223372036854776e+18}}\n", "", 0),
+    ("k:\n  x: [-1]\n  y: -9223372036854775808\n", &[], ".k |= (.x[] as $v ireduce (.; .y |= . * $v))", "k:\n  x: [-1]\n  y: -9223372036854775808\n", "", 0),
+    ("k:\n  x: [-1]\n  y: -9223372036854775808\n", &["-o", "json", "-I0"], ".k |= (.x[] as $v ireduce (.; .y |= . * $v))", "{\"k\":{\"x\":[-1],\"y\":-9223372036854775808}}\n", "", 0),
+    ("k:\n  x: [1]\n  y: 9223372036854775807\n", &[], ".k |= (.x[] as $v ireduce (.; .y |= . + $v))", "k:\n  x: [1]\n  y: -9223372036854775808\n", "", 0),
+    ("k:\n  x: [1]\n  y: 9223372036854775807\n", &["-o", "json", "-I0"], ".k |= (.x[] as $v ireduce (.; .y |= . + $v))", "{\"k\":{\"x\":[1],\"y\":-9223372036854775808}}\n", "", 0),
+    ("k:\n  x: [1, 2]\n  y: [5, 6]\n", &[], ".k |= (.x[] as $v ireduce (.; .y[0] |= . + $v))", "k:\n  x: [1, 2]\n  y: [8, 6]\n", "", 0),
+    ("k:\n  x: [1, 2]\n  y: [5, 6]\n", &["-o", "json", "-I0"], ".k |= (.x[] as $v ireduce (.; .y[0] |= . + $v))", "{\"k\":{\"x\":[1,2],\"y\":[8,6]}}\n", "", 0),
 ];
 
 #[test]
@@ -82,7 +98,7 @@ fn yq_fold_numeric_update_is_linear_7108() -> Result<()> {
     assert_eq!(out, "799980000\n");
     assert_eq!(status, 0);
     assert!(
-        start.elapsed() < std::time::Duration::from_secs(60),
+        start.elapsed() < std::time::Duration::from_secs(30),
         "the fold took {:?}",
         start.elapsed()
     );
