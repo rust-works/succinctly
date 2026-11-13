@@ -53,3 +53,46 @@ fn eval_all_inplace_writes_the_first_file_7042() -> Result<()> {
     }
     Ok(())
 }
+
+/// The first file stays byte-identical when the run fails or refuses, and `-i` never writes ANSI.
+#[test]
+fn eval_all_inplace_keeps_the_file_when_it_must_7042() -> Result<()> {
+    let dir = TempDir::new()?;
+    let first = dir.path().join("a.yaml");
+    let second = dir.path().join("b.yaml");
+    std::fs::write(&first, "a: 1\n")?;
+    std::fs::write(&second, "b: 2\n")?;
+    // A program that raises: yq exits 1 and leaves the file.
+    let (_, stderr, status) = run_yq_files(".a | error(\"x\")", &[&first, &second], &["ea", "-i"])?;
+    assert_eq!(
+        (stderr.lines().next().unwrap_or(""), status),
+        ("Error: x", 1)
+    );
+    assert_eq!(std::fs::read_to_string(&first)?, "a: 1\n");
+    // Standard input has no file to write back to, wherever it sits.
+    for files in [vec![&first, &second], vec![&second, &first]] {
+        let mut paths: Vec<&std::path::Path> = vec![std::path::Path::new("-")];
+        paths.extend(files.iter().map(|p| p.as_path()));
+        let (_, stderr, status) = run_yq_files(".", &paths, &["ea", "-i"])?;
+        assert_eq!(status, 1);
+        assert!(
+            stderr.contains("write in place flag only applicable"),
+            "{stderr}"
+        );
+    }
+    // A complex mapping key would be lost on the way back.
+    std::fs::write(&first, "? [x]\n: 1\n")?;
+    let (_, stderr, status) = run_yq_files(".", &[&first, &second], &["ea", "-i"])?;
+    assert_eq!(status, 1);
+    assert!(stderr.contains("complex mapping key"), "{stderr}");
+    assert_eq!(std::fs::read_to_string(&first)?, "? [x]\n: 1\n");
+    // `-C` is not written to the file.
+    std::fs::write(&first, "a: 1\n")?;
+    let (_, _, status) = run_yq_files(".k = 1", &[&first, &second], &["ea", "-i", "-C"])?;
+    assert_eq!(status, 0);
+    assert_eq!(
+        std::fs::read_to_string(&first)?,
+        "a: 1\nk: 1\n---\nb: 2\nk: 1\n"
+    );
+    Ok(())
+}

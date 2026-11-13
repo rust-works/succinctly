@@ -12647,6 +12647,18 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         }
     }
 
+    if args.eval_all && args.inplace {
+        // #7042: yq reads `-` as stdin, which has no file to write back to; refused before anything
+        // is read, as the other `-i` routes do (#4367).
+        if get_input_files(&args)
+            .iter()
+            .any(|file| is_stdin_file_argument(Path::new(file)))
+        {
+            anyhow::bail!(
+                "write in place flag only applicable when giving an expression and at least one file"
+            );
+        }
+    }
     if args.eval_all {
         if args.slurp {
             anyhow::bail!(
@@ -12772,6 +12784,10 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     // (`length` over three becomes `3 3 3`, one string, when read back), which loses the documents
     // (ADR-0018: matching would corrupt the file; recorded in limitations.md).
     output_config.no_doc |= results_have_no_document && !args.inplace;
+    // `-i` never writes ANSI to a file (#809), `--eval-all` included (#7042).
+    if args.inplace {
+        output_config.use_color = false;
+    }
 
     // Set up output
     let stdout = std::io::stdout();
@@ -14059,6 +14075,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             }
         }
     } else if args.eval_all && !eval_all_per_document {
+        let reports_before_eval_all = sink.report_count();
         // Handle --eval-all: evaluate the filter once over the list of every
         // document of every file, exposing `file_index`/`fileIndex`/`fi`
         // (#715). Input-gathering mirrors --slurp's DOM path (all_docs
@@ -14186,18 +14203,21 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             )?;
         }
         // #7042: `-i` with `--eval-all` writes the results of the one evaluation to the first file and
-        // leaves the others as they are, as yq does. A halt or a reported error keeps the file.
-        if args.inplace {
+        // leaves the others as they are, as yq does. A halt or a reported error keeps the file as it
+        // was (#1615), and so does a YAML file with a complex mapping key (#3463) that would be
+        // written back without it.
+        if args.inplace && !args.null_input {
             let Some(first) = input_files.first() else {
                 anyhow::bail!("--inplace requires at least one file argument");
             };
-            if is_stdin_file_argument(Path::new(first)) {
-                anyhow::bail!(
-                    "write in place flag only applicable when giving an expression and at least one file"
-                );
-            }
             let output = writer.take_buffered()?;
-            if sink.halted().is_none() {
+            if sink.halted().is_none() && sink.report_count() == reports_before_eval_all {
+                if resolve_run_input_format(args.input_format, &input_files) != InputFormat::Json {
+                    let original = std::fs::read(first)
+                        .with_context(|| format!("failed to read file: {first}"))?;
+                    let after_bom = original.starts_with(b"\xEF\xBB\xBF");
+                    refuse_yaml_complex_keys_for_inplace(&original, first, after_bom)?;
+                }
                 std::fs::write(first, &output)
                     .with_context(|| format!("failed to write to file: {first}"))?;
             }
