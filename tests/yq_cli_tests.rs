@@ -63046,9 +63046,12 @@ fn test_yq_fromjson_number_formats_3032() -> Result<()> {
 #[test]
 fn test_yq_fromjson_standard_string_escapes_3032() -> Result<()> {
     // JSON text `"a\nb\tc\rd\be\ff\/g\\h\"i"`, embedded in a yq string
-    // literal (each backslash and quote doubled once more for the outer
-    // literal's own escaping).
-    let filter = r#""\"a\\nb\\tc\\rd\\be\\ff\\/g\\\\h\\\"i\"" | fromjson"#;
+    // literal. yq collapses backslash pairs twice (#7102), so a run of two
+    // reads as the one backslash before `n`, three as `\"`, and eight as
+    // the JSON `\\`; a lone `\"` is the bare quote that opens and closes
+    // the JSON string. (yq's own `fromjson` rejects the `\/` here, which
+    // this one reads: the test is about what `fromjson` decodes.)
+    let filter = r#""\"a\\nb\\tc\\rd\\be\\ff\\/g\\\\\\\\h\\\"i\"" | fromjson"#;
     let (out, code) = run_yq_stdin(filter, "", &["-n"])?;
     assert_eq!(code, 0, "stdout: {out:?}");
     assert_eq!(out.trim_end_matches('\n'), "a\nb\tc\rd\x08e\x0Cf/g\\h\"i");

@@ -12,8 +12,8 @@
 //! agreed for one and two backslashes and read the rest left to right, and refused an unclosed `\(`.
 //!
 //! Not covered: yq's `level=WARN msg="unclosed interpolation string, skipping interpolation"` on stderr,
-//! which is not printed here (recorded in the limitations page), and a run of three or more backslashes
-//! before a character that is not `(`, which differs too and is its own issue.
+//! which is not printed here (recorded in the limitations page). A run before a character that is not `(`
+//! is #7102's (`tests/yq_cli/i7102.rs`).
 
 use std::process::{Command, Stdio};
 

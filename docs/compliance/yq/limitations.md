@@ -8010,7 +8010,5 @@ yq does not pair backslashes left to right: of `n` backslashes before `(`, an in
 
 - **yq's warning for an unclosed `\(` is not printed.**
   yq writes `level=WARN msg="unclosed interpolation string, skipping interpolation"` to stderr and exits 0; this prints the same text on stdout and nothing on stderr.
-- **A run of three or more backslashes before a character that is not `(` still pairs left to right.**
-  yq keeps `ceil(n / 4)` of them in a string that has no unclosed interpolation (`"a\\\x"` is `a\x` in yq with three backslashes, `a\\x` here), and `ceil(n / 2)` in a string that has one.
 - **An empty slot, `"\()"`, is the empty string in yq and a parse error here.**
 - **With `--jq-extensions` a string with an unclosed `\(` is still a parse error**, because a slot may hold a string literal there and the end of the text is not known up front.

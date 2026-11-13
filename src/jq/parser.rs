@@ -523,21 +523,63 @@ pub(crate) fn join_expr_arity(expr: &Expr) -> Option<usize> {
 /// `test("\d+")` reach the regex engine, and `"\u0041"` is six characters, not `A` (live against
 /// the pinned v4.53.3). jq decodes `\u` and `\/` and rejects the rest.
 fn push_yq_string_escape(out: &mut String, c: char) {
-    match c {
-        'n' => out.push('\n'),
-        'r' => out.push('\r'),
-        't' => out.push('\t'),
-        'b' => out.push('\x08'),
-        'f' => out.push('\x0C'),
-        'a' => out.push('\x07'),
-        'v' => out.push('\x0B'),
-        '"' => out.push('"'),
-        '\\' => out.push('\\'),
-        other => {
+    match yq_string_escape(c) {
+        Some(decoded) => out.push(decoded),
+        None => {
             out.push('\\');
-            out.push(other);
+            out.push(c);
         }
     }
+}
+
+/// The character yq's lexer decodes `\c` to, for the escapes it reads (#4916); `None` for every other
+/// character, whose backslash stays as text. The one list [`push_yq_string_escape`] and
+/// [`push_yq_backslash_run`] share.
+fn yq_string_escape(c: char) -> Option<char> {
+    Some(match c {
+        'n' => '\n',
+        'r' => '\r',
+        't' => '\t',
+        'b' => '\x08',
+        'f' => '\x0C',
+        'a' => '\x07',
+        'v' => '\x0B',
+        '"' => '"',
+        '\\' => '\\',
+        _ => return None,
+    })
+}
+
+/// A run of `n` (at least one) backslashes in a yq string literal, before `next` (the character after
+/// the run, `None` at the end of the program), as yq reads it when interpolation is on and every
+/// interpolation of the string closes (#7102): it collapses backslash pairs twice, once in its lexer
+/// and once more when the string is read. The lexer turns each pair into one backslash and, for an odd
+/// `n`, reads the last backslash with `next` as an escape (decoded when [`yq_string_escape`] knows it,
+/// kept as `\next` when it does not); the second pass turns each pair of the backslashes left into one
+/// and keeps a lone one, and decodes nothing. Captured against yq v4.53.3 for `n` = 1..14 before
+/// `x n t r b f a v d u0041 / 0 e é` and a space, before the closing quote, and in a string with a slot
+/// before and after it. Returns the escape `next` forms with the odd backslash (which the caller must
+/// then skip), if it does.
+///
+/// A run before `(` is [`yq_backslash_run_starts_interpolation`]'s (#7063).
+fn push_yq_backslash_run(out: &mut String, n: usize, next: Option<char>) -> Option<char> {
+    let pairs = n / 2;
+    let decoded = if n % 2 == 1 {
+        next.and_then(yq_string_escape)
+    } else {
+        None
+    };
+    // An odd backslash that reads no escape stays in front of `next` and so is collapsed too.
+    let left = if n % 2 == 1 && decoded.is_none() {
+        pairs + 1
+    } else {
+        pairs
+    };
+    out.extend(core::iter::repeat('\\').take(left.div_ceil(2)));
+    if let Some(c) = decoded {
+        out.push(c);
+    }
+    next.filter(|_| decoded.is_some())
 }
 
 /// How many backslashes yq's lexer keeps for a run of `n` before a character that is not `(`, or
@@ -3315,6 +3357,19 @@ impl<'a> Parser<'a> {
                                 };
                                 current_literal.extend(core::iter::repeat('\\').take(kept));
                                 current_literal.push('(');
+                            }
+                            continue;
+                        }
+                        // #7102: a run before any other character, with every interpolation of the
+                        // string closed, collapses twice: `push_yq_backslash_run`. A string with an
+                        // unclosed `\(` collapses once, as below.
+                        if interpolations_closed {
+                            for _ in 0..run {
+                                self.next();
+                            }
+                            let next = self.peek();
+                            if push_yq_backslash_run(&mut current_literal, run, next).is_some() {
+                                self.next();
                             }
                             continue;
                         }
