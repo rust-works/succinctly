@@ -693,6 +693,212 @@ fn evaluated(expr: &Expr, value: &OwnedValue) -> Option<OwnedValue> {
     }
 }
 
+/// `tree` without the line comment of a flow collection (`d: [1, 2] # list`): once the flow style is
+/// dropped the comment would print inside the block it becomes, not where it was written (#4380).
+pub(super) fn without_flow_collection_comments(tree: CommentTree) -> CommentTree {
+    fn quiet(meta: &NodeMeta, collection_is_flow: bool) -> NodeMeta {
+        let mut meta = meta.clone();
+        if collection_is_flow && meta.style == "flow" {
+            meta.comment = None;
+        }
+        meta
+    }
+    match tree {
+        CommentTree::Array(meta, items) => CommentTree::array(
+            quiet(&meta, !items.is_empty()),
+            items
+                .into_iter()
+                .map(without_flow_collection_comments)
+                .collect(),
+        ),
+        CommentTree::Object(meta, fields, keys) => {
+            let own = quiet(&meta, !fields.is_empty());
+            let fields: IndexMap<String, CommentTree> = (*fields)
+                .into_iter()
+                .map(|(key, child)| (key, without_flow_collection_comments(child)))
+                .collect();
+            CommentTree::Object(own.into(), Box::new(fields), keys)
+        }
+        other => other,
+    }
+}
+
+/// The comments above the first node of a document after the first file's belong to that node's head,
+/// whether or not a blank line follows them (yq sets only the first file's aside as a header, #4380).
+pub(super) fn header_to_first_key(value: &OwnedValue, tree: CommentTree) -> Option<CommentTree> {
+    let (CommentTree::Object(meta, fields, keys), OwnedValue::Object(_)) = (&tree, value) else {
+        // A header over a sequence or a scalar is its first node's head too, which is not modelled.
+        return tree.meta().head_comment().is_empty().then_some(tree);
+    };
+    // A block that a blank line separates from the node is the document's head comment, not the node's: not
+    // modelled, and told by the caller (`None`).
+    let head: Vec<String> = meta.head_comment().to_vec();
+    if head.iter().any(String::is_empty) {
+        return None;
+    }
+    if head.is_empty() {
+        return Some(tree);
+    }
+    let mut fields: IndexMap<String, CommentTree> = (**fields).clone();
+    let Some(first) = fields.values_mut().next() else {
+        return Some(tree);
+    };
+    let mut own_head = head;
+    own_head.extend(first.meta().head_comment().iter().cloned());
+    let first_meta = first
+        .meta()
+        .with_head_foot(own_head, first.meta().foot_comment().to_vec());
+    *first.meta_mut() = first_meta;
+    let own = meta.with_head_foot(Vec::new(), meta.foot_comment().to_vec());
+    Some(CommentTree::Object(
+        own.into(),
+        Box::new(fields),
+        keys.clone(),
+    ))
+}
+
+/// One document of an `--eval-all` run: the file it came from and what it holds, with its presentation.
+pub(super) struct EaDocument {
+    pub file: usize,
+    pub pair: ResultWithComments,
+}
+
+/// Whether `expr` has the shape of a merge idiom [`trace_eval_all_merge`] follows, which the caller asks
+/// before it reads the documents a second time.
+pub(super) fn merge_idiom(expr: &Expr) -> bool {
+    match expr {
+        Expr::Paren(inner) => merge_idiom(inner),
+        Expr::Pipe(parts) if parts.len() == 1 => merge_idiom(&parts[0]),
+        Expr::Arithmetic { left, right, .. } => merge_idiom(left) && merge_idiom(right),
+        Expr::Builtin(Builtin::Select(_)) | Expr::Reduce { .. } => true,
+        _ => false,
+    }
+}
+
+/// `--eval-all`'s merge idioms with the presentation of every document they merge (#4380): `. as $x
+/// ireduce (INIT; . * $x)` (also `+`, and the merge flags) and `select(fi == 0) * select(fi == 1)`,
+/// which merge documents the way `.a * .b` merges two nodes of one. The caller checks the value
+/// against the authoritative evaluation before it uses the tree, as it does for every replay here.
+pub(super) fn trace_eval_all_merge(expr: &Expr, docs: &[EaDocument]) -> Option<ResultWithComments> {
+    eval_all_pair(expr, docs, 0)
+}
+
+fn eval_all_pair(expr: &Expr, docs: &[EaDocument], depth: usize) -> Option<ResultWithComments> {
+    if depth >= MAX_VALUE_TREE_DEPTH {
+        return None;
+    }
+    match expr {
+        Expr::Paren(inner) => eval_all_pair(inner, docs, depth + 1),
+        Expr::Pipe(parts) if parts.len() == 1 => eval_all_pair(&parts[0], docs, depth + 1),
+        Expr::Arithmetic {
+            op, left, right, ..
+        } if matches!(op, ArithOp::Add | ArithOp::Mul(_)) && plain_op(op) => {
+            let l = eval_all_pair(left, docs, depth + 1)?;
+            let r = eval_all_pair(right, docs, depth + 1)?;
+            merge_pair(op, l, &r)
+        }
+        // The one document of file N.
+        Expr::Builtin(Builtin::Select(condition)) => {
+            let index = file_index_test(condition)?;
+            let mut of_file = docs.iter().filter(|doc| doc.file == index);
+            let only = of_file.next()?;
+            of_file.next().is_none().then(|| only.pair.clone())
+        }
+        Expr::Reduce {
+            input,
+            patterns,
+            init,
+            update,
+        } if matches!(**input, Expr::Identity) && is_closed_literal(init) => {
+            let [succinctly::jq::Pattern::Var(name)] = patterns.as_slice() else {
+                return None;
+            };
+            let Expr::Arithmetic {
+                op, left, right, ..
+            } = &**update
+            else {
+                return None;
+            };
+            if !matches!(op, ArithOp::Add | ArithOp::Mul(_))
+                || !plain_op(op)
+                || !matches!(**left, Expr::Identity)
+                || !matches!(&**right, Expr::Var(var) if var == name)
+            {
+                return None;
+            }
+            let mut acc = (evaluated(init, &OwnedValue::Null)?, CommentTree::empty());
+            for doc in docs {
+                acc = merge_pair(op, acc, &doc.pair)?;
+            }
+            Some(acc)
+        }
+        _ => None,
+    }
+}
+
+/// `left OP right` over two nodes: the value the evaluator gives, and the tree `merge_tree` makes.
+fn merge_pair(
+    op: &ArithOp,
+    left: ResultWithComments,
+    right: &ResultWithComments,
+) -> Option<ResultWithComments> {
+    let sum = Expr::arithmetic(
+        *op,
+        Expr::tracked_value(left.0.clone()),
+        Expr::tracked_value(right.0.clone()),
+    );
+    let result = evaluated(&sum, &OwnedValue::Null)?;
+    let tree = if left.0 == OwnedValue::Null {
+        // `null + x` is `x`, node and all.
+        right.1.clone()
+    } else if matches!(op, ArithOp::Mul(flags) if !flags.only_new) {
+        merged_root(
+            merge_tree(
+                &left,
+                right,
+                &result,
+                matches!(op, ArithOp::Mul(_)),
+                merge_flags(op),
+                1,
+            )?,
+            left.1.meta(),
+            right.1.meta(),
+        )
+    } else {
+        merge_tree(
+            &left,
+            right,
+            &result,
+            matches!(op, ArithOp::Mul(_)),
+            merge_flags(op),
+            1,
+        )?
+    };
+    Some((result, tree))
+}
+
+/// The `N` of a `fi == N` (or `file_index == N`) condition.
+fn file_index_test(condition: &Expr) -> Option<usize> {
+    let Expr::Compare {
+        op: succinctly::jq::CompareOp::Eq,
+        left,
+        right,
+    } = condition
+    else {
+        return None;
+    };
+    if !matches!(**left, Expr::Builtin(Builtin::FileIndex)) {
+        return None;
+    }
+    match &**right {
+        Expr::Literal(succinctly::jq::Literal::NumberLiteral(_, text)) => {
+            text.parse::<usize>().ok()
+        }
+        Expr::Literal(succinctly::jq::Literal::Int(n)) => usize::try_from(*n).ok(),
+        _ => None,
+    }
+}
+
 pub(super) fn trace(expr: &Expr, input: &ResultWithComments) -> Option<ResultWithComments> {
     trace_at_depth(expr, input, 0)
 }
@@ -1419,6 +1625,75 @@ fn omit_pair(keys: &Expr, input: &ResultWithComments) -> Option<ResultWithCommen
     }
 }
 
+/// yq's `UpdateAttributesFrom` on the comments of a node a `*` assigns onto (#4380): the head, foot
+/// and line comment of `right` replace those of `left` when it has them. A mapping entry's head and
+/// foot comments are its key's, so this is the key's attribute assignment too.
+fn assigned_comments(left: &NodeMeta, right: &NodeMeta) -> NodeMeta {
+    let head_from = if right.head_comment().is_empty() {
+        left
+    } else {
+        right
+    };
+    let foot = if right.foot_comment().is_empty() {
+        left.foot_comment().to_vec()
+    } else {
+        right.foot_comment().to_vec()
+    };
+    let mut meta = left.with_head_foot_of(head_from.head_comment().to_vec(), foot, head_from);
+    if right.comment.as_deref().is_some_and(|c| !c.is_empty()) {
+        meta.comment.clone_from(&right.comment);
+    }
+    meta
+}
+
+/// `tree` with the comments of its own node assigned from `right` over `left` (yq's
+/// `UpdateAttributesFrom`, #4380): its head, foot and line comment are the right node's where it has
+/// them and the left's where not.
+fn with_assigned_comments(mut tree: CommentTree, left: &NodeMeta, right: &NodeMeta) -> CommentTree {
+    let assigned = assigned_comments(left, right);
+    let meta = tree.meta().with_head_foot_of(
+        assigned.head_comment().to_vec(),
+        assigned.foot_comment().to_vec(),
+        &assigned,
+    );
+    let mut meta = meta;
+    meta.comment.clone_from(&assigned.comment);
+    *tree.meta_mut() = meta;
+    tree
+}
+
+/// What a scalar `*` assigns onto: the left node, its comments overridden by the right's, and the
+/// right's style where the left has none (yq: `if n.Style == 0 { n.Style = other.Style }`).
+fn assigned_scalar(left: &NodeMeta, right: &NodeMeta) -> NodeMeta {
+    let meta = assigned_comments(left, right);
+    if left.style.is_empty() && !right.style.is_empty() {
+        meta.with_style(right.style)
+    } else {
+        meta
+    }
+}
+
+/// yq's `getComments` (#4380): the merged document's head comment and leading block are the left
+/// one's when it has either, the right one's when not, and its foot comment likewise.
+fn merged_root(mut tree: CommentTree, left: &NodeMeta, right: &NodeMeta) -> CommentTree {
+    let head_from = if left.head_comment().is_empty() && left.preamble().is_none() {
+        right
+    } else {
+        left
+    };
+    let foot = if left.foot_comment().is_empty() {
+        right.foot_comment().to_vec()
+    } else {
+        left.foot_comment().to_vec()
+    };
+    let meta = tree
+        .meta()
+        .with_head_foot_of(head_from.head_comment().to_vec(), foot, head_from)
+        .with_preamble(head_from.preamble().map(str::to_string));
+    *tree.meta_mut() = meta;
+    tree
+}
+
 fn merge_tree(
     left: &ResultWithComments,
     right: &ResultWithComments,
@@ -1493,7 +1768,7 @@ fn merge_tree(
         if result == rv {
             let children = (0..r.len()).map(|i| rt.at_index(i).clone()).collect();
             return Some(CommentTree::array(
-                lt.meta().without_declared_anchor(),
+                assigned_comments(&lt.meta().without_declared_anchor(), rt.meta()),
                 children,
             ));
         }
@@ -1551,14 +1826,40 @@ fn merge_tree(
                     flags,
                     depth + 1,
                 )?,
+                // `+` of two mappings: the right value is the entry, under the left key's comments.
+                (Some(_), Some(_)) => {
+                    let mut child = rt.field(key).clone();
+                    let left = lt.field(key).meta();
+                    let meta = child.meta().with_head_foot_of(
+                        left.head_comment().to_vec(),
+                        left.foot_comment().to_vec(),
+                        left,
+                    );
+                    *child.meta_mut() = meta;
+                    child
+                }
                 (_, Some(_)) => rt.field(key).clone(),
                 (Some(_), None) => lt.field(key).clone(),
                 _ => return None,
             };
+            // A right value that replaces the left one, or a merge of the two, leaves the left key's
+            // head and foot comments and the value's line comment where the right ones are empty.
+            let child = if deep && !flags.only_new && lvalue.is_some() && rvalue.is_some() {
+                with_assigned_comments(child, lt.field(key).meta(), rt.field(key).meta())
+            } else {
+                child
+            };
             fields.insert(key.clone(), child);
             let key_tree = if lvalue.is_some() { lt } else { rt };
+            // The key's own line comment: the right one's replaces the left's in a `*`, and the left
+            // key stays in a `+`.
+            let key_comment = match (deep && !flags.only_new, lvalue.is_some()) {
+                (true, true) => rt.key_comment(key).or_else(|| lt.key_comment(key)),
+                (false, true) => lt.key_comment(key),
+                _ => key_tree.key_comment(key),
+            };
             if let Some(meta) = KeyMeta::with_shadows(
-                None,
+                key_comment.map(str::to_string),
                 false,
                 key_tree.key_style(key),
                 key_tree.key_anchor(key).map(str::to_string),
@@ -1572,15 +1873,20 @@ fn merge_tree(
                 keys.insert(key.clone(), meta);
             }
         }
-        Some(CommentTree::object(
-            lt.meta().without_declared_anchor(),
-            fields,
-            keys,
-        ))
+        let own = if deep && !flags.only_new {
+            assigned_comments(&lt.meta().without_declared_anchor(), rt.meta())
+        } else {
+            lt.meta().without_declared_anchor()
+        };
+        Some(CommentTree::object(own, fields, keys))
     } else if !matches!(lv, OwnedValue::Array(_) | OwnedValue::Object(_))
         && !matches!(rv, OwnedValue::Array(_) | OwnedValue::Object(_))
     {
-        Some(CommentTree::leaf(lt.meta().clone()))
+        Some(CommentTree::leaf(if flags.only_new {
+            lt.meta().clone()
+        } else {
+            assigned_scalar(lt.meta(), rt.meta())
+        }))
     } else if flags.only_new && *lv != OwnedValue::Null {
         // `*n` (#6900): a left value that is there stays, whatever the right one is.
         Some(lt.clone())

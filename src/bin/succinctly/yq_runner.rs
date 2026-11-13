@@ -2143,6 +2143,82 @@ fn eval_all_documents(
     Ok(all_docs)
 }
 
+/// Whether the comments at the start of `bytes` are separated from the first node by a blank line,
+/// which makes them the document's head comment and not that node's.
+fn header_is_detached(bytes: &[u8]) -> bool {
+    let mut seen_comment = false;
+    for line in bytes.split(|b| *b == b'\n') {
+        let trimmed = line
+            .iter()
+            .position(|b| !matches!(b, b' ' | b'\t' | b'\r'))
+            .map(|start| &line[start..]);
+        match trimmed {
+            None if seen_comment => return true,
+            None => {}
+            Some([b'#', ..]) => seen_comment = true,
+            Some(_) => return false,
+        }
+    }
+    false
+}
+
+/// Every document of the YAML sources of an `--eval-all` run with its presentation, in the order
+/// [`eval_all_documents`] lists them (#4380), or `None` when a source is not YAML or does not read.
+fn eval_all_documents_with_trees(
+    input_sources: &[GatheredSource],
+    input_files: &[String],
+    input_format: InputFormat,
+) -> Option<Vec<reshape_presentation::EaDocument>> {
+    let source_file_indices = gathered_file_indices(
+        input_files,
+        resolve_run_input_format(input_format, input_files),
+    );
+    let mut out = Vec::new();
+    for (source_idx, (bytes, format, _, after_bom)) in input_sources.iter().enumerate() {
+        if *format != InputFormat::Yaml {
+            return None;
+        }
+        let file = source_file_indices
+            .get(source_idx)
+            .copied()
+            .unwrap_or(source_idx);
+        // An anchor or an alias is not followed through a merge here (a byte scan: an `&` or `*` in a
+        // string or a comment also keeps the old output).
+        if bytes.contains(&b'&') || bytes.contains(&b'*') {
+            return None;
+        }
+        // yq sets the comments above the first node aside as a header for the first file only: in a later
+        // one they are that node's head comment, as after a byte-order mark. A later file's header that
+        // a blank line detaches is its document's head comment, which is not modelled.
+        if source_idx > 0 && header_is_detached(bytes) {
+            return None;
+        }
+        let mut index = build_yq_source(bytes, *after_bom || source_idx > 0).ok()?;
+        index.render_merges_through_aliases_only();
+        note_synthesized_empty(&mut index);
+        let root = index.root(bytes);
+        let YamlValue::Sequence(mut docs) = root.value() else {
+            return None;
+        };
+        // One document to a source: a later document's header is not modelled.
+        let mut first_in_source = true;
+        while let Some((cursor, rest)) = docs.uncons_cursor() {
+            if !first_in_source {
+                return None;
+            }
+            first_in_source = false;
+            let mut pair =
+                to_owned_with_comments::<_, YqSemantics>(&cursor.value(), Some(&cursor)).ok()?;
+            if source_idx > 0 {
+                pair.1 = reshape_presentation::header_to_first_key(&pair.0, pair.1)?;
+            }
+            out.push(reshape_presentation::EaDocument { file, pair });
+            docs = rest;
+        }
+    }
+    Some(out)
+}
+
 /// Applies `--front-matter`, if set, to raw input bytes before format
 /// resolution and validation: the raw bytes (e.g. Markdown) aren't valid
 /// standalone YAML, so extraction must happen first. Returns
@@ -14249,6 +14325,24 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             }
         };
 
+        // #4380: a merge of the documents (`. as $x ireduce ({}; . * $x)`) keeps what each document
+        // says about its nodes; the replay is used when it gives the value the evaluator gave.
+        let merged_tree = (results.len() == 1 && args.document.is_none() && !args.null_input)
+            .then_some(())
+            .filter(|()| reshape_presentation::merge_idiom(&program.expr))
+            .and_then(|()| {
+                eval_all_documents_with_trees(&input_sources, &input_files, args.input_format)
+            })
+            .and_then(|docs| reshape_presentation::trace_eval_all_merge(&program.expr, &docs))
+            .filter(|(value, _)| *value == results[0])
+            // The comments only: a merge keeps the left node's style and takes the right's in places that
+            // are not modelled here, and the printer without a tree was block style throughout.
+            .map(|(value, tree)| {
+                strip_presentation_style(
+                    &value,
+                    &reshape_presentation::without_flow_collection_comments(tree),
+                )
+            });
         let mut split_doc_state = SplitDocState::new(has_split_doc);
         for (i, result) in results.iter().enumerate() {
             let wants_doc_separator = !has_split_doc
@@ -14292,7 +14386,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             output_value(
                 &mut writer,
                 result,
-                &CommentTree::empty(),
+                merged_tree.as_ref().unwrap_or(&CommentTree::empty()),
                 &output_config,
                 separator,
             )?;
