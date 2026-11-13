@@ -6368,9 +6368,11 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             // #6531: whether the loop stopped before its last document (`-R`'s pending open failures
             // are then not reached).
             let mut ended_early = false;
-            // Nothing is pending on the common run, which pays nothing per line for it.
-            let pending_failures =
-                PENDING_OPEN_FAILURES.with(|pending| !pending.borrow().is_empty());
+            // Nothing is pending on the common run, which pays nothing per line for it. #7024: a
+            // long list of files `-R` opens as it reaches them has failures only the run finds.
+            let pending_failures = PENDING_OPEN_FAILURES
+                .with(|pending| !pending.borrow().is_empty())
+                || RAW_OPEN_FAILURES_POSSIBLE.with(std::cell::Cell::get);
             'documents: for (document, location, source) in documents {
                 // #6531: a file that did not open is reported when the line read from past it is
                 // reached, before that line.
@@ -6979,6 +6981,7 @@ fn read_inputs(
     LAZY_STREAM_INPUTS.with(|slot| *slot.borrow_mut() = None);
     LAZY_SEQ_INPUTS.with(|slot| *slot.borrow_mut() = None);
     defer_open_failures(Vec::new(), false);
+    RAW_OPEN_FAILURES_POSSIBLE.with(|possible| possible.set(false));
     LAZY_OPEN_FAILED.with(|seen| seen.set(false));
     SLURP_DIRECTORY_READ.with(|slurp| slurp.set(false));
     LAST_DIRECTORY_READ.with(|read| read.set(false));
@@ -7079,7 +7082,7 @@ fn read_inputs(
             .unwrap_or_default();
         let mut texts = vec![(0, first)];
         texts.extend((1..windows.len()).map(|at| {
-            let tag = u32::try_from(at).expect("at most MAX_WINDOWED_FILES sources");
+            let tag = u32::try_from(at).expect("a source for each file named");
             (tag, String::new())
         }));
         opened.clone_from(&files);
@@ -9912,6 +9915,9 @@ thread_local! {
     /// all by a program that stops reading earlier.
     static PENDING_OPEN_FAILURES: RefCell<std::collections::VecDeque<(usize, InputFileOpenError)>> =
         const { RefCell::new(std::collections::VecDeque::new()) };
+    /// Whether the read hook is installed for failures found as the run goes (#7024): `-R` over a long
+    /// list of files opens each when it reaches it, so none is pending when the queue is seeded.
+    static RAW_OPEN_FAILURES_POSSIBLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Whether a pending failure was reported by a read, which makes the run exit 2 (#6475).
     static LAZY_OPEN_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Whether the pending failure is a directory last in a slurp that reads `input` (#6604): the
@@ -10708,7 +10714,9 @@ fn source_ends_cleanly(bytes: &[u8], args: &JqCommand) -> bool {
 /// Has the `input` queue report the failures [`defer_open_failures`] left, as its reads reach them
 /// (#6475). After the seed, which clears the hook.
 fn install_open_failure_hook() {
-    if PENDING_OPEN_FAILURES.with(|pending| !pending.borrow().is_empty()) {
+    if PENDING_OPEN_FAILURES.with(|pending| !pending.borrow().is_empty())
+        || RAW_OPEN_FAILURES_POSSIBLE.with(std::cell::Cell::get)
+    {
         jq::set_input_read_hook(|read, fault| {
             REPORTED_BY_READ
                 .with(|by_read| by_read.set(!MAIN_LOOP_READ.with(std::cell::Cell::get)));
@@ -11384,21 +11392,50 @@ type RawWindowed = (Box<dyn Read>, Option<u64>, Vec<u8>);
 
 /// The sources `-R` reads a window at a time, one for each file in order, or `None` for a run that reads
 /// its input whole: [`raw_windowed_source`]'s one, or several regular files named on the command line,
-/// 4 MiB or more between them and up to [`MAX_WINDOWED_FILES`] (#7024), judged as the plain route judges
-/// them. Each file's lines are decoded on their own, a line jq's reader runs on into the next file
-/// included, as jq decodes them.
+/// 4 MiB or more between them, judged as the plain route judges them (#7024). Up to
+/// [`MAX_WINDOWED_FILES`] are held open from the start; a longer list is opened to be judged, closed,
+/// and opened again when the run reaches each file ([`window::OpenWhenRead`]), as jq opens them. Each
+/// file's lines are decoded on their own, a line jq's reader runs on into the next file included, as jq
+/// decodes them.
 fn raw_windowed_sources(args: &JqCommand, files: &[PathBuf]) -> Option<Vec<RawWindowed>> {
     if files.len() < 2 {
         return raw_windowed_source(args, files).map(|source| vec![source]);
     }
-    if !raw_window_flags(args) || files.len() > MAX_WINDOWED_FILES {
+    if !raw_window_flags(args) {
         return None;
     }
     let mut sources: Vec<RawWindowed> = Vec::with_capacity(files.len());
+    if files.len() > MAX_WINDOWED_FILES {
+        // Each file is closed once judged, so the descriptors held stay a few.
+        judge_regular_files(files, raw_window_min_bytes(), |_, _, _| ())?;
+        sources.extend(files.iter().enumerate().map(|(at, path)| {
+            let reader = window::OpenWhenRead::new(path.clone(), at, at + 1 == files.len());
+            let source: RawWindowed = (Box::new(reader), None, Vec::new());
+            source
+        }));
+        // A file that will not open when the run reaches it is found by a read, which the hook
+        // reports as the reads of the whole-file route's queue do ([`note_raw_open_failure`]).
+        RAW_OPEN_FAILURES_POSSIBLE.with(|possible| possible.set(true));
+        return Some(sources);
+    }
     judge_regular_files(files, raw_window_min_bytes(), |_, file, meta| {
         sources.push((Box::new(file), Some(meta.len()), Vec::new()));
     })?;
     Some(sources)
+}
+
+/// A file of a long list that `-R` reads (#7024) did not open when the run reached it
+/// ([`window::OpenWhenRead`]): jq's reader meets it as it moves on from the file before it, reports it
+/// and exits 2, and its main loop reads no further after the next value. That is what the whole-file
+/// route's failures do, which are known before the run starts and wait in [`PENDING_OPEN_FAILURES`] for
+/// the reads to reach them; this one is found as the run goes, and joins them, `at` files in.
+fn note_raw_open_failure(path: &Path, at: usize, error: &std::io::Error, last: bool) {
+    PENDING_OPEN_FAILURES.with(|pending| {
+        pending
+            .borrow_mut()
+            .push_back((at, InputFileOpenError::from_io(path, error, last)));
+    });
+    note_open_failure_at(at);
 }
 
 /// The source `-R` reads a window at a time (#7023), or `None` for a run that reads its input whole: the
@@ -21082,10 +21119,24 @@ mod tests {
             sources(&with_tinies(MAX_WINDOWED_FILES - 2)),
             Some(MAX_WINDOWED_FILES)
         );
+        // More than it holds open: each is opened when the run reaches it, and judged as before.
         assert_eq!(
             sources(&with_tinies(MAX_WINDOWED_FILES - 1)),
+            Some(MAX_WINDOWED_FILES + 1)
+        );
+        let mut long = with_tinies(MAX_WINDOWED_FILES + 8);
+        assert_eq!(sources(&long), Some(MAX_WINDOWED_FILES + 10));
+        for shape in [&directory, &missing, "-", "/dev/stdin"] {
+            long.push(shape);
+            assert_eq!(sources(&long), None, "a long list with {shape}");
+            long.pop();
+        }
+        let mut under = vec!["jq", "-R", ".", tiny.as_str()];
+        under.extend(std::iter::repeat_n(tiny.as_str(), MAX_WINDOWED_FILES + 8));
+        assert_eq!(
+            sources(&under),
             None,
-            "more than it holds open"
+            "a long list under 4 MiB between them"
         );
         for flags in [&["-s"][..], &["--validate"], &["--stream"], &["--seq"]] {
             let mut argv = vec!["jq", "-R"];

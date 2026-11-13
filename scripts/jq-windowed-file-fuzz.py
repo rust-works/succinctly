@@ -13,7 +13,9 @@ shows in the `(at <file N>:LINE)` of a runtime error. `--pipe` feeds each stream
 instead, which is windowed too (#7024) and words its first fault as it reads, against the same pipe
 named `/dev/stdin`, which is read whole. `--raw` runs `-R` programs over the same streams read as lines
 (#7024): with `--pipe` on a pipe, and without it as a regular file on standard input (`jq -R . < file`),
-at offset 0 or at a random one, each against the bytes from there on a pipe named `/dev/stdin`. A stream of
+at offset 0 or at a random one, each against the bytes from there on a pipe named `/dev/stdin`; with
+`--files K` the stream is cut into K files, as for the plain filter, against the same files as descriptors
+(for K past 32 each file is opened as the run reaches it). A stream of
 lines has no fault, so these cases test where windows cut lines: invalid UTF-8, NULs, a lone CR, a BOM,
 very long lines and no final line break. (The seeds of #7048's runs do not reproduce: the generator
 now cuts the stream into files and picks among more programs.)
@@ -87,6 +89,15 @@ RAW_PROGRAMS = [
     ["-rR", 'select(test("id\\":[0-9]*7[,}]"))'],
     ["-R", "-e", 'select(startswith("{\\"id\\":12345,"))'],
     ["-R", 'if length % 997 == 0 then error("e") else empty end'],
+]
+
+# `-R` over several files (#7024): which file a line was read in, and the line a runtime error names, are part of
+# the answer, and a line cut by a file's end runs on into the next file.
+RAW_FILE_PROGRAMS = [
+    ["-R", "[input_filename, .]"],
+    ["-R", "-c", "[input_filename, input_line_number, length]"],
+    ["-R", 'if length % 997 == 0 then error("e") else empty end'],
+    ["-R", "-r", "input_filename"],
 ]
 
 MUTATIONS = [
@@ -311,8 +322,8 @@ def main():
     parser.add_argument("--raw", action="store_true",
                         help="run -R programs (#7024): on a pipe with --pipe, else as a regular file on standard input")
     args = parser.parse_args()
-    if args.raw and args.files != 1:
-        sys.exit("--raw is one stream on standard input: give no --files")
+    if args.raw and args.pipe and args.files != 1:
+        sys.exit("--raw --pipe is one stream on standard input: give no --files")
     if args.pipe and args.files != 1:
         sys.exit("--pipe is one stream: give no --files")
     if not 1 <= args.files <= 512:
@@ -329,11 +340,11 @@ def main():
             sys.exit("generator bug: case %d is %d bytes, under the windowed route's minimum" % (case, len(data)))
         # A pipe has no file name, and `/dev/stdin` has one: `input_filename` would tell them apart.
         if args.raw:
-            program = rng.choice(RAW_PROGRAMS)
+            program = rng.choice(RAW_PROGRAMS + (RAW_FILE_PROGRAMS * 2 if args.files > 1 else []))
         else:
             program = rng.choice(PROGRAMS if args.pipe else PROGRAMS + FILE_PROGRAMS * 2)
         try:
-            if args.raw and not args.pipe:
+            if args.raw and not args.pipe and args.files == 1:
                 windowed, whole, names, sizes = run_stdin_file(args, rng, data, program, work, args.seed)
             elif args.pipe:
                 windowed, whole, names, sizes = run_pipe(args, data, program)
@@ -352,7 +363,7 @@ def main():
             differences += 1
             kept = [os.path.join(work, "windowed-fuzz-%d-%d-%d.json" % (args.seed, case, n))
                     for n in range(len(names))]
-            if args.pipe or args.raw:
+            if args.pipe or (args.raw and args.files == 1):
                 with open(kept[0], "wb") as handle:
                     handle.write(data)
             else:

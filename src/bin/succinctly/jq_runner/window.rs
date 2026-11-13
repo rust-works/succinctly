@@ -1242,6 +1242,68 @@ impl FileIdentity {
     }
 }
 
+/// The file `path` names now, opened, with its metadata. A directory opens on Unix and fails at its first
+/// read, so it fails here, as `EISDIR`.
+fn open_not_a_directory(path: &std::path::Path) -> io::Result<(File, std::fs::Metadata)> {
+    let file = File::open(path)?;
+    let meta = file.metadata()?;
+    if meta.is_dir() {
+        return Err(io::Error::from_raw_os_error(super::EISDIR));
+    }
+    Ok((file, meta))
+}
+
+/// A file of a long list that `-R` reads (#7024), opened by its path when the run first reads it and
+/// closed when the reader is dropped, so a list of any length holds one descriptor, where a short one
+/// holds each file open from the start. The file is judged before the run starts and closed again
+/// ([`super::judge_regular_files`]); the run then reads what the path names when it gets there, as jq,
+/// which opens each file as it reaches it, does. A path that will not open then (or names a directory)
+/// is read as an empty file and its failure handed to [`super::note_raw_open_failure`], so the tail of
+/// the file before it continues in the file after it, as in jq and in the whole-file route, which drops
+/// such a file from the stream.
+pub(super) struct OpenWhenRead {
+    path: PathBuf,
+    /// The file's position among the files named, which its lines are tagged with.
+    at: usize,
+    /// Whether it is the last of them: jq's reader does not report a directory there (#6472).
+    last: bool,
+    file: Option<File>,
+    /// The file did not open: it reads as no bytes.
+    failed: bool,
+}
+
+impl OpenWhenRead {
+    pub(super) fn new(path: PathBuf, at: usize, last: bool) -> Self {
+        Self {
+            path,
+            at,
+            last,
+            file: None,
+            failed: false,
+        }
+    }
+}
+
+impl Read for OpenWhenRead {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.failed {
+            return Ok(0);
+        }
+        let file = match self.file.as_mut() {
+            Some(file) => file,
+            None => match open_not_a_directory(&self.path) {
+                Ok((file, _)) => self.file.insert(file),
+                Err(error) => {
+                    self.failed = true;
+                    super::note_raw_open_failure(&self.path, self.at, &error, self.last);
+                    return Ok(0);
+                }
+            },
+        };
+        file.read(buf)
+    }
+}
+
 #[cfg_attr(not(unix), allow(dead_code))]
 impl NamedFile {
     pub(super) fn new(path: PathBuf) -> Self {
@@ -1254,14 +1316,7 @@ impl NamedFile {
     /// The file the path names now, opened for the run, and how much of it the run reads; the error
     /// when there is none. A directory opens on Unix and fails at its first read, so it fails here.
     fn open_for_run(&self) -> io::Result<(File, u64)> {
-        let opened = File::open(&self.path).and_then(|file| {
-            let meta = file.metadata()?;
-            if meta.is_dir() {
-                return Err(io::Error::from_raw_os_error(super::EISDIR));
-            }
-            Ok((file, meta))
-        });
-        match opened {
+        match open_not_a_directory(&self.path) {
             Ok((file, meta)) => {
                 self.reach
                     .set(Reach::Opened(FileIdentity::of(&meta), meta.len()));
