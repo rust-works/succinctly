@@ -2544,6 +2544,18 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         }
                     }
                 }
+                // #7141: an integer go-yaml types `!!int` that does not fit `i64` is yq's encoding
+                // failure. Checked on the source bytes first (a plain scalar of 18 bytes or more that
+                // opens with a digit, 18 for `0x8000000000000000`), ahead of the direct transcoding, which writes a `0x` spelling
+                // as the string it is here.
+                if matches!(s, YamlString::Unquoted { .. }) && !self.index.canonicalize_numbers() {
+                    let raw = s.raw_bytes();
+                    if raw.len() >= 18 && raw[0].is_ascii_digit() {
+                        if let Ok(text) = s.as_str() {
+                            reject_int_past_i64(&text)?;
+                        }
+                    }
+                }
                 // Direct transcoding optimization
                 // #1615: a scalar that will not decode raises here rather
                 // than degrading to a silent `null`, matching what every
@@ -2566,6 +2578,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 let canonicalize = self.index.canonicalize_numbers();
                                 let resolved = resolve_plain_sourced(&str_val, canonicalize);
                                 reject_non_finite_json_scalar(resolved, &str_val)?;
+
                                 Ok(stream_resolved_scalar_as_json(
                                     out,
                                     resolved,
@@ -4973,6 +4986,9 @@ const UNSUPPORTED_VALUE_FAILURE: &str = "json: unsupported value: ";
 /// The start of the failure itself, before the scalar's text.
 const PARSE_FLOAT_FAILURE: &str = "strconv.ParseFloat: parsing ";
 
+/// The start of the failure for an integer past `i64` (#7141).
+const PARSE_INT_FAILURE: &str = "strconv.ParseInt: parsing ";
+
 /// The failure real yq raises for a document `.inf`/`.nan` scalar written as JSON (#6867): its
 /// encoder parses the scalar's own text as a float and fails (`strconv.ParseFloat: parsing
 /// ".inf": invalid syntax`, v4.53.3). The streaming writers used to print `null`, which hid it.
@@ -4990,6 +5006,75 @@ fn reject_non_finite_json_scalar(
             ))))
         }
         _ => Ok(()),
+    }
+}
+
+/// The failure yq's JSON encoder raises for a plain scalar go-yaml types `!!int` that does not fit a
+/// signed 64-bit integer (#7141), or `None` for any other text.
+///
+/// go-yaml resolves an unsigned integer it can read with `ParseUint` (base 0: `0x`, `0o`, `0b`, a
+/// leading `0` for octal, any `_` dropped) as `!!int` up to 2^64 - 1, and yq's JSON encoder then calls
+/// `ParseInt` on the node's text, which refuses 2^63 and above (`strconv.ParseInt: parsing
+/// "9223372036854775808": value out of range`; the text is the digits alone for `0x` and `0o`, and a
+/// binary one, or `0O` in capitals, is `invalid syntax` with the prefix kept). A sign makes it a float and 2^64 and above too,
+/// which print as numbers.
+///
+/// The first byte and the length rule out almost every scalar before anything is parsed.
+#[cold]
+#[inline(never)]
+fn int_past_i64_failure(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    if bytes.len() < 18 || !bytes[0].is_ascii_digit() {
+        return None;
+    }
+    let plain: alloc::string::String = text.chars().filter(|&c| c != '_').collect();
+    let lower = plain.to_ascii_lowercase();
+    // `shown` is the text as Go reports it, in the case it was written in.
+    let (radix, digits, shown): (u32, &str, &str) = if let Some(rest) = lower.strip_prefix("0x") {
+        (16, rest, &plain[2..])
+    } else if let Some(rest) = lower.strip_prefix("0o") {
+        // yq strips a lower-case `0o` only: `0O17` reaches `ParseInt` whole, which refuses it.
+        let shown = if plain.starts_with("0O") {
+            plain.as_str()
+        } else {
+            &plain[2..]
+        };
+        (8, rest, shown)
+    } else if let Some(rest) = lower.strip_prefix("0b") {
+        (2, rest, plain.as_str())
+    } else if let Some(rest) = lower.strip_prefix('0') {
+        (8, rest, plain.as_str())
+    } else {
+        (10, lower.as_str(), plain.as_str())
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let mut value: u128 = 0;
+    for c in digits.chars() {
+        let digit = c.to_digit(radix)?;
+        value = value * u128::from(radix) + u128::from(digit);
+        if value > u128::from(u64::MAX) {
+            return None;
+        }
+    }
+    if value <= i64::MAX as u128 {
+        return None;
+    }
+    let quoted = crate::jq::go_quote_bytes(shown.as_bytes());
+    Some(if radix == 2 || plain.starts_with("0O") {
+        alloc::format!("{PARSE_INT_FAILURE}{quoted}: invalid syntax")
+    } else {
+        alloc::format!("{PARSE_INT_FAILURE}{quoted}: value out of range")
+    })
+}
+
+/// [`int_past_i64_failure`] as the writer's failure.
+#[inline]
+fn reject_int_past_i64(text: &str) -> Result<(), StreamFailure> {
+    match int_past_i64_failure(text) {
+        Some(message) => Err(StreamFailure::Decode(EvalError::decode_failure(message))),
+        None => Ok(()),
     }
 }
 
@@ -5095,6 +5180,7 @@ fn wrap_non_finite_marshal_failure(failure: StreamFailure) -> StreamFailure {
         StreamFailure::Decode(e)
             if e.message.starts_with(MARSHAL_FAILURE_WRAP)
                 || e.message.starts_with(PARSE_FLOAT_FAILURE)
+                || e.message.starts_with(PARSE_INT_FAILURE)
                 || e.message.starts_with(UNSUPPORTED_VALUE_FAILURE) =>
         {
             StreamFailure::Decode(EvalError::decode_failure(format!(

@@ -7726,6 +7726,17 @@ The difference that remains is on the streamed route, where `-o=json` copies a d
 The results before the failing one are whole in both, and the run stops there, as it does for any other decode failure on a streamed route (#1615).
 The route that evaluates a result first (a computed number, `-P`) writes nothing of it, as yq does.
 Buffering each streamed result to match would give up the constant-memory write that route exists for, the same trade as the decode failures above.
+
+### `-o=json` of an integer in [2^63, 2^64) fails as yq's encoder does; the rest of the integer is a residual ([#7141](https://github.com/rust-works/succinctly/issues/7141))
+
+go-yaml types an unsigned integer it reads with `ParseUint` (base 0: decimal, `_` separators, `0x`, `0o`, `0b`, a leading `0` for octal) as `!!int` up to 2^64 - 1, and yq's JSON encoder then calls `ParseInt` on its text, which refuses 2^63 and above.
+`-o=json` of such a scalar read from a YAML document is `strconv.ParseInt: parsing "9223372036854775808": value out of range` in both tools, with the digits alone for `0x` and `0o`, `invalid syntax` with the prefix kept for `0b` and a capital `0O`, and the same wrap per node as above (`tests/yq_cli/i7141.rs`, 52 error rows and 24 others captured from yq v4.53.3).
+It printed a rounded float (`9223372036854776000.0`) for the decimal and a string for `0x`, `0o` and `0b`.
+A sign (`+9223372036854775808` is a float), 2^64 and above, JSON input, and every other output format are unchanged, as in yq, and the part of the result before the failing scalar is written first, as in the section above.
+These still differ:
+- `tag` and `type` of such a scalar are `!!int` in yq and `!!float` (decimal) or `!!str` (`0x`, `0o`, `0b`) here, since a value past `i64` has no integer representation;
+- arithmetic, comparison, `sort`, `to_json`, `@json` and `@base64` on it fail in yq (`.a + 1`, `.a < 1`, `.a | @json`: the same `ParseInt` error) and read a float or concatenate text here (`0x8000000000000000 + 1` is `0x80000000000000001`);
+- a value the filter builds from it (`[.a]`, `{"k": .a}`) and every route that evaluates on owned values (`--eval-all`, `--slurp`) print the rounded float as before.
 The exit code and the error line are identical either way, so a caller that checks the status sees the failure, and it is pinned by `tests/yq_cli/i6867.rs`.
 `to_json`, `to_json(N)`, `tojson` and `@json` fail the same way ([#6887](https://github.com/rust-works/succinctly/issues/6887)).
 They raise the marshal error with the wrap count of the value they are given: `.a | to_json` over `a: .inf` has one wrap, `[.a] | to_json` two, `[1 / 0] | @json` two.
