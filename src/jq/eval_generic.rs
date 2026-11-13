@@ -54,6 +54,7 @@ use super::document::{
     DocumentCursor, DocumentElements, DocumentFields, DocumentValue, IndentSpec, JsonConvention,
     LazyKeyLedger,
 };
+use super::encoder_comments::{EncoderComments, EncoderEntry, EncoderMembers, EncoderNodeComments};
 use super::error::EvalEscape;
 use super::eval::LoopAbort;
 use super::eval::{
@@ -93,16 +94,19 @@ use super::eval::{
     RangeNum, Reentry, RestPipe, RestTail, RootWitness, SliceTargetKind, StashedEscape,
     StashedVerdict, YqSemantics, DEFERRED_BIND_UNRESOLVED, MAX_RANGE_TOTAL,
 };
-use super::eval::{format_yq_props_commented, format_yq_xml_commented, yq_props_format_style};
+use super::eval::{
+    format_yq_commented, format_yq_props_commented, yq_encoder_writes_comments,
+    yq_props_format_style,
+};
 use super::eval::{owned_slot_mut, static_path_steps, StepKey};
 #[cfg(test)]
 use super::expr::FuncDefBound;
+use super::expr::YqOutputEncoder;
 use super::expr::{
     ArithOp, ArithSettleMemo, AssignOp, BindOrigin, BoundBody, Builtin, CompareOp, Expr,
     FormatType, FuncDefData, Literal, NumberKey, ObjectEntry, ObjectKey, Pattern, PipeStages,
     StringPart,
 };
-use super::expr::{XmlOptions, YqOutputEncoder};
 use super::path_mode::Route;
 use super::slice::{
     fold_bounds, literal_component_from_values, slice_str, SliceBound, SliceBounds,
@@ -114,7 +118,6 @@ use super::tail_call::{
 use super::value::{
     owned_value_eq, subarray_indices, NumberRepr, ObjectMapOf, OwnedValue, Teardown,
 };
-use super::yq_xml::{XmlComments, XmlEntry, XmlMembers, XmlNodeComments};
 
 /// Recursion-depth ceiling for [`to_owned`]/[`to_owned_cursor`]/
 /// [`to_owned_with_comments`] (#998).
@@ -6311,10 +6314,10 @@ fn collect_props_comments<C: DocumentCursor>(
     }
 }
 
-/// The comments of one node as yq's XML encoder reads them (#7117): `#` and all, a block's lines
-/// joined with a line break, the head as [`DocumentCursor::head_comment_yq_raw`] carries it.
-fn xml_node_comments<C: DocumentCursor>(node: &C) -> XmlNodeComments {
-    XmlNodeComments {
+/// The comments of one node as yq's encoders read them (#7117): `#` and all, a block's lines joined
+/// with a line break, the head as [`DocumentCursor::head_comment_yq_raw`] carries it.
+fn encoder_node_comments<C: DocumentCursor>(node: &C) -> EncoderNodeComments {
+    EncoderNodeComments {
         head: node.head_comment_yq_raw().join("\n"),
         line: node.line_comment_raw().unwrap_or_default(),
         foot: node.foot_comment_raw().join("\n"),
@@ -6322,9 +6325,9 @@ fn xml_node_comments<C: DocumentCursor>(node: &C) -> XmlNodeComments {
 }
 
 /// The comments of the node at `cursor` and of everything below it, in the shape of its value, for
-/// [`format_yq_xml_commented`]: a mapping entry has its key's comments and its value's tree, a sequence
-/// item its own.
-fn collect_xml_comments<C: DocumentCursor>(cursor: &C, depth: usize) -> XmlComments {
+/// the encoders that write comments (`format_yq_commented`): a mapping entry has its key's comments and
+/// its value's tree, a sequence item its own.
+fn collect_encoder_comments<C: DocumentCursor>(cursor: &C, depth: usize) -> EncoderComments {
     super::value::assert_value_tree_depth(depth);
     let value = cursor.value();
     let members = if let Some(mut fields) = value.as_object() {
@@ -6334,25 +6337,25 @@ fn collect_xml_comments<C: DocumentCursor>(cursor: &C, depth: usize) -> XmlComme
             let Some(key) = field.key_str() else {
                 continue;
             };
-            entries.push(XmlEntry {
+            entries.push(EncoderEntry {
                 key: key.into_owned(),
-                key_comments: xml_node_comments(&field.key_cursor),
-                value: collect_xml_comments(&field.value_cursor, depth + 1),
+                key_comments: encoder_node_comments(&field.key_cursor),
+                value: collect_encoder_comments(&field.value_cursor, depth + 1),
             });
         }
-        XmlMembers::Map(entries)
+        EncoderMembers::Map(entries)
     } else if let Some(mut elements) = value.as_array() {
         let mut items = Vec::new();
         while let Some((element, rest)) = elements.uncons_cursor() {
             elements = rest;
-            items.push(collect_xml_comments(&element, depth + 1));
+            items.push(collect_encoder_comments(&element, depth + 1));
         }
-        XmlMembers::Seq(items)
+        EncoderMembers::Seq(items)
     } else {
-        XmlMembers::None
+        EncoderMembers::None
     };
-    XmlComments {
-        own: xml_node_comments(cursor),
+    EncoderComments {
+        own: encoder_node_comments(cursor),
         members,
     }
 }
@@ -6362,29 +6365,33 @@ fn tree_comment_block(lines: &[String]) -> String {
     lines.join("\n")
 }
 
-/// [`collect_xml_comments`] for a result the DOM route holds (a write, a built value): the comments of
+/// [`collect_encoder_comments`] for a result the DOM route holds (a write, a built value): the comments of
 /// `tree`, the presentation tree that goes with `value`, in the shape of the value (#7156). A mapping
 /// entry's head and foot lines are its key's, its trailing comment the value's and the comment on a
 /// key whose value follows on the next line the key's; a sequence item has its own.
-fn xml_comments_of_tree(value: &OwnedValue, tree: &CommentTree, depth: usize) -> XmlComments {
+fn encoder_comments_of_tree(
+    value: &OwnedValue,
+    tree: &CommentTree,
+    depth: usize,
+) -> EncoderComments {
     super::value::assert_value_tree_depth(depth);
     let meta = tree.meta();
     let members = match value {
-        OwnedValue::Object(entries) => XmlMembers::Map(
+        OwnedValue::Object(entries) => EncoderMembers::Map(
             entries
                 .iter()
                 .map(|(key, entry)| {
                     let child = tree.field(key);
                     let child_meta = child.meta();
-                    let mut value = xml_comments_of_tree(entry, child, depth + 1);
-                    value.own = XmlNodeComments {
+                    let mut value = encoder_comments_of_tree(entry, child, depth + 1);
+                    value.own = EncoderNodeComments {
                         head: String::new(),
                         line: child_meta.comment.clone().unwrap_or_default(),
                         foot: String::new(),
                     };
-                    XmlEntry {
+                    EncoderEntry {
                         key: key.clone(),
-                        key_comments: XmlNodeComments {
+                        key_comments: EncoderNodeComments {
                             head: tree_comment_block(child_meta.head_comment()),
                             line: tree.key_comment(key).unwrap_or_default().to_string(),
                             foot: tree_comment_block(child_meta.foot_comment()),
@@ -6394,17 +6401,19 @@ fn xml_comments_of_tree(value: &OwnedValue, tree: &CommentTree, depth: usize) ->
                 })
                 .collect(),
         ),
-        OwnedValue::Array(items) => XmlMembers::Seq(
+        OwnedValue::Array(items) => EncoderMembers::Seq(
             items
                 .iter()
                 .enumerate()
-                .map(|(index, item)| xml_comments_of_tree(item, tree.at_index(index), depth + 1))
+                .map(|(index, item)| {
+                    encoder_comments_of_tree(item, tree.at_index(index), depth + 1)
+                })
                 .collect(),
         ),
-        _ => XmlMembers::None,
+        _ => EncoderMembers::None,
     };
-    XmlComments {
-        own: XmlNodeComments {
+    EncoderComments {
+        own: EncoderNodeComments {
             head: tree_comment_block(meta.head_comment()),
             line: meta.comment.clone().unwrap_or_default(),
             foot: tree_comment_block(meta.foot_comment()),
@@ -6416,7 +6425,7 @@ fn xml_comments_of_tree(value: &OwnedValue, tree: &CommentTree, depth: usize) ->
 /// Put back what the presentation tree lost of a comment block that the pristine document keeps: the
 /// line break a blank line leaves under a head or foot comment (#7034). Only where the key, or the
 /// sequence index, is still there and the tree's block is the pristine one without that break.
-fn restore_comment_breaks(comments: &mut XmlComments, pristine: &XmlComments) {
+fn restore_comment_breaks(comments: &mut EncoderComments, pristine: &EncoderComments) {
     fn restore(block: &mut String, pristine: &str) {
         let Some(rest) = pristine.strip_prefix(block.as_str()) else {
             return;
@@ -6428,7 +6437,7 @@ fn restore_comment_breaks(comments: &mut XmlComments, pristine: &XmlComments) {
     restore(&mut comments.own.head, &pristine.own.head);
     restore(&mut comments.own.foot, &pristine.own.foot);
     match (&mut comments.members, &pristine.members) {
-        (XmlMembers::Map(entries), XmlMembers::Map(originals)) => {
+        (EncoderMembers::Map(entries), EncoderMembers::Map(originals)) => {
             for entry in entries {
                 if let Some(original) = originals.iter().find(|o| o.key == entry.key) {
                     restore(&mut entry.key_comments.head, &original.key_comments.head);
@@ -6438,7 +6447,9 @@ fn restore_comment_breaks(comments: &mut XmlComments, pristine: &XmlComments) {
             }
         }
         // Items are paired by position, which is the same node only while the write left their number alone.
-        (XmlMembers::Seq(items), XmlMembers::Seq(originals)) if items.len() == originals.len() => {
+        (EncoderMembers::Seq(items), EncoderMembers::Seq(originals))
+            if items.len() == originals.len() =>
+        {
             for (item, original) in items.iter_mut().zip(originals) {
                 restore_comment_breaks(item, original);
             }
@@ -6447,25 +6458,30 @@ fn restore_comment_breaks(comments: &mut XmlComments, pristine: &XmlComments) {
     }
 }
 
-/// yq's XML text of a result of the DOM route (a write, a built value) (#7156).
+/// yq's text of a result of the DOM route (a write, a built value), for an encoder that writes comments (#7156).
 ///
 /// `value` is the result and `tree` the presentation tree that goes with it, `pristine` the document it was
 /// made from: the comments are the tree's, with the line break a blank line leaves under a block put back
 /// from the document. The first document's leading block is the pristine document's, whatever the write did
 /// to the first node, when the result is the document (its root has the header or the explicit `---` in
 /// front of it).
-pub fn format_yq_xml_from_tree<C: DocumentCursor>(
-    options: &XmlOptions,
+pub fn format_yq_encoder_from_tree<C: DocumentCursor>(
+    encoder: &YqOutputEncoder,
     value: &OwnedValue,
     tree: &CommentTree,
     pristine: &C,
 ) -> Result<String, EvalError> {
-    let mut comments = xml_comments_of_tree(value, tree, 0);
-    let original = collect_xml_comments(pristine, 0);
-    restore_comment_breaks(&mut comments, &original);
+    let mut comments = encoder_comments_of_tree(value, tree, 0);
+    let original = collect_encoder_comments(pristine, 0);
+    // Only the XML encoder reads the line break a blank line leaves under a block.
+    if matches!(encoder, YqOutputEncoder::Xml(_)) {
+        restore_comment_breaks(&mut comments, &original);
+    }
     let meta = tree.meta();
     let mut leading = String::new();
-    if meta.preamble().is_some() || meta.head_is_header() {
+    if matches!(encoder, YqOutputEncoder::Xml(_))
+        && (meta.preamble().is_some() || meta.head_is_header())
+    {
         leading = pristine.xml_leading_content().unwrap_or_default();
         // What the header holds is not the node's own comment as well.
         comments.own.head.clear();
@@ -6473,7 +6489,7 @@ pub fn format_yq_xml_from_tree<C: DocumentCursor>(
         // wherever a write or a sort has put that node.
         if meta.preamble().is_some() {
             match (&mut comments.members, &original.members) {
-                (XmlMembers::Map(entries), XmlMembers::Map(originals)) => {
+                (EncoderMembers::Map(entries), EncoderMembers::Map(originals)) => {
                     if let Some(first) =
                         originals.first().filter(|f| f.key_comments.head.is_empty())
                     {
@@ -6482,7 +6498,7 @@ pub fn format_yq_xml_from_tree<C: DocumentCursor>(
                         }
                     }
                 }
-                (XmlMembers::Seq(items), XmlMembers::Seq(originals))
+                (EncoderMembers::Seq(items), EncoderMembers::Seq(originals))
                     if originals.first().is_some_and(|f| f.own.head.is_empty()) =>
                 {
                     if let Some(item) = items.first_mut() {
@@ -6493,7 +6509,7 @@ pub fn format_yq_xml_from_tree<C: DocumentCursor>(
             }
         }
     }
-    format_yq_xml_commented(options, value, &comments, &leading)
+    format_yq_commented(encoder, value, &comments, &leading)
 }
 
 /// The text yq's `to_yaml`, `@yaml` and `tostring` make of a *container or alias that is a
@@ -16791,23 +16807,27 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 format_yq_props_commented(format_type, style, &owned, &comments, &leading).into(),
             ))
         }
-        // #7117: yq's XML encoder writes each node's comments, read from the nodes the value came
-        // from, and the first document's leading comments ahead of the first element.
-        Expr::Format(FormatType::YqOutput(YqOutputEncoder::Xml(options)))
-            if S::TAG == EvalTag::Yq && cursor.is_some_and(|c| c.document_has_comments()) =>
+        // #7117, #7159: yq's XML and Lua encoders write each node's comments, read from the nodes the
+        // value came from; the XML one also the first document's leading comments ahead of the first
+        // element.
+        Expr::Format(FormatType::YqOutput(encoder))
+            if S::TAG == EvalTag::Yq
+                && yq_encoder_writes_comments(encoder)
+                && cursor.is_some_and(|c| c.document_has_comments()) =>
         {
             let owned = owned_or_suppress!(to_owned_with_cursor::<_, S>(&value, cursor), optional);
             // The guard holds a cursor.
             let (comments, leading) = cursor.as_ref().map_or_else(
-                || (XmlComments::default(), String::new()),
+                || (EncoderComments::default(), String::new()),
                 |c| {
-                    (
-                        collect_xml_comments(c, 0),
-                        c.xml_leading_content().unwrap_or_default(),
-                    )
+                    let leading = match encoder {
+                        YqOutputEncoder::Xml(_) => c.xml_leading_content().unwrap_or_default(),
+                        _ => String::new(),
+                    };
+                    (collect_encoder_comments(c, 0), leading)
                 },
             );
-            match format_yq_xml_commented(options, &owned, &comments, &leading) {
+            match format_yq_commented(encoder, &owned, &comments, &leading) {
                 Ok(text) => GenericResult::Owned(OwnedValue::String(text.into())),
                 Err(e) => GenericResult::Error(e),
             }

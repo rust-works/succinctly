@@ -27202,17 +27202,31 @@ pub(crate) fn format_yq_props_commented(
     text
 }
 
-/// yq's XML text of `value`, a document node whose comments are `comments`, after the document's
-/// `leading` comment block when the node is the first document's content (#7117). The error is the
-/// output encoder's, as [`format_result`](FormatType::YqOutput) raises it.
-pub(crate) fn format_yq_xml_commented(
-    options: &XmlOptions,
+/// Whether yq's encoder for `-o=<format>` writes the comments of the nodes it is given: the formats that
+/// `format_yq_commented` gives them to (#7117, #7159).
+pub fn yq_encoder_writes_comments(encoder: &YqOutputEncoder) -> bool {
+    matches!(encoder, YqOutputEncoder::Xml(_) | YqOutputEncoder::Lua(_))
+}
+
+/// yq's text of `value`, a document node whose comments are `comments`, for an encoder that writes them
+/// ([`yq_encoder_writes_comments`]), after the document's `leading` comment block when the node is the
+/// first document's content (#7117). The error is the output encoder's, as
+/// [`format_result`](FormatType::YqOutput) raises it.
+pub(crate) fn format_yq_commented(
+    encoder: &YqOutputEncoder,
     value: &OwnedValue,
-    comments: &super::yq_xml::XmlComments,
+    comments: &super::encoder_comments::EncoderComments,
     leading: &str,
 ) -> Result<String, EvalError> {
-    let text = super::yq_xml::format_xml_commented(value, options, comments, leading)
-        .map_err(|e| EvalError::output_encoder(e.message))?;
+    let text = match encoder {
+        YqOutputEncoder::Xml(options) => {
+            super::yq_xml::format_xml_commented(value, options, comments, leading)
+        }
+        YqOutputEncoder::Lua(options) => format_lua_commented(value, options, comments),
+        // The encoders that read no comment.
+        other => return format_yq_output::<YqSemantics>(other, value),
+    }
+    .map_err(|e| EvalError::output_encoder(e.message))?;
     note_output_encoder_result(value);
     Ok(text)
 }
@@ -27555,6 +27569,17 @@ fn yq_encoder_needs_a_string(value: &OwnedValue, format: &str) -> EvalError {
 /// source style or key tag: a literal, folded or flow string (yq writes a long bracket), a single-quoted
 /// one (yq keeps its quote) and a non-string key (yq writes `[1] =`).
 fn format_lua(value: &OwnedValue, options: &LuaOptions) -> Result<String, EvalError> {
+    format_lua_commented(value, options, &super::encoder_comments::NO_COMMENTS)
+}
+
+/// [`format_lua`] writing a line comment as ` -- text` after the entry or item it is on, as yq's encoder
+/// does (#7159): a key's comment after the `["k"] =` and a line break, a value's after its `;`, an array
+/// item's after its `,`. Head and foot comments are not written.
+fn format_lua_commented(
+    value: &OwnedValue,
+    options: &LuaOptions,
+    comments: &super::encoder_comments::EncoderComments,
+) -> Result<String, EvalError> {
     struct Lua<'a> {
         out: String,
         indent: usize,
@@ -27655,16 +27680,35 @@ fn format_lua(value: &OwnedValue, options: &LuaOptions) -> Result<String, EvalEr
                 other => self.out.push_str(&props_value_to_string(other, false)),
             }
         }
-        fn any(&mut self, value: &OwnedValue, depth: usize) {
+        /// yq's `strings.CutPrefix(comment, "#")` after ` --`: a comment's text without its marker.
+        fn comment(&mut self, space: bool, comment: &str) {
+            if comment.is_empty() {
+                return;
+            }
+            if space {
+                self.out.push(' ');
+            }
+            self.out.push_str("--");
+            self.out
+                .push_str(comment.strip_prefix('#').unwrap_or(comment));
+        }
+        fn any(
+            &mut self,
+            value: &OwnedValue,
+            comments: &super::encoder_comments::EncoderComments,
+            depth: usize,
+        ) {
             assert_value_tree_depth(depth);
             match value {
                 OwnedValue::Array(items) => {
                     self.out.push('{');
                     self.indent += 1;
-                    for item in items {
+                    for (index, item) in items.iter().enumerate() {
+                        let item_comments = comments.item(index);
                         self.indent();
-                        self.any(item, depth + 1);
+                        self.any(item, item_comments, depth + 1);
                         self.out.push(',');
+                        self.comment(true, &item_comments.own.line);
                     }
                     self.indent -= 1;
                     if !items.is_empty() {
@@ -27672,16 +27716,23 @@ fn format_lua(value: &OwnedValue, options: &LuaOptions) -> Result<String, EvalEr
                     }
                     self.out.push('}');
                 }
-                OwnedValue::Object(entries) => self.map(entries, false, depth),
+                OwnedValue::Object(entries) => self.map(entries, comments, false, depth),
                 scalar => self.scalar(scalar),
             }
         }
-        fn map(&mut self, entries: &ObjectMap, global: bool, depth: usize) {
+        fn map(
+            &mut self,
+            entries: &ObjectMap,
+            comments: &super::encoder_comments::EncoderComments,
+            global: bool,
+            depth: usize,
+        ) {
             if !global {
                 self.out.push('{');
                 self.indent += 1;
             }
             for (i, (key, value)) in entries.iter().enumerate() {
+                let (key_comments, value_comments) = comments.entry(i, key);
                 if !global || i > 0 {
                     self.indent();
                 }
@@ -27696,8 +27747,14 @@ fn format_lua(value: &OwnedValue, options: &LuaOptions) -> Result<String, EvalEr
                     self.string(key);
                     self.out.push_str("] = ");
                 }
-                self.any(value, depth + 1);
+                // A comment on the key is followed by a line break and the indent, the value's by nothing.
+                if !key_comments.line.is_empty() {
+                    self.comment(false, &key_comments.line);
+                    self.indent();
+                }
+                self.any(value, value_comments, depth + 1);
                 self.out.push(';');
+                self.comment(true, &value_comments.own.line);
             }
             if global {
                 self.out.push('\n');
@@ -27721,11 +27778,11 @@ fn format_lua(value: &OwnedValue, options: &LuaOptions) -> Result<String, EvalEr
                 "--lua-global requires a top level MappingNode".to_string(),
             ));
         };
-        lua.map(entries, true, 0);
+        lua.map(entries, comments, true, 0);
         return Ok(lua.out);
     }
     lua.out.push_str(&options.prefix);
-    lua.any(value, 0);
+    lua.any(value, comments, 0);
     lua.out.push_str(&options.suffix);
     Ok(lua.out)
 }
