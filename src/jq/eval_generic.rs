@@ -16619,6 +16619,10 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // (like `Expr::Optional` above) so `(.)` and friends keep threading
         // the cursor instead of falling to the `to_owned::<S, _>()` bridge below,
         // which collapses duplicate mapping keys (#614).
+        // #7171: `filter(f)` evaluates as the array it stands for.
+        Expr::Builtin(Builtin::Filter(inner)) => {
+            eval_single::<S, _>(inner, value, optional, cursor)
+        }
         Expr::Paren(inner) => eval_single::<S, _>(inner, value, optional, cursor),
 
         // spine 2416 (walk residue; #2428): `..` over a live node keeps every
@@ -18111,6 +18115,9 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             cursor,
             sink,
         ),
+        Expr::Builtin(Builtin::Filter(inner)) => {
+            eval_each_generic::<S, V>(inner, value, optional, cursor, sink)
+        }
         Expr::Paren(inner) => eval_each_generic::<S, V>(inner, value, optional, cursor, sink),
         // #1481: mirrors `eval.rs`'s own `eval_each` `Expr::Compare` arm
         // (#1459, Stage 4) -- `binary_fanout_each_generic` owns the loop
@@ -41397,7 +41404,7 @@ fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
             // carries the key-node flag; see `OwnedIdentityRule::KeyNode`.
             Builtin::Key => KeyNode,
             Builtin::PathNoArg | Builtin::FileIndex | Builtin::Filename => Keeps,
-            Builtin::Map(_) => DetachesContainer,
+            Builtin::Map(_) | Builtin::Filter(_) => DetachesContainer,
             // `min_by`/`max_by` pick a child exactly as `min`/`max` do
             // (jq-only; the model is the captured `min`/`max` rule).
             Builtin::Min | Builtin::Max | Builtin::MinBy(_) | Builtin::MaxBy(_) => Extremum,

@@ -20691,6 +20691,8 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         // Map & Iteration
         Builtin::Map(f) => builtin_map::<W, S>(f, value, optional),
+        // #7171: the array it stands for, run for this one context node.
+        Builtin::Filter(array) => eval_single::<W, S>(array, value, optional),
         Builtin::MapValues(f) => builtin_map_values::<W, S>(f, value, optional),
 
         // Reduction
@@ -48964,6 +48966,7 @@ fn builtin_yields_at_most_one_value(builtin: &Builtin) -> bool {
         | Builtin::Log2
         | Builtin::Ltrim
         | Builtin::Map(_)
+        | Builtin::Filter(_)
         | Builtin::MapValues(_)
         | Builtin::Match(_)
         | Builtin::MatchFlags(_, _)

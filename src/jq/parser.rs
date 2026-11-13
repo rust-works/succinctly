@@ -6373,10 +6373,15 @@ impl<'a> Parser<'a> {
         let Some(condition) = self.parse_required_single_arg(start_pos)? else {
             return Err(ParseError::new("filter expects one argument", start_pos));
         };
-        Ok(Expr::Array(Box::new(Expr::pipe(vec![
-            Expr::Iterate,
-            Expr::Builtin(Builtin::Select(Box::new(condition))),
-        ]))))
+        // A builtin of its own, not the array it evaluates as: yq runs `filter` once per node of its
+        // context, so over an empty one it answers nothing, where an array construction answers `[]`
+        // once (#7171).
+        Ok(Expr::Builtin(Builtin::Filter(Box::new(Expr::Array(
+            Box::new(Expr::pipe(vec![
+                Expr::Iterate,
+                Expr::Builtin(Builtin::Select(Box::new(condition))),
+            ])),
+        )))))
     }
 
     /// Parse yq's `collect(f)` (#4213): `[f]`.
