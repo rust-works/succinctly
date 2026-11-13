@@ -133942,7 +133942,12 @@ mod tests {
     fn test_owned_pipe_rest_is_copied_once_per_program_not_per_value_5404() {
         fn run<S: EvalSemantics>() {
             const STAGES: usize = 12;
-            let program = format!("[.[] | {}] | add", parenthesized_increments(STAGES));
+            // #7132: each stage is `. + 1` spelled so the value doors leave it to the pipe (an `as`
+            // is outside their grammar): `. + 1` itself is now answered whole, with no tail copied.
+            let program = format!(
+                "[.[] | ({})] | add",
+                [". + (1 as $o | $o)"; STAGES].join(" | ")
+            );
             let one = run_owned_pipe_program::<S>(&program, b"[10]");
             let two = run_owned_pipe_program::<S>(&program, b"[10,20]");
             let many = run_owned_pipe_program::<S>(&program, b"[10,20,30,40,50,60,70,80]");
@@ -181127,13 +181132,13 @@ mod share_audit_2999 {
             "reduce .[] as $r ({a: {}}; .a += {($r.name): $r.score})",
             &[(Kind::ObjectMakeMut, 1)],
         );
-        // #5271: an array operand (`[]`, `[a, b]`) is one value, so the step is taken. What
-        // each step still copies is the one array it extends (a group, here of one
-        // element), not the accumulator: 1,000 small copies, none of the 1,000-key state.
+        // #5271: an array operand (`[]`, `[a, b]`) is one value, so the step is taken. #7132: the
+        // update's body is answered by the operand door, which builds `[.]` fresh and extends it,
+        // so not even the one small array per step the step's own concatenation copied is copied.
         assert_forced(
             &json,
             "reduce .[] as $r ({}; .[$r.name] |= [.] + [$r.score])",
-            &[(Kind::ArrayUnwrap, 1000)],
+            &[],
         );
     }
 

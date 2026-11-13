@@ -46619,6 +46619,8 @@ mod tests {
             "[.[] | {a: .} | keys]",
             "[.[] | [., .] | has(1)]",
             "[.[] | {a: .} | tojson]",
+            // #7132: arithmetic over a read is the operand door's.
+            "[.[] | {a: .} | .a + 1]",
         ] {
             assert_eq!(reindexes(filter), 0, "{filter} bridged");
         }
@@ -46627,7 +46629,6 @@ mod tests {
         assert!(reindexes("[.[] | {a: .} | select(.a > 1, .a < 0)]") > 0);
         assert!(reindexes("[.[] | {a: .} | .[]]") > 0);
         assert!(reindexes("[.[] | {a: .} | .a?]") > 0);
-        assert!(reindexes("[.[] | {a: .} | .a + 1]") > 0);
         // yq mode keeps the bridge: its containers carry node metadata and no storage identity.
         let json = b"[1,50,3]";
         let index = JsonIndex::build(json);
