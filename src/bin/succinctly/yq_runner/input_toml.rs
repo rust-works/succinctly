@@ -1584,10 +1584,15 @@ fn descend<'a>(node: &'a Node, path: &mut Vec<Seg>, out: &mut Vec<Visit<'a>>) {
     // yq lists a mapping's children in an ordered map keyed by the key's text, so of two keys
     // spelled alike (an inline table can hold them) only the last is visited, in the first's place.
     let mut entries: Vec<(&String, &Node)> = Vec::with_capacity(node.keys.len());
+    let mut position: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::with_capacity(node.keys.len());
     for (key, value) in node.keys.iter().zip(&node.items) {
-        match entries.iter().position(|(seen, _)| *seen == key) {
-            Some(at) => entries[at].1 = value,
-            None => entries.push((key, value)),
+        match position.get(key.as_str()) {
+            Some(&at) => entries[at].1 = value,
+            None => {
+                position.insert(key, entries.len());
+                entries.push((key, value));
+            }
         }
     }
     for (key, value) in entries {
@@ -1694,7 +1699,7 @@ fn array_append(
     let matches = traverse_path(root, path, false, true, budget)?;
     for at in matches {
         let node = node_at(root, &at);
-        // `add` onto a sequence is its elements and the table; written in place, so a long run of
+        // This is `add`'s rule for a sequence on the left (kept in step with it); written in place, so a long run of
         // `[[array]]` tables does not copy the array once per table (yq does, and is cubic).
         if node.kind == Kind::Seq && node.tag != "!!null" {
             node.items.push(rhs.items[0].clone());
