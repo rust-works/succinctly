@@ -5466,8 +5466,10 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             // stops at the fault. Once met, it is reported below and the run ends after the next
             // value (`stop_at`).
             if !noted.is_empty() {
+                // A fault whose file the second read cannot tell (it declined a file replaced since)
+                // meets none of them: jq's reader may have stopped before any.
                 let fault_at = match (&window_split, &reread) {
-                    (Some((_, Some(_))), Some(reread)) => reread.fault_source(),
+                    (Some((_, Some(_))), Some(reread)) => Some(reread.fault_source().unwrap_or(0)),
                     _ => None,
                 };
                 let met = noted
@@ -11478,7 +11480,8 @@ const MAX_WINDOWED_FILES: usize = 32;
 /// them as (#7024). Each is judged as the lone file is ([`regular_file`]), and one that is not or one
 /// that does not open leaves the run to the route that reads them whole and reports what it finds. Up to
 /// [`MAX_WINDOWED_FILES`] are held open from the start; a longer list is opened to be judged, closed, and
-/// opened again when the run reaches each file, which has to be the file judged ([`window::NamedFile`]).
+/// opened again when the run reaches each file, which reads what the path names then, as jq does
+/// ([`window::NamedFile`]); one that will not open then is reported as jq's reader would.
 #[cfg(unix)]
 fn windowed_regular_files(
     files: &[PathBuf],

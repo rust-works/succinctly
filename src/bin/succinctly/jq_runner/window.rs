@@ -1194,6 +1194,7 @@ fn read_range(_file: &File, _from: u64, _to: u64) -> io::Result<Vec<u8>> {
 /// after it, as in jq and in the whole-file route, which drops such a file from the stream. The second
 /// read that words a fault reads the files as the run read them ([`Reach`]).
 #[derive(Debug)]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(super) struct NamedFile {
     path: PathBuf,
     reach: std::cell::Cell<Reach>,
@@ -1201,6 +1202,7 @@ pub(super) struct NamedFile {
 
 /// What the run found at a [`NamedFile`]'s path when it reached it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
 enum Reach {
     /// Not reached yet.
     Ahead,
@@ -1220,8 +1222,10 @@ struct FileIdentity {
 
 #[cfg(not(unix))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 struct FileIdentity;
 
+#[cfg_attr(not(unix), allow(dead_code))]
 impl FileIdentity {
     #[cfg(unix)]
     fn of(meta: &std::fs::Metadata) -> Self {
@@ -1238,10 +1242,7 @@ impl FileIdentity {
     }
 }
 
-/// `EISDIR`: what a read of a directory fails with on Linux and macOS, which jq reports as `Is a
-/// directory` (`std`'s `ErrorKind::IsADirectory` needs a newer Rust than the crate's).
-const EISDIR: i32 = 21;
-
+#[cfg_attr(not(unix), allow(dead_code))]
 impl NamedFile {
     pub(super) fn new(path: PathBuf) -> Self {
         Self {
@@ -1256,7 +1257,7 @@ impl NamedFile {
         let opened = File::open(&self.path).and_then(|file| {
             let meta = file.metadata()?;
             if meta.is_dir() {
-                return Err(io::Error::from_raw_os_error(EISDIR));
+                return Err(io::Error::from_raw_os_error(super::EISDIR));
             }
             Ok((file, meta))
         });
@@ -1298,6 +1299,7 @@ enum StreamFile {
     /// Open from the start of the run, with how much of it the run reads.
     Held(Rc<File>, u64),
     /// Opened when the run reaches it ([`NamedFile`]).
+    #[cfg_attr(not(unix), allow(dead_code))]
     Named(Rc<NamedFile>),
 }
 
@@ -1696,6 +1698,7 @@ struct RereadSource {
 
 /// The file a [`RereadSource`] reads: a handle the run holds, or a [`NamedFile`] the second read opens
 /// when it reaches it (#7024), and declines if it is no longer the file the run read.
+#[cfg_attr(not(unix), allow(dead_code))]
 enum RereadFile {
     Held(Rc<File>),
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -1704,6 +1707,7 @@ enum RereadFile {
 
 /// How much of a file the second read reads: a length of 0 is not known to be (`WindowedFile`), so the
 /// file is read to its end.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn known_len(len: u64) -> u64 {
     if len == 0 {
         u64::MAX
@@ -1845,11 +1849,6 @@ impl Reread {
             };
             if failed.get() {
                 return None;
-            }
-            if at >= current.len {
-                source += 1;
-                at = 0;
-                continue;
             }
             let (file, len) = match &current.file {
                 RereadFile::Held(file) => (&**file, current.len),

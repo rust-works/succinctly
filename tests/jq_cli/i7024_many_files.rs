@@ -183,12 +183,16 @@ enum Change {
     LastGone,
     /// File 30 removed, after a fault in file 20 that ends the run first.
     GoneAfterAFault,
+    /// The last file replaced by a directory, which jq's reader does not report (#6472), with a
+    /// number open at the end of the file before it.
+    LastDirectory,
 }
 
 /// 40 files, the first big enough that the run is still in it when its output fills the pipe; the
 /// change is made while the run waits to write, and the run is then drained. The answer is what the
-/// files give afterwards on the route that reads them whole, which a missing path or a directory
-/// sends a run to: the run met each change when its reader got there, as jq's does.
+/// files give afterwards on the route that reads them whole: each path that is still a file is given
+/// as a descriptor (`/dev/fd/N`, opened by `bash`), which sends the list to that route, and the names
+/// are made the paths again. The run met each change when its reader got there, as jq's does.
 fn changed_while_running(change: Change, args: &[&str]) -> Result<(Run, Run)> {
     use std::io::Read;
     let dir = tempfile::tempdir()?;
@@ -197,7 +201,12 @@ fn changed_while_running(change: Change, args: &[&str]) -> Result<(Run, Run)> {
         .collect();
     for (n, path) in paths.iter().enumerate() {
         let bytes = match n {
-            0 => text(80_000),
+            // Just over the 4 MiB the route needs, and more output than a pipe holds.
+            0 => {
+                let bytes = text(60_000);
+                assert!(bytes.len() >= 4 << 20, "{} bytes", bytes.len());
+                bytes
+            }
             19 => b"{\"k\":19}\n12".to_vec(),
             20 if matches!(change, Change::GoneAfterAFault) => b"{\"k\":20} }\n".to_vec(),
             21 => b"34\n{\"k\":21}\n".to_vec(),
@@ -231,6 +240,10 @@ fn changed_while_running(change: Change, args: &[&str]) -> Result<(Run, Run)> {
         }
         Change::LastGone => std::fs::remove_file(&paths[FILES - 1])?,
         Change::GoneAfterAFault => std::fs::remove_file(&paths[30])?,
+        Change::LastDirectory => {
+            std::fs::remove_file(&paths[FILES - 1])?;
+            std::fs::create_dir(&paths[FILES - 1])?;
+        }
     }
     let mut rest = Vec::new();
     stdout.read_to_end(&mut rest)?;
@@ -247,15 +260,35 @@ fn changed_while_running(change: Change, args: &[&str]) -> Result<(Run, Run)> {
         String::from_utf8_lossy(&stderr).into_owned(),
         status.code().unwrap_or(-1),
     );
-    let whole = Command::new(bin)
-        .arg("jq")
+    let mut script = String::new();
+    let mut operands = String::new();
+    for (n, path) in paths.iter().enumerate() {
+        if path.is_file() {
+            script.push_str(&format!("exec {}<'{}'\n", n + 10, path.display()));
+            operands.push_str(&format!(" /dev/fd/{}", n + 10));
+        } else {
+            operands.push_str(&format!(" '{}'", path.display()));
+        }
+    }
+    script.push_str(&format!("exec \"$0\" jq \"$@\"{operands}\n"));
+    let whole = Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .arg(bin)
         .args(args)
-        .args(&paths)
         .env("LC_ALL", "C")
         .output()?;
+    let named = |text: &[u8]| {
+        let mut text = String::from_utf8_lossy(text).into_owned();
+        // The longest first: `/dev/fd/1` is a prefix of `/dev/fd/10`.
+        for (n, path) in paths.iter().enumerate().rev() {
+            text = text.replace(&format!("/dev/fd/{}", n + 10), &path.display().to_string());
+        }
+        text
+    };
     let whole = (
-        String::from_utf8_lossy(&whole.stdout).into_owned(),
-        String::from_utf8_lossy(&whole.stderr).into_owned(),
+        named(&whole.stdout),
+        named(&whole.stderr),
         whole.status.code().unwrap_or(-1),
     );
     Ok((windowed, whole))
@@ -269,8 +302,13 @@ fn a_path_that_changes_before_the_run_reaches_it_is_read_as_jq_reads_it_7024() -
         Change::MiddleReplaced,
         Change::LastGone,
         Change::GoneAfterAFault,
+        Change::LastDirectory,
     ] {
-        for args in [&["-c", "."][..], &["-c", "[input_filename, .]"]] {
+        // A halt on the value held before a last file that changed (#6683).
+        let last = matches!(change, Change::LastGone | Change::LastDirectory);
+        let halts = [&["-c", "if . == 77 then halt_error else . end"][..]];
+        let programs = [&["-c", "."][..], &["-c", "[input_filename, .]"]];
+        for args in programs.iter().chain(halts.iter().filter(|_| last)) {
             let (windowed, whole) = changed_while_running(change, args)?;
             assert_eq!(windowed, whole, "{change:?} {args:?}");
         }
@@ -280,6 +318,11 @@ fn a_path_that_changes_before_the_run_reaches_it_is_read_as_jq_reads_it_7024() -
     let (run, _) = changed_while_running(Change::MiddleGone, &["-c", "."])?;
     assert!(run.1.contains("Could not open file"), "{}", run.1);
     assert_eq!((run.0.lines().last(), run.2), (Some("1234"), 2));
+    let (run, _) = changed_while_running(Change::MiddleReplaced, &["-c", "."])?;
+    assert!(
+        run.0.contains("{\"new\":21}") && run.0.contains("1256"),
+        "the file as it now is"
+    );
     let (run, _) = changed_while_running(Change::GoneAfterAFault, &["-c", "."])?;
     assert!(
         !run.1.contains("Could not open"),

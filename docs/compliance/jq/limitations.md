@@ -7508,7 +7508,7 @@ Release builds with `--features cli` of `main` @ `15dcf4a82`, a second build of 
 
 What the windowed route does not cover, and which still hold the input:
 
-- a terminal on standard input, a pipe under 4 MiB, more than 32 files, and a list of files with a path that is not a regular file, that does not open, or that is the run's own standard output or error: #7024;
+- a terminal on standard input, a pipe under 4 MiB, and a list of files with a path that is not a regular file, that does not open, or that is the run's own standard output or error when the run starts: #7024;
 - programs that call `input`/`inputs` (with or without `-n`), `-R`, `--input-dsv` and `--stream-errors`, which have their own readers: #7023; and `--seq` over a pipe, several files or a stream that is not RFC 7464's own framing, and `--seq -s` (the whole-file route's by design; a `--seq` pipe is #7024's stdin question);
 - `-s` and `--validate`, which read the stream whole by design.
 
