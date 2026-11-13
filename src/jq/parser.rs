@@ -632,8 +632,30 @@ fn yq_string_interpolations_are_closed(rest: &str) -> bool {
                         let mut j = i + 1;
                         while j < bytes.len() && bytes[j] != b'"' {
                             match bytes[j] {
-                                // A backslash takes the character after it with it, so `\"` does not end the slot.
-                                b'\\' => j += 1,
+                                // A run of backslashes is read with the character after it (#7105). A `"`
+                                // after an odd run does not end the slot. A `(` counts as an open
+                                // whatever precedes it, so the `\(` of a nested `\(z\(1)` is one. A `)`
+                                // counts as a close unless the run, collapsed once (`ceil(n / 2)`), is odd:
+                                // `\)` and `\\)` do not close a slot, `\\\)` does.
+                                b'\\' => {
+                                    let run_start = j;
+                                    while j < bytes.len() && bytes[j] == b'\\' {
+                                        j += 1;
+                                    }
+                                    let run = j - run_start;
+                                    match bytes.get(j) {
+                                        Some(b'"') if run % 2 == 1 => {}
+                                        Some(b'"') | None => continue,
+                                        Some(b'(') => depth += 1,
+                                        Some(b')') if run.div_ceil(2) % 2 == 0 => {
+                                            depth -= 1;
+                                            if depth == 0 {
+                                                break;
+                                            }
+                                        }
+                                        Some(_) => {}
+                                    }
+                                }
                                 b'(' => depth += 1,
                                 b')' => {
                                     depth -= 1;
