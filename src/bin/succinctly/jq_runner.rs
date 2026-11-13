@@ -11444,20 +11444,19 @@ fn windowed_source(args: &JqCommand) -> Option<WindowedSource> {
 /// fault, which reads them all again, and a process has only so many descriptors. A process's descriptor
 /// table starts at 64 slots and doubling it waits for an RCU grace period (35 ms on the 7950X's Linux, for
 /// each doubling) when the process has a thread besides, so a list that took the table past 64 added more
-/// than the whole of a 10 MiB run: 32 files and the standard ones stay under it.
+/// than the whole of a 10 MiB run: 32 files and the standard ones stay under it. A longer list is opened a
+/// file at a time, by path ([`window::NamedFile`]).
 const MAX_WINDOWED_FILES: usize = 32;
 
 /// Several regular files, 4 MiB or more between them, read a window at a time as the one stream jq reads
-/// them as (#7024). Each is judged as the lone file is ([`regular_file`]), and one that is not, one that
-/// does not open, and a list of more than [`MAX_WINDOWED_FILES`] leave the run to the route that reads
-/// them whole and reports what it finds.
+/// them as (#7024). Each is judged as the lone file is ([`regular_file`]), and one that is not or one
+/// that does not open leaves the run to the route that reads them whole and reports what it finds. Up to
+/// [`MAX_WINDOWED_FILES`] are held open from the start; a longer list is opened to be judged, closed, and
+/// opened again when the run reaches each file, which has to be the file judged ([`window::NamedFile`]).
 #[cfg(unix)]
 fn windowed_regular_files(
     files: &[PathBuf],
 ) -> Option<(window::WindowedFiles, std::rc::Rc<window::Reread>)> {
-    if files.len() > MAX_WINDOWED_FILES {
-        return None;
-    }
     // Every path is judged by `stat` before any is opened: a list of small files is turned down
     // without the cost of opening them.
     let mut total = 0u64;
@@ -11467,14 +11466,27 @@ fn windowed_regular_files(
     if total < window::MIN_WINDOWED_FILE_BYTES {
         return None;
     }
-    let mut opened = Vec::with_capacity(files.len());
-    for path in files {
+    let judge = |path: &PathBuf| {
         let file = std::fs::File::open(path).ok()?;
         // What was opened, not what the path named a moment ago.
         let meta = file.metadata().ok()?;
-        if !meta.is_file() || names_stdin(&meta) || names_output(&meta) {
-            return None;
-        }
+        (meta.is_file() && !names_stdin(&meta) && !names_output(&meta)).then_some((file, meta))
+    };
+    if files.len() > MAX_WINDOWED_FILES {
+        // Each file is closed once judged, so the descriptors held stay a few.
+        let named = files
+            .iter()
+            .map(|path| judge(path).map(|(_, meta)| window::NamedFile::judged(path.clone(), &meta)))
+            .collect::<Option<Vec<_>>>()?;
+        let reread = window::Reread::new_named(&named);
+        return Some((
+            window::WindowedFiles::named(named, window::WINDOW_BYTES),
+            std::rc::Rc::new(reread),
+        ));
+    }
+    let mut opened = Vec::with_capacity(files.len());
+    for path in files {
+        let (file, meta) = judge(path)?;
         opened.push((std::rc::Rc::new(file), meta.len()));
     }
     let reread = window::Reread::new_many(&opened);
@@ -20691,7 +20703,15 @@ mod tests {
             takes(&with_tinies(MAX_WINDOWED_FILES - 1)),
             "as many files as it holds open"
         );
-        assert!(!takes(&with_tinies(MAX_WINDOWED_FILES)), "one more");
+        // A longer list is opened a file at a time (#7024).
+        assert!(takes(&with_tinies(MAX_WINDOWED_FILES)), "one more");
+        assert!(takes(&with_tinies(300)), "many more");
+        let mut long_with_missing = with_tinies(40);
+        long_with_missing.push(missing.as_str());
+        assert!(!takes(&long_with_missing), "one does not open");
+        let mut long_with_directory = with_tinies(40);
+        long_with_directory.push(directory.as_str());
+        assert!(!takes(&long_with_directory), "one is no regular file");
         // A descriptor the run already holds, named by path: opening it again shares its offset on
         // some systems, and the fault's second read would find the end of the file.
         assert!(!takes(&["jq", ".", "/dev/stdin"]));
