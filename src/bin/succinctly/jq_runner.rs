@@ -7078,9 +7078,10 @@ fn read_inputs(
             .map(raw_window_text)
             .unwrap_or_default();
         let mut texts = vec![(0, first)];
-        texts.extend(
-            (1..windows.len()).map(|at| (u32::try_from(at).unwrap_or(u32::MAX), String::new())),
-        );
+        texts.extend((1..windows.len()).map(|at| {
+            let tag = u32::try_from(at).expect("at most MAX_WINDOWED_FILES sources");
+            (tag, String::new())
+        }));
         opened.clone_from(&files);
         let mut locations =
             InputLocations::new(files.iter().map(|p| Some(input_display_name(p))).collect());
@@ -11393,29 +11394,11 @@ fn raw_windowed_sources(args: &JqCommand, files: &[PathBuf]) -> Option<Vec<RawWi
     if !raw_window_flags(args) || files.len() > MAX_WINDOWED_FILES {
         return None;
     }
-    // Every path is judged by `stat` before any is opened, as the plain route does.
-    let mut total = 0u64;
-    for path in files {
-        total = total.checked_add(regular_file(path)?.len())?;
-    }
-    if total < raw_window_min_bytes() {
-        return None;
-    }
-    files
-        .iter()
-        .map(|path| {
-            let file = std::fs::File::open(path).ok()?;
-            // What was opened, not what the path named a moment ago.
-            let meta = file.metadata().ok()?;
-            (meta.is_file() && !names_stdin(&meta) && !names_output(&meta)).then(|| {
-                (
-                    Box::new(file) as Box<dyn Read>,
-                    Some(meta.len()),
-                    Vec::new(),
-                )
-            })
-        })
-        .collect()
+    let mut sources: Vec<RawWindowed> = Vec::with_capacity(files.len());
+    judge_regular_files(files, raw_window_min_bytes(), |_, file, meta| {
+        sources.push((Box::new(file), Some(meta.len()), Vec::new()));
+    })?;
+    Some(sources)
 }
 
 /// The source `-R` reads a window at a time (#7023), or `None` for a run that reads its input whole: the
@@ -11584,38 +11567,21 @@ const MAX_WINDOWED_FILES: usize = 32;
 fn windowed_regular_files(
     files: &[PathBuf],
 ) -> Option<(window::WindowedFiles, std::rc::Rc<window::Reread>)> {
-    // Every path is judged by `stat` before any is opened: a list of small files is turned down
-    // without the cost of opening them.
-    let mut total = 0u64;
-    for path in files {
-        total = total.checked_add(regular_file(path)?.len())?;
-    }
-    if total < window::MIN_WINDOWED_FILE_BYTES {
-        return None;
-    }
-    let judge = |path: &PathBuf| {
-        let file = std::fs::File::open(path).ok()?;
-        // What was opened, not what the path named a moment ago.
-        let meta = file.metadata().ok()?;
-        (meta.is_file() && !names_stdin(&meta) && !names_output(&meta)).then_some((file, meta))
-    };
     if files.len() > MAX_WINDOWED_FILES {
         // Each file is closed once judged, so the descriptors held stay a few.
         let mut named = Vec::with_capacity(files.len());
-        for path in files {
-            judge(path)?;
+        judge_regular_files(files, window::MIN_WINDOWED_FILE_BYTES, |path, _, _| {
             named.push(std::rc::Rc::new(window::NamedFile::new(path.clone())));
-        }
+        })?;
         return Some((
             window::WindowedFiles::named(&named, window::WINDOW_BYTES),
             std::rc::Rc::new(window::Reread::new_named(&named)),
         ));
     }
     let mut opened = Vec::with_capacity(files.len());
-    for path in files {
-        let (file, meta) = judge(path)?;
+    judge_regular_files(files, window::MIN_WINDOWED_FILE_BYTES, |_, file, meta| {
         opened.push((std::rc::Rc::new(file), meta.len()));
-    }
+    })?;
     let reread = window::Reread::new_many(&opened);
     Some((
         window::WindowedFiles::new(opened, window::WINDOW_BYTES),
@@ -11628,6 +11594,36 @@ fn windowed_regular_files(
     _files: &[PathBuf],
 ) -> Option<(window::WindowedFiles, std::rc::Rc<window::Reread>)> {
     None
+}
+
+/// The judgement of several files for a route that reads them a window at a time (#7024), the plain
+/// filter's and `-R`'s: each a regular file by `stat`, `min` bytes or more between them, and then, each
+/// opened, a regular file that is not the run's standard input or output. Every path is judged by `stat`
+/// before any is opened, so a list of small files is turned down without the cost of opening them.
+/// `keep` gets each file as it is opened, with its path and `fstat`, in order; `None` for a list that is
+/// turned down, part-way included.
+fn judge_regular_files(
+    files: &[PathBuf],
+    min: u64,
+    mut keep: impl FnMut(&PathBuf, std::fs::File, std::fs::Metadata),
+) -> Option<()> {
+    let mut total = 0u64;
+    for path in files {
+        total = total.checked_add(regular_file(path)?.len())?;
+    }
+    if total < min {
+        return None;
+    }
+    for path in files {
+        let file = std::fs::File::open(path).ok()?;
+        // What was opened, not what the path named a moment ago.
+        let meta = file.metadata().ok()?;
+        if !meta.is_file() || names_stdin(&meta) || names_output(&meta) {
+            return None;
+        }
+        keep(path, file, meta);
+    }
+    Some(())
 }
 
 /// What `path` is if it is a regular file: judged by `stat`, which opens nothing (opening a named pipe
@@ -14228,8 +14224,11 @@ fn lazy_raw_producer_windowed(
             if file == last {
                 break;
             }
-            // Past the file: its text is no longer needed.
+            // Past the file: its text and its windows (the open file they read) are no longer needed.
             files[file].1 = String::new();
+            if let Some(done) = rest.get_mut(file) {
+                *done = None;
+            }
             file += 1;
             at = 0;
             newlines = 0;
@@ -20968,8 +20967,68 @@ mod tests {
         assert!(windowed_plain_file(&plain).is_none());
     }
 
-    /// #7023: `-R` reads a window at a time only for one regular file big enough to be worth it, on a
-    /// run that reads the lines in order, and the plain route's gate agrees on which files those are.
+    /// #7024: the producer of `-R`'s lines over several files read a window at a time gives what it
+    /// gives over the same files read whole, for windows of every small size, so a window that ends at
+    /// a file's last line break, at its last byte, or a file of several windows followed by a line it
+    /// left open all meet the seam on purpose.
+    #[test]
+    fn several_windowed_files_give_the_lines_the_whole_files_give_7024() {
+        let drain = |mut producer: jq::InputProducer| {
+            let mut out = Vec::new();
+            loop {
+                match producer() {
+                    jq::ProducedInput::Document(value, tag, line) => {
+                        out.push(format!("{tag}:{line}:{value:?}"));
+                    }
+                    jq::ProducedInput::End(end) => {
+                        out.push(format!("end {end:?}"));
+                        return out;
+                    }
+                    jq::ProducedInput::Error(error, at) => {
+                        out.push(format!("error {error:?} {at:?}"))
+                    }
+                }
+            }
+        };
+        let shapes: &[&[&[u8]]] = &[
+            &[b"a1\na2", b"b1\nb2\n"],
+            &[b"a1\na2\n", b"b1\nb2"],
+            &[b"a1\na2", b"", b"c1"],
+            &[b"long line one\nlong line two\nopen", b"", b"", b"x\ny\n"],
+            &[b"\n\n\n", b"\n", b"tail"],
+            &[b"one\n", b"two\n", b"three"],
+            &[b"x\xc3", b"\xa9y\n", b"\xef\xbb\xbfz"],
+            &[b"", b"only\n", b""],
+            &[b"ends open", b""],
+        ];
+        for files in shapes {
+            let whole: Vec<(u32, String)> = files
+                .iter()
+                .enumerate()
+                .map(|(at, bytes)| (at as u32, raw_window_text(bytes.to_vec())))
+                .collect();
+            let want = drain(lazy_raw_producer_windowed(whole, Some(Vec::new()), None));
+            for block in 1..=8 {
+                let windows = files
+                    .iter()
+                    .map(|bytes| {
+                        Some(window::LineWindows::new(
+                            Box::new(std::io::Cursor::new(bytes.to_vec())),
+                            Some(bytes.len() as u64),
+                            block,
+                            Vec::new(),
+                        ))
+                    })
+                    .collect();
+                let texts = (0..files.len())
+                    .map(|at| (at as u32, String::new()))
+                    .collect();
+                let got = drain(lazy_raw_producer_windowed(texts, Some(windows), None));
+                assert_eq!(got, want, "{files:?} at block {block}");
+            }
+        }
+    }
+
     /// #7024: `-R` over several regular files, 4 MiB or more between them and up to as many as the
     /// plain route holds open, is read a window at a time, one source a file; a list with a path that is
     /// not a regular file, one that is too small between them, or too long, is read whole.
@@ -21037,6 +21096,8 @@ mod tests {
         assert_eq!(sources(&["jq", ".", &half, &other]), None, "not -R");
     }
 
+    /// #7023: `-R` reads a window at a time only for one regular file big enough to be worth it, on a
+    /// run that reads the lines in order, and the plain route's gate agrees on which files those are.
     #[test]
     fn lone_raw_windowed_file_takes_only_a_lone_regular_file_7023() {
         use clap::Parser;

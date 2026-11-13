@@ -175,3 +175,62 @@ fn every_line_of_several_files_is_read_7024() -> Result<()> {
     assert_eq!(windowed, ("75001\n".to_string(), String::new(), 0));
     Ok(())
 }
+
+/// The seam rules themselves, as jq 1.7.1 answers them (captured from `/usr/bin/jq` over these files,
+/// 4.47 MB between them, so the route takes them): a last line without a line break joined to the next
+/// file's first and read there, `input_line_number` per file, a two-byte character split between two files
+/// read as two replacement characters, a BOM kept, and a line left open before an empty last file read in
+/// that file at line 0, with `input_line_number` 0 at the end.
+#[test]
+fn the_seams_between_files_are_jqs_7024() -> Result<()> {
+    let filler = |tag: &str, n: usize| -> Vec<u8> {
+        (0..n)
+            .flat_map(|i| format!("filler {tag} {i}\n").into_bytes())
+            .collect()
+    };
+    let mut f0 = filler("a", 100_000);
+    f0.extend_from_slice(b"a2");
+    let mut f1 = b"b1\nb2\n".to_vec();
+    f1.extend(filler("b", 100_000));
+    let mut f4 = b"\xa9y\n\xef\xbb\xbfz\n".to_vec();
+    f4.extend(filler("c", 100_000));
+    f4.extend_from_slice(b"open");
+    let files: [(&str, Vec<u8>); 6] = [
+        ("f0", f0),
+        ("f1", f1),
+        ("f2", Vec::new()),
+        ("f3", b"x\xc3".to_vec()),
+        ("f4", f4),
+        ("f5", Vec::new()),
+    ];
+    let dir = tempfile::tempdir()?;
+    for (name, bytes) in &files {
+        std::fs::write(dir.path().join(name), bytes)?;
+    }
+    let run = |args: &[&str]| -> Result<Run> {
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .arg("jq")
+            .args(args)
+            .args(files.iter().map(|(name, _)| name))
+            .current_dir(dir.path())
+            .env("LC_ALL", "C")
+            .output()?;
+        Ok(finish(&output))
+    };
+    let seams = run(&[
+        "-cR",
+        "select(startswith(\"filler\") | not) | [input_filename, input_line_number, .]",
+    ])?;
+    let want: String = [
+        "[\"f1\",1,\"a2b1\"]\n",
+        "[\"f1\",2,\"b2\"]\n",
+        "[\"f4\",1,\"x\u{fffd}\u{fffd}y\"]\n",
+        "[\"f4\",2,\"\u{feff}z\"]\n",
+        "[\"f5\",0,\"open\"]\n",
+    ]
+    .concat();
+    assert_eq!(seams, (want, String::new(), 0));
+    let count = run(&["-cnR", "[inputs] | length, input_line_number"])?;
+    assert_eq!(count, ("300005\n0\n".to_string(), String::new(), 0));
+    Ok(())
+}
