@@ -79,6 +79,10 @@ fn eval_all_alternative_raises_the_right_sides_error_only_when_it_runs_7173() ->
     let dir = TempDir::new()?;
     let paths = files(&dir)?;
     let refs: Vec<&std::path::Path> = paths.iter().map(std::path::PathBuf::as_path).collect();
+    // An error in the left side ends the run too (`tonumber` of the absent keys' null).
+    let (stdout, _, status) =
+        run_yq_files("(.a | tonumber) // 1", &refs, &["ea", "-o=json", "-I=0"])?;
+    assert_eq!((stdout.as_str(), status), ("", 1));
     for filter in [".a // error(\"boom\")", ".zz // error(\"boom\")"] {
         let (stdout, stderr, status) = run_yq_files(filter, &refs, &["ea", "-o=json", "-I=0"])?;
         assert_eq!((stdout.as_str(), status), ("", 1), "{filter}");

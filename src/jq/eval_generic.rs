@@ -23588,9 +23588,9 @@ fn alternative_together<S: EvalSemantics, V: DocumentValue>(
         if rights.is_none() {
             rights = Some(over(right)?);
         }
-        match rights.as_deref() {
-            Some([]) | None => out.push(item),
-            Some(replaced) => out.extend(replaced.iter().cloned()),
+        match rights.as_deref().unwrap_or_default() {
+            [] => out.push(item),
+            replaced => out.extend(replaced.iter().cloned()),
         }
     }
     Ok(out)
