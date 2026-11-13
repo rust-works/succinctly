@@ -8227,15 +8227,17 @@ In jq mode (`env(VAR)` is succinctly's extension there) the argument stays an id
 - **The wording of the errors differs.**
   An empty argument (`strenv()`, `env()`) and an extra `)` (`strenv(a(b))`) fail in both; yq says `invalid input text "strenv()"` and `bad expression, got close brackets without matching opening bracket`, this says `parse error ... expected identifier, found ')'` and `unexpected character ')'`.
 
-## A scalar appended to a sequence takes the first element's quote style in a construction, not yet in a write ([#7070](https://github.com/rust-works/succinctly/issues/7070))
+## A scalar appended to a sequence takes the first element's quote style in a construction and in `+=`, not yet in the other writes ([#7070](https://github.com/rust-works/succinctly/issues/7070))
 
 yq copies the first element's `Style` onto a scalar that `+` appends to a sequence: `a: ['x']` with `.a + "z"` is `['x', 'z']`, `[x, 'y']` is `[x, 'y', z]`, and a block sequence stays a block sequence.
 A construction does the same (`.a + "z"`, `[.a + "z"]`, `{"k": (.a + "z")}`); it used to lose the sequence's flow style and every quote.
 `tests/yq_cli/i7070_append_style.rs` pins 165 rows captured from yq v4.53.3, among them an appended scalar that carries an anchor, a comment, a tag or a block style.
 These still differ:
 
-- **A write: `.a += "z"`, `.a = .a + "z"` and `.a |= . + "z"`** print the appended scalar plain (`['dog', cat]`) where yq copies the quote (`['dog', 'cat']`).
+- **A write: `.a = .a + "z"` and `.a |= . + "z"`** print the appended scalar plain (`['dog', cat]`) where yq copies the quote (`['dog', 'cat']`).
   The write route replays the presentation of the old document and the appended element has none.
+  `.a += "z"` does copy it (`i7070_assign_style.rs`, 19 rows): a lone `+=` onto a static path, with a scalar literal or a static read of a scalar on the right, copies a single or double quote of the first element.
+  A comma of targets (`(.a, .c) += "z"`), a computed right side (`+= (.d | length)`) and a stage after the write (`.a += "z" | .a style=""`) still print it plain.
 - **A number or a boolean** appended (`.a + 5`, `+= true`) prints bare here and quoted by yq (`['x', '5']`, `['x', 'true']`): yq's copied style turns the scalar into a quoted string.
 - **A right side that is a variable or an assignment's value** (`.a as $x | [$x + "z"]`, `.c = (.a + "z")`) loses the sequence's presentation, as it did before.
 - **`.a + null`** and **`[] + ["z"]`** print a block sequence where yq keeps the left sequence's flow style.

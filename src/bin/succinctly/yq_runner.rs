@@ -5716,6 +5716,65 @@ fn propagate_compound_alias_mark(
     }
 }
 
+/// yq's `+` onto a non-empty sequence of a node that is not a sequence appends a copy that takes
+/// the quoting of the sequence's *first* element (`toNodes` in `operator_add.go`): `.a += "cat"` on
+/// `a: ['dog']` is `a: ['dog', 'cat']`, and `.g += 5` on a sequence of single-quoted strings writes
+/// `'5'` (#7070). A sequence on the right (`+= ["cat"]`) keeps its own elements' spelling, and an
+/// empty or absent target has no first element to copy. Only a scalar literal or a static read of a
+/// scalar is followed, and only a single or double quote is copied.
+fn propagate_compound_append_style(
+    op: &AssignOp,
+    path_expr: &Expr,
+    value_expr: &Expr,
+    result: &OwnedValue,
+    pristine_value: &OwnedValue,
+    tree: &mut CommentTree,
+) {
+    if !matches!(op, AssignOp::Add) {
+        return;
+    }
+    let Some(mut targets) = static_nav_targets(path_expr) else {
+        return;
+    };
+    let (Some(target), None) = (targets.pop(), targets.pop()) else {
+        return;
+    };
+    let target_path = meta_path_of(&target);
+    let (Some(OwnedValue::Array(before)), Some(OwnedValue::Array(after))) = (
+        owned_value_at(pristine_value, &target_path),
+        owned_value_at(result, &target_path),
+    ) else {
+        return;
+    };
+    if before.is_empty() || after.len() != before.len() + 1 {
+        return;
+    }
+    let scalar_rhs = match value_expr {
+        Expr::Literal(Literal::Null) => false,
+        Expr::Literal(_) => true,
+        other => static_nav_steps(other)
+            .and_then(|steps| owned_value_at(pristine_value, &meta_path_of(&steps)))
+            .is_some_and(|read| !matches!(read, OwnedValue::Array(_) | OwnedValue::Null)),
+    };
+    if !scalar_rhs {
+        return;
+    }
+    let mut first = target.clone();
+    first.push(TreeStep::Index(0));
+    let style = match comment_tree_at_path_mut(tree, &first) {
+        Some(node) => node.style(),
+        None => return,
+    };
+    if !matches!(style, "single" | "double") {
+        return;
+    }
+    let mut appended = target;
+    appended.push(TreeStep::Index(before.len()));
+    if let Some(node) = comment_tree_at_path_or_create_mut(tree, &appended) {
+        node.meta_mut().style = style;
+    }
+}
+
 /// The node an assignment's right side leaves in its target, when it is static navigation or a
 /// comma of it: a target takes each result in turn, so the last member that names a node wins
 /// and one that names none (a key the tree lacks) is skipped (`.c = (.a, .b)` keeps `.b`'s alias,
@@ -9523,6 +9582,19 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
                 pristine,
                 comments,
             );
+        }
+        // #7070: `+=` of a scalar onto a sequence quotes the element as the sequence's first.
+        if let Some((op, path_expr, value_expr)) = lone_compound_assign(pass_expr) {
+            for (value, comments) in docs.iter_mut().flatten() {
+                propagate_compound_append_style(
+                    op,
+                    path_expr,
+                    value_expr,
+                    value,
+                    pristine_value,
+                    comments,
+                );
+            }
         }
     }
 
