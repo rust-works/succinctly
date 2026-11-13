@@ -92244,21 +92244,48 @@ fn owned_update_step_arith<S: EvalSemantics>(expr: &Expr, state: OwnedValue) -> 
     // #7108: a yq-mode fold's step may write a plain scalar `=` on the state it owns; the same step
     // run for a document write may not (its alias and presentation rules are the evaluator's).
     if S::TAG == EvalTag::Yq {
-        let outer = YQ_FOLD_STEP.with(|flag| flag.replace(true));
+        let outer = yq_fold_step_enter();
         let step = owned_update_step_arith_inner::<S>(expr, state);
-        YQ_FOLD_STEP.with(|flag| flag.set(outer));
+        yq_fold_step_leave(outer);
         return step;
     }
     owned_update_step_arith_inner::<S>(expr, state)
 }
 
-thread_local! {
+#[cfg(feature = "std")]
+std::thread_local! {
     /// Whether a yq-mode fold's owned step is running ([`owned_update_step_arith`], #7108).
     static YQ_FOLD_STEP: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
+/// Marks a yq fold step as running, and answers what the mark was.
+#[cfg(feature = "std")]
+fn yq_fold_step_enter() -> bool {
+    YQ_FOLD_STEP.with(|flag| flag.replace(true))
+}
+
+#[cfg(feature = "std")]
+fn yq_fold_step_leave(outer: bool) {
+    YQ_FOLD_STEP.with(|flag| flag.set(outer));
+}
+
+#[cfg(feature = "std")]
 fn yq_fold_step_active() -> bool {
     YQ_FOLD_STEP.with(core::cell::Cell::get)
+}
+
+// `no_std` has no `thread_local!`: the plain `=` stays the evaluator's there (the CLI is `std`).
+#[cfg(not(feature = "std"))]
+fn yq_fold_step_enter() -> bool {
+    false
+}
+
+#[cfg(not(feature = "std"))]
+fn yq_fold_step_leave(_outer: bool) {}
+
+#[cfg(not(feature = "std"))]
+fn yq_fold_step_active() -> bool {
+    false
 }
 
 #[inline(always)]
