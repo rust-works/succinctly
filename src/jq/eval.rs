@@ -93573,8 +93573,19 @@ fn eval_owned_read_door_stage<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
 ) -> Option<OwnedValue> {
-    eval_owned_first_last_nth::<S>(expr, input)
-        .or_else(|| eval_owned_slice_door::<S>(expr, input))
+    // The shape is tested here, inline, so the common stage that is neither (once per element on the
+    // generic route) never calls either door.
+    let read = match unwrap_paren(expr) {
+        Expr::Builtin(Builtin::First | Builtin::Last | Builtin::Nth(_)) => {
+            eval_owned_first_last_nth::<S>(expr, input)
+        }
+        Expr::Slice { .. }
+        | Expr::SliceExpr { .. }
+        | Expr::Try { catch: None, .. }
+        | Expr::Optional(_) => eval_owned_slice_door::<S>(expr, input),
+        _ => None,
+    };
+    read
         // A comparison or a boolean over such counts and keys (`length > 5`, `has(5) and length > 2`),
         // as `select` and `until` read one: only an answer is taken, an operand that raises or fans
         // out is the bridge's.
