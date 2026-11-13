@@ -147,8 +147,6 @@ pub(crate) use eval::nonfinite_yaml_spelling;
 pub use eval::set_debug_line_renderer;
 // #5306: `json::light` decodes a `group_by` group with the evaluator's own JSON materializer.
 pub(crate) use eval::to_owned as to_owned_standard_json;
-#[doc(hidden)]
-pub use eval::yq_encoder_writes_comments;
 pub use eval::{
     alias_identity, bound_def, enter_document_index_scope, enter_file_index_scope,
     enter_file_names_scope, enter_security_scope, enter_source_positions_scope, eval,
@@ -160,6 +158,8 @@ pub use eval::{
     VisibleDef, YqSemantics,
 };
 pub use eval::{eval_full, eval_owned_scalar_fast, eval_reindexed_document, with_stderr_muted};
+#[doc(hidden)]
+pub use eval::{yq_encoder_prints_leading_block, yq_encoder_writes_comments};
 #[doc(hidden)]
 pub use eval_generic::format_yq_encoder_from_tree;
 // #6925: Go's `strconv.Quote` and `url.QueryUnescape` over bytes, for the CLI's `-p uri`.

@@ -27205,7 +27205,21 @@ pub(crate) fn format_yq_props_commented(
 /// Whether yq's encoder for `-o=<format>` writes the comments of the nodes it is given: the formats that
 /// `format_yq_commented` gives them to (#7117, #7159).
 pub fn yq_encoder_writes_comments(encoder: &YqOutputEncoder) -> bool {
-    matches!(encoder, YqOutputEncoder::Xml(_) | YqOutputEncoder::Lua(_))
+    matches!(
+        encoder,
+        YqOutputEncoder::Xml(_) | YqOutputEncoder::Lua(_) | YqOutputEncoder::Kyaml(..)
+    )
+}
+
+/// Whether yq's encoder for `-o=<format>` prints the first document's leading block itself (#7117, #7158).
+///
+/// That block is the comments and blank lines before the document, and a `---`: `format_yq_commented` is
+/// handed it for these encoders.
+pub fn yq_encoder_prints_leading_block(encoder: &YqOutputEncoder) -> bool {
+    matches!(
+        encoder,
+        YqOutputEncoder::Xml(_) | YqOutputEncoder::Kyaml(..)
+    )
 }
 
 /// yq's text of `value`, a document node whose comments are `comments`, for an encoder that writes them
@@ -27223,6 +27237,23 @@ pub(crate) fn format_yq_commented(
             super::yq_xml::format_xml_commented(value, options, comments, leading)
         }
         YqOutputEncoder::Lua(options) => format_lua_commented(value, options, comments),
+        // An unwrapped string result is its own text, which has no node to hold a comment.
+        YqOutputEncoder::Kyaml(indent, unwrap, separators) => match value {
+            OwnedValue::String(text) if *unwrap => Ok(text.to_string()),
+            // An unwrapped scalar is its value alone: it has no node to hold a comment.
+            OwnedValue::Array(_) | OwnedValue::Object(_) => Ok(format_kyaml_commented(
+                value,
+                *indent,
+                comments,
+                leading,
+                *separators,
+            )),
+            _ => Ok(if *unwrap {
+                format_kyaml(value, *indent)
+            } else {
+                format_kyaml_commented(value, *indent, comments, leading, *separators)
+            }),
+        },
         // The encoders that read no comment.
         other => return format_yq_output::<YqSemantics>(other, value),
     }
@@ -27535,7 +27566,7 @@ fn format_yq_output<S: EvalSemantics>(
         YqOutputEncoder::Toml => format_toml(value),
         // #7093: unwrapped, a string result is its own text, as for `-o=json -r`; a collection, and every
         // other scalar, print as they do wrapped.
-        YqOutputEncoder::Kyaml(indent, unwrap) => match value {
+        YqOutputEncoder::Kyaml(indent, unwrap, _) => match value {
             OwnedValue::String(text) if *unwrap => Ok(text.to_string()),
             _ => Ok(format_kyaml(value, *indent)),
         },
@@ -28060,6 +28091,59 @@ fn format_toml(value: &OwnedValue) -> Result<String, EvalError> {
 /// not written. The result has no final line break: the printer adds it, so the `---` between documents
 /// starts a line as it does for YAML.
 fn format_kyaml(value: &OwnedValue, indent: usize) -> String {
+    format_kyaml_commented(
+        value,
+        indent,
+        &super::encoder_comments::NO_COMMENTS,
+        "",
+        false,
+    )
+}
+
+/// [`format_kyaml`] writing the comments of the nodes as yq's KYAML encoder does (#7158): the root's head
+/// comment above the `{`, a mapping key's and its value's head comment above the entry, a line comment after
+/// the `,` (the value's, else the key's), a foot comment (the value's, else the key's) after the entry, and
+/// the root's foot comment after the document. A comment line gets a `# ` when it has no `#`, and a line
+/// comment is its first line only.
+fn format_kyaml_commented(
+    value: &OwnedValue,
+    indent: usize,
+    comments: &super::encoder_comments::EncoderComments,
+    leading: &str,
+    separators: bool,
+) -> String {
+    use super::encoder_comments::EncoderComments;
+    /// `writeCommentBlock`: each non-blank line of `comment` at `columns`, with a `#` put in front of one
+    /// that has none.
+    fn block(out: &mut String, comment: &str, columns: usize) {
+        if comment.trim().is_empty() {
+            return;
+        }
+        for line in comment.replace("\r\n", "\n").split('\n') {
+            if line.trim().is_empty() {
+                continue;
+            }
+            out.push_str(&" ".repeat(columns));
+            if !line.trim_start().starts_with('#') {
+                out.push_str("# ");
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    /// `writeInlineComment`: a space and the first line of `comment`, with a `# ` when it has no `#`.
+    fn inline(out: &mut String, comment: &str) {
+        let comment = comment.replace("\r\n", "\n");
+        let first = comment.trim().lines().next().unwrap_or("").trim();
+        if first.is_empty() {
+            return;
+        }
+        out.push(' ');
+        if !first.starts_with('#') {
+            out.push_str("# ");
+        }
+        out.push_str(first);
+    }
     fn quote(text: &str) -> String {
         let mut out = string_with_capacity(text.len() + 2);
         out.push('"');
@@ -28096,19 +28180,52 @@ fn format_kyaml(value: &OwnedValue, indent: usize) -> String {
             other => props_value_to_string(other, false),
         }
     }
-    fn node(out: &mut String, value: &OwnedValue, indent: usize, level: usize, depth: usize) {
+    fn node(
+        out: &mut String,
+        value: &OwnedValue,
+        comments: &EncoderComments,
+        indent: usize,
+        level: usize,
+        depth: usize,
+    ) {
         assert_value_tree_depth(depth);
         let pad = |out: &mut String, columns: usize| out.push_str(&" ".repeat(columns));
         match value {
             OwnedValue::Object(entries) if entries.is_empty() => out.push_str("{}"),
             OwnedValue::Object(entries) => {
                 out.push_str("{\n");
-                for (name, entry) in entries {
-                    pad(out, level + indent);
+                for (index, (name, entry)) in entries.iter().enumerate() {
+                    let (key_comments, value_comments) = comments.entry(index, name);
+                    let entry_level = level + indent;
+                    block(out, &key_comments.head, entry_level);
+                    if !value_comments.own.head.is_empty()
+                        && value_comments.own.head != key_comments.head
+                    {
+                        block(out, &value_comments.own.head, entry_level);
+                    }
+                    pad(out, entry_level);
                     out.push_str(&key(name));
                     out.push_str(": ");
-                    node(out, entry, indent, level + indent, depth + 1);
-                    out.push_str(",\n");
+                    node(out, entry, value_comments, indent, entry_level, depth + 1);
+                    out.push(',');
+                    inline(
+                        out,
+                        if value_comments.own.line.is_empty() {
+                            &key_comments.line
+                        } else {
+                            &value_comments.own.line
+                        },
+                    );
+                    out.push('\n');
+                    block(
+                        out,
+                        if value_comments.own.foot.is_empty() {
+                            &key_comments.foot
+                        } else {
+                            &value_comments.own.foot
+                        },
+                        entry_level,
+                    );
                 }
                 pad(out, level);
                 out.push('}');
@@ -28116,10 +28233,16 @@ fn format_kyaml(value: &OwnedValue, indent: usize) -> String {
             OwnedValue::Array(items) if items.is_empty() => out.push_str("[]"),
             OwnedValue::Array(items) => {
                 out.push_str("[\n");
-                for item in items {
-                    pad(out, level + indent);
-                    node(out, item, indent, level + indent, depth + 1);
-                    out.push_str(",\n");
+                for (index, item) in items.iter().enumerate() {
+                    let item_comments = comments.item(index);
+                    let item_level = level + indent;
+                    block(out, &item_comments.own.head, item_level);
+                    pad(out, item_level);
+                    node(out, item, item_comments, indent, item_level, depth + 1);
+                    out.push(',');
+                    inline(out, &item_comments.own.line);
+                    out.push('\n');
+                    block(out, &item_comments.own.foot, item_level);
                 }
                 pad(out, level);
                 out.push(']');
@@ -28128,8 +28251,37 @@ fn format_kyaml(value: &OwnedValue, indent: usize) -> String {
         }
     }
     let mut out = String::new();
-    node(&mut out, value, indent, 0, 0);
+    leading_content(&mut out, leading, separators);
+    block(&mut out, &comments.own.head, 0);
+    node(&mut out, value, comments, indent, 0, 0);
+    inline(&mut out, &comments.own.line);
+    // The root's foot comment is printed as leading content is.
+    if !comments.own.foot.is_empty() {
+        out.push('\n');
+        leading_content(&mut out, &comments.own.foot, separators);
+    }
     out
+}
+
+/// yq's `PrintYAMLLeadingContent`: `content` as written, a `$yqDocSeparator$` line as `---` (unless `-N`) and a
+/// line with no `#` (other than a blank one or a `%` directive) with one put in front.
+fn leading_content(out: &mut String, content: &str, separators: bool) {
+    for line in content.split_inclusive('\n') {
+        if line.contains("$yqDocSeparator$") {
+            if separators {
+                out.push_str(if line.ends_with("\r\n") {
+                    "---\r\n"
+                } else {
+                    "---\n"
+                });
+            }
+        } else {
+            if line != "\n" && !line.starts_with('%') && !line.trim_start().starts_with('#') {
+                out.push_str("# ");
+            }
+            out.push_str(line);
+        }
+    }
 }
 
 /// yq's `-o=ini` encoder (#6924), over go-ini: the root's scalars are the default section (written first, with

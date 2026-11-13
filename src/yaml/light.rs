@@ -9000,7 +9000,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
         Some(out)
     }
 
-    fn xml_leading_content(&self) -> Option<String> {
+    fn yq_leading_content(&self) -> Option<String> {
         if !self.is_first_document_content() || self.index.after_bom() {
             return None;
         }

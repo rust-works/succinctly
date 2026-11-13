@@ -7839,13 +7839,17 @@ The encoder runs over the value model, which keeps no comment, node style or sou
 - A timestamp (`2001-01-01`) and a `!!binary` scalar are quoted strings, where yq writes their text bare.
 - yq's inline-table hint is set only by its TOML decoder, and `-p toml` writes the nodes as YAML text that is read back, so a TOML file written back as TOML (`*.toml` under `-o auto`, `-i`) writes an inline table as a table and drops its comments (see `-p toml` below).
 
-### `-o=kyaml` — comments and an opening `---` are not read (#6924)
+### `-o=kyaml` — a rebuilt value loses its comments (#6924, #7158)
 
 `-o=kyaml` is a port of yq's KYAML encoder and agrees with yq v4.53.3 on 3,500 random JSON documents under `-I0`, `-I1`, `-I4` and `-N`, and on multi-document input, where the `---` between documents is printed as for YAML.
-The encoder runs over the value model, so on a YAML input these still differ:
+Comments are written as yq's encoder writes them (#7158): the root's head comment above the `{`, a key's and its value's head comment above the entry, a line comment after the `,`, a foot comment after the entry, the root's foot comment after the document, and the first document's leading block (the comments and blank lines before it, and a `---` unless `-N`).
+They are read from the node the result came from and, for a write (`=`, `del()`, `sort_keys`), from its presentation tree (as `-o=xml`, #7156), and agree with yq on random comment positions over twelve document shapes (300 documents for each of the read and four write filters) and on 420 rows of `-N`, `-I` and `-r`.
+So on a YAML input these still differ:
 
-- A head, line or foot comment is dropped, where yq writes it (`a: 1, # c`).
-- An input whose first document opens with `---` prints that `---` first in yq (it keeps the document's leading separator as leading content), and here it does not; the same goes for the comments above it, and for the result of `to_entries`, `from_entries` and `with_entries`, which carry them in YAML output since #7081.
+- A head, line or foot comment is dropped from a value the filter rebuilds where the YAML printer drops its comments too (`with_entries(.)`, `to_entries | from_entries`, `. * {..}`, #5521), and under `--eval-all` (#4380), where yq keeps the comments of the nodes it copies.
+- A mapping built around a document that has comments before its first node (`{"x": .}`) holds them as the first entry's head comment, where yq drops them with the leading block.
+- A `%YAML` directive before the `---` is written by a read and not after a write.
+- A comment block that a blank line splits is one comment here, as in `-o=xml`.
 - The YAML 1.1 integer `1_000` is a string here (see the YAML 1.1 section above), so it is quoted, where yq writes it bare.
 - `-C` colours the output in yq (`-o=kyaml` and `-o=toml` have colour printers of their own) and does nothing here.
 - With `-0`, the separator between documents is `\n---` here and `---` in yq, the existing difference of the `-0` multi-document section above.

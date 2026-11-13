@@ -12580,6 +12580,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         OutputFormat::Kyaml => Some(YqOutputEncoder::Kyaml(
             usize::from(args.indent),
             args.unwrap_scalar == Some(true),
+            !args.no_doc,
         )),
         OutputFormat::Xml => Some(YqOutputEncoder::Xml(Box::new(XmlOptions {
             indent: usize::from(args.indent),
