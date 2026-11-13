@@ -27,6 +27,12 @@ use succinctly::yaml::{
 /// One level of indentation in the text written.
 const STEP: &str = "  ";
 
+/// The deepest element nesting read: 2,000. The tree is converted and written by recursion, so
+/// this keeps a document well inside the 1 MB main-thread stack of a Windows build, and no real
+/// document is a tenth as deep; a deeper one is refused, where yq has no bound and takes minutes
+/// on 100,000 levels.
+const MAX_DEPTH: usize = 2_000;
+
 /// The flags `-p xml` reads (yq's `XmlPreferences`).
 #[derive(Clone, Debug)]
 pub(super) struct XmlOptions {
@@ -53,7 +59,7 @@ pub(super) struct XmlOptions {
 impl Default for XmlOptions {
     /// yq's defaults (`NewDefaultXmlPreferences`).
     fn default() -> Self {
-        XmlOptions {
+        Self {
             attribute_prefix: "+@".to_string(),
             content_name: "+content".to_string(),
             proc_inst_prefix: "+p_".to_string(),
@@ -180,6 +186,7 @@ fn decode_xml(raw: &[u8], options: &XmlOptions) -> Result<(Builder, usize), Stri
     }];
     let mut current: Option<usize> = Some(0);
     let mut started = false;
+    let mut depth = 0usize;
     // yq dies of a nil dereference when it reads past the end of the root; this is the message
     // for the same input.
     let past_root = || "invalid XML: markup after the end of the document's root".to_string();
@@ -190,11 +197,18 @@ fn decode_xml(raw: &[u8], options: &XmlOptions) -> Result<(Builder, usize), Stri
                 let Some(cur) = current else {
                     return Err(past_root());
                 };
-                elements[cur].state = State::Started;
-                let mut label = name.local.clone();
-                if options.keep_namespace && !name.space.is_empty() {
-                    label = format!("{}:{}", name.space, name.local);
+                depth += 1;
+                if depth > MAX_DEPTH {
+                    return Err(format!(
+                        "invalid XML: elements nested deeper than {MAX_DEPTH} levels"
+                    ));
                 }
+                elements[cur].state = State::Started;
+                let label = if options.keep_namespace && !name.space.is_empty() {
+                    format!("{}:{}", name.space, name.local)
+                } else {
+                    name.local.clone()
+                };
                 let node = b.new_node();
                 elements.push(Element {
                     parent: Some(cur),
@@ -234,6 +248,7 @@ fn decode_xml(raw: &[u8], options: &XmlOptions) -> Result<(Builder, usize), Stri
                     continue;
                 };
                 elements[cur].state = State::Finished;
+                depth = depth.saturating_sub(1);
                 if let Some(parent) = elements[cur].parent {
                     let label = elements[cur].label.clone();
                     let (parent_node, node) = (elements[parent].node, elements[cur].node);
@@ -302,7 +317,7 @@ enum Y {
         foot: String,
     },
     Seq {
-        items: Vec<Y>,
+        items: Vec<Self>,
         head: String,
         foot: String,
     },
@@ -439,10 +454,11 @@ impl Converter<'_> {
             .map(|kv| (kv.key.clone(), kv.values.clone(), kv.foot.clone()))
             .collect();
         for (i, (key, values, kv_foot)) in kvs.into_iter().enumerate() {
-            let mut entry_head = String::new();
-            if i == 0 {
-                entry_head = process_comment(&head);
-            }
+            let mut entry_head = if i == 0 {
+                process_comment(&head)
+            } else {
+                String::new()
+            };
             let value = if values.len() > 1 {
                 self.create_sequence(&values)
             } else {
@@ -658,7 +674,7 @@ impl Writer {
                 }
                 Y::Map(entries) => {
                     // The first key's head comment follows the dash.
-                    let mut inner = Writer {
+                    let mut inner = Self {
                         out: String::new(),
                         pending: Vec::new(),
                     };
@@ -675,7 +691,7 @@ impl Writer {
                     foot: f,
                 } => {
                     // A sequence in a sequence: its first dash follows ours.
-                    let mut inner = Writer {
+                    let mut inner = Self {
                         out: String::new(),
                         pending: Vec::new(),
                     };
@@ -838,6 +854,24 @@ mod tests {
         assert_eq!(error("</a><!DOCTYPE a>"), message);
         assert_eq!(yaml("</a>"), "");
         assert_eq!(yaml("<a/></a></a>"), "a:\n");
+    }
+
+    #[test]
+    fn elements_nested_past_the_limit_are_refused() {
+        // The CLI runs on a main thread with a larger stack than a test thread has.
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(|| {
+                let nested = |n: usize| format!("{}{}", "<a>".repeat(n), "</a>".repeat(n));
+                assert!(transcode(nested(MAX_DEPTH).as_bytes(), &XmlOptions::default()).is_ok());
+                assert_eq!(
+                    error(&nested(MAX_DEPTH + 1)),
+                    "invalid XML: elements nested deeper than 2000 levels"
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

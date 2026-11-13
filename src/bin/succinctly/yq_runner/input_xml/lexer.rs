@@ -50,8 +50,8 @@ pub(super) enum XmlError {
 impl XmlError {
     pub(super) fn message(&self) -> String {
         match self {
-            XmlError::Eof => "EOF".to_string(),
-            XmlError::Message(message) => message.clone(),
+            Self::Eof => "EOF".to_string(),
+            Self::Message(message) => message.clone(),
         }
     }
 }
@@ -166,8 +166,7 @@ pub(super) fn trim_non_graphic(s: &str) -> &str {
         .char_indices()
         .rev()
         .find(|&(_, c)| graphic(c))
-        .map(|(i, c)| i + c.len_utf8())
-        .unwrap_or(s.len());
+        .map_or(s.len(), |(i, c)| i + c.len_utf8());
     &s[start..end]
 }
 
@@ -688,21 +687,20 @@ impl<'a> Decoder<'a> {
             let Some(b) = self.mustgetc() else {
                 return Err(self.take_err());
             };
-            let value;
-            if b != b'=' {
+            let value = if b != b'=' {
                 if self.strict {
                     self.err = Some(self.syntax_error("attribute name without = in element"));
                     return Err(self.take_err());
                 }
                 self.ungetc(b);
-                value = attr_name.local.clone();
+                attr_name.local.clone()
             } else {
                 self.space();
                 let Some(data) = self.attrval() else {
                     return Err(self.take_err());
                 };
-                value = String::from_utf8_lossy(&data).into_owned();
-            }
+                String::from_utf8_lossy(&data).into_owned()
+            };
             attr.push(Attr {
                 name: attr_name,
                 value,
@@ -1232,7 +1230,7 @@ mod tests {
         };
         assert_eq!((name.space.as_str(), name.local.as_str()), ("u", "a"));
         assert_eq!(attr[1].name.space, "u");
-        assert_eq!(strict("<x:a xmlns:x='u'></x:a xmlns:x='v'>").is_err(), true);
+        assert!(strict("<x:a xmlns:x='u'></x:a xmlns:x='v'>").is_err());
         assert_eq!(
             strict("<a xmlns:x='u'><x:b></y:b></a>").unwrap_err(),
             "XML syntax error on line 1: element <b> in space x closed by </b> in space y"
