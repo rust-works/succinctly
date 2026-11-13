@@ -27260,7 +27260,7 @@ fn props_comments_of(
             for (index, (key, entry)) in entries.iter().enumerate() {
                 let (key_comments, value_comments) = comments.entry(index, key);
                 let path = if prefix.is_empty() {
-                    key.to_string()
+                    key.clone()
                 } else {
                     format!("{prefix}.{key}")
                 };
