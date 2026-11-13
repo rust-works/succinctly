@@ -99,3 +99,32 @@ fn system_operator_runs_a_program_as_yq_does_7025() -> Result<()> {
     }
     Ok(())
 }
+
+/// The program runs once per node the operator reaches, and a write that holds one probes nothing
+/// first (the counts are yq's: `.c = system(..)` is one run, `.b[] |= system(..)` two).
+#[test]
+fn system_operator_runs_the_program_once_per_node_7025() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    let log = dir.path().join("log");
+    let command = format!("system(\"sh\"; [\"-c\", \"echo x >> {}\"])", log.display());
+    for (template, runs) in [
+        ("CMD", 1),
+        (".c = CMD", 1),
+        (".a |= CMD", 1),
+        (".b[] |= CMD", 2),
+        (".b[0] = CMD", 1),
+        (".a = (CMD | length)", 1),
+        (".a = CMD | .b = CMD", 2),
+        (".c = (CMD // \"d\")", 1),
+        ("[.b[] | CMD]", 2),
+    ] {
+        let _ = std::fs::remove_file(&log);
+        let filter = template.replace("CMD", &command);
+        let (_, err, code) =
+            run_yq_stdin_with_stderr(&filter, DOC, &["--security-enable-system-operator"])?;
+        assert_eq!(code, 0, "{template}: {err}");
+        let lines = std::fs::read_to_string(&log).map_or(0, |text| text.lines().count());
+        assert_eq!(lines, runs, "{template}");
+    }
+    Ok(())
+}

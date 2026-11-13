@@ -111092,8 +111092,15 @@ fn builtin_system<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         let signal = std::os::unix::process::ExitStatusExt::signal(&output.status);
                         #[cfg(not(unix))]
                         let signal: Option<i32> = None;
+                        // Go's names for the signals that are the same on Linux and macOS.
                         match signal {
+                            Some(1) => "signal: hangup".to_string(),
+                            Some(2) => "signal: interrupt".to_string(),
+                            Some(3) => "signal: quit".to_string(),
                             Some(9) => "signal: killed".to_string(),
+                            Some(11) => "signal: segmentation fault".to_string(),
+                            Some(13) => "signal: broken pipe".to_string(),
+                            Some(14) => "signal: alarm clock".to_string(),
                             Some(15) => "signal: terminated".to_string(),
                             Some(n) => format!("signal: {n}"),
                             None => "exit status -1".to_string(),

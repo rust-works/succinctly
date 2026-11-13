@@ -10536,7 +10536,10 @@ impl<'a> Parser<'a> {
         }
 
         // #7025: yq's `system(command)` and `system(command; args)`; not a jq name.
-        if self.mode == ParserMode::Yq && self.matches_keyword("system") {
+        if self.mode == ParserMode::Yq
+            && self.matches_keyword("system")
+            && !self.shadowable_defs.contains("system")
+        {
             let keyword_start = self.pos;
             self.consume_keyword("system");
             self.skip_ws();

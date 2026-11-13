@@ -8148,6 +8148,9 @@ Matching either needs a string that can hold bytes that are not UTF-8, or the su
 - **`system(..)` runs a program only under `--security-enable-system-operator`; without it the operator is an error (`system operations are disabled, use --security-enable-system-operator to enable`), raised when it runs.**
   The node is the program's standard input, written by this build's YAML writer: a flow sequence under a key (`b: [x, y]`) is a block sequence on that input, where yq keeps the flow style.
   An empty or an over-long argument list is a parse error here with this build's wording (`system()` is `'system' expects 1 arg but received none` in yq; `system("a"; "b"; "c")` parses there as an operator whose argument list holds the rest).
+  A program's standard output is read as UTF-8 with U+FFFD for an invalid byte, where yq passes the bytes on; a signal is named for the ones that are alike on Linux and macOS (`killed`, `terminated`, `segmentation fault`, ...) and by number for the rest; a missing shebang interpreter is worded as a missing program.
+  A write probes nothing that holds a `system(..)`: `.c = system("cmd")` runs `cmd` once, as yq does.
+  A plain assignment to several targets (`(.a, .b) = system("cmd")`, `.[] = system("cmd")`) runs it once here, where yq runs it once per target.
   `system` is yq mode only; `succinctly jq` does not have it.
 - **`--security-disable-env-ops` and `--security-disable-file-ops` refuse an operator when it runs, where yq refuses it when its handler is called.**
   `select(false) | strenv(X)`, `.zz[] | strenv(X)` and `.a | select(. == 2) | strenv(X)` fail with `env operations have been disabled` in yq, because the handler is called with an empty context.
