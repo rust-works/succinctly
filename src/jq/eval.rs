@@ -93575,9 +93575,11 @@ fn eval_owned_read_door_stage<S: EvalSemantics>(
 ) -> Option<OwnedValue> {
     // The shape is tested here, inline, so the common stage that is neither (once per element on the
     // generic route) never calls either door.
-    let read = match unwrap_paren(expr) {
+    // The door is handed the stage with its parentheses off, as it is tested: `(first)` is `first`.
+    let shape = unwrap_paren(expr);
+    let read = match shape {
         Expr::Builtin(Builtin::First | Builtin::Last | Builtin::Nth(_)) => {
-            eval_owned_first_last_nth::<S>(expr, input)
+            eval_owned_first_last_nth::<S>(shape, input)
         }
         Expr::Slice { .. }
         | Expr::SliceExpr { .. }
@@ -93772,14 +93774,7 @@ fn eval_owned_slice_door<S: EvalSemantics>(expr: &Expr, input: &OwnedValue) -> O
         Expr::SliceExpr { target, start, end }
             if matches!(unwrap_paren(target), Expr::Identity) =>
         {
-            let bound = |bound: &Option<Box<Expr>>, round: fn(f64) -> f64| match bound {
-                None => Some(Ok(None)),
-                Some(expr) => Some(owned_bound_to_i64_for::<S>(
-                    &eval_owned_closed::<S>(expr)?,
-                    round,
-                )),
-            };
-            let (start, end) = (bound(start, f64::floor)?, bound(end, f64::ceil)?);
+            let (start, end) = owned_closed_slice_bounds::<S>(start, end)?;
             if start.is_err() || end.is_err() {
                 return None;
             }
@@ -93791,6 +93786,26 @@ fn eval_owned_slice_door<S: EvalSemantics>(expr: &Expr, input: &OwnedValue) -> O
         Ok(Some(sliced)) => Some(sliced),
         _ => None,
     }
+}
+
+/// The bounds of a computed slice (`.[$i:]`, `.[(1 + 0):]`) whose bound expressions read no `.`
+/// (#7132), evaluated as the evaluator's slice route evaluates them: floor for the start, ceil for
+/// the end, under the mode's own bound grammar ([`owned_bound_to_i64_for`]). `None` is a bound
+/// that is not closed, or that does not evaluate to one value: the evaluator's. An absent bound is
+/// `Ok(None)`. The owned slice door and the fused slice read (#4286) both take their bounds here,
+/// so the rule has one spelling.
+pub(crate) fn owned_closed_slice_bounds<S: EvalSemantics>(
+    start: &Option<Box<Expr>>,
+    end: &Option<Box<Expr>>,
+) -> Option<(ComputedSliceBound, ComputedSliceBound)> {
+    let bound = |bound: &Option<Box<Expr>>, round: fn(f64) -> f64| match bound {
+        None => Some(Ok(None)),
+        Some(expr) => Some(owned_bound_to_i64_for::<S>(
+            &eval_owned_closed::<S>(expr)?,
+            round,
+        )),
+    };
+    Some((bound(start, f64::floor)?, bound(end, f64::ceil)?))
 }
 
 /// [`eval_owned_input`]'s bridge alone, no fast path and no demotion: build
@@ -130741,6 +130756,14 @@ mod tests {
         // `first` and `last` are jq's: yq gates them (#1512).
         let first = parse("first").unwrap();
         assert!(eval_owned_first_last_nth::<YqSemantics>(&first, &array).is_none());
+        // Parentheses are spelling (#7132 review): `(first)` is answered as `first` is.
+        for (src, answer) in [("(first)", 1), ("((last))", 2), ("(nth(1))", 2)] {
+            assert_eq!(
+                eval_owned_value_doors::<JqSemantics>(&parse(src).unwrap(), &array),
+                Some(OwnedValue::Int(answer)),
+                "{src}"
+            );
+        }
         // A slice is answered for an array or a string, in jq mode, with bounds that resolve; a bound
         // that is not a number, a target of any other kind and yq mode are the bridge's.
         let slice = parse(".[1:]").unwrap();
@@ -131630,6 +131653,39 @@ mod tests {
                 crate::jq::eval_generic::eval_owned_fused_slice_read::<JqSemantics>(stages, &value)
                     .is_none(),
                 "{value:?}"
+            );
+        }
+        // #7132 review: a container element shares its storage with the array, which a live #2889
+        // embed table witnesses, so with a binding in scope that read is the evaluator's; a scalar
+        // element is still answered, and with the table gone the container is too.
+        let nested = OwnedValue::array_from(vec![
+            OwnedValue::array_from(vec![OwnedValue::Int(1)]),
+            OwnedValue::Int(2),
+        ]);
+        let fused = |src: &str| {
+            let Expr::Pipe(stages) = parse(src).unwrap() else {
+                panic!("{src}: not a pipe");
+            };
+            crate::jq::eval_generic::eval_owned_fused_slice_read::<JqSemantics>(&stages, &nested)
+        };
+        let origin = BindOrigin::Node {
+            node: 1,
+            document: 9,
+        };
+        let mut bound = OwnedValue::array_from(vec![OwnedValue::Int(1)]);
+        let guard =
+            super::super::eval_generic::embed_table_push::<JqSemantics>(Some(&origin), &mut bound)
+                .expect("a container bind");
+        for src in [".[0:][0]", ".[(0+0):][0]"] {
+            assert_eq!(fused(src), None, "{src} with the table live");
+        }
+        assert_eq!(fused(".[1:][0]"), Some(OwnedValue::Int(2)));
+        drop(guard);
+        for src in [".[0:][0]", ".[(0+0):][0]"] {
+            assert_eq!(
+                fused(src),
+                Some(OwnedValue::array_from(vec![OwnedValue::Int(1)])),
+                "{src}"
             );
         }
     }

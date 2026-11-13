@@ -28336,14 +28336,7 @@ pub(crate) fn eval_owned_fused_slice_read<S: EvalSemantics>(
     };
     let (start, end) = match slice {
         Expr::SliceExpr { target, start, end } if matches!(**target, Expr::Identity) => {
-            let bound = |bound: &Option<Box<Expr>>, round: fn(f64) -> f64| match bound {
-                None => Some(Ok(None)),
-                Some(expr) => {
-                    let value = crate::jq::eval::eval_owned_closed::<S>(expr)?;
-                    Some(crate::jq::eval::owned_bound_to_i64_for::<S>(&value, round))
-                }
-            };
-            let (start, end) = (bound(start, f64::floor)?, bound(end, f64::ceil)?);
+            let (start, end) = crate::jq::eval::owned_closed_slice_bounds::<S>(start, end)?;
             crate::jq::eval::resolve_computed_slice_bounds_for::<S>(
                 SliceTargetKind::Sliceable,
                 &start,
@@ -28360,7 +28353,13 @@ pub(crate) fn eval_owned_fused_slice_read<S: EvalSemantics>(
     let range = SliceBounds::from_literals(start, end).resolve(items.len());
     Some(match fused_slice_landing::<S>(read, &range)? {
         SliceLanding::Value(owned) => owned,
-        SliceLanding::Element(position) => items.get(position)?.clone(),
+        // A container element shares its storage with `input`, which the #2889 embed table
+        // witnesses while it is live: that read is the evaluator's, as for the `first`/`last`/`nth`
+        // and slice doors (#7132 review).
+        SliceLanding::Element(position) => match items.get(position)? {
+            OwnedValue::Array(_) | OwnedValue::Object(_) if embed_table_active() => return None,
+            element => element.clone(),
+        },
     })
 }
 

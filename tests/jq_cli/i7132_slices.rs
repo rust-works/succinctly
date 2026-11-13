@@ -2229,6 +2229,122 @@ const NULL_INPUT_ROWS: &[(&str, &str, &str, i32)] = &[
         "jq: error (at <unknown>): Cannot index boolean with object\n",
         5,
     ),
+    // #7132 review: an element a door reads out of a bound array is the node `$y` holds, as in jq
+    // (`path($y)` is `[]`), and a parenthesised read is answered as the bare one.
+    (
+        "[[1,2],[3]] as $x | $x[0] as $y | [range(1) | $x | .[0:1][0]] | .[0] | path($y)",
+        "[]\n",
+        "",
+        0,
+    ),
+    (
+        "[[[1,2],[3]][] ] as $x | $x[0] as $y | [range(1) | $x | .[0:1][0]] | .[0] | path($y)",
+        "[]\n",
+        "",
+        0,
+    ),
+    (
+        "[[1,2],[3]] as $x | $x[0] as $y | reduce range(1) as $i (null; $x | .[0:1][0]) | path($y)",
+        "[]\n",
+        "",
+        0,
+    ),
+    (
+        "[[[1,2],[3]][] ] as $x | $x[0] as $y | reduce range(1) as $i (null; $x | .[0:1][0]) | path($y)",
+        "[]\n",
+        "",
+        0,
+    ),
+    (
+        "[[1,2],[3]] as $x | $x[0] as $y | reduce range(1) as $i (null; $x | nth(0)) | path($y)",
+        "[]\n",
+        "",
+        0,
+    ),
+    (
+        "[[[1,2],[3]][] ] as $x | $x[0] as $y | reduce range(1) as $i (null; $x | nth(0)) | path($y)",
+        "[]\n",
+        "",
+        0,
+    ),
+    (
+        "[[1,2],[3]] as $x | $x[0] as $y | reduce range(1) as $i (null; $x | if length > 1 then .[0] else 0 end) | path($y)",
+        "[]\n",
+        "",
+        0,
+    ),
+    (
+        "[[[1,2],[3]][] ] as $x | $x[0] as $y | reduce range(1) as $i (null; $x | if length > 1 then .[0] else 0 end) | path($y)",
+        "[]\n",
+        "",
+        0,
+    ),
+    (
+        "[[1,2],[3]] as $x | $x[0] as $y | [range(1) | $x | .[0:1] | first] | .[0] | path($y)",
+        "[]\n",
+        "",
+        0,
+    ),
+    (
+        "[[[1,2],[3]][] ] as $x | $x[0] as $y | [range(1) | $x | .[0:1] | first] | .[0] | path($y)",
+        "[]\n",
+        "",
+        0,
+    ),
+    (
+        "[[1,2],[3]] as $x | $x[0] as $y | [range(1) | $x | .[-2:-1][0]?] | .[0] | path($y)",
+        "[]\n",
+        "",
+        0,
+    ),
+    (
+        "[[[1,2],[3]][] ] as $x | $x[0] as $y | [range(1) | $x | .[-2:-1][0]?] | .[0] | path($y)",
+        "[]\n",
+        "",
+        0,
+    ),
+    (
+        "[[1,2],[3]] as $x | $x[0] as $y | [range(1) | $x | (first)] | .[0] | path($y)",
+        "[]\n",
+        "",
+        0,
+    ),
+    (
+        "[[[1,2],[3]][] ] as $x | $x[0] as $y | [range(1) | $x | (first)] | .[0] | path($y)",
+        "[]\n",
+        "",
+        0,
+    ),
+    (
+        "[[1,2],[3]] as $x | $x[0] as $y | [range(1) | $x | .[(0+0):][0]] | .[0] | path($y)",
+        "[]\n",
+        "",
+        0,
+    ),
+    (
+        "[[[1,2],[3]][] ] as $x | $x[0] as $y | [range(1) | $x | .[(0+0):][0]] | .[0] | path($y)",
+        "[]\n",
+        "",
+        0,
+    ),
+    (
+        "[1,2,3] as $a | [range(2) | $a | (first)]",
+        "[1,1]\n",
+        "",
+        0,
+    ),
+    (
+        "[1,2,3] as $a | [range(2) | $a | ((nth(1)))]",
+        "[2,2]\n",
+        "",
+        0,
+    ),
+    (
+        "\"abc\" as $a | [range(2) | $a | (first)]",
+        "",
+        "jq: error (at <unknown>): Cannot index string with number\n",
+        5,
+    ),
 ];
 
 #[test]
