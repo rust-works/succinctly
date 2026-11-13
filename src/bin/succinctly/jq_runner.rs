@@ -7057,14 +7057,28 @@ fn read_inputs(
     }
 
     // #7023: `-R` over a lone regular file reads its lines a window at a time, as the plain route
-    // reads its documents; #7024: so does `-R` over standard input. Anything the gate turns down is
-    // read whole below.
-    if let Some((reader, len, front)) = raw_windowed_source(args, &files) {
-        let mut windows = window::LineWindows::new(reader, len, lazy_window_bytes(), front);
-        let first = windows
-            .next_window(None, report_input_read_failure)
+    // reads its documents; #7024: so does `-R` over standard input, and over several regular files,
+    // each a window at a time and in turn. Anything the gate turns down is read whole below.
+    if let Some(sources) = raw_windowed_sources(args, &files) {
+        let mut windows: Vec<Option<window::LineWindows>> = sources
+            .into_iter()
+            .map(|(reader, len, front)| {
+                Some(window::LineWindows::new(
+                    reader,
+                    len,
+                    lazy_window_bytes(),
+                    front,
+                ))
+            })
+            .collect();
+        // The first file's first window now, as for one file; the others when the lines get there.
+        let first = windows[0]
+            .as_mut()
+            .and_then(|first| first.next_window(None, report_input_read_failure))
             .map(raw_window_text)
             .unwrap_or_default();
+        let mut texts = vec![(0, first)];
+        texts.extend((1..windows.len()).map(|at| (u32::try_from(at).unwrap_or(u32::MAX), String::new())));
         opened.clone_from(&files);
         let mut locations =
             InputLocations::new(files.iter().map(|p| Some(input_display_name(p))).collect());
@@ -7073,7 +7087,7 @@ fn read_inputs(
             newlines: 0,
             unknown: true,
         });
-        LAZY_RAW_INPUTS.with(|slot| *slot.borrow_mut() = Some(vec![(0, first)]));
+        LAZY_RAW_INPUTS.with(|slot| *slot.borrow_mut() = Some(texts));
         LAZY_RAW_WINDOWS.with(|slot| *slot.borrow_mut() = Some(windows));
         return Ok(Ok((Vec::new(), locations, None, Vec::new())));
     }
@@ -11365,6 +11379,38 @@ fn raw_window_flags(args: &JqCommand) -> bool {
 /// bytes already read from it, which come first.
 type RawWindowed = (Box<dyn Read>, Option<u64>, Vec<u8>);
 
+/// The sources `-R` reads a window at a time, one for each file in order, or `None` for a run that reads
+/// its input whole: [`raw_windowed_source`]'s one, or several regular files named on the command line,
+/// 4 MiB or more between them and up to [`MAX_WINDOWED_FILES`] (#7024), judged as the plain route judges
+/// them. Each file's lines are decoded on their own, a line jq's reader runs on into the next file
+/// included, as jq decodes them.
+fn raw_windowed_sources(args: &JqCommand, files: &[PathBuf]) -> Option<Vec<RawWindowed>> {
+    if files.len() < 2 {
+        return raw_windowed_source(args, files).map(|source| vec![source]);
+    }
+    if !raw_window_flags(args) || files.len() > MAX_WINDOWED_FILES {
+        return None;
+    }
+    // Every path is judged by `stat` before any is opened, as the plain route does.
+    let mut total = 0u64;
+    for path in files {
+        total = total.checked_add(regular_file(path)?.len())?;
+    }
+    if total < raw_window_min_bytes() {
+        return None;
+    }
+    files
+        .iter()
+        .map(|path| {
+            let file = std::fs::File::open(path).ok()?;
+            // What was opened, not what the path named a moment ago.
+            let meta = file.metadata().ok()?;
+            (meta.is_file() && !names_stdin(&meta) && !names_output(&meta))
+                .then(|| (Box::new(file) as Box<dyn Read>, Some(meta.len()), Vec::new()))
+        })
+        .collect()
+}
+
 /// The source `-R` reads a window at a time (#7023), or `None` for a run that reads its input whole: the
 /// lone regular file named on the command line, or standard input when no file is named (#7024).
 fn raw_windowed_source(args: &JqCommand, files: &[PathBuf]) -> Option<RawWindowed> {
@@ -14123,20 +14169,21 @@ fn lazy_raw_producer(
     lazy_raw_producer_windowed(files, None, exhausted)
 }
 
-/// [`lazy_raw_producer`] for a lone file read a window at a time (#7023): `files` holds its first
-/// window as its text, and `rest` reads the windows after it, each when the lines of the one before
-/// are over. A window ends at a line break, so a line is never split by one, and the text of a window
-/// is dropped when the next is read.
+/// [`lazy_raw_producer`] for files read a window at a time (#7023, #7024): `files` holds the text read
+/// of each so far (the first window of the first, nothing of the rest), and `rest` reads the windows
+/// after it, for each file in turn, each when the lines of the one before are over. A window ends at a
+/// line break, so a line is never split by one, and the text of a window is dropped when the next is
+/// read. A file's last line without a line break is the front of the next file's first, as jq reads it.
 fn lazy_raw_producer_windowed(
     files: Vec<(u32, String)>,
-    rest: Option<window::LineWindows>,
+    rest: Option<Vec<Option<window::LineWindows>>>,
     exhausted: Option<(u32, u32)>,
 ) -> jq::InputProducer {
     let mut files = files;
     // A file read in windows is not counted before the program starts: the end of the stream is the
     // newlines the producer has counted when it gets there, and `<unknown>` if the last line has none.
     let windowed = rest.is_some();
-    let mut rest = rest;
+    let mut rest = rest.unwrap_or_default();
     let last = files.len().saturating_sub(1);
     // The file being read and the offset in it, the newlines of that file read so far (a line's
     // number is the count at its own newline, and a final line without one is on the file's
@@ -14162,15 +14209,16 @@ fn lazy_raw_producer_windowed(
             }
             open.push_str(&text[at..]);
             // The next window of a file read in windows: the text before it is dropped.
+            if let Some(next) = rest
+                .get_mut(file)
+                .and_then(Option::as_mut)
+                .and_then(|windows| windows.next_window(None, report_input_read_failure))
+            {
+                files[file].1 = raw_window_text(next);
+                at = 0;
+                continue;
+            }
             if file == last {
-                if let Some(next) = rest
-                    .as_mut()
-                    .and_then(|windows| windows.next_window(None, report_input_read_failure))
-                {
-                    files[file].1 = raw_window_text(next);
-                    at = 0;
-                    continue;
-                }
                 break;
             }
             // Past the file: its text is no longer needed.
@@ -14667,9 +14715,10 @@ thread_local! {
     /// call site that seeds the `input` queue takes.
     static LAZY_RAW_INPUTS: std::cell::RefCell<Option<Vec<(u32, String)>>> =
         const { std::cell::RefCell::new(None) };
-    /// Set by [`get_inputs`] with [`LAZY_RAW_INPUTS`] for a lone file read a window at a time
-    /// (#7023): the windows after the first, which the producer of the lines reads as it goes.
-    static LAZY_RAW_WINDOWS: std::cell::RefCell<Option<window::LineWindows>> =
+    /// Set by [`get_inputs`] with [`LAZY_RAW_INPUTS`] for sources read a window at a time (#7023,
+    /// #7024): for each file of it, in order, the windows after the text it holds, which the producer
+    /// of the lines reads as it goes.
+    static LAZY_RAW_WINDOWS: std::cell::RefCell<Option<Vec<Option<window::LineWindows>>>> =
         const { std::cell::RefCell::new(None) };
     /// Set by [`get_inputs`] for a `--seq` stream (#6500): its records, converted as the program
     /// reads them, which the call site that seeds the `input` queue takes.
