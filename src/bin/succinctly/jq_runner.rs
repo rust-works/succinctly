@@ -4520,7 +4520,10 @@ fn stopped(on_error: Option<OnError>, sink: &ErrorSink) -> bool {
 /// open, which makes it 2 as it does every other end of the run (`open_failed`, #5472).
 /// Also the code of a run a fault in the input ended (#6476): it is `code` unless a file did not open.
 fn halt_exit_code(code: i32, open_failed: bool) -> i32 {
-    if open_failed || LAZY_OPEN_FAILED.with(std::cell::Cell::get) {
+    if open_failed
+        || LAZY_OPEN_FAILED.with(std::cell::Cell::get)
+        || INPUT_READ_FAILED.with(std::cell::Cell::get)
+    {
         exit_codes::USAGE_ERROR
     } else {
         code
@@ -6947,6 +6950,7 @@ fn read_inputs(
     LAZY_SEQ_INPUTS.with(|slot| *slot.borrow_mut() = None);
     defer_open_failures(Vec::new(), false);
     LAZY_OPEN_FAILED.with(|seen| seen.set(false));
+    INPUT_READ_FAILED.with(|failed| failed.set(false));
     SLURP_DIRECTORY_READ.with(|slurp| slurp.set(false));
     LAST_DIRECTORY_READ.with(|read| read.set(false));
     SLURP_READ_SEEN.with(|seen| seen.set(false));
@@ -10798,7 +10802,16 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
         let pushed_back = STDIN_PUSHBACK.with(|slot| slot.borrow_mut().take());
         let mut stdin =
             std::io::Cursor::new(pushed_back.unwrap_or_default()).chain(std::io::stdin());
-        let head = read_head(&mut stdin).context("Failed to read from stdin")?;
+        // #7126: standard input that cannot be read is an empty one and ends the run with exit 2.
+        let head = if crate::stdin_access::unreadable() {
+            note_stdin_read_failed();
+            Vec::new()
+        } else {
+            read_head(&mut stdin).unwrap_or_else(|_| {
+                note_stdin_read_failed();
+                Vec::new()
+            })
+        };
         let skip = bom_to_skip(&head, &mut look_for_bom);
         openers.push(Box::new(move || {
             let rest = std::io::Cursor::new(head[skip..].to_vec()).chain(stdin);
@@ -10814,27 +10827,24 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
         if is_stdin_dash(path) {
             // `-` is standard input: the first one holds it all (kept whole), a later one is empty.
             let first = !std::mem::replace(&mut dash_seen, true);
-            let read = if first {
-                dash_stdin_bytes()
+            let (mut bytes, failed) = if first {
+                dash_stdin_read()
             } else {
-                Ok(Vec::new())
+                (Vec::new(), false)
             };
-            match read {
-                Ok(mut bytes) => {
-                    let skip = bom_to_skip(&bytes[..bytes.len().min(3)], &mut look_for_bom);
-                    bytes.drain(..skip);
-                    opened.push(path.clone());
-                    openers.push(report_unopened_before(
-                        std::mem::take(&mut unopened),
-                        Box::new(move || Ok(Box::new(std::io::Cursor::new(bytes)))),
-                    ));
-                }
-                Err(e) => {
-                    let e = InputFileOpenError::new(path, e.to_string());
-                    note_open_failure_at(opened.len());
-                    unopened.push(e); // patchcov: coverage tolerate-line reason="untestable: stdin failing part-way"
-                }
-            }
+            let skip = bom_to_skip(&bytes[..bytes.len().min(3)], &mut look_for_bom);
+            bytes.drain(..skip);
+            opened.push(path.clone());
+            openers.push(report_unopened_before(
+                std::mem::take(&mut unopened),
+                // #7126: a standard input that failed ends the run with exit 2 once the reader gets to it.
+                Box::new(move || {
+                    if failed {
+                        note_stdin_read_failed();
+                    }
+                    Ok(Box::new(std::io::Cursor::new(bytes)))
+                }),
+            ));
             continue;
         }
         let probed = std::fs::File::open(path)
@@ -10951,19 +10961,43 @@ fn bom_to_skip(head: &[u8], look_for_bom: &mut bool) -> usize {
     crate::front_matter::leading_bom_len(head)
 }
 
-/// Read stdin to bytes.
+/// A read of standard input failed, or it cannot be read at all (`jq . 0>>file`, `jq . 0<&-`,
+/// `jq . < /`): jq reads what it got (nothing, for a descriptor it cannot read), says nothing, and
+/// exits 2 once the run is over, whatever the program left (#7126).
+fn note_stdin_read_failed() {
+    INPUT_READ_FAILED.with(|failed| failed.set(true));
+}
+
+/// Read stdin to bytes. A stdin that cannot be read (closed, write-only, a directory) is an empty
+/// one that ends the run with exit 2, as it does in jq (#7126), and so is the end of one that
+/// failed part-way, after the bytes it gave.
 fn read_stdin_bytes() -> Result<Vec<u8>> {
+    let (bytes, failed) = read_stdin_bytes_unreported();
+    if failed {
+        note_stdin_read_failed();
+    }
+    Ok(bytes)
+}
+
+/// [`read_stdin_bytes`] without noting a failure: the bytes read, and whether the read failed. For
+/// a caller that notes it when jq's reader reaches the source, not when the source is opened.
+fn read_stdin_bytes_unreported() -> (Vec<u8>, bool) {
+    // Rust's `stdin` reads a descriptor it cannot read as empty, which hides the failure.
+    if crate::stdin_access::unreadable() {
+        STDIN_PUSHBACK.with(|slot| slot.borrow_mut().take());
+        STDIN_PUSHBACK_ERROR.with(|slot| slot.borrow_mut().take());
+        return (Vec::new(), true);
+    }
     if let Some(bytes) = STDIN_PUSHBACK.with(|slot| slot.borrow_mut().take()) {
-        if let Some(error) = STDIN_PUSHBACK_ERROR.with(|slot| slot.borrow_mut().take()) {
-            return Err(anyhow::Error::new(error).context("Failed to read from stdin"));
-        }
-        return Ok(bytes);
+        let failed = STDIN_PUSHBACK_ERROR
+            .with(|slot| slot.borrow_mut().take())
+            .is_some();
+        return (bytes, failed);
     }
     let mut buf = Vec::new();
-    std::io::stdin()
-        .read_to_end(&mut buf)
-        .context("Failed to read from stdin")?;
-    Ok(buf)
+    // What `read_to_end` appended before a failure stays in `buf`.
+    let failed = std::io::stdin().read_to_end(&mut buf).is_err();
+    (buf, failed)
 }
 
 /// Whether an input file argument is `-`, which jq reads as standard input (#6023).
@@ -10975,18 +11009,28 @@ thread_local! {
     /// What standard input held when a `-` input first asked for it (#6023). A route can read the
     /// file list, decline it and leave the next route to read it again; stdin can be read once, so
     /// the bytes are kept and each pass over the list hands them to its first `-` again.
-    static DASH_STDIN: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    static DASH_STDIN: RefCell<Option<(Vec<u8>, bool)>> = const { RefCell::new(None) };
 }
 
 /// Standard input as the first `-` of a pass over the input files sees it: all of it. A later `-`
 /// in the same pass reads nothing, as jq's does (its stdin is spent).
 fn dash_stdin_bytes() -> Result<Vec<u8>> {
+    let (bytes, failed) = dash_stdin_read();
+    if failed {
+        note_stdin_read_failed();
+    }
+    Ok(bytes)
+}
+
+/// [`dash_stdin_bytes`] with the failure of the read left to the caller (#7126): the stream reader notes it
+/// when it reaches the source, as jq's reader does, so a `-` the program never gets to (`jq -n input
+/// f.json -`) does not end the run with exit 2.
+fn dash_stdin_read() -> (Vec<u8>, bool) {
     DASH_STDIN.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if cache.is_none() {
-            *cache = Some(read_stdin_bytes()?);
-        }
-        Ok(cache.clone().unwrap_or_default())
+        cache
+            .borrow_mut()
+            .get_or_insert_with(read_stdin_bytes_unreported)
+            .clone()
     })
 }
 
@@ -13227,6 +13271,11 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
     let (mut reader, capacity): (Box<dyn std::io::Read>, usize) = match files.first() {
         None => {
             let pushed_back = STDIN_PUSHBACK.with(|slot| slot.borrow_mut().take());
+            // #7126: standard input that cannot be read is empty, and ends the run with exit 2.
+            if crate::stdin_access::unreadable() {
+                note_stdin_read_failed();
+                return Ok(LoneStart::Read(Vec::new()));
+            }
             let stdin =
                 std::io::Cursor::new(pushed_back.unwrap_or_default()).chain(std::io::stdin());
             (Box::new(stdin), front)
@@ -13248,14 +13297,22 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
     let from_stdin = files.is_empty();
     // Sized for the whole file, so the rest is read into the same buffer.
     let mut bytes = Vec::with_capacity(capacity);
-    if let Err(error) = reader.by_ref().take(front as u64).read_to_end(&mut bytes) {
-        // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
+    if reader
+        .by_ref()
+        .take(front as u64)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        // #7126: a standard input that fails (a directory) is the empty stream jq reads, plus
+        // what came before the failure, and ends the run with exit 2.
         return if from_stdin {
-            Err(anyhow::Error::new(error).context("Failed to read from stdin"))
+            note_stdin_read_failed();
+            Ok(LoneStart::Read(bytes))
         } else {
+            // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
             Ok(LoneStart::Declined)
+            // patchcov: coverage end
         };
-        // patchcov: coverage end
     }
     // The whole source (stdin's end, or a file that shrank).
     if bytes.len() < front {
@@ -13310,8 +13367,9 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
     match reader.read_to_end(&mut bytes) {
         Ok(_) => Ok(LoneStart::Read(bytes)),
         // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
-        Err(error) if from_stdin => {
-            Err(anyhow::Error::new(error).context("Failed to read from stdin"))
+        Err(_) if from_stdin => {
+            note_stdin_read_failed();
+            Ok(LoneStart::Read(bytes))
         }
         Err(_) => Ok(LoneStart::Declined),
         // patchcov: coverage end
@@ -14514,6 +14572,9 @@ fn stream_reader_producer(lazy: LazyStreamInputs) -> jq::InputProducer {
         last_source,
         raise_errors,
     } = lazy;
+    // #7126: jq says nothing of a standard input that fails when it is the only source (the run's exit
+    // 2 is its whole report); a file that fails part-way is reported (#5498).
+    let stdin_only = files.iter().all(Option::is_none);
     Box::new(move || match reader.next_yielded() {
         Some(input) => {
             let (source, line) = input.location;
@@ -14537,7 +14598,11 @@ fn stream_reader_producer(lazy: LazyStreamInputs) -> jq::InputProducer {
         None => {
             // A source that failed part-way ended there: jq reports it and exits 2 (#5498).
             if let Some(error) = reader.take_error() {
-                report_input_read_failure(&error);
+                if stdin_only {
+                    note_stdin_read_failed();
+                } else {
+                    report_input_read_failure(&error);
+                }
             }
             jq::ProducedInput::End(
                 reader
@@ -20888,20 +20953,20 @@ mod tests {
         .is_none());
     }
 
-    /// #7024: a read the probe of a pipe made that failed before 4 MiB is the whole route's to report,
-    /// as it would have reported it had it made the read itself.
+    /// #7024: a read the probe of a pipe made that failed before 4 MiB is the whole route's to take up,
+    /// as it would have taken it up had it made the read itself: the bytes before the failure are the
+    /// input, and the run ends with jq's exit 2 and no message (#7126).
     #[test]
-    fn a_probe_that_failed_short_is_reported_by_the_whole_route_7024() {
+    fn a_probe_that_failed_short_is_noted_by_the_whole_route_7024() {
+        INPUT_READ_FAILED.with(|failed| failed.set(false));
         STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = Some(b"1\n".to_vec()));
         STDIN_PUSHBACK_ERROR.with(|slot| {
             *slot.borrow_mut() = Some(std::io::Error::new(std::io::ErrorKind::Other, "gone"));
         });
-        let error = read_stdin_bytes().expect_err("the read failed");
-        assert!(
-            format!("{error:#}").contains("Failed to read from stdin: gone"),
-            "{error:#}"
-        );
+        assert_eq!(read_stdin_bytes().expect("the bytes read"), b"1\n");
+        assert!(INPUT_READ_FAILED.with(std::cell::Cell::get));
         assert!(STDIN_PUSHBACK_ERROR.with(|slot| slot.borrow().is_none()));
+        INPUT_READ_FAILED.with(|failed| failed.set(false));
     }
 
     /// #7024: a pipe is windowed once a first read finds 4 MiB in it; one that ends sooner hands what

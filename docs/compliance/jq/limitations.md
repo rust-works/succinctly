@@ -354,6 +354,23 @@ Rows from `printf '<text>' | jq -c .` (a NUL is `\0`), jq 1.7.1 against `succinc
 The last row is the agreement: with a newline in the chunk jq does not truncate either.
 `tests/jq_cli/i5654_nul.rs` pins both sides.
 
+## A standard input that cannot be read: matched, with these differences (#7126)
+
+A standard input that cannot be read is an empty one in jq 1.7.1, which counts the failed read and exits 2 once the run is over, whatever the program left (`-e`'s 4, `input`'s 5), and for a plain read without a word on stderr.
+`succinctly jq` does the same for a descriptor that was not opened for reading (`jq . 0>>file`, the write end of a pipe) and for one that fails to read (`jq . < /`, a directory): empty input, nothing printed, exit 2.
+A program that never reads standard input (`-n 1`, `-n halt`, `halt_error`) is unaffected, in both.
+
+Four combinations stay different, all with a standard input that cannot be read.
+jq prints `jq: error: Bad file descriptor` (`Is a directory`) when its reader reads again after the failed read: a `-` followed by another source (`jq . - f.json`, `jq . f.json - g.json`, `jq . - -`) and `-s`, `-Rs` or `--stream -s` with `-n '[inputs]'`, where a plain read, `-n input` and `-n inputs` print nothing.
+`succinctly jq` never prints it; stdout and the exit status agree.
+`jq -n input f.json -` (also `first(inputs)`, `limit(1; inputs)` and `-Rn input f.txt -`) never reaches the unreadable `-` in jq and exits 0, where `succinctly jq` exits 2: the route that reads every source first notes the failure when it reads the `-`, and telling when the input queue crosses a source is not something it can do (the `--stream` and `-R` stream routes note it when their reader reaches the source, and match).
+`jq --seq -s .` prints nothing in jq, whose parser is left holding an abandoned record, where `succinctly jq` prints `<RS>[]`, with the same stderr note and exit 2.
+
+A **closed** descriptor 0 (`jq . 0<&-`) is the fifth shape that stays different.
+Rust's runtime reopens a closed descriptor 0 on `/dev/null` before `main` runs, so `succinctly jq` reads it as the empty readable standard input it now is and exits 0 (or `-e`'s 4), where jq exits 2.
+Telling the two apart would take a guess from the descriptor's mode, which an ordinary `jq . 0<>/dev/null` shares, so the divergence stands under [ADR-0018](../../adrs/adr-0018.md) (it matches no behaviour a script relies on except testing `$?` after closing its own standard input).
+`tests/jq_cli/i7126.rs` pins the rows captured from jq 1.7.1 for the three shapes that match, and this one.
+
 ## Conversion diagnostics
 
 jq implements `tonumber` and `fromjson` by handing the string to its JSON parser, so a failure surfaces as that parser's diagnostic.

@@ -3464,6 +3464,7 @@ mod malloc_arena;
 mod output;
 mod select_stats_report;
 mod sigpipe;
+mod stdin_access;
 mod text_generators;
 mod text_validate;
 mod utf8_bench;
