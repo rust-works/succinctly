@@ -1433,7 +1433,7 @@ fn empty_input_reads_as_flagged(
         // Under `--front-matter` the extraction reads the input first, and a BOM there was not
         // captured: it keeps the header model it had.
         let no_header =
-            had_bom || (header_off && format != InputFormat::Json && !is_header_only(&bytes));
+            had_bom || (header_off && format == InputFormat::Yaml && !is_header_only(&bytes));
         return Some((bytes, format, false, no_header && !front_matter));
     }
     // `at == 0` first: it settles every input but the first without opening a file.

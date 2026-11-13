@@ -7939,6 +7939,7 @@ Matching either needs a string that can hold bytes that are not UTF-8, or the su
   Every row was captured from yq v4.53.3 (`tests/yq_cli/i7025_header_preprocess.rs`), and 10,360 generated runs (every leading block of up to three of `# c`, `---`, `%YAML 1.1`, `--- # c` and `--- x`, before a map, a sequence, two documents and a commented map, under `.`, `.a`, `-P`, `-N`, a write, `-o=json` and `head_comment`/`foot_comment`/`tag`/`line`) differ only in:
   - a comment or text on a `---` line: `--- # c` / `a: 1` keeps `# c` as the first node's head comment in yq and drops it here, and `# c` / `--- x` / `y` drops the comment in yq and keeps it here (the shape listed under the byte-order mark above);
   - `%YAML 1.1` or `1.2` with no `---` after it, an error in yq and read here;
+  - a blank line made of a tab or a carriage return among comment lines (CRLF text): yq writes it back as a `#` line, and this reads the text as a document and prints a blank line;
   - the `line` of a document with no content (`---` / `---` / `a: 1` is `[0,2]` in yq and `[0,3]` here).
   A scalar or flow-collection document with two comment blocks, not in that sweep, differs as after a byte-order mark ([#7089](https://github.com/rust-works/succinctly/issues/7089)).
   The flag is one setting for the run, so under `--eval-all` and with several files every input is read with no header, as yq does.
