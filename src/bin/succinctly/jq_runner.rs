@@ -5472,7 +5472,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 };
                 let met = noted
                     .iter()
-                    .take_while(|(at, _)| *at <= idx && fault_at.is_none_or(|fault| *at < fault))
+                    .take_while(|(at, _)| *at <= idx && fault_at.map_or(true, |fault| *at < fault))
                     .count();
                 for (at, failure) in noted.drain(..met) {
                     stop_at.get_or_insert(at);

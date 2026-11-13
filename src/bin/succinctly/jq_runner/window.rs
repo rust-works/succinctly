@@ -1284,7 +1284,10 @@ impl NamedFile {
         };
         let file = File::open(&self.path)?;
         if FileIdentity::of(&file.metadata()?) != identity {
-            return Err(io::Error::other("the file is not the one the run read"));
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "the file is not the one the run read",
+            ));
         }
         Ok(Some((file, len)))
     }
