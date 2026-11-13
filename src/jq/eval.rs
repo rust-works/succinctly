@@ -15751,17 +15751,28 @@ fn owned_assign_step<S: EvalSemantics>(
         // once, read by value, so substituting it into the body is the bind --
         // the way `substitute_fold_step` binds the loop variable. A source that
         // reads `.`, raises, or yields other than once is not closed, and the
-        // evaluator keeps it. jq mode only, like the rest of the step.
+        // evaluator keeps it. jq mode, and yq mode for a scalar source (#7108).
         Expr::As {
             expr: source,
             var,
             body,
         } => {
             let body = unwrap_paren(body);
-            if S::TAG != EvalTag::Jq || !is_owned_assign(body) {
+            if !is_owned_assign(body) {
                 return None;
             }
-            let bound = closed_expr_to_owned::<S>(source)?;
+            let bound = match closed_expr_to_owned::<S>(source) {
+                Some(bound) => bound,
+                None if S::TAG != EvalTag::Jq => owned_box_source::<S>(source)?,
+                None => return None,
+            };
+            // #7108: in yq mode a scalar source only; the body is then held to the yq gates of
+            // [`owned_assign_new_value`] (the fold of `with(PATH; SRC as $v | WRITES)` is this shape).
+            if S::TAG != EvalTag::Jq
+                && matches!(bound, OwnedValue::Array(_) | OwnedValue::Object(_))
+            {
+                return None;
+            }
             // #5540: `substitute_var` rebuilds a container as a literal, so a fold's shared
             // element bound here would stop being one handle (`$v as $n | .x = $n`).
             if matches!(bound, OwnedValue::Array(_) | OwnedValue::Object(_))
@@ -15893,8 +15904,18 @@ fn owned_assign_step<S: EvalSemantics>(
                 };
                 return Some(owned_grow::<S>(owned_slot_mut(&key, state)?, right));
             }
-            let yq_shape =
-                matches!(key, StepKey::Field(_)) && matches!(state, OwnedValue::Object(_));
+            let yq_shape = match &key {
+                StepKey::Field(name) if matches!(state, OwnedValue::Object(_)) => {
+                    // A key with a glob character writes into every key it matches in yq, and
+                    // `<<` is a merge key: neither is a plain field.
+                    if name.contains(['*', '?']) || name == "<<" {
+                        YqWrite::Field
+                    } else {
+                        YqWrite::PlainField
+                    }
+                }
+                _ => YqWrite::Other,
+            };
             let new_value = owned_assign_new_value::<S>(expr, rhs, old, yq_shape)?;
             Some(match key {
                 StepKey::Field(name) => set_field(state, name.into_owned(), new_value)
@@ -15925,7 +15946,7 @@ fn owned_assign_step<S: EvalSemantics>(
                 }
                 return Some(owned_grow::<S>(slot, right));
             }
-            let new_value = owned_assign_new_value::<S>(expr, rhs, old, false)?;
+            let new_value = owned_assign_new_value::<S>(expr, rhs, old, YqWrite::Other)?;
             let path = Expr::Pipe(steps.into_iter().map(StepKey::into_component).collect());
             Some(set_path::<S>(
                 state,
@@ -16061,6 +16082,34 @@ pub(crate) fn owned_slot_mut<'v>(
     }
 }
 
+/// `($m | .[])` for a closed `$m` of exactly one element: the one value the box of a `with` binding
+/// holds (#7108), which the fold of `with(PATH; SRC as $v | WRITES)` binds at each step (see
+/// `with_binding_effect` in the parser). An empty box binds nothing (yq's empty-source rule) and
+/// is the evaluator's.
+fn owned_box_source<S: EvalSemantics>(source: &Expr) -> Option<OwnedValue> {
+    let Expr::Pipe(stages) = unwrap_paren(source) else {
+        return None;
+    };
+    let [boxed, Expr::Iterate] = stages.as_slice() else {
+        return None;
+    };
+    match closed_expr_to_owned::<S>(boxed)? {
+        OwnedValue::Array(items) if items.len() == 1 => items.iter().next().cloned(),
+        _ => None,
+    }
+}
+
+/// What a yq-mode single-step write is, for [`owned_assign_new_value`] (#7108).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum YqWrite {
+    /// Not a field of an object state.
+    Other,
+    /// A field of an object state whose name yq treats specially (a glob, `<<`).
+    Field,
+    /// A plain field of an object state.
+    PlainField,
+}
+
 /// The value [`owned_assign_step`] writes, given the old value at its path,
 /// or `None` to decline. yq mode keeps only #3025's `.field op= <number>`
 /// shape (`yq_shape`: one field step into an object), since its `=`
@@ -16071,13 +16120,17 @@ fn owned_assign_new_value<S: EvalSemantics>(
     expr: &Expr,
     rhs: OwnedAssignRhs,
     old: &OwnedValue,
-    yq_shape: bool,
+    yq_shape: YqWrite,
 ) -> Option<OwnedValue> {
     if S::TAG != EvalTag::Jq
-        && !(yq_shape
+        && !(!matches!(yq_shape, YqWrite::Other)
             && matches!(expr, Expr::CompoundAssign { .. })
             && old.is_number()
             && matches!(&rhs, OwnedAssignRhs::Combine(_, right) if right.is_number()))
+        // #7108: a plain `=` of a scalar onto a plain field of an object state.
+        && !(matches!(yq_shape, YqWrite::PlainField)
+            && matches!(expr, Expr::Assign { .. })
+            && matches!(&rhs, OwnedAssignRhs::Value(value) if !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_))))
     {
         return None;
     }

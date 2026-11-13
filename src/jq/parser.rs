@@ -808,9 +808,10 @@ fn binds_one_fixed_value(source: &Expr) -> bool {
 /// The values are SRC's as the node stood before the first write. yq copies each bound node when
 /// its turn comes, so a write to a node a *later* value is bound to (`.x[] as $v | .x[1] = 9 |
 /// .y += [$v]`) is seen there and not here, and a boxed value loses its comment and tag (#5429):
-/// both are in `limitations.md`. Each value is one step of the fold, and a yq-mode step of this
-/// shape re-indexes the node it updates, so many values in a large node cost their product
-/// (#7108); a fold with no binding in its step would need the effect written twice.
+/// both are in `limitations.md`. Each value is one step of the fold, and a yq-mode step that is a
+/// plain `=` of a scalar onto a field is answered on the owned node (#7108); any other effect
+/// re-indexes the node it updates at every step, so many values in a large node cost their
+/// product, and a fold with no binding in its step would need the effect written twice.
 fn with_binding_effect(source: &Expr, var: &str, effect: Expr) -> Expr {
     let bind = |source: Expr, body: Expr| Expr::As {
         expr: Box::new(source),
