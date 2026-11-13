@@ -1279,7 +1279,19 @@ Still different:
   Here each document gets a copy of the list as it was.
 - The separator between results of a filter that follows the assignment (`.k = 1 | length` is `2` three times with no `---` in yq): the document-index rule of [#7019](https://github.com/rust-works/succinctly/issues/7019).
   `.k = 1 | . + {"z": 1}` is the nine results yq prints, in its order, with `---` between all of them where yq separates only the ones from different documents.
-- `.k = (select(fi == 0) | fi)` and `[.] | .[0] | fi` without `--eval-all` ([#7154](https://github.com/rust-works/succinctly/issues/7154)): yq selects over the one document and reads `0` for a node a collect built, where `succinctly yq` writes the document's own `fi` for the first and reads it for the second.
+- `[.] | .[0] | fi` without `--eval-all` ([#7154](https://github.com/rust-works/succinctly/issues/7154)): yq reads `0` for a node a collect built (and `[.] | filename` is empty), where `succinctly yq` reads the document's own.
+
+### An assignment's right side that reads `file_index` after a `select` that dropped the node ([#7154](https://github.com/rust-works/succinctly/issues/7154))
+
+yq has no node after a `select` that drops it, so a read of the node emits nothing: `yq '.k = (select(fi == 1) | fi)' a1.yaml a2.yaml a3.yaml` is `k: null` for the files `select` dropped, and `k: 1` for the second.
+A literal stage re-emits over an empty context (`.k = (select(fi == 1) | 7)` is `k: 7` in all three, in yq and here), which is the difference between the two.
+`succinctly yq` resolved the read to a literal before the context was seen empty, so every file got its own index.
+The resolved `file_index` and `filename` are now a snapshot of the value, which is no literal, and the right side answers as yq does.
+30 rows over three files are pinned against yq v4.53.3 in `tests/yq_cli/i7154.rs`.
+
+Still different, in the same family:
+- `fi` and `filename` after a collect without `--eval-all`: `[.] | .[0] | fi` is `0` for every file in yq and `[.] | filename` is empty, because the collected array and its elements are copies with no origin; the origin is ambient per evaluation here.
+- `.k = (select(fi == 1))` and `.k = (. | select(fi == 1))` write the document into itself in yq (`k: !!null` under the copy), `.k = (select(fi == 1) | line)` reads the line of the selected node, and `.k = (.. | select(fi == 1))` selects the descendants: each prints something else here.
 
 ### An arithmetic result keeps its left operand's origin under `--eval-all` ([#6969](https://github.com/rust-works/succinctly/issues/6969))
 

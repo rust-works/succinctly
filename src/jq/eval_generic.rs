@@ -37226,11 +37226,16 @@ fn path_context_resolve_constants<S: EvalSemantics>(
         // (`--eval-all '.[] | try error("x") catch file_index'` resolves
         // the handler here), so the position's own file it is -- `path` is
         // absolute, which is what `file_index_for_path` reads.
+        //
+        // #7154: a read, not a literal. A literal in the right side of an assignment re-emits over an
+        // empty context (`.a[] | 1` is `1` over `a: []`, #6943), where a read of the node emits
+        // nothing because there is no node: `.k = (select(false) | fi)` is `k: null`, not the
+        // document's own index. A passthrough snapshot says the same value and is no literal.
         Expr::Builtin(Builtin::FileIndex) => {
-            Expr::Literal(Literal::Int(file_index_for_path(&path())))
+            Expr::tracked_value(OwnedValue::Int(file_index_for_path(&path())))
         }
         Expr::Builtin(Builtin::Filename) => {
-            Expr::Literal(Literal::String(filename_for_path(&path()).into()))
+            Expr::tracked_value(OwnedValue::String(filename_for_path(&path()).into()))
         }
         // #2472: `parent`/`parent(n)` inside a stage the owned identity
         // pipe evaluates as a whole (`[path, parent]`, `select(parent !=
