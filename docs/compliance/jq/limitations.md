@@ -7484,6 +7484,26 @@ Time, from an interleaved driver (the two binaries alternate within each repetit
   The second read of the stream now shares the reader's descriptor instead of duplicating it, and a list is capped at 32 files, which leaves the table alone (32 files of 10 MiB read −10.2%).
 - **Correctness**, from `scripts/jq-windowed-file-fuzz.py --files K` (random streams of 4.3 to 7.5 MiB cut at random bytes into K files, compared with the same files given as `/dev/fd/N`, which the route declines): 1,800 cases for K = 1, 2, 5, 12 and 32 on the 7950X and 250 for K = 3 and 9 on the M4 Pro, no difference.
 
+More than 32 files (#7024, opened a file at a time), peak resident set size in MiB for 100 MiB of NDJSON (`json generate -p ndjson`) split at line starts into K files, `/usr/bin/time` (`-f %M` on the 7950X, `-l` on the M4 Pro):
+
+| machine           | files | query                 | before | after |
+|-------------------|------:|-----------------------|-------:|------:|
+| AMD Ryzen 9 7950X |    64 | `-c .`                |  109.5 |  10.6 |
+| AMD Ryzen 9 7950X |    64 | `select(.score > 50)` |  111.4 |  12.4 |
+| AMD Ryzen 9 7950X |   256 | `-c .`                |  109.2 |   9.6 |
+| AMD Ryzen 9 7950X |   256 | `select(.score > 50)` |  111.2 |  11.6 |
+| Apple M4 Pro      |    64 | `-c .`                |  107.0 |   6.8 |
+| Apple M4 Pro      |    64 | `select(.score > 50)` |  107.8 |   8.7 |
+| Apple M4 Pro      |   256 | `-c .`                |  107.0 |   6.4 |
+| Apple M4 Pro      |   256 | `select(.score > 50)` |  107.8 |   7.1 |
+
+At 10 MiB the same lists read 18.9 to 20.8 before and 9.5 to 11.4 after on the 7950X, and 15.8 to 18.3 before and 5.8 to 6.7 after on the M4 Pro, so the route is flat from 10 MiB to 100 MiB; 16 files (held open, not this change's route) read the same before and after.
+Release builds with `--features cli` of `main` @ `15dcf4a82`, a second build of it (an A/A control), and the same plus this change, on `terminus` and `johns-mac-mini`, each checked idle first; the three binaries alternate in rotated order within each repetition (9 at 10 MiB, 5 at 100 MiB, medians), and the output and exit status of every run are identical.
+
+- **x86_64:** at 100 MiB, `-c .` reads −7.6% (64 files) and −8.5% (256), `-r .name` −6.1% and −6.5%, `select` −2.5% and −3.0%; at 10 MiB −1.8% to −9.1%; the A/A control read −1.5% to +1.8%, and 16 files −0.3% to +3.1%.
+- **aarch64:** at 100 MiB, `-c .` reads −5.0% and −5.0%, `-r .name` −5.2% and −4.3%, `select` −2.9% and −2.1%; at 10 MiB −3.4% to +1.2%, neutral; the control read −0.7% to +2.1%, and 16 files −1.0% to +2.0%.
+- **Correctness:** `jq-windowed-file-fuzz.py --files K` for K = 40, 150 and 400, 145 cases on a laptop (Apple silicon), no difference; the window tests run every several-files case over files opened by path as well.
+
 What the windowed route does not cover, and which still hold the input:
 
 - a terminal on standard input, a pipe under 4 MiB, more than 32 files, and a list of files with a path that is not a regular file, that does not open, or that is the run's own standard output or error: #7024;
