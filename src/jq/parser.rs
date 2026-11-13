@@ -1368,6 +1368,9 @@ fn dollar_var_expr(name: String, line: usize) -> Expr {
     }
 }
 
+/// The variable `filter(f)`'s expansion binds its context node to (#7171): a name a program cannot spell.
+const FILTER_NODE_VAR: &str = "__filter_node";
+
 /// The variable `_nwise(n)`'s expansion binds its argument to first (#6684): a name a program
 /// cannot spell, so [`nwise_fallback_arity`] and its siblings recognize the shape.
 const NWISE_ONE_VAR: &str = "__nwise_1";
@@ -6366,17 +6369,25 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse yq's `filter(f)` (#4213): the children of the node that satisfy `f`, as an array --
-    /// `[.[] | select(f)]`. A scalar has no children, so it answers `[]`.
+    /// `[.[] | select(f)]` once per context node. A scalar has no children, so it answers `[]`.
     fn parse_filter_expr(&mut self) -> Result<Expr, ParseError> {
         let start_pos = self.pos;
         self.consume_keyword("filter");
         let Some(condition) = self.parse_required_single_arg(start_pos)? else {
             return Err(ParseError::new("filter expects one argument", start_pos));
         };
-        Ok(Expr::Array(Box::new(Expr::pipe(vec![
-            Expr::Iterate,
-            Expr::Builtin(Builtin::Select(Box::new(condition))),
-        ]))))
+        // yq's `filter` runs once per node of its context (`operator_filter.go`), so over an empty
+        // context it answers nothing, where an array construction answers `[]` once (#7171): the
+        // context node is bound first (binding one is once per node), and the children read from it.
+        Ok(Expr::As {
+            expr: Box::new(Expr::Identity),
+            var: FILTER_NODE_VAR.into(),
+            body: Box::new(Expr::Array(Box::new(Expr::pipe(vec![
+                Expr::Var(FILTER_NODE_VAR.into()),
+                Expr::Iterate,
+                Expr::Builtin(Builtin::Select(Box::new(condition))),
+            ])))),
+        })
     }
 
     /// Parse yq's `collect(f)` (#4213): `[f]`.
