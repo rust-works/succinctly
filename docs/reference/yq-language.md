@@ -830,7 +830,7 @@ same kind of thing as the rest of this table — extra, off by default.
 | Flag                  | Description                                                    |
 |-----------------------|----------------------------------------------------------------|
 | `-n, --null-input`    | Don't read input; use null                                     |
-| `-p, --input-format`  | Input format: `auto`, `yaml`, `json`, `props`, `csv`, `tsv`, `ini`, `kyaml`, `xml`, `base64`, `uri` |
+| `-p, --input-format`  | Input format: `auto`, `yaml`, `json`, `props`, `csv`, `tsv`, `ini`, `kyaml`, `xml`, `toml`, `base64`, `uri` |
 | `-s, --slurp`         | Read all inputs into array                                     |
 | `-R, --raw-input`     | Read lines as strings instead of YAML                          |
 | `--doc N`             | Select Nth document (0-indexed)                                |
@@ -875,7 +875,7 @@ succinctly yq --front-matter extract '.title' post.md
 succinctly yq --front-matter process --inplace '.tags += ["new"]' post.md
 ```
 
-A file without a leading `---` line errors. `--front-matter` is incompatible with `--doc`, `--null-input`, `--raw-input`, `--eval-all`, and an explicit `--input-format json`, `props`, `csv`, `tsv`, `ini`, `base64` or `uri` (front matter is YAML by definition); `--front-matter=process` additionally requires YAML output and is incompatible with `--slurp` (a slurped array can't reattach a body per input file); `--front-matter=extract` is incompatible with `--inplace` (it captures no body to reattach, so `-i` would discard everything after the closing fence). Position builtins (`at_offset`/`at_position`/`line`/`column`) resolve against the extracted YAML block's own coordinates, not the original file (see [Known Limitations](#known-limitations)).
+A file without a leading `---` line errors. `--front-matter` is incompatible with `--doc`, `--null-input`, `--raw-input`, `--eval-all`, and an explicit `--input-format json`, `props`, `csv`, `tsv`, `ini`, `toml`, `base64` or `uri` (front matter is YAML by definition); `--front-matter=process` additionally requires YAML output and is incompatible with `--slurp` (a slurped array can't reattach a body per input file); `--front-matter=extract` is incompatible with `--inplace` (it captures no body to reattach, so `-i` would discard everything after the closing fence). Position builtins (`at_offset`/`at_position`/`line`/`column`) resolve against the extracted YAML block's own coordinates, not the original file (see [Known Limitations](#known-limitations)).
 
 ### `--split-exp`
 

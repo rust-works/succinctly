@@ -21,8 +21,10 @@ use succinctly::yaml::{go_yaml_explicit_key_scalar, go_yaml_key_is_simple, go_ya
 
 use super::input_props::{go_parse_int_error, string_scalar};
 
-/// The most sequence elements one document builds, padding included: 2^24 (see `input_props`).
-const MAX_SEQUENCE_ELEMENTS: usize = 1 << 24;
+/// The most sequence elements one document builds, padding included: 2^21. yq pads an index past
+/// the end with `null` nodes of some 545 bytes each and dies on the allocation well past a
+/// few million; a node here is about 150 bytes, so this is some 300 MB.
+const MAX_SEQUENCE_ELEMENTS: usize = 1 << 21;
 
 /// The deepest an array, an inline table or a key's dotted path may nest. yq has no bound (Go
 /// grows its stack as far as memory allows); a document this deep is refused instead of
@@ -382,7 +384,7 @@ impl<'a> Parser<'a> {
             if self.left.is_empty() {
                 return None;
             }
-            match self.parse_expression(self.left) {
+            match Self::parse_expression(self.left) {
                 Ok((expr, rest)) => {
                     self.left = rest;
                     self.first = false;
@@ -401,7 +403,7 @@ impl<'a> Parser<'a> {
         None
     }
 
-    fn parse_expression(&self, b: &'a [u8]) -> Res<(Option<Expr>, &'a [u8])> {
+    fn parse_expression(b: &'a [u8]) -> Res<(Option<Expr>, &'a [u8])> {
         let b = scan_whitespace(b);
         if b.is_empty() {
             return Ok((None, b));
@@ -414,9 +416,9 @@ impl<'a> Parser<'a> {
             return Ok((None, b));
         }
         let (mut expr, b) = if b[0] == b'[' {
-            self.parse_table(b)?
+            Self::parse_table(b)?
         } else {
-            let (kv, rest) = self.parse_keyval(b, 0)?;
+            let (kv, rest) = Self::parse_keyval(b, 0)?;
             (Expr::KeyValue(kv), rest)
         };
         let b = scan_whitespace(b);
@@ -430,10 +432,10 @@ impl<'a> Parser<'a> {
         Ok((Some(expr), b))
     }
 
-    fn parse_table(&self, b: &'a [u8]) -> Res<(Expr, &'a [u8])> {
+    fn parse_table(b: &'a [u8]) -> Res<(Expr, &'a [u8])> {
         let array = b.len() > 1 && b[1] == b'[';
         let b = scan_whitespace(&b[if array { 2 } else { 1 }..]);
-        let (key, b) = self.parse_key(b)?;
+        let (key, b) = Self::parse_key(b)?;
         let b = scan_whitespace(b);
         let b = expect(b']', b)?;
         if array {
@@ -444,8 +446,8 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_keyval(&self, b: &'a [u8], depth: usize) -> Res<(KeyVal, &'a [u8])> {
-        let (key, b) = self.parse_key(b)?;
+    fn parse_keyval(b: &'a [u8], depth: usize) -> Res<(KeyVal, &'a [u8])> {
+        let (key, b) = Self::parse_key(b)?;
         let b = scan_whitespace(b);
         if b.is_empty() {
             return Err(String::from(
@@ -454,7 +456,7 @@ impl<'a> Parser<'a> {
         }
         let b = expect(b'=', b)?;
         let b = scan_whitespace(b);
-        let (value, b) = self.parse_val(b, depth)?;
+        let (value, b) = Self::parse_val(b, depth)?;
         Ok((
             KeyVal {
                 path: key,
@@ -465,14 +467,14 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    fn parse_key(&self, b: &'a [u8]) -> Res<(Vec<String>, &'a [u8])> {
-        let (first, mut b) = self.parse_simple_key(b)?;
+    fn parse_key(b: &'a [u8]) -> Res<(Vec<String>, &'a [u8])> {
+        let (first, mut b) = Self::parse_simple_key(b)?;
         let mut key = vec![first];
         loop {
             b = scan_whitespace(b);
             if !b.is_empty() && b[0] == b'.' {
                 b = scan_whitespace(&b[1..]);
-                let (part, rest) = self.parse_simple_key(b)?;
+                let (part, rest) = Self::parse_simple_key(b)?;
                 b = rest;
                 key.push(part);
                 if key.len() > MAX_NESTING {
@@ -485,7 +487,7 @@ impl<'a> Parser<'a> {
         Ok((key, b))
     }
 
-    fn parse_simple_key(&self, b: &'a [u8]) -> Res<(String, &'a [u8])> {
+    fn parse_simple_key(b: &'a [u8]) -> Res<(String, &'a [u8])> {
         if b.is_empty() {
             return Err(String::from("expected key but found none"));
         }
@@ -509,7 +511,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_val(&self, b: &'a [u8], depth: usize) -> Res<(Value, &'a [u8])> {
+    fn parse_val(b: &'a [u8], depth: usize) -> Res<(Value, &'a [u8])> {
         if b.is_empty() {
             return Err(String::from("expected value, not eof"));
         }
@@ -546,13 +548,13 @@ impl<'a> Parser<'a> {
                 }
                 Ok((Value::Bool(false), &b[5..]))
             }
-            b'[' => self.parse_val_array(b, depth),
-            b'{' => self.parse_inline_table(b, depth),
+            b'[' => Self::parse_val_array(b, depth),
+            b'{' => Self::parse_inline_table(b, depth),
             _ => parse_int_or_float_or_date_time(b),
         }
     }
 
-    fn parse_inline_table(&self, b: &'a [u8], depth: usize) -> Res<(Value, &'a [u8])> {
+    fn parse_inline_table(b: &'a [u8], depth: usize) -> Res<(Value, &'a [u8])> {
         if depth >= MAX_NESTING {
             return Err(nesting_error());
         }
@@ -571,7 +573,7 @@ impl<'a> Parser<'a> {
                 b = expect(b',', b)?;
                 b = scan_whitespace(b);
             }
-            let (kv, rest) = self.parse_keyval(b, depth + 1)?;
+            let (kv, rest) = Self::parse_keyval(b, depth + 1)?;
             b = rest;
             children.push(kv);
             first = false;
@@ -580,7 +582,7 @@ impl<'a> Parser<'a> {
         Ok((Value::InlineTable(children), rest))
     }
 
-    fn parse_val_array(&self, b: &'a [u8], depth: usize) -> Res<(Value, &'a [u8])> {
+    fn parse_val_array(b: &'a [u8], depth: usize) -> Res<(Value, &'a [u8])> {
         if depth >= MAX_NESTING {
             return Err(nesting_error());
         }
@@ -615,7 +617,7 @@ impl<'a> Parser<'a> {
             if !b.is_empty() && b[0] == b']' {
                 break;
             }
-            let (value, rest) = self.parse_val(b, depth + 1)?;
+            let (value, rest) = Self::parse_val(b, depth + 1)?;
             b = rest;
             items.push(ArrayItem::Value(value));
             let (comment, rest) = parse_optional_whitespace_comment_newline(b)?;
@@ -783,16 +785,16 @@ fn parse_multiline_basic_string(b: &[u8]) -> Res<(&[u8], String, &[u8])> {
         if c == b'\\' {
             // A `\` that ends its line trims itself and the white space after it.
             let mut last_non_whitespace_on_line = false;
-            let mut j = 1;
-            while j < end - i {
-                match token[i + j] {
+            let mut probe = 1;
+            while probe < end - i {
+                match token[i + probe] {
                     b' ' | b'\t' => {
-                        j += 1;
+                        probe += 1;
                         continue;
                     }
                     b'\r' => {
-                        if token[i + j + 1] == b'\n' {
-                            j += 1;
+                        if token[i + probe + 1] == b'\n' {
+                            probe += 1;
                             continue;
                         }
                     }
@@ -802,7 +804,7 @@ fn parse_multiline_basic_string(b: &[u8]) -> Res<(&[u8], String, &[u8])> {
                 break;
             }
             if last_non_whitespace_on_line {
-                i += j;
+                i += probe;
                 while i < end {
                     let c = token[i];
                     if c != b'\n' && c != b'\r' && c != b' ' && c != b'\t' {
@@ -818,13 +820,13 @@ fn parse_multiline_basic_string(b: &[u8]) -> Res<(&[u8], String, &[u8])> {
                 out.push(byte);
             } else if c == b'u' {
                 let after = &token[i + 1..];
-                let x = hex_to_rune(&after[..after.len().min(4)], 4)?;
-                push_char(&mut out, x);
+                let rune = hex_to_rune(&after[..after.len().min(4)], 4)?;
+                push_char(&mut out, rune);
                 i += 4;
             } else if c == b'U' {
                 let after = &token[i + 1..];
-                let x = hex_to_rune(&after[..after.len().min(8)], 8)?;
-                push_char(&mut out, x);
+                let rune = hex_to_rune(&after[..after.len().min(8)], 8)?;
+                push_char(&mut out, rune);
                 i += 8;
             } else {
                 return Err(format!("invalid escaped character {}", go_sharp_u(c)));
@@ -1069,7 +1071,7 @@ fn underscore_ok(mut s: &[u8]) -> bool {
     if s.len() >= 2 && s[0] == b'0' && matches!(s[1].to_ascii_lowercase(), b'b' | b'o' | b'x') {
         i = 2;
         saw = b'0';
-        hex = s[1].to_ascii_lowercase() == b'x';
+        hex = s[1].eq_ignore_ascii_case(&b'x');
     }
     while i < s.len() {
         let c = s[i];
@@ -1300,7 +1302,7 @@ struct Node {
     tag: String,
     value: String,
     keys: Vec<String>,
-    items: Vec<Node>,
+    items: Vec<Self>,
     head: String,
     line: String,
 }
@@ -1336,7 +1338,7 @@ impl Node {
 
     /// `UpdateFrom`: this node becomes a copy of `other` (keeping the comments it has when
     /// `other` has none).
-    fn update_from(&mut self, other: &Node) {
+    fn update_from(&mut self, other: &Self) {
         self.items.clone_from(&other.items);
         self.keys.clone_from(&other.keys);
         self.kind = other.kind;
@@ -1345,7 +1347,7 @@ impl Node {
     }
 
     /// `UpdateAttributesFrom`: kind, tag and comments, but not the content.
-    fn update_attributes_from(&mut self, other: &Node) {
+    fn update_attributes_from(&mut self, other: &Self) {
         if self.kind != other.kind {
             self.items.clear();
             self.keys.clear();
@@ -1558,9 +1560,7 @@ fn multiply(lhs: Node, rhs: &Node, base: &[Seg], budget: &mut Budget) -> Result<
     if rhs.tag == "!!null" {
         return Ok(lhs);
     }
-    if (lhs.kind == Kind::Map && rhs.kind == Kind::Map)
-        || (lhs.tag == "!!null" && rhs.kind == Kind::Map)
-    {
+    if rhs.kind == Kind::Map && (lhs.kind == Kind::Map || lhs.tag == "!!null") {
         let mut blank = lhs;
         if blank.head.is_empty() {
             blank.head.clone_from(&rhs.head);
@@ -1937,7 +1937,7 @@ impl Decoder<'_> {
 
     fn process_array_table(&mut self, root: &mut Node, path: &[String]) -> Result<bool, String> {
         let full = get_path_to_use(root, path, &mut self.budget)?;
-        let mut has_value = self.advance();
+        let has_value = self.advance();
         let mut table = Node::map();
         if let Some(head) = self.take_pending() {
             table.head = head;
@@ -1945,29 +1945,27 @@ impl Decoder<'_> {
         let mut run_again = false;
         let mut saw_key_value = false;
         if has_value {
-            loop {
-                let Some(expr) = self.cur.clone() else { break };
+            while let Some(expr) = self.cur.clone() {
                 match expr {
                     Expr::Comment(comment) => {
                         self.pending.push(comment);
-                        has_value = self.advance();
-                        if !has_value {
+                        if !self.advance() {
                             break;
                         }
-                        continue;
                     }
                     Expr::KeyValue(kv) => {
                         saw_key_value = true;
                         run_again = self.decode_key_values_into_map(&mut table, kv)?;
+                        break;
                     }
                     Expr::Table(_) | Expr::ArrayTable(_) => {
                         if !saw_key_value {
                             self.attach_orphaned_comments(&mut table);
                         }
                         run_again = true;
+                        break;
                     }
                 }
-                break;
             }
         }
         if !saw_key_value {
