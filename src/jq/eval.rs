@@ -1144,6 +1144,7 @@ pub(crate) mod yq_together_rhs {
 #[cfg(not(feature = "std"))]
 pub(crate) mod yq_together_rhs {
     use super::OwnedValue;
+    use alloc::vec::Vec;
 
     pub(crate) struct Guard;
 
