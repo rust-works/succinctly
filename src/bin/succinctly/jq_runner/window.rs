@@ -1254,13 +1254,15 @@ fn open_not_a_directory(path: &std::path::Path) -> io::Result<(File, std::fs::Me
 }
 
 /// A file of a long list that `-R` reads (#7024), opened by its path when the run first reads it and
-/// closed when the reader is dropped, so a list of any length holds one descriptor, where a short one
-/// holds each file open from the start. The file is judged before the run starts and closed again
-/// ([`super::judge_regular_files`]); the run then reads what the path names when it gets there, as jq,
-/// which opens each file as it reaches it, does. A path that will not open then (or names a directory)
-/// is read as an empty file and its failure handed to [`super::note_raw_open_failure`], so the tail of
-/// the file before it continues in the file after it, as in jq and in the whole-file route, which drops
-/// such a file from the stream.
+/// closed when the reader is dropped (the producer drops a file's windows once its lines are over), so
+/// a list of any length holds one descriptor, where a short one holds each file open from the start.
+/// The list is judged by `stat` before the run starts ([`super::judge_regular_paths`]), which opens
+/// nothing; the run then reads what the path names when it gets there, with no second judgement and no
+/// length fixed beforehand, as jq, which opens each file as it reaches it and reads it to its end, does
+/// (a path replaced by a named pipe waits for a writer there, as it does in jq). A path that will not
+/// open then (or names a directory) is read as an empty file and its failure handed to
+/// [`super::note_raw_open_failure`], so the tail of the file before it continues in the file after it,
+/// as in jq and in the whole-file route, which drops such a file from the stream.
 pub(super) struct OpenWhenRead {
     path: PathBuf,
     /// The file's position among the files named, which its lines are tagged with.

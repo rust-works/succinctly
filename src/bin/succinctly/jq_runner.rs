@@ -11440,8 +11440,9 @@ type RawWindowed = (Box<dyn Read>, Option<u64>, Vec<u8>);
 /// The sources `-R` reads a window at a time, one for each file in order, or `None` for a run that reads
 /// its input whole: [`raw_windowed_source`]'s one, or several regular files named on the command line,
 /// 4 MiB or more between them, judged as the plain route judges them (#7024). Up to
-/// [`MAX_WINDOWED_FILES`] are held open from the start; a longer list is opened to be judged, closed,
-/// and opened again when the run reaches each file ([`window::OpenWhenRead`]), as jq opens them. Each
+/// [`MAX_WINDOWED_FILES`] are opened to be judged and held from the start; a longer list is judged by
+/// `stat` alone ([`judge_regular_paths`]) and each file is opened when the run reaches it
+/// ([`window::OpenWhenRead`]), as jq opens them. Each
 /// file's lines are decoded on their own, a line jq's reader runs on into the next file included, as jq
 /// decodes them.
 fn raw_windowed_sources(args: &JqCommand, files: &[PathBuf]) -> Option<Vec<RawWindowed>> {
