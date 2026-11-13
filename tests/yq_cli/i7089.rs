@@ -2,8 +2,9 @@
 //! the body is the foot of the first key, item or scalar (the document's foot for a scalar), and is
 //! dropped before a flow collection, where the block above the marker stays the head. It was placed
 //! in the head with the block above (`# c1` / `---` / `# c2` / blank / `a: 1` was `c1\nc2\n` on `.a`'s key's
-//! head). A marker at the very start, a block with no blank line under it, and a file with no mark
-//! are pinned unchanged.
+//! head). Blocks after the first under the marker stay the head, and a `%TAG` directive above it counts as
+//! something above. A marker at the very start, a block with no blank line under it, and a file with no
+//! mark are pinned unchanged.
 //!
 //! Every row is yq v4.53.3's output for `F` (the head and foot comment of the document and of every
 //! key and item, `-o=json -I0`), `.` and `-o=props .`.
@@ -16,7 +17,7 @@ const F: &str = r#"[head_comment, foot_comment] + [.. | select(tag=="!!map") | k
 
 #[test]
 fn the_block_under_a_first_marker_is_the_first_nodes_foot_after_a_byte_order_mark() -> Result<()> {
-    let rows: [(bool, &str, [&str; 3]); 30] = [
+    let rows: [(bool, &str, [&str; 3]); 54] = [
         (
             true,
             "# c1\n---\n# c2\n\na: 1\n",
@@ -258,6 +259,194 @@ fn the_block_under_a_first_marker_is_the_first_nodes_foot_after_a_byte_order_mar
                 "# c1\n{a: 1}\n",
                 "a = 1\n",
             ],
+        ),
+        (
+            true,
+            "# c1\n---\n# c2\n\n# c3\n\na: 1\n",
+            [
+                "[\"\",\"\",[\"c1\\nc3\\n\",\"c2\"],[]]\n",
+                "# c1\n# c3\na: 1\n# c2\n",
+                "# c1\n# # c3\n# \na = 1\n",
+            ],
+        ),
+        (
+            true,
+            "# c1\n---\n# c2\n\n# c3\n\na: 1 # one\n",
+            [
+                "[\"\",\"\",[\"c1\\nc3\\n\",\"c2\"],[]]\n",
+                "# c1\n# c3\na: 1 # one\n# c2\n",
+                "# c1\n# # c3\n#  one\na = 1\n",
+            ],
+        ),
+        (
+            true,
+            "# c1\n---\n# c2\n\n# c3\n\na:\n  b: 1\n",
+            [
+                "[\"\",\"\",[\"c1\\nc3\\n\",\"c2\"],[\"\",\"\"],[]]\n",
+                "# c1\n# c3\na:\n  b: 1\n# c2\n",
+                "a.b = 1\n",
+            ],
+        ),
+        (
+            true,
+            "# c1\n---\n# c2\n\n# c3\n\n- 1\n",
+            [
+                "[\"\",\"\",[],[\"c1\\nc3\\n\",\"c2\"]]\n",
+                "# c1\n# c3\n- 1\n# c2\n",
+                "# c1\n# # c3\n# \n0 = 1\n",
+            ],
+        ),
+        (
+            true,
+            "# c1\n---\n# c2\n\n# c3\n\n5\n",
+            ["[\"c1\\nc3\\n\",\"c2\",[],[]]\n", "5\n", "5\n"],
+        ),
+        (
+            true,
+            "# c1\n---\n# c2\n\n# c3\n\n{a: 1}\n",
+            [
+                "[\"c1\\nc3\\n\",\"\",[\"\",\"\"],[]]\n",
+                "# c1\n# c3\n{a: 1}\n",
+                "a = 1\n",
+            ],
+        ),
+        (
+            true,
+            "# c1\n---\n# c2\n\n# c3\n\n# c4\n\na: 1\n",
+            [
+                "[\"\",\"\",[\"c1\\nc3\\n\\nc4\\n\",\"c2\"],[]]\n",
+                "# c1\n# c3\n\n# c4\na: 1\n# c2\n",
+                "# c1\n# # c3\n# \n# # c4\n# \na = 1\n",
+            ],
+        ),
+        (
+            true,
+            "# c1\n---\n# c2\n\n# c3\n\n# c4\n\na: 1 # one\n",
+            [
+                "[\"\",\"\",[\"c1\\nc3\\n\\nc4\\n\",\"c2\"],[]]\n",
+                "# c1\n# c3\n\n# c4\na: 1 # one\n# c2\n",
+                "# c1\n# # c3\n# \n# # c4\n#  one\na = 1\n",
+            ],
+        ),
+        (
+            true,
+            "# c1\n---\n# c2\n\n# c3\n\n# c4\n\na:\n  b: 1\n",
+            [
+                "[\"\",\"\",[\"c1\\nc3\\n\\nc4\\n\",\"c2\"],[\"\",\"\"],[]]\n",
+                "# c1\n# c3\n\n# c4\na:\n  b: 1\n# c2\n",
+                "a.b = 1\n",
+            ],
+        ),
+        (
+            true,
+            "# c1\n---\n# c2\n\n# c3\n\n# c4\n\n- 1\n",
+            [
+                "[\"\",\"\",[],[\"c1\\nc3\\n\\nc4\\n\",\"c2\"]]\n",
+                "# c1\n# c3\n\n# c4\n- 1\n# c2\n",
+                "# c1\n# # c3\n# \n# # c4\n# \n0 = 1\n",
+            ],
+        ),
+        (
+            true,
+            "# c1\n---\n# c2\n\n# c3\n\n# c4\n\n5\n",
+            ["[\"c1\\nc3\\n\\nc4\\n\",\"c2\",[],[]]\n", "5\n", "5\n"],
+        ),
+        (
+            true,
+            "# c1\n---\n# c2\n\n# c3\n\n# c4\n\n{a: 1}\n",
+            [
+                "[\"c1\\nc3\\n\\nc4\\n\",\"\",[\"\",\"\"],[]]\n",
+                "# c1\n# c3\n\n# c4\n{a: 1}\n",
+                "a = 1\n",
+            ],
+        ),
+        (
+            true,
+            "\n---\n# c1\n\n# c2\n\na: 1\n",
+            [
+                "[\"\",\"\",[\"c2\\n\",\"c1\"],[]]\n",
+                "# c2\na: 1\n# c1\n",
+                "# c2\n# \na = 1\n",
+            ],
+        ),
+        (
+            true,
+            "\n---\n# c1\n\n# c2\n\na: 1 # one\n",
+            [
+                "[\"\",\"\",[\"c2\\n\",\"c1\"],[]]\n",
+                "# c2\na: 1 # one\n# c1\n",
+                "# c2\n#  one\na = 1\n",
+            ],
+        ),
+        (
+            true,
+            "\n---\n# c1\n\n# c2\n\na:\n  b: 1\n",
+            [
+                "[\"\",\"\",[\"c2\\n\",\"c1\"],[\"\",\"\"],[]]\n",
+                "# c2\na:\n  b: 1\n# c1\n",
+                "a.b = 1\n",
+            ],
+        ),
+        (
+            true,
+            "\n---\n# c1\n\n# c2\n\n- 1\n",
+            [
+                "[\"\",\"\",[],[\"c2\\n\",\"c1\"]]\n",
+                "# c2\n- 1\n# c1\n",
+                "# c2\n# \n0 = 1\n",
+            ],
+        ),
+        (
+            true,
+            "\n---\n# c1\n\n# c2\n\n5\n",
+            ["[\"c2\\n\",\"c1\",[],[]]\n", "5\n", "5\n"],
+        ),
+        (
+            true,
+            "\n---\n# c1\n\n# c2\n\n{a: 1}\n",
+            [
+                "[\"c2\\n\",\"\",[\"\",\"\"],[]]\n",
+                "# c2\n{a: 1}\n",
+                "a = 1\n",
+            ],
+        ),
+        (
+            true,
+            "%TAG ! tag:example.com,2000:\n---\n# c\n\na: 1\n",
+            ["[\"\",\"\",[\"\",\"c\"],[]]\n", "a: 1\n# c\n", "a = 1\n"],
+        ),
+        (
+            true,
+            "%TAG ! tag:example.com,2000:\n---\n# c\n\na: 1 # one\n",
+            [
+                "[\"\",\"\",[\"\",\"c\"],[]]\n",
+                "a: 1 # one\n# c\n",
+                "# one\na = 1\n",
+            ],
+        ),
+        (
+            true,
+            "%TAG ! tag:example.com,2000:\n---\n# c\n\na:\n  b: 1\n",
+            [
+                "[\"\",\"\",[\"\",\"c\"],[\"\",\"\"],[]]\n",
+                "a:\n  b: 1\n# c\n",
+                "a.b = 1\n",
+            ],
+        ),
+        (
+            true,
+            "%TAG ! tag:example.com,2000:\n---\n# c\n\n- 1\n",
+            ["[\"\",\"\",[],[\"\",\"c\"]]\n", "- 1\n# c\n", "0 = 1\n"],
+        ),
+        (
+            true,
+            "%TAG ! tag:example.com,2000:\n---\n# c\n\n5\n",
+            ["[\"\",\"c\",[],[]]\n", "5\n", "5\n"],
+        ),
+        (
+            true,
+            "%TAG ! tag:example.com,2000:\n---\n# c\n\n{a: 1}\n",
+            ["[\"\",\"\",[\"\",\"\"],[]]\n", "{a: 1}\n", "a = 1\n"],
         ),
     ];
     for (bom, text, want) in rows {
