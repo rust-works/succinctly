@@ -1183,13 +1183,133 @@ fn read_range(_file: &File, _from: u64, _to: u64) -> io::Result<Vec<u8>> {
     Ok(Vec::new())
 }
 
+/// A file of a several-files stream that is opened when the run reaches it, by its path, where a short
+/// list holds each file open from the start (#7024): past the descriptors a process holds cheaply, a
+/// long list would grow its descriptor table, and each doubling of that table waits for an RCU grace
+/// period. The file is judged before the run starts ([`super::windowed_regular_files`]) and closed
+/// again; when the run reaches it, it reads what the path names then, as jq, which opens each file as
+/// it reaches it, does. A path that will not open then (or names a directory) is read as an empty file
+/// and its failure kept for the run to report as jq's reader does when it moves past it
+/// ([`WindowedFiles::take_open_failures`]), so the tail of the file before it continues in the file
+/// after it, as in jq and in the whole-file route, which drops such a file from the stream. The second
+/// read that words a fault reads the files as the run read them ([`Reach`]).
+#[derive(Debug)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(super) struct NamedFile {
+    path: PathBuf,
+    reach: std::cell::Cell<Reach>,
+}
+
+/// What the run found at a [`NamedFile`]'s path when it reached it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+enum Reach {
+    /// Not reached yet.
+    Ahead,
+    /// A file, with its device and inode and the length the run reads of it.
+    Opened(FileIdentity, u64),
+    /// Nothing that opened as a file: read as no bytes.
+    Failed,
+}
+
+/// Which file a path named when the run opened it: its device and inode.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(not(unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+struct FileIdentity;
+
+#[cfg_attr(not(unix), allow(dead_code))]
+impl FileIdentity {
+    #[cfg(unix)]
+    fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn of(_: &std::fs::Metadata) -> Self {
+        Self
+    }
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+impl NamedFile {
+    pub(super) fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            reach: std::cell::Cell::new(Reach::Ahead),
+        }
+    }
+
+    /// The file the path names now, opened for the run, and how much of it the run reads; the error
+    /// when there is none. A directory opens on Unix and fails at its first read, so it fails here.
+    fn open_for_run(&self) -> io::Result<(File, u64)> {
+        let opened = File::open(&self.path).and_then(|file| {
+            let meta = file.metadata()?;
+            if meta.is_dir() {
+                return Err(io::Error::from_raw_os_error(super::EISDIR));
+            }
+            Ok((file, meta))
+        });
+        match opened {
+            Ok((file, meta)) => {
+                self.reach
+                    .set(Reach::Opened(FileIdentity::of(&meta), meta.len()));
+                Ok((file, meta.len()))
+            }
+            Err(error) => {
+                self.reach.set(Reach::Failed);
+                Err(error)
+            }
+        }
+    }
+
+    /// The file the run read, opened again for the second read: `None` for one it read as no bytes;
+    /// an error when the path names another file now.
+    fn reopen_as_read(&self) -> io::Result<Option<(File, u64)>> {
+        let (identity, len) = match self.reach.get() {
+            Reach::Failed => return Ok(None),
+            // Not reached: what the run will read there is what the path names now.
+            Reach::Ahead => return self.open_for_run().map(Some),
+            Reach::Opened(identity, len) => (identity, len),
+        };
+        let file = File::open(&self.path)?;
+        if FileIdentity::of(&file.metadata()?) != identity {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "the file is not the one the run read",
+            ));
+        }
+        Ok(Some((file, len)))
+    }
+}
+
+/// Where each file of a several-files stream comes from (#7024).
+enum StreamFile {
+    /// Open from the start of the run, with how much of it the run reads.
+    Held(Rc<File>, u64),
+    /// Opened when the run reaches it ([`NamedFile`]).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Named(Rc<NamedFile>),
+}
+
 /// Several regular files read as the one stream jq reads them as (#7024): each a window at a time, and
 /// a token still open where a file ends continued at the front of the next ([`SeamStitcher`], the code
 /// the whole-file route stitches with), so the documents, the file each is read in and the lines jq
 /// names for it are the whole-file route's.
 pub(super) struct WindowedFiles {
     /// The files not yet reached, each with how much of it the run reads.
-    pending: std::vec::IntoIter<(Rc<File>, u64)>,
+    pending: std::vec::IntoIter<StreamFile>,
     count: usize,
     block: usize,
     current: Option<WindowedFile>,
@@ -1205,10 +1325,35 @@ pub(super) struct WindowedFiles {
     substituted: bool,
     /// Each RS byte of the text is read as a space (a `--seq` stream, #7082).
     blank_rs: bool,
+    /// The files that did not open when the run reached them, with their positions, not yet taken
+    /// by the run ([`NamedFile`]).
+    open_failures: Vec<(usize, PathBuf, io::Error)>,
 }
 
 impl WindowedFiles {
     pub(super) fn new(files: Vec<(Rc<File>, u64)>, block: usize) -> Self {
+        Self::of(
+            files
+                .into_iter()
+                .map(|(file, len)| StreamFile::Held(file, len))
+                .collect(),
+            block,
+        )
+    }
+
+    /// Files opened a file at a time, as the run reaches each ([`NamedFile`]).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(super) fn named(files: &[Rc<NamedFile>], block: usize) -> Self {
+        Self::of(
+            files
+                .iter()
+                .map(|named| StreamFile::Named(Rc::clone(named)))
+                .collect(),
+            block,
+        )
+    }
+
+    fn of(files: Vec<StreamFile>, block: usize) -> Self {
         Self {
             count: files.len(),
             pending: files.into_iter(),
@@ -1220,6 +1365,7 @@ impl WindowedFiles {
             next_index: 0,
             substituted: false,
             blank_rs: false,
+            open_failures: Vec::new(),
         }
     }
 
@@ -1243,6 +1389,34 @@ impl WindowedFiles {
     pub(super) fn blanking_rs(mut self) -> Self {
         self.blank_rs = true;
         self
+    }
+
+    /// [`Self::next_window`], handing `note` each file that did not open on the way to it, in order,
+    /// with its position among the files ([`NamedFile`]).
+    pub(super) fn next_window_noting(
+        &mut self,
+        note: &mut dyn FnMut(usize, super::InputFileOpenError),
+    ) -> io::Result<Option<(usize, Window<'_>)>> {
+        let count = self.count;
+        if let Err(error) = self.reach_a_file_with_windows_left() {
+            self.note_open_failures(count, note);
+            return Err(error);
+        }
+        self.note_open_failures(count, note);
+        self.next_window()
+    }
+
+    fn note_open_failures(
+        &mut self,
+        count: usize,
+        note: &mut dyn FnMut(usize, super::InputFileOpenError),
+    ) {
+        for (at, path, error) in self.open_failures.drain(..) {
+            note(
+                at,
+                super::InputFileOpenError::from_io(&path, &error, at + 1 == count),
+            );
+        }
     }
 
     /// The next window and the position of its file among the files, or `None` when the last file is
@@ -1277,10 +1451,26 @@ impl WindowedFiles {
                 }
                 Some(_) => return Ok(true),
                 None => {
-                    let Some((file, len)) = self.pending.next() else {
-                        return Ok(false);
-                    };
                     let index = self.next_index;
+                    let (file, len) = match self.pending.next() {
+                        None => return Ok(false),
+                        Some(StreamFile::Held(file, len)) => (file, len),
+                        Some(StreamFile::Named(named)) => match named.open_for_run() {
+                            Ok((file, len)) => (Rc::new(file), len),
+                            Err(error) => {
+                                self.open_failures.push((index, named.path.clone(), error));
+                                // Left out of the stream, as the whole-file route leaves it out, so
+                                // the open tail before it continues in the next file. A last one is
+                                // read as no bytes instead, which ends that tail where jq's reader
+                                // names it after the file it could not open (#6480).
+                                if self.pending.len() > 0 {
+                                    self.next_index += 1;
+                                    continue;
+                                }
+                                (Rc::new(File::open("/dev/null")?), 0)
+                            }
+                        },
+                    };
                     self.next_index += 1;
                     let mut seam = Seam::NONE;
                     let carry = self.stitcher.take_carry(&mut seam);
@@ -1490,10 +1680,13 @@ pub(super) struct Reread {
     /// A stream that cannot be read again: its first fault, as its reader found it ([`Certifier`],
     /// #7024).
     seen: Option<SeenFault>,
+    /// The first fault of a stream read again, once read, and the file it lies in
+    /// ([`Reread::fault_source`]).
+    memo: std::cell::OnceCell<(Option<String>, Option<usize>)>,
 }
 
 struct RereadSource {
-    file: Rc<File>,
+    file: RereadFile,
     /// Where the stream starts in the file: 0 for a file named on the command line, and for a standard
     /// input that is a regular file the offset it was at, since the bytes before it were never the run's.
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -1501,6 +1694,26 @@ struct RereadSource {
     /// How much of the file the run could read from `start`: what was left of it when it was opened.
     #[cfg_attr(not(unix), allow(dead_code))]
     len: u64,
+}
+
+/// The file a [`RereadSource`] reads: a handle the run holds, or a [`NamedFile`] the second read opens
+/// when it reaches it (#7024), and declines if it is no longer the file the run read.
+#[cfg_attr(not(unix), allow(dead_code))]
+enum RereadFile {
+    Held(Rc<File>),
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Named(Rc<NamedFile>),
+}
+
+/// How much of a file the second read reads: a length of 0 is not known to be (`WindowedFile`), so the
+/// file is read to its end.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn known_len(len: u64) -> u64 {
+    if len == 0 {
+        u64::MAX
+    } else {
+        len
+    }
 }
 
 /// How much of the file a chunk of the second read holds.
@@ -1527,13 +1740,14 @@ impl Reread {
     pub(super) fn new(file: &File, start: u64, len: u64, path: PathBuf) -> io::Result<Self> {
         Ok(Self {
             sources: vec![RereadSource {
-                file: Rc::new(file.try_clone()?),
+                file: RereadFile::Held(Rc::new(file.try_clone()?)),
                 start,
                 len,
             }],
             path,
             blank_rs: std::cell::Cell::new(false),
             seen: None,
+            memo: std::cell::OnceCell::new(),
         })
     }
 
@@ -1546,6 +1760,7 @@ impl Reread {
             path: PathBuf::new(),
             blank_rs: std::cell::Cell::new(false),
             seen: Some(seen),
+            memo: std::cell::OnceCell::new(),
         }
     }
 
@@ -1554,17 +1769,36 @@ impl Reread {
         let sources = files
             .iter()
             .map(|(file, len)| RereadSource {
-                file: Rc::clone(file),
+                file: RereadFile::Held(Rc::clone(file)),
                 start: 0,
-                // A length of 0 is not known to be (`WindowedFile`): read to the end.
-                len: if *len == 0 { u64::MAX } else { *len },
+                len: known_len(*len),
             })
             .collect();
+        Self::of_sources(sources)
+    }
+
+    /// Several files opened by path, each when the second read reaches it ([`NamedFile`]).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(super) fn new_named(files: &[Rc<NamedFile>]) -> Self {
+        let sources = files
+            .iter()
+            .map(|named| RereadSource {
+                file: RereadFile::Named(Rc::clone(named)),
+                start: 0,
+                // The length is the one the run read, known once it reached the file.
+                len: u64::MAX,
+            })
+            .collect();
+        Self::of_sources(sources)
+    }
+
+    fn of_sources(sources: Vec<RereadSource>) -> Self {
         Self {
             sources,
             path: PathBuf::new(),
             blank_rs: std::cell::Cell::new(false),
             seen: None,
+            memo: std::cell::OnceCell::new(),
         }
     }
 
@@ -1576,29 +1810,77 @@ impl Reread {
     /// jq's parse error for the stream the file holds, or `None` when jq's parser reads it all or the
     /// file cannot be read again. A BOM is skipped at the front, as the run skips it, and the bytes
     /// are counted as read, an invalid one included, as jq's parser counts them.
-    #[cfg(unix)]
     pub(super) fn stream_fault(&self) -> Option<String> {
-        use std::os::unix::fs::FileExt;
         if let Some(seen) = &self.seen {
             return seen.get();
         }
+        self.memo.get_or_init(|| self.read_fault()).0.clone()
+    }
+
+    /// The file the stream's first fault lies in, among the files (one that did not open counts, as
+    /// a file of no bytes), or their count for a fault at the end of the stream: jq's reader opens the
+    /// files up to that one and no further (#7024). `None` when the stream has no fault or cannot be
+    /// read again.
+    pub(super) fn fault_source(&self) -> Option<usize> {
+        if self.seen.is_some() {
+            return None;
+        }
+        self.memo.get_or_init(|| self.read_fault()).1
+    }
+
+    /// jq's parse error for the stream, and the file it lies in ([`Self::fault_source`]).
+    #[cfg(unix)]
+    fn read_fault(&self) -> (Option<String>, Option<usize>) {
+        use std::os::unix::fs::FileExt;
+        // The file of the last chunk handed to the parser, and whether the files ran out.
+        let last_source = std::cell::Cell::new(0usize);
+        let exhausted = std::cell::Cell::new(false);
         let failed = std::cell::Cell::new(false);
         let mut source = 0usize;
         let mut at = 0u64;
         let mut at_front = true;
+        // The named file the read is in, opened when it is reached and closed when it is left, with
+        // the length the run read of it.
+        let mut opened: Option<(usize, File, u64)> = None;
         let chunks = std::iter::from_fn(|| loop {
-            let current = self.sources.get(source)?;
+            let Some(current) = self.sources.get(source) else {
+                exhausted.set(true);
+                return None;
+            };
             if failed.get() {
                 return None;
             }
-            if at >= current.len {
+            let (file, len) = match &current.file {
+                RereadFile::Held(file) => (&**file, current.len),
+                RereadFile::Named(named) => {
+                    if !matches!(&opened, Some((at_source, _, _)) if *at_source == source) {
+                        opened = None;
+                        match named.reopen_as_read() {
+                            Ok(Some((file, len))) => opened = Some((source, file, known_len(len))),
+                            // Read as no bytes by the run: the next file follows.
+                            Ok(None) => {
+                                source += 1;
+                                at = 0;
+                                continue;
+                            }
+                            Err(_) => {
+                                failed.set(true);
+                                return None;
+                            }
+                        }
+                    }
+                    let (_, file, len) = opened.as_ref()?;
+                    (file, *len)
+                }
+            };
+            if at >= len {
                 source += 1;
                 at = 0;
                 continue;
             }
-            let want = (current.len - at).min(REREAD_CHUNK) as usize;
+            let want = (len - at).min(REREAD_CHUNK) as usize;
             let mut chunk = vec![0u8; want];
-            return match current.file.read_at(&mut chunk, current.start + at) {
+            return match file.read_at(&mut chunk, current.start + at) {
                 // A file that gives out early is over, as it is to the run's reader, and the next
                 // one follows.
                 Ok(0) => {
@@ -1616,6 +1898,7 @@ impl Reread {
                         blank_rs_bytes(&mut chunk);
                     }
                     at += read as u64;
+                    last_source.set(source);
                     Some(chunk)
                 }
                 Err(_) => {
@@ -1625,7 +1908,15 @@ impl Reread {
             };
         });
         let fault = succinctly::jq::jq_stream_fault(chunks, 1, 0);
-        (!failed.get()).then_some(fault).flatten()
+        if failed.get() || fault.is_none() {
+            return (None, None);
+        }
+        let source = if exhausted.get() {
+            self.sources.len()
+        } else {
+            last_source.get()
+        };
+        (fault, Some(source))
     }
 
     /// Whether the file is a `--seq` stream that is nothing but plain records (#7082): RFC 7464's own
@@ -1642,10 +1933,15 @@ impl Reread {
         use std::os::unix::fs::FileExt;
         let guards = PlainGuards::ALL;
         // One source: a stream of several files is not this route's.
-        let [source] = self.sources.as_slice() else {
+        let [RereadSource {
+            file: RereadFile::Held(file),
+            start,
+            len,
+        }] = self.sources.as_slice()
+        else {
             return false;
         };
-        let (file, start, len) = (&*source.file, source.start, source.len);
+        let (file, start, len) = (&**file, *start, *len);
         let byte_at = |at: u64| {
             let mut one = [0u8];
             match file.read_at(&mut one, start + at) {
@@ -1693,12 +1989,12 @@ impl Reread {
     }
 
     #[cfg(not(unix))]
-    pub(super) fn stream_fault(&self) -> Option<String> {
-        if let Some(seen) = &self.seen {
-            return seen.get();
-        }
+    fn read_fault(&self) -> (Option<String>, Option<usize>) {
         let _ = (&self.sources, REREAD_CHUNK);
-        super::reread_stream_fault(std::slice::from_ref(&self.path))
+        (
+            super::reread_stream_fault(std::slice::from_ref(&self.path)),
+            None,
+        )
     }
 }
 
@@ -2461,7 +2757,30 @@ mod stream_tests {
                 (Rc::new(file), bytes.len() as u64)
             })
             .collect();
-        let mut reader = WindowedFiles::new(handles, block);
+        windowed_run(files, WindowedFiles::new(handles, block))
+    }
+
+    /// The files written under `dir`, to be opened by path ([`NamedFile`]): what a list longer than
+    /// the handles the run holds is read as (#7024).
+    fn named_files(dir: &std::path::Path, files: &[Vec<u8>]) -> Vec<Rc<NamedFile>> {
+        files
+            .iter()
+            .enumerate()
+            .map(|(n, bytes)| {
+                let path = dir.join(format!("f{n}.json"));
+                std::fs::write(&path, bytes).expect("written");
+                Rc::new(NamedFile::new(path))
+            })
+            .collect()
+    }
+
+    fn windowed_named_route(files: &[Vec<u8>], block: usize) -> (Run, usize) {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let named = named_files(dir.path(), files);
+        windowed_run(files, WindowedFiles::named(&named, block))
+    }
+
+    fn windowed_run(files: &[Vec<u8>], mut reader: WindowedFiles) -> (Run, usize) {
         let mut run = Run {
             docs: Vec::new(),
             seams: vec![Seam::NONE; files.len()],
@@ -2518,7 +2837,12 @@ mod stream_tests {
 
     fn assert_same(files: &[Vec<u8>], block: usize) {
         let want = whole_route(files);
-        let (got, _) = windowed_route(files, block);
+        // Held handles, and the same files opened a file at a time by path (#7024).
+        assert_same_as(files, block, &want, windowed_route(files, block).0);
+        assert_same_as(files, block, &want, windowed_named_route(files, block).0);
+    }
+
+    fn assert_same_as(files: &[Vec<u8>], block: usize, want: &Run, got: Run) {
         let shown: Vec<String> = files
             .iter()
             .map(|f| String::from_utf8_lossy(f).into_owned())
@@ -2837,6 +3161,147 @@ mod stream_tests {
         let (index, window) = reader.next_window().expect("reads").expect("a window");
         assert_eq!((index, window.values.len()), (1, 1));
         assert!(reader.next_window().expect("done").is_none());
+    }
+
+    /// Files judged by path are read a file at a time, whatever their number, as the whole-file route
+    /// reads them (#7024): two hundred files, a token open where many of them end.
+    #[test]
+    fn many_named_files_read_as_the_whole_file_route_reads_them_7024() {
+        let text: Vec<u8> = (0..2_000)
+            .flat_map(|i| format!("{{\"id\":{i},\"s\":\"x{i}\"}}\n").into_bytes())
+            .collect();
+        let at: Vec<usize> = (1..200).map(|n| n * text.len() / 200 + n % 7).collect();
+        let files = cut(&text, &at);
+        let want = whole_route(&files);
+        assert_eq!(want.docs.len(), 2_000);
+        for block in [64, 4096] {
+            assert_same_as(&files, block, &want, windowed_named_route(&files, block).0);
+        }
+    }
+
+    /// The second read of files opened by path words the stream's first fault as jq's parser does over
+    /// the files joined, opening each in turn, and names the file the fault lies in, which is as far as
+    /// jq's reader goes; it reads each file as the run read it, so a file the run read as no bytes is
+    /// left out, and it declines once a file the run read is no longer at its path.
+    #[cfg(unix)]
+    #[test]
+    fn named_files_are_read_again_as_the_run_read_them_7024() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let files = [
+            b"{\"a\":1}\n{\"a\":".to_vec(),
+            b"2}\n{\"b\":[1 2]}\n".to_vec(),
+            b"{\"c\":3}\n".to_vec(),
+        ];
+        let named = named_files(dir.path(), &files);
+        let mut reader = WindowedFiles::named(&named, 4096);
+        while reader.next_window().expect("reads").is_some() {}
+        let reread = Reread::new_named(&named);
+        let joined: Vec<u8> = files.concat();
+        let want = succinctly::jq::jq_stream_fault(std::iter::once(joined), 1, 0);
+        assert!(want.is_some(), "the stream has a fault");
+        assert_eq!(reread.stream_fault(), want);
+        assert_eq!(
+            reread.fault_source(),
+            Some(1),
+            "the fault is in the second file"
+        );
+        // Replaced after the run read it: the second read declines.
+        let other = dir.path().join("other.json");
+        std::fs::write(&other, &files[1]).expect("written");
+        std::fs::rename(&other, dir.path().join("f1.json")).expect("replaced");
+        assert_eq!(Reread::new_named(&named).stream_fault(), None);
+        // A file the run could not open is no bytes to the second read, and a fault at the end of
+        // the stream is past every file.
+        let named = named_files(
+            dir.path(),
+            &[b"1\n[".to_vec(), b"2\n".to_vec(), b"3".to_vec()],
+        );
+        std::fs::remove_file(dir.path().join("f1.json")).expect("removed");
+        let mut reader = WindowedFiles::named(&named, 4096);
+        while reader.next_window().expect("reads").is_some() {}
+        let reread = Reread::new_named(&named);
+        let want = succinctly::jq::jq_stream_fault(std::iter::once(&b"1\n[3"[..]), 1, 0);
+        assert_eq!(reread.stream_fault(), want);
+        assert_eq!(reread.fault_source(), Some(3));
+    }
+
+    /// A file opened by path that will not open when the run reaches it is left out of the stream, as
+    /// the whole-file route leaves out a file it cannot open, so the open tail before it continues in
+    /// the file after it; its failure is handed to the run with its position. A last one is read as no
+    /// bytes, which ends the tail there. A file replaced at its path is read as it is now, as jq reads
+    /// what the path names when it gets there.
+    #[cfg(unix)]
+    #[test]
+    fn a_named_file_is_read_as_its_path_stands_when_the_run_reaches_it_7024() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let files = [
+            b"1\n12".to_vec(),
+            b"9\n".to_vec(),
+            b"34\n".to_vec(),
+            b"5".to_vec(),
+        ];
+        let named = named_files(dir.path(), &files);
+        std::fs::remove_file(dir.path().join("f1.json")).expect("removed");
+        std::fs::remove_file(dir.path().join("f3.json")).expect("removed");
+        let mut reader = WindowedFiles::named(&named, 4096);
+        let mut docs = Vec::new();
+        let mut failed = Vec::new();
+        let mut note = |at: usize, failure: super::super::InputFileOpenError| {
+            failed.push((at, failure.to_string()));
+        };
+        while let Some((index, window)) = reader.next_window_noting(&mut note).expect("reads") {
+            for &(start, end) in &window.values {
+                docs.push((index, window.raw[start..end].to_vec()));
+            }
+        }
+        assert_eq!(docs, vec![(0, b"1".to_vec()), (2, b"1234".to_vec())]);
+        let names: Vec<String> = ["f1.json", "f3.json"]
+            .iter()
+            .map(|name| dir.path().join(name).display().to_string())
+            .collect();
+        assert_eq!(
+            failed,
+            vec![
+                (
+                    1,
+                    format!(
+                        "error: Could not open file {}: No such file or directory",
+                        names[0]
+                    )
+                ),
+                (
+                    3,
+                    format!(
+                        "error: Could not open file {}: No such file or directory",
+                        names[1]
+                    )
+                ),
+            ]
+        );
+        // A tail held at a last file that does not open ends there, in that file's place.
+        let named = named_files(dir.path(), &[b"1\n77".to_vec(), b"8\n".to_vec()]);
+        std::fs::remove_file(dir.path().join("f1.json")).expect("removed");
+        let mut reader = WindowedFiles::named(&named, 4096);
+        let mut docs = Vec::new();
+        while let Some((index, window)) = reader.next_window_noting(&mut |_, _| {}).expect("reads")
+        {
+            for &(start, end) in &window.values {
+                docs.push((index, window.raw[start..end].to_vec()));
+            }
+        }
+        assert_eq!(docs, vec![(0, b"1".to_vec()), (1, b"77".to_vec())]);
+        // Replaced: the new file is read, and the second read reads it too.
+        let named = named_files(dir.path(), &[b"1\n".to_vec(), b"2\n".to_vec()]);
+        let other = dir.path().join("other.json");
+        std::fs::write(&other, b"20\n21\n").expect("written");
+        std::fs::rename(&other, dir.path().join("f1.json")).expect("replaced");
+        let mut reader = WindowedFiles::named(&named, 4096);
+        let mut count = 0;
+        while let Some((_, window)) = reader.next_window().expect("reads") {
+            count += window.values.len();
+        }
+        assert_eq!(count, 3);
+        assert_eq!(Reread::new_named(&named).stream_fault(), None);
     }
 }
 

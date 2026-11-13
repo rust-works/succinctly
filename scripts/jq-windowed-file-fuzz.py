@@ -303,7 +303,8 @@ def main():
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--work", default=None, help="a directory for the streams (default: a temporary one)")
     parser.add_argument("--files", type=int, default=1,
-                        help="cut each stream into this many files, 1 to 32, read as one stream (#7024)")
+                        help="cut each stream into this many files, 1 to 512, read as one stream (#7024); past 32 "
+                             "the route opens each file as it reaches it")
     parser.add_argument("--cap-mb", type=int, default=8000, help="RLIMIT_AS of each run, in MiB (Linux)")
     parser.add_argument("--pipe", action="store_true",
                         help="feed each stream on a pipe on standard input instead (#7024); one file only")
@@ -314,8 +315,8 @@ def main():
         sys.exit("--raw is one stream on standard input: give no --files")
     if args.pipe and args.files != 1:
         sys.exit("--pipe is one stream: give no --files")
-    if not 1 <= args.files <= 32:
-        sys.exit("--files is 1 to 32: the route holds at most 32 files open and takes no more")
+    if not 1 <= args.files <= 512:
+        sys.exit("--files is 1 to 512")
     if not os.path.exists(args.bin):
         sys.exit("no binary at %s: build with `cargo build --release --features cli,simd,regex,serde`" % args.bin)
     work = os.path.abspath(args.work or tempfile.mkdtemp(prefix="windowed-fuzz-"))
