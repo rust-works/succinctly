@@ -293,7 +293,10 @@ pub fn eval_all_matches_per_document(expr: &Expr) -> bool {
             .iter()
             .position(|stage| !is_origin_select(stage))
             .unwrap_or(stages.len());
-        if rest > 0 && rest < stages.len() {
+        if rest == stages.len() {
+            return true;
+        }
+        if rest > 0 {
             return match &stages[rest..] {
                 [only] => eval_all_matches_per_document(only),
                 tail => tail.iter().all(navigates_only),
@@ -316,7 +319,7 @@ pub fn eval_all_matches_per_document(expr: &Expr) -> bool {
 }
 
 /// `select(T)` where `T` tests only the origin of the document (`fi`, `di`, `filename`) against a
-/// literal, alone or under `and`, `or` and `not` (#4380).
+/// literal, alone or under `and` and `or` (#4380).
 fn is_origin_select(stage: &Expr) -> bool {
     fn origin(expr: &Expr) -> bool {
         matches!(
@@ -652,6 +655,8 @@ mod tests {
             "del(.[0])",
             // #4380: a test of the document's origin in front of the same stages.
             "select(fi == 1)",
+            "select(fi == 0) | select(di == 0)",
+            "select(filename == \"a.yaml\") | .a",
             "select(di == 0) | .a",
             "select(fi == 0 or fi == 1) | .a.b | .c",
             "select(fi == 1) | .a = 5",
