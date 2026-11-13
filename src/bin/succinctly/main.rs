@@ -1251,6 +1251,9 @@ pub enum InputFormat {
     /// `--xml-attribute-prefix`, text under `--xml-content-name`, every value a string (#6925)
     #[value(name = "xml", alias = "x")]
     Xml,
+    /// TOML as yq reads it: a port of go-toml's parser and of yq's decoder over it (#6925)
+    #[value(name = "toml")]
+    Toml,
 }
 
 /// Front matter handling mode for `--front-matter`
@@ -1330,7 +1333,7 @@ pub struct YqCommand {
     #[arg(long, overrides_with = "jq_extensions")]
     pub jq_extensions: bool,
 
-    /// Input format type [auto, yaml, json, props, csv, tsv, ini, kyaml, base64, uri] (default: auto)
+    /// Input format type [auto, yaml, json, props, csv, tsv, ini, kyaml, xml, toml, base64, uri] (default: auto)
     #[arg(
         short = 'p',
         long = "input-format",

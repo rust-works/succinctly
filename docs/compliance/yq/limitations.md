@@ -7720,7 +7720,7 @@ The `@props` / `to_props` and `@csv` / `to_csv` operators read the same flags, a
 `-o=toml` is read as well (#6924); where it differs from yq is in its own section below.
 `-o=kyaml` is read as well (#6924); where it differs from yq is in its own section below.
 `-o=xml` is read as well (#6924), with `--xml-attribute-prefix`, `--xml-content-name`, `--xml-proc-inst-prefix` and `--xml-directive-name`; where it differs from yq is in its own section below.
-The other formats yq lists (`hcl`) and every input format but YAML, JSON, `kyaml`, `props`, `csv`, `tsv`, `ini`, `base64` and `uri` (see the `-p kyaml`, `-p base64|uri`, `-p props`, `-p csv|tsv` and `-p ini` sections below) are still refused at the flag.
+The other formats yq lists (`hcl`) and every input format but YAML, JSON, `kyaml`, `props`, `csv`, `tsv`, `ini`, `xml`, `toml`, `base64` and `uri` (see the `-p kyaml`, `-p base64|uri`, `-p props`, `-p csv|tsv`, `-p ini`, `-p xml` and `-p toml` sections) are still refused at the flag.
 Six rows differ from yq v4.53.3, each pinned out of `tests/yq_cli/i6850.rs`:
 
 - A comment of a value the filter builds or writes is not written by `-o=props` or `@props` (`{"z": .a}`, `.a = 5`), where yq keeps the node's comment: the encoder reads comments from the document, as `to_yaml` does (#6933).
@@ -7762,7 +7762,7 @@ The encoder runs over the value model, which keeps no comment, node style or sou
 - A boolean written `True`, `FALSE` or `yes` is `true` or `false`, where yq writes the source text.
 - The YAML 1.1 integers `1_000` and `0b11` are strings here (see the YAML 1.1 section above), so they are quoted, where yq writes them bare.
 - A timestamp (`2001-01-01`) and a `!!binary` scalar are quoted strings, where yq writes their text bare.
-- yq's inline-table hint exists only for TOML input, which `succinctly yq` does not read.
+- yq's inline-table hint is set only by its TOML decoder, and `-p toml` writes the nodes as YAML text that is read back, so a TOML file written back as TOML (`*.toml` under `-o auto`, `-i`) writes an inline table as a table and drops its comments (see `-p toml` below).
 
 ### `-o=kyaml` — comments and an opening `---` are not read (#6924)
 
@@ -7919,6 +7919,38 @@ Still different under `=false`:
 `-p kyaml` (alias `ky`) reads each input with the YAML reader, which is what yq's KYAML decoder is, so KYAML (YAML's flow subset with explicit commas) and block YAML both load and every route after the read is the `-p yaml` one.
 Under `-p auto` a first input file named `*.kyaml` or `*.ky` (any case) reads as YAML and, with `-o auto`, prints as KYAML, and `-i` writes KYAML back.
 `-o=kyaml` itself is under `-o=kyaml` above: its comment and `---` rows apply to KYAML read back as well, since a comment in the input is dropped by the KYAML printer here and kept by yq.
+
+### `-p toml` — a date-time's tag, an infinity in JSON, a comment's place and nesting past a bound differ ([#6925](https://github.com/rust-works/succinctly/issues/6925))
+
+`-p toml` loads each input with a port of go-toml v2.3.1's `unstable` parser (the one yq's decoder drives with `KeepComments`) and of yq's `decoder_toml.go` over it, and writes the nodes yq makes of the file as YAML text; the run reads that text as `-p yaml`, so every route after the read is the YAML one.
+The parser checks TOML's grammar and nothing else, so a key written twice, a table opened twice and `1__0` are all accepted, and its errors are its own words behind `bad file '<name>': ` (`expected value, not eof`, `expected newline but got U+0062 'b'`, `invalid character at start of key: =`).
+yq then decodes each value: a number or boolean keeps its source text under `!!int`, `!!float` or `!!bool` (so `0xDEAD_beef`, `+17` and `1__0` print as written), a string is a `!!str`, a date-time is checked with Go's `time.Parse` and has no tag, and what Go's `strconv` refuses is an error (`0b101` is `strconv.ParseInt: parsing "0b101": invalid syntax`, `+nan` and `1e999` are `strconv.ParseFloat` errors).
+A local date, local time and local date-time are `unsupported type LocalDate` (`LocalTime`, `LocalDateTime`), and a date-time that Go does not read as RFC 3339 (a space instead of the `T`, a lowercase `t` or `z`, a month of 13, a 30th of February, an hour of 25, a second of 60) is the error of reading it as `2006-01-02` (`parsing time "1979-05-27 07:32:00Z": extra text: " 07:32:00Z"`).
+A key and a table are written into the document with yq's own assignment (`DeeplyAssign`), through its traversal: a key is a glob (`"a*" = 1` writes into every key it fits, and a glob that is a key of a table renames the keys it matched), a plain `=` replaces what the path names, a table is merged in with its arrays appended, `[[a]]` is `a += [table]`, and a segment that names an array with an element continues into its last element, so `[a.b]` after `[[a]]` writes into the last `a`.
+A path through a scalar writes nothing and raises nothing, and `a = 1` followed by `[a]` is `cannot multiply !!int with !!map`.
+The two quirks of yq's own that a port has to keep: the keys of an inline table are listed in an ordered map by their text, so of two spelled alike only the last is merged (`x = {a.b = 1, a.c = 2}` is `x: {a: {c: 2}}`, though `x = [{a.b = 1, a.c = 2}]` keeps both), and every comment run inside an array contributes only its first comment.
+Comments gather in a list that the next value, table or array element takes as its head comment (an array element keeps one), the comments above the first key are the document's, a comment on the line of a value is that value's line comment, and one that is the last thing in a table, or in the file, belongs to the table or is dropped, as in yq.
+A document with no key (an empty file, or only comments) holds no document: `-o yaml` prints an empty line and `-o json` prints `null`.
+Under `-p auto` a first input file named `*.toml` (any case) reads and, with `-o auto`, prints as TOML, and `-i` writes it back; the format has no other name here, as in yq (`tml` is not one, and `-p tm` is refused).
+These agree with yq v4.53.3 under `-o yaml` and `-o json` on 5,036 TOML files found on a developer machine (`pyproject.toml`, `Cargo.toml`, tool configuration), and on 14,000 random documents (every scalar spelling above, quoted, dotted and glob keys, tables, arrays of tables, inline tables, comments and CRLF, and the same documents with one or two characters deleted, inserted or replaced); `tests/yq_cli/i6925_toml.rs` pins 190 rows.
+
+These rows differ:
+
+- **A date-time's tag.** yq's node has none, so `.a | tag` prints an empty line; the text is a plain timestamp here, which is `!!timestamp`.
+  The value, `-o json` and `-o yaml` agree.
+- **An infinity or NaN in JSON.** `a = inf`, `-inf`, `+inf` and `nan` print as `!!float inf` (and so on) under `-o yaml`, as yq prints them, but `-o json` writes the string here, where yq stops with `json: error calling MarshalJSON ...: json: unsupported value: +Inf`.
+  The same difference is there for `a: !!float inf` in a YAML input: the JSON writers here refuse a plain `.inf` as yq does and not a tag-forced one ([#7115](https://github.com/rust-works/succinctly/issues/7115)).
+- **An underscored number.** `1_000`, `1__0`, `0xDEAD_beef` and `1_0.5` are plain scalars in yq's output but strings to the YAML reader here (the recorded input-spec divergence for underscored numbers), so they are written with their tag (`!!int 1_000`, `!!float 1_0.5`) and read back as numbers; `-o json` and arithmetic agree (`.a + .b` is `1000 + 3735928559`), and `-o yaml` shows the tag.
+- **Where a comment is attributed.** The nodes are written as text and read back, so `head_comment`, `line_comment` and `foot_comment` show the YAML reader's attribution, not yq's: yq prints the head comment of a scalar value after its line (`b: x` then `# before b`), and the reader here attributes that line to the next key; the printed text agrees.
+  A table's or an array element's head comment, and a scalar's line comment, agree.
+- **A comment on an empty table.** yq writes the head comment of an empty table inside braces (`t: {` / `  # c` / `}`), which no YAML reader keeps; here it is written above its key.
+- **A line comment on a collection.** yq's emitter writes it on the next line that has no comment of its own (`a = {x=1} # c` then `b = 1` is `b: 1 # c`), and the same is done here, including for the next key whose value is a collection (`b: # c`) and a `- ` item that is a mapping (`- # c`); when that line is an empty `[]` or `{}`, yq writes broken YAML (`b: # c` and `{}` at column 0) and here the comment follows the value (`b: {} # c`).
+- **CRLF.** go-toml keeps the `\r` of a CRLF file in every comment and yq writes it back as a bare `\r` that ends the line, so its output has no line break there; the comment is without it and the line break is `\n` here.
+- **`-o toml`.** A TOML file read and written back as TOML (`yq -i` on `*.toml`) loses its comments and writes an inline table as a table, as every `-o=toml` input does (see `-o=toml` above); yq keeps both.
+- **Nesting.** An array or inline table nested more than 400 levels, or a key of more than 400 dotted parts, is refused (`the document nests arrays, inline tables or dotted keys more than 400 levels deep`), where yq's stack grows as far as memory allows; the YAML reader's own limit (128, see above) is reached first by a document that nests that many levels in the YAML text.
+  A path that indexes an array past 2,097,152 elements (`a = [1]` then `a.99999999 = 1`) is refused (`Cannot grow array to N elements`) rather than padded with `null`.
+- `--front-matter` with an explicit `-p toml` is refused (`--front-matter and --input-format toml are incompatible`), as `-p json` is, where yq decodes the front matter as TOML.
+- **Speed.** A run of `[[array]]` tables is written in place here, so 20,000 of them read in half a second; yq copies the array once per table and takes minutes (500 tables take 0.4 s there, 2,000 take 11 s).
 
 ### `-o=xml` — comments, a source spelling and an empty document are not read (#6924)
 

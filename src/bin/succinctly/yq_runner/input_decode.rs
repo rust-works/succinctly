@@ -30,6 +30,8 @@ pub(super) enum TranscodedInput {
     Ini,
     /// `decoder_xml.go`: Go's `encoding/xml`, an element a mapping of its attributes and children.
     Xml,
+    /// `decoder_toml.go`: go-toml's parser, a mapping of the keys and tables.
+    Toml,
 }
 
 /// The flags a transcoder reads besides the input.
@@ -63,6 +65,7 @@ impl TranscodedInput {
             InputFormat::Tsv => Some(Self::Tsv),
             InputFormat::Ini => Some(Self::Ini),
             InputFormat::Xml => Some(Self::Xml),
+            InputFormat::Toml => Some(Self::Toml),
             InputFormat::Auto => match super::lowercase_extension(files.first()?).as_deref() {
                 Some("base64") => Some(Self::Base64),
                 Some("uri") => Some(Self::Uri),
@@ -71,6 +74,7 @@ impl TranscodedInput {
                 Some("tsv" | "t") => Some(Self::Tsv),
                 Some("ini" | "i") => Some(Self::Ini),
                 Some("xml" | "x") => Some(Self::Xml),
+                Some("toml") => Some(Self::Toml),
                 _ => None,
             },
             InputFormat::Yaml | InputFormat::Json | InputFormat::Kyaml => None,
@@ -81,7 +85,9 @@ impl TranscodedInput {
     pub(super) fn reads_as(self) -> InputFormat {
         match self {
             Self::Base64 | Self::Uri => InputFormat::Json,
-            Self::Props | Self::Csv | Self::Tsv | Self::Ini | Self::Xml => InputFormat::Yaml,
+            Self::Props | Self::Csv | Self::Tsv | Self::Ini | Self::Xml | Self::Toml => {
+                InputFormat::Yaml
+            }
         }
     }
 
@@ -95,6 +101,7 @@ impl TranscodedInput {
             Self::Tsv => "tsv",
             Self::Ini => "ini",
             Self::Xml => "xml",
+            Self::Toml => "toml",
         }
     }
 
@@ -103,7 +110,7 @@ impl TranscodedInput {
     pub(super) fn empty_is_document(self) -> bool {
         match self {
             Self::Base64 | Self::Uri | Self::Csv | Self::Tsv | Self::Ini | Self::Xml => true,
-            Self::Props => false,
+            Self::Props | Self::Toml => false,
         }
     }
 
@@ -118,6 +125,7 @@ impl TranscodedInput {
             Some(Self::Tsv) => 5,
             Some(Self::Ini) => 6,
             Some(Self::Xml) => 7,
+            Some(Self::Toml) => 8,
         }
     }
 
@@ -130,6 +138,7 @@ impl TranscodedInput {
             5 => Some(Self::Tsv),
             6 => Some(Self::Ini),
             7 => Some(Self::Xml),
+            8 => Some(Self::Toml),
             _ => None,
         }
     }
@@ -166,6 +175,7 @@ impl TranscodedInput {
                 };
                 return super::input_xml::transcode(raw, xml);
             }
+            Self::Toml => return super::input_toml::transcode(raw),
         };
         Ok(json_string(&decoded))
     }

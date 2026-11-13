@@ -889,7 +889,7 @@ fn seq_index(wanted: &str) -> Result<i64, String> {
 
 /// The `strconv.ParseInt` error yq's `parseInt64` gets for `s`, which it does not read: every `_`
 /// is removed first, then a `0x`/`0X` (hex) or `0o` (octal) prefix picks the base and is dropped.
-fn go_parse_int_error(s: &str) -> String {
+pub(super) fn go_parse_int_error(s: &str) -> String {
     let stripped: String = s.chars().filter(|&c| c != '_').collect();
     let (digits, base) = if let Some(rest) = stripped
         .strip_prefix("0x")
@@ -1063,7 +1063,7 @@ fn render_inline(out: &mut Out, value: &Node, block_indent: &str) {
 
 /// `s` as go-yaml writes a string with no style of its own; `block_indent` is the indent of a
 /// literal block's lines.
-fn string_scalar(s: &str, block_indent: &str, is_key: bool) -> String {
+pub(super) fn string_scalar(s: &str, block_indent: &str, is_key: bool) -> String {
     go_yaml_dom_scalar(s, false, true, is_key)
         .or_else(|| go_yaml_multiline_scalar(s, block_indent, STEP.len()))
         .unwrap_or_else(|| succinctly::yaml::go_yaml_double_quoted_scalar(s))
