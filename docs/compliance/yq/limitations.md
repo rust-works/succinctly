@@ -1319,6 +1319,19 @@ Still different:
 - `pick`, `omit` and `explode` do not return their input in yq: their arguments are evaluated over the list and cross it (`pick(["k"])` prints `{"k":10,"k":10,"k":10,"k":10}`), a separate rule.
 - `del(.k) | .a // 7` and `del(.k) | . as $d | [$d]` follow the `//` rule of [#7173](https://github.com/rust-works/succinctly/issues/7173) and the variable rule of [#2427](https://github.com/rust-works/succinctly/issues/2427); `del(.k) | .z = [.]` writes the list into each document, where yq's array holds the live nodes (see #7137 above).
 
+### `!=` reads its operands read-only under `--eval-all` ([#7179](https://github.com/rust-works/succinctly/issues/7179))
+
+yq's `notEqualsOperator` evaluates both operands through `ReadOnlyClone`, where a key that finds nothing yields no node.
+`==`, `<`, `>`, `<=` and `>=` evaluate them through an ordinary context, where it yields `null`.
+Both cross the whole document list, so an operand over an absent key is empty for `!=` and a list of `null`s for `==`: `yq ea '.zz != 1' a1 a2 a3` is four `true` (an empty left runs once per right result), `.zz != .zz` is one `false`, and `.a != .c` is the single pairing of the document that has `a` with the one that has `c`, where `.zz == 1` pairs sixteen.
+`succinctly yq` read the operands of `!=` the way `==` does.
+Without `--eval-all` nothing differs.
+The rows are pinned against yq v4.53.3 in `tests/yq_cli/i7179.rs`.
+
+Still different:
+- The origin of a comparison's boolean: `.k != 20 | fi` is `0 0 0 0 1 1 1 1 2 2 2 2` in yq, where it is `0` throughout here ([#6973](https://github.com/rust-works/succinctly/issues/6973)).
+- `and` and `or` under `--eval-all` cross the list too, with a short circuit on the left (`(.k and .k)` is nine `true` over three documents that have `k`, `(.k or .k)` is three), and are evaluated per document here.
+
 ### An arithmetic result keeps its left operand's origin under `--eval-all` ([#6969](https://github.com/rust-works/succinctly/issues/6969))
 
 A result of `+`, `-`, `*`, `/` or `%` is read from where its left operand was, as in yq: `yq ea '. * {"z":1} | document_index' md.yaml` over two documents is `0 0 1 1`, and `file_index` and `filename` follow the same way.
