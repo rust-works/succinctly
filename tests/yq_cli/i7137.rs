@@ -156,10 +156,14 @@ fn files(dir: &TempDir, which: &str) -> Result<Vec<std::path::PathBuf>> {
     let texts: [&str; 3] = match which {
         "plain" => ["a: 1\n", "c: 3\n", "e: 5\n"],
         "keyed" => ["a: 1\nk: 10\n", "c: 3\nk: 20\n", "e: 5\nk: 30\n"],
+        "scalar" => ["5\n", "6\n", ""],
+        "multi" => ["a: [1, 2]\nb: 7\n", "a: [3]\nb: 8\n", ""],
+        "nested" => ["a:\n  x: 1\nl: [1]\n", "a:\n  x: 2\nl: [2, 3]\n", "b: 3\n"],
         other => unreachable!("no file set {other}"),
     };
     texts
         .iter()
+        .filter(|text| !text.is_empty())
         .enumerate()
         .map(|(i, text)| {
             let path = dir.path().join(format!("f{}.yaml", i + 1));
@@ -168,6 +172,55 @@ fn files(dir: &TempDir, which: &str) -> Result<Vec<std::path::PathBuf>> {
         })
         .collect()
 }
+
+/// (files, filter, yq's stdout under `-o=json -I=0`): targets that are no-ops, several at once, and nested.
+#[rustfmt::skip]
+const JSON_ROWS: &[(&str, &str, &str)] = &[
+    ("scalar", ".a = error(\"x\")", "5\n6\n"),
+    ("scalar", ".a.b = fi", "5\n6\n"),
+    ("scalar", ".[0] = fi", "5\n6\n"),
+    ("multi", ".[0] = fi", "{\"a\":[1,2],\"b\":7,\"0\":1}\n{\"a\":[3],\"b\":8,\"0\":1}\n"),
+    ("multi", ".a[] = fi", "{\"a\":[1,1],\"b\":7}\n{\"a\":[1],\"b\":8}\n"),
+    ("multi", "(.a, .b) = fi", "{\"a\":1,\"b\":1}\n{\"a\":1,\"b\":1}\n"),
+    ("multi", ".a[] += fi", "{\"a\":[2,3],\"b\":7}\n{\"a\":[4],\"b\":8}\n"),
+    ("multi", ".a[0] = .b", "{\"a\":[8,2],\"b\":7}\n{\"a\":[8],\"b\":8}\n"),
+    ("multi", ".a[] = .b", "{\"a\":[8,8],\"b\":7}\n{\"a\":[8],\"b\":8}\n"),
+    ("multi", ".[] = fi", "{\"a\":1,\"b\":1}\n{\"a\":1,\"b\":1}\n"),
+    ("multi", "(.b | select(. > 7)) = fi", "{\"a\":[1,2],\"b\":7}\n{\"a\":[3],\"b\":1}\n"),
+    ("multi", ".c.d.e = .b", "{\"a\":[1,2],\"b\":7,\"c\":{\"d\":{\"e\":8}}}\n{\"a\":[3],\"b\":8,\"c\":{\"d\":{\"e\":8}}}\n"),
+    ("multi", ".a += .a", "{\"a\":[1,2,3],\"b\":7}\n{\"a\":[3,3],\"b\":8}\n"),
+    ("multi", ".a = .a + .a", "{\"a\":[3,3],\"b\":7}\n{\"a\":[3,3],\"b\":8}\n"),
+    ("multi", ".a = .b", "{\"a\":8,\"b\":7}\n{\"a\":8,\"b\":8}\n"),
+    ("multi", ".b = .a", "{\"a\":[1,2],\"b\":[3]}\n{\"a\":[3],\"b\":[3]}\n"),
+    ("multi", ".b += .b", "{\"a\":[1,2],\"b\":15}\n{\"a\":[3],\"b\":16}\n"),
+    ("multi", ".b -= fi", "{\"a\":[1,2],\"b\":6}\n{\"a\":[3],\"b\":7}\n"),
+    ("multi", ".b *= .b", "{\"a\":[1,2],\"b\":56}\n{\"a\":[3],\"b\":64}\n"),
+    ("multi", ".b = (.b | length)", "{\"a\":[1,2],\"b\":1}\n{\"a\":[3],\"b\":1}\n"),
+    ("multi", ".b = ([.b] | length)", "{\"a\":[1,2],\"b\":2}\n{\"a\":[3],\"b\":2}\n"),
+    ("multi", ".b = ([.a[]] | length)", "{\"a\":[1,2],\"b\":3}\n{\"a\":[3],\"b\":3}\n"),
+    ("multi", ".c = keys", "{\"a\":[1,2],\"b\":7,\"c\":[\"a\",\"b\",\"c\"]}\n{\"a\":[3],\"b\":8,\"c\":[\"a\",\"b\",\"c\"]}\n"),
+    ("multi", ".a[1] = fi", "{\"a\":[1,1],\"b\":7}\n{\"a\":[3,1],\"b\":8}\n"),
+    ("multi", ".a[5] = fi", "{\"a\":[1,2,null,null,null,1],\"b\":7}\n{\"a\":[3,null,null,null,null,1],\"b\":8}\n"),
+    ("multi", ".b = (.a | length)", "{\"a\":[1,2],\"b\":1}\n{\"a\":[3],\"b\":1}\n"),
+    ("multi", ".b = (.a[0] // 9)", "{\"a\":[1,2],\"b\":3}\n{\"a\":[3],\"b\":3}\n"),
+    ("multi", ".b = .a[0]", "{\"a\":[1,2],\"b\":3}\n{\"a\":[3],\"b\":3}\n"),
+    ("nested", ".a.x = fi", "{\"a\":{\"x\":2},\"l\":[1]}\n{\"a\":{\"x\":2},\"l\":[2,3]}\n{\"b\":3,\"a\":{\"x\":2}}\n"),
+    ("nested", ".a = .a", "{\"a\":null,\"l\":[1]}\n{\"a\":null,\"l\":[2,3]}\n{\"b\":3,\"a\":null}\n"),
+    ("nested", ".a.x = .a.x", "{\"a\":{\"x\":null},\"l\":[1]}\n{\"a\":{\"x\":null},\"l\":[2,3]}\n{\"b\":3,\"a\":{\"x\":null}}\n"),
+    ("nested", ".l = .l", "{\"a\":{\"x\":1},\"l\":null}\n{\"a\":{\"x\":2},\"l\":null}\n{\"b\":3,\"l\":null}\n"),
+    ("nested", ".l += .l", "{\"a\":{\"x\":1},\"l\":[1]}\n{\"a\":{\"x\":2},\"l\":[2,3]}\n{\"b\":3,\"l\":null}\n"),
+    ("nested", ".l[] = fi", "{\"a\":{\"x\":1},\"l\":[2]}\n{\"a\":{\"x\":2},\"l\":[2,2]}\n{\"b\":3,\"l\":[]}\n"),
+    ("nested", ".a.y = .a.x", "{\"a\":{\"x\":1,\"y\":2},\"l\":[1]}\n{\"a\":{\"x\":2,\"y\":2},\"l\":[2,3]}\n{\"b\":3,\"a\":{\"y\":2}}\n"),
+    ("nested", ".n = (.a | length)", "{\"a\":{\"x\":1},\"l\":[1],\"n\":1}\n{\"a\":{\"x\":2},\"l\":[2,3],\"n\":1}\n{\"b\":3,\"n\":1}\n"),
+    ("nested", ".n = ([.a] | length)", "{\"a\":{\"x\":1},\"l\":[1],\"n\":2}\n{\"a\":{\"x\":2},\"l\":[2,3],\"n\":2}\n{\"b\":3,\"n\":2}\n"),
+    ("nested", ".a |= . + {\"z\": fi}", "{\"a\":{\"x\":1,\"z\":0},\"l\":[1]}\n{\"a\":{\"x\":2,\"z\":1},\"l\":[2,3]}\n{\"b\":3,\"a\":{\"z\":2}}\n"),
+    ("nested", ".a = (.a + {\"z\": fi})", "{\"a\":{\"z\":2},\"l\":[1]}\n{\"a\":{\"z\":2},\"l\":[2,3]}\n{\"b\":3,\"a\":{\"z\":2}}\n"),
+    ("nested", ".m = [.l[]]", "{\"a\":{\"x\":1},\"l\":[1],\"m\":[1,2,3]}\n{\"a\":{\"x\":2},\"l\":[2,3],\"m\":[1,2,3]}\n{\"b\":3,\"m\":[1,2,3]}\n"),
+    ("nested", ".m = (.l | length)", "{\"a\":{\"x\":1},\"l\":[1],\"m\":2}\n{\"a\":{\"x\":2},\"l\":[2,3],\"m\":2}\n{\"b\":3,\"m\":2}\n"),
+    ("nested", ".m = .b", "{\"a\":{\"x\":1},\"l\":[1],\"m\":3}\n{\"a\":{\"x\":2},\"l\":[2,3],\"m\":3}\n{\"b\":3,\"m\":3}\n"),
+    ("nested", ".a.x = .b", "{\"a\":{\"x\":3},\"l\":[1]}\n{\"a\":{\"x\":3},\"l\":[2,3]}\n{\"b\":3,\"a\":{\"x\":3}}\n"),
+    ("nested", ".[] = .b", "{\"a\":3,\"l\":3}\n{\"a\":3,\"l\":3}\n{\"b\":3}\n"),
+];
 
 /// The right side of `=`, `+=`, `-=`, `*=` is read over the whole list, and the last output wins.
 #[test]
@@ -214,6 +267,24 @@ fn plain_multi_file_assignment_stays_per_file_7137() -> Result<()> {
             (stdout.as_str(), stderr.as_str(), status),
             (expected, "", 0),
             "{filter}"
+        );
+    }
+    Ok(())
+}
+
+/// A document whose target is a no-op never runs the right side (`5 | .a = error("x")` is `5`), several
+/// targets share the one right-side value, and the structure under `-o=json` is yq's.
+#[test]
+fn eval_all_assignment_targets_noop_multiple_and_nested_7137() -> Result<()> {
+    for &(which, filter, expected) in JSON_ROWS {
+        let dir = TempDir::new()?;
+        let paths = files(&dir, which)?;
+        let refs: Vec<&std::path::Path> = paths.iter().map(std::path::PathBuf::as_path).collect();
+        let (stdout, stderr, status) = run_yq_files(filter, &refs, &["ea", "-o=json", "-I=0"])?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), status),
+            (expected, "", 0),
+            "{filter} over {which}"
         );
     }
     Ok(())

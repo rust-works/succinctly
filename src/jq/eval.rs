@@ -15862,6 +15862,15 @@ fn owned_assign_step<S: EvalSemantics>(
     expr: &Expr,
     state: &mut OwnedValue,
 ) -> Option<Result<(), EvalError>> {
+    // #7137: the right side of this write was evaluated over the whole `--eval-all` list and is
+    // waiting for it ([`collect_rhs_outputs`] takes it); the closed operand read here would be the
+    // document's own.
+    if S::TAG == EvalTag::Yq
+        && matches!(expr, Expr::Assign { .. } | Expr::CompoundAssign { .. })
+        && yq_together_rhs::installed()
+    {
+        return None;
+    }
     let (path, rhs) = match expr {
         // #3944: a successful write leaves the state a container (the path
         // has at least one step), which is truthy, so `(A) // B` is `A`'s
@@ -15973,12 +15982,6 @@ fn owned_assign_step<S: EvalSemantics>(
             )
         }
         Expr::CompoundAssign { op, path, value } => {
-            // #7137: the right side was evaluated over the whole `--eval-all` list and is
-            // waiting for this write ([`collect_rhs_outputs`] takes it); the closed operand read
-            // here would be the document's own.
-            if S::TAG == EvalTag::Yq && yq_together_rhs::installed() {
-                return None;
-            }
             let op = match op {
                 AssignOp::Add => ArithOp::Add,
                 AssignOp::Sub => ArithOp::Sub,

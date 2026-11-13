@@ -23029,6 +23029,25 @@ enum YqListStage {
     Assign,
 }
 
+/// Whether the walk takes an assignment's right side over the list (#7137): there is a slot to hand
+/// its outputs to (`std`, [`yq_together_rhs`]), it reads the list, and no assignment sits in the left
+/// side, where it would take the outputs meant for this one (the slot is the first
+/// `collect_rhs_outputs` to run inside the stage, and the left side is resolved before the right).
+fn assign_reads_the_list(path: &Expr, value: &Expr) -> bool {
+    cfg!(feature = "std")
+        && !assign_rhs_ignores_the_list(value)
+        && !crate::jq::walk::any_subexpr(path, &mut |e| {
+            matches!(
+                e,
+                Expr::Assign { .. }
+                    | Expr::Update { .. }
+                    | Expr::CompoundAssign { .. }
+                    | Expr::AlternativeAssign { .. }
+                    | Expr::MetaAssign { .. }
+            )
+        })
+}
+
 /// Whether an assignment's right side reads nothing of the context list, so evaluating it once
 /// over the list or once per document is the same answer: a scalar literal, or a mapping built from
 /// literal keys and such values. A collect is not one: `[1, 2]` under `ea` is `[E]` over every
@@ -23093,8 +23112,8 @@ fn yq_list_stage(stages: &[Expr], together: bool) -> Option<(usize, YqListStage)
                     found = Some((i, YqListStage::Fold));
                     break;
                 }
-                Expr::Assign { value, .. } | Expr::CompoundAssign { value, .. }
-                    if !assign_rhs_ignores_the_list(value) =>
+                Expr::Assign { path, value } | Expr::CompoundAssign { path, value, .. }
+                    if assign_reads_the_list(path, value) =>
                 {
                     found = Some((i, YqListStage::Assign));
                     break;
@@ -23331,19 +23350,27 @@ fn assign_together<S: EvalSemantics, V: DocumentValue>(
             _ => item.clone(),
         });
     }
-    let outputs: Vec<OwnedValue> = {
+    // A right side that fails is not raised here: yq never evaluates it for a document whose target
+    // is a no-op (`5 | .a = error("x")` is `5`), so the documents run their own right side, and
+    // the ones with a target raise.
+    let outputs: Option<Vec<OwnedValue>> = {
         // `assignUpdateOperator` evaluates its right side through `ReadOnlyClone` (#2470).
         let _read_only = yq_read_only_context::enter();
         let mut flat: Vec<Expr> = Vec::new();
         yq_flatten_pipe_stages(core::slice::from_ref(value), &mut flat);
         collect_yq_context::<S, V>(&flat, &targets_created, optional, cur)
-            .map_err(Flow::Escaped)?
-            .into_iter()
-            // STYLE-0012: an output that cannot be read is a decode failure, which an ambient `?`
-            // never silences (#1620, #1902).
-            .map(|item| generic_item_into_owned::<_, S>(item.to_generic_item()))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(Flow::Escaped)?
+            .ok()
+            .and_then(|items| {
+                items
+                    .into_iter()
+                    // Only the last output is applied (`normalize_rhs_values_for_fork`).
+                    // STYLE-0012: an output that cannot be read is a decode failure, which an
+                    // ambient `?` never silences (#1620, #1902): that one is raised per document.
+                    .map(|item| generic_item_into_owned::<_, S>(item.to_generic_item()))
+                    .collect::<Result<Vec<_>, _>>()
+                    .ok()
+            })
+            .map(|mut all| all.pop().into_iter().collect())
     };
     let mut written: Vec<YqContextItem<V>> = vec_with_capacity(context.len());
     for item in context {
@@ -23355,7 +23382,7 @@ fn assign_together<S: EvalSemantics, V: DocumentValue>(
                 origin: item.tag.origin,
             },
         );
-        let _installed = yq_together_rhs::enter(outputs.clone());
+        let _installed = outputs.clone().map(yq_together_rhs::enter);
         let results = collect_yq_context::<S, V>(
             core::slice::from_ref(stage),
             core::slice::from_ref(&alone),
