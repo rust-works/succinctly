@@ -229,3 +229,54 @@ fn a_redirected_file_reads_its_lines_from_its_offset_7024() -> Result<()> {
     same_on_file(&["-nR", "[inputs] | length"], &clean, near_end)?;
     Ok(())
 }
+
+/// A standard input that was not opened for reading (`jq . 0>>file`, `jq . 0> >(cat)`) reads as empty,
+/// whatever its size and whichever route would read it: the answer the whole route has always given,
+/// which a window's own read of the descriptor (`EBADF`) had turned into a failure at 4 MiB or more, on
+/// the plain route over a pipe or a redirected file and on `-R`.
+#[test]
+fn a_stdin_not_open_for_reading_reads_as_empty_at_every_size_7024() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let big = dir.path().join("big.ndjson");
+    std::fs::write(&big, join(&lines(LINES)))?;
+    let small = dir.path().join("small.ndjson");
+    std::fs::write(&small, b"{\"a\":1}\n")?;
+    for args in [
+        &["-c", "."][..],
+        &["-R", "length"],
+        &["-nR", "[inputs] | length"],
+    ] {
+        let mut stdins: Vec<(&str, Stdio)> = Vec::new();
+        for (name, path) in [("big", &big), ("small", &small)] {
+            let file = std::fs::OpenOptions::new().append(true).open(path)?;
+            stdins.push((name, Stdio::from(file)));
+        }
+        let (_reader, writer) = std::io::pipe()?;
+        stdins.push(("pipe write end", Stdio::from(writer)));
+        let mut answers = Vec::new();
+        for (name, stdin) in stdins {
+            let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+                .arg("jq")
+                .args(args)
+                .stdin(stdin)
+                .output()?;
+            answers.push((
+                name,
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+                output.status.code(),
+            ));
+        }
+        let (_, out, err, status) = &answers[1];
+        for answer in &answers {
+            assert_eq!(
+                (&answer.1, &answer.2, answer.3),
+                (out, err, *status),
+                "{args:?} on {}",
+                answer.0
+            );
+        }
+        assert_eq!(*status, Some(0), "{args:?}: {err}");
+    }
+    Ok(())
+}
