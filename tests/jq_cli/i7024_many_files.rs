@@ -1,8 +1,9 @@
 //! #7024: a list of more than 32 regular files is read a window at a time as the one stream jq reads
 //! them as, each file opened when the run reaches it, where such a list was read whole. Every row is
-//! what the same files give when the route declines them, which is when the paths are `/dev/fd/N`:
-//! stdout, stderr and the exit status, with each file's name made one. Descriptors past 9 are opened
-//! by `bash`, which reads `exec 10<path` as a redirection where `sh` may not.
+//! what the same files give when the route declines them, which is when a path is not a regular file:
+//! stdout, stderr and the exit status, with each file's name made one. The files are handed to that
+//! route as named pipes ([`whole_by_descriptor`]): descriptors past 9 opened by `bash` 3.2, macOS's,
+//! did not reopen as `/dev/fd/N` reliably (`Resource temporarily unavailable` on CI).
 
 #![cfg(unix)]
 
@@ -42,56 +43,94 @@ fn cut(bytes: &[u8]) -> Vec<Vec<u8>> {
 
 type Run = (String, String, i32);
 
-/// The files as paths (the windowed route), and as descriptors 10 on (the route that reads them
-/// whole).
+/// The run over `paths` on the route that reads them whole: each path that names a file is given as a
+/// named pipe (`mkfifo`) that a thread fills with the file's bytes, which is no regular file and so
+/// sends the list to that route, and a path that does not (gone, or a directory) is given as itself.
+/// The output names each file by its path again. A pipe the run never opened is opened here once it
+/// exits, so its writer ends.
+fn whole_by_descriptor(args: &[&str], paths: &[std::path::PathBuf]) -> Result<Run> {
+    let dir = tempfile::tempdir()?;
+    let mut operands = Vec::new();
+    let mut writers = Vec::new();
+    for (n, path) in paths.iter().enumerate() {
+        if !path.is_file() {
+            operands.push(path.clone());
+            continue;
+        }
+        let fifo = dir.path().join(format!("p{n:02}"));
+        let made = Command::new("mkfifo").arg(&fifo).status()?;
+        assert!(made.success(), "mkfifo {}", fifo.display());
+        let bytes = std::fs::read(path)?;
+        let target = fifo.clone();
+        // Opening a pipe for writing waits for its reader; a write the reader leaves fails, and is
+        // no concern of the test.
+        writers.push((
+            fifo.clone(),
+            std::thread::spawn(move || {
+                if let Ok(mut pipe) = std::fs::OpenOptions::new().write(true).open(&target) {
+                    let _ = pipe.write_all(&bytes);
+                }
+            }),
+        ));
+        operands.push(fifo);
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("jq")
+        .args(args)
+        .args(&operands)
+        .env("LC_ALL", "C")
+        .output()?;
+    for (fifo, writer) in writers {
+        if !writer.is_finished() {
+            drop(std::fs::File::open(&fifo));
+        }
+        writer.join().expect("the writer ends");
+    }
+    let named = |text: &[u8]| {
+        let mut text = String::from_utf8_lossy(text).into_owned();
+        for (operand, path) in operands.iter().zip(paths) {
+            text = text.replace(&operand.display().to_string(), &path.display().to_string());
+        }
+        text
+    };
+    Ok((
+        named(&output.stdout),
+        named(&output.stderr),
+        output.status.code().unwrap_or(-1),
+    ))
+}
+
+/// The files as paths (the windowed route), and as descriptors (the route that reads them whole).
 fn both(args: &[&str], files: &[Vec<u8>]) -> Result<(Run, Run)> {
     let dir = tempfile::tempdir()?;
     let mut paths = Vec::new();
     for (n, bytes) in files.iter().enumerate() {
         let path = dir.path().join(format!("f{n:02}.json"));
         std::fs::File::create(&path)?.write_all(bytes)?;
-        paths.push(path.to_string_lossy().into_owned());
+        paths.push(path);
     }
-    let bin = env!("CARGO_BIN_EXE_succinctly");
-    let name = |text: &[u8]| {
-        let mut text = String::from_utf8_lossy(text).into_owned();
-        // The longest first: `/dev/fd/1` is a prefix of `/dev/fd/10`.
-        for (n, path) in paths.iter().enumerate().rev() {
-            text = text.replace(path.as_str(), &format!("<file {n}>"));
-            text = text.replace(&format!("/dev/fd/{}", n + 10), &format!("<file {n}>"));
-        }
-        text
+    let name = |run: Run| -> Run {
+        let name = |mut text: String| {
+            // The longest first: `f1.json` is not a prefix of `f10.json`, but keep the order safe.
+            for (n, path) in paths.iter().enumerate().rev() {
+                text = text.replace(&path.display().to_string(), &format!("<file {n}>"));
+            }
+            text
+        };
+        (name(run.0), name(run.1), run.2)
     };
-    let finish = |output: std::process::Output| -> Run {
-        (
-            name(&output.stdout),
-            name(&output.stderr),
-            output.status.code().unwrap_or(-1),
-        )
-    };
-    let windowed = Command::new(bin)
+    let windowed = Command::new(env!("CARGO_BIN_EXE_succinctly"))
         .arg("jq")
         .args(args)
         .args(&paths)
         .env("LC_ALL", "C")
         .output()?;
-    let mut script = String::new();
-    for (n, path) in paths.iter().enumerate() {
-        script.push_str(&format!("exec {}<'{}'\n", n + 10, path));
-    }
-    script.push_str("exec \"$0\" jq \"$@\"");
-    for n in 0..paths.len() {
-        script.push_str(&format!(" /dev/fd/{}", n + 10));
-    }
-    script.push('\n');
-    let whole = Command::new("bash")
-        .arg("-c")
-        .arg(&script)
-        .arg(bin)
-        .args(args)
-        .env("LC_ALL", "C")
-        .output()?;
-    Ok((finish(windowed), finish(whole)))
+    let windowed = (
+        String::from_utf8_lossy(&windowed.stdout).into_owned(),
+        String::from_utf8_lossy(&windowed.stderr).into_owned(),
+        windowed.status.code().unwrap_or(-1),
+    );
+    Ok((name(windowed), name(whole_by_descriptor(args, &paths)?)))
 }
 
 fn same(args: &[&str], files: &[Vec<u8>]) -> Result<Run> {
@@ -190,9 +229,8 @@ enum Change {
 
 /// 40 files, the first big enough that the run is still in it when its output fills the pipe; the
 /// change is made while the run waits to write, and the run is then drained. The answer is what the
-/// files give afterwards on the route that reads them whole: each path that is still a file is given
-/// as a descriptor (`/dev/fd/N`, opened by `bash`), which sends the list to that route, and the names
-/// are made the paths again. The run met each change when its reader got there, as jq's does.
+/// files give afterwards on the route that reads them whole ([`whole_by_descriptor`]): the run met each
+/// change when its reader got there, as jq's does.
 fn changed_while_running(change: Change, args: &[&str]) -> Result<(Run, Run)> {
     use std::io::Read;
     let dir = tempfile::tempdir()?;
@@ -260,37 +298,7 @@ fn changed_while_running(change: Change, args: &[&str]) -> Result<(Run, Run)> {
         String::from_utf8_lossy(&stderr).into_owned(),
         status.code().unwrap_or(-1),
     );
-    let mut script = String::new();
-    let mut operands = String::new();
-    for (n, path) in paths.iter().enumerate() {
-        if path.is_file() {
-            script.push_str(&format!("exec {}<'{}'\n", n + 10, path.display()));
-            operands.push_str(&format!(" /dev/fd/{}", n + 10));
-        } else {
-            operands.push_str(&format!(" '{}'", path.display()));
-        }
-    }
-    script.push_str(&format!("exec \"$0\" jq \"$@\"{operands}\n"));
-    let whole = Command::new("bash")
-        .arg("-c")
-        .arg(&script)
-        .arg(bin)
-        .args(args)
-        .env("LC_ALL", "C")
-        .output()?;
-    let named = |text: &[u8]| {
-        let mut text = String::from_utf8_lossy(text).into_owned();
-        // The longest first: `/dev/fd/1` is a prefix of `/dev/fd/10`.
-        for (n, path) in paths.iter().enumerate().rev() {
-            text = text.replace(&format!("/dev/fd/{}", n + 10), &path.display().to_string());
-        }
-        text
-    };
-    let whole = (
-        named(&whole.stdout),
-        named(&whole.stderr),
-        whole.status.code().unwrap_or(-1),
-    );
+    let whole = whole_by_descriptor(args, &paths)?;
     Ok((windowed, whole))
 }
 
