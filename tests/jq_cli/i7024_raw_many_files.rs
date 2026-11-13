@@ -280,7 +280,7 @@ fn changed_while_running(change: Change, args: &[&str]) -> Result<(Run, Run)> {
         }
         Change::MiddleUnreadable => {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&paths[20], std::fs::Permissions::from_mode(0))?;
+            std::fs::set_permissions(&paths[20], std::fs::Permissions::from_mode(0o0))?;
         }
     }
     let mut rest = Vec::new();
@@ -333,7 +333,7 @@ fn a_path_that_changes_before_the_run_reaches_it_is_read_as_jq_reads_it_7024() -
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("probe");
         std::fs::write(&path, b"x")?;
-        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0))?;
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o0))?;
         std::fs::File::open(&path).is_ok()
     };
     if !readable {
