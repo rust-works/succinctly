@@ -446,6 +446,7 @@ succinctly yq '.users[]' input.yaml
 - `-v, --verbose`: Accepted for yq's flag; the debug log yq writes to stderr is not produced. Like every boolean flag it takes a value after `=` only (`--verbose=false`)
 - `--string-interpolation[=BOOL]`: `--string-interpolation=false` keeps `\(expr)` in a string literal as text, in the program and in `eval(..)` text alike. The default is true
 - `-c, --yaml-compact-seq-indent[=BOOL]`: Write a block sequence under a mapping key two columns left of the default, the kubectl style (`a:` / `- d` at `-I 2`). YAML output only; JSON is unchanged. In `succinctly jq`, `-c` is `--compact-output`
+- `--header-preprocess[=BOOL]`: `--header-preprocess=false` reads a YAML input as an ordinary stream: the leading comments are the first node's head comment and a first `---` is read and not echoed, instead of the default's verbatim header. The default is true
 
 `yq eval` (`e`) and `yq eval-all` (`ea`) are accepted as yq's subcommands (#7040): the word is dropped, and `eval-all` also evaluates once over every document, as `--eval-all` does (`succinctly yq e '.a' f.yaml`, `succinctly yq ea 'select(fi == 1)' a.yaml b.yaml`). Only the first positional is a subcommand, whichever side of it the flags stand.
 
