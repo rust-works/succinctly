@@ -11754,6 +11754,59 @@ pub(crate) fn eval_owned_count_door<S: EvalSemantics>(
     eval_owned_length(expr, input)
         .or_else(|| eval_owned_string_door::<S>(expr, input))
         .or_else(|| eval_owned_def_call_count::<S>(expr, input))
+        .or_else(|| eval_owned_count_arith::<S>(expr, input))
+}
+
+/// Arithmetic over a count and number literals (`length - 5`, `2 * length`, `length / 2 - 1`),
+/// answered from the owned container's length (#7110): `$a[$a | length - 5:]` evaluates its bound
+/// as `$a | (length - 5)`, and the stage `length - 5` has no door of its own, so each evaluation
+/// wrote `$a` out as text and indexed it again (3.7 ms per call over 100,000 elements, linear in
+/// the calls) to read one length that `($a | length) - 5` already took from the tree.
+///
+/// Every operand is a count of the owned container (an [`eval_owned_length`] answer), a number
+/// literal, or such arithmetic again, and at least one is a count, so the answer is a fresh number
+/// that carries nothing of `input`. The sum is [`arith_combine`]'s, the one the closed operators
+/// use. jq mode only (yq's arithmetic rules differ), and an operation that raises (`length / 0`)
+/// declines, so the bridge keeps its error and its text.
+fn eval_owned_count_arith<S: EvalSemantics>(expr: &Expr, input: &OwnedValue) -> Option<OwnedValue> {
+    /// The deepest arithmetic read: deeper declines, so the evaluator charges its own frames.
+    const MAX_DEPTH: usize = 32;
+    fn operand<S: EvalSemantics>(
+        expr: &Expr,
+        input: &OwnedValue,
+        counted: &mut bool,
+        depth: usize,
+    ) -> Option<OwnedValue> {
+        if depth > MAX_DEPTH {
+            return None;
+        }
+        match unwrap_paren(expr) {
+            Expr::Literal(lit) => match literal_to_owned(lit) {
+                number @ (OwnedValue::Int(_)
+                | OwnedValue::Float(_)
+                | OwnedValue::NumberLiteral(..)) => Some(number),
+                _ => None,
+            },
+            Expr::Arithmetic {
+                op, left, right, ..
+            } => {
+                let l = operand::<S>(left, input, counted, depth + 1)?;
+                let r = operand::<S>(right, input, counted, depth + 1)?;
+                arith_combine::<S>(*op, l, r).ok()
+            }
+            other => {
+                let count = eval_owned_length(other, input)?;
+                *counted = true;
+                Some(count)
+            }
+        }
+    }
+    if S::TAG != EvalTag::Jq || !matches!(unwrap_paren(expr), Expr::Arithmetic { .. }) {
+        return None;
+    }
+    let mut counted = false;
+    let answer = operand::<S>(expr, input, &mut counted, 0)?;
+    counted.then_some(answer)
 }
 
 /// A call to a user `def` with no parameters whose body the count doors answer
@@ -130357,6 +130410,86 @@ mod tests {
     /// modes, and declines every other input
     /// and shape (a non-string input, a non-literal or non-string argument, a stage that computes
     /// or fans out), leaving those and their errors to the bridge.
+    #[test]
+    fn eval_owned_count_arith_agrees_with_the_reindex_bridge_7110() {
+        let containers = [
+            OwnedValue::array_from((0..10).map(OwnedValue::Int).collect()),
+            OwnedValue::array(),
+            OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]),
+        ];
+        let answered_shapes = [
+            "length - 5",
+            "5 - length",
+            "(length) * 2",
+            "length / 4",
+            "length % 4",
+            "length + 0.5",
+            "length * 1e1000",
+            "length + 100000000000000000001",
+            "(length - 1) * (length + 1)",
+            "length - length",
+            "2 * length - 1",
+        ];
+        let declined_shapes = [
+            "length / 0",
+            "length % 0",
+            "length + \"x\"",
+            "length - null",
+            "length - (.x)",
+            "1 + 2",
+            ".a + length",
+            "length > 3",
+        ];
+        for value in &containers {
+            for src in answered_shapes {
+                let expr = parse(src).unwrap();
+                let fast = eval_owned_count_door::<JqSemantics>(&expr, value)
+                    .unwrap_or_else(|| panic!("{src:?} declined"));
+                let bridge = debug_normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                    &expr, value, false,
+                ));
+                assert_eq!(
+                    debug_normalize(QueryResult::<Vec<u64>>::Owned(fast)),
+                    bridge,
+                    "{src:?} on {value:?}"
+                );
+                // yq's arithmetic rules differ, so it never takes this door.
+                assert!(eval_owned_count_door::<YqSemantics>(&expr, value).is_none());
+            }
+            for src in declined_shapes {
+                let expr = parse(src).unwrap();
+                // `length > 3` is a comparison the other count door answers; the rest decline.
+                if src != "length > 3" {
+                    assert!(
+                        eval_owned_count_door::<JqSemantics>(&expr, value).is_none(),
+                        "{src:?} was answered"
+                    );
+                }
+            }
+        }
+        // A string's length is the string door's: whatever it answers agrees with the bridge.
+        let string = OwnedValue::String("abc".into());
+        let expr = parse("length - 1").unwrap();
+        if let Some(fast) = eval_owned_count_door::<JqSemantics>(&expr, &string) {
+            let bridge = debug_normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                &expr, &string, false,
+            ));
+            assert_eq!(
+                debug_normalize(QueryResult::<Vec<u64>>::Owned(fast)),
+                bridge
+            );
+        }
+        // Nesting past the bound declines, and a bound below it answers.
+        let nested = |n: usize| format!("{}length{}", "(1 + ".repeat(n), ")".repeat(n));
+        let array = &containers[0];
+        assert!(
+            eval_owned_count_door::<JqSemantics>(&parse(&nested(10)).unwrap(), array).is_some()
+        );
+        assert!(
+            eval_owned_count_door::<JqSemantics>(&parse(&nested(40)).unwrap(), array).is_none()
+        );
+    }
+
     #[test]
     fn eval_owned_string_door_agrees_with_the_reindex_bridge_5691() {
         let strings = [
