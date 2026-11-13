@@ -93540,6 +93540,7 @@ fn eval_owned_value_doors_past_tree<S: EvalSemantics>(
 }
 
 /// [`eval_owned_value_doors`]'s lone stages.
+#[inline]
 fn eval_owned_value_door_stage<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
@@ -93551,6 +93552,7 @@ fn eval_owned_value_door_stage<S: EvalSemantics>(
 /// The lone stages [`eval_each_owned_front_doors`] has always answered, in its order: a count, a
 /// projection, a construction of static reads, a key list or `has`, a fold or map of numbers, a string
 /// stage.
+#[inline]
 fn eval_owned_tree_door_stage<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
@@ -93566,6 +93568,7 @@ fn eval_owned_tree_door_stage<S: EvalSemantics>(
 
 /// The lone stages #7132 added: `first`/`last`/`nth`, a slice, and a comparison or boolean over the
 /// tree doors' answers.
+#[inline]
 fn eval_owned_read_door_stage<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
@@ -93584,13 +93587,19 @@ fn eval_owned_read_door_stage<S: EvalSemantics>(
 }
 
 /// [`eval_owned_value_doors`]'s compositions of its lone stages: a pipe, an `as`-bound count, an `if`.
+/// Dispatched on the expression's kind, so a stage that is none of them (the common decline, once per
+/// element on the generic route) costs one match and not three calls.
+#[inline]
 fn eval_owned_composed_doors<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
 ) -> Option<OwnedValue> {
-    eval_owned_door_pipe::<S>(expr, input)
-        .or_else(|| eval_owned_door_bind::<S>(expr, input))
-        .or_else(|| eval_owned_door_if::<S>(expr, input))
+    match unwrap_paren(expr) {
+        Expr::Pipe(_) => eval_owned_door_pipe::<S>(expr, input),
+        Expr::As { .. } => eval_owned_door_bind::<S>(expr, input),
+        Expr::If { .. } => eval_owned_door_if::<S>(expr, input),
+        _ => None,
+    }
 }
 
 /// A pipe of stages that each answer one value from the owned tree, the answer of one the input of the next
@@ -93734,17 +93743,19 @@ fn eval_owned_first_last_nth<S: EvalSemantics>(
 /// jq mode only, and never while the #2889 embed table is live: the elements of the slice share their
 /// storage with `input`, which the table witnesses, as for [`eval_owned_first_last_nth`].
 fn eval_owned_slice_door<S: EvalSemantics>(expr: &Expr, input: &OwnedValue) -> Option<OwnedValue> {
+    // A slice of an array or a string never raises, so under `?` it is the same answer. The shape
+    // first: it is the cheapest test, and the one most stages fail.
+    let slice = match unwrap_paren(expr) {
+        Expr::Try { expr, catch: None } | Expr::Optional(expr) => unwrap_paren(expr),
+        other => other,
+    };
     if S::TAG != EvalTag::Jq
+        || !matches!(slice, Expr::Slice { .. } | Expr::SliceExpr { .. })
         || !matches!(input, OwnedValue::Array(_) | OwnedValue::String(_))
         || super::eval_generic::embed_table_active()
     {
         return None;
     }
-    // A slice of an array or a string never raises, so under `?` it is the same answer.
-    let slice = match unwrap_paren(expr) {
-        Expr::Try { expr, catch: None } | Expr::Optional(expr) => unwrap_paren(expr),
-        other => other,
-    };
     let answer = match slice {
         Expr::Slice { start, end, .. } => slice_owned_value_read::<S>(input, *start, *end, false),
         Expr::SliceExpr { target, start, end }
