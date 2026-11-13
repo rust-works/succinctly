@@ -92197,7 +92197,42 @@ fn owned_update_step_arith<S: EvalSemantics>(expr: &Expr, state: OwnedValue) -> 
                 done => done,
             }
         }
+        None if matches!(expr, Expr::Arithmetic { left, .. } if matches!(unwrap_paren(left), Expr::Slice { .. })) => {
+            owned_slice_arith_step::<S>(expr, state)
+        }
         None => try_eval_owned_step::<S>(expr, state),
+    }
+}
+
+/// `.[A:B] + <closed>` as a fold's UPDATE (#7109): a slice of the state with literal bounds,
+/// combined with a right operand that needs no input, as `.[1:] + [$i]` slides a queue. Through the
+/// bridge each step wrote the whole state out as JSON and indexed it again, which made the fold
+/// quadratic (41 s at 20,000 steps, where `.[1:] | . + [$i]` takes 0.14 s). The cut is the one
+/// [`try_eval_owned_step`] makes for a slice UPDATE, and the combine is the accumulator step's, so
+/// this is that pipe of two stages applied directly.
+///
+/// jq evaluates the right operand first, so it is settled first here: one closed value, which
+/// cannot raise or yield a second, so the only error left is the cut's or the combine's, in the
+/// order the pipe raises them. A right operand that is not closed, or a cut the step declines
+/// (the #2889 embed table is live, a state that is not an array or a string), hands the untouched
+/// state back and the evaluator answers the whole expression. jq mode only, as the cut is.
+#[inline(never)]
+fn owned_slice_arith_step<S: EvalSemantics>(expr: &Expr, state: OwnedValue) -> OwnedStep {
+    let Expr::Arithmetic {
+        op, left, right, ..
+    } = expr
+    else {
+        return OwnedStep::Declined(state);
+    };
+    if S::TAG != EvalTag::Jq || super::eval_generic::embed_table_active() {
+        return OwnedStep::Declined(state);
+    }
+    let Some(rhs) = closed_expr_to_owned::<S>(right.as_ref()) else {
+        return OwnedStep::Declined(state);
+    };
+    match try_eval_owned_step::<S>(unwrap_paren(left), state) {
+        OwnedStep::Handled(Ok(cut)) => OwnedStep::Handled(arith_combine::<S>(*op, cut, rhs)),
+        done => done,
     }
 }
 
