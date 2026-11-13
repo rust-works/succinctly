@@ -9000,6 +9000,16 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
         Some(out)
     }
 
+    fn xml_leading_content(&self) -> Option<String> {
+        if !self.is_first_document_content() || self.index.after_bom() {
+            return None;
+        }
+        let mut out = String::new();
+        write_yq_header_spelling_markers(&mut out, self.text, self.index, true, "$yqDocSeparator$")
+            .ok()?;
+        Some(out)
+    }
+
     #[inline]
     fn document_has_aliases(&self) -> bool {
         self.index.has_aliases()
@@ -11481,6 +11491,18 @@ fn write_yq_header_with_markers<W: AsRef<[u64]>, Out: core::fmt::Write>(
     index: &YamlIndex<W>,
     doc_markers: bool,
 ) -> core::fmt::Result {
+    write_yq_header_spelling_markers(out, text, index, doc_markers, "---")
+}
+
+/// [`write_yq_header_with_markers`] spelling a bare `---` line as `marker`: yq's own text for it is
+/// `$yqDocSeparator$`, which its XML encoder writes inside the leading comment (#7117).
+fn write_yq_header_spelling_markers<W: AsRef<[u64]>, Out: core::fmt::Write>(
+    out: &mut Out,
+    text: &[u8],
+    index: &YamlIndex<W>,
+    doc_markers: bool,
+    marker_text: &str,
+) -> core::fmt::Result {
     let (end, cut_marker) = index.yq_header(|| yq_header_len(text));
     let Ok(header) = core::str::from_utf8(&text[..end]) else {
         return Ok(());
@@ -11527,7 +11549,7 @@ fn write_yq_header_with_markers<W: AsRef<[u64]>, Out: core::fmt::Write>(
             // A marker is written bare: without its indent and without the blanks after it (#6859).
             out.write_str(
                 if marker && trimmed.trim_end_matches([' ', '\t']) == "---" {
-                    "---"
+                    marker_text
                 } else {
                     line
                 },

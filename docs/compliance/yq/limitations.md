@@ -7939,7 +7939,7 @@ These rows differ:
 - **A multi-byte encoding** declared in the prolog (`shift_jis`, `euc-jp`, `euc-kr`, `gbk`, `gb18030`, `big5`, `iso-2022-jp`, `utf-16`) is refused (`xml: opening charset "shift_jis": unsupported charset: "shift_jis"`), as a label that is no encoding is; yq converts them.
 - **A byte that is not UTF-8 in a name** is U+FFFD in the error message here (`invalid XML name: <U+FFFD>`), where Go prints the byte.
 - **A character Go 1.27 classifies differently from Go 1.26** at the end of a text node (a code point assigned in Unicode 17 or later) is trimmed or kept by the newer table.
-- `-o xml` drops a comment (the `-o=xml` row above), so `-p xml -o xml` loses the comments of its input, and a `null` that a filter assigns (`.a = null`) is written empty when the input was XML, where yq writes `null`.
+- `-o xml` writes the comments of a node it reads (the `-o=xml` row above), so `-p xml -o xml .` keeps those of its input, where a write (`-i`) loses them, and a `null` that a filter assigns (`.a = null`) is written empty when the input was XML, where yq writes `null`.
 - `--front-matter` with an explicit `-p xml` is refused (`--front-matter and --input-format xml are incompatible`), where yq decodes the front matter as XML.
 - yq's warning that `-o auto` defaults to YAML when `-p xml` is explicit is not written.
 
@@ -8010,12 +8010,18 @@ These rows differ:
 - `--front-matter` with an explicit `-p toml` is refused (`--front-matter and --input-format toml are incompatible`), as `-p json` is, where yq decodes the front matter as TOML.
 - **Speed.** A run of `[[array]]` tables is written in place here, so 20,000 of them read in half a second; yq copies the array once per table and takes minutes (500 tables take 0.4 s there, 2,000 take 11 s).
 
-### `-o=xml` — comments, a source spelling and an empty document are not read (#6924)
+### `-o=xml` — a write or a built value loses its comments, and a source spelling and an empty document are not read (#6924, #7117)
 
 `-o=xml` is a port of yq's XML encoder over Go's `encoding/xml` printer (its indentation state, its text and attribute escapes, the refusals of a start tag with no name, of an attribute that is not a scalar, of a processing instruction with a bad target or a `?>` and of a malformed directive) and agrees with yq v4.53.3 on 5,000 random JSON documents.
-It runs over the value model, which keeps no comment or source spelling, so on a YAML input these still differ:
+A node's head, line and foot comments are written as yq's encoder writes them (#7117): above its element, inside it after its text, after its end tag, and the first document's leading comment block ahead of the first element, with yq's own text for a `---` line in it (`$yqDocSeparator$`).
+The comment text goes through the two regular expressions of `encodeComment` and a `-->` in it is refused as Go's `EncodeToken` refuses it.
+That agrees with yq v4.53.3 on 1,900 random YAML documents with comments in every position (twelve document shapes, `-I`, `-N`, filters that navigate) and on `-p xml -o xml` for the XML documents `scripts/yq-xml-input-sweep.py --only xml` generates, except where the input side differs (`-p xml`, above).
+The comments are read from the nodes the result came from, so these still differ on a YAML input:
 
-- A head, line or foot comment is dropped, where yq writes it as an XML comment (`<!-- c -->`, `<a>1<!-- l --></a>`).
+- A head, line or foot comment is dropped after a write (`.a = 1`, `-i`, so `succinctly yq -i '.a.d = "z"' pom.xml` strips the file's comments), and from a value the filter builds (`{"x": .a}`, `.a | to_xml`, `sort_keys(.)`, `with_entries(.)`, `explode(.)`) and under `--eval-all`, where yq keeps the comments of the nodes it copies.
+- A comment block that a blank line splits (`# f`, a blank line, `# g` under a key) is one comment here, where yq makes the first the key's foot comment and the second the next key's head comment or the mapping's foot comment, so it writes two XML comments and this writes one (`<!-- f --><!-- g -->` against `<!-- f`, an empty line, `g -->`).
+  The attribution is the one `head_comment` and `foot_comment` report (`.a | key | foot_comment`), so it is not special to XML.
+- A foot comment in a file with CRLF line ends keeps its line break in yq (`<!-- f`, a line break, `-->`), where it has none here.
 - A null written `~` is `null` and a boolean written `True` is `true`, where yq writes the source text.
 - An empty document, which yq prints as nothing, is `null` here (#5721).
 - A processing-instruction target is checked with an approximation of Go's XML name tables (Unicode letters, digits, `-`, `.`, the middle dot and the common combining marks), so a character the tables treat differently is accepted or refused here and not in yq.

@@ -10,7 +10,8 @@ under several flag sets, and the outputs (and exit statuses) compared:
 
 * `json`: `-o=json -I0 .`, the data model with no comment or style in the way;
 * `yaml`: `-o=yaml .`, which adds the head, line and foot comments of every node;
-* `props`: `-o=props .`, which prints the comments a node has on its own lines.
+* `props`: `-o=props .`, which prints the comments a node has on its own lines;
+* `xml`: `-o=xml .`, the round trip: the comments go back where yq's encoder writes them (#7117).
 
 A run is `ok` when both tools print the same bytes and exit with the same status. A mutated input
 that makes yq die of a Go panic (it dereferences a nil element after the root's end tag) is `panic`
@@ -140,7 +141,7 @@ FLAG_SETS = [
     ["--xml-attribute-prefix=@", "--xml-content-name=#text"],
     ["--xml-proc-inst-prefix=?", "--xml-directive-name=!"],
 ]
-OUTPUTS = [["-o=json", "-I0"], ["-o=yaml"], ["-o=props"]]
+OUTPUTS = [["-o=json", "-I0"], ["-o=yaml"], ["-o=props"], ["-o=xml"]]
 
 
 def run(argv, data):
@@ -174,7 +175,7 @@ def main():
     ap.add_argument("--show", type=int, default=12)
     ap.add_argument("--jobs", type=int, default=6)
     ap.add_argument("--mutate", type=float, default=0.35)
-    ap.add_argument("--only", choices=["json", "yaml", "props"])
+    ap.add_argument("--only", choices=["json", "yaml", "props", "xml"])
     ap.add_argument("--diff", action="store_true", help="show a unified diff, not both outputs")
     opts = ap.parse_args()
     r = random.Random(opts.seed)

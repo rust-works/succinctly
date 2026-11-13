@@ -4,8 +4,8 @@
 //! a key starting with the attribute prefix (`+@`) is an attribute of the enclosing element (a scalar
 //! only), `+content` is the element's text, a key starting with `+p_` is a processing instruction and
 //! `+directive` a directive. The printer's indentation is Go's: a start tag opens a line one level deeper
-//! unless text follows it, which keeps `<a>1</a>` on one line. Comments are not written (the value model
-//! keeps none).
+//! unless text follows it, which keeps `<a>1</a>` on one line. A comment is written where yq's encoder
+//! writes it when the caller has the nodes' comments ([`XmlComments`], #7117); the value model keeps none.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -82,6 +82,20 @@ impl Printer<'_> {
 
     fn text(&mut self, text: &str) {
         escape(&mut self.out, text, false);
+    }
+
+    /// Go's `EncodeToken(xml.Comment)`: written as it is, with no indentation, and refused when it holds
+    /// the closing marker.
+    fn comment(&mut self, text: &str) -> Result<(), EvalError> {
+        if text.contains("-->") {
+            return Err(EvalError::new(
+                "xml: EncodeToken of Comment containing --> marker".to_string(),
+            ));
+        }
+        self.out.push_str("<!--");
+        self.out.push_str(text);
+        self.out.push_str("-->");
+        Ok(())
     }
 
     fn proc_inst(&mut self, target: &str, inst: &str, first: bool) -> Result<(), EvalError> {
@@ -202,6 +216,114 @@ fn is_valid_directive(directive: &str) -> bool {
     depth == 0 && quote == 0 && !comment
 }
 
+/// The head, line and foot comment of one node as yq's node holds it: `#` and all, the lines of a
+/// block joined with a line break (go-yaml's `HeadComment`, `LineComment`, `FootComment`).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct XmlNodeComments {
+    pub head: String,
+    pub line: String,
+    pub foot: String,
+}
+
+/// What a node's members hold: a mapping's entries in order, or a sequence's items.
+#[derive(Debug, Clone, Default)]
+pub(crate) enum XmlMembers {
+    #[default]
+    None,
+    Map(Vec<XmlEntry>),
+    Seq(Vec<XmlComments>),
+}
+
+/// The comments of a node and of everything below it, in the shape of the value they came from.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct XmlComments {
+    pub own: XmlNodeComments,
+    pub members: XmlMembers,
+}
+
+/// A mapping entry: the key's own comments and the value's tree.
+#[derive(Debug, Clone)]
+pub(crate) struct XmlEntry {
+    pub key: String,
+    pub key_comments: XmlNodeComments,
+    pub value: XmlComments,
+}
+
+static NO_COMMENTS: XmlComments = XmlComments {
+    own: XmlNodeComments {
+        head: String::new(),
+        line: String::new(),
+        foot: String::new(),
+    },
+    members: XmlMembers::None,
+};
+
+/// yq's `headComment`, `lineComment` and `footComment`: the comment without its first `#`.
+fn without_first_hash(comment: &str) -> String {
+    comment.replacen('#', "", 1)
+}
+
+fn head_and_line(node: &XmlNodeComments) -> String {
+    without_first_hash(&node.head) + &without_first_hash(&node.line)
+}
+
+/// Go's regexp `\s`.
+fn is_go_space(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\x0C' | '\r' | ' ')
+}
+
+/// `^\s*#(.*)\n?` replaced by `$1`: one comment line's marker, and the line break after it.
+fn strip_single_line_marker(text: &str) -> String {
+    let trimmed = text.trim_start_matches(is_go_space);
+    let Some(rest) = trimmed.strip_prefix('#') else {
+        return text.to_string();
+    };
+    let line_end = rest.find('\n').unwrap_or(rest.len());
+    let (line, after) = rest.split_at(line_end);
+    let after = after.strip_prefix('\n').unwrap_or(after);
+    format!("{line}{after}")
+}
+
+/// `(^|\n) *# ?(.*)` replaced by `$1$2` over every line: a line that starts with blanks and a `#` loses
+/// them and one space after the `#`.
+fn strip_multi_line_markers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (n, line) in text.split('\n').enumerate() {
+        if n > 0 {
+            out.push('\n');
+        }
+        match line.trim_start_matches(' ').strip_prefix('#') {
+            Some(rest) => out.push_str(rest.strip_prefix(' ').unwrap_or(rest)),
+            None => out.push_str(line),
+        }
+    }
+    out
+}
+
+/// The text of the comment yq's `encodeComment` writes for `comment` (already without its first `#`), or
+/// `None` for the empty string, which it skips.
+fn comment_text(comment: &str) -> Option<String> {
+    if comment.is_empty() {
+        return None;
+    }
+    let bytes = comment.as_bytes();
+    let mut text = if bytes.len() > 2 && bytes[1..bytes.len() - 1].contains(&b'\n') {
+        let chomped = comment.strip_suffix('\n').unwrap_or(comment);
+        let mut text = strip_multi_line_markers(chomped);
+        // The first line gets a space unless it starts with one or is empty.
+        if !text.starts_with(['\n', ' ']) {
+            text.insert(0, ' ');
+        }
+        text
+    } else {
+        strip_single_line_marker(comment)
+    };
+    if !text.ends_with([' ', '\n']) {
+        text.push(' ');
+    }
+    Some(text)
+}
+
 struct Encoder<'a> {
     printer: Printer<'a>,
     options: &'a XmlOptions,
@@ -224,26 +346,70 @@ impl Encoder<'_> {
         }
     }
 
-    fn element(&mut self, name: &str, value: &OwnedValue, depth: usize) -> Result<(), EvalError> {
+    /// yq's `encodeComment`.
+    fn comment(&mut self, comment: &str) -> Result<(), EvalError> {
+        match comment_text(comment) {
+            Some(text) => self.printer.comment(&text),
+            None => Ok(()),
+        }
+    }
+
+    /// yq's `doEncode`: the element `name` for `value`.
+    fn element(
+        &mut self,
+        name: &str,
+        value: &OwnedValue,
+        comments: &XmlComments,
+        depth: usize,
+    ) -> Result<(), EvalError> {
         super::value::assert_value_tree_depth(depth);
         match value {
-            OwnedValue::Object(entries) => self.map(name, entries, depth),
+            OwnedValue::Object(entries) => self.map(name, entries, comments, depth),
             OwnedValue::Array(items) => {
-                for item in items {
-                    self.element(name, item, depth + 1)?;
+                self.comment(&head_and_line(&comments.own))?;
+                for (index, item) in items.iter().enumerate() {
+                    let item_comments = match &comments.members {
+                        XmlMembers::Seq(seq) => seq.get(index).unwrap_or(&NO_COMMENTS),
+                        _ => &NO_COMMENTS,
+                    };
+                    self.element(name, item, item_comments, depth + 1)?;
                 }
-                Ok(())
+                self.comment(&without_first_hash(&comments.own.foot))
             }
             scalar => {
                 self.printer.start(name, &[])?;
+                self.comment(&without_first_hash(&comments.own.head))?;
                 self.printer.text(&self.scalar_text(scalar));
+                self.comment(&without_first_hash(&comments.own.line))?;
                 self.printer.end(name);
-                Ok(())
+                self.comment(&without_first_hash(&comments.own.foot))
             }
         }
     }
 
-    fn map(&mut self, name: &str, entries: &ObjectMap, depth: usize) -> Result<(), EvalError> {
+    /// The comments of entry `index` of a mapping, if they are those of `key`.
+    fn entry<'c>(
+        comments: &'c XmlComments,
+        index: usize,
+        key: &str,
+    ) -> (&'c XmlNodeComments, &'c XmlComments) {
+        match &comments.members {
+            XmlMembers::Map(entries) => match entries.get(index) {
+                Some(entry) if entry.key == key => (&entry.key_comments, &entry.value),
+                _ => (&NO_COMMENTS.own, &NO_COMMENTS),
+            },
+            _ => (&NO_COMMENTS.own, &NO_COMMENTS),
+        }
+    }
+
+    /// yq's `encodeMap`.
+    fn map(
+        &mut self,
+        name: &str,
+        entries: &ObjectMap,
+        comments: &XmlComments,
+        depth: usize,
+    ) -> Result<(), EvalError> {
         let mut attributes = Vec::new();
         for (key, value) in entries {
             if self.is_attribute(key) {
@@ -266,7 +432,10 @@ impl Encoder<'_> {
             }
         }
         self.printer.start(name, &attributes)?;
-        for (key, value) in entries {
+        self.comment(&without_first_hash(&comments.own.head))?;
+        for (index, (key, value)) in entries.into_iter().enumerate() {
+            let (key_comments, value_comments) = Self::entry(comments, index, key);
+            self.comment(&head_and_line(key_comments))?;
             if key.starts_with(&self.options.proc_inst_prefix) {
                 let target = key.replacen(&self.options.proc_inst_prefix, "", 1);
                 self.printer
@@ -274,18 +443,32 @@ impl Encoder<'_> {
             } else if *key == self.options.directive_name {
                 self.printer.directive(&self.scalar_text(value))?;
             } else if *key == self.options.content_name {
+                self.comment(&head_and_line(&value_comments.own))?;
                 self.printer.text(&self.scalar_text(value));
+                self.comment(&without_first_hash(&value_comments.own.foot))?;
             } else if !self.is_attribute(key) {
-                self.element(key, value, depth + 1)?;
+                self.element(key, value, value_comments, depth + 1)?;
             }
+            self.comment(&without_first_hash(&key_comments.foot))?;
         }
         self.printer.end(name);
-        Ok(())
+        self.comment(&without_first_hash(&comments.own.foot))
     }
 }
 
 /// The result as XML, ending in a line break unless it is a bare scalar (yq writes that as text alone).
 pub(crate) fn format_xml(value: &OwnedValue, options: &XmlOptions) -> Result<String, EvalError> {
+    format_xml_commented(value, options, &NO_COMMENTS, "")
+}
+
+/// [`format_xml`] with the comments of the nodes the value came from, and the first document's
+/// `leading` comment block, which yq writes ahead of everything but a `<?xml ?>` declaration.
+pub(crate) fn format_xml_commented(
+    value: &OwnedValue,
+    options: &XmlOptions,
+    comments: &XmlComments,
+    leading: &str,
+) -> Result<String, EvalError> {
     let indent = " ".repeat(options.indent);
     let mut encoder = Encoder {
         printer: Printer {
@@ -297,6 +480,23 @@ pub(crate) fn format_xml(value: &OwnedValue, options: &XmlOptions) -> Result<Str
         },
         options,
     };
+    // The declaration comes first wherever its key is.
+    let declaration = format!("{}xml", options.proc_inst_prefix);
+    if let OwnedValue::Object(entries) = value {
+        let mut first = true;
+        for (key, value) in entries {
+            if *key == declaration {
+                let text = encoder.scalar_text(value);
+                encoder.printer.proc_inst("xml", &text, first)?;
+                encoder.printer.out.push('\n');
+                first = false;
+            }
+        }
+    }
+    if !leading.is_empty() {
+        encoder.comment(leading)?;
+        encoder.printer.out.push('\n');
+    }
     let entries = match value {
         OwnedValue::Object(entries) => entries,
         OwnedValue::Array(_) => {
@@ -305,27 +505,21 @@ pub(crate) fn format_xml(value: &OwnedValue, options: &XmlOptions) -> Result<Str
             ))
         }
         scalar => {
-            let mut out = String::new();
-            escape(&mut out, &encoder.scalar_text(scalar), false);
-            return Ok(out);
+            encoder.printer.text(&encoder.scalar_text(scalar));
+            return Ok(encoder.printer.out);
         }
     };
-    // The declaration comes first wherever its key is.
-    let declaration = format!("{}xml", options.proc_inst_prefix);
-    let mut first = true;
-    for (key, value) in entries {
-        if *key == declaration {
-            let text = encoder.scalar_text(value);
-            encoder.printer.proc_inst("xml", &text, first)?;
+    encoder.comment(&head_and_line(&comments.own))?;
+    for (index, (key, value)) in entries.into_iter().enumerate() {
+        let (key_comments, value_comments) = Encoder::entry(comments, index, key);
+        let key_comment = head_and_line(key_comments);
+        encoder.comment(&key_comment)?;
+        if !key_comment.is_empty() {
             encoder.printer.out.push('\n');
-            first = false;
         }
-    }
-    for (key, value) in entries {
         if *key == declaration {
-            continue;
-        }
-        if key.starts_with(&options.proc_inst_prefix) {
+            // Written first, not twice.
+        } else if key.starts_with(&options.proc_inst_prefix) {
             let target = key.replacen(&options.proc_inst_prefix, "", 1);
             let text = encoder.scalar_text(value);
             encoder.printer.proc_inst(&target, &text, false)?;
@@ -335,9 +529,74 @@ pub(crate) fn format_xml(value: &OwnedValue, options: &XmlOptions) -> Result<Str
             encoder.printer.directive(&text)?;
             encoder.printer.out.push('\n');
         } else {
-            encoder.element(key, value, 0)?;
+            encoder.element(key, value, value_comments, 0)?;
         }
+        encoder.comment(&without_first_hash(&key_comments.foot))?;
     }
+    encoder.comment(&without_first_hash(&comments.own.foot))?;
     encoder.printer.out.push('\n');
     Ok(encoder.printer.out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// yq's `encodeComment` on the text it is given (a comment already without its first `#`), as
+    /// captured from yq v4.53.3: a marker after the first is stripped, a block's later lines lose theirs,
+    /// and the text ends in a space unless it ends in a line break.
+    #[test]
+    fn comment_text_follows_yqs_two_regexps_7117() {
+        let rows: &[(&str, Option<&str>)] = &[
+            ("", None),
+            (" c", Some(" c ")),
+            ("c", Some("c ")),
+            ("# x", Some(" x ")),
+            ("  # x", Some(" x ")),
+            ("\n# x", Some(" x ")),
+            (" f1\n# f2", Some(" f1\nf2 ")),
+            (" a\n b", Some(" a\n b ")),
+            (" a\n  # b # c", Some(" a\nb # c ")),
+            (" a\n#b\n", Some(" a\nb ")),
+            ("\n", Some("\n")),
+            (" a\n", Some(" a\n")),
+            ("x\ny", Some(" x\ny ")),
+            ("#\n#", Some("\n")),
+        ];
+        for &(comment, want) in rows {
+            assert_eq!(comment_text(comment).as_deref(), want, "{comment:?}");
+        }
+    }
+
+    #[test]
+    fn a_comment_holding_the_closing_marker_is_refused_7117() {
+        let options = XmlOptions {
+            indent: 2,
+            attribute_prefix: "+@".into(),
+            content_name: "+content".into(),
+            proc_inst_prefix: "+p_".into(),
+            directive_name: "+directive".into(),
+            empty_null: false,
+        };
+        let comments = XmlComments {
+            own: XmlNodeComments::default(),
+            members: XmlMembers::Map(alloc::vec![XmlEntry {
+                key: "a".into(),
+                key_comments: XmlNodeComments::default(),
+                value: XmlComments {
+                    own: XmlNodeComments {
+                        line: "# x --> y".into(),
+                        ..XmlNodeComments::default()
+                    },
+                    members: XmlMembers::None,
+                },
+            }]),
+        };
+        let value = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
+        let err = format_xml_commented(&value, &options, &comments, "").unwrap_err();
+        assert_eq!(
+            err.message,
+            "xml: EncodeToken of Comment containing --> marker"
+        );
+    }
 }
