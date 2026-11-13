@@ -6314,8 +6314,8 @@ fn collect_props_comments<C: DocumentCursor>(
     }
 }
 
-/// The comments of one node as yq's XML encoder reads them (#7117): `#` and all, a block's lines
-/// joined with a line break, the head as [`DocumentCursor::head_comment_yq_raw`] carries it.
+/// The comments of one node as yq's encoders read them (#7117): `#` and all, a block's lines joined
+/// with a line break, the head as [`DocumentCursor::head_comment_yq_raw`] carries it.
 fn encoder_node_comments<C: DocumentCursor>(node: &C) -> EncoderNodeComments {
     EncoderNodeComments {
         head: node.head_comment_yq_raw().join("\n"),
@@ -6325,8 +6325,8 @@ fn encoder_node_comments<C: DocumentCursor>(node: &C) -> EncoderNodeComments {
 }
 
 /// The comments of the node at `cursor` and of everything below it, in the shape of its value, for
-/// [`format_yq_xml_commented`]: a mapping entry has its key's comments and its value's tree, a sequence
-/// item its own.
+/// the encoders that write comments (`format_yq_commented`): a mapping entry has its key's comments and
+/// its value's tree, a sequence item its own.
 fn collect_encoder_comments<C: DocumentCursor>(cursor: &C, depth: usize) -> EncoderComments {
     super::value::assert_value_tree_depth(depth);
     let value = cursor.value();
@@ -6473,7 +6473,10 @@ pub fn format_yq_encoder_from_tree<C: DocumentCursor>(
 ) -> Result<String, EvalError> {
     let mut comments = encoder_comments_of_tree(value, tree, 0);
     let original = collect_encoder_comments(pristine, 0);
-    restore_comment_breaks(&mut comments, &original);
+    // Only the XML encoder reads the line break a blank line leaves under a block.
+    if matches!(encoder, YqOutputEncoder::Xml(_)) {
+        restore_comment_breaks(&mut comments, &original);
+    }
     let meta = tree.meta();
     let mut leading = String::new();
     if matches!(encoder, YqOutputEncoder::Xml(_))

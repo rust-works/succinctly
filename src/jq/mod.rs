@@ -76,6 +76,7 @@ mod collect_object;
 mod deferred_bind;
 pub mod document;
 // Only the `std` build reads the environment; a `no_std` build parses the builtin and refuses it.
+mod encoder_comments;
 #[cfg_attr(not(feature = "std"), allow(dead_code))]
 mod envsubst;
 mod error;
@@ -132,7 +133,6 @@ pub mod utf8_document;
 // Copy-on-write instrumentation for the shared containers (#2999). Compiled
 // under `std`/`test` like `util::select_stats`; the wrappers' call sites are
 // gated on `share-stats` (or `test`).
-mod encoder_comments;
 #[cfg(any(feature = "std", test))]
 pub mod share_stats;
 mod value;
@@ -160,6 +160,7 @@ pub use eval::{
     VisibleDef, YqSemantics,
 };
 pub use eval::{eval_full, eval_owned_scalar_fast, eval_reindexed_document, with_stderr_muted};
+#[doc(hidden)]
 pub use eval_generic::format_yq_encoder_from_tree;
 // #6925: Go's `strconv.Quote` and `url.QueryUnescape` over bytes, for the CLI's `-p uri`.
 #[doc(hidden)]
