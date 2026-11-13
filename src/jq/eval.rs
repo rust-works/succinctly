@@ -27211,6 +27211,7 @@ pub fn yq_encoder_writes_comments(encoder: &YqOutputEncoder) -> bool {
             | YqOutputEncoder::Lua(_)
             | YqOutputEncoder::Kyaml(..)
             | YqOutputEncoder::Toml(true)
+            | YqOutputEncoder::Props { .. }
     )
 }
 
@@ -27223,6 +27224,77 @@ pub fn yq_encoder_prints_leading_block(encoder: &YqOutputEncoder) -> bool {
         encoder,
         YqOutputEncoder::Xml(_) | YqOutputEncoder::Kyaml(..)
     )
+}
+
+/// The comment yq's properties encoder writes above each scalar of `value`, by property path, from the
+/// comments tree of the nodes it came from, as `collect_props_comments` reads them off a cursor (#7166): a
+/// mapping entry's is its key's head and line comment and then its value's, a sequence item's is its own,
+/// each without its first `#`. A container's own comments name no property.
+fn props_comments_of(
+    value: &OwnedValue,
+    comments: &super::encoder_comments::EncoderComments,
+    prefix: &str,
+    array_brackets: bool,
+    out: &mut BTreeMap<String, String>,
+    depth: usize,
+) {
+    assert_value_tree_depth(depth);
+    fn strip_hash(comment: &str) -> &str {
+        comment.strip_prefix('#').unwrap_or(comment)
+    }
+    fn own(node: &super::encoder_comments::EncoderNodeComments, text: &mut String) {
+        text.push_str(strip_hash(&node.head));
+        text.push_str(strip_hash(&node.line));
+    }
+    fn insert(out: &mut BTreeMap<String, String>, path: String, comment: String) {
+        if comment.is_empty() {
+            out.remove(&path);
+        } else {
+            out.insert(path, comment);
+        }
+    }
+    let is_container =
+        |value: &OwnedValue| matches!(value, OwnedValue::Object(_) | OwnedValue::Array(_));
+    match value {
+        OwnedValue::Object(entries) => {
+            for (index, (key, entry)) in entries.iter().enumerate() {
+                let (key_comments, value_comments) = comments.entry(index, key);
+                let path = if prefix.is_empty() {
+                    key.to_string()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                if is_container(entry) {
+                    props_comments_of(entry, value_comments, &path, array_brackets, out, depth + 1);
+                } else {
+                    let mut comment = String::new();
+                    own(key_comments, &mut comment);
+                    own(&value_comments.own, &mut comment);
+                    insert(out, path, comment);
+                }
+            }
+        }
+        OwnedValue::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                let path = if prefix.is_empty() {
+                    format!("{index}")
+                } else if array_brackets {
+                    format!("{prefix}[{index}]")
+                } else {
+                    format!("{prefix}.{index}")
+                };
+                let item_comments = comments.item(index);
+                if is_container(item) {
+                    props_comments_of(item, item_comments, &path, array_brackets, out, depth + 1);
+                } else {
+                    let mut comment = String::new();
+                    own(&item_comments.own, &mut comment);
+                    insert(out, path, comment);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// yq's text of `value`, a document node whose comments are `comments`, for an encoder that writes them
@@ -27258,6 +27330,24 @@ pub(crate) fn format_yq_commented(
             }),
         },
         YqOutputEncoder::Toml(_) => format_toml_commented(value, comments),
+        // The comment of a property is its key's and then its value's, by path (#6922, #7166).
+        YqOutputEncoder::Props {
+            separator,
+            array_brackets,
+            unwrap,
+        } => {
+            let mut map = BTreeMap::new();
+            props_comments_of(value, comments, "", *array_brackets, &mut map, 0);
+            let mut text = String::from(leading);
+            text.push_str(&format_props_styled(
+                value,
+                separator,
+                *array_brackets,
+                !*unwrap,
+                Some(&map),
+            ));
+            Ok(text)
+        }
         // The encoders that read no comment.
         other => return format_yq_output::<YqSemantics>(other, value),
     }

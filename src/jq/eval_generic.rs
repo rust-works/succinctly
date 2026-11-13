@@ -6483,6 +6483,8 @@ pub fn format_yq_encoder_from_tree<C: DocumentCursor>(
         // Only some encoders print the block; none writes it as a comment of a node.
         if yq_encoder_prints_leading_block(encoder) {
             leading = pristine.yq_leading_content().unwrap_or_default();
+        } else if matches!(encoder, YqOutputEncoder::Props { .. }) {
+            leading = pristine.props_leading_content().unwrap_or_default();
         }
         // What the header holds is not the node's own comment as well.
         comments.own.head.clear();
