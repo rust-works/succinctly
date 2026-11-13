@@ -37360,36 +37360,23 @@ fn path_context_resolve_constants<S: EvalSemantics>(
             Some(component) => path_component_literal(component),
             None => Expr::Builtin(Builtin::Empty),
         },
+        // #7154: `path`, `file_index` and `filename` are reads of the node, so they resolve to a
+        // snapshot of the value and not to a literal. A literal in the right side of an assignment
+        // re-emits over an empty context (`.a[] | 1` is `1` over `a: []`, #6943), where a read emits
+        // nothing because there is no node: `.k = (select(false) | fi)` is `k: null`, not the
+        // document's own index, and `.k = (select(false) | path)` is `k: null`, not `[]`.
         Expr::Builtin(Builtin::PathNoArg) => {
-            let components: Vec<Expr> = path().iter().map(path_component_literal).collect();
-            Expr::Array(Box::new(match components.len() {
-                0 => Expr::Builtin(Builtin::Empty),
-                1 => components.into_iter().next().expect("len checked"),
-                _ => Expr::Comma(components),
-            }))
+            Expr::tracked_value(OwnedValue::array_from(path().iter().cloned().collect()))
         }
-        // Still the constant `0`, but no longer for the reason the previous
-        // comment gave: the generic route *does* carry a file-origin table
-        // now (`with_file_origin`, spine 2416 step 5). This arm is simply not
-        // reached with one installed -- measured on 2026-09-05 by
-        // instrumenting it and sweeping the `--eval-all` shapes that could
-        // plausibly take the absent route (`.[] | .nope | file_index`,
-        // `.[] | .a.nope | file_index`, `.[] | .nope | [file_index]`,
-        // `.[] | .nope | select(file_index == 1)`, ...): every one is
-        // answered by `eval_builtin`'s cursor arm or by the eager evaluator
-        // instead, and this arm never fired. Left as the constant rather
-        // than switched to an unexercised `file_index_for_path(path)` call --
-        // `path` here is absolute, so that is the one-line change to make the
-        // moment a route does arrive with a table (#2427).
-        // Reached with a table installed since spine 2416's identity pass
-        // (`--eval-all '.[] | try error("x") catch file_index'` resolves
-        // the handler here), so the position's own file it is -- `path` is
-        // absolute, which is what `file_index_for_path` reads.
+        // The position's own file, read from the absolute `path` (`file_index_for_path`): the generic
+        // route carries a file-origin table (`with_file_origin`, spine 2416 step 5), which is what
+        // this reads, since the identity pass resolves a handler's read here too
+        // (`--eval-all '.[] | try error("x") catch file_index'`, #2427).
         Expr::Builtin(Builtin::FileIndex) => {
-            Expr::Literal(Literal::Int(file_index_for_path(&path())))
+            Expr::tracked_value(OwnedValue::Int(file_index_for_path(&path())))
         }
         Expr::Builtin(Builtin::Filename) => {
-            Expr::Literal(Literal::String(filename_for_path(&path()).into()))
+            Expr::tracked_value(OwnedValue::String(filename_for_path(&path()).into()))
         }
         // #2472: `parent`/`parent(n)` inside a stage the owned identity
         // pipe evaluates as a whole (`[path, parent]`, `select(parent !=
