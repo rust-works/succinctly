@@ -15769,7 +15769,8 @@ fn owned_assign_step<S: EvalSemantics>(
             // #7108: in yq mode a scalar source only; the body is then held to the yq gates of
             // [`owned_assign_new_value`] (the fold of `with(PATH; SRC as $v | WRITES)` is this shape).
             if S::TAG != EvalTag::Jq
-                && matches!(bound, OwnedValue::Array(_) | OwnedValue::Object(_))
+                && (!yq_fold_step_active()
+                    || matches!(bound, OwnedValue::Array(_) | OwnedValue::Object(_)))
             {
                 return None;
             }
@@ -16129,6 +16130,7 @@ fn owned_assign_new_value<S: EvalSemantics>(
             && matches!(&rhs, OwnedAssignRhs::Combine(_, right) if right.is_number()))
         // #7108: a plain `=` of a scalar onto a plain field of an object state.
         && !(matches!(yq_shape, YqWrite::PlainField)
+            && yq_fold_step_active()
             && matches!(expr, Expr::Assign { .. })
             && matches!(&rhs, OwnedAssignRhs::Value(value) if !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_))))
     {
@@ -92239,6 +92241,28 @@ fn off_the_tree_shape(member: &Expr) -> bool {
 /// The rest of [`owned_update_step`], once `expr` is no settleable `if`.
 #[inline(always)]
 fn owned_update_step_arith<S: EvalSemantics>(expr: &Expr, state: OwnedValue) -> OwnedStep {
+    // #7108: a yq-mode fold's step may write a plain scalar `=` on the state it owns; the same step
+    // run for a document write may not (its alias and presentation rules are the evaluator's).
+    if S::TAG == EvalTag::Yq {
+        let outer = YQ_FOLD_STEP.with(|flag| flag.replace(true));
+        let step = owned_update_step_arith_inner::<S>(expr, state);
+        YQ_FOLD_STEP.with(|flag| flag.set(outer));
+        return step;
+    }
+    owned_update_step_arith_inner::<S>(expr, state)
+}
+
+thread_local! {
+    /// Whether a yq-mode fold's owned step is running ([`owned_update_step_arith`], #7108).
+    static YQ_FOLD_STEP: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+fn yq_fold_step_active() -> bool {
+    YQ_FOLD_STEP.with(core::cell::Cell::get)
+}
+
+#[inline(always)]
+fn owned_update_step_arith_inner<S: EvalSemantics>(expr: &Expr, state: OwnedValue) -> OwnedStep {
     match owned_arith_accumulator_shape::<S>(expr) {
         Some((op, rhs)) => OwnedStep::Handled(arith_combine::<S>(op, state, rhs)),
         None if super::eval_generic::embed_table_active() => {
