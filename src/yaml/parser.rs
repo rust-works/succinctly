@@ -9775,7 +9775,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
         self.pos = end;
         core::str::from_utf8(&self.input[start..end])
-            .map(str::to_string)
+            .map(yq_tag_spelling)
             .map_err(|_| YamlError::InvalidUtf8 { offset: start })
     }
 
@@ -11537,6 +11537,28 @@ fn is_tag_blank(b: u8) -> bool {
 #[inline]
 fn is_verbatim_tag(bytes: &[u8], start: usize) -> bool {
     bytes.get(start + 1) == Some(&b'<')
+}
+
+/// A tag as yq spells it (#7139): a verbatim tag of the core schema is its `!!` form
+/// (`!<tag:yaml.org,2002:str>` is `!!str`) and one of the local namespace its `!` form (`!<!foo>`
+/// is `!foo`); every other verbatim tag (`!<!>`, `!<foo>`, `!<tag:example.com,2000:t>`) and every
+/// shorthand tag is as written.
+fn yq_tag_spelling(tag: &str) -> String {
+    if let Some(spelled) = tag
+        .strip_prefix("!<")
+        .and_then(|rest| rest.strip_suffix('>'))
+    {
+        if let Some(core) = spelled.strip_prefix("tag:yaml.org,2002:") {
+            if !core.is_empty() {
+                return alloc::format!("!!{core}");
+            }
+        } else if let Some(local) = spelled.strip_prefix('!') {
+            if !local.is_empty() {
+                return alloc::format!("!{local}");
+            }
+        }
+    }
+    tag.to_string()
 }
 
 /// Scan a tag's raw extent starting at a `!` in `bytes[start..]` (must be

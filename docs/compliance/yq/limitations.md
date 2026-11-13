@@ -2289,6 +2289,7 @@ yq's `split`, `sub`, `test`, `match`, `capture`, `upcase`, `downcase`, `trim`, `
 A number, a bool, a null, a container, a plain date (`!!timestamp`), a plain `<<` (`!!merge`) and an explicit core tag on a string (`!!binary aGk=`, `!!float "x"`) are refused; a custom tag reads as its value's own type, so `!foo x` is a string and `!foo 5` is refused as `!foo`.
 A bad pattern or flag is still reported first, as yq checks those before the input, and `split` passes a null through.
 `tag` and `type` report a verbatim tag as what it spells, a core one in its `!!` form (`!<tag:yaml.org,2002:binary>` is `!!binary`, `!<!foo>` is `!foo`), as yq does.
+The output writes it that way too (#7139): `a: !<tag:yaml.org,2002:str> x` prints `a: !!str x` and `-P` drops it as it does `!!str`; the tag is read in that spelling, so every route agrees.
 An alias node keeps its target's value, where yq applies the builtin to the alias's name (`b: *x` with `upcase` is `X`).
 The refusal is made where the builtin reads a document node; a value reached through an update (`.b |= upcase`), `to_entries`/`with_entries`, or a literal under `-n` (`5 | @base64`) still gets jq's wording or, for `@base64` and `@uri`, an answer.
 Under `--jq-extensions`, `ascii_downcase` and `ascii_upcase` are `downcase` and `upcase` and refuse the same inputs, a plain date among them.
