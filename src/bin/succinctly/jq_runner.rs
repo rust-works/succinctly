@@ -11453,8 +11453,7 @@ fn raw_windowed_sources(args: &JqCommand, files: &[PathBuf]) -> Option<Vec<RawWi
     }
     let mut sources: Vec<RawWindowed> = Vec::with_capacity(files.len());
     if files.len() > MAX_WINDOWED_FILES {
-        // Each file is closed once judged, so the descriptors held stay a few.
-        judge_regular_files(files, raw_window_min_bytes(), |_, _, _| ())?;
+        judge_regular_paths(files, raw_window_min_bytes())?;
         sources.extend(files.iter().enumerate().map(|(at, path)| {
             let reader = window::OpenWhenRead::new(path.clone(), at, at + 1 == files.len());
             let source: RawWindowed = (Box::new(reader), None, Vec::new());
@@ -11709,6 +11708,25 @@ fn judge_regular_files(
         keep(path, file, meta);
     }
     Some(())
+}
+
+/// [`judge_regular_files`] for a list whose files are opened when the run reaches them (`-R`'s past
+/// [`MAX_WINDOWED_FILES`], #7024), by `stat` alone: a regular file each, `min` bytes or more between
+/// them, none of them a file standard input, output or error is open on. Nothing is opened, so a list of
+/// hundreds of files costs the run one system call each beyond what reading them costs. A file that
+/// `stat` finds and that will not open (no read permission) is found when the run reaches it, and
+/// reported as jq reports it, in jq's words once its reader is past it ([`note_raw_open_failure`]).
+fn judge_regular_paths(files: &[PathBuf], min: u64) -> Option<()> {
+    let run = RunFiles::new();
+    let mut total = 0u64;
+    for path in files {
+        let meta = regular_file(path)?;
+        if run.names(&meta) {
+            return None;
+        }
+        total = total.checked_add(meta.len())?;
+    }
+    (total >= min).then_some(())
 }
 
 /// What `path` is if it is a regular file: judged by `stat`, which opens nothing (opening a named pipe

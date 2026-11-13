@@ -216,6 +216,9 @@ enum Change {
     LastDirectory,
     /// Two files in a row removed.
     TwoGone,
+    /// File 20 left in place but made unreadable: judged by `stat` before the run, it fails to open when
+    /// the run gets there, and is reported as a file that is gone is, in the words of its error.
+    MiddleUnreadable,
 }
 
 /// 40 files, the first big enough that the run is still in it when its output fills the pipe; the
@@ -275,6 +278,10 @@ fn changed_while_running(change: Change, args: &[&str]) -> Result<(Run, Run)> {
             std::fs::remove_file(&paths[22])?;
             std::fs::remove_file(&paths[23])?;
         }
+        Change::MiddleUnreadable => {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&paths[20], std::fs::Permissions::from_mode(0))?;
+        }
     }
     let mut rest = Vec::new();
     stdout.read_to_end(&mut rest)?;
@@ -291,6 +298,11 @@ fn changed_while_running(change: Change, args: &[&str]) -> Result<(Run, Run)> {
         String::from_utf8_lossy(&stderr).into_owned(),
         status.code().unwrap_or(-1),
     );
+    // The whole-file route cannot be handed a file it cannot read, so an unreadable file is compared with
+    // a missing one, which fails to open the same way but for its words.
+    if matches!(change, Change::MiddleUnreadable) {
+        std::fs::remove_file(&paths[20])?;
+    }
     let whole = whole_by_descriptor(args, &paths)?;
     Ok((windowed, whole))
 }
@@ -314,6 +326,21 @@ fn a_path_that_changes_before_the_run_reaches_it_is_read_as_jq_reads_it_7024() -
             let (windowed, whole) = changed_while_running(change, args)?;
             assert_eq!(windowed, whole, "{change:?} {args:?}");
         }
+    }
+    // A file that is there but cannot be opened (not when the tests run as root): the same run as a file
+    // that is gone, with the words of its error.
+    let readable = {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("probe");
+        std::fs::write(&path, b"x")?;
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0))?;
+        std::fs::File::open(&path).is_ok()
+    };
+    if !readable {
+        let (windowed, whole) = changed_while_running(Change::MiddleUnreadable, &["-R", "."])?;
+        assert!(windowed.1.contains("Permission denied"), "{}", windowed.1);
+        let gone = (windowed.0, windowed.1.replace("Permission denied", "No such file or directory"), windowed.2);
+        assert_eq!(gone, whole, "an unreadable file");
     }
     // The cases say what they are meant to: a file that did not open is reported, and the run
     // ends after the line the tail before it makes.
