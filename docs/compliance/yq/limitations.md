@@ -1342,7 +1342,7 @@ A comparison's boolean has none here, as before; yq keeps the left read's for `.
 
 An arithmetic result keeps `EvaluateTogether` too, since #6973: yq's result is a copy of its left node (`lhs.Copy()`), so a left operand that is the list's own node passes its flag on, whatever the result is (a map merge, an array concat or a sum: `. * {"z":1} | [.]` and `. + 1 | [.]` are one array of every result), and a following binary stage crosses the whole list of results (`(. * {"z":1}) | . + {"w":2}` is 16 results over two documents).
 A left operand that navigated or built its node has none (`.x + 1 | [.]` and `{"q":1} + . | [.]` are one array per result), and a comparison's boolean is a node of its own.
-21 rows are pinned against yq v4.53.3 in `tests/yq_cli/i6973.rs`.
+27 rows are pinned against yq v4.53.3 in `tests/yq_cli/i6973.rs`.
 
 Not covered here ([#6973](https://github.com/rust-works/succinctly/issues/6973)):
 - A union as the left operand that mixes reads and literals (`(.x, 7) + (10,20)`): yq gives each node its own origin, and this decides it per operand, so the reads lose theirs (as before #6969).
