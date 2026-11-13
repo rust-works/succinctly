@@ -130489,6 +130489,19 @@ mod tests {
             OwnedValue::array_from(vec![OwnedValue::Int(7)]),
             OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]),
         ]));
+        // An owned `Int` is within the exact range of a double (`exact_integer`): a computed integer
+        // past it is a `Float` and a literal past it a `NumberLiteral`, so the matrix's `Int(2^53 + 1)`
+        // is no value a program can hold. The bridge spells it back as a literal, which a branch that
+        // hands the input on (`else .`) shows as a different `Debug` where the printed JSON is the same.
+        fn holds_unspellable_int(value: &OwnedValue) -> bool {
+            match value {
+                OwnedValue::Int(n) => n.unsigned_abs() > 1 << 53,
+                OwnedValue::Array(items) => items.iter().any(holds_unspellable_int),
+                OwnedValue::Object(fields) => fields.values().any(holds_unspellable_int),
+                _ => false,
+            }
+        }
+        values.retain(|value| !holds_unspellable_int(value));
         let sources = [
             "first",
             "last",
