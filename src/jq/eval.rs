@@ -110956,7 +110956,6 @@ fn builtin_system<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    use std::io::Write;
     use std::process::{Command, Stdio};
 
     if !super::eval_generic::system_ops_enabled() {
@@ -111050,9 +111049,26 @@ fn builtin_system<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             format!("system command '{command}' failed: {reason}\nstderr: {stderr}")
         }))
     };
-    let mut child = match Command::new(&command)
+    // The node reaches the program as a file, not a pipe: a program that exits without reading its
+    // input would otherwise make the write die of SIGPIPE, which the CLI leaves at its default.
+    let stdin_file = {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "succinctly-system-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let opened =
+            std::fs::write(&path, stdin_text.as_bytes()).and_then(|()| std::fs::File::open(&path));
+        let _ = std::fs::remove_file(&path);
+        match opened {
+            Ok(file) => file,
+            Err(error) => return failed(error.to_string(), ""),
+        }
+    };
+    let child = match Command::new(&command)
         .args(&args)
-        .stdin(Stdio::piped())
+        .stdin(Stdio::from(stdin_file))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -111075,52 +111091,43 @@ fn builtin_system<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             return failed(reason, "");
         }
     };
-    // The program may not read its input, or exit before it has: a failed write is not an error.
-    if let Some(mut stdin) = child.stdin.take() {
-        let writer = std::thread::spawn(move || {
-            let _ = stdin.write_all(stdin_text.as_bytes());
-        });
-        let output = child.wait_with_output();
-        let _ = writer.join();
-        return match output {
-            Err(error) => failed(error.to_string(), ""),
-            Ok(output) if !output.status.success() => {
-                let reason = match output.status.code() {
-                    Some(code) => format!("exit status {code}"),
-                    None => {
-                        #[cfg(unix)]
-                        let signal = std::os::unix::process::ExitStatusExt::signal(&output.status);
-                        #[cfg(not(unix))]
-                        let signal: Option<i32> = None;
-                        // Go's names for the signals that are the same on Linux and macOS.
-                        match signal {
-                            Some(1) => "signal: hangup".to_string(),
-                            Some(2) => "signal: interrupt".to_string(),
-                            Some(3) => "signal: quit".to_string(),
-                            Some(9) => "signal: killed".to_string(),
-                            Some(11) => "signal: segmentation fault".to_string(),
-                            Some(13) => "signal: broken pipe".to_string(),
-                            Some(14) => "signal: alarm clock".to_string(),
-                            Some(15) => "signal: terminated".to_string(),
-                            Some(n) => format!("signal: {n}"),
-                            None => "exit status -1".to_string(),
-                        }
+    match child.wait_with_output() {
+        Err(error) => failed(error.to_string(), ""),
+        Ok(output) if !output.status.success() => {
+            let reason = match output.status.code() {
+                Some(code) => format!("exit status {code}"),
+                None => {
+                    #[cfg(unix)]
+                    let signal = std::os::unix::process::ExitStatusExt::signal(&output.status);
+                    #[cfg(not(unix))]
+                    let signal: Option<i32> = None;
+                    // Go's names for the signals that are the same on Linux and macOS.
+                    match signal {
+                        Some(1) => "signal: hangup".to_string(),
+                        Some(2) => "signal: interrupt".to_string(),
+                        Some(3) => "signal: quit".to_string(),
+                        Some(9) => "signal: killed".to_string(),
+                        Some(11) => "signal: segmentation fault".to_string(),
+                        Some(13) => "signal: broken pipe".to_string(),
+                        Some(14) => "signal: alarm clock".to_string(),
+                        Some(15) => "signal: terminated".to_string(),
+                        Some(n) => format!("signal: {n}"),
+                        None => "exit status -1".to_string(),
                     }
-                };
-                failed(reason, &String::from_utf8_lossy(&output.stderr))
-            }
-            Ok(output) => {
-                let mut result = String::from_utf8_lossy(&output.stdout).into_owned();
-                if result.ends_with("\r\n") {
-                    result.truncate(result.len() - 2);
-                } else if result.ends_with('\n') {
-                    result.truncate(result.len() - 1);
                 }
-                QueryResult::Owned(OwnedValue::String(result.into()))
+            };
+            failed(reason, &String::from_utf8_lossy(&output.stderr))
+        }
+        Ok(output) => {
+            let mut result = String::from_utf8_lossy(&output.stdout).into_owned();
+            if result.ends_with("\r\n") {
+                result.truncate(result.len() - 2);
+            } else if result.ends_with('\n') {
+                result.truncate(result.len() - 1);
             }
-        };
+            QueryResult::Owned(OwnedValue::String(result.into()))
+        }
     }
-    failed("no standard input".to_string(), "")
 }
 
 /// Builtin: `system(..)` for a no_std build, which cannot start a program.
