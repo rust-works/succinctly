@@ -3347,8 +3347,9 @@ pub enum YqOutputEncoder {
     Tsv,
     /// `-o=ini`
     Ini,
-    /// `-o=toml`
-    Toml,
+    /// `-o=toml`, and whether it writes the comments of the nodes it is given: not for a run that read TOML,
+    /// whose comments the read cannot place on the value nodes yq's encoder looks at (#7160)
+    Toml(bool),
     /// `-o=kyaml`, with `-I` as the indent, whether `-r` / `--unwrapScalar` prints a string result as
     /// its own text (#7093), and whether the first document's leading `---` is written (`-N` says not,
     /// #7158)

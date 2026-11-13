@@ -27207,7 +27207,11 @@ pub(crate) fn format_yq_props_commented(
 pub fn yq_encoder_writes_comments(encoder: &YqOutputEncoder) -> bool {
     matches!(
         encoder,
-        YqOutputEncoder::Xml(_) | YqOutputEncoder::Lua(_) | YqOutputEncoder::Kyaml(..)
+        YqOutputEncoder::Xml(_)
+            | YqOutputEncoder::Lua(_)
+            | YqOutputEncoder::Kyaml(..)
+            | YqOutputEncoder::Toml(true)
+            | YqOutputEncoder::Props { .. }
     )
 }
 
@@ -27220,6 +27224,77 @@ pub fn yq_encoder_prints_leading_block(encoder: &YqOutputEncoder) -> bool {
         encoder,
         YqOutputEncoder::Xml(_) | YqOutputEncoder::Kyaml(..)
     )
+}
+
+/// The comment yq's properties encoder writes above each scalar of `value`, by property path, from the
+/// comments tree of the nodes it came from, as `collect_props_comments` reads them off a cursor (#7166): a
+/// mapping entry's is its key's head and line comment and then its value's, a sequence item's is its own,
+/// each without its first `#`. A container's own comments name no property.
+fn props_comments_of(
+    value: &OwnedValue,
+    comments: &super::encoder_comments::EncoderComments,
+    prefix: &str,
+    array_brackets: bool,
+    out: &mut BTreeMap<String, String>,
+    depth: usize,
+) {
+    assert_value_tree_depth(depth);
+    fn strip_hash(comment: &str) -> &str {
+        comment.strip_prefix('#').unwrap_or(comment)
+    }
+    fn own(node: &super::encoder_comments::EncoderNodeComments, text: &mut String) {
+        text.push_str(strip_hash(&node.head));
+        text.push_str(strip_hash(&node.line));
+    }
+    fn insert(out: &mut BTreeMap<String, String>, path: String, comment: String) {
+        if comment.is_empty() {
+            out.remove(&path);
+        } else {
+            out.insert(path, comment);
+        }
+    }
+    let is_container =
+        |value: &OwnedValue| matches!(value, OwnedValue::Object(_) | OwnedValue::Array(_));
+    match value {
+        OwnedValue::Object(entries) => {
+            for (index, (key, entry)) in entries.iter().enumerate() {
+                let (key_comments, value_comments) = comments.entry(index, key);
+                let path = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                if is_container(entry) {
+                    props_comments_of(entry, value_comments, &path, array_brackets, out, depth + 1);
+                } else {
+                    let mut comment = String::new();
+                    own(key_comments, &mut comment);
+                    own(&value_comments.own, &mut comment);
+                    insert(out, path, comment);
+                }
+            }
+        }
+        OwnedValue::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                let path = if prefix.is_empty() {
+                    format!("{index}")
+                } else if array_brackets {
+                    format!("{prefix}[{index}]")
+                } else {
+                    format!("{prefix}.{index}")
+                };
+                let item_comments = comments.item(index);
+                if is_container(item) {
+                    props_comments_of(item, item_comments, &path, array_brackets, out, depth + 1);
+                } else {
+                    let mut comment = String::new();
+                    own(&item_comments.own, &mut comment);
+                    insert(out, path, comment);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// yq's text of `value`, a document node whose comments are `comments`, for an encoder that writes them
@@ -27254,6 +27329,25 @@ pub(crate) fn format_yq_commented(
                 format_kyaml_commented(value, *indent, comments, leading, *separators)
             }),
         },
+        YqOutputEncoder::Toml(_) => format_toml_commented(value, comments),
+        // The comment of a property is its key's and then its value's, by path (#6922, #7166).
+        YqOutputEncoder::Props {
+            separator,
+            array_brackets,
+            unwrap,
+        } => {
+            let mut map = BTreeMap::new();
+            props_comments_of(value, comments, "", *array_brackets, &mut map, 0);
+            let mut text = String::from(leading);
+            text.push_str(&format_props_styled(
+                value,
+                separator,
+                *array_brackets,
+                !*unwrap,
+                Some(&map),
+            ));
+            Ok(text)
+        }
         // The encoders that read no comment.
         other => return format_yq_output::<YqSemantics>(other, value),
     }
@@ -27563,7 +27657,7 @@ fn format_yq_output<S: EvalSemantics>(
         YqOutputEncoder::Csv(comma) => format_yq_csv::<S>(value, *comma, true),
         YqOutputEncoder::Lua(options) => format_lua(value, options),
         YqOutputEncoder::Ini => format_ini(value),
-        YqOutputEncoder::Toml => format_toml(value),
+        YqOutputEncoder::Toml(_) => format_toml(value),
         // #7093: unwrapped, a string result is its own text, as for `-o=json -r`; a collection, and every
         // other scalar, print as they do wrapped.
         YqOutputEncoder::Kyaml(indent, unwrap, _) => match value {
@@ -27889,6 +27983,19 @@ fn push_go_quoted(out: &mut String, text: &str) {
 /// left out of a table and is `""` inside an array, and a mapping inside an array is an inline table. A root
 /// scalar is its text, any other root that is not a mapping is an error. Comments are not written.
 fn format_toml(value: &OwnedValue) -> Result<String, EvalError> {
+    format_toml_commented(value, &super::encoder_comments::NO_COMMENTS)
+}
+
+/// [`format_toml`] writing the comments yq's encoder writes (#7160): the root mapping's head comment first, a
+/// table's head comment above its header, an attribute's head comment above it and its line comment after it
+/// (two spaces, then the comment), an array's the same, and an array whose elements have head comments in the
+/// multi-line form with each element's above it. Only the comments of the value nodes are read: a comment
+/// above a key is the key's, which the encoder does not look at, and no foot comment is written.
+fn format_toml_commented(
+    value: &OwnedValue,
+    comments: &super::encoder_comments::EncoderComments,
+) -> Result<String, EvalError> {
+    use super::encoder_comments::EncoderComments;
     struct Toml {
         out: String,
         wrote_root_attr: bool,
@@ -27950,19 +28057,92 @@ fn format_toml(value: &OwnedValue) -> Result<String, EvalError> {
             other => scalar(other),
         }
     }
+    /// ` # text` after a line, as yq's encoder puts a line comment: two spaces, and a `# ` when it has no `#`.
+    fn with_line_comment(mut line: String, comment: &str) -> String {
+        if !comment.is_empty() {
+            let comment = comment.trim();
+            line.push_str("  ");
+            if !comment.starts_with('#') {
+                line.push_str("# ");
+            }
+            line.push_str(comment);
+        }
+        line
+    }
     impl Toml {
-        fn attribute(&mut self, name: &str, value: &OwnedValue) {
+        /// `writeComment`: each line of `comment` trimmed, with a `# ` when it has no `#`.
+        fn comment(&mut self, comment: &str) {
+            if comment.is_empty() {
+                return;
+            }
+            for line in comment.split('\n') {
+                let line = line.trim();
+                if !line.starts_with('#') {
+                    self.out.push_str("# ");
+                }
+                self.out.push_str(line);
+                self.out.push('\n');
+            }
+        }
+        fn attribute(&mut self, name: &str, value: &OwnedValue, comments: &EncoderComments) {
             if matches!(value, OwnedValue::Null) {
                 return;
             }
             self.wrote_root_attr = true;
-            self.out
-                .push_str(&format!("{} = {}\n", key(name), scalar(value)));
+            self.comment(&comments.own.head);
+            let line = with_line_comment(
+                format!("{} = {}", key(name), scalar(value)),
+                &comments.own.line,
+            );
+            self.out.push_str(&line);
+            self.out.push('\n');
         }
-        fn array_attribute(&mut self, name: &str, items: &[OwnedValue]) {
+        fn array_attribute(
+            &mut self,
+            name: &str,
+            items: &[OwnedValue],
+            comments: &EncoderComments,
+        ) {
             self.wrote_root_attr = true;
-            self.out
-                .push_str(&format!("{} = {}\n", key(name), inline_array(items, 0)));
+            self.comment(&comments.own.head);
+            if items.is_empty() {
+                let line = with_line_comment(format!("{} = []", key(name)), &comments.own.line);
+                self.out.push_str(&line);
+                self.out.push('\n');
+                return;
+            }
+            let has_element_comments =
+                (0..items.len()).any(|index| !comments.item(index).own.head.is_empty());
+            if has_element_comments {
+                self.out.push_str(&format!("{} = [\n", key(name)));
+                for (index, item) in items.iter().enumerate() {
+                    for line in comments.item(index).own.head.split('\n') {
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        self.out.push_str("  ");
+                        if !line.trim().starts_with('#') {
+                            self.out.push_str("# ");
+                        }
+                        self.out.push_str(line);
+                        self.out.push('\n');
+                    }
+                    self.out.push_str("  ");
+                    self.out.push_str(&inline(item, 1));
+                    self.out.push_str(",\n");
+                    if index + 1 < items.len() {
+                        self.out.push('\n');
+                    }
+                }
+                self.out.push_str("]\n");
+                return;
+            }
+            let line = with_line_comment(
+                format!("{} = {}", key(name), inline_array(items, 0)),
+                &comments.own.line,
+            );
+            self.out.push_str(&line);
+            self.out.push('\n');
         }
         fn blank_line(&mut self) {
             if self.wrote_root_attr {
@@ -27975,30 +28155,37 @@ fn format_toml(value: &OwnedValue) -> Result<String, EvalError> {
             path: &[&str],
             name: &str,
             items: &[OwnedValue],
+            comments: &EncoderComments,
             depth: usize,
         ) {
             let mut full = path.to_vec();
             full.push(name);
-            for item in items {
+            for (index, item) in items.iter().enumerate() {
                 self.out.push_str(&format!("[[{}]]\n", dotted(&full)));
                 if let OwnedValue::Object(entries) = item {
-                    self.body(&full, entries, depth + 1);
+                    self.body(&full, entries, comments.item(index), depth + 1);
                 }
             }
         }
-        fn top_level(&mut self, name: &str, value: &OwnedValue) {
+        fn top_level(&mut self, name: &str, value: &OwnedValue, comments: &EncoderComments) {
             match value {
                 OwnedValue::Array(items) if is_tables(items) => {
                     self.blank_line();
                     // The header is the key alone, the body's path the key: yq's own `[[key]]` spelling.
-                    self.array_of_tables(&[], name, items, 0);
+                    self.array_of_tables(&[], name, items, comments, 0);
                 }
-                OwnedValue::Array(items) => self.array_attribute(name, items),
-                OwnedValue::Object(entries) => self.separate(&[name], entries, 0),
-                scalar => self.attribute(name, scalar),
+                OwnedValue::Array(items) => self.array_attribute(name, items, comments),
+                OwnedValue::Object(entries) => self.separate(&[name], entries, comments, 0),
+                scalar => self.attribute(name, scalar, comments),
             }
         }
-        fn separate(&mut self, path: &[&str], entries: &ObjectMap, depth: usize) {
+        fn separate(
+            &mut self,
+            path: &[&str],
+            entries: &ObjectMap,
+            comments: &EncoderComments,
+            depth: usize,
+        ) {
             assert_value_tree_depth(depth);
             // Not `is_attribute`: yq's `encodeSeparateMapping` does not count a `null` as an attribute, while
             // its `isTomlAttribute` (the root's partition) does -- two predicates in yq, ported as they are.
@@ -28009,50 +28196,61 @@ fn format_toml(value: &OwnedValue) -> Result<String, EvalError> {
             });
             if has_attrs || entries.is_empty() {
                 self.blank_line();
+                self.comment(&comments.own.head);
                 self.out.push_str(&format!("[{}]\n", dotted(path)));
-                self.body(path, entries, depth + 1);
+                self.body(path, entries, comments, depth + 1);
                 return;
             }
-            for (name, value) in entries {
+            for (index, (name, value)) in entries.iter().enumerate() {
+                let (_, value_comments) = comments.entry(index, name);
                 match value {
                     OwnedValue::Object(inner) => {
                         let mut child = path.to_vec();
                         child.push(name);
-                        self.separate(&child, inner, depth + 1);
+                        self.separate(&child, inner, value_comments, depth + 1);
                     }
                     OwnedValue::Array(items) if is_tables(items) => {
                         self.blank_line();
-                        self.array_of_tables(path, name, items, depth);
+                        self.array_of_tables(path, name, items, value_comments, depth);
                     }
-                    OwnedValue::Array(items) => self.array_attribute(name, items), // patchcov: coverage tolerate-line reason="unreachable: a mapping holding an array that is not an array of tables has an attribute, so it took the has_attrs branch above; yq's encodeSeparateMapping keeps the same dead arm"
-                    scalar => self.attribute(name, scalar),
+                    OwnedValue::Array(items) => self.array_attribute(name, items, value_comments), // patchcov: coverage tolerate-line reason="unreachable: a mapping holding an array that is not an array of tables has an attribute, so it took the has_attrs branch above; yq's encodeSeparateMapping keeps the same dead arm"
+                    scalar => self.attribute(name, scalar, value_comments),
                 }
             }
         }
-        fn body(&mut self, path: &[&str], entries: &ObjectMap, depth: usize) {
+        fn body(
+            &mut self,
+            path: &[&str],
+            entries: &ObjectMap,
+            comments: &EncoderComments,
+            depth: usize,
+        ) {
             assert_value_tree_depth(depth);
-            for (name, value) in entries {
+            for (index, (name, value)) in entries.iter().enumerate() {
+                let (_, value_comments) = comments.entry(index, name);
                 match value {
                     OwnedValue::Object(_) => {}
                     OwnedValue::Array(items) if !is_tables(items) => {
-                        self.array_attribute(name, items);
+                        self.array_attribute(name, items, value_comments);
                     }
                     OwnedValue::Array(_) => {}
-                    scalar => self.attribute(name, scalar),
+                    scalar => self.attribute(name, scalar, value_comments),
                 }
             }
-            for (name, value) in entries {
+            for (index, (name, value)) in entries.iter().enumerate() {
                 if let OwnedValue::Array(items) = value {
                     if is_tables(items) {
-                        self.array_of_tables(path, name, items, depth);
+                        let (_, value_comments) = comments.entry(index, name);
+                        self.array_of_tables(path, name, items, value_comments, depth);
                     }
                 }
             }
-            for (name, value) in entries {
+            for (index, (name, value)) in entries.iter().enumerate() {
                 if let OwnedValue::Object(inner) = value {
+                    let (_, value_comments) = comments.entry(index, name);
                     let mut child = path.to_vec();
                     child.push(name);
-                    self.separate(&child, inner, depth + 1);
+                    self.separate(&child, inner, value_comments, depth + 1);
                 }
             }
         }
@@ -28070,14 +28268,15 @@ fn format_toml(value: &OwnedValue) -> Result<String, EvalError> {
         out: String::new(),
         wrote_root_attr: false,
     };
-    for (name, value) in entries {
+    toml.comment(&comments.own.head);
+    for (index, (name, value)) in entries.iter().enumerate() {
         if is_attribute(value) {
-            toml.top_level(name, value);
+            toml.top_level(name, value, comments.entry(index, name).1);
         }
     }
-    for (name, value) in entries {
+    for (index, (name, value)) in entries.iter().enumerate() {
         if !is_attribute(value) {
-            toml.top_level(name, value);
+            toml.top_level(name, value, comments.entry(index, name).1);
         }
     }
     Ok(toml.out)

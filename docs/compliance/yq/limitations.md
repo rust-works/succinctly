@@ -7796,7 +7796,8 @@ The `@props` / `to_props` and `@csv` / `to_csv` operators read the same flags, a
 The other formats yq lists (`hcl`) and every input format but YAML, JSON, `kyaml`, `props`, `csv`, `tsv`, `ini`, `xml`, `toml`, `base64` and `uri` (see the `-p kyaml`, `-p base64|uri`, `-p props`, `-p csv|tsv`, `-p ini`, `-p xml` and `-p toml` sections) are still refused at the flag.
 Six rows differ from yq v4.53.3, each pinned out of `tests/yq_cli/i6850.rs`:
 
-- A comment of a value the filter builds or writes is not written by `-o=props` or `@props` (`{"z": .a}`, `.a = 5`), where yq keeps the node's comment: the encoder reads comments from the document, as `to_yaml` does (#6933).
+- A comment of a value the filter builds is not written by `@props` or `to_props` (`{"z": .a} | @props`), where yq keeps the node's comment: that encoder reads comments from the document, as `to_yaml` does (#6933).
+  `-o=props` writes those of a write (`.a = 5`, `del(.a)`, `sort_keys(.)`, `-i`) and of a rebuilt value from the presentation tree the YAML printer prints the result with, as `-o=xml` does (#7166), and agrees with yq on 300-document sweeps of the read and the write filters over twelve document shapes; `--eval-all` (#4380) still writes none.
   A value read from the document gets them as yq writes them (#6922): above each property, its key's head and line comment and then its value's, each with its first `#` dropped and nothing between them (`# h` over `a: 1 # c` is `# h c`), after a blank line unless it is the first; the comment after a bare `-` goes to the item's first key, or to its first element if that is a scalar; a mapping's or sequence's own comment is dropped; and the first document's leading comment block comes first when the result is that document.
   Where succinctly attributes a comment to a different node than yq does, which `head_comment` and `line_comment` show too, the property gets it as succinctly attributes it (the comment after a bare `-` and the line break a blank line leaves under a head comment agree since #7034, and a block above the first key of a later bare `-` item, which yq reads as that key's foot, since #7044, and a byte-order mark's first comment since #7084).
   `head_comment` reads both from the document node, so a key read inside parentheses, after a `select` or under a non-YAML `-o` loses them (#7043), and after a write (`.[0].b = 2 | .[0].a | key | head_comment` over `- # m` / `  a: 1` is `""`, yq `"m"`), under `--eval-all` and on a built value they are not there (#7034).
@@ -7827,17 +7828,20 @@ The encoder runs over the value model, which keeps no node style or key tag, so 
 - A timestamp (`2001-01-01`) and `!!binary` are written as strings, where yq stops with `lua encoder NYI -- !!timestamp`.
 - The integer spellings `-0o17` and `0O17` and the YAML 1.1 ones `1_000`, `0b11` and `0XfF` are strings here (see the YAML 1.1 section above), so they are quoted, where yq writes them bare.
 
-### `-o=toml` — comments and a value's source spelling are not read (#6924)
+### `-o=toml` — a rebuilt value and a TOML file lose their comments, and a value's source spelling is not read (#6924, #7160)
 
 `-o=toml` is a port of yq's TOML encoder (attributes before tables, `[a.b]` tables, `[[a]]` arrays of tables, inline tables inside arrays, Go `%q` strings) and agrees with yq v4.53.3 on 3,800 random JSON documents.
 Go's `%q` escapes every code point `unicode.IsPrint` rejects, and that set follows the Unicode version of the Go release that built yq, so `src/jq/go_print.rs` is generated from the pinned binary (`scripts/gen_go_print.py`) rather than from a Unicode table here.
-The encoder runs over the value model, which keeps no comment, node style or source spelling, so on a YAML input these still differ:
+Comments are written as yq's encoder writes them (#7160): the root mapping's head comment first, a table's head comment above its header, an attribute's head comment above it and its line comment after it (`a = 1  # l`), an array's the same, and an array whose elements have head comments in the multi-line form.
+A comment above a key is the key's, which yq's encoder does not read (it reads the value's), so a YAML document's comments above its keys are not written by either; no foot comment is.
+The comments are read from the node the result came from and, for a write (`=`, `del()`, `sort_keys`), from its presentation tree (as `-o=xml`, #7156), and agree with yq on random comment positions over twelve document shapes (300 documents for each of the read and four write filters) and on 255 rows over tables, arrays of tables and arrays.
+The encoder runs over the value model, which keeps no node style or source spelling, so on a YAML input these still differ:
 
-- A head, line or foot comment is dropped, where yq writes a head comment above its key and a line comment after the value (`a = 1  # l`).
+- A head, line or foot comment is dropped from a value the filter rebuilds where the YAML printer drops its comments too (`with_entries(.)`, `. * {..}`, #5521) and under `--eval-all` (#4380), where yq keeps the comments of the nodes it copies.
 - A boolean written `True`, `FALSE` or `yes` is `true` or `false`, where yq writes the source text.
 - The YAML 1.1 integers `1_000` and `0b11` are strings here (see the YAML 1.1 section above), so they are quoted, where yq writes them bare.
 - A timestamp (`2001-01-01`) and a `!!binary` scalar are quoted strings, where yq writes their text bare.
-- yq's inline-table hint is set only by its TOML decoder, and `-p toml` writes the nodes as YAML text that is read back, so a TOML file written back as TOML (`*.toml` under `-o auto`, `-i`) writes an inline table as a table and drops its comments (see `-p toml` below).
+- yq's inline-table hint is set only by its TOML decoder, and `-p toml` writes the nodes as YAML text that is read back, so a TOML file written back as TOML (`*.toml` under `-o auto`, `-i`) writes an inline table as a table and, for a run that read TOML, writes no comment (see `-p toml` below): yq's TOML decoder gives a comment to the value that follows it, which the YAML text the read produces can only hold as the key's or the first child's, so writing them would put them on the wrong node (#7170).
 
 ### `-o=kyaml` — a rebuilt value loses its comments (#6924, #7158)
 

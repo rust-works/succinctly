@@ -6473,16 +6473,22 @@ pub fn format_yq_encoder_from_tree<C: DocumentCursor>(
 ) -> Result<String, EvalError> {
     let mut comments = encoder_comments_of_tree(value, tree, 0);
     let original = collect_encoder_comments(pristine, 0);
-    // Only the XML encoder reads the line break a blank line leaves under a block.
-    if matches!(encoder, YqOutputEncoder::Xml(_)) {
+    // Only the XML and properties encoders read the line break a blank line leaves under a block.
+    if matches!(
+        encoder,
+        YqOutputEncoder::Xml(_) | YqOutputEncoder::Props { .. }
+    ) {
         restore_comment_breaks(&mut comments, &original);
     }
     let meta = tree.meta();
     let mut leading = String::new();
-    if yq_encoder_prints_leading_block(encoder)
-        && (meta.preamble().is_some() || meta.head_is_header())
-    {
-        leading = pristine.yq_leading_content().unwrap_or_default();
+    if meta.preamble().is_some() || meta.head_is_header() {
+        // Only some encoders print the block; none writes it as a comment of a node.
+        if yq_encoder_prints_leading_block(encoder) {
+            leading = pristine.yq_leading_content().unwrap_or_default();
+        } else if matches!(encoder, YqOutputEncoder::Props { .. }) {
+            leading = pristine.props_leading_content().unwrap_or_default();
+        }
         // What the header holds is not the node's own comment as well.
         comments.own.head.clear();
         // After an explicit `---` the tree holds the header's comments as the first node's head,
