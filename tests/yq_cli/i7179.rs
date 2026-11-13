@@ -69,3 +69,34 @@ fn eval_all_not_equal_reads_its_operands_read_only_7179() -> Result<()> {
     }
     Ok(())
 }
+
+/// Without `--eval-all` each file is its own evaluation and an absent key is an empty operand for `!=` and
+/// `null` for `==` alike, one result per document: nothing differs from before.
+#[test]
+fn plain_not_equal_stays_per_document_7179() -> Result<()> {
+    let dir = TempDir::new()?;
+    let texts = ["a: 1\nk: 10\n", "c: 3\nk: 20\n", "e: 5\n"];
+    let paths: Vec<_> = texts
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            let path = dir.path().join(format!("f{}.yaml", i + 1));
+            std::fs::write(&path, text).map(|()| path)
+        })
+        .collect::<std::io::Result<_>>()?;
+    let refs: Vec<&std::path::Path> = paths.iter().map(std::path::PathBuf::as_path).collect();
+    for (filter, expected) in [
+        (".zz != 1", "true\ntrue\ntrue\n"),
+        (".zz == 1", "false\nfalse\nfalse\n"),
+        (".k != 20", "true\nfalse\ntrue\n"),
+        (".a != .c", "true\ntrue\nfalse\n"),
+    ] {
+        let (stdout, stderr, status) = run_yq_files(filter, &refs, &["-o=json", "-I=0"])?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), status),
+            (expected, "", 0),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
