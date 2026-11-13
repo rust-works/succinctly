@@ -93203,6 +93203,14 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(e) => e.into(),
         };
     }
+    // #7132: the doors the lazy twin offers a stage right after its fast path, for the stages that
+    // answer one value off the tree. They never read `reentry`, so they come before the scans below
+    // (the embed table's witness walk is O(input) for a bound array). Without them `$a | length > 5`, `$a | has(5)` and `$a | keys` in a loop over a bound
+    // array wrote `$a` out as text and indexed it again for each call (6 to 25 ms over 100,000
+    // elements, where jq takes 0.08), the one cost every stage of a bridged pipe pays.
+    if let Some(answer) = eval_owned_value_doors::<S>(expr, input) {
+        return QueryResult::Owned(answer);
+    }
     // #3180: the relocating fold and the embed peel, as in the lazy twin
     // [`eval_each_owned`]. An eager caller -- an array constructor's
     // collect, `[input | . as $x | {k:.} | .k | path($x)]` -- reaches a
@@ -93257,6 +93265,77 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // After the fast path on purpose: it never reaches a resolver, and
     // demoting rebuilds `expr` whenever it holds a marker at all.
     eval_owned_input_bridge::<W, S>(&reentry.reroot::<S>(expr), input, optional)
+}
+
+/// The stages [`eval_each_owned_front_doors`] answers from the owned tree with one value (a count, a
+/// verdict, a key list, a projection, a construction of static reads, a fold of numbers, a string
+/// stage), in its order, for [`eval_owned_input`] (#7132). Each declines whatever it
+/// would raise, fan out or hand back as a bound node, so the bridge keeps its errors, its `?`
+/// suppression and its per-mode rules. The multi-output door (`.children[]?`) is the lazy twin's alone.
+/// A shape added to that list is added here too: `eval_owned_value_doors_agree_with_the_bridge_7132` is
+/// the pin.
+fn eval_owned_value_doors<S: EvalSemantics>(expr: &Expr, input: &OwnedValue) -> Option<OwnedValue> {
+    eval_owned_count_door::<S>(expr, input)
+        .or_else(|| eval_owned_map_projection::<S>(expr, input))
+        .or_else(|| eval_owned_construct::<S>(expr, input))
+        .or_else(|| eval_owned_container_key_door::<S>(expr, input))
+        .or_else(|| eval_owned_number_fold::<S>(expr, input))
+        .or_else(|| super::eval_generic::eval_owned_number_map::<S>(expr, input))
+        .or_else(|| eval_owned_string_stage::<S>(expr, input))
+        .or_else(|| eval_owned_first_last_nth::<S>(expr, input))
+        // A comparison or a boolean over such counts and keys (`length > 5`, `has(5) and length > 2`),
+        // as `select` and `until` read one: only an answer is taken, an operand that raises or fans
+        // out is the bridge's.
+        .or_else(
+            || match eval_owned_pure_in::<S>(expr, input, ResultPosition::Fresh, true) {
+                Some(Ok(answer)) => Some(answer),
+                _ => None,
+            },
+        )
+}
+
+/// `first`, `last` and `nth(n)` of an owned array or null, as the `.[0]`, `.[-1]` and
+/// `.[n]` they are defined as (#7132): the same read [`eval_owned_navigation`] makes of an index, a
+/// clone of the element that shares its storage. `nth` takes a non-negative integer literal (a
+/// negative one raises in jq and stays the bridge's), and a read that raises (`first` of an object)
+/// declines, so the error and its text are the bridge's. jq mode only: `first` and `last` are gated
+/// in yq (#1512).
+fn eval_owned_first_last_nth<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    let idx = match expr {
+        Expr::Builtin(Builtin::First) => 0,
+        Expr::Builtin(Builtin::Last) => -1,
+        Expr::Builtin(Builtin::Nth(n)) => match unwrap_paren(n) {
+            Expr::Literal(lit) => match literal_to_owned(lit) {
+                OwnedValue::Int(n) | OwnedValue::NumberLiteral(NumberRepr::Int(n), _) if n >= 0 => {
+                    n
+                }
+                _ => return None,
+            },
+            _ => return None,
+        },
+        _ => return None,
+    };
+    match eval_owned_navigation::<S>(&Expr::Index { idx, key: None }, input, false)? {
+        // An integer a double cannot hold is the bridge's: its round trip spells it as the literal it
+        // was read from, which an owned `Int` is not.
+        Ok(Some(OwnedValue::Int(n))) if n.unsigned_abs() > 1 << 53 => None,
+        // A container shares its storage with `input`, which the #2889 embed table witnesses while
+        // it is live: that read is the evaluator's.
+        Ok(Some(element @ (OwnedValue::Array(_) | OwnedValue::Object(_))))
+            if super::eval_generic::embed_table_active() =>
+        {
+            let _ = element;
+            None
+        }
+        Ok(Some(element)) => Some(element),
+        _ => None,
+    }
 }
 
 /// [`eval_owned_input`]'s bridge alone, no fast path and no demotion: build
@@ -130058,6 +130137,82 @@ mod tests {
                 "{src}"
             );
         }
+    }
+
+    /// #7132: the single-value doors `eval_owned_input` takes before its bridge answer what the bridge
+    /// does, in each mode, for `first`, `last`, `nth`, `has`, `keys` and a comparison or boolean over
+    /// them and a count, over every kind of value; a shape a door must not take (a negative or
+    /// computed `nth`, a read that raises) declines.
+    #[test]
+    fn eval_owned_value_doors_agree_with_the_bridge_7132() {
+        let mut values = pure_value_matrix();
+        values.push(OwnedValue::array_from(vec![]));
+        values.push(OwnedValue::object_from(Vec::<(String, OwnedValue)>::new()));
+        values.push(OwnedValue::array_from(vec![
+            OwnedValue::Int(1),
+            OwnedValue::Null,
+            OwnedValue::String("x".into()),
+        ]));
+        values.push(OwnedValue::array_from(vec![
+            OwnedValue::array_from(vec![OwnedValue::Int(7)]),
+            OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]),
+        ]));
+        let sources = [
+            "first",
+            "last",
+            "nth(0)",
+            "nth(1)",
+            "nth(5)",
+            "nth(-1)",
+            "nth(1.5)",
+            "nth(1; .[])",
+            "has(0)",
+            "has(5)",
+            "has(-1)",
+            "has(\"a\")",
+            "keys",
+            "length > 2",
+            "length == 0",
+            "length - 1 > 0",
+            "length > 1 and has(0)",
+            "first == 1",
+            "not",
+            "[first]",
+        ];
+        let mut answered = 0;
+        for value in &values {
+            for src in sources {
+                let expr = parse(src).unwrap();
+                if let Some(fast) = eval_owned_value_doors::<JqSemantics>(&expr, value) {
+                    answered += 1;
+                    let bridge = debug_normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                        &expr, value, false,
+                    ));
+                    let fast = debug_normalize(QueryResult::<Vec<u64>>::Owned(fast));
+                    assert_eq!(fast, bridge, "jq mode: {src:?} on {value:?}");
+                }
+                if let Some(fast) = eval_owned_value_doors::<YqSemantics>(&expr, value) {
+                    let bridge = debug_normalize(eval_owned_input_bridge::<Vec<u64>, YqSemantics>(
+                        &expr, value, false,
+                    ));
+                    let fast = debug_normalize(QueryResult::<Vec<u64>>::Owned(fast));
+                    assert_eq!(fast, bridge, "yq mode: {src:?} on {value:?}");
+                }
+            }
+        }
+        assert!(answered > 40, "the matrix must reach the doors: {answered}");
+        // What a door must not take.
+        let array = OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+        for src in ["nth(-1)", "nth(1.5)", "nth(1; .[])", "first(.[])"] {
+            let expr = parse(src).unwrap();
+            assert!(
+                eval_owned_first_last_nth::<JqSemantics>(&expr, &array).is_none(),
+                "{src}"
+            );
+        }
+        // `first` and `last` are jq's: yq gates them (#1512).
+        let first = parse("first").unwrap();
+        assert!(eval_owned_first_last_nth::<YqSemantics>(&first, &array).is_none());
     }
 
     /// #5816: `test`, `index`, `rindex` and `inside` of a string by a string literal are answered
