@@ -4857,13 +4857,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // on by `ModuleLoader` after parsing (the parser itself has no
             // notion of which file it's reading) -- reported here instead
             // of `<top-level>` when present.
-            let mut obj = IndexMap::new();
-            obj.insert(
-                "file".into(),
-                OwnedValue::String(file.as_deref().unwrap_or("<top-level>").into()),
-            );
-            obj.insert("line".into(), OwnedValue::Int(*line as i64));
-            QueryResult::Owned(OwnedValue::Object(obj.into()))
+            QueryResult::Owned(owned_loc_value(*line, file.as_deref()))
         }
         Expr::Env => {
             // $ENV returns an object containing all environment variables
@@ -12306,6 +12300,17 @@ fn owned_children_flow(container: &OwnedValue, sink: &mut dyn FnMut(OwnedValue) 
     }
 }
 
+/// [`owned_children_flow`] for values a door already read (#7132): each to `sink` in order, until
+/// it asks to stop.
+fn owned_values_flow(values: Vec<OwnedValue>, sink: &mut dyn FnMut(OwnedValue) -> Demand) -> Flow {
+    for value in values {
+        if sink(value) == Demand::Stop {
+            return Flow::Stopped { pending: None };
+        }
+    }
+    Flow::Exhausted
+}
+
 /// A stage that never reads `.`, answered without the owned input (#4053).
 ///
 /// `[$x] | 1` handed the stage `1` an owned array holding the whole of `$x`, and
@@ -13492,6 +13497,11 @@ pub(crate) fn eval_each_owned_front_doors<S: EvalSemantics>(
             Demand::Continue => Flow::Exhausted,
             Demand::Stop => Flow::Stopped { pending: None },
         });
+    }
+    // #7132: a comma of such stages, and `first`/`last`/`nth`/`limit`/`isempty` of `.[]`, answer
+    // zero or several values off the tree.
+    if let Some(values) = eval_owned_many_doors::<S>(expr, input) {
+        return Some(owned_values_flow(values, sink));
     }
     // #5675: an expression that never reads `.` (`$n * 2` once `$n` is a literal, `1 + 2`,
     // `[1, 2]`) is one value whatever the input is, so the input is not written out and indexed to
@@ -94013,8 +94023,12 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             None => owned_vec_to_result(values),
         };
     }
-    // #3177: see `eval_each_owned`.
-    if let Some((values, control)) = owned_path_door_collect::<S>(expr, input, optional, reentry) {
+    // #3177: see `eval_each_owned`. #7132: and a comma of value-door stages, or
+    // `first`/`last`/`nth`/`limit`/`isempty` of `.[]` (`[$a | first, last]`), chained onto this
+    // call so the frame [`eval_owned_pipe`] inlines this into keeps its one slot of this type.
+    if let Some((values, control)) = owned_path_door_collect::<S>(expr, input, optional, reentry)
+        .or_else(|| eval_owned_many_doors::<S>(expr, input).map(|values| (values, None)))
+    {
         return match control {
             Some(control) => partial(values, control),
             None => owned_vec_to_result(values),
@@ -94132,6 +94146,17 @@ fn eval_owned_read_door_stage<S: EvalSemantics>(
         // The operand grammar declines both in result position, so nothing below is skipped.
         Expr::Arithmetic { .. } | Expr::Alternative(..) => {
             return eval_owned_operand_answer::<S>(shape, input)
+        }
+        // #7132: neither reads the input, so neither needs it written out: `$__loc__` names the
+        // program text and `input_line_number` the reader's last line, as the evaluator's arms do.
+        Expr::Loc { line, file } if S::TAG == EvalTag::Jq => {
+            return Some(owned_loc_value(*line, file.as_deref()))
+        }
+        Expr::Builtin(Builtin::InputLineNumber) if S::TAG == EvalTag::Jq => {
+            return match builtin_input_line_number::<Vec<u64>, S>() {
+                QueryResult::Owned(line) => Some(line),
+                _ => None,
+            }
         }
         _ => None,
     };
@@ -94298,6 +94323,199 @@ fn owned_door_answer_may_leave(answer: OwnedValue) -> Option<OwnedValue> {
             None
         }
         answer => Some(answer),
+    }
+}
+
+/// The stages over an owned input that answer zero or several values, or one value of a stream
+/// (#7132): a comma of stages the value doors answer (`first, last`, `.[0], .[1]`), and `first`,
+/// `last`, `nth`, `limit` and `isempty` of `.[]` or `.[]?`. `Some(vec![])` is an answer of no value.
+///
+/// Each element read leaves under [`owned_door_answer_may_leave`], as the `first`/`last`/`nth`
+/// door's does, and the whole stage declines if one does not. A comma is answered only if every branch is, so
+/// no output is emitted before a decline and the bridge keeps jq's interleaving of outputs and errors.
+/// `.[]` of a scalar raises, so it declines; `.[]?` of one is empty. The counts are jq 1.7.1's
+/// (`/usr/bin/jq`): `last` of nothing is `null`; `nth(n; f)` past the end is empty; `limit(0; f)`
+/// never evaluates `f`, and a negative limit is all of `f`. Only an integer literal count is read, as
+/// a fractional one counts in jq in a way of its own (`nth(0.5; .[])` is the second element). jq
+/// mode only: yq's `first(f)` is another builtin (#2377).
+pub(crate) fn eval_owned_many_doors<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Option<Vec<OwnedValue>> {
+    // The shape first: most stages are none of these, and the generic route asks once per element.
+    let shape = unwrap_paren(expr);
+    if !matches!(
+        shape,
+        Expr::Comma(_)
+            | Expr::FirstExpr(_)
+            | Expr::LastExpr(_)
+            | Expr::NthExpr { .. }
+            | Expr::Limit { .. }
+            | Expr::Builtin(
+                Builtin::IsEmpty(_)
+                    | Builtin::FirstStream(_)
+                    | Builtin::LastStream(_)
+                    | Builtin::NthStream(..)
+            )
+    ) || S::TAG != EvalTag::Jq
+    {
+        return None;
+    }
+    let leave = |value: &OwnedValue| owned_door_answer_may_leave(value.clone());
+    match shape {
+        Expr::Comma(branches) => {
+            let mut out = Vec::with_capacity(branches.len());
+            for branch in branches.iter() {
+                match eval_owned_many_doors::<S>(branch, input) {
+                    Some(values) => out.extend(values),
+                    None => out.push(eval_owned_comma_branch::<S>(branch, input)?),
+                }
+            }
+            Some(out)
+        }
+        Expr::FirstExpr(stream) | Expr::Builtin(Builtin::FirstStream(stream)) => {
+            let items = owned_stream_items(stream, input)?;
+            Some(match items.first() {
+                Some(item) => vec![leave(item)?],
+                None => vec![],
+            })
+        }
+        Expr::LastExpr(stream) | Expr::Builtin(Builtin::LastStream(stream)) => {
+            let items = owned_stream_items(stream, input)?;
+            Some(vec![match items.last() {
+                Some(item) => leave(item)?,
+                None => OwnedValue::Null,
+            }])
+        }
+        Expr::NthExpr { n, expr: stream } | Expr::Builtin(Builtin::NthStream(n, stream)) => {
+            let n = usize::try_from(owned_integer_literal(n)?).ok()?;
+            let items = owned_stream_items(stream, input)?;
+            Some(match items.get(n) {
+                Some(item) => vec![leave(item)?],
+                None => vec![],
+            })
+        }
+        Expr::Limit { n, expr: stream } => {
+            let n = owned_integer_literal(n)?;
+            if n == 0 {
+                return Some(vec![]);
+            }
+            let items = owned_stream_items(stream, input)?;
+            let take = if n < 0 {
+                items.len()
+            } else {
+                usize::try_from(n).unwrap_or(usize::MAX)
+            };
+            items.take(take).map(leave).collect()
+        }
+        Expr::Builtin(Builtin::IsEmpty(stream)) => {
+            let items = owned_stream_items(stream, input)?;
+            Some(vec![OwnedValue::Bool(items.is_empty())])
+        }
+        _ => None,
+    }
+}
+
+/// `$__loc__`'s value (#2688, #2774): `{"file": F, "line": N}`, `F` the module's canonical path or
+/// `<top-level>` for the main filter. One spelling for the evaluator's arm and the owned door
+/// (#7132).
+fn owned_loc_value(line: usize, file: Option<&str>) -> OwnedValue {
+    let mut obj = IndexMap::new();
+    obj.insert(
+        "file".into(),
+        OwnedValue::String(file.unwrap_or("<top-level>").into()),
+    );
+    obj.insert("line".into(), OwnedValue::Int(line as i64));
+    OwnedValue::Object(obj.into())
+}
+
+/// One branch of a comma [`eval_owned_many_doors`] answers: a stage a value door answers, or one
+/// the operand grammar answers (a read, `.`, `.a`, `.[0]`, `.[$i + 1]`, and what is built of them)
+/// that leaves under [`owned_door_answer_may_leave`], as [`eval_owned_operand_answer`] takes an
+/// arithmetic stage's, or a stage that never reads `.`.
+fn eval_owned_comma_branch<S: EvalSemantics>(
+    branch: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    if let Some(answer) = eval_owned_value_doors::<S>(branch, input) {
+        return Some(answer);
+    }
+    match eval_owned_pure_in::<S>(branch, input, ResultPosition::Operand, true) {
+        Some(Ok(answer)) => owned_door_answer_may_leave(answer),
+        Some(Err(_)) => None,
+        None => eval_owned_closed::<S>(branch),
+    }
+}
+
+/// The values `.[]` or `.[]?` iterates over an owned input, in order, for
+/// [`eval_owned_many_doors`]: an array's elements or an object's values, borrowed, so a read of one
+/// of them costs no walk of the rest. `.[]` of anything else raises, which is the bridge's (`None`);
+/// `.[]?` of it is empty.
+fn owned_stream_items<'v>(stream: &Expr, input: &'v OwnedValue) -> Option<OwnedStream<'v>> {
+    let optional = match unwrap_paren(stream) {
+        Expr::Iterate => false,
+        Expr::Optional(inner)
+        | Expr::Try {
+            expr: inner,
+            catch: None,
+        } if matches!(unwrap_paren(inner), Expr::Iterate) => true,
+        _ => return None,
+    };
+    match input {
+        OwnedValue::Array(items) => Some(OwnedStream::Array(items)),
+        OwnedValue::Object(map) => Some(OwnedStream::Object(map)),
+        _ if optional => Some(OwnedStream::Array(&[])),
+        _ => None,
+    }
+}
+
+/// [`owned_stream_items`]'s view of what `.[]` iterates.
+enum OwnedStream<'v> {
+    Array(&'v [OwnedValue]),
+    Object(&'v ObjectMap),
+}
+
+impl<'v> OwnedStream<'v> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Array(items) => items.len(),
+            Self::Object(map) => map.values().len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn get(&self, n: usize) -> Option<&'v OwnedValue> {
+        match self {
+            Self::Array(items) => items.get(n),
+            Self::Object(map) => map.values().nth(n),
+        }
+    }
+
+    fn first(&self) -> Option<&'v OwnedValue> {
+        self.get(0)
+    }
+
+    fn last(&self) -> Option<&'v OwnedValue> {
+        self.len().checked_sub(1).and_then(|n| self.get(n))
+    }
+
+    fn take(&self, n: usize) -> impl Iterator<Item = &'v OwnedValue> + '_ {
+        (0..n.min(self.len())).filter_map(move |i| self.get(i))
+    }
+}
+
+/// An integer literal count (`limit(2; ..)`, `nth(1; ..)`), as [`eval_owned_first_last_nth`] reads
+/// `nth(n)`'s; anything else (a fraction, a computed count, `null`) is the evaluator's.
+fn owned_integer_literal(expr: &Expr) -> Option<i64> {
+    match unwrap_paren(expr) {
+        Expr::Literal(lit) => match literal_to_owned(lit) {
+            OwnedValue::Int(n) | OwnedValue::NumberLiteral(NumberRepr::Int(n), _) => Some(n),
+            _ => None,
+        },
+        _ => None,
     }
 }
 

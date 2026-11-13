@@ -6806,6 +6806,11 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
     if let Some(count) = crate::jq::eval::eval_owned_value_doors::<S>(expr, &owned) {
         return GenericResult::Owned(count);
     }
+    // #7132: and a comma of them, or `first`/`last`/`nth`/`limit`/`isempty` of `.[]`, which answer
+    // zero or several values.
+    if let Some(values) = crate::jq::eval::eval_owned_many_doors::<S>(expr, &owned) {
+        return owned_vec_to_generic_result(values);
+    }
 
     // #6122: `map(.field)` over an owned array reads one field of each element, not the array
     // written out and indexed again.
