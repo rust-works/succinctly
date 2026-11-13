@@ -3608,6 +3608,12 @@ pub enum Builtin {
     // Map & Iteration
     /// `map(f)` - apply f to each element: [.[] | f]
     Map(Box<Expr>),
+
+    /// yq's `filter(f)` (#7171): `[.[] | select(f)]` (the expression held, already desugared) that yq runs
+    /// once per node of its context. It evaluates as that array does, but a pipe whose left side matched
+    /// nothing does not run it, where an array construction on its own is emitted once over an empty
+    /// context (`.b[]? | filter(f)` is nothing, `.b[]? | [.[] | select(f)]` is `[]`).
+    Filter(Box<Expr>),
     /// `map_values(f)` - apply f to each object value
     MapValues(Box<Expr>),
 

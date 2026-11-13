@@ -216,6 +216,7 @@ pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
         | Builtin::UpperIn(e)
         | Builtin::Select(e)
         | Builtin::Map(e)
+        | Builtin::Filter(e)
         | Builtin::MapValues(e)
         | Builtin::AnyF(e)
         | Builtin::AllF(e)
@@ -538,6 +539,7 @@ pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr)
         Builtin::UpperIn(e) => Builtin::UpperIn(Box::new(f(e))),
         Builtin::Select(e) => Builtin::Select(Box::new(f(e))),
         Builtin::Map(e) => Builtin::Map(Box::new(f(e))),
+        Builtin::Filter(e) => Builtin::Filter(Box::new(f(e))),
         Builtin::MapValues(e) => Builtin::MapValues(Box::new(f(e))),
         Builtin::AnyF(e) => Builtin::AnyF(Box::new(f(e))),
         Builtin::AllF(e) => Builtin::AllF(Box::new(f(e))),
@@ -1761,6 +1763,7 @@ fn stage_escapes_own_input(expr: &Expr) -> bool {
             | Builtin::Select(_)
             | Builtin::Empty
             | Builtin::Map(_)
+            | Builtin::Filter(_)
             | Builtin::MapValues(_)
             | Builtin::Add
             | Builtin::Any
@@ -2123,6 +2126,7 @@ fn node_reads_ambient(node: &Expr) -> bool {
             | Builtin::UpperInSrc(_, _)
             | Builtin::Select(_)
             | Builtin::Map(_)
+            | Builtin::Filter(_)
             | Builtin::MapValues(_)
             | Builtin::Add
             | Builtin::Any

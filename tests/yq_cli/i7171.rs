@@ -31,3 +31,18 @@ fn filter_over_an_empty_context_answers_nothing_7171() -> Result<()> {
     }
     Ok(())
 }
+
+/// The array it stands for is still read off the cursor, so comments, quotes and anchors of the children
+/// that pass print as before (a regression of binding the node first, found in review).
+#[test]
+fn filter_keeps_the_presentation_of_the_children_it_passes_7171() -> Result<()> {
+    let input = "l:\n  - a: 1 # one\n  # mid\n  - b: &x 2\n  - *x\n  - \"q\" # tail\n";
+    for (filter, expected) in [
+        (".l | filter(. == \"q\")", "- \"q\" # tail\n"),
+        (".l | filter(.a)", "- a: 1 # one\n"),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, input, &[])?;
+        assert_eq!((stdout.as_str(), code), (expected, 0), "{filter}");
+    }
+    Ok(())
+}
