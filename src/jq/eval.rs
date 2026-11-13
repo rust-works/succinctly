@@ -92197,7 +92197,46 @@ fn owned_update_step_arith<S: EvalSemantics>(expr: &Expr, state: OwnedValue) -> 
                 done => done,
             }
         }
+        None if matches!(expr, Expr::Arithmetic { left, .. } if matches!(unwrap_paren(left), Expr::Slice { .. })) => {
+            match owned_slice_arith_step::<S>(expr, state) {
+                OwnedStep::Declined(state) => try_eval_owned_step::<S>(expr, state),
+                done => done,
+            }
+        }
         None => try_eval_owned_step::<S>(expr, state),
+    }
+}
+
+/// `.[a:b] + LITERAL` as a fold's UPDATE, the queue a loop keeps by dropping its head and appending
+/// (#7109): the slice is [`try_eval_owned_step`]'s cut of the state it owns (in place, #6659), and
+/// the combine is [`arith_combine`] of the cut and the closed right operand, as
+/// `.[a:b] | . + LITERAL` is through [`owned_stage_pipe_step`]. Through the bridge each step wrote
+/// the whole state out as JSON and indexed it again, which made `reduce range(n) as $i (.; .[1:] +
+/// [$i])` quadratic (41 s at n = 20,000 against jq's 0.05 s).
+///
+/// The right operand is closed, so it reads nothing the cut changes and the two orders of evaluation
+/// jq may take are one answer. jq mode only (yq's arithmetic has its own rules for the right side,
+/// #6802) and, like every step that shares elements with the state, not under the #2889 embed
+/// table, which [`owned_update_step_arith`] has answered before this. A slice the step does not cut
+/// (a state that is not an array or a string, a bound it cannot take) hands the state back
+/// untouched.
+#[inline(never)]
+fn owned_slice_arith_step<S: EvalSemantics>(expr: &Expr, state: OwnedValue) -> OwnedStep {
+    let Expr::Arithmetic {
+        op, left, right, ..
+    } = expr
+    else {
+        return OwnedStep::Declined(state);
+    };
+    if S::TAG != EvalTag::Jq {
+        return OwnedStep::Declined(state);
+    }
+    let Some(operand) = closed_expr_to_owned::<S>(right.as_ref()) else {
+        return OwnedStep::Declined(state);
+    };
+    match try_eval_owned_step::<S>(left, state) {
+        OwnedStep::Handled(Ok(cut)) => OwnedStep::Handled(arith_combine::<S>(*op, cut, operand)),
+        other => other,
     }
 }
 
