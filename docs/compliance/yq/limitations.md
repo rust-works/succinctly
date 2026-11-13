@@ -1340,10 +1340,11 @@ A constructed left operand takes the origin of the context entry it was built fo
 A left operand that builds a fresh node, a literal or a builtin such as `length`, has none: `10 + .x | document_index` is `0` for every document in yq and here.
 A comparison's boolean has none here, as before; yq keeps the left read's for `.x == 1` (`0 0 1 1`) and gives `. == .` none ([#6973](https://github.com/rust-works/succinctly/issues/6973)).
 
+An arithmetic result keeps `EvaluateTogether` too, since #6973: yq's result is a copy of its left node (`lhs.Copy()`), so a left operand that is the list's own node passes its flag on, whatever the result is (a map merge, an array concat or a sum: `. * {"z":1} | [.]` and `. + 1 | [.]` are one array of every result), and a following binary stage crosses the whole list of results (`(. * {"z":1}) | . + {"w":2}` is 16 results over two documents).
+A left operand that navigated or built its node has none (`.x + 1 | [.]` and `{"q":1} + . | [.]` are one array per result), and a comparison's boolean is a node of its own.
+21 rows are pinned against yq v4.53.3 in `tests/yq_cli/i6973.rs`.
+
 Not covered here ([#6973](https://github.com/rust-works/succinctly/issues/6973)):
-- A map merge or concat keeps `EvaluateTogether` in yq (it copies its left operand), so `. * {"z":1} | [.]` is one array of every result there and one array per result here.
-  A scalar result is a fresh node in both.
-- A later arithmetic stage crosses the whole list of results in yq: `(. * {"z":1}) | . + {"w":2}` is 16 results over two documents and 4 here.
 - A union as the left operand that mixes reads and literals (`(.x, 7) + (10,20)`): yq gives each node its own origin, and this decides it per operand, so the reads lose theirs (as before #6969).
 - `line` of a computed result is `0` here; yq keeps its left operand's line.
 - `. as $d | $d * {"z":1}` is four results in yq and two here.
