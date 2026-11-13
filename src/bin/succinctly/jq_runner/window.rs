@@ -2420,6 +2420,112 @@ mod tests {
         }
     }
 
+    /// Where the first record of `stream` that is not `RS value LF` opens, found record by record with
+    /// the check [`crate::jq_seq_reader::PlainRecords`] makes, or `None` for a stream that is all plain.
+    fn first_unclean_record(stream: &[u8]) -> Option<usize> {
+        use crate::jq_seq_reader::{PlainGuards, PlainRecords};
+        if stream.first() != Some(&RS) {
+            return Some(0);
+        }
+        let mut starts: Vec<usize> = (0..stream.len()).filter(|&i| stream[i] == RS).collect();
+        starts.push(stream.len());
+        starts.windows(2).find_map(|pair| {
+            let record = &stream[pair[0] + 1..pair[1]];
+            (!PlainRecords::record_ok(record, PlainGuards::ALL)).then_some(pair[0])
+        })
+    }
+
+    /// #7164: a `--seq` pipe hands out the documents and lines of its plain records, with each RS read as a
+    /// space, and hands on the stream from its first record that is not plain: its bytes as read, the
+    /// line breaks before it and the byte jq's token buffer holds there. Whatever the reads' size and
+    /// wherever the probe's front ends, the windows are those of the plain records read whole.
+    #[test]
+    fn a_seq_pipe_runs_its_plain_records_and_hands_on_the_rest_7164() {
+        let record = |i: usize| -> String {
+            match i % 5 {
+                0 => format!("\x1e{{\"id\":{i},\"s\":\"bus\"}}\n"),
+                1 => format!("\x1e[{i},\n  \"\\u0041\"]\n"),
+                2 => format!("\x1e{i}\n"),
+                3 => "\x1enull\n".to_string(),
+                _ => "\x1e\"a\"\n\n".to_string(),
+            }
+        };
+        let tails: [&[u8]; 8] = [
+            b"",
+            b"\x1en\n\x1e1\n",
+            b"\x1e{\"a\":1\n\x1e2\n",
+            b"\x1e12.5",
+            b"\x1enan\n",
+            b"\x1e1 2\n\x1e3\n",
+            b"\x1e\x1e\"x\"\n",
+            b"\x1e[1,]\n",
+        ];
+        for count in [1usize, 2, 9, 40] {
+            let records: String = (0..count).map(record).collect();
+            for tail in tails {
+                for front in [b"".as_slice(), b"\xef\xbb\xbf", b"x"] {
+                    let stream = [front, records.as_bytes(), tail].concat();
+                    let at = first_unclean_record(&stream);
+                    let clean = &stream[..at.unwrap_or(stream.len())];
+                    let mut blanked = clean.to_vec();
+                    blank_rs_bytes(&mut blanked);
+                    let want = whole(&blanked);
+                    for block in [1usize, 3, 17, 4096] {
+                        for probe in [0, 1, stream.len() / 2, stream.len()] {
+                            let mut file = tempfile::tempfile().expect("a temp file");
+                            file.write_all(&stream[probe..]).expect("written");
+                            file.rewind().expect("rewound");
+                            let slot = SeqTailSlot::default();
+                            let mut reader = WindowedFile::from_seq_pipe(
+                                Rc::new(file),
+                                stream[..probe].to_vec(),
+                                block,
+                                Rc::clone(&slot),
+                            );
+                            let mut spans = Vec::new();
+                            let mut lines = Vec::new();
+                            while let Some(window) = reader.next_window().expect("reads") {
+                                let mut counter = LineCounter::new(window.raw);
+                                counter.set_lines_before(window.lines_before);
+                                for &(start, end) in &window.values {
+                                    spans.push((window.offset + start, window.offset + end));
+                                    lines.push(counter.read_end_line(end));
+                                }
+                                assert_eq!(window.split_error, None);
+                            }
+                            let shown = String::from_utf8_lossy(&stream);
+                            let case = format!("{shown:?}, block {block}, probe {probe}");
+                            assert_eq!(
+                                (spans, lines),
+                                (want.spans.clone(), want.lines.clone()),
+                                "{case}"
+                            );
+                            let handed = slot.borrow_mut().take();
+                            match at {
+                                None => assert!(handed.is_none(), "{case}"),
+                                Some(at) => {
+                                    let handed = handed.expect("the rest is handed on");
+                                    assert_eq!(handed.bytes, &stream[at..], "{case}");
+                                    assert_eq!(
+                                        handed.lines,
+                                        count_newlines(&stream[..at]),
+                                        "{case}"
+                                    );
+                                    assert_eq!(
+                                        handed.token_byte,
+                                        crate::jq_seq_reader::token_byte_after(&stream[..at]),
+                                        "{case}"
+                                    );
+                                    assert!(handed.error.is_none(), "{case}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// #7082: a window of a `--seq` stream reads each RS as a space, whatever the window, and nothing
     /// else moves: the documents and lines are those of the stream with its RS bytes blanked.
     #[test]
