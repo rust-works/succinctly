@@ -17,7 +17,10 @@ at offset 0 or at a random one, each against the bytes from there on a pipe name
 `--files K` the stream is cut into K files, as for the plain filter, against the same files as descriptors
 (for K past 32 each file is opened as the run reaches it). A stream of
 lines has no fault, so these cases test where windows cut lines: invalid UTF-8, NULs, a lone CR, a BOM,
-very long lines and no final line break. (The seeds of #7048's runs do not reproduce: the generator
+very long lines and no final line break. `--inputs` runs programs that read `input`/`inputs` over `--files`
+files (2 to 32), which their own reader takes a window at a time, one file after another (#7024), against the
+same files as `/dev/fd/N`: those print `input_line_number`, `input_filename` and `$__loc__`, and read past
+faults. (The seeds of #7048's runs do not reproduce: the generator
 now cuts the stream into files and picks among more programs.)
 
 The streams mix the shapes that decide where a window ends: documents of every kind, pretty-printed ones that
@@ -34,7 +37,7 @@ prove nothing, so a case that comes out shorter is a bug of the generator and st
 
 Usage:
     cargo build --release --features cli,simd,regex,serde
-    scripts/jq-windowed-file-fuzz.py [--bin PATH] [-n N] [--seed S] [--work DIR] [--files K | --pipe] [--raw] [--cap-mb MB]
+    scripts/jq-windowed-file-fuzz.py [--bin PATH] [-n N] [--seed S] [--work DIR] [--files K | --pipe] [--raw | --inputs] [--cap-mb MB]
 Each case takes about 0.2 s with a release build. Exit 1 on any difference (a timeout, a crash of the
 script's own and a run that exceeds `--cap-mb` of address space count as one); the stream that differed is
 kept in `--work` as `windowed-fuzz-<seed>-<case>-<file>.json` (one per file), and the case is printed with the mutations applied,
@@ -98,6 +101,20 @@ RAW_FILE_PROGRAMS = [
     ["-R", "-c", "[input_filename, input_line_number, length]"],
     ["-R", 'if length % 997 == 0 then error("e") else empty end'],
     ["-R", "-r", "input_filename"],
+]
+
+# Programs that read `input`/`inputs` (#7024), over several files: the lazy reader of each file, a window at a
+# time. Where each document was read is part of the answer, and so is every fault the reads go past.
+INPUTS_PROGRAMS = [
+    ["-n", "[inputs] | length"],
+    ["-cn", "inputs | [input_filename, input_line_number, (.id? // .n? // .)]"],
+    ["-cn", "last(inputs) | [., input_line_number, input_filename, $__loc__]"],
+    ["-cn", "first(inputs), input_line_number"],
+    ["-n", "reduce inputs as $x (0; . + 1)"],
+    ["-cn", "[inputs | numbers] | length"],
+    ["-c", "[(.id? // .), (input | .id? // .)]"],
+    ["-cn", 'inputs | select(.id? == 40001) | error("e")'],
+    ["-n", "try ([inputs] | length) catch ."],
 ]
 
 MUTATIONS = [
@@ -233,13 +250,15 @@ def run(binary, args, megabytes, stdin=None, pass_fds=(), feed=None):
     return done.stdout, done.stderr, done.returncode
 
 
-def cut_into_files(rng, data, count):
+def cut_into_files(rng, data, count, line_starts=0.25):
     """`data` cut at `count - 1` random bytes, in order. Most cuts fall anywhere (inside a token, a
-    string, a multi-byte character); some at a line start, and some leave a file empty."""
+    string, a multi-byte character); `line_starts` of them at a line start, and some leave a file empty.
+    `--inputs` cuts mostly at line starts: a cut inside a document hands the rest of the stream to the
+    eager reader, so the later files would never be read in windows."""
     cuts = []
     for _ in range(count - 1):
         at = rng.randrange(len(data) + 1)
-        if rng.random() < 0.25:
+        if rng.random() < line_starts:
             at = data.rfind(b"\n", 0, at) + 1
         if rng.random() < 0.1 and cuts:
             at = cuts[-1]
@@ -259,7 +278,7 @@ def named(output, names, descriptors):
 
 def run_files(args, rng, data, case, program, work, seed):
     """One case over several files: windowed (as paths) and whole (as descriptors), compared."""
-    pieces = cut_into_files(rng, data, args.files)
+    pieces = cut_into_files(rng, data, args.files, 0.75 if args.inputs else 0.25)
     names = []
     for n, piece in enumerate(pieces):
         name = os.path.join(work, "windowed-fuzz-%d-%d.json" % (seed, n))
@@ -321,9 +340,15 @@ def main():
                         help="feed each stream on a pipe on standard input instead (#7024); one file only")
     parser.add_argument("--raw", action="store_true",
                         help="run -R programs (#7024): on a pipe with --pipe, else as a regular file on standard input")
+    parser.add_argument("--inputs", action="store_true",
+                        help="run programs that read input/inputs over --files files, 2 to 32 (#7024)")
     args = parser.parse_args()
     if args.raw and args.pipe and args.files != 1:
         sys.exit("--raw --pipe is one stream on standard input: give no --files")
+    if args.inputs and not 2 <= args.files <= 32:
+        sys.exit("--inputs reads several files: give --files 2 to 32")
+    if args.inputs and (args.raw or args.pipe):
+        sys.exit("--inputs is neither --raw nor --pipe")
     if args.pipe and args.files != 1:
         sys.exit("--pipe is one stream: give no --files")
     if not 1 <= args.files <= 512:
@@ -341,6 +366,8 @@ def main():
         # A pipe has no file name, and `/dev/stdin` has one: `input_filename` would tell them apart.
         if args.raw:
             program = rng.choice(RAW_PROGRAMS + (RAW_FILE_PROGRAMS * 2 if args.files > 1 else []))
+        elif args.inputs:
+            program = rng.choice(INPUTS_PROGRAMS)
         else:
             program = rng.choice(PROGRAMS if args.pipe else PROGRAMS + FILE_PROGRAMS * 2)
         try:
