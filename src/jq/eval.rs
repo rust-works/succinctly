@@ -93457,7 +93457,13 @@ fn produces_fresh_value(expr: &Expr) -> bool {
 /// Its value is consumed by a comparison, a boolean or the next pipe stage, and a pipe's last
 /// stage is where a navigated value would have to leave, which `Identity`/`Field`/`Index`
 /// already refuse in `Fresh` position. So `select(. % 3 == 0)` is settled from the tree
-/// while `. + null` as an expression's own answer is still the bridge's.
+/// while `. + null` as an expression's own answer is not this grammar's.
+///
+/// #7132: the value doors do take such an answer, outside this grammar: an arithmetic or `//`
+/// stage is evaluated here in `Operand` position by [`eval_owned_operand_answer`], which lets the
+/// answer leave under [`owned_door_answer_may_leave`] (no integer a double cannot hold, no
+/// container while the #2889 embed table is live) instead of under `ResultPosition`. This function's
+/// own `Fresh` rule, which [`closed_expr_to_owned`] and the resolver also read, is unchanged.
 fn eval_owned_pure<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
