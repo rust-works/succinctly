@@ -6473,8 +6473,11 @@ pub fn format_yq_encoder_from_tree<C: DocumentCursor>(
 ) -> Result<String, EvalError> {
     let mut comments = encoder_comments_of_tree(value, tree, 0);
     let original = collect_encoder_comments(pristine, 0);
-    // Only the XML encoder reads the line break a blank line leaves under a block.
-    if matches!(encoder, YqOutputEncoder::Xml(_)) {
+    // Only the XML and properties encoders read the line break a blank line leaves under a block.
+    if matches!(
+        encoder,
+        YqOutputEncoder::Xml(_) | YqOutputEncoder::Props { .. }
+    ) {
         restore_comment_breaks(&mut comments, &original);
     }
     let meta = tree.meta();
