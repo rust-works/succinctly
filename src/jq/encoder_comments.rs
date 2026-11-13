@@ -3,6 +3,9 @@
 //! from the presentation tree a write comes with (`encoder_comments_of_tree`), and consumed by the encoders
 //! that write comments: `-o xml` (`yq_xml`), `-o lua` and the rest.
 
+use alloc::string::String;
+use alloc::vec::Vec;
+
 /// The head, line and foot comment of one node as yq's node holds it: `#` and all, the lines of a
 /// block joined with a line break (go-yaml's `HeadComment`, `LineComment`, `FootComment`).
 #[derive(Debug, Clone, Default)]
