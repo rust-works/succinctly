@@ -156,8 +156,9 @@ pub use eval::{
     FileNamesScope, JqSemantics, MergedMember, QueryResult, SecurityScope, SourcePositionsScope,
     VisibleDef, YqSemantics,
 };
-#[doc(hidden)]
 pub use eval::{eval_full, eval_owned_scalar_fast, eval_reindexed_document, with_stderr_muted};
+#[doc(hidden)]
+pub use eval_generic::format_yq_xml_from_tree;
 // #6925: Go's `strconv.Quote` and `url.QueryUnescape` over bytes, for the CLI's `-p uri`.
 #[doc(hidden)]
 pub use eval::{go_query_unescape, go_quote_bytes};
