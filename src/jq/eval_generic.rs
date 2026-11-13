@@ -499,9 +499,14 @@ fn binary_math_of_document_number<S: EvalSemantics, V: DocumentValue>(
 }
 
 /// Whether `expr` starts with a shape [`crate::jq::eval::eval_owned_fast_path`] can answer: the
-/// arithmetic accumulator, a comparison, `and`/`or`/`not`, a literal, navigation, `type` and
-/// `tostring`, or a pipe that starts with one (#5601). A necessary condition only, so the fast
-/// path still decides; it keeps a stage outside the grammar from paying a failed walk per value.
+/// arithmetic accumulator, a comparison, `and`/`or`/`not`, a literal, navigation, a slice with
+/// literal bounds, `type` and `tostring`, or a pipe that starts with one (#5601). A necessary
+/// condition only, so the fast path still decides; it keeps a stage outside the grammar from paying
+/// a failed walk per value.
+///
+/// #7132: the slice joins the list. Without it `$a | .[5:]` over an array the filter computed
+/// (`[range(n)] as $a`) wrote the array out and indexed it again on every call, 10 ms over 100,000
+/// elements where jq takes 0.05 ms, while the same stage over a document node was already flat.
 fn owned_fast_path_may_answer(expr: &Expr) -> bool {
     match strip_parens(expr) {
         Expr::Pipe(stages) => stages.first().is_some_and(owned_fast_path_may_answer),
@@ -515,6 +520,7 @@ fn owned_fast_path_may_answer(expr: &Expr) -> bool {
         | Expr::Identity
         | Expr::Field(_)
         | Expr::Index { .. }
+        | Expr::Slice { .. }
         | Expr::Builtin(Builtin::Type | Builtin::ToString) => true,
         _ => false,
     }
@@ -28945,7 +28951,8 @@ fn fused_slice_landing<S: EvalSemantics>(
 /// indexing it again for the bridge, as `.[$i]` already is not.
 ///
 /// `pair` is the two stages `.[a:b]` and `read` (the nested pipe `.[a:b][k]` parses to), applied to
-/// `input`. The slice must read the input itself and its bounds must be closed
+/// `input`, either one under a `?` that [`fusable_slice_read`] looks through. The slice must read the
+/// input itself and its bounds must be literals (#7132) or closed
 /// ([`eval_owned_closed`](crate::jq::eval::eval_owned_closed): they never read `.`, so the bridge's answer
 /// does not depend on the input beyond its length). Anything else, a bound that is not exactly
 /// one number, and an input that is not an array decline to the bridge, which re-derives the
@@ -28954,37 +28961,42 @@ pub(crate) fn eval_owned_fused_slice_read<S: EvalSemantics>(
     pair: &[Expr],
     input: &OwnedValue,
 ) -> Option<OwnedValue> {
-    let [Expr::SliceExpr { target, start, end }, _] = pair else {
+    if pair.len() != 2 {
         return None;
-    };
-    let (_, read) = fusable_slice_read(pair)?;
-    if !matches!(**target, Expr::Identity)
-        || (matches!(read, SliceRead::First | SliceRead::Last) && S::TAG != EvalTag::Jq)
-    {
+    }
+    let (slice, read) = fusable_slice_read(pair)?;
+    if matches!(read, SliceRead::First | SliceRead::Last) && S::TAG != EvalTag::Jq {
         return None;
     }
     let OwnedValue::Array(items) = input else {
         return None;
     };
-    let bound = |bound: &Option<Box<Expr>>, round: fn(f64) -> f64| match bound {
-        None => Some(Ok(None)),
-        Some(expr) => {
-            let value = crate::jq::eval::eval_owned_closed::<S>(expr)?;
-            Some(crate::jq::eval::owned_bound_to_i64_for::<S>(&value, round))
+    let (start, end) = match slice {
+        Expr::SliceExpr { target, start, end } if matches!(**target, Expr::Identity) => {
+            let (start, end) = crate::jq::eval::owned_closed_slice_bounds::<S>(start, end)?;
+            crate::jq::eval::resolve_computed_slice_bounds_for::<S>(
+                SliceTargetKind::Sliceable,
+                &start,
+                &end,
+                || Some(items.len()),
+            )
+            .ok()?
         }
+        // #7132: a literal-bounded slice (`.[5:][0]`), whose bounds the parser already folded, as
+        // the cursor route reads it (#4323).
+        Expr::Slice { start, end, .. } => (*start, *end),
+        _ => return None,
     };
-    let (start, end) = (bound(start, f64::floor)?, bound(end, f64::ceil)?);
-    let (start, end) = crate::jq::eval::resolve_computed_slice_bounds_for::<S>(
-        SliceTargetKind::Sliceable,
-        &start,
-        &end,
-        || Some(items.len()),
-    )
-    .ok()?;
     let range = SliceBounds::from_literals(start, end).resolve(items.len());
     Some(match fused_slice_landing::<S>(read, &range)? {
         SliceLanding::Value(owned) => owned,
-        SliceLanding::Element(position) => items.get(position)?.clone(),
+        // A container element shares its storage with `input`, which the #2889 embed table
+        // witnesses while it is live: that read is the evaluator's, as for the `first`/`last`/`nth`
+        // and slice doors (#7132 review).
+        SliceLanding::Element(position) => match items.get(position)? {
+            OwnedValue::Array(_) | OwnedValue::Object(_) if embed_table_active() => return None,
+            element => element.clone(),
+        },
     })
 }
 

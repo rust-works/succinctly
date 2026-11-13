@@ -13479,6 +13479,20 @@ pub(crate) fn eval_each_owned_front_doors<S: EvalSemantics>(
             Demand::Stop => Flow::Stopped { pending: None },
         });
     }
+    // #7132: and the rest of [`eval_owned_value_doors`]: `first`/`last`/`nth`, a slice, a comparison
+    // or boolean over the doors above, and a pipe, an `as`-bound count or an `if` composed of them
+    // (`reduce range(n) as $i (0; $a | nth(5))` bridged once per round). The doors above are spelled
+    // out here rather than read through that function, though they are its first seven
+    // ([`eval_owned_tree_door_stage`], `lazy_front_doors_answer_what_the_value_doors_answer_7132` is
+    // the pin): reached through its `#[inline(never)]` call, a stage they answer cost 10% more per
+    // element on both architectures (`reduce (range(400000) | [., .]) as $p (0; . + $p[0])`, 96 ->
+    // 105 ms on an M4 Pro and 121 -> 132 ms on a 7950X, whose A/A was within 1.5%).
+    if let Some(answer) = eval_owned_value_doors_past_tree::<S>(expr, input) {
+        return Some(match sink(answer) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped { pending: None },
+        });
+    }
     // #5675: an expression that never reads `.` (`$n * 2` once `$n` is a literal, `1 + 2`,
     // `[1, 2]`) is one value whatever the input is, so the input is not written out and indexed to
     // find it. [`eval_owned_closed`] declines whatever errors, fans out or hands on a bound node.
@@ -94026,26 +94040,50 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     eval_owned_input_bridge::<W, S>(&reentry.reroot::<S>(expr), input, optional)
 }
 
-/// The stages [`eval_each_owned_front_doors`] answers from the owned tree with one value (a count, a
-/// verdict, a key list, a projection, a construction of static reads, a fold of numbers, a string
-/// stage), in its order, for [`eval_owned_input`] (#7132). Each declines whatever it
-/// would raise, fan out or hand back as a bound node, so the bridge keeps its errors, its `?`
-/// suppression and its per-mode rules. The multi-output door (`.children[]?`) is the lazy twin's alone.
-/// A shape added to that list is added here too: `eval_owned_value_doors_agree_with_the_bridge_7132` is
-/// the pin.
+/// The stages answered from the owned tree with one value (a count, a verdict, a key list, a
+/// projection, a construction of static reads, a fold of numbers, a string stage, `first`/`last`/`nth`,
+/// a slice), and the pipes, binds and `if`s composed of them (#7132): the one list
+/// [`eval_owned_input`] and the generic evaluator's owned entry read, and [`eval_each_owned_front_doors`]
+/// reads in two halves (see [`eval_owned_value_doors_past_tree`]). Each declines whatever it would
+/// raise, fan out or hand back as a bound node, so the bridge keeps its errors, its `?` suppression and
+/// its per-mode rules. The multi-output door (`.children[]?`) is the lazy twin's alone.
+/// `eval_owned_value_doors_agree_with_the_bridge_7132` is the pin.
 #[inline(never)]
 pub(crate) fn eval_owned_value_doors<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
 ) -> Option<OwnedValue> {
     eval_owned_value_door_stage::<S>(expr, input)
-        .or_else(|| eval_owned_door_pipe::<S>(expr, input))
-        .or_else(|| eval_owned_door_bind::<S>(expr, input))
-        .or_else(|| eval_owned_door_if::<S>(expr, input))
+        .or_else(|| eval_owned_composed_doors::<S>(expr, input))
+}
+
+/// [`eval_owned_value_doors`] past its first seven doors ([`eval_owned_tree_door_stage`]), which
+/// [`eval_each_owned_front_doors`] spells out ahead of this call (#7132): the read doors and the
+/// composed ones.
+#[inline(never)]
+fn eval_owned_value_doors_past_tree<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    eval_owned_read_door_stage::<S>(expr, input)
+        .or_else(|| eval_owned_composed_doors::<S>(expr, input))
 }
 
 /// [`eval_owned_value_doors`]'s lone stages.
+#[inline]
 fn eval_owned_value_door_stage<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    eval_owned_tree_door_stage::<S>(expr, input)
+        .or_else(|| eval_owned_read_door_stage::<S>(expr, input))
+}
+
+/// The lone stages [`eval_each_owned_front_doors`] has always answered, in its order: a count, a
+/// projection, a construction of static reads, a key list or `has`, a fold or map of numbers, a string
+/// stage.
+#[inline]
+fn eval_owned_tree_door_stage<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
 ) -> Option<OwnedValue> {
@@ -94056,7 +94094,30 @@ fn eval_owned_value_door_stage<S: EvalSemantics>(
         .or_else(|| eval_owned_number_fold::<S>(expr, input))
         .or_else(|| super::eval_generic::eval_owned_number_map::<S>(expr, input))
         .or_else(|| eval_owned_string_stage::<S>(expr, input))
-        .or_else(|| eval_owned_first_last_nth::<S>(expr, input))
+}
+
+/// The lone stages #7132 added: `first`/`last`/`nth`, a slice, and a comparison or boolean over the
+/// tree doors' answers.
+#[inline]
+fn eval_owned_read_door_stage<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    // The shape is tested here, inline, so the common stage that is neither (once per element on the
+    // generic route) never calls either door.
+    // The door is handed the stage with its parentheses off, as it is tested: `(first)` is `first`.
+    let shape = unwrap_paren(expr);
+    let read = match shape {
+        Expr::Builtin(Builtin::First | Builtin::Last | Builtin::Nth(_)) => {
+            eval_owned_first_last_nth::<S>(shape, input)
+        }
+        Expr::Slice { .. }
+        | Expr::SliceExpr { .. }
+        | Expr::Try { catch: None, .. }
+        | Expr::Optional(_) => eval_owned_slice_door::<S>(expr, input),
+        _ => None,
+    };
+    read
         // A comparison or a boolean over such counts and keys (`length > 5`, `has(5) and length > 2`),
         // as `select` and `until` read one: only an answer is taken, an operand that raises or fans
         // out is the bridge's.
@@ -94068,6 +94129,22 @@ fn eval_owned_value_door_stage<S: EvalSemantics>(
         )
 }
 
+/// [`eval_owned_value_doors`]'s compositions of its lone stages: a pipe, an `as`-bound count, an `if`.
+/// Dispatched on the expression's kind, so a stage that is none of them (the common decline, once per
+/// element on the generic route) costs one match and not three calls.
+#[inline]
+fn eval_owned_composed_doors<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    match unwrap_paren(expr) {
+        Expr::Pipe(_) => eval_owned_door_pipe::<S>(expr, input),
+        Expr::As { .. } => eval_owned_door_bind::<S>(expr, input),
+        Expr::If { .. } => eval_owned_door_if::<S>(expr, input),
+        _ => None,
+    }
+}
+
 /// A pipe of stages that each answer one value from the owned tree, the answer of one the input of the next
 /// (`length | tostring`, `has(0) | not`, `first | tostring`), for [`eval_owned_value_doors`] (#7132). Every
 /// stage must be answered, by a door or by `tostring` (the fast path's own arm), or the whole pipe is the
@@ -94077,8 +94154,12 @@ fn eval_owned_door_pipe<S: EvalSemantics>(expr: &Expr, input: &OwnedValue) -> Op
         return None;
     };
     let stages = skip_identity_stages(stages);
-    if stages.len() < 2 {
-        return None;
+    match stages {
+        [] => return None,
+        // A pipe of one stage (`Pipe([if ...])`, `. | first`) is that stage, and answers as it does
+        // (#7132), so a lone stage and the pipe around it read alike (#3673).
+        [only] => return eval_owned_value_doors::<S>(only, input),
+        _ => {}
     }
     let mut current: Option<OwnedValue> = None;
     for stage in stages {
@@ -94192,6 +94273,69 @@ fn eval_owned_first_last_nth<S: EvalSemantics>(
         Ok(Some(element)) => Some(element),
         _ => None,
     }
+}
+
+/// A slice of an owned array or string itself (#7132): `.[5:]`, `.[$i:]` once the loop has put its
+/// variable in, and either one under `?`. The literal-bound spelling is the cut
+/// [`eval_owned_fast_path`] makes (#6258); this door adds the closed computed bounds and the `?`, and
+/// is reached from the lazy twin and the generic evaluator's owned entry, which do not offer the fast
+/// path a container. A bound is evaluated as the evaluator's slice route evaluates it (floor for the
+/// start, ceil for the end), and only a slice that answers is taken: a bound that raises, or is not a
+/// number, and every other target is the bridge's, with its error text and its `?` suppression.
+///
+/// jq mode only, and never while the #2889 embed table is live: the elements of the slice share their
+/// storage with `input`, which the table witnesses, as for [`eval_owned_first_last_nth`].
+fn eval_owned_slice_door<S: EvalSemantics>(expr: &Expr, input: &OwnedValue) -> Option<OwnedValue> {
+    // A slice of an array or a string never raises, so under `?` it is the same answer. The shape
+    // first: it is the cheapest test, and the one most stages fail.
+    let slice = match unwrap_paren(expr) {
+        Expr::Try { expr, catch: None } | Expr::Optional(expr) => unwrap_paren(expr),
+        other => other,
+    };
+    if S::TAG != EvalTag::Jq
+        || !matches!(slice, Expr::Slice { .. } | Expr::SliceExpr { .. })
+        || !matches!(input, OwnedValue::Array(_) | OwnedValue::String(_))
+        || super::eval_generic::embed_table_active()
+    {
+        return None;
+    }
+    let answer = match slice {
+        Expr::Slice { start, end, .. } => slice_owned_value_read::<S>(input, *start, *end, false),
+        Expr::SliceExpr { target, start, end }
+            if matches!(unwrap_paren(target), Expr::Identity) =>
+        {
+            let (start, end) = owned_closed_slice_bounds::<S>(start, end)?;
+            if start.is_err() || end.is_err() {
+                return None;
+            }
+            slice_owned_value_read_computed::<S>(input, &start, &end, false)
+        }
+        _ => return None,
+    };
+    match answer {
+        Ok(Some(sliced)) => Some(sliced),
+        _ => None,
+    }
+}
+
+/// The bounds of a computed slice (`.[$i:]`, `.[(1 + 0):]`) whose bound expressions read no `.`
+/// (#7132), evaluated as the evaluator's slice route evaluates them: floor for the start, ceil for
+/// the end, under the mode's own bound grammar ([`owned_bound_to_i64_for`]). `None` is a bound
+/// that is not closed, or that does not evaluate to one value: the evaluator's. An absent bound is
+/// `Ok(None)`. The owned slice door and the fused slice read (#4286) both take their bounds here,
+/// so the rule has one spelling.
+pub(crate) fn owned_closed_slice_bounds<S: EvalSemantics>(
+    start: &Option<Box<Expr>>,
+    end: &Option<Box<Expr>>,
+) -> Option<(ComputedSliceBound, ComputedSliceBound)> {
+    let bound = |bound: &Option<Box<Expr>>, round: fn(f64) -> f64| match bound {
+        None => Some(Ok(None)),
+        Some(expr) => Some(owned_bound_to_i64_for::<S>(
+            &eval_owned_closed::<S>(expr)?,
+            round,
+        )),
+    };
+    Some((bound(start, f64::floor)?, bound(end, f64::ceil)?))
 }
 
 /// [`eval_owned_input`]'s bridge alone, no fast path and no demotion: build
@@ -131214,12 +131358,9 @@ mod tests {
         }
     }
 
-    /// #7132: the single-value doors `eval_owned_input` takes before its bridge answer what the bridge
-    /// does, in each mode, for `first`, `last`, `nth`, `has`, `keys` and a comparison or boolean over
-    /// them and a count, over every kind of value; a shape a door must not take (a negative or
-    /// computed `nth`, a read that raises) declines.
-    #[test]
-    fn eval_owned_value_doors_agree_with_the_bridge_7132() {
+    /// The bound values the #7132 door tests run over: [`pure_value_matrix`] and the containers a door
+    /// reads, without an owned `Int` no program can hold.
+    fn value_door_matrix_7132() -> Vec<OwnedValue> {
         let mut values = pure_value_matrix();
         values.push(OwnedValue::array_from(vec![]));
         values.push(OwnedValue::object_from(Vec::<(String, OwnedValue)>::new()));
@@ -131245,44 +131386,74 @@ mod tests {
             }
         }
         values.retain(|value| !holds_unspellable_int(value));
-        let sources = [
-            "first",
-            "last",
-            "nth(0)",
-            "nth(1)",
-            "nth(5)",
-            "nth(-1)",
-            "nth(1.5)",
-            "nth(1; .[])",
-            "has(0)",
-            "has(5)",
-            "has(-1)",
-            "has(\"a\")",
-            "keys",
-            "length > 2",
-            "length == 0",
-            "length - 1 > 0",
-            "length > 1 and has(0)",
-            "first == 1",
-            "not",
-            "[first]",
-            "length | tostring",
-            "has(0) | not",
-            "first | tostring",
-            "keys | length",
-            "length | . > 1",
-            "length as $n | $n",
-            "length as $n | $n + 1",
-            "length as $n | $n > 1",
-            "has(0) as $h | $h",
-            "if length > 1 then 1 else 0 end",
-            "if has(0) then first else last end",
-            "if length > 5 then \"big\" else . end",
-            "if first == 1 then 1 else 2 end",
-            "if length > 1 then error(\"x\") else 2 end",
-            "first | length",
-            "tostring | length",
-        ];
+        values.push(OwnedValue::String("h\u{e9}llo".into()));
+        values
+    }
+
+    /// The stages the #7132 door tests run.
+    const VALUE_DOOR_SOURCES_7132: &[&str] = &[
+        "first",
+        "last",
+        "nth(0)",
+        "nth(1)",
+        "nth(5)",
+        "nth(-1)",
+        "nth(1.5)",
+        "nth(1; .[])",
+        "has(0)",
+        "has(5)",
+        "has(-1)",
+        "has(\"a\")",
+        "keys",
+        "length > 2",
+        "length == 0",
+        "length - 1 > 0",
+        "length > 1 and has(0)",
+        "first == 1",
+        "not",
+        "[first]",
+        "length | tostring",
+        "has(0) | not",
+        "first | tostring",
+        "keys | length",
+        "length | . > 1",
+        "length as $n | $n",
+        "length as $n | $n + 1",
+        "length as $n | $n > 1",
+        "has(0) as $h | $h",
+        "if length > 1 then 1 else 0 end",
+        "if has(0) then first else last end",
+        "if length > 5 then \"big\" else . end",
+        "if first == 1 then 1 else 2 end",
+        "if length > 1 then error(\"x\") else 2 end",
+        "first | length",
+        "tostring | length",
+        ".[1:]",
+        ".[:1]",
+        ".[-2:]",
+        ".[1:2]",
+        ".[5:]",
+        ".[1:]?",
+        "try .[1:]",
+        ".[(1 + 0):]",
+        ".[:(0.5 + 1)]",
+        ".[1.5:]",
+        ".[null:2]",
+        ".[\"a\":]",
+        ".[[1]:]",
+        ".[1:] | length",
+        ".[1:] | first",
+        "length > 1 and .[1:] == []",
+    ];
+
+    /// #7132: the single-value doors `eval_owned_input` takes before its bridge answer what the bridge
+    /// does, in each mode, for `first`, `last`, `nth`, `has`, `keys` and a comparison or boolean over
+    /// them and a count, over every kind of value; a shape a door must not take (a negative or
+    /// computed `nth`, a read that raises) declines.
+    #[test]
+    fn eval_owned_value_doors_agree_with_the_bridge_7132() {
+        let values = value_door_matrix_7132();
+        let sources = VALUE_DOOR_SOURCES_7132;
         let mut answered = 0;
         for value in &values {
             for src in sources {
@@ -131317,6 +131488,81 @@ mod tests {
         // `first` and `last` are jq's: yq gates them (#1512).
         let first = parse("first").unwrap();
         assert!(eval_owned_first_last_nth::<YqSemantics>(&first, &array).is_none());
+        // Parentheses are spelling (#7132 review): `(first)` is answered as `first` is.
+        for (src, answer) in [("(first)", 1), ("((last))", 2), ("(nth(1))", 2)] {
+            assert_eq!(
+                eval_owned_value_doors::<JqSemantics>(&parse(src).unwrap(), &array),
+                Some(OwnedValue::Int(answer)),
+                "{src}"
+            );
+        }
+        // A slice is answered for an array or a string, in jq mode, with bounds that resolve; a bound
+        // that is not a number, a target of any other kind and yq mode are the bridge's.
+        let slice = parse(".[1:]").unwrap();
+        assert_eq!(
+            eval_owned_slice_door::<JqSemantics>(&slice, &array),
+            Some(OwnedValue::array_from(vec![OwnedValue::Int(2)]))
+        );
+        assert_eq!(eval_owned_slice_door::<YqSemantics>(&slice, &array), None);
+        for target in [
+            OwnedValue::Null,
+            OwnedValue::Int(1),
+            OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]),
+        ] {
+            assert_eq!(eval_owned_slice_door::<JqSemantics>(&slice, &target), None);
+        }
+        for src in [
+            ".[\"a\":]",
+            ".[[1]:]",
+            ".[:{}]",
+            ".[.:]",
+            ".[1:][0]",
+            "(.[1:], .[2:])",
+        ] {
+            let expr = parse(src).unwrap();
+            assert_eq!(
+                eval_owned_slice_door::<JqSemantics>(&expr, &array),
+                None,
+                "{src}"
+            );
+        }
+    }
+
+    /// #7132: [`eval_each_owned_front_doors`] spells out the first seven value doors and then asks
+    /// [`eval_owned_value_doors_past_tree`] for the rest, so whatever [`eval_owned_value_doors`]
+    /// answers, the lazy twin answers too, with the same one value, in both modes. The pin for the two
+    /// spellings of one list: a door added to the shared list and not to the lazy one fails here.
+    #[test]
+    fn lazy_front_doors_answer_what_the_value_doors_answer_7132() {
+        fn check<S: EvalSemantics>(expr: &Expr, value: &OwnedValue, src: &str) -> bool {
+            let Some(door) = eval_owned_value_doors::<S>(expr, value) else {
+                return false;
+            };
+            let mut out = Vec::new();
+            let flow = eval_each_owned_front_doors::<S>(expr, value, false, &mut |v| {
+                out.push(v);
+                Demand::Continue
+            });
+            assert!(
+                matches!(flow, Some(Flow::Exhausted)),
+                "{src:?} on {value:?}: the lazy doors declined"
+            );
+            let rendered: Vec<String> = out.iter().map(OwnedValue::to_json).collect();
+            assert_eq!(rendered, vec![door.to_json()], "{src:?} on {value:?}");
+            true
+        }
+        let mut answered = 0;
+        for value in &value_door_matrix_7132() {
+            for src in VALUE_DOOR_SOURCES_7132 {
+                let expr = parse(src).unwrap();
+                answered += usize::from(check::<JqSemantics>(&expr, value, src));
+                answered += usize::from(check::<YqSemantics>(&expr, value, src));
+            }
+        }
+        assert!(
+            answered > 100,
+            "the matrix must reach the doors: {answered}"
+        );
     }
 
     /// #5816: `test`, `index`, `rindex` and `inside` of a string by a string literal are answered
@@ -132009,7 +132255,8 @@ mod tests {
     /// #4286: `eval_owned_fused_slice_read` answers `.[a:b] | read` over an owned array the way the
     /// reindex bridge does, in both modes, and declines every shape it does not model. The bounds
     /// are closed expressions that keep the stage on `Expr::SliceExpr` (a literal bound would fold
-    /// to the static `Expr::Slice`), so the fused read is what answers, not the literal route.
+    /// to the static `Expr::Slice`), so the fused read is what answers, not the literal route, and
+    /// (#7132) literal ones, which the fused read takes too.
     #[test]
     fn eval_owned_fused_slice_read_agrees_with_the_reindex_bridge_4286() {
         let mut values = pure_value_matrix();
@@ -132035,9 +132282,19 @@ mod tests {
             ":(1.5+0)",
             "(0+null):",
             "(\"x\"|ascii_downcase):",
+            // #7132: literal bounds, which fold to the static `Expr::Slice`.
+            "1:",
+            ":1",
+            "0:2",
+            "2:1",
+            "-2:",
+            ":-1",
+            "9:",
         ];
         let reads = [
             "[0]", "[1]", "[2]", "[-1]", "[-2]", "[9]", "| length", "| first", "| last",
+            // #7132: a `?` on either stage is looked through.
+            "?[0]", "[0]?", "?[-1]",
         ];
         for value in &values {
             for bound in bounds {
@@ -132128,6 +132385,46 @@ mod tests {
                 crate::jq::eval_generic::eval_owned_fused_slice_read::<JqSemantics>(stages, &value)
                     .is_none(),
                 "{value:?}"
+            );
+        }
+    }
+
+    /// #7132 review: a container element `eval_owned_fused_slice_read` reads shares its storage
+    /// with the array, which a live #2889 embed table witnesses, so with a binding in scope that read
+    /// is the evaluator's, as for the `first`/`last`/`nth` and slice doors; a scalar element is still
+    /// answered, and with the table gone the container is too. `std` only: without it there is no
+    /// table to make live.
+    #[cfg(feature = "std")]
+    #[test]
+    fn eval_owned_fused_slice_read_leaves_a_container_to_a_live_embed_table_7132() {
+        let nested = OwnedValue::array_from(vec![
+            OwnedValue::array_from(vec![OwnedValue::Int(1)]),
+            OwnedValue::Int(2),
+        ]);
+        let fused = |src: &str| {
+            let Expr::Pipe(stages) = parse(src).unwrap() else {
+                panic!("{src}: not a pipe");
+            };
+            crate::jq::eval_generic::eval_owned_fused_slice_read::<JqSemantics>(&stages, &nested)
+        };
+        let origin = BindOrigin::Node {
+            node: 1,
+            document: 9,
+        };
+        let mut bound = OwnedValue::array_from(vec![OwnedValue::Int(1)]);
+        let guard =
+            super::super::eval_generic::embed_table_push::<JqSemantics>(Some(&origin), &mut bound)
+                .expect("a container bind");
+        for src in [".[0:][0]", ".[(0+0):][0]"] {
+            assert_eq!(fused(src), None, "{src} with the table live");
+        }
+        assert_eq!(fused(".[1:][0]"), Some(OwnedValue::Int(2)));
+        drop(guard);
+        for src in [".[0:][0]", ".[(0+0):][0]"] {
+            assert_eq!(
+                fused(src),
+                Some(OwnedValue::array_from(vec![OwnedValue::Int(1)])),
+                "{src}"
             );
         }
     }
@@ -157372,6 +157669,9 @@ mod tests {
             ("if length == 2 then empty else . end", 1),
             ("select(length == 1) | select(length == 1)", 1),
             ("if length == 1 then . else empty end | length", 1),
+            // #7132: an `if` over a count whose branch is `.` or a literal is the value doors'.
+            ("if length == 1 then . else 2 end", 1),
+            ("if length == 1 then 1 else empty end", 1),
             (".[0] // empty", 1),
             (".[1] // empty", 0),
         ] {
@@ -157382,8 +157682,7 @@ mod tests {
         // is computed still go to the bridge, which answers them as before.
         for src in [
             "if (length, 2) == 1 then . else empty end",
-            "if length == 1 then . else 2 end",
-            "if length == 1 then 1 else empty end",
+            "if length == 1 then .[0] else empty end",
             "error(.)?",
             "try error(\"x\") catch empty",
             "1, empty",
