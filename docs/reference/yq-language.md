@@ -830,7 +830,7 @@ same kind of thing as the rest of this table — extra, off by default.
 | Flag                  | Description                                                    |
 |-----------------------|----------------------------------------------------------------|
 | `-n, --null-input`    | Don't read input; use null                                     |
-| `-p, --input-format`  | Input format: `auto`, `yaml`, `json`, `props`, `csv`, `tsv`, `ini`, `kyaml`, `base64`, `uri` |
+| `-p, --input-format`  | Input format: `auto`, `yaml`, `json`, `props`, `csv`, `tsv`, `ini`, `kyaml`, `xml`, `base64`, `uri` |
 | `-s, --slurp`         | Read all inputs into array                                     |
 | `-R, --raw-input`     | Read lines as strings instead of YAML                          |
 | `--doc N`             | Select Nth document (0-indexed)                                |

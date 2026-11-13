@@ -1247,6 +1247,10 @@ pub enum InputFormat {
     /// KYAML, which yq reads with its YAML decoder and prints, by extension, as KYAML (#6925)
     #[value(name = "kyaml", alias = "ky")]
     Kyaml,
+    /// XML as yq's decoder reads it over Go's `encoding/xml`: an element a mapping, attributes under
+    /// `--xml-attribute-prefix`, text under `--xml-content-name`, every value a string (#6925)
+    #[value(name = "xml", alias = "x")]
+    Xml,
 }
 
 /// Front matter handling mode for `--front-matter`
@@ -1474,6 +1478,69 @@ pub struct YqCommand {
     /// Write a string key that is a Lua name unquoted in `-o=lua` (#6924)
     #[arg(long = "lua-unquoted", overrides_with = "lua_unquoted")]
     pub lua_unquoted: bool,
+
+    /// Keep the namespace prefix of an element and an attribute name when `-p xml` reads them, as
+    /// yq's `--xml-keep-namespace` (default true) (#6925)
+    #[arg(
+        long = "xml-keep-namespace",
+        overrides_with = "xml_keep_namespace",
+        value_parser = parse_go_bool,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value = "true"
+    )]
+    pub xml_keep_namespace: bool,
+
+    /// Read `-p xml` with Go's `RawToken` (no end-tag matching, no namespace translation), as yq's
+    /// `--xml-raw-token` (default true) (#6925)
+    #[arg(
+        long = "xml-raw-token",
+        overrides_with = "xml_raw_token",
+        value_parser = parse_go_bool,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value = "true"
+    )]
+    pub xml_raw_token: bool,
+
+    /// Skip the directives (`<!DOCTYPE ...>`) when `-p xml` reads (#6925)
+    #[arg(
+        long = "xml-skip-directives",
+        overrides_with = "xml_skip_directives",
+        value_parser = parse_go_bool,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value = "false"
+    )]
+    pub xml_skip_directives: bool,
+
+    /// Skip the processing instructions (`<?xml ...?>`) when `-p xml` reads (#6925)
+    #[arg(
+        long = "xml-skip-proc-inst",
+        overrides_with = "xml_skip_proc_inst",
+        value_parser = parse_go_bool,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value = "false"
+    )]
+    pub xml_skip_proc_inst: bool,
+
+    /// Read `-p xml` as Go's strict decoder does: an unknown entity, an unquoted attribute value
+    /// and a mismatched end tag are errors (#6925)
+    #[arg(
+        long = "xml-strict-mode",
+        overrides_with = "xml_strict_mode",
+        value_parser = parse_go_bool,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value = "false"
+    )]
+    pub xml_strict_mode: bool,
 
     /// Prefix of a key that is an attribute in `-o=xml` (#6924)
     #[arg(

@@ -58,6 +58,8 @@ mod input_csv;
 mod input_decode;
 mod input_ini;
 mod input_props;
+mod input_xml;
+mod input_xml_tables;
 use go_yaml_color::YamlColorizer;
 use input_decode::{TranscodeOptions, TranscodedInput};
 use succinctly::text::stream_region::{current_region, StreamRegion};
@@ -900,6 +902,7 @@ fn resolve_output_format(output_format: OutputFormat, input_format: InputFormat)
         InputFormat::Csv => OutputFormat::Csv,
         InputFormat::Tsv => OutputFormat::Tsv,
         InputFormat::Ini => OutputFormat::Ini,
+        InputFormat::Xml => OutputFormat::Xml,
     }
 }
 
@@ -1563,6 +1566,10 @@ static TSV_AUTO_PARSE: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 static INI_PRESERVE_QUOTES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// The flags `-p xml` reads (#6925), set once from the arguments.
+static XML_INPUT_OPTIONS: std::sync::Mutex<Option<input_xml::XmlOptions>> =
+    std::sync::Mutex::new(None);
+
 /// Whether an empty input reads as a document: under a string format it is the empty string.
 fn empty_input_is_transcoded_document() -> bool {
     transcoded_input().is_some_and(TranscodedInput::empty_is_document)
@@ -1574,21 +1581,29 @@ fn empty_input_is_transcoded_document() -> bool {
 fn decode_transcoded_input(raw: Vec<u8>, name: &str) -> Result<Vec<u8>> {
     match transcoded_input() {
         None => Ok(raw),
-        Some(format) => format
-            .transcode(
-                &raw,
-                &TranscodeOptions {
-                    array_brackets: PROPS_ARRAY_BRACKETS.load(std::sync::atomic::Ordering::SeqCst),
-                    csv_separator: char::from(
-                        CSV_SEPARATOR.load(std::sync::atomic::Ordering::SeqCst),
-                    ),
-                    csv_auto_parse: CSV_AUTO_PARSE.load(std::sync::atomic::Ordering::SeqCst),
-                    tsv_auto_parse: TSV_AUTO_PARSE.load(std::sync::atomic::Ordering::SeqCst),
-                    ini_preserve_quotes: INI_PRESERVE_QUOTES
-                        .load(std::sync::atomic::Ordering::SeqCst),
-                },
-            )
-            .map_err(|message| anyhow::anyhow!("bad file '{name}': {message}")),
+        Some(format) => {
+            let xml = XML_INPUT_OPTIONS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            format
+                .transcode(
+                    &raw,
+                    &TranscodeOptions {
+                        xml: xml.as_ref(),
+                        array_brackets: PROPS_ARRAY_BRACKETS
+                            .load(std::sync::atomic::Ordering::SeqCst),
+                        csv_separator: char::from(
+                            CSV_SEPARATOR.load(std::sync::atomic::Ordering::SeqCst),
+                        ),
+                        csv_auto_parse: CSV_AUTO_PARSE.load(std::sync::atomic::Ordering::SeqCst),
+                        tsv_auto_parse: TSV_AUTO_PARSE.load(std::sync::atomic::Ordering::SeqCst),
+                        ini_preserve_quotes: INI_PRESERVE_QUOTES
+                            .load(std::sync::atomic::Ordering::SeqCst),
+                    },
+                )
+                .map_err(|message| anyhow::anyhow!("bad file '{name}': {message}"))
+        }
     }
 }
 
@@ -2620,6 +2635,7 @@ fn parse_input(bytes: &[u8], format: InputFormat, after_bom: bool) -> Result<Vec
         | InputFormat::Csv
         | InputFormat::Tsv
         | InputFormat::Ini
+        | InputFormat::Xml
         | InputFormat::Kyaml => {
             // Parse as YAML (Auto defaults to YAML when no extension hint)
             let mut index = build_yq_source(bytes, after_bom)
@@ -12375,6 +12391,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             Some(TranscodedInput::Csv) if by_extension => OutputFormat::Csv,
             Some(TranscodedInput::Tsv) if by_extension => OutputFormat::Tsv,
             Some(TranscodedInput::Ini) if by_extension => OutputFormat::Ini,
+            Some(TranscodedInput::Xml) if by_extension => OutputFormat::Xml,
             Some(_) => OutputFormat::Yaml,
             None if json_input && !nothing_to_match => OutputFormat::Json,
             None if kyaml_input => OutputFormat::Kyaml,
@@ -12398,6 +12415,19 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         args.ini_preserve_quotes,
         std::sync::atomic::Ordering::SeqCst,
     );
+    *XML_INPUT_OPTIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(input_xml::XmlOptions {
+        attribute_prefix: args.xml_attribute_prefix.clone(),
+        content_name: args.xml_content_name.clone(),
+        proc_inst_prefix: args.xml_proc_inst_prefix.clone(),
+        directive_name: args.xml_directive_name.clone(),
+        keep_namespace: args.xml_keep_namespace,
+        raw_token: args.xml_raw_token,
+        skip_directives: args.xml_skip_directives,
+        skip_proc_inst: args.xml_skip_proc_inst,
+        strict: args.xml_strict_mode,
+    });
 
     // `--unwrapScalar` as yq resolves it (#7093): its own value when given, else true for YAML and
     // properties output and false for every other. `raw_output` is the "given as true" the output
@@ -12463,6 +12493,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             content_name: args.xml_content_name.clone(),
             proc_inst_prefix: args.xml_proc_inst_prefix.clone(),
             directive_name: args.xml_directive_name.clone(),
+            empty_null: string_format == Some(TranscodedInput::Xml),
         }))),
         OutputFormat::Yaml | OutputFormat::Json | OutputFormat::Auto => None,
     };
