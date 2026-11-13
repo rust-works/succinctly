@@ -352,6 +352,7 @@ Two operators behave differently under `--eval-all` than they do per document, a
 
 - **`[E]` collects across the whole list**: `--eval-all '[.]'` is one array of every document. Anything that builds a new node clears the flag, so `--eval-all '.name | [.]'` is back to one array per document.
 - **A binary operator runs both operands over the whole list** and emits every pairing: `--eval-all '. + {"z": 9}'` on two files prints four documents.
+- **`//` runs both operands over the whole list** too (#7173): a truthy left output is kept, any other is replaced by every output of the right side over the list, so `--eval-all '.a // 5'` on three files of which one has `a` prints `1` and then six `5`.
 
 `file_index`/`fileIndex`/`fi` returns the 0-indexed origin file position, and `document_index`/`documentIndex`/`di` the document's index within that file. Both answer on the ordinary multi-file path too, not just under `--eval-all`.
 
