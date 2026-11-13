@@ -71,3 +71,71 @@ fn eval_all_arithmetic_keeps_the_left_operands_flag_6973() -> Result<()> {
     }
     Ok(())
 }
+
+/// The `document_index` and `file_index` of a comparison's boolean (#6973): `createBooleanCandidate` makes it
+/// from the left node, so it keeps where that was read, unless the left node is one of the list's own, which
+/// gives it none (`. == . | document_index` is all `0`, `.x == 1 | document_index` is each document's own).
+/// A union left operand that mixes reads and literals still differs. `md` is the file above, `three` is three
+/// files of `x: 1`/`y: 1`, `x: 2`/`y: 3` then `x: 1`/`y: 1`, and `x: 3`.
+#[rustfmt::skip]
+const COMPARISON_ROWS: &[(&str, &str, &str)] = &[
+    ("md", ".x == 1 | di", "0\n0\n1\n1\n"),
+    ("md", ". == . | di", "0\n0\n0\n0\n"),
+    ("md", ". == 1 | di", "0\n0\n0\n0\n"),
+    ("md", "1 == . | di", "0\n0\n0\n0\n"),
+    ("md", ".x == .y | di", "0\n0\n1\n1\n"),
+    ("md", ".x != 1 | di", "0\n0\n1\n1\n"),
+    ("md", ".x < 5 | di", "0\n0\n1\n1\n"),
+    ("md", ". != . | di", "0\n0\n0\n0\n"),
+    ("md", ".x == 1 | fi", "0\n0\n0\n0\n"),
+    ("md", ".x == .y | fi", "0\n0\n0\n0\n"),
+    ("md", ".x >= 1 | di", "0\n0\n1\n1\n"),
+    ("md", ".zz == 1 | di", "0\n0\n1\n1\n"),
+    ("md", ".x == 1 | [.]", "[true]\n[true]\n[false]\n[false]\n"),
+    ("md", "(. == .) | [.]", "[false]\n[false]\n[false]\n[false]\n"),
+    ("three", ".x == 1 | di", "0\n0\n0\n0\n0\n0\n0\n0\n1\n1\n1\n1\n0\n0\n0\n0\n"),
+    ("three", ". == . | di", "0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n"),
+    ("three", ". == 1 | di", "0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n"),
+    ("three", "1 == . | di", "0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n"),
+    ("three", ".x == .y | di", "0\n0\n0\n0\n0\n0\n0\n0\n1\n1\n1\n1\n0\n0\n0\n0\n"),
+    ("three", ".x != 1 | di", "0\n0\n0\n0\n0\n0\n0\n0\n1\n1\n1\n1\n0\n0\n0\n0\n"),
+    ("three", ".x < 5 | di", "0\n0\n0\n0\n0\n0\n0\n0\n1\n1\n1\n1\n0\n0\n0\n0\n"),
+    ("three", ". != . | di", "0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n"),
+    ("three", ".x == 1 | fi", "0\n0\n0\n0\n1\n1\n1\n1\n1\n1\n1\n1\n2\n2\n2\n2\n"),
+    ("three", ".x == .y | fi", "0\n0\n0\n0\n1\n1\n1\n1\n1\n1\n1\n1\n2\n2\n2\n2\n"),
+    ("three", ".x >= 1 | di", "0\n0\n0\n0\n0\n0\n0\n0\n1\n1\n1\n1\n0\n0\n0\n0\n"),
+    ("three", ".zz == 1 | di", "0\n0\n0\n0\n0\n0\n0\n0\n1\n1\n1\n1\n0\n0\n0\n0\n"),
+    ("three", ".x == 1 | [.]", "[true]\n[true]\n[true]\n[true]\n[false]\n[false]\n[false]\n[false]\n[true]\n[true]\n[true]\n[true]\n[false]\n[false]\n[false]\n[false]\n"),
+    ("three", "(. == .) | [.]", "[false]\n[false]\n[false]\n[false]\n[false]\n[false]\n[false]\n[false]\n[false]\n[false]\n[false]\n[false]\n[false]\n[false]\n[false]\n[false]\n"),
+];
+
+#[test]
+fn eval_all_comparison_keeps_the_left_reads_origin_6973() -> Result<()> {
+    let dir = TempDir::new()?;
+    let md = dir.path().join("md.yaml");
+    std::fs::write(&md, text("md"))?;
+    let three: Vec<std::path::PathBuf> =
+        ["x: 1\ny: 1\n", "x: 2\ny: 3\n---\nx: 1\ny: 1\n", "x: 3\n"]
+            .iter()
+            .enumerate()
+            .map(|(i, body)| {
+                let path = dir.path().join(format!("m{}.yaml", i + 1));
+                std::fs::write(&path, body)?;
+                Ok(path)
+            })
+            .collect::<Result<_>>()?;
+    for &(which, filter, expected) in COMPARISON_ROWS {
+        let paths: Vec<&std::path::Path> = if which == "md" {
+            vec![md.as_path()]
+        } else {
+            three.iter().map(std::path::PathBuf::as_path).collect()
+        };
+        let (stdout, stderr, status) = run_yq_files(filter, &paths, &["ea", "-o=json", "-I=0"])?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), status),
+            (expected, "", 0),
+            "{filter} over {which}"
+        );
+    }
+    Ok(())
+}

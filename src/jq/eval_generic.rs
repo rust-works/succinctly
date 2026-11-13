@@ -24028,8 +24028,10 @@ fn cross_together<S: EvalSemantics, V: DocumentValue>(
     // node (`lhs.Copy()`), so it carries that node's flag, which a node the left operand built or
     // navigated to does not have. Both are read as each left output arrives.
     let (left_expr, keeps_left_origin, tracks_left) = match stage {
-        Expr::Compare { left, .. } => (&**left, false, false),
-        Expr::Arithmetic { left, right, .. } => {
+        // A comparison's boolean is created from the left node (`createBooleanCandidate`), which
+        // gives it that node's origin, but not the flag, and not when the left node is one of the
+        // list's own (#6973).
+        Expr::Compare { left, right, .. } | Expr::Arithmetic { left, right, .. } => {
             let settled = settles_both(left, right);
             (&**left, yq_operand_keeps_origin(left) && !settled, !settled)
         }
@@ -24084,10 +24086,11 @@ fn cross_together<S: EvalSemantics, V: DocumentValue>(
     // list (`. + {"z": 9} | [.]` is one array of every result, and a second `+` crosses them,
     // #6973); a left operand that navigated or built its node has no flag (`.x + 1 | [.]` is one
     // array per result). A comparison's boolean is a node of its own, with neither.
+    let is_comparison = matches!(stage, Expr::Compare { .. });
     let mut collect = |item: GenericItem<V>| {
         let tag = YqContextTag {
-            together: tracks_left && left_together.get(),
-            origin: if keeps_left_origin {
+            together: !is_comparison && tracks_left && left_together.get(),
+            origin: if keeps_left_origin && !(is_comparison && left_together.get()) {
                 left_origin.get()
             } else {
                 None
