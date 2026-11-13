@@ -8072,8 +8072,10 @@ The name is the first value the expression produces, read as its scalar text, wi
   `succinctly yq help` reads `help` as the expression and says `help/0 is not defined`, where yq prints its usage.
 - **`--version` prints this crate's own name and version.**
   yq prints `yq (https://github.com/mikefarah/yq/) version v4.53.3`.
-- **`ea -i` and `ea -f` are refused.**
-  yq accepts both (`ea -i '.k = 1' a.yaml b.yaml` writes every result into the first file), and `succinctly yq` stops with `--eval-all and --inplace are incompatible` or `--eval-all and --front-matter are incompatible` ([#7042](https://github.com/rust-works/succinctly/issues/7042)).
+- **`ea -f` is refused.**
+  yq accepts `ea --front-matter=process|extract` (its result for several files keeps the body of the last one only), and `succinctly yq` stops with `--eval-all and --front-matter are incompatible` ([#7042](https://github.com/rust-works/succinctly/issues/7042)).
+- **`ea -i` writes the results of the one evaluation to the first file, as yq does (#7042), through the `--eval-all` route that keeps no comment, flow style or anchor ([#4380](https://github.com/rust-works/succinctly/issues/4380)).**
+  `ea -i '.a = 5' f.yaml` on `a: 1 # c` / `b: [1, 2]` writes `a: 5` and `b:` with a block list, where yq keeps the comment and the flow list; the other files are left as they are, in both.
 
 ## A key written as a literal block scalar (`? |-`) is written back as yq does; a folded one is not ([#7032](https://github.com/rust-works/succinctly/issues/7032))
 

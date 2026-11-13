@@ -473,6 +473,40 @@ pub fn flush_then_err<W: std::io::Write, T>(
 /// other failure (a full disk, `EIO`), and a closed pipe where there is no SIGPIPE (Windows).
 pub struct LoudFlushWriter<W: Write>(BufWriter<W>);
 
+/// Where a run's results go: standard output, or (for `--eval-all --inplace`, #7042) a buffer that is
+/// written to the first file once the run has produced them.
+pub enum OutSink {
+    Stdout(std::io::StdoutLock<'static>),
+    Buffer(Vec<u8>),
+}
+
+impl Write for OutSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Stdout(out) => out.write(buf),
+            Self::Buffer(bytes) => bytes.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Stdout(out) => out.flush(),
+            Self::Buffer(_) => Ok(()),
+        }
+    }
+}
+
+impl LoudFlushWriter<OutSink> {
+    /// What the run wrote to a [`OutSink::Buffer`], emptying it; nothing for standard output.
+    pub fn take_buffered(&mut self) -> std::io::Result<Vec<u8>> {
+        self.0.flush()?;
+        Ok(match self.0.get_mut() {
+            OutSink::Buffer(bytes) => std::mem::take(bytes),
+            OutSink::Stdout(_) => Vec::new(),
+        })
+    }
+}
+
 impl<W: Write> LoudFlushWriter<W> {
     pub fn new(inner: W) -> Self {
         Self(BufWriter::new(inner))

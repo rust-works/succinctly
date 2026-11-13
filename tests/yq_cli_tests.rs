@@ -27305,11 +27305,19 @@ fn test_eval_all_rejects_slurp() -> Result<()> {
 }
 
 #[test]
-fn test_eval_all_rejects_inplace() -> Result<()> {
+fn test_eval_all_accepts_inplace_7042() -> Result<()> {
+    // `--eval-all -i` writes the results to the first file (tests/yq_cli/i7042.rs pins the rows);
+    // standard input has no file to write back to.
     let (f1, _f2) = two_doc_fixtures()?;
-    let (_stdout, stderr, code) = run_yq_files(".", &[f1.path()], &["--eval-all", "-i"])?;
+    let (stdout, stderr, code) = run_yq_files(".", &[f1.path()], &["--eval-all", "-i"])?;
+    assert_eq!((stdout.as_str(), code), ("", 0), "stderr: {stderr}");
+    let (_stdout, stderr, code) =
+        run_yq_files(".", &[std::path::Path::new("-")], &["--eval-all", "-i"])?;
     assert_ne!(code, 0);
-    assert!(stderr.contains("--inplace"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("write in place flag only applicable"),
+        "stderr: {stderr}"
+    );
     Ok(())
 }
 
