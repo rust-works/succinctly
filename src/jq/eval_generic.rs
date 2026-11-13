@@ -93,10 +93,11 @@ use super::eval::{
     Reentry, RestPipe, RestTail, RootWitness, SliceTargetKind, StashedEscape, StashedVerdict,
     YqSemantics, DEFERRED_BIND_UNRESOLVED, MAX_RANGE_TOTAL,
 };
-use super::eval::{format_yq_props_commented, yq_props_format_style};
+use super::eval::{format_yq_props_commented, format_yq_xml_commented, yq_props_format_style};
 use super::eval::{owned_slot_mut, static_path_steps, StepKey};
 #[cfg(test)]
 use super::expr::FuncDefBound;
+use super::expr::YqOutputEncoder;
 use super::expr::{
     ArithOp, ArithSettleMemo, AssignOp, BindOrigin, BoundBody, Builtin, CompareOp, Expr,
     FormatType, FuncDefData, Literal, NumberKey, ObjectEntry, ObjectKey, Pattern, PipeStages,
@@ -113,6 +114,7 @@ use super::tail_call::{
 use super::value::{
     owned_value_eq, subarray_indices, NumberRepr, ObjectMapOf, OwnedValue, Teardown,
 };
+use super::yq_xml::{XmlComments, XmlEntry, XmlMembers, XmlNodeComments};
 
 /// Recursion-depth ceiling for [`to_owned`]/[`to_owned_cursor`]/
 /// [`to_owned_with_comments`] (#998).
@@ -6306,6 +6308,52 @@ fn collect_props_comments<C: DocumentCursor>(
                 insert_comment(out, path, comment);
             }
         }
+    }
+}
+
+/// The comments of one node as yq's XML encoder reads them (#7117): `#` and all, a block's lines
+/// joined with a line break, the head as [`DocumentCursor::head_comment_yq_raw`] carries it.
+fn xml_node_comments<C: DocumentCursor>(node: &C) -> XmlNodeComments {
+    XmlNodeComments {
+        head: node.head_comment_yq_raw().join("\n"),
+        line: node.line_comment_raw().unwrap_or_default(),
+        foot: node.foot_comment_raw().join("\n"),
+    }
+}
+
+/// The comments of the node at `cursor` and of everything below it, in the shape of its value, for
+/// [`format_yq_xml_commented`]: a mapping entry has its key's comments and its value's tree, a sequence
+/// item its own.
+fn collect_xml_comments<C: DocumentCursor>(cursor: &C, depth: usize) -> XmlComments {
+    super::value::assert_value_tree_depth(depth);
+    let value = cursor.value();
+    let members = if let Some(mut fields) = value.as_object() {
+        let mut entries = Vec::new();
+        while let Some((field, rest)) = fields.uncons() {
+            fields = rest;
+            let Some(key) = field.key_str() else {
+                continue;
+            };
+            entries.push(XmlEntry {
+                key: key.into_owned(),
+                key_comments: xml_node_comments(&field.key_cursor),
+                value: collect_xml_comments(&field.value_cursor, depth + 1),
+            });
+        }
+        XmlMembers::Map(entries)
+    } else if let Some(mut elements) = value.as_array() {
+        let mut items = Vec::new();
+        while let Some((element, rest)) = elements.uncons_cursor() {
+            elements = rest;
+            items.push(collect_xml_comments(&element, depth + 1));
+        }
+        XmlMembers::Seq(items)
+    } else {
+        XmlMembers::None
+    };
+    XmlComments {
+        own: xml_node_comments(cursor),
+        members,
     }
 }
 
@@ -16599,6 +16647,27 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             GenericResult::Owned(OwnedValue::String(
                 format_yq_props_commented(format_type, style, &owned, &comments, &leading).into(),
             ))
+        }
+        // #7117: yq's XML encoder writes each node's comments, read from the nodes the value came
+        // from, and the first document's leading comments ahead of the first element.
+        Expr::Format(FormatType::YqOutput(YqOutputEncoder::Xml(options)))
+            if S::TAG == EvalTag::Yq && cursor.is_some_and(|c| c.document_has_comments()) =>
+        {
+            let owned = owned_or_suppress!(to_owned_with_cursor::<_, S>(&value, cursor), optional);
+            // The guard holds a cursor.
+            let (comments, leading) = cursor.as_ref().map_or_else(
+                || (XmlComments::default(), String::new()),
+                |c| {
+                    (
+                        collect_xml_comments(c, 0),
+                        c.xml_leading_content().unwrap_or_default(),
+                    )
+                },
+            );
+            match format_yq_xml_commented(options, &owned, &comments, &leading) {
+                Ok(text) => GenericResult::Owned(OwnedValue::String(text.into())),
+                Err(e) => GenericResult::Error(e),
+            }
         }
         Expr::Format(format_type) => format_result::<S, _>(
             format_type,

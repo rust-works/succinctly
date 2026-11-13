@@ -27115,6 +27115,21 @@ pub(crate) fn format_yq_props_commented(
     text
 }
 
+/// yq's XML text of `value`, a document node whose comments are `comments`, after the document's
+/// `leading` comment block when the node is the first document's content (#7117). The error is the
+/// output encoder's, as [`format_result`](FormatType::YqOutput) raises it.
+pub(crate) fn format_yq_xml_commented(
+    options: &XmlOptions,
+    value: &OwnedValue,
+    comments: &super::yq_xml::XmlComments,
+    leading: &str,
+) -> Result<String, EvalError> {
+    let text = super::yq_xml::format_xml_commented(value, options, comments, leading)
+        .map_err(|e| EvalError::output_encoder(e.message))?;
+    note_output_encoder_result(value);
+    Ok(text)
+}
+
 /// Recursively format a value into Java properties lines, each written with its newline.
 ///
 /// Panics past [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH)

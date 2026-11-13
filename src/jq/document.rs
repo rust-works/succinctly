@@ -913,6 +913,12 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         None
     }
 
+    /// The first document's leading block as yq's XML encoder reads it: verbatim, a `---` line as
+    /// yq's own `$yqDocSeparator$` (#7117). `None` as [`props_leading_content`](Self::props_leading_content).
+    fn xml_leading_content(&self) -> Option<String> {
+        None
+    }
+
     /// Whether this node's text is a transcode of a format whose nodes carry no style (#7031): the
     /// YAML a `-p props` run reads a properties file as. [`style`](Self::style) still reads the
     /// text (a quoted `"2001-12-14"` must stay a string), but the style yq reports and a writer
