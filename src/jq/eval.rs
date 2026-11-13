@@ -27215,8 +27215,9 @@ fn builtin_text_codec<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
     if codec == TextCodec::ToXml {
         let owned = to_owned_lossy::<S, _>(&value);
-        let options = yq_encoder_prefs::with(|prefs| prefs.xml.clone());
-        return match super::yq_xml::format_xml(&owned, &options) {
+        let formatted =
+            yq_encoder_prefs::with(|prefs| super::yq_xml::format_xml(&owned, &prefs.xml));
+        return match formatted {
             Ok(text) => QueryResult::Owned(OwnedValue::from(text)),
             Err(e) => suppress_or_raise(e, optional),
         };
