@@ -12,10 +12,11 @@ use succinctly::jq::document::{
     DistinctKeyCursors, DocumentCursor, DocumentElements, DocumentFields, DocumentValue,
 };
 use succinctly::jq::eval_generic::{
-    to_owned_with_comments, AnchorMark, KeyMeta, LazyElem, KEY_STYLE_STRING,
+    to_owned_with_comments, AnchorMark, KeyMap, KeyMeta, LazyElem, MetaBox, KEY_STYLE_STRING,
 };
 use succinctly::jq::{
-    ArithOp, Builtin, EvalError, MergeFlags, MetaSlot, ObjectKey, MAX_VALUE_TREE_DEPTH,
+    ArithOp, AssignOp, Builtin, EvalError, Literal, LoadKind, MergeFlags, MetaSlot, ObjectKey,
+    MAX_VALUE_TREE_DEPTH,
 };
 use succinctly::jq::{EvalSemantics, YqSemantics};
 
@@ -47,6 +48,17 @@ pub(super) fn supported(expr: &Expr) -> bool {
         Expr::Builtin(Builtin::FlattenDepth(depth)) => is_closed_literal(depth),
         // Paths given as a literal; one built from the document is for the plain route.
         Expr::Builtin(Builtin::Pick(paths) | Builtin::Omit(paths)) => is_closed_literal(paths),
+        // #5439: `load("f.yaml")` of a literal name is the file's document with its own presentation,
+        // read as the evaluator reads it.
+        Expr::Builtin(Builtin::Load(file, LoadKind::Document)) => {
+            matches!(&**file, Expr::Literal(Literal::String(_)))
+        }
+        // `. *= X` and `. += X` are `. * X` and `. + X` written back at the root.
+        Expr::CompoundAssign { op, path, value } => {
+            matches!(**path, Expr::Identity)
+                && compound_as_arithmetic(op).is_some_and(|op| plain_op(&op))
+                && supported(value)
+        }
         Expr::Assign { path, value } => static_path(path) && supported(value),
         // #6089: a key rename, whose target is a path and whose new name is a supported expression.
         Expr::MetaAssign {
@@ -146,6 +158,16 @@ fn plain_op(op: &ArithOp) -> bool {
                     <= 1
         }
         _ => true,
+    }
+}
+
+/// The arithmetic a compound assignment writes back (`+=` is `+`, `*=` is `*` with its flags): the two
+/// that merge nodes, whose result keeps the presentation of the nodes they merge.
+fn compound_as_arithmetic(op: &AssignOp) -> Option<ArithOp> {
+    match op {
+        AssignOp::Add => Some(ArithOp::Add),
+        AssignOp::Mul(flags) => Some(ArithOp::Mul(*flags)),
+        _ => None,
     }
 }
 
@@ -676,8 +698,54 @@ pub(super) fn needed(expr: &Expr) -> bool {
         } => true,
         Expr::Pipe(parts) => parts.iter().any(needed),
         Expr::Paren(inner) => needed(inner),
+        // #5439: `. *= load("f")` writes the merge back, and `.a = load("f")` the loaded node.
+        Expr::CompoundAssign { .. } => true,
+        Expr::Assign { value, .. } => matches!(**value, Expr::Builtin(Builtin::Load(..))),
         _ => false,
     }
+}
+
+/// A mapping with nothing to say, which a write into a null or an absent step makes.
+fn empty_object() -> CommentTree {
+    CommentTree::Object(MetaBox::default(), Box::default(), KeyMap::default())
+}
+
+/// The names of a chain of plain fields (`.a.b`), or `None` for any other path.
+fn field_chain(path: &Expr) -> Option<Vec<String>> {
+    match path {
+        Expr::Field(key) => Some(vec![key.clone()]),
+        Expr::Pipe(parts) => parts
+            .iter()
+            .map(|part| match part {
+                Expr::Field(key) => Some(key.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => None,
+    }
+}
+
+/// `tree` with the node at the field chain `names` replaced by `node` (the entry is added when the
+/// mapping lacks it), the rest of the tree as it was.
+fn with_node_at(tree: &CommentTree, names: &[String], node: CommentTree) -> Option<CommentTree> {
+    let (first, rest) = names.split_first()?;
+    let CommentTree::Object(meta, fields, keys) = tree else {
+        return None;
+    };
+    let mut fields: IndexMap<String, CommentTree> = (**fields).clone();
+    let child = if rest.is_empty() {
+        node
+    } else {
+        // A step the mapping lacks is made by the write, as an empty mapping.
+        let existing = fields.get(first).cloned().unwrap_or_else(empty_object);
+        with_node_at(&existing, rest, node)?
+    };
+    fields.insert(first.clone(), child);
+    Some(CommentTree::Object(
+        meta.clone(),
+        Box::new(fields),
+        keys.clone(),
+    ))
 }
 
 fn evaluated(expr: &Expr, value: &OwnedValue) -> Option<OwnedValue> {
@@ -1294,6 +1362,38 @@ fn trace_at_depth(
                 CommentTree::empty()
             };
             Some((result, meta))
+        }
+        // #5439: the loaded document is a node with its own comments, style and header.
+        Expr::Builtin(Builtin::Load(file, LoadKind::Document)) => {
+            let Expr::Literal(Literal::String(name)) = &**file else {
+                return None;
+            };
+            super::load_document_pair(name.as_ref())
+        }
+        // `. *= X` at the root: the merge `. * X` is what is written back.
+        Expr::CompoundAssign {
+            op,
+            path,
+            value: rhs,
+        } if matches!(**path, Expr::Identity) => {
+            let op = compound_as_arithmetic(op)?;
+            let merged = Expr::arithmetic(op, Expr::Identity, (**rhs).clone());
+            let (result, tree) = next(&merged, input)?;
+            (evaluated(expr, value)? == result).then_some((result, tree))
+        }
+        // #5439: the node `load` read keeps its presentation where it is written.
+        Expr::Assign { path, value: rhs } if matches!(**rhs, Expr::Builtin(Builtin::Load(..))) => {
+            let result = evaluated(expr, value)?;
+            let (_, loaded) = next(rhs, input)?;
+            let names = field_chain(path)?;
+            let targets = collect_write_targets(expr)?;
+            let base = if matches!(value, OwnedValue::Null) {
+                // A null input has no mapping to write into: the write makes one.
+                empty_object()
+            } else {
+                reconcile_presentation(value, tree, &result, &targets)
+            };
+            Some((result, with_node_at(&base, &names, loaded)?))
         }
         Expr::Assign { .. } | Expr::Update { .. } => {
             let result = evaluated(expr, value)?;
