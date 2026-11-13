@@ -634,6 +634,8 @@ Beyond jq's standard formats (`@json`, `@csv`, `@base64`, etc.), yq adds:
 
 yq also spells three encoders as operators (#6985): `to_csv` (or `tocsv`) is `@csv`, `to_tsv` (`totsv`) is `@tsv` and `to_props` (`toprops`) is `@props`, yq mode only.
 
+yq's codec operators over a string or a file (#6998), yq mode only: `from_props`, `from_csv` and `from_tsv` (`fromprops`, ...) read a string as `-p props`, `-p csv` and `-p tsv` read a file (the flags of the run apply), `from_xml` as `-p xml` does, and `to_xml` is `-o xml` of the value (indented by two whatever `-I` says); `load_props` and `load_xml` read a file the same way, behind `failed to load F: bad file 'F': ` for a decode error. A number, a boolean or `null` is decoded as its text (`null | from_xml` is the text `null`), a mapping or sequence as the empty string, which is `EOF` for props, CSV and TSV and `null` for XML.
+
 `@props` escapes as yq's properties encoder does (#4977): backslash, tab, newline, carriage return and
 form feed become `\\`, `\t`, `\n`, `\r`, `\f`; a key also escapes every space and `:` (`a\ b = 1`), a value
 only a leading space (`a = \  x`); everything else (`=`, `#`, `!`, non-ASCII) is written as it is, and a

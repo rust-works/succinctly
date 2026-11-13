@@ -1577,6 +1577,33 @@ fn empty_input_is_transcoded_document() -> bool {
     transcoded_input().is_some_and(TranscodedInput::empty_is_document)
 }
 
+/// The decoder of `-p props|csv|tsv|xml` over a string or a file, for `from_props`, `from_csv`,
+/// `from_tsv`, `from_xml`, `load_props` and `load_xml` (#6998): the flags of the run apply, as in yq.
+fn yq_text_decoder(codec: jq::TextCodec, bytes: &[u8]) -> std::result::Result<Vec<u8>, String> {
+    let format = match codec {
+        jq::TextCodec::FromProps => TranscodedInput::Props,
+        jq::TextCodec::FromCsv => TranscodedInput::Csv,
+        jq::TextCodec::FromTsv => TranscodedInput::Tsv,
+        jq::TextCodec::FromXml => TranscodedInput::Xml,
+        jq::TextCodec::ToXml => return Err("to_xml is an encoder".to_string()),
+    };
+    let xml = XML_INPUT_OPTIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    format.transcode(
+        bytes,
+        &TranscodeOptions {
+            xml: xml.as_ref(),
+            array_brackets: PROPS_ARRAY_BRACKETS.load(std::sync::atomic::Ordering::SeqCst),
+            csv_separator: char::from(CSV_SEPARATOR.load(std::sync::atomic::Ordering::SeqCst)),
+            csv_auto_parse: CSV_AUTO_PARSE.load(std::sync::atomic::Ordering::SeqCst),
+            tsv_auto_parse: TSV_AUTO_PARSE.load(std::sync::atomic::Ordering::SeqCst),
+            ini_preserve_quotes: INI_PRESERVE_QUOTES.load(std::sync::atomic::Ordering::SeqCst),
+        },
+    )
+}
+
 /// `raw`, read from the input yq names `name` (`-` for stdin), as the run reads it: under a
 /// transcoded input format the text it decodes to, or yq's `bad file '<name>': ...` when it does
 /// not decode (#6925). Every other run reads the bytes as they are.
@@ -12463,7 +12490,17 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         properties_array_brackets: args.properties_array_brackets,
         csv_separator,
         unwrap_scalar,
+        // `to_xml` indents by two whatever `-I` says, as yq's does.
+        xml: XmlOptions {
+            indent: 2,
+            attribute_prefix: args.xml_attribute_prefix.clone(),
+            content_name: args.xml_content_name.clone(),
+            proc_inst_prefix: args.xml_proc_inst_prefix.clone(),
+            directive_name: args.xml_directive_name.clone(),
+            empty_null: string_format == Some(TranscodedInput::Xml),
+        },
     });
+    jq::set_yq_text_decoder(yq_text_decoder); // #6998
 
     let output_encoder = match args.output_format {
         OutputFormat::Props => Some(YqOutputEncoder::Props {

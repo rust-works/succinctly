@@ -43,7 +43,7 @@ use super::expr::{
     ArithOp, ArithSettleMemo, AssignOp, Builtin, CompareOp, Expr, FormatType, FuncDefBound, Import,
     Include, Libm1, Libm2, Libm3, Literal, LoadKind, MergeFlags, MetaObject, MetaSlot, MetaValue,
     ModuleMeta, NumberKey, ObjectEntry, ObjectKey, Param, Pattern, PatternEntry, Program,
-    SliceBoundKey, StringPart,
+    SliceBoundKey, StringPart, TextCodec,
 };
 use super::value::{parse_i64_or_f64_in, NumberRepr, OwnedValue};
 use super::walk::{any_subexpr, map_subexprs};
@@ -2092,6 +2092,14 @@ const YQ_SPELLINGS: &[(&str, &[&str])] = &[
     ("to_csv", &["tocsv"]),
     ("to_tsv", &["totsv"]),
     ("to_props", &["toprops"]),
+    // #6998: the codec operators `from_?props|csv|tsv|xml`, `to_?xml`, `load_?props|xml`.
+    ("from_props", &["fromprops"]),
+    ("from_csv", &["fromcsv"]),
+    ("from_tsv", &["fromtsv"]),
+    ("from_xml", &["fromxml"]),
+    ("to_xml", &["toxml"]),
+    ("load_props", &["loadprops"]),
+    ("load_xml", &["loadxml"]),
     ("load_str", &["loadstr", "str_load", "strload"]),
     ("load_base64", &["loadbase64"]),
 ];
@@ -5751,6 +5759,14 @@ impl<'a> Parser<'a> {
                         Some(name),
                         Expr::Format(format),
                     )
+                } else if let Some((name, codec)) = self.yq_codec_operator() {
+                    // #6998: yq's `from_props|csv|tsv|xml` and `to_xml`.
+                    self.consume_keyword(name);
+                    self.zero_arity_or_wrong_arity_call(
+                        keyword_start,
+                        Some(name),
+                        Expr::Builtin(Builtin::TextCodec(codec)),
+                    )
                 } else if self.mode == ParserMode::Yq
                     && self.matches_keyword("root")
                     && !self.shadowable_defs.contains("root")
@@ -6385,6 +6401,29 @@ impl<'a> Parser<'a> {
             ("to_tsv", FormatType::Tsv)
         } else if self.matches_keyword("to_props") {
             ("to_props", FormatType::Props)
+        } else {
+            return None;
+        };
+        (!self.shadowable_defs.contains(found.0)).then_some(found)
+    }
+
+    /// yq's codec operators at the cursor (`from_props`, `from_csv`, `from_tsv`, `from_xml`,
+    /// `to_xml` and their other spellings, #6998), with the codec each names: yq mode only, and not
+    /// when the program defines the name.
+    fn yq_codec_operator(&self) -> Option<(&'static str, TextCodec)> {
+        if self.mode != ParserMode::Yq {
+            return None;
+        }
+        let found = if self.matches_keyword("from_props") {
+            ("from_props", TextCodec::FromProps)
+        } else if self.matches_keyword("from_csv") {
+            ("from_csv", TextCodec::FromCsv)
+        } else if self.matches_keyword("from_tsv") {
+            ("from_tsv", TextCodec::FromTsv)
+        } else if self.matches_keyword("from_xml") {
+            ("from_xml", TextCodec::FromXml)
+        } else if self.matches_keyword("to_xml") {
+            ("to_xml", TextCodec::ToXml)
         } else {
             return None;
         };
@@ -10474,6 +10513,10 @@ impl<'a> Parser<'a> {
                 Some(("load_str", LoadKind::Text))
             } else if self.matches_keyword("load_base64") {
                 Some(("load_base64", LoadKind::Base64))
+            } else if self.matches_keyword("load_props") {
+                Some(("load_props", LoadKind::Props))
+            } else if self.matches_keyword("load_xml") {
+                Some(("load_xml", LoadKind::Xml))
             } else {
                 None
             };
@@ -17344,6 +17387,7 @@ mod tests {
             "anchor",
             "and",
             "any_c",
+            "array_to_map",
             "as",
             "capture",
             "collect",
@@ -17356,6 +17400,7 @@ mod tests {
             "downcase",
             "envsubst",
             "error",
+            "eval",
             "explode",
             "false",
             "fi",
@@ -17366,17 +17411,19 @@ mod tests {
             "first",
             "flatten",
             "foot_comment",
-            "eval",
             "format_datetime",
+            "from_csv",
             "from_entries",
             "from_json",
+            "from_props",
+            "from_tsv",
             "from_unix",
+            "from_xml",
             "from_yaml",
-            "fromyaml",
             "fromjson",
+            "fromyaml",
             "group_by",
             "has",
-            "array_to_map",
             "head_comment",
             "ireduce",
             "join",
@@ -17388,7 +17435,9 @@ mod tests {
             "line_comment",
             "load",
             "load_base64",
+            "load_props",
             "load_str",
+            "load_xml",
             "map",
             "map_values",
             "match",
@@ -17427,11 +17476,12 @@ mod tests {
             "to_string",
             "to_tsv",
             "to_unix",
+            "to_xml",
             "to_yaml",
-            "toyaml",
             "tojson",
             "tonumber",
             "tostring",
+            "toyaml",
             "trim",
             "true",
             "type",

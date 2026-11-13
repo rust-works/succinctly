@@ -511,8 +511,8 @@ use super::expr::{
     retention_scope, ArithOp, ArithSettleMemo, AssignOp, BindOrigin, BoundBody, Builtin, CompareOp,
     Expr, FormatType, FuncDefBound, FuncDefData, Libm1, Libm2, Libm3, Literal, LoadKind,
     LuaOptions, MergeFlags, MetaSlot, NumberKey, ObjectEntry, ObjectKey, Origin, Param, Pattern,
-    PatternEntry, PipeStages, SharedArg, SliceBoundKey, StageClass, StringPart, TailPlan, Tracked,
-    YqOutputEncoder,
+    PatternEntry, PipeStages, SharedArg, SliceBoundKey, StageClass, StringPart, TailPlan,
+    TextCodec, Tracked, XmlOptions, YqOutputEncoder,
 };
 #[cfg(test)]
 use super::value::SharableString;
@@ -20303,6 +20303,7 @@ fn builtin_operand_is_input(builtin: &Builtin) -> bool {
             | Builtin::ToJson
             | Builtin::FromJson
             | Builtin::FromYaml
+            | Builtin::TextCodec(_)
             | Builtin::Envsubst(_)
             | Builtin::Explode
             | Builtin::Implode
@@ -20627,6 +20628,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::ToJson => builtin_tojson::<W, S>(value, optional),
         Builtin::FromJson => builtin_fromjson::<W, S>(value, optional),
         Builtin::FromYaml => builtin_from_yaml::<W, S>(value, optional),
+        Builtin::TextCodec(codec) => builtin_text_codec::<W, S>(*codec, value, optional),
         Builtin::Envsubst(flags) => builtin_envsubst::<W>(value, *flags, optional),
 
         // Phase 6: Additional String Functions
@@ -27142,6 +27144,8 @@ pub struct YqEncoderPrefs {
     /// `--unwrapScalar` as the run resolves it (#7093): false makes `@props` quote a value with a
     /// space in it, as `-o=props` does.
     pub unwrap_scalar: bool,
+    /// The `--xml-*` flags and `-I` that `to_xml` reads, as `-o=xml` does (#6998).
+    pub xml: XmlOptions,
 }
 
 impl Default for YqEncoderPrefs {
@@ -27151,7 +27155,101 @@ impl Default for YqEncoderPrefs {
             properties_array_brackets: false,
             csv_separator: ',',
             unwrap_scalar: true,
+            xml: XmlOptions {
+                indent: 2,
+                attribute_prefix: String::from("+@"),
+                content_name: String::from("+content"),
+                proc_inst_prefix: String::from("+p_"),
+                directive_name: String::from("+directive"),
+                empty_null: false,
+            },
         }
+    }
+}
+
+/// The decoder of `-p props|csv|tsv|xml` over a string (#6998).
+///
+/// It answers the YAML text yq's decoder makes of `bytes`, or its error message. The decoders live
+/// in the CLI (they are the `-p` input formats), which registers this once.
+pub type YqTextDecoder = fn(TextCodec, &[u8]) -> Result<Vec<u8>, String>;
+
+/// Register the [`YqTextDecoder`] `from_props`, `from_csv`, `from_tsv`, `from_xml`, `load_props`
+/// and `load_xml` call. Without one (the library alone) they answer an error.
+pub fn set_yq_text_decoder(decoder: YqTextDecoder) {
+    #[cfg(feature = "std")]
+    {
+        *YQ_TEXT_DECODER
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(decoder);
+    }
+    #[cfg(not(feature = "std"))]
+    let _ = decoder;
+}
+
+#[cfg(feature = "std")]
+static YQ_TEXT_DECODER: std::sync::RwLock<Option<YqTextDecoder>> = std::sync::RwLock::new(None);
+
+/// The YAML text `bytes` decode to under `codec`, or yq's message.
+fn decode_text_codec(codec: TextCodec, bytes: &[u8]) -> Result<Vec<u8>, String> {
+    #[cfg(feature = "std")]
+    {
+        let decoder = *YQ_TEXT_DECODER
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(decoder) = decoder {
+            return decoder(codec, bytes);
+        }
+    }
+    let _ = bytes;
+    Err(alloc::format!("{codec:?} is not available here"))
+}
+
+/// `from_props`, `from_csv`, `from_tsv`, `from_xml` and `to_xml` (#6998).
+fn builtin_text_codec<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    codec: TextCodec,
+    value: StandardJson<'_, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    if S::TAG != EvalTag::Yq {
+        return suppress_or_raise(EvalError::new("not defined in jq mode"), optional);
+    }
+    if codec == TextCodec::ToXml {
+        let owned = to_owned_lossy::<S, _>(&value);
+        let formatted =
+            yq_encoder_prefs::with(|prefs| super::yq_xml::format_xml(&owned, &prefs.xml));
+        return match formatted {
+            Ok(text) => QueryResult::Owned(OwnedValue::from(text)),
+            Err(e) => suppress_or_raise(e, optional),
+        };
+    }
+    let text = match &value {
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => cow.into_owned(),
+            Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
+        },
+        // yq decodes the node's own text: a number, a boolean or `null` as written (`null | from_xml`
+        // is the text `null`), a collection as the empty string.
+        StandardJson::Array(_) | StandardJson::Object(_) => String::new(),
+        _ => tostring_text::<S>(&to_owned_lossy::<S, _>(&value), false),
+    };
+    decode_codec_text::<W, S>(codec, text.as_bytes(), optional)
+}
+
+/// `bytes` read by `codec`'s decoder and the first document of what it makes, as `from_yaml`
+/// reads a string. The empty string is yq's `EOF` for a table or a properties file and `null` for
+/// XML.
+fn decode_codec_text<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    codec: TextCodec,
+    bytes: &[u8],
+    optional: bool,
+) -> QueryResult<'a, W> {
+    if bytes.is_empty() && codec != TextCodec::FromXml {
+        return suppress_or_raise(EvalError::new("EOF"), optional);
+    }
+    match decode_text_codec(codec, bytes) {
+        Ok(yaml) if yaml.is_empty() => QueryResult::Owned(OwnedValue::Null),
+        Ok(yaml) => decode_yaml_text::<W, S>(String::from_utf8_lossy(&yaml).into_owned(), optional),
+        Err(message) => suppress_or_raise(EvalError::new(message), optional),
     }
 }
 
@@ -48236,6 +48334,7 @@ fn builtin_yields_at_most_one_value(builtin: &Builtin) -> bool {
         | Builtin::FromEntries
         | Builtin::FromJson
         | Builtin::FromYaml
+        | Builtin::TextCodec(_)
         | Builtin::Envsubst(_)
         | Builtin::FromJsonStream
         | Builtin::FromStream(_)
@@ -67101,6 +67200,7 @@ fn cannot_move_register(expr: &Expr) -> bool {
             | Builtin::ToJson
             | Builtin::FromJson
             | Builtin::FromYaml
+            | Builtin::TextCodec(_)
             | Builtin::Envsubst(_)
             // #2764: produces nothing, so it navigates nothing --
             // `path(. as $x | [empty] | $x)` is `[]` in jq 1.7.1.
@@ -110071,6 +110171,23 @@ fn load_file<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             return QueryResult::Owned(OwnedValue::from(owned_string_from_decoded_bytes::<S>(
                 file_bytes,
             )))
+        }
+        // The file read as `-p props` / `-p xml` reads it (#6998), its decode error behind `bad file`.
+        LoadKind::Props | LoadKind::Xml => {
+            let codec = if kind == LoadKind::Props {
+                TextCodec::FromProps
+            } else {
+                TextCodec::FromXml
+            };
+            return match decode_text_codec(codec, &file_bytes) {
+                Ok(yaml) if yaml.is_empty() => QueryResult::Owned(OwnedValue::Null),
+                Ok(yaml) => {
+                    decode_yaml_text::<W, S>(String::from_utf8_lossy(&yaml).into_owned(), optional)
+                }
+                Err(message) => QueryResult::Error(EvalError::new(format!(
+                    "failed to load {filename}: bad file '{filename}': {message}"
+                ))),
+            };
         }
         // yq decodes the file as `@base64d` decodes a string (#6985).
         LoadKind::Base64 => {
