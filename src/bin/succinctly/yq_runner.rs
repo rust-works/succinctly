@@ -60,6 +60,7 @@ mod input_ini;
 mod input_props;
 mod input_xml;
 mod input_xml_tables;
+mod input_toml;
 use go_yaml_color::YamlColorizer;
 use input_decode::{TranscodeOptions, TranscodedInput};
 use succinctly::text::stream_region::{current_region, StreamRegion};
@@ -903,6 +904,7 @@ fn resolve_output_format(output_format: OutputFormat, input_format: InputFormat)
         InputFormat::Tsv => OutputFormat::Tsv,
         InputFormat::Ini => OutputFormat::Ini,
         InputFormat::Xml => OutputFormat::Xml,
+        InputFormat::Toml => OutputFormat::Toml,
     }
 }
 
@@ -2636,6 +2638,7 @@ fn parse_input(bytes: &[u8], format: InputFormat, after_bom: bool) -> Result<Vec
         | InputFormat::Tsv
         | InputFormat::Ini
         | InputFormat::Xml
+        | InputFormat::Toml
         | InputFormat::Kyaml => {
             // Parse as YAML (Auto defaults to YAML when no extension hint)
             let mut index = build_yq_source(bytes, after_bom)
@@ -12392,6 +12395,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             Some(TranscodedInput::Tsv) if by_extension => OutputFormat::Tsv,
             Some(TranscodedInput::Ini) if by_extension => OutputFormat::Ini,
             Some(TranscodedInput::Xml) if by_extension => OutputFormat::Xml,
+            Some(TranscodedInput::Toml) if by_extension => OutputFormat::Toml,
             Some(_) => OutputFormat::Yaml,
             None if json_input && !nothing_to_match => OutputFormat::Json,
             None if kyaml_input => OutputFormat::Kyaml,
