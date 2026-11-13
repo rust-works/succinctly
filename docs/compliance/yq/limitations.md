@@ -7939,7 +7939,7 @@ These rows differ:
 - **A multi-byte encoding** declared in the prolog (`shift_jis`, `euc-jp`, `euc-kr`, `gbk`, `gb18030`, `big5`, `iso-2022-jp`, `utf-16`) is refused (`xml: opening charset "shift_jis": unsupported charset: "shift_jis"`), as a label that is no encoding is; yq converts them.
 - **A byte that is not UTF-8 in a name** is U+FFFD in the error message here (`invalid XML name: <U+FFFD>`), where Go prints the byte.
 - **A character Go 1.27 classifies differently from Go 1.26** at the end of a text node (a code point assigned in Unicode 17 or later) is trimmed or kept by the newer table.
-- `-o xml` writes the comments of a node it reads (the `-o=xml` row above), so `-p xml -o xml .` keeps those of its input, where a write (`-i`) loses them, and a `null` that a filter assigns (`.a = null`) is written empty when the input was XML, where yq writes `null`.
+- `-o xml` writes the comments of a node it reads (the `-o=xml` row above), so `-p xml -o xml .` keeps those of its input, a write (`-i`) included, and a `null` that a filter assigns (`.a = null`) is written empty when the input was XML, where yq writes `null`.
 - `--front-matter` with an explicit `-p xml` is refused (`--front-matter and --input-format xml are incompatible`), where yq decodes the front matter as XML.
 - yq's warning that `-o auto` defaults to YAML when `-p xml` is explicit is not written.
 
@@ -8010,15 +8010,18 @@ These rows differ:
 - `--front-matter` with an explicit `-p toml` is refused (`--front-matter and --input-format toml are incompatible`), as `-p json` is, where yq decodes the front matter as TOML.
 - **Speed.** A run of `[[array]]` tables is written in place here, so 20,000 of them read in half a second; yq copies the array once per table and takes minutes (500 tables take 0.4 s there, 2,000 take 11 s).
 
-### `-o=xml` — a write or a built value loses its comments, and a source spelling and an empty document are not read (#6924, #7117)
+### `-o=xml` — a rebuilt value loses its comments, and a source spelling and an empty document are not read (#6924, #7117, #7156)
 
 `-o=xml` is a port of yq's XML encoder over Go's `encoding/xml` printer (its indentation state, its text and attribute escapes, the refusals of a start tag with no name, of an attribute that is not a scalar, of a processing instruction with a bad target or a `?>` and of a malformed directive) and agrees with yq v4.53.3 on 5,000 random JSON documents.
 A node's head, line and foot comments are written as yq's encoder writes them (#7117): above its element, inside it after its text, after its end tag, and the first document's leading comment block ahead of the first element, with yq's own text for a `---` line in it (`$yqDocSeparator$`).
 The comment text goes through the two regular expressions of `encodeComment` and a `-->` in it is refused as Go's `EncodeToken` refuses it.
 That agrees with yq v4.53.3 on 1,900 random YAML documents with comments in every position (twelve document shapes, `-I`, `-N`, filters that navigate) and on `-p xml -o xml` for the XML documents `scripts/yq-xml-input-sweep.py --only xml` generates, except where the input side differs (`-p xml`, above).
-The comments are read from the nodes the result came from, so these still differ on a YAML input:
+A read takes them off the node's cursor, and a write or a rebuilt value (`.a = 1`, `del(.a)`, `sort_keys(.)`, `{"x": .}`; so `-i` on an `.xml` file too) takes them from the presentation tree the YAML printer prints the same result with (#7156): the filter runs without its encoder and each result is encoded with its tree.
+That agrees with yq on 300-document sweeps of `=`, `|=`, `del`, `sort_keys` and a write that adds a key, and on `-i '.a.d = "z"'` over an XML file with comments between elements.
+So these still differ on a YAML input:
 
-- A head, line or foot comment is dropped after a write (`.a = 1`, `-i`, so `succinctly yq -i '.a.d = "z"' pom.xml` strips the file's comments), and from a value the filter builds (`{"x": .a}`, `.a | to_xml`, `sort_keys(.)`, `with_entries(.)`, `explode(.)`) and under `--eval-all`, where yq keeps the comments of the nodes it copies.
+- A head, line or foot comment is dropped from a value the filter rebuilds where the YAML printer drops it too (`with_entries(.)`, `to_entries | from_entries`, `. * {..}`, #5521), from `.a | to_xml`, which has no node, and under `--eval-all` (#4380), where yq keeps the comments of the nodes it copies.
+- A block of comments that sits after a `---` and that a built mapping wraps (`{"x": .}`) is the mapping's head here, where yq drops it with the leading block it came from.
 - A comment block that a blank line splits (`# f`, a blank line, `# g` under a key) is one comment here, where yq makes the first the key's foot comment and the second the next key's head comment or the mapping's foot comment, so it writes two XML comments and this writes one (`<!-- f --><!-- g -->` against `<!-- f`, an empty line, `g -->`).
   The attribution is the one `head_comment` and `foot_comment` report (`.a | key | foot_comment`), so it is not special to XML.
 - A foot comment in a file with CRLF line ends keeps its line break in yq (`<!-- f`, a line break, `-->`), where it has none here.

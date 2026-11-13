@@ -97,12 +97,12 @@ use super::eval::{format_yq_props_commented, format_yq_xml_commented, yq_props_f
 use super::eval::{owned_slot_mut, static_path_steps, StepKey};
 #[cfg(test)]
 use super::expr::FuncDefBound;
-use super::expr::YqOutputEncoder;
 use super::expr::{
     ArithOp, ArithSettleMemo, AssignOp, BindOrigin, BoundBody, Builtin, CompareOp, Expr,
     FormatType, FuncDefData, Literal, NumberKey, ObjectEntry, ObjectKey, Pattern, PipeStages,
     StringPart,
 };
+use super::expr::{XmlOptions, YqOutputEncoder};
 use super::path_mode::Route;
 use super::slice::{
     fold_bounds, literal_component_from_values, slice_str, SliceBound, SliceBounds,
@@ -6355,6 +6355,144 @@ fn collect_xml_comments<C: DocumentCursor>(cursor: &C, depth: usize) -> XmlComme
         own: xml_node_comments(cursor),
         members,
     }
+}
+
+/// `lines` as the one text go-yaml holds a comment block as: the lines joined with a line break.
+fn tree_comment_block(lines: &[String]) -> String {
+    lines.join("\n")
+}
+
+/// [`collect_xml_comments`] for a result the DOM route holds (a write, a built value): the comments of
+/// `tree`, the presentation tree that goes with `value`, in the shape of the value (#7156). A mapping
+/// entry's head and foot lines are its key's, its trailing comment the value's and the comment on a
+/// key whose value follows on the next line the key's; a sequence item has its own.
+fn xml_comments_of_tree(value: &OwnedValue, tree: &CommentTree, depth: usize) -> XmlComments {
+    super::value::assert_value_tree_depth(depth);
+    let meta = tree.meta();
+    let members = match value {
+        OwnedValue::Object(entries) => XmlMembers::Map(
+            entries
+                .iter()
+                .map(|(key, entry)| {
+                    let child = tree.field(key);
+                    let child_meta = child.meta();
+                    let mut value = xml_comments_of_tree(entry, child, depth + 1);
+                    value.own = XmlNodeComments {
+                        head: String::new(),
+                        line: child_meta.comment.clone().unwrap_or_default(),
+                        foot: String::new(),
+                    };
+                    XmlEntry {
+                        key: key.clone(),
+                        key_comments: XmlNodeComments {
+                            head: tree_comment_block(child_meta.head_comment()),
+                            line: tree.key_comment(key).unwrap_or_default().to_string(),
+                            foot: tree_comment_block(child_meta.foot_comment()),
+                        },
+                        value,
+                    }
+                })
+                .collect(),
+        ),
+        OwnedValue::Array(items) => XmlMembers::Seq(
+            items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| xml_comments_of_tree(item, tree.at_index(index), depth + 1))
+                .collect(),
+        ),
+        _ => XmlMembers::None,
+    };
+    XmlComments {
+        own: XmlNodeComments {
+            head: tree_comment_block(meta.head_comment()),
+            line: meta.comment.clone().unwrap_or_default(),
+            foot: tree_comment_block(meta.foot_comment()),
+        },
+        members,
+    }
+}
+
+/// Put back what the presentation tree lost of a comment block that the pristine document keeps: the
+/// line break a blank line leaves under a head or foot comment (#7034). Only where the key, or the
+/// sequence index, is still there and the tree's block is the pristine one without that break.
+fn restore_comment_breaks(comments: &mut XmlComments, pristine: &XmlComments) {
+    fn restore(block: &mut String, pristine: &str) {
+        let Some(rest) = pristine.strip_prefix(block.as_str()) else {
+            return;
+        };
+        if !block.is_empty() && !rest.is_empty() && rest.bytes().all(|b| b == b'\n') {
+            block.push_str(rest);
+        }
+    }
+    restore(&mut comments.own.head, &pristine.own.head);
+    restore(&mut comments.own.foot, &pristine.own.foot);
+    match (&mut comments.members, &pristine.members) {
+        (XmlMembers::Map(entries), XmlMembers::Map(originals)) => {
+            for entry in entries {
+                if let Some(original) = originals.iter().find(|o| o.key == entry.key) {
+                    restore(&mut entry.key_comments.head, &original.key_comments.head);
+                    restore(&mut entry.key_comments.foot, &original.key_comments.foot);
+                    restore_comment_breaks(&mut entry.value, &original.value);
+                }
+            }
+        }
+        (XmlMembers::Seq(items), XmlMembers::Seq(originals)) => {
+            for (item, original) in items.iter_mut().zip(originals) {
+                restore_comment_breaks(item, original);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// yq's XML text of a result of the DOM route (a write, a built value) (#7156).
+///
+/// `value` is the result and `tree` the presentation tree that goes with it, `pristine` the document it was
+/// made from: the comments are the tree's, with the line break a blank line leaves under a block put back
+/// from the document. The first document's leading block is the pristine document's, whatever the write did
+/// to the first node, when the result is the document (its root has the header or the explicit `---` in
+/// front of it).
+pub fn format_yq_xml_from_tree<C: DocumentCursor>(
+    options: &XmlOptions,
+    value: &OwnedValue,
+    tree: &CommentTree,
+    pristine: &C,
+) -> Result<String, EvalError> {
+    let mut comments = xml_comments_of_tree(value, tree, 0);
+    let original = collect_xml_comments(pristine, 0);
+    restore_comment_breaks(&mut comments, &original);
+    let meta = tree.meta();
+    let mut leading = String::new();
+    if meta.preamble().is_some() || meta.head_is_header() {
+        leading = pristine.xml_leading_content().unwrap_or_default();
+        // What the header holds is not the node's own comment as well.
+        comments.own.head.clear();
+        // After an explicit `---` the tree holds the header's comments as the first node's head,
+        // wherever a write or a sort has put that node.
+        if meta.preamble().is_some() {
+            match (&mut comments.members, &original.members) {
+                (XmlMembers::Map(entries), XmlMembers::Map(originals)) => {
+                    if let Some(first) =
+                        originals.first().filter(|f| f.key_comments.head.is_empty())
+                    {
+                        for entry in entries.iter_mut().filter(|e| e.key == first.key) {
+                            entry.key_comments.head.clear();
+                        }
+                    }
+                }
+                (XmlMembers::Seq(items), XmlMembers::Seq(originals))
+                    if originals.first().is_some_and(|f| f.own.head.is_empty()) =>
+                {
+                    if let Some(item) = items.first_mut() {
+                        item.own.head.clear();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    format_yq_xml_commented(options, value, &comments, &leading)
 }
 
 /// The text yq's `to_yaml`, `@yaml` and `tostring` make of a *container or alias that is a

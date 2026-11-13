@@ -8830,6 +8830,22 @@ const PICK_REPLAY_MAX_BYTES: usize = 1 << 20;
 /// (`need_comments`). Supported pure reshapes instead get a traced side-tree
 /// (#3615); other computed values get [`CommentTree::empty`]. See
 /// [`CommentTree`]'s own doc comment for the provenance boundary.
+/// The program and the `-o xml` encoder stage `run_yq` appended to it, if that is how `expr` ends (#7156).
+fn split_xml_encoder(expr: &Expr) -> Option<(Expr, &XmlOptions)> {
+    let Expr::Pipe(stages) = expr else {
+        return None;
+    };
+    let (last, prefix) = stages.split_last()?;
+    let Expr::Format(FormatType::YqOutput(YqOutputEncoder::Xml(options))) = last else {
+        return None;
+    };
+    let inner = match prefix {
+        [only] => only.clone(),
+        _ => Expr::Pipe(prefix.to_vec().into()),
+    };
+    Some((inner, options))
+}
+
 fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
     cursor: YamlCursor<'_, W>,
     expr: &Expr,
@@ -8839,6 +8855,38 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
     sort_keys: bool,
     pristine_override: Option<(OwnedValue, CommentTree)>,
 ) -> Result<Vec<ResultWithComments>> {
+    // #7156: `-o xml` writes the comments of the node it is given, and a write or a built value holds
+    // them in its presentation tree and not on a cursor. So the filter runs without its encoder, with
+    // comments, and each result is encoded with the tree it came with.
+    // A plain read is not taken here: the encoder reads its comments off the cursor, which keeps a
+    // detail the tree does not (the line break a blank line leaves under a head comment).
+    if let Some((inner, options)) = split_xml_encoder(expr).filter(|(inner, _)| {
+        is_alias_sensitive_assign(inner)
+            || reshape_presentation::needed(inner)
+            || reshape_presentation::navigation_construction(inner)
+    }) {
+        let results = evaluate_yaml_cursor_core(
+            cursor,
+            &inner,
+            sink,
+            true,
+            strip_style,
+            sort_keys,
+            pristine_override,
+        )?;
+        let mut encoded = Vec::with_capacity(results.len());
+        for (value, tree) in results {
+            match jq::format_yq_xml_from_tree(options, &value, &tree, &cursor) {
+                Ok(text) => encoded.push((OwnedValue::String(text.into()), CommentTree::empty())),
+                // The results before the one the encoder refuses are printed (#6923).
+                Err(e) => {
+                    sink.report(DiagStyle::Yq, &e, &no_location());
+                    break;
+                }
+            }
+        }
+        return Ok(encoded);
+    }
     // Snapshot alias-sync context from the pristine document *before*
     // evaluation, only when it could possibly matter (#711): an
     // assignment-family expression against a document that actually has

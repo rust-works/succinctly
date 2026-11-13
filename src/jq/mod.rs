@@ -138,6 +138,7 @@ mod value;
 pub mod walk;
 mod yq_datetime;
 mod yq_xml;
+pub use eval_generic::format_yq_xml_from_tree;
 
 pub use error::{BinOp, Control, ErrorKind, EvalError, EvalErrorPayload};
 pub(crate) use eval::last_as_reduce;
