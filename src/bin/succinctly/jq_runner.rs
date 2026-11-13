@@ -20985,7 +20985,7 @@ mod tests {
                         return out;
                     }
                     jq::ProducedInput::Error(error, at) => {
-                        out.push(format!("error {error:?} {at:?}"))
+                        out.push(format!("error {error:?} {at:?}"));
                     }
                 }
             }
