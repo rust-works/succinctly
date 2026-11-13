@@ -93142,7 +93142,17 @@ fn eval_owned_expr_full<S: EvalSemantics>(
     }
 }
 
-/// [`eval_owned_relocating_fold`], then (#5712, jq mode) [`eval_owned_closed`]: an expression that
+/// [`eval_owned_value_doors`] (#7132), then [`eval_owned_relocating_fold`], then (#5712, jq mode)
+/// [`eval_owned_closed`].
+///
+/// The value doors are the lazy twin's own, for the stages that answer one value off the tree (a
+/// count, a verdict, a key list, `first`/`last`/`nth`). They never read the re-entry state, so they
+/// come before the scans [`eval_owned_input`] makes after this call (the embed table's witness walk is
+/// O(input) for a bound array): without them `$a | length > 5`, `$a | has(5)` and `$a | first` in a
+/// loop over a bound array wrote `$a` out as text and indexed it again for each call (3 to 9 ms
+/// over 100,000 elements, where jq takes 0.08).
+///
+/// The closed expression: an expression that
 /// never reads `.` is one value whatever the input is, as the lazy twin [`eval_each_owned`] answers
 /// it. Without it a stage that closes over a bound value (`. as $t | [range(25) | ($t | length)]`,
 /// where `$t` is a computed string or array) wrote the input out and indexed it again to evaluate a
@@ -93154,12 +93164,16 @@ fn eval_owned_expr_full<S: EvalSemantics>(
 /// into the recursive [`eval_owned_pipe`], and a second `Option<OwnedValue>` there cost it 80 bytes
 /// of frame per level in a debug build (`walk_impl_panics_past_nesting_depth_limit_1021` overflowed
 /// a 2 MB test stack on ARM64 Linux at 1021 levels). A change to this pair must keep that frame:
-/// `eval_owned_pipe` is 2944 bytes on aarch64 debug without it.
+/// `eval_owned_pipe` is 2944 bytes on aarch64 debug without it, which is why the value doors are
+/// answered from inside it and `eval_owned_input` has still the one call.
 #[inline(never)]
 fn eval_owned_relocated_or_closed<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
 ) -> Option<OwnedValue> {
+    if let Some(answer) = eval_owned_value_doors::<S>(expr, input) {
+        return Some(answer);
+    }
     if let Some(relocated) = eval_owned_relocating_fold::<S>(expr, input) {
         return Some(relocated);
     }
@@ -93202,14 +93216,6 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Ok(None) => QueryResult::None,
             Err(e) => e.into(),
         };
-    }
-    // #7132: the doors the lazy twin offers a stage right after its fast path, for the stages that
-    // answer one value off the tree. They never read `reentry`, so they come before the scans below
-    // (the embed table's witness walk is O(input) for a bound array). Without them `$a | length > 5`, `$a | has(5)` and `$a | keys` in a loop over a bound
-    // array wrote `$a` out as text and indexed it again for each call (6 to 25 ms over 100,000
-    // elements, where jq takes 0.08), the one cost every stage of a bridged pipe pays.
-    if let Some(answer) = eval_owned_value_doors::<S>(expr, input) {
-        return QueryResult::Owned(answer);
     }
     // #3180: the relocating fold and the embed peel, as in the lazy twin
     // [`eval_each_owned`]. An eager caller -- an array constructor's
@@ -93327,10 +93333,9 @@ fn eval_owned_first_last_nth<S: EvalSemantics>(
         Ok(Some(OwnedValue::Int(n))) if n.unsigned_abs() > 1 << 53 => None,
         // A container shares its storage with `input`, which the #2889 embed table witnesses while
         // it is live: that read is the evaluator's.
-        Ok(Some(element @ (OwnedValue::Array(_) | OwnedValue::Object(_))))
+        Ok(Some(OwnedValue::Array(_) | OwnedValue::Object(_)))
             if super::eval_generic::embed_table_active() =>
         {
-            let _ = element;
             None
         }
         Ok(Some(element)) => Some(element),
@@ -132277,7 +132282,12 @@ mod tests {
                 // Two or more stages: an owned pipe per level that has them.
                 (".a | tostring", 1),
                 ("[.a, .a] | map(. + 1)", 1),
-                (".a | . + 1 | tostring | length", 2),
+                // #7132: jq mode answers the `length` of the string from the string (one level fewer);
+                // yq's evaluator has not those doors for it.
+                (
+                    ".a | . + 1 | tostring | length",
+                    if S::TAG == EvalTag::Jq { 1 } else { 2 },
+                ),
             ] {
                 let parsed = parse(src).unwrap();
                 let rest: Vec<Expr> = match parsed.clone() {
