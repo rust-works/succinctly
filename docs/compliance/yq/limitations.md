@@ -7827,7 +7827,7 @@ The encoder runs over the value model, which keeps no node style or source spell
 - A boolean written `True`, `FALSE` or `yes` is `true` or `false`, where yq writes the source text.
 - The YAML 1.1 integers `1_000` and `0b11` are strings here (see the YAML 1.1 section above), so they are quoted, where yq writes them bare.
 - A timestamp (`2001-01-01`) and a `!!binary` scalar are quoted strings, where yq writes their text bare.
-- yq's inline-table hint is set only by its TOML decoder, and `-p toml` writes the nodes as YAML text that is read back, so a TOML file written back as TOML (`*.toml` under `-o auto`, `-i`) writes an inline table as a table and, for a run that read TOML, writes no comment (see `-p toml` below): yq's TOML decoder gives a comment to the value that follows it, which the YAML text the read produces can only hold as the key's or the first child's, so writing them would put them on the wrong node.
+- yq's inline-table hint is set only by its TOML decoder, and `-p toml` writes the nodes as YAML text that is read back, so a TOML file written back as TOML (`*.toml` under `-o auto`, `-i`) writes an inline table as a table and, for a run that read TOML, writes no comment (see `-p toml` below): yq's TOML decoder gives a comment to the value that follows it, which the YAML text the read produces can only hold as the key's or the first child's, so writing them would put them on the wrong node (#7170).
 
 ### `-o=kyaml` — a rebuilt value loses its comments (#6924, #7158)
 
