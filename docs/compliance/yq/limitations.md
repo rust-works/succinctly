@@ -1261,6 +1261,14 @@ $ succinctly yq --eval-all -o=json -I0 '. as $x | [$x]' f1.yaml f2.yaml
 `. as $d | $d` (no collect in the body) agrees, as does every other row of #2427's own
 capture table.
 
+### `//` reads both operands over the whole document list under `--eval-all` ([#7173](https://github.com/rust-works/succinctly/issues/7173))
+
+yq's `alternativeOperator` is a `crossFunctionWithPrefs` operator, so under `EvaluateTogether` it evaluates the left side over the list, keeps each truthy output, and for every other output emits all of the right side's outputs over the list (the output itself when the right side yields none); a left side with no output runs the right side once.
+The right side is evaluated when the first falsy output needs it, so an error in it raises only then.
+`succinctly yq` ran `//` once per document.
+26 rows over `a: 1` / `c: 3` / `e: 5` are pinned against yq v4.53.3 in `tests/yq_cli/i7173.rs`.
+Still differing, and not specific to `//`: a node a literal builds carries no file index in yq (`5 | fi` is `0 0 0`, `.zz // 5 | fi` is nine zeros, here `0 1 2` repeated), and an `as $x` binding or `. as $d | ...` over a list of several nodes (`(.a // 5) as $x | $x` is `1` in yq).
+
 ### `=` and `+=` read their right side once over the whole document list under `--eval-all` ([#7137](https://github.com/rust-works/succinctly/issues/7137))
 
 Real yq's `assignUpdateOperator` creates the left side's targets, evaluates the right side **once** against the context it was given, and applies that side's last output to every node.

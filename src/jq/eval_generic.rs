@@ -23259,6 +23259,12 @@ enum YqListStage {
     /// `.k = fi` writes the last file's index into every document (#7137). A right side that is a
     /// constant says nothing about the list and stays on the per-document route.
     Assign,
+    /// `//` over inputs that all carry `EvaluateTogether`: real yq's `alternativeOperator`
+    /// (`operator_alternative.go`, v4.53.3) is a `crossFunctionWithPrefs` operator, so under the flag
+    /// it evaluates the left side over the **whole** list, keeps each truthy output as it is, and for
+    /// each other one emits every output of the right side over the whole list (the output itself
+    /// when that yields none); a left side that yields nothing runs the right side once (#7173).
+    Alternative,
 }
 
 /// Whether the walk takes an assignment's right side over the list (#7137): there is a slot to hand
@@ -23342,6 +23348,10 @@ fn yq_list_stage(stages: &[Expr], together: bool) -> Option<(usize, YqListStage)
                 }
                 Expr::Reduce { .. } => {
                     found = Some((i, YqListStage::Fold));
+                    break;
+                }
+                _ if matches!(unwrap_paren(stage), Expr::Alternative(..)) => {
+                    found = Some((i, YqListStage::Alternative));
                     break;
                 }
                 Expr::Assign { path, value } | Expr::CompoundAssign { path, value, .. }
@@ -23515,6 +23525,12 @@ fn eval_yq_context_pipe<S: EvalSemantics, V: DocumentValue>(
             Ok(items) => items,
             Err(flow) => return flow,
         },
+        YqListStage::Alternative => {
+            match alternative_together::<S, V>(&stages[at], &context, optional, cur) {
+                Ok(items) => items,
+                Err(flow) => return flow,
+            }
+        }
         YqListStage::Assign => {
             match assign_together::<S, V>(&stages[at], &context, optional, cur) {
                 Ok(items) => items,
@@ -23529,6 +23545,55 @@ fn eval_yq_context_pipe<S: EvalSemantics, V: DocumentValue>(
     };
 
     eval_yq_context_pipe::<S, V>(rest, &produced, optional, cur, sink)
+}
+
+/// `//` over a context list whose entries all carry `EvaluateTogether` (#7173): both operands are
+/// read over the **whole** list, as `doCrossFunc` reads them (`operators.go`).
+///
+/// For each output of the left side: a truthy one is emitted as it is and the right side is not
+/// consulted (`LhsResultValue`); any other is replaced by every output of the right side, or kept
+/// itself when the right side yields none (`alternativeFunc` with a nil right). A left side with no
+/// output at all emits the right side's outputs once (`CalcWhenEmpty`). The right side is the same
+/// for every falsy output (it reads the list, not the output), so it is evaluated once, when the
+/// first one needs it, and an error in it surfaces only then. The outputs are the nodes the two
+/// sides produced, with the tags they carry.
+fn alternative_together<S: EvalSemantics, V: DocumentValue>(
+    stage: &Expr,
+    context: &[YqContextItem<V>],
+    optional: bool,
+    cur: &core::cell::Cell<YqContextTag>,
+) -> Result<Vec<YqContextItem<V>>, Flow> {
+    let Expr::Alternative(left, right) = unwrap_paren(stage) else {
+        // `yq_list_stage` matched exactly this to pick `at`.
+        // patchcov: coverage tolerate reason="unreachable: yq_list_stage routes only an Alternative here (#7173)"
+        unreachable!("yq_list_stage selects only an Alternative as an alternative stage")
+        // patchcov: coverage end
+    };
+    let over = |operand: &Expr| {
+        let mut flat: Vec<Expr> = Vec::new();
+        yq_flatten_pipe_stages(core::slice::from_ref(operand), &mut flat);
+        collect_yq_context::<S, V>(&flat, context, optional, cur).map_err(Flow::Escaped)
+    };
+    let lefts = over(left)?;
+    if lefts.is_empty() {
+        return over(right);
+    }
+    let mut rights: Option<Vec<YqContextItem<V>>> = None;
+    let mut out: Vec<YqContextItem<V>> = Vec::new();
+    for item in lefts {
+        if generic_item_is_truthy::<V>(&item.to_generic_item()) {
+            out.push(item);
+            continue;
+        }
+        if rights.is_none() {
+            rights = Some(over(right)?);
+        }
+        match rights.as_deref() {
+            Some([]) | None => out.push(item),
+            Some(replaced) => out.extend(replaced.iter().cloned()),
+        }
+    }
+    Ok(out)
 }
 
 /// `=` and the compound assignments over a context list whose entries all carry
