@@ -7024,10 +7024,10 @@ fn read_inputs(
     }
 
     // #7023: `-R` over a lone regular file reads its lines a window at a time, as the plain route
-    // reads its documents. Anything the gate turns down is read whole below.
-    if let Some((file, len)) = lone_raw_windowed_file(args, &files) {
-        let mut windows =
-            window::LineWindows::new(Box::new(file), Some(len), lazy_window_bytes(), Vec::new());
+    // reads its documents; #7024: so does `-R` over standard input. Anything the gate turns down is
+    // read whole below.
+    if let Some((reader, len, front)) = raw_windowed_source(args, &files) {
+        let mut windows = window::LineWindows::new(reader, len, lazy_window_bytes(), front);
         let first = windows
             .next_window(None, report_input_read_failure)
             .map(raw_window_text)
@@ -11265,20 +11265,92 @@ thread_local! {
 /// to word: every flag that has the route read the stream whole (`--slurp`, `--validate`, DSV), and
 /// every shape [`lone_regular_file`] turns down, keeps the route that reads it whole.
 fn lone_raw_windowed_file(args: &JqCommand, files: &[PathBuf]) -> Option<(std::fs::File, u64)> {
-    if !args.raw_input
-        || args.slurp
-        || args.stream
-        || args.stream_errors
-        || args.seq
-        || args.input_dsv.is_some()
-        || args.validate
-        || lazy_route_forced_off()
-    {
+    if !raw_window_flags(args) {
         return None;
     }
     let (path, meta) = lone_regular_file(files, raw_window_min_bytes())?;
     let file = std::fs::File::open(path).ok()?;
     Some((file, meta.len()))
+}
+
+/// Whether `-R` may read its source a window at a time: every flag that has the route read the stream
+/// whole (`--slurp`, `--validate`, `--seq`, the streaming parsers, DSV) turns it down. One test for the
+/// file [`lone_raw_windowed_file`] judges and for standard input ([`raw_windowed_stdin`]), so the two
+/// cannot drift apart.
+fn raw_window_flags(args: &JqCommand) -> bool {
+    args.raw_input
+        && !args.slurp
+        && !args.stream
+        && !args.stream_errors
+        && !args.seq
+        && args.input_dsv.is_none()
+        && !args.validate
+        && !lazy_route_forced_off()
+}
+
+/// What `-R` reads a window at a time: the source, how much of it is left when that is known, and the
+/// bytes already read from it, which come first.
+type RawWindowed = (Box<dyn Read>, Option<u64>, Vec<u8>);
+
+/// The source `-R` reads a window at a time (#7023), or `None` for a run that reads its input whole: the
+/// lone regular file named on the command line, or standard input when no file is named (#7024).
+fn raw_windowed_source(args: &JqCommand, files: &[PathBuf]) -> Option<RawWindowed> {
+    if files.is_empty() {
+        return if raw_window_flags(args) {
+            raw_windowed_stdin()
+        } else {
+            None
+        };
+    }
+    let (file, len) = lone_raw_windowed_file(args, files)?;
+    Some((Box::new(file), Some(len), Vec::new()))
+}
+
+/// Standard input for `-R` (#7024) when it is a regular file with 4 MiB or more left from the offset it
+/// stands at (`jq -R . < log`), or a pipe or socket that holds 4 MiB or more (`cat log | jq -R .`).
+/// A stream of lines has no fault to word, so neither is read again: a duplicate of descriptor 0 is read
+/// from where it stands, and a run that stops early leaves the descriptor where its last window ended,
+/// as jq does. A pipe's length is not known, so its first 4 MiB are read to learn it ([`probe_stdin_pipe`]).
+/// A terminal, a device, and every standard input [`stdin_to_window`] turns down are left to the route that
+/// reads it whole.
+#[cfg(unix)]
+fn raw_windowed_stdin() -> Option<RawWindowed> {
+    use std::os::unix::fs::FileTypeExt;
+    let (file, meta) = stdin_to_window()?;
+    let kind = meta.file_type();
+    if kind.is_file() {
+        raw_windowed_regular_stdin(file, &meta, raw_window_min_bytes())
+    } else if kind.is_fifo() || kind.is_socket() {
+        raw_windowed_pipe(file, raw_window_min_bytes())
+    } else {
+        None
+    }
+}
+
+#[cfg(not(unix))]
+fn raw_windowed_stdin() -> Option<RawWindowed> {
+    None
+}
+
+/// [`raw_windowed_stdin`] over a regular file it has judged: windowed when `min` bytes or more are left
+/// from the offset the handle stands at ([`regular_stdin_left`]). It is read to its end as the file stands
+/// when the reads get there, as the route that reads it whole reads it, so lines a writer appends while
+/// the run reads are read too.
+#[cfg(unix)]
+fn raw_windowed_regular_stdin(
+    mut file: std::fs::File,
+    meta: &std::fs::Metadata,
+    min: u64,
+) -> Option<RawWindowed> {
+    regular_stdin_left(&mut file, meta, min)?;
+    Some((Box::new(file), None, Vec::new()))
+}
+
+/// [`raw_windowed_stdin`] over a pipe it has judged, which is windowed once it holds `min` bytes.
+#[cfg(unix)]
+fn raw_windowed_pipe(file: std::fs::File, min: u64) -> Option<RawWindowed> {
+    let front = probe_stdin_pipe(&file, min)?;
+    Some((Box::new(file), None, front))
 }
 
 /// The lone regular file a `--seq` stream is read from a window at a time (#7082), in the shape
@@ -11450,43 +11522,98 @@ fn lone_regular_file(files: &[PathBuf], min_len: u64) -> Option<(&PathBuf, std::
 /// Standard input when it is a regular file of 4 MiB or more left to read (`jq … < file`, #7024),
 /// read by a duplicate of descriptor 0 from the offset it is at: the stream is what is left of the file
 /// from there, and the fault's second read is by position over the same bytes, which a pipe cannot give.
-/// A terminal, a pipe, a device and a stdin something has already read from (its bytes are held for the
-/// route that reads them whole, [`STDIN_PUSHBACK`]) are left to that route.
+/// A terminal, a pipe, a device and every standard input [`stdin_to_window`] turns down are left to that
+/// route.
 #[cfg(unix)]
 fn windowed_stdin_file() -> Option<(window::WindowedFiles, std::rc::Rc<window::Reread>)> {
+    let (file, _) = stdin_to_window()?;
+    windowed_regular_stdin(file, false)
+}
+
+/// Whether a failed read says the descriptor was not opened for reading (`EBADF`: `jq . 0>file`). Rust's
+/// own standard input reads such a descriptor as empty, which is how the route that reads it whole has
+/// always answered, so a windowed route declines it rather than report a failure that route never meets
+/// (#7024). `EBADF` is 9 on every Unix.
+#[cfg(unix)]
+fn not_open_for_reading(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(9)
+}
+
+/// Standard input as a windowed route may read it (#7024): a duplicate of descriptor 0, with its `stat`.
+/// `None` when something has read it already (its bytes are held for the route that reads them whole,
+/// [`STDIN_PUSHBACK`]), or when the run also writes to it (`jq . <> f >&0`): the windows are read a few at
+/// a time while the output is written, so its writes would land where the next window is read from, and
+/// the whole-file route had read all of it first. Which shapes a route takes, and how much of one, is the
+/// route's to judge, through [`regular_stdin_left`] and [`probe_stdin_pipe`]; the plain route, `--seq` and
+/// `-R` all start here, so they cannot drift apart on what standard input they may read.
+#[cfg(unix)]
+fn stdin_to_window() -> Option<(std::fs::File, std::fs::Metadata)> {
     use std::os::fd::AsFd;
     if STDIN_PUSHBACK.with(|slot| slot.borrow().is_some()) {
         return None;
     }
     let file = std::fs::File::from(std::io::stdin().as_fd().try_clone_to_owned().ok()?);
-    // The windows are read a few at a time while the output is written, so a stdin that is also an
-    // output (`jq . <> f >&0`) would have its writes land where the next read comes from, and its
-    // bytes overwritten while still being read: the whole-file route had read all of it first.
-    let shares_output = names_output(&file.metadata().ok()?);
-    windowed_regular_stdin(file, shares_output)
+    let meta = file.metadata().ok()?;
+    (!names_output(&meta)).then_some((file, meta))
 }
 
-/// [`windowed_stdin_file`] over a handle on descriptor 0 (its half that does not read the process's own
-/// descriptors): `None` for anything but a regular file with 4 MiB or more left from the offset the handle
-/// is at, or one the run also writes to.
+/// Where a regular file on standard input stands, and how much of it is left from there, when that is
+/// `min` bytes or more and the descriptor can be read (a one-byte read by position, which moves nothing,
+/// finds one opened only for writing, [`not_open_for_reading`]); `None` for anything else.
 #[cfg(unix)]
-fn windowed_regular_stdin(
-    mut file: std::fs::File,
-    shares_output: bool,
-) -> Option<(window::WindowedFiles, std::rc::Rc<window::Reread>)> {
+fn regular_stdin_left(
+    file: &mut std::fs::File,
+    meta: &std::fs::Metadata,
+    min: u64,
+) -> Option<(u64, u64)> {
     use std::io::Seek;
-    if shares_output {
-        return None;
-    }
-    let meta = file.metadata().ok()?;
+    use std::os::unix::fs::FileExt;
     if !meta.is_file() {
         return None;
     }
     let start = file.stream_position().ok()?;
     let len = meta.len().checked_sub(start)?;
-    if len < window::MIN_WINDOWED_FILE_BYTES {
+    let unreadable = file
+        .read_at(&mut [0u8], start)
+        .is_err_and(|error| not_open_for_reading(&error));
+    (len >= min && !unreadable).then_some((start, len))
+}
+
+/// The front of a pipe on standard input, read to learn whether it holds `min` bytes, since its length is
+/// not known: the bytes when it does. A pipe that ends sooner hands what it held, and the failure if a
+/// read failed, to the route that reads it whole ([`STDIN_PUSHBACK`], [`STDIN_PUSHBACK_ERROR`]), as if
+/// that route had read them itself, and this returns `None`. A probe that reads all `min` bytes cannot have
+/// failed, since its reads stop at the limit. A descriptor not opened for reading reads as empty, as Rust's
+/// standard input reads it ([`not_open_for_reading`]).
+#[cfg(unix)]
+fn probe_stdin_pipe(file: &std::fs::File, min: u64) -> Option<Vec<u8>> {
+    // The probe's whole size at once, so that its bytes are not grown and copied on the way.
+    let mut front = Vec::with_capacity(usize::try_from(min).unwrap_or(0));
+    let error = Read::take(file, min)
+        .read_to_end(&mut front)
+        .err()
+        .filter(|error| !not_open_for_reading(error));
+    if (front.len() as u64) < min {
+        STDIN_PUSHBACK_ERROR.with(|slot| *slot.borrow_mut() = error);
+        STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = Some(front));
         return None;
     }
+    Some(front)
+}
+
+/// [`windowed_stdin_file`] over a handle on descriptor 0 (its half that does not read the process's own
+/// descriptors): `None` for anything but a regular file with 4 MiB or more left from the offset the handle
+/// is at ([`regular_stdin_left`]), or one the run also writes to.
+#[cfg(unix)]
+fn windowed_regular_stdin(
+    mut file: std::fs::File,
+    shares_output: bool,
+) -> Option<(window::WindowedFiles, std::rc::Rc<window::Reread>)> {
+    if shares_output {
+        return None;
+    }
+    let meta = file.metadata().ok()?;
+    let (start, len) = regular_stdin_left(&mut file, &meta, window::MIN_WINDOWED_FILE_BYTES)?;
     let reread = window::Reread::new(&file, start, len, PathBuf::new()).ok()?;
     Some((
         window::WindowedFiles::new(vec![(std::rc::Rc::new(file), len)], window::WINDOW_BYTES),
@@ -11504,41 +11631,30 @@ fn windowed_stdin_file() -> Option<(window::WindowedFiles, std::rc::Rc<window::R
 /// what it held to the route that reads it whole ([`STDIN_PUSHBACK`]), as if it had read it itself. It
 /// cannot be read again for a fault's wording, so its windows are certified as they are read and the
 /// first fault is kept ([`window::WindowedFile::from_pipe`]). A terminal is left to the route that reads
-/// it whole (it is typed into, and seldom holds 4 MiB), and so are a device, a stdin something has read
-/// from already, and one the run also writes to.
+/// it whole (it is typed into, and seldom holds 4 MiB), and so are a device and every standard input
+/// [`stdin_to_window`] turns down.
 #[cfg(unix)]
 fn windowed_stdin_pipe() -> Option<WindowedSource> {
-    use std::os::fd::AsFd;
     use std::os::unix::fs::FileTypeExt;
-    if STDIN_PUSHBACK.with(|slot| slot.borrow().is_some()) {
-        return None;
-    }
-    let file = std::fs::File::from(std::io::stdin().as_fd().try_clone_to_owned().ok()?);
-    let meta = file.metadata().ok()?;
+    let (file, meta) = stdin_to_window()?;
     let kind = meta.file_type();
-    if !(kind.is_fifo() || kind.is_socket()) || names_output(&meta) {
+    if !(kind.is_fifo() || kind.is_socket()) {
         return None;
     }
     windowed_pipe(file, window::MIN_WINDOWED_FILE_BYTES)
 }
 
-/// [`windowed_stdin_pipe`] over a pipe it has judged, which is windowed once it holds `min` bytes.
+/// [`windowed_stdin_pipe`] over a pipe it has judged, which is windowed once it holds `min` bytes
+/// ([`probe_stdin_pipe`]). A read that fails past the probe is the stream's end, reported after the
+/// documents before it as on a regular file.
 #[cfg(unix)]
 fn windowed_pipe(file: std::fs::File, min: u64) -> Option<WindowedSource> {
-    let mut front = Vec::new();
-    // A read that fails past the minimum is the stream's end, reported after the documents before it as
-    // one further on is; one that fails sooner is the whole route's to report, as it was.
-    let error = (&file).take(min).read_to_end(&mut front).err();
-    if (front.len() as u64) < min {
-        STDIN_PUSHBACK_ERROR.with(|slot| *slot.borrow_mut() = error);
-        STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = Some(front));
-        return None;
-    }
+    let front = probe_stdin_pipe(&file, min)?;
     let seen = window::SeenFault::default();
     let reader = window::WindowedFiles::pipe(
         std::rc::Rc::new(file),
         front,
-        error,
+        None,
         window::WINDOW_BYTES,
         seen.clone(),
     );
@@ -20816,6 +20932,148 @@ mod tests {
         }
         assert_eq!(count, 20);
         assert_eq!(reread.stream_fault(), None);
+    }
+
+    /// #7024: `-R` over a pipe on standard input reads it a window at a time only once it holds the
+    /// minimum, and its lines are the pipe's bytes, the probe's first; a shorter pipe hands what it held to
+    /// the route that reads it whole.
+    #[cfg(unix)]
+    #[test]
+    fn a_raw_pipe_is_windowed_only_once_it_holds_the_minimum_7024() {
+        use std::io::Write;
+        let piped = |bytes: &[u8]| {
+            let (reader, mut writer) = std::io::pipe().expect("pipe");
+            writer.write_all(bytes).expect("write");
+            drop(writer);
+            std::fs::File::from(std::os::fd::OwnedFd::from(reader))
+        };
+        STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = None);
+        assert!(raw_windowed_pipe(piped(b"a\nb\n"), 64).is_none());
+        assert_eq!(
+            STDIN_PUSHBACK.with(|slot| slot.borrow_mut().take()),
+            Some(b"a\nb\n".to_vec())
+        );
+        assert!(STDIN_PUSHBACK_ERROR
+            .with(|slot| slot.borrow_mut().take())
+            .is_none());
+        // A stream with a last line that has no line break, cut by the probe in the middle of a line.
+        let mut stream = b"line one\n".repeat(30);
+        stream.extend_from_slice(b"no break");
+        let (reader, len, front) = raw_windowed_pipe(piped(&stream), 64).expect("windowed");
+        assert_eq!((len, front.as_slice()), (None, &stream[..64]));
+        assert!(STDIN_PUSHBACK.with(|slot| slot.borrow().is_none()));
+        let mut windows = window::LineWindows::new(reader, len, 16, front);
+        let mut read = Vec::new();
+        while let Some(bytes) = windows.next_window(None, |error| panic!("{error}")) {
+            assert!(
+                bytes.ends_with(b"\n") || windows.finished(),
+                "a window ends at a line break"
+            );
+            read.extend(bytes);
+        }
+        assert_eq!(read, stream);
+    }
+
+    /// #7024: `-R` over a regular file on standard input reads what is left of it from the offset the
+    /// descriptor stands at, and only when the minimum is left from there; it reads to the end the file has
+    /// when the reads get there, as the whole route does, so lines appended meanwhile are read too.
+    #[cfg(unix)]
+    #[test]
+    fn a_redirected_raw_file_is_windowed_from_its_offset_7024() {
+        use std::io::{Seek, SeekFrom, Write};
+        let bytes: Vec<u8> = (0..100u8)
+            .map(|i| if i % 10 == 9 { b'\n' } else { b'a' + i % 10 })
+            .collect();
+        let mut file = tempfile::tempfile().expect("tempfile");
+        file.write_all(&bytes).expect("write");
+        let meta = file.metadata().expect("metadata");
+        file.seek(SeekFrom::Start(41)).expect("seek");
+        assert!(raw_windowed_regular_stdin(file.try_clone().expect("dup"), &meta, 60).is_none());
+        file.seek(SeekFrom::Start(33)).expect("seek");
+        let (reader, len, front) =
+            raw_windowed_regular_stdin(file.try_clone().expect("dup"), &meta, 60)
+                .expect("windowed");
+        assert_eq!((len, front.len()), (None, 0));
+        let mut windows = window::LineWindows::new(reader, len, 8, front);
+        let mut read = windows
+            .next_window(None, |error| panic!("{error}"))
+            .expect("a first window");
+        // A writer appends a line after the run started reading.
+        std::os::unix::fs::FileExt::write_at(&file, b"more\n", 100).expect("append");
+        while let Some(window) = windows.next_window(None, |error| panic!("{error}")) {
+            read.extend(window);
+        }
+        let mut grown = bytes[33..].to_vec();
+        grown.extend_from_slice(b"more\n");
+        assert_eq!(read, grown);
+        // The descriptor is shared, so it is left where the windows ended: here, at the end.
+        assert_eq!(file.stream_position().expect("position"), 105);
+    }
+
+    /// #7024: a standard input that was not opened for reading (`jq . 0>file`, `jq . 0> >(cat)`) is not
+    /// windowed, whatever its size: Rust's own standard input reads it as empty, which is the answer the
+    /// route that reads it whole has always given, where a window's read would report `EBADF`.
+    #[cfg(unix)]
+    #[test]
+    fn a_stdin_not_open_for_reading_is_left_to_the_whole_route_7024() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("big.txt");
+        std::fs::write(&path, b"line\n".repeat(40)).expect("write");
+        let mut written = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open for writing");
+        let meta = written.metadata().expect("metadata");
+        assert!(regular_stdin_left(&mut written, &meta, 64).is_none());
+        let mut readable = std::fs::File::open(&path).expect("open");
+        assert_eq!(regular_stdin_left(&mut readable, &meta, 64), Some((0, 200)));
+        // The write end of a pipe, as standard input: the probe reads it as an empty pipe, with no failure.
+        let (_reader, mut writer) = std::io::pipe().expect("pipe");
+        writer.write_all(b"x").expect("write");
+        let writer = std::fs::File::from(std::os::fd::OwnedFd::from(writer));
+        STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = None);
+        assert!(probe_stdin_pipe(&writer, 64).is_none());
+        assert_eq!(
+            STDIN_PUSHBACK.with(|slot| slot.borrow_mut().take()),
+            Some(Vec::new())
+        );
+        assert!(STDIN_PUSHBACK_ERROR
+            .with(|slot| slot.borrow_mut().take())
+            .is_none());
+    }
+
+    /// #7024: every flag that has `-R` read its input whole keeps standard input off the windowed route
+    /// too, without reading it: [`raw_windowed_source`] returns before it looks at standard input.
+    #[test]
+    fn raw_window_flags_keep_the_whole_route_for_stdin_too_7024() {
+        use clap::Parser;
+        let parse = |flags: &[&str]| {
+            let mut argv = vec!["jq"];
+            argv.extend(flags);
+            argv.push(".");
+            JqCommand::try_parse_from(argv).unwrap()
+        };
+        assert!(raw_window_flags(&parse(&["-R"])));
+        assert!(raw_window_flags(&parse(&["-R", "-n"])));
+        assert!(!raw_window_flags(&parse(&[])));
+        for flags in [
+            &["-R", "-s"][..],
+            &["-R", "--stream"],
+            &["-R", "--stream-errors"],
+            &["-R", "--seq"],
+            &["-R", "--validate"],
+            &["-R", "--input-dsv", ","],
+        ] {
+            let cmd = parse(flags);
+            assert!(!raw_window_flags(&cmd), "{flags:?}");
+            STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = None);
+            assert!(raw_windowed_source(&cmd, &[]).is_none(), "{flags:?}");
+            assert!(
+                STDIN_PUSHBACK.with(|slot| slot.borrow().is_none()),
+                "{flags:?} reads nothing from standard input"
+            );
+        }
     }
 
     /// #6451: [`lone_lazy_read`] admits only what the lone source's branch of [`get_inputs`] takes

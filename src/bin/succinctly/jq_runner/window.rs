@@ -1379,6 +1379,16 @@ impl LineWindows {
     ) -> Option<Vec<u8>> {
         let mut bytes = std::mem::take(&mut self.carried);
         let mut ask = want.unwrap_or(self.block).max(1);
+        // #7024: bytes carried in that make a window already (a pipe's probe of 4 MiB) are handed out as
+        // one, up to their last line break. Reading a block onto them would grow the probe's buffer to
+        // twice its size, and a window to the probe and a block. The bytes carried after a window are
+        // past its last line break, so they hold none and are never cut here.
+        if bytes.len() >= ask {
+            if let Some(at) = last_line_break(&bytes) {
+                self.carried = bytes.split_off(at + 1);
+                return Some(bytes);
+            }
+        }
         let mut on_error = Some(on_error);
         loop {
             if !self.eof {
@@ -2210,6 +2220,45 @@ mod tests {
         assert_eq!(shrunk.next_window(None, |_| ()), Some(b"y\n".to_vec()));
         assert_eq!(shrunk.next_window(None, |_| ()), None);
         assert!(shrunk.finished());
+    }
+
+    /// #7024: bytes carried in that make a window already (a pipe's probe) are handed out as one, up to
+    /// their last line break, before anything more is read: the probe is not grown by a block. The rest
+    /// of the source follows, its first window led by what the probe held past that line break.
+    #[test]
+    fn a_carried_front_that_makes_a_window_is_handed_out_unread_7024() {
+        struct Counted(io::Cursor<Vec<u8>>, Rc<std::cell::Cell<usize>>);
+        impl io::Read for Counted {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.1.set(self.1.get() + 1);
+                self.0.read(buf)
+            }
+        }
+        let reads = Rc::new(std::cell::Cell::new(0));
+        let mut windows = LineWindows::new(
+            Box::new(Counted(
+                io::Cursor::new(b"ef\ngh\n".to_vec()),
+                Rc::clone(&reads),
+            )),
+            None,
+            4,
+            b"a\nbc\nd".to_vec(),
+        );
+        assert_eq!(windows.next_window(None, |_| ()), Some(b"a\nbc\n".to_vec()));
+        assert_eq!(reads.get(), 0, "the front is a window without a read");
+        let mut rest = Vec::new();
+        while let Some(window) = windows.next_window(None, |_| ()) {
+            rest.extend(window);
+        }
+        assert_eq!(rest, b"def\ngh\n".to_vec());
+        // A front shorter than a block, or with no line break, is read on as before.
+        let mut short = LineWindows::new(
+            Box::new(io::Cursor::new(b"y\n".to_vec())),
+            None,
+            8,
+            b"x\n".to_vec(),
+        );
+        assert_eq!(short.next_window(None, |_| ()), Some(b"x\ny\n".to_vec()));
     }
 
     /// #7023: a read that fails ends the source with the lines before it, and the line it cut is not

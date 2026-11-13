@@ -11,7 +11,11 @@ bug in the window. A regular file on standard input is windowed too since #7059,
 side. The programs avoid `input_line_number` and `input`, which leave the route: the line a document was read on
 shows in the `(at <file N>:LINE)` of a runtime error. `--pipe` feeds each stream on a pipe on standard input
 instead, which is windowed too (#7024) and words its first fault as it reads, against the same pipe
-named `/dev/stdin`, which is read whole. (The seeds of #7048's runs do not reproduce: the generator
+named `/dev/stdin`, which is read whole. `--raw` runs `-R` programs over the same streams read as lines
+(#7024): with `--pipe` on a pipe, and without it as a regular file on standard input (`jq -R . < file`),
+at offset 0 or at a random one, each against the bytes from there on a pipe named `/dev/stdin`. A stream of
+lines has no fault, so these cases test where windows cut lines: invalid UTF-8, NULs, a lone CR, a BOM,
+very long lines and no final line break. (The seeds of #7048's runs do not reproduce: the generator
 now cuts the stream into files and picks among more programs.)
 
 The streams mix the shapes that decide where a window ends: documents of every kind, pretty-printed ones that
@@ -28,7 +32,7 @@ prove nothing, so a case that comes out shorter is a bug of the generator and st
 
 Usage:
     cargo build --release --features cli,simd,regex,serde
-    scripts/jq-windowed-file-fuzz.py [--bin PATH] [-n N] [--seed S] [--work DIR] [--files K | --pipe] [--cap-mb MB]
+    scripts/jq-windowed-file-fuzz.py [--bin PATH] [-n N] [--seed S] [--work DIR] [--files K | --pipe] [--raw] [--cap-mb MB]
 Each case takes about 0.2 s with a release build. Exit 1 on any difference (a timeout, a crash of the
 script's own and a run that exceeds `--cap-mb` of address space count as one); the stream that differed is
 kept in `--work` as `windowed-fuzz-<seed>-<case>-<file>.json` (one per file), and the case is printed with the mutations applied,
@@ -70,6 +74,19 @@ FILE_PROGRAMS = [
     ["-c", 'select((.id? // 0) % 4001 == 0) | error("e")'],
     ["-c", "[input_filename, ([.. | numbers] | length)]"],
     ["-r", "input_filename"],
+]
+
+# `-R` programs (#7024): each line is a string, so a line's bytes, its number and the count of lines are the
+# answer. `input_filename` is left out: the whole side names its pipe `/dev/stdin`, where a stdin has none.
+RAW_PROGRAMS = [
+    ["-R", "."],
+    ["-R", "length"],
+    ["-nR", "[inputs] | length"],
+    ["-nR", "first(inputs)"],
+    ["-nR", "reduce inputs as $l (0; . + ($l | length))"],
+    ["-rR", 'select(test("id\\":[0-9]*7[,}]"))'],
+    ["-R", "-e", 'select(startswith("{\\"id\\":12345,"))'],
+    ["-R", 'if length % 997 == 0 then error("e") else empty end'],
 ]
 
 MUTATIONS = [
@@ -254,6 +271,22 @@ def run_files(args, rng, data, case, program, work, seed):
     return windowed, whole, names, [len(piece) for piece in pieces]
 
 
+def run_stdin_file(args, rng, data, program, work, seed):
+    """One `-R` case on a regular file on standard input (#7024): windowed (the file, from an offset) and
+    whole (the bytes from there on a pipe named `/dev/stdin`), compared."""
+    # Any offset that leaves the minimum to read, so the windowed side stays windowed.
+    offset = 0 if rng.random() < 0.6 else rng.randrange(len(data) - MIN_BYTES + 1)
+    name = os.path.join(work, "windowed-fuzz-%d-stdin.json" % seed)
+    with open(name, "wb") as handle:
+        handle.write(data)
+    with open(name, "rb") as handle:
+        handle.seek(offset)
+        windowed = run(args.bin, program, args.cap_mb, stdin=handle)
+    whole = run(args.bin, program + ["/dev/stdin"], args.cap_mb, feed=data[offset:])
+    whole = tuple(part.replace(b"/dev/stdin", b"<stdin>") if isinstance(part, bytes) else part for part in whole)
+    return windowed, whole, ["<stdin from %d>" % offset], [len(data) - offset]
+
+
 def run_pipe(args, data, program):
     """One case on a pipe (#7024): windowed (the pipe on standard input) and whole (the same pipe named
     `/dev/stdin`, which the windowed routes decline), compared."""
@@ -274,7 +307,11 @@ def main():
     parser.add_argument("--cap-mb", type=int, default=8000, help="RLIMIT_AS of each run, in MiB (Linux)")
     parser.add_argument("--pipe", action="store_true",
                         help="feed each stream on a pipe on standard input instead (#7024); one file only")
+    parser.add_argument("--raw", action="store_true",
+                        help="run -R programs (#7024): on a pipe with --pipe, else as a regular file on standard input")
     args = parser.parse_args()
+    if args.raw and args.files != 1:
+        sys.exit("--raw is one stream on standard input: give no --files")
     if args.pipe and args.files != 1:
         sys.exit("--pipe is one stream: give no --files")
     if not 1 <= args.files <= 32:
@@ -290,9 +327,14 @@ def main():
         if len(data) < MIN_BYTES:
             sys.exit("generator bug: case %d is %d bytes, under the windowed route's minimum" % (case, len(data)))
         # A pipe has no file name, and `/dev/stdin` has one: `input_filename` would tell them apart.
-        program = rng.choice(PROGRAMS if args.pipe else PROGRAMS + FILE_PROGRAMS * 2)
+        if args.raw:
+            program = rng.choice(RAW_PROGRAMS)
+        else:
+            program = rng.choice(PROGRAMS if args.pipe else PROGRAMS + FILE_PROGRAMS * 2)
         try:
-            if args.pipe:
+            if args.raw and not args.pipe:
+                windowed, whole, names, sizes = run_stdin_file(args, rng, data, program, work, args.seed)
+            elif args.pipe:
                 windowed, whole, names, sizes = run_pipe(args, data, program)
             else:
                 windowed, whole, names, sizes = run_files(args, rng, data, case, program, work, args.seed)
@@ -309,7 +351,7 @@ def main():
             differences += 1
             kept = [os.path.join(work, "windowed-fuzz-%d-%d-%d.json" % (args.seed, case, n))
                     for n in range(len(names))]
-            if args.pipe:
+            if args.pipe or args.raw:
                 with open(kept[0], "wb") as handle:
                     handle.write(data)
             else:
@@ -319,12 +361,12 @@ def main():
                 (at for at, (a, b) in enumerate(zip(windowed[0], whole[0])) if a != b),
                 min(len(windowed[0]), len(whole[0])),
             )
-            print("DIFFERENCE case=%d program=%s mutations=%s sizes=%s exit=%d/%d stdout_differs_at=%s kept=%s"
-                  % (case, program, notes, sizes, windowed[2], whole[2],
+            print("DIFFERENCE case=%d program=%s mutations=%s sources=%s sizes=%s exit=%d/%d stdout_differs_at=%s kept=%s"
+                  % (case, program, notes, names, sizes, windowed[2], whole[2],
                      first if windowed[0] != whole[0] else "-", kept))
             if windowed[1] != whole[1]:
-                print("  files:", windowed[1][:300])
-                print("  fds  :", whole[1][:300])
+                print("  windowed:", windowed[1][:300])
+                print("  whole   :", whole[1][:300])
     print("%d cases, %d differences, seed %d, %.0fs" % (args.n, differences, args.seed, time.time() - started))
     sys.exit(1 if differences else 0)
 
