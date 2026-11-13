@@ -24024,12 +24024,15 @@ fn cross_together<S: EvalSemantics, V: DocumentValue>(
     // The left operand, whose origin an arithmetic result keeps (#6969): only when it is a node
     // that has one, and only when its outputs reach the pairing as they are produced (an operand
     // the settled strategy collects first would leave the last output's origin for every pairing).
-    let (left_expr, keeps_left_origin) = match stage {
-        Expr::Compare { left, .. } => (&**left, false),
-        Expr::Arithmetic { left, right, .. } => (
-            &**left,
-            yq_operand_keeps_origin(left) && !settles_both(left, right),
-        ),
+    // Also whether it keeps `EvaluateTogether` (#6973): yq's arithmetic result is a copy of its left
+    // node (`lhs.Copy()`), so it carries that node's flag, which a node the left operand built or
+    // navigated to does not have. Both are read as each left output arrives.
+    let (left_expr, keeps_left_origin, tracks_left) = match stage {
+        Expr::Compare { left, .. } => (&**left, false, false),
+        Expr::Arithmetic { left, right, .. } => {
+            let settled = settles_both(left, right);
+            (&**left, yq_operand_keeps_origin(left) && !settled, !settled)
+        }
         // Closed by `yq_list_stage` (see the match below).
         // patchcov: coverage tolerate reason="unreachable: `yq_list_stage` routes only Compare and Arithmetic here, the same arm the match below closes (#2549)"
         _ => unreachable!("yq_list_stage selects only Compare/Arithmetic as a binary stage"),
@@ -24040,6 +24043,7 @@ fn cross_together<S: EvalSemantics, V: DocumentValue>(
     // each output arrives. (`cur` is not: the right operand's walk that follows each output moves
     // it on before the entry's next output arrives.)
     let left_origin: core::cell::Cell<Option<NodeOrigin>> = core::cell::Cell::new(None);
+    let left_together = core::cell::Cell::new(false);
     let read_only_operands = matches!(
         stage,
         Expr::Compare {
@@ -24061,10 +24065,11 @@ fn cross_together<S: EvalSemantics, V: DocumentValue>(
                 read_only_operands.then(|| yq_read_only_context::restore(previous));
             operand_sink.push(item)
         });
-        if keeps_left_origin && core::ptr::eq(operand, left_expr) {
+        if tracks_left && core::ptr::eq(operand, left_expr) {
             let budget = outside.budget();
             let mut noting = forward_budget(budget, |item: GenericItem<V>| -> Demand {
                 left_origin.set(node_origin::current());
+                left_together.set(cur.get().together);
                 outside.push(item)
             });
             eval_yq_context_pipe::<S, V>(&flat, context, false, cur, &mut noting)
@@ -24074,13 +24079,14 @@ fn cross_together<S: EvalSemantics, V: DocumentValue>(
     };
     let mut produced: Vec<YqContextItem<V>> = Vec::new();
     let mut stray: Option<Control> = None;
-    // A pairing is a value the operator computed, so it does not carry `EvaluateTogether`:
-    // `. + {"z": 9} | [.]` is one array per result, matching real yq. An arithmetic result does
-    // keep where its left operand was read (`. * {"z": 1} | document_index` is each document's
-    // own), and a comparison's boolean is a node of its own with no origin (#6969).
+    // An arithmetic result is a copy of its left operand's node, so it keeps where that was read
+    // (`. * {"z": 1} | document_index` is each document's own, #6969) and whether it was one of the
+    // list (`. + {"z": 9} | [.]` is one array of every result, and a second `+` crosses them,
+    // #6973); a left operand that navigated or built its node has no flag (`.x + 1 | [.]` is one
+    // array per result). A comparison's boolean is a node of its own, with neither.
     let mut collect = |item: GenericItem<V>| {
         let tag = YqContextTag {
-            together: false,
+            together: tracks_left && left_together.get(),
             origin: if keeps_left_origin {
                 left_origin.get()
             } else {
