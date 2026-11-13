@@ -13559,7 +13559,7 @@ fn first_document_file_is_lazy(
     }
     bytes.truncate(front);
     // Up to the last whole character: the front may end inside one.
-    let valid = std::str::from_utf8(&bytes).map_or_else(|e| e.valid_up_to(), |text| text.len());
+    let valid = std::str::from_utf8(&bytes).map_or_else(|e| e.valid_up_to(), str::len);
     let text = std::str::from_utf8(&bytes[..valid]).ok()?;
     Some(lazy_json_scan_chunk(text, 0, lazy_chunk_budget(0)).end == ChunkEnd::More)
 }
@@ -13631,6 +13631,10 @@ fn check_file_text(file: &mut std::fs::File, start: u64) -> Option<FileText> {
     })
 }
 
+/// One source [`defer_windowed_lazy_sources`] defers: the text read of it so far, the documents of its
+/// first chunk in that text, and the rest of it to read.
+type WindowedLazySource = (String, Vec<(usize, usize)>, LazyRest);
+
 /// The read of a stream the lazy route reads a window at a time, for [`get_inputs`] to hand over:
 /// `sources` deferred in order, each with the text read of it so far, the documents of its first chunk
 /// in that text, and the rest of it to read. A lone source starts on its front (#6451, #7023), with a
@@ -13639,7 +13643,7 @@ fn check_file_text(file: &mut std::fs::File, start: u64) -> Option<FileText> {
 fn defer_windowed_lazy_sources(
     files: &[PathBuf],
     opened: &mut Vec<PathBuf>,
-    sources: Vec<(String, Vec<(usize, usize)>, LazyRest)>,
+    sources: Vec<WindowedLazySource>,
 ) -> Inputs {
     *opened = files.to_vec();
     let mut locations =
