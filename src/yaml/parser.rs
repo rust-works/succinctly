@@ -2183,7 +2183,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         if self.opens_flow_collection(self.pos, false) {
             return;
         }
-        let kept = std::mem::replace(&mut self.pending_head_lines, below);
+        let kept = core::mem::replace(&mut self.pending_head_lines, below);
         self.mark_blank_runs_in_pending();
         self.deferred_foot_lines
             .append(&mut self.pending_head_lines);
