@@ -513,21 +513,6 @@ fn key_text(name: &str, indent: &str) -> String {
     }
 }
 
-/// `text` with every line after the first indented by `indent`.
-fn hang(text: &str, indent: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for (n, line) in text.split('\n').enumerate() {
-        if n > 0 {
-            out.push('\n');
-            if !line.is_empty() {
-                out.push_str(indent);
-            }
-        }
-        out.push_str(line);
-    }
-    out
-}
-
 /// The writer: the text so far and the foot comments of sequences that yq's encoder holds back.
 ///
 /// go-yaml writes a scalar's foot comment right after the scalar and a mapping entry's right after
@@ -555,7 +540,7 @@ impl Writer {
         }
         if let Some(text) = text {
             self.out.push(' ');
-            let rendered = hang(&string_scalar(text, &child), &child);
+            let rendered = string_scalar(text, &child);
             match rendered.split_once('\n') {
                 Some((header, body)) if header.starts_with(['|', '>']) => {
                     self.out.push_str(header);
@@ -753,4 +738,159 @@ pub(super) fn transcode(raw: &[u8], options: &XmlOptions) -> Result<Vec<u8>, Str
         write_comment(&mut writer.out, &comment, "");
     }
     Ok(writer.out.into_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn yaml(input: &str) -> String {
+        String::from_utf8(transcode(input.as_bytes(), &XmlOptions::default()).unwrap()).unwrap()
+    }
+
+    fn error(input: &str) -> String {
+        transcode(input.as_bytes(), &XmlOptions::default()).unwrap_err()
+    }
+
+    #[test]
+    fn an_element_is_a_mapping_of_its_attributes_and_children() {
+        assert_eq!(yaml("<a>1</a>"), "a: \"1\"\n");
+        assert_eq!(
+            yaml("<a x=\"1\">hi<b>2</b><c/></a>"),
+            "a:\n  +content: hi\n  +@x: \"1\"\n  b: \"2\"\n  c:\n"
+        );
+        assert_eq!(
+            yaml("<a><b>1</b><b>2</b><b><c/></b></a>"),
+            "a:\n  b:\n    - \"1\"\n    - \"2\"\n    - c:\n"
+        );
+        assert_eq!(
+            yaml("<a>x<b/>y</a>"),
+            "a:\n  +content:\n    - x\n    - y\n  b:\n"
+        );
+        assert_eq!(
+            yaml("<r><b/><b>x<![CDATA[y]]></b></r>"),
+            "r:\n  b:\n    -\n    - - x\n      - y\n"
+        );
+    }
+
+    #[test]
+    fn an_empty_input_and_a_bare_root_are_a_null_document() {
+        assert_eq!(yaml(""), "");
+        assert_eq!(yaml("<!--c-->"), "");
+        assert_eq!(yaml("<?xml version=\"1.0\"?>"), "+p_xml: version=\"1.0\"\n");
+        assert_eq!(yaml("<!--c-->x"), "x\n");
+        assert_eq!(yaml("<!--c-->1"), "\"1\"\n");
+    }
+
+    #[test]
+    fn comments_become_head_line_and_foot_comments() {
+        assert_eq!(yaml("<a><!--h--><b>1</b></a>"), "a:\n  # h\n  b: \"1\"\n");
+        assert_eq!(yaml("<a><b>1<!--l--></b></a>"), "a:\n  b: \"1\" # l\n");
+        assert_eq!(yaml("<a><b>1</b><!--f--></a>"), "a:\n  b: \"1\"\n  # f\n");
+        assert_eq!(
+            yaml("<a><b>1</b><!--f--><c>2</c></a>"),
+            "a:\n  b: \"1\"\n  # f\n\n  c: \"2\"\n"
+        );
+        assert_eq!(yaml("<a><!--  x  --><b/></a>"), "a:\n  #  x\n  b:\n");
+        assert_eq!(
+            yaml("<a>x<!--l--><b/></a>"),
+            "a:\n  +content: x # l\n  b:\n"
+        );
+        assert_eq!(
+            yaml("<a>x<!--l-->y<b/></a>"),
+            "a:\n  +content: # l\n    - x\n    - y\n  b:\n"
+        );
+        assert_eq!(yaml("<a><b><!--h--></b></a>"), "a:\n  b: # h\n");
+        assert_eq!(
+            yaml("<a><b>1<!--l1\nl2--></b></a>"),
+            "a:\n  b: \"1\" # l1\n  # l2\n"
+        );
+        assert_eq!(
+            yaml("<a>t<!--l\nm-->u</a>"),
+            "a:\n  # l\n  # m\n  - t\n  - u\n"
+        );
+    }
+
+    #[test]
+    fn a_comment_after_a_sequence_waits_for_the_next_node() {
+        assert_eq!(
+            yaml("<q><r><a>x<![CDATA[y]]></a><!--f--></r><s/></q>"),
+            "q:\n  r:\n    a:\n      - x\n      - y\n  s:\n  # f\n"
+        );
+        assert_eq!(
+            yaml("<q><a>x<![CDATA[y]]></a><!--f--></q>"),
+            "q:\n  a:\n    - x\n    - y\n\n# f\n"
+        );
+    }
+
+    #[test]
+    fn a_block_scalar_takes_its_line_comment_after_the_header() {
+        assert_eq!(yaml("<a>x\ny<!--l--></a>"), "a: |- # l\n  x\n  y\n");
+    }
+
+    #[test]
+    fn markup_after_the_roots_end_tag_is_an_error_not_a_panic() {
+        let message = "invalid XML: markup after the end of the document's root";
+        assert_eq!(error("</a><b/>"), message);
+        assert_eq!(error("</a>x"), message);
+        assert_eq!(error("</a><!--c-->"), message);
+        assert_eq!(error("</a><?p x?>"), message);
+        assert_eq!(error("</a><!DOCTYPE a>"), message);
+        assert_eq!(yaml("</a>"), "");
+        assert_eq!(yaml("<a/></a></a>"), "a:\n");
+    }
+
+    #[test]
+    fn text_outside_the_root_is_an_error() {
+        assert_eq!(
+            error("text"),
+            "invalid XML: Encountered chardata [text] outside of XML node"
+        );
+        assert_eq!(yaml("  \n"), "");
+    }
+
+    #[test]
+    fn comments_are_processed_as_yq_processes_them() {
+        assert_eq!(process_comment(""), "");
+        assert_eq!(process_comment("c"), "# c");
+        assert_eq!(process_comment(" c "), "# c");
+        assert_eq!(process_comment("a\nb"), "# a\n# b");
+        assert_eq!(process_comment("\nstart"), "#\n# start");
+        assert_eq!(process_comment("# x"), "## x");
+        assert_eq!(join_comments(&["", "a", "", "b"], " "), "a b");
+    }
+
+    #[test]
+    fn the_flags_rename_the_keys_and_drop_markup() {
+        let options = XmlOptions {
+            attribute_prefix: "@".into(),
+            content_name: "#text".into(),
+            proc_inst_prefix: "?".into(),
+            directive_name: "!".into(),
+            skip_directives: false,
+            skip_proc_inst: false,
+            ..XmlOptions::default()
+        };
+        let text = |input: &str, options: &XmlOptions| {
+            String::from_utf8(transcode(input.as_bytes(), options).unwrap()).unwrap()
+        };
+        assert_eq!(
+            text("<?p x?><!DOCTYPE d><a b=\"1\">t</a>", &options),
+            "?p: x\n'!': DOCTYPE d\na:\n  '#text': t\n  '@b': \"1\"\n"
+        );
+        let skipping = XmlOptions {
+            skip_directives: true,
+            skip_proc_inst: true,
+            ..XmlOptions::default()
+        };
+        assert_eq!(text("<?p x?><!DOCTYPE d><a/>", &skipping), "a:\n");
+        let plain = XmlOptions {
+            keep_namespace: false,
+            ..XmlOptions::default()
+        };
+        assert_eq!(
+            text("<n:a xmlns:n=\"u\" n:b=\"1\"/>", &plain),
+            "a:\n  +@n: u\n  +@b: \"1\"\n"
+        );
+    }
 }

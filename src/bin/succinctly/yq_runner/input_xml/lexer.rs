@@ -1002,3 +1002,274 @@ fn decode_rune(bytes: &[u8]) -> Option<(u32, usize)> {
     let text = std::str::from_utf8(chunk).ok()?;
     text.chars().next().map(|c| (c as u32, width))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tokens(input: &str, strict: bool, raw: bool) -> Result<Vec<Token>, String> {
+        let mut decoder = Decoder::new(
+            input.as_bytes(),
+            LexerOptions {
+                strict,
+                raw_token: raw,
+            },
+        );
+        let mut out = Vec::new();
+        loop {
+            match decoder.next() {
+                Ok(Some(token)) => out.push(token),
+                Ok(None) => return Ok(out),
+                Err(e) => return Err(e.message()),
+            }
+        }
+    }
+
+    fn lenient(input: &str) -> Result<Vec<Token>, String> {
+        tokens(input, false, true)
+    }
+
+    fn texts(input: &str) -> Vec<String> {
+        lenient(input)
+            .unwrap()
+            .into_iter()
+            .filter_map(|t| match t {
+                Token::CharData(d) => Some(String::from_utf8(d).unwrap()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_ascii_fast_path_is_the_table() {
+        for c in 0u32..0x80 {
+            assert_eq!(is_name_start(c), in_table(NAME_FIRST, c), "start {c:#x}");
+            assert_eq!(is_name_char(c), in_table(NAME_SECOND, c), "char {c:#x}");
+        }
+    }
+
+    #[test]
+    fn names_follow_the_xml_tables() {
+        assert!(is_name(b"a-b.c:d"));
+        assert!(is_name("é".as_bytes()));
+        assert!(!is_name(b""));
+        assert!(!is_name(b"1a"));
+        assert!(!is_name(b"-a"));
+        assert!(!is_name(b"a\xa9"));
+        assert!(!is_name("a\u{200b}".as_bytes()));
+    }
+
+    #[test]
+    fn text_is_trimmed_to_its_graphic_ends() {
+        assert_eq!(trim_non_graphic("  hi  "), "hi");
+        assert_eq!(
+            trim_non_graphic("\u{a0}\u{200b}zw\u{200b}\u{a0}nbsp\u{a0}"),
+            "zw\u{200b}\u{a0}nbsp"
+        );
+        assert_eq!(trim_non_graphic(" \n\t"), "");
+        assert_eq!(trim_non_graphic(""), "");
+        assert_eq!(trim_non_graphic("é"), "é");
+    }
+
+    #[test]
+    fn a_processing_instruction_value_is_found_as_go_finds_it() {
+        assert_eq!(proc_inst("version", "version=\"1.0\" encoding='x'"), "1.0");
+        assert_eq!(proc_inst("encoding", "version=\"1.0\" encoding='x'"), "x");
+        assert_eq!(proc_inst("encoding", "encoding=x encoding=\"y\""), "y");
+        assert_eq!(proc_inst("encoding", "encoding="), "");
+        assert_eq!(proc_inst("encoding", "encoding=\"é"), "");
+        assert_eq!(proc_inst("encoding", "é encoding=\"é\""), "é");
+        assert_eq!(proc_inst("encoding", ""), "");
+    }
+
+    #[test]
+    fn character_references_and_entities() {
+        assert_eq!(
+            texts("a&lt;&gt;&amp;&apos;&quot;&#65;&#x42;z"),
+            ["a<>&'\"ABz"]
+        );
+        assert_eq!(
+            texts("&bogus;&amp&#;&#xZZ;&#99999999999;&#xD800;"),
+            ["&bogus;&amp&#;&#xZZ;&#99999999999;\u{fffd}"]
+        );
+        assert_eq!(texts("a\r\nb\rc"), ["a\nb\nc"]);
+        assert_eq!(
+            tokens("&bogus;", true, true).unwrap_err(),
+            "XML syntax error on line 1: invalid character entity &bogus;"
+        );
+        assert_eq!(
+            tokens("&amp", true, true).unwrap_err(),
+            "XML syntax error on line 1: unexpected EOF"
+        );
+    }
+
+    #[test]
+    fn markup_errors_name_their_line() {
+        let error = |input: &str| lenient(input).unwrap_err();
+        assert_eq!(error("<a\n"), "XML syntax error on line 2: unexpected EOF");
+        assert_eq!(
+            error("<a b=\"1"),
+            "XML syntax error on line 1: unexpected EOF"
+        );
+        assert_eq!(
+            error("<!- x>"),
+            "XML syntax error on line 1: invalid sequence <!- not part of <!--"
+        );
+        assert_eq!(
+            error("<!-- a -- b -->"),
+            "XML syntax error on line 1: invalid sequence \"--\" not allowed in comments"
+        );
+        assert_eq!(
+            error("<![XDATA[x]]>"),
+            "XML syntax error on line 1: invalid <![ sequence"
+        );
+        assert_eq!(
+            error("<![CDATA[x"),
+            "XML syntax error on line 1: unexpected EOF in CDATA section"
+        );
+        assert_eq!(
+            error("x ]]> y"),
+            "XML syntax error on line 1: unescaped ]]> not in CDATA section"
+        );
+        assert_eq!(
+            error("<a b=\"<\">"),
+            "XML syntax error on line 1: unescaped < inside quoted string"
+        );
+        assert_eq!(
+            error("\u{1}"),
+            "XML syntax error on line 1: illegal character code U+0001"
+        );
+        assert_eq!(
+            error("< a/>"),
+            "XML syntax error on line 1: expected element name after <"
+        );
+        assert_eq!(
+            error("</>"),
+            "XML syntax error on line 1: expected element name after </"
+        );
+        assert_eq!(
+            error("</a b>"),
+            "XML syntax error on line 1: invalid characters between </a and >"
+        );
+        assert_eq!(
+            error("<a/ >"),
+            "XML syntax error on line 1: expected /> in element"
+        );
+        assert_eq!(
+            error("<a b='1' ='2'>"),
+            "XML syntax error on line 1: expected attribute name in element"
+        );
+        assert_eq!(
+            error("<?>"),
+            "XML syntax error on line 1: expected target name after <?"
+        );
+        assert_eq!(
+            error("<a:b:c/>"),
+            "XML syntax error on line 1: expected element name after <"
+        );
+        assert_eq!(
+            error("<1a/>"),
+            "XML syntax error on line 1: invalid XML name: 1a"
+        );
+        assert_eq!(
+            error("<?xml version=\"1.1\"?>"),
+            "xml: unsupported version \"1.1\"; only version 1.0 is supported"
+        );
+        assert_eq!(
+            error("<?xml version=\"1.0\" encoding=\"x-nope\"?>"),
+            "xml: opening charset \"x-nope\": unsupported charset: \"x-nope\""
+        );
+    }
+
+    #[test]
+    fn lenient_mode_accepts_what_strict_mode_refuses() {
+        assert_eq!(lenient("<a b=c d/>").unwrap().len(), 2);
+        assert_eq!(
+            tokens("<a b=c/>", true, true).unwrap_err(),
+            "XML syntax error on line 1: unquoted or missing attribute value in element"
+        );
+        assert_eq!(
+            tokens("<a b/>", true, true).unwrap_err(),
+            "XML syntax error on line 1: attribute name without = in element"
+        );
+        assert!(tokens("<a></b>", false, true).is_ok());
+    }
+
+    #[test]
+    fn directives_keep_nested_brackets_quotes_and_comments() {
+        let tokens = lenient("<!DOCTYPE a [<!ENTITY e 'x>y'><!-- c -->]>").unwrap();
+        let Token::Directive(data) = &tokens[0] else {
+            panic!("not a directive: {tokens:?}");
+        };
+        assert_eq!(
+            String::from_utf8_lossy(data),
+            "DOCTYPE a [<!ENTITY e 'x>y'> ]"
+        );
+        assert!(lenient("<!DOCTYPE a [<x").is_err());
+        assert!(lenient("<!DOCTYPE a <!- b>").is_err());
+        assert!(lenient("<!DOCTYPE a <!- b>>").is_ok());
+    }
+
+    #[test]
+    fn token_mode_matches_ends_and_keeps_namespaces_apart() {
+        let strict = |input: &str| tokens(input, true, false);
+        assert_eq!(
+            strict("<a></b>").unwrap_err(),
+            "XML syntax error on line 1: element <a> closed by </b>"
+        );
+        assert_eq!(
+            strict("</a>").unwrap_err(),
+            "XML syntax error on line 1: unexpected end element </a>"
+        );
+        assert_eq!(
+            strict("<a>").unwrap_err(),
+            "XML syntax error on line 1: unexpected EOF"
+        );
+        assert_eq!(strict("<x:a xmlns:x='u'></x:a>").map(|t| t.len()), Ok(2));
+        let translated = strict("<x:a xmlns:x='u' x:b='1'></x:a>").unwrap();
+        let Token::Start { name, attr } = &translated[0] else {
+            panic!("not a start: {translated:?}");
+        };
+        assert_eq!((name.space.as_str(), name.local.as_str()), ("u", "a"));
+        assert_eq!(attr[1].name.space, "u");
+        assert_eq!(strict("<x:a xmlns:x='u'></x:a xmlns:x='v'>").is_err(), true);
+        assert_eq!(
+            strict("<a xmlns:x='u'><x:b></y:b></a>").unwrap_err(),
+            "XML syntax error on line 1: element <b> in space x closed by </b> in space y"
+        );
+        // Lenient `Token` closes the element the end tag does not name.
+        assert_eq!(tokens("<a><b></a>", false, false).map(|t| t.len()), Ok(4));
+        let xml_space = tokens("<a xml:lang='en'/>", false, false).unwrap();
+        let Token::Start { attr, .. } = &xml_space[0] else {
+            panic!("not a start");
+        };
+        assert_eq!(attr[0].name.space, XML_URL);
+    }
+
+    #[test]
+    fn declared_charsets_are_opened_by_label() {
+        assert_eq!(
+            charset_reader(" Latin1 ", b"caf\xe9").unwrap(),
+            "café".as_bytes()
+        );
+        assert_eq!(
+            charset_reader("windows-1251", b"\xcf").unwrap(),
+            "П".as_bytes()
+        );
+        assert_eq!(
+            charset_reader("utf8", b"a\xffb\xc3").unwrap(),
+            "a\u{fffd}b\u{fffd}".as_bytes()
+        );
+        assert!(charset_reader("shift_jis", b"x").is_none());
+        let converted =
+            lenient("<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><a>\u{e9}</a>").unwrap();
+        assert!(converted
+            .iter()
+            .any(|t| matches!(t, Token::CharData(d) if d == "Ã©".as_bytes())));
+    }
+
+    #[test]
+    fn go_quote_wraps_the_message_text() {
+        assert_eq!(quote("a\"b"), "\"a\\\"b\"");
+    }
+}
