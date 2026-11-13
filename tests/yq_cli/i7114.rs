@@ -77,6 +77,31 @@ fn an_explicit_indicator_in_a_compact_nested_sequence_reads_as_yq() -> Result<()
             "[[\"lead\\n\",\"x\"]]\n",
             "- - |\n    lead\n  - x\n",
         ),
+        (
+            "- - |2-\r\n     lead\r\n    more\r\n  - x\r\n",
+            "[[\" lead\\nmore\",\"x\"]]\n",
+            "- - |2-\n     lead\n    more\n  - x\n",
+        ),
+        (
+            "- - &a |2\n     lead\n  - x\n",
+            "[[\" lead\\n\",\"x\"]]\n",
+            "- - &a |2\n     lead\n  - x\n",
+        ),
+        (
+            "- - !!str |2\n     lead\n  - x\n",
+            "[[\" lead\\n\",\"x\"]]\n",
+            "- - !!str |2\n     lead\n  - x\n",
+        ),
+        (
+            "- - - |3\n        lead\n    - x\n",
+            "[[[\" lead\\n\",\"x\"]]]\n",
+            "- - - |2\n       lead\n    - x\n",
+        ),
+        (
+            "- - &a k: |2\n       lead\n    j: 1\n",
+            "[[{\"k\":\" lead\\n\",\"j\":1}]]\n",
+            "- - &a k: |2\n       lead\n    j: 1\n",
+        ),
     ];
     for (input, json, yaml) in rows {
         let (stdout, code) = run_yq_stdin(".", input, &["-o=json", "-I0"])?;

@@ -7029,7 +7029,7 @@ impl<'a> YamlString<'a> {
                     }
                     let is_dash = next < indicator_pos
                         && text[next] == b'-'
-                        && matches!(text.get(next + 1), Some(b' ' | b'\t' | b'\n' | b'\r'));
+                        && matches!(text.get(next + 1), Some(b' ' | b'\t' | b'\n'));
                     if !is_dash {
                         break;
                     }
