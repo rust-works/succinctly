@@ -7078,7 +7078,9 @@ fn read_inputs(
             .map(raw_window_text)
             .unwrap_or_default();
         let mut texts = vec![(0, first)];
-        texts.extend((1..windows.len()).map(|at| (u32::try_from(at).unwrap_or(u32::MAX), String::new())));
+        texts.extend(
+            (1..windows.len()).map(|at| (u32::try_from(at).unwrap_or(u32::MAX), String::new())),
+        );
         opened.clone_from(&files);
         let mut locations =
             InputLocations::new(files.iter().map(|p| Some(input_display_name(p))).collect());
@@ -11405,8 +11407,13 @@ fn raw_windowed_sources(args: &JqCommand, files: &[PathBuf]) -> Option<Vec<RawWi
             let file = std::fs::File::open(path).ok()?;
             // What was opened, not what the path named a moment ago.
             let meta = file.metadata().ok()?;
-            (meta.is_file() && !names_stdin(&meta) && !names_output(&meta))
-                .then(|| (Box::new(file) as Box<dyn Read>, Some(meta.len()), Vec::new()))
+            (meta.is_file() && !names_stdin(&meta) && !names_output(&meta)).then(|| {
+                (
+                    Box::new(file) as Box<dyn Read>,
+                    Some(meta.len()),
+                    Vec::new(),
+                )
+            })
         })
         .collect()
 }
@@ -20963,6 +20970,73 @@ mod tests {
 
     /// #7023: `-R` reads a window at a time only for one regular file big enough to be worth it, on a
     /// run that reads the lines in order, and the plain route's gate agrees on which files those are.
+    /// #7024: `-R` over several regular files, 4 MiB or more between them and up to as many as the
+    /// plain route holds open, is read a window at a time, one source a file; a list with a path that is
+    /// not a regular file, one that is too small between them, or too long, is read whole.
+    #[test]
+    fn raw_windowed_sources_take_several_regular_files_7024() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = |name: &str, len: u64| {
+            let path = dir.path().join(name);
+            std::fs::File::create(&path)
+                .and_then(|f| f.set_len(len))
+                .expect("a sparse file");
+            path.to_string_lossy().into_owned()
+        };
+        let half = file("half.txt", window::MIN_WINDOWED_FILE_BYTES / 2);
+        let other = file("other.txt", window::MIN_WINDOWED_FILE_BYTES / 2);
+        let tiny = file("tiny.txt", 1);
+        let directory = dir.path().to_string_lossy().into_owned();
+        let missing = dir
+            .path()
+            .join("missing.txt")
+            .to_string_lossy()
+            .into_owned();
+        let sources = |argv: &[&str]| {
+            let cmd = JqCommand::try_parse_from(argv.iter().copied()).unwrap();
+            raw_windowed_sources(&cmd, &get_input_files(&cmd)).map(|sources| sources.len())
+        };
+        assert_eq!(sources(&["jq", "-R", ".", &half, &other]), Some(2));
+        assert_eq!(
+            sources(&["jq", "-nR", "inputs", &half, &tiny, &other]),
+            Some(3)
+        );
+        assert_eq!(
+            sources(&["jq", "-R", ".", &half, &tiny]),
+            None,
+            "under 4 MiB between them"
+        );
+        for shape in [&directory, &missing, "-", "/dev/stdin"] {
+            assert_eq!(
+                sources(&["jq", "-R", ".", &half, &other, shape]),
+                None,
+                "{shape}"
+            );
+        }
+        let with_tinies = |n: usize| {
+            let mut argv = vec!["jq", "-R", ".", half.as_str(), other.as_str()];
+            argv.extend(std::iter::repeat_n(tiny.as_str(), n));
+            argv
+        };
+        assert_eq!(
+            sources(&with_tinies(MAX_WINDOWED_FILES - 2)),
+            Some(MAX_WINDOWED_FILES)
+        );
+        assert_eq!(
+            sources(&with_tinies(MAX_WINDOWED_FILES - 1)),
+            None,
+            "more than it holds open"
+        );
+        for flags in [&["-s"][..], &["--validate"], &["--stream"], &["--seq"]] {
+            let mut argv = vec!["jq", "-R"];
+            argv.extend(flags);
+            argv.extend([".", half.as_str(), other.as_str()]);
+            assert_eq!(sources(&argv), None, "{flags:?}");
+        }
+        assert_eq!(sources(&["jq", ".", &half, &other]), None, "not -R");
+    }
+
     #[test]
     fn lone_raw_windowed_file_takes_only_a_lone_regular_file_7023() {
         use clap::Parser;
