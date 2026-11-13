@@ -63,6 +63,14 @@ const ROWS: &[(&str, &str)] = &[
     ("[1]\n? x", "[{\"h\":[1]}]\n"),
     ("[1]\n\"q", "[{\"h\":\"[1]\\n\\\"q\"}]\n"),
     ("[1]]\n'x", "[{\"h\":\"[1]]\\n'x\"}]\n"),
+    ("[1] [user@example.com]", "[{\"h\":[1]}]\n"),
+    ("[1] [50%]", "[{\"h\":[1]}]\n"),
+    ("[1] [it's]", "[{\"h\":[1]}]\n"),
+    ("[1] ['x]", "[{\"h\":\"[1] ['x]\"}]\n"),
+    ("~\n---\n1", "[{\"h\":null}]\n"),
+    ("---  # c", "[{\"h\":null}]\n"),
+    ("[a: ...\n]", "[{\"h\":[{\"a\":\"...\"}]}]\n"),
+    ("[a,\n--- x\n]", "[{\"h\":\"[a,\\n--- x\\n]\"}]\n"),
     ("[1]\n---\n\"x", "[{\"h\":\"[1]\\n---\\n\\\"x\"}]\n"),
     ("[1]\n---\n[2] \"", "[{\"h\":[1]}]\n"),
     ("[1]*a[1]", "[{\"h\":\"[1]*a[1]\"}]\n"),
@@ -91,10 +99,8 @@ const NO_AUTO_PARSE: &[(&str, &str)] = &[
 ];
 
 fn run(format: &str, extra: &[&str], cell: &str) -> Result<(String, Option<i32>)> {
-    let delimiter = if format == "tsv" { '\t' } else { ',' };
     let quoted = format!("\"{}\"", cell.replace('"', "\"\""));
     let table = format!("\"h\"\n{quoted}\n");
-    let _ = delimiter;
     let mut child = Command::new(env!("CARGO_BIN_EXE_succinctly"))
         .args(["yq", "-p", format, "-o", "json", "-I=0"])
         .args(extra)

@@ -301,9 +301,9 @@ fn first_document(text: &str) -> &str {
     text
 }
 
-/// Whether `text` opens with a flow collection (#7136), after comment lines and node properties
+/// The offset of the flow collection `text` opens with (#7136), after comment lines and node properties
 /// (`&anchor`, `!tag`).
-fn opens_with_flow_collection(text: &str) -> bool {
+fn flow_collection_start(text: &str) -> Option<usize> {
     let mut rest = text;
     loop {
         rest = rest.trim_start_matches([' ', '\t', '\n']);
@@ -312,7 +312,9 @@ fn opens_with_flow_collection(text: &str) -> bool {
         } else if rest.starts_with(['&', '!']) {
             rest = rest.find([' ', '\t', '\n']).map_or("", |at| &rest[at..]);
         } else {
-            return rest.starts_with(['[', '{']);
+            return rest
+                .starts_with(['[', '{'])
+                .then(|| text.len() - rest.len());
         }
     }
 }
@@ -428,6 +430,12 @@ fn token_after_the_first_node_scans(rest: &str, starts_a_line: bool) -> bool {
     true
 }
 
+/// A `---` line whose only other text is a comment.
+fn is_marker_with_comment(line: &str) -> bool {
+    line.strip_prefix("---")
+        .is_some_and(|rest| rest.starts_with([' ', '\t']) && rest.trim_start().starts_with('#'))
+}
+
 fn blank_or_end(byte: Option<&u8>) -> bool {
     byte.map_or(true, |b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
 }
@@ -445,6 +453,15 @@ fn skip_quoted(bytes: &[u8], start: usize) -> Option<usize> {
             _ => at += 1,
         }
     }
+}
+
+/// Whether a token starts at `at`: the text opens, or a blank, a bracket, a comma or a colon comes before it.
+fn token_starts(bytes: &[u8], at: usize) -> bool {
+    at == 0
+        || matches!(
+            bytes[at - 1],
+            b' ' | b'\t' | b'\r' | b'\n' | b'[' | b'{' | b',' | b':'
+        )
 }
 
 /// The end of the flow collection that opens at `start`, scanning what is inside it; `None` for a
@@ -465,8 +482,10 @@ fn skip_flow_collection(bytes: &[u8], start: usize) -> Option<usize> {
                     return Some(at);
                 }
             }
-            b'\'' | b'"' => at = skip_quoted(bytes, at)?,
-            b'@' | b'`' | b'%' => return None,
+            // A quote, `@`, a backtick and `%` are indicators only where a token starts; inside a plain
+            // scalar (`it's`, `50%`, `user@example.com`) they are text.
+            b'\'' | b'"' if token_starts(bytes, at) => at = skip_quoted(bytes, at)?,
+            b'@' | b'`' | b'%' if token_starts(bytes, at) => return None,
             b'#' if at > 0 && matches!(bytes[at - 1], b' ' | b'\t' | b'\n') => {
                 while bytes.get(at).is_some_and(|&b| b != b'\n') {
                     at += 1;
@@ -505,34 +524,25 @@ fn skip_plain_scalar(bytes: &[u8], start: usize) -> usize {
     at
 }
 
-/// How many closing brackets [`flow_collection_prefix`] tries before it gives up.
-const FLOW_PREFIX_ATTEMPTS: usize = 512;
-
 /// The prefix of `text` that is its first complete flow collection (#7136): `[1-4];[5-8];9` is read by
 /// yq as `[1-4]`, since its decoder returns the first node of the document and never reads the rest.
-/// The first `]` or `}` that leaves a prefix the YAML reader accepts as one flow collection ends it;
-/// a closer inside a nested collection or a quoted string leaves a prefix that does not parse.
+/// The collection ends at the bracket that closes the one the text opens with (quoted strings and
+/// nesting counted), and the text after it must still scan as go-yaml's scanner reads it.
 fn flow_collection_prefix(text: &str) -> Option<&str> {
-    if !opens_with_flow_collection(text) {
-        return None;
-    }
-    let prefix = text
-        .match_indices([']', '}'])
-        .take(FLOW_PREFIX_ATTEMPTS)
-        .map(|(at, _)| &text[..=at])
-        .find(|prefix| {
-            YamlIndex::build_yq(prefix.as_bytes()).is_ok_and(|index| {
-                matches!(
-                    index.root(prefix.as_bytes()).value(),
-                    YamlValue::Sequence(documents)
-                        if documents.uncons_cursor().is_some_and(|(root, rest)| {
-                            rest.uncons_cursor().is_none()
-                                && matches!(root.value(), YamlValue::Mapping(_) | YamlValue::Sequence(_))
-                        })
-                )
-            })
-        })?;
-    token_after_the_first_node_scans(&text[prefix.len()..], false).then_some(prefix)
+    let start = flow_collection_start(text)?;
+    let end = skip_flow_collection(text.as_bytes(), start)?;
+    let prefix = text.get(..end)?;
+    let one_flow_collection = YamlIndex::build_yq(prefix.as_bytes()).is_ok_and(|index| {
+        matches!(
+            index.root(prefix.as_bytes()).value(),
+            YamlValue::Sequence(documents)
+                if documents.uncons_cursor().is_some_and(|(root, rest)| {
+                    rest.uncons_cursor().is_none()
+                        && matches!(root.value(), YamlValue::Mapping(_) | YamlValue::Sequence(_))
+                })
+        )
+    });
+    (one_flow_collection && token_after_the_first_node_scans(&text[end..], false)).then_some(prefix)
 }
 
 fn classify(text: &str, auto_parse: bool) -> Cell {
@@ -615,13 +625,17 @@ fn classify(text: &str, auto_parse: bool) -> Cell {
         YamlValue::Null
             if later_documents
                 || norm.lines().any(|line| {
-                    matches!(line.trim_end(), "---" | "...") || line.starts_with("--- #")
+                    matches!(line.trim_end(), "---" | "...") || is_marker_with_comment(line)
                 }) =>
         {
             Cell::Empty
         }
         YamlValue::Mapping(_) | YamlValue::Sequence(_) => {
-            Cell::Collection(first_document(&norm).to_string())
+            // A marker line inside a multi-line node cuts it short: the cut text must still parse.
+            if first.len() < norm.len() && YamlIndex::build_yq(first.as_bytes()).is_err() {
+                return Cell::Str(text.to_string());
+            }
+            Cell::Collection(first.to_string())
         }
         YamlValue::Null => Cell::Scalar(yaml_trim(&norm).to_string()),
         YamlValue::String(s) => {

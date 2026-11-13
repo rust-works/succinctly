@@ -7865,7 +7865,7 @@ These rows differ:
 - A header that needs the `? ` explicit-key form (it holds a line break or is over 128 bytes) loses a comment-only or blank cell's comment: `? |-` / `  : # c` prints `:` here.
 - `--front-matter` with an explicit `-p csv` or `-p tsv` is refused (`--front-matter and --input-format csv are incompatible`), as `-p json` is, where yq decodes the front matter as a table.
 - A number that go-yaml types as an integer or float but this YAML reader does not (`1_000`, `0b1`, an integer past 2^63) prints as yq prints it under `-o yaml` and differs under `-o json`, the same difference as for a YAML input.
-- A cell that is a flow collection used as a key (`[1]: v`, `{a: 1} : v`) is refused here, where yq reads a mapping with an empty key; and random cells built from brackets, indicators, tags and markers (5,050 of them) still differ from yq in 339, about a fifth of them cells that this reader accepts as a first node where go-yaml's scanner refuses a third token or an odd first node (`[1]}!t %`, `{a: 1}*a]*a{`, `? ,` / `---`).
+- A cell that is a flow collection used as a key (`[1]: v`, `{a: 1} : v`) is refused here, where yq reads a mapping with an empty key; and random cells built from brackets, indicators, tags and markers (5,050 of them) still differ from yq in 319 (594 before #7136), mostly cells where this reader accepts an odd first node that go-yaml refuses (`? ,` / `---`, `{a: 1}*a]*a{`) or where go-yaml's scanner reads a third token (`[1]}!t %`).
 - yq's warning that `-o auto` defaults to YAML when `-p csv` is explicit is not written.
 
 ### `-p ini` — a byte that is not UTF-8 and `--front-matter` differ ([#6925](https://github.com/rust-works/succinctly/issues/6925))
