@@ -23590,6 +23590,20 @@ fn eval_yq_context_pipe<S: EvalSemantics, V: DocumentValue>(
     eval_yq_context_pipe::<S, V>(rest, &produced, optional, cur, sink)
 }
 
+/// An operand of a list-stage operator (`//`, `and`, `or`) read over the whole context list: the
+/// operand's own stages through the context-list walk, under whatever read-only scope is active
+/// (#7173, #7184). One definition, so the operators cannot disagree about how a side is read.
+fn read_operand_over_list<S: EvalSemantics, V: DocumentValue>(
+    operand: &Expr,
+    context: &[YqContextItem<V>],
+    optional: bool,
+    cur: &core::cell::Cell<YqContextTag>,
+) -> Result<Vec<YqContextItem<V>>, Flow> {
+    let mut flat: Vec<Expr> = Vec::new();
+    yq_flatten_pipe_stages(core::slice::from_ref(operand), &mut flat);
+    collect_yq_context::<S, V>(&flat, context, optional, cur).map_err(Flow::Escaped)
+}
+
 /// `and` / `or` over a context list whose entries all carry `EvaluateTogether` (#7184): both
 /// operands are read over the **whole** list, read-only (an absent key is no node), as
 /// `crossFunctionWithPrefs` reads them over `context.ReadOnlyClone()`.
@@ -23616,11 +23630,7 @@ fn boolean_together<S: EvalSemantics, V: DocumentValue>(
         // patchcov: coverage end
     };
     let _read_only = yq_read_only_context::enter();
-    let over = |operand: &Expr| {
-        let mut flat: Vec<Expr> = Vec::new();
-        yq_flatten_pipe_stages(core::slice::from_ref(operand), &mut flat);
-        collect_yq_context::<S, V>(&flat, context, optional, cur).map_err(Flow::Escaped)
-    };
+    let over = |operand: &Expr| read_operand_over_list::<S, V>(operand, context, optional, cur);
     let truthy = |item: &YqContextItem<V>| generic_item_is_truthy::<V>(&item.to_generic_item());
     let lefts = over(left)?;
     // A side with no output stands as one falsy `null`.
@@ -23676,11 +23686,7 @@ fn alternative_together<S: EvalSemantics, V: DocumentValue>(
         unreachable!("yq_list_stage selects only an Alternative as an alternative stage")
         // patchcov: coverage end
     };
-    let over = |operand: &Expr| {
-        let mut flat: Vec<Expr> = Vec::new();
-        yq_flatten_pipe_stages(core::slice::from_ref(operand), &mut flat);
-        collect_yq_context::<S, V>(&flat, context, optional, cur).map_err(Flow::Escaped)
-    };
+    let over = |operand: &Expr| read_operand_over_list::<S, V>(operand, context, optional, cur);
     let lefts = over(left)?;
     if lefts.is_empty() {
         return over(right);

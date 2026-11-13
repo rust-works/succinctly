@@ -43,6 +43,13 @@ const ROWS: &[(&str, &str)] = &[
     (". and true", "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n"),
     ("(.a, .c) and 1", "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n"),
     (".l and .k | length", "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n"),
+    ("(.a, .zz, false) and (.k, 1)", "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\nfalse\nfalse\nfalse\nfalse\n"),
+    ("(0, \"\", null, [], {}) and true", "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\nfalse\nfalse\nfalse\nfalse\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n"),
+    ("(0, \"\", null, [], {}) or false", "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\nfalse\nfalse\nfalse\nfalse\nfalse\nfalse\nfalse\nfalse\nfalse\nfalse\nfalse\nfalse\nfalse\nfalse\nfalse\nfalse\ntrue\ntrue\n"),
+    ("(.k, false) or (.l, 2)", "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n"),
+    ("(.a, 1) and (.zz, 2)", "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n"),
+    ("(true, false, null) or (true, false)", "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\nfalse\nfalse\nfalse\nfalse\ntrue\ntrue\ntrue\ntrue\nfalse\nfalse\nfalse\nfalse\ntrue\ntrue\ntrue\ntrue\nfalse\nfalse\nfalse\nfalse\ntrue\ntrue\ntrue\ntrue\nfalse\nfalse\nfalse\nfalse\ntrue\ntrue\ntrue\ntrue\nfalse\nfalse\nfalse\nfalse\ntrue\ntrue\ntrue\ntrue\nfalse\nfalse\nfalse\nfalse\ntrue\ntrue\ntrue\ntrue\nfalse\nfalse\nfalse\nfalse\ntrue\ntrue\ntrue\ntrue\nfalse\nfalse\nfalse\nfalse\n"),
+    ("(\"false\", \"no\", 0) and 1", "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n"),
 ];
 
 fn files(dir: &TempDir) -> Result<Vec<std::path::PathBuf>> {
@@ -83,20 +90,22 @@ fn eval_all_and_or_raise_the_right_sides_error_only_when_it_is_read_7184() -> Re
     let paths = files(&dir)?;
     let refs: Vec<&std::path::Path> = paths.iter().map(std::path::PathBuf::as_path).collect();
     let args = ["ea", "-o=json", "-I=0"];
-    for (filter, raises) in [
-        (".k or error(\"boom\")", false),
-        (".zz and error(\"boom\")", false),
-        (".k and error(\"boom\")", true),
-        ("false and error(\"boom\")", false),
-        ("true or error(\"boom\")", false),
+    let filter = ".k and error(\"boom\")";
+    let (stdout, stderr, status) = run_yq_files(filter, &refs, &args)?;
+    assert_eq!((stdout.as_str(), status), ("", 1), "{filter}");
+    assert!(stderr.contains("boom"), "{filter}: {stderr}");
+    for (filter, expected) in [
+        (".zz and error(\"boom\")", "false\n"),
+        (".k or error(\"boom\")", "true\ntrue\ntrue\n"),
+        ("false and error(\"boom\")", "false\nfalse\nfalse\nfalse\n"),
+        ("true or error(\"boom\")", "true\ntrue\ntrue\ntrue\n"),
     ] {
         let (stdout, stderr, status) = run_yq_files(filter, &refs, &args)?;
-        if raises {
-            assert_eq!((stdout.as_str(), status), ("", 1), "{filter}");
-            assert!(stderr.contains("boom"), "{filter}: {stderr}");
-        } else {
-            assert_eq!(status, 0, "{filter}: {stderr}");
-        }
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), status),
+            (expected, "", 0),
+            "{filter}"
+        );
     }
     Ok(())
 }

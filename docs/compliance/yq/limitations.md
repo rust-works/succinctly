@@ -1273,7 +1273,7 @@ So `(.k and .k)` over four documents of which three have `k` is nine `true`, `.z
 The right side is read when the first undecided left result needs it, so an error in it is raised only then.
 The booleans are nodes of their own, with no flag and no origin.
 `succinctly yq` ran both per document.
-26 rows over three files and four documents are pinned against yq v4.53.3 in `tests/yq_cli/i7184.rs`.
+33 rows over three files and four documents are pinned against yq v4.53.3 in `tests/yq_cli/i7184.rs`.
 
 ### `//` reads both operands over the whole document list under `--eval-all` ([#7173](https://github.com/rust-works/succinctly/issues/7173))
 
