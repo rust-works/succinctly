@@ -121,7 +121,7 @@ A plain filter over one regular file (`ndjson_identity`, `ndjson_field`, `ndjson
 that change and still show the 41.8x to 48.0x it replaced, until they are regenerated. The same filters over a regular file
 redirected onto standard input (`jq … < file`) or over up to 32 regular files read as one stream
 ([#7024](https://github.com/rust-works/succinctly/issues/7024)) take the same route, and so does `--seq` over a regular file of RFC 7464 records (`seq_identity`, [#7082](https://github.com/rust-works/succinctly/issues/7082): 7 to 10 MiB at 100 MiB). The
-same filters over a pipe hold the whole input as before, and so do `-R` and `input`/`inputs` over several files ([#7023](https://github.com/rust-works/succinctly/issues/7023) and
+same filters over a pipe of 4 MiB or more take it too since #7024 (a shorter pipe is read whole), and `-R` and `input`/`inputs` over several files hold the whole input ([#7023](https://github.com/rust-works/succinctly/issues/7023) and
 [#7024](https://github.com/rust-works/succinctly/issues/7024) track the rest; the cause is in
 [#6913](https://github.com/rust-works/succinctly/issues/6913)). `succinctly jq` is still the faster of the two on most of
 those rows (1.05x to 3.5x on the 7950X and 1.2x to 7.1x on the M4 Pro for the five named, at 100 MB), so this is a memory
@@ -162,7 +162,10 @@ exact RFC 8259 behaviour matters. Section C of each report.
   inputs.
 - Piped stdin: the reports have a section for it (D/E, piped stdin against a file argument). `succinctly jq` reads
   stdin to its end before it starts, so a pipe costs it a little more than a file (up to about 1.3x on `users_field` at 100 MB),
-  and the speedup on stdin is a little smaller than the file figure.
+  and the speedup on stdin is a little smaller than the file figure. The reports predate #7024, since which a plain filter
+  reads a pipe of 4 MiB or more a window at a time: in 18 to 20 MiB on a 7950X and 12 to 13 MiB on an M4 Pro at 100 MiB
+  (from 123 to 129 MiB), and 3% to 15% slower than it read that pipe before (measured in
+  [jq limitations](../compliance/jq/limitations.md), #7024).
 - Machines other than the two named. A larger or smaller cache, a different allocator, or slower storage changes the
   memory-bound rows in particular.
 
