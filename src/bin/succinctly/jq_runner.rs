@@ -13457,8 +13457,9 @@ impl DroppedText {
     }
 }
 
-/// What is left to read of a lone source the lazy route started on the front of (#6451): a window at
-/// a time (#7023), with the bytes read after the front's last whole character carried on.
+/// What is left to read of a lone source the lazy route started on the front of (#6451), or of one of
+/// several files (#7024): a window at a time (#7023), with the bytes read after the front's last whole
+/// character carried on.
 struct LazyRest {
     windows: window::LineWindows,
 }
