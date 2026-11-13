@@ -1242,6 +1242,70 @@ impl FileIdentity {
     }
 }
 
+/// The file `path` names now, opened, with its metadata. A directory opens on Unix and fails at its first
+/// read, so it fails here, as `EISDIR`.
+fn open_not_a_directory(path: &std::path::Path) -> io::Result<(File, std::fs::Metadata)> {
+    let file = File::open(path)?;
+    let meta = file.metadata()?;
+    if meta.is_dir() {
+        return Err(io::Error::from_raw_os_error(super::EISDIR));
+    }
+    Ok((file, meta))
+}
+
+/// A file of a long list that `-R` reads (#7024), opened by its path when the run first reads it and
+/// closed when the reader is dropped (the producer drops a file's windows once its lines are over), so
+/// a list of any length holds one descriptor, where a short one holds each file open from the start.
+/// The list is judged by `stat` before the run starts ([`super::judge_regular_paths`]), which opens
+/// nothing; the run then reads what the path names when it gets there, with no second judgement and no
+/// length fixed beforehand, as jq, which opens each file as it reaches it and reads it to its end, does
+/// (a path replaced by a named pipe waits for a writer there, as it does in jq). A path that will not
+/// open then (or names a directory) is read as an empty file and its failure handed to
+/// [`super::note_raw_open_failure`], so the tail of the file before it continues in the file after it,
+/// as in jq and in the whole-file route, which drops such a file from the stream.
+pub(super) struct OpenWhenRead {
+    path: PathBuf,
+    /// The file's position among the files named, which its lines are tagged with.
+    at: usize,
+    /// Whether it is the last of them: jq's reader does not report a directory there (#6472).
+    last: bool,
+    file: Option<File>,
+    /// The file did not open: it reads as no bytes.
+    failed: bool,
+}
+
+impl OpenWhenRead {
+    pub(super) fn new(path: PathBuf, at: usize, last: bool) -> Self {
+        Self {
+            path,
+            at,
+            last,
+            file: None,
+            failed: false,
+        }
+    }
+}
+
+impl Read for OpenWhenRead {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.failed {
+            return Ok(0);
+        }
+        let file = match self.file.as_mut() {
+            Some(file) => file,
+            None => match open_not_a_directory(&self.path) {
+                Ok((file, _)) => self.file.insert(file),
+                Err(error) => {
+                    self.failed = true;
+                    super::note_raw_open_failure(&self.path, self.at, &error, self.last);
+                    return Ok(0);
+                }
+            },
+        };
+        file.read(buf)
+    }
+}
+
 #[cfg_attr(not(unix), allow(dead_code))]
 impl NamedFile {
     pub(super) fn new(path: PathBuf) -> Self {
@@ -1254,14 +1318,7 @@ impl NamedFile {
     /// The file the path names now, opened for the run, and how much of it the run reads; the error
     /// when there is none. A directory opens on Unix and fails at its first read, so it fails here.
     fn open_for_run(&self) -> io::Result<(File, u64)> {
-        let opened = File::open(&self.path).and_then(|file| {
-            let meta = file.metadata()?;
-            if meta.is_dir() {
-                return Err(io::Error::from_raw_os_error(super::EISDIR));
-            }
-            Ok((file, meta))
-        });
-        match opened {
+        match open_not_a_directory(&self.path) {
             Ok((file, meta)) => {
                 self.reach
                     .set(Reach::Opened(FileIdentity::of(&meta), meta.len()));
@@ -3177,6 +3234,34 @@ mod stream_tests {
         for block in [64, 4096] {
             assert_same_as(&files, block, &want, windowed_named_route(&files, block).0);
         }
+    }
+
+    /// A file of a long list that `-R` reads is opened when it is first read (#7024): one that will not
+    /// open reads as no bytes, however often it is read, and its failure is noted once.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_read_when_reached_that_will_not_open_reads_as_none_and_is_noted_once_7024() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let present = dir.path().join("present.txt");
+        std::fs::write(&present, b"one\ntwo\n").expect("written");
+        let mut seen = String::new();
+        let mut reader = OpenWhenRead::new(present, 3, false);
+        reader.read_to_string(&mut seen).expect("reads");
+        assert_eq!(seen, "one\ntwo\n");
+        let missing = dir.path().join("missing.txt");
+        super::super::PENDING_OPEN_FAILURES.with(|pending| pending.borrow_mut().clear());
+        let mut reader = OpenWhenRead::new(missing, 7, true);
+        let mut buf = [0u8; 16];
+        assert_eq!(reader.read(&mut buf).expect("reads as empty"), 0);
+        assert_eq!(reader.read(&mut buf).expect("still empty"), 0);
+        let noted = super::super::PENDING_OPEN_FAILURES.with(|pending| pending.borrow().len());
+        assert_eq!(noted, 1, "the failure is noted once");
+        // A directory opens on Unix and fails at its first read: it is noted too.
+        let mut reader = OpenWhenRead::new(dir.path().to_path_buf(), 8, true);
+        assert_eq!(reader.read(&mut buf).expect("reads as empty"), 0);
+        let noted = super::super::PENDING_OPEN_FAILURES.with(|pending| pending.borrow().len());
+        assert_eq!(noted, 2);
+        super::super::PENDING_OPEN_FAILURES.with(|pending| pending.borrow_mut().clear());
     }
 
     /// The second read of files opened by path words the stream's first fault as jq's parser does over

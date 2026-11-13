@@ -121,7 +121,7 @@ A plain filter over one regular file (`ndjson_identity`, `ndjson_field`, `ndjson
 that change and still show the 41.8x to 48.0x it replaced, until they are regenerated. The same filters over a regular file
 redirected onto standard input (`jq … < file`) or over several regular files read as one stream
 ([#7024](https://github.com/rust-works/succinctly/issues/7024)) take the same route, and so does `--seq` over a regular file of RFC 7464 records (`seq_identity`, [#7082](https://github.com/rust-works/succinctly/issues/7082): 7 to 10 MiB at 100 MiB). The
-same filters over a pipe of 4 MiB or more take it too since #7024 (a shorter pipe is read whole), and so does `-R` over standard input, a pipe or a redirected file, or over up to 32 regular files with 4 MiB or more between them, while `input`/`inputs` over several files hold the whole input ([#7023](https://github.com/rust-works/succinctly/issues/7023) and
+same filters over a pipe of 4 MiB or more take it too since #7024 (a shorter pipe is read whole), and so does `-R` over standard input, a pipe or a redirected file, or over several regular files with 4 MiB or more between them, while `input`/`inputs` over several files hold the whole input ([#7023](https://github.com/rust-works/succinctly/issues/7023) and
 [#7024](https://github.com/rust-works/succinctly/issues/7024) track the rest; the cause is in
 [#6913](https://github.com/rust-works/succinctly/issues/6913)). `succinctly jq` is still the faster of the two on most of
 those rows (1.05x to 3.5x on the 7950X and 1.2x to 7.1x on the M4 Pro for the five named, at 100 MB), so this is a memory
