@@ -3876,6 +3876,7 @@ Still differing:
   The values are the source's as the node stood before the first write, where yq copies each bound node when its turn comes: a write to a node a later value is bound to is seen by that value in yq and not here (`with(.k; .x[] as $v | .x[] = $v)` over `x: [1, 2]` is `x: [1, 1]` in yq, which copies `x[1]` after the first value rewrote it, and `x: [2, 2]` here).
   A write that removes or replaces the bound node (`del(.x[0])`, `.x = [7, 8]`) agrees, since yq's copy is of the node that was bound.
   Each such value loses its comment and tag on the way (`with(.k; .x[] as $v | .y = $v)` over a block sequence whose last item is `"2" # two` writes `y: "2"` here and `y: "2" # two` in yq), as `[.[]]` does (#5429).
+  Each value is one step of a fold whose state is the node, and a yq-mode fold step of this shape re-indexes its state, so a source of many values inside a large node takes time that grows with their product (10,000 values in the node: seconds, where yq takes 0.1 s), as a yq-mode `ireduce` with an UPDATE other than an accumulator does (#7108).
 
 ### A pipe's empty context list — a stage that builds a node emits once (#6943)
 
