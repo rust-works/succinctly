@@ -11754,6 +11754,53 @@ pub(crate) fn eval_owned_count_door<S: EvalSemantics>(
     eval_owned_length(expr, input)
         .or_else(|| eval_owned_string_door::<S>(expr, input))
         .or_else(|| eval_owned_def_call_count::<S>(expr, input))
+        .or_else(|| eval_owned_count_arith::<S>(expr, input))
+}
+
+/// Arithmetic over a count and number literals (`length - 5`, `2 * length`, `length / 2 - 1`),
+/// answered from the owned container's length (#7110): `$a[$a | length - 5:]` evaluates its bound
+/// as `$a | (length - 5)`, and the stage `length - 5` has no door of its own, so each evaluation
+/// wrote `$a` out as text and indexed it again (3.7 ms per call over 100,000 elements, linear in
+/// the calls) to read one length that `($a | length) - 5` already took from the tree.
+///
+/// Every operand is a count of the owned container (an [`eval_owned_length`] answer), a number
+/// literal, or such arithmetic again, and at least one is a count, so the answer is a fresh number
+/// that carries nothing of `input`. The sum is [`arith_combine`]'s, the one the closed operators
+/// use. jq mode only (yq's arithmetic rules differ), and an operation that raises (`length / 0`)
+/// declines, so the bridge keeps its error and its text.
+fn eval_owned_count_arith<S: EvalSemantics>(expr: &Expr, input: &OwnedValue) -> Option<OwnedValue> {
+    fn operand<S: EvalSemantics>(
+        expr: &Expr,
+        input: &OwnedValue,
+        counted: &mut bool,
+    ) -> Option<OwnedValue> {
+        match unwrap_paren(expr) {
+            Expr::Literal(lit) => match literal_to_owned(lit) {
+                number @ (OwnedValue::Int(_)
+                | OwnedValue::Float(_)
+                | OwnedValue::NumberLiteral(..)) => Some(number),
+                _ => None,
+            },
+            Expr::Arithmetic {
+                op, left, right, ..
+            } => {
+                let l = operand::<S>(left, input, counted)?;
+                let r = operand::<S>(right, input, counted)?;
+                arith_combine::<S>(*op, l, r).ok()
+            }
+            other => {
+                let count = eval_owned_length(other, input)?;
+                *counted = true;
+                Some(count)
+            }
+        }
+    }
+    if S::TAG != EvalTag::Jq || !matches!(unwrap_paren(expr), Expr::Arithmetic { .. }) {
+        return None;
+    }
+    let mut counted = false;
+    let answer = operand::<S>(expr, input, &mut counted)?;
+    counted.then_some(answer)
 }
 
 /// A call to a user `def` with no parameters whose body the count doors answer
