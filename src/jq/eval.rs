@@ -93515,6 +93515,14 @@ fn eval_owned_pure_in<S: EvalSemantics>(
             | Builtin::Inside(_)
             | Builtin::ToString,
         ) if door && position == ResultPosition::Operand => eval_owned_door_arm::<S>(expr, input),
+        // #7132: `first`, `last` and `nth(n)` as the `.[0]`, `.[-1]` and `.[n]` they are defined as
+        // (`first > 1`, `first + 1`), read by [`eval_owned_first_last_nth`]; a read it declines (one
+        // that raises, yq mode) is the bridge's. An operand only, like the other door arms.
+        Expr::Builtin(Builtin::First | Builtin::Last | Builtin::Nth(_))
+            if door && position == ResultPosition::Operand =>
+        {
+            eval_owned_first_last_nth::<S>(expr, input).map(Ok)
+        }
         // `[e]` for a single-output pure `e` is the one-element array of
         // `e`'s answer: no generator to collect, so the evaluator's own
         // array collection is this and an error from `e` is its error. An
@@ -94115,6 +94123,10 @@ fn eval_owned_read_door_stage<S: EvalSemantics>(
         | Expr::SliceExpr { .. }
         | Expr::Try { catch: None, .. }
         | Expr::Optional(_) => eval_owned_slice_door::<S>(expr, input),
+        // The operand grammar declines both in result position, so nothing below is skipped.
+        Expr::Arithmetic { .. } | Expr::Alternative(..) => {
+            return eval_owned_operand_answer::<S>(shape, input)
+        }
         _ => None,
     };
     read
@@ -94260,18 +94272,47 @@ fn eval_owned_first_last_nth<S: EvalSemantics>(
         _ => return None,
     };
     match eval_owned_navigation::<S>(&Expr::Index { idx, key: None }, input, false)? {
-        // An integer a double cannot hold is the bridge's: its round trip spells it as the literal it
-        // was read from, which an owned `Int` is not.
-        Ok(Some(OwnedValue::Int(n))) if n.unsigned_abs() > 1 << 53 => None,
-        // A container shares its storage with `input`, which the #2889 embed table witnesses while
-        // it is live: that read is the evaluator's.
-        Ok(Some(OwnedValue::Array(_) | OwnedValue::Object(_)))
+        Ok(Some(element)) => owned_door_answer_may_leave(element),
+        _ => None,
+    }
+}
+
+/// Whether a value a door read off an owned input may leave as the stage's own answer (#7132): the
+/// rule [`eval_owned_first_last_nth`] and [`eval_owned_operand_answer`] share. An integer a double
+/// cannot hold is the bridge's: its round trip spells it as the literal it was read from, which an
+/// owned `Int` is not. A container shares its storage with `input`, which the #2889 embed table
+/// witnesses while it is live: that read is the evaluator's. Every other value prints, compares and
+/// computes as the bridge's copy of it does.
+fn owned_door_answer_may_leave(answer: OwnedValue) -> Option<OwnedValue> {
+    match answer {
+        OwnedValue::Int(n) if n.unsigned_abs() > 1 << 53 => None,
+        OwnedValue::Array(_) | OwnedValue::Object(_)
             if super::eval_generic::embed_table_active() =>
         {
             None
         }
-        Ok(Some(element)) => Some(element),
-        _ => None,
+        answer => Some(answer),
+    }
+}
+
+/// An arithmetic or `//` stage's own answer over an owned input (#7132): `.[0] + .[1]`, `first + 1`,
+/// `.[0] // 0`, `length - .[0]`. [`eval_owned_pure_in`] reads both as operands only (#2397, #6536,
+/// #6567), because `null + x` and `x // y` hand back a navigated `x` as it is, and the reason that
+/// must not leave is its representation: an owned `Int` where the bridge's copy is the literal it
+/// wrote. [`owned_door_answer_may_leave`] is that rule stated on the answer, as the
+/// `first`/`last`/`nth` door states it, so the operand grammar's answer is taken whenever the rule
+/// lets it leave. An operand that raises, fans out or is outside the grammar declines, and the bridge
+/// keeps jq's message and the order it raises in. jq mode only, as both arms are.
+fn eval_owned_operand_answer<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    match eval_owned_pure_in::<S>(expr, input, ResultPosition::Operand, true)? {
+        Ok(answer) => owned_door_answer_may_leave(answer),
+        Err(_) => None,
     }
 }
 
@@ -131444,7 +131485,71 @@ mod tests {
         ".[1:] | length",
         ".[1:] | first",
         "length > 1 and .[1:] == []",
+        ".[0] + .[1]",
+        ".[1] - .[0]",
+        ".[0] * 2",
+        ".[0] / 0",
+        ".[0] % 0",
+        ".[0] + \"a\"",
+        "first + 1",
+        "last - first",
+        "nth(1) * nth(0)",
+        "length - .[0]",
+        "null + first",
+        "first + null",
+        ".[0] + []",
+        "first > 1",
+        "first == 1",
+        "first < last",
+        "first // 0",
+        ".[0] // 0",
+        ".[5] // \"none\"",
+        ".a // 1",
+        "first // .[1]",
+        "(first | . + 1)",
+        "if first > 0 then first + 1 else 0 end",
     ];
+
+    /// #7132: an arithmetic or `//` stage's answer leaves under the `first`/`last`/`nth` door's rule:
+    /// `null + first` and `first // 0` hand the element back as it is, so a container element stays
+    /// the evaluator's while a #2889 embed table is live and leaves once it is gone, and a computed
+    /// number leaves either way. An integer a double cannot hold never leaves. `std` only: without it
+    /// there is no table to make live.
+    #[cfg(feature = "std")]
+    #[test]
+    fn operand_answers_leave_under_the_read_doors_rule_7132() {
+        let nested = OwnedValue::array_from(vec![
+            OwnedValue::array_from(vec![OwnedValue::Int(1)]),
+            OwnedValue::Int(2),
+        ]);
+        let answer =
+            |src: &str| eval_owned_value_doors::<JqSemantics>(&parse(src).unwrap(), &nested);
+        let element = Some(OwnedValue::array_from(vec![OwnedValue::Int(1)]));
+        let origin = BindOrigin::Node {
+            node: 1,
+            document: 9,
+        };
+        let mut bound = OwnedValue::array_from(vec![OwnedValue::Int(1)]);
+        let guard =
+            super::super::eval_generic::embed_table_push::<JqSemantics>(Some(&origin), &mut bound)
+                .expect("a container bind");
+        for src in ["null + first", "first // 0"] {
+            assert_eq!(answer(src), None, "{src} with the table live");
+        }
+        assert_eq!(answer(".[1] + 1"), Some(OwnedValue::Int(3)));
+        drop(guard);
+        for src in ["null + first", "first // 0"] {
+            assert_eq!(answer(src), element, "{src}");
+        }
+        assert_eq!(
+            owned_door_answer_may_leave(OwnedValue::Int((1 << 53) + 1)),
+            None
+        );
+        assert_eq!(
+            owned_door_answer_may_leave(OwnedValue::Int(1 << 53)),
+            Some(OwnedValue::Int(1 << 53))
+        );
+    }
 
     /// #7132: the single-value doors `eval_owned_input` takes before its bridge answer what the bridge
     /// does, in each mode, for `first`, `last`, `nth`, `has`, `keys` and a comparison or boolean over
@@ -157674,6 +157779,8 @@ mod tests {
             ("if length == 1 then 1 else empty end", 1),
             (".[0] // empty", 1),
             (".[1] // empty", 0),
+            // #7132 part five: `//` over a read is the operand door's, as the stage's own answer.
+            (".[0] // 3", 1),
         ] {
             let got = run(src, &deep).unwrap_or_else(|| panic!("{src} took the bridge"));
             assert_eq!(got.len(), outputs, "{src}");
@@ -157686,7 +157793,6 @@ mod tests {
             "error(.)?",
             "try error(\"x\") catch empty",
             "1, empty",
-            ".[0] // 3",
             "(.[0], .[1]) // empty",
         ] {
             assert!(run(src, &deep).is_none(), "{src} should decline");
