@@ -94346,7 +94346,14 @@ pub(crate) fn eval_owned_many_doors<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
 ) -> Option<Vec<OwnedValue>> {
-    let shape = unwrap_paren(expr);
+    // A one-stage pipe reads as its stage, as the value doors read it (#3673).
+    let shape = match unwrap_paren(expr) {
+        Expr::Pipe(stages) => match skip_identity_stages(stages) {
+            [only] => unwrap_paren(only),
+            _ => return None,
+        },
+        other => other,
+    };
     if !matches!(
         shape,
         Expr::Comma(_)
@@ -94376,8 +94383,8 @@ fn eval_owned_many_doors_answer<S: EvalSemantics>(
     let leave = |value: &OwnedValue| owned_door_answer_may_leave(value.clone());
     match shape {
         Expr::Comma(branches) => {
-            let mut out = Vec::with_capacity(branches.len());
-            for branch in branches.iter() {
+            let mut out = Vec::new();
+            for branch in branches {
                 match eval_owned_many_doors::<S>(branch, input) {
                     Some(values) => out.extend(values),
                     None => out.push(eval_owned_comma_branch::<S>(branch, input)?),
