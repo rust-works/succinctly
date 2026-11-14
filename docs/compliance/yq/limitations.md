@@ -7517,7 +7517,7 @@ A mapping key moves the pending comment aside, and there it waits beside the map
 A comment on a collection's key replaces both, and an empty `[]`/`{}` stays flow with its comment.
 This build follows that for the DOM route that `-P`, a write and
 `--arg` take, on JSON-shaped and YAML input alike (`defer_held_line_comments`). Swept against yq v4.53.3 over 14
-documents x 8 filters, and #7230's random fuzz of 1,500 documents and writes. Still different:
+documents x 8 filters, and #7230's random fuzz of 3,483 documents and writes. Still different:
 
 - **A comment written inside a flow collection** is kept when it follows an element on its line (`[1, # note` / `  2]`, #6334) and when it stands on a line of its own, and is printed as yq prints it.
   The identity route, a write and a navigation lay the collection out across lines with the comment after the element's comma, and the closing bracket on a line of its own when the last element is commented.

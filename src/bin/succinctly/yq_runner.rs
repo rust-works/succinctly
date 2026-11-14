@@ -4811,10 +4811,9 @@ fn reconcile_presentation_at_depth(
 #[inline(never)]
 fn grown_container_meta(meta: &NodeMeta, grown: bool) -> NodeMeta {
     if grown && meta.style == "flow" {
-        // The comment beside `{}` / `[]` goes with the flow spelling (yq drops it).
-        let mut grown = meta.with_style("");
-        grown.comment = None;
-        grown
+        // The comment beside `{}` / `[]` stays with the node, which is a block now: yq's encoder
+        // holds it for a later line, which [`defer_held_line_comments`] places (#7230).
+        meta.with_style("")
     } else {
         meta.clone()
     }
@@ -9936,30 +9935,18 @@ fn is_written_as_block(value: &OwnedValue, tree: &CommentTree, pretty: bool) -> 
         && (pretty || tree.style() != "flow")
 }
 
-/// Give a collection whose tree has no members (a `Leaf`, which a write that changed the node's
-/// kind leaves, or a [`CommentTree::Silent`] one, #6880) a tree with an empty member for each of
-/// its members, so a held comment can be placed on one. The trees read the same: every descent
-/// into a member of either gives the empty tree.
+/// Give a collection whose tree has no member trees (a `Leaf`, which a write that changed the
+/// node's kind leaves, or a [`CommentTree::Silent`] one, #6880) the childless tree of its kind, with
+/// its own metadata, so a held comment can be placed on a member. A member's tree is added only
+/// where one is placed; an absent one reads as the empty tree, as every member of either does.
 fn unfold_members(tree: &mut CommentTree, value: &OwnedValue) {
     let unfolded = match (&*tree, value) {
-        (
-            CommentTree::Leaf(_) | CommentTree::Silent(SilentKind::Array),
-            OwnedValue::Array(items),
-        ) => CommentTree::array(
-            tree.meta().clone(),
-            items.iter().map(|_| CommentTree::empty()).collect(),
-        ),
-        (
-            CommentTree::Leaf(_) | CommentTree::Silent(SilentKind::Object),
-            OwnedValue::Object(members),
-        ) => CommentTree::object(
-            tree.meta().clone(),
-            members
-                .keys()
-                .map(|key| (key.clone(), CommentTree::empty()))
-                .collect(),
-            IndexMap::new(),
-        ),
+        (CommentTree::Leaf(_) | CommentTree::Silent(SilentKind::Array), OwnedValue::Array(_)) => {
+            CommentTree::array(tree.meta().clone(), Vec::new())
+        }
+        (CommentTree::Leaf(_) | CommentTree::Silent(SilentKind::Object), OwnedValue::Object(_)) => {
+            CommentTree::object(tree.meta().clone(), IndexMap::new(), IndexMap::new())
+        }
         _ => return,
     };
     *tree = unfolded;
@@ -10001,8 +9988,13 @@ fn defer_held_line_comments_at(
         }
         return;
     }
-    // The comment of a block collection goes with its end event, after its last line.
-    let own = tree.meta_mut().comment.take();
+    // The comment of a block collection goes with its end event, after its last line. (Read before
+    // it is taken: a collapsed collection, which says nothing, stays collapsed.)
+    let own = if tree.own().is_some() {
+        tree.meta_mut().comment.take()
+    } else {
+        None
+    };
     if held.key.is_some() {
         // A comment a key moved aside can reach a member of a collection that has no tree of its
         // own for them.
@@ -10064,7 +10056,7 @@ fn defer_held_line_comments_at(
                     if held.pending.is_none() && held.key.is_none() {
                         continue;
                     }
-                    slots.resize_with(items.len(), CommentTree::empty);
+                    slots.resize_with(i + 1, CommentTree::empty);
                 }
                 // A collection item opens on its dash, and the writer puts a comment there as the
                 // head comment of the item's first member (#4231).
@@ -10091,11 +10083,23 @@ fn head_comment_first_member(tree: &mut CommentTree, value: &OwnedValue, comment
     // changed the node's kind leaves, #7230) gets an empty one for each, as in the full tree.
     unfold_members(tree, value);
     let first = match (tree, value) {
-        (CommentTree::Array(_, items), OwnedValue::Array(_)) => items.first_mut(),
-        (CommentTree::Object(_, fields, _), OwnedValue::Object(members)) => members
-            .keys()
-            .next()
-            .and_then(|key| fields.get_mut(key.as_str())),
+        (CommentTree::Array(_, items), OwnedValue::Array(_)) => {
+            if items.is_empty() {
+                items.push(CommentTree::empty());
+            }
+            items.first_mut()
+        }
+        (CommentTree::Object(_, fields, _), OwnedValue::Object(members)) => {
+            match members.keys().next() {
+                Some(key) => {
+                    if !fields.contains_key(key.as_str()) {
+                        fields.insert(key.clone(), CommentTree::empty());
+                    }
+                    fields.get_mut(key.as_str())
+                }
+                None => None,
+            }
+        }
         _ => None,
     };
     if let Some(first) = first {

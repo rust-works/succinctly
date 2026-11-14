@@ -221,6 +221,15 @@ fn pretty_holds_a_flow_collections_comment_in_two_slots_7230() -> Result<()> {
             &["-P"],
             "x: &x 1\na:\n  - 1\nb: *x\nc: 3 # ec\n",
         ),
+        // A comment held beside a commented entry of a mapping that is a sequence item waits for a
+        // mapping value, so the next item of the outer sequence does not take it (#6334's row,
+        // which reached `- 2 # c5` before).
+        (
+            "- {k0: {k0: true}, # c5\n  m1: b # c6\n  }\n- 2\n",
+            ".",
+            &["-P"],
+            "- k0:\n    k0: true\n  m1: b # c6\n- 2\n",
+        ),
         (
             "a: [1] # ec\nb: [6] # bc\nc: 8\n",
             ".",
@@ -330,5 +339,26 @@ fn a_held_comment_survives_an_entries_replay_7230() -> Result<()> {
             &[],
             "a:\n  x: 1\nb: 6 # own\n",
         ),
+    ])
+}
+
+/// An empty flow `[]` / `{}` that a write fills is written in block style (#4849), and its comment is
+/// held for a later line like any block collection's. It was dropped.
+#[test]
+fn a_filled_empty_flow_collections_comment_is_held_7230() -> Result<()> {
+    assert_rows(&[
+        (
+            "a: [] # c\nb: 6\n",
+            ".a = [1]",
+            &[],
+            "a:\n  - 1\nb: 6 # c\n",
+        ),
+        (
+            "a: {} # c\nb: 6\n",
+            ".a.x = 1",
+            &[],
+            "a:\n  x: 1\nb: 6 # c\n",
+        ),
+        ("- [] # c\n- 6\n", ".[0] += [1]", &[], "- - 1\n- 6 # c\n"),
     ])
 }
