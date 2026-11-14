@@ -7862,7 +7862,12 @@ Six rows differ from yq v4.53.3, each pinned out of `tests/yq_cli/i6850.rs`:
   `head_comment` reads both from the document node, so a key read inside parentheses, after a `select` or under a non-YAML `-o` loses them (#7043), and after a write (`.[0].b = 2 | .[0].a | key | head_comment` over `- # m` / `  a: 1` is `""`, yq `"m"`), under `--eval-all` and on a built value they are not there (#7034).
   `@props` in the text an `eval` reads, or on the right of an assignment (`.x = (. | @props)`), writes no comment either: that evaluation holds the value without the document node.
   Two keys whose paths join to the same property (`a.b: 1` beside `a: {b: 2}`) write two lines here, each with the later key's comment, where yq writes the property once, with the later value and comment.
-- A null written `~` (or `!!null ""`) prints `null` with every encoder, `ini` included, where yq echoes the spelling (`c = ~`, `c='~'`, `a = `, #2802).
+- `-o=props`, `-o=shell`, `-o=ini` and `-o=xml` print a null and a boolean as the node was written, as yq's encoders print a scalar node's own text (#7204): `a:` with no value is `a = ` (`a=`, `<a></a>`), `~` is `~` (shell `'~'`), `Null` and `NULL` are as written, and `True`, `TRUE`, `False` and `FALSE` are too.
+  The spelling is read from the cursor for a read and from the presentation tree for a write (`=`, `del()`, `sort_keys`, `-i`), so it follows a node that stays where it is.
+  A reshape that moves the nodes (`.c |= reverse`) leaves each spelling at its position, as the YAML printer does for the same filter.
+  A value with no node behind it prints canonically: `tostring` and `join` (#2802), a value a filter computes, and a literal.
+  A document sweep of the four encoders over 2,500 real YAML files differs from yq on 448 file and format pairs before this and 28 after (comment placement, #7202, and files yq refuses or reads differently), and `-o=toml` still writes `true` for a `True` (below).
+  Every other encoder writes a null and a boolean in one spelling (`-o=csv`, `-o=tsv`, `-o=lua`, `-o=kyaml`, `-o=uri`, `-o=base64` agree with yq on every spelling probed) and `-o=json`, `-o=yaml` are unaffected.
 - An encoder that fails after earlier results printed still prints those results first, as yq does (#6923): `printf 'a: x\nb: [1]\nc: {d: e}\n' | yq -o=csv '.[]'` prints `x` and `1`, then the error, exit 1.
   A top-level comma (`.a, .b`) still prints nothing before the error, and the error line is written when it is raised, so the two streams can interleave differently on a terminal.
   The results are kept on the plain, `--eval-all` and `-n` routes; the other input routes were not checked.

@@ -9013,7 +9013,7 @@ fn top_level_comma_branches(expr: &Expr) -> Option<Vec<&Expr>> {
 const PICK_REPLAY_MAX_BYTES: usize = 1 << 20;
 
 /// The program and the encoder stage `run_yq` appended to it, if that is how `expr` ends and the encoder
-/// writes comments (`-o xml`, `-o lua`, #7156).
+/// writes comments (`-o xml`, `-o lua`, #7156) or prints a node's own text (`-o shell`, `-o ini`, #7204).
 fn split_comment_encoder(expr: &Expr) -> Option<(Expr, &YqOutputEncoder)> {
     let Expr::Pipe(stages) = expr else {
         return None;
@@ -9022,7 +9022,7 @@ fn split_comment_encoder(expr: &Expr) -> Option<(Expr, &YqOutputEncoder)> {
     let Expr::Format(FormatType::YqOutput(encoder)) = last else {
         return None;
     };
-    if !jq::yq_encoder_writes_comments(encoder) {
+    if !jq::yq_encoder_writes_comments(encoder) && !jq::yq_encoder_reads_spelling(encoder) {
         return None;
     }
     let inner = match prefix {

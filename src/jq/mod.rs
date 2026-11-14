@@ -159,7 +159,9 @@ pub use eval::{
 };
 pub use eval::{eval_full, eval_owned_scalar_fast, eval_reindexed_document, with_stderr_muted};
 #[doc(hidden)]
-pub use eval::{yq_encoder_prints_leading_block, yq_encoder_writes_comments};
+pub use eval::{
+    yq_encoder_prints_leading_block, yq_encoder_reads_spelling, yq_encoder_writes_comments,
+};
 #[doc(hidden)]
 pub use eval_generic::format_yq_encoder_from_tree;
 // #6925: Go's `strconv.Quote` and `url.QueryUnescape` over bytes, for the CLI's `-p uri`.
