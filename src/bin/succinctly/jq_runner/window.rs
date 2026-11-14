@@ -1422,9 +1422,11 @@ fn open_not_a_directory(path: &std::path::Path) -> io::Result<(File, std::fs::Me
     Ok((file, meta))
 }
 
-/// A file of a long list that `-R` reads (#7024), opened by its path when the run first reads it and
-/// closed when the reader is dropped (the producer drops a file's windows once its lines are over), so
-/// a list of any length holds one descriptor, where a short one holds each file open from the start.
+/// A file of a long list that `-R` (#7024) or `input`/`inputs` (#7197) reads, opened by its path when the
+/// run first reads it and closed once a read reaches its end, so a list of any length holds one
+/// descriptor, where a short one holds each file open from the start. Closing at the end, not when the
+/// reader is dropped, keeps that true for a consumer that holds the readers it has read to the end, as
+/// the eager reader a hand-off gives the rest of the stream to does ([`super::hand_off_later_sources`]).
 /// The list is judged by `stat` before the run starts ([`super::judge_regular_paths`]), which opens
 /// nothing; the run then reads what the path names when it gets there, with no second judgement and no
 /// length fixed beforehand, as jq, which opens each file as it reaches it and reads it to its end, does
@@ -1439,8 +1441,8 @@ pub(super) struct OpenWhenRead {
     /// Whether it is the last of them: jq's reader does not report a directory there (#6472).
     last: bool,
     file: Option<File>,
-    /// The file did not open: it reads as no bytes.
-    failed: bool,
+    /// The file did not open, or was read to its end and closed: it reads as no bytes.
+    ended: bool,
     /// Where the stream starts in the file once it is open: past a byte-order mark jq skips.
     start: u64,
 }
@@ -1452,7 +1454,7 @@ impl OpenWhenRead {
             at,
             last,
             file: None,
-            failed: false,
+            ended: false,
             start: 0,
         }
     }
@@ -1466,7 +1468,7 @@ impl OpenWhenRead {
 
 impl Read for OpenWhenRead {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.failed {
+        if self.ended {
             return Ok(0);
         }
         let file = match self.file.as_mut() {
@@ -1479,13 +1481,19 @@ impl Read for OpenWhenRead {
             }) {
                 Ok(file) => self.file.insert(file),
                 Err(error) => {
-                    self.failed = true;
+                    self.ended = true;
                     super::note_raw_open_failure(&self.path, self.at, &error, self.last);
                     return Ok(0);
                 }
             },
         };
-        file.read(buf)
+        let read = file.read(buf)?;
+        if read == 0 && !buf.is_empty() {
+            // The end of the file: its descriptor is given back now, and the file is not opened again.
+            self.ended = true;
+            self.file = None;
+        }
+        Ok(read)
     }
 }
 
@@ -3571,13 +3579,18 @@ mod stream_tests {
         let present = dir.path().join("present.txt");
         std::fs::write(&present, b"one\ntwo\n").expect("written");
         let mut seen = String::new();
-        let mut reader = OpenWhenRead::new(present, 3, false);
+        let mut reader = OpenWhenRead::new(present.clone(), 3, false);
         reader.read_to_string(&mut seen).expect("reads");
         assert_eq!(seen, "one\ntwo\n");
+        // Read to its end, it holds no descriptor (#7197), and reads nothing more though the file grows.
+        assert!(reader.file.is_none(), "closed at its end");
+        std::fs::write(&present, b"one\ntwo\nthree\n").expect("written");
+        let mut buf = [0u8; 16];
+        assert_eq!(reader.read(&mut buf).expect("reads as empty"), 0);
+        assert!(reader.file.is_none(), "not opened again");
         let missing = dir.path().join("missing.txt");
         super::super::PENDING_OPEN_FAILURES.with(|pending| pending.borrow_mut().clear());
         let mut reader = OpenWhenRead::new(missing, 7, true);
-        let mut buf = [0u8; 16];
         assert_eq!(reader.read(&mut buf).expect("reads as empty"), 0);
         assert_eq!(reader.read(&mut buf).expect("still empty"), 0);
         let noted = super::super::PENDING_OPEN_FAILURES.with(|pending| pending.borrow().len());

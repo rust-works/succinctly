@@ -347,3 +347,46 @@ fn a_path_that_changes_before_the_run_reaches_it_is_read_as_jq_reads_it_7197() -
     assert_eq!(run.2, 2);
     Ok(())
 }
+
+/// A hand-off to the eager reader reads every file after the one it starts in to its end, and gives each
+/// file's descriptor back as it does: under a limit on open files smaller than the list, every file is
+/// still read, where holding them all made each past the limit read as `Too many open files`.
+#[test]
+fn a_hand_off_over_more_files_than_may_be_open_reads_every_file_7197() -> Result<()> {
+    const MANY: usize = 120;
+    let bytes = text(60_000);
+    let mut files = Vec::with_capacity(MANY);
+    let mut from = 0;
+    for n in 1..MANY {
+        let at = bytes[..n * bytes.len() / MANY]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |at| at + 1);
+        files.push(bytes[from..at.max(from)].to_vec());
+        from = at.max(from);
+    }
+    files.push(bytes[from..].to_vec());
+    // A number left open where file 5 ends, which goes on in file 6, hands the rest of the stream over.
+    files[5].extend_from_slice(b"12");
+    files[6].splice(0..0, b"34\n".iter().copied());
+    let dir = tempfile::tempdir()?;
+    let mut paths = Vec::new();
+    for (n, bytes) in files.iter().enumerate() {
+        let path = dir.path().join(format!("f{n:03}.json"));
+        std::fs::write(&path, bytes)?;
+        paths.push(path);
+    }
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg("ulimit -n 40 && exec \"$0\" \"$@\"")
+        .arg(env!("CARGO_BIN_EXE_succinctly"))
+        .args(["jq", "-c", "-n", "[inputs] | length, (map(numbers) | add)"])
+        .args(&paths)
+        .env("LC_ALL", "C")
+        .output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "60001\n1234\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
