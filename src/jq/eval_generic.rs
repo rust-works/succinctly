@@ -6531,6 +6531,14 @@ pub fn format_yq_encoder_from_tree<C: DocumentCursor>(
             first_key.as_deref(),
         );
     }
+    // The same for a document read with `-p xml` (#7202).
+    if matches!(encoder, YqOutputEncoder::Xml(options) if options.empty_null) {
+        super::encoder_comments::xml_first_entry_head(
+            &mut comments,
+            &mut leading,
+            first_key.as_deref(),
+        );
+    }
     format_yq_commented(encoder, value, &comments, &leading)
 }
 
@@ -16872,6 +16880,17 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                         super::encoder_comments::toml_first_entry_head(
                             &mut comments,
                             &leading,
+                            first_key.as_deref(),
+                        );
+                    }
+                    // The same for a document read with `-p xml` (#7202).
+                    let mut leading = leading;
+                    if matches!(encoder, YqOutputEncoder::Xml(options) if options.empty_null) {
+                        let first_key =
+                            super::encoder_comments::first_entry_key(&comments).map(str::to_owned);
+                        super::encoder_comments::xml_first_entry_head(
+                            &mut comments,
+                            &mut leading,
                             first_key.as_deref(),
                         );
                     }
