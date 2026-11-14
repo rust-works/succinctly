@@ -2205,11 +2205,16 @@ impl Reread {
         // all) is left to the whole-file route, which walks the join as jq's reader does. A file the
         // run opens by its path when it reaches it ([`NamedFile`], a long list) is not read here: the
         // prepass would read what the path names now and the run what it names then.
-        !self.sources.is_empty()
-            && self.sources.iter().all(|source| match &source.file {
-                RereadFile::Held(file) => plain_seq_records_in(file, source.start, source.len),
-                RereadFile::Named(_) => false,
-            })
+        let held = |check: &dyn Fn(&File, u64, u64) -> bool| {
+            !self.sources.is_empty()
+                && self.sources.iter().all(|source| match &source.file {
+                    RereadFile::Held(file) => check(file, source.start, source.len),
+                    RereadFile::Named(_) => false,
+                })
+        };
+        // The ends of every file first, so a file that is not framed at all is turned down by two reads
+        // each and not after a pass over the files before it.
+        held(&plain_seq_ends_in) && held(&plain_seq_records_in)
     }
 
     #[cfg(not(unix))]
@@ -2227,13 +2232,11 @@ impl Reread {
     }
 }
 
-/// Whether the `len` bytes of `file` from `start` are a `--seq` stream of nothing but plain records
-/// ([`Reread::is_plain_seq_records`]): the first byte an RS, the last an LF, every record framed.
+/// Whether the `len` bytes of `file` from `start` begin on an RS and end on an LF, the first of what
+/// [`Reread::is_plain_seq_records`] asks of each file.
 #[cfg(unix)]
-fn plain_seq_records_in(file: &File, start: u64, len: u64) -> bool {
-    use crate::jq_seq_reader::{PlainGuards, PlainRecords};
+fn plain_seq_ends_in(file: &File, start: u64, len: u64) -> bool {
     use std::os::unix::fs::FileExt;
-    let guards = PlainGuards::ALL;
     // A length of 0 is not known to be (`known_len`), and a file of none is no record.
     if len == 0 || len == u64::MAX {
         return false;
@@ -2245,9 +2248,15 @@ fn plain_seq_records_in(file: &File, start: u64, len: u64) -> bool {
             _ => None,
         }
     };
-    if byte_at(0) != Some(RS) || byte_at(len - 1) != Some(b'\n') {
-        return false;
-    }
+    byte_at(0) == Some(RS) && byte_at(len - 1) == Some(b'\n')
+}
+
+/// The records of a file whose ends [`plain_seq_ends_in`] has vouched for.
+#[cfg(unix)]
+fn plain_seq_records_in(file: &File, start: u64, len: u64) -> bool {
+    use crate::jq_seq_reader::{PlainGuards, PlainRecords};
+    use std::os::unix::fs::FileExt;
+    let guards = PlainGuards::ALL;
     // The last record first, when an RS is near enough the end to hold it: the verdict does not
     // depend on the order, and a record that fails is most often the last (a write cut short).
     let probe = len.min(TAIL_PROBE);

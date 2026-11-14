@@ -20,7 +20,7 @@ lines has no fault, so these cases test where windows cut lines: invalid UTF-8, 
 very long lines and no final line break. `--inputs` runs programs that read `input`/`inputs` over `--files`
 files (2 to 32), which their own reader takes a window at a time, one file after another (#7024), against the
 same files as `/dev/fd/N`: those print `input_line_number`, `input_filename` and `$__loc__`, and read past
-faults. `--seq --files K` cuts the `--seq` stream into K files (2 to 512), most cuts at a record's start so the
+faults. `--seq --files K` cuts the `--seq` stream into K files (2 to 32), most cuts at a record's start so the
 files are plain records and the route reads them a window at a time (#7218), the rest anywhere, which leaves the
 run to the whole-file route, against the same files as descriptors. `--pipe --seq` feeds a `--seq` stream on the pipe (#7164): mostly records of RFC 7464's own framing
 (`RS value LF`), which the route reads a window at a time, with a turn or two at a random record (often one by
@@ -437,8 +437,9 @@ def main():
         sys.exit("--inputs is neither --raw nor --pipe")
     if args.seq and (args.raw or args.inputs):
         sys.exit("--seq is a stream on a pipe (--pipe) or in files (--files K, #7218): neither --raw nor --inputs")
-    if args.seq and not args.pipe and args.files < 2:
-        sys.exit("--seq is a stream on a pipe or in several files: give --pipe or --files 2 to 512")
+    if args.seq and not args.pipe and not 2 <= args.files <= 32:
+        sys.exit("--seq is a stream on a pipe or in several files: give --pipe or --files 2 to 32 (a longer list "
+                 "is opened by path, which the route leaves to the whole-file one, so it would test nothing)")
     if args.pipe and args.files != 1:
         sys.exit("--pipe is one stream: give no --files")
     if not 1 <= args.files <= 512:
