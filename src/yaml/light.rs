@@ -21,6 +21,8 @@ use std::rc::Rc;
 #[cfg(test)]
 use std::string::ToString;
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use super::block_unicode::{any_break_len, decode_block_unicode, unicode_break_len};
 use super::encode_style::{
     flow_plain_needs_single_quotes, go_yaml_block_scalar, go_yaml_explicit_key_scalar,
@@ -5654,6 +5656,9 @@ impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
     ) -> Option<YamlCursor<'a, W>> {
         assert_depth(depth, MAX_ALIAS_CHAIN_DEPTH);
 
+        if merge_anchor_to_spec() {
+            return Self::traverse_fields_spec(first_key, name, depth, &mut BTreeMap::new());
+        }
         let mut result = None;
         for field in YamlFields::raw(first_key) {
             let key = field.key();
@@ -5665,6 +5670,58 @@ impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
                     }
                 }
             } else if field_key_is_named(&key, name) {
+                result = Some(field.value_cursor);
+            }
+        }
+        result
+    }
+}
+
+impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
+    /// [`traverse_fields`](Self::traverse_fields) under `--yaml-fix-merge-anchor-to-spec`: yq walks
+    /// the `<<` keys first, the last-written first and each one's sources last-listed first (a
+    /// source's own `<<` included), and the own fields after them, so the last hit of that walk is
+    /// the answer: an own key beats every merged member, and of two sources the earlier-listed wins.
+    ///
+    /// `seen` holds what each source mapping (by position) answered for `name`, so a source named
+    /// by many `<<` lists is walked once: without it `<<: [*a, *a]` nested a few dozen deep is
+    /// exponential.
+    fn traverse_fields_spec(
+        first_key: Option<YamlCursor<'a, W>>,
+        name: &str,
+        depth: usize,
+        seen: &mut BTreeMap<usize, Option<YamlCursor<'a, W>>>,
+    ) -> Option<YamlCursor<'a, W>> {
+        assert_depth(depth, MAX_ALIAS_CHAIN_DEPTH);
+        let fields: Vec<(YamlField<'a, W>, bool, bool)> = YamlFields::raw(first_key)
+            .map(|field| {
+                let key = field.key();
+                (
+                    field,
+                    is_spec_merge_key(&field.key_cursor, &key),
+                    field_key_is_named(&key, name),
+                )
+            })
+            .collect();
+        let mut result = None;
+        for (field, _, _) in fields.iter().rev().filter(|(_, is_merge, _)| *is_merge) {
+            for source in spec_walk_order(field.value_cursor) {
+                let hit = match seen.get(&source.bp_pos) {
+                    Some(hit) => *hit,
+                    None => {
+                        let hit =
+                            Self::traverse_fields_spec(source.first_child(), name, depth + 1, seen);
+                        seen.insert(source.bp_pos, hit);
+                        hit
+                    }
+                };
+                if hit.is_some() {
+                    result = hit;
+                }
+            }
+        }
+        for (field, is_merge, named) in &fields {
+            if !is_merge && *named {
                 result = Some(field.value_cursor);
             }
         }
@@ -5750,6 +5807,12 @@ fn resolve_merge_keys<'a, W: AsRef<[u64]>>(
     first_key: Option<YamlCursor<'a, W>>,
     view: MergeView,
 ) -> Option<(MergedEntries<'a, W>, bool)> {
+    // `--yaml-fix-merge-anchor-to-spec` (#7025): yq reads a `<<` by other rules, and in both views
+    // the two listings differ as soon as a mapping has one.
+    if merge_anchor_to_spec() {
+        return resolve_merge_keys_spec(first_key, view, 0, &mut BTreeMap::new())
+            .map(|entries| (entries, true));
+    }
     let mut fields = YamlFields::raw(first_key);
     let mut seen: Vec<(YamlCursor<'a, W>, YamlCursor<'a, W>, YamlValue<'a, W>)> = Vec::new();
 
@@ -6106,6 +6169,233 @@ fn merge_field_into<'a, W: AsRef<[u64]>>(
         }
     }
     (views_differ, contributed)
+}
+
+/// Whether `succinctly yq` runs under yq's `--yaml-fix-merge-anchor-to-spec` (#7025). A process-wide
+/// setting, as yq's `ConfiguredYamlPreferences` is: the reading of a `<<` is a property of the run,
+/// not of one mapping, and the evaluator may read a document from another thread than the one that
+/// parsed the flag.
+static MERGE_ANCHOR_TO_SPEC: AtomicBool = AtomicBool::new(false);
+
+/// Read every `<<` the way yq does under `--yaml-fix-merge-anchor-to-spec`: an own key beats a merged
+/// one wherever the `<<` is written, and of two merged sources the earlier-listed wins.
+///
+/// Process-wide and meant to be set once, before the first document is read (the CLI sets it from the
+/// flag); the library default is yq's legacy reading, which `succinctly yq` follows without the flag.
+pub fn set_merge_anchor_to_spec(on: bool) {
+    MERGE_ANCHOR_TO_SPEC.store(on, Ordering::Relaxed);
+}
+
+/// Whether [`set_merge_anchor_to_spec`] is on.
+fn merge_anchor_to_spec() -> bool {
+    MERGE_ANCHOR_TO_SPEC.load(Ordering::Relaxed)
+}
+
+/// Whether a mapping key is a merge key under `--yaml-fix-merge-anchor-to-spec`: the text `<<` and
+/// not a quoted scalar. yq's default reading merges a quoted `"<<"` too; under the flag it tests the
+/// key's tag, and a quoted key is a string.
+fn is_spec_merge_key<W: AsRef<[u64]>>(
+    key_cursor: &YamlCursor<'_, W>,
+    key_value: &YamlValue<'_, W>,
+) -> bool {
+    is_merge_key_value(key_value)
+        && !key_cursor
+            .text_position()
+            .and_then(|at| key_cursor.text.get(at))
+            .is_some_and(|byte| matches!(byte, b'"' | b'\''))
+}
+
+/// A `<<` value's sources in listed order, as yq's traversal under `--yaml-fix-merge-anchor-to-spec`
+/// reads them (`traverseMergeAnchor`): a mapping, an alias to one, or a sequence of those. `None` marks
+/// a sequence element that is not a mapping, which ends the walk when it is reached from the back
+/// (yq's `return nil`), so the sources listed after it still contribute and those before it do not.
+/// Any other value names no source.
+fn spec_merge_sources<W: AsRef<[u64]>>(
+    value_cursor: YamlCursor<'_, W>,
+) -> Vec<Option<YamlCursor<'_, W>>> {
+    /// What a node is, decided without `value()` where the node is a container: `value()` of a
+    /// mapping that merges resolves its whole field list at once, and a chain of merges that
+    /// name each other twice would resolve each link once per mention.
+    enum Node<'a, W> {
+        Mapping,
+        Sequence(YamlElements<'a, W>),
+        Other,
+    }
+    fn classify<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> Node<'_, W> {
+        if cursor.bp_pos != 0 && cursor.is_container() {
+            return if cursor.index.is_sequence_at_bp(cursor.bp_pos) {
+                Node::Sequence(YamlElements::from_sequence_cursor(cursor))
+            } else {
+                Node::Mapping
+            };
+        }
+        match cursor.value() {
+            YamlValue::Mapping(_) => Node::Mapping,
+            YamlValue::Sequence(sequence) => Node::Sequence(sequence),
+            _ => Node::Other,
+        }
+    }
+    /// The anchored node an alias names, or the node itself.
+    fn through_alias<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> Option<YamlCursor<'_, W>> {
+        if !cursor.is_alias() {
+            return Some(cursor);
+        }
+        match cursor.value() {
+            YamlValue::Alias {
+                target: Some(target),
+                ..
+            } => Some(target),
+            _ => None,
+        }
+    }
+    fn as_mapping<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> Option<YamlCursor<'_, W>> {
+        let target = through_alias(cursor)?;
+        match classify(target) {
+            Node::Mapping if target.bp_pos == cursor.bp_pos => Some(cursor.resolve_bare_seq_item()),
+            Node::Mapping => Some(target),
+            _ => None,
+        }
+    }
+    let mut sources = Vec::new();
+    let Some(target) = through_alias(value_cursor) else {
+        return sources;
+    };
+    match classify(target) {
+        Node::Mapping => sources.push(Some(target)),
+        Node::Sequence(sequence) => {
+            let mut rest = sequence;
+            while let Some((cursor, tail)) = rest.uncons_cursor() {
+                sources.push(as_mapping(cursor));
+                rest = tail;
+            }
+        }
+        Node::Other => {}
+    }
+    sources
+}
+
+/// The sources of one `<<` in the order yq's traversal walks them under
+/// `--yaml-fix-merge-anchor-to-spec`: last listed first, stopping at the first non-mapping element
+/// reached that way. Each source overwrites what an earlier-walked one put in, so the earliest-listed
+/// source wins a conflict.
+fn spec_walk_order<W: AsRef<[u64]>>(
+    value_cursor: YamlCursor<'_, W>,
+) -> impl Iterator<Item = YamlCursor<'_, W>> {
+    spec_merge_sources(value_cursor)
+        .into_iter()
+        .rev()
+        .map_while(|source| source)
+}
+
+/// One `<<` source's fields under `--yaml-fix-merge-anchor-to-spec`: its own resolved list when it
+/// merges too, its plain fields otherwise.
+///
+/// `resolved` holds each source mapping (by position) already listed, so a source named by many `<<`
+/// lists is resolved once: without it `<<: [*a, *a]` nested a few dozen deep is exponential.
+fn spec_source_fields<'a, W: AsRef<[u64]>>(
+    source: YamlCursor<'a, W>,
+    view: MergeView,
+    depth: usize,
+    resolved: &mut SpecResolved<'a, W>,
+) -> Rc<MergedEntries<'a, W>> {
+    if let Some(entries) = resolved.get(&source.bp_pos) {
+        return entries.clone();
+    }
+    let entries = Rc::new(
+        resolve_merge_keys_spec(source.first_child(), view, depth, resolved).unwrap_or_else(|| {
+            YamlFields::raw(source.first_child())
+                .map(|f| (f.key_cursor, f.value_cursor))
+                .collect()
+        }),
+    );
+    resolved.insert(source.bp_pos, entries.clone());
+    entries
+}
+
+/// The listings [`spec_source_fields`] has resolved so far, by source position.
+type SpecResolved<'a, W> = BTreeMap<usize, Rc<MergedEntries<'a, W>>>;
+
+/// A mapping's fields under `--yaml-fix-merge-anchor-to-spec`, both of yq's expansions of them.
+///
+/// The iteration (`.[]`, `.[] | key`: yq's `doTraverseMap`) walks every `<<` first, the last-written
+/// one first and each one's sources last-listed first, a source's own `<<` included; the own fields
+/// then upsert in place, so an own key beats a merged one wherever the `<<` stands. The rendering
+/// (`-o json`, `tojson`, `explode`: `fixedReconstructAliasedMap`) lists the fields in document order
+/// and, where a `<<` stands, the members of each source (itself rendered) whose key is neither an own
+/// key of the mapping nor listed already. Returns `None` for a mapping without a `<<`.
+fn resolve_merge_keys_spec<'a, W: AsRef<[u64]>>(
+    first_key: Option<YamlCursor<'a, W>>,
+    view: MergeView,
+    depth: usize,
+    resolved: &mut SpecResolved<'a, W>,
+) -> Option<MergedEntries<'a, W>> {
+    assert_depth(depth, MAX_ALIAS_CHAIN_DEPTH);
+    let mut fields: Vec<(YamlField<'a, W>, bool, YamlValue<'a, W>)> = Vec::new();
+    let mut merges = false;
+    for field in YamlFields::raw(first_key) {
+        let key_value = field.key();
+        let is_merge = is_spec_merge_key(&field.key_cursor, &key_value);
+        merges |= is_merge;
+        fields.push((field, is_merge, key_value));
+    }
+    if !merges {
+        return None;
+    }
+    let mut entries: MergedEntries<'a, W> = Vec::new();
+    if view == MergeView::Iteration {
+        let mut positions = KeyPositions::default();
+        for (field, _, _) in fields.iter().rev().filter(|(_, is_merge, _)| *is_merge) {
+            for source in spec_walk_order(field.value_cursor) {
+                let source_fields =
+                    spec_source_fields(source, MergeView::Iteration, depth + 1, resolved);
+                for &(key, value) in source_fields.iter() {
+                    let key_value = key.value();
+                    upsert_field(&mut entries, &mut positions, key, value, &key_value);
+                }
+            }
+        }
+        for (field, is_merge, key_value) in &fields {
+            if !is_merge {
+                upsert_field(
+                    &mut entries,
+                    &mut positions,
+                    field.key_cursor,
+                    field.value_cursor,
+                    key_value,
+                );
+            }
+        }
+        return Some(entries);
+    }
+    // The rendering: the names a source member may not take. A `<<` source key counts as an own key
+    // of the mapping, as yq's `getContentValueByKey` reads `node.Content` whole.
+    let own_names: BTreeSet<String> = fields
+        .iter()
+        .map(|(_, _, key_value)| key_value.key_string().into_owned())
+        .collect();
+    let mut listed: BTreeSet<String> = BTreeSet::new();
+    for (field, is_merge, key_value) in &fields {
+        if !is_merge {
+            listed.insert(key_value.key_string().into_owned());
+            entries.push((field.key_cursor, field.value_cursor));
+            continue;
+        }
+        for source in spec_merge_sources(field.value_cursor).into_iter().flatten() {
+            let source_fields = spec_source_fields(source, view, depth + 1, resolved);
+            let mut added: Vec<(YamlCursor<'a, W>, YamlCursor<'a, W>, String)> = Vec::new();
+            for &(key, value) in source_fields.iter() {
+                let name = key.value().key_string().into_owned();
+                if !own_names.contains(&name) && !listed.contains(&name) {
+                    added.push((key, value, name));
+                }
+            }
+            for (key, value, name) in added {
+                listed.insert(name);
+                entries.push((key, value));
+            }
+        }
+    }
+    Some(entries)
 }
 
 /// Insert a field by name, or overwrite an existing entry's value in place.

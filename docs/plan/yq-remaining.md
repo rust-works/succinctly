@@ -19,12 +19,6 @@ See [yq Language Reference](../reference/yq-language.md) for implemented feature
 | `@xml`   | Encode as XML string | Unknown format here; XML input/output is listed as out of scope in the reference |
 | `to_xml` | Same as `@xml`       | `to_xml/0 is not defined`                                                        |
 
-## CLI Options
-
-| Flag                              | Description                                                             |
-|-----------------------------------|-------------------------------------------------------------------------|
-| `--yaml-fix-merge-anchor-to-spec` | Merge `<<` per the YAML spec instead of yq's default; not accepted here |
-
 ## Removed From This List
 
 - **Datetime operators** (`with_dtf`, `format_datetime`, `tz`, and `+`/`-` of a duration to a
@@ -34,6 +28,9 @@ See [yq Language Reference](../reference/yq-language.md) for implemented feature
 
 - **Merge keys** (`<<: *alias`): implemented; reads match yq's default, and the differences in key
   lists, writes and encoders are in [limitations.md](../compliance/yq/limitations.md) (#3556).
+- **`--yaml-fix-merge-anchor-to-spec`**: implemented for value reads, iteration, the JSON rendering and
+  `explode` (#7025); a malformed `<<` and the write routes differ, see
+  [limitations.md](../compliance/yq/limitations.md).
 - **Comment storage and preservation**: implemented (#710, #765, #2795); the remaining gaps are in
   [limitations.md](../compliance/yq/limitations.md).
 - **`--explode-anchors`** and **`--preserve-comments`**: neither is a yq v4.53.3 flag (yq reports

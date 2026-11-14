@@ -291,6 +291,7 @@ pub use index::YamlIndex;
 pub use light::collect_merged_members;
 #[doc(hidden)] // shared with the `succinctly yq` DOM writer; not a supported API
 pub use light::deeper_yaml_indent;
+pub use light::set_merge_anchor_to_spec;
 pub use light::{
     format_float_with_fraction, format_float_yq, format_float_yq_yaml, format_float_yq_yaml_nested,
     stream_json_sequence, stream_yaml_sequence, yq_float_is_scientific, ChompingIndicator,
