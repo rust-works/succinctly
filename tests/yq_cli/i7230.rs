@@ -362,3 +362,37 @@ fn a_filled_empty_flow_collections_comment_is_held_7230() -> Result<()> {
         ("- [] # c\n- 6\n", ".[0] += [1]", &[], "- - 1\n- 6 # c\n"),
     ])
 }
+
+/// #6954: under `-P` the held comment of a flow collection lands on a later item a write gave a new
+/// kind, on its dash, and a comment held from a nested collection reaches it only as yq's two slots
+/// say (`.[4] = [7]`, an append, leaves `# c1` where the item before it puts it).
+#[test]
+fn pretty_places_a_held_comment_on_a_kind_changed_item_6954() -> Result<()> {
+    let nested = "- [{y: ~}] # c8\n- - {c: ~} # c1\n- true # c5\n- {y: 2}\n";
+    assert_rows(&[
+        (
+            "- [1, 2] # ec\n- 5\n",
+            ".[1] = {\"a\": 1}",
+            &["-P"],
+            "- - 1\n  - 2\n- # ec\n  a: 1\n",
+        ),
+        (
+            "- [1, 2] # ec\n- 5\n",
+            ".[1] = [7]",
+            &["-P"],
+            "- - 1\n  - 2\n- # ec\n  - 7\n",
+        ),
+        (
+            nested,
+            ".[2] = [7]",
+            &["-P"],
+            "- - y: ~\n- # c8\n  - c: ~\n- # c1\n  - 7\n- # c5\n  y: 2\n",
+        ),
+        (
+            nested,
+            ".[4] = [7]",
+            &["-P"],
+            "- - y: ~\n- # c8\n  - c: ~\n- true # c5\n- y: 2\n- - 7\n",
+        ),
+    ])
+}
