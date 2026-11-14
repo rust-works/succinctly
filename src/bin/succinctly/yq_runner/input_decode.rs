@@ -49,6 +49,8 @@ pub(super) struct TranscodeOptions<'a> {
     pub tsv_auto_parse: bool,
     /// `--ini-preserve-quotes`: a value keeps the quotes that surround it.
     pub ini_preserve_quotes: bool,
+    /// The run writes TOML: `-p toml` places each comment where yq's TOML encoder reads it (#7170).
+    pub toml_output: bool,
 }
 
 impl TranscodedInput {
@@ -175,7 +177,7 @@ impl TranscodedInput {
                 };
                 return super::input_xml::transcode(raw, xml);
             }
-            Self::Toml => return super::input_toml::transcode(raw),
+            Self::Toml => return super::input_toml::transcode(raw, options.toml_output),
         };
         Ok(json_string(&decoded))
     }

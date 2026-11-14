@@ -27229,7 +27229,7 @@ pub fn yq_encoder_writes_comments(encoder: &YqOutputEncoder) -> bool {
         YqOutputEncoder::Xml(_)
             | YqOutputEncoder::Lua(_)
             | YqOutputEncoder::Kyaml(..)
-            | YqOutputEncoder::Toml(true)
+            | YqOutputEncoder::Toml(_)
             | YqOutputEncoder::Props { .. }
     )
 }
@@ -27241,7 +27241,9 @@ pub fn yq_encoder_writes_comments(encoder: &YqOutputEncoder) -> bool {
 pub fn yq_encoder_prints_leading_block(encoder: &YqOutputEncoder) -> bool {
     matches!(
         encoder,
-        YqOutputEncoder::Xml(_) | YqOutputEncoder::Kyaml(..)
+        YqOutputEncoder::Xml(_)
+            | YqOutputEncoder::Kyaml(..)
+            | YqOutputEncoder::Toml(super::expr::TomlCommentSource::Toml)
     )
 }
 
@@ -27348,7 +27350,14 @@ pub(crate) fn format_yq_commented(
                 format_kyaml_commented(value, *indent, comments, leading, *separators)
             }),
         },
-        YqOutputEncoder::Toml(_) => format_toml_commented(value, comments),
+        YqOutputEncoder::Toml(super::expr::TomlCommentSource::Yaml) => {
+            format_toml_commented(value, comments)
+        }
+        YqOutputEncoder::Toml(super::expr::TomlCommentSource::Toml) => {
+            let mut comments = super::encoder_comments::toml_value_comments(comments);
+            comments.own.head = super::encoder_comments::toml_root_head(leading);
+            format_toml_commented(value, &comments)
+        }
         // The comment of a property is its key's and then its value's, by path (#6922, #7166).
         YqOutputEncoder::Props {
             separator,

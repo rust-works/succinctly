@@ -30,7 +30,7 @@ use succinctly::jq::{
     nesting_depth_exceeded_message, nonfinite_display_string, nonfinite_literal_display,
     sync_aliased_paths, sync_merged_members, ArithOp, AssignOp, Builtin, DefScope, EvalError, Expr,
     FormatType, Literal, LuaOptions, MetaSlot, NumberRepr, ObjectKey, ObjectMap, OwnedValue,
-    QueryResult, XmlOptions, YqOutputEncoder, YqSemantics,
+    QueryResult, TomlCommentSource, XmlOptions, YqOutputEncoder, YqSemantics,
 };
 use succinctly::json::light::JsonCursor;
 use succinctly::json::validate;
@@ -1564,6 +1564,10 @@ static WRAP_SCALARS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 static CSV_AUTO_PARSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static TSV_AUTO_PARSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
+/// Whether the run writes TOML (`-o toml`, or `-i` on a `*.toml` file): `-p toml` then places each comment
+/// where yq's TOML encoder reads it (#7170).
+static TOML_OUTPUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// `--ini-preserve-quotes`, which `-p ini` reads (#6925).
 static INI_PRESERVE_QUOTES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -1600,6 +1604,7 @@ fn yq_text_decoder(codec: jq::TextCodec, bytes: &[u8]) -> std::result::Result<Ve
             csv_auto_parse: CSV_AUTO_PARSE.load(std::sync::atomic::Ordering::SeqCst),
             tsv_auto_parse: TSV_AUTO_PARSE.load(std::sync::atomic::Ordering::SeqCst),
             ini_preserve_quotes: INI_PRESERVE_QUOTES.load(std::sync::atomic::Ordering::SeqCst),
+            toml_output: false,
         },
     )
 }
@@ -1629,6 +1634,7 @@ fn decode_transcoded_input(raw: Vec<u8>, name: &str) -> Result<Vec<u8>> {
                         tsv_auto_parse: TSV_AUTO_PARSE.load(std::sync::atomic::Ordering::SeqCst),
                         ini_preserve_quotes: INI_PRESERVE_QUOTES
                             .load(std::sync::atomic::Ordering::SeqCst),
+                        toml_output: TOML_OUTPUT.load(std::sync::atomic::Ordering::SeqCst),
                     },
                 )
                 .map_err(|message| anyhow::anyhow!("bad file '{name}': {message}"))
@@ -12694,6 +12700,10 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         args.ini_preserve_quotes,
         std::sync::atomic::Ordering::SeqCst,
     );
+    TOML_OUTPUT.store(
+        args.output_format == OutputFormat::Toml,
+        std::sync::atomic::Ordering::SeqCst,
+    );
     *XML_INPUT_OPTIONS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(input_xml::XmlOptions {
@@ -12771,10 +12781,14 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             globals: args.lua_globals,
         }))),
         OutputFormat::Ini => Some(YqOutputEncoder::Ini),
-        // A TOML file's comments are read into the YAML text a node can only hold as its key's or its first
-        // child's, where yq's encoder writes the value's: a run that read TOML writes none (#7160).
+        // A run that read TOML has its comments on the value nodes the encoder reads: the read wrote them there
+        // (#7170), so they are the value nodes' own.
         OutputFormat::Toml => Some(YqOutputEncoder::Toml(
-            string_format != Some(TranscodedInput::Toml),
+            if string_format == Some(TranscodedInput::Toml) {
+                TomlCommentSource::Toml
+            } else {
+                TomlCommentSource::Yaml
+            },
         )),
         OutputFormat::Kyaml => Some(YqOutputEncoder::Kyaml(
             usize::from(args.indent),

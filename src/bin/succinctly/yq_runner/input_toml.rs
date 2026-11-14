@@ -37,7 +37,13 @@ const STEP: &str = "  ";
 /// `raw` as the YAML text of the document yq decodes it to, or yq's message for an input that does
 /// not load (printed after `bad file '<name>': `). An input with no key (empty, or only comments)
 /// holds no document, which is the empty text.
-pub(super) fn transcode(raw: &[u8]) -> Result<Vec<u8>, String> {
+///
+/// `for_toml_output` is a run that writes TOML again (`-o toml`, `-i` on a `*.toml` file): yq's TOML
+/// encoder reads the comments of the value nodes, which the YAML text yq prints can only hold as the
+/// key's or the first child's, so the nodes are written in a text that puts each where the encoder
+/// finds it (#7170): every head comment above the key it belongs to, a sequence's line comment after
+/// its key. A TOML file has no comment of a key, so nothing else is read from those places.
+pub(super) fn transcode(raw: &[u8], for_toml_output: bool) -> Result<Vec<u8>, String> {
     let mut decoder = Decoder {
         parser: Parser {
             left: raw,
@@ -54,7 +60,16 @@ pub(super) fn transcode(raw: &[u8]) -> Result<Vec<u8>, String> {
         return Ok(Vec::new());
     };
     let mut out = Out::default();
-    render_root(&mut out, &root);
+    if for_toml_output {
+        // The YAML read holds every comment before the first key as one block, the first key's head comment
+        // among them, so the root's head is written ahead of an explicit `---`, which the block keeps
+        // apart: what follows it is the first entry's.
+        render_comment(&mut out, &root.head, "");
+        out.text.push_str("---\n");
+        render_map_for_toml(&mut out, &root, 0);
+    } else {
+        render_root(&mut out, &root);
+    }
     Ok(out.text.into_bytes())
 }
 
@@ -2164,6 +2179,73 @@ fn render_compact(out: &mut Out, value: &Node, depth: usize) {
     }
 }
 
+/// [`render_map`] for a run that writes TOML (#7170): each value's head comment above its key, whatever the
+/// value is, and no carried line comment.
+fn render_map_for_toml(out: &mut Out, node: &Node, depth: usize) {
+    let indent = indent_of(depth);
+    let child = indent_of(depth + 1);
+    for (key, value) in node.keys.iter().zip(&node.items) {
+        render_comment(out, &value.head, &indent);
+        out.text.push_str(&indent);
+        if go_yaml_key_is_simple(key) {
+            out.text.push_str(&string_scalar(key, &child, true));
+        } else {
+            out.text.push_str("? ");
+            out.text.push_str(
+                &go_yaml_explicit_key_scalar(key, &child, STEP.len())
+                    .unwrap_or_else(|| string_scalar(key, &child, true)),
+            );
+            out.text.push('\n');
+            out.text.push_str(&indent);
+        }
+        out.text.push(':');
+        match value.kind {
+            Kind::Map if !value.items.is_empty() => {
+                out.text.push('\n');
+                render_map_for_toml(out, value, depth + 1);
+            }
+            Kind::Seq if !value.items.is_empty() => {
+                // The sequence's own line comment, which yq's encoder writes after an array: on its key's line.
+                if !value.line.is_empty() {
+                    out.text.push(' ');
+                    out.text.push_str(&value.line);
+                }
+                out.text.push('\n');
+                render_seq_for_toml(out, value, depth + 1);
+            }
+            _ => {
+                out.text.push(' ');
+                let comment = (!value.line.is_empty()).then(|| value.line.clone());
+                push_line(out, &inline_text(value, &child), comment);
+            }
+        }
+    }
+}
+
+/// The elements of a sequence for a run that writes TOML (#7170): an element's head comment above its `-`, a
+/// collection on the lines after it, so that its first key's head comment is not the element's.
+fn render_seq_for_toml(out: &mut Out, node: &Node, depth: usize) {
+    let indent = indent_of(depth);
+    for item in &node.items {
+        render_comment(out, &item.head, &indent);
+        out.text.push_str(&indent);
+        match item.kind {
+            Kind::Map if !item.items.is_empty() => {
+                out.text.push_str("-\n");
+                render_map_for_toml(out, item, depth + 1);
+            }
+            Kind::Seq if !item.items.is_empty() => {
+                out.text.push_str("-\n");
+                render_seq_for_toml(out, item, depth + 1);
+            }
+            _ => {
+                out.text.push_str("- ");
+                push_line(out, &inline_text(item, &indent_of(depth + 1)), None);
+            }
+        }
+    }
+}
+
 /// A scalar, or an empty collection, as it is written in place.
 fn inline_text(value: &Node, block_indent: &str) -> String {
     match value.kind {
@@ -2211,7 +2293,7 @@ mod tests {
     use super::*;
 
     fn yaml(input: &str) -> Result<String, String> {
-        transcode(input.as_bytes()).map(|text| String::from_utf8(text).unwrap())
+        transcode(input.as_bytes(), false).map(|text| String::from_utf8(text).unwrap())
     }
 
     #[test]

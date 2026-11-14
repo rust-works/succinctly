@@ -7900,7 +7900,11 @@ The encoder runs over the value model, which keeps no node style or source spell
 - A boolean written `True`, `FALSE` or `yes` is `true` or `false`, where yq writes the source text.
 - The YAML 1.1 integers `1_000` and `0b11` are strings here (see the YAML 1.1 section above), so they are quoted, where yq writes them bare.
 - A timestamp (`2001-01-01`) and a `!!binary` scalar are quoted strings, where yq writes their text bare.
-- yq's inline-table hint is set only by its TOML decoder, and `-p toml` writes the nodes as YAML text that is read back, so a TOML file written back as TOML (`*.toml` under `-o auto`, `-i`) writes an inline table as a table and, for a run that read TOML, writes no comment (see `-p toml` below): yq's TOML decoder gives a comment to the value that follows it, which the YAML text the read produces can only hold as the key's or the first child's, so writing them would put them on the wrong node (#7170).
+- yq's inline-table hint is set only by its TOML decoder, and `-p toml` writes the nodes as YAML text that is read back, so a TOML file written back as TOML (`*.toml` under `-o auto`, `-i`) writes an inline table as a table (see `-p toml` below).
+  The comments of a TOML file are kept (#7170): yq's TOML decoder gives each one to a value node, and a run that writes TOML writes the YAML text with each head comment above the key it belongs to, an array's line comment after its key, and the root mapping's head comment ahead of an explicit `---`, so the encoder finds every comment where yq does.
+  A comment a filter sets (`.b head_comment = "X"`, `. head_comment = "R"`) is not read for a TOML file as it is not for a YAML one (#2796): a non-empty text is refused or written beside the wrong node, where yq writes it on the value.
+  What that text cannot do is travel with a node a filter copies or changes the kind of: `.c = .a` copies `a`'s value but not the head comment above it, and `.a = [1]` over `a = 1 # l` drops the line comment, where yq keeps both.
+  The first entry's head comment (a table whose comments follow its header and that has no key of its own) is held with the root's in the document's leading block, and follows the key that was first when the file was read.
 
 ### `-o=kyaml` — a rebuilt value loses its comments (#6924, #7158)
 
@@ -8106,7 +8110,9 @@ These rows differ:
 - **A comment on an empty table.** yq writes the head comment of an empty table inside braces (`t: {` / `  # c` / `}`), which no YAML reader keeps; here it is written above its key.
 - **A line comment on a collection.** yq's emitter writes it on the next line that has no comment of its own (`a = {x=1} # c` then `b = 1` is `b: 1 # c`), and the same is done here, including for the next key whose value is a collection (`b: # c`) and a `- ` item that is a mapping (`- # c`); when that line is an empty `[]` or `{}`, yq writes broken YAML (`b: # c` and `{}` at column 0) and here the comment follows the value (`b: {} # c`).
 - **CRLF.** go-toml keeps the `\r` of a CRLF file in every comment and yq writes it back as a bare `\r` that ends the line, so its output has no line break there; the comment is without it and the line break is `\n` here.
-- **`-o toml`.** A TOML file read and written back as TOML (`yq -i` on `*.toml`) loses its comments and writes an inline table as a table, as every `-o=toml` input does (see `-o=toml` above); yq keeps both.
+- **`-o toml`.** A TOML file read and written back as TOML (`yq -i` on `*.toml`) writes an inline table as a table, as every `-o=toml` input does (see `-o=toml` above); yq keeps it.
+  Its comments are kept (#7170): the read writes the text for a TOML-writing run with each head comment above its key, so the YAML reader holds them where yq's encoder looks (see `-o=toml` above).
+  A run that writes any other format keeps the text above, where a table's head comment is written inside it.
 - **Nesting.** An array or inline table nested more than 400 levels, or a key of more than 400 dotted parts, is refused (`the document nests arrays, inline tables or dotted keys more than 400 levels deep`), where yq's stack grows as far as memory allows; the YAML reader's own limit (128, see above) is reached first by a document that nests that many levels in the YAML text.
   A path that indexes an array past 2,097,152 elements (`a = [1]` then `a.99999999 = 1`) is refused (`Cannot grow array to N elements`) rather than padded with `null`.
 - `--front-matter` with an explicit `-p toml` is refused (`--front-matter and --input-format toml are incompatible`), as `-p json` is, where yq decodes the front matter as TOML.
