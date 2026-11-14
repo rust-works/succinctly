@@ -157616,8 +157616,9 @@ mod tests {
     }
 
     /// #6620: a repeated key reads as jq reads it (the last value wins, one key) through the comma
-    /// array and `keys`/`has`, and no comma array is answered while a binding's embed table is up
-    /// (a node it tracks is the bridge's to name).
+    /// array and `keys`/`has`, and no comma array that holds a container is answered while a
+    /// binding's embed table is up (a node it tracks is the bridge's to name; #7132: one of scalars
+    /// names none, and is answered).
     #[test]
     #[cfg(feature = "std")]
     fn comma_array_and_keys_read_the_collapsed_object_and_decline_under_an_embed_table_6620() {
@@ -157664,11 +157665,27 @@ mod tests {
         let mut bound = repeated.clone();
         let guard =
             embed_table_push::<JqSemantics>(Some(&origin), &mut bound).expect("a container bind");
+        // #7132: a comma array of scalars names no node a binding tracks, so it is answered under the
+        // table too, with the collapsed object's values; one that holds a container is the bridge's.
+        assert_eq!(
+            eval_owned_construct::<JqSemantics>(&parse("[.a, .b]").unwrap(), &repeated),
+            Some(OwnedValue::array_from(vec![
+                OwnedValue::Int(2),
+                OwnedValue::Int(5)
+            ]))
+        );
+        let holding = OwnedValue::object_from([
+            (
+                "a".to_string(),
+                OwnedValue::array_from(vec![OwnedValue::Int(1)]),
+            ),
+            ("b".to_string(), OwnedValue::Int(5)),
+        ]);
         for src in ["[.a, .b]", "[.a]"] {
             let expr = parse(src).unwrap();
             assert!(
-                eval_owned_construct::<JqSemantics>(&expr, &repeated).is_none(),
-                "{src:?} must be left to the bridge under an embed table"
+                eval_owned_construct::<JqSemantics>(&expr, &holding).is_none(),
+                "{src:?} holding a container must be left to the bridge under an embed table"
             );
         }
         drop(guard);
