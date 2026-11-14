@@ -46619,6 +46619,8 @@ mod tests {
             "[.[] | {a: .} | keys]",
             "[.[] | [., .] | has(1)]",
             "[.[] | {a: .} | tojson]",
+            // #7132: arithmetic over a read is the operand door's.
+            "[.[] | {a: .} | .a + 1]",
         ] {
             assert_eq!(reindexes(filter), 0, "{filter} bridged");
         }
@@ -46627,7 +46629,6 @@ mod tests {
         assert!(reindexes("[.[] | {a: .} | select(.a > 1, .a < 0)]") > 0);
         assert!(reindexes("[.[] | {a: .} | .[]]") > 0);
         assert!(reindexes("[.[] | {a: .} | .a?]") > 0);
-        assert!(reindexes("[.[] | {a: .} | .a + 1]") > 0);
         // yq mode keeps the bridge: its containers carry node metadata and no storage identity.
         let json = b"[1,50,3]";
         let index = JsonIndex::build(json);
@@ -46637,6 +46638,54 @@ mod tests {
         let _ = eval_using::<crate::jq::YqSemantics, _>(&yq_expr, index.root(json).value())
             .collect_owned::<crate::jq::YqSemantics>();
         assert!(reindex_count::get() > before, "yq mode skipped the bridge");
+    }
+
+    /// #7132 part five: arithmetic, a comparison and `//` over reads of a bound array the filter
+    /// built are answered from it, on the loop's route and the fold's, with no serialize-and-index
+    /// (`reindex_count`) at all; the CLI cost pin's mechanism, counted rather than timed. The pin can
+    /// fail: each of these bridged once per call before the operand door.
+    #[cfg(feature = "std")]
+    #[test]
+    fn operators_over_reads_of_a_bound_array_are_not_bridged_7132() {
+        use crate::jq::value::reindex_count;
+
+        let json = b"null";
+        let index = JsonIndex::build(json);
+        for (filter, answer) in [
+            (
+                "[range(50)] as $a | [range(3) | $a | .[0] + .[1]]",
+                "[1,1,1]",
+            ),
+            (
+                "[range(50)] as $a | [range(3) | $a | first > 1]",
+                "[false,false,false]",
+            ),
+            (
+                "[range(50)] as $a | [range(3) | $a | first // 7]",
+                "[0,0,0]",
+            ),
+            (
+                "[range(50)] as $a | [range(3) | $a | last - first]",
+                "[49,49,49]",
+            ),
+            (
+                "[range(50)] as $a | [range(3) as $i | $a | .[$i] + 1]",
+                "[1,2,3]",
+            ),
+            (
+                "[range(50)] as $a | reduce range(3) as $i (0; . + ($a | .[0] + .[1]))",
+                "3",
+            ),
+        ] {
+            let expr = crate::jq::parse(filter).unwrap();
+            let before = reindex_count::get();
+            let result = eval_using::<JqSemantics, _>(&expr, index.root(json).value())
+                .collect_owned::<JqSemantics>()
+                .unwrap();
+            assert_eq!(reindex_count::get() - before, 0, "{filter} bridged");
+            assert_eq!(result.len(), 1, "{filter}");
+            assert_eq!(result[0].to_json(), answer, "{filter}");
+        }
     }
 
     /// #3639: a `label` met at a position with no prefetch hook (the absent-
