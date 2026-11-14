@@ -33,7 +33,11 @@ fn run(stdin: &str, args: &[&str]) -> Result<(String, String, Option<i32>)> {
         .spawn()?;
     {
         use std::io::Write;
-        child.stdin.take().expect("piped").write_all(stdin.as_bytes())?;
+        child
+            .stdin
+            .take()
+            .expect("piped")
+            .write_all(stdin.as_bytes())?;
     }
     let output = child.wait_with_output()?;
     Ok((
@@ -53,7 +57,11 @@ fn a_standard_output_that_cannot_be_written_is_reported_with_exit_2_as_in_jq_721
         &["-e", "false"],
     ] {
         let (out, err, code) = run("1\n", args)?;
-        assert_eq!((out.as_str(), err.as_str(), code), ("", FAILED, Some(2)), "{args:?}");
+        assert_eq!(
+            (out.as_str(), err.as_str(), code),
+            ("", FAILED, Some(2)),
+            "{args:?}"
+        );
     }
     Ok(())
 }
