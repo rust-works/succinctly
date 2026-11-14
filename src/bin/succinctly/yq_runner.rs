@@ -13006,6 +13006,12 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     if args.null_input {
         args.null_input = false;
         args.raw_input = false;
+        // yq's `-n` reads nothing, so `-p` has no input to read as (`yq -n -p=csv .` is a blank line).
+        args.input_format = InputFormat::Yaml;
+        TRANSCODED_INPUT.store(
+            TranscodedInput::code(None),
+            std::sync::atomic::Ordering::SeqCst,
+        );
     }
 
     // Parse the jq program (use Yq mode for extended identifier syntax like kebab-case)

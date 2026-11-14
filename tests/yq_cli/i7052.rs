@@ -30,6 +30,10 @@ const ROWS: &[(&str, &[&str], &str)] = &[
     (". // 1", &[], "1\n"),
     (". + 1", &[], "1\n"),
     ("1", &[], "1\n"),
+    (".", &["-p=csv"], "\n"),
+    (".", &["-p=json"], "\n"),
+    (".", &["-p=json", "-o=json"], "null\n"),
+    (".", &["-p=toml"], "\n"),
     (".", &["-o=json"], "null\n"),
     ("[.]", &["-o=json", "-I=0"], "[null]\n"),
     (".", &["-o=lua"], "return nil;\n"),
@@ -79,5 +83,13 @@ fn null_input_prints_what_an_empty_input_prints_7052() -> Result<()> {
             "yq -n {filter:?} against an empty input"
         );
     }
+    Ok(())
+}
+
+/// `-e` reads the empty node as no match, as in yq: the blank line is printed and the exit status is 1.
+#[test]
+fn null_input_under_exit_status_is_no_match_7052() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(".", "a: 1\n", &["-n", "-e"])?;
+    assert_eq!((stdout.as_str(), code), ("\n", 1));
     Ok(())
 }
