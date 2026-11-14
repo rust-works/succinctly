@@ -312,3 +312,23 @@ fn a_node_navigated_to_after_the_write_places_its_own_held_comments_7230() -> Re
         ),
     ])
 }
+
+/// An entries operator around the write, whose presentation is replayed through it, holds the
+/// comment the same way (`main` dropped it).
+#[test]
+fn a_held_comment_survives_an_entries_replay_7230() -> Result<()> {
+    assert_rows(&[
+        (
+            "a: 5 # own\nb: 6\nc: 7\n",
+            ".a = {\"x\": 1} | to_entries | from_entries",
+            &[],
+            "a:\n  x: 1\nb: 6 # own\nc: 7\n",
+        ),
+        (
+            "a: 5 # own\nb: 6\nc: 7\n",
+            "with_entries(select(.key != \"c\")) | .a = {\"x\": 1}",
+            &[],
+            "a:\n  x: 1\nb: 6 # own\n",
+        ),
+    ])
+}
