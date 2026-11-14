@@ -7370,9 +7370,12 @@ An input with no bytes at all reads no document in yq, and a run that read none 
 empty document (`printf '' | yq '.a'` is `null`, `.a = 1` is `a: 1`; `yq '.a' empty.yaml one.yaml` prints
 `1`; `yq '.a' e1.yaml e2.yaml`, both empty, prints `null` once with `file_index` 0). `succinctly yq` reads that
 document as an input of one line break, so it answers like yq wherever a line-break document
-does, and differs where one does not: `[.]`, `{"a": .}` and `. as $x | [$x]` print `- null` / `a: null` where yq
-prints a bare `-` / `a:`, `line` is `1` where yq has `0`, and `@yaml` is `null` where yq's is empty.
+does, and differs where one does not: `. as $x | [$x]` prints `- null` where yq prints a bare `-`, and `@yaml`, `to_yaml`,
+`tostring`, `. + .` and the `-o=props|toml|ini|csv|tsv|shell|kyaml` encoders print `null` (kyaml: a blank line, then `null`) where yq prints nothing.
+`line` and `column` are `0`, as in yq (#7052).
 `filename` is empty over it, as in yq ([#5721](https://github.com/rust-works/succinctly/issues/5721)).
+`-n` is this document too (#7052): `yq -n .` prints a blank line, and every row above differs under `-n` as it does for an empty input.
+`-n -o=xml .` prints nothing in yq and `<!--` / `-->` / `null` here.
 A result that is a document with no content (`# c`, an empty input) is written once, with no blank line after it, by `select`, `(.)` and `..` as by `.`.
 Under `-0` the NUL replaces the line break the header ends in (`# c<NUL>`, and a lone NUL over an empty input), as in yq; with `--colors` a comment's span keeps its break, as yq's does.
 `--eval-all` over an empty input still differs: `select(true)` prints `null` for a blank line, and `.a, filename` writes a `---` between its results.
