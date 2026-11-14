@@ -7898,6 +7898,7 @@ The encoder runs over the value model, which keeps no node style or source spell
 - A timestamp (`2001-01-01`) and a `!!binary` scalar are quoted strings, where yq writes their text bare.
 - yq's inline-table hint is set only by its TOML decoder, and `-p toml` writes the nodes as YAML text that is read back, so a TOML file written back as TOML (`*.toml` under `-o auto`, `-i`) writes an inline table as a table (see `-p toml` below).
   The comments of a TOML file are kept (#7170): yq's TOML decoder gives each one to a value node, and a run that writes TOML writes the YAML text with each head comment above the key it belongs to, an array's line comment after its key, and the root mapping's head comment ahead of an explicit `---`, so the encoder finds every comment where yq does.
+  A comment a filter sets (`.b head_comment = "X"`, `. head_comment = "R"`) is not read for a TOML file as it is not for a YAML one (#2796): a non-empty text is refused or written beside the wrong node, where yq writes it on the value.
   What that text cannot do is travel with a node a filter copies or changes the kind of: `.c = .a` copies `a`'s value but not the head comment above it, and `.a = [1]` over `a = 1 # l` drops the line comment, where yq keeps both.
   The first entry's head comment (a table whose comments follow its header and that has no key of its own) is held with the root's in the document's leading block, and follows the key that was first when the file was read.
 
