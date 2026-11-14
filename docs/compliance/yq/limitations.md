@@ -8046,6 +8046,8 @@ These rows differ:
 - **A byte that is not UTF-8 in a name** is U+FFFD in the error message here (`invalid XML name: <U+FFFD>`), where Go prints the byte.
 - **A character Go 1.27 classifies differently from Go 1.26** at the end of a text node (a code point assigned in Unicode 17 or later) is trimmed or kept by the newer table.
 - `-o xml` writes the comments of a node it reads (the `-o=xml` row above), so `-p xml -o xml .` keeps those of its input, a write (`-i`) included, and a `null` that a filter assigns (`.a = null`) is written empty when the input was XML, where yq writes `null`.
+  The comments before the first element are that first key's head comment, as yq's decoder gave them (#7202), so a first line's trailing blank survives (`<!-- ` and a line break stays `<!-- `).
+  Every other comment is attributed by the YAML reader, as the first bullet above says ([#7212](https://github.com/rust-works/succinctly/issues/7212)).
 - `--front-matter` with an explicit `-p xml` is refused (`--front-matter and --input-format xml are incompatible`), where yq decodes the front matter as XML.
 - yq's warning that `-o auto` defaults to YAML when `-p xml` is explicit is not written.
 

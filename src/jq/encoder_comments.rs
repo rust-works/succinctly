@@ -159,3 +159,32 @@ pub(crate) fn first_entry_key(comments: &EncoderComments) -> Option<&str> {
         _ => None,
     }
 }
+
+/// A document read with `-p xml` and written as XML: the comments before the first element belong to
+/// the first key, as yq's XML decoder attached them (#7202). The YAML reader holds them as the document's
+/// leading block, which the XML encoder writes through the `# ` marker rules of a comment of its own and so
+/// trims a first line's trailing blank where the key's head comment (what yq has) does not. They are moved
+/// back to `first_key` (the key that was first when the document was read), unchanged, and the leading block
+/// is left empty.
+pub(crate) fn xml_first_entry_head(
+    comments: &mut EncoderComments,
+    leading: &mut String,
+    first_key: Option<&str>,
+) {
+    let (Some(first_key), EncoderMembers::Map(entries)) = (first_key, &mut comments.members) else {
+        return;
+    };
+    let Some(found) = entries.iter_mut().find(|e| e.key == first_key) else {
+        return;
+    };
+    let head: Vec<&str> = leading
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| line.starts_with('#'))
+        .collect();
+    if head.is_empty() || !found.key_comments.head.is_empty() {
+        return;
+    }
+    found.key_comments.head = head.join("\n");
+    leading.clear();
+}
