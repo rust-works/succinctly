@@ -2,7 +2,7 @@
 //! kind and the value still fits on that line -- a scalar, or an empty `{}` / `[]`. A flow container
 //! (`b: [1, 2] # t`) keeps `# t` when it is overwritten with a scalar, as a scalar always did.
 //! A non-empty block container does not fit on the line: yq parks the comment on the next line
-//! (or drops it past the last key), which this tool does not reproduce (`limitations.md`).
+//! (or drops it past the last key), which #7230 reproduces.
 //!
 //! The rows cover the document root (an empty `{}` / `[]` keeps the comment, a scalar does not),
 //! anchors, aliases and tags on the node, and the last key of a mapping, where yq drops the
@@ -204,18 +204,18 @@ fn test_5258_a_a_line_comment_stays_beside_a_value_that_fits_on_the_line() -> Re
 }
 
 /// A non-empty container does not fit on the line. yq prints the comment after the next entry
-/// (`c: 3 # t`) and drops it when the node is the last entry; this tool drops it either way rather
-/// than attach it to a node it never described.
+/// (`c: 3 # t`, #7230) and drops it when the node is the last entry.
 #[test]
-fn test_5258_b_a_non_empty_container_result_drops_the_comment() -> Result<()> {
+fn test_5258_b_a_non_empty_container_result_moves_the_comment_to_the_next_line() -> Result<()> {
     for (input, filter, want) in [
         (
             "b: [1, 2] # t\nc: 3\n",
             ".b = {\"y\": 2}",
-            "b:\n  y: 2\nc: 3\n",
+            "b:\n  y: 2\nc: 3 # t\n",
         ),
-        ("b: 1 # t\nc: 3\n", ".b = [9]", "b:\n  - 9\nc: 3\n"),
-        ("b: {x: 1} # t\nc: 3\n", ".b = [9]", "b:\n  - 9\nc: 3\n"),
+        ("b: 1 # t\nc: 3\n", ".b = [9]", "b:\n  - 9\nc: 3 # t\n"),
+        ("b: {x: 1} # t\nc: 3\n", ".b = [9]", "b:\n  - 9\nc: 3 # t\n"),
+        ("a: 1\nb: 1 # t\n", ".b = [9]", "a: 1\nb:\n  - 9\n"),
     ] {
         let (out, code) = run_yq_stdin(filter, input, &[])?;
         assert_eq!(code, 0, "{filter} on {input:?}");
