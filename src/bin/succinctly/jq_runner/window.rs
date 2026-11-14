@@ -1011,7 +1011,7 @@ impl SeqGate {
         use crate::jq_seq_reader::{PlainGuards, PlainRecords};
         if !self.opened {
             match buf.first() {
-                None if !eof => return GateStep::Clean(0),
+                None if !eof => return GateStep::Clean(0), // patchcov: coverage tolerate-line reason="unreachable: the window reads before it asks the gate, so the buffer is empty only at the end of the stream"
                 Some(&RS) => {
                     self.opened = true;
                     self.search_from = 1;
@@ -1089,14 +1089,16 @@ impl WindowedFile {
         };
         self.eof = true;
         let lines = self.lines_before + count_newlines(&self.buf);
-        if let Some(gate) = self.seq_gate.as_mut() {
-            *gate.slot.borrow_mut() = Some(SeqTail {
-                bytes,
-                error,
-                lines,
-                token_byte: gate.token_byte,
-            });
-        }
+        let gate = self
+            .seq_gate
+            .as_ref()
+            .expect("only the gate of a --seq pipe hands a tail on");
+        *gate.slot.borrow_mut() = Some(SeqTail {
+            bytes,
+            error,
+            lines,
+            token_byte: gate.token_byte,
+        });
         at
     }
 

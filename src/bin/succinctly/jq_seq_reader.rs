@@ -659,11 +659,8 @@ pub(crate) fn token_byte_after(records: &[u8]) -> Option<u8> {
                 .rposition(|&b| !(b.is_ascii_alphanumeric() || matches!(b, b'-' | b'+' | b'.')))
                 .map_or(0, |at| at + 1);
             let token = &records[start..end];
-            return Some(match token {
-                [_] => 0,
-                [_, second, ..] => *second,
-                [] => unreachable!("the token holds the byte it was found by"),
-            });
+            // A one-byte number is NUL-terminated over index 1; the token holds the byte it was found by.
+            return Some(if token.len() == 1 { 0 } else { token[1] });
         } else {
             end -= 1;
         }
@@ -3300,10 +3297,13 @@ mod tests {
         let mut rng = Rng(0x1e1e_7164);
         for case in 0..4000 {
             let records: String = (0..=rng.below(4)).map(|_| clean_record(&mut rng)).collect();
-            let mut emit = |_: &str, _: usize| {};
+            // A record that draws a warning first: its reset leaves the token buffer alone.
+            let warned = std::cell::Cell::new(0);
+            let mut emit = |_: &str, _: usize| warned.set(warned.get() + 1);
             let mut reader = Reader::new(bom_prefix(&[]), &mut emit);
-            reader.run(records.as_bytes(), 0, &[]);
+            reader.run(format!("\x1e}}\n{records}").as_bytes(), 0, &[]);
             let held = reader.token_buf.get(1).copied();
+            assert_eq!(warned.get(), 1, "case {case}: {records:?}");
             match token_byte_after(records.as_bytes()) {
                 Some(byte) => assert_eq!(held, Some(byte), "case {case}: {records:?}"),
                 None => assert!(matches!(held, None | Some(0)), "case {case}: {records:?}"),
