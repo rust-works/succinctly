@@ -543,8 +543,15 @@ impl JqStdout {
         }
     }
 
+    /// What a failed write becomes. `Interrupted` is retried by the caller of `write`, and a closed pipe keeps its own
+    /// handling (SIGPIPE on Unix, #5547; the `BrokenPipe` report elsewhere); anything else is jq's failed write.
     fn tag(e: std::io::Error) -> std::io::Error {
-        // `Interrupted` is retried by the caller of `write`; anything else is jq's failed write.
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::Interrupted | std::io::ErrorKind::BrokenPipe
+        ) {
+            return e;
+        }
         let text = e.to_string();
         // strerror only: drop std's " (os error N)" suffix.
         let text = text.split(" (os error").next().unwrap_or(&text).to_string();
@@ -570,17 +577,7 @@ impl Write for JqStdout {
         };
         #[cfg(not(unix))]
         let r = self.out.write(buf);
-        r.map_err(|e| {
-            // A closed pipe keeps its own handling (SIGPIPE on Unix, #5547; the `BrokenPipe` report elsewhere).
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::Interrupted | std::io::ErrorKind::BrokenPipe
-            ) {
-                e
-            } else {
-                Self::tag(e)
-            }
-        })
+        r.map_err(Self::tag)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -1909,6 +1906,66 @@ fn push_nan(scheme: &ColorScheme, result: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #7214: a failed write to standard output keeps its identity through `flush_then_err` and `anyhow`.
+    #[test]
+    fn jq_stdout_tags_a_failed_write_but_not_a_closed_pipe_7214() {
+        use std::io::ErrorKind;
+        let tagged = JqStdout::tag(std::io::Error::from_raw_os_error(9));
+        assert!(is_output_write_failed(&tagged));
+        assert_eq!(
+            output_write_failure(&anyhow::Error::new(tagged)),
+            Some("Bad file descriptor")
+        );
+        for kind in [ErrorKind::BrokenPipe, ErrorKind::Interrupted] {
+            assert!(
+                !is_output_write_failed(&JqStdout::tag(kind.into())),
+                "{kind:?}"
+            );
+        }
+        assert_eq!(OutputWriteFailed("x".into()).to_string(), "x");
+        assert!(output_write_failure(&anyhow::anyhow!("other")).is_none());
+    }
+
+    /// A descriptor 1 that could not be duplicated fails every write with its own OS error, and `Default` is `new`.
+    #[cfg(unix)]
+    #[test]
+    fn jq_stdout_without_a_descriptor_fails_each_write_7214() {
+        let mut out = JqStdout {
+            fd: Err(std::io::Error::from_raw_os_error(24)),
+        };
+        let err = out.write(b"x").unwrap_err();
+        assert_eq!(
+            output_write_failure(&anyhow::Error::new(err)),
+            Some("Too many open files")
+        );
+        let mut bare = JqStdout {
+            fd: Err(std::io::Error::other("no code")),
+        };
+        assert!(is_output_write_failed(&bare.write(b"x").unwrap_err()));
+        assert!(out.flush().is_ok());
+        let _ = JqStdout::default();
+    }
+
+    #[test]
+    fn flush_then_err_keeps_a_failed_stdout_write_as_the_error_7214() {
+        struct Failing;
+        impl Write for Failing {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(JqStdout::tag(std::io::Error::from_raw_os_error(9)))
+            }
+        }
+        // The flush fails with a stdout write failure: it replaces a plain error ...
+        let e = flush_then_err::<_, ()>(&mut Failing, anyhow::anyhow!("boom")).unwrap_err();
+        assert_eq!(output_write_failure(&e), Some("Bad file descriptor"));
+        // ... and an error that already is one is returned as it was.
+        let first = anyhow::Error::new(JqStdout::tag(std::io::Error::from_raw_os_error(28)));
+        let e = flush_then_err::<_, ()>(&mut Failing, first).unwrap_err();
+        assert_eq!(output_write_failure(&e), Some("No space left on device"));
+    }
     use indexmap::IndexMap;
 
     /// A `Write` mock whose `flush()` always fails while `write`/`write_all`
