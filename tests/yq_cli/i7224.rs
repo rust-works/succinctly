@@ -63,3 +63,29 @@ fn a_deep_chain_of_double_merges_is_answered_in_linear_time_7224() -> Result<()>
     assert_eq!(answers[3], ("2\n".to_string(), 0));
     Ok(())
 }
+
+/// The shapes a `<<` source takes, read off the index and not by `value()` since #7224: a bare `-` item
+/// holding a mapping, a sequence, nothing or a scalar, an alias to a scalar, a sequence or another alias,
+/// and a non-mapping element after a mapping. Each is yq v4.53.3's answer (yq refuses some other shapes, which this build reads).
+#[rustfmt::skip]
+const SOURCES: &[(&str, &str, &str, i32)] = &[
+    ("a: &a {x: 1}\nm:\n  <<:\n    -\n      y: 2\n    - *a\n", ".m", "{\"x\":1}\n", 0),
+    ("a: &a {x: 1}\nm:\n  <<:\n    -\n      - n\n    - *a\n    - z: 3\n", ".m", "{\"x\":1}\n", 0),
+    ("a: &a {x: 1}\nm:\n  <<:\n    -\n    - *a\n    - w: 3\n", ".m", "{\"x\":1}\n", 0),
+    ("a: &a {x: 1}\nm:\n  <<:\n    -\n      5\n    - *a\n", ".m", "{\"x\":1}\n", 0),
+    ("s: &s 5\na: &a {x: 1}\nm:\n  <<: [*a, 7, ~, [1]]\n", ".m", "{\"x\":1}\n", 0),
+    ("m:\n  <<:\n    - - - x\n    - k: 1\n", ".m", "{}\n", 0),
+];
+
+#[test]
+fn every_shape_of_merge_source_is_read_as_yq_does_7224() -> Result<()> {
+    for &(input, filter, expected, status) in SOURCES {
+        let (out, _, code) = run_yq_stdin_with_stderr(filter, input, &["-o", "json", "-I0"])?;
+        assert_eq!(
+            (out.as_str(), code),
+            (expected, status),
+            "{filter} on {input:?}"
+        );
+    }
+    Ok(())
+}

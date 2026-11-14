@@ -5601,7 +5601,11 @@ impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
         // name reads the view.
         if name != "<<" {
             if let FieldsInner::Merged { first_key, .. } = &self.inner {
-                return Self::traverse_fields(**first_key, name, depth, &mut BTreeMap::new());
+                return if merge_anchor_to_spec() {
+                    Self::traverse_fields_spec(**first_key, name, depth, &mut BTreeMap::new())
+                } else {
+                    Self::traverse_fields(**first_key, name, depth, &mut BTreeMap::new())
+                };
             }
         }
         self.walk_for(name).0
@@ -5662,10 +5666,6 @@ impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
         seen: &mut BTreeMap<usize, Option<YamlCursor<'a, W>>>,
     ) -> Option<YamlCursor<'a, W>> {
         assert_depth(depth, MAX_ALIAS_CHAIN_DEPTH);
-
-        if merge_anchor_to_spec() {
-            return Self::traverse_fields_spec(first_key, name, depth, &mut BTreeMap::new());
-        }
         let mut result = None;
         for field in YamlFields::raw(first_key) {
             let key = field.key();
