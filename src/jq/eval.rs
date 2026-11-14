@@ -94456,13 +94456,14 @@ fn eval_owned_comma_branch<S: EvalSemantics>(
     branch: &Expr,
     input: &OwnedValue,
 ) -> Option<OwnedValue> {
-    if let Some(answer) = eval_owned_value_doors::<S>(branch, input) {
-        return Some(answer);
-    }
+    // The operand grammar first: it is the cheap walk, and the branch a comma of reads most often
+    // has (`., . + 1`, `.a, .b`) is in it.
     match eval_owned_pure_in::<S>(branch, input, ResultPosition::Operand, true) {
         Some(Ok(answer)) => owned_door_answer_may_leave(answer),
         Some(Err(_)) => None,
-        None => eval_owned_closed::<S>(branch),
+        None => {
+            eval_owned_value_doors::<S>(branch, input).or_else(|| eval_owned_closed::<S>(branch))
+        }
     }
 }
 
