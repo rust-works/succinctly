@@ -7471,7 +7471,9 @@ Where the next file starts in jq's input, which a depth refusal's message names,
 Every file is checked to be UTF-8 before the run starts, a 1 MiB block at a time, as the route that reads them whole checks each before it takes them lazily: a file that is not, or a character a cut between two files splits, keeps that route, which substitutes the bytes, and the first file with a byte is read past its BOM.
 So every byte is read twice, and the first document waits for that pass over all the files (`first(inputs)` over 100 MiB in 4 files takes 10 ms on the 7950X, where the route that read them whole took 727).
 A blank or empty file is read past, as that route skips it, and so is white space longer than a window at a file's front.
-Each file is read to the length it had when the run opened it, the rest a hand-off reads included, and one whose `stat` size is 0 (a `/proc` file) is read to its end.
+Each file is read to the end it has when the run reaches it, the rest a hand-off reads included, as jq opens each file when its reader gets there (#7217).
+So a line a writer appends to a later file while the run is still in an earlier one is read, and so is a `/proc` file, whose `stat` size is 0.
+Up to 32 files the descriptors are held open from the start, so a path removed or replaced while the run goes keeps its old bytes, where jq reads what the path then names; a longer list opens each path when the run reaches it, as jq does.
 A list of more than 32 files (#7197) is read the same way, each file opened by its path when the run first reads it and closed with its lines (`OpenWhenRead`), so a run over hundreds of files holds one of them open at a time, as jq does; the list is judged by `stat`, and each file is opened once before the run to be checked as UTF-8 and closed.
 Such a file is read to its end as it stands when the run gets to it, as jq's reader reads it, not to the length it had when it was checked.
 A path that will not open by then, or names a directory, is read as an empty file and reported as the whole-file route reports it, in jq's words once its reader is past it, as for `-R` above.
