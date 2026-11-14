@@ -4857,13 +4857,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // on by `ModuleLoader` after parsing (the parser itself has no
             // notion of which file it's reading) -- reported here instead
             // of `<top-level>` when present.
-            let mut obj = IndexMap::new();
-            obj.insert(
-                "file".into(),
-                OwnedValue::String(file.as_deref().unwrap_or("<top-level>").into()),
-            );
-            obj.insert("line".into(), OwnedValue::Int(*line as i64));
-            QueryResult::Owned(OwnedValue::Object(obj.into()))
+            QueryResult::Owned(owned_loc_value(*line, file.as_deref()))
         }
         Expr::Env => {
             // $ENV returns an object containing all environment variables
@@ -12167,9 +12161,10 @@ fn path_stages<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
 /// folds them ([`object_from_pairs`]). The elements are the input's own (a refcount bump for a
 /// container); the bridge re-reads its serialization, so a number nested in one is a `NumberLiteral`
 /// there and an `Int` here: two spellings of one value that every printer renders alike, as for
-/// [`eval_owned_map_projection`]. The stage may be wrapped as every front door's is. jq mode only,
-/// and not under an embed table, as [`owned_path_each_optional`]: a node a binding tracks is
-/// answered by the bridge, which can name it.
+/// [`eval_owned_map_projection`]. The stage may be wrapped as every front door's is. jq mode only.
+/// Under an embed table only a construction that holds no container is answered (#7132): a node a
+/// binding tracks is answered by the bridge, which can name it, as for [`owned_path_each_optional`],
+/// and a scalar names none.
 pub(crate) fn eval_owned_construct<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
@@ -12178,12 +12173,29 @@ pub(crate) fn eval_owned_construct<S: EvalSemantics>(
         return None;
     }
     let shape = lone_door_shape(expr)?;
-    if !matches!(shape, Expr::Array(_) | Expr::Object(_))
-        || super::eval_generic::embed_table_active()
-    {
+    if !matches!(shape, Expr::Array(_) | Expr::Object(_)) {
         return None;
     }
-    construct_operand::<S>(shape, input)
+    let built = construct_operand::<S>(shape, input)?;
+    // #7132: under an embed table the answer is taken when it holds no container: a scalar names no
+    // node a binding tracks, as the `first`/`last`/`nth` door's answer does not
+    // ([`owned_door_answer_may_leave`]). `[.[0], .[1]]` of a `. as $a` binding bridged per call.
+    if super::eval_generic::embed_table_active() && owned_holds_container_child(&built) {
+        return None;
+    }
+    Some(built)
+}
+
+/// Whether a constructed array or object holds a container as one of its own elements or values: one
+/// the construct door may have read off the input, so a node an embed table can track (#7132).
+fn owned_holds_container_child(built: &OwnedValue) -> bool {
+    let is_container =
+        |value: &OwnedValue| matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_));
+    match built {
+        OwnedValue::Array(items) => items.iter().any(is_container),
+        OwnedValue::Object(map) => map.values().any(is_container),
+        _ => false,
+    }
 }
 
 /// `keys` and `has(K)` of an owned object or array (#6620), answered from the tree instead of through
@@ -12304,6 +12316,17 @@ fn owned_children_flow(container: &OwnedValue, sink: &mut dyn FnMut(OwnedValue) 
     } else {
         Flow::Stopped { pending: None }
     }
+}
+
+/// [`owned_children_flow`] for values a door already read (#7132): each to `sink` in order, until
+/// it asks to stop.
+fn owned_values_flow(values: Vec<OwnedValue>, sink: &mut dyn FnMut(OwnedValue) -> Demand) -> Flow {
+    for value in values {
+        if sink(value) == Demand::Stop {
+            return Flow::Stopped { pending: None };
+        }
+    }
+    Flow::Exhausted
 }
 
 /// A stage that never reads `.`, answered without the owned input (#4053).
@@ -12652,8 +12675,11 @@ pub(crate) fn eval_owned_relocating_fold<S: EvalSemantics>(
     // computed value, `min`/`max` return an element -- so the common
     // `[1,2,3] | add` declines here, before a single clone. It also
     // subsumes the empty-container check: an `any` over no elements is
-    // false.
-    if !any_child_witnessed(input) {
+    // false. The builtin first (#7132): the scan walks every element, and every
+    // other builtin stage over a bound container (`isempty(.[])` once per call
+    // of a loop) paid it to be declined below.
+    if !matches!(builtin, Builtin::Add | Builtin::Min | Builtin::Max) || !any_child_witnessed(input)
+    {
         return None;
     }
     let items: Vec<OwnedValue> = match (builtin, input) {
@@ -13492,6 +13518,11 @@ pub(crate) fn eval_each_owned_front_doors<S: EvalSemantics>(
             Demand::Continue => Flow::Exhausted,
             Demand::Stop => Flow::Stopped { pending: None },
         });
+    }
+    // #7132: a comma of such stages, and `first`/`last`/`nth`/`limit`/`isempty` of `.[]`, answer
+    // zero or several values off the tree.
+    if let Some(values) = eval_owned_many_doors::<S>(expr, input) {
+        return Some(owned_values_flow(values, sink));
     }
     // #5675: an expression that never reads `.` (`$n * 2` once `$n` is a literal, `1 + 2`,
     // `[1, 2]`) is one value whatever the input is, so the input is not written out and indexed to
@@ -94030,7 +94061,14 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     if let Some(relocated) = eval_owned_relocated_or_closed::<S>(expr, input) {
         return QueryResult::Owned(relocated);
     }
-    if let Some((values, control)) = embed_peel_collect::<S>(expr, input, optional, reentry) {
+    // #7132: a comma of value-door stages, or `first`/`last`/`nth`/`limit`/`isempty` of `.[]`
+    // (`[$a | first, last]`), before the embed peel, which walks every element of `.[]`; an answer
+    // that reads a container under the table declines to it. Chained onto that call so the frame
+    // [`eval_owned_pipe`] inlines this into keeps its one slot of this type.
+    if let Some((values, control)) = eval_owned_many_doors::<S>(expr, input)
+        .map(|values| (values, None))
+        .or_else(|| embed_peel_collect::<S>(expr, input, optional, reentry))
+    {
         return match control {
             Some(control) => partial(values, control),
             None => owned_vec_to_result(values),
@@ -94156,6 +94194,17 @@ fn eval_owned_read_door_stage<S: EvalSemantics>(
         Expr::Arithmetic { .. } | Expr::Alternative(..) => {
             return eval_owned_operand_answer::<S>(shape, input)
         }
+        // #7132: neither reads the input, so neither needs it written out: `$__loc__` names the
+        // program text and `input_line_number` the reader's last line, as the evaluator's arms do.
+        Expr::Loc { line, file } if S::TAG == EvalTag::Jq => {
+            return Some(owned_loc_value(*line, file.as_deref()))
+        }
+        Expr::Builtin(Builtin::InputLineNumber) if S::TAG == EvalTag::Jq => {
+            return match builtin_input_line_number::<Vec<u64>, S>() {
+                QueryResult::Owned(line) => Some(line),
+                _ => None,
+            }
+        }
         _ => None,
     };
     read
@@ -94205,7 +94254,9 @@ fn eval_owned_door_pipe<S: EvalSemantics>(expr: &Expr, input: &OwnedValue) -> Op
     let mut current: Option<OwnedValue> = None;
     for stage in stages {
         let at = current.as_ref().unwrap_or(input);
-        let next = eval_owned_value_door_stage::<S>(stage, at).or_else(|| {
+        // #7132: every value door, the composed ones too, so `length > 5 | if . then 1 else 0 end`
+        // is answered stage by stage as a fold's operand reads it.
+        let next = eval_owned_value_doors::<S>(stage, at).or_else(|| {
             matches!(unwrap_paren(stage), Expr::Builtin(Builtin::ToString)).then(|| match at {
                 OwnedValue::String(_) => at.clone(),
                 _ => OwnedValue::String(tostring_text::<S>(at, false).into()),
@@ -94321,6 +94372,223 @@ fn owned_door_answer_may_leave(answer: OwnedValue) -> Option<OwnedValue> {
             None
         }
         answer => Some(answer),
+    }
+}
+
+/// The stages over an owned input that answer zero or several values, or one value of a stream
+/// (#7132): a comma of stages the value doors answer (`first, last`, `.[0], .[1]`), and `first`,
+/// `last`, `nth`, `limit` and `isempty` of `.[]` or `.[]?`. `Some(vec![])` is an answer of no value.
+///
+/// Each element read leaves under [`owned_door_answer_may_leave`], as the `first`/`last`/`nth`
+/// door's does, and the whole stage declines if one does not. A comma is answered only if every branch is, so
+/// no output is emitted before a decline and the bridge keeps jq's interleaving of outputs and errors.
+/// `.[]` of a scalar raises, so it declines; `.[]?` of one is empty. The counts are jq 1.7.1's
+/// (`/usr/bin/jq`): `last` of nothing is `null`; `nth(n; f)` past the end is empty; `limit(0; f)`
+/// never evaluates `f`, and a negative limit is all of `f`. Only an integer literal count is read, as
+/// a fractional one counts in jq in a way of its own (`nth(0.5; .[])` is the second element). jq
+/// mode only: yq's `first(f)` is another builtin (#2377).
+///
+/// The shape is tested here, inline, and the body is a call of its own: the generic route asks once
+/// per element, and most stages are none of these.
+#[inline]
+pub(crate) fn eval_owned_many_doors<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Option<Vec<OwnedValue>> {
+    match owned_many_door_shape(expr) {
+        Some(shape) if S::TAG == EvalTag::Jq => eval_owned_many_doors_answer::<S>(shape, input),
+        _ => None,
+    }
+}
+
+/// The stage [`eval_owned_many_doors`] may answer, with parentheses off and a one-stage pipe read as
+/// its stage, as the value doors read it (#3673); `None` for every other shape.
+#[inline]
+fn owned_many_door_shape(expr: &Expr) -> Option<&Expr> {
+    let shape = match unwrap_paren(expr) {
+        Expr::Pipe(stages) => match skip_identity_stages(stages) {
+            [only] => unwrap_paren(only),
+            _ => return None,
+        },
+        other => other,
+    };
+    matches!(
+        shape,
+        Expr::Comma(_)
+            | Expr::FirstExpr(_)
+            | Expr::LastExpr(_)
+            | Expr::NthExpr { .. }
+            | Expr::Limit { .. }
+            | Expr::Builtin(
+                Builtin::IsEmpty(_)
+                    | Builtin::FirstStream(_)
+                    | Builtin::LastStream(_)
+                    | Builtin::NthStream(..)
+            )
+    )
+    .then_some(shape)
+}
+
+/// [`eval_owned_many_doors`]' body, for a shape it has already tested.
+#[inline(never)]
+fn eval_owned_many_doors_answer<S: EvalSemantics>(
+    shape: &Expr,
+    input: &OwnedValue,
+) -> Option<Vec<OwnedValue>> {
+    let leave = |value: &OwnedValue| owned_door_answer_may_leave(value.clone());
+    match shape {
+        Expr::Comma(branches) => {
+            let mut out = Vec::new();
+            for branch in branches {
+                match eval_owned_many_doors::<S>(branch, input) {
+                    Some(values) => out.extend(values),
+                    // A stream or comma branch that declined is declined by the other doors too.
+                    None if owned_many_door_shape(branch).is_some() => return None,
+                    None => out.push(eval_owned_comma_branch::<S>(branch, input)?),
+                }
+            }
+            Some(out)
+        }
+        Expr::FirstExpr(stream) | Expr::Builtin(Builtin::FirstStream(stream)) => {
+            let items = owned_stream_items(stream, input)?;
+            Some(match items.first() {
+                Some(item) => vec![leave(item)?],
+                None => vec![],
+            })
+        }
+        Expr::LastExpr(stream) | Expr::Builtin(Builtin::LastStream(stream)) => {
+            let items = owned_stream_items(stream, input)?;
+            Some(vec![match items.last() {
+                Some(item) => leave(item)?,
+                None => OwnedValue::Null,
+            }])
+        }
+        Expr::NthExpr { n, expr: stream } | Expr::Builtin(Builtin::NthStream(n, stream)) => {
+            let n = usize::try_from(owned_integer_literal(n)?).ok()?;
+            let items = owned_stream_items(stream, input)?;
+            Some(match items.get(n) {
+                Some(item) => vec![leave(item)?],
+                None => vec![],
+            })
+        }
+        Expr::Limit { n, expr: stream } => {
+            let n = owned_integer_literal(n)?;
+            if n == 0 {
+                return Some(vec![]);
+            }
+            let items = owned_stream_items(stream, input)?;
+            let take = if n < 0 {
+                items.len()
+            } else {
+                usize::try_from(n).unwrap_or(usize::MAX)
+            };
+            items.take(take).map(leave).collect()
+        }
+        Expr::Builtin(Builtin::IsEmpty(stream)) => {
+            let items = owned_stream_items(stream, input)?;
+            Some(vec![OwnedValue::Bool(items.is_empty())])
+        }
+        _ => None,
+    }
+}
+
+/// `$__loc__`'s value (#2688, #2774): `{"file": F, "line": N}`, `F` the module's canonical path or
+/// `<top-level>` for the main filter. One spelling for the evaluator's arm and the owned door
+/// (#7132).
+fn owned_loc_value(line: usize, file: Option<&str>) -> OwnedValue {
+    let mut obj = IndexMap::new();
+    obj.insert(
+        "file".into(),
+        OwnedValue::String(file.unwrap_or("<top-level>").into()),
+    );
+    obj.insert("line".into(), OwnedValue::Int(line as i64));
+    OwnedValue::Object(obj.into())
+}
+
+/// One branch of a comma [`eval_owned_many_doors`] answers: a stage a value door answers, or one
+/// the operand grammar answers (a read, `.`, `.a`, `.[0]`, `.[$i + 1]`, and what is built of them)
+/// that leaves under [`owned_door_answer_may_leave`], as [`eval_owned_operand_answer`] takes an
+/// arithmetic stage's, or a stage that never reads `.`.
+fn eval_owned_comma_branch<S: EvalSemantics>(
+    branch: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    // The operand grammar first: it is the cheap walk, and the branch a comma of reads most often
+    // has (`., . + 1`, `.a, .b`) is in it. One rule for what may leave, the operand door's.
+    eval_owned_operand_answer::<S>(branch, input)
+        .or_else(|| eval_owned_value_doors::<S>(branch, input))
+        .or_else(|| eval_owned_closed::<S>(branch))
+}
+
+/// The values `.[]` or `.[]?` iterates over an owned input, in order, for
+/// [`eval_owned_many_doors`]: an array's elements or an object's values, borrowed, so a read of one
+/// of them costs no walk of the rest. `.[]` of anything else raises, which is the bridge's (`None`);
+/// `.[]?` of it is empty.
+fn owned_stream_items<'v>(stream: &Expr, input: &'v OwnedValue) -> Option<OwnedStream<'v>> {
+    let optional = match unwrap_paren(stream) {
+        Expr::Iterate => false,
+        Expr::Optional(inner)
+        | Expr::Try {
+            expr: inner,
+            catch: None,
+        } if matches!(unwrap_paren(inner), Expr::Iterate) => true,
+        _ => return None,
+    };
+    match input {
+        OwnedValue::Array(items) => Some(OwnedStream::Array(items)),
+        OwnedValue::Object(map) => Some(OwnedStream::Object(map)),
+        _ if optional => Some(OwnedStream::Array(&[])),
+        _ => None,
+    }
+}
+
+/// [`owned_stream_items`]'s view of what `.[]` iterates.
+enum OwnedStream<'v> {
+    Array(&'v [OwnedValue]),
+    Object(&'v ObjectMap),
+}
+
+impl<'v> OwnedStream<'v> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Array(items) => items.len(),
+            Self::Object(map) => map.values().len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn get(&self, n: usize) -> Option<&'v OwnedValue> {
+        match self {
+            Self::Array(items) => items.get(n),
+            Self::Object(map) => map.values().nth(n),
+        }
+    }
+
+    fn first(&self) -> Option<&'v OwnedValue> {
+        self.get(0)
+    }
+
+    fn last(&self) -> Option<&'v OwnedValue> {
+        self.len().checked_sub(1).and_then(|n| self.get(n))
+    }
+
+    fn take(&self, n: usize) -> impl Iterator<Item = &'v OwnedValue> + '_ {
+        (0..n.min(self.len())).filter_map(move |i| self.get(i))
+    }
+}
+
+/// An integer literal count (`limit(2; ..)`, `nth(1; ..)`), as [`eval_owned_first_last_nth`] reads
+/// `nth(n)`'s; anything else (a fraction, a computed count, `null`) is the evaluator's.
+fn owned_integer_literal(expr: &Expr) -> Option<i64> {
+    match unwrap_paren(expr) {
+        Expr::Literal(lit) => match literal_to_owned(lit) {
+            OwnedValue::Int(n) | OwnedValue::NumberLiteral(NumberRepr::Int(n), _) => Some(n),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -131537,7 +131805,43 @@ mod tests {
         "first // .[1]",
         "(first | . + 1)",
         "if first > 0 then first + 1 else 0 end",
+        "length > 1 | if . then 1 else 0 end",
+        "first | if . == 1 then \"one\" else . end",
+        "[.[0], .[1]]",
     ];
+
+    /// #7132: under a live #2889 embed table the construct door answers a construction that holds
+    /// no container (`[.[0], .[1]]` over numbers), and leaves one that does to the evaluator, which
+    /// can name the node a binding tracks; with the table gone it answers both. `std` only: without it
+    /// there is no table to make live.
+    #[cfg(feature = "std")]
+    #[test]
+    fn construct_door_answers_scalars_under_a_live_embed_table_7132() {
+        let numbers = OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+        let nested = OwnedValue::array_from(vec![
+            OwnedValue::array_from(vec![OwnedValue::Int(1)]),
+            OwnedValue::Int(2),
+        ]);
+        let pair = parse("[.[0], .[1]]").unwrap();
+        let origin = BindOrigin::Node {
+            node: 1,
+            document: 9,
+        };
+        let mut bound = OwnedValue::array_from(vec![OwnedValue::Int(1)]);
+        let guard =
+            super::super::eval_generic::embed_table_push::<JqSemantics>(Some(&origin), &mut bound)
+                .expect("a container bind");
+        assert_eq!(
+            eval_owned_construct::<JqSemantics>(&pair, &numbers),
+            Some(numbers.clone())
+        );
+        assert_eq!(eval_owned_construct::<JqSemantics>(&pair, &nested), None);
+        drop(guard);
+        assert_eq!(
+            eval_owned_construct::<JqSemantics>(&pair, &nested),
+            Some(nested.clone())
+        );
+    }
 
     /// #7132: an arithmetic or `//` stage's answer leaves under the `first`/`last`/`nth` door's rule:
     /// `null + first` and `first // 0` hand the element back as it is, so a container element stays
@@ -131660,6 +131964,97 @@ mod tests {
                 "{src}"
             );
         }
+    }
+
+    /// #7132: [`eval_owned_many_doors`] answers a comma and the stream builtins over `.[]` with the
+    /// values the bridge does, in order, over every kind of value, or declines; yq mode, a count
+    /// that is not an integer literal, `.[]` of a scalar and a branch nothing answers decline.
+    #[test]
+    fn eval_owned_many_doors_agree_with_the_bridge_7132() {
+        const SOURCES: &[&str] = &[
+            "first, last",
+            ".[0], .[1]",
+            "length, first",
+            "., length",
+            ".a, .b",
+            "1, 2",
+            "(first, last)",
+            "first, (.[1] + 1), length > 2",
+            ".[2:4], first",
+            "first(.[])",
+            "last(.[])",
+            "nth(0; .[])",
+            "nth(1; .[])",
+            "nth(9; .[])",
+            "limit(0; .[])",
+            "limit(1; .[])",
+            "limit(2; .[])",
+            "limit(-1; .[])",
+            "limit(9; .[])",
+            "isempty(.[])",
+            "first(.[]?)",
+            "last(.[]?)",
+            "nth(1; .[]?)",
+            "limit(1; .[]?)",
+            "isempty(.[]?)",
+            "first(.[]), last(.[])",
+            "limit(2; .[]), length",
+        ];
+        let mut answered = 0;
+        for value in &value_door_matrix_7132() {
+            for src in SOURCES {
+                let expr = parse(src).unwrap();
+                let Some(values) = eval_owned_many_doors::<JqSemantics>(&expr, value) else {
+                    continue;
+                };
+                answered += 1;
+                let bridge = debug_normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                    &expr, value, false,
+                ));
+                let fast = debug_normalize(owned_vec_to_result::<Vec<u64>>(values));
+                assert_eq!(fast, bridge, "{src:?} on {value:?}");
+                assert!(
+                    eval_owned_many_doors::<YqSemantics>(&expr, value).is_none(),
+                    "yq mode: {src:?}"
+                );
+            }
+        }
+        assert!(
+            answered > 150,
+            "the matrix must reach the doors: {answered}"
+        );
+        let array = OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+        for src in [
+            "nth(-1; .[])",
+            "nth(1.5; .[])",
+            "limit(1.5; .[])",
+            "limit(null; .[])",
+            "first(.[] | .)",
+            "first, .[]",
+            "first, error(\"x\")",
+            "first",
+        ] {
+            assert_eq!(
+                eval_owned_many_doors::<JqSemantics>(&parse(src).unwrap(), &array),
+                None,
+                "{src}"
+            );
+        }
+        for src in ["first(.[])", "limit(1; .[])", "isempty(.[])"] {
+            assert_eq!(
+                eval_owned_many_doors::<JqSemantics>(&parse(src).unwrap(), &OwnedValue::Int(5)),
+                None,
+                "{src} of a scalar raises"
+            );
+        }
+        // `limit(0; f)` never evaluates `f`, so it is empty over a scalar too.
+        assert_eq!(
+            eval_owned_many_doors::<JqSemantics>(
+                &parse("limit(0; .[])").unwrap(),
+                &OwnedValue::Int(5)
+            ),
+            Some(vec![])
+        );
     }
 
     /// #7132: [`eval_each_owned_front_doors`] spells out the first seven value doors and then asks
@@ -157249,8 +157644,9 @@ mod tests {
     }
 
     /// #6620: a repeated key reads as jq reads it (the last value wins, one key) through the comma
-    /// array and `keys`/`has`, and no comma array is answered while a binding's embed table is up
-    /// (a node it tracks is the bridge's to name).
+    /// array and `keys`/`has`, and no comma array that holds a container is answered while a
+    /// binding's embed table is up (a node it tracks is the bridge's to name; #7132: one of scalars
+    /// names none, and is answered).
     #[test]
     #[cfg(feature = "std")]
     fn comma_array_and_keys_read_the_collapsed_object_and_decline_under_an_embed_table_6620() {
@@ -157297,11 +157693,27 @@ mod tests {
         let mut bound = repeated.clone();
         let guard =
             embed_table_push::<JqSemantics>(Some(&origin), &mut bound).expect("a container bind");
+        // #7132: a comma array of scalars names no node a binding tracks, so it is answered under the
+        // table too, with the collapsed object's values; one that holds a container is the bridge's.
+        assert_eq!(
+            eval_owned_construct::<JqSemantics>(&parse("[.a, .b]").unwrap(), &repeated),
+            Some(OwnedValue::array_from(vec![
+                OwnedValue::Int(2),
+                OwnedValue::Int(5)
+            ]))
+        );
+        let holding = OwnedValue::object_from([
+            (
+                "a".to_string(),
+                OwnedValue::array_from(vec![OwnedValue::Int(1)]),
+            ),
+            ("b".to_string(), OwnedValue::Int(5)),
+        ]);
         for src in ["[.a, .b]", "[.a]"] {
             let expr = parse(src).unwrap();
             assert!(
-                eval_owned_construct::<JqSemantics>(&expr, &repeated).is_none(),
-                "{src:?} must be left to the bridge under an embed table"
+                eval_owned_construct::<JqSemantics>(&expr, &holding).is_none(),
+                "{src:?} holding a container must be left to the bridge under an embed table"
             );
         }
         drop(guard);
