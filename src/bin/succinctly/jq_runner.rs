@@ -11566,7 +11566,7 @@ fn raw_windowed_pipe(file: std::fs::File, min: u64) -> Option<RawWindowed> {
     Some((Box::new(file), None, front))
 }
 
-/// The lone regular file a `--seq` stream is read from a window at a time (#7082), in the shape
+/// The regular file, or the several regular files (#7218), a `--seq` stream is read from a window at a time (#7082), in the shape
 /// [`windowed_plain_file`] gives, with each RS byte read as a space, or the pipe on standard input
 /// ([`windowed_seq_pipe`], #7164); or `None` for a run that is not one.
 ///
@@ -11581,11 +11581,10 @@ fn windowed_seq_file(args: &JqCommand) -> Option<WindowedSource> {
     if args.slurp || args.validate || args.null_input || lazy_route_forced_off() {
         return None;
     }
-    // The prepass vouches for one stream, so it is not asked of several files, which it would open.
+    // #7218: several files are windowed when each is plain records on its own and ends in an LF (the
+    // prepass says so, file by file), so what the join holds is what each file holds; any other list is
+    // the whole-file route's.
     let files = get_input_files(args);
-    if files.len() > 1 {
-        return None;
-    }
     let Some((files, reader, reread)) = windowed_source(args) else {
         // #7164: a pipe on standard input, which cannot be read twice, is certified as it is read.
         return files.is_empty().then(windowed_seq_pipe).flatten();
@@ -21814,7 +21813,7 @@ mod tests {
         }
     }
 
-    /// #7082: `--seq` reads a window at a time only for one regular file of RFC 7464's own framing that is
+    /// #7082: `--seq` reads a window at a time only for one regular file, or several, of RFC 7464's own framing that is
     /// big enough to be worth it, on a run that reads the records in order. Anything else, whatever is wrong
     /// with it, is left to the route that walks the stream whole.
     #[test]
@@ -21892,7 +21891,19 @@ mod tests {
         // The size and shape gates are the plain route's.
         let small = write("small.seq", &records[..1000]);
         assert!(!takes(&["jq", "--seq", ".", &small]));
-        assert!(!takes(&["jq", "--seq", ".", &good, &good]));
+        // #7218: several files are windowed when each is framed on its own, and not when one is not.
+        assert!(takes(&["jq", "--seq", ".", &good, &good]));
+        let cut = write("cut.seq", &records[..records.len() - 1]);
+        assert!(!takes(&["jq", "--seq", ".", &good, &cut]));
+        assert!(!takes(&["jq", "--seq", ".", &cut, &good]));
+        let missing = dir.path().join("missing.seq");
+        assert!(!takes(&[
+            "jq",
+            "--seq",
+            ".",
+            &good,
+            &missing.to_string_lossy()
+        ]));
         assert!(!takes(&["jq", "--seq", ".", "/dev/stdin"]));
         // The runs that read the stream whole or otherwise.
         for flags in [&["-s"][..], &["--validate"], &["-n"]] {

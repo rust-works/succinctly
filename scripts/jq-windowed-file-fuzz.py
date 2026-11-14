@@ -20,7 +20,9 @@ lines has no fault, so these cases test where windows cut lines: invalid UTF-8, 
 very long lines and no final line break. `--inputs` runs programs that read `input`/`inputs` over `--files`
 files (2 to 32), which their own reader takes a window at a time, one file after another (#7024), against the
 same files as `/dev/fd/N`: those print `input_line_number`, `input_filename` and `$__loc__`, and read past
-faults. `--pipe --seq` feeds a `--seq` stream on the pipe (#7164): mostly records of RFC 7464's own framing
+faults. `--seq --files K` cuts the `--seq` stream into K files (2 to 512), most cuts at a record's start so the
+files are plain records and the route reads them a window at a time (#7218), the rest anywhere, which leaves the
+run to the whole-file route, against the same files as descriptors. `--pipe --seq` feeds a `--seq` stream on the pipe (#7164): mostly records of RFC 7464's own framing
 (`RS value LF`), which the route reads a window at a time, with a turn or two at a random record (often one by
 a window's end, the 4 MiB probe's or the stream's): a record jq's reader warns about, an RS with nothing in it,
 text before an RS, a value with two documents, a bare `n` after a token that left a `u` in jq's token buffer,
@@ -131,6 +133,7 @@ SEQ_PROGRAMS = [
     ["--seq", "-c", 'if ((.id? // 0) | numbers) % 4001 == 7 then error("e") else empty end'],
     ["--seq", "-e", "select(.id? == 12345) | .name?"],
     ["--seq", "-r", "tojson"],
+    ["--seq", "-c", "[input_filename, input_line_number]"],
     ["--seq", "-c", "[.. | numbers] | length"],
 ]
 
@@ -326,7 +329,7 @@ def run(binary, args, megabytes, stdin=None, pass_fds=(), feed=None):
     return done.stdout, done.stderr, done.returncode
 
 
-def cut_into_files(rng, data, count, line_starts=0.25):
+def cut_into_files(rng, data, count, line_starts=0.25, record_starts=0.0):
     """`data` cut at `count - 1` random bytes, in order. Most cuts fall anywhere (inside a token, a
     string, a multi-byte character); `line_starts` of them at a line start, and some leave a file empty.
     `--inputs` cuts mostly at line starts: a cut inside a document hands the rest of the stream to the
@@ -334,7 +337,10 @@ def cut_into_files(rng, data, count, line_starts=0.25):
     cuts = []
     for _ in range(count - 1):
         at = rng.randrange(len(data) + 1)
-        if rng.random() < line_starts:
+        if rng.random() < record_starts:  # #7218: a `--seq` record's start, so each file is plain records
+            found = data.find(b"\x1e", at)
+            at = len(data) if found < 0 else found
+        elif rng.random() < line_starts:
             at = data.rfind(b"\n", 0, at) + 1
         if rng.random() < 0.1 and cuts:
             at = cuts[-1]
@@ -354,7 +360,8 @@ def named(output, names, descriptors):
 
 def run_files(args, rng, data, case, program, work, seed):
     """One case over several files: windowed (as paths) and whole (as descriptors), compared."""
-    pieces = cut_into_files(rng, data, args.files, 0.75 if args.inputs else 0.25)
+    pieces = cut_into_files(rng, data, args.files, 0.75 if args.inputs else 0.25,
+                            0.85 if args.seq else 0.0)
     names = []
     for n, piece in enumerate(pieces):
         name = os.path.join(work, "windowed-fuzz-%d-%d.json" % (seed, n))
@@ -417,7 +424,8 @@ def main():
     parser.add_argument("--raw", action="store_true",
                         help="run -R programs (#7024): on a pipe with --pipe, else as a regular file on standard input")
     parser.add_argument("--seq", action="store_true",
-                        help="run --seq programs over --seq streams on a pipe (#7164); needs --pipe")
+                        help="run --seq programs over --seq streams on a pipe (#7164), or cut into --files K files "
+                             "(#7218), most at a record's start so each file is plain records")
     parser.add_argument("--inputs", action="store_true",
                         help="run programs that read input/inputs over --files files, 2 to 32 (#7024)")
     args = parser.parse_args()
@@ -427,8 +435,10 @@ def main():
         sys.exit("--inputs reads several files: give --files 2 to 32")
     if args.inputs and (args.raw or args.pipe):
         sys.exit("--inputs is neither --raw nor --pipe")
-    if args.seq and (not args.pipe or args.raw or args.inputs):
-        sys.exit("--seq is a stream on a pipe: give --pipe, and neither --raw nor --inputs")
+    if args.seq and (args.raw or args.inputs):
+        sys.exit("--seq is a stream on a pipe (--pipe) or in files (--files K, #7218): neither --raw nor --inputs")
+    if args.seq and not args.pipe and args.files < 2:
+        sys.exit("--seq is a stream on a pipe or in several files: give --pipe or --files 2 to 512")
     if args.pipe and args.files != 1:
         sys.exit("--pipe is one stream: give no --files")
     if not 1 <= args.files <= 512:

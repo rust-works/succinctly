@@ -2195,61 +2195,21 @@ impl Reread {
     /// failed, or one the walk of jq's reader has to decide), and the whole-file route takes it.
     ///
     /// The memory is a chunk and the biggest record. The first and last bytes are asked of first, so a
-    /// stream that is not framed at all is turned down by two reads, not by a pass over it.
+    /// stream that is not framed at all is turned down by two reads, not by a pass over it. Several files
+    /// are vouched for when each one is (#7218).
     #[cfg(unix)]
     pub(super) fn is_plain_seq_records(&self) -> bool {
-        use crate::jq_seq_reader::{PlainGuards, PlainRecords};
-        use std::os::unix::fs::FileExt;
-        let guards = PlainGuards::ALL;
-        // One source: a stream of several files is not this route's.
-        let [RereadSource {
-            file: RereadFile::Held(file),
-            start,
-            len,
-        }] = self.sources.as_slice()
-        else {
-            return false;
-        };
-        let (file, start, len) = (&**file, *start, *len);
-        let byte_at = |at: u64| {
-            let mut one = [0u8];
-            match file.read_at(&mut one, start + at) {
-                Ok(1) => Some(one[0]),
-                _ => None,
-            }
-        };
-        if len == 0 || byte_at(0) != Some(RS) || byte_at(len - 1) != Some(b'\n') {
-            return false;
-        }
-        // The last record first, when an RS is near enough the end to hold it: the verdict does not
-        // depend on the order, and a record that fails is most often the last (a write cut short).
-        let probe = len.min(TAIL_PROBE);
-        let mut tail = vec![0u8; probe as usize];
-        if file.read_exact_at(&mut tail, start + len - probe).is_err() {
-            return false; // patchcov: coverage tolerate-line reason="untestable: a read that fails right after the last byte was read"
-        }
-        if let Some(rs) = tail.iter().rposition(|&b| b == RS) {
-            if !PlainRecords::record_ok(&tail[rs + 1..], guards) {
-                return false;
-            }
-        }
-        drop(tail);
-        let mut check = PlainRecords::new(guards);
-        let mut chunk = vec![0u8; PREPASS_CHUNK];
-        let mut at = 0u64;
-        while at < len {
-            let want = (len - at).min(PREPASS_CHUNK as u64) as usize;
-            match file.read_at(&mut chunk[..want], start + at) {
-                Ok(read) if read > 0 => {
-                    at += read as u64;
-                    if !check.feed(&chunk[..read]) || check.pending_len() > MAX_PENDING_RECORD {
-                        return false;
-                    }
-                }
-                _ => return false, // patchcov: coverage tolerate-line reason="untestable: a file that shrinks or a read that fails between the passes"
-            }
-        }
-        check.finish_with(&[])
+        // #7218: several files are one stream, so they are plain records when each is, on its own, and
+        // each ends in an LF: the join of two such files is `... LF RS ...`, which is framed as it is
+        // inside one. A file that is not (no RS to start, a cut-short record, no final LF, or none at
+        // all) is left to the whole-file route, which walks the join as jq's reader does. A file the
+        // run opens by its path when it reaches it ([`NamedFile`], a long list) is not read here: the
+        // prepass would read what the path names now and the run what it names then.
+        !self.sources.is_empty()
+            && self.sources.iter().all(|source| match &source.file {
+                RereadFile::Held(file) => plain_seq_records_in(file, source.start, source.len),
+                RereadFile::Named(_) => false,
+            })
     }
 
     #[cfg(not(unix))]
@@ -2265,6 +2225,58 @@ impl Reread {
             None,
         )
     }
+}
+
+/// Whether the `len` bytes of `file` from `start` are a `--seq` stream of nothing but plain records
+/// ([`Reread::is_plain_seq_records`]): the first byte an RS, the last an LF, every record framed.
+#[cfg(unix)]
+fn plain_seq_records_in(file: &File, start: u64, len: u64) -> bool {
+    use crate::jq_seq_reader::{PlainGuards, PlainRecords};
+    use std::os::unix::fs::FileExt;
+    let guards = PlainGuards::ALL;
+    // A length of 0 is not known to be (`known_len`), and a file of none is no record.
+    if len == 0 || len == u64::MAX {
+        return false;
+    }
+    let byte_at = |at: u64| {
+        let mut one = [0u8];
+        match file.read_at(&mut one, start + at) {
+            Ok(1) => Some(one[0]),
+            _ => None,
+        }
+    };
+    if byte_at(0) != Some(RS) || byte_at(len - 1) != Some(b'\n') {
+        return false;
+    }
+    // The last record first, when an RS is near enough the end to hold it: the verdict does not
+    // depend on the order, and a record that fails is most often the last (a write cut short).
+    let probe = len.min(TAIL_PROBE);
+    let mut tail = vec![0u8; probe as usize];
+    if file.read_exact_at(&mut tail, start + len - probe).is_err() {
+        return false; // patchcov: coverage tolerate-line reason="untestable: a read that fails right after the last byte was read"
+    }
+    if let Some(rs) = tail.iter().rposition(|&b| b == RS) {
+        if !PlainRecords::record_ok(&tail[rs + 1..], guards) {
+            return false;
+        }
+    }
+    drop(tail);
+    let mut check = PlainRecords::new(guards);
+    let mut chunk = vec![0u8; PREPASS_CHUNK];
+    let mut at = 0u64;
+    while at < len {
+        let want = (len - at).min(PREPASS_CHUNK as u64) as usize;
+        match file.read_at(&mut chunk[..want], start + at) {
+            Ok(read) if read > 0 => {
+                at += read as u64;
+                if !check.feed(&chunk[..read]) || check.pending_len() > MAX_PENDING_RECORD {
+                    return false;
+                }
+            }
+            _ => return false, // patchcov: coverage tolerate-line reason="untestable: a file that shrinks or a read that fails between the passes"
+        }
+    }
+    check.finish_with(&[])
 }
 
 #[cfg(test)]
@@ -2631,22 +2643,38 @@ mod tests {
         assert!(!reread(text.len() as u64 + 10).is_plain_seq_records());
     }
 
-    /// #7082: the prepass vouches for one stream of one source: several files, which the run's gate
-    /// leaves to the route that reads them whole, are never records to it.
+    /// #7218: the prepass vouches for several files when each is plain records ending in an LF, and for
+    /// none when one is not: no RS to start, a cut-short record, no final LF, an empty file, or a file the
+    /// run opens by its path.
     #[cfg(unix)]
     #[test]
-    fn the_seq_prepass_vouches_for_one_source_only_7082() {
-        let text = b"\x1e{\"a\":1}\n";
-        let open = || {
+    fn the_seq_prepass_vouches_for_several_files_when_each_is_plain_7218() {
+        let open = |text: &[u8]| {
             let mut file = tempfile::tempfile().expect("a temp file");
             file.write_all(text).expect("written");
-            Rc::new(file)
+            (Rc::new(file), text.len() as u64)
         };
-        let len = text.len() as u64;
-        assert!(Reread::new(&open(), 0, len, PathBuf::new())
-            .expect("a reread")
-            .is_plain_seq_records());
-        assert!(!Reread::new_many(&[(open(), len), (open(), len)]).is_plain_seq_records());
+        let plain: &[u8] = b"\x1e{\"a\":1}\n";
+        let many = |texts: &[&[u8]]| {
+            let files: Vec<_> = texts.iter().map(|text| open(text)).collect();
+            Reread::new_many(&files).is_plain_seq_records()
+        };
+        assert!(many(&[plain]));
+        assert!(many(&[plain, plain]));
+        assert!(many(&[plain, b"\x1e1\n\x1e[2]\n", plain]));
+        for bad in [
+            &b"{\"a\":1}\n"[..],          // no RS to start
+            b"\x1e{\"a\":1}",             // no final LF
+            b"\x1e{\"a\":\n",             // a cut-short record that ends in an LF
+            b"\x1e{\"a\":1}\n\x1e{\"b\"", // a record cut short at the end
+            b"",                          // no bytes
+        ] {
+            assert!(!many(&[plain, bad]), "{bad:?} second");
+            assert!(!many(&[bad, plain]), "{bad:?} first");
+        }
+        assert!(!Reread::new_many(&[]).is_plain_seq_records());
+        let named = Rc::new(NamedFile::new(PathBuf::from("/nonexistent")));
+        assert!(!Reread::new_named(&[named]).is_plain_seq_records());
     }
 
     #[test]
