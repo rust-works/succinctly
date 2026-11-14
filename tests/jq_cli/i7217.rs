@@ -55,6 +55,61 @@ fn run_with_append(files: usize, second: bool, program: &[&str]) -> Result<Strin
     Ok(String::from_utf8(out)?)
 }
 
+/// The run's output with what `change` does to the last file once 64 KiB of it has been read, and the
+/// exit status. A first file of 80,000 records, then a one-line file.
+fn run_with_change(change: impl FnOnce(&std::path::Path) -> Result<()>) -> Result<(String, bool)> {
+    let dir = tempfile::tempdir()?;
+    let first = dir.path().join("f0.json");
+    let last = dir.path().join("f1.json");
+    let bytes: Vec<u8> = (0..80_000)
+        .flat_map(|i| format!("{{\"id\":{i},\"pad\":\"{}\"}}\n", "x".repeat(40)).into_bytes())
+        .collect();
+    assert!(bytes.len() >= 4 << 20);
+    std::fs::write(&first, bytes)?;
+    std::fs::write(&last, b"{\"k\":1}\n")?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .args(["jq", "-c", "-n", "inputs"])
+        .args([&first, &last])
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let mut stdout = child.stdout.take().expect("piped");
+    let mut out = vec![0u8; 65536];
+    stdout.read_exact(&mut out)?;
+    change(&last)?;
+    stdout.read_to_end(&mut out)?;
+    let ok = child.wait()?.success();
+    Ok((String::from_utf8(out)?, ok))
+}
+
+/// Bytes that are not UTF-8, appended after the run checked the files, are read as jq reads them: each
+/// is one U+FFFD.
+#[test]
+fn a_non_utf8_line_appended_to_a_later_file_is_substituted_7217() -> Result<()> {
+    let (out, ok) = run_with_change(|last| {
+        let mut file = std::fs::OpenOptions::new().append(true).open(last)?;
+        std::io::Write::write_all(&mut file, b"\"a\xffb\"\n")?;
+        Ok(())
+    })?;
+    assert!(ok);
+    assert!(
+        out.ends_with("{\"k\":1}\n\"a\u{fffd}b\"\n"),
+        "{}",
+        &out[out.len() - 40..]
+    );
+    Ok(())
+}
+
+/// The files are held open from the start, so a path removed while the run is in an earlier file still
+/// gives the bytes it had (jq, which opens it when it gets there, reports it as missing: recorded in
+/// `docs/compliance/jq/limitations.md`).
+#[test]
+fn a_file_removed_while_the_run_is_in_an_earlier_one_keeps_its_bytes_7217() -> Result<()> {
+    let (out, ok) = run_with_change(|last| Ok(std::fs::remove_file(last)?))?;
+    assert!(ok);
+    assert!(out.ends_with("{\"k\":1}\n"));
+    Ok(())
+}
+
 fn count(out: &str, needle: &str) -> usize {
     out.lines().filter(|line| line.contains(needle)).count()
 }
