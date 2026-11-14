@@ -3217,7 +3217,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// [`Self::line`] stays the editor line, which `yq-locate`, `at_offset` and the library API use.
     fn yq_line(&self) -> usize {
         let line = self.line();
-        if line == 0 {
+        // The empty document the CLI makes up (an input with none, and `-n`, #7052) holds no
+        // content to number: yq's empty node is on line 0.
+        if line == 0 || self.index.synthesized_empty() {
             return 0;
         }
         let (lines, _) = self.index.yq_preamble(|| yq_position_preamble(self.text));
@@ -3228,7 +3230,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// `---` and the blanks after it being part of the slurped header.
     fn yq_column(&self) -> usize {
         let column = self.column();
-        if column == 0 {
+        if column == 0 || self.index.synthesized_empty() {
             return 0;
         }
         let (lines, columns) = self.index.yq_preamble(|| yq_position_preamble(self.text));

@@ -1532,8 +1532,22 @@ fn input_file_holds_no_document_bytes(file: &str, format: InputFormat) -> bool {
                 .is_ok_and(|bytes| crate::front_matter::leading_bom_len(&bytes) == bytes.len()))
 }
 
+/// Whether this run is `-n`, which reads nothing and evaluates against yq's empty node (#7052).
+/// That node is the one an input holding no document is, so the run reads an empty stdin
+/// (`yq -n .` and `printf '' | yq .` print the same blank line). Set once by [`run_yq_inner`];
+/// stdin is then never touched, so `-n` cannot block on a terminal.
+static NULL_INPUT_IS_EMPTY_STDIN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn null_input_is_empty_stdin() -> bool {
+    NULL_INPUT_IS_EMPTY_STDIN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Read input from stdin as bytes, decoded when the run reads a string format (#6925).
 fn read_stdin() -> Result<Vec<u8>> {
+    if null_input_is_empty_stdin() {
+        return decode_transcoded_input(Vec::new(), "-");
+    }
     let mut buffer = Vec::new();
     std::io::stdin()
         .read_to_end(&mut buffer)
@@ -1644,6 +1658,9 @@ fn decode_transcoded_input(raw: Vec<u8>, name: &str) -> Result<Vec<u8>> {
 
 /// Read input from stdin as a string.
 fn read_stdin_string() -> Result<String> {
+    if null_input_is_empty_stdin() {
+        return Ok(String::new());
+    }
     let mut buffer = String::new();
     std::io::stdin()
         .read_to_string(&mut buffer)
@@ -12980,6 +12997,15 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         if args.front_matter.is_some() {
             anyhow::bail!("--eval-all and --front-matter are incompatible");
         }
+    }
+
+    // #7052: `-n` evaluates against yq's empty node, which is what an input holding no document
+    // reads as; the run is the one `printf '' | yq` is, whose empty document prints, serializes and
+    // compares as yq's does (`yq -n .` is a blank line, `[.]` is `-`).
+    NULL_INPUT_IS_EMPTY_STDIN.store(args.null_input, std::sync::atomic::Ordering::SeqCst);
+    if args.null_input {
+        args.null_input = false;
+        args.raw_input = false;
     }
 
     // Parse the jq program (use Yq mode for extended identifier syntax like kebab-case)
