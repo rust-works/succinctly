@@ -13580,7 +13580,7 @@ fn several_lazy_windowed_files(
     }
     let mut opened = Vec::with_capacity(files.len());
     judge_regular_files(files, raw_window_min_bytes(), |_, file, _| {
-        opened.push(file)
+        opened.push(file);
     })?;
     // Each file, where its stream starts, and whether it is white space alone.
     let mut sources = Vec::with_capacity(opened.len());
