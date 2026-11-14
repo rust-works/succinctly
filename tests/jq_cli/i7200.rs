@@ -102,3 +102,37 @@ fn a_fifo_path_with_a_byte_order_mark_does_not_hang_7200() -> Result<()> {
     let _ = writer.join();
     Ok(())
 }
+
+#[test]
+fn a_pipe_among_several_named_files_is_read_once_7200() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("succinctly-7200-multi-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let file = dir.join("a.json");
+    std::fs::write(&file, b"\x1e3\n")?;
+    let file = file.to_string_lossy().into_owned();
+    for flags in [&["-c"][..], &["-c", "-s"][..]] {
+        for order in [["/dev/stdin", file.as_str()], [file.as_str(), "/dev/stdin"]] {
+            let mut args = vec!["--seq"];
+            args.extend_from_slice(flags);
+            args.push(".");
+            args.extend_from_slice(&order);
+            let (out, status) = spawn_jq(&args, Some(b"\xef\xbb\xbf\x1e1\n"))?;
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(status, 0, "{args:?}: {err}");
+            let want: &[u8] = if flags.contains(&"-s") {
+                if order[0] == "/dev/stdin" {
+                    b"\x1e[1,3]\n"
+                } else {
+                    b"\x1e[3,1]\n"
+                }
+            } else if order[0] == "/dev/stdin" {
+                b"\x1e1\n\x1e3\n"
+            } else {
+                b"\x1e3\n\x1e1\n"
+            };
+            assert_eq!(out.stdout, want, "{args:?}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}

@@ -15212,7 +15212,8 @@ type PreparedInputs = (Vec<PathBuf>, Vec<Vec<u8>>, OpenFailures);
 /// diagnostic, no deferred or lost position, one source, valid UTF-8, no byte-order mark, and
 /// nothing between the walk's values but JSON whitespace -- so the lazy route finds the values
 /// the walk found, and no others. Anything else gets its bytes back unchanged (stdin through
-/// [`STDIN_PUSHBACK`], a file by being read again) and takes the route it always took.
+/// [`STDIN_PUSHBACK`], a file through [`SEQ_PREREAD`] or [`NAMED_PUSHBACK`]; only a run of several
+/// sources, or with a source that did not open, reads its files again) and takes the route it always took.
 fn seq_plain_json_inputs(args: &JqCommand) -> Result<Option<PreparedInputs>> {
     SEQ_PREREAD.with(|slot| *slot.borrow_mut() = None);
     NAMED_PUSHBACK.with(|slot| *slot.borrow_mut() = None);
@@ -15225,6 +15226,11 @@ fn seq_plain_json_inputs(args: &JqCommand) -> Result<Option<PreparedInputs>> {
     };
     // Stdin is one source that always opens, so a file list is all that can fail this.
     if raws.len() != 1 || !failures.is_empty() {
+        // #7200: several sources that all opened were read for nothing, and a pipe or FIFO among them
+        // cannot be read again; a run with a source that did not open reads its files its own way.
+        if !from_stdin && failures.is_empty() {
+            NAMED_PUSHBACK.with(|slot| *slot.borrow_mut() = Some((named, (files, raws, failures))));
+        }
         return Ok(None);
     }
     let raw = raws.pop().unwrap_or_default();
