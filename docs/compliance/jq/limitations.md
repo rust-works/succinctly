@@ -375,7 +375,7 @@ Telling the two apart would take a guess from the descriptor's mode, which an or
 
 A write to a standard output that cannot be written ends a run of jq 1.7.1 with `jq: error: writing output failed: <strerror>` on stderr and exit 2.
 `succinctly jq` does the same for a descriptor that was not opened for writing (`jq . 1<file`) and for any other write that fails.
-Rust's `std::io::Stdout` reads `EBADF` as success, so `succinctly jq` writes to a duplicate of descriptor 1 instead.
+Rust's `std::io::Stdout` reads `EBADF` as success, so `succinctly jq` writes to a duplicate of descriptor 1 instead (Unix only: on Windows it still writes through `std::io::Stdout`, which swallows the failure).
 A runtime error is still reported first (`-n '1, error("x")'`), and a run that writes nothing (`-n empty`) exits 0.
 
 Two differences remain.

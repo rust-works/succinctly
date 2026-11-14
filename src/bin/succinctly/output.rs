@@ -571,7 +571,11 @@ impl Write for JqStdout {
         #[cfg(not(unix))]
         let r = self.out.write(buf);
         r.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::Interrupted {
+            // A closed pipe keeps its own handling (SIGPIPE on Unix, #5547; the `BrokenPipe` report elsewhere).
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::Interrupted | std::io::ErrorKind::BrokenPipe
+            ) {
                 e
             } else {
                 Self::tag(e)
