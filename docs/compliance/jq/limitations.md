@@ -371,6 +371,22 @@ Rust's runtime reopens a closed descriptor 0 on `/dev/null` before `main` runs, 
 Telling the two apart would take a guess from the descriptor's mode, which an ordinary `jq . 0<>/dev/null` shares, so the divergence stands under [ADR-0018](../../adrs/adr-0018.md) (it matches no behaviour a script relies on except testing `$?` after closing its own standard input).
 `tests/jq_cli/i7126.rs` pins the rows captured from jq 1.7.1 for the three shapes that match, and this one.
 
+## A standard output that cannot be written: matched, with these differences (#7214)
+
+A write to a standard output that cannot be written ends a run of jq 1.7.1 with `jq: error: writing output failed: <strerror>` on stderr and exit 2.
+`succinctly jq` does the same for a descriptor that was not opened for writing (`jq . 1<file`) and for any other write that fails.
+Rust's `std::io::Stdout` reads `EBADF` as success, so `succinctly jq` writes to a duplicate of descriptor 1 instead (Unix only: on Windows it still writes through `std::io::Stdout`, which swallows the failure).
+A runtime error is still reported first (`-n '1, error("x")'`), and a run that writes nothing (`-n empty`) exits 0.
+
+Two differences remain.
+jq goes on evaluating after a failed write and reports the failure once the run is over, where `succinctly jq` stops at the first flush that fails (`-n 'range(100000), error("x")'` prints jq's `error (at <unknown>): x` first, then the write failure, in jq only).
+The exit status and the failure line agree.
+
+A **closed** descriptor 1 (`jq . >&-`) stays different, as a closed descriptor 0 does above.
+Rust's runtime reopens a closed descriptor 1 on `/dev/null` before `main` runs, so `succinctly jq` writes into `/dev/null` and exits 0, where jq exits 2.
+Telling the two apart would take a guess from the descriptor's mode, which an ordinary `jq . 1<>/dev/null` shares, so the divergence stands under [ADR-0018](../../adrs/adr-0018.md).
+`tests/jq_cli/i7214.rs` pins the rows captured from jq 1.7.1 for the shapes that match, and this one.
+
 ## Conversion diagnostics
 
 jq implements `tonumber` and `fromjson` by handing the string to its JSON parser, so a failure surfaces as that parser's diagnostic.
