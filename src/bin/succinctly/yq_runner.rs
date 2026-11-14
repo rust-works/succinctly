@@ -1623,6 +1623,31 @@ fn yq_text_decoder(codec: jq::TextCodec, bytes: &[u8]) -> std::result::Result<Ve
     )
 }
 
+/// How many files a run has read with `-p xml`: the comments the decoder gave a document are the encoder's
+/// only when the run read that one (#7212).
+static XML_INPUTS_READ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A file read with `-p xml`: its YAML text, and its decoder comments registered for the XML encoder.
+fn decode_xml_input(
+    raw: &[u8],
+    xml: Option<&input_xml::XmlOptions>,
+    name: &str,
+) -> Result<Vec<u8>> {
+    let defaults;
+    let xml = match xml {
+        Some(xml) => xml,
+        None => {
+            defaults = input_xml::XmlOptions::default();
+            &defaults
+        }
+    };
+    let (text, comments) = input_xml::transcode_with_comments(raw, xml)
+        .map_err(|message| anyhow::anyhow!("bad file '{name}': {message}"))?;
+    let first = XML_INPUTS_READ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+    jq::set_xml_decoder_comments(first.then_some(comments));
+    Ok(text)
+}
+
 /// `raw`, read from the input yq names `name` (`-` for stdin), as the run reads it: under a
 /// transcoded input format the text it decodes to, or yq's `bad file '<name>': ...` when it does
 /// not decode (#6925). Every other run reads the bytes as they are.
@@ -1634,6 +1659,9 @@ fn decode_transcoded_input(raw: Vec<u8>, name: &str) -> Result<Vec<u8>> {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
+            if format == TranscodedInput::Xml {
+                return decode_xml_input(&raw, xml.as_ref(), name);
+            }
             format
                 .transcode(
                     &raw,

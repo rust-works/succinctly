@@ -6655,6 +6655,7 @@ pub fn format_yq_encoder_from_tree<C: DocumentCursor>(
     }
     // The same for a document read with `-p xml` (#7202).
     if matches!(encoder, YqOutputEncoder::Xml(options) if options.empty_null) {
+        super::encoder_comments::xml_decoder_comments(&mut comments, &mut leading);
         super::encoder_comments::xml_first_entry_head(
             &mut comments,
             &mut leading,
@@ -17019,6 +17020,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                     // The same for a document read with `-p xml` (#7202).
                     let mut leading = leading;
                     if matches!(encoder, YqOutputEncoder::Xml(options) if options.empty_null) {
+                        super::encoder_comments::xml_decoder_comments(&mut comments, &mut leading);
                         let first_key =
                             super::encoder_comments::first_entry_key(&comments).map(str::to_owned);
                         super::encoder_comments::xml_first_entry_head(

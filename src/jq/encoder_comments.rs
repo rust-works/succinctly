@@ -188,3 +188,118 @@ pub(crate) fn xml_first_entry_head(
     found.key_comments.head = head.join("\n");
     leading.clear();
 }
+
+/// What yq's XML decoder put on one node and its members: head, line and foot comment (#7212).
+///
+/// A document read with `-p xml` reaches the run as YAML text, in which a comment is attributed to a
+/// slot by where it sits, and several slots of the decoder's (a comment after a closing tag, a foot of a
+/// `null` value, a foot after a block) read back as another node's. The CLI keeps what the decoder gave each
+/// node, and the XML encoder writes that, not what the text said.
+#[derive(Debug, Clone, Default)]
+pub struct XmlCommentNode {
+    pub head: String,
+    pub line: String,
+    pub foot: String,
+    pub members: XmlCommentMembers,
+}
+
+/// What an [`XmlCommentNode`]'s members are: a mapping's entries or a sequence's items.
+#[derive(Debug, Clone, Default)]
+pub enum XmlCommentMembers {
+    #[default]
+    None,
+    Map(Vec<XmlCommentEntry>),
+    Seq(Vec<XmlCommentNode>),
+}
+
+/// A mapping entry of the decoder's: the key node's comments and the value.
+#[derive(Debug, Clone)]
+pub struct XmlCommentEntry {
+    pub key: String,
+    pub head: String,
+    pub line: String,
+    pub foot: String,
+    pub value: XmlCommentNode,
+}
+
+#[cfg(feature = "std")]
+static XML_DECODER_COMMENTS: std::sync::RwLock<Option<XmlCommentNode>> =
+    std::sync::RwLock::new(None);
+
+/// Register the comments of the one document a run read with `-p xml`, or `None` when the run read more than
+/// one (no document's comments then say which is being written).
+pub fn set_xml_decoder_comments(comments: Option<XmlCommentNode>) {
+    #[cfg(feature = "std")]
+    {
+        *XML_DECODER_COMMENTS
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = comments;
+    }
+    #[cfg(not(feature = "std"))]
+    let _ = comments;
+}
+
+#[cfg(feature = "std")]
+fn node_comments(into: &mut EncoderNodeComments, node: &XmlCommentNode) {
+    into.head.clone_from(&node.head);
+    into.line.clone_from(&node.line);
+    into.foot.clone_from(&node.foot);
+}
+
+/// Lay the decoder's comments over `comments`, entry by entry where the key is the one at that place: a write
+/// that moved, renamed or added an entry keeps what the read attributed to it. Answers whether the first entry
+/// of the root mapping took a head comment from the decoder.
+#[cfg(feature = "std")]
+fn overlay_members(comments: &mut EncoderComments, node: &XmlCommentNode) -> bool {
+    let mut first_head = false;
+    match (&mut comments.members, &node.members) {
+        (EncoderMembers::Map(entries), XmlCommentMembers::Map(decoded)) => {
+            for (at, (entry, d)) in entries.iter_mut().zip(decoded).enumerate() {
+                if entry.key != d.key {
+                    continue;
+                }
+                entry.key_comments.head.clone_from(&d.head);
+                entry.key_comments.line.clone_from(&d.line);
+                entry.key_comments.foot.clone_from(&d.foot);
+                node_comments(&mut entry.value.own, &d.value);
+                overlay_members(&mut entry.value, &d.value);
+                first_head |= at == 0 && !d.head.is_empty();
+            }
+        }
+        // A sequence has no key to say an item is the one it was: one a write added or removed moved the rest.
+        (EncoderMembers::Seq(items), XmlCommentMembers::Seq(decoded))
+            if items.len() == decoded.len() =>
+        {
+            for (item, d) in items.iter_mut().zip(decoded) {
+                node_comments(&mut item.own, d);
+                overlay_members(item, d);
+            }
+        }
+        _ => {}
+    }
+    first_head
+}
+
+/// A document read with `-p xml` and written as XML: every node has the comments yq's decoder gave it
+/// (#7212). The comments before the first element that the YAML reader holds as the document's leading block
+/// are the first key's head, so `leading` is emptied when they were.
+pub(crate) fn xml_decoder_comments(comments: &mut EncoderComments, leading: &mut String) {
+    #[cfg(feature = "std")]
+    {
+        let guard = XML_DECODER_COMMENTS
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(root) = guard.as_ref() {
+            // A comment the text leaves after the document is one of a node's, not the document's.
+            if matches!(comments.members, EncoderMembers::Map(_)) {
+                node_comments(&mut comments.own, root);
+            }
+            if overlay_members(comments, root) {
+                leading.clear();
+            }
+        }
+        drop(guard);
+    }
+    #[cfg(not(feature = "std"))]
+    let _ = (comments, leading);
+}

@@ -193,6 +193,9 @@ pub use eval::input_queue_is_active;
 // #7029: the text a `--split-exp` file is named after.
 pub use eval::yq_node_scalar_text;
 // #6923: what `-e` reads under an `-o=<format>` encoder.
+pub use encoder_comments::{
+    set_xml_decoder_comments, XmlCommentEntry, XmlCommentMembers, XmlCommentNode,
+};
 pub use eval::{output_encoder_saw_truthy, reset_output_encoder_truthy};
 pub use eval::{set_yq_encoder_prefs, set_yq_text_decoder, YqEncoderPrefs, YqTextDecoder};
 // #3046: the CLI facts `input_filename`/`get_search_list`/`get_jq_origin`/
