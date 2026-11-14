@@ -97,6 +97,9 @@ const IS_KEY_ROWS: &[(&str, &str)] = &[
     (".a | key | is_key", "true\n"),
     ("(.a | key) | is_key", "true\n"),
     (".a | key | iskey", "true\n"),
+    (".a | key | (is_key)", "true\n"),
+    (".a | key | . | is_key", "true\n"),
+    (".a | key | is_key and true", "true\n"),
     (".a.b | key | is_key", "true\n"),
     (".a | keys | .[0] | is_key", "false\n"),
     (". | is_key", "false\n"),
@@ -127,5 +130,24 @@ fn test_is_key_defers_to_a_defined_function_and_is_undefined_in_jq_mode_6081() -
         .output()?;
     assert!(!output.status.success());
     assert!(String::from_utf8(output.stderr)?.contains("is_key/0 is not defined"));
+    Ok(())
+}
+
+/// Where `is_key` is not the whole stage straight after `key` it is `false` here and `true` in yq
+/// (docs/compliance/yq/limitations.md): the divergence is pinned so that a change to it is seen.
+#[test]
+fn test_is_key_beyond_the_stage_after_key_stays_false_6081() -> Result<()> {
+    for filter in [
+        ".a | key | [is_key]",
+        ".a | key | is_key as $x | $x",
+        ".a | key as $k | $k | is_key",
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, "a: {b: 1}\n", &["-I0", "-o", "json"])?;
+        assert_eq!(code, 0, "{filter}");
+        assert!(
+            stdout.contains("false") && !stdout.contains("true"),
+            "{filter}: {stdout}"
+        );
+    }
     Ok(())
 }

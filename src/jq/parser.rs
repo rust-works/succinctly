@@ -12034,7 +12034,7 @@ impl<'a> Parser<'a> {
     /// `key` returns a plain string here, so the answer comes from the spelling of the two stages
     /// instead of from a mark on the value; any other place `is_key` appears is `false`
     /// (docs/compliance/yq/limitations.md). `stage` is what was parsed from `start`.
-    fn is_key_after(&self, prev: Option<&Expr>, start: usize, stage: Expr) -> Expr {
+    fn is_key_after(&self, before: &[Expr], start: usize, stage: Expr) -> Expr {
         fn ends_in_key(expr: &Expr) -> bool {
             match expr {
                 Expr::Builtin(Builtin::Key) => true,
@@ -12043,10 +12043,17 @@ impl<'a> Parser<'a> {
                 _ => false,
             }
         }
-        let spelled = self.input[start..self.pos].trim_end();
+        // The stage is the bare name, in parentheses or not, and what feeds it is `key`, possibly
+        // through `.` stages (which hand the same node on).
+        let spelled = self.input[start..self.pos]
+            .trim_matches(|c: char| c.is_whitespace() || c == '(' || c == ')');
+        let prev = before
+            .iter()
+            .rev()
+            .find(|expr| !matches!(expr, Expr::Identity));
         if self.mode == ParserMode::Yq
             && matches!(spelled, "is_key" | "iskey")
-            && !self.shadowable_defs.contains("is_key")
+            && !self.shadowable_defs.contains(spelled)
             && prev.is_some_and(ends_in_key)
         {
             Expr::Literal(Literal::Bool(true))
@@ -12269,7 +12276,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let start = self.pos;
             let stage = self.parse_binding()?;
-            let stage = self.is_key_after(exprs.last(), start, stage);
+            let stage = self.is_key_after(&exprs, start, stage);
             exprs.push(stage);
             self.skip_ws();
         }
