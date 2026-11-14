@@ -94338,11 +94338,14 @@ fn owned_door_answer_may_leave(answer: OwnedValue) -> Option<OwnedValue> {
 /// never evaluates `f`, and a negative limit is all of `f`. Only an integer literal count is read, as
 /// a fractional one counts in jq in a way of its own (`nth(0.5; .[])` is the second element). jq
 /// mode only: yq's `first(f)` is another builtin (#2377).
+///
+/// The shape is tested here, inline, and the body is a call of its own: the generic route asks once
+/// per element, and most stages are none of these.
+#[inline]
 pub(crate) fn eval_owned_many_doors<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
 ) -> Option<Vec<OwnedValue>> {
-    // The shape first: most stages are none of these, and the generic route asks once per element.
     let shape = unwrap_paren(expr);
     if !matches!(
         shape,
@@ -94361,6 +94364,15 @@ pub(crate) fn eval_owned_many_doors<S: EvalSemantics>(
     {
         return None;
     }
+    eval_owned_many_doors_answer::<S>(shape, input)
+}
+
+/// [`eval_owned_many_doors`]' body, for a shape it has already tested.
+#[inline(never)]
+fn eval_owned_many_doors_answer<S: EvalSemantics>(
+    shape: &Expr,
+    input: &OwnedValue,
+) -> Option<Vec<OwnedValue>> {
     let leave = |value: &OwnedValue| owned_door_answer_may_leave(value.clone());
     match shape {
         Expr::Comma(branches) => {
