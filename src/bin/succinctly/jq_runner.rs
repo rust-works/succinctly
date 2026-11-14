@@ -4604,7 +4604,20 @@ pub(crate) fn silence_depth_guard_panic_line() {
 /// A value the program builds is bounded by the native-stack floor `main` registered, not by
 /// `MAX_VALUE_TREE_DEPTH`, as jq bounds it by its C stack alone (#5554).
 pub fn run_jq(args: JqCommand) -> Result<i32> {
-    jq::with_value_depth_on_stack_floor(|| run_jq_on_stack_floor(args))
+    match jq::with_value_depth_on_stack_floor(|| run_jq_on_stack_floor(args)) {
+        // jq's own report and status for a write to standard output that failed, a closed descriptor included (#7214).
+        Err(e) => match super::output::output_write_failure(&e) {
+            Some(strerror) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "jq: error: writing output failed: {strerror}"
+                );
+                Ok(exit_codes::USAGE_ERROR)
+            }
+            None => Err(e),
+        },
+        ok => ok,
+    }
 }
 
 fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
@@ -5002,8 +5015,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     let json_numbers = output_config.convention;
 
     // Set up output writer
-    let stdout = std::io::stdout();
-    let mut out = LoudFlushWriter::new(stdout.lock());
+    let mut out = LoudFlushWriter::new(super::output::JqStdout::new());
     // One record's rendered body, reused across records (#3265).
     let mut record_scratch = Vec::new();
 
