@@ -5803,16 +5803,29 @@ impl<'a, W: AsRef<[u64]>> Iterator for YamlFields<'a, W> {
 /// ever found, `seen` is simply dropped and `None` is returned; the
 /// `Vec`/`BTreeMap` used for deduplication are allocated only once a merge
 /// key is confirmed to exist.
-fn resolve_merge_keys<'a, W: AsRef<[u64]>>(
-    first_key: Option<YamlCursor<'a, W>>,
+fn resolve_merge_keys<W: AsRef<[u64]>>(
+    first_key: Option<YamlCursor<'_, W>>,
     view: MergeView,
-) -> Option<(MergedEntries<'a, W>, bool)> {
+) -> Option<(MergedEntries<'_, W>, bool)> {
     // `--yaml-fix-merge-anchor-to-spec` (#7025): yq reads a `<<` by other rules, and in both views
     // the two listings differ as soon as a mapping has one.
     if merge_anchor_to_spec() {
         return resolve_merge_keys_spec(first_key, view, 0, &mut BTreeMap::new())
             .map(|entries| (entries, true));
     }
+    resolve_merge_keys_memo(first_key, view, &mut IterationSources::new())
+}
+
+/// The iteration's field list of each source mapping already resolved, by position (#7201): a
+/// source that several `<<` lists name is resolved once, so a chain of merges that each name the
+/// last twice stays linear.
+type IterationSources<'a, W> = BTreeMap<usize, Rc<MergedEntries<'a, W>>>;
+
+fn resolve_merge_keys_memo<'a, W: AsRef<[u64]>>(
+    first_key: Option<YamlCursor<'a, W>>,
+    view: MergeView,
+    memo: &mut IterationSources<'a, W>,
+) -> Option<(MergedEntries<'a, W>, bool)> {
     let mut fields = YamlFields::raw(first_key);
     let mut seen: Vec<(YamlCursor<'a, W>, YamlCursor<'a, W>, YamlValue<'a, W>)> = Vec::new();
 
@@ -5846,6 +5859,7 @@ fn resolve_merge_keys<'a, W: AsRef<[u64]>>(
                 &key_value,
                 view,
                 replaced.as_ref(),
+                memo,
             );
 
             fields = rest;
@@ -5859,6 +5873,7 @@ fn resolve_merge_keys<'a, W: AsRef<[u64]>>(
                         &key_value,
                         view,
                         None,
+                        memo,
                     );
                 } else {
                     // The iteration upserts such a key onto the slot of the member it replaces (or
@@ -5931,9 +5946,10 @@ fn merge_key_field<'a, W: AsRef<[u64]>>(
     key_value: &YamlValue<'a, W>,
     view: MergeView,
     replaced: Option<&BTreeSet<String>>,
+    memo: &mut IterationSources<'a, W>,
 ) -> bool {
     let (views_differ, contributed) =
-        merge_field_into(entries, positions, field.value_cursor, view, replaced);
+        merge_field_into(entries, positions, field.value_cursor, view, replaced, memo);
     if contributed {
         return views_differ;
     }
@@ -6131,12 +6147,14 @@ fn merge_field_into<'a, W: AsRef<[u64]>>(
     value_cursor: YamlCursor<'a, W>,
     view: MergeView,
     replaced: Option<&BTreeSet<String>>,
+    memo: &mut IterationSources<'a, W>,
 ) -> (bool, bool) {
     let tagged = merge_sources_tagged(value_cursor);
     // #4987: yq's rendering expands only an alias source; an index that says so drops the rest from
     // that view, which is then not the iteration's list even for a lone source.
     let aliases_only = value_cursor.index.merge_rendering_aliases_only();
-    let views_differ = tagged.len() > 1 || (aliases_only && tagged.iter().any(|(_, alias)| !alias));
+    let mut views_differ =
+        tagged.len() > 1 || (aliases_only && tagged.iter().any(|(_, alias)| !alias));
     let drop_inline = aliases_only && view == MergeView::JsonRendering;
     let mut sources: Vec<_> = tagged
         .into_iter()
@@ -6150,6 +6168,21 @@ fn merge_field_into<'a, W: AsRef<[u64]>>(
     }
     let mut contributed = false;
     for source in sources {
+        // #7201: yq's iteration (`doTraverseMap`) walks a source's own `<<` too, so the source's
+        // members stand where its merge puts them and its own keys upsert over them. The
+        // rendering takes a source's fields verbatim.
+        if view == MergeView::Iteration {
+            if let Some(listed) = iteration_source_entries(source, memo) {
+                // The rendering lists the source's `<<` as an entry, so the views differ.
+                views_differ = true;
+                for (key_cursor, value_cursor) in listed.iter().copied() {
+                    contributed = true;
+                    let key_value = key_cursor.value();
+                    upsert_field(entries, positions, key_cursor, value_cursor, &key_value);
+                }
+                continue;
+            }
+        }
         for source_field in YamlFields::raw(source.first_child()) {
             contributed = true;
             let key_value = source_field.key_cursor.value();
@@ -6169,6 +6202,21 @@ fn merge_field_into<'a, W: AsRef<[u64]>>(
         }
     }
     (views_differ, contributed)
+}
+
+/// A source mapping's field list as yq's iteration reads it, when the source itself has a `<<`
+/// (#7201); `None` for a source without one, whose plain fields are read as before.
+fn iteration_source_entries<'a, W: AsRef<[u64]>>(
+    source: YamlCursor<'a, W>,
+    memo: &mut IterationSources<'a, W>,
+) -> Option<Rc<MergedEntries<'a, W>>> {
+    if let Some(listed) = memo.get(&source.bp_pos) {
+        return Some(listed.clone());
+    }
+    let (listed, _) = resolve_merge_keys_memo(source.first_child(), MergeView::Iteration, memo)?;
+    let listed = Rc::new(listed);
+    memo.insert(source.bp_pos, listed.clone());
+    Some(listed)
 }
 
 /// Whether `succinctly yq` runs under yq's `--yaml-fix-merge-anchor-to-spec` (#7025). A process-wide
