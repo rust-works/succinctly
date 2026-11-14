@@ -1,8 +1,8 @@
 //! #7217: a program that reads `input`/`inputs` over 2 to 32 regular files (4 MiB or more between them)
 //! reads each file to the end it has when the run reaches it, as jq opens each file when its reader gets
 //! there, so a line appended to a later file while the run is still in an earlier one is read. The
-//! expected counts are what `/usr/bin/jq` 1.7.1 gives on the same shape. (A list of 33 or more files
-//! under `input`/`inputs` is read whole and is not covered here; `-R`'s long list is `OpenWhenRead`.)
+//! expected counts are what `/usr/bin/jq` 1.7.1 gives on the same shape. A list of 33 or more files
+//! (#7197) opens each path when the run reaches it and read the line already; it is the control.
 
 #![cfg(unix)]
 
@@ -114,11 +114,11 @@ fn count(out: &str, needle: &str) -> usize {
     out.lines().filter(|line| line.contains(needle)).count()
 }
 
-/// The issue's table for the files the route holds open from the start (2 to 32): the appended line is
-/// read, as jq reads it.
+/// The issue's table: the files the route holds open from the start (2 to 32) read the appended line, as
+/// the longer list (33 and 40, opened when reached) and jq do.
 #[test]
 fn a_line_appended_to_the_last_of_several_files_is_read_7217() -> Result<()> {
-    for files in [2, 3, 32] {
+    for files in [2, 3, 32, 33, 40] {
         let out = run_with_append(files, false, &["-c", "-n", "inputs"])?;
         assert_eq!(count(&out, "appended"), 1, "{files} files");
         // Every record is still there once: 80,000 + the one-liners + the appended one.
