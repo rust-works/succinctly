@@ -95,7 +95,7 @@ fn several_framed_seq_files_give_what_the_whole_route_gives_7218() -> Result<()>
     ] {
         let (out, _, code) = same(args, &files)?;
         assert_eq!(code, 0, "{args:?}");
-        assert!(!out.is_empty());
+        assert_ne!(out, "");
     }
     Ok(())
 }
