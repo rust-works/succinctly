@@ -9932,8 +9932,9 @@ thread_local! {
     /// all by a program that stops reading earlier.
     static PENDING_OPEN_FAILURES: RefCell<std::collections::VecDeque<(usize, InputFileOpenError)>> =
         const { RefCell::new(std::collections::VecDeque::new()) };
-    /// Whether the read hook is installed for failures found as the run goes (#7024): `-R` over a long
-    /// list of files opens each when it reaches it, so none is pending when the queue is seeded.
+    /// Whether the read hook is installed for failures found as the run goes (#7024): `-R` and
+    /// `input`/`inputs` (#7197) over a long list of files open each when they reach it, so none is
+    /// pending when the queue is seeded.
     static RAW_OPEN_FAILURES_POSSIBLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Whether a pending failure was reported by a read, which makes the run exit 2 (#6475).
     static LAZY_OPEN_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -11490,8 +11491,8 @@ fn raw_windowed_sources(args: &JqCommand, files: &[PathBuf]) -> Option<Vec<RawWi
     Some(sources)
 }
 
-/// A file of a long list that `-R` reads (#7024) did not open when the run reached it
-/// ([`window::OpenWhenRead`]): jq's reader meets it as it moves on from the file before it, reports it
+/// A file of a long list that `-R` (#7024) or `input`/`inputs` (#7197) reads did not open when the run
+/// reached it ([`window::OpenWhenRead`]): jq's reader meets it as it moves on from the file before it, reports it
 /// and exits 2, and its main loop reads no further after the next value. That is what the whole-file
 /// route's failures do, which are known before the run starts and wait in [`PENDING_OPEN_FAILURES`] for
 /// the reads to reach them; this one is found as the run goes, and joins them, `at` files in.
@@ -13554,9 +13555,11 @@ fn lazy_read_flags(args: &JqCommand, track_eof: bool) -> bool {
 /// Several regular files a program reading `input`/`inputs` reads a window at a time (#7024), each a
 /// lazy source of its own read in turn, as the lone source past its front is (#7023); or `None` for a
 /// run that reads them whole: a flag [`lazy_read_flags`] turns down, a path that is not a regular file
-/// (judged as the plain route judges them), more than [`MAX_WINDOWED_FILES`], less than 4 MiB between
-/// them, a file that is not UTF-8, no file with a document, or a first file with one that the route
-/// that reads them whole stitches onto the next before it takes them ([`first_document_file_is_lazy`]).
+/// (judged as the plain route judges them), less than 4 MiB between them, a file that is not UTF-8, no
+/// file with a document, or a first file with one that the route that reads them whole stitches onto
+/// the next before it takes them ([`first_document_file_is_lazy`]).
+/// Up to [`MAX_WINDOWED_FILES`] files are held open from the start; a longer list is opened a file at a
+/// time ([`several_lazy_windowed_files_by_path`], #7197).
 ///
 /// Every file is checked to be UTF-8 here, a block at a time, as the route that reads them whole
 /// checks each before it takes them lazily: a file that is not is read as jq's substitution of its
@@ -13568,8 +13571,11 @@ fn several_lazy_windowed_files(
     track_eof: bool,
     files: &[PathBuf],
 ) -> Option<Vec<window::LineWindows>> {
-    if files.len() < 2 || files.len() > MAX_WINDOWED_FILES || !lazy_read_flags(args, track_eof) {
+    if files.len() < 2 || !lazy_read_flags(args, track_eof) {
         return None;
+    }
+    if files.len() > MAX_WINDOWED_FILES {
+        return several_lazy_windowed_files_by_path(files);
     }
     let mut opened = Vec::with_capacity(files.len());
     judge_regular_files(files, raw_window_min_bytes(), |_, file, meta| {
@@ -13580,20 +13586,9 @@ fn several_lazy_windowed_files(
     let mut sources = Vec::with_capacity(opened.len());
     let mut before_first_byte = true;
     for (mut file, len) in opened {
-        let start = if before_first_byte {
-            let mut head = Vec::with_capacity(3);
-            (&file).take(3).read_to_end(&mut head).ok()?;
-            before_first_byte = head.is_empty();
-            crate::front_matter::leading_bom_len(&head) as u64
-        } else {
-            0
-        };
-        let text = check_file_text(&mut file, start)?;
-        if !text.utf8 {
-            return None;
-        }
+        let (start, blank) = windowed_file_start(&mut file, &mut before_first_byte)?;
         let len = (len > 0).then(|| len.saturating_sub(start));
-        sources.push((file, len, start, text.blank));
+        sources.push((file, len, start, blank));
     }
     let first = sources.iter().position(|&(.., blank)| !blank)?;
     let count = sources.len();
@@ -13606,6 +13601,71 @@ fn several_lazy_windowed_files(
             .into_iter()
             .map(|(file, len, ..)| {
                 window::LineWindows::new(Box::new(file), len, lazy_window_bytes(), Vec::new())
+            })
+            .collect(),
+    )
+}
+
+/// Where the stream starts in one of several files read a window at a time, and whether it is white
+/// space alone; or `None` for a file that is not UTF-8 or will not read. The first file with a byte
+/// (`before_first_byte` says no file before it had one, and is updated) starts past a BOM, which jq
+/// skips. One definition for the list held open ([`several_lazy_windowed_files`]) and the list opened a
+/// file at a time ([`several_lazy_windowed_files_by_path`]), so the two cannot judge a file apart.
+fn windowed_file_start(
+    file: &mut std::fs::File,
+    before_first_byte: &mut bool,
+) -> Option<(u64, bool)> {
+    let start = if *before_first_byte {
+        let mut head = Vec::with_capacity(3);
+        (&*file).take(3).read_to_end(&mut head).ok()?;
+        *before_first_byte = head.is_empty();
+        crate::front_matter::leading_bom_len(&head) as u64
+    } else {
+        0
+    };
+    let text = check_file_text(file, start)?;
+    text.utf8.then_some((start, text.blank))
+}
+
+/// [`several_lazy_windowed_files`] for a list past [`MAX_WINDOWED_FILES`] (#7197): the files are judged
+/// by `stat` ([`judge_regular_paths`]) and each is opened, checked to be UTF-8 and closed in turn, so
+/// the list holds one descriptor, and each file's windows read through [`window::OpenWhenRead`], which
+/// opens the path when the run first reads it, as jq does. A file that will not open then reads as no
+/// bytes and is noted for the read hook ([`note_raw_open_failure`]), as for `-R`.
+fn several_lazy_windowed_files_by_path(files: &[PathBuf]) -> Option<Vec<window::LineWindows>> {
+    judge_regular_paths(files, raw_window_min_bytes())?;
+    let count = files.len();
+    let mut sources = Vec::with_capacity(count);
+    let mut before_first_byte = true;
+    let mut first: Option<usize> = None;
+    for (at, path) in files.iter().enumerate() {
+        let mut file = std::fs::File::open(path).ok()?;
+        let meta = file.metadata().ok()?;
+        if !meta.is_file() {
+            return None;
+        }
+        let (start, blank) = windowed_file_start(&mut file, &mut before_first_byte)?;
+        if first.is_none() && !blank {
+            first = Some(at);
+            if !first_document_file_is_lazy(&mut file, start, at, count)? {
+                return None;
+            }
+        }
+        sources.push((path, start, at));
+    }
+    first?;
+    // Each file is opened when the run reaches it, so a failure to open is found by a read
+    // ([`note_raw_open_failure`]).
+    RAW_OPEN_FAILURES_POSSIBLE.with(|possible| possible.set(true));
+    Some(
+        sources
+            .into_iter()
+            .map(|(path, start, at)| {
+                // No length: the file is read to its end as it stands when the run gets to it, as jq's
+                // reader reads it, where the length a `stat` gave now may be another file's.
+                let reader =
+                    window::OpenWhenRead::new(path.clone(), at, at + 1 == count).starting_at(start);
+                window::LineWindows::new(Box::new(reader), None, lazy_window_bytes(), Vec::new())
             })
             .collect(),
     )
@@ -21553,9 +21613,27 @@ mod tests {
         let sub = dir.path().join("sub");
         std::fs::create_dir(&sub).unwrap();
         assert_eq!(takes(&["-n"], &[&a, &sub], 0), None);
-        // Too many files, and every flag that reads the stream another way.
+        // More files than are held open are opened when the run reaches them (#7197), and judged as
+        // before: a file that is not UTF-8, a directory and a missing path turn the list down.
         let many: Vec<&PathBuf> = std::iter::repeat(&a).take(MAX_WINDOWED_FILES + 1).collect();
-        assert_eq!(takes(&["-n"], &many, 0), None);
+        assert_eq!(takes(&["-n"], &many, 0), Some(MAX_WINDOWED_FILES + 1));
+        let mut with_bad = many.clone();
+        with_bad.push(&bad);
+        assert_eq!(takes(&["-n"], &with_bad, 0), None);
+        let mut with_dir = many.clone();
+        with_dir.push(&sub);
+        assert_eq!(takes(&["-n"], &with_dir, 0), None);
+        assert_eq!(
+            takes(&["-n"], &many, 1 << 20),
+            None,
+            "under 4 MiB between them"
+        );
+        // A BOM at the front of the first file is skipped when it is opened.
+        let bom = write("bom.json", b"\xef\xbb\xbf{\"a\":1}\n");
+        let mut with_bom: Vec<&PathBuf> = vec![&bom];
+        with_bom.extend(std::iter::repeat(&a).take(MAX_WINDOWED_FILES));
+        assert_eq!(takes(&["-n"], &with_bom, 0), Some(MAX_WINDOWED_FILES + 1));
+        // Every flag that reads the stream another way.
         assert_eq!(
             takes(&["-n"], &many[..MAX_WINDOWED_FILES], 0),
             Some(MAX_WINDOWED_FILES)
