@@ -8141,7 +8141,7 @@ Matching either needs a string that can hold bytes that are not UTF-8, or the su
 
 ## The argument-level flags of [#7025](https://github.com/rust-works/succinctly/issues/7025) answer as yq does, with these differences
 
-`--expression`, `--split-exp-file`, `-f`, `-v`/`--verbose`, `--security-disable-env-ops`, `--security-disable-file-ops`, `--string-interpolation`, `-c`/`--yaml-compact-seq-indent` and `--header-preprocess` are yq's, and `tests/yq_cli/i7025.rs`, `tests/yq_cli/i7025_string_interpolation.rs`, `tests/yq_cli/i7025_compact_seq_indent.rs` and `tests/yq_cli/i7025_header_preprocess.rs` pin the rows captured from yq v4.53.3.
+`--expression`, `--split-exp-file`, `-f`, `-v`/`--verbose`, `--security-disable-env-ops`, `--security-disable-file-ops`, `--string-interpolation`, `-c`/`--yaml-compact-seq-indent` and `--header-preprocess` are yq's, and `tests/yq_cli/i7025.rs`, `tests/yq_cli/i7025_string_interpolation.rs`, `tests/yq_cli/i7025_compact_seq_indent.rs` and `tests/yq_cli/i7025_header_preprocess.rs` and `tests/yq_cli/i7025_merge_anchor_to_spec.rs` pin the rows captured from yq v4.53.3.
 [#7025](https://github.com/rust-works/succinctly/issues/7025) stays open for `--debug-node-info`.
 `--security-enable-system-operator` and `system(command)` / `system(command; args)` are yq's too (`tests/yq_cli/i7025_system_operator.rs`, 60 rows), with the differences listed below.
 
@@ -8203,13 +8203,15 @@ The flag takes its value after `=` only, as yq's boolean flags do (`--yaml-fix-m
 
 - **A `<<` that names no mapping is ignored where yq fails.**
   Under the flag yq's JSON rendering and `explode` raise `can only use merge anchors with maps (!!map) or sequences (!!seq) of maps, but got sequence containing !!int` for `<<: 5`, `<<: null`, `<<: *seq_of_scalars` and a sequence holding a non-mapping, and print nothing of the document.
-  `succinctly yq` lists the mapping without that `<<`, as it does without the flag.
+  `succinctly yq` lists the mapping without that `<<` and with its other sources, as it does without the flag.
   Value reads and iteration agree with yq: they ignore such a `<<`, and a non-mapping element of a sequence ends the walk of the sources listed before it.
 - **The write routes and the builtins that rebuild a mapping keep the default expansion.**
   A write (`.t.k = 1`, `del(.t.k)`, `-P`, `-i`), `to_entries`, `with_entries`, `map_values`, `pick`, `sort_keys` and `*` over a mapping with a `<<` differ from yq under the flag as they do without it: yq keeps the `<<` entry as written and `succinctly yq` lists the expanded members.
   The flagged order shows in what they list, but no row of them is pinned.
 - **A comment on a repeated own key is lost in a rendering that merges.**
   `explode(.)` over `c: 92` / `<<: {a: 48}` / `c: 85 # c` / `c: 90 # c` keeps both comments in yq and the first one of the repeated `c` here, the same as without the flag.
+- **A complex key is named `""` when a source member is compared with an own key.**
+  In the rendering a member whose key is a sequence or a mapping is dropped when an own key is a real `""` or another complex key, which yq does not do (`.t[]` and the value reads agree).
 - **A source that is an alias into another document is not deduplicated.**
   yq keys the merged members by the document of the node as well as the key text, so with `*base` from the first document, `z: {<<: [*base], p: 5}` in the second iterates `1`, `2`, `5` where `succinctly yq` iterates `5`, `2`.
 - **The default reading still lists a literal `<<` when a source itself merges.**

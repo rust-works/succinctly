@@ -5698,7 +5698,7 @@ impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
                 let key = field.key();
                 (
                     field,
-                    is_merge_key_value(&key),
+                    is_spec_merge_key(&field.key_cursor, &key),
                     field_key_is_named(&key, name),
                 )
             })
@@ -6191,6 +6191,20 @@ fn merge_anchor_to_spec() -> bool {
     MERGE_ANCHOR_TO_SPEC.load(Ordering::Relaxed)
 }
 
+/// Whether a mapping key is a merge key under `--yaml-fix-merge-anchor-to-spec`: the text `<<` and
+/// not a quoted scalar. yq's default reading merges a quoted `"<<"` too; under the flag it tests the
+/// key's tag, and a quoted key is a string.
+fn is_spec_merge_key<W: AsRef<[u64]>>(
+    key_cursor: &YamlCursor<'_, W>,
+    key_value: &YamlValue<'_, W>,
+) -> bool {
+    is_merge_key_value(key_value)
+        && !key_cursor
+            .text_position()
+            .and_then(|at| key_cursor.text.get(at))
+            .is_some_and(|byte| matches!(byte, b'"' | b'\''))
+}
+
 /// A `<<` value's sources in listed order, as yq's traversal under `--yaml-fix-merge-anchor-to-spec`
 /// reads them (`traverseMergeAnchor`): a mapping, an alias to one, or a sequence of those. `None` marks
 /// a sequence element that is not a mapping, which ends the walk when it is reached from the back
@@ -6320,7 +6334,7 @@ fn resolve_merge_keys_spec<'a, W: AsRef<[u64]>>(
     let mut merges = false;
     for field in YamlFields::raw(first_key) {
         let key_value = field.key();
-        let is_merge = is_merge_key_value(&key_value);
+        let is_merge = is_spec_merge_key(&field.key_cursor, &key_value);
         merges |= is_merge;
         fields.push((field, is_merge, key_value));
     }
@@ -6366,10 +6380,7 @@ fn resolve_merge_keys_spec<'a, W: AsRef<[u64]>>(
             entries.push((field.key_cursor, field.value_cursor));
             continue;
         }
-        for source in spec_merge_sources(field.value_cursor)
-            .into_iter()
-            .map_while(|source| source)
-        {
+        for source in spec_merge_sources(field.value_cursor).into_iter().flatten() {
             let source_fields = spec_source_fields(source, view, depth + 1, resolved);
             let mut added: Vec<(YamlCursor<'a, W>, YamlCursor<'a, W>, String)> = Vec::new();
             for &(key, value) in source_fields.iter() {

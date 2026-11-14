@@ -862,6 +862,7 @@ same kind of thing as the rest of this table — extra, off by default.
 | `--security-enable-system-operator` | Let `system(cmd)` and `system(cmd; args)` run a program (#7025) |
 | `-v, --verbose`       | Accepted; no debug log is written (#7025)     |
 | `-c, --yaml-compact-seq-indent[=BOOL]` | A block sequence under a key is two columns left of the default (`-I 2`: at the key's column); the run takes the comment-keeping emitter (#7025) |
+| `--yaml-fix-merge-anchor-to-spec[=BOOL]` | Read `<<` by the YAML spec: an own key beats a merged one, the earlier-listed source wins (#7025) |
 | `--string-interpolation[=BOOL]` | `=false` keeps `\(` in a string literal as text (default true, #7025) |
 | `--header-preprocess[=BOOL]` | `=false` reads a YAML input with no header: leading comments are the first node's head comment, a first `---` is not echoed (default true, #7025) |
 | `-S, --sort-keys`     | Sort mapping keys in output (succinctly extension — real yq has no such flag) |

@@ -425,3 +425,43 @@ fn spec_flag_takes_a_go_bool_after_equals_7025() -> Result<()> {
     assert_eq!((out.as_str(), code), ("", 2), "{err}");
     Ok(())
 }
+
+/// A quoted `"<<"` is a merge key in yq's default reading and an ordinary string key under the flag
+/// (yq tests the key's tag there): `.t` keeps the entry and `.t[]` yields the mapping it names.
+#[rustfmt::skip]
+const QUOTED_ROWS: &[(&str, &str, &str, i32)] = &[
+    (".t", "json", "{\n  \"<<\": {\n    \"x\": 1\n  },\n  \"y\": 2\n}\n", 0),
+    (".t", "yaml", "{\"<<\": *a, y: 2}\n", 0),
+    (".t[]", "json", "{\n  \"x\": 1\n}\n2\n", 0),
+    (".t.x", "json", "null\n", 0),
+    (".t.x", "yaml", "null\n", 0),
+    (".t.y", "json", "2\n", 0),
+    (".t.y", "yaml", "2\n", 0),
+    ("explode(.)", "json", "{\n  \"a\": {\n    \"x\": 1\n  },\n  \"t\": {\n    \"<<\": {\n      \"x\": 1\n    },\n    \"y\": 2\n  },\n  \"u\": {\n    \"x\": 1,\n    \"<<\": {\n      \"z\": 3\n    },\n    \"y\": 2\n  }\n}\n", 0),
+    ("explode(.)", "yaml", "a: {x: 1}\nt: {\"<<\": {x: 1}, y: 2}\nu: {x: 1, \"<<\": {z: 3}, y: 2}\n", 0),
+    (".u", "json", "{\n  \"x\": 1,\n  \"<<\": {\n    \"z\": 3\n  },\n  \"y\": 2\n}\n", 0),
+    (".u", "yaml", "{!!merge <<: *a, \"<<\": {z: 3}, y: 2}\n", 0),
+    (".u[]", "json", "1\n{\n  \"z\": 3\n}\n2\n", 0),
+    (".u[]", "yaml", "1\n{z: 3}\n2\n", 0),
+    (".u.x", "json", "1\n", 0),
+    (".u.x", "yaml", "1\n", 0),
+    (".u.z", "json", "null\n", 0),
+    (".u.z", "yaml", "null\n", 0),
+    ("[.u[]|key]", "json", "[\n  \"x\",\n  \"<<\",\n  \"y\"\n]\n", 0),
+    ("[.u[]|key]", "yaml", "- x\n- \"<<\"\n- y\n", 0),
+];
+
+#[test]
+fn a_quoted_merge_key_is_a_plain_key_under_the_spec_flag_7025() -> Result<()> {
+    let doc = "a: &a {x: 1}\nt: {\"<<\": *a, y: 2}\nu: {<<: *a, \"<<\": {z: 3}, y: 2}\n";
+    for (filter, format, stdout, status) in QUOTED_ROWS {
+        let args = ["-o", format, "-I", "2", "--yaml-fix-merge-anchor-to-spec"];
+        let (out, code) = run_yq_stdin(filter, doc, &args)?;
+        assert_eq!(
+            (out.as_str(), code),
+            (*stdout, *status),
+            "{filter} (-o {format})"
+        );
+    }
+    Ok(())
+}
