@@ -78,3 +78,29 @@ fn a_line_appended_to_the_next_raw_file_and_the_inputs_form_are_read_7223() -> R
     assert_eq!(count(&out, "appended"), 1);
     Ok(())
 }
+
+/// An empty file between two others is read as nothing, as jq reads it: it has no length to say so now.
+#[test]
+fn an_empty_file_among_several_raw_files_reads_as_nothing_7223() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let big: String = (0..80_000)
+        .map(|i| format!("line {i} {}\n", "x".repeat(80)))
+        .collect();
+    let paths = [
+        dir.path().join("a.txt"),
+        dir.path().join("b.txt"),
+        dir.path().join("c.txt"),
+    ];
+    std::fs::write(&paths[0], big)?;
+    std::fs::write(&paths[1], b"")?;
+    std::fs::write(&paths[2], b"tail\n")?;
+    let out = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .args(["jq", "-R", "-c", "."])
+        .args(&paths)
+        .output()?;
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout)?;
+    assert_eq!(text.lines().count(), 80_001);
+    assert_eq!(text.lines().last(), Some("\"tail\""));
+    Ok(())
+}
