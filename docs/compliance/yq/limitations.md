@@ -4430,13 +4430,16 @@ Every row of the issue is pinned against yq v4.53.3 in `tests/yq_cli/i5863.rs`, 
 - `.t + "1h" | tag` is `!!str` here and `!!timestamp` in yq, the same split as the tags above.
 - `from_unix` on a non-number names its tag in yq's words since #5930: `from_unix only works on numbers, found !!str instead` (`!!bool`, `!!seq`, `!!map`, `!!null`, and `!!timestamp` for a string that reads as one).
   In jq mode it keeps `math function requires number`.
-- The `/` and `%` refusals of #5930 write a container or `null` operand differently: yq puts each operand's key in parentheses after its tag when the left operand is a container or `null`, or the right one is a container (`!!timestamp (t) cannot be divided by !!map (m)`), and a value here carries no key, so both are `()`.
+- The `/` and `%` refusals of #5930 write a container or `null` operand differently: yq puts each operand's path in its document in parentheses after its tag when the left operand is a container or `null`, or the right one is a container (`!!timestamp (t) cannot be divided by !!map (m)`).
+  A value here carries no path on the plain route, so both are `()`.
   The `*` refusal has no parentheses in yq and none here.
   Only the message differs; the error and the exit status are the same.
 - An arithmetic operator over two kinds that do not combine words its error as yq does since #6904, in yq mode (`!!float cannot be added to !!null`, `!!seq () cannot be added to a !!float (f)`, `cannot multiply !!int with !!seq`, `!!float cannot be divided by !!null`, `!!int cannot modulo by !!str`, and yq's `-` over two scalars, `!!int cannot be added to !!str`, as it prints it).
   jq mode keeps jq's `number (1.5) and null (null) cannot be added`.
-  A key yq writes in parentheses after a tag is `()` here whenever the operand is a container or the other operand of a container (`+`, `-`, `/`, `%`): a value carries no key, so `.f + .l` is `!!seq () cannot be added to a !!float ()` where yq says `!!seq (l) ... !!float (f)`.
-  A literal operand has no key in yq either, so those rows agree exactly.
+  The text yq writes in parentheses after a tag is the operand's path in its document, as `path` answers it with its segments joined by `.` and none quoted (`.nest.a + .f` is `!!float (f) cannot be added to a !!map (nest.a)`, `.seq[1] + .f` says `(seq[1])`, and the root says `()`).
+  It is `()` here whenever the operand is a container or the other operand of a container (`+`, `-`, `/`, `%`): the path is only computed on the path-context route, which an arithmetic stage does not take, so `.f + .l` is `!!seq () cannot be added to a !!float ()` where yq says `!!seq (l) ... !!float (f)`.
+  The path carries through a pipe in yq (`.nest | .a + 1.5` says `(nest.a)`), and a value built by the filter has its own (`{"z": .m} | .z + 1.5` says `(z)`).
+  A literal operand has no path in yq either, so those rows agree exactly.
   Only the message differs; the error and the exit status are the same.
 - A quoted date times a number (`"2026-01-01T00:00:00Z" * 2`) is yq's string repetition and raises here, since the text stands in for the tag, as above.
 - A quoted string that reads as a date is named `!!timestamp` in the arithmetic errors above, where yq names it `!!str`, for the same reason: `.i - "2001-01-01T00:00:00Z"` is `!!int cannot be added to !!timestamp` here and `!!int cannot be added to !!str` in yq, and `.l - "2001-01-01T00:00:00Z"` is `!!timestamp () cannot be subtracted from !!seq` against `!!str ()`.
