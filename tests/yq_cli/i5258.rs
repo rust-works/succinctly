@@ -203,19 +203,20 @@ fn test_5258_a_a_line_comment_stays_beside_a_value_that_fits_on_the_line() -> Re
     Ok(())
 }
 
-/// A non-empty container does not fit on the line. yq prints the comment after the next entry
-/// (`c: 3 # t`) and drops it when the node is the last entry; this tool drops it either way rather
-/// than attach it to a node it never described.
+/// A non-empty container does not fit on the line. yq's encoder holds the comment and prints it after
+/// the next entry (`c: 3 # t`), and drops it when the node is the last entry (#7230, which placed it;
+/// it was dropped either way before).
 #[test]
-fn test_5258_b_a_non_empty_container_result_drops_the_comment() -> Result<()> {
+fn test_5258_b_a_non_empty_container_result_holds_the_comment_for_the_next_entry() -> Result<()> {
     for (input, filter, want) in [
         (
             "b: [1, 2] # t\nc: 3\n",
             ".b = {\"y\": 2}",
-            "b:\n  y: 2\nc: 3\n",
+            "b:\n  y: 2\nc: 3 # t\n",
         ),
-        ("b: 1 # t\nc: 3\n", ".b = [9]", "b:\n  - 9\nc: 3\n"),
-        ("b: {x: 1} # t\nc: 3\n", ".b = [9]", "b:\n  - 9\nc: 3\n"),
+        ("b: 1 # t\nc: 3\n", ".b = [9]", "b:\n  - 9\nc: 3 # t\n"),
+        ("b: {x: 1} # t\nc: 3\n", ".b = [9]", "b:\n  - 9\nc: 3 # t\n"),
+        ("c: 3\nb: 1 # t\n", ".b = [9]", "c: 3\nb:\n  - 9\n"),
     ] {
         let (out, code) = run_yq_stdin(filter, input, &[])?;
         assert_eq!(code, 0, "{filter} on {input:?}");

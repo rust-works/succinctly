@@ -237,3 +237,52 @@ fn a_flow_item_takes_the_held_comment_beside_it_7230() -> Result<()> {
         ),
     ])
 }
+
+/// The other encoders write the node's own comment where each writes a comment, as yq's do: only
+/// the YAML encoder holds it for a later line. It was dropped.
+#[test]
+fn other_encoders_write_a_replaced_scalars_comment_on_the_node_7230() -> Result<()> {
+    for (format, expected) in [
+        ("xml", "<!-- own --><a>1</a>\n<a>2</a>\n<b>6</b>\n"),
+        (
+            "lua",
+            "return {\n\t[\"a\"] = {\n\t\t1,\n\t\t2,\n\t}; -- own\n\t[\"b\"] = 6;\n};\n",
+        ),
+        (
+            "kyaml",
+            "{\n  a: [\n    1,\n    2,\n  ], # own\n  b: 6,\n}\n",
+        ),
+        ("toml", "a = [1, 2]  # own\nb = 6\n"),
+    ] {
+        let flag = format!("-o={format}");
+        let (out, status) = run_yq_stdin(".a = [1, 2]", "a: 5 # own\nb: 6\n", &[flag.as_str()])?;
+        assert_eq!((out.as_str(), status), (expected, 0), "{flag}");
+    }
+    Ok(())
+}
+
+/// A node navigated to after the write is printed as a document of its own: the comment held in it
+/// lands on its own later line, and a comment held before it does not reach it.
+#[test]
+fn a_node_navigated_to_after_the_write_places_its_own_held_comments_7230() -> Result<()> {
+    assert_rows(&[
+        (
+            "a:\n  b: 5 # own\n  c: 6\nz: 1\n",
+            ".a.b = {\"x\": 1} | .a",
+            &[],
+            "b:\n  x: 1\nc: 6 # own\n",
+        ),
+        (
+            "a: 5 # own\nb: 6\nc:\n  d: 1\n",
+            ".a = {\"x\": 1} | .b",
+            &[],
+            "6\n",
+        ),
+        (
+            "a: 5 # own\nb: 6\nc:\n  d: 1\n",
+            ".a = {\"x\": 1} | .a",
+            &[],
+            "x: 1\n",
+        ),
+    ])
+}

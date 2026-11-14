@@ -7134,9 +7134,17 @@ fn resolve_metadata_write_targets<W: AsRef<[u64]> + Clone>(
         }
         let query = Expr::Pipe(vec![target.clone(), Expr::Builtin(Builtin::PathNoArg)].into());
         let mut scratch = ErrorSink::default();
-        let results =
-            evaluate_yaml_cursor_core(cursor, &query, &mut scratch, false, false, false, None)
-                .ok()?;
+        let results = evaluate_yaml_cursor_core(
+            cursor,
+            &query,
+            &mut scratch,
+            false,
+            false,
+            false,
+            None,
+            false,
+        )
+        .ok()?;
         if scratch.hit() {
             return None;
         }
@@ -8911,6 +8919,7 @@ fn evaluate_yaml_cursor_in_document<W: AsRef<[u64]> + Clone>(
                     strip_style,
                     sort_keys,
                     None,
+                    true,
                 );
             }
         }
@@ -8951,6 +8960,7 @@ fn evaluate_yaml_cursor_in_document<W: AsRef<[u64]> + Clone>(
                         strip_style,
                         sort_keys,
                         pristine,
+                        true,
                     );
                 }
             }
@@ -8970,9 +8980,11 @@ fn evaluate_yaml_cursor_in_document<W: AsRef<[u64]> + Clone>(
             strip_style,
             sort_keys,
             None,
+            true,
         );
     };
     let has_aliases = cursor.index().has_aliases();
+    // The held comments are placed in each navigated node below, which is what is printed.
     let docs = evaluate_yaml_cursor_core(
         cursor,
         &prefix,
@@ -8981,6 +8993,7 @@ fn evaluate_yaml_cursor_in_document<W: AsRef<[u64]> + Clone>(
         strip_style,
         sort_keys,
         None,
+        false,
     )?;
     let path = meta_path_of(&steps);
     let mut out = Vec::with_capacity(docs.len());
@@ -9016,6 +9029,7 @@ fn evaluate_yaml_cursor_in_document<W: AsRef<[u64]> + Clone>(
                     "",
                 ));
             }
+            defer_held_line_comments(&nv, &mut sub, strip_style);
             if has_aliases {
                 enforce_anchor_soundness(&nv, &mut sub, sort_keys);
             }
@@ -9105,6 +9119,10 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
     strip_style: bool,
     sort_keys: bool,
     pristine_override: Option<(OwnedValue, CommentTree)>,
+    // The results are printed as YAML documents, whole: a line comment yq's YAML encoder holds is
+    // placed on a later line of the same document (#7230). Not for a result another encoder writes,
+    // or one the caller navigates into before printing it, which places its own.
+    places_held_comments: bool,
 ) -> Result<Vec<ResultWithComments>> {
     // #7156: `-o xml` writes the comments of the node it is given, and a write or a built value holds
     // them in its presentation tree and not on a cursor. So the filter runs without its encoder, with
@@ -9125,6 +9143,7 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
             strip_style,
             sort_keys,
             pristine_override,
+            false,
         )?;
         let mut encoded = Vec::with_capacity(results.len());
         for (value, tree) in results {
@@ -9780,7 +9799,7 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
     // #7230): the comment of a flow collection `-P` writes in block style, and of a scalar a write
     // replaced with a block collection. Before the style is gone, which says which collections are
     // written in flow.
-    if strip_style || reconciles {
+    if places_held_comments && (strip_style || reconciles) {
         if let Ok(docs) = &mut docs {
             for (value, comments) in docs.iter_mut() {
                 defer_held_line_comments(value, comments, strip_style);
