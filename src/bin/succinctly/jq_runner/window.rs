@@ -1788,7 +1788,8 @@ fn last_line_break(bytes: &[u8]) -> Option<usize> {
 pub(super) struct LineWindows {
     reader: Box<dyn Read>,
     /// How much of the source is left to read: a regular file's length when it was opened, less what
-    /// was read (a file that grows meanwhile is read as it was); `None` for one of unknown length,
+    /// was read (a file that grows meanwhile is read as it was); `None` for one read to its end as it
+    /// stands when the reads get there (a file a writer may append to, #7217), or of unknown length,
     /// which ends at a short read.
     remaining: Option<u64>,
     /// How much a read adds.
@@ -1895,8 +1896,8 @@ impl LineWindows {
         }
     }
 
-    /// The rest of the source, from the bytes carried on, up to the length it had when it was opened as
-    /// [`next_window`](Self::next_window) reads it: for a text that is not UTF-8, which is substituted
+    /// The rest of the source, from the bytes carried on, up to the length it was given (to its end when
+    /// there is none) as [`next_window`](Self::next_window) reads it: for a text that is not UTF-8, which is substituted
     /// whole, and for the eager reader a fault hands the rest of several files to (#7024).
     pub(super) fn take_rest(&mut self, on_error: impl FnOnce(&io::Error)) -> Vec<u8> {
         let mut bytes = std::mem::take(&mut self.carried);

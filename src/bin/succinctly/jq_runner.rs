@@ -13564,8 +13564,9 @@ fn lazy_read_flags(args: &JqCommand, track_eof: bool) -> bool {
 /// Every file is checked to be UTF-8 here, a block at a time, as the route that reads them whole
 /// checks each before it takes them lazily: a file that is not is read as jq's substitution of its
 /// bytes, which the reader that takes over at a fault does only for files read whole. The first file
-/// with a byte is read past its BOM, which jq skips. Each file is left where its stream starts, and one
-/// whose `stat` size is 0 (a `/proc` file) is read to its end, as the plain route reads it.
+/// with a byte is read past its BOM, which jq skips. Each file is left where its stream starts and is
+/// read to its end as it stands when the run gets there (a `/proc` file, whose `stat` size is 0, and a
+/// file a writer appends to meanwhile included), as jq reads it and as a longer list does (#7217).
 fn several_lazy_windowed_files(
     args: &JqCommand,
     track_eof: bool,
@@ -13578,29 +13579,28 @@ fn several_lazy_windowed_files(
         return several_lazy_windowed_files_by_path(files);
     }
     let mut opened = Vec::with_capacity(files.len());
-    judge_regular_files(files, raw_window_min_bytes(), |_, file, meta| {
-        opened.push((file, meta.len()));
+    judge_regular_files(files, raw_window_min_bytes(), |_, file, _| {
+        opened.push(file);
     })?;
-    // Each file, its length (`None` for one `stat` gives none), where its stream starts, and whether
-    // it is white space alone.
+    // Each file, where its stream starts, and whether it is white space alone.
     let mut sources = Vec::with_capacity(opened.len());
     let mut before_first_byte = true;
-    for (mut file, len) in opened {
+    for mut file in opened {
         let (start, blank) = windowed_file_start(&mut file, &mut before_first_byte)?;
-        let len = (len > 0).then(|| len.saturating_sub(start));
-        sources.push((file, len, start, blank));
+        sources.push((file, start, blank));
     }
     let first = sources.iter().position(|&(.., blank)| !blank)?;
     let count = sources.len();
-    let (file, _, start, _) = &mut sources[first];
+    let (file, start, _) = &mut sources[first];
     if !first_document_file_is_lazy(file, *start, first, count)? {
         return None;
     }
     Some(
         sources
             .into_iter()
-            .map(|(file, len, ..)| {
-                window::LineWindows::new(Box::new(file), len, lazy_window_bytes(), Vec::new())
+            .map(|(file, ..)| {
+                // No length: the file is read to the end it has when the reads get there.
+                window::LineWindows::new(Box::new(file), None, lazy_window_bytes(), Vec::new())
             })
             .collect(),
     )
