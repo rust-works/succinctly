@@ -11485,8 +11485,9 @@ fn raw_windowed_sources(args: &JqCommand, files: &[PathBuf]) -> Option<Vec<RawWi
         RAW_OPEN_FAILURES_POSSIBLE.with(|possible| possible.set(true));
         return Some(sources);
     }
-    judge_regular_files(files, raw_window_min_bytes(), |_, file, meta| {
-        sources.push((Box::new(file), Some(meta.len()), Vec::new()));
+    // No length: each file is read to the end it has when the reads get there, as jq reads it (#7223).
+    judge_regular_files(files, raw_window_min_bytes(), |_, file, _| {
+        sources.push((Box::new(file), None, Vec::new()));
     })?;
     Some(sources)
 }
