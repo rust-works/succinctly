@@ -7189,7 +7189,8 @@ fn read_inputs(
     } else {
         let preread = (seq_stream_shape && !args.slurp)
             .then(|| take_seq_preread(PrereadSource::Files(&files), &mut handed))
-            .flatten();
+            .flatten()
+            .or_else(|| take_named_pushback(&files));
         let (files, raws, failures) = match preread {
             Some(prepared) => prepared,
             None => read_input_files(&files, failed_as_sources),
@@ -9891,6 +9892,10 @@ thread_local! {
     /// the clean kind it serves (#5674): stdin can be read once, and the materializing route
     /// reads it through [`read_stdin_bytes`].
     static STDIN_PUSHBACK: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    /// The named source [`seq_plain_json_inputs`] read and found not clean, when it has no walk to
+    /// hand on (#7200): the files named and what it read of them, for the read that would otherwise
+    /// open them again.
+    static NAMED_PUSHBACK: RefCell<Option<(Vec<PathBuf>, PreparedInputs)>> = const { RefCell::new(None) };
     /// The read of stdin that failed before the probe of a pipe saw 4 MiB (#7024): the route that reads
     /// stdin whole reports it, as it would have had it made the read itself.
     static STDIN_PUSHBACK_ERROR: RefCell<Option<std::io::Error>> = const { RefCell::new(None) };
@@ -15207,9 +15212,11 @@ type PreparedInputs = (Vec<PathBuf>, Vec<Vec<u8>>, OpenFailures);
 /// diagnostic, no deferred or lost position, one source, valid UTF-8, no byte-order mark, and
 /// nothing between the walk's values but JSON whitespace -- so the lazy route finds the values
 /// the walk found, and no others. Anything else gets its bytes back unchanged (stdin through
-/// [`STDIN_PUSHBACK`], a file by being read again) and takes the route it always took.
+/// [`STDIN_PUSHBACK`], a file through [`SEQ_PREREAD`] or [`NAMED_PUSHBACK`]; only a run of several
+/// sources, or with a source that did not open, reads its files again) and takes the route it always took.
 fn seq_plain_json_inputs(args: &JqCommand) -> Result<Option<PreparedInputs>> {
     SEQ_PREREAD.with(|slot| *slot.borrow_mut() = None);
+    NAMED_PUSHBACK.with(|slot| *slot.borrow_mut() = None);
     let named = get_input_files(args);
     let from_stdin = named.is_empty();
     let (files, mut raws, failures) = if from_stdin {
@@ -15219,6 +15226,11 @@ fn seq_plain_json_inputs(args: &JqCommand) -> Result<Option<PreparedInputs>> {
     };
     // Stdin is one source that always opens, so a file list is all that can fail this.
     if raws.len() != 1 || !failures.is_empty() {
+        // #7200: several sources that all opened were read for nothing, and a pipe or FIFO among them
+        // cannot be read again; a run with a source that did not open reads its files its own way.
+        if !from_stdin && failures.is_empty() {
+            NAMED_PUSHBACK.with(|slot| *slot.borrow_mut() = Some((named, (files, raws, failures))));
+        }
         return Ok(None);
     }
     let raw = raws.pop().unwrap_or_default();
@@ -15235,6 +15247,13 @@ fn seq_plain_json_inputs(args: &JqCommand) -> Result<Option<PreparedInputs>> {
                 STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = Some(raw));
             } else if walk.is_some() {
                 prepared = Some((files, vec![raw], failures));
+            } else {
+                // #7200: no walk to hand on (a byte-order mark, invalid UTF-8, or a slurp), but the
+                // bytes cannot always be read again: a pipe named `/dev/stdin` is empty the second
+                // time and a FIFO's second open waits for a writer that has gone.
+                NAMED_PUSHBACK.with(|slot| {
+                    *slot.borrow_mut() = Some((named.clone(), (files, vec![raw], failures)));
+                });
             }
             if let Some(walk) = walk {
                 SEQ_PREREAD.with(|slot| {
@@ -15259,6 +15278,18 @@ enum PrereadSource<'a> {
     Stdin(&'a [u8]),
     /// The files named on the command line.
     Files(&'a [PathBuf]),
+}
+
+/// What [`seq_plain_json_inputs`] read of the named `files` when it kept no walk (#7200), taken by the
+/// read that would otherwise open them again. A pushback of other files is left alone.
+fn take_named_pushback(files: &[PathBuf]) -> Option<PreparedInputs> {
+    NAMED_PUSHBACK.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref()?.0 != files {
+            return None;
+        }
+        slot.take().map(|(_, prepared)| prepared)
+    })
 }
 
 /// What [`seq_plain_json_inputs`] read of `source` (#6620), taken by the read that would otherwise
