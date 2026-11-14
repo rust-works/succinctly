@@ -9969,26 +9969,25 @@ fn defer_held_line_comments_at(
     match (value, &mut *tree) {
         (OwnedValue::Object(members), CommentTree::Object(..)) => {
             for (key, child) in members {
-                if tree.key_comment(key).is_some() {
-                    // The key's own comment ends its line, and replaces both held ones.
-                    held.pending = None;
-                    held.key = None;
-                } else if let Some(comment) = held.pending.take() {
-                    held.key = Some(comment);
+                if held.pending.is_some() || held.key.is_some() {
+                    if tree.key_comment(key).is_some() {
+                        // The key's own comment ends its line, and replaces both held ones.
+                        held.pending = None;
+                        held.key = None;
+                    } else if let Some(comment) = held.pending.take() {
+                        held.key = Some(comment);
+                    }
                 }
                 let CommentTree::Object(_, fields, _) = &mut *tree else {
                     break; // patchcov: coverage tolerate-line reason="unreachable: the match arm above proved the tree is an Object and nothing in the loop changes its variant"
                 };
-                if !fields.contains_key(key.as_str()) {
-                    // A member the tree never saw (one the write added) has nothing to move, but
-                    // can still take a held comment.
-                    if held.key.is_none() {
-                        continue;
-                    }
+                // A member the tree never saw (one the write added) has nothing to move, but can
+                // still take a held comment.
+                if held.key.is_some() && !fields.contains_key(key.as_str()) {
                     fields.insert(key.clone(), CommentTree::empty());
                 }
                 let Some(slot) = fields.get_mut(key.as_str()) else {
-                    continue; // patchcov: coverage tolerate-line reason="unreachable: the member was found or inserted just above"
+                    continue;
                 };
                 // A block collection is written on the lines below its key, so the held comment
                 // ends the key's line, before any of the collection's own lines.
