@@ -5601,7 +5601,7 @@ impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
         // name reads the view.
         if name != "<<" {
             if let FieldsInner::Merged { first_key, .. } = &self.inner {
-                return Self::traverse_fields(**first_key, name, depth);
+                return Self::traverse_fields(**first_key, name, depth, &mut BTreeMap::new());
             }
         }
         self.walk_for(name).0
@@ -5651,10 +5651,15 @@ impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
     /// of sibling merges, so `depth` is checked against the same
     /// `MAX_ALIAS_CHAIN_DEPTH` ceiling `resolve_alias_chain` uses for the
     /// same class of hazard, purely as a stack-safety limit.
+    ///
+    /// `seen` holds what each source mapping (by position) answered for `name`, so a source named by
+    /// many `<<` lists is walked once: without it a chain of merges that each name the one before twice
+    /// took 2^depth time (#7224).
     fn traverse_fields(
         first_key: Option<YamlCursor<'a, W>>,
         name: &str,
         depth: usize,
+        seen: &mut BTreeMap<usize, Option<YamlCursor<'a, W>>>,
     ) -> Option<YamlCursor<'a, W>> {
         assert_depth(depth, MAX_ALIAS_CHAIN_DEPTH);
 
@@ -5666,8 +5671,16 @@ impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
             let key = field.key();
             if is_merge_key_value(&key) {
                 for source in merge_sources(field.value_cursor) {
-                    if let Some(hit) = Self::traverse_fields(source.first_child(), name, depth + 1)
-                    {
+                    let answer = match seen.get(&source.bp_pos) {
+                        Some(answer) => *answer,
+                        None => {
+                            let answer =
+                                Self::traverse_fields(source.first_child(), name, depth + 1, seen);
+                            seen.insert(source.bp_pos, answer);
+                            answer
+                        }
+                    };
+                    if let Some(hit) = answer {
                         result = Some(hit);
                     }
                 }
@@ -6207,6 +6220,29 @@ fn is_spec_merge_key<W: AsRef<[u64]>>(
             .is_some_and(|byte| matches!(byte, b'"' | b'\''))
 }
 
+/// What a node is, decided without `value()` where the node is a container: `value()` of a
+/// mapping that merges resolves its whole field list at once, and a chain of merges that
+/// name each other twice would resolve each link once per mention (#7224), under the default reading too.
+enum MergeNode<'a, W> {
+    Mapping,
+    Sequence(YamlElements<'a, W>),
+    Other,
+}
+fn classify_merge_node<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> MergeNode<'_, W> {
+    if cursor.bp_pos != 0 && cursor.is_container() {
+        return if cursor.index.is_sequence_at_bp(cursor.bp_pos) {
+            MergeNode::Sequence(YamlElements::from_sequence_cursor(cursor))
+        } else {
+            MergeNode::Mapping
+        };
+    }
+    match cursor.value() {
+        YamlValue::Mapping(_) => MergeNode::Mapping,
+        YamlValue::Sequence(sequence) => MergeNode::Sequence(sequence),
+        _ => MergeNode::Other,
+    }
+}
+
 /// A `<<` value's sources in listed order, as yq's traversal under `--yaml-fix-merge-anchor-to-spec`
 /// reads them (`traverseMergeAnchor`): a mapping, an alias to one, or a sequence of those. `None` marks
 /// a sequence element that is not a mapping, which ends the walk when it is reached from the back
@@ -6215,28 +6251,6 @@ fn is_spec_merge_key<W: AsRef<[u64]>>(
 fn spec_merge_sources<W: AsRef<[u64]>>(
     value_cursor: YamlCursor<'_, W>,
 ) -> Vec<Option<YamlCursor<'_, W>>> {
-    /// What a node is, decided without `value()` where the node is a container: `value()` of a
-    /// mapping that merges resolves its whole field list at once, and a chain of merges that
-    /// name each other twice would resolve each link once per mention.
-    enum Node<'a, W> {
-        Mapping,
-        Sequence(YamlElements<'a, W>),
-        Other,
-    }
-    fn classify<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> Node<'_, W> {
-        if cursor.bp_pos != 0 && cursor.is_container() {
-            return if cursor.index.is_sequence_at_bp(cursor.bp_pos) {
-                Node::Sequence(YamlElements::from_sequence_cursor(cursor))
-            } else {
-                Node::Mapping
-            };
-        }
-        match cursor.value() {
-            YamlValue::Mapping(_) => Node::Mapping,
-            YamlValue::Sequence(sequence) => Node::Sequence(sequence),
-            _ => Node::Other,
-        }
-    }
     /// The anchored node an alias names, or the node itself.
     fn through_alias<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> Option<YamlCursor<'_, W>> {
         if !cursor.is_alias() {
@@ -6252,9 +6266,11 @@ fn spec_merge_sources<W: AsRef<[u64]>>(
     }
     fn as_mapping<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> Option<YamlCursor<'_, W>> {
         let target = through_alias(cursor)?;
-        match classify(target) {
-            Node::Mapping if target.bp_pos == cursor.bp_pos => Some(cursor.resolve_bare_seq_item()),
-            Node::Mapping => Some(target),
+        match classify_merge_node(target) {
+            MergeNode::Mapping if target.bp_pos == cursor.bp_pos => {
+                Some(cursor.resolve_bare_seq_item())
+            }
+            MergeNode::Mapping => Some(target),
             _ => None,
         }
     }
@@ -6262,16 +6278,16 @@ fn spec_merge_sources<W: AsRef<[u64]>>(
     let Some(target) = through_alias(value_cursor) else {
         return sources;
     };
-    match classify(target) {
-        Node::Mapping => sources.push(Some(target)),
-        Node::Sequence(sequence) => {
+    match classify_merge_node(target) {
+        MergeNode::Mapping => sources.push(Some(target)),
+        MergeNode::Sequence(sequence) => {
             let mut rest = sequence;
             while let Some((cursor, tail)) = rest.uncons_cursor() {
                 sources.push(as_mapping(cursor));
                 rest = tail;
             }
         }
-        Node::Other => {}
+        MergeNode::Other => {}
     }
     sources
 }
@@ -6503,19 +6519,39 @@ fn for_each_merge_source<'a, W: AsRef<[u64]>>(
     mut push: impl FnMut(YamlCursor<'a, W>, bool),
 ) {
     fn as_mapping<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> bool {
-        matches!(cursor.value(), YamlValue::Mapping(_))
+        matches!(classify_merge_node(cursor), MergeNode::Mapping)
+    }
+    /// The mapping an alias names, if it names one.
+    fn alias_to_mapping<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> Option<YamlCursor<'_, W>> {
+        if !cursor.is_alias() {
+            return None;
+        }
+        match cursor.value() {
+            YamlValue::Alias {
+                target: Some(target),
+                ..
+            } if as_mapping(target) => Some(target),
+            _ => None,
+        }
     }
 
-    match value_cursor.value() {
-        YamlValue::Mapping(_) => push(value_cursor, false),
-        YamlValue::Alias {
-            target: Some(target),
-            ..
-        } if as_mapping(target) => push(target, true),
-        YamlValue::Sequence(elements) => {
+    // The kind of a node is read off the index, not by `value()`, which resolves a merging mapping's
+    // whole field list: a chain of merges naming each link twice took 2^depth time (#7224).
+    if let Some(target) = alias_to_mapping(value_cursor) {
+        push(target, true);
+        return;
+    }
+    if value_cursor.is_alias() {
+        return;
+    }
+    match classify_merge_node(value_cursor) {
+        MergeNode::Mapping => push(value_cursor, false),
+        MergeNode::Sequence(elements) => {
             let mut rest = elements;
             while let Some((cursor, tail)) = rest.uncons_cursor() {
-                match cursor.value() {
+                if let Some(target) = alias_to_mapping(cursor) {
+                    push(target, true);
+                } else if !cursor.is_alias() && as_mapping(cursor) {
                     // `cursor` may still be an unresolved bare-`-`
                     // sequence-item wrapper (`uncons_cursor` leaves a
                     // totally bare `-` item pointed at it); resolve before
@@ -6523,17 +6559,12 @@ fn for_each_merge_source<'a, W: AsRef<[u64]>>(
                     // reads the wrapper's one child - the mapping node
                     // itself - instead of its first key, silently dropping
                     // every field of this merge source (#835).
-                    YamlValue::Mapping(_) => push(cursor.resolve_bare_seq_item(), false),
-                    YamlValue::Alias {
-                        target: Some(target),
-                        ..
-                    } if as_mapping(target) => push(target, true),
-                    _ => {}
+                    push(cursor.resolve_bare_seq_item(), false);
                 }
                 rest = tail;
             }
         }
-        _ => {}
+        MergeNode::Other => {}
     }
 }
 
