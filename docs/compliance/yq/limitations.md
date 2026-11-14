@@ -7865,7 +7865,9 @@ Six rows differ from yq v4.53.3, each pinned out of `tests/yq_cli/i6850.rs`:
 - `-o=props`, `-o=shell`, `-o=ini` and `-o=xml` print a null and a boolean as the node was written, as yq's encoders print a scalar node's own text (#7204): `a:` with no value is `a = ` (`a=`, `<a></a>`), `~` is `~` (shell `'~'`), `Null` and `NULL` are as written, and `True`, `TRUE`, `False` and `FALSE` are too.
   The spelling is read from the cursor for a read and from the presentation tree for a write (`=`, `del()`, `sort_keys`, `-i`), so it follows a node that stays where it is.
   A reshape that moves the nodes (`.c |= reverse`) leaves each spelling at its position, as the YAML printer does for the same filter.
-  A value with no node behind it prints canonically: `tostring` and `join` (#2802), a value a filter computes, and a literal.
+  A write whose result still holds an alias or a merge key (`.b = 1` or `del(.a)` over `a: &x ~` / `b: *x`) prints the aliased node canonically (`b = null`, yq `b = ~`): the presentation tree keeps no spelling under an alias.
+  A read through an alias or a merge key is spelled as its anchor's node is.
+  A value with no node behind it prints canonically: `tostring` and `join` (#2802), a value a filter computes, a literal, and every result under `--eval-all` (`yq ea -o=props .` over `a: ~` prints `a = null`, yq `a = ~`; #4380).
   A document sweep of the four encoders over 2,500 real YAML files differs from yq on 448 file and format pairs before this and 28 after (comment placement, #7202, and files yq refuses or reads differently), and `-o=toml` still writes `true` for a `True` (below).
   Every other encoder writes a null and a boolean in one spelling (`-o=csv`, `-o=tsv`, `-o=lua`, `-o=kyaml`, `-o=uri`, `-o=base64` agree with yq on every spelling probed) and `-o=json`, `-o=yaml` are unaffected.
 - An encoder that fails after earlier results printed still prints those results first, as yq does (#6923): `printf 'a: x\nb: [1]\nc: {d: e}\n' | yq -o=csv '.[]'` prints `x` and `1`, then the error, exit 1.

@@ -6371,6 +6371,16 @@ fn tree_comment_block(lines: &[String]) -> String {
     lines.join("\n")
 }
 
+/// Whether `spelling` is a way of writing `value`, a null or a boolean: nothing, `~` or a case of `null`, and
+/// a case of `true` or `false`. A tree a write left a stale spelling in prints the value it holds (#7204).
+fn spelling_names_leaf(spelling: &str, value: &OwnedValue) -> bool {
+    match value {
+        OwnedValue::Null => matches!(spelling, "" | "~" | "null" | "Null" | "NULL"),
+        OwnedValue::Bool(b) => spelling.eq_ignore_ascii_case(if *b { "true" } else { "false" }),
+        _ => false,
+    }
+}
+
 /// Give each null and boolean leaf of `value` the text it was written with, where the node it came from
 /// kept one (`push:` with no value, `~`, `Null`, `True`): a string of that text, which the encoders that
 /// print a node's own text (`-o props`, `-o shell`, `-o ini`, `-o xml`) write as it is (#7204). `tree` is
@@ -6382,7 +6392,11 @@ fn respell_by_tree(value: &mut OwnedValue, tree: &CommentTree, depth: usize) {
     }
     match value {
         OwnedValue::Null | OwnedValue::Bool(_) => {
-            if let Some(spelling) = tree.meta().spelling() {
+            if let Some(spelling) = tree
+                .meta()
+                .spelling()
+                .filter(|s| spelling_names_leaf(s, value))
+            {
                 *value = OwnedValue::String(spelling.into());
             }
         }
@@ -6400,11 +6414,66 @@ fn respell_by_tree(value: &mut OwnedValue, tree: &CommentTree, depth: usize) {
     }
 }
 
+/// [`respell_by_tree`] for a result that is still a node of the document: the spelling is read off the cursor,
+/// with no tree built. A mapping's entries are paired with the cursor's by position and key, as
+/// [`EncoderComments::entry`] pairs them, so an entry the owned value reordered or renamed keeps no spelling.
+fn respell_by_cursor<C: DocumentCursor>(value: &mut OwnedValue, cursor: &C, depth: usize) {
+    super::value::assert_value_tree_depth(depth);
+    match value {
+        OwnedValue::Null | OwnedValue::Bool(_) => {
+            // An alias is spelled as its anchor's node is.
+            let target = cursor.alias_target_cursor();
+            let cursor = target.as_ref().unwrap_or(cursor);
+            if let Some(spelling) = source_spelling(cursor, &cursor.value(), value)
+                .filter(|spelling| spelling_names_leaf(spelling, value))
+            {
+                *value = OwnedValue::String(spelling.into());
+            }
+        }
+        OwnedValue::Object(entries) => {
+            let node = cursor.value();
+            let Some(mut fields) = node.as_object() else {
+                return;
+            };
+            let mut cursors = Vec::new();
+            while let Some((field, rest)) = fields.uncons() {
+                fields = rest;
+                if let Some(key) = field.key_str() {
+                    cursors.push((key.into_owned(), field.value_cursor));
+                }
+            }
+            for (index, (key, entry)) in entries.iter_mut().enumerate() {
+                if let Some((_, child)) = cursors.get(index).filter(|(name, _)| name == key) {
+                    respell_by_cursor(entry, child, depth + 1);
+                }
+            }
+        }
+        OwnedValue::Array(items) => {
+            let node = cursor.value();
+            let Some(mut elements) = node.as_array() else {
+                return;
+            };
+            let mut index = 0usize;
+            while let Some((element, rest)) = elements.uncons_cursor() {
+                elements = rest;
+                if let Some(item) = items.get_mut(index) {
+                    respell_by_cursor(item, &element, depth + 1);
+                }
+                index += 1;
+            }
+        }
+        _ => {}
+    }
+}
+
 /// `value` as [`respell_by_tree`] leaves it, for a result of the DOM route (#7204).
-pub(crate) fn respelled_by_tree(value: &OwnedValue, tree: &CommentTree) -> OwnedValue {
+pub(crate) fn respelled_by_tree(value: &OwnedValue, tree: &CommentTree) -> Option<OwnedValue> {
+    if tree.is_silent() {
+        return None;
+    }
     let mut respelled = value.clone();
     respell_by_tree(&mut respelled, tree, 0);
-    respelled
+    Some(respelled)
 }
 
 /// [`to_owned_with_cursor`] for the value an output format is about to encode: for an encoder that prints a
@@ -6414,10 +6483,10 @@ fn owned_for_format<V: DocumentValue, S: EvalSemantics>(
     value: &V,
     cursor: Option<V::Cursor>,
 ) -> Result<OwnedValue, EvalError> {
-    if let (FormatType::YqOutput(encoder), Some(_)) = (format_type, &cursor) {
+    if let (FormatType::YqOutput(encoder), Some(node)) = (format_type, &cursor) {
         if yq_encoder_reads_spelling(encoder) {
-            let (mut owned, tree) = to_owned_with_comments_pruned::<_, S>(value, cursor.as_ref())?;
-            respell_by_tree(&mut owned, &tree, 0);
+            let mut owned = to_owned_cursor::<S, _>(node)?;
+            respell_by_cursor(&mut owned, node, 0);
             return Ok(owned);
         }
     }
@@ -6531,13 +6600,10 @@ pub fn format_yq_encoder_from_tree<C: DocumentCursor>(
     pristine: &C,
 ) -> Result<String, EvalError> {
     let mut comments = encoder_comments_of_tree(value, tree, 0);
-    let respelled;
-    let value = if yq_encoder_reads_spelling(encoder) {
-        respelled = respelled_by_tree(value, tree);
-        &respelled
-    } else {
-        value
-    };
+    let respelled = yq_encoder_reads_spelling(encoder)
+        .then(|| respelled_by_tree(value, tree))
+        .flatten();
+    let value = respelled.as_ref().unwrap_or(value);
     let original = collect_encoder_comments(pristine, 0);
     // Only the XML and properties encoders read the line break a blank line leaves under a block.
     if matches!(
