@@ -12161,9 +12161,10 @@ fn path_stages<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
 /// folds them ([`object_from_pairs`]). The elements are the input's own (a refcount bump for a
 /// container); the bridge re-reads its serialization, so a number nested in one is a `NumberLiteral`
 /// there and an `Int` here: two spellings of one value that every printer renders alike, as for
-/// [`eval_owned_map_projection`]. The stage may be wrapped as every front door's is. jq mode only,
-/// and not under an embed table, as [`owned_path_each_optional`]: a node a binding tracks is
-/// answered by the bridge, which can name it.
+/// [`eval_owned_map_projection`]. The stage may be wrapped as every front door's is. jq mode only.
+/// Under an embed table only a construction that holds no container is answered (#7132): a node a
+/// binding tracks is answered by the bridge, which can name it, as for [`owned_path_each_optional`],
+/// and a scalar names none.
 pub(crate) fn eval_owned_construct<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
@@ -94371,7 +94372,16 @@ pub(crate) fn eval_owned_many_doors<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
 ) -> Option<Vec<OwnedValue>> {
-    // A one-stage pipe reads as its stage, as the value doors read it (#3673).
+    match owned_many_door_shape(expr) {
+        Some(shape) if S::TAG == EvalTag::Jq => eval_owned_many_doors_answer::<S>(shape, input),
+        _ => None,
+    }
+}
+
+/// The stage [`eval_owned_many_doors`] may answer, with parentheses off and a one-stage pipe read as
+/// its stage, as the value doors read it (#3673); `None` for every other shape.
+#[inline]
+fn owned_many_door_shape(expr: &Expr) -> Option<&Expr> {
     let shape = match unwrap_paren(expr) {
         Expr::Pipe(stages) => match skip_identity_stages(stages) {
             [only] => unwrap_paren(only),
@@ -94379,7 +94389,7 @@ pub(crate) fn eval_owned_many_doors<S: EvalSemantics>(
         },
         other => other,
     };
-    if !matches!(
+    matches!(
         shape,
         Expr::Comma(_)
             | Expr::FirstExpr(_)
@@ -94392,11 +94402,8 @@ pub(crate) fn eval_owned_many_doors<S: EvalSemantics>(
                     | Builtin::LastStream(_)
                     | Builtin::NthStream(..)
             )
-    ) || S::TAG != EvalTag::Jq
-    {
-        return None;
-    }
-    eval_owned_many_doors_answer::<S>(shape, input)
+    )
+    .then_some(shape)
 }
 
 /// [`eval_owned_many_doors`]' body, for a shape it has already tested.
@@ -94412,6 +94419,8 @@ fn eval_owned_many_doors_answer<S: EvalSemantics>(
             for branch in branches {
                 match eval_owned_many_doors::<S>(branch, input) {
                     Some(values) => out.extend(values),
+                    // A stream or comma branch that declined is declined by the other doors too.
+                    None if owned_many_door_shape(branch).is_some() => return None,
                     None => out.push(eval_owned_comma_branch::<S>(branch, input)?),
                 }
             }
@@ -94482,14 +94491,10 @@ fn eval_owned_comma_branch<S: EvalSemantics>(
     input: &OwnedValue,
 ) -> Option<OwnedValue> {
     // The operand grammar first: it is the cheap walk, and the branch a comma of reads most often
-    // has (`., . + 1`, `.a, .b`) is in it.
-    match eval_owned_pure_in::<S>(branch, input, ResultPosition::Operand, true) {
-        Some(Ok(answer)) => owned_door_answer_may_leave(answer),
-        Some(Err(_)) => None,
-        None => {
-            eval_owned_value_doors::<S>(branch, input).or_else(|| eval_owned_closed::<S>(branch))
-        }
-    }
+    // has (`., . + 1`, `.a, .b`) is in it. One rule for what may leave, the operand door's.
+    eval_owned_operand_answer::<S>(branch, input)
+        .or_else(|| eval_owned_value_doors::<S>(branch, input))
+        .or_else(|| eval_owned_closed::<S>(branch))
 }
 
 /// The values `.[]` or `.[]?` iterates over an owned input, in order, for
@@ -131938,10 +131943,6 @@ mod tests {
         }
     }
 
-    /// #7132: [`eval_each_owned_front_doors`] spells out the first seven value doors and then asks
-    /// [`eval_owned_value_doors_past_tree`] for the rest, so whatever [`eval_owned_value_doors`]
-    /// answers, the lazy twin answers too, with the same one value, in both modes. The pin for the two
-    /// spellings of one list: a door added to the shared list and not to the lazy one fails here.
     /// #7132: [`eval_owned_many_doors`] answers a comma and the stream builtins over `.[]` with the
     /// values the bridge does, in order, over every kind of value, or declines; yq mode, a count
     /// that is not an integer literal, `.[]` of a scalar and a branch nothing answers decline.
@@ -132033,6 +132034,10 @@ mod tests {
         );
     }
 
+    /// #7132: [`eval_each_owned_front_doors`] spells out the first seven value doors and then asks
+    /// [`eval_owned_value_doors_past_tree`] for the rest, so whatever [`eval_owned_value_doors`]
+    /// answers, the lazy twin answers too, with the same one value, in both modes. The pin for the two
+    /// spellings of one list: a door added to the shared list and not to the lazy one fails here.
     #[test]
     fn lazy_front_doors_answer_what_the_value_doors_answer_7132() {
         fn check<S: EvalSemantics>(expr: &Expr, value: &OwnedValue, src: &str) -> bool {
