@@ -1728,6 +1728,21 @@ pub struct YqCommand {
     )]
     pub yaml_compact_seq_indent: bool,
 
+    /// yq's `--yaml-fix-merge-anchor-to-spec`: read a `<<` by the YAML merge-key spec. An own key
+    /// beats a merged one wherever the `<<` is written, and of the sources of `<<: [*a, *b]` the
+    /// earlier-listed wins; without the flag yq (and so `succinctly yq`) lets the last write win
+    /// (#7025). Like every boolean flag of yq's it takes its value after `=` only.
+    #[arg(
+        long = "yaml-fix-merge-anchor-to-spec",
+        overrides_with = "yaml_fix_merge_anchor_to_spec",
+        value_parser = parse_go_bool,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value = "false"
+    )]
+    pub yaml_fix_merge_anchor_to_spec: bool,
+
     // === Diagnostics ===
     /// Accepted for yq's `-v`/`--verbose`; the debug log yq writes to stderr is not produced
     /// (#7025). Standard output is unchanged either way.

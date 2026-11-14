@@ -12596,6 +12596,8 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     HEADER_PREPROCESS.store(args.header_preprocess, std::sync::atomic::Ordering::Relaxed);
     // #7025: yq's `--string-interpolation` is a process-wide setting of its lexer.
     succinctly::jq::set_yq_string_interpolation(args.string_interpolation);
+    // #7025: yq's `--yaml-fix-merge-anchor-to-spec` is a process-wide setting of its traversal.
+    succinctly::yaml::set_merge_anchor_to_spec(args.yaml_fix_merge_anchor_to_spec);
 
     // `-j` is real yq's deprecated `--tojson` (#1731): cobra prints the warning while parsing
     // flags, so before everything else (`--version` included), and the alias is applied after
