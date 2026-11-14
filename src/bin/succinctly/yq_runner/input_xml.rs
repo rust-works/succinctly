@@ -19,6 +19,7 @@
 mod lexer;
 
 use lexer::{Decoder, LexerOptions, Token};
+use succinctly::jq::{XmlCommentEntry, XmlCommentMembers, XmlCommentNode};
 use succinctly::yaml::{
     go_yaml_dom_scalar, go_yaml_explicit_key_scalar, go_yaml_key_is_simple,
     go_yaml_multiline_scalar,
@@ -720,6 +721,49 @@ impl Writer {
 /// `raw` as the YAML text of the document yq decodes it to, or the message of the error yq reports
 /// (printed after `bad file '<name>': `).
 pub(super) fn transcode(raw: &[u8], options: &XmlOptions) -> Result<Vec<u8>, String> {
+    transcode_with_comments(raw, options).map(|(text, _)| text)
+}
+
+/// The comments `y` holds, as the XML encoder reads them off the decoder's nodes (#7212).
+fn comment_node(y: &Y) -> XmlCommentNode {
+    match y {
+        Y::Scalar {
+            head, line, foot, ..
+        } => XmlCommentNode {
+            head: head.clone(),
+            line: line.clone(),
+            foot: foot.clone(),
+            members: XmlCommentMembers::None,
+        },
+        Y::Seq { items, head, foot } => XmlCommentNode {
+            head: head.clone(),
+            line: String::new(),
+            foot: foot.clone(),
+            members: XmlCommentMembers::Seq(items.iter().map(comment_node).collect()),
+        },
+        Y::Map(entries) => XmlCommentNode {
+            members: XmlCommentMembers::Map(
+                entries
+                    .iter()
+                    .map(|e| XmlCommentEntry {
+                        key: e.key.clone(),
+                        head: e.head.clone(),
+                        line: e.line.clone(),
+                        foot: e.foot.clone(),
+                        value: comment_node(&e.value),
+                    })
+                    .collect(),
+            ),
+            ..XmlCommentNode::default()
+        },
+    }
+}
+
+/// [`transcode`], and the comments the decoder gave each node (#7212).
+pub(super) fn transcode_with_comments(
+    raw: &[u8],
+    options: &XmlOptions,
+) -> Result<(Vec<u8>, XmlCommentNode), String> {
     let (mut builder, root) = decode_xml(raw, options)?;
     let mut converter = Converter {
         b: &mut builder,
@@ -756,7 +800,7 @@ pub(super) fn transcode(raw: &[u8], options: &XmlOptions) -> Result<Vec<u8>, Str
         writer.out.push('\n');
         write_comment(&mut writer.out, &comment, "");
     }
-    Ok(writer.out.into_bytes())
+    Ok((writer.out.into_bytes(), comment_node(&document)))
 }
 
 #[cfg(test)]
