@@ -27234,9 +27234,10 @@ pub fn yq_encoder_writes_comments(encoder: &YqOutputEncoder) -> bool {
     )
 }
 
-/// Whether yq's encoder for `-o=<format>` prints a scalar node's own text, so that a null written as nothing,
-/// `~` or `Null` and a boolean written `True` come out as written: `-o props`, `-o shell`, `-o ini` and
-/// `-o xml` (#7204). The other encoders write a null and a boolean in one spelling.
+/// Whether yq's encoder for `-o=<format>` prints a scalar node's own text (#7204).
+///
+/// A null written as nothing, `~` or `Null` and a boolean written `True` then come out as written: `-o props`,
+/// `-o shell`, `-o ini` and `-o xml`. The other encoders write a null and a boolean in one spelling.
 pub fn yq_encoder_reads_spelling(encoder: &YqOutputEncoder) -> bool {
     matches!(
         encoder,
