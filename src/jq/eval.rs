@@ -27234,6 +27234,20 @@ pub fn yq_encoder_writes_comments(encoder: &YqOutputEncoder) -> bool {
     )
 }
 
+/// Whether yq's encoder for `-o=<format>` prints a scalar node's own text (#7204).
+///
+/// A null written as nothing, `~` or `Null` and a boolean written `True` then come out as written: `-o props`,
+/// `-o shell`, `-o ini` and `-o xml`. The other encoders write a null and a boolean in one spelling.
+pub fn yq_encoder_reads_spelling(encoder: &YqOutputEncoder) -> bool {
+    matches!(
+        encoder,
+        YqOutputEncoder::Xml(_)
+            | YqOutputEncoder::Props { .. }
+            | YqOutputEncoder::Shell(..)
+            | YqOutputEncoder::Ini
+    )
+}
+
 /// Whether yq's encoder for `-o=<format>` prints the first document's leading block itself (#7117, #7158).
 ///
 /// That block is the comments and blank lines before the document, and a `---`: `format_yq_commented` is

@@ -96,7 +96,7 @@ use super::eval::{
 };
 use super::eval::{
     format_yq_commented, format_yq_props_commented, yq_encoder_prints_leading_block,
-    yq_encoder_writes_comments, yq_props_format_style,
+    yq_encoder_reads_spelling, yq_encoder_writes_comments, yq_props_format_style,
 };
 use super::eval::{owned_slot_mut, static_path_steps, StepKey};
 #[cfg(test)]
@@ -6372,6 +6372,124 @@ fn tree_comment_block(lines: &[String]) -> String {
     lines.join("\n")
 }
 
+/// Whether `spelling` is a way of writing `value`, a null or a boolean: nothing, `~` or a case of `null`, and
+/// a case of `true` or `false`. A tree a write left a stale spelling in prints the value it holds (#7204).
+fn spelling_names_leaf(spelling: &str, value: &OwnedValue) -> bool {
+    match value {
+        OwnedValue::Bool(b) => spelling.eq_ignore_ascii_case(if *b { "true" } else { "false" }),
+        other => {
+            matches!(other, OwnedValue::Null)
+                && matches!(spelling, "" | "~" | "null" | "Null" | "NULL")
+        }
+    }
+}
+
+/// Give each null and boolean leaf of `value` the text it was written with, where the node it came from
+/// kept one (`push:` with no value, `~`, `Null`, `True`): a string of that text, which the encoders that
+/// print a node's own text (`-o props`, `-o shell`, `-o ini`, `-o xml`) write as it is (#7204). `tree` is
+/// the presentation tree that goes with `value`; a leaf it holds nothing for stays as it is.
+fn respell_by_tree(value: &mut OwnedValue, tree: &CommentTree, depth: usize) {
+    super::value::assert_value_tree_depth(depth);
+    if tree.is_silent() {
+        return;
+    }
+    match value {
+        OwnedValue::Null | OwnedValue::Bool(_) => {
+            if let Some(spelling) = tree
+                .meta()
+                .spelling()
+                .filter(|s| spelling_names_leaf(s, value))
+            {
+                *value = OwnedValue::String(spelling.into());
+            }
+        }
+        OwnedValue::Object(entries) => {
+            for (key, entry) in entries.iter_mut() {
+                respell_by_tree(entry, tree.field(key), depth + 1);
+            }
+        }
+        OwnedValue::Array(items) => {
+            for (index, item) in items.iter_mut().enumerate() {
+                respell_by_tree(item, tree.at_index(index), depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// [`respell_by_tree`] for a result that is still a node of the document: the spelling is read off the cursor,
+/// with no tree built. A mapping's entries are paired with the cursor's by position and key, as
+/// [`EncoderComments::entry`] pairs them, so an entry the owned value reordered or renamed keeps no spelling.
+fn respell_by_cursor<C: DocumentCursor>(value: &mut OwnedValue, cursor: &C, depth: usize) {
+    super::value::assert_value_tree_depth(depth);
+    match value {
+        OwnedValue::Null | OwnedValue::Bool(_) => {
+            // An alias is spelled as its anchor's node is.
+            let target = cursor.alias_target_cursor();
+            let cursor = target.as_ref().unwrap_or(cursor);
+            if let Some(spelling) = source_spelling(cursor, &cursor.value(), value)
+                .filter(|spelling| spelling_names_leaf(spelling, value))
+            {
+                *value = OwnedValue::String(spelling.into());
+            }
+        }
+        OwnedValue::Object(entries) => {
+            let mut cursors = Vec::new();
+            let mut fields = cursor.value().as_object();
+            while let Some((field, rest)) = fields.and_then(|f| f.uncons()) {
+                fields = Some(rest);
+                if let Some(key) = field.key_str() {
+                    cursors.push((key.into_owned(), field.value_cursor));
+                }
+            }
+            for (index, (key, entry)) in entries.iter_mut().enumerate() {
+                if let Some((_, child)) = cursors.get(index).filter(|(name, _)| name == key) {
+                    respell_by_cursor(entry, child, depth + 1);
+                }
+            }
+        }
+        OwnedValue::Array(items) => {
+            let mut index = 0usize;
+            let mut elements = cursor.value().as_array();
+            while let Some((element, rest)) = elements.and_then(|e| e.uncons_cursor()) {
+                elements = Some(rest);
+                if let Some(item) = items.get_mut(index) {
+                    respell_by_cursor(item, &element, depth + 1);
+                }
+                index += 1;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `value` as [`respell_by_tree`] leaves it, for a result of the DOM route (#7204).
+pub(crate) fn respelled_by_tree(value: &OwnedValue, tree: &CommentTree) -> Option<OwnedValue> {
+    if tree.is_silent() {
+        return None;
+    }
+    let mut respelled = value.clone();
+    respell_by_tree(&mut respelled, tree, 0);
+    Some(respelled)
+}
+
+/// [`to_owned_with_cursor`] for the value an output format is about to encode: for an encoder that prints a
+/// node's own text, the spelling the nodes were written with (#7204).
+fn owned_for_format<V: DocumentValue, S: EvalSemantics>(
+    format_type: &FormatType,
+    value: &V,
+    cursor: Option<V::Cursor>,
+) -> Result<OwnedValue, EvalError> {
+    if let (FormatType::YqOutput(encoder), Some(node)) = (format_type, &cursor) {
+        if yq_encoder_reads_spelling(encoder) {
+            let mut owned = to_owned_cursor::<S, _>(node)?;
+            respell_by_cursor(&mut owned, node, 0);
+            return Ok(owned);
+        }
+    }
+    to_owned_with_cursor::<_, S>(value, cursor)
+}
+
 /// [`collect_encoder_comments`] for a result the DOM route holds (a write, a built value): the comments of
 /// `tree`, the presentation tree that goes with `value`, in the shape of the value (#7156). A mapping
 /// entry's head and foot lines are its key's, its trailing comment the value's and the comment on a
@@ -6479,6 +6597,10 @@ pub fn format_yq_encoder_from_tree<C: DocumentCursor>(
     pristine: &C,
 ) -> Result<String, EvalError> {
     let mut comments = encoder_comments_of_tree(value, tree, 0);
+    let respelled = yq_encoder_reads_spelling(encoder)
+        .then(|| respelled_by_tree(value, tree))
+        .flatten();
+    let value = respelled.as_ref().unwrap_or(value);
     let original = collect_encoder_comments(pristine, 0);
     let first_key = super::encoder_comments::first_entry_key(&original).map(str::to_owned);
     // Only the XML and properties encoders read the line break a blank line leaves under a block.
@@ -16842,7 +16964,10 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 && cursor.is_some_and(|c| c.document_has_comments())
                 && yq_props_format_style(format_type).is_some() =>
         {
-            let owned = owned_or_suppress!(to_owned_with_cursor::<_, S>(&value, cursor), optional);
+            let owned = owned_or_suppress!(
+                owned_for_format::<_, S>(format_type, &value, cursor),
+                optional
+            );
             let mut comments = alloc::collections::BTreeMap::new();
             let style = yq_props_format_style(format_type).unwrap_or_default();
             // The guard holds a cursor.
@@ -16862,7 +16987,10 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 && yq_encoder_writes_comments(encoder)
                 && cursor.is_some_and(|c| c.document_has_comments()) =>
         {
-            let owned = owned_or_suppress!(to_owned_with_cursor::<_, S>(&value, cursor), optional);
+            let owned = owned_or_suppress!(
+                owned_for_format::<_, S>(&FormatType::YqOutput(encoder.clone()), &value, cursor),
+                optional
+            );
             // The guard holds a cursor.
             let (comments, leading) = cursor.as_ref().map_or_else(
                 || (EncoderComments::default(), String::new()),
@@ -16904,7 +17032,10 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         }
         Expr::Format(format_type) => format_result::<S, _>(
             format_type,
-            &owned_or_suppress!(to_owned_with_cursor::<_, S>(&value, cursor), optional),
+            &owned_or_suppress!(
+                owned_for_format::<_, S>(format_type, &value, cursor),
+                optional
+            ),
             optional,
         ),
 

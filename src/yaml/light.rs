@@ -9260,6 +9260,14 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
         YamlCursor::is_alias(self)
     }
 
+    fn alias_target_cursor(&self) -> Option<Self> {
+        if YamlCursor::is_alias(self) {
+            self.resolve_alias_target_cursor()
+        } else {
+            None
+        }
+    }
+
     #[inline]
     fn is_document_content(&self) -> bool {
         YamlCursor::is_document_content(self)

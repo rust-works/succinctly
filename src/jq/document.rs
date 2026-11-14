@@ -871,6 +871,13 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         false
     }
 
+    /// The node this alias stands for, with a chain of aliases followed to its end, or `None` for a node that
+    /// is no alias and for a dangling one (#7204). A leaf read through an alias is spelled as its anchor's node
+    /// is, which is what yq's encoders print for it.
+    fn alias_target_cursor(&self) -> Option<Self> {
+        None
+    }
+
     /// Whether this cursor stands on a document's own content node -- a
     /// direct child of the document stream, the node the parser keys a
     /// document's own head/foot comments on (#2795 PR B).

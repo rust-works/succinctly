@@ -1,0 +1,286 @@
+//! #7204: `succinctly yq -o props|shell|ini|xml` print a null and a boolean as the node was written, as yq's
+//! encoders print a scalar node's own text: a null written as nothing (`push:`), `~`, `Null` or `NULL`, and a
+//! boolean written `True`, `TRUE`, `False` or `FALSE`. A result that came off a cursor (a read) takes the
+//! spelling from it, and one of the DOM route (a write) from its presentation tree. Every row was captured
+//! from yq v4.53.3 (stdout; the exit status is 0 in all) over four inputs (a spelling matrix, a workflow, a
+//! document with comments, and a quoted `"~"` / `'True'` that stay strings; then an alias, a merge key, a
+//! sequence and a complex key) and ten filters (a read, a
+//! navigation, a write, a delete, a merge, a sort), and kept only where both tools agree.
+
+use anyhow::Result;
+
+use crate::run_yq_stdin_with_stderr;
+
+/// (output format, filter, input, yq's stdout).
+type Row = (&'static str, &'static str, &'static str, &'static str);
+
+#[rustfmt::skip]
+const ROWS: &[Row] = &[
+    ("props", ".", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "a = \nb = ~\nc = null\nd = Null\ne = NULL\nf = True\ng.x = \nh.0 = \nh.1 = 1\n"),
+    ("props", ".d", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "Null\n"),
+    ("props", ".zz = 1", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "a = \nb = ~\nc = null\nd = Null\ne = NULL\nf = True\ng.x = \nh.0 = \nh.1 = 1\nzz = 1\n"),
+    ("props", ".a = 5", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "a = 5\nb = ~\nc = null\nd = Null\ne = NULL\nf = True\ng.x = \nh.0 = \nh.1 = 1\n"),
+    ("props", "del(.c)", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "a = \nb = ~\nd = Null\ne = NULL\nf = True\ng.x = \nh.0 = \nh.1 = 1\n"),
+    ("props", ".c[]", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", ""),
+    ("props", ". * {\"q\": 1}", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "a = \nb = ~\nc = null\nd = Null\ne = NULL\nf = True\ng.x = \nh.0 = \nh.1 = 1\nq = 1\n"),
+    ("props", "sort_keys(.)", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "a = \nb = ~\nc = null\nd = Null\ne = NULL\nf = True\ng.x = \nh.0 = \nh.1 = 1\n"),
+    ("props", ".b = .a", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "a = \nb = \nc = null\nd = Null\ne = NULL\nf = True\ng.x = \nh.0 = \nh.1 = 1\n"),
+    ("props", ".a |= .", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "a = \nb = ~\nc = null\nd = Null\ne = NULL\nf = True\ng.x = \nh.0 = \nh.1 = 1\n"),
+    ("props", ".", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "on.push = \non.pull_request.branches.0 = main\n"),
+    ("props", ".d", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "null\n"),
+    ("props", ".zz = 1", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "on.push = \non.pull_request.branches.0 = main\nzz = 1\n"),
+    ("props", ".a = 5", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "on.push = \non.pull_request.branches.0 = main\na = 5\n"),
+    ("props", "del(.c)", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "on.push = \non.pull_request.branches.0 = main\n"),
+    ("props", ".c[]", "on:\n  push:\n  pull_request:\n    branches: [main]\n", ""),
+    ("props", ". * {\"q\": 1}", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "on.push = \non.pull_request.branches.0 = main\nq = 1\n"),
+    ("props", "sort_keys(.)", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "on.push = \non.pull_request.branches.0 = main\n"),
+    ("props", ".b = .a", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "on.push = \non.pull_request.branches.0 = main\nb = null\n"),
+    ("props", ".a |= .", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "on.push = \non.pull_request.branches.0 = main\na = null\n"),
+    ("props", ".", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "# head\n# line\na = \n\n# tilde\nb = ~\nc.0 = Null\nc.1 = True\nc.2 = False\nc.3 = TRUE\nd.e = NULL\nd.f = ~\nd.g = True\n"),
+    ("props", ".d", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "e = NULL\nf = ~\ng = True\n"),
+    ("props", ".zz = 1", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "# head\n# line\na = \n\n# tilde\nb = ~\nc.0 = Null\nc.1 = True\nc.2 = False\nc.3 = TRUE\nd.e = NULL\nd.f = ~\nd.g = True\nzz = 1\n"),
+    ("props", ".a = 5", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "# head\n# line\na = 5\n\n# tilde\nb = ~\nc.0 = Null\nc.1 = True\nc.2 = False\nc.3 = TRUE\nd.e = NULL\nd.f = ~\nd.g = True\n"),
+    ("props", "del(.c)", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "# head\n# line\na = \n\n# tilde\nb = ~\nd.e = NULL\nd.f = ~\nd.g = True\n"),
+    ("props", ".c[]", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "Null\nTrue\nFalse\nTRUE\n"),
+    ("props", ". * {\"q\": 1}", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "# head\n# line\na = \n\n# tilde\nb = ~\nc.0 = Null\nc.1 = True\nc.2 = False\nc.3 = TRUE\nd.e = NULL\nd.f = ~\nd.g = True\nq = 1\n"),
+    ("props", "sort_keys(.)", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "# head\n# line\na = \n\n# tilde\nb = ~\nc.0 = Null\nc.1 = True\nc.2 = False\nc.3 = TRUE\nd.e = NULL\nd.f = ~\nd.g = True\n"),
+    ("props", ".b = .a", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "# head\n# line\na = \n\n# tilde\nb = \nc.0 = Null\nc.1 = True\nc.2 = False\nc.3 = TRUE\nd.e = NULL\nd.f = ~\nd.g = True\n"),
+    ("props", ".a |= .", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "# head\n# line\na = \n\n# tilde\nb = ~\nc.0 = Null\nc.1 = True\nc.2 = False\nc.3 = TRUE\nd.e = NULL\nd.f = ~\nd.g = True\n"),
+    ("props", ".", "x: [~, null, null]\n", "x.0 = ~\nx.1 = null\nx.2 = null\n"),
+    ("props", ".d", "x: [~, null, null]\n", "null\n"),
+    ("props", ".zz = 1", "x: [~, null, null]\n", "x.0 = ~\nx.1 = null\nx.2 = null\nzz = 1\n"),
+    ("props", ".a = 5", "x: [~, null, null]\n", "x.0 = ~\nx.1 = null\nx.2 = null\na = 5\n"),
+    ("props", "del(.c)", "x: [~, null, null]\n", "x.0 = ~\nx.1 = null\nx.2 = null\n"),
+    ("props", ".c[]", "x: [~, null, null]\n", ""),
+    ("props", ". * {\"q\": 1}", "x: [~, null, null]\n", "x.0 = ~\nx.1 = null\nx.2 = null\nq = 1\n"),
+    ("props", "sort_keys(.)", "x: [~, null, null]\n", "x.0 = ~\nx.1 = null\nx.2 = null\n"),
+    ("props", ".b = .a", "x: [~, null, null]\n", "x.0 = ~\nx.1 = null\nx.2 = null\nb = null\n"),
+    ("props", ".a |= .", "x: [~, null, null]\n", "x.0 = ~\nx.1 = null\nx.2 = null\na = null\n"),
+    ("shell", ".", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "a=\nb='~'\nc=null\nd=Null\ne=NULL\nf=True\ng_x=\nh_0=\nh_1=1\n"),
+    ("shell", ".d", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "value=Null\n"),
+    ("shell", ".zz = 1", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "a=\nb='~'\nc=null\nd=Null\ne=NULL\nf=True\ng_x=\nh_0=\nh_1=1\nzz=1\n"),
+    ("shell", ".a = 5", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "a=5\nb='~'\nc=null\nd=Null\ne=NULL\nf=True\ng_x=\nh_0=\nh_1=1\n"),
+    ("shell", "del(.c)", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "a=\nb='~'\nd=Null\ne=NULL\nf=True\ng_x=\nh_0=\nh_1=1\n"),
+    ("shell", ".c[]", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", ""),
+    ("shell", ". * {\"q\": 1}", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "a=\nb='~'\nc=null\nd=Null\ne=NULL\nf=True\ng_x=\nh_0=\nh_1=1\nq=1\n"),
+    ("shell", "sort_keys(.)", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "a=\nb='~'\nc=null\nd=Null\ne=NULL\nf=True\ng_x=\nh_0=\nh_1=1\n"),
+    ("shell", ".b = .a", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "a=\nb=\nc=null\nd=Null\ne=NULL\nf=True\ng_x=\nh_0=\nh_1=1\n"),
+    ("shell", ".a |= .", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "a=\nb='~'\nc=null\nd=Null\ne=NULL\nf=True\ng_x=\nh_0=\nh_1=1\n"),
+    ("shell", ".", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "on_push=\non_pull_request_branches_0=main\n"),
+    ("shell", ".d", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "value=null\n"),
+    ("shell", ".zz = 1", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "on_push=\non_pull_request_branches_0=main\nzz=1\n"),
+    ("shell", ".a = 5", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "on_push=\non_pull_request_branches_0=main\na=5\n"),
+    ("shell", "del(.c)", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "on_push=\non_pull_request_branches_0=main\n"),
+    ("shell", ".c[]", "on:\n  push:\n  pull_request:\n    branches: [main]\n", ""),
+    ("shell", ". * {\"q\": 1}", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "on_push=\non_pull_request_branches_0=main\nq=1\n"),
+    ("shell", "sort_keys(.)", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "on_push=\non_pull_request_branches_0=main\n"),
+    ("shell", ".b = .a", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "on_push=\non_pull_request_branches_0=main\nb=null\n"),
+    ("shell", ".a |= .", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "on_push=\non_pull_request_branches_0=main\na=null\n"),
+    ("shell", ".", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "a=\nb='~'\nc_0=Null\nc_1=True\nc_2=False\nc_3=TRUE\nd_e=NULL\nd_f='~'\nd_g=True\n"),
+    ("shell", ".d", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "e=NULL\nf='~'\ng=True\n"),
+    ("shell", ".zz = 1", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "a=\nb='~'\nc_0=Null\nc_1=True\nc_2=False\nc_3=TRUE\nd_e=NULL\nd_f='~'\nd_g=True\nzz=1\n"),
+    ("shell", ".a = 5", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "a=5\nb='~'\nc_0=Null\nc_1=True\nc_2=False\nc_3=TRUE\nd_e=NULL\nd_f='~'\nd_g=True\n"),
+    ("shell", "del(.c)", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "a=\nb='~'\nd_e=NULL\nd_f='~'\nd_g=True\n"),
+    ("shell", ".c[]", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "value=Null\nvalue=True\nvalue=False\nvalue=TRUE\n"),
+    ("shell", ". * {\"q\": 1}", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "a=\nb='~'\nc_0=Null\nc_1=True\nc_2=False\nc_3=TRUE\nd_e=NULL\nd_f='~'\nd_g=True\nq=1\n"),
+    ("shell", "sort_keys(.)", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "a=\nb='~'\nc_0=Null\nc_1=True\nc_2=False\nc_3=TRUE\nd_e=NULL\nd_f='~'\nd_g=True\n"),
+    ("shell", ".b = .a", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "a=\nb=\nc_0=Null\nc_1=True\nc_2=False\nc_3=TRUE\nd_e=NULL\nd_f='~'\nd_g=True\n"),
+    ("shell", ".a |= .", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "a=\nb='~'\nc_0=Null\nc_1=True\nc_2=False\nc_3=TRUE\nd_e=NULL\nd_f='~'\nd_g=True\n"),
+    ("shell", ".", "x: [~, null, null]\n", "x_0='~'\nx_1=null\nx_2=null\n"),
+    ("shell", ".d", "x: [~, null, null]\n", "value=null\n"),
+    ("shell", ".zz = 1", "x: [~, null, null]\n", "x_0='~'\nx_1=null\nx_2=null\nzz=1\n"),
+    ("shell", ".a = 5", "x: [~, null, null]\n", "x_0='~'\nx_1=null\nx_2=null\na=5\n"),
+    ("shell", "del(.c)", "x: [~, null, null]\n", "x_0='~'\nx_1=null\nx_2=null\n"),
+    ("shell", ".c[]", "x: [~, null, null]\n", ""),
+    ("shell", ". * {\"q\": 1}", "x: [~, null, null]\n", "x_0='~'\nx_1=null\nx_2=null\nq=1\n"),
+    ("shell", "sort_keys(.)", "x: [~, null, null]\n", "x_0='~'\nx_1=null\nx_2=null\n"),
+    ("shell", ".b = .a", "x: [~, null, null]\n", "x_0='~'\nx_1=null\nx_2=null\nb=null\n"),
+    ("shell", ".a |= .", "x: [~, null, null]\n", "x_0='~'\nx_1=null\nx_2=null\na=null\n"),
+    ("ini", ".", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "a = \nb = ~\nc = null\nd = Null\ne = NULL\nf = True\n\n[g]\nx = \n"),
+    ("ini", ".d", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "Null\n"),
+    ("ini", ".zz = 1", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "a  = \nb  = ~\nc  = null\nd  = Null\ne  = NULL\nf  = True\nzz = 1\n\n[g]\nx = \n"),
+    ("ini", ".a = 5", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "a = 5\nb = ~\nc = null\nd = Null\ne = NULL\nf = True\n\n[g]\nx = \n"),
+    ("ini", "del(.c)", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "a = \nb = ~\nd = Null\ne = NULL\nf = True\n\n[g]\nx = \n"),
+    ("ini", ".c[]", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", ""),
+    ("ini", ". * {\"q\": 1}", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "a = \nb = ~\nc = null\nd = Null\ne = NULL\nf = True\nq = 1\n\n[g]\nx = \n"),
+    ("ini", "sort_keys(.)", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "a = \nb = ~\nc = null\nd = Null\ne = NULL\nf = True\n\n[g]\nx = \n"),
+    ("ini", ".b = .a", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "a = \nb = \nc = null\nd = Null\ne = NULL\nf = True\n\n[g]\nx = \n"),
+    ("ini", ".a |= .", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "a = \nb = ~\nc = null\nd = Null\ne = NULL\nf = True\n\n[g]\nx = \n"),
+    ("ini", ".", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "[on]\npush = \n"),
+    ("ini", ".d", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "null\n"),
+    ("ini", ".zz = 1", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "zz = 1\n\n[on]\npush = \n"),
+    ("ini", ".a = 5", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "a = 5\n\n[on]\npush = \n"),
+    ("ini", "del(.c)", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "[on]\npush = \n"),
+    ("ini", ".c[]", "on:\n  push:\n  pull_request:\n    branches: [main]\n", ""),
+    ("ini", ". * {\"q\": 1}", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "q = 1\n\n[on]\npush = \n"),
+    ("ini", "sort_keys(.)", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "[on]\npush = \n"),
+    ("ini", ".b = .a", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "b = null\n\n[on]\npush = \n"),
+    ("ini", ".a |= .", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "a = null\n\n[on]\npush = \n"),
+    ("ini", ".", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "a = \nb = ~\n\n[d]\ne = NULL\nf = ~\ng = True\n"),
+    ("ini", ".d", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "e = NULL\nf = ~\ng = True\n"),
+    ("ini", ".zz = 1", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "a  = \nb  = ~\nzz = 1\n\n[d]\ne = NULL\nf = ~\ng = True\n"),
+    ("ini", ".a = 5", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "a = 5\nb = ~\n\n[d]\ne = NULL\nf = ~\ng = True\n"),
+    ("ini", "del(.c)", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "a = \nb = ~\n\n[d]\ne = NULL\nf = ~\ng = True\n"),
+    ("ini", ".c[]", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "Null\nTrue\nFalse\nTRUE\n"),
+    ("ini", ". * {\"q\": 1}", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "a = \nb = ~\nq = 1\n\n[d]\ne = NULL\nf = ~\ng = True\n"),
+    ("ini", "sort_keys(.)", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "a = \nb = ~\n\n[d]\ne = NULL\nf = ~\ng = True\n"),
+    ("ini", ".b = .a", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "a = \nb = \n\n[d]\ne = NULL\nf = ~\ng = True\n"),
+    ("ini", ".a |= .", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "a = \nb = ~\n\n[d]\ne = NULL\nf = ~\ng = True\n"),
+    ("ini", ".", "x: [~, null, null]\n", ""),
+    ("ini", ".d", "x: [~, null, null]\n", "null\n"),
+    ("ini", ".zz = 1", "x: [~, null, null]\n", "zz = 1\n"),
+    ("ini", ".a = 5", "x: [~, null, null]\n", "a = 5\n"),
+    ("ini", "del(.c)", "x: [~, null, null]\n", ""),
+    ("ini", ".c[]", "x: [~, null, null]\n", ""),
+    ("ini", ". * {\"q\": 1}", "x: [~, null, null]\n", "q = 1\n"),
+    ("ini", "sort_keys(.)", "x: [~, null, null]\n", ""),
+    ("ini", ".b = .a", "x: [~, null, null]\n", "b = null\n"),
+    ("ini", ".a |= .", "x: [~, null, null]\n", "a = null\n"),
+    ("xml", ".", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "<a></a>\n<b>~</b>\n<c>null</c>\n<d>Null</d>\n<e>NULL</e>\n<f>True</f>\n<g>\n  <x></x>\n</g>\n<h></h>\n<h>1</h>\n"),
+    ("xml", ".d", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "Null"),
+    ("xml", ".zz = 1", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "<a></a>\n<b>~</b>\n<c>null</c>\n<d>Null</d>\n<e>NULL</e>\n<f>True</f>\n<g>\n  <x></x>\n</g>\n<h></h>\n<h>1</h>\n<zz>1</zz>\n"),
+    ("xml", ".a = 5", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "<a>5</a>\n<b>~</b>\n<c>null</c>\n<d>Null</d>\n<e>NULL</e>\n<f>True</f>\n<g>\n  <x></x>\n</g>\n<h></h>\n<h>1</h>\n"),
+    ("xml", "del(.c)", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "<a></a>\n<b>~</b>\n<d>Null</d>\n<e>NULL</e>\n<f>True</f>\n<g>\n  <x></x>\n</g>\n<h></h>\n<h>1</h>\n"),
+    ("xml", ".c[]", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", ""),
+    ("xml", ". * {\"q\": 1}", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "<a></a>\n<b>~</b>\n<c>null</c>\n<d>Null</d>\n<e>NULL</e>\n<f>True</f>\n<g>\n  <x></x>\n</g>\n<h></h>\n<h>1</h>\n<q>1</q>\n"),
+    ("xml", "sort_keys(.)", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "<a></a>\n<b>~</b>\n<c>null</c>\n<d>Null</d>\n<e>NULL</e>\n<f>True</f>\n<g>\n  <x></x>\n</g>\n<h></h>\n<h>1</h>\n"),
+    ("xml", ".b = .a", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "<a></a>\n<b></b>\n<c>null</c>\n<d>Null</d>\n<e>NULL</e>\n<f>True</f>\n<g>\n  <x></x>\n</g>\n<h></h>\n<h>1</h>\n"),
+    ("xml", ".a |= .", "a:\nb: ~\nc: null\nd: Null\ne: NULL\nf: True\ng: {x: }\nh:\n  - \n  - 1\n", "<a></a>\n<b>~</b>\n<c>null</c>\n<d>Null</d>\n<e>NULL</e>\n<f>True</f>\n<g>\n  <x></x>\n</g>\n<h></h>\n<h>1</h>\n"),
+    ("xml", ".", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "<on>\n  <push></push>\n  <pull_request>\n    <branches>main</branches>\n  </pull_request>\n</on>\n"),
+    ("xml", ".d", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "null"),
+    ("xml", ".zz = 1", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "<on>\n  <push></push>\n  <pull_request>\n    <branches>main</branches>\n  </pull_request>\n</on>\n<zz>1</zz>\n"),
+    ("xml", ".a = 5", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "<on>\n  <push></push>\n  <pull_request>\n    <branches>main</branches>\n  </pull_request>\n</on>\n<a>5</a>\n"),
+    ("xml", "del(.c)", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "<on>\n  <push></push>\n  <pull_request>\n    <branches>main</branches>\n  </pull_request>\n</on>\n"),
+    ("xml", ".c[]", "on:\n  push:\n  pull_request:\n    branches: [main]\n", ""),
+    ("xml", ". * {\"q\": 1}", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "<on>\n  <push></push>\n  <pull_request>\n    <branches>main</branches>\n  </pull_request>\n</on>\n<q>1</q>\n"),
+    ("xml", "sort_keys(.)", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "<on>\n  <push></push>\n  <pull_request>\n    <branches>main</branches>\n  </pull_request>\n</on>\n"),
+    ("xml", ".b = .a", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "<on>\n  <push></push>\n  <pull_request>\n    <branches>main</branches>\n  </pull_request>\n</on>\n<b>null</b>\n"),
+    ("xml", ".a |= .", "on:\n  push:\n  pull_request:\n    branches: [main]\n", "<on>\n  <push></push>\n  <pull_request>\n    <branches>main</branches>\n  </pull_request>\n</on>\n<a>null</a>\n"),
+    ("xml", ".", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "<!-- head -->\n<!-- line -->\n<a></a>\n<b>~<!-- tilde --></b>\n<c>Null</c>\n<c>True</c>\n<c>False</c>\n<c>TRUE</c>\n<d>\n  <e>NULL</e>\n  <f>~</f>\n  <g>True</g>\n</d>\n"),
+    ("xml", ".d", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "<e>NULL</e>\n<f>~</f>\n<g>True</g>\n"),
+    ("xml", ".zz = 1", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "<!-- head -->\n<!-- line -->\n<a></a>\n<b>~<!-- tilde --></b>\n<c>Null</c>\n<c>True</c>\n<c>False</c>\n<c>TRUE</c>\n<d>\n  <e>NULL</e>\n  <f>~</f>\n  <g>True</g>\n</d>\n<zz>1</zz>\n"),
+    ("xml", ".a = 5", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "<!-- head -->\n<!-- line -->\n<a>5</a>\n<b>~<!-- tilde --></b>\n<c>Null</c>\n<c>True</c>\n<c>False</c>\n<c>TRUE</c>\n<d>\n  <e>NULL</e>\n  <f>~</f>\n  <g>True</g>\n</d>\n"),
+    ("xml", "del(.c)", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "<!-- head -->\n<!-- line -->\n<a></a>\n<b>~<!-- tilde --></b>\n<d>\n  <e>NULL</e>\n  <f>~</f>\n  <g>True</g>\n</d>\n"),
+    ("xml", ".c[]", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "NullTrueFalseTRUE"),
+    ("xml", ". * {\"q\": 1}", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "<!-- head -->\n<!-- line -->\n<a></a>\n<b>~<!-- tilde --></b>\n<c>Null</c>\n<c>True</c>\n<c>False</c>\n<c>TRUE</c>\n<d>\n  <e>NULL</e>\n  <f>~</f>\n  <g>True</g>\n</d>\n<q>1</q>\n"),
+    ("xml", "sort_keys(.)", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "<!-- head -->\n<!-- line -->\n<a></a>\n<b>~<!-- tilde --></b>\n<c>Null</c>\n<c>True</c>\n<c>False</c>\n<c>TRUE</c>\n<d>\n  <e>NULL</e>\n  <f>~</f>\n  <g>True</g>\n</d>\n"),
+    ("xml", ".b = .a", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "<!-- head -->\n<!-- line -->\n<a></a>\n<b><!-- tilde --></b>\n<c>Null</c>\n<c>True</c>\n<c>False</c>\n<c>TRUE</c>\n<d>\n  <e>NULL</e>\n  <f>~</f>\n  <g>True</g>\n</d>\n"),
+    ("xml", ".a |= .", "# head\na:   # line\nb: ~ # tilde\nc: [Null, True, False, TRUE]\nd:\n  e: NULL\n  f: \"~\"\n  g: 'True'\n", "<!-- head -->\n<!-- line -->\n<a></a>\n<b>~<!-- tilde --></b>\n<c>Null</c>\n<c>True</c>\n<c>False</c>\n<c>TRUE</c>\n<d>\n  <e>NULL</e>\n  <f>~</f>\n  <g>True</g>\n</d>\n"),
+    ("xml", ".", "x: [~, null, null]\n", "<x>~</x>\n<x>null</x>\n<x>null</x>\n"),
+    ("xml", ".d", "x: [~, null, null]\n", "null"),
+    ("xml", ".zz = 1", "x: [~, null, null]\n", "<x>~</x>\n<x>null</x>\n<x>null</x>\n<zz>1</zz>\n"),
+    ("xml", ".a = 5", "x: [~, null, null]\n", "<x>~</x>\n<x>null</x>\n<x>null</x>\n<a>5</a>\n"),
+    ("xml", "del(.c)", "x: [~, null, null]\n", "<x>~</x>\n<x>null</x>\n<x>null</x>\n"),
+    ("xml", ".c[]", "x: [~, null, null]\n", ""),
+    ("xml", ". * {\"q\": 1}", "x: [~, null, null]\n", "<x>~</x>\n<x>null</x>\n<x>null</x>\n<q>1</q>\n"),
+    ("xml", "sort_keys(.)", "x: [~, null, null]\n", "<x>~</x>\n<x>null</x>\n<x>null</x>\n"),
+    ("xml", ".b = .a", "x: [~, null, null]\n", "<x>~</x>\n<x>null</x>\n<x>null</x>\n<b>null</b>\n"),
+    ("xml", ".a |= .", "x: [~, null, null]\n", "<x>~</x>\n<x>null</x>\n<x>null</x>\n<a>null</a>\n"),
+    ("props", ".", "a: &x ~\nb: *x\nc: &y True\nd: *y\n", "a = ~\nb = ~\nc = True\nd = True\n"),
+    ("props", ".m", "a: &x ~\nb: *x\nc: &y True\nd: *y\n", "null\n"),
+    ("props", ".a", "a: &x ~\nb: *x\nc: &y True\nd: *y\n", "~\n"),
+    ("props", ".[0]", "a: &x ~\nb: *x\nc: &y True\nd: *y\n", "null\n"),
+    ("props", ".", "base: &b\n  k: Null\n  t: TRUE\nm:\n  <<: *b\n  z: ~\n", "base.k = Null\nbase.t = TRUE\nm.k = Null\nm.t = TRUE\nm.z = ~\n"),
+    ("props", ".m", "base: &b\n  k: Null\n  t: TRUE\nm:\n  <<: *b\n  z: ~\n", "k = Null\nt = TRUE\nz = ~\n"),
+    ("props", ".a", "base: &b\n  k: Null\n  t: TRUE\nm:\n  <<: *b\n  z: ~\n", "null\n"),
+    ("props", ".[0]", "base: &b\n  k: Null\n  t: TRUE\nm:\n  <<: *b\n  z: ~\n", "null\n"),
+    ("props", ".", "- ~\n- - True\n  - \n- {k: NULL}\n", "0 = ~\n1.0 = True\n1.1 = \n2.k = NULL\n"),
+    ("props", ".[0]", "- ~\n- - True\n  - \n- {k: NULL}\n", "~\n"),
+    ("props", ".", "? ~\n: v\nk: False\n", "~ = v\nk = False\n"),
+    ("props", ".m", "? ~\n: v\nk: False\n", "null\n"),
+    ("props", ".a", "? ~\n: v\nk: False\n", "null\n"),
+    ("props", ".[0]", "? ~\n: v\nk: False\n", "null\n"),
+    ("props", ".b = 1", "? ~\n: v\nk: False\n", "~ = v\nk = False\nb = 1\n"),
+    ("props", "del(.a)", "? ~\n: v\nk: False\n", "~ = v\nk = False\n"),
+    ("shell", ".", "a: &x ~\nb: *x\nc: &y True\nd: *y\n", "a='~'\nb='~'\nc=True\nd=True\n"),
+    ("shell", ".m", "a: &x ~\nb: *x\nc: &y True\nd: *y\n", "value=null\n"),
+    ("shell", ".a", "a: &x ~\nb: *x\nc: &y True\nd: *y\n", "value='~'\n"),
+    ("shell", ".[0]", "a: &x ~\nb: *x\nc: &y True\nd: *y\n", "value=null\n"),
+    ("shell", ".", "base: &b\n  k: Null\n  t: TRUE\nm:\n  <<: *b\n  z: ~\n", "base_k=Null\nbase_t=TRUE\nm_k=Null\nm_t=TRUE\nm_z='~'\n"),
+    ("shell", ".m", "base: &b\n  k: Null\n  t: TRUE\nm:\n  <<: *b\n  z: ~\n", "k=Null\nt=TRUE\nz='~'\n"),
+    ("shell", ".a", "base: &b\n  k: Null\n  t: TRUE\nm:\n  <<: *b\n  z: ~\n", "value=null\n"),
+    ("shell", ".[0]", "base: &b\n  k: Null\n  t: TRUE\nm:\n  <<: *b\n  z: ~\n", "value=null\n"),
+    ("shell", ".", "- ~\n- - True\n  - \n- {k: NULL}\n", "_0='~'\n_1_0=True\n_1_1=\n_2_k=NULL\n"),
+    ("shell", ".[0]", "- ~\n- - True\n  - \n- {k: NULL}\n", "value='~'\n"),
+    ("shell", ".", "? ~\n: v\nk: False\n", "_=v\nk=False\n"),
+    ("shell", ".m", "? ~\n: v\nk: False\n", "value=null\n"),
+    ("shell", ".a", "? ~\n: v\nk: False\n", "value=null\n"),
+    ("shell", ".[0]", "? ~\n: v\nk: False\n", "value=null\n"),
+    ("shell", ".b = 1", "? ~\n: v\nk: False\n", "_=v\nk=False\nb=1\n"),
+    ("shell", "del(.a)", "? ~\n: v\nk: False\n", "_=v\nk=False\n"),
+    ("ini", ".", "a: &x ~\nb: *x\nc: &y True\nd: *y\n", "a = ~\nb = ~\nc = True\nd = True\n"),
+    ("ini", ".m", "a: &x ~\nb: *x\nc: &y True\nd: *y\n", "null\n"),
+    ("ini", ".a", "a: &x ~\nb: *x\nc: &y True\nd: *y\n", "~\n"),
+    ("ini", ".[0]", "a: &x ~\nb: *x\nc: &y True\nd: *y\n", "null\n"),
+    ("ini", ".", "base: &b\n  k: Null\n  t: TRUE\nm:\n  <<: *b\n  z: ~\n", "[base]\nk = Null\nt = TRUE\n\n[m]\nk = Null\nt = TRUE\nz = ~\n"),
+    ("ini", ".m", "base: &b\n  k: Null\n  t: TRUE\nm:\n  <<: *b\n  z: ~\n", "k = Null\nt = TRUE\nz = ~\n"),
+    ("ini", ".a", "base: &b\n  k: Null\n  t: TRUE\nm:\n  <<: *b\n  z: ~\n", "null\n"),
+    ("ini", ".[0]", "base: &b\n  k: Null\n  t: TRUE\nm:\n  <<: *b\n  z: ~\n", "null\n"),
+    ("ini", ".[0]", "- ~\n- - True\n  - \n- {k: NULL}\n", "~\n"),
+    ("ini", ".", "? ~\n: v\nk: False\n", "~ = v\nk = False\n"),
+    ("ini", ".m", "? ~\n: v\nk: False\n", "null\n"),
+    ("ini", ".a", "? ~\n: v\nk: False\n", "null\n"),
+    ("ini", ".[0]", "? ~\n: v\nk: False\n", "null\n"),
+    ("ini", ".b = 1", "? ~\n: v\nk: False\n", "~ = v\nk = False\nb = 1\n"),
+    ("ini", "del(.a)", "? ~\n: v\nk: False\n", "~ = v\nk = False\n"),
+    ("xml", ".", "a: &x ~\nb: *x\nc: &y True\nd: *y\n", "<a>~</a>\n<b>~</b>\n<c>True</c>\n<d>True</d>\n"),
+    ("xml", ".m", "a: &x ~\nb: *x\nc: &y True\nd: *y\n", "null"),
+    ("xml", ".a", "a: &x ~\nb: *x\nc: &y True\nd: *y\n", "~"),
+    ("xml", ".[0]", "a: &x ~\nb: *x\nc: &y True\nd: *y\n", "null"),
+    ("xml", ".", "base: &b\n  k: Null\n  t: TRUE\nm:\n  <<: *b\n  z: ~\n", "<base>\n  <k>Null</k>\n  <t>TRUE</t>\n</base>\n<m>\n  <k>Null</k>\n  <t>TRUE</t>\n  <z>~</z>\n</m>\n"),
+    ("xml", ".m", "base: &b\n  k: Null\n  t: TRUE\nm:\n  <<: *b\n  z: ~\n", "<k>Null</k>\n<t>TRUE</t>\n<z>~</z>\n"),
+    ("xml", ".a", "base: &b\n  k: Null\n  t: TRUE\nm:\n  <<: *b\n  z: ~\n", "null"),
+    ("xml", ".[0]", "base: &b\n  k: Null\n  t: TRUE\nm:\n  <<: *b\n  z: ~\n", "null"),
+    ("xml", ".[0]", "- ~\n- - True\n  - \n- {k: NULL}\n", "~"),
+    ("xml", ".", "? ~\n: v\nk: False\n", "<~>v</~>\n<k>False</k>\n"),
+    ("xml", ".m", "? ~\n: v\nk: False\n", "null"),
+    ("xml", ".a", "? ~\n: v\nk: False\n", "null"),
+    ("xml", ".[0]", "? ~\n: v\nk: False\n", "null"),
+    ("xml", ".b = 1", "? ~\n: v\nk: False\n", "<~>v</~>\n<k>False</k>\n<b>1</b>\n"),
+    ("xml", "del(.a)", "? ~\n: v\nk: False\n", "<~>v</~>\n<k>False</k>\n"),
+    ("shell", ".b = 2", "a: 1\nc: [x, y]\n", "a=1\nc_0=x\nc_1=y\nb=2\n"),
+    ("ini", ".b = 2", "a: 1\n", "a = 1\nb = 2\n"),
+];
+
+#[test]
+fn encoders_print_a_nulls_and_a_bools_source_spelling_7204() -> Result<()> {
+    for &(format, filter, input, stdout) in ROWS {
+        let (out, err, status) = run_yq_stdin_with_stderr(filter, input, &["-o", format])?;
+        let row = format!("-o {format} {filter:?} on {input:?}");
+        assert_eq!(out, stdout, "stdout of {row}");
+        assert_eq!(err.lines().next().unwrap_or(""), "", "stderr of {row}");
+        assert_eq!(status, 0, "exit status of {row}");
+    }
+    Ok(())
+}
+
+/// A value the filter computes has no node behind it, so it prints canonically: a spelling is a node's, and
+/// does not follow the value through `tostring`, `ascii_downcase` or arithmetic (yq's `tostring` keeps the
+/// text, which is #2802).
+#[test]
+fn a_computed_value_prints_canonically_7204() -> Result<()> {
+    for format in ["props", "shell", "ini", "xml"] {
+        let (out, _, status) = run_yq_stdin_with_stderr(
+            "{\"n\": (.a | not), \"m\": null}",
+            "a: True\n",
+            &["-o", format],
+        )?;
+        assert_eq!(status, 0, "-o {format}");
+        assert!(
+            out.contains("false") && out.contains("null"),
+            "-o {format} printed {out:?}"
+        );
+    }
+    Ok(())
+}
+
+/// JSON has no spelling to keep: a `null` and a `true` print as they are, and the read goes through the
+/// cursor of a format whose nodes hold none.
+#[test]
+fn a_json_input_prints_its_nulls_and_bools_as_they_are_7204() -> Result<()> {
+    let input = "{\"a\": null, \"b\": true, \"c\": [null, false]}";
+    let (out, _, status) = run_yq_stdin_with_stderr(".", input, &["-p", "json", "-o", "props"])?;
+    assert_eq!(status, 0);
+    assert_eq!(out, "a = null\nb = true\nc.0 = null\nc.1 = false\n");
+    Ok(())
+}
