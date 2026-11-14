@@ -5,8 +5,8 @@
 //! key's, which yq's encoder does not read, and no foot comment is written. Every row was captured from yq
 //! v4.53.3 (stdout, the first stderr line, the exit status) and kept only when both tools agree: random
 //! comment positions over the document shapes of the `-o xml` sweep (#7117), read as they are and through a
-//! write, and tables, arrays of tables and arrays with comments. A run that read TOML writes none (the
-//! `-p toml` read cannot place a comment on the value nodes the encoder looks at).
+//! write, and tables, arrays of tables and arrays with comments. A run that read TOML is `i7170.rs`'s: the
+//! `-p toml` read places each comment on the value node the encoder looks at.
 
 use anyhow::Result;
 

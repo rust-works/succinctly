@@ -3325,6 +3325,16 @@ pub enum FormatType {
     Unknown(String),
 }
 
+/// Where the comments `-o=toml` writes were read from (#7170).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TomlCommentSource {
+    /// A YAML document, or a value built by the filter: a node's comments are the ones its own node holds.
+    Yaml,
+    /// A TOML file read with `-p toml`: yq's decoder gives every comment to a value node, and the read writes
+    /// the text so that a comment above a key, or after a key whose value follows, is that value's.
+    Toml,
+}
+
 /// The encoder of `-o=<format>` in `succinctly yq` (#6850), see [`FormatType::YqOutput`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum YqOutputEncoder {
@@ -3347,9 +3357,8 @@ pub enum YqOutputEncoder {
     Tsv,
     /// `-o=ini`
     Ini,
-    /// `-o=toml`, and whether it writes the comments of the nodes it is given: not for a run that read TOML,
-    /// whose comments the read cannot place on the value nodes yq's encoder looks at (#7160)
-    Toml(bool),
+    /// `-o=toml`, and where the comments it writes were read from (#7170)
+    Toml(TomlCommentSource),
     /// `-o=kyaml`, with `-I` as the indent, whether `-r` / `--unwrapScalar` prints a string result as
     /// its own text (#7093), and whether the first document's leading `---` is written (`-N` says not,
     /// #7158)

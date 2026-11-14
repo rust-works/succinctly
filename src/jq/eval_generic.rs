@@ -101,6 +101,7 @@ use super::eval::{
 use super::eval::{owned_slot_mut, static_path_steps, StepKey};
 #[cfg(test)]
 use super::expr::FuncDefBound;
+use super::expr::TomlCommentSource;
 use super::expr::YqOutputEncoder;
 use super::expr::{
     ArithOp, ArithSettleMemo, AssignOp, BindOrigin, BoundBody, Builtin, CompareOp, Expr,
@@ -6479,6 +6480,7 @@ pub fn format_yq_encoder_from_tree<C: DocumentCursor>(
 ) -> Result<String, EvalError> {
     let mut comments = encoder_comments_of_tree(value, tree, 0);
     let original = collect_encoder_comments(pristine, 0);
+    let first_key = super::encoder_comments::first_entry_key(&original).map(str::to_owned);
     // Only the XML and properties encoders read the line break a blank line leaves under a block.
     if matches!(
         encoder,
@@ -6520,6 +6522,14 @@ pub fn format_yq_encoder_from_tree<C: DocumentCursor>(
                 _ => {}
             }
         }
+    }
+    // A TOML file's first entry has its head comment in the leading block; it goes back to that entry.
+    if matches!(encoder, YqOutputEncoder::Toml(TomlCommentSource::Toml)) {
+        super::encoder_comments::toml_first_entry_head(
+            &mut comments,
+            &leading,
+            first_key.as_deref(),
+        );
     }
     format_yq_commented(encoder, value, &comments, &leading)
 }
@@ -16854,7 +16864,18 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                     } else {
                         String::new()
                     };
-                    (collect_encoder_comments(c, 0), leading)
+                    let mut comments = collect_encoder_comments(c, 0);
+                    // A TOML file's first entry has its head comment in the leading block; it goes back to it.
+                    if matches!(encoder, YqOutputEncoder::Toml(TomlCommentSource::Toml)) {
+                        let first_key =
+                            super::encoder_comments::first_entry_key(&comments).map(str::to_owned);
+                        super::encoder_comments::toml_first_entry_head(
+                            &mut comments,
+                            &leading,
+                            first_key.as_deref(),
+                        );
+                    }
+                    (comments, leading)
                 },
             );
             match format_yq_commented(encoder, &owned, &comments, &leading) {

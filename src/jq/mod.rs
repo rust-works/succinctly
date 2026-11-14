@@ -201,7 +201,7 @@ pub use expr::{
     FuncDefBound, FuncDefData, Import, Include, Libm1, Libm2, Libm3, Literal, LoadKind, LuaOptions,
     MergeFlags, MetaObject, MetaSlot, MetaValue, ModuleMeta, NumberKey, ObjectEntry, ObjectKey,
     Param, Pattern, PatternEntry, PipeStages, Program, SharedArg, SliceBoundKey, StringPart,
-    TextCodec, XmlOptions, YqOutputEncoder,
+    TextCodec, TomlCommentSource, XmlOptions, YqOutputEncoder,
 };
 pub use lazy::JqValue;
 // #5497: jq's parse-depth limit, applied by the CLI's document routes.
