@@ -10,7 +10,11 @@ use std::process::{Command, Stdio};
 
 use anyhow::Result;
 
-/// A first file of 80,000 lines (past the 4 MiB the route needs and more output than a pipe holds), then
+/// Lines of the first file: 4 KB each, so it is past the 4 MiB the route needs and the output is far more
+/// than a pipe holds, with few enough lines to be read quickly in a debug build.
+const BIG_LINES: usize = 1_100;
+
+/// A first file of `BIG_LINES` lines (past the 4 MiB the route needs and more output than a pipe holds), then
 /// `files - 1` files of one line each. After 64 KiB of the output has been read, which leaves the run
 /// blocked on the pipe in the first file, a line is appended to the last file (or to the second one, when
 /// `second`); the output is returned.
@@ -21,8 +25,8 @@ fn run_with_append(files: usize, second: bool, program: &[&str]) -> Result<Strin
         .collect();
     for (n, path) in paths.iter().enumerate() {
         let bytes: Vec<u8> = if n == 0 {
-            (0..80_000)
-                .flat_map(|i| format!("line {i} {}\n", "x".repeat(80)).into_bytes())
+            (0..BIG_LINES)
+                .flat_map(|i| format!("line {i} {}\n", "x".repeat(4000)).into_bytes())
                 .collect()
         } else {
             format!("one {n}\n").into_bytes()
@@ -62,8 +66,8 @@ fn a_line_appended_to_the_last_of_several_raw_files_is_read_7223() -> Result<()>
     for files in [2, 3, 32, 33, 40] {
         let out = run_with_append(files, false, &["-R", "-c", "."])?;
         assert_eq!(count(&out, "appended"), 1, "{files} files");
-        // Every line is still there once: 80,000 + the one-liners + the appended one.
-        assert_eq!(out.lines().count(), 80_000 + files, "{files} files");
+        // Every line is still there once: the big file's + the one-liners + the appended one.
+        assert_eq!(out.lines().count(), BIG_LINES + files, "{files} files");
     }
     Ok(())
 }
@@ -83,8 +87,8 @@ fn a_line_appended_to_the_next_raw_file_and_the_inputs_form_are_read_7223() -> R
 #[test]
 fn an_empty_file_among_several_raw_files_reads_as_nothing_7223() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let big: String = (0..80_000)
-        .map(|i| format!("line {i} {}\n", "x".repeat(80)))
+    let big: String = (0..BIG_LINES)
+        .map(|i| format!("line {i} {}\n", "x".repeat(4000)))
         .collect();
     let paths = [
         dir.path().join("a.txt"),
@@ -100,7 +104,7 @@ fn an_empty_file_among_several_raw_files_reads_as_nothing_7223() -> Result<()> {
         .output()?;
     assert!(out.status.success());
     let text = String::from_utf8(out.stdout)?;
-    assert_eq!(text.lines().count(), 80_001);
+    assert_eq!(text.lines().count(), BIG_LINES + 1);
     assert_eq!(text.lines().last(), Some("\"tail\""));
     Ok(())
 }
