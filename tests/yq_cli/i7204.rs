@@ -238,6 +238,8 @@ const ROWS: &[Row] = &[
     ("xml", ".[0]", "? ~\n: v\nk: False\n", "null"),
     ("xml", ".b = 1", "? ~\n: v\nk: False\n", "<~>v</~>\n<k>False</k>\n<b>1</b>\n"),
     ("xml", "del(.a)", "? ~\n: v\nk: False\n", "<~>v</~>\n<k>False</k>\n"),
+    ("shell", ".b = 2", "a: 1\nc: [x, y]\n", "a=1\nc_0=x\nc_1=y\nb=2\n"),
+    ("ini", ".b = 2", "a: 1\n", "a = 1\nb = 2\n"),
 ];
 
 #[test]
@@ -269,5 +271,16 @@ fn a_computed_value_prints_canonically_7204() -> Result<()> {
             "-o {format} printed {out:?}"
         );
     }
+    Ok(())
+}
+
+/// JSON has no spelling to keep: a `null` and a `true` print as they are, and the read goes through the
+/// cursor of a format whose nodes hold none.
+#[test]
+fn a_json_input_prints_its_nulls_and_bools_as_they_are_7204() -> Result<()> {
+    let input = "{\"a\": null, \"b\": true, \"c\": [null, false]}";
+    let (out, _, status) = run_yq_stdin_with_stderr(".", input, &["-p", "json", "-o", "props"])?;
+    assert_eq!(status, 0);
+    assert_eq!(out, "a = null\nb = true\nc.0 = null\nc.1 = false\n");
     Ok(())
 }

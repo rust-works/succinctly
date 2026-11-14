@@ -6375,9 +6375,11 @@ fn tree_comment_block(lines: &[String]) -> String {
 /// a case of `true` or `false`. A tree a write left a stale spelling in prints the value it holds (#7204).
 fn spelling_names_leaf(spelling: &str, value: &OwnedValue) -> bool {
     match value {
-        OwnedValue::Null => matches!(spelling, "" | "~" | "null" | "Null" | "NULL"),
         OwnedValue::Bool(b) => spelling.eq_ignore_ascii_case(if *b { "true" } else { "false" }),
-        _ => false,
+        other => {
+            matches!(other, OwnedValue::Null)
+                && matches!(spelling, "" | "~" | "null" | "Null" | "NULL")
+        }
     }
 }
 
@@ -6431,13 +6433,10 @@ fn respell_by_cursor<C: DocumentCursor>(value: &mut OwnedValue, cursor: &C, dept
             }
         }
         OwnedValue::Object(entries) => {
-            let node = cursor.value();
-            let Some(mut fields) = node.as_object() else {
-                return;
-            };
             let mut cursors = Vec::new();
-            while let Some((field, rest)) = fields.uncons() {
-                fields = rest;
+            let mut fields = cursor.value().as_object();
+            while let Some((field, rest)) = fields.and_then(|f| f.uncons()) {
+                fields = Some(rest);
                 if let Some(key) = field.key_str() {
                     cursors.push((key.into_owned(), field.value_cursor));
                 }
@@ -6449,13 +6448,10 @@ fn respell_by_cursor<C: DocumentCursor>(value: &mut OwnedValue, cursor: &C, dept
             }
         }
         OwnedValue::Array(items) => {
-            let node = cursor.value();
-            let Some(mut elements) = node.as_array() else {
-                return;
-            };
             let mut index = 0usize;
-            while let Some((element, rest)) = elements.uncons_cursor() {
-                elements = rest;
+            let mut elements = cursor.value().as_array();
+            while let Some((element, rest)) = elements.and_then(|e| e.uncons_cursor()) {
+                elements = Some(rest);
                 if let Some(item) = items.get_mut(index) {
                     respell_by_cursor(item, &element, depth + 1);
                 }
