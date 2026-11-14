@@ -8060,8 +8060,8 @@ These rows differ:
 - **A character Go 1.27 classifies differently from Go 1.26** at the end of a text node (a code point assigned in Unicode 17 or later) is trimmed or kept by the newer table.
 - `-o xml` writes the comments of a node it reads (the `-o=xml` row above), so `-p xml -o xml .` keeps those of its input, a write (`-i`) included, and a `null` that a filter assigns (`.a = null`) is written empty when the input was XML, where yq writes `null`.
   The comments before the first element are that first key's head comment, as yq's decoder gave them (#7202), so a first line's trailing blank survives (`<!-- ` and a line break stays `<!-- `).
-  Every other comment of a run that read one XML file is on the node yq's decoder gave it as well, entry by entry while a write leaves the key at its place ([#7212](https://github.com/rust-works/succinctly/issues/7212)), so a comment after a closing tag stays after it.
-  A run that read several XML files, and an entry a write moved or renamed, has its comments attributed by the YAML reader, as the first bullet above says.
+  Every other comment of a run that read one XML file is on the node yq's decoder gave it as well, entry by entry, matched by key ([#7212](https://github.com/rust-works/succinctly/issues/7212)), so a comment after a closing tag stays after it.
+  A run that read several XML files, an entry a write added or renamed, a result that is not the whole document (`.r`, `{"r": .r.y}`) and a sequence a write reordered or resized have those comments attributed by the YAML reader, as the first bullet above says.
 - `--front-matter` with an explicit `-p xml` is refused (`--front-matter and --input-format xml are incompatible`), where yq decodes the front matter as XML.
 - yq's warning that `-o auto` defaults to YAML when `-p xml` is explicit is not written.
 

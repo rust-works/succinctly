@@ -246,18 +246,24 @@ fn node_comments(into: &mut EncoderNodeComments, node: &XmlCommentNode) {
     into.foot.clone_from(&node.foot);
 }
 
-/// Lay the decoder's comments over `comments`, entry by entry where the key is the one at that place: a write
-/// that moved, renamed or added an entry keeps what the read attributed to it. Answers whether the first entry
+/// Lay the decoder's comments over `comments`, entry by entry by key: an entry a write added or renamed keeps
+/// what the read attributed to it. Answers whether the first entry
 /// of the root mapping took a head comment from the decoder.
 #[cfg(feature = "std")]
 fn overlay_members(comments: &mut EncoderComments, node: &XmlCommentNode) -> bool {
     let mut first_head = false;
     match (&mut comments.members, &node.members) {
         (EncoderMembers::Map(entries), XmlCommentMembers::Map(decoded)) => {
-            for (at, (entry, d)) in entries.iter_mut().zip(decoded).enumerate() {
-                if entry.key != d.key {
+            // Entries keep their order, so each one is looked for after the one before it: a write that
+            // deleted or added an entry leaves the others at the comments they had.
+            let mut from = 0;
+            for entry in entries.iter_mut() {
+                let Some(at) = decoded[from..].iter().position(|d| d.key == entry.key) else {
                     continue;
-                }
+                };
+                let at = from + at;
+                let d = &decoded[at];
+                from = at + 1;
                 entry.key_comments.head.clone_from(&d.head);
                 entry.key_comments.line.clone_from(&d.line);
                 entry.key_comments.foot.clone_from(&d.foot);
