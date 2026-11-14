@@ -7141,8 +7141,7 @@ fn resolve_metadata_write_targets<W: AsRef<[u64]> + Clone>(
             false,
             false,
             false,
-            None,
-            false,
+            CoreRoute::inner(None),
         )
         .ok()?;
         if scratch.hit() {
@@ -8918,8 +8917,7 @@ fn evaluate_yaml_cursor_in_document<W: AsRef<[u64]> + Clone>(
                     need_comments,
                     strip_style,
                     sort_keys,
-                    None,
-                    true,
+                    CoreRoute::printed(None),
                 );
             }
         }
@@ -8959,8 +8957,7 @@ fn evaluate_yaml_cursor_in_document<W: AsRef<[u64]> + Clone>(
                         need_comments,
                         strip_style,
                         sort_keys,
-                        pristine,
-                        true,
+                        CoreRoute::printed(pristine),
                     );
                 }
             }
@@ -8979,8 +8976,7 @@ fn evaluate_yaml_cursor_in_document<W: AsRef<[u64]> + Clone>(
             need_comments,
             strip_style,
             sort_keys,
-            None,
-            true,
+            CoreRoute::printed(None),
         );
     };
     let has_aliases = cursor.index().has_aliases();
@@ -8992,8 +8988,7 @@ fn evaluate_yaml_cursor_in_document<W: AsRef<[u64]> + Clone>(
         need_comments,
         strip_style,
         sort_keys,
-        None,
-        false,
+        CoreRoute::inner(None),
     )?;
     let path = meta_path_of(&steps);
     let mut out = Vec::with_capacity(docs.len());
@@ -9099,6 +9094,35 @@ fn split_comment_encoder(expr: &Expr) -> Option<(Expr, &YqOutputEncoder)> {
     Some((inner, encoder))
 }
 
+/// What the caller of [`evaluate_yaml_cursor_core`] does with its results, grouped so the function
+/// stays within clippy's argument limits (as [`FallbackStreamState`] does).
+struct CoreRoute {
+    /// The document's own snapshot, when the query runs on a node inside it.
+    pristine_override: Option<(OwnedValue, CommentTree)>,
+    /// The results are printed as YAML documents, whole: a line comment yq's YAML encoder holds is
+    /// placed on a later line of the same document (#7230). Not for a result another encoder writes,
+    /// or one the caller navigates into before printing it, which places its own.
+    places_held_comments: bool,
+}
+
+impl CoreRoute {
+    /// Results printed as YAML documents.
+    fn printed(pristine_override: Option<(OwnedValue, CommentTree)>) -> Self {
+        Self {
+            pristine_override,
+            places_held_comments: true,
+        }
+    }
+
+    /// Results the caller encodes otherwise, navigates into, or only inspects.
+    fn inner(pristine_override: Option<(OwnedValue, CommentTree)>) -> Self {
+        Self {
+            pristine_override,
+            places_held_comments: false,
+        }
+    }
+}
+
 /// Evaluate a jq expression directly on a YAML cursor.
 ///
 /// This uses the generic evaluator to preserve position metadata (line/column).
@@ -9118,12 +9142,12 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
     need_comments: bool,
     strip_style: bool,
     sort_keys: bool,
-    pristine_override: Option<(OwnedValue, CommentTree)>,
-    // The results are printed as YAML documents, whole: a line comment yq's YAML encoder holds is
-    // placed on a later line of the same document (#7230). Not for a result another encoder writes,
-    // or one the caller navigates into before printing it, which places its own.
-    places_held_comments: bool,
+    route: CoreRoute,
 ) -> Result<Vec<ResultWithComments>> {
+    let CoreRoute {
+        pristine_override,
+        places_held_comments,
+    } = route;
     // #7156: `-o xml` writes the comments of the node it is given, and a write or a built value holds
     // them in its presentation tree and not on a cursor. So the filter runs without its encoder, with
     // comments, and each result is encoded with the tree it came with.
@@ -9142,8 +9166,7 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
             true,
             strip_style,
             sort_keys,
-            pristine_override,
-            false,
+            CoreRoute::inner(pristine_override),
         )?;
         let mut encoded = Vec::with_capacity(results.len());
         for (value, tree) in results {

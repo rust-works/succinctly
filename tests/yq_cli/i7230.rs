@@ -129,6 +129,32 @@ fn a_replaced_scalars_comment_is_held_for_a_later_line_7230() -> Result<()> {
             &[],
             "k:\n  - a:\n      b: 1\n  - 6 # own\n",
         ),
+        // An item the write added takes it too, and one a key moved aside waits past the end of its
+        // mapping for a value in the next item, a write's new mapping or a nested sequence's included.
+        (
+            "- 5 # own\n",
+            ".[0] = {\"a\": 1} | .[1] = 3",
+            &[],
+            "- a: 1\n- 3 # own\n",
+        ),
+        (
+            "- a: 5 # own\n  b: 6 # six\n- c: 1\n",
+            ".[0].a = {\"x\": 1}",
+            &[],
+            "- a:\n    x: 1\n  b: 6 # six\n- c: 1 # own\n",
+        ),
+        (
+            "- a: 5 # own\n  b: 6 # six\n- c: 1\n- d: 2\n",
+            ".[0].a = {\"x\": 1} | .[1] = {\"e\": {\"f\": 1}}",
+            &[],
+            "- a:\n    x: 1\n  b: 6 # six\n- e: # own\n    f: 1\n- d: 2\n",
+        ),
+        (
+            "- a: 5 # own\n  b: 6 # six\n- - c: 1\n",
+            ".[0].a = {\"x\": 1}",
+            &[],
+            "- a:\n    x: 1\n  b: 6 # six\n- - c: 1 # own\n",
+        ),
         // A flow collection that a block mapping replaces, an update, and `-P`.
         (
             "a: [1, 2] # ec\nz: 1\n",
