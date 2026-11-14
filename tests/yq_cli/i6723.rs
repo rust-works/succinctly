@@ -50,8 +50,8 @@ fn test_a_merged_member_is_named_by_its_anchors_location_6723() -> Result<()> {
 fn test_the_shapes_that_keep_the_mappings_own_path_6723() -> Result<()> {
     // Not yq's answers, recorded in docs/compliance/yq/limitations.md: a member of an inline
     // `<<: {q: 1}` is `["item","<<","q"]` in yq, and the walk cannot climb through the merge key,
-    // so it keeps the mapping's own path; and two merge sources that each merge list a literal
-    // `<<` entry here where yq lists the entries behind it (`["a","x"]`).
+    // so it keeps the mapping's own path. A source that itself merges is walked into, as yq does
+    // (#7201): `["a","x"]` stands behind `b`'s `<<`, not a literal `<<` entry.
     for (document, filter, want) in [
         (
             "item: {<<: {q: 1}, k: 0}\n",
@@ -61,7 +61,7 @@ fn test_the_shapes_that_keep_the_mappings_own_path_6723() -> Result<()> {
         (
             "a: &a {x: 1}\nb: &b {<<: *a, y: 2}\nitem: {<<: *b, k: 0}\n",
             "[.item | .[] | path]",
-            "[[\"item\",\"<<\"],[\"b\",\"y\"],[\"item\",\"k\"]]\n",
+            "[[\"a\",\"x\"],[\"b\",\"y\"],[\"item\",\"k\"]]\n",
         ),
     ] {
         let (stdout, code) = run_yq_stdin(filter, document, JSON)?;
