@@ -232,6 +232,8 @@ enum Change {
     LastDirectory,
     /// Two files in a row removed.
     TwoGone,
+    /// File 21 replaced by one that is not UTF-8, which the check made before the run did not see.
+    MiddleNotUtf8,
 }
 
 /// 40 files, the first big enough that the run is still in it when its output fills the pipe; the
@@ -290,6 +292,11 @@ fn changed_while_running(change: Change, args: &[&str]) -> Result<(Run, Run)> {
             std::fs::remove_file(&paths[22])?;
             std::fs::remove_file(&paths[23])?;
         }
+        Change::MiddleNotUtf8 => {
+            let other = dir.path().join("other.json");
+            std::fs::write(&other, b"\"a\xffb\"\n{\"new\":21}\n")?;
+            std::fs::rename(&other, &paths[21])?;
+        }
     }
     let mut rest = Vec::new();
     stdout.read_to_end(&mut rest)?;
@@ -319,6 +326,7 @@ fn a_path_that_changes_before_the_run_reaches_it_is_read_as_jq_reads_it_7197() -
         Change::LastGone,
         Change::LastDirectory,
         Change::TwoGone,
+        Change::MiddleNotUtf8,
     ] {
         for args in [
             &["-c", "-n", "inputs"][..],

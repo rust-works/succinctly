@@ -7126,11 +7126,6 @@ fn read_inputs(
     if let Some(windows) = several_lazy_windowed_files(args, track_eof, &files) {
         #[cfg(test)]
         SEVERAL_WINDOWED_STARTS.with(|n| n.set(n.get() + 1));
-        // #7197: a list past the descriptors held opens each file when the run reaches it, so a
-        // failure to open is found by a read ([`note_raw_open_failure`]).
-        if files.len() > MAX_WINDOWED_FILES {
-            RAW_OPEN_FAILURES_POSSIBLE.with(|possible| possible.set(true));
-        }
         let sources = windows
             .into_iter()
             .map(|windows| (String::new(), Vec::new(), LazyRest { windows }))
@@ -13559,9 +13554,10 @@ fn lazy_read_flags(args: &JqCommand, track_eof: bool) -> bool {
 /// Several regular files a program reading `input`/`inputs` reads a window at a time (#7024), each a
 /// lazy source of its own read in turn, as the lone source past its front is (#7023); or `None` for a
 /// run that reads them whole: a flag [`lazy_read_flags`] turns down, a path that is not a regular file
-/// (judged as the plain route judges them), more than [`MAX_WINDOWED_FILES`], less than 4 MiB between
-/// them, a file that is not UTF-8, no file with a document, or a first file with one that the route
+/// (judged as the plain route judges them), less than 4 MiB between them, a file that is not UTF-8, no file with a document, or a first file with one that the route
 /// that reads them whole stitches onto the next before it takes them ([`first_document_file_is_lazy`]).
+/// Up to [`MAX_WINDOWED_FILES`] files are held open from the start; a longer list is opened a file at a
+/// time ([`several_lazy_windowed_files_by_path`], #7197).
 ///
 /// Every file is checked to be UTF-8 here, a block at a time, as the route that reads them whole
 /// checks each before it takes them lazily: a file that is not is read as jq's substitution of its
@@ -13657,6 +13653,9 @@ fn several_lazy_windowed_files_by_path(files: &[PathBuf]) -> Option<Vec<window::
         sources.push((path, start, at));
     }
     first?;
+    // Each file is opened when the run reaches it, so a failure to open is found by a read
+    // ([`note_raw_open_failure`]).
+    RAW_OPEN_FAILURES_POSSIBLE.with(|possible| possible.set(true));
     Some(
         sources
             .into_iter()
