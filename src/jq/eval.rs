@@ -12172,12 +12172,29 @@ pub(crate) fn eval_owned_construct<S: EvalSemantics>(
         return None;
     }
     let shape = lone_door_shape(expr)?;
-    if !matches!(shape, Expr::Array(_) | Expr::Object(_))
-        || super::eval_generic::embed_table_active()
-    {
+    if !matches!(shape, Expr::Array(_) | Expr::Object(_)) {
         return None;
     }
-    construct_operand::<S>(shape, input)
+    let built = construct_operand::<S>(shape, input)?;
+    // #7132: under an embed table the answer is taken when it holds no container: a scalar names no
+    // node a binding tracks, as the `first`/`last`/`nth` door's answer does not
+    // ([`owned_door_answer_may_leave`]). `[.[0], .[1]]` of a `. as $a` binding bridged per call.
+    if super::eval_generic::embed_table_active() && owned_holds_container_child(&built) {
+        return None;
+    }
+    Some(built)
+}
+
+/// Whether a constructed array or object holds a container as one of its own elements or values: one
+/// the construct door may have read off the input, so a node an embed table can track (#7132).
+fn owned_holds_container_child(built: &OwnedValue) -> bool {
+    let is_container =
+        |value: &OwnedValue| matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_));
+    match built {
+        OwnedValue::Array(items) => items.iter().any(is_container),
+        OwnedValue::Object(map) => map.values().any(is_container),
+        _ => false,
+    }
 }
 
 /// `keys` and `has(K)` of an owned object or array (#6620), answered from the tree instead of through
@@ -12657,8 +12674,11 @@ pub(crate) fn eval_owned_relocating_fold<S: EvalSemantics>(
     // computed value, `min`/`max` return an element -- so the common
     // `[1,2,3] | add` declines here, before a single clone. It also
     // subsumes the empty-container check: an `any` over no elements is
-    // false.
-    if !any_child_witnessed(input) {
+    // false. The builtin first (#7132): the scan walks every element, and every
+    // other builtin stage over a bound container (`isempty(.[])` once per call
+    // of a loop) paid it to be declined below.
+    if !matches!(builtin, Builtin::Add | Builtin::Min | Builtin::Max) || !any_child_witnessed(input)
+    {
         return None;
     }
     let items: Vec<OwnedValue> = match (builtin, input) {
@@ -94017,18 +94037,21 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     if let Some(relocated) = eval_owned_relocated_or_closed::<S>(expr, input) {
         return QueryResult::Owned(relocated);
     }
-    if let Some((values, control)) = embed_peel_collect::<S>(expr, input, optional, reentry) {
+    // #7132: a comma of value-door stages, or `first`/`last`/`nth`/`limit`/`isempty` of `.[]`
+    // (`[$a | first, last]`), before the embed peel, which walks every element of `.[]`; an answer
+    // that reads a container under the table declines to it. Chained onto that call so the frame
+    // [`eval_owned_pipe`] inlines this into keeps its one slot of this type.
+    if let Some((values, control)) = eval_owned_many_doors::<S>(expr, input)
+        .map(|values| (values, None))
+        .or_else(|| embed_peel_collect::<S>(expr, input, optional, reentry))
+    {
         return match control {
             Some(control) => partial(values, control),
             None => owned_vec_to_result(values),
         };
     }
-    // #3177: see `eval_each_owned`. #7132: and a comma of value-door stages, or
-    // `first`/`last`/`nth`/`limit`/`isempty` of `.[]` (`[$a | first, last]`), chained onto this
-    // call so the frame [`eval_owned_pipe`] inlines this into keeps its one slot of this type.
-    if let Some((values, control)) = owned_path_door_collect::<S>(expr, input, optional, reentry)
-        .or_else(|| eval_owned_many_doors::<S>(expr, input).map(|values| (values, None)))
-    {
+    // #3177: see `eval_each_owned`.
+    if let Some((values, control)) = owned_path_door_collect::<S>(expr, input, optional, reentry) {
         return match control {
             Some(control) => partial(values, control),
             None => owned_vec_to_result(values),
@@ -94207,7 +94230,9 @@ fn eval_owned_door_pipe<S: EvalSemantics>(expr: &Expr, input: &OwnedValue) -> Op
     let mut current: Option<OwnedValue> = None;
     for stage in stages {
         let at = current.as_ref().unwrap_or(input);
-        let next = eval_owned_value_door_stage::<S>(stage, at).or_else(|| {
+        // #7132: every value door, the composed ones too, so `length > 5 | if . then 1 else 0 end`
+        // is answered stage by stage as a fold's operand reads it.
+        let next = eval_owned_value_doors::<S>(stage, at).or_else(|| {
             matches!(unwrap_paren(stage), Expr::Builtin(Builtin::ToString)).then(|| match at {
                 OwnedValue::String(_) => at.clone(),
                 _ => OwnedValue::String(tostring_text::<S>(at, false).into()),
@@ -131752,7 +131777,43 @@ mod tests {
         "first // .[1]",
         "(first | . + 1)",
         "if first > 0 then first + 1 else 0 end",
+        "length > 1 | if . then 1 else 0 end",
+        "first | if . == 1 then \"one\" else . end",
+        "[.[0], .[1]]",
     ];
+
+    /// #7132: under a live #2889 embed table the construct door answers a construction that holds
+    /// no container (`[.[0], .[1]]` over numbers), and leaves one that does to the evaluator, which
+    /// can name the node a binding tracks; with the table gone it answers both. `std` only: without it
+    /// there is no table to make live.
+    #[cfg(feature = "std")]
+    #[test]
+    fn construct_door_answers_scalars_under_a_live_embed_table_7132() {
+        let numbers = OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+        let nested = OwnedValue::array_from(vec![
+            OwnedValue::array_from(vec![OwnedValue::Int(1)]),
+            OwnedValue::Int(2),
+        ]);
+        let pair = parse("[.[0], .[1]]").unwrap();
+        let origin = BindOrigin::Node {
+            node: 1,
+            document: 9,
+        };
+        let mut bound = OwnedValue::array_from(vec![OwnedValue::Int(1)]);
+        let guard =
+            super::super::eval_generic::embed_table_push::<JqSemantics>(Some(&origin), &mut bound)
+                .expect("a container bind");
+        assert_eq!(
+            eval_owned_construct::<JqSemantics>(&pair, &numbers),
+            Some(numbers.clone())
+        );
+        assert_eq!(eval_owned_construct::<JqSemantics>(&pair, &nested), None);
+        drop(guard);
+        assert_eq!(
+            eval_owned_construct::<JqSemantics>(&pair, &nested),
+            Some(nested.clone())
+        );
+    }
 
     /// #7132: an arithmetic or `//` stage's answer leaves under the `first`/`last`/`nth` door's rule:
     /// `null + first` and `first // 0` hand the element back as it is, so a container element stays
