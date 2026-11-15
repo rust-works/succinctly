@@ -4695,8 +4695,16 @@ fn reconcile_presentation_by_stage(
             }
             ChainStage::Identity | ChainStage::Del(_) => None,
         };
-        // A copy is judged against the target as the stage found it.
-        let before = copy.map(|_| tree.clone());
+        // A copy is judged against the target as the stage found it, the one node of the tree the
+        // copy pass reads from it.
+        let before = copy.map(|_| {
+            path.and_then(|path| {
+                let steps = resolved_tree_steps(&value, path)?;
+                let node = comment_tree_at_path(&tree, &steps)?.clone();
+                Some(tree_holding_only(&steps, node))
+            })
+            .unwrap_or_else(|| tree.clone())
+        });
         reconcile_stage_in_place(&value, &mut tree, &next, &targets, path);
         if let (Some(expr), Some(before)) = (copy, before) {
             propagate_assign_copied_presentation(expr, &next, &value, &before, &mut tree);
@@ -4738,6 +4746,23 @@ fn reconcile_stage_in_place(
     if spliced.is_none() {
         *tree = reconcile_presentation(value, tree, next, targets);
     }
+}
+
+/// A tree with `node` at `steps` and nothing else: an empty member for each item before an index,
+/// no other field. It reads as the full tree at `steps`.
+fn tree_holding_only(steps: &[TreeStep<'_>], node: CommentTree) -> CommentTree {
+    steps.iter().rev().fold(node, |inner, step| match step {
+        TreeStep::Key(k) => CommentTree::object(
+            NodeMeta::empty(),
+            IndexMap::from([((*k).to_string(), inner)]),
+            IndexMap::new(),
+        ),
+        TreeStep::Index(i) => {
+            let mut items: Vec<CommentTree> = (0..*i).map(|_| CommentTree::empty()).collect();
+            items.push(inner);
+            CommentTree::array(NodeMeta::empty(), items)
+        }
+    })
 }
 
 /// `path` as tree steps into `value`, a negative index counted from the end of its array; `None`
