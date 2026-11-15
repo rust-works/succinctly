@@ -4572,48 +4572,54 @@ fn chained_write_stages<'e>(
     expr: &'e Expr,
     targets: &[WriteTarget],
 ) -> Option<Vec<ChainStage<'e>>> {
-    // Two writes at least, or nothing can overlap.
-    if !targets.iter().any(|t| t.stage > 0) {
+    // Two writes at least, or one whose literal has several values (`.a = (1, [2])`), which yq
+    // writes one after the other; otherwise nothing can overlap.
+    let several_values = || jq::walk::any_subexpr(expr, &mut |e| matches!(e, Expr::Comma(_)));
+    if !targets.iter().any(|t| t.stage > 0) && !several_values() {
         return None;
     }
     let mut flat = Vec::new();
     flatten_pipe_stages(expr, &mut flat);
-    let stages = flat
-        .into_iter()
-        .map(|stage| {
-            let static_path = |path: &Expr| {
-                let mut steps = Vec::new();
-                static_path_steps(path, &mut steps).then_some(steps)
-            };
-            let literal = |value: &Expr| {
-                let [value] =
-                    <[OwnedValue; 1]>::try_from(evaluate_input_quiet(&OwnedValue::Null, value)?)
-                        .ok()?;
-                Some(value)
-            };
-            Some(match strip_parens(stage) {
-                stage if is_value_identity_stage(stage) => ChainStage::Identity,
-                Expr::Assign { path, value } if is_closed_literal(value) => {
-                    ChainStage::Set(static_path(path)?, literal(value)?, stage)
+    let mut stages = Vec::new();
+    for stage in flat {
+        let static_path = |path: &Expr| {
+            let mut steps = Vec::new();
+            static_path_steps(path, &mut steps).then_some(steps)
+        };
+        let literal = |value: &Expr| evaluate_input_quiet(&OwnedValue::Null, value);
+        match strip_parens(stage) {
+            stage if is_value_identity_stage(stage) => stages.push(ChainStage::Identity),
+            // `=` writes each value of its right side in turn, the last one staying.
+            Expr::Assign { path, value } if is_closed_literal(value) => {
+                let path = static_path(path)?;
+                for value in literal(value)? {
+                    stages.push(ChainStage::Set(path.clone(), value, stage));
                 }
-                Expr::Update { path, filter } if is_closed_literal(filter) => {
-                    ChainStage::Set(static_path(path)?, literal(filter)?, stage)
-                }
-                Expr::Assign { path, value } => {
-                    ChainStage::Copy(static_path(path)?, static_path(value)?, stage)
-                }
-                Expr::CompoundAssign {
-                    path,
-                    op: AssignOp::Add,
-                    value,
-                } if is_closed_literal(value) => {
-                    ChainStage::Add(static_path(path)?, literal(value)?, stage)
-                }
-                Expr::Builtin(Builtin::Del(path)) => ChainStage::Del(static_path(path)?),
-                _ => return None,
-            })
-        })
-        .collect::<Option<Vec<_>>>()?;
+            }
+            // `|=` writes the first.
+            Expr::Update { path, filter } if is_closed_literal(filter) => {
+                let value = literal(filter)?.into_iter().next()?;
+                stages.push(ChainStage::Set(static_path(path)?, value, stage));
+            }
+            Expr::Assign { path, value } => {
+                stages.push(ChainStage::Copy(
+                    static_path(path)?,
+                    static_path(value)?,
+                    stage,
+                ));
+            }
+            Expr::CompoundAssign {
+                path,
+                op: AssignOp::Add,
+                value,
+            } if is_closed_literal(value) => {
+                let [value] = <[OwnedValue; 1]>::try_from(literal(value)?).ok()?;
+                stages.push(ChainStage::Add(static_path(path)?, value, stage));
+            }
+            Expr::Builtin(Builtin::Del(path)) => stages.push(ChainStage::Del(static_path(path)?)),
+            _ => return None,
+        }
+    }
     // A later write at, above or below a node an earlier one wrote, or one an earlier copy read.
     let related = |p: &[PathStep], q: &[PathStep]| p.starts_with(q) || q.starts_with(p);
     let touched: Vec<(usize, &[PathStep])> = stages

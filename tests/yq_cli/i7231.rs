@@ -199,3 +199,92 @@ fn a_copy_keeps_its_presentation_through_a_later_stage_7231() -> Result<()> {
         ),
     ])
 }
+
+/// The edges of the replay, each as yq writes it: `+=` of a string and a mapping, a negative index, a
+/// write through a scalar (yq leaves it), a `del` of a path that is not there, a stage the replay
+/// does not take (`|= . + 1`, `+=` of a number), and a literal with several values, which `=`
+/// writes one after the other (`.a = (1, [2])` is block, as the last value is written onto the
+/// scalar the first left) and `|=` takes the first of.
+#[test]
+fn the_replays_edges_read_as_yq_does_7231() -> Result<()> {
+    assert_rows(&[
+        (
+            "s: \"q\" # sc\nz: 1\n",
+            ".s += \"x\" | .s += \"y\"",
+            &[],
+            "s: \"qxy\" # sc\nz: 1\n",
+        ),
+        (
+            "o: {j: 1} # oc\nz: 1\n",
+            ".o += {\"k\": 2} | .o.k = 3",
+            &[],
+            "o: {j: 1, k: 3} # oc\nz: 1\n",
+        ),
+        (
+            "a: [1, 2] # c\nz: 1\n",
+            ".a[-1] = 5 | .a[-1] = [9]",
+            &[],
+            "a: [1, [9]] # c\nz: 1\n",
+        ),
+        (
+            "a: 5 # c\nz: 1\n",
+            ".a.b = 1 | .a.b = 2",
+            &[],
+            "a: 5 # c\nz: 1\n",
+        ),
+        (
+            "n: ~ # nc\nz: 1\n",
+            "del(.n.x) | .n = [1]",
+            &[],
+            "n:\n  - 1\nz: 1 # nc\n",
+        ),
+        (
+            "a: {p: 1} # c\nz: 1\n",
+            "del(.a.zz) | .a = [1]",
+            &[],
+            "a:\n  - 1\nz: 1 # c\n",
+        ),
+        (
+            "a: [1] # c\nz: 1\n",
+            "del(.a[5]) | .a = 5",
+            &[],
+            "a: 5 # c\nz: 1\n",
+        ),
+        (
+            "a: 5 # c\nz: 1\n",
+            "del(.a.x) | .a = [1]",
+            &[],
+            "a:\n  - 1\nz: 1 # c\n",
+        ),
+        (
+            "a: [x] # c\nz: 1\n",
+            ".a = 5 | .a |= . + 1",
+            &[],
+            "a: 6 # c\nz: 1\n",
+        ),
+        (
+            "a: 5 # c\nz: 1\n",
+            ".a += 1 | .a = [9]",
+            &[],
+            "a:\n  - 9\nz: 1 # c\n",
+        ),
+        (
+            "a: [x] # c\nz: 1\n",
+            ".a = (1, 2) | .a = [9]",
+            &[],
+            "a:\n  - 9\nz: 1 # c\n",
+        ),
+        (
+            "a: [x] # c\nz: 1\n",
+            ".a = (1, [2])",
+            &[],
+            "a:\n  - 2\nz: 1 # c\n",
+        ),
+        (
+            "a: [x] # c\nz: 1\n",
+            ".a |= ([1], 2)",
+            &[],
+            "a: [1] # c\nz: 1\n",
+        ),
+    ])
+}
