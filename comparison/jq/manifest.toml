@@ -336,8 +336,10 @@ args = ["--oracle", "{jq}", "{subject}"]
 timeout_s = 300
 
 # The rest of the set #7256's skip was verified on (#7257, #7258): two more seeds and the slurp
-# mode's EOF locations. Whether jq 1.7.1 reads an unwritten `tokenbuf[1]` as `u` depends on the
-# libc allocator, so each platform's run has to check these itself; about 17 s each on a Graviton4.
+# mode's EOF locations. jq 1.7.1 reads an unwritten `tokenbuf[1]` as `u` or not depending on the libc
+# allocator, and `artifact()` skips every stream that reaches that read; these entries check that the
+# skip misses none on the platform the run is on. A divergence here is a gap in the skip, or a new
+# platform dependence, not an expected residual. About 17 s each on a Graviton4.
 [[sweep]]
 id = "seq-seed-2"
 script = "scripts/jq-seq-oracle-sweep.py"

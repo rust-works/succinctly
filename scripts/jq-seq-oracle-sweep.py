@@ -309,10 +309,13 @@ def main():
     mode_args = SLURP_LOCATION_ARGS if args.slurp_location else WARNINGS_ARGS
 
     if not os.access(args.binary, os.X_OK):
-        sys.exit(
+        # A setup error exits 2, not 1: the compare harness reads 1 as "diverges" (comparison/jq/manifest.toml).
+        print(
             f"error: succinctly binary not found at {args.binary} — "
-            "run: cargo build --release --features cli"
+            "run: cargo build --release --features cli",
+            file=sys.stderr,
         )
+        sys.exit(2)
     jq, version = resolve_oracle(args.oracle)
     print(f"oracle: {jq} ({version}), succinctly: {args.binary}", file=sys.stderr)
 
