@@ -5782,12 +5782,7 @@ impl<'a> Parser<'a> {
                     && self.matches_keyword("is_key")
                     && !self.shadowable_defs.contains("is_key")
                 {
-                    // #6081: yq's `is_key`, whether the node is a mapping key node. `key` hands
-                    // back a plain string here, so a node is never one on its own: `false`.
-                    // [`Parser::is_key_after`] answers `true` for the stage straight after `key`.
-                    self.consume_keyword("is_key");
-                    let desugared = parse_with_mode_and_extensions("false", ParserMode::Yq, true)?;
-                    self.zero_arity_or_wrong_arity_call(keyword_start, Some("is_key"), desugared)
+                    self.parse_yq_is_key(keyword_start)
                 } else if self.mode == ParserMode::Yq
                     && self.matches_keyword("parents")
                     && !self.shadowable_defs.contains("parents")
@@ -12030,10 +12025,25 @@ impl<'a> Parser<'a> {
         Ok(Expr::pipe(exprs))
     }
 
+    /// #6081: yq's `is_key`, whether the node is a mapping key node. `key` hands back a plain
+    /// string here, so a node is never one on its own: `false`. [`Self::is_key_after`] answers
+    /// `true` for the stage straight after `key`. Out of line so the recursive primary parser's
+    /// frame stays small (a deeper frame overflowed a 40-deep `def` chain on ARM64 Linux).
+    #[inline(never)]
+    fn parse_yq_is_key(&mut self, keyword_start: usize) -> Result<Expr, ParseError> {
+        self.consume_keyword("is_key");
+        self.zero_arity_or_wrong_arity_call(
+            keyword_start,
+            Some("is_key"),
+            Expr::Literal(Literal::Bool(false)),
+        )
+    }
+
     /// #6081: yq's `is_key` on the stage straight after `key` is `true`: `.a | key | is_key`.
     /// `key` returns a plain string here, so the answer comes from the spelling of the two stages
     /// instead of from a mark on the value; any other place `is_key` appears is `false`
     /// (docs/compliance/yq/limitations.md). `stage` is what was parsed from `start`.
+    #[inline(never)]
     fn is_key_after(&self, before: &[Expr], start: usize, stage: Expr) -> Expr {
         fn ends_in_key(expr: &Expr) -> bool {
             match expr {
