@@ -243,6 +243,9 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
         match owned {
             OwnedValue::Null => JqValue::Null,
             OwnedValue::Bool(b) => JqValue::Bool(b),
+            OwnedValue::SpelledScalar(kind, _) => {
+                Self::from_owned_at_depth(kind.canonical(), depth)
+            }
             OwnedValue::Int(n) => JqValue::Int(n),
             OwnedValue::Float(f) => JqValue::Float(f),
             // A parsed NaN (#3309) has no number spelling to defer (its text

@@ -89,6 +89,7 @@ impl SVal {
         match value {
             OwnedValue::Null => Self::Null,
             OwnedValue::Bool(b) => Self::Bool(*b),
+            OwnedValue::SpelledScalar(kind, _) => Self::from_owned(&kind.canonical(), origin),
             OwnedValue::NumberLiteral(..) => Self::literal(value.clone()),
             OwnedValue::Int(_) | OwnedValue::Float(_) => match origin {
                 NumOrigin::Document => Self::literal(value.clone()),

@@ -603,6 +603,21 @@ fn stream_owned_value_json_with_at_depth<W: core::fmt::Write>(
     }
     assert_value_tree_depth(depth);
     match value {
+        OwnedValue::SpelledScalar(kind, _) => stream_owned_value_json_with_at_depth(
+            &kind.canonical(),
+            out,
+            current_indent,
+            indent_spaces,
+            unit,
+            sort_keys,
+            escape,
+            float_fmt,
+            infinite_float,
+            infinite_literal,
+            finite_literal,
+            jq_printer,
+            depth,
+        ),
         OwnedValue::Null => out.write_str("null"),
         OwnedValue::Bool(true) => out.write_str("true"),
         OwnedValue::Bool(false) => out.write_str("false"),
@@ -1045,6 +1060,15 @@ fn stream_owned_value_yaml_at_depth<W: core::fmt::Write>(
 ) -> core::fmt::Result {
     assert_value_tree_depth(depth);
     match value {
+        OwnedValue::SpelledScalar(kind, _) => stream_owned_value_yaml_at_depth(
+            &kind.canonical(),
+            out,
+            indent,
+            indent_spaces,
+            unit,
+            sort_keys,
+            depth,
+        ),
         OwnedValue::Null => out.write_str("null"),
         OwnedValue::Bool(true) => out.write_str("true"),
         OwnedValue::Bool(false) => out.write_str("false"),

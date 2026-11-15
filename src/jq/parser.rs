@@ -1328,6 +1328,7 @@ fn meta_from_owned(value: &OwnedValue) -> MetaValue {
     match value {
         OwnedValue::Null => MetaValue::Null,
         OwnedValue::Bool(b) => MetaValue::Bool(*b),
+        OwnedValue::SpelledScalar(kind, _) => meta_from_owned(&kind.canonical()),
         OwnedValue::Int(n) => MetaValue::Number(Literal::Int(*n)),
         OwnedValue::Float(f) => MetaValue::Number(Literal::Float(*f)),
         OwnedValue::NumberLiteral(repr, text) => {

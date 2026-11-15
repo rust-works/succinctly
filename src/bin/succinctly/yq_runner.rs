@@ -4430,6 +4430,7 @@ fn owned_value_align_hash(value: &OwnedValue) -> u64 {
         assert_value_tree_depth(depth);
         let mut h = DefaultHasher::new();
         match value {
+            OwnedValue::SpelledScalar(kind, _) => return hash_at_depth(&kind.canonical(), depth),
             OwnedValue::Null => 0_u8.hash(&mut h),
             OwnedValue::Bool(b) => (1_u8, b).hash(&mut h),
             OwnedValue::Int(i) => (2_u8, number_bits(*i as f64)).hash(&mut h),
@@ -4965,6 +4966,7 @@ fn core_tag_of(value: &OwnedValue) -> &'static str {
     match value {
         OwnedValue::Null => "!!null",
         OwnedValue::Bool(_) => "!!bool",
+        OwnedValue::SpelledScalar(kind, _) => core_tag_of(&kind.canonical()),
         OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _) => "!!int",
         OwnedValue::Float(_) | OwnedValue::NumberLiteral(NumberRepr::Float(_), _) => "!!float",
         OwnedValue::String(_) => "!!str",
@@ -6738,6 +6740,7 @@ fn anchor_or_alias_name(s: &str, kind: &str) -> Result<Option<String>, EvalError
 /// a quoted style (`a: !!int "5"`, #747) keeps rendering as it does today.
 fn plain_scalar_text(value: &OwnedValue) -> Option<String> {
     match value {
+        OwnedValue::SpelledScalar(kind, _) => plain_scalar_text(&kind.canonical()),
         OwnedValue::Null => Some("null".to_string()),
         OwnedValue::Bool(b) => Some(b.to_string()),
         OwnedValue::Int(n) => Some(n.to_string()),
@@ -11215,6 +11218,15 @@ fn emit_yaml_value_at_depth(
         }
     }
     match value {
+        OwnedValue::SpelledScalar(kind, _) => emit_yaml_value_at_depth(
+            &kind.canonical(),
+            comments,
+            config,
+            indent,
+            in_flow,
+            depth,
+            owner_indent,
+        ),
         OwnedValue::Null => "null".to_string(),
         OwnedValue::Bool(b) => b.to_string(),
         OwnedValue::Int(n) => n.to_string(),
@@ -11988,6 +12000,9 @@ fn emit_tagged_scalar(
         return spelled.map(str::to_string);
     }
     let (tag, text) = match value {
+        OwnedValue::SpelledScalar(kind, _) => {
+            return emit_tagged_scalar(&kind.canonical(), comments, config, indent, in_flow, depth);
+        }
         OwnedValue::Null => ("!!null", "null".to_string()),
         OwnedValue::Bool(b) => ("!!bool", b.to_string()),
         OwnedValue::Int(n) => ("!!int", n.to_string()),

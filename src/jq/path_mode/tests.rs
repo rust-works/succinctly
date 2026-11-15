@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::jq::eval_generic::to_owned;
+use crate::jq::ScalarKind;
 use crate::json::JsonIndex;
 
 /// What jq printed: each output compactly, then the uncaught error's message,
@@ -2535,6 +2536,9 @@ fn owned_value_truthiness_agrees_across_routes_7244() {
         OwnedValue::Null,
         OwnedValue::Bool(false),
         OwnedValue::Bool(true),
+        OwnedValue::SpelledScalar(ScalarKind::Null, "~".into()),
+        OwnedValue::SpelledScalar(ScalarKind::True, "True".into()),
+        OwnedValue::SpelledScalar(ScalarKind::False, "FALSE".into()),
         OwnedValue::Int(0),
         OwnedValue::Float(0.0),
         OwnedValue::String("".into()),
@@ -2543,7 +2547,7 @@ fn owned_value_truthiness_agrees_across_routes_7244() {
         OwnedValue::Object(crate::jq::ObjectMapOf::default()),
     ];
     for v in &values {
-        let expected = !matches!(v, OwnedValue::Null | OwnedValue::Bool(false));
+        let expected = !matches!(*v.canonical(), OwnedValue::Null | OwnedValue::Bool(false));
         assert_eq!(v.is_truthy(), expected, "is_truthy of {v:?}");
         assert_eq!(truthy(v), expected, "path_mode::truthy of {v:?}");
         assert_eq!(v.is_falsy(), !expected, "is_falsy of {v:?}");
