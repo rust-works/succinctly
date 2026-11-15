@@ -3,8 +3,8 @@
 //! A `%YAML` directive was dropped (the preamble gave up on any `%` line) or, after `---`, held as the first node's
 //! head and carried into the document with it; a header with no `---` lost the indent of an indented comment or
 //! `%YAML` line; a comment after `---` over an empty root was lost (it is no node's head); a line of only blanks after
-//! `---` printed twice; and a head written to a scalar root left the header in place. Each row of the tables is a
-//! live yq v4.53.3 capture.
+//! `---` printed twice; a tag or anchor on the root's line (`!!str 5`) gave up on the header; and a head written to a
+//! scalar root left the header in place. Each row of the tables is a live yq v4.53.3 capture.
 
 use anyhow::Result;
 
