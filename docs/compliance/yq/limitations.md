@@ -7548,6 +7548,7 @@ A non-empty block container written over the node (`.b = {"y": 2}`, `.b = [9]`) 
 Swept against yq v4.53.3: four container sources (flow sequence, flow mapping, empty `[]`, empty `{}`) against ten writes (a number, `null`, a quoted string, a string that needs quoting, a multi-line string that becomes `|- # t`, a float, a boolean, `length`, `tostring`, a copy of another node), five sources including a scalar against `{}` and `[]`, the document root, a node with an anchor, an alias or a tag, and a last key.
 Still different:
 
+- **A write inside a construction or read back as text** (`[.a = {"x": 1}]`, `.a = {"x": 1} | tostring`, `| to_yaml`): yq holds the comment there too (`b: 6 # own`), and this build drops it, since the held-comment pass runs on a printed document ([#7235](https://github.com/rust-works/succinctly/issues/7235)).
 - **A block mapping whose key line carries the comment** (`b: # t` / `  x: 1`) overwritten with an empty `{}` / `[]`.
   yq writes `b: # t` and the `{}` on the next line, which it cannot read back as the same document; this build writes `b: {} # t`.
 - **An explicit-key entry** (`? [1] # t` / `: 2`) written through `.[] = 5` prints `'': 5` here and `? [1] # t` / `: 5` in yq: the complex key is spelled `""` ([#3992](https://github.com/rust-works/succinctly/issues/3992)), a different mechanism from the comment.
