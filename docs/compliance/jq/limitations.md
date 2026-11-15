@@ -10171,8 +10171,12 @@ Two pieces of jq's own wording are misleading, and are reproduced rather than co
 
 There is also a genuine quirk in jq's classifier that succinctly matches: `check_literal`
 reads `tokenbuf[1]` without consulting `tokenpos`, so a bare `n` is measured against
-whatever byte an earlier token left behind. `printf '\x1en'` reports `Invalid numeric
-literal`, but the same `n` after an `iu` token reports `Invalid literal`.
+whatever byte an earlier token left behind.
+`printf '\x1e"iu" n'` reports `Invalid literal`, because the string left `u` at index 1, and the same `n`
+after a token that left another byte reports `Invalid numeric literal`.
+When no earlier token in the stream has written index 1, the byte is uninitialised heap in jq itself (`parser_init` leaves `tokenbuf` null and `token()` grows it with `jv_mem_realloc`), so the answer belongs to the libc allocator, not to jq (#7256).
+`printf '\x1en'` reports `Invalid numeric literal` on macOS and on x86_64 glibc, and `Invalid literal` on Amazon Linux 2023 aarch64, from the same 1.7.1 source.
+`succinctly jq` answers as if that byte were not `u`, which is the first of those, and `scripts/jq-seq-oracle-sweep.py` skips a stream whose first bare `n` is classified before any token has written the byte (`--expect-artifacts` includes it).
 
 The value path uses the same reader: values jq hands off before a malformed suffix are
 materialized, while values invalidated by the scan call that discovers the error are not.

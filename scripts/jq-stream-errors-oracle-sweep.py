@@ -31,6 +31,12 @@ TOKENS = [
     "12345678", '"long string value"',
 ]
 
+# No uninitialised-`tokenbuf` exposure (#7256): `check_literal` reads `tokenbuf[1]` for a bare `n`, and
+# jq reads heap nothing wrote when no earlier token has. TOKENS has no one-byte `n` (`nul`, `nan` and
+# `null` each write index 1 themselves) and joins tokens only by concatenation, so a lone `n` token
+# cannot arise. `scripts/jq-seq-oracle-sweep.py` skips the shape; add the same skip here if a bare `n`
+# is ever added to TOKENS.
+
 PROGRAMS = [
     ["-c", "[., input_filename, input_line_number]"],
     ["-c", "-s", "[., input_filename, input_line_number]"],
