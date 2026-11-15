@@ -2524,3 +2524,28 @@ fn an_index_key_holding_an_assignment_is_judged_by_its_parts_5243() {
         );
     }
 }
+
+/// #7244: every route that decides truthiness over an `OwnedValue` answers what
+/// `OwnedValue::is_truthy` does, so a spelled scalar (#2802) has one place to be
+/// taught about. Only `null` and `false` are falsy, whatever else a value holds.
+#[test]
+fn owned_value_truthiness_agrees_across_routes_7244() {
+    use crate::jq::stream::StreamableValue;
+    let values = [
+        OwnedValue::Null,
+        OwnedValue::Bool(false),
+        OwnedValue::Bool(true),
+        OwnedValue::Int(0),
+        OwnedValue::Float(0.0),
+        OwnedValue::String("".into()),
+        OwnedValue::String("false".into()),
+        OwnedValue::Array(crate::jq::ArrayOf::default()),
+        OwnedValue::Object(crate::jq::ObjectMapOf::default()),
+    ];
+    for v in &values {
+        let expected = !matches!(v, OwnedValue::Null | OwnedValue::Bool(false));
+        assert_eq!(v.is_truthy(), expected, "is_truthy of {v:?}");
+        assert_eq!(truthy(v), expected, "path_mode::truthy of {v:?}");
+        assert_eq!(v.is_falsy(), !expected, "is_falsy of {v:?}");
+    }
+}

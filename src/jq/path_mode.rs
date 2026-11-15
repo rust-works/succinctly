@@ -134,7 +134,7 @@ fn promote_built(value: &mut OwnedValue) {
 }
 
 fn truthy(value: &OwnedValue) -> bool {
-    !matches!(value, OwnedValue::Null | OwnedValue::Bool(false))
+    value.is_truthy()
 }
 
 /// A persistent path prefix: a fork shares its parent for free.
