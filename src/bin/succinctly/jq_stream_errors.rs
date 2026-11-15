@@ -1134,6 +1134,8 @@ struct Parser {
     next: Option<OwnedValue>,
     /// jq's `tokenbuf`/`tokenpos`, as in [`crate::jq_seq_reader`]: a buffer that is not cleared
     /// with the token, because `check_literal` reads `tokenbuf[1]` without checking `tokenpos`.
+    /// Before any token has written index 1 that is uninitialised memory in jq, modelled here
+    /// as not `u` (#7256, see [`crate::jq_seq_reader`]).
     token_buf: Vec<u8>,
     token_len: usize,
     source: usize,

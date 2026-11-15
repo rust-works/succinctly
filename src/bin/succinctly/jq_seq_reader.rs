@@ -1116,9 +1116,17 @@ struct Reader<'a> {
     /// reports "Invalid numeric literal", but the same `n` after an
     /// earlier `iu` token reports "Invalid literal" instead. Reproduced
     /// deliberately (ADR-0018 rule: bug-for-bug), and it is deterministic
-    /// for any given input even though jq is reading a stale byte. A string
-    /// leaves the text it decoded to there, not the text it held
+    /// for any given input once some earlier token has written index 1. A
+    /// string leaves the text it decoded to there, not the text it held
     /// ([`Reader::found_string`], #6513).
+    ///
+    /// Until a token has written index 1, jq reads *uninitialised* heap there
+    /// (`parser_init` leaves `tokenbuf` null and `token()` grows it with
+    /// `jv_mem_realloc`), which is not deterministic: it is not `u` on macOS or
+    /// x86_64 glibc and is `u` on Amazon Linux 2023 aarch64 (#7256). No
+    /// implementation can match that, so an unwritten byte is modelled as not
+    /// `u`, the answer of the first two, and `scripts/jq-seq-oracle-sweep.py`
+    /// skips the streams that depend on it.
     token_buf: Vec<u8>,
     token_len: usize,
     next: Option<Kind>,

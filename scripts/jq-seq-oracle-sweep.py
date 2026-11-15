@@ -34,6 +34,17 @@ than its parser, and it does not survive into a newline-terminated stream:
 `--expect-artifacts` re-enables the shape that trips it, for confirming it
 is still the only divergence.
 
+A second artifact is not the line reader's but jq's own, and no implementation
+can match it (#7256): `check_literal` reads `tokenbuf[1]` for a bare `n` without
+consulting `tokenpos`, and when no earlier token of the stream has written index 1
+that byte is uninitialised heap (`parser_init` leaves `tokenbuf` null and `token()`
+grows it with `jv_mem_realloc`). Apple's jq and x86_64 glibc's happen to hold
+something that is not `u` there, Amazon Linux 2023 on aarch64 holds `u`, so
+`\x1en` reports "Invalid numeric literal" on the first two and "Invalid literal" on
+the third. `artifact()` skips a stream whose first bare `n` is classified before
+any token has written index 1, so the sweep keeps checking the case it can check,
+a byte an earlier token left (#1723, #6513). `--expect-artifacts` includes it.
+
 **History.** Two more artifacts of that same `fgets` buffer used to live
 here -- a trailing unterminated RS-record after an earlier newline being
 dropped unread below the buffer boundary and parsed above it, and a record
@@ -179,16 +190,80 @@ def malformed_bom(data):
     return data[:1] == b"\xef" and not data.startswith(b"\xef\xbb\xbf")
 
 
+# Bytes that end a token outside a string: jq's `token()` is called for each of these.
+_TOKEN_ENDS = b" \t\r\n\x1e[]{},:\""
+
+
+def reads_unwritten_tokenbuf(data):
+    """Whether jq 1.7.1 classifies a bare one-byte `n` token (`check_literal`'s
+    `tokenbuf[1] == 'u'`) before anything in `data` has written `tokenbuf[1]`
+    (#7256), so what it compares is uninitialised heap.
+
+    Index 1 is written by a token of two or more bytes (`tokenadd`), by a one-byte
+    token on the number path (`t`, `f` and `n` are the three that are not: jq
+    NUL-terminates the token in place, at index 1), and by a string of two or more
+    bytes, which `tokenadd`s its raw bytes whatever it decodes to (`"\\u0041"` leaves
+    the `u`, #6513) and whether or not it is ever closed. An RS ends a token or a
+    string wherever it stands: jq tests it before its parser state. Bytes before the
+    first RS are not tokenised (jq is waiting for one) unless a malformed BOM has
+    already put the parser back in `Normal`. A parse error does not make jq skip
+    ahead: it resets the parser and reads the next byte (limitations.md, "need RS to
+    resync" never resyncs).
+
+    Where this cannot tell it says "not written", which skips more streams than the
+    exposure needs and never fewer."""
+    if malformed_bom(data):
+        # jq consumed the part of the BOM that matched without tokenising it.
+        start = 0
+        while start < 3 and data[start : start + 1] == b"\xef\xbb\xbf"[start : start + 1]:
+            start += 1
+    else:
+        start = data.find(RS)
+        if start < 0:
+            return False
+    written = False
+    i = start
+    n = len(data)
+    while i < n:
+        byte = data[i]
+        if byte == 0x22:  # a string: up to its closing quote, an RS, or the end
+            j = i + 1
+            while j < n and data[j] not in (0x22, RS[0]):
+                j += 2 if data[j] == 0x5C and data[j + 1 : j + 2] != RS else 1
+            if j - i - 1 >= 2:
+                written = True
+            i = j + 1 if data[j : j + 1] == b'"' else j
+        elif byte in _TOKEN_ENDS:
+            i += 1
+        else:
+            j = i
+            while j < n and data[j] not in _TOKEN_ENDS:
+                j += 1
+            word = data[i:j]
+            if len(word) >= 2:
+                written = True
+            elif word == b"n":
+                if not written:
+                    return True
+                # written already; a bare `n` leaves its own NUL at index 1
+            elif word not in (b"t", b"f"):
+                written = True
+            i = j
+    return False
+
+
 def artifact(data):
-    """Whether `data` trips the one `fgets`-line-reader artifact #2998
-    left unmodeled. jq's own end-of-stream rule (an RS closing a record
+    """Whether `data` trips an artifact of jq itself: the one `fgets`-line-reader
+    artifact #2998 left unmodeled, or the uninitialised `tokenbuf` byte (#7256). jq's own end-of-stream rule (an RS closing a record
     that yields no value ends the *entire* stream, silently, iff that
     record is the first thing jq's own `fgets`-chunked final buffer
     scans) is matched now, so the two shapes that used to trip it --
     both properties of that same buffer boundary, not of the parser --
     are no longer here; see the module docstring's history note."""
     if b"\x00" in data and b"\n" not in data.split(b"\x00", 1)[0]:
-        return True  # strlen truncation -- the one artifact left, #3+
+        return True  # strlen truncation, #3+
+    if reads_unwritten_tokenbuf(data):
+        return True  # jq reads uninitialised memory -- #7256, matched by no implementation
     if RS not in data:
         # #1525's separate template -- except after a malformed BOM, which
         # makes jq read the stream rather than abandon it, so those stay in.
