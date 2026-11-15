@@ -7316,7 +7316,8 @@ Nor, since #7024, for a program that calls `input`/`inputs` over two or more reg
 Standard input named on the command line as `-` (`cat log | jq -R . -`) is read whole, on this route as on the plain filter's: the windowed routes take standard input only when no file is named.
 Since [#7082](https://github.com/rust-works/succinctly/issues/7082) it no longer does for `--seq` over one regular file (or a redirected one) of 4 MiB or more whose stream is RFC 7464's own framing, every record `RS value LF` (below).
 Since [#7164](https://github.com/rust-works/succinctly/issues/7164) it no longer does for `--seq` over a pipe on standard input that holds 4 MiB or more, up to the pipe's first record that is not that framing: from there the rest of the stream is held, as the route that reads it whole holds it.
-Every other route that reads the input still holds all of it: `--seq` over several files or a stream that is not that framing (on a pipe, from its first record that is not), `--input-dsv`, `--stream-errors`, standard input that is a terminal or a pipe under 4 MiB (for the plain filter and for `-R`), and the programs that call `input`/`inputs` over several files one of which is not UTF-8, or past a hand-off to the eager reader (below) (`reduce inputs` peaked at 32.8 MiB against 14.6 for one file, on two 11 MB files, until #7024, and `-R length a b` at 30.7 against 12.7).
+Since [#7218](https://github.com/rust-works/succinctly/issues/7218) and [#7221](https://github.com/rust-works/succinctly/issues/7221) it no longer does for `--seq` over several regular files of 4 MiB or more between them while each file is that framing and ends in an LF: from the first that is not, that file and the ones after it are held (below).
+Every other route that reads the input still holds all of it: `--seq` over a stream that is not that framing (on a pipe, from its first record that is not; over several files, from the first file that is not), `--input-dsv`, `--stream-errors`, standard input that is a terminal or a pipe under 4 MiB (for the plain filter and for `-R`), and the programs that call `input`/`inputs` over several files one of which is not UTF-8, or past a hand-off to the eager reader (below) (`reduce inputs` peaked at 32.8 MiB against 14.6 for one file, on two 11 MB files, until #7024, and `-R length a b` at 30.7 against 12.7).
 That is a known limitation, not supported at this stage: it is outside the three reasons ADR-0018 permits a divergence for, so it is a deferred gap and not a deliberate behaviour.
 It is tracked in [#7024](https://github.com/rust-works/succinctly/issues/7024) (the plain filter over a list with a path that is not a regular file; `input`/`inputs` over a file that is not UTF-8).
 The tables below were measured before #6920 and #7023 and show every row as it was; the rows they fixed are the first five of each (`first(inputs)` was flat already).
@@ -7586,7 +7587,7 @@ Release builds with `--features cli` of `main` @ `15dcf4a82`, a second build of 
 What the windowed route does not cover, and which still hold the input:
 
 - a terminal on standard input, a pipe under 4 MiB, and a list of files with a path that is not a regular file, that does not open, or that is the run's own standard output or error when the run starts: #7024;
-- programs that call `input`/`inputs` (with or without `-n`), `-R`, `--input-dsv` and `--stream-errors`, which have their own readers: #7023 and #7024 cover the first two over regular files (`input`/`inputs` over up to 32), the rest are not windowed; and `--seq` over several files or a stream that is not RFC 7464's own framing (a pipe is windowed up to its first record that is not, [#7164](https://github.com/rust-works/succinctly/issues/7164)), and `--seq -s` (the whole-file route's by design);
+- programs that call `input`/`inputs` (with or without `-n`), `-R`, `--input-dsv` and `--stream-errors`, which have their own readers: #7023 and #7024 cover the first two over regular files (`input`/`inputs` over up to 32), the rest are not windowed; and `--seq` over a stream that is not RFC 7464's own framing (a pipe is windowed up to its first record that is not, [#7164](https://github.com/rust-works/succinctly/issues/7164), several files up to the first file that is not, #7221), and `--seq -s` (the whole-file route's by design);
 - `-s` and `--validate`, which read the stream whole by design.
 
 ### `--seq` over a regular file of RFC 7464 records is windowed (#7082)
@@ -7621,6 +7622,26 @@ Time, interleaved (11 repetitions, a control run of the base beside the real one
 - **Below 4 MiB** the route is not taken: the 1 MiB rows read +0.2% and +0.8% (x86_64) and +2.9% and −3.6% (aarch64), a few tenths of a millisecond.
 
 It was checked against the base binary over 1,680 runs of 210 random 4 to 7 MiB streams (pretty-printed and compact records, a 2 MB record, `\r\n` and blank-line endings, a truncated tail, a stray or doubled RS, a BOM, a NUL, invalid UTF-8, a flipped byte), each under four of seven programs on a file and as `< file`: no difference in stdout, stderr or exit status.
+
+### `--seq` over several regular files is windowed (#7218, #7221)
+
+Several regular files of 4 MiB or more between them are read as the one stream jq reads them as, a window at a time, while each file is RFC 7464's own framing on its own and ends in an LF: the join of two such files is `... LF RS ...`, framed as it is inside one.
+Up to 32 files are held open from the start and each is judged by the prepass above before the run (#7218).
+A longer list is opened by path as the run reaches each file, as jq opens them, so each is judged on the handle the run opened when it reached it (#7221).
+At the first file that is not plain records the windows end, and that file and the ones after it go to the route that reads them whole (`hand_on_seq_files_tail`), behind a source of their own that holds an RS and one line feed for each line already read.
+That is where jq's reader stands after plain records (as for a `--seq` pipe, #7164): a parse warning names the line counted over every file, a runtime error's `(at <file>:N)` the line in its own file, and a byte-order mark there is not the stream's front.
+The byte the records before left in jq's token buffer is carried over too.
+So a list with one file that is not plain holds that file and every file after it.
+
+Peak resident set size, in MiB, `--seq -c .` over 100 MiB of records (993,416 records, 105,851,071 bytes) in 100 files, each a hundredth of the records:
+
+| machine           | before | after | file 50 not plain |
+|-------------------|-------:|------:|------------------:|
+| AMD Ryzen 9 7950X |  248.8 |  11.3 |             132.6 |
+| Apple M4 Pro      |  255.9 |   8.9 |             135.6 |
+
+The x86_64 figures are `/usr/bin/time -f %M` on `terminus` (at 10 MiB 33.2 and 10.3), the aarch64 ones `wait4`'s `ru_maxrss` on `johns-mac-mini` (at 10 MiB 32.9 and 5.8), medians of 3 interleaved with the base, release builds with `--features cli`, base `main` @ `650bf39ea`.
+The output, standard error included, and the exit status of every row are the base binary's, and the 100 plain files print what the one file of the same records prints.
 
 ## Nesting depth (#5497)
 

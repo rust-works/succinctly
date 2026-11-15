@@ -11996,8 +11996,8 @@ thread_local! {
 /// jq's reader stands after the records already run as it stands after an RS and that many line
 /// breaks, with nothing pending (see [`crate::jq_seq_reader::resumed_stream`]), so a source of those
 /// bytes goes first, named as the file before: a parse error's line counts every line of the stream,
-/// and a byte-order mark is skipped only at its front, as in jq. It is a source of its own because
-/// `input_line_number` counts from each file's start. The files from the one that stopped the windows
+/// and a byte-order mark is skipped only at its front, as in jq. It is a source of its own because the
+/// line a runtime error names (`(at <file>:N)`) counts from its file's start. The files from the one that stopped the windows
 /// are read again by path, as the run that reaches them reads them; one that will not open now is
 /// reported by that route, past the files before it. `past_open_failure` is a run that met a file that
 /// did not open, which jq's main loop ends after the next value: the tail's first.
