@@ -9460,22 +9460,17 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
         {
             return None;
         }
-        // The header ends before a line of properties alone (`!!map` over its entries), which is the node's too.
+        // The header ends before a line of properties alone (`!!map` over its entries), which is the node's too, and
+        // before any line yq does not set aside (`%TAG`, a marker with content after it).
         let preamble = core::str::from_utf8(&before[..line_start.min(self.header_end())]).ok()?;
-        let mut directive_seen = false;
-        for line in preamble.split_inclusive('\n') {
-            let bare = line.trim_end_matches(['\n', '\r']);
-            if super::parser::starts_yq_yaml_directive(bare.as_bytes()) {
-                // #7099: a `%YAML` directive is a line of yq's header, which it prints back as written.
-                directive_seen = true;
-            } else if bare.starts_with('%')
-                || (bare.starts_with("---") && !is_bare_marker_line(bare.as_bytes()))
-            {
-                // Another directive, or a marker with something after it: yq's handling of
-                // those is its own (an upstream quirk), not reproduced here.
-                return None;
-            }
-        }
+        // A header cut at a marker with a comment after it (`--- # m`) ends mid-line: yq glues the comment onto the
+        // content's line there and cannot read its output back ([`yq_header_len`]). The preamble stops at the line
+        // before, as it did before #7099, or the marker would glue onto the content here (`---a: 3`).
+        let preamble = &preamble[..preamble.rfind('\n').map_or(0, |i| i + 1)];
+        // #7099: a `%YAML` directive is a line of yq's header, which it prints back as written.
+        let directive_seen = preamble
+            .split_inclusive('\n')
+            .any(|line| super::parser::starts_yq_yaml_directive(line.as_bytes()));
         // Through the last `---` line (or `%YAML` line after one) and the blank lines straight after it; the
         // comments after that belong to the first node, which prints its own head.
         match header_head_start(preamble.as_bytes()) {
@@ -11529,6 +11524,12 @@ fn is_bare_marker_line(line: &[u8]) -> bool {
 /// twice, and a `%YAML` line in a head moved into the document with its node, which then could not be read back
 /// (#7099). The one split for the preamble and the head.
 fn header_head_start(header: &[u8]) -> Option<usize> {
+    // A header cut at a marker with a comment after it (`--- # m`) ends mid-line; the preamble stops at the line
+    // before ([`YamlCursor::document_preamble`]), and so does the split.
+    let header = &header[..header
+        .iter()
+        .rposition(|&b| is_line_break(b))
+        .map_or(0, |i| i + 1)];
     let mut start: Option<usize> = None;
     let mut pos = 0;
     while pos < header.len() {

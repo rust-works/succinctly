@@ -311,3 +311,24 @@ fn test_a_yaml_directive_after_the_marker_never_moves_into_the_document_7099() -
     }
     Ok(())
 }
+
+/// (document, filter, output): a header cut at a marker with a comment after it (`--- # m`), where yq glues the comment
+/// onto the content's line and cannot read its own output back (`yq_header_len`). The preamble stops at the line
+/// before, as on `main`, and the marker never glues onto the content (`---a: 3` is a key named `---a`).
+const CUT_MARKER: &[(&str, &str, &str)] = &[
+    ("--- # m\na: 1\n", ".a = 3", "a: 3\n"),
+    ("# a\n--- # m\na: 1\n", ".a = 3", "# a\n\na: 3\n"),
+    ("%YAML 1.2\n--- # m\n5\n", ". = 6", "%YAML 1.2\n6\n"),
+    ("---\t# m\n[]\n", ".[0] = 1", "- 1\n"),
+];
+
+#[test]
+fn test_a_marker_with_a_comment_after_it_never_glues_onto_the_content_7099() -> Result<()> {
+    for (doc, filter, expected) in CUT_MARKER {
+        let (stdout, code) = run_yq_stdin(filter, doc, &[])?;
+        assert_eq!((stdout.as_str(), code), (*expected, 0), "{doc:?} {filter}");
+        let (_, reread) = run_yq_stdin(".", &stdout, &[])?;
+        assert_eq!(reread, 0, "{doc:?} {filter}: {stdout:?} reads back");
+    }
+    Ok(())
+}
