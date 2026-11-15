@@ -577,8 +577,18 @@ DEFAULT_THRESHOLD = 5.0
 # exact: -4.3% x86_64 on this 2 MB row against a merge-base without it (every other row +0.0%). A
 # revert would read +4.5%, which the default 5.0 lets through. Memory and time are watched by the
 # `seq_field_bad_first` / `seq_field_bad_last` rows of `comparison/jq/queries/perf.tsv`.
+#
+# It is raised to 20.0 for #7263, and `seq_array_bad_last` / `seq_keys_bad_last` carry overrides of
+# the same one-off kind: the `--seq` walk finds the newline that ends each `fgets` chunk a block at a
+# time instead of a byte at a time, and these rows' walk counts every chunk of the stream twice
+# (`final_buffer_start`, `value_locations`): -16.2% / -14.1% / -13.6% x86_64, -12.2% / -10.5% / -9.9%
+# ARM64-Linux against the PR's own merge-base, outputs byte-identical. Lower `seq_name_bad_last` to
+# 3.0 and remove the other two once `main` carries the change and the rows read ~0% against a
+# merge-base that includes it.
 QUERY_THRESHOLDS = {
-    "seq_name_bad_last": 3.0,
+    "seq_name_bad_last": 20.0,
+    "seq_array_bad_last": 20.0,
+    "seq_keys_bad_last": 20.0,
     "wide_keys_unsorted": 10.0,
     "users_yq_raw_test": 65.0,
     "users_yq_raw_slice": 90.0,
