@@ -9104,7 +9104,10 @@ fn retain_truthy_generic<V: DocumentValue, S: EvalSemantics>(
 /// doubles there. A `None` adds nothing to either outcome and is not kept.
 /// Everything else (a cursor, a lazy result, an error a lazy object raised) is
 /// pushed as it is, still flattened in its place, so an earlier lazily failing
-/// element still wins and the prefix kept on an error is unchanged.
+/// element still wins and the prefix kept on an error is unchanged. The batch
+/// itself is reserved for every element left when such a result is its first
+/// entry (an all-cursors walk such as `[.[] | .a]` fills one entry per element),
+/// and not before, since a batch that is one run needs a single entry.
 fn push_element_result<V: DocumentValue>(
     per_element: &mut Vec<GenericResult<V>>,
     result: GenericResult<V>,
@@ -9128,13 +9131,19 @@ fn push_element_result<V: DocumentValue>(
                 per_element.push(GenericResult::ManyOwned(os));
             }
         }
-        other => per_element.push(other),
+        other => {
+            if per_element.is_empty() {
+                per_element.reserve(remaining);
+            }
+            per_element.push(other);
+        }
     }
 }
 
 #[cfg(test)]
 mod per_element_batch_tests_7267 {
     use super::*;
+    use crate::jq::parse;
     use crate::json::light::{JsonIndex, StandardJson};
 
     type Batch<'a> = Vec<GenericResult<StandardJson<'a, Vec<u64>>>>;
@@ -14183,7 +14192,9 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
             GenericResult::ManyCursor(cs) => {
                 let rest = &stages[j..];
                 let rest_whole = PipeWhole::rebuilt();
-                let mut per_element = vec_with_capacity(cs.len());
+                // Reserved by `push_element_result` once it is known what the batch
+                // holds: a run needs one entry, not one per element (#7267).
+                let mut per_element = Vec::new();
                 let elements = cs.len();
                 for (i, c) in cs.into_iter().enumerate() {
                     match eval_single_pipe::<S, _>(rest, &rest_whole, c.value(), optional, Some(c))
