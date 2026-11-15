@@ -6008,7 +6008,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         }
         // A run that stopped reads no further, as jq's main loop does.
         seq_tail_handed_on = !run_stopped
-            && (hand_on_seq_pipe_tail() || hand_on_seq_files_tail(&args, past_open_failure));
+            && (hand_on_seq_pipe_tail(&args) || hand_on_seq_files_tail(&args, past_open_failure));
     }
     if !lazy_path_taken || seq_tail_handed_on {
         // The materializing path: reads every document up front into a
@@ -11591,6 +11591,7 @@ fn windowed_seq_file(args: &JqCommand) -> Option<WindowedSource> {
     // the whole-file route's.
     let files = get_input_files(args);
     SEQ_FILES_TAIL.with(|tail| *tail.borrow_mut() = None);
+    SEQ_PIPE_TAIL.with(|tail| *tail.borrow_mut() = None);
     let Some((files, reader, reread)) = windowed_source(args) else {
         // #7164: a pipe on standard input, which cannot be read twice, is certified as it is read.
         return files.is_empty().then(windowed_seq_pipe).flatten();
@@ -11609,10 +11610,48 @@ fn windowed_seq_file(args: &JqCommand) -> Option<WindowedSource> {
         ));
     }
     if !reread.is_plain_seq_records() {
-        return None;
+        // #7262: a lone source the prepass turns down is read as a `--seq` pipe is (#7164), up to its first
+        // record that is not plain, so one bad record does not cost the whole stream its windows.
+        drop(reader);
+        return gated_seq_source(files);
     }
     reread.blank_rs();
     Some((files, reader.blanking_rs(), reread))
+}
+
+/// A lone `--seq` source that is a regular file (named, or on standard input) which the prepass of
+/// [`windowed_seq_file`] could not vouch for (#7262): it holds a record that is not `RS value LF`, or
+/// none at all. It is read as a `--seq` pipe is ([`window::WindowedFiles::seq_pipe`], #7164): from where it
+/// stands, a window at a time while its records are plain, each certified when the RS after it is read, and
+/// from the first that is not, the rest is read and handed to the route that walks a stream whole
+/// ([`hand_on_seq_pipe_tail`]), where jq's reader stands after the records already run. A stream that is
+/// not plain from its first byte is handed on whole, as that route would have read it. Several files are
+/// the whole-file route's still: what a tail mid-file means for the files after it is not worked out.
+#[cfg(unix)]
+fn gated_seq_source(files: Vec<PathBuf>) -> Option<WindowedSource> {
+    let file = match files.as_slice() {
+        // A duplicate of descriptor 0, at the offset the prepass (which reads by position) left alone.
+        [] => stdin_to_window()?.0,
+        [path] => std::fs::File::open(path).ok()?,
+        _ => return None,
+    };
+    let slot = window::SeqTailSlot::default();
+    SEQ_PIPE_TAIL.with(|tail| *tail.borrow_mut() = Some(std::rc::Rc::clone(&slot)));
+    Some((
+        files,
+        window::WindowedFiles::seq_pipe(
+            std::rc::Rc::new(file),
+            Vec::new(),
+            window::WINDOW_BYTES,
+            slot,
+        ),
+        std::rc::Rc::new(window::Reread::seen(window::SeenFault::default())),
+    ))
+}
+
+#[cfg(not(unix))]
+fn gated_seq_source(_files: Vec<PathBuf>) -> Option<WindowedSource> {
+    None
 }
 
 /// The regular files the plain route reads a window at a time (#6920), opened, and the means to read
@@ -12034,7 +12073,12 @@ fn hand_on_seq_files_tail(args: &JqCommand, past_open_failure: bool) -> bool {
 /// route that reads standard input whole, as the bytes it reads ([`STDIN_PUSHBACK`]), where jq's reader
 /// would stand after the records already run ([`crate::jq_seq_reader::resumed_stream`]); `true` when
 /// there was one.
-fn hand_on_seq_pipe_tail() -> bool {
+///
+/// #7262: the same for a lone named file read so ([`gated_seq_source`]), whose bytes go to that route as the
+/// file's ([`NAMED_PUSHBACK`]): the line a runtime error names counts from the file's start, which the
+/// resumed stream's line breaks keep, and a parse error's counts every line of the stream, which is the
+/// file. A read that failed part way is reported after the bytes read before it, as a file that failed.
+fn hand_on_seq_pipe_tail(args: &JqCommand) -> bool {
     let Some(tail) = SEQ_PIPE_TAIL
         .with(|slot| slot.borrow_mut().take())
         .and_then(|slot| slot.borrow_mut().take())
@@ -12043,6 +12087,18 @@ fn hand_on_seq_pipe_tail() -> bool {
     };
     crate::jq_seq_reader::seed_token_byte(tail.token_byte);
     let stream = crate::jq_seq_reader::resumed_stream(tail.lines, tail.bytes);
+    let named = get_input_files(args);
+    if let [path] = named.as_slice() {
+        let failures = tail
+            .error
+            .map(|error| (1, InputFileOpenError::from_io(path, &error, true)))
+            .into_iter()
+            .collect();
+        NAMED_PUSHBACK.with(|slot| {
+            *slot.borrow_mut() = Some((named.clone(), (named.clone(), vec![stream], failures)));
+        });
+        return true;
+    }
     STDIN_PUSHBACK_ERROR.with(|slot| *slot.borrow_mut() = tail.error);
     STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = Some(stream));
     true
@@ -21881,7 +21937,8 @@ mod tests {
 
     /// #7082: `--seq` reads a window at a time only for one regular file, or several, of RFC 7464's own framing that is
     /// big enough to be worth it, on a run that reads the records in order. Anything else, whatever is wrong
-    /// with it, is left to the route that walks the stream whole.
+    /// with it, is left to the route that walks the stream whole, except that a lone file is read as a pipe
+    /// is up to its first record that is not plain (#7262).
     #[test]
     fn windowed_seq_file_takes_only_framed_streams_7082() {
         use clap::Parser;
@@ -21901,12 +21958,19 @@ mod tests {
             path.to_string_lossy().into_owned()
         };
         let good = write("good.seq", &records);
-        let takes = |argv: &[&str]| {
+        // How the run reads it: vouched for by the prepass, read as a pipe is up to its first record that is
+        // not plain (#7262, a lone file), or neither (the whole-file route).
+        let route = |argv: &[&str]| {
             let cmd = JqCommand::try_parse_from(argv.iter().copied()).unwrap();
-            windowed_seq_file(&cmd).is_some()
+            let windowed = windowed_seq_file(&cmd).is_some();
+            let gated = SEQ_PIPE_TAIL.with(|tail| tail.borrow_mut().take()).is_some();
+            (windowed && !gated, windowed && gated)
         };
+        let takes = |argv: &[&str]| route(argv).0;
+        let gates = |argv: &[&str]| route(argv).1;
         assert!(takes(&["jq", "--seq", ".", &good]));
         assert!(takes(&["jq", "--seq", "-c", "select(.n > 3)", &good]));
+        assert!(!gates(&["jq", "--seq", ".", &good]));
         // Not a framed stream: each of these needs the walk of jq's reader, or has a fault.
         let mut cut = records.clone();
         cut.pop();
@@ -21953,15 +22017,22 @@ mod tests {
         ] {
             let path = write(name, &bytes);
             assert!(!takes(&["jq", "--seq", ".", &path]), "{name}");
+            // #7262: a lone file is read as a pipe is up to its first record that is not plain.
+            assert!(gates(&["jq", "--seq", ".", &path]), "{name}");
         }
         // The size and shape gates are the plain route's.
         let small = write("small.seq", &records[..1000]);
         assert!(!takes(&["jq", "--seq", ".", &small]));
+        let small_cut = write("small_cut.seq", &records[..999]);
+        assert!(!gates(&["jq", "--seq", ".", &small_cut]));
         // #7218: several files are windowed when each is framed on its own, and not when one is not.
         assert!(takes(&["jq", "--seq", ".", &good, &good]));
         let cut = write("cut.seq", &records[..records.len() - 1]);
         assert!(!takes(&["jq", "--seq", ".", &good, &cut]));
         assert!(!takes(&["jq", "--seq", ".", &cut, &good]));
+        // ... and not read as a pipe is either: a lone source only.
+        assert!(!gates(&["jq", "--seq", ".", &good, &cut]));
+        assert!(gates(&["jq", "--seq", ".", &cut]));
         let missing = dir.path().join("missing.seq");
         assert!(!takes(&[
             "jq",
@@ -21977,6 +22048,10 @@ mod tests {
             argv.extend(flags);
             argv.extend([".", good.as_str()]);
             assert!(!takes(&argv), "{flags:?}");
+            let mut argv = vec!["jq", "--seq"];
+            argv.extend(flags);
+            argv.extend([".", cut.as_str()]);
+            assert!(!gates(&argv), "{flags:?}");
         }
         // The plain route does not take a `--seq` stream, nor this one a plain stream's gate.
         let plain = JqCommand::try_parse_from(["jq", "--seq", ".", good.as_str()]).unwrap();
