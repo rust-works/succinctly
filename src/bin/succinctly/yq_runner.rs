@@ -4546,58 +4546,272 @@ fn reconcile_presentation(
     reconcile_presentation_at_depth(pristine_value, pristine_tree, result_value, &relative, 0)
 }
 
-/// The top-level stages of `expr` when a later one writes at or below a path an earlier one wrote
+/// One stage of a write chain that [`reconcile_presentation_by_stage`] replays on an owned copy
+/// of the document, without the evaluator (#7231).
+enum ChainStage<'e> {
+    /// A stage that passes the document through (`.`).
+    Identity,
+    /// `PATH = literal` or `PATH |= literal`: the closed literal, evaluated once.
+    Set(Vec<PathStep>, OwnedValue, &'e Expr),
+    /// `PATH = PATH2`: a static read of the document as the stage finds it.
+    Copy(Vec<PathStep>, Vec<PathStep>, &'e Expr),
+    /// `PATH += literal` over an array, a string or a mapping.
+    Add(Vec<PathStep>, OwnedValue, &'e Expr),
+    /// `del(PATH)`.
+    Del(Vec<PathStep>),
+}
+
+/// The stages of `expr` when a later one writes at or below a path an earlier one wrote
 /// (`.a = 5 | .a = [9]`, #7231), which [`reconcile_presentation`] cannot see from the document and
 /// the final value alone: yq writes each stage onto the node the stage before left, and a node an
 /// earlier write turned into a scalar, a collection of another kind or an empty one takes the style
-/// of what the later write brings (`CandidateNode.UpdateFrom`). `None` for any other expression.
-fn chained_write_stages<'e>(expr: &'e Expr, targets: &[WriteTarget]) -> Option<&'e [Expr]> {
-    let Expr::Pipe(stages) = strip_parens(expr) else {
+/// of what the later write brings (`CandidateNode.UpdateFrom`). `None` for any other expression,
+/// and for a chain with a stage that is not a static write of a literal, a static copy or a
+/// `del`, which the caller reconciles at once, as before.
+fn chained_write_stages<'e>(
+    expr: &'e Expr,
+    targets: &[WriteTarget],
+) -> Option<Vec<ChainStage<'e>>> {
+    // Two writes at least, or nothing can overlap.
+    if !targets.iter().any(|t| t.stage > 0) {
         return None;
-    };
-    targets
-        .iter()
-        .any(|earlier| {
-            targets
-                .iter()
-                .any(|later| later.stage > earlier.stage && later.path.starts_with(&earlier.path))
+    }
+    let mut flat = Vec::new();
+    flatten_pipe_stages(expr, &mut flat);
+    let stages = flat
+        .into_iter()
+        .map(|stage| {
+            let static_path = |path: &Expr| {
+                let mut steps = Vec::new();
+                static_path_steps(path, &mut steps).then_some(steps)
+            };
+            let literal = |value: &Expr| {
+                let [value] =
+                    <[OwnedValue; 1]>::try_from(evaluate_input_quiet(&OwnedValue::Null, value)?)
+                        .ok()?;
+                Some(value)
+            };
+            Some(match strip_parens(stage) {
+                stage if is_value_identity_stage(stage) => ChainStage::Identity,
+                Expr::Assign { path, value } if is_closed_literal(value) => {
+                    ChainStage::Set(static_path(path)?, literal(value)?, stage)
+                }
+                Expr::Update { path, filter } if is_closed_literal(filter) => {
+                    ChainStage::Set(static_path(path)?, literal(filter)?, stage)
+                }
+                Expr::Assign { path, value } => {
+                    ChainStage::Copy(static_path(path)?, static_path(value)?, stage)
+                }
+                Expr::CompoundAssign {
+                    path,
+                    op: AssignOp::Add,
+                    value,
+                } if is_closed_literal(value) => {
+                    ChainStage::Add(static_path(path)?, literal(value)?, stage)
+                }
+                Expr::Builtin(Builtin::Del(path)) => ChainStage::Del(static_path(path)?),
+                _ => return None,
+            })
         })
-        .then_some(&stages[..])
+        .collect::<Option<Vec<_>>>()?;
+    // A later write at, above or below a node an earlier one wrote, or one an earlier copy read.
+    let related = |p: &[PathStep], q: &[PathStep]| p.starts_with(q) || q.starts_with(p);
+    let touched: Vec<(usize, &[PathStep])> = stages
+        .iter()
+        .enumerate()
+        .flat_map(|(i, stage)| {
+            let (written, read): (Option<&[PathStep]>, Option<&[PathStep]>) = match stage {
+                ChainStage::Identity => (None, None),
+                ChainStage::Set(path, ..) | ChainStage::Add(path, ..) | ChainStage::Del(path) => {
+                    (Some(path), None)
+                }
+                ChainStage::Copy(path, source, _) => (Some(path), Some(source)),
+            };
+            written.into_iter().chain(read).map(move |p| (i, p))
+        })
+        .collect();
+    let overlapping = stages.iter().enumerate().any(|(later, stage)| {
+        let written = match stage {
+            ChainStage::Identity => return false,
+            ChainStage::Set(path, ..)
+            | ChainStage::Add(path, ..)
+            | ChainStage::Copy(path, ..)
+            | ChainStage::Del(path) => path,
+        };
+        touched
+            .iter()
+            .any(|(earlier, p)| *earlier < later && related(written, p))
+    });
+    overlapping.then_some(stages)
 }
 
-/// [`reconcile_presentation`] one stage of `stages` at a time, each replayed on the value the stage
-/// before produced (#7231), or `None` when a stage does not replay to exactly one value, its writes
-/// cannot be resolved, or the replay does not end at `result_value` (the caller then reconciles the
-/// whole query at once, as before).
+/// [`reconcile_presentation`] one stage of `stages` at a time, each on the document the stage
+/// before left (#7231), with the presentation a copy brings
+/// ([`propagate_assign_copied_presentation`]) placed at its own stage. `None` when a stage cannot
+/// be applied to the copy (a path through a scalar, an index before the start) or the replay does
+/// not end at `result_value`; the caller then reconciles the whole query at once, as before.
 fn reconcile_presentation_by_stage(
     pristine_value: &OwnedValue,
     pristine_tree: &CommentTree,
     result_value: &OwnedValue,
-    stages: &[Expr],
+    stages: &[ChainStage<'_>],
 ) -> Option<CommentTree> {
-    let (value, tree) = replay_write_stages(pristine_value, pristine_tree, stages)?;
-    (value == *result_value).then_some(tree)
-}
-
-/// The document and its reconciled tree after `stages`, each replayed on what the stage before
-/// left (#7231), or `None` when a stage does not replay to exactly one value or its writes cannot
-/// be resolved.
-fn replay_write_stages(
-    pristine_value: &OwnedValue,
-    pristine_tree: &CommentTree,
-    stages: &[Expr],
-) -> Option<(OwnedValue, CommentTree)> {
     let mut value = pristine_value.clone();
     let mut tree = pristine_tree.clone();
     for stage in stages {
-        let targets = collect_write_targets(stage)?;
-        let [next] = <[OwnedValue; 1]>::try_from(evaluate_input_quiet(&value, stage)?).ok()?;
-        if !targets.is_empty() || next != value {
-            tree = reconcile_presentation(&value, &tree, &next, &targets);
+        let mut next = value.clone();
+        let (targets, copy) = match stage {
+            ChainStage::Identity => continue,
+            ChainStage::Set(path, literal, expr) => {
+                set_owned_at(&mut next, path, literal.clone())?;
+                (collect_write_targets(expr)?, None)
+            }
+            ChainStage::Copy(path, source, expr) => {
+                let read = read_owned_at(&value, source)?.clone();
+                set_owned_at(&mut next, path, read)?;
+                (collect_write_targets(expr)?, Some(*expr))
+            }
+            ChainStage::Add(path, literal, expr) => {
+                let sum = added(read_owned_at(&value, path)?, literal)?;
+                set_owned_at(&mut next, path, sum)?;
+                (collect_write_targets(expr)?, None)
+            }
+            ChainStage::Del(path) => {
+                del_owned_at(&mut next, path)?;
+                let target = WriteTarget {
+                    path: path.clone(),
+                    kind: WriteKind::Del,
+                    fresh: false,
+                    copies: false,
+                    stage: 0,
+                    appends: false,
+                };
+                (vec![target], None)
+            }
+        };
+        let mut next_tree = reconcile_presentation(&value, &tree, &next, &targets);
+        if let Some(expr) = copy {
+            propagate_assign_copied_presentation(expr, &next, &value, &tree, &mut next_tree);
         }
         value = next;
+        tree = next_tree;
     }
-    Some((value, tree))
+    (value == *result_value).then_some(tree)
+}
+
+/// `left + right` for the kinds [`ChainStage::Add`] replays: two arrays, two strings or two
+/// mappings (the right side's entries over the left's). `None` for any other pair.
+fn added(left: &OwnedValue, right: &OwnedValue) -> Option<OwnedValue> {
+    Some(match (left, right) {
+        (OwnedValue::Array(l), OwnedValue::Array(r)) => {
+            OwnedValue::Array(l.iter().chain(r.iter()).cloned().collect::<Vec<_>>().into())
+        }
+        (OwnedValue::String(l), OwnedValue::String(r)) => {
+            OwnedValue::String(format!("{}{}", &**l, &**r).into())
+        }
+        (OwnedValue::Object(l), OwnedValue::Object(r)) => {
+            let mut merged = l.clone();
+            for (key, value) in r.iter() {
+                merged.insert(key.clone(), value.clone());
+            }
+            OwnedValue::Object(merged)
+        }
+        _ => return None,
+    })
+}
+
+/// The index `i` names in an array of `len` items, counting a negative one from the end.
+fn resolved_index(i: i64, len: usize) -> Option<usize> {
+    if i < 0 {
+        usize::try_from(i64::try_from(len).ok()? + i).ok()
+    } else {
+        usize::try_from(i).ok()
+    }
+}
+
+/// The node at `path` in `value`, or `None` where the path leaves the document.
+fn read_owned_at<'v>(value: &'v OwnedValue, path: &[PathStep]) -> Option<&'v OwnedValue> {
+    let mut node = value;
+    for step in path {
+        node = match (node, step) {
+            (OwnedValue::Object(fields), PathStep::Key(k)) => fields.get(k.as_str())?,
+            (OwnedValue::Array(items), PathStep::Index(i)) => {
+                items.get(resolved_index(*i, items.len())?)?
+            }
+            _ => return None,
+        };
+    }
+    Some(node)
+}
+
+/// Write `new` at `path` in `node` as an assignment does: a missing key or a `null` is created, an
+/// index past the end pads with `null`. `None` for a path through a scalar or an index before the
+/// start, which the caller does not try to model.
+fn set_owned_at(node: &mut OwnedValue, path: &[PathStep], new: OwnedValue) -> Option<()> {
+    let Some((step, rest)) = path.split_first() else {
+        *node = new;
+        return Some(());
+    };
+    match step {
+        PathStep::Key(k) => {
+            if matches!(node, OwnedValue::Null) {
+                *node = OwnedValue::Object(IndexMap::new().into());
+            }
+            let OwnedValue::Object(fields) = node else {
+                return None;
+            };
+            if fields.get(k.as_str()).is_none() {
+                fields.insert(k.clone(), OwnedValue::Null);
+            }
+            set_owned_at(fields.get_mut(k.as_str())?, rest, new)
+        }
+        PathStep::Index(i) => {
+            if matches!(node, OwnedValue::Null) {
+                *node = OwnedValue::Array(Vec::new().into());
+            }
+            let OwnedValue::Array(items) = node else {
+                return None;
+            };
+            let at = resolved_index(*i, items.len())?;
+            let mut items = items.make_vec();
+            if at >= items.len() {
+                items.resize(at + 1, OwnedValue::Null);
+            }
+            set_owned_at(&mut items[at], rest, new)
+        }
+    }
+}
+
+/// Remove the node at `path` from `node` as `del` does; a path that is not there removes nothing.
+/// `None` for a path through a scalar.
+fn del_owned_at(node: &mut OwnedValue, path: &[PathStep]) -> Option<()> {
+    let Some((step, rest)) = path.split_first() else {
+        return None;
+    };
+    match (node, step) {
+        (OwnedValue::Null, _) => Some(()),
+        (OwnedValue::Object(fields), PathStep::Key(k)) if rest.is_empty() => {
+            fields.shift_remove(k.as_str());
+            Some(())
+        }
+        (OwnedValue::Object(fields), PathStep::Key(k)) => match fields.get_mut(k.as_str()) {
+            Some(child) => del_owned_at(child, rest),
+            None => Some(()),
+        },
+        (OwnedValue::Array(items), PathStep::Index(i)) => {
+            let Some(at) = resolved_index(*i, items.len()).filter(|at| *at < items.len()) else {
+                return Some(());
+            };
+            let mut items = items.make_vec();
+            if rest.is_empty() {
+                items.remove(at);
+                Some(())
+            } else {
+                del_owned_at(&mut items[at], rest)
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Whether a plain `=` chain in `expr` has a stage whose right side is not a closed literal
@@ -6244,15 +6458,12 @@ fn propagate_assign_copied_presentation(
     if !is_plain_assign_chain(expr) {
         return;
     }
-    // #7231: a target an earlier stage wrote is judged by what that stage left, not by the
-    // pristine document (`.c = "s" | .c = .b` copies `b`'s flow style onto the scalar).
-    let write_targets = collect_write_targets(expr).unwrap_or_default();
     // A plain assign chain always collects.
-    let chain = collect_assign_chain(expr).unwrap_or_default();
-    // Only while its stages are the pipe's own, one write each, so a stage's index names both.
-    let chained =
-        chained_write_stages(expr, &write_targets).filter(|stages| stages.len() == chain.len());
-    for (stage, (path_expr, value_expr)) in chain.into_iter().enumerate() {
+    for (stage, (path_expr, value_expr)) in collect_assign_chain(expr)
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+    {
         // A negative index (`.a[-1] = .a[0]`) names the node counted from the end of the array
         // as the write found it, which only the first stage's pristine document says; a later
         // stage may have changed the length (#5407).
@@ -6283,20 +6494,6 @@ fn propagate_assign_copied_presentation(
         else {
             continue;
         };
-        // The document as the stages before this one left it, when one of them wrote at or above
-        // this stage's target (#7231).
-        let earlier_wrote = write_targets.iter().any(|earlier| {
-            earlier.stage < stage
-                && write_targets
-                    .iter()
-                    .any(|t| t.stage == stage && t.path.starts_with(&earlier.path))
-        });
-        let before = chained
-            .filter(|_| earlier_wrote)
-            .and_then(|stages| replay_write_stages(pristine_value, pristine, &stages[..stage]));
-        let (before_value, before_tree) = before
-            .as_ref()
-            .map_or((pristine_value, pristine), |(value, tree)| (value, tree));
         for path_steps in targets {
             if let Some(target) = comment_tree_at_path_or_create_mut(tree, &path_steps) {
                 let mut copy = source.clone();
@@ -6308,8 +6505,8 @@ fn propagate_assign_copied_presentation(
                 // What the target was before the write decides it, not the tree, which the write
                 // has already grown to the new value's shape. An alias target is no container of
                 // its own kind: the write turns it into one.
-                let old = comment_tree_at_path(before_tree, &path_steps)
-                    .zip(owned_value_at(before_value, &meta_path_of(&path_steps)));
+                let old = comment_tree_at_path(pristine, &path_steps)
+                    .zip(owned_value_at(pristine_value, &meta_path_of(&path_steps)));
                 if matches!(copy, CommentTree::Leaf(_)) {
                     meta = copied_scalar_presentation(meta, &source, read, old);
                 } else {
@@ -9425,20 +9622,26 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
     // - but if it came from a shape-preserving write, `presentation_sync_ctx`
     // lets it recover whatever the write didn't touch instead of falling
     // back to genuinely empty (#739).
-    // #7231: a chain that writes one node twice is reconciled a stage at a time.
-    let chained_stages = chained_write_stages(expr, &write_targets);
+    // #7231: a chain that writes one node twice is reconciled a stage at a time, the presentation a
+    // copy brings included (`staged` then keeps the whole-query copy pass below from running).
+    // Not for a document with aliases, whose writes the evaluator redirects through them.
+    let chained_stages = presentation_sync_ctx
+        .as_ref()
+        .filter(|_| !has_aliases)
+        .and_then(|_| chained_write_stages(expr, &write_targets));
+    let staged = std::cell::Cell::new(false);
     let no_comments = |v: OwnedValue| {
         let comments =
             presentation_sync_ctx
                 .as_ref()
                 .map_or_else(CommentTree::empty, |(pristine, tree)| {
-                    chained_stages
-                        .and_then(|stages| {
-                            reconcile_presentation_by_stage(pristine, tree, &v, stages)
-                        })
-                        .unwrap_or_else(|| {
-                            reconcile_presentation(pristine, tree, &v, &write_targets)
-                        })
+                    let by_stage = chained_stages.as_deref().and_then(|stages| {
+                        reconcile_presentation_by_stage(pristine, tree, &v, stages)
+                    });
+                    staged.set(staged.get() || by_stage.is_some());
+                    by_stage.unwrap_or_else(|| {
+                        reconcile_presentation(pristine, tree, &v, &write_targets)
+                    })
                 });
         (v, comments)
     };
@@ -9781,7 +9984,9 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
     // Copy the source's trailing comment and flow style through a plain assignment from a static
     // read (#5249). It comes before the alias pass below and carries no anchor mark of its own,
     // so that pass stays the one place an alias mark is decided.
-    if let Some((pristine_value, pristine)) = &presentation_sync_ctx {
+    if let Some((pristine_value, pristine)) =
+        presentation_sync_ctx.as_ref().filter(|_| !staged.get())
+    {
         for (value, comments) in docs.iter_mut().flatten() {
             propagate_assign_copied_presentation(
                 pass_expr,

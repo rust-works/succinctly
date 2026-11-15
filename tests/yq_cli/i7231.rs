@@ -134,3 +134,68 @@ fn a_copy_over_a_node_an_earlier_write_changed_takes_the_sources_style_7231() ->
         ),
     ])
 }
+
+/// A `.` stage between the writes changes nothing: the stages either side are still replayed in turn.
+#[test]
+fn an_identity_stage_in_the_chain_is_passed_over_7231() -> Result<()> {
+    assert_rows(&[
+        (
+            "a: [x, 1] # c1\nz: 1\n",
+            ".a = 5 | . | .a = [9]",
+            &[],
+            "a:\n  - 9\nz: 1 # c1\n",
+        ),
+        (
+            "- {k0: [1]}\n- {k1: [2, x]}\n",
+            ".[0] = \"s\" | . | .[0] = .[1]",
+            &[],
+            "- {k1: [2, x]}\n- {k1: [2, x]}\n",
+        ),
+    ])
+}
+
+/// A copy keeps the presentation it brought when a later stage writes into the copy, replaces it or
+/// rewrites its source (#5407's rows): the copy is placed at its own stage, and the later stage
+/// writes onto it as yq does. Before, the copy was skipped, or a later write's kind change moved the
+/// target's comment onto an unrelated key.
+#[test]
+fn a_copy_keeps_its_presentation_through_a_later_stage_7231() -> Result<()> {
+    assert_rows(&[
+        (
+            "a: 5 # c1\nb: [1]\nz: 1\n",
+            ".a = .b | .a = [9]",
+            &[],
+            "a: [9] # c1\nb: [1]\nz: 1\n",
+        ),
+        (
+            "a: 5 # c1\nb: {k: 1}\nz: 1\n",
+            ".a = .b | .a.k = 9",
+            &[],
+            "a: {k: 9} # c1\nb: {k: 1}\nz: 1\n",
+        ),
+        (
+            "a: 5 # c1\nb: [1]\nz: 1\n",
+            ".a = .b | .a += [2]",
+            &[],
+            "a: [1, 2] # c1\nb: [1]\nz: 1\n",
+        ),
+        (
+            "b: [1] # t\nc: 3\nz: 1\n",
+            ".c = .b | .b = 5",
+            &[],
+            "b: 5 # t\nc: [1] # t\nz: 1\n",
+        ),
+        (
+            "b: [{a: 1}] # t\nc: 3\nz: 1\n",
+            ".c = .b | .c[0].a = 2",
+            &[],
+            "b: [{a: 1}] # t\nc: [{a: 2}] # t\nz: 1\n",
+        ),
+        (
+            "b: [1] # t\nc: 3\nz: 1\n",
+            ".c = .b | .c = 5",
+            &[],
+            "b: [1] # t\nc: 5 # t\nz: 1\n",
+        ),
+    ])
+}
