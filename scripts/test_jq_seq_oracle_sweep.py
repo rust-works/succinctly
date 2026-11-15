@@ -54,6 +54,20 @@ class UnwrittenTokenbufTests(unittest.TestCase):
         self.assertTrue(sweep.reads_unwritten_tokenbuf(b"\x1en n\n"))
         self.assertFalse(sweep.reads_unwritten_tokenbuf(b"\x1e1 n n\n"))
 
+    def test_string_writes_its_raw_bytes_and_an_rs_ends_it(self):
+        # `"\\u0041"` decodes to one byte but leaves its raw `u` at index 1 (#6513).
+        self.assertFalse(sweep.reads_unwritten_tokenbuf(b'\x1e"\\u0041" n\n'))
+        self.assertFalse(sweep.reads_unwritten_tokenbuf(b'\x1e"a\\nbcd" n\n'))
+        # An unclosed string was `tokenadd`ed all the same, up to the RS that ends it...
+        self.assertFalse(sweep.reads_unwritten_tokenbuf(b'\x1e"ab\x1en'))
+        # ...but a string of one byte before the RS wrote nothing, and the RS is not its content.
+        self.assertTrue(sweep.reads_unwritten_tokenbuf(b'\x1e"a\x1en'))
+        self.assertTrue(sweep.reads_unwritten_tokenbuf(b'\x1e"\\\x1en'))
+
+    def test_a_parse_error_does_not_skip_what_follows(self):
+        # jq resets the parser at an error and reads on, so the `ab` after `]` is tokenised.
+        self.assertFalse(sweep.reads_unwritten_tokenbuf(b"\x1e]ab\x1en"))
+
     def test_streams_without_a_bare_n_are_not_artifacts(self):
         for data in (b"\x1e1\n", b"\x1enul\n", b"\x1enan\n", b"\x1enull\n", b"\x1e[1,2]\n", b"\x1ea n1\n"):
             self.assertFalse(sweep.reads_unwritten_tokenbuf(data), data)

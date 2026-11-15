@@ -37,6 +37,8 @@ TOKENS = [
 # cannot arise. `scripts/jq-seq-oracle-sweep.py` skips the shape; add the same skip here if a bare `n`
 # is ever added to TOKENS.
 
+assert "n" not in TOKENS, "a bare `n` token reads jq's uninitialised tokenbuf byte (#7256)"
+
 PROGRAMS = [
     ["-c", "[., input_filename, input_line_number]"],
     ["-c", "-s", "[., input_filename, input_line_number]"],

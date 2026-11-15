@@ -201,12 +201,17 @@ def reads_unwritten_tokenbuf(data):
 
     Index 1 is written by a token of two or more bytes (`tokenadd`), by a one-byte
     token on the number path (`t`, `f` and `n` are the three that are not: jq
-    NUL-terminates the token in place, at index 1), and by a string that holds two
-    or more bytes after decoding. Where this cannot tell, it says "not written", so
-    it skips more streams than the exposure strictly needs and never fewer: a string
-    with an escape in it is such a place, and so is everything it reads before the
-    first RS (jq is waiting for one, and tokenises none of it) unless a malformed
-    BOM has already put the parser back in `Normal`."""
+    NUL-terminates the token in place, at index 1), and by a string of two or more
+    bytes, which `tokenadd`s its raw bytes whatever it decodes to (`"\\u0041"` leaves
+    the `u`, #6513) and whether or not it is ever closed. An RS ends a token or a
+    string wherever it stands: jq tests it before its parser state. Bytes before the
+    first RS are not tokenised (jq is waiting for one) unless a malformed BOM has
+    already put the parser back in `Normal`. A parse error does not make jq skip
+    ahead: it resets the parser and reads the next byte (limitations.md, "need RS to
+    resync" never resyncs).
+
+    Where this cannot tell it says "not written", which skips more streams than the
+    exposure needs and never fewer."""
     if malformed_bom(data):
         # jq consumed the part of the BOM that matched without tokenising it.
         start = 0
@@ -221,14 +226,13 @@ def reads_unwritten_tokenbuf(data):
     n = len(data)
     while i < n:
         byte = data[i]
-        if byte == 0x22:  # a string: its content is the bytes up to the next unescaped quote
+        if byte == 0x22:  # a string: up to its closing quote, an RS, or the end
             j = i + 1
-            while j < n and data[j] != 0x22:
-                j += 2 if data[j] == 0x5C else 1
-            content = data[i + 1 : j]
-            if len(content) >= 2 and b"\\" not in content:
+            while j < n and data[j] not in (0x22, RS[0]):
+                j += 2 if data[j] == 0x5C and data[j + 1 : j + 2] != RS else 1
+            if j - i - 1 >= 2:
                 written = True
-            i = j + 1
+            i = j + 1 if data[j : j + 1] == b'"' else j
         elif byte in _TOKEN_ENDS:
             i += 1
         else:
@@ -257,7 +261,7 @@ def artifact(data):
     both properties of that same buffer boundary, not of the parser --
     are no longer here; see the module docstring's history note."""
     if b"\x00" in data and b"\n" not in data.split(b"\x00", 1)[0]:
-        return True  # strlen truncation -- the one artifact left, #3+
+        return True  # strlen truncation, #3+
     if reads_unwritten_tokenbuf(data):
         return True  # jq reads uninitialised memory -- #7256, matched by no implementation
     if RS not in data:
