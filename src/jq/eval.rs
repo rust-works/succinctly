@@ -521,7 +521,7 @@ use super::value::{
     infinite_float_preview_text, int_to_f64, jq_identical, jq_literal_int_to_f64, jq_numeric_cmp,
     numeric_repr_cmp, owned_value_eq, owned_value_eq_at_depth_generic, subarray_indices,
     subarray_positions, window_matches, ArrayVec, NumberRepr, ObjectMap, ObjectMapEntry,
-    ObjectMapOf, OwnedValue,
+    ObjectMapOf, OwnedValue, ScalarKind,
 };
 
 /// Which binary operator an operand that produced *zero outputs* is being
@@ -690,7 +690,9 @@ pub(crate) fn yq_object_key_stringify<S: EvalSemantics>(key: &OwnedValue) -> Opt
         return None;
     }
     match key {
-        OwnedValue::Null | OwnedValue::Bool(_) => Some(owned_to_string::<S>(key)),
+        OwnedValue::Null | OwnedValue::Bool(_) | OwnedValue::SpelledScalar(..) => {
+            Some(owned_to_string::<S>(key))
+        }
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
             Some(owned_to_string::<S>(key))
         }
@@ -884,6 +886,12 @@ pub(crate) fn yq_scalar_text<S: EvalSemantics>(value: &OwnedValue) -> Option<Cow
         OwnedValue::Null => Cow::Borrowed("null"),
         OwnedValue::Bool(true) => Cow::Borrowed("true"),
         OwnedValue::Bool(false) => Cow::Borrowed("false"),
+        // ADR-0028 P1: nothing builds one yet; it reads as what it resolved to.
+        OwnedValue::SpelledScalar(kind, _) => Cow::Borrowed(match kind {
+            ScalarKind::Null => "null",
+            ScalarKind::True => "true",
+            ScalarKind::False => "false",
+        }),
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
             Cow::Owned(numeric_display_string::<S>(value))
         }
@@ -2993,6 +3001,7 @@ fn jq_kind(value: &OwnedValue) -> u8 {
         OwnedValue::Null => JQ_KIND_NULL,
         OwnedValue::Bool(false) => JQ_KIND_FALSE,
         OwnedValue::Bool(true) => JQ_KIND_TRUE,
+        OwnedValue::SpelledScalar(kind, _) => jq_kind(&kind.canonical()),
         // jq has one number kind; `1 | contains(1.0)` is a comparison, not an error.
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => JQ_KIND_NUMBER,
         OwnedValue::String(_) => JQ_KIND_STRING,
@@ -18041,6 +18050,7 @@ fn yq_operand_tag(value: &OwnedValue) -> &'static str {
     match value {
         OwnedValue::Null => "!!null",
         OwnedValue::Bool(_) => "!!bool",
+        OwnedValue::SpelledScalar(kind, _) => yq_operand_tag(&kind.canonical()),
         OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _) => "!!int",
         OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => "!!float",
         OwnedValue::String(_) if yq_is_timestamp(value) => "!!timestamp",
@@ -19767,6 +19777,7 @@ fn yq_sort_flag(value: &OwnedValue) -> u8 {
     match value {
         OwnedValue::Null => YQ_NULL,
         OwnedValue::Bool(_) => YQ_BOOL,
+        OwnedValue::SpelledScalar(kind, _) => yq_sort_flag(&kind.canonical()),
         OwnedValue::Int(n) | OwnedValue::NumberLiteral(NumberRepr::Int(n), _) => {
             let width = n.unsigned_abs();
             if width <= 1 << 53 {
@@ -19929,6 +19940,12 @@ fn compare_values_at_depth<S: EvalSemantics>(
     use core::cmp::Ordering;
 
     assert_value_tree_depth(depth);
+
+    if matches!(left, OwnedValue::SpelledScalar(..))
+        || matches!(right, OwnedValue::SpelledScalar(..))
+    {
+        return compare_values_at_depth::<S>(&left.canonical(), &right.canonical(), depth);
+    }
 
     let left_type = sort_rank(left);
     let right_type = sort_rank(right);
@@ -22799,6 +22816,7 @@ fn yq_extremum_tag(value: &OwnedValue) -> &'static str {
     match value {
         OwnedValue::Null => "!!null",
         OwnedValue::Bool(_) => "!!bool",
+        OwnedValue::SpelledScalar(kind, _) => yq_extremum_tag(&kind.canonical()),
         OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(..), _) => "!!int",
         OwnedValue::Float(_) | OwnedValue::NumberLiteral(NumberRepr::Float(..), _) => "!!float",
         OwnedValue::String(_) => "!!str",
@@ -25976,6 +25994,7 @@ pub(crate) fn owned_to_string<S: EvalSemantics>(value: &OwnedValue) -> String {
         OwnedValue::Null => "null".to_string(),
         OwnedValue::Bool(true) => "true".to_string(),
         OwnedValue::Bool(false) => "false".to_string(),
+        OwnedValue::SpelledScalar(kind, _) => owned_to_string::<S>(&kind.canonical()),
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
             numeric_display_string::<S>(value)
         }
@@ -26242,6 +26261,7 @@ fn stringify_for_format<S: EvalSemantics>(value: &OwnedValue) -> Option<String> 
             }
         }
         OwnedValue::Null => "null".to_string(),
+        OwnedValue::SpelledScalar(kind, _) => return stringify_for_format::<S>(&kind.canonical()),
         OwnedValue::Array(_) | OwnedValue::Object(_) if S::TAG != EvalTag::Yq => {
             owned_value_to_json::<S>(value)
         }
@@ -28800,6 +28820,7 @@ fn props_escape(text: &str, is_key: bool) -> String {
 /// string (a keyed value does, a top-level scalar does not).
 pub(super) fn props_value_to_string(value: &OwnedValue, escape: bool) -> String {
     match value {
+        OwnedValue::SpelledScalar(kind, _) => props_value_to_string(&kind.canonical(), escape),
         OwnedValue::Null => "null".to_string(),
         OwnedValue::Bool(true) => "true".to_string(),
         OwnedValue::Bool(false) => "false".to_string(),
@@ -39671,6 +39692,7 @@ fn resolve_regex_args<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 OwnedValue::String(_)
                 | OwnedValue::Null
                 | OwnedValue::Bool(_)
+                | OwnedValue::SpelledScalar(..)
                 | OwnedValue::Int(_)
                 | OwnedValue::Float(_)
                 | OwnedValue::NumberLiteral(..) => Some(owned_to_string::<S>(f)),
@@ -40603,6 +40625,7 @@ fn yq_non_string_replacement_text<S: EvalSemantics>(replacement: &OwnedValue) ->
         OwnedValue::Object(_) => Cow::Borrowed(""),
         OwnedValue::Null
         | OwnedValue::Bool(_)
+        | OwnedValue::SpelledScalar(..)
         | OwnedValue::Int(_)
         | OwnedValue::Float(_)
         | OwnedValue::NumberLiteral(..) => Cow::Owned(owned_to_string::<S>(replacement)),
@@ -53402,6 +53425,7 @@ pub(crate) fn owned_type_name(value: &OwnedValue) -> &'static str {
     match value {
         OwnedValue::Null => "null",
         OwnedValue::Bool(_) => "boolean",
+        OwnedValue::SpelledScalar(kind, _) => owned_type_name(&kind.canonical()),
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => "number",
         OwnedValue::String(_) => "string",
         OwnedValue::Array(_) => "array",
@@ -53418,6 +53442,7 @@ fn owned_yaml_type_tag(value: &OwnedValue) -> &'static str {
     match value {
         OwnedValue::Null => "!!null",
         OwnedValue::Bool(_) => "!!bool",
+        OwnedValue::SpelledScalar(kind, _) => owned_yaml_type_tag(&kind.canonical()),
         OwnedValue::Int(_) => "!!int",
         OwnedValue::Float(_) => "!!float",
         OwnedValue::NumberLiteral(repr, _) => match repr {
@@ -91041,6 +91066,7 @@ fn owned_to_expr_at_depth(value: &OwnedValue, depth: usize) -> Expr {
     match value {
         OwnedValue::Null => Expr::Literal(Literal::Null),
         OwnedValue::Bool(b) => Expr::Literal(Literal::Bool(*b)),
+        OwnedValue::SpelledScalar(kind, _) => owned_to_expr_at_depth(&kind.canonical(), depth),
         OwnedValue::Int(i) => Expr::Literal(Literal::Int(*i)),
         OwnedValue::Float(f) => Expr::Literal(Literal::Float(*f)),
         // #1035: `Literal::NumberLiteral` now has a source-text slot too,
@@ -112605,6 +112631,7 @@ fn delpaths_component_type_tag(value: &OwnedValue) -> &'static str {
     match value {
         OwnedValue::Null => "!!null",
         OwnedValue::Bool(_) => "!!bool",
+        OwnedValue::SpelledScalar(kind, _) => delpaths_component_type_tag(&kind.canonical()),
         OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _) => "!!int",
         OwnedValue::Float(_) | OwnedValue::NumberLiteral(NumberRepr::Float(_), _) => "!!float",
         OwnedValue::String(_) => "!!str",

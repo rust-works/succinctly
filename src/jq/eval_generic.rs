@@ -7703,7 +7703,10 @@ pub(crate) fn reindex_bridge_is_identity(value: &OwnedValue) -> bool {
         OwnedValue::NumberLiteral(_, _) => true,
         OwnedValue::Array(items) => items.iter().all(reindex_bridge_is_identity),
         OwnedValue::Object(fields) => fields.values().all(reindex_bridge_is_identity),
-        OwnedValue::Null | OwnedValue::Bool(_) | OwnedValue::String(_) => true,
+        OwnedValue::Null
+        | OwnedValue::Bool(_)
+        | OwnedValue::SpelledScalar(..)
+        | OwnedValue::String(_) => true,
     }
 }
 
@@ -34697,9 +34700,11 @@ fn path_component_step_expr(component: &OwnedValue) -> Option<Expr> {
             idx: *f as i64,
             key: Some(NumberKey::Literal(*f, text.to_string().into_boxed_str())),
         },
-        OwnedValue::Null | OwnedValue::Bool(_) | OwnedValue::Array(_) | OwnedValue::Object(_) => {
-            return None
-        }
+        OwnedValue::Null
+        | OwnedValue::Bool(_)
+        | OwnedValue::SpelledScalar(..)
+        | OwnedValue::Array(_)
+        | OwnedValue::Object(_) => return None,
     })
 }
 

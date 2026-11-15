@@ -20588,6 +20588,9 @@ where
     };
 
     match value {
+        OwnedValue::SpelledScalar(kind, _) => {
+            return print_owned_json(out, &kind.canonical(), formatter, config, level);
+        }
         OwnedValue::Null => out.write_all(b"null")?,
         OwnedValue::Bool(true) => out.write_all(b"true")?,
         OwnedValue::Bool(false) => out.write_all(b"false")?,

@@ -3467,6 +3467,28 @@ impl From<SharableLiteral> for Box<str> {
     }
 }
 
+/// What a [`OwnedValue::SpelledScalar`] resolved to (ADR-0028, #2802).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarKind {
+    /// Resolves to `null`.
+    Null,
+    /// Resolves to `true`.
+    True,
+    /// Resolves to `false`.
+    False,
+}
+
+impl ScalarKind {
+    /// The canonical value this kind resolves to.
+    pub const fn canonical(self) -> OwnedValue {
+        match self {
+            Self::Null => OwnedValue::Null,
+            Self::True => OwnedValue::Bool(true),
+            Self::False => OwnedValue::Bool(false),
+        }
+    }
+}
+
 /// An owned JSON value.
 ///
 /// This is used for values that are constructed during evaluation
@@ -3500,6 +3522,17 @@ pub enum OwnedValue {
     /// `into_plain_number`) -- matching jq, where only values that reach
     /// output untouched keep their original spelling.
     NumberLiteral(NumberRepr, SharableLiteral),
+    /// A yq document's `null`, `true` or `false` written other than as the canonical
+    /// `null`/`true`/`false` (`~`, `Null`, `NULL`, an empty value, `True`, `TRUE`, `False`,
+    /// `FALSE`, a tag-forced `!!bool`/`!!null` text), carrying the source text alongside what it
+    /// resolved to (ADR-0028, #2802).
+    ///
+    /// Built only under yq semantics and only from a document, so jq mode and every canonical
+    /// document build exactly what they built before. A reader that wants the text (`tostring`,
+    /// `==`, interpolation, re-emit) reads it; every other reader asks
+    /// [`OwnedValue::canonical`] and sees `Null`/`Bool`. P1 only adds the variant: nothing
+    /// produces it yet.
+    SpelledScalar(ScalarKind, SharableLiteral),
     /// JSON string (inline, or refcounted once a bind has promoted it --
     /// see [`SharableString`] for why, #3191)
     String(SharableString),
@@ -3553,6 +3586,16 @@ impl Teardown for OwnedValue {
 }
 
 impl OwnedValue {
+    /// This value as a type test sees it: a [`SpelledScalar`](Self::SpelledScalar) becomes the
+    /// `Null`/`Bool` it resolved to, anything else is returned unchanged (ADR-0028).
+    #[inline]
+    pub fn canonical(&self) -> Cow<'_, Self> {
+        match self {
+            Self::SpelledScalar(kind, _) => Cow::Owned(kind.canonical()),
+            other => Cow::Borrowed(other),
+        }
+    }
+
     /// Create a null value.
     pub fn null() -> Self {
         Self::Null
@@ -4222,7 +4265,9 @@ impl OwnedValue {
     pub(crate) fn promote_identities(&mut self) {
         match self {
             Self::String(s) => s.promote(),
-            Self::NumberLiteral(_, spelling) => spelling.promote(),
+            Self::NumberLiteral(_, spelling) | Self::SpelledScalar(_, spelling) => {
+                spelling.promote();
+            }
             Self::Array(items) => items.iter_mut().for_each(Self::promote_identities),
             Self::Object(map) => map.values_mut().for_each(Self::promote_identities),
             Self::Null | Self::Bool(_) | Self::Int(_) | Self::Float(_) => {}
@@ -4236,12 +4281,20 @@ impl OwnedValue {
 
     /// Check if this value is null.
     pub fn is_null(&self) -> bool {
-        matches!(self, Self::Null)
+        matches!(self, Self::Null | Self::SpelledScalar(ScalarKind::Null, _))
     }
 
     /// Check if this value is "truthy" (not null and not false).
+    ///
+    /// A [`SpelledScalar`](Self::SpelledScalar) is truthy as what it resolved to (the jq
+    /// rule); where yq decides from the text instead is a P2/P3 question (ADR-0028).
     pub fn is_truthy(&self) -> bool {
-        !matches!(self, Self::Null | Self::Bool(false))
+        !matches!(
+            self,
+            Self::Null
+                | Self::Bool(false)
+                | Self::SpelledScalar(ScalarKind::Null | ScalarKind::False, _)
+        )
     }
 
     /// Whether this value is a number in any of its three representations
@@ -4275,6 +4328,7 @@ impl OwnedValue {
         match self {
             Self::Null => "null",
             Self::Bool(_) => "boolean",
+            Self::SpelledScalar(kind, _) => kind.canonical().type_name(),
             Self::Int(_) | Self::Float(_) | Self::NumberLiteral(..) => "number",
             Self::String(_) => "string",
             Self::Array(_) => "array",
@@ -4286,6 +4340,8 @@ impl OwnedValue {
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             Self::Bool(b) => Some(*b),
+            Self::SpelledScalar(ScalarKind::True, _) => Some(true),
+            Self::SpelledScalar(ScalarKind::False, _) => Some(false),
             _ => None,
         }
     }
@@ -4462,6 +4518,7 @@ impl OwnedValue {
             | Self::Int(_)
             | Self::Float(_)
             | Self::NumberLiteral(..)
+            | Self::SpelledScalar(..)
             | Self::String(_) => {}
         }
         Ok(())
@@ -4746,6 +4803,17 @@ impl OwnedValue {
         }
         assert_value_tree_depth(depth);
         match self {
+            Self::SpelledScalar(kind, _) => {
+                kind.canonical().write_json_at_depth(
+                    out,
+                    depth,
+                    jq_printer,
+                    finite_literal,
+                    float_fmt,
+                    infinite_fmt,
+                    nan_fmt,
+                );
+            }
             Self::Null => out.push_str("null"),
             Self::Bool(true) => out.push_str("true"),
             Self::Bool(false) => out.push_str("false"),
@@ -4837,6 +4905,14 @@ impl OwnedValue {
         }
         assert_value_tree_depth(depth);
         match self {
+            Self::SpelledScalar(kind, _) => kind.canonical().to_json_nested_at_depth(
+                depth,
+                jq_printer,
+                finite_literal,
+                float_fmt,
+                infinite_fmt,
+                nan_fmt,
+            ),
             Self::Null => "null".into(),
             Self::Bool(true) => "true".into(),
             Self::Bool(false) => "false".into(),
@@ -5960,6 +6036,11 @@ pub(crate) fn owned_value_eq_at_depth_generic<S: EvalSemantics>(
     depth: usize,
 ) -> bool {
     assert_value_tree_depth(depth);
+    // ADR-0028 P1: a spelled scalar is equal as what it resolved to (the spelling-aware
+    // comparison is P2/P3's).
+    if matches!(a, OwnedValue::SpelledScalar(..)) || matches!(b, OwnedValue::SpelledScalar(..)) {
+        return owned_value_eq_at_depth_generic::<S>(&a.canonical(), &b.canonical(), depth);
+    }
     match (a, b) {
         // jq's `jv_equal` answers `true` for the same allocation before
         // looking inside it (#3069). Without a NaN inside, identity already
@@ -6584,6 +6665,9 @@ impl PartialEq for OwnedValue {
 /// disagree with itself depending on nesting depth.
 fn owned_value_eq_at_depth(a: &OwnedValue, b: &OwnedValue, depth: usize) -> bool {
     assert_value_tree_depth(depth);
+    if matches!(a, OwnedValue::SpelledScalar(..)) || matches!(b, OwnedValue::SpelledScalar(..)) {
+        return owned_value_eq_at_depth(&a.canonical(), &b.canonical(), depth);
+    }
     match (a, b) {
         (OwnedValue::Null, OwnedValue::Null) => true,
         (OwnedValue::Bool(a), OwnedValue::Bool(b)) => a == b,
@@ -11297,6 +11381,7 @@ mod tests {
             match value {
                 OwnedValue::Null => seen.null = true,
                 OwnedValue::Bool(_) => seen.boolean = true,
+                OwnedValue::SpelledScalar(..) => unreachable!("not in the scalar table above"),
                 OwnedValue::Int(_) => seen.int = true,
                 OwnedValue::Float(f) if f.is_infinite() => seen.infinity = true,
                 OwnedValue::Float(_) => seen.float = true,
@@ -12570,5 +12655,83 @@ mod array_window_tests_6659 {
         assert!(one.shares_storage_with(&two));
         assert!(!one.shares_storage_with(&other));
         assert!(!one.shares_storage_with(&a));
+    }
+}
+
+#[cfg(test)]
+mod spelled_scalar_tests_2802 {
+    use super::*;
+
+    fn spelled(kind: ScalarKind, text: &str) -> OwnedValue {
+        OwnedValue::SpelledScalar(kind, text.into())
+    }
+
+    /// Every spelling ADR-0028 names, with what it resolves to.
+    fn spellings() -> Vec<(OwnedValue, OwnedValue)> {
+        let mut out = Vec::new();
+        for text in ["~", "Null", "NULL", ""] {
+            out.push((spelled(ScalarKind::Null, text), OwnedValue::Null));
+        }
+        for text in ["True", "TRUE"] {
+            out.push((spelled(ScalarKind::True, text), OwnedValue::Bool(true)));
+        }
+        for text in ["False", "FALSE"] {
+            out.push((spelled(ScalarKind::False, text), OwnedValue::Bool(false)));
+        }
+        out
+    }
+
+    #[test]
+    fn canonical_resolves_every_spelling_and_borrows_everything_else() {
+        for (value, resolved) in spellings() {
+            assert_eq!(*value.canonical(), resolved, "{value:?}");
+            assert!(matches!(value.canonical(), Cow::Owned(_)));
+        }
+        for plain in [OwnedValue::Null, OwnedValue::Bool(true), OwnedValue::Int(3)] {
+            assert!(matches!(plain.canonical(), Cow::Borrowed(_)));
+        }
+    }
+
+    #[test]
+    fn type_readers_see_the_resolved_value() {
+        for (value, resolved) in spellings() {
+            assert_eq!(value.type_name(), resolved.type_name());
+            assert_eq!(value.is_null(), resolved.is_null());
+            assert_eq!(value.is_truthy(), resolved.is_truthy());
+            assert_eq!(value.as_bool(), resolved.as_bool());
+            assert_eq!(value.to_json(), resolved.to_json());
+        }
+    }
+
+    /// Equality and ordering see a spelled scalar as what it resolved to, in both modes and
+    /// nested; only the owner-approved text comparison of P2/P3 will differ (ADR-0028).
+    #[test]
+    fn equality_and_ordering_read_a_spelling_as_its_value() {
+        use crate::jq::eval::compare_values;
+        use crate::jq::{JqSemantics, YqSemantics};
+        for (value, resolved) in spellings() {
+            assert_eq!(value, resolved);
+            assert_eq!(resolved, value);
+            assert!(owned_value_eq::<JqSemantics>(&value, &resolved));
+            assert!(owned_value_eq::<YqSemantics>(&value, &resolved));
+            assert_ne!(value, OwnedValue::Int(0));
+            let nested = OwnedValue::array_from(vec![value.clone()]);
+            assert_eq!(nested, OwnedValue::array_from(vec![resolved.clone()]));
+            for other in [
+                OwnedValue::Null,
+                OwnedValue::Bool(false),
+                OwnedValue::Bool(true),
+                OwnedValue::Int(1),
+            ] {
+                assert_eq!(
+                    compare_values::<JqSemantics>(&value, &other),
+                    compare_values::<JqSemantics>(&resolved, &other)
+                );
+                assert_eq!(
+                    compare_values::<YqSemantics>(&other, &value),
+                    compare_values::<YqSemantics>(&other, &resolved)
+                );
+            }
+        }
     }
 }

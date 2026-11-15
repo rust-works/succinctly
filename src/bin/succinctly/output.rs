@@ -843,6 +843,7 @@ impl SkippedKind {
             OwnedValue::Null => Self::Null,
             OwnedValue::Bool(false) => Self::False,
             OwnedValue::Bool(true) => Self::True,
+            OwnedValue::SpelledScalar(kind, _) => Self::of(&kind.canonical()),
             OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
                 Self::Number
             }
@@ -1058,6 +1059,7 @@ fn write_json_impl(out: &mut String, value: &OwnedValue, opts: &JsonFormatOpts, 
 /// The JSON text of a scalar (anything but an array or object).
 fn scalar_json_text(value: &OwnedValue, opts: &JsonFormatOpts) -> String {
     match value {
+        OwnedValue::SpelledScalar(kind, _) => scalar_json_text(&kind.canonical(), opts),
         OwnedValue::Null => "null".to_string(),
         OwnedValue::Bool(b) => b.to_string(),
         OwnedValue::Int(i) => i.to_string(),
