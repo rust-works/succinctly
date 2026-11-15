@@ -11538,13 +11538,8 @@ fn header_head_start(header: &[u8]) -> Option<usize> {
             .iter()
             .position(|&b| is_line_break(b))
             .unwrap_or(rest.len());
-        let next = pos
-            + line_end
-            + if line_end < rest.len() {
-                line_break_len(rest, line_end)
-            } else {
-                0
-            };
+        // Every line has its break: the header was cut back to its last one above.
+        let next = pos + line_end + line_break_len(rest, line_end);
         let line = &rest[..line_end];
         let marker = is_bare_marker_line(line);
         let directive = start.is_some()
