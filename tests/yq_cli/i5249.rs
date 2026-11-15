@@ -197,30 +197,30 @@ fn test_copying_presentation_leaves_the_values_alone_5249() -> Result<()> {
     Ok(())
 }
 
-/// A source a later stage rewrites has presentation that no longer describes the target, so the
-/// copy is skipped: yq copies what the node held when it was read (`c: [1] # t`), this prints the
-/// plain value (recorded in `limitations.md`). The source itself keeps its comment beside the
-/// scalar that overwrote it (`b: 5 # t`, #5258), as yq prints it.
+/// A source a later stage rewrites: the copy is placed at its own stage (#7231), so the target keeps
+/// what the node held when it was read (`c: [1] # t`), as yq prints it. The source itself keeps its
+/// comment beside the scalar that overwrote it (`b: 5 # t`, #5258).
 #[test]
-fn test_a_source_rewritten_by_a_later_stage_copies_nothing_5249() -> Result<()> {
+fn test_a_source_rewritten_by_a_later_stage_keeps_the_copy_5249() -> Result<()> {
     let (output, exit_code) = run_yq_stdin(".c = .b | .b = 5", "b: [1] # t\n", &[])?;
     assert_eq!(exit_code, 0);
-    assert_eq!(output, "b: 5 # t\nc:\n  - 1\n");
+    assert_eq!(output, "b: 5 # t\nc: [1] # t\n");
     Ok(())
 }
 
-/// A target a later stage edits or replaces, and a target that is not a static path, take no copy:
-/// yq prints `c: [{a: 2}] # t`, `c: 5 # t` and `c: [1] # t` for these (recorded in
-/// `limitations.md`). The value is right in every one.
+/// A target a later stage edits or replaces keeps the copy's presentation under the later write, as
+/// in yq, since the chain is replayed a stage at a time (#7231). A target that is not a static path
+/// still takes no copy: yq prints `c: [1] # t` for it (recorded in `limitations.md`). The value is
+/// right in every one.
 #[test]
 fn test_targets_the_pass_does_not_reach_stay_plain_5249() -> Result<()> {
     for (input, filter, expected) in [
         (
             "b: [{a: 1}] # t\n",
             ".c = .b | .c[0].a = 2",
-            "b: [{a: 1}] # t\nc:\n  - a: 2\n",
+            "b: [{a: 1}] # t\nc: [{a: 2}] # t\n",
         ),
-        ("b: [1] # t\n", ".c = .b | .c = 5", "b: [1] # t\nc: 5\n"),
+        ("b: [1] # t\n", ".c = .b | .c = 5", "b: [1] # t\nc: 5 # t\n"),
         ("b: [1] # t\nc: 3\n", ".[] = .b", "b: [1] # t\nc:\n  - 1\n"),
     ] {
         let (output, exit_code) = run_yq_stdin(filter, input, &[])?;
