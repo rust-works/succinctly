@@ -4368,9 +4368,16 @@ fn to_owned_with_comments_impl<V: DocumentValue, S: EvalSemantics>(
         }
         // #4086: the first document's `---` marker (and the comments and blank lines
         // before it) is printed back verbatim before the document on any write, and
-        // stands in for the head comments it already contains.
+        // stands in for the head comments it already contains. The comments after the
+        // marker are the first node's head; an empty collection has none, and keeps
+        // them in the preamble as a scalar does (#7099).
+        let has_first_node = match &v {
+            OwnedValue::Object(map) => !map.is_empty(),
+            OwnedValue::Array(items) => !items.is_empty(),
+            _ => false,
+        };
         if is_document_root && is_first_document {
-            if let Some(preamble) = DocumentCursor::document_preamble(c, !is_collection) {
+            if let Some(preamble) = DocumentCursor::document_preamble(c, !has_first_node) {
                 let meta = comments.meta();
                 let foot = meta.foot_comment().to_vec();
                 *comments.meta_mut() = meta
@@ -4387,7 +4394,8 @@ fn to_owned_with_comments_impl<V: DocumentValue, S: EvalSemantics>(
 }
 
 /// The document preamble as yq prints it (#4086): verbatim, except that the `---` marker
-/// line loses any trailing blanks and a blank CRLF line is `# \r` (#5053).
+/// line loses any trailing blanks, a blank CRLF line is `# \r` (#5053), and a line of only
+/// blanks or an indented `%YAML` line is `# ` and the line (#7099).
 fn normalized_preamble(preamble: &str) -> String {
     preamble
         .split_inclusive('\n')
@@ -4399,6 +4407,13 @@ fn normalized_preamble(preamble: &str) -> String {
             } else if bare.is_empty() && line == "\r\n" {
                 // #5053: a blank CRLF line is `# \r` in yq's output (the `\r` is comment text to go-yaml).
                 alloc::borrow::Cow::Borrowed("# \r\n")
+            } else if bare.starts_with([' ', '\t'])
+                && (bare.trim_start_matches([' ', '\t']).is_empty()
+                    || bare.trim_start_matches([' ', '\t']).starts_with("%YAML"))
+            {
+                // #7099: a line of only blanks (#6401) and an indented `%YAML` line (#6408) are comments to
+                // go-yaml, `# ` and the line.
+                alloc::borrow::Cow::Owned(format!("# {line}"))
             } else {
                 alloc::borrow::Cow::Borrowed(line)
             }
@@ -57284,7 +57299,32 @@ mod tests {
             None,
             "content on the marker's line"
         );
-        assert_eq!(preamble_of(b"%YAML 1.2\n---\na: 1\n"), None, "a directive");
+        // #7099: a `%YAML` directive is part of yq's header, with or without a marker after it.
+        assert_eq!(
+            preamble_of(b"%YAML 1.2\n---\na: 1\n").as_deref(),
+            Some("%YAML 1.2\n---\n"),
+            "a directive"
+        );
+        assert_eq!(
+            preamble_of(b"%YAML 1.2\n# c\na: 1\n").as_deref(),
+            Some("%YAML 1.2\n# c\n"),
+            "a directive with no marker: the comments are the root's, so the preamble holds them"
+        );
+        assert_eq!(
+            preamble_of(b"---\n\t\n# c\na: 1\n").as_deref(),
+            Some("---\n# \t\n"),
+            "a line of blanks after the marker is `# ` and the line"
+        );
+        assert_eq!(
+            preamble_of(b"---\n# c\n[]\n").as_deref(),
+            Some("---\n# c\n"),
+            "an empty root has no first node to hold the comment"
+        );
+        assert_eq!(
+            preamble_of(b"%TAG ! tag:e.com,2000:\n---\na: 1\n"),
+            None,
+            "another directive"
+        );
         // Only the first document's.
         let yaml = b"a: 1\n---\nb: 2\n";
         let index = YamlIndex::build(yaml).unwrap();
