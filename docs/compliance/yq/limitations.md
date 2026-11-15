@@ -7550,6 +7550,10 @@ Still different:
   This build does the same for YAML output ([#7230](https://github.com/rust-works/succinctly/issues/7230)): the next item's line for a scalar, the head comment of a block collection's first member (`- # t` / `  a: 1`), an entry of a mapping that has a comment of its own lets it wait, a commented item of a sequence overwrites it, and a flow collection is skipped.
   Still different: the node after it is itself a collection a write built (`.[] = {"a": 1}`, where yq prints `- # t` / `  a: 1`), a flow collection next in a sequence (yq's own output there reads back as another document), and the comment of an item of a flow sequence; each drops the comment here.
   `-o xml` and the other encoders that write a comment from the tree drop it, as before.
+  Also still different: the comment is lost when the next line is itself a replaced item (`(.[0], .[1]) = {"a": 1}`).
+  After a commented entry inside a sequence item (`- a: 5 # own` / `  b: 6 # six`) it lands on the next item's dash line here, where yq writes it on the next scalar or drops it.
+  Under `-P` with a flow collection after the node, the comment waits behind it here and the `-P` pass then overwrites it.
+  `-o kyaml` and `-o lua` write the comment in yq and drop it here, as does a write inside a construction (`[.a = {"x": 1}]`, `| tostring`).
 - **A block mapping whose key line carries the comment** (`b: # t` / `  x: 1`) overwritten with an empty `{}` / `[]`.
   yq writes `b: # t` and the `{}` on the next line, which it cannot read back as the same document; this build writes `b: {} # t`.
 - **An explicit-key entry** (`? [1] # t` / `: 2`) written through `.[] = 5` prints `'': 5` here and `? [1] # t` / `: 5` in yq: the complex key is spelled `""` ([#3992](https://github.com/rust-works/succinctly/issues/3992)), a different mechanism from the comment.
