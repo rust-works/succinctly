@@ -30436,11 +30436,11 @@ fn extremum_streaming_generic<S: EvalSemantics, V: DocumentValue>(
         } else {
             pos.and_then(|pos| cursor.plain_int_at(pos))
         };
-        // STYLE-0012: raises regardless of `optional`, as `key_elements_generic`'s bare arm does
-        // (see its comment): `to_owned_cursor` raises only decode failures, which `suppresses`
-        // never suppresses, so routing it would be a guaranteed no-op.
         let mut key = match fast {
             Some(i) => Key::Int(i),
+            // STYLE-0012: raises regardless of `optional`, as `key_elements_generic`'s bare arm
+            // does (see its comment): `to_owned_cursor` raises only decode failures, which
+            // `suppresses` never suppresses, so routing it would be a guaranteed no-op.
             None => match to_owned_cursor::<S, _>(&cursor) {
                 Ok(key) => Key::Owned(key),
                 Err(error) => return GenericResult::Error(error),
@@ -30456,6 +30456,8 @@ fn extremum_streaming_generic<S: EvalSemantics, V: DocumentValue>(
                 // min` is the fraction in jq 1.7.1, where the `f64`s are equal (#7261).
                 let upgrade = |side: &mut Key, at: &V::Cursor| -> Result<(), EvalError> {
                     if matches!(side, Key::Int(_)) {
+                        // STYLE-0012: the same unsuppressible decode as the key above (a plain
+                        // integer's never fails); the caller raises it regardless of `optional`.
                         *side = Key::Owned(to_owned_cursor::<S, _>(at)?);
                     }
                     Ok(())
