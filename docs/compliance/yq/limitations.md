@@ -210,7 +210,7 @@ Since [#5257](https://github.com/rust-works/succinctly/issues/5257) the source s
 The source's style and tag are taken when the target is new, is not a scalar, is empty, is plain with no tag, or changes type (`str` to `int`), and the target keeps its own otherwise (`.c = .b` over `c: "old"` stays double-quoted whatever `b` was, over `c: old` it becomes `b`'s `'q'`).
 A custom tag already on the target stays (`c: !foo old` takes `b: x` as `!foo x`), and a custom tag on the source is copied whatever the quoting does.
 A tag names a container's type, so a `!foo` mapping over a flow `{y: 2}` is a change of type and takes the source's block style, and a flow `[1]` over a block `c: !!seq` keeps the block layout.
-A flow container copied onto a scalar or flow target keeps the target's same-line comment (`c: [1] # tc`); a block copy cannot, and drops it (the [#5258](https://github.com/rust-works/succinctly/issues/5258) rule).
+A flow container copied onto a scalar or flow target keeps the target's same-line comment (`c: [1] # tc`); a block copy has no line for it, and the comment is held for a later line as yq's encoder holds it ([#7230](https://github.com/rust-works/succinctly/issues/7230)).
 Swept against yq v4.53.3 over 459 source-by-target pairs of scalar and container styles, tags and comments.
 Still not copied, where yq copies them: the node's own head and foot lines, and an anchor declaration nested inside a copied container (yq prints the `&y` twice; the pass writes no anchor mark of its own, so only the alias marks of [#2505](https://github.com/rust-works/succinctly/issues/2505) reach the copy).
 Still different for a copy: a flow container copied over a block target whose key line carries a comment (`c: # tc` / `  - 9`; yq drops the comment, this prints `c: [1] # tc`), a literal or folded source written over a single-quoted target is `c: "q\n"` here and a multi-line single-quoted scalar in yq (the string emitter, not the copy), a custom-tagged target given a `!!str 5` source reads the text as `5` (an integer) in yq's `-o=json` and stays the string `"5"` here, and under `-P` a container copied onto a target that carries an anchor or tag prints `c: &t # sc` here where yq prints the comment and the tag on separate lines, which it cannot read back.
@@ -6682,7 +6682,7 @@ Four known gaps this write shares with every other write form, none specific to 
   Pinned by `metadata_write_behind_navigation_or_def_is_refused_not_dropped_2679` and `tests/yq_cli/i2679.rs`.
   An ordinary write behind a static navigation (`.a | .b = 5`, `.a | del(.b)`, `.a | sort_keys(.)`) takes the same route, so the subtree keeps its comments, flow style and quoting as in yq (#5286).
   [#2855](https://github.com/rust-works/succinctly/issues/2855)'s `sort_keys(f)` was the first case of the loss to be noticed; it is pinned by `test_yq_sort_keys_composes_with_pipe_2855` (`tests/yq_cli_tests.rs`) and `tests/yq_cli/i5286.rs`.
-  What remains is the loss that already exists without a navigation: a write that replaces a node with a different shape drops the comment on the node it replaced (a trailing `# c` on `d: [1]`, a standalone `# note` above `d:` or above a scalar a container replaces), where yq keeps it ([#5258](https://github.com/rust-works/succinctly/issues/5258)).
+  What remains is the loss that already exists without a navigation: a write that replaces a node with a different shape drops a standalone `# note` above `d:` or above a scalar a container replaces, where yq keeps it ([#5258](https://github.com/rust-works/succinctly/issues/5258)); its trailing `# c` is held for a later line, as in yq ([#7230](https://github.com/rust-works/succinctly/issues/7230)).
   A write followed by a read behind the navigation (`.a | (.b = 1) | .c`) is not a presentation-preserving write as a whole and still takes the old route, which loses the subtree's flow style.
 
 Finally, one rule real yq decides by the target's value, reproduced rather than "fixed":
@@ -7510,12 +7510,14 @@ carries an `&anchor` drops that anchor (`- &x` is printed as `-`), which predate
 no line of its own. yq's encoder holds it and writes it at the end of the next line that carries no comment: the
 next sibling's key line when that is a collection (`b: # ec`), its value line otherwise (`b: 1 # ec`), the dash
 line of a collection item (`- # ec` / `  x: 1`); and it is lost when nothing follows in the document, so
-`yq -P '.a'` on `a: [1, 2] # ec` prints no comment. A scalar that has a comment of its own keeps its line and the
-held comment waits for the next one, a comment on a collection's key overwrites it, an alias is skipped, and an
-empty `[]`/`{}` stays flow with its comment.
-Between the elements of a flow sequence (#6334) the held comment is overwritten by an element that has a comment of its own, and an alias takes it on its line. This build follows that for the DOM route that `-P`, a write and
-`--arg` take, on JSON-shaped and YAML input alike (`defer_flow_line_comments`). Swept against yq v4.53.3 over 14
-documents x 8 filters. Still different:
+`yq -P '.a'` on `a: [1, 2] # ec` prints no comment.
+The encoder holds it in two slots ([#7230](https://github.com/rust-works/succinctly/issues/7230)).
+An item of a sequence writes the pending comment on its own line, an alias included, and an item with a comment of its own replaces it.
+A mapping key moves the pending comment aside, and there it waits beside the mapping's entries, past a value with a comment of its own, an alias, a flow collection and the items of the sequence the mapping ends in, until a value with no comment or a block collection takes it.
+A comment on a collection's key replaces both, and an empty `[]`/`{}` stays flow with its comment.
+This build follows that for the DOM route that `-P`, a write and
+`--arg` take, on JSON-shaped and YAML input alike (`defer_held_line_comments`). Swept against yq v4.53.3 over 14
+documents x 8 filters, and #7230's random fuzz of 3,483 documents and writes. Still different:
 
 - **A comment written inside a flow collection** is kept when it follows an element on its line (`[1, # note` / `  2]`, #6334) and when it stands on a line of its own, and is printed as yq prints it.
   The identity route, a write and a navigation lay the collection out across lines with the comment after the element's comma, and the closing bracket on a line of its own when the last element is commented.
@@ -7526,13 +7528,13 @@ documents x 8 filters. Still different:
   A comment on a line of its own before a comma that is followed by the closing bracket (`[a, b` / `# f` / `,` / `]`) is dropped here; yq moves it, and the comments after that comma, past the collection to whatever follows (the next node, or the document's foot).
   yq writes an empty line before the first comment of a collection nested in a sequence after a sibling mapping that ends with a foot comment (`{k: v` / `# c` / `}, [` / `# d`), and before the foot of a collection that ends a block sequence under `-P`; some of these this build does not write.
   Under `-P` the foot of a last element that is itself a collection is written below the sequence when the sequence has an element after it in an outer sequence, or a key after it in a mapping (yq: `w: # c` / `# f` / `  - 1`), where this build writes it right below the element.
-  A comment held by an entry of a flow mapping that is an item of a block sequence, and left waiting at the end of the mapping by an entry with a comment of its own after it (`- {k0: {x: 1}, # c5` / `m1: b # c6` / `}` / `- 2`), is written on the next item's line here (`- 2 # c5`); yq drops it.
   A comment on the line of a comma that starts its own line, after own-line comments (`x` / `# c3` / `, # c4` / `~`), is the next scalar's line comment in yq (`~, # c4`) and is dropped here.
   A comment on a line of its own between a flow mapping key's colon and its value is held like any other (the next entry's head, or the value's first element's), and one on the colon's line is dropped, as in yq for a collection value; for a scalar value yq keeps it as the value's line comment.
   A comment after a single pair written in a flow sequence (`[a: 1, # c`), after an empty value (`{a: , # c`) or on a key is dropped, and so is a second comment on the line of a comma (`[a # c1` / `, # c2`) when the first stands on a line of its own.
   With `-I4`, the closing bracket of a commented collection nested in a `- [` item is at column 0 where yq puts it at the item's column.
 - **An empty `{}`/`[]` value that follows a held comment**: yq writes `b: # ec` and the `{}` on the next line;
   this build writes `b: {} # ec`.
+  An item of a sequence written in flow, empty or not, that the pending comment reaches is the same: yq writes `- # ec` and the collection on the next line at the sequence's own indentation, which it cannot read back, and this build writes `- [1] # ec` (`- [1] # own` when the item has a comment of its own).
 - **A collection built by an expression** (`[.]`, `{"k": .a}`, `to_entries`) carries no comment tree at all
   (#1361), so no comment is held or printed there.
 
@@ -7542,18 +7544,11 @@ A node's own trailing comment (`b: [1, 2] # t`, `b: 1 # t`, `b: {} # t`) stays b
 That is a scalar or an empty `{}` / `[]`: `.b = 5` over `b: [1, 2] # t` is `b: 5 # t`, and `.b = {}` over `b: 1 # t` is `b: {} # t`, as in yq.
 A document root follows the same rule except that a root scalar keeps no comment (`1 # t` written `. = 5` is `5`), as before.
 `-P` keeps an empty collection flow, and the comment with it.
+A non-empty block container written over the node (`.b = {"y": 2}`, `.b = [9]`) leaves the comment no line of its own, and yq's encoder holds it for a later line, the mechanism of [#4377](https://github.com/rust-works/succinctly/issues/4377)'s section above, which this build follows ([#7230](https://github.com/rust-works/succinctly/issues/7230)).
 Swept against yq v4.53.3: four container sources (flow sequence, flow mapping, empty `[]`, empty `{}`) against ten writes (a number, `null`, a quoted string, a string that needs quoting, a multi-line string that becomes `|- # t`, a float, a boolean, `length`, `tostring`, a copy of another node), five sources including a scalar against `{}` and `[]`, the document root, a node with an anchor, an alias or a tag, and a last key.
 Still different:
 
-- **A non-empty block container written over the node** (`.b = {"y": 2}`, `.b = [9]`).
-  The comment has no line of its own once the value is a block, so yq's encoder holds it and writes it at the end of the next line that carries no comment (`c: 3 # t`), the mechanism [#4377](https://github.com/rust-works/succinctly/issues/4377) describes for `-P`, and drops it when nothing follows.
-  This build does the same for YAML output ([#7230](https://github.com/rust-works/succinctly/issues/7230)): the next item's line for a scalar, the head comment of a block collection's first member (`- # t` / `  a: 1`), an entry of a mapping that has a comment of its own lets it wait, a commented item of a sequence overwrites it, and a flow collection is skipped.
-  Still different: the node after it is itself a collection a write built (`.[] = {"a": 1}`, where yq prints `- # t` / `  a: 1`), a flow collection next in a sequence (yq's own output there reads back as another document), and the comment of an item of a flow sequence; each drops the comment here.
-  `-o xml` and the other encoders that write a comment from the tree drop it, as before.
-  Also still different: the comment is lost when the next line is itself a replaced item (`(.[0], .[1]) = {"a": 1}`).
-  After a commented entry inside a sequence item (`- a: 5 # own` / `  b: 6 # six`) it lands on the next item's dash line here, where yq writes it on the next scalar or drops it.
-  Under `-P` with a flow collection after the node, the comment waits behind it here and the `-P` pass then overwrites it.
-  `-o kyaml` and `-o lua` write the comment in yq and drop it here, as does a write inside a construction (`[.a = {"x": 1}]`, `| tostring`).
+- **A write inside a construction or read back as text** (`[.a = {"x": 1}]`, `.a = {"x": 1} | tostring`, `| to_yaml`): yq holds the comment there too (`b: 6 # own`), and this build drops it, since the held-comment pass runs on a printed document ([#7235](https://github.com/rust-works/succinctly/issues/7235)).
 - **A block mapping whose key line carries the comment** (`b: # t` / `  x: 1`) overwritten with an empty `{}` / `[]`.
   yq writes `b: # t` and the `{}` on the next line, which it cannot read back as the same document; this build writes `b: {} # t`.
 - **An explicit-key entry** (`? [1] # t` / `: 2`) written through `.[] = 5` prints `'': 5` here and `? [1] # t` / `: 5` in yq: the complex key is spelled `""` ([#3992](https://github.com/rust-works/succinctly/issues/3992)), a different mechanism from the comment.

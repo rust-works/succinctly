@@ -4769,30 +4769,23 @@ fn reconcile_presentation_at_depth(
             let rewrites_the_document = depth == 0 && !targets.is_empty();
             let container_result =
                 matches!(result_value, OwnedValue::Object(_) | OwnedValue::Array(_));
-            // A node's own same-line comment stays on its line while the new value fits
-            // there: an empty `{}` / `[]`, or a scalar (#5258). A non-empty block
-            // container breaks the line, and yq then parks the comment on the next
-            // line, which succinctly drops (docs/compliance/yq/limitations.md). A
-            // document root keeps no comment beside a scalar, as before.
+            // A node's own same-line comment stays with it (#5258): beside an empty `{}` / `[]`
+            // or a scalar it stays on the line. A non-empty block container breaks the line, and
+            // yq's encoder then holds the comment and writes it on a later line (`- 5 # own` /
+            // `- 6` written `.[0] = {"a": 1}` is `- a: 1` / `- 6 # own`, #7230), which
+            // [`defer_held_line_comments`] places once the whole document is known. A document
+            // root keeps no comment beside a scalar or a non-empty container, as before: nothing
+            // follows it in the document for a held comment to reach.
             let keeps_line_comment = match result_value {
-                OwnedValue::Object(fields) => fields.is_empty(),
-                OwnedValue::Array(items) => items.is_empty(),
+                OwnedValue::Object(fields) => fields.is_empty() || !rewrites_the_document,
+                OwnedValue::Array(items) => items.is_empty() || !rewrites_the_document,
                 _ => !rewrites_the_document,
             };
-            // A non-empty block container has no line for the comment: yq holds it for the
-            // next line that has none (#7230), which `hold_kind_change_comments` places.
-            let holds_line_comment = !keeps_line_comment
-                && !rewrites_the_document
-                && container_result
-                && pristine_tree.meta().comment.is_some();
-            if holds_line_comment {
-                KIND_CHANGE_HELD.with(|held| held.set(true));
-            }
             kind_changed_leaf(
                 pristine_tree,
                 targets,
                 rewrites_the_document.then_some(container_result),
-                keeps_line_comment || holds_line_comment,
+                keeps_line_comment,
             )
         }
         // Both scalars, any variant/value: same node, only its value
@@ -4809,14 +4802,6 @@ fn reconcile_presentation_at_depth(
     }
 }
 
-thread_local! {
-    /// Set when a write left a node's same-line comment on a `Leaf` that now holds a non-empty
-    /// block container (#7230), for [`hold_kind_change_comments`] to move.
-    static KIND_CHANGE_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Set while the filter runs for an output encoder other than YAML's (`-o xml`).
-    static ENCODER_RUN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 /// The meta a container keeps across a write: its own, except that an empty flow `{}` / `[]` that a
 /// write gave its first child (`grown`) is block-styled (#4849). go-yaml's emitter writes a flow
 /// container in flow only while it is empty -- the one spelling an empty container has -- and a
@@ -4826,10 +4811,9 @@ thread_local! {
 #[inline(never)]
 fn grown_container_meta(meta: &NodeMeta, grown: bool) -> NodeMeta {
     if grown && meta.style == "flow" {
-        // The comment beside `{}` / `[]` goes with the flow spelling (yq drops it).
-        let mut grown = meta.with_style("");
-        grown.comment = None;
-        grown
+        // The comment beside `{}` / `[]` stays with the node, which is a block now: yq's encoder
+        // holds it for a later line, which [`defer_held_line_comments`] places (#7230).
+        meta.with_style("")
     } else {
         meta.clone()
     }
@@ -7149,9 +7133,16 @@ fn resolve_metadata_write_targets<W: AsRef<[u64]> + Clone>(
         }
         let query = Expr::Pipe(vec![target.clone(), Expr::Builtin(Builtin::PathNoArg)].into());
         let mut scratch = ErrorSink::default();
-        let results =
-            evaluate_yaml_cursor_core(cursor, &query, &mut scratch, false, false, false, None)
-                .ok()?;
+        let results = evaluate_yaml_cursor_core(
+            cursor,
+            &query,
+            &mut scratch,
+            false,
+            false,
+            false,
+            CoreRoute::inner(None),
+        )
+        .ok()?;
         if scratch.hit() {
             return None;
         }
@@ -8925,7 +8916,7 @@ fn evaluate_yaml_cursor_in_document<W: AsRef<[u64]> + Clone>(
                     need_comments,
                     strip_style,
                     sort_keys,
-                    None,
+                    CoreRoute::printed(None),
                 );
             }
         }
@@ -8965,7 +8956,7 @@ fn evaluate_yaml_cursor_in_document<W: AsRef<[u64]> + Clone>(
                         need_comments,
                         strip_style,
                         sort_keys,
-                        pristine,
+                        CoreRoute::printed(pristine),
                     );
                 }
             }
@@ -8984,10 +8975,11 @@ fn evaluate_yaml_cursor_in_document<W: AsRef<[u64]> + Clone>(
             need_comments,
             strip_style,
             sort_keys,
-            None,
+            CoreRoute::printed(None),
         );
     };
     let has_aliases = cursor.index().has_aliases();
+    // The held comments are placed in each navigated node below, which is what is printed.
     let docs = evaluate_yaml_cursor_core(
         cursor,
         &prefix,
@@ -8995,7 +8987,7 @@ fn evaluate_yaml_cursor_in_document<W: AsRef<[u64]> + Clone>(
         need_comments,
         strip_style,
         sort_keys,
-        None,
+        CoreRoute::inner(None),
     )?;
     let path = meta_path_of(&steps);
     let mut out = Vec::with_capacity(docs.len());
@@ -9031,6 +9023,7 @@ fn evaluate_yaml_cursor_in_document<W: AsRef<[u64]> + Clone>(
                     "",
                 ));
             }
+            defer_held_line_comments(&nv, &mut sub, strip_style);
             if has_aliases {
                 enforce_anchor_soundness(&nv, &mut sub, sort_keys);
             }
@@ -9100,6 +9093,35 @@ fn split_comment_encoder(expr: &Expr) -> Option<(Expr, &YqOutputEncoder)> {
     Some((inner, encoder))
 }
 
+/// What the caller of [`evaluate_yaml_cursor_core`] does with its results, grouped so the function
+/// stays within clippy's argument limits (as [`FallbackStreamState`] does).
+struct CoreRoute {
+    /// The document's own snapshot, when the query runs on a node inside it.
+    pristine_override: Option<(OwnedValue, CommentTree)>,
+    /// The results are printed as YAML documents, whole: a line comment yq's YAML encoder holds is
+    /// placed on a later line of the same document (#7230). Not for a result another encoder writes,
+    /// or one the caller navigates into before printing it, which places its own.
+    places_held_comments: bool,
+}
+
+impl CoreRoute {
+    /// Results printed as YAML documents.
+    fn printed(pristine_override: Option<(OwnedValue, CommentTree)>) -> Self {
+        Self {
+            pristine_override,
+            places_held_comments: true,
+        }
+    }
+
+    /// Results the caller encodes otherwise, navigates into, or only inspects.
+    fn inner(pristine_override: Option<(OwnedValue, CommentTree)>) -> Self {
+        Self {
+            pristine_override,
+            places_held_comments: false,
+        }
+    }
+}
+
 /// Evaluate a jq expression directly on a YAML cursor.
 ///
 /// This uses the generic evaluator to preserve position metadata (line/column).
@@ -9119,8 +9141,12 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
     need_comments: bool,
     strip_style: bool,
     sort_keys: bool,
-    pristine_override: Option<(OwnedValue, CommentTree)>,
+    route: CoreRoute,
 ) -> Result<Vec<ResultWithComments>> {
+    let CoreRoute {
+        pristine_override,
+        places_held_comments,
+    } = route;
     // #7156: `-o xml` writes the comments of the node it is given, and a write or a built value holds
     // them in its presentation tree and not on a cursor. So the filter runs without its encoder, with
     // comments, and each result is encoded with the tree it came with.
@@ -9132,7 +9158,6 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
                 || reshape_presentation::needed(inner)
                 || reshape_presentation::navigation_construction(inner))
     }) {
-        let outer = ENCODER_RUN.with(|run| run.replace(true));
         let results = evaluate_yaml_cursor_core(
             cursor,
             &inner,
@@ -9140,10 +9165,8 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
             true,
             strip_style,
             sort_keys,
-            pristine_override,
-        );
-        ENCODER_RUN.with(|run| run.set(outer));
-        let results = results?;
+            CoreRoute::inner(pristine_override),
+        )?;
         let mut encoded = Vec::with_capacity(results.len());
         for (value, tree) in results {
             match jq::format_yq_encoder_from_tree(encoder, &value, &tree, &cursor) {
@@ -9232,6 +9255,10 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
         }
         None => None,
     };
+
+    // Whether a result's tree is reconciled against the document's (a write, #739, or the replay of
+    // an entries operator below), and so can hold a comment a write moved off its line (#7230).
+    let mut reconciles = presentation_sync_ctx.is_some();
 
     // Resolve every `PATH <slot> = value` / `PATH <slot> |= filter` (#798)
     // in `expr` before evaluation begins, starting from the pristine
@@ -9614,6 +9641,7 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
                 if let Some((traced, tree)) = reshaped {
                     if results[0].0 == traced {
                         results[0].1 = tree;
+                        reconciles = true;
                     }
                 }
                 // #7081: the document's own tree, for what yq prints before it, is the one just read.
@@ -9789,29 +9817,27 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
         }
     }
 
+    // A line comment yq's encoder cannot write on its node's line waits for a later one (#4377,
+    // #7230): the comment of a flow collection `-P` writes in block style, and of a scalar a write
+    // replaced with a block collection. Before the style is gone, which says which collections are
+    // written in flow.
+    if places_held_comments && (strip_style || reconciles) {
+        if let Ok(docs) = &mut docs {
+            for (value, comments) in docs.iter_mut() {
+                defer_held_line_comments(value, comments, strip_style);
+            }
+        }
+    }
+
     // `-P`/`--pretty-print` (#705) forces block/plain style regardless of
     // source — a real style-clearing step, not just "there's no style data
     // to clear" like before #739's style tracking existed. Comments and
     // anchor marks stay (`-P` only ever claimed to affect style, and real
     // `yq -P '.'` does keep `&x`/`*x`), so this only touches the style slot
     // of every node, not the tree shape.
-    if KIND_CHANGE_HELD.with(std::cell::Cell::take) {
-        // yq's YAML encoder holds the comment; the encoders of other formats (`-o xml`, #7156) have no
-        // such line and drop it.
-        let holds = !ENCODER_RUN.with(std::cell::Cell::get);
-        if let Ok(docs) = &mut docs {
-            for (value, comments) in docs.iter_mut() {
-                hold_kind_change_comments(value, comments, holds);
-            }
-        }
-    }
-
     if strip_style {
         if let Ok(docs) = &mut docs {
             for (value, comments) in docs.iter_mut() {
-                // Before the style is gone: only a node still written in flow style carries the
-                // comment that moves (#4377).
-                defer_flow_line_comments(value, comments);
                 *comments = strip_presentation_style(value, comments);
             }
         }
@@ -9842,65 +9868,56 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
     docs
 }
 
-/// Where yq's `-P` writes the trailing comment of a flow collection it turns into block style
-/// (#4377). The comment sits after the closing `]`/`}`, where a block collection has no line, so
-/// yq's encoder holds it and writes it at the end of the next line it emits that has no comment
-/// of its own, and loses it when nothing follows in the document:
+/// Where yq writes the trailing comment of a collection written in block style, which has no line
+/// of its own to end in (#4377, #7230). go-yaml's serializer gives a collection's line comment to
+/// its *end* event, and its emitter holds a comment it cannot write yet in two slots
+/// ([`HeldComments`]) until a later line takes it. That is the comment of a flow collection `-P`
+/// turns into block style (#4377), and the comment of a scalar a write replaced with a block
+/// collection, which the node keeps (#7230):
 ///
 /// ```text
-/// a: [1, 2] # ec           a:
-/// b: [3]    # fc    -P ->     - 1
+/// a: [1, 2] # ec           a:                  - 5 # own                  - a: 1
+/// b: [3]    # fc    -P ->     - 1             - 6     .[0] = {"a": 1} ->  - 6 # own
 /// c: 4      # gc              - 2
 ///                           b: # ec
 ///                             - 3
 ///                           c: 4 # gc
 /// ```
 ///
-/// A scalar that carries its own comment keeps the line and the held comment waits for the next
-/// one (`z: 1 # fc` after `c: 4 # gc` above, if a `z` follows). A collection that was flow takes
-/// the held comment on its own opening line, since its own comment is no longer written there. An
-/// empty `[]`/`{}` stays flow and keeps its comment, and an alias is one line. The walk follows
+/// A block sequence item writes the pending comment on its own line: a scalar or an alias at its
+/// end (and one with a comment of its own replaces it), a block collection on its dash, as the
+/// head comment of its first member (#4231). A block mapping key moves the pending comment aside,
+/// and it waits beside the mapping's entries until a value takes it: a scalar with no comment of
+/// its own at its end, a block collection on its key's line. A key with a comment of its own
+/// (`k: # note`) replaces both. Whatever is held when the document ends is lost. The walk follows
 /// the value's order, which is the order the document is written in.
 ///
-/// The comment of an element of a collection written in flow (`[[1], # a` / `2]`) is held the same
-/// way (#6334). The held comment is one slot, which the next held comment overwrites; and between
-/// the elements of a flow *sequence* (not a mapping) an element with a comment of its own, an
-/// alias or a scalar, overwrites it where beside block entries it would have waited.
-fn defer_flow_line_comments(value: &OwnedValue, tree: &mut CommentTree) {
-    let mut held = None;
-    defer_flow_line_comments_at(
-        value,
-        tree,
-        LineComment::Free,
-        false,
-        &mut held,
-        0,
-        HoldFor::FlowToBlock,
-    );
+/// `pretty` is `-P`, which writes every non-empty collection in block style. Without it a
+/// collection written in flow keeps its comment beside its closing bracket, and the walk does not
+/// look inside it: its elements are written on its lines.
+///
+/// Where yq writes the comment on a dash or key line and a collection written in flow (an empty one
+/// included) on the next line, at the sequence's indentation (`- # c` / `[1]`, `b: # c` / `{}`),
+/// which it cannot read back, succinctly writes the comment beside the collection
+/// (docs/compliance/yq/limitations.md).
+fn defer_held_line_comments(value: &OwnedValue, tree: &mut CommentTree, pretty: bool) {
+    let mut held = HeldComments::default();
+    defer_held_line_comments_at(value, tree, pretty, &mut held, 0);
 }
 
-/// The same hold for a node a write turned into a non-empty block container (#7230): its line
-/// comment, which [`kind_changed_leaf`] left on the `Leaf`, is written at the end of the next
-/// line that has no comment, and lost when nothing follows. No flow collection is rewritten.
-fn hold_kind_change_comments(value: &OwnedValue, tree: &mut CommentTree, holds: bool) {
-    let mut held = None;
-    let hold_for = if holds {
-        HoldFor::KindChange { parent_flow: false }
-    } else {
-        HoldFor::KindChangeDropped
-    };
-    defer_flow_line_comments_at(
-        value,
-        tree,
-        LineComment::Free,
-        false,
-        &mut held,
-        0,
-        hold_for,
-    );
+/// The two slots go-yaml's emitter holds a line comment in until a line takes it, for
+/// [`defer_held_line_comments`].
+#[derive(Default)]
+struct HeldComments {
+    /// `emitter.LineComment`: the next line that ends writes it, and a node that brings a comment
+    /// of its own replaces it.
+    pending: Option<String>,
+    /// `emitter.key_line_comment`: the pending comment a block mapping key moved aside, for the
+    /// next mapping value that can take it. The next key that finds a pending comment replaces it.
+    key: Option<String>,
 }
 
-/// Whether `value` is a collection with members, the only kind `-P` rewrites from flow to block.
+/// Whether `value` is a collection with members, the only kind a line comment is held after.
 fn is_non_empty_collection(value: &OwnedValue) -> bool {
     match value {
         OwnedValue::Object(members) => !members.is_empty(),
@@ -9909,155 +9926,122 @@ fn is_non_empty_collection(value: &OwnedValue) -> bool {
     }
 }
 
-/// Which comment [`defer_flow_line_comments_at`] moves.
-#[derive(Clone, Copy)]
-enum HoldFor {
-    /// The trailing comment of a flow collection `-P` rewrites as block (#4377).
-    FlowToBlock,
-    /// The line comment a write left on a node it turned into a block container (#7230).
-    /// `parent_flow`: the node's parent is written in flow, where the comment has no line to move to.
-    KindChange { parent_flow: bool },
-    /// The same, for an output format whose encoder has no line to hold it for: it is dropped.
-    KindChangeDropped,
+/// Whether `value`, with `tree` for its presentation, is written as a block collection: lines of
+/// its own below the line it opens on. An alias is one line, and an empty collection is written
+/// `{}` / `[]`.
+fn is_written_as_block(value: &OwnedValue, tree: &CommentTree, pretty: bool) -> bool {
+    tree.alias_name().is_none()
+        && is_non_empty_collection(value)
+        && (pretty || tree.style() != "flow")
 }
 
-impl HoldFor {
-    /// The mode for the children of a node written in flow (`flow`) or not.
-    fn under(self, flow: bool) -> Self {
-        match self {
-            Self::KindChange { .. } => Self::KindChange { parent_flow: flow },
-            Self::FlowToBlock => Self::FlowToBlock,
-            Self::KindChangeDropped => Self::KindChangeDropped,
+/// Give a collection whose tree has no member trees (a `Leaf`, which a write that changed the
+/// node's kind leaves, or a [`CommentTree::Silent`] one, #6880) the childless tree of its kind, with
+/// its own metadata, so a held comment can be placed on a member. A member's tree is added only
+/// where one is placed; an absent one reads as the empty tree, as every member of either does.
+fn unfold_members(tree: &mut CommentTree, value: &OwnedValue) {
+    let unfolded = match (&*tree, value) {
+        (CommentTree::Leaf(_) | CommentTree::Silent(SilentKind::Array), OwnedValue::Array(_)) => {
+            CommentTree::array(tree.meta().clone(), Vec::new())
         }
+        (CommentTree::Leaf(_) | CommentTree::Silent(SilentKind::Object), OwnedValue::Object(_)) => {
+            CommentTree::object(tree.meta().clone(), IndexMap::new(), IndexMap::new())
+        }
+        _ => return,
+    };
+    *tree = unfolded;
+}
+
+/// Whether a mapping value takes the comment its key moved aside when it is no block collection
+/// (which takes it on the key's line): a scalar with no comment of its own, and an empty collection
+/// written in block style. yq writes the comment on the key's line there and the `{}` / `[]` on
+/// the next, which it cannot read back; this build writes it beside the `{}` / `[]`, and drops it
+/// when the collection has a comment of its own. An alias, a scalar with a comment of its own and
+/// a collection written in flow leave it waiting.
+fn takes_key_comment(value: &OwnedValue, tree: &CommentTree, pretty: bool) -> bool {
+    if tree.alias_name().is_some() {
+        return false;
+    }
+    match value {
+        OwnedValue::Object(_) | OwnedValue::Array(_) => pretty || tree.style() != "flow",
+        _ => tree.own().is_none(),
     }
 }
 
-/// How the line a node opens already ends, for [`defer_flow_line_comments_at`].
-#[derive(Clone, Copy)]
-enum LineComment {
-    /// No comment yet: the node's own comment, if it has none, takes a held one.
-    Free,
-    /// The line ends in a comment that belongs to the key (`k: # note`), so yq's encoder
-    /// overwrites the held comment there instead of waiting.
-    Overwritten,
-    /// The caller already wrote a held comment on this line (a key or dash line).
-    Placed,
-}
-
-/// `in_flow`: `tree`'s parent was a sequence written in flow, where an element with a comment of
-/// its own, an alias included, overwrites the held comment instead of leaving it to wait for a
-/// later line, and an alias takes it on its own line (#6334).
-fn defer_flow_line_comments_at(
+fn defer_held_line_comments_at(
     value: &OwnedValue,
     tree: &mut CommentTree,
-    line: LineComment,
-    in_flow: bool,
-    held: &mut Option<String>,
+    pretty: bool,
+    held: &mut HeldComments,
     depth: usize,
-    hold_for: HoldFor,
 ) {
     assert_value_tree_depth(depth);
-    let kind_change = matches!(
-        hold_for,
-        HoldFor::KindChange { .. } | HoldFor::KindChangeDropped
-    );
-    // A flow collection stays as written there, so it is a line that never takes the held
-    // comment (yq writes it on the line after: `b: [c]` / `d: 7 # own`).
-    if kind_change
-        && matches!(value, OwnedValue::Object(_) | OwnedValue::Array(_))
-        && tree.style() == "flow"
-    {
-        return;
-    }
-    // An alias is one line. Beside block entries and in a mapping it never takes the held comment,
-    // the next line does; in a flow sequence it is a line like a scalar's (#6334).
-    if tree.alias_name().is_some() {
-        if in_flow {
-            if tree.own().is_some() {
-                *held = None;
-            } else if let Some(comment) = held.take() {
-                tree.meta_mut().comment = Some(comment);
-            }
+    if !is_written_as_block(value, tree, pretty) {
+        // A node that ends its own line: it writes the pending comment there, unless it brings one
+        // of its own, which replaces it. Only a sequence item meets a pending comment here, since
+        // a mapping key moves it aside first; one written in flow takes it beside its closing
+        // bracket (see [`defer_held_line_comments`]).
+        if tree.own().is_some() {
+            held.pending = None;
+        } else if let Some(comment) = held.pending.take() {
+            tree.meta_mut().comment = Some(comment);
         }
         return;
     }
-    // `kind_change`: the comment a write left on a `Leaf` over a block container (#7230), not a
-    // flow collection `-P` rewrites. Beside the items of a flow sequence it has no line to move to.
-    let converted_flow = is_non_empty_collection(value)
-        && if kind_change {
-            // (A copy written over the node may have put the comment on the copied tree.)
-            tree.own().is_some()
-        } else {
-            tree.style() == "flow"
-        };
-    let own = if converted_flow {
+    // The comment of a block collection goes with its end event, after its last line. (Read before
+    // it is taken: a collapsed collection, which says nothing, stays collapsed.)
+    let own = if tree.own().is_some() {
         tree.meta_mut().comment.take()
     } else {
         None
     };
-    match line {
-        LineComment::Overwritten => {
-            *held = None;
-        }
-        LineComment::Placed => {}
-        LineComment::Free if tree.own().is_none() => {
-            if let Some(comment) = held.take() {
-                tree.meta_mut().comment = Some(comment);
-            }
-        }
-        // Between the elements of a collection written in flow, an element with a comment of its
-        // own overwrites the held one (#6334); beside the entries of a block it waits (#4377).
-        LineComment::Free if in_flow => {
-            *held = None;
-        }
-        LineComment::Free => {}
+    if held.key.is_some() {
+        // A comment a key moved aside can reach a member of a collection that has no tree of its
+        // own for them.
+        unfold_members(tree, value);
     }
-    let children_in_flow = tree.style() == "flow";
     match (value, &mut *tree) {
         (OwnedValue::Object(members), CommentTree::Object(..)) => {
             for (key, child) in members {
-                let key_commented = tree.key_comment(key).is_some();
-                let CommentTree::Object(_, fields, _) = &mut *tree else {
-                    break; // patchcov: coverage tolerate-line reason="unreachable: the match arm above proved the tree is an Object and nothing in the loop changes its variant"
-                };
-                // A member the tree never saw has no style or comment to move or to take.
-                if !fields.contains_key(key.as_str()) {
-                    continue;
-                }
-                // A collection is written on the lines below its key, so the held comment ends
-                // the key's line; any other value ends the line itself.
-                let on_key = !key_commented
-                    && held.is_some()
-                    && is_non_empty_collection(child)
-                    && fields.get(key.as_str()).is_some_and(|slot| {
-                        slot.alias_name().is_none() && !(kind_change && slot.style() == "flow")
-                    });
-                if on_key {
-                    if let Some(comment) = held.take() {
-                        tree.set_key_comment(key, comment);
+                if held.pending.is_some() || held.key.is_some() {
+                    if tree.key_comment(key).is_some() {
+                        // The key's own comment ends its line, and replaces both held ones.
+                        held.pending = None;
+                        held.key = None;
+                    } else if let Some(comment) = held.pending.take() {
+                        held.key = Some(comment);
                     }
                 }
                 let CommentTree::Object(_, fields, _) = &mut *tree else {
                     break; // patchcov: coverage tolerate-line reason="unreachable: the match arm above proved the tree is an Object and nothing in the loop changes its variant"
                 };
-                if let Some(slot) = fields.get_mut(key.as_str()) {
-                    defer_flow_line_comments_at(
-                        child,
-                        slot,
-                        if on_key {
-                            LineComment::Placed
-                        } else if key_commented {
-                            LineComment::Overwritten
-                        } else {
-                            LineComment::Free
-                        },
-                        // Beside the entries of a flow mapping a commented one leaves the held
-                        // comment waiting, as beside block entries.
-                        false,
-                        held,
-                        depth + 1,
-                        hold_for.under(children_in_flow),
-                    );
+                // A member the tree never saw (one the write added) has nothing to move, but can
+                // still take a held comment.
+                if held.key.is_some() && !fields.contains_key(key.as_str()) {
+                    fields.insert(key.clone(), CommentTree::empty());
+                }
+                let Some(slot) = fields.get_mut(key.as_str()) else {
+                    continue;
+                };
+                // A block collection is written on the lines below its key, so the held comment
+                // ends the key's line, before any of the collection's own lines.
+                let on_key = if is_written_as_block(child, slot, pretty) {
+                    held.key.take()
+                } else {
+                    None
+                };
+                if on_key.is_none() && takes_key_comment(child, slot, pretty) {
+                    // A scalar ends its line with the key's held comment, unless it has one of its
+                    // own; an empty block collection takes it beside its `{}` / `[]`.
+                    if let Some(comment) = held.key.take() {
+                        if slot.own().is_none() {
+                            slot.meta_mut().comment = Some(comment);
+                        }
+                    }
+                }
+                defer_held_line_comments_at(child, slot, pretty, held, depth + 1);
+                if let Some(comment) = on_key {
+                    tree.set_key_comment(key, comment);
                 }
             }
         }
@@ -10067,80 +10051,55 @@ fn defer_flow_line_comments_at(
                     break; // patchcov: coverage tolerate-line reason="unreachable: the match arm above proved the tree is an Array and nothing in the loop changes its variant"
                 };
                 if i >= slots.len() {
-                    continue;
+                    // An item the tree never saw (one the write added) has nothing to move, but
+                    // can still take a held comment.
+                    if held.pending.is_none() && held.key.is_none() {
+                        continue;
+                    }
+                    slots.resize_with(i + 1, CommentTree::empty);
                 }
                 // A collection item opens on its dash, and the writer puts a comment there as the
                 // head comment of the item's first member (#4231).
-                let on_dash = held.is_some()
-                    && slots[i].alias_name().is_none()
-                    && !(kind_change && slots[i].style() == "flow")
-                    && is_non_empty_collection(child);
-                if on_dash {
-                    if let Some(comment) = held.take() {
+                if is_written_as_block(child, &slots[i], pretty) {
+                    if let Some(comment) = held.pending.take() {
                         head_comment_first_member(&mut slots[i], child, comment);
                     }
                 }
-                defer_flow_line_comments_at(
-                    child,
-                    &mut slots[i],
-                    if on_dash {
-                        LineComment::Placed
-                    } else {
-                        LineComment::Free
-                    },
-                    // Beside the items of a block sequence a commented one overwrites the held
-                    // comment (`- 6 # six` after the replaced item), where a mapping's entry lets
-                    // it wait (#7230).
-                    children_in_flow || kind_change,
-                    held,
-                    depth + 1,
-                    hold_for.under(children_in_flow),
-                );
+                defer_held_line_comments_at(child, &mut slots[i], pretty, held, depth + 1);
             }
         }
         _ => {}
     }
     if let Some(comment) = own {
-        // One slot: a comment held after a nested flow collection is overwritten by the next one
-        // that is held, the parent's (`{x: [1] # xi` / `} # ec` writes `ec`, #4377).
-        if !matches!(
-            hold_for,
-            HoldFor::KindChange { parent_flow: true } | HoldFor::KindChangeDropped
-        ) {
-            *held = Some(comment);
-        }
+        // One slot: a comment held after a nested collection is replaced by the next one that is
+        // held, the parent's (`{x: [1] # xi` / `} # ec` writes `ec`, #4377).
+        held.pending = Some(comment);
     }
 }
-
 /// Prepend `comment` to the head comment of the first member of the non-empty collection `value`
 /// (`tree` is its tree), where the writer renders the comment on a collection item's dash line.
 fn head_comment_first_member(tree: &mut CommentTree, value: &OwnedValue, comment: String) {
-    // A collapsed collection (#6880) stands for a tree whose first member says nothing: it gets
-    // just the node that holds the comment, as that member does in the full tree. (A `Leaf` over
-    // a collection, which a write that changed a node's kind leaves, has no first member and is
-    // left as it was.)
-    if let CommentTree::Silent(kind) = tree {
-        *tree = match (kind, value) {
-            (SilentKind::Array, OwnedValue::Array(_)) => {
-                CommentTree::array(NodeMeta::empty(), vec![CommentTree::empty()])
-            }
-            (SilentKind::Object, OwnedValue::Object(members)) => match members.keys().next() {
-                Some(key) => CommentTree::object(
-                    NodeMeta::empty(),
-                    IndexMap::from([(key.clone(), CommentTree::empty())]),
-                    IndexMap::new(),
-                ),
-                None => CommentTree::empty(),
-            },
-            _ => CommentTree::empty(),
-        };
-    }
+    // A collection with no tree for its members (a collapsed one, #6880, or the `Leaf` a write that
+    // changed the node's kind leaves, #7230) gets an empty one for each, as in the full tree.
+    unfold_members(tree, value);
     let first = match (tree, value) {
-        (CommentTree::Array(_, items), OwnedValue::Array(_)) => items.first_mut(),
-        (CommentTree::Object(_, fields, _), OwnedValue::Object(members)) => members
-            .keys()
-            .next()
-            .and_then(|key| fields.get_mut(key.as_str())),
+        (CommentTree::Array(_, items), OwnedValue::Array(_)) => {
+            if items.is_empty() {
+                items.push(CommentTree::empty());
+            }
+            items.first_mut()
+        }
+        (CommentTree::Object(_, fields, _), OwnedValue::Object(members)) => {
+            match members.keys().next() {
+                Some(key) => {
+                    if !fields.contains_key(key.as_str()) {
+                        fields.insert(key.clone(), CommentTree::empty());
+                    }
+                    fields.get_mut(key.as_str())
+                }
+                None => None, // patchcov: coverage tolerate-line reason="unreachable: only a non-empty collection, written in block style, is given a held comment on its dash"
+            }
+        }
         _ => None,
     };
     if let Some(first) = first {
