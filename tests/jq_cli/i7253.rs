@@ -9,7 +9,7 @@
 //! reads on. Each file before the gone one is some 100 KB of output, far more than a pipe holds, so the run is
 //! still many files short of it at the removal and reaches it afterwards, which no sleep could promise.
 //! Every row is compared with the same files when the file was never there (the judgement turns that list
-//! down, so the whole-file route runs it) and pins what `/usr/bin/jq` 1.7.1 gives over them: the values
+//! down, so the whole-file route runs it) and pins what `/usr/bin/jq` 1.7.1 gave over them, captured by hand: the values
 //! before the file, the failure, the first value after it, and exit 2.
 
 #![cfg(unix)]
@@ -22,7 +22,8 @@ use anyhow::Result;
 
 type Run = (String, String, i32);
 
-/// More than the 32 files the run holds open from the start.
+/// More than the 32 files a list can have and still be held open from the start: a list this long is opened
+/// by path, each file when the run reaches it, so every one of them, the gone one included, is closed until then.
 const FILES: usize = 40;
 const EACH: usize = 1_000;
 /// The file that is gone when the run reaches it, far enough along for the run to be blocked on its output
@@ -91,14 +92,40 @@ fn never_there(files: &[Vec<u8>]) -> Result<Run> {
     ))
 }
 
+/// A child that is killed and waited for when the test ends early, so that a failed assertion leaves no run
+/// blocked on a pipe behind it.
+struct Reaped(std::process::Child);
+
+impl std::ops::Deref for Reaped {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Reaped {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// The run over every file, with `GONE` removed after the run has begun and before it reaches it.
 fn removed_mid_run(files: &[Vec<u8>]) -> Result<Run> {
     let dir = tempfile::tempdir()?;
     let paths = write(dir.path(), files, None)?;
-    let mut child = command(&paths)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let mut child = Reaped(
+        command(&paths)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    );
     let mut stdout = BufReader::new(child.stdout.take().expect("piped"));
     let mut first = Vec::new();
     stdout.read_until(b'\n', &mut first)?;
