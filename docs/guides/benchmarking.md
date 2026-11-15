@@ -717,10 +717,10 @@ the measurement that justified [select-scan.md](../optimizations/select-scan.md)
 
 #### 2. ARM Neoverse-V2 (AWS Graviton 4)
 - **Location**: AWS EC2 instance
-- **OS**: Linux 6.14.0-1018-aws
+- **OS**: Amazon Linux 2023 (the kernel is recorded in each run's `provenance.txt`)
 - **SIMD**: NEON (128-bit), SVE2 (128-bit), SVEBITPERM (BDEP/BEXT)
 - **Use for**: ARM64 server performance, SVE2 features
-- **Access**: Cloud instance (manual provisioning)
+- **Access**: Cloud instance, provisioned and run by `scripts/compare-ec2/` for `dev compare jq` ([reproducing-the-jq-comparison.md](reproducing-the-jq-comparison.md#on-aws-ec2-scripted))
 
 #### 3. ARM Neoverse-V1 (AWS Graviton 3)
 - **Location**: AWS EC2 instance

@@ -18,6 +18,7 @@ Practical how-to documentation for using and developing succinctly.
 |-------|-------------|
 | [Developer Guide](developer.md) | Contributing to the codebase |
 | [Release Guide](release.md) | Release process (for maintainers) |
+| [Reproducing the jq comparison](reproducing-the-jq-comparison.md) | Valid `dev compare jq` runs on any machine or a scripted EC2 instance, and merging the platforms |
 
 ## Quick Links
 

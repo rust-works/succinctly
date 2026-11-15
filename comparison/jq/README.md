@@ -16,6 +16,9 @@ entries for another OS and the perf and operational dimensions, names each skip,
 that half stays in CI.
 
 Writes `env.json`, `results.json` (schema-versioned) and `report.md` to `data/compare/<run_id>/`.
+Reproducing the committed per-platform reports (what makes a run valid, running every platform at one commit, the
+scripted EC2 pipeline in `scripts/compare-ec2/`, merging with `--render-docs`) is
+[docs/guides/reproducing-the-jq-comparison.md](../../docs/guides/reproducing-the-jq-comparison.md).
 A dirty tree, battery power, a non-release build or a feature set that differs from `manifest.toml`
 marks the run **INVALID** in the report. A query whose output or exit status differs from jq's is
 reported as a correctness row and gets no timing; the command exits 1 on it.
