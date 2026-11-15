@@ -21963,7 +21963,9 @@ mod tests {
         let route = |argv: &[&str]| {
             let cmd = JqCommand::try_parse_from(argv.iter().copied()).unwrap();
             let windowed = windowed_seq_file(&cmd).is_some();
-            let gated = SEQ_PIPE_TAIL.with(|tail| tail.borrow_mut().take()).is_some();
+            let gated = SEQ_PIPE_TAIL
+                .with(|tail| tail.borrow_mut().take())
+                .is_some();
             (windowed && !gated, windowed && gated)
         };
         let takes = |argv: &[&str]| route(argv).0;
