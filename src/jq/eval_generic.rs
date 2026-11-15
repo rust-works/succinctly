@@ -9133,7 +9133,7 @@ fn push_element_result<V: DocumentValue>(
         }
         other => {
             if per_element.is_empty() {
-                per_element.reserve(remaining);
+                *per_element = vec_with_capacity(remaining);
             }
             per_element.push(other);
         }
@@ -9186,7 +9186,7 @@ mod per_element_batch_tests_7267 {
         };
         let mut batch: Batch<'_> = Vec::new();
         push_element_result(&mut batch, GenericResult::Owned(OwnedValue::Int(10)), 6);
-        push_element_result(&mut batch, GenericResult::OneCursor(cs[0].clone()), 5);
+        push_element_result(&mut batch, GenericResult::OneCursor(cs[0]), 5);
         push_element_result(&mut batch, GenericResult::None, 4);
         push_element_result(&mut batch, GenericResult::Owned(OwnedValue::Int(20)), 3);
         push_element_result(
@@ -9194,11 +9194,7 @@ mod per_element_batch_tests_7267 {
             GenericResult::ManyOwned(vec![OwnedValue::Int(30), OwnedValue::Int(40)]),
             2,
         );
-        push_element_result(
-            &mut batch,
-            GenericResult::ManyCursor(vec![cs[1].clone()]),
-            1,
-        );
+        push_element_result(&mut batch, GenericResult::ManyCursor(vec![cs[1]]), 1);
         assert_eq!(batch.len(), 4);
         assert!(matches!(&batch[0], GenericResult::ManyOwned(run) if run.len() == 1));
         assert!(matches!(&batch[1], GenericResult::OneCursor(_)));
