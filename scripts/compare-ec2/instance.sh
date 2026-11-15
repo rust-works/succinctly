@@ -314,9 +314,13 @@ run_user() {
   # `dev compare jq --render-docs` once every platform's files are in place.
   mkdir -p "$out/docs"
   git -C "$src" status --porcelain --untracked-files=all >"$out/tree-changed.txt"
+  # A run without --write-docs (or an invalid one) changes no docs: grep then matches nothing,
+  # which must not fail the run under pipefail and lose its results.
   awk '{print $NF}' "$out/tree-changed.txt" |
-    grep -E '^docs/compare/jq-[a-z]+-[a-z0-9_]+\.(md|json)$' |
+    { grep -E '^docs/compare/jq-[a-z]+-[a-z0-9_]+\.(md|json)$' || true; } |
     while read -r f; do cp "$src/$f" "$out/docs/"; done
+  # The harness's exit status is the run's; reaching here means collecting it worked.
+  return 0
 }
 
 write_provenance() { # what the run was built and measured with
