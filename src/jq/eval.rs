@@ -19941,6 +19941,12 @@ fn compare_values_at_depth<S: EvalSemantics>(
 
     assert_value_tree_depth(depth);
 
+    if matches!(left, OwnedValue::SpelledScalar(..))
+        || matches!(right, OwnedValue::SpelledScalar(..))
+    {
+        return compare_values_at_depth::<S>(&left.canonical(), &right.canonical(), depth);
+    }
+
     let left_type = sort_rank(left);
     let right_type = sort_rank(right);
 

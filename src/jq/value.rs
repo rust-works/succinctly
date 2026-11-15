@@ -6036,6 +6036,11 @@ pub(crate) fn owned_value_eq_at_depth_generic<S: EvalSemantics>(
     depth: usize,
 ) -> bool {
     assert_value_tree_depth(depth);
+    // ADR-0028 P1: a spelled scalar is equal as what it resolved to (the spelling-aware
+    // comparison is P2/P3's).
+    if matches!(a, OwnedValue::SpelledScalar(..)) || matches!(b, OwnedValue::SpelledScalar(..)) {
+        return owned_value_eq_at_depth_generic::<S>(&a.canonical(), &b.canonical(), depth);
+    }
     match (a, b) {
         // jq's `jv_equal` answers `true` for the same allocation before
         // looking inside it (#3069). Without a NaN inside, identity already
@@ -6660,6 +6665,9 @@ impl PartialEq for OwnedValue {
 /// disagree with itself depending on nesting depth.
 fn owned_value_eq_at_depth(a: &OwnedValue, b: &OwnedValue, depth: usize) -> bool {
     assert_value_tree_depth(depth);
+    if matches!(a, OwnedValue::SpelledScalar(..)) || matches!(b, OwnedValue::SpelledScalar(..)) {
+        return owned_value_eq_at_depth(&a.canonical(), &b.canonical(), depth);
+    }
     match (a, b) {
         (OwnedValue::Null, OwnedValue::Null) => true,
         (OwnedValue::Bool(a), OwnedValue::Bool(b)) => a == b,
@@ -12695,18 +12703,35 @@ mod spelled_scalar_tests_2802 {
         }
     }
 
+    /// Equality and ordering see a spelled scalar as what it resolved to, in both modes and
+    /// nested; only the owner-approved text comparison of P2/P3 will differ (ADR-0028).
     #[test]
-    fn a_spelled_scalar_keeps_the_width_of_the_value() {
-        assert_eq!(core::mem::size_of::<OwnedValue>(), 32);
-    }
-
-    /// Nothing builds a spelled scalar yet (P1): jq's own conversion of the same words
-    /// stays the canonical value.
-    #[test]
-    fn a_document_spelling_is_not_produced_yet() {
-        for word in ["~", "True", "FALSE", "Null"] {
-            let built = OwnedValue::from_number_literal_plain(word);
-            assert!(!matches!(built, OwnedValue::SpelledScalar(..)), "{word}");
+    fn equality_and_ordering_read_a_spelling_as_its_value() {
+        use crate::jq::eval::compare_values;
+        use crate::jq::{JqSemantics, YqSemantics};
+        for (value, resolved) in spellings() {
+            assert_eq!(value, resolved);
+            assert_eq!(resolved, value);
+            assert!(owned_value_eq::<JqSemantics>(&value, &resolved));
+            assert!(owned_value_eq::<YqSemantics>(&value, &resolved));
+            assert_ne!(value, OwnedValue::Int(0));
+            let nested = OwnedValue::array_from(vec![value.clone()]);
+            assert_eq!(nested, OwnedValue::array_from(vec![resolved.clone()]));
+            for other in [
+                OwnedValue::Null,
+                OwnedValue::Bool(false),
+                OwnedValue::Bool(true),
+                OwnedValue::Int(1),
+            ] {
+                assert_eq!(
+                    compare_values::<JqSemantics>(&value, &other),
+                    compare_values::<JqSemantics>(&resolved, &other)
+                );
+                assert_eq!(
+                    compare_values::<YqSemantics>(&other, &value),
+                    compare_values::<YqSemantics>(&other, &resolved)
+                );
+            }
         }
     }
 }
