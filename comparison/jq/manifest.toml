@@ -335,6 +335,27 @@ script = "scripts/jq-seq-oracle-sweep.py"
 args = ["--oracle", "{jq}", "{subject}"]
 timeout_s = 300
 
+# The rest of the set #7256's skip was verified on (#7257, #7258): two more seeds and the slurp
+# mode's EOF locations. Whether jq 1.7.1 reads an unwritten `tokenbuf[1]` as `u` depends on the
+# libc allocator, so each platform's run has to check these itself; about 17 s each on a Graviton4.
+[[sweep]]
+id = "seq-seed-2"
+script = "scripts/jq-seq-oracle-sweep.py"
+args = ["--oracle", "{jq}", "--seed", "2", "{subject}"]
+timeout_s = 300
+
+[[sweep]]
+id = "seq-seed-7"
+script = "scripts/jq-seq-oracle-sweep.py"
+args = ["--oracle", "{jq}", "--seed", "7", "{subject}"]
+timeout_s = 300
+
+[[sweep]]
+id = "seq-slurp-location"
+script = "scripts/jq-seq-oracle-sweep.py"
+args = ["--oracle", "{jq}", "--slurp-location", "{subject}"]
+timeout_s = 300
+
 [[sweep]]
 id = "seq-door"
 script = "scripts/jq-seq-door-sweep.py"

@@ -211,7 +211,7 @@ give the base its own checkout so it is not rebuilt. Read each script's header f
 | `path-register-sweep.py`                 | jq's path register (#3456, #3289, #3428), 63.6M rows                        | `--jq-gate --sample 2000`    |
 | `reduce-update-bind-sweep.py`            | a `reduce` UPDATE destructuring an outer `$x` (#4934), and its `?//` grid   | `--jq-gate`, sampled, twice  |
 | `seq-door-sweep.py`                      | `--seq` over a stream with a diagnostic, program by program (#6620)         | `--cases 3000 --both`        |
-| `seq-oracle-sweep.py`                    | `--seq`'s parse-error diagnostics (#1723)                                   | whole grid                   |
+| `seq-oracle-sweep.py`                    | `--seq`'s parse-error diagnostics (#1723)                                   | 3 seeds, `--slurp-location`  |
 | `stream-errors-oracle-sweep.py`          | `--stream-errors` (#5474)                                                   | whole grid                   |
 
 `--jq-gate` (and `assign-path`'s `--gate`) fails a run on a wrong answer against jq alone; without it a script
