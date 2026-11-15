@@ -4707,11 +4707,11 @@ fn added(left: &OwnedValue, right: &OwnedValue) -> Option<OwnedValue> {
             OwnedValue::Array(l.iter().chain(r.iter()).cloned().collect::<Vec<_>>().into())
         }
         (OwnedValue::String(l), OwnedValue::String(r)) => {
-            OwnedValue::String(format!("{}{}", &**l, &**r).into())
+            OwnedValue::String(format!("{}{}", **l, **r).into())
         }
         (OwnedValue::Object(l), OwnedValue::Object(r)) => {
             let mut merged = l.clone();
-            for (key, value) in r.iter() {
+            for (key, value) in r {
                 merged.insert(key.clone(), value.clone());
             }
             OwnedValue::Object(merged)
@@ -4785,9 +4785,7 @@ fn set_owned_at(node: &mut OwnedValue, path: &[PathStep], new: OwnedValue) -> Op
 /// Remove the node at `path` from `node` as `del` does; a path that is not there removes nothing.
 /// `None` for a path through a scalar.
 fn del_owned_at(node: &mut OwnedValue, path: &[PathStep]) -> Option<()> {
-    let Some((step, rest)) = path.split_first() else {
-        return None;
-    };
+    let (step, rest) = path.split_first()?;
     match (node, step) {
         (OwnedValue::Null, _) => Some(()),
         (OwnedValue::Object(fields), PathStep::Key(k)) if rest.is_empty() => {
