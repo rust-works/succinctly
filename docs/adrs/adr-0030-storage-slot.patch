@@ -1,0 +1,90 @@
+diff --git a/src/jq/value.rs b/src/jq/value.rs
+index 643571248..546b8dcd4 100644
+--- a/src/jq/value.rs
++++ b/src/jq/value.rs
+@@ -2339,7 +2339,30 @@ pub type ArrayVec = ArrayOf<OwnedValue>;
+ /// [`ArrayOf`]'s own `Drop` rather than by drop glue, so that releasing the
+ /// last handle -- `Rc::drop_slow`, which drops every element -- runs inside a
+ /// level of `drop_depth`'s count (#5868).
+-type ArrayInnerOf<V> = ManuallyDrop<Rc<Vec<V>>>;
++type ArrayInnerOf<V> = ManuallyDrop<Rc<ArrayStore<V>>>;
++
++/// #7243 spike: the `Rc` payload, a `Vec` plus the one-pointer slot ADR-0030 proposes for child
++/// source handles (`None` always, here: nothing produces it).
++pub(crate) struct ArrayStore<V> {
++    vec: Vec<V>,
++    #[allow(dead_code)]
++    src: Option<Box<[u64]>>,
++}
++
++impl<V> core::ops::Deref for ArrayStore<V> {
++    type Target = Vec<V>;
++    #[inline]
++    fn deref(&self) -> &Vec<V> {
++        &self.vec
++    }
++}
++
++impl<V> core::ops::DerefMut for ArrayStore<V> {
++    #[inline]
++    fn deref_mut(&mut self) -> &mut Vec<V> {
++        &mut self.vec
++    }
++}
+ 
+ /// The offset at which jq stops making a slice a view: `jv.offset` is 16
+ /// bits, so `jvp_array_slice` copies a range starting this many elements or
+@@ -2402,7 +2425,7 @@ impl<V: Teardown> ArrayOf<V> {
+     #[inline]
+     fn unique_parts(&mut self) -> Option<(&mut Vec<V>, &mut usize, &mut usize)> {
+         let Self { inner, start, len } = self;
+-        Rc::get_mut(inner).map(|vec| (vec, start, len))
++        Rc::get_mut(inner).map(|store| (&mut store.vec, start, len))
+     }
+ 
+     /// [`Teardown::detach`] every element, if this handle owns them alone,
+@@ -2520,7 +2543,7 @@ impl<V: Teardown + Clone> ArrayOf<V> {
+     pub fn make_vec(&mut self) -> ArrayVecMut<'_, V> {
+         self.own_storage();
+         let Self { inner, start, len } = self;
+-        let vec = Rc::get_mut(inner).expect("own_storage leaves this handle unique");
++        let vec = &mut Rc::get_mut(inner).expect("own_storage leaves this handle unique").vec;
+         let window = *start..*start + *len;
+         // Zeroed before any element is dropped, and while the `Vec` is lent
+         // out (see `len`'s invariant).
+@@ -2675,7 +2698,7 @@ impl<V: Teardown + Clone> DerefMut for ArrayOf<V> {
+     fn deref_mut(&mut self) -> &mut [V] {
+         self.own_storage();
+         let (start, len) = (self.start, self.len);
+-        let vec = Rc::get_mut(&mut self.inner).expect("own_storage leaves this handle unique");
++        let vec = &mut Rc::get_mut(&mut self.inner).expect("own_storage leaves this handle unique").vec;
+         // SAFETY: as `Deref`'s.
+         unsafe { vec.get_unchecked_mut(start..start + len) }
+     }
+@@ -2686,7 +2709,7 @@ impl<V: Teardown> From<Vec<V>> for ArrayOf<V> {
+     fn from(inner: Vec<V>) -> Self {
+         let len = inner.len();
+         Self {
+-            inner: ManuallyDrop::new(Rc::new(inner)),
++            inner: ManuallyDrop::new(Rc::new(ArrayStore { vec: inner, src: None })),
+             start: 0,
+             len,
+         }
+@@ -2865,7 +2888,7 @@ impl<V: Teardown + Clone> Extend<V> for ArrayOf<V> {
+         // never compacts the head, which `make_vec` would on every round.
+         self.own_storage();
+         let Self { inner, start, len } = self;
+-        let vec = Rc::get_mut(inner).expect("own_storage leaves this handle unique");
++        let vec = &mut Rc::get_mut(inner).expect("own_storage leaves this handle unique").vec;
+         let (offset, kept) = (*start, *len);
+         // Zeroed while the tail past the window is dropped and while `iter`
+         // runs (see `len`'s invariant); `offset <= vec.len()` throughout.
+@@ -2884,7 +2907,7 @@ pub enum ArrayIntoIter<V> {
+     /// are cloned out, from either end.
+     Shared {
+         /// The array every remaining element is cloned from.
+-        vec: Rc<Vec<V>>,
++        vec: Rc<ArrayStore<V>>,
+         /// Index of the next element from the front.
+         next: usize,
+         /// One past the next element from the back.
