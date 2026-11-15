@@ -5993,6 +5993,9 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         }
         // Past the last file that opened: the ones that would not open after it, which jq's
         // reader meets when it asks for more and finds none -- unless the run had stopped.
+        // #7221: or, for `--seq` files whose windows stopped at one that is not plain, as it moves on
+        // to that one, whose first value then ends the run.
+        let past_open_failure = stop_at.is_some() || !noted.is_empty();
         if !run_stopped {
             failures.append(&mut noted);
             report_open_failures(&failures[next_failure..], &mut open_failed);
@@ -6004,7 +6007,8 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             return Ok(halt_exit_code(DiagStyle::Jq.error_exit_code(), open_failed));
         }
         // A run that stopped reads no further, as jq's main loop does.
-        seq_tail_handed_on = !run_stopped && hand_on_seq_pipe_tail();
+        seq_tail_handed_on = !run_stopped
+            && (hand_on_seq_pipe_tail() || hand_on_seq_files_tail(&args, past_open_failure));
     }
     if !lazy_path_taken || seq_tail_handed_on {
         // The materializing path: reads every document up front into a
@@ -11586,10 +11590,24 @@ fn windowed_seq_file(args: &JqCommand) -> Option<WindowedSource> {
     // prepass says so, file by file), so what the join holds is what each file holds; any other list is
     // the whole-file route's.
     let files = get_input_files(args);
+    SEQ_FILES_TAIL.with(|tail| *tail.borrow_mut() = None);
     let Some((files, reader, reread)) = windowed_source(args) else {
         // #7164: a pipe on standard input, which cannot be read twice, is certified as it is read.
         return files.is_empty().then(windowed_seq_pipe).flatten();
     };
+    if reread.opens_files_by_path() {
+        // #7221: a long list, whose files the run opens as it reaches them, is judged a file at a
+        // time on the handle the run opened; from the first that is not plain records the stream is
+        // the whole-file route's ([`hand_on_seq_files_tail`]).
+        let slot = window::SeqFilesTailSlot::default();
+        SEQ_FILES_TAIL.with(|tail| *tail.borrow_mut() = Some(std::rc::Rc::clone(&slot)));
+        reread.blank_rs();
+        return Some((
+            files,
+            reader.blanking_rs().certifying_seq_files(slot),
+            reread,
+        ));
+    }
     if !reread.is_plain_seq_records() {
         return None;
     }
@@ -11966,6 +11984,50 @@ fn windowed_seq_pipe() -> Option<WindowedSource> {
 thread_local! {
     /// Where the `--seq` pipe the run reads a window at a time leaves the rest of its stream (#7164).
     static SEQ_PIPE_TAIL: RefCell<Option<window::SeqTailSlot>> = const { RefCell::new(None) };
+    /// Where the `--seq` list of files opened by path that the run reads a window at a time says it
+    /// stopped (#7221).
+    static SEQ_FILES_TAIL: RefCell<Option<window::SeqFilesTailSlot>> = const { RefCell::new(None) };
+}
+
+/// Hands the files of a `--seq` list from the first that was not plain records (#7221) to the route
+/// that reads files whole, as the files it reads ([`NAMED_PUSHBACK`]); `true` when the windows stopped
+/// at one.
+///
+/// jq's reader stands after the records already run as it stands after an RS and that many line
+/// breaks, with nothing pending (see [`crate::jq_seq_reader::resumed_stream`]), so a source of those
+/// bytes goes first, named as the file before: a parse error's line counts every line of the stream,
+/// and a byte-order mark is skipped only at its front, as in jq. It is a source of its own because the
+/// line a runtime error names (`(at <file>:N)`) counts from its file's start. The files from the one that stopped the windows
+/// are read again by path, as the run that reaches them reads them; one that will not open now is
+/// reported by that route, past the files before it. `past_open_failure` is a run that met a file that
+/// did not open, which jq's main loop ends after the next value: the tail's first.
+fn hand_on_seq_files_tail(args: &JqCommand, past_open_failure: bool) -> bool {
+    let Some(tail) = SEQ_FILES_TAIL
+        .with(|slot| slot.borrow_mut().take())
+        .and_then(|slot| slot.borrow_mut().take())
+    else {
+        return false;
+    };
+    crate::jq_seq_reader::seed_token_byte(tail.token_byte);
+    let named = get_input_files(args);
+    let (mut files, mut raws) = (Vec::new(), Vec::new());
+    if tail.lines > 0 {
+        files.push(named[tail.index - 1].clone());
+        raws.push(crate::jq_seq_reader::resumed_stream(tail.lines, Vec::new()));
+    }
+    let front = files.len();
+    let (rest, rest_raws, failures) = read_input_files(&named[tail.index..], false);
+    files.extend(rest);
+    raws.extend(rest_raws);
+    let failures = failures
+        .into_iter()
+        .map(|(at, failure)| (at + front, failure))
+        .collect();
+    if past_open_failure {
+        FIRST_OPEN_FAILURE_AT.with(|first| first.set(Some(front)));
+    }
+    NAMED_PUSHBACK.with(|slot| *slot.borrow_mut() = Some((named, (files, raws, failures))));
+    true
 }
 
 /// Hands the rest of a `--seq` pipe whose windows ended at a record that is not plain (#7164) to the

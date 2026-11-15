@@ -20,9 +20,11 @@ lines has no fault, so these cases test where windows cut lines: invalid UTF-8, 
 very long lines and no final line break. `--inputs` runs programs that read `input`/`inputs` over `--files`
 files (2 to 32), which their own reader takes a window at a time, one file after another (#7024), against the
 same files as `/dev/fd/N`: those print `input_line_number`, `input_filename` and `$__loc__`, and read past
-faults. `--seq --files K` cuts the `--seq` stream into K files (2 to 32), most cuts at a record's start so the
+faults. `--seq --files K` cuts the `--seq` stream into K files (2 to 512), most cuts at a record's start so the
 files are plain records and the route reads them a window at a time (#7218), the rest anywhere, which leaves the
-run to the whole-file route, against the same files as descriptors. `--pipe --seq` feeds a `--seq` stream on the pipe (#7164): mostly records of RFC 7464's own framing
+run to the whole-file route, against the same files as descriptors. Past 32 files each is opened and judged as
+the run reaches it, and the files from the first that is not plain records are handed to the whole-file route
+(#7221), so most of those cases test that hand-over at a file's start. `--pipe --seq` feeds a `--seq` stream on the pipe (#7164): mostly records of RFC 7464's own framing
 (`RS value LF`), which the route reads a window at a time, with a turn or two at a random record (often one by
 a window's end, the 4 MiB probe's or the stream's): a record jq's reader warns about, an RS with nothing in it,
 text before an RS, a value with two documents, a bare `n` after a token that left a `u` in jq's token buffer,
@@ -360,8 +362,10 @@ def named(output, names, descriptors):
 
 def run_files(args, rng, data, case, program, work, seed):
     """One case over several files: windowed (as paths) and whole (as descriptors), compared."""
+    # #7221: a long list is cut at records' starts more often, so that some cases are plain records to the
+    # end and the others still stop at a file of their own.
     pieces = cut_into_files(rng, data, args.files, 0.75 if args.inputs else 0.25,
-                            0.85 if args.seq else 0.0)
+                            max(0.85, 1 - 2 / args.files) if args.seq else 0.0)
     names = []
     for n, piece in enumerate(pieces):
         name = os.path.join(work, "windowed-fuzz-%d-%d.json" % (seed, n))
@@ -425,7 +429,7 @@ def main():
                         help="run -R programs (#7024): on a pipe with --pipe, else as a regular file on standard input")
     parser.add_argument("--seq", action="store_true",
                         help="run --seq programs over --seq streams on a pipe (#7164), or cut into --files K files "
-                             "(#7218), most at a record's start so each file is plain records")
+                             "(#7218, #7221), most at a record's start so each file is plain records")
     parser.add_argument("--inputs", action="store_true",
                         help="run programs that read input/inputs over --files files, 2 to 32 (#7024)")
     args = parser.parse_args()
@@ -437,9 +441,8 @@ def main():
         sys.exit("--inputs is neither --raw nor --pipe")
     if args.seq and (args.raw or args.inputs):
         sys.exit("--seq is a stream on a pipe (--pipe) or in files (--files K, #7218): neither --raw nor --inputs")
-    if args.seq and not args.pipe and not 2 <= args.files <= 32:
-        sys.exit("--seq is a stream on a pipe or in several files: give --pipe or --files 2 to 32 (a longer list "
-                 "is opened by path, which the route leaves to the whole-file one, so it would test nothing)")
+    if args.seq and not args.pipe and args.files < 2:
+        sys.exit("--seq is a stream on a pipe or in several files: give --pipe or --files 2 to 512")
     if args.pipe and args.files != 1:
         sys.exit("--pipe is one stream: give no --files")
     if not 1 <= args.files <= 512:
