@@ -270,6 +270,13 @@ fn a_flow_item_takes_the_held_comment_beside_it_7230() -> Result<()> {
             &[],
             "a:\n  x: 1\nb: {} # own\nz: 1\n",
         ),
+        // An empty collection with a comment of its own keeps that one (yq: `b: # own` / `{} # bc`).
+        (
+            "a: 5 # own\nb: 3 # bc\nz: 1\n",
+            ".a = {\"x\": 1} | .b = {}",
+            &[],
+            "a:\n  x: 1\nb: {} # bc\nz: 1\n",
+        ),
     ])
 }
 

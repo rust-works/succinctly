@@ -10097,7 +10097,7 @@ fn head_comment_first_member(tree: &mut CommentTree, value: &OwnedValue, comment
                     }
                     fields.get_mut(key.as_str())
                 }
-                None => None,
+                None => None, // patchcov: coverage tolerate-line reason="unreachable: only a non-empty collection, written in block style, is given a held comment on its dash"
             }
         }
         _ => None,
