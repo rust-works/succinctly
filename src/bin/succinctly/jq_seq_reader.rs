@@ -112,12 +112,9 @@ pub(crate) fn fgets_chunk_lens(raw: &[u8]) -> impl Iterator<Item = usize> + '_ {
 /// of [`fgets_chunk_lens`], for a reader that finds the chunks as it goes (#5498).
 pub(crate) fn fgets_chunk_len_at(raw: &[u8], pos: usize) -> Option<usize> {
     let rest = raw.get(pos..).filter(|rest| !rest.is_empty())?;
-    Some(
-        rest.iter()
-            .take(JQ_FGETS_CHUNK)
-            .position(|&byte| byte == b'\n')
-            .map_or_else(|| rest.len().min(JQ_FGETS_CHUNK), |index| index + 1),
-    )
+    let chunk = &rest[..rest.len().min(JQ_FGETS_CHUNK)];
+    // #7263: searched a block at a time; a byte at a time this was most of a long line's walk.
+    Some(find_byte(b'\n', chunk).map_or(chunk.len(), |index| index + 1))
 }
 
 /// The absolute offsets, ascending, at which jq starts a `jv_parser_next`
@@ -320,8 +317,9 @@ pub(crate) fn source_ends<S: AsRef<[u8]>>(sources: &[(Option<usize>, S)]) -> Vec
 /// Every byte of the input stream, as jq's scanner sees it: all sources
 /// concatenated, with [`bom_prefix`]'s bytes already removed.
 ///
-/// Shared with [`super::jq_runner::seq_no_rs_byte_warning`] so the two
-/// walkers over this same stream cannot drift apart on BOM handling.
+/// The byte-at-a-time statement of [`stream_slices`], which the tests hold it to (#7263); the
+/// shipped callers read the slices.
+#[cfg(test)]
 pub(crate) fn stream_bytes(
     raw_bytes: &[(Option<usize>, Vec<u8>)],
 ) -> impl Iterator<Item = u8> + '_ {
@@ -329,6 +327,86 @@ pub(crate) fn stream_bytes(
         .iter()
         .flat_map(|(_, raw)| raw.iter().copied())
         .skip(bom_prefix(raw_bytes).consumed)
+}
+
+/// The input stream a source at a time (#7263): each source's bytes as one slice, the first ones
+/// cut by [`bom_prefix`]'s bytes, so a caller can search them a block at a time rather than visit
+/// each byte. Shared with [`super::jq_runner::seq_no_rs_byte_warning`] so the two walkers over
+/// this same stream cannot drift apart on BOM handling.
+pub(crate) fn stream_slices(
+    raw_bytes: &[(Option<usize>, Vec<u8>)],
+) -> impl Iterator<Item = &[u8]> + '_ {
+    let mut skip = bom_prefix(raw_bytes).consumed;
+    raw_bytes.iter().map(move |(_, raw)| {
+        let cut = skip.min(raw.len());
+        skip -= cut;
+        &raw[cut..]
+    })
+}
+
+/// Move `line` and `column` past `span` as jq's reader counts them, a byte at a time: a newline
+/// starts the next line at column 0, and every other byte is a column (#7263). `span` holds no
+/// RS byte; the callers stop at one. One definition for the walk's discarded bytes and
+/// [`super::jq_runner`]'s no-RS-byte position, which must agree.
+pub(crate) fn advance_position(span: &[u8], line: &mut usize, column: &mut usize) {
+    match rfind_byte(b'\n', span) {
+        Some(last) => {
+            *line += span.iter().filter(|&&b| b == b'\n').count();
+            *column = span.len() - last - 1;
+        }
+        None => *column += span.len(),
+    }
+}
+
+/// The bytes [`find_byte`] and [`rfind_byte`] test at once: a block with no match costs one
+/// comparison per byte with no branch (an OR of bytes, not a short-circuiting `||`), which the
+/// compiler vectorizes.
+const SEARCH_BLOCK: usize = 64;
+
+/// The bytes [`find_byte`] reads one at a time before it takes blocks: a match this near costs no
+/// block, which keeps a stream of short lines (one `fgets` chunk each) as cheap as it was.
+const SEARCH_HEAD: usize = 16;
+
+/// The offset of the first `needle` in `hay` (#7263): the first [`SEARCH_HEAD`] bytes one at a
+/// time, then a [`SEARCH_BLOCK`] at a time, where only the block that holds it is searched a byte
+/// at a time.
+pub(crate) fn find_byte(needle: u8, hay: &[u8]) -> Option<usize> {
+    let head = hay.len().min(SEARCH_HEAD);
+    if let Some(at) = hay[..head].iter().position(|&b| b == needle) {
+        return Some(at);
+    }
+    let mut start = head;
+    for block in hay[head..].chunks(SEARCH_BLOCK) {
+        if block
+            .iter()
+            .fold(0u8, |seen, &b| seen | u8::from(b == needle))
+            != 0
+        {
+            return block.iter().position(|&b| b == needle).map(|at| start + at);
+        }
+        start += block.len();
+    }
+    None
+}
+
+/// The offset of the last `needle` in `hay`, as [`find_byte`] finds the first.
+fn rfind_byte(needle: u8, hay: &[u8]) -> Option<usize> {
+    let mut end = hay.len();
+    for block in hay.rchunks(SEARCH_BLOCK) {
+        let start = end - block.len();
+        if block
+            .iter()
+            .fold(0u8, |seen, &b| seen | u8::from(b == needle))
+            != 0
+        {
+            return block
+                .iter()
+                .rposition(|&b| b == needle)
+                .map(|at| start + at);
+        }
+        end = start;
+    }
+    None
 }
 
 /// jq's own reader over this `--seq` stream's raw bytes: the one walk that
@@ -700,6 +778,36 @@ impl Tail {
         } else {
             Self::Opened
         }
+    }
+}
+
+/// Whether the walk discards the bytes before an RS one at a time, as it did before #7263, rather
+/// than a run at a time: off in the shipped build, and a switch in the tests, which hold the two
+/// to the same answers.
+mod discards {
+    #[cfg(test)]
+    std::thread_local! {
+        static BYTEWISE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(super) fn bytewise() -> bool {
+        false
+    }
+
+    #[cfg(test)]
+    pub(super) fn bytewise() -> bool {
+        BYTEWISE.with(std::cell::Cell::get)
+    }
+
+    /// Run `f` with the walk discarding a byte at a time.
+    #[cfg(test)]
+    pub(super) fn bytewise_in<T>(f: impl FnOnce() -> T) -> T {
+        BYTEWISE.with(|on| on.set(true));
+        let out = f();
+        BYTEWISE.with(|on| on.set(false));
+        out
     }
 }
 
@@ -1402,15 +1510,24 @@ impl<'a> Reader<'a> {
             }
             offset += 1;
             if self.st == St::WaitingForRs {
-                if ch == b'\n' {
-                    self.line += 1;
-                    self.column = 0;
-                } else {
-                    self.column += 1;
-                }
                 if ch == ASCII_RS {
+                    self.column += 1;
                     self.st = St::Normal;
+                    continue;
                 }
+                // #7263: jq discards each byte before an RS with a line or a column and nothing
+                // else, so the run up to the next RS is taken at once, as #5674 takes a run of
+                // string bytes. Not under `resets_per_call`, whose reset at an `fgets` boundary
+                // inside the run puts the parser back to reading.
+                let end = if self.resets_per_call || discards::bytewise() {
+                    offset
+                } else {
+                    find_byte(ASCII_RS, &data[offset..]).map_or(data.len(), |at| offset + at)
+                };
+                advance_position(&data[offset - 1..end], &mut self.line, &mut self.column);
+                self.offset = end - 1;
+                eof_offset = end;
+                offset = end;
                 continue;
             }
             if self.st == St::Normal
@@ -3325,5 +3442,251 @@ mod tests {
         assert_eq!(token_byte_after(b"\x1e[\"a\",{}]\n"), None);
         assert_eq!(resumed_stream(0, b"\x1e1\n".to_vec()), b"\x1e1\n");
         assert_eq!(resumed_stream(2, b"\x1e1\n".to_vec()), b"\x1e\n\n\x1e1\n");
+    }
+
+    /// A small deterministic generator for the #7263 sweeps: the same streams on every run.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((self.0 >> 33) as usize) % n
+        }
+
+        /// `len` bytes drawn from `alphabet`.
+        fn bytes(&mut self, alphabet: &[u8], len: usize) -> Vec<u8> {
+            (0..len)
+                .map(|_| alphabet[self.below(alphabet.len())])
+                .collect()
+        }
+    }
+
+    /// #7263: the block search finds what a byte-at-a-time search finds, first and last, at every
+    /// offset around the head and the block edges, and in no position at all.
+    #[test]
+    fn find_byte_and_rfind_byte_agree_with_a_bytewise_search_7263() {
+        for len in 0..200 {
+            let none = vec![b'a'; len];
+            assert_eq!(find_byte(b'\n', &none), None, "len {len}");
+            assert_eq!(rfind_byte(b'\n', &none), None, "len {len}");
+            for at in 0..len {
+                let mut one = none.clone();
+                one[at] = b'\n';
+                assert_eq!(find_byte(b'\n', &one), Some(at), "len {len} at {at}");
+                assert_eq!(rfind_byte(b'\n', &one), Some(at), "len {len} at {at}");
+            }
+        }
+        let mut rng = Lcg(7263);
+        for _ in 0..2000 {
+            let len = rng.below(400);
+            let hay = rng.bytes(b"ab\n\x1e", len);
+            for needle in [b'\n', ASCII_RS, b'z'] {
+                assert_eq!(
+                    find_byte(needle, &hay),
+                    hay.iter().position(|&b| b == needle),
+                    "{hay:?}"
+                );
+                assert_eq!(
+                    rfind_byte(needle, &hay),
+                    hay.iter().rposition(|&b| b == needle),
+                    "{hay:?}"
+                );
+            }
+        }
+    }
+
+    /// #7263: `fgets_chunk_len_at` keeps the byte-at-a-time rule it replaced: a chunk ends just
+    /// after a newline or after `JQ_FGETS_CHUNK` bytes.
+    #[test]
+    fn fgets_chunk_len_at_keeps_the_bytewise_rule_7263() {
+        let bytewise = |raw: &[u8], pos: usize| {
+            let rest = raw.get(pos..).filter(|rest| !rest.is_empty())?;
+            Some(
+                rest.iter()
+                    .take(JQ_FGETS_CHUNK)
+                    .position(|&byte| byte == b'\n')
+                    .map_or_else(|| rest.len().min(JQ_FGETS_CHUNK), |index| index + 1),
+            )
+        };
+        let mut rng = Lcg(4095);
+        for round in 0..300 {
+            // Long runs without a newline, so that chunks fill to the limit as well as end early.
+            let alphabet: &[u8] = if round % 2 == 0 { b"xxxxxxxx\n" } else { b"x" };
+            let len = rng.below(3 * JQ_FGETS_CHUNK);
+            let raw = rng.bytes(alphabet, len);
+            let mut pos = 0;
+            loop {
+                let got = fgets_chunk_len_at(&raw, pos);
+                assert_eq!(got, bytewise(&raw, pos), "len {len} pos {pos}");
+                let Some(step) = got else { break };
+                pos += step;
+            }
+            assert_eq!(fgets_chunk_len_at(&raw, len + 1), None);
+        }
+    }
+
+    /// #7263: the slices are the bytes: BOM prefixes of every length (whole, partial, malformed)
+    /// cut across empty and short sources.
+    #[test]
+    fn stream_slices_are_stream_bytes_7263() {
+        let prefixes: [&[u8]; 6] = [
+            b"",
+            b"\xEF",
+            b"\xEF\xBB",
+            b"\xEF\xBB\xBF",
+            b"\xEF\xBBx",
+            b"\xEFx",
+        ];
+        let mut rng = Lcg(1525);
+        for prefix in prefixes {
+            for _ in 0..200 {
+                let mut stream = prefix.to_vec();
+                let len = rng.below(12);
+                stream.extend(rng.bytes(b"a\n\x1e", len));
+                // Cut the stream into sources at random points, empty ones included.
+                let mut sources = Vec::new();
+                let mut rest = stream.as_slice();
+                while !rest.is_empty() || rng.below(3) == 0 {
+                    let take = rng.below(rest.len() + 1).min(rng.below(4));
+                    sources.push((None, rest[..take].to_vec()));
+                    rest = &rest[take..];
+                    if rest.is_empty() && rng.below(2) == 0 {
+                        break;
+                    }
+                }
+                let sliced: Vec<u8> = stream_slices(&sources).flatten().copied().collect();
+                assert_eq!(
+                    sliced,
+                    stream_bytes(&sources).collect::<Vec<u8>>(),
+                    "{sources:?}"
+                );
+            }
+        }
+    }
+
+    /// #7263: `advance_position` moves a line and column as a byte-at-a-time count does, from any
+    /// starting point.
+    #[test]
+    fn advance_position_counts_as_a_byte_at_a_time_7263() {
+        let mut rng = Lcg(3);
+        for _ in 0..2000 {
+            let len = rng.below(300);
+            let span = rng.bytes(b"aaaaaaa\n", len);
+            let (start_line, start_column) = (1 + rng.below(5), rng.below(9));
+            let (mut line, mut column) = (start_line, start_column);
+            advance_position(&span, &mut line, &mut column);
+            let (mut want_line, mut want_column) = (start_line, start_column);
+            for &b in &span {
+                if b == b'\n' {
+                    want_line += 1;
+                    want_column = 0;
+                } else {
+                    want_column += 1;
+                }
+            }
+            assert_eq!((line, column), (want_line, want_column), "{span:?}");
+        }
+    }
+
+    /// Everything a walk answers, with each warning and where it was met, for the #7263 sweep.
+    type WalkAnswers = (
+        Vec<(String, usize)>,
+        Vec<SeqFault>,
+        Vec<(usize, usize)>,
+        Vec<(usize, usize)>,
+        Option<String>,
+        bool,
+    );
+
+    fn walk_answers(
+        sources: &[(Option<usize>, Vec<u8>)],
+        slurp: bool,
+        faults: bool,
+    ) -> WalkAnswers {
+        let mut warnings = Vec::new();
+        let walk = walk_stream_collecting_at(sources, slurp, faults, Tail::Opened, &mut |w, at| {
+            warnings.push((w.to_string(), at));
+        });
+        (
+            warnings,
+            walk.faults,
+            walk.values,
+            walk.locations,
+            walk.deferred_warning,
+            walk.slurp_position_lost,
+        )
+    }
+
+    /// #7263: the walk that takes the bytes before an RS a run at a time answers what the walk that
+    /// took them one at a time answered, over streams that open with text and newlines before
+    /// their first RS, across sources, behind every BOM prefix (a malformed one keeps the byte at
+    /// a time), with and without `-s` and the recorded faults.
+    #[test]
+    fn discarding_before_an_rs_a_run_at_a_time_answers_as_bytewise_7263() {
+        let prefixes: [&[u8]; 4] = [b"", b"\xEF\xBB\xBF", b"\xEF\xBB", b"\xEFx"];
+        let mut rng = Lcg(1723);
+        for prefix in prefixes {
+            for _ in 0..300 {
+                let mut stream = prefix.to_vec();
+                let lead = rng.below(150);
+                stream.extend(rng.bytes(b"ab {}1\"\n", lead));
+                let tail = rng.below(60);
+                stream.extend(rng.bytes(b"\x1e\x1e1 2[]{}\"a:,\n\n", tail));
+                if rng.below(2) == 0 {
+                    stream.push(b'\n');
+                }
+                let mut sources = Vec::new();
+                let mut rest = stream.as_slice();
+                loop {
+                    let take = if rng.below(3) == 0 {
+                        rest.len()
+                    } else {
+                        rng.below(rest.len() + 1)
+                    };
+                    sources.push((None, rest[..take].to_vec()));
+                    rest = &rest[take..];
+                    if rest.is_empty() {
+                        break;
+                    }
+                }
+                for slurp in [false, true] {
+                    for faults in [false, true] {
+                        let run = walk_answers(&sources, slurp, faults);
+                        let bytewise =
+                            discards::bytewise_in(|| walk_answers(&sources, slurp, faults));
+                        assert_eq!(run, bytewise, "{sources:?} slurp {slurp} faults {faults}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// #7263: a run long enough to span `fgets` chunks and refill boundaries, before and after the
+    /// first RS, answers as the byte-at-a-time walk does.
+    #[test]
+    fn a_long_discarded_run_answers_as_bytewise_7263() {
+        let mut stream = vec![b'x'; 3 * JQ_FGETS_CHUNK + 7];
+        stream[100] = b'\n';
+        stream[JQ_FGETS_CHUNK + 3] = b'\n';
+        // No newline after the run, so the column of the fault at the end counts every byte of it.
+        stream.extend_from_slice(b"\x1e{\"a\":1} \x1e[1,");
+        let halves = vec![
+            (None, stream[..5000].to_vec()),
+            (None, stream[5000..].to_vec()),
+        ];
+        let whole = vec![(None, stream)];
+        for sources in [whole, halves] {
+            for slurp in [false, true] {
+                let run = walk_answers(&sources, slurp, true);
+                assert_eq!(
+                    run,
+                    discards::bytewise_in(|| walk_answers(&sources, slurp, true))
+                );
+                assert_eq!(run.2.len(), 1, "the one complete record is a value");
+            }
+        }
     }
 }

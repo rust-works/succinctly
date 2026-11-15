@@ -16998,20 +16998,15 @@ fn seq_no_rs_byte_position(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> Option<(us
     }
     let mut line = 1usize;
     let mut column = 0usize;
-    // Shares `stream_bytes` with `jq_seq_reader`, which walks this same
-    // stream to classify the templates that apply once an RS *is* present
-    // (#1723) -- the two must agree on BOM handling and on where a column
-    // starts, so they read the stream through one iterator.
-    for b in crate::jq_seq_reader::stream_bytes(raw_bytes) {
-        if b == ASCII_RS {
+    // Shares `stream_slices` and `advance_position` with `jq_seq_reader`, which walks this same
+    // stream to classify the templates that apply once an RS *is* present (#1723) -- the two must
+    // agree on BOM handling and on where a column starts. #7263: a slice at a time, searched a
+    // block at a time, where a byte at a time was a third of a no-RS run.
+    for slice in crate::jq_seq_reader::stream_slices(raw_bytes) {
+        if slice.contains(&ASCII_RS) {
             return None;
         }
-        if b == b'\n' {
-            line += 1;
-            column = 0;
-        } else {
-            column += 1;
-        }
+        crate::jq_seq_reader::advance_position(slice, &mut line, &mut column);
     }
     if raw_bytes.is_empty() {
         return None;
@@ -24720,6 +24715,55 @@ mod tests {
                         .to_string()
                 )
             );
+        }
+
+        /// #7263: the position found a source at a time is the one the byte-at-a-time count it
+        /// replaced found, over sources cut at every point of streams with and without an RS,
+        /// behind every BOM prefix.
+        #[test]
+        fn position_a_slice_at_a_time_is_the_bytewise_one_7263() {
+            fn bytewise(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> Option<(usize, usize)> {
+                if crate::jq_seq_reader::bom_prefix(raw_bytes).malformed {
+                    return None;
+                }
+                let (mut line, mut column) = (1usize, 0usize);
+                for b in crate::jq_seq_reader::stream_bytes(raw_bytes) {
+                    if b == ASCII_RS {
+                        return None;
+                    }
+                    if b == b'\n' {
+                        line += 1;
+                        column = 0;
+                    } else {
+                        column += 1;
+                    }
+                }
+                (!raw_bytes.is_empty()).then_some((line, column))
+            }
+            let bodies: [&[u8]; 6] = [
+                b"",
+                b"1 2\n3",
+                b"\n\n\nabc\n",
+                b"{\"a\":\n[1,2]}\n\n x",
+                b"ab\x1ecd\n",
+                b"\n\x1e",
+            ];
+            let prefixes: [&[u8]; 5] = [b"", b"\xEF", b"\xEF\xBB", b"\xEF\xBB\xBF", b"\xEFx"];
+            for prefix in prefixes {
+                for body in bodies {
+                    let stream = [prefix, body].concat();
+                    assert_eq!(position(&[&stream]), bytewise(&[(None, stream.clone())]));
+                    for cut in 0..=stream.len() {
+                        for second in cut..=stream.len() {
+                            let parts = [&stream[..cut], &stream[cut..second], &stream[second..]];
+                            let owned: Vec<(Option<usize>, Vec<u8>)> =
+                                parts.iter().map(|part| (None, part.to_vec())).collect();
+                            assert_eq!(position(&parts), bytewise(&owned), "{parts:?}");
+                        }
+                    }
+                }
+            }
+            assert_eq!(position(&[]), None);
         }
     }
 
