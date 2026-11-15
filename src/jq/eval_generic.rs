@@ -9091,6 +9091,125 @@ fn retain_truthy_generic<V: DocumentValue, S: EvalSemantics>(
     }
 }
 
+/// Add one element's result to `fold_pipe_stages`' per-element batch, keeping
+/// what [`flatten_generic_results`] and the all-cursors check would make of the
+/// batch exactly as it was, at about 32 bytes per element instead of 80 (#7267).
+///
+/// A value that is already owned cannot fail later, so consecutive `Owned` and
+/// `ManyOwned` results go into one `ManyOwned` run rather than one 80-byte
+/// `GenericResult` each: flattening a run yields its values in the same order,
+/// and a run is not a cursor, as none of its values were. The first run is
+/// sized by `remaining` (this element and every one after it), which is exact
+/// for a one-value-per-element map such as `[.[] | floor]`, so the run never
+/// doubles there. A `None` adds nothing to either outcome and is not kept.
+/// Everything else (a cursor, a lazy result, an error a lazy object raised) is
+/// pushed as it is, still flattened in its place, so an earlier lazily failing
+/// element still wins and the prefix kept on an error is unchanged.
+fn push_element_result<V: DocumentValue>(
+    per_element: &mut Vec<GenericResult<V>>,
+    result: GenericResult<V>,
+    remaining: usize,
+) {
+    match result {
+        GenericResult::None => {}
+        GenericResult::Owned(o) => {
+            if let Some(GenericResult::ManyOwned(run)) = per_element.last_mut() {
+                run.push(o);
+            } else {
+                let mut run = vec_with_capacity(remaining);
+                run.push(o);
+                per_element.push(GenericResult::ManyOwned(run));
+            }
+        }
+        GenericResult::ManyOwned(os) => {
+            if let Some(GenericResult::ManyOwned(run)) = per_element.last_mut() {
+                run.extend(os);
+            } else {
+                per_element.push(GenericResult::ManyOwned(os));
+            }
+        }
+        other => per_element.push(other),
+    }
+}
+
+#[cfg(test)]
+mod per_element_batch_tests_7267 {
+    use super::*;
+    use crate::json::light::{JsonIndex, StandardJson};
+
+    type Batch<'a> = Vec<GenericResult<StandardJson<'a, Vec<u64>>>>;
+
+    /// A one-value-per-element map fills one run, allocated once at its final size, and the
+    /// flatten hands that same buffer on instead of copying it.
+    #[test]
+    fn owned_results_fill_one_run_that_the_flatten_keeps_7267() {
+        let mut batch: Batch<'_> = Vec::new();
+        for i in 0..1000 {
+            push_element_result(
+                &mut batch,
+                GenericResult::Owned(OwnedValue::Int(i)),
+                1000 - i as usize,
+            );
+        }
+        assert_eq!(batch.len(), 1);
+        let GenericResult::ManyOwned(run) = &batch[0] else {
+            panic!("expected one run, got {:?}", batch[0]) // patchcov: coverage tolerate-line reason="the failure message of the assertion above, unreachable in a passing suite (#7267)"
+        };
+        assert_eq!((run.len(), run.capacity()), (1000, 1000));
+        let buffer = run.as_ptr();
+        let flat = flatten_generic_results::<_, JqSemantics>(batch).unwrap();
+        assert_eq!(flat.as_ptr(), buffer);
+        assert_eq!(flat, (0..1000).map(OwnedValue::Int).collect::<Vec<_>>());
+    }
+
+    /// A cursor between owned results ends a run and stays in its place, a `None` leaves
+    /// nothing behind, and a batch of nothing but `None` is empty, so the all-cursors check
+    /// and the flattened order are what they were with one entry per element.
+    #[test]
+    fn cursors_split_runs_and_nones_leave_nothing_7267() {
+        let json = br#"["a",{"b":1}]"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let GenericResult::ManyCursor(cs) =
+            eval_single::<JqSemantics, _>(&parse(".[]").unwrap(), root.value(), false, Some(root))
+        else {
+            panic!("expected the elements' cursors") // patchcov: coverage tolerate-line reason="the failure message of the pattern above, unreachable in a passing suite (#7267)"
+        };
+        let mut batch: Batch<'_> = Vec::new();
+        push_element_result(&mut batch, GenericResult::Owned(OwnedValue::Int(10)), 6);
+        push_element_result(&mut batch, GenericResult::OneCursor(cs[0].clone()), 5);
+        push_element_result(&mut batch, GenericResult::None, 4);
+        push_element_result(&mut batch, GenericResult::Owned(OwnedValue::Int(20)), 3);
+        push_element_result(
+            &mut batch,
+            GenericResult::ManyOwned(vec![OwnedValue::Int(30), OwnedValue::Int(40)]),
+            2,
+        );
+        push_element_result(
+            &mut batch,
+            GenericResult::ManyCursor(vec![cs[1].clone()]),
+            1,
+        );
+        assert_eq!(batch.len(), 4);
+        assert!(matches!(&batch[0], GenericResult::ManyOwned(run) if run.len() == 1));
+        assert!(matches!(&batch[1], GenericResult::OneCursor(_)));
+        assert!(matches!(&batch[2], GenericResult::ManyOwned(run) if run.len() == 3));
+        assert!(matches!(&batch[3], GenericResult::ManyCursor(_)));
+        let flat: Vec<String> = flatten_generic_results::<_, JqSemantics>(batch)
+            .unwrap()
+            .iter()
+            .map(OwnedValue::to_json)
+            .collect();
+        assert_eq!(flat, ["10", "\"a\"", "20", "30", "40", "{\"b\":1}"]);
+
+        let mut empty: Batch<'_> = Vec::new();
+        for left in (1..=3).rev() {
+            push_element_result(&mut empty, GenericResult::None, left);
+        }
+        assert!(empty.is_empty());
+    }
+}
+
 /// Flatten a batch of per-element results into one `Vec<OwnedValue>`.
 ///
 /// A bare `Error`/`Break`/`Partial` must never appear in `items` — callers
@@ -9112,6 +9231,15 @@ fn flatten_generic_results<V: DocumentValue, S: EvalSemantics>(
 ) -> Result<Vec<OwnedValue>, Control> {
     let mut results = Vec::new();
     for r in items {
+        // #7267: a leading run [`push_element_result`] coalesced becomes the
+        // output itself, so the batch is never copied into a second vector.
+        let r = match r {
+            GenericResult::ManyOwned(os) if results.is_empty() => {
+                results = os;
+                continue;
+            }
+            r => r,
+        };
         match r.materialize_lazy::<S>() {
             // `One`/`Many` are exhaustiveness only here too, same as
             // `into_lazy_items`'s identical comment above: `items`' one
@@ -14056,7 +14184,8 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
                 let rest = &stages[j..];
                 let rest_whole = PipeWhole::rebuilt();
                 let mut per_element = vec_with_capacity(cs.len());
-                for c in cs {
+                let elements = cs.len();
+                for (i, c) in cs.into_iter().enumerate() {
                     match eval_single_pipe::<S, _>(rest, &rest_whole, c.value(), optional, Some(c))
                     {
                         // The elements already piped through no
@@ -14113,10 +14242,12 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
                         // #4044: collected, an object is read in full anyway, so it
                         // is built as it arrives rather than held lazily until
                         // the flatten (N live boxes and entry buffers).
-                        obj @ GenericResult::LazyObject(_) => {
-                            per_element.push(obj.materialize_lazy::<S>());
-                        }
-                        other => per_element.push(other),
+                        obj @ GenericResult::LazyObject(_) => push_element_result(
+                            &mut per_element,
+                            obj.materialize_lazy::<S>(),
+                            elements - i,
+                        ),
+                        other => push_element_result(&mut per_element, other, elements - i),
                     }
                 }
 
