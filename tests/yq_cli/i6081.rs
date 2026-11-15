@@ -88,3 +88,66 @@ fn test_eval_that_evaluates_itself_stops_at_a_nesting_limit_6081() -> Result<()>
     assert_eq!((stdout.as_str(), code), ("", 1));
     Ok(())
 }
+
+/// `is_key` is `true` for the node `key` returns, which a plain string stands for here, so the
+/// answer is read off the stage straight after `key` (`(.a | key) | is_key` too); anywhere else a
+/// node is not a key node. Each row is `yq -I0 -o json FILTER` on `a: {b: 1}`, captured from yq
+/// (v4.52.2 for these rows; the operator's rule is the same in v4.53.3).
+const IS_KEY_ROWS: &[(&str, &str)] = &[
+    (".a | key | is_key", "true\n"),
+    ("(.a | key) | is_key", "true\n"),
+    (".a | key | iskey", "true\n"),
+    (".a | key | (is_key)", "true\n"),
+    (".a | key | . | is_key", "true\n"),
+    (".a | key | is_key and true", "true\n"),
+    (".a.b | key | is_key", "true\n"),
+    (".a | keys | .[0] | is_key", "false\n"),
+    (". | is_key", "false\n"),
+    (".a | is_key", "false\n"),
+    ("[.a | key | is_key, (.a | is_key)]", "[true,false]\n"),
+];
+
+#[test]
+fn test_is_key_is_true_straight_after_key_6081() -> Result<()> {
+    for (filter, expected) in IS_KEY_ROWS {
+        let (stdout, code) = run_yq_stdin(filter, "a: {b: 1}\n", &["-I0", "-o", "json"])?;
+        assert_eq!((stdout.as_str(), code), (*expected, 0), "{filter}");
+    }
+    Ok(())
+}
+
+/// A function the program defines under the name is the one called, and jq has no `is_key`.
+#[test]
+fn test_is_key_defers_to_a_defined_function_and_is_undefined_in_jq_mode_6081() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(
+        "def is_key: 5; .a | key | is_key",
+        "a: {b: 1}\n",
+        &["--jq-extensions"],
+    )?;
+    assert_eq!((stdout.as_str(), code), ("5\n", 0));
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .args(["jq", "-n", "is_key"])
+        .output()?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8(output.stderr)?.contains("is_key/0 is not defined"));
+    Ok(())
+}
+
+/// Where `is_key` is not the whole stage straight after `key` it is `false` here and `true` in yq
+/// (docs/compliance/yq/limitations.md): the divergence is pinned so that a change to it is seen.
+#[test]
+fn test_is_key_beyond_the_stage_after_key_stays_false_6081() -> Result<()> {
+    for filter in [
+        ".a | key | [is_key]",
+        ".a | key | is_key as $x | $x",
+        ".a | key as $k | $k | is_key",
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, "a: {b: 1}\n", &["-I0", "-o", "json"])?;
+        assert_eq!(code, 0, "{filter}");
+        assert!(
+            stdout.contains("false") && !stdout.contains("true"),
+            "{filter}: {stdout}"
+        );
+    }
+    Ok(())
+}

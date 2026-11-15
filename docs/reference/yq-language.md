@@ -403,6 +403,7 @@ succinctly yq --jq-extensions --eval-all '[.] | reduce .[] as $item ({}; . * $it
 | `parent(n)`         | Return nth parent node                                | `parent(2)`                     |
 | `parents`           | The node's ancestors, nearest first                   | `.a.b[1].c \| parents`          |
 | `root`              | The document's root node (`parent(-1)`)               | `.a.b[1].c \| root`             |
+| `is_key`            | Whether the node is a mapping key node (after `key`)  | `.a \| key \| is_key`           |
 | `downcase`          | Lowercase (Unicode simple mapping)                    | `"HELLO" \| downcase`           |
 | `upcase`            | Uppercase (Unicode simple mapping)                    | `"hello" \| upcase`             |
 | `sort_keys(f)`      | Sort a mapping's own keys, shallow (yq only)          | `sort_keys(.)`                  |

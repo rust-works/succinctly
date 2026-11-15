@@ -7759,8 +7759,10 @@ These differ:
   A stored expression that evaluates itself (`s: "eval(.s)"`) runs yq out of stack, and stops here with `eval: expressions nest more than 32 deep` (ADR-0018 rule 4, a crash).
 - **The text of the error for an expression that does not parse differs.**
   yq says `bad expression - probably missing close bracket on (` or reports the lexer's message; both fail with exit 1.
-- **`is_key` is still not defined.**
-  [#6081](https://github.com/rust-works/succinctly/issues/6081) stays open for it.
+- **`is_key` answers from the spelling of the program.**
+  `key` hands back a plain string here, with no mark that it is a key node, so `is_key` is `true` only when it is the whole stage straight after `key` (`.a | key | is_key`, `(.a | key) | is_key`, `.a | key | . | is_key`, `iskey`) and `false` anywhere else.
+  yq says `true` for a key node wherever it has travelled: `.a | key | select(is_key)` is `a` in yq and nothing here, and `.a | key as $k | $k | is_key`, `.a | key | [is_key]`, and `.a | key | is_key as $x | $x` are `true` in yq and `false` here.
+  `... | select(is_key)` needs the `...` operator, which is only a metadata-assignment target here.
 - **The wording of the refusal of a block scalar header left of its owner can differ (#6543).**
   yq words it by the container it stops in (`did not find expected '-' indicator`, or `did not find expected key`).
   `succinctly yq` words it by the last marker of the line above: `'-' indicator` after a dash, `key` otherwise.
