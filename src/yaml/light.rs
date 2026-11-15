@@ -9012,7 +9012,7 @@ impl<W: AsRef<[u64]> + Clone> YamlCursor<'_, W> {
                         &self.text[..header_end],
                         self.index.synthesized_empty(),
                         true,
-                        false,
+                        HeadIndent::Kept,
                     )
                     .map(|lines| lines.into_iter().map(strip).collect())
                 } else {
@@ -9405,6 +9405,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
                     && header_is_rebuilt_from_text(
                         &self.text[..header_end],
                         self.index.synthesized_empty(),
+                        HeadIndent::Kept,
                     )
             })
     }
@@ -9454,42 +9455,27 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
             return None;
         }
         let preamble = core::str::from_utf8(&before[..line_start]).ok()?;
-        // Through the last `---` line and the blank lines straight after it; comments
-        // after the marker belong to the first node, which prints its own head.
-        let mut end = 0;
-        let mut offset = 0;
-        let mut marker_seen = false;
         let mut directive_seen = false;
         for line in preamble.split_inclusive('\n') {
             let bare = line.trim_end_matches(['\n', '\r']);
-            // An indented `---` is yq's marker as well (#6859); `normalized_preamble` writes it flush left.
-            let trimmed = bare.trim_matches([' ', '\t']);
-            offset += line.len();
-            if trimmed == "---" {
-                marker_seen = true;
-                end = offset;
-            } else if !marker_seen && super::parser::starts_yq_yaml_directive(bare.as_bytes()) {
-                // #7099: a `%YAML` directive is a line of yq's header, which it prints back as written. After a
-                // marker the comment index holds one as the first node's head, as it does a comment.
+            if super::parser::starts_yq_yaml_directive(bare.as_bytes()) {
+                // #7099: a `%YAML` directive is a line of yq's header, which it prints back as written.
                 directive_seen = true;
-            } else if marker_seen && super::parser::starts_yq_yaml_directive(bare.as_bytes()) {
-                break;
-            } else if bare.starts_with('%') || (bare.starts_with("---") && !marker_seen) {
+            } else if bare.starts_with('%')
+                || (bare.starts_with("---") && !is_bare_marker_line(bare.as_bytes()))
+            {
                 // Another directive, or a marker with something after it: yq's handling of
                 // those is its own (an upstream quirk), not reproduced here.
                 return None;
-            } else if marker_seen && trimmed.is_empty() {
-                end = offset;
-            } else if marker_seen {
-                break;
             }
         }
-        if marker_seen {
-            Some(&preamble[..if through_content { preamble.len() } else { end }])
-        } else {
+        // Through the last `---` line (or `%YAML` line after one) and the blank lines straight after it; the
+        // comments after that belong to the first node, which prints its own head.
+        match header_head_start(preamble.as_bytes()) {
+            Some(end) => Some(&preamble[..if through_content { preamble.len() } else { end }]),
             // #7099: a directive with no marker after it. The header's comments are the root's head, not the first
             // node's, so the preamble is all of it.
-            directive_seen.then_some(preamble)
+            None => directive_seen.then_some(preamble),
         }
     }
 
@@ -9596,15 +9582,26 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
             // #6401: a header line of only blanks has no range, so a header of nothing else is the first
             // document's all the same.
             || (header_end > 0 && self.is_first_document_content());
+        // #7099: what a header with a `---` holds in front of the first node's head is the preamble's, which the
+        // index may still hold as head lines (a `%YAML` line after the marker, or the comments before it).
+        let head_start = if in_header {
+            header_head_start(&self.text[..header_end]).unwrap_or(0)
+        } else {
+            0
+        };
+        let ranges = &ranges[ranges.partition_point(|&(start, _)| (start as usize) < head_start)..];
         if in_header {
-            let header = &self.text[..header_end];
-            let head = header_after_marker(header);
-            // After a marker a `%YAML` line is part of the first node's head, as the comment index holds it (#7099).
+            // After a marker the head is the first node's, which moves with it (#7099).
+            let indent = if head_start > 0 {
+                HeadIndent::Trimmed
+            } else {
+                HeadIndent::Kept
+            };
             if let Some(lines) = header_head_lines(
-                head,
+                &self.text[head_start..header_end],
                 self.index.synthesized_empty(),
                 false,
-                head.len() < header.len(),
+                indent,
             ) {
                 return lines;
             }
@@ -11471,16 +11468,28 @@ fn header_keeps_empty_lines(header: &[u8]) -> bool {
     empty
 }
 
+/// Whether a comment line indented by blanks is by itself a reason to rebuild a head from the header's text, which
+/// keeps the indent ([`header_head_lines`], #7099). An enum rather than a `bool`, beside `synthesized` and `force`, so
+/// the three cannot be transposed at a call site.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeadIndent {
+    /// It is: the root's head in a header with no `---`, which prints only where yq prints its header.
+    Kept,
+    /// It is not, and the index's line, from its `#`, is kept: the first node's head after a `---` moves with the node
+    /// (`to_entries`, `sort_keys`, a construction), where a comment indented by a tab could not be read back.
+    Trimmed,
+}
+
 /// Whether the DOM route builds a first document's head from the header's text instead of the comment index
-/// ([`header_head_lines`]): a line of only blanks (#6401), a comment or `%YAML` line indented by blanks, which yq
-/// prints as written where the index holds it from its `#` or `%` (#7099), a CRLF break (#5053), or blank lines the index cannot place (#5008)
-/// unless the document is the one the CLI makes up for an empty input, whose line break is not the input's. One
-/// definition for the head and for the gate that decides a document has a head at all.
-fn header_is_rebuilt_from_text(header: &[u8], synthesized: bool) -> bool {
-    header
-        .split(|&b| is_line_break(b))
-        .any(|line| is_blank_line(line) || is_indented_comment_line(line))
-        || header.windows(2).any(|pair| pair == b"\r\n")
+/// ([`header_head_lines`]): a line of only blanks (#6401), a comment or `%YAML` line indented by blanks when `indent`
+/// keeps it, which yq prints as written where the index holds it from its `#` or `%` (#7099), a CRLF break (#5053), or
+/// blank lines the index cannot place (#5008) unless the document is the one the CLI makes up for an empty input,
+/// whose line break is not the input's. One definition for the head and for the gate that decides a document has a
+/// head at all.
+fn header_is_rebuilt_from_text(header: &[u8], synthesized: bool, indent: HeadIndent) -> bool {
+    header.split(|&b| is_line_break(b)).any(|line| {
+        is_blank_line(line) || (indent == HeadIndent::Kept && is_indented_comment_line(line))
+    }) || header.windows(2).any(|pair| pair == b"\r\n")
         || (!synthesized && header_keeps_empty_lines(header))
 }
 
@@ -11490,17 +11499,26 @@ fn is_indented_comment_line(line: &[u8]) -> bool {
         .iter()
         .take_while(|&&b| b == b' ' || b == b'\t')
         .count();
-    indent > 0
-        && (line.get(indent) == Some(&b'#')
-            || super::parser::starts_yq_yaml_directive(&line[indent..]))
+    (indent > 0 && line.get(indent) == Some(&b'#')) || super::is_indented_yq_directive_line(line)
 }
 
-/// The part of a first-document header (`header`: [`yq_header_len`]'s bytes) that is the first node's head: all of it
-/// with no `---` line, otherwise what follows the last one less the empty and blank lines straight after it, which are the
-/// preamble's ([`YamlCursor::document_preamble`]). The lines before the marker are the preamble too, so a head rebuilt
-/// from the whole header would print them twice (#7099).
-fn header_after_marker(header: &[u8]) -> &[u8] {
-    let mut start = 0;
+/// Whether `line`, without its line break, is a bare `---` marker: blanks around it at most (#6859).
+fn is_bare_marker_line(line: &[u8]) -> bool {
+    let blank = |b: &&u8| **b == b' ' || **b == b'\t';
+    let start = line.iter().take_while(blank).count();
+    let end = line.len() - line.iter().rev().take_while(blank).count();
+    start <= end && &line[start..end] == b"---"
+}
+
+/// Where the first node's head starts in a first-document header (`header`: the text in front of its content), or
+/// `None` for a header with no `---` line: after the last line that is a marker or, after one, a `%YAML` directive (at
+/// any indent),
+/// and after the empty and blank lines straight after it. What is before is the document's preamble
+/// ([`YamlCursor::document_preamble`]), so no node's head may hold it: a head rebuilt from the whole header printed it
+/// twice, and a `%YAML` line in a head moved into the document with its node, which then could not be read back
+/// (#7099). The one split for the preamble and the head.
+fn header_head_start(header: &[u8]) -> Option<usize> {
+    let mut start: Option<usize> = None;
     let mut pos = 0;
     while pos < header.len() {
         let rest = &header[pos..];
@@ -11516,15 +11534,18 @@ fn header_after_marker(header: &[u8]) -> &[u8] {
                 0
             };
         let line = &rest[..line_end];
-        let marker = line.starts_with(b"---") || is_indented_bare_marker(line);
+        let marker = is_bare_marker_line(line);
+        let directive = start.is_some()
+            && (super::parser::starts_yq_yaml_directive(line)
+                || super::is_indented_yq_directive_line(line));
         // The empty and blank lines straight after a marker are the preamble's as well.
-        let after_marker = start == pos && start > 0 && (line.is_empty() || is_blank_line(line));
-        if marker || after_marker {
-            start = next;
+        let blank = start == Some(pos) && (line.is_empty() || is_blank_line(line));
+        if marker || directive || blank {
+            start = Some(next);
         }
         pos = next;
     }
-    &header[start..]
+    start
 }
 
 /// Whether a first-document header holds a `---` line, which `head_comment` reads past (#6772).
@@ -11540,15 +11561,15 @@ fn header_has_marker(header: &[u8]) -> bool {
 /// go-yaml -- where one with a bare `\n` stays a blank line (#5053). A line of only blanks is `# ` plus the line
 /// (#6401), which the comment index does not hold, and so are blank lines a header starts with or repeats (#5008),
 /// unless `synthesized`: the empty document the CLI makes up has a line break that is not the input's. The `---` and
-/// `%` lines are the header's own, not comment lines, unless `keep_directives` keeps the `%YAML` ones: after the marker
-/// one is the first node's head (#7099). `force` rebuilds a header that needs no rebuilding.
+/// `%` lines are the header's own, not comment lines. `force` rebuilds a header that needs no rebuilding, and `indent`
+/// says whether an indented comment line alone needs it.
 fn header_head_lines(
     header: &[u8],
     synthesized: bool,
     force: bool,
-    keep_directives: bool,
+    indent: HeadIndent,
 ) -> Option<Vec<String>> {
-    if !force && !header_is_rebuilt_from_text(header, synthesized) {
+    if !force && !header_is_rebuilt_from_text(header, synthesized, indent) {
         return None;
     }
     let mut out = Vec::new();
@@ -11575,10 +11596,7 @@ fn header_head_lines(
                 String::new()
             });
         } else if is_blank_line(line.as_bytes())
-            || (line.starts_with([' ', '\t'])
-                && super::parser::starts_yq_yaml_directive(
-                    line.trim_start_matches([' ', '\t']).as_bytes(),
-                ))
+            || super::is_indented_yq_directive_line(line.as_bytes())
         {
             // #6401: a line of only blanks is a comment, `# ` plus the line, and so is an indented `%YAML` (#7099).
             out.push(if crlf {
@@ -11586,11 +11604,7 @@ fn header_head_lines(
             } else {
                 format!("# {line}")
             });
-        } else if !(line.starts_with("---")
-            || (line.starts_with('%')
-                && !(keep_directives && super::parser::starts_yq_yaml_directive(line.as_bytes())))
-            || indented_marker)
-        {
+        } else if !(line.starts_with("---") || line.starts_with('%') || indented_marker) {
             out.push(if crlf {
                 format!("{line}\r")
             } else {
@@ -11997,10 +12011,7 @@ fn write_yq_header_spelling_markers<W: AsRef<[u64]>, Out: core::fmt::Write>(
             // #6401: a line of only blanks is a comment to go-yaml too, `# ` plus the line. So is an
             // indented `%YAML` line (#6408): the indent follows the `# `.
             if is_blank_line(line.as_bytes())
-                || (line.starts_with([' ', '\t'])
-                    && super::parser::starts_yq_yaml_directive(
-                        line.trim_start_matches([' ', '\t']).as_bytes(),
-                    ))
+                || super::is_indented_yq_directive_line(line.as_bytes())
             {
                 out.write_str("# ")?;
             }
@@ -21014,15 +21025,15 @@ plain: hello
             assert!(!header_keeps_empty_lines(b"\n---\n"));
             assert!(!header_keeps_empty_lines(b"\n%YAML 1.2\n"));
             assert_eq!(
-                header_head_lines(b"\n\n# c\n", false, false, false).unwrap(),
+                header_head_lines(b"\n\n# c\n", false, false, HeadIndent::Kept).unwrap(),
                 ["", "", "# c"]
             );
             assert_eq!(
-                header_head_lines(b"# h\n\n\n# g\n", false, false, false).unwrap(),
+                header_head_lines(b"# h\n\n\n# g\n", false, false, HeadIndent::Kept).unwrap(),
                 ["# h", "", "", "# g"]
             );
             // The empty document the CLI makes up has a break that is not the input's.
-            assert!(header_head_lines(b"\n", true, false, false).is_none());
+            assert!(header_head_lines(b"\n", true, false, HeadIndent::Kept).is_none());
         }
 
         #[test]
@@ -21039,7 +21050,7 @@ plain: hello
             assert!(!is_blank_line(b""));
             assert!(!is_blank_line(b" #"));
             assert_eq!(
-                header_head_lines(b"# c\r\n \r\n\r\n", false, false, false).unwrap(),
+                header_head_lines(b"# c\r\n \r\n\r\n", false, false, HeadIndent::Kept).unwrap(),
                 ["# c\r", "#  \r", "# \r"]
             );
         }

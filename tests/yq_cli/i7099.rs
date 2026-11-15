@@ -1,8 +1,9 @@
 //! #7099: the first document's leading content -- what yq's header preprocessing sets aside before the document and
 //! prints back in front of it -- on a write and on `-P`, which build the output from the document's comment tree.
-//! A `%YAML` directive was dropped (the preamble gave up on any `%` line), a comment or `%YAML` line indented by
-//! blanks lost its indent, a comment after `---` over an empty root was lost (it is no node's head), a line of only
-//! blanks after `---` printed twice, and a head written to a scalar root left the header in place. Each row is a
+//! A `%YAML` directive was dropped (the preamble gave up on any `%` line) or, after `---`, held as the first node's
+//! head and carried into the document with it; a header with no `---` lost the indent of an indented comment or
+//! `%YAML` line; a comment after `---` over an empty root was lost (it is no node's head); a line of only blanks after
+//! `---` printed twice; and a head written to a scalar root left the header in place. Each row of the tables is a
 //! live yq v4.53.3 capture.
 
 use anyhow::Result;
@@ -92,6 +93,36 @@ const DIRECTIVE: &[Row] = &[
         ".k = 1",
         "%YAML 1.2\r\n---\r\nk: 1\n",
     ),
+    (
+        "---\n%YAML 1.2\n- a: 1\n- b: 2\n",
+        &[],
+        "[.[1], .[0]]",
+        "- b: 2\n- a: 1\n",
+    ),
+    (
+        "---\n%YAML 1.2\n- a: 1\n- b: 2\n",
+        &[],
+        ".[0] | .b = 1",
+        "a: 1\nb: 1\n",
+    ),
+    (
+        "---\n%YAML 1.2\n\n\n# c\na: 1\n",
+        &[],
+        ".a = 3",
+        "---\n%YAML 1.2\n\n\n# c\na: 3\n",
+    ),
+    (
+        "---\n# c\n%YAML 1.2\n\n\n# d\na: 1\n",
+        &[],
+        ".a = 3",
+        "---\n# c\n%YAML 1.2\n\n\n# d\na: 3\n",
+    ),
+    (
+        "---\n  %YAML 1.2\nk: v\n",
+        &[],
+        ".k = 1",
+        "---\n#   %YAML 1.2\nk: 1\n",
+    ),
 ];
 
 const INDENTED: &[Row] = &[
@@ -121,22 +152,16 @@ const INDENTED: &[Row] = &[
         "  # two\n- 9\n- 2\n",
     ),
     (
-        "---\n  # ind\nk: v\n",
-        &[],
-        ".k = 1",
-        "---\n  # ind\nk: 1\n",
-    ),
-    (
-        "# p\n\t# tab\n---\n\t# tab\nk: v\n",
-        &[],
-        ".k = 1",
-        "# p\n\t# tab\n---\n\t# tab\nk: 1\n",
-    ),
-    (
         "---\n\t\n# h\nk: v\n",
         &[],
         ".zz = 1",
         "---\n# \t\n# h\nk: v\nzz: 1\n",
+    ),
+    (
+        "# p\n---\n\t\n# h\nk: v\n",
+        &[],
+        ".zz = 1",
+        "# p\n---\n# \t\n# h\nk: v\nzz: 1\n",
     ),
     (
         "---\n\t\n\nk: v\n",
@@ -149,12 +174,6 @@ const INDENTED: &[Row] = &[
         &["-P"],
         ".",
         "# \t\n%YAML 1.1\nk: v # lc\n",
-    ),
-    (
-        "---\n%YAML 1.1\n\t# tab\nk: v\n",
-        &[],
-        ".k = 1",
-        "---\n%YAML 1.1\n\t# tab\nk: 1\n",
     ),
     (
         "---\n%YAML 1.1\n \n# c\nk: v\n",
@@ -230,4 +249,32 @@ fn test_the_comment_after_the_marker_stays_over_an_empty_root_7099() -> Result<(
 #[test]
 fn test_a_head_written_to_a_scalar_root_replaces_the_header_7099() -> Result<()> {
     check(SCALAR_HEAD_WRITE)
+}
+
+/// (document, filter): filters that move the first node away from the top of the document. Where the comment `# c`
+/// lands still differs from yq (it stays in yq's header; #7099's remaining rows), but the `%YAML` line after `---` is
+/// the header's, and carried into the document it is a line neither tool can read back.
+const MOVED: &[(&str, &str)] = &[
+    ("---\n%YAML 1.2\n# c\na: 1\n", "to_entries"),
+    ("---\n%YAML 1.2\n# c\na: 1\n", r#"{"x": .}"#),
+    ("---\n%YAML 1.2\n# c\n- a: 1\n- b: 2\n", "[.[1], .[0]]"),
+    ("---\n  %YAML 1.2\n# c\na: 1\n", "to_entries"),
+];
+
+#[test]
+fn test_a_yaml_directive_after_the_marker_never_moves_into_the_document_7099() -> Result<()> {
+    for (doc, filter) in MOVED {
+        let (stdout, code) = run_yq_stdin(filter, doc, &[])?;
+        assert_eq!(code, 0, "{doc:?} {filter}");
+        let mut body = stdout
+            .lines()
+            .skip_while(|line| *line == "---" || line.starts_with("%YAML"));
+        assert!(
+            body.all(|line| !line.trim_start().starts_with('%')),
+            "{doc:?} {filter}: {stdout:?}"
+        );
+        let (_, reread) = run_yq_stdin(".", &stdout, &[])?;
+        assert_eq!(reread, 0, "{doc:?} {filter}: {stdout:?} reads back");
+    }
+    Ok(())
 }

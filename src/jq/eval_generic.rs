@@ -4407,9 +4407,8 @@ fn normalized_preamble(preamble: &str) -> String {
             } else if bare.is_empty() && line == "\r\n" {
                 // #5053: a blank CRLF line is `# \r` in yq's output (the `\r` is comment text to go-yaml).
                 alloc::borrow::Cow::Borrowed("# \r\n")
-            } else if bare.starts_with([' ', '\t'])
-                && (bare.trim_start_matches([' ', '\t']).is_empty()
-                    || bare.trim_start_matches([' ', '\t']).starts_with("%YAML"))
+            } else if (!bare.is_empty() && bare.trim_start_matches([' ', '\t']).is_empty())
+                || crate::yaml::is_indented_yq_directive_line(bare.as_bytes())
             {
                 // #7099: a line of only blanks (#6401) and an indented `%YAML` line (#6408) are comments to
                 // go-yaml, `# ` and the line.
