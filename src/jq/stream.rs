@@ -261,7 +261,7 @@ impl StreamableValue for OwnedValue {
     }
 
     fn is_falsy(&self) -> bool {
-        matches!(self, Self::Null | Self::Bool(false))
+        !self.is_truthy()
     }
 }
 
