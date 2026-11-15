@@ -40222,7 +40222,9 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
             // #5683: jq's bare `min`/`max` keep the running winner as they walk, rather than
             // collecting every element's cursor and then every element's key before comparing
             // them (two vectors of the array's length, once per call, and a comma of the two
-            // paid it twice). The first minimum and the last maximum win, as below.
+            // paid it twice). The first minimum and the last maximum win, as below. This test once
+            // sat in the `sort` arm above, where it is never true, and every answer stayed right
+            // (#7261): `bare_min_max_take_the_single_walk_7261` pins that the walk runs.
             if !S::MIN_MAX_NEED_AN_ELEMENT && matches!(builtin, Builtin::Min | Builtin::Max) {
                 return extremum_streaming_generic::<S, V>(
                     elements,
