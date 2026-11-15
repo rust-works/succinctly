@@ -4689,14 +4689,77 @@ fn reconcile_presentation_by_stage(
                 (vec![target], None)
             }
         };
-        let mut next_tree = reconcile_presentation(&value, &tree, &next, &targets);
-        if let Some(expr) = copy {
-            propagate_assign_copied_presentation(expr, &next, &value, &tree, &mut next_tree);
+        let path = match stage {
+            ChainStage::Set(path, ..) | ChainStage::Add(path, ..) | ChainStage::Copy(path, ..) => {
+                Some(path.as_slice())
+            }
+            ChainStage::Identity | ChainStage::Del(_) => None,
+        };
+        // A copy is judged against the target as the stage found it.
+        let before = copy.map(|_| tree.clone());
+        reconcile_stage_in_place(&value, &mut tree, &next, &targets, path);
+        if let (Some(expr), Some(before)) = (copy, before) {
+            propagate_assign_copied_presentation(expr, &next, &value, &before, &mut tree);
         }
         value = next;
-        tree = next_tree;
     }
     (value == *result_value).then_some(tree)
+}
+
+/// [`reconcile_presentation`] for one stage of a chain, in place: only the node at `path` when the
+/// stage wrote over a node already there (a write changes nothing outside it), reconciled at its
+/// own depth so it is not taken for a document root, and the whole document otherwise (a key or
+/// item the write added, a `del`, a node whose tree has no member trees).
+fn reconcile_stage_in_place(
+    value: &OwnedValue,
+    tree: &mut CommentTree,
+    next: &OwnedValue,
+    targets: &[WriteTarget],
+    path: Option<&[PathStep]>,
+) {
+    let spliced = path.filter(|path| !path.is_empty()).and_then(|path| {
+        let steps = resolved_tree_steps(value, path)?;
+        let old = owned_value_at(value, &meta_path_of(&steps))?;
+        let new = owned_value_at(next, &meta_path_of(&steps))?;
+        let node = comment_tree_at_path_mut(tree, &steps)?;
+        let relative: Vec<RelTarget<'_>> = targets
+            .iter()
+            .map(|t| {
+                let rest = t
+                    .path
+                    .get(path.len()..)
+                    .filter(|_| t.path.starts_with(path))?;
+                Some((rest, t.kind, t.fresh, t.copies, t.appends))
+            })
+            .collect::<Option<_>>()?;
+        *node = reconcile_presentation_at_depth(old, node, new, &relative, steps.len());
+        Some(())
+    });
+    if spliced.is_none() {
+        *tree = reconcile_presentation(value, tree, next, targets);
+    }
+}
+
+/// `path` as tree steps into `value`, a negative index counted from the end of its array; `None`
+/// where the path leaves the document.
+fn resolved_tree_steps<'p>(value: &OwnedValue, path: &'p [PathStep]) -> Option<Vec<TreeStep<'p>>> {
+    let mut node = value;
+    let mut steps = Vec::with_capacity(path.len());
+    for step in path {
+        match (node, step) {
+            (OwnedValue::Object(fields), PathStep::Key(k)) => {
+                node = fields.get(k.as_str())?;
+                steps.push(TreeStep::Key(k));
+            }
+            (OwnedValue::Array(items), PathStep::Index(i)) => {
+                let at = resolved_index(*i, items.len())?;
+                node = items.get(at)?;
+                steps.push(TreeStep::Index(at));
+            }
+            _ => return None,
+        }
+    }
+    Some(steps)
 }
 
 /// `left + right` for the kinds [`ChainStage::Add`] replays: two arrays, two strings or two
