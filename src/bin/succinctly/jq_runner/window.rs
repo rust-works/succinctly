@@ -1862,6 +1862,9 @@ pub(super) struct LineWindows {
     carried: Vec<u8>,
     /// Nothing more is read: the end of the source, a read that failed, or the length it had.
     eof: bool,
+    /// The most the next window reads, once (#7264): a source started on a few KiB reads up to where
+    /// a start on the whole front would have ended, so its windows then fall where they always did.
+    first_ask: Option<usize>,
 }
 
 impl LineWindows {
@@ -1879,7 +1882,14 @@ impl LineWindows {
             block: block.max(1),
             carried,
             eof: false,
+            first_ask: None,
         }
+    }
+
+    /// The first window reads no more than `bytes`.
+    pub(super) fn with_first_window(mut self, bytes: usize) -> Self {
+        self.first_ask = Some(bytes);
+        self
     }
 
     /// Whether the last window is the last: no byte is left to read or carried.
@@ -1898,6 +1908,9 @@ impl LineWindows {
     ) -> Option<Vec<u8>> {
         let mut bytes = std::mem::take(&mut self.carried);
         let mut ask = want.unwrap_or(self.block).max(1);
+        if let Some(first) = self.first_ask.take() {
+            ask = ask.min(first.max(1));
+        }
         // #7024: bytes carried in that make a window already (a pipe's probe of 4 MiB) are handed out as
         // one, up to their last line break. Reading a block onto them would grow the probe's buffer to
         // twice its size, and a window to the probe and a block. The bytes carried after a window are

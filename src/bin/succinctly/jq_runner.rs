@@ -14011,13 +14011,22 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
                     text,
                     spans: chunk.spans,
                     rest: LazyRest {
-                        windows: window::LineWindows::new(
-                            reader,
-                            // A file's length is known; stdin ends at a short read.
-                            (!from_stdin).then(|| (capacity - read_len) as u64),
-                            lazy_window_bytes(),
-                            pending,
-                        ),
+                        windows: {
+                            let windows = window::LineWindows::new(
+                                reader,
+                                // A file's length is known; stdin ends at a short read.
+                                (!from_stdin).then(|| (capacity - read_len) as u64),
+                                lazy_window_bytes(),
+                                pending,
+                            );
+                            // A start on fewer bytes than the front reads the rest of the front
+                            // first, so the windows after it fall where they did when it read all.
+                            if read_len < front {
+                                windows.with_first_window(front - read_len)
+                            } else {
+                                windows
+                            }
+                        },
                     },
                 });
             }
