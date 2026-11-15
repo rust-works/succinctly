@@ -13565,8 +13565,17 @@ struct LazyRest {
 }
 
 /// How much of a lone source [`lone_lazy_start`] reads before the program starts: room for the
-/// first chunk's documents ([`LAZY_CHUNK_FIRST_BYTES`]) and the one that ends it.
-const LAZY_PREFIX_BYTES: usize = 4 * LAZY_CHUNK_FIRST_BYTES;
+/// documents of the first chunks and the one that ends them. A source shorter than this is read whole
+/// instead, so it is not derived from [`LAZY_CHUNK_FIRST_BYTES`]: shrinking the first chunk (#7264)
+/// must not move which files take the lazy start.
+const LAZY_PREFIX_BYTES: usize = 256 * 1024;
+
+/// How much of a file longer than [`LAZY_PREFIX_BYTES`] [`lone_lazy_start`] reads first: room for the
+/// first chunk's documents ([`LAZY_CHUNK_FIRST_BYTES`]) and the one that ends it, when they are not
+/// bigger than a document in a few thousand bytes; it reads on to the prefix when they are (#7264).
+const LAZY_START_BYTES: usize = 4 * LAZY_CHUNK_FIRST_BYTES;
+
+const _: () = assert!(LAZY_START_BYTES <= LAZY_PREFIX_BYTES);
 
 #[cfg(test)]
 thread_local! {
@@ -13934,48 +13943,66 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
     let from_stdin = files.is_empty();
     // Sized for the whole file, so the rest is read into the same buffer.
     let mut bytes = Vec::with_capacity(capacity);
-    if reader
-        .by_ref()
-        .take(front as u64)
-        .read_to_end(&mut bytes)
-        .is_err()
-    {
-        // #7126: a standard input that fails (a directory) is the empty stream jq reads, plus
-        // what came before the failure, and ends the run with exit 2.
-        return if from_stdin {
-            note_stdin_read_failed();
-            Ok(LoneStart::Read(bytes))
-        } else {
-            // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
-            Ok(LoneStart::Declined)
-            // patchcov: coverage end
-        };
-    }
-    // The whole source (stdin's end, or a file that shrank).
-    if bytes.len() < front {
-        return Ok(LoneStart::Read(bytes));
-    }
-    // The scan reads the text after the BOM jq skips (#5291), as `get_inputs` strips it.
-    let bom = crate::front_matter::leading_bom_len(&bytes);
-    // Up to the last whole character: the front may end inside one.
-    let valid_end = match std::str::from_utf8(&bytes[bom..]) {
-        Ok(_) => bytes.len(),
-        Err(e) if e.error_len().is_none() => bom + e.valid_up_to(),
-        Err(_) => bom,
+    // A file longer than the front is known to be, so its first chunk is looked for in the first
+    // [`LAZY_START_BYTES`] of it and the front is read only when that holds no whole chunk (#7264):
+    // reading 256 KiB first was a tenth of `-n 'first(inputs)|.id'`'s time. Standard input may end
+    // anywhere, and that it holds a front's worth is how it is told from a short source, so it reads
+    // the front at once.
+    let mut want = if from_stdin {
+        front
+    } else {
+        front.min(LAZY_START_BYTES)
     };
-    // The line of a document is jq's count through the read that completes it, which runs to the
-    // next newline ([`LineCounter::read_end_line`]): a newline after the chunk's last document keeps
-    // every count the chunk needs, and the newline the counter keeps for the next, in the front.
-    let more = std::str::from_utf8(&bytes[bom..valid_end])
-        .ok()
-        .and_then(|text| {
-            let chunk = lazy_json_scan_chunk(text, 0, lazy_chunk_budget(0));
-            let newline_after =
-                |&(_, end): &(usize, usize)| text.as_bytes()[end..].contains(&b'\n');
-            (chunk.end == ChunkEnd::More && chunk.spans.last().is_some_and(newline_after))
-                .then_some(chunk)
-        });
-    if let Some(chunk) = more {
+    let more = loop {
+        let read = reader
+            .by_ref()
+            .take((want - bytes.len()) as u64)
+            .read_to_end(&mut bytes);
+        if read.is_err() {
+            // #7126: a standard input that fails (a directory) is the empty stream jq reads, plus
+            // what came before the failure, and ends the run with exit 2.
+            return if from_stdin {
+                note_stdin_read_failed();
+                Ok(LoneStart::Read(bytes))
+            } else {
+                // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
+                Ok(LoneStart::Declined)
+                // patchcov: coverage end
+            };
+        }
+        // The whole source (stdin's end, or a file that shrank).
+        if bytes.len() < want {
+            return Ok(LoneStart::Read(bytes));
+        }
+        // The scan reads the text after the BOM jq skips (#5291), as `get_inputs` strips it.
+        let bom = crate::front_matter::leading_bom_len(&bytes);
+        // Up to the last whole character: the front may end inside one.
+        let valid_end = match std::str::from_utf8(&bytes[bom..]) {
+            Ok(_) => bytes.len(),
+            Err(e) if e.error_len().is_none() => bom + e.valid_up_to(),
+            Err(_) => bom,
+        };
+        // The line of a document is jq's count through the read that completes it, which runs to the
+        // next newline ([`LineCounter::read_end_line`]): a newline after the chunk's last document
+        // keeps every count the chunk needs, and the newline the counter keeps for the next, in the
+        // front.
+        let more = std::str::from_utf8(&bytes[bom..valid_end])
+            .ok()
+            .and_then(|text| {
+                let chunk = lazy_json_scan_chunk(text, 0, lazy_chunk_budget(0));
+                let newline_after =
+                    |&(_, end): &(usize, usize)| text.as_bytes()[end..].contains(&b'\n');
+                (chunk.end == ChunkEnd::More && chunk.spans.last().is_some_and(newline_after))
+                    .then_some(chunk)
+            });
+        if more.is_some() || want >= front {
+            break more.map(|chunk| (chunk, bom, valid_end));
+        }
+        want = front;
+    };
+    if let Some((chunk, bom, valid_end)) = more {
+        // What the reader has read of the source, which is what is left of it to the windows.
+        let read_len = bytes.len();
         let pending = bytes.split_off(valid_end);
         bytes.drain(..bom);
         match String::from_utf8(bytes) {
@@ -13987,7 +14014,7 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
                         windows: window::LineWindows::new(
                             reader,
                             // A file's length is known; stdin ends at a short read.
-                            (!from_stdin).then(|| (capacity - front) as u64),
+                            (!from_stdin).then(|| (capacity - read_len) as u64),
                             lazy_window_bytes(),
                             pending,
                         ),
@@ -14171,10 +14198,27 @@ fn slide_lazy_window(
 /// The first chunk of a lazy stream covers about this much text, and each chunk after it twice the
 /// one before up to [`LAZY_CHUNK_MAX_BYTES`], so a program that stops early (`first(inputs)`)
 /// scans little more than it reads (#5856).
-const LAZY_CHUNK_FIRST_BYTES: usize = 1 << 16;
+///
+/// It is small because the scan checks every document of the chunk (two parsers run against each
+/// other, about 3,600 instructions per 85-byte record) before the first is read: a 64 KiB first chunk
+/// was 2.9 M of the 3.9 M instructions of `-n 'first(inputs)|.id'` over a file, where the whole of
+/// `-n 1` is 1.1 M (#7264).
+const LAZY_CHUNK_FIRST_BYTES: usize = 1 << 12;
 
 /// The most text a chunk of a lazy stream covers, past its first document.
 const LAZY_CHUNK_MAX_BYTES: usize = 1 << 19;
+
+/// How many doublings take [`LAZY_CHUNK_FIRST_BYTES`] to [`LAZY_CHUNK_MAX_BYTES`].
+const LAZY_CHUNK_DOUBLINGS: u32 =
+    LAZY_CHUNK_MAX_BYTES.trailing_zeros() - LAZY_CHUNK_FIRST_BYTES.trailing_zeros();
+
+const _: () = assert!(
+    LAZY_CHUNK_FIRST_BYTES.is_power_of_two()
+        && LAZY_CHUNK_MAX_BYTES.is_power_of_two()
+        && LAZY_CHUNK_FIRST_BYTES <= LAZY_CHUNK_MAX_BYTES
+        // The first chunk stays small: that is what #7264 is for.
+        && LAZY_CHUNK_FIRST_BYTES <= 4096
+);
 
 #[cfg(test)]
 thread_local! {
@@ -14195,8 +14239,8 @@ fn lazy_chunk_budget(index: usize) -> usize {
     if let Some(bytes) = LAZY_CHUNK_BYTES.with(std::cell::Cell::get) {
         return bytes;
     }
-    // 64 KiB doubled three times is the 512 KiB cap, so the shift cannot overflow.
-    (LAZY_CHUNK_FIRST_BYTES << index.min(3)).min(LAZY_CHUNK_MAX_BYTES)
+    // The first chunk doubled `LAZY_CHUNK_DOUBLINGS` times is the cap, so the shift cannot overflow.
+    (LAZY_CHUNK_FIRST_BYTES << index.min(LAZY_CHUNK_DOUBLINGS as usize)).min(LAZY_CHUNK_MAX_BYTES)
 }
 
 /// The text a batch's index covers is at most this long, past its first document (#5854).
@@ -20941,6 +20985,24 @@ mod tests {
         // Brackets inside a string do not count towards the depth.
         let in_string = format!("[\"{}\", 1]\n", "[".repeat(200));
         assert!(spans(&in_string).is_some());
+    }
+
+    /// #7264: the chunks of a lazy stream start at [`LAZY_CHUNK_FIRST_BYTES`], double, and stop at
+    /// [`LAZY_CHUNK_MAX_BYTES`]; the first is small enough that `first(inputs)` scans little more than
+    /// it reads, and the lone-source prefix does not follow it down.
+    #[test]
+    fn the_lazy_chunks_ramp_from_a_small_first_to_the_cap_7264() {
+        assert_eq!(lazy_chunk_budget(0), LAZY_CHUNK_FIRST_BYTES);
+        for index in 0..LAZY_CHUNK_DOUBLINGS as usize {
+            assert_eq!(lazy_chunk_budget(index + 1), 2 * lazy_chunk_budget(index));
+        }
+        assert_eq!(
+            lazy_chunk_budget(LAZY_CHUNK_DOUBLINGS as usize),
+            LAZY_CHUNK_MAX_BYTES
+        );
+        assert_eq!(lazy_chunk_budget(1000), LAZY_CHUNK_MAX_BYTES);
+        // Which files take the lazy start is the 256 KiB it was with a 64 KiB first chunk.
+        assert_eq!(LAZY_PREFIX_BYTES, 256 * 1024);
     }
 
     /// #5853: a stream that turns malformed keeps the documents before its first fault lazy; a
