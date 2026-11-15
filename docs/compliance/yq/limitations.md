@@ -964,6 +964,14 @@ Over 518 generated documents (seven property forms, eleven contexts, six tails, 
 Over five draws of 2,000 generated streams of two to five lines (properties, keys and items with a value left to the next line, block scalars and flow dashes), 474 that differed from yq in whether they are refused now agree and none changed the other way.
 yq prints the documents before the failing one and then the error, as for any later parse error (see above), so the stdout prefix differs.
 
+### A block mapping in a sequence item on a `---` line, with a block scalar for its first value ([#6996](https://github.com/rust-works/succinctly/issues/6996))
+
+yq measures the columns of a `--- ` marker line as if the marker were not there, so on `--- - x: >` the `-` counts as column 0 and the key `x` as column 2.
+`--- - x: >` / blank / `  b: 1` is `[{"x":"","b":1}]` in yq, as `- x: >` / blank / `  b: 1` is in both, and `succinctly yq` refuses it with `inconsistent indentation` (the dedent check, `mapping_under_mapping_gap_reaches`, sees `b` at column 2 under a `-` at column 4).
+The YAML spec does not allow a block mapping on a marker line, and yq refuses one with any other value (`--- - x: 1` / `  b: 2` and `--- x: 1` / `b: 2` are `mapping values are not allowed in this context` in both), so only a block scalar value gets that far.
+Reading it as yq does means subtracting the marker prefix in the parser's indent stack, in the block scalar's base indent (`src/yaml/parser.rs` and `src/yaml/light.rs`) and in the gap checks, a change to indentation tracking for input the spec forbids and no real document holds, so the refusal is recorded here rather than fixed (#6996).
+A deeper line under the same header is a different matter: `--- - x: >` / blank / `      b: 2` is `[{"x":"b: 2\n","b":2}]` here, the text read as the scalar's and as an entry, where yq reads `[{"x":"b: 2\n"}]`, and that silent duplication stays open as a bug in #6996.
+
 ## Open divergences (bugs, not decisions)
 
 Representative cases, each live-verified. These are gaps to close, listed here so they are
@@ -1048,7 +1056,13 @@ The parser notes one on the line walk it already makes, looking at a byte only w
 Only a listed scalar is read line by line, with `src/yaml/block_unicode.rs`, so the decoders never scan for the three and an index rebuilt from its parts (`from_parts`) reads every block scalar the old way.
 A scalar whose dedent line is spaces and one of the three is listed too, because go-yaml reads that line as an empty line and the scalar runs on past it.
 Checked against yq v4.53.3 on 960 documents (four headers, the three breaks, 0-3 spaces on each side, five tails) and on 40,000 random ones (seventeen headers, with properties, `+`, explicit indents, sequence items and a nested key), with no difference, as long as no break follows a line left of the scalar's indent: those are the shapes below.
-Still different, and not block scalars: a plain scalar or key in block context that spans one of the three (`x<LS>b: 1` is `could not find expected ':'` in yq), a comment line, which ends at the break in yq, and the first blank line of a document-root `--- |` when it is spaces and one of the three ([#6820](https://github.com/rust-works/succinctly/issues/6820)).
+Still different, and not block scalars: a plain scalar or key in block context that spans one of the three (`x<LS>b: 1` is `could not find expected ':'` in yq), and a comment line, which ends at the break in yq ([#6820](https://github.com/rust-works/succinctly/issues/6820)).
+Where yq reads the break as the end of a line the data differs, not only the verdict: `a: 1` / `<LS>b: 2` is `{"a":1,"b":2}` in yq (the line before `b` holds only the break) and `{"a":1," b":2}` here, and `a:` / `  c: 1` / `  <PS>d: 2` puts `d` at the root in yq and under `a` here.
+A comment that ends at one loses the key after it here: `a: 1` / `# c<LS>z: 2` and `a: 1 # c<NEL>b: 2` are `{"a":1}`, where yq reads `z` or `b` as a second key.
+A plain scalar that spans one (`a: x<LS>y`, `- x<LS>y`) and a comment line with text after its break (`a: |` / `  x` / `# c<NEL>z`) are refused by yq and read here, and `- a` / `<LS>- b` is `["a","b"]` in yq and refused here.
+A line that begins with a NEL already reads as in yq (`a: 1` / `<NEL>b: 2`), and so does the first blank line of a document-root `--- |` that is spaces and a NEL (`--- |` / `····<NEL>  x` is `"x\n"` in both since #6835).
+These rows are recorded rather than fixed (#6820): each needs one of the three outside a quoted or block scalar, and matching yq means the whole block-context line model reading them as breaks.
+The parser ends a line in about 35 places through `is_break`, `skip_line_break`, `skip_to_eol` and `skip_newlines` (`src/yaml/parser.rs`), which stop at `\n` and `\r` only, so stopping one of them at a NEL alone leaves its callers' `skip_line_break` unable to step over it, and the semi-index decides line structure before the parser sees it (`src/yaml/simd/`).
 A block scalar header's own line ends at the three too ([#6820](https://github.com/rust-works/succinctly/issues/6820)): `a: |<NEL>  x` is `"x\n"` as in yq, and so are `a: |<LS>  x` and `a: | # c<PS>  x`.
 The parser walks the header line to the first break of any of the five spellings and lists the scalar like one that holds a break in its body, so the decoders end the header at the same byte; a header that ends at `\n` or `\r` costs the one byte it always did.
 Also still different ([#6820](https://github.com/rust-works/succinctly/issues/6820)): a comment on a dedent line that begins with one of the three runs to the next `\n` where yq's ends at the break (an invalid document such as that is accepted), and a last content line of the form `x:` followed by a dedented `- z` drops the item without an error.
@@ -1386,7 +1400,7 @@ An absent key read through the loop variable in an arithmetic operand is no outp
 The same read as a whole UPDATE (`ireduce ([]; [$i.a])`) or as the value of a write (`.x = $i.a`) is a `null` node in both.
 A list that grows past 100,000 accumulators is refused with `reduce: maximum iterations exceeded`, where yq grows it until it runs out of memory (`ireduce (0; (. + 1, . + 2))` over 30 elements is 2^30 accumulators), as ADR-0018 allows for a run that would take the host down.
 
-Five things still differ, each in yq v4.53.3 against `succinctly yq`:
+Six things still differ, each in yq v4.53.3 against `succinctly yq`:
 
 - **`{}` over a computed or a written source.**
   The one-`{}` rule holds where the collect reads the document (`.x | [.[] | {}]`, `.x | map({})`) and not where its source is a computed array or a value being written.
@@ -1394,6 +1408,8 @@ Five things still differ, each in yq v4.53.3 against `succinctly yq`:
   `.x |= map({})` and `.x = [.x[] | {}]` write `[{}]` in yq and three `{}` here.
   The owned-value evaluator never enters the context-list walk for a collect, where the document route does.
   `.x | map({})` over a flow sequence prints `[{}]` in YAML in yq (the result keeps its source's flow style) and `- {}` here ([#6801](https://github.com/rust-works/succinctly/issues/6801)).
+- **`{} as $z | $z` under `--eval-all`.**
+  `yq ea '{} as $z | $z' f1 f2` prints one `{}`, the one-`{}` rule of a pipe over the reader's documents, and prints one per document here: the `as` binding does not consult that rule ([#6801](https://github.com/rust-works/succinctly/issues/6801)).
 - **A constant over an empty context.**
   yq answers a literal from a context that holds no node (`yq ea 'select(fi == 9) | 0'` is `0`, and `select(fi == 9) | . as $i ireduce (0; . + 1)` is `0`).
   A literal, a constructor and an operator over literals do here since [#6943](https://github.com/rust-works/succinctly/issues/6943), in a pipe and in `--eval-all`'s list (see "A pipe's empty context list" below).
@@ -1921,9 +1937,10 @@ validate:
   good value wins, and a later file is never read. `--eval-all`, `--slurp` and `--inplace` read every
   value of a stream and fail before printing or writing anything when one is bad, as yq's do (they
   used to read the first value and drop the rest silently). The error *text* is succinctly's own, as
-  for every other `-p json` parse error. One gap remains: the index addresses the rewritten
-  `v1\n---\nv2` text, so a byte offset, `line` or `column` of a streamed value counts the inserted
-  separators.
+  for every other `-p json` parse error.
+  One gap remains, and it is in succinctly's own position navigation, not in yq's surface: the index addresses the rewritten `v1\n---\nv2` text, so `at_offset` and `at_position` over a streamed value count the inserted separators ([#2839](https://github.com/rust-works/succinctly/issues/2839)).
+  Over `{"a":1}` / `{"b":` / `  2}` the second value starts at byte 8 and on line 2, and it is found by `at_offset(12)` and `at_position(3; 1)` here.
+  `line` and `column` answer `0` for every `-p json` value, as yq's do, so they are not affected.
 - `?` (the explicit-key indicator), in *both* the block-context and flow-mapping (`{? "a":
   1}`) spellings — a structural rejection of the marker itself, not a key-grammar check, so
   it stays in scope even though mapping-key *text* grammar (#2777) does not.
@@ -4438,6 +4455,7 @@ Every row of the issue is pinned against yq v4.53.3 in `tests/yq_cli/i5863.rs`, 
   jq mode keeps jq's `number (1.5) and null (null) cannot be added`.
   The text yq writes in parentheses after a tag is the operand's path in its document, as `path` answers it with its segments joined by `.` and none quoted (`.nest.a + .f` is `!!float (f) cannot be added to a !!map (nest.a)`, `.seq[1] + .f` says `(seq[1])`, and the root says `()`).
   It is `()` here whenever the operand is a container or the other operand of a container (`+`, `-`, `/`, `%`): the path is only computed on the path-context route, which an arithmetic stage does not take, so `.f + .l` is `!!seq () cannot be added to a !!float ()` where yq says `!!seq (l) ... !!float (f)`.
+  Putting every arithmetic stage on that route would charge every `+` for a string only an error prints, and re-evaluating an operand on error needs the context path the plain route does not keep, so this is recorded rather than fixed ([#6930](https://github.com/rust-works/succinctly/issues/6930)).
   The path carries through a pipe in yq (`.nest | .a + 1.5` says `(nest.a)`), and a value built by the filter has its own (`{"z": .m} | .z + 1.5` says `(z)`).
   A literal operand has no path in yq either, so those rows agree exactly.
   Only the message differs; the error and the exit status are the same.
@@ -5884,7 +5902,11 @@ ruled out), even though real yq supports every one of them:
   collection value (`a: !!seq [1, 2]`) on the streaming route; `-P` keeps a core tag on a
   container it does not restate (`!!str []`, `!!seq {}`). Still not matched: a core `!!null`
   on a container (`a: !!null [1]`) is dropped by `-P` and kept by the default route, where yq
-  turns the value into `null` on both ([#4111](https://github.com/rust-works/succinctly/issues/4111)). A key's tag
+  turns the value into `null` on both ([#4111](https://github.com/rust-works/succinctly/issues/4111)).
+  Evaluation differs the same way: such a container is read as the container here and as `null` in yq, so over `a: !!null [1]` and `c: !!null {x: 1}` `.a | length` is `0` in yq and `1` here, `.c | keys` is `cannot get keys of !!null` in yq and `- x` here, and `.c.x` is `null` in yq and `1` here.
+  Matching yq needs the same rule in every place that decides on its own whether a node is a container (`DocumentCursor::value()`, `stream_json_value`, the streaming printers, the YAML and `-P` emitters and the owned materializer): a probe of 38 filters over six such shapes found 90 of 114 rows different, writes and output included.
+  A `!!null` tag on a collection is almost always a typo, so this is recorded rather than fixed (#4111).
+  A key's tag
   is kept when a write copies its mapping from a plain path (`.a = .b` over a tagged key in `.b`),
   and lost when the right-hand side is constructed or bound (`.a = [.b]`, `. as $x | .a = $x.b`,
   [#5249](https://github.com/rust-works/succinctly/issues/5249)).
