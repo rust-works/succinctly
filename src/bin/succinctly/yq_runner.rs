@@ -4546,6 +4546,60 @@ fn reconcile_presentation(
     reconcile_presentation_at_depth(pristine_value, pristine_tree, result_value, &relative, 0)
 }
 
+/// The top-level stages of `expr` when a later one writes at or below a path an earlier one wrote
+/// (`.a = 5 | .a = [9]`, #7231), which [`reconcile_presentation`] cannot see from the document and
+/// the final value alone: yq writes each stage onto the node the stage before left, and a node an
+/// earlier write turned into a scalar, a collection of another kind or an empty one takes the style
+/// of what the later write brings (`CandidateNode.UpdateFrom`). `None` for any other expression.
+fn chained_write_stages<'e>(expr: &'e Expr, targets: &[WriteTarget]) -> Option<&'e [Expr]> {
+    let Expr::Pipe(stages) = strip_parens(expr) else {
+        return None;
+    };
+    targets
+        .iter()
+        .any(|earlier| {
+            targets
+                .iter()
+                .any(|later| later.stage > earlier.stage && later.path.starts_with(&earlier.path))
+        })
+        .then_some(&stages[..])
+}
+
+/// [`reconcile_presentation`] one stage of `stages` at a time, each replayed on the value the stage
+/// before produced (#7231), or `None` when a stage does not replay to exactly one value, its writes
+/// cannot be resolved, or the replay does not end at `result_value` (the caller then reconciles the
+/// whole query at once, as before).
+fn reconcile_presentation_by_stage(
+    pristine_value: &OwnedValue,
+    pristine_tree: &CommentTree,
+    result_value: &OwnedValue,
+    stages: &[Expr],
+) -> Option<CommentTree> {
+    let (value, tree) = replay_write_stages(pristine_value, pristine_tree, stages)?;
+    (value == *result_value).then_some(tree)
+}
+
+/// The document and its reconciled tree after `stages`, each replayed on what the stage before
+/// left (#7231), or `None` when a stage does not replay to exactly one value or its writes cannot
+/// be resolved.
+fn replay_write_stages(
+    pristine_value: &OwnedValue,
+    pristine_tree: &CommentTree,
+    stages: &[Expr],
+) -> Option<(OwnedValue, CommentTree)> {
+    let mut value = pristine_value.clone();
+    let mut tree = pristine_tree.clone();
+    for stage in stages {
+        let targets = collect_write_targets(stage)?;
+        let [next] = <[OwnedValue; 1]>::try_from(evaluate_input_quiet(&value, stage)?).ok()?;
+        if !targets.is_empty() || next != value {
+            tree = reconcile_presentation(&value, &tree, &next, &targets);
+        }
+        value = next;
+    }
+    Some((value, tree))
+}
+
 /// Whether a plain `=` chain in `expr` has a stage whose right side is not a closed literal
 /// (#6880): `propagate_assign_copied_presentation` and `propagate_assign_spellings` then read the
 /// source node's subtree of the tree by path and shape (`.c = .a`, `.c = (.a // 0)`), so a
@@ -6190,12 +6244,15 @@ fn propagate_assign_copied_presentation(
     if !is_plain_assign_chain(expr) {
         return;
     }
+    // #7231: a target an earlier stage wrote is judged by what that stage left, not by the
+    // pristine document (`.c = "s" | .c = .b` copies `b`'s flow style onto the scalar).
+    let write_targets = collect_write_targets(expr).unwrap_or_default();
     // A plain assign chain always collects.
-    for (stage, (path_expr, value_expr)) in collect_assign_chain(expr)
-        .unwrap_or_default()
-        .into_iter()
-        .enumerate()
-    {
+    let chain = collect_assign_chain(expr).unwrap_or_default();
+    // Only while its stages are the pipe's own, one write each, so a stage's index names both.
+    let chained =
+        chained_write_stages(expr, &write_targets).filter(|stages| stages.len() == chain.len());
+    for (stage, (path_expr, value_expr)) in chain.into_iter().enumerate() {
         // A negative index (`.a[-1] = .a[0]`) names the node counted from the end of the array
         // as the write found it, which only the first stage's pristine document says; a later
         // stage may have changed the length (#5407).
@@ -6226,6 +6283,20 @@ fn propagate_assign_copied_presentation(
         else {
             continue;
         };
+        // The document as the stages before this one left it, when one of them wrote at or above
+        // this stage's target (#7231).
+        let earlier_wrote = write_targets.iter().any(|earlier| {
+            earlier.stage < stage
+                && write_targets
+                    .iter()
+                    .any(|t| t.stage == stage && t.path.starts_with(&earlier.path))
+        });
+        let before = chained
+            .filter(|_| earlier_wrote)
+            .and_then(|stages| replay_write_stages(pristine_value, pristine, &stages[..stage]));
+        let (before_value, before_tree) = before
+            .as_ref()
+            .map_or((pristine_value, pristine), |(value, tree)| (value, tree));
         for path_steps in targets {
             if let Some(target) = comment_tree_at_path_or_create_mut(tree, &path_steps) {
                 let mut copy = source.clone();
@@ -6237,8 +6308,8 @@ fn propagate_assign_copied_presentation(
                 // What the target was before the write decides it, not the tree, which the write
                 // has already grown to the new value's shape. An alias target is no container of
                 // its own kind: the write turns it into one.
-                let old = comment_tree_at_path(pristine, &path_steps)
-                    .zip(owned_value_at(pristine_value, &meta_path_of(&path_steps)));
+                let old = comment_tree_at_path(before_tree, &path_steps)
+                    .zip(owned_value_at(before_value, &meta_path_of(&path_steps)));
                 if matches!(copy, CommentTree::Leaf(_)) {
                     meta = copied_scalar_presentation(meta, &source, read, old);
                 } else {
@@ -9354,12 +9425,21 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
     // - but if it came from a shape-preserving write, `presentation_sync_ctx`
     // lets it recover whatever the write didn't touch instead of falling
     // back to genuinely empty (#739).
+    // #7231: a chain that writes one node twice is reconciled a stage at a time.
+    let chained_stages = chained_write_stages(expr, &write_targets);
     let no_comments = |v: OwnedValue| {
-        let comments = presentation_sync_ctx
-            .as_ref()
-            .map_or_else(CommentTree::empty, |(pristine, tree)| {
-                reconcile_presentation(pristine, tree, &v, &write_targets)
-            });
+        let comments =
+            presentation_sync_ctx
+                .as_ref()
+                .map_or_else(CommentTree::empty, |(pristine, tree)| {
+                    chained_stages
+                        .and_then(|stages| {
+                            reconcile_presentation_by_stage(pristine, tree, &v, stages)
+                        })
+                        .unwrap_or_else(|| {
+                            reconcile_presentation(pristine, tree, &v, &write_targets)
+                        })
+                });
         (v, comments)
     };
     // `to_owned_with_comments` builds a full parallel `IndexMap`/`Vec` tree
