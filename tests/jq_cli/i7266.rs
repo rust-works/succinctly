@@ -85,9 +85,9 @@ fn what_a_window_of_the_probe_cuts_reads_as_the_whole_stream_does_7266() -> Resu
         let inside_pad = start + base[n].len() - 5;
         lossy.splice(inside_pad..inside_pad, *b"\xff\xfe");
         let m = n + 3;
-        // Past the two bytes put in above.
-        let start = join(&base[..m]).len() + 2;
-        lossy.splice(start + 1..start + 1, *b"\"q\":[1 2],");
+        // Past the two bytes put in above, and the `{` that opens the record.
+        let after_brace = join(&base[..m]).len() + 2 + 1;
+        lossy.splice(after_brace..after_brace, *b"\"q\":[1 2],");
         lossy.extend_from_slice(b"{\"id\":");
         // A document over several lines across the block's end.
         let mut pretty = base.clone();
