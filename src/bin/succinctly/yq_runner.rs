@@ -8023,6 +8023,13 @@ fn apply_meta_assign_writes(
                 if line.is_some() && !defers_to_own_block(node_value, node) {
                     node.meta_mut().comment.clone_from(line);
                 }
+            } else if head.is_some() {
+                // The head written is not printed, but it still replaces the document's header: yq's
+                // `# a` / `---` / `5` with `. head_comment = "x"` is `5` (#7099).
+                let meta = node.meta();
+                *node.meta_mut() = meta
+                    .with_head_foot(Vec::new(), meta.foot_comment().to_vec())
+                    .with_preamble(None);
             }
             continue;
         }

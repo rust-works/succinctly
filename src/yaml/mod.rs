@@ -99,6 +99,19 @@ pub(crate) fn is_seq_indicator_next(next: Option<u8>) -> bool {
     matches!(next, Some(b' ' | b'\t' | b'\n' | b'\r') | None)
 }
 
+pub(crate) use light::is_blank_line;
+
+/// Whether a header line (without its line break) is a `%YAML` directive indented by blanks, which yq's header slurp
+/// keeps and go-yaml then reads as a comment: yq prints it as `# ` and the line (#6408). The one definition for the
+/// streaming header, the DOM route's preamble and its rebuilt head (#7099).
+pub(crate) fn is_indented_yq_directive_line(line: &[u8]) -> bool {
+    let indent = line
+        .iter()
+        .take_while(|&&b| b == b' ' || b == b'\t')
+        .count();
+    indent > 0 && parser::starts_yq_yaml_directive(&line[indent..])
+}
+
 /// Does `text` at `pos` begin with the block sequence-entry indicator?
 ///
 /// A `-` followed by anything outside [`is_seq_indicator_next`] (`-1`, `-`, `[-]`) starts
