@@ -99,6 +99,8 @@ pub(crate) fn is_seq_indicator_next(next: Option<u8>) -> bool {
     matches!(next, Some(b' ' | b'\t' | b'\n' | b'\r') | None)
 }
 
+pub(crate) use light::is_blank_line;
+
 /// Whether a header line (without its line break) is a `%YAML` directive indented by blanks, which yq's header slurp
 /// keeps and go-yaml then reads as a comment: yq prints it as `# ` and the line (#6408). The one definition for the
 /// streaming header, the DOM route's preamble and its rebuilt head (#7099).

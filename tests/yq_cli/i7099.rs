@@ -204,6 +204,34 @@ const EMPTY_ROOT: &[Row] = &[
     ),
 ];
 
+const PROPERTIES: &[Row] = &[
+    (
+        "%YAML 1.2\n---\n!!str 5\n",
+        &[],
+        ". = 6",
+        "%YAML 1.2\n---\n6\n",
+    ),
+    ("---\n!!str 5\n", &[], ". = 6", "---\n6\n"),
+    (
+        "%YAML 1.2\n# a\n&x {}\n",
+        &[],
+        ".x = 9",
+        "%YAML 1.2\n# a\n&x\nx: 9\n",
+    ),
+    (
+        "# p\n---\n&a !t\nk: v\n",
+        &[],
+        ".k = 1",
+        "# p\n---\n&a !t\nk: 1\n",
+    ),
+    (
+        "%YAML 1.2\n%TAG ! tag:e.com,2000:\n---\na: 1\n",
+        &[],
+        ".a = 2",
+        "%YAML 1.2\na: 2\n",
+    ),
+];
+
 const SCALAR_HEAD_WRITE: &[Row] = &[
     ("---\n# a\n5\n", &[], r#". head_comment = "x""#, "5\n"),
     ("---\n# a\n5\n", &[], r#". head_comment |= "x""#, "5\n"),
@@ -244,6 +272,11 @@ fn test_an_indented_or_blank_header_line_is_printed_as_yq_prints_it_7099() -> Re
 #[test]
 fn test_the_comment_after_the_marker_stays_over_an_empty_root_7099() -> Result<()> {
     check(EMPTY_ROOT)
+}
+
+#[test]
+fn test_a_tag_or_anchor_on_the_root_keeps_the_header_7099() -> Result<()> {
+    check(PROPERTIES)
 }
 
 #[test]

@@ -9401,11 +9401,12 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
             // #6401: a header line of only blanks is a comment to yq, and the comment index does not hold it.
             || (self.is_first_document_content() && {
                 let header_end = self.header_end();
+                let header = &self.text[..header_end];
                 header_end > 0
                     && header_is_rebuilt_from_text(
-                        &self.text[..header_end],
+                        header,
                         self.index.synthesized_empty(),
-                        HeadIndent::Kept,
+                        HeadIndent::of(header),
                     )
             })
     }
@@ -9451,10 +9452,16 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
             .iter()
             .rposition(|&b| b == b'\n')
             .map_or(0, |i| i + 1);
-        if !before[line_start..].iter().all(|&b| b == b' ') {
+        // A tag or an anchor in front of the content (`!!str 5`, `&x {}`) is the node's, and leaves the header as it
+        // is (#7099).
+        if !before[line_start..]
+            .split(|&b| b == b' ' || b == b'\t')
+            .all(|token| token.is_empty() || token.starts_with(b"!") || token.starts_with(b"&"))
+        {
             return None;
         }
-        let preamble = core::str::from_utf8(&before[..line_start]).ok()?;
+        // The header ends before a line of properties alone (`!!map` over its entries), which is the node's too.
+        let preamble = core::str::from_utf8(&before[..line_start.min(self.header_end())]).ok()?;
         let mut directive_seen = false;
         for line in preamble.split_inclusive('\n') {
             let bare = line.trim_end_matches(['\n', '\r']);
@@ -9591,17 +9598,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
         };
         let ranges = &ranges[ranges.partition_point(|&(start, _)| (start as usize) < head_start)..];
         if in_header {
-            // After a marker the head is the first node's, which moves with it (#7099).
-            let indent = if head_start > 0 {
-                HeadIndent::Trimmed
-            } else {
-                HeadIndent::Kept
-            };
             if let Some(lines) = header_head_lines(
                 &self.text[head_start..header_end],
                 self.index.synthesized_empty(),
                 false,
-                indent,
+                HeadIndent::of(&self.text[..header_end]),
             ) {
                 return lines;
             }
@@ -11430,8 +11431,9 @@ fn is_indented_bare_marker(line: &[u8]) -> bool {
 }
 
 /// Whether `line` (without its break) is non-empty and holds only blanks: the header line go-yaml reads as the
-/// comment `# ` plus the line (#6401).
-fn is_blank_line(line: &[u8]) -> bool {
+/// comment `# ` plus the line (#6401). The one definition for the streaming header, the DOM route's preamble and its
+/// rebuilt head (#7099).
+pub(crate) fn is_blank_line(line: &[u8]) -> bool {
     !line.is_empty() && line.iter().all(|&b| b == b' ' || b == b'\t')
 }
 
@@ -11480,6 +11482,18 @@ enum HeadIndent {
     Trimmed,
 }
 
+impl HeadIndent {
+    /// The rule for a first-document header: [`Self::Trimmed`] when it has a `---`, so the head is the first node's.
+    /// One answer for the head ([`header_head_lines`]) and for the gate that says the document has one.
+    fn of(header: &[u8]) -> Self {
+        if header_head_start(header).is_some() {
+            Self::Trimmed
+        } else {
+            Self::Kept
+        }
+    }
+}
+
 /// Whether the DOM route builds a first document's head from the header's text instead of the comment index
 /// ([`header_head_lines`]): a line of only blanks (#6401), a comment or `%YAML` line indented by blanks when `indent`
 /// keeps it, which yq prints as written where the index holds it from its `#` or `%` (#7099), a CRLF break (#5053), or
@@ -11504,16 +11518,13 @@ fn is_indented_comment_line(line: &[u8]) -> bool {
 
 /// Whether `line`, without its line break, is a bare `---` marker: blanks around it at most (#6859).
 fn is_bare_marker_line(line: &[u8]) -> bool {
-    let blank = |b: &&u8| **b == b' ' || **b == b'\t';
-    let start = line.iter().take_while(blank).count();
-    let end = line.len() - line.iter().rev().take_while(blank).count();
-    start <= end && &line[start..end] == b"---"
+    is_indented_bare_marker(line)
+        || (line.starts_with(b"---") && line[3..].iter().all(|&b| b == b' ' || b == b'\t'))
 }
 
 /// Where the first node's head starts in a first-document header (`header`: the text in front of its content), or
 /// `None` for a header with no `---` line: after the last line that is a marker or, after one, a `%YAML` directive (at
-/// any indent),
-/// and after the empty and blank lines straight after it. What is before is the document's preamble
+/// any indent), and after the empty and blank lines straight after it. What is before is the document's preamble
 /// ([`YamlCursor::document_preamble`]), so no node's head may hold it: a head rebuilt from the whole header printed it
 /// twice, and a `%YAML` line in a head moved into the document with its node, which then could not be read back
 /// (#7099). The one split for the preamble and the head.
