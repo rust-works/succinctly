@@ -46,6 +46,13 @@ Before the state machine runs, SIMD identifies structural characters in parallel
 
 Based on [simdjson](https://arxiv.org/abs/1902.08318) (Langdale & Lemire 2019).
 
+The AVX2 kernel inverts that order (#7299): it steps a compile-time table of the state
+machine (`STEP_TABLE` in [src/json/standard.rs](../../src/json/standard.rs), one load and one
+shift per byte, no branch on the input), then uses `movemask` to pull each 32-byte block's
+IB, BP-open and BP-close bits out of the stored steps, and skips a block that lies wholly
+inside a string. A per-byte branch tree was 1.5-2.6x slower and moved by up to 10% with code
+placement on Zen 4.
+
 ## Interest Bits and BP Encoding
 
 ```
