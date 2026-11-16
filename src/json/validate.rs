@@ -1000,6 +1000,24 @@ pub fn is_valid_number(bytes: &[u8]) -> bool {
     i == bytes.len()
 }
 
+/// [`is_valid_number`]'s answer as the token's text (#7287).
+///
+/// `Some` exactly when the bytes are an RFC 8259 number, borrowed as a `&str` without a second
+/// validation pass. The grammar admits
+/// only ASCII bytes (`-`, `+`, `.`, `e`, `E` and digits), and ASCII is UTF-8, so a number that
+/// passed has nothing left for `str::from_utf8` to check.
+#[must_use]
+#[allow(unsafe_code)] // skips a UTF-8 pass over bytes the number grammar just proved ASCII (#7287)
+pub fn valid_number_str(bytes: &[u8]) -> Option<&str> {
+    if !is_valid_number(bytes) {
+        return None;
+    }
+    debug_assert!(bytes.is_ascii());
+    // SAFETY: `is_valid_number` accepted `bytes`, and every byte its grammar admits is ASCII
+    // (`-`, `+`, `.`, `e`, `E`, `0`-`9`), so `bytes` is valid UTF-8.
+    Some(unsafe { core::str::from_utf8_unchecked(bytes) })
+}
+
 /// Strip a redundant leading zero (`007` -> `7`, `-007` -> `-7`) from a
 /// single, already-isolated number token's integer part.
 ///
@@ -2506,6 +2524,39 @@ mod tests {
         // over-accepting as a single number token.
         for s in ["007", "1.2.3", "1-2", "1.", ".5", "1e", "-", "1e+", ""] {
             assert!(!is_valid_number(s.as_bytes()), "expected invalid: {s:?}");
+        }
+    }
+
+    #[test]
+    fn valid_number_str_is_is_valid_number_as_text() {
+        // #7287: `Some` exactly when `is_valid_number` accepts, and then the same text
+        // `str::from_utf8` reads.
+        for bytes in [
+            &b"0"[..],
+            b"-0",
+            b"1",
+            b"-3.14e10",
+            b"1E+2",
+            b"1e-2",
+            b"0.000000",
+            b"123456789012345678.9",
+            b"007",
+            b"1.2.3",
+            b"1.",
+            b".5",
+            b"+1",
+            b"-",
+            b"",
+            b"1e",
+            b"42x",
+            b"42 ",
+            b"nan",
+            "\u{0663}".as_bytes(),
+            b"\xff",
+            b"1\xff",
+        ] {
+            let expected = is_valid_number(bytes).then(|| core::str::from_utf8(bytes).unwrap());
+            assert_eq!(valid_number_str(bytes), expected, "{bytes:?}");
         }
     }
 
