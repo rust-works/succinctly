@@ -12,9 +12,11 @@
 //!    the pipe; it adds no bytes, so a reader that did see its end of file sees nothing new.
 //! 2. **A blocking open waits forever when the other side never comes.** The old clean-up opened a
 //!    pipe for reading when its writer had not finished, which blocked for good when the writer
-//!    finished in between. Here every open is `O_NONBLOCK`: a writer retries while no reader has the
-//!    pipe (`ENXIO`) and retries a full pipe (`WouldBlock`), checking whether it has been told to
-//!    stop, so dropping a [`Feed`] always ends its writer.
+//!    finished in between. Here the test side never opens a pipe in a way that can block: dropping a
+//!    [`Feed`] opens it for reading with `O_NONBLOCK`, which lets a writer still waiting in its own
+//!    (blocking) open go on and see that it is to stop, and does so until the writer has ended.
+//!    The writer waits in the kernel, not in a polling loop: forty writers polling every half
+//!    millisecond for each of several tests at once took a laptop's load average past 500.
 //! 3. **`Command::output` has no deadline.** [`output`] waits for the child for [`DEADLINE`], then
 //!    kills it and fails with the state of every pipe that fed it.
 
@@ -34,9 +36,6 @@ use anyhow::{bail, Result};
 /// How long a pipe-fed run may take before it is killed and the test fails. A run of these tests takes
 /// well under a second alone and a few seconds on a loaded machine.
 pub const DEADLINE: Duration = Duration::from_secs(60);
-
-/// How often a writer retries an open no reader has answered, or a write into a full pipe.
-const POLL: Duration = Duration::from_micros(500);
 
 /// How often a writer that has written everything hands its reader the end of file again (1).
 pub const KICK: Duration = Duration::from_millis(50);
@@ -58,12 +57,12 @@ pub struct Feed {
 
 impl Feed {
     /// Makes the pipe at `path` (with `mkfifo`) and starts writing `bytes` to its reader.
-    pub fn new(path: PathBuf, bytes: Vec<u8>) -> Feed {
-        Feed::after(path, bytes, Duration::ZERO)
+    pub fn new(path: PathBuf, bytes: Vec<u8>) -> Self {
+        Self::after(path, bytes, Duration::ZERO)
     }
 
     /// As [`Feed::new`], with the writer's first open made only after `delay`.
-    pub fn after(path: PathBuf, bytes: Vec<u8>, delay: Duration) -> Feed {
+    pub fn after(path: PathBuf, bytes: Vec<u8>, delay: Duration) -> Self {
         let made = Command::new("mkfifo")
             .arg(&path)
             .status()
@@ -81,7 +80,7 @@ impl Feed {
                 state.store(end, Ordering::SeqCst);
             })
         };
-        Feed {
+        Self {
             path,
             stop,
             state,
@@ -92,6 +91,11 @@ impl Feed {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// How many times the writer has handed a reader that still held the pipe its end of file again.
+    pub fn kicks(&self) -> u32 {
+        self.kicks.load(Ordering::SeqCst)
     }
 
     /// The pipe's name and how far its writer got.
@@ -117,10 +121,30 @@ impl Feed {
 impl Drop for Feed {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        if let Some(writer) = self.writer.take() {
-            // Every step of the writer is non-blocking and checks `stop`, so this returns at once.
-            let _ = writer.join();
+        let Some(writer) = self.writer.take() else {
+            return;
+        };
+        // A writer whose reader never came waits in its open, and one whose reader left mid-write ends
+        // on its own: a reader opened without blocking ends the wait, and nothing here can block on a
+        // writer that has already gone (2).
+        let start = Instant::now();
+        while !writer.is_finished() {
+            let reader = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&self.path);
+            std::thread::sleep(Duration::from_millis(1));
+            drop(reader);
+            if start.elapsed() > DEADLINE {
+                // Not a panic: this may run while a failed test unwinds.
+                eprintln!(
+                    "the writer of {} did not end; left running",
+                    self.path.display()
+                );
+                return;
+            }
         }
+        let _ = writer.join();
     }
 }
 
@@ -131,36 +155,26 @@ fn open_for_writing(path: &Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
-/// The writer: open once a reader has the pipe, write everything, close, then hand the reader its end
-/// of file again until it lets go. Returns the state it ended in.
+/// The writer: open once a reader has the pipe (a blocking open, which [`Feed`]'s drop can end), write
+/// everything, close, then hand the reader its end of file again until it lets go. Returns the state it
+/// ended in.
 fn feed(path: &Path, bytes: &[u8], stop: &AtomicBool, state: &AtomicU8, kicks: &AtomicU32) -> u8 {
     let mut pipe = loop {
-        if stop.load(Ordering::SeqCst) {
-            return STOPPED;
-        }
-        match open_for_writing(path) {
+        match std::fs::OpenOptions::new().write(true).open(path) {
             Ok(pipe) => break pipe,
-            Err(e) if e.raw_os_error() == Some(libc::ENXIO) => std::thread::sleep(POLL),
             Err(e) if e.kind() == ErrorKind::Interrupted => {}
             // The path is gone, or not a pipe: nothing to feed.
             Err(_) => return STOPPED,
         }
     };
+    if stop.load(Ordering::SeqCst) {
+        // Opened by the drop's reader: the run never came for these bytes.
+        return STOPPED;
+    }
     state.store(WRITING, Ordering::SeqCst);
-    let mut rest = bytes;
-    while !rest.is_empty() {
-        match pipe.write(rest) {
-            Ok(n) => rest = &rest[n..],
-            Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                if stop.load(Ordering::SeqCst) {
-                    return STOPPED;
-                }
-                std::thread::sleep(POLL);
-            }
-            Err(e) if e.kind() == ErrorKind::Interrupted => {}
-            // `EPIPE`: the reader left before the end, which is the run's business.
-            Err(_) => return RELEASED,
-        }
+    if pipe.write_all(bytes).is_err() {
+        // `EPIPE`: the reader left before the end, which is the run's business.
+        return RELEASED;
     }
     drop(pipe);
     state.store(WRITTEN, Ordering::SeqCst);

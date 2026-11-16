@@ -81,7 +81,11 @@ fn a_fifo_path_with_a_byte_order_mark_does_not_hang_7200() -> Result<()> {
     drop(feed);
     let _ = std::fs::remove_dir_all(&dir);
     let out = out?;
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(out.stdout, b"\x1e1\n");
     Ok(())
 }
