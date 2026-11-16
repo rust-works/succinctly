@@ -9092,184 +9092,368 @@ fn retain_truthy_generic<V: DocumentValue, S: EvalSemantics>(
     }
 }
 
-/// What [`push_element_result`] needs to know about a batch without reading its
-/// last 80-byte entry back on every element (#7267 review: that read, done per
-/// element, was most of the extra instructions over a plain push).
-#[derive(Default)]
-struct ElementBatch {
-    /// The kind of the batch's last entry.
-    last: LastEntry,
-    /// The batch's one run sized for every element left has been made.
-    sized_run: bool,
-    /// The batch has been sized for every element left, or no longer can be.
-    sized_batch: bool,
+/// What `fold_pipe_stages`' `ManyCursor` arm collected from its elements (#7267), from
+/// [`collect_element_results`].
+enum ElementResults<V: DocumentValue> {
+    /// Every element yielded one computed value or nothing: the values, in order.
+    Values(Vec<OwnedValue>),
+    /// An element yielded something else: the per-element batch [`collect_entries`] built from
+    /// that element on, behind one leading entry for the values before it.
+    Entries(Vec<GenericResult<V>>),
+    /// An element stopped the fold (an error, a break, a halt, a partial prefix): what the arm
+    /// returns.
+    Stopped(GenericResult<V>),
 }
 
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
-enum LastEntry {
-    #[default]
-    Nothing,
-    /// A plain `Owned`, which a second computed value turns into a run.
-    Owned,
-    /// A `ManyOwned` run this batch made, which computed values extend.
-    Run,
-    /// Anything else: a cursor, a lazy result, an error a lazy object raised.
-    Other,
-}
-
-/// Add one element's result to `fold_pipe_stages`' per-element batch, keeping
-/// what [`flatten_generic_results`] and the all-cursors check would make of the
-/// batch exactly as it was, at about 32 bytes per element instead of 80 for a
-/// stretch of computed values (#7267).
+/// Collect the per-element results of `fold_pipe_stages`' `ManyCursor` arm, in one of two modes
+/// (#7267).
 ///
-/// A value that is already owned cannot fail later, so two or more consecutive
-/// `Owned` results become one `ManyOwned` run rather than one 80-byte
-/// `GenericResult` each: flattening a run yields its values in the same order,
-/// and a run is not a cursor, as none of its values were. A lone `Owned`
-/// between other entries stays as it is, so a batch that alternates computed
-/// values with cursors (`[.[] | .name // "anon"]`) is laid out as it was before
-/// runs existed, and so does an element's own `ManyOwned` (an inner
-/// generator's values), which is already one compact entry. A `None` adds
-/// nothing to either outcome and is not kept. Everything else (a cursor, a lazy
-/// result, an error a lazy object raised) is pushed as it is, still flattened
-/// in its place, so an earlier lazily failing element still wins and the prefix
-/// kept on an error is unchanged.
+/// While every element has yielded one computed value (`Owned`) or nothing, the values go
+/// straight into one vector, allocated for every element left when a second value arrives (not
+/// at the first, so a fold whose computed values alternate with cursors never allocates it):
+/// about 32 bytes per element, where an 80-byte `GenericResult` per element plus the vector the
+/// flatten grew from empty held 112-144. A computed value cannot fail later and a `None` adds
+/// nothing, so a fold that ends in this mode hands the vector on as its result, after giving
+/// back the slack of the elements that yielded nothing ([`release_slack`]).
 ///
-/// What is reserved stays linear in the elements (`remaining` is this element
-/// and every one after it):
-/// - the first run of the batch ([`ElementBatch::sized_run`]) is sized for
-///   every element left, which is exact for a one-value-per-element map such as
-///   `[.[] | floor]`; every later run starts small and doubles; any run that
-///   another kind of entry closes gives back its slack past [`slack_allowed`]
-///   (an eighth of its length, or 16 slots), and so does the flatten's output,
-///   so no vector of values leaves a fold more than about an eighth over its
-///   values, whatever the fold reserved while it ran;
-/// - the batch itself is sized for every element left when its first entry
-///   that is not owned arrives while it holds at most two entries (an
-///   all-cursors walk such as `[.[] | .a]` fills one entry per element, and no
-///   element adds more than one), and not before, since a batch that is one run
-///   needs a single entry.
-///
-/// Inlined into the loop, and `fold_pipe_stages` calls the per-kind halves
-/// straight from its own match (#7267 review): called out of line, moving each
-/// 80-byte result into the call and matching it a second time cost about 70
-/// more instructions per element than the plain push it replaced.
+/// At the first element that yields anything else (a cursor, a lazy result, an inner
+/// generator's `ManyOwned`, a failure), the values so far become one leading entry, shrunk to
+/// fit once, and the rest of the fold is [`collect_entries`] and then [`finish_entries`]: the
+/// per-element batch and flatten as they were before #7267, element by element. The leading
+/// entry flattens to the same values in the same place and is not a cursor, as none of its
+/// values was, so the all-cursors decision, the prefix kept on a failure and "an earlier lazily
+/// failing element wins" are as they were.
 #[inline(always)]
-fn push_element_result<V: DocumentValue>(
-    per_element: &mut Vec<GenericResult<V>>,
-    result: GenericResult<V>,
-    remaining: usize,
-    batch: &mut ElementBatch,
-) {
-    match result {
-        GenericResult::None => {}
-        GenericResult::Owned(o) => push_owned_element(per_element, o, remaining, batch),
-        other => push_other_element(per_element, other, remaining, batch),
+fn collect_element_results<S: EvalSemantics, V: DocumentValue>(
+    mut results: impl ExactSizeIterator<Item = GenericResult<V>>,
+) -> ElementResults<V> {
+    #[cfg(test)]
+    let elements = results.len();
+    let mut values: Vec<OwnedValue> = Vec::new();
+    // The first computed value, until a second one says the vector is worth allocating.
+    let mut lone: Option<OwnedValue> = None;
+    // The first result of another kind, and whether it is already the batch entry (a lazy
+    // object whose building failed, which the batch keeps as it is, as `collect_entries` does).
+    let other = loop {
+        let value = match results.next() {
+            None => break None,
+            Some(GenericResult::None) => continue,
+            Some(GenericResult::Owned(o)) => o,
+            // #4044, as in `collect_entries`: a lazy object is built as it arrives.
+            Some(obj @ GenericResult::LazyObject(_)) => match obj.materialize_lazy::<S>() {
+                GenericResult::Owned(o) => o,
+                failed => break Some((failed, true)),
+            },
+            Some(other) => break Some((other, false)),
+        };
+        if !values.is_empty() {
+            values.push(value);
+        } else if let Some(first) = lone.take() {
+            values = vec_with_capacity(results.len() + 2);
+            values.push(first);
+            values.push(value);
+        } else {
+            lone = Some(value);
+        }
+    };
+    let Some((other, is_entry)) = other else {
+        #[cfg(test)]
+        let reserved = values.capacity();
+        values.extend(lone);
+        release_slack(&mut values);
+        #[cfg(test)]
+        batch_stats_7267::note_fold(batch_stats_7267::Fold::Values {
+            elements,
+            reserved,
+            len: values.len(),
+            capacity: values.capacity(),
+        });
+        return ElementResults::Values(values);
+    };
+    // The values so far, as the one entry they become. Shrunk before the batch is allocated, so
+    // the two are never both at full size.
+    let leading = match lone {
+        Some(only) => Some(GenericResult::Owned(only)),
+        None if values.is_empty() => None,
+        None => {
+            #[cfg(test)]
+            batch_stats_7267::note_copied(values.len());
+            values.shrink_to_fit();
+            Some(GenericResult::ManyOwned(values))
+        }
+    };
+    #[cfg(test)]
+    let leading_run = match &leading {
+        Some(GenericResult::ManyOwned(os)) => Some((os.len(), os.capacity())),
+        _ => None,
+    };
+    // No more entries than main reserved: one per element left, this one and the leading one.
+    let mut per_element = vec_with_capacity(results.len() + 2);
+    per_element.extend(leading);
+    let first = if is_entry {
+        per_element.push(other);
+        None
+    } else {
+        Some(other)
+    };
+    match collect_entries::<S, V>(&mut per_element, first.into_iter().chain(results)) {
+        Some(stopped) => ElementResults::Stopped(stopped),
+        None => {
+            #[cfg(test)]
+            batch_stats_7267::note_entries(
+                elements,
+                leading_run,
+                per_element.capacity(),
+                &per_element,
+            );
+            ElementResults::Entries(per_element)
+        }
     }
 }
 
-/// [`push_element_result`]'s `Owned` arm, which `fold_pipe_stages` calls straight from its
-/// own match so that a result is not matched twice per element (#7267 review).
+/// `fold_pipe_stages`' per-element batch as it was before #7267, from the first element
+/// [`collect_element_results`] could not keep as a computed value: every result is pushed as
+/// its own entry, a lazy object built as it arrives, and an element that stops the fold makes the
+/// batch so far into the prefix it returns. Returns that result when an element stopped the fold,
+/// and `None` when every element was pushed.
 #[inline(always)]
-fn push_owned_element<V: DocumentValue>(
+fn collect_entries<S: EvalSemantics, V: DocumentValue>(
     per_element: &mut Vec<GenericResult<V>>,
-    o: OwnedValue,
-    remaining: usize,
-    batch: &mut ElementBatch,
-) {
-    match batch.last {
-        LastEntry::Run => {
-            let Some(GenericResult::ManyOwned(run)) = per_element.last_mut() else {
-                unreachable!("the last entry is the batch's open run") // patchcov: coverage tolerate-line reason="unreachable: `ElementBatch::last` is `Run` only right after a run was pushed or extended (#7267)"
-            };
-            #[cfg(test)]
-            let before = run.capacity();
-            run.push(o);
-            #[cfg(test)]
-            if run.capacity() != before {
-                batch_stats_7267::note_copied(before);
+    results: impl Iterator<Item = GenericResult<V>>,
+) -> Option<GenericResult<V>> {
+    for result in results {
+        match result {
+            // The elements already piped through no
+            // longer vanish (#400, #494). If an earlier
+            // element's own buffered `LazySeq` also fails
+            // once `flatten_generic_results` materializes
+            // it, that earlier failure wins -- it's
+            // chronologically first in evaluation order.
+            GenericResult::Error(e) => {
+                return Some(
+                    match flatten_generic_results::<_, S>(core::mem::take(per_element)) {
+                        Ok(prefix) => partial_generic(prefix, Control::Error(e)),
+                        Err(Control::Error(earlier)) => GenericResult::Error(earlier),
+                        Err(Control::Break(label)) => GenericResult::Break(label),
+                        Err(Control::Halt(code)) => GenericResult::Halt(code),
+                    },
+                );
+            }
+            GenericResult::Break(label) => {
+                return Some(
+                    match flatten_generic_results::<_, S>(core::mem::take(per_element)) {
+                        Ok(prefix) => partial_generic(prefix, Control::Break(label)),
+                        Err(Control::Error(earlier)) => GenericResult::Error(earlier),
+                        Err(Control::Break(earlier_label)) => GenericResult::Break(earlier_label),
+                        Err(Control::Halt(code)) => GenericResult::Halt(code),
+                    },
+                );
+            }
+            // Same immediate-stop treatment as `Error`/`Break`
+            // above — halt is an opaque terminal signal, not
+            // catchable by anything downstream, so this must
+            // not fall through to the `other => ...` wildcard
+            // below (which would keep evaluating later cursor
+            // elements instead of stopping immediately).
+            GenericResult::Halt(code) => {
+                return Some(
+                    match flatten_generic_results::<_, S>(core::mem::take(per_element)) {
+                        Ok(prefix) => partial_generic(prefix, Control::Halt(code)),
+                        Err(Control::Error(earlier)) => GenericResult::Error(earlier),
+                        Err(Control::Break(label)) => GenericResult::Break(label),
+                        Err(Control::Halt(earlier_code)) => GenericResult::Halt(earlier_code),
+                    },
+                );
+            }
+            GenericResult::Partial(vs, control) => {
+                return Some(
+                    match flatten_generic_results::<_, S>(core::mem::take(per_element)) {
+                        Ok(mut prefix) => {
+                            prefix.extend(vs);
+                            partial_generic(prefix, control)
+                        }
+                        Err(Control::Error(earlier)) => GenericResult::Error(earlier),
+                        Err(Control::Break(label)) => GenericResult::Break(label),
+                        Err(Control::Halt(code)) => GenericResult::Halt(code),
+                    },
+                );
+            }
+            // #4044: collected, an object is read in full anyway, so it
+            // is built as it arrives rather than held lazily until
+            // the flatten (N live boxes and entry buffers).
+            obj @ GenericResult::LazyObject(_) => {
+                per_element.push(obj.materialize_lazy::<S>());
+            }
+            other => per_element.push(other),
+        }
+    }
+    None
+}
+
+/// What `fold_pipe_stages`' `ManyCursor` arm returns for a batch [`collect_entries`] built, as
+/// before #7267: when every element's result is cursor-backed or empty, the cursors in order, so
+/// that a further stage can still resolve a position; otherwise the flattened values.
+#[inline(always)]
+fn finish_entries<S: EvalSemantics, V: DocumentValue>(
+    per_element: Vec<GenericResult<V>>,
+) -> GenericResult<V> {
+    let all_cursor_or_empty = per_element.iter().all(|r| {
+        matches!(
+            r,
+            GenericResult::OneCursor(_) | GenericResult::ManyCursor(_) | GenericResult::None
+        )
+    });
+
+    if all_cursor_or_empty {
+        let mut cursors = vec_with_capacity(per_element.len());
+        for r in per_element {
+            match r {
+                GenericResult::OneCursor(c) => cursors.push(c),
+                GenericResult::ManyCursor(cs) => cursors.extend(cs),
+                GenericResult::None => {}
+                _ => unreachable!("checked all_cursor_or_empty above"),
             }
         }
-        LastEntry::Owned => {
-            let Some(GenericResult::Owned(previous)) = per_element.pop() else {
-                unreachable!("the last entry is a plain `Owned`")
-            };
-            let mut run = if batch.sized_run {
-                Vec::new()
-            } else {
-                batch.sized_run = true;
-                vec_with_capacity(remaining + 1)
-            };
-            run.push(previous);
-            run.push(o);
-            per_element.push(GenericResult::ManyOwned(run));
-            batch.last = LastEntry::Run;
+        if cursors.is_empty() {
+            GenericResult::None
+        } else {
+            GenericResult::ManyCursor(cursors)
         }
-        LastEntry::Nothing | LastEntry::Other => {
-            per_element.push(GenericResult::Owned(o));
-            batch.last = LastEntry::Owned;
+    } else {
+        match flatten_generic_results::<_, S>(per_element) {
+            Ok(results) if results.is_empty() => GenericResult::None,
+            Ok(results) => {
+                #[cfg(test)]
+                batch_stats_7267::note_output(results.len(), results.capacity());
+                GenericResult::ManyOwned(results)
+            }
+            Err(Control::Error(e)) => GenericResult::Error(e),
+            Err(Control::Break(label)) => GenericResult::Break(label),
+            Err(Control::Halt(code)) => GenericResult::Halt(code),
         }
     }
 }
 
-/// [`push_element_result`]'s arm for every result but an empty or a single owned one. A
-/// `ManyOwned` (an inner generator's values, `.[] | (.[] | f)`) is kept as the entry it
-/// already is rather than copied into a run, as it was before runs existed (#7267 review:
-/// copying it in and growing the run cost 12% on that shape).
-#[inline(always)]
-fn push_other_element<V: DocumentValue>(
-    per_element: &mut Vec<GenericResult<V>>,
-    other: GenericResult<V>,
-    remaining: usize,
-    batch: &mut ElementBatch,
-) {
-    if batch.last == LastEntry::Run {
-        let Some(GenericResult::ManyOwned(run)) = per_element.last_mut() else {
-            unreachable!("the last entry is the batch's open run") // patchcov: coverage tolerate-line reason="unreachable: `ElementBatch::last` is `Run` only right after a run was pushed or extended (#7267)"
-        };
-        // A closed run is never extended again: give back the sized run's unused
-        // tail, or what doubling left.
-        release_slack(run);
+/// The slack a fold's vector of computed values may keep when it is handed on: an eighth of its
+/// length, or 16 slots for a short one (#7267). The vector is allocated for every element left,
+/// so a fold whose elements then yield nothing would otherwise hand on, and an enclosing fold
+/// keep, room for values that never came.
+const fn slack_allowed(len: usize) -> usize {
+    let eighth = len / 8;
+    if eighth > 16 {
+        eighth
+    } else {
+        16
     }
-    if !batch.sized_batch {
-        batch.sized_batch = true;
-        if per_element.len() <= 2 {
-            let mut sized = vec_with_capacity(per_element.len() + remaining);
-            sized.append(per_element);
-            *per_element = sized;
-        }
+}
+
+/// Give back `v`'s capacity past [`slack_allowed`] (#7267).
+#[inline]
+fn release_slack(v: &mut Vec<OwnedValue>) {
+    if v.capacity() - v.len() > slack_allowed(v.len()) {
+        #[cfg(test)]
+        batch_stats_7267::note_copied(v.len());
+        v.shrink_to_fit();
     }
-    per_element.push(other);
-    batch.last = LastEntry::Other;
+}
+
+/// Test-only accounting for [`collect_element_results`] (#7267): what each fold reserved and
+/// handed on, and how many values its own reallocations copied.
+#[cfg(test)]
+mod batch_stats_7267 {
+    use super::{DocumentValue, GenericResult};
+    use core::cell::RefCell;
+
+    /// One fold's collection.
+    #[derive(Clone, Debug)]
+    pub(super) enum Fold {
+        /// It ended with every element computed or empty.
+        Values {
+            /// The elements it iterated.
+            elements: usize,
+            /// The capacity of its vector of values before the slack was given back.
+            reserved: usize,
+            /// The vector it handed on.
+            len: usize,
+            capacity: usize,
+        },
+        /// It moved to the per-element batch.
+        Entries {
+            elements: usize,
+            /// The batch's capacity.
+            batch: usize,
+            /// `(len, capacity)` of the batch's leading entry, if it is a vector of values.
+            leading: Option<(usize, usize)>,
+            /// `(len, capacity)` of every other vector of values the batch holds.
+            runs: Vec<(usize, usize)>,
+        },
+    }
+
+    #[derive(Default, Clone, Debug)]
+    pub(super) struct Stats {
+        /// Every fold, innermost first.
+        pub(super) folds: Vec<Fold>,
+        /// `(len, capacity)` of every vector the per-element batch's flatten handed on.
+        pub(super) outputs: Vec<(usize, usize)>,
+        /// Values copied by a shrink of the fold's own vector of values.
+        pub(super) copied: usize,
+    }
+
+    std::thread_local! {
+        static STATS: RefCell<Stats> = RefCell::new(Stats::default());
+    }
+
+    pub(super) fn note_copied(values: usize) {
+        STATS.with(|s| s.borrow_mut().copied += values);
+    }
+
+    pub(super) fn note_fold(fold: Fold) {
+        STATS.with(|s| s.borrow_mut().folds.push(fold));
+    }
+
+    pub(super) fn note_entries<V: DocumentValue>(
+        elements: usize,
+        leading: Option<(usize, usize)>,
+        capacity: usize,
+        batch: &[GenericResult<V>],
+    ) {
+        let runs = batch
+            .iter()
+            .skip(usize::from(leading.is_some()))
+            .filter_map(|r| match r {
+                GenericResult::ManyOwned(os) => Some((os.len(), os.capacity())),
+                _ => None,
+            })
+            .collect();
+        note_fold(Fold::Entries {
+            elements,
+            batch: capacity,
+            leading,
+            runs,
+        });
+    }
+
+    pub(super) fn note_output(len: usize, capacity: usize) {
+        STATS.with(|s| s.borrow_mut().outputs.push((len, capacity)));
+    }
+
+    pub(super) fn take() -> Stats {
+        STATS.with(|s| core::mem::take(&mut *s.borrow_mut()))
+    }
 }
 
 #[cfg(test)]
 mod per_element_batch_tests_7267 {
+    use super::batch_stats_7267::Fold;
     use super::*;
     use crate::jq::parse;
     use crate::json::light::{JsonIndex, StandardJson};
 
-    type Batch<'a> = Vec<GenericResult<StandardJson<'a, Vec<u64>>>>;
+    type Doc<'a> = StandardJson<'a, Vec<u64>>;
+    type Cursor<'a> = <Doc<'a> as DocumentValue>::Cursor;
 
-    /// What a batch reserves for its values: the 80-byte entries plus every run's buffer.
-    fn reserved_bytes(batch: &Batch<'_>) -> usize {
-        let runs: usize = batch
-            .iter()
-            .map(|r| match r {
-                GenericResult::ManyOwned(run) => run.capacity(),
-                _ => 0,
-            })
-            .sum();
-        batch.capacity() * core::mem::size_of::<GenericResult<StandardJson<'_, Vec<u64>>>>()
-            + runs * core::mem::size_of::<OwnedValue>()
-    }
-
-    fn owned(i: usize) -> GenericResult<StandardJson<'static, Vec<u64>>> {
-        GenericResult::Owned(OwnedValue::Int(i as i64))
-    }
-
-    /// `n` cursors into a document of `n` small arrays, for the non-owned entries.
-    fn cursors(json: &[u8]) -> Vec<<StandardJson<'_, Vec<u64>> as DocumentValue>::Cursor> {
+    /// The cursors of a test document's elements.
+    fn cursors(json: &'static [u8]) -> Vec<Cursor<'static>> {
         // The index has to outlive the cursors, so it is leaked: a test-only document.
         let index: &'static JsonIndex = Box::leak(Box::new(JsonIndex::build(json)));
         let root = index.root(json);
@@ -9281,141 +9465,234 @@ mod per_element_batch_tests_7267 {
         cs
     }
 
-    /// A one-value-per-element map fills one run, allocated once at its final size, and the
-    /// flatten hands that same buffer on instead of copying it.
-    #[test]
-    fn owned_results_fill_one_run_that_the_flatten_keeps_7267() {
-        let mut batch: Batch<'_> = Vec::new();
-        let mut sized = ElementBatch::default();
-        for i in 0..1000 {
-            push_element_result(&mut batch, owned(i), 1000 - i, &mut sized);
-        }
-        assert_eq!(batch.len(), 1);
-        let GenericResult::ManyOwned(run) = &batch[0] else {
-            panic!("expected one run, got {:?}", batch[0]) // patchcov: coverage tolerate-line reason="the failure message of the assertion above, unreachable in a passing suite (#7267)"
-        };
-        assert_eq!((run.len(), run.capacity()), (1000, 1000));
-        let buffer = run.as_ptr();
-        let flat = flatten_generic_results::<_, JqSemantics>(batch).unwrap();
-        assert_eq!(flat.as_ptr(), buffer);
-        assert_eq!(flat, (0..1000).map(OwnedValue::Int).collect::<Vec<_>>());
+    /// One element's result, as a recipe: results are not `Clone`, and each test builds the same
+    /// sequence twice.
+    #[derive(Clone, Copy, Debug)]
+    enum Kind {
+        Nothing,
+        Value(i64),
+        Cursor(usize),
+        /// An inner generator's computed values.
+        Values(usize),
+        /// An inner generator's cursors.
+        Cursors(usize),
+        Fail,
     }
 
-    /// The batch's one run sized for every element left is shrunk when a cursor ends it with
-    /// most of it unused, and the next run starts small: one run that reserves the rest of the
-    /// batch, not one per run.
-    #[test]
-    fn a_cursor_shrinks_the_sized_run_and_the_next_run_starts_small_7267() {
-        let cs = cursors(b"[[0],[1]]");
-        let mut batch: Batch<'_> = Vec::new();
-        let mut sized = ElementBatch::default();
-        push_element_result(&mut batch, owned(0), 1000, &mut sized);
-        push_element_result(&mut batch, owned(1), 999, &mut sized);
-        assert!(matches!(&batch[0], GenericResult::ManyOwned(run) if run.capacity() == 1000));
-        push_element_result(&mut batch, GenericResult::OneCursor(cs[0]), 998, &mut sized);
-        assert!(matches!(&batch[0], GenericResult::ManyOwned(run) if run.capacity() == 2));
-        push_element_result(&mut batch, owned(3), 997, &mut sized);
-        push_element_result(&mut batch, owned(4), 996, &mut sized);
-        assert!(
-            matches!(&batch[2], GenericResult::ManyOwned(run) if run.len() == 2 && run.capacity() < 997)
-        );
-        // The batch was sized for every element left when the cursor arrived, and never grew.
-        assert!(batch.capacity() >= 999);
-    }
-
-    /// Computed values alternating with cursors, in runs of one, two and three, reserve a
-    /// linear number of bytes. Sizing each new run for every element left (the first version
-    /// of #7267) reserved a quadratic number: about 40 KB per run at 1,000 elements left.
-    #[test]
-    fn mixed_kinds_reserve_linearly_7267() {
-        let n = 6000;
-        let doc = format!("[{}]", vec!["[0]"; n].join(","));
-        let cs = cursors(Box::leak(doc.into_bytes().into_boxed_slice()));
-        for stretch in 1..=3 {
-            let mut batch: Batch<'_> = Vec::new();
-            let mut sized = ElementBatch::default();
-            for (i, c) in cs.iter().enumerate() {
-                let result = if i % (stretch + 1) == stretch {
-                    GenericResult::OneCursor(*c)
-                } else {
-                    owned(i)
-                };
-                push_element_result(&mut batch, result, n - i, &mut sized);
-                // Only the batch's first run may be sized ahead of its values.
-                let ahead = batch
-                    .iter()
-                    .filter(|r| matches!(r, GenericResult::ManyOwned(run) if run.capacity() > 2 * run.len() + 4))
-                    .count();
-                assert!(
-                    ahead <= 1,
-                    "stretch {stretch}, element {i}: {ahead} runs sized ahead"
-                );
-                assert!(reserved_bytes(&batch) <= n * (80 + 2 * 32) + 4096 + n * 32);
+    fn build(kind: Kind, cs: &[Cursor<'static>]) -> GenericResult<Doc<'static>> {
+        match kind {
+            Kind::Nothing => GenericResult::None,
+            Kind::Value(i) => GenericResult::Owned(OwnedValue::Int(i)),
+            Kind::Cursor(i) => GenericResult::OneCursor(cs[i % cs.len()]),
+            Kind::Values(n) => {
+                GenericResult::ManyOwned((0..n as i64).map(OwnedValue::Int).collect())
             }
-            let bound = n * (80 + 2 * 32) + 4096;
-            assert!(
-                reserved_bytes(&batch) <= bound,
-                "stretch {stretch}: {} > {bound}",
-                reserved_bytes(&batch)
-            );
-            let flat = flatten_generic_results::<_, JqSemantics>(batch).unwrap();
-            assert_eq!(flat.len(), n);
-            assert!(
-                (0..n)
-                    .all(|i| (i % (stretch + 1) == stretch)
-                        == matches!(flat[i], OwnedValue::Array(_)))
-            );
+            Kind::Cursors(n) => GenericResult::ManyCursor(cs[..n % cs.len()].to_vec()),
+            Kind::Fail => GenericResult::Error(EvalError::new("x")),
         }
     }
 
-    /// Runs after the batch's first grow by doubling; a cursor that closes one takes its slack
-    /// back, so closed runs hold no more than an eighth (or 16 slots) over their values. Keeping
-    /// the doubled capacity, as a rule that shrinks only a run under half used does, fails here.
+    fn collect(kinds: &[Kind], cs: &[Cursor<'static>]) -> ElementResults<Doc<'static>> {
+        collect_element_results::<JqSemantics, _>(kinds.iter().map(|k| build(*k, cs)))
+    }
+
+    /// The batch as the fold built it before #7267: [`collect_entries`] from the first element.
+    fn main_batch(
+        kinds: &[Kind],
+        cs: &[Cursor<'static>],
+    ) -> (
+        Vec<GenericResult<Doc<'static>>>,
+        Option<GenericResult<Doc<'static>>>,
+    ) {
+        let mut batch = vec_with_capacity(kinds.len());
+        let stopped = collect_entries::<JqSemantics, _>(
+            &mut batch,
+            None.into_iter().chain(kinds.iter().map(|k| build(*k, cs))),
+        );
+        (batch, stopped)
+    }
+
+    /// After the move to the per-element batch, the fold's entries are exactly the ones the batch
+    /// built from the first element holds from that element on, behind one leading entry for the
+    /// values before it; and the result, a stop included, is the same. Over random sequences of
+    /// every kind of result.
     #[test]
-    fn closed_runs_give_back_doubling_slack_7267() {
-        let n = 20_000;
-        let doc = format!("[{}]", vec!["[0]"; n].join(","));
-        let cs = cursors(Box::leak(doc.into_bytes().into_boxed_slice()));
-        let mut batch: Batch<'_> = Vec::new();
-        let mut state = ElementBatch::default();
-        let mut stretch = 0;
-        let mut owned_values = 0;
-        for (i, c) in cs.iter().enumerate() {
-            let result = if stretch == 0 {
-                stretch = 2 + (i * 37) % 300;
-                GenericResult::OneCursor(*c)
+    fn entries_after_the_move_are_what_main_builds_7267() {
+        use rand::{RngExt, SeedableRng};
+        let cs = cursors(br#"["a",{"b":1},[2,3],4,"e"]"#);
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(7267);
+        let mut moved = 0;
+        for case in 0..3000 {
+            // A long computed stretch first in a share of the cases, then anything.
+            let lead = if rng.random_bool(0.3) {
+                rng.random_range(0..6)
             } else {
-                stretch -= 1;
-                owned_values += 1;
-                owned(i)
+                0
             };
-            push_element_result(&mut batch, result, n - i, &mut state);
-        }
-        let closed = &batch[..batch.len() - 1];
-        let runs = closed
-            .iter()
-            .filter(|r| matches!(r, GenericResult::ManyOwned(_)))
-            .count();
-        assert!(runs > 50, "{runs} closed runs");
-        for entry in closed {
-            if let GenericResult::ManyOwned(run) = entry {
-                let slack = run.capacity() - run.len();
-                assert!(
-                    slack <= (run.len() / 8).max(16),
-                    "{} of {}",
-                    run.len(),
-                    run.capacity()
-                );
+            let len = lead + rng.random_range(0..12);
+            let kinds: Vec<Kind> = (0..len)
+                .map(
+                    |i| match rng.random_range(0..if i < lead { 3 } else { 16 }) {
+                        0 => Kind::Nothing,
+                        1 | 2 => Kind::Value(i as i64),
+                        3..=5 => Kind::Nothing,
+                        6..=8 => Kind::Value(i as i64),
+                        9 | 10 => Kind::Cursor(i),
+                        11 => Kind::Values(i % 4),
+                        12 => Kind::Cursors(i),
+                        13 if rng.random_bool(0.3) => Kind::Fail,
+                        _ => Kind::Value(-(i as i64)),
+                    },
+                )
+                .collect();
+            let (main, main_stopped) = main_batch(&kinds, &cs);
+            let at = kinds
+                .iter()
+                .position(|k| !matches!(k, Kind::Nothing | Kind::Value(_)));
+            match collect(&kinds, &cs) {
+                ElementResults::Values(values) => {
+                    assert!(
+                        at.is_none() && main_stopped.is_none(),
+                        "case {case}: {kinds:?}"
+                    );
+                    let want = finish_entries::<JqSemantics, _>(main);
+                    let got: GenericResult<Doc<'static>> = if values.is_empty() {
+                        GenericResult::None
+                    } else {
+                        GenericResult::ManyOwned(values)
+                    };
+                    assert_eq!(
+                        format!("{got:?}"),
+                        format!("{want:?}"),
+                        "case {case}: {kinds:?}"
+                    );
+                }
+                ElementResults::Entries(entries) => {
+                    let at = at.unwrap();
+                    moved += 1;
+                    assert!(main_stopped.is_none(), "case {case}: {kinds:?}");
+                    let before: Vec<i64> = kinds[..at]
+                        .iter()
+                        .filter_map(|k| match k {
+                            Kind::Value(i) => Some(*i),
+                            _ => None,
+                        })
+                        .collect();
+                    let lead_entries = usize::from(!before.is_empty());
+                    let leading = match before.as_slice() {
+                        [] => String::new(),
+                        [only] => format!("{:?}", build(Kind::Value(*only), &cs)),
+                        many => format!(
+                            "{:?}",
+                            GenericResult::<Doc<'static>>::ManyOwned(
+                                many.iter().copied().map(OwnedValue::Int).collect()
+                            )
+                        ),
+                    };
+                    assert_eq!(
+                        entries[..lead_entries]
+                            .iter()
+                            .map(|e| format!("{e:?}"))
+                            .collect::<String>(),
+                        leading,
+                        "case {case}: {kinds:?}"
+                    );
+                    assert_eq!(
+                        format!("{:?}", &entries[lead_entries..]),
+                        format!("{:?}", &main[at..]),
+                        "case {case}: {kinds:?}"
+                    );
+                    assert!(entries.capacity() <= kinds.len() + 1, "case {case}");
+                    let got = finish_entries::<JqSemantics, _>(entries);
+                    let want = finish_entries::<JqSemantics, _>(main);
+                    assert_eq!(
+                        format!("{got:?}"),
+                        format!("{want:?}"),
+                        "case {case}: {kinds:?}"
+                    );
+                }
+                ElementResults::Stopped(stopped) => {
+                    let want = main_stopped.expect("main stops too");
+                    assert_eq!(
+                        format!("{stopped:?}"),
+                        format!("{want:?}"),
+                        "case {case}: {kinds:?}"
+                    );
+                }
             }
         }
-        let flat = flatten_generic_results::<_, JqSemantics>(batch).unwrap();
-        assert_eq!(flat.len(), n);
-        assert_eq!(
-            flat.iter()
-                .filter(|v| matches!(v, OwnedValue::Int(_)))
-                .count(),
-            owned_values
+        assert!(moved > 1000, "{moved} cases moved to the batch");
+    }
+
+    /// A one-value-per-element map allocates its vector once, at its final size, and hands it on
+    /// without a copy.
+    #[test]
+    fn computed_values_fill_one_vector_of_the_final_size_7267() {
+        let kinds: Vec<Kind> = (0..1000).map(Kind::Value).collect();
+        let _ = batch_stats_7267::take();
+        let ElementResults::Values(values) = collect(&kinds, &[]) else {
+            panic!("expected the values") // patchcov: coverage tolerate-line reason="the failure message of the pattern above, unreachable in a passing suite (#7267)"
+        };
+        assert_eq!((values.len(), values.capacity()), (1000, 1000));
+        assert_eq!(values, (0..1000).map(OwnedValue::Int).collect::<Vec<_>>());
+        assert_eq!(batch_stats_7267::take().copied, 0);
+    }
+
+    /// A computed value followed by a cursor moves to the batch without allocating a vector of
+    /// values; two followed by a cursor become one leading entry shrunk to fit.
+    #[test]
+    fn the_vector_waits_for_a_second_value_and_is_shrunk_when_the_fold_moves_7267() {
+        let cs = cursors(br#"["a","b"]"#);
+        let alternating: Vec<Kind> = (0..100)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Kind::Value(i)
+                } else {
+                    Kind::Cursor(0)
+                }
+            })
+            .collect();
+        let _ = batch_stats_7267::take();
+        let ElementResults::Entries(entries) = collect(&alternating, &cs) else {
+            panic!("expected the batch") // patchcov: coverage tolerate-line reason="the failure message of the pattern above, unreachable in a passing suite (#7267)"
+        };
+        assert!(matches!(
+            entries[0],
+            GenericResult::Owned(OwnedValue::Int(0))
+        ));
+        assert_eq!(entries.len(), 100);
+        let stats = batch_stats_7267::take();
+        assert_eq!(stats.copied, 0);
+        assert!(matches!(
+            stats.folds[..],
+            [Fold::Entries {
+                leading: None,
+                batch: 100,
+                ..
+            }]
+        ));
+
+        let mut two_then_cursor = vec![
+            Kind::Value(1),
+            Kind::Nothing,
+            Kind::Value(2),
+            Kind::Cursor(1),
+        ];
+        two_then_cursor.extend((0..996).map(Kind::Value));
+        let ElementResults::Entries(entries) = collect(&two_then_cursor, &cs) else {
+            panic!("expected the batch") // patchcov: coverage tolerate-line reason="the failure message of the pattern above, unreachable in a passing suite (#7267)"
+        };
+        assert!(
+            matches!(&entries[0], GenericResult::ManyOwned(os) if os.len() == 2 && os.capacity() == 2)
         );
+        assert_eq!(entries.len(), 998);
+        assert!(matches!(
+            batch_stats_7267::take().folds[..],
+            [Fold::Entries {
+                leading: Some((2, 2)),
+                ..
+            }]
+        ));
     }
 
     /// One element of a generated document, and what the leaf filter below makes of it.
@@ -9473,10 +9750,11 @@ mod per_element_batch_tests_7267 {
         }
     }
 
-    /// `n` elements `depth` levels up from the leaves: arrays of arrays down to a leaf level
-    /// that mixes every result kind. A share of leaf arrays keep almost nothing (`k << n`,
-    /// with the kept values sometimes adjacent), the shape that once handed a run sized for
-    /// every element on; the others keep most of their values.
+    /// `n` elements `depth` levels up from the leaves: arrays of arrays down to a leaf level.
+    /// Some leaf arrays hold numbers only and so end in computed values; the others mix every
+    /// result kind and move to the batch. Half of them keep almost nothing (`k << n`, with the
+    /// kept values sometimes adjacent), the shape that once handed on a vector allocated for
+    /// every element; the others keep most of their values.
     fn gen(rng: &mut rand_chacha::ChaCha8Rng, depth: usize, n: usize) -> Vec<Gen> {
         use rand::RngExt;
         if depth > 1 {
@@ -9489,11 +9767,12 @@ mod per_element_batch_tests_7267 {
                 .collect();
         }
         let sparse = rng.random_bool(0.5);
+        let numbers_only = rng.random_bool(0.4);
         (0..n)
             .map(|i| match rng.random_range(0..12) {
                 0 => Gen::Nothing,
-                1 => Gen::Str(format!("s{i}")),
-                2 => Gen::Lazy((0..rng.random_range(0..4)).collect()),
+                1 if !numbers_only => Gen::Str(format!("s{i}")),
+                2 if !numbers_only => Gen::Lazy((0..rng.random_range(0..4)).collect()),
                 _ if sparse && i % 50 > 1 => Gen::Num(5 + i as i64),
                 _ => Gen::Num(rng.random_range(0..2)),
             })
@@ -9501,16 +9780,19 @@ mod per_element_batch_tests_7267 {
     }
 
     /// The invariant, over random mixes of every result kind at nesting depths 1-3: the real
-    /// fold yields the reference's values in its order, every vector a flatten hands on holds
-    /// at most `slack_allowed` over its values, and the batch's own reallocations copy at most
-    /// three times the values the folds produced (plus a constant per fold). Without the
-    /// flatten's release, a leaf array that keeps two adjacent values handed on a run sized
-    /// for every element it iterated.
+    /// fold yields the reference's values in its order; a fold that ends in computed values
+    /// allocated its vector once, for at most every element, and hands it on with at most
+    /// `slack_allowed` over its values (fails without the release, the `1cbb5dcde` shape: a leaf
+    /// array keeping two of many values handed on a vector sized for all of them); a fold that
+    /// moved to the batch holds at most one entry per element plus one, a leading vector exactly
+    /// its size, and no vector of values sized ahead of its values (fails on the first version's
+    /// policy, `ae55f31b6`, which sized every new run for every element left); and the fold's
+    /// own shrinks copy each value at most once.
     #[test]
     fn folds_hand_on_tight_vectors_and_copy_linearly_7267() {
         use rand::{RngExt, SeedableRng};
         let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(7267);
-        let mut inner_folds = 0;
+        let (mut released, mut inner_folds) = (0, 0);
         for case in 0..30 {
             let depth = 1 + case % 3;
             let n = rng.random_range(1..if depth == 1 { 600 } else { 40 });
@@ -9542,127 +9824,51 @@ mod per_element_batch_tests_7267 {
                 format!("[{}]", want.join(",")),
                 "case {case}: {program}"
             );
-            let produced: usize = stats.outputs.iter().map(|(len, _)| len).sum();
-            for &(len, capacity) in &stats.outputs {
-                assert!(
-                    capacity <= len + slack_allowed(len),
-                    "case {case}: {len} values in {capacity}"
-                );
+            let mut produced = 0;
+            for fold in &stats.folds {
+                match *fold {
+                    Fold::Values {
+                        elements,
+                        reserved,
+                        len,
+                        capacity,
+                    } => {
+                        produced += len;
+                        assert!(reserved <= elements, "case {case}: {fold:?}");
+                        assert!(
+                            capacity <= len + slack_allowed(len),
+                            "case {case}: {fold:?}"
+                        );
+                        released += usize::from(reserved > len + slack_allowed(len));
+                    }
+                    Fold::Entries {
+                        elements,
+                        batch,
+                        leading,
+                        ref runs,
+                    } => {
+                        assert!(batch <= elements + 1, "case {case}: {fold:?}");
+                        if let Some((len, capacity)) = leading {
+                            produced += len;
+                            assert_eq!(len, capacity, "case {case}: {fold:?}");
+                        }
+                        for &(len, capacity) in runs {
+                            assert!(
+                                capacity <= len + len.max(slack_allowed(len)),
+                                "case {case}: {fold:?}"
+                            );
+                        }
+                    }
+                }
             }
-            assert!(
-                stats.copied <= 3 * produced + 16 * stats.outputs.len(),
-                "case {case}: copied {} for {produced} values over {} folds",
-                stats.copied,
-                stats.outputs.len()
-            );
+            assert!(stats.copied <= produced, "case {case}: {stats:?}");
             if depth > 1 {
-                inner_folds += stats.outputs.len().saturating_sub(1);
+                inner_folds += stats.folds.len().saturating_sub(1);
             }
         }
-        // The generated documents really reached the nested folds.
+        // The generated documents really reached the nested folds, and the release.
         assert!(inner_folds > 150, "{inner_folds} inner folds");
-    }
-
-    /// A lone computed value between cursors stays as it is, `None` leaves nothing, runs keep
-    /// their place, so the all-cursors check and the flattened order are what they were with
-    /// one entry per element.
-    #[test]
-    fn cursors_split_runs_and_nones_leave_nothing_7267() {
-        let cs = cursors(br#"["a",{"b":1}]"#);
-        let mut batch: Batch<'_> = Vec::new();
-        let mut sized = ElementBatch::default();
-        push_element_result(&mut batch, owned(10), 7, &mut sized);
-        push_element_result(&mut batch, GenericResult::OneCursor(cs[0]), 6, &mut sized);
-        push_element_result(&mut batch, GenericResult::None, 5, &mut sized);
-        push_element_result(&mut batch, owned(20), 4, &mut sized);
-        push_element_result(&mut batch, owned(25), 3, &mut sized);
-        push_element_result(
-            &mut batch,
-            GenericResult::ManyOwned(vec![OwnedValue::Int(30), OwnedValue::Int(40)]),
-            2,
-            &mut sized,
-        );
-        push_element_result(
-            &mut batch,
-            GenericResult::ManyCursor(vec![cs[1]]),
-            1,
-            &mut sized,
-        );
-        assert_eq!(batch.len(), 5);
-        assert!(matches!(&batch[0], GenericResult::Owned(_)));
-        assert!(matches!(&batch[1], GenericResult::OneCursor(_)));
-        assert!(matches!(&batch[2], GenericResult::ManyOwned(run) if run.len() == 2));
-        // An element's own `ManyOwned` stays the entry it is, not copied into the run.
-        assert!(matches!(&batch[3], GenericResult::ManyOwned(os) if os.len() == 2));
-        assert!(matches!(&batch[4], GenericResult::ManyCursor(_)));
-        let flat: Vec<String> = flatten_generic_results::<_, JqSemantics>(batch)
-            .unwrap()
-            .iter()
-            .map(OwnedValue::to_json)
-            .collect();
-        assert_eq!(flat, ["10", "\"a\"", "20", "25", "30", "40", "{\"b\":1}"]);
-
-        let mut empty: Batch<'_> = Vec::new();
-        let mut sized = ElementBatch::default();
-        for left in (1..=3).rev() {
-            push_element_result(&mut empty, GenericResult::None, left, &mut sized);
-        }
-        assert!(empty.is_empty());
-    }
-}
-
-/// The slack a vector of values may keep once it leaves a fold, or once its run is closed:
-/// an eighth of its length, or 16 slots for a short one (#7267). Everything a fold hands on
-/// is held to it, so a fold's output is never more than about an eighth over its values,
-/// whatever the fold reserved while it ran (a run sized for every element left, a buffer
-/// grown by doubling).
-const fn slack_allowed(len: usize) -> usize {
-    let eighth = len / 8;
-    if eighth > 16 {
-        eighth
-    } else {
-        16
-    }
-}
-
-/// Give back `v`'s capacity past [`slack_allowed`] (#7267).
-#[inline]
-fn release_slack(v: &mut Vec<OwnedValue>) {
-    if v.capacity() - v.len() > slack_allowed(v.len()) {
-        #[cfg(test)]
-        batch_stats_7267::note_copied(v.len());
-        v.shrink_to_fit();
-    }
-}
-
-/// Test-only accounting for the per-element batch (#7267): what each fold's flatten hands
-/// on, and how many values the batch's own reallocations copied.
-#[cfg(test)]
-mod batch_stats_7267 {
-    use core::cell::RefCell;
-
-    #[derive(Default, Clone, Debug)]
-    pub(super) struct Stats {
-        /// `(len, capacity)` of every vector a flatten handed on, innermost fold first.
-        pub(super) outputs: Vec<(usize, usize)>,
-        /// Values copied by a run's regrowth or a slack release.
-        pub(super) copied: usize,
-    }
-
-    std::thread_local! {
-        static STATS: RefCell<Stats> = RefCell::new(Stats::default());
-    }
-
-    pub(super) fn note_copied(values: usize) {
-        STATS.with(|s| s.borrow_mut().copied += values);
-    }
-
-    pub(super) fn note_output(len: usize, capacity: usize) {
-        STATS.with(|s| s.borrow_mut().outputs.push((len, capacity)));
-    }
-
-    pub(super) fn take() -> Stats {
-        STATS.with(|s| core::mem::take(&mut *s.borrow_mut()))
+        assert!(released > 20, "{released} folds gave slack back");
     }
 }
 
@@ -9687,15 +9893,6 @@ fn flatten_generic_results<V: DocumentValue, S: EvalSemantics>(
 ) -> Result<Vec<OwnedValue>, Control> {
     let mut results = Vec::new();
     for r in items {
-        // #7267: a leading run [`push_element_result`] coalesced becomes the
-        // output itself, so the batch is never copied into a second vector.
-        let r = match r {
-            GenericResult::ManyOwned(os) if results.is_empty() => {
-                results = os;
-                continue;
-            }
-            r => r,
-        };
         match r.materialize_lazy::<S>() {
             // `One`/`Many` are exhaustiveness only here too, same as
             // `into_lazy_items`'s identical comment above: `items`' one
@@ -9738,12 +9935,6 @@ fn flatten_generic_results<V: DocumentValue, S: EvalSemantics>(
             }
         }
     }
-    // #7267: what leaves the fold keeps no more slack than `slack_allowed`, whether it
-    // is an adopted run sized for elements that then gave nothing, or a vector the
-    // appends above grew by doubling.
-    release_slack(&mut results);
-    #[cfg(test)]
-    batch_stats_7267::note_output(results.len(), results.capacity());
     Ok(results)
 }
 
@@ -14645,118 +14836,17 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
             GenericResult::ManyCursor(cs) => {
                 let rest = &stages[j..];
                 let rest_whole = PipeWhole::rebuilt();
-                // Reserved by `push_element_result` once it is known what the batch
-                // holds: a run needs one entry, not one per element (#7267).
-                let mut per_element = Vec::new();
-                let elements = cs.len();
-                let mut batch = ElementBatch::default();
-                for (i, c) in cs.into_iter().enumerate() {
-                    match eval_single_pipe::<S, _>(rest, &rest_whole, c.value(), optional, Some(c))
-                    {
-                        // The elements already piped through no
-                        // longer vanish (#400, #494). If an earlier
-                        // element's own buffered `LazySeq` also fails
-                        // once `flatten_generic_results` materializes
-                        // it, that earlier failure wins -- it's
-                        // chronologically first in evaluation order.
-                        GenericResult::Error(e) => {
-                            return match flatten_generic_results::<_, S>(per_element) {
-                                Ok(prefix) => partial_generic(prefix, Control::Error(e)),
-                                Err(Control::Error(earlier)) => GenericResult::Error(earlier),
-                                Err(Control::Break(label)) => GenericResult::Break(label),
-                                Err(Control::Halt(code)) => GenericResult::Halt(code),
-                            };
-                        }
-                        GenericResult::Break(label) => {
-                            return match flatten_generic_results::<_, S>(per_element) {
-                                Ok(prefix) => partial_generic(prefix, Control::Break(label)),
-                                Err(Control::Error(earlier)) => GenericResult::Error(earlier),
-                                Err(Control::Break(earlier_label)) => {
-                                    GenericResult::Break(earlier_label)
-                                }
-                                Err(Control::Halt(code)) => GenericResult::Halt(code),
-                            };
-                        }
-                        // Same immediate-stop treatment as `Error`/`Break`
-                        // above — halt is an opaque terminal signal, not
-                        // catchable by anything downstream, so this must
-                        // not fall through to the `other => ...` wildcard
-                        // below (which would keep evaluating later cursor
-                        // elements instead of stopping immediately).
-                        GenericResult::Halt(code) => {
-                            return match flatten_generic_results::<_, S>(per_element) {
-                                Ok(prefix) => partial_generic(prefix, Control::Halt(code)),
-                                Err(Control::Error(earlier)) => GenericResult::Error(earlier),
-                                Err(Control::Break(label)) => GenericResult::Break(label),
-                                Err(Control::Halt(earlier_code)) => {
-                                    GenericResult::Halt(earlier_code)
-                                }
-                            };
-                        }
-                        GenericResult::Partial(vs, control) => {
-                            return match flatten_generic_results::<_, S>(per_element) {
-                                Ok(mut prefix) => {
-                                    prefix.extend(vs);
-                                    partial_generic(prefix, control)
-                                }
-                                Err(Control::Error(earlier)) => GenericResult::Error(earlier),
-                                Err(Control::Break(label)) => GenericResult::Break(label),
-                                Err(Control::Halt(code)) => GenericResult::Halt(code),
-                            };
-                        }
-                        // #4044: collected, an object is read in full anyway, so it
-                        // is built as it arrives rather than held lazily until
-                        // the flatten (N live boxes and entry buffers).
-                        obj @ GenericResult::LazyObject(_) => push_element_result(
-                            &mut per_element,
-                            obj.materialize_lazy::<S>(),
-                            elements - i,
-                            &mut batch,
-                        ),
-                        // Matched here rather than in `push_element_result`, so that each
-                        // result is matched once (#7267 review).
-                        GenericResult::None => {}
-                        GenericResult::Owned(o) => {
-                            push_owned_element(&mut per_element, o, elements - i, &mut batch);
-                        }
-                        other => {
-                            push_other_element(&mut per_element, other, elements - i, &mut batch);
-                        }
-                    }
-                }
-
-                let all_cursor_or_empty = per_element.iter().all(|r| {
-                    matches!(
-                        r,
-                        GenericResult::OneCursor(_)
-                            | GenericResult::ManyCursor(_)
-                            | GenericResult::None
-                    )
+                // #7267: computed values straight into one vector while every element
+                // yields one or nothing; the per-element batch as before from the first
+                // element that yields anything else.
+                let results = cs.into_iter().map(|c| {
+                    eval_single_pipe::<S, _>(rest, &rest_whole, c.value(), optional, Some(c))
                 });
-
-                return if all_cursor_or_empty {
-                    let mut cursors = vec_with_capacity(per_element.len());
-                    for r in per_element {
-                        match r {
-                            GenericResult::OneCursor(c) => cursors.push(c),
-                            GenericResult::ManyCursor(cs) => cursors.extend(cs),
-                            GenericResult::None => {}
-                            _ => unreachable!("checked all_cursor_or_empty above"),
-                        }
-                    }
-                    if cursors.is_empty() {
-                        GenericResult::None
-                    } else {
-                        GenericResult::ManyCursor(cursors)
-                    }
-                } else {
-                    match flatten_generic_results::<_, S>(per_element) {
-                        Ok(results) if results.is_empty() => GenericResult::None,
-                        Ok(results) => GenericResult::ManyOwned(results),
-                        Err(Control::Error(e)) => GenericResult::Error(e),
-                        Err(Control::Break(label)) => GenericResult::Break(label),
-                        Err(Control::Halt(code)) => GenericResult::Halt(code),
-                    }
+                return match collect_element_results::<S, V>(results) {
+                    ElementResults::Values(values) if values.is_empty() => GenericResult::None,
+                    ElementResults::Values(values) => GenericResult::ManyOwned(values),
+                    ElementResults::Entries(per_element) => finish_entries::<S, V>(per_element),
+                    ElementResults::Stopped(stopped) => stopped,
                 };
             }
             // The whole point of `LazyKeys`: `length` always, and
