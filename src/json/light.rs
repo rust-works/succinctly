@@ -5576,6 +5576,10 @@ mod pretty_streaming_tests_7271 {
             r"\u007f",
             " ",
             "x\u{7f}",
+            r"]\u001f,",
+            r"\u001f:",
+            r"{\u001f",
+            r"\u001f}",
         ];
         const SCALARS: &[&str] = &[
             "0", "-1", "42", "3.5", "-0.25", "1e+100", "true", "false", "null",
@@ -5661,6 +5665,19 @@ mod pretty_streaming_tests_7271 {
             }
         }
         assert!(certified > 1500, "only {certified} documents certified");
+    }
+
+    /// Indentation written from a run of the unit is the unit repeated, at every width the
+    /// run's length divides unevenly, for spaces, tabs and any other unit.
+    #[test]
+    fn indent_from_a_run_is_the_unit_repeated_7271() {
+        for unit in [' ', '\t', '-'] {
+            for n in 0..200 {
+                let mut out = String::new();
+                write_json_indent(&mut out, n, unit).unwrap();
+                assert_eq!(out, unit.to_string().repeat(n), "{n} x {unit:?}");
+            }
+        }
     }
 
     /// A fault anywhere, even past the last chunk boundary, makes the scan decline the span,
@@ -6244,13 +6261,33 @@ fn stream_json_sequence<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
 /// indent primitive, distinct from [`write_json_yaml_indent`] below (which
 /// is JSON-to-*YAML*'s and always uses a space, since `JsonCursor::stream_yaml`
 /// doesn't honor `--tab` either -- see its own doc comment).
+///
+/// Written as slices of a run of the unit rather than a character at a time
+/// (#7271 review): a writer with work per call, such as the chunked writer of a
+/// streamed pretty render, otherwise pays it once per byte of indentation,
+/// which on a document 250 levels deep is most of the output.
 fn write_json_indent<Out: core::fmt::Write>(
     out: &mut Out,
     spaces: usize,
     unit: char,
 ) -> core::fmt::Result {
-    for _ in 0..spaces {
-        out.write_char(unit)?;
+    const SPACES: &str = "                                                                ";
+    const TABS: &str = "\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t";
+    let run = match unit {
+        ' ' => SPACES,
+        '\t' => TABS,
+        _ => {
+            for _ in 0..spaces {
+                out.write_char(unit)?;
+            }
+            return Ok(());
+        }
+    };
+    let mut left = spaces;
+    while left > 0 {
+        let take = left.min(run.len());
+        out.write_str(&run[..take])?;
+        left -= take;
     }
     Ok(())
 }
