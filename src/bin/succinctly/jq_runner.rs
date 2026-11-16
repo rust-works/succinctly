@@ -14097,10 +14097,46 @@ fn read_lazy_window(lazy: &mut LazyJsonInputs, more: &mut LazyMore, want: usize)
     };
     #[cfg(test)]
     LAZY_WINDOWS_READ.with(|n| n.set((n.get().0 + 1, n.get().1)));
-    let Some(fresh) = rest
-        .windows
-        .next_window(Some(want), report_input_read_failure)
-    else {
+    // #7264: the window after a short start is read onto the text's own buffer, which has room for the
+    // whole file, instead of a buffer of its own that is then copied: the copy touched 240 KiB of
+    // fresh pages twice (60 more page faults than a start on the whole front, 0.18 ms on a 1 MB
+    // file). The text moves out of its `Rc` for it and goes back.
+    let mut appended = false;
+    let next = if rest.windows.first_window_pending() && std::rc::Rc::strong_count(&lazy.text) == 1
+    {
+        let text = std::mem::take(std::rc::Rc::make_mut(&mut lazy.text)).into_bytes();
+        let kept = text.len();
+        match rest
+            .windows
+            .next_window_after(Some(want), text, report_input_read_failure)
+        {
+            Ok(all) => match String::from_utf8(all) {
+                Ok(all) => {
+                    *std::rc::Rc::make_mut(&mut lazy.text) = all;
+                    appended = true;
+                    Some(Vec::new())
+                }
+                // Not UTF-8: what was read after the text is handled below as any window is.
+                Err(error) => {
+                    let mut all = error.into_bytes();
+                    let fresh = all.split_off(kept);
+                    *std::rc::Rc::make_mut(&mut lazy.text) =
+                        String::from_utf8(all).expect("the text was UTF-8");
+                    Some(fresh)
+                }
+            },
+            // Nothing was added: the text is as it was.
+            Err(text) => {
+                *std::rc::Rc::make_mut(&mut lazy.text) =
+                    String::from_utf8(text).expect("the text was UTF-8");
+                None
+            }
+        }
+    } else {
+        rest.windows
+            .next_window(Some(want), report_input_read_failure)
+    };
+    let Some(fresh) = next else {
         // An empty file of several (#7024), or one that shrank to its front while the run read it.
         return WindowRead::Eof;
     };
@@ -14136,7 +14172,9 @@ fn read_lazy_window(lazy: &mut LazyJsonInputs, more: &mut LazyMore, want: usize)
         *std::rc::Rc::make_mut(&mut lazy.text) = text;
         return WindowRead::Eof;
     };
-    std::rc::Rc::make_mut(&mut lazy.text).push_str(new);
+    if !appended {
+        std::rc::Rc::make_mut(&mut lazy.text).push_str(new);
+    }
     if rest.windows.finished() {
         WindowRead::Eof
     } else {

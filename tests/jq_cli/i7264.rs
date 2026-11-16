@@ -119,3 +119,47 @@ fn documents_bigger_than_the_start_are_read_as_before_7264() -> Result<()> {
     }
     Ok(())
 }
+
+/// A byte that is not UTF-8 in the first window after the 16 KiB start (record 3000, about 120 KB in), in
+/// the start itself (record 300), and past the front (record 11000): jq reads it as U+FFFD wherever it
+/// falls. The expected text is jq 1.7.1's.
+#[test]
+fn an_invalid_byte_in_any_window_of_a_long_file_reads_as_jq_reads_it_7264() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("invalid.ndjson");
+    let file = path.to_string_lossy().into_owned();
+    for bad in [300usize, 3000, 11_000] {
+        let mut bytes = Vec::new();
+        for id in 0..RECORDS {
+            let mut line = record(id).into_bytes();
+            if id == bad {
+                // `user-` is at offset 20 in the record: put the byte after it.
+                let at = line.windows(5).position(|w| w == b"user-").expect("name") + 5;
+                line.insert(at, 0xff);
+            }
+            bytes.extend(line);
+        }
+        std::fs::write(&path, bytes)?;
+        let program = format!("[inputs|.name]|[length, .[{bad}]]");
+        let (stdout, stderr, code) = run_jq_full(&["-nc", &program, &file], None)?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (
+                format!("[{RECORDS},\"user-\u{fffd}{bad:06}\"]\n").as_str(),
+                "",
+                0
+            ),
+            "invalid byte in record {bad}"
+        );
+        let (stdout, _, code) = run_jq_full(
+            &[
+                "-nc",
+                "reduce inputs as $r (0; . + ($r.name|length))",
+                &file,
+            ],
+            None,
+        )?;
+        assert_eq!((stdout.as_str(), code), ("132001\n", 0), "record {bad}");
+    }
+    Ok(())
+}
