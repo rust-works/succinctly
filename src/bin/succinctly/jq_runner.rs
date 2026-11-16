@@ -13567,12 +13567,16 @@ struct LazyRest {
 /// How much of a lone source [`lone_lazy_start`] reads before the program starts: room for the
 /// documents of the first chunks and the one that ends them. A source shorter than this is read whole
 /// instead, so it is not derived from [`LAZY_CHUNK_FIRST_BYTES`]: shrinking the first chunk (#7264)
-/// must not move which files take the lazy start.
+/// leaves unchanged which files *try* the lazy start (those longer than this). It does not leave
+/// unchanged which of them take it: that is decided on the first chunk, 4 KiB where it was 64 KiB, so
+/// a stream with a fault, or invalid UTF-8, further in than the first chunk now goes lazy and meets
+/// the fault in a later chunk or window, where it used to be read whole by the eager route. The
+/// answers are the same (the lazy route hands a fault to the eager reader from where it is).
 const LAZY_PREFIX_BYTES: usize = 256 * 1024;
 
 /// How much of a file longer than [`LAZY_PREFIX_BYTES`] [`lone_lazy_start`] reads first: room for the
 /// first chunk's documents ([`LAZY_CHUNK_FIRST_BYTES`]) and the one that ends it, when they are not
-/// bigger than a document in a few thousand bytes; it reads on to the prefix when they are (#7264).
+/// a document of a few KiB; it reads on to the prefix when the first chunk does not fit (#7264).
 const LAZY_START_BYTES: usize = 4 * LAZY_CHUNK_FIRST_BYTES;
 
 const _: () = assert!(LAZY_START_BYTES <= LAZY_PREFIX_BYTES);
@@ -13583,6 +13587,11 @@ thread_local! {
     static LAZY_PREFIX_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     /// Test-only: how many runs [`get_inputs`] started on the front of a lone source.
     static LONE_FRONT_STARTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test-only: the bytes [`lone_lazy_start`] had read when its first chunk was in them (#7264).
+    static LONE_START_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test-only: the windows [`read_lazy_window`] read onto the text, and the ones it read into a
+    /// buffer of their own because something else held the text (#7264).
+    static LAZY_WINDOWS_ONTO_TEXT: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 fn lazy_prefix_bytes() -> usize {
@@ -14000,6 +14009,8 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
         }
         want = front;
     };
+    #[cfg(test)]
+    LONE_START_READ.with(|n| n.set(bytes.len()));
     if let Some((chunk, bom, valid_end)) = more {
         // What the reader has read of the source, which is what is left of it to the windows.
         let read_len = bytes.len();
@@ -14102,8 +14113,20 @@ fn read_lazy_window(lazy: &mut LazyJsonInputs, more: &mut LazyMore, want: usize)
     // fresh pages twice (60 more page faults than a start on the whole front, 0.18 ms on a 1 MB
     // file). The text moves out of its `Rc` for it and goes back.
     let mut appended = false;
-    let next = if rest.windows.first_window_pending() && std::rc::Rc::strong_count(&lazy.text) == 1
-    {
+    // Unreachable by construction as `true`: nothing but `lazy` holds the text's `Rc`. The guard keeps
+    // `Rc::make_mut` below from copying the whole text should something ever hold it.
+    let shared = std::rc::Rc::strong_count(&lazy.text) != 1;
+    #[cfg(test)]
+    if rest.windows.first_window_pending() {
+        LAZY_WINDOWS_ONTO_TEXT.with(|n| {
+            let (onto, shared_text) = n.get();
+            n.set((
+                onto + usize::from(!shared),
+                shared_text + usize::from(shared),
+            ));
+        });
+    }
+    let next = if rest.windows.first_window_pending() && !shared {
         let text = std::mem::take(std::rc::Rc::make_mut(&mut lazy.text)).into_bytes();
         let kept = text.len();
         match rest
@@ -16082,7 +16105,11 @@ fn split_json_values_until(
     from: usize,
     stop_at: usize,
 ) -> (Vec<(usize, usize)>, Option<usize>, bool) {
-    let mut values = Vec::new();
+    // Room for the documents of a chunk of small ones (a chunk of a stream of 64-byte documents
+    // fills it), so that the small chunks the scan now starts on do not grow it by doubling: that
+    // growth was +1.5% of the instructions of `reduce inputs` over a 1 MB file, all in malloc (#7264).
+    let mut values =
+        Vec::with_capacity((stop_at.min(bytes.len()).saturating_sub(from) / 64).min(1 << 13));
     let mut pos = from;
 
     while pos < bytes.len() {
@@ -21034,22 +21061,20 @@ mod tests {
         assert!(spans(&in_string).is_some());
     }
 
-    /// #7264: the chunks of a lazy stream start at [`LAZY_CHUNK_FIRST_BYTES`], double, and stop at
-    /// [`LAZY_CHUNK_MAX_BYTES`]; the first is small enough that `first(inputs)` scans little more than
-    /// it reads, and the lone-source prefix does not follow it down.
+    /// #7264: the chunks of a lazy stream are 4 KiB, 8 KiB, ... up to 512 KiB and stay there. The
+    /// numbers are written out; the const assertions beside the constants keep the first small.
     #[test]
-    fn the_lazy_chunks_ramp_from_a_small_first_to_the_cap_7264() {
-        assert_eq!(lazy_chunk_budget(0), LAZY_CHUNK_FIRST_BYTES);
-        for index in 0..LAZY_CHUNK_DOUBLINGS as usize {
-            assert_eq!(lazy_chunk_budget(index + 1), 2 * lazy_chunk_budget(index));
+    fn the_lazy_chunks_ramp_from_4_kib_to_512_kib_7264() {
+        let kib = |n: usize| n * 1024;
+        let want = [4, 8, 16, 32, 64, 128, 256, 512, 512, 512];
+        for (index, &size) in want.iter().enumerate() {
+            assert_eq!(lazy_chunk_budget(index), kib(size), "chunk {index}");
         }
-        assert_eq!(
-            lazy_chunk_budget(LAZY_CHUNK_DOUBLINGS as usize),
-            LAZY_CHUNK_MAX_BYTES
-        );
-        assert_eq!(lazy_chunk_budget(1000), LAZY_CHUNK_MAX_BYTES);
-        // Which files take the lazy start is the 256 KiB it was with a 64 KiB first chunk.
-        assert_eq!(LAZY_PREFIX_BYTES, 256 * 1024);
+        assert_eq!(lazy_chunk_budget(1000), kib(512));
+        // Which files try the lazy start (longer than this front) is what it was with a 64 KiB first
+        // chunk; what the front's first chunk then decides is not (#7264).
+        assert_eq!(LAZY_PREFIX_BYTES, kib(256));
+        assert_eq!(LAZY_START_BYTES, kib(16));
     }
 
     /// #5853: a stream that turns malformed keeps the documents before its first fault lazy; a
@@ -22931,6 +22956,109 @@ mod tests {
         );
         // Drain the queue so the next test starts clean.
         while !matches!(jq::pop_input(), jq::InputPop::Exhausted) {}
+    }
+
+    /// Start `-n 'inputs'` over `file` as a run does and hand back how many bytes the start read, and
+    /// the counters of the chunk scan and of the first window; the queue is drained by the caller.
+    fn lone_start_of(file: &std::path::Path) -> usize {
+        use clap::Parser;
+        let cmd = JqCommand::try_parse_from(["jq", "-n", "first(inputs)", file.to_str().unwrap()])
+            .unwrap();
+        LONE_START_READ.with(|n| n.set(0));
+        LAZY_BYTES_SCANNED.with(|n| n.set(0));
+        LAZY_WINDOWS_ONTO_TEXT.with(|n| n.set((0, 0)));
+        let (mut open_failed, mut opened) = (false, Vec::new());
+        let (inputs, locations, trailing, resumed) =
+            get_inputs(&cmd, true, true, &mut open_failed, &mut opened)
+                .expect("no exit code")
+                .expect("reads");
+        seed_input_queue(false, inputs, &locations, trailing, resumed);
+        LONE_START_READ.with(std::cell::Cell::get)
+    }
+
+    /// #7264: a file longer than the front is read on 16 KiB before its first record is handed out,
+    /// not on the 256 KiB front, and its first chunk is 4 KiB, the next 8 KiB, the next 16 KiB: the
+    /// numbers are written out, so a start on 256 KiB or a first chunk of 64 KiB fails here, where the
+    /// answers of the run do not change with either.
+    #[test]
+    fn a_long_file_starts_on_16_kib_and_scans_4_8_16_kib_chunks_7264() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("long.ndjson");
+        let record = |i: usize| {
+            format!(
+                "{{\"id\":{i},\"name\":\"user-{i:06}\",\"score\":{}}}\n",
+                i % 97
+            )
+        };
+        let stream: String = (0..20_000).map(record).collect();
+        let doc = record(0).len();
+        assert!(
+            stream.len() > 2 * lazy_prefix_bytes(),
+            "longer than the front"
+        );
+        std::fs::write(&file, &stream).unwrap();
+        let read = lone_start_of(&file);
+        assert_eq!(read, 16 * 1024, "bytes read before the first document");
+        assert!(matches!(jq::pop_input(), jq::InputPop::Document(_)));
+        let scanned = || LAZY_BYTES_SCANNED.with(std::cell::Cell::get);
+        let first = scanned();
+        assert!(
+            (4096..4096 + doc).contains(&first),
+            "the first chunk scanned {first} bytes"
+        );
+        // The documents of the first chunk, then each next chunk is the next power of two.
+        let mut chunks = vec![first];
+        let mut last = first;
+        while chunks.len() < 3 {
+            assert!(matches!(jq::pop_input(), jq::InputPop::Document(_)));
+            if scanned() != last {
+                chunks.push(scanned() - last);
+                last = scanned();
+            }
+        }
+        for (chunk, want) in chunks.iter().zip([4096, 8192, 16_384]) {
+            assert!(
+                (want..want + doc).contains(chunk),
+                "chunks scanned so far: {chunks:?}"
+            );
+        }
+        while !matches!(jq::pop_input(), jq::InputPop::Exhausted) {}
+    }
+
+    /// #7264: when the first chunk does not fit in the 16 KiB start (documents of 20 KB), the start
+    /// reads on to the 256 KiB front as it did before, and the stream still goes lazy.
+    #[test]
+    fn a_long_file_of_big_documents_reads_on_to_the_front_7264() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("big.ndjson");
+        let stream: String = (0..40)
+            .map(|i| format!("{{\"id\":{i},\"pad\":\"{}\"}}\n", "x".repeat(20_000)))
+            .collect();
+        std::fs::write(&file, &stream).unwrap();
+        assert_eq!(lone_start_of(&file), lazy_prefix_bytes());
+        assert!(matches!(jq::pop_input(), jq::InputPop::Document(_)));
+        while !matches!(jq::pop_input(), jq::InputPop::Exhausted) {}
+    }
+
+    /// #7264: the first window after a short start is read onto the text's own buffer, once, and every
+    /// document of the stream comes out. (The guard on `Rc::strong_count` in `read_lazy_window` is
+    /// unreachable by construction: nothing but `LazyJsonInputs` holds the text's `Rc`, and its
+    /// documents are converted out of it, not kept pointing into it; no test can build a second holder.)
+    #[test]
+    fn the_first_window_after_a_short_start_is_read_onto_the_text_7264() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("long.ndjson");
+        let stream: String = (0..20_000)
+            .map(|i| format!("{{\"id\":{i},\"name\":\"user-{i:06}\"}}\n"))
+            .collect();
+        std::fs::write(&file, &stream).unwrap();
+        lone_start_of(&file);
+        let mut count = 0;
+        while let jq::InputPop::Document(_) = jq::pop_input() {
+            count += 1;
+        }
+        assert_eq!(count, 20_000);
+        assert_eq!(LAZY_WINDOWS_ONTO_TEXT.with(std::cell::Cell::get), (1, 0));
     }
 
     /// #6725: `--seq --stream` and `--seq --stream-errors` read through the queue now, so the
