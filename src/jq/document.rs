@@ -3192,9 +3192,10 @@ impl KeyHashes {
     /// by a table (#3333).
     ///
     /// A caller that collects an object's hashes first and settles them
-    /// afterwards ([`has_repeat`](Self::has_repeat)) stops collecting here,
-    /// so it declines exactly the objects an incrementally filled table
-    /// would, and builds a table no larger than `MAX_SLOTS`.
+    /// afterwards ([`has_repeat`](Self::has_repeat)) settles a list this
+    /// long or longer some other way, so it builds a table no larger than
+    /// `MAX_SLOTS`: the canonical echo scan sorts it ([`any_hash_repeats`],
+    /// #7293), as `DistinctKeyCursors` does past its table's ceiling.
     pub const SATURATING_KEYS: usize = Self::MAX_SLOTS * 3 / 4;
 
     /// Whether `hashes` holds the same value twice, through a table sized
@@ -3211,6 +3212,7 @@ impl KeyHashes {
     /// answers `true` without building anything, as a saturated table's
     /// `insert` does: the table sized for it would be wider than
     /// `MAX_SLOTS`.
+    #[inline]
     pub fn has_repeat(hashes: &[u64]) -> bool {
         // Past the ceiling the answer is the conservative one, as a
         // saturated table's `insert` gives it, rather than a table wider
