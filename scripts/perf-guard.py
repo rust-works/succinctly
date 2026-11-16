@@ -577,6 +577,12 @@ DEFAULT_THRESHOLD = 5.0
 # exact: -4.3% x86_64 on this 2 MB row against a merge-base without it (every other row +0.0%). A
 # revert would read +4.5%, which the default 5.0 lets through. Memory and time are watched by the
 # `seq_field_bad_first` / `seq_field_bad_last` rows of `comparison/jq/queries/perf.tsv`.
+#
+# `arrays_identity` (#7293) carries an override of the same one-off kind: indentation is written as
+# fixed-length slices of a run instead of one slice whose length is known only at run time, a
+# `memcpy` call per line, so this pretty `.` of nested arrays does less work (-4.3% x86_64 / -5.9%
+# ARM64-Linux against the PR's own merge-base, outputs byte-identical). Remove it once `main` carries
+# the change and the row reads ~0% against a merge-base that includes it.
 QUERY_THRESHOLDS = {
     "seq_name_bad_last": 3.0,
     "wide_keys_unsorted": 10.0,
@@ -588,6 +594,7 @@ QUERY_THRESHOLDS = {
     "users_assign_scores": 30.0,
     "users_update_select": 30.0,
     "users_yq_del_select": 15.0,
+    "arrays_identity": 10.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
