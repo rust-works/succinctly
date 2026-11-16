@@ -13565,8 +13565,21 @@ struct LazyRest {
 }
 
 /// How much of a lone source [`lone_lazy_start`] reads before the program starts: room for the
-/// first chunk's documents ([`LAZY_CHUNK_FIRST_BYTES`]) and the one that ends it.
-const LAZY_PREFIX_BYTES: usize = 4 * LAZY_CHUNK_FIRST_BYTES;
+/// documents of the first chunks and the one that ends them. A source shorter than this is read whole
+/// instead, so it is not derived from [`LAZY_CHUNK_FIRST_BYTES`]: shrinking the first chunk (#7264)
+/// leaves unchanged which files *try* the lazy start (those longer than this). It does not leave
+/// unchanged which of them take it: that is decided on the first chunk, 4 KiB where it was 64 KiB, so
+/// a stream with a fault, or invalid UTF-8, further in than the first chunk now goes lazy and meets
+/// the fault in a later chunk or window, where it used to be read whole by the eager route. The
+/// answers are the same (the lazy route hands a fault to the eager reader from where it is).
+const LAZY_PREFIX_BYTES: usize = 256 * 1024;
+
+/// How much of a file longer than [`LAZY_PREFIX_BYTES`] [`lone_lazy_start`] reads first: room for the
+/// first chunk's documents ([`LAZY_CHUNK_FIRST_BYTES`]) and the one that ends it, when they are not
+/// a document of a few KiB; it reads on to the prefix when the first chunk does not fit (#7264).
+const LAZY_START_BYTES: usize = 4 * LAZY_CHUNK_FIRST_BYTES;
+
+const _: () = assert!(LAZY_START_BYTES <= LAZY_PREFIX_BYTES);
 
 #[cfg(test)]
 thread_local! {
@@ -13574,6 +13587,11 @@ thread_local! {
     static LAZY_PREFIX_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     /// Test-only: how many runs [`get_inputs`] started on the front of a lone source.
     static LONE_FRONT_STARTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test-only: the bytes [`lone_lazy_start`] had read when its first chunk was in them (#7264).
+    static LONE_START_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test-only: the windows [`read_lazy_window`] read onto the text, and the ones it read into a
+    /// buffer of their own because something else held the text (#7264).
+    static LAZY_WINDOWS_ONTO_TEXT: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 fn lazy_prefix_bytes() -> usize {
@@ -13934,48 +13952,68 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
     let from_stdin = files.is_empty();
     // Sized for the whole file, so the rest is read into the same buffer.
     let mut bytes = Vec::with_capacity(capacity);
-    if reader
-        .by_ref()
-        .take(front as u64)
-        .read_to_end(&mut bytes)
-        .is_err()
-    {
-        // #7126: a standard input that fails (a directory) is the empty stream jq reads, plus
-        // what came before the failure, and ends the run with exit 2.
-        return if from_stdin {
-            note_stdin_read_failed();
-            Ok(LoneStart::Read(bytes))
-        } else {
-            // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
-            Ok(LoneStart::Declined)
-            // patchcov: coverage end
-        };
-    }
-    // The whole source (stdin's end, or a file that shrank).
-    if bytes.len() < front {
-        return Ok(LoneStart::Read(bytes));
-    }
-    // The scan reads the text after the BOM jq skips (#5291), as `get_inputs` strips it.
-    let bom = crate::front_matter::leading_bom_len(&bytes);
-    // Up to the last whole character: the front may end inside one.
-    let valid_end = match std::str::from_utf8(&bytes[bom..]) {
-        Ok(_) => bytes.len(),
-        Err(e) if e.error_len().is_none() => bom + e.valid_up_to(),
-        Err(_) => bom,
+    // A file longer than the front is known to be, so its first chunk is looked for in the first
+    // [`LAZY_START_BYTES`] of it and the front is read only when that holds no whole chunk (#7264):
+    // reading 256 KiB first was a tenth of `-n 'first(inputs)|.id'`'s time. Standard input may end
+    // anywhere, and that it holds a front's worth is how it is told from a short source, so it reads
+    // the front at once.
+    let mut want = if from_stdin {
+        front
+    } else {
+        front.min(LAZY_START_BYTES)
     };
-    // The line of a document is jq's count through the read that completes it, which runs to the
-    // next newline ([`LineCounter::read_end_line`]): a newline after the chunk's last document keeps
-    // every count the chunk needs, and the newline the counter keeps for the next, in the front.
-    let more = std::str::from_utf8(&bytes[bom..valid_end])
-        .ok()
-        .and_then(|text| {
-            let chunk = lazy_json_scan_chunk(text, 0, lazy_chunk_budget(0));
-            let newline_after =
-                |&(_, end): &(usize, usize)| text.as_bytes()[end..].contains(&b'\n');
-            (chunk.end == ChunkEnd::More && chunk.spans.last().is_some_and(newline_after))
-                .then_some(chunk)
-        });
-    if let Some(chunk) = more {
+    let more = loop {
+        let read = reader
+            .by_ref()
+            .take((want - bytes.len()) as u64)
+            .read_to_end(&mut bytes);
+        if read.is_err() {
+            // #7126: a standard input that fails (a directory) is the empty stream jq reads, plus
+            // what came before the failure, and ends the run with exit 2.
+            return if from_stdin {
+                note_stdin_read_failed();
+                Ok(LoneStart::Read(bytes))
+            } else {
+                // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
+                Ok(LoneStart::Declined)
+                // patchcov: coverage end
+            };
+        }
+        // The whole source (stdin's end, or a file that shrank).
+        if bytes.len() < want {
+            return Ok(LoneStart::Read(bytes));
+        }
+        // The scan reads the text after the BOM jq skips (#5291), as `get_inputs` strips it.
+        let bom = crate::front_matter::leading_bom_len(&bytes);
+        // Up to the last whole character: the front may end inside one.
+        let valid_end = match std::str::from_utf8(&bytes[bom..]) {
+            Ok(_) => bytes.len(),
+            Err(e) if e.error_len().is_none() => bom + e.valid_up_to(),
+            Err(_) => bom,
+        };
+        // The line of a document is jq's count through the read that completes it, which runs to the
+        // next newline ([`LineCounter::read_end_line`]): a newline after the chunk's last document
+        // keeps every count the chunk needs, and the newline the counter keeps for the next, in the
+        // front.
+        let more = std::str::from_utf8(&bytes[bom..valid_end])
+            .ok()
+            .and_then(|text| {
+                let chunk = lazy_json_scan_chunk(text, 0, lazy_chunk_budget(0));
+                let newline_after =
+                    |&(_, end): &(usize, usize)| text.as_bytes()[end..].contains(&b'\n');
+                (chunk.end == ChunkEnd::More && chunk.spans.last().is_some_and(newline_after))
+                    .then_some(chunk)
+            });
+        if more.is_some() || want >= front {
+            break more.map(|chunk| (chunk, bom, valid_end));
+        }
+        want = front;
+    };
+    #[cfg(test)]
+    LONE_START_READ.with(|n| n.set(bytes.len()));
+    if let Some((chunk, bom, valid_end)) = more {
+        // What the reader has read of the source, which is what is left of it to the windows.
+        let read_len = bytes.len();
         let pending = bytes.split_off(valid_end);
         bytes.drain(..bom);
         match String::from_utf8(bytes) {
@@ -13984,13 +14022,22 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
                     text,
                     spans: chunk.spans,
                     rest: LazyRest {
-                        windows: window::LineWindows::new(
-                            reader,
-                            // A file's length is known; stdin ends at a short read.
-                            (!from_stdin).then(|| (capacity - front) as u64),
-                            lazy_window_bytes(),
-                            pending,
-                        ),
+                        windows: {
+                            let windows = window::LineWindows::new(
+                                reader,
+                                // A file's length is known; stdin ends at a short read.
+                                (!from_stdin).then(|| (capacity - read_len) as u64),
+                                lazy_window_bytes(),
+                                pending,
+                            );
+                            // A start on fewer bytes than the front reads the rest of the front
+                            // first, so the windows after it fall where they did when it read all.
+                            if read_len < front {
+                                windows.with_first_window(front - read_len)
+                            } else {
+                                windows
+                            }
+                        },
                     },
                 });
             }
@@ -14061,10 +14108,58 @@ fn read_lazy_window(lazy: &mut LazyJsonInputs, more: &mut LazyMore, want: usize)
     };
     #[cfg(test)]
     LAZY_WINDOWS_READ.with(|n| n.set((n.get().0 + 1, n.get().1)));
-    let Some(fresh) = rest
-        .windows
-        .next_window(Some(want), report_input_read_failure)
-    else {
+    // #7264: the window after a short start is read onto the text's own buffer, which has room for the
+    // whole file, instead of a buffer of its own that is then copied: the copy touched 240 KiB of
+    // fresh pages twice (60 more page faults than a start on the whole front, 0.18 ms on a 1 MB
+    // file). The text moves out of its `Rc` for it and goes back.
+    let mut appended = false;
+    // Unreachable by construction as `true`: nothing but `lazy` holds the text's `Rc`. The guard keeps
+    // `Rc::make_mut` below from copying the whole text should something ever hold it.
+    let shared = std::rc::Rc::strong_count(&lazy.text) != 1;
+    #[cfg(test)]
+    if rest.windows.first_window_pending() {
+        LAZY_WINDOWS_ONTO_TEXT.with(|n| {
+            let (onto, shared_text) = n.get();
+            n.set((
+                onto + usize::from(!shared),
+                shared_text + usize::from(shared),
+            ));
+        });
+    }
+    let next = if rest.windows.first_window_pending() && !shared {
+        let text = std::mem::take(std::rc::Rc::make_mut(&mut lazy.text)).into_bytes();
+        let kept = text.len();
+        match rest
+            .windows
+            .next_window_after(Some(want), text, report_input_read_failure)
+        {
+            Ok(all) => match String::from_utf8(all) {
+                Ok(all) => {
+                    *std::rc::Rc::make_mut(&mut lazy.text) = all;
+                    appended = true;
+                    Some(Vec::new())
+                }
+                // Not UTF-8: what was read after the text is handled below as any window is.
+                Err(error) => {
+                    let mut all = error.into_bytes();
+                    let fresh = all.split_off(kept);
+                    *std::rc::Rc::make_mut(&mut lazy.text) =
+                        String::from_utf8(all).expect("the text was UTF-8");
+                    Some(fresh)
+                }
+            },
+            // Nothing was added: the text is as it was.
+            Err(text) => {
+                *std::rc::Rc::make_mut(&mut lazy.text) =
+                    String::from_utf8(text).expect("the text was UTF-8");
+                None
+            }
+        }
+    } else {
+        rest.windows
+            .next_window(Some(want), report_input_read_failure)
+    };
+    let Some(fresh) = next else {
         // An empty file of several (#7024), or one that shrank to its front while the run read it.
         return WindowRead::Eof;
     };
@@ -14100,7 +14195,9 @@ fn read_lazy_window(lazy: &mut LazyJsonInputs, more: &mut LazyMore, want: usize)
         *std::rc::Rc::make_mut(&mut lazy.text) = text;
         return WindowRead::Eof;
     };
-    std::rc::Rc::make_mut(&mut lazy.text).push_str(new);
+    if !appended {
+        std::rc::Rc::make_mut(&mut lazy.text).push_str(new);
+    }
     if rest.windows.finished() {
         WindowRead::Eof
     } else {
@@ -14171,10 +14268,27 @@ fn slide_lazy_window(
 /// The first chunk of a lazy stream covers about this much text, and each chunk after it twice the
 /// one before up to [`LAZY_CHUNK_MAX_BYTES`], so a program that stops early (`first(inputs)`)
 /// scans little more than it reads (#5856).
-const LAZY_CHUNK_FIRST_BYTES: usize = 1 << 16;
+///
+/// It is small because the scan checks every document of the chunk (two parsers run against each
+/// other, about 3,600 instructions per 85-byte record) before the first is read: a 64 KiB first chunk
+/// was 2.9 M of the 3.9 M instructions of `-n 'first(inputs)|.id'` over a file, where the whole of
+/// `-n 1` is 1.1 M (#7264).
+const LAZY_CHUNK_FIRST_BYTES: usize = 1 << 12;
 
 /// The most text a chunk of a lazy stream covers, past its first document.
 const LAZY_CHUNK_MAX_BYTES: usize = 1 << 19;
+
+/// How many doublings take [`LAZY_CHUNK_FIRST_BYTES`] to [`LAZY_CHUNK_MAX_BYTES`].
+const LAZY_CHUNK_DOUBLINGS: u32 =
+    LAZY_CHUNK_MAX_BYTES.trailing_zeros() - LAZY_CHUNK_FIRST_BYTES.trailing_zeros();
+
+const _: () = assert!(
+    LAZY_CHUNK_FIRST_BYTES.is_power_of_two()
+        && LAZY_CHUNK_MAX_BYTES.is_power_of_two()
+        && LAZY_CHUNK_FIRST_BYTES <= LAZY_CHUNK_MAX_BYTES
+        // The first chunk stays small: that is what #7264 is for.
+        && LAZY_CHUNK_FIRST_BYTES <= 4096
+);
 
 #[cfg(test)]
 thread_local! {
@@ -14195,8 +14309,8 @@ fn lazy_chunk_budget(index: usize) -> usize {
     if let Some(bytes) = LAZY_CHUNK_BYTES.with(std::cell::Cell::get) {
         return bytes;
     }
-    // 64 KiB doubled three times is the 512 KiB cap, so the shift cannot overflow.
-    (LAZY_CHUNK_FIRST_BYTES << index.min(3)).min(LAZY_CHUNK_MAX_BYTES)
+    // The first chunk doubled `LAZY_CHUNK_DOUBLINGS` times is the cap, so the shift cannot overflow.
+    (LAZY_CHUNK_FIRST_BYTES << index.min(LAZY_CHUNK_DOUBLINGS as usize)).min(LAZY_CHUNK_MAX_BYTES)
 }
 
 /// The text a batch's index covers is at most this long, past its first document (#5854).
@@ -15981,6 +16095,17 @@ fn split_json_values(bytes: &[u8]) -> (Vec<(usize, usize)>, Option<usize>) {
     (values, None)
 }
 
+/// An empty vector with room for the documents of `chunk_bytes` of small ones (a chunk of 64-byte
+/// documents fills it), so that the small chunks the lazy scan starts on do not grow it by doubling
+/// (#7264). Out of line on purpose: written in the splitter's own body it moved the register
+/// allocation of its byte loop (`lazy_json_scan_chunk`, which inlines the splitter, 1,993 to 2,081 bytes
+/// and +8% of its instructions, about 1.2 per byte of string and container text), where a call keeps the
+/// loop as it was (1,972 bytes, +0.04% inclusive).
+#[inline(never)]
+fn spans_with_room(chunk_bytes: usize) -> Vec<(usize, usize)> {
+    Vec::with_capacity((chunk_bytes / 64).min(1 << 13))
+}
+
 /// [`split_json_values`] from `from`, which stops after the first value that ends at `stop_at` or
 /// later and that jq reads whatever follows it: a string or container, or a number or literal
 /// followed by white space. A number or literal directly followed by another byte is read with it
@@ -15991,7 +16116,7 @@ fn split_json_values_until(
     from: usize,
     stop_at: usize,
 ) -> (Vec<(usize, usize)>, Option<usize>, bool) {
-    let mut values = Vec::new();
+    let mut values = spans_with_room(stop_at.min(bytes.len()).saturating_sub(from));
     let mut pos = from;
 
     while pos < bytes.len() {
@@ -20938,6 +21063,22 @@ mod tests {
         assert!(spans(&in_string).is_some());
     }
 
+    /// #7264: the chunks of a lazy stream are 4 KiB, 8 KiB, ... up to 512 KiB and stay there. The
+    /// numbers are written out; the const assertions beside the constants keep the first small.
+    #[test]
+    fn the_lazy_chunks_ramp_from_4_kib_to_512_kib_7264() {
+        let kib = |n: usize| n * 1024;
+        let want = [4, 8, 16, 32, 64, 128, 256, 512, 512, 512];
+        for (index, &size) in want.iter().enumerate() {
+            assert_eq!(lazy_chunk_budget(index), kib(size), "chunk {index}");
+        }
+        assert_eq!(lazy_chunk_budget(1000), kib(512));
+        // Which files try the lazy start (longer than this front) is what it was with a 64 KiB first
+        // chunk; what the front's first chunk then decides is not (#7264).
+        assert_eq!(LAZY_PREFIX_BYTES, kib(256));
+        assert_eq!(LAZY_START_BYTES, kib(16));
+    }
+
     /// #5853: a stream that turns malformed keeps the documents before its first fault lazy; a
     /// number or literal last among them is the eager route's to decide, and a stream with
     /// nothing before the fault, or a BOM, keeps none.
@@ -22817,6 +22958,109 @@ mod tests {
         );
         // Drain the queue so the next test starts clean.
         while !matches!(jq::pop_input(), jq::InputPop::Exhausted) {}
+    }
+
+    /// Start `-n 'inputs'` over `file` as a run does and hand back how many bytes the start read, and
+    /// the counters of the chunk scan and of the first window; the queue is drained by the caller.
+    fn lone_start_of(file: &std::path::Path) -> usize {
+        use clap::Parser;
+        let cmd = JqCommand::try_parse_from(["jq", "-n", "first(inputs)", file.to_str().unwrap()])
+            .unwrap();
+        LONE_START_READ.with(|n| n.set(0));
+        LAZY_BYTES_SCANNED.with(|n| n.set(0));
+        LAZY_WINDOWS_ONTO_TEXT.with(|n| n.set((0, 0)));
+        let (mut open_failed, mut opened) = (false, Vec::new());
+        let (inputs, locations, trailing, resumed) =
+            get_inputs(&cmd, true, true, &mut open_failed, &mut opened)
+                .expect("no exit code")
+                .expect("reads");
+        seed_input_queue(false, inputs, &locations, trailing, resumed);
+        LONE_START_READ.with(std::cell::Cell::get)
+    }
+
+    /// #7264: a file longer than the front is read on 16 KiB before its first record is handed out,
+    /// not on the 256 KiB front, and its first chunk is 4 KiB, the next 8 KiB, the next 16 KiB: the
+    /// numbers are written out, so a start on 256 KiB or a first chunk of 64 KiB fails here, where the
+    /// answers of the run do not change with either.
+    #[test]
+    fn a_long_file_starts_on_16_kib_and_scans_4_8_16_kib_chunks_7264() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("long.ndjson");
+        let record = |i: usize| {
+            format!(
+                "{{\"id\":{i},\"name\":\"user-{i:06}\",\"score\":{}}}\n",
+                i % 97
+            )
+        };
+        let stream: String = (0..20_000).map(record).collect();
+        let doc = record(0).len();
+        assert!(
+            stream.len() > 2 * lazy_prefix_bytes(),
+            "longer than the front"
+        );
+        std::fs::write(&file, &stream).unwrap();
+        let read = lone_start_of(&file);
+        assert_eq!(read, 16 * 1024, "bytes read before the first document");
+        assert!(matches!(jq::pop_input(), jq::InputPop::Document(_)));
+        let scanned = || LAZY_BYTES_SCANNED.with(std::cell::Cell::get);
+        let first = scanned();
+        assert!(
+            (4096..4096 + doc).contains(&first),
+            "the first chunk scanned {first} bytes"
+        );
+        // The documents of the first chunk, then each next chunk is the next power of two.
+        let mut chunks = vec![first];
+        let mut last = first;
+        while chunks.len() < 3 {
+            assert!(matches!(jq::pop_input(), jq::InputPop::Document(_)));
+            if scanned() != last {
+                chunks.push(scanned() - last);
+                last = scanned();
+            }
+        }
+        for (chunk, want) in chunks.iter().zip([4096, 8192, 16_384]) {
+            assert!(
+                (want..want + doc).contains(chunk),
+                "chunks scanned so far: {chunks:?}"
+            );
+        }
+        while !matches!(jq::pop_input(), jq::InputPop::Exhausted) {}
+    }
+
+    /// #7264: when the first chunk does not fit in the 16 KiB start (documents of 20 KB), the start
+    /// reads on to the 256 KiB front as it did before, and the stream still goes lazy.
+    #[test]
+    fn a_long_file_of_big_documents_reads_on_to_the_front_7264() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("big.ndjson");
+        let stream: String = (0..40)
+            .map(|i| format!("{{\"id\":{i},\"pad\":\"{}\"}}\n", "x".repeat(20_000)))
+            .collect();
+        std::fs::write(&file, &stream).unwrap();
+        assert_eq!(lone_start_of(&file), lazy_prefix_bytes());
+        assert!(matches!(jq::pop_input(), jq::InputPop::Document(_)));
+        while !matches!(jq::pop_input(), jq::InputPop::Exhausted) {}
+    }
+
+    /// #7264: the first window after a short start is read onto the text's own buffer, once, and every
+    /// document of the stream comes out. (The guard on `Rc::strong_count` in `read_lazy_window` is
+    /// unreachable by construction: nothing but `LazyJsonInputs` holds the text's `Rc`, and its
+    /// documents are converted out of it, not kept pointing into it; no test can build a second holder.)
+    #[test]
+    fn the_first_window_after_a_short_start_is_read_onto_the_text_7264() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("long.ndjson");
+        let stream: String = (0..20_000)
+            .map(|i| format!("{{\"id\":{i},\"name\":\"user-{i:06}\"}}\n"))
+            .collect();
+        std::fs::write(&file, &stream).unwrap();
+        lone_start_of(&file);
+        let mut count = 0;
+        while let jq::InputPop::Document(_) = jq::pop_input() {
+            count += 1;
+        }
+        assert_eq!(count, 20_000);
+        assert_eq!(LAZY_WINDOWS_ONTO_TEXT.with(std::cell::Cell::get), (1, 0));
     }
 
     /// #6725: `--seq --stream` and `--seq --stream-errors` read through the queue now, so the

@@ -1952,6 +1952,9 @@ pub(super) struct LineWindows {
     carried: Vec<u8>,
     /// Nothing more is read: the end of the source, a read that failed, or the length it had.
     eof: bool,
+    /// The most the next window reads, once (#7264): a source started on a few KiB reads up to where
+    /// a start on the whole front would have ended, so its windows then fall where they always did.
+    first_ask: Option<usize>,
 }
 
 impl LineWindows {
@@ -1969,7 +1972,14 @@ impl LineWindows {
             block: block.max(1),
             carried,
             eof: false,
+            first_ask: None,
         }
+    }
+
+    /// The first window reads no more than `bytes`.
+    pub(super) fn with_first_window(mut self, bytes: usize) -> Self {
+        self.first_ask = Some(bytes);
+        self
     }
 
     /// Whether the last window is the last: no byte is left to read or carried.
@@ -1986,16 +1996,41 @@ impl LineWindows {
         want: Option<usize>,
         on_error: impl FnOnce(&io::Error),
     ) -> Option<Vec<u8>> {
-        let mut bytes = std::mem::take(&mut self.carried);
+        self.next_window_after(want, Vec::new(), on_error).ok()
+    }
+
+    /// Whether the next window is the one [`with_first_window`](Self::with_first_window) limits.
+    pub(super) fn first_window_pending(&self) -> bool {
+        self.first_ask.is_some()
+    }
+
+    /// [`next_window`](Self::next_window) read onto `before`, which comes first in what it returns: the
+    /// bytes of a text that the window is to be appended to, so that the window is read straight into
+    /// the text's own buffer instead of one of its own and then copied (#7264: the copy faulted a
+    /// second set of pages for the 240 KiB after a short start). Its last line break is still the
+    /// window's, and a read that fails cuts only the window's line. `Err(before)` when there is no
+    /// window: nothing was added.
+    pub(super) fn next_window_after(
+        &mut self,
+        want: Option<usize>,
+        before: Vec<u8>,
+        on_error: impl FnOnce(&io::Error),
+    ) -> Result<Vec<u8>, Vec<u8>> {
+        let floor = before.len();
+        let mut bytes = before;
+        bytes.extend_from_slice(&std::mem::take(&mut self.carried));
         let mut ask = want.unwrap_or(self.block).max(1);
+        if let Some(first) = self.first_ask.take() {
+            ask = ask.min(first.max(1));
+        }
         // #7024: bytes carried in that make a window already (a pipe's probe of 4 MiB) are handed out as
         // one, up to their last line break. Reading a block onto them would grow the probe's buffer to
         // twice its size, and a window to the probe and a block. The bytes carried after a window are
         // past its last line break, so they hold none and are never cut here.
-        if bytes.len() >= ask {
-            if let Some(at) = last_line_break(&bytes) {
-                self.carried = bytes.split_off(at + 1);
-                return Some(bytes);
+        if bytes.len() - floor >= ask {
+            if let Some(at) = last_line_break(&bytes[floor..]) {
+                self.carried = bytes.split_off(floor + at + 1);
+                return Ok(bytes);
             }
         }
         let mut on_error = Some(on_error);
@@ -2009,7 +2044,11 @@ impl LineWindows {
                 }
             }
             if self.eof {
-                return (!bytes.is_empty()).then_some(bytes);
+                return if bytes.len() > floor {
+                    Ok(bytes)
+                } else {
+                    Err(bytes)
+                };
             }
             let n = self.remaining.map_or(ask, |left| {
                 ask.min(usize::try_from(left).unwrap_or(usize::MAX))
@@ -2019,6 +2058,7 @@ impl LineWindows {
             if bytes.try_reserve(n).is_err() {
                 self.fail(
                     &mut bytes,
+                    floor,
                     &mut on_error,
                     &io::Error::from(io::ErrorKind::OutOfMemory),
                 );
@@ -2035,14 +2075,14 @@ impl LineWindows {
                     }
                 }
                 Err(error) => {
-                    self.fail(&mut bytes, &mut on_error, &error);
+                    self.fail(&mut bytes, floor, &mut on_error, &error);
                     continue;
                 }
             }
             if !self.eof {
                 if let Some(at) = last_line_break(&bytes[before..]) {
                     self.carried = bytes.split_off(before + at + 1);
-                    return Some(bytes);
+                    return Ok(bytes);
                 }
                 // No line break in what was read: a long line, read on twice as far.
                 ask = ask.saturating_mul(2);
@@ -2074,6 +2114,7 @@ impl LineWindows {
     fn fail(
         &mut self,
         bytes: &mut Vec<u8>,
+        floor: usize,
         on_error: &mut Option<impl FnOnce(&io::Error)>,
         error: &io::Error,
     ) {
@@ -2081,11 +2122,11 @@ impl LineWindows {
         if let Some(report) = on_error.take() {
             report(error);
         }
-        let kept = bytes
+        let kept = bytes[floor..]
             .iter()
             .rposition(|&b| b == b'\n')
             .map_or(0, |at| at + 1);
-        bytes.truncate(kept);
+        bytes.truncate(floor + kept);
     }
 }
 
@@ -3194,6 +3235,93 @@ mod tests {
             b"x\n".to_vec(),
         );
         assert_eq!(short.next_window(None, |_| ()), Some(b"x\ny\n".to_vec()));
+    }
+
+    /// #7264: the first window of a source started on a few KiB reads no more than the rest of the
+    /// front, and the windows after it are the block's again; the lines are the same either way.
+    #[test]
+    fn the_first_window_reads_no_more_than_it_was_asked_to_7264() {
+        let text: Vec<u8> = (0..40)
+            .flat_map(|n| format!("{n:07}\n").into_bytes())
+            .collect();
+        let windows = |first: Option<usize>| {
+            let mut w = LineWindows::new(
+                Box::new(io::Cursor::new(text.clone())),
+                Some(text.len() as u64),
+                64,
+                Vec::new(),
+            );
+            if let Some(first) = first {
+                w = w.with_first_window(first);
+            }
+            std::iter::from_fn(|| w.next_window(Some(1000), |_| ())).collect::<Vec<_>>()
+        };
+        let plain = windows(None);
+        let small = windows(Some(16));
+        assert_eq!(plain.len(), 1, "one window of the 320 bytes");
+        assert_eq!(
+            small[0],
+            text[..16].to_vec(),
+            "the first stops at its 16 bytes"
+        );
+        assert!(small.len() >= 2, "{} windows", small.len());
+        assert_eq!(small.concat(), plain.concat(), "the same lines");
+    }
+
+    /// #7264: a window read onto a text is that text and the window, cut where the window alone would
+    /// be; a read that fails keeps the text whole and drops only the line it cut; no window hands the
+    /// text back.
+    #[test]
+    fn a_window_read_onto_a_text_is_the_text_and_the_window_7264() {
+        let text: Vec<u8> = (0..40)
+            .flat_map(|n| format!("{n:07}\n").into_bytes())
+            .collect();
+        let source = || {
+            LineWindows::new(
+                Box::new(io::Cursor::new(text.clone())),
+                None,
+                20,
+                b"carried\n".to_vec(),
+            )
+        };
+        let mut alone = source();
+        let mut onto = source();
+        let prefix = b"no newline at the end of the text".to_vec();
+        loop {
+            let window = alone.next_window(None, |_| ());
+            let after = onto.next_window_after(None, prefix.clone(), |_| ());
+            match (window, after) {
+                (Some(window), Ok(after)) => {
+                    assert_eq!(after, [prefix.as_slice(), &window].concat());
+                }
+                (None, Err(back)) => {
+                    assert_eq!(back, prefix);
+                    break;
+                }
+                (window, after) => panic!("{window:?} against {after:?}"),
+            }
+        }
+        let mut failing = LineWindows::new(
+            Box::new(Failing(io::Cursor::new(b"a\nb\ncut".to_vec()))),
+            None,
+            64,
+            Vec::new(),
+        );
+        let mut reported = 0;
+        let kept = failing.next_window_after(None, b"head".to_vec(), |_| reported += 1);
+        assert_eq!(kept, Ok(b"heada\nb\n".to_vec()));
+        assert_eq!(reported, 1);
+        let mut no_newline = LineWindows::new(
+            Box::new(Failing(io::Cursor::new(b"cut".to_vec()))),
+            None,
+            64,
+            Vec::new(),
+        );
+        assert_eq!(
+            no_newline.next_window_after(None, b"x\ny".to_vec(), |_| ()),
+            Err(b"x\ny".to_vec()),
+            "the text's own line break is not the window's"
+        );
     }
 
     /// #7023: a read that fails ends the source with the lines before it, and the line it cut is not
