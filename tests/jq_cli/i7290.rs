@@ -185,6 +185,26 @@ fn test_wide_object_with_repeated_keys_sums_its_collapsed_values_7290() -> Resul
 fn test_colliding_key_hashes_collapse_nothing_7290() -> Result<()> {
     let pair = r#"{"key-one-padding!":1,"kwjfpwvojvWuiqDf":2}"#;
     let repeat = r#"{"key-one-padding!":1,"kwjfpwvojvWuiqDf":2,"key-one-padding!":3}"#;
+    // The second key of a colliding pair repeated; four, three and five keys on the one hash
+    // (`i7f35QhA5RFytU=l`, `MO7swvZKnn*|^JFk` and `QpymxnKzS~a*(k]#` share it too), with repeats.
+    let second = r#"{"key-one-padding!":1,"kwjfpwvojvWuiqDf":2,"kwjfpwvojvWuiqDf":3}"#;
+    let four = r#"{"key-one-padding!":1,"kwjfpwvojvWuiqDf":2,"i7f35QhA5RFytU=l":3,"MO7swvZKnn*|^JFk":4,"kwjfpwvojvWuiqDf":5,"MO7swvZKnn*|^JFk":6,"key-one-padding!":7}"#;
+    let three = r#"{"i7f35QhA5RFytU=l":1,"MO7swvZKnn*|^JFk":2,"QpymxnKzS~a*(k]#":3,"i7f35QhA5RFytU=l":4,"QpymxnKzS~a*(k]#":5}"#;
+    // Ten fields, past the pairwise check: five colliding keys, each twice.
+    let keys = [
+        "key-one-padding!",
+        "kwjfpwvojvWuiqDf",
+        "i7f35QhA5RFytU=l",
+        "MO7swvZKnn*|^JFk",
+        "QpymxnKzS~a*(k]#",
+    ];
+    let five = format!(
+        "{{{}}}",
+        (0..10)
+            .map(|i| format!("\"{}\":{}", keys[i % 5], i + 1))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
     let mut wide = String::from("{");
     for i in 0..200 {
         wide.push_str(&format!("\"k{i}\":{i},"));
@@ -198,6 +218,13 @@ fn test_colliding_key_hashes_collapse_nothing_7290() -> Result<()> {
         (repeat, "[.[]]|add", "5\n"),
         (wide.as_str(), "[.[]]|add", "19903\n"),
         (wide.as_str(), "[.[]]|length", "202\n"),
+        (second, "[.[]]", "[1,3]\n"),
+        (second, "[.[]]|add", "4\n"),
+        (four, "[.[]]", "[7,5,3,6]\n"),
+        (four, "[.[]]|add", "21\n"),
+        (three, "[.[]]", "[4,2,5]\n"),
+        (five.as_str(), "[.[]]", "[6,7,8,9,10]\n"),
+        (five.as_str(), "[.[]]|add", "40\n"),
     ] {
         let (out, err, code) = run_jq_full(&["-c", filter], Some(document))?;
         assert_eq!(

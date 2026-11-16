@@ -3806,11 +3806,12 @@ pub fn effective_fields_checked<F: DocumentFields>(
 /// collecting `into_iter().map(..)` reuses the source buffer. On `wide-100mb` (8.2 M fields) that
 /// buffer was 1.2 GB of the run's peak.
 ///
-/// `capacity` is the caller's upper bound on the field count (0 for none): both lists are
-/// reserved at it, so neither is copied as it grows. The keys are hashed
-/// [`KEY_HASH_BATCH`] at a time rather than one per step of the walk, which measured 3-5% faster
-/// on an M4 Pro over an object whose values are containers, where hashing inside the walk was
-/// 2-4% slower than the field list it replaced.
+/// The keys are hashed [`KEY_HASH_BATCH`] at a time rather than one per step of the walk, which
+/// measured 3-5% faster on an M4 Pro over an object whose values are containers, where hashing
+/// inside the walk was 2-4% slower than the field list it replaced. The first
+/// [`SMALL_OBJECT_FIELDS`] hashes live on the stack and are compared pairwise, so an object that
+/// small allocates nothing but its cursor list: the batch and the hash list, and the sort, are
+/// for a wider one.
 ///
 /// Only an object whose key hashes repeat, under a collapsing mode, walks a second time
 /// (`collapse_repeated_cursors`): the collapse needs the keys, and a hash shared by two
@@ -3819,11 +3820,14 @@ pub fn effective_fields_checked<F: DocumentFields>(
 pub fn effective_value_cursors_checked<F: DocumentFields>(
     fields: &F,
     collapse: bool,
-    capacity: usize,
 ) -> Result<Vec<F::Cursor>, EvalError> {
-    let mut out = Vec::with_capacity(capacity);
-    let mut hashes: Vec<u64> = Vec::with_capacity(if collapse { capacity } else { 0 });
-    let mut batch: Vec<F::Value> = Vec::with_capacity(if collapse { KEY_HASH_BATCH } else { 0 });
+    let mut out = Vec::new();
+    // The hashes of the first `SMALL_OBJECT_FIELDS` keyed fields; past them, `hashes` takes
+    // these and every later one, through `batch`.
+    let mut small = [0u64; SMALL_OBJECT_FIELDS];
+    let mut small_len = 0usize;
+    let mut hashes: Vec<u64> = Vec::new();
+    let mut batch: Vec<F::Value> = Vec::new();
     let mut walk = fields.clone();
     let mut is_first = true;
     while let Some((field, rest)) = walk.uncons() {
@@ -3835,9 +3839,20 @@ pub fn effective_value_cursors_checked<F: DocumentFields>(
         }
         out.push(field.value_cursor);
         if collapse {
-            batch.push(field.key);
-            if batch.len() == KEY_HASH_BATCH {
-                hashes.extend(batch.drain(..).filter_map(|key| key_hash_of(&key)));
+            if out.len() <= SMALL_OBJECT_FIELDS {
+                if let Some(hash) = key_hash_of(&field.key) {
+                    small[small_len] = hash;
+                    small_len += 1;
+                }
+            } else {
+                if batch.capacity() == 0 {
+                    batch.reserve_exact(KEY_HASH_BATCH);
+                    hashes.extend_from_slice(&small[..small_len]);
+                }
+                batch.push(field.key);
+                if batch.len() == KEY_HASH_BATCH {
+                    hashes.extend(batch.drain(..).filter_map(|key| key_hash_of(&key)));
+                }
             }
         }
         walk = rest;
@@ -3851,14 +3866,32 @@ pub fn effective_value_cursors_checked<F: DocumentFields>(
             return Err(walk.malformed_member_error());
         }
     }
-    hashes.extend(batch.drain(..).filter_map(|key| key_hash_of(&key)));
     // `keys_repeat`'s answer: it hashes the same keys, skipping the same ones, and asks the
     // same question of fewer than two fields.
-    if collapse && out.len() >= 2 && any_hash_repeats(hashes) {
+    let repeats = collapse
+        && out.len() >= 2
+        && if out.len() <= SMALL_OBJECT_FIELDS {
+            let small = &small[..small_len];
+            small
+                .iter()
+                .enumerate()
+                .any(|(i, hash)| small[i + 1..].contains(hash))
+        } else {
+            hashes.extend(batch.drain(..).filter_map(|key| key_hash_of(&key)));
+            any_hash_repeats(hashes)
+        };
+    if repeats {
         return Ok(collapse_repeated_cursors(fields, out));
     }
     Ok(out)
 }
+
+/// The widest object whose key hashes [`effective_value_cursors_checked`] keeps on the stack.
+///
+/// They are compared pairwise (#7290). A record of a few fields is the common object, often met
+/// by the million; allocating a hash list and a key batch for each one cost a third more
+/// instructions than the field list did on one-field objects.
+pub const SMALL_OBJECT_FIELDS: usize = 8;
 
 /// How many keys [`effective_value_cursors_checked`] holds before hashing them: a few
 /// kilobytes of decoded keys, so the batch stays in the first-level cache.

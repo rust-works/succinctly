@@ -16734,11 +16734,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                     return GenericResult::Error(err);
                 }
                 // #7290: the value cursors alone, not the field list.
-                match effective_value_cursors_checked(
-                    &fields,
-                    true,
-                    object_field_bound(cursor.as_ref()),
-                ) {
+                match effective_value_cursors_checked(&fields, true) {
                     Ok(cursors) => {
                         if cursors.is_empty() {
                             GenericResult::None
@@ -21809,7 +21805,7 @@ fn any_all_f_generic<S: EvalSemantics, V: DocumentValue>(
         // `[false]` under yq too, and so is the eager `any_all_f`'s walk.
         // The mode constant governs the *keys* builtins, where yq keeps every
         // occurrence; here it would have answered `any(.)` `true`.
-        match effective_value_cursors_checked(&fields, true, object_field_bound(Some(&cursor))) {
+        match effective_value_cursors_checked(&fields, true) {
             Ok(cursors) => {
                 for value_cursor in cursors {
                     if let Some(result) = probe(value_cursor, &mut matches) {
@@ -30486,22 +30482,6 @@ fn add_cursors_generic<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
-/// An upper bound on the field count of the object at `cursor`, for
-/// [`effective_value_cursors_checked`] to reserve its lists at (#7290): a field is a key node and
-/// a value node, each an open and a close parenthesis in the node numbering, so the subtree holds
-/// at least four positions per field. Exact for an object of scalars, loose where the values are
-/// containers, which costs address space and not memory: a reserved page is never touched. Capped
-/// at 2^24 fields, and 0 (grow as needed) without a cursor.
-fn object_field_bound<C: DocumentCursor>(cursor: Option<&C>) -> usize {
-    cursor
-        .and_then(|c| {
-            c.subtree_end()
-                .map(|end| end.saturating_sub(c.node_id()) / 4)
-        })
-        .unwrap_or(0)
-        .min(1 << 24)
-}
-
 /// How many times [`add_cursors_generic`] ran on this thread, so a test can assert that
 /// `[.[]] | add` takes it (#7290): the `_` arm it replaced answers the same. `cfg(test)` only.
 #[cfg(test)]
@@ -38840,11 +38820,7 @@ fn any_all_generic<S: EvalSemantics, V: DocumentValue>(
         if S::TAG == EvalTag::Yq {
             return yq_reject_non_array();
         }
-        match effective_value_cursors_checked(
-            &fields,
-            S::COLLAPSE_DUPLICATE_KEYS,
-            object_field_bound(Some(&cursor)),
-        ) {
+        match effective_value_cursors_checked(&fields, S::COLLAPSE_DUPLICATE_KEYS) {
             Ok(cursors) => {
                 for value_cursor in cursors {
                     let truthy = !value_cursor.is_falsy();
@@ -46529,6 +46505,9 @@ mod tests {
             // Two different keys with one 64-bit hash: the collapse walk runs and keeps both.
             br#"{"key-one-padding!":1,"kwjfpwvojvWuiqDf":2}"#,
             br#"{"key-one-padding!":1,"kwjfpwvojvWuiqDf":2,"key-one-padding!":3}"#,
+            br#"{"key-one-padding!":1,"kwjfpwvojvWuiqDf":2,"kwjfpwvojvWuiqDf":3}"#,
+            br#"{"key-one-padding!":1,"kwjfpwvojvWuiqDf":2,"i7f35QhA5RFytU=l":3,"MO7swvZKnn*|^JFk":4,"kwjfpwvojvWuiqDf":5,"MO7swvZKnn*|^JFk":6,"key-one-padding!":7}"#,
+            br#"{"key-one-padding!":1,"kwjfpwvojvWuiqDf":2,"i7f35QhA5RFytU=l":3,"MO7swvZKnn*|^JFk":4,"QpymxnKzS~a*(k]#":5,"key-one-padding!":6,"kwjfpwvojvWuiqDf":7,"i7f35QhA5RFytU=l":8,"MO7swvZKnn*|^JFk":9,"QpymxnKzS~a*(k]#":10}"#,
             br#"{"a":1,}"#,
             br#"{"a":1 "b":2}"#,
             br#"{"a" 1,"b":2}"#,
@@ -46558,22 +46537,15 @@ mod tests {
                             .collect::<Vec<_>>()
                     })
                     .map_err(|e| alloc::format!("{e:?}"));
-                // Unreserved and reserved at the bound `.[]` passes: the same answer.
-                for capacity in [0, object_field_bound(Some(&root))] {
-                    let cursors = effective_value_cursors_checked(&fields, collapse, capacity)
-                        .map(|cs| cs.iter().map(DocumentCursor::node_id).collect::<Vec<_>>())
-                        .map_err(|e| alloc::format!("{e:?}"));
-                    assert_eq!(
-                        cursors,
-                        list,
-                        "{} collapse={collapse} capacity={capacity}",
-                        String::from_utf8_lossy(json)
-                    );
-                }
-                // The bound is never below the field count.
-                if let Ok(all) = effective_fields_checked(&fields, false) {
-                    assert!(object_field_bound(Some(&root)) >= all.len());
-                }
+                let cursors = effective_value_cursors_checked(&fields, collapse)
+                    .map(|cs| cs.iter().map(DocumentCursor::node_id).collect::<Vec<_>>())
+                    .map_err(|e| alloc::format!("{e:?}"));
+                assert_eq!(
+                    cursors,
+                    list,
+                    "{} collapse={collapse}",
+                    String::from_utf8_lossy(json)
+                );
                 if list.is_ok() {
                     answered += 1;
                 } else {
@@ -46581,15 +46553,39 @@ mod tests {
                 }
             }
         }
-        assert_eq!((answered, raised), (20, 10));
-        // Exact for an object of scalars: two nodes per field.
-        let flat = br#"{"a":1,"b":"x","c":null,"d":true}"#;
-        let index = JsonIndex::build(flat);
-        assert_eq!(object_field_bound(Some(&index.root(flat))), 4);
-        assert_eq!(
-            object_field_bound::<crate::json::light::JsonCursor<'_>>(None),
-            0
-        );
+        assert_eq!((answered, raised), (26, 10));
+        // Either side of the pairwise check's `SMALL_OBJECT_FIELDS`: no repeat, a repeat inside
+        // the first fields, one between the first field and the last, and one between the last
+        // two, at every width from 2 to 3 past the batch.
+        for n in [2, 3, 7, 8, 9, 10, 16, 63, 64, 65, 66, 72, 73] {
+            for repeat in [None, Some((0, 1)), Some((0, n - 1)), Some((n - 2, n - 1))] {
+                let mut text = alloc::string::String::from("{");
+                for i in 0..n {
+                    let key = match repeat {
+                        Some((first, again)) if i == again => first,
+                        _ => i,
+                    };
+                    text.push_str(&alloc::format!("\"k{key}\":{i},"));
+                }
+                text.pop();
+                text.push('}');
+                let json = text.as_bytes();
+                let index = JsonIndex::build(json);
+                let fields = index.root(json).value().as_object().expect("an object");
+                let list: Vec<_> = effective_fields_checked(&fields, true)
+                    .expect("well-formed")
+                    .iter()
+                    .map(|f| f.value_cursor.node_id())
+                    .collect();
+                let cursors: Vec<_> = effective_value_cursors_checked(&fields, true)
+                    .expect("well-formed")
+                    .iter()
+                    .map(DocumentCursor::node_id)
+                    .collect();
+                assert_eq!(cursors, list, "{text}");
+                assert_eq!(list.len(), n - usize::from(repeat.is_some()), "{text}");
+            }
+        }
 
         // YAML: repeated keys, a `<<` merge, an alias, a complex key and flow mappings, each
         // mapping of the document in turn, as yq's build reads them.
@@ -46608,8 +46604,8 @@ mod tests {
         }
         let mut collapsed_some = 0;
         for fields in &mappings {
-            let raw = effective_value_cursors_checked(fields, false, 0).expect("well-formed");
-            let kept = effective_value_cursors_checked(fields, true, 0).expect("well-formed");
+            let raw = effective_value_cursors_checked(fields, false).expect("well-formed");
+            let kept = effective_value_cursors_checked(fields, true).expect("well-formed");
             collapsed_some += usize::from(kept.len() < raw.len());
             for collapse in [false, true] {
                 let list: Vec<_> = effective_fields_checked(fields, collapse)
@@ -46617,7 +46613,7 @@ mod tests {
                     .iter()
                     .map(|f| f.value_cursor.node_id())
                     .collect();
-                let cursors: Vec<_> = effective_value_cursors_checked(fields, collapse, 0)
+                let cursors: Vec<_> = effective_value_cursors_checked(fields, collapse)
                     .expect("well-formed")
                     .iter()
                     .map(DocumentCursor::node_id)
