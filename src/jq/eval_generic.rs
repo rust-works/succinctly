@@ -117,7 +117,8 @@ use super::tail_call::{
     Tail, TailRounds,
 };
 use super::value::{
-    owned_value_eq, subarray_indices, NumberRepr, ObjectMapOf, OwnedValue, Teardown,
+    jq_literal_int_to_f64, owned_value_eq, subarray_indices, NumberRepr, ObjectMapOf, OwnedValue,
+    Teardown,
 };
 
 /// Recursion-depth ceiling for [`to_owned`]/[`to_owned_cursor`]/
@@ -30362,6 +30363,59 @@ fn key_elements_generic<S: EvalSemantics, V: DocumentValue>(
     Ok(keyed)
 }
 
+/// A document number's value as [`to_owned_cursor`] would build it, read without building it
+/// (#7278): the repr of the `OwnedValue::NumberLiteral` it would make, and whether its spelling is
+/// a negative zero (`-0`, whose sign only the text carries). The spelling itself is not copied:
+/// a fold that only reads the value (`add`, the `min`/`max` walk) never needs it, and the document
+/// still holds it for the one that does.
+///
+/// `None` for everything else, which the caller decodes as before: a non-number, a jq-mode
+/// spelling the plain parse does not read (`.inf`, `0x1f`), a bridge's computed number (bare, not a
+/// literal), a tagged or JSON-sourced YAML scalar, and any value outside jq mode. It follows
+/// `to_owned_cursor`'s scalar route step for step (no tag, no canonicalized numbers, the bridge's
+/// computed numbers first, `number_literal`, then `OwnedValue::from_number_literal`'s own
+/// non-finite gate and parse), and `borrowed_number_matches_the_decode_7278` checks it against that
+/// route. The caller asks only while no `as` binding is in scope (`to_owned_cursor`'s first test).
+struct BorrowedNumber {
+    repr: NumberRepr,
+    negative_zero: bool,
+}
+
+fn borrowed_document_number<S: EvalSemantics, C: DocumentCursor>(
+    cursor: &C,
+) -> Option<BorrowedNumber> {
+    if S::TAG != EvalTag::Jq || cursor.explicit_tag().is_some() || cursor.canonicalize_numbers() {
+        return None;
+    }
+    let value = cursor.value();
+    if value.bridge_computed_int().is_some() || value.bridge_computed_float().is_some() {
+        return None;
+    }
+    let literal = value.number_literal()?;
+    if literal.len() <= 5
+        && matches!(literal.as_bytes().first(), Some(b'.' | b'+' | b'-'))
+        && crate::yaml::nonfinite_literal_value(&literal).is_some()
+    {
+        return None;
+    }
+    let repr = crate::jq::value::parse_i64_or_f64_in::<S>(&literal)?;
+    Some(BorrowedNumber {
+        repr,
+        negative_zero: matches!(repr, NumberRepr::Int(0)) && literal.starts_with('-'),
+    })
+}
+
+/// The tie-break of two document numbers' literal comparison: their spellings, read off the
+/// document, compared as exact decimals ([`crate::jq::value::cmp_literal_texts`]). Both cursors
+/// were keyed by [`borrowed_document_number`] or `plain_int_at`, so both are number tokens.
+fn literal_spellings_cmp<C: DocumentCursor>(a: &C, b: &C) -> core::cmp::Ordering {
+    let (a, b) = (a.value(), b.value());
+    match (a.number_literal(), b.number_literal()) {
+        (Some(a), Some(b)) => crate::jq::value::cmp_literal_texts(&a, &b),
+        _ => unreachable!("both keys were read off a number token"), // patchcov: coverage tolerate-line reason="unreachable: a key is a bare number only when its cursor's `number_literal` answered (#7278)"
+    }
+}
+
 /// How many times [`extremum_streaming_generic`] ran on this thread, so a test can assert that bare
 /// `min`/`max` take that walk (#7261): its dispatch once sat in an arm they never reach, and every
 /// answer stayed right while each element's cursor and key were collected first. `cfg(test)` only.
@@ -30388,8 +30442,11 @@ pub(crate) mod extremum_walk_count {
 /// `key_elements_generic` does it (the #1677/#2261 delimiter checks, `to_owned_cursor`'s checked
 /// conversion), and the winner is the element itself, a cursor, so a duplicate key it holds is not
 /// collapsed (#1687). The first of equal minima and the last of equal maxima win, which is what
-/// `Iterator::min_by`/`max_by` did to the keyed vector. The one difference is which of two faults
-/// in the same array is reported when it has both: this walk meets them in document order.
+/// `Iterator::min_by`/`max_by` did to the keyed vector.
+///
+/// A document number is keyed by its parsed value alone ([`borrowed_document_number`]), not decoded
+/// into an `OwnedValue` with an owned copy of its spelling (#7278): only a double tie between two
+/// such keys reads the two spellings, off the document, as jq's exact literal comparison does.
 fn extremum_streaming_generic<S: EvalSemantics, V: DocumentValue>(
     elements: V::Elements,
     want_max: bool,
@@ -30397,9 +30454,10 @@ fn extremum_streaming_generic<S: EvalSemantics, V: DocumentValue>(
 ) -> GenericResult<V> {
     #[cfg(test)]
     extremum_walk_count::bump();
-    /// The winner's key: a plain integer is held bare, anything else as the decoded value.
+    /// The winner's key: a document number is held as its literal's double and `i64` (the parts
+    /// jq's literal comparison reads first), anything else as the decoded value.
     enum Key {
-        Int(i64),
+        Number(f64, Option<i64>),
         Owned(OwnedValue),
     }
     // The delimiter fault of this array, suppressed by `optional` as `owned_or_suppress!` does.
@@ -30412,8 +30470,8 @@ fn extremum_streaming_generic<S: EvalSemantics, V: DocumentValue>(
         }
     };
     // Nothing the walk does changes the table, so it is asked once: while a binding's embedded
-    // node could be handed back instead of a decoded copy (`to_owned_cursor`'s own first test) the
-    // integer read is not taken.
+    // node could be handed back instead of a decoded copy (`to_owned_cursor`'s own first test) no
+    // number is read bare.
     let table_live = embed_table::live();
     let mut winner: Option<(Key, V::Cursor)> = None;
     let mut last: Option<V::Cursor> = None;
@@ -30435,9 +30493,18 @@ fn extremum_streaming_generic<S: EvalSemantics, V: DocumentValue>(
             None
         } else {
             pos.and_then(|pos| cursor.plain_int_at(pos))
+                .map(|i| Key::Number(jq_literal_int_to_f64(i), Some(i)))
+                .or_else(|| {
+                    // A NaN literal keeps the decoded comparison and its NaN rules (#6008).
+                    borrowed_document_number::<S, _>(&cursor).and_then(|number| match number.repr {
+                        NumberRepr::Int(i) => Some(Key::Number(jq_literal_int_to_f64(i), Some(i))),
+                        NumberRepr::Float(f) if f.is_nan() => None,
+                        NumberRepr::Float(f) => Some(Key::Number(f, None)),
+                    })
+                })
         };
         let mut key = match fast {
-            Some(i) => Key::Int(i),
+            Some(key) => key,
             // STYLE-0012: raises regardless of `optional`, as `key_elements_generic`'s bare arm
             // does (see its comment): `to_owned_cursor` raises only decode failures, which
             // `suppresses` never suppresses, so routing it would be a guaranteed no-op.
@@ -30449,22 +30516,23 @@ fn extremum_streaming_generic<S: EvalSemantics, V: DocumentValue>(
         let replaces = match winner.as_mut() {
             None => true,
             Some((best, best_cursor)) => {
-                // Two bare integers compare as `i64`s, exactly as their literals do. Against a
-                // decoded element the bare side is decoded too, so two document numbers compare
-                // as jq compares two literals (`compare_values` on both spellings) and not as an
-                // `i64` against the other's `f64`: `[123456789012345679,123456789012345678.9] |
-                // min` is the fraction in jq 1.7.1, where the `f64`s are equal (#7261).
+                // Two document numbers compare as jq compares two literals: integers by value,
+                // otherwise by double, and a double tie by the exact decimals, read off the
+                // document only then (`[123456789012345679,123456789012345678.9] | min` is the
+                // fraction in jq 1.7.1, where the doubles are equal, #7261). Against a decoded
+                // element the bare side is decoded too, so the pair compares as `compare_values`
+                // compares any two values.
                 let upgrade = |side: &mut Key, at: &V::Cursor| -> Result<(), EvalError> {
-                    if matches!(side, Key::Int(_)) {
-                        // STYLE-0012: the same unsuppressible decode as the key above (a plain
-                        // integer's never fails); the caller raises it regardless of `optional`.
+                    if matches!(side, Key::Number(..)) {
+                        // STYLE-0012: the same unsuppressible decode as the key above (a number
+                        // read bare never fails it); the caller raises it regardless of `optional`.
                         *side = Key::Owned(to_owned_cursor::<S, _>(at)?);
                     }
                     Ok(())
                 };
                 if matches!(
                     (&key, &*best),
-                    (Key::Int(_), Key::Owned(_)) | (Key::Owned(_), Key::Int(_))
+                    (Key::Number(..), Key::Owned(_)) | (Key::Owned(_), Key::Number(..))
                 ) {
                     if let Err(error) =
                         upgrade(&mut key, &cursor).and_then(|()| upgrade(best, best_cursor))
@@ -30473,9 +30541,13 @@ fn extremum_streaming_generic<S: EvalSemantics, V: DocumentValue>(
                     }
                 }
                 let order = match (&key, &*best) {
-                    (Key::Int(a), Key::Int(b)) => a.cmp(b),
+                    (Key::Number(a, ai), Key::Number(b, bi)) => {
+                        crate::jq::value::cmp_jq_number_literals((*a, *ai), (*b, *bi), || {
+                            literal_spellings_cmp(&cursor, best_cursor)
+                        })
+                    }
                     (Key::Owned(a), Key::Owned(b)) => compare_values::<S>(a, b),
-                    _ => unreachable!("a bare integer beside a decoded key was decoded above"),
+                    _ => unreachable!("a bare number beside a decoded key was decoded above"), // patchcov: coverage tolerate-line reason="unreachable: a mixed pair is decoded on both sides just above (#7261)"
                 };
                 if want_max {
                     order != core::cmp::Ordering::Less
@@ -40177,6 +40249,25 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
             let mut total: Option<OwnedValue> = None;
             let mut failed: Option<EvalError> = None;
             for element in &cursors {
+                // #7278: once the sum is a number, a document number is added as its value
+                // alone: the result is computed, so the spelling `to_owned_cursor` would copy is
+                // never read. Not the first number, which `[1.0] | add` and `null + 1.0` print
+                // as written. A `-0` literal reads as `-0.0`, as `arith_add` reads it.
+                if failed.is_none() && total.as_ref().is_some_and(OwnedValue::is_number) {
+                    if let Some(number) = borrowed_document_number::<S, _>(element) {
+                        let operand = match number.repr {
+                            _ if number.negative_zero => OwnedValue::Float(-0.0),
+                            NumberRepr::Int(i) => OwnedValue::Int(i),
+                            NumberRepr::Float(f) => OwnedValue::Float(f),
+                        };
+                        let acc = total.take().unwrap_or(OwnedValue::Null);
+                        match crate::jq::eval::arith_add::<S>(acc, operand) {
+                            Ok(sum) => total = Some(sum),
+                            Err(error) => failed = Some(error), // patchcov: coverage tolerate-line reason="unreachable: two numbers always add (#7278)"
+                        }
+                        continue;
+                    }
+                }
                 let item = owned_or_suppress!(to_owned_cursor::<S, _>(element), optional);
                 if failed.is_some() {
                     continue;
@@ -46285,6 +46376,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #7278: `borrowed_document_number` answers exactly the repr `to_owned_cursor` builds for a
+    /// document number, and `None` wherever that is not a `NumberLiteral`, over the spellings jq's
+    /// reader accepts (fractions, exponents, `-0`, 17+ digits, past `i64`, `1e1000`, the lenient
+    /// `007`/`.5`) and non-numbers. Its `negative_zero` is the spelling's sign on an integer zero,
+    /// what `arith_add` reads. yq mode never reads a number bare.
+    #[cfg(feature = "std")]
+    #[test]
+    fn borrowed_number_matches_the_decode_7278() {
+        let json: &[u8] = br#"[0,-0,1,1.0,1.00,-1,1e2,1E+2,-0.0,0.10,3.1415930,123456789012345678,
+            123456789012345679,123456789012345678.9,9007199254740993,9223372036854775807,
+            9223372036854775808,-9223372036854775809,100000000000000000001,1e1000,-1e1000,
+            1e-400,0.1,2.5e-3,"1",null,true,[1],{"a":1}]"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let mut elems = root.value().as_array().expect("an array");
+        let (mut numbers, mut others, mut zeros) = (0, 0, 0);
+        while let Some((cursor, rest)) = elems.uncons_cursor() {
+            let decoded = to_owned_cursor::<JqSemantics, _>(&cursor).expect("decodes");
+            let bare = borrowed_document_number::<JqSemantics, _>(&cursor);
+            match (&decoded, &bare) {
+                (OwnedValue::NumberLiteral(repr, text), Some(number)) => {
+                    let same = match (repr, number.repr) {
+                        (NumberRepr::Int(a), NumberRepr::Int(b)) => *a == b,
+                        (NumberRepr::Float(a), NumberRepr::Float(b)) => a.to_bits() == b.to_bits(),
+                        _ => false,
+                    };
+                    assert!(
+                        same,
+                        "{text}: {repr:?} decoded, {:?} read bare",
+                        number.repr
+                    );
+                    let signed_zero = matches!(repr, NumberRepr::Int(0)) && text.starts_with('-');
+                    assert_eq!(number.negative_zero, signed_zero, "{text}");
+                    zeros += usize::from(signed_zero);
+                    numbers += 1;
+                }
+                (_, None) if !matches!(decoded, OwnedValue::NumberLiteral(..)) => others += 1,
+                _ => panic!(
+                    "{} decoded, {:?} read bare",
+                    decoded.to_json(),
+                    bare.map(|b| b.repr)
+                ),
+            }
+            assert!(borrowed_document_number::<YqSemantics, _>(&cursor).is_none());
+            elems = rest;
+        }
+        assert_eq!((numbers, others, zeros), (24, 5, 1));
     }
 
     /// #6534: in yq mode a string's `length` inside a loop body is read off the string, not off a

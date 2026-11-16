@@ -6436,6 +6436,36 @@ pub(crate) fn bridge_keeps_int_computed<S: EvalSemantics>(n: i64) -> bool {
     S::TAG == EvalTag::Jq && jq_int_within_exact_f64_range(n)
 }
 
+/// How jq orders two number *literals* (`decNumberCompare`), given each one's double (jq's
+/// 17-digit-rounded one, [`jq_literal_int_to_f64`] for an integer) and its `i64` when it has one:
+/// two integers by value, otherwise by double, and a double tie by the exact decimals, which
+/// `texts` compares (it is asked only then, so a caller that holds no spelling reads one only on a
+/// tie). The one definition [`jq_numeric_cmp`] and the `min`/`max` walk over document numbers
+/// share (#7278).
+pub(crate) fn cmp_jq_number_literals(
+    a: (f64, Option<i64>),
+    b: (f64, Option<i64>),
+    texts: impl FnOnce() -> core::cmp::Ordering,
+) -> core::cmp::Ordering {
+    if let (Some(x), Some(y)) = (a.1, b.1) {
+        return x.cmp(&y);
+    }
+    match cmp_f64(a.0, b.0) {
+        core::cmp::Ordering::Equal => texts(),
+        strict => strict,
+    }
+}
+
+/// The tie-break of [`cmp_jq_number_literals`]: two literal spellings compared as exact decimals,
+/// byte-equal ones short-circuiting.
+pub(crate) fn cmp_literal_texts(a: &str, b: &str) -> core::cmp::Ordering {
+    if a == b {
+        core::cmp::Ordering::Equal
+    } else {
+        cmp_decimal_literals(a, b)
+    }
+}
+
 /// jq's own number comparison (`jvp_number_cmp`, `src/jv.c`), behind
 /// jq-mode `==` and ordering (#2906): two *literals* compare exactly as
 /// decimals (`decNumberCompare`), while any pair involving a *computed*
@@ -6535,19 +6565,9 @@ pub(crate) fn jq_numeric_cmp(left: &OwnedValue, right: &OwnedValue) -> Option<co
         literal.double
     }
     fn cmp_literals(a: &Literal<'_>, b: &Literal<'_>) -> Ordering {
-        if let (Some(x), Some(y)) = (a.int, b.int) {
-            return x.cmp(&y);
-        }
-        match cmp_f64(a.double, b.double) {
-            Ordering::Equal => {
-                if a.text == b.text {
-                    Ordering::Equal
-                } else {
-                    cmp_decimal_literals(a.text, b.text)
-                }
-            }
-            strict => strict,
-        }
+        cmp_jq_number_literals((a.double, a.int), (b.double, b.int), || {
+            cmp_literal_texts(a.text, b.text)
+        })
     }
 
     Some(match (side(left)?, side(right)?) {
