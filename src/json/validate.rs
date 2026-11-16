@@ -1000,8 +1000,10 @@ pub fn is_valid_number(bytes: &[u8]) -> bool {
     i == bytes.len()
 }
 
-/// [`is_valid_number`]'s answer as the token's text (#7287): `Some` exactly when the bytes are an
-/// RFC 8259 number, borrowed as a `&str` without a second validation pass. The grammar admits
+/// [`is_valid_number`]'s answer as the token's text (#7287).
+///
+/// `Some` exactly when the bytes are an RFC 8259 number, borrowed as a `&str` without a second
+/// validation pass. The grammar admits
 /// only ASCII bytes (`-`, `+`, `.`, `e`, `E` and digits), and ASCII is UTF-8, so a number that
 /// passed has nothing left for `str::from_utf8` to check.
 #[must_use]
