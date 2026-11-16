@@ -30362,6 +30362,26 @@ fn key_elements_generic<S: EvalSemantics, V: DocumentValue>(
     Ok(keyed)
 }
 
+/// How many times [`extremum_streaming_generic`] ran on this thread, so a test can assert that bare
+/// `min`/`max` take that walk (#7261): its dispatch once sat in an arm they never reach, and every
+/// answer stayed right while each element's cursor and key were collected first. `cfg(test)` only.
+#[cfg(test)]
+pub(crate) mod extremum_walk_count {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn bump() {
+        COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn get() -> usize {
+        COUNT.with(Cell::get)
+    }
+}
+
 /// jq's bare `min`/`max` over an array, as a single walk that keeps the winner so far (#5683).
 ///
 /// Every element is checked and keyed exactly as `collect_cursors_checked` followed by
@@ -30375,6 +30395,8 @@ fn extremum_streaming_generic<S: EvalSemantics, V: DocumentValue>(
     want_max: bool,
     optional: bool,
 ) -> GenericResult<V> {
+    #[cfg(test)]
+    extremum_walk_count::bump();
     /// The winner's key: a plain integer is held bare, anything else as the decoded value.
     enum Key {
         Int(i64),
@@ -30414,7 +30436,7 @@ fn extremum_streaming_generic<S: EvalSemantics, V: DocumentValue>(
         } else {
             pos.and_then(|pos| cursor.plain_int_at(pos))
         };
-        let key = match fast {
+        let mut key = match fast {
             Some(i) => Key::Int(i),
             // STYLE-0012: raises regardless of `optional`, as `key_elements_generic`'s bare arm
             // does (see its comment): `to_owned_cursor` raises only decode failures, which
@@ -30424,14 +30446,36 @@ fn extremum_streaming_generic<S: EvalSemantics, V: DocumentValue>(
                 Err(error) => return GenericResult::Error(error),
             },
         };
-        let replaces = match winner.as_ref() {
+        let replaces = match winner.as_mut() {
             None => true,
-            Some((best, _)) => {
-                let order = match (&key, best) {
+            Some((best, best_cursor)) => {
+                // Two bare integers compare as `i64`s, exactly as their literals do. Against a
+                // decoded element the bare side is decoded too, so two document numbers compare
+                // as jq compares two literals (`compare_values` on both spellings) and not as an
+                // `i64` against the other's `f64`: `[123456789012345679,123456789012345678.9] |
+                // min` is the fraction in jq 1.7.1, where the `f64`s are equal (#7261).
+                let upgrade = |side: &mut Key, at: &V::Cursor| -> Result<(), EvalError> {
+                    if matches!(side, Key::Int(_)) {
+                        // STYLE-0012: the same unsuppressible decode as the key above (a plain
+                        // integer's never fails); the caller raises it regardless of `optional`.
+                        *side = Key::Owned(to_owned_cursor::<S, _>(at)?);
+                    }
+                    Ok(())
+                };
+                if matches!(
+                    (&key, &*best),
+                    (Key::Int(_), Key::Owned(_)) | (Key::Owned(_), Key::Int(_))
+                ) {
+                    if let Err(error) =
+                        upgrade(&mut key, &cursor).and_then(|()| upgrade(best, best_cursor))
+                    {
+                        return GenericResult::Error(error);
+                    }
+                }
+                let order = match (&key, &*best) {
                     (Key::Int(a), Key::Int(b)) => a.cmp(b),
-                    (Key::Int(a), Key::Owned(b)) => compare_values::<S>(&OwnedValue::Int(*a), b),
-                    (Key::Owned(a), Key::Int(b)) => compare_values::<S>(a, &OwnedValue::Int(*b)),
                     (Key::Owned(a), Key::Owned(b)) => compare_values::<S>(a, b),
+                    _ => unreachable!("a bare integer beside a decoded key was decoded above"),
                 };
                 if want_max {
                     order != core::cmp::Ordering::Less
@@ -40035,17 +40079,6 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 _ => None,
             };
             let dedup = matches!(builtin, Builtin::Unique | Builtin::UniqueBy(_));
-            // #5683: jq's bare `min`/`max` keep the running winner as they walk, rather than
-            // collecting every element's cursor and then every element's key before comparing
-            // them (two vectors of the array's length, once per call, and a comma of the two
-            // paid it twice). The first minimum and the last maximum win, as below.
-            if !S::MIN_MAX_NEED_AN_ELEMENT && matches!(builtin, Builtin::Min | Builtin::Max) {
-                return extremum_streaming_generic::<S, V>(
-                    elements,
-                    matches!(builtin, Builtin::Max),
-                    optional,
-                );
-            }
             // #2261 (systematic sweep): `collect_cursors_checked`, not the
             // unchecked `collect_cursors` this arm used -- every one of
             // these builtins already resolves each element's cursor to
@@ -40187,6 +40220,19 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
             // earlier (there is no element to hang a check on).
             if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
                 return GenericResult::Error(err);
+            }
+            // #5683: jq's bare `min`/`max` keep the running winner as they walk, rather than
+            // collecting every element's cursor and then every element's key before comparing
+            // them (two vectors of the array's length, once per call, and a comma of the two
+            // paid it twice). The first minimum and the last maximum win, as below. This test once
+            // sat in the `sort` arm above, where it is never true, and every answer stayed right
+            // (#7261): `bare_min_max_take_the_single_walk_7261` pins that the walk runs.
+            if !S::MIN_MAX_NEED_AN_ELEMENT && matches!(builtin, Builtin::Min | Builtin::Max) {
+                return extremum_streaming_generic::<S, V>(
+                    elements,
+                    matches!(builtin, Builtin::Max),
+                    optional,
+                );
             }
             // #2261 (systematic sweep): `collect_cursors_checked`, not the
             // unchecked `collect_cursors` this arm used -- every one of
@@ -46150,6 +46196,95 @@ mod tests {
         assert_eq!((with_table.as_str(), without_table.as_str()), ("6", "6"));
         assert!(with_table_reindexes > 0, "a live embed table must bridge");
         assert_eq!(without_table_reindexes, 0);
+    }
+
+    /// #7261: jq's bare `min`/`max` over a document array take #5683's single walk
+    /// (`extremum_streaming_generic`), not the collect-every-cursor-and-key path the `_by` forms
+    /// take. The dispatch once sat in the `sort`/`unique` arm, where its guard is never true, and
+    /// every answer stayed right, so the pin is the walk's own counter. Each answer is also the
+    /// full evaluator's (the bridge), as printed. The pin can fail: with the dispatch moved back
+    /// into the `sort` arm every bare row reads 0 walks.
+    #[cfg(feature = "std")]
+    #[test]
+    fn bare_min_max_take_the_single_walk_7261() {
+        type V<'a> = crate::json::light::StandardJson<'a, Vec<u64>>;
+        fn shown<S: EvalSemantics>(result: GenericResult<V<'_>>) -> String {
+            match result {
+                GenericResult::Error(e) | GenericResult::Partial(_, Control::Error(e)) => {
+                    format!("error: {}", e.message)
+                }
+                other => other.collect_owned::<S>().map_or_else(
+                    |e| format!("error: {}", e.message),
+                    |values| {
+                        values
+                            .iter()
+                            .map(OwnedValue::to_json)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    },
+                ),
+            }
+        }
+        fn run<S: EvalSemantics>(json: &[u8], filter: &str, via_bridge: bool) -> (String, usize) {
+            let expr = crate::jq::parse(filter).unwrap();
+            let index = JsonIndex::build(json);
+            let root = index.root(json);
+            let before = extremum_walk_count::get();
+            let result = if via_bridge {
+                bridge_to_full_evaluator::<S, V<'_>>(&expr, root.value(), Some(root), false)
+            } else {
+                eval_using::<S, _>(&expr, root.value())
+            };
+            (shown::<S>(result), extremum_walk_count::get() - before)
+        }
+        let arrays: &[&[u8]] = &[
+            b"[]",
+            b"[5]",
+            b"[3,1,2]",
+            b"[1,1.0,1.00]",
+            b"[1.00,1.0,1]",
+            b"[0.000000,3.141593,2.5,3.1415930]",
+            b"[123456789012345679,123456789012345678.9]",
+            b"[1e1000,1,-1e1000]",
+            b"[null,false,true,0,\"a\",[],{}]",
+            b"[{\"a\":1},{\"a\":1.0},[2],\"z\"]",
+            b"[nan,1]",
+            b"[1,nan]",
+            b"[1,2,]",
+        ];
+        for json in arrays {
+            let text = String::from_utf8_lossy(json);
+            for (filter, walks) in [("min", 1), ("max", 1), ("[min,max]", 2), ("max?", 1)] {
+                let (native, native_walks) = run::<JqSemantics>(json, filter, false);
+                let (bridged, _) = run::<JqSemantics>(json, filter, true);
+                assert_eq!(native, bridged, "{filter} over {text}");
+                // A malformed array raises in the comma's first walk, so the second never runs.
+                let walks = if native.starts_with("error:") {
+                    1
+                } else {
+                    walks
+                };
+                assert_eq!(
+                    native_walks, walks,
+                    "{filter} over {text} must take the walk"
+                );
+            }
+            // The `_by` forms and yq's own extremum keep the keyed path.
+            for filter in ["min_by(.)", "max_by(.)"] {
+                assert_eq!(
+                    run::<JqSemantics>(json, filter, false).1,
+                    0,
+                    "{filter} over {text}"
+                );
+            }
+            for filter in ["min", "max"] {
+                assert_eq!(
+                    run::<YqSemantics>(json, filter, false).1,
+                    0,
+                    "yq {filter} over {text}"
+                );
+            }
+        }
     }
 
     /// #6534: in yq mode a string's `length` inside a loop body is read off the string, not off a
