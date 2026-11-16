@@ -9200,6 +9200,9 @@ fn fold_cursor_elements<S: EvalSemantics, V: DocumentValue, I: ExactSizeIterator
             return collect_computed_run::<S, V, I>(per_element, elements, eval);
         }
     }
+    // Main's `for` loop consumed the elements, so their cursors were freed before the flatten
+    // (#7267 review: kept to here, 100,000 of them held 3.1 MiB more at the peak).
+    drop(elements);
     finish_entries::<S, V>(per_element)
 }
 
@@ -9257,6 +9260,7 @@ fn collect_computed_run<S: EvalSemantics, V: DocumentValue, I: ExactSizeIterator
         }
     };
     let Some((other, is_entry)) = other else {
+        drop(elements);
         #[cfg(test)]
         let reserved = values.capacity();
         release_slack(&mut values);
