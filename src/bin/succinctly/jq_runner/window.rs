@@ -3119,6 +3119,37 @@ mod tests {
         assert_eq!(short.next_window(None, |_| ()), Some(b"x\ny\n".to_vec()));
     }
 
+    /// #7264: the first window of a source started on a few KiB reads no more than the rest of the
+    /// front, and the windows after it are the block's again; the lines are the same either way.
+    #[test]
+    fn the_first_window_reads_no_more_than_it_was_asked_to_7264() {
+        let text: Vec<u8> = (0..40)
+            .flat_map(|n| format!("{n:07}\n").into_bytes())
+            .collect();
+        let windows = |first: Option<usize>| {
+            let mut w = LineWindows::new(
+                Box::new(io::Cursor::new(text.clone())),
+                Some(text.len() as u64),
+                64,
+                Vec::new(),
+            );
+            if let Some(first) = first {
+                w = w.with_first_window(first);
+            }
+            std::iter::from_fn(|| w.next_window(Some(1000), |_| ())).collect::<Vec<_>>()
+        };
+        let plain = windows(None);
+        let small = windows(Some(16));
+        assert_eq!(plain.len(), 1, "one window of the 320 bytes");
+        assert_eq!(
+            small[0],
+            text[..16].to_vec(),
+            "the first stops at its 16 bytes"
+        );
+        assert!(small.len() >= 2, "{} windows", small.len());
+        assert_eq!(small.concat(), plain.concat(), "the same lines");
+    }
+
     /// #7023: a read that fails ends the source with the lines before it, and the line it cut is not
     /// handed out as if it were whole; the failure is reported once.
     #[test]

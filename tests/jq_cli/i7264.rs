@@ -90,3 +90,32 @@ fn a_stray_brace_at_any_chunk_boundary_is_met_as_jq_meets_it_7264() -> Result<()
     }
     Ok(())
 }
+
+/// Documents bigger than the 16 KiB a long file is first read on (and than the 4 KiB first chunk) do
+/// not fit in that start: it reads on to the 256 KiB front, and a document bigger than that too is
+/// read by the route that reads the file whole. Each answers as it did.
+#[test]
+fn documents_bigger_than_the_start_are_read_as_before_7264() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("big.ndjson");
+    let file = path.to_string_lossy().into_owned();
+    for (size, count) in [(20_000usize, 40usize), (100_000, 8), (300_000, 3)] {
+        let stream: String = (0..count)
+            .map(|id| format!("{{\"id\":{id},\"pad\":\"{}\"}}\n", "x".repeat(size)))
+            .collect();
+        std::fs::write(&path, stream)?;
+        for (program, want) in [
+            ("first(inputs)|.id", "0\n".to_string()),
+            ("[inputs|.id]|length", format!("{count}\n")),
+            ("last(inputs)|.id", format!("{}\n", count - 1)),
+        ] {
+            let (stdout, stderr, code) = run_jq_full(&["-n", program, &file], None)?;
+            assert_eq!(
+                (stdout.as_str(), stderr.as_str(), code),
+                (want.as_str(), "", 0),
+                "{program} over {count} documents of {size} bytes"
+            );
+        }
+    }
+    Ok(())
+}
