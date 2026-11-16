@@ -30755,20 +30755,14 @@ fn group_construct_operand<S: EvalSemantics, V: DocumentValue>(
         Expr::Literal(lit) => Some(literal_to_owned(lit)),
         Expr::Object(_) | Expr::Array(_) => group_construct::<S, V>(operand, group),
         read => {
-            let group = Box::new(LazySeq::from_cursors(group.to_vec()));
             // A pipe's head picks one element and its steps run on that element, as the `Groups`
-            // arm of `fold_lazy_seq_stage` runs `.[0].name`; `first | .name` takes the same
-            // one-element pull.
+            // arm of `fold_lazy_seq_stage` runs `.[0].name`.
             let answer = match read {
-                Expr::Pipe(stages) => match stages.split_first() {
-                    Some((head, steps)) => fold_pipe_stages::<S, V>(
-                        fold_lazy_seq_stage::<S, V>(group, head, false),
-                        steps,
-                        false,
-                    ),
-                    None => return None, // patchcov: coverage tolerate-line reason="unreachable: is_group_construct admits a pipe with a head only (#7280)"
-                },
-                _ => fold_lazy_seq_stage::<S, V>(group, read, false),
+                Expr::Pipe(stages) => {
+                    let (head, steps) = stages.split_first()?;
+                    fold_pipe_stages::<S, V>(group_head_read::<S, V>(head, group)?, steps, false)
+                }
+                _ => group_head_read::<S, V>(read, group)?,
             };
             match answer {
                 GenericResult::OneCursor(cursor) => to_owned_cursor::<S, _>(&cursor).ok(),
@@ -30776,6 +30770,42 @@ fn group_construct_operand<S: EvalSemantics, V: DocumentValue>(
                 _ => None,
             }
         }
+    }
+}
+
+/// What a read head of [`reads_one_value_off_cursors`] answers over `group`, read off the slice:
+/// the count, or the one element it names (`null` past either end), exactly as
+/// `fold_lazy_seq_stage` answers it over the group's cursors. Reading the slice rather than a
+/// `LazySeq` of the group keeps a construction of many reads from copying the group's cursors
+/// once per read (#7280 review: thirty `length`s over two 500,000-element groups). jq mode only,
+/// where groups are cut; `None` for any other head, which the caller's decoded route answers.
+fn group_head_read<S: EvalSemantics, V: DocumentValue>(
+    head: &Expr,
+    group: &[V::Cursor],
+) -> Option<GenericResult<V>> {
+    let element = |cursor: Option<&V::Cursor>| {
+        cursor.copied().map_or(
+            GenericResult::Owned(OwnedValue::Null),
+            GenericResult::OneCursor,
+        )
+    };
+    if S::TAG != EvalTag::Jq {
+        return None; // patchcov: coverage tolerate-line reason="unreachable: group_by cuts a Groups source in jq mode alone (#5306)"
+    }
+    match unwrap_paren(head) {
+        Expr::Builtin(Builtin::Length) => Some(GenericResult::Owned(OwnedValue::Int(
+            i64::try_from(group.len()).ok()?,
+        ))),
+        Expr::Builtin(Builtin::First) => Some(element(group.first())),
+        Expr::Builtin(Builtin::Last) => Some(element(group.last())),
+        Expr::Index { idx, key: None } => {
+            let len = i64::try_from(group.len()).ok()?;
+            let resolved = if *idx < 0 { len + idx } else { *idx };
+            Some(element(
+                usize::try_from(resolved).ok().and_then(|i| group.get(i)),
+            ))
+        }
+        _ => None, // patchcov: coverage tolerate-line reason="unreachable: is_group_construct admits these heads only (#7280)"
     }
 }
 
@@ -61729,6 +61759,10 @@ mod tests {
                 r#"[["y",2,[{"a":1.0,"b":100000000000000000001}]],["x",2,[{"a":2,"b":"z"}]]]"#,
             ),
             ("group_by(.a) | map([length])", "[[2],[2]]"),
+            (
+                "group_by(.a) | map({a: .[-9], b: .[-2].b, c: .[2], n: length, m: length})",
+                r#"[{"a":null,"b":"y","c":null,"n":2,"m":2},{"a":null,"b":"x","c":null,"n":2,"m":2}]"#,
+            ),
             (
                 "group_by(.a) | map({k: .[0].a, k: length})",
                 r#"[{"k":2},{"k":2}]"#,
