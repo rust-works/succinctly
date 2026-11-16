@@ -270,11 +270,9 @@ class NewPatternRowTests(unittest.TestCase):
     def test_every_other_row_is_still_compared_beside_a_new_one(self):
         measured = {q[0]: 100.0 for q in perf_guard.QUERIES}
         baseline = {k: v for k, v in measured.items() if k != "seq_name_bad_last"}
-        # A row with no `QUERY_THRESHOLDS` override, so the default 5.0 applies (#7271 gave
-        # `wide_identity` one).
-        baseline["wide_length"] = 80.0  # +25% now
+        baseline["wide_identity"] = 80.0  # +25% now
         failed, _ = self._drift(baseline, measured)
-        self.assertEqual([f[0] for f in failed], ["wide_length"])
+        self.assertEqual([f[0] for f in failed], ["wide_identity"])
 
     def test_the_new_rows_own_threshold_applies_once_it_has_a_baseline(self):
         # Whatever the row's threshold is now (#6619 set 3.0, #6620 raises it while the change it
