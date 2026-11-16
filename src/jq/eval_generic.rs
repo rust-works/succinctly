@@ -9139,9 +9139,10 @@ enum LastEntry {
 /// - the first run of the batch ([`ElementBatch::sized_run`]) is sized for
 ///   every element left, which is exact for a one-value-per-element map such as
 ///   `[.[] | floor]`; every later run starts small and doubles; any run that
-///   another kind of entry closes gives back its slack (more than an eighth of
-///   its length, or 16 slots), so closed runs hold at most about an eighth over
-///   their values;
+///   another kind of entry closes gives back its slack past [`slack_allowed`]
+///   (an eighth of its length, or 16 slots), and so does the flatten's output,
+///   so no vector of values leaves a fold more than about an eighth over its
+///   values, whatever the fold reserved while it ran;
 /// - the batch itself is sized for every element left when its first entry
 ///   that is not owned arrives while it holds at most two entries (an
 ///   all-cursors walk such as `[.[] | .a]` fills one entry per element, and no
@@ -9177,8 +9178,15 @@ fn push_owned_element<V: DocumentValue>(
 ) {
     match batch.last {
         LastEntry::Run => {
-            if let Some(GenericResult::ManyOwned(run)) = per_element.last_mut() {
-                run.push(o);
+            let Some(GenericResult::ManyOwned(run)) = per_element.last_mut() else {
+                unreachable!("the last entry is the batch's open run") // patchcov: coverage tolerate-line reason="unreachable: `ElementBatch::last` is `Run` only right after a run was pushed or extended (#7267)"
+            };
+            #[cfg(test)]
+            let before = run.capacity();
+            run.push(o);
+            #[cfg(test)]
+            if run.capacity() != before {
+                batch_stats_7267::note_copied(before);
             }
         }
         LastEntry::Owned => {
@@ -9215,16 +9223,12 @@ fn push_other_element<V: DocumentValue>(
     batch: &mut ElementBatch,
 ) {
     if batch.last == LastEntry::Run {
-        if let Some(GenericResult::ManyOwned(run)) = per_element.last_mut() {
-            // A closed run is never extended again: give back its slack, whether it
-            // is the sized run's unused tail or what doubling left after values were
-            // appended (an inner generator's results, `.[] | (.[] | f)`). A small run
-            // keeps up to 16 spare slots, so runs of two or three values between
-            // cursors do not pay a reallocation each.
-            if run.capacity() - run.len() > (run.len() / 8).max(16) {
-                run.shrink_to_fit();
-            }
-        }
+        let Some(GenericResult::ManyOwned(run)) = per_element.last_mut() else {
+            unreachable!("the last entry is the batch's open run") // patchcov: coverage tolerate-line reason="unreachable: `ElementBatch::last` is `Run` only right after a run was pushed or extended (#7267)"
+        };
+        // A closed run is never extended again: give back the sized run's unused
+        // tail, or what doubling left.
+        release_slack(run);
     }
     if !batch.sized_batch {
         batch.sized_batch = true;
@@ -9413,6 +9417,151 @@ mod per_element_batch_tests_7267 {
         );
     }
 
+    /// One element of a generated document, and what the leaf filter below makes of it.
+    #[derive(Clone)]
+    enum Gen {
+        /// `null`: no value (`empty`).
+        Nothing,
+        /// A number: one computed value (`. + 1`) when the select keeps it (below 2).
+        Num(i64),
+        /// A string: the element's own cursor (`.`).
+        Str(String),
+        /// `{"m": [..]}`: one lazy result (`.m | map(. + 1)`).
+        Lazy(Vec<i64>),
+        /// An array one level up: an inner generator over its elements (`.[] | ...`).
+        Arr(Vec<Self>),
+    }
+
+    fn gen_json(g: &Gen) -> String {
+        match g {
+            Gen::Nothing => "null".into(),
+            Gen::Num(n) => n.to_string(),
+            Gen::Str(s) => format!("\"{s}\""),
+            Gen::Lazy(ns) => format!(
+                r#"{{"m":[{}]}}"#,
+                ns.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
+            ),
+            Gen::Arr(gs) => format!(
+                "[{}]",
+                gs.iter().map(gen_json).collect::<Vec<_>>().join(",")
+            ),
+        }
+    }
+
+    const LEAF: &str = r#"select(type != "number" or . < 2) | if type == "null" then empty elif type == "number" then . + 1 elif type == "string" then . else (.m | map(. + 1)) end"#;
+
+    /// The naive reference: the leaves in document order, through the select and the leaf.
+    fn reference(g: &Gen, out: &mut Vec<String>) {
+        match g {
+            Gen::Nothing => {}
+            Gen::Num(n) if *n >= 2 => {}
+            Gen::Num(n) => out.push((n + 1).to_string()),
+            Gen::Str(s) => out.push(format!("\"{s}\"")),
+            Gen::Lazy(ns) => out.push(format!(
+                "[{}]",
+                ns.iter()
+                    .map(|n| (n + 1).to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )),
+            Gen::Arr(gs) => {
+                for inner in gs {
+                    reference(inner, out);
+                }
+            }
+        }
+    }
+
+    /// `n` elements `depth` levels up from the leaves: arrays of arrays down to a leaf level
+    /// that mixes every result kind. A share of leaf arrays keep almost nothing (`k << n`,
+    /// with the kept values sometimes adjacent), the shape that once handed a run sized for
+    /// every element on; the others keep most of their values.
+    fn gen(rng: &mut rand_chacha::ChaCha8Rng, depth: usize, n: usize) -> Vec<Gen> {
+        use rand::RngExt;
+        if depth > 1 {
+            let inner = if depth == 2 { 300 } else { 30 };
+            return (0..n)
+                .map(|_| {
+                    let len = rng.random_range(0..inner);
+                    Gen::Arr(gen(rng, depth - 1, len))
+                })
+                .collect();
+        }
+        let sparse = rng.random_bool(0.5);
+        (0..n)
+            .map(|i| match rng.random_range(0..12) {
+                0 => Gen::Nothing,
+                1 => Gen::Str(format!("s{i}")),
+                2 => Gen::Lazy((0..rng.random_range(0..4)).collect()),
+                _ if sparse && i % 50 > 1 => Gen::Num(5 + i as i64),
+                _ => Gen::Num(rng.random_range(0..2)),
+            })
+            .collect()
+    }
+
+    /// The invariant, over random mixes of every result kind at nesting depths 1-3: the real
+    /// fold yields the reference's values in its order, every vector a flatten hands on holds
+    /// at most `slack_allowed` over its values, and the batch's own reallocations copy at most
+    /// three times the values the folds produced (plus a constant per fold). Without the
+    /// flatten's release, a leaf array that keeps two adjacent values handed on a run sized
+    /// for every element it iterated.
+    #[test]
+    fn folds_hand_on_tight_vectors_and_copy_linearly_7267() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(7267);
+        let mut inner_folds = 0;
+        for case in 0..30 {
+            let depth = 1 + case % 3;
+            let n = rng.random_range(1..if depth == 1 { 600 } else { 40 });
+            let elements = gen(&mut rng, depth, n);
+            let doc = format!(
+                "[{}]",
+                elements.iter().map(gen_json).collect::<Vec<_>>().join(",")
+            );
+            let mut want = Vec::new();
+            for g in &elements {
+                reference(g, &mut want);
+            }
+            let program = format!("[{} | {LEAF}]", vec![".[]"; depth].join(" | "));
+            let index = JsonIndex::build(doc.as_bytes());
+            let root = index.root(doc.as_bytes());
+            let _ = batch_stats_7267::take();
+            let got = eval_single::<JqSemantics, _>(
+                &parse(&program).unwrap(),
+                root.value(),
+                false,
+                Some(root),
+            )
+            .collect_owned::<JqSemantics>()
+            .unwrap();
+            let stats = batch_stats_7267::take();
+            assert_eq!(got.len(), 1, "{program}");
+            assert_eq!(
+                got[0].to_json(),
+                format!("[{}]", want.join(",")),
+                "case {case}: {program}"
+            );
+            let produced: usize = stats.outputs.iter().map(|(len, _)| len).sum();
+            for &(len, capacity) in &stats.outputs {
+                assert!(
+                    capacity <= len + slack_allowed(len),
+                    "case {case}: {len} values in {capacity}"
+                );
+            }
+            assert!(
+                stats.copied <= 3 * produced + 16 * stats.outputs.len(),
+                "case {case}: copied {} for {produced} values over {} folds",
+                stats.copied,
+                stats.outputs.len()
+            );
+            if depth > 1 {
+                inner_folds += stats.outputs.len().saturating_sub(1);
+            }
+        }
+        // The generated documents really reached the nested folds.
+        assert!(inner_folds > 150, "{inner_folds} inner folds");
+    }
+
     /// A lone computed value between cursors stays as it is, `None` leaves nothing, runs keep
     /// their place, so the all-cursors check and the flattened order are what they were with
     /// one entry per element.
@@ -9458,6 +9607,61 @@ mod per_element_batch_tests_7267 {
             push_element_result(&mut empty, GenericResult::None, left, &mut sized);
         }
         assert!(empty.is_empty());
+    }
+}
+
+/// The slack a vector of values may keep once it leaves a fold, or once its run is closed:
+/// an eighth of its length, or 16 slots for a short one (#7267). Everything a fold hands on
+/// is held to it, so a fold's output is never more than about an eighth over its values,
+/// whatever the fold reserved while it ran (a run sized for every element left, a buffer
+/// grown by doubling).
+const fn slack_allowed(len: usize) -> usize {
+    let eighth = len / 8;
+    if eighth > 16 {
+        eighth
+    } else {
+        16
+    }
+}
+
+/// Give back `v`'s capacity past [`slack_allowed`] (#7267).
+#[inline]
+fn release_slack(v: &mut Vec<OwnedValue>) {
+    if v.capacity() - v.len() > slack_allowed(v.len()) {
+        #[cfg(test)]
+        batch_stats_7267::note_copied(v.len());
+        v.shrink_to_fit();
+    }
+}
+
+/// Test-only accounting for the per-element batch (#7267): what each fold's flatten hands
+/// on, and how many values the batch's own reallocations copied.
+#[cfg(test)]
+mod batch_stats_7267 {
+    use core::cell::RefCell;
+
+    #[derive(Default, Clone, Debug)]
+    pub(super) struct Stats {
+        /// `(len, capacity)` of every vector a flatten handed on, innermost fold first.
+        pub(super) outputs: Vec<(usize, usize)>,
+        /// Values copied by a run's regrowth or a slack release.
+        pub(super) copied: usize,
+    }
+
+    std::thread_local! {
+        static STATS: RefCell<Stats> = RefCell::new(Stats::default());
+    }
+
+    pub(super) fn note_copied(values: usize) {
+        STATS.with(|s| s.borrow_mut().copied += values);
+    }
+
+    pub(super) fn note_output(len: usize, capacity: usize) {
+        STATS.with(|s| s.borrow_mut().outputs.push((len, capacity)));
+    }
+
+    pub(super) fn take() -> Stats {
+        STATS.with(|s| core::mem::take(&mut *s.borrow_mut()))
     }
 }
 
@@ -9533,6 +9737,12 @@ fn flatten_generic_results<V: DocumentValue, S: EvalSemantics>(
             }
         }
     }
+    // #7267: what leaves the fold keeps no more slack than `slack_allowed`, whether it
+    // is an adopted run sized for elements that then gave nothing, or a vector the
+    // appends above grew by doubling.
+    release_slack(&mut results);
+    #[cfg(test)]
+    batch_stats_7267::note_output(results.len(), results.capacity());
     Ok(results)
 }
 
