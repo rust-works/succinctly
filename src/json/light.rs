@@ -5474,7 +5474,7 @@ mod pretty_streaming_tests_7271 {
         let late = doc.rfind(r#""id":"#).unwrap() + 5;
         let mut bad = doc.clone().into_bytes();
         bad[late] = b'@';
-        let mut trailing = doc[..doc.len() - 2].as_bytes().to_vec();
+        let mut trailing = doc.as_bytes()[..doc.len() - 2].to_vec();
         trailing.extend_from_slice(b",]}");
         for json in [bad, trailing] {
             for indent in [
