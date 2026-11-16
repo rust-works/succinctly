@@ -44,6 +44,11 @@ pub mod x86;
 #[cfg(target_arch = "x86_64")]
 pub mod avx2;
 
+// The branch-free Standard Cursor kernel the two x86 builders share; compiled in
+// tests on every target, so its block logic is also tested on aarch64.
+#[cfg(any(target_arch = "x86_64", test))]
+mod step;
+
 // ============================================================================
 // ARM exports with optional runtime dispatch to SVE2 (requires std)
 // ============================================================================
