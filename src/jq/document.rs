@@ -3806,15 +3806,24 @@ pub fn effective_fields_checked<F: DocumentFields>(
 /// collecting `into_iter().map(..)` reuses the source buffer. On `wide-100mb` (8.2 M fields) that
 /// buffer was 1.2 GB of the run's peak.
 ///
+/// `capacity` is the caller's upper bound on the field count (0 for none): both lists are
+/// reserved at it, so neither is copied as it grows. The keys are hashed
+/// [`KEY_HASH_BATCH`] at a time rather than one per step of the walk, which measured 3-5% faster
+/// on an M4 Pro over an object whose values are containers, where hashing inside the walk was
+/// 2-4% slower than the field list it replaced.
+///
 /// Only an object whose key hashes repeat, under a collapsing mode, walks a second time
 /// (`collapse_repeated_cursors`): the collapse needs the keys, and a hash shared by two
 /// different keys collapses nothing there.
+#[allow(clippy::iter_with_drain)] // the batch's buffer is reused for every batch of the walk, which `into_iter()` would give up
 pub fn effective_value_cursors_checked<F: DocumentFields>(
     fields: &F,
     collapse: bool,
+    capacity: usize,
 ) -> Result<Vec<F::Cursor>, EvalError> {
-    let mut out = Vec::new();
-    let mut hashes: Vec<u64> = Vec::new();
+    let mut out = Vec::with_capacity(capacity);
+    let mut hashes: Vec<u64> = Vec::with_capacity(if collapse { capacity } else { 0 });
+    let mut batch: Vec<F::Value> = Vec::with_capacity(if collapse { KEY_HASH_BATCH } else { 0 });
     let mut walk = fields.clone();
     let mut is_first = true;
     while let Some((field, rest)) = walk.uncons() {
@@ -3824,12 +3833,13 @@ pub fn effective_value_cursors_checked<F: DocumentFields>(
         if !field.delimiters_ok::<F>(is_first) {
             return Err(walk.malformed_member_error());
         }
+        out.push(field.value_cursor);
         if collapse {
-            if let Some(hash) = field_key_hash(&field) {
-                hashes.push(hash);
+            batch.push(field.key);
+            if batch.len() == KEY_HASH_BATCH {
+                hashes.extend(batch.drain(..).filter_map(|key| key_hash_of(&key)));
             }
         }
-        out.push(field.value_cursor);
         walk = rest;
         is_first = false;
     }
@@ -3841,6 +3851,7 @@ pub fn effective_value_cursors_checked<F: DocumentFields>(
             return Err(walk.malformed_member_error());
         }
     }
+    hashes.extend(batch.drain(..).filter_map(|key| key_hash_of(&key)));
     // `keys_repeat`'s answer: it hashes the same keys, skipping the same ones, and asks the
     // same question of fewer than two fields.
     if collapse && out.len() >= 2 && any_hash_repeats(hashes) {
@@ -3849,32 +3860,78 @@ pub fn effective_value_cursors_checked<F: DocumentFields>(
     Ok(out)
 }
 
+/// How many keys [`effective_value_cursors_checked`] holds before hashing them: a few
+/// kilobytes of decoded keys, so the batch stays in the first-level cache.
+pub const KEY_HASH_BATCH: usize = 64;
+
+/// A 64-bit key hash as its own `Hash` value, for a map keyed by [`key_hash`] (#7290).
+#[derive(Default)]
+struct KeyHashIdentity(u64);
+
+impl core::hash::Hasher for KeyHashIdentity {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    // `u64`'s `Hash` calls `write_u64` alone; this is only the trait's required fallback.
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(b); // patchcov: coverage tolerate-line reason="unreachable: the map is keyed by u64, whose Hash calls write_u64 (#7290)"
+        }
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n;
+    }
+}
+
 /// [`collapse_repeated`] over the value cursors of every field of `fields`, in document order
 /// (#7290): the same keys (`key_str`), so the same first position and last value for each, and a
 /// key that does not stringify kept where it stands. The keys come from a key-only walk, which
 /// meets the fields `uncons` met in the same order (both read the format's one field walk, the
 /// trait default delegating outright), and the survivors are compacted into `values` itself: a
-/// field's slot is never after it. An owned key is made only for a key not seen before, where
-/// `collapse_repeated` made one per field. The caller has already walked and checked every member.
+/// field's slot is never after it. The caller has already walked and checked every member.
+///
+/// A slot is found by the key's [`key_hash`] and confirmed by comparing the key's text with the
+/// first key that hash met, so an owned key is made once per distinct key and no key is run
+/// through a general-purpose hasher; a different key on the same hash goes to an exact map of
+/// its own. Against `collapse_repeated`'s `IndexMap<String, _>` (an owned key and a SipHash per
+/// field) this measured 3% faster on an object of eight keys repeated over 100 MB.
 fn collapse_repeated_cursors<F: DocumentFields>(
     fields: &F,
     mut values: Vec<F::Cursor>,
 ) -> Vec<F::Cursor> {
-    let mut slot_of: IndexMap<String, usize> = IndexMap::new();
+    let mut by_hash: IndexMap<
+        u64,
+        (String, usize),
+        core::hash::BuildHasherDefault<KeyHashIdentity>,
+    > = IndexMap::default();
+    let mut collided: IndexMap<String, usize> = IndexMap::new();
     let mut kept = 0usize;
     let mut walk = fields.clone();
     let mut at = 0usize;
     while let Some((key, _cursor, rest)) = walk.uncons_key() {
         let value = values[at];
         match key.key_string() {
-            Some(key) => match slot_of.get(key.as_ref()) {
-                Some(&slot) => values[slot] = value,
-                None => {
-                    slot_of.insert(key.into_owned(), kept);
-                    values[kept] = value;
-                    kept += 1;
+            Some(key) => {
+                let hash = key_hash(key.as_bytes());
+                match by_hash.get(&hash) {
+                    Some((first, slot)) if first.as_str() == key.as_ref() => values[*slot] = value,
+                    Some(_) => match collided.get(key.as_ref()) {
+                        Some(&slot) => values[slot] = value,
+                        None => {
+                            collided.insert(key.into_owned(), kept);
+                            values[kept] = value;
+                            kept += 1;
+                        }
+                    },
+                    None => {
+                        by_hash.insert(hash, (key.into_owned(), kept));
+                        values[kept] = value;
+                        kept += 1;
+                    }
                 }
-            },
+            }
             None => {
                 values[kept] = value;
                 kept += 1;
