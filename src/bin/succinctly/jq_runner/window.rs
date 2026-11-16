@@ -407,13 +407,14 @@ impl WindowedFile {
         // #7266: a pipe's probe that still holds bytes past the text handed out gives the window,
         // ending at its last line break within a block of what is validated, with no read onto it,
         // so a stream of lines never grows the probe's buffer. A window of the probe with no
-        // document that ends in it (one over several lines and longer than a block) is read as the
-        // probe handed out whole was: the rest of the probe and a block onto it, which fits in the
-        // room the windows before it freed, and then the look-ahead below. One that starts after
-        // the stream's front, where the whole probe's first window had run the documents before
-        // it, is read on a block at a time to two blocks past the probe first, as far as that
-        // reader had read when a window of it alone looked ahead. Each of those is no more than
-        // what the probe handed out whole held, and no more scans of the document.
+        // document that ends in it (one over several lines and longer than a block), or whose last
+        // document is open over half a block, is read as the probe handed out whole was: the rest
+        // of the probe and a read onto it, of the room the windows before freed in its buffer
+        // ([`Self::room_or_block`]), then the look-ahead below. A document still open then that
+        // starts after the stream's front, where the whole probe's first window had run the
+        // documents before it, is read on a block at a time to two blocks past the probe first, as
+        // far as that reader had read when a window of it alone looked ahead. None of it holds or
+        // scans more than the probe handed out whole did.
         let mut in_front = true;
         loop {
             let from_front = in_front && !self.eof && self.front_end > self.validated;
@@ -486,6 +487,17 @@ impl WindowedFile {
                     }
                 }
             }
+            // #7266: a window of the probe whose last document is open over half a block or more
+            // would hand that much out to be copied again with the next window: it is read as a
+            // window with no document that ends in it is (below), the rest of the probe and a block.
+            if pending && from_front {
+                let open_from = values.last().map_or(self.skip, |&(_, end)| end);
+                if !values.is_empty() && self.validated - open_from >= self.block / 2 {
+                    in_front = false;
+                    grow = self.room_or_block();
+                    continue;
+                }
+            }
             if self.eof || definitive || !values.is_empty() {
                 let last = self.eof || definitive;
                 if last {
@@ -538,9 +550,9 @@ impl WindowedFile {
             // windows once, and past that, which is a file that is one document or has a very big
             // one, for the rest of the file, as the whole-file route reads it.
             if pending && from_front {
-                // #7266: the rest of the probe, and a block onto it.
+                // #7266: the rest of the probe, and the room it leaves (or a block onto it).
                 in_front = false;
-                grow = self.block;
+                grow = self.room_or_block();
             } else if pending && self.offset > 0 && self.file_read < self.probe_reach {
                 grow = self.block;
             } else if pending {
@@ -554,6 +566,16 @@ impl WindowedFile {
                 self.consumed = self.validated;
                 self.drop_consumed();
             }
+        }
+    }
+
+    /// What a read onto a pipe's probe asks for once a document in it is open past its window
+    /// (#7266): the room the windows handed out of the probe have freed in its buffer, so it is not
+    /// grown, or with no room a block, which grows it as the probe handed out whole grew it.
+    fn room_or_block(&self) -> usize {
+        match self.buf.capacity() - self.buf.len() {
+            0 => self.block,
+            room => room,
         }
     }
 
@@ -4586,6 +4608,40 @@ mod pipe_tests {
             assert_eq!(seen.get(), None);
             assert_eq!(run, as_file(&text, block).0, "grows {grows}");
         }
+    }
+
+    /// A window of the probe is not handed out with half a block or more of an open document at its
+    /// end, which the next window would hand out (and the certifier copy) again (#7266): records, then a
+    /// document over several lines that starts late in a block and ends past the next.
+    #[test]
+    fn a_window_of_the_probe_does_not_end_in_a_long_open_document_7266() {
+        let block = 1_000;
+        let record = "{\"id\":1,\"name\":\"n\"}\n";
+        let mut text = record.repeat(60).into_bytes();
+        text.extend_from_slice(b"{\"v\":[\n");
+        while text.len() < 3_800 {
+            text.extend_from_slice(b" 12345,\n");
+        }
+        text.extend_from_slice(b" 0]}\n");
+        text.extend(record.repeat(300).as_bytes());
+        let mut file = tempfile::tempfile().expect("a temp file");
+        file.write_all(&text).expect("written");
+        file.seek(SeekFrom::Start(4 * block as u64))
+            .expect("seeked");
+        let seen = SeenFault::default();
+        let probe = text[..4 * block].to_vec();
+        let mut reader = WindowedFile::from_pipe(Rc::new(file), probe, None, block, seen.clone());
+        let (mut docs, mut end) = (0, 0usize);
+        while let Some(window) = reader.next_window().expect("reads") {
+            docs += window.values.len();
+            // What this window hands out again of the one before: the line its last document ended
+            // on, and an open document's text.
+            let again = end.saturating_sub(window.offset);
+            assert!(again <= block / 2, "{again} bytes handed out again");
+            end = window.offset + window.raw.len();
+        }
+        assert_eq!(docs, 361);
+        assert_eq!(seen.get(), None);
     }
 
     /// A document over several lines much longer than the probe, at the stream's front, is scanned
