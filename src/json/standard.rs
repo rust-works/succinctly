@@ -96,38 +96,38 @@ impl SemiIndex {
 
 /// Check if byte is an opening bracket or brace.
 #[inline]
-fn is_open(c: u8) -> bool {
+const fn is_open(c: u8) -> bool {
     c == OPEN_BRACKET || c == OPEN_BRACE
 }
 
 /// Check if byte is a closing bracket or brace.
 #[inline]
-fn is_close(c: u8) -> bool {
+const fn is_close(c: u8) -> bool {
     c == CLOSE_BRACKET || c == CLOSE_BRACE
 }
 
 /// Check if byte is a delimiter (comma or colon).
 #[inline]
-fn is_delim(c: u8) -> bool {
+const fn is_delim(c: u8) -> bool {
     c == COMMA || c == COLON
 }
 
 /// Check if byte is alphabetic (a-z, A-Z).
 #[inline]
-fn is_alphabetic(c: u8) -> bool {
+const fn is_alphabetic(c: u8) -> bool {
     c.is_ascii_alphabetic()
 }
 
 /// Check if byte is a digit (0-9).
 #[inline]
-fn is_digit(c: u8) -> bool {
+const fn is_digit(c: u8) -> bool {
     c.is_ascii_digit()
 }
 
 /// Check if byte can be part of a JSON value (number, boolean, null).
 /// Includes: alphanumeric, period, minus, plus
 #[inline]
-fn is_value_char(c: u8) -> bool {
+const fn is_value_char(c: u8) -> bool {
     is_alphabetic(c) || is_digit(c) || c == PERIOD || c == MINUS || c == PLUS
 }
 
@@ -163,7 +163,7 @@ impl Phi {
 /// State machine transition: given input byte and current state,
 /// returns (new_state, output).
 #[inline]
-fn state_machine(c: u8, state: State) -> (State, Phi) {
+const fn state_machine(c: u8, state: State) -> (State, Phi) {
     match state {
         State::InJson => {
             if is_open(c) {
@@ -213,6 +213,55 @@ fn state_machine(c: u8, state: State) -> (State, Phi) {
             }
         }
     }
+}
+
+/// The four states in [`State`] declaration order, so `STATES[s as usize] == s`.
+///
+/// This and the step table below serve only the x86_64 AVX2 kernel (and the tests).
+#[cfg(any(target_arch = "x86_64", test))]
+pub(crate) const STATES: [State; 4] = [
+    State::InJson,
+    State::InString,
+    State::InEscape,
+    State::InValue,
+];
+
+/// [`state_machine`] tabulated per input byte, for the branch-free AVX2 kernel
+/// (`json::simd::avx2`, #7299).
+///
+/// Entry `c` holds one 8-bit field per state: field `s` (bits `8s..8s+8`, `s` the
+/// state's [`STATES`] index) is `phi << 5 | next << 3`, the [`Phi`] bits above the
+/// next state's index, with bits 0-2 clear. Shifting the entry right by `8 * s`
+/// therefore leaves `8 * next` in its low five bits, which is exactly the count
+/// `u32::wrapping_shr` reads for the following byte: carrying the state from one
+/// byte to the next is one shift, and no branch depends on the input.
+#[cfg(any(target_arch = "x86_64", test))]
+pub(crate) static STEP_TABLE: [u32; 256] = build_step_table();
+
+/// Bit positions of the [`Phi`] bits inside a [`STEP_TABLE`] field.
+#[cfg(any(target_arch = "x86_64", test))]
+pub(crate) const STEP_CLOSE: u32 = 5;
+#[cfg(any(target_arch = "x86_64", test))]
+pub(crate) const STEP_OPEN: u32 = 6;
+#[cfg(any(target_arch = "x86_64", test))]
+pub(crate) const STEP_IB: u32 = 7;
+
+#[cfg(any(target_arch = "x86_64", test))]
+const fn build_step_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut c = 0;
+    while c < 256 {
+        let mut entry = 0u32;
+        let mut s = 0;
+        while s < 4 {
+            let (next, phi) = state_machine(c as u8, STATES[s]);
+            entry |= ((phi.0 as u32) << STEP_CLOSE | (next as u32) << 3) << (8 * s);
+            s += 1;
+        }
+        table[c] = entry;
+        c += 1;
+    }
+    table
 }
 
 /// Build a semi-index from JSON bytes using the Standard Cursor algorithm.
@@ -314,6 +363,29 @@ mod tests {
         (0..n)
             .map(|i| if get_bit(words, i) { '1' } else { '0' })
             .collect()
+    }
+
+    /// Every (byte, state) entry of the branch-free kernel's table is the scalar
+    /// [`state_machine`]'s answer, and the low three bits of each field are clear,
+    /// so the shifted field is the next byte's shift count (#7299).
+    #[test]
+    fn test_step_table_matches_state_machine() {
+        for (s, &state) in STATES.iter().enumerate() {
+            assert_eq!(state as usize, s, "STATES is in declaration order");
+            for c in 0..=255u8 {
+                let field = (STEP_TABLE[c as usize] >> (8 * s)) & 0xFF;
+                let (next, phi) = state_machine(c, state);
+                let what = format!("byte {c:#04x} in {state:?}");
+                assert_eq!(field & 0x1F, 8 * next as u32, "next state, {what}");
+                assert_eq!((field >> STEP_IB) & 1 != 0, phi.ib(), "IB, {what}");
+                assert_eq!((field >> STEP_OPEN) & 1 != 0, phi.bp_open(), "open, {what}");
+                assert_eq!(
+                    (field >> STEP_CLOSE) & 1 != 0,
+                    phi.bp_close(),
+                    "close, {what}"
+                );
+            }
+        }
     }
 
     #[test]
