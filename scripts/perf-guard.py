@@ -577,21 +577,9 @@ DEFAULT_THRESHOLD = 5.0
 # exact: -4.3% x86_64 on this 2 MB row against a merge-base without it (every other row +0.0%). A
 # revert would read +4.5%, which the default 5.0 lets through. Memory and time are watched by the
 # `seq_field_bad_first` / `seq_field_bad_last` rows of `comparison/jq/queries/perf.tsv`.
-#
-# The twelve #7299 entries below are one-off loosenings for an improvement. The x86_64 AVX2 index
-# kernel now steps a branch-free byte table instead of a per-byte branch tree, so every row that
-# builds a JSON index runs fewer instructions. Measured on x86_64 (AMD Ryzen 9 7950X, valgrind 3.18.1)
-# against the PR's own merge-base `d001ae47f`, outputs byte-identical: users_keys_unsorted -43.4%,
-# arrays_first_map_iterate -52.6%, users_compact_identity -29.2%, wide_identity -19.9%,
-# users_identity -19.9%, arrays_identity -17.8%, wide_length -17.2%, mid512_map_length_add -16.6%,
-# wide_keys_unsorted -13.2%, wide_escaped_keys_unsorted -11.4%, users_path_walk -11.0%,
-# users_compact_latefail -7.6%. ARM64-Linux builds the index with NEON and does not compile the
-# changed kernel. Each threshold is the drift plus about 3 points. Remove all twelve once `main`
-# carries the change and the rows read ~0% against a merge-base that includes it; restore
-# `wide_keys_unsorted` to its 10.0 above.
 QUERY_THRESHOLDS = {
     "seq_name_bad_last": 3.0,
-    "wide_keys_unsorted": 16.0,  # #7299: 10.0 once main carries it
+    "wide_keys_unsorted": 10.0,
     "users_yq_raw_test": 65.0,
     "users_yq_raw_slice": 90.0,
     "arrays_map_iterate": 8.0,
@@ -600,18 +588,6 @@ QUERY_THRESHOLDS = {
     "users_assign_scores": 30.0,
     "users_update_select": 30.0,
     "users_yq_del_select": 15.0,
-    # #7299, temporary (see the note above the dict).
-    "wide_escaped_keys_unsorted": 14.0,
-    "wide_identity": 23.0,
-    "users_keys_unsorted": 46.0,
-    "users_identity": 23.0,
-    "arrays_identity": 21.0,
-    "arrays_first_map_iterate": 56.0,
-    "users_path_walk": 14.0,
-    "users_compact_identity": 32.0,
-    "users_compact_latefail": 10.0,
-    "wide_length": 20.0,
-    "mid512_map_length_add": 20.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
