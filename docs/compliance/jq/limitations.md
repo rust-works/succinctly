@@ -7630,6 +7630,7 @@ It was checked against the base binary over 1,680 runs of 210 random 4 to 7 MiB 
 
 Several regular files of 4 MiB or more between them are read as the one stream jq reads them as, a window at a time, while each file is RFC 7464's own framing on its own and ends in an LF: the join of two such files is `... LF RS ...`, framed as it is inside one.
 Up to 32 files are held open from the start and each is judged by the prepass above before the run (#7218).
+Until [#7279](https://github.com/rust-works/succinctly/issues/7279) one such list with a file that was not plain was read whole, every file of it; since then the files before that one are read a window at a time, as for a longer list.
 A longer list is opened by path as the run reaches each file, as jq opens them, so each is judged on the handle the run opened when it reached it (#7221).
 At the first file that is not plain records the windows end, and that file and the ones after it go to the route that reads them whole (`hand_on_seq_files_tail`), behind a source of their own that holds an RS and one line feed for each line already read.
 That is where jq's reader stands after plain records (as for a `--seq` pipe, #7164): a parse warning names the line counted over every file, a runtime error's `(at <file>:N)` the line in its own file, and a byte-order mark there is not the stream's front.
