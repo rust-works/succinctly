@@ -226,6 +226,29 @@ pub(crate) const STATES: [State; 4] = [
     State::InValue,
 ];
 
+// The step table holds one 8-bit field per state in a `u32` and stores the next
+// state as `next << 3` in a field's low five bits (so `next <= 3`), and the AVX2
+// kernel decodes the final state with `& 3`: all of it assumes exactly four states.
+// The match below is exhaustive, so a fifth `State` variant stops the build here
+// instead of corrupting the index, and the loop pins `STATES` to declaration order.
+#[cfg(any(target_arch = "x86_64", test))]
+const _: () = {
+    const fn index(state: State) -> usize {
+        match state {
+            State::InJson => 0,
+            State::InString => 1,
+            State::InEscape => 2,
+            State::InValue => 3,
+        }
+    }
+    assert!(STATES.len() == 4 && STATES.len() * 8 <= u32::BITS as usize);
+    let mut i = 0;
+    while i < STATES.len() {
+        assert!(index(STATES[i]) == i && STATES[i] as usize == i);
+        i += 1;
+    }
+};
+
 /// [`state_machine`] tabulated per input byte, for the branch-free AVX2 kernel
 /// (`json::simd::avx2`, #7299).
 ///
