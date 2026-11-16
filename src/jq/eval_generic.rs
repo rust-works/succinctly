@@ -46501,13 +46501,20 @@ mod tests {
             br#"{"a":1,"b":2,"a":3}"#,
             br#"{"b":1,"a":2,"b":3,"c":4,"a":5}"#,
             br#"{"a":1,"a":2,"a":3,"a":4}"#,
-            br#"{"a":1,"a":2}"#,
+            br#"{"\u0061":1,"a":2}"#,
+            // Two different keys with one 64-bit hash: the collapse walk runs and keeps both.
+            br#"{"key-one-padding!":1,"kwjfpwvojvWuiqDf":2}"#,
+            br#"{"key-one-padding!":1,"kwjfpwvojvWuiqDf":2,"key-one-padding!":3}"#,
             br#"{"a":1,}"#,
             br#"{"a":1 "b":2}"#,
             br#"{"a" 1,"b":2}"#,
             br#"{a:1,"b":2}"#,
             br#"{"a":1,"b"}"#,
         ];
+        assert_eq!(
+            super::super::document::key_hash(b"key-one-padding!"),
+            super::super::document::key_hash(b"kwjfpwvojvWuiqDf")
+        );
         let mut wide = alloc::string::String::from("{");
         for i in 0..300 {
             wide.push_str(&alloc::format!("\"k{}\":{},", i % 250, i));
@@ -46543,7 +46550,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!((answered, raised), (16, 10));
+        assert_eq!((answered, raised), (20, 10));
 
         // YAML: repeated keys, a `<<` merge, an alias, a complex key and flow mappings, each
         // mapping of the document in turn, as yq's build reads them.

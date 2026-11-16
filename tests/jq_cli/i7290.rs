@@ -175,3 +175,36 @@ fn test_wide_object_with_repeated_keys_sums_its_collapsed_values_7290() -> Resul
     assert_eq!(out, format!("{}\n", (3992..4000).sum::<i64>()));
     Ok(())
 }
+
+/// Two different keys whose 64-bit hashes are equal (`key-one-padding!` and `kwjfpwvojvWuiqDf`,
+/// constructed by inverting the hash's per-word step): the hashes repeat, so the collapse walk
+/// runs, and it compares the keys themselves, so nothing collapses that jq 1.7.1 keeps apart.
+/// Alone, with a real repeat beside them, and among 200 other keys (past the hash prefilter's
+/// 128-key floor).
+#[test]
+fn test_colliding_key_hashes_collapse_nothing_7290() -> Result<()> {
+    let pair = r#"{"key-one-padding!":1,"kwjfpwvojvWuiqDf":2}"#;
+    let repeat = r#"{"key-one-padding!":1,"kwjfpwvojvWuiqDf":2,"key-one-padding!":3}"#;
+    let mut wide = String::from("{");
+    for i in 0..200 {
+        wide.push_str(&format!("\"k{i}\":{i},"));
+    }
+    wide.push_str(r#""key-one-padding!":1,"kwjfpwvojvWuiqDf":2}"#);
+    for (document, filter, stdout) in [
+        (pair, "[.[]]", "[1,2]\n"),
+        (pair, "[.[]]|add", "3\n"),
+        (pair, "any(. > 1)", "true\n"),
+        (repeat, "[.[]]", "[3,2]\n"),
+        (repeat, "[.[]]|add", "5\n"),
+        (wide.as_str(), "[.[]]|add", "19903\n"),
+        (wide.as_str(), "[.[]]|length", "202\n"),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(document))?;
+        assert_eq!(
+            (out.as_str(), err.as_str(), code),
+            (stdout, "", 0),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
