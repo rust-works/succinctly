@@ -1447,7 +1447,7 @@ impl WindowedFile {
     fn text_capacity(&self) -> usize {
         self.held
             .as_ref()
-            .map_or(self.buf.capacity(), |text| text.capacity())
+            .map_or_else(|| self.buf.capacity(), |text| text.capacity())
     }
 
     /// The reads by jq's parser the windows certified so far took.
@@ -4971,16 +4971,15 @@ mod pipe_tests {
             // Unless the thread found the early fault first, the window handed out last is the
             // buffer the certifier holds, not yet certified.
             if !text.starts_with(&early) {
-                let state = seen.lock();
-                let Some(Job {
-                    text: JobText::Held(held, _),
-                    ..
-                }) = &state.last
-                else {
-                    panic!("{what}: the last window is left for the reader of the fault");
+                let held = match &seen.lock().last {
+                    Some(Job {
+                        text: JobText::Held(held, _),
+                        ..
+                    }) => Arc::clone(held),
+                    _ => panic!("{what}: the last window is left for the reader of the fault"),
                 };
                 assert_eq!(Some(held.as_ptr()), last_raw, "{what}");
-                assert!(Arc::ptr_eq(held, reader.held.as_ref().expect("held")));
+                assert!(Arc::ptr_eq(&held, reader.held.as_ref().expect("held")));
             }
             let expected = succinctly::jq::jq_stream_fault([&text[..]], 1, 0);
             assert_eq!(seen.get(), expected, "{what}");
