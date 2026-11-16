@@ -69,10 +69,10 @@ use super::eval::{
     finish_fork_from_flow, finish_short_circuit, fold_escaped_generator_prefix, foreach_forks,
     format_owned, has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
     index_one_owned_read_of as index_owned_by_key, is_assignment_expr, is_eager_arg,
-    is_identity_passthrough, is_retryable_control, is_retryable_stop, jq_max_by, jq_min_by,
-    key_arrays_eq, keys_have_nan, limit_raising, literal_to_owned, mark_nonretryable_escape,
-    native_stack_exhausted, needs_path_context, numeric_key_to_array_index, numeric_key_to_index,
-    numeric_length_owned, owned_bound_to_i64_for, owned_index_key_to_expr, owned_to_string,
+    is_identity_passthrough, is_retryable_control, is_retryable_stop, key_arrays_eq, keys_have_nan,
+    limit_raising, literal_to_owned, mark_nonretryable_escape, native_stack_exhausted,
+    needs_path_context, numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned,
+    owned_bound_to_i64_for, owned_index_key_to_expr, owned_to_string,
     pattern_alternatives_var_names, pipe_holds_bind, pipe_needs_path_context,
     prefer_pending_control, probe_def_call, range_from_literal_override, range_max_exceeded_error,
     range_num, reads_parent, recurse_walk_flow, reduce_forks, reroot_for_reentry, reroot_markers,
@@ -30436,6 +30436,26 @@ pub(crate) mod extremum_walk_count {
     }
 }
 
+/// How many times [`extremum_by_streaming_generic`] ran on this thread, so a test can assert that
+/// `min_by`/`max_by` take that walk rather than collecting every cursor and key (#7306). `cfg(test)`
+/// only.
+#[cfg(test)]
+pub(crate) mod extremum_by_walk_count {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn bump() {
+        COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn get() -> usize {
+        COUNT.with(Cell::get)
+    }
+}
+
 /// jq's bare `min`/`max` over an array, as a single walk that keeps the winner so far (#5683).
 ///
 /// Every element is checked and keyed exactly as `collect_cursors_checked` followed by
@@ -30573,6 +30593,117 @@ fn extremum_streaming_generic<S: EvalSemantics, V: DocumentValue>(
         Some((_, cursor)) => GenericResult::OneCursor(cursor),
         // jq answers `null` for an empty array.
         None => GenericResult::Owned(OwnedValue::Null),
+    }
+}
+
+/// How [`walk_elements_checked`] ended before the last element.
+enum ElementWalkFault<E> {
+    /// A malformed `,` before an element or a stray one after the last (#1677, #2261): the error
+    /// `collect_cursors_checked` raises.
+    Gap(EvalError),
+    /// What the step returned for an element, once no later gap of the array is malformed.
+    Step(E),
+}
+
+/// Hand every element of `elements` to `step` in order, with `collect_cursors_checked`'s gap
+/// checks, holding no cursor (#7306): a builtin that walks an array once (`add`, `min_by`) need not
+/// collect a vector of the array's length to check its gaps first.
+///
+/// When `step` fails at one element, the walk goes on checking the gaps of the rest, and a
+/// malformed one is reported in its place: the error stays the one the collect-first order raised,
+/// where every gap was checked before any element was read. So `step` must have no effect anyone
+/// can see before that gap error (no `debug`, `input` or `halt` in a key filter); a caller with one
+/// walks once with a step that does nothing first.
+fn walk_elements_checked<E: DocumentElements, F>(
+    elements: E,
+    mut step: impl FnMut(E::Cursor) -> Result<(), F>,
+) -> Result<(), ElementWalkFault<F>> {
+    let mut failed: Option<F> = None;
+    let mut last: Option<E::Cursor> = None;
+    let mut rest = elements;
+    let mut is_first = true;
+    while let Some((cursor, next)) = rest.uncons_cursor() {
+        if !cursor.element_gap_ok(is_first) {
+            return Err(ElementWalkFault::Gap(elements.malformed_element_error()));
+        }
+        if failed.is_none() {
+            if let Err(fault) = step(cursor) {
+                failed = Some(fault);
+            }
+        }
+        last = Some(cursor);
+        rest = next;
+        is_first = false;
+    }
+    if last.is_some_and(|last| !trailing_element_gap_ok(&last, b']')) {
+        return Err(ElementWalkFault::Gap(elements.malformed_element_error()));
+    }
+    failed.map_or(Ok(()), |fault| Err(ElementWalkFault::Step(fault)))
+}
+
+/// jq's `min_by(f)`/`max_by(f)` over an array, as one walk that keeps only the winner so far and
+/// its key (#7306), where the arm once collected every element's cursor and then every element's
+/// `[f]` before comparing any: two vectors of the array's length and one key allocation per
+/// element held at once, 1.8 GB on a 100 MB array of numbers where jq 1.7.1 peaks near 1 GB.
+///
+/// Each element is validated and keyed as `key_elements_generic` does it, in the same order, and
+/// the winner is replaced on the rule of `jq_min_by`/`jq_max_by`: the first of equal minima and the
+/// last of equal maxima win, and of two NaN keys the last for `min_by` and the first for `max_by`
+/// (#6008). A key filter with an effect walks the gaps first (see [`walk_elements_checked`]).
+fn extremum_by_streaming_generic<S: EvalSemantics, V: DocumentValue>(
+    elements: V::Elements,
+    f: &Expr,
+    want_max: bool,
+    optional: bool,
+) -> GenericResult<V> {
+    #[cfg(test)]
+    extremum_by_walk_count::bump();
+    let gap_fault = |error: EvalError| {
+        if suppresses(&error, optional) {
+            GenericResult::None
+        } else {
+            GenericResult::Error(error)
+        }
+    };
+    let has_effects = super::eval::walk_body_may_have_effects(f)
+        || crate::jq::walk::any_subexpr(f, &mut |e| matches!(e, Expr::DefCall { .. }));
+    if has_effects {
+        if let Err(ElementWalkFault::Gap(error)) =
+            walk_elements_checked(elements, |_| Ok::<(), core::convert::Infallible>(()))
+        {
+            return gap_fault(error);
+        }
+    }
+    let mut held: Option<(Vec<OwnedValue>, V::Cursor)> = None;
+    let walk = walk_elements_checked(elements, |cursor| {
+        // #1755: an undecodable element raises though only its key is read, as
+        // `key_elements_generic` raises it.
+        if let Some(control) = push_generic_document_validation_error(&cursor, 0) {
+            return Err(control);
+        }
+        let key = sort_key_generic::<S, V>(f, &cursor, optional)?;
+        // `map_or(true, ..)`, not `is_none_or`: the crate's MSRV is 1.73.
+        let replaces = held.as_ref().map_or(true, |(best, _)| {
+            let order = compare_key_arrays::<S>(&key, best);
+            if want_max {
+                order != core::cmp::Ordering::Less
+            } else {
+                order == core::cmp::Ordering::Less
+            }
+        });
+        if replaces {
+            held = Some((key, cursor));
+        }
+        Ok(())
+    });
+    match walk {
+        Err(ElementWalkFault::Gap(error)) => gap_fault(error),
+        Err(ElementWalkFault::Step(control)) => sort_family_control(control),
+        Ok(()) => match held {
+            Some((_, cursor)) => GenericResult::OneCursor(cursor),
+            // jq answers `null` for an empty array.
+            None => GenericResult::Owned(OwnedValue::Null),
+        },
     }
 }
 
@@ -40437,21 +40568,23 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
             if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
                 return GenericResult::Error(err);
             }
-            // The same gap checks the whole-array conversion made, before any element is read.
-            let cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
             // `builtin_add` converts every element before it adds any, so an undecodable
             // element is reported ahead of an addition that fails earlier in the array. Adding
             // as we go and keeping the first addition error until every element has converted
             // gives the same answer without holding the converted elements.
+            //
+            // #7306: the walk makes the gap checks the whole-array conversion made, and reports an
+            // undecodable element only once no gap of the array is malformed, as when every gap
+            // was checked first, without a vector of the array's cursors to check them from.
             let mut total: Option<OwnedValue> = None;
             let mut failed: Option<EvalError> = None;
-            for element in &cursors {
+            let walk = walk_elements_checked(elements, |element| {
                 // #7278: once the sum is a number, a document number is added as its value
                 // alone: the result is computed, so the spelling `to_owned_cursor` would copy is
                 // never read. Not the first number, which `[1.0] | add` and `null + 1.0` print
                 // as written. A `-0` literal reads as `-0.0`, as `arith_add` reads it.
                 if failed.is_none() && total.as_ref().is_some_and(OwnedValue::is_number) {
-                    if let Some(number) = borrowed_document_number::<S, _>(element) {
+                    if let Some(number) = borrowed_document_number::<S, _>(&element) {
                         let operand = match number.repr {
                             _ if number.negative_zero => OwnedValue::Float(-0.0),
                             NumberRepr::Int(i) => OwnedValue::Int(i),
@@ -40462,12 +40595,12 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                             Ok(sum) => total = Some(sum),
                             Err(error) => failed = Some(error), // patchcov: coverage tolerate-line reason="unreachable: two numbers always add (#7278)"
                         }
-                        continue;
+                        return Ok(());
                     }
                 }
-                let item = owned_or_suppress!(to_owned_cursor::<S, _>(element), optional);
+                let item = to_owned_cursor::<S, _>(&element)?;
                 if failed.is_some() {
-                    continue;
+                    return Ok(());
                 }
                 total = match total.take() {
                     None => Some(item),
@@ -40479,6 +40612,17 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                         }
                     },
                 };
+                Ok(())
+            });
+            match walk {
+                Ok(()) => {}
+                Err(ElementWalkFault::Gap(error) | ElementWalkFault::Step(error)) => {
+                    return if suppresses(&error, optional) {
+                        GenericResult::None
+                    } else {
+                        GenericResult::Error(error)
+                    };
+                }
             }
             match (failed, total) {
                 (Some(error), _) => GenericResult::Error(error),
@@ -40522,75 +40666,49 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                     optional,
                 );
             }
-            // #2261 (systematic sweep): `collect_cursors_checked`, not the
-            // unchecked `collect_cursors` this arm used -- every one of
-            // these builtins already resolves each element's cursor to
-            // compare them, so the #1677/#2261 gap checks ride along for
-            // free.
-            //
-            // #2327: owned_or_suppress!, not owned_or_err! -- `optional` is
-            // passed to `key_elements_generic` a few lines below, so
-            // ignoring it here was the same asymmetry #2280 fixed for
-            // Format/Path/GetPath. Defensive today (see `Reverse`'s sibling
-            // comment above for why).
-            let cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
-            // jq answers `null` for an empty array, for all four spellings; yq has no element
-            // to pick and picks nothing (#4236).
-            if cursors.is_empty() {
-                // `min_by`/`max_by` are not yq builtins; as a gated extension they follow jq.
-                return if S::MIN_MAX_NEED_AN_ELEMENT
-                    && matches!(builtin, Builtin::Min | Builtin::Max)
-                {
-                    GenericResult::None
-                } else {
-                    GenericResult::Owned(OwnedValue::Null)
-                };
+            // #7306: the keyed forms keep the running winner and its key the same way, in both
+            // modes (`min_by`/`max_by` are not yq builtins; as a gated extension they follow jq).
+            if let Builtin::MinBy(f) | Builtin::MaxBy(f) = builtin {
+                return extremum_by_streaming_generic::<S, V>(
+                    elements,
+                    f,
+                    matches!(builtin, Builtin::MaxBy(_)),
+                    optional,
+                );
             }
-            let key = match builtin {
-                Builtin::MinBy(f) | Builtin::MaxBy(f) => Some(&**f),
-                _ => None,
-            };
-            let keyed = match key_elements_generic::<S, V>(cursors, key, optional) {
+            // Only yq's bare `min`/`max` reach here (#4055): yq's own comparator and tie rule,
+            // whose keys are the elements themselves.
+            //
+            // #2261 (systematic sweep): `collect_cursors_checked`, not the unchecked
+            // `collect_cursors` this arm used, so the #1677/#2261 gap checks ride along. #2327:
+            // `owned_or_suppress!`, as `optional` reaches `key_elements_generic` below.
+            let cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
+            // yq has no element to pick and picks nothing (#4236).
+            if cursors.is_empty() {
+                return GenericResult::None;
+            }
+            let keyed = match key_elements_generic::<S, V>(cursors, None, optional) {
                 Ok(keyed) => keyed,
                 Err(control) => return sort_family_control(control),
             };
-            // `min_by`/`max_by` on ties: jq's own definitions keep the
-            // *first* minimum and the *last* maximum (`min_by` uses `<`,
-            // `max_by` uses `<=` internally), which is what `jq_min_by`/`jq_max_by` do: a
-            // new item replaces the held one when it compares `Less` (`min`) or unless it does
-            // (`max`). For two NaNs, which each compare `Less` than the other, that is the last
-            // for `min_by` and the first for `max_by` (#6008).
-            // #4055: yq's own comparator and tie rule for the bare spellings, whose keys are the
-            // elements themselves.
-            if S::MIN_MAX_NEED_AN_ELEMENT && matches!(builtin, Builtin::Min | Builtin::Max) {
-                let picked = {
-                    let owned: Vec<&OwnedValue> = keyed
-                        .iter()
-                        .filter_map(|(key, _)| match key {
-                            SortKey::Own(value) => Some(value),
-                            SortKey::By(_) => None,
-                        })
-                        .collect();
-                    crate::jq::eval::yq_extremum_index(&owned, matches!(builtin, Builtin::Max))
-                };
-                return match picked {
-                    Ok(at) => keyed
-                        .into_iter()
-                        .nth(at)
-                        .map_or(GenericResult::None, |(_, cursor)| {
-                            GenericResult::OneCursor(cursor)
-                        }),
-                    Err(e) => GenericResult::Error(e),
-                };
-            }
-            let winner = if matches!(builtin, Builtin::Min | Builtin::MinBy(_)) {
-                jq_min_by(keyed, |(a, _), (b, _)| a.cmp::<S>(b))
-            } else {
-                jq_max_by(keyed, |(a, _), (b, _)| a.cmp::<S>(b))
+            let picked = {
+                let owned: Vec<&OwnedValue> = keyed
+                    .iter()
+                    .filter_map(|(key, _)| match key {
+                        SortKey::Own(value) => Some(value),
+                        SortKey::By(_) => None,
+                    })
+                    .collect();
+                crate::jq::eval::yq_extremum_index(&owned, matches!(builtin, Builtin::Max))
             };
-            match winner {
-                Some((_, cursor)) => GenericResult::OneCursor(cursor),
-                None => unreachable!("the empty case returned above"),
+            match picked {
+                Ok(at) => keyed
+                    .into_iter()
+                    .nth(at)
+                    .map_or(GenericResult::None, |(_, cursor)| {
+                        GenericResult::OneCursor(cursor)
+                    }),
+                Err(e) => GenericResult::Error(e),
             }
         }
 
@@ -46573,6 +46691,93 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #7306: `min_by`/`max_by` over a document array take the single keyed walk
+    /// (`extremum_by_streaming_generic`), and each answer is the full evaluator's (the bridge),
+    /// which still converts the whole array before it keys any element. The malformed arrays pin
+    /// the error order: a key filter that fails on an early element (`.a` on a number) must still
+    /// report the stray comma after the last one, as the collect-first order did, and a key filter
+    /// with an effect (a `def`, whose body the walk does not read) checks the gaps first. The pin
+    /// can fail: with the dispatch removed every row reads 0 walks, and without the gap scan after
+    /// a failed step `max_by(.a)` over `[{"a":1},2,3,]` answers the index error.
+    #[cfg(feature = "std")]
+    #[test]
+    fn keyed_min_max_take_the_single_walk_7306() {
+        type V<'a> = crate::json::light::StandardJson<'a, Vec<u64>>;
+        fn shown<S: EvalSemantics>(result: GenericResult<V<'_>>) -> String {
+            match result {
+                GenericResult::Error(e) | GenericResult::Partial(_, Control::Error(e)) => {
+                    format!("error: {}", e.message)
+                }
+                other => other.collect_owned::<S>().map_or_else(
+                    |e| format!("error: {}", e.message),
+                    |values| {
+                        values
+                            .iter()
+                            .map(OwnedValue::to_json)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    },
+                ),
+            }
+        }
+        fn run<S: EvalSemantics>(json: &[u8], filter: &str, via_bridge: bool) -> (String, usize) {
+            let expr = crate::jq::parse(filter).unwrap();
+            let index = JsonIndex::build(json);
+            let root = index.root(json);
+            let before = extremum_by_walk_count::get();
+            let result = if via_bridge {
+                bridge_to_full_evaluator::<S, V<'_>>(&expr, root.value(), Some(root), false)
+            } else {
+                eval_using::<S, _>(&expr, root.value())
+            };
+            (shown::<S>(result), extremum_by_walk_count::get() - before)
+        }
+        let arrays: &[&[u8]] = &[
+            b"[]",
+            b"[5]",
+            b"[3,1,2]",
+            b"[1,1.0,1.00]",
+            b"[123456789012345679,123456789012345678.9]",
+            b"[null,false,true,0,\"a\",[],{}]",
+            b"[{\"a\":1,\"i\":0},{\"a\":1,\"i\":1},{\"a\":0,\"i\":2}]",
+            b"[{\"a\":1,\"b\":5},{\"a\":1,\"b\":3},{\"b\":9}]",
+            b"[nan,1]",
+            b"[1,nan]",
+            b"[1,2,]",
+            b"[{\"a\":1},2,3,]",
+            b"[{\"a\":1},2,3]",
+        ];
+        let filters = [
+            "min_by(.)",
+            "max_by(.)",
+            "min_by(.a)",
+            "max_by(.a)",
+            "max_by(.a, .b)",
+            "min_by(empty)",
+            "max_by(empty)",
+            "max_by(error)",
+            "max_by(.a)?",
+            "def k: .a; max_by(k)",
+            "[min_by(.), max_by(.)]",
+        ];
+        for json in arrays {
+            let text = String::from_utf8_lossy(json);
+            for filter in filters {
+                let (native, walks) = run::<JqSemantics>(json, filter, false);
+                let (bridged, _) = run::<JqSemantics>(json, filter, true);
+                assert_eq!(native, bridged, "{filter} over {text}");
+                assert!(walks >= 1, "{filter} over {text} must take the walk");
+                let (yq_native, yq_walks) = run::<YqSemantics>(json, filter, false);
+                let (yq_bridged, _) = run::<YqSemantics>(json, filter, true);
+                assert_eq!(yq_native, yq_bridged, "yq {filter} over {text}");
+                assert!(yq_walks >= 1, "yq {filter} over {text} must take the walk");
+            }
+        }
+        // The stray comma wins over the first element's index error.
+        let (native, _) = run::<JqSemantics>(b"[{\"a\":1},2,3,]", "max_by(.a)", false);
+        assert!(native.starts_with("error: Invalid JSON text"), "{native}");
     }
 
     /// #7278: `borrowed_document_number` answers exactly the repr `to_owned_cursor` builds for a
