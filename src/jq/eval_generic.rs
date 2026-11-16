@@ -9730,6 +9730,61 @@ mod per_element_batch_tests_7267 {
         ));
     }
 
+    /// Real per-element results, lazy objects among them (built as they arrive in both modes, and
+    /// one that fails to build kept as the entry it is): the two modes give what the batch built
+    /// from the first element gives.
+    #[test]
+    fn real_results_and_lazy_objects_match_main_7267() {
+        let lazy = core::cell::Cell::new(0);
+        // A lazy object holds a container node; one over `[tru]` fails when it is built.
+        let cases: [(&'static [u8], &str); 7] = [
+            (b"[[1],[2],{}]", "{a: .}"),
+            (
+                br#"["s",[1],[2]]"#,
+                r#"if type == "string" then . else {a: .} end"#,
+            ),
+            (b"[[tru]]", "{a: .}"),
+            (b"[[1],[2],[tru],[3]]", "{a: .}"),
+            (
+                br#"[[1],"s",[tru],[3]]"#,
+                r#"if type == "string" then . else {a: .} end"#,
+            ),
+            (br#"[1,2,"s",3]"#, r#"if . == 3 then error("e") else . end"#),
+            (b"[1,2,3]", r#"if . == 3 then error("e") else . end"#),
+        ];
+        for (doc, rest) in cases {
+            let cs = cursors(doc);
+            let expr = parse(rest).unwrap();
+            let eval = |c: Cursor<'static>| {
+                let r = eval_single::<JqSemantics, _>(&expr, c.value(), false, Some(c));
+                lazy.set(lazy.get() + usize::from(matches!(r, GenericResult::LazyObject(_))));
+                r
+            };
+            let two =
+                match collect_element_results::<JqSemantics, _, _>(cs.clone().into_iter(), eval) {
+                    ElementResults::Values(v) if v.is_empty() => GenericResult::None,
+                    ElementResults::Values(v) => GenericResult::ManyOwned(v),
+                    ElementResults::Entries(e) => finish_entries::<JqSemantics, _>(e),
+                    ElementResults::Stopped(s) => s,
+                };
+            let mut batch = vec_with_capacity(cs.len());
+            let main = match collect_entries::<JqSemantics, _, _>(&mut batch, cs.into_iter(), eval)
+            {
+                Some(stopped) => stopped,
+                None => finish_entries::<JqSemantics, _>(batch),
+            };
+            assert_eq!(
+                format!("{two:?}"),
+                format!("{main:?}"),
+                "{rest} over {doc:?}"
+            );
+            if doc == b"[[tru]]" {
+                assert!(matches!(two, GenericResult::Error(_)), "{two:?}");
+            }
+        }
+        assert!(lazy.get() > 4, "{} lazy objects", lazy.get());
+    }
+
     /// One element of a generated document, and what the leaf filter below makes of it.
     #[derive(Clone)]
     enum Gen {
