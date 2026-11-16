@@ -6290,25 +6290,14 @@ fn stream_json_sequence<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
 /// Written as slices of a run of the unit rather than a character at a time
 /// (#7271 review): a writer with work per call, such as the chunked writer of a
 /// streamed pretty render, otherwise pays it once per byte of indentation,
-/// which on a document 250 levels deep is most of the output. Every slice has
-/// a length fixed at compile time (#7293): 64 units at a time, then what is
-/// left in one slice picked by a `match` on its length, so a line under 64
-/// units is one write whatever the width. A slice whose length is only known
-/// at run time reaches `String::push_str` as a call to `memcpy`, which on the
-/// buffered render of an object of 7.1 M keys at two spaces measured 142 M
-/// more instructions than the character loop it replaced (7950X), where a
-/// slice of fixed length is a store or two. One slice per set bit of the
-/// remainder (an earlier draft) was two to four writes a line at `--indent 5`
-/// and `--indent 7`, and read up to 2.2% more instructions than one `memcpy`.
+/// which on a document 250 levels deep is most of the output.
 fn write_json_indent<Out: core::fmt::Write>(
     out: &mut Out,
     spaces: usize,
     unit: char,
 ) -> core::fmt::Result {
     const SPACES: &str = "                                                                ";
-    const TABS: &str = "\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\
-                        \t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t";
-    const RUN: usize = 64;
+    const TABS: &str = "\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t";
     let run = match unit {
         ' ' => SPACES,
         '\t' => TABS,
@@ -6319,27 +6308,13 @@ fn write_json_indent<Out: core::fmt::Write>(
             return Ok(());
         }
     };
-    debug_assert_eq!(run.len(), RUN);
     let mut left = spaces;
-    while left >= RUN {
-        out.write_str(&run[..RUN])?;
-        left -= RUN;
+    while left > 0 {
+        let take = left.min(run.len());
+        out.write_str(&run[..take])?;
+        left -= take;
     }
-    // One arm per length, so each slice's length is a constant.
-    macro_rules! tail {
-        ($($n:literal)*) => {
-            match left {
-                $($n => out.write_str(&run[..$n]),)*
-                _ => Ok(()),
-            }
-        };
-    }
-    tail!(
-        1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16
-        17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32
-        33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48
-        49 50 51 52 53 54 55 56 57 58 59 60 61 62 63
-    )
+    Ok(())
 }
 
 // ============================================================================
