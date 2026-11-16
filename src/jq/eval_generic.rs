@@ -9219,10 +9219,7 @@ mod per_element_batch_tests_7267 {
         let buffer = run.as_ptr();
         let flat = flatten_generic_results::<_, JqSemantics>(batch).unwrap();
         assert_eq!(flat.as_ptr(), buffer);
-        assert_eq!(
-            flat,
-            (0..1000).map(|i| OwnedValue::Int(i)).collect::<Vec<_>>()
-        );
+        assert_eq!(flat, (0..1000).map(OwnedValue::Int).collect::<Vec<_>>());
     }
 
     /// The batch's one run sized for every element left is shrunk when a cursor ends it with
@@ -9230,8 +9227,7 @@ mod per_element_batch_tests_7267 {
     /// batch, not one per run.
     #[test]
     fn a_cursor_shrinks_the_sized_run_and_the_next_run_starts_small_7267() {
-        let json = br#"[[0],[1]]"#.repeat(1).into_boxed_slice();
-        let cs = cursors(Box::leak(json));
+        let cs = cursors(b"[[0],[1]]");
         let mut batch: Batch<'_> = Vec::new();
         let mut sized = false;
         push_element_result(&mut batch, owned(0), 1000, &mut sized);
@@ -9259,9 +9255,9 @@ mod per_element_batch_tests_7267 {
         for stretch in 1..=3 {
             let mut batch: Batch<'_> = Vec::new();
             let mut sized = false;
-            for i in 0..n {
+            for (i, c) in cs.iter().enumerate() {
                 let result = if i % (stretch + 1) == stretch {
-                    GenericResult::OneCursor(cs[i])
+                    GenericResult::OneCursor(*c)
                 } else {
                     owned(i)
                 };
