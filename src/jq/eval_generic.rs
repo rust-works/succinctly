@@ -9109,57 +9109,115 @@ fn retain_truthy_generic<V: DocumentValue, S: EvalSemantics>(
 ///
 /// What is reserved stays linear in the elements (`remaining` is this element
 /// and every one after it):
-/// - the first run of the batch (`sized_run` says it was made) is sized for
+/// - the first run of the batch ([`ElementBatch::sized_run`]) is sized for
 ///   every element left, which is exact for a one-value-per-element map such as
-///   `[.[] | floor]`, and is shrunk to fit if another kind of entry ends it with
-///   less than half of it used; every later run starts small and doubles;
+///   `[.[] | floor]`; every later run starts small and doubles; any run that
+///   another kind of entry closes gives back its slack (more than an eighth of
+///   its length, or 16 slots), so the batch never holds more than about an eighth
+///   over its values in closed runs;
 /// - the batch itself is sized for every element left when its first entry
 ///   that is not owned arrives while it holds at most two entries (an
 ///   all-cursors walk such as `[.[] | .a]` fills one entry per element, and no
 ///   element adds more than one), and not before, since a batch that is one run
 ///   needs a single entry.
+///
+/// Inlined into the loop (#7267 review): called out of line, moving each 80-byte result
+/// into the call cost about 64 more instructions per element than the plain push it
+/// replaced, 1.5% of `[.xs[] | .name // "anon"]` over 1M elements.
+/// What [`push_element_result`] needs to know about a batch without reading its
+/// last 80-byte entry back on every element (#7267 review: that read, done per
+/// element, was most of the extra instructions over a plain push).
+#[derive(Default)]
+struct ElementBatch {
+    /// The kind of the batch's last entry.
+    last: LastEntry,
+    /// The batch's one run sized for every element left has been made.
+    sized_run: bool,
+    /// The batch has been sized for every element left, or no longer can be.
+    sized_batch: bool,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum LastEntry {
+    #[default]
+    Nothing,
+    /// A plain `Owned`, which a second computed value turns into a run.
+    Owned,
+    /// A `ManyOwned` run, which computed values extend.
+    Run,
+    /// Anything else: a cursor, a lazy result, an error a lazy object raised.
+    Other,
+}
+
+#[inline(always)]
 fn push_element_result<V: DocumentValue>(
     per_element: &mut Vec<GenericResult<V>>,
     result: GenericResult<V>,
     remaining: usize,
-    sized_run: &mut bool,
+    batch: &mut ElementBatch,
 ) {
     match result {
         GenericResult::None => {}
-        GenericResult::Owned(o) => match per_element.last_mut() {
-            Some(GenericResult::ManyOwned(run)) => run.push(o),
-            Some(GenericResult::Owned(_)) => {
+        GenericResult::Owned(o) => match batch.last {
+            LastEntry::Run => {
+                if let Some(GenericResult::ManyOwned(run)) = per_element.last_mut() {
+                    run.push(o);
+                }
+            }
+            LastEntry::Owned => {
                 let Some(GenericResult::Owned(previous)) = per_element.pop() else {
-                    unreachable!("the last entry was just matched as `Owned`")
+                    unreachable!("the last entry is a plain `Owned`")
                 };
-                let mut run = if *sized_run {
+                let mut run = if batch.sized_run {
                     Vec::new()
                 } else {
-                    *sized_run = true;
+                    batch.sized_run = true;
                     vec_with_capacity(remaining + 1)
                 };
                 run.push(previous);
                 run.push(o);
                 per_element.push(GenericResult::ManyOwned(run));
+                batch.last = LastEntry::Run;
             }
-            _ => per_element.push(GenericResult::Owned(o)),
+            LastEntry::Nothing | LastEntry::Other => {
+                per_element.push(GenericResult::Owned(o));
+                batch.last = LastEntry::Owned;
+            }
         },
-        GenericResult::ManyOwned(os) => match per_element.last_mut() {
-            Some(GenericResult::ManyOwned(run)) => run.extend(os),
-            _ => per_element.push(GenericResult::ManyOwned(os)),
-        },
+        GenericResult::ManyOwned(os) => {
+            if batch.last == LastEntry::Run {
+                if let Some(GenericResult::ManyOwned(run)) = per_element.last_mut() {
+                    run.extend(os);
+                }
+            } else {
+                per_element.push(GenericResult::ManyOwned(os));
+                batch.last = LastEntry::Run;
+            }
+        }
         other => {
-            if let Some(GenericResult::ManyOwned(run)) = per_element.last_mut() {
-                if run.capacity() / 2 > run.len() {
-                    run.shrink_to_fit();
+            if batch.last == LastEntry::Run {
+                if let Some(GenericResult::ManyOwned(run)) = per_element.last_mut() {
+                    // A closed run is never extended again: give back its slack,
+                    // whether it is the sized run's unused tail or what doubling
+                    // left after values were appended (an inner generator's
+                    // results, `.[] | (.[] | f)`). A small run keeps up to 16
+                    // spare slots, so runs of two or three values between cursors
+                    // do not pay a reallocation each.
+                    if run.capacity() - run.len() > (run.len() / 8).max(16) {
+                        run.shrink_to_fit();
+                    }
                 }
             }
-            if per_element.len() <= 2 && per_element.capacity() < per_element.len() + remaining {
-                let mut sized = vec_with_capacity(per_element.len() + remaining);
-                sized.append(per_element);
-                *per_element = sized;
+            if !batch.sized_batch {
+                batch.sized_batch = true;
+                if per_element.len() <= 2 {
+                    let mut sized = vec_with_capacity(per_element.len() + remaining);
+                    sized.append(per_element);
+                    *per_element = sized;
+                }
             }
             per_element.push(other);
+            batch.last = LastEntry::Other;
         }
     }
 }
@@ -9207,7 +9265,7 @@ mod per_element_batch_tests_7267 {
     #[test]
     fn owned_results_fill_one_run_that_the_flatten_keeps_7267() {
         let mut batch: Batch<'_> = Vec::new();
-        let mut sized = false;
+        let mut sized = ElementBatch::default();
         for i in 0..1000 {
             push_element_result(&mut batch, owned(i), 1000 - i, &mut sized);
         }
@@ -9229,7 +9287,7 @@ mod per_element_batch_tests_7267 {
     fn a_cursor_shrinks_the_sized_run_and_the_next_run_starts_small_7267() {
         let cs = cursors(b"[[0],[1]]");
         let mut batch: Batch<'_> = Vec::new();
-        let mut sized = false;
+        let mut sized = ElementBatch::default();
         push_element_result(&mut batch, owned(0), 1000, &mut sized);
         push_element_result(&mut batch, owned(1), 999, &mut sized);
         assert!(matches!(&batch[0], GenericResult::ManyOwned(run) if run.capacity() == 1000));
@@ -9254,7 +9312,7 @@ mod per_element_batch_tests_7267 {
         let cs = cursors(Box::leak(doc.into_bytes().into_boxed_slice()));
         for stretch in 1..=3 {
             let mut batch: Batch<'_> = Vec::new();
-            let mut sized = false;
+            let mut sized = ElementBatch::default();
             for (i, c) in cs.iter().enumerate() {
                 let result = if i % (stretch + 1) == stretch {
                     GenericResult::OneCursor(*c)
@@ -9289,6 +9347,43 @@ mod per_element_batch_tests_7267 {
         }
     }
 
+    /// An inner generator's results (`.[] | (.[] | f)`) extend the run they follow, which then
+    /// grows by doubling; a cursor that closes such a run takes its slack back, so the closed
+    /// runs hold no more than an eighth (or 16 slots) over their values. Holding the doubled
+    /// capacity was 9% over main's peak on arrays of 0-2,000 values between strings.
+    #[test]
+    fn closed_runs_give_back_doubling_slack_7267() {
+        let n = 4000;
+        let doc = format!("[{}]", vec!["[0]"; n].join(","));
+        let cs = cursors(Box::leak(doc.into_bytes().into_boxed_slice()));
+        let mut batch: Batch<'_> = Vec::new();
+        let mut state = ElementBatch::default();
+        let mut values = 0;
+        for (i, c) in cs.iter().enumerate() {
+            let result = if i % 3 == 2 {
+                GenericResult::OneCursor(*c)
+            } else {
+                let k = (i * 37) % 300;
+                values += k;
+                GenericResult::ManyOwned((0..k).map(|v| OwnedValue::Int(v as i64)).collect())
+            };
+            push_element_result(&mut batch, result, n - i, &mut state);
+        }
+        let closed = &batch[..batch.len() - 1];
+        for entry in closed {
+            if let GenericResult::ManyOwned(run) = entry {
+                assert!(
+                    run.capacity() - run.len() <= (run.len() / 8).max(16),
+                    "{} of {}",
+                    run.len(),
+                    run.capacity()
+                );
+            }
+        }
+        let flat = flatten_generic_results::<_, JqSemantics>(batch).unwrap();
+        assert_eq!(flat.len(), values + n / 3);
+    }
+
     /// A lone computed value between cursors stays as it is, `None` leaves nothing, runs keep
     /// their place, so the all-cursors check and the flattened order are what they were with
     /// one entry per element.
@@ -9296,7 +9391,7 @@ mod per_element_batch_tests_7267 {
     fn cursors_split_runs_and_nones_leave_nothing_7267() {
         let cs = cursors(br#"["a",{"b":1}]"#);
         let mut batch: Batch<'_> = Vec::new();
-        let mut sized = false;
+        let mut sized = ElementBatch::default();
         push_element_result(&mut batch, owned(10), 7, &mut sized);
         push_element_result(&mut batch, GenericResult::OneCursor(cs[0]), 6, &mut sized);
         push_element_result(&mut batch, GenericResult::None, 5, &mut sized);
@@ -9327,6 +9422,7 @@ mod per_element_batch_tests_7267 {
         assert_eq!(flat, ["10", "\"a\"", "20", "25", "30", "40", "{\"b\":1}"]);
 
         let mut empty: Batch<'_> = Vec::new();
+        let mut sized = ElementBatch::default();
         for left in (1..=3).rev() {
             push_element_result(&mut empty, GenericResult::None, left, &mut sized);
         }
@@ -14311,7 +14407,7 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
                 // holds: a run needs one entry, not one per element (#7267).
                 let mut per_element = Vec::new();
                 let elements = cs.len();
-                let mut sized_run = false;
+                let mut batch = ElementBatch::default();
                 for (i, c) in cs.into_iter().enumerate() {
                     match eval_single_pipe::<S, _>(rest, &rest_whole, c.value(), optional, Some(c))
                     {
@@ -14373,14 +14469,11 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
                             &mut per_element,
                             obj.materialize_lazy::<S>(),
                             elements - i,
-                            &mut sized_run,
+                            &mut batch,
                         ),
-                        other => push_element_result(
-                            &mut per_element,
-                            other,
-                            elements - i,
-                            &mut sized_run,
-                        ),
+                        other => {
+                            push_element_result(&mut per_element, other, elements - i, &mut batch);
+                        }
                     }
                 }
 
