@@ -428,7 +428,9 @@ impl WindowedFile {
             self.validate_lines(
                 from_front.then(|| (self.validated + self.block).min(self.front_end)),
             );
-            if from_front && self.validated == before {
+            // A `--seq` pipe's gate that handed the stream on ended it (#7277): what is validated is
+            // the last window, as after a read.
+            if from_front && self.validated == before && !self.eof {
                 // What is left of the probe is part of a line: the next read completes it.
                 in_front = false;
                 first = false;
@@ -717,7 +719,12 @@ impl WindowedFile {
             .map(|gate| gate.advance(&self.buf, self.eof));
         let end = if let Some(step) = gated {
             match step {
-                GateStep::Clean(end) => end,
+                // #7277: a window of a pipe's probe ends at the last record the gate passed within
+                // a block, as the plain pipe's ends at a line break (#7266); a record longer than
+                // that is the gate's end.
+                GateStep::Clean(end) => near
+                    .and_then(|near| self.last_record_start(near.min(end)))
+                    .unwrap_or(end),
                 GateStep::Unclean(at) => self.hand_on_seq_tail(at),
             }
         } else if self.eof {
@@ -1191,11 +1198,24 @@ impl WindowedFile {
     ) -> Self {
         let mut this = Self::in_stream(file, 0, block, Place::alone());
         this.file_read = front.len() as u64;
+        // #7277: the probe is handed out a block of records at a time, not read onto.
+        this.front_end = front.len();
         this.buf = front;
         this.started = true;
         this.blank_rs = true;
         this.seq_gate = Some(SeqGate::new(slot));
         this
+    }
+
+    /// The last record start (an RS) after `validated` and no later than `limit`, which the gate has
+    /// passed (#7277): every RS it passed opens a record, and an RS past `validated` is not blanked yet.
+    fn last_record_start(&self, limit: usize) -> Option<usize> {
+        let from = self.validated + 1;
+        let to = (limit + 1).min(self.buf.len());
+        (from < to)
+            .then(|| self.buf[from..to].iter().rposition(|&b| b == RS))
+            .flatten()
+            .map(|at| from + at)
     }
 
     /// Ends the text at `at`, where the gate found the first record that is not plain, reads the rest of
@@ -2879,6 +2899,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #7277: a `--seq` pipe's probe is handed out a block of records at a time from the buffer it was
+    /// read into, where a block read onto it doubled the buffer and made one window of the probe and a
+    /// block. A record longer than a block is a window of its own; the documents and lines are those of
+    /// the records read whole.
+    #[test]
+    fn a_seq_pipes_probe_is_handed_out_a_block_at_a_time_7277() {
+        let block = 1_000;
+        let short = |i: usize| format!("\x1e{{\"id\":{i},\"s\":\"bus\"}}\n");
+        let long = format!("\x1e[{}0]\n", "1,\n".repeat(700));
+        let mut stream = String::new();
+        for i in 0..400 {
+            stream.push_str(&short(i));
+            if i == 60 {
+                stream.push_str(&long);
+            }
+        }
+        let stream = stream.into_bytes();
+        let mut blanked = stream.clone();
+        blank_rs_bytes(&mut blanked);
+        let want = whole(&blanked);
+        let front = 4 * block;
+        let mut file = tempfile::tempfile().expect("a temp file");
+        file.write_all(&stream[front..]).expect("written");
+        file.rewind().expect("rewound");
+        let probe = stream[..front].to_vec();
+        let capacity = probe.capacity();
+        let mut reader =
+            WindowedFile::from_seq_pipe(Rc::new(file), probe, block, SeqTailSlot::default());
+        let (mut spans, mut peak) = (Vec::new(), 0);
+        while let Some(window) = reader.next_window().expect("reads") {
+            peak = peak.max(window.raw.len());
+            spans.extend(
+                window
+                    .values
+                    .iter()
+                    .map(|&(start, end)| (window.offset + start, window.offset + end)),
+            );
+        }
+        assert_eq!(spans, want.spans);
+        // The long record and the short one kept before it; every other window is about a block.
+        assert!(peak <= long.len() + block, "window of {peak}");
+        assert_eq!(reader.buf.capacity(), capacity, "grown");
     }
 
     /// #7082: a window of a `--seq` stream reads each RS as a space, whatever the window, and nothing
