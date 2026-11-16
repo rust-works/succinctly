@@ -16095,6 +16095,17 @@ fn split_json_values(bytes: &[u8]) -> (Vec<(usize, usize)>, Option<usize>) {
     (values, None)
 }
 
+/// An empty vector with room for the documents of `chunk_bytes` of small ones (a chunk of 64-byte
+/// documents fills it), so that the small chunks the lazy scan starts on do not grow it by doubling
+/// (#7264). Out of line on purpose: written in the splitter's own body it moved the register
+/// allocation of its byte loop (`lazy_json_scan_chunk`, which inlines the splitter, 1,993 to 2,081 bytes
+/// and +8% of its instructions, about 1.2 per byte of string and container text), where a call keeps the
+/// loop as it was (1,972 bytes, +0.04% inclusive).
+#[inline(never)]
+fn spans_with_room(chunk_bytes: usize) -> Vec<(usize, usize)> {
+    Vec::with_capacity((chunk_bytes / 64).min(1 << 13))
+}
+
 /// [`split_json_values`] from `from`, which stops after the first value that ends at `stop_at` or
 /// later and that jq reads whatever follows it: a string or container, or a number or literal
 /// followed by white space. A number or literal directly followed by another byte is read with it
@@ -16105,11 +16116,7 @@ fn split_json_values_until(
     from: usize,
     stop_at: usize,
 ) -> (Vec<(usize, usize)>, Option<usize>, bool) {
-    // Room for the documents of a chunk of small ones (a chunk of a stream of 64-byte documents
-    // fills it), so that the small chunks the scan now starts on do not grow it by doubling: that
-    // growth was +1.5% of the instructions of `reduce inputs` over a 1 MB file, all in malloc (#7264).
-    let mut values =
-        Vec::with_capacity((stop_at.min(bytes.len()).saturating_sub(from) / 64).min(1 << 13));
+    let mut values = spans_with_room(stop_at.min(bytes.len()).saturating_sub(from));
     let mut pos = from;
 
     while pos < bytes.len() {
