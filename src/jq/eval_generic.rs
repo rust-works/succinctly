@@ -9091,39 +9091,6 @@ fn retain_truthy_generic<V: DocumentValue, S: EvalSemantics>(
     }
 }
 
-/// Add one element's result to `fold_pipe_stages`' per-element batch, keeping
-/// what [`flatten_generic_results`] and the all-cursors check would make of the
-/// batch exactly as it was, at about 32 bytes per element instead of 80 for a
-/// stretch of computed values (#7267).
-///
-/// A value that is already owned cannot fail later, so two or more consecutive
-/// `Owned` results become one `ManyOwned` run rather than one 80-byte
-/// `GenericResult` each: flattening a run yields its values in the same order,
-/// and a run is not a cursor, as none of its values were. A lone `Owned`
-/// between other entries stays as it is, so a batch that alternates computed
-/// values with cursors (`[.[] | .name // "anon"]`) is laid out as it was before
-/// runs existed. A `None` adds nothing to either outcome and is not kept.
-/// Everything else (a cursor, a lazy result, an error a lazy object raised) is
-/// pushed as it is, still flattened in its place, so an earlier lazily failing
-/// element still wins and the prefix kept on an error is unchanged.
-///
-/// What is reserved stays linear in the elements (`remaining` is this element
-/// and every one after it):
-/// - the first run of the batch ([`ElementBatch::sized_run`]) is sized for
-///   every element left, which is exact for a one-value-per-element map such as
-///   `[.[] | floor]`; every later run starts small and doubles; any run that
-///   another kind of entry closes gives back its slack (more than an eighth of
-///   its length, or 16 slots), so the batch never holds more than about an eighth
-///   over its values in closed runs;
-/// - the batch itself is sized for every element left when its first entry
-///   that is not owned arrives while it holds at most two entries (an
-///   all-cursors walk such as `[.[] | .a]` fills one entry per element, and no
-///   element adds more than one), and not before, since a batch that is one run
-///   needs a single entry.
-///
-/// Inlined into the loop (#7267 review): called out of line, moving each 80-byte result
-/// into the call cost about 64 more instructions per element than the plain push it
-/// replaced, 1.5% of `[.xs[] | .name // "anon"]` over 1M elements.
 /// What [`push_element_result`] needs to know about a batch without reading its
 /// last 80-byte entry back on every element (#7267 review: that read, done per
 /// element, was most of the extra instructions over a plain push).
@@ -9143,12 +9110,48 @@ enum LastEntry {
     Nothing,
     /// A plain `Owned`, which a second computed value turns into a run.
     Owned,
-    /// A `ManyOwned` run, which computed values extend.
+    /// A `ManyOwned` run this batch made, which computed values extend.
     Run,
     /// Anything else: a cursor, a lazy result, an error a lazy object raised.
     Other,
 }
 
+/// Add one element's result to `fold_pipe_stages`' per-element batch, keeping
+/// what [`flatten_generic_results`] and the all-cursors check would make of the
+/// batch exactly as it was, at about 32 bytes per element instead of 80 for a
+/// stretch of computed values (#7267).
+///
+/// A value that is already owned cannot fail later, so two or more consecutive
+/// `Owned` results become one `ManyOwned` run rather than one 80-byte
+/// `GenericResult` each: flattening a run yields its values in the same order,
+/// and a run is not a cursor, as none of its values were. A lone `Owned`
+/// between other entries stays as it is, so a batch that alternates computed
+/// values with cursors (`[.[] | .name // "anon"]`) is laid out as it was before
+/// runs existed, and so does an element's own `ManyOwned` (an inner
+/// generator's values), which is already one compact entry. A `None` adds
+/// nothing to either outcome and is not kept. Everything else (a cursor, a lazy
+/// result, an error a lazy object raised) is pushed as it is, still flattened
+/// in its place, so an earlier lazily failing element still wins and the prefix
+/// kept on an error is unchanged.
+///
+/// What is reserved stays linear in the elements (`remaining` is this element
+/// and every one after it):
+/// - the first run of the batch ([`ElementBatch::sized_run`]) is sized for
+///   every element left, which is exact for a one-value-per-element map such as
+///   `[.[] | floor]`; every later run starts small and doubles; any run that
+///   another kind of entry closes gives back its slack (more than an eighth of
+///   its length, or 16 slots), so closed runs hold at most about an eighth over
+///   their values;
+/// - the batch itself is sized for every element left when its first entry
+///   that is not owned arrives while it holds at most two entries (an
+///   all-cursors walk such as `[.[] | .a]` fills one entry per element, and no
+///   element adds more than one), and not before, since a batch that is one run
+///   needs a single entry.
+///
+/// Inlined into the loop, and `fold_pipe_stages` calls the per-kind halves
+/// straight from its own match (#7267 review): called out of line, moving each
+/// 80-byte result into the call and matching it a second time cost about 70
+/// more instructions per element than the plain push it replaced.
 #[inline(always)]
 fn push_element_result<V: DocumentValue>(
     per_element: &mut Vec<GenericResult<V>>,
@@ -9159,7 +9162,6 @@ fn push_element_result<V: DocumentValue>(
     match result {
         GenericResult::None => {}
         GenericResult::Owned(o) => push_owned_element(per_element, o, remaining, batch),
-        GenericResult::ManyOwned(os) => push_owned_elements(per_element, os, batch),
         other => push_other_element(per_element, other, remaining, batch),
     }
 }
@@ -9201,24 +9203,10 @@ fn push_owned_element<V: DocumentValue>(
     }
 }
 
-/// [`push_element_result`]'s `ManyOwned` arm.
-#[inline(always)]
-fn push_owned_elements<V: DocumentValue>(
-    per_element: &mut Vec<GenericResult<V>>,
-    os: Vec<OwnedValue>,
-    batch: &mut ElementBatch,
-) {
-    if batch.last == LastEntry::Run {
-        if let Some(GenericResult::ManyOwned(run)) = per_element.last_mut() {
-            run.extend(os);
-        }
-    } else {
-        per_element.push(GenericResult::ManyOwned(os));
-        batch.last = LastEntry::Run;
-    }
-}
-
-/// [`push_element_result`]'s arm for every result that is neither empty nor owned.
+/// [`push_element_result`]'s arm for every result but an empty or a single owned one. A
+/// `ManyOwned` (an inner generator's values, `.[] | (.[] | f)`) is kept as the entry it
+/// already is rather than copied into a run, as it was before runs existed (#7267 review:
+/// copying it in and growing the run cost 12% on that shape).
 #[inline(always)]
 fn push_other_element<V: DocumentValue>(
     per_element: &mut Vec<GenericResult<V>>,
@@ -9375,33 +9363,40 @@ mod per_element_batch_tests_7267 {
         }
     }
 
-    /// An inner generator's results (`.[] | (.[] | f)`) extend the run they follow, which then
-    /// grows by doubling; a cursor that closes such a run takes its slack back, so the closed
-    /// runs hold no more than an eighth (or 16 slots) over their values. Holding the doubled
-    /// capacity was 9% over main's peak on arrays of 0-2,000 values between strings.
+    /// Runs after the batch's first grow by doubling; a cursor that closes one takes its slack
+    /// back, so closed runs hold no more than an eighth (or 16 slots) over their values. Keeping
+    /// the doubled capacity, as a rule that shrinks only a run under half used does, fails here.
     #[test]
     fn closed_runs_give_back_doubling_slack_7267() {
-        let n = 4000;
+        let n = 20_000;
         let doc = format!("[{}]", vec!["[0]"; n].join(","));
         let cs = cursors(Box::leak(doc.into_bytes().into_boxed_slice()));
         let mut batch: Batch<'_> = Vec::new();
         let mut state = ElementBatch::default();
-        let mut values = 0;
+        let mut stretch = 0;
+        let mut owned_values = 0;
         for (i, c) in cs.iter().enumerate() {
-            let result = if i % 3 == 2 {
+            let result = if stretch == 0 {
+                stretch = 2 + (i * 37) % 300;
                 GenericResult::OneCursor(*c)
             } else {
-                let k = (i * 37) % 300;
-                values += k;
-                GenericResult::ManyOwned((0..k).map(|v| OwnedValue::Int(v as i64)).collect())
+                stretch -= 1;
+                owned_values += 1;
+                owned(i)
             };
             push_element_result(&mut batch, result, n - i, &mut state);
         }
         let closed = &batch[..batch.len() - 1];
+        let runs = closed
+            .iter()
+            .filter(|r| matches!(r, GenericResult::ManyOwned(_)))
+            .count();
+        assert!(runs > 50, "{runs} closed runs");
         for entry in closed {
             if let GenericResult::ManyOwned(run) = entry {
+                let slack = run.capacity() - run.len();
                 assert!(
-                    run.capacity() - run.len() <= (run.len() / 8).max(16),
+                    slack <= (run.len() / 8).max(16),
                     "{} of {}",
                     run.len(),
                     run.capacity()
@@ -9409,7 +9404,13 @@ mod per_element_batch_tests_7267 {
             }
         }
         let flat = flatten_generic_results::<_, JqSemantics>(batch).unwrap();
-        assert_eq!(flat.len(), values + n / 3);
+        assert_eq!(flat.len(), n);
+        assert_eq!(
+            flat.iter()
+                .filter(|v| matches!(v, OwnedValue::Int(_)))
+                .count(),
+            owned_values
+        );
     }
 
     /// A lone computed value between cursors stays as it is, `None` leaves nothing, runs keep
@@ -9437,11 +9438,13 @@ mod per_element_batch_tests_7267 {
             1,
             &mut sized,
         );
-        assert_eq!(batch.len(), 4);
+        assert_eq!(batch.len(), 5);
         assert!(matches!(&batch[0], GenericResult::Owned(_)));
         assert!(matches!(&batch[1], GenericResult::OneCursor(_)));
-        assert!(matches!(&batch[2], GenericResult::ManyOwned(run) if run.len() == 4));
-        assert!(matches!(&batch[3], GenericResult::ManyCursor(_)));
+        assert!(matches!(&batch[2], GenericResult::ManyOwned(run) if run.len() == 2));
+        // An element's own `ManyOwned` stays the entry it is, not copied into the run.
+        assert!(matches!(&batch[3], GenericResult::ManyOwned(os) if os.len() == 2));
+        assert!(matches!(&batch[4], GenericResult::ManyCursor(_)));
         let flat: Vec<String> = flatten_generic_results::<_, JqSemantics>(batch)
             .unwrap()
             .iter()
@@ -14504,9 +14507,6 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
                         GenericResult::None => {}
                         GenericResult::Owned(o) => {
                             push_owned_element(&mut per_element, o, elements - i, &mut batch);
-                        }
-                        GenericResult::ManyOwned(os) => {
-                            push_owned_elements(&mut per_element, os, &mut batch);
                         }
                         other => {
                             push_other_element(&mut per_element, other, elements - i, &mut batch);
