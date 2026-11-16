@@ -3811,7 +3811,7 @@ pub fn effective_fields_checked<F: DocumentFields>(
 /// inside the walk was 2-4% slower than the field list it replaced. The first
 /// [`SMALL_OBJECT_FIELDS`] hashes live on the stack and are compared pairwise, so an object that
 /// small allocates nothing but its cursor list: the batch and the hash list, and the sort, are
-/// for a wider one.
+/// for a wider one. A one-field object hashes nothing, as `keys_repeat` did not.
 ///
 /// Only an object whose key hashes repeat, under a collapsing mode, walks a second time
 /// (`collapse_repeated_cursors`): the collapse needs the keys, and a hash shared by two
@@ -3826,6 +3826,7 @@ pub fn effective_value_cursors_checked<F: DocumentFields>(
     // these and every later one, through `batch`.
     let mut small = [0u64; SMALL_OBJECT_FIELDS];
     let mut small_len = 0usize;
+    let mut first_key: Option<F::Value> = None;
     let mut hashes: Vec<u64> = Vec::new();
     let mut batch: Vec<F::Value> = Vec::new();
     let mut walk = fields.clone();
@@ -3839,10 +3840,15 @@ pub fn effective_value_cursors_checked<F: DocumentFields>(
         }
         out.push(field.value_cursor);
         if collapse {
-            if out.len() <= SMALL_OBJECT_FIELDS {
-                if let Some(hash) = key_hash_of(&field.key) {
-                    small[small_len] = hash;
-                    small_len += 1;
+            if out.len() == 1 {
+                // A lone field repeats nothing, so its key is hashed only once a second arrives.
+                first_key = Some(field.key);
+            } else if out.len() <= SMALL_OBJECT_FIELDS {
+                for key in first_key.take().iter().chain(core::iter::once(&field.key)) {
+                    if let Some(hash) = key_hash_of(key) {
+                        small[small_len] = hash;
+                        small_len += 1;
+                    }
                 }
             } else {
                 if batch.capacity() == 0 {
