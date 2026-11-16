@@ -4943,8 +4943,8 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
                     return Some(Cow::Owned(spelling));
                 }
                 let bytes = n.raw_bytes();
-                if crate::json::validate::is_valid_number(bytes) {
-                    return core::str::from_utf8(bytes).ok().map(Cow::Borrowed);
+                if let Some(text) = crate::json::validate::valid_number_str(bytes) {
+                    return Some(Cow::Borrowed(text));
                 }
                 // Real jq's own number reader tolerates a redundant
                 // leading zero that strict RFC 8259 doesn't (`007` ->

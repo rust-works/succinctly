@@ -246,13 +246,45 @@ impl NumberRepr {
 /// `from_document_float`), yq's own `from_number_literal_plain`, and the
 /// `Literal` constructor tests build with.
 pub(crate) fn parse_i64_or_f64(s: &str) -> Option<NumberRepr> {
-    if let Ok(i) = s.parse::<i64>() {
+    if let Some(i) = parse_i64_exact(s) {
         Some(NumberRepr::Int(i))
     } else if let Ok(f) = s.parse::<f64>() {
         Some(NumberRepr::Float(f))
     } else {
         None
     }
+}
+
+/// `s.parse::<i64>().ok()`, exactly (#7287): an optional `+` or `-`, then one or more ASCII
+/// digits and nothing else, in `i64`'s range. It answers `None` at the first byte that is not a
+/// digit, where `i64`'s `FromStr` builds an error first, and every fraction and exponent a number
+/// funnel reads (`3.141593`, `1e2`) stops there one or two bytes in.
+/// `parse_i64_exact_matches_from_str` checks it against `FromStr`.
+#[inline]
+pub(crate) fn parse_i64_exact(s: &str) -> Option<i64> {
+    let bytes = s.as_bytes();
+    let (negative, digits) = match bytes.split_first() {
+        Some((b'-', rest)) => (true, rest),
+        Some((b'+', rest)) => (false, rest),
+        _ => (false, bytes),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let mut value: i64 = 0;
+    for &byte in digits {
+        let digit = byte.wrapping_sub(b'0');
+        if digit > 9 {
+            return None;
+        }
+        value = value.checked_mul(10)?;
+        value = if negative {
+            value.checked_sub(i64::from(digit))?
+        } else {
+            value.checked_add(i64::from(digit))?
+        };
+    }
+    Some(value)
 }
 
 /// [`parse_i64_or_f64`] under `S`'s number model (#2936): the `Int` arm is
@@ -263,7 +295,7 @@ pub(crate) fn parse_i64_or_f64(s: &str) -> Option<NumberRepr> {
 /// ([`jq_literal_text_to_f64`]) when `EvalSemantics::DECNUMBER_LITERALS`
 /// and the plain parse otherwise.
 pub(crate) fn parse_i64_or_f64_in<S: EvalSemantics>(s: &str) -> Option<NumberRepr> {
-    if let Ok(i) = s.parse::<i64>() {
+    if let Some(i) = parse_i64_exact(s) {
         return Some(NumberRepr::Int(i));
     }
     let f = if S::DECNUMBER_LITERALS {
@@ -6820,6 +6852,83 @@ impl<T: Into<Self>> From<Vec<T>> for OwnedValue {
 
 #[cfg(test)]
 mod tests {
+    /// #7287: `parse_i64_exact` is `str::parse::<i64>().ok()` over every spelling a number funnel
+    /// hands it: signs, leading zeros, the `i64` bounds and one past them, fractions, exponents,
+    /// YAML's spelled integers (`0x1f`, `0o17`, `1_000`, `+5`), the non-finite words and stray
+    /// bytes, plus every string of up to three bytes over a small alphabet.
+    #[test]
+    fn parse_i64_exact_matches_from_str() {
+        let fixed = [
+            "",
+            "+",
+            "-",
+            "0",
+            "-0",
+            "+0",
+            "00",
+            "007",
+            "-007",
+            "1",
+            "-1",
+            "+1",
+            "42",
+            "9223372036854775807",
+            "-9223372036854775808",
+            "9223372036854775808",
+            "-9223372036854775809",
+            "+9223372036854775807",
+            "99999999999999999999",
+            "18446744073709551616",
+            "0000000000000000000000000001",
+            "1.0",
+            "1.",
+            ".5",
+            "-.5",
+            "3.141593",
+            "1e2",
+            "1E2",
+            "1e+2",
+            "-1e-2",
+            "1_000",
+            "0x1f",
+            "0o17",
+            "0b101",
+            "+-5",
+            "-+5",
+            "--5",
+            "++5",
+            " 5",
+            "5 ",
+            "5\n",
+            ".inf",
+            "-.inf",
+            ".nan",
+            "nan",
+            "inf",
+            "Infinity",
+            "1\u{0663}",
+            "١",
+            "12a",
+            "a12",
+        ];
+        for s in fixed {
+            assert_eq!(super::parse_i64_exact(s), s.parse::<i64>().ok(), "{s:?}");
+        }
+        let alphabet = ['0', '1', '9', '-', '+', '.', 'e', 'x', '_', ' '];
+        let mut checked = 0usize;
+        for a in alphabet {
+            for b in alphabet {
+                for c in alphabet {
+                    for s in [a.to_string(), format!("{a}{b}"), format!("{a}{b}{c}")] {
+                        assert_eq!(super::parse_i64_exact(&s), s.parse::<i64>().ok(), "{s:?}");
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 3000);
+    }
+
     use super::*;
 
     /// #2429/#3506: the subarray search counts overlapping matches, answers
