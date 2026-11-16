@@ -9094,9 +9094,12 @@ fn retain_truthy_generic<V: DocumentValue, S: EvalSemantics>(
 
 /// How many elements `fold_pipe_stages`' `ManyCursor` arm folds exactly as it did before #7267
 /// before it may move a fold whose elements have all yielded one computed value or nothing so
-/// far to [`collect_computed_run`] (#7267). Below it, every fold builds main's batch, its
-/// flatten and its handed-on vector, allocator calls included; above it, the run of computed
-/// values is long enough to pay for the vector it moves into. Chosen by measurement (#7267
+/// far to [`collect_computed_run`], and how many must be left for it to (#7267). A fold of fewer
+/// than twice this many elements, or one that meets any other kind of result in its first
+/// `COMPUTED_RUN_MIN`, builds main's batch, its flatten and its handed-on vector, allocator calls
+/// included; a longer one is long enough to pay for the vector it moves into (#7267 review: a
+/// fold that moved with a single element left and then went back to main's entries ran 0.7% more
+/// instructions on the Apple M4 Pro). Chosen by measurement (#7267
 /// review: a short computed run followed by another kind of result held up to 2x main's
 /// capacity, and cost two more allocations per fold, when it moved at the second value).
 const COMPUTED_RUN_MIN: usize = 64;
@@ -9177,7 +9180,7 @@ macro_rules! push_element_result_7267 {
 /// `fold_pipe_stages`' `ManyCursor` arm over its elements' results (`eval` of each element).
 ///
 /// It is the arm as it was before #7267, with one addition: once [`COMPUTED_RUN_MIN`] elements
-/// have each yielded one computed value or nothing, and elements are left, the fold moves to
+/// have each yielded one computed value or nothing, and at least as many are left, the fold moves to
 /// [`collect_computed_run`], which keeps the values in one vector instead of an 80-byte entry
 /// each (#7267). A fold that is shorter, or that has met any other kind of result by then, is
 /// main's fold throughout: the same batch, flatten, handed-on vector and allocator calls.
@@ -9190,7 +9193,10 @@ fn fold_cursor_elements<S: EvalSemantics, V: DocumentValue, I: ExactSizeIterator
     let mut computed_only = true;
     while let Some(element) = elements.next() {
         push_element_result_7267!(S, per_element, eval(element), computed_only);
-        if computed_only && per_element.len() == COMPUTED_RUN_MIN && elements.len() != 0 {
+        if computed_only
+            && per_element.len() == COMPUTED_RUN_MIN
+            && elements.len() >= COMPUTED_RUN_MIN
+        {
             return collect_computed_run::<S, V, I>(per_element, elements, eval);
         }
     }
@@ -9228,11 +9234,13 @@ fn collect_computed_run<S: EvalSemantics, V: DocumentValue, I: ExactSizeIterator
     #[cfg(test)]
     let total = per_element.len() + elements.len();
     let mut values: Vec<OwnedValue> = vec_with_capacity(per_element.len() + elements.len());
-    for entry in per_element.drain(..) {
-        if let GenericResult::Owned(o) = entry {
+    // Taken out in place rather than drained, which keeps the batch's capacity for later too.
+    for entry in &mut per_element {
+        if let GenericResult::Owned(o) = core::mem::replace(entry, GenericResult::None) {
             values.push(o);
         }
     }
+    per_element.clear();
     // The first result of another kind, and whether it is already the batch entry (a lazy
     // object whose building failed, which the batch keeps as it is).
     let other = loop {
@@ -9608,7 +9616,7 @@ mod per_element_batch_tests_7267 {
         let (mut moved, mut stayed) = (0, 0);
         for case in 0..3000 {
             let lead = if rng.random_bool(0.4) {
-                rng.random_range(0..150)
+                rng.random_range(0..300)
             } else {
                 0
             };
@@ -9647,19 +9655,17 @@ mod per_element_batch_tests_7267 {
             }
             if !bounded {
                 assert_eq!(capacity(&got), capacity(&want), "case {case}: {kinds:?}");
-            } else {
-                if let GenericResult::ManyOwned(v) = &got {
-                    assert!(
-                        v.capacity() <= v.len() + slack_allowed(v.len()),
-                        "case {case}: {} values in {}",
-                        v.len(),
-                        v.capacity()
-                    );
-                }
+            } else if let GenericResult::ManyOwned(v) = &got {
+                assert!(
+                    v.capacity() <= v.len() + slack_allowed(v.len()),
+                    "case {case}: {} values in {}",
+                    v.len(),
+                    v.capacity()
+                );
             }
         }
         assert!(
-            moved > 500 && stayed > 1000,
+            moved > 400 && stayed > 1000,
             "{moved} moved, {stayed} stayed"
         );
     }
@@ -9670,7 +9676,7 @@ mod per_element_batch_tests_7267 {
     #[test]
     fn k_values_then_a_cursor_hand_on_no_more_than_main_7267() {
         let expr = parse(r#"if type == "number" then . + 1 else . end"#).unwrap();
-        for k in (1..=70).chain([100, 127, 128, 129, 1000]) {
+        for k in (1..=70).chain([100, 126, 127, 128, 129, 1000]) {
             let doc = format!(
                 "[{}\"s\"]",
                 (1..=k).map(|i| format!("{i},")).collect::<String>()
@@ -9680,14 +9686,17 @@ mod per_element_batch_tests_7267 {
                 eval_single::<JqSemantics, _>(&expr, c.value(), false, Some(c))
             };
             let want = main_fold(cs.clone().into_iter(), eval);
+            let _ = batch_stats_7267::take();
             let got = fold(cs.into_iter(), eval);
+            let moved = !batch_stats_7267::take().folds.is_empty();
+            assert_eq!(moved, k >= 2 * COMPUTED_RUN_MIN - 1, "k = {k}");
             assert_eq!(format!("{got:?}"), format!("{want:?}"), "k = {k}");
             let (Some(got_cap), Some(want_cap)) = (capacity(&got), capacity(&want)) else {
                 panic!("expected values for k = {k}") // patchcov: coverage tolerate-line reason="the failure message of the pattern above, unreachable in a passing suite (#7267)"
             };
             let len = k + 1;
-            // A run of no more than `COMPUTED_RUN_MIN` values goes back as main's own entries.
-            if k <= COMPUTED_RUN_MIN {
+            // A fold too short to move is main's fold.
+            if !moved {
                 assert_eq!(got_cap, want_cap, "k = {k}");
             } else {
                 assert!(
@@ -9736,11 +9745,11 @@ mod per_element_batch_tests_7267 {
             ),
             (
                 format!("[{numbers}]"),
-                r#"if . % 3 == 0 then empty else . + 1 end"#,
+                "if . % 3 == 0 then empty else . + 1 end",
             ),
             (
                 format!("[{numbers}]"),
-                r#"if . == 75 then [., .] | .[] else . end"#,
+                "if . == 75 then [., .] | .[] else . end",
             ),
         ];
         for (doc, rest) in &cases {
