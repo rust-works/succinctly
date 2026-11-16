@@ -30707,7 +30707,8 @@ fn reads_one_value_off_cursors(read: &Expr) -> bool {
 /// and then wrote each one out as JSON and indexed it again to read one field and a count (46%
 /// of the instructions of a 249-record group-and-count). Each operand runs on the group as
 /// `map_groups_eagerly`'s cursor route runs `h`, in entry order, and the pairs fold into the
-/// object as the evaluator's construction folds them ([`object_from_pairs`]).
+/// object as the evaluator's construction folds them
+/// ([`object_from_pairs`](super::eval::object_from_pairs)).
 ///
 /// `None` when an operand does not answer one value (a step raised on the wrong kind of value):
 /// the operands are reads with no effect, so the caller's decoded route can run `h` again and
