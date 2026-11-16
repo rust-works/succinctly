@@ -79,8 +79,8 @@ fn test_an_object_past_the_key_table_ceiling_prints_what_jq_prints_7293() -> Res
     Ok(())
 }
 
-/// Indentation is written 64 units at a time and the rest in one slice whose length a `match`
-/// picks (#7293), so every line length crosses one of those paths. Ten levels of `{"a":[...]}` nest
+/// Indentation is written as slices of a run of 64 units (`write_json_indent`, #7271 review), so a
+/// line deeper than 64 or 128 columns takes more than one slice. Ten levels of `{"a":[...]}` nest
 /// twenty deep: at `--indent 7` the deepest line is 140 columns, past one and two runs of 64, and
 /// `--indent 1` and `--indent 3` stay inside the first run.
 #[test]
