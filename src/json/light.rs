@@ -3566,8 +3566,8 @@ pub type BorrowedJsonCursor<'a> = JsonCursor<'a, &'a [u64]>;
 // ============================================================================
 
 use crate::jq::document::{
-    collapsed_fields_checked, document_token_of, effective_fields_checked, key_hash,
-    key_is_malformed, key_span_fingerprint, trailing_element_gap_ok, DocumentCursor,
+    any_hash_repeats, collapsed_fields_checked, document_token_of, effective_fields_checked,
+    key_hash, key_is_malformed, key_span_fingerprint, trailing_element_gap_ok, DocumentCursor,
     DocumentElements, DocumentField, DocumentFields, DocumentValue, IndentSpec, JsonConvention,
     KeyHashes, PAIRWISE_SPAN_SCAN_LIMIT,
 };
@@ -3925,12 +3925,13 @@ fn scalar_end_pos<W: AsRef<[u64]> + Clone>(
 ///   each key's [`key_hash`] is only collected as the object is scanned,
 ///   and [`KeyHashes::has_repeat`] settles them all at the closing `}`
 ///   through a table sized for exactly that many keys, so nothing is
-///   rehashed on the way up. It stops collecting at
-///   [`KeyHashes::SATURATING_KEYS`] keys, the width at which a table grown
-///   key by key would have turned `saturated()` -- the same bail as every
-///   other `KeyHashes` caller in the tree (`DistinctKeyCursors::next`,
-///   `src/jq/document.rs`) -- so an over-wide object is declined without
-///   paying for one more doomed string-scan-and-hash. A repeat in a wide
+///   rehashed on the way up. From [`KeyHashes::SATURATING_KEYS`] keys, the
+///   width at which a table grown key by key would have turned
+///   `saturated()`, the list is settled by `any_hash_repeats`'s sort instead,
+///   as `DistinctKeyCursors` settles an object that wide (`src/jq/document.rs`);
+///   until #7293 the scan declined such an object outright, which left its
+///   caller to walk and hash every key after the scan had hashed 786,432 of
+///   them. A repeat in a wide
 ///   object is found at its end rather than at the key; the span is
 ///   declined either way. Either tier's "seen before" answer covers both a
 ///   genuine duplicate key and a bare 64-bit hash collision between two
@@ -3940,10 +3941,10 @@ fn scalar_end_pos<W: AsRef<[u64]> + Clone>(
 ///   canonical" -- `KeyHashes`'s own doc comment describes the same
 ///   conservatism for its other callers. Both tiers, the seeding handoff
 ///   between them, a duplicate placed on either side of the boundary and
-///   across it, and the saturation bail all have their own sweeps in this
-///   module's `mod tests` (`canonical_object_key_tiers_2608` and
-///   `canonical_echo_bails_when_the_key_table_saturates_2608`, #2608
-///   review) -- the corpus below them tops out at six keys, which is why
+///   across it, and the sort past the table's ceiling all have their own
+///   sweeps in this module's `mod tests` (`canonical_object_key_tiers_2608`
+///   and `canonical_echo_settles_a_saturating_object_by_sort_7293`, #2608
+///   review, #7293) -- the corpus below them tops out at six keys, which is why
 ///   the fuzz generator draws an occasional wide object too.
 ///
 /// The safety argument for this whole function is exactly the equivalence
@@ -4311,10 +4312,13 @@ fn scan_canonical_object(
 /// table sized for exactly that many keys settles them at the closing `}`
 /// ([`KeyHashes::has_repeat`]). A table grown key by key was 83 Ir per key
 /// on a wide object, about half of it rehashing what it had already
-/// placed. The object is declined at the same width a growing table would
-/// have been ([`KeyHashes::SATURATING_KEYS`]), checked as each hash is
-/// pushed so a doomed object costs no more string-scan-and-hash than it
-/// used to (#2919 review).
+/// placed. An object of [`KeyHashes::SATURATING_KEYS`] keys or more, too
+/// wide for that table, is settled by [`any_hash_repeats`] instead, the
+/// sort every other batch caller uses past the table's ceiling (#7293).
+/// It used to be declined there, which made the scan of its first 786,432
+/// keys pure waste: every caller then walks the object, and the walk
+/// hashes and sorts every key itself. The list costs 8 bytes per key, as
+/// the walk's does.
 ///
 /// A repeat is therefore found at the end of the object rather than at the
 /// key. That is the cost of a bail only: the span is declined either way and
@@ -4342,7 +4346,17 @@ fn scan_canonical_object_wide(
         let mut i = scan_canonical_value(bytes, after_key + 1, depth + 1, specials)?;
         match bytes.get(i) {
             Some(b',') => i += 1,
-            Some(b'}') => return (!KeyHashes::has_repeat(&hashes)).then_some(i + 1),
+            Some(b'}') => {
+                // Below the table's ceiling the exactly sized table settles the list; at or
+                // past it, the sort (#7293). Branched here rather than in a helper so the
+                // table's settle stays inlined into this loop, as it was before the sort.
+                let repeat = if hashes.len() < KeyHashes::SATURATING_KEYS {
+                    KeyHashes::has_repeat(&hashes)
+                } else {
+                    sorted_keys_repeat(hashes)
+                };
+                return (!repeat).then_some(i + 1);
+            }
             _ => return None,
         }
         if bytes.get(i) != Some(&b'"') {
@@ -4350,11 +4364,22 @@ fn scan_canonical_object_wide(
         }
         let (key_start, key_end, next_after_key) = scan_json_string_span(bytes, i, specials)?;
         hashes.push(key_hash(&bytes[key_start..key_end]));
-        if hashes.len() >= KeyHashes::SATURATING_KEYS {
-            return None;
-        }
         after_key = next_after_key;
     }
+}
+
+/// Whether any two of an object's key hashes are equal, for an object of
+/// [`KeyHashes::SATURATING_KEYS`] keys or more (#7293): [`any_hash_repeats`]'s
+/// sort, since an exactly sized table would outgrow the table's ceiling there
+/// and [`KeyHashes::has_repeat`] only answers the conservative `true`. Both are
+/// conservative in the same way: two distinct keys sharing a 64-bit hash count
+/// as a repeat, which declines the span. Out of line, so that the sort does
+/// not cost `has_repeat` its inlining into `scan_canonical_object_wide`: with
+/// both behind one inlined helper the table lost it, and the scan of `wide`
+/// 10 MB read 1.8 M more instructions (7950X).
+#[inline(never)]
+fn sorted_keys_repeat(hashes: Vec<u64>) -> bool {
+    any_hash_repeats(hashes)
 }
 
 /// The array-token rule: `[`, then either an immediate `]` or `value`
@@ -8599,23 +8624,24 @@ mod tests {
         }
     }
 
-    /// The table tier's third exit, after "seen this key" and "the span
-    /// ended": [`KeyHashes`] stops growing at its own ceiling, and
-    /// `scan_canonical_object_wide` stops collecting at
-    /// `KeyHashes::SATURATING_KEYS` keys so it bails there instead of
-    /// certifying the rest of a very wide object against a table that
-    /// could no longer record anything (#2608 review, #3333).
+    /// The table tier's width ceiling (#2608 review, #3333, #7293):
+    /// [`KeyHashes`] stops growing at its own ceiling, so from
+    /// `KeyHashes::SATURATING_KEYS` keys `scan_canonical_object_wide` settles
+    /// its list by sorting it (`any_hash_repeats`) rather than through a
+    /// table. Until #7293 it declined there, so every caller re-walked an
+    /// object it had already hashed 786,432 keys of.
     ///
     /// The width is not negotiable -- `KeyHashes::MAX_SLOTS * 3 / 4`
     /// exactly, the point `src/jq/document.rs`'s own
     /// `key_hashes_stops_growing_at_the_ceiling_1588` pins -- so this
     /// document is ~9 MB and this is deliberately the only test here that
-    /// builds one. It is also why the assertions are cheap: the scan must
-    /// decline, and the gate must still print the document, because the
-    /// re-render of a canonical span *is* that span. Nothing about the
-    /// output changes; only which branch produced it.
+    /// builds one. Both sides of the ceiling certify a no-repeat object, a
+    /// repeat on either side is still found (the last key repeating the
+    /// first, so the sort must compare the two ends of the list), and the
+    /// gate prints the document either way, because the re-render of a
+    /// canonical span *is* that span.
     #[test]
-    fn canonical_echo_bails_when_the_key_table_saturates_2608() {
+    fn canonical_echo_settles_a_saturating_object_by_sort_7293() {
         // `KeyHashes::MAX_SLOTS` (`1 << 20`) * 3/4: the key count at which
         // `insert` would next have doubled a table already at its ceiling,
         // so `saturated()` first answers `true`. Spelled out here as an
@@ -8624,44 +8650,39 @@ mod tests {
         const SATURATES_AT: usize = 786_432;
         assert_eq!(KeyHashes::SATURATING_KEYS, SATURATES_AT);
 
-        let mut doc = String::with_capacity(SATURATES_AT * 13);
-        doc.push('{');
-        // Where the last field's separating comma sits, so the same build
-        // yields the one-key-narrower document below without a second
-        // nine-megabyte pass.
-        let mut before_last_field = 0usize;
-        for i in 0..SATURATES_AT {
-            if i > 0 {
-                doc.push(',');
+        fn object(keys: usize, last: Option<&str>) -> Vec<u8> {
+            let mut doc = String::with_capacity(keys * 13);
+            doc.push('{');
+            for i in 0..keys {
+                if i > 0 {
+                    doc.push(',');
+                }
+                match last {
+                    Some(key) if i == keys - 1 => doc.push_str(&format!("\"{key}\":1")),
+                    _ => doc.push_str(&format!("\"k{i:06}\":0")),
+                }
             }
-            if i == SATURATES_AT - 1 {
-                before_last_field = doc.len() - 1;
-            }
-            doc.push_str(&format!("\"k{i:06}\":0"));
+            doc.push('}');
+            doc.into_bytes()
         }
-        doc.push('}');
-        let doc = doc.into_bytes();
 
-        assert!(
-            !is_canonical_compact_jq_span(&doc),
-            "a saturating object must bail rather than certify"
-        );
-        // One key short of saturation the same object certifies, which is
-        // what makes the assertion above a statement about the ceiling
-        // and not about width in general.
-        let mut narrower = doc[..before_last_field].to_vec();
-        narrower.push(b'}');
-        assert!(
-            is_canonical_compact_jq_span(&narrower),
-            "one key below the ceiling still certifies"
-        );
-        drop(narrower);
-
-        assert_eq!(
-            render_compact_jq_through_gate(&doc),
-            Some(String::from_utf8_lossy(&doc).into_owned()),
-            "the re-render of a canonical span is the span"
-        );
+        for keys in [SATURATES_AT - 1, SATURATES_AT, SATURATES_AT + 1] {
+            let doc = object(keys, None);
+            assert!(
+                is_canonical_compact_jq_span(&doc),
+                "{keys} distinct keys certify on either side of the ceiling"
+            );
+            assert_eq!(
+                render_compact_jq_through_gate(&doc),
+                Some(String::from_utf8_lossy(&doc).into_owned()),
+                "the re-render of a canonical span is the span ({keys} keys)"
+            );
+            let repeat = object(keys, Some("k000000"));
+            assert!(
+                !is_canonical_compact_jq_span(&repeat),
+                "a last key repeating the first declines at {keys} keys"
+            );
+        }
     }
 
     /// Same load-bearing direction as the corpus test above --
