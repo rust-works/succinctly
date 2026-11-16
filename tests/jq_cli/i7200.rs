@@ -6,12 +6,12 @@
 
 #![cfg(unix)]
 
-use std::io::Write;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 use anyhow::Result;
 
+use crate::fifo_feed::{self, Feed};
 use crate::{spawn_jq, succinctly_bin};
 
 const STREAMS: [(&[u8], &str); 3] = [
@@ -68,38 +68,21 @@ fn a_fifo_path_with_a_byte_order_mark_does_not_hang_7200() -> Result<()> {
     let dir = std::env::temp_dir().join(format!("succinctly-7200-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     let fifo = dir.join("f");
-    assert!(Command::new("mkfifo").arg(&fifo).status()?.success());
-    let writer_path = fifo.clone();
-    let writer = std::thread::spawn(move || {
-        // One open for writing: a second open of the path by the reader would wait forever.
-        if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(writer_path) {
-            let _ = f.write_all(b"\xef\xbb\xbf\x1e1\n");
-        }
-    });
-    let mut child = Command::new(succinctly_bin())
-        .args(["jq", "--seq", "-c", "."])
-        .arg(&fifo)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let start = Instant::now();
-    let finished = loop {
-        if let Some(status) = child.try_wait()? {
-            break Some(status);
-        }
-        if start.elapsed() > Duration::from_secs(20) {
-            child.kill()?;
-            child.wait()?;
-            break None;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    let out = child.wait_with_output()?;
+    // One writer, which writes the bytes once: a second open of the path by the reader used to wait
+    // forever, and with this writer reads an end of file, so the bytes are missing from the output.
+    let feed = Feed::new(fifo.clone(), b"\xef\xbb\xbf\x1e1\n".to_vec());
+    let out = fifo_feed::output_within(
+        Command::new(succinctly_bin())
+            .args(["jq", "--seq", "-c", "."])
+            .arg(&fifo),
+        std::slice::from_ref(&feed),
+        Duration::from_secs(20),
+    );
+    drop(feed);
     let _ = std::fs::remove_dir_all(&dir);
-    let status = finished.expect("`--seq` over a FIFO path returned");
-    assert!(status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = out?;
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.stdout, b"\x1e1\n");
-    let _ = writer.join();
     Ok(())
 }
 

@@ -224,6 +224,12 @@ use cargo_run_exit::{
     write_stdin_then_wait, MAX_CARGO_RETRIES,
 };
 
+// Named pipes that feed a run, and a deadline for it: every test that hands the binary a FIFO goes
+// through this (#7304).
+#[cfg(unix)]
+#[path = "common/fifo_feed.rs"]
+mod fifo_feed;
+
 // New tests go in `tests/jq_cli/` (one `iNNNN.rs` per issue), not at the end of this file:
 // see the header of `tests/jq_cli/mod.rs`. #4329, #5697.
 #[path = "jq_cli/mod.rs"]
