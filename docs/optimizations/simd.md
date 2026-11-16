@@ -853,6 +853,13 @@ well-predicted branches is simply shorter.
   padding that moves it the same way, with no source change, reproduces the slowdown,
   and the effect repeats every 64 bytes, a 15% band on this shape. See
   [benchmarking.md § 9](../guides/benchmarking.md#what-the-pinned-profile-does-not-pin-function-placement-3100).
+  #7299 replaced that loop with a branch-free table kernel (one load and one shift per
+  byte, `movemask` for the bits). It narrowed the band to 1-4% across four positions mod
+  64, against 7.7% for the kernel it replaced, and the kernel alone is 1.2x (strings
+  that are all backslash escapes) to about 50x (long strings, skipped block by block)
+  faster. It is not the rejected P3: P3 tabulated a per-character classification the
+  branch predictor already got right, while this tabulates the data-dependent state
+  transition the predictor could not.
 - On x86_64 the probe compiles out (`PREFIX = 0`); before the inlining change the guard
   read every row at ±0.0% against `main` on the 7950X. A build with the word probe enabled on x86_64 too
   was measured and not shipped: the guard read `users_keys_unsorted` +1.2% and the 7950X

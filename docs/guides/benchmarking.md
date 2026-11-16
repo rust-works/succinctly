@@ -1232,6 +1232,27 @@ Current `main` lands there, so turning the flag on for `main` makes
 of the flags was adopted. A source-level fix, a dispatch loop whose speed does not depend
 on where its jump targets land, is the remaining option.
 
+**The source-level fix (#7299).** By `618a24ee4` the kernel had become a branch tree rather
+than a jump table (three conditional branches per byte, both bit writers' state reloaded and
+stored per written bit), and it was still the lottery: two builds a number-decoding change apart
+timed `.users[0].name` on the 100 MB `users` document at 145.8 and 158.3 ms on the 7950X, with
+`process_chunk_standard`'s `Ir`, branches and simulated mispredicts identical and only its
+address changed (48 against 32 mod 64). It was replaced by a branch-free kernel: a compile-time
+table of `standard::state_machine` per byte carries the state through one shift, `movemask`
+extracts each block's bits, and a block wholly inside a string is skipped. The same padding
+holdout, applied to both sides (min / median ms, 11 interleaved reps, 100 MB `users`):
+
+| build (hot function at)                      | `.users[0].name`  | `-c .`        | `length`      |
+|----------------------------------------------|-------------------|---------------|---------------|
+| old kernel, padded 0/16/32/48 (0/16/32/48)   | 143.5-154.5 (min) | 227.9-235.7   | 126.6-137.4   |
+| new kernel, padded 0/16/32/48 (16/32/48/0)   | 117.5-119.6 (min) | 199.1-201.9   | 100.3-102.7   |
+
+The old kernel's band is 7.7% of its fastest layout and the new one's is 1.8% here. An
+independent sweep over four more positions read 1.3-4.4% across `.users[0].name`, `-c .`,
+`length` and `pathological` `length`, so the new kernel is much less sensitive to placement,
+not immune. Its slowest layout is still 17% faster than the old kernel's fastest. The rule below still stands for every other
+hot loop.
+
 **Rule.** On x86_64, a wall-clock delta between two builds whose per-function `Ir` agrees
 is layout until a padding holdout says otherwise. Before blaming the diff, rebuild the
 *base* with an inert padding function sized to move the hot code by 16/32/48/64 bytes, and

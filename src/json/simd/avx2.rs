@@ -8,7 +8,7 @@
 use core::arch::x86_64::*;
 
 use crate::json::simple::{SemiIndex as SimpleSemiIndex, State as SimpleState};
-use crate::json::standard::{SemiIndex, State};
+use crate::json::standard::{SemiIndex, State, STATES, STEP_CLOSE, STEP_IB, STEP_OPEN, STEP_TABLE};
 use crate::json::BitWriter;
 
 /// ASCII byte constants
@@ -34,8 +34,6 @@ struct CharClass {
     closes: u32,
     /// Mask of bytes that are ',' or ':'
     delims: u32,
-    /// Mask of bytes that could start/continue a value (alphanumeric, ., -, +)
-    value_chars: u32,
 }
 
 /// Classify 32 bytes at once using AVX2.
@@ -43,185 +41,84 @@ struct CharClass {
 #[target_feature(enable = "avx2")]
 #[cfg(target_arch = "x86_64")]
 unsafe fn classify_chars(chunk: __m256i) -> CharClass {
-    unsafe {
-        // Create comparison vectors for each character
-        let v_quote = _mm256_set1_epi8(DOUBLE_QUOTE);
-        let v_backslash = _mm256_set1_epi8(BACKSLASH);
-        let v_open_brace = _mm256_set1_epi8(OPEN_BRACE);
-        let v_close_brace = _mm256_set1_epi8(CLOSE_BRACE);
-        let v_open_bracket = _mm256_set1_epi8(OPEN_BRACKET);
-        let v_close_bracket = _mm256_set1_epi8(CLOSE_BRACKET);
-        let v_comma = _mm256_set1_epi8(COMMA);
-        let v_colon = _mm256_set1_epi8(COLON);
+    // Create comparison vectors for each character
+    let v_quote = _mm256_set1_epi8(DOUBLE_QUOTE);
+    let v_backslash = _mm256_set1_epi8(BACKSLASH);
+    let v_open_brace = _mm256_set1_epi8(OPEN_BRACE);
+    let v_close_brace = _mm256_set1_epi8(CLOSE_BRACE);
+    let v_open_bracket = _mm256_set1_epi8(OPEN_BRACKET);
+    let v_close_bracket = _mm256_set1_epi8(CLOSE_BRACKET);
+    let v_comma = _mm256_set1_epi8(COMMA);
+    let v_colon = _mm256_set1_epi8(COLON);
 
-        // Compare and get masks using _mm256_cmpeq_epi8
-        let eq_quote = _mm256_cmpeq_epi8(chunk, v_quote);
-        let eq_backslash = _mm256_cmpeq_epi8(chunk, v_backslash);
-        let eq_open_brace = _mm256_cmpeq_epi8(chunk, v_open_brace);
-        let eq_close_brace = _mm256_cmpeq_epi8(chunk, v_close_brace);
-        let eq_open_bracket = _mm256_cmpeq_epi8(chunk, v_open_bracket);
-        let eq_close_bracket = _mm256_cmpeq_epi8(chunk, v_close_bracket);
-        let eq_comma = _mm256_cmpeq_epi8(chunk, v_comma);
-        let eq_colon = _mm256_cmpeq_epi8(chunk, v_colon);
+    // Compare and get masks using _mm256_cmpeq_epi8
+    let eq_quote = _mm256_cmpeq_epi8(chunk, v_quote);
+    let eq_backslash = _mm256_cmpeq_epi8(chunk, v_backslash);
+    let eq_open_brace = _mm256_cmpeq_epi8(chunk, v_open_brace);
+    let eq_close_brace = _mm256_cmpeq_epi8(chunk, v_close_brace);
+    let eq_open_bracket = _mm256_cmpeq_epi8(chunk, v_open_bracket);
+    let eq_close_bracket = _mm256_cmpeq_epi8(chunk, v_close_bracket);
+    let eq_comma = _mm256_cmpeq_epi8(chunk, v_comma);
+    let eq_colon = _mm256_cmpeq_epi8(chunk, v_colon);
 
-        // Combine opens and closes
-        let opens = _mm256_or_si256(eq_open_brace, eq_open_bracket);
-        let closes = _mm256_or_si256(eq_close_brace, eq_close_bracket);
-        let delims = _mm256_or_si256(eq_comma, eq_colon);
+    // Combine opens and closes
+    let opens = _mm256_or_si256(eq_open_brace, eq_open_bracket);
+    let closes = _mm256_or_si256(eq_close_brace, eq_close_bracket);
+    let delims = _mm256_or_si256(eq_comma, eq_colon);
 
-        // Value chars: alphanumeric, period, minus, plus
-        // a-z: 0x61-0x7a, A-Z: 0x41-0x5a, 0-9: 0x30-0x39
-        // period: 0x2e, minus: 0x2d, plus: 0x2b
-
-        // Check for lowercase: c >= 'a' && c <= 'z'
-        let v_a_lower = _mm256_set1_epi8(b'a' as i8);
-        let v_z_range = _mm256_set1_epi8((b'z' - b'a') as i8);
-        let sub_a = _mm256_sub_epi8(chunk, v_a_lower);
-        let lowercase = unsigned_le(sub_a, v_z_range);
-
-        // Check for uppercase: c >= 'A' && c <= 'Z'
-        let v_a_upper = _mm256_set1_epi8(b'A' as i8);
-        let sub_a_upper = _mm256_sub_epi8(chunk, v_a_upper);
-        let uppercase = unsigned_le(sub_a_upper, v_z_range);
-
-        // Check for digit: c >= '0' && c <= '9'
-        let v_0 = _mm256_set1_epi8(b'0' as i8);
-        let v_9_range = _mm256_set1_epi8(9); // '9' - '0' = 9
-        let sub_0 = _mm256_sub_epi8(chunk, v_0);
-        let digit = unsigned_le(sub_0, v_9_range);
-
-        // Check for period, minus, plus
-        let v_period = _mm256_set1_epi8(b'.' as i8);
-        let v_minus = _mm256_set1_epi8(b'-' as i8);
-        let v_plus = _mm256_set1_epi8(b'+' as i8);
-        let eq_period = _mm256_cmpeq_epi8(chunk, v_period);
-        let eq_minus = _mm256_cmpeq_epi8(chunk, v_minus);
-        let eq_plus = _mm256_cmpeq_epi8(chunk, v_plus);
-
-        // Combine all value chars
-        let alpha = _mm256_or_si256(lowercase, uppercase);
-        let alnum = _mm256_or_si256(alpha, digit);
-        let punct = _mm256_or_si256(_mm256_or_si256(eq_period, eq_minus), eq_plus);
-        let value_chars = _mm256_or_si256(alnum, punct);
-
-        // Convert to bitmasks using _mm256_movemask_epi8
-        CharClass {
-            quotes: _mm256_movemask_epi8(eq_quote) as u32,
-            backslashes: _mm256_movemask_epi8(eq_backslash) as u32,
-            opens: _mm256_movemask_epi8(opens) as u32,
-            closes: _mm256_movemask_epi8(closes) as u32,
-            delims: _mm256_movemask_epi8(delims) as u32,
-            value_chars: _mm256_movemask_epi8(value_chars) as u32,
-        }
+    // Convert to bitmasks using _mm256_movemask_epi8
+    CharClass {
+        quotes: _mm256_movemask_epi8(eq_quote) as u32,
+        backslashes: _mm256_movemask_epi8(eq_backslash) as u32,
+        opens: _mm256_movemask_epi8(opens) as u32,
+        closes: _mm256_movemask_epi8(closes) as u32,
+        delims: _mm256_movemask_epi8(delims) as u32,
     }
 }
 
-/// Unsigned less-than-or-equal comparison for AVX2.
-/// Returns 0xFF for bytes where a <= b (unsigned), 0x00 otherwise.
-#[inline]
-#[target_feature(enable = "avx2")]
-#[cfg(target_arch = "x86_64")]
-unsafe fn unsigned_le(a: __m256i, b: __m256i) -> __m256i {
-    // For unsigned comparison a <= b:
-    // We use: min(a, b) == a
-    // AVX2 has _mm256_min_epu8 for unsigned byte minimum
-    let min_ab = _mm256_min_epu8(a, b);
-    _mm256_cmpeq_epi8(min_ab, a)
-}
+/// The BP bits four bytes emit, indexed by their open bits (low nibble) and close
+/// bits (high nibble): the bits in the low byte, their count in the high byte.
+///
+/// A byte with both bits writes `10` (open, then close), so only open bits are ever
+/// set and a close only advances the count.
+static BP_NIBBLE: [u16; 256] = build_bp_nibble();
 
-/// Process a 32-byte chunk and update IB/BP writers.
-/// Returns the new state after processing all 32 bytes.
-#[inline]
-fn process_chunk_standard(
-    class: CharClass,
-    mut state: State,
-    ib: &mut BitWriter,
-    bp: &mut BitWriter,
-    bytes: &[u8],
-) -> State {
-    // Process each byte using the classification masks
-    for i in 0..bytes.len().min(32) {
-        let bit = 1u32 << i;
-
-        let is_quote = (class.quotes & bit) != 0;
-        let is_backslash = (class.backslashes & bit) != 0;
-        let is_open = (class.opens & bit) != 0;
-        let is_close = (class.closes & bit) != 0;
-        let is_delim = (class.delims & bit) != 0;
-        let is_value_char = (class.value_chars & bit) != 0;
-
-        match state {
-            State::InJson => {
-                if is_open {
-                    ib.write_1();
-                    bp.write_1();
-                    // state stays InJson
-                } else if is_close {
-                    ib.write_0();
-                    bp.write_0();
-                    // state stays InJson
-                } else if is_delim {
-                    ib.write_0();
-                    // no BP output
-                    // state stays InJson
-                } else if is_value_char {
-                    ib.write_1();
-                    bp.write_1();
-                    bp.write_0();
-                    state = State::InValue;
-                } else if is_quote {
-                    ib.write_1();
-                    bp.write_1();
-                    bp.write_0();
-                    state = State::InString;
-                } else {
-                    // whitespace or other
-                    ib.write_0();
-                }
+const fn build_bp_nibble() -> [u16; 256] {
+    let mut table = [0u16; 256];
+    let mut idx = 0;
+    while idx < 256 {
+        let (open, close) = (idx & 0xF, idx >> 4);
+        let (mut bits, mut len) = (0u16, 0u16);
+        let mut i = 0;
+        while i < 4 {
+            if (open >> i) & 1 != 0 {
+                bits |= 1 << len;
+                len += 1;
             }
-            State::InString => {
-                ib.write_0();
-                if is_quote {
-                    state = State::InJson;
-                } else if is_backslash {
-                    state = State::InEscape;
-                }
+            if (close >> i) & 1 != 0 {
+                len += 1;
             }
-            State::InEscape => {
-                ib.write_0();
-                state = State::InString;
-            }
-            State::InValue => {
-                if is_open {
-                    ib.write_1();
-                    bp.write_1();
-                    state = State::InJson;
-                } else if is_close {
-                    ib.write_0();
-                    bp.write_0();
-                    state = State::InJson;
-                } else if is_delim {
-                    ib.write_0();
-                    state = State::InJson;
-                } else if is_value_char {
-                    ib.write_0();
-                    // state stays InValue
-                } else {
-                    // whitespace ends value
-                    ib.write_0();
-                    state = State::InJson;
-                }
-            }
+            i += 1;
         }
+        table[idx] = bits | len << 8;
+        idx += 1;
     }
-
-    state
+    table
 }
+
+/// Low five bits of a [`STEP_TABLE`] field when the state is `InString`.
+const IN_STRING_SHIFT: u32 = 8 * State::InString as u32;
 
 /// Build a semi-index from JSON bytes using SIMD-accelerated Standard Cursor algorithm.
 ///
-/// Processes 32 bytes at a time using x86_64 AVX2 instructions for character
-/// classification, then processes the state machine transitions.
+/// The state machine runs one `STEP_TABLE` load and one shift per byte, with no
+/// branch on the input; AVX2 then pulls each 32-byte block's IB, BP-open and
+/// BP-close bits out of the stored fields with three `movemask`s, and skips a block
+/// that lies wholly inside a string without stepping it. The per-byte `match` this
+/// replaced (#7299) kept both writers' state in memory and ran about three
+/// data-dependent branches per byte. It was 1.2x (all-backslash strings) to about
+/// 50x (long strings) slower, and its speed on a Ryzen 9 7950X moved by up to 10% with
+/// where unrelated changes placed it; this kernel's moves by 1-4%.
 #[cfg(target_arch = "x86_64")]
 pub fn build_semi_index_standard(json: &[u8]) -> SemiIndex {
     // SAFETY: Caller must ensure AVX2 is available
@@ -235,33 +132,68 @@ unsafe fn build_semi_index_standard_avx2(json: &[u8]) -> SemiIndex {
         let word_capacity = json.len().div_ceil(64);
         let mut ib = BitWriter::with_capacity(word_capacity);
         let mut bp = BitWriter::with_capacity(word_capacity * 2);
-        let mut state = State::InJson;
+        let v_quote = _mm256_set1_epi8(DOUBLE_QUOTE);
+        let v_backslash = _mm256_set1_epi8(BACKSLASH);
+        // The last step's field; its low five bits are `8 * state index`.
+        let mut field: u32 = 0;
+        let mut fields = [0u8; 32];
 
-        let mut offset = 0;
+        let mut blocks = json.chunks_exact(32);
+        for block in &mut blocks {
+            if field & 0x1F == IN_STRING_SHIFT {
+                let chunk = _mm256_loadu_si256(block.as_ptr().cast::<__m256i>());
+                let specials = _mm256_or_si256(
+                    _mm256_cmpeq_epi8(chunk, v_quote),
+                    _mm256_cmpeq_epi8(chunk, v_backslash),
+                );
+                if _mm256_movemask_epi8(specials) == 0 {
+                    // Every byte stays in the string: IB 0, no BP.
+                    ib.write_zeros(32);
+                    continue;
+                }
+            }
+            for (slot, &c) in fields.iter_mut().zip(block) {
+                field = STEP_TABLE[c as usize].wrapping_shr(field);
+                *slot = field as u8;
+            }
+            // `movemask` reads bit 7 of each byte, so shift the open (bit 6) and
+            // close (bit 5) bits up to it; a 16-bit lane shift is fine because
+            // only each byte's own lower bits move into its bit 7.
+            let v = _mm256_loadu_si256(fields.as_ptr().cast::<__m256i>());
+            let ib_bits = _mm256_movemask_epi8(v) as u32;
+            let opens = _mm256_movemask_epi8(_mm256_slli_epi16::<1>(v)) as u32;
+            let closes = _mm256_movemask_epi8(_mm256_slli_epi16::<2>(v)) as u32;
+            const _: () = assert!(STEP_IB == 7 && STEP_OPEN == 6 && STEP_CLOSE == 5);
 
-        // Process 32-byte chunks
-        while offset + 32 <= json.len() {
-            let chunk = _mm256_loadu_si256(json.as_ptr().add(offset).cast::<__m256i>());
-            let class = classify_chars(chunk);
-            state =
-                process_chunk_standard(class, state, &mut ib, &mut bp, &json[offset..offset + 32]);
-            offset += 32;
+            // At most two BP bits per byte, so 32 bytes fill at most one word.
+            let mut bp_bits: u64 = 0;
+            let mut bp_len: u32 = 0;
+            let mut k = 0;
+            while k < 32 {
+                let nibble = ((opens >> k) & 0xF) | ((closes >> k) & 0xF) << 4;
+                let entry = BP_NIBBLE[nibble as usize];
+                bp_bits |= u64::from(entry & 0xFF) << bp_len;
+                bp_len += u32::from(entry >> 8);
+                k += 4;
+            }
+            ib.write_bits(u64::from(ib_bits), 32);
+            bp.write_bits(bp_bits, bp_len as usize);
         }
 
-        // Process remaining bytes (less than 32)
-        if offset < json.len() {
-            // Pad with zeros and process
-            let mut padded = [0u8; 32];
-            let remaining = json.len() - offset;
-            padded[..remaining].copy_from_slice(&json[offset..]);
-
-            let chunk = _mm256_loadu_si256(padded.as_ptr().cast::<__m256i>());
-            let class = classify_chars(chunk);
-            state = process_chunk_standard(class, state, &mut ib, &mut bp, &json[offset..]);
+        // Fewer than 32 bytes left: step them one at a time.
+        for &c in blocks.remainder() {
+            field = STEP_TABLE[c as usize].wrapping_shr(field);
+            ib.write_bit((field >> STEP_IB) & 1 != 0);
+            if (field >> STEP_OPEN) & 1 != 0 {
+                bp.write_1();
+            }
+            if (field >> STEP_CLOSE) & 1 != 0 {
+                bp.write_0();
+            }
         }
 
         SemiIndex {
-            state,
+            state: STATES[((field >> 3) & 3) as usize],
             ib: ib.finish(),
             bp: bp.finish(),
         }
@@ -435,11 +367,6 @@ mod tests {
 
             // Position 8 is ':'
             assert_ne!(class.delims & (1 << 8), 0, "':' at position 8");
-
-            // Positions 9, 10, 11 are digits
-            assert_ne!(class.value_chars & (1 << 9), 0, "'1' at position 9");
-            assert_ne!(class.value_chars & (1 << 10), 0, "'2' at position 10");
-            assert_ne!(class.value_chars & (1 << 11), 0, "'3' at position 11");
         }
     }
 
@@ -535,6 +462,68 @@ mod tests {
             bits_to_string(&scalar_result.ib, json.len()),
             "IB mismatch for 64-byte input"
         );
+    }
+
+    /// The branch-free kernel (#7299) against the scalar state machine: IB, BP and
+    /// the final state, for every length from 0 to 300 over three alphabets.
+    #[test]
+    fn test_avx2_branch_free_matches_scalar_on_random_input() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        // Few quotes, so many 32-byte blocks lie wholly inside a string and take
+        // the skip; backslashes so an escape can straddle a block edge.
+        let long_strings: Vec<u8> = {
+            let mut v = vec![b'"', b'\\'];
+            v.extend(std::iter::repeat_n(b'x', 60));
+            v
+        };
+        let alphabets: [&[u8]; 3] = [
+            &(0..=255).collect::<Vec<u8>>(),
+            br#"{}[]",:\ a1-.+e"#,
+            &long_strings,
+        ];
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        for alphabet in alphabets {
+            for len in 0..=300 {
+                for _ in 0..4 {
+                    let json: Vec<u8> = (0..len)
+                        .map(|_| {
+                            seed ^= seed << 13;
+                            seed ^= seed >> 7;
+                            seed ^= seed << 17;
+                            alphabet[(seed % alphabet.len() as u64) as usize]
+                        })
+                        .collect();
+                    let simd = build_semi_index_standard(&json);
+                    let scalar = crate::json::standard::build_semi_index_scalar(&json);
+                    assert_eq!(simd.ib, scalar.ib, "IB for {json:?}");
+                    assert_eq!(simd.bp, scalar.bp, "BP for {json:?}");
+                    assert_eq!(simd.state, scalar.state, "state for {json:?}");
+                }
+            }
+        }
+    }
+
+    /// A block skipped as wholly inside a string must not swallow the escape that
+    /// ends the block before it, or the escaped quote that opens the next one.
+    #[test]
+    fn test_avx2_branch_free_string_skip_at_block_edges() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for pad in 0..64 {
+            let mut json = br#"{"k":""#.to_vec();
+            json.extend(std::iter::repeat_n(b'a', pad));
+            json.extend_from_slice(br#"\""#);
+            json.extend(std::iter::repeat_n(b'b', 96));
+            json.extend_from_slice(br#"","n":12,"v":[true,{}]}"#);
+            let simd = build_semi_index_standard(&json);
+            let scalar = crate::json::standard::build_semi_index_scalar(&json);
+            assert_eq!(simd.ib, scalar.ib, "IB, pad {pad}");
+            assert_eq!(simd.bp, scalar.bp, "BP, pad {pad}");
+            assert_eq!(simd.state, scalar.state, "state, pad {pad}");
+        }
     }
 
     // ========================================================================
