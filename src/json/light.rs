@@ -4766,38 +4766,29 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
                 self.text(),
             )));
         }
-        // #7271: an indented, unsorted default render of a certified span
-        // cannot fail, so it need not be held back. The certificate says the
-        // compact render of this span succeeds and is the span itself; the
-        // indented render walks the same nodes in the same order and makes
-        // the same decisions, and only writes whitespace between them, so it
-        // succeeds too and nothing is written that a later fault would have
-        // had to retract. It is written out a chunk at a time instead of
-        // whole. `-S` (a different walk over decoded keys), other number
-        // conventions and every span the scan declines (whitespace inside it,
-        // a spelling jq rewrites, a repeated key, invalid UTF-8, a fault)
-        // keep the whole-value buffer, and with it jq's print-nothing on a
-        // malformed document. The compact case asked the scan already, above.
-        if !indent.is_compact()
-            && !sort_keys
-            && numbers == JsonConvention::JqCompat
-            && self.canonical_compact_span(0).is_some()
-        {
-            let mut chunked = ChunkedWrite {
-                out,
-                buf: String::new(),
-            };
-            stream_json_pretty(
-                &mut chunked,
-                value,
-                0,
-                indent.width,
-                indent.unit,
-                sort_keys,
-                numbers,
-                0,
-            )?;
-            return Ok(chunked.finish()?);
+        // #7271: an indented, unsorted default render of a certified span is
+        // the span itself with jq's whitespace put between its tokens, so it
+        // is written by re-indenting the span's bytes (`write_reindented`)
+        // rather than by walking the tree, and out a chunk at a time rather
+        // than whole. The certificate says the compact render of this span
+        // succeeds and is the span byte for byte; the indented render makes
+        // the same decisions in the same order and only adds whitespace, so
+        // it cannot fail part-way, and nothing is written that a later fault
+        // would have had to retract. `-S` (a different walk over decoded
+        // keys), other number conventions and every span the scan declines
+        // (whitespace inside it, a spelling jq rewrites, a repeated key,
+        // invalid UTF-8, a fault) keep the whole-value buffer below, and with
+        // it jq's print-nothing on a malformed document. The compact case
+        // asked the scan already, above.
+        if !indent.is_compact() && !sort_keys && numbers == JsonConvention::JqCompat {
+            if let Some(span) = self.canonical_compact_span(0) {
+                let mut chunked = ChunkedWrite {
+                    out,
+                    buf: String::new(),
+                };
+                write_reindented(&mut chunked, span, indent.width, indent.unit)?;
+                return Ok(chunked.finish()?);
+            }
         }
         let mut buf = String::new();
         stream_json_pretty(
@@ -5356,6 +5347,88 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentElements for JsonElements<'a, W> {
 // JSON to JSON Streaming Helpers (#1576)
 // ============================================================================
 
+/// jq's indented spelling of `span`, a value [`JsonCursor::canonical_compact_span`]
+/// certified (#7271): what [`stream_json_pretty`] writes for it with `width` copies of
+/// `unit` per level, unsorted, under `JsonConvention::JqCompat`.
+///
+/// A certified span is exactly the compact render, so the indented render is the same
+/// tokens with whitespace between them, and only five bytes decide where it goes, all of
+/// them outside strings: an opening bracket starts a new line one level in (an empty
+/// container stays `[]`/`{}`), a comma starts a new line at the same level, a closing
+/// bracket starts a new line one level out, and a colon becomes `": "`. Strings, numbers
+/// and literals are copied as they are, since the certificate says they are already jq's
+/// spelling. `pretty_render_of_a_certified_span_is_its_reindentation_7271` checks this
+/// against `stream_json_pretty` on generated documents.
+fn write_reindented<Out: core::fmt::Write>(
+    out: &mut Out,
+    span: &str,
+    width: usize,
+    unit: char,
+) -> core::fmt::Result {
+    let bytes = span.as_bytes();
+    let mut depth = 0usize;
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    let line = |out: &mut Out, depth: usize| -> core::fmt::Result {
+        out.write_char('\n')?;
+        write_json_indent(out, depth * width, unit)
+    };
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                // A certified string's only escapes are `\x` pairs, so the first unescaped
+                // quote ends it.
+                i += 1;
+                while let Some(at) = bytes[i..].iter().position(|&b| b == b'"' || b == b'\\') {
+                    i += at;
+                    if bytes[i] == b'"' {
+                        break;
+                    }
+                    i += 2;
+                }
+                i += 1;
+            }
+            open @ (b'[' | b'{') => {
+                out.write_str(&span[copied..i])?;
+                let close = if open == b'[' { b']' } else { b'}' };
+                if bytes.get(i + 1) == Some(&close) {
+                    out.write_str(if open == b'[' { "[]" } else { "{}" })?;
+                    i += 2;
+                } else {
+                    out.write_char(open as char)?;
+                    depth += 1;
+                    line(out, depth)?;
+                    i += 1;
+                }
+                copied = i;
+            }
+            close @ (b']' | b'}') => {
+                out.write_str(&span[copied..i])?;
+                depth -= 1;
+                line(out, depth)?;
+                out.write_char(close as char)?;
+                i += 1;
+                copied = i;
+            }
+            b',' => {
+                out.write_str(&span[copied..i])?;
+                out.write_char(',')?;
+                line(out, depth)?;
+                i += 1;
+                copied = i;
+            }
+            b':' => {
+                out.write_str(&span[copied..i])?;
+                out.write_str(": ")?;
+                i += 1;
+                copied = i;
+            }
+            _ => i += 1,
+        }
+    }
+    out.write_str(&span[copied..])
+}
+
 /// The bytes [`ChunkedWrite`] gathers before passing them on: large enough
 /// that a render's many small writes reach the real writer as a few large
 /// ones, small enough that the output is never held whole (#7271).
@@ -5377,23 +5450,33 @@ impl<Out: core::fmt::Write> ChunkedWrite<'_, Out> {
         }
         self.out.write_str(&self.buf)
     }
+
+    /// Passes the gathered chunk on. Out of line and cold, so that the render's many
+    /// write sites inline only the push and the length check, as they do into a `String`.
+    #[cold]
+    #[inline(never)]
+    fn pass_on(&mut self) -> core::fmt::Result {
+        self.out.write_str(&self.buf)?;
+        self.buf.clear();
+        Ok(())
+    }
 }
 
 impl<Out: core::fmt::Write> core::fmt::Write for ChunkedWrite<'_, Out> {
+    #[inline]
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         self.buf.push_str(s);
         if self.buf.len() >= CHUNKED_WRITE_BYTES {
-            self.out.write_str(&self.buf)?;
-            self.buf.clear();
+            return self.pass_on();
         }
         Ok(())
     }
 
+    #[inline]
     fn write_char(&mut self, c: char) -> core::fmt::Result {
         self.buf.push(c);
         if self.buf.len() >= CHUNKED_WRITE_BYTES {
-            self.out.write_str(&self.buf)?;
-            self.buf.clear();
+            return self.pass_on();
         }
         Ok(())
     }
@@ -5464,6 +5547,120 @@ mod pretty_streaming_tests_7271 {
         assert!(streamed
             .1
             .ends_with("\"s\": \"é😀\\nxxxxxxxxxx\"\n    }\n  ]\n}"));
+    }
+
+    /// The re-indenter writes what the tree walk writes, for every certified document the
+    /// generator draws: nested and empty containers, keys and strings holding the structural
+    /// bytes and escaped quotes, every canonical scalar, and each indentation unit and width.
+    #[test]
+    fn pretty_render_of_a_certified_span_is_its_reindentation_7271() {
+        use rand::{RngExt, SeedableRng};
+        use rand_chacha::ChaCha8Rng;
+
+        const STRINGS: &[&str] = &[
+            "",
+            "a",
+            "[",
+            "]",
+            "{",
+            "}",
+            ",",
+            ":",
+            "a, b: [c]",
+            r#"\""#,
+            r"\\",
+            r#"\\\""#,
+            "é😀",
+            r"\n",
+            r"\u0000",
+            r"\u007f",
+            " ",
+            "x\u{7f}",
+        ];
+        const SCALARS: &[&str] = &[
+            "0", "-1", "42", "3.5", "-0.25", "1e+100", "true", "false", "null",
+        ];
+        fn value(rng: &mut ChaCha8Rng, depth: u32, out: &mut String) {
+            if depth == 0 || rng.random_bool(0.3) {
+                if rng.random_bool(0.5) {
+                    out.push('"');
+                    out.push_str(STRINGS[rng.random_range(0..STRINGS.len())]);
+                    out.push('"');
+                } else {
+                    out.push_str(SCALARS[rng.random_range(0..SCALARS.len())]);
+                }
+                return;
+            }
+            let n = rng.random_range(0..5);
+            if rng.random_bool(0.5) {
+                out.push('[');
+                for i in 0..n {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    value(rng, depth - 1, out);
+                }
+                out.push(']');
+            } else {
+                out.push('{');
+                for i in 0..n {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&format!(
+                        r#""k{i}{}":"#,
+                        STRINGS[rng.random_range(0..STRINGS.len())]
+                    ));
+                    value(rng, depth - 1, out);
+                }
+                out.push('}');
+            }
+        }
+
+        let mut rng = ChaCha8Rng::seed_from_u64(7271);
+        let mut certified = 0;
+        for _ in 0..3000 {
+            let mut doc = String::new();
+            value(&mut rng, 5, &mut doc);
+            let index = JsonIndex::build(doc.as_bytes());
+            let root = index.root(doc.as_bytes());
+            let Some(span) = root.canonical_compact_span(0) else {
+                continue;
+            };
+            certified += 1;
+            for indent in [
+                TWO,
+                IndentSpec {
+                    width: 1,
+                    unit: ' ',
+                },
+                IndentSpec {
+                    width: 7,
+                    unit: ' ',
+                },
+                IndentSpec {
+                    width: 1,
+                    unit: '\t',
+                },
+            ] {
+                let mut walked = String::new();
+                stream_json_pretty(
+                    &mut walked,
+                    root.value(),
+                    0,
+                    indent.width,
+                    indent.unit,
+                    false,
+                    JsonConvention::JqCompat,
+                    0,
+                )
+                .unwrap();
+                let mut reindented = String::new();
+                write_reindented(&mut reindented, span, indent.width, indent.unit).unwrap();
+                assert_eq!(reindented, walked, "{doc}");
+            }
+        }
+        assert!(certified > 1500, "only {certified} documents certified");
     }
 
     /// A fault anywhere, even past the last chunk boundary, makes the scan decline the span,
