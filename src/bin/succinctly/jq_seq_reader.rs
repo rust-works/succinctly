@@ -687,10 +687,31 @@ pub(crate) fn resumed_stream(lines: usize, tail: Vec<u8>) -> Vec<u8> {
     if lines == 0 {
         return tail;
     }
-    let mut stream = Vec::with_capacity(1 + lines + tail.len());
-    stream.push(ASCII_RS);
-    stream.resize(1 + lines, b'\n');
+    let mut stream = resumed_front(lines, tail.len());
     stream.extend_from_slice(&tail);
+    stream
+}
+
+/// The front of a [`resumed_stream`] after `lines` line breaks, with room for `tail` more bytes, so a
+/// reader can read the tail straight in behind it rather than read it and copy it (#7262): a tail can be
+/// most of a big stream. Empty for `lines` of 0, where the tail is the stream.
+///
+/// The room is asked for, not required: room no allocation can hold (the length of a sparse file of
+/// terabytes) is not reserved, and the reader grows the stream as it reads, whose failure is reported as
+/// the read's own error where an allocation that must succeed would abort the process.
+pub(crate) fn resumed_front(lines: usize, tail: usize) -> Vec<u8> {
+    let front = if lines == 0 { 0 } else { 1 + lines };
+    let mut stream = Vec::new();
+    if stream
+        .try_reserve_exact(front.saturating_add(tail))
+        .is_err()
+    {
+        stream.reserve_exact(front);
+    }
+    if lines > 0 {
+        stream.push(ASCII_RS);
+        stream.resize(front, b'\n');
+    }
     stream
 }
 
@@ -3441,6 +3462,14 @@ mod tests {
         assert_eq!(token_byte_after(b"\x1e7\n"), Some(0));
         assert_eq!(token_byte_after(b"\x1e[\"a\",{}]\n"), None);
         assert_eq!(resumed_stream(0, b"\x1e1\n".to_vec()), b"\x1e1\n");
+        // #7262: room for a tail no allocation can hold is not reserved, rather than abort the process.
+        for room in [usize::MAX, usize::MAX - 2, isize::MAX as usize] {
+            let front = resumed_front(2, room);
+            assert_eq!(front, b"\x1e\n\n", "{room}");
+            assert!(front.capacity() < room, "{room}");
+        }
+        assert!(resumed_front(2, 100).capacity() >= 103);
+        assert_eq!(resumed_front(0, usize::MAX), b"");
         assert_eq!(resumed_stream(2, b"\x1e1\n".to_vec()), b"\x1e\n\n\x1e1\n");
     }
 

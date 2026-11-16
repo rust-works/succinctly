@@ -1039,16 +1039,22 @@ fn start_worker(seen: &SeenFault) -> io::Result<Worker> {
 /// What a `--seq` pipe hands on at its first record that is not RFC 7464's own framing (#7164): the
 /// windows before it were run, and the rest of the stream is the whole-stream route's.
 pub(super) struct SeqTail {
-    /// The stream from the RS that opens that record to its end, as read.
-    pub bytes: Vec<u8>,
+    /// The stream from the RS that opens that record to its end, as read, behind the front that resumes
+    /// jq's reader after `lines` line breaks ([`crate::jq_seq_reader::resumed_stream`]): the tail is read
+    /// into it, never copied (#7262).
+    pub stream: Vec<u8>,
     /// The failure of a read of the pipe, which ended the stream there.
     pub error: Option<io::Error>,
-    /// The line breaks before it, all in records already run: 0 when no record was clean, and the
-    /// stream is all of it.
-    pub lines: usize,
     /// The byte the records before it left at index 1 of jq's token buffer
     /// ([`crate::jq_seq_reader::token_byte_after`]).
     pub token_byte: Option<u8>,
+    /// Where `stream` was first allocated, and the room it had before the tail was read, so a test can
+    /// tell the tail was read into it in place (a pointer alone does not: a large buffer can be grown in
+    /// place by `mremap` on Linux).
+    #[cfg(test)]
+    pub reserved_at: usize,
+    #[cfg(test)]
+    pub reserved_room: usize,
 }
 
 /// Where a `--seq` pipe leaves its [`SeqTail`] for the run, which takes it once the windows are out.
@@ -1194,23 +1200,49 @@ impl WindowedFile {
 
     /// Ends the text at `at`, where the gate found the first record that is not plain, reads the rest of
     /// the pipe and hands it on; the end of the text.
+    ///
+    /// #7262: the tail is read once, into the stream the route that reads it whole is given, which has room
+    /// for all of it when the source is a regular file (what is left of it from where the reads stand): a
+    /// fault near a big file's start hands on most of the file, which a copy would hold twice.
     fn hand_on_seq_tail(&mut self, at: usize) -> usize {
-        let mut bytes = self.buf.split_off(at);
+        use std::io::Seek;
+        let lines = self.lines_before + count_newlines(&self.buf[..at]);
+        let left = if self.eof {
+            0
+        } else {
+            let mut file = &*self.file;
+            match (file.metadata(), file.stream_position()) {
+                (Ok(meta), Ok(at)) if meta.is_file() => {
+                    usize::try_from(meta.len().saturating_sub(at)).unwrap_or(0)
+                }
+                _ => 0,
+            }
+        };
+        let mut bytes = crate::jq_seq_reader::resumed_front(lines, self.buf.len() - at + left);
+        #[cfg(test)]
+        let (reserved_at, reserved_room) = (bytes.as_ptr() as usize, bytes.capacity());
+        bytes.extend_from_slice(&self.buf[at..]);
+        // The windows' buffer keeps only the text still to be handed out, so the run does not hold its
+        // room beside the tail.
+        self.buf.truncate(at);
+        self.buf.shrink_to_fit();
         let error = if self.eof {
             self.read_error.take()
         } else {
             (&*self.file).read_to_end(&mut bytes).err()
         };
         self.eof = true;
-        let lines = self.lines_before + count_newlines(&self.buf);
         let gate = self
             .seq_gate
             .as_ref()
             .expect("only the gate of a --seq pipe hands a tail on");
         *gate.slot.borrow_mut() = Some(SeqTail {
-            bytes,
+            #[cfg(test)]
+            reserved_at,
+            #[cfg(test)]
+            reserved_room,
+            stream: bytes,
             error,
-            lines,
             token_byte: gate.token_byte,
         });
         at
@@ -2818,10 +2850,12 @@ mod tests {
                                 None => assert!(handed.is_none(), "{case}"),
                                 Some(at) => {
                                     let handed = handed.expect("the rest is handed on");
-                                    assert_eq!(handed.bytes, &stream[at..], "{case}");
                                     assert_eq!(
-                                        handed.lines,
-                                        count_newlines(&stream[..at]),
+                                        handed.stream,
+                                        crate::jq_seq_reader::resumed_stream(
+                                            count_newlines(&stream[..at]),
+                                            stream[at..].to_vec()
+                                        ),
                                         "{case}"
                                     );
                                     assert_eq!(
@@ -2830,6 +2864,14 @@ mod tests {
                                         "{case}"
                                     );
                                     assert!(handed.error.is_none(), "{case}");
+                                    // #7262: a regular file's tail is read into room reserved for all
+                                    // of it, behind the front: one allocation, never grown or copied.
+                                    assert_eq!(
+                                        (handed.stream.as_ptr() as usize, handed.stream.capacity()),
+                                        (handed.reserved_at, handed.stream.len()),
+                                        "{case}"
+                                    );
+                                    assert_eq!(handed.reserved_room, handed.stream.len(), "{case}");
                                 }
                             }
                         }
