@@ -112,7 +112,7 @@ impl BlockMasks for Avx2 {
 /// branch on the input; each 32-byte block's IB, BP-open and BP-close bits are
 /// then pulled out of the stored fields with `movemask`s, and a run of blocks that
 /// lies wholly inside a string is skipped without stepping it. The kernel is
-/// [`super::step`]'s, shared with the SSE2 builder. The per-byte `match` it
+/// `json::simd::step`'s, shared with the SSE2 builder. The per-byte `match` it
 /// replaced (#7299) kept both writers' state in memory and ran about three
 /// data-dependent branches per byte. It was 1.2x (all-backslash strings) to about
 /// 50x (long strings) slower, and its speed on a Ryzen 9 7950X moved by up to 10% with

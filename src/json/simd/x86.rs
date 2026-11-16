@@ -137,7 +137,7 @@ fn join(lo: __m128i, hi: __m128i) -> u32 {
 
 /// Build a semi-index from JSON bytes using SIMD-accelerated Standard Cursor algorithm.
 ///
-/// The kernel is [`super::step`]'s, shared with the AVX2 builder: one
+/// The kernel is `json::simd::step`'s, shared with the AVX2 builder: one
 /// `STEP_TABLE` load and one shift per byte with no branch on the input, each
 /// 32-byte block's IB, BP-open and BP-close bits pulled out of the stored fields
 /// with two 16-byte `movemask`s apiece, and a block that lies wholly inside a
