@@ -991,7 +991,9 @@ const CERTIFIED_DEPTH: usize = 127;
 /// The verdict decides the wording of a fault and nothing the run prints, so the windows are certified
 /// on a thread of their own, over a copy of each, while the filter runs over the window (#7106): the
 /// thread starts with the first window, in a run that reads a pipe of 4 MiB or more, and a reader of
-/// the fault waits for it ([`SeenFault::get`]).
+/// the fault waits for it ([`SeenFault::get`]). The last window is never dropped, so it is certified
+/// only when the fault is asked for, over its own buffer (#7294): a pipe that holds one big document is
+/// that one window, and a run over it that meets no fault never certifies it.
 struct Certifier {
     seen: SeenFault,
     /// The thread, started with the first window.
