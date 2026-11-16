@@ -1247,8 +1247,10 @@ holdout, applied to both sides (min / median ms, 11 interleaved reps, 100 MB `us
 | old kernel, padded 0/16/32/48 (0/16/32/48)   | 143.5-154.5 (min) | 227.9-235.7   | 126.6-137.4   |
 | new kernel, padded 0/16/32/48 (16/32/48/0)   | 117.5-119.6 (min) | 199.1-201.9   | 100.3-102.7   |
 
-The old kernel's band is 7.7% of its fastest layout; the new one's is 1.8%, and its slowest
-layout is 17% faster than the old one's fastest. The rule below still stands for every other
+The old kernel's band is 7.7% of its fastest layout and the new one's is 1.8% here. An
+independent sweep over four more positions read 1.3-4.4% across `.users[0].name`, `-c .`,
+`length` and `pathological` `length`, so the new kernel is much less sensitive to placement,
+not immune. Its slowest layout is still 17% faster than the old kernel's fastest. The rule below still stands for every other
 hot loop.
 
 **Rule.** On x86_64, a wall-clock delta between two builds whose per-function `Ir` agrees

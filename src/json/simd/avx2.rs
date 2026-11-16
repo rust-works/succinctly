@@ -116,8 +116,9 @@ const IN_STRING_SHIFT: u32 = 8 * State::InString as u32;
 /// BP-close bits out of the stored fields with three `movemask`s, and skips a block
 /// that lies wholly inside a string without stepping it. The per-byte `match` this
 /// replaced (#7299) kept both writers' state in memory and ran about three
-/// data-dependent branches per byte; it was 1.5-2.6x slower, and its speed on a
-/// Ryzen 9 7950X moved by up to 10% with where unrelated changes placed it.
+/// data-dependent branches per byte. It was 1.2x (all-backslash strings) to about
+/// 50x (long strings) slower, and its speed on a Ryzen 9 7950X moved by up to 10% with
+/// where unrelated changes placed it; this kernel's moves by 1-4%.
 #[cfg(target_arch = "x86_64")]
 pub fn build_semi_index_standard(json: &[u8]) -> SemiIndex {
     // SAFETY: Caller must ensure AVX2 is available
