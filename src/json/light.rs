@@ -5399,6 +5399,99 @@ impl<Out: core::fmt::Write> core::fmt::Write for ChunkedWrite<'_, Out> {
     }
 }
 
+#[cfg(test)]
+mod pretty_streaming_tests_7271 {
+    use super::*;
+
+    /// Records every write, so a test can tell a render passed on in pieces from one held
+    /// back and written whole.
+    #[derive(Default)]
+    struct Writes(Vec<usize>, String);
+
+    impl core::fmt::Write for Writes {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            self.0.push(s.len());
+            self.1.push_str(s);
+            Ok(())
+        }
+    }
+
+    const TWO: IndentSpec = IndentSpec {
+        width: 2,
+        unit: ' ',
+    };
+
+    /// About 200 KB of canonical compact JSON, three chunks' worth of indented output.
+    fn certified_doc() -> String {
+        let items: Vec<String> = (0..4000)
+            .map(|i| {
+                format!(
+                    r#"{{"id":{i},"n":[1,-2.5,null,true],"s":"é😀\n{}"}}"#,
+                    "x".repeat(10)
+                )
+            })
+            .collect();
+        format!(r#"{{"xs":[{}]}}"#, items.join(","))
+    }
+
+    fn render(json: &[u8], indent: IndentSpec, sort: bool) -> (StreamResult, Writes) {
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let mut out = Writes::default();
+        let result = root.stream_json(&mut out, indent, sort, JsonConvention::JqCompat);
+        (result, out)
+    }
+
+    /// A certified span's indented render reaches the writer in chunks of at most
+    /// `CHUNKED_WRITE_BYTES` (plus the write that crossed the line), not as one whole
+    /// value, and the text is the one the buffered render writes (`-S` still buffers).
+    #[test]
+    fn a_certified_span_streams_its_indented_render_in_chunks_7271() {
+        let doc = certified_doc();
+        assert!(doc.len() > 3 * CHUNKED_WRITE_BYTES / 2);
+        let (result, streamed) = render(doc.as_bytes(), TWO, false);
+        result.unwrap();
+        assert!(streamed.0.len() > 2, "{:?}", streamed.0);
+        assert!(streamed.0.iter().all(|&n| n < 2 * CHUNKED_WRITE_BYTES));
+        let (result, whole) = render(doc.as_bytes(), TWO, true);
+        result.unwrap();
+        assert_eq!(whole.0.len(), 1, "-S keeps the whole-value buffer");
+        // Every object's keys are already in order, so `-S` renders the same text, whole.
+        assert_eq!(streamed.1, whole.1);
+        assert!(streamed
+            .1
+            .starts_with("{\n  \"xs\": [\n    {\n      \"id\": 0,\n      \"n\": [\n        1,"));
+        assert!(streamed
+            .1
+            .ends_with("\"s\": \"é😀\\nxxxxxxxxxx\"\n    }\n  ]\n}"));
+    }
+
+    /// A fault anywhere, even past the last chunk boundary, makes the scan decline the span,
+    /// so the render is held back and nothing at all reaches the writer, as in jq.
+    #[test]
+    fn a_late_fault_writes_nothing_7271() {
+        let doc = certified_doc();
+        let late = doc.rfind(r#""id":"#).unwrap() + 5;
+        let mut bad = doc.clone().into_bytes();
+        bad[late] = b'@';
+        let mut trailing = doc[..doc.len() - 2].as_bytes().to_vec();
+        trailing.extend_from_slice(b",]}");
+        for json in [bad, trailing] {
+            for indent in [
+                TWO,
+                IndentSpec {
+                    width: 1,
+                    unit: '\t',
+                },
+            ] {
+                let (result, out) = render(&json, indent, false);
+                assert!(result.is_err());
+                assert!(out.0.is_empty(), "{:?}", out.0);
+            }
+        }
+    }
+}
+
 /// Stream a JSON value as (pretty- or compact-, sorted- or unsorted-) JSON,
 /// without materializing an `OwnedValue` -- the pretty-capable counterpart
 /// [`JsonCursor::stream_json`] falls back to for anything but the
