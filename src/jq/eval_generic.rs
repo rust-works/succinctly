@@ -46554,6 +46554,42 @@ mod tests {
             }
         }
         assert_eq!((answered, raised), (26, 10));
+        // The cursor list is sized by the fields, not by what they hold: two fields whose values
+        // are 20,000-element arrays keep a list of a handful of slots. (A bound read off the
+        // subtree once reserved 343 MB of address space for ten such cursors, and a run under
+        // `ulimit -v` aborted where base answered.)
+        let mut big = alloc::string::String::from("{");
+        for name in ["a", "b"] {
+            big.push_str(&alloc::format!("\"{name}\":["));
+            big.push_str(
+                &(0..20_000)
+                    .map(|i| alloc::format!("{i}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            big.push_str("],");
+        }
+        big.pop();
+        big.push('}');
+        let index = JsonIndex::build(big.as_bytes());
+        let fields = index
+            .root(big.as_bytes())
+            .value()
+            .as_object()
+            .expect("an object");
+        let cursors = effective_value_cursors_checked(&fields, true).expect("well-formed");
+        assert_eq!(cursors.len(), 2);
+        assert!(cursors.capacity() <= 8, "capacity {}", cursors.capacity());
+        // And `.[]`'s own arm, which is where that bound was taken.
+        let expr = crate::jq::parse(".[]").unwrap();
+        match eval_using::<JqSemantics, _>(&expr, index.root(big.as_bytes()).value()) {
+            GenericResult::ManyCursor(cursors) => {
+                assert_eq!(cursors.len(), 2);
+                assert!(cursors.capacity() <= 8, "capacity {}", cursors.capacity());
+            }
+            _ => panic!("`.[]` over an object of nodes answers its cursors"),
+        }
+
         // Either side of the pairwise check's `SMALL_OBJECT_FIELDS`: no repeat, a repeat inside
         // the first fields, one between the first field and the last, and one between the last
         // two, at every width from 2 to 3 past the batch.
