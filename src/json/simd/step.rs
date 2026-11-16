@@ -477,8 +477,43 @@ mod tests {
     }
 
     #[test]
-    fn test_shared_kernel_matches_scalar() {
-        suite::all(portable);
+    fn test_shared_kernel_every_byte_state_offset() {
+        suite::every_byte_state_offset(portable);
+    }
+
+    #[test]
+    fn test_shared_kernel_byte_pairs_at_block_edges() {
+        suite::byte_pairs_at_block_edges(portable);
+    }
+
+    #[test]
+    fn test_shared_kernel_exhaustive_short_strings() {
+        suite::exhaustive_short_strings(portable);
+    }
+
+    #[test]
+    fn test_shared_kernel_random_documents() {
+        suite::random_documents(portable);
+    }
+
+    #[test]
+    fn test_shared_kernel_no_skip_in_escape_state() {
+        suite::no_skip_in_escape_state(portable);
+    }
+
+    #[test]
+    fn test_shared_kernel_tail_last_byte() {
+        suite::tail_last_byte(portable);
+    }
+
+    #[test]
+    fn test_shared_kernel_open_close_order() {
+        suite::open_close_order(portable);
+    }
+
+    #[test]
+    fn test_shared_kernel_carried_and_final_state() {
+        suite::carried_and_final_state(portable);
     }
 
     #[test]
