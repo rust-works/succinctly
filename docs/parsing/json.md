@@ -337,7 +337,9 @@ succinctly jq-locate file.json --offset 42 --format json
 | `src/json/light.rs`         | JsonIndex, JsonCursor APIs     |
 | `src/json/locate.rs`        | Path location (jq-locate CLI)  |
 | `src/json/bit_writer.rs`    | BitWriter implementation       |
-| `src/json/simd/avx2.rs`     | AVX2 classification            |
+| `src/json/simd/step.rs`     | x86 index kernel (shared)      |
+| `src/json/simd/avx2.rs`     | AVX2 masks, classification     |
+| `src/json/simd/x86.rs`      | SSE2 masks, classification     |
 | `src/json/simd/neon.rs`     | NEON nibble lookup             |
 | `src/trees/bp.rs`           | Balanced parentheses operations|
 

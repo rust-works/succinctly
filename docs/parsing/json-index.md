@@ -41,7 +41,7 @@ Before the state machine runs, SIMD identifies structural characters in parallel
 | Platform | Width              | Throughput                             |
 |----------|--------------------|----------------------------------------|
 | AVX2     | 32 bytes/iteration | ~880 MiB/s                             |
-| SSE2     | 16 bytes/iteration | —                                      |
+| SSE2     | 32 bytes/iteration | —                                      |
 | NEON     | 16 bytes/iteration | —                                      |
 
 Based on [simdjson](https://arxiv.org/abs/1902.08318) (Langdale & Lemire 2019).
@@ -53,6 +53,16 @@ IB, BP-open and BP-close bits out of the stored steps, and skips a block that li
 inside a string. The per-byte branch tree it replaced was 1.2x (all-backslash strings) to
 about 50x (long strings) slower, and moved by up to 10% with code placement on Zen 4, where
 the new kernel moves by 1-4%.
+
+Since #7305 the SSE2 builder (x86_64 without AVX2, and every `no_std` x86_64 build) runs the
+same kernel. The block loop lives once, in `json::simd::step`. Each instruction set answers
+only two questions per block: which bytes are `"` or `\`, and the IB, BP-open and BP-close
+masks of the 32 stored steps. The SSE2 builder had kept the per-byte branch tree, and it was
+no faster than the scalar PFSM builder. On a Ryzen 9 7950X the shared kernel is 1.25x
+(strings made only of escapes) to 38x (long strings) faster than it.
+Both instruction sets read the three masks as two 16-byte halves, and a run of blocks
+inside a string is skipped with one write for the whole run. Together those make the AVX2
+kernel 9-18% faster than #7299's on every generated pattern and size.
 
 ## Interest Bits and BP Encoding
 
