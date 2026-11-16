@@ -30700,9 +30700,191 @@ fn reads_cursors_alone(h: &Expr) -> bool {
     }
 }
 
+/// Whether `h` is an array or object construction [`group_construct`] builds from a group's
+/// cursors (#7280): `{k: .[0].k, n: length}`, `[first.id, length]`. Every key is a literal (a
+/// computed key is a generator) and every operand is a literal, a construction of the same
+/// kind, or a [`reads_one_value_off_cursors`] read.
+fn is_group_construct(h: &Expr) -> bool {
+    match unwrap_paren(h) {
+        Expr::Object(entries) => {
+            !entries.is_empty()
+                && entries.iter().all(|entry| {
+                    matches!(entry.key, ObjectKey::Literal(_))
+                        && is_group_construct_operand(&entry.value)
+                })
+        }
+        // `[]` is a comma of none, which stays the decoded route's.
+        Expr::Array(inner) => match unwrap_paren(inner) {
+            Expr::Comma(operands) => {
+                !operands.is_empty() && operands.iter().all(is_group_construct_operand)
+            }
+            other => is_group_construct_operand(other),
+        },
+        _ => false,
+    }
+}
+
+/// How many groups [`group_construct`] built on this thread, so a test can assert that a
+/// construction over `group_by`'s groups takes the cursor route (#7280): the decoded route
+/// answers every such row alike. `cfg(test)` only.
+#[cfg(test)]
+pub(crate) mod group_construct_count {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn bump() {
+        COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn get() -> usize {
+        COUNT.with(Cell::get)
+    }
+}
+
+/// One operand of an [`is_group_construct`] construction.
+fn is_group_construct_operand(operand: &Expr) -> bool {
+    matches!(unwrap_paren(operand), Expr::Literal(_))
+        || is_group_construct(operand)
+        || reads_one_value_off_cursors(operand)
+}
+
+/// The reads of a group that answer exactly one value and do nothing else: `length`, `first`,
+/// `last`, `.[n]`, and `.[n]`, `first` or `last` followed by static `.name`/`.[n]` steps
+/// (`.[0].peak_hour`, `first.id`). A step on the wrong kind of value raises; nothing yields twice
+/// or none. A group is never empty, so `first` is `.[0]`.
+fn reads_one_value_off_cursors(read: &Expr) -> bool {
+    match unwrap_paren(read) {
+        Expr::Index { key: None, .. }
+        | Expr::Builtin(Builtin::First | Builtin::Last | Builtin::Length) => true,
+        Expr::Pipe(stages) => stages.split_first().is_some_and(|(head, steps)| {
+            matches!(
+                unwrap_paren(head),
+                Expr::Index { key: None, .. } | Expr::Builtin(Builtin::First | Builtin::Last)
+            ) && steps.iter().all(|step| {
+                matches!(
+                    unwrap_paren(step),
+                    Expr::Field(_) | Expr::Index { key: None, .. }
+                )
+            })
+        }),
+        _ => false,
+    }
+}
+
+/// An [`is_group_construct`] construction built from `group`'s cursors (#7280), decoding only
+/// the values its operands read: `group_by(.k) | map({k: .[0].k, n: length})` decoded every group
+/// and then wrote each one out as JSON and indexed it again to read one field and a count (46%
+/// of the instructions of a 249-record group-and-count). Each operand runs on the group as
+/// `map_groups_eagerly`'s cursor route runs `h`, in entry order, and the pairs fold into the
+/// object as the evaluator's construction folds them
+/// ([`object_from_pairs`](super::eval::object_from_pairs)).
+///
+/// `None` when an operand does not answer one value (a step raised on the wrong kind of value):
+/// the operands are reads with no effect, so the caller's decoded route can run `h` again and
+/// raise with its own diagnostics.
+fn group_construct<S: EvalSemantics, V: DocumentValue>(
+    h: &Expr,
+    group: &[V::Cursor],
+) -> Option<OwnedValue> {
+    match unwrap_paren(h) {
+        Expr::Object(entries) => {
+            let mut pairs = vec_with_capacity(entries.len());
+            for entry in entries {
+                let ObjectKey::Literal(key) = &entry.key else {
+                    return None; // patchcov: coverage tolerate-line reason="unreachable: is_group_construct admits literal keys only (#7280)"
+                };
+                pairs.push((
+                    key.clone(),
+                    group_construct_operand::<S, V>(&entry.value, group)?,
+                ));
+            }
+            let fields = super::eval::object_from_pairs::<S>(pairs).ok()?;
+            Some(OwnedValue::Object(fields.into()))
+        }
+        Expr::Array(inner) => {
+            let elements = match unwrap_paren(inner) {
+                Expr::Comma(operands) => operands
+                    .iter()
+                    .map(|operand| group_construct_operand::<S, V>(operand, group))
+                    .collect::<Option<Vec<_>>>()?,
+                other => vec![group_construct_operand::<S, V>(other, group)?],
+            };
+            Some(OwnedValue::array_from(elements))
+        }
+        _ => None, // patchcov: coverage tolerate-line reason="unreachable: is_group_construct admits an array or object construction only (#7280)"
+    }
+}
+
+/// One operand of [`group_construct`]: a literal, a nested construction, or a read of the group.
+fn group_construct_operand<S: EvalSemantics, V: DocumentValue>(
+    operand: &Expr,
+    group: &[V::Cursor],
+) -> Option<OwnedValue> {
+    match unwrap_paren(operand) {
+        Expr::Literal(lit) => Some(literal_to_owned(lit)),
+        Expr::Object(_) | Expr::Array(_) => group_construct::<S, V>(operand, group),
+        read => {
+            // A pipe's head picks one element and its steps run on that element, as the `Groups`
+            // arm of `fold_lazy_seq_stage` runs `.[0].name`.
+            let answer = match read {
+                Expr::Pipe(stages) => {
+                    let (head, steps) = stages.split_first()?;
+                    fold_pipe_stages::<S, V>(group_head_read::<S, V>(head, group)?, steps, false)
+                }
+                _ => group_head_read::<S, V>(read, group)?,
+            };
+            match answer {
+                GenericResult::OneCursor(cursor) => to_owned_cursor::<S, _>(&cursor).ok(),
+                GenericResult::Owned(value) => Some(value),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// What a read head of [`reads_one_value_off_cursors`] answers over `group`, read off the slice:
+/// the count, or the one element it names (`null` past either end), exactly as
+/// `fold_lazy_seq_stage` answers it over the group's cursors. Reading the slice rather than a
+/// `LazySeq` of the group keeps a construction of many reads from copying the group's cursors
+/// once per read (#7280 review: thirty `length`s over two 500,000-element groups). jq mode only,
+/// where groups are cut; `None` for any other head, which the caller's decoded route answers.
+fn group_head_read<S: EvalSemantics, V: DocumentValue>(
+    head: &Expr,
+    group: &[V::Cursor],
+) -> Option<GenericResult<V>> {
+    let element = |cursor: Option<&V::Cursor>| {
+        cursor.copied().map_or(
+            GenericResult::Owned(OwnedValue::Null),
+            GenericResult::OneCursor,
+        )
+    };
+    if S::TAG != EvalTag::Jq {
+        return None; // patchcov: coverage tolerate-line reason="unreachable: group_by cuts a Groups source in jq mode alone (#5306)"
+    }
+    match unwrap_paren(head) {
+        Expr::Builtin(Builtin::Length) => Some(GenericResult::Owned(OwnedValue::Int(
+            i64::try_from(group.len()).ok()?,
+        ))),
+        Expr::Builtin(Builtin::First) => Some(element(group.first())),
+        Expr::Builtin(Builtin::Last) => Some(element(group.last())),
+        Expr::Index { idx, key: None } => {
+            let len = i64::try_from(group.len()).ok()?;
+            let resolved = if *idx < 0 { len + idx } else { *idx };
+            Some(element(
+                usize::try_from(resolved).ok().and_then(|i| group.get(i)),
+            ))
+        }
+        _ => None, // patchcov: coverage tolerate-line reason="unreachable: is_group_construct admits these heads only (#7280)"
+    }
+}
+
 /// `map(h)` over `group_by`'s groups, run to the end now (#5306): a group that `h` reads in
-/// part (`.[0].id`, `length`) is folded over its cursors and never decoded; any other `h` runs
-/// on the group decoded once, as it ran on every group before. Only `h`'s outputs are kept.
+/// part (`.[0].id`, `length`) is folded over its cursors and never decoded, and so is a
+/// construction of such reads (`{id: .[0].id, n: length}`, #7280); any other `h` runs on the
+/// group decoded once, as it ran on every group before. Only `h`'s outputs are kept.
 /// Eager on purpose, as `map` is in jq: a failing, breaking or halting `h` stops here, inside
 /// whatever `label` or `try` encloses the `map`, and a later `first` cannot skip it.
 fn map_groups_eagerly<S: EvalSemantics, V: DocumentValue>(
@@ -30710,10 +30892,25 @@ fn map_groups_eagerly<S: EvalSemantics, V: DocumentValue>(
     h: &Expr,
 ) -> GenericResult<V> {
     let on_cursors = reads_cursors_alone(h);
+    // #7280: `{k: .[0].k, n: length}` reads the group as `on_cursors` does, operand by operand.
+    // Not under an embed table, as `eval_owned_construct`: a node a binding tracks is answered
+    // by the decoded route, which can name it.
+    let construct = !on_cursors && is_group_construct(h) && !embed_table_active();
     let mut out: Vec<LazyElem<V>> = vec_with_capacity(groups.len());
     for group in groups {
+        let built = if construct {
+            group_construct::<S, V>(h, group)
+        } else {
+            None
+        };
+        #[cfg(test)]
+        if built.is_some() {
+            group_construct_count::bump();
+        }
         let result = if on_cursors {
             fold_lazy_seq_stage::<S, V>(Box::new(LazySeq::from_cursors(group.to_vec())), h, false)
+        } else if let Some(built) = built {
+            GenericResult::Owned(built)
         } else {
             match decode_group::<V>(S::TAG, group) {
                 // `map(.)` keeps the group as it decoded: a pass through `eval_on_owned` would
@@ -61651,6 +61848,147 @@ mod tests {
             other => panic!("unexpected result {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#5306)"
         };
         assert_eq!(built.to_json(), r#"[[{"a":1}],[{"a":2},{"a":2}]]"#);
+    }
+
+    /// The answer of `filter` over `doc` as `-c` JSON lines, and how many groups
+    /// `group_construct` built on the way (#7280).
+    fn group_construct_run(doc: &str, filter: &str) -> (Result<String, EvalError>, usize) {
+        let index = JsonIndex::build(doc.as_bytes());
+        let expr = parse(filter).unwrap();
+        let before = group_construct_count::get();
+        let result = eval_with_cursor_using::<JqSemantics, _>(&expr, index.root(doc.as_bytes()));
+        // `collect_owned` answers an error as no values, and these rows read the error.
+        let result = match result {
+            GenericResult::LazySeq(seq) => match seq.materialize_atomic::<JqSemantics>() {
+                Ok(value) => GenericResult::Owned(value),
+                Err(Control::Error(error)) => GenericResult::Error(error),
+                Err(other) => panic!("unexpected control {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#7280)"
+            },
+            other => other,
+        };
+        if let GenericResult::Error(error) = result {
+            return (Err(error), group_construct_count::get() - before);
+        }
+        let answer = result.collect_owned::<JqSemantics>().map(|values| {
+            values
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
+        (answer, group_construct_count::get() - before)
+    }
+
+    /// #7280: `map(h)` over `group_by`'s groups builds an array or object construction of
+    /// one-value reads from each group's cursors, one `group_construct` per group, and the
+    /// answer is the one the decoded route gave (jq 1.7.1's).
+    #[test]
+    fn test_map_over_groups_builds_a_construction_off_the_cursors_7280() {
+        let doc = r#"[{"a":2,"b":"x"},{"a":1,"b":"y"},{"a":2,"b":"z"},{"a":1.0,"b":100000000000000000001}]"#;
+        let rows: &[(&str, &str)] = &[
+            (
+                "group_by(.a) | map({h: .[0].a, n: length})",
+                r#"[{"h":1,"n":2},{"h":2,"n":2}]"#,
+            ),
+            (
+                "group_by(.a) | map({f: first.b, l: last.b, x: .[5], lit: \"k\", in: {n: length}})",
+                r#"[{"f":"y","l":100000000000000000001,"x":null,"lit":"k","in":{"n":2}},{"f":"x","l":"z","x":null,"lit":"k","in":{"n":2}}]"#,
+            ),
+            (
+                "group_by(.a) | map([.[0].b, length, [last]])",
+                r#"[["y",2,[{"a":1.0,"b":100000000000000000001}]],["x",2,[{"a":2,"b":"z"}]]]"#,
+            ),
+            ("group_by(.a) | map([length])", "[[2],[2]]"),
+            (
+                "group_by(.a) | map({a: .[-9], b: .[-2].b, c: .[2], n: length, m: length})",
+                r#"[{"a":null,"b":"y","c":null,"n":2,"m":2},{"a":null,"b":"x","c":null,"n":2,"m":2}]"#,
+            ),
+            (
+                "group_by(.a) | map({k: .[0].a, k: length})",
+                r#"[{"k":2},{"k":2}]"#,
+            ),
+        ];
+        for (filter, want) in rows {
+            let (answer, built) = group_construct_run(doc, filter);
+            assert_eq!(answer.as_deref(), Ok(*want), "`{filter}`");
+            assert_eq!(
+                built, 2,
+                "`{filter}` builds each of its two groups off the cursors"
+            );
+        }
+    }
+
+    /// #7280: a construction that is not one of `group_construct`'s, or whose read raises, takes
+    /// the decoded route, and a raise keeps that route's diagnostic.
+    #[test]
+    fn test_map_over_groups_leaves_other_constructions_to_the_decoded_route_7280() {
+        let doc = r#"[{"a":2,"b":"x"},{"a":1,"b":"y"},{"a":2,"b":"z"}]"#;
+        let rows: &[(&str, Result<&str, &str>)] = &[
+            (
+                "group_by(.a) | map({b})",
+                Err("Cannot index array with string \"b\""),
+            ),
+            (
+                "group_by(.a) | map({k: .[0].a.c})",
+                Err("Cannot index number with string \"c\""),
+            ),
+            (
+                "group_by(.a) | map({(.[0].b): length})",
+                Ok(r#"[{"y":1},{"x":2}]"#),
+            ),
+            (
+                "group_by(.a) | map({k: .[0]?.b})",
+                Ok(r#"[{"k":"y"},{"k":"x"}]"#),
+            ),
+            (
+                "group_by(.a) | map({k: map(.b)})",
+                Ok(r#"[{"k":["y"]},{"k":["x","z"]}]"#),
+            ),
+            ("group_by(.a) | map([])", Ok("[[],[]]")),
+        ];
+        for (filter, want) in rows {
+            let (answer, built) = group_construct_run(doc, filter);
+            let answer = answer.map_err(|error| error.to_string());
+            match want {
+                Ok(json) => assert_eq!(answer.as_deref(), Ok(*json), "`{filter}`"),
+                Err(text) => assert!(
+                    answer.as_ref().is_err_and(|error| error.contains(text)),
+                    "`{filter}`: {answer:?}"
+                ),
+            }
+            assert_eq!(built, 0, "`{filter}` decodes its groups");
+        }
+    }
+
+    /// #7280: the shapes `is_group_construct` admits, and the ones it leaves to the decoded
+    /// route: a computed key, a generator, a read that is not one value, and anything that is not
+    /// a construction.
+    #[test]
+    fn test_is_group_construct_admits_one_value_reads_only_7280() {
+        for filter in [
+            "{h: .[0].a, n: length}",
+            "{f: first, l: last.b.c, i: .[-1][0], lit: 1}",
+            "{k: first | .a}",
+            "[length]",
+            "[.[0], {n: length}, [last]]",
+        ] {
+            assert!(is_group_construct(&parse(filter).unwrap()), "`{filter}`");
+        }
+        for filter in [
+            "{(.k): length}",
+            "{b}",
+            "{k: .[0].a?}",
+            "{k: .[]}",
+            "{k: .[0:2]}",
+            "{k: first.a[]}",
+            "{k: (length, 1)}",
+            "[length, .[0] | keys]",
+            "[]",
+            "length",
+            "{}",
+        ] {
+            assert!(!is_group_construct(&parse(filter).unwrap()), "`{filter}`");
+        }
     }
 
     /// #3856: a sequence with no stage and a source that is neither a cursor
