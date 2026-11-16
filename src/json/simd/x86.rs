@@ -96,18 +96,35 @@ impl BlockMasks for Sse2 {
 
     #[inline]
     unsafe fn phi_masks(fields: &[u8; 32]) -> [u32; 3] {
-        unsafe {
-            // `movemask` reads bit 7 of each byte, so shift the open (bit 6) and
-            // close (bit 5) bits up to it; a 16-bit lane shift is fine because
-            // only each byte's own lower bits move into its bit 7.
-            let lo = _mm_loadu_si128(fields.as_ptr().cast::<__m128i>());
-            let hi = _mm_loadu_si128(fields.as_ptr().add(16).cast::<__m128i>());
-            [
-                join(lo, hi),
-                join(_mm_slli_epi16::<1>(lo), _mm_slli_epi16::<1>(hi)),
-                join(_mm_slli_epi16::<2>(lo), _mm_slli_epi16::<2>(hi)),
-            ]
-        }
+        // SAFETY: SSE2 is part of the x86_64 baseline.
+        unsafe { phi_masks_in_halves(fields) }
+    }
+}
+
+/// Bits 7, 6 and 5 of each of the 32 stored fields, as the IB, BP-open and
+/// BP-close masks, read as two 16-byte halves.
+///
+/// The AVX2 kernel answers this question with it too. On a Ryzen 9 7950X its
+/// kernel ran 15-20% faster on every input that is not mostly long strings with
+/// these two halves than with one 32-byte load, shift and `movemask` (#7305).
+///
+/// # Safety
+///
+/// None beyond SSE2, which is part of the x86_64 baseline; `unsafe` only because
+/// the loads are raw-pointer intrinsics.
+#[inline(always)]
+pub(super) unsafe fn phi_masks_in_halves(fields: &[u8; 32]) -> [u32; 3] {
+    unsafe {
+        // `movemask` reads bit 7 of each byte, so shift the open (bit 6) and
+        // close (bit 5) bits up to it; a 16-bit lane shift is fine because
+        // only each byte's own lower bits move into its bit 7.
+        let lo = _mm_loadu_si128(fields.as_ptr().cast::<__m128i>());
+        let hi = _mm_loadu_si128(fields.as_ptr().add(16).cast::<__m128i>());
+        [
+            join(lo, hi),
+            join(_mm_slli_epi16::<1>(lo), _mm_slli_epi16::<1>(hi)),
+            join(_mm_slli_epi16::<2>(lo), _mm_slli_epi16::<2>(hi)),
+        ]
     }
 }
 

@@ -78,7 +78,8 @@ unsafe fn classify_chars(chunk: __m256i) -> CharClass {
 }
 
 /// The AVX2 answers to the shared kernel's per-block questions: one 32-byte
-/// `movemask` each.
+/// compare and `movemask` for the skip test, and the SSE2 kernel's two 16-byte
+/// halves for the field masks.
 struct Avx2;
 
 impl BlockMasks for Avx2 {
@@ -98,26 +99,19 @@ impl BlockMasks for Avx2 {
     #[inline]
     #[target_feature(enable = "avx2")]
     unsafe fn phi_masks(fields: &[u8; 32]) -> [u32; 3] {
-        unsafe {
-            // `movemask` reads bit 7 of each byte, so shift the open (bit 6) and
-            // close (bit 5) bits up to it; a 16-bit lane shift is fine because
-            // only each byte's own lower bits move into its bit 7.
-            let v = _mm256_loadu_si256(fields.as_ptr().cast::<__m256i>());
-            [
-                _mm256_movemask_epi8(v) as u32,
-                _mm256_movemask_epi8(_mm256_slli_epi16::<1>(v)) as u32,
-                _mm256_movemask_epi8(_mm256_slli_epi16::<2>(v)) as u32,
-            ]
-        }
+        // Two 16-byte halves, not one 32-byte `movemask` per mask: see
+        // `phi_masks_in_halves` for the measurement.
+        // SAFETY: SSE2 is part of the x86_64 baseline.
+        unsafe { super::x86::phi_masks_in_halves(fields) }
     }
 }
 
 /// Build a semi-index from JSON bytes using SIMD-accelerated Standard Cursor algorithm.
 ///
 /// The state machine runs one `STEP_TABLE` load and one shift per byte, with no
-/// branch on the input; AVX2 then pulls each 32-byte block's IB, BP-open and
-/// BP-close bits out of the stored fields with three `movemask`s, and skips a block
-/// that lies wholly inside a string without stepping it. The kernel is
+/// branch on the input; each 32-byte block's IB, BP-open and BP-close bits are
+/// then pulled out of the stored fields with `movemask`s, and a run of blocks that
+/// lies wholly inside a string is skipped without stepping it. The kernel is
 /// [`super::step`]'s, shared with the SSE2 builder. The per-byte `match` it
 /// replaced (#7299) kept both writers' state in memory and ran about three
 /// data-dependent branches per byte. It was 1.2x (all-backslash strings) to about

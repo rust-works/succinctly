@@ -4,12 +4,11 @@
 //! [`build_semi_index_standard`] runs [`STEP_TABLE`] over the input, one load and
 //! one shift per byte with no branch on the input, and stores each 32-byte block's
 //! fields. It leaves only two questions per block to the instruction set, through
-//! [`BlockMasks`]: which bytes are `"` or `\` (a block that starts inside a string
-//! and holds neither is skipped), and bits 7, 6 and 5 of the 32 stored fields, as
-//! the block's IB, BP-open and BP-close masks. AVX2 answers each with one 32-byte
-//! `movemask`, SSE2 with two 16-byte ones. Everything else is this one definition,
-//! so the two kernels cannot drift apart (#7299 introduced the step for AVX2; #7305
-//! moved SSE2 onto it).
+//! [`BlockMasks`]: which bytes are `"` or `\` (a run of blocks that starts inside a
+//! string and holds neither is skipped), and bits 7, 6 and 5 of the 32 stored
+//! fields, as the block's IB, BP-open and BP-close masks. Everything else is this
+//! one definition, so the two kernels cannot drift apart (#7299 introduced the step
+//! for AVX2; #7305 moved SSE2 onto it).
 
 use crate::json::standard::{SemiIndex, State, STATES, STEP_CLOSE, STEP_IB, STEP_OPEN, STEP_TABLE};
 use crate::json::BitWriter;
@@ -84,6 +83,19 @@ fn compact_bp(opens: u32, closes: u32) -> (u64, u32) {
 /// Low five bits of a [`STEP_TABLE`] field when the state is `InString`.
 const IN_STRING_SHIFT: u32 = 8 * State::InString as u32;
 
+/// The `b`-th 32-byte block of `json`.
+///
+/// # Safety
+///
+/// `32 * (b + 1) <= json.len()`.
+#[inline(always)]
+unsafe fn block_at(json: &[u8], b: usize) -> &[u8; 32] {
+    debug_assert!(32 * (b + 1) <= json.len());
+    // SAFETY: the caller keeps the 32 bytes inside `json`, and `[u8; 32]` has the
+    // alignment of `u8`.
+    unsafe { &*json.as_ptr().add(32 * b).cast::<[u8; 32]>() }
+}
+
 /// Build a Standard Cursor semi-index, asking `M` the per-block questions.
 ///
 /// Inlined into each instruction set's `#[target_feature]` entry point, so `M`'s
@@ -101,15 +113,22 @@ pub(super) unsafe fn build_semi_index_standard<M: BlockMasks>(json: &[u8]) -> Se
     let mut field: u32 = 0;
     let mut fields = [0u8; 32];
 
-    let mut blocks = json.chunks_exact(32);
-    for block in &mut blocks {
-        // SAFETY: `chunks_exact(32)` yields 32-byte slices, and `[u8; 32]` has
-        // the alignment of `u8`.
-        let block = unsafe { &*block.as_ptr().cast::<[u8; 32]>() };
+    let blocks = json.len() / 32;
+    let mut b = 0;
+    while b < blocks {
+        // SAFETY: `b < blocks`, so the block lies inside `json`.
+        let block = unsafe { block_at(json, b) };
+        b += 1;
         // SAFETY: the caller guarantees `M`'s features.
         if field & 0x1F == IN_STRING_SHIFT && unsafe { M::specials(block) } == 0 {
-            // Every byte stays in the string: IB 0, no BP.
-            ib.write_zeros(32);
+            // This block and every following one with no quote or backslash stay
+            // in the string: IB 0 and no BP for the whole run, written at once.
+            let run_start = b - 1;
+            // SAFETY: as above, for `b < blocks`.
+            while b < blocks && unsafe { M::specials(block_at(json, b)) } == 0 {
+                b += 1;
+            }
+            ib.write_zeros(32 * (b - run_start));
             continue;
         }
         for (slot, &c) in fields.iter_mut().zip(block) {
@@ -124,7 +143,7 @@ pub(super) unsafe fn build_semi_index_standard<M: BlockMasks>(json: &[u8]) -> Se
     }
 
     // Fewer than 32 bytes left: step them one at a time.
-    for &c in blocks.remainder() {
+    for &c in &json[32 * blocks..] {
         field = STEP_TABLE[c as usize].wrapping_shr(field);
         ib.write_bit((field >> STEP_IB) & 1 != 0);
         if (field >> STEP_OPEN) & 1 != 0 {
@@ -172,7 +191,7 @@ impl BlockMasks for Portable {
 /// [`Portable`] on every target, and the AVX2 and SSE2 tests over their kernels.
 #[cfg(test)]
 pub(super) mod suite {
-    use super::{compact_bp, BlockMasks, Portable};
+    use super::compact_bp;
     use crate::json::standard::{build_semi_index_scalar, SemiIndex, State, STATES};
 
     type Build = fn(&[u8]) -> SemiIndex;
@@ -393,6 +412,7 @@ pub(super) mod suite {
     }
 
     /// Every check above, for one kernel.
+    #[cfg(target_arch = "x86_64")]
     pub fn all(build: Build) {
         every_byte_state_offset(build);
         byte_pairs_at_block_edges(build);
@@ -410,7 +430,8 @@ pub(super) mod suite {
     /// # Safety
     ///
     /// `M`'s target features must be available.
-    pub unsafe fn masks_agree<M: BlockMasks>() {
+    #[cfg(target_arch = "x86_64")]
+    pub unsafe fn masks_agree<M: super::BlockMasks>() {
         let mut blocks: Vec<[u8; 32]> = Vec::new();
         for b in 0..=255u8 {
             for i in 0..32 {
@@ -431,8 +452,10 @@ pub(super) mod suite {
         for block in &blocks {
             // SAFETY: the caller guarantees `M`'s features; `Portable` needs none.
             unsafe {
-                assert_eq!(M::specials(block), Portable::specials(block), "{block:?}");
-                assert_eq!(M::phi_masks(block), Portable::phi_masks(block), "{block:?}");
+                let portable = <super::Portable as super::BlockMasks>::specials(block);
+                assert_eq!(M::specials(block), portable, "{block:?}");
+                let portable = <super::Portable as super::BlockMasks>::phi_masks(block);
+                assert_eq!(M::phi_masks(block), portable, "{block:?}");
             }
         }
     }
