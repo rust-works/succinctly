@@ -9123,33 +9123,41 @@ enum ElementResults<V: DocumentValue> {
 /// entry flattens to the same values in the same place and is not a cursor, as none of its
 /// values was, so the all-cursors decision, the prefix kept on a failure and "an earlier lazily
 /// failing element wins" are as they were.
+///
+/// `eval` gives an element's result; both modes call it directly, so that, as before, nothing
+/// but `eval_single_pipe` itself stands between the loop and each element (#7267 review: an
+/// iterator of results shared by the two loops was left out of line, one more call and an
+/// 80-byte copy per element).
 #[inline(always)]
-fn collect_element_results<S: EvalSemantics, V: DocumentValue>(
-    mut results: impl ExactSizeIterator<Item = GenericResult<V>>,
+fn collect_element_results<S: EvalSemantics, V: DocumentValue, I: ExactSizeIterator>(
+    mut elements_left: I,
+    mut eval: impl FnMut(I::Item) -> GenericResult<V>,
 ) -> ElementResults<V> {
     #[cfg(test)]
-    let elements = results.len();
+    let elements = elements_left.len();
     let mut values: Vec<OwnedValue> = Vec::new();
     // The first computed value, until a second one says the vector is worth allocating.
     let mut lone: Option<OwnedValue> = None;
     // The first result of another kind, and whether it is already the batch entry (a lazy
     // object whose building failed, which the batch keeps as it is, as `collect_entries` does).
     let other = loop {
-        let value = match results.next() {
-            None => break None,
-            Some(GenericResult::None) => continue,
-            Some(GenericResult::Owned(o)) => o,
+        let Some(element) = elements_left.next() else {
+            break None;
+        };
+        let value = match eval(element) {
+            GenericResult::None => continue,
+            GenericResult::Owned(o) => o,
             // #4044, as in `collect_entries`: a lazy object is built as it arrives.
-            Some(obj @ GenericResult::LazyObject(_)) => match obj.materialize_lazy::<S>() {
+            obj @ GenericResult::LazyObject(_) => match obj.materialize_lazy::<S>() {
                 GenericResult::Owned(o) => o,
                 failed => break Some((failed, true)),
             },
-            Some(other) => break Some((other, false)),
+            other => break Some((other, false)),
         };
         if !values.is_empty() {
             values.push(value);
         } else if let Some(first) = lone.take() {
-            values = vec_with_capacity(results.len() + 2);
+            values = vec_with_capacity(elements_left.len() + 2);
             values.push(first);
             values.push(value);
         } else {
@@ -9188,15 +9196,19 @@ fn collect_element_results<S: EvalSemantics, V: DocumentValue>(
         _ => None,
     };
     // No more entries than main reserved: one per element left, this one and the leading one.
-    let mut per_element = vec_with_capacity(results.len() + 2);
+    let mut per_element = vec_with_capacity(elements_left.len() + 2);
     per_element.extend(leading);
-    let first = if is_entry {
+    let stopped = if is_entry {
         per_element.push(other);
         None
     } else {
-        Some(other)
+        push_first_entry::<S, V>(&mut per_element, other)
     };
-    match collect_entries::<S, V>(&mut per_element, first.into_iter().chain(results)) {
+    let stopped = match stopped {
+        Some(stopped) => Some(stopped),
+        None => collect_entries::<S, V, I>(&mut per_element, elements_left, eval),
+    };
+    match stopped {
         Some(stopped) => ElementResults::Stopped(stopped),
         None => {
             #[cfg(test)]
@@ -9217,75 +9229,98 @@ fn collect_element_results<S: EvalSemantics, V: DocumentValue>(
 /// batch so far into the prefix it returns. Returns that result when an element stopped the fold,
 /// and `None` when every element was pushed.
 #[inline(always)]
-fn collect_entries<S: EvalSemantics, V: DocumentValue>(
+fn collect_entries<S: EvalSemantics, V: DocumentValue, I: Iterator>(
     per_element: &mut Vec<GenericResult<V>>,
-    results: impl Iterator<Item = GenericResult<V>>,
+    elements_left: I,
+    mut eval: impl FnMut(I::Item) -> GenericResult<V>,
 ) -> Option<GenericResult<V>> {
-    for result in results {
-        match result {
-            // The elements already piped through no
-            // longer vanish (#400, #494). If an earlier
-            // element's own buffered `LazySeq` also fails
-            // once `flatten_generic_results` materializes
-            // it, that earlier failure wins -- it's
-            // chronologically first in evaluation order.
-            GenericResult::Error(e) => {
-                return Some(
-                    match flatten_generic_results::<_, S>(core::mem::take(per_element)) {
-                        Ok(prefix) => partial_generic(prefix, Control::Error(e)),
-                        Err(Control::Error(earlier)) => GenericResult::Error(earlier),
-                        Err(Control::Break(label)) => GenericResult::Break(label),
-                        Err(Control::Halt(code)) => GenericResult::Halt(code),
-                    },
-                );
-            }
-            GenericResult::Break(label) => {
-                return Some(
-                    match flatten_generic_results::<_, S>(core::mem::take(per_element)) {
-                        Ok(prefix) => partial_generic(prefix, Control::Break(label)),
-                        Err(Control::Error(earlier)) => GenericResult::Error(earlier),
-                        Err(Control::Break(earlier_label)) => GenericResult::Break(earlier_label),
-                        Err(Control::Halt(code)) => GenericResult::Halt(code),
-                    },
-                );
-            }
-            // Same immediate-stop treatment as `Error`/`Break`
-            // above — halt is an opaque terminal signal, not
-            // catchable by anything downstream, so this must
-            // not fall through to the `other => ...` wildcard
-            // below (which would keep evaluating later cursor
-            // elements instead of stopping immediately).
-            GenericResult::Halt(code) => {
-                return Some(
-                    match flatten_generic_results::<_, S>(core::mem::take(per_element)) {
-                        Ok(prefix) => partial_generic(prefix, Control::Halt(code)),
-                        Err(Control::Error(earlier)) => GenericResult::Error(earlier),
-                        Err(Control::Break(label)) => GenericResult::Break(label),
-                        Err(Control::Halt(earlier_code)) => GenericResult::Halt(earlier_code),
-                    },
-                );
-            }
-            GenericResult::Partial(vs, control) => {
-                return Some(
-                    match flatten_generic_results::<_, S>(core::mem::take(per_element)) {
-                        Ok(mut prefix) => {
-                            prefix.extend(vs);
-                            partial_generic(prefix, control)
-                        }
-                        Err(Control::Error(earlier)) => GenericResult::Error(earlier),
-                        Err(Control::Break(label)) => GenericResult::Break(label),
-                        Err(Control::Halt(code)) => GenericResult::Halt(code),
-                    },
-                );
-            }
-            // #4044: collected, an object is read in full anyway, so it
-            // is built as it arrives rather than held lazily until
-            // the flatten (N live boxes and entry buffers).
-            obj @ GenericResult::LazyObject(_) => {
-                per_element.push(obj.materialize_lazy::<S>());
-            }
-            other => per_element.push(other),
+    for element in elements_left {
+        if let Some(stopped) = push_entry::<S, V>(per_element, eval(element)) {
+            return Some(stopped);
         }
+    }
+    None
+}
+
+/// [`push_entry`] for the element that moved the fold to the batch, out of the loop's way.
+#[inline(never)]
+fn push_first_entry<S: EvalSemantics, V: DocumentValue>(
+    per_element: &mut Vec<GenericResult<V>>,
+    result: GenericResult<V>,
+) -> Option<GenericResult<V>> {
+    push_entry::<S, V>(per_element, result)
+}
+
+/// One element's result into [`collect_entries`]' batch: the body of the loop before #7267.
+/// Returns what the fold returns when the element stops it.
+#[inline(always)]
+fn push_entry<S: EvalSemantics, V: DocumentValue>(
+    per_element: &mut Vec<GenericResult<V>>,
+    result: GenericResult<V>,
+) -> Option<GenericResult<V>> {
+    match result {
+        // The elements already piped through no
+        // longer vanish (#400, #494). If an earlier
+        // element's own buffered `LazySeq` also fails
+        // once `flatten_generic_results` materializes
+        // it, that earlier failure wins -- it's
+        // chronologically first in evaluation order.
+        GenericResult::Error(e) => {
+            return Some(
+                match flatten_generic_results::<_, S>(core::mem::take(per_element)) {
+                    Ok(prefix) => partial_generic(prefix, Control::Error(e)),
+                    Err(Control::Error(earlier)) => GenericResult::Error(earlier),
+                    Err(Control::Break(label)) => GenericResult::Break(label),
+                    Err(Control::Halt(code)) => GenericResult::Halt(code),
+                },
+            );
+        }
+        GenericResult::Break(label) => {
+            return Some(
+                match flatten_generic_results::<_, S>(core::mem::take(per_element)) {
+                    Ok(prefix) => partial_generic(prefix, Control::Break(label)),
+                    Err(Control::Error(earlier)) => GenericResult::Error(earlier),
+                    Err(Control::Break(earlier_label)) => GenericResult::Break(earlier_label),
+                    Err(Control::Halt(code)) => GenericResult::Halt(code),
+                },
+            );
+        }
+        // Same immediate-stop treatment as `Error`/`Break`
+        // above — halt is an opaque terminal signal, not
+        // catchable by anything downstream, so this must
+        // not fall through to the `other => ...` wildcard
+        // below (which would keep evaluating later cursor
+        // elements instead of stopping immediately).
+        GenericResult::Halt(code) => {
+            return Some(
+                match flatten_generic_results::<_, S>(core::mem::take(per_element)) {
+                    Ok(prefix) => partial_generic(prefix, Control::Halt(code)),
+                    Err(Control::Error(earlier)) => GenericResult::Error(earlier),
+                    Err(Control::Break(label)) => GenericResult::Break(label),
+                    Err(Control::Halt(earlier_code)) => GenericResult::Halt(earlier_code),
+                },
+            );
+        }
+        GenericResult::Partial(vs, control) => {
+            return Some(
+                match flatten_generic_results::<_, S>(core::mem::take(per_element)) {
+                    Ok(mut prefix) => {
+                        prefix.extend(vs);
+                        partial_generic(prefix, control)
+                    }
+                    Err(Control::Error(earlier)) => GenericResult::Error(earlier),
+                    Err(Control::Break(label)) => GenericResult::Break(label),
+                    Err(Control::Halt(code)) => GenericResult::Halt(code),
+                },
+            );
+        }
+        // #4044: collected, an object is read in full anyway, so it
+        // is built as it arrives rather than held lazily until
+        // the flatten (N live boxes and entry buffers).
+        obj @ GenericResult::LazyObject(_) => {
+            per_element.push(obj.materialize_lazy::<S>());
+        }
+        other => per_element.push(other),
     }
     None
 }
@@ -9493,7 +9528,7 @@ mod per_element_batch_tests_7267 {
     }
 
     fn collect(kinds: &[Kind], cs: &[Cursor<'static>]) -> ElementResults<Doc<'static>> {
-        collect_element_results::<JqSemantics, _>(kinds.iter().map(|k| build(*k, cs)))
+        collect_element_results::<JqSemantics, _, _>(kinds.iter().copied(), |k| build(k, cs))
     }
 
     /// The batch as the fold built it before #7267: [`collect_entries`] from the first element.
@@ -9505,10 +9540,10 @@ mod per_element_batch_tests_7267 {
         Option<GenericResult<Doc<'static>>>,
     ) {
         let mut batch = vec_with_capacity(kinds.len());
-        let stopped = collect_entries::<JqSemantics, _>(
-            &mut batch,
-            None.into_iter().chain(kinds.iter().map(|k| build(*k, cs))),
-        );
+        let stopped =
+            collect_entries::<JqSemantics, _, _>(&mut batch, kinds.iter().copied(), |k| {
+                build(k, cs)
+            });
         (batch, stopped)
     }
 
@@ -14839,10 +14874,10 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
                 // #7267: computed values straight into one vector while every element
                 // yields one or nothing; the per-element batch as before from the first
                 // element that yields anything else.
-                let results = cs.into_iter().map(|c| {
+                let eval = |c: V::Cursor| {
                     eval_single_pipe::<S, _>(rest, &rest_whole, c.value(), optional, Some(c))
-                });
-                return match collect_element_results::<S, V>(results) {
+                };
+                return match collect_element_results::<S, V, _>(cs.into_iter(), eval) {
                     ElementResults::Values(values) if values.is_empty() => GenericResult::None,
                     ElementResults::Values(values) => GenericResult::ManyOwned(values),
                     ElementResults::Entries(per_element) => finish_entries::<S, V>(per_element),
