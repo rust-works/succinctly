@@ -79,20 +79,21 @@ fn test_an_object_past_the_key_table_ceiling_prints_what_jq_prints_7293() -> Res
     Ok(())
 }
 
-/// Indentation of up to eight characters is written a character at a time and deeper indentation
-/// as slices of a run (#7293); both widths, and the step between them, print what jq prints.
+/// Indentation is written 64 units at a time and the rest in one slice whose length a `match`
+/// picks (#7293), so every line length crosses one of those paths. Ten levels of `{"a":[...]}` nest
+/// twenty deep: at `--indent 7` the deepest line is 140 columns, past one and two runs of 64, and
+/// `--indent 1` and `--indent 3` stay inside the first run.
 #[test]
 fn test_shallow_and_deep_indentation_print_what_jq_prints_7293() -> Result<()> {
-    // Nine levels of `{"a":[...]}`, so `--indent 1` reaches 18 columns and `--indent 3` 54.
     let mut doc = String::from("1");
-    for _ in 0..9 {
+    for _ in 0..10 {
         doc = format!("{{\"a\":[{doc},true]}}");
     }
-    for (flags, width) in [(vec!["--indent", "1"], 1), (vec!["--indent", "3"], 3)] {
+    for width in [1usize, 3, 7] {
         // Built inside out, each level adds one object and one array level of indentation.
         let mut want = String::from("1");
         let pad = |n: usize| " ".repeat(n * width);
-        for _ in 0..9 {
+        for _ in 0..10 {
             let inner = want.replace('\n', &format!("\n{}", pad(2)));
             want = format!(
                 "{{\n{o}\"a\": [\n{a}{inner},\n{a}true\n{o}]\n}}",
@@ -101,6 +102,13 @@ fn test_shallow_and_deep_indentation_print_what_jq_prints_7293() -> Result<()> {
             );
         }
         want.push('\n');
+        assert!(
+            want.lines()
+                .any(|line| line.len() - line.trim_start().len() > 128)
+                || width < 7
+        );
+        let flags = ["--indent", &width.to_string()].map(String::from);
+        let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
         let (out, err, code) = run(&flags, &doc)?;
         assert_eq!((err.as_str(), code), ("", 0), "{flags:?}");
         assert_eq!(out, want, "{flags:?}");
