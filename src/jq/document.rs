@@ -3796,6 +3796,61 @@ pub fn effective_fields_checked<F: DocumentFields>(
     Ok(out)
 }
 
+/// The value cursors of [`effective_fields_checked`]'s list, in its order, without that list
+/// (#7290): what `.[]` over an object hands on.
+///
+/// The same walk and the same checks, in the same order, so it raises exactly what
+/// `effective_fields_checked` raises. It keeps one value cursor and one key hash per field where
+/// that function keeps a whole [`DocumentField`] (key and value decoded, both cursors: 144 bytes
+/// on a JSON document), and `.[]` used to keep that list's allocation as its cursor list, since
+/// collecting `into_iter().map(..)` reuses the source buffer. On `wide-100mb` (8.2 M fields) that
+/// buffer was 1.2 GB of the run's peak.
+///
+/// Only an object whose key hashes repeat, under a collapsing mode, walks a second time, through
+/// `effective_fields_checked` itself: the collapse needs the keys, and a hash shared by two
+/// different keys collapses nothing there.
+pub fn effective_value_cursors_checked<F: DocumentFields>(
+    fields: &F,
+    collapse: bool,
+) -> Result<Vec<F::Cursor>, EvalError> {
+    let mut out = Vec::new();
+    let mut hashes: Vec<u64> = Vec::new();
+    let mut walk = fields.clone();
+    let mut is_first = true;
+    while let Some((field, rest)) = walk.uncons() {
+        if key_is_malformed(&field.key) {
+            return Err(walk.malformed_member_error());
+        }
+        if !field.delimiters_ok::<F>(is_first) {
+            return Err(walk.malformed_member_error());
+        }
+        if collapse {
+            if let Some(hash) = field_key_hash(&field) {
+                hashes.push(hash);
+            }
+        }
+        out.push(field.value_cursor);
+        walk = rest;
+        is_first = false;
+    }
+    if walk.ends_unpaired() {
+        return Err(walk.malformed_member_error());
+    }
+    if let Some(last) = out.last() {
+        if !trailing_element_gap_ok(last, b'}') {
+            return Err(walk.malformed_member_error());
+        }
+    }
+    // `keys_repeat`'s answer: it hashes the same keys, skipping the same ones, and asks the
+    // same question of fewer than two fields.
+    if collapse && out.len() >= 2 && any_hash_repeats(hashes) {
+        let collapsed = effective_fields_checked(fields, true)?;
+        // Not `into_iter().map(..).collect()`, which would keep the field list's buffer.
+        return Ok(collapsed.iter().map(|field| field.value_cursor).collect());
+    }
+    Ok(out)
+}
+
 /// The collapsed field list, or `None` when no key repeats.
 ///
 /// Lets a caller keep whatever zero-allocation fast path it already has for

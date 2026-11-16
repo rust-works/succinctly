@@ -48,11 +48,11 @@ use super::deferred_bind::{
 use super::document::{
     checked_member_key, child_tail_gap_ok, collapsed_fields_checked, collapsed_fields_if,
     container_tail_gap_ok, effective_fields_checked, effective_fields_with_raw_last,
-    effective_len_checked, empty_elements_tail_gap_ok, empty_fields_tail_gap_ok, key_delimiter_ok,
-    key_display_string, key_display_string_kind, key_hash, key_is_malformed, resolve_display_key,
-    tail_gap_ok, trailing_element_gap_ok, value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors,
-    DocumentCursor, DocumentElements, DocumentFields, DocumentValue, IndentSpec, JsonConvention,
-    LazyKeyLedger,
+    effective_len_checked, effective_value_cursors_checked, empty_elements_tail_gap_ok,
+    empty_fields_tail_gap_ok, key_delimiter_ok, key_display_string, key_display_string_kind,
+    key_hash, key_is_malformed, resolve_display_key, tail_gap_ok, trailing_element_gap_ok,
+    value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors, DocumentCursor, DocumentElements,
+    DocumentFields, DocumentValue, IndentSpec, JsonConvention, LazyKeyLedger,
 };
 use super::encoder_comments::{EncoderComments, EncoderEntry, EncoderMembers, EncoderNodeComments};
 use super::error::EvalEscape;
@@ -14708,6 +14708,18 @@ fn fold_lazy_seq_stage<S: EvalSemantics, V: DocumentValue>(
         {
             let remaining = &cursors[*next..];
             match unwrap_paren(expr) {
+                // #7290: `[.[]] | add` adds the nodes from their cursors, as `.xs | add` does,
+                // where the `_` arm below decoded the whole array first and handed that to the
+                // owned `add`. Each node is still decoded in order, so the first one that does not
+                // decode is the error either way. The same gates as the document array's arm.
+                Expr::Builtin(Builtin::Add)
+                    if S::TAG == EvalTag::Jq
+                        && !*may_repeat
+                        && !embed_table_active()
+                        && reordering_may_keep_cursors::<V>(remaining.first()) =>
+                {
+                    return add_cursors_generic::<S, V>(remaining, optional);
+                }
                 Expr::Index { idx, key: None } if *idx != 0 => {
                     let len = remaining.len();
                     let resolved = if *idx < 0 { len as i64 + idx } else { *idx };
@@ -16721,12 +16733,9 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 if let Err(err) = empty_fields_tail_gap_ok(&fields, cursor.as_ref()) {
                     return GenericResult::Error(err);
                 }
-                match effective_fields_checked(&fields, true) {
-                    Ok(effective) => {
-                        let cursors: Vec<_> = effective
-                            .into_iter()
-                            .map(|field| field.value_cursor)
-                            .collect();
+                // #7290: the value cursors alone, not the field list.
+                match effective_value_cursors_checked(&fields, true) {
+                    Ok(cursors) => {
                         if cursors.is_empty() {
                             GenericResult::None
                         } else {
@@ -21796,10 +21805,10 @@ fn any_all_f_generic<S: EvalSemantics, V: DocumentValue>(
         // `[false]` under yq too, and so is the eager `any_all_f`'s walk.
         // The mode constant governs the *keys* builtins, where yq keeps every
         // occurrence; here it would have answered `any(.)` `true`.
-        match effective_fields_checked(&fields, true) {
-            Ok(fields) => {
-                for field in fields {
-                    if let Some(result) = probe(field.value_cursor, &mut matches) {
+        match effective_value_cursors_checked(&fields, true) {
+            Ok(cursors) => {
+                for value_cursor in cursors {
+                    if let Some(result) = probe(value_cursor, &mut matches) {
                         return result;
                     }
                 }
@@ -30416,6 +30425,82 @@ fn literal_spellings_cmp<C: DocumentCursor>(a: &C, b: &C) -> core::cmp::Ordering
     }
 }
 
+/// `add` over document nodes, in order, read from their cursors (#5595): the jq-mode fold both an
+/// array in the document and an array built of its nodes (`[.[]] | add`, #7290) take, so neither
+/// holds the decoded elements. The caller has made the container's own gap checks.
+fn add_cursors_generic<S: EvalSemantics, V: DocumentValue>(
+    cursors: &[V::Cursor],
+    optional: bool,
+) -> GenericResult<V> {
+    #[cfg(test)]
+    add_walk_count::bump();
+    // `builtin_add` converts every element before it adds any, so an undecodable
+    // element is reported ahead of an addition that fails earlier in the array. Adding
+    // as we go and keeping the first addition error until every element has converted
+    // gives the same answer without holding the converted elements.
+    let mut total: Option<OwnedValue> = None;
+    let mut failed: Option<EvalError> = None;
+    for element in cursors {
+        // #7278: once the sum is a number, a document number is added as its value
+        // alone: the result is computed, so the spelling `to_owned_cursor` would copy is
+        // never read. Not the first number, which `[1.0] | add` and `null + 1.0` print
+        // as written. A `-0` literal reads as `-0.0`, as `arith_add` reads it.
+        if failed.is_none() && total.as_ref().is_some_and(OwnedValue::is_number) {
+            if let Some(number) = borrowed_document_number::<S, _>(element) {
+                let operand = match number.repr {
+                    _ if number.negative_zero => OwnedValue::Float(-0.0),
+                    NumberRepr::Int(i) => OwnedValue::Int(i),
+                    NumberRepr::Float(f) => OwnedValue::Float(f),
+                };
+                let acc = total.take().unwrap_or(OwnedValue::Null);
+                match crate::jq::eval::arith_add::<S>(acc, operand) {
+                    Ok(sum) => total = Some(sum),
+                    Err(error) => failed = Some(error), // patchcov: coverage tolerate-line reason="unreachable: two numbers always add (#7278)"
+                }
+                continue;
+            }
+        }
+        let item = owned_or_suppress!(to_owned_cursor::<S, _>(element), optional);
+        if failed.is_some() {
+            continue;
+        }
+        total = match total.take() {
+            None => Some(item),
+            Some(acc) => match crate::jq::eval::arith_add::<S>(acc, item) {
+                Ok(sum) => Some(sum),
+                Err(error) => {
+                    failed = Some(error);
+                    None
+                }
+            },
+        };
+    }
+    match (failed, total) {
+        (Some(error), _) => GenericResult::Error(error),
+        (None, Some(sum)) => GenericResult::Owned(sum),
+        (None, None) => GenericResult::Owned(OwnedValue::Null),
+    }
+}
+
+/// How many times [`add_cursors_generic`] ran on this thread, so a test can assert that
+/// `[.[]] | add` takes it (#7290): the `_` arm it replaced answers the same. `cfg(test)` only.
+#[cfg(test)]
+pub(crate) mod add_walk_count {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn bump() {
+        COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn get() -> usize {
+        COUNT.with(Cell::get)
+    }
+}
+
 /// How many times [`extremum_streaming_generic`] ran on this thread, so a test can assert that bare
 /// `min`/`max` take that walk (#7261): its dispatch once sat in an arm they never reach, and every
 /// answer stayed right while each element's cursor and key were collected first. `cfg(test)` only.
@@ -38735,10 +38820,10 @@ fn any_all_generic<S: EvalSemantics, V: DocumentValue>(
         if S::TAG == EvalTag::Yq {
             return yq_reject_non_array();
         }
-        match effective_fields_checked(&fields, S::COLLAPSE_DUPLICATE_KEYS) {
-            Ok(fields) => {
-                for field in fields {
-                    let truthy = !field.value_cursor.is_falsy();
+        match effective_value_cursors_checked(&fields, S::COLLAPSE_DUPLICATE_KEYS) {
+            Ok(cursors) => {
+                for value_cursor in cursors {
+                    let truthy = !value_cursor.is_falsy();
                     if truthy == target_truthy {
                         return answer(target_truthy);
                     }
@@ -40242,52 +40327,7 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
             }
             // The same gap checks the whole-array conversion made, before any element is read.
             let cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
-            // `builtin_add` converts every element before it adds any, so an undecodable
-            // element is reported ahead of an addition that fails earlier in the array. Adding
-            // as we go and keeping the first addition error until every element has converted
-            // gives the same answer without holding the converted elements.
-            let mut total: Option<OwnedValue> = None;
-            let mut failed: Option<EvalError> = None;
-            for element in &cursors {
-                // #7278: once the sum is a number, a document number is added as its value
-                // alone: the result is computed, so the spelling `to_owned_cursor` would copy is
-                // never read. Not the first number, which `[1.0] | add` and `null + 1.0` print
-                // as written. A `-0` literal reads as `-0.0`, as `arith_add` reads it.
-                if failed.is_none() && total.as_ref().is_some_and(OwnedValue::is_number) {
-                    if let Some(number) = borrowed_document_number::<S, _>(element) {
-                        let operand = match number.repr {
-                            _ if number.negative_zero => OwnedValue::Float(-0.0),
-                            NumberRepr::Int(i) => OwnedValue::Int(i),
-                            NumberRepr::Float(f) => OwnedValue::Float(f),
-                        };
-                        let acc = total.take().unwrap_or(OwnedValue::Null);
-                        match crate::jq::eval::arith_add::<S>(acc, operand) {
-                            Ok(sum) => total = Some(sum),
-                            Err(error) => failed = Some(error), // patchcov: coverage tolerate-line reason="unreachable: two numbers always add (#7278)"
-                        }
-                        continue;
-                    }
-                }
-                let item = owned_or_suppress!(to_owned_cursor::<S, _>(element), optional);
-                if failed.is_some() {
-                    continue;
-                }
-                total = match total.take() {
-                    None => Some(item),
-                    Some(acc) => match crate::jq::eval::arith_add::<S>(acc, item) {
-                        Ok(sum) => Some(sum),
-                        Err(error) => {
-                            failed = Some(error);
-                            None
-                        }
-                    },
-                };
-            }
-            match (failed, total) {
-                (Some(error), _) => GenericResult::Error(error),
-                (None, Some(sum)) => GenericResult::Owned(sum),
-                (None, None) => GenericResult::Owned(OwnedValue::Null),
-            }
+            add_cursors_generic::<S, V>(&cursors, optional)
         }
 
         // The single-element half of the same family. `min`/`max` answer one
@@ -46376,6 +46416,134 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #7290: `[.[]] | add` over an object adds its values from their cursors, in one walk, and
+    /// answers what the full evaluator answers for the same filter, including a repeated key, a
+    /// first number's spelling and a type error. A sequence that may name a node twice
+    /// (`[.[], .[]]`), one under a binding and `add?` keep the decoding route.
+    #[cfg(feature = "std")]
+    #[test]
+    fn object_values_add_from_their_cursors_7290() {
+        type V<'a> = crate::json::light::StandardJson<'a, Vec<u64>>;
+        fn shown<S: EvalSemantics>(result: GenericResult<V<'_>>) -> String {
+            match result {
+                GenericResult::Error(e) | GenericResult::Partial(_, Control::Error(e)) => {
+                    format!("error: {}", e.message)
+                }
+                other => other.collect_owned::<S>().map_or_else(
+                    |e| format!("error: {}", e.message),
+                    |values| {
+                        values
+                            .iter()
+                            .map(OwnedValue::to_json)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    },
+                ),
+            }
+        }
+        fn run(json: &[u8], filter: &str, via_bridge: bool) -> (String, usize) {
+            let expr = crate::jq::parse(filter).unwrap();
+            let index = JsonIndex::build(json);
+            let root = index.root(json);
+            let before = add_walk_count::get();
+            let result = if via_bridge {
+                bridge_to_full_evaluator::<JqSemantics, V<'_>>(
+                    &expr,
+                    root.value(),
+                    Some(root),
+                    false,
+                )
+            } else {
+                eval_using::<JqSemantics, _>(&expr, root.value())
+            };
+            (shown::<JqSemantics>(result), add_walk_count::get() - before)
+        }
+        let objects: &[&[u8]] = &[
+            b"{}",
+            b"{\"a\":1.0}",
+            b"{\"a\":null,\"b\":1.50}",
+            b"{\"a\":1,\"b\":2,\"a\":3}",
+            b"{\"a\":\"x\",\"b\":\"y\",\"a\":\"z\"}",
+            b"{\"a\":-0,\"b\":-0}",
+            b"{\"a\":1,\"b\":\"x\"}",
+            b"{\"a\":[1],\"b\":[2]}",
+        ];
+        for json in objects {
+            let text = String::from_utf8_lossy(json);
+            for (filter, walks) in [
+                ("[.[]] | add", 1),
+                ("[.[]] | add?", 0),
+                ("[.[], .[]] | add", 0),
+                (". as $x | [$x[]] | add", 0),
+            ] {
+                let (native, native_walks) = run(json, filter, false);
+                let (bridged, _) = run(json, filter, true);
+                assert_eq!(native, bridged, "{filter} over {text}");
+                // `.[]` of `{}` is empty, so `[.[]]` is a decoded `[]`.
+                let walks = if text == "{}" { 0 } else { walks };
+                assert_eq!(native_walks, walks, "{filter} over {text}");
+            }
+        }
+    }
+
+    /// #7290: `effective_value_cursors_checked` answers `effective_fields_checked`'s value cursors,
+    /// in its order, and its error wherever that raises, in both modes, over objects with no
+    /// repeated key, a few, every key repeated, one field, none, and members JSON never allowed.
+    #[cfg(feature = "std")]
+    #[test]
+    fn value_cursors_match_the_field_list_7290() {
+        let documents: &[&[u8]] = &[
+            br#"{}"#,
+            br#"{"a":1}"#,
+            br#"{"a":1,"b":[2],"c":{"d":3}}"#,
+            br#"{"a":1,"b":2,"a":3}"#,
+            br#"{"b":1,"a":2,"b":3,"c":4,"a":5}"#,
+            br#"{"a":1,"a":2,"a":3,"a":4}"#,
+            br#"{"a":1,"a":2}"#,
+            br#"{"a":1,}"#,
+            br#"{"a":1 "b":2}"#,
+            br#"{"a" 1,"b":2}"#,
+            br#"{a:1,"b":2}"#,
+            br#"{"a":1,"b"}"#,
+        ];
+        let mut wide = alloc::string::String::from("{");
+        for i in 0..300 {
+            wide.push_str(&alloc::format!("\"k{}\":{},", i % 250, i));
+        }
+        wide.push_str("\"z\":0}");
+        let wide = wide.into_bytes();
+        let (mut answered, mut raised) = (0, 0);
+        for json in documents.iter().copied().chain([wide.as_slice()]) {
+            let index = JsonIndex::build(json);
+            let root = index.root(json);
+            let fields = root.value().as_object().expect("an object");
+            for collapse in [false, true] {
+                let list = effective_fields_checked(&fields, collapse)
+                    .map(|list| {
+                        list.iter()
+                            .map(|f| f.value_cursor.node_id())
+                            .collect::<Vec<_>>()
+                    })
+                    .map_err(|e| alloc::format!("{e:?}"));
+                let cursors = effective_value_cursors_checked(&fields, collapse)
+                    .map(|cs| cs.iter().map(|c| c.node_id()).collect::<Vec<_>>())
+                    .map_err(|e| alloc::format!("{e:?}"));
+                assert_eq!(
+                    cursors,
+                    list,
+                    "{} collapse={collapse}",
+                    String::from_utf8_lossy(json)
+                );
+                if list.is_ok() {
+                    answered += 1;
+                } else {
+                    raised += 1;
+                }
+            }
+        }
+        assert_eq!((answered, raised), (16, 10));
     }
 
     /// #7278: `borrowed_document_number` answers exactly the repr `to_owned_cursor` builds for a
