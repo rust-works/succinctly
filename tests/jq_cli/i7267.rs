@@ -1,7 +1,7 @@
 //! #7267: an array built from a value computed per element of a document array (`[.xs[] | floor]`)
 //! keeps one 32-byte owned value per element while it is built, not an 80-byte per-element result
-//! beside a second, doubling vector. The batch now coalesces owned results into runs and drops empty
-//! ones, so these rows pin what must not move with it: order across cursors and computed values,
+//! beside a second, doubling vector, once a long enough run of elements has yielded computed values
+//! only. These rows pin what must not move with it: order across cursors and computed values,
 //! `empty`, several values from one element, an error after a prefix (raised, caught, suppressed) and a
 //! `halt_error` part-way. Every expected text was captured from jq 1.7.1 (`/usr/bin/jq`).
 
@@ -128,5 +128,22 @@ fn test_per_element_collections_match_jq_7267() -> Result<()> {
         let want = (stdout.to_string(), stderr.replace("<file>", file), code);
         assert_eq!(got, want, "{filter} over {input}");
     }
+    Ok(())
+}
+
+/// A fold recursing through a per-element pipe as deep as main's native stack allows it, captured
+/// from jq 1.7.1 (`0`): the frame of `fold_pipe_stages`, which every level of this recursion keeps
+/// on the stack, grew by more than half in one version of #7267 and the stack guard refused it at
+/// depth 3,200 (#7267 review; main refuses past about 3,250 on an Apple M4 Pro and 3,370 on an AMD
+/// Ryzen 9 7950X in a release build). A debug build reserves a larger stack, so there the row only
+/// pins the output.
+#[test]
+fn test_deep_recursion_through_a_per_element_fold_7267() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("d.json");
+    std::fs::write(&path, "[1,2,3]")?;
+    let filter = ". as $d | def f(n): if n == 0 then 0 else [$d[] | if . == 1 then ($d | f(n - 1)) else . end] | .[0] end; f(3200)";
+    let got = run_jq_full(&[filter, path.to_str().expect("utf-8 temp path")], None)?;
+    assert_eq!(got, ("0\n".to_string(), String::new(), 0));
     Ok(())
 }
