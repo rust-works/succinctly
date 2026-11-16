@@ -4766,6 +4766,39 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
                 self.text(),
             )));
         }
+        // #7271: an indented, unsorted default render of a certified span
+        // cannot fail, so it need not be held back. The certificate says the
+        // compact render of this span succeeds and is the span itself; the
+        // indented render walks the same nodes in the same order and makes
+        // the same decisions, and only writes whitespace between them, so it
+        // succeeds too and nothing is written that a later fault would have
+        // had to retract. It is written out a chunk at a time instead of
+        // whole. `-S` (a different walk over decoded keys), other number
+        // conventions and every span the scan declines (whitespace inside it,
+        // a spelling jq rewrites, a repeated key, invalid UTF-8, a fault)
+        // keep the whole-value buffer, and with it jq's print-nothing on a
+        // malformed document. The compact case asked the scan already, above.
+        if !indent.is_compact()
+            && !sort_keys
+            && numbers == JsonConvention::JqCompat
+            && self.canonical_compact_span(0).is_some()
+        {
+            let mut chunked = ChunkedWrite {
+                out,
+                buf: String::new(),
+            };
+            stream_json_pretty(
+                &mut chunked,
+                value,
+                0,
+                indent.width,
+                indent.unit,
+                sort_keys,
+                numbers,
+                0,
+            )?;
+            return Ok(chunked.finish()?);
+        }
         let mut buf = String::new();
         stream_json_pretty(
             &mut buf,
@@ -5322,6 +5355,49 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentElements for JsonElements<'a, W> {
 // ============================================================================
 // JSON to JSON Streaming Helpers (#1576)
 // ============================================================================
+
+/// The bytes [`ChunkedWrite`] gathers before passing them on: large enough
+/// that a render's many small writes reach the real writer as a few large
+/// ones, small enough that the output is never held whole (#7271).
+const CHUNKED_WRITE_BYTES: usize = 64 * 1024;
+
+/// A writer that passes what it is given on to `out` a chunk of
+/// [`CHUNKED_WRITE_BYTES`] at a time, for a render that is known not to fail
+/// and so need not be held back whole (#7271, `JsonCursor::stream_json`).
+/// [`ChunkedWrite::finish`] writes what is left.
+struct ChunkedWrite<'o, Out: core::fmt::Write> {
+    out: &'o mut Out,
+    buf: String,
+}
+
+impl<Out: core::fmt::Write> ChunkedWrite<'_, Out> {
+    fn finish(self) -> core::fmt::Result {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        self.out.write_str(&self.buf)
+    }
+}
+
+impl<Out: core::fmt::Write> core::fmt::Write for ChunkedWrite<'_, Out> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.buf.push_str(s);
+        if self.buf.len() >= CHUNKED_WRITE_BYTES {
+            self.out.write_str(&self.buf)?;
+            self.buf.clear();
+        }
+        Ok(())
+    }
+
+    fn write_char(&mut self, c: char) -> core::fmt::Result {
+        self.buf.push(c);
+        if self.buf.len() >= CHUNKED_WRITE_BYTES {
+            self.out.write_str(&self.buf)?;
+            self.buf.clear();
+        }
+        Ok(())
+    }
+}
 
 /// Stream a JSON value as (pretty- or compact-, sorted- or unsorted-) JSON,
 /// without materializing an `OwnedValue` -- the pretty-capable counterpart
