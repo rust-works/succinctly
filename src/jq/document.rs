@@ -3806,8 +3806,8 @@ pub fn effective_fields_checked<F: DocumentFields>(
 /// collecting `into_iter().map(..)` reuses the source buffer. On `wide-100mb` (8.2 M fields) that
 /// buffer was 1.2 GB of the run's peak.
 ///
-/// Only an object whose key hashes repeat, under a collapsing mode, walks a second time, through
-/// `effective_fields_checked` itself: the collapse needs the keys, and a hash shared by two
+/// Only an object whose key hashes repeat, under a collapsing mode, walks a second time
+/// (`collapse_repeated_cursors`): the collapse needs the keys, and a hash shared by two
 /// different keys collapses nothing there.
 pub fn effective_value_cursors_checked<F: DocumentFields>(
     fields: &F,
@@ -3844,11 +3844,47 @@ pub fn effective_value_cursors_checked<F: DocumentFields>(
     // `keys_repeat`'s answer: it hashes the same keys, skipping the same ones, and asks the
     // same question of fewer than two fields.
     if collapse && out.len() >= 2 && any_hash_repeats(hashes) {
-        let collapsed = effective_fields_checked(fields, true)?;
-        // Not `into_iter().map(..).collect()`, which would keep the field list's buffer.
-        return Ok(collapsed.iter().map(|field| field.value_cursor).collect());
+        return Ok(collapse_repeated_cursors(fields, out));
     }
     Ok(out)
+}
+
+/// [`collapse_repeated`] over the value cursors of every field of `fields`, in document order
+/// (#7290): the same keys (`key_str`), so the same first position and last value for each, and a
+/// key that does not stringify kept where it stands. The keys come from a key-only walk, which
+/// meets the fields `uncons` met in the same order (both read the format's one field walk, the
+/// trait default delegating outright), and the survivors are compacted into `values` itself: a
+/// field's slot is never after it. An owned key is made only for a key not seen before, where
+/// `collapse_repeated` made one per field. The caller has already walked and checked every member.
+fn collapse_repeated_cursors<F: DocumentFields>(
+    fields: &F,
+    mut values: Vec<F::Cursor>,
+) -> Vec<F::Cursor> {
+    let mut slot_of: IndexMap<String, usize> = IndexMap::new();
+    let mut kept = 0usize;
+    let mut walk = fields.clone();
+    let mut at = 0usize;
+    while let Some((key, _cursor, rest)) = walk.uncons_key() {
+        let value = values[at];
+        match key.key_string() {
+            Some(key) => match slot_of.get(key.as_ref()) {
+                Some(&slot) => values[slot] = value,
+                None => {
+                    slot_of.insert(key.into_owned(), kept);
+                    values[kept] = value;
+                    kept += 1;
+                }
+            },
+            None => {
+                values[kept] = value;
+                kept += 1;
+            }
+        }
+        at += 1;
+        walk = rest;
+    }
+    values.truncate(kept);
+    values
 }
 
 /// The collapsed field list, or `None` when no key repeats.

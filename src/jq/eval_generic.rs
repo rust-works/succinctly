@@ -46495,7 +46495,7 @@ mod tests {
     #[test]
     fn value_cursors_match_the_field_list_7290() {
         let documents: &[&[u8]] = &[
-            br#"{}"#,
+            b"{}",
             br#"{"a":1}"#,
             br#"{"a":1,"b":[2],"c":{"d":3}}"#,
             br#"{"a":1,"b":2,"a":3}"#,
@@ -46528,7 +46528,7 @@ mod tests {
                     })
                     .map_err(|e| alloc::format!("{e:?}"));
                 let cursors = effective_value_cursors_checked(&fields, collapse)
-                    .map(|cs| cs.iter().map(|c| c.node_id()).collect::<Vec<_>>())
+                    .map(|cs| cs.iter().map(DocumentCursor::node_id).collect::<Vec<_>>())
                     .map_err(|e| alloc::format!("{e:?}"));
                 assert_eq!(
                     cursors,
@@ -46544,6 +46544,44 @@ mod tests {
             }
         }
         assert_eq!((answered, raised), (16, 10));
+
+        // YAML: repeated keys, a `<<` merge, an alias, a complex key and flow mappings, each
+        // mapping of the document in turn, as yq's build reads them.
+        use crate::yaml::YamlIndex;
+        let yaml: &[u8] = b"a: 1\nb: 2\na: 3\nm: &m {x: 1, y: 2}\nn: {p: 1, q: 2, p: 3}\n\
+            k: {<<: *m, y: 3, w: 4}\no: {? [1, 2] : p, ? [1, 2] : q, r: *m}\ne: {}\n";
+        let index = YamlIndex::build_yq(yaml).unwrap();
+        let top = index.root(yaml).first_child().expect("a document");
+        let top_fields = top.value().as_object().expect("a mapping");
+        let mut mappings = alloc::vec![top_fields.clone()];
+        for name in ["m", "n", "k", "o", "e"] {
+            let found = DocumentFields::find_cursor(&top_fields, name)
+                .unwrap()
+                .expect(name);
+            mappings.push(found.value().as_object().expect("a mapping"));
+        }
+        let mut collapsed_some = 0;
+        for fields in &mappings {
+            let raw = effective_value_cursors_checked(fields, false).expect("well-formed");
+            let kept = effective_value_cursors_checked(fields, true).expect("well-formed");
+            collapsed_some += usize::from(kept.len() < raw.len());
+            for collapse in [false, true] {
+                let list: Vec<_> = effective_fields_checked(fields, collapse)
+                    .expect("well-formed")
+                    .iter()
+                    .map(|f| f.value_cursor.node_id())
+                    .collect();
+                let cursors: Vec<_> = effective_value_cursors_checked(fields, collapse)
+                    .expect("well-formed")
+                    .iter()
+                    .map(DocumentCursor::node_id)
+                    .collect();
+                assert_eq!(cursors, list, "collapse={collapse}");
+            }
+        }
+        // The top mapping repeats `a` and `n` repeats `p`; `o`'s repeated complex key is never a
+        // duplicate (#1385), and `k`'s `<<` is one member of its own at this level.
+        assert_eq!(collapsed_some, 2);
     }
 
     /// #7278: `borrowed_document_number` answers exactly the repr `to_owned_cursor` builds for a
