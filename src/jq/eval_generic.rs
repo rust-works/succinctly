@@ -9158,68 +9158,96 @@ fn push_element_result<V: DocumentValue>(
 ) {
     match result {
         GenericResult::None => {}
-        GenericResult::Owned(o) => match batch.last {
-            LastEntry::Run => {
-                if let Some(GenericResult::ManyOwned(run)) = per_element.last_mut() {
-                    run.push(o);
-                }
-            }
-            LastEntry::Owned => {
-                let Some(GenericResult::Owned(previous)) = per_element.pop() else {
-                    unreachable!("the last entry is a plain `Owned`")
-                };
-                let mut run = if batch.sized_run {
-                    Vec::new()
-                } else {
-                    batch.sized_run = true;
-                    vec_with_capacity(remaining + 1)
-                };
-                run.push(previous);
+        GenericResult::Owned(o) => push_owned_element(per_element, o, remaining, batch),
+        GenericResult::ManyOwned(os) => push_owned_elements(per_element, os, batch),
+        other => push_other_element(per_element, other, remaining, batch),
+    }
+}
+
+/// [`push_element_result`]'s `Owned` arm, which `fold_pipe_stages` calls straight from its
+/// own match so that a result is not matched twice per element (#7267 review).
+#[inline(always)]
+fn push_owned_element<V: DocumentValue>(
+    per_element: &mut Vec<GenericResult<V>>,
+    o: OwnedValue,
+    remaining: usize,
+    batch: &mut ElementBatch,
+) {
+    match batch.last {
+        LastEntry::Run => {
+            if let Some(GenericResult::ManyOwned(run)) = per_element.last_mut() {
                 run.push(o);
-                per_element.push(GenericResult::ManyOwned(run));
-                batch.last = LastEntry::Run;
-            }
-            LastEntry::Nothing | LastEntry::Other => {
-                per_element.push(GenericResult::Owned(o));
-                batch.last = LastEntry::Owned;
-            }
-        },
-        GenericResult::ManyOwned(os) => {
-            if batch.last == LastEntry::Run {
-                if let Some(GenericResult::ManyOwned(run)) = per_element.last_mut() {
-                    run.extend(os);
-                }
-            } else {
-                per_element.push(GenericResult::ManyOwned(os));
-                batch.last = LastEntry::Run;
             }
         }
-        other => {
-            if batch.last == LastEntry::Run {
-                if let Some(GenericResult::ManyOwned(run)) = per_element.last_mut() {
-                    // A closed run is never extended again: give back its slack,
-                    // whether it is the sized run's unused tail or what doubling
-                    // left after values were appended (an inner generator's
-                    // results, `.[] | (.[] | f)`). A small run keeps up to 16
-                    // spare slots, so runs of two or three values between cursors
-                    // do not pay a reallocation each.
-                    if run.capacity() - run.len() > (run.len() / 8).max(16) {
-                        run.shrink_to_fit();
-                    }
-                }
-            }
-            if !batch.sized_batch {
-                batch.sized_batch = true;
-                if per_element.len() <= 2 {
-                    let mut sized = vec_with_capacity(per_element.len() + remaining);
-                    sized.append(per_element);
-                    *per_element = sized;
-                }
-            }
-            per_element.push(other);
-            batch.last = LastEntry::Other;
+        LastEntry::Owned => {
+            let Some(GenericResult::Owned(previous)) = per_element.pop() else {
+                unreachable!("the last entry is a plain `Owned`")
+            };
+            let mut run = if batch.sized_run {
+                Vec::new()
+            } else {
+                batch.sized_run = true;
+                vec_with_capacity(remaining + 1)
+            };
+            run.push(previous);
+            run.push(o);
+            per_element.push(GenericResult::ManyOwned(run));
+            batch.last = LastEntry::Run;
+        }
+        LastEntry::Nothing | LastEntry::Other => {
+            per_element.push(GenericResult::Owned(o));
+            batch.last = LastEntry::Owned;
         }
     }
+}
+
+/// [`push_element_result`]'s `ManyOwned` arm.
+#[inline(always)]
+fn push_owned_elements<V: DocumentValue>(
+    per_element: &mut Vec<GenericResult<V>>,
+    os: Vec<OwnedValue>,
+    batch: &mut ElementBatch,
+) {
+    if batch.last == LastEntry::Run {
+        if let Some(GenericResult::ManyOwned(run)) = per_element.last_mut() {
+            run.extend(os);
+        }
+    } else {
+        per_element.push(GenericResult::ManyOwned(os));
+        batch.last = LastEntry::Run;
+    }
+}
+
+/// [`push_element_result`]'s arm for every result that is neither empty nor owned.
+#[inline(always)]
+fn push_other_element<V: DocumentValue>(
+    per_element: &mut Vec<GenericResult<V>>,
+    other: GenericResult<V>,
+    remaining: usize,
+    batch: &mut ElementBatch,
+) {
+    if batch.last == LastEntry::Run {
+        if let Some(GenericResult::ManyOwned(run)) = per_element.last_mut() {
+            // A closed run is never extended again: give back its slack, whether it
+            // is the sized run's unused tail or what doubling left after values were
+            // appended (an inner generator's results, `.[] | (.[] | f)`). A small run
+            // keeps up to 16 spare slots, so runs of two or three values between
+            // cursors do not pay a reallocation each.
+            if run.capacity() - run.len() > (run.len() / 8).max(16) {
+                run.shrink_to_fit();
+            }
+        }
+    }
+    if !batch.sized_batch {
+        batch.sized_batch = true;
+        if per_element.len() <= 2 {
+            let mut sized = vec_with_capacity(per_element.len() + remaining);
+            sized.append(per_element);
+            *per_element = sized;
+        }
+    }
+    per_element.push(other);
+    batch.last = LastEntry::Other;
 }
 
 #[cfg(test)]
@@ -14471,8 +14499,17 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
                             elements - i,
                             &mut batch,
                         ),
+                        // Matched here rather than in `push_element_result`, so that each
+                        // result is matched once (#7267 review).
+                        GenericResult::None => {}
+                        GenericResult::Owned(o) => {
+                            push_owned_element(&mut per_element, o, elements - i, &mut batch);
+                        }
+                        GenericResult::ManyOwned(os) => {
+                            push_owned_elements(&mut per_element, os, &mut batch);
+                        }
                         other => {
-                            push_element_result(&mut per_element, other, elements - i, &mut batch);
+                            push_other_element(&mut per_element, other, elements - i, &mut batch);
                         }
                     }
                 }
