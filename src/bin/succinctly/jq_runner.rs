@@ -12086,7 +12086,7 @@ fn hand_on_seq_pipe_tail(args: &JqCommand) -> bool {
         return false;
     };
     crate::jq_seq_reader::seed_token_byte(tail.token_byte);
-    let stream = crate::jq_seq_reader::resumed_stream(tail.lines, tail.bytes);
+    let stream = tail.stream;
     let named = get_input_files(args);
     if let [path] = named.as_slice() {
         let failures = tail
@@ -21932,6 +21932,65 @@ mod tests {
             argv.extend(flags);
             argv.extend([".", big.as_str()]);
             assert!(!takes(&argv), "{flags:?}");
+        }
+    }
+
+    /// #7262: a lone `--seq` file the prepass turns down is read a window at a time up to its first record
+    /// that is not plain, and only from there is it handed to the whole-stream route: the windows give
+    /// every record before that one and none after, and the route is handed the rest behind the front that
+    /// resumes jq's reader, as the file's own bytes, in the buffer it was read into (never copied).
+    #[cfg(unix)]
+    #[test]
+    fn a_lone_seq_file_with_a_bad_record_is_windowed_up_to_it_7262() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut records = Vec::new();
+        let mut count = 0;
+        while records.len() < window::MIN_WINDOWED_FILE_BYTES as usize + 4096 {
+            records.extend_from_slice(format!("\x1e{{\"n\":{count}}}\n").as_bytes());
+            count += 1;
+        }
+        let bad = b"\x1e{\"cut\":\"x\n";
+        for (name, at) in [("last", records.len()), ("middle", records.len() / 2)] {
+            // The fault goes in at the first record from `at`.
+            let at = records[at..]
+                .iter()
+                .position(|&b| b == 0x1e)
+                .map_or(records.len(), |i| at + i);
+            let stream = [&records[..at], &bad[..], &records[at..]].concat();
+            let path = dir.path().join(format!("{name}.seq"));
+            std::fs::write(&path, &stream).expect("written");
+            let path = path.to_string_lossy().into_owned();
+            let cmd = JqCommand::try_parse_from(["jq", "--seq", ".n", path.as_str()]).unwrap();
+            let (files, mut reader, _) = windowed_seq_file(&cmd).expect("windowed up to the fault");
+            let mut values = 0;
+            while let Some((_, window)) = reader.next_window().expect("reads") {
+                values += window.values.len();
+            }
+            let before = stream[..at].iter().filter(|&&b| b == 0x1e).count();
+            assert_eq!(values, before, "{name}");
+            let tail = SEQ_PIPE_TAIL
+                .with(|slot| slot.borrow().clone())
+                .and_then(|slot| slot.borrow_mut().take())
+                .expect("the rest is handed on");
+            let in_place = (tail.stream.as_ptr() as usize, tail.stream.capacity());
+            assert_eq!(in_place, (tail.reserved_at, tail.stream.len()), "{name}");
+            assert_eq!(
+                tail.stream,
+                crate::jq_seq_reader::resumed_stream(before, stream[at..].to_vec()),
+                "{name}"
+            );
+            // The run's hand-off gives that buffer to the whole-file route as the file's bytes.
+            let slot = window::SeqTailSlot::default();
+            *slot.borrow_mut() = Some(tail);
+            SEQ_PIPE_TAIL.with(|tail| *tail.borrow_mut() = Some(slot));
+            assert!(hand_on_seq_pipe_tail(&cmd));
+            let (named, (pushed_files, raws, failures)) = NAMED_PUSHBACK
+                .with(|slot| slot.borrow_mut().take())
+                .expect("pushed back as the file");
+            assert_eq!((&named, &pushed_files), (&files, &files), "{name}");
+            assert!(failures.is_empty(), "{name}");
+            assert_eq!(raws[0].as_ptr() as usize, in_place.0, "{name}: not copied");
         }
     }
 

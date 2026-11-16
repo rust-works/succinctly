@@ -609,10 +609,21 @@ pub(crate) fn resumed_stream(lines: usize, tail: Vec<u8>) -> Vec<u8> {
     if lines == 0 {
         return tail;
     }
-    let mut stream = Vec::with_capacity(1 + lines + tail.len());
-    stream.push(ASCII_RS);
-    stream.resize(1 + lines, b'\n');
+    let mut stream = resumed_front(lines, tail.len());
     stream.extend_from_slice(&tail);
+    stream
+}
+
+/// The front of a [`resumed_stream`] after `lines` line breaks, with room for `tail` more bytes, so a
+/// reader can read the tail straight in behind it rather than read it and copy it (#7262): a tail can be
+/// most of a big stream. Empty for `lines` of 0, where the tail is the stream.
+pub(crate) fn resumed_front(lines: usize, tail: usize) -> Vec<u8> {
+    let front = if lines == 0 { 0 } else { 1 + lines };
+    let mut stream = Vec::with_capacity(front.saturating_add(tail));
+    if lines > 0 {
+        stream.push(ASCII_RS);
+        stream.resize(front, b'\n');
+    }
     stream
 }
 
