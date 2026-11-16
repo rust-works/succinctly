@@ -395,10 +395,16 @@ impl WindowedFile {
         self.drop_consumed();
         let mut grow = self.block;
         let mut first = true;
+        // #7266: a pipe's probe that still holds bytes past the text handed out gives the window,
+        // ending at its last line break within `reach` of it, with no read onto it; a document that
+        // does not end there doubles `reach`, so the probe's buffer is never grown while it lasts
+        // and no window of it is much more than twice the documents it holds. Once the probe is
+        // all validated and a document is still open, the reads are the ones a probe handed out
+        // whole had (a block onto it, then the look-ahead below).
+        let mut reach = self.block;
+        let mut in_front = true;
         loop {
-            // #7266: a pipe's probe that still holds bytes past the text handed out gives the
-            // window, ending at its last line break within a block, with no read onto it.
-            let from_front = first && !self.eof && self.front_end > self.validated;
+            let from_front = in_front && !self.eof && self.front_end > self.validated;
             if from_front {
                 // The read that would have skipped it.
                 self.skip_front_bom();
@@ -406,9 +412,10 @@ impl WindowedFile {
                 self.read_more(grow);
             }
             let before = self.validated;
-            self.validate_lines(from_front.then(|| (self.validated + grow).min(self.front_end)));
+            self.validate_lines(from_front.then(|| (self.validated + reach).min(self.front_end)));
             if from_front && self.validated == before {
                 // What is left of the probe is part of a line: the next read completes it.
+                in_front = false;
                 first = false;
                 continue;
             }
@@ -512,7 +519,10 @@ impl WindowedFile {
             // two scans of a document in all: a document bigger than a window is read on to eight
             // windows once, and past that, which is a file that is one document or has a very big
             // one, for the rest of the file, as the whole-file route reads it.
-            if pending {
+            if pending && from_front {
+                // #7266: more of the probe first; once it is all validated, a block onto it.
+                reach = reach.saturating_mul(2);
+            } else if pending {
                 let lookahead = self.block.saturating_mul(LOOKAHEAD_WINDOWS);
                 grow = if self.buf.len() >= lookahead {
                     self.rest()
@@ -745,9 +755,13 @@ impl WindowedFile {
                 .push(text_start, raw_len, text.len(), edits, raw_edits);
         }
         let new_end = self.validated + text.len();
-        // The probe's bytes after the region move with its end; it is never past them (#7266).
+        // The probe's bytes after the region move with its end (#7266). A region that ends past
+        // them (a line longer than the probe's block, found by the search past `reach`) leaves none
+        // of them to validate: 0 says so, as it does once they are dropped.
         if self.front_end >= end {
             self.front_end = self.front_end - end + new_end;
+        } else if self.front_end > self.validated {
+            self.front_end = 0;
         }
         self.buf.splice(self.validated..end, text);
         self.validated = new_end;
@@ -4477,6 +4491,99 @@ mod pipe_tests {
         );
         // Certified here, over the buffer: no thread was started for it.
         assert!(reader.certifier.as_ref().expect("a pipe").worker.is_none());
+    }
+
+    /// The same over-limit document after a small one (#7106's own shape): the small one is a window of
+    /// its own, which starts the thread, and the big one is then certified here (`certify_here`, after
+    /// the thread's window), with the fault after it worded on a later line, from a window that does
+    /// not start the stream.
+    #[test]
+    fn an_over_limit_window_after_the_thread_started_is_certified_here_7266() {
+        let mut text = b"{\"a\":1}\n[".to_vec();
+        text.extend("1,".repeat(CERTIFIER_COPY_LIMIT).as_bytes());
+        text.extend_from_slice(b"2]\n{\"x\":");
+        let file = tempfile::tempfile().expect("a temp file");
+        let seen = SeenFault::default();
+        let mut reader =
+            WindowedFile::from_pipe(Rc::new(file), text.clone(), None, 4_096, seen.clone());
+        let mut origins = Vec::new();
+        while let Some(window) = reader.next_window().expect("reads") {
+            origins.push((window.origin, window.raw.len()));
+        }
+        assert!(origins.len() >= 2, "{origins:?}");
+        assert!(origins[1].1 > CERTIFIER_COPY_LIMIT, "{origins:?}");
+        assert_ne!(origins.last().expect("windows").0, (1, 0), "{origins:?}");
+        let fault = seen.get();
+        assert_eq!(fault, succinctly::jq::jq_stream_fault([&text[..]], 1, 0));
+        assert!(fault.is_some_and(|fault| fault.contains("line 3")));
+        assert!(reader.certifier.as_ref().expect("a pipe").worker.is_some());
+    }
+
+    /// A document over several lines that does not end within a block of the probe is looked for in
+    /// more of the probe, not read onto it (#7266): the probe's buffer is never grown, and no window is
+    /// much more than twice the documents it holds. Documents back to back from the front of the probe,
+    /// and one starting partway in that ends near the probe's end, each among one-line records.
+    #[test]
+    fn a_document_over_several_lines_in_the_probe_is_not_read_onto_7266() {
+        let block = 1_000;
+        let pretty = |id: usize, len: usize| {
+            let mut doc = format!("{{\"id\":{id},\"v\":[\n");
+            while doc.len() < len {
+                doc.push_str(" 12345,\n");
+            }
+            doc.push_str(" 0]}\n");
+            doc
+        };
+        let record = "{\"id\":1,\"name\":\"n\"}\n";
+        let back_to_back: String = (0..3).map(|id| pretty(id, 1_400)).collect();
+        let partway = format!(
+            "{}{}{}",
+            record.repeat(60),
+            pretty(9, 2_500),
+            record.repeat(10)
+        );
+        for (shape, front, longest) in [
+            (back_to_back, 4 * block, 1_400),
+            (partway, 4 * block, 2_500),
+        ] {
+            let mut text = shape.into_bytes();
+            text.extend(record.repeat(400).as_bytes());
+            let mut file = tempfile::tempfile().expect("a temp file");
+            file.write_all(&text).expect("written");
+            file.seek(SeekFrom::Start(front as u64)).expect("seeked");
+            let probe = text[..front].to_vec();
+            let capacity = probe.capacity();
+            let seen = SeenFault::default();
+            let mut reader =
+                WindowedFile::from_pipe(Rc::new(file), probe, None, block, seen.clone());
+            let (run, peak) = drain(&mut reader);
+            assert!(
+                peak <= 2 * (longest + 8) + block + 2 * record.len(),
+                "longest {longest}: window of {peak}"
+            );
+            assert_eq!(reader.buf.capacity(), capacity, "longest {longest}: grown");
+            assert_eq!(seen.get(), None);
+            assert_eq!(run, as_file(&text, block).0, "longest {longest}");
+        }
+    }
+
+    /// The probe's bytes move with a substitution in a window made of them (#7266): while nothing has
+    /// been read onto the probe, they end where the buffer does.
+    #[test]
+    fn a_substitution_in_the_probe_moves_where_it_ends_7266() {
+        let mut text = Vec::new();
+        for i in 0..300 {
+            text.extend_from_slice(format!("{{\"i\":{i},\"s\":\"").as_bytes());
+            text.extend_from_slice(b"\xff\xfe");
+            text.extend_from_slice(b"\"}\n");
+        }
+        let file = tempfile::tempfile().expect("a temp file");
+        let seen = SeenFault::default();
+        let mut reader = WindowedFile::from_pipe(Rc::new(file), text.clone(), None, 1_000, seen);
+        let window = reader.next_window().expect("reads").expect("a window");
+        assert!(window.substituted);
+        assert!(window.raw.len() < text.len());
+        assert_eq!(reader.front_end, reader.buf.len());
     }
 
     /// Where no thread could be started every window is certified on the filter's own thread, and the
