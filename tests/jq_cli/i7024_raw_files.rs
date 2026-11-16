@@ -11,10 +11,11 @@
 
 #![cfg(unix)]
 
-use std::io::Write;
 use std::process::Command;
 
 use anyhow::Result;
+
+use crate::fifo_feed::{self, Feed};
 
 /// stdout, stderr and the exit status of a run (shared with `i7024_inputs_files`).
 pub(crate) type Run = (String, String, i32);
@@ -28,38 +29,24 @@ fn finish(output: &std::process::Output) -> Run {
 }
 
 /// The run over `paths` on the route that reads them whole: each file as a named pipe a thread fills
-/// with its bytes. A pipe the run never opened is opened once it exits, so its writer ends.
+/// with its bytes. The pipes, and the deadline the run is held to, are `fifo_feed`'s (#7304).
 fn whole(args: &[&str], paths: &[std::path::PathBuf]) -> Result<Run> {
     let dir = tempfile::tempdir()?;
     let mut pipes = Vec::new();
-    let mut writers = Vec::new();
+    let mut feeds = Vec::new();
     for (n, path) in paths.iter().enumerate() {
         let pipe = dir.path().join(format!("p{n:02}"));
-        assert!(Command::new("mkfifo").arg(&pipe).status()?.success());
-        let bytes = std::fs::read(path)?;
-        let target = pipe.clone();
-        writers.push((
-            pipe.clone(),
-            std::thread::spawn(move || {
-                if let Ok(mut out) = std::fs::OpenOptions::new().write(true).open(&target) {
-                    let _ = out.write_all(&bytes);
-                }
-            }),
-        ));
+        feeds.push(Feed::new(pipe.clone(), std::fs::read(path)?));
         pipes.push(pipe);
     }
-    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .arg("jq")
-        .args(args)
-        .args(&pipes)
-        .env("LC_ALL", "C")
-        .output()?;
-    for (pipe, writer) in writers {
-        if !writer.is_finished() {
-            drop(std::fs::File::open(&pipe));
-        }
-        writer.join().expect("the writer ends");
-    }
+    let output = fifo_feed::output(
+        Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .arg("jq")
+            .args(args)
+            .args(&pipes)
+            .env("LC_ALL", "C"),
+        &feeds,
+    )?;
     let (mut stdout, mut stderr, status) = finish(&output);
     for (pipe, path) in pipes.iter().zip(paths) {
         let (pipe, path) = (pipe.display().to_string(), path.display().to_string());

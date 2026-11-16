@@ -273,23 +273,27 @@ fn a_document_past_the_depth_limit_is_refused_where_it_is_6920() -> Result<()> {
 fn a_named_pipe_still_delivers_its_bytes_6920() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let fifo = dir.path().join("pipe");
-    assert!(std::process::Command::new("mkfifo")
-        .arg(&fifo)
-        .status()?
-        .success());
-    let writer_path = fifo.clone();
-    let writer = std::thread::spawn(move || {
-        // Written after the reader has had time to be started: a gate that opened the pipe and dropped
-        // it would have paired with this open and closed it on the writer.
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        std::fs::write(&writer_path, b"{\"a\":1}\n{\"a\":2}\n")
-    });
-    let path = fifo.to_string_lossy().into_owned();
-    let (output, status) = spawn_jq(&["-c", ".a", &path], None)?;
-    writer.join().expect("writer thread")?;
+    // Written after the reader has had time to be started: a gate that opened the pipe and dropped it
+    // would have paired with this open and closed it on the writer. The pipe and the run's deadline are
+    // `fifo_feed`'s (#7304).
+    let feed = crate::fifo_feed::Feed::after(
+        fifo.clone(),
+        b"{\"a\":1}\n{\"a\":2}\n".to_vec(),
+        std::time::Duration::from_millis(300),
+    );
+    let output = crate::fifo_feed::output(
+        std::process::Command::new(crate::succinctly_bin())
+            .args(["jq", "-c", ".a"])
+            .arg(&fifo)
+            .env("LC_ALL", "C"),
+        std::slice::from_ref(&feed),
+    )?;
     assert_eq!(
-        (String::from_utf8_lossy(&output.stdout).as_ref(), status),
-        ("1\n2\n", 0)
+        (
+            String::from_utf8_lossy(&output.stdout).as_ref(),
+            output.status.code()
+        ),
+        ("1\n2\n", Some(0))
     );
     Ok(())
 }
