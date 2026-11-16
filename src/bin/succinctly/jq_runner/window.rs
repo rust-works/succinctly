@@ -3202,7 +3202,7 @@ mod tests {
             let after = onto.next_window_after(None, prefix.clone(), |_| ());
             match (window, after) {
                 (Some(window), Ok(after)) => {
-                    assert_eq!(after, [prefix.as_slice(), &window].concat())
+                    assert_eq!(after, [prefix.as_slice(), &window].concat());
                 }
                 (None, Err(back)) => {
                     assert_eq!(back, prefix);
