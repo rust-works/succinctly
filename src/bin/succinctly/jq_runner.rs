@@ -11629,12 +11629,24 @@ fn windowed_seq_file(args: &JqCommand) -> Option<WindowedSource> {
 /// the whole-file route's still: what a tail mid-file means for the files after it is not worked out.
 #[cfg(unix)]
 fn gated_seq_source(files: Vec<PathBuf>) -> Option<WindowedSource> {
-    let file = match files.as_slice() {
+    use std::io::Seek;
+    let mut file = match files.as_slice() {
         // A duplicate of descriptor 0, at the offset the prepass (which reads by position) left alone.
         [] => stdin_to_window()?.0,
         [path] => std::fs::File::open(path).ok()?,
         _ => return None,
     };
+    // A file the whole-file route could not hold (a sparse file of terabytes) is that route's to report,
+    // as it reads it before it runs anything (`Could not open file ...: out of memory`): read here, the
+    // records before the bad one would be run first.
+    let left = file
+        .metadata()
+        .ok()?
+        .len()
+        .saturating_sub(file.stream_position().ok()?);
+    if !could_hold(left) {
+        return None;
+    }
     let slot = window::SeqTailSlot::default();
     SEQ_PIPE_TAIL.with(|tail| *tail.borrow_mut() = Some(std::rc::Rc::clone(&slot)));
     Some((
@@ -11652,6 +11664,14 @@ fn gated_seq_source(files: Vec<PathBuf>) -> Option<WindowedSource> {
 #[cfg(not(unix))]
 fn gated_seq_source(_files: Vec<PathBuf>) -> Option<WindowedSource> {
     None
+}
+
+/// Whether `len` bytes can be allocated, as the whole-file route allocates a file it reads
+/// (`std::fs::read` reserves the file's length at once and fails, not aborts, when it cannot). The room
+/// is given back at once.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn could_hold(len: u64) -> bool {
+    usize::try_from(len).is_ok_and(|len| Vec::<u8>::new().try_reserve_exact(len).is_ok())
 }
 
 /// The regular files the plain route reads a window at a time (#6920), opened, and the means to read
@@ -21935,6 +21955,38 @@ mod tests {
         }
     }
 
+    /// #7262: a lone `--seq` file the whole-file route could not hold is that route's, which reports it before
+    /// it runs a record, rather than read a window at a time up to its bad record: a sparse file of 64 TiB,
+    /// where the file system allows one (APFS and ext4 do not agree on the largest file; the case is skipped
+    /// where `set_len` refuses it), and an injected length no allocation can hold.
+    #[cfg(unix)]
+    #[test]
+    fn a_seq_file_too_big_to_hold_is_left_to_the_whole_file_route_7262() {
+        use clap::Parser;
+        assert!(could_hold(1 << 20));
+        assert!(!could_hold(u64::MAX));
+        assert!(!could_hold(isize::MAX as u64 + 1));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sparse.seq");
+        let mut bytes = b"\x1e{\"id\":0}\n\x1e{\"cut\n".to_vec();
+        for n in 1..=600_000 {
+            bytes.extend_from_slice(format!("\x1e{{\"id\":{n}}}\n").as_bytes());
+        }
+        std::fs::write(&path, &bytes).expect("written");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("opened");
+        let huge = 64u64 << 40;
+        if file.set_len(huge).is_err() || could_hold(huge) {
+            return;
+        }
+        let path = path.to_string_lossy().into_owned();
+        let cmd = JqCommand::try_parse_from(["jq", "--seq", "-c", ".id", path.as_str()]).unwrap();
+        assert!(windowed_seq_file(&cmd).is_none());
+        assert!(SEQ_PIPE_TAIL.with(|slot| slot.borrow().is_none()));
+    }
+
     /// #7262: a lone `--seq` file the prepass turns down is read a window at a time up to its first record
     /// that is not plain, and only from there is it handed to the whole-stream route: the windows give
     /// every record before that one and none after, and the route is handed the rest behind the front that
@@ -21975,6 +22027,11 @@ mod tests {
                 .expect("the rest is handed on");
             let in_place = (tail.stream.as_ptr() as usize, tail.stream.capacity());
             assert_eq!(in_place, (tail.reserved_at, tail.stream.len()), "{name}");
+            assert_eq!(
+                tail.reserved_room,
+                tail.stream.len(),
+                "{name}: room reserved first"
+            );
             assert_eq!(
                 tail.stream,
                 crate::jq_seq_reader::resumed_stream(before, stream[at..].to_vec()),

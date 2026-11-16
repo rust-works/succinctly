@@ -960,9 +960,13 @@ pub(super) struct SeqTail {
     /// The byte the records before it left at index 1 of jq's token buffer
     /// ([`crate::jq_seq_reader::token_byte_after`]).
     pub token_byte: Option<u8>,
-    /// Where `stream` was first allocated, so a test can tell the tail was read into it in place.
+    /// Where `stream` was first allocated, and the room it had before the tail was read, so a test can
+    /// tell the tail was read into it in place (a pointer alone does not: a large buffer can be grown in
+    /// place by `mremap` on Linux).
     #[cfg(test)]
     pub reserved_at: usize,
+    #[cfg(test)]
+    pub reserved_room: usize,
 }
 
 /// Where a `--seq` pipe leaves its [`SeqTail`] for the run, which takes it once the windows are out.
@@ -1128,7 +1132,7 @@ impl WindowedFile {
         };
         let mut bytes = crate::jq_seq_reader::resumed_front(lines, self.buf.len() - at + left);
         #[cfg(test)]
-        let reserved_at = bytes.as_ptr() as usize;
+        let (reserved_at, reserved_room) = (bytes.as_ptr() as usize, bytes.capacity());
         bytes.extend_from_slice(&self.buf[at..]);
         // The windows' buffer keeps only the text still to be handed out, so the run does not hold its
         // room beside the tail.
@@ -1147,6 +1151,8 @@ impl WindowedFile {
         *gate.slot.borrow_mut() = Some(SeqTail {
             #[cfg(test)]
             reserved_at,
+            #[cfg(test)]
+            reserved_room,
             stream: bytes,
             error,
             token_byte: gate.token_byte,
@@ -2734,6 +2740,7 @@ mod tests {
                                         (handed.reserved_at, handed.stream.len()),
                                         "{case}"
                                     );
+                                    assert_eq!(handed.reserved_room, handed.stream.len(), "{case}");
                                 }
                             }
                         }
