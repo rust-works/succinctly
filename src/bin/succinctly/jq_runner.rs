@@ -11609,7 +11609,21 @@ fn windowed_seq_file(args: &JqCommand) -> Option<WindowedSource> {
             reread,
         ));
     }
-    if !reread.is_plain_seq_records() {
+    let plain = reread.plain_seq_files();
+    if files.len() > 1 && (1..files.len()).contains(&plain) {
+        // #7279: several files the run holds, the first `plain` of them plain records ending in an LF: those
+        // are read a window at a time, and from the first that is not the stream is the whole-file
+        // route's, as for a long list ([`hand_on_seq_files_tail`]).
+        let slot = window::SeqFilesTailSlot::default();
+        SEQ_FILES_TAIL.with(|tail| *tail.borrow_mut() = Some(std::rc::Rc::clone(&slot)));
+        reread.blank_rs();
+        return Some((
+            files,
+            reader.blanking_rs().stopping_seq_files_at(slot, plain),
+            reread,
+        ));
+    }
+    if plain < files.len().max(1) {
         // #7262: a lone source the prepass turns down is read as a `--seq` pipe is (#7164), up to its first
         // record that is not plain, so one bad record does not cost the whole stream its windows.
         drop(reader);
@@ -22218,7 +22232,11 @@ mod tests {
             let gated = SEQ_PIPE_TAIL
                 .with(|tail| tail.borrow_mut().take())
                 .is_some();
-            (windowed && !gated, windowed && gated)
+            // #7279: several files read a window at a time up to the first that is not plain.
+            let stops = SEQ_FILES_TAIL
+                .with(|tail| tail.borrow_mut().take())
+                .is_some();
+            (windowed && !gated && !stops, windowed && gated)
         };
         let takes = |argv: &[&str]| route(argv).0;
         let gates = |argv: &[&str]| route(argv).1;
@@ -22284,6 +22302,32 @@ mod tests {
         let cut = write("cut.seq", &records[..records.len() - 1]);
         assert!(!takes(&["jq", "--seq", ".", &good, &cut]));
         assert!(!takes(&["jq", "--seq", ".", &cut, &good]));
+        // #7279: the files before the first that is not are read a window at a time, and from that one
+        // the stream is the whole-file route's ([`hand_on_seq_files_tail`]); a list whose first file is
+        // not plain is that route's from its start.
+        let stops_at = |argv: &[&str]| {
+            let cmd = JqCommand::try_parse_from(argv.iter().copied()).unwrap();
+            let (_, mut reader, _) = windowed_seq_file(&cmd)?;
+            let mut values = 0;
+            while let Some((_, window)) = reader.next_window().expect("reads") {
+                values += window.values.len();
+            }
+            let tail = SEQ_FILES_TAIL
+                .with(|slot| slot.borrow_mut().take())
+                .and_then(|slot| slot.borrow_mut().take())
+                .expect("stopped at a file");
+            Some((values, tail.index, tail.lines))
+        };
+        let lines = records.iter().filter(|&&b| b == b'\n').count();
+        assert_eq!(
+            stops_at(&["jq", "--seq", ".", &good, &cut]),
+            Some((n, 1, lines))
+        );
+        assert_eq!(
+            stops_at(&["jq", "--seq", ".", &good, &good, &cut, &good]),
+            Some((2 * n, 2, 2 * lines))
+        );
+        assert_eq!(stops_at(&["jq", "--seq", ".", &cut, &good]), None);
         // ... and not read as a pipe is either: a lone source only.
         assert!(!gates(&["jq", "--seq", ".", &good, &cut]));
         assert!(gates(&["jq", "--seq", ".", &cut]));

@@ -1084,6 +1084,10 @@ pub(super) type SeqFilesTailSlot = Rc<std::cell::RefCell<Option<SeqFilesTail>>>;
 struct SeqFilesCheck {
     slot: SeqFilesTailSlot,
     token_byte: Option<u8>,
+    /// For files the run holds (#7279): the position of the first that the prepass found is not plain
+    /// records ending in an LF. The files before it are vouched for and are not judged again, and the
+    /// stream ends before it.
+    stop_at: Option<usize>,
 }
 
 /// The certification of a `--seq` pipe's records (#7164), which decides what of the stream is read a window
@@ -1817,6 +1821,21 @@ impl WindowedFiles {
         self.seq_files = Some(SeqFilesCheck {
             slot,
             token_byte: None,
+            stop_at: None,
+        });
+        self
+    }
+
+    /// The same for a `--seq` list of files the run holds (#7279), where the prepass found the first that is
+    /// not plain records ending in an LF at position `stop_at` ([`Reread::plain_seq_files`]): the files
+    /// before it are read a window at a time, and the stream ends before it, which goes to `slot` with the
+    /// rest, as a list opened by path goes from the first file it judges not plain.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(super) fn stopping_seq_files_at(mut self, slot: SeqFilesTailSlot, stop_at: usize) -> Self {
+        self.seq_files = Some(SeqFilesCheck {
+            slot,
+            token_byte: None,
+            stop_at: Some(stop_at),
         });
         self
     }
@@ -1884,7 +1903,29 @@ impl WindowedFiles {
                     let index = self.next_index;
                     let (file, len) = match self.pending.next() {
                         None => return Ok(false),
-                        Some(StreamFile::Held(file, len)) => (file, len),
+                        Some(StreamFile::Held(file, len)) => {
+                            if let Some(check) = &mut self.seq_files {
+                                // #7279: vouched for by the prepass up to `stop_at`, so only the byte
+                                // its records leave in jq's token buffer is read (from its end); a read
+                                // that fails stops the stream here instead, before the file.
+                                let byte = (check.stop_at != Some(index))
+                                    .then(|| seq_token_byte_in(&file, len).ok())
+                                    .flatten();
+                                match byte {
+                                    Some(byte) => check.token_byte = byte.or(check.token_byte),
+                                    None => {
+                                        *check.slot.borrow_mut() = Some(SeqFilesTail {
+                                            index,
+                                            lines: self.end_origin.0 - 1,
+                                            token_byte: check.token_byte,
+                                        });
+                                        self.pending = Vec::new().into_iter();
+                                        return Ok(false);
+                                    }
+                                }
+                            }
+                            (file, len)
+                        }
                         Some(StreamFile::Named(named)) => match named.open_for_run() {
                             Ok((file, len)) => {
                                 if let Some(check) = &mut self.seq_files {
@@ -2425,29 +2466,52 @@ impl Reread {
     /// The memory is a chunk and the biggest record. The first and last bytes are asked of first, so a
     /// stream that is not framed at all is turned down by two reads, not by a pass over it. Several files
     /// are vouched for when each one is (#7218).
+    ///
+    /// #7218: several files are one stream, so they are plain records when each is, on its own, and
+    /// each ends in an LF: the join of two such files is `... LF RS ...`, which is framed as it is
+    /// inside one. A file that is not (no RS to start, a cut-short record, no final LF, or none at
+    /// all) is left to the whole-file route, which walks the join as jq's reader does. A file the
+    /// run opens by its path when it reaches it ([`NamedFile`], a long list) is not read here: the
+    /// prepass would read what the path names now and the run what it names then. The run asks
+    /// [`Self::plain_seq_files`], of which this is the verdict for every file.
     #[cfg(unix)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn is_plain_seq_records(&self) -> bool {
-        // #7218: several files are one stream, so they are plain records when each is, on its own, and
-        // each ends in an LF: the join of two such files is `... LF RS ...`, which is framed as it is
-        // inside one. A file that is not (no RS to start, a cut-short record, no final LF, or none at
-        // all) is left to the whole-file route, which walks the join as jq's reader does. A file the
-        // run opens by its path when it reaches it ([`NamedFile`], a long list) is not read here: the
-        // prepass would read what the path names now and the run what it names then.
-        let held = |check: &dyn Fn(&File, u64, u64) -> bool| {
-            !self.sources.is_empty()
-                && self.sources.iter().all(|source| match &source.file {
-                    RereadFile::Held(file) => check(file, source.start, source.len),
-                    RereadFile::Named(_) => false,
-                })
-        };
-        // The ends of every file first, so a file that is not framed at all is turned down by two reads
-        // each and not after a pass over the files before it.
-        held(&plain_seq_ends_in) && held(&plain_seq_records_in)
+        !self.sources.is_empty() && self.plain_seq_files() == self.sources.len()
+    }
+
+    /// How many of the files, from the first, [`Self::is_plain_seq_records`] vouches for one by one
+    /// (#7279): plain records ending in an LF. All of them is the plain stream; fewer is a stream whose
+    /// files before the first that is not can still be read a window at a time. 0 for a list of files
+    /// the run opens by path, or none.
+    #[cfg(unix)]
+    pub(super) fn plain_seq_files(&self) -> usize {
+        let held =
+            |source: &RereadSource, check: &dyn Fn(&File, u64, u64) -> bool| match &source.file {
+                RereadFile::Held(file) => check(file, source.start, source.len),
+                RereadFile::Named(_) => false,
+            };
+        // The ends first, as above: a file that is not framed at all stops the count with two reads.
+        let ends = self
+            .sources
+            .iter()
+            .take_while(|source| held(source, &plain_seq_ends_in))
+            .count();
+        self.sources[..ends]
+            .iter()
+            .take_while(|source| held(source, &plain_seq_records_in))
+            .count()
     }
 
     #[cfg(not(unix))]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn is_plain_seq_records(&self) -> bool {
         false
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn plain_seq_files(&self) -> usize {
+        0
     }
 
     /// Whether the run opens every file by its path when it reaches it ([`NamedFile`], a long list):
