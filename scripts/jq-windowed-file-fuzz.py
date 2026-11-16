@@ -30,7 +30,9 @@ a window's end, the 4 MiB probe's or the stream's): a record jq's reader warns a
 text before an RS, a value with two documents, a bare `n` after a token that left a `u` in jq's token buffer,
 a stream that ends without its line break. From the first turn on the route reads the stream whole, so these
 cases test that hand-over, against the same bytes on a pipe named `-` (`/dev/stdin` reads a `--seq` stream
-that starts with a BOM as no records). (The seeds of #7048's runs do not reproduce: the generator
+that starts with a BOM as no records). `--seq` alone runs the same streams from one regular file (#7262), named
+(against the file as a descriptor) or on standard input from an offset (against the bytes from there on a pipe
+named `-`): a file the prepass cannot vouch for is read as the pipe is, up to its first record that is not plain. (The seeds of #7048's runs do not reproduce: the generator
 now cuts the stream into files and picks among more programs.)
 
 The streams mix the shapes that decide where a window ends: documents of every kind, pretty-printed ones that
@@ -390,16 +392,20 @@ def run_files(args, rng, data, case, program, work, seed):
 
 def run_stdin_file(args, rng, data, program, work, seed):
     """One `-R` case on a regular file on standard input (#7024): windowed (the file, from an offset) and
-    whole (the bytes from there on a pipe named `/dev/stdin`), compared."""
-    # Any offset that leaves the minimum to read, so the windowed side stays windowed.
+    whole (the bytes from there on a pipe named `/dev/stdin`, or `-` under `--seq`, #7262), compared."""
+    # Any offset that leaves the minimum to read, so the windowed side stays windowed; a `--seq` stream from
+    # an offset at a record's start (#7262) as often as not, so that it can still be plain records.
     offset = 0 if rng.random() < 0.6 else rng.randrange(len(data) - MIN_BYTES + 1)
+    if args.seq and offset and rng.random() < 0.5:
+        found = data.find(b"\x1e", offset)
+        offset = offset if found < 0 or len(data) - found < MIN_BYTES else found
     name = os.path.join(work, "windowed-fuzz-%d-stdin.json" % seed)
     with open(name, "wb") as handle:
         handle.write(data)
     with open(name, "rb") as handle:
         handle.seek(offset)
         windowed = run(args.bin, program, args.cap_mb, stdin=handle)
-    whole = run(args.bin, program + ["/dev/stdin"], args.cap_mb, feed=data[offset:])
+    whole = run(args.bin, program + ["-" if args.seq else "/dev/stdin"], args.cap_mb, feed=data[offset:])
     whole = tuple(part.replace(b"/dev/stdin", b"<stdin>") if isinstance(part, bytes) else part for part in whole)
     return windowed, whole, ["<stdin from %d>" % offset], [len(data) - offset]
 
@@ -428,8 +434,9 @@ def main():
     parser.add_argument("--raw", action="store_true",
                         help="run -R programs (#7024): on a pipe with --pipe, else as a regular file on standard input")
     parser.add_argument("--seq", action="store_true",
-                        help="run --seq programs over --seq streams on a pipe (#7164), or cut into --files K files "
-                             "(#7218, #7221), most at a record's start so each file is plain records")
+                        help="run --seq programs over --seq streams on a pipe (#7164), cut into --files K files "
+                             "(#7218, #7221), most at a record's start so each file is plain records, or in one "
+                             "regular file, named or on standard input (#7262)")
     parser.add_argument("--inputs", action="store_true",
                         help="run programs that read input/inputs over --files files, 2 to 32 (#7024)")
     args = parser.parse_args()
@@ -441,8 +448,6 @@ def main():
         sys.exit("--inputs is neither --raw nor --pipe")
     if args.seq and (args.raw or args.inputs):
         sys.exit("--seq is a stream on a pipe (--pipe) or in files (--files K, #7218): neither --raw nor --inputs")
-    if args.seq and not args.pipe and args.files < 2:
-        sys.exit("--seq is a stream on a pipe or in several files: give --pipe or --files 2 to 512")
     if args.pipe and args.files != 1:
         sys.exit("--pipe is one stream: give no --files")
     if not 1 <= args.files <= 512:
@@ -467,7 +472,7 @@ def main():
         else:
             program = rng.choice(PROGRAMS if args.pipe else PROGRAMS + FILE_PROGRAMS * 2)
         try:
-            if args.raw and not args.pipe and args.files == 1:
+            if not args.pipe and args.files == 1 and (args.raw or (args.seq and rng.random() < 0.5)):
                 windowed, whole, names, sizes = run_stdin_file(args, rng, data, program, work, args.seed)
             elif args.pipe:
                 windowed, whole, names, sizes = run_pipe(args, data, program)
@@ -486,7 +491,7 @@ def main():
             differences += 1
             kept = [os.path.join(work, "windowed-fuzz-%d-%d-%d.json" % (args.seed, case, n))
                     for n in range(len(names))]
-            if args.pipe or (args.raw and args.files == 1):
+            if args.pipe or names[0].startswith("<stdin"):
                 with open(kept[0], "wb") as handle:
                     handle.write(data)
             else:

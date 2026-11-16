@@ -117,7 +117,8 @@ use super::tail_call::{
     Tail, TailRounds,
 };
 use super::value::{
-    owned_value_eq, subarray_indices, NumberRepr, ObjectMapOf, OwnedValue, Teardown,
+    jq_literal_int_to_f64, owned_value_eq, subarray_indices, NumberRepr, ObjectMapOf, OwnedValue,
+    Teardown,
 };
 
 /// Recursion-depth ceiling for [`to_owned`]/[`to_owned_cursor`]/
@@ -30966,22 +30967,101 @@ fn key_elements_generic<S: EvalSemantics, V: DocumentValue>(
     Ok(keyed)
 }
 
+/// A document number's value as [`to_owned_cursor`] would build it, read without building it
+/// (#7278): the repr of the `OwnedValue::NumberLiteral` it would make, and whether its spelling is
+/// a negative zero (`-0`, whose sign only the text carries). The spelling itself is not copied:
+/// a fold that only reads the value (`add`, the `min`/`max` walk) never needs it, and the document
+/// still holds it for the one that does.
+///
+/// `None` for everything else, which the caller decodes as before: a non-number, a jq-mode
+/// spelling the plain parse does not read (`.inf`, `0x1f`), a bridge's computed number (bare, not a
+/// literal), a tagged or JSON-sourced YAML scalar, and any value outside jq mode. It follows
+/// `to_owned_cursor`'s scalar route step for step (no tag, no canonicalized numbers, the bridge's
+/// computed numbers first, `number_literal`, then `OwnedValue::from_number_literal`'s own
+/// non-finite gate and parse), and `borrowed_number_matches_the_decode_7278` checks it against that
+/// route. The caller asks only while no `as` binding is in scope (`to_owned_cursor`'s first test).
+struct BorrowedNumber {
+    repr: NumberRepr,
+    negative_zero: bool,
+}
+
+fn borrowed_document_number<S: EvalSemantics, C: DocumentCursor>(
+    cursor: &C,
+) -> Option<BorrowedNumber> {
+    if S::TAG != EvalTag::Jq || cursor.explicit_tag().is_some() || cursor.canonicalize_numbers() {
+        return None;
+    }
+    let value = cursor.value();
+    if value.bridge_computed_int().is_some() || value.bridge_computed_float().is_some() {
+        return None;
+    }
+    let literal = value.number_literal()?;
+    if literal.len() <= 5
+        && matches!(literal.as_bytes().first(), Some(b'.' | b'+' | b'-'))
+        && crate::yaml::nonfinite_literal_value(&literal).is_some()
+    {
+        return None;
+    }
+    let repr = crate::jq::value::parse_i64_or_f64_in::<S>(&literal)?;
+    Some(BorrowedNumber {
+        repr,
+        negative_zero: matches!(repr, NumberRepr::Int(0)) && literal.starts_with('-'),
+    })
+}
+
+/// The tie-break of two document numbers' literal comparison: their spellings, read off the
+/// document, compared as exact decimals ([`crate::jq::value::cmp_literal_texts`]). Both cursors
+/// were keyed by [`borrowed_document_number`] or `plain_int_at`, so both are number tokens.
+fn literal_spellings_cmp<C: DocumentCursor>(a: &C, b: &C) -> core::cmp::Ordering {
+    let (a, b) = (a.value(), b.value());
+    match (a.number_literal(), b.number_literal()) {
+        (Some(a), Some(b)) => crate::jq::value::cmp_literal_texts(&a, &b),
+        _ => unreachable!("both keys were read off a number token"), // patchcov: coverage tolerate-line reason="unreachable: a key is a bare number only when its cursor's `number_literal` answered (#7278)"
+    }
+}
+
+/// How many times [`extremum_streaming_generic`] ran on this thread, so a test can assert that bare
+/// `min`/`max` take that walk (#7261): its dispatch once sat in an arm they never reach, and every
+/// answer stayed right while each element's cursor and key were collected first. `cfg(test)` only.
+#[cfg(test)]
+pub(crate) mod extremum_walk_count {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn bump() {
+        COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn get() -> usize {
+        COUNT.with(Cell::get)
+    }
+}
+
 /// jq's bare `min`/`max` over an array, as a single walk that keeps the winner so far (#5683).
 ///
 /// Every element is checked and keyed exactly as `collect_cursors_checked` followed by
 /// `key_elements_generic` does it (the #1677/#2261 delimiter checks, `to_owned_cursor`'s checked
 /// conversion), and the winner is the element itself, a cursor, so a duplicate key it holds is not
 /// collapsed (#1687). The first of equal minima and the last of equal maxima win, which is what
-/// `Iterator::min_by`/`max_by` did to the keyed vector. The one difference is which of two faults
-/// in the same array is reported when it has both: this walk meets them in document order.
+/// `Iterator::min_by`/`max_by` did to the keyed vector.
+///
+/// A document number is keyed by its parsed value alone ([`borrowed_document_number`]), not decoded
+/// into an `OwnedValue` with an owned copy of its spelling (#7278): only a double tie between two
+/// such keys reads the two spellings, off the document, as jq's exact literal comparison does.
 fn extremum_streaming_generic<S: EvalSemantics, V: DocumentValue>(
     elements: V::Elements,
     want_max: bool,
     optional: bool,
 ) -> GenericResult<V> {
-    /// The winner's key: a plain integer is held bare, anything else as the decoded value.
+    #[cfg(test)]
+    extremum_walk_count::bump();
+    /// The winner's key: a document number is held as its literal's double and `i64` (the parts
+    /// jq's literal comparison reads first), anything else as the decoded value.
     enum Key {
-        Int(i64),
+        Number(f64, Option<i64>),
         Owned(OwnedValue),
     }
     // The delimiter fault of this array, suppressed by `optional` as `owned_or_suppress!` does.
@@ -30994,8 +31074,8 @@ fn extremum_streaming_generic<S: EvalSemantics, V: DocumentValue>(
         }
     };
     // Nothing the walk does changes the table, so it is asked once: while a binding's embedded
-    // node could be handed back instead of a decoded copy (`to_owned_cursor`'s own first test) the
-    // integer read is not taken.
+    // node could be handed back instead of a decoded copy (`to_owned_cursor`'s own first test) no
+    // number is read bare.
     let table_live = embed_table::live();
     let mut winner: Option<(Key, V::Cursor)> = None;
     let mut last: Option<V::Cursor> = None;
@@ -31017,9 +31097,18 @@ fn extremum_streaming_generic<S: EvalSemantics, V: DocumentValue>(
             None
         } else {
             pos.and_then(|pos| cursor.plain_int_at(pos))
+                .map(|i| Key::Number(jq_literal_int_to_f64(i), Some(i)))
+                .or_else(|| {
+                    // A NaN literal keeps the decoded comparison and its NaN rules (#6008).
+                    borrowed_document_number::<S, _>(&cursor).and_then(|number| match number.repr {
+                        NumberRepr::Int(i) => Some(Key::Number(jq_literal_int_to_f64(i), Some(i))),
+                        NumberRepr::Float(f) if f.is_nan() => None,
+                        NumberRepr::Float(f) => Some(Key::Number(f, None)),
+                    })
+                })
         };
-        let key = match fast {
-            Some(i) => Key::Int(i),
+        let mut key = match fast {
+            Some(key) => key,
             // STYLE-0012: raises regardless of `optional`, as `key_elements_generic`'s bare arm
             // does (see its comment): `to_owned_cursor` raises only decode failures, which
             // `suppresses` never suppresses, so routing it would be a guaranteed no-op.
@@ -31028,14 +31117,41 @@ fn extremum_streaming_generic<S: EvalSemantics, V: DocumentValue>(
                 Err(error) => return GenericResult::Error(error),
             },
         };
-        let replaces = match winner.as_ref() {
+        let replaces = match winner.as_mut() {
             None => true,
-            Some((best, _)) => {
-                let order = match (&key, best) {
-                    (Key::Int(a), Key::Int(b)) => a.cmp(b),
-                    (Key::Int(a), Key::Owned(b)) => compare_values::<S>(&OwnedValue::Int(*a), b),
-                    (Key::Owned(a), Key::Int(b)) => compare_values::<S>(a, &OwnedValue::Int(*b)),
+            Some((best, best_cursor)) => {
+                // Two document numbers compare as jq compares two literals: integers by value,
+                // otherwise by double, and a double tie by the exact decimals, read off the
+                // document only then (`[123456789012345679,123456789012345678.9] | min` is the
+                // fraction in jq 1.7.1, where the doubles are equal, #7261). Against a decoded
+                // element the bare side is decoded too, so the pair compares as `compare_values`
+                // compares any two values.
+                let upgrade = |side: &mut Key, at: &V::Cursor| -> Result<(), EvalError> {
+                    if matches!(side, Key::Number(..)) {
+                        // STYLE-0012: the same unsuppressible decode as the key above (a number
+                        // read bare never fails it); the caller raises it regardless of `optional`.
+                        *side = Key::Owned(to_owned_cursor::<S, _>(at)?);
+                    }
+                    Ok(())
+                };
+                if matches!(
+                    (&key, &*best),
+                    (Key::Number(..), Key::Owned(_)) | (Key::Owned(_), Key::Number(..))
+                ) {
+                    if let Err(error) =
+                        upgrade(&mut key, &cursor).and_then(|()| upgrade(best, best_cursor))
+                    {
+                        return GenericResult::Error(error);
+                    }
+                }
+                let order = match (&key, &*best) {
+                    (Key::Number(a, ai), Key::Number(b, bi)) => {
+                        crate::jq::value::cmp_jq_number_literals((*a, *ai), (*b, *bi), || {
+                            literal_spellings_cmp(&cursor, best_cursor)
+                        })
+                    }
                     (Key::Owned(a), Key::Owned(b)) => compare_values::<S>(a, b),
+                    _ => unreachable!("a bare number beside a decoded key was decoded above"), // patchcov: coverage tolerate-line reason="unreachable: a mixed pair is decoded on both sides just above (#7261)"
                 };
                 if want_max {
                     order != core::cmp::Ordering::Less
@@ -31188,9 +31304,191 @@ fn reads_cursors_alone(h: &Expr) -> bool {
     }
 }
 
+/// Whether `h` is an array or object construction [`group_construct`] builds from a group's
+/// cursors (#7280): `{k: .[0].k, n: length}`, `[first.id, length]`. Every key is a literal (a
+/// computed key is a generator) and every operand is a literal, a construction of the same
+/// kind, or a [`reads_one_value_off_cursors`] read.
+fn is_group_construct(h: &Expr) -> bool {
+    match unwrap_paren(h) {
+        Expr::Object(entries) => {
+            !entries.is_empty()
+                && entries.iter().all(|entry| {
+                    matches!(entry.key, ObjectKey::Literal(_))
+                        && is_group_construct_operand(&entry.value)
+                })
+        }
+        // `[]` is a comma of none, which stays the decoded route's.
+        Expr::Array(inner) => match unwrap_paren(inner) {
+            Expr::Comma(operands) => {
+                !operands.is_empty() && operands.iter().all(is_group_construct_operand)
+            }
+            other => is_group_construct_operand(other),
+        },
+        _ => false,
+    }
+}
+
+/// How many groups [`group_construct`] built on this thread, so a test can assert that a
+/// construction over `group_by`'s groups takes the cursor route (#7280): the decoded route
+/// answers every such row alike. `cfg(test)` only.
+#[cfg(test)]
+pub(crate) mod group_construct_count {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn bump() {
+        COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn get() -> usize {
+        COUNT.with(Cell::get)
+    }
+}
+
+/// One operand of an [`is_group_construct`] construction.
+fn is_group_construct_operand(operand: &Expr) -> bool {
+    matches!(unwrap_paren(operand), Expr::Literal(_))
+        || is_group_construct(operand)
+        || reads_one_value_off_cursors(operand)
+}
+
+/// The reads of a group that answer exactly one value and do nothing else: `length`, `first`,
+/// `last`, `.[n]`, and `.[n]`, `first` or `last` followed by static `.name`/`.[n]` steps
+/// (`.[0].peak_hour`, `first.id`). A step on the wrong kind of value raises; nothing yields twice
+/// or none. A group is never empty, so `first` is `.[0]`.
+fn reads_one_value_off_cursors(read: &Expr) -> bool {
+    match unwrap_paren(read) {
+        Expr::Index { key: None, .. }
+        | Expr::Builtin(Builtin::First | Builtin::Last | Builtin::Length) => true,
+        Expr::Pipe(stages) => stages.split_first().is_some_and(|(head, steps)| {
+            matches!(
+                unwrap_paren(head),
+                Expr::Index { key: None, .. } | Expr::Builtin(Builtin::First | Builtin::Last)
+            ) && steps.iter().all(|step| {
+                matches!(
+                    unwrap_paren(step),
+                    Expr::Field(_) | Expr::Index { key: None, .. }
+                )
+            })
+        }),
+        _ => false,
+    }
+}
+
+/// An [`is_group_construct`] construction built from `group`'s cursors (#7280), decoding only
+/// the values its operands read: `group_by(.k) | map({k: .[0].k, n: length})` decoded every group
+/// and then wrote each one out as JSON and indexed it again to read one field and a count (46%
+/// of the instructions of a 249-record group-and-count). Each operand runs on the group as
+/// `map_groups_eagerly`'s cursor route runs `h`, in entry order, and the pairs fold into the
+/// object as the evaluator's construction folds them
+/// ([`object_from_pairs`](super::eval::object_from_pairs)).
+///
+/// `None` when an operand does not answer one value (a step raised on the wrong kind of value):
+/// the operands are reads with no effect, so the caller's decoded route can run `h` again and
+/// raise with its own diagnostics.
+fn group_construct<S: EvalSemantics, V: DocumentValue>(
+    h: &Expr,
+    group: &[V::Cursor],
+) -> Option<OwnedValue> {
+    match unwrap_paren(h) {
+        Expr::Object(entries) => {
+            let mut pairs = vec_with_capacity(entries.len());
+            for entry in entries {
+                let ObjectKey::Literal(key) = &entry.key else {
+                    return None; // patchcov: coverage tolerate-line reason="unreachable: is_group_construct admits literal keys only (#7280)"
+                };
+                pairs.push((
+                    key.clone(),
+                    group_construct_operand::<S, V>(&entry.value, group)?,
+                ));
+            }
+            let fields = super::eval::object_from_pairs::<S>(pairs).ok()?;
+            Some(OwnedValue::Object(fields.into()))
+        }
+        Expr::Array(inner) => {
+            let elements = match unwrap_paren(inner) {
+                Expr::Comma(operands) => operands
+                    .iter()
+                    .map(|operand| group_construct_operand::<S, V>(operand, group))
+                    .collect::<Option<Vec<_>>>()?,
+                other => vec![group_construct_operand::<S, V>(other, group)?],
+            };
+            Some(OwnedValue::array_from(elements))
+        }
+        _ => None, // patchcov: coverage tolerate-line reason="unreachable: is_group_construct admits an array or object construction only (#7280)"
+    }
+}
+
+/// One operand of [`group_construct`]: a literal, a nested construction, or a read of the group.
+fn group_construct_operand<S: EvalSemantics, V: DocumentValue>(
+    operand: &Expr,
+    group: &[V::Cursor],
+) -> Option<OwnedValue> {
+    match unwrap_paren(operand) {
+        Expr::Literal(lit) => Some(literal_to_owned(lit)),
+        Expr::Object(_) | Expr::Array(_) => group_construct::<S, V>(operand, group),
+        read => {
+            // A pipe's head picks one element and its steps run on that element, as the `Groups`
+            // arm of `fold_lazy_seq_stage` runs `.[0].name`.
+            let answer = match read {
+                Expr::Pipe(stages) => {
+                    let (head, steps) = stages.split_first()?;
+                    fold_pipe_stages::<S, V>(group_head_read::<S, V>(head, group)?, steps, false)
+                }
+                _ => group_head_read::<S, V>(read, group)?,
+            };
+            match answer {
+                GenericResult::OneCursor(cursor) => to_owned_cursor::<S, _>(&cursor).ok(),
+                GenericResult::Owned(value) => Some(value),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// What a read head of [`reads_one_value_off_cursors`] answers over `group`, read off the slice:
+/// the count, or the one element it names (`null` past either end), exactly as
+/// `fold_lazy_seq_stage` answers it over the group's cursors. Reading the slice rather than a
+/// `LazySeq` of the group keeps a construction of many reads from copying the group's cursors
+/// once per read (#7280 review: thirty `length`s over two 500,000-element groups). jq mode only,
+/// where groups are cut; `None` for any other head, which the caller's decoded route answers.
+fn group_head_read<S: EvalSemantics, V: DocumentValue>(
+    head: &Expr,
+    group: &[V::Cursor],
+) -> Option<GenericResult<V>> {
+    let element = |cursor: Option<&V::Cursor>| {
+        cursor.copied().map_or(
+            GenericResult::Owned(OwnedValue::Null),
+            GenericResult::OneCursor,
+        )
+    };
+    if S::TAG != EvalTag::Jq {
+        return None; // patchcov: coverage tolerate-line reason="unreachable: group_by cuts a Groups source in jq mode alone (#5306)"
+    }
+    match unwrap_paren(head) {
+        Expr::Builtin(Builtin::Length) => Some(GenericResult::Owned(OwnedValue::Int(
+            i64::try_from(group.len()).ok()?,
+        ))),
+        Expr::Builtin(Builtin::First) => Some(element(group.first())),
+        Expr::Builtin(Builtin::Last) => Some(element(group.last())),
+        Expr::Index { idx, key: None } => {
+            let len = i64::try_from(group.len()).ok()?;
+            let resolved = if *idx < 0 { len + idx } else { *idx };
+            Some(element(
+                usize::try_from(resolved).ok().and_then(|i| group.get(i)),
+            ))
+        }
+        _ => None, // patchcov: coverage tolerate-line reason="unreachable: is_group_construct admits these heads only (#7280)"
+    }
+}
+
 /// `map(h)` over `group_by`'s groups, run to the end now (#5306): a group that `h` reads in
-/// part (`.[0].id`, `length`) is folded over its cursors and never decoded; any other `h` runs
-/// on the group decoded once, as it ran on every group before. Only `h`'s outputs are kept.
+/// part (`.[0].id`, `length`) is folded over its cursors and never decoded, and so is a
+/// construction of such reads (`{id: .[0].id, n: length}`, #7280); any other `h` runs on the
+/// group decoded once, as it ran on every group before. Only `h`'s outputs are kept.
 /// Eager on purpose, as `map` is in jq: a failing, breaking or halting `h` stops here, inside
 /// whatever `label` or `try` encloses the `map`, and a later `first` cannot skip it.
 fn map_groups_eagerly<S: EvalSemantics, V: DocumentValue>(
@@ -31198,10 +31496,25 @@ fn map_groups_eagerly<S: EvalSemantics, V: DocumentValue>(
     h: &Expr,
 ) -> GenericResult<V> {
     let on_cursors = reads_cursors_alone(h);
+    // #7280: `{k: .[0].k, n: length}` reads the group as `on_cursors` does, operand by operand.
+    // Not under an embed table, as `eval_owned_construct`: a node a binding tracks is answered
+    // by the decoded route, which can name it.
+    let construct = !on_cursors && is_group_construct(h) && !embed_table_active();
     let mut out: Vec<LazyElem<V>> = vec_with_capacity(groups.len());
     for group in groups {
+        let built = if construct {
+            group_construct::<S, V>(h, group)
+        } else {
+            None
+        };
+        #[cfg(test)]
+        if built.is_some() {
+            group_construct_count::bump();
+        }
         let result = if on_cursors {
             fold_lazy_seq_stage::<S, V>(Box::new(LazySeq::from_cursors(group.to_vec())), h, false)
+        } else if let Some(built) = built {
+            GenericResult::Owned(built)
         } else {
             match decode_group::<V>(S::TAG, group) {
                 // `map(.)` keeps the group as it decoded: a pass through `eval_on_owned` would
@@ -40639,17 +40952,6 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 _ => None,
             };
             let dedup = matches!(builtin, Builtin::Unique | Builtin::UniqueBy(_));
-            // #5683: jq's bare `min`/`max` keep the running winner as they walk, rather than
-            // collecting every element's cursor and then every element's key before comparing
-            // them (two vectors of the array's length, once per call, and a comma of the two
-            // paid it twice). The first minimum and the last maximum win, as below.
-            if !S::MIN_MAX_NEED_AN_ELEMENT && matches!(builtin, Builtin::Min | Builtin::Max) {
-                return extremum_streaming_generic::<S, V>(
-                    elements,
-                    matches!(builtin, Builtin::Max),
-                    optional,
-                );
-            }
             // #2261 (systematic sweep): `collect_cursors_checked`, not the
             // unchecked `collect_cursors` this arm used -- every one of
             // these builtins already resolves each element's cursor to
@@ -40748,6 +41050,25 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
             let mut total: Option<OwnedValue> = None;
             let mut failed: Option<EvalError> = None;
             for element in &cursors {
+                // #7278: once the sum is a number, a document number is added as its value
+                // alone: the result is computed, so the spelling `to_owned_cursor` would copy is
+                // never read. Not the first number, which `[1.0] | add` and `null + 1.0` print
+                // as written. A `-0` literal reads as `-0.0`, as `arith_add` reads it.
+                if failed.is_none() && total.as_ref().is_some_and(OwnedValue::is_number) {
+                    if let Some(number) = borrowed_document_number::<S, _>(element) {
+                        let operand = match number.repr {
+                            _ if number.negative_zero => OwnedValue::Float(-0.0),
+                            NumberRepr::Int(i) => OwnedValue::Int(i),
+                            NumberRepr::Float(f) => OwnedValue::Float(f),
+                        };
+                        let acc = total.take().unwrap_or(OwnedValue::Null);
+                        match crate::jq::eval::arith_add::<S>(acc, operand) {
+                            Ok(sum) => total = Some(sum),
+                            Err(error) => failed = Some(error), // patchcov: coverage tolerate-line reason="unreachable: two numbers always add (#7278)"
+                        }
+                        continue;
+                    }
+                }
                 let item = owned_or_suppress!(to_owned_cursor::<S, _>(element), optional);
                 if failed.is_some() {
                     continue;
@@ -40791,6 +41112,19 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
             // earlier (there is no element to hang a check on).
             if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
                 return GenericResult::Error(err);
+            }
+            // #5683: jq's bare `min`/`max` keep the running winner as they walk, rather than
+            // collecting every element's cursor and then every element's key before comparing
+            // them (two vectors of the array's length, once per call, and a comma of the two
+            // paid it twice). The first minimum and the last maximum win, as below. This test once
+            // sat in the `sort` arm above, where it is never true, and every answer stayed right
+            // (#7261): `bare_min_max_take_the_single_walk_7261` pins that the walk runs.
+            if !S::MIN_MAX_NEED_AN_ELEMENT && matches!(builtin, Builtin::Min | Builtin::Max) {
+                return extremum_streaming_generic::<S, V>(
+                    elements,
+                    matches!(builtin, Builtin::Max),
+                    optional,
+                );
             }
             // #2261 (systematic sweep): `collect_cursors_checked`, not the
             // unchecked `collect_cursors` this arm used -- every one of
@@ -46754,6 +47088,144 @@ mod tests {
         assert_eq!((with_table.as_str(), without_table.as_str()), ("6", "6"));
         assert!(with_table_reindexes > 0, "a live embed table must bridge");
         assert_eq!(without_table_reindexes, 0);
+    }
+
+    /// #7261: jq's bare `min`/`max` over a document array take #5683's single walk
+    /// (`extremum_streaming_generic`), not the collect-every-cursor-and-key path the `_by` forms
+    /// take. The dispatch once sat in the `sort`/`unique` arm, where its guard is never true, and
+    /// every answer stayed right, so the pin is the walk's own counter. Each answer is also the
+    /// full evaluator's (the bridge), as printed. The pin can fail: with the dispatch moved back
+    /// into the `sort` arm every bare row reads 0 walks.
+    #[cfg(feature = "std")]
+    #[test]
+    fn bare_min_max_take_the_single_walk_7261() {
+        type V<'a> = crate::json::light::StandardJson<'a, Vec<u64>>;
+        fn shown<S: EvalSemantics>(result: GenericResult<V<'_>>) -> String {
+            match result {
+                GenericResult::Error(e) | GenericResult::Partial(_, Control::Error(e)) => {
+                    format!("error: {}", e.message)
+                }
+                other => other.collect_owned::<S>().map_or_else(
+                    |e| format!("error: {}", e.message),
+                    |values| {
+                        values
+                            .iter()
+                            .map(OwnedValue::to_json)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    },
+                ),
+            }
+        }
+        fn run<S: EvalSemantics>(json: &[u8], filter: &str, via_bridge: bool) -> (String, usize) {
+            let expr = crate::jq::parse(filter).unwrap();
+            let index = JsonIndex::build(json);
+            let root = index.root(json);
+            let before = extremum_walk_count::get();
+            let result = if via_bridge {
+                bridge_to_full_evaluator::<S, V<'_>>(&expr, root.value(), Some(root), false)
+            } else {
+                eval_using::<S, _>(&expr, root.value())
+            };
+            (shown::<S>(result), extremum_walk_count::get() - before)
+        }
+        let arrays: &[&[u8]] = &[
+            b"[]",
+            b"[5]",
+            b"[3,1,2]",
+            b"[1,1.0,1.00]",
+            b"[1.00,1.0,1]",
+            b"[0.000000,3.141593,2.5,3.1415930]",
+            b"[123456789012345679,123456789012345678.9]",
+            b"[1e1000,1,-1e1000]",
+            b"[null,false,true,0,\"a\",[],{}]",
+            b"[{\"a\":1},{\"a\":1.0},[2],\"z\"]",
+            b"[nan,1]",
+            b"[1,nan]",
+            b"[1,2,]",
+        ];
+        for json in arrays {
+            let text = String::from_utf8_lossy(json);
+            for (filter, walks) in [("min", 1), ("max", 1), ("[min,max]", 2), ("max?", 1)] {
+                let (native, native_walks) = run::<JqSemantics>(json, filter, false);
+                let (bridged, _) = run::<JqSemantics>(json, filter, true);
+                assert_eq!(native, bridged, "{filter} over {text}");
+                // A malformed array raises in the comma's first walk, so the second never runs.
+                let walks = if native.starts_with("error:") {
+                    1
+                } else {
+                    walks
+                };
+                assert_eq!(
+                    native_walks, walks,
+                    "{filter} over {text} must take the walk"
+                );
+            }
+            // The `_by` forms and yq's own extremum keep the keyed path.
+            for filter in ["min_by(.)", "max_by(.)"] {
+                assert_eq!(
+                    run::<JqSemantics>(json, filter, false).1,
+                    0,
+                    "{filter} over {text}"
+                );
+            }
+            for filter in ["min", "max"] {
+                assert_eq!(
+                    run::<YqSemantics>(json, filter, false).1,
+                    0,
+                    "yq {filter} over {text}"
+                );
+            }
+        }
+    }
+
+    /// #7278: `borrowed_document_number` answers exactly the repr `to_owned_cursor` builds for a
+    /// document number, and `None` wherever that is not a `NumberLiteral`, over the spellings jq's
+    /// reader accepts (fractions, exponents, `-0`, 17+ digits, past `i64`, `1e1000`, the lenient
+    /// `007`/`.5`) and non-numbers. Its `negative_zero` is the spelling's sign on an integer zero,
+    /// what `arith_add` reads. yq mode never reads a number bare.
+    #[cfg(feature = "std")]
+    #[test]
+    fn borrowed_number_matches_the_decode_7278() {
+        let json: &[u8] = br#"[0,-0,1,1.0,1.00,-1,1e2,1E+2,-0.0,0.10,3.1415930,123456789012345678,
+            123456789012345679,123456789012345678.9,9007199254740993,9223372036854775807,
+            9223372036854775808,-9223372036854775809,100000000000000000001,1e1000,-1e1000,
+            1e-400,0.1,2.5e-3,"1",null,true,[1],{"a":1}]"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let mut elems = root.value().as_array().expect("an array");
+        let (mut numbers, mut others, mut zeros) = (0, 0, 0);
+        while let Some((cursor, rest)) = elems.uncons_cursor() {
+            let decoded = to_owned_cursor::<JqSemantics, _>(&cursor).expect("decodes");
+            let bare = borrowed_document_number::<JqSemantics, _>(&cursor);
+            match (&decoded, &bare) {
+                (OwnedValue::NumberLiteral(repr, text), Some(number)) => {
+                    let same = match (repr, number.repr) {
+                        (NumberRepr::Int(a), NumberRepr::Int(b)) => *a == b,
+                        (NumberRepr::Float(a), NumberRepr::Float(b)) => a.to_bits() == b.to_bits(),
+                        _ => false,
+                    };
+                    assert!(
+                        same,
+                        "{text}: {repr:?} decoded, {:?} read bare",
+                        number.repr
+                    );
+                    let signed_zero = matches!(repr, NumberRepr::Int(0)) && text.starts_with('-');
+                    assert_eq!(number.negative_zero, signed_zero, "{text}");
+                    zeros += usize::from(signed_zero);
+                    numbers += 1;
+                }
+                (_, None) if !matches!(decoded, OwnedValue::NumberLiteral(..)) => others += 1,
+                _ => panic!(
+                    "{} decoded, {:?} read bare",
+                    decoded.to_json(),
+                    bare.map(|b| b.repr)
+                ),
+            }
+            assert!(borrowed_document_number::<YqSemantics, _>(&cursor).is_none());
+            elems = rest;
+        }
+        assert_eq!((numbers, others, zeros), (24, 5, 1));
     }
 
     /// #6534: in yq mode a string's `length` inside a loop body is read off the string, not off a
@@ -61980,6 +62452,147 @@ mod tests {
             other => panic!("unexpected result {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#5306)"
         };
         assert_eq!(built.to_json(), r#"[[{"a":1}],[{"a":2},{"a":2}]]"#);
+    }
+
+    /// The answer of `filter` over `doc` as `-c` JSON lines, and how many groups
+    /// `group_construct` built on the way (#7280).
+    fn group_construct_run(doc: &str, filter: &str) -> (Result<String, EvalError>, usize) {
+        let index = JsonIndex::build(doc.as_bytes());
+        let expr = parse(filter).unwrap();
+        let before = group_construct_count::get();
+        let result = eval_with_cursor_using::<JqSemantics, _>(&expr, index.root(doc.as_bytes()));
+        // `collect_owned` answers an error as no values, and these rows read the error.
+        let result = match result {
+            GenericResult::LazySeq(seq) => match seq.materialize_atomic::<JqSemantics>() {
+                Ok(value) => GenericResult::Owned(value),
+                Err(Control::Error(error)) => GenericResult::Error(error),
+                Err(other) => panic!("unexpected control {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#7280)"
+            },
+            other => other,
+        };
+        if let GenericResult::Error(error) = result {
+            return (Err(error), group_construct_count::get() - before);
+        }
+        let answer = result.collect_owned::<JqSemantics>().map(|values| {
+            values
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
+        (answer, group_construct_count::get() - before)
+    }
+
+    /// #7280: `map(h)` over `group_by`'s groups builds an array or object construction of
+    /// one-value reads from each group's cursors, one `group_construct` per group, and the
+    /// answer is the one the decoded route gave (jq 1.7.1's).
+    #[test]
+    fn test_map_over_groups_builds_a_construction_off_the_cursors_7280() {
+        let doc = r#"[{"a":2,"b":"x"},{"a":1,"b":"y"},{"a":2,"b":"z"},{"a":1.0,"b":100000000000000000001}]"#;
+        let rows: &[(&str, &str)] = &[
+            (
+                "group_by(.a) | map({h: .[0].a, n: length})",
+                r#"[{"h":1,"n":2},{"h":2,"n":2}]"#,
+            ),
+            (
+                "group_by(.a) | map({f: first.b, l: last.b, x: .[5], lit: \"k\", in: {n: length}})",
+                r#"[{"f":"y","l":100000000000000000001,"x":null,"lit":"k","in":{"n":2}},{"f":"x","l":"z","x":null,"lit":"k","in":{"n":2}}]"#,
+            ),
+            (
+                "group_by(.a) | map([.[0].b, length, [last]])",
+                r#"[["y",2,[{"a":1.0,"b":100000000000000000001}]],["x",2,[{"a":2,"b":"z"}]]]"#,
+            ),
+            ("group_by(.a) | map([length])", "[[2],[2]]"),
+            (
+                "group_by(.a) | map({a: .[-9], b: .[-2].b, c: .[2], n: length, m: length})",
+                r#"[{"a":null,"b":"y","c":null,"n":2,"m":2},{"a":null,"b":"x","c":null,"n":2,"m":2}]"#,
+            ),
+            (
+                "group_by(.a) | map({k: .[0].a, k: length})",
+                r#"[{"k":2},{"k":2}]"#,
+            ),
+        ];
+        for (filter, want) in rows {
+            let (answer, built) = group_construct_run(doc, filter);
+            assert_eq!(answer.as_deref(), Ok(*want), "`{filter}`");
+            assert_eq!(
+                built, 2,
+                "`{filter}` builds each of its two groups off the cursors"
+            );
+        }
+    }
+
+    /// #7280: a construction that is not one of `group_construct`'s, or whose read raises, takes
+    /// the decoded route, and a raise keeps that route's diagnostic.
+    #[test]
+    fn test_map_over_groups_leaves_other_constructions_to_the_decoded_route_7280() {
+        let doc = r#"[{"a":2,"b":"x"},{"a":1,"b":"y"},{"a":2,"b":"z"}]"#;
+        let rows: &[(&str, Result<&str, &str>)] = &[
+            (
+                "group_by(.a) | map({b})",
+                Err("Cannot index array with string \"b\""),
+            ),
+            (
+                "group_by(.a) | map({k: .[0].a.c})",
+                Err("Cannot index number with string \"c\""),
+            ),
+            (
+                "group_by(.a) | map({(.[0].b): length})",
+                Ok(r#"[{"y":1},{"x":2}]"#),
+            ),
+            (
+                "group_by(.a) | map({k: .[0]?.b})",
+                Ok(r#"[{"k":"y"},{"k":"x"}]"#),
+            ),
+            (
+                "group_by(.a) | map({k: map(.b)})",
+                Ok(r#"[{"k":["y"]},{"k":["x","z"]}]"#),
+            ),
+            ("group_by(.a) | map([])", Ok("[[],[]]")),
+        ];
+        for (filter, want) in rows {
+            let (answer, built) = group_construct_run(doc, filter);
+            let answer = answer.map_err(|error| error.to_string());
+            match want {
+                Ok(json) => assert_eq!(answer.as_deref(), Ok(*json), "`{filter}`"),
+                Err(text) => assert!(
+                    answer.as_ref().is_err_and(|error| error.contains(text)),
+                    "`{filter}`: {answer:?}"
+                ),
+            }
+            assert_eq!(built, 0, "`{filter}` decodes its groups");
+        }
+    }
+
+    /// #7280: the shapes `is_group_construct` admits, and the ones it leaves to the decoded
+    /// route: a computed key, a generator, a read that is not one value, and anything that is not
+    /// a construction.
+    #[test]
+    fn test_is_group_construct_admits_one_value_reads_only_7280() {
+        for filter in [
+            "{h: .[0].a, n: length}",
+            "{f: first, l: last.b.c, i: .[-1][0], lit: 1}",
+            "{k: first | .a}",
+            "[length]",
+            "[.[0], {n: length}, [last]]",
+        ] {
+            assert!(is_group_construct(&parse(filter).unwrap()), "`{filter}`");
+        }
+        for filter in [
+            "{(.k): length}",
+            "{b}",
+            "{k: .[0].a?}",
+            "{k: .[]}",
+            "{k: .[0:2]}",
+            "{k: first.a[]}",
+            "{k: (length, 1)}",
+            "[length, .[0] | keys]",
+            "[]",
+            "length",
+            "{}",
+        ] {
+            assert!(!is_group_construct(&parse(filter).unwrap()), "`{filter}`");
+        }
     }
 
     /// #3856: a sequence with no stage and a source that is neither a cursor
