@@ -102,10 +102,14 @@ fn test_shallow_and_deep_indentation_print_what_jq_prints_7293() -> Result<()> {
             );
         }
         want.push('\n');
-        assert!(
-            want.lines()
-                .any(|line| line.len() - line.trim_start().len() > 128)
-                || width < 7
+        let deepest = want
+            .lines()
+            .map(|line| line.len() - line.trim_start().len())
+            .max();
+        assert_eq!(
+            deepest,
+            Some(20 * width),
+            "deepest line at --indent {width}"
         );
         let flags = ["--indent", &width.to_string()].map(String::from);
         let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
