@@ -3,8 +3,9 @@
 //! `(document, filter, stdout, stderr, exit status)` as jq 1.7.1 (`/usr/bin/jq`) answers: ties (the
 //! first of equal minima and the last of equal maxima win, also between equal spellings), NaN keys
 //! (#6008), the empty array, a key filter with several outputs, none, or an error on the first
-//! element that raises, keys of mixed types, a non-array input, and `add` over every kind of
-//! element it concatenates or refuses.
+//! element that raises, keys of mixed types, a non-array input, the same over a computed array
+//! (which the full evaluator answers), and `add` over every kind of element it concatenates or
+//! refuses.
 
 use anyhow::Result;
 
@@ -151,6 +152,69 @@ const ROWS: &[(&str, &str, &str, &str, i32)] = &[
         "",
         "jq: error (at <stdin>:0): Invalid path expression with result 2\n",
         5,
+    ),
+    (
+        "[{\"a\":1,\"i\":0},{\"a\":1,\"i\":1},{\"a\":0,\"i\":2},{\"a\":1,\"i\":3}]",
+        "[.[]] | [min_by(.a), max_by(.a)]",
+        "[{\"a\":0,\"i\":2},{\"a\":1,\"i\":3}]\n",
+        "",
+        0,
+    ),
+    (
+        "[{\"a\":1,\"i\":0},{\"a\":1,\"i\":1},{\"a\":0,\"i\":2},{\"a\":1,\"i\":3}]",
+        "map(.) | [min_by(.a), max_by(.a)]",
+        "[{\"a\":0,\"i\":2},{\"a\":1,\"i\":3}]\n",
+        "",
+        0,
+    ),
+    (
+        "[3,1,1.0,2]",
+        ".[1:] | [min_by(.), max_by(.)]",
+        "[1,2]\n",
+        "",
+        0,
+    ),
+    (
+        "[1,2,3]",
+        "[.[]] | [min_by(if . == 2 then nan else . end), max_by(if . == 2 then nan else . end)]",
+        "[2,3]\n",
+        "",
+        0,
+    ),
+    (
+        "[1,2,3]",
+        "[.[]] | [min_by(empty), max_by(empty)]",
+        "[1,3]\n",
+        "",
+        0,
+    ),
+    (
+        "[{\"a\":1,\"b\":5},{\"a\":1,\"b\":3},{\"a\":0,\"b\":9}]",
+        "[.[]] | [min_by(.a, .b), max_by(.a, .b)]",
+        "[{\"a\":0,\"b\":9},{\"a\":1,\"b\":5}]\n",
+        "",
+        0,
+    ),
+    (
+        "[1,2]",
+        "[.[]] | max_by(error)",
+        "",
+        "jq: error (at <stdin>:0) (not a string): 1\n",
+        5,
+    ),
+    (
+        "[{\"a\":1},2,{\"a\":3}]",
+        "[.[]] | min_by(.a)",
+        "",
+        "jq: error (at <stdin>:0): Cannot index number with string \"a\"\n",
+        5,
+    ),
+    (
+        "[]",
+        "[.[]] | [min_by(.), max_by(.)]",
+        "[null,null]\n",
+        "",
+        0,
     ),
     ("[1,2.5,-0]", "add", "3.5\n", "", 0),
     ("[null,1]", "add", "1\n", "", 0),
