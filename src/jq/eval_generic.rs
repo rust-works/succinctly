@@ -9214,7 +9214,12 @@ fn fold_cursor_elements<S: EvalSemantics, V: DocumentValue, I: ExactSizeIterator
 /// not a cursor, so the all-cursors decision, the prefix kept on a failure and "an earlier lazily
 /// failing element wins" are as they were. The flatten's output grows from the leading entry's
 /// length rather than main's power of two, so its slack is given back once too.
-#[inline(never)]
+///
+/// `#[inline]`, not `#[inline(never)]`, although it is not inlined: a generic function without the
+/// hint is reused from the library crate's instantiation, whose copy of the evaluator below `eval`
+/// LLVM inlined differently, and every element then ran about 3% more instructions (#7267 review,
+/// cachegrind on the AMD Ryzen 9 7950X).
+#[inline]
 fn collect_computed_run<S: EvalSemantics, V: DocumentValue, I: ExactSizeIterator>(
     mut per_element: Vec<GenericResult<V>>,
     mut elements: I,
