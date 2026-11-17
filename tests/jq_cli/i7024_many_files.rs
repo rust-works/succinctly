@@ -12,6 +12,8 @@ use std::process::Command;
 
 use anyhow::Result;
 
+use crate::fifo_feed::{self, Feed};
+
 /// More files than the route holds open (32), small enough that a token is open where many end.
 const FILES: usize = 40;
 
@@ -46,46 +48,29 @@ type Run = (String, String, i32);
 /// The run over `paths` on the route that reads them whole: each path that names a file is given as a
 /// named pipe (`mkfifo`) that a thread fills with the file's bytes, which is no regular file and so
 /// sends the list to that route, and a path that does not (gone, or a directory) is given as itself.
-/// The output names each file by its path again. A pipe the run never opened is opened here once it
-/// exits, so its writer ends.
+/// The output names each file by its path again. The pipes, and the deadline the run is held to, are
+/// `fifo_feed`'s (#7304).
 fn whole_by_descriptor(args: &[&str], paths: &[std::path::PathBuf]) -> Result<Run> {
     let dir = tempfile::tempdir()?;
     let mut operands = Vec::new();
-    let mut writers = Vec::new();
+    let mut feeds = Vec::new();
     for (n, path) in paths.iter().enumerate() {
         if !path.is_file() {
             operands.push(path.clone());
             continue;
         }
         let fifo = dir.path().join(format!("p{n:02}"));
-        let made = Command::new("mkfifo").arg(&fifo).status()?;
-        assert!(made.success(), "mkfifo {}", fifo.display());
-        let bytes = std::fs::read(path)?;
-        let target = fifo.clone();
-        // Opening a pipe for writing waits for its reader; a write the reader leaves fails, and is
-        // no concern of the test.
-        writers.push((
-            fifo.clone(),
-            std::thread::spawn(move || {
-                if let Ok(mut pipe) = std::fs::OpenOptions::new().write(true).open(&target) {
-                    let _ = pipe.write_all(&bytes);
-                }
-            }),
-        ));
+        feeds.push(Feed::new(fifo.clone(), std::fs::read(path)?));
         operands.push(fifo);
     }
-    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .arg("jq")
-        .args(args)
-        .args(&operands)
-        .env("LC_ALL", "C")
-        .output()?;
-    for (fifo, writer) in writers {
-        if !writer.is_finished() {
-            drop(std::fs::File::open(&fifo));
-        }
-        writer.join().expect("the writer ends");
-    }
+    let output = fifo_feed::output(
+        Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .arg("jq")
+            .args(args)
+            .args(&operands)
+            .env("LC_ALL", "C"),
+        &feeds,
+    )?;
     let named = |text: &[u8]| {
         let mut text = String::from_utf8_lossy(text).into_owned();
         for (operand, path) in operands.iter().zip(paths) {

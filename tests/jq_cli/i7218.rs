@@ -10,6 +10,8 @@ use std::process::Command;
 
 use anyhow::Result;
 
+use crate::fifo_feed::{self, Feed};
+
 type Run = (String, String, i32);
 
 fn records(from: usize, count: usize) -> Vec<u8> {
@@ -23,31 +25,25 @@ fn both(args: &[&str], files: &[Vec<u8>]) -> Result<(Run, Run)> {
     let dir = tempfile::tempdir()?;
     let mut paths = Vec::new();
     let mut fifos = Vec::new();
-    let mut writers = Vec::new();
+    let mut feeds = Vec::new();
     for (n, bytes) in files.iter().enumerate() {
         let path = dir.path().join(format!("f{n:02}.seq"));
         std::fs::File::create(&path)?.write_all(bytes)?;
         let fifo = dir.path().join(format!("p{n:02}"));
-        assert!(Command::new("mkfifo").arg(&fifo).status()?.success());
-        let (target, bytes) = (fifo.clone(), bytes.clone());
-        writers.push((
-            fifo.clone(),
-            std::thread::spawn(move || {
-                if let Ok(mut pipe) = std::fs::OpenOptions::new().write(true).open(&target) {
-                    let _ = pipe.write_all(&bytes);
-                }
-            }),
-        ));
+        feeds.push(Feed::new(fifo.clone(), bytes.clone()));
         paths.push(path);
         fifos.push(fifo);
     }
-    let run = |operands: &[std::path::PathBuf]| -> Result<Run> {
-        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-            .arg("jq")
-            .args(args)
-            .args(operands)
-            .env("LC_ALL", "C")
-            .output()?;
+    // The pipes, and the deadline the run is held to, are `fifo_feed`'s (#7304).
+    let run = |operands: &[std::path::PathBuf], feeds: &[Feed]| -> Result<Run> {
+        let output = fifo_feed::output(
+            Command::new(env!("CARGO_BIN_EXE_succinctly"))
+                .arg("jq")
+                .args(args)
+                .args(operands)
+                .env("LC_ALL", "C"),
+            feeds,
+        )?;
         let name = |bytes: &[u8]| {
             let mut text = String::from_utf8_lossy(bytes).into_owned();
             for (n, operand) in operands.iter().enumerate().rev() {
@@ -61,14 +57,8 @@ fn both(args: &[&str], files: &[Vec<u8>]) -> Result<(Run, Run)> {
             output.status.code().unwrap_or(-1),
         ))
     };
-    let windowed = run(&paths)?;
-    let whole = run(&fifos)?;
-    for (fifo, writer) in writers {
-        if !writer.is_finished() {
-            drop(std::fs::File::open(&fifo));
-        }
-        writer.join().expect("the writer ends");
-    }
+    let windowed = run(&paths, &[])?;
+    let whole = run(&fifos, &feeds)?;
     Ok((windowed, whole))
 }
 

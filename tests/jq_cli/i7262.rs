@@ -13,6 +13,8 @@ use std::process::{Command, Stdio};
 
 use anyhow::Result;
 
+use crate::fifo_feed::{self, Feed};
+
 type Run = (String, String, i32);
 
 /// How many records the fixtures have: about 6.5 MiB, well over the 4 MiB a file needs to be windowed.
@@ -29,14 +31,16 @@ fn records(range: std::ops::Range<usize>) -> String {
     range.map(record).collect()
 }
 
-fn jq(args: &[&str], operand: &std::path::Path, stdin: Stdio) -> Result<Run> {
-    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .arg("jq")
-        .args(args)
-        .arg(operand)
-        .stdin(stdin)
-        .env("LC_ALL", "C")
-        .output()?;
+/// `succinctly jq ARGS OPERAND` with stdin null, fed by `feeds` and held to their deadline (#7304).
+fn jq(args: &[&str], operand: &std::path::Path, feeds: &[Feed]) -> Result<Run> {
+    let output = fifo_feed::output(
+        Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .arg("jq")
+            .args(args)
+            .arg(operand)
+            .env("LC_ALL", "C"),
+        feeds,
+    )?;
     let name = |bytes: &[u8]| {
         String::from_utf8_lossy(bytes).replace(&operand.display().to_string(), "<file>")
     };
@@ -55,19 +59,9 @@ fn named(args: &[&str], bytes: &[u8]) -> Result<Run> {
     let path = dir.path().join("f.seq");
     std::fs::File::create(&path)?.write_all(bytes)?;
     let fifo = dir.path().join("p");
-    assert!(Command::new("mkfifo").arg(&fifo).status()?.success());
-    let (target, held) = (fifo.clone(), bytes.to_vec());
-    let writer = std::thread::spawn(move || {
-        if let Ok(mut pipe) = std::fs::OpenOptions::new().write(true).open(&target) {
-            let _ = pipe.write_all(&held);
-        }
-    });
-    let windowed = jq(args, &path, Stdio::null())?;
-    let whole = jq(args, &fifo, Stdio::null())?;
-    if !writer.is_finished() {
-        drop(std::fs::File::open(&fifo));
-    }
-    writer.join().expect("the writer ends");
+    let feed = Feed::new(fifo.clone(), bytes.to_vec());
+    let windowed = jq(args, &path, &[])?;
+    let whole = jq(args, &fifo, std::slice::from_ref(&feed))?;
     assert_eq!(windowed, whole, "{args:?}");
     Ok(windowed)
 }

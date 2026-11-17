@@ -3798,6 +3798,193 @@ pub fn effective_fields_checked<F: DocumentFields>(
     Ok(out)
 }
 
+/// The value cursors of [`effective_fields_checked`]'s list, in its order, without that list
+/// (#7290): what `.[]` over an object hands on.
+///
+/// The same walk and the same checks, in the same order, so it raises exactly what
+/// `effective_fields_checked` raises. It keeps one value cursor and one key hash per field where
+/// that function keeps a whole [`DocumentField`] (key and value decoded, both cursors: 144 bytes
+/// on a JSON document), and `.[]` used to keep that list's allocation as its cursor list, since
+/// collecting `into_iter().map(..)` reuses the source buffer. On `wide-100mb` (8.2 M fields) that
+/// buffer was 1.2 GB of the run's peak.
+///
+/// The keys are hashed [`KEY_HASH_BATCH`] at a time rather than one per step of the walk, which
+/// measured 3-5% faster on an M4 Pro over an object whose values are containers, where hashing
+/// inside the walk was 2-4% slower than the field list it replaced. The first
+/// [`SMALL_OBJECT_FIELDS`] hashes live on the stack and are compared pairwise, so an object that
+/// small allocates nothing but its cursor list: the batch and the hash list, and the sort, are
+/// for a wider one. A one-field object hashes nothing, as `keys_repeat` did not.
+///
+/// Only an object whose key hashes repeat, under a collapsing mode, walks a second time
+/// (`collapse_repeated_cursors`): the collapse needs the keys, and a hash shared by two
+/// different keys collapses nothing there.
+#[allow(clippy::iter_with_drain)] // the batch's buffer is reused for every batch of the walk, which `into_iter()` would give up
+pub fn effective_value_cursors_checked<F: DocumentFields>(
+    fields: &F,
+    collapse: bool,
+) -> Result<Vec<F::Cursor>, EvalError> {
+    let mut out = Vec::new();
+    // The hashes of the first `SMALL_OBJECT_FIELDS` keyed fields; past them, `hashes` takes
+    // these and every later one, through `batch`.
+    let mut small = [0u64; SMALL_OBJECT_FIELDS];
+    let mut small_len = 0usize;
+    let mut first_key: Option<F::Value> = None;
+    let mut hashes: Vec<u64> = Vec::new();
+    let mut batch: Vec<F::Value> = Vec::new();
+    let mut walk = fields.clone();
+    let mut is_first = true;
+    while let Some((field, rest)) = walk.uncons() {
+        if key_is_malformed(&field.key) {
+            return Err(walk.malformed_member_error());
+        }
+        if !field.delimiters_ok::<F>(is_first) {
+            return Err(walk.malformed_member_error());
+        }
+        out.push(field.value_cursor);
+        if collapse {
+            if out.len() == 1 {
+                // A lone field repeats nothing, so its key is hashed only once a second arrives.
+                first_key = Some(field.key);
+            } else if out.len() <= SMALL_OBJECT_FIELDS {
+                for key in first_key.take().iter().chain(core::iter::once(&field.key)) {
+                    if let Some(hash) = key_hash_of(key) {
+                        small[small_len] = hash;
+                        small_len += 1;
+                    }
+                }
+            } else {
+                if batch.capacity() == 0 {
+                    batch.reserve_exact(KEY_HASH_BATCH);
+                    hashes.extend_from_slice(&small[..small_len]);
+                }
+                batch.push(field.key);
+                if batch.len() == KEY_HASH_BATCH {
+                    hashes.extend(batch.drain(..).filter_map(|key| key_hash_of(&key)));
+                }
+            }
+        }
+        walk = rest;
+        is_first = false;
+    }
+    if walk.ends_unpaired() {
+        return Err(walk.malformed_member_error());
+    }
+    if let Some(last) = out.last() {
+        if !trailing_element_gap_ok(last, b'}') {
+            return Err(walk.malformed_member_error());
+        }
+    }
+    // `keys_repeat`'s answer: it hashes the same keys, skipping the same ones, and asks the
+    // same question of fewer than two fields.
+    let repeats = collapse
+        && out.len() >= 2
+        && if out.len() <= SMALL_OBJECT_FIELDS {
+            let small = &small[..small_len];
+            small
+                .iter()
+                .enumerate()
+                .any(|(i, hash)| small[i + 1..].contains(hash))
+        } else {
+            hashes.extend(batch.drain(..).filter_map(|key| key_hash_of(&key)));
+            any_hash_repeats(hashes)
+        };
+    if repeats {
+        return Ok(collapse_repeated_cursors(fields, out));
+    }
+    Ok(out)
+}
+
+/// The widest object whose key hashes [`effective_value_cursors_checked`] keeps on the stack.
+///
+/// They are compared pairwise (#7290). A record of a few fields is the common object, often met
+/// by the million; allocating a hash list and a key batch for each one cost a third more
+/// instructions than the field list did on one-field objects.
+pub const SMALL_OBJECT_FIELDS: usize = 8;
+
+/// How many keys [`effective_value_cursors_checked`] holds before hashing them: a few
+/// kilobytes of decoded keys, so the batch stays in the first-level cache.
+pub const KEY_HASH_BATCH: usize = 64;
+
+/// A 64-bit key hash as its own `Hash` value, for a map keyed by [`key_hash`] (#7290).
+#[derive(Default)]
+struct KeyHashIdentity(u64);
+
+impl core::hash::Hasher for KeyHashIdentity {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    // `u64`'s `Hash` calls `write_u64` alone; this is only the trait's required fallback.
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(b); // patchcov: coverage tolerate-line reason="unreachable: the map is keyed by u64, whose Hash calls write_u64 (#7290)"
+        }
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n;
+    }
+}
+
+/// [`collapse_repeated`] over the value cursors of every field of `fields`, in document order
+/// (#7290): the same keys (`key_str`), so the same first position and last value for each, and a
+/// key that does not stringify kept where it stands. The keys come from a key-only walk, which
+/// meets the fields `uncons` met in the same order (both read the format's one field walk, the
+/// trait default delegating outright), and the survivors are compacted into `values` itself: a
+/// field's slot is never after it. The caller has already walked and checked every member.
+///
+/// A slot is found by the key's [`key_hash`] and confirmed by comparing the key's text with the
+/// first key that hash met, so an owned key is made once per distinct key and no key is run
+/// through a general-purpose hasher; a different key on the same hash goes to an exact map of
+/// its own. Against `collapse_repeated`'s `IndexMap<String, _>` (an owned key and a SipHash per
+/// field) this measured 3% faster on an object of eight keys repeated over 100 MB.
+fn collapse_repeated_cursors<F: DocumentFields>(
+    fields: &F,
+    mut values: Vec<F::Cursor>,
+) -> Vec<F::Cursor> {
+    let mut by_hash: IndexMap<
+        u64,
+        (String, usize),
+        core::hash::BuildHasherDefault<KeyHashIdentity>,
+    > = IndexMap::default();
+    let mut collided: IndexMap<String, usize> = IndexMap::new();
+    let mut kept = 0usize;
+    let mut walk = fields.clone();
+    let mut at = 0usize;
+    while let Some((key, _cursor, rest)) = walk.uncons_key() {
+        let value = values[at];
+        match key.key_string() {
+            Some(key) => {
+                let hash = key_hash(key.as_bytes());
+                match by_hash.get(&hash) {
+                    Some((first, slot)) if first.as_str() == key.as_ref() => values[*slot] = value,
+                    Some(_) => match collided.get(key.as_ref()) {
+                        Some(&slot) => values[slot] = value,
+                        None => {
+                            collided.insert(key.into_owned(), kept);
+                            values[kept] = value;
+                            kept += 1;
+                        }
+                    },
+                    None => {
+                        by_hash.insert(hash, (key.into_owned(), kept));
+                        values[kept] = value;
+                        kept += 1;
+                    }
+                }
+            }
+            None => {
+                values[kept] = value;
+                kept += 1;
+            }
+        }
+        at += 1;
+        walk = rest;
+    }
+    values.truncate(kept);
+    values
+}
+
 /// The collapsed field list, or `None` when no key repeats.
 ///
 /// Lets a caller keep whatever zero-allocation fast path it already has for
