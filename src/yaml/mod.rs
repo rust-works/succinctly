@@ -17,8 +17,9 @@
 //! - Explicit keys (`?` / `:`)
 //! - Multi-document streams (`---` / `...`), wrapped in an implicit root sequence
 //! - Comments (ignored in block context)
-//! - `%YAML` / `%TAG` directives — recognized and consumed; a directive's version/handle
-//!   is not surfaced (issue #225)
+//! - `%YAML` / `%TAG` directives — recognized and consumed; a directive's version is not
+//!   surfaced (issue #225), and a `%TAG` named handle (`!e!`) resolves the tags written with it
+//!   to their verbatim form for the document it precedes (issue #7234)
 //! - Tags (`!!str`, `!custom`, verbatim `!<...>`) — resolved, matching `yq`: the 5
 //!   core-schema tags (`!!str`/`!!null`/`!!bool`/`!!int`/`!!float`) force scalar-type
 //!   coercion regardless of quoting style; any other tag (a custom tag,
