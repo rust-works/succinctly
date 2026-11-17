@@ -135,3 +135,52 @@ fn an_iterated_write_after_another_write_drops_the_comments_too_7236() -> Result
         "x:\n  - 1\ny:\n  - 1\n",
     )])
 }
+
+/// A `del` in the pipe renumbers the items the iterated write reaches, which is read as it is for a
+/// write at an index; the optional `.[]?`, a step below the iterated one, and a pipe that grows the
+/// sequence take the same route.
+#[test]
+fn an_iterated_write_beside_a_del_or_below_a_step_drops_the_comments_7236() -> Result<()> {
+    assert_rows(&[
+        (
+            "- [1] # p\n- [2] # q\n",
+            "del(.[0]) | .[] |= [7]",
+            "- [7] # q\n",
+        ),
+        (
+            "- [1] # p\n- [2] # q\n",
+            ".[] |= [7] | del(.[0])",
+            "- [7] # q\n",
+        ),
+        (
+            "- [1] # p\n- [2] # q\n- [3] # r\n",
+            "del(.[1]) | .[] |= [7]",
+            "- [7] # p\n- [7] # r\n",
+        ),
+        (
+            "a:\n  - [1] # p\n  - [2] # q\n",
+            "del(.a[0]) | .a[] |= [7]",
+            "a:\n  - [7] # q\n",
+        ),
+        (
+            "- [1] # p\n- [2] # q\n",
+            ".[]? |= [7]",
+            "- [7] # p\n- [7] # q\n",
+        ),
+        (
+            "- {a: 1} # p\n- {a: 2} # q\n",
+            ".[].a |= [9]",
+            "- {a: [9]} # p\n- {a: [9]} # q\n",
+        ),
+        (
+            "a: [1, 2] # p\n",
+            ".a += [4] | .a[] |= [1]",
+            "a: [[1], [1], [1]] # p\n",
+        ),
+        (
+            "a: [1, 2] # p\n",
+            ".a[] |= [1] | .a += [4]",
+            "a: [[1], [1], 4] # p\n",
+        ),
+    ])
+}

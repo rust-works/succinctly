@@ -3641,7 +3641,8 @@ enum PathStep {
     Index(i64),
     /// Every member of the node at the path (`.[]`): a write of a closed literal through it
     /// (`.[] |= [1]`) reaches each child, whichever key or slot it holds (#7236). Only
-    /// [`collect_write_targets`] makes one, for a lone write of that shape.
+    /// [`collect_write_targets`] makes one, for `=` and `|=` with a closed literal, alone or beside
+    /// other writes of the pipe.
     Each,
 }
 
@@ -3813,13 +3814,14 @@ fn is_closed_literal(expr: &Expr) -> bool {
         Expr::Literal(_) => true,
         Expr::Array(inner) | Expr::Paren(inner) | Expr::Negate(inner) => is_closed_literal(inner),
         Expr::Comma(parts) => parts.iter().all(is_closed_literal),
-        // `[1] | .` reads nothing either: the stages after the first only pass it on (#7236).
+        // `[1] | .` reads nothing either: the stages after the first only pass it on (#7236). `debug`
+        // is one of them, as in `is_value_identity_stage`.
         Expr::Pipe(stages) => match stages.split_first() {
             Some((first, rest)) => {
                 is_closed_literal(first)
                     && rest
                         .iter()
-                        .all(|s| matches!(strip_parens(s), Expr::Identity))
+                        .all(|s| is_value_identity_stage(strip_parens(s)))
             }
             None => false,
         },
@@ -4071,14 +4073,6 @@ fn collect_write_targets(expr: &Expr) -> Option<Vec<WriteTarget>> {
     if !walk(expr, &mut DefScope::default(), &mut out) {
         return None;
     }
-    // #7236: a `del` renumbers the slots a write is read at (`resolve_stage_order`), and a path
-    // through `.[]` names none to renumber. A pipe that has both stays on the positional walk.
-    if out.iter().any(|t| t.path.contains(&PathStep::Each))
-        && out.iter().any(|t| t.kind == WriteKind::Del)
-    {
-        return None;
-    }
-
     resolve_stage_order(out)
 }
 
@@ -18695,7 +18689,8 @@ mod tests {
 
     /// #7236: `.[]` is a path step only for a write of a closed literal, which builds the node each
     /// member is replaced by. A write that reads the node (`.[] |= .`, a compound assign) has no such
-    /// step, nor has a `del`, and a pipe that holds one next to a `del` stays positional.
+    /// step, nor has a `del`; a `del` of an index beside one is kept (the step names no slot to
+    /// renumber).
     #[test]
     fn collect_write_targets_reads_each_only_for_a_literal_write_7236() {
         let one = || Expr::Literal(succinctly::jq::Literal::Int(1));
@@ -18732,7 +18727,7 @@ mod tests {
             targets_of(&Expr::Builtin(Builtin::Del(Box::new(Expr::Iterate)))),
             None
         );
-        // Another write beside it is kept, and a `del` of an index is not mixed with it.
+        // Another write beside it is kept, a `del` too.
         let other = update(Expr::Field("b".into()), literal());
         assert_eq!(
             targets_of(&Expr::Pipe(
@@ -18748,7 +18743,10 @@ mod tests {
             targets_of(&Expr::Pipe(
                 vec![del, update(Expr::Iterate, literal())].into()
             )),
-            None
+            Some(vec![
+                (vec![PathStep::Index(0)], WriteKind::Del),
+                (vec![PathStep::Each], WriteKind::Set),
+            ])
         );
     }
 
