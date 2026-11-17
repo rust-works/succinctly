@@ -814,7 +814,7 @@ impl WindowedFile {
                     // #7322: the records go on being plain after a stretch that is not, which is
                     // read as jq's reader reads it and the windows carry on.
                     GateStep::Stretch { from, to, next_end } => {
-                        if !self.resume_after_stretch(from, to, next_end) {
+                        if !self.resume_after_stretch(from, to, Some(next_end)) {
                             break self.hand_on_seq_tail(from);
                         }
                         // #7341: the warnings wait for the window that ends the text they were met
@@ -823,6 +823,22 @@ impl WindowedFile {
                         // on from there with the next.
                         if self.notes.len() >= MAX_QUEUED_NOTES {
                             self.gate_cut = true;
+                            break self
+                                .seq_gate
+                                .as_ref()
+                                .expect("checked: the stream has a gate")
+                                .checked;
+                        }
+                    }
+                    // #7341: a long stretch, or one that runs to the stream's end, read up to an RS at
+                    // a line start; the gate goes on judging from it.
+                    GateStep::Cut { from, to } => {
+                        if !self.resume_after_stretch(from, to, None) {
+                            break self.hand_on_seq_tail(from);
+                        }
+                        if self.notes.len() >= MAX_QUEUED_NOTES {
+                            self.gate_cut = true;
+                            // Where the gate stands now: `to`, moved by any substitution before it.
                             break self
                                 .seq_gate
                                 .as_ref()
@@ -1280,6 +1296,9 @@ struct SeqGate {
     /// the stretch before it, not from the front of the buffer each time.
     lines_at: usize,
     lines: usize,
+    /// #7341: the last RS past `checked` that starts a line, in the stretch being judged: where it can
+    /// be cut ([`GateStep::Cut`]).
+    stretch_cut: Option<usize>,
     slot: SeqTailSlot,
 }
 
@@ -1295,6 +1314,14 @@ enum GateStep {
         from: usize,
         to: usize,
         next_end: usize,
+    },
+    /// #7341: the stretch at `from` is read on to `to`, an RS that starts a line and opens a record
+    /// that is not plain (or is not read yet), and the gate goes on judging from there. The stretch is
+    /// long enough to be read in pieces, or it runs to the end of the stream, which is handed on from
+    /// `to` rather than from `from`.
+    Cut {
+        from: usize,
+        to: usize,
     },
 }
 
@@ -1312,6 +1339,13 @@ const MAX_SEQ_STRETCH: usize = 4 * WINDOW_BYTES;
 /// is dropped from the front of the buffer a few times a block, not once a few stretches.
 const MAX_QUEUED_NOTES: usize = 1 << 16;
 
+/// How long a stretch a `--seq` gate reads before it cuts it at the last RS that starts a line
+/// (#7341, [`GateStep::Cut`]): jq's reader stands after any such RS as it stands after one between
+/// plain records, so the stretch before it is read, its warnings handed out with their window, and
+/// what follows is judged as from a record's start. Each piece a stretch is read in is this or a line,
+/// so the look-ahead of [`MAX_SEQ_STRETCH`] is the longest a stretch's line may be, not the stretch.
+const SEQ_STRETCH_PIECE: usize = 64 << 10;
+
 impl SeqGate {
     #[cfg_attr(not(unix), allow(dead_code))]
     fn new(slot: SeqTailSlot) -> Self {
@@ -1323,6 +1357,7 @@ impl SeqGate {
             cand: 0,
             lines_at: 0,
             lines: 0,
+            stretch_cut: None,
             slot,
         }
     }
@@ -1366,12 +1401,16 @@ impl SeqGate {
                 None if eof => buf.len(),
                 None => {
                     self.search_from = buf.len();
-                    let limit = if in_stretch {
-                        MAX_SEQ_STRETCH
-                    } else {
-                        MAX_PENDING_RECORD
-                    };
-                    return if buf.len() - self.checked <= limit {
+                    if in_stretch {
+                        // The record being read is part of the stretch, which may be long enough to cut.
+                        if buf[self.cand - 1] == b'\n' {
+                            self.stretch_cut = Some(self.cand);
+                        }
+                        return self
+                            .cut_if_long(buf.len())
+                            .unwrap_or(GateStep::Clean(self.checked));
+                    }
+                    return if buf.len() - self.checked <= MAX_PENDING_RECORD {
                         GateStep::Clean(self.checked)
                     } else {
                         GateStep::Unclean(self.checked)
@@ -1383,23 +1422,55 @@ impl SeqGate {
                 if plain {
                     self.checked = end;
                 }
-            } else if self.cand - self.checked > MAX_SEQ_STRETCH {
-                return GateStep::Unclean(self.checked);
-            } else if plain && buf[self.cand - 1] == b'\n' {
-                return GateStep::Stretch {
-                    from: self.checked,
-                    to: self.cand,
-                    next_end: end,
-                };
+            } else {
+                let starts_line = buf[self.cand - 1] == b'\n';
+                if plain && starts_line {
+                    return GateStep::Stretch {
+                        from: self.checked,
+                        to: self.cand,
+                        next_end: end,
+                    };
+                }
+                if starts_line {
+                    self.stretch_cut = Some(self.cand);
+                }
+                if let Some(step) = self.cut_if_long(self.cand) {
+                    return step;
+                }
             }
             self.cand = end;
             self.search_from = end + 1;
         }
         if self.cand > self.checked {
-            // The stretch runs to the end of the stream.
-            GateStep::Unclean(self.checked)
+            // The stretch runs to the end of the stream: it is read to its last RS that starts a line,
+            // and the stream is handed on from there.
+            match self.stretch_cut.take() {
+                Some(to) => GateStep::Cut {
+                    from: self.checked,
+                    to,
+                },
+                None => GateStep::Unclean(self.checked),
+            }
         } else {
             GateStep::Clean(self.checked)
+        }
+    }
+
+    /// #7341: the stretch from `checked`, read to `reach`, cut at its last RS that starts a line once
+    /// it is longer than a piece ([`SEQ_STRETCH_PIECE`]), or handed on past the look-ahead
+    /// ([`MAX_SEQ_STRETCH`]) when it has none; `None` while it is shorter.
+    fn cut_if_long(&mut self, reach: usize) -> Option<GateStep> {
+        let long = reach - self.checked;
+        match self.stretch_cut {
+            Some(to) if long > SEQ_STRETCH_PIECE => {
+                self.stretch_cut = None;
+                Some(GateStep::Cut {
+                    from: self.checked,
+                    to,
+                })
+            }
+            None if long > MAX_SEQ_STRETCH => Some(GateStep::Unclean(self.checked)),
+            _ => None,
         }
     }
 
@@ -1411,6 +1482,18 @@ impl SeqGate {
         self.checked = next_end;
         self.cand = next_end;
         self.search_from = next_end + 1;
+        self.stretch_cut = None;
+    }
+
+    /// The stretch [`GateStep::Cut`] named was read to `to` as jq's reader reads it, and left
+    /// `token_byte` in its token buffer: the stream is certified to `to`, an RS at a line start, and
+    /// the record it opens is judged next (#7341).
+    fn resume_at_cut(&mut self, to: usize, token_byte: Option<u8>) {
+        self.token_byte = token_byte;
+        self.checked = to;
+        self.cand = to;
+        self.search_from = to + 1;
+        self.stretch_cut = None;
     }
 
     /// How many line breaks `buf[..at]` holds, for an `at` that only moves on between drops.
@@ -1426,6 +1509,9 @@ impl SeqGate {
         self.checked -= n;
         self.cand -= n;
         self.search_from -= n;
+        if let Some(cut) = self.stretch_cut.as_mut() {
+            *cut -= n;
+        }
         if self.lines_at >= n {
             self.lines_at -= n;
             self.lines -= newlines;
@@ -1485,7 +1571,7 @@ impl WindowedFile {
     /// UTF-8 in a string is substituted here as the whole-stream route substitutes it, and what comes
     /// after it moves with the substitution. The stretch is declined only when the splitter does not
     /// find exactly those values in the text: a check, not a case that is known to occur.
-    fn resume_after_stretch(&mut self, from: usize, to: usize, next_end: usize) -> bool {
+    fn resume_after_stretch(&mut self, from: usize, to: usize, next_end: Option<usize>) -> bool {
         let gate = self
             .seq_gate
             .as_mut()
@@ -1545,7 +1631,10 @@ impl WindowedFile {
             .seq_gate
             .as_mut()
             .expect("checked above: the stream has a gate");
-        gate.resume(&self.buf, shift(to), shift(next_end), walk.token_byte);
+        match next_end {
+            Some(next_end) => gate.resume(&self.buf, shift(to), shift(next_end), walk.token_byte),
+            None => gate.resume_at_cut(shift(to), walk.token_byte),
+        }
         true
     }
 
@@ -3269,6 +3358,25 @@ mod tests {
         let plain = |i: usize| {
             PlainRecords::record_ok(&stream[starts[i] + 1..starts[i + 1]], PlainGuards::ALL)
         };
+        // The stretch from `from` read up to the RS at `to`, as the gate's windows read it.
+        let read_to = |from: usize, to: usize, token: Option<u8>| {
+            let lines = count_newlines(&stream[..from]);
+            let walk = walk_stretch(&stream[from..=to], lines, token)?;
+            let mut stretch = stream[from..to].to_vec();
+            let mut at = 0;
+            for &(start, end) in &walk.values {
+                blank_between_values(&mut stretch[at..start]);
+                at = end;
+            }
+            blank_between_values(&mut stretch[at..]);
+            let (stretch, edits) = substitute_invalid_utf8_jq_document_mapped(&stretch);
+            let warned: Vec<(usize, String)> = walk
+                .warnings
+                .iter()
+                .map(|(at, line)| (substituted_offset(&edits, *at), line.clone()))
+                .collect();
+            Some((stretch.into_bytes(), warned, walk.token_byte))
+        };
         let mut i = 0;
         while i + 1 < starts.len() {
             if plain(i) {
@@ -3278,30 +3386,29 @@ mod tests {
                 continue;
             }
             let from = starts[i];
+            let line_starts = |j: &usize| stream[starts[*j] - 1] == b'\n';
             let resumed = (i + 1..starts.len() - 1)
-                .find(|&j| stream[starts[j] - 1] == b'\n' && plain(j))
-                .and_then(|j| {
-                    let to = starts[j];
-                    let lines = count_newlines(&stream[..from]);
-                    let walk = walk_stretch(&stream[from..=to], lines, token)?;
-                    let mut stretch = stream[from..to].to_vec();
-                    let mut at = 0;
-                    for &(start, end) in &walk.values {
-                        blank_between_values(&mut stretch[at..start]);
-                        at = end;
+                .find(|j| line_starts(j) && plain(*j))
+                .and_then(|j| Some((j, read_to(from, starts[j], token)?)));
+            let Some((j, (stretch, warned, token_byte))) = resumed else {
+                // #7341: a stretch that runs to the stream's end is read to its last RS that starts a
+                // line, and the stream is handed on from there.
+                let cut = (i + 1..starts.len() - 1)
+                    .rev()
+                    .find(line_starts)
+                    .and_then(|j| Some((j, read_to(from, starts[j], token)?)));
+                let at = match cut {
+                    Some((j, (stretch, warned, token_byte))) => {
+                        let base = text.len();
+                        warnings.extend(warned.into_iter().map(|(at, line)| (base + at, line)));
+                        text.extend_from_slice(&stretch);
+                        token = token_byte;
+                        starts[j]
                     }
-                    blank_between_values(&mut stretch[at..]);
-                    let (stretch, edits) = substitute_invalid_utf8_jq_document_mapped(&stretch);
-                    let warned: Vec<(usize, String)> = walk
-                        .warnings
-                        .iter()
-                        .map(|(at, line)| (substituted_offset(&edits, *at), line.clone()))
-                        .collect();
-                    Some((j, stretch.into_bytes(), warned, walk.token_byte))
-                });
-            let Some((j, stretch, warned, token_byte)) = resumed else {
+                    None => from,
+                };
                 blank_rs_bytes(&mut text);
-                return (text, Some(from), token, warnings);
+                return (text, Some(at), token, warnings);
             };
             let base = text.len();
             warnings.extend(warned.into_iter().map(|(at, line)| (base + at, line)));
@@ -3328,12 +3435,11 @@ mod tests {
         [records.as_bytes(), tail].concat()
     }
 
-    /// #7322: the windows of a `--seq` stream carry on after a stretch that is not plain records, and
-    /// with what is handed on they are the stream as jq's reader reads it whole: the same values, each
-    /// on the line jq names for it, and the same warnings in the same order, wherever the stretches lie
-    /// (the stream's first record among them) and whatever the reads' size.
-    #[test]
-    fn a_seq_stream_carries_on_after_a_stretch_that_is_not_plain_7322() {
+    /// The check [`a_seq_stream_carries_on_after_a_stretch_that_is_not_plain_7322`] makes of one
+    /// stream, for each read size of `blocks` and three probe splits: the gate's windows against the
+    /// model of them ([`gated`]), and with what they hand on, against jq's reader walking the stream
+    /// whole. Whether any stretch was carried on after, with warnings.
+    fn check_gated_windows(stream: &[u8], blocks: &[usize]) -> bool {
         use crate::jq_seq_reader::{resumed_stream, seed_token_byte, walk_stream};
         let walked = |stream: &[u8]| -> (Vec<String>, Vec<(String, usize)>) {
             let sources = vec![(None, stream.to_vec())];
@@ -3352,6 +3458,137 @@ mod tests {
                 .collect();
             (warnings, values)
         };
+        let (text, at, token, warnings) = gated(stream);
+        let want = whole(&text);
+        // A pipe's probe holds the front of the stream before the first window: none of
+        // it, half of it and all of it.
+        for (block, probe) in blocks
+            .iter()
+            .flat_map(|&block| [0, stream.len() / 2, stream.len()].map(|p| (block, p)))
+        {
+            let mut file = tempfile::tempfile().expect("a temp file");
+            file.write_all(&stream[probe..]).expect("written");
+            file.rewind().expect("rewound");
+            let slot = SeqTailSlot::default();
+            let mut reader = WindowedFile::from_seq_pipe(
+                Rc::new(file),
+                stream[..probe].to_vec(),
+                block,
+                Rc::clone(&slot),
+            );
+            let (mut spans, mut lines, mut notes) = (Vec::new(), Vec::new(), Vec::new());
+            // What a run shows, in its order: each warning before the first value that
+            // starts after it.
+            let mut shown = Vec::new();
+            while let Some(window) = reader.next_window().expect("reads") {
+                let mut counter = LineCounter::new(window.raw);
+                counter.set_lines_before(window.lines_before);
+                let mut met = window.notes.iter().peekable();
+                for &(start, end) in &window.values {
+                    while let Some((_, line)) = met.next_if(|&&(at, _)| at < start) {
+                        shown.push(line.clone());
+                    }
+                    let text = String::from_utf8_lossy(&window.raw[start..end]);
+                    shown.push(format!("{text} at {}", counter.read_end_line(end)));
+                    spans.push((window.offset + start, window.offset + end));
+                    lines.push(counter.read_end_line(end));
+                }
+                shown.extend(met.map(|(_, line)| line.clone()));
+                notes.extend(
+                    window
+                        .notes
+                        .iter()
+                        .map(|(at, line)| (window.offset + at, line.clone())),
+                );
+                assert_eq!(window.split_error, None);
+            }
+            let case = format!(
+                "{:?} ({} bytes), block {block}, probe {probe}",
+                String::from_utf8_lossy(&stream[..stream.len().min(300)]),
+                stream.len()
+            );
+            assert_eq!(
+                (spans, lines),
+                (want.spans.clone(), want.lines.clone()),
+                "{case}"
+            );
+            // A warning met in text that was dropped with nothing to run is moved to
+            // the front of what is left, so only the lines and their order are the
+            // gate's; `shown` below holds their place among the values.
+            let lines_of = |notes: &[(usize, String)]| -> Vec<String> {
+                notes.iter().map(|(_, line)| line.clone()).collect()
+            };
+            assert_eq!(lines_of(&notes), lines_of(&warnings), "{case}");
+            assert!(
+                notes
+                    .iter()
+                    .zip(&warnings)
+                    .all(|(got, want)| got.0 >= want.0),
+                "{case}"
+            );
+            let handed = slot.borrow_mut().take();
+            assert_eq!(handed.is_some(), at.is_some(), "{case}");
+            // The run as jq's reader reads the stream whole.
+            let mut jq_shown = Vec::new();
+            {
+                let sources = vec![(None, stream.to_vec())];
+                let mut events: Vec<(usize, String)> = Vec::new();
+                let walk = crate::jq_seq_reader::walk_stream_collecting_at(
+                    &sources,
+                    false,
+                    false,
+                    crate::jq_seq_reader::Tail::Opened,
+                    &mut |warning, at| events.push((at, warning.to_string())),
+                );
+                let mut events = events.into_iter().peekable();
+                for (&(start, end), &(_, line)) in walk.values.iter().zip(&walk.locations) {
+                    while let Some((_, warning)) = events.next_if(|&(at, _)| at < start) {
+                        jq_shown.push(warning);
+                    }
+                    let text = String::from_utf8_lossy(&stream[start..end]);
+                    jq_shown.push(format!("{text} at {line}"));
+                }
+                jq_shown.extend(events.map(|(_, warning)| warning));
+            }
+            if let Some(handed) = handed {
+                let at = at.expect("checked");
+                assert_eq!(
+                    handed.stream,
+                    resumed_stream(count_newlines(&stream[..at]), stream[at..].to_vec()),
+                    "{case}"
+                );
+                assert_eq!(handed.token_byte, token, "{case}");
+                seed_token_byte(handed.token_byte);
+                let (tail_warnings, tail_values) = walked(&handed.stream);
+                seed_token_byte(None);
+                // The tail's warnings and values, in the order the whole walk has them.
+                let tail_shown = &jq_shown[shown.len()..];
+                let mut tail_events: Vec<&String> = tail_shown.iter().collect();
+                tail_events.sort();
+                let mut tail_made: Vec<String> = tail_warnings
+                    .into_iter()
+                    .chain(
+                        tail_values
+                            .iter()
+                            .map(|(text, line)| format!("{text} at {line}")),
+                    )
+                    .collect();
+                tail_made.sort();
+                assert_eq!(tail_made.iter().collect::<Vec<_>>(), tail_events, "{case}");
+                assert_eq!(shown, jq_shown[..shown.len()], "{case}");
+            } else {
+                assert_eq!(shown, jq_shown, "{case}");
+            }
+        }
+        !warnings.is_empty()
+    }
+
+    /// #7322: the windows of a `--seq` stream carry on after a stretch that is not plain records, and
+    /// with what is handed on they are the stream as jq's reader reads it whole: the same values, each
+    /// on the line jq names for it, and the same warnings in the same order, wherever the stretches lie
+    /// (the stream's first record among them) and whatever the reads' size.
+    #[test]
+    fn a_seq_stream_carries_on_after_a_stretch_that_is_not_plain_7322() {
         let stretches: [&[u8]; 14] = [
             b"\x1e{\"id\":-1,\"name\":\"cut\n",
             b"\x1en\n",
@@ -3385,135 +3622,7 @@ mod tests {
                     if shape != 2 && m != (n + 1) % stretches.len() {
                         continue;
                     }
-                    let (text, at, token, warnings) = gated(stream);
-                    resumed_streams += usize::from(!warnings.is_empty());
-                    let want = whole(&text);
-                    // A pipe's probe holds the front of the stream before the first window: none of
-                    // it, half of it and all of it.
-                    for (block, probe) in [1usize, 7, 64, 4096]
-                        .into_iter()
-                        .flat_map(|block| [0, stream.len() / 2, stream.len()].map(|p| (block, p)))
-                    {
-                        let mut file = tempfile::tempfile().expect("a temp file");
-                        file.write_all(&stream[probe..]).expect("written");
-                        file.rewind().expect("rewound");
-                        let slot = SeqTailSlot::default();
-                        let mut reader = WindowedFile::from_seq_pipe(
-                            Rc::new(file),
-                            stream[..probe].to_vec(),
-                            block,
-                            Rc::clone(&slot),
-                        );
-                        let (mut spans, mut lines, mut notes) =
-                            (Vec::new(), Vec::new(), Vec::new());
-                        // What a run shows, in its order: each warning before the first value that
-                        // starts after it.
-                        let mut shown = Vec::new();
-                        while let Some(window) = reader.next_window().expect("reads") {
-                            let mut counter = LineCounter::new(window.raw);
-                            counter.set_lines_before(window.lines_before);
-                            let mut met = window.notes.iter().peekable();
-                            for &(start, end) in &window.values {
-                                while let Some((_, line)) = met.next_if(|&&(at, _)| at < start) {
-                                    shown.push(line.clone());
-                                }
-                                let text = String::from_utf8_lossy(&window.raw[start..end]);
-                                shown.push(format!("{text} at {}", counter.read_end_line(end)));
-                                spans.push((window.offset + start, window.offset + end));
-                                lines.push(counter.read_end_line(end));
-                            }
-                            shown.extend(met.map(|(_, line)| line.clone()));
-                            notes.extend(
-                                window
-                                    .notes
-                                    .iter()
-                                    .map(|(at, line)| (window.offset + at, line.clone())),
-                            );
-                            assert_eq!(window.split_error, None);
-                        }
-                        let case = format!(
-                            "{:?}, block {block}, probe {probe}",
-                            String::from_utf8_lossy(stream)
-                        );
-                        assert_eq!(
-                            (spans, lines),
-                            (want.spans.clone(), want.lines.clone()),
-                            "{case}"
-                        );
-                        // A warning met in text that was dropped with nothing to run is moved to
-                        // the front of what is left, so only the lines and their order are the
-                        // gate's; `shown` below holds their place among the values.
-                        let lines_of = |notes: &[(usize, String)]| -> Vec<String> {
-                            notes.iter().map(|(_, line)| line.clone()).collect()
-                        };
-                        assert_eq!(lines_of(&notes), lines_of(&warnings), "{case}");
-                        assert!(
-                            notes
-                                .iter()
-                                .zip(&warnings)
-                                .all(|(got, want)| got.0 >= want.0),
-                            "{case}"
-                        );
-                        let handed = slot.borrow_mut().take();
-                        assert_eq!(handed.is_some(), at.is_some(), "{case}");
-                        // The run as jq's reader reads the stream whole.
-                        let mut jq_shown = Vec::new();
-                        {
-                            let sources = vec![(None, stream.clone())];
-                            let mut events: Vec<(usize, String)> = Vec::new();
-                            let walk = crate::jq_seq_reader::walk_stream_collecting_at(
-                                &sources,
-                                false,
-                                false,
-                                crate::jq_seq_reader::Tail::Opened,
-                                &mut |warning, at| events.push((at, warning.to_string())),
-                            );
-                            let mut events = events.into_iter().peekable();
-                            for (&(start, end), &(_, line)) in
-                                walk.values.iter().zip(&walk.locations)
-                            {
-                                while let Some((_, warning)) = events.next_if(|&(at, _)| at < start)
-                                {
-                                    jq_shown.push(warning);
-                                }
-                                let text = String::from_utf8_lossy(&stream[start..end]);
-                                jq_shown.push(format!("{text} at {line}"));
-                            }
-                            jq_shown.extend(events.map(|(_, warning)| warning));
-                        }
-                        if let Some(handed) = handed {
-                            let at = at.expect("checked");
-                            assert_eq!(
-                                handed.stream,
-                                resumed_stream(
-                                    count_newlines(&stream[..at]),
-                                    stream[at..].to_vec()
-                                ),
-                                "{case}"
-                            );
-                            assert_eq!(handed.token_byte, token, "{case}");
-                            seed_token_byte(handed.token_byte);
-                            let (tail_warnings, tail_values) = walked(&handed.stream);
-                            seed_token_byte(None);
-                            // The tail's warnings and values, in the order the whole walk has them.
-                            let tail_shown = &jq_shown[shown.len()..];
-                            let mut tail_events: Vec<&String> = tail_shown.iter().collect();
-                            tail_events.sort();
-                            let mut tail_made: Vec<String> = tail_warnings
-                                .into_iter()
-                                .chain(
-                                    tail_values
-                                        .iter()
-                                        .map(|(text, line)| format!("{text} at {line}")),
-                                )
-                                .collect();
-                            tail_made.sort();
-                            assert_eq!(tail_made.iter().collect::<Vec<_>>(), tail_events, "{case}");
-                            assert_eq!(shown, jq_shown[..shown.len()], "{case}");
-                        } else {
-                            assert_eq!(shown, jq_shown, "{case}");
-                        }
-                    }
+                    resumed_streams += usize::from(check_gated_windows(stream, &[1, 7, 64, 4096]));
                 }
             }
         }
@@ -3571,10 +3680,43 @@ mod tests {
         }
     }
 
-    /// #7322: a stretch with no plain record after it within the gate's look-ahead is handed on with the
-    /// rest of the stream, as every record that is not plain was.
+    /// #7341: a stretch several pieces long is read a piece at a time, cut at an RS that starts a line,
+    /// and its windows with what is handed on are the stream as jq's reader reads it whole: in the
+    /// middle of the stream, at its start, and running to its end, where the stream is handed on from
+    /// the stretch's last RS that starts a line.
     #[test]
-    fn a_stretch_longer_than_the_look_ahead_is_handed_on_7322() {
+    fn a_long_stretch_is_read_in_pieces_as_jq_reads_it_whole_7341() {
+        let bad: [&[u8]; 6] = [
+            b"\x1e[1,]\n",
+            b"\x1enan\n",
+            b"\x1e} 5\n",
+            b"\x1e012 [1,\n",
+            b"\x1e\"\xff\"\n",
+            b"\x1e1\x1e",
+        ];
+        let mut long = Vec::new();
+        for i in 0.. {
+            if long.len() > 3 * SEQ_STRETCH_PIECE + 100 {
+                break;
+            }
+            long.extend_from_slice(bad[i % bad.len()]);
+        }
+        let streams = [
+            [seq_stream(5, b"").as_slice(), &long, &seq_stream(5, b"")].concat(),
+            [long.as_slice(), &seq_stream(3, b"")].concat(),
+            [seq_stream(5, b"").as_slice(), &long].concat(),
+        ];
+        for stream in &streams {
+            assert!(check_gated_windows(stream, &[4096, 65536, 1 << 20]));
+        }
+    }
+
+    /// #7322, #7341: a stretch is read on to the first plain record at a line start after it; one
+    /// longer than a piece ([`SEQ_STRETCH_PIECE`]) is cut at its last RS that starts a line, and only a
+    /// line longer than the look-ahead ([`MAX_SEQ_STRETCH`]) with no plain record in sight yet is handed
+    /// on with the rest of the stream.
+    #[test]
+    fn a_long_stretch_is_cut_at_a_line_start_and_a_long_line_handed_on_7341() {
         let gate = |stream: &[u8]| {
             let mut gate = SeqGate::new(SeqTailSlot::default());
             gate.advance(stream, false)
@@ -3588,6 +3730,7 @@ mod tests {
         ]
         .concat();
         assert!(matches!(gate(&near), GateStep::Stretch { from, .. } if from == records.len()));
+        // A line past the look-ahead that a plain record follows is read on, as it is already read.
         let far = [
             records.as_slice(),
             b"\x1e\"",
@@ -3595,17 +3738,42 @@ mod tests {
             b"\n\x1e1\n\x1e2\n",
         ]
         .concat();
-        assert!(matches!(gate(&far), GateStep::Unclean(at) if at == records.len()));
-        // The same while the record after a bad one is still being read, with no RS after it yet.
+        assert!(matches!(gate(&far), GateStep::Stretch { from, .. } if from == records.len()));
+        // While the record after a bad one is still being read, with no RS after it yet: a line past
+        // the look-ahead is handed on, and the bad record before it is cut off first.
+        let line = [
+            records.as_slice(),
+            b"\x1e[1,]\x1e\"",
+            &vec![b'x'; MAX_SEQ_STRETCH],
+        ]
+        .concat();
+        assert!(matches!(gate(&line), GateStep::Unclean(at) if at == records.len()));
         let open = [
             records.as_slice(),
             b"\x1e[1,]\n\x1e\"",
             &vec![b'x'; MAX_SEQ_STRETCH],
         ]
         .concat();
-        assert!(matches!(gate(&open), GateStep::Unclean(at) if at == records.len()));
+        let cut = records.len() + b"\x1e[1,]\n".len();
+        assert!(
+            matches!(gate(&open), GateStep::Cut { from, to } if from == records.len() && to == cut)
+        );
         let short = [records.as_slice(), b"\x1e[1,]\n\x1e\"", &vec![b'x'; 1000]].concat();
         assert!(matches!(gate(&short), GateStep::Clean(at) if at == records.len()));
+        // Bad records, one a line, for longer than a piece: cut at the last one that starts within it.
+        let bad_record = b"\x1e[1,]\n";
+        let bad: Vec<u8> = bad_record.repeat(SEQ_STRETCH_PIECE / bad_record.len() + 10);
+        let many = [records.as_slice(), &bad, b"\x1e2\n"].concat();
+        match gate(&many) {
+            GateStep::Cut { from, to } => {
+                assert_eq!(from, records.len());
+                assert_eq!(many[to], RS);
+                assert_eq!(many[to - 1], b'\n');
+                let piece = to - from;
+                assert!(piece > SEQ_STRETCH_PIECE && piece <= SEQ_STRETCH_PIECE + bad_record.len());
+            }
+            _ => panic!("a long stretch of lines is cut"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#7341)"
+        }
     }
 
     /// #7164: a `--seq` pipe hands out the documents and lines of its plain records, with each RS read as a

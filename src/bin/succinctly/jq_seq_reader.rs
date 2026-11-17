@@ -793,8 +793,9 @@ pub(crate) struct StretchWalk {
 }
 
 /// The most warnings a [`walk_stretch`] keeps: a stretch can warn once a byte (a run of `}`), and each
-/// is a line held until the values before it have run.
-const MAX_STRETCH_WARNINGS: usize = 1024;
+/// is a line held until the values before it have run. A stretch is read in pieces of 64 KiB, or a line
+/// (#7341), so this is a piece's worth: only a line longer than that which warns once a byte is past it.
+const MAX_STRETCH_WARNINGS: usize = 1 << 16;
 
 /// Walks `stretch` as jq's reader walks it in the middle of a stream (#7322): from the RS that opens a
 /// record which is not `RS value LF`, through the next RS at a line start that opens a record which
