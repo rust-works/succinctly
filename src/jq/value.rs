@@ -332,10 +332,23 @@ pub(crate) fn document_number_f64<S: EvalSemantics>(
     fallback: impl FnOnce() -> Option<f64>,
 ) -> Option<f64> {
     if S::DECNUMBER_LITERALS {
-        if let Some(f) = core::str::from_utf8(bytes)
-            .ok()
-            .and_then(jq_literal_text_to_f64)
-        {
+        if let Ok(text) = core::str::from_utf8(bytes) {
+            return document_number_text_f64::<S>(text, fallback);
+        }
+    }
+    fallback()
+}
+
+/// [`document_number_f64`] of a number's text that is already a `&str`: the same answer, without
+/// a second UTF-8 pass over bytes the caller has decoded once (#7315). A math builtin read each
+/// document number's span three times through `str::from_utf8`, 12.5% of `[.numbers[] | floor]`'s
+/// instructions on 699,050 numbers.
+pub(crate) fn document_number_text_f64<S: EvalSemantics>(
+    text: &str,
+    fallback: impl FnOnce() -> Option<f64>,
+) -> Option<f64> {
+    if S::DECNUMBER_LITERALS {
+        if let Some(f) = jq_literal_text_to_f64(text) {
             return Some(f);
         }
     }

@@ -113175,7 +113175,7 @@ pub(crate) fn owned_unary_math<S: EvalSemantics>(
         OwnedValue::NumberLiteral(_, text)
             if crate::json::validate::is_valid_number(text.as_bytes()) =>
         {
-            super::value::document_number_f64::<S>(text.as_bytes(), || input.as_f64())
+            super::value::document_number_text_f64::<S>(text, || input.as_f64())
         }
         _ => None,
     }

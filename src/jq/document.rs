@@ -1412,6 +1412,18 @@ pub trait DocumentValue: Sized + Clone {
         self.number_literal()
     }
 
+    /// [`number_text`](Self::number_text) when that text is an RFC 8259 number
+    /// ([`is_valid_number`](crate::json::validate::is_valid_number)), `None`
+    /// otherwise: a bridge token, a lenient span, a non-number. The readers that
+    /// accept only a valid span (the math builtins of a document number) ask
+    /// this rather than validating `number_text`'s answer themselves, so JSON
+    /// can answer from one grammar pass over the raw span and skip the UTF-8
+    /// pass `number_text` makes (#7315).
+    fn valid_number_text(&self) -> Option<Cow<'_, str>> {
+        self.number_text()
+            .filter(|text| crate::json::validate::is_valid_number(text.as_bytes()))
+    }
+
     /// The value this number token carries if it is the reindex bridge's
     /// computed-float token (`crate::json::validate::computed_float_token`,
     /// #2902), `None` for every other value.

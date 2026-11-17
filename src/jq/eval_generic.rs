@@ -412,9 +412,8 @@ fn guard_path_walk_depth_past_constant() -> Result<(), EvalError> {
 /// token or a decNumber word takes the plain `as_f64()` exactly as before.
 fn document_number_f64_generic<S: EvalSemantics, V: DocumentValue>(value: &V) -> Option<f64> {
     match value.number_text() {
-        Some(text) => {
-            crate::jq::value::document_number_f64::<S>(text.as_bytes(), || value.as_f64())
-        }
+        // #7315: the text is decoded already; reading it from its bytes would decode it again.
+        Some(text) => crate::jq::value::document_number_text_f64::<S>(&text, || value.as_f64()),
         None => value.as_f64(),
     }
 }
@@ -426,8 +425,9 @@ fn document_number_f64_generic<S: EvalSemantics, V: DocumentValue>(value: &V) ->
 /// evaluates the builtin over that one-number document: a round trip and an index build per number
 /// to make one libm call (`[.numbers[]|floor]` was 0.87x of jq, and `floor|.+1` 0.57x).
 ///
-/// The double is [`document_number_f64_generic`]'s, which is `eval.rs`'s `json_number_f64` for a
-/// cursor, and the result is the one `builtin_floor` and its siblings build
+/// The double is [`document_number_f64_generic`]'s (read from the text
+/// [`DocumentValue::valid_number_text`] already decoded, #7315), which is `eval.rs`'s
+/// `json_number_f64` for a cursor, and the result is the one `builtin_floor` and its siblings build
 /// ([`integral_f64_result`](crate::jq::eval::integral_f64_result), `OwnedValue::Float` for
 /// `sqrt`/`fabs`), so the answer is the same value the bridge produced.
 ///
@@ -447,11 +447,11 @@ fn unary_math_of_document_number<S: EvalSemantics, V: DocumentValue>(
     if !crate::jq::eval::is_unary_math_builtin(builtin) {
         return None;
     }
-    let text = value.number_text()?;
-    if !crate::json::validate::is_valid_number(text.as_bytes()) {
-        return None;
-    }
-    let n = document_number_f64_generic::<S, V>(value).filter(|n| n.is_finite())?;
+    // #7315: one read of the span, which validates it as a number and as UTF-8 at once; it used to
+    // be decoded three times (`number_text` here, then again for the double).
+    let text = value.valid_number_text()?;
+    let n = crate::jq::value::document_number_text_f64::<S>(&text, || value.as_f64())
+        .filter(|n| n.is_finite())?;
     crate::jq::eval::unary_math_apply::<S>(builtin, n)
 }
 
@@ -492,10 +492,7 @@ fn binary_math_of_document_number<S: EvalSemantics, V: DocumentValue>(
     if S::TAG != EvalTag::Jq || !crate::jq::eval::binary_math_operands_are_simple(builtin) {
         return None;
     }
-    let text = value.number_text()?;
-    if !crate::json::validate::is_valid_number(text.as_bytes()) {
-        return None;
-    }
+    value.valid_number_text()?;
     let owned = to_owned::<S, V>(value).ok()?;
     crate::jq::eval::owned_binary_math::<S>(builtin, &owned)
 }
