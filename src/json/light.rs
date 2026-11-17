@@ -9047,6 +9047,16 @@ mod tests {
                 },
                 "a repeat at {keys} keys is reported as one"
             );
+            // And is printed as jq collapses it: the first key takes the last
+            // one's value, and the last goes (#7310, the plan built from the
+            // scan's hashes on either side of the ceiling).
+            let mut want = String::from_utf8(object(keys - 1, None)).unwrap();
+            want.replace_range(.."{\"k000000\":0".len(), "{\"k000000\":1");
+            assert_eq!(
+                render_compact_jq_through_gate(&repeat),
+                Some(want),
+                "the collapse of a repeat at {keys} keys"
+            );
         }
     }
 
