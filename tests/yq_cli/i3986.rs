@@ -166,3 +166,45 @@ fn a_getter_of_a_navigated_node_keeps_the_separator_3986() -> Result<()> {
         ),
     ])
 }
+
+/// A root that carries a comment of its own, a getter after `.` or a root rebound to a variable:
+/// the string is still computed, so no separator.
+#[test]
+fn a_getter_of_a_commented_or_rebound_root_prints_no_separator_3986() -> Result<()> {
+    assert_rows(&[
+        ("1 # c1\n---\n2 # c2\n", &[], "line_comment", "c1\nc2\n"),
+        ("1 # c1\n---\n2 # c2\n", &[], ". | line_comment", "c1\nc2\n"),
+        ("# h1\n1\n---\n# h2\n2\n", &[], "head_comment", "h1\nh2\n"),
+        (
+            "# h1\n1\n---\n# h2\n2\n",
+            &[],
+            ". | head_comment",
+            "h1\nh2\n",
+        ),
+        ("1\n# f1\n---\n2\n# f2\n", &[], "foot_comment", "f1\nf2\n"),
+        (
+            "1\n# f1\n---\n2\n# f2\n",
+            &[],
+            ". | foot_comment",
+            "f1\nf2\n",
+        ),
+        (
+            "a: &x 1\nb: *x\n---\na: &y 2\nb: *y\n",
+            &[],
+            ".b | alias",
+            "x\n---\ny\n",
+        ),
+        (
+            "a: &x 1\nb: *x\n---\na: &y 2\nb: *y\n",
+            &[],
+            ". as $r | $r | head_comment",
+            "\n\n",
+        ),
+        (
+            "a: 1 # l\nb: 2\n---\na: 3\nb: 4\n",
+            &[],
+            ". as $r | $r | line_comment",
+            "\n\n",
+        ),
+    ])
+}
