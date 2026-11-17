@@ -5233,7 +5233,8 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
 
     // #7082: a lone regular file of RFC 7464's own framing is read a window at a time, as the plain
     // route reads its file (#6920), so the run holds a window where it held the file; #7164: a pipe
-    // too, up to its first record that is not that framing.
+    // too, up to its first record that is not that framing; #7322: and past such a record, when
+    // plain records follow it.
     let mut seq_windowed = if args.seq && lazy_route_open {
         windowed_seq_file(&args)
     } else {
@@ -11686,8 +11687,10 @@ fn windowed_seq_file(args: &JqCommand) -> Option<WindowedSource> {
 /// A lone `--seq` source that is a regular file (named, or on standard input) which the prepass of
 /// [`windowed_seq_file`] could not vouch for (#7262): it holds a record that is not `RS value LF`, or
 /// none at all. It is read as a `--seq` pipe is ([`window::WindowedFiles::seq_pipe`], #7164): from where it
-/// stands, a window at a time while its records are plain, each certified when the RS after it is read, and
-/// from the first that is not, the rest is read and handed to the route that walks a stream whole
+/// stands, a window at a time while its records are plain, each certified when the RS after it is read. A
+/// record that is not plain with plain records after it is read as jq's reader reads it, and the windows
+/// carry on (#7322: a bad first record no longer costs the whole file). From the first the windows cannot
+/// carry on after, the rest is read and handed to the route that walks a stream whole
 /// ([`hand_on_seq_pipe_tail`]), where jq's reader stands after the records already run. A stream that is
 /// not plain from its first byte is handed on whole, as that route would have read it. Several files are
 /// the whole-file route's still: what a tail mid-file means for the files after it is not worked out.

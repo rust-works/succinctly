@@ -1194,10 +1194,11 @@ struct SeqFilesCheck {
 /// at a time. A pipe cannot be read twice, and its windows' output cannot be taken back, so unlike the
 /// regular file's prepass (#7082) the verdict comes as the windows are read: each record is checked when
 /// the RS after it (or the stream's end) is read, with the check [`crate::jq_seq_reader::PlainRecords`]
-/// makes of a whole stream, and a window gives the records up to the last checked one. At the first
-/// record that is not `RS value LF`, or one bigger than [`MAX_PENDING_RECORD`], the windows end before
-/// its RS and the rest of the stream is read and handed on ([`SeqTail`]), where jq's reader stands at a
-/// line start with nothing pending.
+/// makes of a whole stream, and a window gives the records up to the last checked one. A record that is
+/// not `RS value LF` is read as jq's reader reads it when plain records follow it, and the windows carry
+/// on after it ([`SeqGate::judge`], #7322). At the first such record they cannot carry on after, or one
+/// bigger than [`MAX_PENDING_RECORD`], the windows end before its RS and the rest of the stream is read
+/// and handed on ([`SeqTail`]), where jq's reader stands at a line start with nothing pending.
 struct SeqGate {
     /// `buf[..checked]` is records that are each `RS value LF`; the record in progress opens at `checked`
     /// (an RS), or the stream is all certified when it is the end of `buf`.
@@ -1364,9 +1365,10 @@ impl SeqGate {
 }
 
 impl WindowedFile {
-    /// A `--seq` pipe on standard input (#7164), from the front a first read of it took: only its records
-    /// that are `RS value LF` are handed out, each RS read as a space, and the stream from the first that
-    /// is not goes to `slot` ([`SeqGate`]). Nothing of the text is changed before it is certified, so the
+    /// A `--seq` pipe on standard input (#7164), from the front a first read of it took: its records
+    /// that are `RS value LF` are handed out, each RS read as a space, with the values of the stretches
+    /// between them that jq's reader can be followed through (#7322), and the stream from the first
+    /// record it cannot be goes to `slot` ([`SeqGate`]). Nothing of the text is changed before it is certified, so the
     /// tail is the bytes as read: no BOM is skipped (one is no record's start, and the gate hands it on).
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) fn from_seq_pipe(
