@@ -19889,12 +19889,14 @@ mod standalone_comment_attribution_2811 {
         assert_slots("---\n# c\n42\n", &[(". | head_comment", "c")])?;
         assert_slots("42\n\n# foot\n", &[(". | foot_comment", "foot")])?;
         assert_slots("[1, 2]\n  # foot\n", &[(". | foot_comment", "foot")])?;
+        // A comment getter builds a string that belongs to no document, so yq v4.53.3 prints no
+        // `---` between the two documents' values (#3986).
         let (out, code) = run_yq_stdin(". | foot_comment", "42\n# f1\n---\n# h\n43\n", &[])?;
         assert_eq!(code, 0);
-        assert_eq!(out, "f1\n---\n\n");
+        assert_eq!(out, "f1\n\n");
         let (out, code) = run_yq_stdin(". | head_comment", "42\n# f1\n---\n# h\n43\n", &[])?;
         assert_eq!(code, 0);
-        assert_eq!(out, "\n---\nh\n");
+        assert_eq!(out, "\nh\n");
         Ok(())
     }
 

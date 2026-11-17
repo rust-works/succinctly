@@ -304,6 +304,10 @@ fn builtin_node(builtin: &Builtin, input: Node) -> Option<Node> {
         | Builtin::Type
         | Builtin::Tag
         | Builtin::Anchor
+        | Builtin::Alias
+        | Builtin::HeadComment
+        | Builtin::LineComment
+        | Builtin::FootComment
         | Builtin::Style
         | Builtin::Kind
         | Builtin::Key
@@ -356,6 +360,10 @@ mod tests {
             ". as $x | \"x\"",
             "file_index",
             "document_index",
+            "head_comment",
+            "line_comment",
+            "foot_comment",
+            "alias",
             ".a | keys",
             ".a | with_entries(.)",
             ".a | \"\\(.)\"",
@@ -387,6 +395,10 @@ mod tests {
             "{\"k\": .a}",
             ".a + 1",
             ".a | document_index",
+            ".a | head_comment",
+            ".a | line_comment",
+            ".a | foot_comment",
+            ".a | alias",
             ".a == 1",
             "null + .a",
             ".[] == 1",
