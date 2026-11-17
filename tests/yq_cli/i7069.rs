@@ -1,7 +1,9 @@
 //! #7069: yq's `...` is `..` that also yields each mapping key before its value, so `[...] | length` counts the
 //! keys too (7 over `a:` / `  b: thing` / `  c: something`, where `[..] | length` is 4). It was a parse error
 //! outside a metadata assignment (`... comments = ""`, #2796). Each row is a live yq v4.53.3 capture
-//! (`yq -o=json -I0 FILTER`).
+//! (`yq -o=json -I0 FILTER`). The tests from `META_ROWS` on are the second slice: a metadata assignment in the
+//! body of `with(PATH; ...)` or `PATH |= (...)`, which is a stage of the filter with `PATH` in front of its
+//! target (YAML output, `yq FILTER`).
 
 use anyhow::Result;
 
@@ -268,6 +270,74 @@ fn a_body_that_reads_the_node_or_deletes_stays_refused_7069() -> Result<()> {
             "a:\n  b: thing\n  c: something\n",
             "with(.a; . style=\"double\" | .c = .b)",
         ),
+    ] {
+        let (out, code) = run_yq_stdin(filter, doc, &[])?;
+        assert_eq!((out.as_str(), code), ("", 1), "{filter}");
+    }
+    Ok(())
+}
+
+/// The same writes as a stage among others: behind a variable binding, a `select`, a parenthesis,
+/// another write, and as the first of two (every row is yq's output).
+const META_CONTEXT_ROWS: &[(&str, &str, &str)] = &[
+    (
+        "- a: x\n- a: y\n",
+        ". as $v | with(.[0]; .a style=\"double\")",
+        "- a: \"x\"\n- a: y\n",
+    ),
+    (
+        "- a: x\n- a: y\n",
+        "select(true) | with(.[]; .a style=\"double\")",
+        "- a: \"x\"\n- a: \"y\"\n",
+    ),
+    (
+        "- a: x\n- a: y\n",
+        "with(.[0]; .a style=\"double\") | .[0]",
+        "a: \"x\"\n",
+    ),
+    (
+        "- a: x\n- a: y\n",
+        "(with(.[]; .a style=\"double\"))",
+        "- a: \"x\"\n- a: \"y\"\n",
+    ),
+    (
+        "- a: x\n- a: y\n",
+        "with(.[1]; with(.[]; .a style=\"double\"))",
+        "- a: x\n- a: y\n",
+    ),
+    (
+        "- a: x\n- a: y\n",
+        ".[0] |= (.a style=\"double\") | .[0] |= (.a style=\"double\")",
+        "- a: \"x\"\n- a: y\n",
+    ),
+    (
+        "- a: x\n- a: y\n",
+        "with(.[0]; .a style=\"double\") | with(.[0]; .a style=\"double\")",
+        "- a: \"x\"\n- a: y\n",
+    ),
+    (
+        "- a: x\n- a: y\n",
+        ". as $v | .[0] |= (.a style=\"double\")",
+        "- a: \"x\"\n- a: y\n",
+    ),
+];
+
+#[test]
+fn a_metadata_assignment_in_a_with_body_works_as_a_stage_among_others_7069() -> Result<()> {
+    for &(doc, filter, want) in META_CONTEXT_ROWS {
+        let (out, code) = run_yq_stdin(filter, doc, &[])?;
+        assert_eq!((out.as_str(), code), (want, 0), "{filter} on {doc:?}");
+    }
+    Ok(())
+}
+
+/// Behind a navigation that is not a path to one node the write is refused (#2679), where the build
+/// before the rewrite printed the input with an extra `0: null` entry for the same filters.
+#[test]
+fn a_metadata_assignment_in_a_with_body_behind_a_navigation_is_refused_7069() -> Result<()> {
+    for (doc, filter) in [
+        ("- a: x\n- a: y\n", ".[] | with(.[0]; .a style=\"double\")"),
+        ("- a: x\n- a: y\n", ".. | .[0] |= (.a style=\"double\")"),
     ] {
         let (out, code) = run_yq_stdin(filter, doc, &[])?;
         assert_eq!((out.as_str(), code), ("", 1), "{filter}");
