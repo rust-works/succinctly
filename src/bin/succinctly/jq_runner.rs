@@ -11653,24 +11653,19 @@ fn gated_seq_source(files: Vec<PathBuf>) -> Option<WindowedSource> {
     // A file the whole-file route could not hold (a sparse file of terabytes) is that route's to report,
     // as it reads it before it runs anything (`Could not open file ...: out of memory`): read here, the
     // records before the bad one would be run first.
-    let left = file
-        .metadata()
-        .ok()?
-        .len()
-        .saturating_sub(file.stream_position().ok()?);
+    let start = file.stream_position().ok()?;
+    let left = file.metadata().ok()?.len().saturating_sub(start);
     if !could_hold(left) {
         return None;
     }
+    // #7312: a stream that does not open with an RS is handed on at its first byte, so it is not read a
+    // megabyte window first.
+    let block = window::seq_block_bytes(&file, start);
     let slot = window::SeqTailSlot::default();
     SEQ_PIPE_TAIL.with(|tail| *tail.borrow_mut() = Some(std::rc::Rc::clone(&slot)));
     Some((
         files,
-        window::WindowedFiles::seq_pipe(
-            std::rc::Rc::new(file),
-            Vec::new(),
-            window::WINDOW_BYTES,
-            slot,
-        ),
+        window::WindowedFiles::seq_pipe(std::rc::Rc::new(file), Vec::new(), block, slot),
         std::rc::Rc::new(window::Reread::seen(window::SeenFault::default())),
     ))
 }

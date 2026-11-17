@@ -73,6 +73,27 @@ pub(super) const WINDOW_BYTES: usize = 1 << 20;
 /// route, and the file is read whole as before.
 pub(super) const MIN_WINDOWED_FILE_BYTES: u64 = 4 * WINDOW_BYTES as u64;
 
+/// The window of a lone `--seq` file whose first byte is not an RS (#7312): [`SeqGate`] hands the stream
+/// on at that byte whatever is read, so the first read, which is all the gate looks at, is a page and
+/// not a [`WINDOW_BYTES`] block that is filled, found to be all tail and freed, which the allocator
+/// then keeps resident beside the tail (1 MiB at the run's peak).
+const SEQ_UNOPENED_BLOCK_BYTES: usize = 4096;
+
+/// The window size for a `--seq` file read from byte `start`: [`WINDOW_BYTES`], or
+/// [`SEQ_UNOPENED_BLOCK_BYTES`] when the stream does not open with an RS, which the gate hands on at
+/// its first byte (#7312). Only the size of the reads differs, never the answers: the windows of a
+/// stream that is handed on at once are empty. A file that cannot be read at `start` gets the full
+/// block.
+#[cfg(unix)]
+pub(super) fn seq_block_bytes(file: &File, start: u64) -> usize {
+    use std::os::unix::fs::FileExt;
+    let mut first = [0u8; 1];
+    match file.read_at(&mut first, start) {
+        Ok(read) if read == 0 || first[0] != RS => SEQ_UNOPENED_BLOCK_BYTES,
+        _ => WINDOW_BYTES,
+    }
+}
+
 /// How many windows a document that does not fit in one is read on to before the rest of the file is.
 const LOOKAHEAD_WINDOWS: usize = 8;
 
@@ -2780,6 +2801,40 @@ mod tests {
             fault,
             lines,
         }
+    }
+
+    /// #7312: a `--seq` file is read a megabyte at a time only when its first byte, from where the run
+    /// reads it, is an RS: any other stream is handed on at that byte, so a page is all that is read.
+    #[test]
+    fn seq_block_is_a_page_unless_the_stream_opens_with_an_rs_7312() {
+        let file_of = |bytes: &[u8]| {
+            let mut file = tempfile::tempfile().expect("a temp file");
+            file.write_all(bytes).expect("written");
+            file
+        };
+        let opens = file_of(b"\x1e1\n");
+        assert_eq!(seq_block_bytes(&opens, 0), WINDOW_BYTES);
+        // Text before the first RS, a BOM, white space, a file with no RS at all, and an empty one.
+        for (name, bytes) in [
+            ("text", &b"x\x1e1\n"[..]),
+            ("bom", &b"\xef\xbb\xbf\x1e1\n"[..]),
+            ("space", &b" \x1e1\n"[..]),
+            ("none", &b"[1,2]\n"[..]),
+            ("empty", &b""[..]),
+        ] {
+            assert_eq!(
+                seq_block_bytes(&file_of(bytes), 0),
+                SEQ_UNOPENED_BLOCK_BYTES,
+                "{name}"
+            );
+        }
+        // Where the run reads from decides, not the file's first byte: a file on standard input that
+        // is read from an offset (the descriptor's position).
+        let shifted = file_of(b"x\x1e1\n");
+        assert_eq!(seq_block_bytes(&shifted, 1), WINDOW_BYTES);
+        assert_eq!(seq_block_bytes(&shifted, 0), SEQ_UNOPENED_BLOCK_BYTES);
+        assert_eq!(seq_block_bytes(&shifted, 99), SEQ_UNOPENED_BLOCK_BYTES);
+        assert!(SEQ_UNOPENED_BLOCK_BYTES < WINDOW_BYTES);
     }
 
     fn open(text: &[u8], block: usize) -> WindowedFile {
