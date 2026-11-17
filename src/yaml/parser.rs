@@ -733,6 +733,13 @@ struct Parser<'a, const HAS_CR: bool> {
     /// Whether a directive other than `%YAML` was skipped (#6342): `%TAG` and the rest are not
     /// set aside by yq's slurp, so go-yaml sees them and wants a `---` after them.
     saw_non_header_directive: bool,
+    /// The named handles (`!e!`) a `%TAG` directive declared for the document being read, with
+    /// their prefixes (#7234): a tag written with one is the verbatim tag the prefix makes, as
+    /// go-yaml resolves it. The directives of a run wait in `pending_tag_prefixes` until the
+    /// document they belong to starts, and a document that follows one with directives has none.
+    tag_prefixes: Vec<(String, String)>,
+    /// The handles of the `%TAG` directives met since the last document started.
+    pending_tag_prefixes: Vec<(String, String)>,
     /// How many documents `start_document` has started: the leading run only ever merges into the
     /// first (`a: 1` / `---` / `---` / `b: 2` is three documents in yq as in YAML).
     documents_started: usize,
@@ -830,6 +837,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             yq_mode: false,
             properties_end: usize::MAX,
             saw_non_header_directive: false,
+            tag_prefixes: Vec::new(),
+            pending_tag_prefixes: Vec::new(),
             documents_started: 0,
             leading_run_from: 0,
             yq_no_head: false,
@@ -3959,6 +3968,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
         self.seen_any_document = true;
         self.documents_started += 1;
+        self.tag_prefixes = core::mem::take(&mut self.pending_tag_prefixes);
         self.document_root_node_taken = false;
         self.document_start_bp_pos = self.bp_pos;
         // A standalone comment block seen before this document's content
@@ -4076,6 +4086,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             }
             if self.yq_mode {
                 self.check_yq_directive(&mut run)?;
+            }
+            // The head of the first document, behind yq's leading `---`, is set aside with its own
+            // directives, which no document resolves a tag with.
+            if !in_head_document {
+                if let Some(declared) = tag_directive_handle(&self.input[self.pos..]) {
+                    self.pending_tag_prefixes.push(declared);
+                }
             }
             self.skip_to_eol();
             self.skip_line_break();
@@ -9824,9 +9841,36 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             });
         }
         self.pos = end;
-        core::str::from_utf8(&self.input[start..end])
-            .map(yq_tag_spelling)
-            .map_err(|_| YamlError::InvalidUtf8 { offset: start })
+        let written = core::str::from_utf8(&self.input[start..end])
+            .map_err(|_| YamlError::InvalidUtf8 { offset: start })?;
+        // #7234: a tag written with a named handle the document's `%TAG` declared is the tag the
+        // prefix makes, which go-yaml resolves before yq sees it and so prints verbatim.
+        if let Some((_, prefix, suffix)) = self.declared_handle_of(written) {
+            return Ok(yq_tag_spelling(&alloc::format!("!<{prefix}{suffix}>")));
+        }
+        Ok(yq_tag_spelling(written))
+    }
+
+    /// `tag` split into a named handle this document declared, its prefix and the suffix after it.
+    /// `None` for every other tag: a verbatim one, `!`, `!!` and a handle no directive declared
+    /// (the primary and secondary handles keep their own meaning), and a suffix with a `%` escape,
+    /// which go-yaml decodes and this does not.
+    fn declared_handle_of<'t>(&self, tag: &'t str) -> Option<(&'t str, &str, &'t str)> {
+        if self.tag_prefixes.is_empty() {
+            return None;
+        }
+        let rest = tag.strip_prefix('!')?;
+        let word = rest.bytes().take_while(|&b| is_word(b)).count();
+        if word == 0 || rest.as_bytes().get(word) != Some(&b'!') {
+            return None;
+        }
+        let handle = &tag[..word + 2];
+        let suffix = &rest[word + 1..];
+        if suffix.contains('%') {
+            return None;
+        }
+        let (_, prefix) = self.tag_prefixes.iter().find(|(h, _)| h == handle)?;
+        Some((handle, prefix, suffix))
     }
 
     /// Consume any combination of a leading `&anchor` and/or `!tag` before a
@@ -11538,6 +11582,52 @@ pub(super) fn starts_yq_yaml_directive(rest: &[u8]) -> bool {
     rest.starts_with(b"%YAML")
 }
 
+/// A byte of a `%TAG` handle's word: go-yaml's `is_alpha`, a letter, digit, `_` or `-`.
+fn is_word(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+}
+
+/// The named handle and prefix a `%TAG` directive line declares (#7234), `line` starting at its `%`.
+/// `None` for any other directive, for the primary and secondary handles (`!`, `!!`) and for a line
+/// that is not well formed, which yq's check refuses where it matters.
+fn tag_directive_handle(line: &[u8]) -> Option<(String, String)> {
+    let blanks = |from: &[u8]| {
+        from.iter()
+            .take_while(|&&b| matches!(b, b' ' | b'\t'))
+            .count()
+    };
+    let line = &line[..line
+        .iter()
+        .position(|&b| is_line_break(b))
+        .unwrap_or(line.len())];
+    let rest = line.strip_prefix(b"%TAG")?;
+    if blanks(rest) == 0 {
+        return None;
+    }
+    let rest = &rest[blanks(rest)..];
+    let word = rest
+        .strip_prefix(b"!")?
+        .iter()
+        .take_while(|&&b| is_word(b))
+        .count();
+    // The handle is `!word!`: both bangs, and a word between them.
+    if word == 0 || rest.get(word + 1) != Some(&b'!') {
+        return None;
+    }
+    let handle = core::str::from_utf8(&rest[..word + 2]).ok()?;
+    let after = &rest[word + 2..];
+    if blanks(after) == 0 {
+        return None;
+    }
+    let after = &after[blanks(after)..];
+    let prefix_len = after
+        .iter()
+        .take_while(|&&b| !matches!(b, b' ' | b'\t' | b'#'))
+        .count();
+    let prefix = core::str::from_utf8(&after[..prefix_len]).ok()?;
+    (!prefix.is_empty() && !prefix.contains('%')).then(|| (handle.to_string(), prefix.to_string()))
+}
+
 /// What [`Parser::check_yq_directive`] remembers across one run of directive lines (#6412, #6419): go-yaml refuses a
 /// `%TAG` handle given twice and a second `%YAML` for one document.
 #[derive(Default)]
@@ -12714,6 +12804,49 @@ mod tests {
         let yaml = b"---\nname: Alice\n---\nname: Bob";
         let result = build_semi_index(yaml);
         assert!(result.is_ok(), "two documents should parse: {result:?}");
+    }
+
+    /// #7234: the named handle and prefix a `%TAG` line declares, and none for anything else.
+    #[test]
+    fn tag_directive_handle_reads_a_named_handle_and_its_prefix_7234() {
+        let some = |line: &[u8]| tag_directive_handle(line);
+        assert_eq!(
+            some(b"%TAG !e! tag:e.com,2000:\n---"),
+            Some(("!e!".to_string(), "tag:e.com,2000:".to_string()))
+        );
+        assert_eq!(
+            some(b"%TAG \t!a-b_1!   p://x/y # c"),
+            Some(("!a-b_1!".to_string(), "p://x/y".to_string()))
+        );
+        for not in [
+            &b"%TAG ! tag:e.com,2000:"[..],
+            b"%TAG !! tag:e.com,2000:",
+            b"%TAG !e! ",
+            b"%TAG !e! a%20b",
+            b"%TAG !e!tag:x",
+            b"%TAG",
+            b"%TAGX !e! x",
+            b"%YAML 1.1",
+            b"%TAG e! x",
+        ] {
+            assert_eq!(some(not), None, "{}", String::from_utf8_lossy(not));
+        }
+    }
+
+    /// #7234: a tag written with a declared handle is the verbatim tag its prefix makes, per
+    /// document; a handle no directive declared, a `%` escape in the suffix and the primary and
+    /// secondary handles keep their text.
+    #[test]
+    fn declared_handles_resolve_per_document_7234() {
+        let doc =
+            b"%TAG !e! tag:e.com,2000:\n---\na: !e!x 1\nb: !e!a%20b 2\nc: !!str 3\nd: !f!x 4\n\
+            ---\ne: !e!x 5\n";
+        let index = build_semi_index_yq(doc).unwrap();
+        let tags: Vec<&str> = index.tags.values().map(String::as_str).collect();
+        assert_eq!(
+            tags,
+            ["!<tag:e.com,2000:x>", "!e!a%20b", "!!str", "!f!x", "!e!x"]
+        );
     }
 
     #[test]

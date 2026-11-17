@@ -803,6 +803,7 @@ The verbatim spelling of a core tag is that tag (`!<tag:yaml.org,2002:int> "1"` 
 Shapes still read where yq differs:
 - A named handle that no `%TAG` directive declares (`a: !x!y 1` is `found undefined tag handle` in yq) and a bare `!!` (`did not find expected tag URI`) are accepted.
 - A `%TAG !! <prefix>` directive that redefines the secondary handle is not seen, so `!!foo 1` under it is `"1"` here and `1` in yq.
+- A `%TAG` directive that redefines the primary handle `!` is not seen either, and neither is a `%TAG` prefix holding a `%` escape: a tag written with a named handle (`!e!x`) resolves through the document's directive to the verbatim tag, as yq prints it, only when the prefix and suffix have none ([#7234](https://github.com/rust-works/succinctly/issues/7234)).
 - An operator that reads the node's tag refuses it in yq and does not here: `.a + 1` on `a: !!foo 1` is `!!foo cannot be added to !!int` there and `"11"` here, `.a * 2` is `cannot multiply !!foo with !!int` and `"11"`, and `.a | keys` names the tag.
   This is the same family as the operators listed under #6291.
 
