@@ -249,11 +249,17 @@ pub fn perf_block(platform: &str, v: &Value) -> String {
         .unwrap_or_default();
     let _ = writeln!(
         s,
-        "**Timed binary**: {}, built with `{}`.\n",
+        "**Timed binary**: {}{}, built with `{}`.\n",
         if v["env"]["subject_is_harness"].as_bool() == Some(false) {
             "a separate build passed with `--subject`, not the harness"
         } else {
             "the harness itself"
+        },
+        // Absent from a run that predates #7321, whose rows timed the unstripped build.
+        if v["env"]["timed_binary_stripped"].as_bool() == Some(true) {
+            " (timed as a copy stripped like the release archive's binary)"
+        } else {
+            ""
         },
         features.join(","),
     );
@@ -755,6 +761,21 @@ mod tests {
             .contains("**Timed binary**: the harness itself, built with `cli,simd`."));
         v["env"]["subject_is_harness"] = json!(false);
         assert!(perf_block("p", &v).contains("a separate build passed with `--subject`"));
+    }
+
+    /// A run that timed a stripped copy says so; one that predates #7321 has no such field and
+    /// renders as before, so a committed report does not change when it is re-rendered.
+    #[test]
+    fn the_perf_block_says_when_a_stripped_copy_was_timed() {
+        let mut v = perf_run();
+        assert!(!perf_block("p", &v).contains("stripped"));
+        v["env"]["timed_binary_stripped"] = json!(false);
+        assert!(!perf_block("p", &v).contains("stripped"));
+        v["env"]["timed_binary_stripped"] = json!(true);
+        assert!(perf_block("p", &v).contains(
+            "**Timed binary**: the harness itself (timed as a copy stripped like the release \
+             archive's binary), built with `cli,simd`."
+        ));
     }
 
     /// Bold marks a printed win: a ratio that prints as 1.00x is not one.

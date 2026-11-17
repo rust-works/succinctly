@@ -26,6 +26,7 @@ mod operational;
 mod perf;
 mod report;
 mod robust;
+mod stripped;
 mod suites;
 mod sweep;
 mod verify;
@@ -826,6 +827,31 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
             .filter_map(|(_, i)| i.map(|i| i.id.as_str()))
             .collect();
         let generator = std::env::current_exe()?;
+        // The rows time what the release archive ships, which is stripped; `target/release` is
+        // not (#7321). The copy lives until this block ends. A `strip` that cannot run leaves the
+        // timed binary as built and makes the run unquotable, instead of failing it.
+        let mut timed_copy = None;
+        if !args.control {
+            match stripped::StrippedCopy::of(
+                std::path::Path::new(&subject.program),
+                &root.join("target/compare"),
+            ) {
+                Ok(c) => {
+                    env.timed_binary_stripped = true;
+                    timed_copy = Some(c);
+                }
+                Err(why) => env.invalid_reasons.push(format!(
+                    "the timed binary is not stripped like the release archive's: {why:#}"
+                )),
+            }
+        }
+        let timed_subject = match &timed_copy {
+            Some(c) => Tool {
+                program: c.path().to_string_lossy().into(),
+                ..subject.clone()
+            },
+            None => subject.clone(),
+        };
         let mut tools = vec![
             if args.control {
                 Tool {
@@ -833,7 +859,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
                     ..reference.clone()
                 }
             } else {
-                subject.clone()
+                timed_subject
             },
             reference.clone(),
         ];
