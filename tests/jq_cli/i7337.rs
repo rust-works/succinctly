@@ -105,3 +105,44 @@ fn a_bind_over_a_group_that_needs_no_retry_and_one_under_try_are_unchanged_7337(
     }
     Ok(())
 }
+
+/// The retry is per value, and what an earlier value already answered stays: the group of `a == 1`
+/// answers `"y"` on its first alternative, the next group's first alternative raises `late`, and
+/// its second (the group as an array) raises `arr`, which is the error jq reports after the `"y"`.
+#[test]
+fn an_earlier_groups_output_survives_a_later_groups_retried_error_7337() -> Result<()> {
+    let filter = r#"group_by(.a) | .[0:2][] | (. as [$x] ?// $x | $x) | if type == "object" then (if .a == 1 then .b else error("late") end) else error("arr") end"#;
+    let (stdout, stderr, code) = run(GROUPS, filter)?;
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        ("\"y\"\n", "jq: error (at <stdin>:0): arr\n", 5)
+    );
+    // An error raised by a generator after the groups (`error("boom")`) is not a bind's to retry.
+    let filter = r#"[(group_by(.a)[0:2][], error("boom")) | (. as [$x] ?// $x | $x) | .a]"#;
+    let (stdout, stderr, code) = run(GROUPS, filter)?;
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        ("", "jq: error (at <stdin>:0): boom\n", 5)
+    );
+    Ok(())
+}
+
+/// A consumer that stops after the first output is an error the bind retries on, in jq: `limit(1; ..)`
+/// reaches the second alternative, whose `.a` over the group's array raises. The slice-then-iterate
+/// route used to answer `[1]`, as it ran the bind over every value before any stop could reach it.
+#[test]
+fn a_stop_after_the_first_output_retries_the_bind_over_a_slice_of_groups_7337() -> Result<()> {
+    let bound = r"(. as [$x] ?// $x | $x)";
+    let retried = "jq: error (at <stdin>:0): Cannot index array with string \"a\"\n";
+    let filter = format!("[limit(1; group_by(.a) | .[0:3][] | {bound} | .a)]");
+    let (stdout, stderr, code) = run(GROUPS, &filter)?;
+    assert_eq!((stdout.as_str(), stderr.as_str(), code), ("", retried, 5));
+    // `first` prints its one output before the stop is retried into the same error.
+    let filter = format!("first(group_by(.a) | .[0:3][] | {bound} | .a)");
+    let (stdout, stderr, code) = run(GROUPS, &filter)?;
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        ("1\n", retried, 5)
+    );
+    Ok(())
+}

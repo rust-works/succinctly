@@ -98,7 +98,7 @@ use super::eval::{
     format_yq_commented, format_yq_props_commented, yq_encoder_prints_leading_block,
     yq_encoder_reads_spelling, yq_encoder_writes_comments, yq_props_format_style,
 };
-use super::eval::{owned_slot_mut, static_path_steps, StepKey};
+use super::eval::{owned_slot_mut, starts_with_pattern_bind, static_path_steps, StepKey};
 #[cfg(test)]
 use super::expr::FuncDefBound;
 use super::expr::TomlCommentSource;
@@ -14997,14 +14997,16 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
         // #7337: see `fold_pipe_stages_sink`. The stages from a `?//` bind on run as one pipe
         // over each value in hand, so a later stage's error retries the bind's next alternative.
         // A lazy value is forced first; a `ManyOwned` is what a nested `.[a:b][]` stage leaves.
+        // An `Owned` that arrived as one is not touched: it already runs the bind with the rest.
         if starts_with_pattern_bind(&stages[j..]) {
-            let forced = if current.is_lazy() {
+            let was_lazy = current.is_lazy();
+            let forced = if was_lazy {
                 current.materialize_lazy::<S>()
             } else {
                 current
             };
             match forced {
-                GenericResult::Owned(owned) => {
+                GenericResult::Owned(owned) if was_lazy => {
                     return fold_owned_values_through_bind::<S, V>(
                         core::iter::once(owned),
                         &stages[j..],
@@ -15238,10 +15240,10 @@ fn fold_owned_values_through_bind<S: EvalSemantics, V: DocumentValue>(
     rest: &[Expr],
     optional: bool,
 ) -> GenericResult<V> {
-    let pipe = Expr::Pipe(rest.to_vec().into());
+    let mut rest = RestPipe::new(rest);
     let mut collected: Vec<OwnedValue> = Vec::new();
     for value in values {
-        let flow = eval_each_owned::<S>(&pipe, &value, optional, Reentry::REBUILT, &mut |v| {
+        let flow = rest.run_owned::<S>(&value, optional, Reentry::REBUILT, &mut |v| {
             collected.push(v);
             Demand::Continue
         });
@@ -16703,13 +16705,27 @@ fn fold_pipe_stages_sink<S: EvalSemantics, V: DocumentValue>(
         if j == stages.len() {
             return drain_result_generic(current, sink);
         }
-        // #7337: a lazy value met by a `?//` bind is forced, and the stages from the bind on go
-        // to the `Owned` arm below, which runs them as one pipe with the bind's retries. The
-        // per-stage fold would run the bind to completion before a later stage's error could
-        // unwind into its next alternative.
-        if current.is_lazy() && starts_with_pattern_bind(&stages[j..]) {
-            current = current.materialize_lazy::<S>();
-            continue;
+        // #7337: a lazy value met by a `?//` bind is forced, and the stages from the bind on run
+        // as one pipe, so that a later stage's error (or the consumer's stop) unwinds into the
+        // bind's next alternative as in jq. A forced value goes on to the `Owned` arm below,
+        // which runs them through `run_owned`; a `ManyOwned` (what a nested `.[a:b][]` stage
+        // leaves) goes element by element to the driver that serves a lazy sequence's elements.
+        // The per-stage fold would run the bind to completion first.
+        if starts_with_pattern_bind(&stages[j..]) {
+            if current.is_lazy() {
+                current = current.materialize_lazy::<S>();
+            }
+            match current {
+                GenericResult::ManyOwned(values) => {
+                    return drive_pipe_elements_generic::<S, V>(
+                        values.into_iter().map(|o| Ok(GenericItem::Owned(o))),
+                        &stages[j..],
+                        optional,
+                        sink,
+                    );
+                }
+                other => current = other,
+            }
         }
         let expr = &stages[j];
         let rest = &stages[j + 1..];
@@ -17199,15 +17215,6 @@ fn generic_result_is_empty<V: DocumentValue>(result: &GenericResult<V>) -> bool 
         | GenericResult::Halt(_)
         | GenericResult::Partial(..) => false,
     }
-}
-
-/// Whether a pipe's first stage is a parenthesised pattern bind (`(. as [$x] ?// $x | $x) | ...`).
-///
-/// Such a bind has to stay alive while a later stage raises, so that the error unwinds into the
-/// bind's next alternative as jq's does (#3410). Each route that folds a pipe a stage at a time
-/// asks this one question, so that none of them runs the bind to completion first (#7337).
-fn starts_with_pattern_bind(stages: &[Expr]) -> bool {
-    matches!(stages.first(), Some(Expr::Paren(inner)) if matches!(inner.as_ref(), Expr::AsPattern { .. }))
 }
 
 fn eval_single_pipe_stages<S: EvalSemantics, V: DocumentValue>(
