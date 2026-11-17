@@ -741,6 +741,22 @@ fn is_ident_start_char(c: char) -> bool {
     c.is_alphabetic() || c == '_'
 }
 
+/// `with(PATH; UPDATE)` once its arguments are read: a metadata assignment in the update is a stage
+/// of the filter, with `PATH` ahead of it (#7069), and any other update is `PATH |= effect`
+/// ([`with_update_effect`]). Out of line, like [`Parser::finish_update`], to keep the frame of
+/// `parse_with_expr`, which sits in the grammar's recursion, as it was.
+#[inline(never)]
+fn finish_with(path: Expr, update: &Expr) -> Expr {
+    if let Some(stages) = with_meta_stages(&path, update) {
+        return stages;
+    }
+    let filter = with_update_effect(update);
+    Expr::Update {
+        path: Box::new(path),
+        filter: Box::new(filter),
+    }
+}
+
 /// Whether `expr` builds its value from literals alone, so it reads nothing from the node it is
 /// written to (`"new"`, `7`, `[1, 2]`, `{"x": 1}`), a comma of values excepted (#7069).
 fn is_plain_literal(expr: &Expr) -> bool {
@@ -6714,15 +6730,7 @@ impl<'a> Parser<'a> {
             return self.wrong_arity_or_expect(start_pos, ')', vec![path, update]);
         }
         self.next();
-        // #7069: a metadata assignment in the update is a stage of the filter, with `path` ahead of it.
-        if let Some(stages) = with_meta_stages(&path, &update) {
-            return Ok(stages);
-        }
-        let filter = with_update_effect(&update);
-        Ok(Expr::Update {
-            path: Box::new(path),
-            filter: Box::new(filter),
-        })
+        Ok(finish_with(path, &update))
     }
 
     /// Parse `JOIN($idx; idx_expr)`, `JOIN($idx; stream; idx_expr)` or
@@ -11776,6 +11784,24 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The `LHS |= BODY` expression of [`Self::parse_assignment_level`], out of line so that its frame,
+    /// which every level of nesting of the grammar pays, does not hold what this needs (the same
+    /// reason as `try_parse_meta_op`'s). In yq mode a body that assigns metadata is a stage of the
+    /// filter (#7069, [`with_meta_stages`]), and a comma in the body is read as `with` reads it
+    /// (#6854).
+    #[inline(never)]
+    fn finish_update(&self, left: Expr, filter: Expr) -> Expr {
+        let filter = if self.mode == ParserMode::Yq {
+            if let Some(stages) = with_meta_stages(&left, &filter) {
+                return stages;
+            }
+            update_body_effect(&filter).unwrap_or(filter)
+        } else {
+            filter
+        };
+        self.assign_or_rename_key(left, filter, true)
+    }
+
     /// Parse assignment expressions: `path = value`, `path |= filter`, `path += value`, etc.
     /// Assignment has higher precedence than pipe; against `//` see [`Self::parse_assignment`].
     fn parse_assignment_level(&mut self) -> Result<Expr, ParseError> {
@@ -11816,16 +11842,7 @@ impl<'a> Parser<'a> {
             self.next(); // =
             self.skip_ws();
             let filter = self.parse_assignment_operand()?;
-            let filter = if self.mode == ParserMode::Yq {
-                // #7069: `PATH |= (. = "new" | . style="double")` writes metadata at `PATH`.
-                if let Some(stages) = with_meta_stages(&left, &filter) {
-                    return Ok(stages);
-                }
-                update_body_effect(&filter).unwrap_or(filter)
-            } else {
-                filter
-            };
-            return Ok(self.assign_or_rename_key(left, filter, true));
+            return Ok(self.finish_update(left, filter));
         }
 
         // Check for //= (alternative assignment)
