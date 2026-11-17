@@ -1,0 +1,14 @@
+# macOS binaries target macOS 12.0, not rustc's default for arm64 (11.0) (#7321).
+#
+# A 12.0 target gets chained fixups from the linker: a rebase opcode stream of 22,214 entries
+# into 103 pages of `__DATA_CONST` (each a copy-on-write fault at every start) goes away, which
+# is about 0.07 ms of a 1.7 ms `jq -n 1` on an Apple M4 Pro. The price is that the shipped
+# macOS binary no longer runs on macOS 11.
+#
+# One setting here, and not one in `release.yml`, so that the release archive, the binary
+# `succinctly dev compare jq` times and a local `cargo build --release` are built the same way.
+# `force = false` leaves a `MACOSX_DEPLOYMENT_TARGET` the caller exported in charge. The file is
+# not in the published crate (`include` in `Cargo.toml`), so `cargo install succinctly` keeps
+# rustc's default. It has no effect on a non-Apple target.
+[env]
+MACOSX_DEPLOYMENT_TARGET = { value = "12.0", force = false }

@@ -20,6 +20,8 @@ pub struct Env {
     pub succinctly_features: Vec<String>,
     /// The timed binary is a separate `--subject` build, not the harness itself (#5570).
     pub subject_is_harness: bool,
+    /// The performance rows timed a copy stripped as the release archive's binary is (#7321).
+    pub timed_binary_stripped: bool,
     pub jq_sha256: String,
     pub jq_version: String,
     pub jq_build_configuration: String,
@@ -139,6 +141,7 @@ impl Env {
             succinctly_profile: profile,
             succinctly_features: feats,
             subject_is_harness,
+            timed_binary_stripped: false,
             jq_sha256,
             jq_version: cmd_stdout(&jq_str, &["--version"]).unwrap_or_default(),
             jq_build_configuration: cmd_stdout(&jq_str, &["--build-configuration"])

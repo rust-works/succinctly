@@ -57,6 +57,11 @@ both are single-threaded measurements, so core count barely changes that. The ru
 (`env.json`, `results.json`, `report.md`) and, with `--write-docs`, rewrites `docs/compare/jq-<os>-<arch>.{md,json}`
 plus the index and the blocks other pages quote.
 
+The performance rows time a copy of the binary stripped with plain `strip`, as `release.yml` strips the archive's, and
+not `target/release/succinctly` itself: the unstripped build starts about 0.07 ms slower on an Apple M4 Pro (#7321). The
+copy is made under `target/compare/` and removed when the dimension ends; the report's *Timed binary* line says so. A
+`strip` that cannot run leaves the unstripped binary timed and adds a reason to `env.json`'s `invalid_reasons`.
+
 macOS has no `ulimit -v`, so the 1 GB tier relies on the machine having the memory; on Linux, `--cachegrind` (with
 `valgrind` installed) adds instruction counts beside the timings.
 
