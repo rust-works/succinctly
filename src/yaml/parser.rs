@@ -4087,10 +4087,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             if self.yq_mode {
                 self.check_yq_directive(&mut run)?;
             }
-            // The head of the first document, behind yq's leading `---`, is set aside with its own
-            // directives, which no document resolves a tag with.
-            if !in_head_document {
-                if let Some(declared) = tag_directive_handle(&self.input[self.pos..]) {
+            // The directives in the head of the first document, behind yq's leading `---`, belong
+            // to that document, which is already open; every other run is for the next one.
+            if let Some(declared) = tag_directive_handle(&self.input[self.pos..]) {
+                if in_head_document {
+                    self.tag_prefixes.push(declared);
+                } else {
                     self.pending_tag_prefixes.push(declared);
                 }
             }
@@ -9866,10 +9868,21 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
         let handle = &tag[..word + 2];
         let suffix = &rest[word + 1..];
-        if suffix.contains('%') {
+        // An empty suffix is no tag (yq refuses it), a `%` escape is decoded by go-yaml, and it
+        // writes a `!`, `{` or `}` of the resolved URI percent-encoded (`x!y` is `x%21y`), none of
+        // which this reproduces: those tags keep their text.
+        if suffix.is_empty() || suffix.contains(['%', '!', '{', '}']) {
             return None;
         }
         let (_, prefix) = self.tag_prefixes.iter().find(|(h, _)| h == handle)?;
+        // A `!` after the first byte (`!!` as a prefix) or a brace is encoded the same way.
+        if prefix
+            .get(1..)
+            .is_some_and(|rest| rest.contains(['!', '{', '}']))
+            || prefix.starts_with(['{', '}'])
+        {
+            return None;
+        }
         Some((handle, prefix, suffix))
     }
 
@@ -12834,18 +12847,26 @@ mod tests {
     }
 
     /// #7234: a tag written with a declared handle is the verbatim tag its prefix makes, per
-    /// document; a handle no directive declared, a `%` escape in the suffix and the primary and
-    /// secondary handles keep their text.
+    /// document; a handle no directive declared, an empty suffix, a `%` escape, `!` or a brace in
+    /// the suffix and the primary and secondary handles keep their text.
     #[test]
     fn declared_handles_resolve_per_document_7234() {
         let doc =
             b"%TAG !e! tag:e.com,2000:\n---\na: !e!x 1\nb: !e!a%20b 2\nc: !!str 3\nd: !f!x 4\n\
-            ---\ne: !e!x 5\n";
+            f: !e!p!q 6\ng: !e! 7\n---\ne: !e!x 5\n";
         let index = build_semi_index_yq(doc).unwrap();
         let tags: Vec<&str> = index.tags.values().map(String::as_str).collect();
         assert_eq!(
             tags,
-            ["!<tag:e.com,2000:x>", "!e!a%20b", "!!str", "!f!x", "!e!x"]
+            [
+                "!<tag:e.com,2000:x>",
+                "!e!a%20b",
+                "!!str",
+                "!f!x",
+                "!e!p!q",
+                "!e!",
+                "!e!x"
+            ]
         );
     }
 

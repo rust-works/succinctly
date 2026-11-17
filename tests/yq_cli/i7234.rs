@@ -32,6 +32,7 @@ const ROWS: &[(&str, &[&str], &str)] = &[
     ("%TAG !e! tag:e.com,2000:\n---\na: !!str 1\nb: !loc 2\nc: !<tag:z.com,2000:t> 3\n", &["."], "a: !!str 1\nb: !loc 2\nc: !<tag:z.com,2000:t> 3\n"),
     ("%TAG !e! tag:e.com,2000:\n---\na: !e!x |\n  text\n", &["."], "a: !<tag:e.com,2000:x> |\n  text\n"),
     ("%TAG !e! tag:e.com,2000:\n---\nk: !e!x v\n", &["-P", "."], "k: !<tag:e.com,2000:x> v\n"),
+    ("---\n%TAG !e! tag:e.com,2000:\n---\na: !e!x 1\n", &["."], "---\na: !<tag:e.com,2000:x> 1\n"),
 ];
 
 #[test]
