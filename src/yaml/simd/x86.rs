@@ -7,34 +7,12 @@
 use core::arch::x86_64::*;
 
 use super::scalar::{find_block_scalar_end_scalar, parse_anchor_name_scalar};
+#[cfg(any(test, feature = "std"))]
+use crate::util::simd::clamp_below_avx2;
 
 // ============================================================================
 // Dispatch clamp (SUCCINCTLY_SIMD)
 // ============================================================================
-
-/// Parsed `SUCCINCTLY_SIMD` value: does it clamp x86 dispatch below AVX2?
-///
-/// - `Some(true)` — a recognized level below AVX2 (`scalar`, `sse2`, `sse42`,
-///   `sse4.2`): use the 16-byte SSE2 kernels. (`scalar` still means SSE2 here;
-///   scalar YAML parsing is compile-time only, via `--features scalar-yaml`.)
-/// - `Some(false)` — recognized no-op (`avx2`, empty): keep detected dispatch.
-/// - `None` — unrecognized. The runtime ignores it (no clamp), but the
-///   `test_succinctly_simd_env_contract` test fails loudly on it so a typo in
-///   a CI leg cannot silently un-clamp the suite.
-#[cfg(any(test, feature = "std"))]
-fn parse_simd_clamp(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "scalar" | "sse2" | "sse42" | "sse4.2" => Some(true),
-        "avx2" | "" => Some(false),
-        _ => None,
-    }
-}
-
-/// Whether `SUCCINCTLY_SIMD` requests clamping dispatch below AVX2.
-#[cfg(any(test, feature = "std"))]
-fn clamp_below_avx2() -> bool {
-    std::env::var("SUCCINCTLY_SIMD").is_ok_and(|v| parse_simd_clamp(&v) == Some(true))
-}
 
 /// Whether the 32-byte AVX2 kernels should be dispatched.
 ///
@@ -1191,23 +1169,6 @@ mod tests {
     // SUCCINCTLY_SIMD dispatch clamp (#247)
     // ========================================================================
 
-    #[test]
-    fn test_parse_simd_clamp_values() {
-        // Recognized levels below AVX2 clamp (whitespace/case-insensitive).
-        for v in ["scalar", "sse2", "sse42", "sse4.2", " SSE2 ", "Sse4.2"] {
-            assert_eq!(parse_simd_clamp(v), Some(true), "{v:?} should clamp");
-        }
-        // Recognized no-ops.
-        for v in ["avx2", "AVX2", ""] {
-            assert_eq!(parse_simd_clamp(v), Some(false), "{v:?} should be a no-op");
-        }
-        // Unrecognized values parse to None (runtime ignores; contract test
-        // fails loudly when the env var is actually set to one of these).
-        for v in ["banana", "neon", "1", "sse", "avx512"] {
-            assert_eq!(parse_simd_clamp(v), None, "{v:?} should be unrecognized");
-        }
-    }
-
     /// Contract test for the `SUCCINCTLY_SIMD` clamp, in the spirit of
     /// `SUCCINCTLY_EXPECT_SIMD` (#192): when a CI leg sets the variable, the
     /// dispatcher must observably honor it, and a typo'd value must fail the
@@ -1219,7 +1180,7 @@ mod tests {
         let width = classify_yaml_chars::<true>(&buf, 0).unwrap().width;
 
         match std::env::var("SUCCINCTLY_SIMD") {
-            Ok(v) => match parse_simd_clamp(&v) {
+            Ok(v) => match crate::util::simd::clamp::parse(&v) {
                 Some(true) => {
                     assert!(!avx2_enabled(), "SUCCINCTLY_SIMD={v} must clamp dispatch");
                     assert_eq!(width, 16, "SUCCINCTLY_SIMD={v} must force 16-byte classify");

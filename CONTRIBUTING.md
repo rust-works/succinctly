@@ -299,7 +299,10 @@ x86 leg **re-runs the whole suite with `SUCCINCTLY_SIMD=sse2`** (the
 "SSE2-clamped dispatch" step, #247), forcing the yaml parser through the real
 16-byte dispatch path; an in-lib contract test
 (`test_succinctly_simd_env_contract`) fails the step if the clamp stops
-applying. See
+applying. The same variable clamps the JSON index builders (#7318), and the
+leg also runs the JSON-reading CLI suites with it set, so the SSE2 JSON kernel
+runs through `succinctly jq`; its contract test is
+`test_succinctly_simd_env_contract_json`. See
 [docs/reference/environment-variables.md](docs/reference/environment-variables.md#succinctly_simd).
 
 **SVE2 (#194).** The Neoverse-N2 runner detects `sve2` and `sve2-bitperm`, so

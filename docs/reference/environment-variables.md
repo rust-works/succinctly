@@ -6,17 +6,17 @@ Every environment variable succinctly reads, what it accepts, and what it change
 
 ## Overview
 
-| Variable                                                  | Applies to                       | Accepted values                | When unset                    |
-|-----------------------------------------------------------|----------------------------------|--------------------------------|-------------------------------|
-| [`SUCCINCTLY_SIMD`](#succinctly_simd)                     | Library (YAML parsing, x86_64)   | `scalar`/`sse2`/`sse4.2`/`avx2`| Best detected level           |
-| [`SUCCINCTLY_SVE2`](#succinctly_sve2)                     | Library (JSON indexing, ARM)     | Exactly `1`                    | NEON kernels                  |
-| [`SUCCINCTLY_PRESERVE_INPUT`](#succinctly_preserve_input) | `succinctly jq`                  | `1` or `true`                  | jq-compatible formatting      |
-| [`NO_COLOR`](#no_color)                                   | `succinctly jq`, `succinctly yq` | Any non-empty value            | Color if stdout is a terminal |
-| [`JQ_COLORS`](#jq_colors)                                 | `succinctly jq`                  | Eight `:`-separated SGR fields | Built-in color scheme         |
-| [`JQ_LIBRARY_PATH`](#jq_library_path)                     | `succinctly jq`                  | `:`-separated directories      | Only `-L` paths and `~/.jq`   |
-| [`HOME`](#home)                                           | `succinctly jq`                  | A directory path               | No `~/.jq` auto-loading       |
-| [`TZ`](#tz)                                               | Library (jq date builtins)       | IANA name or POSIX string      | System zone                   |
-| [`SUCCINCTLY_EXPECT_SIMD`](#succinctly_expect_simd)       | Test suite (`cargo test`)        | Comma-separated CPU features   | Expectation check skipped     |
+| Variable                                                  | Applies to                            | Accepted values                 | When unset                    |
+|-----------------------------------------------------------|---------------------------------------|---------------------------------|-------------------------------|
+| [`SUCCINCTLY_SIMD`](#succinctly_simd)                     | Library (YAML, JSON indexing, x86_64) | `scalar`/`sse2`/`sse4.2`/`avx2` | Best detected level           |
+| [`SUCCINCTLY_SVE2`](#succinctly_sve2)                     | Library (JSON indexing, ARM)          | Exactly `1`                     | NEON kernels                  |
+| [`SUCCINCTLY_PRESERVE_INPUT`](#succinctly_preserve_input) | `succinctly jq`                       | `1` or `true`                   | jq-compatible formatting      |
+| [`NO_COLOR`](#no_color)                                   | `succinctly jq`, `succinctly yq`      | Any non-empty value             | Color if stdout is a terminal |
+| [`JQ_COLORS`](#jq_colors)                                 | `succinctly jq`                       | Eight `:`-separated SGR fields  | Built-in color scheme         |
+| [`JQ_LIBRARY_PATH`](#jq_library_path)                     | `succinctly jq`                       | `:`-separated directories       | Only `-L` paths and `~/.jq`   |
+| [`HOME`](#home)                                           | `succinctly jq`                       | A directory path                | No `~/.jq` auto-loading       |
+| [`TZ`](#tz)                                               | Library (jq date builtins)            | IANA name or POSIX string       | System zone                   |
+| [`SUCCINCTLY_EXPECT_SIMD`](#succinctly_expect_simd)       | Test suite (`cargo test`)             | Comma-separated CPU features    | Expectation check skipped     |
 
 Queries can also read **any** variable through the [`env` builtins](#reading-the-environment-from-a-query).
 
@@ -28,8 +28,8 @@ These affect the `succinctly` library itself, so they apply to anything built on
 
 ### `SUCCINCTLY_SIMD`
 
-Clamps the x86_64 **YAML** SIMD dispatch to a lower instruction-set level than the CPU supports.
-`SUCCINCTLY_SIMD=sse2` makes the YAML parser use the 16-byte SSE2 kernels even on an AVX2 machine.
+Clamps the x86_64 **YAML** and **JSON** SIMD dispatch to a lower instruction-set level than the CPU supports.
+`SUCCINCTLY_SIMD=sse2` makes the YAML parser and the JSON index builders use their SSE2 kernels (16-byte for YAML) even on an AVX2 machine.
 
 This is a **clamp, not a selector**: it can only lower the dispatch level, never raise it.
 Requesting a level the CPU does not support would mean executing undetected instructions, which is
@@ -42,6 +42,11 @@ Reasons to set it:
   path (the [#231](https://github.com/rust-works/succinctly/issues/231) bug class) executes for
   real on AVX2 runners. An in-lib contract test fails loudly if the variable is set to an
   unrecognized value or the clamp stops applying.
+- **The JSON SSE2 index kernel through the CLI** ([#7318](https://github.com/rust-works/succinctly/issues/7318)):
+  on an AVX2 CPU `succinctly jq` and the other JSON routes always build their index with the AVX2
+  kernel, so the same leg also runs the `jq_golden_tests`, `cli_golden_tests`,
+  `cli_characterization_tests`, `json_validate_tests` and `locate_cli_tests` suites with the
+  variable set (not `jq_cli_tests`, which would make that leg the slowest of the matrix). The child processes those tests spawn inherit it.
 - A/B benchmarking the SSE2 path against AVX2 on the same machine.
 
 Accepted values (case-insensitive, surrounding whitespace ignored):
@@ -56,11 +61,12 @@ Note that `scalar` still runs the SSE2 kernels: scalar YAML parsing is a compile
 (`--features scalar-yaml`), not a runtime dispatch level, and SSE2 is unconditionally available on
 x86_64.
 
-Scope worth knowing: it clamps **YAML parsing on x86_64 only**
-([`src/yaml/simd/x86.rs`](../../src/yaml/simd/x86.rs)). JSON, DSV, popcount, and balanced-parens
-dispatch are unaffected (extending the clamp to those sites is tracked as follow-up to #247), and
-`aarch64` never reads it. Requires the `std` feature; `no_std` builds compile straight to SSE2
-dispatch with no AVX2 path at all.
+Scope worth knowing: it clamps **YAML parsing** ([`src/yaml/simd/x86.rs`](../../src/yaml/simd/x86.rs))
+and **JSON index building** ([`src/json/simd/mod.rs`](../../src/json/simd/mod.rs)) **on x86_64 only**;
+both read one shared parser, `util::simd::clamp`. DSV, popcount, balanced-parens and the shared
+escape scan dispatch are unaffected (extending the clamp to those sites is tracked as follow-up to
+#247), and `aarch64` never reads it. Requires the `std` feature; `no_std` builds compile straight
+to SSE2 dispatch with no AVX2 path at all.
 
 The value is read **once per process**, on first use, and cached. Changing it mid-run has no effect.
 
@@ -89,12 +95,12 @@ It takes effect only when **all** of the following hold; otherwise it is silentl
 | Requirement                    | Otherwise                                                                    |
 |--------------------------------|------------------------------------------------------------------------------|
 | Value is exactly `1`           | `true`, `yes`, `TRUE`, `0` and empty all mean "unset" — no error, no warning |
-| Target is `aarch64`            | Ignored on x86_64 (whose YAML dispatch has its own [`SUCCINCTLY_SIMD`](#succinctly_simd) clamp) |
+| Target is `aarch64`            | Ignored on x86_64 (whose YAML and JSON dispatch have their own [`SUCCINCTLY_SIMD`](#succinctly_simd) clamp) |
 | CPU reports the `sve2` feature | Falls back to NEON                                                           |
 | Built with the `std` feature   | `no_std` builds compile straight to NEON, with no dispatch                   |
 
 Scope worth knowing: it switches **JSON index building only** ([`src/json/simd/mod.rs`](../../src/json/simd/mod.rs)).
-YAML's own dispatch override is the x86-only [`SUCCINCTLY_SIMD`](#succinctly_simd) clamp, and DSV
+YAML's and x86_64 JSON's own dispatch override is the x86-only [`SUCCINCTLY_SIMD`](#succinctly_simd) clamp, and DSV
 and broadword select use the *different* `sve2-bitperm` feature unconditionally — so "SVE2" is
 opt-in for JSON but always-on elsewhere when the CPU supports it.
 
