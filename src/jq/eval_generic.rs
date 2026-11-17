@@ -10393,6 +10393,17 @@ impl<V: DocumentValue> GenericResult<V> {
         }
     }
 
+    /// Whether this is one of the lazy variants [`Self::materialize_lazy`] forces.
+    fn is_lazy(&self) -> bool {
+        matches!(
+            self,
+            Self::LazyKeys { .. }
+                | Self::LazyIndexRange(_)
+                | Self::LazySeq(_)
+                | Self::LazyObject(_)
+        )
+    }
+
     /// Materialize any lazy variant (`LazyKeys`/`LazyIndexRange`/`LazySeq`)
     /// into `Owned`/`Error`/`Break`, leaving every other variant unchanged.
     /// The shared collapse point for every consumer that was always going to
@@ -14953,7 +14964,12 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
         // #7282: `.[]` over `group_by`'s groups with more of the pipe after it runs that rest on
         // each group's cursors, where the arms below decoded every group first. Only the shapes of
         // the stage and of its input are read here, so any other pipe pays a comparison or two.
-        if S::TAG == EvalTag::Jq && j + 1 < stages.len() {
+        // A rest that opens with a `?//` bind is not run here: the bind has to see the later stages'
+        // errors, which the group-by-group run below cannot give it (#7337, see below).
+        if S::TAG == EvalTag::Jq
+            && j + 1 < stages.len()
+            && !starts_with_pattern_bind(&stages[j + 1..])
+        {
             let rest = &stages[j + 1..];
             if let GenericResult::LazySeq(seq) = &current {
                 if matches!(unwrap_paren(expr), Expr::Iterate) {
@@ -14976,6 +14992,32 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
                     }
                     Err(other) => other,
                 };
+            }
+        }
+        // #7337: see `fold_pipe_stages_sink`. The stages from a `?//` bind on run as one pipe
+        // over each value in hand, so a later stage's error retries the bind's next alternative.
+        // A lazy value is forced first; a `ManyOwned` is what a nested `.[a:b][]` stage leaves.
+        if starts_with_pattern_bind(&stages[j..]) {
+            let forced = if current.is_lazy() {
+                current.materialize_lazy::<S>()
+            } else {
+                current
+            };
+            match forced {
+                GenericResult::Owned(owned) => {
+                    return fold_owned_values_through_bind::<S, V>(
+                        core::iter::once(owned),
+                        &stages[j..],
+                        optional,
+                    );
+                }
+                GenericResult::ManyOwned(owned) => {
+                    return fold_owned_values_through_bind::<S, V>(owned, &stages[j..], optional);
+                }
+                // Anything else is not for this fold to settle: a failed force (`Error`, `Break`,
+                // `Halt`) is the answer, and the cursor and single-value variants already run
+                // the rest of the pipe per value, past `eval_single_pipe`'s own guard.
+                other => current = other,
             }
         }
         current = match current {
@@ -15186,6 +15228,28 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
     }
 
     current
+}
+
+/// The stages `rest`, which open with a `?//` bind, run as one pipe over each of `values` in order
+/// (#7337): a later stage's error unwinds into the bind's next alternative for that value, as in
+/// jq. The outputs before an error stay, as they do on every route that streams them.
+fn fold_owned_values_through_bind<S: EvalSemantics, V: DocumentValue>(
+    values: impl IntoIterator<Item = OwnedValue>,
+    rest: &[Expr],
+    optional: bool,
+) -> GenericResult<V> {
+    let pipe = Expr::Pipe(rest.to_vec().into());
+    let mut collected: Vec<OwnedValue> = Vec::new();
+    for value in values {
+        let flow = eval_each_owned::<S>(&pipe, &value, optional, Reentry::REBUILT, &mut |v| {
+            collected.push(v);
+            Demand::Continue
+        });
+        if let Flow::Escaped(control) = flow {
+            return partial_generic(collected, control);
+        }
+    }
+    owned_vec_to_generic_result(collected)
 }
 
 /// One step of folding a `GenericResult::LazyKeys` through a single further
@@ -16639,6 +16703,14 @@ fn fold_pipe_stages_sink<S: EvalSemantics, V: DocumentValue>(
         if j == stages.len() {
             return drain_result_generic(current, sink);
         }
+        // #7337: a lazy value met by a `?//` bind is forced, and the stages from the bind on go
+        // to the `Owned` arm below, which runs them as one pipe with the bind's retries. The
+        // per-stage fold would run the bind to completion before a later stage's error could
+        // unwind into its next alternative.
+        if current.is_lazy() && starts_with_pattern_bind(&stages[j..]) {
+            current = current.materialize_lazy::<S>();
+            continue;
+        }
         let expr = &stages[j];
         let rest = &stages[j + 1..];
         let is_iterate = matches!(unwrap_paren(expr), Expr::Iterate);
@@ -17129,6 +17201,15 @@ fn generic_result_is_empty<V: DocumentValue>(result: &GenericResult<V>) -> bool 
     }
 }
 
+/// Whether a pipe's first stage is a parenthesised pattern bind (`(. as [$x] ?// $x | $x) | ...`).
+///
+/// Such a bind has to stay alive while a later stage raises, so that the error unwinds into the
+/// bind's next alternative as jq's does (#3410). Each route that folds a pipe a stage at a time
+/// asks this one question, so that none of them runs the bind to completion first (#7337).
+fn starts_with_pattern_bind(stages: &[Expr]) -> bool {
+    matches!(stages.first(), Some(Expr::Paren(inner)) if matches!(inner.as_ref(), Expr::AsPattern { .. }))
+}
+
 fn eval_single_pipe_stages<S: EvalSemantics, V: DocumentValue>(
     exprs: &[Expr],
     whole: &PipeWhole<'_>,
@@ -17218,8 +17299,7 @@ fn eval_single_pipe_stages<S: EvalSemantics, V: DocumentValue>(
 
     // Keep the bind alive while a downstream stop/error unwinds into
     // its next alternative; the eager fold below runs it too soon.
-    if matches!(exprs.first(), Some(Expr::Paren(inner)) if matches!(inner.as_ref(), Expr::AsPattern { .. }))
-    {
+    if starts_with_pattern_bind(exprs) {
         return collect_each_generic::<S, V>(whole.get(exprs), value, optional, cursor);
     }
 

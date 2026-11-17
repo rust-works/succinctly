@@ -1,0 +1,107 @@
+//! #7337: a `?//` bind that opens the rest of a pipe over a `group_by` group, or any other lazy
+//! sequence, retries its next alternative when a later stage raises, as jq's does.
+//!
+//! The bind used to run to completion on the group before the next stage saw its first output, so
+//! the error of `.b + 1` over the first alternative's `{"a":1,"b":"y"}` was reported as it was
+//! (`string ("y") and number (1) cannot be added`) where jq retries the second alternative, `$x`
+//! bound to the whole group, and reports `Cannot index array with string "b"`.
+//!
+//! Every expected line is jq 1.7.1's (`/usr/bin/jq -c`, input on stdin).
+
+use anyhow::Result;
+
+use crate::run_jq_full;
+
+const GROUPS: &str = r#"[{"a":2,"b":"x"},{"a":1,"b":"y"},{"a":2,"b":"z"}]"#;
+const ARRAYS: &str = r#"[[{"a":2,"b":"x"}],[{"a":1,"b":"y"}],[{"a":3,"b":"z"}]]"#;
+
+/// The bind, then a stage that fails on the first alternative's value and on the second's alike
+/// (an object has a `.b` that is no number; an array has no `.b`).
+const BIND: &str = r"(. as [$x] ?// $x | $x) | .b + 1";
+
+const RETRIED: &str = "jq: error (at <stdin>:0): Cannot index array with string \"b\"\n";
+
+fn run(input: &str, filter: &str) -> Result<(String, String, i32)> {
+    run_jq_full(&["-c", filter], Some(input))
+}
+
+/// Every spelling that hands the group on, or a group's slice, to the bind answers jq's retried
+/// error: the sink route, the collecting route, a slice then `[]`, and a lone group by index.
+#[test]
+fn a_bind_over_a_group_retries_its_alternative_on_a_later_error_7337() -> Result<()> {
+    for filter in [
+        format!("[group_by(.a)[] | {BIND}]"),
+        format!("group_by(.a)[] | {BIND}"),
+        format!("group_by(.a) | .[0:2][] | {BIND}"),
+        format!("group_by(.a) | .[1:][] | {BIND}"),
+        format!("[group_by(.a)[0:2][] | {BIND}]"),
+        format!("group_by(.a) | first | {BIND}"),
+        format!("group_by(.a) | .[-1] | {BIND}"),
+        format!("first(group_by(.a)[] | {BIND})"),
+    ] {
+        let (stdout, stderr, code) = run(GROUPS, &filter)?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            ("", RETRIED, 5),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
+/// The same shapes over a `map` sequence and over a plain array, which the first of these shared
+/// the divergence with (a slice's `[]` left a multi-value the bind stage was then applied to one
+/// stage at a time) and the second never had.
+#[test]
+fn a_bind_after_a_slice_and_iterate_retries_over_any_lazy_sequence_7337() -> Result<()> {
+    for filter in [
+        format!("map(.) | .[0:2][] | {BIND}"),
+        format!(".[0:2][] | {BIND}"),
+    ] {
+        let (stdout, stderr, code) = run(ARRAYS, &filter)?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            ("", RETRIED, 5),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
+/// When the retried alternative succeeds, its output is what comes out: the groups' arrays have a
+/// length, where their first element does not (`error("e")`).
+#[test]
+fn the_retried_alternative_supplies_the_output_over_a_group_7337() -> Result<()> {
+    let filter = r#"[group_by(.a)[] | (. as [$x] ?// $x | $x) | if type == "array" then length else error("e") end]"#;
+    let (stdout, stderr, code) = run(GROUPS, filter)?;
+    assert_eq!((stdout.as_str(), stderr.as_str(), code), ("[1,2]\n", "", 0));
+    Ok(())
+}
+
+/// A bind that does not retry still binds the first alternative, and a `try` around the whole
+/// pipe catches the error the retry ends in.
+#[test]
+fn a_bind_over_a_group_that_needs_no_retry_and_one_under_try_are_unchanged_7337() -> Result<()> {
+    for (filter, expected) in [
+        (
+            "[group_by(.a)[] | (. as [$x] ?// $x | $x) | .a]".to_string(),
+            "[1,2]\n",
+        ),
+        (
+            r#"[group_by(.a)[] | (. as [$x] ?// $x | $x) | select(.b == "z")]"#.to_string(),
+            "[]\n",
+        ),
+        (
+            format!(r#"[group_by(.a)[] | try ({BIND}) catch "caught"]"#),
+            "[\"caught\",\"caught\"]\n",
+        ),
+    ] {
+        let (stdout, stderr, code) = run(GROUPS, &filter)?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (expected, "", 0),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
