@@ -46,11 +46,11 @@ use super::deferred_bind::{
     deferred_bind_cursor, deferred_bind_reads, mentions_var, DeferredReads,
 };
 use super::document::{
-    checked_member_key, child_tail_gap_ok, collapsed_fields_checked, collapsed_fields_if,
-    container_tail_gap_ok, effective_fields_checked, effective_fields_with_raw_last,
-    effective_len_checked, effective_value_cursors_checked, empty_elements_tail_gap_ok,
-    empty_fields_tail_gap_ok, key_delimiter_ok, key_display_string, key_display_string_kind,
-    key_hash, key_is_malformed, resolve_display_key, tail_gap_ok, trailing_element_gap_ok,
+    checked_member_key, child_tail_gap_ok, collapsed_fields_if, container_tail_gap_ok,
+    effective_fields_checked, effective_fields_with_raw_last, effective_len_checked,
+    effective_value_cursors_checked, empty_elements_tail_gap_ok, empty_fields_tail_gap_ok,
+    key_delimiter_ok, key_display_string, key_display_string_kind, key_hash, key_is_malformed,
+    repeat_plan_checked, resolve_display_key, tail_gap_ok, trailing_element_gap_ok,
     value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors, DocumentCursor, DocumentElements,
     DocumentFields, DocumentValue, IndentSpec, JsonConvention, LazyKeyLedger,
 };
@@ -5372,7 +5372,7 @@ enum LazySource<V: DocumentValue> {
     /// closing bracket's own gap is read from it when the walk runs out (#5654).
     Elements(V::Elements, Option<V::Cursor>),
     /// Bare `obj | map(f)` (#725). Every member was checked up front, by the same
-    /// `collapsed_fields_checked` probe that finds a repeated key (#5654).
+    /// `repeat_plan_checked` walk that finds a repeated key (#5654, #7311).
     Values(V::Fields),
     /// `keys_unsorted | map(f)` (#724).
     ///
@@ -40515,20 +40515,18 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 // last-seen value in both modes (#1398), which needs every
                 // occurrence seen before any value can be emitted --
                 // incompatible with `Values`'s incremental cons-list pull.
-                // `collapsed_fields_checked` gates the materializing fallback
-                // behind a cheap fingerprint probe (`document::census`),
+                // `repeat_plan_checked` gates the cursor-list fallback
+                // behind a cheap key-only hash walk (`document::census`'s),
                 // so the duplicate-free case (by far the common one) keeps
-                // #724/#725's lazy pull unchanged. The same probe checks
+                // #724/#725's lazy pull unchanged. The same walk checks
                 // every member's gaps, a trailing `,` and an unpaired last
                 // field, in both branches (#5654), so `Values` pulls none.
-                let source = match collapsed_fields_checked(&fields, true) {
+                // The fallback keeps one value cursor per surviving field,
+                // where it used to materialize every field and own every
+                // key to collapse them (#7311).
+                let source = match repeat_plan_checked(&fields, true) {
                     Err(err) => return GenericResult::Error(err),
-                    Ok(Some(collapsed)) => LazySource::cursors(
-                        collapsed
-                            .into_iter()
-                            .map(|field| field.value_cursor)
-                            .collect(),
-                    ),
+                    Ok(Some(plan)) => LazySource::cursors(plan.value_cursors(&fields)),
                     Ok(None) => LazySource::Values(fields),
                 };
                 GenericResult::LazySeq(Box::new(LazySeq::new(source).push_map(f, S::TAG)))

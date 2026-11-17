@@ -12,8 +12,9 @@ use std::path::{Path, PathBuf};
 
 use succinctly::dsv::{build_index as build_dsv_index, DsvConfig, DsvRows};
 use succinctly::jq::document::{
-    any_hash_repeats, effective_keys, key_hash, key_span_fingerprint, DistinctKeyCursors,
-    DocumentCursor, DocumentValue, IndentSpec, JsonConvention, PAIRWISE_SPAN_SCAN_LIMIT,
+    any_hash_repeats, effective_keys, key_hash, key_span_fingerprint, shared_key_hashes,
+    DistinctKeyCursors, DocumentCursor, DocumentValue, IndentSpec, JsonConvention,
+    PAIRWISE_SPAN_SCAN_LIMIT,
 };
 use succinctly::jq::eval_generic::{
     check_nesting_depth, depth_guard_panic_message, eval_with_cursor, to_owned as generic_to_owned,
@@ -3418,9 +3419,9 @@ fn spans_repeat(prepared: &[PreparedField<'_>]) -> bool {
 /// a repeated key collapses to its *first* position holding its *last*
 /// value.
 ///
-/// Returns `None` when no key repeats, which lets the caller print straight
-/// from the list it already has. Only an object that genuinely carries a
-/// duplicate allocates.
+/// Collapses `prepared` in place and returns how many fields it keeps, at
+/// its front: all of them when no key repeats, which lets the caller print
+/// straight from the list it already has.
 ///
 /// Keys compare by raw source span while nothing is escaped -- two
 /// escape-free spans are equal exactly when their decoded values are. A
@@ -3431,50 +3432,90 @@ fn spans_repeat(prepared: &[PreparedField<'_>]) -> bool {
 /// `HashMap`, never from scanning the keys accepted so far. Scanning made a
 /// single duplicate in a 100K-field object take 8.5 s where not collapsing
 /// at all took 0.02 s and real jq took 0.03 s.
+///
+/// Only the keys whose [`collapse_key_hash`] another key shares are decoded
+/// and mapped, and the fields are compacted where they lie (#7311). Every
+/// other key occurs once, so its field keeps its place as it stands.
+/// Decoding every key into a list, mapping them all, and copying the fields
+/// into a second list made one repeat in a 100 MB object of 7.1 M keys hold
+/// all three at once, beside the field list itself.
 fn collapse_duplicate_fields<'a>(
-    prepared: &[PreparedField<'a>],
+    prepared: &mut [PreparedField<'a>],
     frame: &Frame<'a, impl Clone + AsRef<[u64]>>,
-) -> Option<Vec<PreparedField<'a>>> {
+) -> usize {
     if prepared.len() < 2 {
-        return None;
+        return prepared.len();
     }
     let any_escaped = prepared.iter().any(|field| field.escaped);
     if !any_escaped && !spans_repeat(prepared) {
-        return None;
+        return prepared.len();
+    }
+    let shared = shared_key_hashes(
+        prepared
+            .iter()
+            .filter_map(|field| collapse_key_hash(field, frame))
+            .collect(),
+    );
+    if shared.is_empty() {
+        return prepared.len();
     }
 
-    let decoded: Vec<Option<PreparedCow<'a, str>>> = prepared
-        .iter()
-        .map(|field| match frame.cursor(field.key_bp).value() {
-            StandardJson::String(k) => k.as_str().ok(),
-            _ => None,
-        })
-        .collect();
-
-    let mut slot_of: HashMap<&str, usize> = HashMap::with_capacity(prepared.len());
-    let mut chosen: Vec<PreparedField<'a>> = Vec::with_capacity(prepared.len());
-    for (i, field) in prepared.iter().enumerate() {
+    let mut slot_of: HashMap<PreparedCow<'a, str>, usize> = HashMap::new();
+    let mut kept = 0usize;
+    for i in 0..prepared.len() {
+        let field = prepared[i];
         // A key that does not decode has no name to collapse on, so it is
         // kept where it stands. Skipping it instead deleted the field from
         // the output entirely -- `{"a\q":1,"b":2}` printed as `{"b":2}`
-        // (#1385 review); the write loop below still has its raw span and
-        // echoes it verbatim, which is what this printer did before #1385.
-        let Some(name) = decoded[i].as_deref() else {
-            chosen.push(*field);
-            continue;
-        };
-        match slot_of.get(name) {
-            Some(&at) => chosen[at] = *field,
+        // (#1385 review); the write loop still has its raw span and echoes
+        // it verbatim, which is what this printer did before #1385.
+        let name = collapse_key_hash(&field, frame)
+            .filter(|hash| shared.binary_search(hash).is_ok())
+            .and_then(|_| collapse_key_name(&field, frame));
+        match name.and_then(|name| match slot_of.get(name.as_ref()) {
+            Some(&at) => Some(at),
             None => {
-                slot_of.insert(name, chosen.len());
-                chosen.push(*field);
+                slot_of.insert(name, kept);
+                None
+            }
+        }) {
+            Some(at) => prepared[at] = field,
+            None => {
+                prepared[kept] = field;
+                kept += 1;
             }
         }
     }
-    if chosen.len() == prepared.len() {
-        return None;
+    kept
+}
+
+/// A key's decoded spelling, or `None` when it will not decode.
+fn collapse_key_name<'a>(
+    field: &PreparedField<'a>,
+    frame: &Frame<'a, impl Clone + AsRef<[u64]>>,
+) -> Option<PreparedCow<'a, str>> {
+    if !field.escaped {
+        // An escape-free span between its quotes is the decoded key.
+        let inner = field.raw.get(1..field.raw.len().checked_sub(1)?)?;
+        if let Ok(name) = std::str::from_utf8(inner) {
+            return Some(PreparedCow::Borrowed(name));
+        }
     }
-    Some(chosen)
+    match frame.cursor(field.key_bp).value() {
+        StandardJson::String(k) => k.as_str().ok(),
+        _ => None,
+    }
+}
+
+/// The hash [`collapse_duplicate_fields`] compares a key under, which two
+/// keys share whenever they decode to the same string: the escape-free span
+/// between its quotes is hashed as it stands, and only an escaped key is
+/// decoded first. `None` for a key that will not decode.
+fn collapse_key_hash(
+    field: &PreparedField<'_>,
+    frame: &Frame<'_, impl Clone + AsRef<[u64]>>,
+) -> Option<u64> {
+    collapse_key_name(field, frame).map(|name| key_hash(name.as_bytes()))
 }
 
 /// Write one object key and its colon, honouring `-a`/`--ascii-output`.
@@ -20454,20 +20495,20 @@ where
                                 .into());
                             }
                         }
-                        let collapsed = if !config.convention.preserves_source_values() {
-                            collapse_duplicate_fields(&scratch[base..], &frame)
+                        // The collapse compacts this object's own slots,
+                        // `base..base + count`; the slots after them stay
+                        // where they are until the truncate below, so a
+                        // nested object still appends past the end.
+                        let count = if !config.convention.preserves_source_values() {
+                            collapse_duplicate_fields(&mut scratch[base..], &frame)
                         } else {
-                            None
+                            scratch.len() - base
                         };
-                        let count = collapsed.as_ref().map_or(scratch.len() - base, Vec::len);
 
                         out.write_all(b"{")?;
                         out.write_all(separator.as_bytes())?;
                         for i in 0..count {
-                            let field = match &collapsed {
-                                Some(list) => list[i],
-                                None => scratch[base + i],
-                            };
+                            let field = scratch[base + i];
                             if i > 0 {
                                 out.write_all(b",")?;
                                 out.write_all(separator.as_bytes())?;
