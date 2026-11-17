@@ -5712,15 +5712,32 @@ impl<Out: core::fmt::Write> ChunkedWrite<'_, Out> {
         self.buf.clear();
         Ok(())
     }
+
+    /// Passes the gathered chunk on, then `s`: straight to `out` when it is itself a chunk's worth,
+    /// else into the emptied buffer. Cold for the same reason as [`Self::pass_on`] (#7356).
+    #[cold]
+    #[inline(never)]
+    fn pass_on_with(&mut self, s: &str) -> core::fmt::Result {
+        if !self.buf.is_empty() {
+            self.pass_on()?;
+        }
+        if s.len() >= CHUNKED_WRITE_BYTES {
+            return self.out.write_str(s);
+        }
+        self.buf.push_str(s);
+        Ok(())
+    }
 }
 
 impl<Out: core::fmt::Write> core::fmt::Write for ChunkedWrite<'_, Out> {
     #[inline]
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        self.buf.push_str(s);
-        if self.buf.len() >= CHUNKED_WRITE_BYTES {
-            return self.pass_on();
+        // The length is checked before the push, so a write that would carry the buffer to the
+        // limit never grows it: one string token of 50 MiB was gathered whole here (#7356).
+        if self.buf.len() + s.len() >= CHUNKED_WRITE_BYTES {
+            return self.pass_on_with(s);
         }
+        self.buf.push_str(s);
         Ok(())
     }
 
@@ -5799,6 +5816,44 @@ mod pretty_streaming_tests_7271 {
         assert!(streamed
             .1
             .ends_with("\"s\": \"é😀\\nxxxxxxxxxx\"\n    }\n  ]\n}"));
+    }
+
+    /// One write of a chunk's worth or more goes to the writer as it is, and never into the
+    /// buffer: a 50 MiB string token was gathered whole before (#7356). The writes around it keep
+    /// their order and the buffer stays below the limit.
+    #[test]
+    fn a_long_write_bypasses_the_chunk_buffer_7356() {
+        let long = "x".repeat(3 * CHUNKED_WRITE_BYTES + 5);
+        let mut out = Writes::default();
+        let mut chunked = ChunkedWrite {
+            out: &mut out,
+            buf: String::new(),
+        };
+        core::fmt::Write::write_str(&mut chunked, "head,").unwrap();
+        core::fmt::Write::write_str(&mut chunked, &long).unwrap();
+        assert!(
+            chunked.buf.capacity() < CHUNKED_WRITE_BYTES,
+            "{}",
+            chunked.buf.capacity()
+        );
+        core::fmt::Write::write_str(&mut chunked, ",tail").unwrap();
+        chunked.finish().unwrap();
+        assert_eq!(out.0, [5, long.len(), 5]);
+        assert_eq!(out.1, format!("head,{long},tail"));
+
+        // A write that only reaches the limit with the buffer's help passes the buffer on, then
+        // sits in the emptied one.
+        let mut out = Writes::default();
+        let mut chunked = ChunkedWrite {
+            out: &mut out,
+            buf: String::new(),
+        };
+        let part = "y".repeat(CHUNKED_WRITE_BYTES - 3);
+        core::fmt::Write::write_str(&mut chunked, &part).unwrap();
+        core::fmt::Write::write_str(&mut chunked, "zzzz").unwrap();
+        assert_eq!(chunked.buf, "zzzz");
+        chunked.finish().unwrap();
+        assert_eq!(out.0, [part.len(), 4]);
     }
 
     /// The re-indenter writes what the tree walk writes, for every certified document the
