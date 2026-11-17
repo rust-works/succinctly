@@ -3566,10 +3566,10 @@ pub type BorrowedJsonCursor<'a> = JsonCursor<'a, &'a [u64]>;
 // ============================================================================
 
 use crate::jq::document::{
-    any_hash_repeats, collapsed_fields_checked, document_token_of, effective_fields_checked,
-    key_hash, key_is_malformed, key_span_fingerprint, trailing_element_gap_ok, DocumentCursor,
-    DocumentElements, DocumentField, DocumentFields, DocumentValue, IndentSpec, JsonConvention,
-    KeyHashes, PAIRWISE_SPAN_SCAN_LIMIT,
+    any_hash_repeats, document_token_of, effective_fields_checked, key_hash, key_is_malformed,
+    key_span_fingerprint, repeat_plan_checked, trailing_element_gap_ok, DocumentCursor,
+    DocumentElements, DocumentField, DocumentFields, DocumentValue, FieldFate, IndentSpec,
+    JsonConvention, KeyHashes, RepeatPlan, PAIRWISE_SPAN_SCAN_LIMIT,
 };
 use crate::jq::escape::{write_json_body_jq, write_json_body_yq};
 use crate::jq::stream::{StreamFailure, StreamResult};
@@ -5891,17 +5891,24 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
             let collapse = numbers == JsonConvention::JqCompat;
             // #2720: the fields are materialized only when the writer
             // genuinely needs all of them in hand before it can write the
-            // first -- `-S` (every key, to sort) and an object that
-            // actually repeats a key under a collapsing mode (a later
-            // occurrence changes an earlier field's value). Every other
-            // object -- the common one -- is validated by one key-only
-            // walk (`collapsed_fields_checked`, #1194/#1677/#2261's checks,
-            // the same ones the materializing `effective_fields_checked`
-            // runs) and then streamed straight off `uncons` in document
-            // order. The materialized path used to be unconditional: a
-            // 144-byte `DocumentField` per field, 22.9 MB for perf-guard's
-            // 2 MB `wide` fixture, and half of the identity print's
+            // first, which is `-S` (every key, to sort). Every other
+            // object is validated by one key-only walk
+            // (`repeat_plan_checked`, #1194/#1677/#2261's checks, the same
+            // ones the materializing `effective_fields_checked` runs) and
+            // then streamed straight off `uncons` in document order. The
+            // materialized path used to be unconditional: a 144-byte
+            // `DocumentField` per field, 22.9 MB for perf-guard's 2 MB
+            // `wide` fixture, and half of the identity print's
             // instructions on a 7950X.
+            //
+            // #7311: an object that repeats a key under a collapsing mode
+            // streams too. Its plan names the few fields the rule changes
+            // (a repeated key's first occurrence takes its last value, and
+            // its later occurrences go), found by decoding only the keys
+            // whose hash another key shares. Materializing such an object
+            // instead peaked at 2.6-2.9 GB for `.` over a 100 MB object of
+            // 7.1 M keys with one repeat, where the plan peaks at the
+            // 260-370 MB the same object takes without it (7950X, M4 Pro).
             let materialized = if sort_keys {
                 let items =
                     effective_fields_checked(&fields, collapse).map_err(StreamFailure::Decode)?;
@@ -5932,13 +5939,18 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
                         .collect::<Vec<_>>(),
                 )
             } else {
-                collapsed_fields_checked(&fields, collapse).map_err(StreamFailure::Decode)?
+                None
+            };
+            let plan = if sort_keys {
+                None
+            } else {
+                repeat_plan_checked(&fields, collapse).map_err(StreamFailure::Decode)?
             };
             out.write_char('{')?;
             let next_indent = current_indent + indent_spaces;
             let mut first = true;
-            match materialized {
-                Some(items) => {
+            match (materialized, plan) {
+                (Some(items), _) => {
                     for field in items {
                         stream_json_field(
                             out,
@@ -5956,7 +5968,7 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
                         first = false;
                     }
                 }
-                None => {
+                (None, None) => {
                     // The inherent `JsonFields::uncons`, not the trait's:
                     // two cursors per field and nothing decoded until the
                     // writer asks (`key()`/`value()` below), where the trait
@@ -5980,6 +5992,16 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
                         walk = rest;
                     }
                 }
+                (None, Some(plan)) => stream_json_planned_fields(
+                    out,
+                    fields,
+                    plan,
+                    next_indent,
+                    indent_spaces,
+                    unit,
+                    numbers,
+                    depth,
+                )?,
             }
             if indent_spaces > 0 {
                 out.write_char('\n')?;
@@ -6013,6 +6035,55 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
         // #2286.
         StandardJson::Error(msg) => Err(StreamFailure::Decode(EvalError::decode_failure(msg))),
     }
+}
+
+/// The fields of an object that repeats a key, for [`stream_json_pretty`]'s
+/// object arm: its streaming walk, asking `plan` what becomes of each field
+/// (#7311), never under `-S`.
+///
+/// Out of line and cold, so that the writer every value recurses through
+/// keeps the size it had; see `plan_repeats` (`src/jq/document.rs`) for what
+/// keeping it in line cost.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)] // STYLE-0004: stream_json_pretty's own ambients, which this loop threads through.
+fn stream_json_planned_fields<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
+    out: &mut Out,
+    fields: JsonFields<'_, W>,
+    mut plan: RepeatPlan<JsonCursor<'_, W>>,
+    next_indent: usize,
+    indent_spaces: usize,
+    unit: char,
+    numbers: JsonConvention,
+    depth: usize,
+) -> StreamResult {
+    let mut first = true;
+    let mut walk = fields;
+    let mut at = 0usize;
+    while let Some((field, rest)) = JsonFields::uncons(&walk) {
+        walk = rest;
+        at += 1;
+        let (value, value_cursor) = match plan.fate(at - 1) {
+            FieldFate::Unchanged => (field.value(), field.value_cursor()),
+            FieldFate::Value(cursor) => (cursor.value(), cursor),
+            FieldFate::Dropped => continue,
+        };
+        stream_json_field(
+            out,
+            field.key(),
+            value,
+            &value_cursor,
+            first,
+            next_indent,
+            indent_spaces,
+            unit,
+            false,
+            numbers,
+            depth,
+        )?;
+        first = false;
+    }
+    Ok(())
 }
 
 /// One object member of [`stream_json_pretty`]'s object arm -- the

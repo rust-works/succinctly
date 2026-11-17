@@ -5997,7 +5997,7 @@ the record.
 `LazySource::Values` in `eval_generic.rs`, whose `uncons` cannot tell "no more fields" from
 "the last field never got a value" apart — the same ambiguity `effective_fields_checked` closes for
 bare `.[]`. Left open by #1641, mirroring the `#1629` precedent above rather than silently
-expanding that PR's scope; `obj | map(f)` now takes `collapsed_fields_checked`'s probe, which checks every member and the unpaired tail.
+expanding that PR's scope; `obj | map(f)` now takes `repeat_plan_checked`'s walk, which checks every member and the unpaired tail.
 
 `LazySource::Keys` -- `keys_unsorted | map(f)`, the sibling variant of the same `advance()`
 match, sourcing from a `DistinctKeyCursors` walk rather than raw `uncons` -- is *not* this

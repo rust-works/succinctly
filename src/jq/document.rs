@@ -3426,6 +3426,14 @@ fn repeated_hashes(mut hashes: Vec<u64>) -> (Vec<u64>, usize) {
     (shared, alone + distinct)
 }
 
+/// The values that occur more than once in `hashes`, sorted ascending and
+/// deduplicated: [`repeated_hashes`]'s list, for the printer's collapse
+/// (`jq_runner.rs`), which decodes only the keys that carry one (#7311).
+#[doc(hidden)]
+pub fn shared_key_hashes(hashes: Vec<u64>) -> Vec<u64> {
+    repeated_hashes(hashes).0
+}
+
 /// Whether any value occurs more than once in `hashes` (#4169) -- what
 /// `sort_unstable` followed by [`hashes_repeat`] answers, through the same
 /// bitset prefilter as [`repeated_hashes`], for the batch callers that need
@@ -3514,6 +3522,71 @@ fn prefilter_candidates(hashes: &[u64]) -> Option<Vec<u64>> {
 /// 159 K keys (#3343) while winning on an M4 Pro -- the architecture split
 /// [`KeyHashes`] records for #1514.
 fn census<F: DocumentFields>(fields: &F) -> KeyCensus {
+    let HashWalk {
+        shared,
+        distinct_hashes,
+        unkeyed,
+        malformed,
+    } = hash_walk(fields);
+    if shared.is_empty() {
+        return KeyCensus {
+            distinct: distinct_hashes,
+            unkeyed,
+            repeated: false,
+            malformed,
+        };
+    }
+
+    // A shared hash is nearly always a genuine repeat, but two different
+    // keys can collide, and counting those as one would be wrong. Re-walk
+    // owning *only* the colliding keys -- on an ordinary duplicate that is
+    // a handful of strings, not one per field. `uncons_key` (#1514), same
+    // as the first walk: a census never looks at values.
+    let mut colliding: Vec<String> = Vec::new();
+    let mut walk = fields.clone();
+    while let Some((key, _cursor, rest)) = walk.uncons_key() {
+        // `key_hash_of` answers `Some` only for a key that stringifies,
+        // so the `key_string` is how the owned spelling is obtained here,
+        // not a second filter that could drop a counted field.
+        if let Some(k) = key_hash_of(&key)
+            .filter(|hash| shared.binary_search(hash).is_ok())
+            .and_then(|_| key.key_string())
+        {
+            colliding.push(k.into_owned());
+        }
+        walk = rest;
+    }
+    colliding.sort_unstable();
+    let (distinct_colliding, repeated) = distinct_sorted(&colliding);
+    KeyCensus {
+        // `distinct_hashes` counts distinct *hashes*; every colliding
+        // group contributed exactly one of them, so swap each group's
+        // single hash for however many distinct keys it actually held.
+        distinct: distinct_hashes - shared.len() + distinct_colliding,
+        unkeyed,
+        repeated,
+        malformed,
+    }
+}
+
+/// What [`hash_walk`] learns from one key-only walk over an object.
+struct HashWalk {
+    /// The key hashes that occur more than once, sorted and deduplicated.
+    /// Every field whose key repeats has one of these; so, rarely, does a
+    /// field whose key only shares a 64-bit hash with a different one.
+    shared: Vec<u64>,
+    /// How many distinct hashes the stringifiable keys have.
+    distinct_hashes: usize,
+    /// See [`KeyCensus::unkeyed`].
+    unkeyed: usize,
+    /// See [`KeyCensus::malformed`].
+    malformed: bool,
+}
+
+/// The first walk of [`census`]: a hash per key, the member checks, and
+/// which hashes repeat. [`repeat_plan_checked`] takes it too, because the
+/// shared hashes are what let it decode only the keys that can collapse.
+fn hash_walk<F: DocumentFields>(fields: &F) -> HashWalk {
     let mut hashes: Vec<u64> = Vec::new();
     let mut unkeyed = 0usize;
     let mut malformed = false;
@@ -3556,45 +3629,237 @@ fn census<F: DocumentFields>(fields: &F) -> KeyCensus {
     // gap (#2243) this inherits.
     malformed |= !last_field_trailing_gap_ok(last_key_cursor, b'}');
     let (shared, distinct_hashes) = repeated_hashes(hashes);
-    if shared.is_empty() {
-        return KeyCensus {
-            distinct: distinct_hashes,
-            unkeyed,
-            repeated: false,
-            malformed,
-        };
+    HashWalk {
+        shared,
+        distinct_hashes,
+        unkeyed,
+        malformed,
+    }
+}
+
+/// What jq's duplicate-key rule does to the fields of one object, by
+/// position in its field walk, for a writer that streams the fields rather
+/// than holding them (#7311).
+///
+/// Only the fields whose key can collapse have a step; every other field is
+/// written as it stands. A repeated key's first occurrence keeps its position
+/// and takes its last occurrence's value, and every later occurrence is
+/// dropped: the rule `collapse_repeated` applies, without the list of every
+/// field it needs. On a 100 MB object of 7.1 M keys with one repeat, that
+/// list and its map of every key took the print's peak to 2.6-2.9 GB; this holds
+/// two steps. A step is a position and a slot, and a value cursor is kept per
+/// slot, so an object that repeats a few keys a million times holds 16 bytes
+/// per occurrence and one cursor per key.
+pub(crate) struct RepeatPlan<C> {
+    /// One per field that has a step, in walk order.
+    steps: Vec<RepeatStep>,
+    /// The value each slot's field is written with: its key's last occurrence's.
+    values: Vec<C>,
+    /// The next step [`RepeatPlan::fate`] has not reached yet.
+    next: usize,
+}
+
+/// One field of a [`RepeatPlan`]: its position, and the slot of the value
+/// written there, or [`RepeatStep::DROPPED`].
+struct RepeatStep {
+    at: usize,
+    slot: usize,
+}
+
+impl RepeatStep {
+    /// The slot of a field that is not written.
+    const DROPPED: usize = usize::MAX;
+}
+
+/// What a [`RepeatPlan`] makes of one field.
+pub(crate) enum FieldFate<C> {
+    /// Written as it stands.
+    Unchanged,
+    /// Written with this value, its key's last occurrence's.
+    Value(C),
+    /// A later occurrence of a key already written: not written.
+    Dropped,
+}
+
+impl<C: Copy> RepeatPlan<C> {
+    /// What becomes of the field at position `at` of the walk. Asked once
+    /// per field, in walk order.
+    pub(crate) fn fate(&mut self, at: usize) -> FieldFate<C> {
+        match self.steps.get(self.next) {
+            Some(step) if step.at == at => {
+                self.next += 1;
+                match self.values.get(step.slot) {
+                    Some(&value) => FieldFate::Value(value),
+                    None => FieldFate::Dropped,
+                }
+            }
+            _ => FieldFate::Unchanged,
+        }
     }
 
-    // A shared hash is nearly always a genuine repeat, but two different
-    // keys can collide, and counting those as one would be wrong. Re-walk
-    // owning *only* the colliding keys -- on an ordinary duplicate that is
-    // a handful of strings, not one per field. `uncons_key` (#1514), same
-    // as the first walk above: a census never looks at values.
-    let mut colliding: Vec<String> = Vec::new();
+    /// The value cursors of the fields the rule keeps, in their order: the
+    /// values a collapsed field list holds, without the list (`map` over an
+    /// object that repeats a key). The walk is `uncons`, as the list's was.
+    pub(crate) fn value_cursors<F: DocumentFields<Cursor = C>>(mut self, fields: &F) -> Vec<C> {
+        let mut out = Vec::new();
+        let mut walk = fields.clone();
+        let mut at = 0usize;
+        while let Some((field, rest)) = walk.uncons() {
+            match self.fate(at) {
+                FieldFate::Unchanged => out.push(field.value_cursor),
+                FieldFate::Value(cursor) => out.push(cursor),
+                FieldFate::Dropped => {}
+            }
+            at += 1;
+            walk = rest;
+        }
+        out
+    }
+}
+
+/// The [`RepeatPlan`] for `fields` under the mode's duplicate-key rule, refusing an object whose
+/// members the format's grammar never allowed (#1194, #1677, #2261) -- the streaming writer's
+/// gate (#2720, #7311).
+///
+/// `Ok(None)` is the answer a writer wants for the overwhelmingly common object: well-formed,
+/// no repeated key (or `collapse` off), so the fields can be streamed straight off `uncons` in
+/// document order. `Err` is the same `malformed_member_error` the materializing
+/// [`effective_fields_checked`] raises; the checks are `census`'s, so a caller switching
+/// between the two sees the same diagnostic.
+///
+/// It takes the census's key-only walk, then walks again decoding only the
+/// keys whose hash is shared: a handful on an ordinary object, so the
+/// second walk allocates next to nothing. A different key that merely
+/// shares a hash gets its own slot, which keeps its field as it stands, and
+/// an object where that is all that happened answers `Ok(None)`.
+///
+/// Whether a key repeats is the hashes' answer, as it is for `census`, but
+/// which fields collapse is `collapse_repeated`'s: every key that stringifies,
+/// compared by its string. The two agree unless some key has no hash -- a
+/// YAML complex key (`? [x]`), or an escape that will not decode -- and then
+/// every key is decoded, so `{a: 1, a: 2, [x]: 3, [x]: 4}` still collapses
+/// both pairs under `map(f)`, as it did before and as yq does (#7311 review).
+pub(crate) fn repeat_plan_checked<F: DocumentFields>(
+    fields: &F,
+    collapse: bool,
+) -> Result<Option<RepeatPlan<F::Cursor>>, EvalError> {
+    let walked = hash_walk(fields);
+    if walked.malformed {
+        return Err(fields.malformed_member_error());
+    }
+    if !collapse || walked.shared.is_empty() {
+        return Ok(None);
+    }
+    Ok(plan_repeats(fields, &walked.shared, walked.unkeyed > 0))
+}
+
+/// [`repeat_plan_checked`]'s second walk, for an object whose hashes repeat.
+///
+/// Out of line and cold, so that the gate the writers call for every object
+/// stays as small as `collapsed_fields_checked`'s was. A build that kept this
+/// walk, the JSON writer's plan loop and the printer's collapse in line read
+/// up to 4% slower on a 7950X over objects that repeat nothing (`.` over a
+/// 100 MB object the scan declines), at an instruction count within 0.05%;
+/// with the three out of line it timed flat (#7311).
+#[cold]
+#[inline(never)]
+fn plan_repeats<F: DocumentFields>(
+    fields: &F,
+    shared: &[u64],
+    every_key: bool,
+) -> Option<RepeatPlan<F::Cursor>> {
+    let mut steps: Vec<RepeatStep> = Vec::new();
+    let mut values: Vec<F::Cursor> = Vec::new();
+    let mut slots = SharedKeySlots::default();
+    let mut dropped = false;
     let mut walk = fields.clone();
+    let mut at = 0usize;
     while let Some((key, _cursor, rest)) = walk.uncons_key() {
-        // `key_hash_of` answers `Some` only for a key that stringifies,
-        // so the inner `key_string` is how the owned spelling is obtained
-        // here, not a second filter that could drop a counted field.
-        if let Some(hash) = key_hash_of(&key) {
-            if shared.binary_search(&hash).is_ok() {
-                if let Some(k) = key.key_string() {
-                    colliding.push(k.into_owned());
+        if let Some(name) = collapsing_key(&key, shared, every_key) {
+            // `uncons` meets the same field `uncons_key` just did, so it is
+            // not `None` on the object the walk above accepted.
+            if let Some((field, _)) = walk.uncons() {
+                let value = field.value_cursor;
+                match slots.slot(name, values.len()) {
+                    Some(slot) => {
+                        values[slot] = value;
+                        steps.push(RepeatStep {
+                            at,
+                            slot: RepeatStep::DROPPED,
+                        });
+                        dropped = true;
+                    }
+                    None => {
+                        steps.push(RepeatStep {
+                            at,
+                            slot: values.len(),
+                        });
+                        values.push(value);
+                    }
                 }
             }
         }
+        at += 1;
         walk = rest;
     }
-    colliding.sort_unstable();
-    let (distinct_colliding, repeated) = distinct_sorted(&colliding);
-    KeyCensus {
-        // `distinct_hashes` counts distinct *hashes*; every colliding
-        // group contributed exactly one of them, so swap each group's
-        // single hash for however many distinct keys it actually held.
-        distinct: distinct_hashes - shared.len() + distinct_colliding,
-        unkeyed,
-        repeated,
-        malformed,
+    dropped.then_some(RepeatPlan {
+        steps,
+        values,
+        next: 0,
+    })
+}
+
+/// The name `key` collapses under, when the collapse walks have to compare it:
+/// its hash is in `shared` (sorted: the hashes that occur more than once, or a
+/// superset), or `every_key` is set because some key of the object has no hash
+/// to tell it apart by. `None` for every other key, which occurs once, and for
+/// a key that does not stringify, which has no name to collapse on and keeps
+/// its place.
+fn collapsing_key<'v, V: DocumentValue>(
+    key: &'v V,
+    shared: &[u64],
+    every_key: bool,
+) -> Option<Cow<'v, str>> {
+    if !every_key {
+        let hash = key_hash_of(key)?;
+        shared.binary_search(&hash).ok()?;
+    }
+    key.key_string()
+}
+
+/// The slot of each repeated key seen so far, for the collapse walks that
+/// decode only the keys that can collapse ([`repeat_plan_checked`],
+/// [`collapse_repeated_cursors`]).
+///
+/// Found by the key's [`key_hash`] and confirmed against the first key that
+/// hash met, so an owned key is made once per distinct key and a key is not
+/// run through a general-purpose hasher; a different key on the same hash goes
+/// to an exact map of its own.
+#[derive(Default)]
+struct SharedKeySlots {
+    by_hash: IndexMap<u64, (String, usize), core::hash::BuildHasherDefault<KeyHashIdentity>>,
+    collided: IndexMap<String, usize>,
+}
+
+impl SharedKeySlots {
+    /// The slot already claimed by `key`, or `None` after claiming `slot`
+    /// for it.
+    fn slot(&mut self, key: Cow<'_, str>, slot: usize) -> Option<usize> {
+        let hash = key_hash(key.as_bytes());
+        match self.by_hash.get(&hash) {
+            Some((first, at)) if first.as_str() == key.as_ref() => Some(*at),
+            Some(_) => match self.collided.get(key.as_ref()) {
+                Some(&at) => Some(at),
+                None => {
+                    self.collided.insert(key.into_owned(), slot);
+                    None
+                }
+            },
+            None => {
+                self.by_hash.insert(hash, (key.into_owned(), slot));
+                None
+            }
+        }
     }
 }
 
@@ -3887,23 +4152,35 @@ pub fn effective_value_cursors_checked<F: DocumentFields>(
         }
     }
     // `keys_repeat`'s answer: it hashes the same keys, skipping the same ones, and asks the
-    // same question of fewer than two fields.
-    let repeats = collapse
-        && out.len() >= 2
-        && if out.len() <= SMALL_OBJECT_FIELDS {
-            let small = &small[..small_len];
-            small
-                .iter()
-                .enumerate()
-                .any(|(i, hash)| small[i + 1..].contains(hash))
-        } else {
-            hashes.extend(batch.drain(..).filter_map(|key| key_hash_of(&key)));
-            any_hash_repeats(hashes)
-        };
-    if repeats {
-        return Ok(collapse_repeated_cursors(fields, out));
+    // same question of fewer than two fields. A wide object keeps the hashes that repeat, so
+    // the collapse below decodes only the keys that carry one (#7311).
+    if !collapse || out.len() < 2 {
+        return Ok(out);
     }
-    Ok(out)
+    if out.len() <= SMALL_OBJECT_FIELDS {
+        let small = &small[..small_len];
+        let repeats = small
+            .iter()
+            .enumerate()
+            .any(|(i, hash)| small[i + 1..].contains(hash));
+        if repeats {
+            // Every hash of so small an object, not only those that repeat: a superset only
+            // decodes a few keys that occur once, and each of those keeps its place anyway.
+            let mut shared = small.to_vec();
+            shared.sort_unstable();
+            let every_key = small.len() < out.len();
+            return Ok(collapse_repeated_cursors(fields, out, &shared, every_key));
+        }
+        return Ok(out);
+    }
+    hashes.extend(batch.drain(..).filter_map(|key| key_hash_of(&key)));
+    // A key with no hash left no entry, which `collapse_repeated_cursors` has to know (#7311).
+    let every_key = hashes.len() < out.len();
+    let (shared, _) = repeated_hashes(hashes);
+    if shared.is_empty() {
+        return Ok(out);
+    }
+    Ok(collapse_repeated_cursors(fields, out, &shared, every_key))
 }
 
 /// The widest object whose key hashes [`effective_value_cursors_checked`] keeps on the stack.
@@ -3945,46 +4222,36 @@ impl core::hash::Hasher for KeyHashIdentity {
 /// trait default delegating outright), and the survivors are compacted into `values` itself: a
 /// field's slot is never after it. The caller has already walked and checked every member.
 ///
-/// A slot is found by the key's [`key_hash`] and confirmed by comparing the key's text with the
-/// first key that hash met, so an owned key is made once per distinct key and no key is run
-/// through a general-purpose hasher; a different key on the same hash goes to an exact map of
-/// its own. Against `collapse_repeated`'s `IndexMap<String, _>` (an owned key and a SipHash per
-/// field) this measured 3% faster on an object of eight keys repeated over 100 MB.
+/// Only a key whose [`key_hash_of`] is in `shared` (sorted: the hashes that occur more than once)
+/// is decoded and given a slot, through [`SharedKeySlots`]; every other field keeps its place, as
+/// it would have anyway, since no other field has its key. `every_key` (some key has no hash: a
+/// YAML complex key, an undecodable escape) decodes every key, as [`repeat_plan_checked`] does. Decoding and owning every key instead
+/// held 7.1 M strings in two maps for one repeat in a 100 MB object (#7311). On an object that
+/// repeats nearly every key the slots are what they were: found by hash and confirmed against
+/// the first key that hash met, which against `collapse_repeated`'s `IndexMap<String, _>` (an
+/// owned key and a SipHash per field) measured 3% faster on eight keys repeated over 100 MB.
+#[cold]
+#[inline(never)]
 fn collapse_repeated_cursors<F: DocumentFields>(
     fields: &F,
     mut values: Vec<F::Cursor>,
+    shared: &[u64],
+    every_key: bool,
 ) -> Vec<F::Cursor> {
-    let mut by_hash: IndexMap<
-        u64,
-        (String, usize),
-        core::hash::BuildHasherDefault<KeyHashIdentity>,
-    > = IndexMap::default();
-    let mut collided: IndexMap<String, usize> = IndexMap::new();
+    let mut slots = SharedKeySlots::default();
     let mut kept = 0usize;
     let mut walk = fields.clone();
     let mut at = 0usize;
     while let Some((key, _cursor, rest)) = walk.uncons_key() {
         let value = values[at];
-        match key.key_string() {
-            Some(key) => {
-                let hash = key_hash(key.as_bytes());
-                match by_hash.get(&hash) {
-                    Some((first, slot)) if first.as_str() == key.as_ref() => values[*slot] = value,
-                    Some(_) => match collided.get(key.as_ref()) {
-                        Some(&slot) => values[slot] = value,
-                        None => {
-                            collided.insert(key.into_owned(), kept);
-                            values[kept] = value;
-                            kept += 1;
-                        }
-                    },
-                    None => {
-                        by_hash.insert(hash, (key.into_owned(), kept));
-                        values[kept] = value;
-                        kept += 1;
-                    }
+        match collapsing_key(&key, shared, every_key) {
+            Some(name) => match slots.slot(name, kept) {
+                Some(slot) => values[slot] = value,
+                None => {
+                    values[kept] = value;
+                    kept += 1;
                 }
-            }
+            },
             None => {
                 values[kept] = value;
                 kept += 1;
@@ -4011,46 +4278,6 @@ pub fn collapsed_fields<F: DocumentFields>(
         return None;
     }
     Some(collapse_repeated(fields.all_fields()))
-}
-
-/// [`collapsed_fields_if`], refusing an object whose members the format's
-/// grammar never allowed (#1194, #1677, #2261) -- the streaming writer's
-/// gate (#2720).
-///
-/// `Ok(None)` is the answer a writer wants for the overwhelmingly common
-/// object: well-formed, no repeated key, so the fields can be streamed
-/// straight off `uncons` in document order with nothing materialized.
-/// `Ok(Some(..))` is the collapsed list for an object that does repeat a key
-/// under a collapsing mode, and `Err` the same `malformed_member_error` the
-/// materializing [`effective_fields_checked`] raises. One `census` walk --
-/// key-only, 8 bytes per field -- answers all three, where
-/// `effective_fields_checked` walked every field's value as well and kept
-/// a 144-byte `DocumentField` per field: on perf-guard's 2 MB `wide`
-/// fixture (a 158,981-field object) that list was 22.9 MB for a 2 MB input,
-/// and building it was half of the identity print's instructions (#2720's
-/// attribution on a 7950X).
-///
-/// The checks are `census`'s: the same `,`/`:` delimiter checks (#1677,
-/// key-side, as `effective_len_checked` already relies on for `length`),
-/// the bareword/non-string key check (#1194), an unpaired tail, and a
-/// trailing stray `,` after the real last field (#2261). The error carries
-/// no member position either way -- both constructors read only the
-/// document text -- so a caller switching between the two sees the same
-/// diagnostic.
-#[allow(clippy::type_complexity)] // STYLE-0004: mirrors collapsed_fields's own Option<Vec<DocumentField<..>>>, plus a Result for the #1194 check
-pub fn collapsed_fields_checked<F: DocumentFields>(
-    fields: &F,
-    collapse: bool,
-) -> Result<Option<Vec<DocumentField<F::Value, F::Cursor>>>, EvalError> {
-    let census = census(fields);
-    if census.malformed {
-        return Err(fields.malformed_member_error());
-    }
-    if collapse && census.repeated {
-        Ok(Some(collapse_repeated(fields.all_fields())))
-    } else {
-        Ok(None)
-    }
 }
 
 /// [`collapsed_fields`], but skipped outright when the mode doesn't
