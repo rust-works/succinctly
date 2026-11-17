@@ -5873,6 +5873,14 @@ ruled out), even though real yq supports every one of them:
   A key keeps the type of its spelling in yq and is a string here (`1: a` is the int `1` and `true: b` the bool there, `"1"` and `"true"` here), and a `<<` merge key is walked as its members here, where yq walks the `!!merge` key and the alias.
   A value that is an alias is walked into, where yq stops at it (`b: *x` over `a: &x {p: 1}` is 9 nodes here and 7 in yq), as `..` does (#4223).
   `(... | select(...)) |= f` is refused (`Invalid path expression`): the walk is not a path expression, and yq writes through it.
+- **A metadata assignment in a `with` or `|=` body is a stage of the filter with the path in front of it** ([#7069](https://github.com/rust-works/succinctly/issues/7069), `tests/yq_cli/i7069.rs`): `with(.a.b; . = "new" | . style="double")` and `.a.b |= (. = "new" | . style="double")` are `.a.b = "new" | .a.b style="double"`, and `with(.a; .b line_comment="x")` is `.a.b line_comment="x"`, in the order written, whether the path exists or not.
+  Both spellings were refused (`metadata assignment ... is only supported as a pipe stage`).
+  yq answers the stage form and the two bodies alike on all 2,815 rows of a probe over eight documents, thirteen paths (a key, an index, `?`, `[]`, a missing one) and fourteen bodies.
+  The rewrite is made when every stage of the body is a metadata assignment, or an `=` or `|=` whose right side is a literal, or `.`, and the path has no comma.
+  A body with another right side (`.b line_comment = .c`, `. = .b`), a `del` or any other stage is still refused, as before, because a right side is read against the node the body runs on.
+  What the stage form does not do stays what it was: a head or foot comment with text (`not yet supported for a non-empty text`), and `... style=` and `ref`, which the issue also names.
+  As a stage among others (behind `as $v`, a `select`, a parenthesis, another write) it works as it does in yq; behind a navigation that is not a path to one node (`.[] | with(.[0]; .a style="double")`) it is refused (#2679).
+  Inside `map(...)`, a comma or an array constructor a metadata assignment does nothing, bare (`map(.a style="double")`) or in such a body, where yq writes it: the filter answers its value, and that is the input unchanged.
 - **`style` of a tagged node** is `"tagged"` when only the tag styles it and `"<unknown>"` when it also has quotes, a block scalar or a flow collection ([#6881](https://github.com/rust-works/succinctly/issues/6881)), as in yq.
   Over an owned value (`with_entries(.value |= style)`) there is no node to read, and the getter answers `""` as it did for an untagged one.
   A tagged mapping key read through `to_entries` is the same (yq `"tagged"`, here `""`).
