@@ -1404,8 +1404,8 @@ impl SeqGate {
     /// it and left `token_byte` in jq's token buffer, and the stream stands at a line start there.
     fn for_file_after(slot: SeqTailSlot, lines_base: usize, token_byte: Option<u8>) -> Self {
         Self {
-            lines_base,
             token_byte,
+            lines_base,
             ..Self::new(slot)
         }
     }

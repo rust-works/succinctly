@@ -22633,9 +22633,10 @@ mod tests {
         let cut = write("cut.seq", &records[..records.len() - 1]);
         assert!(!takes(&["jq", "--seq", ".", &good, &cut]));
         assert!(!takes(&["jq", "--seq", ".", &cut, &good]));
-        // #7279: the files before the first that is not are read a window at a time, and from that one
-        // the stream is the whole-file route's ([`hand_on_seq_files_tail`]); a list whose first file is
-        // not plain is that route's from its start.
+        // #7279: the files before the first that is not are read a window at a time. #7341: that one,
+        // which opens with an RS, is read by a gate of its own up to its last record (cut short), and the
+        // rest of it, with the files after it, is the whole-file route's ([`hand_on_seq_files_tail`]);
+        // a list whose first file is the one is read so from its start.
         let stops_at = |argv: &[&str]| {
             let cmd = JqCommand::try_parse_from(argv.iter().copied()).unwrap();
             let (_, mut reader, _) = windowed_seq_file(&cmd)?;
@@ -22652,13 +22653,16 @@ mod tests {
         let lines = records.iter().filter(|&&b| b == b'\n').count();
         assert_eq!(
             stops_at(&["jq", "--seq", ".", &good, &cut]),
-            Some((n, 1, lines))
+            Some((2 * n - 1, 1, lines))
         );
         assert_eq!(
             stops_at(&["jq", "--seq", ".", &good, &good, &cut, &good]),
-            Some((2 * n, 2, 2 * lines))
+            Some((3 * n - 1, 2, 2 * lines))
         );
-        assert_eq!(stops_at(&["jq", "--seq", ".", &cut, &good]), None);
+        assert_eq!(
+            stops_at(&["jq", "--seq", ".", &cut, &good]),
+            Some((n - 1, 0, 0))
+        );
         // ... and not read as a pipe is either: a lone source only.
         assert!(!gates(&["jq", "--seq", ".", &good, &cut]));
         assert!(gates(&["jq", "--seq", ".", &cut]));
