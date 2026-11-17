@@ -1208,6 +1208,8 @@ succinctly's values carry no such field.
 It writes `---` before each document's first result when the output is YAML, which agrees with real yq for every filter in group (2)'s first list and for one-document-per-file input.
 For a filter every one of whose results yq builds with no document it writes none (#7019): `yq_result_document.rs` reads that from the filter, stage by stage, from yq's rule for each operator (a navigation step keeps its input's document, a replacement of a document's root and a literal have none, `{...}` keeps its input's).
 That covers literals, `[...]`, `length`, `has`, `contains`, `tostring`, `to_json`, `to_yaml`, `@json`, `@yaml`, `@props`, `to_entries`, `not`, `key`, `anchor`, `tag`, `type`, `style`, `kind`, `line`, `column`, `path`, `file_index`, `document_index` and `filename` over a document's root; `keys`, `with_entries` and interpolation over any input, which build a new node; `{}`, which yq reads as a literal; a comparison, `and` or `or` whose left operand always yields one result of that kind (yq builds the boolean from the left operand); arithmetic whose left operand is a literal other than `null`; `//` whose left operand is a literal (the left one when it is truthy, else the right one); a `$name` bound to one of those; and any pipe whose last such stage builds one over whatever it is handed (`del(.a) | "x"`).
+`alias`, `head_comment`, `line_comment` and `foot_comment` over a document's root build a string that belongs to no document, so they print no separator either (#3986, `tests/yq_cli/i3986.rs`).
+`.a | head_comment` keeps `.a`'s document, as in yq.
 `.a | length` keeps `.a`'s document, as in yq.
 The run's `---` lines go and a document's own leading `---` stays, as in yq.
 `-i` keeps the separators, a divergence (ADR-0018: matching would corrupt the file): without them yq rewrites a file of several documents as one, so `yq -i length` over three documents writes `3`, `3`, `3`, which reads back as the one string `3 3 3`, and `with_entries(.)` joins their keys into one mapping.
@@ -1226,6 +1228,11 @@ Where yq's index differs between the results of one filter, or depends on the va
 - `map` over a document's node copies an empty input (which keeps the document) and builds a fresh sequence from any other, so `.l | map(.)` over `l: [1, 2]` / `---` / `l: [3]` / `---` / `l: []` is `[1, 2]` / `[3]` / `---` / `[]` in yq, and here every result is separated.
 - A comma whose branches differ (`.a, "x"`) or `..` (whose first result is the root) separates within a document in yq (`2` / `---` / `x` in the second document), and here only before a document's first result.
 - `//` whose left operand is not a literal is that operand where it is truthy and its right one otherwise, so `.z // "x"` with no `.z` has no document in yq and is separated here; arithmetic whose left operand is null copies its right one (`.z + 1`), and a comparison whose left operand yields nothing builds from its right one, the same way.
+- A comment getter beside another result, or over a collection's members, separates at a place that depends on the values (#3986, v4.53.3).
+  `.a, head_comment` over `a: 1` / `b: 2` / `---` / `a: 3` / `b: 4` is `1`, an empty line, `---`, `3`, `---`, an empty line in yq, and without the second `---` here.
+  `map(head_comment)` over `- 1` / `- 2` / `---` / `- 3` is one sequence of three empty strings in yq, and here a `---` stands before the third.
+  `del(.a) | head_comment` prints no `---` in yq and one here.
+  `.. | alias` over `a: 1` / `---` / `a: 2` is an empty line, `1`, an empty line, `---`, `2` in yq, and puts the separator before the second document's empty line here.
 - Any stage outside the list above (`del`, `sort_keys`, `select` after a construction it cannot see through, `$x`, `reduce`, ...) keeps the separator, whatever yq builds there.
 - yq never updates the file index it compares against (point 1), so every result from a file other than the first printed result's is separated, both of `.name, .name`'s second-file results above included; here only a document's first result is.
 
