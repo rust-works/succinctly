@@ -2976,10 +2976,12 @@ parentless target therefore deletes nothing, as in yq (`del(1)`, `del(.a | 1)`, 
 A pipe of navigation that ends in `tostring`, `length`, `not`, `@json`, `tojson` or `type` deletes the navigation, as
 yq's derived value keeps its source's slot (`del(.b | tostring)` deletes `.b`, `del(.arr[] |
 tostring)` empties `.arr`, [#4476](https://github.com/rust-works/succinctly/issues/4476)): those
-stages answer every node, so the rewrite cannot hide a type error. Any other target -- arithmetic
+stages answer every node, so the rewrite cannot hide a type error.
+A `select(...)` stage hands its input on with its slot, so one between the navigation and the deriving stage does not change that (`del(.arr[] | select(. > 1) | tostring)` deletes the elements it kept), and a target that selects nothing is a navigation with no match (`del(.a | select(false), 1)` leaves the document, as in yq; #4476, `tests/yq_cli/i4476.rs`).
+Any other target -- arithmetic
 (`del(.a, .b + 1)`, an error in yq when the types differ, which the rewrite would turn into a delete),
 a derived document root (`del(.. | tostring)` is `{}` in yq: the root has no parent; a comma group with a root member is refused whole), a bound variable
-(`del(.a, (.b as $y | $y))`), `select(false)`, a builtin -- still refuses, because succinctly's
+(`del(.a, (.b as $y | $y))`), a builtin -- still refuses, because succinctly's
 "untracked" is wider than yq's "has no path". yq's `$var` keeps node identity, so
 `del(.a as $y | $y)` deletes `.a`
 ([#2643](https://github.com/rust-works/succinctly/issues/2643)); yq's `tojson` and `tostring`

@@ -88874,6 +88874,8 @@ fn del_target_shape(expr: &Expr) -> DelTargetShape {
         | Expr::SliceExpr { .. }
         | Expr::RecursiveDescent
         | Expr::RecursiveDescentWithKeys => Navigation,
+        // `select(cond)` hands its input on, with its path: it only filters (#4476).
+        Expr::Builtin(Builtin::Select(_)) => Navigation,
         Expr::Literal(_) | Expr::Array(_) | Expr::Object(_) => Parentless,
         Expr::Optional(inner) | Expr::Paren(inner) => del_target_shape(inner),
         Expr::Pipe(stages) => match stages.last().map(del_target_shape) {
