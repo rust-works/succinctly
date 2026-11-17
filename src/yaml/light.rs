@@ -271,6 +271,14 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         self.bp_pos != 0 && self.index.bp().parent(self.bp_pos) == Some(0)
     }
 
+    /// Whether the text was read as yq reads an input that began with a byte-order mark (#7089):
+    /// it sets no header aside, so a comment ahead of the first document's content is that node's
+    /// own head comment.
+    #[inline]
+    pub fn follows_byte_order_mark(&self) -> bool {
+        self.index.after_bom()
+    }
+
     /// Navigate to the parent.
     #[inline]
     pub fn parent(&self) -> Option<Self> {
@@ -9358,11 +9366,6 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     #[inline]
     fn is_first_document_content(&self) -> bool {
         self.bp_pos == FIRST_DOCUMENT_BP && YamlCursor::is_document_content(self)
-    }
-
-    #[inline]
-    fn follows_byte_order_mark(&self) -> bool {
-        self.index.after_bom()
     }
 
     fn style_less(&self) -> bool {

@@ -905,14 +905,6 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         false
     }
 
-    /// Whether the text was read as yq reads an input that began with a byte-order mark (#7089): it
-    /// sets no header aside, so a comment ahead of the first document's content is that node's own
-    /// head comment, which yq's encoder does not write for a scalar root. `false` for formats with
-    /// no such mark.
-    fn follows_byte_order_mark(&self) -> bool {
-        false
-    }
-
     /// Whether the document holds a comment anywhere -- a line, head or foot comment, or a
     /// header line yq reads as one -- so a writer that would look for comments node by node can
     /// skip the walk on a document without any (#6922). `false` for formats with no comments.

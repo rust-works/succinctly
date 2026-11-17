@@ -4496,6 +4496,27 @@ fn owned_value_align_hash(value: &OwnedValue) -> u64 {
     hash_at_depth(value, 0)
 }
 
+/// `tree` of a first document's result without the head comment of a scalar root that a byte-order
+/// mark left on the node (#7089). After a mark yq sets no header aside, so the comments ahead of
+/// the content are the node's own head, which its encoder writes for a collection and not for a
+/// scalar: `# lead` / `5` is `5` under `.` and `-P .`, `.a = 1` over the scalar and `. = 6` over a
+/// scalar, mapping or sequence root is `5` and `6`, while `head_comment` still reads `lead`.
+/// `cursor` is the node the result came from, or the document's root for a write.
+fn without_scalar_root_head_after_bom<W: AsRef<[u64]> + Clone>(
+    cursor: &YamlCursor<'_, W>,
+    value: &OwnedValue,
+    mut tree: CommentTree,
+) -> CommentTree {
+    let scalar = !matches!(value, OwnedValue::Object(_) | OwnedValue::Array(_));
+    if scalar && cursor.is_first_document_content() && cursor.follows_byte_order_mark() {
+        let meta = tree.meta();
+        if !meta.head_comment().is_empty() {
+            *tree.meta_mut() = meta.with_head_foot(Vec::new(), meta.foot_comment().to_vec());
+        }
+    }
+    tree
+}
+
 /// Reconcile a pristine (pre-write) presentation tree against a post-write
 /// value (issue #739, ADR-0017's mechanism 1, applied to path-mutation
 /// queries: `=`, `|=`, `+=`, `del()`, ...).
@@ -4563,27 +4584,6 @@ fn owned_value_align_hash(value: &OwnedValue) -> u64 {
 /// Closing (1) properly needs a node-identity model for the values
 /// themselves (#865; #1351's alias redirect gives anchors and aliases that
 /// identity, not arbitrary reshaped nodes).
-/// `tree` of a first document's result without the head comment of a scalar root that a byte-order
-/// mark left on the node (#7089). After a mark yq sets no header aside, so the comments ahead of
-/// the content are the node's own head, which its encoder writes for a collection and not for a
-/// scalar: `# lead` / `5` is `5` under `-P .` and `. = 6` is `6`, even over a mapping that had the
-/// comment. A plain read of the document keeps it, as it does not go through the encoder. `cursor`
-/// is the node the result came from.
-fn without_scalar_root_head_after_bom<W: AsRef<[u64]> + Clone>(
-    cursor: &YamlCursor<'_, W>,
-    value: &OwnedValue,
-    mut tree: CommentTree,
-) -> CommentTree {
-    let scalar = !matches!(value, OwnedValue::Object(_) | OwnedValue::Array(_));
-    if scalar && cursor.is_first_document_content() && cursor.follows_byte_order_mark() {
-        let meta = tree.meta();
-        if !meta.head_comment().is_empty() {
-            *tree.meta_mut() = meta.with_head_foot(Vec::new(), meta.foot_comment().to_vec());
-        }
-    }
-    tree
-}
-
 fn reconcile_presentation(
     pristine_value: &OwnedValue,
     pristine_tree: &CommentTree,
@@ -9825,7 +9825,10 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
             // `to_owned_with_comments` itself (#2795 PR B review), since
             // the write path's pristine snapshot (`presentation_sync_ctx`
             // above) needs the exact same rule and was missing it.
-            to_owned_with_comments::<_, YqSemantics>(&c.value(), Some(c))
+            to_owned_with_comments::<_, YqSemantics>(&c.value(), Some(c)).map(|(v, comments)| {
+                let comments = without_scalar_root_head_after_bom(c, &v, comments);
+                (v, comments)
+            })
         } else {
             generic_to_owned_cursor::<YqSemantics, _>(c).map(no_comments)
         }
@@ -9855,13 +9858,12 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
                 Ok(vec![no_comments(v)])
             }
             GenericResult::OneCursor(c) => {
-                let Some((v, comments)) =
+                let Some(v) =
                     sink.materialize(DiagStyle::Yq, owned_with_comments(&c), &no_location())
                 else {
                     return Ok(Vec::new());
                 };
-                let comments = without_scalar_root_head_after_bom(&c, &v, comments);
-                Ok(vec![(v, comments)])
+                Ok(vec![v])
             }
             GenericResult::Many(vs) => {
                 let Some(vs) = sink.materialize(

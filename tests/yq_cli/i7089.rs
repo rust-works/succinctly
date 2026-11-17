@@ -472,8 +472,8 @@ fn the_block_under_a_first_marker_is_the_first_nodes_foot_after_a_byte_order_mar
 // its first node, and yq's encoder writes a head comment for a collection and not for a scalar root.
 // `# lead` / `5` is `5` under `-P .`, `. = 6` is `6` whatever the root was (a mapping or sequence that
 // had the comment included), and `.a = 1` over the scalar leaves `5`; the comment stayed as the head
-// here. A plain read of the document keeps it (it never goes through the encoder), and so does a
-// result that is a collection. Rows are yq v4.53.3's output on the input behind a mark.
+// here. A plain `.` prints none either, `head_comment` still reads it, and a result that is a
+// collection keeps it. Rows are yq v4.53.3's output on the input behind a mark.
 
 fn assert_rows_after_bom(rows: &[(&str, &[&str], &str, &str)]) -> Result<()> {
     for &(input, flags, filter, expected) in rows {
@@ -513,9 +513,10 @@ fn a_scalar_root_after_a_bom_writes_no_head_comment_7089() -> Result<()> {
     ])
 }
 
-/// What keeps it: a plain read, a collection result, and the metadata of a read.
+/// What agrees: a plain read prints no comment for a scalar, a collection result keeps it, and the
+/// metadata of a read reads it.
 #[test]
-fn a_plain_read_or_a_collection_result_keeps_the_head_comment_7089() -> Result<()> {
+fn a_collection_result_keeps_the_head_comment_and_a_read_prints_none_7089() -> Result<()> {
     assert_rows_after_bom(&[
         ("# lead\n5\n", &[], ".", "5\n"),
         ("# lead\n\"s\"\n", &[], ".", "s\n"),
