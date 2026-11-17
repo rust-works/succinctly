@@ -123,6 +123,23 @@ fn blank_between_values(bytes: &mut [u8]) {
 
 /// Whether a document starting with `byte` is a container or string, which jq's parser has read once
 /// its last byte is (a number or literal waits on the byte after it).
+/// Where `raw`, an offset into a text before `edits` substituted its invalid UTF-8, is in the text
+/// they made (#7341): moved by every edit before it, and an offset inside an edit's bytes is where
+/// that edit's replacement starts. A value's end is never inside one: an edit is in a string.
+fn substituted_offset(
+    edits: &[succinctly::jq::utf8_document::SubstitutionEdit],
+    raw: usize,
+) -> usize {
+    let before = edits.partition_point(|edit| edit.raw.end <= raw);
+    match edits.get(before) {
+        Some(edit) if edit.raw.start < raw => edit.text.start,
+        _ => match before.checked_sub(1).map(|i| &edits[i]) {
+            Some(edit) => raw - edit.raw.end + edit.text.end,
+            None => raw,
+        },
+    }
+}
+
 fn opens_container_or_string(byte: u8) -> bool {
     matches!(byte, b'{' | b'[' | b'"')
 }
@@ -1431,9 +1448,11 @@ impl WindowedFile {
     /// ([`crate::jq_seq_reader::walk_stretch`]). Every byte of the stretch that is in no value is
     /// read as a space, as an RS is (a line break stays, so every line and offset is where it was),
     /// and the warnings are handed out with the window ([`Window::notes`]). What is left is those
-    /// values with white space between them, which the filter's parser reads as jq's reads them when
-    /// each is an RFC 8259 document, as it does a plain record. The stretch is declined when one is
-    /// not (`nan`, a control character in a string, invalid UTF-8), and when the splitter does not
+    /// values with white space between them, which the filter's parser reads as jq's parser reads
+    /// them, as it does the documents of any other input: jq's leniencies (`nan`, `012`, nesting past
+    /// RFC 8259's 128 levels up to the 256 jq's reader allows) included (#7341). A value with invalid
+    /// UTF-8 in a string is substituted here as the whole-stream route substitutes it, and what comes
+    /// after it moves with the substitution. The stretch is declined only when the splitter does not
     /// find exactly those values in the text: a check, not a case that is known to occur.
     fn resume_after_stretch(&mut self, from: usize, to: usize, next_end: usize) -> bool {
         let gate = self
@@ -1441,7 +1460,7 @@ impl WindowedFile {
             .as_mut()
             .expect("only the gate of a --seq stream finds a stretch");
         let lines = self.lines_before + gate.lines_to(&self.buf, from);
-        let Some(walk) =
+        let Some(mut walk) =
             crate::jq_seq_reader::walk_stretch(&self.buf[from..=to], lines, gate.token_byte)
         else {
             return false;
@@ -1449,24 +1468,53 @@ impl WindowedFile {
         let mut text = self.buf[from..to].to_vec();
         let mut at = 0;
         for &(start, end) in &walk.values {
-            if succinctly::json::validate::validate(&text[start..end]).is_err() {
-                return false;
-            }
             blank_between_values(&mut text[at..start]);
             at = end;
         }
         blank_between_values(&mut text[at..]);
+        // #7341: only a value's string can still hold invalid UTF-8 here, as jq's parser takes no
+        // other byte that is not; it is read with each invalid sequence replaced, as jq reads it.
+        if std::str::from_utf8(&text).is_err() {
+            // A source whose text is mapped back to its bytes as read keeps that map in
+            // `substitute_region` alone.
+            if self.track_raw {
+                return false; // patchcov: coverage tolerate-line reason="unreachable: only a --seq file or pipe read alone has a gate, and neither maps its text back (track_raw is for a file another follows)"
+            }
+            let (substituted, edits) =
+                succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document_mapped(&text);
+            let moved = |raw: usize| substituted_offset(&edits, raw);
+            for value in &mut walk.values {
+                *value = (moved(value.0), moved(value.1));
+            }
+            for (at, _) in &mut walk.warnings {
+                *at = moved(*at);
+            }
+            text = substituted.into_bytes();
+            self.substituted = true;
+        }
         let (values, fault) = split_json_values(&text);
         if fault.is_some() || values != walk.values {
-            return false; // patchcov: coverage tolerate-line reason="defensive: the splitter reads RFC 8259 documents with white space between them as jq's parser does; kept so a disagreement leaves the stretch to the reader's model"
+            return false; // patchcov: coverage tolerate-line reason="defensive: the splitter reads the values jq's reader yields with white space between them as jq's parser does; kept so a disagreement leaves the stretch to the reader's model"
         }
-        self.buf[from..to].copy_from_slice(&text);
+        let delta = text.len() as isize - (to - from) as isize;
+        self.buf.splice(from..to, text);
+        let shift = |at: usize| at.checked_add_signed(delta).expect("within the buffer");
+        if self.front_end >= to {
+            self.front_end = shift(self.front_end);
+        }
+        if self.no_break_from >= to {
+            self.no_break_from = shift(self.no_break_from);
+        }
         self.notes.extend(
             walk.warnings
                 .into_iter()
                 .map(|(at, line)| (from + at, line)),
         );
-        gate.resume(&self.buf, to, next_end, walk.token_byte);
+        let gate = self
+            .seq_gate
+            .as_mut()
+            .expect("checked above: the stream has a gate");
+        gate.resume(&self.buf, shift(to), shift(next_end), walk.token_byte);
         true
     }
 
@@ -3171,14 +3219,16 @@ mod tests {
     type Gated = (Vec<u8>, Option<usize>, Option<u8>, Vec<(usize, String)>);
 
     /// What a `--seq` gate makes of `stream`, worked out over the whole of it (#7322): the text its
-    /// windows hand out, where the stream is handed on from (`None` when it is not), the byte jq's
-    /// token buffer holds there, and the warnings of the stretches the windows carried on after, each
-    /// with where it was met. A record that is not plain ends the windows only when no RS after it
-    /// both starts a line and opens a plain record, or when the stretch up to that RS is one the
-    /// reader's model does not read as RFC 8259 values with white space between them.
+    /// windows hand out, where in the stream it is handed on from (`None` when it is not), the byte
+    /// jq's token buffer holds there, and the warnings of the stretches the windows carried on after,
+    /// each with where in the text it was met. A record that is not plain ends the windows only when
+    /// no RS after it both starts a line and opens a plain record. The stretch up to that RS is its
+    /// values with white space between them, whatever jq's parser took them as (#7341), and a value's
+    /// invalid UTF-8 is substituted as the whole-stream route substitutes it.
     fn gated(stream: &[u8]) -> Gated {
         use crate::jq_seq_reader::{token_byte_after, walk_stretch, PlainGuards, PlainRecords};
-        let mut text = stream.to_vec();
+        use succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document_mapped;
+        let mut text = Vec::with_capacity(stream.len());
         let (mut token, mut warnings) = (None, Vec::new());
         if stream.first() != Some(&RS) {
             return (Vec::new(), Some(0), token, warnings);
@@ -3192,6 +3242,7 @@ mod tests {
         while i + 1 < starts.len() {
             if plain(i) {
                 token = token_byte_after(&stream[starts[i]..starts[i + 1]]).or(token);
+                text.extend_from_slice(&stream[starts[i]..starts[i + 1]]);
                 i += 1;
                 continue;
             }
@@ -3202,27 +3253,29 @@ mod tests {
                     let to = starts[j];
                     let lines = count_newlines(&stream[..from]);
                     let walk = walk_stretch(&stream[from..=to], lines, token)?;
-                    let mut at = from;
+                    let mut stretch = stream[from..to].to_vec();
+                    let mut at = 0;
                     for &(start, end) in &walk.values {
-                        succinctly::json::validate::validate(&stream[from + start..from + end])
-                            .ok()?;
-                        blank_between_values(&mut text[at..from + start]);
-                        at = from + end;
+                        blank_between_values(&mut stretch[at..start]);
+                        at = end;
                     }
-                    blank_between_values(&mut text[at..to]);
-                    Some((j, walk))
+                    blank_between_values(&mut stretch[at..]);
+                    let (stretch, edits) = substitute_invalid_utf8_jq_document_mapped(&stretch);
+                    let warned: Vec<(usize, String)> = walk
+                        .warnings
+                        .iter()
+                        .map(|(at, line)| (substituted_offset(&edits, *at), line.clone()))
+                        .collect();
+                    Some((j, stretch.into_bytes(), warned, walk.token_byte))
                 });
-            let Some((j, walk)) = resumed else {
-                text.truncate(from);
+            let Some((j, stretch, warned, token_byte)) = resumed else {
                 blank_rs_bytes(&mut text);
                 return (text, Some(from), token, warnings);
             };
-            warnings.extend(
-                walk.warnings
-                    .into_iter()
-                    .map(|(at, line)| (from + at, line)),
-            );
-            token = walk.token_byte;
+            let base = text.len();
+            warnings.extend(warned.into_iter().map(|(at, line)| (base + at, line)));
+            text.extend_from_slice(&stretch);
+            token = token_byte;
             i = j;
         }
         blank_rs_bytes(&mut text);
