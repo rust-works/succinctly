@@ -28,8 +28,9 @@ const CUT: &str = "\x1e{\"id\":-1,\"name\":\"cut\n";
 /// that record with it as far as the windows go.
 const MIXED: &str = "\x1e} 5\n\x1e1 2\n\x1e[1,]\n\x1e\"bu\"\n\x1en\n\x1e7";
 
-/// A record jq reads a value from that is no RFC 8259 document, which the windows do not carry on
-/// after, and a bare `n` behind it, read by the route that walks the rest whole.
+/// A record jq reads a value from that is no RFC 8259 document, and a bare `n` behind it. The windows
+/// did not carry on after it until #7341, so the rows below once checked the route that walks the rest
+/// whole here; they check that `nan` is read where it is now, as jq reads it.
 const NOT_JSON: &str = "\x1enan\n\x1en\n";
 
 /// Prints the values that are not one of the fixture's records.
@@ -183,10 +184,9 @@ fn a_seq_stream_carries_on_after_stretches_in_its_middle_7322() -> Result<()> {
     Ok(())
 }
 
-/// A stretch the windows carry on after, and later one they do not (`nan` is a value to jq and no
-/// RFC 8259 document): the rest is read by the route that walks it whole, from where jq's reader
-/// stood after the stretches before it, so its lines count them and its bare `n` is worded by the
-/// last token ("Invalid numeric literal" after `nan`). jq 1.7.1's output.
+/// Stretches the windows carry on after, a `nan` among them (no RFC 8259 document, which until #7341
+/// handed the rest of the stream on): the lines count every stretch before, and the bare `n` is worded
+/// by the last token ("Invalid numeric literal" after `nan`). jq 1.7.1's output.
 #[test]
 fn a_seq_stream_is_handed_on_after_stretches_it_carried_on_past_7322() -> Result<()> {
     let stream = format!(
