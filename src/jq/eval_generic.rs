@@ -14964,12 +14964,7 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
         // #7282: `.[]` over `group_by`'s groups with more of the pipe after it runs that rest on
         // each group's cursors, where the arms below decoded every group first. Only the shapes of
         // the stage and of its input are read here, so any other pipe pays a comparison or two.
-        // A rest that opens with a `?//` bind is not run here: the bind has to see the later stages'
-        // errors, which the group-by-group run below cannot give it (#7337, see below).
-        if S::TAG == EvalTag::Jq
-            && j + 1 < stages.len()
-            && !starts_with_pattern_bind(&stages[j + 1..])
-        {
+        if S::TAG == EvalTag::Jq && j + 1 < stages.len() {
             let rest = &stages[j + 1..];
             if let GenericResult::LazySeq(seq) = &current {
                 if matches!(unwrap_paren(expr), Expr::Iterate) {
