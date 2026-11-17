@@ -1325,9 +1325,9 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
     /// Or when the node is canonical but for one object inside it that the
     /// scan declined that way ([`CanonicalSpan::NestedRepeatedKeys`], #7366).
     pub(crate) fn canonical_compact_scan(&self, depth: usize) -> CanonicalSpan<'a> {
-        let Some((value_start, rest)) = self
+        let Some(rest) = self
             .text_position()
-            .and_then(|start| Some((start, self.text.get(start..)?)))
+            .and_then(|start| self.text.get(start..))
         else {
             return CanonicalSpan::Declined;
         };
@@ -1357,11 +1357,7 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
             // object's keys too (see the arm above).
             CanonicalScan::NestedRepeatedKeys { end, object } => {
                 match self.certified_span(rest, end) {
-                    Some(span) => CanonicalSpan::NestedRepeatedKeys {
-                        value_start,
-                        span,
-                        object,
-                    },
+                    Some(span) => CanonicalSpan::NestedRepeatedKeys { span, object },
                     None => CanonicalSpan::Declined,
                 }
             }
@@ -4081,8 +4077,6 @@ pub(crate) enum CanonicalSpan<'a> {
     /// one object inside it that is what [`RepeatedKeys`](Self::RepeatedKeys)
     /// says of a node ([`CanonicalScan::NestedRepeatedKeys`], #7366).
     NestedRepeatedKeys {
-        /// Where the node starts in the document's text.
-        value_start: usize,
         /// The node's text.
         span: &'a str,
         /// The object inside it, placed within `span`.
@@ -4179,6 +4173,12 @@ pub(crate) fn canonical_compact_jq_scan_at_depth(bytes: &[u8], depth: usize) -> 
             }),
         ) => {
             debug_assert!(member_depth > depth + 1 && start < object_end && object_end <= end);
+            // A record no frame placed (a `{` left unknown) or that does not
+            // sit inside the value is no use to a printer, which cuts the
+            // value's text at it: decline it, as the walk is always sound.
+            if start >= object_end || object_end > end || member_depth <= depth + 1 {
+                return CanonicalScan::Declined;
+            }
             CanonicalScan::NestedRepeatedKeys {
                 end,
                 object: Box::new(NestedRepeat {
@@ -4204,7 +4204,8 @@ pub(crate) fn canonical_compact_jq_scan_at_depth(bytes: &[u8], depth: usize) -> 
 
 /// The canonical scan's running state: the [`SpecialMask`] its string arm
 /// walks, and the one record [`canonical_compact_jq_scan_at_depth`] reads
-/// back after a decline (#7310).
+/// back (#7310): after a decline, for the value itself, and after a
+/// certification, for an object further in (#7366).
 ///
 /// `repr(C)` with the mask first, so `&mut scan.specials` is the state's own
 /// address: left to order the fields, the compiler put the record first, and
@@ -4507,7 +4508,8 @@ fn canonical_escape_len(bytes: &[u8], i: usize) -> Option<usize> {
 /// [`PAIRWISE_SPAN_SCAN_LIMIT`] keys, through one exactly sized
 /// [`KeyHashes::has_repeat`] table per object above it
 /// (`scan_canonical_object_wide`). A repeat among the first keys is the table's too when the
-/// caller reads the record of one ([`ScanState::wants_repeats`], `pairwise_repeat`, #7355).
+/// caller reads the record of one ([`ScanState::value_member_depth`], `pairwise_repeat`, #7355),
+/// for the value and, while nothing is recorded yet, for an object further in (#7366).
 fn scan_canonical_object(
     bytes: &[u8],
     pos: usize,
@@ -4749,7 +4751,8 @@ fn scan_canonical_object_wide(
 /// once recorded (#7366): the scan goes on past it, and its caller prints the
 /// text around it ([`CanonicalScan::NestedRepeatedKeys`]). Only the first
 /// object is recorded, and a scan whose caller does not read the record
-/// records none; either way the object declines.
+/// records none: an object not recorded, a second one or any in such a scan,
+/// declines.
 #[cold]
 #[inline(never)]
 fn record_repeated_keys(
@@ -5238,23 +5241,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
             }
             // #7366: certified but for one object inside it, which declined
             // the same way. See `stream_around_scanned_repeats`.
-            (
-                CanonicalSpan::NestedRepeatedKeys {
-                    value_start,
-                    span,
-                    object,
-                },
-                value,
-            ) => stream_around_scanned_repeats(
-                &mut buf,
-                self,
-                value,
-                value_start,
-                span,
-                &object,
-                indent,
-                numbers,
-            )?,
+            (CanonicalSpan::NestedRepeatedKeys { span, object }, value) => {
+                stream_around_scanned_repeats(
+                    &mut buf, self, value, span, &object, indent, numbers,
+                )?;
+            }
             (_, value) => stream_json_pretty(
                 &mut buf,
                 value,
@@ -6684,8 +6675,8 @@ fn stream_scanned_repeats<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
 /// The unsorted `JqCompat` print, compact or indented, of a value the
 /// canonical scan certified but for one object inside it, which it declined
 /// only because some of its keys' hashes repeat (#7366,
-/// [`CanonicalSpan::NestedRepeatedKeys`]): `span`, the value's text, which
-/// starts at byte `value_start` of the document.
+/// [`CanonicalSpan::NestedRepeatedKeys`]): `span`, the text of the value at
+/// `cursor`.
 ///
 /// The text before the object and the text after it are already their compact
 /// render, as a certified span's is, so they are written as they stand (or
@@ -6703,20 +6694,22 @@ fn stream_scanned_repeats<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
 /// whose echo arms are the common ones.
 #[cold]
 #[inline(never)]
-#[allow(clippy::too_many_arguments)] // STYLE-0004: stream_json's own ambients, plus the scan's record
 fn stream_around_scanned_repeats<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
     out: &mut Out,
     cursor: &JsonCursor<'_, W>,
     value: StandardJson<'_, W>,
-    value_start: usize,
     span: &str,
     object: &NestedRepeat,
     indent: IndentSpec,
     numbers: JsonConvention,
 ) -> StreamResult {
     let fields = cursor
-        .cursor_at_offset(value_start + object.start)
-        .filter(|found| found.text_position() == Some(value_start + object.start))
+        .text_position()
+        .and_then(|value_start| value_start.checked_add(object.start))
+        .and_then(|at| {
+            let found = cursor.cursor_at_offset(at)?;
+            (found.text_position() == Some(at)).then_some(found)
+        })
         .and_then(|found| match found.value() {
             StandardJson::Object(fields) => Some(fields),
             _ => None,
@@ -6727,20 +6720,19 @@ fn stream_around_scanned_repeats<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>
         debug_assert!(false, "a certified span's recorded object is in the index");
         return stream_json_pretty(out, value, 0, indent.width, indent.unit, false, numbers, 0);
     };
-    if indent.is_compact() {
-        out.write_str(before)?;
-        stream_scanned_repeats(out, fields, &object.shared, indent, numbers, object.level)?;
-        return Ok(out.write_str(after)?);
-    }
-    write_reindented_at(out, before, indent.width, indent.unit, 0)?;
+    // `-c` writes the text as it stands; an indented render re-indents it,
+    // the text after the object from the object's own level.
+    let compact = indent.is_compact();
+    let write_text = |out: &mut Out, text: &str, level: usize| -> core::fmt::Result {
+        if compact {
+            out.write_str(text)
+        } else {
+            write_reindented_at(out, text, indent.width, indent.unit, level)
+        }
+    };
+    write_text(out, before, 0)?;
     stream_scanned_repeats(out, fields, &object.shared, indent, numbers, object.level)?;
-    Ok(write_reindented_at(
-        out,
-        after,
-        indent.width,
-        indent.unit,
-        object.level,
-    )?)
+    Ok(write_text(out, after, object.level)?)
 }
 
 /// One object member of [`stream_json_pretty`]'s object arm -- the
@@ -9612,8 +9604,7 @@ mod tests {
             );
         }
         // A nested object's repeat is `RepeatedKeys` only when it is the value
-        // asked about: from its parent it is the text around it (#7366), placed
-        // in the document by where the parent starts.
+        // asked about: from its parent it is the text around it (#7366).
         let nested = format!("{{\"a\":{repeat}}}");
         let index = JsonIndex::build(nested.as_bytes());
         let inner = index.root(nested.as_bytes()).first_child().unwrap();
@@ -9625,7 +9616,6 @@ mod tests {
         assert_eq!(
             index.root(nested.as_bytes()).canonical_compact_scan(0),
             CanonicalSpan::NestedRepeatedKeys {
-                value_start: 0,
                 span: &nested,
                 object: Box::new(NestedRepeat {
                     start: 5,
@@ -9641,8 +9631,35 @@ mod tests {
         let second = second.next_sibling().unwrap();
         assert!(matches!(
             second.canonical_compact_scan(1),
-            CanonicalSpan::NestedRepeatedKeys { value_start: 3, span, .. } if span == nested
+            CanonicalSpan::NestedRepeatedKeys { span, .. } if span == nested
         ));
+        // A node that is not the document finds the object from where the node
+        // starts: printed from its text, it prints what the re-render does.
+        for indent in [
+            IndentSpec::COMPACT,
+            IndentSpec {
+                width: 2,
+                unit: ' ',
+            },
+        ] {
+            let mut printed = String::new();
+            second
+                .stream_json(&mut printed, indent, false, JsonConvention::JqCompat)
+                .unwrap();
+            let mut rerender = String::new();
+            stream_json_pretty(
+                &mut rerender,
+                second.value(),
+                0,
+                indent.width,
+                indent.unit,
+                false,
+                JsonConvention::JqCompat,
+                0,
+            )
+            .unwrap();
+            assert_eq!(printed, rerender, "{indent:?}");
+        }
         // A repeat among the first keys is recorded for a scan that reads the record
         // (above), and not for one that does not (#7355).
         assert_eq!(canonical_compact_jq_span_end(early.as_bytes()), None);
@@ -9662,6 +9679,70 @@ mod tests {
             index.root(&invalid).canonical_compact_scan(0),
             CanonicalSpan::Declined
         );
+    }
+
+    /// #7366: an object printed by [`stream_scanned_repeats`] at a level below
+    /// the value, which the plan finds nothing to collapse in (a shared hash no
+    /// two of its keys have, as a bare collision leaves it), is printed by the
+    /// object arm at that level: members one level further in, `}` at it.
+    #[test]
+    fn scanned_repeats_without_a_plan_print_at_their_level_7366() {
+        let doc = "{\"a\":1,\"b\":[2,{\"c\":null}],\"d\":{}}";
+        let index = JsonIndex::build(doc.as_bytes());
+        let root = index.root(doc.as_bytes());
+        let StandardJson::Object(fields) = root.value() else {
+            panic!("{doc}");
+        };
+        let shared = [key_hash(b"b")];
+        assert!(repeat_plan_from_shared(&fields, &shared, raw_key_hash).is_none());
+        for (indent, level) in [
+            (IndentSpec::COMPACT, 2),
+            (
+                IndentSpec {
+                    width: 2,
+                    unit: ' ',
+                },
+                2,
+            ),
+            (
+                IndentSpec {
+                    width: 1,
+                    unit: '\t',
+                },
+                3,
+            ),
+        ] {
+            let mut printed = String::new();
+            stream_scanned_repeats(
+                &mut printed,
+                fields,
+                &shared,
+                indent,
+                JsonConvention::JqCompat,
+                level,
+            )
+            .unwrap();
+            let mut rerender = String::new();
+            stream_json_pretty(
+                &mut rerender,
+                root.value(),
+                level * indent.width,
+                indent.width,
+                indent.unit,
+                false,
+                JsonConvention::JqCompat,
+                level,
+            )
+            .unwrap();
+            assert_eq!(printed, rerender, "{indent:?} {level}");
+            if indent.width > 0 {
+                let close = alloc::format!(
+                    "\n{}}}",
+                    indent.unit.to_string().repeat(level * indent.width)
+                );
+                assert!(printed.ends_with(&close), "{printed:?}");
+            }
+        }
     }
 
     /// #7310: `stream_json` prints an object the scan declined on its keys
