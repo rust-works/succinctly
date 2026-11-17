@@ -1470,8 +1470,10 @@ impl<'a> Reader<'a> {
     }
 
     /// jq's `parser_reset`. Note it restores `Normal` -- including over a
-    /// `WaitingForRs` just assigned by the mid-buffer error path, which is
-    /// the upstream bug this module reproduces.
+    /// `WaitingForRs` that jq's own error path has just assigned, which is
+    /// the upstream bug this module reproduces: a malformed BOM starts the
+    /// reader in `Normal` (see `Reader::new`) and nothing here ever assigns
+    /// `WaitingForRs` again.
     fn reset(&mut self) {
         self.stack.clear();
         self.token_len = 0;
@@ -3709,13 +3711,18 @@ mod tests {
     #[test]
     fn the_bytewise_switch_is_off_after_a_panicking_closure_7320() {
         assert!(!discards::bytewise());
-        let panicked = std::panic::catch_unwind(|| {
+        let on_at_the_panic = std::cell::Cell::new(false);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             discards::bytewise_in(|| {
-                assert!(discards::bytewise());
+                on_at_the_panic.set(discards::bytewise());
                 panic!("closure panics with the switch on");
             });
-        });
+        }));
         assert!(panicked.is_err());
+        assert!(
+            on_at_the_panic.get(),
+            "the switch was on when the closure panicked"
+        );
         assert!(!discards::bytewise());
     }
 
