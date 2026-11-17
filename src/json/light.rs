@@ -5855,7 +5855,7 @@ mod pretty_streaming_tests_7271 {
         let part = "y".repeat(CHUNKED_WRITE_BYTES - 3);
         core::fmt::Write::write_str(&mut chunked, &part).unwrap();
         core::fmt::Write::write_str(&mut chunked, "zzzz").unwrap();
-        assert!(chunked.buf.is_empty());
+        assert_eq!(chunked.buf, "");
         core::fmt::Write::write_str(&mut chunked, "w").unwrap();
         chunked.finish().unwrap();
         assert_eq!(out.0, [part.len() + 4, 1]);
@@ -5874,7 +5874,7 @@ mod pretty_streaming_tests_7271 {
         core::fmt::Write::write_str(&mut chunked, &short).unwrap();
         assert_eq!(chunked.buf.len(), short.len());
         core::fmt::Write::write_char(&mut chunked, 'c').unwrap();
-        assert!(chunked.buf.is_empty());
+        assert_eq!(chunked.buf, "");
         chunked.finish().unwrap();
         assert_eq!(out.0, [exact.len(), CHUNKED_WRITE_BYTES]);
     }
