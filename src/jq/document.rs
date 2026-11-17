@@ -2381,6 +2381,12 @@ pub(crate) fn key_hash_and_end_of<V: DocumentValue>(key: &V) -> (Option<u64>, Op
     }
 }
 
+/// The hash a collection key carries when it reads as the empty text yq gives it (#7292): the one
+/// definition, shared by [`collapse_key_hash_of`] and `hash_walk`.
+fn empty_text_hash() -> u64 {
+    key_hash(b"")
+}
+
 /// [`key_hash_of`] for a walk that collapses a repeated key the way yq's `.[]` does (#7292): with
 /// `as_empty` set, a collection key hashes as the empty text it has there
 /// ([`DocumentValue::key_collapses_as_empty`]), so it joins a collapse with every other
@@ -3660,7 +3666,7 @@ fn hash_walk<F: DocumentFields>(fields: &F, collections_as_empty: bool) -> HashW
             // A collection key (#7292) hashes as the empty text yq gives it, as
             // `collapse_key_hash_of` does, when the caller asks for that.
             None if collections_as_empty && key.key_collapses_as_empty() => {
-                hashes.push(key_hash(b""));
+                hashes.push(empty_text_hash());
             }
             None => {
                 unkeyed += 1;
