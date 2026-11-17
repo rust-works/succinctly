@@ -12,7 +12,7 @@ use std::process::{Command, Stdio};
 
 use anyhow::Result;
 
-use crate::spawn_jq;
+use crate::fifo_feed::spawn_jq_deadline;
 
 const LINES: usize = 60_000;
 const MIN: usize = 4 * 1024 * 1024;
@@ -38,7 +38,7 @@ fn join(lines: &[String]) -> Vec<u8> {
 fn whole(args: &[&str], bytes: &[u8]) -> Result<(String, String, i32)> {
     let mut whole_args = args.to_vec();
     whole_args.push("/dev/stdin");
-    let (output, status) = spawn_jq(&whole_args, Some(bytes))?;
+    let (output, status) = spawn_jq_deadline(&whole_args, Some(bytes))?;
     Ok((
         String::from_utf8_lossy(&output.stdout).replace("/dev/stdin", "<stdin>"),
         String::from_utf8_lossy(&output.stderr).replace("/dev/stdin", "<stdin>"),
@@ -65,7 +65,7 @@ fn assert_same(
 /// `succinctly jq ARGS` over `bytes` on a pipe, read the windowed way, once it is checked to be the
 /// whole route's.
 fn same_on_pipe(args: &[&str], bytes: &[u8]) -> Result<(String, String, i32)> {
-    let (output, status) = spawn_jq(args, Some(bytes))?;
+    let (output, status) = spawn_jq_deadline(args, Some(bytes))?;
     let got = (
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),

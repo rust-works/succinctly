@@ -9,7 +9,7 @@
 #![cfg(unix)]
 
 use std::io::{Seek, SeekFrom, Write};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use anyhow::Result;
 
@@ -74,33 +74,28 @@ fn on_stdin(args: &[&str], bytes: &[u8], offset: u64) -> Result<Run> {
     std::fs::File::create(&path)?.write_all(bytes)?;
     let mut file = std::fs::File::open(&path)?;
     file.seek(SeekFrom::Start(offset))?;
-    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .arg("jq")
-        .args(args)
-        .stdin(file)
-        .env("LC_ALL", "C")
-        .output()?;
+    // Both runs are held to `fifo_feed`'s deadline (#7314): the first reads a file on its standard input,
+    // the second a pipe, whose bytes the helper writes on a thread of its own.
+    let output = fifo_feed::output_stdin_file(
+        Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .arg("jq")
+            .args(args)
+            .env("LC_ALL", "C"),
+        file,
+    )?;
     let windowed = (
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
         output.status.code().unwrap_or(-1),
     );
-    let mut child = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .arg("jq")
-        .args(args)
-        .arg("-")
-        .env("LC_ALL", "C")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let mut pipe = child.stdin.take().expect("piped");
-    let rest = bytes[offset as usize..].to_vec();
-    let writer = std::thread::spawn(move || {
-        let _ = pipe.write_all(&rest);
-    });
-    let output = child.wait_with_output()?;
-    writer.join().expect("the writer ends");
+    let output = fifo_feed::output_stdin(
+        Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .arg("jq")
+            .args(args)
+            .arg("-")
+            .env("LC_ALL", "C"),
+        &bytes[offset as usize..],
+    )?;
     let whole = (
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),

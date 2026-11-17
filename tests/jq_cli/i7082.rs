@@ -10,6 +10,10 @@
 
 use anyhow::Result;
 
+// On Unix the run is held to `fifo_feed`'s deadline, which `spawn_jq` has not (#7314).
+#[cfg(unix)]
+use crate::fifo_feed::spawn_jq_deadline as spawn_jq;
+#[cfg(not(unix))]
 use crate::spawn_jq;
 
 /// How many records the fixtures have: about 6.8 MiB, well over the 4 MiB the route takes.

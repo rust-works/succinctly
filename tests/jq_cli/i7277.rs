@@ -10,7 +10,7 @@
 
 use anyhow::Result;
 
-use crate::spawn_jq;
+use crate::fifo_feed::spawn_jq_deadline;
 
 const MIB: usize = 1 << 20;
 
@@ -32,10 +32,10 @@ fn same(args: &[&str], bytes: &[u8]) -> Result<()> {
         bytes.len() > 4 * MIB,
         "the pipe must hold enough to be windowed"
     );
-    let (windowed, windowed_status) = spawn_jq(args, Some(bytes))?;
+    let (windowed, windowed_status) = spawn_jq_deadline(args, Some(bytes))?;
     let mut whole_args = args.to_vec();
     whole_args.push("-");
-    let (whole, whole_status) = spawn_jq(&whole_args, Some(bytes))?;
+    let (whole, whole_status) = spawn_jq_deadline(&whole_args, Some(bytes))?;
     assert!(
         windowed.stdout == whole.stdout,
         "{args:?}: stdout differs ({} and {} bytes)",
