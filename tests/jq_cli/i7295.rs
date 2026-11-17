@@ -1,14 +1,18 @@
 //! #7295: `--stream` over a pipe named by path (`/dev/stdin`, `/dev/fd/0`) failed with `Illegal seek` and
 //! printed nothing, valid input included. The stream reader probed each file for a BOM, closed it, and
 //! opened it again at the byte after the BOM, which a pipe cannot do (and what the probe read is gone from
-//! it). A source that is not a regular file is now kept open and read on from the probe. Each row is jq
+//! it). A pipe or socket is now kept open and read on from the probe. Each row is jq
 //! 1.7.1's answer over the same bytes (captured from `/usr/bin/jq`).
 
 #![cfg(unix)]
 
 use anyhow::Result;
 
-use crate::fifo_feed::spawn_jq_deadline;
+use std::process::Command;
+use std::time::Duration;
+
+use crate::fifo_feed::{self, spawn_jq_deadline, Feed};
+use crate::succinctly_bin;
 
 /// `--stream` over `bytes` on a pipe named `source`: stdout, stderr and the exit status.
 fn stream(source: &str, bytes: &[u8]) -> Result<(String, String, i32)> {
@@ -109,5 +113,69 @@ fn a_named_pipe_past_the_probe_is_streamed_whole_7295() -> Result<()> {
     let stdout = String::from_utf8(output.stdout)?;
     assert_eq!(stdout.lines().count(), 400_000);
     assert_eq!(stdout.lines().last(), Some("399999"));
+    Ok(())
+}
+
+#[test]
+fn a_named_fifo_is_read_after_its_bom_7295() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fifo = dir.path().join("f");
+    let feed = Feed::new(fifo.clone(), b"\xef\xbb\xbf[1]".to_vec());
+    let out = fifo_feed::output_within(
+        Command::new(succinctly_bin())
+            .args(["jq", "-c", "--stream", "."])
+            .arg(&fifo),
+        std::slice::from_ref(&feed),
+        Duration::from_secs(20),
+    );
+    drop(feed);
+    let out = out?;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"[[0],1]\n[[0]]\n");
+    Ok(())
+}
+
+#[test]
+fn one_pipe_named_twice_reads_as_jq_reads_it_7295() -> Result<()> {
+    // Each name is a handle on the one pipe, probed before the run reads any: jq 1.7.1 gives the
+    // same answer (a fault at the byte the second probe took, after the first event), exit 5.
+    let (out, err, status) = {
+        let (output, status) = spawn_jq_deadline(
+            &["-c", "--stream", ".", "/dev/stdin", "/dev/fd/0"],
+            Some(b"[1,2,3,4,5,6]"),
+        )?;
+        (
+            String::from_utf8(output.stdout)?,
+            String::from_utf8(output.stderr)?,
+            status,
+        )
+    };
+    assert_eq!(out, "[[0],1]\n");
+    assert!(err.contains("Expected value before ','"), "{err}");
+    assert_eq!(status, 5);
+    Ok(())
+}
+
+#[test]
+fn devices_named_many_times_hold_no_descriptor_between_probe_and_read_7295() -> Result<()> {
+    // 200 sources under a limit of 64 descriptors: only pipes and sockets are kept open (they
+    // cannot be opened again), so a device is closed after its probe as a regular file is.
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg("ulimit -n 64 && exec \"$0\" jq -c --stream . \"$@\"")
+        .arg(succinctly_bin());
+    command.args(std::iter::repeat_n("/dev/null", 200));
+    let out = fifo_feed::output(&mut command, &[])?;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"");
     Ok(())
 }

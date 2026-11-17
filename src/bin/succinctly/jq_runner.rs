@@ -10869,6 +10869,8 @@ fn report_lazy_open_failures(failures: &[InputFileOpenError]) {
 /// be read (a directory) fails here with the message `std::fs::read` gave, and the BOM jq skips at
 /// the front of its input (#5291) is found on the first source that has bytes. The reader opens
 /// each file when it gets to it and drops it when it is read, so a run over many files holds one.
+/// A pipe or socket named by path is the exception (#7295): it cannot be opened again or seeked, so
+/// the probe's handle is kept (until the reader gets to it) and read on from the probe.
 /// Stdin is read for its first bytes and kept.
 fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
     let mut opened = Vec::with_capacity(files.len());
@@ -10926,11 +10928,14 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
         let probed = std::fs::File::open(path)
             .and_then(|mut file| {
                 let head = read_head(&mut file)?;
-                // #7295: a pipe, socket or device named by path (`/dev/stdin`, `/dev/fd/0`, a FIFO)
-                // cannot be opened again or seeked, and what the probe read is gone from it: the
-                // handle is kept and read on from where the probe stopped.
-                let streaming = !file.metadata()?.is_file();
-                Ok((head, streaming.then_some(file)))
+                Ok((head.len() < 3, probe_keeps_handle(&file), file, head))
+            })
+            .map(|(at_end, keep, file, head)| {
+                // #7295: a pipe or socket named by path (`/dev/stdin`, `/dev/fd/0`, a FIFO) cannot be
+                // seeked, and what the probe read is gone from it: the handle is kept and read on from
+                // where the probe stopped, unless the probe met the end of it (then the head is all of it).
+                let kept = keep.then_some((!at_end).then_some(file));
+                (head, kept)
             })
             .map_err(|e| InputFileOpenError::from_io(path, &e, at + 1 == files.len()));
         match probed {
@@ -10943,7 +10948,11 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
                     Box::new(move || {
                         use std::io::Seek;
                         if let Some(file) = kept {
-                            let rest = std::io::Cursor::new(head[skip..].to_vec()).chain(file);
+                            let front = std::io::Cursor::new(head[skip..].to_vec());
+                            let rest: Box<dyn std::io::Read> = match file {
+                                Some(file) => Box::new(front.chain(file)),
+                                None => Box::new(front),
+                            };
                             return Ok(
                                 Box::new(std::io::BufReader::with_capacity(64 * 1024, rest))
                                     as Box<dyn std::io::BufRead>,
@@ -11024,6 +11033,21 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
         Vec::new()
     };
     Ok((opened, openers, tail, tail_is_source))
+}
+
+/// Whether the probe's handle on a source is the one the reader reads on: a pipe or a socket
+/// (#7295). A regular file, a device and a handle whose type cannot be read are reopened and
+/// seeked, as they always were, and so hold no descriptor between the probe and the read.
+#[cfg(unix)]
+fn probe_keeps_handle(file: &std::fs::File) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    file.metadata()
+        .is_ok_and(|meta| meta.file_type().is_fifo() || meta.file_type().is_socket())
+}
+
+#[cfg(not(unix))]
+fn probe_keeps_handle(_file: &std::fs::File) -> bool {
+    false
 }
 
 /// The first three bytes of `reader`, or fewer at its end.
