@@ -33,7 +33,8 @@
 //! this module decides only where each one begins and ends and which error fires.
 
 use crate::jq_seq_reader::{
-    decode_string_in_place, fgets_chunk_len_at, number_is_valid, JQ_FGETS_CHUNK,
+    c_string, decode_string_in_place, fgets_chunk_len_at, fgets_visible_len, number_is_valid,
+    JQ_FGETS_CHUNK,
 };
 use succinctly::jq::OwnedValue;
 
@@ -388,12 +389,9 @@ impl RefillSource for ChunkedSources {
                 self.unsettled = true;
                 self.unsettled_full = end == ChunkEnd::Full;
             }
-            if !newline {
-                // The parser sees a chunk with no newline up to its first NUL (`strlen`).
-                if let Some(nul) = buf.iter().position(|&byte| byte == 0) {
-                    buf.truncate(nul);
-                }
-            }
+            // The parser sees a chunk with no newline up to its first NUL (`strlen`).
+            let visible = fgets_visible_len(buf);
+            buf.truncate(visible);
             let is_last = last_source && hit_eof;
             self.last = Some((source, is_last));
             return Some(Refill {
@@ -498,11 +496,7 @@ impl RefillCursor {
             }
             let newline = chunk.ends_with(b"\n");
             let hit_eof = !newline && len < JQ_FGETS_CHUNK;
-            let bytes = if newline {
-                chunk
-            } else {
-                &chunk[..chunk.iter().position(|&b| b == 0).unwrap_or(len)]
-            };
+            let bytes = &chunk[..fgets_visible_len(chunk)];
             let is_last = last_source && at_end && hit_eof;
             self.last = Some((source, is_last));
             if at_end && !last_source && !newline && len == JQ_FGETS_CHUNK {
@@ -1703,8 +1697,7 @@ impl Parser {
                 self.token_buf[self.token_len] = 0;
                 // ... which also means the number parser reads the token as a C string: a NUL in
                 // it ends the number (`2.5` then NUL then `{}` is the number `2.5`).
-                let token = &self.token_buf[..self.token_len];
-                let token = &token[..token.iter().position(|&b| b == 0).unwrap_or(token.len())];
+                let token = c_string(&self.token_buf[..self.token_len]);
                 if !number_is_valid(token) {
                     return Err("Invalid numeric literal");
                 }

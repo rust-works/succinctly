@@ -130,6 +130,9 @@ HAND = [
     b'\x1e"ab" \x00 7 [8] ' + b" " * 5000 + b"9 10\n",
     b"\x1e[1," + b" " * 4000 + b"\x00garbage" + b" " * 200 + b"2]\n",
     b'\x1e"x' + b"y" * 4093 + b"\x00zz" + b"w" * 10 + b'"\n',
+    # A NUL jq never sees does not make a BOM malformed, and a BOM can complete across it.
+    b"\xef\xbb\x00" + b" " * 4100 + b"\x1e1\n", b"\xef\xbb\x00" + b" " * 4092 + b"\xbf\x1e1\n",
+    b"\xef\xbb\x00x\n\x1e1\n",
 ]
 
 
@@ -285,7 +288,8 @@ def artifact(data):
     if RS not in visible(data):
         # #1525's separate template -- except after a malformed BOM, which
         # makes jq read the stream rather than abandon it, so those stay in.
-        return not malformed_bom(data)
+        # Both are judged on the bytes jq's parser sees (#7340).
+        return not malformed_bom(visible(data))
     return False
 
 
@@ -320,7 +324,8 @@ def random_cases(count, seed, allow_artifacts, long_lines=False):
             cases.append(body)
         elif rng.random() < 0.7:
             body = bytes(rng.choice(ALPHABET) for _ in range(rng.randint(1, 24)))
-            cases.append(rng.choice(BOM_PREFIXES) + RS + body + b"\n")
+            # Now and then no RS after the BOM prefix, so a NUL can follow it (#7340).
+            cases.append(rng.choice(BOM_PREFIXES) + rng.choice([RS, RS, RS, b""]) + body + b"\n")
         else:
             body = bytes(rng.choice(plain) for _ in range(rng.randint(1, 24)))
             cases.append(rng.choice(BOM_PREFIXES) + RS + body)

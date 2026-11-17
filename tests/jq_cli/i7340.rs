@@ -162,6 +162,42 @@ fn rows() -> Vec<Row> {
             },
         ),
         (
+            // A BOM's bytes are matched against what jq's parser sees, so a NUL it never sees does
+            // not make `EF BB` malformed (here, or with the NUL in the next file), and a BOM can
+            // complete across one.
+            "a NUL after a partial BOM",
+            vec![b"\xef\xbb\x00x".to_vec()],
+            {
+                let w = "Unfinished abandoned text at EOF at line 1, column 0";
+                [
+                    (String::new(), warn(w)),
+                    (format!("{RS}[]\n"), warn(w)),
+                    (format!("{RS}[\"{w}\"{}]\n", breaks(7)), String::new()),
+                ]
+            },
+        ),
+        (
+            "a NUL after a partial BOM, in the next file",
+            vec![b"\xef".to_vec(), b"\x00x".to_vec()],
+            {
+                let w = "Unfinished abandoned text at EOF at line 1, column 0";
+                [
+                    (String::new(), warn(w)),
+                    (format!("{RS}[]\n"), warn(w)),
+                    (format!("{RS}[\"{w}\"{}]\n", breaks(7)), String::new()),
+                ]
+            },
+        ),
+        (
+            "a BOM across the dropped bytes",
+            vec![[&b"\xef\xbb\x00"[..], &[b' '; 4092], b"\xbf\x1e1\n"].concat()],
+            [
+                (format!("{RS}1\n"), String::new()),
+                (format!("{RS}[1]\n"), String::new()),
+                (format!("{RS}[1{}]\n", breaks(7)), String::new()),
+            ],
+        ),
+        (
             // ... and an RS after a NUL is not one, but an RS in the next chunk is.
             "an RS after a NUL, then one in the next chunk",
             vec![b"x\nab\x00cd\x1e1\nzz".to_vec()],

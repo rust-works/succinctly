@@ -17272,37 +17272,48 @@ fn seq_no_rs_byte_position(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> Option<(us
     }
     let mut line = 1usize;
     let mut column = 0usize;
-    // #7340: what jq's parser never sees, which is a stream's NULs and what follows them.
-    let cuts = crate::jq_seq_reader::nul_cuts(raw_bytes);
-    let mut cuts = cuts.iter().peekable();
+    // #7340: what jq's parser never sees, which is a stream's NULs and what follows them. A cut
+    // starts at a NUL, so an RS with no NUL before it in its source is one jq sees: the common
+    // stream answers here, having read up to its first RS and no further.
+    let mut nul_seen = false;
+    for slice in crate::jq_seq_reader::stream_slices(raw_bytes) {
+        let rs = crate::jq_seq_reader::find_byte(ASCII_RS, slice);
+        if crate::jq_seq_reader::find_byte(0, rs.map_or(slice, |at| &slice[..at])).is_some() {
+            nul_seen = true;
+            break;
+        }
+        if rs.is_some() {
+            return None;
+        }
+    }
+    let cuts = if nul_seen {
+        crate::jq_seq_reader::nul_cuts(raw_bytes)
+    } else {
+        Vec::new()
+    };
     let ends = crate::jq_seq_reader::source_ends(raw_bytes);
     // Shares `stream_slices` and `advance_position` with `jq_seq_reader`, which walks this same
     // stream to classify the templates that apply once an RS *is* present (#1723) -- the two must
     // agree on BOM handling and on where a column starts. #7263: a slice at a time, searched a
     // block at a time, where a byte at a time was a third of a no-RS run.
     for (slice, end) in crate::jq_seq_reader::stream_slices(raw_bytes).zip(ends) {
-        // A BOM is cut from the front of a slice, so the slice ends where its source does. A cut
-        // never spans two sources, and never starts in a BOM, which holds no NUL.
+        // A BOM is cut from the front of a slice, so the slice ends where its source does, and a
+        // cut never spans two sources. A cut can start before the slice (in the consumed BOM).
         let start = end - slice.len();
+        // The pieces of the slice between its cuts.
+        let mut pieces = Vec::new();
         let mut at = start;
-        let pieces = std::iter::from_fn(|| {
-            if at == end {
-                return None;
+        for &(cut_start, cut_end) in &cuts[cuts.partition_point(|&(_, cut_end)| cut_end <= start)..]
+        {
+            if cut_start >= end {
+                break;
             }
-            let piece_end = match cuts.next_if(|&&(cut_start, _)| cut_start < end) {
-                Some(&(cut_start, cut_end)) => {
-                    let piece = (at, cut_start);
-                    at = cut_end;
-                    return Some(piece);
-                }
-                None => end,
-            };
-            let piece = (at, piece_end);
-            at = end;
-            Some(piece)
-        });
-        for (piece_start, piece_end) in pieces {
-            let piece = &slice[piece_start - start..piece_end - start];
+            pieces.push((at, cut_start.max(at)));
+            at = cut_end.max(at);
+        }
+        pieces.push((at, end));
+        for (gap_start, gap_end) in pieces {
+            let piece = &slice[gap_start - start..gap_end - start];
             if piece.contains(&ASCII_RS) {
                 return None;
             }
