@@ -272,6 +272,15 @@ jobs:
               cargo test --features cli,bench-runner --test orchestrate_cli_tests
               cargo test --features cli,bench-runner --bin succinctly
               SUCCINCTLY_SIMD=sse2 cargo test --verbose
+              # #7318: the clamp reaches the JSON index builders too, so the SSE2 kernel
+              # (`json::simd::x86`) runs through the CLI here. Everything else runs the AVX2 one on
+              # these runners (without `std` the SSE2 one is the only builder, and nothing builds
+              # the CLI that way), so the differential CLI suites never executed it. Last, so the
+              # `--features cli` relink of `target/debug/succinctly` comes after
+              # `orchestrate_cli_tests` (#1705). Same skip list as `cli-gated`: the slowest
+              # `jq_cli_tests` run in `deep-recursion`, and only the JSON-reading suites are named.
+              skip=$(scripts/deep-recursion-tests.sh skip-args)
+              SUCCINCTLY_SIMD=sse2 cargo test --features cli --test jq_cli_tests --test jq_golden_tests --test cli_golden_tests --test cli_characterization_tests --test json_validate_tests --test locate_cli_tests -- $skip
           - name: default
             buildCli: false
             testCmd: cargo test --verbose
