@@ -11790,7 +11790,9 @@ fn windowed_seq_file(args: &JqCommand) -> Option<WindowedSource> {
         ));
     }
     let plain = reread.plain_seq_files();
-    if files.len() > 1 && (1..files.len()).contains(&plain) {
+    // #7341: the first file not plain may be the first of all: the files from it are judged as the run
+    // reaches them, and one that opens with an RS is read by a gate of its own.
+    if files.len() > 1 && plain < files.len() {
         // #7279: several files the run holds, the first `plain` of them plain records ending in an LF: those
         // are read a window at a time, and from the first that is not the stream is the whole-file
         // route's, as for a long list ([`hand_on_seq_files_tail`]).
@@ -12266,13 +12268,32 @@ fn hand_on_seq_files_tail(args: &JqCommand, past_open_failure: bool) -> bool {
         raws.push(crate::jq_seq_reader::resumed_stream(tail.lines, Vec::new()));
     }
     let front = files.len();
-    let (rest, rest_raws, failures) = read_input_files(&named[tail.index..], false);
+    // #7341: a file a gate of its own read up to a stretch it could not carry on after goes as the rest
+    // of it, from that stretch, behind the front that resumes jq's reader after its lines before it; the
+    // files after it are read by path.
+    let mut failures = Vec::new();
+    let from = match tail.front {
+        Some(rest) => {
+            let path = &named[tail.index];
+            if let Some(error) = &rest.error {
+                let last = tail.index + 1 == named.len();
+                failures.push((front + 1, InputFileOpenError::from_io(path, error, last)));
+            }
+            files.push(path.clone());
+            raws.push(rest.stream);
+            tail.index + 1
+        }
+        None => tail.index,
+    };
+    let at = files.len();
+    let (rest, rest_raws, rest_failures) = read_input_files(&named[from..], false);
     files.extend(rest);
     raws.extend(rest_raws);
-    let failures = failures
-        .into_iter()
-        .map(|(at, failure)| (at + front, failure))
-        .collect();
+    failures.extend(
+        rest_failures
+            .into_iter()
+            .map(|(at_file, failure)| (at_file + at, failure)),
+    );
     if past_open_failure {
         FIRST_OPEN_FAILURE_AT.with(|first| first.set(Some(front)));
     }

@@ -1261,7 +1261,28 @@ pub(super) struct SeqFilesTail {
     /// The byte the records before it left at index 1 of jq's token buffer
     /// ([`crate::jq_seq_reader::token_byte_after`]).
     pub token_byte: Option<u8>,
+    /// #7341: the file was read a window at a time by a gate of its own ([`SeqGate`]) up to a stretch
+    /// it could not carry on after, and this is the rest of it, from that stretch's RS, behind the front
+    /// that resumes jq's reader after the file's lines before it: the file's bytes as the route that
+    /// reads it whole is to read them. `None` when the stream stops before the file.
+    pub front: Option<SeqFront>,
 }
+
+/// The rest of a file of a `--seq` list from where its gate stopped (#7341, [`SeqFilesTail::front`]).
+#[derive(Debug)]
+pub(super) struct SeqFront {
+    pub stream: Vec<u8>,
+    /// The failure of a read of the file, which ended it there.
+    pub error: Option<io::Error>,
+}
+
+impl PartialEq for SeqFront {
+    fn eq(&self, other: &Self) -> bool {
+        self.stream == other.stream && self.error.is_some() == other.error.is_some()
+    }
+}
+
+impl Eq for SeqFront {}
 
 /// Where a `--seq` list of files opened by path leaves its [`SeqFilesTail`] for the run (#7221).
 pub(super) type SeqFilesTailSlot = Rc<std::cell::RefCell<Option<SeqFilesTail>>>;
@@ -1272,9 +1293,12 @@ struct SeqFilesCheck {
     slot: SeqFilesTailSlot,
     token_byte: Option<u8>,
     /// For files the run holds (#7279): the position of the first that the prepass found is not plain
-    /// records ending in an LF. The files before it are vouched for and are not judged again, and the
-    /// stream ends before it.
+    /// records ending in an LF. The files before it are vouched for and are not judged again; it and the
+    /// ones after it are judged as the run reaches them, as a list opened by path is.
     stop_at: Option<usize>,
+    /// #7341: the file being read by a gate of its own, with the line breaks of the stream before it,
+    /// and where its gate leaves what it hands on.
+    gated: Option<(usize, SeqTailSlot)>,
 }
 
 /// The certification of a `--seq` pipe's records (#7164), which decides what of the stream is read a window
@@ -1307,6 +1331,10 @@ struct SeqGate {
     /// #7341: the last RS past `checked` that starts a line, in the stretch being judged: where it can
     /// be cut ([`GateStep::Cut`]).
     stretch_cut: Option<usize>,
+    /// #7341: the line breaks of the stream before the source the gate reads: none for a stream of one
+    /// source, and those of the files before it for a file of a `--seq` list. jq's reader counts the
+    /// lines it warns at over the whole stream.
+    lines_base: usize,
     slot: SeqTailSlot,
 }
 
@@ -1366,7 +1394,18 @@ impl SeqGate {
             lines_at: 0,
             lines: 0,
             stretch_cut: None,
+            lines_base: 0,
             slot,
+        }
+    }
+
+    /// A gate for a file of a `--seq` list (#7341): `lines_base` line breaks of the stream come before
+    /// it and left `token_byte` in jq's token buffer, and the stream stands at a line start there.
+    fn for_file_after(slot: SeqTailSlot, lines_base: usize, token_byte: Option<u8>) -> Self {
+        Self {
+            lines_base,
+            token_byte,
+            ..Self::new(slot)
         }
     }
 
@@ -1596,7 +1635,7 @@ impl WindowedFile {
             .seq_gate
             .as_mut()
             .expect("only the gate of a --seq stream finds a stretch");
-        let lines = self.lines_before + gate.lines_to(&self.buf, from);
+        let lines = gate.lines_base + self.lines_before + gate.lines_to(&self.buf, from);
         let Some(walk) =
             crate::jq_seq_reader::walk_stretch(&self.buf[from..=to], lines, gate.token_byte)
         else {
@@ -2278,6 +2317,7 @@ impl WindowedFiles {
             slot,
             token_byte: None,
             stop_at: None,
+            gated: None,
         });
         self
     }
@@ -2292,6 +2332,7 @@ impl WindowedFiles {
             slot,
             token_byte: None,
             stop_at: Some(stop_at),
+            gated: None,
         });
         self
     }
@@ -2349,7 +2390,32 @@ impl WindowedFiles {
                     self.substituted |= current.substituted;
                     self.only_empty &= current.file_read == 0;
                     let error = current.read_error.take();
+                    let (index, gate_token) = (
+                        current.index,
+                        current.seq_gate.as_ref().map(|g| g.token_byte),
+                    );
                     self.current = None;
+                    // #7341: a file a gate of its own read either handed the rest of itself on, which
+                    // ends the stream here, or was read to its end, and the records after it are read
+                    // after the byte it left in jq's token buffer.
+                    if let Some(check) = &mut self.seq_files {
+                        if let Some((lines, slot)) = check.gated.take() {
+                            if let Some(tail) = slot.borrow_mut().take() {
+                                *check.slot.borrow_mut() = Some(SeqFilesTail {
+                                    index,
+                                    lines,
+                                    token_byte: tail.token_byte,
+                                    front: Some(SeqFront {
+                                        stream: tail.stream,
+                                        error: tail.error,
+                                    }),
+                                });
+                                self.pending = Vec::new().into_iter();
+                                return Ok(false);
+                            }
+                            check.token_byte = gate_token.flatten();
+                        }
+                    }
                     if let Some(error) = error {
                         return Err(error);
                     }
@@ -2360,49 +2426,33 @@ impl WindowedFiles {
                     let (file, len) = match self.pending.next() {
                         None => return Ok(false),
                         Some(StreamFile::Held(file, len)) => {
-                            if let Some(check) = &mut self.seq_files {
+                            if let Some(check) = &self.seq_files {
                                 // #7279: vouched for by the prepass up to `stop_at`, so only the byte
                                 // its records leave in jq's token buffer is read (from its end); a read
-                                // that fails stops the stream here instead, before the file.
-                                let byte = (check.stop_at != Some(index))
-                                    .then(|| seq_token_byte_in(&file, len).ok())
-                                    .flatten();
-                                match byte {
-                                    Some(byte) => check.token_byte = byte.or(check.token_byte),
-                                    None => {
-                                        *check.slot.borrow_mut() = Some(SeqFilesTail {
-                                            index,
-                                            lines: self.end_origin.0 - 1,
-                                            token_byte: check.token_byte,
-                                        });
-                                        self.pending = Vec::new().into_iter();
-                                        return Ok(false);
-                                    }
+                                // that fails stops the stream here instead, before the file. #7341: the
+                                // files from `stop_at` on are judged as the run reaches them.
+                                let verdict = if check.stop_at.is_some_and(|stop| index < stop) {
+                                    seq_token_byte_in(&file, len)
+                                        .map_or(SeqFileVerdict::Unread, SeqFileVerdict::Plain)
+                                } else {
+                                    seq_file_verdict(&file, len)
+                                };
+                                if !self.judge_seq_file(&file, verdict, index) {
+                                    return Ok(false);
                                 }
                             }
                             (file, len)
                         }
                         Some(StreamFile::Named(named)) => match named.open_for_run() {
                             Ok((file, len)) => {
-                                if let Some(check) = &mut self.seq_files {
-                                    match seq_file_verdict(&file, len) {
-                                        SeqFileVerdict::Plain(byte) => {
-                                            check.token_byte = byte.or(check.token_byte);
-                                        }
-                                        SeqFileVerdict::Other => {
-                                            // The files before it end in an LF, so the stream stands
-                                            // at a line's start: `end_origin` counts the lines.
-                                            *check.slot.borrow_mut() = Some(SeqFilesTail {
-                                                index,
-                                                lines: self.end_origin.0 - 1,
-                                                token_byte: check.token_byte,
-                                            });
-                                            self.pending = Vec::new().into_iter();
-                                            return Ok(false);
-                                        }
+                                let file = Rc::new(file);
+                                if self.seq_files.is_some() {
+                                    let verdict = seq_file_verdict(&file, len);
+                                    if !self.judge_seq_file(&file, verdict, index) {
+                                        return Ok(false);
                                     }
                                 }
-                                (Rc::new(file), len)
+                                (file, len)
                             }
                             Err(error) => {
                                 self.open_failures.push((index, named.path.clone(), error));
@@ -2421,22 +2471,84 @@ impl WindowedFiles {
                     self.next_index += 1;
                     let mut seam = Seam::NONE;
                     let carry = self.stitcher.take_carry(&mut seam);
+                    // #7341: a file a gate of its own reads stands at a line start with nothing open
+                    // before it, and hands on no open tail: the gate certifies whole records.
+                    let gate = self.seq_files.as_ref().and_then(|check| {
+                        check.gated.as_ref().map(|(lines, slot)| {
+                            SeqGate::for_file_after(Rc::clone(slot), *lines, check.token_byte)
+                        })
+                    });
                     let place = Place {
                         index,
                         carry,
                         seam,
-                        hold_tail: index + 1 < self.count,
+                        hold_tail: gate.is_none() && index + 1 < self.count,
                         strip_bom: self.only_empty,
                         origin: self.end_origin,
                         substituted: self.substituted,
                     };
-                    let mut opened = WindowedFile::in_stream(file, len, self.block, place);
+                    let block = if gate.is_some() {
+                        WINDOW_BYTES
+                    } else {
+                        self.block
+                    };
+                    let mut opened = WindowedFile::in_stream(file, len, block, place);
                     opened.blank_rs = self.blank_rs;
+                    opened.seq_gate = gate;
                     self.current = Some(opened);
                 }
             }
         }
     }
+}
+
+impl WindowedFiles {
+    /// What a `--seq` list does with the file at `index` the run has reached, by `verdict`: `true` to
+    /// read it, after a plain one's records, or by a gate of its own (#7341) when it is not plain and
+    /// opens with an RS (the files before it end at a line start, so jq's reader stands there as it
+    /// stands between records); `false` when the stream ends before it, which goes to the slot.
+    fn judge_seq_file(&mut self, file: &File, verdict: SeqFileVerdict, index: usize) -> bool {
+        let lines = self.end_origin.0 - 1;
+        let check = self
+            .seq_files
+            .as_mut()
+            .expect("only a --seq list judges its files");
+        match verdict {
+            SeqFileVerdict::Plain(byte) => {
+                check.token_byte = byte.or(check.token_byte);
+                true
+            }
+            SeqFileVerdict::Other if opens_with_rs(file) => {
+                check.gated = Some((lines, SeqTailSlot::default()));
+                true
+            }
+            SeqFileVerdict::Other | SeqFileVerdict::Unread => {
+                // The files before it end in an LF, so the stream stands at a line's start:
+                // `end_origin` counts the lines.
+                *check.slot.borrow_mut() = Some(SeqFilesTail {
+                    index,
+                    lines,
+                    token_byte: check.token_byte,
+                    front: None,
+                });
+                self.pending = Vec::new().into_iter();
+                false
+            }
+        }
+    }
+}
+
+/// Whether `file`'s first byte is an RS (#7341).
+#[cfg(unix)]
+fn opens_with_rs(file: &File) -> bool {
+    use std::os::unix::fs::FileExt;
+    let mut first = [0u8; 1];
+    matches!(file.read_at(&mut first, 0), Ok(1) if first[0] == RS)
+}
+
+#[cfg(not(unix))]
+fn opens_with_rs(_file: &File) -> bool {
+    false
 }
 
 /// The index of the last line break in `bytes`. Fixed-width chunks with an OR fold rather than
@@ -3062,8 +3174,11 @@ enum SeqFileVerdict {
     /// Plain records ending in an LF, with the byte they leave at index 1 of jq's token buffer (`None`
     /// for records that write none there).
     Plain(Option<u8>),
-    /// Not plain records, or a file a read of failed in: the whole-file route's.
+    /// Not plain records, or a file a read of failed in: a gate of its own reads it when it opens with
+    /// an RS (#7341), and the whole-file route does otherwise.
     Other,
+    /// A file the prepass vouched for whose byte could not be read: the whole-file route's.
+    Unread,
 }
 
 /// [`SeqFileVerdict`] of a file judged on the handle the run opened, as [`Reread::is_plain_seq_records`]
@@ -5352,6 +5467,7 @@ mod stream_tests {
                     index: 2,
                     lines: 5,
                     token_byte: Some(b'b'),
+                    front: None,
                 }),
                 "{name}"
             );
@@ -5371,6 +5487,7 @@ mod stream_tests {
                 index: 0,
                 lines: 0,
                 token_byte: None,
+                front: None,
             })
         );
         // A file that does not open is no bytes, judged as nothing: it neither stops the windows nor
@@ -5384,6 +5501,7 @@ mod stream_tests {
                 index: 2,
                 lines: 2,
                 token_byte: Some(b'b'),
+                front: None,
             })
         );
     }
