@@ -3099,13 +3099,16 @@ mod tests {
         }
     }
 
+    /// What [`gated`] answers.
+    type Gated = (Vec<u8>, Option<usize>, Option<u8>, Vec<(usize, String)>);
+
     /// What a `--seq` gate makes of `stream`, worked out over the whole of it (#7322): the text its
     /// windows hand out, where the stream is handed on from (`None` when it is not), the byte jq's
     /// token buffer holds there, and the warnings of the stretches the windows carried on after, each
     /// with where it was met. A record that is not plain ends the windows only when no RS after it
     /// both starts a line and opens a plain record, or when the stretch up to that RS is one the
     /// reader's model does not read as RFC 8259 values with white space between them.
-    fn gated(stream: &[u8]) -> (Vec<u8>, Option<usize>, Option<u8>, Vec<(usize, String)>) {
+    fn gated(stream: &[u8]) -> Gated {
         use crate::jq_seq_reader::{token_byte_after, walk_stretch, PlainGuards, PlainRecords};
         let mut text = stream.to_vec();
         let (mut token, mut warnings) = (None, Vec::new());
