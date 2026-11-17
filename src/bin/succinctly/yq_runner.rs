@@ -3639,6 +3639,10 @@ fn walk_alias_groups<W: AsRef<[u64]> + Clone>(
 enum PathStep {
     Key(String),
     Index(i64),
+    /// Every member of the node at the path (`.[]`): a write of a closed literal through it
+    /// (`.[] |= [1]`) reaches each child, whichever key or slot it holds (#7236). Only
+    /// [`collect_write_targets`] makes one, for a lone write of that shape.
+    Each,
 }
 
 /// What a write did at the path it resolved to (#870).
@@ -3728,8 +3732,17 @@ fn literal_path_steps(expr: &Expr, out: &mut Vec<PathStep>) -> bool {
 }
 
 fn static_path_steps(expr: &Expr, out: &mut Vec<PathStep>) -> bool {
+    static_path_steps_each(expr, false, out)
+}
+
+/// [`static_path_steps`], reading `.[]` as a [`PathStep::Each`] when `each` is set (#7236).
+fn static_path_steps_each(expr: &Expr, each: bool, out: &mut Vec<PathStep>) -> bool {
     match expr {
         Expr::Identity => true,
+        Expr::Iterate if each => {
+            out.push(PathStep::Each);
+            true
+        }
         Expr::Field(name) => {
             out.push(PathStep::Key(name.clone()));
             true
@@ -3741,7 +3754,7 @@ fn static_path_steps(expr: &Expr, out: &mut Vec<PathStep>) -> bool {
         // #2126: `del(.["a"][0])` keeps the bracket form; it is `del(.a[0])` to the reconcile.
         Expr::IndexExpr { target, .. } => match expr.literal_bracket_key() {
             Some((_, name)) => {
-                static_path_steps(target, out) && {
+                static_path_steps_each(target, each, out) && {
                     out.push(PathStep::Key(name.into()));
                     true
                 }
@@ -3761,8 +3774,8 @@ fn static_path_steps(expr: &Expr, out: &mut Vec<PathStep>) -> bool {
             out.push(PathStep::Index(0));
             true
         }
-        Expr::Paren(inner) | Expr::Optional(inner) => static_path_steps(inner, out),
-        Expr::Pipe(stages) => stages.iter().all(|s| static_path_steps(s, out)),
+        Expr::Paren(inner) | Expr::Optional(inner) => static_path_steps_each(inner, each, out),
+        Expr::Pipe(stages) => stages.iter().all(|s| static_path_steps_each(s, each, out)),
         _ => false,
     }
 }
@@ -3800,6 +3813,16 @@ fn is_closed_literal(expr: &Expr) -> bool {
         Expr::Literal(_) => true,
         Expr::Array(inner) | Expr::Paren(inner) | Expr::Negate(inner) => is_closed_literal(inner),
         Expr::Comma(parts) => parts.iter().all(is_closed_literal),
+        // `[1] | .` reads nothing either: the stages after the first only pass it on (#7236).
+        Expr::Pipe(stages) => match stages.split_first() {
+            Some((first, rest)) => {
+                is_closed_literal(first)
+                    && rest
+                        .iter()
+                        .all(|s| matches!(strip_parens(s), Expr::Identity))
+            }
+            None => false,
+        },
         Expr::Arithmetic { left, right, .. } => is_closed_literal(left) && is_closed_literal(right),
         Expr::Object(entries) => entries.iter().all(|e| {
             let key_closed = match &e.key {
@@ -3875,7 +3898,10 @@ fn collect_write_targets(expr: &Expr) -> Option<Vec<WriteTarget>> {
                 .all(|b| push_at(b, kind, (fresh, copies), appends, stage, out)),
             _ => {
                 let mut path = Vec::new();
-                if !static_path_steps(lhs, &mut path) {
+                // #7236: a write of a closed literal reaches every member `.[]` yields, and each
+                // gets the node a literal builds. Nothing else is read through `.[]` here.
+                let each = kind == WriteKind::Set && fresh;
+                if !static_path_steps_each(lhs, each, &mut path) {
                     return false;
                 }
                 out.push(WriteTarget {
@@ -4043,6 +4069,13 @@ fn collect_write_targets(expr: &Expr) -> Option<Vec<WriteTarget>> {
 
     let mut out = Vec::new();
     if !walk(expr, &mut DefScope::default(), &mut out) {
+        return None;
+    }
+    // #7236: a `del` renumbers the slots a write is read at (`resolve_stage_order`), and a path
+    // through `.[]` names none to renumber. A pipe that has both stays on the positional walk.
+    if out.iter().any(|t| t.path.contains(&PathStep::Each))
+        && out.iter().any(|t| t.kind == WriteKind::Del)
+    {
         return None;
     }
 
@@ -4253,6 +4286,7 @@ fn descend_key<'t>(targets: &[RelTarget<'t>], key: &str) -> Vec<RelTarget<'t>> {
                 Some((PathStep::Key(k), rest)) if k == key => {
                     Some((rest, *kind, *fresh, *copies, *appends))
                 }
+                Some((PathStep::Each, rest)) => Some((rest, *kind, *fresh, *copies, *appends)),
                 _ => None,
             },
         )
@@ -4269,6 +4303,7 @@ fn descend_index<'t>(targets: &[RelTarget<'t>], index: usize, len: usize) -> Vec
                 Some((PathStep::Index(n), rest)) if resolve_index(*n, len) == Some(index) => {
                     Some((rest, *kind, *fresh, *copies, *appends))
                 }
+                Some((PathStep::Each, rest)) => Some((rest, *kind, *fresh, *copies, *appends)),
                 _ => None,
             },
         )
@@ -4874,6 +4909,8 @@ fn set_owned_at(node: &mut OwnedValue, path: &[PathStep], new: OwnedValue) -> Op
             }
             set_owned_at(&mut items[at], rest, new)
         }
+        // A chain stage's path is static (`static_path_steps`), so it holds no `Each`.
+        PathStep::Each => None,
     }
 }
 
@@ -18654,6 +18691,65 @@ mod tests {
         // whole, even though `is_alias_sensitive_assign` would not let one
         // reach here today.
         assert_eq!(targets_of(&Expr::Field("a".into())), None);
+    }
+
+    /// #7236: `.[]` is a path step only for a write of a closed literal, which builds the node each
+    /// member is replaced by. A write that reads the node (`.[] |= .`, a compound assign) has no such
+    /// step, nor has a `del`, and a pipe that holds one next to a `del` stays positional.
+    #[test]
+    fn collect_write_targets_reads_each_only_for_a_literal_write_7236() {
+        let one = || Expr::Literal(succinctly::jq::Literal::Int(1));
+        let literal = || Expr::Array(Box::new(one()));
+        let each_of = |path: Vec<Expr>| Expr::Pipe(path.into());
+        let update = |path: Expr, filter: Expr| Expr::Update {
+            path: Box::new(path),
+            filter: Box::new(filter),
+        };
+        let set = vec![(vec![PathStep::Each], WriteKind::Set)];
+
+        assert_eq!(targets_of(&update(Expr::Iterate, literal())), Some(set));
+        assert_eq!(
+            targets_of(&Expr::Assign {
+                path: Box::new(each_of(vec![Expr::Field("a".into()), Expr::Iterate])),
+                value: Box::new(literal()),
+            }),
+            Some(vec![(
+                vec![PathStep::Key("a".into()), PathStep::Each],
+                WriteKind::Set
+            )])
+        );
+        // The body reads the node, the operator reads it, or the write is a `del`.
+        assert_eq!(targets_of(&update(Expr::Iterate, Expr::Identity)), None);
+        assert_eq!(
+            targets_of(&Expr::CompoundAssign {
+                path: Box::new(Expr::Iterate),
+                op: AssignOp::Add,
+                value: Box::new(literal()),
+            }),
+            None
+        );
+        assert_eq!(
+            targets_of(&Expr::Builtin(Builtin::Del(Box::new(Expr::Iterate)))),
+            None
+        );
+        // Another write beside it is kept, and a `del` of an index is not mixed with it.
+        let other = update(Expr::Field("b".into()), literal());
+        assert_eq!(
+            targets_of(&Expr::Pipe(
+                vec![other, update(Expr::Iterate, literal())].into()
+            )),
+            Some(vec![
+                (vec![PathStep::Key("b".into())], WriteKind::Set),
+                (vec![PathStep::Each], WriteKind::Set),
+            ])
+        );
+        let del = Expr::Builtin(Builtin::Del(Box::new(Expr::Index { idx: 0, key: None })));
+        assert_eq!(
+            targets_of(&Expr::Pipe(
+                vec![del, update(Expr::Iterate, literal())].into()
+            )),
+            None
+        );
     }
 
     fn setpath(path: Expr, value: Expr) -> Expr {
