@@ -1262,6 +1262,19 @@ position on this curve, not the change's cost. In the #3100 data that curve span
 enough to flip the sign of any change under 15% that moves the index builder: an
 `Ir`-neutral change that moves the builder forward 16 bytes reads +10% slower.
 
+**Placement is not the only thing a startup change moves (#7332).** `.numbers | sort | .[0]` on a
+10 MB `numbers` document read +6.5% on a 7950X from a change that only reshaped start-up, with the
+per-function `Ir` flat, and the padding holdout above did not reproduce it: bases padded by 16 bytes
+to 12 KiB in `main` and in three library modules, and with the heap start moved by 24 to 120
+bytes, all stayed within 1% of the unpadded one. The delta was the allocator: the slow build ran
+glibc's `malloc_consolidate` (and its `unlink_chunk`) over the million small chunks the sort had
+freed, because the index buffers freed at the end happened to join past 64 KiB, and the fast build
+never did. `valgrind --tool=cachegrind --cache-sim=yes` on both builds and a `cg_diff` showed a
+libc function present in one build only (+54 M `Ir`, +3.2 M `D1mr`); the padding holdout is still the
+first test, and this is the second when it fails. `GLIBC_TUNABLES=glibc.malloc.mxfast=0` confirmed
+it by putting both builds at the same time. macOS's allocator has no such step, so the M4 Pro read
+no change from either the delta or its fix.
+
 ### 10. Attribute the cost before you A/B it — hold one suspect quantity fixed
 
 Rules 1-9 assume you already know what to change. When a performance *issue* names a suspected
