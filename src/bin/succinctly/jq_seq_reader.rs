@@ -780,6 +780,86 @@ pub(crate) fn seed_token_byte(byte: Option<u8>) {
     SEEDED_TOKEN_BYTE.with(|seed| seed.set(byte));
 }
 
+/// What jq's reader makes of a stretch of a `--seq` stream that is not RFC 7464's own framing
+/// ([`walk_stretch`], #7322).
+pub(crate) struct StretchWalk {
+    /// The byte range of every value the reader yields, in order, as offsets into the stretch.
+    pub(crate) values: Vec<(usize, usize)>,
+    /// Each line the reader warns with (`jq: ignoring parse error: ...`), in order, with the offset
+    /// in the stretch of the byte it met it on. No value is yielded on that byte, and none holds it.
+    pub(crate) warnings: Vec<(usize, String)>,
+    /// What the reader's token buffer holds at index 1 after the stretch ([`token_byte_after`]).
+    pub(crate) token_byte: Option<u8>,
+}
+
+/// The most warnings a [`walk_stretch`] keeps: a stretch can warn once a byte (a run of `}`), and each
+/// is a line held until the values before it have run.
+const MAX_STRETCH_WARNINGS: usize = 1024;
+
+/// Walks `stretch` as jq's reader walks it in the middle of a stream (#7322): from the RS that opens a
+/// record which is not `RS value LF`, through the next RS at a line start. `lines` line breaks of
+/// RFC 7464's own framing came before it and left `token_byte` in the token buffer; `lines` of 0 is a
+/// stretch at the stream's very start.
+///
+/// The reader stands before it as [`resumed_stream`] says: at a line start, in `Normal` with nothing
+/// pending (or waiting for the stream's first RS). After its last byte, an RS, the reader is there
+/// again whatever the stretch held: an RS resets the parser, with a warning or without. So the
+/// records after the stretch are read as the records before it were, and the stretch is all of the
+/// stream this walk needs. It is never the stream's end, so neither the final buffer's rule (#2998)
+/// nor the EOF branch applies.
+///
+/// `None` when the stretch warns more than [`MAX_STRETCH_WARNINGS`] times, or (defensive) when the
+/// walk ends in any other state: the caller then leaves the stream from the stretch on to the walk
+/// that reads it whole.
+pub(crate) fn walk_stretch(
+    stretch: &[u8],
+    lines: usize,
+    token_byte: Option<u8>,
+) -> Option<StretchWalk> {
+    debug_assert_eq!(stretch.first(), Some(&ASCII_RS));
+    debug_assert_eq!(stretch.last(), Some(&ASCII_RS));
+    let mut warnings: Vec<(usize, String)> = Vec::new();
+    let mut overflowed = false;
+    let mut emit = |warning: &str, at: usize| {
+        if warnings.len() < MAX_STRETCH_WARNINGS {
+            warnings.push((at, warning.to_string()));
+        } else {
+            overflowed = true;
+        }
+    };
+    let bom = BomPrefix {
+        consumed: 0,
+        malformed: false,
+    };
+    let mut reader = Reader::new(bom, &mut emit);
+    reader.token_buf = token_byte.map_or_else(Vec::new, |byte| vec![0, byte]);
+    if lines > 0 {
+        // As after an RS and `lines` line breaks.
+        reader.st = St::Normal;
+        reader.last_ch_was_ws = true;
+        reader.line += lines;
+    }
+    reader.total = stretch.len();
+    reader.run(stretch, 0, &[]);
+    let settled = reader.st == St::Normal
+        && reader.stack.is_empty()
+        && reader.token_len == 0
+        && reader.next.is_none()
+        && !reader.stopped;
+    let token_byte = reader.token_buf.get(1).copied();
+    let values = std::mem::take(&mut reader.values);
+    let at_eof = reader.yielded_at.contains(&YIELDED_AT_EOF);
+    drop(reader);
+    if overflowed || !settled || at_eof || warnings.iter().any(|&(at, _)| at == AT_EOF) {
+        return None;
+    }
+    Some(StretchWalk {
+        values,
+        warnings,
+        token_byte,
+    })
+}
+
 /// What follows the last of the files a walk reads (#6588): a file that did not open means jq's
 /// reader asks that file for more before it is at its end, so the refill that sets `is_last` is
 /// the empty one at the missing file, and the last opened file's last chunk is not the final

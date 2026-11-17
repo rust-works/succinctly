@@ -5456,7 +5456,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             // The next file's text, or for a windowed file its next window with the documents the
             // window holds (#6920): the splitter already ran over it, and `lines_before` line
             // breaks and `window_substituted` come with it.
-            let (idx, raw, window_split, lines_before, window_substituted, window_place) =
+            let (idx, raw, window_split, lines_before, window_substituted, window_place, notes) =
                 match windowed.as_mut() {
                     Some(reader) => match reader.next_window_noting(&mut |at, failure| {
                         noted.push((at, failure));
@@ -5468,6 +5468,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                             next.lines_before,
                             next.substituted,
                             Some((next.seam, next.origin)),
+                            next.notes,
                         ),
                         Ok(None) => break,
                         // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
@@ -5477,7 +5478,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                         } // patchcov: coverage end
                     },
                     None => match whole_files.next() {
-                        Some((idx, raw)) => (idx, raw.as_slice(), None, 0, false, None),
+                        Some((idx, raw)) => (idx, raw.as_slice(), None, 0, false, None, Vec::new()),
                         None => break,
                     },
                 };
@@ -5611,11 +5612,18 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             )
             .with_lines_before(lines_before);
             let tail_locator = ValueLocator::new(b"", value_tail.as_deref(), Some(0), Seam::NONE);
+            // #7322: what jq's `--seq` reader warns of in a stretch of the window that was not plain
+            // records, each printed when the run reaches where the reader met it, as jq's main loop
+            // prints it between the values it reads.
+            let mut notes = notes.into_iter().peekable();
             for (start, end) in values {
                 if !finished.next_input(args.on_error, &mut sink, &mut had_output, &mut last_output)
                 {
                     run_stopped = true;
                     break 'files;
+                }
+                while let Some((_, warning)) = notes.next_if(|&(at, _)| at < start) {
+                    eprintln!("{warning}");
                 }
                 // #6480: the last value, read at a last file that did not open, which its read
                 // reports first.
@@ -5956,6 +5964,10 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             if stopped(args.on_error, &sink) {
                 run_stopped = true;
                 break;
+            }
+            // #7322: the warnings met after the window's last value.
+            for (_, warning) in notes {
+                eprintln!("{warning}");
             }
             if let Some(offset) = split_error {
                 // #5497: jq meets its depth limit first when the refused bracket comes before
