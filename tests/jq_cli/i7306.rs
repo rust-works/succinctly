@@ -1,9 +1,9 @@
 //! #7306: `min_by(f)`/`max_by(f)` over a document array take one walk that keeps only the winner
 //! and its key, and `add` folds without collecting the array's cursors first. Each row is
 //! `(document, filter, stdout, stderr, exit status)` as jq 1.7.1 (`/usr/bin/jq`) answers: ties (the
-//! first of equal minima and the last of equal maxima win, also between equal spellings), NaN keys
-//! (#6008), the empty array, a key filter with several outputs, none, or an error on the first
-//! element that raises, keys of mixed types, a non-array input, the same over a computed array
+//! first of equal minima and the last of equal maxima win, also between equal spellings), a winner
+//! that is overtaken later (its key must move with it), NaN keys (#6008), the empty array, a key
+//! filter with several outputs, none, or an error on the first element that raises, keys of mixed types, a non-array input, the same over a computed array
 //! (which the full evaluator answers), and `add` over every kind of element it concatenates or
 //! refuses.
 
@@ -32,6 +32,17 @@ const ROWS: &[(&str, &str, &str, &str, i32)] = &[
         "[123456789012345679,123456789012345678.9]",
         "[min_by(.), max_by(.)]",
         "[123456789012345678.9,123456789012345679]\n",
+        "",
+        0,
+    ),
+    ("[3,1,2]", "min_by(.)", "1\n", "", 0),
+    ("[1,3,2]", "max_by(.)", "3\n", "", 0),
+    ("[3,1,2]", "[.[]] | min_by(.)", "1\n", "", 0),
+    ("[1,3,2]", "[.[]] | max_by(.)", "3\n", "", 0),
+    (
+        "[{\"a\":3},{\"a\":1},{\"a\":2}]",
+        "[min_by(.a), max_by(.a)]",
+        "[{\"a\":1},{\"a\":3}]\n",
         "",
         0,
     ),
