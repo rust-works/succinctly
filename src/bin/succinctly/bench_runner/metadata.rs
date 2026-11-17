@@ -2,9 +2,10 @@
 //!
 //! Collects git, system, and toolchain information.
 
-use super::utils::{get_cpu_info, get_os_version, get_total_ram_gb};
+use super::utils::{
+    get_cpu_info, get_os_version, get_total_ram_gb, now_local_fmt, now_utc_rfc3339,
+};
 use anyhow::{Context, Result};
-use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 
@@ -53,12 +54,9 @@ pub struct BenchmarkMetadata {
 impl BenchmarkMetadata {
     /// Collect all metadata.
     pub fn collect() -> Result<Self> {
-        let now_utc: DateTime<Utc> = Utc::now();
-        let now_local: DateTime<Local> = Local::now();
-
         Ok(Self {
-            timestamp: now_utc.to_rfc3339(),
-            timestamp_local: now_local.format("%Y-%m-%d %H:%M:%S %Z").to_string(),
+            timestamp: now_utc_rfc3339(),
+            timestamp_local: now_local_fmt("%Y-%m-%d %H:%M:%S %Z"),
             git: collect_git_info()?,
             system: collect_system_info(),
             toolchain: collect_toolchain_info()?,
@@ -67,7 +65,7 @@ impl BenchmarkMetadata {
 
     /// Generate output directory name from metadata.
     pub fn output_dir_name(&self) -> String {
-        let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
+        let timestamp = now_local_fmt("%Y%m%d_%H%M%S");
         if self.git.dirty {
             format!("{}_{}_dirty", timestamp, self.git.commit_short)
         } else {

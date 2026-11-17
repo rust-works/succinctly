@@ -342,7 +342,7 @@ fn create_output_dir(base: &Path, metadata: &Option<BenchmarkMetadata>) -> Resul
     let dir_name = if let Some(meta) = metadata {
         meta.output_dir_name()
     } else {
-        chrono::Local::now().format("%Y%m%d_%H%M%S").to_string()
+        super::utils::now_local_fmt("%Y%m%d_%H%M%S")
     };
 
     let dir = base.join(&dir_name);

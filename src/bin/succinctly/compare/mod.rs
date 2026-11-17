@@ -1004,7 +1004,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
     }
 
     let run_id = {
-        let t = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+        let t = crate::bench_runner::utils::now_utc_fmt("%Y%m%d_%H%M%S");
         format!(
             "{t}_{}{}",
             env.git.commit_short,
