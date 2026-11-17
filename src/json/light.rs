@@ -4103,6 +4103,7 @@ pub(crate) enum CanonicalScan {
 #[must_use]
 pub(crate) fn canonical_compact_jq_scan_at_depth(bytes: &[u8], depth: usize) -> CanonicalScan {
     let mut scan = ScanState::new();
+    scan.wants_repeats = true;
     match scan_canonical_value(bytes, 0, depth, &mut scan) {
         Some(end) => CanonicalScan::Canonical(end),
         // The scan stops at its first fault, so at most one object recorded
@@ -4134,6 +4135,11 @@ struct ScanState {
     /// `}` only because its keys' hashes repeat. Written at most once per
     /// scan, since that decline ends the scan.
     repeated_keys: Option<RepeatedKeys>,
+    /// Whether the caller reads [`ScanState::repeated_keys`] back
+    /// ([`canonical_compact_jq_scan_at_depth`]): only then is a repeat among an object's first
+    /// keys scanned on to the closing `}` for the record (`pairwise_repeat`, #7355). The other
+    /// callers decline at the repeated key, as they always did.
+    wants_repeats: bool,
 }
 
 /// [`ScanState::repeated_keys`]: how deep the members of the object that
@@ -4151,6 +4157,7 @@ impl ScanState {
         Self {
             specials: SpecialMask::new(),
             repeated_keys: None,
+            wants_repeats: false,
         }
     }
 }
@@ -4401,7 +4408,8 @@ fn canonical_escape_len(bytes: &[u8], i: usize) -> Option<usize> {
 /// comment for why that's sound) to bail on any repeat -- pairwise below
 /// [`PAIRWISE_SPAN_SCAN_LIMIT`] keys, through one exactly sized
 /// [`KeyHashes::has_repeat`] table per object above it
-/// (`scan_canonical_object_wide`).
+/// (`scan_canonical_object_wide`). A repeat among the first keys is the table's too when the
+/// caller reads the record of one ([`ScanState::wants_repeats`], `pairwise_repeat`, #7355).
 fn scan_canonical_object(
     bytes: &[u8],
     pos: usize,
@@ -4434,10 +4442,19 @@ fn scan_canonical_object(
             small_fps[j] == fp && bytes[s..e] == bytes[key_start..key_end]
         });
         if repeat {
-            // A genuine duplicate key, or merely a hash collision --
-            // either way this object's span cannot be certified
-            // canonical (see this function's own doc comment).
-            return None;
+            // A genuine duplicate key (the spans are compared byte for byte), which no
+            // canonical span holds. The rest of the object is scanned by the table tier, so
+            // that the keys the repeat shares are recorded for a caller to print from the text
+            // (#7355) instead of walking and re-rendering every member.
+            return pairwise_repeat(
+                bytes,
+                pos,
+                &small_spans[..small_count],
+                (key_start, key_end),
+                after_key,
+                depth,
+                scan,
+            );
         }
         if small_count < PAIRWISE_SPAN_SCAN_LIMIT {
             small_fps[small_count] = fp;
@@ -4471,10 +4488,44 @@ fn scan_canonical_object(
     }
 }
 
+/// The rest of an object [`scan_canonical_object`] found a repeated key in among its first
+/// [`PAIRWISE_SPAN_SCAN_LIMIT`] keys, `spans` being the keys before it and `key` the repeat,
+/// entered with `after_key` just past it (#7355): [`scan_canonical_object_wide`] from there, with
+/// every hash so far. Without it the pairwise tier declined at the key with no record, and every
+/// caller walked and re-rendered the whole object, which the same repeat after the pairwise
+/// tier did not cost. Out of line and cold, so that the small-object loop keeps no state for it.
+#[cold]
+#[inline(never)]
+fn pairwise_repeat(
+    bytes: &[u8],
+    pos: usize,
+    spans: &[(usize, usize)],
+    key: (usize, usize),
+    after_key: usize,
+    depth: usize,
+    scan: &mut ScanState,
+) -> Option<usize> {
+    // Only a caller that reads the record, and only the value it asked about, can use it: any
+    // other scan, and an object further in, is declined at the key as it always was, and not
+    // scanned to its end for nothing. The scan's value starts at byte 0 and a nested one never
+    // does (`pos` is the object's `{`).
+    if !scan.wants_repeats || pos != 0 {
+        return None;
+    }
+    let mut hashes = Vec::with_capacity(PAIRWISE_SPAN_SCAN_LIMIT * 4);
+    for &(s, e) in spans {
+        hashes.push(key_hash(&bytes[s..e]));
+    }
+    hashes.push(key_hash(&bytes[key.0..key.1]));
+    scan_canonical_object_wide(bytes, after_key, depth, scan, hashes)
+}
+
 /// The rest of an object [`scan_canonical_object`] found wider than
 /// [`PAIRWISE_SPAN_SCAN_LIMIT`] keys (#3333), entered with `after_key` just
-/// past the key that overflowed the pairwise tier and `hashes` holding
-/// every key's [`key_hash`] up to and including it.
+/// past the key that overflowed the pairwise tier (or, for a caller that reads the record, that
+/// repeated an earlier one, `pairwise_repeat`) and `hashes` holding
+/// every key's [`key_hash`] up to and including it. The two entries build that list the same
+/// way, the overflow's written in line in the pairwise loop.
 ///
 /// Past the pairwise tier the keys' hashes are only *collected*, and one
 /// table sized for exactly that many keys settles them at the closing `}`
@@ -4494,7 +4545,9 @@ fn scan_canonical_object(
 /// scan. An early checkpoint over the first hashes would recover it for a
 /// repeat inside them, but charges every no-repeat object just past its width
 /// more than it saves, so it was not taken (#4156; `docs/parsing/json.md`,
-/// "Rejected: a checkpoint for a front-loaded repeat").
+/// "Rejected: a checkpoint for a front-loaded repeat"). A repeat among the first keys is a
+/// different case: the pairwise tier has already found it, so no check is paid for it, and the
+/// scan goes on only for a caller that reads the record (#7355).
 ///
 /// A separate function, not a branch in the loop above, so the small-object
 /// loop that nearly every object takes keeps no wide-tier state and no
@@ -9187,11 +9240,33 @@ mod tests {
         // The whole span is the object's even with bytes after it.
         let trailing = format!("{repeat} 1");
         assert_eq!(repeated(&trailing, 0), want);
+        // A repeat among the first `PAIRWISE_SPAN_SCAN_LIMIT` keys is the table tier's from the
+        // repeated key on, so it is recorded the same (#7355): in an object of two, ten and forty
+        // keys, the first key repeated by the second, by the last and by one past the pairwise tier.
+        for (keys, first, again) in [
+            (2, 0, 1),
+            (10, 2, 7),
+            (40, 2, 7),
+            (PAIRWISE_SPAN_SCAN_LIMIT, 0, PAIRWISE_SPAN_SCAN_LIMIT - 1),
+            (PAIRWISE_SPAN_SCAN_LIMIT + 3, 4, PAIRWISE_SPAN_SCAN_LIMIT),
+        ] {
+            let doc = String::from_utf8(wide_canonical_object(keys, Some((first, again)))).unwrap();
+            let key = alloc::format!("k{first:04}");
+            assert_eq!(
+                repeated(&doc, 0),
+                Some((doc.len(), vec![key_hash(key.as_bytes())])),
+                "{doc}"
+            );
+            // A fault after the repeat still declines the span with no record.
+            let faulty = doc.replacen(&alloc::format!(":{}", keys - 1), ":1e3", 1);
+            assert_eq!(
+                canonical_compact_jq_scan_at_depth(faulty.as_bytes(), 0),
+                CanonicalScan::Declined,
+                "{faulty}"
+            );
+        }
 
         let declined = [
-            // The pairwise tier finds a repeat at the key and stops there.
-            String::from_utf8(wide_canonical_object(10, Some((2, 7)))).unwrap(),
-            String::from_utf8(wide_canonical_object(40, Some((2, 7)))).unwrap(),
             // The repeat is a nested object's, not the value's.
             format!("[{repeat}]"),
             format!("{{\"a\":{repeat}}}"),
@@ -9228,6 +9303,23 @@ mod tests {
             index.root(nested.as_bytes()).canonical_compact_scan(0),
             CanonicalSpan::Declined
         );
+        // A repeat among the first keys is recorded for the value asked about and for no other
+        // object, and not for a scan that does not read the record (#7355): in a wrapper, an
+        // array, and the other scans of the same span.
+        let early = String::from_utf8(wide_canonical_object(10, Some((2, 7)))).unwrap();
+        for doc in [
+            format!("{{\"a\":{early}}}"),
+            format!("[{early}]"),
+            format!("[1,{early}]"),
+        ] {
+            assert_eq!(
+                canonical_compact_jq_scan_at_depth(doc.as_bytes(), 0),
+                CanonicalScan::Declined,
+                "{doc}"
+            );
+        }
+        assert_eq!(canonical_compact_jq_span_end(early.as_bytes()), None);
+        assert!(!is_canonical_compact_jq_span(early.as_bytes()));
         // The scan leaves UTF-8 to its caller, and the cursor declines an
         // object that is not: a key that will not decode needs the walk that
         // compares every key.
@@ -9294,14 +9386,14 @@ mod tests {
             "{\"a\":1,\"a\":2}",
         ];
 
-        // The first `PAIRWISE_SPAN_SCAN_LIMIT` keys are distinct, since a
-        // repeat among them is the pairwise tier's and declines at the key;
-        // later ones come from the small alphabet a quarter of the time. A
+        // A key comes from the small alphabet a quarter of the time, among the first
+        // `PAIRWISE_SPAN_SCAN_LIMIT` too, where a repeat is the pairwise tier's (#7355), and a
+        // root object may be as narrow as two keys. A
         // value is a fault (`VALUES`' non-canonical tail) only in a `dirty`
         // document, so that most documents get as far as the closing brace.
         fn object(rng: &mut ChaCha8Rng, depth: usize, dirty: bool, out: &mut String) {
             let fields = if depth == 0 {
-                rng.random_range(PAIRWISE_SPAN_SCAN_LIMIT + 1..60)
+                rng.random_range(2..60)
             } else {
                 rng.random_range(0..24)
             };
@@ -9310,7 +9402,7 @@ mod tests {
                 if i > 0 {
                     out.push(',');
                 }
-                if i <= PAIRWISE_SPAN_SCAN_LIMIT || rng.random_range(0..4) > 0 {
+                if rng.random_range(0..4) > 0 {
                     out.push_str(&format!("\"d{i}\":"));
                 } else {
                     out.push_str(&format!("\"{}\":", KEYS[rng.random_range(0..KEYS.len())]));
@@ -9338,7 +9430,7 @@ mod tests {
         ];
         let mut rng = ChaCha8Rng::seed_from_u64(7310);
         let mut repeated = 0;
-        for _ in 0..1500 {
+        for _ in 0..3000 {
             let mut doc = String::new();
             let dirty = rng.random_range(0..4) == 0;
             object(&mut rng, 0, dirty, &mut doc);
