@@ -8361,7 +8361,8 @@ A write copies it too when it appends one string literal: `.a += "z"`, `.a |= . 
 `tests/yq_cli/i7070_write_append_style.rs` pins 231 rows of that.
 A comma of paths appends the same way (`(.a, .b) += "z"` and `(.a, .b) |= . + "z"` print `['dog', 'z']` and `["p", "z"]` over `a: ['dog']` and `b: ["p"]`), each sequence taking its own first element's style.
 A null right operand leaves the left node as it is, and yq answers that node itself, so `.a + null`, `.a + .absent` and `.a * null` keep a flow sequence's style and a block one's comments (`['dog']`, `- 1 # c`).
-`tests/yq_cli/i7070_null_operand_and_comma_append.rs` pins 21 rows of those two, captured from yq v4.53.3.
+`tests/yq_cli/i7070_null_operand_and_comma_append.rs` pins 38 rows of those two, captured from yq v4.53.3: nested and flagged `*` over a null, overlapping comma branches, a branch that is no sequence or is absent, and the other writes of a pipe among them.
+Under `--eval-all` both print every sequence as a block, as that route drops the presentation of any write (#4380).
 These still differ:
 
 - **A write that does not append one string literal, or that the static write analysis does not take**: a `style=` stage after the write (`.a += "z" | .a style=""`), and an empty flow sequence with `= .a + "z"` (`a: []` is `- z` in yq, `[z]` here) print the appended string plain.
