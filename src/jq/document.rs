@@ -4105,6 +4105,8 @@ pub fn effective_value_cursors_checked<F: DocumentFields>(
             .enumerate()
             .any(|(i, hash)| small[i + 1..].contains(hash));
         if repeats {
+            // Every hash of so small an object, not only those that repeat: a superset only
+            // decodes a few keys that occur once, and each of those keeps its place anyway.
             let mut shared = small.to_vec();
             shared.sort_unstable();
             return Ok(collapse_repeated_cursors(fields, out, &shared));
