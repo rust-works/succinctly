@@ -107,6 +107,13 @@ const SELECT_ROWS: &[(&str, &str)] = &[
     ("del(.a | select(false), .b)", "{\"a\":1,\"c\":3,\"s\":\"x\",\"arr\":[1,2,3],\"o\":{\"p\":5,\"q\":6},\"t\":true,\"z\":null,\"l\":[{\"k\":1},{\"k\":2}]}\n"),
     ("del(.b, .a | select(false))", "{\"a\":1,\"c\":3,\"s\":\"x\",\"arr\":[1,2,3],\"o\":{\"p\":5,\"q\":6},\"t\":true,\"z\":null,\"l\":[{\"k\":1},{\"k\":2}]}\n"),
     ("del(.c | select(true), 1)", "{\"a\":1,\"b\":2,\"c\":3,\"s\":\"x\",\"arr\":[1,2,3],\"o\":{\"p\":5,\"q\":6},\"t\":true,\"z\":null,\"l\":[{\"k\":1},{\"k\":2}]}\n"),
+    ("del(.arr[]? | select(. > 1) | tostring)", "{\"a\":1,\"b\":2,\"c\":3,\"s\":\"x\",\"arr\":[1],\"o\":{\"p\":5,\"q\":6},\"t\":true,\"z\":null,\"l\":[{\"k\":1},{\"k\":2}]}\n"),
+    ("del((.arr[] | select(. > 1)) | tostring)", "{\"a\":1,\"b\":2,\"c\":3,\"s\":\"x\",\"arr\":[1],\"o\":{\"p\":5,\"q\":6},\"t\":true,\"z\":null,\"l\":[{\"k\":1},{\"k\":2}]}\n"),
+    ("del(.l[] | select(.[0] > 1) | tostring)", "{\"a\":1,\"b\":2,\"c\":3,\"s\":\"x\",\"arr\":[1,2,3],\"o\":{\"p\":5,\"q\":6},\"t\":true,\"z\":null,\"l\":[{\"k\":1},{\"k\":2}]}\n"),
+    ("del(.o | select(.p) | length)", "{\"a\":1,\"b\":2,\"c\":3,\"s\":\"x\",\"arr\":[1,2,3],\"t\":true,\"z\":null,\"l\":[{\"k\":1},{\"k\":2}]}\n"),
+    ("del(.arr | select(length > 1) | length)", "{\"a\":1,\"b\":2,\"c\":3,\"s\":\"x\",\"o\":{\"p\":5,\"q\":6},\"t\":true,\"z\":null,\"l\":[{\"k\":1},{\"k\":2}]}\n"),
+    ("del(select(true))", ""),
+    ("del(select(false))", "{\"a\":1,\"b\":2,\"c\":3,\"s\":\"x\",\"arr\":[1,2,3],\"o\":{\"p\":5,\"q\":6},\"t\":true,\"z\":null,\"l\":[{\"k\":1},{\"k\":2}]}\n"),
 ];
 
 #[test]
@@ -115,6 +122,24 @@ fn test_4476_c_a_select_stage_keeps_the_slot_of_its_input() -> Result<()> {
         let (out, code) = run_yq_stdin(filter, SELECT_DOC, &["-o=json", "-I=0"])?;
         assert_eq!(code, 0, "{filter}");
         assert_eq!(&out, want, "{filter}");
+    }
+    Ok(())
+}
+
+/// What stays refused after a `select`: arithmetic or `map` after it, and a `select` after the
+/// deriving stage. yq deletes the node there, and a rewrite that only looked at the `select` would
+/// have to be sure of the stage after it, which these are not (`.b + [1]` is a type error in yq).
+#[test]
+fn test_4476_d_a_select_before_arithmetic_or_after_the_derived_value_is_still_refused() -> Result<()>
+{
+    for filter in [
+        "del(.arr[] | select(. > 1) | . + 1)",
+        "del(.arr[] | select(. > 1) | map(.))",
+        "del(.a | select(.) | . + 1)",
+        "del(.a | tostring | select(true))",
+    ] {
+        let (out, code) = run_yq_stdin(filter, SELECT_DOC, &["-o=json", "-I=0"])?;
+        assert_eq!((out.as_str(), code), ("", 1), "{filter}");
     }
     Ok(())
 }
