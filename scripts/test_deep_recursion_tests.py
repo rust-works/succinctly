@@ -277,20 +277,12 @@ class CiWiringTests(unittest.TestCase):
                 )
 
     def test_no_other_leg_runs_jq_cli_tests_with_the_two_tests_twice(self):
-        # A third place running `--test jq_cli_tests` unskipped would run them twice. Another
-        # leg may run the target (the x86_64 `sse2-dispatch` leg re-runs it clamped, #7318), but
-        # only through the same `$skip` list `cli-gated` takes.
+        # A third place running `--test jq_cli_tests` unskipped would run them twice.
         for job in MATRIX_JOBS:
             with self.subTest(job=job):
                 for name, leg in matrix_legs(job).items():
-                    if name == "cli-gated":
-                        continue
-                    for line in leg.split("\n"):
-                        if "--test jq_cli_tests" in line:
-                            self.assertIn("-- $skip", line, f"{name}: {line.strip()}")
-                            self.assertIn(
-                                "skip=$(scripts/deep-recursion-tests.sh skip-args)", leg, name
-                            )
+                    if name != "cli-gated":
+                        self.assertNotIn("--test jq_cli_tests", leg, name)
 
 
 def coverage_ignored_names():

@@ -44,9 +44,9 @@ Reasons to set it:
   unrecognized value or the clamp stops applying.
 - **The JSON SSE2 index kernel through the CLI** ([#7318](https://github.com/rust-works/succinctly/issues/7318)):
   on an AVX2 CPU `succinctly jq` and the other JSON routes always build their index with the AVX2
-  kernel, so the same leg also runs the `jq_cli_tests`, `jq_golden_tests`, `cli_golden_tests`,
+  kernel, so the same leg also runs the `jq_golden_tests`, `cli_golden_tests`,
   `cli_characterization_tests`, `json_validate_tests` and `locate_cli_tests` suites with the
-  variable set. The child processes those tests spawn inherit it.
+  variable set (not `jq_cli_tests`, which would make that leg the slowest of the matrix). The child processes those tests spawn inherit it.
 - A/B benchmarking the SSE2 path against AVX2 on the same machine.
 
 Accepted values (case-insensitive, surrounding whitespace ignored):

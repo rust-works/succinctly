@@ -277,10 +277,10 @@ jobs:
               # these runners (without `std` the SSE2 one is the only builder, and nothing builds
               # the CLI that way), so the differential CLI suites never executed it. Last, so the
               # `--features cli` relink of `target/debug/succinctly` comes after
-              # `orchestrate_cli_tests` (#1705). Same skip list as `cli-gated`: the slowest
-              # `jq_cli_tests` run in `deep-recursion`, and only the JSON-reading suites are named.
-              skip=$(scripts/deep-recursion-tests.sh skip-args)
-              SUCCINCTLY_SIMD=sse2 cargo test --features cli --test jq_cli_tests --test jq_golden_tests --test cli_golden_tests --test cli_characterization_tests --test json_validate_tests --test locate_cli_tests -- $skip
+              # `orchestrate_cli_tests` (#1705). Only the suites that push varied JSON through the
+              # index are named, not `jq_cli_tests`: it is mostly jq semantics, and running it here
+              # took this leg from ~6 min to ~31 min, the critical path of `Test (x86_64)`.
+              SUCCINCTLY_SIMD=sse2 cargo test --features cli --test jq_golden_tests --test cli_golden_tests --test cli_characterization_tests --test json_validate_tests --test locate_cli_tests
           - name: default
             buildCli: false
             testCmd: cargo test --verbose
