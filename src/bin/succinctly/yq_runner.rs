@@ -3894,8 +3894,10 @@ fn collect_write_targets(expr: &Expr) -> Option<Vec<WriteTarget>> {
             // `del(.arr[0], .arr[2])` removes both, and each branch is a
             // path of its own — a generator is only valid on a `del`'s
             // left, never an assignment's, so this arm is gated on `Del`
-            // rather than accepting `.a, .b = 1`.
-            Expr::Comma(branches) if kind == WriteKind::Del => branches
+            // rather than accepting `.a, .b = 1`. The one assignment it takes is an append
+            // (`(.a, .b) += "z"`, `(.a, .b) |= . + "z"`, #7070), which writes each branch's own
+            // sequence the same way.
+            Expr::Comma(branches) if kind == WriteKind::Del || appends => branches
                 .iter()
                 .all(|b| push_at(b, kind, (fresh, copies), appends, stage, out)),
             _ => {

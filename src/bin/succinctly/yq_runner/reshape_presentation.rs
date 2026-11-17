@@ -1823,6 +1823,15 @@ fn merge_tree(
     }
     let (lv, lt) = left;
     let (rv, rt) = right;
+    // #7070: a null right operand (`.a + null`, `.a + .absent`, `.a * null`) leaves the left node as it
+    // is, and yq answers that node itself, so it keeps its flow style and comments (`['dog']`, not a
+    // block sequence). A scalar has no collection style to lose, and is the plain case below.
+    if matches!(rv, OwnedValue::Null)
+        && matches!(lv, OwnedValue::Array(_) | OwnedValue::Object(_))
+        && result == lv
+    {
+        return Some(lt.clone());
+    }
     if let (OwnedValue::Array(l), OwnedValue::Array(r)) = (lv, rv) {
         // An empty left array is no node to keep: `*`, `*+` and `*d` answer the right one as it is
         // (`[]` merged with `[1]` prints a block sequence in yq, not the `[]`'s flow style).
