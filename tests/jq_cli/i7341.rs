@@ -145,6 +145,53 @@ fn a_file_with_stretches_among_plain_files_is_read_by_its_own_gate_7341() -> Res
     Ok(())
 }
 
+/// Two files with stretches in a row: the second's gate counts the lines it warns at from the stream's
+/// start, past the first gated file's lines (where the files after a gated one start was once taken to
+/// be its start, which restarted the count).
+#[test]
+fn two_gated_files_in_a_row_count_the_streams_lines_7341() -> Result<()> {
+    let files = [
+        ("a.seq", records(0..25_000)),
+        (
+            "b-mid.seq",
+            format!(
+                "{}{CUT}{}{MIXED}{}{NAN}{}",
+                records(25_000..35_000),
+                records(35_000..45_000),
+                records(45_000..50_000),
+                records(50_000..55_000)
+            ),
+        ),
+        (
+            "b2.seq",
+            format!(
+                "{}{CUT}{}{NAN}{}",
+                records(55_000..60_000),
+                records(60_000..65_000),
+                records(65_000..70_000)
+            ),
+        ),
+        ("c2.seq", records(70_000..80_000)),
+    ];
+    let (out, err, status) = several(ODD, &files)?;
+    assert_eq!(out, "\x1e5\n\x1e1\n\x1e2\n\x1e\"bu\"\n\x1enull\n\x1enull\n");
+    assert_eq!(status, 0);
+    assert!(
+        err.ends_with(
+            "at line 45007, column 3\njq: ignoring parse error: Truncated value at line 60009, column 1\n"
+        ),
+        "{err}"
+    );
+    let (_, err, _) = several(NUMBERS, &files)?;
+    assert!(
+        err.ends_with(
+            "jq: ignoring parse error: Truncated value at line 60009, column 1\njq: error (at b2.seq:10002): n\n"
+        ),
+        "{err}"
+    );
+    Ok(())
+}
+
 /// A file whose last stretch runs on into the next file: its gate hands the rest of it on, from that
 /// stretch, with the files after it, and the route that reads them whole reads across the files'
 /// boundary as jq's reader does.

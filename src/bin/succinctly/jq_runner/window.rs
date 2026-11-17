@@ -585,8 +585,9 @@ impl WindowedFile {
                     seam.moved_len = moved.moved_len;
                     seam.moved_newline = moved.moved_newline;
                 }
-                // Where the next file starts in the stream: nothing else reads it.
-                if last && self.hold_tail {
+                // Where the next file starts in the stream: nothing else reads it. #7341: a file of a
+                // `--seq` list its own gate reads holds no tail, and a file may follow it.
+                if last && (self.hold_tail || self.seq_gate.is_some()) {
                     self.end_origin = advance_position(self.origin, &self.buf[..text_end]);
                 }
                 // The stream's first fault, if this window holds it, found before any of it runs.
