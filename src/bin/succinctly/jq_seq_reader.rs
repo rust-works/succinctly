@@ -825,10 +825,17 @@ mod discards {
     /// Run `f` with the walk discarding a byte at a time.
     #[cfg(test)]
     pub(super) fn bytewise_in<T>(f: impl FnOnce() -> T) -> T {
+        /// Clears the switch when dropped, so a closure that panics leaves it off for the rest
+        /// of the test thread.
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                BYTEWISE.with(|on| on.set(false));
+            }
+        }
         BYTEWISE.with(|on| on.set(true));
-        let out = f();
-        BYTEWISE.with(|on| on.set(false));
-        out
+        let _reset = Reset;
+        f()
     }
 }
 
@@ -1538,9 +1545,13 @@ impl<'a> Reader<'a> {
                 }
                 // #7263: jq discards each byte before an RS with a line or a column and nothing
                 // else, so the run up to the next RS is taken at once, as #5674 takes a run of
-                // string bytes. Not under `resets_per_call`, whose reset at an `fgets` boundary
-                // inside the run puts the parser back to reading.
-                let end = if self.resets_per_call || discards::bytewise() {
+                // string bytes. `resets_per_call` is never set here: `WaitingForRs` is assigned
+                // only in `Reader::new`, and only for a BOM that is not malformed, while
+                // `resets_per_call` is `bom.malformed`; `reset` only ever restores `Normal`. (Were
+                // both set, a reset at an `fgets` boundary inside the run would put the parser
+                // back to reading, and the run could not be taken at once.)
+                debug_assert!(!self.resets_per_call);
+                let end = if discards::bytewise() {
                     offset
                 } else {
                     find_byte(ASCII_RS, &data[offset..]).map_or(data.len(), |at| offset + at)
@@ -3691,6 +3702,21 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #7320: the test switch is off again after its closure panics, not left on for the rest of
+    /// the thread.
+    #[test]
+    fn the_bytewise_switch_is_off_after_a_panicking_closure_7320() {
+        assert!(!discards::bytewise());
+        let panicked = std::panic::catch_unwind(|| {
+            discards::bytewise_in(|| {
+                assert!(discards::bytewise());
+                panic!("closure panics with the switch on");
+            });
+        });
+        assert!(panicked.is_err());
+        assert!(!discards::bytewise());
     }
 
     /// #7263: a run long enough to span `fgets` chunks and refill boundaries, before and after the
