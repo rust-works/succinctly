@@ -2050,7 +2050,10 @@ impl<'a> Reader<'a> {
                 if !number_is_valid(number) {
                     return Err("Invalid numeric literal");
                 }
-                if let Some(nul) = self.token_nul_at {
+                // Only a literal token's: one ends at the newline that ends its `fgets` chunk at the
+                // latest, so its tail overlaps no scan cut. An open string's bytes are asked about
+                // only by an RS that then reports a truncation, which yields no value.
+                if let (Some(nul), St::Normal) = (self.token_nul_at, self.st) {
                     self.token_cuts.push((nul, self.offset));
                 }
                 Kind::Number

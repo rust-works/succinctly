@@ -27004,7 +27004,14 @@ mod tests {
             .map(|(idx, s)| (*idx, s.as_bytes().to_vec()))
             .collect();
         let walk = crate::jq_seq_reader::walk_stream(&raw, false, &mut |_| {});
-        build_seq_values(&raw, &walk.values, &walk.cuts, &walk.locations, locations, false)
+        build_seq_values(
+            &raw,
+            &walk.values,
+            &walk.cuts,
+            &walk.locations,
+            locations,
+            false,
+        )
     }
 
     /// One `--seq` stream's values, the way `get_inputs` builds them.
