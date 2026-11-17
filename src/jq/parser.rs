@@ -818,10 +818,8 @@ fn with_meta_stages(path: &Expr, body: &Expr) -> Option<Expr> {
                 other => steps.push(other.clone()),
             }
         }
-        match steps.len() {
-            0 => Expr::Identity,
-            _ => Expr::pipe(steps),
-        }
+        // `path` is navigation, so there is at least one step.
+        Expr::pipe(steps)
     };
     let mut rewritten = Vec::with_capacity(stages.len());
     let mut writes_metadata = false;

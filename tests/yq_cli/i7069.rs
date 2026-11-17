@@ -237,6 +237,26 @@ const META_ROWS: &[(&str, &str, &str)] = &[
         ".[] |= (.b style=\"single\" | .c line_comment=\"x\")",
         "a:\n  b: 'thing'\n  c: something # x\n",
     ),
+    (
+        "a:\n  b: thing\n  c: something\n",
+        "with(.a.b; . |= \"new\" | . style=\"double\")",
+        "a:\n  b: \"new\"\n  c: something\n",
+    ),
+    (
+        "a:\n  b: thing\n  c: something\n",
+        ".a.b |= (. |= \"x\" | . style=\"single\")",
+        "a:\n  b: 'x'\n  c: something\n",
+    ),
+    (
+        "a:\n  b: thing\n  c: something\n",
+        "with(.a.b; . = [1] | . style=\"flow\")",
+        "a:\n  b: [1]\n  c: something\n",
+    ),
+    (
+        "a:\n  b: thing\n  c: something\n",
+        "with(.a; .c |= [7] | .c style=\"flow\")",
+        "a:\n  b: thing\n  c: [7]\n",
+    ),
 ];
 
 #[test]
