@@ -15243,13 +15243,19 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
     current
 }
 
-/// Whether a value that is lazy, or a `ManyOwned`, can go on one stage at a time through `stages`
-/// (#7337): not when they hold a `?//` bind anywhere (`((. as [$x] ?// $x | $x))` and a bind inside
-/// a sub-pipe as much as one that opens a stage), since the bind must still be live when a later
-/// stage raises. Asked of the value's shape first, so a pipe without one pays a comparison.
+/// Whether `stages` hold a `?//` bind anywhere (#7337): `((. as [$x] ?// $x | $x))` and a bind
+/// inside a sub-pipe as much as one that opens a stage. A value that meets them one stage at a
+/// time must not, since the bind has to be live when a later stage raises.
+fn stages_hold_retrying_bind(stages: &[Expr]) -> bool {
+    stages.iter().any(contains_retrying_pattern_bind)
+}
+
+/// Whether the eager fold has to run `stages` as one pipe over `current` (#7337): a lazy value, or
+/// a `ManyOwned`, and a bind in the stages. Asked of the value's shape first, so a pipe without
+/// either pays a comparison.
 fn must_run_through_bind<V: DocumentValue>(current: &GenericResult<V>, stages: &[Expr]) -> bool {
     (current.is_lazy() || matches!(current, GenericResult::ManyOwned(_)))
-        && stages.iter().any(contains_retrying_pattern_bind)
+        && stages_hold_retrying_bind(stages)
 }
 
 /// The stages `rest`, which hold a `?//` bind, run as one pipe over each of `values` in order
@@ -16725,27 +16731,14 @@ fn fold_pipe_stages_sink<S: EvalSemantics, V: DocumentValue>(
         if j == stages.len() {
             return drain_result_generic(current, sink);
         }
-        // #7337: a lazy value met by a `?//` bind is forced, and the stages from the bind on run
-        // as one pipe, so that a later stage's error (or the consumer's stop) unwinds into the
-        // bind's next alternative as in jq. A forced value goes on to the `Owned` arm below,
-        // which runs them through `run_owned`; a `ManyOwned` (what a nested `.[a:b][]` stage
-        // leaves) goes element by element to the driver that serves a lazy sequence's elements.
-        // The per-stage fold would run the bind to completion first.
-        if must_run_through_bind(&current, &stages[j..]) {
-            if current.is_lazy() {
-                current = current.materialize_lazy::<S>();
-            }
-            match current {
-                GenericResult::ManyOwned(values) => {
-                    return drive_pipe_elements_generic::<S, V>(
-                        values.into_iter().map(|o| Ok(GenericItem::Owned(o))),
-                        &stages[j..],
-                        optional,
-                        sink,
-                    );
-                }
-                other => current = other,
-            }
+        // #7337: a lazy value that has a `?//` bind anywhere in the stages still to run is forced
+        // here, and goes on to the `Owned` arm below, which runs them as one pipe through
+        // `run_owned`: a later stage's error (or the consumer's stop) then unwinds into the bind's
+        // next alternative as in jq. The per-stage fold would run the bind to completion first.
+        // Forced at the first stage, so nothing it leaves reaches a later stage lazy or as a
+        // `ManyOwned` with the bind still to come.
+        if current.is_lazy() && stages_hold_retrying_bind(&stages[j..]) {
+            current = current.materialize_lazy::<S>();
         }
         let expr = &stages[j];
         let rest = &stages[j + 1..];
@@ -57391,6 +57384,15 @@ mod tests {
                 &format!("group_by(.a) | .[0:2][] | ({bind} | .b) | . + 1")
             ),
             retried
+        );
+        // A `ManyOwned` the stage before the bind leaves: `[1]` binds, `["a"]` raises in the stage
+        // after it and retries `$x` as the array, which raises again.
+        assert_eq!(
+            summarize(
+                b"null",
+                r#"([1],["a"]) | (. as [$x] ?// $x | $x) | if type == "string" then error("s") else . + 1 end"#
+            ),
+            partial_err(&["2"], "array ([\"a\"]) and number (1) cannot be added")
         );
         // The retry is per value, and what an earlier value answered stays: the first group's
         // `.b` is `"y"`, the second group's first alternative raises `late` and its second `arr`.
