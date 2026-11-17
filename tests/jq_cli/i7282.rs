@@ -88,9 +88,33 @@ const MAP_ROWS: &[(&str, &str, &str, i32)] = &[
     ("[(group_by(.a)[]) | length]", "[2,1]\n", "", 0),
 ];
 
+/// A `group_by(f)[]` chain in a later stage over values `group_by` cuts no groups from: the
+/// chain's own answer, folded through the rest as before.
+const NO_GROUPS_INPUT: &str = r#"{"x":{"p":{"a":1}},"y":"s"}"#;
+
+/// (filter, expected `-c` stdout, expected stderr, exit code), run on [`NO_GROUPS_INPUT`].
+const NO_GROUPS_ROWS: &[(&str, &str, &str, i32)] = &[
+    (
+        "try ([.x | group_by(.a)[] | length]) catch .",
+        "\"object ({\\\"p\\\":{\\\"a\\\":1}}) and array ([[1]]) cannot be sorted, as they are not both arrays\"\n",
+        "",
+        0,
+    ),
+    (
+        "try ([.y | group_by(.a)[] | length]) catch .",
+        "\"Cannot iterate over string (\\\"s\\\")\"\n",
+        "",
+        0,
+    ),
+];
+
 #[test]
 fn test_iterate_over_groups_answers_as_jq_7282() -> Result<()> {
-    for (input, rows) in [(INPUT, ROWS), (MAP_INPUT, MAP_ROWS)] {
+    for (input, rows) in [
+        (INPUT, ROWS),
+        (MAP_INPUT, MAP_ROWS),
+        (NO_GROUPS_INPUT, NO_GROUPS_ROWS),
+    ] {
         for (filter, want_out, want_err, want_code) in rows {
             let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
             assert_eq!(
