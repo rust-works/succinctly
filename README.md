@@ -52,7 +52,12 @@ The `succinctly-linux-x64` and `succinctly-windows-x64` archives are built with 
 queries are typically 2-3% faster end to end, up to 20% on structure-heavy YAML, on a Ryzen 9 7950X (see
 [docs/optimizations/simd.md](docs/optimizations/simd.md)). On an older CPU
 the binary stops at startup with a message naming the requirement; `cargo install succinctly --features cli` builds
-for the baseline target and runs everywhere. The Linux and macOS ARM64 archives are unaffected.
+for the baseline target and runs everywhere. The Linux ARM64 archive is unaffected.
+
+The `succinctly-macos-arm64` archive is built for macOS 12 (Monterey) or newer and does not run on macOS 11: the
+12.0 deployment target gets chained fixups from the linker, which start about 0.07 ms faster than the opcode
+fixups of the default 11.0 target (#7321). `cargo install succinctly --features cli` builds for the default target
+and runs on macOS 11.
 
 ## Quick Start
 
