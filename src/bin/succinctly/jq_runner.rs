@@ -10924,10 +10924,17 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
             continue;
         }
         let probed = std::fs::File::open(path)
-            .and_then(|mut file| read_head(&mut file))
+            .and_then(|mut file| {
+                let head = read_head(&mut file)?;
+                // #7295: a pipe, socket or device named by path (`/dev/stdin`, `/dev/fd/0`, a FIFO)
+                // cannot be opened again or seeked, and what the probe read is gone from it: the
+                // handle is kept and read on from where the probe stopped.
+                let streaming = !file.metadata()?.is_file();
+                Ok((head, streaming.then_some(file)))
+            })
             .map_err(|e| InputFileOpenError::from_io(path, &e, at + 1 == files.len()));
         match probed {
-            Ok(head) => {
+            Ok((head, kept)) => {
                 let skip = bom_to_skip(&head, &mut look_for_bom);
                 let path = path.clone();
                 opened.push(path.clone());
@@ -10935,6 +10942,13 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
                     std::mem::take(&mut unopened),
                     Box::new(move || {
                         use std::io::Seek;
+                        if let Some(file) = kept {
+                            let rest = std::io::Cursor::new(head[skip..].to_vec()).chain(file);
+                            return Ok(
+                                Box::new(std::io::BufReader::with_capacity(64 * 1024, rest))
+                                    as Box<dyn std::io::BufRead>,
+                            );
+                        }
                         let mut file = std::fs::File::open(&path)?;
                         file.seek(std::io::SeekFrom::Start(skip as u64))?;
                         Ok(Box::new(std::io::BufReader::with_capacity(64 * 1024, file)))
