@@ -1315,6 +1315,48 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
     pub fn canonical_compact_span(&self, depth: usize) -> Option<&'a str> {
         let rest = self.text.get(self.text_position()?..)?;
         let end = canonical_compact_jq_span_end_at_depth(rest, depth)?;
+        self.certified_span(rest, end)
+    }
+
+    /// [`canonical_compact_span`](Self::canonical_compact_span), also saying
+    /// when the node is an object the scan declined only because its keys'
+    /// hashes repeat ([`CanonicalSpan::RepeatedKeys`], #7310).
+    pub(crate) fn canonical_compact_scan(&self, depth: usize) -> CanonicalSpan<'a> {
+        let Some(rest) = self
+            .text_position()
+            .and_then(|start| self.text.get(start..))
+        else {
+            return CanonicalSpan::Declined;
+        };
+        match canonical_compact_jq_scan_at_depth(rest, depth) {
+            CanonicalScan::Canonical(end) => match self.certified_span(rest, end) {
+                Some(span) => CanonicalSpan::Echo(span),
+                None => CanonicalSpan::Declined,
+            },
+            CanonicalScan::RepeatedKeys { end, shared } => {
+                debug_assert_eq!(
+                    self.text_range().map(|(start, stop)| stop - start),
+                    Some(end),
+                    "the canonical scan and `text_range` must agree on a scanned object"
+                );
+                // The span must be valid UTF-8, as an echo's must, and for a
+                // reason of its own: then every key decodes (a certified
+                // escape always does), which is what lets the caller's plan
+                // compare only the keys whose hash is shared. A key that does
+                // not decode makes the plan compare every key
+                // (`repeat_plan_checked`), so that object takes its route.
+                if core::str::from_utf8(&rest[..end]).is_err() {
+                    return CanonicalSpan::Declined;
+                }
+                CanonicalSpan::RepeatedKeys(shared)
+            }
+            CanonicalScan::Declined => CanonicalSpan::Declined,
+        }
+    }
+
+    /// The `end` bytes of `rest` the canonical scan accepted, as text, or
+    /// `None` when they are not valid UTF-8.
+    fn certified_span(&self, rest: &'a [u8], end: usize) -> Option<&'a str> {
         debug_assert_eq!(
             self.text_range().map(|(start, stop)| stop - start),
             Some(end),
@@ -3566,10 +3608,11 @@ pub type BorrowedJsonCursor<'a> = JsonCursor<'a, &'a [u64]>;
 // ============================================================================
 
 use crate::jq::document::{
-    any_hash_repeats, document_token_of, effective_fields_checked, key_hash, key_is_malformed,
-    key_span_fingerprint, repeat_plan_checked, trailing_element_gap_ok, DocumentCursor,
-    DocumentElements, DocumentField, DocumentFields, DocumentValue, FieldFate, IndentSpec,
-    JsonConvention, KeyHashes, RepeatPlan, PAIRWISE_SPAN_SCAN_LIMIT,
+    document_token_of, effective_fields_checked, key_hash, key_is_malformed, key_span_fingerprint,
+    repeat_plan_checked, repeat_plan_from_shared, shared_key_hashes_if_any,
+    trailing_element_gap_ok, DocumentCursor, DocumentElements, DocumentField, DocumentFields,
+    DocumentValue, FieldFate, IndentSpec, JsonConvention, KeyHashes, RepeatPlan,
+    PAIRWISE_SPAN_SCAN_LIMIT,
 };
 use crate::jq::escape::{write_json_body_jq, write_json_body_yq};
 use crate::jq::stream::{StreamFailure, StreamResult};
@@ -3927,7 +3970,7 @@ fn scalar_end_pos<W: AsRef<[u64]> + Clone>(
 ///   through a table sized for exactly that many keys, so nothing is
 ///   rehashed on the way up. From [`KeyHashes::SATURATING_KEYS`] keys, the
 ///   width at which a table grown key by key would have turned
-///   `saturated()`, the list is settled by `any_hash_repeats`'s sort instead,
+///   `saturated()`, the list is settled by `shared_key_hashes_if_any`'s sort instead,
 ///   as `DistinctKeyCursors` settles an object that wide (`src/jq/document.rs`);
 ///   until #7293 the scan declined such an object outright, which left its
 ///   caller to walk and hash every key after the scan had hashed 786,432 of
@@ -4004,7 +4047,132 @@ pub(crate) fn canonical_compact_jq_span_end(bytes: &[u8]) -> Option<usize> {
 /// larger `depth` only narrows what is accepted.
 #[must_use]
 pub(crate) fn canonical_compact_jq_span_end_at_depth(bytes: &[u8], depth: usize) -> Option<usize> {
-    scan_canonical_value(bytes, 0, depth, &mut SpecialMask::new())
+    scan_canonical_value(bytes, 0, depth, &mut ScanState::new())
+}
+
+/// What [`JsonCursor::canonical_compact_scan`] made of a node (#7310).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CanonicalSpan<'a> {
+    /// The node's text, which is already its compact jq render
+    /// ([`JsonCursor::canonical_compact_span`]'s `Some`).
+    Echo(&'a str),
+    /// The node is an object whose every member is canonical and well
+    /// formed, whose span is valid UTF-8 (so every key decodes), and these of
+    /// whose key hashes ([`raw_key_hash`]) repeat
+    /// ([`CanonicalScan::RepeatedKeys`]). Whether a key really does is left
+    /// to the keys themselves: the scan compared 64-bit hashes of them.
+    RepeatedKeys(Vec<u64>),
+    /// Anything else: the scan declined, the node has no text position, or
+    /// the span it accepted is not valid UTF-8.
+    Declined,
+}
+
+/// What the canonical scan made of one value (#7310): the end of a span it
+/// certifies, or that it declined, keeping apart the one decline a caller can
+/// still use.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CanonicalScan {
+    /// The value's span runs to here and is canonical
+    /// ([`canonical_compact_jq_span_end_at_depth`] answers `Some` with it).
+    Canonical(usize),
+    /// The value is an object whose span runs to `end`, every member of it
+    /// is canonical, and some of its own keys' hashes repeat: a repeated key,
+    /// or two distinct keys sharing a 64-bit hash. Only the wide tier reports
+    /// this ([`scan_canonical_object_wide`]); a repeat the pairwise tier finds
+    /// is [`Declined`](Self::Declined), and so is a repeat in a nested object.
+    RepeatedKeys {
+        /// One past the object's closing `}`.
+        end: usize,
+        /// The hashes more than one key has, sorted and deduplicated. Each is
+        /// a [`key_hash`] of a key's raw span, the bytes between its quotes
+        /// with any escape left as written ([`raw_key_hash`]).
+        shared: Vec<u64>,
+    },
+    /// Anything else the scan declines.
+    Declined,
+}
+
+/// [`canonical_compact_jq_span_end_at_depth`], also saying when the value is
+/// an object the scan declined only on its own keys' hashes (#7310).
+///
+/// The wide tier settles an object's key hashes at its closing `}`, after
+/// every member has been certified, so a repeat found there leaves nothing
+/// unchecked but the repeat itself. A caller that would otherwise walk the
+/// object to hash every key and learn which hashes repeat, and whether it is
+/// well formed, has all of that already.
+#[must_use]
+pub(crate) fn canonical_compact_jq_scan_at_depth(bytes: &[u8], depth: usize) -> CanonicalScan {
+    let mut scan = ScanState::new();
+    match scan_canonical_value(bytes, 0, depth, &mut scan) {
+        Some(end) => CanonicalScan::Canonical(end),
+        // The scan stops at its first fault, so at most one object recorded
+        // a repeat, and it is the value itself exactly when its members sit
+        // one level below the starting depth: a nested object's sit deeper.
+        None => match scan.repeated_keys {
+            Some(RepeatedKeys {
+                member_depth,
+                end,
+                shared,
+            }) if member_depth == depth + 1 => CanonicalScan::RepeatedKeys { end, shared },
+            _ => CanonicalScan::Declined,
+        },
+    }
+}
+
+/// The canonical scan's running state: the [`SpecialMask`] its string arm
+/// walks, and the one record [`canonical_compact_jq_scan_at_depth`] reads
+/// back after a decline (#7310).
+///
+/// `repr(C)` with the mask first, so `&mut scan.specials` is the state's own
+/// address: left to order the fields, the compiler put the record first, and
+/// offsetting the pointer on every key cost the wide loop 2 instructions per
+/// key on a 7950X.
+#[repr(C)]
+struct ScanState {
+    specials: SpecialMask,
+    /// Set by [`scan_canonical_object_wide`] when it declines at its closing
+    /// `}` only because its keys' hashes repeat. Written at most once per
+    /// scan, since that decline ends the scan.
+    repeated_keys: Option<RepeatedKeys>,
+}
+
+/// [`ScanState::repeated_keys`]: how deep the members of the object that
+/// declined on its keys were scanned (one more than the object itself), where
+/// it ends, and which of its key hashes repeat.
+struct RepeatedKeys {
+    member_depth: usize,
+    end: usize,
+    shared: Vec<u64>,
+}
+
+impl ScanState {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            specials: SpecialMask::new(),
+            repeated_keys: None,
+        }
+    }
+}
+
+/// The hash the canonical scan gives a key (#7310): [`key_hash`] of its raw
+/// span, the bytes between its quotes with any escape left as written, or
+/// `None` for a key that is not a string token.
+///
+/// Within one certified object it identifies keys exactly as their decoded
+/// spellings do, because the scan only certifies a key spelled the one way
+/// jq's writer spells it, so two keys have the same raw span exactly when
+/// they decode to the same string. It differs from [`key_hash_of`]'s decoded
+/// hash for a key with an escape in it, which is why a caller holding the
+/// scan's shared hashes compares keys under this one.
+pub(crate) fn raw_key_hash<W: AsRef<[u64]> + Clone>(key: &StandardJson<'_, W>) -> Option<u64> {
+    match key {
+        StandardJson::String(s) => {
+            let (raw, _escaped, _has_del) = s.raw_and_escaped();
+            (raw.len() >= 2).then(|| key_hash(&raw[1..raw.len() - 1]))
+        }
+        _ => None,
+    }
 }
 
 /// The whole-buffer form of `canonical_compact_jq_span_end`: true iff
@@ -4043,16 +4211,16 @@ fn scan_canonical_value(
     bytes: &[u8],
     pos: usize,
     depth: usize,
-    specials: &mut SpecialMask,
+    scan: &mut ScanState,
 ) -> Option<usize> {
     if depth >= MAX_VALUE_TREE_DEPTH {
         return None;
     }
     let byte = *bytes.get(pos)?;
     match byte {
-        b'{' => scan_canonical_object(bytes, pos, depth, specials),
-        b'[' => scan_canonical_array(bytes, pos, depth, specials),
-        b'"' => scan_json_string_span(bytes, pos, specials).map(|(.., end)| end),
+        b'{' => scan_canonical_object(bytes, pos, depth, scan),
+        b'[' => scan_canonical_array(bytes, pos, depth, scan),
+        b'"' => scan_json_string_span(bytes, pos, &mut scan.specials).map(|(.., end)| end),
         b't' => scan_canonical_literal(bytes, pos, b"true"),
         b'f' => scan_canonical_literal(bytes, pos, b"false"),
         b'n' => scan_canonical_literal(bytes, pos, b"null"),
@@ -4238,7 +4406,7 @@ fn scan_canonical_object(
     bytes: &[u8],
     pos: usize,
     depth: usize,
-    specials: &mut SpecialMask,
+    scan: &mut ScanState,
 ) -> Option<usize> {
     debug_assert_eq!(bytes.get(pos), Some(&b'{'));
     let mut i = pos + 1;
@@ -4259,7 +4427,7 @@ fn scan_canonical_object(
         if bytes.get(i) != Some(&b'"') {
             return None;
         }
-        let (key_start, key_end, after_key) = scan_json_string_span(bytes, i, specials)?;
+        let (key_start, key_end, after_key) = scan_json_string_span(bytes, i, &mut scan.specials)?;
         let fp = key_span_fingerprint(&bytes[i..after_key]);
         let repeat = (0..small_count).any(|j| {
             let (s, e) = small_spans[j];
@@ -4289,12 +4457,12 @@ fn scan_canonical_object(
                 hashes.push(key_hash(&bytes[s..e]));
             }
             hashes.push(key_hash(&bytes[key_start..key_end]));
-            return scan_canonical_object_wide(bytes, after_key, depth, specials, hashes);
+            return scan_canonical_object_wide(bytes, after_key, depth, scan, hashes);
         }
         if bytes.get(after_key) != Some(&b':') {
             return None;
         }
-        i = scan_canonical_value(bytes, after_key + 1, depth + 1, specials)?;
+        i = scan_canonical_value(bytes, after_key + 1, depth + 1, scan)?;
         match bytes.get(i) {
             Some(b',') => i += 1,
             Some(b'}') => return Some(i + 1),
@@ -4313,7 +4481,7 @@ fn scan_canonical_object(
 /// ([`KeyHashes::has_repeat`]). A table grown key by key was 83 Ir per key
 /// on a wide object, about half of it rehashing what it had already
 /// placed. An object of [`KeyHashes::SATURATING_KEYS`] keys or more, too
-/// wide for that table, is settled by [`any_hash_repeats`] instead, the
+/// wide for that table, is settled by [`shared_key_hashes_if_any`] instead, the
 /// sort every other batch caller uses past the table's ceiling (#7293).
 /// It used to be declined there, which made the scan of its first 786,432
 /// keys pure waste: every caller then walks the object, and the walk
@@ -4336,50 +4504,85 @@ fn scan_canonical_object_wide(
     bytes: &[u8],
     mut after_key: usize,
     depth: usize,
-    specials: &mut SpecialMask,
+    scan: &mut ScanState,
     mut hashes: Vec<u64>,
 ) -> Option<usize> {
+    // The members' depth, the one depth the loop needs: also the one the
+    // record names, so that no second depth stays live across the loop (with
+    // the object's own depth kept for the record, it cost the loop a stack
+    // reload per key on a 7950X, #7310).
+    let depth = depth + 1;
     loop {
         if bytes.get(after_key) != Some(&b':') {
             return None;
         }
-        let mut i = scan_canonical_value(bytes, after_key + 1, depth + 1, specials)?;
+        let mut i = scan_canonical_value(bytes, after_key + 1, depth, scan)?;
         match bytes.get(i) {
             Some(b',') => i += 1,
             Some(b'}') => {
                 // Below the table's ceiling the exactly sized table settles the list; at or
                 // past it, the sort (#7293). Branched here rather than in a helper so the
                 // table's settle stays inlined into this loop, as it was before the sort.
-                let repeat = if hashes.len() < KeyHashes::SATURATING_KEYS {
-                    KeyHashes::has_repeat(&hashes)
-                } else {
-                    sorted_keys_repeat(hashes)
-                };
-                return (!repeat).then_some(i + 1);
+                // A repeat the table finds, and every list past the ceiling,
+                // go to the sort, which names the hashes that repeat (#7310).
+                if hashes.len() < KeyHashes::SATURATING_KEYS && !KeyHashes::has_repeat(&hashes) {
+                    return Some(i + 1);
+                }
+                return record_repeated_keys(scan, depth, i + 1, sorted_keys_shared(hashes));
             }
             _ => return None,
         }
         if bytes.get(i) != Some(&b'"') {
             return None;
         }
-        let (key_start, key_end, next_after_key) = scan_json_string_span(bytes, i, specials)?;
+        let (key_start, key_end, next_after_key) =
+            scan_json_string_span(bytes, i, &mut scan.specials)?;
         hashes.push(key_hash(&bytes[key_start..key_end]));
         after_key = next_after_key;
     }
 }
 
-/// Whether any two of an object's key hashes are equal, for an object of
-/// [`KeyHashes::SATURATING_KEYS`] keys or more (#7293): [`any_hash_repeats`]'s
-/// sort, since an exactly sized table would outgrow the table's ceiling there
-/// and [`KeyHashes::has_repeat`] only answers the conservative `true`. Both are
-/// conservative in the same way: two distinct keys sharing a 64-bit hash count
-/// as a repeat, which declines the span. Out of line, so that the sort does
-/// not cost `has_repeat` its inlining into `scan_canonical_object_wide`: with
-/// both behind one inlined helper the table lost it, and the scan of `wide`
-/// 10 MB read 1.8 M more instructions (7950X).
+/// Records an object [`scan_canonical_object_wide`] declines at its closing
+/// `}` only because the hashes in `shared` repeat among its keys, its members
+/// scanned at `member_depth` and the object ending at `end` (#7310), and
+/// declines it; or, when `shared` is empty, certifies it.
+///
+/// Every member is certified by then, so the record is all a caller needs to
+/// skip its own walk of the keys ([`CanonicalScan::RepeatedKeys`]). Out of
+/// line and cold, so that the loop's common exit stays as small as it was.
+#[cold]
 #[inline(never)]
-fn sorted_keys_repeat(hashes: Vec<u64>) -> bool {
-    any_hash_repeats(hashes)
+fn record_repeated_keys(
+    scan: &mut ScanState,
+    member_depth: usize,
+    end: usize,
+    shared: Vec<u64>,
+) -> Option<usize> {
+    if shared.is_empty() {
+        return Some(end);
+    }
+    scan.repeated_keys = Some(RepeatedKeys {
+        member_depth,
+        end,
+        shared,
+    });
+    None
+}
+
+/// The key hashes that occur more than once, for an object of
+/// [`KeyHashes::SATURATING_KEYS`] keys or more (#7293, #7310):
+/// [`shared_key_hashes_if_any`]'s sort, since an exactly sized table would outgrow
+/// the table's ceiling there and [`KeyHashes::has_repeat`] only answers the
+/// conservative `true`. Both are conservative in the same way: two distinct
+/// keys sharing a 64-bit hash count as a repeat, which declines the span. The
+/// list rather than a yes/no, so that a decline hands the caller the hashes
+/// the keys share (#7310). Out of line, so that the sort does not cost
+/// `has_repeat` its inlining into `scan_canonical_object_wide`: with both
+/// behind one inlined helper the table lost it, and the scan of `wide` 10 MB
+/// read 1.8 M more instructions (7950X).
+#[inline(never)]
+fn sorted_keys_shared(hashes: Vec<u64>) -> Vec<u64> {
+    shared_key_hashes_if_any(hashes)
 }
 
 /// The array-token rule: `[`, then either an immediate `]` or `value`
@@ -4388,7 +4591,7 @@ fn scan_canonical_array(
     bytes: &[u8],
     pos: usize,
     depth: usize,
-    specials: &mut SpecialMask,
+    scan: &mut ScanState,
 ) -> Option<usize> {
     debug_assert_eq!(bytes.get(pos), Some(&b'['));
     let mut i = pos + 1;
@@ -4396,7 +4599,7 @@ fn scan_canonical_array(
         return Some(i + 1);
     }
     loop {
-        i = scan_canonical_value(bytes, i, depth + 1, specials)?;
+        i = scan_canonical_value(bytes, i, depth + 1, scan)?;
         match bytes.get(i) {
             Some(b',') => i += 1,
             Some(b']') => return Some(i + 1),
@@ -4770,8 +4973,17 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
         // reaching it: `stream_json` has no ascii parameter at all, and
         // every caller that wants ascii-escaped output routes around this
         // method entirely rather than calling it with `JqCompat`.
-        if indent.is_compact() && !sort_keys && numbers == JsonConvention::JqCompat {
-            if let Some(span) = self.canonical_compact_span(0) {
+        //
+        // One scan answers both layouts (#7271 for the indented one, below),
+        // and its decline on a wide object's repeated keys hands the
+        // re-render the hashes it needs (#7310, below too).
+        let scan = if !sort_keys && numbers == JsonConvention::JqCompat {
+            self.canonical_compact_scan(0)
+        } else {
+            CanonicalSpan::Declined
+        };
+        if indent.is_compact() {
+            if let CanonicalSpan::Echo(span) = scan {
                 return Ok(out.write_str(span)?);
             }
             // Falls through to the general re-render path below -- no text
@@ -4804,28 +5016,33 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
         // (whitespace inside it, a spelling jq rewrites, a repeated key,
         // invalid UTF-8, a fault) keep the whole-value buffer below, and with
         // it jq's print-nothing on a malformed document. The compact case
-        // asked the scan already, above.
-        if !indent.is_compact() && !sort_keys && numbers == JsonConvention::JqCompat {
-            if let Some(span) = self.canonical_compact_span(0) {
-                let mut chunked = ChunkedWrite {
-                    out,
-                    buf: String::new(),
-                };
-                write_reindented(&mut chunked, span, indent.width, indent.unit)?;
-                return Ok(chunked.finish()?);
-            }
+        // returned its echo already, above.
+        if let CanonicalSpan::Echo(span) = scan {
+            let mut chunked = ChunkedWrite {
+                out,
+                buf: String::new(),
+            };
+            write_reindented(&mut chunked, span, indent.width, indent.unit)?;
+            return Ok(chunked.finish()?);
         }
         let mut buf = String::new();
-        stream_json_pretty(
-            &mut buf,
-            value,
-            0,
-            indent.width,
-            indent.unit,
-            sort_keys,
-            numbers,
-            0,
-        )?;
+        match (scan, value) {
+            // #7310: the scan certified every member of this object and
+            // declined only on its keys' hashes. See `stream_scanned_repeats`.
+            (CanonicalSpan::RepeatedKeys(shared), StandardJson::Object(fields)) => {
+                stream_scanned_repeats(&mut buf, fields, &shared, indent, numbers)?;
+            }
+            (_, value) => stream_json_pretty(
+                &mut buf,
+                value,
+                0,
+                indent.width,
+                indent.unit,
+                sort_keys,
+                numbers,
+                0,
+            )?,
+        }
         Ok(out.write_str(&buf)?)
     }
 
@@ -6084,6 +6301,63 @@ fn stream_json_planned_fields<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
         first = false;
     }
     Ok(())
+}
+
+/// The unsorted `JqCompat` print, compact or indented, of a root object the
+/// canonical scan certified member by member and declined only because the
+/// hashes in `shared` repeat among its keys (#7310,
+/// [`CanonicalSpan::RepeatedKeys`]).
+///
+/// Such an object is well formed, the scan has hashed every key and found
+/// which hashes repeat, and since its span is valid UTF-8 every key decodes:
+/// everything the object arm's `repeat_plan_checked` takes a key-only walk
+/// for, hashing every key and sorting the hashes. So the plan is built from
+/// the scan's list straight away, comparing each key under the scan's own hash
+/// ([`raw_key_hash`]), and the fields are written by the object arm's own
+/// [`stream_json_planned_fields`]. The plan groups keys by their decoded
+/// spelling, so when the shared hashes turn out to be a bare collision between
+/// different keys there is no plan, and the object is printed by the object
+/// arm, which costs that rare object its key walk.
+///
+/// Out of line and cold: it is the rare branch of [`JsonCursor::stream_json`],
+/// whose echo arms are the common ones.
+#[cold]
+#[inline(never)]
+fn stream_scanned_repeats<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
+    out: &mut Out,
+    fields: JsonFields<'_, W>,
+    shared: &[u64],
+    indent: IndentSpec,
+    numbers: JsonConvention,
+) -> StreamResult {
+    let Some(plan) = repeat_plan_from_shared(&fields, shared, raw_key_hash) else {
+        return stream_json_pretty(
+            out,
+            StandardJson::Object(fields),
+            0,
+            indent.width,
+            indent.unit,
+            false,
+            numbers,
+            0,
+        );
+    };
+    out.write_char('{')?;
+    stream_json_planned_fields(
+        out,
+        fields,
+        plan,
+        indent.width,
+        indent.width,
+        indent.unit,
+        numbers,
+        0,
+    )?;
+    if indent.width > 0 {
+        out.write_char('\n')?;
+        write_json_indent(out, 0, indent.unit)?;
+    }
+    Ok(out.write_char('}')?)
 }
 
 /// One object member of [`stream_json_pretty`]'s object arm -- the
@@ -8708,7 +8982,7 @@ mod tests {
     /// The table tier's width ceiling (#2608 review, #3333, #7293):
     /// [`KeyHashes`] stops growing at its own ceiling, so from
     /// `KeyHashes::SATURATING_KEYS` keys `scan_canonical_object_wide` settles
-    /// its list by sorting it (`any_hash_repeats`) rather than through a
+    /// its list by sorting it (`shared_key_hashes_if_any`) rather than through a
     /// table. Until #7293 it declined there, so every caller re-walked an
     /// object it had already hashed 786,432 keys of.
     ///
@@ -8763,7 +9037,253 @@ mod tests {
                 !is_canonical_compact_jq_span(&repeat),
                 "a last key repeating the first declines at {keys} keys"
             );
+            // #7310: and says it declined on the keys alone, on either side
+            // of the ceiling (the table below it, the sort from it).
+            assert_eq!(
+                canonical_compact_jq_scan_at_depth(&repeat, 0),
+                CanonicalScan::RepeatedKeys {
+                    end: repeat.len(),
+                    shared: vec![key_hash(b"k000000")],
+                },
+                "a repeat at {keys} keys is reported as one"
+            );
         }
+    }
+
+    /// #7310: [`canonical_compact_jq_scan_at_depth`] reports
+    /// [`CanonicalScan::RepeatedKeys`] for exactly the value that is a wide
+    /// object declining on its own keys' hashes, and nothing else the scan
+    /// declines, and hands back exactly the hashes that repeat. A wrong
+    /// `RepeatedKeys` would send a malformed object past the walk that refuses
+    /// it, so every neighbour of the one shape that earns it is held to
+    /// `Declined`: the repeat found by the pairwise tier, a repeat in a nested
+    /// object, a fault before or after the repeated key, a fault inside a
+    /// later value, and an object that never closes.
+    #[test]
+    fn canonical_scan_reports_only_its_own_keys_repeat_7310() {
+        let repeated = |doc: &str, depth: usize| match canonical_compact_jq_scan_at_depth(
+            doc.as_bytes(),
+            depth,
+        ) {
+            CanonicalScan::RepeatedKeys { end, shared } => Some((end, shared)),
+            _ => None,
+        };
+        let repeat = wide_canonical_object(40, Some((3, 30)));
+        let repeat = String::from_utf8(repeat).unwrap();
+        let want = Some((repeat.len(), vec![key_hash(b"k0003")]));
+        assert_eq!(repeated(&repeat, 0), want);
+        // The starting depth is the caller's, and the record is compared to it.
+        assert_eq!(repeated(&repeat, 7), want);
+        // Two repeated keys, one of them three times: each hash once, sorted.
+        let doc = wide_canonical_object(40, Some((3, 30)))
+            .into_iter()
+            .map(char::from)
+            .collect::<String>()
+            .replacen("\"k0031\"", "\"k0017\"", 1)
+            .replacen("\"k0032\"", "\"k0017\"", 1);
+        let mut both = vec![key_hash(b"k0003"), key_hash(b"k0017")];
+        both.sort_unstable();
+        assert_eq!(repeated(&doc, 0), Some((doc.len(), both)));
+        // An escaped key is hashed as written, escape and all.
+        let escaped = repeat.replace("\"k0003\"", "\"k\\n3\"");
+        assert_eq!(
+            repeated(&escaped, 0),
+            Some((escaped.len(), vec![key_hash(b"k\\n3")]))
+        );
+        // A canonical object is still `Canonical`.
+        let clean = String::from_utf8(wide_canonical_object(40, None)).unwrap();
+        assert_eq!(
+            canonical_compact_jq_scan_at_depth(clean.as_bytes(), 0),
+            CanonicalScan::Canonical(clean.len())
+        );
+        // The whole span is the object's even with bytes after it.
+        let trailing = format!("{repeat} 1");
+        assert_eq!(repeated(&trailing, 0), want);
+
+        let declined = [
+            // The pairwise tier finds a repeat at the key and stops there.
+            String::from_utf8(wide_canonical_object(10, Some((2, 7)))).unwrap(),
+            String::from_utf8(wide_canonical_object(40, Some((2, 7)))).unwrap(),
+            // The repeat is a nested object's, not the value's.
+            format!("[{repeat}]"),
+            format!("{{\"a\":{repeat}}}"),
+            format!("[1,{repeat},2]"),
+            // A fault ahead of the closing brace ends the scan first: in a
+            // value before the repeat, after it, in a key, a stray space.
+            repeat.replacen(":1,", ":1e3,", 1),
+            repeat.replacen(":31,", ":1e3,", 1),
+            repeat.replacen(":31,", ":[1 ],", 1),
+            repeat.replacen("\"k0035\"", "\"k\\/35\"", 1),
+            repeat.replacen(",\"k0039\"", ", \"k0039\"", 1),
+            // Never closes, and so never settles its hashes.
+            repeat[..repeat.len() - 1].to_owned(),
+            format!("{},", &repeat[..repeat.len() - 1]),
+        ];
+        for doc in &declined {
+            assert_eq!(
+                canonical_compact_jq_scan_at_depth(doc.as_bytes(), 0),
+                CanonicalScan::Declined,
+                "{doc}"
+            );
+        }
+        // A nested object's repeat is `RepeatedKeys` only when it is the value
+        // asked about: from its parent it is a decline, as above.
+        let nested = format!("{{\"a\":{repeat}}}");
+        let index = JsonIndex::build(nested.as_bytes());
+        let inner = index.root(nested.as_bytes()).first_child().unwrap();
+        let inner = inner.next_sibling().unwrap();
+        assert_eq!(
+            inner.canonical_compact_scan(1),
+            CanonicalSpan::RepeatedKeys(vec![key_hash(b"k0003")])
+        );
+        assert_eq!(
+            index.root(nested.as_bytes()).canonical_compact_scan(0),
+            CanonicalSpan::Declined
+        );
+        // The scan leaves UTF-8 to its caller, and the cursor declines an
+        // object that is not: a key that will not decode needs the walk that
+        // compares every key.
+        let mut invalid = repeat.clone().into_bytes();
+        let at = invalid.windows(7).position(|w| w == b"\"k0005\"").unwrap() + 3;
+        invalid[at] = 0xFF;
+        assert!(matches!(
+            canonical_compact_jq_scan_at_depth(&invalid, 0),
+            CanonicalScan::RepeatedKeys { .. }
+        ));
+        let index = JsonIndex::build(&invalid);
+        assert_eq!(
+            index.root(&invalid).canonical_compact_scan(0),
+            CanonicalSpan::Declined
+        );
+    }
+
+    /// #7310: `stream_json` prints an object the scan declined on its keys
+    /// from a repeat plan built on the scan's own hashes, and that must print
+    /// what the re-render (`stream_json_pretty`, whose plan takes a key walk of
+    /// its own) prints, compact and indented. The key alphabet has escaped keys
+    /// in it, whose scan hash differs from the walk's decoded one: comparing
+    /// them under the wrong hash would leave a repeat uncollapsed. Seeded wide objects over a key alphabet small enough to repeat
+    /// often, with values that are themselves canonical or not, nested
+    /// objects that repeat their own keys, escaped and multi-byte keys, and
+    /// the odd fault: every outcome of the scan comes up, and each document
+    /// is held to the re-render whatever the scan said.
+    #[test]
+    fn repeated_keys_print_as_the_rerender_does_7310() {
+        use rand::{RngExt, SeedableRng};
+        use rand_chacha::ChaCha8Rng;
+
+        const KEYS: &[&str] = &[
+            "a",
+            "b",
+            "k0",
+            "k1",
+            "\\n",
+            "\\u0001",
+            "\\\"q",
+            "\u{e9}",
+            "\u{1f600}",
+            "x y",
+        ];
+        // The first `CANONICAL` are jq's own spelling (jq 1.7.1 keeps `1.0`
+        // and `1.50` as written); the rest it rewrites, or repeat a key.
+        const CANONICAL: usize = 12;
+        const VALUES: &[&str] = &[
+            "0",
+            "-1",
+            "1.5",
+            "1.0",
+            "null",
+            "true",
+            "\"s\"",
+            "\"\u{e9}\\n\"",
+            "[]",
+            "{}",
+            "[1,2]",
+            "{\"b\":[{\"c\":null}]}",
+            "1e3",
+            "\"\\u00e9\"",
+            "[1, 2]",
+            "{\"a\":1,\"a\":2}",
+        ];
+
+        // The first `PAIRWISE_SPAN_SCAN_LIMIT` keys are distinct, since a
+        // repeat among them is the pairwise tier's and declines at the key;
+        // later ones come from the small alphabet a quarter of the time. A
+        // value is a fault (`VALUES`' non-canonical tail) only in a `dirty`
+        // document, so that most documents get as far as the closing brace.
+        fn object(rng: &mut ChaCha8Rng, depth: usize, dirty: bool, out: &mut String) {
+            let fields = if depth == 0 {
+                rng.random_range(PAIRWISE_SPAN_SCAN_LIMIT + 1..60)
+            } else {
+                rng.random_range(0..24)
+            };
+            out.push('{');
+            for i in 0..fields {
+                if i > 0 {
+                    out.push(',');
+                }
+                if i <= PAIRWISE_SPAN_SCAN_LIMIT || rng.random_range(0..4) > 0 {
+                    out.push_str(&format!("\"d{i}\":"));
+                } else {
+                    out.push_str(&format!("\"{}\":", KEYS[rng.random_range(0..KEYS.len())]));
+                }
+                if depth < 2 && rng.random_range(0..8) == 0 {
+                    object(rng, depth + 1, dirty, out);
+                } else {
+                    let values = if dirty { VALUES.len() } else { CANONICAL };
+                    out.push_str(VALUES[rng.random_range(0..values)]);
+                }
+            }
+            out.push('}');
+        }
+
+        let indents = [
+            IndentSpec::COMPACT,
+            IndentSpec {
+                width: 2,
+                unit: ' ',
+            },
+            IndentSpec {
+                width: 1,
+                unit: '\t',
+            },
+        ];
+        let mut rng = ChaCha8Rng::seed_from_u64(7310);
+        let mut repeated = 0;
+        for _ in 0..1500 {
+            let mut doc = String::new();
+            let dirty = rng.random_range(0..4) == 0;
+            object(&mut rng, 0, dirty, &mut doc);
+            let index = JsonIndex::build(doc.as_bytes());
+            let root = index.root(doc.as_bytes());
+            if matches!(
+                root.canonical_compact_scan(0),
+                CanonicalSpan::RepeatedKeys(_)
+            ) {
+                repeated += 1;
+            }
+            for indent in indents {
+                let mut gate = String::new();
+                let gate = root
+                    .stream_json(&mut gate, indent, false, JsonConvention::JqCompat)
+                    .map(|()| gate);
+                let mut rerender = String::new();
+                let rerender = stream_json_pretty(
+                    &mut rerender,
+                    root.value(),
+                    0,
+                    indent.width,
+                    indent.unit,
+                    false,
+                    JsonConvention::JqCompat,
+                    0,
+                )
+                .map(|()| rerender);
+                assert_eq!(gate.ok(), rerender.ok(), "{indent:?} {doc}");
+            }
+        }
+        // The sweep has to reach the new branch often enough to mean anything.
+        assert!(repeated > 100, "only {repeated} documents declined on keys");
     }
 
     /// Same load-bearing direction as the corpus test above --
