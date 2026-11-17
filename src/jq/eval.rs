@@ -13742,6 +13742,16 @@ pub(crate) mod owned_pipe_copies {
     }
 }
 
+/// Whether a pipe's first stage is a parenthesised pattern bind (`(. as [$x] ?// $x | $x) | ...`).
+///
+/// Such a bind has to stay alive while a later stage raises, so that the error unwinds into the
+/// bind's next alternative as jq's does (#3410). Every route that folds a pipe a stage at a time
+/// asks this one question, in both evaluators, so that none of them runs the bind to completion
+/// first (#7337).
+pub(crate) fn starts_with_pattern_bind(stages: &[Expr]) -> bool {
+    matches!(stages.first(), Some(Expr::Paren(inner)) if matches!(inner.as_ref(), Expr::AsPattern { .. }))
+}
+
 /// The stages after the current one, plus the owned `Expr::Pipe` copy that
 /// [`eval_each_owned`] needs of them -- built at most once, and only if the
 /// rest cannot be answered without it (#1598, #3673, #3682).
@@ -42442,9 +42452,7 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // one is: the recursive calls pass it rather than walk.
     let effect_before_last = effect_before_last
         .unwrap_or_else(|| S::PIPE_EFFECTS_RUN_DEPTH_FIRST && stages_effect_before_last(exprs));
-    if effect_before_last
-        || matches!(exprs.first(), Some(Expr::Paren(inner)) if matches!(inner.as_ref(), Expr::AsPattern { .. }))
-    {
+    if effect_before_last || starts_with_pattern_bind(exprs) {
         let mut outputs = Vec::new();
         let mut conversion_error = None;
         // The path-context check at the top of this function has passed, so no

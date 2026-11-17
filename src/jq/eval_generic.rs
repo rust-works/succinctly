@@ -95,10 +95,13 @@ use super::eval::{
     StashedVerdict, YqSemantics, DEFERRED_BIND_UNRESOLVED, MAX_RANGE_TOTAL,
 };
 use super::eval::{
+    contains_retrying_pattern_bind, owned_slot_mut, starts_with_pattern_bind, static_path_steps,
+    StepKey,
+};
+use super::eval::{
     format_yq_commented, format_yq_props_commented, yq_encoder_prints_leading_block,
     yq_encoder_reads_spelling, yq_encoder_writes_comments, yq_props_format_style,
 };
-use super::eval::{owned_slot_mut, static_path_steps, StepKey};
 #[cfg(test)]
 use super::expr::FuncDefBound;
 use super::expr::TomlCommentSource;
@@ -10393,6 +10396,29 @@ impl<V: DocumentValue> GenericResult<V> {
         }
     }
 
+    /// Whether this is one of the lazy variants [`Self::materialize_lazy`] forces.
+    fn is_lazy(&self) -> bool {
+        // Exhaustive, as `generic_result_is_empty` is: the next lazy variant has to be placed
+        // here, and in `materialize_lazy`, or this does not compile.
+        match self {
+            Self::LazyKeys { .. }
+            | Self::LazyIndexRange(_)
+            | Self::LazySeq(_)
+            | Self::LazyObject(_) => true,
+            Self::One(_)
+            | Self::OneCursor(_)
+            | Self::Many(_)
+            | Self::ManyCursor(_)
+            | Self::ManyOwned(_)
+            | Self::Owned(_)
+            | Self::Error(_)
+            | Self::Break(_)
+            | Self::Halt(_)
+            | Self::Partial(..)
+            | Self::None => false,
+        }
+    }
+
     /// Materialize any lazy variant (`LazyKeys`/`LazyIndexRange`/`LazySeq`)
     /// into `Owned`/`Error`/`Break`, leaving every other variant unchanged.
     /// The shared collapse point for every consumer that was always going to
@@ -14950,6 +14976,35 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
 ) -> GenericResult<V> {
     for (j, expr) in stages.iter().enumerate() {
+        // #7337: see `fold_pipe_stages_sink`. The stages, which hold a `?//` bind, run as one pipe
+        // over each value in hand, so a later stage's error retries the bind's next alternative.
+        // Ahead of the group fast path below, which runs a rest group by group and would not.
+        // A lazy value is forced first; a `ManyOwned` is what a nested `.[a:b][]` stage leaves.
+        // An `Owned` that arrived as one is not touched: it already runs the bind with the rest.
+        if must_run_through_bind(&current, &stages[j..]) {
+            let was_lazy = current.is_lazy();
+            let forced = if was_lazy {
+                current.materialize_lazy::<S>()
+            } else {
+                current
+            };
+            match forced {
+                GenericResult::Owned(owned) if was_lazy => {
+                    return fold_owned_values_through_bind::<S, V>(
+                        core::iter::once(owned),
+                        &stages[j..],
+                        optional,
+                    );
+                }
+                GenericResult::ManyOwned(owned) => {
+                    return fold_owned_values_through_bind::<S, V>(owned, &stages[j..], optional);
+                }
+                // Anything else is not for this fold to settle: a failed force (`Error`, `Break`,
+                // `Halt`) is the answer, and the cursor and single-value variants already run
+                // the rest of the pipe per value, past `eval_single_pipe`'s own guard.
+                other => current = other,
+            }
+        }
         // #7282: `.[]` over `group_by`'s groups with more of the pipe after it runs that rest on
         // each group's cursors, where the arms below decoded every group first. Only the shapes of
         // the stage and of its input are read here, so any other pipe pays a comparison or two.
@@ -15186,6 +15241,43 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
     }
 
     current
+}
+
+/// Whether `stages` hold a `?//` bind anywhere (#7337): `((. as [$x] ?// $x | $x))` and a bind
+/// inside a sub-pipe as much as one that opens a stage. A value that meets them one stage at a
+/// time must not, since the bind has to be live when a later stage raises.
+fn stages_hold_retrying_bind(stages: &[Expr]) -> bool {
+    stages.iter().any(contains_retrying_pattern_bind)
+}
+
+/// Whether the eager fold has to run `stages` as one pipe over `current` (#7337): a lazy value, or
+/// a `ManyOwned`, and a bind in the stages. Asked of the value's shape first, so a pipe without
+/// either pays a comparison.
+fn must_run_through_bind<V: DocumentValue>(current: &GenericResult<V>, stages: &[Expr]) -> bool {
+    (current.is_lazy() || matches!(current, GenericResult::ManyOwned(_)))
+        && stages_hold_retrying_bind(stages)
+}
+
+/// The stages `rest`, which hold a `?//` bind, run as one pipe over each of `values` in order
+/// (#7337): a later stage's error unwinds into the bind's next alternative for that value, as in
+/// jq. The outputs before an error stay, as they do on every route that streams them.
+fn fold_owned_values_through_bind<S: EvalSemantics, V: DocumentValue>(
+    values: impl IntoIterator<Item = OwnedValue>,
+    rest: &[Expr],
+    optional: bool,
+) -> GenericResult<V> {
+    let mut rest = RestPipe::new(rest);
+    let mut collected: Vec<OwnedValue> = Vec::new();
+    for value in values {
+        let flow = rest.run_owned::<S>(&value, optional, Reentry::REBUILT, &mut |v| {
+            collected.push(v);
+            Demand::Continue
+        });
+        if let Flow::Escaped(control) = flow {
+            return partial_generic(collected, control);
+        }
+    }
+    owned_vec_to_generic_result(collected)
 }
 
 /// One step of folding a `GenericResult::LazyKeys` through a single further
@@ -16639,6 +16731,15 @@ fn fold_pipe_stages_sink<S: EvalSemantics, V: DocumentValue>(
         if j == stages.len() {
             return drain_result_generic(current, sink);
         }
+        // #7337: a lazy value that has a `?//` bind anywhere in the stages still to run is forced
+        // here, and goes on to the `Owned` arm below, which runs them as one pipe through
+        // `run_owned`: a later stage's error (or the consumer's stop) then unwinds into the bind's
+        // next alternative as in jq. The per-stage fold would run the bind to completion first.
+        // Forced at the first stage, so nothing it leaves reaches a later stage lazy or as a
+        // `ManyOwned` with the bind still to come.
+        if current.is_lazy() && stages_hold_retrying_bind(&stages[j..]) {
+            current = current.materialize_lazy::<S>();
+        }
         let expr = &stages[j];
         let rest = &stages[j + 1..];
         let is_iterate = matches!(unwrap_paren(expr), Expr::Iterate);
@@ -17218,8 +17319,7 @@ fn eval_single_pipe_stages<S: EvalSemantics, V: DocumentValue>(
 
     // Keep the bind alive while a downstream stop/error unwinds into
     // its next alternative; the eager fold below runs it too soon.
-    if matches!(exprs.first(), Some(Expr::Paren(inner)) if matches!(inner.as_ref(), Expr::AsPattern { .. }))
-    {
+    if starts_with_pattern_bind(exprs) {
         return collect_each_generic::<S, V>(whole.get(exprs), value, optional, cursor);
     }
 
@@ -57240,6 +57340,91 @@ mod tests {
             prefix.iter().map(|s| (*s).to_string()).collect(),
             Box::new(Summary::Break("out".to_string())),
         )
+    }
+
+    /// #7337: the eager fold (`eval_generic::eval`, which the CLI's sink route does not reach for
+    /// these shapes) runs the stages from a `?//` bind on as one pipe over a lazy sequence or over
+    /// the values a nested `.[a:b][]` stage leaves, so a later stage's error retries the bind's
+    /// next alternative. Every expectation was verified against jq 1.7.1.
+    #[test]
+    fn the_eager_fold_retries_a_bind_met_by_a_lazy_value_on_a_later_error_7337() {
+        let json = br#"[{"a":2,"b":"x"},{"a":1,"b":"y"},{"a":2,"b":"z"}]"#;
+        let bind = "(. as [$x] ?// $x | $x)";
+        let retried = Summary::Error("Cannot index array with string \"b\"".to_string());
+        // A lone group (`first` reads it out of the lazy `group_by`) and the `ManyOwned` a
+        // slice-then-iterate stage leaves.
+        for filter in [
+            format!("group_by(.a) | first | {bind} | .b + 1"),
+            format!("group_by(.a) | .[0:2][] | {bind} | .b + 1"),
+        ] {
+            assert_eq!(summarize(json, &filter), retried, "{filter}");
+        }
+        // The same over a `map` sequence, whose elements have to be arrays for the first
+        // alternative to bind them.
+        assert_eq!(
+            summarize(
+                br#"[[{"a":2,"b":"x"}],[{"a":1,"b":"y"}],[{"a":3,"b":"z"}]]"#,
+                &format!("map(.) | .[0:2][] | {bind} | .b + 1")
+            ),
+            retried
+        );
+        // The bind need not open its stage: doubly parenthesised, or inside a sub-pipe.
+        assert_eq!(
+            summarize(json, &format!("group_by(.a) | first | (({bind})) | .b + 1")),
+            retried
+        );
+        // Not without `std`: the retry of a bind nested in a sub-pipe rides on a thread-local
+        // retry generation that `no_std` has none of (`direct_pattern_retry` is all it has).
+        #[cfg(feature = "std")]
+        assert_eq!(
+            summarize(
+                json,
+                &format!("group_by(.a) | .[0:2][] | ({bind} | .b) | . + 1")
+            ),
+            retried
+        );
+        // A `ManyOwned` the stage before the bind leaves: `[1]` binds, `["a"]` raises in the stage
+        // after it and retries `$x` as the array, which raises again.
+        assert_eq!(
+            summarize(
+                b"null",
+                r#"([1],["a"]) | (. as [$x] ?// $x | $x) | if type == "string" then error("s") else . + 1 end"#
+            ),
+            partial_err(&["2"], "array ([\"a\"]) and number (1) cannot be added")
+        );
+        // The retry is per value, and what an earlier value answered stays: the first group's
+        // `.b` is `"y"`, the second group's first alternative raises `late` and its second `arr`.
+        assert_eq!(
+            summarize(
+                json,
+                &format!(
+                    r#"group_by(.a) | .[0:2][] | {bind} | if type == "object" then (if .a == 1 then .b else error("late") end) else error("arr") end"#
+                )
+            ),
+            partial_err(&["\"y\""], "arr")
+        );
+        // The retried alternative's own output is the answer where it succeeds.
+        assert_eq!(
+            summarize(
+                json,
+                &format!(
+                    r#"group_by(.a) | .[0:2][] | {bind} | if type == "array" then length else error("e") end"#
+                )
+            ),
+            Summary::Values(vec!["1".to_string(), "2".to_string()])
+        );
+        // No later stage raises, so the first alternative stands (the bound element, not the array).
+        for (filter, expected) in [
+            (format!("map(.) | {bind} | length"), "2"),
+            (format!("group_by(.a) | {bind} | length"), "1"),
+            (format!("group_by(.a) | .[0:2] | {bind} | length"), "1"),
+        ] {
+            assert_eq!(
+                summarize(json, &filter),
+                Summary::Values(vec![expected.to_string()]),
+                "{filter}"
+            );
+        }
     }
 
     #[test]
