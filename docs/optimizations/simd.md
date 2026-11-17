@@ -66,7 +66,15 @@ unsafe fn classify_avx2(data: &[u8; 32]) -> u32 {
 }
 ```
 
-**Result in succinctly**: 78% faster JSON parsing vs SSE2.
+**Result in succinctly**: the JSON index builders no longer differ by width. Since #7305
+the AVX2 and SSE2 builders share one branch-free kernel (`json::simd::step`), and AVX2 is
+used only for the 32-byte in-string skip test. The three field masks are read as two
+16-byte halves in both. On a Ryzen 9 7950X, measured alone, that was 15-20% faster for the
+whole AVX2 kernel than one 32-byte load, shift and `movemask` per mask, on every input that
+is not mostly long strings. The `vpinsrb` chains that gather
+the stored bytes are the same in both builds. The likely cause is that the first half's
+masks no longer wait for the second half's chain and the 128-to-256-bit merge, but that
+was not isolated.
 
 ### AVX-512
 

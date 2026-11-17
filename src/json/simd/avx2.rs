@@ -7,8 +7,9 @@
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
+use super::step::BlockMasks;
 use crate::json::simple::{SemiIndex as SimpleSemiIndex, State as SimpleState};
-use crate::json::standard::{SemiIndex, State, STATES, STEP_CLOSE, STEP_IB, STEP_OPEN, STEP_TABLE};
+use crate::json::standard::SemiIndex;
 use crate::json::BitWriter;
 
 /// ASCII byte constants
@@ -76,45 +77,42 @@ unsafe fn classify_chars(chunk: __m256i) -> CharClass {
     }
 }
 
-/// The BP bits four bytes emit, indexed by their open bits (low nibble) and close
-/// bits (high nibble): the bits in the low byte, their count in the high byte.
-///
-/// A byte with both bits writes `10` (open, then close), so only open bits are ever
-/// set and a close only advances the count.
-static BP_NIBBLE: [u16; 256] = build_bp_nibble();
+/// The AVX2 answers to the shared kernel's per-block questions: one 32-byte
+/// compare and `movemask` for the skip test, and the SSE2 kernel's two 16-byte
+/// halves for the field masks.
+struct Avx2;
 
-const fn build_bp_nibble() -> [u16; 256] {
-    let mut table = [0u16; 256];
-    let mut idx = 0;
-    while idx < 256 {
-        let (open, close) = (idx & 0xF, idx >> 4);
-        let (mut bits, mut len) = (0u16, 0u16);
-        let mut i = 0;
-        while i < 4 {
-            if (open >> i) & 1 != 0 {
-                bits |= 1 << len;
-                len += 1;
-            }
-            if (close >> i) & 1 != 0 {
-                len += 1;
-            }
-            i += 1;
+impl BlockMasks for Avx2 {
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn specials(block: &[u8; 32]) -> u32 {
+        unsafe {
+            let chunk = _mm256_loadu_si256(block.as_ptr().cast::<__m256i>());
+            let specials = _mm256_or_si256(
+                _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(DOUBLE_QUOTE)),
+                _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(BACKSLASH)),
+            );
+            _mm256_movemask_epi8(specials) as u32
         }
-        table[idx] = bits | len << 8;
-        idx += 1;
     }
-    table
-}
 
-/// Low five bits of a [`STEP_TABLE`] field when the state is `InString`.
-const IN_STRING_SHIFT: u32 = 8 * State::InString as u32;
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn phi_masks(fields: &[u8; 32]) -> [u32; 3] {
+        // Two 16-byte halves, not one 32-byte `movemask` per mask: see
+        // `phi_masks_in_halves` for the measurement.
+        // SAFETY: SSE2 is part of the x86_64 baseline.
+        unsafe { super::x86::phi_masks_in_halves(fields) }
+    }
+}
 
 /// Build a semi-index from JSON bytes using SIMD-accelerated Standard Cursor algorithm.
 ///
 /// The state machine runs one `STEP_TABLE` load and one shift per byte, with no
-/// branch on the input; AVX2 then pulls each 32-byte block's IB, BP-open and
-/// BP-close bits out of the stored fields with three `movemask`s, and skips a block
-/// that lies wholly inside a string without stepping it. The per-byte `match` this
+/// branch on the input; each 32-byte block's IB, BP-open and BP-close bits are
+/// then pulled out of the stored fields with `movemask`s, and a run of blocks that
+/// lies wholly inside a string is skipped without stepping it. The kernel is
+/// `json::simd::step`'s, shared with the SSE2 builder. The per-byte `match` it
 /// replaced (#7299) kept both writers' state in memory and ran about three
 /// data-dependent branches per byte. It was 1.2x (all-backslash strings) to about
 /// 50x (long strings) slower, and its speed on a Ryzen 9 7950X moved by up to 10% with
@@ -128,76 +126,8 @@ pub fn build_semi_index_standard(json: &[u8]) -> SemiIndex {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn build_semi_index_standard_avx2(json: &[u8]) -> SemiIndex {
-    unsafe {
-        let word_capacity = json.len().div_ceil(64);
-        let mut ib = BitWriter::with_capacity(word_capacity);
-        let mut bp = BitWriter::with_capacity(word_capacity * 2);
-        let v_quote = _mm256_set1_epi8(DOUBLE_QUOTE);
-        let v_backslash = _mm256_set1_epi8(BACKSLASH);
-        // The last step's field; its low five bits are `8 * state index`.
-        let mut field: u32 = 0;
-        let mut fields = [0u8; 32];
-
-        let mut blocks = json.chunks_exact(32);
-        for block in &mut blocks {
-            if field & 0x1F == IN_STRING_SHIFT {
-                let chunk = _mm256_loadu_si256(block.as_ptr().cast::<__m256i>());
-                let specials = _mm256_or_si256(
-                    _mm256_cmpeq_epi8(chunk, v_quote),
-                    _mm256_cmpeq_epi8(chunk, v_backslash),
-                );
-                if _mm256_movemask_epi8(specials) == 0 {
-                    // Every byte stays in the string: IB 0, no BP.
-                    ib.write_zeros(32);
-                    continue;
-                }
-            }
-            for (slot, &c) in fields.iter_mut().zip(block) {
-                field = STEP_TABLE[c as usize].wrapping_shr(field);
-                *slot = field as u8;
-            }
-            // `movemask` reads bit 7 of each byte, so shift the open (bit 6) and
-            // close (bit 5) bits up to it; a 16-bit lane shift is fine because
-            // only each byte's own lower bits move into its bit 7.
-            let v = _mm256_loadu_si256(fields.as_ptr().cast::<__m256i>());
-            let ib_bits = _mm256_movemask_epi8(v) as u32;
-            let opens = _mm256_movemask_epi8(_mm256_slli_epi16::<1>(v)) as u32;
-            let closes = _mm256_movemask_epi8(_mm256_slli_epi16::<2>(v)) as u32;
-            const _: () = assert!(STEP_IB == 7 && STEP_OPEN == 6 && STEP_CLOSE == 5);
-
-            // At most two BP bits per byte, so 32 bytes fill at most one word.
-            let mut bp_bits: u64 = 0;
-            let mut bp_len: u32 = 0;
-            let mut k = 0;
-            while k < 32 {
-                let nibble = ((opens >> k) & 0xF) | ((closes >> k) & 0xF) << 4;
-                let entry = BP_NIBBLE[nibble as usize];
-                bp_bits |= u64::from(entry & 0xFF) << bp_len;
-                bp_len += u32::from(entry >> 8);
-                k += 4;
-            }
-            ib.write_bits(u64::from(ib_bits), 32);
-            bp.write_bits(bp_bits, bp_len as usize);
-        }
-
-        // Fewer than 32 bytes left: step them one at a time.
-        for &c in blocks.remainder() {
-            field = STEP_TABLE[c as usize].wrapping_shr(field);
-            ib.write_bit((field >> STEP_IB) & 1 != 0);
-            if (field >> STEP_OPEN) & 1 != 0 {
-                bp.write_1();
-            }
-            if (field >> STEP_CLOSE) & 1 != 0 {
-                bp.write_0();
-            }
-        }
-
-        SemiIndex {
-            state: STATES[((field >> 3) & 3) as usize],
-            ib: ib.finish(),
-            bp: bp.finish(),
-        }
-    }
+    // SAFETY: this function's own `avx2` feature is `Avx2`'s.
+    unsafe { super::step::build_semi_index_standard::<Avx2>(json) }
 }
 
 // ============================================================================
@@ -524,6 +454,26 @@ mod tests {
             assert_eq!(simd.bp, scalar.bp, "BP, pad {pad}");
             assert_eq!(simd.state, scalar.state, "state, pad {pad}");
         }
+    }
+
+    /// The shared kernel's differential suite, over the AVX2 builder (#7305).
+    #[test]
+    fn test_avx2_standard_kernel_suite() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        crate::json::simd::step::suite::all(build_semi_index_standard);
+    }
+
+    /// AVX2's answers to the shared kernel's per-block questions are the portable
+    /// reference's (#7305).
+    #[test]
+    fn test_avx2_block_masks_agree_with_portable() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        // SAFETY: AVX2 was detected above.
+        unsafe { crate::json::simd::step::suite::masks_agree::<Avx2>() };
     }
 
     // ========================================================================
