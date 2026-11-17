@@ -594,8 +594,14 @@ impl WindowedFile {
                     let fault_at_end = last && split_error.is_some() && self.read_error.is_none();
                     self.certify(&values, fault_at_end);
                 }
-                // #7322: the warnings met in the text this window ends.
-                let met = self.notes.partition_point(|&(at, _)| at < self.validated);
+                // #7322: the warnings met in the text this window ends. #7341: the last window takes every
+                // one left: a warning met at the RS the stream is handed on from (a stretch's piece
+                // ends on it) comes after this window's values, and before anything handed on.
+                let met = if last {
+                    self.notes.len()
+                } else {
+                    self.notes.partition_point(|&(at, _)| at < self.validated)
+                };
                 let notes: Vec<(usize, String)> = self.notes.drain(..met).collect();
                 let text = self.held.as_deref().unwrap_or(&self.buf);
                 return Ok(Some(Window {
@@ -890,7 +896,7 @@ impl WindowedFile {
             let (from, delta) = (self.validated, text.len() as isize - raw_len as isize);
             let moved = |at: usize| {
                 if at < from {
-                    at
+                    at // patchcov: coverage tolerate-line reason="defensive: the gate's positions are past what was validated before, and a warning before the region is one a window has not handed out yet, which the region's text cannot move"
                 } else if at >= end {
                     at.checked_add_signed(delta)
                         .expect("past the region, which keeps its bytes")
@@ -3725,10 +3731,21 @@ mod tests {
         let records = seq_stream(5, b"");
         let warn_line = [b"\x1e".as_slice(), &[b'}'; 1000], b"\n"].concat();
         let lines = |n: usize| warn_line.repeat(n);
+        // A line that draws more warnings than a piece's walk keeps, between bad records: the piece it
+        // is cut into is handed on with the rest of the stream.
+        let flood = [b"\x1e".as_slice(), &vec![b'}'; 70_000], b"\n"].concat();
         let streams = [
             [records.as_slice(), &lines(200), &records].concat(),
             [records.as_slice(), &lines(200)].concat(),
             b"\x1e\"\xff\"\n\x1e1\n".repeat(3000),
+            [
+                records.as_slice(),
+                b"\x1e[1,]\n",
+                &flood,
+                b"\x1e[1,]\n",
+                &records,
+            ]
+            .concat(),
         ];
         for stream in &streams {
             check_gated_windows(stream, &[4096, 65536, 1 << 20], false);
@@ -3799,6 +3816,9 @@ mod tests {
         );
         let short = [records.as_slice(), b"\x1e[1,]\n\x1e\"", &vec![b'x'; 1000]].concat();
         assert!(matches!(gate(&short), GateStep::Clean(at) if at == records.len()));
+        // A plain record still being read, with no RS after it yet, is waited for.
+        let pending = [records.as_slice(), b"\x1e{\"a\":", &vec![b'1'; 1000]].concat();
+        assert!(matches!(gate(&pending), GateStep::Clean(at) if at == records.len()));
         // Bad records, one a line, for longer than a piece: cut before the one that would take it past.
         let bad_record = b"\x1e[1,]\n";
         let bad: Vec<u8> = bad_record.repeat(SEQ_STRETCH_PIECE / bad_record.len() + 10);
