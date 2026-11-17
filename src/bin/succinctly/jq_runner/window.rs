@@ -79,6 +79,8 @@ pub(super) const MIN_WINDOWED_FILE_BYTES: u64 = 4 * WINDOW_BYTES as u64;
 /// then keeps resident beside the tail (1 MiB at the run's peak).
 const SEQ_UNOPENED_BLOCK_BYTES: usize = 4096;
 
+const _: () = assert!(SEQ_UNOPENED_BLOCK_BYTES < WINDOW_BYTES);
+
 /// The window size for a `--seq` file read from byte `start`: [`WINDOW_BYTES`], or
 /// [`SEQ_UNOPENED_BLOCK_BYTES`] when the stream does not open with an RS, which the gate hands on at
 /// its first byte (#7312). Only the size of the reads differs, never the answers: the windows of a
@@ -2834,7 +2836,6 @@ mod tests {
         assert_eq!(seq_block_bytes(&shifted, 1), WINDOW_BYTES);
         assert_eq!(seq_block_bytes(&shifted, 0), SEQ_UNOPENED_BLOCK_BYTES);
         assert_eq!(seq_block_bytes(&shifted, 99), SEQ_UNOPENED_BLOCK_BYTES);
-        assert!(SEQ_UNOPENED_BLOCK_BYTES < WINDOW_BYTES);
     }
 
     fn open(text: &[u8], block: usize) -> WindowedFile {
