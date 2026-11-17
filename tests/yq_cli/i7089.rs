@@ -465,3 +465,72 @@ fn the_block_under_a_first_marker_is_the_first_nodes_foot_after_a_byte_order_mar
     }
     Ok(())
 }
+
+// Family 4 (slice 3): the head comment of a scalar root after a byte-order mark.
+//
+// After a mark yq sets no header aside, so the comment ahead of a document's content is the head of
+// its first node, and yq's encoder writes a head comment for a collection and not for a scalar root.
+// `# lead` / `5` is `5` under `-P .`, `. = 6` is `6` whatever the root was (a mapping or sequence that
+// had the comment included), and `.a = 1` over the scalar leaves `5`; the comment stayed as the head
+// here. A plain `.` prints none either, `head_comment` still reads it, and a result that is a
+// collection keeps it. Rows are yq v4.53.3's output on the input behind a mark.
+
+fn assert_rows_after_bom(rows: &[(&str, &[&str], &str, &str)]) -> Result<()> {
+    for &(input, flags, filter, expected) in rows {
+        let (out, status) = run_yq_stdin(filter, &format!("\u{feff}{input}"), flags)?;
+        assert_eq!(
+            (out.as_str(), status),
+            (expected, 0),
+            "{filter} {flags:?} on {input:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A scalar result written as the first document's root drops the comment the mark left on the node.
+#[test]
+fn a_scalar_root_after_a_bom_writes_no_head_comment_7089() -> Result<()> {
+    assert_rows_after_bom(&[
+        ("# lead\n5\n", &["-P"], ".", "5\n"),
+        ("# lead\n5\n", &[], ". = 6", "6\n"),
+        ("# lead\n5\n", &[], ". |= 6", "6\n"),
+        ("# lead\n5\n", &[], ".a = 1", "5\n"),
+        ("# lead\n5\n", &[], ". style=\"double\"", "5\n"),
+        ("# lead\n\"s\"\n", &["-P"], ".", "s\n"),
+        ("# lead\n\"s\"\n", &[], ". = 6", "6\n"),
+        ("# lead\nnull\n", &["-P"], ".", "null\n"),
+        ("# lead\ntrue\n", &["-P"], ".", "true\n"),
+        ("# l1\n\n# l2\n5\n", &["-P"], ".", "5\n"),
+        ("# a\n# b\n5\n", &["-P"], ".", "5\n"),
+        ("\n# lead\n5\n", &["-P"], ".", "5\n"),
+        ("# lead\n---\n5\n", &["-P"], ".", "5\n"),
+        ("# lead\n5\n# foot\n", &["-P"], ".", "5\n"),
+        ("# lead\n5 # line\n", &["-P"], ".", "5\n"),
+        ("# lead\n[1]\n", &[], ". = 6", "6\n"),
+        ("# lead\n{a: 1}\n", &[], ". = 6", "6\n"),
+        ("# lead\n- 1\n", &[], ". |= 6", "6\n"),
+        ("# lead\na: 1\n", &["-P"], ". = 6", "6\n"),
+    ])
+}
+
+/// What agrees: a plain read prints no comment for a scalar, a collection result keeps it, and the
+/// metadata of a read reads it.
+#[test]
+fn a_collection_result_keeps_the_head_comment_and_a_read_prints_none_7089() -> Result<()> {
+    assert_rows_after_bom(&[
+        ("# lead\n5\n", &[], ".", "5\n"),
+        ("# lead\n\"s\"\n", &[], ".", "s\n"),
+        (
+            "# lead\n5\n",
+            &["-o=json", "-I0"],
+            "[head_comment, foot_comment]",
+            "[\"lead\",\"\"]\n",
+        ),
+        ("# lead\n{a: 1}\n", &[], ".a = 2", "# lead\n{a: 2}\n"),
+        ("# lead\n[1]\n", &[], ". = [7]", "# lead\n[7]\n"),
+        ("# lead\n[1]\n", &[], ". = {\"b\": 2}", "# lead\nb: 2\n"),
+        ("# lead\na: 1\n", &["-P"], ".", "# lead\na: 1\n"),
+        ("# lead\n- 1\n", &[], ".[0] = 9", "# lead\n- 9\n"),
+        ("# lead\nnull\n", &[], ".a = 1", "# lead\na: 1\n"),
+    ])
+}
