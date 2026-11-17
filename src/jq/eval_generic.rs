@@ -57378,12 +57378,20 @@ mod tests {
             retried
         );
         // The bind need not open its stage: doubly parenthesised, or inside a sub-pipe.
-        for filter in [
-            format!("group_by(.a) | first | (({bind})) | .b + 1"),
-            format!("group_by(.a) | .[0:2][] | ({bind} | .b) | . + 1"),
-        ] {
-            assert_eq!(summarize(json, &filter), retried, "{filter}");
-        }
+        assert_eq!(
+            summarize(json, &format!("group_by(.a) | first | (({bind})) | .b + 1")),
+            retried
+        );
+        // Not without `std`: the retry of a bind nested in a sub-pipe rides on a thread-local
+        // retry generation that `no_std` has none of (`direct_pattern_retry` is all it has).
+        #[cfg(feature = "std")]
+        assert_eq!(
+            summarize(
+                json,
+                &format!("group_by(.a) | .[0:2][] | ({bind} | .b) | . + 1")
+            ),
+            retried
+        );
         // The retry is per value, and what an earlier value answered stays: the first group's
         // `.b` is `"y"`, the second group's first alternative raises `late` and its second `arr`.
         assert_eq!(
