@@ -146,3 +146,24 @@ fn a_stop_after_the_first_output_retries_the_bind_over_a_slice_of_groups_7337() 
     );
     Ok(())
 }
+
+/// The bind need not open its stage: parenthesised twice, or inside a sub-pipe, it still has to be
+/// live when the next stage raises. Over a plain array these always retried; a group did not.
+#[test]
+fn a_bind_inside_parentheses_or_a_sub_pipe_retries_over_a_group_7337() -> Result<()> {
+    let bound = r"(. as [$x] ?// $x | $x)";
+    for filter in [
+        format!("group_by(.a)[] | (({bound})) | .b + 1"),
+        format!("group_by(.a) | .[0:2][] | (({bound})) | .b + 1"),
+        format!("[group_by(.a)[] | ({bound} | .b) | . + 1]"),
+        format!("group_by(.a)[] | (.[0:1] | {bound}) | .b + 1"),
+    ] {
+        let (stdout, stderr, code) = run(GROUPS, &filter)?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            ("", RETRIED, 5),
+            "{filter}"
+        );
+    }
+    Ok(())
+}

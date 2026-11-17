@@ -95,10 +95,13 @@ use super::eval::{
     StashedVerdict, YqSemantics, DEFERRED_BIND_UNRESOLVED, MAX_RANGE_TOTAL,
 };
 use super::eval::{
+    contains_retrying_pattern_bind, owned_slot_mut, starts_with_pattern_bind, static_path_steps,
+    StepKey,
+};
+use super::eval::{
     format_yq_commented, format_yq_props_commented, yq_encoder_prints_leading_block,
     yq_encoder_reads_spelling, yq_encoder_writes_comments, yq_props_format_style,
 };
-use super::eval::{owned_slot_mut, starts_with_pattern_bind, static_path_steps, StepKey};
 #[cfg(test)]
 use super::expr::FuncDefBound;
 use super::expr::TomlCommentSource;
@@ -10395,13 +10398,25 @@ impl<V: DocumentValue> GenericResult<V> {
 
     /// Whether this is one of the lazy variants [`Self::materialize_lazy`] forces.
     fn is_lazy(&self) -> bool {
-        matches!(
-            self,
+        // Exhaustive, as `generic_result_is_empty` is: the next lazy variant has to be placed
+        // here, and in `materialize_lazy`, or this does not compile.
+        match self {
             Self::LazyKeys { .. }
-                | Self::LazyIndexRange(_)
-                | Self::LazySeq(_)
-                | Self::LazyObject(_)
-        )
+            | Self::LazyIndexRange(_)
+            | Self::LazySeq(_)
+            | Self::LazyObject(_) => true,
+            Self::One(_)
+            | Self::OneCursor(_)
+            | Self::Many(_)
+            | Self::ManyCursor(_)
+            | Self::ManyOwned(_)
+            | Self::Owned(_)
+            | Self::Error(_)
+            | Self::Break(_)
+            | Self::Halt(_)
+            | Self::Partial(..)
+            | Self::None => false,
+        }
     }
 
     /// Materialize any lazy variant (`LazyKeys`/`LazyIndexRange`/`LazySeq`)
@@ -14961,6 +14976,35 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
 ) -> GenericResult<V> {
     for (j, expr) in stages.iter().enumerate() {
+        // #7337: see `fold_pipe_stages_sink`. The stages, which hold a `?//` bind, run as one pipe
+        // over each value in hand, so a later stage's error retries the bind's next alternative.
+        // Ahead of the group fast path below, which runs a rest group by group and would not.
+        // A lazy value is forced first; a `ManyOwned` is what a nested `.[a:b][]` stage leaves.
+        // An `Owned` that arrived as one is not touched: it already runs the bind with the rest.
+        if must_run_through_bind(&current, &stages[j..]) {
+            let was_lazy = current.is_lazy();
+            let forced = if was_lazy {
+                current.materialize_lazy::<S>()
+            } else {
+                current
+            };
+            match forced {
+                GenericResult::Owned(owned) if was_lazy => {
+                    return fold_owned_values_through_bind::<S, V>(
+                        core::iter::once(owned),
+                        &stages[j..],
+                        optional,
+                    );
+                }
+                GenericResult::ManyOwned(owned) => {
+                    return fold_owned_values_through_bind::<S, V>(owned, &stages[j..], optional);
+                }
+                // Anything else is not for this fold to settle: a failed force (`Error`, `Break`,
+                // `Halt`) is the answer, and the cursor and single-value variants already run
+                // the rest of the pipe per value, past `eval_single_pipe`'s own guard.
+                other => current = other,
+            }
+        }
         // #7282: `.[]` over `group_by`'s groups with more of the pipe after it runs that rest on
         // each group's cursors, where the arms below decoded every group first. Only the shapes of
         // the stage and of its input are read here, so any other pipe pays a comparison or two.
@@ -14987,34 +15031,6 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
                     }
                     Err(other) => other,
                 };
-            }
-        }
-        // #7337: see `fold_pipe_stages_sink`. The stages from a `?//` bind on run as one pipe
-        // over each value in hand, so a later stage's error retries the bind's next alternative.
-        // A lazy value is forced first; a `ManyOwned` is what a nested `.[a:b][]` stage leaves.
-        // An `Owned` that arrived as one is not touched: it already runs the bind with the rest.
-        if starts_with_pattern_bind(&stages[j..]) {
-            let was_lazy = current.is_lazy();
-            let forced = if was_lazy {
-                current.materialize_lazy::<S>()
-            } else {
-                current
-            };
-            match forced {
-                GenericResult::Owned(owned) if was_lazy => {
-                    return fold_owned_values_through_bind::<S, V>(
-                        core::iter::once(owned),
-                        &stages[j..],
-                        optional,
-                    );
-                }
-                GenericResult::ManyOwned(owned) => {
-                    return fold_owned_values_through_bind::<S, V>(owned, &stages[j..], optional);
-                }
-                // Anything else is not for this fold to settle: a failed force (`Error`, `Break`,
-                // `Halt`) is the answer, and the cursor and single-value variants already run
-                // the rest of the pipe per value, past `eval_single_pipe`'s own guard.
-                other => current = other,
             }
         }
         current = match current {
@@ -15227,7 +15243,16 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
     current
 }
 
-/// The stages `rest`, which open with a `?//` bind, run as one pipe over each of `values` in order
+/// Whether a value that is lazy, or a `ManyOwned`, can go on one stage at a time through `stages`
+/// (#7337): not when they hold a `?//` bind anywhere (`((. as [$x] ?// $x | $x))` and a bind inside
+/// a sub-pipe as much as one that opens a stage), since the bind must still be live when a later
+/// stage raises. Asked of the value's shape first, so a pipe without one pays a comparison.
+fn must_run_through_bind<V: DocumentValue>(current: &GenericResult<V>, stages: &[Expr]) -> bool {
+    (current.is_lazy() || matches!(current, GenericResult::ManyOwned(_)))
+        && stages.iter().any(contains_retrying_pattern_bind)
+}
+
+/// The stages `rest`, which hold a `?//` bind, run as one pipe over each of `values` in order
 /// (#7337): a later stage's error unwinds into the bind's next alternative for that value, as in
 /// jq. The outputs before an error stay, as they do on every route that streams them.
 fn fold_owned_values_through_bind<S: EvalSemantics, V: DocumentValue>(
@@ -16706,7 +16731,7 @@ fn fold_pipe_stages_sink<S: EvalSemantics, V: DocumentValue>(
         // which runs them through `run_owned`; a `ManyOwned` (what a nested `.[a:b][]` stage
         // leaves) goes element by element to the driver that serves a lazy sequence's elements.
         // The per-stage fold would run the bind to completion first.
-        if starts_with_pattern_bind(&stages[j..]) {
+        if must_run_through_bind(&current, &stages[j..]) {
             if current.is_lazy() {
                 current = current.materialize_lazy::<S>();
             }
@@ -57352,6 +57377,13 @@ mod tests {
             ),
             retried
         );
+        // The bind need not open its stage: doubly parenthesised, or inside a sub-pipe.
+        for filter in [
+            format!("group_by(.a) | first | (({bind})) | .b + 1"),
+            format!("group_by(.a) | .[0:2][] | ({bind} | .b) | . + 1"),
+        ] {
+            assert_eq!(summarize(json, &filter), retried, "{filter}");
+        }
         // The retry is per value, and what an earlier value answered stays: the first group's
         // `.b` is `"y"`, the second group's first alternative raises `late` and its second `arr`.
         assert_eq!(
