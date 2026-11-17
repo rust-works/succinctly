@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use crate::fifo_feed::{self, Feed};
-use crate::{spawn_jq, succinctly_bin};
+use crate::fifo_feed::{self, spawn_jq_deadline, Feed};
+use crate::succinctly_bin;
 
 const STREAMS: [(&[u8], &str); 3] = [
     (b"\x1e\"\xff\"\n\x1e2\n", "invalid UTF-8"),
@@ -30,8 +30,8 @@ fn a_pipe_named_as_a_file_reads_as_the_stream_named_dash_does_7200() -> Result<(
             let mut dash = named.clone();
             named.push("/dev/stdin");
             dash.push("-");
-            let (by_name, name_status) = spawn_jq(&named, Some(bytes))?;
-            let (by_dash, dash_status) = spawn_jq(&dash, Some(bytes))?;
+            let (by_name, name_status) = spawn_jq_deadline(&named, Some(bytes))?;
+            let (by_dash, dash_status) = spawn_jq_deadline(&dash, Some(bytes))?;
             assert_eq!(
                 by_name.stdout, by_dash.stdout,
                 "{flags:?} over {what}: stdout"
@@ -50,12 +50,12 @@ fn a_pipe_named_as_a_file_reads_as_the_stream_named_dash_does_7200() -> Result<(
 
 #[test]
 fn a_pipe_named_as_a_file_keeps_its_values_7200() -> Result<()> {
-    let (out, _) = spawn_jq(
+    let (out, _) = spawn_jq_deadline(
         &["--seq", "-c", ".", "/dev/stdin"],
         Some(b"\xef\xbb\xbf\x1e1\n"),
     )?;
     assert_eq!(out.stdout, b"\x1e1\n");
-    let (out, _) = spawn_jq(
+    let (out, _) = spawn_jq_deadline(
         &["--seq", "-c", "-s", ".", "/dev/stdin"],
         Some(b"\x1e\"\xff\"\n\x1e2\n"),
     )?;
@@ -69,7 +69,10 @@ fn a_fifo_path_with_a_byte_order_mark_does_not_hang_7200() -> Result<()> {
     std::fs::create_dir_all(&dir)?;
     let fifo = dir.join("f");
     // One writer, which writes the bytes once: a second open of the path by the reader used to wait
-    // forever, and with this writer reads an end of file, so the bytes are missing from the output.
+    // for a writer that never came. What a second open does now is the platform's. On Linux it pairs
+    // with the writer's non-blocking open (the end of file it hands a reader, #7304) and reads an end of
+    // file at once, so the bytes are missing from the output. On macOS it was seen to wait until the
+    // deadline below instead. Either way the run fails and says why; neither is a hang.
     let feed = Feed::new(fifo.clone(), b"\xef\xbb\xbf\x1e1\n".to_vec());
     let out = fifo_feed::output_within(
         Command::new(succinctly_bin())
@@ -103,7 +106,7 @@ fn a_pipe_among_several_named_files_is_read_once_7200() -> Result<()> {
             args.extend_from_slice(flags);
             args.push(".");
             args.extend_from_slice(&order);
-            let (out, status) = spawn_jq(&args, Some(b"\xef\xbb\xbf\x1e1\n"))?;
+            let (out, status) = spawn_jq_deadline(&args, Some(b"\xef\xbb\xbf\x1e1\n"))?;
             let err = String::from_utf8_lossy(&out.stderr);
             assert_eq!(status, 0, "{args:?}: {err}");
             let want: &[u8] = if flags.contains(&"-s") {

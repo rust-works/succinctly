@@ -14,7 +14,7 @@ use std::process::{Command, Stdio};
 
 use anyhow::Result;
 
-use crate::spawn_jq;
+use crate::fifo_feed::spawn_jq_deadline;
 
 const LINES: usize = 60_000;
 
@@ -60,7 +60,7 @@ fn with_stdin_file(args: &[&str], bytes: &[u8], offset: u64) -> Result<(Vec<u8>,
 fn with_stdin_pipe(args: &[&str], bytes: &[u8], offset: usize) -> Result<(Vec<u8>, Vec<u8>, i32)> {
     let mut whole = args.to_vec();
     whole.push("/dev/stdin");
-    let (output, status) = spawn_jq(&whole, Some(&bytes[offset..]))?;
+    let (output, status) = spawn_jq_deadline(&whole, Some(&bytes[offset..]))?;
     let stdout = String::from_utf8_lossy(&output.stdout).replace("/dev/stdin", "<stdin>");
     let stderr = String::from_utf8_lossy(&output.stderr).replace("/dev/stdin", "<stdin>");
     Ok((stdout.into_bytes(), stderr.into_bytes(), status))
@@ -195,7 +195,7 @@ fn a_stdin_that_is_also_stdout_is_read_whole_7024() -> Result<()> {
         .output()?;
     assert!(output.status.success(), "{:?}", output.status);
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");
-    let (expected, _) = spawn_jq(&["-c", "."], Some(&bytes))?;
+    let (expected, _) = spawn_jq_deadline(&["-c", "."], Some(&bytes))?;
     let mut written = Vec::new();
     file.seek(SeekFrom::Start(0))?;
     std::io::Read::read_to_end(&mut file, &mut written)?;

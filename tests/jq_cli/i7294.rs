@@ -10,7 +10,7 @@
 
 use anyhow::Result;
 
-use crate::spawn_jq;
+use crate::fifo_feed::spawn_jq_deadline;
 
 /// One line: `{"users":[...],"tail":TAIL}` with `mid` put among the records at the middle, and `end`
 /// in place of the closing brace.
@@ -39,10 +39,10 @@ fn document(mid: &[u8], tail: &[u8], end: &[u8]) -> Vec<u8> {
 /// The run over `bytes` on a pipe, checked against the same bytes read whole: stdout, stderr, status.
 fn piped(args: &[&str], bytes: &[u8]) -> Result<(String, String, i32)> {
     assert!(bytes.len() > 4 << 20, "the pipe must be windowed");
-    let (windowed, status) = spawn_jq(args, Some(bytes))?;
+    let (windowed, status) = spawn_jq_deadline(args, Some(bytes))?;
     let mut whole_args = args.to_vec();
     whole_args.push("/dev/stdin");
-    let (whole, whole_status) = spawn_jq(&whole_args, Some(bytes))?;
+    let (whole, whole_status) = spawn_jq_deadline(&whole_args, Some(bytes))?;
     let out = String::from_utf8_lossy(&windowed.stdout).into_owned();
     let err = String::from_utf8_lossy(&windowed.stderr).into_owned();
     assert_eq!(

@@ -11,7 +11,7 @@
 
 use anyhow::Result;
 
-use crate::spawn_jq;
+use crate::fifo_feed::spawn_jq_deadline;
 
 /// How many records the fixtures have: about 6.5 MiB, well over the 4 MiB a pipe needs to be windowed.
 const RECORDS: usize = 60_000;
@@ -34,10 +34,10 @@ fn same(args: &[&str], bytes: &[u8]) -> Result<(String, String, i32)> {
         bytes.len() > 4 * 1024 * 1024,
         "the pipe must hold enough to be windowed"
     );
-    let (windowed, windowed_status) = spawn_jq(args, Some(bytes))?;
+    let (windowed, windowed_status) = spawn_jq_deadline(args, Some(bytes))?;
     let mut whole_args = args.to_vec();
     whole_args.push("-");
-    let (whole, whole_status) = spawn_jq(&whole_args, Some(bytes))?;
+    let (whole, whole_status) = spawn_jq_deadline(&whole_args, Some(bytes))?;
     let whole_err = String::from_utf8_lossy(&whole.stderr).into_owned();
     let err = String::from_utf8_lossy(&windowed.stderr).into_owned();
     assert!(

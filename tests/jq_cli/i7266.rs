@@ -9,7 +9,7 @@
 
 use anyhow::Result;
 
-use crate::spawn_jq;
+use crate::fifo_feed::spawn_jq_deadline;
 
 /// About 6 MiB of records, so the probe is full and the pipe goes on past it.
 fn records() -> Vec<String> {
@@ -31,10 +31,10 @@ fn join(lines: &[String]) -> Vec<u8> {
 
 /// The windowed run over `bytes` on a pipe, checked against the whole run: its stderr and status.
 fn same(args: &[&str], bytes: &[u8]) -> Result<(String, i32)> {
-    let (windowed, windowed_status) = spawn_jq(args, Some(bytes))?;
+    let (windowed, windowed_status) = spawn_jq_deadline(args, Some(bytes))?;
     let mut whole_args = args.to_vec();
     whole_args.push("/dev/stdin");
-    let (whole, whole_status) = spawn_jq(&whole_args, Some(bytes))?;
+    let (whole, whole_status) = spawn_jq_deadline(&whole_args, Some(bytes))?;
     let whole_err = String::from_utf8_lossy(&whole.stderr).replace("/dev/stdin", "<stdin>");
     let err = String::from_utf8_lossy(&windowed.stderr).into_owned();
     assert!(

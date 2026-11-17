@@ -9,6 +9,10 @@
 
 use anyhow::Result;
 
+// On Unix the run is held to `fifo_feed`'s deadline, which `spawn_jq` has not (#7314).
+#[cfg(unix)]
+use crate::fifo_feed::spawn_jq_deadline as spawn_jq;
+#[cfg(not(unix))]
 use crate::spawn_jq;
 
 /// How many lines the fixtures have: about 6.6 MiB, well over the 4 MiB the route takes, so the
@@ -272,28 +276,27 @@ fn a_document_past_the_depth_limit_is_refused_where_it_is_6920() -> Result<()> {
 #[test]
 fn a_named_pipe_still_delivers_its_bytes_6920() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let fifo = dir.path().join("pipe");
     // Written after the reader has had time to be started: a gate that opened the pipe and dropped it
     // would have paired with this open and closed it on the writer. The pipe and the run's deadline are
-    // `fifo_feed`'s (#7304).
-    let feed = crate::fifo_feed::Feed::after(
-        fifo.clone(),
-        b"{\"a\":1}\n{\"a\":2}\n".to_vec(),
-        std::time::Duration::from_millis(300),
-    );
-    let output = crate::fifo_feed::output(
-        std::process::Command::new(crate::succinctly_bin())
+    // `fifo_feed`'s (#7304), and so is the retry the run had through `spawn_jq` (a spawn that finds no
+    // binary, a child killed by a signal), which makes a new pipe for each attempt (#7314).
+    let (output, status) = crate::fifo_feed::output_retrying(|attempt| {
+        let fifo = dir.path().join(format!("pipe{attempt}"));
+        let feed = crate::fifo_feed::Feed::after(
+            fifo.clone(),
+            b"{\"a\":1}\n{\"a\":2}\n".to_vec(),
+            std::time::Duration::from_millis(300),
+        );
+        let mut command = std::process::Command::new(crate::succinctly_bin());
+        command
             .args(["jq", "-c", ".a"])
             .arg(&fifo)
-            .env("LC_ALL", "C"),
-        std::slice::from_ref(&feed),
-    )?;
+            .env("LC_ALL", "C");
+        (command, vec![feed])
+    })?;
     assert_eq!(
-        (
-            String::from_utf8_lossy(&output.stdout).as_ref(),
-            output.status.code()
-        ),
-        ("1\n2\n", Some(0))
+        (String::from_utf8_lossy(&output.stdout).as_ref(), status),
+        ("1\n2\n", 0)
     );
     Ok(())
 }
