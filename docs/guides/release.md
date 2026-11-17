@@ -175,7 +175,7 @@ setting is `MACOSX_DEPLOYMENT_TARGET` in `.cargo/config.toml`'s `[env]`, so the 
 --release` and the binary `succinctly dev compare jq` times are built the same way, and `release.yml` needs no
 setting of its own. A 12.0 target gets chained fixups, which remove 22,214 rebases into 103 `__DATA_CONST` pages
 from every start (about 0.07 ms of `jq -n 1` on an Apple M4 Pro); the cost is that the archive does not run on
-macOS 11. `tests/macos_deployment_target_tests.rs` reads `minos` and the fixup load command of the built binary.
+macOS 11. `tests/jq_cli/i7321.rs` reads `minos` and the fixup load command of the built binary.
 State the macOS floor in the release notes of the first release that ships this. `cargo install` builds for the
 default target and keeps running on macOS 11. Any build run from inside a source checkout (a clone, a source
 tarball) reads the file too and gets the 12.0 floor, on x86_64 as well as arm64; export `MACOSX_DEPLOYMENT_TARGET`

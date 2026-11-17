@@ -2,8 +2,9 @@
 //!
 //! `.cargo/config.toml` sets `MACOSX_DEPLOYMENT_TARGET`, and nothing else would notice it
 //! going missing: the binary would still run, 0.07 ms slower to start. This reads the load
-//! commands of the binary this test run built.
-#![cfg(all(feature = "cli", target_os = "macos"))]
+//! commands of the binary this test run built. macOS only: no other platform has a deployment target.
+
+#![cfg(target_os = "macos")]
 
 use std::process::Command;
 
