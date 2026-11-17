@@ -25,16 +25,14 @@ unreachable rather than filtering them out afterwards:
   mid-value, which is what exercises the `at EOF` templates, and a lone
   record has no interior RS byte for the stream to end early on.
 
-One artifact remains, a property of jq's 4096-byte `fgets` buffer rather
-than its parser, and it does not survive into a newline-terminated stream:
+A NUL byte is in the alphabet (#7340): jq's `jq_util_input_read_more` measures
+an `fgets` chunk that holds no newline with `strlen`, so the chunk ends at its
+first NUL, and `check_literal` hands a number token to its number parser as a C
+string, so the number ends there too. The reader models both, and `--long`
+generates the records that put a NUL in a full 4095-byte chunk, with a value
+open across the bytes jq drops.
 
-* `jq_util_input_read_more` measures the chunk with `strlen`, so a NUL
-  byte truncates the input -- but only in a chunk holding no newline.
-
-`--expect-artifacts` re-enables the shape that trips it, for confirming it
-is still the only divergence.
-
-A second artifact is not the line reader's but jq's own, and no implementation
+One artifact is not the line reader's but jq's own, and no implementation
 can match it (#7256): `check_literal` reads `tokenbuf[1]` for a bare `n` without
 consulting `tokenpos`, and when no earlier token of the stream has written index 1
 that byte is uninitialised heap (`parser_init` leaves `tokenbuf` null and `token()`
@@ -92,7 +90,7 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 # Structural bytes, both quote-ish characters, digits, the letters that start
 # jq's keywords and decNumber's special forms, and the number punctuation --
 # small enough that random strings collide into real JSON shapes often.
-ALPHABET = b'\x1e{}[]",:0-9abfilnrstuxe \n\\.-+'
+ALPHABET = b'\x1e{}[]",:0-9abfilnrstuxe \n\\.-+\x00'
 
 # BOM prefixes are their own dimension: jq consumes the matching prefix of
 # one *without counting it*, and a prefix that starts a BOM and then
@@ -125,6 +123,16 @@ HAND = [
     b"\x1e1{", b"\x1e1[", b"\x1etrue{", b"\x1e1 2{", b'\x1etrue"', b'\x1e1"',
     b'\x1e"a"{', b"\x1e{}{", b'\x1e"a"[', b"\x1e[0,]\x1e1{", b"\x1e1\x1e{",
     b"\x1e1\n\x1e2{", b"\x1e1}\n\x1e2{", b"\x1e1{ ", b"\x1e1{\n",
+    # #7340: a NUL in a chunk with a newline ends a number; in one without, it ends the chunk.
+    b'\x1e"ab"\n\x1e1\x00\n\x1e7 \n', b"\x1e[1\x00]\n", b"\x1e2.50\x00x\n", b"\x1enan\x00\n",
+    b"\x1etrue\x00\n", b"\x1e\x00\n", b'\x1e"a\x00b"\n', b"\x1e12\x00\x1e3\n", b"\x1e12\x00\x1e3",
+    b"ab\x00\x1e1 2", b"\x1e1 \x00 2", b"\xef\xbb\xbfab\x00cd", b"x\nab\x00cd\x1e1\nzz",
+    b'\x1e"ab" \x00 7 [8] ' + b" " * 5000 + b"9 10\n",
+    b"\x1e[1," + b" " * 4000 + b"\x00garbage" + b" " * 200 + b"2]\n",
+    b'\x1e"x' + b"y" * 4093 + b"\x00zz" + b"w" * 10 + b'"\n',
+    # A NUL jq never sees does not make a BOM malformed, and a BOM can complete across it.
+    b"\xef\xbb\x00" + b" " * 4100 + b"\x1e1\n", b"\xef\xbb\x00" + b" " * 4092 + b"\xbf\x1e1\n",
+    b"\xef\xbb\x00x\n\x1e1\n",
 ]
 
 
@@ -252,6 +260,21 @@ def reads_unwritten_tokenbuf(data):
     return False
 
 
+def visible(data):
+    """The bytes of `data` jq's parser sees (#7340): each 4095-byte `fgets` chunk that holds no
+    newline ends at its first NUL."""
+    out, at = [], 0
+    while at < len(data):
+        newline = data.find(b"\n", at, at + 4095)
+        end = newline + 1 if newline >= 0 else min(at + 4095, len(data))
+        chunk = data[at:end]
+        if newline < 0 and b"\x00" in chunk:
+            chunk = chunk[: chunk.index(b"\x00")]
+        out.append(chunk)
+        at = end
+    return b"".join(out)
+
+
 def artifact(data):
     """Whether `data` trips an artifact of jq itself: the one `fgets`-line-reader
     artifact #2998 left unmodeled, or the uninitialised `tokenbuf` byte (#7256). jq's own end-of-stream rule (an RS closing a record
@@ -260,28 +283,49 @@ def artifact(data):
     scans) is matched now, so the two shapes that used to trip it --
     both properties of that same buffer boundary, not of the parser --
     are no longer here; see the module docstring's history note."""
-    if b"\x00" in data and b"\n" not in data.split(b"\x00", 1)[0]:
-        return True  # strlen truncation, #3+
-    if reads_unwritten_tokenbuf(data):
+    if reads_unwritten_tokenbuf(visible(data)):
         return True  # jq reads uninitialised memory -- #7256, matched by no implementation
-    if RS not in data:
+    if RS not in visible(data):
         # #1525's separate template -- except after a malformed BOM, which
         # makes jq read the stream rather than abandon it, so those stay in.
-        return not malformed_bom(data)
+        # Both are judged on the bytes jq's parser sees (#7340).
+        return not malformed_bom(visible(data))
     return False
 
 
-def random_cases(count, seed, allow_artifacts):
+def long_case(rng, plain):
+    """A stream whose lines run past jq's 4095-byte `fgets` chunk, with NULs in it (#7340): a
+    random record padded with white space, string bytes or array items so that a value is open
+    across the chunk's end, and a NUL placed near that end often enough to cut something."""
+    out = bytearray(rng.choice(BOM_PREFIXES))
+    for _ in range(rng.randint(1, 3)):
+        out += RS + bytes(rng.choice(ALPHABET) for _ in range(rng.randint(0, 6)))
+        filler = rng.choice([b" ", b"y", b"1,", b"[", b'"a",'])
+        out += filler * (rng.randint(3900, 4300) // len(filler))
+        tail = bytearray(rng.choice(plain) for _ in range(rng.randint(1, 24)))
+        if rng.random() < 0.8:
+            tail.insert(rng.randint(0, len(tail)), 0)
+        at = len(out) - rng.randint(0, 120)
+        out[at:at] = tail
+        if rng.random() < 0.7:
+            out += b"\n"
+    return bytes(out)
+
+
+def random_cases(count, seed, allow_artifacts, long_lines=False):
     rng = random.Random(seed)
     plain = bytes(b for b in ALPHABET if b not in (RS[0], 0x0A))
     cases = []
     for _ in range(count):
-        if allow_artifacts:
+        if long_lines:
+            cases.append(long_case(rng, plain))
+        elif allow_artifacts:
             body = bytes(rng.choice(ALPHABET) for _ in range(rng.randint(1, 24)))
             cases.append(body)
         elif rng.random() < 0.7:
             body = bytes(rng.choice(ALPHABET) for _ in range(rng.randint(1, 24)))
-            cases.append(rng.choice(BOM_PREFIXES) + RS + body + b"\n")
+            # Now and then no RS after the BOM prefix, so a NUL can follow it (#7340).
+            cases.append(rng.choice(BOM_PREFIXES) + rng.choice([RS, RS, RS, b""]) + body + b"\n")
         else:
             body = bytes(rng.choice(plain) for _ in range(rng.randint(1, 24)))
             cases.append(rng.choice(BOM_PREFIXES) + RS + body)
@@ -298,6 +342,11 @@ def main():
         "--expect-artifacts",
         action="store_true",
         help="include the line-reader-artifact shapes, to confirm they are still the only divergences",
+    )
+    parser.add_argument(
+        "--long",
+        action="store_true",
+        help="generate streams whose lines run past jq's 4095-byte fgets chunk, with NULs (#7340)",
     )
     parser.add_argument(
         "--slurp-location",
@@ -319,7 +368,7 @@ def main():
     jq, version = resolve_oracle(args.oracle)
     print(f"oracle: {jq} ({version}), succinctly: {args.binary}", file=sys.stderr)
 
-    cases = HAND + random_cases(args.cases, args.seed, args.expect_artifacts)
+    cases = HAND + random_cases(args.cases, args.seed, args.expect_artifacts, args.long)
     stderr_bad, stdout_super, skipped = [], [], 0
     for data in cases:
         if not args.expect_artifacts and artifact(data):

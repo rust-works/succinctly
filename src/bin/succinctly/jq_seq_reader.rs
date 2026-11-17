@@ -117,6 +117,55 @@ pub(crate) fn fgets_chunk_len_at(raw: &[u8], pos: usize) -> Option<usize> {
     Some(find_byte(b'\n', chunk).map_or(chunk.len(), |index| index + 1))
 }
 
+/// The bytes of the stream jq's parser never sees, as absolute `[start, end)` offsets into the
+/// concatenated sources, ascending (#7340): from the first NUL of each `fgets` chunk that holds no
+/// newline to that chunk's end. `jq_util_input_read_more` (`src/util.c`) measures such a chunk with
+/// `strlen`, the buffer being a C string, where a chunk that ends in a newline is measured up to
+/// the newline and handed over whole, its NULs included. The chunks are still `fgets`'s, so the
+/// line count and the refills ([`fgets_chunk_lens`]) do not move; only what the parser scans does.
+///
+/// Empty, after one search for a NUL, for a stream that holds none.
+pub(crate) fn nul_cuts(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> Vec<(usize, usize)> {
+    let mut cuts = Vec::new();
+    let mut source_start = 0usize;
+    for (_, raw) in raw_bytes {
+        if find_byte(0, raw).is_some() {
+            let mut chunk_start = 0usize;
+            for len in fgets_chunk_lens(raw) {
+                let visible = fgets_visible_len(&raw[chunk_start..chunk_start + len]);
+                if visible < len {
+                    cuts.push((
+                        source_start + chunk_start + visible,
+                        source_start + chunk_start + len,
+                    ));
+                }
+                chunk_start += len;
+            }
+        }
+        source_start += raw.len();
+    }
+    cuts
+}
+
+/// How much of one `fgets` chunk jq's parser is handed (#7340): all of a chunk that ends in a
+/// newline, and a chunk that does not up to its first NUL, since `jq_util_input_read_more` measures
+/// that one with `strlen`. The one statement of the rule, for [`nul_cuts`], [`bom_prefix`] and the
+/// streaming parser's refills ([`super::jq_stream_errors`]).
+pub(crate) fn fgets_visible_len(chunk: &[u8]) -> usize {
+    if chunk.last() == Some(&b'\n') {
+        chunk.len()
+    } else {
+        find_byte(0, chunk).unwrap_or(chunk.len())
+    }
+}
+
+/// `bytes` read as a C string, up to its first NUL: what jq's number parser reads of a token
+/// (`check_literal` hands `tokenbuf` to `jv_number_with_literal`, which takes its `strlen`). Shared
+/// by both ports of `check_literal` (#7340).
+pub(crate) fn c_string(bytes: &[u8]) -> &[u8] {
+    &bytes[..find_byte(0, bytes).unwrap_or(bytes.len())]
+}
+
 /// The absolute offsets, ascending, at which jq starts a `jv_parser_next`
 /// that the reader's own byte loop does not already reset at: each source
 /// after the first, since jq refills one file at a time (#3002), and, with
@@ -280,22 +329,37 @@ pub(crate) struct BomPrefix {
     pub(crate) malformed: bool,
 }
 
+/// Only the bytes jq's parser is handed take part (#7340): a NUL that a chunk with no newline ends
+/// at is no byte to jq, so `EF BB` then NUL is a BOM still waiting for its last byte, not a
+/// malformed one. `consumed` is then the offset the scanner starts at, the bytes jq never saw
+/// before it included.
 pub(crate) fn bom_prefix(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> BomPrefix {
-    let mut consumed = 0;
-    for byte in raw_bytes.iter().flat_map(|(_, raw)| raw.iter().copied()) {
-        if consumed == UTF8_BOM.len() || byte != UTF8_BOM[consumed] {
-            // A mismatch at offset 0 just means "no BOM here"; one after a
-            // partial match is the malformed case. Running out of input
-            // mid-BOM is neither -- jq is still waiting for the rest.
-            return BomPrefix {
-                consumed,
-                malformed: consumed > 0 && consumed < UTF8_BOM.len(),
-            };
+    // How many BOM bytes have matched, and where the chunk being read starts (an absolute offset).
+    let mut matched = 0;
+    let mut chunk_start = 0usize;
+    for (_, raw) in raw_bytes {
+        let mut local = 0usize;
+        for len in fgets_chunk_lens(raw) {
+            let chunk = &raw[local..local + len];
+            for (index, &byte) in chunk[..fgets_visible_len(chunk)].iter().enumerate() {
+                if matched == UTF8_BOM.len() || byte != UTF8_BOM[matched] {
+                    // A mismatch at offset 0 just means "no BOM here"; one after a
+                    // partial match is the malformed case. Running out of input
+                    // mid-BOM is neither -- jq is still waiting for the rest.
+                    return BomPrefix {
+                        consumed: chunk_start + index,
+                        malformed: matched > 0 && matched < UTF8_BOM.len(),
+                    };
+                }
+                matched += 1;
+            }
+            // Every byte of the chunk is consumed: matched, or never seen.
+            chunk_start += len;
+            local += len;
         }
-        consumed += 1;
     }
     BomPrefix {
-        consumed,
+        consumed: chunk_start,
         malformed: false,
     }
 }
@@ -952,6 +1016,7 @@ fn walk_stream_placing(
     let bom = bom_prefix(raw_bytes);
     let mut reader = Reader::new(bom, emit);
     reader.collect_faults = collect_faults;
+    reader.scan_cuts = nul_cuts(raw_bytes);
     // jq refills its reader one file at a time, so each source after the
     // first begins its own `jv_parser_next` -- whose malformed-BOM reset the
     // walk must reproduce (#3002). The offsets are the sources' absolute
@@ -1042,6 +1107,13 @@ fn walk_stream_placing(
         // ([`SeqStreamWalk::place_values`], #6620).
         (Vec::new(), std::mem::take(&mut reader.yielded_at))
     };
+    // Both lists are ascending and neither overlaps the other: a scanned NUL stands in a chunk that
+    // ends in a newline, where nothing is cut.
+    let mut cuts = std::mem::take(&mut reader.scan_cuts);
+    if !reader.token_cuts.is_empty() {
+        cuts.append(&mut reader.token_cuts);
+        cuts.sort_unstable();
+    }
     SeqStreamWalk {
         faults,
         slurp_position_lost,
@@ -1049,6 +1121,7 @@ fn walk_stream_placing(
         unplaced,
         deferred_warning,
         values: reader.values,
+        cuts,
     }
 }
 
@@ -1222,6 +1295,11 @@ pub(crate) struct SeqStreamWalk {
     /// its strings, and substitution is scoped per string (#1743), so the
     /// result is the same as substituting the whole document.
     pub(crate) values: Vec<(usize, usize)>,
+    /// The bytes within `values` that are not part of them, as ascending `[start, end)` offsets
+    /// (#7340): what jq's parser never sees ([`nul_cuts`]), and the tail of a number token from a
+    /// NUL in it, which jq's number parser stops at. A value is its range with these taken out
+    /// ([`splice_cuts`]). Empty for a stream with no NUL byte.
+    pub(crate) cuts: Vec<(usize, usize)>,
     /// Parallel to `values` (empty under `-s`): each one's `(source index,
     /// line)`, jq's
     /// `input_filename`/`input_line_number` and `(at file:line)` for it
@@ -1244,6 +1322,35 @@ pub(crate) struct SeqStreamWalk {
     /// -- and an `input`/`inputs` in the filter receives it as its own
     /// error instead, at `(at <unknown>)`.
     pub(crate) deferred_warning: Option<String>,
+}
+
+/// The bytes of `combined[start..end]` with `cuts` ([`SeqStreamWalk::cuts`]) taken out, borrowed
+/// when no cut falls inside the range (#7340).
+pub(crate) fn splice_cuts<'a>(
+    combined: &'a [u8],
+    start: usize,
+    end: usize,
+    cuts: &[(usize, usize)],
+) -> std::borrow::Cow<'a, [u8]> {
+    let first = cuts.partition_point(|&(_, cut_end)| cut_end <= start);
+    let inside = &cuts[first..];
+    if inside
+        .first()
+        .map_or(true, |&(cut_start, _)| cut_start >= end)
+    {
+        return std::borrow::Cow::Borrowed(&combined[start..end]);
+    }
+    let mut out = Vec::with_capacity(end - start);
+    let mut at = start;
+    for &(cut_start, cut_end) in inside {
+        if cut_start >= end {
+            break;
+        }
+        out.extend_from_slice(&combined[at..cut_start.max(at)]);
+        at = cut_end.min(end).max(at);
+    }
+    out.extend_from_slice(&combined[at..end]);
+    std::borrow::Cow::Owned(out)
 }
 
 /// [`SeqStreamWalk::slurp_position_lost`] on its own: literally
@@ -1298,6 +1405,9 @@ enum St {
 #[derive(PartialEq, Eq)]
 enum Cls {
     Literal,
+    /// A NUL, which is a literal byte to jq's `classify` and ends a number all the same (#7340):
+    /// its own class so that the other literal bytes pay nothing for it.
+    Nul,
     Whitespace,
     Structure,
     Quote,
@@ -1308,6 +1418,7 @@ fn classify(c: u8) -> Cls {
         b' ' | b'\t' | b'\r' | b'\n' => Cls::Whitespace,
         b'"' => Cls::Quote,
         b'[' | b',' | b']' | b'{' | b':' | b'}' => Cls::Structure,
+        0 => Cls::Nul,
         _ => Cls::Literal,
     }
 }
@@ -1346,6 +1457,17 @@ struct Reader<'a> {
     /// skips the streams that depend on it.
     token_buf: Vec<u8>,
     token_len: usize,
+    /// The offset of the first NUL of the literal token being read (#7340). jq reads a number
+    /// token as a C string, so the number ends there and the rest of the token is not part of it.
+    /// A string's bytes are read the same way, since an RS that truncates `"-9` then NUL asks
+    /// `check_literal` whether the buffer is a number (it is `-9`), but that rare case searches
+    /// the buffer itself rather than have every string byte checked.
+    token_nul_at: Option<usize>,
+    /// The bytes jq's parser never sees ([`nul_cuts`]), which [`Reader::run`] steps over.
+    scan_cuts: Vec<(usize, usize)>,
+    /// The tail of each number token from its first NUL to its end, which jq's number parser does
+    /// not read (#7340): with `scan_cuts`, what [`SeqStreamWalk::cuts`] holds.
+    token_cuts: Vec<(usize, usize)>,
     next: Option<Kind>,
     last_ch_was_ws: bool,
     /// A malformed BOM makes jq re-run `parser_reset` at the top of every
@@ -1470,6 +1592,9 @@ impl<'a> Reader<'a> {
                 .with(std::cell::Cell::get)
                 .map_or_else(Vec::new, |byte| vec![0, byte]),
             token_len: 0,
+            token_nul_at: None,
+            scan_cuts: Vec::new(),
+            token_cuts: Vec::new(),
             next: None,
             last_ch_was_ws: false,
             resets_per_call: bom.malformed,
@@ -1558,6 +1683,7 @@ impl<'a> Reader<'a> {
     fn reset(&mut self) {
         self.stack.clear();
         self.token_len = 0;
+        self.token_nul_at = None;
         self.next = None;
         self.st = St::Normal;
         self.value_start = None;
@@ -1588,99 +1714,117 @@ impl<'a> Reader<'a> {
         let mut boundary = 0;
         let mut eof_offset = 0;
         let mut offset = skip;
-        while offset < data.len() {
-            let ch = data[offset];
-            self.offset = offset;
-            eof_offset = offset + 1;
-            while boundary < boundaries.len() && boundaries[boundary] <= offset {
-                if self.resets_per_call {
-                    self.reset();
+        // #7340: the bytes are scanned a stretch at a time, each running to the next of
+        // `scan_cuts` (whose bytes are never scanned) or to the end. A stream with no NUL is one
+        // stretch, so the loop below costs it nothing it did not cost before.
+        let mut cut = 0;
+        loop {
+            let limit = self
+                .scan_cuts
+                .get(cut)
+                .map_or(data.len(), |&(start, _)| start.min(data.len()));
+            while offset < limit {
+                let ch = data[offset];
+                self.offset = offset;
+                eof_offset = offset + 1;
+                while boundary < boundaries.len() && boundaries[boundary] <= offset {
+                    if self.resets_per_call {
+                        self.reset();
+                    }
+                    boundary += 1;
                 }
-                boundary += 1;
-            }
-            // #5674: a run of ordinary string bytes is `scan`'s `token_add` and a column each, and
-            // nothing else -- no value completes, no diagnostic is raised, no line starts -- so it
-            // is taken at once. Not under `resets_per_call`, which wipes the parser at the
-            // `fgets` boundaries inside the run.
-            if self.st == St::Str && !self.resets_per_call {
-                let run = data[offset..]
-                    .iter()
-                    .position(|&b| matches!(b, b'"' | b'\\' | b'\n' | ASCII_RS))
-                    .unwrap_or(data.len() - offset);
-                if run > 0 {
-                    self.token_add_all(&data[offset..offset + run]);
-                    self.column += run;
-                    self.last_ch_was_ws = false;
-                    self.offset = offset + run - 1;
-                    eof_offset = offset + run;
-                    self.last_byte_yielded_value = false;
-                    self.produced_value = false;
-                    offset += run;
+                // #5674: a run of ordinary string bytes is `scan`'s `token_add` and a column each, and
+                // nothing else -- no value completes, no diagnostic is raised, no line starts -- so it
+                // is taken at once. Not under `resets_per_call`, which wipes the parser at the
+                // `fgets` boundaries inside the run.
+                if self.st == St::Str && !self.resets_per_call {
+                    let run = data[offset..limit]
+                        .iter()
+                        .position(|&b| matches!(b, b'"' | b'\\' | b'\n' | ASCII_RS))
+                        .unwrap_or(limit - offset);
+                    if run > 0 {
+                        self.token_add_all(&data[offset..offset + run]);
+                        self.column += run;
+                        self.last_ch_was_ws = false;
+                        self.offset = offset + run - 1;
+                        eof_offset = offset + run;
+                        self.last_byte_yielded_value = false;
+                        self.produced_value = false;
+                        offset += run;
+                        continue;
+                    }
+                }
+                offset += 1;
+                if self.st == St::WaitingForRs {
+                    if ch == ASCII_RS {
+                        self.column += 1;
+                        self.st = St::Normal;
+                        continue;
+                    }
+                    // #7263: jq discards each byte before an RS with a line or a column and nothing
+                    // else, so the run up to the next RS is taken at once, as #5674 takes a run of
+                    // string bytes. `resets_per_call` is never set here: `WaitingForRs` is assigned
+                    // only in `Reader::new`, and only for a BOM that is not malformed, while
+                    // `resets_per_call` is `bom.malformed`; `reset` only ever restores `Normal`. (Were
+                    // both set, a reset at an `fgets` boundary inside the run would put the parser
+                    // back to reading, and the run could not be taken at once.)
+                    debug_assert!(!self.resets_per_call);
+                    let end = if discards::bytewise() {
+                        offset
+                    } else {
+                        find_byte(ASCII_RS, &data[offset..limit]).map_or(limit, |at| offset + at)
+                    };
+                    advance_position(&data[offset - 1..end], &mut self.line, &mut self.column);
+                    self.offset = end - 1;
+                    eof_offset = end;
+                    offset = end;
                     continue;
                 }
-            }
-            offset += 1;
-            if self.st == St::WaitingForRs {
-                if ch == ASCII_RS {
-                    self.column += 1;
-                    self.st = St::Normal;
-                    continue;
+                if self.st == St::Normal
+                    && self.stack.is_empty()
+                    && self.next.is_none()
+                    && self.token_len == 0
+                    && !ch.is_ascii_whitespace()
+                    && ch != ASCII_RS
+                {
+                    self.value_start = Some(self.offset);
                 }
-                // #7263: jq discards each byte before an RS with a line or a column and nothing
-                // else, so the run up to the next RS is taken at once, as #5674 takes a run of
-                // string bytes. `resets_per_call` is never set here: `WaitingForRs` is assigned
-                // only in `Reader::new`, and only for a BOM that is not malformed, while
-                // `resets_per_call` is `bom.malformed`; `reset` only ever restores `Normal`. (Were
-                // both set, a reset at an `fgets` boundary inside the run would put the parser
-                // back to reading, and the run could not be taken at once.)
-                debug_assert!(!self.resets_per_call);
-                let end = if discards::bytewise() {
-                    offset
-                } else {
-                    find_byte(ASCII_RS, &data[offset..]).map_or(data.len(), |at| offset + at)
-                };
-                advance_position(&data[offset - 1..end], &mut self.line, &mut self.column);
-                self.offset = end - 1;
-                eof_offset = end;
-                offset = end;
-                continue;
-            }
-            if self.st == St::Normal
-                && self.stack.is_empty()
-                && self.next.is_none()
-                && self.token_len == 0
-                && !ch.is_ascii_whitespace()
-                && ch != ASCII_RS
-            {
-                self.value_start = Some(self.offset);
-            }
-            if let Err(category) = self.scan(ch) {
-                let (line, column) = (self.line, self.column);
-                if ch == ASCII_RS {
-                    self.warn(&format!("{category} at line {line}, column {column}"));
-                } else {
-                    self.warn(&format!(
-                        "{category} at line {line}, column {column} (need RS to resync)"
-                    ));
-                }
-                self.reset();
-            } else {
-                self.flush_completed();
-                if self.resets_per_call && (self.produced_value || ch == b'\n') {
+                if let Err(category) = self.scan(ch) {
+                    let (line, column) = (self.line, self.column);
+                    if ch == ASCII_RS {
+                        self.warn(&format!("{category} at line {line}, column {column}"));
+                    } else {
+                        self.warn(&format!(
+                            "{category} at line {line}, column {column} (need RS to resync)"
+                        ));
+                    }
                     self.reset();
+                } else {
+                    self.flush_completed();
+                    if self.resets_per_call && (self.produced_value || ch == b'\n') {
+                        self.reset();
+                    }
+                }
+                // Captured here, per byte, rather than read after the loop:
+                // `finish` re-sets `produced_value` for a value jq's EOF branch
+                // completes, which is not an `OK` return on the last byte
+                // (#3003).
+                self.last_byte_yielded_value = self.produced_value;
+                self.produced_value = false;
+                if self.stopped {
+                    // jq's stream ends *here*: `p->eof` is never set on this
+                    // path, so nothing past this byte is ever scanned and no
+                    // `at EOF` diagnostic follows (#2998).
+                    return;
                 }
             }
-            // Captured here, per byte, rather than read after the loop:
-            // `finish` re-sets `produced_value` for a value jq's EOF branch
-            // completes, which is not an `OK` return on the last byte
-            // (#3003).
-            self.last_byte_yielded_value = self.produced_value;
-            self.produced_value = false;
-            if self.stopped {
-                // jq's stream ends *here*: `p->eof` is never set on this
-                // path, so nothing past this byte is ever scanned and no
-                // `at EOF` diagnostic follows (#2998).
-                return;
+            match self.scan_cuts.get(cut) {
+                // Past the cut; a BOM jq consumed can already have taken the reader beyond its start.
+                Some(&(_, end)) => {
+                    offset = offset.max(end);
+                    cut += 1;
+                }
+                None => break,
             }
         }
         // A boundary with no scanned byte at or after it (a trailing source
@@ -1777,12 +1921,18 @@ impl<'a> Reader<'a> {
             if cls == Cls::Whitespace {
                 self.last_ch_was_ws = true;
             }
-            if cls != Cls::Literal {
+            if !matches!(cls, Cls::Literal | Cls::Nul) {
                 self.check_literal()?;
                 self.check_done();
             }
             match cls {
                 Cls::Literal => self.token_add(ch),
+                Cls::Nul => {
+                    if self.token_nul_at.is_none() {
+                        self.token_nul_at = Some(self.offset);
+                    }
+                    self.token_add(ch);
+                }
                 Cls::Whitespace => {}
                 Cls::Quote => {
                     // As with `1[1]`, a pending scalar can be followed by
@@ -2013,8 +2163,24 @@ impl<'a> Reader<'a> {
                     self.token_buf.resize(self.token_buf.len() * 2 + 256, 0);
                 }
                 self.token_buf[self.token_len] = 0;
-                if !number_is_valid(&self.token_buf[..self.token_len]) {
+                // ... and so reads it as a C string: a NUL in it ends the number (#7340), `1` then
+                // NUL then `x` is the number `1`, which the value's bytes are cut to.
+                let token = &self.token_buf[..self.token_len];
+                // A literal token's NUL is recorded as it is scanned; an open string's bytes, which
+                // only an RS asks about, are searched here instead, off the string runs' path.
+                let number = if self.token_nul_at.is_some() || self.st != St::Normal {
+                    c_string(token)
+                } else {
+                    token
+                };
+                if !number_is_valid(number) {
                     return Err("Invalid numeric literal");
+                }
+                // Only a literal token's: one ends at the newline that ends its `fgets` chunk at the
+                // latest, so its tail overlaps no scan cut. An open string's bytes are asked about
+                // only by an RS that then reports a truncation, which yields no value.
+                if let (Some(nul), St::Normal) = (self.token_nul_at, self.st) {
+                    self.token_cuts.push((nul, self.offset));
                 }
                 Kind::Number
             }
@@ -2022,6 +2188,7 @@ impl<'a> Reader<'a> {
         self.value(kind)?;
         self.value_end = self.offset;
         self.token_len = 0;
+        self.token_nul_at = None;
         Ok(())
     }
 
@@ -2034,6 +2201,7 @@ impl<'a> Reader<'a> {
         self.value(Kind::String)?;
         self.value_end = self.offset + 1;
         self.token_len = 0;
+        self.token_nul_at = None;
         Ok(())
     }
 
@@ -2311,6 +2479,130 @@ mod tests {
             format!("\x1e\"{long}\n{long}").as_bytes(),
             &["Unfinished string at EOF at line 2, column 700"],
         );
+    }
+
+    /// #7340: an `fgets` chunk that holds no newline reaches jq's parser up to its first NUL, one
+    /// that ends in a newline whole. The chunks are each source's own, the offsets absolute.
+    #[test]
+    fn nul_cuts_end_each_chunk_with_no_newline_at_its_first_nul_7340() {
+        let one = |raw: &[u8]| nul_cuts(&[(None, raw.to_vec())]);
+        assert_eq!(one(b"\x1e1\n"), vec![]);
+        assert_eq!(one(b"\x1e1\x00\n"), vec![]);
+        assert_eq!(one(b"\x1e1\x00\x00x"), vec![(2, 5)]);
+        assert_eq!(one(b"a\x00\nb\x00c"), vec![(4, 6)]);
+        // A full chunk is cut to its end, 4095 bytes in; the next one ends in a newline.
+        let mut long = vec![b' '; 5000];
+        long[10] = 0;
+        long[4100] = 0;
+        long.push(b'\n');
+        assert_eq!(one(&long), vec![(10, JQ_FGETS_CHUNK)]);
+        // Both chunks of a line that has no newline in either.
+        long.pop();
+        assert_eq!(one(&long), vec![(10, JQ_FGETS_CHUNK), (4100, 5000)]);
+        let two = [(None, b"ab".to_vec()), (None, b"c\x00d".to_vec())];
+        assert_eq!(nul_cuts(&two), vec![(3, 5)]);
+    }
+
+    /// #7340: a NUL in a number token ends the number, and the bytes jq never sees are neither
+    /// scanned nor counted, so a value can be open across them.
+    #[test]
+    fn a_nul_ends_a_number_and_cut_bytes_are_not_scanned_7340() {
+        let texts = |input: &[u8]| -> Vec<String> {
+            let owned = vec![(None, input.to_vec())];
+            let walk = walk_stream(&owned, false, &mut |w| panic!("no warning expected: {w}"));
+            walk.values
+                .iter()
+                .map(|&(start, end)| {
+                    String::from_utf8(splice_cuts(input, start, end, &walk.cuts).into_owned())
+                        .unwrap()
+                })
+                .collect()
+        };
+        assert_eq!(
+            texts(b"\x1e[1\x00]\n\x1e2.50\x00x\n\x1enan\x00\n\x1e3\x00\x00x\n"),
+            ["[1]", "2.50", "nan", "3"]
+        );
+        let owned = vec![(None, b"\x1e[1\x00]\n\x1e2\x00x\n".to_vec())];
+        let walk = walk_stream(&owned, false, &mut |_| {});
+        assert_eq!(walk.values, vec![(1, 5), (7, 10)]);
+        assert_eq!(walk.cuts, vec![(3, 4), (8, 10)]);
+        // An RS asks whether the buffer is a number even when it holds an open string's bytes,
+        // and those end at a NUL as well: `"-9` then NUL is the number `-9`.
+        assert_warnings(
+            b"\x1e\"-9\x00x\x1e1\n",
+            &["Potentially truncated top-level numeric value at line 1, column 7"],
+        );
+        // A keyword is compared over its whole length, the NUL included; an empty number is none.
+        assert_warnings(
+            b"\x1etrue\x00\n\x1e\x00\n",
+            &[
+                "Invalid literal at line 2, column 0 (need RS to resync)",
+                "Invalid numeric literal at line 3, column 0 (need RS to resync)",
+            ],
+        );
+        // The rest of a full chunk is not scanned: `7 [8]` yields nothing, an RS there starts no
+        // record, and the column counts only what jq saw.
+        let pad = |head: &[u8], tail: &[u8]| [head, &[b' '; 4200], tail].concat();
+        assert_eq!(
+            texts(&pad(b"\x1e\"ab\" \x00 7 [8]", b"9\n")),
+            ["\"ab\"", "9"]
+        );
+        assert_eq!(
+            texts(&pad(b"\x1e1 \x00\x1e2\x1e3", b"\n\x1e4\n")),
+            ["1", "4"]
+        );
+        assert_eq!(texts(&pad(b"\x1e[1, \x00 garbage", b"2]\n")).len(), 1);
+        assert_warnings(
+            &pad(b"\x1e\"ab\" \x00", b"}\n"),
+            &["Unmatched '}' at line 1, column 119 (need RS to resync)"],
+        );
+        // A string open across them.
+        let string = [
+            &b"\x1e\"x"[..],
+            &[b'y'; 4000],
+            b"\x00zz",
+            &[b'y'; 200],
+            b"\"\n",
+        ]
+        .concat();
+        assert_eq!(texts(&string), [format!("\"x{}\"", "y".repeat(4111))]);
+    }
+
+    /// #7340: a BOM is matched against the bytes jq's parser sees. A NUL that ends a chunk with no
+    /// newline is not one, so `EF BB` then NUL is still waiting for its last byte, and the BOM can
+    /// complete in the next chunk or the next file; a NUL in a chunk that ends in a newline is seen,
+    /// and makes the BOM malformed. `consumed` is where the scanner starts.
+    #[test]
+    fn bom_prefix_reads_only_what_jq_sees_7340() {
+        let one = |raw: &[u8]| bom_prefix(&[(None, raw.to_vec())]);
+        let bom = |consumed, malformed| BomPrefix {
+            consumed,
+            malformed,
+        };
+        assert_eq!(one(b"\xef\xbb\x00x"), bom(4, false));
+        assert_eq!(one(b"\xef\xbb\x00x\n"), bom(2, true));
+        let split = [&b"\xef\xbb\x00"[..], &[b' '; 4092], b"\xbf\x1e1\n"].concat();
+        assert_eq!(one(&split), bom(4096, false));
+        let files = [(None, b"\xef".to_vec()), (None, b"\x00x".to_vec())];
+        assert_eq!(bom_prefix(&files), bom(3, false));
+        // Without a NUL, as before.
+        assert_eq!(one(b"\xef\xbb\xbf\x1e1\n"), bom(3, false));
+        assert_eq!(one(b"\xef1"), bom(1, true));
+        assert_eq!(one(b"\x1e1"), bom(0, false));
+    }
+
+    /// #7340: [`splice_cuts`] takes out the cuts inside the range and borrows when there are none.
+    #[test]
+    fn splice_cuts_takes_out_the_cuts_inside_the_range_7340() {
+        let bytes = b"0123456789";
+        let cuts = [(1, 3), (5, 6), (8, 12)];
+        assert!(matches!(
+            splice_cuts(bytes, 3, 5, &cuts),
+            std::borrow::Cow::Borrowed(b"34")
+        ));
+        assert_eq!(&*splice_cuts(bytes, 0, 10, &cuts), b"03467");
+        assert_eq!(&*splice_cuts(bytes, 2, 7, &cuts), b"346");
+        assert_eq!(&*splice_cuts(bytes, 0, 10, &[]), bytes);
     }
 
     /// [`SeqStreamWalk::values`] over the given sources.
