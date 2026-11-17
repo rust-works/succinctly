@@ -25223,6 +25223,7 @@ mod tests {
             assert_eq!(position(&[b"ab\x00cd\n"]), Some((2, 0)));
             assert_eq!(position(&[b"x\nab\x00cd"]), Some((2, 2)));
             assert_eq!(position(&[b"ab\x00cd", b"ef"]), Some((1, 4)));
+            assert_eq!(position(&[b"ab", b"c\x00d"]), Some((1, 3)));
             assert_eq!(position(&[b"\xEF\xBB\xBFab\x00cd"]), Some((1, 2)));
             // ... but a chunk that ends in a newline keeps an RS after its NUL.
             assert_eq!(position(&[b"x\nab\x00cd\x1e1\nzz"]), None);

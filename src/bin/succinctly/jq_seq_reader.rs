@@ -2438,8 +2438,8 @@ mod tests {
                 .collect()
         };
         assert_eq!(
-            texts(b"\x1e[1\x00]\n\x1e2.50\x00x\n\x1enan\x00\n"),
-            ["[1]", "2.50", "nan"]
+            texts(b"\x1e[1\x00]\n\x1e2.50\x00x\n\x1enan\x00\n\x1e3\x00\x00x\n"),
+            ["[1]", "2.50", "nan", "3"]
         );
         let owned = vec![(None, b"\x1e[1\x00]\n\x1e2\x00x\n".to_vec())];
         let walk = walk_stream(&owned, false, &mut |_| {});
