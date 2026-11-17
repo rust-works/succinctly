@@ -334,8 +334,11 @@ jobs:
       #    "sse2-clamped-dispatch" leg re-runs the suite with
       #    SUCCINCTLY_SIMD=sse2 (docs/reference/environment-variables.md),
       #    forcing the yaml parser through the real 16-byte SSE2 dispatch
-      #    path (#247). The clamp affects dispatch only, not detection, so
-      #    this expectation still holds in that leg.
+      #    path (#247) and, since #7318, the JSON index builders through the
+      #    SSE2 kernel, which that leg also runs through the CLI suites. The
+      #    clamp affects dispatch only, not detection, so this expectation
+      #    still holds in that leg. (The leg is `bench-runner-and-sse2-dispatch`
+      #    now; it was `sse2-clamped-dispatch` before #3064 merged them.)
       SUCCINCTLY_EXPECT_SIMD: sse2,sse4.2,avx2,bmi2,popcnt
     steps:
       - uses: actions/checkout@v7
