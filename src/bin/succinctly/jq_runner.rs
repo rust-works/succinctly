@@ -12276,10 +12276,12 @@ fn hand_on_seq_files_tail(args: &JqCommand, past_open_failure: bool) -> bool {
     let from = match tail.front {
         Some(rest) => {
             let path = &named[tail.index];
+            // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
             if let Some(error) = &rest.error {
                 let last = tail.index + 1 == named.len();
                 failures.push((front + 1, InputFileOpenError::from_io(path, error, last)));
             }
+            // patchcov: coverage end
             files.push(path.clone());
             raws.push(rest.stream);
             tail.index + 1
