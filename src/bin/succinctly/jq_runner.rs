@@ -4595,6 +4595,51 @@ pub(crate) fn silence_depth_guard_panic_line() {
     });
 }
 
+/// The index of one input value, which the run's last value does not give back (#7332).
+///
+/// The process ends once the last value is done, and freeing its index first is not free: the
+/// buffers it holds are the first large blocks the allocator sees go back after the run's
+/// own small frees. When the program has just dropped a large array of small strings (`.numbers |
+/// sort | .[0]` over a million numbers), glibc's `free` of a block that joins its neighbours past
+/// 64 KiB first sweeps every freed small chunk in its fast bins (`malloc_consolidate`), 25 ms at a
+/// million chunks and 3 million extra L1 misses. Whether the index buffers sit next to one another
+/// decides it, and a change that only moved the start-up allocations (#7151) flipped it. Every
+/// other value's index is freed as before: a stream of values must not keep them.
+struct RunIndex {
+    index: Option<JsonIndex>,
+    /// Hold the index past this value's end rather than free it.
+    keep: bool,
+}
+
+impl RunIndex {
+    fn build(json: &[u8], last_value_of_the_run: bool) -> Self {
+        Self {
+            index: Some(JsonIndex::build(json)),
+            keep: last_value_of_the_run,
+        }
+    }
+}
+
+impl core::ops::Deref for RunIndex {
+    type Target = JsonIndex;
+
+    fn deref(&self) -> &JsonIndex {
+        self.index
+            .as_ref()
+            .expect("the index is taken only when the value is dropped")
+    }
+}
+
+impl Drop for RunIndex {
+    fn drop(&mut self) {
+        if self.keep {
+            if let Some(index) = self.index.take() {
+                std::mem::forget(index);
+            }
+        }
+    }
+}
+
 /// Run the jq command with the given arguments.
 /// Returns the exit code (0 for success, non-zero for various errors).
 ///
@@ -5658,7 +5703,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 }
 
                 // Slow path: build index and evaluate expression
-                let index = JsonIndex::build(json_bytes);
+                let index = RunIndex::build(json_bytes, is_last_value);
                 // #5497: jq's parser refuses a document past its depth limit before any filter
                 // runs, and reads nothing after it, this file or any later one.
                 let source = if slurped.is_some() {
@@ -27327,6 +27372,21 @@ mod tests {
         let value = cursor.value();
         let err = standard_json_to_jq_value(value, &cursor).unwrap_err();
         assert!(err.message.contains("invalid UTF-8"), "{err:?}");
+    }
+
+    /// #7332: the index of the run's last value is held past the value's end, any other's is freed,
+    /// and either reads as the `JsonIndex` it wraps.
+    #[test]
+    fn run_index_reads_as_the_index_whether_or_not_it_is_kept_7332() {
+        let json: &[u8] = b"[1,2,3]";
+        let plain = JsonIndex::build(json);
+        for keep in [false, true] {
+            let held = RunIndex::build(json, keep);
+            assert_eq!(held.keep, keep);
+            assert_eq!(held.bp().len(), plain.bp().len(), "keep={keep}");
+            assert!(held.root(json).value().is_array(), "keep={keep}");
+            drop(held);
+        }
     }
 
     /// #1192: an immediate object key that fails to decode now errors too,
