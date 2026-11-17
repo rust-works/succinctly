@@ -257,7 +257,10 @@ QUERIES = [
     # twin: the same fixture with one byte-edited duplicate of the very last
     # user object's last member, so the canonical scan walks the *entire*
     # document before failing at that last object, then pays the ordinary
-    # re-render on top -- the gate's own precheck cost, worst-cased. Measured
+    # re-render on top -- the gate's own precheck cost, worst-cased. Since
+    # #7366 a repeat in a nested object no longer fails the scan: it is
+    # recorded and the document printed around it, so this twin times that
+    # route instead (see its `QUERY_THRESHOLDS` entry). Measured
     # against the PR's own merge-base (`--baseline-binary`, #1582; 7950X
     # callgrind, a 7MB `{"data":[...]}` fixture of the same record shape as
     # the 2MB `users` fixture here): `users_compact_identity` ~-66% Ir (the
@@ -570,6 +573,14 @@ DEFAULT_THRESHOLD = 5.0
 # x86_64 / -11.6% ARM64-Linux against the PR's own merge-base, outputs byte-identical). Remove it once
 # `main` carries the change and the row reads ~0% against a merge-base that includes it.
 #
+# `users_compact_latefail` (#7366) carries an override of the same one-off kind: its duplicated
+# last member is a repeat in an object below the document, which the canonical scan now records
+# and scans past, so the document is printed from its text around that object instead of being
+# re-rendered whole after the scan (-80.5% x86_64 / -76.7% ARM64-Linux against the PR's own
+# merge-base; outputs identical to jq 1.7.1's). The row then measures that route, not the full
+# scan and re-render its comment above names. Remove the override once `main` carries the change
+# and the row reads ~0% against a merge-base that includes it.
+#
 # `seq_name_bad_last` (#6619) carries a TIGHTER threshold than the default (3.0 against 5.0), the one
 # override here that is not a loosening. #6594 (#6500) converts each record as the queue is read
 # instead of materializing every record first, and what that saves is mostly peak memory (1.1 GB
@@ -588,6 +599,7 @@ QUERY_THRESHOLDS = {
     "users_assign_scores": 30.0,
     "users_update_select": 30.0,
     "users_yq_del_select": 15.0,
+    "users_compact_latefail": 85.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
