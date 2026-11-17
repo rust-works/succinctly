@@ -3546,14 +3546,13 @@ fn census<F: DocumentFields>(fields: &F) -> KeyCensus {
     let mut walk = fields.clone();
     while let Some((key, _cursor, rest)) = walk.uncons_key() {
         // `key_hash_of` answers `Some` only for a key that stringifies,
-        // so the inner `key_string` is how the owned spelling is obtained
-        // here, not a second filter that could drop a counted field.
-        if let Some(hash) = key_hash_of(&key) {
-            if shared.binary_search(&hash).is_ok() {
-                if let Some(k) = key.key_string() {
-                    colliding.push(k.into_owned());
-                }
-            }
+        // so the `key_string` is how the owned spelling is obtained here,
+        // not a second filter that could drop a counted field.
+        if let Some(k) = key_hash_of(&key)
+            .filter(|hash| shared.binary_search(hash).is_ok())
+            .and_then(|_| key.key_string())
+        {
+            colliding.push(k.into_owned());
         }
         walk = rest;
     }

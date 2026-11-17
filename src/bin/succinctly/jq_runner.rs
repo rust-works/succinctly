@@ -3505,7 +3505,7 @@ fn collapse_key_name<'a>(
     }
     match frame.cursor(field.key_bp).value() {
         StandardJson::String(k) => k.as_str().ok(),
-        _ => None,
+        _ => None, // patchcov: coverage tolerate-line reason="unreachable: print_json raises on a key that is not a string before it collapses the object's fields (#1194, #7311)"
     }
 }
 
