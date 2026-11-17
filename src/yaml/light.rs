@@ -10190,6 +10190,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
         }
     }
 
+    /// A mapping or sequence key: yq's text for it is empty (#7292).
+    fn key_collapses_as_empty(&self) -> bool {
+        matches!(self, YamlValue::Mapping(_) | YamlValue::Sequence(_))
+    }
+
     fn as_object(&self) -> Option<Self::Fields> {
         match self {
             YamlValue::Mapping(fields) => Some(fields.clone()),

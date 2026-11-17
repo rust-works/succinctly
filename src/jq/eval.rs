@@ -204,6 +204,11 @@ pub trait EvalSemantics: Copy + Default {
     /// The jq CLI's `--preserve-input` extension keeps every occurrence
     /// regardless, via its own `jq_compat` gate -- ADR-0018 rule 5.
     const COLLAPSE_DUPLICATE_KEYS: bool;
+    /// Whether `.[]` and `map(f)` over a mapping read a collection key (a YAML sequence or mapping
+    /// key) as the empty text yq gives it, so every such key of the mapping collapses into one
+    /// slot, with a plain `""` key too (#7292). yq does; jq mode keeps a collection key apart
+    /// (#1740, and no JSON document has one).
+    const ITERATION_COLLAPSES_COLLECTION_KEYS: bool;
     /// A deliberate, artificial byte-length cap string-repeat (`s * n`)
     /// refuses past, entirely separate from whatever the host can actually
     /// allocate — `None` for jq, which has no such cap and lets any count
@@ -442,6 +447,7 @@ impl EvalSemantics for JqSemantics {
     const ADD_RIGHT_NULL_REQUIRES_CONCAT_TYPE: bool = false;
     const SUB_LEFT_NULL_IS_IDENTITY: bool = false;
     const COLLAPSE_DUPLICATE_KEYS: bool = true;
+    const ITERATION_COLLAPSES_COLLECTION_KEYS: bool = false;
     const MAX_STRING_REPEAT_BYTES: Option<u128> = None;
     const SELECT_EMITS_ONCE_IF_ANY_TRUTHY: bool = false;
     const UTF8_LOSSY_USES_JQ_MAXIMAL_SUBPART_RULE: bool = true;
@@ -487,6 +493,7 @@ impl EvalSemantics for YqSemantics {
     const ADD_RIGHT_NULL_REQUIRES_CONCAT_TYPE: bool = true;
     const SUB_LEFT_NULL_IS_IDENTITY: bool = true;
     const COLLAPSE_DUPLICATE_KEYS: bool = false;
+    const ITERATION_COLLAPSES_COLLECTION_KEYS: bool = true;
     const MAX_STRING_REPEAT_BYTES: Option<u128> = Some(10 * 1024 * 1024);
     const SELECT_EMITS_ONCE_IF_ANY_TRUTHY: bool = true;
     const UTF8_LOSSY_USES_JQ_MAXIMAL_SUBPART_RULE: bool = false;

@@ -6079,7 +6079,7 @@ const TWO_ALIASES_NAMING_EQUAL_SCALARS: &str =
 #[test]
 fn test_yq_merge_keys_keep_colliding_complex_keys_in_streams_3467() -> Result<()> {
     let rows: &[(&str, &str, &str)] = &[
-        (MERGED_VS_LOCAL_COMPLEX, "[.b[]] | length", "2\n"),
+        (MERGED_VS_LOCAL_COMPLEX, "[.b[]] | length", "1\n"),
         (
             MERGED_VS_LOCAL_COMPLEX,
             ".b | to_entries | map(.key)",
@@ -6090,30 +6090,30 @@ fn test_yq_merge_keys_keep_colliding_complex_keys_in_streams_3467() -> Result<()
             ".b | to_entries",
             "- key: \"\"\n  value: x\n- key: \"\"\n  value: y\n",
         ),
-        (TWO_MERGE_SOURCES_COMPLEX, "[.b[]] | length", "2\n"),
+        (TWO_MERGE_SOURCES_COMPLEX, "[.b[]] | length", "1\n"),
         (
             TWO_MERGE_SOURCES_COMPLEX,
             ".b | to_entries | map(.key)",
             "- \"\"\n- \"\"\n",
         ),
-        (MERGED_COMPLEX_VS_GENUINE_EMPTY, "[.b[]] | length", "2\n"),
+        (MERGED_COMPLEX_VS_GENUINE_EMPTY, "[.b[]] | length", "1\n"),
         // Keys that only *look* alike stay two entries: `[1]` against `["1"]`
         // (a number and a string), two different mapping keys, and two equal
         // ones in different nodes (compared by node, never by content).
-        (MERGED_NUMBER_VS_STRING_KEY, "[.b[]] | length", "2\n"),
-        (MERGED_DIFFERENT_MAPPING_KEYS, "[.b[]] | length", "2\n"),
-        (MERGED_EQUAL_MAPPING_KEYS, "[.b[]] | length", "2\n"),
+        (MERGED_NUMBER_VS_STRING_KEY, "[.b[]] | length", "1\n"),
+        (MERGED_DIFFERENT_MAPPING_KEYS, "[.b[]] | length", "1\n"),
+        (MERGED_EQUAL_MAPPING_KEYS, "[.b[]] | length", "1\n"),
         (
             DIFFERENT_ALIAS_KEYS_MERGED_AND_LOCAL,
             "[.b[]] | length",
             "2\n",
         ),
-        (EMPTY_SEQUENCE_VS_ONE_KEY, "[.b[]] | length", "2\n"),
-        (DIFFERENT_NESTED_SEQUENCE_KEYS, "[.b[]] | length", "2\n"),
+        (EMPTY_SEQUENCE_VS_ONE_KEY, "[.b[]] | length", "1\n"),
+        (DIFFERENT_NESTED_SEQUENCE_KEYS, "[.b[]] | length", "1\n"),
         (
             EQUAL_MAPPING_NESTED_IN_SEQUENCE_KEY,
             "[.b[]] | length",
-            "2\n",
+            "1\n",
         ),
         (DIFFERENT_ALIAS_TO_MAPPING_KEYS, "[.b[]] | length", "2\n"),
         // Looking up the genuine `""` key finds it, never a complex key that
@@ -6309,7 +6309,9 @@ fn test_yq_merge_keys_still_override_ordinary_and_genuine_empty_keys_3467() -> R
 /// by design (an equal key written twice collapses within it and stays two
 /// entries past it), so pin both sides deterministically: `[*l0]` is about a
 /// dozen nodes and `[*l1]` well over a hundred. The wall-clock test below checks
-/// the cap really bounds the work; this one checks where it falls.
+/// the cap really bounds the work; this one checks where it falls. It counts with
+/// `to_entries`, which lists every member the merge left: `.[]` collapses complex
+/// keys into one slot, as yq's does (#7292).
 #[test]
 fn test_yq_merge_key_content_comparison_stops_at_the_node_cap_3467() -> Result<()> {
     let key_twice = |level: usize| -> String {
@@ -6326,7 +6328,7 @@ fn test_yq_merge_key_content_comparison_stops_at_the_node_cap_3467() -> Result<(
     };
     for (level, expected) in [(0, "1\n"), (1, "2\n")] {
         let (output, stderr, code) =
-            run_yq_stdin_with_stderr("[.b[]] | length", &key_twice(level), &[])?;
+            run_yq_stdin_with_stderr(".b | to_entries | length", &key_twice(level), &[])?;
         assert_eq!(code, 0, "level {level}, stderr: {stderr}");
         assert_eq!(output, expected, "level {level}");
     }

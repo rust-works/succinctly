@@ -3608,7 +3608,9 @@ local leaves the local entry alone, because yq matches keys by their text and a 
 none. A yq *write* never expands a merge (it keeps `<<: *a` as written), so it loses nothing;
 succinctly's writes materialize the expansion, which is why this entry exists. succinctly keeps
 both entries on the streaming routes and refuses on the materializing ones, rather than copy
-yq's expansion into the user's file. How yq's key-list builtins treat a merge key at all is
+yq's expansion into the user's file.
+`.[]` and `map(f)` are the exception: they collapse every complex key of a mapping into one slot, as yq's traversal does, so a merged-in `[1]` and a local `[2]` are one member there ([#7292](https://github.com/rust-works/succinctly/issues/7292)).
+How yq's key-list builtins treat a merge key at all is
 the next entry ([#3556](https://github.com/rust-works/succinctly/issues/3556)).
 
 **`keys`, `length` and `has` count the `<<` merge key itself

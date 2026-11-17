@@ -1606,10 +1606,25 @@ pub trait DocumentValue: Sized + Clone {
     /// is a placeholder rather than an identity: two different complex keys
     /// are not a repeated key, so `key_hash_of` gives them no hash and a
     /// duplicate-key collapse never merges them (#1740, the sibling of #1385's
-    /// "a key that will not decode is never a duplicate"). `false` for every
+    /// "a key that will not decode is never a duplicate"). The one exception is yq's own `.[]` and
+    /// `map(f)`, which read a collection key's empty text and collapse them
+    /// ([`key_collapses_as_empty`](Self::key_collapses_as_empty), #7292). `false` for every
     /// format whose keys are all strings, which is what lets the check fold
     /// away on JSON's path.
     fn key_is_complex(&self) -> bool {
+        false
+    }
+
+    /// Whether this key is a collection (a YAML mapping or sequence), which `.[]` and `map(f)`
+    /// collapse as one key (#7292).
+    ///
+    /// Real yq's iteration keys a mapping's members by their key node's text, and a collection's
+    /// text is empty: every collection key of a mapping, however different, is the same key to
+    /// `.[]`, and the same as a plain `""` key. `length`, `keys` and `to_entries` do not collapse
+    /// (yq keeps every member there), so only the walks that collapse a repeated key under yq's
+    /// `.[]` ask this, through `collapse_key_hash_of`. An alias key is not one: yq reads it as
+    /// the alias's name, whatever it points at. `false` for every format whose keys are strings.
+    fn key_collapses_as_empty(&self) -> bool {
         false
     }
 
@@ -2364,6 +2379,20 @@ pub(crate) fn key_hash_and_end_of<V: DocumentValue>(key: &V) -> (Option<u64>, Op
         },
         None => (key_hash_of(key), key.text_end()),
     }
+}
+
+/// [`key_hash_of`] for a walk that collapses a repeated key the way yq's `.[]` does (#7292): with
+/// `as_empty` set, a collection key hashes as the empty text it has there
+/// ([`DocumentValue::key_collapses_as_empty`]), so it joins a collapse with every other
+/// collection key and with a plain `""` key.
+///
+/// `as_empty` is `EvalSemantics::ITERATION_COLLAPSES_COLLECTION_KEYS`, so only yq's `.[]` walks
+/// set it. [`key_hash_of`] stays what it was for every other caller, and for jq mode, where two
+/// collection keys are not a repeated key (#1740). The extra test runs only after the ordinary
+/// hash answered `None`, so a format whose keys are all strings never pays for it.
+#[inline]
+pub(crate) fn collapse_key_hash_of<V: DocumentValue>(key: &V, as_empty: bool) -> Option<u64> {
+    key_hash_of(key).or_else(|| (as_empty && key.key_collapses_as_empty()).then(|| key_hash(b"")))
 }
 
 /// [`key_hash_of`] for a caller holding a whole field.
@@ -3546,7 +3575,7 @@ fn census<F: DocumentFields>(fields: &F) -> KeyCensus {
         distinct_hashes,
         unkeyed,
         malformed,
-    } = hash_walk(fields);
+    } = hash_walk(fields, false);
     if shared.is_empty() {
         return KeyCensus {
             distinct: distinct_hashes,
@@ -3605,7 +3634,7 @@ struct HashWalk {
 /// The first walk of [`census`]: a hash per key, the member checks, and
 /// which hashes repeat. [`repeat_plan_checked`] takes it too, because the
 /// shared hashes are what let it decode only the keys that can collapse.
-fn hash_walk<F: DocumentFields>(fields: &F) -> HashWalk {
+fn hash_walk<F: DocumentFields>(fields: &F, collections_as_empty: bool) -> HashWalk {
     let mut hashes: Vec<u64> = Vec::new();
     let mut unkeyed = 0usize;
     let mut malformed = false;
@@ -3628,6 +3657,11 @@ fn hash_walk<F: DocumentFields>(fields: &F) -> HashWalk {
             // `key_hash_of` answers `None` for exactly the keys that do not
             // stringify, so this is the only branch [`key_is_malformed`] can
             // fire on -- and it is never taken by a well-formed document.
+            // A collection key (#7292) hashes as the empty text yq gives it, as
+            // `collapse_key_hash_of` does, when the caller asks for that.
+            None if collections_as_empty && key.key_collapses_as_empty() => {
+                hashes.push(key_hash(b""));
+            }
             None => {
                 unkeyed += 1;
                 malformed |= key_is_malformed(&key);
@@ -3761,8 +3795,9 @@ impl<C: Copy> RepeatPlan<C> {
 pub(crate) fn repeat_plan_checked<F: DocumentFields>(
     fields: &F,
     collapse: bool,
+    collections_as_empty: bool,
 ) -> Result<Option<RepeatPlan<F::Cursor>>, EvalError> {
-    let walked = hash_walk(fields);
+    let walked = hash_walk(fields, collections_as_empty);
     if walked.malformed {
         return Err(fields.malformed_member_error());
     }
@@ -3773,7 +3808,7 @@ pub(crate) fn repeat_plan_checked<F: DocumentFields>(
         fields,
         &walked.shared,
         walked.unkeyed > 0,
-        key_hash_of,
+        |key| collapse_key_hash_of(key, collections_as_empty),
     ))
 }
 
@@ -4143,6 +4178,7 @@ pub fn effective_fields_checked<F: DocumentFields>(
 pub fn effective_value_cursors_checked<F: DocumentFields>(
     fields: &F,
     collapse: bool,
+    collections_as_empty: bool,
 ) -> Result<Vec<F::Cursor>, EvalError> {
     let mut out = Vec::new();
     // The hashes of the first `SMALL_OBJECT_FIELDS` keyed fields; past them, `hashes` takes
@@ -4168,7 +4204,7 @@ pub fn effective_value_cursors_checked<F: DocumentFields>(
                 first_key = Some(field.key);
             } else if out.len() <= SMALL_OBJECT_FIELDS {
                 for key in first_key.take().iter().chain(core::iter::once(&field.key)) {
-                    if let Some(hash) = key_hash_of(key) {
+                    if let Some(hash) = collapse_key_hash_of(key, collections_as_empty) {
                         small[small_len] = hash;
                         small_len += 1;
                     }
@@ -4180,7 +4216,11 @@ pub fn effective_value_cursors_checked<F: DocumentFields>(
                 }
                 batch.push(field.key);
                 if batch.len() == KEY_HASH_BATCH {
-                    hashes.extend(batch.drain(..).filter_map(|key| key_hash_of(&key)));
+                    hashes.extend(
+                        batch
+                            .drain(..)
+                            .filter_map(|key| collapse_key_hash_of(&key, collections_as_empty)),
+                    );
                 }
             }
         }
@@ -4213,18 +4253,34 @@ pub fn effective_value_cursors_checked<F: DocumentFields>(
             let mut shared = small.to_vec();
             shared.sort_unstable();
             let every_key = small.len() < out.len();
-            return Ok(collapse_repeated_cursors(fields, out, &shared, every_key));
+            return Ok(collapse_repeated_cursors(
+                fields,
+                out,
+                &shared,
+                every_key,
+                collections_as_empty,
+            ));
         }
         return Ok(out);
     }
-    hashes.extend(batch.drain(..).filter_map(|key| key_hash_of(&key)));
+    hashes.extend(
+        batch
+            .drain(..)
+            .filter_map(|key| collapse_key_hash_of(&key, collections_as_empty)),
+    );
     // A key with no hash left no entry, which `collapse_repeated_cursors` has to know (#7311).
     let every_key = hashes.len() < out.len();
     let (shared, _) = repeated_hashes(hashes);
     if shared.is_empty() {
         return Ok(out);
     }
-    Ok(collapse_repeated_cursors(fields, out, &shared, every_key))
+    Ok(collapse_repeated_cursors(
+        fields,
+        out,
+        &shared,
+        every_key,
+        collections_as_empty,
+    ))
 }
 
 /// The widest object whose key hashes [`effective_value_cursors_checked`] keeps on the stack.
@@ -4281,6 +4337,7 @@ fn collapse_repeated_cursors<F: DocumentFields>(
     mut values: Vec<F::Cursor>,
     shared: &[u64],
     every_key: bool,
+    collections_as_empty: bool,
 ) -> Vec<F::Cursor> {
     let mut slots = SharedKeySlots::default();
     let mut kept = 0usize;
@@ -4288,7 +4345,9 @@ fn collapse_repeated_cursors<F: DocumentFields>(
     let mut at = 0usize;
     while let Some((key, _cursor, rest)) = walk.uncons_key() {
         let value = values[at];
-        match collapsing_key(&key, shared, every_key, key_hash_of) {
+        match collapsing_key(&key, shared, every_key, |key| {
+            collapse_key_hash_of(key, collections_as_empty)
+        }) {
             Some(name) => match slots.slot(name, kept) {
                 Some(slot) => values[slot] = value,
                 None => {
