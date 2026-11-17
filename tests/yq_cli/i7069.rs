@@ -74,3 +74,203 @@ fn dots_as_a_comment_target_and_in_jq_keep_their_readings_7069() -> Result<()> {
     assert_ne!(code, 0, "jq has no `...`");
     Ok(())
 }
+
+/// #7069 (the slice of the 2026-11-18 triage): a metadata assignment in the body of `with(PATH; ...)` or
+/// `PATH |= (...)` is a stage of the filter with `PATH` in front of its target, in the same order, so
+/// `with(.a.b; . = "new" | . style="double")` is `.a.b = "new" | .a.b style="double"`. Both spellings
+/// were refused. Each row is a live yq v4.53.3 capture (`yq FILTER`, YAML output).
+const META_ROWS: &[(&str, &str, &str)] = &[
+    (
+        "a:\n  b: thing\n  c: something\n",
+        "with(.a.b; . = \"new\" | . style=\"double\")",
+        "a:\n  b: \"new\"\n  c: something\n",
+    ),
+    (
+        "a:\n  b: thing\n  c: something\n",
+        "with(.a.deeply.nested; . = \"newValue\" | . style=\"single\")",
+        "a:\n  b: thing\n  c: something\n  deeply:\n    nested: 'newValue'\n",
+    ),
+    (
+        "a:\n  deeply:\n    nested: v\n",
+        "with(.a.deeply.nested; . = \"newValue\" | . style=\"single\")",
+        "a:\n  deeply:\n    nested: 'newValue'\n",
+    ),
+    (
+        "a:\n  b: thing\n  c: something\n",
+        "with(.a; .b line_comment=\"x\")",
+        "a:\n  b: thing # x\n  c: something\n",
+    ),
+    (
+        "a:\n  b: thing\n  c: something\n",
+        "with(.a.b; . style=\"double\" | . = \"new\")",
+        "a:\n  b: \"new\"\n  c: something\n",
+    ),
+    (
+        "a:\n  b: thing\n  c: something\n",
+        "with(.a.b; . style=\"double\")",
+        "a:\n  b: \"thing\"\n  c: something\n",
+    ),
+    (
+        "a:\n  b: thing\n  c: something\n",
+        "with(.a.b; . line_comment=\"x\")",
+        "a:\n  b: thing # x\n  c: something\n",
+    ),
+    (
+        "a:\n  b: thing\n  c: something\n",
+        "with(.a.b; . = \"n\" | . line_comment=\"x\")",
+        "a:\n  b: n # x\n  c: something\n",
+    ),
+    (
+        "a:\n  b: thing\n  c: something\n",
+        "with(.a; .b style=\"double\" | .c style=\"single\")",
+        "a:\n  b: \"thing\"\n  c: 'something'\n",
+    ),
+    (
+        "a:\n  b: thing\n  c: something\n",
+        "with(.a; .b = \"n\" | .b style=\"double\")",
+        "a:\n  b: \"n\"\n  c: something\n",
+    ),
+    (
+        "a:\n  b: thing\n  c: something\n",
+        "with(.a.b; . = {\"x\": 1} | .x style=\"double\")",
+        "a:\n  b:\n    x: \"1\"\n  c: something\n",
+    ),
+    (
+        "a:\n  b: thing\n  c: something\n",
+        "with(.a.b; . = [1, 2] | . style=\"flow\")",
+        "a:\n  b: [1, 2]\n  c: something\n",
+    ),
+    (
+        "a:\n  b: thing\n  c: something\n",
+        "with(.a.b; . = 5 | . style=\"single\")",
+        "a:\n  b: '5'\n  c: something\n",
+    ),
+    (
+        "a:\n  b: thing\n  c: something\n",
+        "with(.a.b; . anchor=\"z\")",
+        "a:\n  b: &z thing\n  c: something\n",
+    ),
+    (
+        "a:\n  b: thing\n  c: something\n",
+        "with(.a.b; . tag=\"!!str\")",
+        "a:\n  b: thing\n  c: something\n",
+    ),
+    (
+        "a:\n  b: thing # c1\n  c: [1, 2]\nd: 4\n",
+        "with(.a.b; . = \"new\" | . style=\"double\")",
+        "a:\n  b: \"new\" # c1\n  c: [1, 2]\nd: 4\n",
+    ),
+    (
+        "a:\n  b: thing # c1\n  c: [1, 2]\nd: 4\n",
+        "with(.a.c; . style=\"double\")",
+        "a:\n  b: thing # c1\n  c:\n    - 1\n    - 2\nd: 4\n",
+    ),
+    (
+        "a:\n  b: thing # c1\n  c: [1, 2]\nd: 4\n",
+        "with(.d; . line_comment=\"y\")",
+        "a:\n  b: thing # c1\n  c: [1, 2]\nd: 4 # y\n",
+    ),
+    (
+        "l:\n  - x\n  - y\n",
+        "with(.l[0]; . = \"new\" | . style=\"double\")",
+        "l:\n  - \"new\"\n  - y\n",
+    ),
+    (
+        "l:\n  - x\n  - y\n",
+        "with(.l[]; . style=\"double\")",
+        "l:\n  - \"x\"\n  - \"y\"\n",
+    ),
+    (
+        "l:\n  - x\n  - y\n",
+        "with(.l[]; . = \"n\" | . style=\"single\")",
+        "l:\n  - 'n'\n  - 'n'\n",
+    ),
+    (
+        "a:\n  b: thing\n  c: something\n",
+        "with(.z; . = \"new\" | . style=\"double\")",
+        "a:\n  b: thing\n  c: something\nz: \"new\"\n",
+    ),
+    (
+        "a:\n  b: thing\n  c: something\n",
+        "with(.a.z; . = 5 | . line_comment=\"five\")",
+        "a:\n  b: thing\n  c: something\n  z: 5 # five\n",
+    ),
+    (
+        "a:\n  b: thing\n  c: something\n",
+        "with(.a.b?; . style=\"double\")",
+        "a:\n  b: \"thing\"\n  c: something\n",
+    ),
+    (
+        "a:\n  b: thing\n  c: something\n",
+        ".a.b |= (. = \"new\" | . style=\"double\")",
+        "a:\n  b: \"new\"\n  c: something\n",
+    ),
+    (
+        "a:\n  b: thing\n  c: something\n",
+        ".a |= (.b line_comment=\"x\")",
+        "a:\n  b: thing # x\n  c: something\n",
+    ),
+    (
+        "a:\n  b: thing\n  c: something\n",
+        ".a.b |= (. style=\"double\" | . = \"new\")",
+        "a:\n  b: \"new\"\n  c: something\n",
+    ),
+    (
+        "a:\n  b: thing\n  c: something\n",
+        ".a.b |= . style=\"double\"",
+        "a:\n  b: \"thing\"\n  c: something\n",
+    ),
+    (
+        "l:\n  - x\n  - y\n",
+        ".l[] |= (. = \"n\" | . style=\"single\")",
+        "l:\n  - 'n'\n  - 'n'\n",
+    ),
+    (
+        "a:\n  b: thing\n  c: something\n",
+        ".a[] |= (. style=\"double\")",
+        "a:\n  b: \"thing\"\n  c: \"something\"\n",
+    ),
+    (
+        "a:\n  b: thing\n  c: something\n",
+        ".[] |= (.b style=\"single\" | .c line_comment=\"x\")",
+        "a:\n  b: 'thing'\n  c: something # x\n",
+    ),
+];
+
+#[test]
+fn a_metadata_assignment_inside_with_or_an_update_body_writes_at_the_path_7069() -> Result<()> {
+    for &(doc, filter, want) in META_ROWS {
+        let (out, code) = run_yq_stdin(filter, doc, &[])?;
+        assert_eq!((out.as_str(), code), (want, 0), "{filter} on {doc:?}");
+    }
+    Ok(())
+}
+
+/// A body that is not stages of literals stays refused: a right side reads the node the body runs on,
+/// so it would read another one with `PATH` in front of it, and a `del` is not an assignment of this
+/// kind. yq answers these; they are listed in `limitations.md`.
+#[test]
+fn a_body_that_reads_the_node_or_deletes_stays_refused_7069() -> Result<()> {
+    for (doc, filter) in [
+        (
+            "a:\n  b: thing\n  c: something\n",
+            "with(.a; .b line_comment = .c)",
+        ),
+        (
+            "a:\n  b: thing\n  c: something\n",
+            ".a |= (. = .b | . style=\"double\")",
+        ),
+        (
+            "a:\n  b: thing\n  c: something\n",
+            "with(.a; del(.b) | . style=\"double\")",
+        ),
+        (
+            "a:\n  b: thing\n  c: something\n",
+            "with(.a; . style=\"double\" | .c = .b)",
+        ),
+    ] {
+        let (out, code) = run_yq_stdin(filter, doc, &[])?;
+        assert_eq!((out.as_str(), code), ("", 1), "{filter}");
+    }
+    Ok(())
+}

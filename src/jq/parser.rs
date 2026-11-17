@@ -741,6 +741,115 @@ fn is_ident_start_char(c: char) -> bool {
     c.is_alphabetic() || c == '_'
 }
 
+/// Whether `expr` builds its value from literals alone, so it reads nothing from the node it is
+/// written to (`"new"`, `7`, `[1, 2]`, `{"x": 1}`), a comma of values excepted (#7069).
+fn is_plain_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) => true,
+        Expr::Paren(inner) => is_plain_literal(inner),
+        Expr::Array(inner) => match inner.as_ref() {
+            Expr::Comma(items) => items.iter().all(is_plain_literal),
+            single => is_plain_literal(single),
+        },
+        Expr::Object(entries) => entries.iter().all(|entry| {
+            matches!(entry.key, ObjectKey::Literal(_)) && is_plain_literal(&entry.value)
+        }),
+        _ => false,
+    }
+}
+
+/// yq's `with(PATH; BODY)` and `PATH |= (BODY)` whose body assigns metadata, as the pipe-stage
+/// form that already works (#7069): every stage of the body with `PATH` put in front of its target,
+/// in the same order. `with(.a.b; . = "new" | . style="double")` is `.a.b = "new" | .a.b
+/// style="double"`, and `with(.a; .b line_comment="x")` is `.a.b line_comment="x"`; yq answers the same
+/// for both spellings, whether `PATH` exists or not (a missing one is created by the write, as `|=`
+/// creates it).
+///
+/// A metadata write is resolved against the document a pipe stage sees, so it only works as a stage
+/// of the filter, and not inside the body of an update. Only a body that this can state as stages
+/// is rewritten: each stage is a metadata assignment, an `=` or a `|=` whose right side is a literal
+/// (read against the node the body runs on, so any other right side would read a different node
+/// once `PATH` is in front), or `.`. `PATH` has to be navigation with no comma. `None` for any
+/// other body (it keeps the update), and for one with no metadata assignment in it.
+fn with_meta_stages(path: &Expr, body: &Expr) -> Option<Expr> {
+    fn names_one_node_or_many(expr: &Expr) -> bool {
+        match expr {
+            Expr::Comma(_) => false,
+            Expr::Paren(inner) | Expr::Optional(inner) => names_one_node_or_many(inner),
+            Expr::Pipe(stages) => stages.iter().all(names_one_node_or_many),
+            _ => true,
+        }
+    }
+    fn stages_of<'e>(body: &'e Expr, out: &mut Vec<&'e Expr>) {
+        match body {
+            Expr::Paren(inner) => stages_of(inner, out),
+            Expr::Pipe(stages) => stages.iter().for_each(|stage| stages_of(stage, out)),
+            stage => out.push(stage),
+        }
+    }
+    if !is_navigation_expr(path) || !names_one_node_or_many(path) {
+        return None;
+    }
+    let mut stages = Vec::new();
+    stages_of(body, &mut stages);
+    // One flat pipe of steps, as the parser reads `.a.b.c` (`.a[0]` then `.x` is `.a[0].x`).
+    let under = |target: &Expr| {
+        let mut steps = Vec::new();
+        for part in [path, target] {
+            match part {
+                Expr::Identity => {}
+                Expr::Pipe(inner) => steps.extend(inner.iter().cloned()),
+                other => steps.push(other.clone()),
+            }
+        }
+        match steps.len() {
+            0 => Expr::Identity,
+            _ => Expr::pipe(steps),
+        }
+    };
+    let mut rewritten = Vec::with_capacity(stages.len());
+    let mut writes_metadata = false;
+    for stage in stages {
+        match stage {
+            Expr::Identity => {}
+            Expr::MetaAssign {
+                target,
+                slot,
+                value,
+                is_update,
+            } if *slot != MetaSlot::KeyName && is_plain_literal(value) => {
+                writes_metadata = true;
+                rewritten.push(Expr::MetaAssign {
+                    target: Box::new(under(target)),
+                    slot: *slot,
+                    value: value.clone(),
+                    is_update: *is_update,
+                });
+            }
+            Expr::Assign {
+                path: target,
+                value,
+            } if is_plain_literal(value) => {
+                rewritten.push(Expr::Assign {
+                    path: Box::new(under(target)),
+                    value: value.clone(),
+                });
+            }
+            Expr::Update {
+                path: target,
+                filter,
+            } if is_plain_literal(filter) => {
+                rewritten.push(Expr::Update {
+                    path: Box::new(under(target)),
+                    filter: filter.clone(),
+                });
+            }
+            _ => return None,
+        }
+    }
+    writes_metadata.then(|| Expr::pipe(rewritten))
+}
+
 /// What yq's `with(path; update)` keeps of `update` (#4206): the in-place changes its assignments
 /// make, applied to the node `path` names, and nothing else. yq runs `update` with each node as
 /// its context and discards the value of whatever is not an assignment, so `. = 2 | . + 1`
@@ -6605,6 +6714,10 @@ impl<'a> Parser<'a> {
             return self.wrong_arity_or_expect(start_pos, ')', vec![path, update]);
         }
         self.next();
+        // #7069: a metadata assignment in the update is a stage of the filter, with `path` ahead of it.
+        if let Some(stages) = with_meta_stages(&path, &update) {
+            return Ok(stages);
+        }
         let filter = with_update_effect(&update);
         Ok(Expr::Update {
             path: Box::new(path),
@@ -11704,6 +11817,10 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let filter = self.parse_assignment_operand()?;
             let filter = if self.mode == ParserMode::Yq {
+                // #7069: `PATH |= (. = "new" | . style="double")` writes metadata at `PATH`.
+                if let Some(stages) = with_meta_stages(&left, &filter) {
+                    return Ok(stages);
+                }
                 update_body_effect(&filter).unwrap_or(filter)
             } else {
                 filter
