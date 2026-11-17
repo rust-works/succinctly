@@ -9094,7 +9094,7 @@ fn retain_truthy_generic<V: DocumentValue, S: EvalSemantics>(
 
 /// How many elements `fold_pipe_stages`' `ManyCursor` arm folds exactly as it did before #7267
 /// before it may move a fold whose elements have all yielded one computed value or nothing so
-/// far to [`collect_computed_run`], and how many must be left for it to (#7267). A fold of fewer
+/// far to its run of values ([`move_computed_run`]), and how many must be left for it to (#7267). A fold of fewer
 /// than twice this many elements, or one that meets any other kind of result in its first
 /// `COMPUTED_RUN_MIN`, builds main's batch, its flatten and its handed-on vector, allocator calls
 /// included; a longer one is long enough to pay for the vector it moves into (#7267 review: a
@@ -9109,7 +9109,7 @@ const COMPUTED_RUN_MIN: usize = 64;
 /// enclosing function returns, a lazy object is built as it arrives, and anything else is pushed
 /// as its own entry. `$computed_only` is cleared by any entry but an `Owned` or a `None`.
 macro_rules! push_element_result_7267 {
-    ($S:ty, $prefix:expr, $per_element:ident, $result:expr, $computed_only:ident) => {
+    ($S:ty, $wrap:expr, $prefix:expr, $per_element:ident, $result:expr, $computed_only:ident) => {
         match $result {
             // The elements already piped through no
             // longer vanish (#400, #494). If an earlier
@@ -9118,20 +9118,20 @@ macro_rules! push_element_result_7267 {
             // it, that earlier failure wins -- it's
             // chronologically first in evaluation order.
             GenericResult::Error(e) => {
-                return match flatten_generic_results_onto::<_, $S>($prefix, $per_element) {
-                    Ok(prefix) => partial_generic(prefix, Control::Error(e)),
-                    Err(Control::Error(earlier)) => GenericResult::Error(earlier),
-                    Err(Control::Break(label)) => GenericResult::Break(label),
-                    Err(Control::Halt(code)) => GenericResult::Halt(code),
-                };
+                return $wrap(stop_fold::<_, $S>(
+                    $prefix,
+                    $per_element,
+                    Control::Error(e),
+                    Vec::new(),
+                ));
             }
             GenericResult::Break(label) => {
-                return match flatten_generic_results_onto::<_, $S>($prefix, $per_element) {
-                    Ok(prefix) => partial_generic(prefix, Control::Break(label)),
-                    Err(Control::Error(earlier)) => GenericResult::Error(earlier),
-                    Err(Control::Break(earlier_label)) => GenericResult::Break(earlier_label),
-                    Err(Control::Halt(code)) => GenericResult::Halt(code),
-                };
+                return $wrap(stop_fold::<_, $S>(
+                    $prefix,
+                    $per_element,
+                    Control::Break(label),
+                    Vec::new(),
+                ));
             }
             // Same immediate-stop treatment as `Error`/`Break`
             // above — halt is an opaque terminal signal, not
@@ -9140,23 +9140,15 @@ macro_rules! push_element_result_7267 {
             // below (which would keep evaluating later cursor
             // elements instead of stopping immediately).
             GenericResult::Halt(code) => {
-                return match flatten_generic_results_onto::<_, $S>($prefix, $per_element) {
-                    Ok(prefix) => partial_generic(prefix, Control::Halt(code)),
-                    Err(Control::Error(earlier)) => GenericResult::Error(earlier),
-                    Err(Control::Break(label)) => GenericResult::Break(label),
-                    Err(Control::Halt(earlier_code)) => GenericResult::Halt(earlier_code),
-                };
+                return $wrap(stop_fold::<_, $S>(
+                    $prefix,
+                    $per_element,
+                    Control::Halt(code),
+                    Vec::new(),
+                ));
             }
             GenericResult::Partial(vs, control) => {
-                return match flatten_generic_results_onto::<_, $S>($prefix, $per_element) {
-                    Ok(mut prefix) => {
-                        prefix.extend(vs);
-                        partial_generic(prefix, control)
-                    }
-                    Err(Control::Error(earlier)) => GenericResult::Error(earlier),
-                    Err(Control::Break(label)) => GenericResult::Break(label),
-                    Err(Control::Halt(code)) => GenericResult::Halt(code),
-                };
+                return $wrap(stop_fold::<_, $S>($prefix, $per_element, control, vs));
             }
             // #4044: collected, an object is read in full anyway, so it
             // is built as it arrives rather than held lazily until
@@ -9180,9 +9172,24 @@ macro_rules! push_element_result_7267 {
 /// `fold_pipe_stages`' `ManyCursor` arm over its elements' results (`eval` of each element).
 ///
 /// It is the arm as it was before #7267, with one addition: once [`COMPUTED_RUN_MIN`] elements
-/// have each yielded one computed value or nothing, and at least as many are left, the fold moves to
-/// [`collect_computed_run`], which keeps the values in one vector instead of an 80-byte entry
-/// each (#7267). A fold that is shorter, or that has met any other kind of result by then, is
+/// have each yielded one computed value or nothing, and at least as many are left, the fold
+/// moves its values into one vector ([`move_computed_run`]), sized for every element, and pushes
+/// each further computed value straight into it: about 32 bytes per element where an 80-byte
+/// `GenericResult` per element plus the vector the flatten grew from empty held 112-144 (#7267).
+/// A computed value cannot fail later and a `None` adds nothing, so a fold that ends this way
+/// hands the vector on as its result ([`finish_computed_run`]).
+///
+/// At the first element that yields anything else, the fold goes back to main's loop body
+/// ([`leave_computed_run`]): up to [`COMPUTED_RUN_MIN`] values become the `Owned` entries main
+/// would have pushed, and the fold ends as main's; a longer run stays the first part of the
+/// result, and main's batch for the rest is flattened onto it in place (on a failure too, so the
+/// prefix kept is the same). Computed values are not cursors, so the all-cursors decision is the
+/// one main would make, and "an earlier lazily failing element wins" holds as before.
+///
+/// Both modes run in this one loop, so an element evaluated after the move recurses from this
+/// frame alone (#7267 review: a moved run in its own out-of-line function kept that frame too, and
+/// the native-stack guard refused a recursion through such folds 2% sooner than main). A fold that
+/// is shorter, or that meets another kind of result in its first [`COMPUTED_RUN_MIN`] elements, is
 /// main's fold throughout: the same batch, flatten, handed-on vector and allocator calls.
 #[inline(always)]
 fn fold_cursor_elements<S: EvalSemantics, V: DocumentValue, I: ExactSizeIterator>(
@@ -9191,82 +9198,197 @@ fn fold_cursor_elements<S: EvalSemantics, V: DocumentValue, I: ExactSizeIterator
 ) -> GenericResult<V> {
     let mut per_element = vec_with_capacity(elements.len());
     let mut computed_only = true;
+    // The moved run: empty until the fold moves, and the prefix of the result once a long run
+    // has gone back to the batch.
+    let mut values: Vec<OwnedValue> = Vec::new();
+    let mut moved = false;
+    #[cfg(test)]
+    let mut went_back = false;
     while let Some(element) = elements.next() {
-        push_element_result_7267!(S, Vec::new(), per_element, eval(element), computed_only);
+        let result = eval(element);
+        if moved {
+            match result {
+                GenericResult::None => continue,
+                GenericResult::Owned(o) => {
+                    values.push(o);
+                    continue;
+                }
+                // #4044, as main's loop body does: a lazy object is built as it arrives.
+                obj @ GenericResult::LazyObject(_) => match obj.materialize_lazy::<S>() {
+                    GenericResult::Owned(o) => {
+                        values.push(o);
+                        continue;
+                    }
+                    failed => {
+                        moved = false;
+                        #[cfg(test)]
+                        {
+                            went_back = true;
+                        }
+                        leave_computed_run(&mut values, &mut per_element);
+                        per_element.push(failed);
+                        continue;
+                    }
+                },
+                other => {
+                    moved = false;
+                    #[cfg(test)]
+                    {
+                        went_back = true;
+                    }
+                    leave_computed_run(&mut values, &mut per_element);
+                    // Out of line, so that this loop holds one element's result at a time.
+                    if let Some(stopped) =
+                        push_element_result_cold::<S, V>(&mut values, &mut per_element, other)
+                    {
+                        return stopped;
+                    }
+                    continue;
+                }
+            }
+        }
+        push_element_result_7267!(
+            S,
+            core::convert::identity,
+            core::mem::take(&mut values),
+            per_element,
+            result,
+            computed_only
+        );
         if computed_only
             && per_element.len() == COMPUTED_RUN_MIN
             && elements.len() >= COMPUTED_RUN_MIN
         {
-            return collect_computed_run::<S, V, I>(per_element, elements, eval);
+            computed_only = false;
+            moved = true;
+            move_computed_run(&mut per_element, &mut values, elements.len());
         }
     }
     // Main's `for` loop consumed the elements, so their cursors were freed before the flatten
     // (#7267 review: kept to here, 100,000 of them held 3.1 MiB more at the peak).
     drop(elements);
+    #[cfg(test)]
+    if went_back {
+        batch_stats_7267::note_entries(
+            per_element.capacity(),
+            per_element.capacity(),
+            &per_element,
+        );
+    }
+    if moved || !values.is_empty() {
+        return finish_computed_run::<S, V>(values, per_element, moved);
+    }
     finish_entries::<S, V>(per_element)
 }
 
-/// The rest of a fold whose first [`COMPUTED_RUN_MIN`] elements each yielded one computed value
-/// or nothing (#7267). `per_element` holds those elements' entries; its capacity, one entry per
-/// element of the fold, is kept for the batch should the fold need one again.
-///
-/// The values go into one vector sized for every element, and each further computed value is
-/// pushed straight into it: about 32 bytes per element where an 80-byte `GenericResult` per
-/// element plus the vector the flatten grew from empty held 112-144. A computed value cannot
-/// fail later and a `None` adds nothing, so a fold that ends this way hands the vector on as its
-/// result, after giving back the slack of the elements that yielded nothing ([`release_slack`]).
-///
-/// At the first element that yields anything else, the rest of the fold is main's loop body. If
-/// there are no more than [`COMPUTED_RUN_MIN`] values, they go back as the `Owned` entries main
-/// would have pushed and the fold ends as main's; otherwise they stay the first part of the
-/// result, and main's batch for the rest is flattened onto them in place (on a failure too, so the
-/// prefix kept is the same). Computed values are not cursors, so the all-cursors decision is the
-/// one main would make, and "an earlier lazily failing element wins" holds as before.
-///
-/// `#[inline]`, not `#[inline(never)]`, although it is not inlined: a generic function without the
-/// hint is reused from the library crate's instantiation, whose copy of the evaluator below `eval`
-/// LLVM inlined differently, and every element then ran about 3% more instructions (#7267 review,
-/// cachegrind on the AMD Ryzen 9 7950X).
-#[inline]
-fn collect_computed_run<S: EvalSemantics, V: DocumentValue, I: ExactSizeIterator>(
-    mut per_element: Vec<GenericResult<V>>,
-    mut elements: I,
-    mut eval: impl FnMut(I::Item) -> GenericResult<V>,
+/// What `fold_pipe_stages`' `ManyCursor` arm returns when an element stops the fold with
+/// `control` (and, for a `Partial`, the values `tail` it produced first), as main's loop body
+/// computed it: the batch so far flattened onto `prefix`, then `tail`, as the prefix of a
+/// `Partial`; or, if an earlier element's buffered lazy result fails in the flatten, that earlier
+/// failure, which is first in evaluation order. Out of line, so that the loop's frame does not
+/// hold these rare temporaries (#7267 review: the frame is what each level of a recursion
+/// through the fold costs the native-stack guard).
+#[inline(never)]
+fn stop_fold<V: DocumentValue, S: EvalSemantics>(
+    prefix: Vec<OwnedValue>,
+    per_element: Vec<GenericResult<V>>,
+    control: Control,
+    tail: Vec<OwnedValue>,
 ) -> GenericResult<V> {
-    #[cfg(test)]
-    let total = per_element.len() + elements.len();
-    let mut values: Vec<OwnedValue> = vec_with_capacity(per_element.len() + elements.len());
-    // Taken out in place rather than drained, which keeps the batch's capacity for later too.
-    for entry in &mut per_element {
+    match flatten_generic_results_onto::<V, S>(prefix, per_element) {
+        Ok(mut prefix) => {
+            prefix.extend(tail);
+            partial_generic(prefix, control)
+        }
+        Err(Control::Error(earlier)) => GenericResult::Error(earlier),
+        Err(Control::Break(label)) => GenericResult::Break(label),
+        Err(Control::Halt(code)) => GenericResult::Halt(code),
+    }
+}
+
+/// Main's loop body for the element that ends a moved run, which [`fold_cursor_elements`] calls
+/// out of line so that its loop holds a single element's result (#7267): the stack each level of
+/// a recursion through such folds takes is then no more than main's. Returns what the fold returns
+/// when the element stops it.
+#[inline(never)]
+fn push_element_result_cold<S: EvalSemantics, V: DocumentValue>(
+    values: &mut Vec<OwnedValue>,
+    per_element: &mut Vec<GenericResult<V>>,
+    result: GenericResult<V>,
+) -> Option<GenericResult<V>> {
+    let mut batch = core::mem::take(per_element);
+    let mut _computed_only = false;
+    push_element_result_7267!(
+        S,
+        Some,
+        core::mem::take(values),
+        batch,
+        result,
+        _computed_only
+    );
+    *per_element = batch;
+    None
+}
+
+/// The move of [`fold_cursor_elements`]: the values of the batch's entries so far into one
+/// vector sized for every element of the fold (#7267). The batch keeps its capacity, one entry
+/// per element, should the fold need it again.
+#[inline(never)]
+fn move_computed_run<V: DocumentValue>(
+    per_element: &mut Vec<GenericResult<V>>,
+    values: &mut Vec<OwnedValue>,
+    left: usize,
+) {
+    *values = vec_with_capacity(per_element.len() + left);
+    // Taken out in place rather than drained, which keeps the batch's capacity.
+    for entry in per_element.iter_mut() {
         if let GenericResult::Owned(o) = core::mem::replace(entry, GenericResult::None) {
             values.push(o);
         }
     }
     per_element.clear();
-    // The first result of another kind, and whether it is already the batch entry (a lazy
-    // object whose building failed, which the batch keeps as it is).
-    let other = loop {
-        let Some(element) = elements.next() else {
-            break None;
-        };
-        match eval(element) {
-            GenericResult::None => {}
-            GenericResult::Owned(o) => values.push(o),
-            obj @ GenericResult::LazyObject(_) => match obj.materialize_lazy::<S>() {
-                GenericResult::Owned(o) => values.push(o),
-                failed => break Some((failed, true)),
-            },
-            other => break Some((other, false)),
-        }
-    };
-    let Some((other, is_entry)) = other else {
-        drop(elements);
+}
+
+/// The way back of [`fold_cursor_elements`] to main's batch (#7267). A short run goes back as the
+/// `Owned` entries main would have pushed, and the fold ends as main's. A long one stays in
+/// `values` as the first part of the result, which main's batch for the rest is flattened onto in
+/// place (#7267 review: as a leading `ManyOwned` entry it was copied into a vector the flatten
+/// grew from the run's length and then shrank, and on glibc the shrunk tails of the vectors an
+/// enclosing fold kept fragmented the heap, +81% peak RSS over 20,000 inner folds of 1,000 values
+/// on the AMD Ryzen 9 7950X).
+#[inline(never)]
+fn leave_computed_run<V: DocumentValue>(
+    values: &mut Vec<OwnedValue>,
+    per_element: &mut Vec<GenericResult<V>>,
+) {
+    if values.len() <= COMPUTED_RUN_MIN {
+        per_element.extend(
+            core::mem::take(values)
+                .into_iter()
+                .map(GenericResult::Owned),
+        );
+    } else {
+        #[cfg(test)]
+        batch_stats_7267::note_leading(values.len(), values.capacity(), per_element.capacity());
+    }
+}
+
+/// The end of a fold that moved (#7267): its run, with the slack of the elements that yielded
+/// nothing given back ([`release_slack`]), if it never went back; otherwise main's batch for the
+/// rest flattened onto the run, released the same way.
+#[inline(never)]
+fn finish_computed_run<S: EvalSemantics, V: DocumentValue>(
+    mut values: Vec<OwnedValue>,
+    per_element: Vec<GenericResult<V>>,
+    moved: bool,
+) -> GenericResult<V> {
+    if moved {
         #[cfg(test)]
         let reserved = values.capacity();
         release_slack(&mut values);
         #[cfg(test)]
         batch_stats_7267::note_fold(batch_stats_7267::Fold::Values {
-            elements: total,
+            elements: per_element.capacity(),
             reserved,
             len: values.len(),
             capacity: values.capacity(),
@@ -9276,36 +9398,8 @@ fn collect_computed_run<S: EvalSemantics, V: DocumentValue, I: ExactSizeIterator
         } else {
             GenericResult::ManyOwned(values)
         };
-    };
-    // A short run goes back as the `Owned` entries main would have pushed, and the fold ends as
-    // main's. A long one stays the first part of the result: the rest of the fold is main's batch,
-    // flattened onto it in place (#7267 review: as a leading `ManyOwned` entry it was copied
-    // into a vector the flatten grew from the run's length and then shrank, and on glibc the
-    // shrunk tails of the vectors an enclosing fold kept fragmented the heap, +81% peak RSS over
-    // 20,000 inner folds of 1,000 values on the AMD Ryzen 9 7950X).
-    let prefix = if values.len() <= COMPUTED_RUN_MIN {
-        per_element.extend(values.into_iter().map(GenericResult::Owned));
-        Vec::new()
-    } else {
-        #[cfg(test)]
-        batch_stats_7267::note_leading(values.len(), values.capacity(), total);
-        values
-    };
-    let mut _computed_only = false;
-    if is_entry {
-        per_element.push(other);
-    } else {
-        push_element_result_7267!(S, prefix, per_element, other, _computed_only);
     }
-    for element in elements {
-        push_element_result_7267!(S, prefix, per_element, eval(element), _computed_only);
-    }
-    #[cfg(test)]
-    batch_stats_7267::note_entries(total, per_element.capacity(), &per_element);
-    if prefix.is_empty() {
-        return finish_entries::<S, V>(per_element);
-    }
-    match flatten_generic_results_onto::<V, S>(prefix, per_element) {
+    match flatten_generic_results_onto::<V, S>(values, per_element) {
         Ok(mut results) => {
             release_slack(&mut results);
             #[cfg(test)]
@@ -9382,14 +9476,14 @@ fn release_slack(v: &mut Vec<OwnedValue>) {
     }
 }
 
-/// Test-only accounting for [`collect_computed_run`] (#7267): what each fold that moved there
+/// Test-only accounting for [`fold_cursor_elements`] (#7267): what each fold that moved
 /// reserved and handed on, and how many values its own reallocations copied.
 #[cfg(test)]
 mod batch_stats_7267 {
     use super::{DocumentValue, GenericResult};
     use core::cell::RefCell;
 
-    /// One fold that moved to [`super::collect_computed_run`].
+    /// One fold that moved its values out of the batch.
     #[derive(Clone, Debug)]
     pub(super) enum Fold {
         /// It ended with every element computed or empty.
@@ -9617,7 +9711,7 @@ mod per_element_batch_tests_7267 {
 
     /// Random sequences of every kind of result, short and long, some led by a long computed run:
     /// the result is main's (`Debug`-equal, a stop included); a fold that never moved to
-    /// `collect_computed_run` hands on exactly main's capacity, and one that did hands on no more
+    /// moving hands on exactly main's capacity, and one that did hands on no more
     /// than `slack_allowed` over its values.
     #[test]
     fn folds_give_mains_results_and_capacity_7267() {

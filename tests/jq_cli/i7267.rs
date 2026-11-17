@@ -147,3 +147,21 @@ fn test_deep_recursion_through_a_per_element_fold_7267() -> Result<()> {
     assert_eq!(got, ("0\n".to_string(), String::new(), 0));
     Ok(())
 }
+
+/// The same recursion from inside a fold that has moved its computed values to their own vector,
+/// captured from jq 1.7.1 (`1`): the 99 values before the recursing element move after 64, so each
+/// level keeps the moved fold's frames on the stack. In 4fcc22658 that path ran in a second,
+/// out-of-line frame and the stack guard refused it at about depth 3,185, where main answers to
+/// 3,255 on an Apple M4 Pro in a release build (#7267 review); this depth lies between the two. A
+/// debug build reserves a larger stack, so there the row only pins the output.
+#[test]
+fn test_deep_recursion_from_a_moved_fold_7267() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("d.json");
+    let doc: Vec<String> = (1..=200).map(|n| n.to_string()).collect();
+    std::fs::write(&path, format!("[{}]", doc.join(",")))?;
+    let filter = ". as $d | def f(n): if n == 0 then 0 else [$d[] | if . == 100 then ($d | f(n - 1)) else . + 0 end] | .[0] end; f(3240)";
+    let got = run_jq_full(&[filter, path.to_str().expect("utf-8 temp path")], None)?;
+    assert_eq!(got, ("1\n".to_string(), String::new(), 0));
+    Ok(())
+}
