@@ -3642,29 +3642,38 @@ fn hash_walk<F: DocumentFields>(fields: &F) -> HashWalk {
 /// position in its field walk, for a writer that streams the fields rather
 /// than holding them (#7311).
 ///
-/// Only the fields whose key hash another field shares have a step; every
-/// other field is written as it stands. A repeated key's first occurrence
-/// keeps its position and takes its last occurrence's value, and every later
-/// occurrence is dropped: the rule `collapse_repeated` applies, without the
-/// list of every field it needs. On a 100 MB object of 7.1 M keys with one
-/// repeat, that list and its map of every key were 2.8 GiB of the print's
-/// peak; this holds two steps.
-pub struct RepeatPlan<C> {
+/// Only the fields whose key can collapse have a step; every other field is
+/// written as it stands. A repeated key's first occurrence keeps its position
+/// and takes its last occurrence's value, and every later occurrence is
+/// dropped: the rule `collapse_repeated` applies, without the list of every
+/// field it needs. On a 100 MB object of 7.1 M keys with one repeat, that
+/// list and its map of every key were 2.8 GiB of the print's peak; this holds
+/// two steps. A step is a position and a slot, and a value cursor is kept per
+/// slot, so an object that repeats a few keys a million times holds 16 bytes
+/// per occurrence and one cursor per key.
+pub(crate) struct RepeatPlan<C> {
     /// One per field that has a step, in walk order.
-    steps: Vec<RepeatStep<C>>,
+    steps: Vec<RepeatStep>,
+    /// The value each slot's field is written with: its key's last occurrence's.
+    values: Vec<C>,
     /// The next step [`RepeatPlan::fate`] has not reached yet.
     next: usize,
 }
 
-/// One field of a [`RepeatPlan`]: its position, and what is written there.
-struct RepeatStep<C> {
+/// One field of a [`RepeatPlan`]: its position, and the slot of the value
+/// written there, or [`RepeatStep::DROPPED`].
+struct RepeatStep {
     at: usize,
-    /// The value cursor written at `at`, or `None` when the field is dropped.
-    value: Option<C>,
+    slot: usize,
+}
+
+impl RepeatStep {
+    /// The slot of a field that is not written.
+    const DROPPED: usize = usize::MAX;
 }
 
 /// What a [`RepeatPlan`] makes of one field.
-pub enum FieldFate<C> {
+pub(crate) enum FieldFate<C> {
     /// Written as it stands.
     Unchanged,
     /// Written with this value, its key's last occurrence's.
@@ -3676,11 +3685,14 @@ pub enum FieldFate<C> {
 impl<C: Copy> RepeatPlan<C> {
     /// What becomes of the field at position `at` of the walk. Asked once
     /// per field, in walk order.
-    pub fn fate(&mut self, at: usize) -> FieldFate<C> {
+    pub(crate) fn fate(&mut self, at: usize) -> FieldFate<C> {
         match self.steps.get(self.next) {
             Some(step) if step.at == at => {
                 self.next += 1;
-                step.value.map_or(FieldFate::Dropped, FieldFate::Value)
+                match self.values.get(step.slot) {
+                    Some(&value) => FieldFate::Value(value),
+                    None => FieldFate::Dropped,
+                }
             }
             _ => FieldFate::Unchanged,
         }
@@ -3688,8 +3700,8 @@ impl<C: Copy> RepeatPlan<C> {
 
     /// The value cursors of the fields the rule keeps, in their order: the
     /// values a collapsed field list holds, without the list (`map` over an
-    /// object that repeats a key).
-    pub fn value_cursors<F: DocumentFields<Cursor = C>>(mut self, fields: &F) -> Vec<C> {
+    /// object that repeats a key). The walk is `uncons`, as the list's was.
+    pub(crate) fn value_cursors<F: DocumentFields<Cursor = C>>(mut self, fields: &F) -> Vec<C> {
         let mut out = Vec::new();
         let mut walk = fields.clone();
         let mut at = 0usize;
@@ -3720,11 +3732,15 @@ impl<C: Copy> RepeatPlan<C> {
 /// keys whose hash is shared: a handful on an ordinary object, so the
 /// second walk allocates next to nothing. A different key that merely
 /// shares a hash gets its own slot, which keeps its field as it stands, and
-/// an object where that is all that happened answers `Ok(None)`. A repeated
-/// key's slot is found by its hash and confirmed against the first key that
-/// hash met, as in `collapse_repeated_cursors`, so most fields of an
-/// object that repeats nearly every key cost no general-purpose hash.
-pub fn repeat_plan_checked<F: DocumentFields>(
+/// an object where that is all that happened answers `Ok(None)`.
+///
+/// Whether a key repeats is the hashes' answer, as it is for `census`, but
+/// which fields collapse is `collapse_repeated`'s: every key that stringifies,
+/// compared by its string. The two agree unless some key has no hash -- a
+/// YAML complex key (`? [x]`), or an escape that will not decode -- and then
+/// every key is decoded, so `{a: 1, a: 2, [x]: 3, [x]: 4}` still collapses
+/// both pairs under `map(f)`, as it did before and as yq does (#7311 review).
+pub(crate) fn repeat_plan_checked<F: DocumentFields>(
     fields: &F,
     collapse: bool,
 ) -> Result<Option<RepeatPlan<F::Cursor>>, EvalError> {
@@ -3735,30 +3751,34 @@ pub fn repeat_plan_checked<F: DocumentFields>(
     if !collapse || walked.shared.is_empty() {
         return Ok(None);
     }
-    let mut steps: Vec<RepeatStep<F::Cursor>> = Vec::new();
+    let every_key = walked.unkeyed > 0;
+    let mut steps: Vec<RepeatStep> = Vec::new();
+    let mut values: Vec<F::Cursor> = Vec::new();
     let mut slots = SharedKeySlots::default();
     let mut dropped = false;
     let mut walk = fields.clone();
     let mut at = 0usize;
     while let Some((key, _cursor, rest)) = walk.uncons_key() {
-        if let Some(hash) = key_hash_of(&key) {
-            if walked.shared.binary_search(&hash).is_ok() {
-                // `key_hash_of` answers `Some` only for a key that
-                // stringifies, and `uncons` meets the same field
-                // `uncons_key` just did, so neither of these is `None` on
-                // the object the walk above accepted.
-                if let (Some(name), Some((field, _))) = (key.key_string(), walk.uncons()) {
-                    let value = field.value_cursor;
-                    match slots.slot(hash, name, steps.len()) {
-                        Some(first) => {
-                            steps[first].value = Some(value);
-                            steps.push(RepeatStep { at, value: None });
-                            dropped = true;
-                        }
-                        None => steps.push(RepeatStep {
+        if let Some(name) = collapsing_key(&key, &walked.shared, every_key) {
+            // `uncons` meets the same field `uncons_key` just did, so it is
+            // not `None` on the object the walk above accepted.
+            if let Some((field, _)) = walk.uncons() {
+                let value = field.value_cursor;
+                match slots.slot(name, values.len()) {
+                    Some(slot) => {
+                        values[slot] = value;
+                        steps.push(RepeatStep {
                             at,
-                            value: Some(value),
-                        }),
+                            slot: RepeatStep::DROPPED,
+                        });
+                        dropped = true;
+                    }
+                    None => {
+                        steps.push(RepeatStep {
+                            at,
+                            slot: values.len(),
+                        });
+                        values.push(value);
                     }
                 }
             }
@@ -3766,16 +3786,38 @@ pub fn repeat_plan_checked<F: DocumentFields>(
         at += 1;
         walk = rest;
     }
-    Ok(dropped.then_some(RepeatPlan { steps, next: 0 }))
+    Ok(dropped.then_some(RepeatPlan {
+        steps,
+        values,
+        next: 0,
+    }))
+}
+
+/// The name `key` collapses under, when the collapse walks have to compare it:
+/// its hash is in `shared` (sorted: the hashes that occur more than once, or a
+/// superset), or `every_key` is set because some key of the object has no hash
+/// to tell it apart by. `None` for every other key, which occurs once, and for
+/// a key that does not stringify, which has no name to collapse on and keeps
+/// its place.
+fn collapsing_key<'v, V: DocumentValue>(
+    key: &'v V,
+    shared: &[u64],
+    every_key: bool,
+) -> Option<Cow<'v, str>> {
+    if !every_key {
+        let hash = key_hash_of(key)?;
+        shared.binary_search(&hash).ok()?;
+    }
+    key.key_string()
 }
 
 /// The slot of each repeated key seen so far, for the collapse walks that
-/// decode only the keys whose hash is shared ([`repeat_plan_checked`],
+/// decode only the keys that can collapse ([`repeat_plan_checked`],
 /// [`collapse_repeated_cursors`]).
 ///
-/// Found by the key's hash and confirmed against the first key that hash
-/// met, so an owned key is made once per distinct key and a key is not run
-/// through a general-purpose hasher; a different key on the same hash goes
+/// Found by the key's [`key_hash`] and confirmed against the first key that
+/// hash met, so an owned key is made once per distinct key and a key is not
+/// run through a general-purpose hasher; a different key on the same hash goes
 /// to an exact map of its own.
 #[derive(Default)]
 struct SharedKeySlots {
@@ -3786,7 +3828,8 @@ struct SharedKeySlots {
 impl SharedKeySlots {
     /// The slot already claimed by `key`, or `None` after claiming `slot`
     /// for it.
-    fn slot(&mut self, hash: u64, key: Cow<'_, str>, slot: usize) -> Option<usize> {
+    fn slot(&mut self, key: Cow<'_, str>, slot: usize) -> Option<usize> {
+        let hash = key_hash(key.as_bytes());
         match self.by_hash.get(&hash) {
             Some((first, at)) if first.as_str() == key.as_ref() => Some(*at),
             Some(_) => match self.collided.get(key.as_ref()) {
@@ -4109,16 +4152,19 @@ pub fn effective_value_cursors_checked<F: DocumentFields>(
             // decodes a few keys that occur once, and each of those keeps its place anyway.
             let mut shared = small.to_vec();
             shared.sort_unstable();
-            return Ok(collapse_repeated_cursors(fields, out, &shared));
+            let every_key = small.len() < out.len();
+            return Ok(collapse_repeated_cursors(fields, out, &shared, every_key));
         }
         return Ok(out);
     }
     hashes.extend(batch.drain(..).filter_map(|key| key_hash_of(&key)));
+    // A key with no hash left no entry, which `collapse_repeated_cursors` has to know (#7311).
+    let every_key = hashes.len() < out.len();
     let (shared, _) = repeated_hashes(hashes);
     if shared.is_empty() {
         return Ok(out);
     }
-    Ok(collapse_repeated_cursors(fields, out, &shared))
+    Ok(collapse_repeated_cursors(fields, out, &shared, every_key))
 }
 
 /// The widest object whose key hashes [`effective_value_cursors_checked`] keeps on the stack.
@@ -4162,7 +4208,8 @@ impl core::hash::Hasher for KeyHashIdentity {
 ///
 /// Only a key whose [`key_hash_of`] is in `shared` (sorted: the hashes that occur more than once)
 /// is decoded and given a slot, through [`SharedKeySlots`]; every other field keeps its place, as
-/// it would have anyway, since no other field has its key. Decoding and owning every key instead
+/// it would have anyway, since no other field has its key. `every_key` (some key has no hash: a
+/// YAML complex key, an undecodable escape) decodes every key, as [`repeat_plan_checked`] does. Decoding and owning every key instead
 /// held 7.1 M strings in two maps for one repeat in a 100 MB object (#7311). On an object that
 /// repeats nearly every key the slots are what they were: found by hash and confirmed against
 /// the first key that hash met, which against `collapse_repeated`'s `IndexMap<String, _>` (an
@@ -4171,6 +4218,7 @@ fn collapse_repeated_cursors<F: DocumentFields>(
     fields: &F,
     mut values: Vec<F::Cursor>,
     shared: &[u64],
+    every_key: bool,
 ) -> Vec<F::Cursor> {
     let mut slots = SharedKeySlots::default();
     let mut kept = 0usize;
@@ -4178,11 +4226,8 @@ fn collapse_repeated_cursors<F: DocumentFields>(
     let mut at = 0usize;
     while let Some((key, _cursor, rest)) = walk.uncons_key() {
         let value = values[at];
-        let name = key_hash_of(&key)
-            .filter(|hash| shared.binary_search(hash).is_ok())
-            .and_then(|hash| Some((hash, key.key_string()?)));
-        match name {
-            Some((hash, name)) => match slots.slot(hash, name, kept) {
+        match collapsing_key(&key, shared, every_key) {
+            Some(name) => match slots.slot(name, kept) {
                 Some(slot) => values[slot] = value,
                 None => {
                     values[kept] = value;
