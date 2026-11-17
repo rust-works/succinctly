@@ -8268,12 +8268,14 @@ fn comment_tree_at_path_or_create_mut<'t>(
 /// node wholesale" rule. `value` is needed alongside `tree` for the two
 /// rules real yq decides by the target's *value*, both live-verified:
 ///
-/// - a `line_comment` written onto a block-rendered container is dropped
-///   (`.a line_comment = "y"` on `a:\n  b: 1` prints it unchanged; so does
-///   a block root, and a scalar root, which never renders one), while a
-///   flow or empty container keeps it on its one line (`a: {b: 1} # y`,
-///   `a: [] # y`) -- the emitter's own [`defers_to_own_block`] is exactly
-///   that split;
+/// - a `line_comment` written onto a block-rendered container has no line
+///   of its own: yq's encoder holds it and writes it on a later one
+///   (`.a line_comment = "y"` on `a:\n  b: 1` / `c: 2` prints `c: 2 # y`,
+///   #7235), which [`defer_held_line_comments`] places, and loses it when
+///   nothing follows; a block root, and a scalar root, never render one,
+///   while a flow or empty container keeps it on its one line
+///   (`a: {b: 1} # y`, `a: [] # y`) -- the emitter's own
+///   [`defers_to_own_block`] is exactly that split;
 /// - `style = "double"`/`"single"` on a non-string scalar turns it into the
 ///   quoted string, see [`plain_scalar_text`].
 ///
@@ -8428,10 +8430,10 @@ fn apply_meta_assign_writes(
             continue;
         }
         match &write.effect {
+            // On a block container the comment is stored too: yq's encoder cannot write it on the
+            // key's line, holds it, and writes it on a later one, which [`defer_held_line_comments`]
+            // places (`.a line_comment = "x"` on `a:` / `  c: 1` / `b: 6` is `b: 6 # x`, #7235).
             MetaEffect::LineComment(text) => {
-                if defers_to_own_block(node_value, node) {
-                    continue;
-                }
                 node.meta_mut().comment.clone_from(text);
             }
             MetaEffect::Style(style) => {

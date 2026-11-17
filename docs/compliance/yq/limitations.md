@@ -6713,10 +6713,11 @@ Four known gaps this write shares with every other write form, none specific to 
   A write followed by a read behind the navigation (`.a | (.b = 1) | .c`) is not a presentation-preserving write as a whole and still takes the old route, which loses the subtree's flow style.
 
 Finally, one rule real yq decides by the target's value, reproduced rather than "fixed":
-a `line_comment` written onto a **block-rendered container** is dropped (`.a line_comment
-= "y"` on `a:\n  b: 1` prints it unchanged; so does a block root), while a flow or empty
+a `line_comment` written onto a **block-rendered container** has no line to trail: the encoder holds it and writes it on the next line that ends (`.a line_comment = "y"` on `a:\n  b: 1\nc: 2` prints `c: 2 # y`, [#7235](https://github.com/rust-works/succinctly/issues/7235)), and loses it when nothing follows (`a:\n  b: 1` prints unchanged, so does a block root), while a flow or empty
 container keeps it on its one line (`a: {b: 1} # y`, `a: [] # y`). The emitter's own
-`defers_to_own_block` is exactly that split. A multi-line comment (`"m\nl"`) renders
+`defers_to_own_block` is exactly that split.
+The held comment is placed when the written document is printed whole.
+It stays unplaced in a result that is not (`.x, .y` or `[.x]` after the write, a copy of the node into another place, `yq ea`, [#4380](https://github.com/rust-works/succinctly/issues/4380)), where yq writes it on the next line too. A multi-line comment (`"m\nl"`) renders
 go-yaml's way: first line after the value, each further line as its own comment line at
 the key's indent, an empty line left empty, and — top level only — one blank line before
 the continuation (`a: 1 # m` / blank / `# l`, but `  b: 1 # m` / `  # l` when nested).
@@ -7576,6 +7577,7 @@ Swept against yq v4.53.3: four container sources (flow sequence, flow mapping, e
 Still different:
 
 - **A write inside a construction or read back as text** (`[.a = {"x": 1}]`, `.a = {"x": 1} | tostring`, `| to_yaml`): yq holds the comment there too (`b: 6 # own`), and this build drops it, since the held-comment pass runs on a printed document ([#7235](https://github.com/rust-works/succinctly/issues/7235)).
+  The text of a value the filter wrote or copied loses every comment and style, not only this one: an owned value carries no presentation, which is [#6933](https://github.com/rust-works/succinctly/issues/6933)'s, behind the design of [#7243](https://github.com/rust-works/succinctly/issues/7243).
 - **A block mapping whose key line carries the comment** (`b: # t` / `  x: 1`) overwritten with an empty `{}` / `[]`.
   yq writes `b: # t` and the `{}` on the next line, which it cannot read back as the same document; this build writes `b: {} # t`.
 - **An explicit-key entry** (`? [1] # t` / `: 2`) written through `.[] = 5` prints `'': 5` here and `? [1] # t` / `: 5` in yq: the complex key is spelled `""` ([#3992](https://github.com/rust-works/succinctly/issues/3992)), a different mechanism from the comment.

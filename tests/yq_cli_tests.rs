@@ -21081,8 +21081,8 @@ mod meta_assign_798 {
 
     /// Root (`.`) targets: `anchor`/`style` render at the document root;
     /// `line_comment` on a block-rendered root does not, in either tool
-    /// (real yq drops a line comment written onto any block container --
-    /// see `line_comment_on_a_container_follows_yqs_block_vs_flow_rule`).
+    /// (real yq loses a line comment written onto a block root, nothing
+    /// follows it -- see `line_comment_on_a_container_follows_yqs_block_vs_flow_rule`).
     #[test]
     fn root_anchor_and_style_assign_render_but_root_line_comment_does_not() -> Result<()> {
         let (out, code) = run_yq_stdin(". anchor = \"z\"", "a: 1\n", &[])?;
@@ -21750,10 +21750,12 @@ mod meta_assign_798 {
         Ok(())
     }
 
-    /// Real yq drops a `line_comment` written onto a block-rendered
-    /// container (there is no line to trail) but keeps one on a flow or
-    /// empty container, and on a flow root; a scalar root never renders
-    /// one. All live-verified.
+    /// Real yq holds a `line_comment` written onto a block-rendered
+    /// container (there is no line to trail) for a later line, and loses it
+    /// when nothing follows (the fixtures here end after the collection;
+    /// `tests/yq_cli/i7235.rs` has the rows with a sibling), but keeps one on
+    /// a flow or empty container, and on a flow root; a scalar root never
+    /// renders one. All live-verified.
     #[test]
     fn line_comment_on_a_container_follows_yqs_block_vs_flow_rule() -> Result<()> {
         for (filter, input, expected) in [
