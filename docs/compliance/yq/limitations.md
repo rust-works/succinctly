@@ -667,7 +667,8 @@ These shapes still differ from yq after a mark, each captured from v4.53.3:
   Only the first block under the marker is the foot: a later one stays the node's head, as in yq.
   Still different: that block together with a foot comment after the body (`a: 1` / `# f1`) or with a second document, where yq's `c2` and `f1` do not combine as they do here, a second block directly above the node (`# c1` / `---` / `# c2` / blank / `# c3` / `a: 1`, where yq makes `c2` the foot and `c3` the head), and a blank line between the block above the marker and the marker (`# c1` / blank / `---` / `# c2` / blank / `a: 1`), where yq's head `c1` keeps a trailing line break.
   The head comment of a scalar or flow-collection document that has two blocks (`# l1` / blank / `# l2` / `5`) is `l1# l2` in yq and the two blocks with their blank line here.
-  `-P` over a scalar document prints its comment where yq prints none.
+  A scalar root writes no head comment through yq's encoder, and since #7089 none here: `# lead` / `5` is `5` under `-P .`, `.a = 1` over it and `. = 6` over a scalar, a mapping or a sequence root, as in yq, while a plain read of the document still prints it, as yq does.
+  Still different: a comment-only document written into a collection (`# lead` alone, `.a = 1`: yq prints no comment), and a `null` root merged into a mapping (`. * {"z": 1}`: yq keeps it).
 - A first document written on its marker line (`--- # c`, `--- !!map`, `--- |`) is not read as yq reads it: `--- # c` / `a: 1` prints `# c` / `a: 1` in yq, `--- !!map` / `a: 1` prints `!!map` / `a: 1`, and `--- |` / `  x` is a parse error here.
 - `%YAML 1.2` as the first line is an error in yq (`found incompatible YAML document`), and is read here.
 - A text with only a comment prints a blank line on the streaming routes, as in yq, and still prints the comment (or, for a write, keeps it above the result) on the DOM routes.

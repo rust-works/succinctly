@@ -9360,6 +9360,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
         self.bp_pos == FIRST_DOCUMENT_BP && YamlCursor::is_document_content(self)
     }
 
+    #[inline]
+    fn follows_byte_order_mark(&self) -> bool {
+        self.index.after_bom()
+    }
+
     fn style_less(&self) -> bool {
         self.index.style_less()
     }
