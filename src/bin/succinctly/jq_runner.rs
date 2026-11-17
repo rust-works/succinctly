@@ -25202,6 +25202,21 @@ mod tests {
             assert_eq!(position(&[b"\xEF\xB71\n"]), None);
         }
 
+        /// #7340: a chunk with no newline is jq's only up to its first NUL, so the column stops
+        /// there and an RS after it is no RS; a chunk that ends in a newline is counted whole.
+        /// Each source's chunks are its own, and a BOM before the NUL is still not counted.
+        #[test]
+        fn position_skips_what_jq_never_sees_past_a_nul_7340() {
+            assert_eq!(position(&[b"ab\x00cd"]), Some((1, 2)));
+            assert_eq!(position(&[b"ab\x00\x1ecd"]), Some((1, 2)));
+            assert_eq!(position(&[b"ab\x00cd\n"]), Some((2, 0)));
+            assert_eq!(position(&[b"x\nab\x00cd"]), Some((2, 2)));
+            assert_eq!(position(&[b"ab\x00cd", b"ef"]), Some((1, 4)));
+            assert_eq!(position(&[b"\xEF\xBB\xBFab\x00cd"]), Some((1, 2)));
+            // ... but a chunk that ends in a newline keeps an RS after its NUL.
+            assert_eq!(position(&[b"x\nab\x00cd\x1e1\nzz"]), None);
+        }
+
         #[test]
         fn rs_byte_anywhere_suppresses_the_warning() {
             assert_eq!(warning(&[b"\x1e1\n"]), None);
