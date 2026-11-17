@@ -370,6 +370,10 @@ pub(super) struct WindowedFile {
     /// The warnings of the stretches the gate resumed after (#7322) that no window has handed out
     /// yet, in order, each with where in `buf` jq's reader met it ([`Window::notes`]).
     notes: Vec<(usize, String)>,
+    /// The gate ended the text validated so far after a stretch, short of what is read, because
+    /// [`MAX_QUEUED_NOTES`] warnings were waiting (#7341): the window it makes is not the last, even
+    /// once the stream is read to its end.
+    gate_cut: bool,
     /// Where the bytes a pipe's probe read end in `buf` (0 once they are dropped, and for every other
     /// source): while they hold a block past `validated`, a window is made of them and nothing is read
     /// onto them (#7266). Reading a block onto the probe's 4 MiB grew its buffer to 8 MiB, and made a
@@ -433,6 +437,7 @@ impl WindowedFile {
             held: None,
             seq_gate: None,
             notes: Vec::new(),
+            gate_cut: false,
             front_end: 0,
             probe_reach: 0,
             #[cfg(test)]
@@ -478,14 +483,18 @@ impl WindowedFile {
         // far as that reader had read when a window of it alone looked ahead. None of it holds or
         // scans more than the probe handed out whole did.
         let mut in_front = true;
+        // #7341: the text the gate cut short is followed by bytes read and not yet judged, which
+        // the gate goes on through before anything more is read onto them.
+        let mut after_cut = self.gate_cut;
         loop {
             let from_front = in_front && !self.eof && self.front_end > self.validated;
             if from_front {
                 // The read that would have skipped it.
                 self.skip_front_bom();
-            } else if !self.eof {
+            } else if !self.eof && !after_cut {
                 self.read_more(grow);
             }
+            after_cut = false;
             let before = self.validated;
             self.validate_lines(
                 from_front.then(|| (self.validated + self.block).min(self.front_end)),
@@ -563,7 +572,8 @@ impl WindowedFile {
                 }
             }
             if self.eof || definitive || !values.is_empty() {
-                let last = self.eof || definitive;
+                // #7341: a text the gate cut short is followed by more of the stream, read or not.
+                let last = (self.eof && !self.gate_cut) || definitive;
                 if last {
                     self.done = true;
                 }
@@ -784,6 +794,7 @@ impl WindowedFile {
     /// substituting any invalid UTF-8 on the way as the whole-file route does. With `near`, to the last
     /// line break before it when there is one (a window made of a pipe's probe, #7266).
     fn validate_lines(&mut self, near: Option<usize>) {
+        self.gate_cut = false;
         let end = if self.seq_gate.is_some() {
             loop {
                 let gate = self
@@ -805,6 +816,18 @@ impl WindowedFile {
                     GateStep::Stretch { from, to, next_end } => {
                         if !self.resume_after_stretch(from, to, next_end) {
                             break self.hand_on_seq_tail(from);
+                        }
+                        // #7341: the warnings wait for the window that ends the text they were met
+                        // in, and a stretch can warn once a byte: once enough are waiting, the window
+                        // ends after the plain record the stretch is followed by, and the gate goes
+                        // on from there with the next.
+                        if self.notes.len() >= MAX_QUEUED_NOTES {
+                            self.gate_cut = true;
+                            break self
+                                .seq_gate
+                                .as_ref()
+                                .expect("checked: the stream has a gate")
+                                .checked;
                         }
                     }
                 }
@@ -1280,6 +1303,14 @@ enum GateStep {
 /// of the stream is handed on, as all of it was before: the look-ahead is held beside the tail while
 /// that is read, so it is a few windows.
 const MAX_SEQ_STRETCH: usize = 4 * WINDOW_BYTES;
+
+/// How many warnings of the stretches a `--seq` gate carried on after may wait for their window
+/// (#7341). Each is a line of text held until the values before it have run, and a window of
+/// stretches that warn once a byte held about a million: a pipe of 18 MB peaked at 633 MiB where jq
+/// holds 2.6. Past this the window ends at the next plain record: about 8 MiB of warnings at most,
+/// and a window of at least a sixteenth of a block of a stream that warns once a byte, so the text
+/// is dropped from the front of the buffer a few times a block, not once a few stretches.
+const MAX_QUEUED_NOTES: usize = 1 << 16;
 
 impl SeqGate {
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -3487,6 +3518,57 @@ mod tests {
             }
         }
         assert!(resumed_streams > 40, "{resumed_streams}");
+    }
+
+    /// #7341: stretches that warn a lot end their window once [`MAX_QUEUED_NOTES`] warnings wait, at
+    /// the plain record after the stretch, and the windows go on from there: whatever the reads' size,
+    /// the stream read whole in one (where the cut window is not the last though the stream is read to
+    /// its end) among them, the windows give every value on its line and every warning in order, and
+    /// none waits for more than a window's worth.
+    #[test]
+    fn warnings_end_a_window_once_enough_wait_7341() {
+        let stretch = [b"\x1e".as_slice(), &[b'}'; 1000], b"\n\x1e1\n"].concat();
+        // Enough stretches for three windows' worth of warnings and some.
+        let stretches = 3 * MAX_QUEUED_NOTES / 1000 + 5;
+        let stream = [seq_stream(3, b"").as_slice(), &stretch.repeat(stretches)].concat();
+        let (text, at, _, warnings) = gated(&stream);
+        assert_eq!(at, None);
+        assert_eq!(warnings.len(), stretches * 1000);
+        let want = whole(&text);
+        for block in [1 << 20, 4096, 997] {
+            let mut file = tempfile::tempfile().expect("a temp file");
+            file.write_all(&stream).expect("written");
+            file.rewind().expect("rewound");
+            let slot = SeqTailSlot::default();
+            let mut reader =
+                WindowedFile::from_seq_pipe(Rc::new(file), Vec::new(), block, Rc::clone(&slot));
+            let (mut spans, mut lines, mut notes, mut windows) =
+                (Vec::new(), Vec::new(), Vec::new(), 0);
+            while let Some(window) = reader.next_window().expect("reads") {
+                windows += 1;
+                assert!(
+                    window.notes.len() < MAX_QUEUED_NOTES + 1000,
+                    "{} warnings in one window, block {block}",
+                    window.notes.len()
+                );
+                let mut counter = LineCounter::new(window.raw);
+                counter.set_lines_before(window.lines_before);
+                for &(start, end) in &window.values {
+                    spans.push((window.offset + start, window.offset + end));
+                    lines.push(counter.read_end_line(end));
+                }
+                notes.extend(window.notes.iter().map(|(_, line)| line.clone()));
+            }
+            assert_eq!(
+                (&spans, &lines),
+                (&want.spans, &want.lines),
+                "block {block}"
+            );
+            let warned: Vec<String> = warnings.iter().map(|(_, line)| line.clone()).collect();
+            assert_eq!(notes, warned, "block {block}");
+            assert!(windows >= 3, "block {block}: {windows} windows");
+            assert!(slot.borrow().is_none(), "block {block}");
+        }
     }
 
     /// #7322: a stretch with no plain record after it within the gate's look-ahead is handed on with the
