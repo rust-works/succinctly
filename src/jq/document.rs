@@ -3750,7 +3750,22 @@ pub(crate) fn repeat_plan_checked<F: DocumentFields>(
     if !collapse || walked.shared.is_empty() {
         return Ok(None);
     }
-    let every_key = walked.unkeyed > 0;
+    Ok(plan_repeats(fields, &walked.shared, walked.unkeyed > 0))
+}
+
+/// [`repeat_plan_checked`]'s second walk, for an object whose hashes repeat.
+///
+/// Out of line and cold, so that the gate the writers call for every object
+/// stays as small as `collapsed_fields_checked`'s was: with this walk inlined
+/// into it, `.` over a 100 MB object the scan declines read 4% slower on a
+/// 7950X at an unchanged instruction count (#7311).
+#[cold]
+#[inline(never)]
+fn plan_repeats<F: DocumentFields>(
+    fields: &F,
+    shared: &[u64],
+    every_key: bool,
+) -> Option<RepeatPlan<F::Cursor>> {
     let mut steps: Vec<RepeatStep> = Vec::new();
     let mut values: Vec<F::Cursor> = Vec::new();
     let mut slots = SharedKeySlots::default();
@@ -3758,7 +3773,7 @@ pub(crate) fn repeat_plan_checked<F: DocumentFields>(
     let mut walk = fields.clone();
     let mut at = 0usize;
     while let Some((key, _cursor, rest)) = walk.uncons_key() {
-        if let Some(name) = collapsing_key(&key, &walked.shared, every_key) {
+        if let Some(name) = collapsing_key(&key, shared, every_key) {
             // `uncons` meets the same field `uncons_key` just did, so it is
             // not `None` on the object the walk above accepted.
             if let Some((field, _)) = walk.uncons() {
@@ -3785,11 +3800,11 @@ pub(crate) fn repeat_plan_checked<F: DocumentFields>(
         at += 1;
         walk = rest;
     }
-    Ok(dropped.then_some(RepeatPlan {
+    dropped.then_some(RepeatPlan {
         steps,
         values,
         next: 0,
-    }))
+    })
 }
 
 /// The name `key` collapses under, when the collapse walks have to compare it:
@@ -4213,6 +4228,8 @@ impl core::hash::Hasher for KeyHashIdentity {
 /// repeats nearly every key the slots are what they were: found by hash and confirmed against
 /// the first key that hash met, which against `collapse_repeated`'s `IndexMap<String, _>` (an
 /// owned key and a SipHash per field) measured 3% faster on eight keys repeated over 100 MB.
+#[cold]
+#[inline(never)]
 fn collapse_repeated_cursors<F: DocumentFields>(
     fields: &F,
     mut values: Vec<F::Cursor>,

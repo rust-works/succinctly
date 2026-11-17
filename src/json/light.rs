@@ -3569,7 +3569,7 @@ use crate::jq::document::{
     any_hash_repeats, document_token_of, effective_fields_checked, key_hash, key_is_malformed,
     key_span_fingerprint, repeat_plan_checked, trailing_element_gap_ok, DocumentCursor,
     DocumentElements, DocumentField, DocumentFields, DocumentValue, FieldFate, IndentSpec,
-    JsonConvention, KeyHashes, PAIRWISE_SPAN_SCAN_LIMIT,
+    JsonConvention, KeyHashes, RepeatPlan, PAIRWISE_SPAN_SCAN_LIMIT,
 };
 use crate::jq::escape::{write_json_body_jq, write_json_body_yq};
 use crate::jq::stream::{StreamFailure, StreamResult};
@@ -5991,38 +5991,16 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
                         walk = rest;
                     }
                 }
-                // #7311: the same walk, asking the plan about each field. A
-                // loop of its own, so the object with no repeat -- nearly
-                // every one -- pays nothing for the question: asked inside
-                // the loop above, it cost 0.8% of the instructions of `.`
-                // over a 100 MB object the scan declines.
-                (None, Some(mut plan)) => {
-                    let mut walk = fields;
-                    let mut at = 0usize;
-                    while let Some((field, rest)) = JsonFields::uncons(&walk) {
-                        walk = rest;
-                        at += 1;
-                        let (value, value_cursor) = match plan.fate(at - 1) {
-                            FieldFate::Unchanged => (field.value(), field.value_cursor()),
-                            FieldFate::Value(cursor) => (cursor.value(), cursor),
-                            FieldFate::Dropped => continue,
-                        };
-                        stream_json_field(
-                            out,
-                            field.key(),
-                            value,
-                            &value_cursor,
-                            first,
-                            next_indent,
-                            indent_spaces,
-                            unit,
-                            sort_keys,
-                            numbers,
-                            depth,
-                        )?;
-                        first = false;
-                    }
-                }
+                (None, Some(plan)) => stream_json_planned_fields(
+                    out,
+                    fields,
+                    plan,
+                    next_indent,
+                    indent_spaces,
+                    unit,
+                    numbers,
+                    depth,
+                )?,
             }
             if indent_spaces > 0 {
                 out.write_char('\n')?;
@@ -6056,6 +6034,56 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
         // #2286.
         StandardJson::Error(msg) => Err(StreamFailure::Decode(EvalError::decode_failure(msg))),
     }
+}
+
+/// The fields of an object that repeats a key, for [`stream_json_pretty`]'s
+/// object arm: its streaming walk, asking `plan` what becomes of each field
+/// (#7311), never under `-S`.
+///
+/// Out of line and cold, so that the writer every value recurses through
+/// keeps the size it had: with this loop beside the plain one in its body,
+/// `.` over a 100 MB object the scan declines read 4% slower on a 7950X at an
+/// unchanged instruction count.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)] // STYLE-0004: stream_json_pretty's own ambients, which this loop threads through.
+fn stream_json_planned_fields<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
+    out: &mut Out,
+    fields: JsonFields<'_, W>,
+    mut plan: RepeatPlan<JsonCursor<'_, W>>,
+    next_indent: usize,
+    indent_spaces: usize,
+    unit: char,
+    numbers: JsonConvention,
+    depth: usize,
+) -> StreamResult {
+    let mut first = true;
+    let mut walk = fields;
+    let mut at = 0usize;
+    while let Some((field, rest)) = JsonFields::uncons(&walk) {
+        walk = rest;
+        at += 1;
+        let (value, value_cursor) = match plan.fate(at - 1) {
+            FieldFate::Unchanged => (field.value(), field.value_cursor()),
+            FieldFate::Value(cursor) => (cursor.value(), cursor),
+            FieldFate::Dropped => continue,
+        };
+        stream_json_field(
+            out,
+            field.key(),
+            value,
+            &value_cursor,
+            first,
+            next_indent,
+            indent_spaces,
+            unit,
+            false,
+            numbers,
+            depth,
+        )?;
+        first = false;
+    }
+    Ok(())
 }
 
 /// One object member of [`stream_json_pretty`]'s object arm -- the

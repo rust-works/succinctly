@@ -3451,6 +3451,21 @@ fn collapse_duplicate_fields<'a>(
     if !any_escaped && !spans_repeat(prepared) {
         return prepared.len();
     }
+    collapse_repeated_fields(prepared, frame)
+}
+
+/// [`collapse_duplicate_fields`] past its gate: an object whose spans may
+/// repeat, or that escapes a key.
+///
+/// Out of line and cold, as the JSON writer's own collapse walk is
+/// (`plan_repeats`, #7311), so the printer every value recurses through does
+/// not carry it.
+#[cold]
+#[inline(never)]
+fn collapse_repeated_fields<'a>(
+    prepared: &mut [PreparedField<'a>],
+    frame: &Frame<'a, impl Clone + AsRef<[u64]>>,
+) -> usize {
     let shared = shared_key_hashes(
         prepared
             .iter()
