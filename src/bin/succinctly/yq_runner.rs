@@ -18750,6 +18750,33 @@ mod tests {
         );
     }
 
+    /// #7236: a literal piped through stages that only pass it on is closed (`[1] | .`, `[1] | debug`),
+    /// and one piped through anything else, or no stage at all, is not. A chain stage's static path
+    /// has no `.[]` step, so one is not written through.
+    #[test]
+    fn a_literal_through_identity_stages_is_closed_7236() {
+        let lit = || Expr::Array(Box::new(Expr::Literal(succinctly::jq::Literal::Int(1))));
+        let pipe = |stages: Vec<Expr>| Expr::Pipe(stages.into());
+        assert!(is_closed_literal(&pipe(vec![lit(), Expr::Identity])));
+        assert!(is_closed_literal(&pipe(vec![
+            lit(),
+            Expr::Paren(Box::new(Expr::Identity)),
+            Expr::Builtin(Builtin::Debug)
+        ])));
+        assert!(!is_closed_literal(&pipe(vec![
+            lit(),
+            Expr::Builtin(Builtin::Length)
+        ])));
+        assert!(!is_closed_literal(&pipe(vec![Expr::Identity, lit()])));
+        assert!(!is_closed_literal(&pipe(vec![])));
+
+        let mut node = OwnedValue::Array(vec![OwnedValue::Int(1)].into());
+        assert_eq!(
+            set_owned_at(&mut node, &[PathStep::Each], OwnedValue::Int(2)),
+            None
+        );
+    }
+
     fn setpath(path: Expr, value: Expr) -> Expr {
         Expr::Builtin(Builtin::SetPath(Box::new(path), Box::new(value)))
     }
