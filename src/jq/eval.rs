@@ -88780,8 +88780,9 @@ fn resolve_del_path_branches<'a, S: EvalSemantics>(
 /// ends in `tostring`, `length`, `not` or `@json` to the navigation: the stages whose result
 /// does not depend on the input's type (each answers every node, which `+`, `@uri` and the other
 /// formats do not: `.b + [1]` is a type error in yq, and dropping it here would turn that error
-/// into a delete). Anything else (a constructor, `map`, arithmetic, `select`) is left to the
-/// general rule. `None` when nothing in `expr` has that shape.
+/// into a delete). A `select(...)` stage is navigation (it hands its input on with its slot, #4476),
+/// so it may stand between the navigation and the deriving stage. Anything else (a constructor,
+/// `map`, arithmetic) is left to the general rule. `None` when nothing in `expr` has that shape.
 fn yq_slot_keeping_del_target(expr: &Expr) -> Option<Expr> {
     let deriving_stage = |stage: &Expr| {
         matches!(
@@ -88874,6 +88875,8 @@ fn del_target_shape(expr: &Expr) -> DelTargetShape {
         | Expr::SliceExpr { .. }
         | Expr::RecursiveDescent
         | Expr::RecursiveDescentWithKeys => Navigation,
+        // `select(cond)` hands its input on, with its path: it only filters (#4476).
+        Expr::Builtin(Builtin::Select(_)) => Navigation,
         Expr::Literal(_) | Expr::Array(_) | Expr::Object(_) => Parentless,
         Expr::Optional(inner) | Expr::Paren(inner) => del_target_shape(inner),
         Expr::Pipe(stages) => match stages.last().map(del_target_shape) {
