@@ -14950,6 +14950,20 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
 ) -> GenericResult<V> {
     for (j, expr) in stages.iter().enumerate() {
+        // #7282: `.[]` over `group_by`'s groups with more of the pipe after it runs that rest on
+        // each group's cursors, where the arms below decoded every group first. Only the shapes of
+        // the stage and of its input are read here, so any other pipe pays a comparison or two.
+        if S::TAG == EvalTag::Jq && j + 1 < stages.len() && may_iterate_groups(&current, expr) {
+            current = match iterate_groups_stage::<S, V>(current, expr, &stages[j + 1..], optional)
+            {
+                GroupsStage::Done(result) => return result,
+                GroupsStage::Stage(result) => {
+                    current = result;
+                    continue;
+                }
+                GroupsStage::Declined(current) => current,
+            };
+        }
         current = match current {
             // The previous stage produced `vs` before terminating in
             // `outer_control` (#400, #494): pipe that prefix through
@@ -17240,6 +17254,24 @@ fn eval_single_pipe_stages<S: EvalSemantics, V: DocumentValue>(
     if !needs_path && exprs.first().is_some_and(is_slice_head) {
         if let Some((owned, rest)) = fused_slice_pipe_head::<S, V>(exprs, value.clone(), cursor) {
             return fold_pipe_stages::<S, V>(GenericResult::Owned(owned), rest, optional);
+        }
+    }
+
+    // #7282: a head `group_by(f)[]` with more of the pipe after it, as `fold_pipe_stages` takes
+    // one in any later position.
+    if S::TAG == EvalTag::Jq && exprs.len() > 1 {
+        if let Some(chain) = group_iterate_chain(&exprs[0]) {
+            return match iterate_group_chain::<S, V>(
+                &exprs[0],
+                chain,
+                value,
+                cursor,
+                &exprs[1..],
+                optional,
+            ) {
+                Ok(done) => done,
+                Err(head) => fold_pipe_stages::<S, V>(head, &exprs[1..], optional),
+            };
         }
     }
 
@@ -32118,6 +32150,169 @@ fn map_groups_eagerly<S: EvalSemantics, V: DocumentValue>(
         }
     }
     GenericResult::LazySeq(Box::new(LazySeq::from_mixed(out)))
+}
+
+/// What [`iterate_groups_stage`] did with one stage of `fold_pipe_stages` (#7282).
+enum GroupsStage<V: DocumentValue> {
+    /// The stage and the rest of the pipe after it, run on each group: the pipe's answer.
+    Done(GenericResult<V>),
+    /// The stage alone (a `group_by(f)[]` chain whose `group_by` did not cut groups): the rest of
+    /// the pipe is still to run on it.
+    Stage(GenericResult<V>),
+    /// Nothing run: the stage's input, handed back to the fold's own arms.
+    Declined(GenericResult<V>),
+}
+
+/// Whether [`iterate_groups_stage`] may take `stage` over `input`: `.[]` over a lazy sequence,
+/// or a `group_by(f)[]` chain over one value. Shapes only, so it costs a pipe that has neither
+/// a comparison or two.
+#[inline(always)]
+fn may_iterate_groups<V: DocumentValue>(input: &GenericResult<V>, stage: &Expr) -> bool {
+    match input {
+        GenericResult::LazySeq(_) => matches!(stage, Expr::Iterate),
+        GenericResult::One(_) | GenericResult::OneCursor(_) => group_iterate_chain(stage).is_some(),
+        _ => false,
+    }
+}
+
+/// The stages of `group_by(f)[]` when `stage` is that postfix chain, which parses as its own
+/// pipe of the two (`parse_postfix`), so the `.[]` never meets what follows the chain in the
+/// enclosing pipe.
+fn group_iterate_chain(stage: &Expr) -> Option<&PipeStages> {
+    match stage {
+        Expr::Pipe(stages)
+            if matches!(
+                stages.as_slice(),
+                [Expr::Builtin(Builtin::GroupBy(_)), Expr::Iterate]
+            ) =>
+        {
+            Some(stages)
+        }
+        _ => None,
+    }
+}
+
+/// Whether the rest of a pipe after a `.[]` over groups may run on each group's cursors rather
+/// than on the group decoded: anything but a stage that reads path context, whose answer a
+/// cursor sequence and the decoded array do not give alike.
+fn groups_take_rest(rest: &[Expr]) -> bool {
+    !rest.iter().any(needs_path_context)
+}
+
+/// `fold_pipe_stages`' step for a stage [`may_iterate_groups`] admits (#7282): `.[]` over
+/// `group_by`'s groups (or the `group_by(f)[]` chain, [`iterate_group_chain`]) with `rest` after
+/// it runs `rest` on each group as the cursor sequence it is, as the sink route's
+/// `each_lazy_seq_iterate_sink` hands each one on. The eager `.[]` arm of
+/// `fold_lazy_seq_stage` decoded every group first, so `[group_by(.source)[] | length]`
+/// decoded 254 links to count them (`decode_group`, 32% of the instructions).
+fn iterate_groups_stage<S: EvalSemantics, V: DocumentValue>(
+    input: GenericResult<V>,
+    stage: &Expr,
+    rest: &[Expr],
+    optional: bool,
+) -> GroupsStage<V> {
+    match input {
+        GenericResult::LazySeq(seq) => match seq.plain_groups() {
+            Some(groups) if groups_take_rest(rest) => {
+                GroupsStage::Done(iterate_groups::<S, V>(groups, rest, optional))
+            }
+            _ => GroupsStage::Declined(GenericResult::LazySeq(seq)),
+        },
+        GenericResult::One(value) => run_group_chain::<S, V>(stage, value, None, rest, optional),
+        GenericResult::OneCursor(cursor) => {
+            run_group_chain::<S, V>(stage, cursor.value(), Some(cursor), rest, optional)
+        }
+        other => GroupsStage::Declined(other), // patchcov: coverage tolerate-line reason="unreachable: may_iterate_groups admits a lazy sequence, One or OneCursor only (#7282)"
+    }
+}
+
+/// [`iterate_groups_stage`] for a `group_by(f)[]` chain stage over one value.
+fn run_group_chain<S: EvalSemantics, V: DocumentValue>(
+    stage: &Expr,
+    value: V,
+    cursor: Option<V::Cursor>,
+    rest: &[Expr],
+    optional: bool,
+) -> GroupsStage<V> {
+    let Some(chain) = group_iterate_chain(stage) else {
+        return GroupsStage::Declined(
+            cursor.map_or(GenericResult::One(value), GenericResult::OneCursor),
+        ); // patchcov: coverage tolerate-line reason="unreachable: may_iterate_groups admits One or OneCursor for a group_by(f)[] chain only (#7282)"
+    };
+    match iterate_group_chain::<S, V>(stage, chain, value, cursor, rest, optional) {
+        Ok(done) => GroupsStage::Done(done),
+        Err(stage_result) => GroupsStage::Stage(stage_result),
+    }
+}
+
+/// The `group_by(f)[]` chain (`chain`, [`group_iterate_chain`]) over `value`, with `rest` after
+/// it (#7282): `Ok` with the pipe's answer when `group_by` cut groups and `rest` ran on each one,
+/// or `Err` with the chain's own answer, as `eval_single` gives it, for the caller to run `rest`
+/// on.
+///
+/// `eval_single` would have run the chain as a pipe of its own, and that pipe's routing reads
+/// two facts about its stages: whether one needs path context, and whether one before the last
+/// may have an effect (#4293). With either, or under `optional`, the chain is handed to
+/// `eval_single` whole. Without them that pipe is `group_by(f)` folded through `.[]`, which is
+/// what this runs, so the chain's other answers are unchanged.
+fn iterate_group_chain<S: EvalSemantics, V: DocumentValue>(
+    stage: &Expr,
+    chain: &PipeStages,
+    value: V,
+    cursor: Option<V::Cursor>,
+    rest: &[Expr],
+    optional: bool,
+) -> Result<GenericResult<V>, GenericResult<V>> {
+    if optional || pipe_needs_path_context(chain) || crate::jq::eval::pipe_effect_before_last(chain)
+    {
+        return Err(eval_single::<S, V>(stage, value, optional, cursor));
+    }
+    let head = eval_single::<S, V>(&chain[0], value, optional, cursor);
+    if let GenericResult::LazySeq(seq) = &head {
+        if let Some(groups) = seq.plain_groups() {
+            if groups_take_rest(rest) {
+                return Ok(iterate_groups::<S, V>(groups, rest, optional));
+            }
+        }
+    }
+    Err(fold_pipe_stages::<S, V>(head, &chain[1..], optional))
+}
+
+/// `rest` run on each of `groups` as the cursor sequence it is (#7282), the outputs in group
+/// order, through the fold `fold_pipe_stages`' `ManyCursor` arm runs its elements through: an
+/// output stays a node where every group's does, and a group whose `rest` fails ends the fold
+/// with the earlier groups' outputs as the prefix of a `Partial`, as the decoded groups' fold
+/// (`eval_on_many_owned`) ended it.
+fn iterate_groups<S: EvalSemantics, V: DocumentValue>(
+    groups: Vec<&[V::Cursor]>,
+    rest: &[Expr],
+    optional: bool,
+) -> GenericResult<V> {
+    #[cfg(test)]
+    iterate_groups_count::bump();
+    fold_cursor_elements::<S, V, _>(groups.into_iter(), |group| {
+        fold_pipe_stages::<S, V>(group_value::<V>(group), rest, optional)
+    })
+}
+
+/// How many times [`iterate_groups`] ran on this thread, so a test can assert that a pipe over
+/// `group_by`'s groups takes the cursor route (#7282): the decoded route gives every such row
+/// the same answer. `cfg(test)` only.
+#[cfg(test)]
+pub(crate) mod iterate_groups_count {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn bump() {
+        COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn get() -> usize {
+        COUNT.with(Cell::get)
+    }
 }
 
 /// `group_by(f)` over an array's element cursors, in jq mode (#5306): sort the cursors by
@@ -63400,9 +63595,19 @@ mod tests {
     /// The answer of `filter` over `doc` as `-c` JSON lines, and how many groups
     /// `group_construct` built on the way (#7280).
     fn group_construct_run(doc: &str, filter: &str) -> (Result<String, EvalError>, usize) {
+        counted_run(doc, filter, group_construct_count::get)
+    }
+
+    /// The answer of `filter` over `doc` as `-c` JSON lines, and how far `count` moved on the
+    /// way (#7280, #7282).
+    fn counted_run(
+        doc: &str,
+        filter: &str,
+        count: fn() -> usize,
+    ) -> (Result<String, EvalError>, usize) {
         let index = JsonIndex::build(doc.as_bytes());
         let expr = parse(filter).unwrap();
-        let before = group_construct_count::get();
+        let before = count();
         let result = eval_with_cursor_using::<JqSemantics, _>(&expr, index.root(doc.as_bytes()));
         // `collect_owned` answers an error as no values, and these rows read the error.
         let result = match result {
@@ -63414,7 +63619,7 @@ mod tests {
             other => other,
         };
         if let GenericResult::Error(error) = result {
-            return (Err(error), group_construct_count::get() - before);
+            return (Err(error), count() - before);
         }
         let answer = result.collect_owned::<JqSemantics>().map(|values| {
             values
@@ -63423,7 +63628,76 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         });
-        (answer, group_construct_count::get() - before)
+        (answer, count() - before)
+    }
+
+    /// #7282: `.[]` over `group_by`'s groups with more of the pipe after it runs that rest on
+    /// each group's cursors (one `iterate_groups` per `.[]`), flat or as the `group_by(f)[]`
+    /// chain, and the answer is jq 1.7.1's. A `.[]` with nothing after it keeps the decoded
+    /// route; `path(f)` reads its own path, not the pipe's, so it runs on the group too.
+    #[test]
+    fn test_iterate_over_groups_runs_the_rest_on_each_group_7282() {
+        let doc = r#"[{"a":2,"b":"x"},{"a":1,"b":"y"},{"a":2,"b":"z"},{"a":1.0,"b":100000000000000000001},{"a":"k","b":-0},{"a":"k","b":[1,{"c":2}]}]"#;
+        let rows: &[(&str, Result<&str, &str>, usize)] = &[
+            ("[group_by(.a)[] | length]", Ok("[2,2,2]"), 1),
+            ("[group_by(.a) | .[] | .[0].b]", Ok(r#"["y","x",-0]"#), 1),
+            ("[group_by(.a)[] | map(.b) | length]", Ok("[2,2,2]"), 1),
+            (
+                "[group_by(.a)[][] | .b]",
+                Ok(r#"["y",100000000000000000001,"x","z",-0,[1,{"c":2}]]"#),
+                1,
+            ),
+            ("[group_by(.a)[] | .[1:] | length]", Ok("[1,1,1]"), 1),
+            (
+                "[group_by(.a)[] | .[] | .b + 1]",
+                Err(r#"string ("y") and number (1) cannot be added"#),
+                1,
+            ),
+            ("[group_by(.a)[]] | length", Ok("3"), 0),
+            ("[group_by(.a)[] | path(.[0])]", Ok("[[0],[0],[0]]"), 1),
+        ];
+        for (filter, want, runs) in rows {
+            let (answer, ran) = counted_run(doc, filter, iterate_groups_count::get);
+            let answer = answer.map_err(|error| error.to_string());
+            assert_eq!(
+                answer.as_deref().map_err(String::as_str),
+                *want,
+                "`{filter}`"
+            );
+            assert_eq!(ran, *runs, "`{filter}` runs iterate_groups {runs} times");
+        }
+    }
+
+    /// #7282: the chain in a later stage, over each of several cursors, and a `group_by` that
+    /// cuts no groups (an object input bridges) is folded through its `.[]` as before.
+    #[test]
+    fn test_group_chain_in_a_later_stage_7282() {
+        let doc = r#"[[{"a":1},{"a":1},{"a":2}],[{"a":3}]]"#;
+        let (answer, ran) = counted_run(
+            doc,
+            "[.[] | group_by(.a)[] | length]",
+            iterate_groups_count::get,
+        );
+        assert_eq!(answer.as_deref(), Ok("[2,1,1]"));
+        assert_eq!(ran, 2, "one run per outer element");
+        let (answer, ran) = counted_run(
+            r#"{"x":[{"a":1},{"a":1}]}"#,
+            "[.x | group_by(.a)[] | length]",
+            iterate_groups_count::get,
+        );
+        assert_eq!(answer.as_deref(), Ok("[2]"));
+        assert_eq!(ran, 1);
+        let (answer, ran) = counted_run(
+            r#"{"x":[{"a":1},{"a":1}]}"#,
+            "try ([group_by(.a)[] | length]) catch .",
+            iterate_groups_count::get,
+        );
+        // jq 1.7.1's answer.
+        assert_eq!(
+            answer.as_deref(),
+            Ok(r#""Cannot index array with string \"a\"""#)
+        );
+        assert_eq!(ran, 0, "an object cuts no groups");
     }
 
     /// #7280: `map(h)` over `group_by`'s groups builds an array or object construction of
