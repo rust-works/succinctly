@@ -1676,6 +1676,10 @@ impl WindowedFile {
     /// #7262: the tail is read once, into the stream the route that reads it whole is given, which has room
     /// for all of it when the source is a regular file (what is left of it from where the reads stand): a
     /// fault near a big file's start hands on most of the file, which a copy would hold twice.
+    ///
+    /// The front counts the lines of this source alone, not the gate's `lines_base`: a file of a `--seq`
+    /// list goes behind a source of its own for the files before it ([`SeqFilesTail::front`],
+    /// `hand_on_seq_files_tail`), as a runtime error names the line in its own file.
     fn hand_on_seq_tail(&mut self, at: usize) -> usize {
         use std::io::Seek;
         let lines = self.lines_before + count_newlines(&self.buf[..at]);
@@ -1707,7 +1711,7 @@ impl WindowedFile {
         let gate = self
             .seq_gate
             .as_ref()
-            .expect("only the gate of a --seq pipe hands a tail on");
+            .expect("only a --seq source's gate hands a tail on");
         *gate.slot.borrow_mut() = Some(SeqTail {
             #[cfg(test)]
             reserved_at,
@@ -2224,8 +2228,9 @@ pub(super) struct WindowedFiles {
     /// The files that did not open when the run reached them, with their positions, not yet taken
     /// by the run ([`NamedFile`]).
     open_failures: Vec<(usize, PathBuf, io::Error)>,
-    /// Each file opened by path is judged when the run reaches it, and the stream ends before the
-    /// first that is not plain `--seq` records ([`Self::certifying_seq_files`], #7221).
+    /// Each file opened by path is judged when the run reaches it ([`Self::certifying_seq_files`],
+    /// #7221): one that is not plain `--seq` records is read by a gate of its own when it opens with an
+    /// RS (#7341), and the stream ends before it otherwise.
     seq_files: Option<SeqFilesCheck>,
 }
 
@@ -2310,8 +2315,9 @@ impl WindowedFiles {
     /// The same for a `--seq` list of files opened by path (#7221), which no prepass can vouch for (it
     /// would read what each path names before the run, and the run what it names when it gets there):
     /// each file is judged on the handle the run opens when it reaches it, as the prepass judges a
-    /// file the run holds ([`Reread::is_plain_seq_records`]). At the first that is not plain records
-    /// ending in an LF the stream ends, before any of that file, and where it stopped goes to `slot`.
+    /// file the run holds ([`Reread::is_plain_seq_records`]). One that is not plain records ending in an
+    /// LF is read by a gate of its own when it opens with an RS (#7341); at the first that does not, or
+    /// where a gate cannot carry on, the stream ends, and where it stopped goes to `slot`.
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) fn certifying_seq_files(mut self, slot: SeqFilesTailSlot) -> Self {
         self.seq_files = Some(SeqFilesCheck {
@@ -2325,8 +2331,8 @@ impl WindowedFiles {
 
     /// The same for a `--seq` list of files the run holds (#7279), where the prepass found the first that is
     /// not plain records ending in an LF at position `stop_at` ([`Reread::plain_seq_files`]): the files
-    /// before it are read a window at a time, and the stream ends before it, which goes to `slot` with the
-    /// rest, as a list opened by path goes from the first file it judges not plain.
+    /// before it are read a window at a time, and it and the ones after it are judged as the run reaches
+    /// them, as a list opened by path judges its files (#7341).
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) fn stopping_seq_files_at(mut self, slot: SeqFilesTailSlot, stop_at: usize) -> Self {
         self.seq_files = Some(SeqFilesCheck {
@@ -2432,11 +2438,12 @@ impl WindowedFiles {
                                 // its records leave in jq's token buffer is read (from its end); a read
                                 // that fails stops the stream here instead, before the file. #7341: the
                                 // files from `stop_at` on are judged as the run reaches them.
-                                let verdict = if check.stop_at.is_some_and(|stop| index < stop) {
-                                    seq_token_byte_in(&file, len)
-                                        .map_or(SeqFileVerdict::Unread, SeqFileVerdict::Plain)
-                                } else {
-                                    seq_file_verdict(&file, len)
+                                // The prepass already found the file at `stop_at` is not plain.
+                                let verdict = match check.stop_at {
+                                    Some(stop) if index < stop => seq_token_byte_in(&file, len)
+                                        .map_or(SeqFileVerdict::Unread, SeqFileVerdict::Plain),
+                                    Some(stop) if index == stop => SeqFileVerdict::Other,
+                                    _ => seq_file_verdict(&file, len),
                                 };
                                 if !self.judge_seq_file(&file, verdict, index) {
                                     return Ok(false);

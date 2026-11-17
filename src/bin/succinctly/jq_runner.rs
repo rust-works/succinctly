@@ -11794,8 +11794,9 @@ fn windowed_seq_file(args: &JqCommand) -> Option<WindowedSource> {
     // reaches them, and one that opens with an RS is read by a gate of its own.
     if files.len() > 1 && plain < files.len() {
         // #7279: several files the run holds, the first `plain` of them plain records ending in an LF: those
-        // are read a window at a time, and from the first that is not the stream is the whole-file
-        // route's, as for a long list ([`hand_on_seq_files_tail`]).
+        // are read a window at a time, and the ones from the first that is not are judged as the run
+        // reaches them, as for a long list; what is not read so is the whole-file route's
+        // ([`hand_on_seq_files_tail`]).
         let slot = window::SeqFilesTailSlot::default();
         SEQ_FILES_TAIL.with(|tail| *tail.borrow_mut() = Some(std::rc::Rc::clone(&slot)));
         reread.blank_rs();
@@ -11824,7 +11825,7 @@ fn windowed_seq_file(args: &JqCommand) -> Option<WindowedSource> {
 /// carry on after, the rest is read and handed to the route that walks a stream whole
 /// ([`hand_on_seq_pipe_tail`]), where jq's reader stands after the records already run. A stream that is
 /// not plain from its first byte is handed on whole, as that route would have read it. Several files are
-/// the whole-file route's still: what a tail mid-file means for the files after it is not worked out.
+/// [`window::WindowedFiles::stopping_seq_files_at`]'s, which gives such a file a gate of its own (#7341).
 #[cfg(unix)]
 fn gated_seq_source(files: Vec<PathBuf>) -> Option<WindowedSource> {
     use std::io::Seek;

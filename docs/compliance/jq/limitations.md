@@ -7647,7 +7647,7 @@ Its gate counts the lines it warns at from the stream's start and starts from th
 Where its gate cannot carry on, the rest of that file, from the stretch's RS behind its own resumed front, goes as that file's bytes, and the files after it are read by path.
 That is where jq's reader stands after plain records (as for a `--seq` pipe, #7164): a parse warning names the line counted over every file, a runtime error's `(at <file>:N)` the line in its own file, and a byte-order mark there is not the stream's front.
 The byte the records before left in jq's token buffer is carried over too.
-So a list with one file that is not plain held that file and every file after it until #7341, and now holds a window unless that file does not open with an RS.
+So a list with one file that is not plain held that file and every file after it until #7341; now it does so only when that file does not open with an RS, and otherwise holds only what that file's gate cannot carry on after (a stretch line it cannot end in, or a stretch that runs into the next file), with the files after it.
 
 Peak resident set size, in MiB, `--seq -c .` over 100 MiB of records (993,416 records, 105,851,071 bytes) in 100 files, each a hundredth of the records:
 
