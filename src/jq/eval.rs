@@ -23143,43 +23143,59 @@ fn object_pair_type_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// `min_by(f)`/`max_by(f)` over an array's elements, as one pass that keeps only the winner so
+/// far and its key (#7306), where each arm once collected every element and then every element's
+/// `[f]` before comparing any. Keys are computed in element order, so the first key filter to fail
+/// raises as before; the winner is replaced on `jq_min_by`/`jq_max_by`'s rule (a key that compares
+/// `Less` for `min_by`, any that does not for `max_by`), so the first of equal minima and the last
+/// of equal maxima win and the NaN order of #6008 holds. An empty array is `null`.
+fn extremum_by_elements<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    f: &Expr,
+    elements: impl Iterator<Item = StandardJson<'a, W>>,
+    want_max: bool,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let mut held: Option<(Vec<OwnedValue>, StandardJson<'a, W>)> = None;
+    for item in elements {
+        // jq keys by `[f]`, the array of *all* outputs of the key filter, not just its first
+        // output (#155); a bare `Vec`, compared with `compare_key_arrays`, rather than an
+        // `OwnedValue::Array` (#2999; see `collect_array_items`).
+        let key = match collect_array_items::<W, S>(f, item.clone(), optional) {
+            Ok(key) => key,
+            Err(escape) => return escape,
+        };
+        // `map_or(true, ..)`, not `is_none_or`: the crate's MSRV is 1.73.
+        let replaces = held.as_ref().map_or(true, |(best, _)| {
+            let order = compare_key_arrays::<S>(&key, best);
+            if want_max {
+                order != core::cmp::Ordering::Less
+            } else {
+                order == core::cmp::Ordering::Less
+            }
+        });
+        if replaces {
+            held = Some((key, item));
+        }
+    }
+    let Some((_, winner)) = held else {
+        return QueryResult::Owned(OwnedValue::Null);
+    };
+    // #1755: to_owned, not to_owned_lossy -- an undecodable string result must raise, not
+    // silently return "". #2327: suppress_or_raise, not a bare match -- see `builtin_del`'s doc
+    // comment for the shared reasoning.
+    match to_owned::<S, _>(&winner) {
+        Ok(v) => QueryResult::Owned(v),
+        Err(e) => suppress_or_raise(e, optional),
+    }
+}
+
 fn builtin_min_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     f: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     match value {
-        StandardJson::Array(elements) => {
-            let items: Vec<StandardJson<'a, W>> = elements.collect();
-            if items.is_empty() {
-                return QueryResult::Owned(OwnedValue::Null);
-            }
-
-            // Compute keys for each item. jq keys by `[f]` — the array of
-            // *all* outputs of the key filter, not just its first output
-            // (#155).
-            let mut keyed: Vec<(Vec<OwnedValue>, StandardJson<'a, W>)> = Vec::new();
-            for item in items {
-                // A bare `Vec`, compared with `compare_key_arrays`, rather
-                // than an `OwnedValue::Array` (#2999; see
-                // `collect_array_items`).
-                match collect_array_items::<W, S>(f, item.clone(), optional) {
-                    Ok(key) => keyed.push((key, item)),
-                    Err(escape) => return escape,
-                }
-            }
-
-            // #1755: to_owned, not to_owned_lossy -- an undecodable
-            // string result must raise, not silently return "".
-            // #2327: suppress_or_raise, not a bare match -- see
-            // `builtin_del`'s doc comment for the shared reasoning.
-            let (_, v) = jq_min_by(keyed, |(a, _), (b, _)| compare_key_arrays::<S>(a, b)).unwrap();
-            let min = match to_owned::<S, _>(&v) {
-                Ok(v) => v,
-                Err(e) => return suppress_or_raise(e, optional),
-            };
-            QueryResult::Owned(min)
-        }
+        StandardJson::Array(elements) => extremum_by_elements::<W, S>(f, elements, false, optional),
         // #929: see `object_pair_type_error` -- confirmed live:
         // `{"a":3,"b":1} | min_by(.)` raises `object ({"a":3,"b":1}) and
         // array ([[3],[1]]) cannot be iterated over` in jq 1.7.1.
@@ -23208,37 +23224,7 @@ fn builtin_max_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     match value {
-        StandardJson::Array(elements) => {
-            let items: Vec<StandardJson<'a, W>> = elements.collect();
-            if items.is_empty() {
-                return QueryResult::Owned(OwnedValue::Null);
-            }
-
-            // Compute keys for each item. jq keys by `[f]` — the array of
-            // *all* outputs of the key filter, not just its first output
-            // (#155).
-            let mut keyed: Vec<(Vec<OwnedValue>, StandardJson<'a, W>)> = Vec::new();
-            for item in items {
-                // A bare `Vec`, compared with `compare_key_arrays`, rather
-                // than an `OwnedValue::Array` (#2999; see
-                // `collect_array_items`).
-                match collect_array_items::<W, S>(f, item.clone(), optional) {
-                    Ok(key) => keyed.push((key, item)),
-                    Err(escape) => return escape,
-                }
-            }
-
-            // #1755: to_owned, not to_owned_lossy -- an undecodable
-            // string result must raise, not silently return "".
-            // #2327: suppress_or_raise, not a bare match -- see
-            // `builtin_min_by`'s sibling comment above.
-            let (_, v) = jq_max_by(keyed, |(a, _), (b, _)| compare_key_arrays::<S>(a, b)).unwrap();
-            let max = match to_owned::<S, _>(&v) {
-                Ok(v) => v,
-                Err(e) => return suppress_or_raise(e, optional),
-            };
-            QueryResult::Owned(max)
-        }
+        StandardJson::Array(elements) => extremum_by_elements::<W, S>(f, elements, true, optional),
         // #929: same operand-pairing as min_by's own Object arm above --
         // confirmed live: `{"a":3,"b":1} | max_by(.)` raises `object
         // ({"a":3,"b":1}) and array ([[3],[1]]) cannot be iterated over` in
