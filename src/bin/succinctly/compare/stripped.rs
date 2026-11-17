@@ -25,6 +25,8 @@ impl StrippedCopy {
     /// do not replace each other's binary.
     pub fn of(exe: &Path, parent: &Path) -> Result<Self> {
         let dir = parent.join(format!("stripped-{}", std::process::id()));
+        // A directory a killed run of the same pid left behind is replaced, not copied into.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).with_context(|| dir.display().to_string())?;
         // Built before the copy so a failure below still removes the directory.
         let mut copy = Self {
@@ -33,20 +35,8 @@ impl StrippedCopy {
         };
         std::fs::copy(exe, &copy.exe)
             .with_context(|| format!("copying {} to {}", exe.display(), copy.exe.display()))?;
+        // Apple's `strip` signs the result again itself, as in the release workflow's step.
         run("strip", &[copy.exe.as_os_str()])?;
-        // On macOS `strip` leaves the ad-hoc signature stale, and an arm64 kernel kills a binary
-        // whose signature does not match. Signing again is what the linker did the first time.
-        if cfg!(target_os = "macos") {
-            run(
-                "codesign",
-                &[
-                    "--force".as_ref(),
-                    "-s".as_ref(),
-                    "-".as_ref(),
-                    copy.exe.as_os_str(),
-                ],
-            )?;
-        }
         copy.exe = copy.exe.canonicalize()?;
         Ok(copy)
     }

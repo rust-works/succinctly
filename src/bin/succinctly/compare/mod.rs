@@ -829,9 +829,10 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         let generator = std::env::current_exe()?;
         // The rows time what the release archive ships, which is stripped; `target/release` is
         // not (#7321). The copy lives until this block ends. A `strip` that cannot run leaves the
-        // timed binary as built and makes the run unquotable, instead of failing it.
+        // timed binary as built and makes the run unquotable, instead of failing it. The Windows
+        // archive is not stripped, so a Windows run times the binary as built.
         let mut timed_copy = None;
-        if !args.control {
+        if !args.control && cfg!(unix) {
             match stripped::StrippedCopy::of(
                 std::path::Path::new(&subject.program),
                 &root.join("target/compare"),
