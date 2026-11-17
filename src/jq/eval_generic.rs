@@ -9107,7 +9107,8 @@ const COMPUTED_RUN_MIN: usize = 64;
 /// The body of `fold_pipe_stages`' per-element loop as it was before #7267, for one element's
 /// `$result`: an element that stops the fold makes the batch so far into the prefix the
 /// enclosing function returns, a lazy object is built as it arrives, and anything else is pushed
-/// as its own entry. `$computed_only` is cleared by any entry but an `Owned` or a `None`.
+/// as its own entry. `$computed_only` (a mode byte, `WATCHING` or `MAIN`) becomes `MAIN` at any
+/// entry but an `Owned` or a `None`.
 macro_rules! push_element_result_7267 {
     ($S:ty, $wrap:expr, $prefix:expr, $per_element:ident, $result:expr, $computed_only:ident) => {
         match $result {
@@ -9155,19 +9156,26 @@ macro_rules! push_element_result_7267 {
             // the flatten (N live boxes and entry buffers).
             obj @ GenericResult::LazyObject(_) => {
                 let built = obj.materialize_lazy::<$S>();
-                $computed_only &= matches!(built, GenericResult::Owned(_));
+                $computed_only &= u8::from(matches!(built, GenericResult::Owned(_)));
                 $per_element.push(built);
             }
             computed @ (GenericResult::Owned(_) | GenericResult::None) => {
                 $per_element.push(computed);
             }
             other => {
-                $computed_only = false;
+                $computed_only = MAIN;
                 $per_element.push(other);
             }
         }
     };
 }
+
+/// [`fold_cursor_elements`]' modes: main's fold, ...
+const MAIN: u8 = 0;
+/// ... main's fold while every element so far yielded one computed value or nothing, ...
+const WATCHING: u8 = 1;
+/// ... and the moved run.
+const MOVED: u8 = 2;
 
 /// `fold_pipe_stages`' `ManyCursor` arm over its elements' results (`eval` of each element).
 ///
@@ -9197,16 +9205,18 @@ fn fold_cursor_elements<S: EvalSemantics, V: DocumentValue, I: ExactSizeIterator
     mut eval: impl FnMut(I::Item) -> GenericResult<V>,
 ) -> GenericResult<V> {
     let mut per_element = vec_with_capacity(elements.len());
-    let mut computed_only = true;
+    // Whether the fold is still watching for a run and whether it has moved, in one byte: as two
+    // flags beside the run, main's path kept them in memory and reloaded the batch from it, about
+    // 10 more instructions per element (#7267 review, callgrind on the AMD Ryzen 9 7950X).
+    let mut mode = WATCHING;
     // The moved run: empty until the fold moves, and the prefix of the result once a long run
     // has gone back to the batch.
     let mut values: Vec<OwnedValue> = Vec::new();
-    let mut moved = false;
     #[cfg(test)]
     let mut went_back = false;
     while let Some(element) = elements.next() {
         let result = eval(element);
-        if moved {
+        if mode == MOVED {
             match result {
                 GenericResult::None => continue,
                 GenericResult::Owned(o) => {
@@ -9220,7 +9230,7 @@ fn fold_cursor_elements<S: EvalSemantics, V: DocumentValue, I: ExactSizeIterator
                         continue;
                     }
                     failed => {
-                        moved = false;
+                        mode = MAIN;
                         #[cfg(test)]
                         {
                             went_back = true;
@@ -9231,7 +9241,7 @@ fn fold_cursor_elements<S: EvalSemantics, V: DocumentValue, I: ExactSizeIterator
                     }
                 },
                 other => {
-                    moved = false;
+                    mode = MAIN;
                     #[cfg(test)]
                     {
                         went_back = true;
@@ -9253,14 +9263,13 @@ fn fold_cursor_elements<S: EvalSemantics, V: DocumentValue, I: ExactSizeIterator
             core::mem::take(&mut values),
             per_element,
             result,
-            computed_only
+            mode
         );
-        if computed_only
+        if mode == WATCHING
             && per_element.len() == COMPUTED_RUN_MIN
             && elements.len() >= COMPUTED_RUN_MIN
         {
-            computed_only = false;
-            moved = true;
+            mode = MOVED;
             move_computed_run(&mut per_element, &mut values, elements.len());
         }
     }
@@ -9275,9 +9284,14 @@ fn fold_cursor_elements<S: EvalSemantics, V: DocumentValue, I: ExactSizeIterator
             &per_element,
         );
     }
-    if moved || !values.is_empty() {
-        return finish_computed_run::<S, V>(values, per_element, moved);
+    // A fold that moved has a run sized for its elements, and one that went back with a long run
+    // keeps it; otherwise `values` holds no allocation.
+    if values.capacity() != 0 {
+        return finish_computed_run::<S, V>(values, per_element, mode == MOVED);
     }
+    // Nothing to free; dropping it was an out-of-line call of 25 instructions per fold (#7267
+    // review, cachegrind on the AMD Ryzen 9 7950X).
+    core::mem::forget(values);
     finish_entries::<S, V>(per_element)
 }
 
@@ -9317,15 +9331,8 @@ fn push_element_result_cold<S: EvalSemantics, V: DocumentValue>(
     result: GenericResult<V>,
 ) -> Option<GenericResult<V>> {
     let mut batch = core::mem::take(per_element);
-    let mut _computed_only = false;
-    push_element_result_7267!(
-        S,
-        Some,
-        core::mem::take(values),
-        batch,
-        result,
-        _computed_only
-    );
+    let mut _mode = MAIN;
+    push_element_result_7267!(S, Some, core::mem::take(values), batch, result, _mode);
     *per_element = batch;
     None
 }
@@ -9809,6 +9816,39 @@ mod per_element_batch_tests_7267 {
                     "k = {k}: {got_cap} against main's {want_cap}"
                 );
             }
+        }
+    }
+
+    /// A fold that moves with few values (the rest of its first elements yield nothing) and meets
+    /// a cursor while its run is still no longer than `COMPUTED_RUN_MIN`: the run goes back as the
+    /// `Owned` entries main pushed, not as a prefix, so the fold hands on main's result and
+    /// capacity.
+    #[test]
+    fn a_short_moved_run_goes_back_as_mains_entries_7267() {
+        let cs = cursors(br#"["a",{"b":1},[2,3],4,"e"]"#);
+        for values in [0, 1, 5, 32, 63, 64] {
+            let mut kinds: Vec<Kind> = (0..COMPUTED_RUN_MIN)
+                .map(|i| {
+                    if i < values {
+                        Kind::Value(i as i64)
+                    } else {
+                        Kind::Nothing
+                    }
+                })
+                .collect();
+            kinds.extend((0..COMPUTED_RUN_MIN).map(|_| Kind::Nothing));
+            kinds.push(Kind::Cursor(0));
+            kinds.extend((1..4).map(|i| Kind::Value(-i)));
+            let want = main_fold(kinds.iter().copied(), |k| build(k, &cs));
+            let _ = batch_stats_7267::take();
+            let got = fold(kinds.iter().copied(), |k| build(k, &cs));
+            let stats = batch_stats_7267::take();
+            assert!(
+                stats.leading.is_empty(),
+                "{values} values went back as a prefix"
+            );
+            assert_eq!(format!("{got:?}"), format!("{want:?}"), "{values} values");
+            assert_eq!(capacity(&got), capacity(&want), "{values} values");
         }
     }
 
