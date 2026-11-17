@@ -26,6 +26,64 @@ pub(crate) mod specials;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(crate) mod quote_mask;
 
+/// The `SUCCINCTLY_SIMD` dispatch clamp, one definition for every x86_64 dispatcher that
+/// honors it (the YAML kernels and, since #7318, the JSON index builders), so the two cannot
+/// disagree about which values clamp.
+///
+/// It is a clamp, not a selector: it can only lower the level below AVX2, never raise it, since
+/// dispatching an undetected feature is undefined behaviour. See
+/// `docs/reference/environment-variables.md`.
+#[cfg(all(target_arch = "x86_64", any(test, feature = "std")))]
+pub(crate) mod clamp {
+    /// Parsed `SUCCINCTLY_SIMD` value: does it clamp x86 dispatch below AVX2?
+    ///
+    /// - `Some(true)`: a recognized level below AVX2 (`scalar`, `sse2`, `sse42`, `sse4.2`), so
+    ///   use the 16-byte SSE2 kernels. (`scalar` still means SSE2 here; scalar YAML parsing is
+    ///   compile-time only, via `--features scalar-yaml`.)
+    /// - `Some(false)`: a recognized no-op (`avx2`, empty), so keep the detected dispatch.
+    /// - `None`: unrecognized. The runtime ignores it (no clamp), but the contract tests
+    ///   (`test_succinctly_simd_env_contract` for YAML, `json::simd`'s for JSON) fail loudly on
+    ///   it, so a typo in a CI leg cannot silently un-clamp the suite.
+    pub(crate) fn parse(value: &str) -> Option<bool> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "scalar" | "sse2" | "sse42" | "sse4.2" => Some(true),
+            "avx2" | "" => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Whether `SUCCINCTLY_SIMD` requests clamping dispatch below AVX2. Reads the environment
+    /// on every call: callers cache the answer (STYLE-0003).
+    pub(crate) fn below_avx2() -> bool {
+        std::env::var("SUCCINCTLY_SIMD").is_ok_and(|v| parse(&v) == Some(true))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::parse;
+
+        #[test]
+        fn test_parse_simd_clamp_values() {
+            // Recognized levels below AVX2 clamp (whitespace/case-insensitive).
+            for v in ["scalar", "sse2", "sse42", "sse4.2", " SSE2 ", "Sse4.2"] {
+                assert_eq!(parse(v), Some(true), "{v:?} should clamp");
+            }
+            // Recognized no-ops.
+            for v in ["avx2", "AVX2", ""] {
+                assert_eq!(parse(v), Some(false), "{v:?} should be a no-op");
+            }
+            // Unrecognized values parse to None (runtime ignores; the contract tests fail
+            // loudly when the env var is actually set to one of these).
+            for v in ["banana", "neon", "1", "sse", "avx512"] {
+                assert_eq!(parse(v), None, "{v:?} should be unrecognized");
+            }
+        }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", any(test, feature = "std")))]
+pub(crate) use clamp::below_avx2 as clamp_below_avx2;
+
 /// Popcount of a 512-bit (64-byte) block.
 ///
 /// Uses the best available implementation for the current platform.
