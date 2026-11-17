@@ -3313,6 +3313,7 @@ impl OutputConfig {
 }
 
 use std::borrow::Cow as PreparedCow;
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
 /// One object field, recorded on the single walk `print_json` makes over
@@ -3399,8 +3400,8 @@ impl<'a, W: Clone + AsRef<[u64]>> Frame<'a, W> {
 ///
 /// The answer above the threshold is conservative: two distinct keys
 /// sharing a 64-bit hash report `true`. [`collapse_duplicate_fields`]
-/// resolves it on the spans themselves and returns `None` when nothing
-/// actually collapsed, so a collision costs one exact rebuild.
+/// resolves it on the keys themselves and keeps every field when nothing
+/// actually collapsed, so a collision costs one exact pass.
 fn spans_repeat(prepared: &[PreparedField<'_>]) -> bool {
     if prepared.len() <= PAIRWISE_SPAN_SCAN_LIMIT {
         let mut marks = [0u64; PAIRWISE_SPAN_SCAN_LIMIT];
@@ -3472,19 +3473,20 @@ fn collapse_duplicate_fields<'a>(
         let name = collapse_key_hash(&field, frame)
             .filter(|hash| shared.binary_search(hash).is_ok())
             .and_then(|_| collapse_key_name(&field, frame));
-        match name.and_then(|name| match slot_of.get(name.as_ref()) {
-            Some(&at) => Some(at),
-            None => {
-                slot_of.insert(name, kept);
-                None
-            }
-        }) {
-            Some(at) => prepared[at] = field,
-            None => {
-                prepared[kept] = field;
-                kept += 1;
+        if let Some(name) = name {
+            match slot_of.entry(name) {
+                // A later occurrence: its key's first slot takes this field.
+                Entry::Occupied(slot) => {
+                    prepared[*slot.get()] = field;
+                    continue;
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert(kept);
+                }
             }
         }
+        prepared[kept] = field;
+        kept += 1;
     }
     kept
 }
