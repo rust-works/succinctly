@@ -536,6 +536,55 @@ open-addressed table keeps 16 bytes per key at its half-load point where a sorte
 8. That is the trade for the time above, and defect 4 in this document is the precedent for
 reporting both rather than one.
 
+## Collapsing a repeat without the field list (#7311)
+
+Everything above made the *clean* object cheap. The object that does repeat a key still paid for
+the whole collapse: the JSON writer materialized every field (`collapse_repeated(all_fields())`, a
+144-byte `DocumentField` each) and owned every key in an `IndexMap<String, _>`. `.[]`'s cursor
+collapse (#7290) and the printer's `collapse_duplicate_fields` each owned or decoded every key the
+same way. One repeated key in the 100 MB `wide` object (7.1 M keys) cost `.` 2,648 MB on a 7950X
+(2,852 MB on an M4 Pro), against 260 MB for the same object printed through the same walk without
+the repeat.
+
+The census already knew which hashes repeat. A key whose hash no other key shares occurs once, so
+it keeps its place whatever the rule does, and only the keys on a shared hash need decoding and
+comparing:
+
+- `repeat_plan_checked` (`src/jq/document.rs`) takes the census's key-only walk (`hash_walk`), then
+  walks again decoding only those keys, and records by field position what the rule changes: a
+  repeated key's first occurrence takes its last value (a slot holding one value cursor), and its
+  later occurrences are dropped. The writer (`stream_json_pretty`) streams the fields and asks the
+  plan about each. `map(f)` turns the plan into the survivors' value cursors.
+- `.[]` and the printer keep their in-place compaction, and decode only the keys on a shared hash.
+- **Which fields collapse is still the full collapse's answer.** It compares every key that
+  stringifies by its string, and a key with no hash (a YAML complex key, an undecodable escape)
+  stringifies without hashing. An object holding one decodes every key, as before; review caught a
+  build that did not, where `succinctly yq 'map(.)'` over `{a: 1, a: 2, [x]: 3, [x]: 4}` printed
+  `[2,3,4]` where main and yq print `[2,4]`.
+- **The collapse walks are out of line and cold.** A build that kept the plan's walk, the writer's
+  plan loop and the printer's collapse in line read up to 4% slower on a 7950X on objects that
+  repeat nothing, at an instruction count within 0.05%. A padding holdout that moved the index
+  builder to the same position did not reproduce it, so the cost was in the writers' own bodies;
+  with the three out of line the clean rows timed flat.
+
+Measured with `scripts/ab-cli.py`, interleaved, against `6ac00e97b`, `.` over `wide` with its last
+key renamed `k0` (median):
+
+| size   | 7950X time      | M4 Pro time     | 7950X peak RSS      | M4 Pro peak footprint |
+|--------|-----------------|-----------------|---------------------|-----------------------|
+| 1 MB   | −52.7%          | −29.5%          |                     |                       |
+| 10 MB  | −61.1%          | −34.8%          |                     |                       |
+| 100 MB | 3.90 s → 1.36 s | 1.76 s → 1.08 s | 2,648 MB → 261 MB   | 2,852 MB → 311 MB     |
+
+At 100 MB, `map(.) | length` is −60.6% / −34.0% (7950X / M4 Pro), `.[]` −44.6% / −22.6%, and
+`select(true)` −37.8% / −15.7%. The rows that repeat no key stayed inside about ±1.5% on both
+boxes, against A/A control bands of −1.6% to +0.5%.
+
+What remains on the repeat row over the plain walk is the canonical scan, which declines the object
+at its closing brace (#7310), and the two key-only walks. Echoing the unchanged fields from the text,
+as the clean object is, needs a scan that ignores repeats at one level and a re-indent of fragments;
+that is a separate change.
+
 ## Open risks for an implementer to sanity-check
 
 1. ~~**The 4-6% wants confirming on the pinned hosts.**~~ **Closed by
