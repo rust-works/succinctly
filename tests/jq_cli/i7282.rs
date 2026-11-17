@@ -59,15 +59,46 @@ const ROWS: &[(&str, &str, &str, i32)] = &[
     ),
 ];
 
+/// A group whose second element fails `.b + 1`: a `map` read by `first` or `.[0]` still runs
+/// every element and raises, as jq's eager `map` does (#7282 review).
+const MAP_INPUT: &str = r#"[{"a":1,"b":1},{"a":1,"b":"x"},{"a":2,"b":3}]"#;
+
+/// (filter, expected `-c` stdout, expected stderr, exit code), run on [`MAP_INPUT`].
+const MAP_ROWS: &[(&str, &str, &str, i32)] = &[
+    (
+        "[group_by(.a)[] | map(.b + 1) | first]",
+        "",
+        "jq: error (at <stdin>:0): string (\"x\") and number (1) cannot be added\n",
+        5,
+    ),
+    (
+        "[group_by(.a) | .[] | map(.b) | map(. + 1) | .[0]]",
+        "",
+        "jq: error (at <stdin>:0): string (\"x\") and number (1) cannot be added\n",
+        5,
+    ),
+    ("[group_by(.a)[] | map(.b) | first]", "[1,3]\n", "", 0),
+    (
+        "[group_by(.a)[] | map(.b) | .[1:] | first]",
+        "[\"x\",null]\n",
+        "",
+        0,
+    ),
+    ("[group_by(.a) | (.[]) | length]", "[2,1]\n", "", 0),
+    ("[(group_by(.a)[]) | length]", "[2,1]\n", "", 0),
+];
+
 #[test]
 fn test_iterate_over_groups_answers_as_jq_7282() -> Result<()> {
-    for (filter, want_out, want_err, want_code) in ROWS {
-        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(INPUT))?;
-        assert_eq!(
-            (stdout.as_str(), stderr.as_str(), code),
-            (*want_out, *want_err, *want_code),
-            "`{filter}`"
-        );
+    for (input, rows) in [(INPUT, ROWS), (MAP_INPUT, MAP_ROWS)] {
+        for (filter, want_out, want_err, want_code) in rows {
+            let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+            assert_eq!(
+                (stdout.as_str(), stderr.as_str(), code),
+                (*want_out, *want_err, *want_code),
+                "`{filter}`"
+            );
+        }
     }
     Ok(())
 }
