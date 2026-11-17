@@ -9092,6 +9092,1037 @@ fn retain_truthy_generic<V: DocumentValue, S: EvalSemantics>(
     }
 }
 
+/// How many elements `fold_pipe_stages`' `ManyCursor` arm folds exactly as it did before #7267
+/// before it may move a fold whose elements have all yielded one computed value or nothing so
+/// far to its run of values ([`move_computed_run`]), and how many must be left for it to (#7267). A fold of fewer
+/// than twice this many elements, or one that meets any other kind of result in its first
+/// `COMPUTED_RUN_MIN`, builds main's batch, its flatten and its handed-on vector, allocator calls
+/// included; a longer one is long enough to pay for the vector it moves into (#7267 review: a
+/// fold that moved with a single element left and then went back to main's entries ran 0.7% more
+/// instructions on the Apple M4 Pro). Chosen by measurement (#7267
+/// review: a short computed run followed by another kind of result held up to 2x main's
+/// capacity, and cost two more allocations per fold, when it moved at the second value).
+const COMPUTED_RUN_MIN: usize = 64;
+
+/// The body of `fold_pipe_stages`' per-element loop as it was before #7267, for one element's
+/// `$result`: an element that stops the fold makes the batch so far into the prefix the
+/// enclosing function returns, a lazy object is built as it arrives, and anything else is pushed
+/// as its own entry. `$computed_only` (a mode byte, `WATCHING` or `MAIN`) becomes `MAIN` at any
+/// entry but an `Owned` or a `None`.
+macro_rules! push_element_result_7267 {
+    ($S:ty, $wrap:expr, $prefix:expr, $per_element:ident, $result:expr, $computed_only:ident) => {
+        match $result {
+            // The elements already piped through no
+            // longer vanish (#400, #494). If an earlier
+            // element's own buffered `LazySeq` also fails
+            // once `flatten_generic_results` materializes
+            // it, that earlier failure wins -- it's
+            // chronologically first in evaluation order.
+            GenericResult::Error(e) => {
+                return $wrap(stop_fold::<_, $S>(
+                    $prefix,
+                    $per_element,
+                    Control::Error(e),
+                    Vec::new(),
+                ));
+            }
+            GenericResult::Break(label) => {
+                return $wrap(stop_fold::<_, $S>(
+                    $prefix,
+                    $per_element,
+                    Control::Break(label),
+                    Vec::new(),
+                ));
+            }
+            // Same immediate-stop treatment as `Error`/`Break`
+            // above — halt is an opaque terminal signal, not
+            // catchable by anything downstream, so this must
+            // not fall through to the `other => ...` wildcard
+            // below (which would keep evaluating later cursor
+            // elements instead of stopping immediately).
+            GenericResult::Halt(code) => {
+                return $wrap(stop_fold::<_, $S>(
+                    $prefix,
+                    $per_element,
+                    Control::Halt(code),
+                    Vec::new(),
+                ));
+            }
+            GenericResult::Partial(vs, control) => {
+                return $wrap(stop_fold::<_, $S>($prefix, $per_element, control, vs));
+            }
+            // #4044: collected, an object is read in full anyway, so it
+            // is built as it arrives rather than held lazily until
+            // the flatten (N live boxes and entry buffers).
+            obj @ GenericResult::LazyObject(_) => {
+                let built = obj.materialize_lazy::<$S>();
+                $computed_only &= u8::from(matches!(built, GenericResult::Owned(_)));
+                $per_element.push(built);
+            }
+            computed @ (GenericResult::Owned(_) | GenericResult::None) => {
+                $per_element.push(computed);
+            }
+            other => {
+                $computed_only = MAIN;
+                $per_element.push(other);
+            }
+        }
+    };
+}
+
+/// [`fold_cursor_elements`]' modes: main's fold, ...
+const MAIN: u8 = 0;
+/// ... main's fold while every element so far yielded one computed value or nothing, ...
+const WATCHING: u8 = 1;
+/// ... and the moved run.
+const MOVED: u8 = 2;
+
+/// `fold_pipe_stages`' `ManyCursor` arm over its elements' results (`eval` of each element).
+///
+/// It is the arm as it was before #7267, with one addition: once [`COMPUTED_RUN_MIN`] elements
+/// have each yielded one computed value or nothing, and at least as many are left, the fold
+/// moves its values into one vector ([`move_computed_run`]), sized for every element, and pushes
+/// each further computed value straight into it: about 32 bytes per element where an 80-byte
+/// `GenericResult` per element plus the vector the flatten grew from empty held 112-144 (#7267).
+/// A computed value cannot fail later and a `None` adds nothing, so a fold that ends this way
+/// hands the vector on as its result ([`finish_computed_run`]).
+///
+/// At the first element that yields anything else, the fold goes back to main's loop body
+/// ([`leave_computed_run`]): up to [`COMPUTED_RUN_MIN`] values become the `Owned` entries main
+/// would have pushed, and the fold ends as main's; a longer run stays the first part of the
+/// result, and main's batch for the rest is flattened onto it in place (on a failure too, so the
+/// prefix kept is the same). Computed values are not cursors, so the all-cursors decision is the
+/// one main would make, and "an earlier lazily failing element wins" holds as before.
+///
+/// Both modes run in this one loop, so an element evaluated after the move recurses from this
+/// frame alone (#7267 review: a moved run in its own out-of-line function kept that frame too, and
+/// the native-stack guard refused a recursion through such folds 2% sooner than main). A fold that
+/// is shorter, or that meets another kind of result in its first [`COMPUTED_RUN_MIN`] elements, is
+/// main's fold throughout: the same batch, flatten, handed-on vector and allocator calls.
+#[inline(always)]
+fn fold_cursor_elements<S: EvalSemantics, V: DocumentValue, I: ExactSizeIterator>(
+    mut elements: I,
+    mut eval: impl FnMut(I::Item) -> GenericResult<V>,
+) -> GenericResult<V> {
+    let mut per_element = vec_with_capacity(elements.len());
+    // Whether the fold is still watching for a run and whether it has moved, in one byte: as two
+    // flags beside the run, main's path kept them in memory and reloaded the batch from it, about
+    // 10 more instructions per element (#7267 review, callgrind on the AMD Ryzen 9 7950X).
+    let mut mode = WATCHING;
+    // The moved run: empty until the fold moves, and the prefix of the result once a long run
+    // has gone back to the batch.
+    let mut values: Vec<OwnedValue> = Vec::new();
+    #[cfg(test)]
+    let mut went_back = false;
+    while let Some(element) = elements.next() {
+        let result = eval(element);
+        if mode == MOVED {
+            match result {
+                GenericResult::None => continue,
+                GenericResult::Owned(o) => {
+                    values.push(o);
+                    continue;
+                }
+                // #4044, as main's loop body does: a lazy object is built as it arrives.
+                obj @ GenericResult::LazyObject(_) => match obj.materialize_lazy::<S>() {
+                    GenericResult::Owned(o) => {
+                        values.push(o);
+                        continue;
+                    }
+                    failed => {
+                        mode = MAIN;
+                        #[cfg(test)]
+                        {
+                            went_back = true;
+                        }
+                        (values, per_element) = leave_computed_run(values, per_element);
+                        per_element.push(failed);
+                        continue;
+                    }
+                },
+                other => {
+                    mode = MAIN;
+                    #[cfg(test)]
+                    {
+                        went_back = true;
+                    }
+                    (values, per_element) = leave_computed_run(values, per_element);
+                    // Out of line, so that this loop holds one element's result at a time.
+                    match push_element_result_cold::<S, V>(values, per_element, other) {
+                        Ok(kept) => (values, per_element) = kept,
+                        Err(stopped) => return stopped,
+                    }
+                    continue;
+                }
+            }
+        }
+        push_element_result_7267!(
+            S,
+            core::convert::identity,
+            core::mem::take(&mut values),
+            per_element,
+            result,
+            mode
+        );
+        if mode == WATCHING
+            && per_element.len() == COMPUTED_RUN_MIN
+            && elements.len() >= COMPUTED_RUN_MIN
+        {
+            mode = MOVED;
+            (per_element, values) = move_computed_run(per_element, elements.len());
+        }
+    }
+    // Main's `for` loop consumed the elements, so their cursors were freed before the flatten
+    // (#7267 review: kept to here, 100,000 of them held 3.1 MiB more at the peak).
+    drop(elements);
+    #[cfg(test)]
+    if went_back {
+        batch_stats_7267::note_entries(
+            per_element.capacity(),
+            per_element.capacity(),
+            &per_element,
+        );
+    }
+    // A fold that moved has a run sized for its elements, and one that went back with a long run
+    // keeps it; otherwise `values` holds no allocation.
+    if values.capacity() != 0 {
+        return finish_computed_run::<S, V>(values, per_element, mode == MOVED);
+    }
+    // Nothing to free; dropping it was an out-of-line call of 25 instructions per fold (#7267
+    // review, cachegrind on the AMD Ryzen 9 7950X).
+    core::mem::forget(values);
+    finish_entries::<S, V>(per_element)
+}
+
+/// What `fold_pipe_stages`' `ManyCursor` arm returns when an element stops the fold with
+/// `control` (and, for a `Partial`, the values `tail` it produced first), as main's loop body
+/// computed it: the batch so far flattened onto `prefix`, then `tail`, as the prefix of a
+/// `Partial`; or, if an earlier element's buffered lazy result fails in the flatten, that earlier
+/// failure, which is first in evaluation order. Out of line, so that the loop's frame does not
+/// hold these rare temporaries (#7267 review: the frame is what each level of a recursion
+/// through the fold costs the native-stack guard).
+#[inline(never)]
+fn stop_fold<V: DocumentValue, S: EvalSemantics>(
+    prefix: Vec<OwnedValue>,
+    per_element: Vec<GenericResult<V>>,
+    control: Control,
+    tail: Vec<OwnedValue>,
+) -> GenericResult<V> {
+    match flatten_generic_results_onto::<V, S>(prefix, per_element) {
+        Ok(mut prefix) => {
+            prefix.extend(tail);
+            partial_generic(prefix, control)
+        }
+        Err(Control::Error(earlier)) => GenericResult::Error(earlier),
+        Err(Control::Break(label)) => GenericResult::Break(label),
+        Err(Control::Halt(code)) => GenericResult::Halt(code),
+    }
+}
+
+/// The moved run and the batch, as [`fold_cursor_elements`]' helpers give them back.
+type RunAndBatch<V> = (Vec<OwnedValue>, Vec<GenericResult<V>>);
+
+/// Main's loop body for the element that ends a moved run, which [`fold_cursor_elements`] calls
+/// out of line so that its loop holds a single element's result (#7267): the stack each level of
+/// a recursion through such folds takes is then no more than main's. Returns the run and the batch
+/// to go on with, or what the fold returns when the element stops it.
+///
+/// This and the other helpers of [`fold_cursor_elements`] take and give back the vectors by value:
+/// a `&mut` to the batch let its length escape, and main's path then reloaded it from memory
+/// after every element's evaluation (#7267 review: `mix_alternating` and `mix_lead_cursor` 2-4%
+/// slower on the Apple M4 Pro, with the same instructions).
+#[inline(never)]
+fn push_element_result_cold<S: EvalSemantics, V: DocumentValue>(
+    values: Vec<OwnedValue>,
+    mut per_element: Vec<GenericResult<V>>,
+    result: GenericResult<V>,
+) -> Result<RunAndBatch<V>, GenericResult<V>> {
+    let mut _mode = MAIN;
+    push_element_result_7267!(S, Err, values, per_element, result, _mode);
+    Ok((values, per_element))
+}
+
+/// The move of [`fold_cursor_elements`]: the values of the batch's entries so far into one
+/// vector sized for every element of the fold (#7267). The batch keeps its capacity, one entry
+/// per element, should the fold need it again.
+#[inline(never)]
+fn move_computed_run<V: DocumentValue>(
+    mut per_element: Vec<GenericResult<V>>,
+    left: usize,
+) -> (Vec<GenericResult<V>>, Vec<OwnedValue>) {
+    let mut values = vec_with_capacity(per_element.len() + left);
+    // Taken out in place rather than drained, which keeps the batch's capacity.
+    for entry in &mut per_element {
+        if let GenericResult::Owned(o) = core::mem::replace(entry, GenericResult::None) {
+            values.push(o);
+        }
+    }
+    per_element.clear();
+    (per_element, values)
+}
+
+/// The way back of [`fold_cursor_elements`] to main's batch (#7267). A short run goes back as the
+/// `Owned` entries main would have pushed, and the fold ends as main's. A long one stays in
+/// `values` as the first part of the result, which main's batch for the rest is flattened onto in
+/// place (#7267 review: as a leading `ManyOwned` entry it was copied into a vector the flatten
+/// grew from the run's length and then shrank, and on glibc the shrunk tails of the vectors an
+/// enclosing fold kept fragmented the heap, +81% peak RSS over 20,000 inner folds of 1,000 values
+/// on the AMD Ryzen 9 7950X).
+#[inline(never)]
+fn leave_computed_run<V: DocumentValue>(
+    values: Vec<OwnedValue>,
+    mut per_element: Vec<GenericResult<V>>,
+) -> (Vec<OwnedValue>, Vec<GenericResult<V>>) {
+    if values.len() <= COMPUTED_RUN_MIN {
+        per_element.extend(values.into_iter().map(GenericResult::Owned));
+        return (Vec::new(), per_element);
+    }
+    #[cfg(test)]
+    batch_stats_7267::note_leading(values.len(), values.capacity(), per_element.capacity());
+    (values, per_element)
+}
+
+/// The end of a fold that moved (#7267): its run, with the slack of the elements that yielded
+/// nothing given back ([`release_slack`]), if it never went back; otherwise main's batch for the
+/// rest flattened onto the run, released the same way.
+#[inline(never)]
+fn finish_computed_run<S: EvalSemantics, V: DocumentValue>(
+    mut values: Vec<OwnedValue>,
+    per_element: Vec<GenericResult<V>>,
+    moved: bool,
+) -> GenericResult<V> {
+    if moved {
+        #[cfg(test)]
+        let reserved = values.capacity();
+        release_slack(&mut values);
+        #[cfg(test)]
+        batch_stats_7267::note_fold(batch_stats_7267::Fold::Values {
+            elements: per_element.capacity(),
+            reserved,
+            len: values.len(),
+            capacity: values.capacity(),
+        });
+        return if values.is_empty() {
+            GenericResult::None
+        } else {
+            GenericResult::ManyOwned(values)
+        };
+    }
+    match flatten_generic_results_onto::<V, S>(values, per_element) {
+        Ok(mut results) => {
+            release_slack(&mut results);
+            #[cfg(test)]
+            batch_stats_7267::note_released(results.len(), results.capacity());
+            GenericResult::ManyOwned(results)
+        }
+        Err(Control::Error(e)) => GenericResult::Error(e),
+        Err(Control::Break(label)) => GenericResult::Break(label),
+        Err(Control::Halt(code)) => GenericResult::Halt(code),
+    }
+}
+
+/// The end of `fold_pipe_stages`' `ManyCursor` arm as it was before #7267: when every element's
+/// result is cursor-backed or empty, the cursors in order, so that a further stage can still
+/// resolve a position; otherwise the flattened values.
+#[inline(always)]
+fn finish_entries<S: EvalSemantics, V: DocumentValue>(
+    per_element: Vec<GenericResult<V>>,
+) -> GenericResult<V> {
+    let all_cursor_or_empty = per_element.iter().all(|r| {
+        matches!(
+            r,
+            GenericResult::OneCursor(_) | GenericResult::ManyCursor(_) | GenericResult::None
+        )
+    });
+
+    if all_cursor_or_empty {
+        let mut cursors = vec_with_capacity(per_element.len());
+        for r in per_element {
+            match r {
+                GenericResult::OneCursor(c) => cursors.push(c),
+                GenericResult::ManyCursor(cs) => cursors.extend(cs),
+                GenericResult::None => {}
+                _ => unreachable!("checked all_cursor_or_empty above"),
+            }
+        }
+        if cursors.is_empty() {
+            GenericResult::None
+        } else {
+            GenericResult::ManyCursor(cursors)
+        }
+    } else {
+        match flatten_generic_results::<_, S>(per_element) {
+            Ok(results) if results.is_empty() => GenericResult::None,
+            Ok(results) => GenericResult::ManyOwned(results),
+            Err(Control::Error(e)) => GenericResult::Error(e),
+            Err(Control::Break(label)) => GenericResult::Break(label),
+            Err(Control::Halt(code)) => GenericResult::Halt(code),
+        }
+    }
+}
+
+/// The slack a fold's vector of computed values may keep when it is handed on: an eighth of its
+/// length, or 16 slots for a short one (#7267). The vector is allocated for every element, so a
+/// fold whose elements then yield nothing would otherwise hand on, and an enclosing fold keep,
+/// room for values that never came; and a flatten that grew from a leading run of values doubles
+/// from that run's length, not from main's power of two.
+const fn slack_allowed(len: usize) -> usize {
+    let eighth = len / 8;
+    if eighth > 16 {
+        eighth
+    } else {
+        16
+    }
+}
+
+/// Give back `v`'s capacity past [`slack_allowed`] (#7267).
+#[inline]
+fn release_slack(v: &mut Vec<OwnedValue>) {
+    if v.capacity() - v.len() > slack_allowed(v.len()) {
+        #[cfg(test)]
+        batch_stats_7267::note_copied(v.len());
+        v.shrink_to_fit();
+    }
+}
+
+/// Test-only accounting for [`fold_cursor_elements`] (#7267): what each fold that moved
+/// reserved and handed on, and how many values its own reallocations copied.
+#[cfg(test)]
+mod batch_stats_7267 {
+    use super::{DocumentValue, GenericResult};
+    use core::cell::RefCell;
+
+    /// One fold that moved its values out of the batch.
+    #[derive(Clone, Debug)]
+    pub(super) enum Fold {
+        /// It ended with every element computed or empty.
+        Values {
+            /// The elements it iterated.
+            elements: usize,
+            /// The capacity of its vector of values before the slack was given back.
+            reserved: usize,
+            /// The vector it handed on.
+            len: usize,
+            capacity: usize,
+        },
+        /// It went back to the per-element batch.
+        Entries {
+            elements: usize,
+            /// The batch's capacity.
+            batch: usize,
+            /// `(len, capacity)` of every vector of values the batch holds, the leading one first.
+            runs: Vec<(usize, usize)>,
+        },
+    }
+
+    #[derive(Default, Clone, Debug)]
+    pub(super) struct Stats {
+        /// Every fold that moved, innermost first.
+        pub(super) folds: Vec<Fold>,
+        /// `(len, capacity, elements)` of every run kept as the first part of a fold's result.
+        pub(super) leading: Vec<(usize, usize, usize)>,
+        /// `(len, capacity)` of every vector handed on after a leading entry, once released.
+        pub(super) released: Vec<(usize, usize)>,
+        /// Values copied by a shrink of the fold's own vector of values.
+        pub(super) copied: usize,
+    }
+
+    std::thread_local! {
+        static STATS: RefCell<Stats> = RefCell::new(Stats::default());
+    }
+
+    pub(super) fn note_copied(values: usize) {
+        STATS.with(|s| s.borrow_mut().copied += values);
+    }
+
+    pub(super) fn note_fold(fold: Fold) {
+        STATS.with(|s| s.borrow_mut().folds.push(fold));
+    }
+
+    pub(super) fn note_leading(len: usize, capacity: usize, elements: usize) {
+        STATS.with(|s| s.borrow_mut().leading.push((len, capacity, elements)));
+    }
+
+    pub(super) fn note_released(len: usize, capacity: usize) {
+        STATS.with(|s| s.borrow_mut().released.push((len, capacity)));
+    }
+
+    pub(super) fn note_entries<V: DocumentValue>(
+        elements: usize,
+        capacity: usize,
+        batch: &[GenericResult<V>],
+    ) {
+        let runs = batch
+            .iter()
+            .filter_map(|r| match r {
+                GenericResult::ManyOwned(os) => Some((os.len(), os.capacity())),
+                _ => None,
+            })
+            .collect();
+        note_fold(Fold::Entries {
+            elements,
+            batch: capacity,
+            runs,
+        });
+    }
+
+    pub(super) fn take() -> Stats {
+        STATS.with(|s| core::mem::take(&mut *s.borrow_mut()))
+    }
+}
+
+#[cfg(test)]
+mod per_element_batch_tests_7267 {
+    use super::batch_stats_7267::Fold;
+    use super::*;
+    use crate::jq::parse;
+    use crate::json::light::{JsonIndex, StandardJson};
+
+    type Doc<'a> = StandardJson<'a, Vec<u64>>;
+    type Cursor<'a> = <Doc<'a> as DocumentValue>::Cursor;
+
+    /// The cursors of a test document's elements.
+    fn cursors(json: &[u8]) -> Vec<Cursor<'static>> {
+        // The document and its index have to outlive the cursors, so both are leaked.
+        let json: &'static [u8] = Box::leak(json.to_vec().into_boxed_slice());
+        let index: &'static JsonIndex = Box::leak(Box::new(JsonIndex::build(json)));
+        let root = index.root(json);
+        let GenericResult::ManyCursor(cs) =
+            eval_single::<JqSemantics, _>(&parse(".[]").unwrap(), root.value(), false, Some(root))
+        else {
+            panic!("expected the elements' cursors") // patchcov: coverage tolerate-line reason="the failure message of the pattern above, unreachable in a passing suite (#7267)"
+        };
+        cs
+    }
+
+    /// `fold_pipe_stages`' `ManyCursor` arm as it was before #7267, verbatim but for taking the
+    /// elements' results from `eval`: the reference every test below compares against.
+    fn main_fold<I: ExactSizeIterator>(
+        elements: I,
+        mut eval: impl FnMut(I::Item) -> GenericResult<Doc<'static>>,
+    ) -> GenericResult<Doc<'static>> {
+        type S = JqSemantics;
+        let mut per_element = vec_with_capacity(elements.len());
+        for element in elements {
+            match eval(element) {
+                GenericResult::Error(e) => {
+                    return match flatten_generic_results::<_, S>(per_element) {
+                        Ok(prefix) => partial_generic(prefix, Control::Error(e)),
+                        Err(Control::Error(earlier)) => GenericResult::Error(earlier),
+                        Err(Control::Break(label)) => GenericResult::Break(label),
+                        Err(Control::Halt(code)) => GenericResult::Halt(code),
+                    };
+                }
+                GenericResult::Break(label) => {
+                    return match flatten_generic_results::<_, S>(per_element) {
+                        Ok(prefix) => partial_generic(prefix, Control::Break(label)),
+                        Err(Control::Error(earlier)) => GenericResult::Error(earlier),
+                        Err(Control::Break(earlier_label)) => GenericResult::Break(earlier_label),
+                        Err(Control::Halt(code)) => GenericResult::Halt(code),
+                    };
+                }
+                GenericResult::Halt(code) => {
+                    return match flatten_generic_results::<_, S>(per_element) {
+                        Ok(prefix) => partial_generic(prefix, Control::Halt(code)),
+                        Err(Control::Error(earlier)) => GenericResult::Error(earlier),
+                        Err(Control::Break(label)) => GenericResult::Break(label),
+                        Err(Control::Halt(earlier_code)) => GenericResult::Halt(earlier_code),
+                    };
+                }
+                GenericResult::Partial(vs, control) => {
+                    return match flatten_generic_results::<_, S>(per_element) {
+                        Ok(mut prefix) => {
+                            prefix.extend(vs);
+                            partial_generic(prefix, control)
+                        }
+                        Err(Control::Error(earlier)) => GenericResult::Error(earlier),
+                        Err(Control::Break(label)) => GenericResult::Break(label),
+                        Err(Control::Halt(code)) => GenericResult::Halt(code),
+                    };
+                }
+                obj @ GenericResult::LazyObject(_) => {
+                    per_element.push(obj.materialize_lazy::<S>());
+                }
+                other => per_element.push(other),
+            }
+        }
+        let all_cursor_or_empty = per_element.iter().all(|r| {
+            matches!(
+                r,
+                GenericResult::OneCursor(_) | GenericResult::ManyCursor(_) | GenericResult::None
+            )
+        });
+        if all_cursor_or_empty {
+            let mut cursors = vec_with_capacity(per_element.len());
+            for r in per_element {
+                match r {
+                    GenericResult::OneCursor(c) => cursors.push(c),
+                    GenericResult::ManyCursor(cs) => cursors.extend(cs),
+                    _ => {}
+                }
+            }
+            if cursors.is_empty() {
+                GenericResult::None
+            } else {
+                GenericResult::ManyCursor(cursors)
+            }
+        } else {
+            match flatten_generic_results::<_, S>(per_element) {
+                Ok(results) if results.is_empty() => GenericResult::None,
+                Ok(results) => GenericResult::ManyOwned(results),
+                Err(Control::Error(e)) => GenericResult::Error(e),
+                Err(Control::Break(label)) => GenericResult::Break(label),
+                Err(Control::Halt(code)) => GenericResult::Halt(code),
+            }
+        }
+    }
+
+    fn fold<I: ExactSizeIterator>(
+        elements: I,
+        eval: impl FnMut(I::Item) -> GenericResult<Doc<'static>>,
+    ) -> GenericResult<Doc<'static>> {
+        fold_cursor_elements::<JqSemantics, _, I>(elements, eval)
+    }
+
+    fn capacity(r: &GenericResult<Doc<'static>>) -> Option<usize> {
+        match r {
+            GenericResult::ManyOwned(v) => Some(v.capacity()),
+            _ => None,
+        }
+    }
+
+    /// One element's result, as a recipe: results are not `Clone`, and each test builds the same
+    /// sequence twice.
+    #[derive(Clone, Copy, Debug)]
+    enum Kind {
+        Nothing,
+        Value(i64),
+        Cursor(usize),
+        /// An inner generator's computed values.
+        Values(usize),
+        /// An inner generator's cursors.
+        Cursors(usize),
+        Fail,
+    }
+
+    fn build(kind: Kind, cs: &[Cursor<'static>]) -> GenericResult<Doc<'static>> {
+        match kind {
+            Kind::Nothing => GenericResult::None,
+            Kind::Value(i) => GenericResult::Owned(OwnedValue::Int(i)),
+            Kind::Cursor(i) => GenericResult::OneCursor(cs[i % cs.len()]),
+            Kind::Values(n) => {
+                GenericResult::ManyOwned((0..n as i64).map(OwnedValue::Int).collect())
+            }
+            Kind::Cursors(n) => GenericResult::ManyCursor(cs[..n % cs.len()].to_vec()),
+            Kind::Fail => GenericResult::Error(EvalError::new("x")),
+        }
+    }
+
+    /// Random sequences of every kind of result, short and long, some led by a long computed run:
+    /// the result is main's (`Debug`-equal, a stop included); a fold that never moved to
+    /// moving hands on exactly main's capacity, and one that did hands on no more
+    /// than `slack_allowed` over its values.
+    #[test]
+    fn folds_give_mains_results_and_capacity_7267() {
+        use rand::{RngExt, SeedableRng};
+        let cs = cursors(br#"["a",{"b":1},[2,3],4,"e"]"#);
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(7267);
+        let (mut moved, mut stayed) = (0, 0);
+        for case in 0..3000 {
+            let lead = if rng.random_bool(0.4) {
+                rng.random_range(0..300)
+            } else {
+                0
+            };
+            let tail = if rng.random_bool(0.2) { 200 } else { 12 };
+            let len = lead + rng.random_range(0..tail);
+            let kinds: Vec<Kind> = (0..len)
+                .map(
+                    |i| match rng.random_range(0..if i < lead { 4 } else { 16 }) {
+                        0 => Kind::Nothing,
+                        1..=3 => Kind::Value(i as i64),
+                        4..=6 => Kind::Nothing,
+                        7..=8 => Kind::Value(-(i as i64)),
+                        9 | 10 => Kind::Cursor(i),
+                        11 => Kind::Values(i % 4),
+                        12 => Kind::Cursors(i),
+                        13 if rng.random_bool(0.3) => Kind::Fail,
+                        _ => Kind::Value(i as i64),
+                    },
+                )
+                .collect();
+            let want = main_fold(kinds.iter().copied(), |k| build(k, &cs));
+            let _ = batch_stats_7267::take();
+            let got = fold(kinds.iter().copied(), |k| build(k, &cs));
+            let stats = batch_stats_7267::take();
+            assert_eq!(
+                format!("{got:?}"),
+                format!("{want:?}"),
+                "case {case}: {kinds:?}"
+            );
+            let bounded =
+                matches!(stats.folds[..], [Fold::Values { .. }]) || !stats.leading.is_empty();
+            if stats.folds.is_empty() {
+                stayed += 1;
+            } else {
+                moved += 1;
+            }
+            if !bounded {
+                assert_eq!(capacity(&got), capacity(&want), "case {case}: {kinds:?}");
+            } else if let GenericResult::ManyOwned(v) = &got {
+                assert!(
+                    v.capacity() <= v.len() + slack_allowed(v.len()),
+                    "case {case}: {} values in {}",
+                    v.len(),
+                    v.capacity()
+                );
+            }
+        }
+        assert!(
+            moved > 400 && stayed > 1000,
+            "{moved} moved, {stayed} stayed"
+        );
+    }
+
+    /// `k` computed values and then a cursor, the shape whose short runs once handed on up to
+    /// twice main's capacity: for every `k` the fold hands on main's capacity when it stays main's
+    /// fold, and no more than main's, nor more than `slack_allowed` over its values, when it moves.
+    #[test]
+    fn k_values_then_a_cursor_hand_on_no_more_than_main_7267() {
+        let expr = parse(r#"if type == "number" then . + 1 else . end"#).unwrap();
+        for k in (1..=70).chain([100, 126, 127, 128, 129, 1000]) {
+            let doc = format!(
+                "[{}\"s\"]",
+                (1..=k).map(|i| format!("{i},")).collect::<String>()
+            );
+            let cs = cursors(doc.as_bytes());
+            let eval = |c: Cursor<'static>| {
+                eval_single::<JqSemantics, _>(&expr, c.value(), false, Some(c))
+            };
+            let want = main_fold(cs.clone().into_iter(), eval);
+            let _ = batch_stats_7267::take();
+            let got = fold(cs.into_iter(), eval);
+            let moved = !batch_stats_7267::take().folds.is_empty();
+            assert_eq!(moved, k >= 2 * COMPUTED_RUN_MIN - 1, "k = {k}");
+            assert_eq!(format!("{got:?}"), format!("{want:?}"), "k = {k}");
+            let (Some(got_cap), Some(want_cap)) = (capacity(&got), capacity(&want)) else {
+                panic!("expected values for k = {k}") // patchcov: coverage tolerate-line reason="the failure message of the pattern above, unreachable in a passing suite (#7267)"
+            };
+            let len = k + 1;
+            // A fold too short to move is main's fold.
+            if !moved {
+                assert_eq!(got_cap, want_cap, "k = {k}");
+            } else {
+                assert!(
+                    got_cap <= want_cap && got_cap <= len + slack_allowed(len),
+                    "k = {k}: {got_cap} against main's {want_cap}"
+                );
+            }
+        }
+    }
+
+    /// A fold that moves with few values (the rest of its first elements yield nothing) and meets
+    /// a cursor while its run is still no longer than `COMPUTED_RUN_MIN`: the run goes back as the
+    /// `Owned` entries main pushed, not as a prefix, so the fold hands on main's result and
+    /// capacity.
+    #[test]
+    fn a_short_moved_run_goes_back_as_mains_entries_7267() {
+        let cs = cursors(br#"["a",{"b":1},[2,3],4,"e"]"#);
+        for values in [0, 1, 5, 32, 63, 64] {
+            let mut kinds: Vec<Kind> = (0..COMPUTED_RUN_MIN)
+                .map(|i| {
+                    if i < values {
+                        Kind::Value(i as i64)
+                    } else {
+                        Kind::Nothing
+                    }
+                })
+                .collect();
+            kinds.extend((0..COMPUTED_RUN_MIN).map(|_| Kind::Nothing));
+            kinds.push(Kind::Cursor(0));
+            kinds.extend((1..4).map(|i| Kind::Value(-i)));
+            let want = main_fold(kinds.iter().copied(), |k| build(k, &cs));
+            let _ = batch_stats_7267::take();
+            let got = fold(kinds.iter().copied(), |k| build(k, &cs));
+            let stats = batch_stats_7267::take();
+            assert!(
+                stats.leading.is_empty(),
+                "{values} values went back as a prefix"
+            );
+            assert_eq!(format!("{got:?}"), format!("{want:?}"), "{values} values");
+            assert_eq!(capacity(&got), capacity(&want), "{values} values");
+        }
+    }
+
+    /// Real per-element results, lazy objects among them (built as they arrive, one that fails to
+    /// build kept as the entry it is), in folds short enough to stay main's and long enough to
+    /// move, before and after the move: every result is main's.
+    #[test]
+    fn real_results_and_lazy_objects_match_main_7267() {
+        let lazy = core::cell::Cell::new(0);
+        let arrays = |n: usize| (0..n).map(|i| format!("[{i}]")).collect::<Vec<_>>();
+        let long = |at: usize, insert: &str| {
+            let mut v = arrays(80);
+            v.insert(at, insert.to_string());
+            format!("[{}]", v.join(","))
+        };
+        let numbers = (0..80).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        let cases: Vec<(String, &str)> = vec![
+            ("[[1],[2],{}]".into(), "{a: .}"),
+            (
+                r#"["s",[1],[2]]"#.into(),
+                r#"if type == "string" then . else {a: .} end"#,
+            ),
+            ("[[tru]]".into(), "{a: .}"),
+            ("[[1],[2],[tru],[3]]".into(), "{a: .}"),
+            (format!("[{}]", arrays(80).join(",")), "{a: .}"),
+            (long(70, "[tru]"), "{a: .}"),
+            (long(10, "[tru]"), "{a: .}"),
+            (
+                long(70, r#""s""#),
+                r#"if type == "string" then . else {a: .} end"#,
+            ),
+            (
+                format!("[{numbers}]"),
+                r#"if . == 70 then error("e") else . end"#,
+            ),
+            (
+                format!("[{numbers}]"),
+                r#"if . == 30 then error("e") else . end"#,
+            ),
+            (
+                format!("[{numbers}]"),
+                "if . % 3 == 0 then empty else . + 1 end",
+            ),
+            (
+                format!("[{numbers}]"),
+                "if . == 75 then [., .] | .[] else . end",
+            ),
+        ];
+        for (doc, rest) in &cases {
+            let cs = cursors(doc.as_bytes());
+            let expr = parse(rest).unwrap();
+            let eval = |c: Cursor<'static>| {
+                let r = eval_single::<JqSemantics, _>(&expr, c.value(), false, Some(c));
+                lazy.set(lazy.get() + usize::from(matches!(r, GenericResult::LazyObject(_))));
+                r
+            };
+            let want = main_fold(cs.clone().into_iter(), eval);
+            let got = fold(cs.into_iter(), eval);
+            assert_eq!(format!("{got:?}"), format!("{want:?}"), "{rest} over {doc}");
+            if doc.contains("tru") {
+                assert!(matches!(got, GenericResult::Error(_)), "{got:?}");
+            }
+        }
+        assert!(lazy.get() > 200, "{} lazy objects", lazy.get());
+    }
+
+    /// A one-value-per-element map allocates its vector once, at its final size, and hands it on
+    /// without a copy.
+    #[test]
+    fn computed_values_fill_one_vector_of_the_final_size_7267() {
+        let kinds: Vec<Kind> = (0..1000).map(Kind::Value).collect();
+        let _ = batch_stats_7267::take();
+        let GenericResult::ManyOwned(values) = fold(kinds.iter().copied(), |k| build(k, &[]))
+        else {
+            panic!("expected the values") // patchcov: coverage tolerate-line reason="the failure message of the pattern above, unreachable in a passing suite (#7267)"
+        };
+        assert_eq!((values.len(), values.capacity()), (1000, 1000));
+        assert_eq!(values, (0..1000).map(OwnedValue::Int).collect::<Vec<_>>());
+        assert_eq!(batch_stats_7267::take().copied, 0);
+    }
+
+    /// One element of a generated document, and what the leaf filter below makes of it.
+    #[derive(Clone)]
+    enum Gen {
+        /// `null`: no value (`empty`).
+        Nothing,
+        /// A number: one computed value (`. + 1`) when the select keeps it (below 2).
+        Num(i64),
+        /// A string: the element's own cursor (`.`).
+        Str(String),
+        /// `{"m": [..]}`: one lazy result (`.m | map(. + 1)`).
+        Lazy(Vec<i64>),
+        /// An array one level up: an inner generator over its elements (`.[] | ...`).
+        Arr(Vec<Self>),
+    }
+
+    fn gen_json(g: &Gen) -> String {
+        match g {
+            Gen::Nothing => "null".into(),
+            Gen::Num(n) => n.to_string(),
+            Gen::Str(s) => format!("\"{s}\""),
+            Gen::Lazy(ns) => format!(
+                r#"{{"m":[{}]}}"#,
+                ns.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
+            ),
+            Gen::Arr(gs) => format!(
+                "[{}]",
+                gs.iter().map(gen_json).collect::<Vec<_>>().join(",")
+            ),
+        }
+    }
+
+    const LEAF: &str = r#"select(type != "number" or . < 2) | if type == "null" then empty elif type == "number" then . + 1 elif type == "string" then . else (.m | map(. + 1)) end"#;
+
+    /// The naive reference: the leaves in document order, through the select and the leaf.
+    fn reference(g: &Gen, out: &mut Vec<String>) {
+        match g {
+            Gen::Nothing => {}
+            Gen::Num(n) if *n >= 2 => {}
+            Gen::Num(n) => out.push((n + 1).to_string()),
+            Gen::Str(s) => out.push(format!("\"{s}\"")),
+            Gen::Lazy(ns) => out.push(format!(
+                "[{}]",
+                ns.iter()
+                    .map(|n| (n + 1).to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )),
+            Gen::Arr(gs) => {
+                for inner in gs {
+                    reference(inner, out);
+                }
+            }
+        }
+    }
+
+    /// `n` elements `depth` levels up from the leaves: arrays of arrays down to a leaf level.
+    /// Some leaf arrays hold numbers only and so end in computed values; some lead with numbers
+    /// and then mix every result kind, so they move and then go back to the batch; the others
+    /// mix from the start. Half of them keep almost nothing (`k << n`), the shape that once
+    /// handed on a vector allocated for every element; the others keep most of their values.
+    fn gen(rng: &mut rand_chacha::ChaCha8Rng, depth: usize, n: usize) -> Vec<Gen> {
+        use rand::RngExt;
+        if depth > 1 {
+            let inner = if depth == 2 { 300 } else { 30 };
+            return (0..n)
+                .map(|_| {
+                    let len = rng.random_range(0..inner);
+                    Gen::Arr(gen(rng, depth - 1, len))
+                })
+                .collect();
+        }
+        let sparse = rng.random_bool(0.5);
+        let numbers_until = match rng.random_range(0..3) {
+            0 => n,
+            1 => rng.random_range(0..=n),
+            _ => 0,
+        };
+        (0..n)
+            .map(|i| match rng.random_range(0..12) {
+                0 => Gen::Nothing,
+                1 if i >= numbers_until => Gen::Str(format!("s{i}")),
+                2 if i >= numbers_until => Gen::Lazy((0..rng.random_range(0..4)).collect()),
+                _ if sparse && i % 50 > 1 => Gen::Num(5 + i as i64),
+                _ => Gen::Num(rng.random_range(0..2)),
+            })
+            .collect()
+    }
+
+    /// The invariant, over random mixes of every result kind at nesting depths 1-3: the real
+    /// fold yields the reference's values in its order. A fold that moved and ended in computed
+    /// values reserved at most one slot per element and hands on at most `slack_allowed` over its
+    /// values (fails without that release, the `1cbb5dcde` shape); one that went back to the
+    /// batch keeps main's batch, a leading vector exactly its size (fails without the shrink),
+    /// no other vector of values sized ahead of its values (fails on the first version's policy,
+    /// `ae55f31b6`, which sized a run for every element left at each computed stretch), and
+    /// hands on at most `slack_allowed` over its values (fails without the release after the
+    /// flatten); and the folds' own shrinks copy each value at most once.
+    #[test]
+    fn folds_hand_on_tight_vectors_and_copy_linearly_7267() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(7267);
+        let (mut released, mut went_back, mut inner_folds) = (0, 0, 0);
+        for case in 0..40 {
+            let depth = 1 + case % 3;
+            let n = rng.random_range(1..if depth == 1 { 600 } else { 40 });
+            let elements = gen(&mut rng, depth, n);
+            let doc = format!(
+                "[{}]",
+                elements.iter().map(gen_json).collect::<Vec<_>>().join(",")
+            );
+            let mut want = Vec::new();
+            for g in &elements {
+                reference(g, &mut want);
+            }
+            let program = format!("[{} | {LEAF}]", vec![".[]"; depth].join(" | "));
+            let index = JsonIndex::build(doc.as_bytes());
+            let root = index.root(doc.as_bytes());
+            let _ = batch_stats_7267::take();
+            let got = eval_single::<JqSemantics, _>(
+                &parse(&program).unwrap(),
+                root.value(),
+                false,
+                Some(root),
+            )
+            .collect_owned::<JqSemantics>()
+            .unwrap();
+            let stats = batch_stats_7267::take();
+            assert_eq!(got.len(), 1, "{program}");
+            assert_eq!(
+                got[0].to_json(),
+                format!("[{}]", want.join(",")),
+                "case {case}: {program}"
+            );
+            let mut produced = 0;
+            for fold in &stats.folds {
+                match *fold {
+                    Fold::Values {
+                        elements,
+                        reserved,
+                        len,
+                        capacity,
+                    } => {
+                        produced += len;
+                        assert!(reserved <= elements, "case {case}: {fold:?}");
+                        assert!(
+                            capacity <= len + slack_allowed(len),
+                            "case {case}: {fold:?}"
+                        );
+                        released += usize::from(reserved > len + slack_allowed(len));
+                    }
+                    Fold::Entries {
+                        elements,
+                        batch,
+                        ref runs,
+                    } => {
+                        went_back += 1;
+                        assert!(batch <= elements, "case {case}: {fold:?}");
+                        for &(len, capacity) in runs {
+                            assert!(
+                                capacity <= len + len.max(slack_allowed(len)),
+                                "case {case}: {fold:?}"
+                            );
+                        }
+                    }
+                }
+            }
+            for &(len, capacity, elements) in &stats.leading {
+                assert!(
+                    len <= capacity && capacity <= elements,
+                    "case {case}: kept run {len} in {capacity} for {elements} elements"
+                );
+            }
+            for &(len, capacity) in &stats.released {
+                produced += len;
+                assert!(
+                    capacity <= len + slack_allowed(len),
+                    "case {case}: handed on {len} in {capacity}"
+                );
+            }
+            assert!(stats.copied <= produced, "case {case}: {stats:?}");
+            if depth > 1 {
+                inner_folds += stats.folds.len().saturating_sub(1);
+            }
+        }
+        // The generated documents really reached the nested folds, the release, and the way back.
+        assert!(inner_folds > 30, "{inner_folds} inner folds moved");
+        assert!(released > 10, "{released} folds gave slack back");
+        assert!(went_back > 10, "{went_back} folds went back to the batch");
+    }
+}
+
 /// Flatten a batch of per-element results into one `Vec<OwnedValue>`.
 ///
 /// A bare `Error`/`Break`/`Partial` must never appear in `items` — callers
@@ -9111,7 +10142,16 @@ fn retain_truthy_generic<V: DocumentValue, S: EvalSemantics>(
 fn flatten_generic_results<V: DocumentValue, S: EvalSemantics>(
     items: Vec<GenericResult<V>>,
 ) -> Result<Vec<OwnedValue>, Control> {
-    let mut results = Vec::new();
+    flatten_generic_results_onto::<V, S>(Vec::new(), items)
+}
+
+/// [`flatten_generic_results`] onto `results`, which already holds the values before `items`
+/// (#7267: a fold's long run of computed values, which the rest of the fold's values extend in
+/// place rather than being copied into a vector grown from empty).
+fn flatten_generic_results_onto<V: DocumentValue, S: EvalSemantics>(
+    mut results: Vec<OwnedValue>,
+    items: Vec<GenericResult<V>>,
+) -> Result<Vec<OwnedValue>, Control> {
     for r in items {
         match r.materialize_lazy::<S>() {
             // `One`/`Many` are exhaustiveness only here too, same as
@@ -14056,104 +15096,11 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
             GenericResult::ManyCursor(cs) => {
                 let rest = &stages[j..];
                 let rest_whole = PipeWhole::rebuilt();
-                let mut per_element = vec_with_capacity(cs.len());
-                for c in cs {
-                    match eval_single_pipe::<S, _>(rest, &rest_whole, c.value(), optional, Some(c))
-                    {
-                        // The elements already piped through no
-                        // longer vanish (#400, #494). If an earlier
-                        // element's own buffered `LazySeq` also fails
-                        // once `flatten_generic_results` materializes
-                        // it, that earlier failure wins -- it's
-                        // chronologically first in evaluation order.
-                        GenericResult::Error(e) => {
-                            return match flatten_generic_results::<_, S>(per_element) {
-                                Ok(prefix) => partial_generic(prefix, Control::Error(e)),
-                                Err(Control::Error(earlier)) => GenericResult::Error(earlier),
-                                Err(Control::Break(label)) => GenericResult::Break(label),
-                                Err(Control::Halt(code)) => GenericResult::Halt(code),
-                            };
-                        }
-                        GenericResult::Break(label) => {
-                            return match flatten_generic_results::<_, S>(per_element) {
-                                Ok(prefix) => partial_generic(prefix, Control::Break(label)),
-                                Err(Control::Error(earlier)) => GenericResult::Error(earlier),
-                                Err(Control::Break(earlier_label)) => {
-                                    GenericResult::Break(earlier_label)
-                                }
-                                Err(Control::Halt(code)) => GenericResult::Halt(code),
-                            };
-                        }
-                        // Same immediate-stop treatment as `Error`/`Break`
-                        // above — halt is an opaque terminal signal, not
-                        // catchable by anything downstream, so this must
-                        // not fall through to the `other => ...` wildcard
-                        // below (which would keep evaluating later cursor
-                        // elements instead of stopping immediately).
-                        GenericResult::Halt(code) => {
-                            return match flatten_generic_results::<_, S>(per_element) {
-                                Ok(prefix) => partial_generic(prefix, Control::Halt(code)),
-                                Err(Control::Error(earlier)) => GenericResult::Error(earlier),
-                                Err(Control::Break(label)) => GenericResult::Break(label),
-                                Err(Control::Halt(earlier_code)) => {
-                                    GenericResult::Halt(earlier_code)
-                                }
-                            };
-                        }
-                        GenericResult::Partial(vs, control) => {
-                            return match flatten_generic_results::<_, S>(per_element) {
-                                Ok(mut prefix) => {
-                                    prefix.extend(vs);
-                                    partial_generic(prefix, control)
-                                }
-                                Err(Control::Error(earlier)) => GenericResult::Error(earlier),
-                                Err(Control::Break(label)) => GenericResult::Break(label),
-                                Err(Control::Halt(code)) => GenericResult::Halt(code),
-                            };
-                        }
-                        // #4044: collected, an object is read in full anyway, so it
-                        // is built as it arrives rather than held lazily until
-                        // the flatten (N live boxes and entry buffers).
-                        obj @ GenericResult::LazyObject(_) => {
-                            per_element.push(obj.materialize_lazy::<S>());
-                        }
-                        other => per_element.push(other),
-                    }
-                }
-
-                let all_cursor_or_empty = per_element.iter().all(|r| {
-                    matches!(
-                        r,
-                        GenericResult::OneCursor(_)
-                            | GenericResult::ManyCursor(_)
-                            | GenericResult::None
-                    )
-                });
-
-                return if all_cursor_or_empty {
-                    let mut cursors = vec_with_capacity(per_element.len());
-                    for r in per_element {
-                        match r {
-                            GenericResult::OneCursor(c) => cursors.push(c),
-                            GenericResult::ManyCursor(cs) => cursors.extend(cs),
-                            GenericResult::None => {}
-                            _ => unreachable!("checked all_cursor_or_empty above"),
-                        }
-                    }
-                    if cursors.is_empty() {
-                        GenericResult::None
-                    } else {
-                        GenericResult::ManyCursor(cursors)
-                    }
-                } else {
-                    match flatten_generic_results::<_, S>(per_element) {
-                        Ok(results) if results.is_empty() => GenericResult::None,
-                        Ok(results) => GenericResult::ManyOwned(results),
-                        Err(Control::Error(e)) => GenericResult::Error(e),
-                        Err(Control::Break(label)) => GenericResult::Break(label),
-                        Err(Control::Halt(code)) => GenericResult::Halt(code),
-                    }
+                // #7267: main's fold, which keeps a long run of computed values in one vector.
+                let eval = |c: V::Cursor| {
+                    eval_single_pipe::<S, _>(rest, &rest_whole, c.value(), optional, Some(c))
                 };
+                return fold_cursor_elements::<S, V, _>(cs.into_iter(), eval);
             }
             // The whole point of `LazyKeys`: `length` always, and
             // `.[]`, `.[n]`, `first`, and `last` when `!sorted`, all
