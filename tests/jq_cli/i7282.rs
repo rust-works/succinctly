@@ -31,6 +31,20 @@ const ROWS: &[(&str, &str, &str, i32)] = &[
     ("[group_by(.a)[] | path(.[0])]", "[[0],[0],[0]]\n", "", 0),
     ("[.[] | [.] | group_by(.a)[] | length] | add", "6\n", "", 0),
     ("[group_by(.a)[]] | length", "3\n", "", 0),
+    // A key with an effect keeps the chain whole (#4293's routing), and one in the rest runs
+    // once per group, in group order.
+    (
+        "[group_by(.a | debug)[] | length]",
+        "[2,2,2]\n",
+        "[\"DEBUG:\",2]\n[\"DEBUG:\",1]\n[\"DEBUG:\",2]\n[\"DEBUG:\",1.0]\n[\"DEBUG:\",\"k\"]\n[\"DEBUG:\",\"k\"]\n",
+        0,
+    ),
+    (
+        "[group_by(.a)[] | length | debug]",
+        "[2,2,2]\n",
+        "[\"DEBUG:\",2]\n[\"DEBUG:\",2]\n[\"DEBUG:\",2]\n",
+        0,
+    ),
     (
         "[group_by(.a)[] | .[] | .b + 1]",
         "",
