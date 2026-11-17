@@ -57331,6 +57331,67 @@ mod tests {
         )
     }
 
+    /// #7337: the eager fold (`eval_generic::eval`, which the CLI's sink route does not reach for
+    /// these shapes) runs the stages from a `?//` bind on as one pipe over a lazy sequence or over
+    /// the values a nested `.[a:b][]` stage leaves, so a later stage's error retries the bind's
+    /// next alternative. Every expectation was verified against jq 1.7.1.
+    #[test]
+    fn the_eager_fold_retries_a_bind_met_by_a_lazy_value_on_a_later_error_7337() {
+        let json = br#"[{"a":2,"b":"x"},{"a":1,"b":"y"},{"a":2,"b":"z"}]"#;
+        let bind = "(. as [$x] ?// $x | $x)";
+        let retried = Summary::Error("Cannot index array with string \"b\"".to_string());
+        // A lone group (`first` reads it out of the lazy `group_by`) and the `ManyOwned` a
+        // slice-then-iterate stage leaves.
+        for filter in [
+            format!("group_by(.a) | first | {bind} | .b + 1"),
+            format!("group_by(.a) | .[0:2][] | {bind} | .b + 1"),
+        ] {
+            assert_eq!(summarize(json, &filter), retried, "{filter}");
+        }
+        // The same over a `map` sequence, whose elements have to be arrays for the first
+        // alternative to bind them.
+        assert_eq!(
+            summarize(
+                br#"[[{"a":2,"b":"x"}],[{"a":1,"b":"y"}],[{"a":3,"b":"z"}]]"#,
+                &format!("map(.) | .[0:2][] | {bind} | .b + 1")
+            ),
+            retried
+        );
+        // The retry is per value, and what an earlier value answered stays: the first group's
+        // `.b` is `"y"`, the second group's first alternative raises `late` and its second `arr`.
+        assert_eq!(
+            summarize(
+                json,
+                &format!(
+                    r#"group_by(.a) | .[0:2][] | {bind} | if type == "object" then (if .a == 1 then .b else error("late") end) else error("arr") end"#
+                )
+            ),
+            partial_err(&["\"y\""], "arr")
+        );
+        // The retried alternative's own output is the answer where it succeeds.
+        assert_eq!(
+            summarize(
+                json,
+                &format!(
+                    r#"group_by(.a) | .[0:2][] | {bind} | if type == "array" then length else error("e") end"#
+                )
+            ),
+            Summary::Values(vec!["1".to_string(), "2".to_string()])
+        );
+        // No later stage raises, so the first alternative stands (the bound element, not the array).
+        for (filter, expected) in [
+            (format!("map(.) | {bind} | length"), "2"),
+            (format!("group_by(.a) | {bind} | length"), "1"),
+            (format!("group_by(.a) | .[0:2] | {bind} | length"), "1"),
+        ] {
+            assert_eq!(
+                summarize(json, &filter),
+                Summary::Values(vec![expected.to_string()]),
+                "{filter}"
+            );
+        }
+    }
+
     #[test]
     fn generic_pipe_stages_keep_the_prefix_before_a_control() {
         // The generic evaluator has its own copy of the #400/#494 pipe
