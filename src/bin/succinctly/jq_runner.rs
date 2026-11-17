@@ -11833,7 +11833,7 @@ fn gated_seq_source(files: Vec<PathBuf>) -> Option<WindowedSource> {
         // A duplicate of descriptor 0, at the offset the prepass (which reads by position) left alone.
         [] => stdin_to_window()?.0,
         [path] => std::fs::File::open(path).ok()?,
-        _ => return None,
+        _ => return None, // patchcov: coverage tolerate-line reason="unreachable: several files go to stopping_seq_files_at before this is asked (#7341)"
     };
     // A file the whole-file route could not hold (a sparse file of terabytes) is that route's to report,
     // as it reads it before it runs anything (`Could not open file ...: out of memory`): read here, the
