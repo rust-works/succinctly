@@ -2186,7 +2186,8 @@ impl LineWindows {
     /// the text's own buffer instead of one of its own and then copied (#7264: the copy faulted a
     /// second set of pages for the 240 KiB after a short start). Its last line break is still the
     /// window's, and a read that fails cuts only the window's line. `Err(before)` when there is no
-    /// window: nothing was added.
+    /// window: nothing was added. A `before` with no buffer at all ([`next_window`](Self::next_window)'s)
+    /// takes the carried bytes' own buffer instead, so they are not copied (#7323).
     pub(super) fn next_window_after(
         &mut self,
         want: Option<usize>,
@@ -2195,10 +2196,9 @@ impl LineWindows {
     ) -> Result<Vec<u8>, Vec<u8>> {
         let floor = before.len();
         let carried = std::mem::take(&mut self.carried);
-        // #7323: with no text to read onto and no room for them, the carried bytes are the window's
-        // buffer. Copying them onto an empty one held a pipe's 4 MiB probe twice (8.4 MiB peak for
-        // `-R` over a pipe).
-        let mut bytes = if before.is_empty() && before.capacity() < carried.len() {
+        // #7323: with no buffer to read onto, the carried bytes are the window's buffer. Copying them
+        // onto a new one held a pipe's 4 MiB probe twice (an 8.0 MiB heap peak for `-R` over a pipe).
+        let mut bytes = if before.capacity() == 0 {
             carried
         } else {
             let mut bytes = before;
