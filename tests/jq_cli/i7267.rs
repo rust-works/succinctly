@@ -152,16 +152,20 @@ fn test_deep_recursion_through_a_per_element_fold_7267() -> Result<()> {
 /// captured from jq 1.7.1 (`1`): the 99 values before the recursing element move after 64, so each
 /// level keeps the moved fold's frames on the stack. In 4fcc22658 that path ran in a second,
 /// out-of-line frame and the stack guard refused it at about depth 3,185, where main answers to
-/// 3,255 on an Apple M4 Pro in a release build (#7267 review); this depth lies between the two. A
-/// debug build reserves a larger stack, so there the row only pins the output.
+/// 3,255 on an Apple M4 Pro in a release build (#7267 review); 3,240 lies between the two. A debug
+/// build's 2 GiB stack does not make up for its larger frames (this shape refuses past about 3,200
+/// there on an Apple M5 Max), so there a shallower row only pins the output.
 #[test]
 fn test_deep_recursion_from_a_moved_fold_7267() -> Result<()> {
+    let depth = if cfg!(debug_assertions) { 2_000 } else { 3_240 };
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("d.json");
     let doc: Vec<String> = (1..=200).map(|n| n.to_string()).collect();
     std::fs::write(&path, format!("[{}]", doc.join(",")))?;
-    let filter = ". as $d | def f(n): if n == 0 then 0 else [$d[] | if . == 100 then ($d | f(n - 1)) else . + 0 end] | .[0] end; f(3240)";
-    let got = run_jq_full(&[filter, path.to_str().expect("utf-8 temp path")], None)?;
+    let filter = format!(
+        ". as $d | def f(n): if n == 0 then 0 else [$d[] | if . == 100 then ($d | f(n - 1)) else . + 0 end] | .[0] end; f({depth})"
+    );
+    let got = run_jq_full(&[&filter, path.to_str().expect("utf-8 temp path")], None)?;
     assert_eq!(got, ("1\n".to_string(), String::new(), 0));
     Ok(())
 }

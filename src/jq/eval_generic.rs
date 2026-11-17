@@ -9235,7 +9235,7 @@ fn fold_cursor_elements<S: EvalSemantics, V: DocumentValue, I: ExactSizeIterator
                         {
                             went_back = true;
                         }
-                        leave_computed_run(&mut values, &mut per_element);
+                        (values, per_element) = leave_computed_run(values, per_element);
                         per_element.push(failed);
                         continue;
                     }
@@ -9246,12 +9246,11 @@ fn fold_cursor_elements<S: EvalSemantics, V: DocumentValue, I: ExactSizeIterator
                     {
                         went_back = true;
                     }
-                    leave_computed_run(&mut values, &mut per_element);
+                    (values, per_element) = leave_computed_run(values, per_element);
                     // Out of line, so that this loop holds one element's result at a time.
-                    if let Some(stopped) =
-                        push_element_result_cold::<S, V>(&mut values, &mut per_element, other)
-                    {
-                        return stopped;
+                    match push_element_result_cold::<S, V>(values, per_element, other) {
+                        Ok(kept) => (values, per_element) = kept,
+                        Err(stopped) => return stopped,
                     }
                     continue;
                 }
@@ -9270,7 +9269,7 @@ fn fold_cursor_elements<S: EvalSemantics, V: DocumentValue, I: ExactSizeIterator
             && elements.len() >= COMPUTED_RUN_MIN
         {
             mode = MOVED;
-            move_computed_run(&mut per_element, &mut values, elements.len());
+            (per_element, values) = move_computed_run(per_element, elements.len());
         }
     }
     // Main's `for` loop consumed the elements, so their cursors were freed before the flatten
@@ -9322,19 +9321,22 @@ fn stop_fold<V: DocumentValue, S: EvalSemantics>(
 
 /// Main's loop body for the element that ends a moved run, which [`fold_cursor_elements`] calls
 /// out of line so that its loop holds a single element's result (#7267): the stack each level of
-/// a recursion through such folds takes is then no more than main's. Returns what the fold returns
-/// when the element stops it.
+/// a recursion through such folds takes is then no more than main's. Returns the run and the batch
+/// to go on with, or what the fold returns when the element stops it.
+///
+/// This and the other helpers of [`fold_cursor_elements`] take and give back the vectors by value:
+/// a `&mut` to the batch let its length escape, and main's path then reloaded it from memory
+/// after every element's evaluation (#7267 review: `mix_alternating` and `mix_lead_cursor` 2-4%
+/// slower on the Apple M4 Pro, with the same instructions).
 #[inline(never)]
 fn push_element_result_cold<S: EvalSemantics, V: DocumentValue>(
-    values: &mut Vec<OwnedValue>,
-    per_element: &mut Vec<GenericResult<V>>,
+    values: Vec<OwnedValue>,
+    mut per_element: Vec<GenericResult<V>>,
     result: GenericResult<V>,
-) -> Option<GenericResult<V>> {
-    let mut batch = core::mem::take(per_element);
+) -> Result<(Vec<OwnedValue>, Vec<GenericResult<V>>), GenericResult<V>> {
     let mut _mode = MAIN;
-    push_element_result_7267!(S, Some, core::mem::take(values), batch, result, _mode);
-    *per_element = batch;
-    None
+    push_element_result_7267!(S, Err, values, per_element, result, _mode);
+    Ok((values, per_element))
 }
 
 /// The move of [`fold_cursor_elements`]: the values of the batch's entries so far into one
@@ -9342,18 +9344,18 @@ fn push_element_result_cold<S: EvalSemantics, V: DocumentValue>(
 /// per element, should the fold need it again.
 #[inline(never)]
 fn move_computed_run<V: DocumentValue>(
-    per_element: &mut Vec<GenericResult<V>>,
-    values: &mut Vec<OwnedValue>,
+    mut per_element: Vec<GenericResult<V>>,
     left: usize,
-) {
-    *values = vec_with_capacity(per_element.len() + left);
+) -> (Vec<GenericResult<V>>, Vec<OwnedValue>) {
+    let mut values = vec_with_capacity(per_element.len() + left);
     // Taken out in place rather than drained, which keeps the batch's capacity.
-    for entry in per_element.iter_mut() {
+    for entry in &mut per_element {
         if let GenericResult::Owned(o) = core::mem::replace(entry, GenericResult::None) {
             values.push(o);
         }
     }
     per_element.clear();
+    (per_element, values)
 }
 
 /// The way back of [`fold_cursor_elements`] to main's batch (#7267). A short run goes back as the
@@ -9365,19 +9367,16 @@ fn move_computed_run<V: DocumentValue>(
 /// on the AMD Ryzen 9 7950X).
 #[inline(never)]
 fn leave_computed_run<V: DocumentValue>(
-    values: &mut Vec<OwnedValue>,
-    per_element: &mut Vec<GenericResult<V>>,
-) {
+    values: Vec<OwnedValue>,
+    mut per_element: Vec<GenericResult<V>>,
+) -> (Vec<OwnedValue>, Vec<GenericResult<V>>) {
     if values.len() <= COMPUTED_RUN_MIN {
-        per_element.extend(
-            core::mem::take(values)
-                .into_iter()
-                .map(GenericResult::Owned),
-        );
-    } else {
-        #[cfg(test)]
-        batch_stats_7267::note_leading(values.len(), values.capacity(), per_element.capacity());
+        per_element.extend(values.into_iter().map(GenericResult::Owned));
+        return (Vec::new(), per_element);
     }
+    #[cfg(test)]
+    batch_stats_7267::note_leading(values.len(), values.capacity(), per_element.capacity());
+    (values, per_element)
 }
 
 /// The end of a fold that moved (#7267): its run, with the slack of the elements that yielded
