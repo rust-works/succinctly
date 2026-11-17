@@ -780,6 +780,87 @@ pub(crate) fn seed_token_byte(byte: Option<u8>) {
     SEEDED_TOKEN_BYTE.with(|seed| seed.set(byte));
 }
 
+/// What jq's reader makes of a stretch of a `--seq` stream that is not RFC 7464's own framing
+/// ([`walk_stretch`], #7322).
+pub(crate) struct StretchWalk {
+    /// The byte range of every value the reader yields, in order, as offsets into the stretch.
+    pub(crate) values: Vec<(usize, usize)>,
+    /// Each line the reader warns with (`jq: ignoring parse error: ...`), in order, with the offset
+    /// in the stretch of the byte it met it on. No value is yielded on that byte, and none holds it.
+    pub(crate) warnings: Vec<(usize, String)>,
+    /// What the reader's token buffer holds at index 1 after the stretch ([`token_byte_after`]).
+    pub(crate) token_byte: Option<u8>,
+}
+
+/// The most warnings a [`walk_stretch`] keeps: a stretch can warn once a byte (a run of `}`), and each
+/// is a line held until the values before it have run.
+const MAX_STRETCH_WARNINGS: usize = 1024;
+
+/// Walks `stretch` as jq's reader walks it in the middle of a stream (#7322): from the RS that opens a
+/// record which is not `RS value LF`, through the next RS at a line start that opens a record which
+/// is (an RS before it may start a line too, and open a record that is not). `lines` line breaks of
+/// RFC 7464's own framing came before it and left `token_byte` in the token buffer; `lines` of 0 is a
+/// stretch at the stream's very start.
+///
+/// The reader stands before it as [`resumed_stream`] says: at a line start, in `Normal` with nothing
+/// pending (or waiting for the stream's first RS). After its last byte, an RS, the reader is there
+/// again whatever the stretch held: an RS resets the parser, with a warning or without. So the
+/// records after the stretch are read as the records before it were, and the stretch is all of the
+/// stream this walk needs. It is never the stream's end, so neither the final buffer's rule (#2998)
+/// nor the EOF branch applies.
+///
+/// `None` when the stretch warns more than [`MAX_STRETCH_WARNINGS`] times, or (defensive) when the
+/// walk ends in any other state: the caller then leaves the stream from the stretch on to the walk
+/// that reads it whole.
+pub(crate) fn walk_stretch(
+    stretch: &[u8],
+    lines: usize,
+    token_byte: Option<u8>,
+) -> Option<StretchWalk> {
+    debug_assert_eq!(stretch.first(), Some(&ASCII_RS));
+    debug_assert_eq!(stretch.last(), Some(&ASCII_RS));
+    let mut warnings: Vec<(usize, String)> = Vec::new();
+    let mut overflowed = false;
+    let mut emit = |warning: &str, at: usize| {
+        if warnings.len() < MAX_STRETCH_WARNINGS {
+            warnings.push((at, warning.to_string()));
+        } else {
+            overflowed = true;
+        }
+    };
+    let bom = BomPrefix {
+        consumed: 0,
+        malformed: false,
+    };
+    let mut reader = Reader::new(bom, &mut emit);
+    reader.token_buf = token_byte.map_or_else(Vec::new, |byte| vec![0, byte]);
+    if lines > 0 {
+        // As after an RS and `lines` line breaks.
+        reader.st = St::Normal;
+        reader.last_ch_was_ws = true;
+        reader.line += lines;
+    }
+    reader.total = stretch.len();
+    reader.run(stretch, 0, &[]);
+    let settled = reader.st == St::Normal
+        && reader.stack.is_empty()
+        && reader.token_len == 0
+        && reader.next.is_none()
+        && !reader.stopped;
+    let token_byte = reader.token_buf.get(1).copied();
+    let values = std::mem::take(&mut reader.values);
+    let at_eof = reader.yielded_at.contains(&YIELDED_AT_EOF);
+    drop(reader);
+    if overflowed || !settled || at_eof || warnings.iter().any(|&(at, _)| at == AT_EOF) {
+        return None;
+    }
+    Some(StretchWalk {
+        values,
+        warnings,
+        token_byte,
+    })
+}
+
 /// What follows the last of the files a walk reads (#6588): a file that did not open means jq's
 /// reader asks that file for more before it is at its end, so the refill that sets `is_last` is
 /// the empty one at the missing file, and the last opened file's last chunk is not the final
@@ -3447,6 +3528,117 @@ mod tests {
                 String::from_utf8_lossy(&rest)
             );
         }
+    }
+
+    /// #7322: a stretch that is not plain records, from the RS at a line start that opens it through the
+    /// next RS at a line start, is walked on its own as the walk of the whole stream reads it: the same
+    /// warnings and values, and the stream after it reads as [`resumed_stream`] with the byte the stretch
+    /// left. With no record before it, it is the stream's start.
+    #[test]
+    fn a_stretch_is_walked_as_the_whole_walk_reads_it_7322() {
+        let pieces = [
+            "\x1en\n",
+            "\x1e[n]\n",
+            "\x1enul\n",
+            "\x1e1 2\n",
+            "\x1e{\"a\":1\n",
+            "\x1e\"open\n",
+            "\x1e12.5",
+            "\x1e",
+            "\x1e\x1e",
+            "garbage\n",
+            "\n\n",
+            "\x1enan\n",
+            "\x1e[1,]\n",
+            "\x1e} 5\n",
+            "\x1etrue",
+            " ",
+            "\x1e\"\\u0041\"\n",
+            "\x1e\"a\" [1,\n2]\n",
+            "\x1e1\"bu\"\n",
+        ];
+        let mut rng = Rng(0x7322_7322);
+        let mut walked_alone = 0;
+        for case in 0..6000 {
+            let records: String = (0..rng.below(5)).map(|_| clean_record(&mut rng)).collect();
+            let mut stretch = String::from("\x1e");
+            for _ in 0..=rng.below(4) {
+                stretch.push_str(rng.pick(&pieces));
+            }
+            if !stretch.ends_with('\n') {
+                stretch.push('\n');
+            }
+            let mut rest: Vec<u8> = (0..=rng.below(3))
+                .flat_map(|_| clean_record(&mut rng).into_bytes())
+                .collect();
+            if rng.below(2) == 0 {
+                rest.extend(tail(&mut rng));
+            }
+            let whole = [records.as_bytes(), stretch.as_bytes(), &rest].concat();
+            let shown = format!("case {case}: {:?}", String::from_utf8_lossy(&whole));
+            let (whole_warnings, whole_values) = walked(&whole);
+            let lines = records.bytes().filter(|&b| b == b'\n').count();
+            // The stretch, through the RS that opens the first record after it.
+            let through = [stretch.as_bytes(), b"\x1e"].concat();
+            let Some(walk) = walk_stretch(&through, lines, token_byte_after(records.as_bytes()))
+            else {
+                continue;
+            };
+            walked_alone += 1;
+            let clean_values = walked(records.as_bytes()).1.len();
+            seed_token_byte(walk.token_byte);
+            let after = lines + stretch.bytes().filter(|&b| b == b'\n').count();
+            let (rest_warnings, rest_values) = walked(&resumed_stream(after, rest.clone()));
+            seed_token_byte(None);
+            let warnings: Vec<String> = walk
+                .warnings
+                .iter()
+                .map(|(_, warning)| warning.clone())
+                .chain(rest_warnings)
+                .collect();
+            assert_eq!(warnings, whole_warnings, "{shown}");
+            let values: Vec<String> = walk
+                .values
+                .iter()
+                .map(|&(start, end)| String::from_utf8_lossy(&through[start..end]).into_owned())
+                .chain(rest_values.iter().map(|(text, _)| text.clone()))
+                .collect();
+            let whole_texts: Vec<String> = whole_values[clean_values..]
+                .iter()
+                .map(|(text, _)| text.clone())
+                .collect();
+            assert_eq!(values, whole_texts, "{shown}");
+            // The lines of the values after the stretch are the whole walk's.
+            let rest_lines: Vec<usize> = rest_values.iter().map(|&(_, line)| line).collect();
+            let whole_lines: Vec<usize> = whole_values[whole_values.len() - rest_values.len()..]
+                .iter()
+                .map(|&(_, line)| line)
+                .collect();
+            assert_eq!(rest_lines, whole_lines, "{shown}");
+            // A warning is met on a byte no value holds, and each is where the reader stood.
+            for &(at, _) in &walk.warnings {
+                assert!(
+                    walk.values
+                        .iter()
+                        .all(|&(start, end)| at < start || at >= end),
+                    "{shown}"
+                );
+            }
+            assert!(
+                walk.warnings.windows(2).all(|pair| pair[0].0 < pair[1].0),
+                "{shown}"
+            );
+        }
+        assert!(walked_alone > 5000, "{walked_alone}");
+    }
+
+    /// #7322: a stretch that warns more often than the walk keeps is declined.
+    #[test]
+    fn a_stretch_that_warns_without_end_is_declined_7322() {
+        let few = format!("\x1e{}\n\x1e", "}".repeat(MAX_STRETCH_WARNINGS - 1));
+        assert!(walk_stretch(few.as_bytes(), 0, None).is_some());
+        let many = format!("\x1e{}\n\x1e", "}".repeat(MAX_STRETCH_WARNINGS + 1));
+        assert!(walk_stretch(many.as_bytes(), 0, None).is_none());
     }
 
     /// #7164: [`token_byte_after`] is the byte the reader's own buffer holds at index 1 once it has read

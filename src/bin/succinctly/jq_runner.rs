@@ -5233,7 +5233,8 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
 
     // #7082: a lone regular file of RFC 7464's own framing is read a window at a time, as the plain
     // route reads its file (#6920), so the run holds a window where it held the file; #7164: a pipe
-    // too, up to its first record that is not that framing.
+    // too, up to its first record that is not that framing; #7322: and past such a record, when
+    // plain records follow it.
     let mut seq_windowed = if args.seq && lazy_route_open {
         windowed_seq_file(&args)
     } else {
@@ -5456,7 +5457,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             // The next file's text, or for a windowed file its next window with the documents the
             // window holds (#6920): the splitter already ran over it, and `lines_before` line
             // breaks and `window_substituted` come with it.
-            let (idx, raw, window_split, lines_before, window_substituted, window_place) =
+            let (idx, raw, window_split, lines_before, window_substituted, window_place, notes) =
                 match windowed.as_mut() {
                     Some(reader) => match reader.next_window_noting(&mut |at, failure| {
                         noted.push((at, failure));
@@ -5468,6 +5469,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                             next.lines_before,
                             next.substituted,
                             Some((next.seam, next.origin)),
+                            next.notes,
                         ),
                         Ok(None) => break,
                         // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
@@ -5477,7 +5479,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                         } // patchcov: coverage end
                     },
                     None => match whole_files.next() {
-                        Some((idx, raw)) => (idx, raw.as_slice(), None, 0, false, None),
+                        Some((idx, raw)) => (idx, raw.as_slice(), None, 0, false, None, Vec::new()),
                         None => break,
                     },
                 };
@@ -5611,11 +5613,18 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             )
             .with_lines_before(lines_before);
             let tail_locator = ValueLocator::new(b"", value_tail.as_deref(), Some(0), Seam::NONE);
+            // #7322: what jq's `--seq` reader warns of in a stretch of the window that was not plain
+            // records, each printed when the run reaches where the reader met it, as jq's main loop
+            // prints it between the values it reads.
+            let mut notes = notes.into_iter().peekable();
             for (start, end) in values {
                 if !finished.next_input(args.on_error, &mut sink, &mut had_output, &mut last_output)
                 {
                     run_stopped = true;
                     break 'files;
+                }
+                while let Some((_, warning)) = notes.next_if(|&(at, _)| at < start) {
+                    eprintln!("{warning}");
                 }
                 // #6480: the last value, read at a last file that did not open, which its read
                 // reports first.
@@ -5956,6 +5965,10 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             if stopped(args.on_error, &sink) {
                 run_stopped = true;
                 break;
+            }
+            // #7322: the warnings met after the window's last value.
+            for (_, warning) in notes {
+                eprintln!("{warning}");
             }
             if let Some(offset) = split_error {
                 // #5497: jq meets its depth limit first when the refused bracket comes before
@@ -11674,8 +11687,10 @@ fn windowed_seq_file(args: &JqCommand) -> Option<WindowedSource> {
 /// A lone `--seq` source that is a regular file (named, or on standard input) which the prepass of
 /// [`windowed_seq_file`] could not vouch for (#7262): it holds a record that is not `RS value LF`, or
 /// none at all. It is read as a `--seq` pipe is ([`window::WindowedFiles::seq_pipe`], #7164): from where it
-/// stands, a window at a time while its records are plain, each certified when the RS after it is read, and
-/// from the first that is not, the rest is read and handed to the route that walks a stream whole
+/// stands, a window at a time while its records are plain, each certified when the RS after it is read. A
+/// record that is not plain with plain records after it is read as jq's reader reads it, and the windows
+/// carry on (#7322: a bad first record no longer costs the whole file). From the first the windows cannot
+/// carry on after, the rest is read and handed to the route that walks a stream whole
 /// ([`hand_on_seq_pipe_tail`]), where jq's reader stands after the records already run. A stream that is
 /// not plain from its first byte is handed on whole, as that route would have read it. Several files are
 /// the whole-file route's still: what a tail mid-file means for the files after it is not worked out.
@@ -22171,7 +22186,8 @@ mod tests {
     }
 
     /// #7262: a lone `--seq` file the prepass turns down is read a window at a time up to its first record
-    /// that is not plain, and only from there is it handed to the whole-stream route: the windows give
+    /// that is not plain and that the windows cannot carry on after (#7322: the stream's last record, or
+    /// one jq reads a value from that is not RFC 8259), and only from there is it handed to the whole-stream route: the windows give
     /// every record before that one and none after, and the route is handed the rest behind the front that
     /// resumes jq's reader, as the file's own bytes, in the buffer it was read into (never copied).
     #[cfg(unix)]
@@ -22185,14 +22201,18 @@ mod tests {
             records.extend_from_slice(format!("\x1e{{\"n\":{count}}}\n").as_bytes());
             count += 1;
         }
-        let bad = b"\x1e{\"cut\":\"x\n";
-        for (name, at) in [("last", records.len()), ("middle", records.len() / 2)] {
+        let cut: &[u8] = b"\x1e{\"cut\":\"x\n";
+        let nan: &[u8] = b"\x1enan\n";
+        for (name, at, bad) in [
+            ("last", records.len(), cut),
+            ("middle", records.len() / 2, nan),
+        ] {
             // The fault goes in at the first record from `at`.
             let at = records[at..]
                 .iter()
                 .position(|&b| b == 0x1e)
                 .map_or(records.len(), |i| at + i);
-            let stream = [&records[..at], &bad[..], &records[at..]].concat();
+            let stream = [&records[..at], bad, &records[at..]].concat();
             let path = dir.path().join(format!("{name}.seq"));
             std::fs::write(&path, &stream).expect("written");
             let path = path.to_string_lossy().into_owned();
@@ -22231,6 +22251,62 @@ mod tests {
             assert_eq!((&named, &pushed_files), (&files, &files), "{name}");
             assert!(failures.is_empty(), "{name}");
             assert_eq!(raws[0].as_ptr() as usize, in_place.0, "{name}: not copied");
+        }
+    }
+
+    /// #7322: a lone `--seq` file with a record that is not plain, the first one or one in the middle, and
+    /// plain records after it is read a window at a time from end to end: the windows give every plain
+    /// record, with the warning jq's reader has for the bad one where it met it, and nothing is handed to
+    /// the whole-stream route.
+    #[cfg(unix)]
+    #[test]
+    fn a_lone_seq_file_is_windowed_past_a_bad_record_7322() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut records = Vec::new();
+        let mut count = 0;
+        while records.len() < window::MIN_WINDOWED_FILE_BYTES as usize + 4096 {
+            records.extend_from_slice(format!("\x1e{{\"n\":{count}}}\n").as_bytes());
+            count += 1;
+        }
+        let bad = b"\x1e{\"cut\":\"x\n";
+        for (name, at) in [("first", 0), ("middle", records.len() / 2)] {
+            let at = records[at..]
+                .iter()
+                .position(|&b| b == 0x1e)
+                .map_or(records.len(), |i| at + i);
+            let stream = [&records[..at], &bad[..], &records[at..]].concat();
+            let path = dir.path().join(format!("{name}.seq"));
+            std::fs::write(&path, &stream).expect("written");
+            let path = path.to_string_lossy().into_owned();
+            let cmd = JqCommand::try_parse_from(["jq", "--seq", ".n", path.as_str()]).unwrap();
+            let (_, mut reader, _) = windowed_seq_file(&cmd).expect("windowed");
+            let (mut values, mut warnings, mut longest) = (0, Vec::new(), 0);
+            while let Some((_, window)) = reader.next_window().expect("reads") {
+                // The warning comes after every value before the bad record and before every one after.
+                for (met, warning) in &window.notes {
+                    let before = window.values.iter().filter(|&&(start, _)| start < *met);
+                    warnings.push((values + before.count(), warning.clone()));
+                }
+                values += window.values.len();
+                longest = longest.max(window.raw.len());
+            }
+            assert_eq!(values, count, "{name}");
+            let before = stream[..at].iter().filter(|&&b| b == 0x1e).count();
+            let line = before + 2;
+            assert_eq!(
+                warnings,
+                [(
+                    before,
+                    format!("jq: ignoring parse error: Truncated value at line {line}, column 1")
+                )],
+                "{name}"
+            );
+            assert!(longest < stream.len() / 2, "{name}: {longest}");
+            let handed = SEQ_PIPE_TAIL
+                .with(|slot| slot.borrow().clone())
+                .and_then(|slot| slot.borrow_mut().take());
+            assert!(handed.is_none(), "{name}: nothing is handed on");
         }
     }
 
