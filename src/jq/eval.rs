@@ -3001,7 +3001,13 @@ fn jq_kind(value: &OwnedValue) -> u8 {
         OwnedValue::Null => JQ_KIND_NULL,
         OwnedValue::Bool(false) => JQ_KIND_FALSE,
         OwnedValue::Bool(true) => JQ_KIND_TRUE,
-        OwnedValue::SpelledScalar(kind, _) => jq_kind(&kind.canonical()),
+        // Not `jq_kind(&kind.canonical())`: a function that calls itself is not inlined, and this
+        // one sits in every comparison of a sort (`sort_rank`), where that call cost 6.6% of the
+        // instructions of `.numbers | sort` (#7316). `spelled_scalar_kind_agrees_with_canonical`
+        // pins the two spellings of the rule together.
+        OwnedValue::SpelledScalar(ScalarKind::Null, _) => JQ_KIND_NULL,
+        OwnedValue::SpelledScalar(ScalarKind::False, _) => JQ_KIND_FALSE,
+        OwnedValue::SpelledScalar(ScalarKind::True, _) => JQ_KIND_TRUE,
         // jq has one number kind; `1 | contains(1.0)` is a comparison, not an error.
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => JQ_KIND_NUMBER,
         OwnedValue::String(_) => JQ_KIND_STRING,
@@ -144966,6 +144972,19 @@ mod tests {
         // < object, with the two booleans sharing the `boolean` slot.
         let ranks: Vec<u8> = values.iter().map(sort_rank).collect();
         assert_eq!(ranks, vec![0, 1, 1, 2, 2, 3, 4, 5]);
+    }
+
+    /// `jq_kind` maps a spelled scalar without going through `canonical()` (a self-recursive
+    /// `jq_kind` is not inlined, and it is on the sort's comparison path, #7316); the two must
+    /// still agree, kind and rank.
+    #[test]
+    fn spelled_scalar_kind_agrees_with_canonical() {
+        for kind in [ScalarKind::Null, ScalarKind::True, ScalarKind::False] {
+            let spelled = OwnedValue::SpelledScalar(kind, "spelling".into());
+            let canonical = kind.canonical();
+            assert_eq!(jq_kind(&spelled), jq_kind(&canonical), "{kind:?}");
+            assert_eq!(sort_rank(&spelled), sort_rank(&canonical), "{kind:?}");
+        }
     }
 
     /// jq errors when the two operands' kinds cannot be compared, rather than
