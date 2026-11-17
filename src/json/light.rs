@@ -40,7 +40,7 @@
 //! ```
 
 #[cfg(not(test))]
-use alloc::{borrow::Cow, string::String, vec::Vec};
+use alloc::{borrow::Cow, boxed::Box, string::String, vec::Vec};
 
 #[cfg(test)]
 use std::borrow::Cow;
@@ -1321,10 +1321,13 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
     /// [`canonical_compact_span`](Self::canonical_compact_span), also saying
     /// when the node is an object the scan declined only because its keys'
     /// hashes repeat ([`CanonicalSpan::RepeatedKeys`], #7310).
+    ///
+    /// Or when the node is canonical but for one object inside it that the
+    /// scan declined that way ([`CanonicalSpan::NestedRepeatedKeys`], #7366).
     pub(crate) fn canonical_compact_scan(&self, depth: usize) -> CanonicalSpan<'a> {
-        let Some(rest) = self
+        let Some((value_start, rest)) = self
             .text_position()
-            .and_then(|start| self.text.get(start..))
+            .and_then(|start| Some((start, self.text.get(start..)?)))
         else {
             return CanonicalSpan::Declined;
         };
@@ -1349,6 +1352,18 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
                     return CanonicalSpan::Declined;
                 }
                 CanonicalSpan::RepeatedKeys(shared)
+            }
+            // The whole span is checked, as an echo's is, which covers the
+            // object's keys too (see the arm above).
+            CanonicalScan::NestedRepeatedKeys { end, object } => {
+                match self.certified_span(rest, end) {
+                    Some(span) => CanonicalSpan::NestedRepeatedKeys {
+                        value_start,
+                        span,
+                        object,
+                    },
+                    None => CanonicalSpan::Declined,
+                }
             }
             CanonicalScan::Declined => CanonicalSpan::Declined,
         }
@@ -4062,9 +4077,37 @@ pub(crate) enum CanonicalSpan<'a> {
     /// ([`CanonicalScan::RepeatedKeys`]). Whether a key really does is left
     /// to the keys themselves: the scan compared 64-bit hashes of them.
     RepeatedKeys(Vec<u64>),
+    /// The node's text, valid UTF-8, which is its compact jq render but for
+    /// one object inside it that is what [`RepeatedKeys`](Self::RepeatedKeys)
+    /// says of a node ([`CanonicalScan::NestedRepeatedKeys`], #7366).
+    NestedRepeatedKeys {
+        /// Where the node starts in the document's text.
+        value_start: usize,
+        /// The node's text.
+        span: &'a str,
+        /// The object inside it, placed within `span`.
+        object: Box<NestedRepeat>,
+    },
     /// Anything else: the scan declined, the node has no text position, or
     /// the span it accepted is not valid UTF-8.
     Declined,
+}
+
+/// The one object inside a scanned value that the canonical scan declined only
+/// on its keys' hashes, the value being canonical around it
+/// ([`CanonicalScan::NestedRepeatedKeys`], #7366).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NestedRepeat {
+    /// Where the object's `{` is, counted from the value's first byte.
+    pub(crate) start: usize,
+    /// One past the object's closing `}`, counted the same way.
+    pub(crate) end: usize,
+    /// How many levels below the value the object sits (1 for a member or an
+    /// element of the value itself).
+    pub(crate) level: usize,
+    /// The hashes more than one of its keys has, as
+    /// [`CanonicalScan::RepeatedKeys`]'s `shared`.
+    pub(crate) shared: Vec<u64>,
 }
 
 /// What the canonical scan made of one value (#7310): the end of a span it
@@ -4077,9 +4120,9 @@ pub(crate) enum CanonicalScan {
     Canonical(usize),
     /// The value is an object whose span runs to `end`, every member of it
     /// is canonical, and some of its own keys' hashes repeat: a repeated key,
-    /// or two distinct keys sharing a 64-bit hash. Only the wide tier reports
-    /// this ([`scan_canonical_object_wide`]); a repeat the pairwise tier finds
-    /// is [`Declined`](Self::Declined), and so is a repeat in a nested object.
+    /// or two distinct keys sharing a 64-bit hash. The wide tier settles this
+    /// ([`scan_canonical_object_wide`]), the pairwise tier handing a repeat
+    /// among the first keys over to it (`pairwise_repeat`, #7355).
     RepeatedKeys {
         /// One past the object's closing `}`.
         end: usize,
@@ -4087,6 +4130,16 @@ pub(crate) enum CanonicalScan {
         /// a [`key_hash`] of a key's raw span, the bytes between its quotes
         /// with any escape left as written ([`raw_key_hash`]).
         shared: Vec<u64>,
+    },
+    /// The value's span runs to `end` and is canonical but for one object
+    /// inside it, which is what [`RepeatedKeys`](Self::RepeatedKeys) says of a
+    /// value (#7366). A second such object, or such an object in a value that
+    /// is itself one, is [`Declined`](Self::Declined).
+    NestedRepeatedKeys {
+        /// One past the value's last byte.
+        end: usize,
+        /// The object inside it.
+        object: Box<NestedRepeat>,
     },
     /// Anything else the scan declines.
     Declined,
@@ -4100,23 +4153,52 @@ pub(crate) enum CanonicalScan {
 /// unchecked but the repeat itself. A caller that would otherwise walk the
 /// object to hash every key and learn which hashes repeat, and whether it is
 /// well formed, has all of that already.
+///
+/// An object further in that declines the same way is recorded too, and the
+/// scan goes on past it (#7366): the rest of the value can still be certified,
+/// so that a caller prints the text around that object and only the object by
+/// its keys. One such object is recorded per scan; a second one, or the value
+/// itself declining after one, declines the value as any other fault does.
 #[must_use]
 pub(crate) fn canonical_compact_jq_scan_at_depth(bytes: &[u8], depth: usize) -> CanonicalScan {
     let mut scan = ScanState::new();
-    scan.wants_repeats = true;
-    match scan_canonical_value(bytes, 0, depth, &mut scan) {
-        Some(end) => CanonicalScan::Canonical(end),
-        // The scan stops at its first fault, so at most one object recorded
-        // a repeat, and it is the value itself exactly when its members sit
-        // one level below the starting depth: a nested object's sit deeper.
-        None => match scan.repeated_keys {
+    scan.value_member_depth = depth + 1;
+    let certified = scan_canonical_value(bytes, 0, depth, &mut scan);
+    // At most one object recorded a repeat (`record_repeated_keys`), and it is
+    // the value itself exactly when its members sit one level below the
+    // starting depth: a nested object's sit deeper.
+    match (certified, scan.repeated_keys) {
+        (Some(end), None) => CanonicalScan::Canonical(end),
+        (
+            Some(end),
+            Some(RepeatedKeys {
+                member_depth,
+                start,
+                end: object_end,
+                shared,
+            }),
+        ) => {
+            debug_assert!(member_depth > depth + 1 && start < object_end && object_end <= end);
+            CanonicalScan::NestedRepeatedKeys {
+                end,
+                object: Box::new(NestedRepeat {
+                    start,
+                    end: object_end,
+                    level: member_depth - (depth + 1),
+                    shared,
+                }),
+            }
+        }
+        (
+            None,
             Some(RepeatedKeys {
                 member_depth,
                 end,
                 shared,
-            }) if member_depth == depth + 1 => CanonicalScan::RepeatedKeys { end, shared },
-            _ => CanonicalScan::Declined,
-        },
+                ..
+            }),
+        ) if member_depth == depth + 1 => CanonicalScan::RepeatedKeys { end, shared },
+        (None, _) => CanonicalScan::Declined,
     }
 }
 
@@ -4132,23 +4214,39 @@ pub(crate) fn canonical_compact_jq_scan_at_depth(bytes: &[u8], depth: usize) -> 
 struct ScanState {
     specials: SpecialMask,
     /// Set by [`scan_canonical_object_wide`] when it declines at its closing
-    /// `}` only because its keys' hashes repeat. Written at most once per
-    /// scan, since that decline ends the scan.
+    /// `}` only because its keys' hashes repeat (`record_repeated_keys`).
+    /// Written at most once per scan: that decline ends the scan for the value
+    /// itself, and a second object declining so ends it for one further in
+    /// (#7366).
     repeated_keys: Option<RepeatedKeys>,
-    /// Whether the caller reads [`ScanState::repeated_keys`] back
-    /// ([`canonical_compact_jq_scan_at_depth`]): only then is a repeat among an object's first
-    /// keys scanned on to the closing `}` for the record (`pairwise_repeat`, #7355). The other
-    /// callers decline at the repeated key, as they always did.
-    wants_repeats: bool,
+    /// The depth the members of the value the scan was asked about sit at,
+    /// when the caller reads [`ScanState::repeated_keys`] back
+    /// ([`canonical_compact_jq_scan_at_depth`]), and 0 (no value's members sit
+    /// there) when it does not. Only for such a caller is a repeat among an
+    /// object's first keys scanned on to the closing `}` for the record
+    /// (`pairwise_repeat`, #7355), and an object further in that declines on
+    /// its keys scanned past (#7366); the other callers decline at the
+    /// repeated key, as they always did.
+    value_member_depth: usize,
 }
 
 /// [`ScanState::repeated_keys`]: how deep the members of the object that
 /// declined on its keys were scanned (one more than the object itself), where
-/// it ends, and which of its key hashes repeat.
+/// it starts and ends, and which of its key hashes repeat.
 struct RepeatedKeys {
     member_depth: usize,
+    /// The object's `{`, or [`RepeatedKeys::START_UNKNOWN`] until the frame
+    /// that scanned the `{` fills it in (`fill_repeat_start`): the wide tier,
+    /// which records the object, does not keep it, since a second position
+    /// live across its loop costs every key (#7310).
+    start: usize,
     end: usize,
     shared: Vec<u64>,
+}
+
+impl RepeatedKeys {
+    /// [`RepeatedKeys::start`] before it is known.
+    const START_UNKNOWN: usize = usize::MAX;
 }
 
 impl ScanState {
@@ -4157,7 +4255,7 @@ impl ScanState {
         Self {
             specials: SpecialMask::new(),
             repeated_keys: None,
-            wants_repeats: false,
+            value_member_depth: 0,
         }
     }
 }
@@ -4469,12 +4567,15 @@ fn scan_canonical_object(
             // proved distinct, which this whole function treats as "bail,
             // don't try to disambiguate" (see `KeyHashes`'s own doc comment
             // on `insert`).
-            let mut hashes = Vec::with_capacity(PAIRWISE_SPAN_SCAN_LIMIT * 4);
-            for &(s, e) in &small_spans[..small_count] {
-                hashes.push(key_hash(&bytes[s..e]));
-            }
-            hashes.push(key_hash(&bytes[key_start..key_end]));
-            return scan_canonical_object_wide(bytes, after_key, depth, scan, hashes);
+            return pairwise_overflow(
+                bytes,
+                pos,
+                &small_spans[..small_count],
+                (key_start, key_end),
+                after_key,
+                depth,
+                scan,
+            );
         }
         if bytes.get(after_key) != Some(&b':') {
             return None;
@@ -4505,27 +4606,67 @@ fn pairwise_repeat(
     depth: usize,
     scan: &mut ScanState,
 ) -> Option<usize> {
-    // Only a caller that reads the record, and only the value it asked about, can use it: any
-    // other scan, and an object further in, is declined at the key as it always was, and not
-    // scanned to its end for nothing. The scan's value starts at byte 0 and a nested one never
-    // does (`pos` is the object's `{`).
-    if !scan.wants_repeats || pos != 0 {
+    // Only a caller that reads the record can use it, and only the first object to decline
+    // on its keys: any other scan, and a second such object, is declined at the key as it
+    // always was, and not scanned to its end for nothing. An object further in is scanned on
+    // as the value is, since the scan then goes on past it (#7366).
+    if scan.value_member_depth == 0 || scan.repeated_keys.is_some() {
         return None;
     }
+    pairwise_overflow(bytes, pos, spans, key, after_key, depth, scan)
+}
+
+/// The rest of an object whose `{` is at `pos`, from the key `key` that [`scan_canonical_object`]
+/// handed over to [`scan_canonical_object_wide`] at, `spans` being the keys before it and
+/// `after_key` just past it: the key past the pairwise tier (#3333), or one repeating an earlier
+/// one (`pairwise_repeat`). The table tier is seeded with every key's [`key_hash`] so far.
+///
+/// Out of line, so that the pairwise loop's hand-off is a tail call: the table tier does not
+/// keep the object's `{`, since a second position live across its loop costs every key (#7310),
+/// and a record it makes of the object is given it here, once the tier returns (#7366). With that
+/// fill-in after the call in the pairwise loop itself, every object paid 2 instructions more on a
+/// 7950X, in the frame the loop had to keep for it.
+#[inline(never)]
+fn pairwise_overflow(
+    bytes: &[u8],
+    pos: usize,
+    spans: &[(usize, usize)],
+    key: (usize, usize),
+    after_key: usize,
+    depth: usize,
+    scan: &mut ScanState,
+) -> Option<usize> {
     let mut hashes = Vec::with_capacity(PAIRWISE_SPAN_SCAN_LIMIT * 4);
     for &(s, e) in spans {
         hashes.push(key_hash(&bytes[s..e]));
     }
     hashes.push(key_hash(&bytes[key.0..key.1]));
-    scan_canonical_object_wide(bytes, after_key, depth, scan, hashes)
+    let end = scan_canonical_object_wide(bytes, after_key, depth, scan, hashes);
+    if scan.repeated_keys.is_some() {
+        fill_repeat_start(scan, pos);
+    }
+    end
+}
+
+/// Fills in the `{` at `pos` as the start of the object [`ScanState::repeated_keys`]
+/// records, if that is the object whose scan just returned to the frame that scanned its `{`
+/// (#7366): an object recorded further in has had its own filled in by then, by its own frame.
+#[cold]
+#[inline(never)]
+fn fill_repeat_start(scan: &mut ScanState, pos: usize) {
+    if let Some(record) = &mut scan.repeated_keys {
+        if record.start == RepeatedKeys::START_UNKNOWN {
+            record.start = pos;
+        }
+    }
 }
 
 /// The rest of an object [`scan_canonical_object`] found wider than
 /// [`PAIRWISE_SPAN_SCAN_LIMIT`] keys (#3333), entered with `after_key` just
 /// past the key that overflowed the pairwise tier (or, for a caller that reads the record, that
 /// repeated an earlier one, `pairwise_repeat`) and `hashes` holding
-/// every key's [`key_hash`] up to and including it. The two entries build that list the same
-/// way, the overflow's written in line in the pairwise loop.
+/// every key's [`key_hash`] up to and including it. Both entries build that list in
+/// `pairwise_overflow`.
 ///
 /// Past the pairwise tier the keys' hashes are only *collected*, and one
 /// table sized for exactly that many keys settles them at the closing `}`
@@ -4603,6 +4744,12 @@ fn scan_canonical_object_wide(
 /// Every member is certified by then, so the record is all a caller needs to
 /// skip its own walk of the keys ([`CanonicalScan::RepeatedKeys`]). Out of
 /// line and cold, so that the loop's common exit stays as small as it was.
+///
+/// An object further in than the value the scan was asked about is certified
+/// once recorded (#7366): the scan goes on past it, and its caller prints the
+/// text around it ([`CanonicalScan::NestedRepeatedKeys`]). Only the first
+/// object is recorded, and a scan whose caller does not read the record
+/// records none; either way the object declines.
 #[cold]
 #[inline(never)]
 fn record_repeated_keys(
@@ -4614,12 +4761,16 @@ fn record_repeated_keys(
     if shared.is_empty() {
         return Some(end);
     }
+    if scan.value_member_depth == 0 || scan.repeated_keys.is_some() {
+        return None;
+    }
     scan.repeated_keys = Some(RepeatedKeys {
         member_depth,
+        start: RepeatedKeys::START_UNKNOWN,
         end,
         shared,
     });
-    None
+    (member_depth > scan.value_member_depth).then_some(end)
 }
 
 /// The key hashes that occur more than once, for an object of
@@ -5083,8 +5234,27 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
             // #7310: the scan certified every member of this object and
             // declined only on its keys' hashes. See `stream_scanned_repeats`.
             (CanonicalSpan::RepeatedKeys(shared), StandardJson::Object(fields)) => {
-                stream_scanned_repeats(&mut buf, fields, &shared, indent, numbers)?;
+                stream_scanned_repeats(&mut buf, fields, &shared, indent, numbers, 0)?;
             }
+            // #7366: certified but for one object inside it, which declined
+            // the same way. See `stream_around_scanned_repeats`.
+            (
+                CanonicalSpan::NestedRepeatedKeys {
+                    value_start,
+                    span,
+                    object,
+                },
+                value,
+            ) => stream_around_scanned_repeats(
+                &mut buf,
+                self,
+                value,
+                value_start,
+                span,
+                &object,
+                indent,
+                numbers,
+            )?,
             (_, value) => stream_json_pretty(
                 &mut buf,
                 value,
@@ -5670,8 +5840,23 @@ fn write_reindented<Out: core::fmt::Write>(
     width: usize,
     unit: char,
 ) -> core::fmt::Result {
+    write_reindented_at(out, span, width, unit, 0)
+}
+
+/// [`write_reindented`] for text that starts `level` levels in, or that leaves
+/// some brackets open (#7366): the text around an object written by other
+/// means, whose lines are indented from where it starts, as the whole
+/// value's would be at that point.
+#[inline(always)]
+fn write_reindented_at<Out: core::fmt::Write>(
+    out: &mut Out,
+    span: &str,
+    width: usize,
+    unit: char,
+    level: usize,
+) -> core::fmt::Result {
     let bytes = span.as_bytes();
-    let mut depth = 0usize;
+    let mut depth = level;
     let mut copied = 0usize;
     let mut i = 0usize;
     let line = |out: &mut Out, depth: usize| -> core::fmt::Result {
@@ -6452,6 +6637,10 @@ fn stream_json_planned_fields<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
 ///
 /// Out of line and cold: it is the rare branch of [`JsonCursor::stream_json`],
 /// whose echo arms are the common ones.
+///
+/// `level` is how many levels in the object is written, 0 for the value
+/// itself and more for one inside it ([`stream_around_scanned_repeats`],
+/// #7366): its members are indented one level further, and its `}` at it.
 #[cold]
 #[inline(never)]
 fn stream_scanned_repeats<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
@@ -6460,17 +6649,18 @@ fn stream_scanned_repeats<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
     shared: &[u64],
     indent: IndentSpec,
     numbers: JsonConvention,
+    level: usize,
 ) -> StreamResult {
     let Some(plan) = repeat_plan_from_shared(&fields, shared, raw_key_hash) else {
         return stream_json_pretty(
             out,
             StandardJson::Object(fields),
-            0,
+            level * indent.width,
             indent.width,
             indent.unit,
             false,
             numbers,
-            0,
+            level,
         );
     };
     out.write_char('{')?;
@@ -6478,17 +6668,79 @@ fn stream_scanned_repeats<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
         out,
         fields,
         plan,
-        indent.width,
+        (level + 1) * indent.width,
         indent.width,
         indent.unit,
         numbers,
-        0,
+        level,
     )?;
     if indent.width > 0 {
         out.write_char('\n')?;
-        write_json_indent(out, 0, indent.unit)?;
+        write_json_indent(out, level * indent.width, indent.unit)?;
     }
     Ok(out.write_char('}')?)
+}
+
+/// The unsorted `JqCompat` print, compact or indented, of a value the
+/// canonical scan certified but for one object inside it, which it declined
+/// only because some of its keys' hashes repeat (#7366,
+/// [`CanonicalSpan::NestedRepeatedKeys`]): `span`, the value's text, which
+/// starts at byte `value_start` of the document.
+///
+/// The text before the object and the text after it are already their compact
+/// render, as a certified span's is, so they are written as they stand (or
+/// re-indented, [`write_reindented_at`]), and only the object is written by its
+/// keys, as a value that is such an object is ([`stream_scanned_repeats`]).
+/// Before this, the scan stopped at that object, and every member of every
+/// value around it was walked and re-rendered.
+///
+/// The object is found in the index by where it starts
+/// ([`JsonCursor::cursor_at_offset`]). A cursor that is not at that `{`, which
+/// a certified span should never give, has the value printed by
+/// [`stream_json_pretty`], as a declined value is.
+///
+/// Out of line and cold: it is the rare branch of [`JsonCursor::stream_json`],
+/// whose echo arms are the common ones.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)] // STYLE-0004: stream_json's own ambients, plus the scan's record
+fn stream_around_scanned_repeats<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
+    out: &mut Out,
+    cursor: &JsonCursor<'_, W>,
+    value: StandardJson<'_, W>,
+    value_start: usize,
+    span: &str,
+    object: &NestedRepeat,
+    indent: IndentSpec,
+    numbers: JsonConvention,
+) -> StreamResult {
+    let fields = cursor
+        .cursor_at_offset(value_start + object.start)
+        .filter(|found| found.text_position() == Some(value_start + object.start))
+        .and_then(|found| match found.value() {
+            StandardJson::Object(fields) => Some(fields),
+            _ => None,
+        });
+    let (Some(fields), Some(before), Some(after)) =
+        (fields, span.get(..object.start), span.get(object.end..))
+    else {
+        debug_assert!(false, "a certified span's recorded object is in the index");
+        return stream_json_pretty(out, value, 0, indent.width, indent.unit, false, numbers, 0);
+    };
+    if indent.is_compact() {
+        out.write_str(before)?;
+        stream_scanned_repeats(out, fields, &object.shared, indent, numbers, object.level)?;
+        return Ok(out.write_str(after)?);
+    }
+    write_reindented_at(out, before, indent.width, indent.unit, 0)?;
+    stream_scanned_repeats(out, fields, &object.shared, indent, numbers, object.level)?;
+    Ok(write_reindented_at(
+        out,
+        after,
+        indent.width,
+        indent.unit,
+        object.level,
+    )?)
 }
 
 /// One object member of [`stream_json_pretty`]'s object arm -- the
@@ -9197,9 +9449,12 @@ mod tests {
     /// declines, and hands back exactly the hashes that repeat. A wrong
     /// `RepeatedKeys` would send a malformed object past the walk that refuses
     /// it, so every neighbour of the one shape that earns it is held to
-    /// `Declined`: the repeat found by the pairwise tier, a repeat in a nested
-    /// object, a fault before or after the repeated key, a fault inside a
-    /// later value, and an object that never closes.
+    /// `Declined`: a fault before or after the repeated key, a fault inside a
+    /// later value, and an object that never closes. A repeat in a nested
+    /// object is [`CanonicalScan::NestedRepeatedKeys`] when the value is
+    /// canonical around it (#7366), and every neighbour of that is `Declined`
+    /// too: a second such object, the value's own repeat after one, a fault
+    /// anywhere else.
     #[test]
     fn canonical_scan_reports_only_its_own_keys_repeat_7310() {
         let repeated = |doc: &str, depth: usize| match canonical_compact_jq_scan_at_depth(
@@ -9266,11 +9521,78 @@ mod tests {
             );
         }
 
+        // A repeat in an object further in is that object's record, and the
+        // scan goes on past it to certify the rest of the value (#7366): the
+        // object found by the wide tier and by the pairwise one (`early`), as an
+        // element, a member, deeper, and with a wide value after it.
+        let early = String::from_utf8(wide_canonical_object(10, Some((2, 7)))).unwrap();
+        let nested_record = |doc: &str, depth: usize| match canonical_compact_jq_scan_at_depth(
+            doc.as_bytes(),
+            depth,
+        ) {
+            CanonicalScan::NestedRepeatedKeys { end, object } => Some((end, *object)),
+            _ => None,
+        };
+        let wide_tail = String::from_utf8(wide_canonical_object(40, None)).unwrap();
+        for (object, shared) in [(&repeat, key_hash(b"k0003")), (&early, key_hash(b"k0002"))] {
+            for (before, after, level) in [
+                ("[", "]", 1),
+                ("{\"a\":", "}", 1),
+                ("[1,", ",2]", 1),
+                ("{\"x\":[true,{\"y\":", "}],\"z\":null}", 3),
+                ("[[", alloc::format!("],{wide_tail}]").as_str(), 2),
+            ] {
+                let doc = format!("{before}{object}{after}");
+                let want = NestedRepeat {
+                    start: before.len(),
+                    end: before.len() + object.len(),
+                    level,
+                    shared: vec![shared],
+                };
+                assert_eq!(
+                    nested_record(&doc, 0),
+                    Some((doc.len(), want.clone())),
+                    "{doc}"
+                );
+                // The level is counted from the value, whatever depth it starts at.
+                assert_eq!(nested_record(&doc, 5), Some((doc.len(), want)), "{doc}");
+                // The scans that do not read the record decline at the object.
+                assert_eq!(canonical_compact_jq_span_end(doc.as_bytes()), None, "{doc}");
+            }
+        }
+        // One such object is recorded, and its value certified around it; a
+        // second, or the value itself repeating a key after one, or any later
+        // fault, declines the value. So does an earlier one, which ends the scan.
+        let declined_around = [
+            format!("[{repeat},{early}]"),
+            format!("[{early},{early}]"),
+            format!("[{early},[{repeat}]]"),
+            format!("{{\"a\":{early},\"a\":1}}"),
+            format!("{{\"a\":{early},\"b\":1,\"a\":1}}"),
+            format!("[{early},1e3]"),
+            format!("[{early},1 ]"),
+            format!("[1e3,{early}]"),
+            format!("[{early}"),
+        ];
+        for doc in &declined_around {
+            assert_eq!(
+                canonical_compact_jq_scan_at_depth(doc.as_bytes(), 0),
+                CanonicalScan::Declined,
+                "{doc}"
+            );
+        }
+        // An object of a wide tier recorded inside it is what declines the
+        // outer one, which is no record of its own.
+        let wide_around = String::from_utf8(wide_canonical_object(40, None))
+            .unwrap()
+            .replacen(":7,", &alloc::format!(":{early},"), 1);
+        let Some((end, object)) = nested_record(&wide_around, 0) else {
+            panic!("{wide_around}");
+        };
+        assert_eq!(end, wide_around.len());
+        assert_eq!(&wide_around[object.start..object.end], early);
+
         let declined = [
-            // The repeat is a nested object's, not the value's.
-            format!("[{repeat}]"),
-            format!("{{\"a\":{repeat}}}"),
-            format!("[1,{repeat},2]"),
             // A fault ahead of the closing brace ends the scan first: in a
             // value before the repeat, after it, in a key, a stray space.
             repeat.replacen(":1,", ":1e3,", 1),
@@ -9290,7 +9612,8 @@ mod tests {
             );
         }
         // A nested object's repeat is `RepeatedKeys` only when it is the value
-        // asked about: from its parent it is a decline, as above.
+        // asked about: from its parent it is the text around it (#7366), placed
+        // in the document by where the parent starts.
         let nested = format!("{{\"a\":{repeat}}}");
         let index = JsonIndex::build(nested.as_bytes());
         let inner = index.root(nested.as_bytes()).first_child().unwrap();
@@ -9301,23 +9624,27 @@ mod tests {
         );
         assert_eq!(
             index.root(nested.as_bytes()).canonical_compact_scan(0),
-            CanonicalSpan::Declined
+            CanonicalSpan::NestedRepeatedKeys {
+                value_start: 0,
+                span: &nested,
+                object: Box::new(NestedRepeat {
+                    start: 5,
+                    end: nested.len() - 1,
+                    level: 1,
+                    shared: vec![key_hash(b"k0003")],
+                }),
+            }
         );
-        // A repeat among the first keys is recorded for the value asked about and for no other
-        // object, and not for a scan that does not read the record (#7355): in a wrapper, an
-        // array, and the other scans of the same span.
-        let early = String::from_utf8(wide_canonical_object(10, Some((2, 7)))).unwrap();
-        for doc in [
-            format!("{{\"a\":{early}}}"),
-            format!("[{early}]"),
-            format!("[1,{early}]"),
-        ] {
-            assert_eq!(
-                canonical_compact_jq_scan_at_depth(doc.as_bytes(), 0),
-                CanonicalScan::Declined,
-                "{doc}"
-            );
-        }
+        let element = format!("[0,{nested}]");
+        let index = JsonIndex::build(element.as_bytes());
+        let second = index.root(element.as_bytes()).first_child().unwrap();
+        let second = second.next_sibling().unwrap();
+        assert!(matches!(
+            second.canonical_compact_scan(1),
+            CanonicalSpan::NestedRepeatedKeys { value_start: 3, span, .. } if span == nested
+        ));
+        // A repeat among the first keys is recorded for a scan that reads the record
+        // (above), and not for one that does not (#7355).
         assert_eq!(canonical_compact_jq_span_end(early.as_bytes()), None);
         assert!(!is_canonical_compact_jq_span(early.as_bytes()));
         // The scan leaves UTF-8 to its caller, and the cursor declines an
@@ -9430,17 +9757,39 @@ mod tests {
         ];
         let mut rng = ChaCha8Rng::seed_from_u64(7310);
         let mut repeated = 0;
-        for _ in 0..3000 {
+        let mut around = 0;
+        for _ in 0..4000 {
             let mut doc = String::new();
             let dirty = rng.random_range(0..4) == 0;
-            object(&mut rng, 0, dirty, &mut doc);
+            // The object is the document half the time, and otherwise inside one, so
+            // that its repeat is a nested object's and printed around (#7366): after a wide
+            // run of canonical values, in an object, or beside a second object of its own.
+            match rng.random_range(0..6) {
+                0..=2 => object(&mut rng, 0, dirty, &mut doc),
+                3 => {
+                    doc.push_str("[0,\"\u{e9}\",{\"x\":[1,{}]},");
+                    object(&mut rng, 0, dirty, &mut doc);
+                    doc.push_str(",[[]]]");
+                }
+                4 => {
+                    doc.push_str("{\"data\":");
+                    object(&mut rng, 0, dirty, &mut doc);
+                    doc.push_str(",\"n\":1.0}");
+                }
+                _ => {
+                    doc.push('[');
+                    object(&mut rng, 0, dirty, &mut doc);
+                    doc.push(',');
+                    object(&mut rng, 1, dirty, &mut doc);
+                    doc.push(']');
+                }
+            }
             let index = JsonIndex::build(doc.as_bytes());
             let root = index.root(doc.as_bytes());
-            if matches!(
-                root.canonical_compact_scan(0),
-                CanonicalSpan::RepeatedKeys(_)
-            ) {
-                repeated += 1;
+            match root.canonical_compact_scan(0) {
+                CanonicalSpan::RepeatedKeys(_) => repeated += 1,
+                CanonicalSpan::NestedRepeatedKeys { .. } => around += 1,
+                _ => {}
             }
             for indent in indents {
                 let mut gate = String::new();
@@ -9464,6 +9813,10 @@ mod tests {
         }
         // The sweep has to reach the new branch often enough to mean anything.
         assert!(repeated > 100, "only {repeated} documents declined on keys");
+        assert!(
+            around > 100,
+            "only {around} documents printed around an object"
+        );
     }
 
     /// Same load-bearing direction as the corpus test above --
