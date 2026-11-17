@@ -14211,6 +14211,9 @@ thread_local! {
     static LAZY_WINDOWS_READ: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
     /// Test-only: the most text a lone source held when [`lazy_scan_on`] scanned it.
     static LAZY_TEXT_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test-only: the most window text, over every file, [`lazy_raw_producer_windowed`] held as it read
+    /// a window (#7323).
+    static LAZY_RAW_HELD_AT_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn lazy_window_bytes() -> usize {
@@ -15029,8 +15032,8 @@ fn lazy_raw_producer(
 /// [`lazy_raw_producer`] for files read a window at a time (#7023, #7024): `files` holds the text read
 /// of each so far (the first window of the first, nothing of the rest), and `rest` reads the windows
 /// after it, for each file in turn, each when the lines of the one before are over. A window ends at a
-/// line break, so a line is never split by one, and the text of a window is dropped when the next is
-/// read. A file's last line without a line break is the front of the next file's first, as jq reads it.
+/// line break, so a line is never split by one, and the text of a window is dropped before the next is
+/// read, so two are never held together (#7323). A file's last line without a line break is the front of the next file's first, as jq reads it.
 fn lazy_raw_producer_windowed(
     files: Vec<(u32, String)>,
     rest: Option<Vec<Option<window::LineWindows>>>,
@@ -15065,26 +15068,35 @@ fn lazy_raw_producer_windowed(
                 );
             }
             open.push_str(&text[at..]);
-            // The next window of a file read in windows: the text before it is dropped.
+            // The text is all handed out (its tail is in `open`), so it goes before the next window
+            // is read: the two are never held together (#7323). On a pipe the first window is the
+            // 4 MiB probe, which the next window's read was otherwise allocated beside.
+            files[file].1 = String::new();
+            at = 0;
+            // The next window of a file read in windows.
             if let Some(next) = rest
                 .get_mut(file)
                 .and_then(Option::as_mut)
-                .and_then(|windows| windows.next_window(None, report_input_read_failure))
+                .and_then(|windows| {
+                    #[cfg(test)]
+                    LAZY_RAW_HELD_AT_READ.with(|n| {
+                        let held: usize = files.iter().map(|(_, text)| text.capacity()).sum();
+                        n.set(n.get().max(held));
+                    });
+                    windows.next_window(None, report_input_read_failure)
+                })
             {
                 files[file].1 = raw_window_text(next);
-                at = 0;
                 continue;
             }
             if file == last {
                 break;
             }
-            // Past the file: its text and its windows (the open file they read) are no longer needed.
-            files[file].1 = String::new();
+            // Past the file: its windows (the open file they read) are no longer needed.
             if let Some(done) = rest.get_mut(file) {
                 *done = None;
             }
             file += 1;
-            at = 0;
             newlines = 0;
         }
         if open.is_empty() {
@@ -22525,6 +22537,55 @@ mod tests {
                 assert_eq!(got, want, "{files:?} at block {block}");
             }
         }
+    }
+
+    /// #7323: a pipe's probe, carried into `-R`'s windows, is the first window whole, and its text is
+    /// dropped before the next window is read, so the two are never held together (the probe and a
+    /// window beside it held twice what a window over a file does).
+    #[test]
+    fn raw_window_text_is_dropped_before_the_next_window_is_read_7323() {
+        let probe = b"one\ntwo\nthree\nfour\nfi".to_vec();
+        let rest = b"ve\nsix\nseven\neight\nnine\nten".to_vec();
+        let mut windows = window::LineWindows::new(
+            Box::new(std::io::Cursor::new(rest.clone())),
+            None,
+            4,
+            probe.clone(),
+        );
+        let first = windows
+            .next_window(None, |_| panic!("a cursor does not fail"))
+            .map(raw_window_text)
+            .expect("the probe is a window");
+        assert_eq!(
+            first, "one\ntwo\nthree\nfour\n",
+            "the probe up to its last line break"
+        );
+        LAZY_RAW_HELD_AT_READ.with(|n| n.set(0));
+        let mut producer =
+            lazy_raw_producer_windowed(vec![(0, first)], Some(vec![Some(windows)]), None);
+        let mut lines = Vec::new();
+        let end = loop {
+            match producer() {
+                jq::ProducedInput::Document(OwnedValue::String(line), _, _) => {
+                    lines.push(line.to_string());
+                }
+                jq::ProducedInput::End(end) => break end,
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        let text = [probe, rest].concat();
+        let want: Vec<String> = String::from_utf8(text)
+            .unwrap()
+            .split('\n')
+            .map(str::to_string)
+            .collect();
+        assert_eq!(lines, want);
+        assert_eq!(end, None, "the last line has no line break");
+        assert_eq!(
+            LAZY_RAW_HELD_AT_READ.with(std::cell::Cell::get),
+            0,
+            "a window was read while the text before it was held"
+        );
     }
 
     /// #7024: `-R` over several regular files, 4 MiB or more between them and up to as many as the

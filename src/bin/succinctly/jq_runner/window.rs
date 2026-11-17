@@ -2378,7 +2378,8 @@ impl LineWindows {
     /// the text's own buffer instead of one of its own and then copied (#7264: the copy faulted a
     /// second set of pages for the 240 KiB after a short start). Its last line break is still the
     /// window's, and a read that fails cuts only the window's line. `Err(before)` when there is no
-    /// window: nothing was added.
+    /// window: nothing was added. A `before` with no buffer at all ([`next_window`](Self::next_window)'s)
+    /// takes the carried bytes' own buffer instead, so they are not copied (#7323).
     pub(super) fn next_window_after(
         &mut self,
         want: Option<usize>,
@@ -2386,8 +2387,16 @@ impl LineWindows {
         on_error: impl FnOnce(&io::Error),
     ) -> Result<Vec<u8>, Vec<u8>> {
         let floor = before.len();
-        let mut bytes = before;
-        bytes.extend_from_slice(&std::mem::take(&mut self.carried));
+        let carried = std::mem::take(&mut self.carried);
+        // #7323: with no buffer to read onto, the carried bytes are the window's buffer. Copying them
+        // onto a new one held a pipe's 4 MiB probe twice (an 8.0 MiB heap peak for `-R` over a pipe).
+        let mut bytes = if before.capacity() == 0 {
+            carried
+        } else {
+            let mut bytes = before;
+            bytes.extend_from_slice(&carried);
+            bytes
+        };
         let mut ask = want.unwrap_or(self.block).max(1);
         if let Some(first) = self.first_ask.take() {
             ask = ask.min(first.max(1));
@@ -3961,6 +3970,33 @@ mod tests {
         assert_eq!(shrunk.next_window(None, |_| ()), Some(b"y\n".to_vec()));
         assert_eq!(shrunk.next_window(None, |_| ()), None);
         assert!(shrunk.finished());
+    }
+
+    /// #7323: the window a pipe's probe makes is the probe's own buffer, not a copy of it, so the probe
+    /// is not held twice. A window read onto text ([`LineWindows::next_window_after`]) is still the
+    /// text's buffer.
+    #[test]
+    fn a_carried_front_is_the_windows_buffer_not_a_copy_7323() {
+        let probe = b"a\nbc\nd".to_vec();
+        let at = probe.as_ptr();
+        let mut windows = LineWindows::new(
+            Box::new(io::Cursor::new(b"ef\ngh\n".to_vec())),
+            None,
+            4,
+            probe,
+        );
+        let window = windows
+            .next_window(None, |_| ())
+            .expect("the probe is a window");
+        assert_eq!(window, b"a\nbc\n");
+        assert_eq!(window.as_ptr(), at, "the probe was copied");
+        let text = Vec::with_capacity(64);
+        let at = text.as_ptr();
+        let window = windows
+            .next_window_after(None, text, |_| ())
+            .expect("the rest is a window");
+        assert_eq!(window, b"def\n");
+        assert_eq!(window.as_ptr(), at, "the window was not read onto the text");
     }
 
     /// #7024: bytes carried in that make a window already (a pipe's probe) are handed out as one, up to
