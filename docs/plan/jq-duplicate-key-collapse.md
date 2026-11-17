@@ -577,8 +577,8 @@ key renamed `k0` (median):
 | 100 MB | 3.90 s → 1.36 s | 1.76 s → 1.08 s | 2,648 MB → 261 MB   | 2,852 MB → 311 MB     |
 
 At 100 MB, `map(.) | length` is −60.6% / −34.0% (7950X / M4 Pro), `.[]` −44.6% / −22.6%, and
-`select(true)` −37.8% / −15.7%. The rows that repeat no key stayed inside about ±1.5% on both
-boxes, against A/A control bands of −1.6% to +0.5%.
+`select(true)` −37.8% / −15.7%. The medians of the rows that repeat no key stayed within −2.0% to
++2.0% on both boxes, against A/A control bands of −4.4% to +0.5% (the widest at 1 MB).
 
 What remains on the repeat row over the plain walk is the canonical scan, which declines the object
 at its closing brace (#7310), and the two key-only walks. Echoing the unchanged fields from the text,
