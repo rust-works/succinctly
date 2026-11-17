@@ -1,6 +1,8 @@
 //! #7235: `.a line_comment = "x"` on a block collection. yq's encoder cannot write the comment on
 //! the key's line, holds it and writes it on a later one (`b: 6 # x`), or loses it when nothing
 //! follows, as it does for a collection a write put where a commented scalar was (#7230).
+//! The comment is placed when the written document is printed whole; a result that is not (`[.a]`,
+//! `.a, .b`, `yq ea`) leaves it unplaced, which the limitations page records.
 //! Each row is `(document, filter, stdout)` as yq v4.53.3 answers.
 
 use anyhow::Result;
@@ -83,6 +85,36 @@ const ROWS: &[(&str, &str, &str)] = &[
         "a:\n  c: 1\nb: 6\n",
         ".a line_comment = \"x\" | .b = 1",
         "a:\n  c: 1\nb: 1 # x\n",
+    ),
+    (
+        "a: &x\n  c: 1\nb: 6\n",
+        ".a line_comment = \"x\"",
+        "a: &x\n  c: 1\nb: 6 # x\n",
+    ),
+    (
+        "a:\n  c: 1\nb: []\n",
+        ".a line_comment = \"x\"",
+        "a:\n  c: 1\nb: []\n",
+    ),
+    (
+        "a:\n  c: 1\nb: |\n  text\n",
+        ".a line_comment = \"x\"",
+        "a:\n  c: 1\nb: | # x\n  text\n",
+    ),
+    (
+        "a:\n  c: 1\nb: 6\n",
+        ".a line_comment = \"x\" | .b = [1]",
+        "a:\n  c: 1\nb: # x\n  - 1\n",
+    ),
+    (
+        "a:\n  c: 1\nb: 6\n",
+        ".a line_comment = \"x\" | .a.n = 3",
+        "a:\n  c: 1\n  n: 3\nb: 6 # x\n",
+    ),
+    (
+        "a:\n  c: 1\nb: 6\n",
+        ".a line_comment = \"x\" | .b = \"s\\nt\"",
+        "a:\n  c: 1\nb: |- # x\n  s\n  t\n",
     ),
 ];
 
