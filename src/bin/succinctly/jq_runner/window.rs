@@ -1200,10 +1200,11 @@ struct SeqFilesCheck {
 /// bigger than [`MAX_PENDING_RECORD`], the windows end before its RS and the rest of the stream is read
 /// and handed on ([`SeqTail`]), where jq's reader stands at a line start with nothing pending.
 struct SeqGate {
-    /// `buf[..checked]` is records that are each `RS value LF`; the record in progress opens at `checked`
-    /// (an RS), or the stream is all certified when it is the end of `buf`.
+    /// `buf[..checked]` is certified: records that are each `RS value LF`, and the stretches between
+    /// them the windows carried on after (#7322). The record in progress opens at `checked` (an RS), or
+    /// the stream is all certified when it is the end of `buf`.
     checked: usize,
-    /// Where the search for the RS that closes the record at `checked` goes on from.
+    /// Where the search for the RS that closes the record at `cand` goes on from.
     search_from: usize,
     /// The stream's first byte was an RS.
     opened: bool,
@@ -3238,14 +3239,19 @@ mod tests {
                     let (text, at, token, warnings) = gated(stream);
                     resumed_streams += usize::from(!warnings.is_empty());
                     let want = whole(&text);
-                    for block in [1usize, 7, 64, 4096] {
+                    // A pipe's probe holds the front of the stream before the first window: none of
+                    // it, half of it and all of it.
+                    for (block, probe) in [1usize, 7, 64, 4096]
+                        .into_iter()
+                        .flat_map(|block| [0, stream.len() / 2, stream.len()].map(|p| (block, p)))
+                    {
                         let mut file = tempfile::tempfile().expect("a temp file");
-                        file.write_all(stream).expect("written");
+                        file.write_all(&stream[probe..]).expect("written");
                         file.rewind().expect("rewound");
                         let slot = SeqTailSlot::default();
                         let mut reader = WindowedFile::from_seq_pipe(
                             Rc::new(file),
-                            Vec::new(),
+                            stream[..probe].to_vec(),
                             block,
                             Rc::clone(&slot),
                         );
@@ -3276,13 +3282,29 @@ mod tests {
                             );
                             assert_eq!(window.split_error, None);
                         }
-                        let case = format!("{:?}, block {block}", String::from_utf8_lossy(stream));
+                        let case = format!(
+                            "{:?}, block {block}, probe {probe}",
+                            String::from_utf8_lossy(stream)
+                        );
                         assert_eq!(
                             (spans, lines),
                             (want.spans.clone(), want.lines.clone()),
                             "{case}"
                         );
-                        assert_eq!(notes, warnings, "{case}");
+                        // A warning met in text that was dropped with nothing to run is moved to
+                        // the front of what is left, so only the lines and their order are the
+                        // gate's; `shown` below holds their place among the values.
+                        let lines_of = |notes: &[(usize, String)]| -> Vec<String> {
+                            notes.iter().map(|(_, line)| line.clone()).collect()
+                        };
+                        assert_eq!(lines_of(&notes), lines_of(&warnings), "{case}");
+                        assert!(
+                            notes
+                                .iter()
+                                .zip(&warnings)
+                                .all(|(got, want)| got.0 >= want.0),
+                            "{case}"
+                        );
                         let handed = slot.borrow_mut().take();
                         assert_eq!(handed.is_some(), at.is_some(), "{case}");
                         // The run as jq's reader reads the stream whole.

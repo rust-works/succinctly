@@ -797,7 +797,8 @@ pub(crate) struct StretchWalk {
 const MAX_STRETCH_WARNINGS: usize = 1024;
 
 /// Walks `stretch` as jq's reader walks it in the middle of a stream (#7322): from the RS that opens a
-/// record which is not `RS value LF`, through the next RS at a line start. `lines` line breaks of
+/// record which is not `RS value LF`, through the next RS at a line start that opens a record which
+/// is (an RS before it may start a line too, and open a record that is not). `lines` line breaks of
 /// RFC 7464's own framing came before it and left `token_byte` in the token buffer; `lines` of 0 is a
 /// stretch at the stream's very start.
 ///
