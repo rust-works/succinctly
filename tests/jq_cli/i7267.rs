@@ -135,15 +135,19 @@ fn test_per_element_collections_match_jq_7267() -> Result<()> {
 /// from jq 1.7.1 (`0`): the frame of `fold_pipe_stages`, which every level of this recursion keeps
 /// on the stack, grew by more than half in one version of #7267 and the stack guard refused it at
 /// depth 3,200 (#7267 review; main refuses past about 3,250 on an Apple M4 Pro and 3,370 on an AMD
-/// Ryzen 9 7950X in a release build). A debug build reserves a larger stack, so there the row only
-/// pins the output.
+/// Ryzen 9 7950X in a release build). A debug build's 2 GiB stack does not make up for its larger
+/// frames (this shape refuses past about 3,190 there on an Apple M5 Max), so there a shallower row
+/// only pins the output.
 #[test]
 fn test_deep_recursion_through_a_per_element_fold_7267() -> Result<()> {
+    let depth = if cfg!(debug_assertions) { 2_000 } else { 3_200 };
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("d.json");
     std::fs::write(&path, "[1,2,3]")?;
-    let filter = ". as $d | def f(n): if n == 0 then 0 else [$d[] | if . == 1 then ($d | f(n - 1)) else . end] | .[0] end; f(3200)";
-    let got = run_jq_full(&[filter, path.to_str().expect("utf-8 temp path")], None)?;
+    let filter = format!(
+        ". as $d | def f(n): if n == 0 then 0 else [$d[] | if . == 1 then ($d | f(n - 1)) else . end] | .[0] end; f({depth})"
+    );
+    let got = run_jq_full(&[&filter, path.to_str().expect("utf-8 temp path")], None)?;
     assert_eq!(got, ("0\n".to_string(), String::new(), 0));
     Ok(())
 }

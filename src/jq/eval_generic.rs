@@ -9319,6 +9319,9 @@ fn stop_fold<V: DocumentValue, S: EvalSemantics>(
     }
 }
 
+/// The moved run and the batch, as [`fold_cursor_elements`]' helpers give them back.
+type RunAndBatch<V> = (Vec<OwnedValue>, Vec<GenericResult<V>>);
+
 /// Main's loop body for the element that ends a moved run, which [`fold_cursor_elements`] calls
 /// out of line so that its loop holds a single element's result (#7267): the stack each level of
 /// a recursion through such folds takes is then no more than main's. Returns the run and the batch
@@ -9333,7 +9336,7 @@ fn push_element_result_cold<S: EvalSemantics, V: DocumentValue>(
     values: Vec<OwnedValue>,
     mut per_element: Vec<GenericResult<V>>,
     result: GenericResult<V>,
-) -> Result<(Vec<OwnedValue>, Vec<GenericResult<V>>), GenericResult<V>> {
+) -> Result<RunAndBatch<V>, GenericResult<V>> {
     let mut _mode = MAIN;
     push_element_result_7267!(S, Err, values, per_element, result, _mode);
     Ok((values, per_element))
