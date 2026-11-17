@@ -106,14 +106,17 @@ fn a_spawn_that_finds_no_binary_is_tried_again_7314() {
 
 /// A writer that cannot open its pipe reports the `errno`, not only that it stopped: here the path
 /// holds a directory by the time the writer opens it (`EISDIR`, where `EMFILE` would look the same to
-/// the reader, blocked in its own open).
+/// the reader, blocked in its own open). The writer is held at its gate until the directory is in
+/// place, so no clock decides the order.
 #[test]
 fn a_writer_that_cannot_open_its_pipe_reports_why_7314() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("p00");
-    let feed = Feed::after(path.clone(), b"x".to_vec(), Duration::from_millis(500));
+    let (open, gate) = std::sync::mpsc::channel();
+    let feed = Feed::gated(path.clone(), b"x".to_vec(), gate);
     std::fs::remove_file(&path)?;
     std::fs::create_dir(&path)?;
+    open.send(())?;
     let start = Instant::now();
     let said = loop {
         let said = feed.describe();

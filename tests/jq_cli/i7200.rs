@@ -68,11 +68,13 @@ fn a_fifo_path_with_a_byte_order_mark_does_not_hang_7200() -> Result<()> {
     let dir = std::env::temp_dir().join(format!("succinctly-7200-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     let fifo = dir.join("f");
-    // One writer, which writes the bytes once: a second open of the path by the reader used to wait
-    // for a writer that never came. What a second open does now is the platform's. On Linux it pairs
-    // with the writer's non-blocking open (the end of file it hands a reader, #7304) and reads an end of
-    // file at once, so the bytes are missing from the output. On macOS it was seen to wait until the
-    // deadline below instead. Either way the run fails and says why; neither is a hang.
+    // One writer, which writes the bytes once: a second open of the path by the binary used to wait
+    // for a writer that never came. Were it to open the path again, what that open did would depend on
+    // whether its first descriptor is still open at the writer's next kick (#7304). If it is, the
+    // writer's non-blocking open pairs with the blocked one and hands it an end of file at once, so the
+    // bytes are missing from the output. If the first has been closed, the kick finds no reader
+    // (`ENXIO`), the writer stops kicking, and the second open waits until the deadline below. Either
+    // way this test fails and says why, on either OS; neither is a hang.
     let feed = Feed::new(fifo.clone(), b"\xef\xbb\xbf\x1e1\n".to_vec());
     let out = fifo_feed::output_within(
         Command::new(succinctly_bin())

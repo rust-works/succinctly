@@ -20,9 +20,11 @@
 //! 3. **`Command::output` has no deadline.** [`output`] waits for the child for [`DEADLINE`], then
 //!    kills it and fails with the state of every pipe that fed it. A run fed through an anonymous pipe
 //!    on its standard input has the same hole (`wait_with_output` waits for as long as the child does),
-//!    so [`output_stdin`] and [`spawn_jq_deadline`] give it the same deadline (#7314). Both retry as
-//!    `spawn_with_signal_retry` does (a spawn that finds no binary, a child killed by a signal), and so
-//!    does [`output_retrying`] for a run fed by named pipes, which makes new pipes for each attempt.
+//!    so [`output_stdin`], [`output_stdin_within`] and [`output_stdin_file`] give it the same deadline
+//!    (#7314). Every run here retries a spawn that finds no binary, as `spawn_with_signal_retry` does.
+//!    Only [`spawn_jq_deadline`] (a new run of the same bytes) and [`output_retrying`] (a run fed by
+//!    named pipes, which makes new pipes for each attempt) also run again a child killed by a signal;
+//!    the `output_stdin*` functions do not.
 
 #![allow(dead_code)] // Each consumer uses a different subset.
 
@@ -71,6 +73,19 @@ impl Feed {
 
     /// As [`Feed::new`], with the writer's first open made only after `delay`.
     pub fn after(path: PathBuf, bytes: Vec<u8>, delay: Duration) -> Self {
+        Self::start(path, bytes, move || std::thread::sleep(delay))
+    }
+
+    /// As [`Feed::new`], with the writer's first open made only once `gate` has been sent to (or its
+    /// sender dropped): the order of the writer's open and the test's own steps is the test's, not the
+    /// clock's.
+    pub fn gated(path: PathBuf, bytes: Vec<u8>, gate: std::sync::mpsc::Receiver<()>) -> Self {
+        Self::start(path, bytes, move || {
+            let _ = gate.recv();
+        })
+    }
+
+    fn start(path: PathBuf, bytes: Vec<u8>, wait: impl FnOnce() + Send + 'static) -> Self {
         let made = Command::new("mkfifo")
             .arg(&path)
             .status()
@@ -89,7 +104,7 @@ impl Feed {
                 errno.clone(),
             );
             std::thread::spawn(move || {
-                std::thread::sleep(delay);
+                wait();
                 let end = feed(&path, &bytes, &stop, &state, &kicks, &errno);
                 state.store(end, Ordering::SeqCst);
             })
