@@ -17824,7 +17824,11 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                     return GenericResult::Error(err);
                 }
                 // #7290: the value cursors alone, not the field list.
-                match effective_value_cursors_checked(&fields, true) {
+                match effective_value_cursors_checked(
+                    &fields,
+                    true,
+                    S::ITERATION_COLLAPSES_COLLECTION_KEYS,
+                ) {
                     Ok(cursors) => {
                         if cursors.is_empty() {
                             GenericResult::None
@@ -22895,7 +22899,8 @@ fn any_all_f_generic<S: EvalSemantics, V: DocumentValue>(
         // `[false]` under yq too, and so is the eager `any_all_f`'s walk.
         // The mode constant governs the *keys* builtins, where yq keeps every
         // occurrence; here it would have answered `any(.)` `true`.
-        match effective_value_cursors_checked(&fields, true) {
+        match effective_value_cursors_checked(&fields, true, S::ITERATION_COLLAPSES_COLLECTION_KEYS)
+        {
             Ok(cursors) => {
                 for value_cursor in cursors {
                     if let Some(result) = probe(value_cursor, &mut matches) {
@@ -40406,7 +40411,7 @@ fn any_all_generic<S: EvalSemantics, V: DocumentValue>(
         if S::TAG == EvalTag::Yq {
             return yq_reject_non_array();
         }
-        match effective_value_cursors_checked(&fields, S::COLLAPSE_DUPLICATE_KEYS) {
+        match effective_value_cursors_checked(&fields, S::COLLAPSE_DUPLICATE_KEYS, false) {
             Ok(cursors) => {
                 for value_cursor in cursors {
                     let truthy = !value_cursor.is_falsy();
@@ -40810,7 +40815,11 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 // The fallback keeps one value cursor per surviving field,
                 // where it used to materialize every field and own every
                 // key to collapse them (#7311).
-                let source = match repeat_plan_checked(&fields, true) {
+                let source = match repeat_plan_checked(
+                    &fields,
+                    true,
+                    S::ITERATION_COLLAPSES_COLLECTION_KEYS,
+                ) {
                     Err(err) => return GenericResult::Error(err),
                     Ok(Some(plan)) => LazySource::cursors(plan.value_cursors(&fields)),
                     Ok(None) => LazySource::Values(fields),
@@ -48281,7 +48290,7 @@ mod tests {
                             .collect::<Vec<_>>()
                     })
                     .map_err(|e| alloc::format!("{e:?}"));
-                let cursors = effective_value_cursors_checked(&fields, collapse)
+                let cursors = effective_value_cursors_checked(&fields, collapse, false)
                     .map(|cs| cs.iter().map(DocumentCursor::node_id).collect::<Vec<_>>())
                     .map_err(|e| alloc::format!("{e:?}"));
                 assert_eq!(
@@ -48321,7 +48330,7 @@ mod tests {
             .value()
             .as_object()
             .expect("an object");
-        let cursors = effective_value_cursors_checked(&fields, true).expect("well-formed");
+        let cursors = effective_value_cursors_checked(&fields, true, false).expect("well-formed");
         assert_eq!(cursors.len(), 2);
         assert!(cursors.capacity() <= 8, "capacity {}", cursors.capacity());
         // And `.[]`'s own arm, which is where that bound was taken.
@@ -48357,7 +48366,7 @@ mod tests {
                     .iter()
                     .map(|f| f.value_cursor.node_id())
                     .collect();
-                let cursors: Vec<_> = effective_value_cursors_checked(&fields, true)
+                let cursors: Vec<_> = effective_value_cursors_checked(&fields, true, false)
                     .expect("well-formed")
                     .iter()
                     .map(DocumentCursor::node_id)
@@ -48384,8 +48393,8 @@ mod tests {
         }
         let mut collapsed_some = 0;
         for fields in &mappings {
-            let raw = effective_value_cursors_checked(fields, false).expect("well-formed");
-            let kept = effective_value_cursors_checked(fields, true).expect("well-formed");
+            let raw = effective_value_cursors_checked(fields, false, false).expect("well-formed");
+            let kept = effective_value_cursors_checked(fields, true, false).expect("well-formed");
             collapsed_some += usize::from(kept.len() < raw.len());
             for collapse in [false, true] {
                 let list: Vec<_> = effective_fields_checked(fields, collapse)
@@ -48393,7 +48402,7 @@ mod tests {
                     .iter()
                     .map(|f| f.value_cursor.node_id())
                     .collect();
-                let cursors: Vec<_> = effective_value_cursors_checked(fields, collapse)
+                let cursors: Vec<_> = effective_value_cursors_checked(fields, collapse, false)
                     .expect("well-formed")
                     .iter()
                     .map(DocumentCursor::node_id)
@@ -48404,6 +48413,28 @@ mod tests {
         // The top mapping repeats `a` and `n` repeats `p`; `o`'s repeated complex key is never a
         // duplicate (#1385), and `k`'s `<<` is one member of its own at this level.
         assert_eq!(collapsed_some, 2);
+        // yq's `.[]` reads a collection key as empty text (#7292), so `o`'s two collapse there,
+        // by the cursor walk and by the plan `map(f)` takes, and only there.
+        let o = DocumentFields::find_cursor(&top_fields, "o")
+            .unwrap()
+            .expect("o")
+            .value()
+            .as_object()
+            .expect("a mapping");
+        assert_eq!(
+            effective_value_cursors_checked(&o, true, false)
+                .expect("well-formed")
+                .len(),
+            3
+        );
+        assert_eq!(
+            effective_value_cursors_checked(&o, true, true)
+                .expect("well-formed")
+                .len(),
+            2
+        );
+        assert!(repeat_plan_checked(&o, true, false).unwrap().is_none());
+        assert!(repeat_plan_checked(&o, true, true).unwrap().is_some());
     }
 
     /// #7278: `borrowed_document_number` answers exactly the repr `to_owned_cursor` builds for a

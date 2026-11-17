@@ -6161,7 +6161,7 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
             let plan = if sort_keys {
                 None
             } else {
-                repeat_plan_checked(&fields, collapse).map_err(StreamFailure::Decode)?
+                repeat_plan_checked(&fields, collapse, false).map_err(StreamFailure::Decode)?
             };
             out.write_char('{')?;
             let next_indent = current_indent + indent_spaces;
