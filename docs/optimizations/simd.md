@@ -76,6 +76,18 @@ the stored bytes are the same in both builds. The likely cause is that the first
 masks no longer wait for the second half's chain and the 128-to-256-bit merge, but that
 was not isolated.
 
+**Simple cursor: not converted (#7318).** `process_chunk_simple` in `json::simd::x86` and
+`avx2` still branch per byte on a three-state machine (`InJson`, `InString`, `InEscape`; two BP
+bits per structural byte), as the standard-cursor kernels did before #7300 and #7305. Only the
+library type `SimpleJsonIndex` reaches them: it has no in-crate consumer, no CLI route, no
+`perf.tsv` row, no benchmark and no documentation beyond its rustdoc, and the release binary does
+not link the kernels. A sibling step table on `json::simd::step`'s shared loop would remove the
+branch, but it would be a second table and a second contract test for a path nothing here
+measures or runs, so it is left until a user of `SimpleJsonIndex` asks for the speed or a CLI
+route starts to use it. What *is* covered: both kernels' answers against the scalar reference
+(`tests/simd_level_tests.rs`), and, since #7318, the SSE2 standard-cursor kernel through the CLI
+(`SUCCINCTLY_SIMD=sse2`, [environment variables](../reference/environment-variables.md#succinctly_simd)).
+
 ### AVX-512
 
 512-bit vectors. **Use with caution** - not always faster.
