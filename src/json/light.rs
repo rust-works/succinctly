@@ -4955,6 +4955,16 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
         }
     }
 
+    fn valid_number_text(&self) -> Option<Cow<'_, str>> {
+        match self {
+            // #7315: the grammar pass is the UTF-8 check too (`valid_number_str`).
+            StandardJson::Number(n) => {
+                crate::json::validate::valid_number_str(n.raw_bytes()).map(Cow::Borrowed)
+            }
+            _ => None,
+        }
+    }
+
     fn number_literal(&self) -> Option<Cow<'_, str>> {
         match self {
             StandardJson::Number(n) => {
@@ -11353,6 +11363,81 @@ mod tests {
             let number: StandardJson<'_, Vec<u64>> = StandardJson::Number(n);
             assert_eq!(number.number_literal(), None, "{token}");
         }
+    }
+
+    /// #7315: JSON's `valid_number_text` override answers what the trait default would: the raw
+    /// span when it is an RFC 8259 number, `None` for every other span (lenient spellings, bridge
+    /// tokens, bytes that are not UTF-8) and every non-number. The two definitions are kept apart
+    /// only so JSON can skip a UTF-8 pass; this is the test that they agree.
+    #[test]
+    fn valid_number_text_is_number_text_filtered_by_is_valid_number_7315() {
+        let mut docs: Vec<Vec<u8>> = [
+            "0",
+            "-0",
+            "1.0",
+            "-1.5e-3",
+            "1e1000",
+            "-1E+400",
+            "123456789012345678901234",
+            "0.30000000000000004",
+            "007",
+            "-007.5",
+            ".5",
+            "-.5",
+            "5.",
+            "1e",
+            "1.e5",
+            "+1",
+            "0x10",
+            "\"12\"",
+            "null",
+            "true",
+            "[]",
+            "{}",
+        ]
+        .iter()
+        .map(|t| format!("[{t}]").into_bytes())
+        .collect();
+        docs.push(
+            format!(
+                "[{}]",
+                crate::json::validate::computed_float_token(0.1 + 0.2)
+            )
+            .into_bytes(),
+        );
+        docs.push(b"[1\xff]".to_vec());
+        docs.push(b"[\xff1]".to_vec());
+        docs.push(b"[-\xc3\xa9]".to_vec());
+        let (mut valid, mut refused_numbers) = (0usize, 0usize);
+        for bytes in &docs {
+            for index in [JsonIndex::build(bytes), JsonIndex::build_reindex(bytes)] {
+                let root = index.root(bytes);
+                let StandardJson::Array(items) = root.value() else {
+                    panic!("expected an array: {:?}", String::from_utf8_lossy(bytes));
+                };
+                for value in items {
+                    let expected = value
+                        .number_text()
+                        .filter(|text| crate::json::validate::is_valid_number(text.as_bytes()));
+                    assert_eq!(
+                        value.valid_number_text(),
+                        expected,
+                        "{:?}",
+                        String::from_utf8_lossy(bytes)
+                    );
+                    if expected.is_some() {
+                        valid += 1;
+                    } else if value.number_text().is_some() {
+                        refused_numbers += 1;
+                    }
+                }
+            }
+        }
+        // Both answers are exercised: valid spans, and number spans the grammar refuses.
+        assert!(
+            valid >= 14 && refused_numbers >= 8,
+            "{valid} valid, {refused_numbers} refused"
+        );
     }
 
     /// #6275: a computed integer's token is one `Number` span the bridge's index decodes to the
