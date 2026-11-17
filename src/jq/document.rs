@@ -3434,6 +3434,25 @@ pub fn shared_key_hashes(hashes: Vec<u64>) -> Vec<u64> {
     repeated_hashes(hashes).0
 }
 
+/// [`shared_key_hashes`]'s list by [`any_hash_repeats`]'s route (#7310): the
+/// prefilter, a sort of what it leaves, and a test for a repeat, with the list
+/// collected only when that test finds one. So a list with no repeat costs
+/// exactly what `any_hash_repeats` charges it, and answers empty: for the
+/// canonical scan, which settles every wide object's keys and needs the
+/// shared hashes only for the rare one that repeats. Through
+/// [`repeated_hashes`], which also counts the distinct hashes, the 7.1 M keys
+/// of the 100 MB `wide` object without a repeat cost 85 M more instructions
+/// (`-c .`, 1.7%, 7950X).
+#[doc(hidden)]
+pub fn shared_key_hashes_if_any(hashes: Vec<u64>) -> Vec<u64> {
+    let mut sorted = prefilter_candidates(&hashes).unwrap_or(hashes);
+    sorted.sort_unstable();
+    if !hashes_repeat(&sorted) {
+        return Vec::new();
+    }
+    shared_hashes(&sorted).0
+}
+
 /// Whether any value occurs more than once in `hashes` (#4169) -- what
 /// `sort_unstable` followed by [`hashes_repeat`] answers, through the same
 /// bitset prefilter as [`repeated_hashes`], for the batch callers that need
@@ -3750,7 +3769,30 @@ pub(crate) fn repeat_plan_checked<F: DocumentFields>(
     if !collapse || walked.shared.is_empty() {
         return Ok(None);
     }
-    Ok(plan_repeats(fields, &walked.shared, walked.unkeyed > 0))
+    Ok(plan_repeats(
+        fields,
+        &walked.shared,
+        walked.unkeyed > 0,
+        key_hash_of,
+    ))
+}
+
+/// [`repeat_plan_checked`]'s second walk alone, for a caller that knows the
+/// object is well formed, that every key of it decodes, and which key hashes
+/// it shares (#7310): the JSON printer, given all three by the canonical scan,
+/// which hashed every key on its way to a wide object's closing `}`.
+///
+/// `shared` is sorted and deduplicated, and `hash_of` is the hash it was
+/// built under: the walk compares each key's `hash_of` against it, so a key
+/// hashed one way and listed another would be missed. Keys are still grouped
+/// by their decoded spelling, so a hash two different keys share is told
+/// apart here, and an object where that is all that happened answers `None`.
+pub(crate) fn repeat_plan_from_shared<F: DocumentFields>(
+    fields: &F,
+    shared: &[u64],
+    hash_of: impl Fn(&F::Value) -> Option<u64>,
+) -> Option<RepeatPlan<F::Cursor>> {
+    plan_repeats(fields, shared, false, hash_of)
 }
 
 /// [`repeat_plan_checked`]'s second walk, for an object whose hashes repeat.
@@ -3767,6 +3809,7 @@ fn plan_repeats<F: DocumentFields>(
     fields: &F,
     shared: &[u64],
     every_key: bool,
+    hash_of: impl Fn(&F::Value) -> Option<u64>,
 ) -> Option<RepeatPlan<F::Cursor>> {
     let mut steps: Vec<RepeatStep> = Vec::new();
     let mut values: Vec<F::Cursor> = Vec::new();
@@ -3775,7 +3818,7 @@ fn plan_repeats<F: DocumentFields>(
     let mut walk = fields.clone();
     let mut at = 0usize;
     while let Some((key, _cursor, rest)) = walk.uncons_key() {
-        if let Some(name) = collapsing_key(&key, shared, every_key) {
+        if let Some(name) = collapsing_key(&key, shared, every_key, &hash_of) {
             // `uncons` meets the same field `uncons_key` just did, so it is
             // not `None` on the object the walk above accepted.
             if let Some((field, _)) = walk.uncons() {
@@ -3810,18 +3853,19 @@ fn plan_repeats<F: DocumentFields>(
 }
 
 /// The name `key` collapses under, when the collapse walks have to compare it:
-/// its hash is in `shared` (sorted: the hashes that occur more than once, or a
-/// superset), or `every_key` is set because some key of the object has no hash
-/// to tell it apart by. `None` for every other key, which occurs once, and for
+/// its `hash_of` is in `shared` (sorted: the hashes that occur more than once,
+/// or a superset, under that same hash), or `every_key` is set because some key
+/// of the object has no hash to tell it apart by. `None` for every other key, which occurs once, and for
 /// a key that does not stringify, which has no name to collapse on and keeps
 /// its place.
 fn collapsing_key<'v, V: DocumentValue>(
     key: &'v V,
     shared: &[u64],
     every_key: bool,
+    hash_of: impl Fn(&V) -> Option<u64>,
 ) -> Option<Cow<'v, str>> {
     if !every_key {
-        let hash = key_hash_of(key)?;
+        let hash = hash_of(key)?;
         shared.binary_search(&hash).ok()?;
     }
     key.key_string()
@@ -4244,7 +4288,7 @@ fn collapse_repeated_cursors<F: DocumentFields>(
     let mut at = 0usize;
     while let Some((key, _cursor, rest)) = walk.uncons_key() {
         let value = values[at];
-        match collapsing_key(&key, shared, every_key) {
+        match collapsing_key(&key, shared, every_key, key_hash_of) {
             Some(name) => match slots.slot(name, kept) {
                 Some(slot) => values[slot] = value,
                 None => {

@@ -580,10 +580,12 @@ At 100 MB, `map(.) | length` is −60.6% / −34.0% (7950X / M4 Pro), `.[]` −4
 `select(true)` −37.8% / −15.7%. The medians of the rows that repeat no key stayed within −2.0% to
 +2.0% on both boxes, against A/A control bands of −4.4% to +0.5% (the widest at 1 MB).
 
-What remains on the repeat row over the plain walk is the canonical scan, which declines the object
-at its closing brace (#7310), and the two key-only walks. Echoing the unchanged fields from the text,
-as the clean object is, needs a scan that ignores repeats at one level and a re-indent of fragments;
-that is a separate change.
+What remained on the repeat row over the plain walk was the canonical scan, which declines the object
+at its closing brace, and the two key-only walks. Since #7310 the scan hands the hashes it found
+repeated to the plan, so a wide object it declines on its keys alone takes only the plan's walk:
+another -26% to -29% at 100 MB on both boxes (`docs/parsing/json.md`, "A wide object declined on its
+keys hands its shared hashes on"). Echoing the unchanged fields from the text, as the clean object
+is, needs a re-indent of fragments between the plan's steps; that is a separate change (#7346).
 
 ## Open risks for an implementer to sanity-check
 
