@@ -5906,8 +5906,9 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
             // (a repeated key's first occurrence takes its last value, and
             // its later occurrences go), found by decoding only the keys
             // whose hash another key shares. Materializing such an object
-            // instead cost 2.8 GiB and 4x the instructions on a 100 MB
-            // object of 7.1 M keys with one repeat.
+            // instead peaked at 2.6-2.9 GB for `.` over a 100 MB object of
+            // 7.1 M keys with one repeat, where the plan peaks at the
+            // 260-370 MB the same object takes without it (7950X, M4 Pro).
             let materialized = if sort_keys {
                 let items =
                     effective_fields_checked(&fields, collapse).map_err(StreamFailure::Decode)?;
@@ -6041,9 +6042,8 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
 /// (#7311), never under `-S`.
 ///
 /// Out of line and cold, so that the writer every value recurses through
-/// keeps the size it had: with this loop beside the plain one in its body,
-/// `.` over a 100 MB object the scan declines read 4% slower on a 7950X at an
-/// unchanged instruction count.
+/// keeps the size it had; see `plan_repeats` (`src/jq/document.rs`) for what
+/// keeping it in line cost.
 #[cold]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)] // STYLE-0004: stream_json_pretty's own ambients, which this loop threads through.

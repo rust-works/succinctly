@@ -3646,7 +3646,7 @@ fn hash_walk<F: DocumentFields>(fields: &F) -> HashWalk {
 /// and takes its last occurrence's value, and every later occurrence is
 /// dropped: the rule `collapse_repeated` applies, without the list of every
 /// field it needs. On a 100 MB object of 7.1 M keys with one repeat, that
-/// list and its map of every key were 2.8 GiB of the print's peak; this holds
+/// list and its map of every key took the print's peak to 2.6-2.9 GB; this holds
 /// two steps. A step is a position and a slot, and a value cursor is kept per
 /// slot, so an object that repeats a few keys a million times holds 16 bytes
 /// per occurrence and one cursor per key.
@@ -3756,9 +3756,11 @@ pub(crate) fn repeat_plan_checked<F: DocumentFields>(
 /// [`repeat_plan_checked`]'s second walk, for an object whose hashes repeat.
 ///
 /// Out of line and cold, so that the gate the writers call for every object
-/// stays as small as `collapsed_fields_checked`'s was: with this walk inlined
-/// into it, `.` over a 100 MB object the scan declines read 4% slower on a
-/// 7950X at an unchanged instruction count (#7311).
+/// stays as small as `collapsed_fields_checked`'s was. A build that kept this
+/// walk, the JSON writer's plan loop and the printer's collapse in line read
+/// up to 4% slower on a 7950X over objects that repeat nothing (`.` over a
+/// 100 MB object the scan declines), at an instruction count within 0.05%;
+/// with the three out of line it timed flat (#7311).
 #[cold]
 #[inline(never)]
 fn plan_repeats<F: DocumentFields>(

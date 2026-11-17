@@ -3458,8 +3458,9 @@ fn collapse_duplicate_fields<'a>(
 /// repeat, or that escapes a key.
 ///
 /// Out of line and cold, as the JSON writer's own collapse walk is
-/// (`plan_repeats`, #7311), so the printer every value recurses through does
-/// not carry it.
+/// (`plan_repeats` in `src/jq/document.rs` says what keeping them in line
+/// cost, #7311), so the printer every value recurses through does not carry
+/// it.
 #[cold]
 #[inline(never)]
 fn collapse_repeated_fields<'a>(
