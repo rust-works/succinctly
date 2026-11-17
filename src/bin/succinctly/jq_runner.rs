@@ -22188,7 +22188,8 @@ mod tests {
     }
 
     /// #7262: a lone `--seq` file the prepass turns down is read a window at a time up to its first record
-    /// that is not plain, and only from there is it handed to the whole-stream route: the windows give
+    /// that is not plain and that the windows cannot carry on after (#7322: the stream's last record, or
+    /// one jq reads a value from that is not RFC 8259), and only from there is it handed to the whole-stream route: the windows give
     /// every record before that one and none after, and the route is handed the rest behind the front that
     /// resumes jq's reader, as the file's own bytes, in the buffer it was read into (never copied).
     #[cfg(unix)]
@@ -22202,14 +22203,18 @@ mod tests {
             records.extend_from_slice(format!("\x1e{{\"n\":{count}}}\n").as_bytes());
             count += 1;
         }
-        let bad = b"\x1e{\"cut\":\"x\n";
-        for (name, at) in [("last", records.len()), ("middle", records.len() / 2)] {
+        let cut: &[u8] = b"\x1e{\"cut\":\"x\n";
+        let nan: &[u8] = b"\x1enan\n";
+        for (name, at, bad) in [
+            ("last", records.len(), cut),
+            ("middle", records.len() / 2, nan),
+        ] {
             // The fault goes in at the first record from `at`.
             let at = records[at..]
                 .iter()
                 .position(|&b| b == 0x1e)
                 .map_or(records.len(), |i| at + i);
-            let stream = [&records[..at], &bad[..], &records[at..]].concat();
+            let stream = [&records[..at], bad, &records[at..]].concat();
             let path = dir.path().join(format!("{name}.seq"));
             std::fs::write(&path, &stream).expect("written");
             let path = path.to_string_lossy().into_owned();
@@ -22248,6 +22253,62 @@ mod tests {
             assert_eq!((&named, &pushed_files), (&files, &files), "{name}");
             assert!(failures.is_empty(), "{name}");
             assert_eq!(raws[0].as_ptr() as usize, in_place.0, "{name}: not copied");
+        }
+    }
+
+    /// #7322: a lone `--seq` file with a record that is not plain, the first one or one in the middle, and
+    /// plain records after it is read a window at a time from end to end: the windows give every plain
+    /// record, with the warning jq's reader has for the bad one where it met it, and nothing is handed to
+    /// the whole-stream route.
+    #[cfg(unix)]
+    #[test]
+    fn a_lone_seq_file_is_windowed_past_a_bad_record_7322() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut records = Vec::new();
+        let mut count = 0;
+        while records.len() < window::MIN_WINDOWED_FILE_BYTES as usize + 4096 {
+            records.extend_from_slice(format!("\x1e{{\"n\":{count}}}\n").as_bytes());
+            count += 1;
+        }
+        let bad = b"\x1e{\"cut\":\"x\n";
+        for (name, at) in [("first", 0), ("middle", records.len() / 2)] {
+            let at = records[at..]
+                .iter()
+                .position(|&b| b == 0x1e)
+                .map_or(records.len(), |i| at + i);
+            let stream = [&records[..at], &bad[..], &records[at..]].concat();
+            let path = dir.path().join(format!("{name}.seq"));
+            std::fs::write(&path, &stream).expect("written");
+            let path = path.to_string_lossy().into_owned();
+            let cmd = JqCommand::try_parse_from(["jq", "--seq", ".n", path.as_str()]).unwrap();
+            let (_, mut reader, _) = windowed_seq_file(&cmd).expect("windowed");
+            let (mut values, mut warnings, mut longest) = (0, Vec::new(), 0);
+            while let Some((_, window)) = reader.next_window().expect("reads") {
+                // The warning comes after every value before the bad record and before every one after.
+                for (met, warning) in &window.notes {
+                    let before = window.values.iter().filter(|&&(start, _)| start < *met);
+                    warnings.push((values + before.count(), warning.clone()));
+                }
+                values += window.values.len();
+                longest = longest.max(window.raw.len());
+            }
+            assert_eq!(values, count, "{name}");
+            let before = stream[..at].iter().filter(|&&b| b == 0x1e).count();
+            let line = before + 2;
+            assert_eq!(
+                warnings,
+                [(
+                    before,
+                    format!("jq: ignoring parse error: Truncated value at line {line}, column 1")
+                )],
+                "{name}"
+            );
+            assert!(longest < stream.len() / 2, "{name}: {longest}");
+            let handed = SEQ_PIPE_TAIL
+                .with(|slot| slot.borrow().clone())
+                .and_then(|slot| slot.borrow_mut().take());
+            assert!(handed.is_none(), "{name}: nothing is handed on");
         }
     }
 

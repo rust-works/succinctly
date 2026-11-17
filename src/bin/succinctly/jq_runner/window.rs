@@ -1233,9 +1233,10 @@ enum GateStep {
     },
 }
 
-/// How far past a record that is not plain a `--seq` gate looks for the records to be plain again
-/// (#7322), the first plain record included. Past it the rest of the stream is handed on, as all of
-/// it was before: the look-ahead is held beside the tail while that is read, so it is a few windows.
+/// The longest stretch that is not plain records a `--seq` gate carries on after (#7322), and how far
+/// past the stretch's start it reads while the record that may end it is still open. Past it the rest
+/// of the stream is handed on, as all of it was before: the look-ahead is held beside the tail while
+/// that is read, so it is a few windows.
 const MAX_SEQ_STRETCH: usize = 4 * WINDOW_BYTES;
 
 impl SeqGate {
@@ -1309,14 +1310,14 @@ impl SeqGate {
                 if plain {
                     self.checked = end;
                 }
+            } else if self.cand - self.checked > MAX_SEQ_STRETCH {
+                return GateStep::Unclean(self.checked);
             } else if plain && buf[self.cand - 1] == b'\n' {
                 return GateStep::Stretch {
                     from: self.checked,
                     to: self.cand,
                     next_end: end,
                 };
-            } else if end - self.checked > MAX_SEQ_STRETCH {
-                return GateStep::Unclean(self.checked);
             }
             self.cand = end;
             self.search_from = end + 1;
@@ -1333,8 +1334,7 @@ impl SeqGate {
     /// in its token buffer: the stream is certified to `next_end`, the end of the plain record after it,
     /// whose first byte is `buf[to]`.
     fn resume(&mut self, buf: &[u8], to: usize, next_end: usize, token_byte: Option<u8>) {
-        self.token_byte =
-            crate::jq_seq_reader::token_byte_after(&buf[to..next_end]).or(token_byte);
+        self.token_byte = crate::jq_seq_reader::token_byte_after(&buf[to..next_end]).or(token_byte);
         self.checked = next_end;
         self.cand = next_end;
         self.search_from = next_end + 1;
@@ -1435,8 +1435,11 @@ impl WindowedFile {
             return false; // patchcov: coverage tolerate-line reason="defensive: the splitter reads RFC 8259 documents with white space between them as jq's parser does; kept so a disagreement leaves the stretch to the reader's model"
         }
         self.buf[from..to].copy_from_slice(&text);
-        self.notes
-            .extend(walk.warnings.into_iter().map(|(at, line)| (from + at, line)));
+        self.notes.extend(
+            walk.warnings
+                .into_iter()
+                .map(|(at, line)| (from + at, line)),
+        );
         gate.resume(&self.buf, to, next_end, walk.token_byte);
         true
     }
@@ -3096,23 +3099,291 @@ mod tests {
         }
     }
 
-    /// Where the first record of `stream` that is not `RS value LF` opens, found record by record with
-    /// the check [`crate::jq_seq_reader::PlainRecords`] makes, or `None` for a stream that is all plain.
-    fn first_unclean_record(stream: &[u8]) -> Option<usize> {
-        use crate::jq_seq_reader::{PlainGuards, PlainRecords};
+    /// What a `--seq` gate makes of `stream`, worked out over the whole of it (#7322): the text its
+    /// windows hand out, where the stream is handed on from (`None` when it is not), the byte jq's
+    /// token buffer holds there, and the warnings of the stretches the windows carried on after, each
+    /// with where it was met. A record that is not plain ends the windows only when no RS after it
+    /// both starts a line and opens a plain record, or when the stretch up to that RS is one the
+    /// reader's model does not read as RFC 8259 values with white space between them.
+    fn gated(stream: &[u8]) -> (Vec<u8>, Option<usize>, Option<u8>, Vec<(usize, String)>) {
+        use crate::jq_seq_reader::{token_byte_after, walk_stretch, PlainGuards, PlainRecords};
+        let mut text = stream.to_vec();
+        let (mut token, mut warnings) = (None, Vec::new());
         if stream.first() != Some(&RS) {
-            return Some(0);
+            return (Vec::new(), Some(0), token, warnings);
         }
         let mut starts: Vec<usize> = (0..stream.len()).filter(|&i| stream[i] == RS).collect();
         starts.push(stream.len());
-        starts.windows(2).find_map(|pair| {
-            let record = &stream[pair[0] + 1..pair[1]];
-            (!PlainRecords::record_ok(record, PlainGuards::ALL)).then_some(pair[0])
-        })
+        let plain = |i: usize| {
+            PlainRecords::record_ok(&stream[starts[i] + 1..starts[i + 1]], PlainGuards::ALL)
+        };
+        let mut i = 0;
+        while i + 1 < starts.len() {
+            if plain(i) {
+                token = token_byte_after(&stream[starts[i]..starts[i + 1]]).or(token);
+                i += 1;
+                continue;
+            }
+            let from = starts[i];
+            let resumed = (i + 1..starts.len() - 1)
+                .find(|&j| stream[starts[j] - 1] == b'\n' && plain(j))
+                .and_then(|j| {
+                    let to = starts[j];
+                    let lines = count_newlines(&stream[..from]);
+                    let walk = walk_stretch(&stream[from..=to], lines, token)?;
+                    let mut at = from;
+                    for &(start, end) in &walk.values {
+                        succinctly::json::validate::validate(&stream[from + start..from + end])
+                            .ok()?;
+                        blank_between_values(&mut text[at..from + start]);
+                        at = from + end;
+                    }
+                    blank_between_values(&mut text[at..to]);
+                    Some((j, walk))
+                });
+            let Some((j, walk)) = resumed else {
+                text.truncate(from);
+                blank_rs_bytes(&mut text);
+                return (text, Some(from), token, warnings);
+            };
+            warnings.extend(
+                walk.warnings
+                    .into_iter()
+                    .map(|(at, line)| (from + at, line)),
+            );
+            token = walk.token_byte;
+            i = j;
+        }
+        blank_rs_bytes(&mut text);
+        (text, None, token, warnings)
+    }
+
+    /// The streams the gate's tests read: `count` plain records of every kind, then `tail`.
+    fn seq_stream(count: usize, tail: &[u8]) -> Vec<u8> {
+        let record = |i: usize| -> String {
+            match i % 5 {
+                0 => format!("\x1e{{\"id\":{i},\"s\":\"bus\"}}\n"),
+                1 => format!("\x1e[{i},\n  \"\\u0041\"]\n"),
+                2 => format!("\x1e{i}\n"),
+                3 => "\x1enull\n".to_string(),
+                _ => "\x1e\"a\"\n\n".to_string(),
+            }
+        };
+        let records: String = (0..count).map(record).collect();
+        [records.as_bytes(), tail].concat()
+    }
+
+    /// #7322: the windows of a `--seq` stream carry on after a stretch that is not plain records, and
+    /// with what is handed on they are the stream as jq's reader reads it whole: the same values, each
+    /// on the line jq names for it, and the same warnings in the same order, wherever the stretches lie
+    /// (the stream's first record among them) and whatever the reads' size.
+    #[test]
+    fn a_seq_stream_carries_on_after_a_stretch_that_is_not_plain_7322() {
+        use crate::jq_seq_reader::{resumed_stream, seed_token_byte, walk_stream};
+        let walked = |stream: &[u8]| -> (Vec<String>, Vec<(String, usize)>) {
+            let sources = vec![(None, stream.to_vec())];
+            let mut warnings = Vec::new();
+            let walk = walk_stream(&sources, false, &mut |w| warnings.push(w.to_string()));
+            let values = walk
+                .values
+                .iter()
+                .zip(&walk.locations)
+                .map(|(&(start, end), &(_, line))| {
+                    (
+                        String::from_utf8_lossy(&stream[start..end]).into_owned(),
+                        line,
+                    )
+                })
+                .collect();
+            (warnings, values)
+        };
+        let stretches: [&[u8]; 14] = [
+            b"\x1e{\"id\":-1,\"name\":\"cut\n",
+            b"\x1en\n",
+            b"\x1e1 2\n",
+            b"\x1e} 5\n\x1e[1,]\n",
+            b"\x1e12.5\x1e\"x\"\n",
+            b"\x1e\x1e\x1e\n",
+            b"\x1e\"a\" [1,\n2] {\"k\":null}\n",
+            b"\x1enan\n",
+            b"\x1e\"tab\there\"\n",
+            b"\x1e\"\xff\"\n",
+            b"\x1e1\"bu\"\n\x1en\n",
+            b"\x1e[1,2]",
+            b"\x1e\n\n\x1etrue false\n",
+            b"\x1e{\"a\":[1,{\"b\":2}]}}\n",
+        ];
+        let mut resumed_streams = 0;
+        for (n, first) in stretches.iter().enumerate() {
+            for (m, second) in stretches.iter().enumerate() {
+                // Each shape: the stretch first, in the middle, twice, and last.
+                let shapes: [Vec<u8>; 4] = [
+                    [first, seq_stream(7, b"").as_slice()].concat(),
+                    seq_stream(3, &[first, seq_stream(4, second).as_slice()].concat()),
+                    seq_stream(
+                        2,
+                        &[first, seq_stream(1, second).as_slice(), &seq_stream(3, b"")].concat(),
+                    ),
+                    seq_stream(5, first),
+                ];
+                for (shape, stream) in shapes.iter().enumerate() {
+                    if shape != 2 && m != (n + 1) % stretches.len() {
+                        continue;
+                    }
+                    let (text, at, token, warnings) = gated(stream);
+                    resumed_streams += usize::from(!warnings.is_empty());
+                    let want = whole(&text);
+                    for block in [1usize, 7, 64, 4096] {
+                        let mut file = tempfile::tempfile().expect("a temp file");
+                        file.write_all(stream).expect("written");
+                        file.rewind().expect("rewound");
+                        let slot = SeqTailSlot::default();
+                        let mut reader = WindowedFile::from_seq_pipe(
+                            Rc::new(file),
+                            Vec::new(),
+                            block,
+                            Rc::clone(&slot),
+                        );
+                        let (mut spans, mut lines, mut notes) =
+                            (Vec::new(), Vec::new(), Vec::new());
+                        // What a run shows, in its order: each warning before the first value that
+                        // starts after it.
+                        let mut shown = Vec::new();
+                        while let Some(window) = reader.next_window().expect("reads") {
+                            let mut counter = LineCounter::new(window.raw);
+                            counter.set_lines_before(window.lines_before);
+                            let mut met = window.notes.iter().peekable();
+                            for &(start, end) in &window.values {
+                                while let Some((_, line)) = met.next_if(|&&(at, _)| at < start) {
+                                    shown.push(line.clone());
+                                }
+                                let text = String::from_utf8_lossy(&window.raw[start..end]);
+                                shown.push(format!("{text} at {}", counter.read_end_line(end)));
+                                spans.push((window.offset + start, window.offset + end));
+                                lines.push(counter.read_end_line(end));
+                            }
+                            shown.extend(met.map(|(_, line)| line.clone()));
+                            notes.extend(
+                                window
+                                    .notes
+                                    .iter()
+                                    .map(|(at, line)| (window.offset + at, line.clone())),
+                            );
+                            assert_eq!(window.split_error, None);
+                        }
+                        let case = format!("{:?}, block {block}", String::from_utf8_lossy(stream));
+                        assert_eq!(
+                            (spans, lines),
+                            (want.spans.clone(), want.lines.clone()),
+                            "{case}"
+                        );
+                        assert_eq!(notes, warnings, "{case}");
+                        let handed = slot.borrow_mut().take();
+                        assert_eq!(handed.is_some(), at.is_some(), "{case}");
+                        // The run as jq's reader reads the stream whole.
+                        let mut jq_shown = Vec::new();
+                        {
+                            let sources = vec![(None, stream.clone())];
+                            let mut events: Vec<(usize, String)> = Vec::new();
+                            let walk = crate::jq_seq_reader::walk_stream_collecting_at(
+                                &sources,
+                                false,
+                                false,
+                                crate::jq_seq_reader::Tail::Opened,
+                                &mut |warning, at| events.push((at, warning.to_string())),
+                            );
+                            let mut events = events.into_iter().peekable();
+                            for (&(start, end), &(_, line)) in
+                                walk.values.iter().zip(&walk.locations)
+                            {
+                                while let Some((_, warning)) = events.next_if(|&(at, _)| at < start)
+                                {
+                                    jq_shown.push(warning);
+                                }
+                                let text = String::from_utf8_lossy(&stream[start..end]);
+                                jq_shown.push(format!("{text} at {line}"));
+                            }
+                            jq_shown.extend(events.map(|(_, warning)| warning));
+                        }
+                        if let Some(handed) = handed {
+                            let at = at.expect("checked");
+                            assert_eq!(
+                                handed.stream,
+                                resumed_stream(
+                                    count_newlines(&stream[..at]),
+                                    stream[at..].to_vec()
+                                ),
+                                "{case}"
+                            );
+                            assert_eq!(handed.token_byte, token, "{case}");
+                            seed_token_byte(handed.token_byte);
+                            let (tail_warnings, tail_values) = walked(&handed.stream);
+                            seed_token_byte(None);
+                            // The tail's warnings and values, in the order the whole walk has them.
+                            let tail_shown = &jq_shown[shown.len()..];
+                            let mut tail_events: Vec<&String> = tail_shown.iter().collect();
+                            tail_events.sort();
+                            let mut tail_made: Vec<String> = tail_warnings
+                                .into_iter()
+                                .chain(
+                                    tail_values
+                                        .iter()
+                                        .map(|(text, line)| format!("{text} at {line}")),
+                                )
+                                .collect();
+                            tail_made.sort();
+                            assert_eq!(tail_made.iter().collect::<Vec<_>>(), tail_events, "{case}");
+                            assert_eq!(shown, jq_shown[..shown.len()], "{case}");
+                        } else {
+                            assert_eq!(shown, jq_shown, "{case}");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(resumed_streams > 40, "{resumed_streams}");
+    }
+
+    /// #7322: a stretch with no plain record after it within the gate's look-ahead is handed on with the
+    /// rest of the stream, as every record that is not plain was.
+    #[test]
+    fn a_stretch_longer_than_the_look_ahead_is_handed_on_7322() {
+        let gate = |stream: &[u8]| {
+            let mut gate = SeqGate::new(SeqTailSlot::default());
+            gate.advance(stream, false)
+        };
+        let records = seq_stream(3, b"");
+        let near = [
+            records.as_slice(),
+            b"\x1e\"",
+            &vec![b'x'; MAX_SEQ_STRETCH - 100],
+            b"\n\x1e1\n\x1e2\n",
+        ]
+        .concat();
+        assert!(matches!(gate(&near), GateStep::Stretch { from, .. } if from == records.len()));
+        let far = [
+            records.as_slice(),
+            b"\x1e\"",
+            &vec![b'x'; MAX_SEQ_STRETCH],
+            b"\n\x1e1\n\x1e2\n",
+        ]
+        .concat();
+        assert!(matches!(gate(&far), GateStep::Unclean(at) if at == records.len()));
+        // The same while the record after a bad one is still being read, with no RS after it yet.
+        let open = [
+            records.as_slice(),
+            b"\x1e[1,]\n\x1e\"",
+            &vec![b'x'; MAX_SEQ_STRETCH],
+        ]
+        .concat();
+        assert!(matches!(gate(&open), GateStep::Unclean(at) if at == records.len()));
+        let short = [records.as_slice(), b"\x1e[1,]\n\x1e\"", &vec![b'x'; 1000]].concat();
+        assert!(matches!(gate(&short), GateStep::Clean(at) if at == records.len()));
     }
 
     /// #7164: a `--seq` pipe hands out the documents and lines of its plain records, with each RS read as a
-    /// space, and hands on the stream from its first record that is not plain: its bytes as read, the
+    /// space, and hands on the stream from its first record that is not plain and has no plain record at
+    /// a line start after it (#7322): its bytes as read, the
     /// line breaks before it and the byte jq's token buffer holds there. Whatever the reads' size and
     /// wherever the probe's front ends, the windows are those of the plain records read whole.
     #[test]
@@ -3141,10 +3412,8 @@ mod tests {
             for tail in tails {
                 for front in [b"".as_slice(), b"\xef\xbb\xbf", b"x"] {
                     let stream = [front, records.as_bytes(), tail].concat();
-                    let at = first_unclean_record(&stream);
-                    let clean = &stream[..at.unwrap_or(stream.len())];
-                    let mut blanked = clean.to_vec();
-                    blank_rs_bytes(&mut blanked);
+                    // #7322: the windows carry on after a stretch with plain records after it.
+                    let (blanked, at, token, _) = gated(&stream);
                     let want = whole(&blanked);
                     for block in [1usize, 3, 17, 4096] {
                         for probe in [0, 1, stream.len() / 2, stream.len()] {
@@ -3189,11 +3458,7 @@ mod tests {
                                         ),
                                         "{case}"
                                     );
-                                    assert_eq!(
-                                        handed.token_byte,
-                                        crate::jq_seq_reader::token_byte_after(&stream[..at]),
-                                        "{case}"
-                                    );
+                                    assert_eq!(handed.token_byte, token, "{case}");
                                     assert!(handed.error.is_none(), "{case}");
                                     // #7262: a regular file's tail is read into room reserved for all
                                     // of it, behind the front: one allocation, never grown or copied.
