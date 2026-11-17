@@ -3935,6 +3935,14 @@ mod tests {
         // A plain record still being read, with no RS after it yet, is waited for.
         let pending = [records.as_slice(), b"\x1e{\"a\":", &vec![b'1'; 1000]].concat();
         assert!(matches!(gate(&pending), GateStep::Clean(at) if at == records.len()));
+        // One still being read past the longest record held for it is handed on.
+        let huge = [
+            records.as_slice(),
+            b"\x1e\"",
+            &vec![b'x'; MAX_PENDING_RECORD + 1],
+        ]
+        .concat();
+        assert!(matches!(gate(&huge), GateStep::Unclean(at) if at == records.len()));
         // Bad records, one a line, for longer than a piece: cut before the one that would take it past.
         let bad_record = b"\x1e[1,]\n";
         let bad: Vec<u8> = bad_record.repeat(SEQ_STRETCH_PIECE / bad_record.len() + 10);
