@@ -11790,10 +11790,13 @@ fn windowed_seq_file(args: &JqCommand) -> Option<WindowedSource> {
         ));
     }
     let plain = reread.plain_seq_files();
-    if files.len() > 1 && (1..files.len()).contains(&plain) {
+    // #7341: the first file not plain may be the first of all: the files from it are judged as the run
+    // reaches them, and one that opens with an RS is read by a gate of its own.
+    if files.len() > 1 && plain < files.len() {
         // #7279: several files the run holds, the first `plain` of them plain records ending in an LF: those
-        // are read a window at a time, and from the first that is not the stream is the whole-file
-        // route's, as for a long list ([`hand_on_seq_files_tail`]).
+        // are read a window at a time, and the ones from the first that is not are judged as the run
+        // reaches them, as for a long list; what is not read so is the whole-file route's
+        // ([`hand_on_seq_files_tail`]).
         let slot = window::SeqFilesTailSlot::default();
         SEQ_FILES_TAIL.with(|tail| *tail.borrow_mut() = Some(std::rc::Rc::clone(&slot)));
         reread.blank_rs();
@@ -11822,7 +11825,7 @@ fn windowed_seq_file(args: &JqCommand) -> Option<WindowedSource> {
 /// carry on after, the rest is read and handed to the route that walks a stream whole
 /// ([`hand_on_seq_pipe_tail`]), where jq's reader stands after the records already run. A stream that is
 /// not plain from its first byte is handed on whole, as that route would have read it. Several files are
-/// the whole-file route's still: what a tail mid-file means for the files after it is not worked out.
+/// [`window::WindowedFiles::stopping_seq_files_at`]'s, which gives such a file a gate of its own (#7341).
 #[cfg(unix)]
 fn gated_seq_source(files: Vec<PathBuf>) -> Option<WindowedSource> {
     use std::io::Seek;
@@ -11830,7 +11833,7 @@ fn gated_seq_source(files: Vec<PathBuf>) -> Option<WindowedSource> {
         // A duplicate of descriptor 0, at the offset the prepass (which reads by position) left alone.
         [] => stdin_to_window()?.0,
         [path] => std::fs::File::open(path).ok()?,
-        _ => return None,
+        _ => return None, // patchcov: coverage tolerate-line reason="unreachable: several files go to stopping_seq_files_at before this is asked (#7341)"
     };
     // A file the whole-file route could not hold (a sparse file of terabytes) is that route's to report,
     // as it reads it before it runs anything (`Could not open file ...: out of memory`): read here, the
@@ -12266,13 +12269,34 @@ fn hand_on_seq_files_tail(args: &JqCommand, past_open_failure: bool) -> bool {
         raws.push(crate::jq_seq_reader::resumed_stream(tail.lines, Vec::new()));
     }
     let front = files.len();
-    let (rest, rest_raws, failures) = read_input_files(&named[tail.index..], false);
+    // #7341: a file a gate of its own read up to a stretch it could not carry on after goes as the rest
+    // of it, from that stretch, behind the front that resumes jq's reader after its lines before it; the
+    // files after it are read by path.
+    let mut failures = Vec::new();
+    let from = match tail.front {
+        Some(rest) => {
+            let path = &named[tail.index];
+            // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
+            if let Some(error) = &rest.error {
+                let last = tail.index + 1 == named.len();
+                failures.push((front + 1, InputFileOpenError::from_io(path, error, last)));
+            }
+            // patchcov: coverage end
+            files.push(path.clone());
+            raws.push(rest.stream);
+            tail.index + 1
+        }
+        None => tail.index,
+    };
+    let at = files.len();
+    let (rest, rest_raws, rest_failures) = read_input_files(&named[from..], false);
     files.extend(rest);
     raws.extend(rest_raws);
-    let failures = failures
-        .into_iter()
-        .map(|(at, failure)| (at + front, failure))
-        .collect();
+    failures.extend(
+        rest_failures
+            .into_iter()
+            .map(|(at_file, failure)| (at_file + at, failure)),
+    );
     if past_open_failure {
         FIRST_OPEN_FAILURE_AT.with(|first| first.set(Some(front)));
     }
@@ -22612,9 +22636,10 @@ mod tests {
         let cut = write("cut.seq", &records[..records.len() - 1]);
         assert!(!takes(&["jq", "--seq", ".", &good, &cut]));
         assert!(!takes(&["jq", "--seq", ".", &cut, &good]));
-        // #7279: the files before the first that is not are read a window at a time, and from that one
-        // the stream is the whole-file route's ([`hand_on_seq_files_tail`]); a list whose first file is
-        // not plain is that route's from its start.
+        // #7279: the files before the first that is not are read a window at a time. #7341: that one,
+        // which opens with an RS, is read by a gate of its own up to its last record (cut short), and the
+        // rest of it, with the files after it, is the whole-file route's ([`hand_on_seq_files_tail`]);
+        // a list whose first file is the one is read so from its start.
         let stops_at = |argv: &[&str]| {
             let cmd = JqCommand::try_parse_from(argv.iter().copied()).unwrap();
             let (_, mut reader, _) = windowed_seq_file(&cmd)?;
@@ -22631,13 +22656,16 @@ mod tests {
         let lines = records.iter().filter(|&&b| b == b'\n').count();
         assert_eq!(
             stops_at(&["jq", "--seq", ".", &good, &cut]),
-            Some((n, 1, lines))
+            Some((2 * n - 1, 1, lines))
         );
         assert_eq!(
             stops_at(&["jq", "--seq", ".", &good, &good, &cut, &good]),
-            Some((2 * n, 2, 2 * lines))
+            Some((3 * n - 1, 2, 2 * lines))
         );
-        assert_eq!(stops_at(&["jq", "--seq", ".", &cut, &good]), None);
+        assert_eq!(
+            stops_at(&["jq", "--seq", ".", &cut, &good]),
+            Some((n - 1, 0, 0))
+        );
         // ... and not read as a pipe is either: a lone source only.
         assert!(!gates(&["jq", "--seq", ".", &good, &cut]));
         assert!(gates(&["jq", "--seq", ".", &cut]));

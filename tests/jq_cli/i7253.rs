@@ -199,3 +199,11 @@ fn the_file_after_one_that_did_not_open_is_the_one_handed_on_7253() -> Result<()
 fn plain_files_between_the_failure_and_the_handed_on_file_7253() -> Result<()> {
     pinned("plain files between", &[GONE + 3])
 }
+
+/// (c) #7341: the file that is not plain records comes before the one that is gone, so the files from it are
+/// handed to the route that reads them whole, which meets the failure when it reads them by path and reports
+/// it after the files before it (`hand_on_seq_files_tail` places it past the handed-on front).
+#[test]
+fn a_file_gone_past_the_handed_on_one_is_reported_by_that_route_7341() -> Result<()> {
+    pinned("hand-off file before", &[GONE - 2])
+}
