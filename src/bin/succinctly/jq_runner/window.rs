@@ -5450,11 +5450,9 @@ mod stream_tests {
             (1, doc("{\n}")),
         ];
         for (name, turn) in [
-            ("no final LF", b"\x1e3\n\x1e4".to_vec()),
             ("no RS to start", b"3\n".to_vec()),
             ("empty", Vec::new()),
             ("a BOM", b"\xef\xbb\xbf\x1e3\n".to_vec()),
-            ("a record that is no document", b"\x1e3\n\x1e{\n".to_vec()),
         ] {
             let mut files = plain.to_vec();
             files.push(turn);
@@ -5472,6 +5470,54 @@ mod stream_tests {
                 "{name}"
             );
         }
+        // #7341: a file that opens with an RS is read by a gate of its own: its plain records are, and
+        // the rest of it, from a stretch that runs to its end, is handed on as its bytes behind the front
+        // that resumes jq's reader after its line before it.
+        for (name, turn, rest) in [
+            ("no final LF", b"\x1e3\n\x1e4".to_vec(), b"\x1e4".to_vec()),
+            (
+                "a record that is no document",
+                b"\x1e3\n\x1e{\n".to_vec(),
+                b"\x1e{\n".to_vec(),
+            ),
+        ] {
+            let mut files = plain.to_vec();
+            files.push(turn);
+            files.push(b"\x1e5\n".to_vec());
+            let (docs, tail) = seq_named_run(dir.path(), &files, &[]);
+            let mut read = read_of_plain.clone();
+            read.push((2, doc("3")));
+            assert_eq!(docs, read, "{name}");
+            assert_eq!(
+                tail,
+                Some(SeqFilesTail {
+                    index: 2,
+                    lines: 5,
+                    // The `3` the file's gate read ends jq's token with a NUL at index 1.
+                    token_byte: Some(0),
+                    front: Some(SeqFront {
+                        stream: crate::jq_seq_reader::resumed_stream(1, rest),
+                        error: None,
+                    }),
+                }),
+                "{name}"
+            );
+        }
+        // A file with a stretch it carries on past is read to its end, and the files after it are.
+        let mut files = plain.to_vec();
+        files.push(b"\x1enan\n\x1e} 6\n\x1e7\n".to_vec());
+        files.push(b"\x1e\"cd\"\n".to_vec());
+        let (docs, tail) = seq_named_run(dir.path(), &files, &[]);
+        let mut read = read_of_plain.clone();
+        // jq's reader warns at the `}` and reads the `6` after it.
+        read.extend([
+            (2, doc("nan")),
+            (2, doc("6")),
+            (2, doc("7")),
+            (3, doc("\"cd\"")),
+        ]);
+        assert_eq!(docs, read);
+        assert_eq!(tail, None);
         // Every file plain: nothing is handed on.
         let mut files = plain.to_vec();
         files.push(b"\x1e5\n".to_vec());
