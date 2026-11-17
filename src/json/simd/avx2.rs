@@ -117,15 +117,50 @@ impl BlockMasks for Avx2 {
 /// data-dependent branches per byte. It was 1.2x (all-backslash strings) to about
 /// 50x (long strings) slower, and its speed on a Ryzen 9 7950X moved by up to 10% with
 /// where unrelated changes placed it; this kernel's moves by 1-4%.
+///
+/// Safe to call on any x86_64 CPU: without AVX2 it builds the identical index
+/// with the SSE2 builder, [`super::x86::build_semi_index_standard`]. AVX2 is
+/// detected at run time with the `std` feature; without it, only a build that
+/// enables `avx2` at compile time uses it.
 #[cfg(target_arch = "x86_64")]
 pub fn build_semi_index_standard(json: &[u8]) -> SemiIndex {
-    // SAFETY: Caller must ensure AVX2 is available
-    unsafe { build_semi_index_standard_avx2(json) }
+    if avx2_available() {
+        // SAFETY: the CPU implements AVX2, which `avx2_available` just checked.
+        unsafe { build_semi_index_standard_avx2(json) }
+    } else {
+        super::x86::build_semi_index_standard(json)
+    }
 }
 
+/// Is AVX2 usable here?
+///
+/// With `std`, a runtime check (`is_x86_feature_detected!`, one cached load).
+/// Without it there is no runtime detection, so only a build that enables
+/// `avx2` at compile time (`-C target-feature=+avx2` or a `target-cpu` that has
+/// it) uses AVX2; every other `no_std` build takes the SSE2 builder, which SSE2
+/// being part of the x86_64 baseline makes safe everywhere (#7317).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn avx2_available() -> bool {
+    #[cfg(any(test, feature = "std"))]
+    {
+        is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(any(test, feature = "std")))]
+    {
+        cfg!(target_feature = "avx2")
+    }
+}
+
+/// [`build_semi_index_standard`] without the AVX2 check, for the dispatcher in
+/// `json::simd`, which has already made it.
+///
+/// # Safety
+///
+/// The CPU must implement AVX2.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn build_semi_index_standard_avx2(json: &[u8]) -> SemiIndex {
+pub(super) unsafe fn build_semi_index_standard_avx2(json: &[u8]) -> SemiIndex {
     // SAFETY: this function's own `avx2` feature is `Avx2`'s.
     unsafe { super::step::build_semi_index_standard::<Avx2>(json) }
 }
@@ -208,15 +243,29 @@ fn process_chunk_simple(
 ///
 /// Processes 32 bytes at a time using x86_64 AVX2 instructions for character
 /// classification, then processes the state machine transitions.
+///
+/// Safe to call on any x86_64 CPU: without AVX2 it builds the identical index
+/// with the SSE2 builder, [`super::x86::build_semi_index_simple`], detecting
+/// AVX2 as [`build_semi_index_standard`] does.
 #[cfg(target_arch = "x86_64")]
 pub fn build_semi_index_simple(json: &[u8]) -> SimpleSemiIndex {
-    // SAFETY: Caller must ensure AVX2 is available
-    unsafe { build_semi_index_simple_avx2(json) }
+    if avx2_available() {
+        // SAFETY: the CPU implements AVX2, which `avx2_available` just checked.
+        unsafe { build_semi_index_simple_avx2(json) }
+    } else {
+        super::x86::build_semi_index_simple(json)
+    }
 }
 
+/// [`build_semi_index_simple`] without the AVX2 check, for the dispatcher in
+/// `json::simd`, which has already made it.
+///
+/// # Safety
+///
+/// The CPU must implement AVX2.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn build_semi_index_simple_avx2(json: &[u8]) -> SimpleSemiIndex {
+pub(super) unsafe fn build_semi_index_simple_avx2(json: &[u8]) -> SimpleSemiIndex {
     unsafe {
         let word_capacity = json.len().div_ceil(64);
         let mut ib = BitWriter::with_capacity(word_capacity);
@@ -274,6 +323,47 @@ mod tests {
         (0..n)
             .map(|i| if get_bit(words, i) { '1' } else { '0' })
             .collect()
+    }
+
+    /// #7317: the public builders are safe `fn`s, so they must be sound on every
+    /// x86_64 CPU. Unlike the tests below, this one has no `is_x86_feature_detected!`
+    /// skip: without AVX2 it runs the SSE2 fallback, with it the AVX2 kernel, and
+    /// either way the index must be the scalar builder's.
+    #[test]
+    fn safe_builders_need_no_avx2_check_and_match_scalar() {
+        // Still safe `fn`s with these signatures (the fix is not a breaking change).
+        let standard: fn(&[u8]) -> SemiIndex = build_semi_index_standard;
+        let simple: fn(&[u8]) -> SimpleSemiIndex = build_semi_index_simple;
+
+        let long_string = format!(
+            r#"{{"k":"{}","n":[1,2,{{"x":null}}]}}"#,
+            "a\\\"b".repeat(40)
+        );
+        let corpus: [&[u8]; 9] = [
+            b"",
+            b"{}",
+            br#"{"a":"b"}"#,
+            br#"[1, 2.5, -3e7, true, false, null, "s"]"#,
+            br#"{"esc":"a\"b\\c\u00e9","nested":{"deep":[[[{}]]]}}  "#,
+            br#"{"exactly thirty-two bytes!!":0}"#,
+            br#"{"unterminated": "string \"#,
+            b"   \n\t [ {\"a\" : [ ] } , \"\\\\\" ]   ",
+            long_string.as_bytes(),
+        ];
+        for json in corpus {
+            let name = String::from_utf8_lossy(json);
+            let got = standard(json);
+            let want = crate::json::standard::build_semi_index(json);
+            assert_eq!(got.ib, want.ib, "standard IB: {name}");
+            assert_eq!(got.bp, want.bp, "standard BP: {name}");
+            assert_eq!(got.state, want.state, "standard state: {name}");
+
+            let got = simple(json);
+            let want = crate::json::simple::build_semi_index(json);
+            assert_eq!(got.ib, want.ib, "simple IB: {name}");
+            assert_eq!(got.bp, want.bp, "simple BP: {name}");
+            assert_eq!(got.state, want.state, "simple state: {name}");
+        }
     }
 
     #[test]

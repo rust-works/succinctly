@@ -113,7 +113,9 @@ pub use neon::build_semi_index_standard;
 #[cfg(all(target_arch = "x86_64", any(test, feature = "std")))]
 pub fn build_semi_index_standard(json: &[u8]) -> crate::json::standard::SemiIndex {
     if is_x86_feature_detected!("avx2") {
-        avx2::build_semi_index_standard(json)
+        // SAFETY: AVX2 was just detected. The unchecked builder, not the safe
+        // `avx2::build_semi_index_standard`, so the check is made once (#7317).
+        unsafe { avx2::build_semi_index_standard_avx2(json) }
     } else {
         x86::build_semi_index_standard(json)
     }
@@ -122,14 +124,16 @@ pub fn build_semi_index_standard(json: &[u8]) -> crate::json::standard::SemiInde
 #[cfg(all(target_arch = "x86_64", any(test, feature = "std")))]
 pub fn build_semi_index_simple(json: &[u8]) -> crate::json::simple::SemiIndex {
     if is_x86_feature_detected!("avx2") {
-        avx2::build_semi_index_simple(json)
+        // SAFETY: AVX2 was just detected (see `build_semi_index_standard`).
+        unsafe { avx2::build_semi_index_simple_avx2(json) }
     } else {
         x86::build_semi_index_simple(json)
     }
 }
 
-// Without std feature, default to SSE2 (universally available on x86_64)
-// Users can explicitly use the avx2:: module if they know CPU capabilities
+// Without std feature, default to SSE2 (universally available on x86_64).
+// `avx2::build_semi_index_*` use AVX2 in a no_std build only when it is enabled
+// at compile time, and fall back to SSE2 otherwise.
 #[cfg(all(target_arch = "x86_64", not(any(test, feature = "std"))))]
 pub use x86::build_semi_index_simple;
 
