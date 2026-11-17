@@ -1466,23 +1466,25 @@ impl Job<'_> {
         // Only white space has been dropped past the boundary: the parser stands at the text's start.
         let mut at = (*resume).max(self.offset) - self.offset;
         let mut fault = None;
+        // `JobText`'s `Deref` is a match and, for a held buffer, a bounds check: take it once, not per document (#7313).
+        let text: &[u8] = &self.text;
         for &(start, end) in &self.values {
-            let certified = succinctly::json::validate::Validator::new(&self.text[start..end])
+            let certified = succinctly::json::validate::Validator::new(&text[start..end])
                 .with_max_depth(CERTIFIED_DEPTH)
                 .validate()
                 .is_ok();
             if certified {
-                at = self.boundary_after(start, end);
+                at = Self::boundary_after(text, start, end);
                 continue;
             }
             // One read by jq's parser, from the last boundary to the end of the window, covers this
             // document and every one after it, so a window costs one such read at most whatever it
             // holds (a stream of `NaN`s is read at the parser's speed, not once a document).
-            match self.read_from(at, self.text.len()) {
+            match self.read_from(at, text.len()) {
                 Err(message) => fault = Some(message),
                 Ok(_) => {
                     if let Some(&(start, end)) = self.values.last() {
-                        at = self.boundary_after(start, end);
+                        at = Self::boundary_after(text, start, end);
                     }
                 }
             }
@@ -1498,8 +1500,8 @@ impl Job<'_> {
     /// Where jq's parser stands at a boundary once the document at `start..end` is read: after it for a
     /// container or string, and at its start for a number or literal, whose bytes the parser holds
     /// until the byte that ends it.
-    fn boundary_after(&self, start: usize, end: usize) -> usize {
-        if opens_container_or_string(self.text[start]) {
+    fn boundary_after(text: &[u8], start: usize, end: usize) -> usize {
+        if opens_container_or_string(text[start]) {
             end
         } else {
             start
