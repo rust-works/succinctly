@@ -130,10 +130,11 @@ pub fn original_offset(edits: &[SubstitutionEdit], at: usize) -> usize {
     }
 }
 
-/// The offset in the text the substitution made of `raw`, an offset in the document: the inverse of
-/// [`original_offset`] (#7341). It moves by the edits before it, and an offset inside an edit's bytes
-/// is where that edit's replacement starts, as `original_offset` takes an offset inside a replacement
-/// to where the bytes it replaced start.
+/// The offset in the substituted text of `raw`, an offset in the document (#7341).
+///
+/// The inverse of [`original_offset`]: it moves by the edits before it, and an offset inside an
+/// edit's bytes is where that edit's replacement starts, as `original_offset` takes an offset inside
+/// a replacement to where the bytes it replaced start.
 pub fn substituted_offset(edits: &[SubstitutionEdit], raw: usize) -> usize {
     let before = edits.partition_point(|edit| edit.raw.end <= raw);
     match edits.get(before) {

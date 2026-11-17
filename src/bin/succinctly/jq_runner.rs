@@ -22216,7 +22216,7 @@ mod tests {
         let cut: &[u8] = b"\x1e{\"cut\":\"x\n";
         // #7341: a line that draws more warnings than a stretch's walk keeps is one the windows
         // cannot carry on after (`nan` was, until then).
-        let warns: Vec<u8> = [b"\x1e".as_slice(), &[b'}'; 70_000], b"\n"].concat();
+        let warns: Vec<u8> = [b"\x1e".as_slice(), &vec![b'}'; 70_000], b"\n"].concat();
         for (name, at, bad) in [
             ("last", records.len(), cut),
             ("middle", records.len() / 2, warns.as_slice()),
