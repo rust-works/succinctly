@@ -338,7 +338,7 @@ A chunk that does hold a newline is handed to the parser whole, so the same NUL 
 The input's last chunk, the only one of a short file without a trailing newline, is the case that loses data.
 `succinctly jq` reads the text as it is and reports the NUL as a parse error in both cases.
 This is jq discarding the input after the NUL with exit status 0, so the divergence stands under [ADR-0018](../../adrs/adr-0018.md) rather than being matched.
-The `--seq` reader has the same quirk, recorded above.
+The `--seq` reader matches jq instead (#7340), as it matches jq's other silent drops there (#2998): a `--seq` stream is one jq reads past its faults by design, with no exit status to report them.
 
 Rows from `printf '<text>' | jq -c .` (a NUL is `\0`), jq 1.7.1 against `succinctly jq`:
 
@@ -10207,16 +10207,10 @@ over the substituted stream. Outside a string, jq's short-tail rule could fold a
 lead byte *and* the RS or whitespace after it into one U+FFFD, so
 `printf '\xe0\x1e"a"\n' | succinctly jq --seq -c .` printed nothing where jq prints `"a"`.
 
-One `--seq` divergence remains, an artifact of jq's 4096-byte `fgets` *line reader* rather
-than its parser, and unreachable from a newline-free chunk:
-
-* `jq_util_input_read_more` measures each chunk with `strlen`, so a NUL byte truncates the
-  input — only in a chunk holding no newline. `printf '\x1eA+\x008e'` reports at column 3
-  in real jq (which stopped at the NUL) and column 6 here.
-
-Running the sweep with `--expect-artifacts` puts this shape back -- attributable, and the
-only one left. The `--seq` reader's own non-slurp end-of-stream rule, described just below,
-no longer needs that flag: the corpus generates it unconditionally now that it is modeled.
+A NUL byte is matched too, since [#7340](https://github.com/rust-works/succinctly/issues/7340).
+`jq_util_input_read_more` measures an `fgets` chunk that holds no newline with `strlen`, so jq's parser never sees the chunk from its first NUL on (`printf '\x1eA+\x008e'` reports at column 3, where succinctly said column 6), and `check_literal` reads a number token as a C string, so a NUL in one ends the number (`\x1e1\x00\n` is the value `1`, where succinctly warned and dropped it).
+The sweep's alphabet holds a NUL, and `--long` generates the lines past a 4095-byte chunk that put one inside an open value.
+The `--seq` reader's own non-slurp end-of-stream rule, described just below, is in the corpus unconditionally too, now that it is modeled.
 
 ### jq's stream can end silently, mid-buffer, with nothing to explain it (#2998)
 

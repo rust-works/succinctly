@@ -358,6 +358,14 @@ script = "scripts/jq-seq-oracle-sweep.py"
 args = ["--oracle", "{jq}", "--slurp-location", "{subject}"]
 timeout_s = 300
 
+# #7340: lines past jq's 4095-byte `fgets` chunk with NUL bytes in them, so that jq's `strlen` cut
+# lands inside a value. About 1,000 streams of 4-13 KB.
+[[sweep]]
+id = "seq-long"
+script = "scripts/jq-seq-oracle-sweep.py"
+args = ["--oracle", "{jq}", "--long", "--cases", "500", "{subject}"]
+timeout_s = 300
+
 [[sweep]]
 id = "seq-door"
 script = "scripts/jq-seq-door-sweep.py"

@@ -7596,6 +7596,8 @@ fn read_inputs(
     // finds no value but records the `Unfinished abandoned text` fault `input` raises
     // (#5636, #5640).
     let mut seq_values: Vec<(usize, usize)> = Vec::new();
+    // The bytes inside those ranges that are not part of the values (`SeqStreamWalk::cuts`, #7340).
+    let mut seq_cuts: Vec<(usize, usize)> = Vec::new();
     // And each value's `(source index, line)` from the same walk (#3250).
     let mut seq_value_locations: Vec<(usize, usize)> = Vec::new();
     // The walk's diagnostics, kept only where `input`/`inputs` raise them ([`seq_faults_queued`]):
@@ -7706,6 +7708,7 @@ fn read_inputs(
                     )
                 };
                 seq_values = walk.values;
+                seq_cuts = walk.cuts;
                 seq_value_locations = walk.locations;
                 seq_deferred_warning = walk.deferred_warning;
                 seq_fault_errors = seq_fault_errors_of(walk.faults, &raw_bytes, args.slurp);
@@ -7726,6 +7729,7 @@ fn read_inputs(
             &mut |_| {},
         );
         seq_values = walk.values;
+        seq_cuts = walk.cuts;
         seq_value_locations = walk.locations;
         // `input`/`inputs` raise what a plain run only warns about (#5640).
         seq_fault_errors = seq_fault_errors_of(walk.faults, &raw_bytes, args.slurp);
@@ -8386,6 +8390,7 @@ fn read_inputs(
             *slot.borrow_mut() = Some(LazySeqInputs::new(
                 seq_raw,
                 std::mem::take(&mut seq_values),
+                std::mem::take(&mut seq_cuts),
                 &seq_value_locations,
                 std::mem::take(&mut resumed_errors),
             ));
@@ -8394,6 +8399,7 @@ fn read_inputs(
         values = build_seq_values(
             &seq_raw,
             &seq_values,
+            &seq_cuts,
             &seq_value_locations,
             &mut locations,
             args.slurp,
@@ -15404,6 +15410,8 @@ struct LazySeqInputs {
     first_invalid: usize,
     /// Each record's `(start, end)` in `combined`.
     ranges: Vec<(usize, usize)>,
+    /// The bytes of `combined` that are not part of any record (`SeqStreamWalk::cuts`, #7340).
+    cuts: Vec<(usize, usize)>,
     /// `(source tag, line)` of every record, as jq's reader stood when it yielded it.
     places: Vec<(u32, u32)>,
     /// The reader's faults, each with how many records come before it.
@@ -15418,6 +15426,7 @@ impl LazySeqInputs {
     fn new(
         mut sources: Vec<(Option<usize>, Vec<u8>)>,
         ranges: Vec<(usize, usize)>,
+        cuts: Vec<(usize, usize)>,
         value_locations: &[(usize, usize)],
         errors: Vec<(usize, TrailingParseError)>,
     ) -> Self {
@@ -15446,6 +15455,7 @@ impl LazySeqInputs {
             first_invalid: first_invalid_utf8(&combined),
             combined,
             ranges,
+            cuts,
             places,
             errors: errors.into_iter().peekable(),
             next: 0,
@@ -15473,7 +15483,9 @@ impl LazySeqInputs {
             let (source, line) = self.places[self.next];
             self.next += 1;
             // A record the checked materializer refuses is dropped, with its place.
-            if let Some(value) = seq_record_value(&self.combined, self.first_invalid, start, end) {
+            if let Some(value) =
+                seq_record_value(&self.combined, self.first_invalid, start, end, &self.cuts)
+            {
                 return Some(jq::ProducedInput::Document(value, source, line));
             }
         }
@@ -15877,7 +15889,8 @@ fn seq_stream_walked_as_plain_json_with(
             return Err(($raw, kept.then(|| Box::new($walk))))
         };
     }
-    if warned || deferred || position_lost || values.is_empty() {
+    // #7340: a stream with bytes inside its values that are not part of them is never plain.
+    if warned || deferred || position_lost || values.is_empty() || !walk.cuts.is_empty() {
         not_plain!(raw, walk);
     }
     // `-s` wraps the values in one array, which is a level more than the deepest value has: a
@@ -16934,6 +16947,8 @@ fn build_seq_values(
     // `jq_seq_reader::SeqStreamWalk::values` for these same sources: raw
     // offsets into their concatenation.
     ranges: &[(usize, usize)],
+    // `jq_seq_reader::SeqStreamWalk::cuts` for these ranges (#7340).
+    cuts: &[(usize, usize)],
     // `jq_seq_reader::SeqStreamWalk::locations`, parallel to `ranges`: each
     // value's `(source index, line)` as jq reports it (#3250).
     value_locations: &[(usize, usize)],
@@ -16953,7 +16968,7 @@ fn build_seq_values(
             std::borrow::Cow::Owned(all)
         }
     };
-    let parsed = seq_values_with_indices(&combined, ranges);
+    let parsed = seq_values_with_indices(&combined, ranges, cuts);
 
     if !slurp {
         debug_assert_eq!(
@@ -17129,13 +17144,17 @@ fn remap_ends_to_locations<S: AsRef<[u8]>>(
 /// reader decides on.
 ///
 /// [`jq_seq_reader::walk_stream`]: crate::jq_seq_reader::walk_stream
-fn seq_values_with_indices(combined: &[u8], ranges: &[(usize, usize)]) -> Vec<(OwnedValue, usize)> {
+fn seq_values_with_indices(
+    combined: &[u8],
+    ranges: &[(usize, usize)],
+    cuts: &[(usize, usize)],
+) -> Vec<(OwnedValue, usize)> {
     let first_invalid = first_invalid_utf8(combined);
     ranges
         .iter()
         .enumerate()
         .filter_map(|(index, &(start, end))| {
-            seq_record_value(combined, first_invalid, start, end).map(|value| (value, index))
+            seq_record_value(combined, first_invalid, start, end, cuts).map(|value| (value, index))
         })
         .collect()
 }
@@ -17151,17 +17170,26 @@ fn first_invalid_utf8(combined: &[u8]) -> usize {
 
 /// The value of the record at `start..end` of the `--seq` stream `combined`, for
 /// [`seq_values_with_indices`] and [`LazySeqInputs`] (#6500), which must agree on every record.
-/// `first_invalid` is [`first_invalid_utf8`] of the stream. `None` for a record the checked
-/// materializer refuses, which both routes drop.
+/// `first_invalid` is [`first_invalid_utf8`] of the stream, and `cuts` the bytes of it that are
+/// not part of any value (`SeqStreamWalk::cuts`, #7340), taken out of the record first. `None` for
+/// a record the checked materializer refuses, which both routes drop.
 fn seq_record_value(
     combined: &[u8],
     first_invalid: usize,
     start: usize,
     end: usize,
+    cuts: &[(usize, usize)],
 ) -> Option<OwnedValue> {
-    let raw = &combined[start..end];
+    let spliced = crate::jq_seq_reader::splice_cuts(combined, start, end, cuts);
+    // Taking bytes out of a range of valid UTF-8 leaves it valid UTF-8 only when the cuts fall on
+    // character boundaries, which a NUL and the end of an `fgets` chunk need not, so a spliced
+    // record is always checked.
+    let unspliced = matches!(spliced, std::borrow::Cow::Borrowed(_));
+    let raw: &[u8] = &spliced;
     let substituted;
-    let bytes = if end <= first_invalid || succinctly::text::utf8::validate_utf8(raw).is_ok() {
+    let bytes = if (unspliced && end <= first_invalid)
+        || succinctly::text::utf8::validate_utf8(raw).is_ok()
+    {
         raw
     } else {
         substituted = succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(raw);
@@ -17217,14 +17245,12 @@ fn seq_record_general_value(bytes: &[u8]) -> Option<OwnedValue> {
 /// the BOM in the second file, since real jq treats every source as one
 /// continuous stream).
 ///
-/// Two narrower gaps deliberately not chased, both apparent artifacts of
-/// jq's own C byte-reader rather than a documented rule: an embedded NUL
-/// byte stops jq's own column count from advancing any further on that
-/// line (oracle-verified: `ab\0cd` reports column 2, not 5), and jq's BOM
-/// detection consumes a *partial*, never-completed `EF`/`EF BB` prefix
-/// too, not just a full 3-byte match. Both are folded into #1723's
-/// existing "matching jq's own incremental-reader internals precisely"
-/// scope rather than given a separate issue.
+/// The bytes jq's parser never sees are neither counted nor searched for an RS
+/// (`jq_seq_reader::nul_cuts`, #7340): `jq_util_input_read_more` measures an
+/// `fgets` chunk with no newline by `strlen`, so `ab\0cd` reports column 2, not
+/// 5, and an RS after such a NUL is no RS to jq. jq's BOM detection consumes a
+/// *partial*, never-completed `EF`/`EF BB` prefix too, not just a full 3-byte
+/// match (`jq_seq_reader::bom_prefix`).
 fn seq_no_rs_byte_warning(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> Option<String> {
     let (line, column) = seq_no_rs_byte_position(raw_bytes)?;
     Some(crate::jq_seq_reader::ignored_parse_error(&format!(
@@ -17246,15 +17272,42 @@ fn seq_no_rs_byte_position(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> Option<(us
     }
     let mut line = 1usize;
     let mut column = 0usize;
+    // #7340: what jq's parser never sees, which is a stream's NULs and what follows them.
+    let cuts = crate::jq_seq_reader::nul_cuts(raw_bytes);
+    let mut cuts = cuts.iter().peekable();
+    let ends = crate::jq_seq_reader::source_ends(raw_bytes);
     // Shares `stream_slices` and `advance_position` with `jq_seq_reader`, which walks this same
     // stream to classify the templates that apply once an RS *is* present (#1723) -- the two must
     // agree on BOM handling and on where a column starts. #7263: a slice at a time, searched a
     // block at a time, where a byte at a time was a third of a no-RS run.
-    for slice in crate::jq_seq_reader::stream_slices(raw_bytes) {
-        if slice.contains(&ASCII_RS) {
-            return None;
+    for (slice, end) in crate::jq_seq_reader::stream_slices(raw_bytes).zip(ends) {
+        // A BOM is cut from the front of a slice, so the slice ends where its source does. A cut
+        // never spans two sources, and never starts in a BOM, which holds no NUL.
+        let start = end - slice.len();
+        let mut at = start;
+        let pieces = std::iter::from_fn(|| {
+            if at == end {
+                return None;
+            }
+            let piece_end = match cuts.next_if(|&&(cut_start, _)| cut_start < end) {
+                Some(&(cut_start, cut_end)) => {
+                    let piece = (at, cut_start);
+                    at = cut_end;
+                    return Some(piece);
+                }
+                None => end,
+            };
+            let piece = (at, piece_end);
+            at = end;
+            Some(piece)
+        });
+        for (piece_start, piece_end) in pieces {
+            let piece = &slice[piece_start - start..piece_end - start];
+            if piece.contains(&ASCII_RS) {
+                return None;
+            }
+            crate::jq_seq_reader::advance_position(piece, &mut line, &mut column);
         }
-        crate::jq_seq_reader::advance_position(slice, &mut line, &mut column);
     }
     if raw_bytes.is_empty() {
         return None;
@@ -26951,7 +27004,7 @@ mod tests {
             .map(|(idx, s)| (*idx, s.as_bytes().to_vec()))
             .collect();
         let walk = crate::jq_seq_reader::walk_stream(&raw, false, &mut |_| {});
-        build_seq_values(&raw, &walk.values, &walk.locations, locations, false)
+        build_seq_values(&raw, &walk.values, &walk.cuts, &walk.locations, locations, false)
     }
 
     /// One `--seq` stream's values, the way `get_inputs` builds them.
@@ -27079,7 +27132,7 @@ mod tests {
                 }
                 None => {
                     // The record's value is whatever the general route says, as before.
-                    let direct = seq_record_value(bytes, usize::MAX, 0, bytes.len());
+                    let direct = seq_record_value(bytes, usize::MAX, 0, bytes.len(), &[]);
                     assert_eq!(
                         direct.as_ref().map(|v| seq_record_prints(record, v)),
                         general.as_ref().map(|v| seq_record_prints(record, v)),
@@ -27089,7 +27142,7 @@ mod tests {
             }
             // Through the one function both routes call, a record is its general value either way.
             assert_eq!(
-                seq_record_value(bytes, usize::MAX, 0, bytes.len())
+                seq_record_value(bytes, usize::MAX, 0, bytes.len(), &[])
                     .as_ref()
                     .map(|v| seq_record_prints(record, v)),
                 general.as_ref().map(|v| seq_record_prints(record, v)),
@@ -27103,7 +27156,7 @@ mod tests {
         // Invalid UTF-8 never reaches the reader: it is substituted first, as before.
         let raw = b"\"a\xffb\"";
         assert_eq!(
-            seq_record_value(raw, 0, 0, raw.len()).map(|v| v.to_json()),
+            seq_record_value(raw, 0, 0, raw.len(), &[]).map(|v| v.to_json()),
             Some("\"a\u{fffd}b\"".to_string())
         );
     }
