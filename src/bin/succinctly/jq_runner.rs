@@ -4595,32 +4595,42 @@ pub(crate) fn silence_depth_guard_panic_line() {
     });
 }
 
-/// The index of one input value, which the run's last value does not give back (#7332).
+/// The index of one input value, which the last value of a file or window leaves in `held` at its
+/// end, for the next value to give back when it builds its own, or for the run to forget (#7332).
 ///
-/// The process ends once the last value is done, and freeing its index first is not free: the
-/// buffers it holds are the first large blocks the allocator sees go back after the run's
-/// own small frees. When the program has just dropped a large array of small strings (`.numbers |
-/// sort | .[0]` over a million numbers), glibc's `free` of a block that joins its neighbours past
-/// 64 KiB first sweeps every freed small chunk in its fast bins (`malloc_consolidate`), 25 ms at a
-/// million chunks and 3 million extra L1 misses. Whether the index buffers sit next to one another
-/// decides it, and a change that only moved the start-up allocations (#7151) flipped it. Every
-/// other value's index is freed as before: a stream of values must not keep them.
-struct RunIndex {
+/// The process ends after the run's last value, and freeing its index first is not free: those
+/// buffers are the first large blocks the allocator sees go back after the run's own small frees.
+/// When the program has just dropped a large array of small strings (`.numbers | sort | .[0]` over a
+/// million numbers), glibc's `free` of a block that joins its neighbours past 64 KiB first sweeps
+/// every freed small chunk in its fast bins (`malloc_consolidate`): 25 ms at a million chunks, 3
+/// million extra L1 misses. Whether the index buffers sit side by side decides it, and a change that
+/// only moved the start-up allocations (#7151) flipped it.
+///
+/// Every other value's index is freed at its value's end, as before. A windowed file hands the loop
+/// a last value for each window, so the one held is replaced by the next window's first value and
+/// the run never holds more than one.
+struct RunIndex<'a> {
     index: Option<JsonIndex>,
-    /// Hold the index past this value's end rather than free it.
-    keep: bool,
+    /// Where to leave the index at the end of this value, for the last value of a file or window.
+    hold_in: Option<&'a std::cell::RefCell<Option<JsonIndex>>>,
 }
 
-impl RunIndex {
-    fn build(json: &[u8], last_value_of_the_run: bool) -> Self {
+impl<'a> RunIndex<'a> {
+    fn build(
+        json: &[u8],
+        held: &'a std::cell::RefCell<Option<JsonIndex>>,
+        last_of_its_file_or_window: bool,
+    ) -> Self {
+        // The previous window's last index is given back before this one is built.
+        drop(held.borrow_mut().take());
         Self {
             index: Some(JsonIndex::build(json)),
-            keep: last_value_of_the_run,
+            hold_in: last_of_its_file_or_window.then_some(held),
         }
     }
 }
 
-impl core::ops::Deref for RunIndex {
+impl core::ops::Deref for RunIndex<'_> {
     type Target = JsonIndex;
 
     fn deref(&self) -> &JsonIndex {
@@ -4630,12 +4640,11 @@ impl core::ops::Deref for RunIndex {
     }
 }
 
-impl Drop for RunIndex {
+impl Drop for RunIndex<'_> {
     fn drop(&mut self) {
-        if self.keep {
-            if let Some(index) = self.index.take() {
-                std::mem::forget(index);
-            }
+        // Only a value that is held moves its index; the others free it where it lies.
+        if let Some(held) = self.hold_in {
+            *held.borrow_mut() = self.index.take();
         }
     }
 }
@@ -5497,6 +5506,9 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         let seams_align = seams.is_empty() || seams.len() == raw_inputs.len();
         debug_assert!(slurped.is_some() || seams_align);
         let mut whole_files = raw_inputs.iter().enumerate();
+        // #7332: where the last value of a file or window leaves its index (see `RunIndex`); the one
+        // left when the loop ends is forgotten below.
+        let held_index = std::cell::RefCell::new(None);
         'files: loop {
             // The next file's text, or for a windowed file its next window with the documents the
             // window holds (#6920): the splitter already ran over it, and `lines_before` line
@@ -5703,7 +5715,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 }
 
                 // Slow path: build index and evaluate expression
-                let index = RunIndex::build(json_bytes, is_last_value);
+                let index = RunIndex::build(json_bytes, &held_index, is_last_value);
                 // #5497: jq's parser refuses a document past its depth limit before any filter
                 // runs, and reads nothing after it, this file or any later one.
                 let source = if slurped.is_some() {
@@ -6036,6 +6048,8 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 // patchcov: coverage end
             }
         }
+        // #7332: the last value's index is not given back, see `RunIndex`.
+        std::mem::forget(held_index.into_inner());
         // Past the last file that opened: the ones that would not open after it, which jq's
         // reader meets when it asks for more and finds none -- unless the run had stopped.
         // #7221: or, for `--seq` files whose windows stopped at one that is not plain, as it moves on
@@ -27374,19 +27388,40 @@ mod tests {
         assert!(err.message.contains("invalid UTF-8"), "{err:?}");
     }
 
-    /// #7332: the index of the run's last value is held past the value's end, any other's is freed,
-    /// and either reads as the `JsonIndex` it wraps.
+    /// #7332: only the last value of a file or window leaves its index in the slot, and the next
+    /// value gives it back before it builds its own, so a windowed run holds one at a time.
     #[test]
-    fn run_index_reads_as_the_index_whether_or_not_it_is_kept_7332() {
+    fn run_index_leaves_only_the_last_value_of_a_window_in_the_slot_7332() {
+        let held = std::cell::RefCell::new(None);
         let json: &[u8] = b"[1,2,3]";
         let plain = JsonIndex::build(json);
-        for keep in [false, true] {
-            let held = RunIndex::build(json, keep);
-            assert_eq!(held.keep, keep);
-            assert_eq!(held.bp().len(), plain.bp().len(), "keep={keep}");
-            assert!(held.root(json).value().is_array(), "keep={keep}");
-            drop(held);
-        }
+
+        let inner = RunIndex::build(json, &held, false);
+        assert_eq!(inner.bp().len(), plain.bp().len());
+        drop(inner);
+        assert!(
+            held.borrow().is_none(),
+            "a value that is not the last leaves nothing"
+        );
+
+        drop(RunIndex::build(json, &held, true));
+        assert!(held.borrow().is_some(), "the last value leaves its index");
+
+        let next = RunIndex::build(json, &held, false);
+        assert!(
+            held.borrow().is_none(),
+            "the next value gives it back first"
+        );
+        assert!(next.root(json).value().is_array());
+        drop(next);
+        assert!(held.borrow().is_none());
+
+        drop(RunIndex::build(json, &held, true));
+        drop(RunIndex::build(json, &held, true));
+        assert!(
+            held.borrow().is_some(),
+            "two windows' last values: one held, not two"
+        );
     }
 
     /// #1192: an immediate object key that fails to decode now errors too,
