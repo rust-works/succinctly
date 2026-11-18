@@ -172,6 +172,15 @@ first. That leg also runs all of `yq_cli_tests` (#5705, ~30% of `cli-gated`'s te
 as a separate `cargo test --features cli --test yq_cli_tests` after the script, so `run` alone
 does not reproduce the leg. A plain `cargo test --features cli` still runs everything.
 
+CI builds the `cli-gated` legs at `opt-level=1` (`CARGO_PROFILE_DEV_OPT_LEVEL=1`, set in
+`.github/workflows/ci.yml`; debug assertions and overflow checks stay on), because `jq_cli_tests`
+spends 1,125 s unoptimised and 455 s that way (#7373, M5 Max). A local `cargo test` and the
+`deep-recursion` leg are unoptimised. So a test that passes locally and fails only in `cli-gated`
+may depend on the build: one that pins where the native-stack floor falls does, since the floor
+follows the build's frame sizes. Reproduce it with that variable set, and if the dependence is what
+the test is for, add it to `HEAVY_TESTS` so it runs unoptimised
+(`per_issue::i6356::a_chain_past_the_native_stack_floor_refuses_at_exit_5_6356` is there for this).
+
 ### Differential sweeps against jq
 
 A change to the jq evaluator, the path register above all, is judged against `/usr/bin/jq` (1.7.1) over a
