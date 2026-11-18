@@ -56,7 +56,6 @@ use super::document::{
 };
 use super::encoder_comments::{EncoderComments, EncoderEntry, EncoderMembers, EncoderNodeComments};
 use super::error::EvalEscape;
-use super::eval::LoopAbort;
 use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, binary_fanout_rules, bind_def, bind_def_call,
     boolean_fanout_bools, boolean_fanout_each, bound_shape, by_key_scope,
@@ -102,6 +101,7 @@ use super::eval::{
     format_yq_commented, format_yq_props_commented, yq_encoder_prints_leading_block,
     yq_encoder_reads_spelling, yq_encoder_writes_comments, yq_props_format_style,
 };
+use super::eval::{yq_yaml_unwrapped_text, LoopAbort};
 #[cfg(test)]
 use super::expr::FuncDefBound;
 use super::expr::TomlCommentSource;
@@ -18071,7 +18071,11 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 FormatType::YqYaml(n) => crate::jq::stream::yq_to_yaml_indent_width(*n),
                 _ => 2,
             };
-            let node_text = if indent <= 9 {
+            // #5836: a string node that is not an alias is unwrapped to its own text; an alias node
+            // is still `*name` (the unwrapped root is the alias node), which the node writer gives.
+            let unwrapped = yq_yaml_unwrapped_text(&owned).is_some()
+                && !cursor.as_ref().is_some_and(DocumentCursor::is_alias);
+            let node_text = if indent <= 9 && !unwrapped {
                 yq_node_yaml_text::<S, _>(cursor.as_ref(), &owned, indent)
             } else {
                 None
