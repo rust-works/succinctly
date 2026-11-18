@@ -8,6 +8,22 @@
 use anyhow::{Context, Result};
 use std::process::{Command, Stdio};
 
+/// The current UTC instant as RFC 3339 (`2026-01-29T20:00:00.123456789Z`).
+pub fn now_utc_rfc3339() -> String {
+    jiff::Timestamp::now().to_string()
+}
+
+/// The current UTC time through a `strftime` format (`%Y%m%d_%H%M%S`).
+pub fn now_utc_fmt(format: &str) -> String {
+    jiff::Timestamp::now().strftime(format).to_string()
+}
+
+/// The current time in the system zone through a `strftime` format. UTC where the zone is
+/// unknown (Windows, or an unreadable system zone).
+pub fn now_local_fmt(format: &str) -> String {
+    jiff::Zoned::now().strftime(format).to_string()
+}
+
 /// Get CPU information for the current system.
 pub fn get_cpu_info() -> String {
     #[cfg(target_os = "macos")]
@@ -427,5 +443,37 @@ mod tests {
         assert_eq!(arm_core_name("CPU implementer\t: 0x41\n"), None);
         assert_eq!(arm_core_name("CPU part\t: 0xd4f\n"), None);
         assert_eq!(arm_core_name(""), None);
+    }
+
+    /// A `%Y%m%d_%H%M%S` stamp: 8 digits, `_`, 6 digits. The run directories and `run_id`s are
+    /// named from it, so a shape change would orphan the existing ones (#7345).
+    fn is_compact_stamp(s: &str) -> bool {
+        let (date, time) = s.split_once('_').expect("an underscore");
+        date.len() == 8
+            && time.len() == 6
+            && date.bytes().chain(time.bytes()).all(|b| b.is_ascii_digit())
+    }
+
+    #[test]
+    fn the_compact_stamps_keep_the_run_directory_shape_7345() {
+        assert!(is_compact_stamp(&now_utc_fmt("%Y%m%d_%H%M%S")));
+        assert!(is_compact_stamp(&now_local_fmt("%Y%m%d_%H%M%S")));
+    }
+
+    #[test]
+    fn the_utc_stamp_is_rfc3339_in_zulu_and_parses_back_7345() {
+        let stamp = now_utc_rfc3339();
+        assert!(stamp.ends_with('Z'), "{stamp}");
+        let parsed: jiff::Timestamp = stamp.parse().expect("jiff reads its own stamp");
+        let drift = jiff::Timestamp::now().as_second() - parsed.as_second();
+        assert!((0..60).contains(&drift), "{stamp} is {drift}s old");
+    }
+
+    #[test]
+    fn the_local_stamp_ends_in_a_zone_abbreviation_7345() {
+        let stamp = now_local_fmt("%Y-%m-%d %H:%M:%S %Z");
+        let (clock, zone) = stamp.rsplit_once(' ').expect("a zone after the clock");
+        assert_eq!(clock.len(), "2026-01-29 12:00:00".len(), "{stamp}");
+        assert!(!zone.is_empty(), "{stamp}");
     }
 }

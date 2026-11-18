@@ -174,11 +174,11 @@ pub(crate) fn run_orchestrate_with(
 }
 
 fn run_id_now() -> String {
-    chrono::Local::now().format("%Y-%m-%dT%H-%M-%S").to_string()
+    crate::bench_runner::utils::now_local_fmt("%Y-%m-%dT%H-%M-%S")
 }
 
 fn timestamp_now() -> String {
-    chrono::Utc::now().to_rfc3339()
+    crate::bench_runner::utils::now_utc_rfc3339()
 }
 
 /// Select nodes matching `--node`/`--arch`, defaulting to all configured
