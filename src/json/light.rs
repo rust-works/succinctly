@@ -3619,8 +3619,8 @@ use crate::jq::document::{
     document_token_of, effective_fields_checked, key_hash, key_is_malformed, key_span_fingerprint,
     repeat_plan_checked, repeat_plan_from_shared, shared_key_hashes_if_any,
     trailing_element_gap_ok, DocumentCursor, DocumentElements, DocumentField, DocumentFields,
-    DocumentValue, FieldFate, IndentSpec, JsonConvention, KeyHashes, RepeatPlan, RepeatPlanBuilder,
-    StepSpan, PAIRWISE_SPAN_SCAN_LIMIT,
+    DocumentValue, FieldFate, IndentSpec, JsonConvention, KeyHashes, PositionOf, RepeatPlan,
+    RepeatPlanBuilder, StepSpan, PAIRWISE_SPAN_SCAN_LIMIT,
 };
 use crate::jq::escape::{write_json_body_jq, write_json_body_yq};
 use crate::jq::stream::{StreamFailure, StreamResult};
@@ -6723,17 +6723,18 @@ fn stream_scanned_repeats<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
         level,
     } = text;
     let at = |value: &usize| Some(*value);
-    if let Some(plan) = text_repeat_plan(span, start, shared) {
-        if cut_planned_text(&plan, at, span, start, &mut |_| Ok(())).is_some() {
-            return write_planned_text(out, &plan, at, text, indent);
+    let position_of = match text_repeat_plan(span, start, shared) {
+        TextPlan::Plan(plan) => {
+            if cut_planned_text(&plan, at, span, start, &mut |_| Ok(())).is_some() {
+                return write_planned_text(out, &plan, at, text, indent);
+            }
+            Some(JsonCursor::text_position as PositionOf<_>) // patchcov: coverage tolerate-line reason="unreachable: a text plan's spans come from the text it cuts (#7350); kept so a mismatch takes the fields' walk"
         }
-    }
-    let plan = repeat_plan_from_shared(
-        &fields,
-        shared,
-        raw_key_hash,
-        Some(JsonCursor::text_position),
-    );
+        // The walk would give its spans up at the same field.
+        TextPlan::Dense => None,
+        TextPlan::Walk => Some(JsonCursor::text_position as PositionOf<_>),
+    };
+    let plan = repeat_plan_from_shared(&fields, shared, raw_key_hash, position_of);
     let at = JsonCursor::text_position;
     match plan {
         Some(plan) if cut_planned_text(&plan, at, span, start, &mut |_| Ok(())).is_some() => {
@@ -6877,7 +6878,35 @@ fn stream_planned_object<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
 /// [`repeat_plan_from_shared`]) cost about 470 instructions a member over the
 /// echo on the 100 MB `wide` object, whose members are about 14 bytes of text
 /// (M4 Pro).
-fn text_repeat_plan(span: &str, start: usize, shared: &[u64]) -> Option<RepeatPlan<usize>> {
+fn text_repeat_plan(span: &str, start: usize, shared: &[u64]) -> TextPlan {
+    text_plan_or_walk(span, start, shared).unwrap_or(TextPlan::Walk)
+}
+
+/// What [`text_repeat_plan`] made of an object (#7350).
+enum TextPlan {
+    /// The plan, its spans found in the text.
+    Plan(RepeatPlan<usize>),
+    /// More than half the fields have a step ([`StepSpan::dense`]): the fields'
+    /// walk would give up its spans at the same field, so it need not record
+    /// them.
+    Dense,
+    /// No plan from the text: the object is left to the fields' walk, which
+    /// records its spans.
+    Walk,
+}
+
+impl TextPlan {
+    /// The plan, when there is one.
+    fn plan(self) -> Option<RepeatPlan<usize>> {
+        match self {
+            Self::Plan(plan) => Some(plan),
+            Self::Dense | Self::Walk => None,
+        }
+    }
+}
+
+/// [`text_repeat_plan`], `None` for [`TextPlan::Walk`].
+fn text_plan_or_walk(span: &str, start: usize, shared: &[u64]) -> Option<TextPlan> {
     let bytes = span.as_bytes();
     let close = bytes.len().checked_sub(1)?;
     if bytes.first() != Some(&b'{') || bytes[close] != b'}' || close == 1 {
@@ -6925,7 +6954,7 @@ fn text_repeat_plan(span: &str, start: usize, shared: &[u64]) -> Option<RepeatPl
             });
             awaiting_next = true;
             if StepSpan::dense(spans.len(), at + 1, false) {
-                return None;
+                return Some(TextPlan::Dense);
             }
         }
         at += 1;
@@ -6936,9 +6965,9 @@ fn text_repeat_plan(span: &str, start: usize, shared: &[u64]) -> Option<RepeatPl
         }
     }
     if StepSpan::dense(spans.len(), at, true) {
-        return None;
+        return Some(TextPlan::Dense);
     }
-    plan.finish(spans)
+    plan.finish(spans).map(TextPlan::Plan)
 }
 
 /// One past the closing quote of the certified string whose opening quote is
@@ -6957,15 +6986,39 @@ fn certified_string_end(text: &[u8], at: usize) -> Option<usize> {
     }
     let mut i = at + 1;
     loop {
-        i += text
-            .get(i..)?
-            .iter()
-            .position(|&b| b == b'"' || b == b'\\')?;
+        i = quote_or_backslash(text, i)?;
         if text[i] == b'"' {
             return Some(i + 1);
         }
         i += 2;
     }
+}
+
+/// The first `"` or backslash in `text` at or after `from`, eight bytes at a
+/// time ([`certified_string_end`]): a word's matching bytes are the zero bytes
+/// of it XOR-ed with each byte, and the lowest flagged byte of `(x - LO) & !x &
+/// HI` is always a real zero, so its `trailing_zeros` is exact. A byte at a
+/// time cost about 7 instructions a byte, which made the text walk lose to the
+/// fields' walk over 256-byte strings (+17% to +29%, both chips).
+fn quote_or_backslash(text: &[u8], from: usize) -> Option<usize> {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    const QUOTES: u64 = LO * b'"' as u64;
+    const BACKSLASHES: u64 = LO * b'\\' as u64;
+    let zero = |x: u64| x.wrapping_sub(LO) & !x & HI;
+    let mut i = from;
+    while let Some(chunk) = text.get(i..i + 8) {
+        let word = u64::from_le_bytes(<[u8; 8]>::try_from(chunk).ok()?);
+        let hit = zero(word ^ QUOTES) | zero(word ^ BACKSLASHES);
+        if hit != 0 {
+            return Some(i + (hit.trailing_zeros() / 8) as usize);
+        }
+        i += 8;
+    }
+    let rest = text.get(i..)?;
+    rest.iter()
+        .position(|&b| b == b'"' || b == b'\\')
+        .map(|at| i + at)
 }
 
 /// Where the certified value that starts at `text[at]` ends, `text` being an
@@ -10195,7 +10248,7 @@ mod tests {
             panic!("{doc}");
         };
         let shared = [key_hash(b"b")];
-        assert!(text_repeat_plan(doc, 0, &shared).is_none());
+        assert!(text_repeat_plan(doc, 0, &shared).plan().is_none());
         assert!(repeat_plan_from_shared(&fields, &shared, raw_key_hash, None).is_none());
         for (indent, level) in [
             (IndentSpec::COMPACT, 2),
@@ -10400,14 +10453,14 @@ mod tests {
                     let StandardJson::Object(fields) = root.value() else {
                         panic!("not an object"); // patchcov: coverage tolerate-line reason="the failure message for the assertion this #7346 test exists to make"
                     };
-                    let plan = text_repeat_plan(span, start, &shared);
+                    let plan = text_repeat_plan(span, start, &shared).plan();
                     // #7350: the plan found from the text is the fields'
                     // walk's, field by field, unless it was too dense to keep.
                     let walked = repeat_plan_from_shared(&fields, &shared, raw_key_hash, None);
                     match (&plan, walked) {
                         (Some(_), Some(walked)) => assert_eq!(
                             text_plan_fates(
-                                text_repeat_plan(span, start, &shared).unwrap(),
+                                text_repeat_plan(span, start, &shared).plan().unwrap(),
                                 &fields
                             ),
                             walked_plan_fates(walked, &fields),
@@ -10572,10 +10625,13 @@ mod tests {
                 let StandardJson::Object(fields) = root.value() else {
                     panic!("an object"); // patchcov: coverage tolerate-line reason="the failure message for the assertion this #7350 test exists to make"
                 };
-                let plan = text_repeat_plan(span, start, &shared).expect(&doc);
+                let plan = text_repeat_plan(span, start, &shared).plan().expect(&doc);
                 let walked = repeat_plan_from_shared(&fields, &shared, raw_key_hash, None).unwrap();
                 assert_eq!(
-                    text_plan_fates(text_repeat_plan(span, start, &shared).unwrap(), &fields),
+                    text_plan_fates(
+                        text_repeat_plan(span, start, &shared).plan().unwrap(),
+                        &fields
+                    ),
                     walked_plan_fates(walked, &fields),
                     "{doc}"
                 );
@@ -10603,10 +10659,13 @@ mod tests {
                 assert_eq!(plan.spans(), want.as_slice(), "{doc}");
                 let cuts = [&span[1..], &span[..span.len() - 1], &span[..span.len() - 2]];
                 for cut in cuts {
-                    assert!(text_repeat_plan(cut, start, &shared).is_none(), "{cut}");
+                    assert!(
+                        text_repeat_plan(cut, start, &shared).plan().is_none(),
+                        "{cut}"
+                    );
                 }
                 // Without the shared hashes nothing is compared, so nothing repeats.
-                assert!(text_repeat_plan(span, start, &[]).is_none(), "{doc}");
+                assert!(text_repeat_plan(span, start, &[]).plan().is_none(), "{doc}");
             }
         }
         // Ten keys that occur once, so that two `a`s are not dense and only
@@ -10617,7 +10676,7 @@ mod tests {
             .join(",");
         let shared = [key_hash(b"a")];
         let well_formed = format!("{{{pad},\"a\":1,\"a\":2}}");
-        assert!(text_repeat_plan(&well_formed, 0, &shared).is_some());
+        assert!(text_repeat_plan(&well_formed, 0, &shared).plan().is_some());
         for fault in [
             "\"a\"",
             "\"a\":",
@@ -10632,10 +10691,16 @@ mod tests {
             "a:1,\"a\":2",
         ] {
             let text = format!("{{{pad},{fault}}}");
-            assert!(text_repeat_plan(&text, 0, &shared).is_none(), "{text}");
+            assert!(
+                text_repeat_plan(&text, 0, &shared).plan().is_none(),
+                "{text}"
+            );
         }
         for text in ["{}", "[]", "{\"a\":1,\"a\":2}"] {
-            assert!(text_repeat_plan(text, 0, &shared).is_none(), "{text}");
+            assert!(
+                text_repeat_plan(text, 0, &shared).plan().is_none(),
+                "{text}"
+            );
         }
     }
 
@@ -10672,7 +10737,7 @@ mod tests {
                 Some(JsonCursor::text_position),
             )
             .unwrap();
-            let text = text_repeat_plan(span, start, &shared);
+            let text = text_repeat_plan(span, start, &shared).plan();
             assert_eq!(text.is_none(), len > TEXT_WALK_MEMBER_BYTES, "{len}");
             if let Some(text) = text {
                 assert_eq!(text.spans(), walked.spans());
@@ -10701,6 +10766,38 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(printed, rerender, "{len}");
+            }
+        }
+    }
+
+    /// #7350: [`quote_or_backslash`]'s word-at-a-time search finds what a
+    /// byte-at-a-time one does, from every start, over seeded text dense and
+    /// sparse in quotes, backslashes and bytes one bit away from either.
+    #[test]
+    fn quote_or_backslash_matches_the_byte_search_7350() {
+        use rand::{RngExt, SeedableRng};
+        use rand_chacha::ChaCha8Rng;
+        const BYTES: &[u8] = b"\"\\x#]\x22\x5d\x5c\xa2\xdc\x23\x5e\x00\xff";
+        let mut rng = ChaCha8Rng::seed_from_u64(7350);
+        for len in 0..80 {
+            for _ in 0..20 {
+                let sparse = rng.random_range(0..2) == 0;
+                let text: Vec<u8> = (0..len)
+                    .map(|_| {
+                        if sparse && rng.random_range(0..12) > 0 {
+                            b'x'
+                        } else {
+                            BYTES[rng.random_range(0..BYTES.len())]
+                        }
+                    })
+                    .collect();
+                for from in 0..=len + 1 {
+                    let want = text
+                        .get(from..)
+                        .and_then(|rest| rest.iter().position(|&b| b == b'"' || b == b'\\'))
+                        .map(|at| from + at);
+                    assert_eq!(quote_or_backslash(&text, from), want, "{text:?} {from}");
+                }
             }
         }
     }
@@ -10745,7 +10842,7 @@ mod tests {
         let StandardJson::Object(fields) = root.value() else {
             panic!("an object"); // patchcov: coverage tolerate-line reason="the failure message for the assertion this #7346 test exists to make"
         };
-        let plan = text_repeat_plan(span, start, &shared).unwrap();
+        let plan = text_repeat_plan(span, start, &shared).plan().unwrap();
         let run = |from: usize, to: usize| {
             (from..to)
                 .map(|i| format!("\"k{i:04}\":{i}"))
@@ -10867,7 +10964,7 @@ mod tests {
         let StandardJson::Object(fields) = root.value() else {
             panic!("an object"); // patchcov: coverage tolerate-line reason="the failure message for the assertion this #7346 test exists to make"
         };
-        let plan = text_repeat_plan(span, start, &shared).unwrap();
+        let plan = text_repeat_plan(span, start, &shared).plan().unwrap();
         // The cut stops at the planned field and answers the writer's error.
         let mut seen = Vec::new();
         let cut = cut_planned_text(&plan, |v| Some(*v), span, start, &mut |piece| {
@@ -10920,7 +11017,14 @@ mod tests {
                 panic!("an object"); // patchcov: coverage tolerate-line reason="the failure message for the assertion this #7346 test exists to make"
             };
             assert!(repeat_plan_from_shared(&fields, &shared, raw_key_hash, None).is_some());
-            let plan = text_repeat_plan(span, start, &shared);
+            // #7350: a dense object says so, so the walk does not record spans.
+            assert_eq!(
+                matches!(text_repeat_plan(span, start, &shared), TextPlan::Dense),
+                !want_spans,
+                "{}",
+                doc.len()
+            );
+            let plan = text_repeat_plan(span, start, &shared).plan();
             assert_eq!(plan.is_some(), want_spans, "{}", doc.len());
             for indent in [
                 IndentSpec::COMPACT,
