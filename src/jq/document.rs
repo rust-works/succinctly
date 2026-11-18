@@ -3877,8 +3877,13 @@ pub(crate) fn repeat_plan_checked<F: DocumentFields>(
         &walked.shared,
         walked.unkeyed > 0,
         |key| collapse_key_hash_of(key, collections_as_empty),
+        None,
     ))
 }
+
+/// Where a cursor's node starts in its document's text:
+/// [`repeat_plan_from_shared`]'s `position_of` (#7346).
+pub(crate) type PositionOf<C> = fn(&C) -> Option<usize>;
 
 /// [`repeat_plan_checked`]'s second walk alone, for a caller that knows the
 /// object is well formed, that every key of it decodes, and which key hashes
@@ -3891,12 +3896,19 @@ pub(crate) fn repeat_plan_checked<F: DocumentFields>(
 /// hashed one way and listed another would be missed. Keys are still grouped
 /// by their decoded spelling, so a hash two different keys share is told
 /// apart here, and an object where that is all that happened answers `None`.
+///
+/// `position_of`, when given, is asked where each step's key and value start
+/// in the text, and where the key of the field after it does, so that the
+/// writer can copy the fields between steps from the text (#7346,
+/// [`RepeatPlan::spanned_steps`]). A position it cannot give, or a plan too
+/// dense to keep them ([`StepSpan::dense`]), leaves the plan without spans.
 pub(crate) fn repeat_plan_from_shared<F: DocumentFields>(
     fields: &F,
     shared: &[u64],
     hash_of: impl Fn(&F::Value) -> Option<u64>,
+    position_of: Option<PositionOf<F::Cursor>>,
 ) -> Option<RepeatPlan<F::Cursor>> {
-    plan_repeats(fields, shared, false, hash_of)
+    plan_repeats(fields, shared, false, hash_of, position_of)
 }
 
 /// [`repeat_plan_checked`]'s second walk, for an object whose hashes repeat.
@@ -3914,22 +3926,57 @@ fn plan_repeats<F: DocumentFields>(
     shared: &[u64],
     every_key: bool,
     hash_of: impl Fn(&F::Value) -> Option<u64>,
+    mut position_of: Option<PositionOf<F::Cursor>>,
 ) -> Option<RepeatPlan<F::Cursor>> {
     let mut plan = RepeatPlanBuilder::default();
+    let mut spans: Vec<StepSpan> = Vec::new();
+    // Whether the last step still waits for the position of the key after
+    // its field.
+    let mut awaiting_next = false;
     let mut walk = fields.clone();
     let mut at = 0usize;
-    while let Some((key, _, rest)) = walk.uncons_key() {
+    while let Some((key, key_cursor, rest)) = walk.uncons_key() {
+        // This key's position, when the step before it asked for it; a step
+        // here reuses it.
+        let mut key_at = None;
+        if core::mem::take(&mut awaiting_next) {
+            key_at = position_of.and_then(|of| of(&key_cursor));
+            match (key_at, spans.last_mut()) {
+                (Some(at), Some(last)) => last.next = at,
+                _ => position_of = None, // patchcov: coverage tolerate-line reason="unreachable for JSON, the one caller: every cursor of a text-backed index has a position; kept so a format without one keeps no spans (#7346)"
+            }
+        }
         if let Some(name) = collapsing_key(&key, shared, every_key, &hash_of) {
             // `uncons` meets the same field `uncons_key` just did, so it is
             // not `None` on the object the walk above accepted.
             if let Some((field, _)) = walk.uncons() {
-                plan.field(at, name, field.value_cursor);
+                let value = field.value_cursor;
+                if let Some(of) = position_of {
+                    match (key_at.or_else(|| of(&key_cursor)), of(&value)) {
+                        (Some(key), Some(value)) => spans.push(StepSpan {
+                            key,
+                            value,
+                            next: StepSpan::LAST,
+                        }),
+                        _ => position_of = None, // patchcov: coverage tolerate-line reason="unreachable for JSON, the one caller: every cursor of a text-backed index has a position; kept so a format without one keeps no spans (#7346)"
+                    }
+                    awaiting_next = position_of.is_some();
+                    // Too many steps to be worth their spans: stop asking.
+                    if StepSpan::dense(spans.len(), at + 1, false) {
+                        position_of = None;
+                        awaiting_next = false;
+                    }
+                }
+                plan.field(at, name, value);
             }
         }
         at += 1;
         walk = rest;
     }
-    plan.finish(Vec::new())
+    if position_of.is_none() || StepSpan::dense(spans.len(), at, true) {
+        spans = Vec::new();
+    }
+    plan.finish(spans)
 }
 
 /// A [`RepeatPlan`] being built by a walk that meets an object's fields in

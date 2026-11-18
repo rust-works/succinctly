@@ -6696,11 +6696,12 @@ impl<'s> RepeatText<'s> {
 /// instead took about 3x the time of the same object without the repeat,
 /// which is echoed.
 ///
-/// An object the text walk finds no plan for, or a plan too dense to keep its
-/// spans, is written by the fields' walk instead ([`stream_planned_object`],
-/// with [`repeat_plan_from_shared`]'s plan, comparing each key under the
-/// scan's own hash, [`raw_key_hash`]), with the text around it, whole into a
-/// buffer, as a declined value is.
+/// An object the text walk leaves alone is planned by the fields' walk instead
+/// ([`repeat_plan_from_shared`], comparing each key under the scan's own hash,
+/// [`raw_key_hash`], and recording where each step lies), and written from its
+/// text the same way; one whose plan is too dense to keep its spans, or has no
+/// plan, is written by that walk ([`stream_planned_object`]), with the text
+/// around it, whole into a buffer, as a declined value is.
 ///
 /// Out of line and cold: it is the rare branch of [`JsonCursor::stream_json`],
 /// whose echo arms are the common ones.
@@ -6721,24 +6722,58 @@ fn stream_scanned_repeats<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
         after,
         level,
     } = text;
-    let plan = match text_repeat_plan(span, start, shared) {
-        Some(plan) if cut_planned_text(&plan, span, start, &mut |_| Ok(())).is_some() => plan,
-        _ => {
-            let plan = repeat_plan_from_shared(&fields, shared, raw_key_hash);
+    let at = |value: &usize| Some(*value);
+    if let Some(plan) = text_repeat_plan(span, start, shared) {
+        if cut_planned_text(&plan, at, span, start, &mut |_| Ok(())).is_some() {
+            return write_planned_text(out, &plan, at, text, indent);
+        }
+    }
+    let plan = repeat_plan_from_shared(
+        &fields,
+        shared,
+        raw_key_hash,
+        Some(JsonCursor::text_position),
+    );
+    let at = JsonCursor::text_position;
+    match plan {
+        Some(plan) if cut_planned_text(&plan, at, span, start, &mut |_| Ok(())).is_some() => {
+            write_planned_text(out, &plan, at, text, indent)
+        }
+        plan => {
             let mut buf = String::new();
             write_around(&mut buf, before, 0, indent)?;
             stream_planned_object(&mut buf, fields, plan, indent, numbers, level)?;
             write_around(&mut buf, after, level, indent)?;
-            return Ok(out.write_str(&buf)?);
+            Ok(out.write_str(&buf)?)
         }
-    };
+    }
+}
+
+/// Writes the object [`stream_scanned_repeats`] prints from its text, with the
+/// text around it, by `plan`, whose values are found in the text by `at`
+/// (#7346, #7350). The caller has cut the same plan from the same text once
+/// already, so the cut cannot fail here and only the writer can.
+fn write_planned_text<C: Copy, Out: core::fmt::Write>(
+    out: &mut Out,
+    plan: &RepeatPlan<C>,
+    at: impl Fn(&C) -> Option<usize>,
+    text: RepeatText<'_>,
+    indent: IndentSpec,
+) -> StreamResult {
+    let RepeatText {
+        span,
+        start,
+        before,
+        after,
+        level,
+    } = text;
     let mut chunked = ChunkedWrite {
         out,
         buf: String::new(),
     };
     let mut first = true;
     write_around(&mut chunked, before, 0, indent)?;
-    let written = cut_planned_text(&plan, span, start, &mut |piece| {
+    let written = cut_planned_text(plan, at, span, start, &mut |piece| {
         write_planned_piece(&mut chunked, piece, &mut first, indent, level)
     })
     .map(|written| {
@@ -6746,7 +6781,7 @@ fn stream_scanned_repeats<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
             .and_then(|()| write_around(&mut chunked, after, level, indent))
             .and_then(|()| chunked.finish())
     });
-    // The check above cut the same plan from the same text.
+    // The caller cut the same plan from the same text.
     written
         .unwrap_or(Err(core::fmt::Error))
         .map_err(StreamFailure::from)
@@ -6821,8 +6856,10 @@ fn stream_planned_object<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
 /// positions of its key, its value and the next field's key, as
 /// [`cut_planned_text`] reads them. `None` when no key repeats (the shared
 /// hashes were a bare collision), when the plan is too dense to keep its spans
-/// ([`StepSpan::dense`]), or when `span` is not the certified object it
-/// should be: each leaves the object to the fields' walk.
+/// ([`StepSpan::dense`]), when its members are long on average
+/// ([`TEXT_WALK_MEMBER_BYTES`]), or when `span` is not the certified object it
+/// should be: each leaves the object to the fields' walk, which records the
+/// same spans from the index (`repeat_plan_from_shared`'s `position_of`).
 ///
 /// The members are cut as the scan certified them ([`certified_value_end`]):
 /// a string by the scan's own [`scan_json_string_span`], a container by
@@ -6848,7 +6885,6 @@ fn text_repeat_plan(span: &str, start: usize, shared: &[u64]) -> Option<RepeatPl
     }
     // The members, without the closing brace, so that no cut runs past it.
     let text = &bytes[..close];
-    let mut specials = SpecialMask::new();
     let mut plan = RepeatPlanBuilder::default();
     let mut spans: Vec<StepSpan> = Vec::new();
     // Whether the last step waits for the position of the next field's key.
@@ -6857,20 +6893,22 @@ fn text_repeat_plan(span: &str, start: usize, shared: &[u64]) -> Option<RepeatPl
     // The first byte of the member being cut: its key's opening quote.
     let mut key = 1usize;
     loop {
-        if text.get(key) != Some(&b'"') {
+        // Members too long on average to be worth reading: the walk.
+        if at % 64 == 0 && key > at.saturating_mul(TEXT_WALK_MEMBER_BYTES) && at > 0 {
             return None;
         }
-        let (name_start, name_end, key_end) = scan_json_string_span(text, key, &mut specials)?;
+        let key_end = certified_string_end(text, key)?;
         if text.get(key_end) != Some(&b':') {
             return None;
         }
+        let (name_start, name_end) = (key + 1, key_end - 1);
         if core::mem::take(&mut awaiting_next) {
             if let Some(last) = spans.last_mut() {
                 last.next = start + key;
             }
         }
         let value = key_end + 1;
-        let value_end = certified_value_end(text, value, &mut specials)?;
+        let value_end = certified_value_end(text, value)?;
         if shared
             .binary_search(&key_hash(&text[name_start..name_end]))
             .is_ok()
@@ -6903,17 +6941,43 @@ fn text_repeat_plan(span: &str, start: usize, shared: &[u64]) -> Option<RepeatPl
     plan.finish(spans)
 }
 
+/// One past the closing quote of the certified string whose opening quote is
+/// `text[at]` ([`text_repeat_plan`]): a certified string's only escapes are
+/// pairs of a backslash and one byte, so its first unescaped quote ends it,
+/// the rule [`write_reindented_at`] cuts by. `None` when `text[at]` is not a
+/// quote or the string does not close in `text`.
+///
+/// A byte at a time: the strings this sees are short, since an object of long
+/// members is left to the fields' walk ([`TEXT_WALK_MEMBER_BYTES`]), and
+/// [`scan_json_string_span`]'s block mask read 25 M more instructions than
+/// this on the 10 MB repeat row (7950X).
+fn certified_string_end(text: &[u8], at: usize) -> Option<usize> {
+    if text.get(at) != Some(&b'"') {
+        return None;
+    }
+    let mut i = at + 1;
+    loop {
+        i += text
+            .get(i..)?
+            .iter()
+            .position(|&b| b == b'"' || b == b'\\')?;
+        if text[i] == b'"' {
+            return Some(i + 1);
+        }
+        i += 2;
+    }
+}
+
 /// Where the certified value that starts at `text[at]` ends, `text` being an
 /// object's members without its closing `}` ([`text_repeat_plan`]): one past
 /// its last byte, which is its member's `,` or the end of `text`. A string is
-/// cut as the scan certified it ([`scan_json_string_span`], whose block mask
-/// `specials` carries from one call to the next), a container by
-/// [`container_end`], and a number or a literal runs to its member's `,`.
-/// `None` when the value is empty, does not close in `text`, or a number or
-/// literal runs into a byte no member's value holds there.
-fn certified_value_end(text: &[u8], at: usize, specials: &mut SpecialMask) -> Option<usize> {
+/// cut by [`certified_string_end`], a container by [`container_end`], and a
+/// number or a literal runs to its member's `,`. `None` when the value is
+/// empty, does not close in `text`, or a number or literal runs into a byte no
+/// member's value holds there.
+fn certified_value_end(text: &[u8], at: usize) -> Option<usize> {
     match *text.get(at)? {
-        b'"' => scan_json_string_span(text, at, specials).map(|(_, _, end)| end),
+        b'"' => certified_string_end(text, at),
         b'{' | b'[' => container_end(text, at),
         _ => {
             let rest = text.get(at..)?;
@@ -6928,6 +6992,14 @@ fn certified_value_end(text: &[u8], at: usize, specials: &mut SpecialMask) -> Op
         }
     }
 }
+
+/// The member length past which [`text_repeat_plan`] leaves an object to the
+/// fields' walk, judged on its average every 64 members. The text walk reads
+/// every byte of a member and the fields' walk costs the same per member
+/// whatever its length, so long members are cheaper walked: on the M4 Pro the
+/// text walk was 1.4-2.2% faster than the walk over 256-byte members and 2-5%
+/// slower over 1 KB and 2 KB strings (#7350).
+const TEXT_WALK_MEMBER_BYTES: usize = 512;
 
 /// One piece of a planned object's text (#7346, [`cut_planned_text`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6957,8 +7029,9 @@ enum PlannedPiece<'s> {
 /// the comma before the next key or the closing brace, with no value read to
 /// find it, and a planned value's text runs from its own position to the end
 /// of the field it came from, a later step's, found by its position.
-fn cut_planned_text<'s>(
-    plan: &RepeatPlan<usize>,
+fn cut_planned_text<'s, C: Copy>(
+    plan: &RepeatPlan<C>,
+    value_at: impl Fn(&C) -> Option<usize>,
     span: &'s str,
     start: usize,
     emit: &mut dyn FnMut(PlannedPiece<'s>) -> core::fmt::Result,
@@ -7000,7 +7073,7 @@ fn cut_planned_text<'s>(
                 if colon <= field_start || bytes.get(colon) != Some(&b':') {
                     return None; // patchcov: coverage tolerate-line reason="defensive: a plan's spans come from the same certified text it cuts, so a field never starts before the cut and always has its colon; kept so a mismatch declines rather than slicing wrong (#7346)"
                 }
-                let at = value;
+                let at = value_at(&value)?;
                 let from = spans.binary_search_by_key(&at, |span| span.value).ok()?;
                 let value = span.get(local(at)?..field_end(&spans[from])?)?;
                 emit(PlannedPiece::Field {
@@ -10123,7 +10196,7 @@ mod tests {
         };
         let shared = [key_hash(b"b")];
         assert!(text_repeat_plan(doc, 0, &shared).is_none());
-        assert!(repeat_plan_from_shared(&fields, &shared, raw_key_hash).is_none());
+        assert!(repeat_plan_from_shared(&fields, &shared, raw_key_hash, None).is_none());
         for (indent, level) in [
             (IndentSpec::COMPACT, 2),
             (
@@ -10330,7 +10403,7 @@ mod tests {
                     let plan = text_repeat_plan(span, start, &shared);
                     // #7350: the plan found from the text is the fields'
                     // walk's, field by field, unless it was too dense to keep.
-                    let walked = repeat_plan_from_shared(&fields, &shared, raw_key_hash);
+                    let walked = repeat_plan_from_shared(&fields, &shared, raw_key_hash, None);
                     match (&plan, walked) {
                         (Some(_), Some(walked)) => assert_eq!(
                             text_plan_fates(
@@ -10500,7 +10573,7 @@ mod tests {
                     panic!("an object"); // patchcov: coverage tolerate-line reason="the failure message for the assertion this #7350 test exists to make"
                 };
                 let plan = text_repeat_plan(span, start, &shared).expect(&doc);
-                let walked = repeat_plan_from_shared(&fields, &shared, raw_key_hash).unwrap();
+                let walked = repeat_plan_from_shared(&fields, &shared, raw_key_hash, None).unwrap();
                 assert_eq!(
                     text_plan_fates(text_repeat_plan(span, start, &shared).unwrap(), &fields),
                     walked_plan_fates(walked, &fields),
@@ -10566,6 +10639,72 @@ mod tests {
         }
     }
 
+    /// #7350: an object whose members average more than
+    /// [`TEXT_WALK_MEMBER_BYTES`] has no text plan, and is printed from its
+    /// text by the fields' walk's plan, which records where each step lies
+    /// (#7346): the same spans the text walk finds for short members. Either
+    /// way it prints what the re-render prints.
+    #[test]
+    fn long_members_take_the_fields_walk_7350() {
+        for (keys, len) in [(200, 2000), (200, 100)] {
+            let mut fields: Vec<String> = (0..keys)
+                .map(|i| format!("\"k{i}\":\"{}{i}\"", "x".repeat(len)))
+                .collect();
+            fields.push(format!("\"k0\":[{}]", "1,".repeat(len / 2) + "1"));
+            let doc = format!("{{{}}}", fields.join(","));
+            let index = JsonIndex::build(doc.as_bytes());
+            let root = index.root(doc.as_bytes());
+            let CanonicalSpan::RepeatedKeys {
+                start,
+                span,
+                shared,
+            } = root.canonical_compact_scan(0)
+            else {
+                panic!("the scan declines on the keys alone"); // patchcov: coverage tolerate-line reason="the failure message for the assertion this #7350 test exists to make"
+            };
+            let StandardJson::Object(fields) = root.value() else {
+                panic!("an object"); // patchcov: coverage tolerate-line reason="the failure message for the assertion this #7350 test exists to make"
+            };
+            let walked = repeat_plan_from_shared(
+                &fields,
+                &shared,
+                raw_key_hash,
+                Some(JsonCursor::text_position),
+            )
+            .unwrap();
+            let text = text_repeat_plan(span, start, &shared);
+            assert_eq!(text.is_none(), len > TEXT_WALK_MEMBER_BYTES, "{len}");
+            if let Some(text) = text {
+                assert_eq!(text.spans(), walked.spans());
+            }
+            assert!(walked.spanned_steps().is_some());
+            for indent in [
+                IndentSpec::COMPACT,
+                IndentSpec {
+                    width: 2,
+                    unit: ' ',
+                },
+            ] {
+                let mut printed = String::new();
+                root.stream_json(&mut printed, indent, false, JsonConvention::JqCompat)
+                    .unwrap();
+                let mut rerender = String::new();
+                stream_json_pretty(
+                    &mut rerender,
+                    root.value(),
+                    0,
+                    indent.width,
+                    indent.unit,
+                    false,
+                    JsonConvention::JqCompat,
+                    0,
+                )
+                .unwrap();
+                assert_eq!(printed, rerender, "{len}");
+            }
+        }
+    }
+
     /// [`cut_planned_text`]'s pieces, collected (#7346).
     fn planned_pieces<'s>(
         plan: &RepeatPlan<usize>,
@@ -10573,7 +10712,7 @@ mod tests {
         start: usize,
     ) -> Option<Vec<PlannedPiece<'s>>> {
         let mut pieces = Vec::new();
-        cut_planned_text(plan, span, start, &mut |piece| {
+        cut_planned_text(plan, |v| Some(*v), span, start, &mut |piece| {
             pieces.push(piece);
             Ok(())
         })?
@@ -10731,7 +10870,7 @@ mod tests {
         let plan = text_repeat_plan(span, start, &shared).unwrap();
         // The cut stops at the planned field and answers the writer's error.
         let mut seen = Vec::new();
-        let cut = cut_planned_text(&plan, span, start, &mut |piece| {
+        let cut = cut_planned_text(&plan, |v| Some(*v), span, start, &mut |piece| {
             seen.push(piece);
             match piece {
                 PlannedPiece::Field { .. } => Err(core::fmt::Error),
@@ -10780,7 +10919,7 @@ mod tests {
             let StandardJson::Object(fields) = root.value() else {
                 panic!("an object"); // patchcov: coverage tolerate-line reason="the failure message for the assertion this #7346 test exists to make"
             };
-            assert!(repeat_plan_from_shared(&fields, &shared, raw_key_hash).is_some());
+            assert!(repeat_plan_from_shared(&fields, &shared, raw_key_hash, None).is_some());
             let plan = text_repeat_plan(span, start, &shared);
             assert_eq!(plan.is_some(), want_spans, "{}", doc.len());
             for indent in [
