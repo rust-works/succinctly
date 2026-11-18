@@ -101,7 +101,7 @@ use super::eval::{
     format_yq_commented, format_yq_props_commented, yq_encoder_prints_leading_block,
     yq_encoder_reads_spelling, yq_encoder_writes_comments, yq_props_format_style,
 };
-use super::eval::{yq_yaml_unwraps_string, LoopAbort};
+use super::eval::{yq_yaml_unwrapped_text, LoopAbort};
 #[cfg(test)]
 use super::expr::FuncDefBound;
 use super::expr::TomlCommentSource;
@@ -18073,7 +18073,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             };
             // #5836: a string node that is not an alias is unwrapped to its own text; an alias node
             // is still `*name` (the unwrapped root is the alias node), which the node writer gives.
-            let unwrapped = yq_yaml_unwraps_string(&owned)
+            let unwrapped = yq_yaml_unwrapped_text(&owned).is_some()
                 && !cursor.as_ref().is_some_and(DocumentCursor::is_alias);
             let node_text = if indent <= 9 && !unwrapped {
                 yq_node_yaml_text::<S, _>(cursor.as_ref(), &owned, indent)

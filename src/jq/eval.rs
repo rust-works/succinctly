@@ -26095,6 +26095,14 @@ pub(crate) fn format_owned<S: EvalSemantics>(
     owned: &OwnedValue,
     optional: bool,
 ) -> Result<String, EvalError> {
+    // #5836: yq's encoder writes a top-level scalar as its own text while `--unwrapScalar` is on, the
+    // default, so `to_yaml` and `@yaml` of a string are that string whatever go-yaml would quote
+    // (`"<<"`, `"1"`, `"- x"`, `"a\nb"`); inside a collection it is quoted as before.
+    if S::TAG == EvalTag::Yq && matches!(format_type, FormatType::Yaml | FormatType::YqYaml(_)) {
+        if let Some(text) = yq_yaml_unwrapped_text(owned) {
+            return Ok(alloc::format!("{text}\n"));
+        }
+    }
     match format_type {
         FormatType::Text => format_text::<S>(owned),
         FormatType::Json => format_json::<S>(owned),
@@ -26107,17 +26115,6 @@ pub(crate) fn format_owned<S: EvalSemantics>(
         FormatType::Html => format_html::<S>(owned, optional),
         FormatType::Sh => format_sh::<S>(owned, optional),
         FormatType::Urid => format_urid::<S>(owned, optional),
-        // #5836: yq's encoder writes a top-level scalar as its own text while `--unwrapScalar` is on,
-        // the default, so `to_yaml` and `@yaml` of a string are that string whatever go-yaml would
-        // quote (`"<<"`, `"1"`, `"- x"`, `"a\nb"`); inside a collection it is quoted as before.
-        FormatType::Yaml | FormatType::YqYaml(_)
-            if S::TAG == EvalTag::Yq && yq_yaml_unwraps_string(owned) =>
-        {
-            let OwnedValue::String(text) = owned else {
-                unreachable!("yq_yaml_unwraps_string holds for a string")
-            };
-            Ok(alloc::format!("{text}\n"))
-        }
         FormatType::Yaml => format_yaml(owned),
         FormatType::Props if S::TAG == EvalTag::Yq => Ok(yq_encoder_prefs::with(|prefs| {
             format_props_with(
@@ -27157,10 +27154,16 @@ fn format_sh<S: EvalSemantics>(value: &OwnedValue, _optional: bool) -> Result<St
     }
 }
 
-/// Whether yq's `to_yaml` / `@yaml` writes `value` as its own text (#5836): a string at the top level
-/// while `--unwrapScalar` holds, which is yq's encoder unwrapping a scalar root.
-pub(crate) fn yq_yaml_unwraps_string(value: &OwnedValue) -> bool {
-    matches!(value, OwnedValue::String(_)) && yq_encoder_prefs::with(|prefs| prefs.unwrap_scalar)
+/// The text yq's `to_yaml` / `@yaml` writes for `value` as its own (#5836): a string at the top level
+/// while `--unwrapScalar` holds, which is yq's encoder unwrapping a scalar root. `None` for any other
+/// value, and for a string when the run keeps the scalar wrapped.
+pub(crate) fn yq_yaml_unwrapped_text(value: &OwnedValue) -> Option<&str> {
+    match value {
+        OwnedValue::String(text) if yq_encoder_prefs::with(|prefs| prefs.unwrap_scalar) => {
+            Some(text)
+        }
+        _ => None,
+    }
 }
 
 /// @yaml - Format value as YAML string (yq): the block-style document the
