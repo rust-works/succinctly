@@ -6677,7 +6677,7 @@ impl<'s> RepeatText<'s> {
 /// everything the object arm's `repeat_plan_checked` takes a key-only walk
 /// for. So the plan is built from the scan's list straight away, and from the
 /// object's text ([`text_repeat_plan`], #7350): a byte loop over its members,
-/// where walking the index over every field cost about 460 instructions a
+/// where walking the index over every field cost about 470 instructions a
 /// member over the echo.
 ///
 /// Every member is certified, so each run of members the plan leaves alone is
@@ -6824,9 +6824,10 @@ fn stream_planned_object<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
 /// ([`StepSpan::dense`]), or when `span` is not the certified object it
 /// should be: each leaves the object to the fields' walk.
 ///
-/// A byte loop cuts the members, as [`write_reindented_at`]'s cuts tokens: a
-/// certified string's only escapes are `\x` pairs, and outside strings only
-/// brackets change the depth. Each key is hashed between its quotes as the
+/// The members are cut as the scan certified them ([`certified_value_end`]):
+/// a string by the scan's own [`scan_json_string_span`], a container by
+/// [`container_end`], and a number or a literal at its member's `,`, so the
+/// walk reads a long value a 64-byte block at a time. Each key is hashed between its quotes as the
 /// scan hashed it ([`key_hash`] of the raw span, escapes as written), and only
 /// a key whose hash is in `shared` is handed to the duplicate-key rule
 /// ([`RepeatPlanBuilder`], the one `repeat_plan_checked` builds with), under
@@ -6836,7 +6837,7 @@ fn stream_planned_object<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
 /// same raw span exactly when they decode to the same string.
 ///
 /// Walking the index instead (`uncons_key` and `uncons` over every member,
-/// [`repeat_plan_from_shared`]) cost about 460 instructions a member over the
+/// [`repeat_plan_from_shared`]) cost about 470 instructions a member over the
 /// echo on the 100 MB `wide` object, whose members are about 14 bytes of text
 /// (M4 Pro).
 fn text_repeat_plan(span: &str, start: usize, shared: &[u64]) -> Option<RepeatPlan<usize>> {
@@ -6845,6 +6846,9 @@ fn text_repeat_plan(span: &str, start: usize, shared: &[u64]) -> Option<RepeatPl
     if bytes.first() != Some(&b'{') || bytes[close] != b'}' || close == 1 {
         return None;
     }
+    // The members, without the closing brace, so that no cut runs past it.
+    let text = &bytes[..close];
+    let mut specials = SpecialMask::new();
     let mut plan = RepeatPlanBuilder::default();
     let mut spans: Vec<StepSpan> = Vec::new();
     // Whether the last step waits for the position of the next field's key.
@@ -6853,8 +6857,11 @@ fn text_repeat_plan(span: &str, start: usize, shared: &[u64]) -> Option<RepeatPl
     // The first byte of the member being cut: its key's opening quote.
     let mut key = 1usize;
     loop {
-        let key_end = certified_string_end(bytes, key, close)?;
-        if bytes[key_end] != b':' {
+        if text.get(key) != Some(&b'"') {
+            return None;
+        }
+        let (name_start, name_end, key_end) = scan_json_string_span(text, key, &mut specials)?;
+        if text.get(key_end) != Some(&b':') {
             return None;
         }
         if core::mem::take(&mut awaiting_next) {
@@ -6863,14 +6870,14 @@ fn text_repeat_plan(span: &str, start: usize, shared: &[u64]) -> Option<RepeatPl
             }
         }
         let value = key_end + 1;
-        let value_end = certified_value_end(bytes, value, close)?;
+        let value_end = certified_value_end(text, value, &mut specials)?;
         if shared
-            .binary_search(&key_hash(&bytes[key + 1..key_end - 1]))
+            .binary_search(&key_hash(&text[name_start..name_end]))
             .is_ok()
         {
             plan.field(
                 at,
-                Cow::Borrowed(span.get(key + 1..key_end - 1)?),
+                Cow::Borrowed(span.get(name_start..name_end)?),
                 start + value,
             );
             spans.push(StepSpan {
@@ -6896,63 +6903,28 @@ fn text_repeat_plan(span: &str, start: usize, shared: &[u64]) -> Option<RepeatPl
     plan.finish(spans)
 }
 
-/// One past the closing quote of the certified string whose opening quote is
-/// `bytes[at]`, found before `close` ([`text_repeat_plan`]): a certified
-/// string's only escapes are `\x` pairs, so its first unescaped quote ends
-/// it. `None` when `bytes[at]` is not a quote or the string is not closed
-/// before `close`.
-fn certified_string_end(bytes: &[u8], at: usize, close: usize) -> Option<usize> {
-    if bytes.get(at) != Some(&b'"') {
-        return None;
-    }
-    let text = bytes.get(..close)?;
-    let mut i = at + 1;
-    loop {
-        i += text
-            .get(i..)?
-            .iter()
-            .position(|&b| b == b'"' || b == b'\\')?;
-        if text[i] == b'"' {
-            return Some(i + 1);
-        }
-        i += 2;
-    }
-}
-
-/// Where the certified value that starts at `bytes[at]` ends, in the object
-/// whose closing `}` is at `close` ([`text_repeat_plan`]): its member's `,`,
-/// or `close` for the last member. `None` when the value is empty or its
-/// brackets do not close before `close`.
-fn certified_value_end(bytes: &[u8], at: usize, close: usize) -> Option<usize> {
-    match *bytes.get(at)? {
-        b'"' => certified_string_end(bytes, at, close),
-        b'{' | b'[' => {
-            let mut depth = 0usize;
-            let mut i = at;
-            while i < close {
-                match bytes[i] {
-                    b'"' => {
-                        i = certified_string_end(bytes, i, close)?;
-                        continue;
-                    }
-                    b'{' | b'[' => depth += 1,
-                    b'}' | b']' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            return Some(i + 1);
-                        }
-                    }
-                    _ => {}
-                }
-                i += 1;
-            }
-            None
-        }
-        // A number or a literal: no `,`, `}` or `]` inside it.
-        b',' | b'}' | b']' | b':' => None,
+/// Where the certified value that starts at `text[at]` ends, `text` being an
+/// object's members without its closing `}` ([`text_repeat_plan`]): one past
+/// its last byte, which is its member's `,` or the end of `text`. A string is
+/// cut as the scan certified it ([`scan_json_string_span`], whose block mask
+/// `specials` carries from one call to the next), a container by
+/// [`container_end`], and a number or a literal runs to its member's `,`.
+/// `None` when the value is empty, does not close in `text`, or a number or
+/// literal runs into a byte no member's value holds there.
+fn certified_value_end(text: &[u8], at: usize, specials: &mut SpecialMask) -> Option<usize> {
+    match *text.get(at)? {
+        b'"' => scan_json_string_span(text, at, specials).map(|(_, _, end)| end),
+        b'{' | b'[' => container_end(text, at),
         _ => {
-            let len = bytes.get(at..close)?.iter().position(|&b| b == b',');
-            Some(len.map_or(close, |len| at + len))
+            let rest = text.get(at..)?;
+            match rest
+                .iter()
+                .position(|&b| matches!(b, b',' | b':' | b'"' | b'[' | b']' | b'{' | b'}'))
+            {
+                Some(0) => None,
+                Some(len) => (rest[len] == b',').then_some(at + len),
+                None => Some(text.len()),
+            }
         }
     }
 }
@@ -10369,7 +10341,15 @@ mod tests {
                             "{doc}"
                         ),
                         (Some(_), None) => panic!("only the text found a plan: {doc}"), // patchcov: coverage tolerate-line reason="the failure message for the assertion this #7350 test exists to make"
-                        (None, _) => {}
+                        // Too dense to keep spans is the one reason to have
+                        // no plan from the text when the walk finds one.
+                        (None, Some(walked)) => {
+                            assert!(
+                                fates_are_dense(&walked_plan_fates(walked, &fields)),
+                                "{doc}"
+                            )
+                        }
+                        (None, None) => {}
                     }
                     from_text += usize::from(
                         plan.is_some_and(|plan| planned_pieces(&plan, span, start).is_some()),
@@ -10419,6 +10399,21 @@ mod tests {
     /// How many fields `fields` has.
     fn field_count<W: AsRef<[u64]> + Clone>(fields: &JsonFields<'_, W>) -> usize {
         core::iter::successors(Some(*fields), |f| f.uncons().map(|(_, rest)| rest)).count() - 1
+    }
+
+    /// Whether a plan with these fates gives up its spans ([`StepSpan::dense`]):
+    /// during the walk, at some step, or at its end.
+    fn fates_are_dense(fates: &Fates) -> bool {
+        let mut steps = 0usize;
+        for (at, fate) in fates.iter().enumerate() {
+            if fate.is_some() {
+                steps += 1;
+                if StepSpan::dense(steps, at + 1, false) {
+                    return true;
+                }
+            }
+        }
+        StepSpan::dense(steps, fates.len(), true)
     }
 
     /// [`Fates`] of the plan [`text_repeat_plan`] found for `fields`.
@@ -10541,26 +10536,34 @@ mod tests {
                 assert!(text_repeat_plan(span, start, &[]).is_none(), "{doc}");
             }
         }
+        // Ten keys that occur once, so that two `a`s are not dense and only
+        // the fault can leave the plan out.
+        let pad = (0..10)
+            .map(|i| format!("\"u{i}\":{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
         let shared = [key_hash(b"a")];
-        for text in [
-            "{}",
-            "{\"a\"}",
-            "{\"a\":}",
-            "{\"a\":1,}",
-            "{\"a\":1]}",
-            "{\"a\":[1}",
-            "{\"a\":\"1}",
-            "{\"a\":1,\"a\":2,1}",
-            "{\"a\":1:\"a\":2}",
-            "{a:1}",
-            "[]",
+        let well_formed = format!("{{{pad},\"a\":1,\"a\":2}}");
+        assert!(text_repeat_plan(&well_formed, 0, &shared).is_some());
+        for fault in [
+            "\"a\"",
+            "\"a\":",
+            "\"a\":1,",
+            "\"a\":1],\"a\":2",
+            "\"a\":1:\"b\":2,\"a\":3",
+            "\"a\":1\"b\",\"a\":2",
+            "\"a\":1{},\"a\":2",
+            "\"a\":[1,\"a\":2",
+            "\"a\":\"1,\"a\":2",
+            "\"a\":1,\"a\":2,1",
+            "a:1,\"a\":2",
         ] {
+            let text = format!("{{{pad},{fault}}}");
+            assert!(text_repeat_plan(&text, 0, &shared).is_none(), "{text}");
+        }
+        for text in ["{}", "[]", "{\"a\":1,\"a\":2}"] {
             assert!(text_repeat_plan(text, 0, &shared).is_none(), "{text}");
         }
-        assert!(
-            text_repeat_plan("{\"a\":1,\"a\":2}", 0, &shared).is_none(),
-            "dense"
-        );
     }
 
     /// [`cut_planned_text`]'s pieces, collected (#7346).
