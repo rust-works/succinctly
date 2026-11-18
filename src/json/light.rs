@@ -6863,9 +6863,9 @@ fn stream_planned_object<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
 /// same spans from the index (`repeat_plan_from_shared`'s `position_of`).
 ///
 /// The members are cut as the scan certified them ([`certified_value_end`]):
-/// a string by the scan's own [`scan_json_string_span`], a container by
-/// [`container_end`], and a number or a literal at its member's `,`, so the
-/// walk reads a long value a 64-byte block at a time. Each key is hashed between its quotes as the
+/// a string at its first unescaped quote, found a word at a time
+/// ([`quote_or_backslash`]), a container by [`container_end`], and a number or
+/// a literal at its member's `,`. Each key is hashed between its quotes as the
 /// scan hashed it ([`key_hash`] of the raw span, escapes as written), and only
 /// a key whose hash is in `shared` is handed to the duplicate-key rule
 /// ([`RepeatPlanBuilder`], the one `repeat_plan_checked` builds with), under
@@ -6977,10 +6977,11 @@ fn text_plan_or_walk(span: &str, start: usize, shared: &[u64]) -> Option<TextPla
 /// the rule [`write_reindented_at`] cuts by. `None` when `text[at]` is not a
 /// quote or the string does not close in `text`.
 ///
-/// A byte at a time: the strings this sees are short, since an object of long
-/// members is left to the fields' walk ([`TEXT_WALK_MEMBER_BYTES`]), and
-/// [`scan_json_string_span`]'s block mask read 25 M more instructions than
-/// this on the 10 MB repeat row (7950X).
+/// The strings this sees are short, since an object of long members is left to
+/// the fields' walk ([`TEXT_WALK_MEMBER_BYTES`]), so it searches a word at a
+/// time rather than through the scan's block mask ([`scan_json_string_span`]),
+/// which read 25 M more instructions than a byte-at-a-time search on the 10 MB
+/// repeat row (7950X).
 fn certified_string_end(text: &[u8], at: usize) -> Option<usize> {
     if text.get(at) != Some(&b'"') {
         return None;
