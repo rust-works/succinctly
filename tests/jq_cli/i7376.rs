@@ -109,3 +109,70 @@ fn a_file_of_four_small_windows_reads_as_it_does_whole_7376() -> Result<()> {
     assert_eq!(run(Some("8192"), &file)?, whole);
     Ok(())
 }
+
+/// More than 32 files at the window that ships, in any build: `i7024_many_files`,
+/// `i7024_raw_many_files` and `i7197` run on the small window in a debug build, so without this row
+/// `cargo test` would run that route's 1 MiB window nowhere. No variable is set; the first file is
+/// over 4 MiB, a number lies across the end of one file and the start of the next, and the answers
+/// are worked out here, not read from another route.
+#[test]
+fn more_than_32_files_are_read_at_the_shipped_window_7376() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut big = String::new();
+    let mut lines = 0;
+    while big.len() < (4 << 20) + 4096 {
+        big.push_str(&format!(
+            "{{\"id\":{lines},\"pad\":\"{}\"}}\n",
+            "x".repeat(60)
+        ));
+        lines += 1;
+    }
+    let mut texts = vec![big];
+    for n in 1..40 {
+        texts.push(match n {
+            19 => "{\"id\":-19}\n12".to_string(),
+            20 => "34\n{\"id\":-20}\n".to_string(),
+            n => format!("{{\"id\":-{n}}}\n"),
+        });
+    }
+    let mut paths = Vec::new();
+    for (n, text) in texts.iter().enumerate() {
+        let path = dir.path().join(format!("f{n:02}.json"));
+        std::fs::write(&path, text)?;
+        paths.push(path);
+    }
+    let run = |args: &[&str]| -> Result<(String, String, i32)> {
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .arg("jq")
+            .args(args)
+            .args(&paths)
+            .env("LC_ALL", "C")
+            .env_remove(small_window::ENV)
+            .output()?;
+        Ok((
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            output.status.code().unwrap_or(-1),
+        ))
+    };
+    let all = texts.concat();
+    // The values: every record's id, and the number the two files make between them.
+    let ids: String = (0..lines)
+        .map(|i| format!("{i}\n"))
+        .chain((1..40).map(|n| match n {
+            20 => "1234\n-20\n".to_string(),
+            n => format!("-{n}\n"),
+        }))
+        .collect();
+    assert_eq!(
+        run(&["-c", "if type == \"object\" then .id else . end"])?,
+        (ids, String::new(), 0)
+    );
+    // The lines: `-R` reads the same bytes as text.
+    let lengths: String = all
+        .lines()
+        .map(|line| format!("{}\n", line.len()))
+        .collect();
+    assert_eq!(run(&["-R", "length"])?, (lengths, String::new(), 0));
+    Ok(())
+}
