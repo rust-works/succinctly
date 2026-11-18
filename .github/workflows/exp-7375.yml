@@ -31,7 +31,7 @@ jobs:
           cargo fetch
       - name: Measure
         run: |
-          set -u
+          set +e -u
           TESTS="--test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests --test serde_tests --test locate_cli_tests --test corpus_stats_cli_tests --test yq_tonumber_fixture_tests --test jq_path_context_alphabet_tests --test jq_extension_roster_tests --test jq_path_context_streaming_tests --test validate_snippet_multibyte_5988"
           skip=$(scripts/deep-recursion-tests.sh skip-args)
           t() { # label, command...
