@@ -10470,8 +10470,16 @@ mod tests {
             r#""a\n":[1,{"a\n":"]"}],"a":{},"a\n":"\\""#,
             r#""\u0000":null,"é":"é","\u0000":[[],[[]]],"é":true"#,
             r#""k0003":{"k0003":{"x":[",",{"}":"{"}]}},"z":[],"k0003":-1.5"#,
-        ];
-        for tail in tails {
+        ]
+        .map(String::from);
+        // Strings, of a key and of a value, long enough to cross several
+        // 64-byte blocks, full of commas and escaped quotes, with an escape at
+        // every offset against a block's end.
+        let long = (0..64).map(|pad| {
+            let text = format!("{}{}", "p".repeat(pad), r#",\"x\\"#.repeat(40));
+            format!(r#""{text}":1,"a":"{text}","{text}":[2],"a":3"#)
+        });
+        for tail in tails.into_iter().chain(long) {
             for nested in [false, true] {
                 let object = format!("{{{head},{tail}}}");
                 let doc = if nested {
