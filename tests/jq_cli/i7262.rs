@@ -5,6 +5,10 @@
 //! behind a named pipe (which the windowed routes decline), with each operand's name made one, and a file
 //! on standard input against the bytes from where it stands on a pipe named `-`. The rows the turn is
 //! worded by what came before it are pinned to jq 1.7.1's own output as well.
+//!
+//! In a debug build the fixtures are a sixteenth of the size and the binary's window is 64 KiB
+//! (`small_window`, #7376); a release build runs the same rows over the 1 MiB window. The lines jq's
+//! messages name are the fixture's, so they are made from [`RECORDS`].
 
 #![cfg(unix)]
 
@@ -14,11 +18,13 @@ use std::process::Command;
 use anyhow::Result;
 
 use crate::fifo_feed::{self, Feed};
+use crate::small_window::{self, scaled};
 
 type Run = (String, String, i32);
 
-/// How many records the fixtures have: about 6.5 MiB, well over the 4 MiB a file needs to be windowed.
-const RECORDS: usize = 60_000;
+/// How many records the fixtures have: about six windows (6.5 MiB on the shipped one), well over the
+/// four a file needs to be windowed.
+const RECORDS: usize = scaled(60_000);
 
 fn record(i: usize) -> String {
     format!(
@@ -34,11 +40,13 @@ fn records(range: std::ops::Range<usize>) -> String {
 /// `succinctly jq ARGS OPERAND` with stdin null, fed by `feeds` and held to their deadline (#7304).
 fn jq(args: &[&str], operand: &std::path::Path, feeds: &[Feed]) -> Result<Run> {
     let output = fifo_feed::output(
-        Command::new(env!("CARGO_BIN_EXE_succinctly"))
-            .arg("jq")
-            .args(args)
-            .arg(operand)
-            .env("LC_ALL", "C"),
+        small_window::apply(
+            Command::new(env!("CARGO_BIN_EXE_succinctly"))
+                .arg("jq")
+                .args(args)
+                .arg(operand)
+                .env("LC_ALL", "C"),
+        ),
         feeds,
     )?;
     let name = |bytes: &[u8]| {
@@ -54,7 +62,10 @@ fn jq(args: &[&str], operand: &std::path::Path, feeds: &[Feed]) -> Result<Run> {
 /// `succinctly jq ARGS FILE` over `bytes` in a named file (the windowed route) and behind a named pipe
 /// (the route that reads it whole): the run, once the two are checked to be one.
 fn named(args: &[&str], bytes: &[u8]) -> Result<Run> {
-    assert!(bytes.len() > 4 * 1024 * 1024, "the file must be windowed");
+    assert!(
+        bytes.len() > small_window::MIN_BYTES,
+        "the file must be windowed"
+    );
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("f.seq");
     std::fs::File::create(&path)?.write_all(bytes)?;
@@ -74,13 +85,19 @@ fn on_stdin(args: &[&str], bytes: &[u8], offset: u64) -> Result<Run> {
     std::fs::File::create(&path)?.write_all(bytes)?;
     let mut file = std::fs::File::open(&path)?;
     file.seek(SeekFrom::Start(offset))?;
+    assert!(
+        bytes.len() - offset as usize > small_window::MIN_BYTES,
+        "what is left of the file must be windowed"
+    );
     // Both runs are held to `fifo_feed`'s deadline (#7314): the first reads a file on its standard input,
     // the second a pipe, whose bytes the helper writes on a thread of its own.
     let output = fifo_feed::output_stdin_file(
-        Command::new(env!("CARGO_BIN_EXE_succinctly"))
-            .arg("jq")
-            .args(args)
-            .env("LC_ALL", "C"),
+        small_window::apply(
+            Command::new(env!("CARGO_BIN_EXE_succinctly"))
+                .arg("jq")
+                .args(args)
+                .env("LC_ALL", "C"),
+        ),
         file,
     )?;
     let windowed = (
@@ -89,11 +106,13 @@ fn on_stdin(args: &[&str], bytes: &[u8], offset: u64) -> Result<Run> {
         output.status.code().unwrap_or(-1),
     );
     let output = fifo_feed::output_stdin(
-        Command::new(env!("CARGO_BIN_EXE_succinctly"))
-            .arg("jq")
-            .args(args)
-            .arg("-")
-            .env("LC_ALL", "C"),
+        small_window::apply(
+            Command::new(env!("CARGO_BIN_EXE_succinctly"))
+                .arg("jq")
+                .args(args)
+                .arg("-")
+                .env("LC_ALL", "C"),
+        ),
         &bytes[offset as usize..],
     )?;
     let whole = (
@@ -105,15 +124,16 @@ fn on_stdin(args: &[&str], bytes: &[u8], offset: u64) -> Result<Run> {
     Ok(windowed)
 }
 
-const PROGRAMS: [&[&str]; 3] = [
-    &["--seq", "-c", "."],
-    &["--seq", "-c", ".id?"],
-    &[
-        "--seq",
-        "-c",
-        "if .id? == 30000 then error(\"boom\") else empty end",
-    ],
-];
+/// The record in the middle of the fixture, which [`boom`] raises an error at.
+const MIDDLE: usize = RECORDS / 2;
+
+/// A runtime error at the record in the middle.
+fn boom() -> String {
+    format!("if .id? == {MIDDLE} then error(\"boom\") else empty end")
+}
+
+const IDENTITY: &[&str] = &["--seq", "-c", "."];
+const IDS: &[&str] = &["--seq", "-c", ".id?"];
 
 /// A file that stops being plain part-way is the whole-stream route's from there: its warnings name the
 /// lines and columns of the whole file, a runtime error after the turn names the line its value was read
@@ -122,6 +142,8 @@ const PROGRAMS: [&[&str]; 3] = [
 fn a_seq_file_that_turns_is_read_on_as_the_whole_file_7262() -> Result<()> {
     let head = records(0..RECORDS / 2);
     let rest = records(RECORDS / 2..RECORDS);
+    let boom = boom();
+    let boom: &[&str] = &["--seq", "-c", &boom];
     for turn in [
         "\x1e{\"a\":1\n",
         "\x1e[1,]\n",
@@ -133,20 +155,22 @@ fn a_seq_file_that_turns_is_read_on_as_the_whole_file_7262() -> Result<()> {
         "\x1e{}\n\n",
     ] {
         let stream = format!("{head}{turn}{rest}").into_bytes();
-        named(PROGRAMS[0], &stream)?;
-        named(PROGRAMS[2], &stream)?;
-        on_stdin(PROGRAMS[2], &stream, 0)?;
+        named(IDENTITY, &stream)?;
+        named(boom, &stream)?;
+        on_stdin(boom, &stream, 0)?;
     }
     let stream = format!("{head}\x1e[1,]\n{rest}").into_bytes();
     let expected = |name: &str| {
         format!(
-            "jq: ignoring parse error: Expected another array element at line 30001, column 5 (need RS to resync)\n\
-             jq: error (at {name}:30002): boom\n"
+            "jq: ignoring parse error: Expected another array element at line {}, column 5 (need RS to resync)\n\
+             jq: error (at {name}:{}): boom\n",
+            MIDDLE + 1,
+            MIDDLE + 2
         )
     };
-    let (_, err, status) = named(PROGRAMS[2], &stream)?;
+    let (_, err, status) = named(boom, &stream)?;
     assert_eq!((err, status), (expected("<file>"), 0));
-    let (_, err, _) = on_stdin(PROGRAMS[2], &stream, 0)?;
+    let (_, err, _) = on_stdin(boom, &stream, 0)?;
     assert_eq!(err, expected("<stdin>"));
     Ok(())
 }
@@ -166,13 +190,16 @@ fn a_seq_file_with_a_cut_record_first_or_last_7262() -> Result<()> {
             0
         )
     );
-    assert!(out.starts_with("user 0\n") && out.ends_with("user 59999\n"));
+    assert!(out.starts_with("user 0\n") && out.ends_with(&format!("user {}\n", RECORDS - 1)));
     let last = format!("{clean}{cut}").into_bytes();
     let (out, err, status) = named(&["--seq", "-r", ".name"], &last)?;
     assert_eq!(
-        (err.as_str(), status),
+        (err, status),
         (
-            "jq: ignoring parse error: Unfinished string at EOF at line 60002, column 0\n",
+            format!(
+                "jq: ignoring parse error: Unfinished string at EOF at line {}, column 0\n",
+                RECORDS + 2
+            ),
             0
         )
     );
@@ -188,22 +215,18 @@ fn a_seq_file_with_a_cut_record_first_or_last_7262() -> Result<()> {
 #[test]
 fn a_seq_file_turns_with_what_its_records_left_7262() -> Result<()> {
     let head = records(0..RECORDS);
+    // The line of the bare `n`: the records, the record before it, and its own.
+    let line = RECORDS + 3;
+    let literal = format!(
+        "jq: ignoring parse error: Invalid literal at line {line}, column 0 (need RS to resync)\n"
+    );
+    let numeric = format!(
+        "jq: ignoring parse error: Invalid numeric literal at line {line}, column 0 (need RS to resync)\n"
+    );
     let cases: [(&str, &str, &str); 4] = [
-        (
-            "\x1e[\"x\\u0075\"]\n\x1en\n",
-            "\x1e[\"xu\"]\n",
-            "jq: ignoring parse error: Invalid literal at line 60003, column 0 (need RS to resync)\n",
-        ),
-        (
-            "\x1enull\n\x1en\n",
-            "\x1enull\n",
-            "jq: ignoring parse error: Invalid literal at line 60003, column 0 (need RS to resync)\n",
-        ),
-        (
-            "\x1e7\n\x1en\n",
-            "\x1e7\n",
-            "jq: ignoring parse error: Invalid numeric literal at line 60003, column 0 (need RS to resync)\n",
-        ),
+        ("\x1e[\"x\\u0075\"]\n\x1en\n", "\x1e[\"xu\"]\n", &literal),
+        ("\x1enull\n\x1en\n", "\x1enull\n", &literal),
+        ("\x1e7\n\x1en\n", "\x1e7\n", &numeric),
         ("\x1e12.5", "", ""),
     ];
     for (turn, last, err) in cases {
@@ -211,7 +234,8 @@ fn a_seq_file_turns_with_what_its_records_left_7262() -> Result<()> {
         let (out, got_err, status) = named(&["--seq", "-c", "."], &stream)?;
         assert!(
             out.ends_with(&format!(
-                "\"tags\":[\"a\",\"b\",\"c\"],\"score\":999}}\n{last}"
+                "\"tags\":[\"a\",\"b\",\"c\"],\"score\":{}}}\n{last}",
+                (RECORDS - 1) % 1000
             )),
             "{turn:?}"
         );
@@ -228,13 +252,15 @@ fn a_seq_file_that_never_turns_plain_or_stops_first_7262() -> Result<()> {
     let clean = records(0..RECORDS);
     for front in ["\u{feff}", "x\n", "\n"] {
         let stream = format!("{front}{clean}{}", "\x1e[1,]\n").into_bytes();
-        named(PROGRAMS[1], &stream)?;
-        on_stdin(PROGRAMS[1], &stream, 0)?;
+        named(IDS, &stream)?;
+        on_stdin(IDS, &stream, 0)?;
     }
     let stream = format!("{clean}\x1e{{\"a\"\n").into_bytes();
-    let at = clean.find("\x1e{\"id\":1000,").expect("a record") as u64;
+    let at = clean
+        .find(&format!("\x1e{{\"id\":{},", scaled(1000)))
+        .expect("a record") as u64;
     for offset in [at, at + 3] {
-        on_stdin(PROGRAMS[1], &stream, offset)?;
+        on_stdin(IDS, &stream, offset)?;
     }
     let (_, err, status) = named(
         &[

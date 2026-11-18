@@ -7,6 +7,9 @@
 //!
 //! The rules the documents meet by are those of the same program over a few files (`i7024_inputs_files.rs`);
 //! what this adds is that a path may change before the run gets to it, which it then reads as it stands.
+//!
+//! In a debug build the fixtures are a sixteenth of the size and the binary's window is 64 KiB
+//! (`small_window`, #7376); a release build runs the same rows over the 1 MiB window.
 
 #![cfg(unix)]
 
@@ -16,9 +19,13 @@ use std::process::Command;
 use anyhow::Result;
 
 use crate::fifo_feed::{self, Feed};
+use crate::small_window::{self, scaled};
 
 /// More files than the route holds open (32), small enough that a token is open where many end.
 const FILES: usize = 40;
+
+/// How many lines the fixtures have: four windows or more of text (the tests check it).
+const LINES: usize = scaled(64_000);
 
 fn text(lines: usize) -> Vec<u8> {
     (0..lines)
@@ -53,11 +60,13 @@ fn whole_by_descriptor(args: &[&str], paths: &[std::path::PathBuf]) -> Result<Ru
         operands.push(fifo);
     }
     let output = fifo_feed::output(
-        Command::new(env!("CARGO_BIN_EXE_succinctly"))
-            .arg("jq")
-            .args(args)
-            .args(&operands)
-            .env("LC_ALL", "C"),
+        small_window::apply(
+            Command::new(env!("CARGO_BIN_EXE_succinctly"))
+                .arg("jq")
+                .args(args)
+                .args(&operands)
+                .env("LC_ALL", "C"),
+        ),
         &feeds,
     )?;
     let named = |text: &[u8]| {
@@ -93,12 +102,14 @@ fn both(args: &[&str], files: &[Vec<u8>]) -> Result<(Run, Run)> {
         };
         (name(run.0), name(run.1), run.2)
     };
-    let windowed = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .arg("jq")
-        .args(args)
-        .args(&paths)
-        .env("LC_ALL", "C")
-        .output()?;
+    let windowed = small_window::apply(
+        Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .arg("jq")
+            .args(args)
+            .args(&paths)
+            .env("LC_ALL", "C"),
+    )
+    .output()?;
     let windowed = (
         String::from_utf8_lossy(&windowed.stdout).into_owned(),
         String::from_utf8_lossy(&windowed.stderr).into_owned(),
@@ -131,29 +142,44 @@ fn cut_at_lines(bytes: &[u8]) -> Vec<Vec<u8>> {
 
 #[test]
 fn input_over_more_files_than_are_held_open_reads_as_one_stream_7197() -> Result<()> {
-    let files = cut_at_lines(&text(60_000));
-    assert!(files.iter().map(Vec::len).sum::<usize>() >= 4 << 20);
+    let files = cut_at_lines(&text(LINES));
+    assert!(files.iter().map(Vec::len).sum::<usize>() >= small_window::MIN_BYTES);
+    let late = LINES * 3 / 4;
+    let names = format!(
+        "input_filename, (input | input_filename), (inputs | select(.id == {late}) | input_filename)"
+    );
+    let some = format!("[inputs | select(.id % {} == 0) | .id]", LINES / 6 - 1);
+    let stop = format!("inputs | if .id == {late} then error(\"stop\") else .id end");
+    let last = format!("inputs | select(.id > {}) | .id", LINES - 10);
     for args in [
         &["-c", "-n", "[inputs] | length"][..],
         &["-c", "-n", "first(inputs) | .id"],
         &["-c", "-n", "reduce inputs as $x (0; . + 1)"],
         &["-c", "-n", "[limit(5; inputs | .id)]"],
         &["-c", "[., input] | length"],
-        &["-c", "-n", "input_filename, (input | input_filename), (inputs | select(.id == 45000) | input_filename)"],
-        &["-c", "-n", "[inputs | select(.id % 9999 == 0) | .id]"],
+        &["-c", "-n", &names],
+        &["-c", "-n", &some],
         &["-c", "-n", "[inputs | input_line_number] | add"],
         // A runtime error names the file and line jq's reader is at.
-        &["-c", "-n", "inputs | if .id == 45000 then error(\"stop\") else .id end"],
-        &["-c", "-n", "inputs | select(.id > 59990) | .id"],
+        &["-c", "-n", &stop],
+        &["-c", "-n", &last],
     ] {
         same(args, &files)?;
     }
+    // The rows say what they are meant to: the ids are in the text at this size.
+    let (stdout, _, _) = same(&["-c", "-n", &names], &files)?;
+    assert_eq!(stdout.lines().count(), 3, "{stdout}");
+    let (stdout, stderr, status) = same(&["-c", "-n", &stop], &files)?;
+    assert_eq!(stdout.lines().count(), late);
+    assert!(stderr.contains("stop") && status == 5, "{stderr}");
+    let (stdout, _, _) = same(&["-c", "-n", &last], &files)?;
+    assert_eq!(stdout.lines().count(), 9);
     Ok(())
 }
 
 #[test]
 fn a_bom_at_the_front_is_skipped_when_the_first_file_is_opened_7197() -> Result<()> {
-    let mut files = cut_at_lines(&text(60_000));
+    let mut files = cut_at_lines(&text(LINES));
     files[0].splice(0..0, b"\xef\xbb\xbf".iter().copied());
     for args in [
         &["-c", "-n", "[inputs] | length"][..],
@@ -167,7 +193,7 @@ fn a_bom_at_the_front_is_skipped_when_the_first_file_is_opened_7197() -> Result<
 
 #[test]
 fn a_fault_or_an_open_token_hands_the_rest_to_the_eager_reader_7197() -> Result<()> {
-    let bytes = text(60_000);
+    let bytes = text(LINES);
     for (at, bad) in [
         (bytes.len() / 3, &b"{\"bad\": [1 2]}\n"[..]),
         (bytes.len() / 2, b"}\n"),
@@ -232,10 +258,14 @@ fn changed_while_running(change: Change, args: &[&str]) -> Result<(Run, Run)> {
         .collect();
     for (n, path) in paths.iter().enumerate() {
         let bytes = match n {
-            // Just over the 4 MiB the route needs, and more output than a pipe holds.
+            // Just over the four windows the route needs, and more output than a pipe holds.
             0 => {
-                let bytes = text(60_000);
-                assert!(bytes.len() >= 4 << 20, "{} bytes", bytes.len());
+                let bytes = text(LINES);
+                assert!(
+                    bytes.len() >= small_window::MIN_BYTES,
+                    "{} bytes",
+                    bytes.len()
+                );
                 bytes
             }
             19 => b"{\"k\":19}\n12".to_vec(),
@@ -246,14 +276,16 @@ fn changed_while_running(change: Change, args: &[&str]) -> Result<(Run, Run)> {
         std::fs::write(path, bytes)?;
     }
     let bin = env!("CARGO_BIN_EXE_succinctly");
-    let mut child = Command::new(bin)
-        .arg("jq")
-        .args(args)
-        .args(&paths)
-        .env("LC_ALL", "C")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
+    let mut child = small_window::apply(
+        Command::new(bin)
+            .arg("jq")
+            .args(args)
+            .args(&paths)
+            .env("LC_ALL", "C"),
+    )
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()?;
     let mut stdout = child.stdout.take().expect("piped");
     let mut first = vec![0u8; 4096];
     stdout.read_exact(&mut first)?;
@@ -339,7 +371,7 @@ fn a_path_that_changes_before_the_run_reaches_it_is_read_as_jq_reads_it_7197() -
 #[test]
 fn a_hand_off_over_more_files_than_may_be_open_reads_every_file_7197() -> Result<()> {
     const MANY: usize = 120;
-    let bytes = text(60_000);
+    let bytes = text(LINES);
     let mut files = Vec::with_capacity(MANY);
     let mut from = 0;
     for n in 1..MANY {
@@ -361,17 +393,22 @@ fn a_hand_off_over_more_files_than_may_be_open_reads_every_file_7197() -> Result
         std::fs::write(&path, bytes)?;
         paths.push(path);
     }
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg("ulimit -n 40 && exec \"$0\" \"$@\"")
-        .arg(env!("CARGO_BIN_EXE_succinctly"))
-        .args(["jq", "-c", "-n", "[inputs] | length, (map(numbers) | add)"])
-        .args(&paths)
-        .env("LC_ALL", "C")
-        .output()?;
+    let output = small_window::apply(
+        Command::new("sh")
+            .arg("-c")
+            .arg("ulimit -n 40 && exec \"$0\" \"$@\"")
+            .arg(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["jq", "-c", "-n", "[inputs] | length, (map(numbers) | add)"])
+            .args(&paths)
+            .env("LC_ALL", "C"),
+    )
+    .output()?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(0), "{stderr}");
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "60001\n1234\n");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("{}\n1234\n", LINES + 1)
+    );
     assert_eq!(stderr, "");
     Ok(())
 }

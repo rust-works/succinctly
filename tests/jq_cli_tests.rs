@@ -230,6 +230,10 @@ use cargo_run_exit::{
 #[path = "common/fifo_feed.rs"]
 mod fifo_feed;
 
+// The windowed routes over small fixtures: the debug build's window knob (#7376).
+#[path = "common/small_window.rs"]
+mod small_window;
+
 // New tests go in `tests/jq_cli/` (one `iNNNN.rs` per issue), not at the end of this file:
 // see the header of `tests/jq_cli/mod.rs`. #4329, #5697.
 #[path = "jq_cli/mod.rs"]
