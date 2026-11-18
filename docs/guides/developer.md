@@ -184,6 +184,28 @@ add it to `HEAVY_TESTS` so it runs unoptimised on every platform
 The list handles that one test target only: a test in another `cli-gated` binary has to hold on
 both builds, by deriving its depth from the build or by asserting only what both give.
 
+`succinctly jq` reads a big file, a list of files or a pipe a window at a time once it holds four
+windows, and a window is 1 MiB, so a CLI test of those routes needs a fixture of 4 MiB or more
+and was the heaviest kind of test in `jq_cli_tests`. A **debug build** of the binary reads a
+smaller window from `SUCCINCTLY_DEBUG_JQ_WINDOW_BYTES` (8192 to 1048576; `window::window_bytes`,
+#7376), and every limit that is a multiple of the window follows it. The variable is a test knob,
+not a feature: it is compiled out of a release build (`cfg(debug_assertions)`), where the window
+is a constant, and `tests/jq_cli/i7376.rs` pins that its name is not in a release binary. A value
+a debug build cannot use is refused at exit 2 instead of ignored. A new windowed-route test
+should use `tests/common/small_window.rs` (`crate::small_window` in `jq_cli_tests`): build the
+fixture from `scaled(...)` counts, run the binary through `apply` or `small_window::spawn_jq`, and
+derive the expected lines and ids from the scaled count. The test then runs a 64 KiB window over
+a fixture a sixteenth of the size in a debug build (CI's `opt-level=1` legs included, which keep
+debug assertions) and the shipped 1 MiB window in `cargo test --release`. These tests compare the
+windowed route with the one that reads the input whole, so one that stops reaching the route
+still passes: assert the fixture is at least `small_window::MIN_BYTES`, and when converting an
+existing test compare the lines of `src/bin/succinctly/jq_runner/window.rs` and `jq_runner.rs`
+it executes before and after. Eight files are converted (`i7024_many_files`,
+`i7024_raw_many_files`, `i7164`, `i7197`, `i7262`, `i7266`, `i7277`, `i7279`). The rest are not,
+some on purpose: `i6920`, `i7023`, `i7024`, `i7024_files`, `i7024_pipe`, `i7024_raw`, `i7082`,
+`i7322` and `i7341` among them still run the 1 MiB window in a debug build, so `cargo test` runs
+each route's shipped constants end to end.
+
 ### Differential sweeps against jq
 
 A change to the jq evaluator, the path register above all, is judged against `/usr/bin/jq` (1.7.1) over a
