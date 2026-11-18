@@ -18071,7 +18071,11 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 FormatType::YqYaml(n) => crate::jq::stream::yq_to_yaml_indent_width(*n),
                 _ => 2,
             };
-            let node_text = if indent <= 9 && !yq_yaml_unwraps_string(&owned) {
+            // #5836: a string node that is not an alias is unwrapped to its own text; an alias node
+            // is still `*name` (the unwrapped root is the alias node), which the node writer gives.
+            let unwrapped = yq_yaml_unwraps_string(&owned)
+                && !cursor.as_ref().is_some_and(DocumentCursor::is_alias);
+            let node_text = if indent <= 9 && !unwrapped {
                 yq_node_yaml_text::<S, _>(cursor.as_ref(), &owned, indent)
             } else {
                 None

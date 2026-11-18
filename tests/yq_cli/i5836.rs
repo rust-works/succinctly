@@ -419,3 +419,52 @@ fn a_top_level_string_is_written_as_its_own_text_by_yaml_5836() -> Result<()> {
     }
     Ok(())
 }
+
+/// The same over document nodes: an alias node stays `*name` (the unwrapped root is the alias node),
+/// and an anchored, tagged, commented or block-scalar string is its own text.
+const UNWRAP_NODE_ROWS: &[(&str, &[&str], &str, &str)] = &[
+    ("a: &x q\nb: *x\n", &[], ".b | @yaml", "*x\n\n"),
+    ("a: &x q\nb: *x\n", &[], ".b | to_yaml", "*x\n\n"),
+    ("a: &x q\nb: *x\n", &[], ".b | to_yaml(4)", "*x\n\n"),
+    ("a: &x q\nb: *x\n", &[], ".a | @yaml", "q\n\n"),
+    ("a: &x \"1\"\nb: *x\n", &[], ".b | @yaml", "*x\n\n"),
+    ("a: &x \"1\"\nb: *x\n", &[], ".b | to_yaml", "*x\n\n"),
+    ("a: &x \"1\"\nb: *x\n", &[], ".b | to_yaml(4)", "*x\n\n"),
+    ("a: &x \"1\"\nb: *x\n", &[], ".a | @yaml", "1\n\n"),
+    ("a: &x <<\nb: *x\n", &[], ".b | @yaml", "*x\n\n"),
+    ("a: &x <<\nb: *x\n", &[], ".b | to_yaml", "*x\n\n"),
+    ("a: &x <<\nb: *x\n", &[], ".b | to_yaml(4)", "*x\n\n"),
+    ("a: &x <<\nb: *x\n", &[], ".a | @yaml", "<<\n\n"),
+    ("a: &x |\n  l1\nb: *x\n", &[], ".b | @yaml", "*x\n\n"),
+    ("a: &x |\n  l1\nb: *x\n", &[], ".b | to_yaml", "*x\n\n"),
+    ("a: &x |\n  l1\nb: *x\n", &[], ".b | to_yaml(4)", "*x\n\n"),
+    ("a: &x |\n  l1\nb: *x\n", &[], ".a | @yaml", "l1\n\n\n"),
+    ("a: &x q # c\nb: *x\n", &[], ".b | @yaml", "*x\n\n"),
+    ("a: &x q # c\nb: *x\n", &[], ".b | to_yaml", "*x\n\n"),
+    ("a: &x q # c\nb: *x\n", &[], ".b | to_yaml(4)", "*x\n\n"),
+    ("a: &x q # c\nb: *x\n", &[], ".a | @yaml", "q\n\n"),
+    ("a: !!str q\n", &[], ".a | @yaml", "q\n\n"),
+    ("a: q # c\n", &[], ".a | to_yaml", "q\n\n"),
+    ("a: !foo q\n", &[], ".a | @yaml", "q\n\n"),
+    ("a: |\n  l1\n  l2\n", &[], ".a | @yaml", "l1\nl2\n\n\n"),
+    ("a: >\n  l1\n  l2\n", &[], ".a | to_yaml", "l1 l2\n\n\n"),
+    (
+        "a: &x \"1\"\nb: x\n",
+        &[],
+        ". | @yaml",
+        "a: &x \"1\"\nb: x\n\n",
+    ),
+];
+
+#[test]
+fn an_alias_node_stays_an_alias_and_other_string_nodes_are_their_text_5836() -> Result<()> {
+    for &(doc, flags, filter, want) in UNWRAP_NODE_ROWS {
+        let (out, code) = run_yq_stdin(filter, doc, flags)?;
+        assert_eq!(
+            (out.as_str(), code),
+            (want, 0),
+            "{filter} {flags:?} on {doc:?}"
+        );
+    }
+    Ok(())
+}

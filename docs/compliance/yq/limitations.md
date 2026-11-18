@@ -7637,9 +7637,15 @@ A flow collection stays flow, a nested one inside a block node too, a trailing c
 That is pinned by `tests/yq_cli/i6901.rs`.
 What is left is a value with no node to read: `[.a] | to_yaml` over `a: {b: 1}` is `- b: 1` here and `- {b: 1}` in yq, and so is a node behind a write (`.z = 1 | .a | to_yaml`), one read back out of a constructor (`{"k": .a} | .k | to_yaml`), and one behind `with_entries`, `sort`, `reverse`, `unique`, `pick` or an array `+`, which yq reorders or copies in place and so leaves in its source style.
 A string at the top level of `@yaml` or `to_yaml` is its own text while `--unwrapScalar` holds, which is the default ([#5836](https://github.com/rust-works/succinctly/issues/5836), `tests/yq_cli/i5836.rs`).
-yq's encoder unwraps a scalar root, so `"<<" | @yaml` is `<<`, `"1"` is `1`, `"- x"` is `- x` and `"x\ny"` is two lines, where go-yaml would quote each of them; they were quoted here.
-A string inside a collection (`["<<"] | @yaml`) is quoted as before, and so is every string under `--unwrapScalar=false` and `-o=json`, which write no unwrapped scalar.
-That checked 1,820 rows against yq v4.53.3 (27 strings, 14 filters, 5 flag sets); a multi-line string inside a collection and a string encoded twice under `--unwrapScalar=false` still differ, as the table below says.
+yq's encoder unwraps a scalar root.
+So `"<<" | @yaml` is `<<`, `"1"` is `1`, `"- x"` is `- x` and `"x\ny"` is two lines.
+go-yaml would quote each of them, and they were quoted here.
+A string node that is an alias is still `*name`, as the unwrapped root is the alias node.
+A string inside a collection (`["<<"] | @yaml`) is quoted as before.
+So is every string under `--unwrapScalar=false` and `-o=json`, which write no unwrapped scalar.
+That checked 1,820 rows against yq v4.53.3 (27 strings, 14 filters, 5 flag sets) and 84 rows over document nodes (aliases, anchors, tags, comments, block scalars).
+A multi-line string, at the top level of those two modes or inside a collection, is a literal block in yq and a double-quoted string here, as the table below says.
+A string encoded twice under `--unwrapScalar=false` still differs the same way.
 Captured live (v4.53.3):
 
 | filter                                         | real yq           | succinctly yq | why                                                                                                                                                                                                      |
