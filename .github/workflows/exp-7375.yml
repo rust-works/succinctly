@@ -1,0 +1,74 @@
+# Throwaway measurement for #7375; this branch is never merged.
+name: exp-7375
+on:
+  push:
+    branches: ['exp-7375-*']
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: 1
+jobs:
+  measure:
+    name: measure (${{ matrix.order }})
+    runs-on: macos-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - order: "o1 o1-lt o1-d0 o0 o0-lt"
+          - order: "o0-lt o0 o1-d0 o1-lt o1"
+          - order: "o1-lt o0 o1 o0-lt o1-d0"
+    env:
+      SUCCINCTLY_EXPECT_SIMD: neon
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: |
+          sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+          df -h /
+          cargo fetch
+      - name: Measure
+        run: |
+          set -u
+          TESTS="--test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests --test serde_tests --test locate_cli_tests --test corpus_stats_cli_tests --test yq_tonumber_fixture_tests --test jq_path_context_alphabet_tests --test jq_extension_roster_tests --test jq_path_context_streaming_tests --test validate_snippet_multibyte_5988"
+          skip=$(scripts/deep-recursion-tests.sh skip-args)
+          t() { # label, command...
+            local label="$1"; shift
+            local s=$(date +%s)
+            "$@" > step.log 2>&1
+            local rc=$?
+            local e=$(date +%s)
+            echo "RESULT $variant $label $((e - s)) s rc=$rc"
+            if [ $rc -ne 0 ]; then tail -60 step.log; fi
+            grep -E "^test result|finished in" step.log | sed "s/^/  $variant $label: /" | sort -t' ' -k1,1 | tail -25 || true
+          }
+          for variant in ${{ matrix.order }}; do
+            unset CARGO_INCREMENTAL CARGO_PROFILE_DEV_DEBUG
+            case $variant in
+              o1)    export CARGO_PROFILE_DEV_OPT_LEVEL=1 ;;
+              o1-lt) export CARGO_PROFILE_DEV_OPT_LEVEL=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=line-tables-only ;;
+              o1-d0) export CARGO_PROFILE_DEV_OPT_LEVEL=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 ;;
+              o0)    export CARGO_PROFILE_DEV_OPT_LEVEL=0 ;;
+              o0-lt) export CARGO_PROFILE_DEV_OPT_LEVEL=0 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=line-tables-only ;;
+            esac
+            rm -rf target
+            t build-bin cargo build --features cli --bin succinctly
+            t build-tests cargo test --features cli $TESTS --no-run
+            echo "RESULT $variant target-size $(du -sm target | cut -f1) MB"
+            case $variant in
+              o1|o1-lt|o0)
+                t run-tests cargo test --features cli $TESTS -- $skip
+                ;;
+            esac
+            case $variant in
+              o1-lt|o0-lt)
+                t build-yq cargo test --features cli --test yq_cli_tests --no-run
+                t run-yq cargo test --features cli --test yq_cli_tests
+                ;;
+            esac
+            if [ $variant = o0-lt ]; then
+              t deep-recursion scripts/deep-recursion-tests.sh run
+            fi
+          done
