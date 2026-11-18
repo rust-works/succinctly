@@ -3708,7 +3708,8 @@ fn hash_walk<F: DocumentFields>(fields: &F, collections_as_empty: bool) -> HashW
 /// list and its map of every key took the print's peak to 2.6-2.9 GB; this holds
 /// two steps. A step is a position and a slot, and a value cursor is kept per
 /// slot, so an object that repeats a few keys a million times holds 16 bytes
-/// per occurrence and one cursor per key.
+/// per occurrence and one cursor per key; the JSON printer's plan holds 24
+/// more per occurrence, where its field lies in the text (#7346).
 pub(crate) struct RepeatPlan<C> {
     /// One per field that has a step, in walk order.
     steps: Vec<RepeatStep>,
@@ -3716,6 +3717,41 @@ pub(crate) struct RepeatPlan<C> {
     values: Vec<C>,
     /// The next step [`RepeatPlan::fate`] has not reached yet.
     next: usize,
+    /// Where each step's field lies in the text, one per step, when the plan
+    /// was asked for them ([`repeat_plan_from_shared`]'s `position_of`), so
+    /// that a writer can copy the text between steps rather than walk it
+    /// (#7346). Empty otherwise, and when some position was missing.
+    spans: Vec<StepSpan>,
+}
+
+/// Where one step's field of a [`RepeatPlan`] lies in the text (#7346): the
+/// positions of its key, of its value, and of the key of the field after it,
+/// or [`StepSpan::LAST`] when it is the object's last field. Three positions
+/// a walk reads in constant time, so the field's end is never searched for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StepSpan {
+    pub(crate) key: usize,
+    pub(crate) value: usize,
+    pub(crate) next: usize,
+}
+
+impl StepSpan {
+    /// [`StepSpan::next`] of the object's last field.
+    pub(crate) const LAST: usize = usize::MAX;
+
+    /// How many steps a plan records spans for before it gives them up when
+    /// more than half the fields walked so far have a step; a plan that ends
+    /// with more than half its fields stepped gives them up too. Past that
+    /// share the walk writes the object for less: each span costs three
+    /// text-position lookups and 24 bytes, and the text print saves only the
+    /// fields without a step. With spans, an object of 20 keys followed by
+    /// one key a million times read 2,450 M instructions instead of 2,004 M
+    /// and peaked at 74 MB instead of 42 MB (M4 Pro, `.`). The check during
+    /// the walk sees only the fields walked so far, so it waits for this many
+    /// steps (1.5 MB of spans) before it judges: an object whose repeats
+    /// cluster in its first fields keeps its spans unless they number more
+    /// than this.
+    pub(crate) const DENSE_FROM: usize = 1 << 16;
 }
 
 /// One field of a [`RepeatPlan`]: its position, and the slot of the value
@@ -3774,6 +3810,24 @@ impl<C: Copy> RepeatPlan<C> {
         }
         out
     }
+
+    /// Every step in walk order, as where its own field lies in the text and
+    /// the value it is written with, `None` for a field that is dropped
+    /// (#7346). `None` when the plan has no spans.
+    pub(crate) fn spanned_steps(&self) -> Option<impl Iterator<Item = (StepSpan, Option<C>)> + '_> {
+        (!self.spans.is_empty()).then(|| {
+            self.steps
+                .iter()
+                .zip(&self.spans)
+                .map(|(step, &span)| (span, self.values.get(step.slot).copied()))
+        })
+    }
+
+    /// The spans of every step, in walk order ([`RepeatPlan::spanned_steps`]),
+    /// for a writer that looks up where a planned value's own field ends.
+    pub(crate) fn spans(&self) -> &[StepSpan] {
+        &self.spans
+    }
 }
 
 /// The [`RepeatPlan`] for `fields` under the mode's duplicate-key rule, refusing an object whose
@@ -3815,8 +3869,13 @@ pub(crate) fn repeat_plan_checked<F: DocumentFields>(
         &walked.shared,
         walked.unkeyed > 0,
         |key| collapse_key_hash_of(key, collections_as_empty),
+        None,
     ))
 }
+
+/// Where a cursor's node starts in its document's text:
+/// [`repeat_plan_from_shared`]'s `position_of` (#7346).
+pub(crate) type PositionOf<C> = fn(&C) -> Option<usize>;
 
 /// [`repeat_plan_checked`]'s second walk alone, for a caller that knows the
 /// object is well formed, that every key of it decodes, and which key hashes
@@ -3828,12 +3887,19 @@ pub(crate) fn repeat_plan_checked<F: DocumentFields>(
 /// hashed one way and listed another would be missed. Keys are still grouped
 /// by their decoded spelling, so a hash two different keys share is told
 /// apart here, and an object where that is all that happened answers `None`.
+///
+/// `position_of` is asked where each step's key and value start in the text,
+/// and where the key of the field after it does, so that the writer can copy
+/// the fields between steps from the text (#7346,
+/// [`RepeatPlan::spanned_steps`]). A position it cannot give leaves the plan
+/// without spans.
 pub(crate) fn repeat_plan_from_shared<F: DocumentFields>(
     fields: &F,
     shared: &[u64],
     hash_of: impl Fn(&F::Value) -> Option<u64>,
+    position_of: PositionOf<F::Cursor>,
 ) -> Option<RepeatPlan<F::Cursor>> {
-    plan_repeats(fields, shared, false, hash_of)
+    plan_repeats(fields, shared, false, hash_of, Some(position_of))
 }
 
 /// [`repeat_plan_checked`]'s second walk, for an object whose hashes repeat.
@@ -3851,19 +3917,56 @@ fn plan_repeats<F: DocumentFields>(
     shared: &[u64],
     every_key: bool,
     hash_of: impl Fn(&F::Value) -> Option<u64>,
+    mut position_of: Option<PositionOf<F::Cursor>>,
 ) -> Option<RepeatPlan<F::Cursor>> {
     let mut steps: Vec<RepeatStep> = Vec::new();
+    let mut spans: Vec<StepSpan> = Vec::new();
+    // Whether every position asked for was given, and whether the last step
+    // still waits for the position of the key after its field.
+    let mut spans_whole = position_of.is_some();
+    let mut awaiting_next = false;
     let mut values: Vec<F::Cursor> = Vec::new();
     let mut slots = SharedKeySlots::default();
     let mut dropped = false;
     let mut walk = fields.clone();
     let mut at = 0usize;
-    while let Some((key, _cursor, rest)) = walk.uncons_key() {
+    while let Some((key, key_cursor, rest)) = walk.uncons_key() {
+        // This key's position, when the step before it asked for it; a step
+        // here reuses it.
+        let mut key_at = None;
+        if awaiting_next {
+            awaiting_next = false;
+            key_at = position_of.and_then(|of| of(&key_cursor));
+            match (key_at, spans.last_mut()) {
+                (Some(at), Some(last)) => last.next = at,
+                _ => spans_whole = false, // patchcov: coverage tolerate-line reason="unreachable for JSON, the one caller: every cursor of a text-backed index has a position; kept so a format without one keeps no spans (#7346)"
+            }
+        }
         if let Some(name) = collapsing_key(&key, shared, every_key, &hash_of) {
             // `uncons` meets the same field `uncons_key` just did, so it is
             // not `None` on the object the walk above accepted.
             if let Some((field, _)) = walk.uncons() {
                 let value = field.value_cursor;
+                if let Some(of) = position_of {
+                    match (key_at.or_else(|| of(&key_cursor)), of(&value)) {
+                        (Some(key), Some(value)) => spans.push(StepSpan {
+                            key,
+                            value,
+                            next: StepSpan::LAST,
+                        }),
+                        _ => spans_whole = false, // patchcov: coverage tolerate-line reason="unreachable for JSON, the one caller: every cursor of a text-backed index has a position; kept so a format without one keeps no spans (#7346)"
+                    }
+                    awaiting_next = true;
+                    // Too many steps to be worth their spans: stop asking.
+                    if spans.len() > StepSpan::DENSE_FROM && spans.len() * 2 > at + 1 {
+                        spans_whole = false;
+                    }
+                    if !spans_whole {
+                        position_of = None;
+                        awaiting_next = false;
+                        spans = Vec::new();
+                    }
+                }
                 match slots.slot(name, values.len()) {
                     Some(slot) => {
                         values[slot] = value;
@@ -3886,10 +3989,14 @@ fn plan_repeats<F: DocumentFields>(
         at += 1;
         walk = rest;
     }
+    if !spans_whole || spans.len() != steps.len() || spans.len() > at / 2 {
+        spans = Vec::new();
+    }
     dropped.then_some(RepeatPlan {
         steps,
         values,
         next: 0,
+        spans,
     })
 }
 

@@ -18448,9 +18448,10 @@ fn colored_stream_safe(json: &[u8]) -> bool {
 /// *without* its own buffer here for the same reason: `m2_json_fallback_
 /// safe` guarantees at most one top-level result, and `JsonCursor::
 /// stream_json` (`src/json/light.rs`) already buffers internally per
-/// value for exactly this reason, so nothing reaches `out` (the real
-/// writer, not the `FmtWriter` wrapping it) until that one result is
-/// known good.
+/// value for exactly this reason, or writes the value from a span it has
+/// certified, checked whole first (#7271, #7346), so nothing reaches `out`
+/// (the real writer, not the `FmtWriter` wrapping it) until that one result
+/// is known good.
 #[allow(clippy::too_many_arguments)] // one caller, one gate (`can_json_fast_path`); a struct would hide the 1:1 relationship each param has to a specific CLI flag.
 fn evaluate_m2_fast_path<W: Write>(
     json_bytes: &[u8],
@@ -18557,10 +18558,11 @@ fn evaluate_m2_fast_path<W: Write>(
         }
         // `m2_json_fallback_safe` guarantees at most one top-level result
         // for every expression that reaches this branch, and
-        // `JsonCursor::stream_json` buffers that one result internally
-        // before ever touching `writer`/`out` -- so an error here means
-        // nothing has reached `out` yet, same as the `LazySeq` branch
-        // above, and falling back is equally safe.
+        // `JsonCursor::stream_json` either buffers that one result internally
+        // before ever touching `writer`/`out`, or writes it from a span it has
+        // certified (#7271, #7346), after which only the writer can fail -- so
+        // an error here means nothing has reached `out` yet, same as the
+        // `LazySeq` branch above, and falling back is equally safe.
         if stats.error.is_some() {
             return Ok(false);
         }
