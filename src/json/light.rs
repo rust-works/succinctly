@@ -1325,9 +1325,9 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
     /// Or when the node is canonical but for one object inside it that the
     /// scan declined that way ([`CanonicalSpan::NestedRepeatedKeys`], #7366).
     pub(crate) fn canonical_compact_scan(&self, depth: usize) -> CanonicalSpan<'a> {
-        let Some(rest) = self
+        let Some((start, rest)) = self
             .text_position()
-            .and_then(|start| self.text.get(start..))
+            .and_then(|start| Some((start, self.text.get(start..)?)))
         else {
             return CanonicalSpan::Declined;
         };
@@ -1336,23 +1336,20 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
                 Some(span) => CanonicalSpan::Echo(span),
                 None => CanonicalSpan::Declined,
             },
-            CanonicalScan::RepeatedKeys { end, shared } => {
-                debug_assert_eq!(
-                    self.text_range().map(|(start, stop)| stop - start),
-                    Some(end),
-                    "the canonical scan and `text_range` must agree on a scanned object"
-                );
-                // The span must be valid UTF-8, as an echo's must, and for a
-                // reason of its own: then every key decodes (a certified
-                // escape always does), which is what lets the caller's plan
-                // compare only the keys whose hash is shared. A key that does
-                // not decode makes the plan compare every key
-                // (`repeat_plan_checked`), so that object takes its route.
-                if core::str::from_utf8(&rest[..end]).is_err() {
-                    return CanonicalSpan::Declined;
-                }
-                CanonicalSpan::RepeatedKeys(shared)
-            }
+            // The span must be valid UTF-8, as an echo's must, and for a
+            // reason of its own: then every key decodes (a certified escape
+            // always does), which is what lets the caller's plan compare only
+            // the keys whose hash is shared. A key that does not decode makes
+            // the plan compare every key (`repeat_plan_checked`), so that
+            // object takes its route.
+            CanonicalScan::RepeatedKeys { end, shared } => match self.certified_span(rest, end) {
+                Some(span) => CanonicalSpan::RepeatedKeys {
+                    start,
+                    span,
+                    shared,
+                },
+                None => CanonicalSpan::Declined,
+            },
             // The whole span is checked, as an echo's is, which covers the
             // object's keys too (see the arm above).
             CanonicalScan::NestedRepeatedKeys { end, object } => {
@@ -3622,7 +3619,7 @@ use crate::jq::document::{
     document_token_of, effective_fields_checked, key_hash, key_is_malformed, key_span_fingerprint,
     repeat_plan_checked, repeat_plan_from_shared, shared_key_hashes_if_any,
     trailing_element_gap_ok, DocumentCursor, DocumentElements, DocumentField, DocumentFields,
-    DocumentValue, FieldFate, IndentSpec, JsonConvention, KeyHashes, RepeatPlan,
+    DocumentValue, FieldFate, IndentSpec, JsonConvention, KeyHashes, RepeatPlan, StepSpan,
     PAIRWISE_SPAN_SCAN_LIMIT,
 };
 use crate::jq::escape::{write_json_body_jq, write_json_body_yq};
@@ -4072,7 +4069,16 @@ pub(crate) enum CanonicalSpan<'a> {
     /// whose key hashes ([`raw_key_hash`]) repeat
     /// ([`CanonicalScan::RepeatedKeys`]). Whether a key really does is left
     /// to the keys themselves: the scan compared 64-bit hashes of them.
-    RepeatedKeys(Vec<u64>),
+    RepeatedKeys {
+        /// Where the object starts in the document's text.
+        start: usize,
+        /// The object's text, which the scan certified member by member, so
+        /// that each run of members the duplicate-key rule leaves alone is
+        /// already its own compact render (#7346).
+        span: &'a str,
+        /// The hashes more than one key has ([`CanonicalScan::RepeatedKeys`]).
+        shared: Vec<u64>,
+    },
     /// The node's text, valid UTF-8, which is its compact jq render but for
     /// one object inside it that is what [`RepeatedKeys`](Self::RepeatedKeys)
     /// says of a node ([`CanonicalScan::NestedRepeatedKeys`], #7366).
@@ -5223,7 +5229,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
         // (whitespace inside it, a spelling jq rewrites, a repeated key,
         // invalid UTF-8, a fault) keep the whole-value buffer below, and with
         // it jq's print-nothing on a malformed document. The compact case
-        // returned its echo already, above.
+        // returned its echo already, above. One decline is written from the
+        // text as well (#7346): an object certified member by member and
+        // declined only on its keys, alone or inside a value certified around
+        // it (#7366), whose pieces are all checked before any is written
+        // (`stream_scanned_repeats`).
         if let CanonicalSpan::Echo(span) = scan {
             let mut chunked = ChunkedWrite {
                 out,
@@ -5235,16 +5245,30 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
         let mut buf = String::new();
         match (scan, value) {
             // #7310: the scan certified every member of this object and
-            // declined only on its keys' hashes. See `stream_scanned_repeats`.
-            (CanonicalSpan::RepeatedKeys(shared), StandardJson::Object(fields)) => {
-                stream_scanned_repeats(&mut buf, fields, &shared, indent, numbers, 0)?;
+            // declined only on its keys' hashes, so it is written from its
+            // text (#7346), or buffered when it cannot be. See
+            // `stream_scanned_repeats`. Kept an arm of this match: as an
+            // early `if let` ahead of the buffer, the same call moved the
+            // inlined `write_reindented` loop above, and clean pretty `.`
+            // read 0.7% to 1.9% more instructions on a 7950X (8.8% more time
+            // on `numbers`); as an arm it reads what #7310's did.
+            (
+                CanonicalSpan::RepeatedKeys {
+                    start,
+                    span,
+                    shared,
+                },
+                StandardJson::Object(fields),
+            ) => {
+                let text = RepeatText::whole(span, start);
+                return stream_scanned_repeats(out, fields, text, &shared, indent, numbers);
             }
             // #7366: certified but for one object inside it, which declined
             // the same way. See `stream_around_scanned_repeats`.
             (CanonicalSpan::NestedRepeatedKeys { span, object }, value) => {
-                stream_around_scanned_repeats(
-                    &mut buf, self, value, span, &object, indent, numbers,
-                )?;
+                return stream_around_scanned_repeats(
+                    out, self, value, span, &object, indent, numbers,
+                );
             }
             (_, value) => stream_json_pretty(
                 &mut buf,
@@ -5837,9 +5861,11 @@ fn write_reindented<Out: core::fmt::Write>(
 /// [`write_reindented`] for text that starts `level` levels in, or that leaves
 /// some brackets open (#7366): the text around an object written by other
 /// means, whose lines are indented from where it starts, as the whole
-/// value's would be at that point.
+/// value's would be at that point; or a value or a comma-separated run of
+/// members of an object being written at that level (#7346), the caller
+/// having written the line break and indentation before it.
 #[inline(always)]
-fn write_reindented_at<Out: core::fmt::Write>(
+fn write_reindented_at<Out: core::fmt::Write + ?Sized>(
     out: &mut Out,
     span: &str,
     width: usize,
@@ -6610,39 +6636,151 @@ fn stream_json_planned_fields<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
     Ok(())
 }
 
-/// The unsorted `JqCompat` print, compact or indented, of a root object the
+/// Where an object [`stream_scanned_repeats`] prints sits (#7346, #7366): its
+/// own text, and the certified text of the value around it.
+#[derive(Clone, Copy, Debug)]
+struct RepeatText<'s> {
+    /// The object's text, which the scan certified member by member.
+    span: &'s str,
+    /// Where `span` starts in the document.
+    start: usize,
+    /// The value's text before the object; empty when the object is the value.
+    before: &'s str,
+    /// The value's text after the object; empty when the object is the value.
+    after: &'s str,
+    /// How many levels in the object is, 0 when it is the value.
+    level: usize,
+}
+
+impl<'s> RepeatText<'s> {
+    /// An object that is the whole value being printed.
+    fn whole(span: &'s str, start: usize) -> Self {
+        Self {
+            span,
+            start,
+            before: "",
+            after: "",
+            level: 0,
+        }
+    }
+}
+
+/// The unsorted `JqCompat` print, compact or indented, of an object the
 /// canonical scan certified member by member and declined only because the
 /// hashes in `shared` repeat among its keys (#7310,
-/// [`CanonicalSpan::RepeatedKeys`]).
+/// [`CanonicalSpan::RepeatedKeys`]), with the certified text around it when it
+/// sits inside the value being printed (#7366,
+/// [`stream_around_scanned_repeats`]), all written from `text` (#7346).
 ///
 /// Such an object is well formed, the scan has hashed every key and found
 /// which hashes repeat, and since its span is valid UTF-8 every key decodes:
 /// everything the object arm's `repeat_plan_checked` takes a key-only walk
-/// for, hashing every key and sorting the hashes. So the plan is built from
-/// the scan's list straight away, comparing each key under the scan's own hash
-/// ([`raw_key_hash`]), and the fields are written by the object arm's own
-/// [`stream_json_planned_fields`]. The plan groups keys by their decoded
-/// spelling, so when the shared hashes turn out to be a bare collision between
-/// different keys there is no plan, and the object is printed by the object
-/// arm, which costs that rare object its key walk.
+/// for. So the plan is built from the scan's list straight away, comparing
+/// each key under the scan's own hash ([`raw_key_hash`]).
+///
+/// Every member is certified, so each run of members the plan leaves alone is
+/// already its own compact render, and a planned field is its first
+/// occurrence's key and its last occurrence's value, both certified too. The
+/// object is cut into those pieces of its span ([`cut_planned_text`]) and
+/// written from them ([`write_planned_piece`]), without walking or rendering
+/// the members between the plan's steps: as they stand for `-c`, and
+/// re-indented otherwise, through [`ChunkedWrite`], which passes a run of a
+/// chunk's worth or more on by itself (#7356), so the output is never held
+/// whole. The text around the object is written the same way. The cut is
+/// checked whole before anything
+/// is written, and after that only the writer can fail, so nothing is written
+/// that a decline would have to retract (`evaluate_m2_fast_path`'s fall back
+/// to the general path relies on that). Walking and re-rendering every member
+/// instead took about 3x the time of the same object without the repeat,
+/// which is echoed.
+///
+/// An object with no plan, or whose plan keeps no spans, is written by its
+/// walk instead ([`stream_planned_object`]), with the text around it, whole
+/// into a buffer, as a declined value is.
 ///
 /// Out of line and cold: it is the rare branch of [`JsonCursor::stream_json`],
 /// whose echo arms are the common ones.
-///
-/// `level` is how many levels in the object is written, 0 for the value
-/// itself and more for one inside it ([`stream_around_scanned_repeats`],
-/// #7366): its members are indented one level further, and its `}` at it.
 #[cold]
 #[inline(never)]
 fn stream_scanned_repeats<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
     out: &mut Out,
     fields: JsonFields<'_, W>,
+    text: RepeatText<'_>,
     shared: &[u64],
+    indent: IndentSpec,
+    numbers: JsonConvention,
+) -> StreamResult {
+    let RepeatText {
+        span,
+        start,
+        before,
+        after,
+        level,
+    } = text;
+    let plan =
+        match repeat_plan_from_shared(&fields, shared, raw_key_hash, JsonCursor::text_position) {
+            Some(plan) if cut_planned_text(&plan, span, start, &mut |_| Ok(())).is_some() => plan,
+            plan => {
+                let mut buf = String::new();
+                write_around(&mut buf, before, 0, indent)?;
+                stream_planned_object(&mut buf, fields, plan, indent, numbers, level)?;
+                write_around(&mut buf, after, level, indent)?;
+                return Ok(out.write_str(&buf)?);
+            }
+        };
+    let mut chunked = ChunkedWrite {
+        out,
+        buf: String::new(),
+    };
+    let mut first = true;
+    write_around(&mut chunked, before, 0, indent)?;
+    let written = cut_planned_text(&plan, span, start, &mut |piece| {
+        write_planned_piece(&mut chunked, piece, &mut first, indent, level)
+    })
+    .map(|written| {
+        written
+            .and_then(|()| write_around(&mut chunked, after, level, indent))
+            .and_then(|()| chunked.finish())
+    });
+    // The check above cut the same plan from the same text.
+    written
+        .unwrap_or(Err(core::fmt::Error))
+        .map_err(StreamFailure::from)
+}
+
+/// The certified text around an object [`stream_scanned_repeats`] prints
+/// (#7366): as it stands for `-c`, and otherwise re-indented from `level`, the
+/// level it starts at ([`write_reindented_at`]).
+fn write_around<Out: core::fmt::Write + ?Sized>(
+    out: &mut Out,
+    text: &str,
+    level: usize,
+    indent: IndentSpec,
+) -> core::fmt::Result {
+    if text.is_empty() {
+        Ok(())
+    } else if indent.is_compact() {
+        out.write_str(text)
+    } else {
+        write_reindented_at(out, text, indent.width, indent.unit, level)
+    }
+}
+
+/// An object [`stream_scanned_repeats`] does not write from its text, written
+/// by its plan's walk ([`stream_json_planned_fields`], #7310): its plan keeps
+/// no spans, because most of its fields have a step (`StepSpan::DENSE_FROM`),
+/// or they are not where its members are. With no plan at all, because the
+/// shared hashes are a bare collision between different keys, the object arm
+/// writes it, which costs that rare object its key walk.
+fn stream_planned_object<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
+    out: &mut Out,
+    fields: JsonFields<'_, W>,
+    plan: Option<RepeatPlan<JsonCursor<'_, W>>>,
     indent: IndentSpec,
     numbers: JsonConvention,
     level: usize,
 ) -> StreamResult {
-    let Some(plan) = repeat_plan_from_shared(&fields, shared, raw_key_hash) else {
+    let Some(plan) = plan else {
         return stream_json_pretty(
             out,
             StandardJson::Object(fields),
@@ -6671,6 +6809,171 @@ fn stream_scanned_repeats<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
     }
     Ok(out.write_char('}')?)
 }
+/// One piece of a planned object's text (#7346, [`cut_planned_text`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlannedPiece<'s> {
+    /// The object's opening brace.
+    Open,
+    /// Members written as they stand: their text, with the commas between
+    /// them and none at either end.
+    Run(&'s str),
+    /// A repeated key's first occurrence, `key` (its quoted text), written with
+    /// its last occurrence's `value` (that value's text).
+    Field { key: &'s str, value: &'s str },
+    /// The object's closing brace.
+    Close,
+}
+
+/// Cuts an object's certified text `span`, which starts at byte `start` of the
+/// document, into the pieces its plan writes (#7346), handing each to `emit`
+/// in order: the runs between the plan's steps, and each step's field unless
+/// it is dropped. `None`, before `emit` sees anything past where it went
+/// wrong, when the plan has no spans or a span is not where a member of
+/// `span` would be; a caller that must not write part of an object cuts once
+/// with an `emit` that writes nothing first. `Some` with `emit`'s first error
+/// otherwise.
+///
+/// Each step's span gives three positions ([`StepSpan`]), so a field's end is
+/// the comma before the next key or the closing brace, with no value read to
+/// find it, and a planned value's text runs from its own position to the end
+/// of the field it came from, a later step's, found by its position.
+fn cut_planned_text<'s, W: AsRef<[u64]> + Clone>(
+    plan: &RepeatPlan<JsonCursor<'_, W>>,
+    span: &'s str,
+    start: usize,
+    emit: &mut dyn FnMut(PlannedPiece<'s>) -> core::fmt::Result,
+) -> Option<core::fmt::Result> {
+    let bytes = span.as_bytes();
+    let close = span.len().checked_sub(1)?;
+    if bytes.first() != Some(&b'{') || bytes.get(close) != Some(&b'}') {
+        return None;
+    }
+    let local = |at: usize| at.checked_sub(start).filter(|&at| at < close);
+    // Where the field of `step` ends: the comma before the next key, or the
+    // closing brace.
+    let field_end = |step: &StepSpan| -> Option<usize> {
+        if step.next == StepSpan::LAST {
+            return Some(close);
+        }
+        let end = local(step.next)?.checked_sub(1)?;
+        (bytes.get(end) == Some(&b',')).then_some(end)
+    };
+    let spans = plan.spans();
+    let pieces = |emit: &mut dyn FnMut(PlannedPiece<'s>) -> core::fmt::Result| {
+        emit(PlannedPiece::Open).ok()?;
+        // The first byte of the next member not yet cut.
+        let mut next = 1usize;
+        for (step, value) in plan.spanned_steps()? {
+            let field_start = local(step.key)?;
+            if field_start < next {
+                return None; // patchcov: coverage tolerate-line reason="defensive: a plan's spans come from the same certified text it cuts, so a field never starts before the cut and always has its colon; kept so a mismatch declines rather than slicing wrong (#7346)"
+            }
+            if field_start > next {
+                // The run ends at the comma before this field.
+                if bytes.get(field_start - 1) != Some(&b',') {
+                    return None;
+                }
+                emit(PlannedPiece::Run(span.get(next..field_start - 1)?)).ok()?;
+            }
+            if let Some(value) = value {
+                let colon = local(step.value)?.checked_sub(1)?;
+                if colon <= field_start || bytes.get(colon) != Some(&b':') {
+                    return None; // patchcov: coverage tolerate-line reason="defensive: a plan's spans come from the same certified text it cuts, so a field never starts before the cut and always has its colon; kept so a mismatch declines rather than slicing wrong (#7346)"
+                }
+                let at = value.text_position()?;
+                let from = spans.binary_search_by_key(&at, |span| span.value).ok()?;
+                let value = span.get(local(at)?..field_end(&spans[from])?)?;
+                emit(PlannedPiece::Field {
+                    key: span.get(field_start..colon)?,
+                    value,
+                })
+                .ok()?;
+            }
+            next = match field_end(&step)? {
+                end if end == close => close,
+                end => end + 1,
+            };
+        }
+        if next < close {
+            emit(PlannedPiece::Run(span.get(next..close)?)).ok()?;
+        }
+        emit(PlannedPiece::Close).ok()?;
+        Some(())
+    };
+    // `emit`'s error stops the cut where it happened; `pieces` answers `None`
+    // for it as for a misplaced span, so it is kept apart here.
+    let mut failed = Ok(());
+    let cut = pieces(&mut |piece| {
+        let written = emit(piece);
+        if written.is_err() {
+            failed = written;
+        }
+        written
+    });
+    match (cut, failed) {
+        (_, Err(e)) => Some(Err(e)),
+        (Some(()), Ok(())) => Some(Ok(())),
+        (None, Ok(())) => None,
+    }
+}
+
+/// Writes one piece of a planned object ([`cut_planned_text`]) as jq prints
+/// it, the object being `level` levels in: compact when `indent` is, otherwise
+/// with its members indented one level further and its `}` at `level`
+/// (#7346). `first` says no member has been written yet. Each piece's text is
+/// certified, so a run is already its compact render and is re-indented as
+/// [`write_reindented`] re-indents a whole span.
+fn write_planned_piece<Out: core::fmt::Write + ?Sized>(
+    out: &mut Out,
+    piece: PlannedPiece<'_>,
+    first: &mut bool,
+    indent: IndentSpec,
+    level: usize,
+) -> core::fmt::Result {
+    let text = match piece {
+        PlannedPiece::Open => return out.write_char('{'),
+        PlannedPiece::Close => {
+            if !indent.is_compact() {
+                out.write_char('\n')?;
+                write_json_indent(out, level * indent.width, indent.unit)?;
+            }
+            return out.write_char('}');
+        }
+        PlannedPiece::Run(run) => {
+            member_line(out, first, indent, level)?;
+            run
+        }
+        PlannedPiece::Field { key, value } => {
+            member_line(out, first, indent, level)?;
+            out.write_str(key)?;
+            out.write_str(if indent.is_compact() { ":" } else { ": " })?;
+            value
+        }
+    };
+    if indent.is_compact() {
+        out.write_str(text)
+    } else {
+        write_reindented_at(out, text, indent.width, indent.unit, level + 1)
+    }
+}
+
+/// The separator and, when indented, the line a member of a planned object
+/// `level` levels in starts with ([`write_planned_piece`]).
+fn member_line<Out: core::fmt::Write + ?Sized>(
+    out: &mut Out,
+    first: &mut bool,
+    indent: IndentSpec,
+    level: usize,
+) -> core::fmt::Result {
+    if !core::mem::take(first) {
+        out.write_char(',')?;
+    }
+    if !indent.is_compact() {
+        out.write_char('\n')?;
+        write_json_indent(out, (level + 1) * indent.width, indent.unit)?;
+    }
+    Ok(())
+}
 
 /// The unsorted `JqCompat` print, compact or indented, of a value the
 /// canonical scan certified but for one object inside it, which it declined
@@ -6680,15 +6983,16 @@ fn stream_scanned_repeats<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
 ///
 /// The text before the object and the text after it are already their compact
 /// render, as a certified span's is, so they are written as they stand (or
-/// re-indented, [`write_reindented_at`]), and only the object is written by its
-/// keys, as a value that is such an object is ([`stream_scanned_repeats`]).
-/// Before this, the scan stopped at that object, and every member of every
-/// value around it was walked and re-rendered.
+/// re-indented, [`write_reindented_at`]), and the object is written from its
+/// text and its plan, as a value that is such an object is
+/// ([`stream_scanned_repeats`], #7346). Before #7366, the scan stopped at that
+/// object, and every member of every value around it was walked and
+/// re-rendered.
 ///
 /// The object is found in the index by where it starts
 /// ([`JsonCursor::cursor_at_offset`]). A cursor that is not at that `{`, which
 /// a certified span should never give, has the value printed by
-/// [`stream_json_pretty`], as a declined value is.
+/// [`stream_json_pretty`], whole into a buffer, as a declined value is.
 ///
 /// Out of line and cold: it is the rare branch of [`JsonCursor::stream_json`],
 /// whose echo arms are the common ones.
@@ -6703,38 +7007,38 @@ fn stream_around_scanned_repeats<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>
     indent: IndentSpec,
     numbers: JsonConvention,
 ) -> StreamResult {
-    let fields = cursor
+    let found = cursor
         .text_position()
         .and_then(|value_start| value_start.checked_add(object.start))
         .and_then(|at| {
             let found = cursor.cursor_at_offset(at)?;
-            (found.text_position() == Some(at)).then_some(found)
+            (found.text_position() == Some(at)).then_some((at, found))
         })
-        .and_then(|found| match found.value() {
-            StandardJson::Object(fields) => Some(fields),
+        .and_then(|(at, found)| match found.value() {
+            StandardJson::Object(fields) => Some((at, fields)),
             _ => None,
         });
-    let (Some(fields), Some(before), Some(after)) =
-        (fields, span.get(..object.start), span.get(object.end..))
-    else {
-        debug_assert!(false, "a certified span's recorded object is in the index");
-        return stream_json_pretty(out, value, 0, indent.width, indent.unit, false, numbers, 0);
+    let (Some((start, fields)), Some(before), Some(object_span), Some(after)) = (
+        found,
+        span.get(..object.start),
+        span.get(object.start..object.end),
+        span.get(object.end..),
+    ) else {
+        debug_assert!(false, "a certified span's recorded object is in the index"); // patchcov: coverage tolerate-line reason="unreachable: a certified span's recorded object is in the index (#7366); kept so a mismatch prints the value whole, as a declined value is (#7346)"
+        let mut buf = String::new(); // patchcov: coverage tolerate-line reason="unreachable: a certified span's recorded object is in the index (#7366); kept so a mismatch prints the value whole, as a declined value is (#7346)"
+        #[rustfmt::skip]
+        stream_json_pretty(&mut buf, value, 0, indent.width, indent.unit, false, numbers, 0)?; // patchcov: coverage tolerate-line reason="unreachable: a certified span's recorded object is in the index (#7366); kept so a mismatch prints the value whole, as a declined value is (#7346)"
+        return Ok(out.write_str(&buf)?); // patchcov: coverage tolerate-line reason="unreachable: a certified span's recorded object is in the index (#7366); kept so a mismatch prints the value whole, as a declined value is (#7346)"
     };
-    // `-c` writes the text as it stands; an indented render re-indents it,
-    // the text after the object from the object's own level.
-    let compact = indent.is_compact();
-    let write_text = |out: &mut Out, text: &str, level: usize| -> core::fmt::Result {
-        if compact {
-            out.write_str(text)
-        } else {
-            write_reindented_at(out, text, indent.width, indent.unit, level)
-        }
+    let text = RepeatText {
+        span: object_span,
+        start,
+        before,
+        after,
+        level: object.level,
     };
-    write_text(out, before, 0)?;
-    stream_scanned_repeats(out, fields, &object.shared, indent, numbers, object.level)?;
-    Ok(write_text(out, after, object.level)?)
+    stream_scanned_repeats(out, fields, text, &object.shared, indent, numbers)
 }
-
 /// One object member of [`stream_json_pretty`]'s object arm -- the
 /// separator, indentation, key, `:`, the nested-empty-container check and
 /// the value's own recursive render -- shared by its materialized and
@@ -7021,7 +7325,7 @@ fn stream_json_sequence<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
 /// (#7271 review): a writer with work per call, such as the chunked writer of a
 /// streamed pretty render, otherwise pays it once per byte of indentation,
 /// which on a document 250 levels deep is most of the output.
-fn write_json_indent<Out: core::fmt::Write>(
+fn write_json_indent<Out: core::fmt::Write + ?Sized>(
     out: &mut Out,
     spaces: usize,
     unit: char,
@@ -9611,7 +9915,11 @@ mod tests {
         let inner = inner.next_sibling().unwrap();
         assert_eq!(
             inner.canonical_compact_scan(1),
-            CanonicalSpan::RepeatedKeys(vec![key_hash(b"k0003")])
+            CanonicalSpan::RepeatedKeys {
+                start: 5,
+                span: &nested[5..nested.len() - 1],
+                shared: vec![key_hash(b"k0003")],
+            }
         );
         assert_eq!(
             index.root(nested.as_bytes()).canonical_compact_scan(0),
@@ -9694,7 +10002,10 @@ mod tests {
             panic!("{doc}");
         };
         let shared = [key_hash(b"b")];
-        assert!(repeat_plan_from_shared(&fields, &shared, raw_key_hash).is_none());
+        assert!(
+            repeat_plan_from_shared(&fields, &shared, raw_key_hash, JsonCursor::text_position)
+                .is_none()
+        );
         for (indent, level) in [
             (IndentSpec::COMPACT, 2),
             (
@@ -9713,13 +10024,17 @@ mod tests {
             ),
         ] {
             let mut printed = String::new();
+            let text = RepeatText {
+                level,
+                ..RepeatText::whole(doc, 0)
+            };
             stream_scanned_repeats(
                 &mut printed,
                 fields,
+                text,
                 &shared,
                 indent,
                 JsonConvention::JqCompat,
-                level,
             )
             .unwrap();
             let mut rerender = String::new();
@@ -9839,13 +10154,17 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(7310);
         let mut repeated = 0;
         let mut around = 0;
+        let mut from_text = 0;
         for _ in 0..4000 {
             let mut doc = String::new();
             let dirty = rng.random_range(0..4) == 0;
             // The object is the document half the time, and otherwise inside one, so
             // that its repeat is a nested object's and printed around (#7366): after a wide
             // run of canonical values, in an object, or beside a second object of its own.
-            match rng.random_range(0..6) {
+            // #7346: or it is an array's second element, scanned on its own, so that the
+            // value printed starts past the document's first byte.
+            let mut second = false;
+            match rng.random_range(0..7) {
                 0..=2 => object(&mut rng, 0, dirty, &mut doc),
                 3 => {
                     doc.push_str("[0,\"\u{e9}\",{\"x\":[1,{}]},");
@@ -9857,18 +10176,49 @@ mod tests {
                     object(&mut rng, 0, dirty, &mut doc);
                     doc.push_str(",\"n\":1.0}");
                 }
-                _ => {
+                5 => {
                     doc.push('[');
                     object(&mut rng, 0, dirty, &mut doc);
                     doc.push(',');
                     object(&mut rng, 1, dirty, &mut doc);
                     doc.push(']');
                 }
+                _ => {
+                    doc.push_str("[1,");
+                    object(&mut rng, 0, dirty, &mut doc);
+                    doc.push(']');
+                    second = true;
+                }
             }
             let index = JsonIndex::build(doc.as_bytes());
             let root = index.root(doc.as_bytes());
+            let root = if second {
+                root.first_child().unwrap().next_sibling().unwrap()
+            } else {
+                root
+            };
             match root.canonical_compact_scan(0) {
-                CanonicalSpan::RepeatedKeys(_) => repeated += 1,
+                CanonicalSpan::RepeatedKeys {
+                    start,
+                    span,
+                    shared,
+                } => {
+                    repeated += 1;
+                    // #7346: and is written from its text when its plan keeps
+                    // spans (unless more than half the fields have a step).
+                    let StandardJson::Object(fields) = root.value() else {
+                        panic!("not an object"); // patchcov: coverage tolerate-line reason="the failure message for the assertion this #7346 test exists to make"
+                    };
+                    let plan = repeat_plan_from_shared(
+                        &fields,
+                        &shared,
+                        raw_key_hash,
+                        JsonCursor::text_position,
+                    );
+                    from_text += usize::from(
+                        plan.is_some_and(|plan| planned_pieces(&plan, span, start).is_some()),
+                    );
+                }
                 CanonicalSpan::NestedRepeatedKeys { .. } => around += 1,
                 _ => {}
             }
@@ -9898,6 +10248,363 @@ mod tests {
             around > 100,
             "only {around} documents printed around an object"
         );
+        assert!(
+            from_text > 100,
+            "only {from_text} documents printed from text"
+        );
+    }
+
+    /// [`cut_planned_text`]'s pieces, collected (#7346).
+    fn planned_pieces<'s, W: AsRef<[u64]> + Clone>(
+        plan: &RepeatPlan<JsonCursor<'_, W>>,
+        span: &'s str,
+        start: usize,
+    ) -> Option<Vec<PlannedPiece<'s>>> {
+        let mut pieces = Vec::new();
+        cut_planned_text(plan, span, start, &mut |piece| {
+            pieces.push(piece);
+            Ok(())
+        })?
+        .expect("collecting pieces does not fail");
+        Some(pieces)
+    }
+
+    /// #7346: a root object the scan declined only on its keys is cut into
+    /// the runs its plan leaves alone and its planned fields, each a slice of
+    /// its text, and printed from them: compact, and indented from the
+    /// members' level, the repeated key in its first place with its last
+    /// value. A plan whose spans are not where the object's members are (here,
+    /// the wrong start) cuts nothing, and `stream_scanned_repeats` then writes
+    /// nothing and leaves the object to the walk.
+    #[test]
+    fn repeated_keys_print_from_their_text_7346() {
+        let doc = String::from_utf8(wide_canonical_object(40, Some((3, 30)))).unwrap();
+        let doc = doc.replacen(":30,", ":[30,{\"v\":[]}],", 1);
+        let index = JsonIndex::build(doc.as_bytes());
+        let root = index.root(doc.as_bytes());
+        let CanonicalSpan::RepeatedKeys {
+            start,
+            span,
+            shared,
+        } = root.canonical_compact_scan(0)
+        else {
+            panic!("the scan declines on the keys alone"); // patchcov: coverage tolerate-line reason="the failure message for the assertion this #7346 test exists to make"
+        };
+        assert_eq!((start, span), (0, doc.as_str()));
+        let StandardJson::Object(fields) = root.value() else {
+            panic!("an object"); // patchcov: coverage tolerate-line reason="the failure message for the assertion this #7346 test exists to make"
+        };
+        let plan =
+            repeat_plan_from_shared(&fields, &shared, raw_key_hash, JsonCursor::text_position)
+                .unwrap();
+        let run = |from: usize, to: usize| {
+            (from..to)
+                .map(|i| format!("\"k{i:04}\":{i}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let (head, middle, tail) = (run(0, 3), run(4, 30), run(31, 40));
+        assert_eq!(
+            planned_pieces(&plan, span, 0),
+            Some(vec![
+                PlannedPiece::Open,
+                PlannedPiece::Run(&head),
+                PlannedPiece::Field {
+                    key: "\"k0003\"",
+                    value: "[30,{\"v\":[]}]",
+                },
+                PlannedPiece::Run(&middle),
+                PlannedPiece::Run(&tail),
+                PlannedPiece::Close,
+            ])
+        );
+        assert_eq!(planned_pieces(&plan, span, 1), None);
+        assert_eq!(planned_pieces(&plan, &span[1..], 0), None);
+        for indent in [
+            IndentSpec::COMPACT,
+            IndentSpec {
+                width: 2,
+                unit: ' ',
+            },
+        ] {
+            // A misplaced span is written by the plan's walk instead, as the
+            // object arm writes it.
+            let mut walked = String::new();
+            let text = RepeatText::whole(span, 1);
+            stream_scanned_repeats(
+                &mut walked,
+                fields,
+                text,
+                &shared,
+                indent,
+                JsonConvention::JqCompat,
+            )
+            .unwrap();
+            let mut rerender = String::new();
+            stream_json_pretty(
+                &mut rerender,
+                root.value(),
+                0,
+                indent.width,
+                indent.unit,
+                false,
+                JsonConvention::JqCompat,
+                0,
+            )
+            .unwrap();
+            assert_eq!(walked, rerender);
+        }
+
+        let print = |indent| {
+            let mut out = String::new();
+            root.stream_json(&mut out, indent, false, JsonConvention::JqCompat)
+                .unwrap();
+            out
+        };
+        assert_eq!(
+            print(IndentSpec::COMPACT),
+            format!("{{{head},\"k0003\":[30,{{\"v\":[]}}],{middle},{tail}}}")
+        );
+        let pretty = print(IndentSpec {
+            width: 2,
+            unit: ' ',
+        });
+        let lines = pretty.lines().collect::<Vec<_>>();
+        // 39 fields, the braces, and five more lines for the nested value.
+        assert_eq!(lines.len(), 39 + 2 + 5);
+        assert_eq!(&lines[..3], ["{", "  \"k0000\": 0,", "  \"k0001\": 1,"]);
+        assert_eq!(
+            &lines[4..11],
+            [
+                "  \"k0003\": [",
+                "    30,",
+                "    {",
+                "      \"v\": []",
+                "    }",
+                "  ],",
+                "  \"k0004\": 4,",
+            ]
+        );
+        assert_eq!(&lines[lines.len() - 2..], ["  \"k0039\": 39", "}"]);
+    }
+
+    /// #7346: a writer that fails part-way stops the text print with its
+    /// error, where the cut stopped, rather than reading as a misplaced span
+    /// (which would send the object to the walk and print it a second time).
+    #[test]
+    fn a_failing_writer_stops_the_text_print_7346() {
+        /// Fails once it has been given `budget` bytes.
+        struct Failing(usize);
+        impl core::fmt::Write for Failing {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                self.0 = self.0.checked_sub(s.len()).ok_or(core::fmt::Error)?;
+                Ok(())
+            }
+        }
+        // Several chunks long, so that the writer fails part-way through the
+        // cut: [`ChunkedWrite`] passes the first chunk on, then fails the next.
+        let doc = String::from_utf8(wide_canonical_object(20_000, Some((3, 19_990)))).unwrap();
+        assert!(doc.len() > 3 * CHUNKED_WRITE_BYTES);
+        let index = JsonIndex::build(doc.as_bytes());
+        let root = index.root(doc.as_bytes());
+        let CanonicalSpan::RepeatedKeys {
+            start,
+            span,
+            shared,
+        } = root.canonical_compact_scan(0)
+        else {
+            panic!("the scan declines on the keys alone"); // patchcov: coverage tolerate-line reason="the failure message for the assertion this #7346 test exists to make"
+        };
+        let StandardJson::Object(fields) = root.value() else {
+            panic!("an object"); // patchcov: coverage tolerate-line reason="the failure message for the assertion this #7346 test exists to make"
+        };
+        let plan =
+            repeat_plan_from_shared(&fields, &shared, raw_key_hash, JsonCursor::text_position)
+                .unwrap();
+        // The cut stops at the planned field and answers the writer's error.
+        let mut seen = Vec::new();
+        let cut = cut_planned_text(&plan, span, start, &mut |piece| {
+            seen.push(piece);
+            match piece {
+                PlannedPiece::Field { .. } => Err(core::fmt::Error),
+                _ => Ok(()),
+            }
+        });
+        assert_eq!(cut, Some(Err(core::fmt::Error)));
+        assert!(matches!(seen.last(), Some(PlannedPiece::Field { .. })));
+        assert_eq!(seen.len(), 3, "the brace, the first run and the field");
+        for indent in [
+            IndentSpec::COMPACT,
+            IndentSpec {
+                width: 2,
+                unit: ' ',
+            },
+        ] {
+            let failed = stream_scanned_repeats(
+                &mut Failing(CHUNKED_WRITE_BYTES + CHUNKED_WRITE_BYTES / 2),
+                fields,
+                RepeatText::whole(span, start),
+                &shared,
+                indent,
+                JsonConvention::JqCompat,
+            );
+            assert!(matches!(failed, Err(StreamFailure::Fmt)), "{indent:?}");
+        }
+    }
+
+    /// #7346: a plan where more than half the fields have a step keeps no
+    /// spans (`StepSpan::DENSE_FROM`), so the object is written by the plan's
+    /// walk, as the re-render writes it; below that share the plan keeps them,
+    /// and the object is printed from its text.
+    #[test]
+    fn dense_repeats_print_by_the_walk_7346() {
+        let plan_of = |doc: &str, want_spans: bool| {
+            let index = JsonIndex::build(doc.as_bytes());
+            let root = index.root(doc.as_bytes());
+            let CanonicalSpan::RepeatedKeys { shared, .. } = root.canonical_compact_scan(0) else {
+                panic!("the scan declines on the keys alone"); // patchcov: coverage tolerate-line reason="the failure message for the assertion this #7346 test exists to make"
+            };
+            let StandardJson::Object(fields) = root.value() else {
+                panic!("an object"); // patchcov: coverage tolerate-line reason="the failure message for the assertion this #7346 test exists to make"
+            };
+            let plan =
+                repeat_plan_from_shared(&fields, &shared, raw_key_hash, JsonCursor::text_position)
+                    .unwrap();
+            assert_eq!(plan.spanned_steps().is_some(), want_spans, "{}", doc.len());
+            for indent in [
+                IndentSpec::COMPACT,
+                IndentSpec {
+                    width: 2,
+                    unit: ' ',
+                },
+            ] {
+                let mut printed = String::new();
+                root.stream_json(&mut printed, indent, false, JsonConvention::JqCompat)
+                    .unwrap();
+                let mut rerender = String::new();
+                stream_json_pretty(
+                    &mut rerender,
+                    root.value(),
+                    0,
+                    indent.width,
+                    indent.unit,
+                    false,
+                    JsonConvention::JqCompat,
+                    0,
+                )
+                .unwrap();
+                assert_eq!(printed, rerender);
+            }
+        };
+        // `unique` keys, `repeats` fields of one key, then `after` more keys.
+        let object = |unique: usize, repeats: usize, after: usize| {
+            let mut fields: Vec<String> = (0..unique).map(|i| format!("\"u{i}\":{i}")).collect();
+            fields.extend((0..repeats).map(|i| format!("\"x\":{i}")));
+            fields.extend((0..after).map(|i| format!("\"v{i}\":{i}")));
+            format!("{{{}}}", fields.join(","))
+        };
+        let floor = StepSpan::DENSE_FROM;
+        // Over half the fields: given up during the walk once past the floor,
+        // and at its end under it.
+        plan_of(&object(20, floor + 10, 0), false);
+        plan_of(&object(20, 3000, 0), false);
+        // Under half: spans, past the floor and under it.
+        plan_of(&object(floor + 20, floor + 10, 0), true);
+        plan_of(&object(600, 500, 0), true);
+        // Repeats clustered in the first fields, under the floor, of an object
+        // they are a small share of: the walk's running share is past half
+        // while it is among them, and the spans are kept.
+        plan_of(&object(20, 3000, 30_000), true);
+    }
+
+    /// #7346: the compact text print passes each long run on in one write,
+    /// where gathering it would hold most of the object (100 MB more at the
+    /// peak of `-c .` over the 100 MB `wide` object, before #7356 let a long
+    /// write through [`ChunkedWrite`]); the indented one is passed on a chunk at
+    /// a time.
+    /// The last key repeats the first, so one run holds nearly all of it.
+    #[test]
+    fn repeated_keys_text_print_write_sizes_7346() {
+        /// Every write's length, and the text.
+        #[derive(Default)]
+        struct Writes(Vec<usize>, String);
+        impl core::fmt::Write for Writes {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                self.0.push(s.len());
+                self.1.push_str(s);
+                Ok(())
+            }
+        }
+        let keys = 20_000;
+        let doc = String::from_utf8(wide_canonical_object(keys, Some((0, keys - 1)))).unwrap();
+        assert!(doc.len() > 2 * CHUNKED_WRITE_BYTES);
+        let index = JsonIndex::build(doc.as_bytes());
+        let root = index.root(doc.as_bytes());
+        assert!(matches!(
+            root.canonical_compact_scan(0),
+            CanonicalSpan::RepeatedKeys { .. }
+        ));
+        let mut compact = Writes::default();
+        root.stream_json(
+            &mut compact,
+            IndentSpec::COMPACT,
+            false,
+            JsonConvention::JqCompat,
+        )
+        .unwrap();
+        assert_eq!(
+            compact.1,
+            wide_object_expectation(keys, Some((0, keys - 1)))
+        );
+        assert!(
+            compact.0[0] < CHUNKED_WRITE_BYTES,
+            "the brace and the planned first field go on before the run, not with it"
+        );
+        assert!(compact.0.iter().any(|&n| n > 2 * CHUNKED_WRITE_BYTES));
+        let mut pretty = Writes::default();
+        let two = IndentSpec {
+            width: 2,
+            unit: ' ',
+        };
+        root.stream_json(&mut pretty, two, false, JsonConvention::JqCompat)
+            .unwrap();
+        assert!(pretty.0.len() > 2);
+        assert!(pretty.0.iter().all(|&n| n < 2 * CHUNKED_WRITE_BYTES));
+
+        // #7366's nested object is written from its text too, with the text
+        // around it, where the walk would have buffered the whole value for
+        // one write.
+        let nested = format!("[0,{{\"a\":{doc}}},[1]]");
+        let index = JsonIndex::build(nested.as_bytes());
+        let root = index.root(nested.as_bytes());
+        assert!(matches!(
+            root.canonical_compact_scan(0),
+            CanonicalSpan::NestedRepeatedKeys { .. }
+        ));
+        for indent in [IndentSpec::COMPACT, two] {
+            let mut printed = Writes::default();
+            root.stream_json(&mut printed, indent, false, JsonConvention::JqCompat)
+                .unwrap();
+            let mut rerender = String::new();
+            stream_json_pretty(
+                &mut rerender,
+                root.value(),
+                0,
+                indent.width,
+                indent.unit,
+                false,
+                JsonConvention::JqCompat,
+                0,
+            )
+            .unwrap();
+            assert_eq!(printed.1, rerender, "{indent:?}");
+            assert!(printed.0.len() > 2, "{indent:?}: {:?}", printed.0.len());
+            assert_eq!(
+                printed.0.iter().any(|&n| n > 2 * CHUNKED_WRITE_BYTES),
+                indent.is_compact(),
+                "{indent:?}: only `-c` has a run of more than a chunk"
+            );
+        }
     }
 
     /// Same load-bearing direction as the corpus test above --

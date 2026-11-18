@@ -584,8 +584,12 @@ What remained on the repeat row over the plain walk was the canonical scan, whic
 at its closing brace, and the two key-only walks. Since #7310 the scan hands the hashes it found
 repeated to the plan, so a wide object it declines on its keys alone takes only the plan's walk:
 another -26% to -29% at 100 MB on both boxes (`docs/parsing/json.md`, "A wide object declined on its
-keys hands its shared hashes on"). Echoing the unchanged fields from the text, as the clean object
-is, needs a re-indent of fragments between the plan's steps; that is a separate change (#7346).
+keys hands its shared hashes on"). Since #7346 the fields between the plan's steps are copied from
+the text, as the clean object is, or re-indented from the members' level, so that object prints in
+1.4-1.6x the echo's time on the M4 Pro and 1.6-1.8x on the 7950X, at the echo's peak
+(`docs/parsing/json.md`, "A wide object declined on its keys prints from its text"), whether it is
+the value, sits inside it (#7366) or repeats one of its first keys (#7355). What is left is the plan's
+walk of every field (#7350).
 
 ## Open risks for an implementer to sanity-check
 
