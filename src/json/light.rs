@@ -7024,19 +7024,11 @@ fn stream_around_scanned_repeats<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>
         span.get(object.start..object.end),
         span.get(object.end..),
     ) else {
-        debug_assert!(false, "a certified span's recorded object is in the index");
-        let mut buf = String::new();
-        stream_json_pretty(
-            &mut buf,
-            value,
-            0,
-            indent.width,
-            indent.unit,
-            false,
-            numbers,
-            0,
-        )?;
-        return Ok(out.write_str(&buf)?);
+        debug_assert!(false, "a certified span's recorded object is in the index"); // patchcov: coverage tolerate-line reason="unreachable: a certified span's recorded object is in the index (#7366); kept so a mismatch prints the value whole, as a declined value is (#7346)"
+        let mut buf = String::new(); // patchcov: coverage tolerate-line reason="unreachable: a certified span's recorded object is in the index (#7366); kept so a mismatch prints the value whole, as a declined value is (#7346)"
+        #[rustfmt::skip]
+        stream_json_pretty(&mut buf, value, 0, indent.width, indent.unit, false, numbers, 0)?; // patchcov: coverage tolerate-line reason="unreachable: a certified span's recorded object is in the index (#7366); kept so a mismatch prints the value whole, as a declined value is (#7346)"
+        return Ok(out.write_str(&buf)?); // patchcov: coverage tolerate-line reason="unreachable: a certified span's recorded object is in the index (#7366); kept so a mismatch prints the value whole, as a declined value is (#7346)"
     };
     let text = RepeatText {
         span: object_span,
@@ -10215,8 +10207,7 @@ mod tests {
                     // #7346: and is written from its text when its plan keeps
                     // spans (unless more than half the fields have a step).
                     let StandardJson::Object(fields) = root.value() else {
-                        panic!("a scan that reports repeated keys was given an object");
-                        // patchcov: coverage tolerate-line reason="the failure message for the assertion this #7346 test exists to make"
+                        panic!("not an object"); // patchcov: coverage tolerate-line reason="the failure message for the assertion this #7346 test exists to make"
                     };
                     let plan = repeat_plan_from_shared(
                         &fields,
@@ -10410,7 +10401,10 @@ mod tests {
                 Ok(())
             }
         }
-        let doc = String::from_utf8(wide_canonical_object(40, Some((3, 30)))).unwrap();
+        // Several chunks long, so that the writer fails part-way through the
+        // cut: [`ChunkedWrite`] passes the first chunk on, then fails the next.
+        let doc = String::from_utf8(wide_canonical_object(20_000, Some((3, 19_990)))).unwrap();
+        assert!(doc.len() > 3 * CHUNKED_WRITE_BYTES);
         let index = JsonIndex::build(doc.as_bytes());
         let root = index.root(doc.as_bytes());
         let CanonicalSpan::RepeatedKeys {
@@ -10447,7 +10441,7 @@ mod tests {
             },
         ] {
             let failed = stream_scanned_repeats(
-                &mut Failing(20),
+                &mut Failing(CHUNKED_WRITE_BYTES + CHUNKED_WRITE_BYTES / 2),
                 fields,
                 RepeatText::whole(span, start),
                 &shared,
