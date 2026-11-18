@@ -43,30 +43,61 @@ fn a_static_chain_past_384_components_answers_as_jq_6356() -> Result<()> {
     Ok(())
 }
 
+/// `filter` run from a program file (a chain this long does not fit an argument), on `{}`.
+fn run_program_file(filter: &str) -> Result<(String, String, i32)> {
+    let mut program = NamedTempFile::new()?;
+    program.write_all(filter.as_bytes())?;
+    program.flush()?;
+    let path = program.path().to_str().unwrap();
+    run_jq_full(&["-c", "-f", path], Some("{}"))
+}
+
+/// The chain the search for the floor starts at, and the longest it tries.
+const FIRST_CHAIN: usize = 2_000_000;
+const LONGEST_CHAIN: usize = 32_000_000;
+
 /// Past the floor the walker refuses at exit 5, never a stack overflow (134) or a raw panic (101),
 /// and `?` and `try` do not absorb it: the guard keeps its `decode_failure` tag. jq has no row here,
-/// since it refuses to compile a program this long. Two million components is past the floor of
-/// both the debug and the release thread, and the program has to come from a file to fit. It is not
-/// past the floor of every build: at `opt-level=1` the frames are smaller and the chain answers
-/// `2000000`, so CI runs this in the unoptimised `deep-recursion` leg, not in `cli-gated` (#7373,
-/// `scripts/deep-recursion-tests.sh`).
+/// since it refuses to compile a program this long.
+///
+/// How long a chain is past the floor follows the build (#7377): the stack's size keys on
+/// `debug_assertions` and a frame's on the optimisation level. Two million components are refused by
+/// the unoptimised build and by the release build; an `opt-level=1` build, which two `cli-gated` CI
+/// legs are (#7373), answers `2000000` and refuses 2,500,000, and `opt-level=2` and `3` with debug
+/// assertions answer 2,500,000 and refuse 3,000,000 (M5 Max). So the chain is found, not fixed: it
+/// doubles from two million until the plain program is refused, and every chain short of that has
+/// to answer its own length. Below the floor an answer, past it this refusal, and nothing else
+/// on any build.
 #[test]
 fn a_chain_past_the_native_stack_floor_refuses_at_exit_5_6356() -> Result<()> {
-    let chain = ".a".repeat(2_000_000);
+    let refused = (String::new(), FLOOR_REFUSAL.to_string(), 5);
+    let mut components = FIRST_CHAIN;
+    loop {
+        let chain = ".a".repeat(components);
+        let got = run_program_file(&format!("path({chain}) | length"))?;
+        if got == refused {
+            break;
+        }
+        assert_eq!(
+            got,
+            (format!("{components}\n"), String::new(), 0),
+            "{components} components: neither the answer nor the floor's refusal"
+        );
+        assert!(
+            components < LONGEST_CHAIN,
+            "no refusal up to {LONGEST_CHAIN} components"
+        );
+        components *= 2;
+    }
+    let chain = ".a".repeat(components);
     for filter in [
-        format!("path({chain}) | length"),
         format!("[path({chain})?] | length"),
         format!(r#"try (path({chain}) | length) catch "x""#),
     ] {
-        let mut program = NamedTempFile::new()?;
-        program.write_all(filter.as_bytes())?;
-        program.flush()?;
-        let path = program.path().to_str().unwrap();
-        let (stdout, stderr, code) = run_jq_full(&["-c", "-f", path], Some("{}"))?;
         assert_eq!(
-            (stdout.as_str(), stderr.as_str(), code),
-            ("", FLOOR_REFUSAL, 5),
-            "{}",
+            run_program_file(&filter)?,
+            refused,
+            "{components} components: {}",
             &filter[..20]
         );
     }
