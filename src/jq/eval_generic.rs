@@ -56,7 +56,6 @@ use super::document::{
 };
 use super::encoder_comments::{EncoderComments, EncoderEntry, EncoderMembers, EncoderNodeComments};
 use super::error::EvalEscape;
-use super::eval::LoopAbort;
 use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, binary_fanout_rules, bind_def, bind_def_call,
     boolean_fanout_bools, boolean_fanout_each, bound_shape, by_key_scope,
@@ -102,6 +101,7 @@ use super::eval::{
     format_yq_commented, format_yq_props_commented, yq_encoder_prints_leading_block,
     yq_encoder_reads_spelling, yq_encoder_writes_comments, yq_props_format_style,
 };
+use super::eval::{yq_yaml_unwraps_string, LoopAbort};
 #[cfg(test)]
 use super::expr::FuncDefBound;
 use super::expr::TomlCommentSource;
@@ -18071,7 +18071,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 FormatType::YqYaml(n) => crate::jq::stream::yq_to_yaml_indent_width(*n),
                 _ => 2,
             };
-            let node_text = if indent <= 9 {
+            let node_text = if indent <= 9 && !yq_yaml_unwraps_string(&owned) {
                 yq_node_yaml_text::<S, _>(cursor.as_ref(), &owned, indent)
             } else {
                 None

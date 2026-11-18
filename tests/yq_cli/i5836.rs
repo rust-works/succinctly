@@ -2,11 +2,13 @@
 //! builtin's own words, and `tag` reads a plain date as `!!timestamp` and a plain `<<` as
 //! `!!merge`. A custom tag reads as its value's own type (`!foo x` is a string, `!foo 5` is
 //! refused as `!foo`). Every row is `printf 'a: DOC\n' | yq '.a | FILTER'` from yq v4.53.3:
-//! stdout, and stderr for a refusal (exit 1). `@sh` on a string is pinned by `i5837.rs`.
+//! stdout, and stderr for a refusal (exit 1). `@sh` on a string is pinned by `i5837.rs`. The last test
+//! (`UNWRAP_ROWS`) is the encoder rule of this issue's 2026-11-18 slice: a top-level string of `@yaml` and
+//! `to_yaml` is its own text.
 
 use anyhow::Result;
 
-use crate::run_yq_stdin_with_stderr;
+use crate::{run_yq_stdin, run_yq_stdin_with_stderr};
 
 /// (document value, filter, stdout, stderr)
 const ROWS: &[(&str, &str, &str, &str)] = &[
@@ -282,5 +284,138 @@ fn test_an_alias_node_is_left_to_the_builtin_5836() -> Result<()> {
     let (stdout, stderr, code) =
         run_yq_stdin_with_stderr(".c | upcase", "b: &x foo\nc: *x\n", &[])?;
     assert_eq!((stdout.as_str(), code), ("FOO\n", 0), "{stderr:?}");
+    Ok(())
+}
+
+/// yq's encoder unwraps a scalar root, so `to_yaml` and `@yaml` of a top-level string are the string's
+/// own text where go-yaml would quote it (`"<<" | @yaml` is `<<`, `"1"` is `1`, `"- x"` is `- x`, a string
+/// with a line break is its lines); a string inside a collection, and every string under
+/// `--unwrapScalar=false` and `-o=json`, is quoted as before. `(document, flags, filter, stdout)`, every
+/// row captured from yq v4.53.3.
+const UNWRAP_ROWS: &[(&str, &[&str], &str, &str)] = &[
+    ("null\n", &[], "\"<<\" | @yaml", "<<\n\n"),
+    ("null\n", &[], "\"<<\" | to_yaml", "<<\n\n"),
+    ("null\n", &[], "\"<<:\" | @yaml", "<<:\n\n"),
+    ("null\n", &[], "\"<<:\" | to_yaml", "<<:\n\n"),
+    ("null\n", &[], "\"<< \" | @yaml", "<< \n\n"),
+    ("null\n", &[], "\"<< \" | to_yaml", "<< \n\n"),
+    ("null\n", &[], "\"- <<\" | @yaml", "- <<\n\n"),
+    ("null\n", &[], "\"- <<\" | to_yaml", "- <<\n\n"),
+    ("null\n", &[], "\"x <<: y\" | @yaml", "x <<: y\n\n"),
+    ("null\n", &[], "\"x <<: y\" | to_yaml", "x <<: y\n\n"),
+    ("null\n", &[], "\"1\" | @yaml", "1\n\n"),
+    ("null\n", &[], "\"1\" | to_yaml", "1\n\n"),
+    ("null\n", &[], "\"1.5\" | @yaml", "1.5\n\n"),
+    ("null\n", &[], "\"1.5\" | to_yaml", "1.5\n\n"),
+    ("null\n", &[], "\"0x1F\" | @yaml", "0x1F\n\n"),
+    ("null\n", &[], "\"0x1F\" | to_yaml", "0x1F\n\n"),
+    ("null\n", &[], "\"true\" | @yaml", "true\n\n"),
+    ("null\n", &[], "\"true\" | to_yaml", "true\n\n"),
+    ("null\n", &[], "\"null\" | @yaml", "null\n\n"),
+    ("null\n", &[], "\"null\" | to_yaml", "null\n\n"),
+    ("null\n", &[], "\"~\" | @yaml", "~\n\n"),
+    ("null\n", &[], "\"~\" | to_yaml", "~\n\n"),
+    ("null\n", &[], "\"\" | @yaml", "\n\n"),
+    ("null\n", &[], "\"\" | to_yaml", "\n\n"),
+    ("null\n", &[], "\"- x\" | @yaml", "- x\n\n"),
+    ("null\n", &[], "\"- x\" | to_yaml", "- x\n\n"),
+    ("null\n", &[], "\"a: b\" | @yaml", "a: b\n\n"),
+    ("null\n", &[], "\"a: b\" | to_yaml", "a: b\n\n"),
+    ("null\n", &[], "\"#a\" | @yaml", "#a\n\n"),
+    ("null\n", &[], "\"#a\" | to_yaml", "#a\n\n"),
+    ("null\n", &[], "\"|\" | @yaml", "|\n\n"),
+    ("null\n", &[], "\"|\" | to_yaml", "|\n\n"),
+    ("null\n", &[], "\"a\\nb\" | @yaml", "a\nb\n\n"),
+    ("null\n", &[], "\"a\\nb\" | to_yaml", "a\nb\n\n"),
+    ("null\n", &[], "\"a\\n\" | @yaml", "a\n\n\n"),
+    ("null\n", &[], "\"a\\n\" | to_yaml", "a\n\n\n"),
+    ("null\n", &[], "\"tab\\there\" | @yaml", "tab\there\n\n"),
+    ("null\n", &[], "\"tab\\there\" | to_yaml", "tab\there\n\n"),
+    ("null\n", &[], "\"---\" | @yaml", "---\n\n"),
+    ("null\n", &[], "\"---\" | to_yaml", "---\n\n"),
+    ("null\n", &[], "\"x\" | @yaml", "x\n\n"),
+    ("null\n", &[], "\"x\" | to_yaml", "x\n\n"),
+    ("null\n", &[], "\"a b\" | @yaml", "a b\n\n"),
+    ("null\n", &[], "\"a b\" | to_yaml", "a b\n\n"),
+    ("null\n", &[], "\"\\\"a\" | @yaml", "\"a\n\n"),
+    ("null\n", &[], "\"\\\"a\" | to_yaml", "\"a\n\n"),
+    ("null\n", &[], "\"'a\" | @yaml", "'a\n\n"),
+    ("null\n", &[], "\"'a\" | to_yaml", "'a\n\n"),
+    ("null\n", &[], "\"12:30:45\" | @yaml", "12:30:45\n\n"),
+    ("null\n", &[], "\"12:30:45\" | to_yaml", "12:30:45\n\n"),
+    ("null\n", &[], "\"2001-12-14\" | @yaml", "2001-12-14\n\n"),
+    ("null\n", &[], "\"2001-12-14\" | to_yaml", "2001-12-14\n\n"),
+    ("null\n", &[], "\"<<\" | to_yaml(4)", "<<\n\n"),
+    ("null\n", &[], "\"<<\" | . + \"\" | @yaml", "<<\n\n"),
+    (
+        "null\n",
+        &["--unwrapScalar=false"],
+        "\"<<\" | @yaml",
+        "|\n  \"<<\"\n",
+    ),
+    (
+        "null\n",
+        &["-o=json", "-I0"],
+        "\"<<\" | @yaml",
+        "\"\\\"<<\\\"\\n\"\n",
+    ),
+    ("null\n", &[], "[\"<<\"] | @yaml", "- \"<<\"\n\n"),
+    ("null\n", &[], "{\"k\": \"<<\"} | @yaml", "k: \"<<\"\n\n"),
+    ("null\n", &[], "\"1\" | to_yaml(4)", "1\n\n"),
+    ("null\n", &[], "\"1\" | . + \"\" | @yaml", "1\n\n"),
+    (
+        "null\n",
+        &["--unwrapScalar=false"],
+        "\"1\" | @yaml",
+        "|\n  \"1\"\n",
+    ),
+    (
+        "null\n",
+        &["-o=json", "-I0"],
+        "\"1\" | @yaml",
+        "\"\\\"1\\\"\\n\"\n",
+    ),
+    ("null\n", &[], "[\"1\"] | @yaml", "- \"1\"\n\n"),
+    ("null\n", &[], "{\"k\": \"1\"} | @yaml", "k: \"1\"\n\n"),
+    ("null\n", &[], "\"- x\" | to_yaml(4)", "- x\n\n"),
+    ("null\n", &[], "\"- x\" | . + \"\" | @yaml", "- x\n\n"),
+    (
+        "null\n",
+        &["--unwrapScalar=false"],
+        "\"- x\" | @yaml",
+        "|\n  '- x'\n",
+    ),
+    (
+        "null\n",
+        &["-o=json", "-I0"],
+        "\"- x\" | @yaml",
+        "\"'- x'\\n\"\n",
+    ),
+    ("null\n", &[], "[\"- x\"] | @yaml", "- '- x'\n\n"),
+    ("null\n", &[], "{\"k\": \"- x\"} | @yaml", "k: '- x'\n\n"),
+    ("null\n", &[], "\"a\\nb\" | to_yaml(4)", "a\nb\n\n"),
+    ("null\n", &[], "\"a\\nb\" | . + \"\" | @yaml", "a\nb\n\n"),
+    ("a: \"<<\"\n", &[], ".a | @yaml", "<<\n\n"),
+    ("a: '<<'\n", &[], ".a | to_yaml", "<<\n\n"),
+    ("a: <<\n", &[], ".a | @yaml", "<<\n\n"),
+    ("a: !!str <<\n", &[], ".a | @yaml", "<<\n\n"),
+    ("a: \"1\"\nb: x\n", &[], ".a | @yaml", "1\n\n"),
+    ("a: \"1\"\nb: x\n", &[], ". | @yaml", "a: \"1\"\nb: x\n\n"),
+    ("a: \"1\"\n", &[], "[.a] | @yaml", "- \"1\"\n\n"),
+    ("a: \"- x\"\n", &[], ".a | to_yaml", "- x\n\n"),
+    ("a: |\n  l1\n  l2\n", &[], ".a | @yaml", "l1\nl2\n\n\n"),
+    ("a: \"<<\"\n", &[], ".a | @yaml | length", "3\n"),
+];
+
+#[test]
+fn a_top_level_string_is_written_as_its_own_text_by_yaml_5836() -> Result<()> {
+    for &(doc, flags, filter, want) in UNWRAP_ROWS {
+        let (out, code) = run_yq_stdin(filter, doc, flags)?;
+        assert_eq!(
+            (out.as_str(), code),
+            (want, 0),
+            "{filter} {flags:?} on {doc:?}"
+        );
+    }
     Ok(())
 }
