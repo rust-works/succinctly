@@ -24,9 +24,10 @@
 # so a test that holds only on the unoptimised build runs here. `i6356`'s stack-floor test was
 # listed for that until it stopped fixing the length of its chain and searched for the one the
 # build refuses (#7377): prefer that, since a test listed here runs on one build only. Of the
-# #5554 tests below, `i5554c`'s needs this leg for its build as well as its time: its
-# `tojson | length` row answers on the unoptimised and the release build and is refused at
-# `opt-level=1` to `3` with debug assertions (#7378).
+# #5554 tests below, `i5554c`'s needs this leg for its build as well as its time: its value of two
+# million levels is past the floor of the unoptimised build and of the release build, and at
+# `opt-level=1` it is not, so the walks it expects refused answer there (#7378 measured it, after
+# removing a debug-only check that had been refusing them for another reason).
 #
 # All of `yq_cli_tests` (104 s of macOS test time, #5705) runs in that leg too, but not from
 # here: ci.yml runs `cargo test --features cli --test yq_cli_tests` after `run`, with no skip
