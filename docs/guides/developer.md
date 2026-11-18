@@ -179,8 +179,9 @@ the Linux ARM64 `cli-gated` leg and every `deep-recursion` leg are unoptimised. 
 locally and fails only in an optimised `cli-gated` leg may depend on the build: one that pins where
 the native-stack floor falls does, since the floor follows the build's frame sizes. Reproduce it
 with that variable set. If the dependence is what the test is for and it is a `jq_cli_tests` test,
-add it to `HEAVY_TESTS` so it runs unoptimised on every platform
-(`per_issue::i6356::a_chain_past_the_native_stack_floor_refuses_at_exit_5_6356` is there for this).
+add it to `HEAVY_TESTS` so it runs unoptimised on every platform. Prefer a test that holds on any
+build: `per_issue::i6356::a_chain_past_the_native_stack_floor_refuses_at_exit_5_6356` was listed for
+this and no longer is, because it doubles its chain until the build refuses it (#7377).
 The list handles that one test target only: a test in another `cli-gated` binary has to hold on
 both builds, by deriving its depth from the build or by asserting only what both give.
 

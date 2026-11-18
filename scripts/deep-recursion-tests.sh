@@ -19,11 +19,14 @@
 # similar amounts (#5705 has since moved `yq_cli_tests` here, below). A `yq_cli_tests` test cannot be listed: `run` lists and runs one target.
 # #5782's ten-million-level drop test joined later, timed on its own rather than in that run.
 #
-# One test is listed for the build, not for its time (#7373): the x86_64 and macOS `cli-gated`
-# legs are built at `opt-level=1`, and `i6356`'s stack-floor test pins a refusal that the
-# unoptimised build and the release build give and an `opt-level=1` build does not. The
-# `deep-recursion` legs are unoptimised on every platform, so it runs here. Do not move it back
-# because it is quick.
+# A test can be listed for the build instead of its time (#7373): the x86_64 and macOS `cli-gated`
+# legs are built at `opt-level=1`, and the `deep-recursion` legs are unoptimised on every platform,
+# so a test that holds only on the unoptimised build runs here. `i6356`'s stack-floor test was
+# listed for that until it stopped fixing the length of its chain and searched for the one the
+# build refuses (#7377): prefer that, since a test listed here runs on one build only. Of the
+# #5554 tests below, `i5554c`'s needs this leg for its build as well as its time: its
+# `tojson | length` row answers on the unoptimised and the release build and is refused at
+# `opt-level=1` to `3` with debug assertions (#7378).
 #
 # All of `yq_cli_tests` (104 s of macOS test time, #5705) runs in that leg too, but not from
 # here: ci.yml runs `cargo test --features cli --test yq_cli_tests` after `run`, with no skip
@@ -76,7 +79,7 @@ STACK_TESTS=(
 )
 
 # 10 s or more each, in the order of the #5494 measurement (seconds, M5 Max, in parallel), then
-# the #5554 tests, then the one that is here for the unoptimised build (#7373).
+# the #5554 tests.
 HEAVY_TESTS=(
   test_fused_slice_read_equals_the_unfused_spelling_4195 # 72
   test_recurse_cap_raises_instead_of_ending_silently_3716 # 68
@@ -103,11 +106,6 @@ HEAVY_TESTS=(
   per_issue::i5526::test_built_value_past_the_native_stack_floor_is_a_refusal_not_a_panic_5526 # 25
   per_issue::i5554c::a_walk_past_the_native_stack_floor_refuses_at_exit_5_5554 # 17
   per_issue::i5526::test_built_value_past_the_native_stack_floor_on_document_input_5526 # 17
-  # #7373: here for the build, not its time (6 s). The `cli-gated` legs are built at `opt-level=1`,
-  # whose smaller frames let this two-million-component chain fit under the native-stack floor
-  # (it answers 2000000); the unoptimised build and the release build both refuse it, which is
-  # what the test pins. This leg stays unoptimised.
-  per_issue::i6356::a_chain_past_the_native_stack_floor_refuses_at_exit_5_6356
 )
 
 # What the `deep-recursion` leg runs, and every other leg skips.
