@@ -6895,6 +6895,7 @@ enum TextPlan {
     Walk,
 }
 
+#[cfg(test)]
 impl TextPlan {
     /// The plan, when there is one.
     fn plan(self) -> Option<RepeatPlan<usize>> {
@@ -7048,11 +7049,13 @@ fn certified_value_end(text: &[u8], at: usize) -> Option<usize> {
 
 /// The member length past which [`text_repeat_plan`] leaves an object to the
 /// fields' walk, judged on its average every 64 members. The text walk reads
-/// every byte of a member and the fields' walk costs the same per member
-/// whatever its length, so long members are cheaper walked: on the M4 Pro the
-/// text walk was 1.4-2.2% faster than the walk over 256-byte members and 2-5%
-/// slower over 1 KB and 2 KB strings (#7350).
-const TEXT_WALK_MEMBER_BYTES: usize = 512;
+/// every byte of a member, about 1.5 instructions a byte for a string
+/// ([`quote_or_backslash`]), and the fields' walk costs about 470 a member
+/// whatever its length, so long members are cheaper walked: over members of
+/// about 270 bytes (256-byte strings) the text walk read 6% more instructions
+/// than the walk (7950X, 512 bytes here), and over 1 KB and 2 KB strings it was
+/// 2% to 5% slower (M4 Pro, #7350).
+const TEXT_WALK_MEMBER_BYTES: usize = 256;
 
 /// One piece of a planned object's text (#7346, [`cut_planned_text`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10711,7 +10714,7 @@ mod tests {
     /// way it prints what the re-render prints.
     #[test]
     fn long_members_take_the_fields_walk_7350() {
-        for (keys, len) in [(200, 2000), (200, 100)] {
+        for (keys, len) in [(200, 2000), (200, 400), (200, 100)] {
             let mut fields: Vec<String> = (0..keys)
                 .map(|i| format!("\"k{i}\":\"{}{i}\"", "x".repeat(len)))
                 .collect();
