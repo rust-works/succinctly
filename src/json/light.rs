@@ -10347,7 +10347,7 @@ mod tests {
                             assert!(
                                 fates_are_dense(&walked_plan_fates(walked, &fields)),
                                 "{doc}"
-                            )
+                            );
                         }
                         (None, None) => {}
                     }
