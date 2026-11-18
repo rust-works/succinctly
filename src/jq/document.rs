@@ -3965,6 +3965,7 @@ fn plan_repeats<F: DocumentFields>(
                     if StepSpan::dense(spans.len(), at + 1, false) {
                         position_of = None;
                         awaiting_next = false;
+                        spans = Vec::new();
                     }
                 }
                 plan.field(at, name, value);
@@ -4009,7 +4010,16 @@ impl<C> RepeatPlanBuilder<C> {
     /// its place and is written with the last one's value; every later one is
     /// dropped.
     pub(crate) fn field(&mut self, at: usize, name: Cow<'_, str>, value: C) {
-        match self.slots.slot(name, self.values.len()) {
+        let hash = key_hash(name.as_bytes());
+        self.field_hashed(at, hash, name, value);
+    }
+
+    /// [`RepeatPlanBuilder::field`] for a walk that has hashed `name` already:
+    /// `hash` is its [`key_hash`] (the JSON text walk's, which hashes the raw
+    /// spelling it hands over as `name`, #7350).
+    pub(crate) fn field_hashed(&mut self, at: usize, hash: u64, name: Cow<'_, str>, value: C) {
+        debug_assert_eq!(hash, key_hash(name.as_bytes()));
+        match self.slots.slot(hash, name, self.values.len()) {
             Some(slot) => {
                 self.values[slot] = value;
                 self.steps.push(RepeatStep {
@@ -4076,10 +4086,9 @@ struct SharedKeySlots {
 }
 
 impl SharedKeySlots {
-    /// The slot already claimed by `key`, or `None` after claiming `slot`
-    /// for it.
-    fn slot(&mut self, key: Cow<'_, str>, slot: usize) -> Option<usize> {
-        let hash = key_hash(key.as_bytes());
+    /// The slot already claimed by `key`, whose [`key_hash`] is `hash`, or
+    /// `None` after claiming `slot` for it.
+    fn slot(&mut self, hash: u64, key: Cow<'_, str>, slot: usize) -> Option<usize> {
         match self.by_hash.get(&hash) {
             Some((first, at)) if first.as_str() == key.as_ref() => Some(*at),
             Some(_) => match self.collided.get(key.as_ref()) {
@@ -4503,7 +4512,7 @@ fn collapse_repeated_cursors<F: DocumentFields>(
         match collapsing_key(&key, shared, every_key, |key| {
             collapse_key_hash_of(key, collections_as_empty)
         }) {
-            Some(name) => match slots.slot(name, kept) {
+            Some(name) => match slots.slot(key_hash(name.as_bytes()), name, kept) {
                 Some(slot) => values[slot] = value,
                 None => {
                     values[kept] = value;
