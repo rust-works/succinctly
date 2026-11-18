@@ -395,16 +395,23 @@ jobs:
 
       # #7373: `matrix.optLevel` is set on the `cli-gated` leg only; 0 is the `dev` default. Both steps
       # carry it: with the build step unoptimised the run step would build the binary a second time.
+      # #7375: the optimised leg is also built with line tables for debug info and no incremental
+      # state, neither of which a CI run reads back (a backtrace keeps its file and line). The other
+      # legs get the `dev` defaults spelled out (`debug = 2`, incremental on), so they build as before.
       - name: Build CLI (for integration tests)
         if: needs.gate.outputs.code == 'true' && matrix.buildCli
         env:
           CARGO_PROFILE_DEV_OPT_LEVEL: ${{ matrix.optLevel || 0 }}
+          CARGO_PROFILE_DEV_DEBUG: ${{ matrix.optLevel && 'line-tables-only' || 2 }}
+          CARGO_INCREMENTAL: ${{ matrix.optLevel && '0' || '1' }}
         run: cargo build --features cli --bin succinctly
 
       - name: Run tests
         if: needs.gate.outputs.code == 'true'
         env:
           CARGO_PROFILE_DEV_OPT_LEVEL: ${{ matrix.optLevel || 0 }}
+          CARGO_PROFILE_DEV_DEBUG: ${{ matrix.optLevel && 'line-tables-only' || 2 }}
+          CARGO_INCREMENTAL: ${{ matrix.optLevel && '0' || '1' }}
         run: ${{ matrix.testCmd }}
 
   # #3059: same rationale as test-x86/test-x86-matrix above — the feature-flag
@@ -672,6 +679,25 @@ jobs:
   # the `ci:macos` label. `Test (macOS ARM64)` reports success on a deferred PR, with a notice;
   # `skipped` is accepted nowhere else. Re-run `scripts/ci-load-report.py` over a window before
   # and after, and see #5699 for the numbers this was decided on.
+  #
+  # #7375: at `opt-level=1` (#7373) the macOS `cli-gated` leg compiled for longer than the faster
+  # tests saved. Measured as pairs on one runner each, so runner speed cancels (two macOS runners,
+  # each building every variant from an empty `target`; compile is the binary plus the leg's test
+  # binaries, tests are the leg's `cargo test`):
+  #
+  #   build                                        compile      tests        both
+  #   unoptimised                                  176 / 185 s  760 / 916 s  936 / 1,101 s
+  #   opt-level=1                                  672 / 615 s  329 / 414 s  1,001 / 1,029 s
+  #   opt-level=1, line tables, no incremental     510 / 488 s  299 / 344 s  809 / 832 s
+  #   opt-level=1, no debug info, no incremental   477 / 452 s  (not run)
+  #
+  # So the optimised leg is built with `debug = "line-tables-only"` and `CARGO_INCREMENTAL=0`: about
+  # a fifth less than either build above, where `opt-level=1` alone was no better than unoptimised.
+  # Dropping debug info altogether saves another 35 s and costs the file and line of a backtrace, so
+  # it is not taken. The same two settings on an unoptimised build measured 190 / 153 s of compile
+  # against 176 / 185 s, no clear gain, so the unoptimised legs keep the defaults.
+  # `yq_cli_tests` stays in `deep-recursion`: at `opt-level=1` it costs about 205 s here (compile
+  # 53 s, tests 150 s), which would make this leg about 1,020 s against `deep-recursion`'s 950 s.
   test-macos-arm:
     name: Test (macOS ARM64)
     needs: [gate, test-macos-arm-matrix]
@@ -765,16 +791,23 @@ jobs:
 
       # #7373: `matrix.optLevel` is set on the `cli-gated` leg only; 0 is the `dev` default. Both steps
       # carry it: with the build step unoptimised the run step would build the binary a second time.
+      # #7375: the optimised leg is also built with line tables for debug info and no incremental
+      # state, neither of which a CI run reads back (a backtrace keeps its file and line). The other
+      # legs get the `dev` defaults spelled out (`debug = 2`, incremental on), so they build as before.
       - name: Build CLI (for integration tests)
         if: needs.gate.outputs.code == 'true' && matrix.buildCli
         env:
           CARGO_PROFILE_DEV_OPT_LEVEL: ${{ matrix.optLevel || 0 }}
+          CARGO_PROFILE_DEV_DEBUG: ${{ matrix.optLevel && 'line-tables-only' || 2 }}
+          CARGO_INCREMENTAL: ${{ matrix.optLevel && '0' || '1' }}
         run: cargo build --features cli --bin succinctly
 
       - name: Run
         if: needs.gate.outputs.code == 'true'
         env:
           CARGO_PROFILE_DEV_OPT_LEVEL: ${{ matrix.optLevel || 0 }}
+          CARGO_PROFILE_DEV_DEBUG: ${{ matrix.optLevel && 'line-tables-only' || 2 }}
+          CARGO_INCREMENTAL: ${{ matrix.optLevel && '0' || '1' }}
         run: ${{ matrix.testCmd }}
 
   # The beta/nightly upstream-toolchain legs (#203) and `bench` no longer run

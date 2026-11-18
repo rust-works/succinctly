@@ -264,7 +264,14 @@ class CiWiringTests(unittest.TestCase):
         # plain `cargo test` makes; and the setting has to reach the build step as well as the run
         # step, or the binary is built twice and the first build is the wrong one.
         text = CI_YML.read_text()
-        passed_on = "CARGO_PROFILE_DEV_OPT_LEVEL: ${{ matrix.optLevel || 0 }}"
+        # #7375: the optimised leg also drops full debug info and incremental state, which cost it
+        # a fifth of its time on macOS; the other legs get the `dev` defaults spelled out, so the
+        # settings travel with `optLevel` and reach nothing else.
+        passed_on = (
+            "CARGO_PROFILE_DEV_OPT_LEVEL: ${{ matrix.optLevel || 0 }}\n"
+            "          CARGO_PROFILE_DEV_DEBUG: ${{ matrix.optLevel && 'line-tables-only' || 2 }}\n"
+            "          CARGO_INCREMENTAL: ${{ matrix.optLevel && '0' || '1' }}\n"
+        )
         optimised_jobs = {"test-x86-matrix": True, "test-arm-matrix": False, "test-macos-arm-matrix": True}
         self.assertEqual(set(optimised_jobs), set(MATRIX_JOBS))
         for job, optimised in optimised_jobs.items():
@@ -301,7 +308,8 @@ class CiWiringTests(unittest.TestCase):
         code = "\n".join(
             line for line in text.split("\n") if not line.lstrip().startswith("#")
         )
-        self.assertEqual(code.count("CARGO_PROFILE_"), 2 * sum(optimised_jobs.values()))
+        self.assertEqual(code.count("CARGO_PROFILE_"), 4 * sum(optimised_jobs.values()))
+        self.assertEqual(code.count("CARGO_INCREMENTAL"), 2 * sum(optimised_jobs.values()))
         self.assertNotRegex(code, r"opt-level|RUSTFLAGS:")
         manifest = (CI_YML.parents[2] / "Cargo.toml").read_text()
         self.assertNotRegex(manifest, r"(?m)^\[profile\.(dev|test)\b")

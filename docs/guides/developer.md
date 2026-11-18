@@ -174,8 +174,11 @@ does not reproduce the leg. A plain `cargo test --features cli` still runs every
 
 CI builds the x86_64 and macOS `cli-gated` legs at `opt-level=1` (`CARGO_PROFILE_DEV_OPT_LEVEL=1`,
 set in `.github/workflows/ci.yml`; debug assertions and overflow checks stay on), because
-`jq_cli_tests` spends 1,125 s unoptimised and 455 s that way (#7373, M5 Max). A local `cargo test`,
-the Linux ARM64 `cli-gated` leg and every `deep-recursion` leg are unoptimised. So a test that passes
+`jq_cli_tests` spends 1,125 s unoptimised and 455 s that way (#7373, M5 Max). Those two legs are
+also built with `CARGO_PROFILE_DEV_DEBUG=line-tables-only` and `CARGO_INCREMENTAL=0`, which cut the
+optimised compile by about a quarter on a macOS runner (#7375); a backtrace there still has its file
+and line. A local `cargo test`, the Linux ARM64 `cli-gated` leg and every `deep-recursion` leg are
+unoptimised. So a test that passes
 locally and fails only in an optimised `cli-gated` leg may depend on the build: one that pins where
 the native-stack floor falls does, since the floor follows the build's frame sizes. Reproduce it
 with that variable set. If the dependence is what the test is for and it is a `jq_cli_tests` test,
