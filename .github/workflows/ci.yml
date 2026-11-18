@@ -235,9 +235,13 @@ jobs:
           # since Nov 8 were 62% of that, most of them 4 MiB windowed-route fixtures (the route starts
           # at 4 MiB) run a dozen times each through an unoptimised binary. Measured on an M5 Max with
           # this skip list: 1,125 s of test time unoptimised, 455 s at `opt-level=1`. Only this leg is
-          # optimised: `deep-recursion` pins where the native-stack floor falls, which depends on the
-          # build's frame sizes, so a test that passes unoptimised and fails here belongs in
-          # scripts/deep-recursion-tests.sh (`scripts/test_deep_recursion_tests.py` pins the wiring).
+          # optimised, here and on macOS, the two platforms where it set the wall time. `deep-recursion`
+          # pins where the native-stack floor falls, which depends on the build's frame sizes, so a
+          # `jq_cli_tests` test that passes unoptimised and fails here belongs in
+          # scripts/deep-recursion-tests.sh. The Linux ARM64 `cli-gated` leg stays unoptimised (it was
+          # the shortest of the three, about 13 min), so a required leg still runs every test here
+          # against the build a plain `cargo test` makes: a recursive frame that grows past a depth
+          # test's margin fails there. `scripts/test_deep_recursion_tests.py` pins all of this.
           - name: cli-gated
             buildCli: true
             optLevel: 1
@@ -435,10 +439,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # #7373: built at `opt-level=1`, as the x86_64 leg's (see the comment on its entry).
+          # #7373: NOT built at `opt-level=1`, unlike the x86_64 and macOS legs (see the comment on the
+          # x86_64 entry): this is the required leg that runs every one of these tests unoptimised.
           - name: cli-gated
             buildCli: true
-            optLevel: 1
             testCmd: |
               skip=$(scripts/deep-recursion-tests.sh skip-args)
               cargo test --features cli --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests --test serde_tests --test locate_cli_tests --test corpus_stats_cli_tests --test yq_tonumber_fixture_tests --test jq_path_context_alphabet_tests --test jq_extension_roster_tests --test jq_path_context_streaming_tests --test validate_snippet_multibyte_5988 -- $skip
@@ -570,18 +574,12 @@ jobs:
           fi
           echo "NEON (always on aarch64) + SVE2-BITPERM present: SIMD tests will assert, not skip."
 
-      # #7373: `matrix.optLevel` is set on the `cli-gated` leg only; 0 is the `dev` default. Both steps
-      # carry it: with the build step unoptimised the run step would build the binary a second time.
       - name: Build CLI (for integration tests)
         if: needs.gate.outputs.code == 'true' && matrix.buildCli
-        env:
-          CARGO_PROFILE_DEV_OPT_LEVEL: ${{ matrix.optLevel || 0 }}
         run: cargo build --features cli --bin succinctly
 
       - name: Run
         if: needs.gate.outputs.code == 'true'
-        env:
-          CARGO_PROFILE_DEV_OPT_LEVEL: ${{ matrix.optLevel || 0 }}
         run: ${{ matrix.testCmd }}
 
   # #3064: converts the previously-sequential 6-step chain below (15m45s in

@@ -46,7 +46,10 @@ fn a_static_chain_past_384_components_answers_as_jq_6356() -> Result<()> {
 /// Past the floor the walker refuses at exit 5, never a stack overflow (134) or a raw panic (101),
 /// and `?` and `try` do not absorb it: the guard keeps its `decode_failure` tag. jq has no row here,
 /// since it refuses to compile a program this long. Two million components is past the floor of
-/// both the debug and the release thread, and the program has to come from a file to fit.
+/// both the debug and the release thread, and the program has to come from a file to fit. It is not
+/// past the floor of every build: at `opt-level=1` the frames are smaller and the chain answers
+/// `2000000`, so CI runs this in the unoptimised `deep-recursion` leg, not in `cli-gated` (#7373,
+/// `scripts/deep-recursion-tests.sh`).
 #[test]
 fn a_chain_past_the_native_stack_floor_refuses_at_exit_5_6356() -> Result<()> {
     let chain = ".a".repeat(2_000_000);

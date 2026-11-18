@@ -257,38 +257,54 @@ class CiWiringTests(unittest.TestCase):
                 self.assertIn("buildCli: true", deep)
 
     def test_only_cli_gated_is_built_optimised_and_both_steps_say_so(self):
-        # #7373: `cli-gated` is built at `opt-level=1` (it had doubled in ten days). The legs that
-        # pin where the native-stack floor falls must stay unoptimised, since the floor follows
-        # the build's frame sizes, and the setting has to reach the build step as well as the run
+        # #7373: `cli-gated` is built at `opt-level=1` on x86_64 and macOS (it had doubled in ten
+        # days and set the wall time there). The legs that pin where the native-stack floor falls
+        # must stay unoptimised, since the floor follows the build's frame sizes; Linux ARM64's
+        # `cli-gated` stays unoptimised so one required leg runs every test against the build a
+        # plain `cargo test` makes; and the setting has to reach the build step as well as the run
         # step, or the binary is built twice and the first build is the wrong one.
         text = CI_YML.read_text()
         passed_on = "CARGO_PROFILE_DEV_OPT_LEVEL: ${{ matrix.optLevel || 0 }}"
-        for job in MATRIX_JOBS:
+        optimised_jobs = {"test-x86-matrix": True, "test-arm-matrix": False, "test-macos-arm-matrix": True}
+        self.assertEqual(set(optimised_jobs), set(MATRIX_JOBS))
+        for job, optimised in optimised_jobs.items():
             with self.subTest(job=job):
                 legs = matrix_legs(job)
                 # The matrix key, not `matrix.optLevel` in the steps the last leg's text runs on into.
-                optimised = {
-                    name for name, leg in legs.items() if re.search(r"^ +optLevel:", leg, re.M)
+                levels = {
+                    name: re.findall(r"^ +optLevel: (\S+)$", leg, re.M)
+                    for name, leg in legs.items()
+                    if re.search(r"^ +optLevel:", leg, re.M)
                 }
-                self.assertEqual(optimised, {"cli-gated"})
-                self.assertEqual(
-                    re.findall(r"^ +optLevel: (\S+)$", legs["cli-gated"], re.M), ["1"]
-                )
+                self.assertEqual(levels, {"cli-gated": ["1"]} if optimised else {})
                 found = re.search(
                     rf"^  {re.escape(job)}:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", text, re.M | re.S
                 )
-                steps = re.split(r"^      - ", found.group(1), flags=re.M)[1:]
+                body = "\n".join(
+                    line
+                    for line in found.group(1).split("\n")
+                    if not line.lstrip().startswith("#")
+                )
+                # Every step that can run cargo, however its `run:` is written.
                 cargo = [
                     step
-                    for step in steps
-                    if "matrix.testCmd" in step or re.search(r"^ +run: cargo ", step, re.M)
+                    for step in re.split(r"^      - ", body, flags=re.M)[1:]
+                    if "matrix.testCmd" in step or re.search(r"\bcargo\b", step)
                 ]
                 self.assertEqual(len(cargo), 2, [step.split("\n", 1)[0] for step in cargo])
                 for step in cargo:
-                    self.assertEqual(step.count(passed_on), 1, step.split("\n", 1)[0])
-        # Nothing else in the workflow sets it: a job-wide or workflow-wide value would reach
-        # `deep-recursion` too.
-        self.assertEqual(text.count("CARGO_PROFILE_DEV_OPT_LEVEL:"), 2 * len(MATRIX_JOBS))
+                    self.assertEqual(
+                        step.count(passed_on), 1 if optimised else 0, step.split("\n", 1)[0]
+                    )
+        # Nothing else sets a profile or an optimisation level: a job-wide or workflow-wide value,
+        # `RUSTFLAGS`, or a `[profile.dev]` in Cargo.toml would reach `deep-recursion` too.
+        code = "\n".join(
+            line for line in text.split("\n") if not line.lstrip().startswith("#")
+        )
+        self.assertEqual(code.count("CARGO_PROFILE_"), 2 * sum(optimised_jobs.values()))
+        self.assertNotRegex(code, r"opt-level|RUSTFLAGS:")
+        manifest = (CI_YML.parents[2] / "Cargo.toml").read_text()
+        self.assertNotRegex(manifest, r"(?m)^\[profile\.(dev|test)\b")
 
     def test_yq_cli_tests_runs_once_per_platform_in_deep_recursion(self):
         # #5705: `cli-gated` was the macOS critical path and yq_cli_tests was ~30% of its test
