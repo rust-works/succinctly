@@ -304,6 +304,13 @@ fn changed_while_running(change: Change, args: &[&str]) -> Result<(Run, Run)> {
         .read_to_end(&mut stderr)?;
     let status = child.wait()?;
     first.extend(rest);
+    // The run was still in the first file when the change was made only if it could not write all
+    // of its output: a pipe holds 64 KiB, and a program that prints less races the change (#7376).
+    assert!(
+        first.len() >= 2 * (64 << 10),
+        "{args:?} wrote {} bytes, which a pipe may hold",
+        first.len()
+    );
     let windowed = (
         String::from_utf8_lossy(&first).into_owned(),
         String::from_utf8_lossy(&stderr).into_owned(),

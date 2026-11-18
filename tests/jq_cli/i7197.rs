@@ -325,6 +325,13 @@ fn changed_while_running(change: Change, args: &[&str]) -> Result<(Run, Run)> {
         .read_to_end(&mut stderr)?;
     let status = child.wait()?;
     first.extend(rest);
+    // The run was still in the first file when the change was made only if it could not write all
+    // of its output: a pipe holds 64 KiB, and a program that prints less races the change (#7376).
+    assert!(
+        first.len() >= 2 * (64 << 10),
+        "{args:?} wrote {} bytes, which a pipe may hold",
+        first.len()
+    );
     let windowed = (
         String::from_utf8_lossy(&first).into_owned(),
         String::from_utf8_lossy(&stderr).into_owned(),
@@ -351,7 +358,9 @@ fn a_path_that_changes_before_the_run_reaches_it_is_read_as_jq_reads_it_7197() -
             &[
                 "-c",
                 "-n",
-                "inputs | select(type == \"object\") | tojson | length",
+                // The value rides with what is computed from it: the lengths alone are 12 KB over
+                // the small window's fixture, which a pipe holds, and the run would not wait (#7376).
+                "inputs | select(type == \"object\") | [(tojson | length), .]",
             ],
         ] {
             let (windowed, whole) = changed_while_running(change, args)?;
