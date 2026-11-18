@@ -3385,6 +3385,22 @@ fn embed_shared_for_value<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
     super::eval_generic::embed_shared_for::<S, _>(&cursor)
 }
 
+/// Whether every node of `value` is fewer than `levels` deep, the root counting as depth 0: what
+/// [`assert_value_tree_depth`] passes, whatever the native-stack floor allows, with `levels` at
+/// [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH). Stops at the first node past it,
+/// so it recurses `levels` deep at most.
+#[cfg(debug_assertions)]
+fn nests_within(value: &OwnedValue, levels: usize) -> bool {
+    let Some(below) = levels.checked_sub(1) else {
+        return false;
+    };
+    match value {
+        OwnedValue::Array(items) => items.iter().all(|item| nests_within(item, below)),
+        OwnedValue::Object(fields) => fields.iter().all(|(_, item)| nests_within(item, below)),
+        _ => true,
+    }
+}
+
 /// The storage a container read out of the reindex bridge went *in* as, if
 /// `value` stands at a container of a registered bridge document (#3069) --
 /// see [`bridge_provenance`](super::value::bridge_provenance) for why that
@@ -3462,8 +3478,14 @@ pub(crate) fn bridge_shared_for_value<S: EvalSemantics, W: Clone + AsRef<[u64]>>
         ); // patchcov: coverage tolerate-line reason="unreachable: a bridge document is its source's serialization, so the node at each recorded position is the recorded kind (#3069)"
         return None; // patchcov: coverage tolerate-line reason="unreachable: see the debug_assert above (#3069)"
     }
+    // The check is a second, recursive walk of the value, which the shipped route does not make.
+    // Past the constant that walk is bounded by the native-stack floor (#5554) and its frames are
+    // the widest of any walk here, so on a value the bridge had just handed back whole it spent
+    // the floor and turned the answer into a refusal, in a debug build only and only over the
+    // band of depths the bridge serves and the check cannot walk (#7378). It is made where it
+    // cannot refuse: on a value within the constant.
     #[cfg(debug_assertions)]
-    {
+    if nests_within(&shared, super::value::MAX_VALUE_TREE_DEPTH) {
         let fresh = to_owned_at_depth::<S, W>(value, None, 0);
         debug_assert!(
             fresh
