@@ -96,6 +96,11 @@ HEAVY_TESTS=(
   per_issue::i5526::test_built_value_past_the_native_stack_floor_is_a_refusal_not_a_panic_5526 # 25
   per_issue::i5554c::a_walk_past_the_native_stack_floor_refuses_at_exit_5_5554 # 17
   per_issue::i5526::test_built_value_past_the_native_stack_floor_on_document_input_5526 # 17
+  # #7373: here for the build, not its time (6 s). The `cli-gated` legs are built at `opt-level=1`,
+  # whose smaller frames let this two-million-component chain fit under the native-stack floor
+  # (it answers 2000000); the unoptimised build and the release build both refuse it, which is
+  # what the test pins. This leg stays unoptimised.
+  per_issue::i6356::a_chain_past_the_native_stack_floor_refuses_at_exit_5_6356
 )
 
 # What the `deep-recursion` leg runs, and every other leg skips.

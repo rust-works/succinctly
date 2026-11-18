@@ -256,6 +256,40 @@ class CiWiringTests(unittest.TestCase):
                 )
                 self.assertIn("buildCli: true", deep)
 
+    def test_only_cli_gated_is_built_optimised_and_both_steps_say_so(self):
+        # #7373: `cli-gated` is built at `opt-level=1` (it had doubled in ten days). The legs that
+        # pin where the native-stack floor falls must stay unoptimised, since the floor follows
+        # the build's frame sizes, and the setting has to reach the build step as well as the run
+        # step, or the binary is built twice and the first build is the wrong one.
+        text = CI_YML.read_text()
+        passed_on = "CARGO_PROFILE_DEV_OPT_LEVEL: ${{ matrix.optLevel || 0 }}"
+        for job in MATRIX_JOBS:
+            with self.subTest(job=job):
+                legs = matrix_legs(job)
+                # The matrix key, not `matrix.optLevel` in the steps the last leg's text runs on into.
+                optimised = {
+                    name for name, leg in legs.items() if re.search(r"^ +optLevel:", leg, re.M)
+                }
+                self.assertEqual(optimised, {"cli-gated"})
+                self.assertEqual(
+                    re.findall(r"^ +optLevel: (\S+)$", legs["cli-gated"], re.M), ["1"]
+                )
+                found = re.search(
+                    rf"^  {re.escape(job)}:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", text, re.M | re.S
+                )
+                steps = re.split(r"^      - ", found.group(1), flags=re.M)[1:]
+                cargo = [
+                    step
+                    for step in steps
+                    if "matrix.testCmd" in step or re.search(r"^ +run: cargo ", step, re.M)
+                ]
+                self.assertEqual(len(cargo), 2, [step.split("\n", 1)[0] for step in cargo])
+                for step in cargo:
+                    self.assertEqual(step.count(passed_on), 1, step.split("\n", 1)[0])
+        # Nothing else in the workflow sets it: a job-wide or workflow-wide value would reach
+        # `deep-recursion` too.
+        self.assertEqual(text.count("CARGO_PROFILE_DEV_OPT_LEVEL:"), 2 * len(MATRIX_JOBS))
+
     def test_yq_cli_tests_runs_once_per_platform_in_deep_recursion(self):
         # #5705: `cli-gated` was the macOS critical path and yq_cli_tests was ~30% of its test
         # time, so it runs in the `deep-recursion` leg, which already builds the CLI. It takes
