@@ -6950,9 +6950,8 @@ fn text_plan_or_walk(span: &str, start: usize, shared: &[u64]) -> Option<TextPla
         }
         let (name_start, name_end) = (key + 1, key_end - 1);
         if core::mem::take(&mut awaiting_next) {
-            if let Some(last) = spans.last_mut() {
-                last.next = start + key;
-            }
+            // Set only once a step has been pushed.
+            spans.last_mut()?.next = start + key;
         }
         let value = key_end + 1;
         let value_end = certified_value_end(window, value)?;
@@ -10502,13 +10501,8 @@ mod tests {
                         (Some(_), None) => panic!("only the text found a plan: {doc}"), // patchcov: coverage tolerate-line reason="the failure message for the assertion this #7350 test exists to make"
                         // Too dense to keep spans is the one reason to have
                         // no plan from the text when the walk finds one.
-                        (None, Some(walked)) => {
-                            assert!(
-                                fates_are_dense(&walked_plan_fates(walked, &fields)),
-                                "{doc}"
-                            );
-                        }
-                        (None, None) => {}
+                        #[rustfmt::skip]
+                        (None, walked) => assert!(walked.into_iter().all(|w| fates_are_dense(&walked_plan_fates(w, &fields))), "{doc}"), // patchcov: coverage tolerate-line reason="the sweep's objects are never dense or a bare collision; dense_repeats_print_by_the_walk_7346 and scanned_repeats_without_a_plan_print_at_their_level_7366 cover both (#7350)"
                     }
                     from_text += usize::from(
                         plan.is_some_and(|plan| planned_pieces(&plan, span, start).is_some()),
@@ -10719,6 +10713,8 @@ mod tests {
             "\"a\":\"1,\"a\":2",
             "\"a\":1,\"a\":2,1",
             "a:1,\"a\":2",
+            "\"a\":\"x\u{1}y\",\"a\":2",
+            "\"a\":,\"a\":2",
         ] {
             let text = format!("{{{pad},{fault}}}");
             assert!(
@@ -10726,6 +10722,13 @@ mod tests {
                 "{text}"
             );
         }
+        // A number that runs past the reading budget is handed over, not cut
+        // at the budget's edge.
+        let long = format!("{{{pad},\"a\":{},\"a\":2}}", "1".repeat(40_000));
+        assert!(matches!(
+            text_repeat_plan(&long, 0, &shared),
+            TextPlan::Walk
+        ));
         for text in ["{}", "[]", "{\"a\":1,\"a\":2}"] {
             assert!(
                 text_repeat_plan(text, 0, &shared).plan().is_none(),
@@ -11070,6 +11073,13 @@ mod tests {
             assert_eq!(
                 spanned.spanned_steps().is_some(),
                 want_spans,
+                "{}",
+                doc.len()
+            );
+            let walked = repeat_plan_from_shared(&fields, &shared, raw_key_hash, None).unwrap();
+            assert_eq!(
+                fates_are_dense(&walked_plan_fates(walked, &fields)),
+                !want_spans,
                 "{}",
                 doc.len()
             );
