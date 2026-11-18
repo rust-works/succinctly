@@ -3,6 +3,9 @@
 //! and that file and the ones after it are handed to the route that reads them whole, as for a longer list
 //! (#7221). Every row is what the same files give when the route declines them (they are handed over as named
 //! pipes): stdout, stderr and the exit status, each file's name made one.
+//!
+//! In a debug build the files are a sixteenth of the size and the binary's window is 64 KiB
+//! (`small_window`, #7376); a release build runs the same rows over the 1 MiB window.
 
 #![cfg(unix)]
 
@@ -12,14 +15,16 @@ use std::process::Command;
 use anyhow::Result;
 
 use crate::fifo_feed::{self, Feed};
+use crate::small_window::{self, scaled};
 
 type Run = (String, String, i32);
 
 /// Within the 32 files the run holds open from the start.
 const FILES: usize = 8;
 
-/// Records in each file: 8 files of about 660 KB, so 5.3 MB between them, over the 4 MiB the route needs.
-const EACH: usize = 6_000;
+/// Records in each file: 8 files of about 660 KB on the shipped window, so 5.3 MB between them, over the
+/// 4 MiB (four windows) the route needs. [`framed`] checks it at the window in use.
+const EACH: usize = scaled(6_000);
 
 fn records(from: usize, count: usize) -> Vec<u8> {
     (from..from + count)
@@ -44,11 +49,13 @@ fn both(args: &[&str], files: &[Vec<u8>]) -> Result<(Run, Run)> {
     // The pipes, and the deadline the run is held to, are `fifo_feed`'s (#7304).
     let run = |operands: &[std::path::PathBuf], feeds: &[Feed]| -> Result<Run> {
         let output = fifo_feed::output(
-            Command::new(env!("CARGO_BIN_EXE_succinctly"))
-                .arg("jq")
-                .args(args)
-                .args(operands)
-                .env("LC_ALL", "C"),
+            small_window::apply(
+                Command::new(env!("CARGO_BIN_EXE_succinctly"))
+                    .arg("jq")
+                    .args(args)
+                    .args(operands)
+                    .env("LC_ALL", "C"),
+            ),
             feeds,
         )?;
         let name = |bytes: &[u8]| {
@@ -75,9 +82,14 @@ fn same(name: &str, args: &[&str], files: &[Vec<u8>]) -> Result<Run> {
     Ok(windowed)
 }
 
-/// 5.3 MB of records in 8 files, framed.
+/// Over four windows of records in 8 files (5.3 MB on the shipped window), framed.
 fn framed() -> Vec<Vec<u8>> {
-    (0..FILES).map(|n| records(n * EACH, EACH)).collect()
+    let files: Vec<Vec<u8>> = (0..FILES).map(|n| records(n * EACH, EACH)).collect();
+    assert!(
+        files.iter().map(Vec::len).sum::<usize>() > small_window::MIN_BYTES + 4096,
+        "the files must be windowed"
+    );
+    files
 }
 
 #[test]
@@ -168,17 +180,14 @@ fn the_files_from_one_that_is_not_plain_records_are_read_whole_7279() -> Result<
             }),
         ),
     ];
+    // A record of the file after the one that turns (30,000 of 48,000 on the shipped window).
+    let boom = format!(
+        "if .id == {} then error(\"boom\") else empty end",
+        FILES * EACH * 5 / 8
+    );
     for (name, files) in cases {
         same(name, &["--seq", "-c", "[input_filename, .id]"], &files)?;
-        same(
-            name,
-            &[
-                "--seq",
-                "-c",
-                "if .id == 30000 then error(\"boom\") else empty end",
-            ],
-            &files,
-        )?;
+        same(name, &["--seq", "-c", &boom], &files)?;
     }
     Ok(())
 }

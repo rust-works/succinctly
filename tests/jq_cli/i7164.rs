@@ -6,15 +6,20 @@
 //! as #7024's pipe rows use: that name reads a `--seq` stream that starts with a BOM as no records at all.) The rows where the stream turns at a record whose wording depends on what came
 //! before it (a bare `n` after a token that left a `u` in jq's token buffer, an RS in the final buffer) are
 //! also pinned to jq 1.7.1's own output.
+//!
+//! In a debug build the fixtures are a sixteenth of the size and the binary's window is 64 KiB
+//! (`small_window`, #7376); a release build runs the same rows over the 1 MiB window. The lines jq's
+//! messages name are the fixture's, so they are made from [`RECORDS`].
 
 #![cfg(unix)]
 
 use anyhow::Result;
 
-use crate::fifo_feed::spawn_jq_deadline;
+use crate::small_window::{self, scaled, spawn_jq as spawn_jq_deadline};
 
-/// How many records the fixtures have: about 6.5 MiB, well over the 4 MiB a pipe needs to be windowed.
-const RECORDS: usize = 60_000;
+/// How many records the fixtures have: about six windows (6.5 MiB on the shipped one), well over the
+/// four a pipe needs to be windowed.
+const RECORDS: usize = scaled(60_000);
 
 fn record(i: usize) -> String {
     format!(
@@ -31,7 +36,7 @@ fn records(range: std::ops::Range<usize>) -> String {
 /// stderr and exit status of the windowed run, once they are checked to be the whole run's.
 fn same(args: &[&str], bytes: &[u8]) -> Result<(String, String, i32)> {
     assert!(
-        bytes.len() > 4 * 1024 * 1024,
+        bytes.len() > small_window::MIN_BYTES,
         "the pipe must hold enough to be windowed"
     );
     let (windowed, windowed_status) = spawn_jq_deadline(args, Some(bytes))?;
@@ -55,27 +60,52 @@ fn same(args: &[&str], bytes: &[u8]) -> Result<(String, String, i32)> {
     ))
 }
 
-const PROGRAMS: [&[&str]; 4] = [
-    &["--seq", "-c", "."],
-    &["--seq", "-c", ".id?"],
-    &[
-        "--seq",
-        "-c",
-        "if .id? == 30000 then error(\"boom\") else empty end",
-    ],
-    &["--seq", "-e", "select(.id? == 59999) | .name"],
-];
+/// The programs: the raw-bytes fast path, a field, a runtime error at the record in the middle, and
+/// `-e` over the last record.
+fn programs() -> [Vec<String>; 4] {
+    let args = |args: &[&str]| args.iter().map(|&arg| arg.to_owned()).collect::<Vec<_>>();
+    [
+        args(&["--seq", "-c", "."]),
+        args(&["--seq", "-c", ".id?"]),
+        args(&[
+            "--seq",
+            "-c",
+            &format!(
+                "if .id? == {} then error(\"boom\") else empty end",
+                RECORDS / 2
+            ),
+        ]),
+        args(&[
+            "--seq",
+            "-e",
+            &format!("select(.id? == {}) | .name", RECORDS - 1),
+        ]),
+    ]
+}
+
+fn strs(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
+}
 
 #[test]
 fn a_clean_seq_pipe_reads_as_the_whole_stream_does_7164() -> Result<()> {
     let clean = records(0..RECORDS).into_bytes();
-    for args in PROGRAMS {
-        same(args, &clean)?;
+    let programs = programs();
+    for args in &programs {
+        same(&strs(args), &clean)?;
     }
-    let (_, err, status) = same(PROGRAMS[2], &clean)?;
+    let (_, err, status) = same(&strs(&programs[2]), &clean)?;
     assert_eq!(
-        (err.as_str(), status),
-        ("jq: error (at <stdin>:30001): boom\n", 0)
+        (err, status),
+        (
+            format!("jq: error (at <stdin>:{}): boom\n", RECORDS / 2 + 1),
+            0
+        )
+    );
+    let (out, _, status) = same(&strs(&programs[3]), &clean)?;
+    assert_eq!(
+        (out, status),
+        (format!("\x1e\"user {}\"\n", RECORDS - 1), 0)
     );
     Ok(())
 }
@@ -87,6 +117,7 @@ fn a_clean_seq_pipe_reads_as_the_whole_stream_does_7164() -> Result<()> {
 fn a_seq_pipe_that_turns_is_read_on_as_the_whole_stream_7164() -> Result<()> {
     let head = records(0..RECORDS / 2);
     let rest = records(RECORDS / 2..RECORDS);
+    let programs = programs();
     for turn in [
         "\x1e{\"a\":1\n",
         "\x1e[1,]\n",
@@ -99,16 +130,20 @@ fn a_seq_pipe_that_turns_is_read_on_as_the_whole_stream_7164() -> Result<()> {
     ] {
         let stream = format!("{head}{turn}{rest}").into_bytes();
         // The raw-bytes fast path, and the general one with the line of a runtime error.
-        for args in [PROGRAMS[0], PROGRAMS[2]] {
-            same(args, &stream)?;
+        for args in [&programs[0], &programs[2]] {
+            same(&strs(args), &stream)?;
         }
     }
     let stream = format!("{head}\x1e[1,]\n{rest}").into_bytes();
-    let (_, err, _) = same(PROGRAMS[2], &stream)?;
+    let (_, err, _) = same(&strs(&programs[2]), &stream)?;
     assert_eq!(
         err,
-        "jq: ignoring parse error: Expected another array element at line 30001, column 5 (need RS to resync)\n\
-         jq: error (at <stdin>:30002): boom\n"
+        format!(
+            "jq: ignoring parse error: Expected another array element at line {}, column 5 (need RS to resync)\n\
+             jq: error (at <stdin>:{}): boom\n",
+            RECORDS / 2 + 1,
+            RECORDS / 2 + 2
+        )
     );
     Ok(())
 }
@@ -120,22 +155,18 @@ fn a_seq_pipe_that_turns_is_read_on_as_the_whole_stream_7164() -> Result<()> {
 #[test]
 fn a_seq_pipe_turns_with_what_its_records_left_7164() -> Result<()> {
     let head = records(0..RECORDS);
+    // The line of the bare `n`: the records, the record before it, and its own.
+    let line = RECORDS + 3;
+    let literal = format!(
+        "jq: ignoring parse error: Invalid literal at line {line}, column 0 (need RS to resync)\n"
+    );
+    let numeric = format!(
+        "jq: ignoring parse error: Invalid numeric literal at line {line}, column 0 (need RS to resync)\n"
+    );
     let cases: [(&str, &str, &str); 4] = [
-        (
-            "\x1e[\"x\\u0075\"]\n\x1en\n",
-            "\x1e[\"xu\"]\n",
-            "jq: ignoring parse error: Invalid literal at line 60003, column 0 (need RS to resync)\n",
-        ),
-        (
-            "\x1enull\n\x1en\n",
-            "\x1enull\n",
-            "jq: ignoring parse error: Invalid literal at line 60003, column 0 (need RS to resync)\n",
-        ),
-        (
-            "\x1e7\n\x1en\n",
-            "\x1e7\n",
-            "jq: ignoring parse error: Invalid numeric literal at line 60003, column 0 (need RS to resync)\n",
-        ),
+        ("\x1e[\"x\\u0075\"]\n\x1en\n", "\x1e[\"xu\"]\n", &literal),
+        ("\x1enull\n\x1en\n", "\x1enull\n", &literal),
+        ("\x1e7\n\x1en\n", "\x1e7\n", &numeric),
         ("\x1e12.5", "", ""),
     ];
     for (turn, last, err) in cases {
@@ -143,7 +174,8 @@ fn a_seq_pipe_turns_with_what_its_records_left_7164() -> Result<()> {
         let (out, got_err, status) = same(&["--seq", "-c", "."], &stream)?;
         assert!(
             out.ends_with(&format!(
-                "\"tags\":[\"a\",\"b\",\"c\"],\"score\":999}}\n{last}"
+                "\"tags\":[\"a\",\"b\",\"c\"],\"score\":{}}}\n{last}",
+                (RECORDS - 1) % 1000
             )),
             "{turn:?}"
         );
@@ -160,7 +192,7 @@ fn a_seq_pipe_that_never_turns_plain_or_stops_first_7164() -> Result<()> {
     let clean = records(0..RECORDS);
     for front in ["\u{feff}", "x\n", "\n"] {
         let stream = format!("{front}{clean}").into_bytes();
-        same(PROGRAMS[1], &stream)?;
+        same(&strs(&programs()[1]), &stream)?;
     }
     // The last value is in the windows, and the rest reads none.
     let stream = format!("{clean}\x1efalse\n\x1e{{\"a\"\n").into_bytes();

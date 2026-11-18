@@ -4,6 +4,9 @@
 //! stdout, stderr and the exit status, with each file's name made one. The files are handed to that
 //! route as named pipes ([`whole_by_descriptor`]): descriptors past 9 opened by `bash` 3.2, macOS's,
 //! did not reopen as `/dev/fd/N` reliably (`Resource temporarily unavailable` on CI).
+//!
+//! In a debug build the fixtures are a sixteenth of the size and the binary's window is 64 KiB
+//! (`small_window`, #7376); a release build runs the same rows over the 1 MiB window.
 
 #![cfg(unix)]
 
@@ -13,9 +16,13 @@ use std::process::Command;
 use anyhow::Result;
 
 use crate::fifo_feed::{self, Feed};
+use crate::small_window::{self, scaled};
 
 /// More files than the route holds open (32), small enough that a token is open where many end.
 const FILES: usize = 40;
+
+/// How many lines the fixtures have: four windows or more of text ([`big`] checks it).
+const LINES: usize = scaled(64_000);
 
 fn text(lines: usize) -> Vec<u8> {
     (0..lines)
@@ -64,11 +71,13 @@ fn whole_by_descriptor(args: &[&str], paths: &[std::path::PathBuf]) -> Result<Ru
         operands.push(fifo);
     }
     let output = fifo_feed::output(
-        Command::new(env!("CARGO_BIN_EXE_succinctly"))
-            .arg("jq")
-            .args(args)
-            .args(&operands)
-            .env("LC_ALL", "C"),
+        small_window::apply(
+            Command::new(env!("CARGO_BIN_EXE_succinctly"))
+                .arg("jq")
+                .args(args)
+                .args(&operands)
+                .env("LC_ALL", "C"),
+        ),
         &feeds,
     )?;
     let named = |text: &[u8]| {
@@ -104,12 +113,14 @@ fn both(args: &[&str], files: &[Vec<u8>]) -> Result<(Run, Run)> {
         };
         (name(run.0), name(run.1), run.2)
     };
-    let windowed = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .arg("jq")
-        .args(args)
-        .args(&paths)
-        .env("LC_ALL", "C")
-        .output()?;
+    let windowed = small_window::apply(
+        Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .arg("jq")
+            .args(args)
+            .args(&paths)
+            .env("LC_ALL", "C"),
+    )
+    .output()?;
     let windowed = (
         String::from_utf8_lossy(&windowed.stdout).into_owned(),
         String::from_utf8_lossy(&windowed.stderr).into_owned(),
@@ -124,10 +135,14 @@ fn same(args: &[&str], files: &[Vec<u8>]) -> Result<Run> {
     Ok(windowed)
 }
 
-/// 4 MiB or more between the files, so the route takes them.
+/// Four windows or more between the files (4 MiB on the shipped window), so the route takes them.
 fn big() -> Vec<u8> {
-    let bytes = text(60_000);
-    assert!(bytes.len() >= 4 << 20, "{} bytes", bytes.len());
+    let bytes = text(LINES);
+    assert!(
+        bytes.len() >= small_window::MIN_BYTES,
+        "{} bytes",
+        bytes.len()
+    );
     bytes
 }
 
@@ -137,17 +152,30 @@ fn more_files_than_are_held_open_read_as_one_stream_7024() -> Result<()> {
     let (stdout, stderr, status) = same(&["-c", "."], &files)?;
     assert_eq!(
         (stdout.lines().count(), stderr.as_str(), status),
-        (60_000, "", 0)
+        (LINES, "", 0)
     );
     let (stdout, _, _) = same(&["input_filename"], &files)?;
     assert!(stdout.contains("<file 39>"), "every file is reached");
     same(&["-e", ".nope"], &files)?;
-    same(&[".id | select(. % 9999 == 0)"], &files)?;
-    // A runtime error names the file and line jq's reader is at.
-    same(
-        &["if .id == 45000 then error(\"stop\") else .id end"],
+    let (stdout, _, _) = same(
+        &[&format!(".id | select(. % {} == 0)", LINES / 6 - 1)],
         &files,
     )?;
+    assert_eq!(
+        stdout.lines().count(),
+        7,
+        "one in each sixth, and the first"
+    );
+    // A runtime error names the file and line jq's reader is at.
+    let (stdout, stderr, _) = same(
+        &[&format!(
+            "if .id == {} then error(\"stop\") else .id end",
+            LINES * 3 / 4
+        )],
+        &files,
+    )?;
+    assert_eq!(stdout.lines().count(), LINES - 1);
+    assert!(stderr.contains("stop"), "{stderr}");
     Ok(())
 }
 
@@ -224,12 +252,8 @@ fn changed_while_running(change: Change, args: &[&str]) -> Result<(Run, Run)> {
         .collect();
     for (n, path) in paths.iter().enumerate() {
         let bytes = match n {
-            // Just over the 4 MiB the route needs, and more output than a pipe holds.
-            0 => {
-                let bytes = text(60_000);
-                assert!(bytes.len() >= 4 << 20, "{} bytes", bytes.len());
-                bytes
-            }
+            // Just over the four windows the route needs, and more output than a pipe holds.
+            0 => big(),
             19 => b"{\"k\":19}\n12".to_vec(),
             20 if matches!(change, Change::GoneAfterAFault) => b"{\"k\":20} }\n".to_vec(),
             21 => b"34\n{\"k\":21}\n".to_vec(),
@@ -239,14 +263,16 @@ fn changed_while_running(change: Change, args: &[&str]) -> Result<(Run, Run)> {
         std::fs::write(path, bytes)?;
     }
     let bin = env!("CARGO_BIN_EXE_succinctly");
-    let mut child = Command::new(bin)
-        .arg("jq")
-        .args(args)
-        .args(&paths)
-        .env("LC_ALL", "C")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
+    let mut child = small_window::apply(
+        Command::new(bin)
+            .arg("jq")
+            .args(args)
+            .args(&paths)
+            .env("LC_ALL", "C"),
+    )
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()?;
     let mut stdout = child.stdout.take().expect("piped");
     let mut first = vec![0u8; 4096];
     stdout.read_exact(&mut first)?;
@@ -278,6 +304,13 @@ fn changed_while_running(change: Change, args: &[&str]) -> Result<(Run, Run)> {
         .read_to_end(&mut stderr)?;
     let status = child.wait()?;
     first.extend(rest);
+    // The run was still in the first file when the change was made only if it could not write all
+    // of its output: a pipe holds 64 KiB, and a program that prints less races the change (#7376).
+    assert!(
+        first.len() >= 2 * (64 << 10),
+        "{args:?} wrote {} bytes, which a pipe may hold",
+        first.len()
+    );
     let windowed = (
         String::from_utf8_lossy(&first).into_owned(),
         String::from_utf8_lossy(&stderr).into_owned(),

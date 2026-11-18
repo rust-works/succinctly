@@ -4,16 +4,23 @@
 //! lines, a line longer than a block, a BOM) and checks the run against the same bytes read whole: the
 //! pipe named as `/dev/stdin`, which the windowed routes decline, so stdout, stderr (with that name read
 //! as `<stdin>`) and the exit status are the whole-file route's.
+//!
+//! Every size here is a number of windows. In a debug build the window is 64 KiB and the fixtures
+//! a sixteenth of the size (`small_window`, #7376); a release build runs the same rows over the
+//! 1 MiB window, where the probe is the 4 MiB the first line speaks of.
 
 #![cfg(unix)]
 
 use anyhow::Result;
 
-use crate::fifo_feed::spawn_jq_deadline;
+use crate::small_window::{scaled, spawn_jq as spawn_jq_deadline, WINDOW};
 
-/// About 6 MiB of records, so the probe is full and the pipe goes on past it.
+/// How many records the fixtures have: about six windows (6 MiB on the shipped one), so the probe is
+/// full and the pipe goes on past it.
+const RECORDS: usize = scaled(60_000);
+
 fn records() -> Vec<String> {
-    (0..60_000)
+    (0..RECORDS)
         .map(|i| {
             format!(
                 "{{\"id\":{i},\"name\":\"user {i}\",\"pad\":\"{}\"}}",
@@ -60,18 +67,18 @@ fn line_at(lines: &[String], at: usize) -> usize {
         .expect("in the stream")
 }
 
-const MIB: usize = 1 << 20;
-
 #[test]
 fn what_a_window_of_the_probe_cuts_reads_as_the_whole_stream_does_7266() -> Result<()> {
     let base = records();
-    let programs: [&[&str]; 3] = [
-        &["-c", "."],
-        &["-r", "select(.id % 7919 == 0) | .name"],
-        &["-c", "select(.id == 59999) | .id"],
-    ];
+    assert!(
+        join(&base).len() > 5 * WINDOW,
+        "the pipe must go on past the probe"
+    );
+    let some = format!("select(.id % {} == 0) | .name", RECORDS / 8 + 1);
+    let last = format!("select(.id == {}) | .id", RECORDS - 1);
+    let programs: [&[&str]; 3] = [&["-c", "."], &["-r", &some], &["-c", &last]];
     // Near each block's end inside the probe, and in its last block.
-    for at in [MIB - 40, 2 * MIB + 7, 4 * MIB - 30] {
+    for at in [WINDOW - 40, 2 * WINDOW + 7, 4 * WINDOW - 30] {
         let n = line_at(&base, at);
         // A fault in a member the filter never reads, worded once the stream ends inside a document
         // (the first fault of the stream, which the probe's window held and dropped long before).
@@ -107,9 +114,43 @@ fn what_a_window_of_the_probe_cuts_reads_as_the_whole_stream_does_7266() -> Resu
             same(args, &join(&pretty))?;
         }
     }
+    // The same shapes across a block's end by construction. The rows above meet them only when a
+    // record happens to lie across one, which the 1 MiB window's fixture did at 2 MiB + 7 and the
+    // 64 KiB window's does nowhere (#7376): a window ends at the last line break before the block's
+    // end, so the record that holds the end's byte is the first line of the next window, and a
+    // document of a hundred lines that starts 20 bytes or more before the end has a line break on
+    // each side of it.
+    for end in [WINDOW, 2 * WINDOW, 4 * WINDOW] {
+        let n = line_at(&base, end);
+        let mut fault = base.clone();
+        fault[n] = format!(
+            "{{\"id\":{n},\"name\":\"{}\",\"t\":[1 2]}}",
+            "x".repeat(120)
+        );
+        let mut fault = join(&fault);
+        fault.extend_from_slice(b"{\"id\":");
+        let p = line_at(&base, end - 20);
+        let mut pretty = base.clone();
+        pretty[p] = format!(
+            "{{\"id\":{p},\n  \"name\":\"p\",\n  \"v\":[{}3]}}",
+            "1,\n".repeat(100)
+        );
+        for args in programs {
+            let (err, status) = same(args, &fault)?;
+            assert!(
+                err.contains(&format!("at line {}", n + 1)),
+                "{end} {args:?}: {err}"
+            );
+            assert_ne!(status, 0);
+            same(args, &join(&pretty))?;
+        }
+    }
     // A line longer than a block inside the probe, and a BOM at its front.
     let mut long = base.clone();
-    long[100] = format!("{{\"id\":100,\"name\":\"{}\"}}", "y".repeat(MIB + MIB / 2));
+    long[100] = format!(
+        "{{\"id\":100,\"name\":\"{}\"}}",
+        "y".repeat(WINDOW + WINDOW / 2)
+    );
     let mut bom = b"\xef\xbb\xbf".to_vec();
     bom.extend(join(&base));
     for args in programs {

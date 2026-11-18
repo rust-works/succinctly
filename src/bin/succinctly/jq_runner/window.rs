@@ -67,11 +67,77 @@ use super::{
 
 /// How much of the file one window reads, and so about how much memory the route holds besides a
 /// document that is bigger than that.
+///
+/// The route reads [`window_bytes`], which is this constant in every build that ships. The limits
+/// below that are multiples of it are functions of that for the same reason.
 pub(super) const WINDOW_BYTES: usize = 1 << 20;
 
-/// The smallest file the route reads a window at a time: below this it is not worth the second
-/// route, and the file is read whole as before.
-pub(super) const MIN_WINDOWED_FILE_BYTES: u64 = 4 * WINDOW_BYTES as u64;
+/// The environment variable a **debug build only** reads a smaller window from (#7376), so a CLI
+/// test can run the route over a fixture of tens of KiB where the real window needs 4 MiB. It is
+/// compiled out of a release build (`cfg(debug_assertions)`): there the name is not in the binary
+/// and [`window_bytes`] is the constant. Unit tests do not read it either (they pass the window in,
+/// or use the `cfg(test)` overrides), so a variable left in the environment cannot move them.
+#[cfg(any(test, debug_assertions))]
+pub(super) const DEBUG_WINDOW_ENV: &str = "SUCCINCTLY_DEBUG_JQ_WINDOW_BYTES";
+
+/// The smallest window [`DEBUG_WINDOW_ENV`] may name: two of the pages a `--seq` gate's first read
+/// takes ([`SEQ_UNOPENED_BLOCK_BYTES`]), so that read stays smaller than a window as it is in production.
+#[cfg(any(test, debug_assertions))]
+const DEBUG_WINDOW_MIN_BYTES: usize = 2 * SEQ_UNOPENED_BLOCK_BYTES;
+
+/// The window [`DEBUG_WINDOW_ENV`] asks for: `None` when it is not set, and a refusal for anything
+/// but a decimal count of bytes from [`DEBUG_WINDOW_MIN_BYTES`] to [`WINDOW_BYTES`]. A value that is
+/// not usable is refused, not ignored: a test whose small fixture ran on the 1 MiB window would
+/// read its file whole and still pass, having tested nothing.
+#[cfg(any(test, debug_assertions))]
+fn debug_window_bytes(value: Option<&std::ffi::OsStr>) -> Result<Option<usize>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let refusal = || {
+        format!(
+            "{DEBUG_WINDOW_ENV}={} is not a count of bytes from {DEBUG_WINDOW_MIN_BYTES} to {WINDOW_BYTES}",
+            value.to_string_lossy()
+        )
+    };
+    let text = value.to_str().ok_or_else(refusal)?;
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(refusal());
+    }
+    match text.parse::<usize>() {
+        Ok(bytes) if (DEBUG_WINDOW_MIN_BYTES..=WINDOW_BYTES).contains(&bytes) => Ok(Some(bytes)),
+        _ => Err(refusal()),
+    }
+}
+
+/// [`WINDOW_BYTES`], or in a debug build what [`DEBUG_WINDOW_ENV`] names (#7376). Read once.
+#[cfg(all(debug_assertions, not(test)))]
+pub(super) fn window_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(
+        || match debug_window_bytes(std::env::var_os(DEBUG_WINDOW_ENV).as_deref()) {
+            Ok(bytes) => bytes.unwrap_or(WINDOW_BYTES),
+            Err(refusal) => {
+                eprintln!("succinctly: {refusal} (a debug-build test knob, #7376)");
+                std::process::exit(2);
+            }
+        },
+    )
+}
+
+/// [`WINDOW_BYTES`]: a release build and the unit tests have no other window.
+#[cfg(any(test, not(debug_assertions)))]
+#[inline(always)]
+pub(super) const fn window_bytes() -> usize {
+    WINDOW_BYTES
+}
+
+/// The smallest file the route reads a window at a time, four windows (4 MiB in every build that
+/// ships): below this it is not worth the second route, and the file is read whole as before.
+#[inline]
+pub(super) fn min_windowed_file_bytes() -> u64 {
+    4 * window_bytes() as u64
+}
 
 /// The window of a lone `--seq` file whose first byte is not an RS (#7312): [`SeqGate`] hands the stream
 /// on at that byte whatever is read, so the first read, which is all the gate looks at, is a page and
@@ -92,7 +158,7 @@ pub(super) fn seq_block_bytes(file: &File, start: u64) -> usize {
     let mut first = [0u8; 1];
     match file.read_at(&mut first, start) {
         Ok(read) if read == 0 || first[0] != RS => SEQ_UNOPENED_BLOCK_BYTES,
-        _ => WINDOW_BYTES,
+        _ => window_bytes(),
     }
 }
 
@@ -495,7 +561,7 @@ impl WindowedFile {
                 // few of them is read in a linear amount of work, and once that is several windows
                 // (it is one long document, or a file of one line) for all of what is left, as
                 // the whole-file route reads it.
-                grow = if grow >= 4 * WINDOW_BYTES {
+                grow = if grow >= 4 * window_bytes() {
                     self.rest()
                 } else {
                     grow.saturating_mul(2)
@@ -737,7 +803,7 @@ impl WindowedFile {
     /// a few windows).
     fn rest(&self) -> usize {
         if self.unknown_len {
-            4 * WINDOW_BYTES
+            4 * window_bytes()
         } else {
             usize::try_from(self.remaining).unwrap_or(usize::MAX)
         }
@@ -960,11 +1026,17 @@ const CERTIFIER_WINDOWS_IN_FLIGHT: usize = 2;
 /// #7106). The probe's 4 MiB are handed out a block at a time, so each of its windows is copied as
 /// every later one is (#7266). Certifying them here instead would cost a pipe of 10 MiB 4 to 10% of
 /// its run (measured, #7106, when the probe was one window of 4 MiB or more).
-const CERTIFIER_COPY_LIMIT: usize = 8 * WINDOW_BYTES;
+#[inline]
+fn certifier_copy_limit() -> usize {
+    8 * window_bytes()
+}
 
 /// A buffer the certifying thread hands back is kept for the next window only up to this size, about two
 /// windows, so the probe's copy and one that grew with a document are not held for the run.
-const CERTIFIER_KEEP_BYTES: usize = 2 * WINDOW_BYTES;
+#[inline]
+fn certifier_keep_bytes() -> usize {
+    2 * window_bytes()
+}
 
 /// The first fault of a stream that cannot be read again, where it has been found: shared by the thread
 /// that finds it ([`Certifier`]) and the [`Reread`] that words it.
@@ -1124,7 +1196,7 @@ struct Certifier {
     /// The thread, started with the first window.
     worker: Option<Worker>,
     /// No thread could be started: every window is certified on the filter's own thread, as the one
-    /// over [`CERTIFIER_COPY_LIMIT`] is.
+    /// over [`certifier_copy_limit`] is.
     threadless: bool,
     /// How many reads by jq's parser certifying the windows took.
     #[cfg(test)]
@@ -1198,7 +1270,7 @@ fn certify_windows(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.certify(&mut resume)))
         };
         let text = match std::mem::take(&mut job.text) {
-            JobText::Copied(mut text) if text.capacity() <= CERTIFIER_KEEP_BYTES => {
+            JobText::Copied(mut text) if text.capacity() <= certifier_keep_bytes() => {
                 text.clear();
                 text
             }
@@ -1366,7 +1438,10 @@ enum GateStep {
 /// past the stretch's start it reads while the record that may end it is still open. Past it the rest
 /// of the stream is handed on, as all of it was before: the look-ahead is held beside the tail while
 /// that is read, so it is a few windows.
-const MAX_SEQ_STRETCH: usize = 4 * WINDOW_BYTES;
+#[inline]
+fn max_seq_stretch() -> usize {
+    4 * window_bytes()
+}
 
 /// How many warnings of the stretches a `--seq` gate carried on after may wait for their window
 /// (#7341). Each is a line of text held until the values before it have run, and a window of
@@ -1380,7 +1455,7 @@ const MAX_QUEUED_NOTES: usize = 1 << 16;
 /// (#7341, [`GateStep::Cut`]): jq's reader stands after any such RS as it stands after one between
 /// plain records, so the stretch before it is read, its warnings handed out with their window, and
 /// what follows is judged as from a record's start. Each piece a stretch is read in is this or a line,
-/// so the look-ahead of [`MAX_SEQ_STRETCH`] is the longest a stretch's line may be, not the stretch.
+/// so the look-ahead of [`max_seq_stretch`] is the longest a stretch's line may be, not the stretch.
 const SEQ_STRETCH_PIECE: usize = 64 << 10;
 
 impl SeqGate {
@@ -1435,7 +1510,7 @@ impl SeqGate {
     /// RS after it (or the stream's end) is read.
     ///
     /// #7322: a record at `checked` that is not plain does not end the windows there. The gate reads
-    /// on, up to [`MAX_SEQ_STRETCH`], for the first RS that starts a line and opens a record that is
+    /// on, up to [`max_seq_stretch`], for the first RS that starts a line and opens a record that is
     /// plain: jq's reader stands after that RS as it stands after any RS between plain records
     /// ([`crate::jq_seq_reader::walk_stretch`]), so the windows can carry on from it. A stretch that
     /// runs to the stream's end, or past the look-ahead, is handed on with the rest of the stream.
@@ -1503,7 +1578,7 @@ impl SeqGate {
     /// `cand` when it starts a line. Once the stretch is longer than a piece ([`SEQ_STRETCH_PIECE`]) it
     /// is cut before that record, at the last RS that starts a line, so no piece is longer than one;
     /// or at `here` when there was none before it (the piece is then one line, and longer). With no
-    /// RS that starts a line in it at all, it is handed on past the look-ahead ([`MAX_SEQ_STRETCH`]).
+    /// RS that starts a line in it at all, it is handed on past the look-ahead ([`max_seq_stretch`]).
     /// `None` while it is shorter.
     fn cut_if_long(&mut self, reach: usize, here: Option<usize>) -> Option<GateStep> {
         let long = reach - self.checked;
@@ -1518,7 +1593,7 @@ impl SeqGate {
         if here.is_some() {
             self.stretch_cut = here;
         }
-        (long > MAX_SEQ_STRETCH && self.stretch_cut.is_none())
+        (long > max_seq_stretch() && self.stretch_cut.is_none())
             .then_some(GateStep::Unclean(self.checked))
     }
 
@@ -1761,7 +1836,7 @@ impl WindowedFile {
     /// Certifies `values`, the documents of the window about to be handed out (and the bytes after them,
     /// when `fault_at_end`: the window is the last and ends in a fault), and keeps the stream's first
     /// fault. The window is handed to the thread that certifies them, over a copy, and waits only while
-    /// two others are in flight; one of more than [`CERTIFIER_COPY_LIMIT`], or any when no thread could
+    /// two others are in flight; one of more than [`certifier_copy_limit`], or any when no thread could
     /// be started, is certified here, over the buffer itself. The last window is certified only if a
     /// fault is asked for, over the buffer, which it then shares ([`SeenFault::defer_last`], #7294).
     fn certify(&mut self, values: &[Span], fault_at_end: bool) {
@@ -1789,7 +1864,9 @@ impl WindowedFile {
             return;
         }
         let text = &self.buf[..self.validated];
-        if certifier.worker.is_none() && !certifier.threadless && text.len() <= CERTIFIER_COPY_LIMIT
+        if certifier.worker.is_none()
+            && !certifier.threadless
+            && text.len() <= certifier_copy_limit()
         {
             match start_worker(&certifier.seen) {
                 Ok(worker) => certifier.worker = Some(worker),
@@ -1799,7 +1876,7 @@ impl WindowedFile {
         let Some(worker) = certifier
             .worker
             .as_ref()
-            .filter(|_| text.len() <= CERTIFIER_COPY_LIMIT)
+            .filter(|_| text.len() <= certifier_copy_limit())
         else {
             let job = Job {
                 text: JobText::Borrowed(text),
@@ -2496,7 +2573,7 @@ impl WindowedFiles {
                         substituted: self.substituted,
                     };
                     let block = if gate.is_some() {
-                        WINDOW_BYTES
+                        window_bytes()
                     } else {
                         self.block
                     };
@@ -3270,6 +3347,63 @@ mod tests {
 
     /// #7312: a `--seq` file is read a megabyte at a time only when its first byte, from where the run
     /// reads it, is an RS: any other stream is handed on at that byte, so a page is all that is read.
+    /// #7376: the debug-build window knob takes a decimal count of bytes from two `--seq` pages to
+    /// the real window and refuses everything else, so a test whose small fixture would be read
+    /// whole on the 1 MiB window fails instead of passing without the route. The unit tests
+    /// themselves run on the constants: `window_bytes` does not read the variable under `cfg(test)`.
+    #[test]
+    fn the_debug_window_knob_takes_a_window_in_range_and_refuses_the_rest_7376() {
+        use std::ffi::OsStr;
+        assert_eq!(debug_window_bytes(None), Ok(None));
+        for (value, bytes) in [
+            ("8192", 8192),
+            ("65536", 65536),
+            ("100000", 100_000),
+            ("1048576", WINDOW_BYTES),
+        ] {
+            assert_eq!(
+                debug_window_bytes(Some(OsStr::new(value))),
+                Ok(Some(bytes)),
+                "{value}"
+            );
+        }
+        for value in [
+            "",
+            "0",
+            "1",
+            "8191",
+            "1048577",
+            "64k",
+            "65536 ",
+            " 65536",
+            "+65536",
+            "-1",
+            "0x10000",
+            "1e5",
+            "99999999999999999999999999",
+        ] {
+            let refusal = debug_window_bytes(Some(OsStr::new(value))).unwrap_err();
+            assert_eq!(
+                refusal,
+                format!(
+                    "SUCCINCTLY_DEBUG_JQ_WINDOW_BYTES={value} is not a count of bytes from 8192 to 1048576"
+                ),
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(debug_window_bytes(Some(OsStr::from_bytes(b"6553\xff"))).is_err());
+        }
+        assert_eq!(DEBUG_WINDOW_ENV, "SUCCINCTLY_DEBUG_JQ_WINDOW_BYTES");
+        // The unit tests' window, and every limit that is a multiple of it, are the shipped ones.
+        assert_eq!(window_bytes(), 1 << 20);
+        assert_eq!(min_windowed_file_bytes(), 4 << 20);
+        assert_eq!(certifier_copy_limit(), 8 << 20);
+        assert_eq!(certifier_keep_bytes(), 2 << 20);
+        assert_eq!(max_seq_stretch(), 4 << 20);
+    }
+
     #[test]
     fn seq_block_is_a_page_unless_the_stream_opens_with_an_rs_7312() {
         let file_of = |bytes: &[u8]| {
@@ -3892,7 +4026,7 @@ mod tests {
 
     /// #7322, #7341: a stretch is read on to the first plain record at a line start after it; one
     /// longer than a piece ([`SEQ_STRETCH_PIECE`]) is cut at its last RS that starts a line, and only a
-    /// line longer than the look-ahead ([`MAX_SEQ_STRETCH`]) with no plain record in sight yet is handed
+    /// line longer than the look-ahead ([`max_seq_stretch`]) with no plain record in sight yet is handed
     /// on with the rest of the stream.
     #[test]
     fn a_long_stretch_is_cut_at_a_line_start_and_a_long_line_handed_on_7341() {
@@ -3904,7 +4038,7 @@ mod tests {
         let near = [
             records.as_slice(),
             b"\x1e\"",
-            &vec![b'x'; MAX_SEQ_STRETCH - 100],
+            &vec![b'x'; max_seq_stretch() - 100],
             b"\n\x1e1\n\x1e2\n",
         ]
         .concat();
@@ -3913,7 +4047,7 @@ mod tests {
         let far = [
             records.as_slice(),
             b"\x1e\"",
-            &vec![b'x'; MAX_SEQ_STRETCH],
+            &vec![b'x'; max_seq_stretch()],
             b"\n\x1e1\n\x1e2\n",
         ]
         .concat();
@@ -3923,14 +4057,14 @@ mod tests {
         let line = [
             records.as_slice(),
             b"\x1e[1,]\x1e\"",
-            &vec![b'x'; MAX_SEQ_STRETCH],
+            &vec![b'x'; max_seq_stretch()],
         ]
         .concat();
         assert!(matches!(gate(&line), GateStep::Unclean(at) if at == records.len()));
         let open = [
             records.as_slice(),
             b"\x1e[1,]\n\x1e\"",
-            &vec![b'x'; MAX_SEQ_STRETCH],
+            &vec![b'x'; max_seq_stretch()],
         ]
         .concat();
         let cut = records.len() + b"\x1e[1,]\n".len();
@@ -5989,7 +6123,7 @@ mod pipe_tests {
     #[test]
     fn a_window_over_the_copy_limit_is_certified_without_a_copy_7106() {
         let mut text = b"[".to_vec();
-        text.extend("1,".repeat(CERTIFIER_COPY_LIMIT).as_bytes());
+        text.extend("1,".repeat(certifier_copy_limit()).as_bytes());
         text.extend_from_slice(b"2]\n{\"x\":");
         // The whole stream is what the probe read, and its first line break ends the big document, so
         // the first window is that document (a window made of the probe ends at its first block's last
@@ -6090,7 +6224,7 @@ mod pipe_tests {
     #[test]
     fn an_over_limit_window_after_the_thread_started_is_certified_here_7266() {
         let mut text = b"{\"a\":1}\n[".to_vec();
-        text.extend("1,".repeat(CERTIFIER_COPY_LIMIT).as_bytes());
+        text.extend("1,".repeat(certifier_copy_limit()).as_bytes());
         text.extend_from_slice(b"2]\n{\"x\":");
         let file = tempfile::tempfile().expect("a temp file");
         let seen = SeenFault::default();
@@ -6101,7 +6235,7 @@ mod pipe_tests {
             origins.push((window.origin, window.raw.len()));
         }
         assert!(origins.len() >= 2, "{origins:?}");
-        assert!(origins[1].1 > CERTIFIER_COPY_LIMIT, "{origins:?}");
+        assert!(origins[1].1 > certifier_copy_limit(), "{origins:?}");
         assert_ne!(origins.last().expect("windows").0, (1, 0), "{origins:?}");
         let fault = seen.get();
         assert_eq!(fault, succinctly::jq::jq_stream_fault([&text[..]], 1, 0));

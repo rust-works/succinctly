@@ -309,9 +309,20 @@ pub fn output_retrying(
 /// binary's `LC_ALL=C` run of the `spawn_jq` in `jq_cli_tests.rs` (the same retries on a missing binary and
 /// on a signal death) held to [`DEADLINE`] as `spawn_jq` is not (#7314).
 pub fn spawn_jq_deadline(args: &[&str], stdin_input: Option<&[u8]>) -> Result<(Output, i32)> {
+    spawn_jq_deadline_with(args, stdin_input, |_| {})
+}
+
+/// [`spawn_jq_deadline`] with `configure` run over the command of each attempt before it is spawned (an
+/// environment variable for the run, such as the debug build's window, #7376).
+pub fn spawn_jq_deadline_with(
+    args: &[&str],
+    stdin_input: Option<&[u8]>,
+    configure: impl Fn(&mut Command),
+) -> Result<(Output, i32)> {
     for n in 0..MAX_CARGO_RETRIES {
         let mut command = Command::new(succinctly_bin());
         command.arg("jq").args(args).env("LC_ALL", "C");
+        configure(&mut command);
         let input = stdin_input.map_or(Input::Null, Input::Bytes);
         let output = run(&mut command, &[], input, DEADLINE)?;
         if let Some(code) = output.status.code() {

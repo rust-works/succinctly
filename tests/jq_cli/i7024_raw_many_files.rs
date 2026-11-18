@@ -9,6 +9,9 @@
 //! line without a line break runs on into the next file's first and is read in that one, and each
 //! file's bytes are decoded on their own. What this adds is that a path may change before the run gets
 //! to it, which it then reads as it stands.
+//!
+//! In a debug build the fixtures are a sixteenth of the size and the binary's window is 64 KiB
+//! (`small_window`, #7376); a release build runs the same rows over the 1 MiB window.
 
 #![cfg(unix)]
 
@@ -18,9 +21,13 @@ use std::process::Command;
 use anyhow::Result;
 
 use crate::fifo_feed::{self, Feed};
+use crate::small_window::{self, scaled};
 
 /// More files than the route holds open (32), small enough that a token is open where many end.
 const FILES: usize = 40;
+
+/// How many lines the fixtures have: four windows or more of text (each test checks it).
+const LINES: usize = scaled(64_000);
 
 fn text(lines: usize) -> Vec<u8> {
     (0..lines)
@@ -69,11 +76,13 @@ fn whole_by_descriptor(args: &[&str], paths: &[std::path::PathBuf]) -> Result<Ru
         operands.push(fifo);
     }
     let output = fifo_feed::output(
-        Command::new(env!("CARGO_BIN_EXE_succinctly"))
-            .arg("jq")
-            .args(args)
-            .args(&operands)
-            .env("LC_ALL", "C"),
+        small_window::apply(
+            Command::new(env!("CARGO_BIN_EXE_succinctly"))
+                .arg("jq")
+                .args(args)
+                .args(&operands)
+                .env("LC_ALL", "C"),
+        ),
         &feeds,
     )?;
     let named = |text: &[u8]| {
@@ -109,12 +118,14 @@ fn both(args: &[&str], files: &[Vec<u8>]) -> Result<(Run, Run)> {
         };
         (name(run.0), name(run.1), run.2)
     };
-    let windowed = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .arg("jq")
-        .args(args)
-        .args(&paths)
-        .env("LC_ALL", "C")
-        .output()?;
+    let windowed = small_window::apply(
+        Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .arg("jq")
+            .args(args)
+            .args(&paths)
+            .env("LC_ALL", "C"),
+    )
+    .output()?;
     let windowed = (
         String::from_utf8_lossy(&windowed.stdout).into_owned(),
         String::from_utf8_lossy(&windowed.stderr).into_owned(),
@@ -130,24 +141,33 @@ fn same(args: &[&str], files: &[Vec<u8>]) -> Result<Run> {
 }
 
 /// Lines with the shapes `-R` meets at a file's end: a CRLF line, invalid UTF-8, a BOM, a two-byte
-/// character, and a line cut in two by a file boundary (`cut` moves every cut off a line start).
+/// character, and a line cut in two by a file boundary (`cut` moves every cut off a line start). They
+/// are where they were in the text (each in a file of its own, the first in file 0), at any window.
 fn lines(count: usize) -> Vec<u8> {
     let mut bytes = text(count);
     bytes.splice(1000..1000, *b"\r\n");
-    bytes.splice(200_000..200_000, *b"\xff\xfe");
-    bytes.splice(300_000..300_000, *b"\xef\xbb\xbf");
-    bytes.splice(400_000..400_000, "é".bytes());
+    let at = scaled(200_000);
+    bytes.splice(at..at, *b"\xff\xfe");
+    let at = scaled(300_000);
+    bytes.splice(at..at, *b"\xef\xbb\xbf");
+    let at = scaled(400_000);
+    bytes.splice(at..at, "é".bytes());
     bytes
 }
 
 #[test]
 fn raw_over_more_files_than_are_held_open_reads_as_one_stream_7024() -> Result<()> {
-    let files = cut(&lines(60_000));
-    assert!(files.iter().map(Vec::len).sum::<usize>() >= 4 << 20);
+    let files = cut(&lines(LINES));
+    assert!(files.iter().map(Vec::len).sum::<usize>() >= small_window::MIN_BYTES);
     let (stdout, stderr, status) = same(&["-R", "."], &files)?;
+    // One line more than the text has: the CRLF put into one. A line a cut opens is joined again.
     assert_eq!(
-        (stdout.lines().count() > 59_000, stderr.as_str(), status),
-        (true, "", 0)
+        (stdout.lines().count(), stderr.as_str(), status),
+        (LINES + 1, "", 0)
+    );
+    let stop = format!(
+        "if contains(\"user {}\\\"\") then error(\"stop\") else length end",
+        LINES * 3 / 4
     );
     for args in [
         &["-r", "-R", "."][..],
@@ -161,13 +181,12 @@ fn raw_over_more_files_than_are_held_open_reads_as_one_stream_7024() -> Result<(
         &["-R", "-e", "select(length > 100000)"],
         &["-R", "if length == 77 then halt_error else . end"],
         // A runtime error names the file and line jq's reader is at.
-        &[
-            "-R",
-            "if contains(\"user 45000\") then error(\"stop\") else length end",
-        ],
+        &["-R", &stop],
     ] {
         same(args, &files)?;
     }
+    let (_, stderr, _) = same(&["-R", &stop], &files)?;
+    assert!(stderr.contains("): stop"), "{stderr}");
     // Every file is reached.
     let (stdout, _, _) = same(&["-R", "input_filename"], &files)?;
     assert!(stdout.contains("<file 39>"), "every file is reached");
@@ -177,8 +196,9 @@ fn raw_over_more_files_than_are_held_open_reads_as_one_stream_7024() -> Result<(
 #[test]
 fn raw_over_a_bom_at_the_front_and_files_that_are_not_utf8_7024() -> Result<()> {
     let mut text = b"\xef\xbb\xbf".to_vec();
-    text.extend_from_slice(&lines(60_000));
-    text.splice(2_000_000..2_000_000, b"\xc3\n\xe2\x82\n".iter().copied());
+    text.extend_from_slice(&lines(LINES));
+    let at = scaled(2_000_000);
+    text.splice(at..at, b"\xc3\n\xe2\x82\n".iter().copied());
     let files = cut(&text);
     same(&["-R", "."], &files)?;
     same(&["-R", "length"], &files)?;
@@ -218,10 +238,14 @@ fn changed_while_running(change: Change, args: &[&str]) -> Result<(Run, Run)> {
         .collect();
     for (n, path) in paths.iter().enumerate() {
         let bytes = match n {
-            // Just over the 4 MiB the route needs, and more output than a pipe holds.
+            // Just over the four windows the route needs, and more output than a pipe holds.
             0 => {
-                let bytes = text(60_000);
-                assert!(bytes.len() >= 4 << 20, "{} bytes", bytes.len());
+                let bytes = text(LINES);
+                assert!(
+                    bytes.len() >= small_window::MIN_BYTES,
+                    "{} bytes",
+                    bytes.len()
+                );
                 bytes
             }
             19 => b"line 19\nopen 19 ".to_vec(),
@@ -232,14 +256,16 @@ fn changed_while_running(change: Change, args: &[&str]) -> Result<(Run, Run)> {
         std::fs::write(path, bytes)?;
     }
     let bin = env!("CARGO_BIN_EXE_succinctly");
-    let mut child = Command::new(bin)
-        .arg("jq")
-        .args(args)
-        .args(&paths)
-        .env("LC_ALL", "C")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
+    let mut child = small_window::apply(
+        Command::new(bin)
+            .arg("jq")
+            .args(args)
+            .args(&paths)
+            .env("LC_ALL", "C"),
+    )
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()?;
     let mut stdout = child.stdout.take().expect("piped");
     let mut first = vec![0u8; 4096];
     stdout.read_exact(&mut first)?;
@@ -278,6 +304,13 @@ fn changed_while_running(change: Change, args: &[&str]) -> Result<(Run, Run)> {
         .read_to_end(&mut stderr)?;
     let status = child.wait()?;
     first.extend(rest);
+    // The run was still in the first file when the change was made only if it could not write all
+    // of its output: a pipe holds 64 KiB, and a program that prints less races the change (#7376).
+    assert!(
+        first.len() >= 2 * (64 << 10),
+        "{args:?} wrote {} bytes, which a pipe may hold",
+        first.len()
+    );
     let windowed = (
         String::from_utf8_lossy(&first).into_owned(),
         String::from_utf8_lossy(&stderr).into_owned(),
@@ -359,26 +392,28 @@ fn a_file_of_a_long_list_that_is_also_the_output_is_read_whole_7024() -> Result<
         .collect();
     for (n, path) in paths.iter().enumerate() {
         let bytes = match n {
-            0 => text(60_000),
+            0 => text(LINES),
             n => format!("line {n}\n").into_bytes(),
         };
         std::fs::write(path, bytes)?;
     }
     // `1<>$OUT` opens file 20 read-write as standard output.
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg("exec \"$0\" jq -R length \"$@\" 1<>\"$OUT\"")
-        .arg(env!("CARGO_BIN_EXE_succinctly"))
-        .args(&paths)
-        .env("OUT", &paths[20])
-        .output()?;
+    let output = small_window::apply(
+        Command::new("sh")
+            .arg("-c")
+            .arg("exec \"$0\" jq -R length \"$@\" 1<>\"$OUT\"")
+            .arg(env!("CARGO_BIN_EXE_succinctly"))
+            .args(&paths)
+            .env("OUT", &paths[20]),
+    )
+    .output()?;
     assert!(output.status.success(), "{:?}", output.status);
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");
     // What the whole-file route writes into file 20: the length of every line of every file.
     let written = std::fs::read(&paths[20])?;
     assert_eq!(
         written.iter().filter(|&&c| c == b'\n').count(),
-        60_000 + FILES - 1
+        LINES + FILES - 1
     );
     Ok(())
 }

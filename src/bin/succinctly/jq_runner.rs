@@ -11599,7 +11599,7 @@ fn raw_window_min_bytes() -> u64 {
     if let Some(bytes) = LAZY_RAW_MIN_OVERRIDE.with(std::cell::Cell::get) {
         return bytes;
     }
-    window::MIN_WINDOWED_FILE_BYTES
+    window::min_windowed_file_bytes()
 }
 
 #[cfg(test)]
@@ -11916,14 +11916,14 @@ fn windowed_source(args: &JqCommand) -> Option<WindowedSource> {
         let (reader, reread) = windowed_regular_files(&files)?;
         return Some((files, reader, reread));
     }
-    let (path, meta) = lone_regular_file(&files, window::MIN_WINDOWED_FILE_BYTES)?;
+    let (path, meta) = lone_regular_file(&files, window::min_windowed_file_bytes())?;
     let file = std::fs::File::open(path).ok()?;
     let reread = window::Reread::new(&file, 0, meta.len(), path.clone()).ok()?;
     Some((
         files,
         window::WindowedFiles::new(
             vec![(std::rc::Rc::new(file), meta.len())],
-            window::WINDOW_BYTES,
+            window::window_bytes(),
         ),
         std::rc::Rc::new(reread),
     ))
@@ -11950,21 +11950,21 @@ fn windowed_regular_files(
     if files.len() > MAX_WINDOWED_FILES {
         // Each file is closed once judged, so the descriptors held stay a few.
         let mut named = Vec::with_capacity(files.len());
-        judge_regular_files(files, window::MIN_WINDOWED_FILE_BYTES, |path, _, _| {
+        judge_regular_files(files, window::min_windowed_file_bytes(), |path, _, _| {
             named.push(std::rc::Rc::new(window::NamedFile::new(path.clone())));
         })?;
         return Some((
-            window::WindowedFiles::named(&named, window::WINDOW_BYTES),
+            window::WindowedFiles::named(&named, window::window_bytes()),
             std::rc::Rc::new(window::Reread::new_named(&named)),
         ));
     }
     let mut opened = Vec::with_capacity(files.len());
-    judge_regular_files(files, window::MIN_WINDOWED_FILE_BYTES, |_, file, meta| {
+    judge_regular_files(files, window::min_windowed_file_bytes(), |_, file, meta| {
         opened.push((std::rc::Rc::new(file), meta.len()));
     })?;
     let reread = window::Reread::new_many(&opened);
     Some((
-        window::WindowedFiles::new(opened, window::WINDOW_BYTES),
+        window::WindowedFiles::new(opened, window::window_bytes()),
         std::rc::Rc::new(reread),
     ))
 }
@@ -12148,10 +12148,10 @@ fn windowed_regular_stdin(
         return None;
     }
     let meta = file.metadata().ok()?;
-    let (start, len) = regular_stdin_left(&mut file, &meta, window::MIN_WINDOWED_FILE_BYTES)?;
+    let (start, len) = regular_stdin_left(&mut file, &meta, window::min_windowed_file_bytes())?;
     let reread = window::Reread::new(&file, start, len, PathBuf::new()).ok()?;
     Some((
-        window::WindowedFiles::new(vec![(std::rc::Rc::new(file), len)], window::WINDOW_BYTES),
+        window::WindowedFiles::new(vec![(std::rc::Rc::new(file), len)], window::window_bytes()),
         std::rc::Rc::new(reread),
     ))
 }
@@ -12176,7 +12176,7 @@ fn windowed_stdin_pipe() -> Option<WindowedSource> {
     if !(kind.is_fifo() || kind.is_socket()) {
         return None;
     }
-    windowed_pipe(file, window::MIN_WINDOWED_FILE_BYTES)
+    windowed_pipe(file, window::min_windowed_file_bytes())
 }
 
 /// [`windowed_stdin_pipe`] over a pipe it has judged, which is windowed once it holds `min` bytes
@@ -12190,7 +12190,7 @@ fn windowed_pipe(file: std::fs::File, min: u64) -> Option<WindowedSource> {
         std::rc::Rc::new(file),
         front,
         None,
-        window::WINDOW_BYTES,
+        window::window_bytes(),
         seen.clone(),
     );
     Some((
@@ -12219,12 +12219,17 @@ fn windowed_seq_pipe() -> Option<WindowedSource> {
     if !(kind.is_fifo() || kind.is_socket()) {
         return None;
     }
-    let front = probe_stdin_pipe(&file, window::MIN_WINDOWED_FILE_BYTES)?;
+    let front = probe_stdin_pipe(&file, window::min_windowed_file_bytes())?;
     let slot = window::SeqTailSlot::default();
     SEQ_PIPE_TAIL.with(|tail| *tail.borrow_mut() = Some(std::rc::Rc::clone(&slot)));
     Some((
         Vec::new(),
-        window::WindowedFiles::seq_pipe(std::rc::Rc::new(file), front, window::WINDOW_BYTES, slot),
+        window::WindowedFiles::seq_pipe(
+            std::rc::Rc::new(file),
+            front,
+            window::window_bytes(),
+            slot,
+        ),
         std::rc::Rc::new(window::Reread::seen(window::SeenFault::default())),
     ))
 }
@@ -14374,7 +14379,8 @@ fn lazy_window_bytes() -> usize {
     if let Some(bytes) = LAZY_WINDOW_OVERRIDE.with(std::cell::Cell::get) {
         return bytes;
     }
-    LAZY_WINDOW_BYTES
+    // A debug build's smaller window (#7376) is this route's too; in a release build both are 1 MiB.
+    LAZY_WINDOW_BYTES.min(window::window_bytes())
 }
 
 /// What [`read_lazy_window`] did.
@@ -22309,9 +22315,9 @@ mod tests {
                 .expect("a sparse file");
             path.to_string_lossy().into_owned()
         };
-        let big = file("big.json", window::MIN_WINDOWED_FILE_BYTES);
-        let also_big = file("also-big.json", window::MIN_WINDOWED_FILE_BYTES * 2);
-        let small = file("small.json", window::MIN_WINDOWED_FILE_BYTES - 1);
+        let big = file("big.json", window::min_windowed_file_bytes());
+        let also_big = file("also-big.json", window::min_windowed_file_bytes() * 2);
+        let small = file("small.json", window::min_windowed_file_bytes() - 1);
         let tiny = file("tiny.json", 100);
         let directory = dir.path().to_string_lossy().into_owned();
         let missing = dir
@@ -22422,7 +22428,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut records = Vec::new();
         let mut count = 0;
-        while records.len() < window::MIN_WINDOWED_FILE_BYTES as usize + 4096 {
+        while records.len() < window::min_windowed_file_bytes() as usize + 4096 {
             records.extend_from_slice(format!("\x1e{{\"n\":{count}}}\n").as_bytes());
             count += 1;
         }
@@ -22492,7 +22498,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut records = Vec::new();
         let mut count = 0;
-        while records.len() < window::MIN_WINDOWED_FILE_BYTES as usize + 4096 {
+        while records.len() < window::min_windowed_file_bytes() as usize + 4096 {
             records.extend_from_slice(format!("\x1e{{\"n\":{count}}}\n").as_bytes());
             count += 1;
         }
@@ -22547,7 +22553,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut records = Vec::new();
         let mut n = 0;
-        while records.len() < window::MIN_WINDOWED_FILE_BYTES as usize {
+        while records.len() < window::min_windowed_file_bytes() as usize {
             records.push(0x1e);
             records.extend_from_slice(
                 format!("{{\"n\":{n},\"pad\":\"{}\"}}\n", "x".repeat(60)).as_bytes(),
@@ -22821,8 +22827,8 @@ mod tests {
                 .expect("a sparse file");
             path.to_string_lossy().into_owned()
         };
-        let half = file("half.txt", window::MIN_WINDOWED_FILE_BYTES / 2);
-        let other = file("other.txt", window::MIN_WINDOWED_FILE_BYTES / 2);
+        let half = file("half.txt", window::min_windowed_file_bytes() / 2);
+        let other = file("other.txt", window::min_windowed_file_bytes() / 2);
         let tiny = file("tiny.txt", 1);
         let directory = dir.path().to_string_lossy().into_owned();
         let missing = dir
@@ -22901,8 +22907,8 @@ mod tests {
                 .expect("a sparse file");
             path.to_string_lossy().into_owned()
         };
-        let big = file("big.txt", window::MIN_WINDOWED_FILE_BYTES);
-        let small = file("small.txt", window::MIN_WINDOWED_FILE_BYTES - 1);
+        let big = file("big.txt", window::min_windowed_file_bytes());
+        let small = file("small.txt", window::min_windowed_file_bytes() - 1);
         let directory = dir.path().to_string_lossy().into_owned();
         let missing = dir
             .path()
@@ -22954,7 +22960,7 @@ mod tests {
     #[test]
     fn windowed_regular_stdin_takes_only_a_big_regular_file_7024() {
         use std::io::{Seek, SeekFrom, Write};
-        let min = window::MIN_WINDOWED_FILE_BYTES;
+        let min = window::min_windowed_file_bytes();
         let at = |len: u64, offset: u64| {
             let mut file = tempfile::tempfile().expect("tempfile");
             file.set_len(len).expect("set_len");
