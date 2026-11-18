@@ -9,14 +9,15 @@ choice, and ties every claim to the rows of the committed comparison reports tha
 
 - [Linux x86_64, AMD Ryzen 9 7950X](../compare/jq-linux-x86_64.md)
 - [macOS aarch64, Apple M4 Pro](../compare/jq-macos-aarch64.md)
+- [Linux aarch64, ARM Neoverse-V2](../compare/jq-linux-aarch64.md)
 
 Speedup is jq 1.7.1's time over `succinctly jq`'s, so below `1.00x` jq is faster. Memory ratios are `succinctly jq`'s peak
 RSS over jq's. Both come from interleaved, output-gated runs: a row is timed only where the two tools print the same
-bytes. The figures are medians on the two machines named above, and memory-bound effects do not port between
-architectures, so each claim below is checked on both.
+bytes. The figures quoted are medians on the 7950X and the M4 Pro, and memory-bound effects do not port between
+architectures, so each claim below is checked on all three machines.
 
 Each claim carries an HTML comment marker naming it (`claim:` and an id). [`tests/jq_guidance_claims.rs`](../../tests/jq_guidance_claims.rs)
-reads the two committed reports, checks each claim against its stated threshold, and fails when a report is
+reads the committed reports, checks each claim against its stated threshold, and fails when a report is
 regenerated and a claim stops holding: change the claim, or the advice, in the same change.
 
 ## The short version
@@ -26,9 +27,9 @@ regenerated and a claim stops holding: change the claim, or the advice, in the s
 | One document of 1 MB or more: filter, reformat, pretty-print   | `succinctly jq`                              | 2x to 15x faster, in a fraction of jq's memory                                                           |
 | `first`, `limit`, `.[0]` of a large document                   | `succinctly jq`                              | stops reading early: 5x to 7x at 100 MB                                                                  |
 | Regex or case mapping over large strings                       | `succinctly jq`                              | up to 52x                                                                                                |
-| Many short invocations, or documents under about 100 KB        | jq                                           | startup is jq's (0.67x to 0.93x); no gain on most small documents                                        |
-| A stream of many values (NDJSON, `--seq`)                      | depends                                      | faster for `.`, same speed for most filters; holds a window of a file for a plain filter, else all of it |
-| `--seq` output, or `input` / `inputs` taken once and abandoned | jq                                           | `succinctly jq` is slower                                                                                |
+| Many short invocations, or documents under about 100 KB        | jq on macOS, either on Linux                 | jq starts faster on macOS (0.65x); about even on Linux; little gain on small documents                   |
+| A stream of many values (NDJSON, `--seq`)                      | `succinctly jq`                              | 3x to 7x for `.`, 1.1x to 1.8x for most filters, in 10 to 15 MiB at any length (jq: 3 MiB)               |
+| `input` taken once and the rest of the stream abandoned        | jq                                           | `succinctly jq` is slower (0.64x to 0.91x)                                                               |
 | Strict RFC 8259 input                                          | either, with `--validate` on `succinctly jq` | neither is strict by default                                                                             |
 | Features new in jq 1.8                                         | jq 1.8                                       | `succinctly jq` follows 1.7.1                                                                            |
 | Binary size                                                    | jq                                           | 9x to 22x smaller                                                                                        |
@@ -96,42 +97,39 @@ Regex over large strings is where jq can fail outright: `regex-gsub-large` times
 
 ## Use jq when
 
-### The invocation is short
+### The invocation is short, on macOS
 
 <!-- claim: startup -->
 
-The `startup` row (`jq -n 1`) is 0.93x on the 7950X and 0.67x on the M4 Pro: jq starts faster. The `corpus_*` rows, real
-documents of a few KB to 100 KB, run from 0.81x to 2.5x on the 7950X (jq is faster on the object-heavy ones: `corpus_tabular_group`
-is 0.81x) and from 0.63x to 3.0x on the M4 Pro (`corpus_tabular_group` is 0.72x, and mostly the pretty-printed ones, with `corpus_geojson_points`,
-favour `succinctly jq`). A shell loop that starts the tool a thousand times pays that difference a thousand times.
+The `startup` row (`jq -n 1`) is 0.65x on the M4 Pro: jq starts faster on macOS. On Linux the two start in about the same
+time (1.03x on the 7950X). The `corpus_*` rows, real documents of a few KB to 100 KB, run from 0.65x to 3.1x on the M4 Pro
+(`corpus_tabular_group` is 0.79x; only the pretty-printed ones and `corpus_geojson_points` favour `succinctly jq`) and from
+0.94x to 2.9x on the 7950X (`corpus_tabular_group` is 1.08x). A shell loop on a Mac that starts the tool a thousand times
+pays that difference a thousand times.
 
-### The input is a long stream of small values
+### The input is a long stream and memory is tight
 
 <!-- claim: stream-memory -->
 
-For `--seq` input over several files or a stream that is not RFC 7464's own framing, programs that read `input`/`inputs`, `-R`, standard input and several files, `succinctly jq` holds the
-whole input in memory while jq holds one value. At 100 MB, `ndjson_inputs_reduce` peaks at 37.4x of jq's resident set on
-the 7950X and 42.8x on the M4 Pro, and `seq_identity` at 42.1x and 47.9x (about 105 to 112 MB against 3 MB); the slope is
-about 1.0 MB per MB of input, so a multi-gigabyte log read that way needs about as much memory as the file. Rows:
-`ndjson_inputs_reduce`, `ndjson_raw_lines`, `seq_identity`, section E.
+On a stream of many small values jq holds one value at a time, about 3 MiB of resident set however long the stream is.
+`succinctly jq` reads a stream a window at a time ([#6920](https://github.com/rust-works/succinctly/issues/6920) and its
+follow-ups) and holds 10 to 15 MiB, which does not grow with the stream either. That is true of a plain filter, of
+`input`/`inputs`, of `-R` and of `--seq`, read from a file or from a pipe. At 100 MB, `ndjson_inputs_reduce` peaks at 15.4 MiB on the 7950X and 13.9 MiB on the M4 Pro,
+`ndjson_raw_lines` (`-R`) at 10.1 and 9.7 MiB and `seq_identity` (`--seq`) at 10.1 and 10.3 MiB, against jq's 3 MiB.
+At 1 GB, `ndjson_inputs_reduce` still peaks at 15 MiB on both machines, and over a pipe at 100 MB (`ndjson_inputs_reduce_stdin`) at 15 MiB.
+That is 3x to 5x jq's resident set, where the reports of 2026-11-12 showed 37x to 48x for the same rows. Rows:
+`ndjson_*`, `seq_identity`, sections E, D/E (piped stdin) and D/E (1 GB tier).
 
-A plain filter over one regular file (`ndjson_identity`, `ndjson_field`, `ndjson_select`, `ndjson_tsv`: no `-n`, no
-`input`, no `-s`) holds one 1 MiB window of it since [#6920](https://github.com/rust-works/succinctly/issues/6920), about
-10 MB at 100 MB on the 7950X and 13 MB (the machine's floor) on the M4 Pro, flat from 10 MB. The committed reports predate
-that change and still show the 41.8x to 48.0x it replaced, until they are regenerated. The same filters over a regular file
-redirected onto standard input (`jq … < file`) or over several regular files read as one stream
-([#7024](https://github.com/rust-works/succinctly/issues/7024)) take the same route, and so does `--seq` over a regular file of RFC 7464 records (`seq_identity`, [#7082](https://github.com/rust-works/succinctly/issues/7082): 7 to 10 MiB at 100 MiB). The
-same filters over a pipe of 4 MiB or more take it too since #7024 (a shorter pipe is read whole), and so does `-R` over standard input, a pipe or a redirected file, or over several regular files with 4 MiB or more between them, and so does a program that reads `input`/`inputs` over several regular files with 4 MiB or more between them, and so does `--seq` over a pipe of 4 MiB or more up to its first record that is not RFC 7464's own framing ([#7164](https://github.com/rust-works/succinctly/issues/7164)), and over one regular file up to that record too ([#7262](https://github.com/rust-works/succinctly/issues/7262)), and past it when plain records follow ([#7322](https://github.com/rust-works/succinctly/issues/7322)), while the other routes hold the whole input ([#7023](https://github.com/rust-works/succinctly/issues/7023) and
-[#7024](https://github.com/rust-works/succinctly/issues/7024) track the rest; the cause is in
-[#6913](https://github.com/rust-works/succinctly/issues/6913)). `succinctly jq` is still the faster of the two on most of
-those rows (1.05x to 3.5x on the 7950X and 1.2x to 7.1x on the M4 Pro for the five named, at 100 MB), so this is a memory
-trade and not a speed one.
+Some inputs are still read whole: one under 4 MiB, standard input named on the command line as `-`, a terminal, and a
+file that is one document, not a stream of them. [jq limitations](../compliance/jq/limitations.md) lists each case.
+`succinctly jq` is the faster of the two on every stream row named here but one (1.1x to 4.6x on the 7950X and 1.2x
+to 7.1x on the M4 Pro, at 100 MB), so jq is the better choice only where 10 to 15 MiB is more than the machine can spare.
 
 <!-- claim: stream-abandon -->
 
-Two stream shapes are slower: taking the first `input` and abandoning the rest (`ndjson_inputs_first` is 0.76x and 0.61x
-at 100 MB), and `--seq` output
-(`users_seq_output` is 0.61x and 0.63x at 10 MB).
+One stream shape is slower: taking the first `input` and abandoning the rest (`ndjson_inputs_first` is 0.91x on the
+7950X and 0.64x on the M4 Pro at 100 MB, and 0.94x and 0.61x at 1 GB). `--seq` output, which the reports of 2026-11-12
+showed slower too, is now faster (`users_seq_output` is 2.4x and 3.9x at 10 MB).
 
 ### The program needs a jq 1.8 feature
 
@@ -157,16 +155,12 @@ exact RFC 8259 behaviour matters. Section C of each report.
 
 ## What this page does not cover
 
-- Inputs of 1 GB or more: the largest timed input is 100 MB. A tier for streaming and early-exit rows at 1 GB is tracked
-  in [#6915](https://github.com/rust-works/succinctly/issues/6915), and may change the advice for piped and very large
-  inputs.
-- Piped stdin: the reports have a section for it (D/E, piped stdin against a file argument). `succinctly jq` reads
-  stdin to its end before it starts, so a pipe costs it a little more than a file (up to about 1.3x on `users_field` at 100 MB),
-  and the speedup on stdin is a little smaller than the file figure. The reports predate #7024, since which a plain filter
-  reads a pipe of 4 MiB or more a window at a time: in 23 to 26 MiB on a 7950X and about 19 MiB on an M4 Pro at 100 MiB
-  (from 123 to 127 MiB), and 2% to 6% faster than it read that pipe before (measured in
-  [jq limitations](../compliance/jq/limitations.md), #7024, #7106).
-- Machines other than the two named. A larger or smaller cache, a different allocator, or slower storage changes the
+- Inputs larger than 1 GB: the 1 GB tier (`--huge`, section D/E) times six rows, and nothing larger is measured.
+- Piped stdin in depth: section D/E times eight rows over a pipe against the same file named as an argument. A stream
+  on a pipe is read a window at a time, as from a file (`ndjson_field_stdin` peaks at 14 MiB on the 7950X and 16 MiB
+  on the M4 Pro at 100 MB). One document on a pipe is read whole before evaluation starts
+  (`users_field_stdin`: 94 and 93 MiB, against jq's 599 and 618 MiB).
+- Machines other than the three named. A larger or smaller cache, a different allocator, or slower storage changes the
   memory-bound rows in particular.
 
 Reproduce the figures with `succinctly dev compare jq --full`; see

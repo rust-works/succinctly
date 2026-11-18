@@ -2,7 +2,7 @@
 //!
 //! The guide says where `succinctly jq` or jq is the better choice and quotes the figures behind each
 //! recommendation. Those figures come from `docs/compare/jq-<platform>.json`, which `succinctly dev compare jq
-//! --write-docs` regenerates. This test reads both reports, checks every claim against the threshold the guide
+//! --write-docs` regenerates. This test reads every platform's report, checks every claim against the threshold the guide
 //! states for it, and checks that the guide carries a `<!-- claim: id -->` marker for every claim and no marker
 //! for a claim that is not here, so a report that stops backing a sentence fails the build instead of leaving the
 //! sentence behind.
@@ -56,6 +56,25 @@ fn geomean(report: &Value, select: impl Fn(&str) -> bool) -> f64 {
         .collect();
     assert!(!speedups.is_empty(), "no rows in the group");
     (speedups.iter().map(|s| s.ln()).sum::<f64>() / speedups.len() as f64).exp()
+}
+
+/// `succinctly jq`'s peak resident set, in MiB, on the row of `query` over `input` in the report's
+/// `section` (`perf`, `perf_huge` or `perf_stdin`).
+fn peak_mib(report: &Value, section: &str, query: &str, input: &str) -> f64 {
+    report[section]
+        .as_array()
+        .unwrap_or_else(|| panic!("no section {section}"))
+        .iter()
+        .find(|r| r["query"] == query && r["input"] == input)
+        .and_then(|r| r["tools"].as_array())
+        .and_then(|tools| tools.iter().find(|t| t["tool"] == "succinctly jq"))
+        .and_then(|t| t["peak_rss_kb"].as_f64())
+        .unwrap_or_else(|| panic!("no succinctly peak RSS for {query} over {input} in {section}"))
+        / 1024.0
+}
+
+fn is_macos(report: &Value) -> bool {
+    report["env"]["system"]["os"] == "macos"
 }
 
 fn binary_bytes(report: &Value, tool: &str) -> f64 {
@@ -172,28 +191,43 @@ const CLAIMS: &[Claim] = &[
             .iter()
             .all(|input| speedup(r, "strings_upcase", input) > 25.0)
     }),
-    // jq starts faster, and loses its lead on the small real documents.
+    // On macOS jq starts faster and keeps a lead on the small object-heavy documents; on Linux the two
+    // start in about the same time, within 15% either way.
     ("startup", |r| {
-        speedup(r, "startup", "none") < 1.0
-            && speedup(r, "corpus_tabular_group", "corpus-tabular") < 1.0
+        let startup = speedup(r, "startup", "none");
+        if is_macos(r) {
+            startup < 0.8 && speedup(r, "corpus_tabular_group", "corpus-tabular") < 1.0
+        } else {
+            startup > 0.85 && startup < 1.15
+        }
     }),
-    // A stream read through `input`/`inputs`, `-R` or `--seq` is held whole: more than 30x jq's resident
-    // set at 100 MB, for every such row named. The plain rows (`ndjson_identity`, `ndjson_field`,
-    // `ndjson_select`, `ndjson_tsv`) are not named: a regular file is read a window at a time since #6920,
-    // so their ratio falls to a few times jq's when the reports are regenerated.
+    // A stream is read a window at a time (#6920 and its slices): under 24 MiB at 100 MB for every
+    // stream row named, plain filter, `inputs`, `-R` and `--seq` alike, and still under 24 MiB at 1 GB
+    // and over a pipe, so the footprint does not grow with the stream. The guide quotes 10 to 15 MiB.
     ("stream-memory", |r| {
         [
-            ("ndjson_inputs_reduce", "ndjson-100mb"),
-            ("ndjson_raw_lines", "ndjson-100mb"),
-            ("seq_identity", "jsonseq-100mb"),
+            "ndjson_identity",
+            "ndjson_field",
+            "ndjson_select",
+            "ndjson_tsv",
+            "ndjson_inputs_reduce",
+            "ndjson_raw_lines",
         ]
         .iter()
-        .all(|(query, input)| rss_ratio(r, query, input) > 30.0)
+        .all(|query| peak_mib(r, "perf", query, "ndjson-100mb") < 24.0)
+            && peak_mib(r, "perf", "seq_identity", "jsonseq-100mb") < 24.0
+            && peak_mib(r, "perf_huge", "ndjson_inputs_reduce", "ndjson-1gb") < 24.0
+            && peak_mib(
+                r,
+                "perf_stdin",
+                "ndjson_inputs_reduce_stdin",
+                "ndjson-100mb",
+            ) < 24.0
     }),
-    // And two stream shapes where jq is the faster tool.
+    // One stream shape where jq is the faster tool, and `--seq` output, which no longer is.
     ("stream-abandon", |r| {
         speedup(r, "ndjson_inputs_first", "ndjson-100mb") < 1.0
-            && speedup(r, "users_seq_output", "users-10mb") < 1.0
+            && speedup(r, "users_seq_output", "users-10mb") > 1.5
     }),
     // jq 1.8.2's own tests: most of `jq.test` agrees (the guide says 475 of 550), some does not, and all of
     // 1.7.1's does.
