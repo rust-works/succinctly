@@ -1,0 +1,14 @@
+{
+  "about": "Stripped size in bytes of `cargo build --release --features cli` (release.yml's command), per target, checked by scripts/binary_size.py in ci.yml's Linux `Perf Regression Guard` legs (#7390). A size more than `tolerance` above a budget fails CI: if the growth is intended, set `bytes` to the size the failing run printed, in the same PR. Take the number from CI's log, not a local build: another toolchain, linker or strip moves it by a percent or two.",
+  "tolerance": 0.05,
+  "targets": {
+    "aarch64-unknown-linux-gnu": {
+      "bytes": 15932024,
+      "measured": "CI perf-guard ARM64-Linux, ubuntu-24.04-arm, rustc 1.100.0, 044aa8c52 (PR #7395, job 135648800479)"
+    },
+    "x86_64-unknown-linux-gnu": {
+      "bytes": 19321128,
+      "measured": "CI perf-guard x86_64, ubuntu-26.04, rustc 1.100.0, 044aa8c52 (PR #7395, job 135648800376)"
+    }
+  }
+}
