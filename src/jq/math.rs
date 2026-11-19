@@ -28,24 +28,131 @@
 
 #![allow(unsafe_code)] // FFI to the platform libm: pure by-value f64 functions
 
-macro_rules! libm_fns {
-    ($( $name:ident ( $($arg:ident),+ ) => $sym:ident ; )+) => {
-        #[cfg(feature = "std")]
-        mod platform {
-            extern "C" {
-                $( pub fn $sym($($arg: f64),+) -> f64; )+
+/// Where a C symbol of this module is found on an Apple platform: in libSystem, looked up the first
+/// time it is called (#7260).
+///
+/// A macOS 12 target binds every import while the process starts (chained fixups have no lazy
+/// binding, #7321), and dyld finds a symbol imported from libSystem by searching its 39
+/// re-exported libraries in turn: about 1.9 us an import on an Apple M4 Pro. The 47 libm
+/// symbols this module named were 0.08 ms of every start (`jq -n 1` is 1.5 ms), for a math
+/// builtin few programs call. Looked up here instead, with `dlsym` in the same library the
+/// load-time bind searched, a program pays only for the functions it calls, once each. Other
+/// platforms bind them as plain `extern "C"` functions (glibc's lookups are hash-table probes).
+#[cfg(all(feature = "std", target_vendor = "apple"))]
+mod on_first_call {
+    use core::ffi::{c_char, c_int, c_void};
+    use core::sync::atomic::{AtomicPtr, Ordering};
+
+    extern "C" {
+        fn dlopen(path: *const c_char, mode: c_int) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+
+    // <dlfcn.h> on Apple platforms.
+    const RTLD_LAZY: c_int = 0x1;
+    const RTLD_NOLOAD: c_int = 0x10;
+    const RTLD_DEFAULT: *mut c_void = -2_isize as *mut c_void;
+
+    /// One symbol's address, null until its first call.
+    pub(super) struct Symbol(AtomicPtr<c_void>);
+
+    impl Symbol {
+        pub(super) const fn new() -> Self {
+            Self(AtomicPtr::new(core::ptr::null_mut()))
+        }
+
+        /// The address of `name` (NUL-terminated), looked up on the first call. Two threads that
+        /// both find it unset look it up twice and store the same address.
+        #[inline]
+        pub(super) fn get(&self, name: &'static [u8]) -> *mut c_void {
+            let p = self.0.load(Ordering::Relaxed);
+            if p.is_null() {
+                self.look_up(name)
+            } else {
+                p
             }
         }
 
+        #[cold]
+        #[inline(never)]
+        fn look_up(&self, name: &'static [u8]) -> *mut c_void {
+            static LIBSYSTEM: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
+            debug_assert_eq!(name.last(), Some(&0));
+            let mut lib = LIBSYSTEM.load(Ordering::Relaxed);
+            if lib.is_null() {
+                // SAFETY: a NUL-terminated path; `RTLD_NOLOAD` only finds the image every process
+                // on the platform has loaded.
+                lib = unsafe {
+                    dlopen(
+                        b"/usr/lib/libSystem.B.dylib\0".as_ptr().cast(),
+                        RTLD_LAZY | RTLD_NOLOAD,
+                    )
+                };
+                if lib.is_null() {
+                    lib = RTLD_DEFAULT;
+                }
+                LIBSYSTEM.store(lib, Ordering::Relaxed);
+            }
+            // SAFETY: a handle from `dlopen` (or the default pseudo-handle) and a NUL-terminated name.
+            let p = unsafe { dlsym(lib, name.as_ptr().cast()) };
+            // A load-time bind of the same symbol would have stopped the process from starting.
+            assert!(
+                !p.is_null(),
+                "libSystem exports no {}",
+                String::from_utf8_lossy(&name[..name.len() - 1])
+            );
+            self.0.store(p, Ordering::Relaxed);
+            p
+        }
+    }
+}
+
+/// A call of the platform C library's `name` (by default the function's own name), with the C
+/// signature given: looked up on its first call on Apple platforms ([`on_first_call`]), an
+/// `extern "C"` call elsewhere. Every caller passes plain values or pointers to its own live locals.
+#[cfg(feature = "std")]
+macro_rules! c_call {
+    ($sym:ident ( $($arg:expr => $ty:ty),* ) -> $ret:ty) => {
+        c_call!(@ $sym, stringify!($sym), ( $($arg => $ty),* ) -> $ret)
+    };
+    ($sym:ident as $name:literal ( $($arg:expr => $ty:ty),* ) -> $ret:ty) => {
+        c_call!(@ $sym, $name, ( $($arg => $ty),* ) -> $ret)
+    };
+    (@ $sym:ident, $name:expr, ( $($arg:expr => $ty:ty),* ) -> $ret:ty) => {{
+        #[cfg(target_vendor = "apple")]
+        {
+            static SYMBOL: on_first_call::Symbol = on_first_call::Symbol::new();
+            let address = SYMBOL.get(concat!($name, "\0").as_bytes());
+            // SAFETY: the C library's function of this name has exactly this signature.
+            let f = unsafe {
+                core::mem::transmute::<*mut core::ffi::c_void, unsafe extern "C" fn($($ty),*) -> $ret>(
+                    address,
+                )
+            };
+            // SAFETY: as for the declaration below.
+            unsafe { f($($arg),*) }
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            extern "C" {
+                fn $sym($(_: $ty),*) -> $ret;
+            }
+            // SAFETY: a C math function taking values (and at most a pointer to the caller's own
+            // live local), with no global state and no preconditions -- every input pattern is a
+            // valid double.
+            unsafe { $sym($($arg),*) }
+        }
+    }};
+}
+
+macro_rules! libm_fns {
+    ($( $name:ident ( $($arg:ident),+ ) => $sym:ident ; )+) => {
         $(
             #[inline]
             pub(crate) fn $name($($arg: f64),+) -> f64 {
                 #[cfg(feature = "std")]
                 {
-                    // SAFETY: a C math function taking and returning `f64` by
-                    // value, with no pointers, no global state and no
-                    // preconditions -- every input pattern is a valid double.
-                    unsafe { platform::$sym($($arg),+) }
+                    c_call!($sym($($arg => f64),+) -> f64)
                 }
                 #[cfg(not(feature = "std"))]
                 {
@@ -123,11 +230,7 @@ macro_rules! posix_libm_fns {
             pub(crate) fn $name($($arg: f64),+) -> f64 {
                 #[cfg(all(feature = "std", not(target_os = "windows")))]
                 {
-                    extern "C" {
-                        fn $name($($arg: f64),+) -> f64;
-                    }
-                    // SAFETY: as for `libm_fns!`.
-                    unsafe { $name($($arg),+) }
+                    c_call!($name($($arg => f64),+) -> f64)
                 }
                 #[cfg(any(not(feature = "std"), target_os = "windows"))]
                 {
@@ -206,11 +309,7 @@ macro_rules! glibc_next_fns {
                 }
                 #[cfg(all(feature = "std", not(all(target_os = "linux", target_env = "gnu"))))]
                 {
-                    extern "C" {
-                        fn $name($($arg: f64),+) -> f64;
-                    }
-                    // SAFETY: as for `libm_fns!`.
-                    unsafe { $name($($arg),+) }
+                    c_call!($name($($arg => f64),+) -> f64)
                 }
                 #[cfg(not(feature = "std"))]
                 {
@@ -277,11 +376,7 @@ fn c_long(x: f64) -> core::ffi::c_long {
 pub(crate) fn ldexp(x: f64, n: f64) -> f64 {
     #[cfg(feature = "std")]
     {
-        extern "C" {
-            fn ldexp(x: f64, n: core::ffi::c_int) -> f64;
-        }
-        // SAFETY: as for `libm_fns!`.
-        unsafe { ldexp(x, c_int(n)) }
+        c_call!(ldexp(x => f64, c_int(n) => core::ffi::c_int) -> f64)
     }
     #[cfg(not(feature = "std"))]
     {
@@ -293,11 +388,7 @@ pub(crate) fn ldexp(x: f64, n: f64) -> f64 {
 pub(crate) fn scalbln(x: f64, n: f64) -> f64 {
     #[cfg(feature = "std")]
     {
-        extern "C" {
-            fn scalbln(x: f64, n: core::ffi::c_long) -> f64;
-        }
-        // SAFETY: as for `libm_fns!`.
-        unsafe { scalbln(x, c_long(n)) }
+        c_call!(scalbln(x => f64, c_long(n) => core::ffi::c_long) -> f64)
     }
     #[cfg(not(feature = "std"))]
     {
@@ -316,11 +407,7 @@ pub(crate) fn scalbln(x: f64, n: f64) -> f64 {
 pub(crate) fn scalb(x: f64, y: f64) -> f64 {
     #[cfg(all(feature = "std", not(target_os = "windows")))]
     {
-        extern "C" {
-            fn scalb(x: f64, y: f64) -> f64;
-        }
-        // SAFETY: as for `libm_fns!`.
-        unsafe { scalb(x, y) }
+        c_call!(scalb(x => f64, y => f64) -> f64)
     }
     #[cfg(any(not(feature = "std"), target_os = "windows"))]
     {
@@ -338,11 +425,7 @@ pub(crate) fn scalb(x: f64, y: f64) -> f64 {
 pub(crate) fn jn(n: f64, x: f64) -> f64 {
     #[cfg(all(feature = "std", not(target_os = "windows")))]
     {
-        extern "C" {
-            fn jn(n: core::ffi::c_int, x: f64) -> f64;
-        }
-        // SAFETY: as for `libm_fns!`.
-        unsafe { jn(c_int(n), x) }
+        c_call!(jn(c_int(n) => core::ffi::c_int, x => f64) -> f64)
     }
     #[cfg(any(not(feature = "std"), target_os = "windows"))]
     {
@@ -354,11 +437,7 @@ pub(crate) fn jn(n: f64, x: f64) -> f64 {
 pub(crate) fn yn(n: f64, x: f64) -> f64 {
     #[cfg(all(feature = "std", not(target_os = "windows")))]
     {
-        extern "C" {
-            fn yn(n: core::ffi::c_int, x: f64) -> f64;
-        }
-        // SAFETY: as for `libm_fns!`.
-        unsafe { yn(c_int(n), x) }
+        c_call!(yn(c_int(n) => core::ffi::c_int, x => f64) -> f64)
     }
     #[cfg(any(not(feature = "std"), target_os = "windows"))]
     {
@@ -371,12 +450,9 @@ pub(crate) fn yn(n: f64, x: f64) -> f64 {
 pub(crate) fn frexp(x: f64) -> (f64, i32) {
     #[cfg(feature = "std")]
     {
-        extern "C" {
-            fn frexp(x: f64, exp: *mut core::ffi::c_int) -> f64;
-        }
         let mut e: core::ffi::c_int = 0;
-        // SAFETY: `exp` points at a live, writable `c_int` for the call.
-        let m = unsafe { frexp(x, &mut e) };
+        // `exp` points at a live, writable `c_int` for the call.
+        let m = c_call!(frexp(x => f64, &mut e => *mut core::ffi::c_int) -> f64);
         (m, e)
     }
     #[cfg(not(feature = "std"))]
@@ -390,12 +466,9 @@ pub(crate) fn frexp(x: f64) -> (f64, i32) {
 pub(crate) fn modf(x: f64) -> (f64, f64) {
     #[cfg(feature = "std")]
     {
-        extern "C" {
-            fn modf(x: f64, iptr: *mut f64) -> f64;
-        }
         let mut i = 0.0_f64;
-        // SAFETY: `iptr` points at a live, writable `f64` for the call.
-        let f = unsafe { modf(x, &mut i) };
+        // `iptr` points at a live, writable `f64` for the call.
+        let f = c_call!(modf(x => f64, &mut i => *mut f64) -> f64);
         (f, i)
     }
     #[cfg(not(feature = "std"))]
@@ -409,12 +482,9 @@ pub(crate) fn modf(x: f64) -> (f64, f64) {
 pub(crate) fn lgamma_r(x: f64) -> (f64, i32) {
     #[cfg(all(feature = "std", not(target_os = "windows")))]
     {
-        extern "C" {
-            fn lgamma_r(x: f64, sign: *mut core::ffi::c_int) -> f64;
-        }
         let mut s: core::ffi::c_int = 0;
-        // SAFETY: `sign` points at a live, writable `c_int` for the call.
-        let v = unsafe { lgamma_r(x, &mut s) };
+        // `sign` points at a live, writable `c_int` for the call.
+        let v = c_call!(lgamma_r(x => f64, &mut s => *mut core::ffi::c_int) -> f64);
         (v, s)
     }
     #[cfg(any(not(feature = "std"), target_os = "windows"))]
@@ -447,11 +517,7 @@ pub(crate) fn gamma(x: f64) -> f64 {
 pub(crate) fn logb(x: f64) -> f64 {
     #[cfg(feature = "std")]
     {
-        extern "C" {
-            fn logb(x: f64) -> f64;
-        }
-        // SAFETY: as for `libm_fns!`.
-        unsafe { logb(x) }
+        c_call!(logb(x => f64) -> f64)
     }
     #[cfg(not(feature = "std"))]
     {
@@ -498,12 +564,7 @@ pub(crate) fn nearbyint(x: f64) -> f64 {
 pub(crate) fn exp10(x: f64) -> f64 {
     #[cfg(all(feature = "std", target_vendor = "apple"))]
     {
-        extern "C" {
-            #[link_name = "__exp10"]
-            fn apple_exp10(x: f64) -> f64;
-        }
-        // SAFETY: as for the functions above.
-        unsafe { apple_exp10(x) }
+        c_call!(apple_exp10 as "__exp10"(x => f64) -> f64)
     }
     #[cfg(all(
         feature = "std",
@@ -511,11 +572,7 @@ pub(crate) fn exp10(x: f64) -> f64 {
         any(target_env = "gnu", target_env = "musl")
     ))]
     {
-        extern "C" {
-            fn exp10(x: f64) -> f64;
-        }
-        // SAFETY: as for the functions above.
-        unsafe { exp10(x) }
+        c_call!(exp10(x => f64) -> f64)
     }
     #[cfg(all(
         feature = "std",
@@ -534,6 +591,31 @@ pub(crate) fn exp10(x: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #7260: a symbol is looked up once and kept, and is libSystem's own (the address the load-time
+    /// bind of the same name gives); a name libSystem does not export is a panic, not a null call.
+    #[cfg(all(feature = "std", target_vendor = "apple"))]
+    #[test]
+    fn a_symbol_is_found_in_libsystem_on_its_first_call_and_kept_7260() {
+        extern "C" {
+            #[link_name = "atan2"]
+            fn bound_at_load(y: f64, x: f64) -> f64;
+        }
+        let symbol = on_first_call::Symbol::new();
+        let first = symbol.get(b"atan2\0");
+        let at_load: unsafe extern "C" fn(f64, f64) -> f64 = bound_at_load;
+        assert_eq!(first, at_load as *mut core::ffi::c_void);
+        assert_eq!(symbol.get(b"atan2\0"), first);
+        // SAFETY: as for `c_call!`.
+        assert_eq!(
+            atan2(1.0, 2.0).to_bits(),
+            unsafe { bound_at_load(1.0, 2.0) }.to_bits()
+        );
+        let missing = std::panic::catch_unwind(|| {
+            on_first_call::Symbol::new().get(b"succinctly_no_such_symbol_7260\0")
+        });
+        assert!(missing.is_err());
+    }
 
     /// Inputs are `i * 0.137 - 20` (or the other sweep sets, noted per row)
     /// as two IEEE operations, so they are the exact doubles jq computes for
