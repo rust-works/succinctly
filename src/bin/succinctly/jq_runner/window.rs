@@ -2947,14 +2947,16 @@ const REREAD_CHUNK: u64 = 1 << 20;
 /// pipe hands such a record on to that route too ([`SeqGate`], #7164).
 const MAX_PENDING_RECORD: usize = 64 << 20;
 
-/// How much of the end of the file the `--seq` prepass reads first, to check the last record: a stream
-/// that fails does so most often at its end, and the check then costs this, not a pass over the file.
+/// How much of the end of a file of a `--seq` list the run reads at a time for the byte its records
+/// leave in jq's token buffer ([`seq_token_byte_in`]).
 #[cfg(unix)]
 const TAIL_PROBE: u64 = 256 << 10;
 
 /// How much of the file a chunk of the `--seq` prepass holds (#7082): small enough that the buffer comes
 /// from the heap and is not a mapping that is freed, which glibc answers by raising the size it maps
 /// from, so that the window buffers after it were carved from a heap that fragments (+6 MiB at 100 MiB).
+/// It is also how much of the file's end the prepass reads first, to check the last record: a stream
+/// that fails does so most often at its end, and the check then costs this, not a pass over the file.
 #[cfg(unix)]
 const PREPASS_CHUNK: usize = 64 << 10;
 
@@ -3245,21 +3247,27 @@ fn plain_seq_records_in(file: &File, start: u64, len: u64) -> bool {
     use crate::cli::jq_seq_reader::{PlainGuards, PlainRecords};
     use std::os::unix::fs::FileExt;
     let guards = PlainGuards::ALL;
+    let mut chunk = vec![0u8; PREPASS_CHUNK];
     // The last record first, when an RS is near enough the end to hold it: the verdict does not
-    // depend on the order, and a record that fails is most often the last (a write cut short).
-    let probe = len.min(TAIL_PROBE);
-    let mut tail = vec![0u8; probe as usize];
-    if file.read_exact_at(&mut tail, start + len - probe).is_err() {
-        return false; // patchcov: coverage tolerate-line reason="untestable: a read that fails right after the last byte was read"
-    }
-    if let Some(rs) = tail.iter().rposition(|&b| b == RS) {
-        if !PlainRecords::record_ok(&tail[rs + 1..], guards) {
-            return false;
+    // depend on the order, and a record that fails is most often the last (a write cut short). #7260:
+    // read into the chunk the pass reads with, and only for a file longer than one, which the pass
+    // reads whole at once: a probe of its own was a 256 KiB buffer mapped, faulted in and freed, and a
+    // file of 256 KiB was read twice before its windows read it (4-6% of its run on the 7950X).
+    if len > PREPASS_CHUNK as u64 {
+        let tail = &mut chunk[..PREPASS_CHUNK];
+        if file
+            .read_exact_at(tail, start + len - PREPASS_CHUNK as u64)
+            .is_err()
+        {
+            return false; // patchcov: coverage tolerate-line reason="untestable: a read that fails right after the last byte was read"
+        }
+        if let Some(rs) = tail.iter().rposition(|&b| b == RS) {
+            if !PlainRecords::record_ok(&tail[rs + 1..], guards) {
+                return false;
+            }
         }
     }
-    drop(tail);
     let mut check = PlainRecords::new(guards);
-    let mut chunk = vec![0u8; PREPASS_CHUNK];
     let mut at = 0u64;
     while at < len {
         let want = (len - at).min(PREPASS_CHUNK as u64) as usize;
