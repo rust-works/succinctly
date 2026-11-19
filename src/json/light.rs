@@ -1879,7 +1879,7 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
             // deliberately *not* what it answers `true` for); this only
             // stops one bad key destroying valid results.
             if let StandardJson::String(key_str) = key {
-                if key_str.as_str().is_ok_and(|k| k == name) {
+                if key_str.decodes_to(name) {
                     winner = Some((key_str.start(), field, index == 0));
                 }
             }
@@ -1992,7 +1992,7 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
             }
             // Same undecodable-key skip as `find` above (#1247).
             if let StandardJson::String(key) = key {
-                if key.as_str().is_ok_and(|k| k == name) {
+                if key.decodes_to(name) {
                     winner = Some((key.start(), field.value_cursor(), index == 0));
                 }
             }
@@ -2410,6 +2410,33 @@ impl<'a> JsonString<'a> {
         } else {
             // Has escapes - need to decode
             decode_escapes(bytes).map(Cow::Owned)
+        }
+    }
+
+    /// Whether the string decodes to `name`: `self.as_str().is_ok_and(|k| k == name)`, without
+    /// decoding a key that cannot match (#7260).
+    ///
+    /// A field lookup compares every key of the object, and decoding one means scanning it to
+    /// its closing quote and checking it for UTF-8. Up to the first byte where the text and
+    /// `name` differ there is no backslash (`name` has none), so the decoded string agrees with
+    /// the text there and differs from `name` at that byte, unless the byte is a backslash
+    /// that may decode to it. Only that case, and a `name` holding a quote or backslash, decode.
+    #[inline]
+    pub fn decodes_to(&self, name: &str) -> bool {
+        let want = name.as_bytes();
+        if want.iter().any(|&b| b == b'"' || b == b'\\') {
+            return self.as_str().is_ok_and(|k| k == name);
+        }
+        let body = self.text.get(self.start + 1..).unwrap_or_default();
+        let common = body.iter().zip(want).take_while(|(a, b)| a == b).count();
+        match body.get(common) {
+            // An escape where the text leaves `name` may still decode to it.
+            Some(b'\\') => self.as_str().is_ok_and(|k| k == name),
+            // The whole of `name`, then the closing quote (or the end of an unclosed text,
+            // which `as_str` reads as the string's end).
+            Some(b'"') | None => common == want.len(),
+            // The text goes on past `name`, or differs from it at a byte that is itself.
+            Some(_) => false,
         }
     }
 
@@ -14838,6 +14865,56 @@ mod tests {
         };
         assert_eq!(closed.end(), 6);
         assert_eq!(closed.raw_bytes(), br#""abc""#);
+    }
+
+    /// #7260: `decodes_to` answers what decoding the key and comparing it answers, for every
+    /// pairing of these key texts (escapes, invalid UTF-8 and escapes, unclosed strings, a
+    /// multi-byte character split where the two differ) with these names.
+    #[test]
+    fn decodes_to_agrees_with_decoding_the_key_7260() {
+        let keys: [&[u8]; 22] = [
+            br#""""#,
+            br#""a""#,
+            br#""ab""#,
+            br#""abc""#,
+            br#""a\u0062""#,
+            br#""\u0061b""#,
+            br#""a\"b""#,
+            br#""a\\b""#,
+            br#""a\qb""#,
+            br#""\ud800""#,
+            "\"\u{e9}\"".as_bytes(),
+            "\"\u{e8}\"".as_bytes(),
+            br#""\u00e9""#,
+            b"\"a\xffb\"",
+            b"\"ab\xff\"",
+            b"\"\xc3\"",
+            br#""ab"#,
+            br#""a"#,
+            br#"""#,
+            br#""a\"#,
+            br#""ab\n""#,
+            br#""name": 1"#,
+        ];
+        let names = [
+            "", "a", "ab", "abc", "a\"b", "a\\b", "\u{e9}", "\u{e8}", "ab\n", "name", "b",
+        ];
+        for key in keys {
+            let mut text = alloc::vec![b'{'];
+            text.extend_from_slice(key);
+            let s = JsonString {
+                text: &text,
+                start: 1,
+            };
+            for name in names {
+                assert_eq!(
+                    s.decodes_to(name),
+                    s.as_str().is_ok_and(|k| k == name),
+                    "key {:?}, name {name:?}",
+                    String::from_utf8_lossy(key)
+                );
+            }
+        }
     }
 
     /// #4217: `build_reindex_scalar_from` overwrites the buffers it is given.
