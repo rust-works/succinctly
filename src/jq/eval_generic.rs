@@ -94,6 +94,9 @@ use super::eval::{
     StashedVerdict, YqSemantics, DEFERRED_BIND_UNRESOLVED, MAX_RANGE_TOTAL,
 };
 use super::eval::{
+    collect_tostream_events, share_path_component, yq_yaml_unwrapped_text, LoopAbort,
+};
+use super::eval::{
     contains_retrying_pattern_bind, owned_slot_mut, starts_with_pattern_bind, static_path_steps,
     StepKey,
 };
@@ -101,7 +104,6 @@ use super::eval::{
     format_yq_commented, format_yq_props_commented, yq_encoder_prints_leading_block,
     yq_encoder_reads_spelling, yq_encoder_writes_comments, yq_props_format_style,
 };
-use super::eval::{yq_yaml_unwrapped_text, LoopAbort};
 #[cfg(test)]
 use super::expr::FuncDefBound;
 use super::expr::TomlCommentSource;
@@ -30793,11 +30795,16 @@ fn collect_paths_generic<S: EvalSemantics, V: DocumentValue>(
             let Some(key) = key_display_string(&field.key) else {
                 return Err(fields.malformed_member_error());
             };
-            current_path.push(if S::TAG == EvalTag::Yq {
+            let mut component = if S::TAG == EvalTag::Yq {
                 yq_path_component(key, &field.key_cursor)
             } else {
                 OwnedValue::String(key.into_owned().into())
-            });
+            };
+            // #7260: every path beneath a container repeats this key.
+            if field.value.is_iterable() {
+                share_path_component(&mut component);
+            }
+            current_path.push(component);
             if !leaves_only {
                 paths.push(OwnedValue::Array(current_path.clone().into()));
                 if let Some(nodes) = nodes.as_deref_mut() {
@@ -30902,11 +30909,16 @@ fn collect_tostream_generic<S: EvalSemantics, V: DocumentValue>(
             let Some(key) = key_display_string(&field.key) else {
                 return Err(fields.malformed_member_error());
             };
-            current_path.push(if S::TAG == EvalTag::Yq {
+            let mut component = if S::TAG == EvalTag::Yq {
                 yq_path_component(key, &field.key_cursor)
             } else {
                 OwnedValue::String(key.into_owned().into())
-            });
+            };
+            // #7260: every event beneath a container repeats this key.
+            if field.value.is_iterable() {
+                share_path_component(&mut component);
+            }
+            current_path.push(component);
             collect_tostream_generic::<S, _>(
                 &field.value,
                 &field.value_cursor,
@@ -41520,6 +41532,33 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 ),
                 Err(e) => GenericResult::Error(e),
             }
+        }
+
+        // #7260: jq mode, where the owned walk is exact (a repeated key
+        // collapses either way). The fallback below materialized the document,
+        // wrote it out again to reindex it for `eval.rs`, and cloned every
+        // leaf out of a value the bridge still held, so the document, its
+        // text and a second copy of each leaf string were live beside the
+        // events at the peak. This materializes it the same way and hands it
+        // to `collect_tostream_events` to consume: each leaf moves into its
+        // event and each container is released once its children are taken.
+        // A value some binding still holds (#2889) is shared, and is then
+        // cloned out of exactly as before.
+        Builtin::ToStream if S::COLLAPSE_DUPLICATE_KEYS => {
+            let expr = builtin_expr(whole, builtin);
+            let rooted = reindexed_root_for::<S, _>(&expr, cursor.as_ref());
+            let owned = owned_or_suppress!(
+                bridge_input_over::<_, S>(&expr, &value, cursor, rooted.as_deref()),
+                optional
+            );
+            let mut events = Vec::new();
+            collect_tostream_events(owned, &mut Vec::new(), &mut events);
+            collapse_vec(
+                events,
+                || GenericResult::None,
+                GenericResult::Owned,
+                GenericResult::ManyOwned,
+            )
         }
 
         Builtin::LeafPaths => {
@@ -63842,6 +63881,62 @@ mod tests {
         let items = materialize("[.a, .b]");
         assert_eq!(items[0], items[1]);
         assert!(!items[0].shares_storage_with(&items[1]));
+    }
+
+    /// #7260: `paths`, `leaf_paths` and yq's `tostream` walk the document
+    /// and share the key above a container among every path beneath it; a
+    /// key above a leaf stays an inline copy.
+    #[test]
+    fn test_path_walks_share_keys_above_containers_7260() {
+        let doc = r#"{"a":{"b":1,"c":[2]},"d":3}"#;
+        let index = JsonIndex::build(doc.as_bytes());
+        let root = index.root(doc.as_bytes());
+        let key = |path: &OwnedValue, at: usize| match path {
+            OwnedValue::Array(items) => match &items[at] {
+                OwnedValue::String(s) => s.clone(),
+                other => panic!("component {at} of {path:?} is {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#7260)"
+            },
+            other => panic!("not a path: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#7260)"
+        };
+        for leaves_only in [false, true] {
+            let mut paths = Vec::new();
+            collect_paths_generic::<JqSemantics, _>(
+                &root.value(),
+                Some(&root),
+                &mut Vec::new(),
+                &mut paths,
+                leaves_only,
+                None,
+            )
+            .unwrap();
+            let a = key(&paths[0], 0);
+            assert!(a.is_shared(), "{paths:?}");
+            assert!(paths
+                .iter()
+                .filter(|p| key(p, 0) == "a")
+                .all(|p| key(p, 0).ptr_eq(&a)));
+            let d = paths.last().unwrap();
+            assert!(!key(d, 0).is_shared(), "`d` is above a leaf");
+        }
+        let mut events = Vec::new();
+        collect_tostream_generic::<YqSemantics, _>(
+            &root.value(),
+            &root,
+            &mut Vec::new(),
+            &mut events,
+        )
+        .unwrap();
+        let paths: Vec<OwnedValue> = events
+            .iter()
+            .map(|event| match event {
+                OwnedValue::Array(items) => items[0].clone(),
+                other => panic!("not an event: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#7260)"
+            })
+            .collect();
+        let a = key(&paths[0], 0);
+        assert!(a.is_shared(), "{events:?}");
+        assert!(key(&paths[3], 0).ptr_eq(&a), "{events:?}");
+        assert!(!key(&paths[4], 0).is_shared(), "`d` is above a leaf");
     }
 
     /// #3856: a sequence holding both nodes and computed values materializes
