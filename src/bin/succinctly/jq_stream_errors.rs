@@ -1127,6 +1127,11 @@ struct Fed {
     errored: bool,
 }
 
+/// How many events a pausing feed yields before it hands them out (#7260): few enough that what they
+/// hold is still in the first-level data cache when the program reads them, enough that the parser's
+/// code is not evicted by the program's between every two.
+const PAUSE_EVENTS: usize = 32;
+
 /// How far [`Parser::feed_from`] got: to the end of its refill, or to a pause after a value.
 enum Feeding {
     Done(Fed),
@@ -1304,10 +1309,10 @@ impl Parser {
     }
 
     /// [`feed`](Self::feed) from byte `from` of the refill, and when `pause` is set, stopping after
-    /// the first byte that yields a value, unless it is the refill's last (#7260): the reader hands
-    /// that value out before the parser reads on, as jq's `jv_parser_next` returns it, so a refill's
-    /// worth of values is not built ahead of the program reading them. Only a parser that is not
-    /// `--seq`'s pauses: its calls carry no state across a value but the byte reached.
+    /// a byte that leaves [`PAUSE_EVENTS`] values waiting, unless it is the refill's last (#7260):
+    /// the reader hands those out before the parser reads on, so a refill's worth of values is not
+    /// built ahead of the program reading them. Only a parser that is not `--seq`'s pauses: its
+    /// calls carry no state across a value but the byte reached.
     fn feed_from(
         &mut self,
         chunk: &[u8],
@@ -1365,7 +1370,7 @@ impl Parser {
                             ..Fed::ended()
                         });
                     }
-                    if pause {
+                    if pause && self.pending.len() >= PAUSE_EVENTS {
                         return Feeding::Paused(index + 1);
                     }
                 }
@@ -2709,9 +2714,9 @@ mod tests {
         assert!(reader.next().is_none(), "a finished reader stays finished");
     }
 
-    /// #7260: within a refill, too, the parser reads only as far as the value handed out: a line of
-    /// a few hundred events is not built ahead of the reads, and every event still comes out, in
-    /// order, where it did.
+    /// #7260: within a refill, too, the parser reads only a few events past the one handed out: a
+    /// line of a few hundred events is not built ahead of the reads, and every event still comes out,
+    /// in order, where it did.
     #[test]
     fn a_refill_is_fed_only_as_far_as_the_value_handed_out_7260() {
         let line = format!(
@@ -2726,15 +2731,16 @@ mod tests {
         let mut reader = Reader::new(&sources);
         let (first, _) = reader.next().expect("a first input");
         assert_eq!(first.to_json(), r#"[[0,"k"],0]"#);
+        // The byte that completes an event can complete a second (a leaf and its container's close).
         assert!(
-            reader.parser.pending.len() <= 1,
+            reader.parser.pending.len() <= PAUSE_EVENTS + 1,
             "{} pending",
             reader.parser.pending.len()
         );
         let mut paused = Vec::new();
         paused.push((first.to_json(), (0, 1)));
         while let Some((value, at)) = reader.next() {
-            assert!(reader.parser.pending.len() <= 2);
+            assert!(reader.parser.pending.len() <= PAUSE_EVENTS + 1);
             paused.push((value.to_json(), at));
         }
         // What `jq -c --stream .` prints for the line, every event at line 1 of source 0.
