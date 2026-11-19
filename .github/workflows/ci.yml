@@ -921,6 +921,11 @@ jobs:
       - name: ci-release-downloads self-tests
         run: python3 scripts/test_ci_release_downloads.py -v
 
+      # #7390: the stripped-size budget check run after the release build below: a fake strip,
+      # no build. It also pins that this job's release build is the one release.yml ships.
+      - name: binary_size.py self-tests
+        run: python3 scripts/test_binary_size.py -v
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -1102,6 +1107,7 @@ jobs:
           fi
 
       - name: Build release binary
+        id: release-build
         run: cargo build --release --features cli
 
       # #5704: what the lookup step above finds. Named by arch, SHA and a hash of
@@ -1143,6 +1149,14 @@ jobs:
             EXTRA_ARGS=""
           fi
           python3 scripts/perf-guard.py --binary target/release/succinctly --arch "${{ matrix.name }}" --check $EXTRA_ARGS
+
+      # #7390: the stripped size of the binary built above (release.yml's own command, so the shipped
+      # shape) against tests/data/binary-size-budget.json, failing past 5% growth. An intended increase
+      # bumps the committed number in the same PR: the failure prints the measured size and the edit.
+      # Runs whether or not the perf guard passed, so each reports on its own.
+      - name: Check stripped binary size
+        if: ${{ !cancelled() && steps.release-build.outcome == 'success' }}
+        run: python3 scripts/binary_size.py check --binary target/release/succinctly
 
   clippy:
     name: Clippy

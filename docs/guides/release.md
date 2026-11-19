@@ -170,6 +170,12 @@ The release workflow produces:
 
 All Unix binaries are stripped for smaller size.
 
+The stripped Linux x64 and ARM64 binaries have a size budget, `tests/data/binary-size-budget.json` (#7390). CI's
+`Perf Regression Guard` legs build this workflow's command, strip a copy and fail when it is more than 5% over its
+budget (`scripts/binary_size.py`); an intended increase sets the target's `bytes` to the size the failing run printed,
+in the same PR. Take the number from CI's log, not a local build: another toolchain, linker or `strip` moves it by a
+percent or two. macOS has no budget, since macOS runners are not spent on the perf guard.
+
 The macOS ARM64 archive is built for macOS 12.0 or newer, not for rustc's default of 11.0 on arm64 (#7321). The
 setting is `MACOSX_DEPLOYMENT_TARGET` in `.cargo/config.toml`'s `[env]`, so the archive, a local `cargo build
 --release` and the binary `succinctly dev compare jq` times are built the same way, and `release.yml` needs no
