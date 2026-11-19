@@ -12185,6 +12185,49 @@ fn probe_stdin_pipe(file: &std::fs::File, min: u64) -> Option<Vec<u8>> {
     Some(front)
 }
 
+/// [`probe_stdin_pipe`] a block at a time (#7260): the probe's bytes as blocks of `block` bytes each,
+/// in order, so the windows of the plain route free each once it is run, where one buffer of the
+/// probe was held until the last of it was. A pipe that ends sooner is handed on as
+/// [`probe_stdin_pipe`] hands it on, its blocks joined: the first has room past a block for the rest of
+/// a short one (a stream of a little more than a block, as 1 MB is, is not copied), and room for the
+/// bytes a window keeps in front of each (a line).
+#[cfg(unix)]
+fn probe_stdin_pipe_blocks(
+    file: &std::fs::File,
+    min: u64,
+    block: usize,
+) -> Option<std::collections::VecDeque<Vec<u8>>> {
+    const ROOM: usize = 64 << 10;
+    let block = block.max(1);
+    let mut blocks = std::collections::VecDeque::new();
+    let mut total = 0u64;
+    let mut error = None;
+    while total < min {
+        let want = usize::try_from(min - total).map_or(block, |left| left.min(block));
+        let mut bytes = Vec::with_capacity(want + ROOM);
+        error = Read::take(file, want as u64)
+            .read_to_end(&mut bytes)
+            .err()
+            .filter(|error| !not_open_for_reading(error));
+        total += bytes.len() as u64;
+        let short = bytes.len() < want;
+        blocks.push_back(bytes);
+        if short || error.is_some() {
+            break;
+        }
+    }
+    if total < min {
+        let mut whole = blocks.pop_front().unwrap_or_default();
+        for bytes in blocks {
+            whole.extend_from_slice(&bytes);
+        }
+        STDIN_PUSHBACK_ERROR.with(|slot| *slot.borrow_mut() = error);
+        STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = Some(whole));
+        return None;
+    }
+    Some(blocks)
+}
+
 /// [`windowed_stdin_file`] over a handle on descriptor 0 (its half that does not read the process's own
 /// descriptors): `None` for anything but a regular file with 4 MiB or more left from the offset the handle
 /// is at ([`regular_stdin_left`]), or one the run also writes to.
@@ -12234,12 +12277,11 @@ fn windowed_stdin_pipe() -> Option<WindowedSource> {
 /// documents before it as on a regular file.
 #[cfg(unix)]
 fn windowed_pipe(file: std::fs::File, min: u64) -> Option<WindowedSource> {
-    let front = probe_stdin_pipe(&file, min)?;
+    let blocks = probe_stdin_pipe_blocks(&file, min, window::window_bytes())?;
     let seen = window::SeenFault::default();
     let reader = window::WindowedFiles::pipe(
         std::rc::Rc::new(file),
-        front,
-        None,
+        blocks,
         window::window_bytes(),
         seen.clone(),
     );
@@ -23192,6 +23234,34 @@ mod tests {
         }
         assert_eq!(count, 20);
         assert_eq!(reread.stream_fault(), None);
+    }
+
+    /// #7260: the plain route's probe reads a pipe in blocks, every byte of it in order, and hands a pipe
+    /// that ends short of the minimum on as the one buffer it would have read, its blocks joined.
+    #[cfg(unix)]
+    #[test]
+    fn a_pipes_probe_is_read_in_blocks_and_joined_when_short_7260() {
+        use std::io::Write;
+        let piped = |bytes: &[u8]| {
+            let (reader, mut writer) = std::io::pipe().expect("pipe");
+            writer.write_all(bytes).expect("write");
+            drop(writer);
+            std::fs::File::from(std::os::fd::OwnedFd::from(reader))
+        };
+        let stream: Vec<u8> = (0..200u8).collect();
+        let blocks = probe_stdin_pipe_blocks(&piped(&stream), 100, 30).expect("the minimum");
+        assert_eq!(
+            blocks.iter().map(Vec::len).collect::<Vec<_>>(),
+            [30, 30, 30, 10]
+        );
+        assert_eq!(Vec::from(blocks).concat(), stream[..100]);
+        STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = None);
+        assert!(probe_stdin_pipe_blocks(&piped(&stream[..95]), 100, 30).is_none());
+        assert_eq!(
+            STDIN_PUSHBACK.with(|slot| slot.borrow_mut().take()),
+            Some(stream[..95].to_vec())
+        );
+        assert!(STDIN_PUSHBACK_ERROR.with(|slot| slot.borrow().is_none()));
     }
 
     /// #7024: `-R` over a pipe on standard input reads it a window at a time only once it holds the

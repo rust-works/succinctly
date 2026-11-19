@@ -451,6 +451,14 @@ pub(super) struct WindowedFile {
     /// Two blocks past where a pipe's probe ends in the stream (0 for every other source): a document
     /// still open there is read on a block at a time up to it before the look-ahead (#7266).
     probe_reach: u64,
+    /// The rest of a pipe's probe, read in blocks of their own (#7260): each read takes the next of
+    /// them before the pipe is read, so a block of the probe is freed once its window is out, where
+    /// one buffer of the probe was held until all of it was.
+    pre_read: std::collections::VecDeque<Vec<u8>>,
+    /// The windows whose kept bytes went to a buffer of their own because the certifying thread still
+    /// read them ([`Self::drop_consumed`], #7260).
+    #[cfg(test)]
+    kept_apart: usize,
     #[cfg(test)]
     break_search_bytes: usize,
     /// The bytes the splitter has scanned, rescans of a document not yet whole included.
@@ -510,6 +518,9 @@ impl WindowedFile {
             gate_cut: false,
             front_end: 0,
             probe_reach: 0,
+            pre_read: std::collections::VecDeque::new(),
+            #[cfg(test)]
+            kept_apart: 0,
             #[cfg(test)]
             break_search_bytes: 0,
             #[cfg(test)]
@@ -753,23 +764,66 @@ impl WindowedFile {
     /// carry ends (#4316), so a seam kept over a text that no longer starts with the carry would
     /// count them from the wrong byte. Once the drop reaches past it the seam goes with it, and the
     /// lines of the carry are not the file's.
+    ///
+    /// #7260: the last window's text may be shared with the thread that certifies it ([`Self::held`]):
+    /// it is the buffer again once the thread is done with it, and while it is not, what is kept goes
+    /// to a buffer of its own, so no window is copied for the thread.
     fn drop_consumed(&mut self) {
-        let consumed = self.consumed.min(self.buf.len());
-        let mut line_start = self.buf[..consumed]
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .map_or(0, |at| at + 1);
-        let base = self.seam.base;
-        if line_start < base {
-            line_start = 0;
+        let held = self.held.take();
+        let (consumed, line_start, dropped) = {
+            let text = held.as_deref().unwrap_or(&self.buf);
+            let consumed = self.consumed.min(text.len());
+            let mut line_start = text[..consumed]
+                .iter()
+                .rposition(|&b| b == b'\n')
+                .map_or(0, |at| at + 1);
+            let base = self.seam.base;
+            if line_start < base {
+                line_start = 0;
+            }
+            let dropped = (line_start > 0).then(|| {
+                (
+                    count_newlines(&text[..line_start]),
+                    count_newlines(&text[..base]),
+                )
+            });
+            (consumed, line_start, dropped)
+        };
+        let mut kept_apart = false;
+        if let Some(held) = held {
+            self.buf = match Arc::try_unwrap(held) {
+                Ok(buf) => buf,
+                Err(held) => {
+                    kept_apart = true;
+                    #[cfg(test)]
+                    {
+                        self.kept_apart += 1;
+                    }
+                    let mut buf = self.spare_buffer(held.len() - line_start, held.capacity());
+                    buf.extend_from_slice(&held[line_start..]);
+                    buf
+                }
+            };
         }
         if line_start > 0 {
-            let dropped = count_newlines(&self.buf[..line_start]);
-            self.lines_before += dropped - count_newlines(&self.buf[..base]);
-            self.origin = (self.origin.0 + dropped, 0);
             self.offset += line_start;
-            self.buf.drain(..line_start);
+            if !kept_apart {
+                self.buf.drain(..line_start);
+            }
             self.validated -= line_start;
+        }
+        self.after_front_drop(line_start, dropped);
+        self.skip = consumed - line_start;
+        self.consumed = self.skip;
+    }
+
+    /// What [`Self::drop_consumed`] keeps track of when `line_start` bytes are dropped from the front of
+    /// the text, with `dropped` line breaks in them and the carry's own before `seam.base`.
+    fn after_front_drop(&mut self, line_start: usize, dropped: Option<(usize, usize)>) {
+        let base = self.seam.base;
+        if let Some((dropped, carry_lines)) = dropped {
+            self.lines_before += dropped - carry_lines;
+            self.origin = (self.origin.0 + dropped, 0);
             self.front_end = self.front_end.saturating_sub(line_start);
             self.no_break_from = self.no_break_from.saturating_sub(line_start);
             if let Some(gate) = self.seq_gate.as_mut() {
@@ -786,8 +840,27 @@ impl WindowedFile {
             }
             self.raw_map.drop_before(self.offset);
         }
-        self.skip = consumed - line_start;
-        self.consumed = self.skip;
+    }
+
+    /// A buffer to read the next window into with `kept` bytes of the last at its front, while the
+    /// certifying thread still reads that one (#7260): one it has handed back, or a new one of a block
+    /// and those bytes, but no bigger than the one it stands in for (`room`), as the windows of one
+    /// buffer never grew it.
+    fn spare_buffer(&self, kept: usize, room: usize) -> Vec<u8> {
+        let spare = self
+            .certifier
+            .as_ref()
+            .and_then(|certifier| certifier.worker.as_ref())
+            .and_then(|worker| worker.recycled.try_recv().ok());
+        let mut buf = spare.unwrap_or_default();
+        buf.clear();
+        // The next read takes a block of the probe, which these bytes are put in front of.
+        buf.reserve(if self.pre_read.is_empty() {
+            (kept + self.block).min(room.max(kept))
+        } else {
+            kept
+        });
+        buf
     }
 
     /// The bytes of the open tail of the file from `start` in the text, as they were read, which is
@@ -833,6 +906,20 @@ impl WindowedFile {
     /// Reads up to `n` more bytes; a short read, or the length the file had, is the end of the file,
     /// and an error is kept to be returned after the bytes before it have been run.
     fn read_more(&mut self, n: usize) {
+        if let Some(block) = self.pre_read.pop_front() {
+            // #7260: the probe's next block, read before the pipe is, with what is kept in front of it;
+            // a buffer that holds less than it is put on its front, so the block is not copied.
+            if self.buf.len() <= block.len() {
+                let mut block = block;
+                block.splice(..0, self.buf.drain(..));
+                self.buf = block;
+            } else {
+                self.buf.extend_from_slice(&block);
+            }
+            // As after a read of the pipe: a BOM is the stream's front's, which may be cut across blocks.
+            self.skip_front_bom();
+            return;
+        }
         let n = usize::try_from(self.remaining).map_or(n, |left| n.min(left));
         if n == 0 {
             self.eof = true;
@@ -1038,22 +1125,23 @@ impl WindowedFile {
 
 /// How many windows may be waiting for the certifying thread (or in its hands) at once: the filter
 /// runs over window N while N and N - 1 are certified, so a thread that falls behind holds the filter
-/// back at the next window and the copies of the text stay at two (#7106).
+/// back at the next window and the buffers it holds stay at two (#7106, #7260).
 const CERTIFIER_WINDOWS_IN_FLIGHT: usize = 2;
 
 /// A window of more than this is certified on the filter's own thread, over the buffer itself: it holds a
-/// document bigger than a few windows, and a copy of it would add its size to the peak memory of a run
-/// whose point is to hold less (a 175 MB one-line array read 395 MB with the copy and 222 MB without,
-/// #7106). The probe's 4 MiB are handed out a block at a time, so each of its windows is copied as
-/// every later one is (#7266). Certifying them here instead would cost a pipe of 10 MiB 4 to 10% of
-/// its run (measured, #7106, when the probe was one window of 4 MiB or more).
+/// document bigger than a few windows, which a copy for the thread added the size of to the peak memory
+/// of a run whose point is to hold less (a 175 MB one-line array read 395 MB with the copy and 222 MB
+/// without, #7106). The thread reads a window's own buffer since #7260, so this is no longer a copy's
+/// limit, and is kept so such a document is certified as it was. Certifying every window here instead
+/// would cost a pipe of 10 MiB 4 to 10% of its run (measured, #7106, when the probe was one window of
+/// 4 MiB or more).
 #[inline]
 fn certifier_copy_limit() -> usize {
     8 * window_bytes()
 }
 
 /// A buffer the certifying thread hands back is kept for the next window only up to this size, about two
-/// windows, so the probe's copy and one that grew with a document are not held for the run.
+/// windows, so one that grew with a document is not held for the run.
 #[inline]
 fn certifier_keep_bytes() -> usize {
     2 * window_bytes()
@@ -1207,7 +1295,8 @@ const CERTIFIED_DEPTH: usize = 127;
 /// at the end of the stream; every later window goes unchecked.
 ///
 /// The verdict decides the wording of a fault and nothing the run prints, so the windows are certified
-/// on a thread of their own, over a copy of each, while the filter runs over the window (#7106): the
+/// on a thread of their own, over each window's own buffer, which the window handed out shares (#7260;
+/// a copy of each until then), while the filter runs over the window (#7106): the
 /// thread starts with the first window, in a run that reads a pipe of 4 MiB or more, and a reader of
 /// the fault waits for it ([`SeenFault::get`]). The last window is never dropped, so it is certified
 /// only when the fault is asked for, over its own buffer (#7294): a pipe that holds one big document is
@@ -1234,15 +1323,14 @@ struct Worker {
 enum JobText<'a> {
     /// The buffer itself, certified on the filter's own thread.
     Borrowed(&'a [u8]),
-    /// A copy, for the certifying thread.
-    Copied(Vec<u8>),
-    /// The last window's buffer, shared with the reader that hands it out: `len` bytes of it (#7294).
+    /// A window's buffer, shared with the reader that hands it out: `len` bytes of it, the last
+    /// window's (#7294) and, for the certifying thread, every other one's (#7260).
     Held(Arc<Vec<u8>>, usize),
 }
 
 impl Default for JobText<'_> {
     fn default() -> Self {
-        Self::Copied(Vec::new())
+        Self::Borrowed(&[])
     }
 }
 
@@ -1252,16 +1340,16 @@ impl std::ops::Deref for JobText<'_> {
     fn deref(&self) -> &[u8] {
         match self {
             Self::Borrowed(text) => text,
-            Self::Copied(text) => text,
             Self::Held(text, len) => &text[..*len],
         }
     }
 }
 
-/// One window to certify: a copy of the text and what the certifier needs of the reader's state to word
-/// a fault from it.
+/// One window to certify: its text and what the certifier needs of the reader's state to word a fault
+/// from it.
 struct Job<'a> {
-    /// `buf[..validated]` of the window: a copy for the thread, the buffer itself for the filter's own.
+    /// `buf[..validated]` of the window: the buffer the window shares, for the thread (#7260), or the
+    /// buffer itself, for the filter's own.
     text: JobText<'a>,
     /// The documents of the window, in `text`.
     values: Vec<Span>,
@@ -1290,15 +1378,16 @@ fn certify_windows(
         } else {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.certify(&mut resume)))
         };
+        // #7260: a window's buffer the reader no longer holds is handed back to read a window into.
         let text = match std::mem::take(&mut job.text) {
-            JobText::Copied(mut text) if text.capacity() <= certifier_keep_bytes() => {
-                text.clear();
-                text
-            }
-            _ => Vec::new(),
+            JobText::Held(text, _) => Arc::try_unwrap(text).ok(),
+            JobText::Borrowed(_) => None, // patchcov: coverage tolerate-line reason="unreachable: the thread is handed held windows only"
         };
-        // The reader may have gone: a buffer nobody wants is dropped.
-        let _ = recycled.send(text);
+        if let Some(mut text) = text.filter(|text| text.capacity() <= certifier_keep_bytes()) {
+            text.clear();
+            // The reader may have gone, or hold a spare already: a buffer nobody wants is dropped.
+            let _ = recycled.try_send(text);
+        }
         match outcome {
             Ok(fault) => seen.finish(fault, Some(resume), false),
             Err(_) => seen.finish(None, None, true), // patchcov: coverage tolerate-line reason="defensive: certify does not panic; kept so a bug in it is reported by SeenFault::get"
@@ -1309,7 +1398,8 @@ fn certify_windows(
 /// The thread that certifies the windows, and the channels to and from it.
 fn start_worker(seen: &SeenFault) -> io::Result<Worker> {
     let (jobs, inbox) = sync_channel(CERTIFIER_WINDOWS_IN_FLIGHT);
-    let (outbox, recycled) = sync_channel(CERTIFIER_WINDOWS_IN_FLIGHT + 1);
+    // #7260: one spare at most, so the buffers the reader has finished with are not kept resident.
+    let (outbox, recycled) = sync_channel(1);
     let seen = seen.clone();
     std::thread::Builder::new()
         .name("certify-windows".into())
@@ -1955,10 +2045,21 @@ impl WindowedFile {
         this
     }
 
+    /// A pipe whose probe read `blocks` after its front (#7260): they are read, in order, before the
+    /// pipe is ([`Self::pre_read`]).
+    fn then_reads(mut self, blocks: std::collections::VecDeque<Vec<u8>>) -> Self {
+        let read: u64 = blocks.iter().map(|block| block.len() as u64).sum();
+        self.file_read += read;
+        self.probe_reach += read;
+        self.pre_read = blocks;
+        self
+    }
+
     /// Certifies `values`, the documents of the window about to be handed out (and the bytes after them,
     /// when `fault_at_end`: the window is the last and ends in a fault), and keeps the stream's first
-    /// fault. The window is handed to the thread that certifies them, over a copy, and waits only while
-    /// two others are in flight; one of more than [`certifier_copy_limit`], or any when no thread could
+    /// fault. The window is handed to the thread that certifies them, over its own buffer, which the window
+    /// handed out shares ([`Self::held`], #7260), and waits only while two others are in flight; one of
+    /// more than [`certifier_copy_limit`], or any when no thread could
     /// be started, is certified here, over the buffer itself. The last window is certified only if a
     /// fault is asked for, over the buffer, which it then shares ([`SeenFault::defer_last`], #7294).
     fn certify(&mut self, values: &[Span], fault_at_end: bool) {
@@ -2014,13 +2115,16 @@ impl WindowedFile {
             certifier.seen.certify_here(|resume| job.certify(resume));
             return;
         };
-        // A place first, so the copies of the text are never more than two.
+        // A place first, so the windows the thread holds are never more than two.
         certifier.seen.begin();
-        // A buffer the thread has finished with, or a new one while fewer than three are in use.
-        let mut copy: Vec<u8> = worker.recycled.try_recv().unwrap_or_default();
-        copy.extend_from_slice(text);
+        // #7260: the thread reads the window's own buffer, which it shares with the window handed out
+        // ([`Self::held`]), where it read a copy: that copied every byte of the stream once more, and
+        // held up to three copies of a window beside the buffer.
+        let validated = self.validated;
+        let text = Arc::new(std::mem::take(&mut self.buf));
+        self.held = Some(Arc::clone(&text));
         let job = Job {
-            text: JobText::Copied(copy),
+            text: JobText::Held(text, validated),
             values: values.to_vec(),
             fault_at_end,
             offset: self.offset,
@@ -2473,19 +2577,22 @@ impl WindowedFiles {
         }
     }
 
-    /// A pipe on standard input ([`WindowedFile::from_pipe`], #7024): the stream's one source.
+    /// A pipe on standard input ([`WindowedFile::from_pipe`], #7024), the stream's one source, from the
+    /// probe that read its front in blocks (#7260): the first block is the front, and the rest are read
+    /// before the pipe is ([`WindowedFile::pre_read`]).
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) fn pipe(
         file: Rc<File>,
-        front: Vec<u8>,
-        error: Option<io::Error>,
+        mut blocks: std::collections::VecDeque<Vec<u8>>,
         block: usize,
         seen: SeenFault,
     ) -> Self {
+        let front = blocks.pop_front().unwrap_or_default();
         let mut this = Self::new(Vec::new(), block);
         this.count = 1;
         this.next_index = 1;
-        this.current = Some(WindowedFile::from_pipe(file, front, error, block, seen));
+        this.current =
+            Some(WindowedFile::from_pipe(file, front, None, block, seen).then_reads(blocks));
         this
     }
 
@@ -5938,6 +6045,24 @@ mod pipe_tests {
         (run, peak, fault)
     }
 
+    /// `text` read as a pipe whose probe read it in `blocks` blocks of `block` bytes (#7260): the first is
+    /// the front, the rest are read before the source.
+    fn piped_blocks(text: &[u8], blocks: usize, block: usize) -> (Run, usize, Option<String>) {
+        let mut file = tempfile::tempfile().expect("a temp file");
+        file.write_all(text).expect("written");
+        let probe = (blocks * block).min(text.len());
+        file.seek(SeekFrom::Start(probe as u64)).expect("seeked");
+        let mut read: std::collections::VecDeque<Vec<u8>> =
+            text[..probe].chunks(block).map(<[u8]>::to_vec).collect();
+        let front = read.pop_front().unwrap_or_default();
+        let seen = SeenFault::default();
+        let mut reader = WindowedFile::from_pipe(Rc::new(file), front, None, block, seen.clone())
+            .then_reads(read);
+        let (run, peak) = drain(&mut reader);
+        let fault = Reread::seen(seen).stream_fault();
+        (run, peak, fault)
+    }
+
     /// The same text as a regular file, which words its fault by reading itself again.
     fn as_file(text: &[u8], block: usize) -> (Run, Option<String>) {
         let mut file = tempfile::tempfile().expect("a temp file");
@@ -5972,6 +6097,12 @@ mod pipe_tests {
                 "fault at block {block}, front {front}: {:?}",
                 String::from_utf8_lossy(text)
             );
+        }
+        // #7260: a probe read in blocks, of every count up to the whole text.
+        for blocks in [1, 2, 4, text.len() / block.max(1) + 1] {
+            let (run, _, fault) = piped_blocks(text, blocks, block);
+            assert_eq!(run, file_run, "documents at block {block}, {blocks} blocks");
+            assert_eq!(fault, file_fault, "fault at block {block}, {blocks} blocks");
         }
     }
 
@@ -6098,9 +6229,69 @@ mod pipe_tests {
                 peak <= block + 2 * line.len(),
                 "front {front}: window of {peak}"
             );
-            assert_eq!(reader.text_capacity(), capacity, "front {front}: grown");
+            // #7260: a window the certifying thread still reads keeps its bytes in a buffer of its
+            // own, a block and a line, so the text is never more than the probe's buffer either.
+            assert!(
+                reader.text_capacity() <= capacity,
+                "front {front}: grown to {}",
+                reader.text_capacity()
+            );
             assert_eq!(seen.get(), None);
             assert_eq!(run, as_file(&text, block).0, "front {front}");
+        }
+    }
+
+    /// #7260: the certifying thread reads each window's own buffer, not a copy. A window it still holds
+    /// when the next is asked for keeps its bytes in a buffer of its own; one it is done with is the
+    /// buffer again. Either way the windows are the file route's.
+    #[test]
+    fn a_window_the_thread_still_reads_is_kept_apart_7260() {
+        let line = "{\"name\":\"n\",\"v\":[1,2,3]}\n";
+        let text = line.repeat(400);
+        let block = 1_000;
+        for hold in [false, true] {
+            let mut file = tempfile::tempfile().expect("a temp file");
+            file.write_all(text.as_bytes()).expect("written");
+            file.seek(SeekFrom::Start(block as u64)).expect("seeked");
+            let seen = SeenFault::default();
+            let mut reader = WindowedFile::from_pipe(
+                Rc::new(file),
+                text.as_bytes()[..block].to_vec(),
+                None,
+                block,
+                seen.clone(),
+            );
+            let mut run = Vec::new();
+            let mut windows = 0;
+            loop {
+                // The thread's share of the last window, while it would still read it.
+                let held = hold.then(|| reader.held.clone()).flatten();
+                let Some(window) = reader.next_window().expect("reads") else {
+                    break;
+                };
+                windows += 1;
+                run.extend(
+                    window
+                        .values
+                        .iter()
+                        .map(|&(start, end)| window.raw[start..end].to_vec()),
+                );
+                drop(held);
+            }
+            assert_eq!(seen.get(), None);
+            assert_eq!(run.len(), 400, "hold {hold}");
+            assert!(windows > 2, "{windows}");
+            if hold {
+                // Every window but the first is asked for while the one before is held.
+                assert_eq!(reader.kept_apart, windows - 1, "hold {hold}");
+            }
+            let want: Vec<Vec<u8>> = as_file(text.as_bytes(), block)
+                .0
+                .docs
+                .into_iter()
+                .map(|(doc, _)| doc)
+                .collect();
+            assert_eq!(run, want, "hold {hold}");
         }
     }
 
@@ -6426,7 +6617,7 @@ mod pipe_tests {
             let (run, peak) = drain(&mut reader);
             assert!(peak <= front + block, "grows {grows}: window of {peak}");
             if !grows {
-                assert_eq!(reader.text_capacity(), capacity, "grown");
+                assert!(reader.text_capacity() <= capacity, "grown");
             }
             assert_eq!(seen.get(), None);
             assert_eq!(run, as_file(&text, block).0, "grows {grows}");
@@ -6545,7 +6736,12 @@ mod pipe_tests {
         let window = reader.next_window().expect("reads").expect("a window");
         assert!(window.substituted);
         assert!(window.raw.len() < text.len());
-        assert_eq!(reader.front_end, reader.buf.len());
+        // #7260: the window's text is shared with the certifying thread, so it is held, not the buffer.
+        let held = reader
+            .held
+            .as_ref()
+            .map_or(reader.buf.len(), |text| text.len());
+        assert_eq!(reader.front_end, held);
     }
 
     /// Where no thread could be started every window is certified on the filter's own thread, and the
