@@ -101867,8 +101867,8 @@ fn collect_paths(
 ///
 /// Panics past [`MAX_VALUE_TREE_DEPTH`](crate::jq::value::MAX_VALUE_TREE_DEPTH)
 /// levels of nesting (#1021, following #1005's precedent) — `path` already
-/// grows by exactly one component per descent from its sole call site
-/// (`builtin_tostream`, starting at an empty `Vec`), so its length doubles as
+/// grows by exactly one component per descent from both call sites
+/// (each starting at an empty `Vec`), so its length doubles as
 /// the recursion depth with no extra parameter needed.
 ///
 /// `path` is threaded through with push/recurse/pop rather than
@@ -101876,14 +101876,15 @@ fn collect_paths(
 /// #701 fix): every `push` is matched by exactly one `pop` on every exit path
 /// out of that iteration.
 ///
-/// The walk consumes `value` (#7260): `builtin_tostream` materialized it for
-/// this walk alone, so each leaf moves into its event instead of being copied
+/// The walk consumes `value` (#7260): its callers (`builtin_tostream`, and
+/// `eval_generic`'s jq-mode `Builtin::ToStream` arm) materialized it for this
+/// walk alone, so each leaf moves into its event instead of being copied
 /// next to a document that is dropped the moment the walk ends, and each
 /// container's storage is released as soon as its children have been taken.
 /// A key above a non-empty container is shared ([`share_path_component`]),
 /// since every event beneath it holds the key in its path; a key above a leaf
 /// is held once or twice and stays inline.
-fn collect_tostream_events(
+pub(crate) fn collect_tostream_events(
     value: OwnedValue,
     path: &mut Vec<OwnedValue>,
     events: &mut Vec<OwnedValue>,

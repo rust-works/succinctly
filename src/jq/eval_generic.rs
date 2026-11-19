@@ -94,6 +94,9 @@ use super::eval::{
     StashedVerdict, YqSemantics, DEFERRED_BIND_UNRESOLVED, MAX_RANGE_TOTAL,
 };
 use super::eval::{
+    collect_tostream_events, share_path_component, yq_yaml_unwrapped_text, LoopAbort,
+};
+use super::eval::{
     contains_retrying_pattern_bind, owned_slot_mut, starts_with_pattern_bind, static_path_steps,
     StepKey,
 };
@@ -101,7 +104,6 @@ use super::eval::{
     format_yq_commented, format_yq_props_commented, yq_encoder_prints_leading_block,
     yq_encoder_reads_spelling, yq_encoder_writes_comments, yq_props_format_style,
 };
-use super::eval::{share_path_component, yq_yaml_unwrapped_text, LoopAbort};
 #[cfg(test)]
 use super::expr::FuncDefBound;
 use super::expr::TomlCommentSource;
@@ -41476,6 +41478,33 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 ),
                 Err(e) => GenericResult::Error(e),
             }
+        }
+
+        // #7260: jq mode, where the owned walk is exact (a repeated key
+        // collapses either way). The fallback below materialized the document,
+        // wrote it out again to reindex it for `eval.rs`, and cloned every
+        // leaf out of a value the bridge still held, so the document, its
+        // text and a second copy of each leaf string were live beside the
+        // events at the peak. This materializes it the same way and hands it
+        // to `collect_tostream_events` to consume: each leaf moves into its
+        // event and each container is released once its children are taken.
+        // A value some binding still holds (#2889) is shared, and is then
+        // cloned out of exactly as before.
+        Builtin::ToStream if S::COLLAPSE_DUPLICATE_KEYS => {
+            let expr = builtin_expr(whole, builtin);
+            let rooted = reindexed_root_for::<S, _>(&expr, cursor.as_ref());
+            let owned = owned_or_suppress!(
+                bridge_input_over::<_, S>(&expr, &value, cursor, rooted.as_deref()),
+                optional
+            );
+            let mut events = Vec::new();
+            collect_tostream_events(owned, &mut Vec::new(), &mut events);
+            collapse_vec(
+                events,
+                || GenericResult::None,
+                GenericResult::Owned,
+                GenericResult::ManyOwned,
+            )
         }
 
         Builtin::LeafPaths => {
