@@ -1864,7 +1864,7 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
         let mut index = 0usize;
         while let Some((field, rest)) = fields.uncons() {
             let key = field.key();
-            if key_is_malformed(&key) {
+            if json_key_is_malformed(&key) {
                 return Err(fields.malformed_member_error());
             }
             // An undecodable key (invalid UTF-8, an invalid escape, an
@@ -1987,7 +1987,7 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
         let mut index = 0usize;
         while let Some((field, rest)) = fields.uncons() {
             let key = field.key();
-            if key_is_malformed(&key) {
+            if json_key_is_malformed(&key) {
                 return (Err(fields.malformed_member_error()), 0);
             }
             // Same undecodable-key skip as `find` above (#1247).
@@ -2024,6 +2024,15 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
         }
         (Ok(winner.map(|(_, value_cursor, _)| value_cursor)), index)
     }
+}
+
+/// [`key_is_malformed`](crate::jq::document::key_is_malformed) for a JSON key, without decoding it (#7260): its `decoded_key_str` answers
+/// `Ok(None)`, the grammar fault, exactly for a key that is not a string, and a string's decode
+/// (`Ok` or the #1247 `Err`) is not that. A field lookup asked it of every key it walked, which
+/// decoded each one a second time.
+#[inline]
+fn json_key_is_malformed<W>(key: &StandardJson<'_, W>) -> bool {
+    !matches!(key, StandardJson::String(_))
 }
 
 impl<'a, W: AsRef<[u64]>> Iterator for JsonFields<'a, W> {
@@ -3662,7 +3671,7 @@ pub type BorrowedJsonCursor<'a> = JsonCursor<'a, &'a [u64]>;
 // ============================================================================
 
 use crate::jq::document::{
-    document_token_of, effective_fields_checked, key_hash, key_is_malformed, key_span_fingerprint,
+    document_token_of, effective_fields_checked, key_hash, key_span_fingerprint,
     repeat_plan_checked, repeat_plan_from_shared, shared_key_hashes_if_any,
     trailing_element_gap_ok, DocumentCursor, DocumentElements, DocumentField, DocumentFields,
     DocumentValue, FieldFate, IndentSpec, JsonConvention, KeyHashes, PositionOf, RepeatPlan,
@@ -14865,6 +14874,42 @@ mod tests {
         };
         assert_eq!(closed.end(), 6);
         assert_eq!(closed.raw_bytes(), br#""abc""#);
+    }
+
+    /// #7260: the JSON lookups' own malformed-key test answers what the shared one does, for keys
+    /// that decode, keys that do not (#1247), and keys the grammar never allowed (#1995).
+    #[test]
+    fn json_key_is_malformed_agrees_with_the_shared_predicate_7260() {
+        use crate::jq::document::key_is_malformed;
+        for text in [
+            &br#"{"a":1}"#[..],
+            br#"{"":1}"#,
+            br#"{"a\u0062":1}"#,
+            br#"{"\ud800":1}"#,
+            br#"{"a\q":1}"#,
+            b"{\"a\xff\":1}",
+            br#"{"a":1,123:2}"#,
+            br#"{"a":1,true:2}"#,
+            br#"{"a":1,null:2}"#,
+            br#"{"a":1,[1]:2}"#,
+            br#"{"a":1,{}:2}"#,
+        ] {
+            let index = JsonIndex::build(text);
+            let root = index.root(text);
+            let StandardJson::Object(mut fields) = root.value() else {
+                panic!("an object: {:?}", String::from_utf8_lossy(text));
+            };
+            while let Some((field, rest)) = fields.uncons() {
+                let key = field.key();
+                assert_eq!(
+                    json_key_is_malformed(&key),
+                    key_is_malformed(&key),
+                    "{:?}",
+                    String::from_utf8_lossy(text)
+                );
+                fields = rest;
+            }
+        }
     }
 
     /// #7260: `decodes_to` answers what decoding the key and comparing it answers, for every
