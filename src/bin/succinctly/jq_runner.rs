@@ -11535,6 +11535,7 @@ fn file_identity(fd: std::os::fd::BorrowedFd<'_>) -> Option<(u64, u64)> {
 /// [`names_stdin`] and [`names_output`] ask of one file. A list of hundreds of files asks of each, and
 /// each such question duplicates a descriptor to read its `fstat` (three descriptors, so nine system
 /// calls a file, more than the rest of judging one), where this asks once ([`RunFiles::names`]).
+#[cfg_attr(not(unix), allow(dead_code))] // read only by the Unix descriptor checks
 struct RunFiles(Vec<(u64, u64)>);
 
 impl RunFiles {

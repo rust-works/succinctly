@@ -2965,6 +2965,7 @@ impl Reread {
     }
 
     /// Several files, each from its start, `len` bytes of it.
+    #[cfg_attr(not(unix), allow(dead_code))] // its callers read files at an offset, Unix only
     pub(super) fn new_many(files: &[(Rc<File>, u64)]) -> Self {
         let sources = files
             .iter()
@@ -3315,6 +3316,14 @@ fn seq_token_byte_in(file: &File, len: u64) -> io::Result<Option<u8>> {
         reach = TAIL_PROBE;
     }
     Ok(None)
+}
+
+/// Without positioned reads the byte is not read: the caller takes the file as
+/// [`SeqFileVerdict::Unread`], the whole-file route's, as the non-Unix [`seq_file_verdict`] takes
+/// every file as `Other`.
+#[cfg(not(unix))]
+fn seq_token_byte_in(_file: &File, _len: u64) -> io::Result<Option<u8>> {
+    Err(io::ErrorKind::Unsupported.into())
 }
 
 #[cfg(test)]

@@ -671,11 +671,13 @@ impl PlainRecords {
     }
 
     /// How many bytes of the record in progress earlier pieces held.
+    #[cfg_attr(not(unix), allow(dead_code))] // the windowed `--seq` reads are Unix only
     pub(crate) fn pending_len(&self) -> usize {
         self.record.len()
     }
 
     /// The next piece of the stream. `false` means the stream is not plain, whatever follows.
+    #[cfg_attr(not(unix), allow(dead_code))] // the windowed `--seq` reads are Unix only
     pub(crate) fn feed(&mut self, piece: &[u8]) -> bool {
         self.step(piece, false)
     }
