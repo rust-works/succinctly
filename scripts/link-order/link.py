@@ -6,8 +6,9 @@ workflow ships from Linux and macOS; that script runs this one. It runs the real
 (`cc`, or `$SUCCINCTLY_LINK_ORDER_CC`) with the arguments rustc gave it, plus one option that
 orders the executable's functions by `symbols.txt` in this directory:
 
-- Linux, when rustc links with lld (`-fuse-ld=lld`, the x86_64 default since Rust 1.90):
-  `--symbol-ordering-file`. GNU ld has no such option, so another linker gets no ordering.
+- Linux: lld's `--symbol-ordering-file`. rustc's own `-fuse-ld=lld` is used when it passes one;
+  otherwise the wrapper adds rustup's lld (`gcc-ld/ld.lld`) itself. GNU ld has no such option, so
+  a link where neither is available, or where rustc chose another `-fuse-ld`, gets no ordering.
 - macOS: ld64's `-order_file`.
 
 Why: the release build is one codegen unit with fat LTO, so the 1-2 MB of functions a query runs
@@ -23,8 +24,9 @@ define is skipped. `generate.py` regenerates the list.
 
 It steps aside (plain link) when: the output is not a `succinctly-*` file under a non-debug
 profile directory, the link makes a shared library, `SUCCINCTLY_LINK_ORDER=0`, the platform is
-neither Linux nor macOS, or anything in the resolution step fails. The resolved file and a one-line
-summary are left next to the output as `<output>.link-order.txt` and `<output>.link-order.log`.
+neither Linux nor macOS, or anything in the resolution step fails. For the release binary the
+resolved file and a one-line summary (or why it linked plain) are left next to the output as
+`<output>.link-order.txt` and `<output>.link-order.log`.
 """
 import os
 import re
@@ -70,22 +72,52 @@ def output_of(args):
     return None
 
 
-def wants_order(args, platform=sys.platform, env=os.environ):
-    """The option to add for this link, or None for a plain link."""
+def is_release_binary(args, env=os.environ):
+    """Whether this link makes the `succinctly` executable of a non-debug profile."""
     if env.get("SUCCINCTLY_LINK_ORDER", "1") == "0":
-        return None
+        return False
     if any(a in ("-shared", "-dynamiclib", "-r") or a.startswith("@") for a in args):
-        return None
+        return False
     out = output_of(args)
     if not out or not os.path.basename(out).startswith("succinctly-"):
-        return None
-    if os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(out)))) == "debug":
-        return None
-    if platform == "darwin":
-        return "-Wl,-order_file,{}"
-    if platform.startswith("linux") and "-fuse-ld=lld" in args:
-        return "-Wl,--symbol-ordering-file={}"
+        return False
+    return os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(out)))) != "debug"
+
+
+def rust_lld_dir(args):
+    """rustup's `gcc-ld` directory (an `ld.lld` that runs `rust-lld`), found from the `-L
+    <sysroot>/lib/rustlib/<target>/lib` rustc passes, or None."""
+    for i, a in enumerate(args):
+        path = args[i + 1] if a == "-L" and i + 1 < len(args) else a[2:] if a.startswith("-L") else None
+        if path and os.path.basename(os.path.dirname(os.path.dirname(path))) == "rustlib":
+            d = os.path.join(os.path.dirname(path), "bin", "gcc-ld")
+            if os.path.isfile(os.path.join(d, "ld.lld")):
+                return d
     return None
+
+
+def wants_order(args, platform=sys.platform, env=os.environ):
+    """(ordering option, other driver arguments to add, why) for this link; option None = plain.
+
+    On Linux the ordering option needs lld. rustc links x86_64 with its own lld (`-fuse-ld=lld`)
+    by default since 1.90; a link that reaches the wrapper without any `-fuse-ld` (the x86_64 perf
+    guard on rustc 1.100 linked unordered, #7260) gets rustup's lld added here instead, when the
+    toolchain ships it.
+    """
+    if not is_release_binary(args, env):
+        return None, [], "not the release binary"
+    if platform == "darwin":
+        return "-Wl,-order_file,{}", [], "ld64"
+    if not platform.startswith("linux"):
+        return None, [], f"no ordering option on {platform}"
+    if "-fuse-ld=lld" in args:
+        return "-Wl,--symbol-ordering-file={}", [], "rustc links with lld"
+    if any(a.startswith("-fuse-ld=") for a in args):
+        return None, [], "rustc chose another linker: " + next(a for a in args if a.startswith("-fuse-ld="))
+    d = rust_lld_dir(args)
+    if d:
+        return "-Wl,--symbol-ordering-file={}", ["-B" + d, "-fuse-ld=lld"], "added rustup's lld"
+    return None, [], "no lld: GNU ld has no --symbol-ordering-file"
 
 
 def objects(args):
@@ -132,28 +164,30 @@ def resolve(names, table, platform=sys.platform):
 
 
 def main(args):
-    opt = wants_order(args)
+    opt, driver, why = wants_order(args)
     extra = []
-    if opt and os.path.isfile(LIST):
+    if is_release_binary(args):
         out = output_of(args)
-        log = out + ".link-order.log"
+        msg = f"plain link: {why}\n"
+        if opt and os.path.isfile(LIST):
+            try:
+                files = objects(args)
+                mangled = text_symbols(files)
+                table = demangled_to_mangled(mangled, demangle(mangled))
+                names = read_list(LIST)
+                order, missing = resolve(names, table)
+                path = out + ".link-order.txt"
+                with open(path, "w") as f:
+                    f.write("".join(m + "\n" for m in order))
+                extra = driver + [opt.format(path)]
+                if opt.startswith("-Wl,--symbol"):
+                    extra.append("-Wl,--no-warn-symbol-ordering")
+                msg = (f"{len(names)} listed, {len(names) - missing} found, {len(order)} symbols "
+                       f"ordered ({why})\n")
+            except (OSError, ValueError, subprocess.CalledProcessError) as e:
+                extra, msg = [], f"plain link: {e}\n"
         try:
-            files = objects(args)
-            mangled = text_symbols(files)
-            table = demangled_to_mangled(mangled, demangle(mangled))
-            names = read_list(LIST)
-            order, missing = resolve(names, table)
-            path = out + ".link-order.txt"
-            with open(path, "w") as f:
-                f.write("".join(m + "\n" for m in order))
-            extra = [opt.format(path)]
-            if opt.startswith("-Wl,--symbol"):
-                extra.append("-Wl,--no-warn-symbol-ordering")
-            msg = f"{len(names)} listed, {len(names) - missing} found, {len(order)} symbols ordered\n"
-        except (OSError, ValueError, subprocess.CalledProcessError) as e:
-            extra, msg = [], f"no ordering: {e}\n"
-        try:
-            with open(log, "w") as f:
+            with open(out + ".link-order.log", "w") as f:
                 f.write(msg)
         except OSError:
             pass

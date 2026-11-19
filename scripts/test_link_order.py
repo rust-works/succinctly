@@ -23,42 +23,58 @@ class WantsOrder(unittest.TestCase):
 
     def test_release_binary_on_linux_with_lld_is_ordered(self):
         a = args_for("/t/target/release/deps/succinctly-0123abcd")
-        self.assertEqual(link.wants_order(a, "linux", self.env), "-Wl,--symbol-ordering-file={}")
+        self.assertEqual(link.wants_order(a, "linux", self.env)[:2], ("-Wl,--symbol-ordering-file={}", []))
 
     def test_cross_target_release_dir_is_ordered(self):
         a = args_for("/t/target/x86_64-unknown-linux-gnu/release/deps/succinctly-0123abcd")
-        self.assertIsNotNone(link.wants_order(a, "linux", self.env))
+        self.assertIsNotNone(link.wants_order(a, "linux", self.env)[0])
 
     def test_macos_uses_order_file(self):
         a = ["-arch", "arm64", "x.o", "-o", "/t/target/release/deps/succinctly-0123abcd"]
-        self.assertEqual(link.wants_order(a, "darwin", self.env), "-Wl,-order_file,{}")
+        self.assertEqual(link.wants_order(a, "darwin", self.env)[0], "-Wl,-order_file,{}")
 
     def test_gnu_ld_gets_no_option(self):
         # GNU ld has no --symbol-ordering-file; passing it would fail the link.
         a = ["x.o", "-o", "/t/target/release/deps/succinctly-0123abcd"]
-        self.assertIsNone(link.wants_order(a, "linux", self.env))
+        self.assertIsNone(link.wants_order(a, "linux", self.env)[0])
+
+    def test_rustup_lld_is_added_when_rustc_names_no_linker(self):
+        with tempfile.TemporaryDirectory() as root:
+            lib = os.path.join(root, "lib", "rustlib", "x86_64-unknown-linux-gnu", "lib")
+            gcc_ld = os.path.join(root, "lib", "rustlib", "x86_64-unknown-linux-gnu", "bin", "gcc-ld")
+            os.makedirs(lib)
+            os.makedirs(gcc_ld)
+            open(os.path.join(gcc_ld, "ld.lld"), "w").close()
+            a = ["x.o", "-L", lib, "-o", "/t/target/release/deps/succinctly-0123abcd"]
+            opt, driver, _ = link.wants_order(a, "linux", self.env)
+            self.assertEqual(opt, "-Wl,--symbol-ordering-file={}")
+            self.assertEqual(driver, ["-B" + gcc_ld, "-fuse-ld=lld"])
+
+    def test_another_chosen_linker_is_respected(self):
+        a = ["x.o", "-fuse-ld=mold", "-o", "/t/target/release/deps/succinctly-0123abcd"]
+        self.assertIsNone(link.wants_order(a, "linux", self.env)[0])
 
     def test_debug_profile_is_left_alone(self):
         a = args_for("/t/target/debug/deps/succinctly-0123abcd")
-        self.assertIsNone(link.wants_order(a, "linux", self.env))
+        self.assertIsNone(link.wants_order(a, "linux", self.env)[0])
 
     def test_other_outputs_are_left_alone(self):
         for out in ("/t/target/release/deps/libserde_derive-01.so", "/t/target/release/deps/jq_cli_tests-01",
                     "/t/target/release/build/foo-01/build_script_build-01"):
-            self.assertIsNone(link.wants_order(args_for(out), "linux", self.env), out)
+            self.assertIsNone(link.wants_order(args_for(out), "linux", self.env)[0], out)
 
     def test_shared_library_and_response_file_are_left_alone(self):
         out = "/t/target/release/deps/succinctly-0123abcd"
-        self.assertIsNone(link.wants_order(args_for(out, "-shared"), "linux", self.env))
-        self.assertIsNone(link.wants_order(args_for(out, "@/tmp/args"), "linux", self.env))
+        self.assertIsNone(link.wants_order(args_for(out, "-shared"), "linux", self.env)[0])
+        self.assertIsNone(link.wants_order(args_for(out, "@/tmp/args"), "linux", self.env)[0])
 
     def test_opt_out(self):
         a = args_for("/t/target/release/deps/succinctly-0123abcd")
-        self.assertIsNone(link.wants_order(a, "linux", {"SUCCINCTLY_LINK_ORDER": "0"}))
+        self.assertIsNone(link.wants_order(a, "linux", {"SUCCINCTLY_LINK_ORDER": "0"})[0])
 
     def test_windows_is_left_alone(self):
         a = args_for("/t/target/release/deps/succinctly-0123abcd")
-        self.assertIsNone(link.wants_order(a, "win32", self.env))
+        self.assertIsNone(link.wants_order(a, "win32", self.env)[0])
 
 
 class Norm(unittest.TestCase):
