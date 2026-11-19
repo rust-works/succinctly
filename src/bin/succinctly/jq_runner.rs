@@ -618,6 +618,19 @@ fn strerror_only(e: &std::io::Error) -> String {
     }
 }
 
+/// `--slurpfile`'s values read from the file a chunk at a time (#7260), so the run never holds the
+/// whole text beside the values it builds, as jq's reader never does; `None` for a file that is not
+/// a regular file (a pipe cannot be read a second time) or whose text the one-pass reader declines,
+/// which [`read_arg_file`] and [`parse_json_stream`] then read and word as before. A value that
+/// reader accepts is one the general route builds the same way: plain RFC 8259 text, valid UTF-8,
+/// no byte-order mark, no repeated key.
+fn slurp_file_in_chunks(file: &str) -> Option<Vec<OwnedValue>> {
+    if !std::fs::metadata(file).ok()?.is_file() {
+        return None;
+    }
+    jq::parse_plain_stream_from(std::fs::File::open(file).ok()?)
+}
+
 /// Read `--slurpfile`/`--rawfile`'s file argument, wrapped in jq's own
 /// `Bad JSON in --<flag> <name> <file>: Could not open <file>: <detail>`
 /// shape on a read failure (#3051, confirmed live for both flags) -- one
@@ -5383,25 +5396,37 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         // empty buffer for each file and is handed their windows.
         let mut windowed: Option<window::WindowedFiles> = None;
         let mut reread: Option<std::rc::Rc<window::Reread>> = None;
+        // #7260: a document the program's first stage builds whole, read into that tree a chunk at a
+        // time, so the run holds neither its text nor its index (see [`text_free_document`]).
+        let mut text_free: Option<(OwnedValue, InputLocation)> = None;
         let (files, mut raw_inputs, mut failures) = match seq_plain.take() {
             Some(prepared) => prepared,
-            None => match seq_windowed.take().or_else(|| windowed_plain_file(&args)) {
-                Some((files, reader, again)) => {
-                    windowed = Some(reader);
-                    reread = Some(again);
-                    // One empty buffer for each file: the windows are what the loop reads, and the
-                    // files after the one it is at are all empty to the check for the last value.
-                    let buffers = vec![Vec::new(); files.len().max(1)];
-                    (files, buffers, Vec::new())
+            None => match (seq_windowed.is_none())
+                .then(|| text_free_document(&args, &expr, &output_config))
+                .flatten()
+            {
+                Some((files, value, at)) => {
+                    text_free = Some((value, at));
+                    (files, vec![Vec::new()], Vec::new())
                 }
-                None => {
-                    let files = get_input_files(&args);
-                    if files.is_empty() {
-                        (files, vec![read_stdin_bytes()?], Vec::new())
-                    } else {
-                        read_input_files(&files, false)
+                None => match seq_windowed.take().or_else(|| windowed_plain_file(&args)) {
+                    Some((files, reader, again)) => {
+                        windowed = Some(reader);
+                        reread = Some(again);
+                        // One empty buffer for each file: the windows are what the loop reads, and the
+                        // files after the one it is at are all empty to the check for the last value.
+                        let buffers = vec![Vec::new(); files.len().max(1)];
+                        (files, buffers, Vec::new())
                     }
-                }
+                    None => {
+                        let files = get_input_files(&args);
+                        if files.is_empty() {
+                            (files, vec![read_stdin_bytes()?], Vec::new())
+                        } else {
+                            read_input_files(&files, false)
+                        }
+                    }
+                },
             },
         };
         // A slurp reads every file in the one fetch that meets the first failure, so it
@@ -5675,7 +5700,10 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             // A slurped input is already split: the one span is the whole
             // synthesized array, and scanning it again would be a second pass
             // over the entire input for nothing.
-            let (mut values, split_error) = if slurped.is_some() {
+            let (mut values, split_error) = if text_free.is_some() {
+                // #7260: the one document, read already; its text was never held.
+                (vec![(0, 0)], None)
+            } else if slurped.is_some() {
                 (vec![(0, raw.len())], None)
             } else if let Some(split) = window_split {
                 split
@@ -5785,6 +5813,49 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     }
                     output_config.write_identity_bytes(&mut out, json_bytes)?;
                     out.write_all(b"\n")?;
+                    continue;
+                }
+
+                // #7260: the document read a chunk at a time, evaluated where it lies.
+                if let Some((value, location)) = text_free.take() {
+                    let at = LazyLocation::resolved(locator, end, location);
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        evaluate_owned_document(
+                            value,
+                            &expr,
+                            &at,
+                            &mut sink,
+                            &mut |sink: &mut ErrorSink, v: OwnedValue| -> Result<bool> {
+                                had_output = true;
+                                if args.exit_status {
+                                    last_output = Some(OwnedValue::Bool(!matches!(
+                                        v,
+                                        OwnedValue::Null | OwnedValue::Bool(false)
+                                    )));
+                                }
+                                let stop = route_write_error(
+                                    sink,
+                                    &mut out,
+                                    || at.get().clone(),
+                                    |o| write_output_owned_value(o, &v, &output_config),
+                                )?;
+                                Ok(!stop)
+                            },
+                        )
+                    }));
+                    match outcome {
+                        Ok(written) => written?,
+                        Err(payload) => {
+                            let Some(message) = depth_guard_panic_message(&*payload) else {
+                                std::panic::resume_unwind(payload);
+                            };
+                            sink.report(DiagStyle::Jq, &EvalError::new(message), at.get());
+                        }
+                    }
+                    if let Some(code) = sink.halted() {
+                        out.flush()?;
+                        return Ok(halt_exit_code(code, open_failed));
+                    }
                     continue;
                 }
 
@@ -6746,12 +6817,17 @@ fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
                     .next()
                     .filter(|pair| !context.named.contains_key(&pair[0]))
                 {
-                    let contents = read_arg_file("slurpfile", name, file)?;
-                    let values = parse_json_stream(&contents).map_err(|e| {
-                        BuildContextError::Usage(format!(
-                            "Bad JSON in --slurpfile {name} {file}: {e:#}"
-                        ))
-                    })?;
+                    let values = match slurp_file_in_chunks(file) {
+                        Some(values) => values,
+                        None => {
+                            let contents = read_arg_file("slurpfile", name, file)?;
+                            parse_json_stream(&contents).map_err(|e| {
+                                BuildContextError::Usage(format!(
+                                    "Bad JSON in --slurpfile {name} {file}: {e:#}"
+                                ))
+                            })?
+                        }
+                    };
                     context
                         .named
                         .insert(name.clone(), OwnedValue::array_from(values));
@@ -11883,6 +11959,90 @@ fn could_hold(len: u64) -> bool {
     usize::try_from(len).is_ok_and(|len| Vec::<u8>::new().try_reserve_exact(len).is_ok())
 }
 
+/// The one document of a run whose program builds it whole first (#7260), read into that tree a
+/// chunk at a time, with the location a diagnostic about it names; `None` for every other run,
+/// which reads its input as before.
+///
+/// A program whose first stage is an assignment or `del` ([`first_stage_owns_document`]) builds
+/// the input as an owned tree on the cursor route too, and from then on reads only that tree: the
+/// text and its semi-index the route had built first were held to the end of the run for nothing,
+/// 6.9 MB and 3.1 MB beside a 45 MB tree for a 7 MB file of records, where jq holds the tree and a
+/// 4 KiB read buffer. Here neither is built. The tree is the one the cursor route builds, by the
+/// reader that route uses for a plain document ([`jq::parse_plain_document_from`]).
+///
+/// Taken only for a lone regular file named on the command line, which can be read a second time:
+/// whatever the one-pass reader declines (a leniency, a repeated key, a byte-order mark, a second
+/// value, nesting past its limit, a fault, a read that fails) is read again from its start by the
+/// route that always read it, which then decides every message, position and exit code. Every flag
+/// that reads the stream differently keeps its own route.
+///
+/// [`first_stage_owns_document`]: jq::eval_generic::first_stage_owns_document
+fn text_free_document(
+    args: &JqCommand,
+    expr: &jq::Expr,
+    output_config: &OutputConfig,
+) -> Option<(Vec<PathBuf>, OwnedValue, InputLocation)> {
+    if args.slurp
+        || args.validate
+        || args.seq
+        || args.null_input
+        || output_config.convention.preserves_source_values()
+        || lazy_route_forced_off()
+        || !jq::eval_generic::first_stage_owns_document(expr)
+    {
+        return None;
+    }
+    let files = get_input_files(args);
+    let (path, _) = lone_regular_file(&files, 0)?;
+    let file = std::fs::File::open(path).ok()?;
+    let (value, end) = jq::parse_plain_document_from(file)?;
+    let at = InputLocation::at(Some(&input_display_name(path)), document_end_line(&end));
+    Some((files, value, at))
+}
+
+/// [`LineCounter::read_end_line`] for a document read a chunk at a time, from what the reader
+/// noted where the value completes (#7260): the line breaks before that byte, and one more when the
+/// next line break ends the same `fgets` read of jq's.
+fn document_end_line(end: &jq::DocumentEnd) -> usize {
+    let same_read = end.next_newline.is_some_and(|next| {
+        next < end.len
+            && (next - end.line_start) / JQ_READ_CHUNK
+                == (end.completes_at - end.line_start) / JQ_READ_CHUNK
+    });
+    end.newlines_before + usize::from(same_read)
+}
+
+/// [`evaluate_bytes_streaming`] for the document [`text_free_document`] read (#7260): the program
+/// runs on the tree it is handed, each output goes to `on_value`, and the control it ends with is
+/// reported as that function reports it.
+fn evaluate_owned_document(
+    value: OwnedValue,
+    expr: &jq::Expr,
+    at: &LazyLocation<'_, '_>,
+    sink: &mut ErrorSink,
+    on_value: &mut dyn FnMut(&mut ErrorSink, OwnedValue) -> Result<bool>,
+) -> Result<()> {
+    let mut write_err: Option<anyhow::Error> = None;
+    let control =
+        jq::eval_generic::eval_each_owned_document(expr, value, &mut |v| match on_value(sink, v) {
+            Ok(keep_going) => keep_going,
+            Err(e) => {
+                write_err = Some(e);
+                false
+            }
+        });
+    match control {
+        None => {}
+        Some(jq::Control::Error(e)) => sink.report(DiagStyle::Jq, &e, at.get()),
+        Some(jq::Control::Break(label)) => sink.report_break(DiagStyle::Jq, &label, at.get()),
+        Some(jq::Control::Halt(code)) => sink.request_halt(code),
+    }
+    if let Some(e) = write_err {
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// The regular files the plain route reads a window at a time (#6920), opened, and the means to read
 /// them again for a fault's wording, with the file list the run then has (the paths, or none for a
 /// standard input that is a regular file, #7024); or `None` for a run that is not one: a pipe, a
@@ -12952,6 +13112,15 @@ impl<'l, 'a> LazyLocation<'l, 'a> {
             locator,
             end,
             resolved: OnceCell::new(),
+        }
+    }
+
+    /// A value whose location the caller worked out as it read the value (#7260).
+    fn resolved(locator: &'l ValueLocator<'a>, end: usize, location: InputLocation) -> Self {
+        Self {
+            locator,
+            end,
+            resolved: OnceCell::from(location),
         }
     }
 

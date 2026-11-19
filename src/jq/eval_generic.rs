@@ -14919,6 +14919,102 @@ fn eval_each_owned_input_in(
     })
 }
 
+/// Whether a jq program's first stage builds the whole input as an owned tree on the cursor route
+/// anyway (#7260): an assignment (`=`, `op=`, `//=`, `|=`) or `del(..)`, alone or at the head of a
+/// pipe. Such a program gains nothing from the input's text and semi-index once that tree is
+/// built, so the CLI may build the tree straight from the text, a chunk at a time
+/// ([`eval_each_owned_document`]). A program that reads the input stream or a cursor's position
+/// is not one, whatever its first stage.
+///
+/// `tojson` builds the tree too, and is left out on purpose: reading it this way lowered the peak
+/// on glibc (89.5 to 81.2 MB at 10 MB, 7950X) but raised Apple's resident set from 78.5 to 106 MB
+/// (M4 Pro): the first tree, freed for the string, stays resident as reusable pages that the
+/// second (`fromjson`'s) does not reuse, where the cursor route's order of allocations does.
+///
+/// Not a supported entry point.
+#[doc(hidden)]
+pub fn first_stage_owns_document(expr: &Expr) -> bool {
+    let first = match unwrap_paren(expr) {
+        Expr::Pipe(stages) => match stages.first() {
+            Some(first) => unwrap_paren(first),
+            None => return false,
+        },
+        other => other,
+    };
+    let owns = match first {
+        Expr::Assign { .. } | Expr::CompoundAssign { .. } | Expr::AlternativeAssign { .. } => true,
+        Expr::Update { .. } => update_takes_owned_door::<JqSemantics>(first),
+        Expr::Builtin(Builtin::Del(_)) => true,
+        _ => false,
+    };
+    owns && !crate::jq::walk::uses_input_builtins(expr)
+        && !crate::jq::walk::uses_cursor_metadata_builtins(expr)
+}
+
+/// [`eval_each_owned_input`] for an input the caller hands over (#7260): a program whose first
+/// stage is an assignment the owned route answers writes into `input` itself, as the cursor
+/// route's bridge does with the tree it builds (`bridge_to_each_owned_flow`), instead of copying
+/// every container on the path of a shared one.
+///
+/// Not a supported entry point.
+#[doc(hidden)]
+pub fn eval_each_owned_document(
+    expr: &Expr,
+    input: OwnedValue,
+    on_value: &mut dyn FnMut(OwnedValue) -> bool,
+) -> Option<Control> {
+    with_anchor_scope::<JqSemantics, _>(expr, || {
+        match super::path_mode::route(expr) {
+            Route::Interpreter => return super::path_mode::run_program(expr, input, on_value),
+            Route::Refused(e) => return Some(Control::Error(e)),
+            Route::Shipped => {}
+        }
+        let (first, rest) = match unwrap_paren(expr) {
+            Expr::Pipe(stages) => match stages.split_first() {
+                Some((first, rest)) if !rest.is_empty() => (unwrap_paren(first), Some(rest)),
+                _ => (expr, None),
+            },
+            other => (other, None),
+        };
+        let input = match super::eval::owned_assign_moved::<JqSemantics>(first, input) {
+            super::eval::OwnedStep::Handled(Ok(value)) => return run_rest(value, rest, on_value),
+            super::eval::OwnedStep::Handled(Err(error)) => return Some(Control::Error(error)),
+            super::eval::OwnedStep::Declined(input) => input,
+        };
+        // A `del` of a static path deletes in `input` itself, as the bridge's does (#5549).
+        let input = match super::eval::owned_del_step::<JqSemantics>(first, input) {
+            super::eval::OwnedStep::Handled(Ok(value)) => return run_rest(value, rest, on_value),
+            super::eval::OwnedStep::Handled(Err(error)) => return Some(Control::Error(error)),
+            super::eval::OwnedStep::Declined(input) => input,
+        };
+        match eval_each_owned_input_in(expr, &input, on_value, false) {
+            OwnedInput::Answered(control) => control,
+            OwnedInput::Declined => None,
+        }
+    })
+}
+
+/// The stages of a pipe after its first, on the one value the first answered
+/// ([`eval_each_owned_document`]); the value itself when there are none.
+fn run_rest(
+    value: OwnedValue,
+    rest: Option<&[Expr]>,
+    on_value: &mut dyn FnMut(OwnedValue) -> bool,
+) -> Option<Control> {
+    let Some(rest) = rest else {
+        on_value(value);
+        return None;
+    };
+    let rest = match rest {
+        [one] => Cow::Borrowed(one),
+        more => Cow::Owned(Expr::Pipe(more.to_vec().into())),
+    };
+    match eval_each_owned_input_in(&rest, &value, on_value, false) {
+        OwnedInput::Answered(control) => control,
+        OwnedInput::Declined => None,
+    }
+}
+
 /// [`eval_each_with_cursor_using`] inside the anchor scope it opens (#3134).
 fn eval_each_with_cursor_unscoped<S: EvalSemantics, C: DocumentCursor>(
     expr: &Expr,

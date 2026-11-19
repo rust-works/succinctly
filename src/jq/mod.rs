@@ -94,11 +94,17 @@ mod go_regex;
 mod go_sort;
 mod go_time;
 mod json_fast;
+#[cfg(feature = "std")]
+mod json_fast_stream;
 pub(crate) use eval_generic::SiblingShape;
 #[doc(hidden)]
 pub use json_fast::{parse_plain, parse_plain_stream};
 pub(crate) use json_fast::{
     parse_plain_at, parse_plain_sized, plain_value_end, PLAIN_END_MAX_DEPTH,
+};
+#[cfg(feature = "std")]
+pub(crate) use json_fast_stream::{
+    parse_plain_document_from, parse_plain_stream_from, DocumentEnd,
 };
 mod key_index;
 mod lazy;
