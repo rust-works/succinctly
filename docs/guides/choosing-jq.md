@@ -32,7 +32,7 @@ regenerated and a claim stops holding: change the claim, or the advice, in the s
 | `input` taken once and the rest of the stream abandoned        | jq                                           | `succinctly jq` is slower (0.64x to 0.91x)                                                               |
 | Strict RFC 8259 input                                          | either, with `--validate` on `succinctly jq` | neither is strict by default                                                                             |
 | Features new in jq 1.8                                         | jq 1.8                                       | `succinctly jq` follows 1.7.1                                                                            |
-| Binary size                                                    | jq                                           | 10x to 24x smaller                                                                                       |
+| Binary size                                                    | jq                                           | 23x to 27x smaller (stripped)                                                                            |
 
 ## By category
 
@@ -143,7 +143,13 @@ agrees on every one of 447 `jq.test` programs. Rows: the secondary differential 
 
 <!-- claim: binary-size -->
 
-`succinctly jq` is 30.4 MB on x86_64 Linux, 26.7 MB on aarch64 Linux and 24.9 MB on macOS; jq 1.7.1 is 2.7 MB, 2.7 MB and 1.1 MB (about 11x, 10x and 24x).
+Stripped as `release.yml` strips the archive, the release build (`--features cli`) at `73f049b2c` is 24.8 MB on x86_64
+Linux and 19.9 MB on macOS, against jq 1.7.1's 0.91 MB and 0.85 MB: about 27x and 23.5x (measured in
+[#7383](https://github.com/rust-works/succinctly/pull/7383); aarch64 Linux was not measured stripped). Section H of the
+committed reports sizes the files as built, 30.4 MB, 26.7 MB and 24.9 MB against 2.7 MB, 2.7 MB and 1.1 MB, which
+understates the gap on Linux by more than half: the pinned jq builds keep their debug info, two thirds of jq's file there.
+A report from a run after #7383 also sizes every binary stripped, the harness's own build (which adds `bench-runner`) for
+`succinctly jq`, and the test reads that size where a report has it.
 
 ## Neither is strict by default
 

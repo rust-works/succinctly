@@ -77,13 +77,15 @@ fn is_macos(report: &Value) -> bool {
     report["env"]["system"]["os"] == "macos"
 }
 
+/// A tool's binary size: stripped as the release archive is where the report has it (#7383), as
+/// built otherwise.
 fn binary_bytes(report: &Value, tool: &str) -> f64 {
     report["operational"]["binaries"]
         .as_array()
         .expect("binaries")
         .iter()
         .find(|b| b["tool"] == tool)
-        .and_then(|b| b["bytes"].as_f64())
+        .and_then(|b| b["stripped_bytes"].as_f64().or_else(|| b["bytes"].as_f64()))
         .unwrap_or_else(|| panic!("no binary size for {tool}"))
 }
 
@@ -240,7 +242,8 @@ const CLAIMS: &[Claim] = &[
         );
         matching < total && matching / total > 0.8 && primary["total"] == primary["matching"]
     }),
-    // 10x to 24x: more than eight times the size of jq 1.7.1 (the Neoverse-V2 build is 10.0x).
+    // 23x to 27x stripped (10x to 24x as built): more than eight times the size of jq 1.7.1 either way. A
+    // report from a run after #7383 carries stripped sizes, and the check reads them where present.
     ("binary-size", |r| {
         binary_bytes(r, "succinctly jq") > 8.0 * binary_bytes(r, "jq-1.7.1")
     }),
