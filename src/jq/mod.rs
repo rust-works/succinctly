@@ -97,7 +97,9 @@ mod json_fast;
 pub(crate) use eval_generic::SiblingShape;
 #[doc(hidden)]
 pub use json_fast::{parse_plain, parse_plain_stream};
-pub(crate) use json_fast::{parse_plain_at, parse_plain_sized, plain_value_end};
+pub(crate) use json_fast::{
+    parse_plain_at, parse_plain_sized, plain_value_end, PLAIN_END_MAX_DEPTH,
+};
 mod key_index;
 mod lazy;
 mod local_zone;

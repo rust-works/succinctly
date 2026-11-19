@@ -204,6 +204,12 @@ impl Skip<'_> {
     fn string(&mut self) -> Option<()> {
         self.at += 1;
         loop {
+            // The run of ordinary bytes up to the next quote, backslash or control byte.
+            let run = self.bytes.get(self.at..)?;
+            self.at += run
+                .iter()
+                .position(|&b| b == b'"' || b == b'\\' || b < 0x20)
+                .unwrap_or(run.len());
             match *self.bytes.get(self.at)? {
                 b'"' => {
                     self.at += 1;
@@ -226,8 +232,8 @@ impl Skip<'_> {
                         _ => return None,
                     }
                 }
-                0..=0x1f => return None,
-                _ => self.at += 1,
+                // The run stopped at a control byte.
+                _ => return None,
             }
         }
     }

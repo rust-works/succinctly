@@ -16366,13 +16366,16 @@ fn lazy_json_scan_chunk(raw: &str, from: usize, budget: usize) -> LazyChunk {
         }
     }
     // A document too deep to convert lazily ends the lazy prefix there.
-    let shallow = spans
-        .iter()
-        .take_while(|&&(start, end)| {
-            end - start <= LAZY_JSON_SHALLOW_LEN
-                || json_depth_at_most(&bytes[start..end], LAZY_JSON_MAX_DEPTH)
-        })
-        .count();
+    // The documents the one pass checked are no deeper than it follows, which is within the limit.
+    const _: () = assert!(jq::PLAIN_END_MAX_DEPTH <= LAZY_JSON_MAX_DEPTH);
+    let shallow = checked
+        + spans[checked..]
+            .iter()
+            .take_while(|&&(start, end)| {
+                end - start <= LAZY_JSON_SHALLOW_LEN
+                    || json_depth_at_most(&bytes[start..end], LAZY_JSON_MAX_DEPTH)
+            })
+            .count();
     if shallow < spans.len() {
         fault = true;
         open_tail = false;
