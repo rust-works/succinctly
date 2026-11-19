@@ -46,6 +46,13 @@ const _: () = assert!(MAX_DEPTH <= super::eval_generic::MAX_NESTING_DEPTH);
 /// `text` as an [`OwnedValue`] if it is one plain JSON value, optionally surrounded by JSON
 /// whitespace; `None` when it is anything else, for the caller's general route to decide.
 pub fn parse_plain(text: &str) -> Option<OwnedValue> {
+    parse_plain_sized(text, 0)
+}
+
+/// [`parse_plain`], with room for `capacity` members if the value is an object (#7260): a stream
+/// of records sizes each document's map from the ones before it, as an array sizes its elements'
+/// ([`SiblingShape`], #5594), instead of growing every record's map from empty.
+pub(crate) fn parse_plain_sized(text: &str, capacity: usize) -> Option<OwnedValue> {
     let mut reader = Reader {
         text: Some(text),
         bytes: text.as_bytes(),
@@ -53,7 +60,7 @@ pub fn parse_plain(text: &str) -> Option<OwnedValue> {
         nodes: 0,
     };
     reader.space();
-    let value = reader.value(0)?;
+    let value = reader.value_sized(0, capacity)?;
     reader.space();
     (reader.at == reader.bytes.len()).then_some(value)
 }
@@ -103,6 +110,187 @@ pub(crate) fn parse_plain_at(bytes: &[u8], start: usize) -> Option<(OwnedValue, 
     };
     let value = reader.value(0)?;
     Some((value, reader.nodes - 1))
+}
+
+/// How deep [`plain_value_end`] follows a value; deeper is the caller's general route's.
+///
+/// Below every ceiling a parser the stream loaders cross-check against has (serde's 128 levels,
+/// [`MAX_DEPTH`]), so a value it accepts is one each of them reads whole.
+pub(crate) const PLAIN_END_MAX_DEPTH: usize = 64;
+
+/// Where the plain RFC 8259 value at `bytes[start]` ends, if it is one: checked as the reader
+/// checks it, and built into nothing (#7260). `None` for anything else, a value nested deeper
+/// than [`PLAIN_END_MAX_DEPTH`] and a string holding a surrogate escape included, for the caller's
+/// general route to decide.
+///
+/// What follows the value is not looked at. The lazy `inputs` scan finds a document and checks it
+/// with this one pass, where it ran the splitter and then serde over the same text.
+pub(crate) fn plain_value_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut skip = Skip { bytes, at: start };
+    skip.value(0)?;
+    Some(skip.at)
+}
+
+/// [`plain_value_end`]'s walk: the grammar [`Reader`] reads, without building the value.
+struct Skip<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl Skip<'_> {
+    #[inline]
+    fn space(&mut self) {
+        while matches!(self.bytes.get(self.at), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.at += 1;
+        }
+    }
+
+    fn value(&mut self, depth: usize) -> Option<()> {
+        match *self.bytes.get(self.at)? {
+            b'{' => self.object(depth),
+            b'[' => self.array(depth),
+            b'"' => self.string(),
+            b't' => self.word(b"true"),
+            b'f' => self.word(b"false"),
+            b'n' => self.word(b"null"),
+            b'-' | b'0'..=b'9' => self.number(),
+            _ => None,
+        }
+    }
+
+    fn word(&mut self, word: &[u8]) -> Option<()> {
+        let end = self.at + word.len();
+        (self.bytes.get(self.at..end)? == word).then(|| self.at = end)
+    }
+
+    fn digits(&mut self) -> usize {
+        let start = self.at;
+        while matches!(self.bytes.get(self.at), Some(b'0'..=b'9')) {
+            self.at += 1;
+        }
+        self.at - start
+    }
+
+    /// `-? (0 | [1-9][0-9]*) (\.[0-9]+)? ([eE][+-]?[0-9]+)?`
+    fn number(&mut self) -> Option<()> {
+        if self.bytes.get(self.at) == Some(&b'-') {
+            self.at += 1;
+        }
+        match *self.bytes.get(self.at)? {
+            b'0' => self.at += 1,
+            b'1'..=b'9' => {
+                self.digits();
+            }
+            _ => return None,
+        }
+        if self.bytes.get(self.at) == Some(&b'.') {
+            self.at += 1;
+            if self.digits() == 0 {
+                return None;
+            }
+        }
+        if matches!(self.bytes.get(self.at), Some(b'e' | b'E')) {
+            self.at += 1;
+            if matches!(self.bytes.get(self.at), Some(b'+' | b'-')) {
+                self.at += 1;
+            }
+            if self.digits() == 0 {
+                return None;
+            }
+        }
+        Some(())
+    }
+
+    fn string(&mut self) -> Option<()> {
+        self.at += 1;
+        loop {
+            match *self.bytes.get(self.at)? {
+                b'"' => {
+                    self.at += 1;
+                    return Some(());
+                }
+                b'\\' => {
+                    match *self.bytes.get(self.at + 1)? {
+                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => self.at += 2,
+                        b'u' => {
+                            let hex = self.bytes.get(self.at + 2..self.at + 6)?;
+                            // A surrogate half is the general route's, as it is the reader's.
+                            if !hex.iter().all(u8::is_ascii_hexdigit)
+                                || matches!(hex[0], b'd' | b'D')
+                                    && matches!(hex[1], b'8'..=b'9' | b'a'..=b'f' | b'A'..=b'F')
+                            {
+                                return None;
+                            }
+                            self.at += 6;
+                        }
+                        _ => return None,
+                    }
+                }
+                0..=0x1f => return None,
+                _ => self.at += 1,
+            }
+        }
+    }
+
+    fn array(&mut self, depth: usize) -> Option<()> {
+        if depth >= PLAIN_END_MAX_DEPTH {
+            return None;
+        }
+        self.at += 1;
+        self.space();
+        if self.bytes.get(self.at) == Some(&b']') {
+            self.at += 1;
+            return Some(());
+        }
+        loop {
+            self.space();
+            self.value(depth + 1)?;
+            self.space();
+            match *self.bytes.get(self.at)? {
+                b',' => self.at += 1,
+                b']' => {
+                    self.at += 1;
+                    return Some(());
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    fn object(&mut self, depth: usize) -> Option<()> {
+        if depth >= PLAIN_END_MAX_DEPTH {
+            return None;
+        }
+        self.at += 1;
+        self.space();
+        if self.bytes.get(self.at) == Some(&b'}') {
+            self.at += 1;
+            return Some(());
+        }
+        loop {
+            self.space();
+            if self.bytes.get(self.at) != Some(&b'"') {
+                return None;
+            }
+            self.string()?;
+            self.space();
+            if self.bytes.get(self.at) != Some(&b':') {
+                return None;
+            }
+            self.at += 1;
+            self.space();
+            self.value(depth + 1)?;
+            self.space();
+            match *self.bytes.get(self.at)? {
+                b',' => self.at += 1,
+                b'}' => {
+                    self.at += 1;
+                    return Some(());
+                }
+                _ => return None,
+            }
+        }
+    }
 }
 
 struct Reader<'a> {
@@ -370,6 +558,68 @@ mod tests {
                 Err(_) => false,
             },
         }
+    }
+
+    /// The lazy scan checks a document against serde's reader of nothing ([`IgnoredAny`]), and so
+    /// does this.
+    ///
+    /// [`IgnoredAny`]: serde::de::IgnoredAny
+    ///
+    /// For a container, the values the lazy scan asks about: [`plain_value_end`] either declines,
+    /// or ends it where serde's stream reader ends it, and it accepts every one the reader builds
+    /// that holds no surrogate escape (#7260). (A scalar's end is where serde would look at the
+    /// byte after it, which the caller decides.)
+    #[cfg(feature = "serde")]
+    fn end_agrees(text: &str) -> bool {
+        let bytes = text.as_bytes();
+        let start = bytes
+            .iter()
+            .take_while(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+            .count();
+        if !matches!(bytes.get(start), Some(b'{' | b'[')) {
+            return true;
+        }
+        let end = plain_value_end(bytes, start);
+        let mut stream =
+            serde_json::Deserializer::from_str(&text[start..]).into_iter::<serde::de::IgnoredAny>();
+        let serde_end = matches!(stream.next(), Some(Ok(_))).then(|| start + stream.byte_offset());
+        if end.is_some() && end != serde_end {
+            return false;
+        }
+        if !text.to_ascii_lowercase().contains("\\ud") && parse_plain(text).is_some() {
+            return end == Some(text.trim_end_matches([' ', '\t', '\n', '\r']).len());
+        }
+        true
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn plain_value_end_is_where_serde_ends_the_value_7260() {
+        for text in [
+            "{}",
+            "[]",
+            "{\"a\":1,\"b\":[true,null,{\"c\":\"d\"}]} x",
+            "[1, 2.5e-3, -0, \"\\n\\u0041\"]]",
+            "{\"a\":1,\"a\":2}",
+            "[1,]",
+            "[01]",
+            "[1.]",
+            "[\"\\ud83d\\ude00\"]",
+            "[\"a\nb\"]",
+            "[nan]",
+            "{\"a\" 1}",
+        ] {
+            assert!(end_agrees(text), "ends differ on {text:?}");
+        }
+        assert_eq!(plain_value_end(b"[1] [2]", 0), Some(3));
+        assert_eq!(plain_value_end(b"[1] [2]", 4), Some(7));
+        assert_eq!(plain_value_end(br#"{"a":{"b":[]}}"#, 0), Some(14));
+        // Deeper than the limit, a surrogate escape, a repeated key the reader declines: the caller's.
+        let deep = |n: usize| alloc::format!("{}{}", "[".repeat(n), "]".repeat(n));
+        assert!(plain_value_end(deep(PLAIN_END_MAX_DEPTH).as_bytes(), 0).is_some());
+        assert!(plain_value_end(deep(PLAIN_END_MAX_DEPTH + 1).as_bytes(), 0).is_none());
+        assert!(plain_value_end(br#"["\ud83d\ude00"]"#, 0).is_none());
+        assert!(plain_value_end(br#"{"a":1,"a":2}"#, 0).is_some());
     }
 
     #[test]
@@ -707,6 +957,8 @@ mod tests {
                 accepted += 1;
             }
             assert!(agrees(&text), "differs on {text:?}");
+            #[cfg(feature = "serde")]
+            assert!(end_agrees(&text), "ends differ on {text:?}");
         }
         assert!(
             accepted > 3_000,
