@@ -26804,28 +26804,49 @@ fn format_csv<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<St
     }
 }
 
+/// `@tsv`'s escaping of a string field: a backslash, tab, line feed and carriage return are written
+/// `\\`, `\t`, `\n` and `\r`, and a NUL as [`escape_nul`] writes it (#647, #5302).
+fn push_tsv_escaped<S: EvalSemantics>(out: &mut String, s: &str) {
+    let mut from = 0;
+    for (at, byte) in s.bytes().enumerate() {
+        let escape = match byte {
+            b'\\' => "\\\\",
+            b'\t' => "\\t",
+            b'\n' => "\\n",
+            b'\r' => "\\r",
+            0 if S::TAG != EvalTag::Yq => "\\0",
+            _ => continue,
+        };
+        out.push_str(&s[from..at]);
+        out.push_str(escape);
+        from = at + 1;
+    }
+    out.push_str(&s[from..]);
+}
+
 /// @tsv - TSV format (for arrays)
 fn format_tsv<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
     if S::TAG == EvalTag::Yq {
         return format_yq_csv::<S>(value, '\t', false);
     }
     match value {
+        // One string for the row (#7260): each field is written into it, where it used to be a
+        // `String` of its own, joined, with four `replace` copies of every string field.
         OwnedValue::Array(arr) => {
-            let parts = arr
-                .iter()
-                .map(|v| {
-                    format_csv_row_element::<S>(v, |s| {
-                        escape_nul::<S>(
-                            &s.replace('\\', "\\\\")
-                                .replace('\t', "\\t")
-                                .replace('\n', "\\n")
-                                .replace('\r', "\\r"),
-                        )
-                        .into_owned()
-                    })
-                })
-                .collect::<Result<Vec<String>, EvalError>>()?;
-            Ok(parts.join("\t"))
+            let mut row = String::new();
+            for (at, v) in arr.iter().enumerate() {
+                if at > 0 {
+                    row.push('\t');
+                }
+                match v {
+                    OwnedValue::String(s) => push_tsv_escaped::<S>(&mut row, s),
+                    // A string never reaches the quoting function, which is here only for the type.
+                    other => {
+                        row.push_str(&format_csv_row_element::<S>(other, |s| String::from(s))?);
+                    }
+                }
+            }
+            Ok(row)
         }
         _ if optional => Ok(String::new()),
         // #929: confirmed live: `5 | @tsv` raises "number (5) cannot be
@@ -91159,7 +91180,8 @@ fn owned_to_expr_at_depth(value: &OwnedValue, depth: usize) -> Expr {
         // #1062: `repr` is already parsed on the source `OwnedValue` --
         // carried straight through instead of discarded and re-derived.
         OwnedValue::NumberLiteral(repr, text) => {
-            Expr::Literal(Literal::NumberLiteral(*repr, text.to_string()))
+            // `String::from` and not `to_string`, which formats the text through `Display` (#7260).
+            Expr::Literal(Literal::NumberLiteral(*repr, String::from(&**text)))
         }
         OwnedValue::String(s) => Expr::Literal(Literal::String(s.clone())),
         OwnedValue::Array(arr) => {

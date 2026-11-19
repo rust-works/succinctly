@@ -1709,7 +1709,7 @@ const MAX_SIBLING_CAPACITY: usize = 16;
 /// the first object that turns out smaller than the room it was given ends the
 /// guessing for the rest of the array: at most one map per array is oversized.
 #[derive(Default)]
-pub(super) struct SiblingShape {
+pub(crate) struct SiblingShape {
     last: usize,
     before_last: usize,
     overshot: bool,
@@ -1717,7 +1717,7 @@ pub(super) struct SiblingShape {
 
 impl SiblingShape {
     /// How many members to make room for in the next element's map.
-    pub(super) fn capacity(&self) -> usize {
+    pub(crate) fn capacity(&self) -> usize {
         if !self.overshot && self.last == self.before_last {
             self.last
         } else {
@@ -1727,7 +1727,7 @@ impl SiblingShape {
 
     /// Record an element that was given room for `given` members and holds
     /// `members` if it is an object (`None` for anything else).
-    pub(super) fn push(&mut self, members: Option<usize>, given: usize) {
+    pub(crate) fn push(&mut self, members: Option<usize>, given: usize) {
         let members = members.unwrap_or(0);
         self.overshot |= members < given;
         self.before_last = self.last;

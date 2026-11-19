@@ -581,6 +581,12 @@ DEFAULT_THRESHOLD = 5.0
 # scan and re-render its comment above names. Remove the override once `main` carries the change
 # and the row reads ~0% against a merge-base that includes it.
 #
+# `users_path_walk` (#7260) carries an override of the same one-off kind: a field lookup over a
+# semi-indexed object compares an unescaped key's bytes with the name instead of decoding every key
+# (and checking it is a string instead of decoding it again), so `.users[] | .age` does less work per
+# record (-13.4% x86_64 / -12.1% ARM64-Linux against the PR's own merge-base, outputs byte-identical).
+# Remove it once `main` carries the change and the row reads ~0% against a merge-base that includes it.
+#
 # `seq_name_bad_last` (#6619) carries a TIGHTER threshold than the default (3.0 against 5.0), the one
 # override here that is not a loosening. #6594 (#6500) converts each record as the queue is read
 # instead of materializing every record first, and what that saves is mostly peak memory (1.1 GB
@@ -600,6 +606,7 @@ QUERY_THRESHOLDS = {
     "users_update_select": 30.0,
     "users_yq_del_select": 15.0,
     "users_compact_latefail": 85.0,
+    "users_path_walk": 20.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant

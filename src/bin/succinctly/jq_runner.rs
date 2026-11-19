@@ -14781,11 +14781,21 @@ fn lazy_json_producer_then(
         // the batch is built when a document is not, and serves the documents it covers, so a
         // declined document is not parsed twice and a run of them reads as it did.
         let batched = cursor.batch.as_ref().is_some_and(|b| cursor.next < b.end);
+        let capacity = cursor.siblings.capacity();
         let plain = if batched {
             None
         } else {
-            lazy.text.get(start..end).and_then(jq::parse_plain)
+            lazy.text
+                .get(start..end)
+                .and_then(|text| jq::parse_plain_sized(text, capacity))
         };
+        if let Some(value) = &plain {
+            let members = match value {
+                OwnedValue::Object(map) => Some(map.len()),
+                _ => None,
+            };
+            cursor.siblings.push(members, capacity);
+        }
         if plain.is_none() && !batched {
             cursor.batch = Some(LazyBatch::build(
                 bytes,
@@ -15177,6 +15187,8 @@ struct LazyCursor {
     batch: Option<LazyBatch>,
     /// How much text the next batch covers.
     batch_bytes: usize,
+    /// The member counts of the documents before, which size the next one's map (#7260).
+    siblings: jq::SiblingShape,
 }
 
 impl Default for LazyCursor {
@@ -15186,6 +15198,7 @@ impl Default for LazyCursor {
             lines: None,
             batch: None,
             batch_bytes: LAZY_BATCH_FIRST_BYTES,
+            siblings: jq::SiblingShape::default(),
         }
     }
 }
@@ -16318,38 +16331,57 @@ fn lazy_json_scan_chunk(raw: &str, from: usize, budget: usize) -> LazyChunk {
         return none;
     }
     let bytes = raw.as_bytes();
-    let (mut spans, split_error, stopped) =
-        split_json_values_until(bytes, from, from.saturating_add(budget));
+    let stop_at = from.saturating_add(budget);
+    // #7260: a run of containers of plain text is found and checked in one pass each, where the
+    // splitter and then serde read every document. Both would agree with it: such a container ends
+    // where its brackets match, and serde reads it whole.
+    let (mut spans, plain_end, plain_stopped) = plain_container_prefix(bytes, from, stop_at);
+    let (more, split_error, stopped) = if plain_stopped {
+        (Vec::new(), None, true)
+    } else if bytes[plain_end..]
+        .iter()
+        .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+    {
+        // The text ends with the run: what the splitter answers there.
+        (Vec::new(), None, false)
+    } else {
+        split_json_values_until(bytes, plain_end, stop_at)
+    };
+    let checked = spans.len();
+    spans.extend(more);
     #[cfg(test)]
     LAZY_BYTES_SCANNED.with(|n| n.set(n.get() + spans.last().map_or(0, |&(_, end)| end - from)));
     let mut fault = split_error.is_some();
     // The splitter's fault is at a container or string that the text does not finish.
     let mut open_tail = split_error.is_some_and(|at| matches!(bytes[at], b'{' | b'[' | b'"'));
     // Where the two parsers stop agreeing on a document's end, the stream stops being lazy.
-    if let (Some(&(first, _)), Some(&(_, last))) = (spans.first(), spans.last()) {
+    if let (Some(&(first, _)), Some(&(_, last))) = (spans.get(checked), spans.last()) {
         let mut stream = serde_json::Deserializer::from_str(&raw[first..last])
             .into_iter::<serde::de::IgnoredAny>();
-        let agreed = spans
+        let agreed = spans[checked..]
             .iter()
             .take_while(|&&(_, end)| {
                 stream.next().is_some_and(|value| value.is_ok())
                     && first + stream.byte_offset() == end
             })
             .count();
-        if agreed < spans.len() {
+        if checked + agreed < spans.len() {
             fault = true;
             open_tail = false;
-            spans.truncate(agreed);
+            spans.truncate(checked + agreed);
         }
     }
     // A document too deep to convert lazily ends the lazy prefix there.
-    let shallow = spans
-        .iter()
-        .take_while(|&&(start, end)| {
-            end - start <= LAZY_JSON_SHALLOW_LEN
-                || json_depth_at_most(&bytes[start..end], LAZY_JSON_MAX_DEPTH)
-        })
-        .count();
+    // The documents the one pass checked are no deeper than it follows, which is within the limit.
+    const _: () = assert!(jq::PLAIN_END_MAX_DEPTH <= LAZY_JSON_MAX_DEPTH);
+    let shallow = checked
+        + spans[checked..]
+            .iter()
+            .take_while(|&&(start, end)| {
+                end - start <= LAZY_JSON_SHALLOW_LEN
+                    || json_depth_at_most(&bytes[start..end], LAZY_JSON_MAX_DEPTH)
+            })
+            .count();
     if shallow < spans.len() {
         fault = true;
         open_tail = false;
@@ -16381,6 +16413,39 @@ fn lazy_json_scan_chunk(raw: &str, from: usize, budget: usize) -> LazyChunk {
         spans,
         end,
         open_tail: open_tail && fault,
+    }
+}
+
+/// The documents of `bytes` from `from` that are objects or arrays of plain RFC 8259 text
+/// ([`jq::plain_value_end`]), up to the first that is not, and where the next document (or the
+/// white space before it) starts. Stops, as [`split_json_values_until`] does, after the first that
+/// ends at `stop_at` or later, which the flag says (#7260).
+///
+/// Each is the span that splitter finds for it and that serde reads, so [`lazy_json_scan_chunk`]
+/// checks only the documents after these with the two.
+fn plain_container_prefix(
+    bytes: &[u8],
+    from: usize,
+    stop_at: usize,
+) -> (Vec<(usize, usize)>, usize, bool) {
+    let mut spans = spans_with_room(stop_at.min(bytes.len()).saturating_sub(from));
+    let mut pos = from;
+    loop {
+        let mut start = pos;
+        while matches!(bytes.get(start), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            start += 1;
+        }
+        if !matches!(bytes.get(start), Some(b'{' | b'[')) {
+            return (spans, pos, false);
+        }
+        let Some(end) = jq::plain_value_end(bytes, start) else {
+            return (spans, pos, false);
+        };
+        spans.push((start, end));
+        pos = end;
+        if end >= stop_at {
+            return (spans, pos, true);
+        }
     }
 }
 
