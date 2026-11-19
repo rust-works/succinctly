@@ -16,7 +16,12 @@ use std::process::{Command, Stdio};
 #[derive(Debug, Clone, Serialize)]
 pub struct BinaryInfo {
     pub tool: String,
+    /// The file as built: `cargo build --release` keeps the symbol table, and the pinned jq builds
+    /// keep their debug info, which is two thirds of jq's file on Linux.
     pub bytes: u64,
+    /// A copy stripped with plain `strip`, as `release.yml` strips the archive's binary: the size
+    /// to compare (#7383). `None` where `strip` cannot run (Windows, or no `strip` on `PATH`).
+    pub stripped_bytes: Option<u64>,
     pub dynamic_libs: Vec<String>,
 }
 
@@ -383,6 +388,12 @@ pub fn collect(
             Some(BinaryInfo {
                 tool: t.name.clone(),
                 bytes,
+                // Its own parent: `StrippedCopy` names its directory by pid, and the timed copy lives under
+                // `target/compare` itself.
+                stripped_bytes: stripped_bytes(
+                    Path::new(&t.program),
+                    &root.join("target/compare/sizes"),
+                ),
                 dynamic_libs: dynamic_libs(&t.program),
             })
         })
@@ -407,9 +418,54 @@ pub fn collect(
     })
 }
 
+/// The size of a copy of `exe` stripped as the release archive is, made under `parent` and removed
+/// before this returns. Unstripped sizes are not comparable: a debug-info jq on Linux is three times
+/// its stripped size, the succinctly binary 1.15 times, so the two as built read 11x apart where the
+/// shipped binaries are 27x (#7383).
+fn stripped_bytes(exe: &Path, parent: &Path) -> Option<u64> {
+    if !cfg!(unix) {
+        return None;
+    }
+    let copy = super::stripped::StrippedCopy::of(exe, parent).ok()?;
+    std::fs::metadata(copy.path()).ok().map(|m| m.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stripped size is the size of a smaller copy, and the copy is gone afterwards. The test
+    /// binary is a debug build, so it carries a symbol table to strip.
+    #[test]
+    #[cfg(unix)]
+    fn the_stripped_size_is_of_a_smaller_copy_that_does_not_outlive_it_7383() {
+        let me = std::env::current_exe().unwrap();
+        let built = std::fs::metadata(&me).unwrap().len();
+        let parent =
+            std::env::temp_dir().join(format!("stripped-size-test-{}", std::process::id()));
+        let stripped = stripped_bytes(&me, &parent).expect("a stripped size");
+        assert!(
+            stripped < built,
+            "{stripped} bytes stripped, {built} as built"
+        );
+        assert_eq!(
+            std::fs::read_dir(&parent).unwrap().count(),
+            0,
+            "the copy outlived the call"
+        );
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn a_binary_that_is_not_there_has_no_stripped_size_7383() {
+        let parent =
+            std::env::temp_dir().join(format!("stripped-missing-test-{}", std::process::id()));
+        assert_eq!(
+            stripped_bytes(Path::new("/no/such/binary-7383"), &parent),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&parent);
+    }
 
     #[test]
     fn otool_and_ldd_output_are_parsed() {
