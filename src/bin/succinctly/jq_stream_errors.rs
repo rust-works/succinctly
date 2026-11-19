@@ -1132,6 +1132,13 @@ struct Fed {
 /// code is not evicted by the program's between every two.
 const PAUSE_EVENTS: usize = 32;
 
+/// A byte `scan` treats inside a string only by adding it to the token: not a quote, a backslash,
+/// a line feed (which counts a line) or an RS (which ends a `--seq` record).
+#[inline]
+fn is_plain_string_byte(b: u8) -> bool {
+    !matches!(b, b'"' | b'\\' | b'\n' | RS)
+}
+
 /// How far [`Parser::feed_from`] got: to the end of its refill, or to a pause after a value.
 enum Feeding {
     Done(Fed),
@@ -1325,7 +1332,12 @@ impl Parser {
         let mut first_call = true;
         let mut errored = false;
         let mut call_start = true;
+        // Where a run of string bytes read in one step ends (#7260).
+        let mut run_end = from;
         for (index, &ch) in chunk.iter().enumerate().skip(from) {
+            if index < run_end {
+                continue;
+            }
             let last = index + 1 == chunk.len();
             if call_start && self.bom == BOM_MALFORMED {
                 // `jv_parser_next` begins by wiping the state of a parser whose mark broke off,
@@ -1344,6 +1356,18 @@ impl Parser {
                 if ch == RS {
                     self.st = St::Normal;
                 }
+                continue;
+            }
+            if self.st == St::Str && is_plain_string_byte(ch) {
+                // #7260: what `scan` does to each byte of a run inside a string that holds no
+                // quote, backslash, line feed or RS (the bytes it treats apart): a column each,
+                // added to the token, the state left `Str`.
+                run_end = chunk[index..]
+                    .iter()
+                    .position(|&b| !is_plain_string_byte(b))
+                    .map_or(chunk.len(), |n| index + n);
+                self.column += run_end - index;
+                self.token_extend(&chunk[index..run_end]);
                 continue;
             }
             match self.scan(ch) {
@@ -1541,6 +1565,16 @@ impl Parser {
     /// any other depth the path has already answered.
     fn check_truncation(&self) -> bool {
         !self.path.is_empty()
+    }
+
+    /// [`token_add`](Self::token_add) of each of `bytes`, the buffer grown as it would grow
+    /// byte by byte.
+    fn token_extend(&mut self, bytes: &[u8]) {
+        while self.token_len + bytes.len() > self.token_buf.len() {
+            self.token_buf.resize(self.token_buf.len() * 2 + 256, 0);
+        }
+        self.token_buf[self.token_len..self.token_len + bytes.len()].copy_from_slice(bytes);
+        self.token_len += bytes.len();
     }
 
     /// jq's `tokenadd`, growth policy included.
