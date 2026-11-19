@@ -1320,6 +1320,10 @@ pub(super) struct SeqTail {
     /// The byte the records before it left at index 1 of jq's token buffer
     /// ([`crate::cli::jq_seq_reader::token_byte_after`]).
     pub token_byte: Option<u8>,
+    /// Where in `stream` the RS the tail opens with is, when jq's reader met it with a value pending:
+    /// a stretch read before it warned there, which the windows have printed
+    /// ([`crate::cli::jq_seq_reader::seed_faulted_rs`], #7260).
+    pub faulted_rs: Option<usize>,
     /// Where `stream` was first allocated, and the room it had before the tail was read, so a test can
     /// tell the tail was read into it in place (a pointer alone does not: a large buffer can be grown in
     /// place by `mremap` on Linux).
@@ -1785,6 +1789,10 @@ impl WindowedFile {
         let mut bytes = crate::cli::jq_seq_reader::resumed_front(lines, self.buf.len() - at + left);
         #[cfg(test)]
         let (reserved_at, reserved_room) = (bytes.as_ptr() as usize, bytes.capacity());
+        // #7260: a warning met at the RS the tail opens with is a stretch's, which ended there.
+        let faulted_rs = (self.buf.get(at) == Some(&RS)
+            && self.notes.iter().any(|&(met, _)| met == at))
+        .then_some(bytes.len());
         bytes.extend_from_slice(&self.buf[at..]);
         // The windows' buffer keeps only the text still to be handed out, so the run does not hold its
         // room beside the tail.
@@ -1808,6 +1816,7 @@ impl WindowedFile {
             stream: bytes,
             error,
             token_byte: gate.token_byte,
+            faulted_rs,
         });
         at
     }

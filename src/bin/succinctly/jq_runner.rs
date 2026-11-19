@@ -12348,6 +12348,7 @@ fn hand_on_seq_pipe_tail(args: &JqCommand) -> bool {
         return false;
     };
     crate::cli::jq_seq_reader::seed_token_byte(tail.token_byte);
+    crate::cli::jq_seq_reader::seed_faulted_rs(tail.faulted_rs);
     let stream = tail.stream;
     let named = get_input_files(args);
     if let [path] = named.as_slice() {

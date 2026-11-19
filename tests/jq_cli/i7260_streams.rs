@@ -236,3 +236,36 @@ fn field_arrays_and_keys_of_a_windowed_seq_file_read_as_read_whole_7260() -> Res
     );
     Ok(())
 }
+
+/// A stretch that runs to the stream's end and ends at an RS with a value pending: jq's reader meets
+/// that RS as the end of a truncated value, so the bare number after it is read on to the end of the
+/// stream, where jq warns that it may be truncated. The tail handed on at that RS used to read it as an
+/// RS with nothing pending, which in jq's last read ends the stream (#2998), and the warning was lost:
+/// a file of 4 MiB or more did that before the windows were taken from 64 KiB. jq 1.7.1's output.
+#[test]
+fn a_seq_file_whose_stretch_ends_at_its_last_rs_reads_on_to_its_end_7260() -> Result<()> {
+    let truncated = |line: usize| {
+        format!("jq: ignoring parse error: Truncated value at line {line}, column 1\n")
+    };
+    let at_eof = |line: usize, column: usize| {
+        format!("jq: ignoring parse error: Potentially truncated top-level numeric value at EOF at line {line}, column {column}\n")
+    };
+    let rows: [(&str, &str, String); 3] = [
+        ("\x1e{\"\\\n\x1enan", "", truncated(2002) + &at_eof(2002, 4)),
+        (
+            "\x1e{\"\\\n\x1e\x1e7",
+            "",
+            truncated(2002) + &at_eof(2002, 3),
+        ),
+        (
+            "\x1e1 2\n\x1e{\"\\\n\x1e1",
+            "\x1e1\n\x1e2\n",
+            truncated(2003) + &at_eof(2003, 2),
+        ),
+    ];
+    for (tail, out, err) in rows {
+        let stream = format!("{}{tail}", records(0..RECORDS)).into_bytes();
+        assert_eq!(seq(ODD, &stream)?, (out.to_string(), err, 0), "{tail:?}");
+    }
+    Ok(())
+}
