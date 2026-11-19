@@ -28,7 +28,7 @@
 
 use core::ops::{Index, Range, RangeFrom};
 
-use crate::output::Terminator;
+use crate::cli::output::Terminator;
 
 const RESET: &str = "\x1b[0m";
 const CYAN: &str = "\x1b[36m";

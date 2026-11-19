@@ -371,7 +371,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         // Before measuring anything: a machine with no block of its own would
         // otherwise find out only when the run is over.
         let doc = std::fs::read_to_string(root.join(docs::BENCHMARKS_DOC))?;
-        let cpu = crate::bench_runner::metadata::collect_system_info().cpu;
+        let cpu = crate::cli::bench_runner::metadata::collect_system_info().cpu;
         docs::check_block_cpu(&doc, &format!("jq-{}", docs::PLATFORM), &cpu)
             .map_err(|e| anyhow::anyhow!("--write-docs: {}: {e}", docs::BENCHMARKS_DOC))?;
     }
@@ -1004,7 +1004,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
     }
 
     let run_id = {
-        let t = crate::bench_runner::utils::now_utc_fmt("%Y%m%d_%H%M%S");
+        let t = crate::cli::bench_runner::utils::now_utc_fmt("%Y%m%d_%H%M%S");
         format!(
             "{t}_{}{}",
             env.git.commit_short,

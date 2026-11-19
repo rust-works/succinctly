@@ -2299,7 +2299,7 @@ fn spawn_eval_thread() -> Result<std::thread::JoinHandle<Result<()>>> {
         .context("failed to spawn the evaluation thread")
 }
 
-fn main() -> Result<()> {
+pub fn main() -> Result<()> {
     #[cfg(all(target_arch = "x86_64", target_feature = "popcnt"))]
     require_popcnt();
     malloc_arena::use_one();

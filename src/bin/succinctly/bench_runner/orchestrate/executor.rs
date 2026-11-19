@@ -11,7 +11,7 @@ use super::config::{load_config, Architecture, BenchmarkOverride, Config, NodeCo
 use super::scheduler::{schedule_node, Wave};
 use super::ssh::RemoteExec;
 use super::sync::{sync_node, BuildRunner};
-use crate::bench_runner::registry::BenchmarkInfo;
+use crate::cli::bench_runner::registry::BenchmarkInfo;
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::{Path, PathBuf};
@@ -158,7 +158,7 @@ pub(crate) fn run_orchestrate_with(
 
     let meta = RunMetadata {
         run_id: run_id.clone(),
-        git_commit: crate::bench_runner::metadata::collect_git_info()
+        git_commit: crate::cli::bench_runner::metadata::collect_git_info()
             .ok()
             .map(|g| g.commit),
         config_path: args.config.display().to_string(),
@@ -174,11 +174,11 @@ pub(crate) fn run_orchestrate_with(
 }
 
 fn run_id_now() -> String {
-    crate::bench_runner::utils::now_local_fmt("%Y-%m-%dT%H-%M-%S")
+    crate::cli::bench_runner::utils::now_local_fmt("%Y-%m-%dT%H-%M-%S")
 }
 
 fn timestamp_now() -> String {
-    crate::bench_runner::utils::now_utc_rfc3339()
+    crate::cli::bench_runner::utils::now_utc_rfc3339()
 }
 
 /// Select nodes matching `--node`/`--arch`, defaulting to all configured
@@ -197,7 +197,7 @@ fn select_nodes<'a>(config: &'a Config, args: &OrchestrateArgs) -> Vec<&'a NodeC
 /// Select benchmarks from `--all` or positional args, warning (not failing)
 /// on names not present in the registry.
 fn select_benchmarks(args: &OrchestrateArgs) -> Vec<&'static BenchmarkInfo> {
-    use crate::bench_runner::registry::{filter_by_names, BENCHMARKS};
+    use crate::cli::bench_runner::registry::{filter_by_names, BENCHMARKS};
 
     if args.all {
         return BENCHMARKS.iter().collect();

@@ -30,7 +30,7 @@ pub struct BenchmarkOverride {
     /// added to this struct can't silently reset isolation via
     /// `#[serde(default)]` on a bare (non-`Option`) enum.
     #[serde(default)]
-    pub isolation: Option<crate::bench_runner::registry::Isolation>,
+    pub isolation: Option<crate::cli::bench_runner::registry::Isolation>,
 }
 
 /// Coordinator-wide settings.

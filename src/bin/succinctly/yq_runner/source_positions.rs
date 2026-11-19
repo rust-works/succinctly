@@ -21,7 +21,7 @@ use succinctly::jq::{self, Expr};
 use succinctly::yaml::{YamlCursor, YamlIndex, YamlValue};
 
 use super::{gathered_file_indices, resolve_run_input_format, GatheredSource};
-use crate::InputFormat;
+use crate::cli::InputFormat;
 
 type Cursor<'a> = YamlCursor<'a, Vec<u64>>;
 

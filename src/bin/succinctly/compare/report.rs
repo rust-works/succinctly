@@ -1573,7 +1573,7 @@ mod tests {
 
     fn timed(name: &str, median: f64, rss: u64, private: u64) -> ToolResult {
         ToolResult {
-            stats: Some(crate::compare::harness::Stats {
+            stats: Some(crate::cli::compare::harness::Stats {
                 n: 3,
                 min_ms: median,
                 median_ms: median,

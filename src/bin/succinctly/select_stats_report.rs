@@ -24,7 +24,7 @@ use succinctly::json::JsonIndex;
 use succinctly::select_stats::{self, Histogram, Site};
 use succinctly::yaml::{YamlCursor, YamlIndex, YamlValue};
 
-use crate::corpus_stats::{classify, collect_files};
+use crate::cli::corpus_stats::{classify, collect_files};
 
 /// Traverse every JSON node, materialising each one's text position.
 ///

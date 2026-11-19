@@ -9,7 +9,7 @@
 //! any network access.
 
 use super::config::NodeConfig;
-use crate::exit_status::exit_code_or_signal_death;
+use crate::cli::exit_status::exit_code_or_signal_death;
 use anyhow::{Context, Result};
 use std::fs;
 use std::io::Read;

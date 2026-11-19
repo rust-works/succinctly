@@ -33,7 +33,7 @@ use succinctly::json::JsonIndex;
 
 use super::m2_gate::can_use_m2_streaming;
 use super::{JqCommand, OnError};
-use crate::output::{
+use crate::cli::output::{
     self, escape_json_string, escape_json_string_ascii, exit_codes, flush_then_err, ColorScheme,
     DiagStyle, ErrorSink, InputLocation, JsonFormatOpts, LoudFlushWriter, StreamFault, Terminator,
 };
@@ -3204,9 +3204,9 @@ impl OutputConfig {
         };
 
         // Priority is documented on `resolve_color`.
-        let color_output = crate::env_config::resolve_color(
-            crate::env_config::ColorChoice::from_flags(args.monochrome_output, args.color_output),
-            crate::env_config::no_color_from_env(),
+        let color_output = crate::cli::env_config::resolve_color(
+            crate::cli::env_config::ColorChoice::from_flags(args.monochrome_output, args.color_output),
+            crate::cli::env_config::no_color_from_env(),
             std::io::stdout().is_terminal(),
         );
 
@@ -4517,7 +4517,7 @@ fn get_error_line(input: &[u8], line: usize, column: usize) -> Option<(String, u
     let line_content = &text[line_start..line_end];
 
     // Truncate long lines (on character boundaries, #5988)
-    let (display_content, caret_offset) = crate::error_snippet::truncate_line(line_content, column);
+    let (display_content, caret_offset) = crate::cli::error_snippet::truncate_line(line_content, column);
 
     Some((display_content, caret_offset))
 }
@@ -6386,14 +6386,14 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                         // and the main loop when it is the one that pops it.
                         jq::InputPop::ParseError(error)
                             if seq_by_stream_reader(&args)
-                                && error.message == crate::jq_seq_reader::MESSAGELESS_RETURN =>
+                                && error.message == crate::cli::jq_seq_reader::MESSAGELESS_RETURN =>
                         {
                             break;
                         }
                         jq::InputPop::ParseError(error) if seq_stream_warns => {
                             eprintln!(
                                 "{}",
-                                crate::jq_seq_reader::ignored_parse_error(&error.message)
+                                crate::cli::jq_seq_reader::ignored_parse_error(&error.message)
                             );
                             continue;
                         }
@@ -6403,7 +6403,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                             if !seq_warning_unread {
                                 eprintln!(
                                     "{}",
-                                    crate::jq_seq_reader::ignored_parse_error(&error.message)
+                                    crate::cli::jq_seq_reader::ignored_parse_error(&error.message)
                                 );
                             }
                             break;
@@ -6413,12 +6413,12 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                         // stream holds -- but the reader's message-less return ends jq's main
                         // loop, whatever follows it.
                         jq::InputPop::ParseError(error) if seq_faults_warn => {
-                            if error.message == crate::jq_seq_reader::MESSAGELESS_RETURN {
+                            if error.message == crate::cli::jq_seq_reader::MESSAGELESS_RETURN {
                                 break;
                             }
                             eprintln!(
                                 "{}",
-                                crate::jq_seq_reader::ignored_parse_error(&error.message)
+                                crate::cli::jq_seq_reader::ignored_parse_error(&error.message)
                             );
                             continue;
                         }
@@ -6635,7 +6635,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 } else if t.seq_warning {
                     eprintln!(
                         "{}",
-                        crate::jq_seq_reader::ignored_parse_error(&t.error.message)
+                        crate::cli::jq_seq_reader::ignored_parse_error(&t.error.message)
                     );
                 } else if t.as_parse_error {
                     sink.report_parse_error(&t.error.message);
@@ -7209,8 +7209,8 @@ fn read_inputs(
                 )
                 .unwrap_or(u32::MAX),
                 files: tags,
-                reader: crate::jq_stream_errors::Reader::from_source(Box::new(
-                    crate::jq_stream_errors::ChunkedSources::new(readers)
+                reader: crate::cli::jq_stream_errors::Reader::from_source(Box::new(
+                    crate::cli::jq_stream_errors::ChunkedSources::new(readers)
                         .with_tail(unopened_tail, tail_is_source),
                 )),
                 raise_errors: !args.stream_errors,
@@ -7794,13 +7794,13 @@ fn read_inputs(
                 // leaves `WAITING_FOR_RS`, so no value can exist. Only
                 // read under `-s` below, so the walk is skipped
                 // otherwise.
-                args.slurp && crate::jq_seq_reader::slurp_eof_position_lost(&raw_bytes)
+                args.slurp && crate::cli::jq_seq_reader::slurp_eof_position_lost(&raw_bytes)
             }
             None => {
                 // #6137: a program that reads `input`/`inputs` meets each fault as an input,
                 // as under `-n`, so it is queued rather than printed here.
                 let queue_faults = seq_faults_queued(args, track_eof);
-                let ends = crate::jq_seq_reader::source_ends(&raw_bytes);
+                let ends = crate::cli::jq_seq_reader::source_ends(&raw_bytes);
                 // #6620: the walk the clean check made is this one when it queued the same faults
                 // over the same bytes, from a first source that opened; its warnings are queued as
                 // faults, which this route's own would not have printed.
@@ -7815,11 +7815,11 @@ fn read_inputs(
                     walk.place_values(&raw_bytes);
                     *walk
                 } else {
-                    crate::jq_seq_reader::walk_stream_collecting_at(
+                    crate::cli::jq_seq_reader::walk_stream_collecting_at(
                         &raw_bytes,
                         args.slurp,
                         queue_faults,
-                        crate::jq_seq_reader::Tail::of(unopened_tail),
+                        crate::cli::jq_seq_reader::Tail::of(unopened_tail),
                         &mut |warning, at| {
                             // #6589: jq's main loop reads no further after a warning once a file has
                             // failed to open.
@@ -7828,7 +7828,7 @@ fn read_inputs(
                             }
                             // The source the warning was met in: a failure before it is reported
                             // first, as jq's reader opens the files in order.
-                            let source = if at == crate::jq_seq_reader::AT_EOF {
+                            let source = if at == crate::cli::jq_seq_reader::AT_EOF {
                                 usize::MAX
                             } else {
                                 ends.partition_point(|&end| end <= at)
@@ -7857,11 +7857,11 @@ fn read_inputs(
         // `-R` are excluded from both gates identically. That combination
         // skips the warnings but still needs the values and `-s`'s
         // location, so it runs the walk here with a no-op sink.
-        let walk = crate::jq_seq_reader::walk_stream_collecting(
+        let walk = crate::cli::jq_seq_reader::walk_stream_collecting(
             &raw_bytes,
             args.slurp,
             true,
-            crate::jq_seq_reader::Tail::of(unopened_tail),
+            crate::cli::jq_seq_reader::Tail::of(unopened_tail),
             &mut |_| {},
         );
         seq_values = walk.values;
@@ -7897,7 +7897,7 @@ fn read_inputs(
         if seq_stream_shape {
             seq_slurp_position_lost
         } else {
-            crate::jq_seq_reader::slurp_eof_position_lost(&raw_bytes)
+            crate::cli::jq_seq_reader::slurp_eof_position_lost(&raw_bytes)
         }
     };
 
@@ -7912,7 +7912,7 @@ fn read_inputs(
         // And the end-of-stream stop (#2998) is a barrier in that queue, behind which the stream
         // goes on (#6141); a run that never reads an input ends at it. A slurp's loop reads on past
         // that stop (`stops_on_empty`), so the barrier never comes up there.
-        let read = crate::jq_stream_errors::read_seq(
+        let read = crate::cli::jq_stream_errors::read_seq(
             &raw_bytes,
             args.slurp,
             args.stream_errors,
@@ -7962,7 +7962,7 @@ fn read_inputs(
                             .count();
                     held_open_failures.iter().all(|&(at, _)| at <= last) || reads_behind <= 1
                 });
-        let eof_term_dropped = |fault: &crate::jq_stream_errors::SeqFault| -> bool {
+        let eof_term_dropped = |fault: &crate::cli::jq_stream_errors::SeqFault| -> bool {
             eof_term_after_failures
                 && fault.after_array
                 && fault.message.starts_with("Unfinished JSON term at EOF")
@@ -8015,7 +8015,7 @@ fn read_inputs(
                 }
                 eprintln!(
                     "{}",
-                    crate::jq_seq_reader::ignored_parse_error(&fault.message)
+                    crate::cli::jq_seq_reader::ignored_parse_error(&fault.message)
                 );
             } else if slurp_stopped
                 || (eof_term_dropped(&fault)
@@ -8108,8 +8108,8 @@ fn read_inputs(
                     files: raw_bytes.iter().map(|(file, _)| *file).collect(),
                     last_source: u32::try_from(locations.files().len().saturating_sub(1))
                         .unwrap_or(u32::MAX),
-                    reader: crate::jq_stream_errors::Reader::from_source(Box::new(
-                        crate::jq_stream_errors::MemorySources::new(raw_bytes),
+                    reader: crate::cli::jq_stream_errors::Reader::from_source(Box::new(
+                        crate::cli::jq_stream_errors::MemorySources::new(raw_bytes),
                     )),
                     raise_errors: stream_by_reader,
                 });
@@ -8120,7 +8120,7 @@ fn read_inputs(
         // faults the slurp loop meets come first, one per call, then the array, then whatever the
         // loop left for the calls after it. A program that never asks for one prints its result.
         if args.slurp && args.null_input && stream_by_reader {
-            let read = crate::jq_stream_errors::read_for_deferred_slurp(&raw_bytes);
+            let read = crate::cli::jq_stream_errors::read_for_deferred_slurp(&raw_bytes);
             let place = |at| stream_location(&raw_bytes, at);
             let fault = |message: String, at: (usize, usize)| {
                 let (source, line) = place(at);
@@ -8147,12 +8147,12 @@ fn read_inputs(
             locations.push(source, line);
             for item in read.after {
                 match item {
-                    crate::jq_stream_errors::Afterwards::Value(value, at) => {
+                    crate::cli::jq_stream_errors::Afterwards::Value(value, at) => {
                         let (source, line) = place(at);
                         locations.push(source, line);
                         values.push(value);
                     }
-                    crate::jq_stream_errors::Afterwards::Fault(message, at) => {
+                    crate::cli::jq_stream_errors::Afterwards::Fault(message, at) => {
                         resumed.push((values.len(), fault(message, at)));
                     }
                 }
@@ -8160,9 +8160,9 @@ fn read_inputs(
             return Ok(Ok((values, locations, None, resumed)));
         }
         let mut read = if args.slurp {
-            crate::jq_stream_errors::read_for_slurp(&raw_bytes, stream_by_reader)
+            crate::cli::jq_stream_errors::read_for_slurp(&raw_bytes, stream_by_reader)
         } else {
-            crate::jq_stream_errors::read(&raw_bytes)
+            crate::cli::jq_stream_errors::read(&raw_bytes)
         };
         // Without `--stream-errors` a fault is not an input: `-s` reads everything before it
         // runs the program, so the first one is the whole result (#5498), and the read stopped
@@ -8180,7 +8180,7 @@ fn read_inputs(
             // reader places the fault itself: before the array's last call it is the whole result,
             // and after it (behind a closing event the file before the failure held back) it is not.
             if args.slurp {
-                let deferred = crate::jq_stream_errors::read_for_deferred_slurp(&raw_bytes);
+                let deferred = crate::cli::jq_stream_errors::read_for_deferred_slurp(&raw_bytes);
                 if deferred.before.is_empty() {
                     let place = |at| stream_location(&raw_bytes, at);
                     let (array_source, array_line) = place(deferred.slurp_at);
@@ -8189,20 +8189,20 @@ fn read_inputs(
                     let mut trailing_error = None;
                     for item in deferred.after {
                         match item {
-                            crate::jq_stream_errors::Afterwards::Value(value, at) => {
+                            crate::cli::jq_stream_errors::Afterwards::Value(value, at) => {
                                 let (source, line) = place(at);
                                 locations.push(source, line);
                                 values.push(value);
                             }
                             // #6485: jq's main loop reads no further once a file has failed to
                             // open, and the fault comes from a read after the array.
-                            crate::jq_stream_errors::Afterwards::Fault(..)
+                            crate::cli::jq_stream_errors::Afterwards::Fault(..)
                                 if any_open_failure
                                     && !PROGRAM_READS_INPUTS.with(std::cell::Cell::get) =>
                             {
                                 break;
                             }
-                            crate::jq_stream_errors::Afterwards::Fault(message, at) => {
+                            crate::cli::jq_stream_errors::Afterwards::Fault(message, at) => {
                                 let (source, line) = place(at);
                                 trailing_error = Some(TrailingParseError {
                                     error: EvalError::new(message),
@@ -8225,7 +8225,7 @@ fn read_inputs(
         // The slurp read keeps the last few locations only: more values after the array than that
         // (none seen) are read again with all of them.
         if args.slurp && read.inside < read.locations_from {
-            read = crate::jq_stream_errors::read(&raw_bytes);
+            read = crate::cli::jq_stream_errors::read(&raw_bytes);
         }
         let mut values = read.values;
         let mut value_locations = read.locations;
@@ -9088,10 +9088,10 @@ fn seq_faults_by_queue(args: &JqCommand) -> bool {
     seq_faults_queued(args, true) && !args.null_input
 }
 
-/// The `--seq` reader's faults ([`crate::jq_seq_reader::walk_stream_collecting`]) as the parse
+/// The `--seq` reader's faults ([`crate::cli::jq_seq_reader::walk_stream_collecting`]) as the parse
 /// errors the input queue holds, each with how many values come before it (#5640).
 fn seq_fault_errors_of(
-    faults: Vec<crate::jq_seq_reader::SeqFault>,
+    faults: Vec<crate::cli::jq_seq_reader::SeqFault>,
     raw_bytes: &[(Option<usize>, Vec<u8>)],
     slurp: bool,
 ) -> Vec<(usize, TrailingParseError)> {
@@ -9156,7 +9156,7 @@ fn stream_location(
     sources: &[(Option<usize>, Vec<u8>)],
     (source, line): (usize, usize),
 ) -> (usize, usize) {
-    if line == crate::jq_stream_errors::CLOSED {
+    if line == crate::cli::jq_stream_errors::CLOSED {
         (0, UNKNOWN_LINE as usize)
     } else {
         // `get` and not an index: a slurped array has a location even when no file opened
@@ -10024,7 +10024,7 @@ fn advance_source(
 
 /// The walk [`seq_plain_json_inputs`] hands on (#6620).
 struct HandedWalk {
-    walk: Box<crate::jq_seq_reader::SeqStreamWalk>,
+    walk: Box<crate::cli::jq_seq_reader::SeqStreamWalk>,
     /// Whether it recorded the reader's faults, as the route that queues them asks.
     collect_faults: bool,
     /// The length of the bytes it walked.
@@ -10046,7 +10046,7 @@ struct SeqPreread {
     /// [`STDIN_PUSHBACK`]).
     prepared: Option<PreparedInputs>,
     /// The walk, with the values unplaced (`jq_seq_reader::walk_stream_keeping`).
-    walk: Box<crate::jq_seq_reader::SeqStreamWalk>,
+    walk: Box<crate::cli::jq_seq_reader::SeqStreamWalk>,
     /// Whether that walk recorded the reader's faults, as the route that queues them asks.
     collect_faults: bool,
 }
@@ -10148,11 +10148,11 @@ fn seq_faults_all_before_end(raws: &[Vec<u8>], unopened_tail: bool) -> bool {
         .enumerate()
         .map(|(at, raw)| (Some(at), raw.clone()))
         .collect();
-    let walk = crate::jq_seq_reader::walk_stream_collecting(
+    let walk = crate::cli::jq_seq_reader::walk_stream_collecting(
         &sources,
         false,
         true,
-        crate::jq_seq_reader::Tail::of(unopened_tail),
+        crate::cli::jq_seq_reader::Tail::of(unopened_tail),
         &mut |_| {},
     );
     !walk.faults.is_empty()
@@ -10170,11 +10170,11 @@ fn seq_fault_ends(raws: &[Vec<u8>], unopened_tail: bool) -> Vec<bool> {
         .enumerate()
         .map(|(at, raw)| (Some(at), raw.clone()))
         .collect();
-    crate::jq_seq_reader::walk_stream_collecting(
+    crate::cli::jq_seq_reader::walk_stream_collecting(
         &sources,
         false,
         true,
-        crate::jq_seq_reader::Tail::of(unopened_tail),
+        crate::cli::jq_seq_reader::Tail::of(unopened_tail),
         &mut |_| {},
     )
     .faults
@@ -10199,11 +10199,11 @@ fn seq_text_reads_clean(raws: &[Vec<u8>], unopened_tail: bool) -> bool {
     let mut warned = false;
     // Collecting the faults, as the queue's own walk does: without it, a final buffer that starts on
     // an RS (#2998) ends the stream with no word, which the queue raises as `break` (#5662).
-    let walk = crate::jq_seq_reader::walk_stream_collecting(
+    let walk = crate::cli::jq_seq_reader::walk_stream_collecting(
         &sources,
         false,
         true,
-        crate::jq_seq_reader::Tail::of(unopened_tail),
+        crate::cli::jq_seq_reader::Tail::of(unopened_tail),
         &mut |_| {
             warned = true;
         },
@@ -10367,10 +10367,10 @@ enum YieldPast {
 /// when the reader asks for more, so the yield may come from a file past a second failure (`[` then
 /// `1 2` then `[`: the fault is raised in the third file) or from the end of the text (`[` then
 /// `1 2`), and jq has by then opened, and counted, every file that did not open before it. `None`
-/// for a text longer than [`crate::jq_stream_errors::FIRST_EVENT_PREFIX_LIMIT`], which is not read
+/// for a text longer than [`crate::cli::jq_stream_errors::FIRST_EVENT_PREFIX_LIMIT`], which is not read
 /// for it, and for a stream that yields nothing past the failure.
 fn first_yield_past_failure(raws: &[Vec<u8>], first_failure: usize) -> Option<YieldPast> {
-    if raws.iter().map(Vec::len).sum::<usize>() > crate::jq_stream_errors::FIRST_EVENT_PREFIX_LIMIT
+    if raws.iter().map(Vec::len).sum::<usize>() > crate::cli::jq_stream_errors::FIRST_EVENT_PREFIX_LIMIT
     {
         return None;
     }
@@ -10380,14 +10380,14 @@ fn first_yield_past_failure(raws: &[Vec<u8>], first_failure: usize) -> Option<Yi
         .enumerate()
         .map(|(at, raw)| {
             let bom = if Some(at) == first {
-                crate::front_matter::leading_bom_len(raw)
+                crate::cli::front_matter::leading_bom_len(raw)
             } else {
                 0
             };
             (Some(at), raw[bom..].to_vec())
         })
         .collect();
-    let mut reader = crate::jq_stream_errors::Reader::new(&sources[..]);
+    let mut reader = crate::cli::jq_stream_errors::Reader::new(&sources[..]);
     while let Some(yielded) = reader.next_yielded() {
         if yielded.location.0 >= first_failure {
             // Only a fault is placed here: a value is placed by the rules below.
@@ -10447,7 +10447,7 @@ fn closer_lags_in_joined_text(raws: &[Vec<u8>]) -> bool {
 /// file that returns nothing follows it (#6760). One definition for [`closing_event_lags`] and the
 /// joined-text test of [`held_back_closer_before`] (#6732), which must agree on it.
 fn last_read_fills_buffer(raw: &[u8]) -> bool {
-    crate::jq_seq_reader::fgets_chunk_lens(raw).last() == Some(crate::jq_seq_reader::JQ_FGETS_CHUNK)
+    crate::cli::jq_seq_reader::fgets_chunk_lens(raw).last() == Some(crate::cli::jq_seq_reader::JQ_FGETS_CHUNK)
 }
 
 /// Whether the last record of the `--seq` text `raw` leaves jq's stream parser holding its closing
@@ -10563,11 +10563,11 @@ fn first_value_completes_at(raws: &[Vec<u8>], at: usize, args: &JqCommand) -> bo
         }
         // jq skips a byte-order mark at the front of its input: of the first file with bytes.
         let bom = if raws[..at].iter().all(Vec::is_empty) {
-            crate::front_matter::leading_bom_len(raw)
+            crate::cli::front_matter::leading_bom_len(raw)
         } else {
             0
         };
-        crate::jq_stream_errors::first_event_completes_in(&raw[bom..])
+        crate::cli::jq_stream_errors::first_event_completes_in(&raw[bom..])
     } else {
         first_value_completes_in(&raws[at], args)
     }
@@ -10579,13 +10579,13 @@ fn first_value_completes_at(raws: &[Vec<u8>], at: usize, args: &JqCommand) -> bo
 /// time ([`first_value_completes_at`]) cannot see. `None` where no file ends it or it is too long
 /// to read for.
 fn first_event_completing_file(raws: &[Vec<u8>]) -> Option<usize> {
-    let limit = crate::jq_stream_errors::FIRST_EVENT_PREFIX_LIMIT;
+    let limit = crate::cli::jq_stream_errors::FIRST_EVENT_PREFIX_LIMIT;
     let mut text: Vec<u8> = Vec::new();
     let files = raws.iter().enumerate().filter(|(_, raw)| !raw.is_empty());
     for (position, (at, raw)) in files.enumerate() {
         // jq skips a byte-order mark at the front of its input: of the first file with bytes.
         let bom = if position == 0 {
-            crate::front_matter::leading_bom_len(raw)
+            crate::cli::front_matter::leading_bom_len(raw)
         } else {
             0
         };
@@ -10593,7 +10593,7 @@ fn first_event_completing_file(raws: &[Vec<u8>]) -> Option<usize> {
         let room = limit - text.len();
         let bytes = &raw[bom..];
         text.extend_from_slice(&bytes[..bytes.len().min(room)]);
-        if crate::jq_stream_errors::first_event_completes_in(&text) {
+        if crate::cli::jq_stream_errors::first_event_completes_in(&text) {
             return Some(at);
         }
         if text.len() >= limit {
@@ -10641,7 +10641,7 @@ fn first_stream_fault(raws: &[Vec<u8>]) -> Option<(usize, bool)> {
     let first = raws.iter().position(|raw| !raw.is_empty());
     let chunks = raws.iter().enumerate().map(|(at, raw)| {
         if Some(at) == first {
-            &raw[crate::front_matter::leading_bom_len(raw)..]
+            &raw[crate::cli::front_matter::leading_bom_len(raw)..]
         } else {
             raw.as_slice()
         }
@@ -10973,8 +10973,8 @@ fn stream_read_in_chunks(args: &JqCommand, track_eof: bool) -> bool {
 /// when it asks past the last of them ([`open_chunked_inputs`]).
 type ChunkedInputs = (
     Vec<PathBuf>,
-    Vec<crate::jq_stream_errors::Opener>,
-    crate::jq_stream_errors::Tail,
+    Vec<crate::cli::jq_stream_errors::Opener>,
+    crate::cli::jq_stream_errors::Tail,
     bool,
 );
 
@@ -10983,8 +10983,8 @@ type ChunkedInputs = (
 /// the reader never reaches, past a fault or a program that stopped asking, is not reported.
 fn report_unopened_before(
     failures: Vec<InputFileOpenError>,
-    open: crate::jq_stream_errors::Opener,
-) -> crate::jq_stream_errors::Opener {
+    open: crate::cli::jq_stream_errors::Opener,
+) -> crate::cli::jq_stream_errors::Opener {
     if failures.is_empty() {
         return open;
     }
@@ -11016,14 +11016,14 @@ fn report_lazy_open_failures(failures: &[InputFileOpenError]) {
 /// Stdin is read for its first bytes and kept.
 fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
     let mut opened = Vec::with_capacity(files.len());
-    let mut openers: Vec<crate::jq_stream_errors::Opener> = Vec::with_capacity(files.len().max(1));
+    let mut openers: Vec<crate::cli::jq_stream_errors::Opener> = Vec::with_capacity(files.len().max(1));
     let mut look_for_bom = true;
     if files.is_empty() {
         let pushed_back = STDIN_PUSHBACK.with(|slot| slot.borrow_mut().take());
         let mut stdin =
             std::io::Cursor::new(pushed_back.unwrap_or_default()).chain(std::io::stdin());
         // #7126: standard input that cannot be read is an empty one and ends the run with exit 2.
-        let head = if crate::stdin_access::unreadable() {
+        let head = if crate::cli::stdin_access::unreadable() {
             note_stdin_read_failed();
             Vec::new()
         } else {
@@ -11157,7 +11157,7 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
         let name = input_display_name(&failure.path);
         UNOPENED_TAIL_NAME.with(|tail| *tail.borrow_mut() = Some(name));
     }
-    let tail: crate::jq_stream_errors::Tail = if unopened.is_empty() {
+    let tail: crate::cli::jq_stream_errors::Tail = if unopened.is_empty() {
         Vec::new()
     } else if tail_is_source {
         vec![Box::new(move || report_lazy_open_failures(&unopened))]
@@ -11214,7 +11214,7 @@ fn bom_to_skip(head: &[u8], look_for_bom: &mut bool) -> usize {
         return 0;
     }
     *look_for_bom = false;
-    crate::front_matter::leading_bom_len(head)
+    crate::cli::front_matter::leading_bom_len(head)
 }
 
 /// A read of standard input failed, or it cannot be read at all (`jq . 0>>file`, `jq . 0<&-`,
@@ -11239,7 +11239,7 @@ fn read_stdin_bytes() -> Result<Vec<u8>> {
 /// a caller that notes it when jq's reader reaches the source, not when the source is opened.
 fn read_stdin_bytes_unreported() -> (Vec<u8>, bool) {
     // Rust's `stdin` reads a descriptor it cannot read as empty, which hides the failure.
-    if crate::stdin_access::unreadable() {
+    if crate::cli::stdin_access::unreadable() {
         STDIN_PUSHBACK.with(|slot| slot.borrow_mut().take());
         STDIN_PUSHBACK_ERROR.with(|slot| slot.borrow_mut().take());
         return (Vec::new(), true);
@@ -11327,7 +11327,7 @@ fn read_file_bytes(path: &Path, last: bool) -> std::result::Result<Vec<u8>, Inpu
 /// the malformed forms.
 fn strip_leading_json_bom<'a>(raws: impl Iterator<Item = &'a mut Vec<u8>>) {
     if let Some(first) = raws.into_iter().find(|raw| !raw.is_empty()) {
-        let bom_len = crate::front_matter::leading_bom_len(first);
+        let bom_len = crate::cli::front_matter::leading_bom_len(first);
         first.drain(..bom_len);
     }
 }
@@ -12253,7 +12253,7 @@ thread_local! {
 /// at one.
 ///
 /// jq's reader stands after the records already run as it stands after an RS and that many line
-/// breaks, with nothing pending (see [`crate::jq_seq_reader::resumed_stream`]), so a source of those
+/// breaks, with nothing pending (see [`crate::cli::jq_seq_reader::resumed_stream`]), so a source of those
 /// bytes goes first, named as the file before: a parse error's line counts every line of the stream,
 /// and a byte-order mark is skipped only at its front, as in jq. It is a source of its own because the
 /// line a runtime error names (`(at <file>:N)`) counts from its file's start. The files from the one that stopped the windows
@@ -12267,12 +12267,12 @@ fn hand_on_seq_files_tail(args: &JqCommand, past_open_failure: bool) -> bool {
     else {
         return false;
     };
-    crate::jq_seq_reader::seed_token_byte(tail.token_byte);
+    crate::cli::jq_seq_reader::seed_token_byte(tail.token_byte);
     let named = get_input_files(args);
     let (mut files, mut raws) = (Vec::new(), Vec::new());
     if tail.lines > 0 {
         files.push(named[tail.index - 1].clone());
-        raws.push(crate::jq_seq_reader::resumed_stream(tail.lines, Vec::new()));
+        raws.push(crate::cli::jq_seq_reader::resumed_stream(tail.lines, Vec::new()));
     }
     let front = files.len();
     // #7341: a file a gate of its own read up to a stretch it could not carry on after goes as the rest
@@ -12312,7 +12312,7 @@ fn hand_on_seq_files_tail(args: &JqCommand, past_open_failure: bool) -> bool {
 
 /// Hands the rest of a `--seq` pipe whose windows ended at a record that is not plain (#7164) to the
 /// route that reads standard input whole, as the bytes it reads ([`STDIN_PUSHBACK`]), where jq's reader
-/// would stand after the records already run ([`crate::jq_seq_reader::resumed_stream`]); `true` when
+/// would stand after the records already run ([`crate::cli::jq_seq_reader::resumed_stream`]); `true` when
 /// there was one.
 ///
 /// #7262: the same for a lone named file read so ([`gated_seq_source`]), whose bytes go to that route as the
@@ -12326,7 +12326,7 @@ fn hand_on_seq_pipe_tail(args: &JqCommand) -> bool {
     else {
         return false;
     };
-    crate::jq_seq_reader::seed_token_byte(tail.token_byte);
+    crate::cli::jq_seq_reader::seed_token_byte(tail.token_byte);
     let stream = tail.stream;
     let named = get_input_files(args);
     if let [path] = named.as_slice() {
@@ -13996,7 +13996,7 @@ fn windowed_file_start(
         let mut head = Vec::with_capacity(3);
         (&*file).take(3).read_to_end(&mut head).ok()?;
         *before_first_byte = head.is_empty();
-        crate::front_matter::leading_bom_len(&head) as u64
+        crate::cli::front_matter::leading_bom_len(&head) as u64
     } else {
         0
     };
@@ -14224,7 +14224,7 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
         None => {
             let pushed_back = STDIN_PUSHBACK.with(|slot| slot.borrow_mut().take());
             // #7126: standard input that cannot be read is empty, and ends the run with exit 2.
-            if crate::stdin_access::unreadable() {
+            if crate::cli::stdin_access::unreadable() {
                 note_stdin_read_failed();
                 return Ok(LoneStart::Read(Vec::new()));
             }
@@ -14281,7 +14281,7 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
             return Ok(LoneStart::Read(bytes));
         }
         // The scan reads the text after the BOM jq skips (#5291), as `get_inputs` strips it.
-        let bom = crate::front_matter::leading_bom_len(&bytes);
+        let bom = crate::cli::front_matter::leading_bom_len(&bytes);
         // Up to the last whole character: the front may end inside one.
         let valid_end = match std::str::from_utf8(&bytes[bom..]) {
             Ok(_) => bytes.len(),
@@ -15579,7 +15579,7 @@ impl Iterator for LazyTail {
 
 /// A `--seq` stream's records, converted as the program reads them (#6500).
 ///
-/// The walk of [`crate::jq_seq_reader`] has already found every record's bytes, its place, and the
+/// The walk of [`crate::cli::jq_seq_reader`] has already found every record's bytes, its place, and the
 /// faults between the records, so nothing here is parsed again to decide anything: a record is
 /// turned into its value when the queue asks for it, and the value is dropped once the program has
 /// read it. The eager route built every record's value before the program ran, which held about
@@ -15681,7 +15681,7 @@ impl LazySeqInputs {
 /// `--stream` and `--stream-errors` inputs read as the program asks for them (#5498): jq's streaming parser over
 /// the sources' bytes, and what its source indices mean.
 struct LazyStreamInputs {
-    reader: crate::jq_stream_errors::Reader<Box<dyn crate::jq_stream_errors::RefillSource>>,
+    reader: crate::cli::jq_stream_errors::Reader<Box<dyn crate::cli::jq_stream_errors::RefillSource>>,
     /// The file each source was read from, as `get_inputs` tags its values.
     files: Vec<Option<usize>>,
     /// The tag of the last source, which the end of the stream names.
@@ -15709,7 +15709,7 @@ fn stream_reader_producer(lazy: LazyStreamInputs) -> jq::InputProducer {
             let (source, line) = input.location;
             // The same tags the whole read gave: a value yielded after jq closed its input has
             // no line, and the first source is tag 0 when it is stdin.
-            let (tag, line) = if line == crate::jq_stream_errors::CLOSED {
+            let (tag, line) = if line == crate::cli::jq_stream_errors::CLOSED {
                 (0, UNKNOWN_LINE)
             } else {
                 (
@@ -15965,7 +15965,7 @@ fn seq_stream_as_plain_json(raw: Vec<u8>, slurp: bool) -> std::result::Result<Ve
 
 /// What [`seq_stream_as_plain_json_with`] hands back for a stream that is not clean: its bytes, and
 /// the walk that found it so when it made one (#6620).
-type NotPlain = (Vec<u8>, Option<Box<crate::jq_seq_reader::SeqStreamWalk>>);
+type NotPlain = (Vec<u8>, Option<Box<crate::cli::jq_seq_reader::SeqStreamWalk>>);
 
 /// [`seq_stream_as_plain_json`], keeping the walk that decides when `keep_walk` says which faults
 /// it should record (#6620): `Some(collect_faults)` for a stream that is not slurped, `None` to
@@ -15984,7 +15984,7 @@ fn seq_stream_as_plain_json_with(
     // instead of the walk's. Every other stream takes the walk, as before. `-s` keeps the depth
     // check the walk's answer is given below, since the array it wraps the values in is a level
     // more than the deepest value has.
-    if seq_stream_is_plain_records(&raw, slurp, crate::jq_seq_reader::PlainGuards::ALL) {
+    if seq_stream_is_plain_records(&raw, slurp, crate::cli::jq_seq_reader::PlainGuards::ALL) {
         for b in &mut raw {
             if *b == ASCII_RS {
                 *b = b' ';
@@ -15996,22 +15996,22 @@ fn seq_stream_as_plain_json_with(
 }
 
 /// Whether [`seq_stream_as_plain_json`] may skip the walk for `raw` (#6501): the stream is RFC 7464's
-/// own framing ([`crate::jq_seq_reader::plain_record_sequence`]), and under `-s` also shallow
+/// own framing ([`crate::cli::jq_seq_reader::plain_record_sequence`]), and under `-s` also shallow
 /// enough that the array the values are wrapped in stays under the nesting ceiling (#2847), which
 /// the walk's answer is given the same bound. A function of its own so that the test holds exactly
-/// this to the walk, with `guards` as the shipped [`crate::jq_seq_reader::PlainGuards::ALL`] or one
+/// this to the walk, with `guards` as the shipped [`crate::cli::jq_seq_reader::PlainGuards::ALL`] or one
 /// dropped.
 fn seq_stream_is_plain_records(
     raw: &[u8],
     slurp: bool,
-    guards: crate::jq_seq_reader::PlainGuards,
+    guards: crate::cli::jq_seq_reader::PlainGuards,
 ) -> bool {
-    crate::jq_seq_reader::plain_record_sequence(raw, guards)
+    crate::cli::jq_seq_reader::plain_record_sequence(raw, guards)
         && (!slurp || json_depth_at_most(raw, LAZY_JSON_MAX_DEPTH))
 }
 
 /// [`seq_stream_as_plain_json`]'s decision by the walk of jq's reader, for the streams
-/// [`crate::jq_seq_reader::plain_record_sequence`] does not vouch for.
+/// [`crate::cli::jq_seq_reader::plain_record_sequence`] does not vouch for.
 #[cfg(test)]
 fn seq_stream_walked_as_plain_json(
     raw: Vec<u8>,
@@ -16031,11 +16031,11 @@ fn seq_stream_walked_as_plain_json_with(
     let kept = keep_walk.is_some() && !slurp;
     let walk = match keep_walk {
         Some(collect_faults) if !slurp => {
-            crate::jq_seq_reader::walk_stream_keeping(&sources, collect_faults, &mut |_| {
+            crate::cli::jq_seq_reader::walk_stream_keeping(&sources, collect_faults, &mut |_| {
                 warned = true;
             })
         }
-        _ => crate::jq_seq_reader::walk_stream_values(&sources, slurp, &mut |_| warned = true),
+        _ => crate::cli::jq_seq_reader::walk_stream_values(&sources, slurp, &mut |_| warned = true),
     };
     // A walk that records faults goes on past jq's end-of-stream drop (#2998), where the one that
     // does not stops. The verdict is the stopping walk's (it was before the walk was kept, #6620),
@@ -16047,7 +16047,7 @@ fn seq_stream_walked_as_plain_json_with(
         .then(|| {
             walk.faults
                 .iter()
-                .position(|fault| fault.body == crate::jq_seq_reader::MESSAGELESS_RETURN)
+                .position(|fault| fault.body == crate::cli::jq_seq_reader::MESSAGELESS_RETURN)
         })
         .flatten();
     let (warned, deferred, position_lost, values_end) = match drop {
@@ -16639,7 +16639,7 @@ fn reread_stream_fault(files: &[PathBuf]) -> Option<String> {
                 // The bytes as read, not as substituted: jq's parser counts those (#5964).
                 if at_front && !raw.is_empty() {
                     at_front = false;
-                    raw.drain(..crate::front_matter::leading_bom_len(&raw));
+                    raw.drain(..crate::cli::front_matter::leading_bom_len(&raw));
                 }
                 Some(raw)
             }
@@ -17244,7 +17244,7 @@ fn build_raw_input_values(
 /// view of the whole multi-file input as one continuous stream of lines.
 fn concat_with_file_ends(raw_inputs: &[(Option<usize>, String)]) -> (String, Vec<usize>) {
     let combined: String = raw_inputs.iter().map(|(_, raw)| raw.as_str()).collect();
-    (combined, crate::jq_seq_reader::source_ends(raw_inputs))
+    (combined, crate::cli::jq_seq_reader::source_ends(raw_inputs))
 }
 
 /// Map each `end` offset in `ends` (non-decreasing, an exclusive position
@@ -17324,7 +17324,7 @@ fn remap_ends_to_locations<S: AsRef<[u8]>>(
 /// would have given -- without rewriting the bytes between values that the
 /// reader decides on.
 ///
-/// [`jq_seq_reader::walk_stream`]: crate::jq_seq_reader::walk_stream
+/// [`jq_seq_reader::walk_stream`]: crate::cli::jq_seq_reader::walk_stream
 fn seq_values_with_indices(
     combined: &[u8],
     ranges: &[(usize, usize)],
@@ -17361,7 +17361,7 @@ fn seq_record_value(
     end: usize,
     cuts: &[(usize, usize)],
 ) -> Option<OwnedValue> {
-    let spliced = crate::jq_seq_reader::splice_cuts(combined, start, end, cuts);
+    let spliced = crate::cli::jq_seq_reader::splice_cuts(combined, start, end, cuts);
     // Taking bytes out of a range of valid UTF-8 leaves it valid UTF-8 only when the cuts fall on
     // character boundaries, which a NUL and the end of an `fgets` chunk need not, so a spliced
     // record is always checked.
@@ -17434,7 +17434,7 @@ fn seq_record_general_value(bytes: &[u8]) -> Option<OwnedValue> {
 /// match (`jq_seq_reader::bom_prefix`).
 fn seq_no_rs_byte_warning(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> Option<String> {
     let (line, column) = seq_no_rs_byte_position(raw_bytes)?;
-    Some(crate::jq_seq_reader::ignored_parse_error(&format!(
+    Some(crate::cli::jq_seq_reader::ignored_parse_error(&format!(
         "Unfinished abandoned text at EOF at line {line}, column {column}"
     )))
 }
@@ -17448,7 +17448,7 @@ fn seq_no_rs_byte_position(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> Option<(us
     // template: it costs jq a `parser_reset` that leaves the parser reading rather than waiting
     // for an RS, so the reader owns that case (#1723). One definition for the warning and the
     // `-n` error (#5636).
-    if crate::jq_seq_reader::bom_prefix(raw_bytes).malformed {
+    if crate::cli::jq_seq_reader::bom_prefix(raw_bytes).malformed {
         return None;
     }
     let mut line = 1usize;
@@ -17457,9 +17457,9 @@ fn seq_no_rs_byte_position(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> Option<(us
     // starts at a NUL, so an RS with no NUL before it in its source is one jq sees: the common
     // stream answers here, having read up to its first RS and no further.
     let mut nul_seen = false;
-    for slice in crate::jq_seq_reader::stream_slices(raw_bytes) {
-        let rs = crate::jq_seq_reader::find_byte(ASCII_RS, slice);
-        if crate::jq_seq_reader::find_byte(0, rs.map_or(slice, |at| &slice[..at])).is_some() {
+    for slice in crate::cli::jq_seq_reader::stream_slices(raw_bytes) {
+        let rs = crate::cli::jq_seq_reader::find_byte(ASCII_RS, slice);
+        if crate::cli::jq_seq_reader::find_byte(0, rs.map_or(slice, |at| &slice[..at])).is_some() {
             nul_seen = true;
             break;
         }
@@ -17468,16 +17468,16 @@ fn seq_no_rs_byte_position(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> Option<(us
         }
     }
     let cuts = if nul_seen {
-        crate::jq_seq_reader::nul_cuts(raw_bytes)
+        crate::cli::jq_seq_reader::nul_cuts(raw_bytes)
     } else {
         Vec::new()
     };
-    let ends = crate::jq_seq_reader::source_ends(raw_bytes);
+    let ends = crate::cli::jq_seq_reader::source_ends(raw_bytes);
     // Shares `stream_slices` and `advance_position` with `jq_seq_reader`, which walks this same
     // stream to classify the templates that apply once an RS *is* present (#1723) -- the two must
     // agree on BOM handling and on where a column starts. #7263: a slice at a time, searched a
     // block at a time, where a byte at a time was a third of a no-RS run.
-    for (slice, end) in crate::jq_seq_reader::stream_slices(raw_bytes).zip(ends) {
+    for (slice, end) in crate::cli::jq_seq_reader::stream_slices(raw_bytes).zip(ends) {
         // A BOM is cut from the front of a slice, so the slice ends where its source does, and a
         // cut never spans two sources. A cut can start before the slice (in the consumed BOM).
         let start = end - slice.len();
@@ -17498,7 +17498,7 @@ fn seq_no_rs_byte_position(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> Option<(us
             if piece.contains(&ASCII_RS) {
                 return None;
             }
-            crate::jq_seq_reader::advance_position(piece, &mut line, &mut column);
+            crate::cli::jq_seq_reader::advance_position(piece, &mut line, &mut column);
         }
     }
     if raw_bytes.is_empty() {
@@ -20020,7 +20020,7 @@ fn validate_json_delimiters<W: Clone + AsRef<[u64]>>(
 /// and the `--seq` per-record materializer. Before
 /// #2295 only `parse_json_stream`'s `find_json_values` fallback used this;
 /// every other caller reached a since-removed bare, panicking version
-/// directly (`crate::output::json_bytes_to_owned_value`, now dead code with
+/// directly (`crate::cli::output::json_bytes_to_owned_value`, now dead code with
 /// no remaining callers -- deleted rather than left unused),
 /// protected only incidentally by whichever upstream validator happened to
 /// run first (`serde_json`'s own default 128-deep recursion limit, or
@@ -21208,7 +21208,7 @@ mod tests {
             first_event_completing_file(&files(&[b"\xef\xbb\xbf", b"[1]\n"])),
             Some(1)
         );
-        let long = vec![b'1'; crate::jq_stream_errors::FIRST_EVENT_PREFIX_LIMIT + 10];
+        let long = vec![b'1'; crate::cli::jq_stream_errors::FIRST_EVENT_PREFIX_LIMIT + 10];
         assert_eq!(first_event_completing_file(&[long, b"1\n".to_vec()]), None);
     }
 
@@ -21961,7 +21961,7 @@ mod tests {
                     .map(|(at, file)| (Some(at), String::from_utf8(file.to_vec()).unwrap()))
                     .collect();
                 if let Some((_, text)) = texts.iter_mut().find(|(_, text)| !text.is_empty()) {
-                    let bom = crate::front_matter::leading_bom_len(text.as_bytes());
+                    let bom = crate::cli::front_matter::leading_bom_len(text.as_bytes());
                     text.drain(..bom);
                 }
                 // The chunk size `observe` scans with.
@@ -22110,7 +22110,7 @@ mod tests {
             LAZY_RAW_MIN_OVERRIDE.with(|c| c.set(Some(0)));
             let taken = several_lazy_windowed_files(&cmd, true, &get_input_files(&cmd)).is_some();
             LAZY_RAW_MIN_OVERRIDE.with(|c| c.set(None));
-            let bom = crate::front_matter::leading_bom_len(first);
+            let bom = crate::cli::front_matter::leading_bom_len(first);
             let text = String::from_utf8(first[bom..].to_vec()).unwrap();
             let whole = matches!(
                 lazy_json_sources(&[(Some(0), text), (Some(1), "{\"b\":2}\n".into())], None),
@@ -22471,7 +22471,7 @@ mod tests {
             );
             assert_eq!(
                 tail.stream,
-                crate::jq_seq_reader::resumed_stream(before, stream[at..].to_vec()),
+                crate::cli::jq_seq_reader::resumed_stream(before, stream[at..].to_vec()),
                 "{name}"
             );
             // The run's hand-off gives that buffer to the whole-file route as the file's bytes.
@@ -25616,11 +25616,11 @@ mod tests {
         #[test]
         fn position_a_slice_at_a_time_is_the_bytewise_one_7263() {
             fn bytewise(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> Option<(usize, usize)> {
-                if crate::jq_seq_reader::bom_prefix(raw_bytes).malformed {
+                if crate::cli::jq_seq_reader::bom_prefix(raw_bytes).malformed {
                     return None;
                 }
                 let (mut line, mut column) = (1usize, 0usize);
-                for b in crate::jq_seq_reader::stream_bytes(raw_bytes) {
+                for b in crate::cli::jq_seq_reader::stream_bytes(raw_bytes) {
                     if b == ASCII_RS {
                         return None;
                     }
@@ -27329,7 +27329,7 @@ mod tests {
             .iter()
             .map(|(idx, s)| (*idx, s.as_bytes().to_vec()))
             .collect();
-        let walk = crate::jq_seq_reader::walk_stream(&raw, false, &mut |_| {});
+        let walk = crate::cli::jq_seq_reader::walk_stream(&raw, false, &mut |_| {});
         build_seq_values(
             &raw,
             &walk.values,
@@ -28898,7 +28898,7 @@ mod tests {
             argv.push(".name");
             argv.push(path.to_str().unwrap());
             let cmd = JqCommand::try_parse_from(argv).unwrap();
-            let before = crate::jq_seq_reader::walks::made();
+            let before = crate::cli::jq_seq_reader::walks::made();
             let (mut open_failed, mut opened) = (false, Vec::new());
             assert!(
                 seq_plain_json_inputs(&cmd).expect("reads").is_none(),
@@ -28910,7 +28910,7 @@ mod tests {
             // What the run holds for the program's reads is not left for the next run on this thread.
             LAZY_SEQ_INPUTS.with(|slot| slot.borrow_mut().take());
             SEQ_PREREAD.with(|slot| slot.borrow_mut().take());
-            crate::jq_seq_reader::walks::made() - before
+            crate::cli::jq_seq_reader::walks::made() - before
         };
         let faulty: &[u8] = b"\x1e{\"name\":1}\n\x1e{\"name\":\n\x1e{\"name\":3}\n";
         assert_eq!(walks_made(faulty, &[]), 1, "the walk is handed on");
@@ -28918,14 +28918,14 @@ mod tests {
         // Stdin's bytes come back through the pushback, and the walk goes with them.
         let cmd = JqCommand::try_parse_from(["jq", "--seq", ".name"]).unwrap();
         STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = Some(faulty.to_vec()));
-        let before = crate::jq_seq_reader::walks::made();
+        let before = crate::cli::jq_seq_reader::walks::made();
         let (mut open_failed, mut opened) = (false, Vec::new());
         assert!(seq_plain_json_inputs(&cmd).expect("reads").is_none());
         get_inputs(&cmd, true, true, &mut open_failed, &mut opened)
             .expect("no exit code")
             .expect("reads");
         LAZY_SEQ_INPUTS.with(|slot| slot.borrow_mut().take());
-        assert_eq!(crate::jq_seq_reader::walks::made() - before, 1, "stdin");
+        assert_eq!(crate::cli::jq_seq_reader::walks::made() - before, 1, "stdin");
         // The streams the handoff declines keep the walk each route makes.
         assert_eq!(walks_made(faulty, &["-s"]), 2, "a slurp walks for itself");
         assert_eq!(
@@ -29024,15 +29024,15 @@ mod tests {
                     drops += usize::from(
                         walk.faults
                             .iter()
-                            .any(|fault| fault.body == crate::jq_seq_reader::MESSAGELESS_RETURN),
+                            .any(|fault| fault.body == crate::cli::jq_seq_reader::MESSAGELESS_RETURN),
                     );
                     // The walk the reading route makes over the same bytes.
                     let sources = [(None, raw.clone())];
-                    let mut fresh = crate::jq_seq_reader::walk_stream_collecting_at(
+                    let mut fresh = crate::cli::jq_seq_reader::walk_stream_collecting_at(
                         &sources,
                         false,
                         true,
-                        crate::jq_seq_reader::Tail::Opened,
+                        crate::cli::jq_seq_reader::Tail::Opened,
                         &mut |_, _| {},
                     );
                     walk.place_values(&sources);
@@ -29739,14 +29739,14 @@ mod tests {
     }
 }
 
-/// #6501: [`crate::jq_seq_reader::plain_record_sequence`] is a second definition of part of what
+/// #6501: [`crate::cli::jq_seq_reader::plain_record_sequence`] is a second definition of part of what
 /// the walk decides, so this holds the two together: `true` must imply that the walk finds the
 /// same clean stream, under both `-s` values, and each guard is dropped in turn to show the test
 /// can fail without it.
 #[cfg(test)]
 mod plain_record_sequence_tests {
     use super::*;
-    use crate::jq_seq_reader::{plain_record_sequence, PlainGuards};
+    use crate::cli::jq_seq_reader::{plain_record_sequence, PlainGuards};
 
     /// xorshift64: a fixed stream of streams, so a failure repeats.
     struct Rng(u64);
@@ -30040,7 +30040,7 @@ mod plain_record_sequence_tests {
     /// one it replaced, for every stream, every set of guards and every way of cutting the stream.
     #[test]
     fn the_record_check_gives_one_verdict_however_the_stream_is_cut_7082() {
-        use crate::jq_seq_reader::PlainRecords;
+        use crate::cli::jq_seq_reader::PlainRecords;
         let all = PlainGuards::ALL;
         let none = PlainGuards {
             starts_on_rs: false,

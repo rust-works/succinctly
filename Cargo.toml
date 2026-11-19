@@ -206,7 +206,7 @@ harness = false
 
 [[bin]]
 name = "succinctly"
-path = "src/bin/succinctly/main.rs"
+path = "src/main.rs"
 required-features = ["cli"]
 
 [lib]

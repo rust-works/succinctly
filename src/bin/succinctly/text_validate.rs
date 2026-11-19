@@ -307,7 +307,7 @@ fn get_error_snippet(input: &[u8], line: usize, column: usize) -> Option<ErrorSn
     let line_content = &text[line_start..line_end];
 
     // Truncate long lines (on character boundaries, #5988)
-    let (display_content, caret_offset) = crate::error_snippet::truncate_line(line_content, column);
+    let (display_content, caret_offset) = crate::cli::error_snippet::truncate_line(line_content, column);
 
     Some(ErrorSnippet {
         line_content: display_content,

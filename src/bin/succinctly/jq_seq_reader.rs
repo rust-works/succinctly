@@ -73,7 +73,7 @@
 //! value and so ended the call before that branch ran. See
 //! [`SeqStreamWalk::slurp_position_lost`] for the full derivation.
 
-use crate::front_matter::UTF8_BOM;
+use crate::cli::front_matter::UTF8_BOM;
 
 const ASCII_RS: u8 = 0x1e;
 

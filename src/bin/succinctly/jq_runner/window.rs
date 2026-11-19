@@ -845,7 +845,7 @@ impl WindowedFile {
     fn skip_front_bom(&mut self) {
         if !self.started && (self.buf.len() >= 3 || self.eof) {
             self.started = true;
-            let bom = crate::front_matter::leading_bom_len(&self.buf);
+            let bom = crate::cli::front_matter::leading_bom_len(&self.buf);
             if bom > 0 {
                 self.buf.drain(..bom);
                 self.offset += bom;
@@ -1300,13 +1300,13 @@ fn start_worker(seen: &SeenFault) -> io::Result<Worker> {
 /// windows before it were run, and the rest of the stream is the whole-stream route's.
 pub(super) struct SeqTail {
     /// The stream from the RS that opens that record to its end, as read, behind the front that resumes
-    /// jq's reader after `lines` line breaks ([`crate::jq_seq_reader::resumed_stream`]): the tail is read
+    /// jq's reader after `lines` line breaks ([`crate::cli::jq_seq_reader::resumed_stream`]): the tail is read
     /// into it, never copied (#7262).
     pub stream: Vec<u8>,
     /// The failure of a read of the pipe, which ended the stream there.
     pub error: Option<io::Error>,
     /// The byte the records before it left at index 1 of jq's token buffer
-    /// ([`crate::jq_seq_reader::token_byte_after`]).
+    /// ([`crate::cli::jq_seq_reader::token_byte_after`]).
     pub token_byte: Option<u8>,
     /// Where `stream` was first allocated, and the room it had before the tail was read, so a test can
     /// tell the tail was read into it in place (a pointer alone does not: a large buffer can be grown in
@@ -1332,7 +1332,7 @@ pub(super) struct SeqFilesTail {
     /// a byte, and the stream starts at this file.
     pub lines: usize,
     /// The byte the records before it left at index 1 of jq's token buffer
-    /// ([`crate::jq_seq_reader::token_byte_after`]).
+    /// ([`crate::cli::jq_seq_reader::token_byte_after`]).
     pub token_byte: Option<u8>,
     /// #7341: the file was read a window at a time by a gate of its own ([`SeqGate`]) up to a stretch
     /// it could not carry on after, and this is the rest of it, from that stretch's RS, behind the front
@@ -1377,7 +1377,7 @@ struct SeqFilesCheck {
 /// The certification of a `--seq` pipe's records (#7164), which decides what of the stream is read a window
 /// at a time. A pipe cannot be read twice, and its windows' output cannot be taken back, so unlike the
 /// regular file's prepass (#7082) the verdict comes as the windows are read: each record is checked when
-/// the RS after it (or the stream's end) is read, with the check [`crate::jq_seq_reader::PlainRecords`]
+/// the RS after it (or the stream's end) is read, with the check [`crate::cli::jq_seq_reader::PlainRecords`]
 /// makes of a whole stream, and a window gives the records up to the last checked one. A record that is
 /// not `RS value LF` is read as jq's reader reads it when plain records follow it, and the windows carry
 /// on after it ([`SeqGate::judge`], #7322). At the first such record they cannot carry on after, or one
@@ -1500,7 +1500,7 @@ impl SeqGate {
         }
         let from = self.checked;
         let step = self.judge(buf, eof);
-        if let Some(byte) = crate::jq_seq_reader::token_byte_after(&buf[from..self.checked]) {
+        if let Some(byte) = crate::cli::jq_seq_reader::token_byte_after(&buf[from..self.checked]) {
             self.token_byte = Some(byte);
         }
         step
@@ -1512,10 +1512,10 @@ impl SeqGate {
     /// #7322: a record at `checked` that is not plain does not end the windows there. The gate reads
     /// on, up to [`max_seq_stretch`], for the first RS that starts a line and opens a record that is
     /// plain: jq's reader stands after that RS as it stands after any RS between plain records
-    /// ([`crate::jq_seq_reader::walk_stretch`]), so the windows can carry on from it. A stretch that
+    /// ([`crate::cli::jq_seq_reader::walk_stretch`]), so the windows can carry on from it. A stretch that
     /// runs to the stream's end, or past the look-ahead, is handed on with the rest of the stream.
     fn judge(&mut self, buf: &[u8], eof: bool) -> GateStep {
-        use crate::jq_seq_reader::{PlainGuards, PlainRecords};
+        use crate::cli::jq_seq_reader::{PlainGuards, PlainRecords};
         while self.cand < buf.len() {
             let in_stretch = self.cand > self.checked;
             let next = buf[self.search_from..].iter().position(|&b| b == RS);
@@ -1601,7 +1601,7 @@ impl SeqGate {
     /// in its token buffer: the stream is certified to `next_end`, the end of the plain record after it,
     /// whose first byte is `buf[to]`.
     fn resume(&mut self, buf: &[u8], to: usize, next_end: usize, token_byte: Option<u8>) {
-        self.token_byte = crate::jq_seq_reader::token_byte_after(&buf[to..next_end]).or(token_byte);
+        self.token_byte = crate::cli::jq_seq_reader::token_byte_after(&buf[to..next_end]).or(token_byte);
         self.checked = next_end;
         self.cand = next_end;
         self.search_from = next_end + 1;
@@ -1696,7 +1696,7 @@ impl WindowedFile {
     /// `false` when the stretch is left to the whole-stream route with the rest of the stream.
     ///
     /// The reader's model says which values the stretch yields and what it warns of
-    /// ([`crate::jq_seq_reader::walk_stretch`]). Every byte of the stretch that is in no value is
+    /// ([`crate::cli::jq_seq_reader::walk_stretch`]). Every byte of the stretch that is in no value is
     /// read as a space, as an RS is (a line break stays, so every line and offset is where it was),
     /// and the warnings are handed out with the window ([`Window::notes`]). What is left is those
     /// values with white space between them, which the filter's parser reads as jq's parser reads
@@ -1713,7 +1713,7 @@ impl WindowedFile {
             .expect("only the gate of a --seq stream finds a stretch");
         let lines = gate.lines_base + self.lines_before + gate.lines_to(&self.buf, from);
         let Some(walk) =
-            crate::jq_seq_reader::walk_stretch(&self.buf[from..=to], lines, gate.token_byte)
+            crate::cli::jq_seq_reader::walk_stretch(&self.buf[from..=to], lines, gate.token_byte)
         else {
             return false;
         };
@@ -1769,7 +1769,7 @@ impl WindowedFile {
                 _ => 0,
             }
         };
-        let mut bytes = crate::jq_seq_reader::resumed_front(lines, self.buf.len() - at + left);
+        let mut bytes = crate::cli::jq_seq_reader::resumed_front(lines, self.buf.len() - at + left);
         #[cfg(test)]
         let (reserved_at, reserved_room) = (bytes.as_ptr() as usize, bytes.capacity());
         bytes.extend_from_slice(&self.buf[at..]);
@@ -3093,7 +3093,7 @@ impl Reread {
                     chunk.truncate(read);
                     if at_front {
                         at_front = false;
-                        chunk.drain(..crate::front_matter::leading_bom_len(&chunk));
+                        chunk.drain(..crate::cli::front_matter::leading_bom_len(&chunk));
                     }
                     if self.blank_rs.get() {
                         blank_rs_bytes(&mut chunk);
@@ -3121,7 +3121,7 @@ impl Reread {
     }
 
     /// Whether the file is a `--seq` stream that is nothing but plain records (#7082): RFC 7464's own
-    /// framing, which [`crate::jq_seq_reader::plain_record_sequence`] vouches for over a text held
+    /// framing, which [`crate::cli::jq_seq_reader::plain_record_sequence`] vouches for over a text held
     /// whole and this does a chunk at a time, by the same checker. So the run may read it as the plain
     /// JSON stream it is with each RS blanked. `false` is no verdict on the stream (a read that
     /// failed, or one the walk of jq's reader has to decide), and the whole-file route takes it.
@@ -3220,7 +3220,7 @@ fn plain_seq_ends_in(file: &File, start: u64, len: u64) -> bool {
 /// The records of a file whose ends [`plain_seq_ends_in`] has vouched for.
 #[cfg(unix)]
 fn plain_seq_records_in(file: &File, start: u64, len: u64) -> bool {
-    use crate::jq_seq_reader::{PlainGuards, PlainRecords};
+    use crate::cli::jq_seq_reader::{PlainGuards, PlainRecords};
     use std::os::unix::fs::FileExt;
     let guards = PlainGuards::ALL;
     // The last record first, when an RS is near enough the end to hold it: the verdict does not
@@ -3288,7 +3288,7 @@ fn seq_file_verdict(_file: &File, _len: u64) -> SeqFileVerdict {
 }
 
 /// The byte the plain records of `file`'s first `len` bytes leave at index 1 of jq's token buffer
-/// ([`crate::jq_seq_reader::token_byte_after`]), read from the end a stretch at a time: the last token
+/// ([`crate::cli::jq_seq_reader::token_byte_after`]), read from the end a stretch at a time: the last token
 /// that writes there decides, so most files are answered by their last record. A stretch starts at an
 /// RS, which no record of RFC 8259 holds, so it is whole records; one with no RS in it is part of a
 /// record bigger than it, and the next read goes twice as far back.
@@ -3309,7 +3309,7 @@ fn seq_token_byte_in(file: &File, len: u64) -> io::Result<Option<u8>> {
             reach = reach.saturating_mul(2);
             continue;
         };
-        if let Some(byte) = crate::jq_seq_reader::token_byte_after(&bytes[rs..]) {
+        if let Some(byte) = crate::cli::jq_seq_reader::token_byte_after(&bytes[rs..]) {
             return Ok(Some(byte));
         }
         end = from + rs as u64;
@@ -3604,7 +3604,7 @@ mod tests {
     /// values with white space between them, whatever jq's parser took them as (#7341), and a value's
     /// invalid UTF-8 is substituted as the whole-stream route substitutes it.
     fn gated(stream: &[u8]) -> Gated {
-        use crate::jq_seq_reader::{token_byte_after, walk_stretch, PlainGuards, PlainRecords};
+        use crate::cli::jq_seq_reader::{token_byte_after, walk_stretch, PlainGuards, PlainRecords};
         use succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document_mapped;
         let mut text = Vec::with_capacity(stream.len());
         let (mut token, mut warnings) = (None, Vec::new());
@@ -3706,7 +3706,7 @@ mod tests {
     /// Without `model`, against jq's reader alone: the model reads a stretch in one walk, which keeps
     /// at most a walk's worth of warnings, where the gate reads one in pieces (#7341).
     fn check_gated_windows(stream: &[u8], blocks: &[usize], model: bool) -> bool {
-        use crate::jq_seq_reader::{resumed_stream, seed_token_byte, walk_stream};
+        use crate::cli::jq_seq_reader::{resumed_stream, seed_token_byte, walk_stream};
         let walked = |stream: &[u8]| -> (Vec<String>, Vec<(String, usize)>) {
             let sources = vec![(None, stream.to_vec())];
             let mut warnings = Vec::new();
@@ -3805,11 +3805,11 @@ mod tests {
             {
                 let sources = vec![(None, stream.to_vec())];
                 let mut events: Vec<(usize, String)> = Vec::new();
-                let walk = crate::jq_seq_reader::walk_stream_collecting_at(
+                let walk = crate::cli::jq_seq_reader::walk_stream_collecting_at(
                     &sources,
                     false,
                     false,
-                    crate::jq_seq_reader::Tail::Opened,
+                    crate::cli::jq_seq_reader::Tail::Opened,
                     &mut |warning, at| events.push((at, warning.to_string())),
                 );
                 let mut events = events.into_iter().peekable();
@@ -4181,7 +4181,7 @@ mod tests {
                                     let handed = handed.expect("the rest is handed on");
                                     assert_eq!(
                                         handed.stream,
-                                        crate::jq_seq_reader::resumed_stream(
+                                        crate::cli::jq_seq_reader::resumed_stream(
                                             count_newlines(&stream[..at]),
                                             stream[at..].to_vec()
                                         ),
@@ -5655,7 +5655,7 @@ mod stream_tests {
                     // The `3` the file's gate read ends jq's token with a NUL at index 1.
                     token_byte: Some(0),
                     front: Some(SeqFront {
-                        stream: crate::jq_seq_reader::resumed_stream(1, rest),
+                        stream: crate::cli::jq_seq_reader::resumed_stream(1, rest),
                         error: None,
                     }),
                 }),
@@ -5712,7 +5712,7 @@ mod stream_tests {
     }
 
     /// #7221: the byte a file's plain records leave at index 1 of jq's token buffer is
-    /// [`crate::jq_seq_reader::token_byte_after`]'s over the whole file, read from the end a stretch
+    /// [`crate::cli::jq_seq_reader::token_byte_after`]'s over the whole file, read from the end a stretch
     /// at a time: past a last record bigger than a stretch, and past records that write nothing there.
     #[cfg(unix)]
     #[test]
@@ -5739,7 +5739,7 @@ mod stream_tests {
             let file = File::open(&path).expect("opens");
             assert_eq!(
                 seq_token_byte_in(&file, bytes.len() as u64).expect("reads"),
-                crate::jq_seq_reader::token_byte_after(&bytes),
+                crate::cli::jq_seq_reader::token_byte_after(&bytes),
                 "{name}"
             );
         }
@@ -5817,7 +5817,7 @@ mod pipe_tests {
     fn assert_same(text: &[u8], block: usize) {
         let (file_run, file_fault) = as_file(text, block);
         // The fault is the whole stream's first, as jq's parser words it.
-        let bom = crate::front_matter::leading_bom_len(text);
+        let bom = crate::cli::front_matter::leading_bom_len(text);
         assert_eq!(
             file_fault,
             succinctly::jq::jq_stream_fault([&text[bom..]], 1, 0),

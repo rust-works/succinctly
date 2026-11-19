@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::bench_reps::{ensure_success, interleaved_reps};
+use crate::cli::bench_reps::{ensure_success, interleaved_reps};
 
 /// Query types for benchmarking different `eval_generic.rs` execution paths.
 ///
@@ -291,7 +291,7 @@ pub fn run_benchmark(
 
     // Set up Ctrl+C handler
     let interrupted = Arc::new(AtomicBool::new(false));
-    crate::interrupt::on_interrupt(&interrupted, "Interrupted! Writing partial results...")?;
+    crate::cli::interrupt::on_interrupt(&interrupted, "Interrupted! Writing partial results...")?;
 
     eprintln!("Running jq benchmark suite...");
     eprintln!("  Data directory: {}", config.data_dir.display());

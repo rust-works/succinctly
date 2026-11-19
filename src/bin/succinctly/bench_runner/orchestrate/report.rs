@@ -10,7 +10,7 @@
 //! nor SSH, so it's its own standalone `bench report` subcommand.
 
 use super::config::Architecture;
-use crate::bench_runner::runner::RunSummary;
+use crate::cli::bench_runner::runner::RunSummary;
 use anyhow::{Context, Result};
 use clap::Parser;
 use serde::Deserialize;
@@ -286,7 +286,7 @@ fn render_regressions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bench_runner::runner::BenchmarkResult;
+    use crate::cli::bench_runner::runner::BenchmarkResult;
     use tempfile::tempdir;
 
     fn write_summary(dir: &Path, node: &str, benchmark: &str, duration: f64, success: bool) {

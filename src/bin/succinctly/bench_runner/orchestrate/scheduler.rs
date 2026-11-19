@@ -7,7 +7,7 @@
 //! is the only module that turns a [`NodeSchedule`] into real work.
 
 use super::config::{BenchmarkOverride, NodeConfig};
-use crate::bench_runner::registry::{BenchmarkInfo, Isolation};
+use crate::cli::bench_runner::registry::{BenchmarkInfo, Isolation};
 
 /// A batch of benchmarks that run concurrently on a node (bounded by
 /// `max_concurrent`), or a single exclusive benchmark.
@@ -68,7 +68,7 @@ pub fn schedule_node<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bench_runner::registry::{BenchmarkCategory, BenchmarkType};
+    use crate::cli::bench_runner::registry::{BenchmarkCategory, BenchmarkType};
 
     fn benchmark(name: &'static str, isolation: Isolation) -> BenchmarkInfo {
         BenchmarkInfo {

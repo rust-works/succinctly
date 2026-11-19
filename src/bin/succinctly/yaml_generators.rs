@@ -49,7 +49,7 @@
 use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
-pub use crate::yaml_pattern_registry::{PatternScale, YamlPattern, ALL_PATTERNS};
+pub use crate::cli::yaml_pattern_registry::{PatternScale, YamlPattern, ALL_PATTERNS};
 
 /// Generate YAML of approximately target_size bytes
 pub fn generate_yaml(target_size: usize, pattern: YamlPattern, seed: Option<u64>) -> String {

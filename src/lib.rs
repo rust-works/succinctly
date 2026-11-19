@@ -55,6 +55,18 @@ extern crate std as alloc;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+// #7384 prototype: the CLI is a module of this crate rather than a crate of its
+// own. Its generic calls into the evaluator are then instantiated in one crate,
+// next to the library's own, instead of once here and again in the binary
+// (stable Rust shares no generic instance between crates, and fat LTO does not
+// merge identical functions). `extern crate self` keeps its `succinctly::` paths.
+#[cfg(feature = "cli")]
+extern crate self as succinctly;
+#[cfg(feature = "cli")]
+#[doc(hidden)]
+#[path = "bin/succinctly/main.rs"]
+pub mod cli;
+
 // =============================================================================
 // Core modules (organized by category)
 // =============================================================================

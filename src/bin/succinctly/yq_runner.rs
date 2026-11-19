@@ -47,8 +47,8 @@ use succinctly::yaml::{
 
 use super::m2_gate::{can_use_m2_streaming, eval_all_matches_per_document, is_array_of_nodes};
 use super::{FrontMatterMode, InputFormat, OnError, OutputFormat, YqCommand};
-use crate::front_matter;
-use crate::output::{
+use crate::cli::front_matter;
+use crate::cli::output::{
     self, exit_codes, flush_then_err, ColorScheme, DiagStyle, ErrorSink, InputLocation,
     JsonFormatOpts, LoudFlushWriter, OutSink, Terminator,
 };
@@ -954,13 +954,13 @@ struct OutputConfig {
 impl OutputConfig {
     fn from_args(args: &YqCommand) -> Self {
         // Shares the jq runner's precedence, documented on `resolve_color`.
-        let use_color = crate::env_config::resolve_color(
+        let use_color = crate::cli::env_config::resolve_color(
             // #7051: yq's `-C` beats `-M` whatever their order, where jq's `-M` wins.
-            crate::env_config::ColorChoice::from_flags_force_color_wins(
+            crate::cli::env_config::ColorChoice::from_flags_force_color_wins(
                 args.monochrome_output,
                 args.color_output,
             ),
-            crate::env_config::no_color_from_env(),
+            crate::cli::env_config::no_color_from_env(),
             std::io::stdout().is_terminal(),
         );
 
@@ -1414,7 +1414,7 @@ fn empty_input_reads_as_flagged(
     // Done here, where every route's bytes pass before anything is indexed, and ahead of the
     // emptiness test: a file that is only the mark reads as an empty one.
     if format != InputFormat::Json {
-        let bom_len = crate::front_matter::leading_bom_len(&bytes);
+        let bom_len = crate::cli::front_matter::leading_bom_len(&bytes);
         bytes.drain(..bom_len);
         had_bom = bom_len > 0;
         // #6276: the break after a leading `--- text` line is lost to yq's header slurp. Not under
@@ -1457,7 +1457,7 @@ fn empty_input_reads_as_flagged(
 /// return. A form feed, vertical tab, no-break space or byte-order mark is not, and is refused.
 /// The same four bytes jq's lexer skips, so the one definition is `jq_runner`'s.
 fn is_json_whitespace(byte: u8) -> bool {
-    crate::jq_runner::is_json_whitespace(char::from(byte))
+    crate::cli::jq_runner::is_json_whitespace(char::from(byte))
 }
 
 /// Whether `bytes` hold no document as `format` reads them (#5478): nothing at all, or, for JSON,
@@ -1527,9 +1527,9 @@ fn input_file_holds_no_document_bytes(file: &str, format: InputFormat) -> bool {
         });
     }
     metadata.len() == 0
-        || (metadata.len() == crate::front_matter::UTF8_BOM.len() as u64
+        || (metadata.len() == crate::cli::front_matter::UTF8_BOM.len() as u64
             && std::fs::read(file)
-                .is_ok_and(|bytes| crate::front_matter::leading_bom_len(&bytes) == bytes.len()))
+                .is_ok_and(|bytes| crate::cli::front_matter::leading_bom_len(&bytes) == bytes.len()))
 }
 
 /// Whether this run is `-n`, which reads nothing and evaluates against yq's empty node (#7052).
@@ -13632,7 +13632,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     // #7019: read before the #5450 fold below, which moves a navigation inside an array, and before
     // the `-o` encoder is piped on.
     let results_have_no_document =
-        crate::yq_result_document::results_have_no_document(&program.expr);
+        crate::cli::yq_result_document::results_have_no_document(&program.expr);
     // #5450: `.a | [.[] | key]` is `[.a[] | key]`, whose key nodes keep their presentation. Not under
     // `--eval-all`, where an array collects every document's results into one (#4380).
     if !args.eval_all {
@@ -18065,7 +18065,7 @@ mod tests {
                 let input = dir.path().join("in.yaml");
                 std::fs::write(&input, "a: 1\n").expect("write input");
                 let deep = "def deep(m): if m == 0 then . else [deep(m - 1)] end; deep(400)";
-                let command = crate::YqCommand::parse_from([
+                let command = crate::cli::YqCommand::parse_from([
                     "yq",
                     "--jq-extensions",
                     "-o",
