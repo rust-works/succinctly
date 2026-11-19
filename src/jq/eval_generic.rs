@@ -50,9 +50,9 @@ use super::document::{
     effective_fields_checked, effective_fields_with_raw_last, effective_len_checked,
     effective_value_cursors_checked, empty_elements_tail_gap_ok, empty_fields_tail_gap_ok,
     key_delimiter_ok, key_display_string, key_display_string_kind, key_hash, key_is_malformed,
-    repeat_plan_checked, resolve_display_key, tail_gap_ok, trailing_element_gap_ok,
+    repeat_plan_checked, resolve_display_key, stream_len, tail_gap_ok, trailing_element_gap_ok,
     value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors, DocumentCursor, DocumentElements,
-    DocumentFields, DocumentValue, IndentSpec, JsonConvention, LazyKeyLedger,
+    DocumentFields, DocumentValue, EffectiveFields, IndentSpec, JsonConvention, LazyKeyLedger,
 };
 use super::encoder_comments::{EncoderComments, EncoderEntry, EncoderMembers, EncoderNodeComments};
 use super::error::EvalEscape;
@@ -41259,7 +41259,7 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 let cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
                 let mut entries: Vec<OwnedValue> = Vec::new();
                 for (i, elem_cursor) in cursors.into_iter().enumerate() {
-                    let mut entry = IndexMap::new();
+                    let mut entry = IndexMap::with_capacity(2);
                     entry.insert("key".to_string(), OwnedValue::Int(i as i64));
                     entry.insert(
                         "value".to_string(),
@@ -41284,8 +41284,6 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 if let Err(err) = empty_fields_tail_gap_ok(&fields, cursor.as_ref()) {
                     return GenericResult::Error(err);
                 }
-                // A loop for the same reason as the array arm above.
-                let mut entries: Vec<OwnedValue> = Vec::new();
                 // #2261: the *raw, pre-collapse* walk's own textually last
                 // field's value cursor -- not derivable from the collapsed
                 // list this loop iterates below, whose own last element can
@@ -41293,8 +41291,24 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 // key collapses (see `effective_fields_with_raw_last`'s own
                 // doc comment for why, and the well-formed case this would
                 // otherwise wrongly reject).
+                //
+                // #7260: an object the census accepts, with no key hash repeating under the mode's
+                // rule, is walked in place of that list (`stream_len`): every check below then
+                // passes, as the census's did, so only a value that will not materialize can
+                // still stop the walk, at the same field the list's walk stopped at. The list held
+                // 144 bytes per field for the whole loop (18 MiB on `wide-1mb`).
                 let (effective, last_value_cursor) =
-                    effective_fields_with_raw_last(&fields, S::COLLAPSE_DUPLICATE_KEYS);
+                    match stream_len(&fields, S::COLLAPSE_DUPLICATE_KEYS) {
+                        Some(len) => (EffectiveFields::walk(&fields, len), None),
+                        None => {
+                            let (list, last) =
+                                effective_fields_with_raw_last(&fields, S::COLLAPSE_DUPLICATE_KEYS);
+                            (EffectiveFields::listed(list), last)
+                        }
+                    };
+                // A loop for the same reason as the array arm above. Sized by the walk's count,
+                // where pushing grew it to the next power of two (#7260).
+                let mut entries: Vec<OwnedValue> = vec_with_capacity(effective.len());
                 for field in effective {
                     // A key that will not *decode* is preserved via its raw
                     // source span rather than raised on (#1247/#1642),
@@ -41338,7 +41352,9 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                     if !value_delimiter_ok::<V::Fields>(Some(&field.value), &field.value_cursor) {
                         return GenericResult::Error(fields.malformed_member_error());
                     }
-                    let mut entry = IndexMap::new();
+                    // #7260: sized for its two entries, where `new()` grows to three (192 bytes
+                    // where two take 128, on every entry).
+                    let mut entry = IndexMap::with_capacity(2);
                     entry.insert("key".to_string(), key);
                     entry.insert(
                         "value".to_string(),
@@ -48452,6 +48468,116 @@ mod tests {
         );
         assert!(repeat_plan_checked(&o, true, false).unwrap().is_none());
         assert!(repeat_plan_checked(&o, true, true).unwrap().is_some());
+    }
+
+    /// #7260: `effective_fields_checked_iter` hands out `effective_fields_checked`'s fields (key
+    /// and value, in its order, `len` of them) and raises its error wherever that raises, in both
+    /// modes; and `stream_len` accepts exactly the objects it walks in place of the list: well
+    /// formed, with no key hash shared under a collapse. Over JSON objects with no repeated key,
+    /// a few, every key repeated, two keys sharing a hash, members JSON never allowed, and wide
+    /// ones past the census's prefilter; and over YAML mappings with a merge, an alias and a
+    /// complex key.
+    #[cfg(feature = "std")]
+    #[test]
+    fn streamed_fields_match_the_field_list_7260() {
+        fn ids<F: DocumentFields>(
+            fields: impl Iterator<Item = super::super::document::DocumentField<F::Value, F::Cursor>>,
+        ) -> Vec<(usize, usize)> {
+            fields
+                .map(|f| (f.key_cursor.node_id(), f.value_cursor.node_id()))
+                .collect()
+        }
+        fn check<F: DocumentFields>(fields: &F, what: &str) -> (bool, bool) {
+            let mut streamed_any = false;
+            let mut raised = false;
+            for collapse in [false, true] {
+                let list = effective_fields_checked(fields, collapse)
+                    .map(|list| ids::<F>(list.into_iter()))
+                    .map_err(|e| alloc::format!("{e:?}"));
+                let iter = super::super::document::effective_fields_checked_iter(fields, collapse)
+                    .map_err(|e| alloc::format!("{e:?}"));
+                let len = iter.as_ref().map(ExactSizeIterator::len).ok();
+                let walked = iter.map(|it| ids::<F>(it));
+                assert_eq!(walked, list, "{what} collapse={collapse}");
+                assert_eq!(
+                    len,
+                    list.as_ref().ok().map(Vec::len),
+                    "{what} collapse={collapse}"
+                );
+                let streamed = stream_len(fields, collapse);
+                if let Some(n) = streamed {
+                    // Accepted only where the list is the raw walk, unchanged.
+                    let raw =
+                        effective_fields_checked(fields, false).map(|l| ids::<F>(l.into_iter()));
+                    assert_eq!(Ok(n), list.as_ref().map(Vec::len).map_err(|_| ()), "{what}");
+                    assert_eq!(raw.ok(), list.clone().ok(), "{what} collapse={collapse}");
+                    streamed_any = true;
+                }
+                raised |= list.is_err();
+            }
+            (streamed_any, raised)
+        }
+
+        let mut documents: Vec<alloc::vec::Vec<u8>> = [
+            &b"{}"[..],
+            br#"{"a":1}"#,
+            br#"{"a":1,"b":[2],"c":{"d":3}}"#,
+            br#"{"a":1,"b":2,"a":3}"#,
+            br#"{"a":1,"a":2,"a":3,"a":4}"#,
+            br#"{"\u0061":1,"a":2}"#,
+            br#"{"key-one-padding!":1,"kwjfpwvojvWuiqDf":2}"#,
+            br#"{"a":1,}"#,
+            br#"{"a":{"b":1},}"#,
+            br#"{"a":1 "b":2}"#,
+            br#"{"a" 1,"b":2}"#,
+            br#"{a:1,"b":2}"#,
+            br#"{"a":1,"b"}"#,
+            br#"{"a":1,,"b":2}"#,
+        ]
+        .iter()
+        .map(|d| d.to_vec())
+        .collect();
+        // Past `SMALL_OBJECT_FIELDS` and the prefilter's 128-hash gate: distinct keys, a repeat
+        // at the end, and the same two with a stray comma before the `}`.
+        for (n, distinct, tail) in [
+            (300, 300, ""),
+            (300, 250, ""),
+            (300, 300, ","),
+            (300, 250, ","),
+        ] {
+            let members: Vec<String> = (0..n)
+                .map(|i| alloc::format!("\"k{}\":{i}", i % distinct))
+                .collect();
+            documents.push(alloc::format!("{{{}{tail}}}", members.join(",")).into_bytes());
+        }
+        let (mut streamed, mut raised) = (0, 0);
+        for json in &documents {
+            let index = JsonIndex::build(json);
+            let fields = index.root(json).value().as_object().expect("an object");
+            let (s, r) = check(&fields, &String::from_utf8_lossy(json));
+            streamed += usize::from(s);
+            raised += usize::from(r);
+        }
+        // Every well-formed document streams at least without a collapse; the nine malformed
+        // ones (seven short, two wide) raise and never stream.
+        assert_eq!((streamed, raised), (documents.len() - 9, 9));
+
+        use crate::yaml::YamlIndex;
+        let yaml: &[u8] = b"a: 1\nb: 2\na: 3\nm: &m {x: 1, y: 2}\nn: {p: 1, q: 2, p: 3}\n\
+            k: {<<: *m, y: 3, w: 4}\no: {? [1, 2] : p, ? [1, 2] : q, r: *m}\ne: {}\n";
+        let index = YamlIndex::build_yq(yaml).unwrap();
+        let top = index.root(yaml).first_child().expect("a document");
+        let top_fields = top.value().as_object().expect("a mapping");
+        let mut mappings = alloc::vec![top_fields.clone()];
+        for name in ["m", "n", "k", "o", "e"] {
+            let found = DocumentFields::find_cursor(&top_fields, name)
+                .unwrap()
+                .expect(name);
+            mappings.push(found.value().as_object().expect("a mapping"));
+        }
+        for fields in &mappings {
+            assert_eq!(check(fields, "yaml"), (true, false));
+        }
     }
 
     /// #7278: `borrowed_document_number` answers exactly the repr `to_owned_cursor` builds for a
