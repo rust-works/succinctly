@@ -11787,7 +11787,9 @@ fn windowed_seq_file(args: &JqCommand) -> Option<WindowedSource> {
     let files = get_input_files(args);
     SEQ_FILES_TAIL.with(|tail| *tail.borrow_mut() = None);
     SEQ_PIPE_TAIL.with(|tail| *tail.borrow_mut() = None);
-    let Some((files, reader, reread)) = windowed_source(args) else {
+    let Some((files, reader, reread)) =
+        windowed_source(args, window::min_windowed_seq_file_bytes())
+    else {
         // #7164: a pipe on standard input, which cannot be read twice, is certified as it is read.
         return files.is_empty().then(windowed_seq_pipe).flatten();
     };
@@ -11900,7 +11902,7 @@ fn windowed_plain_file(args: &JqCommand) -> Option<WindowedSource> {
     if args.slurp || args.validate || args.seq || args.null_input {
         return None;
     }
-    windowed_source(args).or_else(|| {
+    windowed_source(args, window::min_windowed_file_bytes()).or_else(|| {
         // #7024: a pipe on standard input, read a window at a time with its first fault kept as it is
         // read (`--seq` over a pipe is [`windowed_seq_pipe`]'s, #7164).
         get_input_files(args)
@@ -11919,19 +11921,20 @@ type WindowedSource = (
 );
 
 /// The source [`windowed_plain_file`] and [`windowed_seq_file`] read a window at a time, once their own
-/// flags have let the run through: a regular file of 4 MiB or more named on the command line, several
-/// regular files, or standard input when it is one (#7024).
-fn windowed_source(args: &JqCommand) -> Option<WindowedSource> {
+/// flags have let the run through: a regular file of `min` bytes or more named on the command line
+/// (4 MiB for the plain route, [`window::min_windowed_seq_file_bytes`] for `--seq`, #7260), several
+/// regular files (4 MiB or more between them), or standard input when it is one (#7024).
+fn windowed_source(args: &JqCommand, min: u64) -> Option<WindowedSource> {
     let files = get_input_files(args);
     if files.is_empty() {
-        let (reader, reread) = windowed_stdin_file()?;
+        let (reader, reread) = windowed_stdin_file(min)?;
         return Some((files, reader, reread));
     }
     if files.len() > 1 {
         let (reader, reread) = windowed_regular_files(&files)?;
         return Some((files, reader, reread));
     }
-    let (path, meta) = lone_regular_file(&files, window::min_windowed_file_bytes())?;
+    let (path, meta) = lone_regular_file(&files, min)?;
     let file = std::fs::File::open(path).ok()?;
     let reread = window::Reread::new(&file, 0, meta.len(), path.clone()).ok()?;
     Some((
@@ -12075,9 +12078,9 @@ fn lone_regular_file(files: &[PathBuf], min_len: u64) -> Option<(&PathBuf, std::
 /// A terminal, a pipe, a device and every standard input [`stdin_to_window`] turns down are left to that
 /// route.
 #[cfg(unix)]
-fn windowed_stdin_file() -> Option<(window::WindowedFiles, std::rc::Rc<window::Reread>)> {
+fn windowed_stdin_file(min: u64) -> Option<(window::WindowedFiles, std::rc::Rc<window::Reread>)> {
     let (file, _) = stdin_to_window()?;
-    windowed_regular_stdin(file, false)
+    windowed_regular_stdin(file, false, min)
 }
 
 /// Whether a failed read says the descriptor was not opened for reading (`EBADF`: `jq . 0>file`). Rust's
@@ -12158,12 +12161,13 @@ fn probe_stdin_pipe(file: &std::fs::File, min: u64) -> Option<Vec<u8>> {
 fn windowed_regular_stdin(
     mut file: std::fs::File,
     shares_output: bool,
+    min: u64,
 ) -> Option<(window::WindowedFiles, std::rc::Rc<window::Reread>)> {
     if shares_output {
         return None;
     }
     let meta = file.metadata().ok()?;
-    let (start, len) = regular_stdin_left(&mut file, &meta, window::min_windowed_file_bytes())?;
+    let (start, len) = regular_stdin_left(&mut file, &meta, min)?;
     let reread = window::Reread::new(&file, start, len, PathBuf::new()).ok()?;
     Some((
         window::WindowedFiles::new(vec![(std::rc::Rc::new(file), len)], window::window_bytes()),
@@ -12172,7 +12176,7 @@ fn windowed_regular_stdin(
 }
 
 #[cfg(not(unix))]
-fn windowed_stdin_file() -> Option<(window::WindowedFiles, std::rc::Rc<window::Reread>)> {
+fn windowed_stdin_file(_min: u64) -> Option<(window::WindowedFiles, std::rc::Rc<window::Reread>)> {
     None
 }
 
@@ -22630,6 +22634,65 @@ mod tests {
         }
     }
 
+    /// #7260: a lone `--seq` file is read a window at a time from 64 KiB, where the plain route waits for
+    /// 4 MiB: plain records with each RS blanked, and one with a record that is not plain through the gate
+    /// that carries on past it. A file under 64 KiB keeps the route that reads it whole, and so does a
+    /// plain JSON file of 64 KiB.
+    #[cfg(unix)]
+    #[test]
+    fn a_lone_seq_file_of_64_kib_is_windowed_7260() {
+        use clap::Parser;
+        let min = window::min_windowed_seq_file_bytes() as usize;
+        assert!(min < window::min_windowed_file_bytes() as usize);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut records = Vec::new();
+        let mut n = 0;
+        while records.len() < min {
+            records.extend_from_slice(format!("\x1e{{\"n\":{n}}}\n").as_bytes());
+            n += 1;
+        }
+        let write = |name: &str, bytes: &[u8]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).expect("written");
+            path.to_string_lossy().into_owned()
+        };
+        // (windowed, gated) for `args` over the file `path`.
+        let route = |args: &[&str], path: &str| {
+            let mut argv = vec!["jq"];
+            argv.extend_from_slice(args);
+            argv.push(path);
+            let cmd = JqCommand::try_parse_from(argv).unwrap();
+            let windowed = windowed_seq_file(&cmd);
+            let gated = SEQ_PIPE_TAIL
+                .with(|tail| tail.borrow_mut().take())
+                .is_some();
+            (windowed.is_some(), gated)
+        };
+        let good = write("good.seq", &records);
+        assert_eq!(route(&["--seq", "."], &good), (true, false));
+        let bad = write("bad.seq", &[b"\x1e{\"cut\n".as_slice(), &records].concat());
+        assert_eq!(route(&["--seq", "."], &bad), (true, true));
+        let mut short = records.clone();
+        let last = short[..short.len() - 1]
+            .iter()
+            .rposition(|&b| b == 0x1e)
+            .expect("a record");
+        short.truncate(last);
+        assert!(short.len() < min);
+        let short = write("short.seq", &short);
+        assert_eq!(route(&["--seq", "."], &short), (false, false));
+        // The plain route's own minimum is unchanged.
+        let plain = write(
+            "plain.json",
+            &records
+                .iter()
+                .map(|&b| if b == 0x1e { b' ' } else { b })
+                .collect::<Vec<_>>(),
+        );
+        let cmd = JqCommand::try_parse_from(["jq", ".", plain.as_str()]).unwrap();
+        assert!(windowed_plain_file(&cmd).is_none());
+    }
+
     /// #7082: `--seq` reads a window at a time only for one regular file, or several, of RFC 7464's own framing that is
     /// big enough to be worth it, on a run that reads the records in order. Anything else, whatever is wrong
     /// with it, is left to the route that walks the stream whole, except that a lone file is read as a pipe
@@ -23041,35 +23104,42 @@ mod tests {
         }
     }
 
-    /// #7024: a standard input is windowed only when it is a regular file with 4 MiB or more left from its
-    /// offset that the run does not also write to.
+    /// #7024: a standard input is windowed only when it is a regular file with the route's minimum or more
+    /// left from its offset (4 MiB for the plain route, #7260: 64 KiB for `--seq`) that the run does not
+    /// also write to.
     #[cfg(unix)]
     #[test]
     fn windowed_regular_stdin_takes_only_a_big_regular_file_7024() {
         use std::io::{Seek, SeekFrom, Write};
-        let min = window::min_windowed_file_bytes();
         let at = |len: u64, offset: u64| {
             let mut file = tempfile::tempfile().expect("tempfile");
             file.set_len(len).expect("set_len");
             file.seek(SeekFrom::Start(offset)).expect("seek");
             file
         };
-        assert!(windowed_regular_stdin(at(min, 0), false).is_some());
-        assert!(windowed_regular_stdin(at(min * 2, min), false).is_some());
-        // Under 4 MiB, or under it from the offset, or an offset past the end.
-        assert!(windowed_regular_stdin(at(min - 1, 0), false).is_none());
-        assert!(windowed_regular_stdin(at(min * 2, min + 1), false).is_none());
-        assert!(windowed_regular_stdin(at(10, 20), false).is_none());
-        // A file the run writes to as well.
-        assert!(windowed_regular_stdin(at(min, 0), true).is_none());
-        // A pipe is not a file.
-        let (reader, mut writer) = std::io::pipe().expect("pipe");
-        writer.write_all(b"{}").expect("write");
-        assert!(windowed_regular_stdin(
-            std::fs::File::from(std::os::fd::OwnedFd::from(reader)),
-            false
-        )
-        .is_none());
+        assert_eq!(window::min_windowed_seq_file_bytes(), 64 << 10);
+        for min in [
+            window::min_windowed_file_bytes(),
+            window::min_windowed_seq_file_bytes(),
+        ] {
+            assert!(windowed_regular_stdin(at(min, 0), false, min).is_some());
+            assert!(windowed_regular_stdin(at(min * 2, min), false, min).is_some());
+            // Under the minimum, or under it from the offset, or an offset past the end.
+            assert!(windowed_regular_stdin(at(min - 1, 0), false, min).is_none());
+            assert!(windowed_regular_stdin(at(min * 2, min + 1), false, min).is_none());
+            assert!(windowed_regular_stdin(at(10, 20), false, min).is_none());
+            // A file the run writes to as well.
+            assert!(windowed_regular_stdin(at(min, 0), true, min).is_none());
+            // A pipe is not a file.
+            let (reader, mut writer) = std::io::pipe().expect("pipe");
+            writer.write_all(b"{}").expect("write");
+            assert!(windowed_regular_stdin(
+                std::fs::File::from(std::os::fd::OwnedFd::from(reader)),
+                false,
+                min
+            )
+            .is_none());
+        }
     }
 
     /// #7024: a read the probe of a pipe made that failed before 4 MiB is the whole route's to take up,

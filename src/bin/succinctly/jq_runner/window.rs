@@ -139,6 +139,18 @@ pub(super) fn min_windowed_file_bytes() -> u64 {
     4 * window_bytes() as u64
 }
 
+/// The smallest lone `--seq` regular file (named, or on standard input) the route reads a window at a
+/// time, a sixteenth of a window (64 KiB in every build that ships), where the plain route waits for
+/// [`min_windowed_file_bytes`] (#7260). The whole-file route walks a `--seq` stream that is not plain
+/// records with jq's reader and converts every record to an owned value, which cost a 1 MiB stream with
+/// one bad record 17-18% of its time against the windows that carry on past it (#7322); a stream that
+/// is plain records takes as long either way, so the windows take both. Below this the run is its
+/// startup, and the file keeps the route that reads it whole.
+#[inline]
+pub(super) fn min_windowed_seq_file_bytes() -> u64 {
+    (window_bytes() / 16) as u64
+}
+
 /// The window of a lone `--seq` file whose first byte is not an RS (#7312): [`SeqGate`] hands the stream
 /// on at that byte whatever is read, so the first read, which is all the gate looks at, is a page and
 /// not a [`WINDOW_BYTES`] block that is filled, found to be all tail and freed, which the allocator
