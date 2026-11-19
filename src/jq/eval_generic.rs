@@ -31844,9 +31844,13 @@ pub(crate) mod number_sort_count {
 /// element, as for the `min`/`max` walk: the caller then takes the general route, unchanged. The
 /// elements' gaps were checked when `cursors` was collected, and a number read bare never fails to
 /// decode, so this route raises nothing.
+///
+/// `sort_by(.)`, `unique_by(.)` and `group_by(.)` take it too: their key `[.]` orders and equates
+/// one-element arrays as their elements, and a number's key filter cannot fail or have an effect.
+/// A group is a run of equal numbers in the sorted order, as `group_by_array_generic` cuts one.
 fn sort_document_numbers<S: EvalSemantics, V: DocumentValue>(
     cursors: &mut Vec<V::Cursor>,
-    dedup: bool,
+    out: NumberSortOut,
 ) -> Option<GenericResult<V>> {
     /// Marks a permuted slot (and bounds how many elements an index can name).
     const DONE: u32 = u32::MAX;
@@ -31881,7 +31885,18 @@ fn sort_document_numbers<S: EvalSemantics, V: DocumentValue>(
     // The index breaks every tie, so the unstable sort leaves equal numbers in input order, as
     // jq's sort does, and needs no buffer.
     keys.sort_unstable_by(|a, b| value_order(a, b).then(a.1.cmp(&b.1)));
-    if dedup {
+    let mut ends = Vec::new();
+    if out == NumberSortOut::Groups {
+        for i in 1..keys.len() {
+            if value_order(&keys[i - 1], &keys[i]) != core::cmp::Ordering::Equal {
+                ends.push(i);
+            }
+        }
+        if !keys.is_empty() {
+            ends.push(keys.len());
+        }
+    }
+    if out == NumberSortOut::Unique {
         // `unique` keeps the first of each run of equal numbers, as `dedup_by` on the sorted keys.
         keys.dedup_by(|later, earlier| value_order(earlier, later) == core::cmp::Ordering::Equal);
         let kept = keys
@@ -31912,9 +31927,20 @@ fn sort_document_numbers<S: EvalSemantics, V: DocumentValue>(
         }
     }
     drop(keys);
-    Some(GenericResult::LazySeq(Box::new(LazySeq::from_cursors(
-        core::mem::take(cursors),
-    ))))
+    let sorted = core::mem::take(cursors);
+    Some(GenericResult::LazySeq(Box::new(match out {
+        NumberSortOut::Groups => LazySeq::from_groups(sorted, ends, S::TAG),
+        _ => LazySeq::from_cursors(sorted),
+    })))
+}
+
+/// What [`sort_document_numbers`] answers with: the sorted elements, the first of each run of
+/// equal ones (`unique`), or the runs as groups (`group_by(.)`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NumberSortOut {
+    Sorted,
+    Unique,
+    Groups,
 }
 
 /// How [`walk_elements_checked`] ended before the last element.
@@ -42031,9 +42057,14 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
             // comment above for why).
             let mut cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
             // #7260: an array of document numbers sorts on their parsed values, not on decoded
-            // copies of every element.
-            if key.is_none() {
-                if let Some(sorted) = sort_document_numbers::<S, V>(&mut cursors, dedup) {
+            // copies of every element; `[.]` keys a number as the number itself.
+            if key.map_or(true, |f| unwrap_paren(f).is_identity()) {
+                let out = if dedup {
+                    NumberSortOut::Unique
+                } else {
+                    NumberSortOut::Sorted
+                };
+                if let Some(sorted) = sort_document_numbers::<S, V>(&mut cursors, out) {
                     return sorted;
                 }
             }
@@ -42089,7 +42120,15 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
             if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
                 return GenericResult::Error(err);
             }
-            let cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
+            let mut cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
+            // #7260: `group_by(.)` over document numbers, as `sort` sorts them.
+            if unwrap_paren(f).is_identity() {
+                if let Some(groups) =
+                    sort_document_numbers::<S, V>(&mut cursors, NumberSortOut::Groups)
+                {
+                    return groups;
+                }
+            }
             group_by_array_generic::<S, V>(f, cursors, optional)
         }
 
@@ -48194,8 +48233,9 @@ mod tests {
         }
     }
 
-    /// #7260: jq's bare `sort`/`unique` over an array of document numbers sort on the numbers'
-    /// parsed values (`sort_document_numbers`), and each answer, spellings and tie order included,
+    /// #7260: jq's bare `sort`/`unique`, and `sort_by(.)`/`unique_by(.)`/`group_by(.)`, over an
+    /// array of document numbers sort on the numbers' parsed values (`sort_document_numbers`), and
+    /// each answer, spellings and tie order included,
     /// is the full evaluator's (the bridge), which decodes every element and sorts the decoded
     /// values. An array holding anything else, or a NaN, keeps the decoded route (0 sorts). The pin
     /// can fail: with the dispatch removed every number row reads 0 sorts, and with the index
@@ -48272,15 +48312,23 @@ mod tests {
         ];
         for (json, takes_it) in arrays {
             let text = String::from_utf8_lossy(json);
-            for filter in ["sort", "unique"] {
+            for filter in [
+                "sort",
+                "unique",
+                "sort_by(.)",
+                "unique_by(.)",
+                "group_by(.)",
+            ] {
                 let (native, sorts) = run(json, filter, false);
                 let (bridged, _) = run(json, filter, true);
                 assert_eq!(native, bridged, "{filter} over {text}");
                 assert_eq!(sorts, usize::from(*takes_it), "{filter} over {text}");
             }
         }
-        // The `_by` forms keep the keyed route.
-        assert_eq!(run(b"[3,1,2]", "sort_by(.)", false).1, 0);
+        // A key filter other than `.` keeps the keyed route.
+        for filter in ["sort_by(-.)", "unique_by(. + 0)", "group_by(. % 2)"] {
+            assert_eq!(run(b"[3,1,2]", filter, false).1, 0, "{filter}");
+        }
     }
 
     /// #7306: `min_by`/`max_by` over a document array take the keyed walk
