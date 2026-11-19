@@ -31544,6 +31544,19 @@ impl AddFold {
         // as written. A `-0` literal reads as `-0.0`, as `arith_add` reads it.
         if self.failed.is_none() && self.total.as_ref().is_some_and(OwnedValue::is_number) {
             if let Some(number) = borrowed_document_number::<S, _>(element) {
+                // #7384: a float sum takes a document float in place, which is what `arith_add`'s
+                // `(Float, Float)` arm computes (`negative_zero` is never set on a float: it is
+                // the sign of an integer zero). The general route below takes the sum out, builds
+                // the operand and calls `arith_add`, moving two `OwnedValue`s through memory for
+                // every element. With it `.numbers | add` over 100 MB of floats took 493 ms on an
+                // M4 Pro and 450 on a Ryzen 9 7950X, where the binary built before #7384 took 568
+                // and 552, and this branch without it 744 and 571.
+                if let (Some(OwnedValue::Float(sum)), NumberRepr::Float(f)) =
+                    (&mut self.total, number.repr)
+                {
+                    *sum += f;
+                    return Ok(());
+                }
                 let operand = match number.repr {
                     _ if number.negative_zero => OwnedValue::Float(-0.0),
                     NumberRepr::Int(i) => OwnedValue::Int(i),
@@ -48488,6 +48501,63 @@ mod tests {
             elems = rest;
         }
         assert_eq!((numbers, others, zeros), (24, 5, 1));
+    }
+
+    /// #7384: `add` over a document array adds a float to a float sum in place, and answers what
+    /// the full evaluator answers for the same array: signed zeros in every order, a sum that
+    /// overflows to infinity, integers mixed in before and after the sum turns float, a first
+    /// number's spelling, `null` and a type error.
+    #[cfg(feature = "std")]
+    #[test]
+    fn float_sum_adds_in_place_as_arith_add_7384() {
+        type V<'a> = crate::json::light::StandardJson<'a, Vec<u64>>;
+        fn run(json: &[u8], via_bridge: bool) -> String {
+            let expr = crate::jq::parse("add").unwrap();
+            let index = JsonIndex::build(json);
+            let root = index.root(json);
+            let result = if via_bridge {
+                bridge_to_full_evaluator::<JqSemantics, V<'_>>(
+                    &expr,
+                    root.value(),
+                    Some(root),
+                    false,
+                )
+            } else {
+                eval_using::<JqSemantics, _>(&expr, root.value())
+            };
+            match result.collect_owned::<JqSemantics>() {
+                Ok(values) => values
+                    .iter()
+                    .map(OwnedValue::to_json)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                Err(e) => format!("error: {}", e.message),
+            }
+        }
+        let arrays: &[&[u8]] = &[
+            b"[1.5,2.25,0.125]",
+            b"[-0.0,-0.0,-0.0]",
+            b"[-0.0,-0.0,0.0]",
+            b"[0.0,-0.0,-0.0]",
+            b"[-0.0,-0,-0.0]",
+            b"[1e308,1e308,-1e308]",
+            b"[0.1,0.2,0.3,1,2]",
+            b"[1,2,0.5,0.25,3]",
+            b"[1.50,2.5]",
+            b"[1.5,null,2.5,0.5]",
+            b"[1.5,2.5,\"x\"]",
+        ];
+        for json in arrays {
+            let text = String::from_utf8_lossy(json);
+            let before = add_walk_count::get();
+            let native = run(json, false);
+            assert_eq!(
+                add_walk_count::get() - before,
+                1,
+                "add over {text} took the fold"
+            );
+            assert_eq!(native, run(json, true), "add over {text}");
+        }
     }
 
     /// #6534: in yq mode a string's `length` inside a loop body is read off the string, not off a
