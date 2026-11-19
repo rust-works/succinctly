@@ -8456,8 +8456,14 @@ fn read_inputs(
     // jq -R -s: the entire input (all files concatenated) becomes a single
     // string; no line splitting and no array wrap.
     if args.raw_input && args.slurp && args.input_dsv.is_none() {
-        let mut combined = String::new();
-        for (_, raw) in &raw_inputs {
+        // The first input's buffer becomes the string, and the rest are appended to it once,
+        // so a single input is moved and not copied: the run held two copies of its text where
+        // jq holds about 1.6 (#7260).
+        let rest: usize = raw_inputs.iter().skip(1).map(|(_, raw)| raw.len()).sum();
+        let mut sources = raw_inputs.iter_mut().map(|(_, raw)| raw);
+        let mut combined = sources.next().map(std::mem::take).unwrap_or_default();
+        combined.reserve_exact(rest);
+        for raw in sources {
             combined.push_str(raw);
         }
         // `slurp_eof_line`'s only `None` case is gated on `!args.raw_input`
