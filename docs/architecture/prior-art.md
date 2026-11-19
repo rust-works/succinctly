@@ -141,7 +141,7 @@ therefore unusable from succinctly's `no_std` core.
 
 ### Online Resources
 
-- Drepper, U. [What Every Programmer Should Know About Memory](https://people.freebsd.org/~lstewart/articles/cpumemory.pdf)
+- Drepper, U. [What Every Programmer Should Know About Memory](https://www.akkadia.org/drepper/cpumemory.pdf)
 - Fog, A. [Optimizing Software in C++](https://www.agner.org/optimize/optimizing_cpp.pdf)
 - [Intel Intrinsics Guide](https://www.intel.com/content/www/us/en/docs/intrinsics-guide)
 - [ARM NEON Intrinsics Reference](https://developer.arm.com/architectures/instruction-sets/intrinsics/)
