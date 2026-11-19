@@ -31818,6 +31818,114 @@ fn extremum_streaming_generic<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
+/// How many times [`sort_document_numbers`] answered on this thread, so a test can assert that a
+/// bare `sort`/`unique` over document numbers takes it (#7260). `cfg(test)` only.
+#[cfg(test)]
+pub(crate) mod number_sort_count {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn bump() {
+        COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn get() -> usize {
+        COUNT.with(Cell::get)
+    }
+}
+
+/// jq's bare `sort` (and `unique`, a sort and a dedup) over an array whose every element is a
+/// document number, keyed by each number's parsed value alone (#7260): `key_elements_generic`
+/// decoded each element into an `OwnedValue::NumberLiteral` holding an owned copy of its spelling,
+/// paired it with its cursor (64 bytes an element), and the stable sort then took a scratch buffer
+/// of the same size; `.numbers | sort` over 70,000 numbers held 10.75 MiB at its peak, where jq
+/// 1.7.1 holds 8.35 MiB. Here an element is its parsed value and its index (24 bytes), sorted in
+/// place with the index as the last tie-break (the order a stable sort gives, with no scratch), and
+/// the cursors are permuted in place. Only a double tie between two keys reads the two spellings,
+/// off the document, as jq's exact literal comparison does ([`extremum_streaming_generic`]).
+///
+/// `None` (nothing done but the reads) when an element is not such a number -- any other value, a
+/// NaN literal (whose comparison rules are `sort_like_jq`'s, #6008) or a number `to_owned_cursor`
+/// would not build bare -- and while a binding's embedded node could be handed back for an
+/// element, as for the `min`/`max` walk: the caller then takes the general route, unchanged. The
+/// elements' gaps were checked when `cursors` was collected, and a number read bare never fails to
+/// decode, so this route raises nothing.
+fn sort_document_numbers<S: EvalSemantics, V: DocumentValue>(
+    cursors: &mut Vec<V::Cursor>,
+    dedup: bool,
+) -> Option<GenericResult<V>> {
+    /// Marks a permuted slot (and bounds how many elements an index can name).
+    const DONE: u32 = u32::MAX;
+    if S::TAG != EvalTag::Jq || embed_table::live() || cursors.len() >= DONE as usize {
+        return None;
+    }
+    let mut keys: Vec<(NumberRepr, u32)> = vec_with_capacity(cursors.len());
+    for (index, cursor) in cursors.iter().enumerate() {
+        let repr = match cursor
+            .text_position()
+            .and_then(|pos| cursor.plain_int_at(pos))
+        {
+            Some(i) => NumberRepr::Int(i),
+            None => match borrowed_document_number::<S, _>(cursor)?.repr {
+                NumberRepr::Float(f) if f.is_nan() => return None,
+                repr => repr,
+            },
+        };
+        keys.push((repr, index as u32));
+    }
+    #[cfg(test)]
+    number_sort_count::bump();
+    let parts = |repr: NumberRepr| match repr {
+        NumberRepr::Int(i) => (jq_literal_int_to_f64(i), Some(i)),
+        NumberRepr::Float(f) => (f, None),
+    };
+    let value_order = |a: &(NumberRepr, u32), b: &(NumberRepr, u32)| {
+        crate::jq::value::cmp_jq_number_literals(parts(a.0), parts(b.0), || {
+            literal_spellings_cmp(&cursors[a.1 as usize], &cursors[b.1 as usize])
+        })
+    };
+    // The index breaks every tie, so the unstable sort leaves equal numbers in input order, as
+    // jq's sort does, and needs no buffer.
+    keys.sort_unstable_by(|a, b| value_order(a, b).then(a.1.cmp(&b.1)));
+    if dedup {
+        // `unique` keeps the first of each run of equal numbers, as `dedup_by` on the sorted keys.
+        keys.dedup_by(|later, earlier| value_order(earlier, later) == core::cmp::Ordering::Equal);
+        let kept = keys
+            .iter()
+            .map(|&(_, index)| cursors[index as usize])
+            .collect();
+        return Some(GenericResult::LazySeq(Box::new(LazySeq::from_cursors(
+            kept,
+        ))));
+    }
+    // `keys[i].1` is the element that goes to position `i`: follow each cycle of that permutation,
+    // marking the slots it fills.
+    for start in 0..keys.len() {
+        if keys[start].1 == DONE {
+            continue;
+        }
+        let saved = cursors[start];
+        let mut at = start;
+        loop {
+            let from = keys[at].1 as usize;
+            keys[at].1 = DONE;
+            if from == start {
+                cursors[at] = saved;
+                break;
+            }
+            cursors[at] = cursors[from];
+            at = from;
+        }
+    }
+    drop(keys);
+    Some(GenericResult::LazySeq(Box::new(LazySeq::from_cursors(
+        core::mem::take(cursors),
+    ))))
+}
+
 /// How [`walk_elements_checked`] ended before the last element.
 enum ElementWalkFault<E> {
     /// A malformed `,` before an element or a stray one after the last (#1677, #2261): the error
@@ -41857,7 +41965,14 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
             // so ignoring it here was the same asymmetry #2280 fixed for
             // Format/Path/GetPath. Defensive today (see `Reverse`'s sibling
             // comment above for why).
-            let cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
+            let mut cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
+            // #7260: an array of document numbers sorts on their parsed values, not on decoded
+            // copies of every element.
+            if key.is_none() {
+                if let Some(sorted) = sort_document_numbers::<S, V>(&mut cursors, dedup) {
+                    return sorted;
+                }
+            }
             // #4054: yq runs a `sort_by`/`unique_by` key filter read-only, so an absent key is no
             // output (see `eval::by_key_scope`). Not `min_by`/`max_by`, which are gated extensions
             // that follow jq and sit in the arm below.
@@ -48013,6 +48128,95 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #7260: jq's bare `sort`/`unique` over an array of document numbers sort on the numbers'
+    /// parsed values (`sort_document_numbers`), and each answer, spellings and tie order included,
+    /// is the full evaluator's (the bridge), which decodes every element and sorts the decoded
+    /// values. An array holding anything else, or a NaN, keeps the decoded route (0 sorts). The pin
+    /// can fail: with the dispatch removed every number row reads 0 sorts, and with the index
+    /// tie-break dropped the `1,1.0,1.00` rows come out of input order.
+    #[cfg(feature = "std")]
+    #[test]
+    fn number_sorts_take_the_parsed_value_route_7260() {
+        type V<'a> = crate::json::light::StandardJson<'a, Vec<u64>>;
+        fn shown(result: GenericResult<V<'_>>) -> String {
+            match result {
+                GenericResult::Error(e) | GenericResult::Partial(_, Control::Error(e)) => {
+                    format!("error: {}", e.message)
+                }
+                other => other.collect_owned::<JqSemantics>().map_or_else(
+                    |e| format!("error: {}", e.message),
+                    |values| {
+                        values
+                            .iter()
+                            .map(OwnedValue::to_json)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    },
+                ),
+            }
+        }
+        fn run(json: &[u8], filter: &str, via_bridge: bool) -> (String, usize) {
+            let expr = crate::jq::parse(filter).unwrap();
+            let index = JsonIndex::build(json);
+            let root = index.root(json);
+            let before = number_sort_count::get();
+            let result = if via_bridge {
+                bridge_to_full_evaluator::<JqSemantics, V<'_>>(
+                    &expr,
+                    root.value(),
+                    Some(root),
+                    false,
+                )
+            } else {
+                eval_using::<JqSemantics, _>(&expr, root.value())
+            };
+            (shown(result), number_sort_count::get() - before)
+        }
+        let mut ties = String::from("[");
+        for i in 0..90 {
+            let spelling = ["2.0", "2", "2.00", "1e0", "1", "1.0", "-0", "0", "0.0"][i % 9];
+            if i > 0 {
+                ties.push(',');
+            }
+            ties.push_str(spelling);
+        }
+        ties.push(']');
+        let arrays: &[(&[u8], bool)] = &[
+            (b"[]", true),
+            (b"[5]", true),
+            (b"[3,1,2]", true),
+            (b"[1,1.0,1.00]", true),
+            (b"[1.00,1.0,1]", true),
+            (b"[100000000000000000001,100000000000000000000,1e20]", true),
+            (
+                b"[123456789012345679,123456789012345678.9,123456789012345678]",
+                true,
+            ),
+            (b"[1e1000,1,-1e1000,1e2000]", true),
+            (b"[-0,0,-0.0,0.0,-1e-400,1e-400]", true),
+            (
+                b"[9223372036854775807,9223372036854775808,-9223372036854775808]",
+                true,
+            ),
+            (ties.as_bytes(), true),
+            (b"[null,false,true,0,\"a\",[],{}]", false),
+            (b"[1,2,\"a\"]", false),
+            (b"[nan,1]", false),
+            (b"[1,nan]", false),
+        ];
+        for (json, takes_it) in arrays {
+            let text = String::from_utf8_lossy(json);
+            for filter in ["sort", "unique"] {
+                let (native, sorts) = run(json, filter, false);
+                let (bridged, _) = run(json, filter, true);
+                assert_eq!(native, bridged, "{filter} over {text}");
+                assert_eq!(sorts, usize::from(*takes_it), "{filter} over {text}");
+            }
+        }
+        // The `_by` forms keep the keyed route.
+        assert_eq!(run(b"[3,1,2]", "sort_by(.)", false).1, 0);
     }
 
     /// #7306: `min_by`/`max_by` over a document array take the keyed walk
