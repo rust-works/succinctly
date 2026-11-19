@@ -90,6 +90,18 @@ jobs:
         RUSTFLAGS: ${{ matrix.rustflags }}
       run: cargo build --verbose --release --features cli --target ${{ matrix.target }}
 
+    # #7260: scripts/link-order/cc (.cargo/config.toml) orders the binary's functions on the
+    # x86_64 Linux and macOS builds; its log says how many it ordered or why it linked plain.
+    - name: Show the link order
+      if: matrix.build == 'linux-x64' || matrix.build == 'macos-arm64'
+      shell: bash
+      run: |
+        # cargo 1.100 links in build/<pkg>/<hash>/out/ (its build-dir layout), earlier ones in deps/.
+        log=$(cat target/${{ matrix.target }}/release/deps/succinctly*.link-order.log target/${{ matrix.target }}/release/build/succinctly/*/out/succinctly*.link-order.log 2>/dev/null || true)
+        [ -n "$log" ] || log="no link-order log"
+        echo "$log"
+        case "$log" in *ordered*) ;; *) echo "::warning::release binary linked without the function order: $log" ;; esac
+
     - name: Strip release binary (linux and macos)
       if: matrix.build != 'windows'
       run: strip "target/${{ matrix.target }}/release/succinctly"

@@ -12,3 +12,18 @@
 # rustc's default. It has no effect on a non-Apple target.
 [env]
 MACOSX_DEPLOYMENT_TARGET = { value = "12.0", force = false }
+
+# The functions a run executes go first in the release binary's text, in the order of
+# `scripts/link-order/symbols.txt` (#7260). One codegen unit with fat LTO scatters the ~1-2 MB a
+# query runs over 12-15 MB of text, and each page it touches stays resident: `succinctly jq -n 1`
+# had 4.5-5 MB of its own text resident on Linux (a file fault maps 64 KB or a whole large folio)
+# and 1.5 MB on macOS, against jq 1.7.1's 0.3 MB. Ordered, it is ~1.2 MB and 0.8 MB.
+# `scripts/link-order/link.py` says when the wrapper steps aside (debug builds, other outputs,
+# a linker other than lld or ld64, `SUCCINCTLY_LINK_ORDER=0`); `generate.py` refreshes the list.
+# A path with a slash is relative to the directory holding `.cargo/`. Windows and
+# aarch64-unknown-linux-gnu (GNU ld, no ordering option) link as before.
+[target.x86_64-unknown-linux-gnu]
+linker = "scripts/link-order/cc"
+
+[target.aarch64-apple-darwin]
+linker = "scripts/link-order/cc"
