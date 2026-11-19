@@ -17429,6 +17429,15 @@ fn eval_single_pipe_stages<S: EvalSemantics, V: DocumentValue>(
         }
     }
 
+    // #7260: a `..` head with more of the pipe after it streams, each node through the rest as the
+    // walk reaches it, and only the pipe's outputs are collected. The staged fold collected every
+    // node's cursor first and then held a result per node before flattening them (`[..|numbers]`
+    // over the 124,000 nodes of a 1 MB document: 9 MiB of cursors and 9.5 MiB of results at once,
+    // where jq 1.7.1's whole peak is 12.6 MiB). The walk is pre-order, as jq's `..` is, so the
+    // outputs and the first failure are the ones the staged fold met in that order.
+    if exprs.len() > 1 && cursor.is_some() && descent_collects_cursors::<S>(&exprs[0]) {
+        return collect_each_generic::<S, V>(whole.get(exprs), value, optional, cursor);
+    }
     let current = eval_single::<S, _>(&exprs[0], value, optional, cursor);
     fold_pipe_stages::<S, V>(current, &exprs[1..], optional)
 }
@@ -17954,28 +17963,10 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // spine 2416 (walk residue; #2428): `..` over a live node keeps every
         // node's cursor on this route too -- the non-sink twin of
         // `eval_each_generic`'s own arm, so `.. | {"k": key}` answers the
-        // same on the CLI's DOM path as in the sink pipeline.
-        Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown)
-            if cursor.is_some() =>
-        {
-            collect_each_generic::<S, V>(expr, value, optional, cursor)
-        }
-        // #3773: `recurse(.[]?)` is jq's own definition of bare `recurse`, so it
-        // keeps each node's cursor here too.
-        Expr::Builtin(Builtin::RecurseF(f))
-            if cursor.is_some() && crate::jq::eval::is_structural_descent(f, None) =>
-        {
-            collect_each_generic::<S, V>(expr, value, optional, cursor)
-        }
-        // #4095: and `recurse(.[]?; cond)` for a `cond` yielding at most one value, the
-        // non-sink twin of `eval_each_generic`'s cursor arm. yq mode only: jq mode's collecting
-        // route keeps the owned walk it has always had here, which answers a `cond` from the tree
-        // where the cursor walk asks the node.
-        Expr::Builtin(Builtin::RecurseCond(f, cond))
-            if S::TAG == EvalTag::Yq
-                && cursor.is_some()
-                && crate::jq::eval::is_gated_structural_descent(f, Some(cond)) =>
-        {
+        // same on the CLI's DOM path as in the sink pipeline. #3773:
+        // `recurse(.[]?)` too, and #4095 `recurse(.[]?; cond)` in yq mode
+        // ([`descent_collects_cursors`]).
+        _ if cursor.is_some() && descent_collects_cursors::<S>(expr) => {
             collect_each_generic::<S, V>(expr, value, optional, cursor)
         }
         Expr::Pipe(exprs) => {
@@ -31868,6 +31859,140 @@ fn extremum_streaming_generic<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
+/// How many times [`sort_document_numbers`] answered on this thread, so a test can assert that a
+/// bare `sort`/`unique` over document numbers takes it (#7260). `cfg(test)` only.
+#[cfg(test)]
+pub(crate) mod number_sort_count {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn bump() {
+        COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn get() -> usize {
+        COUNT.with(Cell::get)
+    }
+}
+
+/// jq's bare `sort` (and `unique`, a sort and a dedup) over an array whose every element is a
+/// document number, keyed by each number's parsed value alone (#7260): `key_elements_generic`
+/// decoded each element into an `OwnedValue::NumberLiteral` holding an owned copy of its spelling,
+/// paired it with its cursor (64 bytes an element), and the stable sort then took a scratch buffer
+/// of the same size; `.numbers | sort` over 70,000 numbers held 10.75 MiB at its peak, where jq
+/// 1.7.1 holds 8.35 MiB. Here an element is its parsed value and its index (24 bytes), sorted in
+/// place with the index as the last tie-break (the order a stable sort gives, with no scratch), and
+/// the cursors are permuted in place. Only a double tie between two keys reads the two spellings,
+/// off the document, as jq's exact literal comparison does ([`extremum_streaming_generic`]).
+///
+/// `None` (nothing done but the reads) when an element is not such a number -- any other value, a
+/// NaN literal (whose comparison rules are `sort_like_jq`'s, #6008) or a number `to_owned_cursor`
+/// would not build bare -- and while a binding's embedded node could be handed back for an
+/// element, as for the `min`/`max` walk: the caller then takes the general route, unchanged. The
+/// elements' gaps were checked when `cursors` was collected, and a number read bare never fails to
+/// decode, so this route raises nothing.
+///
+/// `sort_by(.)`, `unique_by(.)` and `group_by(.)` take it too: their key `[.]` orders and equates
+/// one-element arrays as their elements, and a number's key filter cannot fail or have an effect.
+/// A group is a run of equal numbers in the sorted order, as `group_by_array_generic` cuts one.
+fn sort_document_numbers<S: EvalSemantics, V: DocumentValue>(
+    cursors: &mut Vec<V::Cursor>,
+    out: NumberSortOut,
+) -> Option<GenericResult<V>> {
+    /// Marks a permuted slot (and bounds how many elements an index can name).
+    const DONE: u32 = u32::MAX;
+    if S::TAG != EvalTag::Jq || embed_table::live() || cursors.len() >= DONE as usize {
+        return None;
+    }
+    let mut keys: Vec<(NumberRepr, u32)> = vec_with_capacity(cursors.len());
+    for (index, cursor) in cursors.iter().enumerate() {
+        let repr = match cursor
+            .text_position()
+            .and_then(|pos| cursor.plain_int_at(pos))
+        {
+            Some(i) => NumberRepr::Int(i),
+            None => match borrowed_document_number::<S, _>(cursor)?.repr {
+                NumberRepr::Float(f) if f.is_nan() => return None,
+                repr => repr,
+            },
+        };
+        keys.push((repr, index as u32));
+    }
+    #[cfg(test)]
+    number_sort_count::bump();
+    let parts = |repr: NumberRepr| match repr {
+        NumberRepr::Int(i) => (jq_literal_int_to_f64(i), Some(i)),
+        NumberRepr::Float(f) => (f, None),
+    };
+    let value_order = |a: &(NumberRepr, u32), b: &(NumberRepr, u32)| {
+        crate::jq::value::cmp_jq_number_literals(parts(a.0), parts(b.0), || {
+            literal_spellings_cmp(&cursors[a.1 as usize], &cursors[b.1 as usize])
+        })
+    };
+    // The index breaks every tie, so the unstable sort leaves equal numbers in input order, as
+    // jq's sort does, and needs no buffer.
+    keys.sort_unstable_by(|a, b| value_order(a, b).then(a.1.cmp(&b.1)));
+    let mut ends = Vec::new();
+    if out == NumberSortOut::Groups {
+        for i in 1..keys.len() {
+            if value_order(&keys[i - 1], &keys[i]) != core::cmp::Ordering::Equal {
+                ends.push(i);
+            }
+        }
+        if !keys.is_empty() {
+            ends.push(keys.len());
+        }
+    }
+    if out == NumberSortOut::Unique {
+        // `unique` keeps the first of each run of equal numbers, as `dedup_by` on the sorted keys.
+        keys.dedup_by(|later, earlier| value_order(earlier, later) == core::cmp::Ordering::Equal);
+        let kept = keys
+            .iter()
+            .map(|&(_, index)| cursors[index as usize])
+            .collect();
+        return Some(GenericResult::LazySeq(Box::new(LazySeq::from_cursors(
+            kept,
+        ))));
+    }
+    // `keys[i].1` is the element that goes to position `i`: follow each cycle of that permutation,
+    // marking the slots it fills.
+    for start in 0..keys.len() {
+        if keys[start].1 == DONE {
+            continue;
+        }
+        let saved = cursors[start];
+        let mut at = start;
+        loop {
+            let from = keys[at].1 as usize;
+            keys[at].1 = DONE;
+            if from == start {
+                cursors[at] = saved;
+                break;
+            }
+            cursors[at] = cursors[from];
+            at = from;
+        }
+    }
+    drop(keys);
+    let sorted = core::mem::take(cursors);
+    Some(GenericResult::LazySeq(Box::new(match out {
+        NumberSortOut::Groups => LazySeq::from_groups(sorted, ends, S::TAG),
+        _ => LazySeq::from_cursors(sorted),
+    })))
+}
+
+/// What [`sort_document_numbers`] answers with: the sorted elements, the first of each run of
+/// equal ones (`unique`), or the runs as groups (`group_by(.)`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NumberSortOut {
+    Sorted,
+    Unique,
+    Groups,
+}
+
 /// How [`walk_elements_checked`] ended before the last element.
 enum ElementWalkFault<E> {
     /// A malformed `,` before an element or a stray one after the last (#1677, #2261): the error
@@ -37114,12 +37239,85 @@ fn collect_each_generic<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
-    let mut items: Vec<GenericItem<V>> = Vec::new();
+    let mut collected = Collected::Empty;
     let flow = eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| {
-        items.push(item);
+        collected.push(item);
         Demand::Continue
     });
-    collected_items_result::<_, S>(items, flow)
+    match (collected, flow) {
+        // #7260: a run that kept one kind of output answers from its own vector, as
+        // `items_to_generic_result` answers for the items it would have been.
+        (Collected::Empty, Flow::Exhausted | Flow::Stopped { pending: None }) => {
+            GenericResult::None
+        }
+        (Collected::Cursors(cursors), Flow::Exhausted | Flow::Stopped { pending: None }) => {
+            cursor_vec_to_generic_result(cursors)
+        }
+        (Collected::Owned(values), Flow::Exhausted | Flow::Stopped { pending: None }) => {
+            owned_vec_to_generic_result(values)
+        }
+        (collected, flow) => collected_items_result::<_, S>(collected.into_items(), flow),
+    }
+}
+
+/// What [`collect_each_generic`] has collected (#7260): while every output is a document node, or
+/// every output a computed value, the bare cursors or values, and the items otherwise. A
+/// `GenericItem` is 72 bytes where a cursor is 32 and a value 32, so `[..]` held 72 bytes a node,
+/// and a cursor vector made from it in place kept that allocation (9 MiB for the 124,000 nodes of a
+/// 1 MB document). The answer is the one the items give: [`items_to_generic_result`] makes a run of
+/// cursors the cursor result, and a run of values the values, each as it is.
+enum Collected<V: DocumentValue> {
+    Empty,
+    Cursors(Vec<V::Cursor>),
+    Owned(Vec<OwnedValue>),
+    Items(Vec<GenericItem<V>>),
+}
+
+impl<V: DocumentValue> Collected<V> {
+    #[inline]
+    fn push(&mut self, item: GenericItem<V>) {
+        match (&mut *self, item) {
+            (Self::Cursors(cursors), GenericItem::OneCursor(c)) => cursors.push(c),
+            (Self::Owned(values), GenericItem::Owned(v)) => values.push(v),
+            (Self::Items(items), item) => items.push(item),
+            (Self::Empty, GenericItem::OneCursor(c)) => *self = Self::Cursors(alloc::vec![c]),
+            (Self::Empty, GenericItem::Owned(v)) => *self = Self::Owned(alloc::vec![v]),
+            (_, item) => self.push_other(item),
+        }
+    }
+
+    /// The first output of another kind: everything so far becomes items.
+    #[cold]
+    #[inline(never)]
+    fn push_other(&mut self, item: GenericItem<V>) {
+        let mut items = core::mem::replace(self, Self::Empty).into_items();
+        items.push(item);
+        *self = Self::Items(items);
+    }
+
+    fn into_items(self) -> Vec<GenericItem<V>> {
+        match self {
+            Self::Empty => Vec::new(),
+            Self::Cursors(cursors) => cursors.into_iter().map(GenericItem::OneCursor).collect(),
+            Self::Owned(values) => values.into_iter().map(GenericItem::Owned).collect(),
+            Self::Items(items) => items,
+        }
+    }
+}
+
+/// Whether `expr` is a walk [`collect_each_generic`] runs from a live node, as cursors: `..`,
+/// `recurse` and `recurse(.[]?)` (#2428, #3773), and in yq mode `recurse(.[]?; cond)` for a `cond`
+/// yielding at most one value (#4095; jq mode's collecting route keeps the owned walk it has always
+/// had there, which answers a `cond` from the tree where the cursor walk asks the node).
+fn descent_collects_cursors<S: EvalSemantics>(expr: &Expr) -> bool {
+    match expr {
+        Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => true,
+        Expr::Builtin(Builtin::RecurseF(f)) => crate::jq::eval::is_structural_descent(f, None),
+        Expr::Builtin(Builtin::RecurseCond(f, cond)) => {
+            S::TAG == EvalTag::Yq && crate::jq::eval::is_gated_structural_descent(f, Some(cond))
+        }
+        _ => false,
+    }
 }
 
 /// How many delivered outputs [`collected_items_result`] converted to owned values for a partial
@@ -41950,7 +42148,19 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
             // so ignoring it here was the same asymmetry #2280 fixed for
             // Format/Path/GetPath. Defensive today (see `Reverse`'s sibling
             // comment above for why).
-            let cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
+            let mut cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
+            // #7260: an array of document numbers sorts on their parsed values, not on decoded
+            // copies of every element; `[.]` keys a number as the number itself.
+            if key.map_or(true, |f| unwrap_paren(f).is_identity()) {
+                let out = if dedup {
+                    NumberSortOut::Unique
+                } else {
+                    NumberSortOut::Sorted
+                };
+                if let Some(sorted) = sort_document_numbers::<S, V>(&mut cursors, out) {
+                    return sorted;
+                }
+            }
             // #4054: yq runs a `sort_by`/`unique_by` key filter read-only, so an absent key is no
             // output (see `eval::by_key_scope`). Not `min_by`/`max_by`, which are gated extensions
             // that follow jq and sit in the arm below.
@@ -42003,7 +42213,15 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
             if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
                 return GenericResult::Error(err);
             }
-            let cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
+            let mut cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
+            // #7260: `group_by(.)` over document numbers, as `sort` sorts them.
+            if unwrap_paren(f).is_identity() {
+                if let Some(groups) =
+                    sort_document_numbers::<S, V>(&mut cursors, NumberSortOut::Groups)
+                {
+                    return groups;
+                }
+            }
             group_by_array_generic::<S, V>(f, cursors, optional)
         }
 
@@ -48105,6 +48323,104 @@ mod tests {
                     "yq {filter} over {text}"
                 );
             }
+        }
+    }
+
+    /// #7260: jq's bare `sort`/`unique`, and `sort_by(.)`/`unique_by(.)`/`group_by(.)`, over an
+    /// array of document numbers sort on the numbers' parsed values (`sort_document_numbers`), and
+    /// each answer, spellings and tie order included,
+    /// is the full evaluator's (the bridge), which decodes every element and sorts the decoded
+    /// values. An array holding anything else, or a NaN, keeps the decoded route (0 sorts). The pin
+    /// can fail: with the dispatch removed every number row reads 0 sorts, and with the index
+    /// tie-break dropped the `1,1.0,1.00` rows come out of input order.
+    #[cfg(feature = "std")]
+    #[test]
+    fn number_sorts_take_the_parsed_value_route_7260() {
+        type V<'a> = crate::json::light::StandardJson<'a, Vec<u64>>;
+        fn shown(result: GenericResult<V<'_>>) -> String {
+            match result {
+                GenericResult::Error(e) | GenericResult::Partial(_, Control::Error(e)) => {
+                    format!("error: {}", e.message)
+                }
+                other => other.collect_owned::<JqSemantics>().map_or_else(
+                    |e| format!("error: {}", e.message),
+                    |values| {
+                        values
+                            .iter()
+                            .map(OwnedValue::to_json)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    },
+                ),
+            }
+        }
+        fn run(json: &[u8], filter: &str, via_bridge: bool) -> (String, usize) {
+            let expr = crate::jq::parse(filter).unwrap();
+            let index = JsonIndex::build(json);
+            let root = index.root(json);
+            let before = number_sort_count::get();
+            let result = if via_bridge {
+                bridge_to_full_evaluator::<JqSemantics, V<'_>>(
+                    &expr,
+                    root.value(),
+                    Some(root),
+                    false,
+                )
+            } else {
+                eval_using::<JqSemantics, _>(&expr, root.value())
+            };
+            (shown(result), number_sort_count::get() - before)
+        }
+        let mut ties = String::from("[");
+        for i in 0..90 {
+            let spelling = ["2.0", "2", "2.00", "1e0", "1", "1.0", "-0", "0", "0.0"][i % 9];
+            if i > 0 {
+                ties.push(',');
+            }
+            ties.push_str(spelling);
+        }
+        ties.push(']');
+        let arrays: &[(&[u8], bool)] = &[
+            (b"[]", true),
+            (b"[5]", true),
+            (b"[3,1,2]", true),
+            (b"[1,1.0,1.00]", true),
+            (b"[1.00,1.0,1]", true),
+            (b"[100000000000000000001,100000000000000000000,1e20]", true),
+            (
+                b"[123456789012345679,123456789012345678.9,123456789012345678]",
+                true,
+            ),
+            (b"[1e1000,1,-1e1000,1e2000]", true),
+            (b"[-0,0,-0.0,0.0,-1e-400,1e-400]", true),
+            (
+                b"[9223372036854775807,9223372036854775808,-9223372036854775808]",
+                true,
+            ),
+            (ties.as_bytes(), true),
+            (b"[null,false,true,0,\"a\",[],{}]", false),
+            (b"[1,2,\"a\"]", false),
+            (b"[nan,1]", false),
+            (b"[1,nan]", false),
+        ];
+        for (json, takes_it) in arrays {
+            let text = String::from_utf8_lossy(json);
+            for filter in [
+                "sort",
+                "unique",
+                "sort_by(.)",
+                "unique_by(.)",
+                "group_by(.)",
+            ] {
+                let (native, sorts) = run(json, filter, false);
+                let (bridged, _) = run(json, filter, true);
+                assert_eq!(native, bridged, "{filter} over {text}");
+                assert_eq!(sorts, usize::from(*takes_it), "{filter} over {text}");
+            }
+        }
+        // A key filter other than `.` keeps the keyed route.
+        for filter in ["sort_by(-.)", "unique_by(. + 0)", "group_by(. % 2)"] {
+            assert_eq!(run(b"[3,1,2]", filter, false).1, 0, "{filter}");
         }
     }
 
