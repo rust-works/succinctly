@@ -96,7 +96,9 @@ jobs:
       if: matrix.build == 'linux-x64' || matrix.build == 'macos-arm64'
       shell: bash
       run: |
-        log=$(cat target/${{ matrix.target }}/release/deps/succinctly-*.link-order.log 2>/dev/null || echo "no link-order log")
+        # cargo 1.100 links in build/<pkg>/<hash>/out/ (its build-dir layout), earlier ones in deps/.
+        log=$(cat target/${{ matrix.target }}/release/deps/succinctly*.link-order.log target/${{ matrix.target }}/release/build/succinctly/*/out/succinctly*.link-order.log 2>/dev/null || true)
+        [ -n "$log" ] || log="no link-order log"
         echo "$log"
         case "$log" in *ordered*) ;; *) echo "::warning::release binary linked without the function order: $log" ;; esac
 

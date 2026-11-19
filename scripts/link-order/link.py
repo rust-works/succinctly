@@ -22,8 +22,9 @@ crate version, the target triple and the toolchain, so the list is resolved here
 against the symbols of the objects being linked (`nm`, then `c++filt`). A name the objects do not
 define is skipped. `generate.py` regenerates the list.
 
-It steps aside (plain link) when: the output is not a `succinctly-*` file under a non-debug
-profile directory, the link makes a shared library, `SUCCINCTLY_LINK_ORDER=0`, the platform is
+It steps aside (plain link) when: the output is not the `succinctly` executable (cargo's
+`deps/succinctly-<hash>` or, from cargo 1.100, `build/succinctly/<hash>/out/succinctly`) of a
+non-debug profile, the link makes a shared library, `SUCCINCTLY_LINK_ORDER=0`, the platform is
 neither Linux nor macOS, or anything in the resolution step fails. For the release binary the
 resolved file and a one-line summary (or why it linked plain) are left next to the output as
 `<output>.link-order.txt` and `<output>.link-order.log`.
@@ -79,9 +80,12 @@ def is_release_binary(args, env=os.environ):
     if any(a in ("-shared", "-dynamiclib", "-r") for a in args):
         return False
     out = output_of(args)
-    if not out or not os.path.basename(out).startswith("succinctly-"):
+    # Cargo up to 1.99 links `target/<profile>/deps/succinctly-<hash>`; 1.100 (its build-dir
+    # layout) links `target/<profile>/build/succinctly/<hash>/out/succinctly` and copies it up.
+    if not out or not re.fullmatch(r"succinctly(-[0-9a-f]+)?", os.path.basename(out)):
         return False
-    return os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(out)))) != "debug"
+    parts = os.path.abspath(out).split(os.sep)
+    return not any(p == "debug" and q in ("deps", "build") for p, q in zip(parts, parts[1:]))
 
 
 def rust_lld_dir(args):
@@ -100,9 +104,8 @@ def wants_order(args, platform=sys.platform, env=os.environ):
     """(ordering option, other driver arguments to add, why) for this link; option None = plain.
 
     On Linux the ordering option needs lld. rustc links x86_64 with its own lld (`-fuse-ld=lld`)
-    by default since 1.90; a link that reaches the wrapper without any `-fuse-ld` (the x86_64 perf
-    guard on rustc 1.100 linked unordered, #7260) gets rustup's lld added here instead, when the
-    toolchain ships it.
+    by default since 1.90; a link that reaches the wrapper without any `-fuse-ld` gets rustup's lld
+    added here instead, when the toolchain ships it.
     """
     if not is_release_binary(args, env):
         return None, [], "not the release binary"

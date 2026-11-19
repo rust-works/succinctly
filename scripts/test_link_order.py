@@ -29,6 +29,15 @@ class WantsOrder(unittest.TestCase):
         a = args_for("/t/target/x86_64-unknown-linux-gnu/release/deps/succinctly-0123abcd")
         self.assertIsNotNone(link.wants_order(a, "linux", self.env)[0])
 
+    def test_cargo_1_100_build_dir_layout_is_ordered(self):
+        # cargo 1.100 links into build/<pkg>/<hash>/out/ and copies the binary up (#7260's CI).
+        a = args_for("/t/target/release/build/succinctly/745a72d7e8e86ffb/out/succinctly")
+        self.assertIsNotNone(link.wants_order(a, "linux", self.env)[0])
+        a = args_for("/t/target/debug/build/succinctly/745a72d7e8e86ffb/out/succinctly")
+        self.assertIsNone(link.wants_order(a, "linux", self.env)[0])
+        a = args_for("/t/target/release/build/succinctly/194701fa9bc3b178/out/generate_pfsm_tables")
+        self.assertIsNone(link.wants_order(a, "linux", self.env)[0])
+
     def test_macos_uses_order_file(self):
         a = ["-arch", "arm64", "x.o", "-o", "/t/target/release/deps/succinctly-0123abcd"]
         self.assertEqual(link.wants_order(a, "darwin", self.env)[0], "-Wl,-order_file,{}")
