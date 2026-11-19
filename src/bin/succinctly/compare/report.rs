@@ -1285,11 +1285,11 @@ fn operational_section(s: &mut String, r: &Results) {
     let _ = writeln!(s, "\n## H. Platform and operational properties\n");
     let _ = writeln!(
         s,
-        "| Tool | Binary size | Dynamic libraries | CPU time ÷ wall time (`.` on 10 MB) |"
+        "| Tool | Binary size (stripped) | As built | Dynamic libraries | CPU time ÷ wall time (`.` on 10 MB) |"
     );
     let _ = writeln!(
         s,
-        "|------|-------------|-------------------|--------------------------------------|"
+        "|------|------------------------|----------|-------------------|--------------------------------------|"
     );
     for b in &o.binaries {
         let par = o
@@ -1298,14 +1298,26 @@ fn operational_section(s: &mut String, r: &Results) {
             .find(|p| p.tool == b.tool)
             .and_then(|p| p.cpu_over_wall)
             .map_or_else(|| "n/a".into(), |v| format!("{v:.2}"));
+        let stripped = b.stripped_bytes.map_or_else(
+            || "n/a".into(),
+            |n| format!("{:.1} MiB", n as f64 / 1_048_576.0),
+        );
         let _ = writeln!(
             s,
-            "| {} | {:.1} MiB | {} | {par} |",
+            "| {} | {stripped} | {:.1} MiB | {} | {par} |",
             b.tool,
             b.bytes as f64 / 1_048_576.0,
             b.dynamic_libs.len()
         );
     }
+    let _ = writeln!(
+        s,
+        "\nStripped is a copy stripped with plain `strip`, as `release.yml` strips the release archive's \
+         binary, and is the size to compare: as built, `cargo build --release` keeps the symbol table and \
+         the pinned jq builds keep their debug info. The `succinctly jq` row is the binary under test, by \
+         default this harness's own build, which adds `bench-runner` to the shipped `cli` feature set and \
+         so is larger than the archive's."
+    );
     let _ = writeln!(
         s,
         "\nA ratio near 1.00 means one thread. Rust dependencies of the shipped feature set \
