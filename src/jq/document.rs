@@ -4318,6 +4318,100 @@ pub fn effective_fields_checked<F: DocumentFields>(
     Ok(out)
 }
 
+/// [`effective_fields_checked`]'s fields, one at a time, without its list where nothing in the
+/// object needs one (#7260).
+///
+/// That list holds a whole [`DocumentField`] per field (key and value decoded, both cursors: 144
+/// bytes on a JSON document) for as long as the caller walks it, which on the 82,210-field
+/// `wide-1mb` object was an 18 MiB block live at `map_values`' and `to_entries`' peaks, half of
+/// `map_values`'. For an object `stream_len` accepts, the iterator walks `uncons` itself, in
+/// the order the list held. Any other object (one the census, `hash_walk`, calls malformed, or
+/// one with a key hash that repeats under `collapse`) gets the list, and the same `Err` the list
+/// raises, so the rule for a repeated key and every diagnostic are the list's own.
+pub fn effective_fields_checked_iter<F: DocumentFields>(
+    fields: &F,
+    collapse: bool,
+) -> Result<EffectiveFields<F>, EvalError> {
+    match stream_len(fields, collapse) {
+        Some(len) => Ok(EffectiveFields::walk(fields, len)),
+        None => effective_fields_checked(fields, collapse).map(EffectiveFields::listed),
+    }
+}
+
+/// How many fields `fields` has, when they can be walked as they stand in place of
+/// [`effective_fields_checked`]'s list: `None` for an object the census calls malformed (whose
+/// caller then raises, or not, exactly as the list's walk does), or whose key hashes repeat under
+/// `collapse` (whose collapse is the list's).
+///
+/// The census's key-only walk, with its checks ([`repeat_plan_checked`] leans on the same
+/// agreement with the list's), and one 8-byte hash per key, where the list held 144 bytes per
+/// field.
+pub(crate) fn stream_len<F: DocumentFields>(fields: &F, collapse: bool) -> Option<usize> {
+    let walked = hash_walk(fields, false);
+    if walked.malformed || (collapse && !walked.shared.is_empty()) {
+        return None;
+    }
+    // With no hash shared, each hashed key is its own distinct hash; every other key is unkeyed.
+    // Without `collapse` a shared hash still counts once in `distinct_hashes`, so count again.
+    if walked.shared.is_empty() {
+        Some(walked.distinct_hashes + walked.unkeyed)
+    } else {
+        Some(fields.len())
+    }
+}
+
+/// The fields of [`effective_fields_checked_iter`]: a walk of the object, or the list.
+pub struct EffectiveFields<F: DocumentFields> {
+    inner: EffectiveFieldsInner<F>,
+    remaining: usize,
+}
+
+enum EffectiveFieldsInner<F: DocumentFields> {
+    Walk(F),
+    Listed(alloc::vec::IntoIter<DocumentField<F::Value, F::Cursor>>),
+}
+
+impl<F: DocumentFields> EffectiveFields<F> {
+    /// The fields of `fields` as they stand, `len` of them.
+    pub(crate) fn walk(fields: &F, len: usize) -> Self {
+        Self {
+            inner: EffectiveFieldsInner::Walk(fields.clone()),
+            remaining: len,
+        }
+    }
+
+    /// The fields of a list.
+    pub(crate) fn listed(list: Vec<DocumentField<F::Value, F::Cursor>>) -> Self {
+        Self {
+            remaining: list.len(),
+            inner: EffectiveFieldsInner::Listed(list.into_iter()),
+        }
+    }
+}
+
+impl<F: DocumentFields> Iterator for EffectiveFields<F> {
+    type Item = DocumentField<F::Value, F::Cursor>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let field = match &mut self.inner {
+            EffectiveFieldsInner::Walk(walk) => {
+                let (field, rest) = walk.uncons()?;
+                *walk = rest;
+                field
+            }
+            EffectiveFieldsInner::Listed(list) => list.next()?,
+        };
+        self.remaining = self.remaining.saturating_sub(1);
+        Some(field)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl<F: DocumentFields> ExactSizeIterator for EffectiveFields<F> {}
+
 /// The value cursors of [`effective_fields_checked`]'s list, in its order, without that list
 /// (#7290): what `.[]` over an object hands on.
 ///

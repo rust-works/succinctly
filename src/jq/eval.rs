@@ -41,9 +41,9 @@ use indexmap::IndexMap;
 
 use super::array_index;
 use super::document::{
-    effective_fields, effective_fields_checked, effective_keys, effective_len_checked,
-    key_display_string, key_display_string_kind, tail_gap_ok, DisplayKeyGuard, DocumentCursor,
-    DocumentElements, DocumentFields,
+    effective_fields, effective_fields_checked, effective_fields_checked_iter, effective_keys,
+    effective_len_checked, key_display_string, key_display_string_kind, tail_gap_ok,
+    DisplayKeyGuard, DocumentCursor, DocumentElements, DocumentFields, EffectiveFields,
 };
 use super::glob::yq_match_key;
 use super::key_index;
@@ -22073,7 +22073,16 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // reaches (code review, #1829): `{"a":"x","a":2} |
             // map_values(.+1)` must give `{"a":3}` like jq does, not error
             // on `"x"+1` for a value collapse would have already dropped.
-            let checked = match effective_fields_checked(&fields, S::COLLAPSE_DUPLICATE_KEYS) {
+            //
+            // #7260: jq mode walks the fields without `effective_fields_checked`'s list, which on a
+            // wide object was half this builtin's peak (`effective_fields_checked_iter`); yq mode
+            // indexes the list below, so it keeps it.
+            let checked = if S::COLLAPSE_DUPLICATE_KEYS {
+                effective_fields_checked_iter(&fields, true)
+            } else {
+                effective_fields_checked(&fields, false).map(EffectiveFields::listed)
+            };
+            let checked = match checked {
                 Ok(f) => f,
                 Err(e) => return QueryResult::Error(e),
             };
@@ -22150,6 +22159,7 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 return QueryResult::Owned(OwnedValue::Object(result_map.into()));
             }
 
+            let checked: Vec<_> = checked.collect();
             // The display key of every field, then which occurrence of each key is its live (last)
             // one. yq's `map_values` rewrites that entry and leaves a repeated key's earlier entries
             // as they were (ADR-0027, #1344); jq mode's `checked` is already collapsed, so every
