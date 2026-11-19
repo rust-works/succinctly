@@ -578,6 +578,15 @@ pub(crate) struct Reader<R: RefillSource> {
     /// Whether the call that read the last refill returned a parse error, which costs a slurped
     /// array the position jq would otherwise name for it (#3003).
     terminal_fault: bool,
+    /// The refill being fed paused after a value ([`Parser::feed_from`], #7260).
+    paused: Option<PausedRefill>,
+}
+
+/// Where a paused refill reads on from, and what [`Reader::step`] knew of it.
+struct PausedRefill {
+    at: usize,
+    is_last: bool,
+    drained: bool,
 }
 
 impl<S: AsRef<[(Option<usize>, Vec<u8>)]>> Reader<MemorySources<S>> {
@@ -626,6 +635,7 @@ impl<R: RefillSource> Reader<R> {
             stop_is_barrier: mode.stop_is_barrier,
             errors_end_call: seq && !mode.errors_are_events,
             terminal_fault: false,
+            paused: None,
         }
     }
 
@@ -650,8 +660,16 @@ impl<R: RefillSource> Reader<R> {
         }
     }
 
-    /// One refill of jq's input buffer, or what follows the last one.
+    /// One refill of jq's input buffer, or what follows the last one; or the rest of a refill whose
+    /// feed paused.
     fn step(&mut self) {
+        if let Some(paused) = self.paused.take() {
+            let feeding =
+                self.parser
+                    .feed_from(&self.buf, paused.at, &mut self.deferred, false, true);
+            self.after_feed(feeding, paused.is_last, paused.drained);
+            return;
+        }
         let Some(refill) = self.source.next_refill(&mut self.buf) else {
             // Whatever is left comes from calls made after jq has closed its input.
             self.parser.closed = true;
@@ -681,11 +699,32 @@ impl<R: RefillSource> Reader<R> {
         for value in std::mem::take(&mut self.deferred) {
             parser.yield_value(value);
         }
-        let mut fed = parser.feed(
+        // A `--seq` parser's stops and barriers are decided over the whole refill.
+        let pause = !parser.seq;
+        let feeding = parser.feed_from(
             &self.buf,
+            0,
             &mut self.deferred,
             refill.is_last && !drained && self.stops_on_empty,
+            pause,
         );
+        self.after_feed(feeding, refill.is_last, drained);
+    }
+
+    /// What [`step`](Self::step) does once a refill has been fed to its end.
+    fn after_feed(&mut self, feeding: Feeding, is_last: bool, drained: bool) {
+        let mut fed = match feeding {
+            Feeding::Done(fed) => fed,
+            Feeding::Paused(at) => {
+                self.paused = Some(PausedRefill {
+                    at,
+                    is_last,
+                    drained,
+                });
+                return;
+            }
+        };
+        let parser = &mut self.parser;
         if fed.stopped && self.stop_is_barrier {
             // The call that read the last refill returned nothing, which `input` raises as `break`
             // and the main loop takes for the end of its input. The stream goes on behind it: the
@@ -712,7 +751,7 @@ impl<R: RefillSource> Reader<R> {
             return;
         }
         let ended_with_value = fed.ended;
-        if refill.is_last {
+        if is_last {
             // The slurp loop ends with the first call that leaves nothing in the buffer.
             // An error returned earlier on this refill ended the call that read it, so the call that
             // reaches the end of the buffer is a later one, which reads again before it gives up.
@@ -1088,6 +1127,13 @@ struct Fed {
     errored: bool,
 }
 
+/// How far [`Parser::feed_from`] got: to the end of its refill, or to a pause after a value.
+enum Feeding {
+    Done(Fed),
+    /// The byte to read on from.
+    Paused(usize),
+}
+
 impl Fed {
     fn ended() -> Self {
         Self {
@@ -1250,10 +1296,31 @@ impl Parser {
     /// nothing pending returns an invalid with no message. That last one ends jq's input when it is
     /// the first call after the refill that hit the end of the file (`stops_on_empty`, #2998).
     fn feed(&mut self, chunk: &[u8], deferred: &mut Vec<OwnedValue>, stops_on_empty: bool) -> Fed {
+        match self.feed_from(chunk, 0, deferred, stops_on_empty, false) {
+            Feeding::Done(fed) => fed,
+            // patchcov: coverage tolerate-line reason="unreachable: a feed that does not pause runs to the end of its chunk"
+            Feeding::Paused(_) => Fed::ended(),
+        }
+    }
+
+    /// [`feed`](Self::feed) from byte `from` of the refill, and when `pause` is set, stopping after
+    /// the first byte that yields a value, unless it is the refill's last (#7260): the reader hands
+    /// that value out before the parser reads on, as jq's `jv_parser_next` returns it, so a refill's
+    /// worth of values is not built ahead of the program reading them. Only a parser that is not
+    /// `--seq`'s pauses: its calls carry no state across a value but the byte reached.
+    fn feed_from(
+        &mut self,
+        chunk: &[u8],
+        from: usize,
+        deferred: &mut Vec<OwnedValue>,
+        stops_on_empty: bool,
+        pause: bool,
+    ) -> Feeding {
+        debug_assert!(!(pause && self.seq), "a --seq parser does not pause");
         let mut first_call = true;
         let mut errored = false;
         let mut call_start = true;
-        for (index, &ch) in chunk.iter().enumerate() {
+        for (index, &ch) in chunk.iter().enumerate().skip(from) {
             let last = index + 1 == chunk.len();
             if call_start && self.bom == BOM_MALFORMED {
                 // `jv_parser_next` begins by wiping the state of a parser whose mark broke off,
@@ -1293,29 +1360,32 @@ impl Parser {
                         }
                     }
                     if last {
-                        return Fed {
+                        return Feeding::Done(Fed {
                             errored,
                             ..Fed::ended()
-                        };
+                        });
+                    }
+                    if pause {
+                        return Feeding::Paused(index + 1);
                     }
                 }
                 Ok(Scanned::More) => {}
                 Ok(Scanned::Empty) => {
                     call_start = true;
                     if first_call && stops_on_empty {
-                        return Fed {
+                        return Feeding::Done(Fed {
                             ended: true,
                             stopped: true,
                             consumed: index + 1,
                             errored: false,
-                        };
+                        });
                     }
                     first_call = false;
                     if last {
-                        return Fed {
+                        return Feeding::Done(Fed {
                             errored,
                             ..Fed::ended()
-                        };
+                        });
                     }
                 }
                 Err(message) => {
@@ -1336,27 +1406,27 @@ impl Parser {
                     call_start = true;
                     if !self.seq {
                         // `p->curr_buf = 0`: the rest of this refill is thrown away.
-                        return Fed {
+                        return Feeding::Done(Fed {
                             errored,
                             ..Fed::ended()
-                        };
+                        });
                     }
                     first_call = false;
                     if last {
-                        return Fed {
+                        return Feeding::Done(Fed {
                             errored,
                             ..Fed::ended()
-                        };
+                        });
                     }
                 }
             }
         }
-        Fed {
+        Feeding::Done(Fed {
             ended: false,
             stopped: false,
             consumed: 0,
             errored,
-        }
+        })
     }
 
     /// The EOF branch of `jv_parser_next`.
@@ -1489,8 +1559,10 @@ impl Parser {
             return None;
         }
         if self.output.len() > 2 {
-            let leaf = OwnedValue::array_from(vec![self.output[0].clone(), self.output[1].clone()]);
-            self.output.truncate(1);
+            // `[path, value, true]`: the leaf takes the value, and `[path]` is left to close.
+            self.output.truncate(2);
+            let value = self.output.pop().unwrap_or(OwnedValue::Null);
+            let leaf = OwnedValue::array_from(vec![self.output[0].clone(), value]);
             return Some(leaf);
         }
         Some(OwnedValue::array_from(std::mem::take(&mut self.output)))
@@ -1564,7 +1636,13 @@ impl Parser {
                     return Err("':' should follow a key");
                 }
                 self.last_seen = LastSeen::Colon;
-                if let (Some(key), Some(slot)) = (self.next.take(), self.path.last_mut()) {
+                if let (Some(mut key), Some(slot)) = (self.next.take(), self.path.last_mut()) {
+                    // Every event under this key carries it in its path: shared, each one takes a
+                    // refcount rather than a copy (#7260), as each takes a reference to the one
+                    // key in jq.
+                    if let OwnedValue::String(text) = &mut key {
+                        text.promote();
+                    }
                     *slot = key;
                 }
             }
@@ -2629,6 +2707,43 @@ mod tests {
         assert_eq!(end.open_at_end, batch.open_at_end);
         assert_eq!(end.first_error, batch.first_error);
         assert!(reader.next().is_none(), "a finished reader stays finished");
+    }
+
+    /// #7260: within a refill, too, the parser reads only as far as the value handed out: a line of
+    /// a few hundred events is not built ahead of the reads, and every event still comes out, in
+    /// order, where it did.
+    #[test]
+    fn a_refill_is_fed_only_as_far_as_the_value_handed_out_7260() {
+        let line = format!(
+            "[{}]\n",
+            (0..400)
+                .map(|i| format!("{{\"k\":{i}}}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(line.len() < 4095, "one refill");
+        let sources = vec![(Some(0), line.clone().into_bytes())];
+        let mut reader = Reader::new(&sources);
+        let (first, _) = reader.next().expect("a first input");
+        assert_eq!(first.to_json(), r#"[[0,"k"],0]"#);
+        assert!(
+            reader.parser.pending.len() <= 1,
+            "{} pending",
+            reader.parser.pending.len()
+        );
+        let mut paused = Vec::new();
+        paused.push((first.to_json(), (0, 1)));
+        while let Some((value, at)) = reader.next() {
+            assert!(reader.parser.pending.len() <= 2);
+            paused.push((value.to_json(), at));
+        }
+        // What `jq -c --stream .` prints for the line, every event at line 1 of source 0.
+        let mut expected: Vec<(String, (usize, usize))> = (0..400)
+            .flat_map(|i| [format!(r#"[[{i},"k"],{i}]"#), format!(r#"[[{i},"k"]]"#)])
+            .map(|event| (event, (0, 1)))
+            .collect();
+        expected.push(("[[399]]".to_string(), (0, 1)));
+        assert_eq!(paused, expected);
     }
 
     /// #5498: a reader that has handed out one input has fed the parser the refills that
