@@ -885,10 +885,12 @@ and the library-only `SUCCINCTLY_SIMD` and `SUCCINCTLY_SVE2`.
 
 ## Development
 
-Run tests for the CLI:
+Run tests for the CLI (its unit tests are in the library as `succinctly::cli` since #7384, and its
+integration tests are under `tests/`):
 
 ```bash
-cargo test --features cli --bin succinctly
+cargo test --features cli --lib cli::
+cargo test --features cli --test jq_cli_tests --test yq_cli_tests
 ```
 
 Build in debug mode:
