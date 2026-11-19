@@ -3205,7 +3205,10 @@ impl OutputConfig {
 
         // Priority is documented on `resolve_color`.
         let color_output = crate::cli::env_config::resolve_color(
-            crate::cli::env_config::ColorChoice::from_flags(args.monochrome_output, args.color_output),
+            crate::cli::env_config::ColorChoice::from_flags(
+                args.monochrome_output,
+                args.color_output,
+            ),
             crate::cli::env_config::no_color_from_env(),
             std::io::stdout().is_terminal(),
         );
@@ -4517,7 +4520,8 @@ fn get_error_line(input: &[u8], line: usize, column: usize) -> Option<(String, u
     let line_content = &text[line_start..line_end];
 
     // Truncate long lines (on character boundaries, #5988)
-    let (display_content, caret_offset) = crate::cli::error_snippet::truncate_line(line_content, column);
+    let (display_content, caret_offset) =
+        crate::cli::error_snippet::truncate_line(line_content, column);
 
     Some((display_content, caret_offset))
 }
@@ -6386,7 +6390,8 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                         // and the main loop when it is the one that pops it.
                         jq::InputPop::ParseError(error)
                             if seq_by_stream_reader(&args)
-                                && error.message == crate::cli::jq_seq_reader::MESSAGELESS_RETURN =>
+                                && error.message
+                                    == crate::cli::jq_seq_reader::MESSAGELESS_RETURN =>
                         {
                             break;
                         }
@@ -10370,7 +10375,8 @@ enum YieldPast {
 /// for a text longer than [`crate::cli::jq_stream_errors::FIRST_EVENT_PREFIX_LIMIT`], which is not read
 /// for it, and for a stream that yields nothing past the failure.
 fn first_yield_past_failure(raws: &[Vec<u8>], first_failure: usize) -> Option<YieldPast> {
-    if raws.iter().map(Vec::len).sum::<usize>() > crate::cli::jq_stream_errors::FIRST_EVENT_PREFIX_LIMIT
+    if raws.iter().map(Vec::len).sum::<usize>()
+        > crate::cli::jq_stream_errors::FIRST_EVENT_PREFIX_LIMIT
     {
         return None;
     }
@@ -10447,7 +10453,8 @@ fn closer_lags_in_joined_text(raws: &[Vec<u8>]) -> bool {
 /// file that returns nothing follows it (#6760). One definition for [`closing_event_lags`] and the
 /// joined-text test of [`held_back_closer_before`] (#6732), which must agree on it.
 fn last_read_fills_buffer(raw: &[u8]) -> bool {
-    crate::cli::jq_seq_reader::fgets_chunk_lens(raw).last() == Some(crate::cli::jq_seq_reader::JQ_FGETS_CHUNK)
+    crate::cli::jq_seq_reader::fgets_chunk_lens(raw).last()
+        == Some(crate::cli::jq_seq_reader::JQ_FGETS_CHUNK)
 }
 
 /// Whether the last record of the `--seq` text `raw` leaves jq's stream parser holding its closing
@@ -11016,7 +11023,8 @@ fn report_lazy_open_failures(failures: &[InputFileOpenError]) {
 /// Stdin is read for its first bytes and kept.
 fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
     let mut opened = Vec::with_capacity(files.len());
-    let mut openers: Vec<crate::cli::jq_stream_errors::Opener> = Vec::with_capacity(files.len().max(1));
+    let mut openers: Vec<crate::cli::jq_stream_errors::Opener> =
+        Vec::with_capacity(files.len().max(1));
     let mut look_for_bom = true;
     if files.is_empty() {
         let pushed_back = STDIN_PUSHBACK.with(|slot| slot.borrow_mut().take());
@@ -12272,7 +12280,10 @@ fn hand_on_seq_files_tail(args: &JqCommand, past_open_failure: bool) -> bool {
     let (mut files, mut raws) = (Vec::new(), Vec::new());
     if tail.lines > 0 {
         files.push(named[tail.index - 1].clone());
-        raws.push(crate::cli::jq_seq_reader::resumed_stream(tail.lines, Vec::new()));
+        raws.push(crate::cli::jq_seq_reader::resumed_stream(
+            tail.lines,
+            Vec::new(),
+        ));
     }
     let front = files.len();
     // #7341: a file a gate of its own read up to a stretch it could not carry on after goes as the rest
@@ -15681,7 +15692,8 @@ impl LazySeqInputs {
 /// `--stream` and `--stream-errors` inputs read as the program asks for them (#5498): jq's streaming parser over
 /// the sources' bytes, and what its source indices mean.
 struct LazyStreamInputs {
-    reader: crate::cli::jq_stream_errors::Reader<Box<dyn crate::cli::jq_stream_errors::RefillSource>>,
+    reader:
+        crate::cli::jq_stream_errors::Reader<Box<dyn crate::cli::jq_stream_errors::RefillSource>>,
     /// The file each source was read from, as `get_inputs` tags its values.
     files: Vec<Option<usize>>,
     /// The tag of the last source, which the end of the stream names.
@@ -15965,7 +15977,10 @@ fn seq_stream_as_plain_json(raw: Vec<u8>, slurp: bool) -> std::result::Result<Ve
 
 /// What [`seq_stream_as_plain_json_with`] hands back for a stream that is not clean: its bytes, and
 /// the walk that found it so when it made one (#6620).
-type NotPlain = (Vec<u8>, Option<Box<crate::cli::jq_seq_reader::SeqStreamWalk>>);
+type NotPlain = (
+    Vec<u8>,
+    Option<Box<crate::cli::jq_seq_reader::SeqStreamWalk>>,
+);
 
 /// [`seq_stream_as_plain_json`], keeping the walk that decides when `keep_walk` says which faults
 /// it should record (#6620): `Some(collect_faults)` for a stream that is not slurped, `None` to
@@ -28925,7 +28940,11 @@ mod tests {
             .expect("no exit code")
             .expect("reads");
         LAZY_SEQ_INPUTS.with(|slot| slot.borrow_mut().take());
-        assert_eq!(crate::cli::jq_seq_reader::walks::made() - before, 1, "stdin");
+        assert_eq!(
+            crate::cli::jq_seq_reader::walks::made() - before,
+            1,
+            "stdin"
+        );
         // The streams the handoff declines keep the walk each route makes.
         assert_eq!(walks_made(faulty, &["-s"]), 2, "a slurp walks for itself");
         assert_eq!(
@@ -29021,11 +29040,10 @@ mod tests {
                     kept += 1;
                     // The streams that reach jq's end-of-stream drop: the walk goes past it, and
                     // its verdict is the stopping walk's.
-                    drops += usize::from(
-                        walk.faults
-                            .iter()
-                            .any(|fault| fault.body == crate::cli::jq_seq_reader::MESSAGELESS_RETURN),
-                    );
+                    drops +=
+                        usize::from(walk.faults.iter().any(|fault| {
+                            fault.body == crate::cli::jq_seq_reader::MESSAGELESS_RETURN
+                        }));
                     // The walk the reading route makes over the same bytes.
                     let sources = [(None, raw.clone())];
                     let mut fresh = crate::cli::jq_seq_reader::walk_stream_collecting_at(

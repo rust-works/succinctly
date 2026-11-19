@@ -1601,7 +1601,8 @@ impl SeqGate {
     /// in its token buffer: the stream is certified to `next_end`, the end of the plain record after it,
     /// whose first byte is `buf[to]`.
     fn resume(&mut self, buf: &[u8], to: usize, next_end: usize, token_byte: Option<u8>) {
-        self.token_byte = crate::cli::jq_seq_reader::token_byte_after(&buf[to..next_end]).or(token_byte);
+        self.token_byte =
+            crate::cli::jq_seq_reader::token_byte_after(&buf[to..next_end]).or(token_byte);
         self.checked = next_end;
         self.cand = next_end;
         self.search_from = next_end + 1;
@@ -3604,7 +3605,9 @@ mod tests {
     /// values with white space between them, whatever jq's parser took them as (#7341), and a value's
     /// invalid UTF-8 is substituted as the whole-stream route substitutes it.
     fn gated(stream: &[u8]) -> Gated {
-        use crate::cli::jq_seq_reader::{token_byte_after, walk_stretch, PlainGuards, PlainRecords};
+        use crate::cli::jq_seq_reader::{
+            token_byte_after, walk_stretch, PlainGuards, PlainRecords,
+        };
         use succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document_mapped;
         let mut text = Vec::with_capacity(stream.len());
         let (mut token, mut warnings) = (None, Vec::new());

@@ -1528,8 +1528,9 @@ fn input_file_holds_no_document_bytes(file: &str, format: InputFormat) -> bool {
     }
     metadata.len() == 0
         || (metadata.len() == crate::cli::front_matter::UTF8_BOM.len() as u64
-            && std::fs::read(file)
-                .is_ok_and(|bytes| crate::cli::front_matter::leading_bom_len(&bytes) == bytes.len()))
+            && std::fs::read(file).is_ok_and(|bytes| {
+                crate::cli::front_matter::leading_bom_len(&bytes) == bytes.len()
+            }))
 }
 
 /// Whether this run is `-n`, which reads nothing and evaluates against yq's empty node (#7052).

@@ -930,7 +930,8 @@ pub(crate) fn read_seq(
         match item.error {
             // The barrier is a read of its own, whatever a fault is under `--stream-errors`.
             Some(message)
-                if !errors_are_events || message == crate::cli::jq_seq_reader::MESSAGELESS_RETURN =>
+                if !errors_are_events
+                    || message == crate::cli::jq_seq_reader::MESSAGELESS_RETURN =>
             {
                 faults.push((index, events.len(), message, item.location));
             }
