@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use succinctly::dsv::{build_index as build_dsv_index, DsvConfig, DsvRows};
 use succinctly::jq::document::{
     any_hash_repeats, effective_keys, key_hash, key_span_fingerprint, shared_key_hashes,
-    DistinctKeyCursors, DocumentCursor, DocumentValue, IndentSpec, JsonConvention,
-    PAIRWISE_SPAN_SCAN_LIMIT,
+    sorted_effective_keys, DistinctKeyCursors, DocumentCursor, DocumentValue, IndentSpec,
+    JsonConvention, PAIRWISE_SPAN_SCAN_LIMIT,
 };
 use succinctly::jq::eval_generic::{
     check_nesting_depth, depth_guard_panic_message, eval_with_cursor, to_owned as generic_to_owned,
@@ -18215,14 +18215,15 @@ fn materialize_stream_item<V: succinctly::jq::document::DocumentValue>(
             sorted,
             collapse,
         } => {
-            let mut keys = sink.materialize(
+            let keys = sink.materialize(
                 DiagStyle::Jq,
-                effective_keys(&fields, collapse),
+                if sorted {
+                    sorted_effective_keys(&fields, collapse)
+                } else {
+                    effective_keys(&fields, collapse)
+                },
                 &at.resolve(),
             )?;
-            if sorted {
-                keys.sort();
-            }
             Some(OwnedValue::Array(
                 keys.into_iter().map(OwnedValue::string).collect(),
             ))
@@ -18833,9 +18834,8 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
             fields,
             sorted: true,
             collapse,
-        } => match effective_keys(&fields, collapse) {
-            Ok(mut keys) => {
-                keys.sort();
+        } => match sorted_effective_keys(&fields, collapse) {
+            Ok(keys) => {
                 vec![OutputItem::Owned(OwnedValue::Array(
                     keys.into_iter().map(OwnedValue::string).collect(),
                 ))]

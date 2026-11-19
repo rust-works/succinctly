@@ -1,5 +1,8 @@
-//! #7260: an array of field reads (`[.id, .name]`) walks the object's members once for every name,
-//! where each read walked them all again. Every expectation here was captured from jq 1.7.1.
+//! #7260: two per-record walks of an object were cut down. An array of field reads (`[.id, .name]`)
+//! walks the object's members once for every name, where each read walked them all again, and jq's
+//! `keys` of an object whose keys are all escape-free strings sorts them and drops a repeat, without
+//! the hash probe that collapsed a repeat as the walk went. Every expectation here was captured from
+//! jq 1.7.1.
 
 use anyhow::Result;
 
@@ -88,6 +91,59 @@ fn an_array_of_field_reads_raises_what_a_read_raises_7260() -> Result<()> {
     for (input, stderr) in rows {
         assert_eq!(
             jq("[.a,.b]", input)?,
+            (String::new(), String::from(*stderr), 5),
+            "{input}"
+        );
+    }
+    Ok(())
+}
+
+/// `keys` sorted by code point with a repeated key once, whether the repeat is spelled the same or
+/// with an escape (which the escape-free walk leaves to the collapsing one), and a key holding an
+/// escaped NUL or a DEL, which is printed escaped.
+#[test]
+fn keys_sorts_and_collapses_as_jq_does_7260() -> Result<()> {
+    let rows: &[(&str, &str, &str)] = &[
+        ("keys", r#"{"b":1,"a":2,"b":3}"#, "[\"a\",\"b\"]\n"),
+        (
+            "keys",
+            r#"{"é":1,"e":2,"z":3,"E":4}"#,
+            "[\"E\",\"e\",\"z\",\"é\"]\n",
+        ),
+        ("keys", r#"{"\u0062":1,"b":2,"a":3}"#, "[\"a\",\"b\"]\n"),
+        (
+            "keys",
+            r#"{"a":1,"a":2,"a\u0000":3}"#,
+            "[\"a\",\"a\\u0000\"]\n",
+        ),
+        ("keys", "{\"\x7f\":1,\"\":2}", "[\"\",\"\\u007f\"]\n"),
+        ("keys", "{}", "[]\n"),
+        (
+            "[keys[]], (keys|length)",
+            r#"{"b":1,"a":2,"b":3}"#,
+            "[\"a\",\"b\"]\n2\n",
+        ),
+    ];
+    for (filter, input, expected) in rows {
+        assert_eq!(
+            jq(filter, input)?,
+            (String::from(*expected), String::new(), 0),
+            "{filter} over {input}"
+        );
+    }
+    let faults: &[(&str, &str)] = &[
+        (
+            r#"{"a":1,}"#,
+            "jq: parse error: Expected another key-value pair at line 1, column 8\n",
+        ),
+        (
+            r#"{"a" 1}"#,
+            "jq: parse error: Expected separator between values at line 1, column 7\n",
+        ),
+    ];
+    for (input, stderr) in faults {
+        assert_eq!(
+            jq("keys", input)?,
             (String::new(), String::from(*stderr), 5),
             "{input}"
         );

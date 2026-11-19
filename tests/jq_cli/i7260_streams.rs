@@ -211,3 +211,28 @@ fn seq_files_either_side_of_the_window_minimum_read_as_read_whole_7260() -> Resu
     );
     Ok(())
 }
+
+/// `[.id, .name]` and `keys` (the guard's array and key rows, which the whole-file route answered from
+/// the owned record) over a windowed stream cut at both ends: each record's answer, and both warnings,
+/// as jq 1.7.1 gives them and as the same bytes read whole give them.
+#[test]
+fn field_arrays_and_keys_of_a_windowed_seq_file_read_as_read_whole_7260() -> Result<()> {
+    let stream = format!("{CUT}{}{CUT}", records(0..RECORDS)).into_bytes();
+    let warnings = concat!(
+        "jq: ignoring parse error: Truncated value at line 2, column 1\n",
+        "jq: ignoring parse error: Unfinished string at EOF at line 2003, column 0\n",
+    );
+    let (out, err, status) = seq(&["--seq", "-c", "[.id,.name]"], &stream)?;
+    assert_eq!((err.as_str(), status), (warnings, 0));
+    let expected: String = (0..RECORDS)
+        .map(|i| format!("\x1e[{i},\"user {i}\"]\n"))
+        .collect();
+    assert_eq!(out, expected);
+    let (out, err, status) = seq(&["--seq", "-c", "keys"], &stream)?;
+    assert_eq!((err.as_str(), status), (warnings, 0));
+    assert_eq!(
+        out,
+        "\x1e[\"email\",\"id\",\"name\",\"score\",\"tags\"]\n".repeat(RECORDS)
+    );
+    Ok(())
+}

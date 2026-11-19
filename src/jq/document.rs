@@ -5240,6 +5240,49 @@ pub fn find_cursors_one_by_one<F: DocumentFields>(
     (Ok(()), walked)
 }
 
+/// [`effective_keys`], sorted: jq's `keys` of an object (#7260).
+///
+/// With `collapse`, an object whose every key is a string with no escape is walked without the
+/// hash probe [`DistinctKeyCursors`] runs to collapse a repeat as it goes: sorting puts a repeat
+/// next to itself, and such a key is its own decoded text, so dropping a neighbour equal to the
+/// one before it leaves what collapsing and then sorting leaves. The walk makes the checks the
+/// collapsing walk makes of every member (the `,`/`:` gaps, an unpaired last child, the gap after
+/// the last member) and raises what [`effective_keys`] raises. An object with any other key (an
+/// escape, which may decode like another key; a key that does not decode, which never collapses;
+/// one that is not a string) is [`effective_keys`]'s, as is every walk without `collapse`.
+pub fn sorted_effective_keys<F: DocumentFields>(
+    fields: &F,
+    collapse: bool,
+) -> Result<Vec<String>, EvalError> {
+    if collapse {
+        if let Some(keys) = plain_sorted_keys(fields) {
+            return keys;
+        }
+    }
+    let mut keys = effective_keys(fields, collapse)?;
+    keys.sort();
+    Ok(keys)
+}
+
+/// [`sorted_effective_keys`]' walk of an object whose keys are all escape-free strings, or `None`
+/// at the first key that is not one.
+fn plain_sorted_keys<F: DocumentFields>(fields: &F) -> Option<Result<Vec<String>, EvalError>> {
+    let mut keys: Vec<String> = Vec::new();
+    let mut cursors = DistinctKeyCursors::new(fields, false);
+    for (key, _) in cursors.by_ref() {
+        // `_with_end`: it declines an unterminated span, where the plain span would hand back a
+        // text the key does not hold.
+        let text = core::str::from_utf8(key.key_raw_unescaped_with_end()?.0).ok()?;
+        keys.push(String::from(text));
+    }
+    if cursors.is_malformed() || !cursors.trailing_gap_ok(b'}') {
+        return Some(Err(fields.malformed_member_error()));
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    Some(Ok(keys))
+}
+
 /// A single field from an object.
 #[derive(Clone)]
 pub struct DocumentField<V, C> {

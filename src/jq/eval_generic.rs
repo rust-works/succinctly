@@ -5058,6 +5058,13 @@ fn materialize_lazy_keys<V: DocumentValue, S: EvalSemantics>(
     sorted: bool,
     collapse: bool,
 ) -> Result<OwnedValue, EvalError> {
+    if sorted && collapse {
+        // #7260: jq's keys are strings, so the string walk that sorts them answers.
+        let keys = crate::jq::document::sorted_effective_keys(fields, collapse)?;
+        return Ok(OwnedValue::array_from(
+            keys.into_iter().map(OwnedValue::string).collect(),
+        ));
+    }
     let mut keys = effective_key_values::<_, S>(fields, collapse)?;
     if sorted {
         // `sorted` is only ever `true` in jq mode -- not by convention, but
