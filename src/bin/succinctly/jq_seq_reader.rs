@@ -381,8 +381,8 @@ pub(crate) fn source_ends<S: AsRef<[u8]>>(sources: &[(Option<usize>, S)]) -> Vec
 /// Every byte of the input stream, as jq's scanner sees it: all sources
 /// concatenated, with [`bom_prefix`]'s bytes already removed.
 ///
-/// The byte-at-a-time statement of [`stream_slices`], which the tests hold it to (#7263); the
-/// shipped callers read the slices.
+/// The byte-at-a-time statement of what [`NoRsScan`] counts, which the tests hold it to (#7263,
+/// #7260).
 #[cfg(test)]
 pub(crate) fn stream_bytes(
     raw_bytes: &[(Option<usize>, Vec<u8>)],
@@ -391,21 +391,6 @@ pub(crate) fn stream_bytes(
         .iter()
         .flat_map(|(_, raw)| raw.iter().copied())
         .skip(bom_prefix(raw_bytes).consumed)
-}
-
-/// The input stream a source at a time (#7263): each source's bytes as one slice, the first ones
-/// cut by [`bom_prefix`]'s bytes, so a caller can search them a block at a time rather than visit
-/// each byte. Shared with [`super::jq_runner::seq_no_rs_byte_warning`] so the two walkers over
-/// this same stream cannot drift apart on BOM handling.
-pub(crate) fn stream_slices(
-    raw_bytes: &[(Option<usize>, Vec<u8>)],
-) -> impl Iterator<Item = &[u8]> + '_ {
-    let mut skip = bom_prefix(raw_bytes).consumed;
-    raw_bytes.iter().map(move |(_, raw)| {
-        let cut = skip.min(raw.len());
-        skip -= cut;
-        &raw[cut..]
-    })
 }
 
 /// Move `line` and `column` past `span` as jq's reader counts them, a byte at a time: a newline
@@ -451,6 +436,97 @@ pub(crate) fn find_byte(needle: u8, hay: &[u8]) -> Option<usize> {
         start += block.len();
     }
     None
+}
+
+/// jq's reader over a `--seq` stream before it has seen an RS (#1525's template), read a piece at a
+/// time (#7260): the line and column it stands at, which is where `Unfinished abandoned text at EOF`
+/// is reported when the stream ends without one. jq's parser counts the bytes it is handed while it
+/// waits for an RS and does nothing else with them, so this is all it holds of them, and a stream with
+/// no RS need not be held to be answered.
+///
+/// The bytes are fed a source at a time, each in pieces that start where one of jq's `fgets` reads
+/// starts ([`JQ_FGETS_CHUNK`]); [`NoRsScan::feed`] says how far it read, which is always such a
+/// start, so the caller keeps the rest in front of the next piece. What jq's parser is handed of a
+/// read is [`fgets_visible_len`]'s, so a NUL hides the rest of a read with no newline (#7340); a
+/// BOM, whole or a prefix of one, is consumed at the stream's front and not counted
+/// ([`bom_prefix`]). The one definition of the position: [`super::jq_runner`]'s whole-stream answer
+/// feeds every source whole, and the windowed `--seq` route feeds a file it does not hold.
+pub(crate) struct NoRsScan {
+    line: usize,
+    column: usize,
+    /// How many bytes of a BOM the stream's front has matched, while it may still be one.
+    bom_matched: usize,
+    bom_open: bool,
+}
+
+impl Default for NoRsScan {
+    fn default() -> Self {
+        Self {
+            line: 1,
+            column: 0,
+            bom_matched: 0,
+            bom_open: true,
+        }
+    }
+}
+
+impl NoRsScan {
+    /// Reads `bytes`, the next bytes of a source from the start of one of jq's reads, through the last
+    /// read that ends in them (all of them when `end`: they run to the source's end, where jq's last
+    /// read of it ends). The bytes read, or `None` once jq's reader would stop waiting for an RS: it
+    /// sees one, or the stream opens with a malformed BOM, which leaves its parser reading
+    /// ([`BomPrefix::malformed`]). Each source starts a read of its own.
+    pub(crate) fn feed(&mut self, bytes: &[u8], end: bool) -> Option<usize> {
+        let upto = if end {
+            bytes.len()
+        } else {
+            // Reads start after a newline and then every JQ_FGETS_CHUNK bytes along a line; `bytes`
+            // starts at one, so the line in it after its last newline starts at one too.
+            let line_start = rfind_byte(b'\n', bytes).map_or(0, |at| at + 1);
+            line_start + (bytes.len() - line_start) / JQ_FGETS_CHUNK * JQ_FGETS_CHUNK
+        };
+        let region = &bytes[..upto];
+        if find_byte(0, region).is_none() {
+            // Every byte of every read is handed to the parser.
+            self.visible(region)?;
+        } else {
+            let mut at = 0;
+            for len in fgets_chunk_lens(region) {
+                let chunk = &region[at..at + len];
+                self.visible(&chunk[..fgets_visible_len(chunk)])?;
+                at += len;
+            }
+        }
+        Some(upto)
+    }
+
+    /// Bytes jq's parser is handed, in order.
+    fn visible(&mut self, mut bytes: &[u8]) -> Option<()> {
+        while self.bom_open {
+            let Some(&byte) = bytes.first() else {
+                return Some(());
+            };
+            if self.bom_matched == UTF8_BOM.len() || byte != UTF8_BOM[self.bom_matched] {
+                self.bom_open = false;
+                if self.bom_matched > 0 && self.bom_matched < UTF8_BOM.len() {
+                    return None;
+                }
+            } else {
+                self.bom_matched += 1;
+                bytes = &bytes[1..];
+            }
+        }
+        if find_byte(ASCII_RS, bytes).is_some() {
+            return None;
+        }
+        advance_position(bytes, &mut self.line, &mut self.column);
+        Some(())
+    }
+
+    /// The 1-based line and the column jq's reader stands at after what was fed.
+    pub(crate) fn position(&self) -> (usize, usize) {
+        (self.line, self.column)
+    }
 }
 
 /// The offset of the last `needle` in `hay`, as [`find_byte`] finds the first.
@@ -4096,10 +4172,40 @@ mod tests {
         }
     }
 
-    /// #7263: the slices are the bytes: BOM prefixes of every length (whole, partial, malformed)
-    /// cut across empty and short sources.
+    /// jq's reader over a stream with no RS it sees, a byte at a time, from the functions that say
+    /// which bytes it sees ([`bom_prefix`], [`nul_cuts`]): `None` where an RS is seen or the BOM is
+    /// malformed.
+    fn no_rs_position_bytewise(sources: &[(Option<usize>, Vec<u8>)]) -> Option<(usize, usize)> {
+        let bom = bom_prefix(sources);
+        if bom.malformed {
+            return None;
+        }
+        let cuts = nul_cuts(sources);
+        let (mut line, mut column) = (1usize, 0usize);
+        for (at, &b) in sources.iter().flat_map(|(_, raw)| raw.iter()).enumerate() {
+            if at < bom.consumed || cuts.iter().any(|&(from, to)| (from..to).contains(&at)) {
+                continue;
+            }
+            if b == ASCII_RS {
+                return None;
+            }
+            if b == b'\n' {
+                line += 1;
+                column = 0;
+            } else {
+                column += 1;
+            }
+        }
+        Some((line, column))
+    }
+
+    /// #7260: [`NoRsScan`] fed a source in pieces of any size, each read up to where it says and the
+    /// rest kept in front of the next piece (as the windowed route reads a file), stands where it does
+    /// fed each source whole, and where jq's reader stands counted a byte at a time: over BOM
+    /// prefixes of every kind, NULs in reads with and without a newline, lines longer than one of
+    /// jq's reads, and RS bytes seen and hidden.
     #[test]
-    fn stream_slices_are_stream_bytes_7263() {
+    fn no_rs_scan_in_pieces_is_the_bytewise_count_7260() {
         let prefixes: [&[u8]; 6] = [
             b"",
             b"\xEF",
@@ -4108,29 +4214,70 @@ mod tests {
             b"\xEF\xBBx",
             b"\xEFx",
         ];
-        let mut rng = Lcg(1525);
+        let mut rng = Lcg(7260);
         for prefix in prefixes {
-            for _ in 0..200 {
+            for round in 0..300 {
                 let mut stream = prefix.to_vec();
-                let len = rng.below(12);
-                stream.extend(rng.bytes(b"a\n\x1e", len));
-                // Cut the stream into sources at random points, empty ones included.
-                let mut sources = Vec::new();
-                let mut rest = stream.as_slice();
-                while !rest.is_empty() || rng.below(3) == 0 {
-                    let take = rng.below(rest.len() + 1).min(rng.below(4));
-                    sources.push((None, rest[..take].to_vec()));
-                    rest = &rest[take..];
-                    if rest.is_empty() && rng.below(2) == 0 {
-                        break;
+                // Long lines past a read of JQ_FGETS_CHUNK bytes, and an RS or NUL now and then.
+                let len = rng.below(if round % 3 == 0 {
+                    3 * JQ_FGETS_CHUNK
+                } else {
+                    40
+                });
+                let alphabet: &[u8] = match round % 5 {
+                    0 => b"ab\n",
+                    1 => b"aaaaaaaaab\n\0",
+                    2 => b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaab\0\x1e\n",
+                    // Lines of thousands of bytes, with a NUL in some of their reads.
+                    3 => &[b'a'; 1500][..],
+                    _ => b"a\n\0\xEF\xBB\xBF",
+                };
+                stream.extend(rng.bytes(alphabet, len));
+                if round % 5 == 3 {
+                    for _ in 0..rng.below(4) {
+                        let at = prefix.len() + rng.below(len + 1);
+                        stream.insert(at, [b'\0', b'\n', ASCII_RS][rng.below(3)]);
                     }
                 }
-                let sliced: Vec<u8> = stream_slices(&sources).flatten().copied().collect();
-                assert_eq!(
-                    sliced,
-                    stream_bytes(&sources).collect::<Vec<u8>>(),
-                    "{sources:?}"
-                );
+                if round % 7 == 0 {
+                    // A long line with a NUL in its second read and an RS after it, unseen.
+                    stream.extend(std::iter::repeat_n(b'a', JQ_FGETS_CHUNK + 7));
+                    stream.extend(b"\0x\x1ey");
+                }
+                let mut sources = Vec::new();
+                let mut rest = stream.as_slice();
+                while !rest.is_empty() {
+                    let take = rng.below(rest.len() + 1).max(rng.below(2));
+                    sources.push((None, rest[..take].to_vec()));
+                    rest = &rest[take..];
+                }
+                let want = no_rs_position_bytewise(&sources);
+                let mut whole = NoRsScan::default();
+                let whole = sources
+                    .iter()
+                    .try_for_each(|(_, raw)| whole.feed(raw, true).map(|_| ()))
+                    .map(|()| whole.position());
+                assert_eq!(whole, want, "{sources:?}");
+                let mut scan = NoRsScan::default();
+                let pieces = sources.iter().try_for_each(|(_, raw)| {
+                    let mut held = Vec::new();
+                    let mut rest = raw.as_slice();
+                    loop {
+                        let take = rng.below(rest.len() + 1).max(rng.below(2)).min(rest.len());
+                        held.extend_from_slice(&rest[..take]);
+                        rest = &rest[take..];
+                        let read = scan.feed(&held, rest.is_empty())?;
+                        if rest.is_empty() {
+                            assert_eq!(read, held.len());
+                            return Some(());
+                        }
+                        // What is left is less than one of jq's reads, which never holds a newline.
+                        assert!(held.len() - read < JQ_FGETS_CHUNK);
+                        assert!(!held[read..].contains(&b'\n'));
+                        held.drain(..read);
+                    }
+                });
+                assert_eq!(pieces.map(|()| scan.position()), want, "{sources:?}");
             }
         }
     }

@@ -12385,6 +12385,8 @@ fn hand_on_seq_pipe_tail(args: &JqCommand) -> bool {
     };
     crate::cli::jq_seq_reader::seed_token_byte(tail.token_byte);
     crate::cli::jq_seq_reader::seed_faulted_rs(tail.faulted_rs);
+    // #7260: a file read to its end that held no RS is handed on as no bytes and where it ended.
+    HANDED_ON_NO_RS_END.with(|end| end.set(tail.no_rs_end));
     let stream = tail.stream;
     let named = get_input_files(args);
     if let [path] = named.as_slice() {
@@ -17571,67 +17573,34 @@ fn seq_no_rs_byte_warning(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> Option<Stri
 /// there is no source at all. [`seq_no_rs_byte_warning`] words it as the warning a non-`-n` run
 /// prints; `-n` with `input`/`inputs` raises it as an error instead (#5636).
 fn seq_no_rs_byte_position(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> Option<(usize, usize)> {
-    // A *malformed* BOM is the one case where "no RS byte anywhere" does not imply #1525's
-    // template: it costs jq a `parser_reset` that leaves the parser reading rather than waiting
-    // for an RS, so the reader owns that case (#1723). One definition for the warning and the
-    // `-n` error (#5636).
-    if crate::cli::jq_seq_reader::bom_prefix(raw_bytes).malformed {
-        return None;
-    }
-    let mut line = 1usize;
-    let mut column = 0usize;
-    // #7340: what jq's parser never sees, which is a stream's NULs and what follows them. A cut
-    // starts at a NUL, so an RS with no NUL before it in its source is one jq sees: the common
-    // stream answers here, having read up to its first RS and no further.
-    let mut nul_seen = false;
-    for slice in crate::cli::jq_seq_reader::stream_slices(raw_bytes) {
-        let rs = crate::cli::jq_seq_reader::find_byte(ASCII_RS, slice);
-        if crate::cli::jq_seq_reader::find_byte(0, rs.map_or(slice, |at| &slice[..at])).is_some() {
-            nul_seen = true;
-            break;
-        }
-        if rs.is_some() {
-            return None;
-        }
-    }
-    let cuts = if nul_seen {
-        crate::cli::jq_seq_reader::nul_cuts(raw_bytes)
-    } else {
-        Vec::new()
-    };
-    let ends = crate::cli::jq_seq_reader::source_ends(raw_bytes);
-    // Shares `stream_slices` and `advance_position` with `jq_seq_reader`, which walks this same
-    // stream to classify the templates that apply once an RS *is* present (#1723) -- the two must
-    // agree on BOM handling and on where a column starts. #7263: a slice at a time, searched a
-    // block at a time, where a byte at a time was a third of a no-RS run.
-    for (slice, end) in crate::cli::jq_seq_reader::stream_slices(raw_bytes).zip(ends) {
-        // A BOM is cut from the front of a slice, so the slice ends where its source does, and a
-        // cut never spans two sources. A cut can start before the slice (in the consumed BOM).
-        let start = end - slice.len();
-        // The pieces of the slice between its cuts.
-        let mut pieces = Vec::new();
-        let mut at = start;
-        for &(cut_start, cut_end) in &cuts[cuts.partition_point(|&(_, cut_end)| cut_end <= start)..]
-        {
-            if cut_start >= end {
-                break;
-            }
-            pieces.push((at, cut_start.max(at)));
-            at = cut_end.max(at);
-        }
-        pieces.push((at, end));
-        for (gap_start, gap_end) in pieces {
-            let piece = &slice[gap_start - start..gap_end - start];
-            if piece.contains(&ASCII_RS) {
-                return None;
-            }
-            crate::cli::jq_seq_reader::advance_position(piece, &mut line, &mut column);
-        }
+    // #7260: a `--seq` file the windowed route read to its end without holding it, and found no RS
+    // jq sees in, is handed on as an empty stream with the position its scan found.
+    if let Some(position) = HANDED_ON_NO_RS_END.with(std::cell::Cell::take) {
+        debug_assert!(raw_bytes.iter().all(|(_, raw)| raw.is_empty()));
+        return Some(position);
     }
     if raw_bytes.is_empty() {
         return None;
     }
-    Some((line, column))
+    // A *malformed* BOM is the one case where "no RS byte anywhere" does not imply #1525's
+    // template: it costs jq a `parser_reset` that leaves the parser reading rather than waiting
+    // for an RS, so the reader owns that case (#1723); the scan says so as it says it met an RS.
+    // #7340: what jq's parser never sees, a stream's NULs and what follows them in a read with no
+    // newline, is neither counted nor searched for an RS. Each source is fed whole: jq starts a
+    // read at each file's start. #7260: one definition with the windowed route's scan.
+    let mut scan = crate::cli::jq_seq_reader::NoRsScan::default();
+    for (_, raw) in raw_bytes {
+        scan.feed(raw, true)?;
+    }
+    Some(scan.position())
+}
+
+thread_local! {
+    /// The position [`seq_no_rs_byte_position`] answers for the next stream it is asked about: one
+    /// the windowed `--seq` route scanned to its end without holding it, and found no RS in, which it
+    /// hands on as no bytes (#7260, `window::WindowedFile::hand_on_seq_tail`).
+    static HANDED_ON_NO_RS_END: std::cell::Cell<Option<(usize, usize)>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Validate that the DSV delimiter is acceptable.

@@ -180,6 +180,11 @@ const LOOKAHEAD_WINDOWS: usize = 8;
 /// The record separator of a `--seq` stream.
 const RS: u8 = 0x1e;
 
+/// The most bytes a scan of jq's reads leaves unread at the end of a piece: less than one read
+/// ([`crate::cli::jq_seq_reader::JQ_FGETS_CHUNK`]), so a piece with this much room past what is
+/// left always reads on (#7260).
+const JQ_READ_CARRY: usize = crate::cli::jq_seq_reader::JQ_FGETS_CHUNK;
+
 /// Reads each RS byte of `bytes` as a space (#7082).
 fn blank_rs_bytes(bytes: &mut [u8]) {
     for b in bytes {
@@ -428,6 +433,9 @@ pub(super) struct WindowedFile {
     /// A `--seq` pipe (#7164): only its records that are RFC 7464's own framing are handed out, and the
     /// stream from the first that is not is handed on ([`SeqGate`]).
     seq_gate: Option<SeqGate>,
+    /// The gate's stream is the run's only source ([`Self::from_seq_pipe`]), whose tail goes to the
+    /// route that reads a stream whole, not a file of a `--seq` list (#7260, [`Self::no_rs_end`]).
+    lone_seq: bool,
     /// The warnings of the stretches the gate resumed after (#7322) that no window has handed out
     /// yet, in order, each with where in `buf` jq's reader met it ([`Window::notes`]).
     notes: Vec<(usize, String)>,
@@ -497,6 +505,7 @@ impl WindowedFile {
             certifier: None,
             held: None,
             seq_gate: None,
+            lone_seq: false,
             notes: Vec::new(),
             gate_cut: false,
             front_end: 0,
@@ -1324,6 +1333,11 @@ pub(super) struct SeqTail {
     /// a stretch read before it warned there, which the windows have printed
     /// ([`crate::cli::jq_seq_reader::seed_faulted_rs`], #7260).
     pub faulted_rs: Option<usize>,
+    /// #7260: a regular file that does not open with an RS, read to its end and found to hold no RS jq
+    /// sees, is not handed on as its bytes (`stream` is empty): this is the line and column jq's
+    /// reader stands at at its end, where it reports `Unfinished abandoned text at EOF`, which is all
+    /// the route that reads a stream whole would make of it.
+    pub no_rs_end: Option<(usize, usize)>,
     /// Where `stream` was first allocated, and the room it had before the tail was read, so a test can
     /// tell the tail was read into it in place (a pointer alone does not: a large buffer can be grown in
     /// place by `mremap` on Linux).
@@ -1699,6 +1713,7 @@ impl WindowedFile {
         this.started = true;
         this.blank_rs = true;
         this.seq_gate = Some(SeqGate::new(slot));
+        this.lone_seq = true;
         this
     }
 
@@ -1779,6 +1794,27 @@ impl WindowedFile {
     /// `hand_on_seq_files_tail`), as a runtime error names the line in its own file.
     fn hand_on_seq_tail(&mut self, at: usize) -> usize {
         use std::io::Seek;
+        if let Some(end) = self.no_rs_end(at) {
+            self.buf.truncate(at);
+            self.buf.shrink_to_fit();
+            self.eof = true;
+            let gate = self
+                .seq_gate
+                .as_ref()
+                .expect("only a --seq source's gate hands a tail on");
+            *gate.slot.borrow_mut() = Some(SeqTail {
+                #[cfg(test)]
+                reserved_at: 0,
+                #[cfg(test)]
+                reserved_room: 0,
+                stream: Vec::new(),
+                error: None,
+                token_byte: gate.token_byte,
+                faulted_rs: None,
+                no_rs_end: Some(end),
+            });
+            return at;
+        }
         let lines = self.lines_before + count_newlines(&self.buf[..at]);
         let left = if self.eof {
             0
@@ -1822,8 +1858,67 @@ impl WindowedFile {
             error,
             token_byte: gate.token_byte,
             faulted_rs,
+            no_rs_end: None,
         });
         at
+    }
+
+    /// #7260: where jq's reader stands at the end of a regular file whose stream does not open with an
+    /// RS (the gate hands it on at `at`, its first byte), read to its end a piece at a time, when it
+    /// holds no RS jq sees ([`crate::cli::jq_seq_reader::NoRsScan`]): jq prints only `Unfinished
+    /// abandoned text at EOF` there, so the route that reads a stream whole need not be handed all of
+    /// it (78 MB held for a 70 MB file). `None` for any other stream, which is then read from where
+    /// it was, as before: a pipe, which cannot be read again; a stream an RS or a malformed BOM turns
+    /// up in, or whose read fails, which the file is put back for (it is seeked to where the scan
+    /// began).
+    fn no_rs_end(&self, at: usize) -> Option<(usize, usize)> {
+        use std::io::{Seek, SeekFrom};
+        /// How much of the file a read of the scan takes.
+        const PIECE: usize = 64 << 10;
+        let gate = self.seq_gate.as_ref()?;
+        if !self.lone_seq || at != 0 || gate.opened || self.read_error.is_some() {
+            return None;
+        }
+        let mut file = &*self.file;
+        if !file.metadata().ok()?.is_file() {
+            return None;
+        }
+        let start = file.stream_position().ok()?;
+        let mut scan = crate::cli::jq_seq_reader::NoRsScan::default();
+        let mut piece = Vec::with_capacity(PIECE.max(self.buf.len()) + JQ_READ_CARRY);
+        piece.extend_from_slice(&self.buf);
+        // What the gate read first is judged before anything more is read: a stream that has an RS
+        // near its front (one led by a line break) is handed on with nothing read past it to put back.
+        let read = scan.feed(&piece, self.eof)?;
+        if self.eof {
+            return Some(scan.position());
+        }
+        piece.drain(..read);
+        let mut eof = false;
+        let found = loop {
+            if !eof {
+                let room = piece.capacity() - piece.len();
+                match file.take(room as u64).read_to_end(&mut piece) {
+                    // A short read is the file's end, as a read of it to its end finds it.
+                    Ok(read) => eof = read < room,
+                    // patchcov: coverage tolerate-line reason="untestable: a read that fails after the file opened"
+                    Err(_) => break false,
+                }
+            }
+            let Some(read) = scan.feed(&piece, eof) else {
+                break false;
+            };
+            if eof {
+                break true;
+            }
+            piece.drain(..read);
+        };
+        if found {
+            return Some(scan.position());
+        }
+        // patchcov: coverage tolerate-line reason="defensive: a regular file that was read can be seeked"
+        file.seek(SeekFrom::Start(start)).ok()?;
+        None
     }
 
     /// A pipe on standard input, from what a first read of it took (`front`, which ended in `error` if
