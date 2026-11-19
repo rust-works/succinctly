@@ -11,7 +11,7 @@
 //! ([`super::input_props`]), and `-p csv` / `-p tsv` a table as the sequence of mappings yq makes of
 //! its records ([`super::input_csv`]), so those runs are `-p yaml` runs.
 
-use crate::InputFormat;
+use crate::cli::InputFormat;
 
 /// An input format the run transcodes before reading it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

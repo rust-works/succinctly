@@ -135,7 +135,7 @@ pub fn run_benchmark(
 
     // Set up Ctrl+C handler
     let interrupted = Arc::new(AtomicBool::new(false));
-    crate::interrupt::on_interrupt(&interrupted, "Interrupted! Writing partial results...")?;
+    crate::cli::interrupt::on_interrupt(&interrupted, "Interrupted! Writing partial results...")?;
 
     eprintln!("Running UTF-8 validation benchmark suite (scalar)...");
     eprintln!("  Data directory: {}", config.data_dir.display());

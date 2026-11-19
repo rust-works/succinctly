@@ -11,7 +11,7 @@
 //! 1.7.1's `jv_parse.c` (`stream_token`, `stream_check_done`, `scan`, `check_literal`,
 //! `found_string` and the EOF branch of `jv_parser_next`), checked against the pinned
 //! `/usr/bin/jq` rather than written from the documentation. It reuses
-//! [`crate::jq_seq_reader`]'s port of the tokenizer pieces both modes share: the `fgets` chunking,
+//! [`crate::cli::jq_seq_reader`]'s port of the tokenizer pieces both modes share: the `fgets` chunking,
 //! the number grammar, `\uXXXX`.
 //!
 //! What it keeps from jq on purpose:
@@ -32,7 +32,7 @@
 //! bytes, so a number keeps its spelling and a string its decoding exactly as a document's would;
 //! this module decides only where each one begins and ends and which error fires.
 
-use crate::jq_seq_reader::{
+use crate::cli::jq_seq_reader::{
     c_string, decode_string_in_place, fgets_chunk_len_at, fgets_visible_len, number_is_valid,
     JQ_FGETS_CHUNK,
 };
@@ -569,7 +569,7 @@ pub(crate) struct Reader<R: RefillSource> {
     /// refill that hit the end of the file stop jq's input on an empty record (#2998).
     stops_on_empty: bool,
     /// Whether that stop is only the end of the call that met it: the input queue holds a barrier
-    /// there ([`crate::jq_seq_reader::MESSAGELESS_RETURN`]) and the reader parses on past it, as
+    /// there ([`crate::cli::jq_seq_reader::MESSAGELESS_RETURN`]) and the reader parses on past it, as
     /// jq's parser keeps the rest of its buffer for the next call (#6141).
     stop_is_barrier: bool,
     /// Whether a parse error ends jq's `next_input` call, as it does where it is not an input of its
@@ -693,7 +693,7 @@ impl<R: RefillSource> Reader<R> {
             parser.pending.push_back(Yielded {
                 value: OwnedValue::Null,
                 location: (parser.source, parser.lines_read),
-                error: Some(crate::jq_seq_reader::MESSAGELESS_RETURN.to_string()),
+                error: Some(crate::cli::jq_seq_reader::MESSAGELESS_RETURN.to_string()),
             });
             let rest = &self.buf[fed.consumed..];
             fed = if rest.is_empty() {
@@ -930,7 +930,8 @@ pub(crate) fn read_seq(
         match item.error {
             // The barrier is a read of its own, whatever a fault is under `--stream-errors`.
             Some(message)
-                if !errors_are_events || message == crate::jq_seq_reader::MESSAGELESS_RETURN =>
+                if !errors_are_events
+                    || message == crate::cli::jq_seq_reader::MESSAGELESS_RETURN =>
             {
                 faults.push((index, events.len(), message, item.location));
             }
@@ -1126,10 +1127,10 @@ struct Parser {
     /// [`Parser::check_done`] hands out as the leaf and then `[path]`.
     output: Vec<OwnedValue>,
     next: Option<OwnedValue>,
-    /// jq's `tokenbuf`/`tokenpos`, as in [`crate::jq_seq_reader`]: a buffer that is not cleared
+    /// jq's `tokenbuf`/`tokenpos`, as in [`crate::cli::jq_seq_reader`]: a buffer that is not cleared
     /// with the token, because `check_literal` reads `tokenbuf[1]` without checking `tokenpos`.
     /// Before any token has written index 1 that is uninitialised memory in jq, modelled here
-    /// as not `u` (#7256, see [`crate::jq_seq_reader`]).
+    /// as not `u` (#7256, see [`crate::cli::jq_seq_reader`]).
     token_buf: Vec<u8>,
     token_len: usize,
     source: usize,
@@ -1764,7 +1765,7 @@ fn materialize(token: &[u8]) -> OwnedValue {
         substituted = succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(token);
         substituted.as_bytes()
     };
-    crate::jq_runner::json_bytes_to_owned_value_checked(bytes).unwrap_or(OwnedValue::Null)
+    crate::cli::jq_runner::json_bytes_to_owned_value_checked(bytes).unwrap_or(OwnedValue::Null)
 }
 
 #[cfg(test)]
@@ -2508,7 +2509,7 @@ mod tests {
         let mut refills: Vec<(usize, Vec<u8>, bool, bool)> = Vec::new();
         for (index, (_, raw)) in sources.iter().enumerate() {
             let last_source = index + 1 == sources.len();
-            let lens: Vec<usize> = crate::jq_seq_reader::fgets_chunk_lens(raw).collect();
+            let lens: Vec<usize> = crate::cli::jq_seq_reader::fgets_chunk_lens(raw).collect();
             if lens.is_empty() {
                 refills.push((index, Vec::new(), false, last_source));
                 continue;

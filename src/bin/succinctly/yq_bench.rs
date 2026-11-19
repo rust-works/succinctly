@@ -14,9 +14,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::bench_reps::{ensure_success, interleaved_reps};
+use crate::cli::bench_reps::{ensure_success, interleaved_reps};
 
-use crate::yaml_generators;
+use crate::cli::yaml_generators;
 
 /// Every generated suite pattern, alphabetically.
 ///
@@ -195,7 +195,7 @@ pub fn run_benchmark(
 
     // Set up Ctrl+C handler
     let interrupted = Arc::new(AtomicBool::new(false));
-    crate::interrupt::on_interrupt(&interrupted, "Interrupted! Writing partial results...")?;
+    crate::cli::interrupt::on_interrupt(&interrupted, "Interrupted! Writing partial results...")?;
 
     eprintln!("Running yq benchmark suite...");
     eprintln!("  Data directory: {}", config.data_dir.display());

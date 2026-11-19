@@ -1141,16 +1141,35 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
     /// which alone may decode a bridge token (#3034, #2802).
     #[inline]
     fn number_at(&self, text_pos: usize) -> StandardJson<'a, W> {
-        let strict_end = strict_number_end(self.text, text_pos);
-        let end = strict_end.unwrap_or_else(|| nested_number_span(self.text, text_pos));
+        if let Some(end) = strict_number_end(self.text, text_pos) {
+            return StandardJson::Number(JsonNumber {
+                text: self.text,
+                start: text_pos,
+                len: u32::try_from(end - text_pos).unwrap_or(UNMEASURED_SPAN),
+                bridge: self.index.bridge_tokens,
+            });
+        }
+        self.lenient_number_at(text_pos)
+    }
+
+    /// [`number_at`](Self::number_at) for a span [`strict_number_end`] did not settle: a lenient
+    /// spelling, a decNumber word, a bridge token or a malformed span.
+    ///
+    /// Out of line and cold so that `number_at`, which every number a document walk reads goes
+    /// through, is the strict scan and nothing else (#7384). With this and
+    /// `lenient_number_literal` split out, `.numbers | add` and `.numbers | max` over 100 MB of
+    /// floats measured about 2% faster on an M4 Pro.
+    #[cold]
+    #[inline(never)]
+    fn lenient_number_at(&self, text_pos: usize) -> StandardJson<'a, W> {
+        let end = nested_number_span(self.text, text_pos);
         let n = JsonNumber {
             text: self.text,
             start: text_pos,
             len: u32::try_from(end - text_pos).unwrap_or(UNMEASURED_SPAN),
             bridge: self.index.bridge_tokens,
         };
-        if strict_end.is_some()
-            || n.bridge_value().is_some()
+        if n.bridge_value().is_some()
             || n.bridge_spelling().is_some()
             || crate::json::validate::number_span_decodes(&self.text[text_pos..end])
         {
@@ -5423,113 +5442,14 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
     fn number_literal(&self) -> Option<Cow<'_, str>> {
         match self {
             StandardJson::Number(n) => {
-                // #1071: the bridge's token for a document `.inf`/`.NaN` stands for
-                // the spelling the owned value carried.
-                if let Some(literal) = n.bridge_nonfinite_literal() {
-                    return Some(Cow::Borrowed(literal));
-                }
-                // #2802: so does the token for a scalar written in a non-JSON spelling.
-                if let Some(spelling) = n.bridge_spelling() {
-                    return Some(Cow::Owned(spelling));
-                }
-                let bytes = n.raw_bytes();
-                if let Some(text) = crate::json::validate::valid_number_str(bytes) {
-                    return Some(Cow::Borrowed(text));
-                }
-                // Real jq's own number reader tolerates a redundant
-                // leading zero that strict RFC 8259 doesn't (`007` ->
-                // `7`, `007e5` -> `7E+5`, `007.500` -> `7.500`) -- #1149,
-                // same leniency as `OwnedValue::from_number_bytes`'s own
-                // leading-zero handling (shared gate via
-                // `strip_redundant_leading_zeros`, since this trait impl
-                // has no access to that jq-layer type). Reached by
-                // `--argjson`/`--jsonargs` (`parse_json_value`'s own
-                // normalize-and-retry validation lets a leading-zero
-                // literal survive to materialize here) and this crate's
-                // own `.json`-file input path, which both materialize
-                // through this generic `DocumentValue` trait rather than
-                // `from_number_bytes` directly. `--slurpfile`/`--seq`
-                // don't reach this arm at all -- both validate via a
-                // stricter path with no leading-zero retry
-                // (`parse_json_stream`'s `serde_json::Deserializer`,
-                // `parse_json_seq`'s own `validate::validate`), so
-                // a leading-zero literal there still errors/is dropped
-                // before ever reaching `number_literal()` (confirmed
-                // live; pre-existing, out-of-scope gap, unchanged by this
-                // fix). Returns the *original*
-                // `bytes` here, not the stripped copy the gate check
-                // builds -- dropping the redundant zero is purely a
-                // display-time concern (`format_number_jq_compat`), not
-                // something the stored spelling itself needs to already
-                // reflect (matches `from_number_bytes`'s own leading-dot
-                // and leading-zero handling, both of which store the
-                // original text for the same reason).
-                // Real jq's own number reader also accepts a leading `.`
-                // (with or without a preceding `-`) when at least one digit
-                // follows (`.5` -> `0.5`, `-.5` -> `-0.5`, #1171) -- same
-                // leniency as `OwnedValue::from_number_bytes`'s own
-                // leading-dot handling, shared gate via `has_leading_dot`.
-                // Checked before the leading-zero-strip escape below (no
-                // int digits to strip in the first place for a leading-dot
-                // token, so the two never compose the way the leading-zero
-                // and trailing-dot escapes do) -- missing entirely until
-                // #2240's own code review found it: `--argjson` navigating
-                // through this generic-evaluator path (not
-                // `from_number_bytes`'s own primary document-input path)
-                // silently lost precision on a leading-dot literal instead
-                // of preserving its spelling, once #2240's own fix let
-                // `--argjson` accept one in the first place.
-                if crate::json::validate::has_leading_dot(bytes) {
-                    return core::str::from_utf8(bytes).ok().map(Cow::Borrowed);
-                }
-                let zero_stripped = crate::json::validate::strip_redundant_leading_zeros(bytes);
-                if let Some(stripped) = &zero_stripped {
-                    if crate::json::validate::is_valid_number(stripped) {
-                        return core::str::from_utf8(bytes).ok().map(Cow::Borrowed);
+                // The ordinary document number: no bridge token to decode, and an RFC 8259
+                // spelling. Everything else is `lenient_number_literal`.
+                if !n.bridge {
+                    if let Some(text) = crate::json::validate::valid_number_str(n.raw_bytes()) {
+                        return Some(Cow::Borrowed(text));
                     }
                 }
-                // Real jq's own number reader also tolerates a trailing
-                // `.` immediately before an exponent marker (`1.e999` ->
-                // `1.0e999`) -- same leniency as
-                // `OwnedValue::from_number_bytes`'s own trailing-dot
-                // handling (#2220, shared gate via
-                // `has_trailing_dot_before_exponent`). Checked against the
-                // leading-zero-stripped form above (when one exists), not
-                // always `bytes` itself, so the two escapes compose: a
-                // token can have both a redundant leading zero *and* a
-                // trailing dot before its exponent at once (`007.e999`).
-                // Returns the *original* `bytes`, matching every other
-                // escape in this function and in `from_number_bytes`.
-                let base = zero_stripped.as_deref().unwrap_or(bytes);
-                if crate::json::validate::has_trailing_dot_before_exponent(base) {
-                    return core::str::from_utf8(bytes).ok().map(Cow::Borrowed);
-                }
-                // A leading `+` (#2877): `+X` is `X` in jq, and the
-                // literal is the *unsigned* text, borrowed from the same
-                // span one byte in -- the same peel
-                // `OwnedValue::from_number_bytes` makes, re-running the
-                // four gates above on the unsigned text
-                // (`is_preservable_number_literal` names that exact set).
-                // decNumber's special words (`nan`, `-Infinity`, ...)
-                // deliberately reach none of these gates and return `None`
-                // here: they have no JSON spelling to preserve, so the
-                // caller's `as_f64` fallback hands back the bare value
-                // instead, exactly as `from_number_bytes` does.
-                if let Some(text) = n.bridge_signed_overflowed_int() {
-                    return Some(Cow::Borrowed(text));
-                }
-                if let Some(unsigned) = crate::json::validate::strip_leading_plus(bytes) {
-                    if crate::json::validate::is_preservable_number_literal(unsigned) {
-                        return core::str::from_utf8(unsigned).ok().map(Cow::Borrowed);
-                    }
-                }
-                // The semi-index scanner accepts number *spans* more
-                // leniently than RFC 8259 beyond just a leading zero
-                // (e.g. `1.2.3` — see #966): echoing such text verbatim
-                // would produce invalid JSON output. Fall through to
-                // `as_i64`/`as_f64` (still lenient, but numerically
-                // sound) or `Null`.
-                None
+                lenient_number_literal(n)
             }
             _ => None,
         }
@@ -5706,6 +5626,124 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
             _ => None,
         }
     }
+}
+
+/// `DocumentValue::number_literal` of a number that is not an RFC 8259 spelling read off a
+/// document: a reindex bridge token, or one of the lenient spellings jq reads.
+///
+/// Out of line and cold for the reason `JsonCursor::lenient_number_at` is (#7384): the
+/// `number_literal` a fold over a document's numbers calls once per element is then the bridge
+/// test and one grammar check.
+#[cold]
+#[inline(never)]
+fn lenient_number_literal<'a>(n: &JsonNumber<'a>) -> Option<Cow<'a, str>> {
+    // #1071: the bridge's token for a document `.inf`/`.NaN` stands for
+    // the spelling the owned value carried.
+    if let Some(literal) = n.bridge_nonfinite_literal() {
+        return Some(Cow::Borrowed(literal));
+    }
+    // #2802: so does the token for a scalar written in a non-JSON spelling.
+    if let Some(spelling) = n.bridge_spelling() {
+        return Some(Cow::Owned(spelling));
+    }
+    let bytes = n.raw_bytes();
+    if let Some(text) = crate::json::validate::valid_number_str(bytes) {
+        return Some(Cow::Borrowed(text));
+    }
+    // Real jq's own number reader tolerates a redundant
+    // leading zero that strict RFC 8259 doesn't (`007` ->
+    // `7`, `007e5` -> `7E+5`, `007.500` -> `7.500`) -- #1149,
+    // same leniency as `OwnedValue::from_number_bytes`'s own
+    // leading-zero handling (shared gate via
+    // `strip_redundant_leading_zeros`, since this trait impl
+    // has no access to that jq-layer type). Reached by
+    // `--argjson`/`--jsonargs` (`parse_json_value`'s own
+    // normalize-and-retry validation lets a leading-zero
+    // literal survive to materialize here) and this crate's
+    // own `.json`-file input path, which both materialize
+    // through this generic `DocumentValue` trait rather than
+    // `from_number_bytes` directly. `--slurpfile`/`--seq`
+    // don't reach this arm at all -- both validate via a
+    // stricter path with no leading-zero retry
+    // (`parse_json_stream`'s `serde_json::Deserializer`,
+    // `parse_json_seq`'s own `validate::validate`), so
+    // a leading-zero literal there still errors/is dropped
+    // before ever reaching `number_literal()` (confirmed
+    // live; pre-existing, out-of-scope gap, unchanged by this
+    // fix). Returns the *original*
+    // `bytes` here, not the stripped copy the gate check
+    // builds -- dropping the redundant zero is purely a
+    // display-time concern (`format_number_jq_compat`), not
+    // something the stored spelling itself needs to already
+    // reflect (matches `from_number_bytes`'s own leading-dot
+    // and leading-zero handling, both of which store the
+    // original text for the same reason).
+    // Real jq's own number reader also accepts a leading `.`
+    // (with or without a preceding `-`) when at least one digit
+    // follows (`.5` -> `0.5`, `-.5` -> `-0.5`, #1171) -- same
+    // leniency as `OwnedValue::from_number_bytes`'s own
+    // leading-dot handling, shared gate via `has_leading_dot`.
+    // Checked before the leading-zero-strip escape below (no
+    // int digits to strip in the first place for a leading-dot
+    // token, so the two never compose the way the leading-zero
+    // and trailing-dot escapes do) -- missing entirely until
+    // #2240's own code review found it: `--argjson` navigating
+    // through this generic-evaluator path (not
+    // `from_number_bytes`'s own primary document-input path)
+    // silently lost precision on a leading-dot literal instead
+    // of preserving its spelling, once #2240's own fix let
+    // `--argjson` accept one in the first place.
+    if crate::json::validate::has_leading_dot(bytes) {
+        return core::str::from_utf8(bytes).ok().map(Cow::Borrowed);
+    }
+    let zero_stripped = crate::json::validate::strip_redundant_leading_zeros(bytes);
+    if let Some(stripped) = &zero_stripped {
+        if crate::json::validate::is_valid_number(stripped) {
+            return core::str::from_utf8(bytes).ok().map(Cow::Borrowed);
+        }
+    }
+    // Real jq's own number reader also tolerates a trailing
+    // `.` immediately before an exponent marker (`1.e999` ->
+    // `1.0e999`) -- same leniency as
+    // `OwnedValue::from_number_bytes`'s own trailing-dot
+    // handling (#2220, shared gate via
+    // `has_trailing_dot_before_exponent`). Checked against the
+    // leading-zero-stripped form above (when one exists), not
+    // always `bytes` itself, so the two escapes compose: a
+    // token can have both a redundant leading zero *and* a
+    // trailing dot before its exponent at once (`007.e999`).
+    // Returns the *original* `bytes`, matching every other
+    // escape in this function and in `from_number_bytes`.
+    let base = zero_stripped.as_deref().unwrap_or(bytes);
+    if crate::json::validate::has_trailing_dot_before_exponent(base) {
+        return core::str::from_utf8(bytes).ok().map(Cow::Borrowed);
+    }
+    // A leading `+` (#2877): `+X` is `X` in jq, and the
+    // literal is the *unsigned* text, borrowed from the same
+    // span one byte in -- the same peel
+    // `OwnedValue::from_number_bytes` makes, re-running the
+    // four gates above on the unsigned text
+    // (`is_preservable_number_literal` names that exact set).
+    // decNumber's special words (`nan`, `-Infinity`, ...)
+    // deliberately reach none of these gates and return `None`
+    // here: they have no JSON spelling to preserve, so the
+    // caller's `as_f64` fallback hands back the bare value
+    // instead, exactly as `from_number_bytes` does.
+    if let Some(text) = n.bridge_signed_overflowed_int() {
+        return Some(Cow::Borrowed(text));
+    }
+    if let Some(unsigned) = crate::json::validate::strip_leading_plus(bytes) {
+        if crate::json::validate::is_preservable_number_literal(unsigned) {
+            return core::str::from_utf8(unsigned).ok().map(Cow::Borrowed);
+        }
+    }
+    // The semi-index scanner accepts number *spans* more
+    // leniently than RFC 8259 beyond just a leading zero
+    // (e.g. `1.2.3` — see #966): echoing such text verbatim
+    // would produce invalid JSON output. Fall through to
+    // `as_i64`/`as_f64` (still lenient, but numerically
+    // sound) or `Null`.
+    None
 }
 
 impl<'a, W: AsRef<[u64]> + Clone> DocumentFields for JsonFields<'a, W> {

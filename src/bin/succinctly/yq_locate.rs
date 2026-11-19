@@ -51,7 +51,7 @@ pub fn run_yq_locate(args: YqLocateArgs) -> Result<i32> {
     // #5356: a leading UTF-8 byte-order mark is not part of the document. `succinctly yq` drops it
     // before indexing, so `at_offset(n)` and `at_position` count from the first byte after it,
     // and so does this -- as `jq-locate` does (#5313).
-    let bom_len = crate::front_matter::leading_bom_len(&file_bytes);
+    let bom_len = crate::cli::front_matter::leading_bom_len(&file_bytes);
     let text = &file_bytes[bom_len..];
 
     // Unlike `yq`/`yq --validate`/`at_offset` (which all reject invalid UTF-8

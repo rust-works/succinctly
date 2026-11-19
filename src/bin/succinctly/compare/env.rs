@@ -1,6 +1,6 @@
 //! `env.json`: the machine and build a run was taken on (#5409 rule 4).
 
-use crate::bench_runner::metadata::{
+use crate::cli::bench_runner::metadata::{
     collect_git_info, collect_system_info, collect_toolchain_info, GitInfo, SystemInfo,
     ToolchainInfo,
 };

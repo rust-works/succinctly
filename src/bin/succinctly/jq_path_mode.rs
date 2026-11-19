@@ -68,9 +68,9 @@ pub fn run(args: JqPathModeArgs) -> i32 {
     // (values are `Rc`, so the input is parsed there too).
     let (filter, raw, null_input) = (args.filter, args.raw, args.null_input);
     let worker = std::thread::Builder::new()
-        .stack_size(crate::EVAL_STACK_SIZE)
+        .stack_size(crate::cli::EVAL_STACK_SIZE)
         .spawn(move || {
-            succinctly::jq::with_stack_budget(crate::EVAL_STACK_SIZE, || {
+            succinctly::jq::with_stack_budget(crate::cli::EVAL_STACK_SIZE, || {
                 // Compiled again on this thread: the program holds `Rc`s.
                 match path_mode::compile(&filter) {
                     // A built value is bounded by that floor past 384 levels, as in
@@ -100,13 +100,13 @@ pub fn run(args: JqPathModeArgs) -> i32 {
 /// With `-n` the filter runs once on `null`, and the queue holds every value.
 fn run_inputs(program: &Expr, bytes: Option<&[u8]>, raw: bool, null_input: bool) -> i32 {
     let (spans, malformed) = match bytes {
-        Some(bytes) => crate::jq_runner::split_json_values_strict(bytes),
+        Some(bytes) => crate::cli::jq_runner::split_json_values_strict(bytes),
         None => (Vec::new(), None),
     };
     let mut documents = Vec::new();
     for (start, end) in spans {
         let bytes = bytes.unwrap_or_default();
-        match crate::jq_runner::json_bytes_to_owned_value_checked(&bytes[start..end]) {
+        match crate::cli::jq_runner::json_bytes_to_owned_value_checked(&bytes[start..end]) {
             Ok(value) => documents.push((value, 0, 0)),
             Err(e) => {
                 eprintln!("jq: error (at <stdin>:0): {}", e.message);

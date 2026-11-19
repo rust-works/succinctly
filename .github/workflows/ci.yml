@@ -274,7 +274,8 @@ jobs:
           # (test_succinctly_simd_env_contract) fails this leg if the clamp
           # ever stops applying or the value here is typo'd.
           #
-          # #5409: the bin's unit tests under `bench-runner`. `compare` and
+          # #5409: the CLI's unit tests under `bench-runner` (in the library as `cli::` since
+          # #7384, so `--lib cli::` rather than `--bin succinctly`). `compare` and
           # `bench_runner` are `#[cfg(feature = "bench-runner")]`, and no other
           # leg builds the bin with that feature (coverage's `--bins` does not
           # enable it), so their tests -- among them the guards that hold
@@ -285,7 +286,7 @@ jobs:
             buildCli: true
             testCmd: |
               cargo test --features cli,bench-runner --test orchestrate_cli_tests
-              cargo test --features cli,bench-runner --bin succinctly
+              cargo test --features cli,bench-runner --lib cli::
               SUCCINCTLY_SIMD=sse2 cargo test --verbose
               # #7318: the clamp reaches the JSON index builders too, so the SSE2 kernel
               # (`json::simd::x86`) runs through the CLI here. Everything else runs the AVX2 one on
@@ -453,12 +454,12 @@ jobs:
             testCmd: |
               skip=$(scripts/deep-recursion-tests.sh skip-args)
               cargo test --features cli --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests --test serde_tests --test locate_cli_tests --test corpus_stats_cli_tests --test yq_tonumber_fixture_tests --test jq_path_context_alphabet_tests --test jq_extension_roster_tests --test jq_path_context_streaming_tests --test validate_snippet_multibyte_5988 -- $skip
-          # The bin's `bench-runner` unit tests run here too (#5409; see the x86_64 leg).
+          # The CLI's `bench-runner` unit tests run here too (#5409; see the x86_64 leg).
           - name: bench-runner-gated
             buildCli: true
             testCmd: |
               cargo test --features cli,bench-runner --test orchestrate_cli_tests
-              cargo test --features cli,bench-runner --bin succinctly
+              cargo test --features cli,bench-runner --lib cli::
           - name: default
             buildCli: false
             testCmd: cargo test --verbose

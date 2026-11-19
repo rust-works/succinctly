@@ -792,7 +792,7 @@ pub struct JsonFormatOpts<'a> {
 }
 
 /// [`JsonFormatOpts::mark_nan_for_color`]'s placeholder: the render-time
-/// analogue of [`crate::jq::value::NAN_SENTINEL`]'s parse-time one (#3413) --
+/// analogue of [`crate::cli::jq::value::NAN_SENTINEL`]'s parse-time one (#3413) --
 /// same problem (smuggle "this is a NaN" through a text round-trip to a
 /// reader with no access to the original value), different pipeline. Unlike
 /// that sentinel, this one doesn't need to be digit-led: `colorize_json`

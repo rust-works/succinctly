@@ -328,7 +328,8 @@ fn get_error_snippet(
     let line_content = &text[line_start..line_end];
 
     // Truncate long lines (on character boundaries, #5988)
-    let (display_content, caret_offset) = crate::error_snippet::truncate_line(line_content, column);
+    let (display_content, caret_offset) =
+        crate::cli::error_snippet::truncate_line(line_content, column);
 
     // Determine caret width (usually 1, but could be 2 for certain errors)
     let caret_width = 1;

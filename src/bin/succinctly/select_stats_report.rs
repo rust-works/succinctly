@@ -24,7 +24,7 @@ use succinctly::json::JsonIndex;
 use succinctly::select_stats::{self, Histogram, Site};
 use succinctly::yaml::{YamlCursor, YamlIndex, YamlValue};
 
-use crate::corpus_stats::{classify, collect_files};
+use crate::cli::corpus_stats::{classify, collect_files};
 
 /// Traverse every JSON node, materialising each one's text position.
 ///
@@ -386,7 +386,9 @@ mod tests {
 
         // Exit code reflects whether counters were populated, which depends on
         // the feature this build was compiled with.
-        assert_eq!(code, i32::from(!cfg!(feature = "select-stats")));
+        // The CLI is a module of the library since #7384, so its tests build with the library's
+        // `cfg(test)`, which also turns on `json::light`'s one counter (`any(feature = "select-stats", test)`).
+        assert_eq!(code, i32::from(!cfg!(any(feature = "select-stats", test))));
     }
 
     #[test]
@@ -395,7 +397,9 @@ mod tests {
         write_file(dir.path(), "json/a/one.json", br"[1,2,3]");
         // Exercises the stdout branch; the code again tracks the feature.
         let code = run(dir.path(), None).unwrap();
-        assert_eq!(code, i32::from(!cfg!(feature = "select-stats")));
+        // The CLI is a module of the library since #7384, so its tests build with the library's
+        // `cfg(test)`, which also turns on `json::light`'s one counter (`any(feature = "select-stats", test)`).
+        assert_eq!(code, i32::from(!cfg!(any(feature = "select-stats", test))));
     }
 
     #[test]
