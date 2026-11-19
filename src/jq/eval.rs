@@ -101837,7 +101837,11 @@ fn collect_paths(
     match value {
         OwnedValue::Object(entries) => {
             for (key, val) in entries {
-                current_path.push(OwnedValue::String(key.clone().into()));
+                let mut component = OwnedValue::String(key.clone().into());
+                if has_children(val) {
+                    share_path_component(&mut component);
+                }
+                current_path.push(component);
                 paths.push(OwnedValue::Array(current_path.clone().into()));
                 collect_paths(val, current_path, paths);
                 current_path.pop();
@@ -101870,49 +101874,86 @@ fn collect_paths(
 /// `path` is threaded through with push/recurse/pop rather than
 /// clone-and-extend (#1657, mirroring `eval_generic::collect_paths_generic`'s
 /// #701 fix): every `push` is matched by exactly one `pop` on every exit path
-/// out of that iteration. The closing `[path]` marker re-pushes the last
-/// child's own key/index after the loop — for an array that's an O(1) index
-/// recompute (`arr.len() - 1`); for an object, `IndexMap::last()` reads the
-/// final entry's key in O(1) without an extra clone-per-iteration to track
-/// it.
+/// out of that iteration.
+///
+/// The walk consumes `value` (#7260): `builtin_tostream` materialized it for
+/// this walk alone, so each leaf moves into its event instead of being copied
+/// next to a document that is dropped the moment the walk ends, and each
+/// container's storage is released as soon as its children have been taken.
+/// A key above a non-empty container is shared ([`share_path_component`]),
+/// since every event beneath it holds the key in its path; a key above a leaf
+/// is held once or twice and stays inline.
 fn collect_tostream_events(
-    value: &OwnedValue,
+    value: OwnedValue,
     path: &mut Vec<OwnedValue>,
     events: &mut Vec<OwnedValue>,
 ) {
     assert_value_tree_depth(path.len());
     match value {
         OwnedValue::Object(entries) if !entries.is_empty() => {
-            for (key, val) in entries {
-                path.push(OwnedValue::String(key.clone().into()));
+            let last = entries.len() - 1;
+            for (i, (key, val)) in entries.into_iter().enumerate() {
+                let mut component = OwnedValue::String(key.into());
+                if has_children(&val) {
+                    share_path_component(&mut component);
+                }
+                path.push(component);
                 collect_tostream_events(val, path, events);
-                path.pop();
-            }
-            if let Some((last_key, _)) = entries.last() {
-                path.push(OwnedValue::String(last_key.clone().into()));
-                events.push(OwnedValue::Array(
-                    vec![OwnedValue::Array(path.clone().into())].into(),
-                ));
+                if i == last {
+                    events.push(tostream_closing_event(path));
+                }
                 path.pop();
             }
         }
         OwnedValue::Array(arr) if !arr.is_empty() => {
-            for (i, val) in arr.iter().enumerate() {
+            let last = arr.len() - 1;
+            for (i, val) in arr.into_iter().enumerate() {
                 path.push(OwnedValue::Int(i as i64));
                 collect_tostream_events(val, path, events);
+                if i == last {
+                    events.push(tostream_closing_event(path));
+                }
                 path.pop();
             }
-            path.push(OwnedValue::Int((arr.len() - 1) as i64));
-            events.push(OwnedValue::Array(
-                vec![OwnedValue::Array(path.clone().into())].into(),
-            ));
-            path.pop();
         }
         leaf => {
             events.push(OwnedValue::Array(
-                vec![OwnedValue::Array(path.clone().into()), leaf.clone()].into(),
+                vec![OwnedValue::Array(path.clone().into()), leaf].into(),
             ));
         }
+    }
+}
+
+/// `tostream`'s closing `[path]` event, `path` naming the container's last child.
+fn tostream_closing_event(path: &[OwnedValue]) -> OwnedValue {
+    OwnedValue::Array(vec![OwnedValue::Array(path.to_vec().into())].into())
+}
+
+/// Whether `value` is a non-empty container, i.e. whether a path walk records
+/// paths *beneath* it that repeat the key leading to it.
+pub(crate) fn has_children(value: &OwnedValue) -> bool {
+    match value {
+        OwnedValue::Object(entries) => !entries.is_empty(),
+        OwnedValue::Array(items) => !items.is_empty(),
+        _ => false,
+    }
+}
+
+/// Put a path's object key on refcounted storage, so that every path cloned
+/// from the walk's current path shares one copy of it instead of copying it
+/// again (#7260) -- what jq does, whose paths hold the object's own key
+/// `jv`s. A no-op for an index or an already shared key.
+///
+/// Call it only for a key that several paths will hold (one above a
+/// non-empty container): a shared string is one allocation more than an
+/// inline one, so a key held once costs more shared than copied.
+///
+/// Identity: two keys shared this way are `ptr_eq` (jq's `jv_identical`),
+/// as the two `jv`s are in jq, where they are one key of one object; the
+/// resolver's string identity then holds where it held by value before.
+pub(crate) fn share_path_component(component: &mut OwnedValue) {
+    if let OwnedValue::String(key) = component {
+        key.promote();
     }
 }
 
@@ -101927,7 +101968,7 @@ fn builtin_tostream<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // exemption documented anywhere for this sibling either.
     let owned = to_owned_or_suppress!(&value, optional);
     let mut events = Vec::new();
-    collect_tostream_events(&owned, &mut Vec::new(), &mut events);
+    collect_tostream_events(owned, &mut Vec::new(), &mut events);
     // Always non-empty: every value (including an empty container or a
     // top-level scalar) produces at least one leaf event -- routed through
     // `collapse_vec` anyway (#1067) so a future change to
@@ -173152,18 +173193,87 @@ mod tests {
 
         let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
         let mut events = Vec::new();
-        collect_tostream_events(&under, &mut Vec::new(), &mut events);
+        collect_tostream_events(under, &mut Vec::new(), &mut events);
         assert!(!events.is_empty(), "{events:?}");
 
         let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut events = Vec::new();
-            collect_tostream_events(&over, &mut Vec::new(), &mut events);
+            collect_tostream_events(over, &mut Vec::new(), &mut events);
         }));
         assert!(
             result.is_err(),
             "collect_tostream_events should panic at MAX_VALUE_TREE_DEPTH"
         );
+    }
+
+    /// #7260: the key above a non-empty container is one shared string in
+    /// every path beneath it, as jq's paths hold the object's own key `jv`;
+    /// a key above a leaf stays an inline copy. Same rule in `tostream`'s
+    /// walk and `paths`'.
+    #[test]
+    fn path_walks_share_keys_above_containers_7260() {
+        // {"a":{"b":1,"c":[2]},"d":3}
+        let doc = || {
+            OwnedValue::object_from([
+                (
+                    "a".to_string(),
+                    OwnedValue::object_from([
+                        ("b".to_string(), OwnedValue::Int(1)),
+                        (
+                            "c".to_string(),
+                            OwnedValue::array_from(vec![OwnedValue::Int(2)]),
+                        ),
+                    ]),
+                ),
+                ("d".to_string(), OwnedValue::Int(3)),
+            ])
+        };
+        let key = |path: &OwnedValue, at: usize| match path {
+            OwnedValue::Array(items) => match &items[at] {
+                OwnedValue::String(s) => s.clone(),
+                other => panic!("component {at} of {path:?} is {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#7260)"
+            },
+            other => panic!("not a path: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#7260)"
+        };
+        let event_path = |event: &OwnedValue| match event {
+            OwnedValue::Array(items) => items[0].clone(),
+            other => panic!("not an event: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#7260)"
+        };
+
+        let mut events = Vec::new();
+        collect_tostream_events(doc(), &mut Vec::new(), &mut events);
+        let paths: Vec<OwnedValue> = events.iter().map(event_path).collect();
+        // [a,b] [a,c,0] [a,c,0]-closing [a,c]-closing [d] [d]-closing
+        assert_eq!(paths.len(), 6, "{events:?}");
+        let a = key(&paths[0], 0);
+        assert!(a.is_shared());
+        for path in &paths[1..4] {
+            assert!(key(path, 0).ptr_eq(&a), "{path:?}");
+        }
+        assert!(
+            key(&paths[1], 1).ptr_eq(&key(&paths[2], 1)),
+            "`c` is shared"
+        );
+        assert!(!key(&paths[0], 1).is_shared(), "`b` is above a leaf");
+        assert!(!key(&paths[4], 0).is_shared(), "`d` is above a leaf");
+        assert!(!key(&paths[4], 0).ptr_eq(&key(&paths[5], 0)));
+
+        let mut paths = Vec::new();
+        collect_paths(&doc(), &mut Vec::new(), &mut paths);
+        // [a] [a,b] [a,c] [a,c,0] [d]
+        assert_eq!(paths.len(), 5, "{paths:?}");
+        let a = key(&paths[0], 0);
+        assert!(a.is_shared());
+        for path in &paths[1..4] {
+            assert!(key(path, 0).ptr_eq(&a), "{path:?}");
+        }
+        assert!(!key(&paths[1], 1).is_shared(), "`b` is above a leaf");
+        assert!(
+            key(&paths[2], 1).ptr_eq(&key(&paths[3], 1)),
+            "`c` is shared"
+        );
+        assert!(!key(&paths[4], 0).is_shared(), "`d` is above a leaf");
     }
 
     /// #1021: `push_recursive_branches` (backs `..`/bare `recurse`) had no
