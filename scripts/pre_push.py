@@ -142,8 +142,8 @@ GATES = (
     Gate(
         "bench-runner-bin",
         "fast",
-        ("cargo test --features cli,bench-runner --bin succinctly",),
-        (r"^cargo test --features cli,bench-runner --bin succinctly$",),
+        ("cargo test --features cli,bench-runner --lib cli::",),
+        (r"^cargo test --features cli,bench-runner --lib cli::$",),
         paths=BENCH_RUNNER_BIN_PATHS,
         cost=2,
     ),

@@ -285,7 +285,7 @@ jobs:
             buildCli: true
             testCmd: |
               cargo test --features cli,bench-runner --test orchestrate_cli_tests
-              cargo test --features cli,bench-runner --bin succinctly
+              cargo test --features cli,bench-runner --lib cli::
               SUCCINCTLY_SIMD=sse2 cargo test --verbose
               # #7318: the clamp reaches the JSON index builders too, so the SSE2 kernel
               # (`json::simd::x86`) runs through the CLI here. Everything else runs the AVX2 one on
@@ -458,7 +458,7 @@ jobs:
             buildCli: true
             testCmd: |
               cargo test --features cli,bench-runner --test orchestrate_cli_tests
-              cargo test --features cli,bench-runner --bin succinctly
+              cargo test --features cli,bench-runner --lib cli::
           - name: default
             buildCli: false
             testCmd: cargo test --verbose
