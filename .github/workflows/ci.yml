@@ -1114,6 +1114,8 @@ jobs:
 
       - name: Build release binary
         id: release-build
+        env:
+          SUCCINCTLY_LINK_ORDER_TRACE: ${{ runner.temp }}/link-order-trace.txt
         run: cargo build --release --features cli
 
       # #7260: the functions a startup run executes must be in scripts/link-order/symbols.txt, or
@@ -1124,7 +1126,8 @@ jobs:
       - name: Link order covers the startup path
         if: matrix.name == 'x86_64'
         run: |
-          cat target/release/deps/succinctly-*.link-order.log
+          cat "$RUNNER_TEMP/link-order-trace.txt" || echo "the linker wrapper ran for no link"
+          cat target/release/deps/succinctly-*.link-order.log || true
           python3 scripts/link-order/generate.py check target/release/succinctly scripts/link-order/symbols.txt 65536
 
       # #5704: what the lookup step above finds. Named by arch, SHA and a hash of

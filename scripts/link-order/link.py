@@ -76,7 +76,7 @@ def is_release_binary(args, env=os.environ):
     """Whether this link makes the `succinctly` executable of a non-debug profile."""
     if env.get("SUCCINCTLY_LINK_ORDER", "1") == "0":
         return False
-    if any(a in ("-shared", "-dynamiclib", "-r") or a.startswith("@") for a in args):
+    if any(a in ("-shared", "-dynamiclib", "-r") for a in args):
         return False
     out = output_of(args)
     if not out or not os.path.basename(out).startswith("succinctly-"):
@@ -163,9 +163,31 @@ def resolve(names, table, platform=sys.platform):
     return out, missing
 
 
-def main(args):
+def expand(args):
+    """`args` with each `@file` (rustc writes one when the command line is long) read in: one
+    argument per line, with `\\` before a backslash or a space."""
+    out = []
+    for a in args:
+        if a.startswith("@") and os.path.isfile(a[1:]):
+            with open(a[1:]) as f:
+                out += [re.sub(r"\\(.)", r"\1", line.rstrip("\n")) for line in f if line.strip()]
+        else:
+            out.append(a)
+    return out
+
+
+def main(argv):
+    args = expand(argv)
     opt, driver, why = wants_order(args)
     extra = []
+    trace = os.environ.get("SUCCINCTLY_LINK_ORDER_TRACE")
+    if trace:  # every link the wrapper sees, for a build that came out unordered (CI sets it)
+        try:
+            with open(trace, "a") as f:
+                fuse = [a for a in args if a.startswith(("-fuse-ld", "-B", "@"))]
+                f.write(f"{output_of(args)}: {why}; {fuse}\n")
+        except OSError:
+            pass
     if is_release_binary(args):
         out = output_of(args)
         msg = f"plain link: {why}\n"
@@ -191,7 +213,7 @@ def main(args):
                 f.write(msg)
         except OSError:
             pass
-    os.execvp(real_cc(), [real_cc()] + args + extra)
+    os.execvp(real_cc(), [real_cc()] + argv + extra)
 
 
 if __name__ == "__main__":

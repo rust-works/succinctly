@@ -63,10 +63,19 @@ class WantsOrder(unittest.TestCase):
                     "/t/target/release/build/foo-01/build_script_build-01"):
             self.assertIsNone(link.wants_order(args_for(out), "linux", self.env)[0], out)
 
-    def test_shared_library_and_response_file_are_left_alone(self):
+    def test_shared_library_is_left_alone(self):
         out = "/t/target/release/deps/succinctly-0123abcd"
         self.assertIsNone(link.wants_order(args_for(out, "-shared"), "linux", self.env)[0])
-        self.assertIsNone(link.wants_order(args_for(out, "@/tmp/args"), "linux", self.env)[0])
+
+    def test_response_file_is_read(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+            f.write("x.o\n-fuse-ld=lld\n-o\n/t/target/release/deps/succinctly-01\n/a\\ b/c.o\n")
+        try:
+            args = link.expand(["-m64", "@" + f.name])
+            self.assertEqual(args, ["-m64", "x.o", "-fuse-ld=lld", "-o", "/t/target/release/deps/succinctly-01", "/a b/c.o"])
+            self.assertIsNotNone(link.wants_order(args, "linux", self.env)[0])
+        finally:
+            os.unlink(f.name)
 
     def test_opt_out(self):
         a = args_for("/t/target/release/deps/succinctly-0123abcd")
