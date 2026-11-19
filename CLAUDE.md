@@ -459,7 +459,7 @@ Geomean speedup over jq-1.7.1 (its time over `succinctly jq`'s; below 1.00x jq i
 
 | CPU                                                                    | Commit      | Startup |  1 MB | 10 MB | 100 MB | All rows | jq faster on |
 |------------------------------------------------------------------------|-------------|---------|-------|-------|--------|----------|--------------|
-| [ARM Neoverse-V2](docs/compare/jq-linux-aarch64.md)                    | `027745e`   |   0.91x | 1.89x | 2.78x |  3.67x |    2.41x |    37 of 221 |
+| [ARM Neoverse-V2](docs/compare/jq-linux-aarch64.md)                    | `73f049b2c` |   0.89x | 2.03x | 3.19x |  4.45x |    2.71x |    28 of 221 |
 | [AMD Ryzen 9 7950X 16-Core Processor](docs/compare/jq-linux-x86_64.md) | `73f049b2c` |   0.99x | 2.01x | 3.29x |  4.58x |    2.74x |     9 of 221 |
 | [Apple M4 Pro](docs/compare/jq-macos-aarch64.md)                       | `73f049b2c` |   0.64x | 1.68x | 3.34x |  4.99x |    2.56x |    30 of 221 |
 
@@ -467,14 +467,14 @@ The same geomeans per kind of query, because the all-rows figure above counts ev
 
 | Group                         | ARM Neoverse-V2 (linux-aarch64) | AMD Ryzen 9 7950X 16-Core Processor (linux-x86_64) |   Apple M4 Pro (macos-aarch64) |
 |-------------------------------|---------------------------------|----------------------------------------------------|--------------------------------|
-| Pass-through and reformatting |    4.57x (jq faster on 3 of 50) |                       4.52x (jq faster on 0 of 50) |   5.09x (jq faster on 6 of 50) |
-| Field access and navigation   |    4.37x (jq faster on 0 of 17) |                       5.06x (jq faster on 0 of 17) |   3.54x (jq faster on 0 of 17) |
-| Early exit                    |     5.93x (jq faster on 0 of 6) |                        6.56x (jq faster on 0 of 6) |    4.19x (jq faster on 0 of 6) |
-| Transforms                    |    2.22x (jq faster on 3 of 70) |                       2.76x (jq faster on 0 of 70) |   2.41x (jq faster on 2 of 70) |
-| Streams (NDJSON, `--seq`)     |   1.46x (jq faster on 17 of 46) |                       1.65x (jq faster on 5 of 46) |   1.81x (jq faster on 5 of 46) |
-| Startup-bound                 |   1.15x (jq faster on 10 of 21) |                       1.26x (jq faster on 4 of 21) |  0.90x (jq faster on 17 of 21) |
-| All rows without pass-through |  2.00x (jq faster on 34 of 171) |                      2.37x (jq faster on 9 of 171) | 2.09x (jq faster on 24 of 171) |
-| All rows                      |  2.41x (jq faster on 37 of 221) |                      2.74x (jq faster on 9 of 221) | 2.56x (jq faster on 30 of 221) |
+| Pass-through and reformatting |    5.74x (jq faster on 4 of 50) |                       4.52x (jq faster on 0 of 50) |   5.09x (jq faster on 6 of 50) |
+| Field access and navigation   |    4.43x (jq faster on 0 of 17) |                       5.06x (jq faster on 0 of 17) |   3.54x (jq faster on 0 of 17) |
+| Early exit                    |     5.98x (jq faster on 0 of 6) |                        6.56x (jq faster on 0 of 6) |    4.19x (jq faster on 0 of 6) |
+| Transforms                    |    2.50x (jq faster on 0 of 70) |                       2.76x (jq faster on 0 of 70) |   2.41x (jq faster on 2 of 70) |
+| Streams (NDJSON, `--seq`)     |   1.54x (jq faster on 12 of 46) |                       1.65x (jq faster on 5 of 46) |   1.81x (jq faster on 5 of 46) |
+| Startup-bound                 |   1.14x (jq faster on 10 of 21) |                       1.26x (jq faster on 4 of 21) |  0.90x (jq faster on 17 of 21) |
+| All rows without pass-through |  2.18x (jq faster on 24 of 171) |                      2.37x (jq faster on 9 of 171) | 2.09x (jq faster on 24 of 171) |
+| All rows                      |  2.71x (jq faster on 28 of 221) |                      2.74x (jq faster on 9 of 221) | 2.56x (jq faster on 30 of 221) |
 <!-- /compare:jq-summary -->
 
 Which tool to pick for which workload, with the report rows behind each claim and a test that fails when one stops holding: [docs/guides/choosing-jq.md](docs/guides/choosing-jq.md).

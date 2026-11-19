@@ -240,7 +240,7 @@ const CLAIMS: &[Claim] = &[
         );
         matching < total && matching / total > 0.8 && primary["total"] == primary["matching"]
     }),
-    // 9x to 22x: more than eight times the size of jq 1.7.1 (the Neoverse-V2 build is 9.4x).
+    // 10x to 24x: more than eight times the size of jq 1.7.1 (the Neoverse-V2 build is 10.0x).
     ("binary-size", |r| {
         binary_bytes(r, "succinctly jq") > 8.0 * binary_bytes(r, "jq-1.7.1")
     }),

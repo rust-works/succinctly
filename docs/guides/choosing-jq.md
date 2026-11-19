@@ -32,7 +32,7 @@ regenerated and a claim stops holding: change the claim, or the advice, in the s
 | `input` taken once and the rest of the stream abandoned        | jq                                           | `succinctly jq` is slower (0.64x to 0.91x)                                                               |
 | Strict RFC 8259 input                                          | either, with `--validate` on `succinctly jq` | neither is strict by default                                                                             |
 | Features new in jq 1.8                                         | jq 1.8                                       | `succinctly jq` follows 1.7.1                                                                            |
-| Binary size                                                    | jq                                           | 9x to 22x smaller                                                                                        |
+| Binary size                                                    | jq                                           | 10x to 24x smaller                                                                                       |
 
 ## By category
 
@@ -51,12 +51,12 @@ most rows and not all of them (the slurp, raw-file and `tojson` round-trip rows 
 <!-- compare:jq-categories -->
 | Group                         | Queries                                                                                            | [ARM Neoverse-V2](../compare/jq-linux-aarch64.md) | [AMD Ryzen 9 7950X 16-Core Processor](../compare/jq-linux-x86_64.md) | [Apple M4 Pro](../compare/jq-macos-aarch64.md) |
 |-------------------------------|----------------------------------------------------------------------------------------------------|---------------------------------------------------|----------------------------------------------------------------------|------------------------------------------------|
-| Pass-through and reformatting | `identity`, `identity_compact`                                                                     |                                             4.57x |                                                                4.52x |                                          5.09x |
-| Field access and navigation   | `users_field`, `users_length`, `users_names`, `users_to_entries`, `wide_keys`, `users_three_files` |                                             4.37x |                                                                5.06x |                                          3.54x |
-| Early exit                    | `users_first_early_exit`, `users_limit_early_exit`                                                 |                                             5.93x |                                                                6.56x |                                          4.19x |
-| Transforms                    | maps, sorts, groups, reduce, regex, paths, walk, numbers, strings, wide and nested objects         |                                             2.22x |                                                                2.76x |                                          2.41x |
-| Streams (NDJSON, `--seq`)     | `ndjson_*`, `seq_*`                                                                                |                                             1.46x |                                                                1.65x |                                          1.81x |
-| Startup-bound                 | `startup`, `args_many`, `corpus_*`                                                                 |                                             1.15x |                                                                1.26x |                                          0.90x |
+| Pass-through and reformatting | `identity`, `identity_compact`                                                                     |                                             5.74x |                                                                4.52x |                                          5.09x |
+| Field access and navigation   | `users_field`, `users_length`, `users_names`, `users_to_entries`, `wide_keys`, `users_three_files` |                                             4.43x |                                                                5.06x |                                          3.54x |
+| Early exit                    | `users_first_early_exit`, `users_limit_early_exit`                                                 |                                             5.98x |                                                                6.56x |                                          4.19x |
+| Transforms                    | maps, sorts, groups, reduce, regex, paths, walk, numbers, strings, wide and nested objects         |                                             2.50x |                                                                2.76x |                                          2.41x |
+| Streams (NDJSON, `--seq`)     | `ndjson_*`, `seq_*`                                                                                |                                             1.54x |                                                                1.65x |                                          1.81x |
+| Startup-bound                 | `startup`, `args_many`, `corpus_*`                                                                 |                                             1.14x |                                                                1.26x |                                          0.90x |
 <!-- /compare:jq-categories -->
 
 The all-rows geomean of [`docs/compare/jq.md`](../compare/jq.md) averages all of these rows, the 50 `identity` rows
@@ -143,7 +143,7 @@ agrees on every one of 447 `jq.test` programs. Rows: the secondary differential 
 
 <!-- claim: binary-size -->
 
-`succinctly jq` is 28.5 MB on x86_64 Linux, 25.1 MB on aarch64 Linux and 23.2 MB on macOS; jq 1.7.1 is 2.7 MB, 2.7 MB and 1.1 MB (about 11x, 9x and 22x).
+`succinctly jq` is 30.4 MB on x86_64 Linux, 26.7 MB on aarch64 Linux and 24.9 MB on macOS; jq 1.7.1 is 2.7 MB, 2.7 MB and 1.1 MB (about 11x, 10x and 24x).
 
 ## Neither is strict by default
 
