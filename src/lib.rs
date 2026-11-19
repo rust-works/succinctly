@@ -64,6 +64,8 @@ use serde::{Deserialize, Serialize};
 extern crate self as succinctly;
 #[cfg(feature = "cli")]
 #[doc(hidden)]
+// The CLI's doc comments are clap's `--help` text (`--bench <name>`), not rustdoc.
+#[allow(rustdoc::invalid_html_tags)]
 #[path = "bin/succinctly/main.rs"]
 pub mod cli;
 
