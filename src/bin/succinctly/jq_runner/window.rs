@@ -2956,6 +2956,7 @@ impl LineWindows {
     }
 
     /// Whether the next window is the one [`with_first_window`](Self::with_first_window) limits.
+    #[cfg(test)]
     pub(super) fn first_window_pending(&self) -> bool {
         self.first_ask.is_some()
     }

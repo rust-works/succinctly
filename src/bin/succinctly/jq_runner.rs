@@ -14529,7 +14529,10 @@ fn read_lazy_window(lazy: &mut LazyJsonInputs, more: &mut LazyMore, want: usize)
             ));
         });
     }
-    let next = if rest.windows.first_window_pending() && !shared {
+    // #7260: every window is read onto the text, not only the first after a short start: a window read
+    // into a buffer of its own was a block held beside the text it was copied onto (1 MiB of the
+    // route's peak), and a copy of every byte of the source.
+    let next = if !shared {
         let text = std::mem::take(std::rc::Rc::make_mut(&mut lazy.text)).into_bytes();
         let kept = text.len();
         match rest
