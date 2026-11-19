@@ -17389,6 +17389,15 @@ fn eval_single_pipe_stages<S: EvalSemantics, V: DocumentValue>(
         }
     }
 
+    // #7260: a `..` head with more of the pipe after it streams, each node through the rest as the
+    // walk reaches it, and only the pipe's outputs are collected. The staged fold collected every
+    // node's cursor first and then held a result per node before flattening them (`[..|numbers]`
+    // over the 124,000 nodes of a 1 MB document: 9 MiB of cursors and 9.5 MiB of results at once,
+    // where jq 1.7.1's whole peak is 12.6 MiB). The walk is pre-order, as jq's `..` is, so the
+    // outputs and the first failure are the ones the staged fold met in that order.
+    if exprs.len() > 1 && cursor.is_some() && descent_collects_cursors::<S>(&exprs[0]) {
+        return collect_each_generic::<S, V>(whole.get(exprs), value, optional, cursor);
+    }
     let current = eval_single::<S, _>(&exprs[0], value, optional, cursor);
     fold_pipe_stages::<S, V>(current, &exprs[1..], optional)
 }
@@ -17914,28 +17923,10 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // spine 2416 (walk residue; #2428): `..` over a live node keeps every
         // node's cursor on this route too -- the non-sink twin of
         // `eval_each_generic`'s own arm, so `.. | {"k": key}` answers the
-        // same on the CLI's DOM path as in the sink pipeline.
-        Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown)
-            if cursor.is_some() =>
-        {
-            collect_each_generic::<S, V>(expr, value, optional, cursor)
-        }
-        // #3773: `recurse(.[]?)` is jq's own definition of bare `recurse`, so it
-        // keeps each node's cursor here too.
-        Expr::Builtin(Builtin::RecurseF(f))
-            if cursor.is_some() && crate::jq::eval::is_structural_descent(f, None) =>
-        {
-            collect_each_generic::<S, V>(expr, value, optional, cursor)
-        }
-        // #4095: and `recurse(.[]?; cond)` for a `cond` yielding at most one value, the
-        // non-sink twin of `eval_each_generic`'s cursor arm. yq mode only: jq mode's collecting
-        // route keeps the owned walk it has always had here, which answers a `cond` from the tree
-        // where the cursor walk asks the node.
-        Expr::Builtin(Builtin::RecurseCond(f, cond))
-            if S::TAG == EvalTag::Yq
-                && cursor.is_some()
-                && crate::jq::eval::is_gated_structural_descent(f, Some(cond)) =>
-        {
+        // same on the CLI's DOM path as in the sink pipeline. #3773:
+        // `recurse(.[]?)` too, and #4095 `recurse(.[]?; cond)` in yq mode
+        // ([`descent_collects_cursors`]).
+        _ if cursor.is_some() && descent_collects_cursors::<S>(expr) => {
             collect_each_generic::<S, V>(expr, value, optional, cursor)
         }
         Expr::Pipe(exprs) => {
@@ -37172,12 +37163,85 @@ fn collect_each_generic<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
-    let mut items: Vec<GenericItem<V>> = Vec::new();
+    let mut collected = Collected::Empty;
     let flow = eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| {
-        items.push(item);
+        collected.push(item);
         Demand::Continue
     });
-    collected_items_result::<_, S>(items, flow)
+    match (collected, flow) {
+        // #7260: a run that kept one kind of output answers from its own vector, as
+        // `items_to_generic_result` answers for the items it would have been.
+        (Collected::Empty, Flow::Exhausted | Flow::Stopped { pending: None }) => {
+            GenericResult::None
+        }
+        (Collected::Cursors(cursors), Flow::Exhausted | Flow::Stopped { pending: None }) => {
+            cursor_vec_to_generic_result(cursors)
+        }
+        (Collected::Owned(values), Flow::Exhausted | Flow::Stopped { pending: None }) => {
+            owned_vec_to_generic_result(values)
+        }
+        (collected, flow) => collected_items_result::<_, S>(collected.into_items(), flow),
+    }
+}
+
+/// What [`collect_each_generic`] has collected (#7260): while every output is a document node, or
+/// every output a computed value, the bare cursors or values, and the items otherwise. A
+/// `GenericItem` is 72 bytes where a cursor is 32 and a value 32, so `[..]` held 72 bytes a node,
+/// and a cursor vector made from it in place kept that allocation (9 MiB for the 124,000 nodes of a
+/// 1 MB document). The answer is the one the items give: [`items_to_generic_result`] makes a run of
+/// cursors the cursor result, and a run of values the values, each as it is.
+enum Collected<V: DocumentValue> {
+    Empty,
+    Cursors(Vec<V::Cursor>),
+    Owned(Vec<OwnedValue>),
+    Items(Vec<GenericItem<V>>),
+}
+
+impl<V: DocumentValue> Collected<V> {
+    #[inline]
+    fn push(&mut self, item: GenericItem<V>) {
+        match (&mut *self, item) {
+            (Self::Cursors(cursors), GenericItem::OneCursor(c)) => cursors.push(c),
+            (Self::Owned(values), GenericItem::Owned(v)) => values.push(v),
+            (Self::Items(items), item) => items.push(item),
+            (Self::Empty, GenericItem::OneCursor(c)) => *self = Self::Cursors(alloc::vec![c]),
+            (Self::Empty, GenericItem::Owned(v)) => *self = Self::Owned(alloc::vec![v]),
+            (_, item) => self.push_other(item),
+        }
+    }
+
+    /// The first output of another kind: everything so far becomes items.
+    #[cold]
+    #[inline(never)]
+    fn push_other(&mut self, item: GenericItem<V>) {
+        let mut items = core::mem::replace(self, Self::Empty).into_items();
+        items.push(item);
+        *self = Self::Items(items);
+    }
+
+    fn into_items(self) -> Vec<GenericItem<V>> {
+        match self {
+            Self::Empty => Vec::new(),
+            Self::Cursors(cursors) => cursors.into_iter().map(GenericItem::OneCursor).collect(),
+            Self::Owned(values) => values.into_iter().map(GenericItem::Owned).collect(),
+            Self::Items(items) => items,
+        }
+    }
+}
+
+/// Whether `expr` is a walk [`collect_each_generic`] runs from a live node, as cursors: `..`,
+/// `recurse` and `recurse(.[]?)` (#2428, #3773), and in yq mode `recurse(.[]?; cond)` for a `cond`
+/// yielding at most one value (#4095; jq mode's collecting route keeps the owned walk it has always
+/// had there, which answers a `cond` from the tree where the cursor walk asks the node).
+fn descent_collects_cursors<S: EvalSemantics>(expr: &Expr) -> bool {
+    match expr {
+        Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => true,
+        Expr::Builtin(Builtin::RecurseF(f)) => crate::jq::eval::is_structural_descent(f, None),
+        Expr::Builtin(Builtin::RecurseCond(f, cond)) => {
+            S::TAG == EvalTag::Yq && crate::jq::eval::is_gated_structural_descent(f, Some(cond))
+        }
+        _ => false,
+    }
 }
 
 /// How many delivered outputs [`collected_items_result`] converted to owned values for a partial
