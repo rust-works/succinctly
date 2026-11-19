@@ -303,6 +303,29 @@ pub(crate) fn find_cursor_memoized<F: DocumentFields>(
     found
 }
 
+/// [`find_cursor_memoized`] for several names of one object (#7260), each answered as its own
+/// lookup would answer it: `found[i]` for `names[i]`, or the first lookup's error. Once an
+/// evaluation has seen a wide object the names are looked up one at a time, so an index answers
+/// them; otherwise one walk answers them all ([`DocumentFields::find_cursors_counted`]), and a
+/// wide one registers the object as the first lookup's walk would have.
+pub(crate) fn find_cursors_memoized<F: DocumentFields>(
+    fields: &F,
+    names: &[&str],
+    found: &mut [Option<F::Cursor>],
+) -> Result<(), EvalError> {
+    if memo::armed() {
+        for (name, slot) in names.iter().zip(found.iter_mut()) {
+            *slot = find_cursor_memoized(fields, name)?;
+        }
+        return Ok(());
+    }
+    let (answer, walked) = fields.find_cursors_counted(names, found);
+    if walked >= WIDE_MEMBERS && answer.is_ok() {
+        memo::note_wide(fields);
+    }
+    answer
+}
+
 /// [`DocumentFields::contains_checked`] for a caller inside an evaluation: the
 /// same answer, from a [`KeyIndex`] once the object has proved wide (#4002).
 #[inline]
@@ -436,6 +459,13 @@ pub(crate) mod memo {
                 entries: Vec::new(),
             })))
         })
+    }
+
+    /// Whether this evaluation has seen a wide object, so [`answer`] may answer a lookup from
+    /// the memo instead of a walk (#7260).
+    #[inline]
+    pub(crate) fn armed() -> bool {
+        ARMED.with(Cell::get)
     }
 
     /// Answer a lookup from the memo: `None` means "walk" (nothing remembered
@@ -584,6 +614,10 @@ pub(crate) mod memo {
 
     pub(crate) fn enter(_document: usize) -> Guard {
         Guard
+    }
+
+    pub(crate) fn armed() -> bool {
+        false
     }
 
     pub(crate) fn answer<F: DocumentFields>(

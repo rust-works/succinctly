@@ -1889,6 +1889,24 @@ pub trait DocumentFields: Sized + Clone {
         (self.find_cursor(name), 0)
     }
 
+    /// [`find_cursor_counted`](Self::find_cursor_counted) for several names at once (#7260):
+    /// `found[i]` is what the lookup of `names[i]` answers, and an `Err` is the error the first
+    /// of those lookups that fails raises, with `found` then meaningless. `found` is as long as
+    /// `names`. The count is the walk's, as for one name.
+    ///
+    /// The default looks each name up in turn. JSON walks the members once for all of them
+    /// (`[.id, .name]` read every member twice), which answers the same because every error a
+    /// lookup there raises is one the others would raise too: a key that is not a string is a
+    /// fault of the walk, whatever the name, and a bad gap around the winner or after the last
+    /// member is the same document's [`EvalError::malformed_json_text`].
+    fn find_cursors_counted(
+        &self,
+        names: &[&str],
+        found: &mut [Option<Self::Cursor>],
+    ) -> (Result<(), EvalError>, usize) {
+        find_cursors_one_by_one(self, names, found)
+    }
+
     /// The key node of the first member this list still holds, or `None` for
     /// an exhausted list or a format that does not support the key index
     /// (#3913).
@@ -5199,6 +5217,27 @@ pub fn effective_keys<F: DocumentFields>(
         return Err(fields.malformed_member_error());
     }
     Ok(keys)
+}
+
+/// [`DocumentFields::find_cursors_counted`] a name at a time (#7260).
+///
+/// Each name's [`find_cursor_counted`](DocumentFields::find_cursor_counted), stopping at the first
+/// error: the trait's default, and JSON's answer for more names than its one walk takes.
+pub fn find_cursors_one_by_one<F: DocumentFields>(
+    fields: &F,
+    names: &[&str],
+    found: &mut [Option<F::Cursor>],
+) -> (Result<(), EvalError>, usize) {
+    let mut walked = 0;
+    for (name, slot) in names.iter().zip(found.iter_mut()) {
+        let (answer, count) = fields.find_cursor_counted(name);
+        match answer {
+            Ok(cursor) => *slot = cursor,
+            Err(err) => return (Err(err), 0),
+        }
+        walked = count;
+    }
+    (Ok(()), walked)
 }
 
 /// A single field from an object.
