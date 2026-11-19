@@ -2355,7 +2355,10 @@ fn parse_jq(argv: Vec<String>, about: Option<&'static str>) -> JqCommand {
         if let Some(about) = about {
             command = command.about(about);
         }
-        JqCommand::from_arg_matches(&command.try_get_matches_from(args)?)
+        let matches = command.try_get_matches_from(args)?;
+        let mut cmd = JqCommand::from_arg_matches(&matches)?;
+        cmd.named_order = jq_runner::named_flag_order_of(&matches);
+        Ok(cmd)
     })
 }
 
