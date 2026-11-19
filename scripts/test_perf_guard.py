@@ -89,6 +89,59 @@ class RawInputRowTests(unittest.TestCase):
         self.assertIn(".[0:3]", filters)
 
 
+class SeqLfLedRowTests(unittest.TestCase):
+    """#7260: the `--seq` rows read their stream behind one LF, so they keep reaching the route that
+    walks a stream whole (a lone `--seq` file of 64 KiB or more is otherwise read a window at a
+    time). A row left on the generated stream would still report a number, for another route."""
+
+    def test_the_lf_led_rows_are_the_seq_rows_of_the_stream(self):
+        seq_rows = {q[0] for q in perf_guard.QUERIES if (q[1], q[2]) == perf_guard.SEQ_LF_LED_SOURCE}
+        self.assertEqual(seq_rows, set(perf_guard.SEQ_LF_LED_ROWS))
+        for query_id in perf_guard.SEQ_LF_LED_ROWS:
+            self.assertIn("--seq", perf_guard.QUERY_FLAGS[query_id], query_id)
+
+    def test_the_fixture_is_the_stream_behind_one_lf(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "s.json")
+            out = os.path.join(tmp, "o.json")
+            with open(source, "wb") as f:
+                f.write(b'\x1e{"id":1}\n\x1e{"id":')
+            perf_guard.write_lf_led_fixture(source, out)
+            with open(out, "rb") as f:
+                self.assertEqual(f.read(), b'\n\x1e{"id":1}\n\x1e{"id":')
+
+    def test_measure_all_hands_the_seq_rows_the_lf_led_fixture(self):
+        seen = {}
+
+        def fake_generate(binary, pattern, size, seed, out_path):
+            with open(out_path, "wb") as f:
+                f.write(b'\x1e{"id":1}\n' if pattern == "json-seq-bad-last" else b"{}")
+
+        def fake_derive(binary, source_path, out_path):
+            with open(out_path, "w") as f:
+                f.write('{"users":[{"age":1,"score":1}]}')
+
+        def fake_measure(valgrind_bin, binary, mode, flags, filter_expr, fixture_path, reps):
+            with open(fixture_path, "rb") as f:
+                seen[(filter_expr, tuple(flags))] = f.read(2)
+            return 1
+
+        with contextlib.ExitStack() as stack:
+            for name, fn in {
+                "generate_fixture": fake_generate,
+                "generate_compact_fixture": fake_derive,
+                "generate_lines_fixture": fake_derive,
+                "measure_query": fake_measure,
+            }.items():
+                stack.enter_context(mock.patch.object(perf_guard, name, fn))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            perf_guard.measure_all("bin", "valgrind", 1)
+        queries = {q[0]: q for q in perf_guard.QUERIES}
+        for query_id in perf_guard.SEQ_LF_LED_ROWS:
+            key = (queries[query_id][4], tuple(perf_guard.QUERY_FLAGS[query_id]))
+            self.assertEqual(seen[key], b"\n\x1e", query_id)
+
+
 class CensusRowTests(unittest.TestCase):
     """#4168: `wide_length` and `mid512_map_length_add` exist to see `census`
     (#3343/#4167), which no other row isolates. The mid-width row's fixture is

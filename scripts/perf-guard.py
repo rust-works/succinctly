@@ -300,6 +300,8 @@ QUERIES = [
     # 0.22x and 1.1 GB at 100 MB #6500 started from) read 0.0% on every row above. `json-seq-bad-last`
     # is the `json-seq` pattern's records and one cut-off record after them, read as `-r .name`
     # (`QUERY_FLAGS`), so the time and, through the instruction count, the work are both watched.
+    # #7260: read behind one LF (`SEQ_LF_LED_ROWS`), since the stream itself is now read a window
+    # at a time.
     ("seq_name_bad_last", "json-seq-bad-last", "2mb", "jq", ".name"),
     # #6620: the same stream read through the owned evaluator's other doors. `.name` is a path
     # read, and `[.id,.name]` and `keys` were the programs no door answered (2.5 s against jq's
@@ -346,6 +348,18 @@ QUERY_FLAGS = {
 # object per line (#3479). Listed once so `measure_all` and the self-tests
 # agree on which rows are derived this way.
 LINES_FIXTURE_ROWS = ("users_yq_raw_slice", "users_yq_raw_concat", "users_yq_raw_test")
+
+# Rows whose fixture is the `json-seq-bad-last`/2mb stream with one LF before its first RS
+# (#7260). Since #7260 a lone `--seq` file of 64 KiB or more is read a window at a time, past a bad
+# record too (#7322), so the generated stream itself no longer reaches the route these rows were
+# added to watch: jq's reader walking the stream whole, converting each record as it goes (#6594)
+# and answering `.name`, `[.id,.name]` and `keys` from the owned record (#6739). A stream that does
+# not open with an RS is handed to that route at its first byte (#7312), and jq reads the LF as the
+# whitespace it is, so the records, the diagnostic and the output are the generated stream's. The
+# windowed route over the generated stream is timed by `comparison/jq/queries/perf.tsv`'s
+# `seq_field_bad_first` / `seq_field_bad_last` rows.
+SEQ_LF_LED_ROWS = ("seq_name_bad_last", "seq_array_bad_last", "seq_keys_bad_last")
+SEQ_LF_LED_SOURCE = ("json-seq-bad-last", "2mb")
 
 IR_PATTERN = re.compile(r"I\s+refs:\s+([\d,]+)")
 
@@ -742,6 +756,15 @@ def generate_lines_fixture(binary, source_path, out_path):
         )
 
 
+def write_lf_led_fixture(source_path, out_path):
+    """Writes `source_path` with one LF before it, for `SEQ_LF_LED_ROWS` (#7260): a `--seq` stream
+    whose first byte is not an RS is handed whole to the route that walks it with jq's reader."""
+    with open(source_path, "rb") as f:
+        data = f.read()
+    with open(out_path, "wb") as f:
+        f.write(b"\n" + data)
+
+
 def inject_duplicate_last_member(compact_path, out_path):
     """Byte-edits `compact_path` (expected to end `...}]}`, i.e. a top-level
     `{"users":[...]}` document) into `users_compact_latefail`'s twin: the
@@ -931,6 +954,15 @@ def measure_all(binary, valgrind_bin, reps, label="binary", baseline_run=False):
         generate_lines_fixture(binary, base, lines_path)
         for query_id in LINES_FIXTURE_ROWS:
             derived_fixture_paths[query_id] = lines_path
+
+        # #7260: the `--seq` rows read their stream behind one LF (`SEQ_LF_LED_ROWS`). A baseline
+        # that cannot generate the stream (#6619) leaves the rows out, as it leaves out its own.
+        seq_source = fixture_paths.get(SEQ_LF_LED_SOURCE)
+        if seq_source is not None:
+            lf_led_path = os.path.join(tmp, "json-seq-bad-last_2mb_lf_led.json")
+            write_lf_led_fixture(seq_source, lf_led_path)
+            for query_id in SEQ_LF_LED_ROWS:
+                derived_fixture_paths[query_id] = lf_led_path
 
         # #4168: the mid-width census row's fixture, written by this script.
         mid_width_path = os.path.join(tmp, "mid512_4mb.json")
