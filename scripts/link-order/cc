@@ -1,0 +1,8 @@
+#!/bin/sh
+# Linker wrapper for the release binary: puts the functions that `scripts/link-order/symbols.txt`
+# lists first in the executable's text, in that order (#7260). See link.py for what it does and
+# when it steps aside. Without python3 it is a plain `cc`.
+if command -v python3 >/dev/null 2>&1; then
+    exec python3 "$(dirname "$0")/link.py" "$@"
+fi
+exec "${SUCCINCTLY_LINK_ORDER_CC:-cc}" "$@"
