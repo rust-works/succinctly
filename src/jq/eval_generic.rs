@@ -7106,6 +7106,19 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
     // After the bypasses on purpose: neither reaches a resolver, and
     // demoting rebuilds `expr` whenever it holds a marker at all.
     let expr = reentry.reroot::<S>(expr);
+    // #7260: `walk(f)` rebuilds its input from an owned tree, which `owned` already is. Across the
+    // bridge it was written out as JSON, indexed and decoded again, so that the walk read a second
+    // tree while this frame still held the first: three copies of the document at the peak. Handed
+    // `owned` itself, the walk consumes it as it rebuilds. This is the call the bridge makes
+    // (`eval::builtin_walk` with `optional` false, the bridge's own, over a value equal to `owned`),
+    // without the round trip. jq mode only, and not with the #2889 embed table live, where `owned`
+    // may be a bound node's own value.
+    if S::TAG == EvalTag::Jq && !embed_table_active() {
+        if let Expr::Builtin(Builtin::Walk(f)) = &*expr {
+            let (outputs, control) = crate::jq::eval::walk_owned::<S>(f, owned);
+            return finish_fork_generic(outputs, control, false);
+        }
+    }
     let rebuilt;
     // #6666: the memos belong to a document, and `rebuilt` is this bridge's own (a `rooted` one
     // is the caller's, whose scope is already open: opening it again would be a no-op).
@@ -7281,6 +7294,20 @@ fn bridge_to_each_owned_flow<S: EvalSemantics, V: DocumentValue>(
     let root = RootWitness::of(cursor.as_ref());
     match bridge_ambient_input::<_, S>(expr, &value, cursor) {
         Ok(owned) => {
+            // #7260: an assignment the owned route answers writes into `owned` itself, which this
+            // frame would otherwise keep while the write copied every container on its path. No
+            // door ahead of that answer in `eval_each_owned` takes an assignment, so the answer is
+            // the one it gives.
+            let owned = match crate::jq::eval::owned_assign_moved::<S>(expr, owned) {
+                crate::jq::eval::OwnedStep::Handled(Ok(value)) => {
+                    return drain_result_generic(GenericResult::Owned(value), sink)
+                }
+                crate::jq::eval::OwnedStep::Handled(Err(_)) if optional => return Flow::Exhausted,
+                crate::jq::eval::OwnedStep::Handled(Err(error)) => {
+                    return Flow::Escaped(Control::Error(error))
+                }
+                crate::jq::eval::OwnedStep::Declined(owned) => owned,
+            };
             eval_each_owned::<S>(expr, &owned, optional, Reentry::Against(root), &mut |v| {
                 sink.push(GenericItem::Owned(v))
             })
@@ -7321,6 +7348,17 @@ fn bridge_update_flow<S: EvalSemantics, V: DocumentValue>(
     let root = RootWitness::of(cursor.as_ref());
     match bridge_ambient_input::<_, S>(expr, &value, cursor) {
         Ok(owned) => {
+            // #7260: see `bridge_to_each_owned_flow`.
+            let owned = match crate::jq::eval::owned_assign_moved::<S>(expr, owned) {
+                crate::jq::eval::OwnedStep::Handled(Ok(value)) => {
+                    return drain_result_generic(GenericResult::Owned(value), sink)
+                }
+                crate::jq::eval::OwnedStep::Handled(Err(_)) if optional => return Flow::Exhausted,
+                crate::jq::eval::OwnedStep::Handled(Err(error)) => {
+                    return Flow::Escaped(Control::Error(error))
+                }
+                crate::jq::eval::OwnedStep::Declined(owned) => owned,
+            };
             let result =
                 eval_each_owned_collect::<S, V>(expr, &owned, optional, Reentry::Against(root));
             drop(owned);

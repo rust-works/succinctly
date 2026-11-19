@@ -15046,6 +15046,28 @@ pub(crate) fn try_owned_assign_step<S: EvalSemantics>(
     }
 }
 
+/// [`eval_owned_reindex_free`]'s assignment answer, on a state the caller hands over instead of
+/// a copy-on-write clone of one it keeps (#7260): the write then reaches the state's own storage,
+/// where the clone made the root and every container on the path shared, so the first write to
+/// each copied it (the whole `users` array, to write `.users[0].name`). jq's `_modify` on an
+/// unshared input writes in place the same way. Only where that function would answer: jq mode,
+/// not under the #2889 embed table, and [`is_owned_assign`]'s shapes. A decline hands the state
+/// back untouched, for the caller's usual route.
+pub(crate) fn owned_assign_moved<S: EvalSemantics>(
+    expr: &Expr,
+    mut state: OwnedValue,
+) -> OwnedStep {
+    if S::TAG != EvalTag::Jq || !is_owned_assign(expr) || super::eval_generic::embed_table_active()
+    {
+        return OwnedStep::Declined(state);
+    }
+    match owned_assign_step::<S>(expr, &mut state) {
+        Some(Ok(())) => OwnedStep::Handled(Ok(state)),
+        Some(Err(error)) => OwnedStep::Handled(Err(error)),
+        None => OwnedStep::Declined(state),
+    }
+}
+
 /// The stages of a pipe of assignments [`owned_assign_pipe_step`] may apply (#5285): jq mode,
 /// not under the #2889 embed table, an assignment first -- the stage that may still decline
 /// cleanly -- and after it only assignments that yield exactly one value or raise
@@ -100833,6 +100855,16 @@ fn walk_impl<S: EvalSemantics>(
     walk_impl_at_depth::<S>(f, value, optional, 0)
 }
 
+/// `walk(f)` over an owned `value`, as [`builtin_walk`] runs it once the value is materialized
+/// (`optional` false, the reindex bridge's): what `eval_generic::eval_on_owned_over` calls in
+/// place of writing `value` out and indexing it again to reach [`builtin_walk`] (#7260).
+pub(crate) fn walk_owned<S: EvalSemantics>(
+    f: &Expr,
+    value: OwnedValue,
+) -> (Vec<OwnedValue>, Option<Control>) {
+    walk_impl::<S>(f, value, false)
+}
+
 /// Whether a control that `walk`'s object arm met on a member aborts the whole object.
 /// The arm is `map_values(w)`, which reads one output per member, so a control `w` raises
 /// after producing a value is never reached and the member keeps that value (#5794, the rule
@@ -100853,16 +100885,49 @@ fn walk_impl_at_depth<S: EvalSemantics>(
 ) -> (Vec<OwnedValue>, Option<Control>) {
     assert_value_tree_depth(depth);
     let processed = match value {
-        OwnedValue::Array(arr) => {
-            let mut new_arr = vec_with_capacity(arr.len());
-            for v in arr {
-                let (vs, control) = walk_impl_at_depth::<S>(f, v, optional, depth + 1);
-                new_arr.extend(vs);
+        // #7260: rebuilt in its own storage (copied first only if another handle shares it), the
+        // way jq's `map(w)` on an unshared array writes in place: each element is taken out, walked
+        // and its one output written back over the kept prefix, so the walk holds one tree of the
+        // document at a time instead of the old one and the new one. An element with several
+        // outputs spills the rest into a fresh array, which is what `[.[] | w]` builds.
+        OwnedValue::Array(mut arr) => {
+            let mut items = arr.make_vec();
+            let len = items.len();
+            let mut kept = 0;
+            let mut spill: Option<Vec<OwnedValue>> = None;
+            for at in 0..len {
+                let v = core::mem::replace(&mut items[at], OwnedValue::Null);
+                let (mut vs, control) = walk_impl_at_depth::<S>(f, v, optional, depth + 1);
                 if let Some(control) = control {
                     return (Vec::new(), Some(control));
                 }
+                match &mut spill {
+                    Some(spill) => spill.extend(vs),
+                    None if vs.len() == 1 => {
+                        items[kept] = vs.pop().expect("one output");
+                        kept += 1;
+                    }
+                    None if vs.is_empty() => {}
+                    None => {
+                        let mut fresh = vec_with_capacity(kept + vs.len() + (len - at - 1));
+                        fresh.extend(
+                            items[..kept]
+                                .iter_mut()
+                                .map(|item| core::mem::replace(item, OwnedValue::Null)),
+                        );
+                        fresh.extend(vs);
+                        spill = Some(fresh);
+                    }
+                }
             }
-            OwnedValue::array_from(new_arr)
+            match spill {
+                Some(fresh) => OwnedValue::array_from(fresh),
+                None => {
+                    items.truncate(kept);
+                    drop(items);
+                    OwnedValue::Array(arr)
+                }
+            }
         }
         // `map_values(w)` rewrites each key's live entry and leaves a repeated key's earlier entries
         // as read (yq, ADR-0027), so an object that has any starts from itself.
@@ -100886,20 +100951,40 @@ fn walk_impl_at_depth<S: EvalSemantics>(
             }
             OwnedValue::Object(new_obj)
         }
-        OwnedValue::Object(obj) => {
-            let mut new_obj = IndexMap::with_capacity(obj.len());
-            for (k, v) in obj {
+        // #7260: rewritten in place, as `map_values(w)` (`.[] |= w`) writes an unshared object in
+        // jq: the map (copied first only if another handle shares it) keeps its keys, entries and
+        // hash table, and each value is taken out, walked and its first output put back. A member
+        // with no output is deleted afterwards, in one pass that keeps the others' order.
+        OwnedValue::Object(mut obj) => {
+            let map: &mut IndexMap<String, OwnedValue> = &mut obj;
+            let mut deleted: Vec<usize> = Vec::new();
+            for at in 0..map.len() {
+                let slot = map.get_index_mut(at).expect("in bounds").1;
+                let v = core::mem::replace(slot, OwnedValue::Null);
                 let (vs, control) = walk_impl_at_depth::<S>(f, v, optional, depth + 1);
                 if let Some(control) = control {
                     if walk_member_raises(&vs) {
                         return (Vec::new(), Some(control));
                     }
                 }
-                if let Some(new_v) = vs.into_iter().next() {
-                    new_obj.insert(k, new_v);
+                match vs.into_iter().next() {
+                    Some(new_v) => *map.get_index_mut(at).expect("in bounds").1 = new_v,
+                    None => deleted.push(at),
                 }
             }
-            OwnedValue::Object(new_obj.into())
+            if !deleted.is_empty() {
+                let mut at = 0;
+                let mut next = deleted.iter().copied().peekable();
+                map.retain(|_, _| {
+                    let keep = next.peek() != Some(&at);
+                    if !keep {
+                        next.next();
+                    }
+                    at += 1;
+                    keep
+                });
+            }
+            OwnedValue::Object(obj)
         }
         other => other,
     };
@@ -173426,6 +173511,44 @@ mod tests {
                 "walk_impl should panic at MAX_VALUE_TREE_DEPTH"
             );
         });
+    }
+
+    /// #7260: `walk` rewrites an unshared tree in place -- the root object keeps its map and the
+    /// array its storage -- so the walk never holds the old tree and the rebuilt one at once. The
+    /// answer is the one the rebuild gave (`walk(if type == "number" then . + 1 else . end)` on
+    /// `{"a":[1,2],"b":{"c":3}}`, jq 1.7.1: `{"a":[2,3],"b":{"c":4}}`).
+    #[test]
+    fn walk_rewrites_an_unshared_tree_in_place_7260() {
+        let input = crate::jq::value::OwnedValue::object_from([
+            (
+                "a".to_string(),
+                OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
+            ),
+            (
+                "b".to_string(),
+                OwnedValue::object_from([("c".to_string(), OwnedValue::Int(3))]),
+            ),
+        ]);
+        let addresses = |value: &OwnedValue| {
+            let OwnedValue::Object(map) = value else {
+                panic!("an object: {value:?}")
+            };
+            let Some(OwnedValue::Array(items)) = map.get("a") else {
+                panic!("an array at .a: {value:?}")
+            };
+            (core::ptr::addr_of!(**map) as usize, items.as_ptr() as usize)
+        };
+        let before = addresses(&input);
+        let f = crate::jq::parse(r#"if type == "number" then . + 1 else . end"#).unwrap();
+        let (mut outputs, control) = walk_impl::<JqSemantics>(&f, input, false);
+        assert!(control.is_none());
+        assert_eq!(outputs.len(), 1);
+        let output = outputs.pop().unwrap();
+        assert_eq!(addresses(&output), before);
+        assert_eq!(
+            owned_value_to_json::<JqSemantics>(&output),
+            r#"{"a":[2,3],"b":{"c":4}}"#
+        );
     }
 
     /// #1023: `finish_recurse_walk` locks in `builtin_recurse_f`/
