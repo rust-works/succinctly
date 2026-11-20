@@ -701,7 +701,9 @@ succinctly::cli::jq_runner::echoable_span::<alloc::vec::Vec<u64>>
 <alloc::raw_vec::RawVec<core::option::Option<bool>>>::grow_one
 core::ptr::drop_glue::<succinctly::jq::eval::LazyMarker>
 <succinctly::jq::eval_generic::LazySeq<succinctly::json::light::StandardJson>>::drain_atomic
-succinctly::jq::eval_generic::move_computed_run::<succinctly::json::light::StandardJson>
+succinctly::jq::eval_generic::move_computed_run::<succinctly::json::light::StandardJson, succinctly::json::light::JsonCursor>
+<succinctly::jq::element_run::ElementRun<succinctly::json::light::JsonCursor, succinctly::jq::value::OwnedValue>>::into_values
+core::ptr::drop_glue::<succinctly::jq::element_run::ElementRun<succinctly::json::light::JsonCursor, succinctly::jq::value::OwnedValue>>
 succinctly::json::light::pairwise_overflow
 <alloc::vec::Vec<u8>>::append_elements
 <succinctly::jq::parser::Parser>::parse_string_or_interpolation
