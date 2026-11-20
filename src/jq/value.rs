@@ -2374,7 +2374,9 @@ pub type ObjectMap = ObjectMapOf<OwnedValue>;
 /// **One block (#7260).** The storage is a single heap block -- reference
 /// count, length, capacity, then the elements -- as jq's `jvp_array` is, not
 /// an `Rc` around a `Vec` (two blocks per array; see `array_block`'s module
-/// docs). An empty `[]` is still one block (the 24-byte header), so a fresh
+/// docs); an array of 16 KiB or more made from a `Vec` keeps that `Vec`'s
+/// buffer behind a small block instead of copying it. An empty `[]` is still
+/// one block (the 24-byte header), so a fresh
 /// empty array is a node of its own, as `jv_array()` is. The window adds two
 /// words to the handle (24 bytes, the width of `OwnedValue::String`'s
 /// payload, so `OwnedValue` stays 32) and nothing to the heap.
@@ -2460,12 +2462,7 @@ impl<V: Teardown> ArrayOf<V> {
     /// would build as a `Vec` and then move into a block.
     #[inline]
     pub fn from_array<const N: usize>(items: [V; N]) -> Self {
-        let mut block = array_block::Block::with_capacity(N);
-        block
-            .get_mut()
-            .expect("a new block has one handle")
-            .extend(items);
-        Self::from_block(block)
+        Self::from_block(array_block::Block::from_array(items))
     }
 
     /// Take this handle's block out of a wrapper whose `Drop` will not run.
@@ -2659,12 +2656,7 @@ impl<V: Teardown + Clone> ArrayOf<V> {
     /// An array of clones of `items`, in one exactly sized allocation.
     #[inline]
     pub fn from_slice(items: &[V]) -> Self {
-        let mut block = array_block::Block::with_capacity(items.len());
-        block
-            .get_mut()
-            .expect("a new block has one handle")
-            .extend(items.iter().cloned());
-        Self::from_block(block)
+        Self::from_block(array_block::Block::from_slice(items))
     }
 
     /// Consume the wrapper, yielding the window's elements as a `Vec` -- by

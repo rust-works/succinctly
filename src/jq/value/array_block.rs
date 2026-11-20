@@ -273,6 +273,42 @@ impl<V> Block<V> {
         }
     }
 
+    /// A block of exactly `items`, moved in at once.
+    #[inline]
+    pub(crate) fn from_array<const N: usize>(items: [V; N]) -> Self {
+        let mut block = Self::with_capacity(N);
+        // SAFETY: a new inline block with `N` free slots; the array is moved
+        // in whole and then counted.
+        unsafe {
+            block.elements().cast::<[V; N]>().write(items);
+            block.header_mut().len = N;
+        }
+        block
+    }
+
+    /// A block of clones of `items`, exactly sized.
+    #[inline]
+    pub(crate) fn from_slice(items: &[V]) -> Self
+    where
+        V: Clone,
+    {
+        let block = Self::with_capacity(items.len());
+        let base = block.elements();
+        let mut counted = CountOnDrop {
+            header: block.ptr,
+            len: 0,
+        };
+        for (at, item) in items.iter().enumerate() {
+            // SAFETY: slot `at < items.len()` is allocated and free; the
+            // count covers it once it is written, also if a later clone
+            // panics.
+            unsafe { base.add(at).write(item.clone()) };
+            counted.len = at + 1;
+        }
+        drop(counted);
+        block
+    }
+
     /// An external block over `vec`'s buffer, which it takes as it stands.
     #[cold]
     #[inline(never)]
@@ -537,6 +573,22 @@ impl<V> Drop for Block<V> {
     }
 }
 
+/// Writes a fresh block's element count when it drops: the count of slots
+/// written so far, so a panic part-way through filling the block drops
+/// exactly those.
+struct CountOnDrop {
+    header: NonNull<Header>,
+    len: usize,
+}
+
+impl Drop for CountOnDrop {
+    #[inline]
+    fn drop(&mut self) {
+        // SAFETY: the header of a block only its filler holds.
+        unsafe { (*self.header.as_ptr()).len = self.len };
+    }
+}
+
 /// Write access to a block that has no other handle: the `Vec` methods an
 /// array write needs, and a `[V]` of all its elements.
 pub(crate) struct UniqueBlock<'a, V> {
@@ -775,8 +827,23 @@ impl<'a, V> UniqueBlock<'a, V> {
 
     /// Append every item of `iter`.
     pub(crate) fn extend<I: IntoIterator<Item = V>>(&mut self, iter: I) {
-        let iter = iter.into_iter();
+        let mut iter = iter.into_iter();
         self.reserve(iter.size_hint().0);
+        // The reserved slots are filled without a capacity check or a
+        // header write per element; anything past them is pushed.
+        let (start, room) = (self.len(), self.capacity());
+        let base = self.elements();
+        let mut counted = CountOnDrop {
+            header: self.block.ptr,
+            len: start,
+        };
+        while counted.len < room {
+            let Some(value) = iter.next() else { break };
+            // SAFETY: slot `counted.len < room` is allocated and free.
+            unsafe { base.add(counted.len).write(value) };
+            counted.len += 1;
+        }
+        drop(counted);
         for value in iter {
             self.push(value);
         }
