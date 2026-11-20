@@ -1347,6 +1347,47 @@ jobs:
         if: needs.gate.outputs.code == 'true'
         run: python3 scripts/crate_size.py check --verify --features cli
 
+  # `rust-version` in Cargo.toml is what `cargo install` and a dependent's resolver trust, and every
+  # other job builds with the newest stable, so it went stale unseen: it said 1.73.0 while the code
+  # and Cargo.lock needed 1.89. This job checks it with the committed lockfile, for the library with
+  # default features and for the feature set the CLI is tested with. It reads the version from
+  # Cargo.toml, so a bump is one edit there. x86_64 on purpose: the `simd` feature's AVX-512
+  # popcount kernel is what sets the floor (docs/guides/release.md#msrv-policy). Warnings are not
+  # denied, since an older rustc warns about different things; Clippy holds the lint bar. Not a
+  # required check; it skips wholesale like coverage and perf-guard.
+  msrv:
+    name: MSRV
+    needs: gate
+    if: needs.gate.outputs.retest != 'false' && needs.gate.outputs.code == 'true'
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["rust-version"])')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust ${{ steps.msrv.outputs.version }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      # RUSTUP_TOOLCHAIN as well as the action's default, so that nothing on the runner (a
+      # rust-toolchain file, a preinstalled default) can put another rustc under these checks.
+      - name: Check the library (default features)
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
+        run: |
+          rustc -V
+          cargo check --locked --lib
+
+      - name: Check the CLI feature set
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
+        run: cargo check --locked --features cli,simd,regex,serde
+
   # Pull-request coverage: the sticky patch-coverage comment, diffed against the
   # baseline that coverage-baseline.yml published for the PR's merge-base. Only
   # `pull_request` runs it (#3649): a merge-group build has no PR to comment on
