@@ -9637,8 +9637,14 @@ fn seq_eof_tail(sources: &[(Option<usize>, Vec<u8>)], ranges: &[(usize, usize)])
                 >= total - last.len() + EofTail::final_read_start(last, 0)
         })
     });
+    // #7260: a resumed stream's one source starts that many line breaks in.
+    let base = if sources.len() == 1 {
+        crate::cli::jq_seq_reader::seeded_line_base()
+    } else {
+        0
+    };
     EofTail {
-        newlines: u32::try_from(count_newlines(last)).unwrap_or(u32::MAX),
+        newlines: u32::try_from(count_newlines(last) + base).unwrap_or(u32::MAX),
         unknown,
     }
 }
@@ -12185,6 +12191,49 @@ fn probe_stdin_pipe(file: &std::fs::File, min: u64) -> Option<Vec<u8>> {
     Some(front)
 }
 
+/// [`probe_stdin_pipe`] a block at a time (#7260): the probe's bytes as blocks of `block` bytes each,
+/// in order, so the windows of the plain route free each once it is run, where one buffer of the
+/// probe was held until the last of it was. A pipe that ends sooner is handed on as
+/// [`probe_stdin_pipe`] hands it on, its blocks joined: the first has room past a block for the rest of
+/// a short one (a stream of a little more than a block, as 1 MB is, is not copied), and room for the
+/// bytes a window keeps in front of each (a line).
+#[cfg(unix)]
+fn probe_stdin_pipe_blocks(
+    file: &std::fs::File,
+    min: u64,
+    block: usize,
+) -> Option<std::collections::VecDeque<Vec<u8>>> {
+    const ROOM: usize = 64 << 10;
+    let block = block.max(1);
+    let mut blocks = std::collections::VecDeque::new();
+    let mut total = 0u64;
+    let mut error = None;
+    while total < min {
+        let want = usize::try_from(min - total).map_or(block, |left| left.min(block));
+        let mut bytes = Vec::with_capacity(want + ROOM);
+        error = Read::take(file, want as u64)
+            .read_to_end(&mut bytes)
+            .err()
+            .filter(|error| !not_open_for_reading(error));
+        total += bytes.len() as u64;
+        let short = bytes.len() < want;
+        blocks.push_back(bytes);
+        if short || error.is_some() {
+            break;
+        }
+    }
+    if total < min {
+        let mut whole = blocks.pop_front().unwrap_or_default();
+        for bytes in blocks {
+            whole.extend_from_slice(&bytes);
+        }
+        STDIN_PUSHBACK_ERROR.with(|slot| *slot.borrow_mut() = error);
+        STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = Some(whole));
+        return None;
+    }
+    Some(blocks)
+}
+
 /// [`windowed_stdin_file`] over a handle on descriptor 0 (its half that does not read the process's own
 /// descriptors): `None` for anything but a regular file with 4 MiB or more left from the offset the handle
 /// is at ([`regular_stdin_left`]), or one the run also writes to.
@@ -12211,8 +12260,9 @@ fn windowed_stdin_file(_min: u64) -> Option<(window::WindowedFiles, std::rc::Rc<
     None
 }
 
-/// Standard input when it is a pipe (or a socket) that holds 4 MiB or more (#7024), read a window at a
-/// time. Its length is not known, so the first 4 MiB are read to find out: a pipe that ends sooner hands
+/// Standard input when it is a pipe (or a socket) that holds two windows or more (#7024; four until
+/// #7260, [`window::min_windowed_pipe_bytes`]), read a window at a time. Its length is not known, so
+/// the first two windows are read to find out: a pipe that ends sooner hands
 /// what it held to the route that reads it whole ([`STDIN_PUSHBACK`]), as if it had read it itself. It
 /// cannot be read again for a fault's wording, so its windows are certified as they are read and the
 /// first fault is kept ([`window::WindowedFile::from_pipe`]). A terminal is left to the route that reads
@@ -12226,7 +12276,7 @@ fn windowed_stdin_pipe() -> Option<WindowedSource> {
     if !(kind.is_fifo() || kind.is_socket()) {
         return None;
     }
-    windowed_pipe(file, window::min_windowed_file_bytes())
+    windowed_pipe(file, window::min_windowed_pipe_bytes())
 }
 
 /// [`windowed_stdin_pipe`] over a pipe it has judged, which is windowed once it holds `min` bytes
@@ -12234,12 +12284,11 @@ fn windowed_stdin_pipe() -> Option<WindowedSource> {
 /// documents before it as on a regular file.
 #[cfg(unix)]
 fn windowed_pipe(file: std::fs::File, min: u64) -> Option<WindowedSource> {
-    let front = probe_stdin_pipe(&file, min)?;
+    let blocks = probe_stdin_pipe_blocks(&file, min, window::window_bytes())?;
     let seen = window::SeenFault::default();
     let reader = window::WindowedFiles::pipe(
         std::rc::Rc::new(file),
-        front,
-        None,
+        blocks,
         window::window_bytes(),
         seen.clone(),
     );
@@ -12255,11 +12304,12 @@ fn windowed_stdin_pipe() -> Option<WindowedSource> {
     None
 }
 
-/// A pipe (or a socket) on standard input that holds 4 MiB or more of a `--seq` stream (#7164), read a
-/// window at a time while its records are RFC 7464's own framing ([`window::WindowedFiles::seq_pipe`]),
-/// each RS read as a space as [`windowed_seq_file`] reads a regular file. Its length is not known, so
-/// the first 4 MiB are read to learn it, and a pipe that ends sooner is the whole-stream route's
-/// ([`probe_stdin_pipe`]). The rest of a stream that turns out not to be plain is handed to that route
+/// A pipe (or a socket) on standard input that holds two windows or more of a `--seq` stream (#7164;
+/// four until #7260, [`window::min_windowed_pipe_bytes`]), read a window at a time while its records are
+/// RFC 7464's own framing ([`window::WindowedFiles::seq_pipe`]), each RS read as a space as
+/// [`windowed_seq_file`] reads a regular file. Its length is not known, so the first two windows are
+/// read to learn it, and a pipe that ends sooner is the whole-stream route's
+/// ([`probe_stdin_pipe_blocks`]). The rest of a stream that turns out not to be plain is handed to that route
 /// once the windows before it are out ([`hand_on_seq_pipe_tail`]), so there is no fault to word here.
 #[cfg(unix)]
 fn windowed_seq_pipe() -> Option<WindowedSource> {
@@ -12269,14 +12319,18 @@ fn windowed_seq_pipe() -> Option<WindowedSource> {
     if !(kind.is_fifo() || kind.is_socket()) {
         return None;
     }
-    let front = probe_stdin_pipe(&file, window::min_windowed_file_bytes())?;
+    let blocks = probe_stdin_pipe_blocks(
+        &file,
+        window::min_windowed_pipe_bytes(),
+        window::window_bytes(),
+    )?;
     let slot = window::SeqTailSlot::default();
     SEQ_PIPE_TAIL.with(|tail| *tail.borrow_mut() = Some(std::rc::Rc::clone(&slot)));
     Some((
         Vec::new(),
-        window::WindowedFiles::seq_pipe(
+        window::WindowedFiles::seq_pipe_blocks(
             std::rc::Rc::new(file),
-            front,
+            blocks,
             window::window_bytes(),
             slot,
         ),
@@ -12385,6 +12439,9 @@ fn hand_on_seq_pipe_tail(args: &JqCommand) -> bool {
     };
     crate::cli::jq_seq_reader::seed_token_byte(tail.token_byte);
     crate::cli::jq_seq_reader::seed_faulted_rs(tail.faulted_rs);
+    crate::cli::jq_seq_reader::seed_line_base(tail.line_base);
+    // #7260: a file read to its end that held no RS is handed on as no bytes and where it ended.
+    HANDED_ON_NO_RS_END.with(|end| end.set(tail.no_rs_end));
     let stream = tail.stream;
     let named = get_input_files(args);
     if let [path] = named.as_slice() {
@@ -14288,7 +14345,10 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
             }
             let stdin =
                 std::io::Cursor::new(pushed_back.unwrap_or_default()).chain(std::io::stdin());
-            (Box::new(stdin), front)
+            // #7260: room for the windows read onto the text after the front, as a file's length is,
+            // so the text is not grown by doubling as they are (a 2.5 MiB buffer copied out of a
+            // 1.25 MiB one at the peak); room not written to is not memory the run holds.
+            (Box::new(stdin), front + 2 * lazy_window_bytes())
         }
         Some(path) => {
             let Ok(file) = std::fs::File::open(path) else {
@@ -14485,7 +14545,10 @@ fn read_lazy_window(lazy: &mut LazyJsonInputs, more: &mut LazyMore, want: usize)
             ));
         });
     }
-    let next = if rest.windows.first_window_pending() && !shared {
+    // #7260: every window is read onto the text, not only the first after a short start: a window read
+    // into a buffer of its own was a block held beside the text it was copied onto (1 MiB of the
+    // route's peak), and a copy of every byte of the source.
+    let next = if !shared {
         let text = std::mem::take(std::rc::Rc::make_mut(&mut lazy.text)).into_bytes();
         let kept = text.len();
         match rest
@@ -17571,67 +17634,34 @@ fn seq_no_rs_byte_warning(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> Option<Stri
 /// there is no source at all. [`seq_no_rs_byte_warning`] words it as the warning a non-`-n` run
 /// prints; `-n` with `input`/`inputs` raises it as an error instead (#5636).
 fn seq_no_rs_byte_position(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> Option<(usize, usize)> {
-    // A *malformed* BOM is the one case where "no RS byte anywhere" does not imply #1525's
-    // template: it costs jq a `parser_reset` that leaves the parser reading rather than waiting
-    // for an RS, so the reader owns that case (#1723). One definition for the warning and the
-    // `-n` error (#5636).
-    if crate::cli::jq_seq_reader::bom_prefix(raw_bytes).malformed {
-        return None;
-    }
-    let mut line = 1usize;
-    let mut column = 0usize;
-    // #7340: what jq's parser never sees, which is a stream's NULs and what follows them. A cut
-    // starts at a NUL, so an RS with no NUL before it in its source is one jq sees: the common
-    // stream answers here, having read up to its first RS and no further.
-    let mut nul_seen = false;
-    for slice in crate::cli::jq_seq_reader::stream_slices(raw_bytes) {
-        let rs = crate::cli::jq_seq_reader::find_byte(ASCII_RS, slice);
-        if crate::cli::jq_seq_reader::find_byte(0, rs.map_or(slice, |at| &slice[..at])).is_some() {
-            nul_seen = true;
-            break;
-        }
-        if rs.is_some() {
-            return None;
-        }
-    }
-    let cuts = if nul_seen {
-        crate::cli::jq_seq_reader::nul_cuts(raw_bytes)
-    } else {
-        Vec::new()
-    };
-    let ends = crate::cli::jq_seq_reader::source_ends(raw_bytes);
-    // Shares `stream_slices` and `advance_position` with `jq_seq_reader`, which walks this same
-    // stream to classify the templates that apply once an RS *is* present (#1723) -- the two must
-    // agree on BOM handling and on where a column starts. #7263: a slice at a time, searched a
-    // block at a time, where a byte at a time was a third of a no-RS run.
-    for (slice, end) in crate::cli::jq_seq_reader::stream_slices(raw_bytes).zip(ends) {
-        // A BOM is cut from the front of a slice, so the slice ends where its source does, and a
-        // cut never spans two sources. A cut can start before the slice (in the consumed BOM).
-        let start = end - slice.len();
-        // The pieces of the slice between its cuts.
-        let mut pieces = Vec::new();
-        let mut at = start;
-        for &(cut_start, cut_end) in &cuts[cuts.partition_point(|&(_, cut_end)| cut_end <= start)..]
-        {
-            if cut_start >= end {
-                break;
-            }
-            pieces.push((at, cut_start.max(at)));
-            at = cut_end.max(at);
-        }
-        pieces.push((at, end));
-        for (gap_start, gap_end) in pieces {
-            let piece = &slice[gap_start - start..gap_end - start];
-            if piece.contains(&ASCII_RS) {
-                return None;
-            }
-            crate::cli::jq_seq_reader::advance_position(piece, &mut line, &mut column);
-        }
+    // #7260: a `--seq` file the windowed route read to its end without holding it, and found no RS
+    // jq sees in, is handed on as an empty stream with the position its scan found.
+    if let Some(position) = HANDED_ON_NO_RS_END.with(std::cell::Cell::take) {
+        debug_assert!(raw_bytes.iter().all(|(_, raw)| raw.is_empty()));
+        return Some(position);
     }
     if raw_bytes.is_empty() {
         return None;
     }
-    Some((line, column))
+    // A *malformed* BOM is the one case where "no RS byte anywhere" does not imply #1525's
+    // template: it costs jq a `parser_reset` that leaves the parser reading rather than waiting
+    // for an RS, so the reader owns that case (#1723); the scan says so as it says it met an RS.
+    // #7340: what jq's parser never sees, a stream's NULs and what follows them in a read with no
+    // newline, is neither counted nor searched for an RS. Each source is fed whole: jq starts a
+    // read at each file's start. #7260: one definition with the windowed route's scan.
+    let mut scan = crate::cli::jq_seq_reader::NoRsScan::default();
+    for (_, raw) in raw_bytes {
+        scan.feed(raw, true)?;
+    }
+    Some(scan.position())
+}
+
+thread_local! {
+    /// The position [`seq_no_rs_byte_position`] answers for the next stream it is asked about: one
+    /// the windowed `--seq` route scanned to its end without holding it, and found no RS in, which it
+    /// hands on as no bytes (#7260, `window::WindowedFile::hand_on_seq_tail`).
+    static HANDED_ON_NO_RS_END: std::cell::Cell<Option<(usize, usize)>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Validate that the DSV delimiter is acceptable.
@@ -22596,9 +22626,10 @@ mod tests {
                 tail.stream.len(),
                 "{name}: room reserved first"
             );
+            // #7260: the front holds one line break and the tail counts the rest.
             assert_eq!(
-                tail.stream,
-                crate::cli::jq_seq_reader::resumed_stream(before, stream[at..].to_vec()),
+                (tail.stream.clone(), tail.line_base),
+                crate::cli::jq_seq_reader::resumed_stream_counted(before, stream[at..].to_vec()),
                 "{name}"
             );
             // The run's hand-off gives that buffer to the whole-file route as the file's bytes.
@@ -23223,6 +23254,34 @@ mod tests {
         }
         assert_eq!(count, 20);
         assert_eq!(reread.stream_fault(), None);
+    }
+
+    /// #7260: the plain route's probe reads a pipe in blocks, every byte of it in order, and hands a pipe
+    /// that ends short of the minimum on as the one buffer it would have read, its blocks joined.
+    #[cfg(unix)]
+    #[test]
+    fn a_pipes_probe_is_read_in_blocks_and_joined_when_short_7260() {
+        use std::io::Write;
+        let piped = |bytes: &[u8]| {
+            let (reader, mut writer) = std::io::pipe().expect("pipe");
+            writer.write_all(bytes).expect("write");
+            drop(writer);
+            std::fs::File::from(std::os::fd::OwnedFd::from(reader))
+        };
+        let stream: Vec<u8> = (0..200u8).collect();
+        let blocks = probe_stdin_pipe_blocks(&piped(&stream), 100, 30).expect("the minimum");
+        assert_eq!(
+            blocks.iter().map(Vec::len).collect::<Vec<_>>(),
+            [30, 30, 30, 10]
+        );
+        assert_eq!(Vec::from(blocks).concat(), stream[..100]);
+        STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = None);
+        assert!(probe_stdin_pipe_blocks(&piped(&stream[..95]), 100, 30).is_none());
+        assert_eq!(
+            STDIN_PUSHBACK.with(|slot| slot.borrow_mut().take()),
+            Some(stream[..95].to_vec())
+        );
+        assert!(STDIN_PUSHBACK_ERROR.with(|slot| slot.borrow().is_none()));
     }
 
     /// #7024: `-R` over a pipe on standard input reads it a window at a time only once it holds the
