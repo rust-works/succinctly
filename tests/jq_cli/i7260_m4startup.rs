@@ -3,7 +3,8 @@
 //! instead of a second scan of argv, and on Apple platforms every libm function behind a math builtin
 //! is looked up on its first call instead of being bound while the process starts. These rows call
 //! each such function once in one process (and some twice, through the kept address) with inputs whose
-//! results are exact on every libm, and put the named flags in the orders jq applies them in. Every
+//! results are exact on every libm (checked against jq 1.7.1 on glibc and on Apple's libm: `27|cbrt` is
+//! `3.0000000000000004` on glibc), and put the named flags in the orders jq applies them in. Every
 //! expected text was captured from jq 1.7.1 (`/usr/bin/jq`).
 
 use anyhow::Result;
@@ -13,8 +14,8 @@ use crate::run_jq_full;
 /// Every function `src/jq/math.rs` calls in the platform libm, in one program.
 #[test]
 fn test_each_libm_builtin_answers_on_its_first_and_later_calls_7260() -> Result<()> {
-    let program = r#"[(0|sin,cos,tan,asin,atan,sinh,cosh,tanh,asinh,atanh,exp,erf,erfc,expm1,log1p,j0,j1), (1|acos,acosh,log,lgamma), (3|exp2,logb), (27|cbrt), (8|log2,significand,frexp), (1000|log10), (16|sqrt), (5|tgamma), (2|exp10), (3.5|modf), (1|lgamma_r), (0|atan2(.;1)), pow(2;10), hypot(3;4), fmod(7;3), fdim(5;3), remainder(7;4), nextafter(1;1), fma(2;3;4), ldexp(3;2), scalb(3;2), scalbln(3;2), jn(2;0), (0|y0,y1), yn(2;0)|tostring]|join(" ")"#;
-    let expected = "0 1 0 0 0 0 1 0 0 0 1 0 1 0 0 1 0 0 0 0 0 8 1 3 3 1 [0.5,4] 3 4 24 100 [0.5,3] [0,1] 0 1024 5 1 2 -1 1 10 12 12 12 0 -1.7976931348623157e+308 -1.7976931348623157e+308 -1.7976931348623157e+308\n";
+    let program = r#"[(0|sin,cos,tan,asin,atan,sinh,cosh,tanh,asinh,atanh,exp,erf,erfc,expm1,log1p,j0,j1), (1|acos,acosh,log,lgamma), (3|exp2,logb), (1|cbrt), (8|log2,significand,frexp), (1000|log10), (16|sqrt), (5|tgamma), (2|exp10), (3.5|modf), (1|lgamma_r), (0|atan2(.;1)), pow(2;10), hypot(3;4), fmod(7;3), fdim(5;3), remainder(7;4), nextafter(1;1), fma(2;3;4), ldexp(3;2), scalb(3;2), scalbln(3;2), jn(2;0), (0|y0,y1), yn(2;0)|tostring]|join(" ")"#;
+    let expected = "0 1 0 0 0 0 1 0 0 0 1 0 1 0 0 1 0 0 0 0 0 8 1 1 3 1 [0.5,4] 3 4 24 100 [0.5,3] [0,1] 0 1024 5 1 2 -1 1 10 12 12 12 0 -1.7976931348623157e+308 -1.7976931348623157e+308 -1.7976931348623157e+308\n";
     assert_eq!(
         run_jq_full(&["-nr", program], None)?,
         (expected.to_string(), String::new(), 0)
