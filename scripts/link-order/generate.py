@@ -9,7 +9,13 @@
 `linux` runs every row of `comparison/jq/queries/perf.tsv` at 1 MB (and two startup-only runs)
 under valgrind. The startup runs (`jq -n 1`, `jq .` on empty input) give the first block, in the
 order their functions first execute (lackey superblock trace); then comes every other function
-callgrind saw execute in any row, those run by the most rows first, then by instructions.
+callgrind saw execute in any row, those run by the most rows first, then by instructions. Last come
+the functions only the rows at 10 MB run, ranked the same way (#7412): a file of 4 MiB or more takes
+the windowed routes (`jq_runner/window.rs`), which no 1 MB row reaches, and left unordered their
+two dozen functions kept three or four large folios of text resident in every stream row.
+
+    # Add that 10 MB tail to an existing list without reordering it
+    python3 scripts/link-order/generate.py extend target/release/succinctly data/compare/inputs symbols.txt > new.txt
 
 `macos` cannot trace (no valgrind, and lldb needs a debugging grant), so it samples instead: each
 run gets a fresh copy of the binary, whose pages are then in no cache, and `mincore()` at exit
@@ -38,7 +44,7 @@ PERF = os.path.join(ROOT, "comparison", "jq", "queries", "perf.tsv")
 MARK = "# -- end of startup block --"
 STARTUP = [(["-n", "1"], None), (["."], "/dev/null")]
 sys.path.insert(0, HERE)
-from link import demangle, norm  # noqa: E402
+from link import CRT_STARTUP, demangle, norm  # noqa: E402
 
 
 def rows(inputs, size="1mb"):
@@ -166,6 +172,23 @@ def callgrind_counts(binary, runs):
     return nrows, ir
 
 
+def large_rows(inputs):
+    """The rows of `rows(inputs, "10mb")` that read a 10 MB input: a row with none is the same run."""
+    return [r for r in rows(inputs, "10mb") if any("-10mb." in a for a in r[0] + [r[1] or ""])]
+
+
+def large_tail(binary, inputs, dem, have):
+    """Demangled names of the functions the 10 MB rows run and `have` lacks, most rows first."""
+    nrows, ir = callgrind_counts(binary, large_rows(inputs))
+    tail = sorted((f for f in nrows if f in dem and norm(dem[f]) not in have), key=lambda f: (-nrows[f], -ir[f]))
+    out, seen = [], set()
+    for m in tail:
+        if norm(dem[m]) not in seen:
+            seen.add(norm(dem[m]))
+            out.append(dem[m])
+    return out
+
+
 def linux(binary, inputs):
     syms = nm_pairs(binary)
     dem = {s[2]: s[3] for s in syms}
@@ -184,7 +207,14 @@ def linux(binary, inputs):
             elif dem[m] not in seen:
                 seen.add(dem[m])
                 out.append(dem[m])
-    return out
+    return out + large_tail(binary, inputs, dem, {norm(n) for n in seen})
+
+
+def extend(binary, inputs, listfile):
+    """`listfile` as it is, then the functions only the 10 MB rows run (see `large_tail`)."""
+    old = [l.rstrip("\n") for l in open(listfile)]
+    dem = {s[2]: s[3] for s in nm_pairs(binary)}
+    return old + large_tail(binary, inputs, dem, {norm(l) for l in old if not l.startswith("#")})
 
 
 MINCORE_C = r"""
@@ -262,7 +292,7 @@ def check(binary, listfile, limit):
     """Fail when a startup run executes more than `limit` bytes of functions the list does not name,
     or when the binary was not linked in the list's order (the functions it does name are spread
     over more than twice their size). Linux, valgrind."""
-    have = {norm(l.rstrip("\n")) for l in open(listfile) if not l.startswith("#")}
+    have = {norm(l.rstrip("\n")) for l in open(listfile) if not l.startswith("#")} | set(CRT_STARTUP)
     syms = nm_pairs(binary)
     by = {s[2]: s for s in syms}
     missing, listed = {}, {}
@@ -276,8 +306,8 @@ def check(binary, listfile, limit):
     print(f"startup functions missing from the list: {len(missing)}, {lost} bytes (limit {limit})")
     ok = lost <= limit
     if listed:
-        # Ordered, the listed functions open the text; a few can sit elsewhere (`_start` lives in
-        # crt1.o's one `.text` section, which the linker cannot move), so ask for 90% of the bytes.
+        # Ordered, the listed functions open the text (link.py puts the C runtime's `_start` and
+        # crtbeginS.o's functions first, #7412); a few can sit elsewhere, so ask for 90% of the bytes.
         lo = min(v[0] for v in listed.values())
         total = sum(v[1] for v in listed.values())
         near = sum(v[1] for v in listed.values() if v[0] + v[1] <= lo + 2 * total + 65536)
@@ -292,6 +322,8 @@ def check(binary, listfile, limit):
 def main(argv):
     if len(argv) >= 3 and argv[0] == "linux":
         print("\n".join(linux(argv[1], argv[2])))
+    elif len(argv) >= 4 and argv[0] == "extend":
+        print("\n".join(extend(argv[1], argv[2], argv[3])))
     elif len(argv) >= 4 and argv[0] == "macos":
         print("\n".join(macos(argv[1], argv[2], argv[3])))
     elif len(argv) >= 3 and argv[0] == "check":

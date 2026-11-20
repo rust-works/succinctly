@@ -3,12 +3,16 @@
 # hashes; a name the build does not define is skipped. Lines starting with `#` are comments.
 # Generated 2026-11-20 from 9c434fa4c by `generate.py linux` on a Ryzen 9 7950X (Linux, valgrind 3.18),
 # then `generate.py macos` on an Apple M4 Pro (16 KB-page sampling, so its 37 additions are approximate).
+# The last 60 names are `generate.py extend` on 07cf224f2 (Ryzen 9 7950X): what only the 10 MB rows run (#7412).
 _start
 std::sys::args::unix::imp::ARGV_INIT_ARRAY::init_wrapper
 main
 std::sys::pal::unix::stack_overflow::imp::make_handler
 std::sys::pal::unix::stack_overflow::thread_info::set_current_info
 succinctly::main
+succinctly::cli::relocation_pages::release
+succinctly::cli::relocation_pages::imp::release
+succinctly::cli::relocation_pages::imp::ranges
 <std::thread::thread::Thread>::new
 std::thread::spawnhook::run_spawn_hooks
 std::sys::thread_local::destructors::linux_like::register
@@ -1395,3 +1399,63 @@ alloc::slice::stable_sort::<alloc::string::String, <alloc::string::String as cor
 <succinctly::cli::jq_stream_errors::ChunkedSources as succinctly::cli::jq_stream_errors::RefillSource>::take_error
 core::ptr::drop_glue::<core::io::util::Chain<core::io::cursor::Cursor<alloc::vec::Vec<u8>>, std::io::stdio::Stdin>>
 <succinctly::jq::parser::Parser>::parse_assignment_operand
+<succinctly::cli::jq_runner::window::WindowedFile>::validate_lines
+<succinctly::cli::jq_runner::window::WindowedFile>::next_window_with
+<succinctly::cli::jq_runner::window::WindowedFile>::drop_consumed
+alloc::io::read::default_read_to_end::<core::io::util::Take<&std::fs::File>>
+<succinctly::cli::jq_runner::window::WindowedFiles>::reach_a_file_with_windows_left
+<succinctly::cli::jq_runner::window::WindowedFiles>::next_window_noting
+<succinctly::cli::jq_runner::window::WindowedFiles>::note_open_failures
+alloc::io::read::default_read_to_end::small_probe_read::<core::io::util::Take<&std::fs::File>>
+core::ptr::drop_glue::<core::result::Result<core::option::Option<(usize, succinctly::cli::jq_runner::window::Window)>, core::io::error::Error>>
+core::ptr::drop_glue::<succinctly::cli::jq_runner::window::WindowedFile>
+core::ptr::drop_glue::<succinctly::cli::jq_runner::window::Reread>
+<alloc::vec::Vec<u8> as alloc::vec::spec_from_elem::SpecFromElem>::from_elem::<alloc::alloc::Global>
+core::ptr::drop_glue::<succinctly::cli::jq_runner::window::WindowedFiles>
+core::ptr::drop_glue::<alloc::vec::Vec<succinctly::cli::jq_runner::window::SubstitutedRegion>>
+core::ptr::drop_glue::<alloc::collections::vec_deque::VecDeque<alloc::vec::Vec<u8>>>
+<alloc::rc::Rc<std::fs::File>>::drop_slow
+<succinctly::cli::output::StreamFault>::new::<succinctly::cli::jq_runner::run_jq_on_stack_floor::{closure#22}>
+<alloc::rc::Rc<succinctly::cli::jq_runner::window::Reread>>::drop_slow
+core::ptr::drop_glue::<succinctly::cli::jq_runner::run_jq_on_stack_floor::{closure#22}>
+<succinctly::cli::jq_runner::window::Reread>::new
+<succinctly::jq::value::array_block::Block<succinctly::jq::value::OwnedValue>>::from_vec
+<succinctly::jq::value::array_block::Block<succinctly::jq::value::OwnedValue>>::drop_slow
+<succinctly::jq::value::array_block::Block<succinctly::jq::value::OwnedValue>>::external
+<std::fs::File>::metadata
+succinctly::cli::jq_runner::window::plain_seq_ends_in
+succinctly::cli::jq_runner::window::plain_seq_records_in
+<succinctly::cli::jq_runner::window::WindowedFiles>::seq_pipe_blocks
+<std::fs::File as core::io::seek::Seek>::stream_position
+<std::fs::File as std::os::unix::fs::FileExt>::read_at
+<alloc::rc::Rc<core::cell::RefCell<core::option::Option<succinctly::cli::jq_runner::window::SeqTail>>>>::drop_slow
+<alloc::sync::Arc<succinctly::cli::jq_runner::window::SeenShared>>::drop_slow
+<succinctly::jq::eval_generic::CommaArray<succinctly::json::light::StandardJson>>::push::<succinctly::jq::eval::JqSemantics>
+<succinctly::cli::jq_seq_reader::NoRsScan>::visible
+<succinctly::cli::jq_seq_reader::NoRsScan>::feed
+core::ptr::drop_glue::<succinctly::jq::value::ArrayIntoIter<succinctly::jq::value::OwnedValue>>
+succinctly::cli::jq_seq_reader::token_byte_after
+<succinctly::cli::jq_runner::window::WindowedFile>::hand_on_seq_tail
+<succinctly::cli::jq_runner::RunFiles>::new
+succinctly::jq::eval_generic::map_values_of_fields::<succinctly::jq::eval::JqSemantics, succinctly::json::light::StandardJson>
+succinctly::jq::eval_generic::binary_fanout_each_generic_with::<succinctly::json::light::StandardJson, succinctly::jq::eval::JqSemantics, succinctly::jq::eval_generic::eval_each_generic<succinctly::jq::eval::JqSemantics, succinctly::json::light::StandardJson>::{closure#2}, succinctly::jq::eval_generic::eval_each_generic<succinctly::jq::eval::JqSemantics, succinctly::json::light::StandardJson>::{closure#3}>
+<succinctly::jq::eval_generic::binary_fanout_each_generic_with<succinctly::json::light::StandardJson, succinctly::jq::eval::JqSemantics, succinctly::jq::eval_generic::eval_each_generic<succinctly::jq::eval::JqSemantics, succinctly::json::light::StandardJson>::{closure#2}, succinctly::jq::eval_generic::eval_each_generic<succinctly::jq::eval::JqSemantics, succinctly::json::light::StandardJson>::{closure#3}>::{closure#0} as succinctly::jq::eval_generic::Sink<succinctly::json::light::StandardJson>>::push
+<succinctly::jq::eval_generic::binary_fanout_each_generic_with<succinctly::json::light::StandardJson, succinctly::jq::eval::JqSemantics, succinctly::jq::eval_generic::eval_each_generic<succinctly::jq::eval::JqSemantics, succinctly::json::light::StandardJson>::{closure#2}, succinctly::jq::eval_generic::eval_each_generic<succinctly::jq::eval::JqSemantics, succinctly::json::light::StandardJson>::{closure#3}>::{closure#0}::{closure#0} as succinctly::jq::eval_generic::Sink<succinctly::json::light::StandardJson>>::push
+<succinctly::jq::value::array_block::Block<succinctly::jq::value::OwnedValue>>::from_slice
+succinctly::jq::eval_generic::read_only_operand_strategy_generic::<succinctly::json::light::StandardJson, succinctly::jq::eval_generic::eval_each_generic<succinctly::jq::eval::JqSemantics, succinctly::json::light::StandardJson>::{closure#2}>::{closure#0}
+<succinctly::cli::jq_runner::window::WindowedFile>::resume_after_stretch
+succinctly::jq::eval::owned_assign_step_child
+succinctly::cli::jq_seq_reader::resumed_front
+succinctly::cli::jq_seq_reader::walk_stretch::{closure#0}
+succinctly::jq::eval_generic::map_values_of_document_object::<succinctly::jq::eval::JqSemantics, succinctly::json::light::StandardJson>
+<succinctly::jq::value::ArrayVecMut<succinctly::jq::value::OwnedValue>>::remove
+core::ptr::drop_glue::<<alloc::collections::vec_deque::drain::Drain<_, _> as core::ops::drop::Drop>::drop::DropGuard<alloc::vec::Vec<u8>, alloc::alloc::Global>>
+<succinctly::jq::value::ArrayOf<succinctly::jq::value::OwnedValue> as core::ops::deref::DerefMut>::deref_mut
+succinctly::jq::document::effective_fields_checked_iter::<succinctly::json::light::JsonFields>
+core::ptr::drop_glue::<alloc::vec::drain::Drain<u8>>
+core::ptr::drop_glue::<alloc::vec::Vec<(succinctly::jq::expr::ArithOp, succinctly::jq::value::OwnedValue)>>
+<succinctly::jq::value::object_map::ObjectMapOf<succinctly::jq::value::OwnedValue> as core::convert::From<succinctly::jq::value::field_map::FieldMap<succinctly::jq::value::OwnedValue>>>::from
+core::ptr::drop_glue::<succinctly::jq::value::field_map::FieldMap<()>>
+core::ptr::drop_glue::<alloc::collections::vec_deque::drain::Drain<alloc::vec::Vec<u8>>>
+succinctly::cli::jq_runner::read_inputs::{closure#43}
+<succinctly::jq::eval_generic::CheckOnly as succinctly::jq::eval_generic::CursorWalkOutput>::object
