@@ -30851,7 +30851,9 @@ fn collect_paths_generic<S: EvalSemantics, V: DocumentValue>(
             // mirroring `to_owned_at_depth`'s identical object arm.
             empty_fields_tail_gap_ok(&fields, cursor)?;
             if leaves_only {
-                paths.push(OwnedValue::Array(current_path.clone().into()));
+                paths.push(OwnedValue::Array(crate::jq::ArrayVec::from_slice(
+                    &current_path[..],
+                )));
             }
             return Ok(());
         }
@@ -30874,7 +30876,9 @@ fn collect_paths_generic<S: EvalSemantics, V: DocumentValue>(
             }
             current_path.push(component);
             if !leaves_only {
-                paths.push(OwnedValue::Array(current_path.clone().into()));
+                paths.push(OwnedValue::Array(crate::jq::ArrayVec::from_slice(
+                    &current_path[..],
+                )));
                 if let Some(nodes) = nodes.as_deref_mut() {
                     nodes.push((field.value.clone(), field.value_cursor));
                 }
@@ -30910,7 +30914,9 @@ fn collect_paths_generic<S: EvalSemantics, V: DocumentValue>(
             // arm above.
             empty_elements_tail_gap_ok(&elements, cursor)?;
             if leaves_only {
-                paths.push(OwnedValue::Array(current_path.clone().into()));
+                paths.push(OwnedValue::Array(crate::jq::ArrayVec::from_slice(
+                    &current_path[..],
+                )));
             }
             return Ok(());
         }
@@ -30918,7 +30924,9 @@ fn collect_paths_generic<S: EvalSemantics, V: DocumentValue>(
             current_path.push(OwnedValue::Int(i as i64));
             let elem = elem_cursor.value();
             if !leaves_only {
-                paths.push(OwnedValue::Array(current_path.clone().into()));
+                paths.push(OwnedValue::Array(crate::jq::ArrayVec::from_slice(
+                    &current_path[..],
+                )));
                 if let Some(nodes) = nodes.as_deref_mut() {
                     nodes.push((elem.clone(), elem_cursor));
                 }
@@ -30934,7 +30942,9 @@ fn collect_paths_generic<S: EvalSemantics, V: DocumentValue>(
             current_path.pop();
         }
     } else if leaves_only {
-        paths.push(OwnedValue::Array(current_path.clone().into()));
+        paths.push(OwnedValue::Array(crate::jq::ArrayVec::from_slice(
+            &current_path[..],
+        )));
     }
     Ok(())
 }
@@ -30957,10 +30967,15 @@ fn collect_tostream_generic<S: EvalSemantics, V: DocumentValue>(
 ) -> Result<(), EvalError> {
     guard_path_walk_depth(current_path.len())?;
     let leaf = |current_path: &[OwnedValue], leaf: OwnedValue| {
-        OwnedValue::Array(vec![OwnedValue::Array(current_path.to_vec().into()), leaf].into())
+        OwnedValue::Array(crate::jq::ArrayVec::from_array([
+            OwnedValue::Array(crate::jq::ArrayVec::from_slice(current_path)),
+            leaf,
+        ]))
     };
     let closing = |current_path: &[OwnedValue]| {
-        OwnedValue::Array(vec![OwnedValue::Array(current_path.to_vec().into())].into())
+        OwnedValue::Array(crate::jq::ArrayVec::from_array([OwnedValue::Array(
+            crate::jq::ArrayVec::from_slice(current_path),
+        )]))
     };
     if let Some(fields) = value.as_object_rendered() {
         let checked = effective_fields_checked(&fields, false)?;

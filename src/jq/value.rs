@@ -17,7 +17,6 @@ use alloc::vec::Vec;
 #[cfg(test)]
 use std::borrow::Cow;
 
-use alloc::rc::Rc;
 use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
 
@@ -33,6 +32,7 @@ use super::eval::{
 };
 use super::expr::Literal;
 
+mod array_block;
 pub mod field_map;
 mod object_map;
 
@@ -2371,12 +2371,13 @@ pub type ObjectMap = ObjectMapOf<OwnedValue>;
 /// exactly, because [`ptr_eq`](Self::ptr_eq) is `jv_identical` and the embed
 /// table and the resolver read it.
 ///
-/// The cost is one extra allocation (the `Rc` header plus the `Vec` header)
-/// and one pointer chase per array, including an empty `[]` that used to be
-/// free on the heap. Arrays of many small arrays are where that shows;
-/// #2999's measurements put a number on it. The window adds two words to the
-/// handle (24 bytes, the width of `OwnedValue::String`'s payload, so
-/// `OwnedValue` stays 32) and nothing to the heap.
+/// **One block (#7260).** The storage is a single heap block -- reference
+/// count, length, capacity, then the elements -- as jq's `jvp_array` is, not
+/// an `Rc` around a `Vec` (two blocks per array; see `array_block`'s module
+/// docs). An empty `[]` is still one block (the 24-byte header), so a fresh
+/// empty array is a node of its own, as `jv_array()` is. The window adds two
+/// words to the handle (24 bytes, the width of `OwnedValue::String`'s
+/// payload, so `OwnedValue` stays 32) and nothing to the heap.
 ///
 /// Same transparency contract as [`ObjectMapOf`] for reads: [`Deref`] to the
 /// window's elements (a `[V]`), all three [`IntoIterator`] forms,
@@ -2406,9 +2407,11 @@ pub type ArrayVec = ArrayOf<OwnedValue>;
 
 /// [`ArrayOf`]'s inner representation: refcounted, and released by
 /// [`ArrayOf`]'s own `Drop` rather than by drop glue, so that releasing the
-/// last handle -- `Rc::drop_slow`, which drops every element -- runs inside a
-/// level of `drop_depth`'s count (#5868).
-type ArrayInnerOf<V> = ManuallyDrop<Rc<Vec<V>>>;
+/// last handle -- the block's `drop_slow`, which drops every element -- runs
+/// inside a level of `drop_depth`'s count (#5868).
+type ArrayInnerOf<V> = ManuallyDrop<array_block::Block<V>>;
+
+pub use array_block::ArrayReserveError;
 
 /// The offset at which jq stops making a slice a view: `jv.offset` is 16
 /// bits, so `jvp_array_slice` copies a range starting this many elements or
@@ -2432,13 +2435,48 @@ impl<V: Teardown> ArrayOf<V> {
     /// An empty array.
     #[inline]
     pub fn new() -> Self {
-        Self::from(Vec::new())
+        Self::with_capacity(0)
     }
 
     /// An empty array with room for `capacity` elements.
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
-        Self::from(Vec::with_capacity(capacity))
+        Self::from_block(array_block::Block::with_capacity(capacity))
+    }
+
+    /// The whole of `block` as a window.
+    #[inline]
+    fn from_block(block: array_block::Block<V>) -> Self {
+        let len = block.len();
+        Self {
+            inner: ManuallyDrop::new(block),
+            start: 0,
+            len,
+        }
+    }
+
+    /// An array of exactly `items`, in one allocation: the literal-sized
+    /// constructor (`[path, leaf]` events, #7260) that a `vec![..].into()`
+    /// would build as a `Vec` and then move into a block.
+    #[inline]
+    pub fn from_array<const N: usize>(items: [V; N]) -> Self {
+        let mut block = array_block::Block::with_capacity(N);
+        block
+            .get_mut()
+            .expect("a new block has one handle")
+            .extend(items);
+        Self::from_block(block)
+    }
+
+    /// Take this handle's block out of a wrapper whose `Drop` will not run.
+    #[inline]
+    #[allow(unsafe_code)] // moves the one non-`Copy` field out of a `ManuallyDrop` wrapper
+    fn into_block(self) -> (array_block::Block<V>, core::ops::Range<usize>) {
+        let this = ManuallyDrop::new(self);
+        let window = this.start..this.start + this.len;
+        // SAFETY: `this` is never dropped, so the handle is read out (and
+        // released by its new owner) exactly once.
+        (unsafe { core::ptr::read(&*this.inner) }, window)
     }
 
     /// Whether `self` and `other` are two handles on the *same* node --
@@ -2457,21 +2495,23 @@ impl<V: Teardown> ArrayOf<V> {
     /// since they were split.
     #[inline]
     pub fn ptr_eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.inner, &other.inner) && self.start == other.start && self.len == other.len
+        self.inner.ptr_eq(&other.inner) && self.start == other.start && self.len == other.len
     }
 
     /// Whether another handle currently shares this storage, i.e. whether
     /// the next write through this handle will copy it.
     #[inline]
     pub fn is_shared(&self) -> bool {
-        Rc::strong_count(&self.inner) > 1
+        self.inner.strong_count() > 1
     }
 
-    /// The `Vec` and the window, if this handle owns the storage alone.
+    /// The storage and the window, if this handle owns the storage alone.
     #[inline]
-    fn unique_parts(&mut self) -> Option<(&mut Vec<V>, &mut usize, &mut usize)> {
+    fn unique_parts(
+        &mut self,
+    ) -> Option<(array_block::UniqueBlock<'_, V>, &mut usize, &mut usize)> {
         let Self { inner, start, len } = self;
-        Rc::get_mut(inner).map(|vec| (vec, start, len))
+        inner.get_mut().map(|vec| (vec, start, len))
     }
 
     /// [`Teardown::detach`] every element, if this handle owns them alone,
@@ -2479,7 +2519,7 @@ impl<V: Teardown> ArrayOf<V> {
     /// recurses), so the array's own `Drop` finds it empty. Elements outside
     /// the window are this storage's too, and are taken apart with the rest.
     fn detach_into(&mut self, work: &mut Vec<V>) {
-        if let Some((vec, start, len)) = self.unique_parts() {
+        if let Some((mut vec, start, len)) = self.unique_parts() {
             // Zeroed first: a child's release can run a destructor.
             *start = 0;
             *len = 0;
@@ -2516,10 +2556,10 @@ impl<V: Teardown + Clone> ArrayOf<V> {
         }
         let start = self.start + range.start;
         if start >= JQ_SLICE_OFFSET_LIMIT {
-            return Self::from(self[range].to_vec());
+            return Self::from_slice(&self[range]);
         }
         Self {
-            inner: ManuallyDrop::new(Rc::clone(&self.inner)),
+            inner: ManuallyDrop::new(array_block::Block::clone(&self.inner)),
             start,
             len: range.end - range.start,
         }
@@ -2546,7 +2586,7 @@ impl<V: Teardown + Clone> ArrayOf<V> {
             *self = Self::new();
             return;
         }
-        let Some((vec, start, len)) = self.unique_parts() else {
+        let Some((mut vec, start, len)) = self.unique_parts() else {
             *self = self.slice(range);
             return;
         };
@@ -2557,7 +2597,7 @@ impl<V: Teardown + Clone> ArrayOf<V> {
         *len = 0;
         vec.truncate(new_start + new_len);
         if new_start >= JQ_SLICE_OFFSET_LIMIT {
-            vec.drain(..new_start);
+            vec.drain(0..new_start);
             if vec.capacity() > 2 * vec.len() + 16 {
                 vec.shrink_to_fit();
             }
@@ -2589,7 +2629,9 @@ impl<V: Teardown + Clone> ArrayOf<V> {
     pub fn make_vec(&mut self) -> ArrayVecMut<'_, V> {
         self.own_storage();
         let Self { inner, start, len } = self;
-        let vec = Rc::get_mut(inner).expect("own_storage leaves this handle unique");
+        let mut vec = inner
+            .get_mut()
+            .expect("own_storage leaves this handle unique");
         let window = *start..*start + *len;
         // Zeroed before any element is dropped, and while the `Vec` is lent
         // out (see `len`'s invariant).
@@ -2597,7 +2639,7 @@ impl<V: Teardown + Clone> ArrayOf<V> {
         *len = 0;
         if window.start > 0 || window.end < vec.len() {
             vec.truncate(window.end);
-            vec.drain(..window.start);
+            vec.drain(0..window.start);
         }
         ArrayVecMut { vec, len }
     }
@@ -2608,10 +2650,21 @@ impl<V: Teardown + Clone> ArrayOf<V> {
     #[inline]
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     fn own_storage(&mut self) {
-        if Rc::strong_count(&self.inner) > 1 {
+        if self.inner.strong_count() > 1 {
             note_forced_copy!(ArrayMakeMut);
-            *self = Self::from(self[..].to_vec());
+            *self = Self::from_slice(&self[..]);
         }
+    }
+
+    /// An array of clones of `items`, in one exactly sized allocation.
+    #[inline]
+    pub fn from_slice(items: &[V]) -> Self {
+        let mut block = array_block::Block::with_capacity(items.len());
+        block
+            .get_mut()
+            .expect("a new block has one handle")
+            .extend(items.iter().cloned());
+        Self::from_block(block)
     }
 
     /// Consume the wrapper, yielding the window's elements as a `Vec` -- by
@@ -2620,51 +2673,215 @@ impl<V: Teardown + Clone> ArrayOf<V> {
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     pub fn into_vec(mut self) -> Vec<V> {
         let window = self.start..self.start + self.len;
-        match self.unique_parts() {
-            Some((vec, start, len)) => {
-                *start = 0;
-                *len = 0;
-                let mut vec = core::mem::take(vec);
-                vec.truncate(window.end);
-                vec.drain(..window.start);
-                vec
-            }
-            None => {
-                note_forced_copy!(ArrayUnwrap);
-                self.inner[window].to_vec()
-            }
+        let Some((mut vec, start, len)) = self.unique_parts() else {
+            note_forced_copy!(ArrayUnwrap);
+            return self[..].to_vec();
+        };
+        *start = 0;
+        *len = 0;
+        vec.truncate(window.end);
+        vec.drain(0..window.start);
+        let (block, _) = self.into_block();
+        match block.try_into_vec() {
+            Ok(vec) => vec,
+            Err(_) => unreachable!("the handle was unique a moment ago"),
         }
     }
 }
 
-/// [`ArrayOf::make_vec`]'s loan of the `Vec`: derefs to it, and puts its
-/// length back into the window when it drops.
+/// [`ArrayOf::make_vec`]'s loan of the storage.
+///
+/// It has the `Vec` methods an array write uses (`push`, `truncate`,
+/// `splice`, `retain`, ...) and derefs to a `[V]` of the elements; dropping it
+/// puts the array's length back into the window.
 pub struct ArrayVecMut<'a, V> {
-    vec: &'a mut Vec<V>,
+    vec: array_block::UniqueBlock<'a, V>,
     len: &'a mut usize,
 }
 
+/// A `RangeBounds` over `len` elements as a `Range`, checked as `Vec`'s
+/// methods check theirs.
+#[track_caller]
+fn bounded_range<R: core::ops::RangeBounds<usize>>(
+    range: &R,
+    len: usize,
+) -> core::ops::Range<usize> {
+    use core::ops::Bound;
+    let start = match range.start_bound() {
+        Bound::Included(&n) => n,
+        Bound::Excluded(&n) => n.checked_add(1).expect("range start overflows"),
+        Bound::Unbounded => 0,
+    };
+    let end = match range.end_bound() {
+        Bound::Included(&n) => n.checked_add(1).expect("range end overflows"),
+        Bound::Excluded(&n) => n,
+        Bound::Unbounded => len,
+    };
+    assert!(
+        start <= end && end <= len,
+        "range {start}..{end} out of bounds for length {len}"
+    );
+    start..end
+}
+
+impl<V> ArrayVecMut<'_, V> {
+    /// How many elements there are.
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.vec.len()
+    }
+
+    /// Whether there is no element.
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.vec.is_empty()
+    }
+
+    /// Slots allocated, used or not.
+    #[inline]
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.vec.capacity()
+    }
+
+    /// Room for `additional` more elements, or the reason there is none
+    /// (`Vec::try_reserve`).
+    ///
+    /// # Errors
+    ///
+    /// If the size overflows or the allocator refuses it.
+    #[inline]
+    pub fn try_reserve(&mut self, additional: usize) -> Result<(), ArrayReserveError> {
+        self.vec.try_reserve(additional)
+    }
+
+    /// Room for `additional` more elements (`Vec::reserve`).
+    #[inline]
+    pub fn reserve(&mut self, additional: usize) {
+        self.vec.reserve(additional);
+    }
+
+    /// Append `value`.
+    #[inline]
+    pub fn push(&mut self, value: V) {
+        self.vec.push(value);
+    }
+
+    /// Remove and return the last element.
+    #[inline]
+    pub fn pop(&mut self) -> Option<V> {
+        self.vec.pop()
+    }
+
+    /// Drop every element from `len` on.
+    #[inline]
+    pub fn truncate(&mut self, len: usize) {
+        self.vec.truncate(len);
+    }
+
+    /// Drop every element.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.vec.clear();
+    }
+
+    /// Insert `value` at `index`, shifting the rest right.
+    ///
+    /// # Panics
+    ///
+    /// If `index > len`.
+    #[inline]
+    #[track_caller]
+    pub fn insert(&mut self, index: usize, value: V) {
+        self.vec.insert(index, value);
+    }
+
+    /// Remove and return the element at `index`, shifting the rest left.
+    ///
+    /// # Panics
+    ///
+    /// If `index >= len`.
+    #[inline]
+    #[track_caller]
+    pub fn remove(&mut self, index: usize) -> V {
+        self.vec.remove(index)
+    }
+
+    /// Append every item of `iter`.
+    #[inline]
+    pub fn extend<I: IntoIterator<Item = V>>(&mut self, iter: I) {
+        self.vec.extend(iter);
+    }
+
+    /// Keep only the elements `keep` answers `true` for, in order.
+    #[inline]
+    pub fn retain<F: FnMut(&V) -> bool>(&mut self, keep: F) {
+        self.vec.retain(keep);
+    }
+
+    /// Replace the elements in `range` with `replacement`'s (`Vec::splice`,
+    /// the removed elements dropped).
+    ///
+    /// # Panics
+    ///
+    /// If `range` is out of bounds.
+    #[inline]
+    #[track_caller]
+    pub fn splice<R, I>(&mut self, range: R, replacement: I)
+    where
+        R: core::ops::RangeBounds<usize>,
+        I: IntoIterator<Item = V>,
+    {
+        let range = bounded_range(&range, self.len());
+        self.vec.splice(range, replacement);
+    }
+
+    /// Drop the elements in `range` (`Vec::drain`, the drained elements
+    /// dropped).
+    ///
+    /// # Panics
+    ///
+    /// If `range` is out of bounds.
+    #[inline]
+    #[track_caller]
+    pub fn drain<R: core::ops::RangeBounds<usize>>(&mut self, range: R) {
+        let range = bounded_range(&range, self.len());
+        self.vec.drain(range);
+    }
+
+    /// Grow to `new_len` with clones of `value`, or truncate to it.
+    #[inline]
+    pub fn resize(&mut self, new_len: usize, value: V)
+    where
+        V: Clone,
+    {
+        self.vec.resize(new_len, value);
+    }
+}
+
 impl<V> Deref for ArrayVecMut<'_, V> {
-    type Target = Vec<V>;
+    type Target = [V];
 
     #[inline]
-    fn deref(&self) -> &Vec<V> {
-        self.vec
+    fn deref(&self) -> &[V] {
+        &self.vec
     }
 }
 
 impl<V> DerefMut for ArrayVecMut<'_, V> {
     #[inline]
-    fn deref_mut(&mut self) -> &mut Vec<V> {
-        self.vec
+    fn deref_mut(&mut self) -> &mut [V] {
+        &mut self.vec
     }
 }
 
-/// Transparent, as [`ArrayOf`]'s is: the `Vec`'s elements.
+/// Transparent, as [`ArrayOf`]'s is: the elements.
 impl<V: core::fmt::Debug> core::fmt::Debug for ArrayVecMut<'_, V> {
     #[inline]
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        core::fmt::Debug::fmt(&**self.vec, f)
+        core::fmt::Debug::fmt(&**self, f)
     }
 }
 
@@ -2726,9 +2943,13 @@ impl<V: Teardown> Deref for ArrayOf<V> {
     #[allow(unsafe_code)] // the window's bounds check, on every array read (#6659)
     fn deref(&self) -> &[V] {
         // SAFETY: `start + len <= inner.len()` is the window's invariant
-        // (see `len`): every change to the `Vec`'s length restores it before
-        // the window can be read again.
-        unsafe { self.inner.get_unchecked(self.start..self.start + self.len) }
+        // (see `len`): every change to the storage's length restores it
+        // before the window can be read again.
+        unsafe {
+            self.inner
+                .as_slice()
+                .get_unchecked(self.start..self.start + self.len)
+        }
     }
 }
 
@@ -2744,7 +2965,11 @@ impl<V: Teardown + Clone> DerefMut for ArrayOf<V> {
     fn deref_mut(&mut self) -> &mut [V] {
         self.own_storage();
         let (start, len) = (self.start, self.len);
-        let vec = Rc::get_mut(&mut self.inner).expect("own_storage leaves this handle unique");
+        let vec = self
+            .inner
+            .get_mut()
+            .expect("own_storage leaves this handle unique")
+            .into_mut_slice();
         // SAFETY: as `Deref`'s.
         unsafe { vec.get_unchecked_mut(start..start + len) }
     }
@@ -2753,12 +2978,7 @@ impl<V: Teardown + Clone> DerefMut for ArrayOf<V> {
 impl<V: Teardown> From<Vec<V>> for ArrayOf<V> {
     #[inline]
     fn from(inner: Vec<V>) -> Self {
-        let len = inner.len();
-        Self {
-            inner: ManuallyDrop::new(Rc::new(inner)),
-            start: 0,
-            len,
-        }
+        Self::from_block(array_block::Block::from_vec(inner))
     }
 }
 
@@ -2781,7 +3001,7 @@ impl<V: Teardown + Clone> From<ArrayOf<V>> for Vec<V> {
 /// down as well.
 ///
 /// Within the limit the level wraps the release of the `Rc` itself, so the
-/// elements are dropped by `Rc::drop_slow` -- the one out-of-line call per
+/// elements are dropped by the block's `drop_slow` -- the one out-of-line call per
 /// array that drop glue made before #5782 -- and no loop over them is
 /// inlined into `OwnedValue`'s drop glue. Clearing the `Vec` here instead
 /// (#5815) inlined that loop, which made the glue save 10 registers on every
@@ -2792,7 +3012,7 @@ impl<V: Teardown> Drop for ArrayOf<V> {
     fn drop(&mut self) {
         // Releasing the last handle (no `Weak` is ever made) drops the
         // elements: the only release that can recurse.
-        if V::ITERATIVE && Rc::strong_count(&self.inner) == 1 && !self.inner.is_empty() {
+        if V::ITERATIVE && self.inner.strong_count() == 1 && !self.inner.is_empty() {
             #[cfg(feature = "std")]
             {
                 if let Some(_level) = drop_depth::enter() {
@@ -2804,7 +3024,7 @@ impl<V: Teardown> Drop for ArrayOf<V> {
                 self.tear_down_cold();
             }
             #[cfg(not(feature = "std"))]
-            if self.inner.iter().any(V::is_nonempty_container) {
+            if self.inner.as_slice().iter().any(V::is_nonempty_container) {
                 self.tear_down_cold();
             }
         }
@@ -2921,7 +3141,19 @@ impl<V: Teardown + PartialEq> PartialEq<ArrayOf<V>> for Vec<V> {
 impl<V: Teardown> FromIterator<V> for ArrayOf<V> {
     #[inline]
     fn from_iter<I: IntoIterator<Item = V>>(iter: I) -> Self {
-        Self::from(Vec::from_iter(iter))
+        let iter = iter.into_iter();
+        match iter.size_hint() {
+            // A known length is built in its block directly.
+            (lower, Some(upper)) if lower == upper => {
+                let mut block = array_block::Block::with_capacity(lower);
+                block
+                    .get_mut()
+                    .expect("a new block has one handle")
+                    .extend(iter);
+                Self::from_block(block)
+            }
+            _ => Self::from(Vec::from_iter(iter)),
+        }
     }
 }
 
@@ -2934,7 +3166,9 @@ impl<V: Teardown + Clone> Extend<V> for ArrayOf<V> {
         // never compacts the head, which `make_vec` would on every round.
         self.own_storage();
         let Self { inner, start, len } = self;
-        let vec = Rc::get_mut(inner).expect("own_storage leaves this handle unique");
+        let mut vec = inner
+            .get_mut()
+            .expect("own_storage leaves this handle unique");
         let (offset, kept) = (*start, *len);
         // Zeroed while the tail past the window is dropped and while `iter`
         // runs (see `len`'s invariant); `offset <= vec.len()` throughout.
@@ -2946,14 +3180,16 @@ impl<V: Teardown + Clone> Extend<V> for ArrayOf<V> {
 }
 
 /// By-value iteration over an [`ArrayOf`]; see [`ObjectMapIntoIter`].
-pub enum ArrayIntoIter<V> {
-    /// This handle owned the array outright.
-    Owned(alloc::vec::IntoIter<V>),
+pub struct ArrayIntoIter<V>(ArrayIntoIterRepr<V>);
+
+enum ArrayIntoIterRepr<V> {
+    /// This handle owned the array outright: the elements move out.
+    Owned(array_block::BlockIntoIter<V>),
     /// Another handle still shares the array; the elements in `next..end`
     /// are cloned out, from either end.
     Shared {
         /// The array every remaining element is cloned from.
-        vec: Rc<Vec<V>>,
+        block: array_block::Block<V>,
         /// Index of the next element from the front.
         next: usize,
         /// One past the next element from the back.
@@ -2966,13 +3202,13 @@ impl<V: Clone> Iterator for ArrayIntoIter<V> {
 
     #[inline]
     fn next(&mut self) -> Option<V> {
-        match self {
-            Self::Owned(iter) => iter.next(),
-            Self::Shared { vec, next, end } => {
+        match &mut self.0 {
+            ArrayIntoIterRepr::Owned(iter) => iter.next(),
+            ArrayIntoIterRepr::Shared { block, next, end } => {
                 if next >= end {
                     return None;
                 }
-                let v = vec.get(*next)?;
+                let v = block.as_slice().get(*next)?;
                 *next += 1;
                 Some(v.clone())
             }
@@ -2981,9 +3217,9 @@ impl<V: Clone> Iterator for ArrayIntoIter<V> {
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        match self {
-            Self::Owned(iter) => iter.size_hint(),
-            Self::Shared { next, end, .. } => {
+        match &self.0 {
+            ArrayIntoIterRepr::Owned(iter) => iter.size_hint(),
+            ArrayIntoIterRepr::Shared { next, end, .. } => {
                 let n = end - next;
                 (n, Some(n))
             }
@@ -2994,14 +3230,14 @@ impl<V: Clone> Iterator for ArrayIntoIter<V> {
 impl<V: Clone> DoubleEndedIterator for ArrayIntoIter<V> {
     #[inline]
     fn next_back(&mut self) -> Option<V> {
-        match self {
-            Self::Owned(iter) => iter.next_back(),
-            Self::Shared { vec, next, end } => {
+        match &mut self.0 {
+            ArrayIntoIterRepr::Owned(iter) => iter.next_back(),
+            ArrayIntoIterRepr::Shared { block, next, end } => {
                 if next >= end {
                     return None;
                 }
                 *end -= 1;
-                vec.get(*end).cloned()
+                block.as_slice().get(*end).cloned()
             }
         }
     }
@@ -3016,30 +3252,20 @@ impl<V: Teardown + Clone> IntoIterator for ArrayOf<V> {
     #[inline]
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     fn into_iter(self) -> Self::IntoIter {
-        let mut this = self;
-        let window = this.start..this.start + this.len;
-        match this.unique_parts() {
-            Some((vec, start, len)) => {
-                *start = 0;
-                *len = 0;
-                let mut vec = core::mem::take(vec);
-                vec.truncate(window.end);
-                let mut iter = vec.into_iter();
-                if window.start > 0 {
-                    // Drops the elements before the window, in order.
-                    iter.nth(window.start - 1);
+        let (block, window) = self.into_block();
+        ArrayIntoIter(
+            match array_block::BlockIntoIter::new(block, window.clone()) {
+                Ok(iter) => ArrayIntoIterRepr::Owned(iter),
+                Err(block) => {
+                    note_forced_copy!(ArrayUnwrap);
+                    ArrayIntoIterRepr::Shared {
+                        block,
+                        next: window.start,
+                        end: window.end,
+                    }
                 }
-                ArrayIntoIter::Owned(iter)
-            }
-            None => {
-                note_forced_copy!(ArrayUnwrap);
-                ArrayIntoIter::Shared {
-                    vec: Rc::clone(&this.inner),
-                    next: window.start,
-                    end: window.end,
-                }
-            }
-        }
+            },
+        )
     }
 }
 
@@ -7506,18 +7732,17 @@ mod tests {
         assert!(sized.make_vec().capacity() >= 8);
     }
 
-    /// `as_array` hands out the elements and `as_array_mut` a guard that
-    /// derefs to the array's own `Vec` (#2999's public-API promise, narrowed
-    /// by #6659's window: the read side is a slice now, and the write side
-    /// still pushes like a `Vec`).
+    /// `as_array` hands out the elements and `as_array_mut` a guard with the
+    /// `Vec` methods an array write needs (#2999's public-API promise,
+    /// narrowed by #6659's window to a slice on the read side, and by #7260's
+    /// one-block storage to `Vec`-like methods on the write side).
     #[test]
     fn as_array_accessors_hand_out_the_elements_and_the_vec_6659() {
         let mut value = OwnedValue::array_from(vec![OwnedValue::Int(1)]);
         let read: &[OwnedValue] = value.as_array().unwrap();
         assert_eq!(read.len(), 1);
         let mut write = value.as_array_mut().unwrap();
-        let vec: &mut Vec<OwnedValue> = &mut write;
-        vec.push(OwnedValue::Int(2));
+        write.push(OwnedValue::Int(2));
         drop(write);
         assert_eq!(value.as_array().unwrap().len(), 2);
         assert!(OwnedValue::Null.as_array().is_none());
@@ -12496,6 +12721,7 @@ mod tests {
 #[cfg(test)]
 mod array_window_tests_6659 {
     use super::*;
+    use alloc::rc::Rc;
     use alloc::vec;
     use core::cell::Cell;
 
@@ -12581,10 +12807,10 @@ mod array_window_tests_6659 {
     fn a_write_through_a_unique_window_stays_in_place() {
         let mut a = ints(0..5);
         a.cut(1..4);
-        let storage = Rc::as_ptr(&a.inner);
+        let storage = a.inner.as_ptr();
         a[0] = OwnedValue::Int(-1);
         assert_eq!(values(&a), [-1, 2, 3]);
-        assert_eq!(Rc::as_ptr(&a.inner), storage);
+        assert_eq!(a.inner.as_ptr(), storage);
         assert_eq!((a.start, a.len), (1, 3));
     }
 
@@ -12616,28 +12842,31 @@ mod array_window_tests_6659 {
     fn a_fold_of_unique_cuts_moves_its_offset_as_jq_does() {
         let len = JQ_SLICE_OFFSET_LIMIT as i64 + 4_464;
         let mut a = ints(0..len);
-        let storage = Rc::as_ptr(&a.inner);
         let mut compactions = 0;
-        while a.len() > 10 {
-            a.cut(1..a.len());
-            // Never more than jq's 16-bit offset of cut-off elements kept alive, and the tail
-            // past the window is dropped at once.
-            assert!(a.start < JQ_SLICE_OFFSET_LIMIT);
-            assert_eq!(a.inner.len(), a.start + a.len());
-            if a.start == 0 {
-                compactions += 1;
+        // The storage is never copied out (a forced copy is recorded); a
+        // compaction moves elements within it, and may give back the
+        // allocation's tail (#7260: the block itself can move then).
+        let ((), copies) = crate::jq::share_stats::measure(|| {
+            while a.len() > 10 {
+                a.cut(1..a.len());
+                // Never more than jq's 16-bit offset of cut-off elements kept alive, and the tail
+                // past the window is dropped at once.
+                assert!(a.start < JQ_SLICE_OFFSET_LIMIT);
+                assert_eq!(a.inner.len(), a.start + a.len());
+                if a.start == 0 {
+                    compactions += 1;
+                }
             }
-        }
+        });
+        assert!(
+            copies.is_empty(),
+            "compacted in place, not copied: {copies:?}"
+        );
         assert_eq!(values(&a), (len - 10..len).collect::<Vec<_>>());
         // One compaction, where jq's offset reached 65,536 and `jvp_array_slice` copied; after
         // it the offset counts from 0 again, as the copy's does.
         assert_eq!(compactions, 1);
         assert_eq!(a.start, len as usize - 10 - JQ_SLICE_OFFSET_LIMIT);
-        assert_eq!(
-            Rc::as_ptr(&a.inner),
-            storage,
-            "compacted in place, not copied"
-        );
         // Cutting to nothing gives a fresh `[]`.
         a.cut(3..3);
         assert!(a.is_empty() && a.inner.is_empty());
@@ -12647,7 +12876,8 @@ mod array_window_tests_6659 {
     fn an_append_to_a_unique_window_keeps_its_offset() {
         let mut a = ints(0..6);
         a.cut(2..3);
-        let storage = Rc::as_ptr(&a.inner);
+        // Within the block's capacity, so the block does not move either.
+        let storage = a.inner.as_ptr();
         a.push(OwnedValue::Int(9));
         a.extend([OwnedValue::Int(10), OwnedValue::Int(11)]);
         assert_eq!(values(&a), [2, 9, 10, 11]);
@@ -12656,15 +12886,18 @@ mod array_window_tests_6659 {
             (2, 4),
             "`jvp_array_write` appends to the view in place"
         );
-        assert_eq!(Rc::as_ptr(&a.inner), storage);
-        // A queue (peel the front, push the back) never compacts before jq's offset limit.
-        for i in 0..1_000 {
-            a.cut(1..a.len());
-            a.push(OwnedValue::Int(100 + i));
-        }
+        assert_eq!(a.inner.as_ptr(), storage);
+        // A queue (peel the front, push the back) never compacts before jq's offset limit,
+        // and never copies the storage out (growing it may move the block).
+        let ((), copies) = crate::jq::share_stats::measure(|| {
+            for i in 0..1_000 {
+                a.cut(1..a.len());
+                a.push(OwnedValue::Int(100 + i));
+            }
+        });
+        assert!(copies.is_empty(), "{copies:?}");
         assert_eq!(a.len(), 4);
         assert_eq!(a.start, 1_002);
-        assert_eq!(Rc::as_ptr(&a.inner), storage);
         // An append to a shared window copies the window out and leaves the other handle alone.
         let b = a.clone();
         a.push(OwnedValue::Int(-1));
