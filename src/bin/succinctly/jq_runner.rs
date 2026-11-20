@@ -12286,6 +12286,9 @@ fn hand_on_seq_files_tail(args: &JqCommand, past_open_failure: bool) -> bool {
         return false;
     };
     crate::cli::jq_seq_reader::seed_token_byte(tail.token_byte);
+    // #7404: an RS the file's gate handed its rest on at, met with a value pending, is placed in the
+    // stream of every source handed on, which jq's reader reads as one.
+    crate::cli::jq_seq_reader::seed_faulted_rs(None);
     let named = get_input_files(args);
     let (mut files, mut raws) = (Vec::new(), Vec::new());
     if tail.lines > 0 {
@@ -12309,6 +12312,8 @@ fn hand_on_seq_files_tail(args: &JqCommand, past_open_failure: bool) -> bool {
                 failures.push((front + 1, InputFileOpenError::from_io(path, error, last)));
             }
             // patchcov: coverage end
+            let before: usize = raws.iter().map(Vec::len).sum();
+            crate::cli::jq_seq_reader::seed_faulted_rs(rest.faulted_rs.map(|at| before + at));
             files.push(path.clone());
             raws.push(rest.stream);
             tail.index + 1

@@ -269,3 +269,46 @@ fn a_seq_file_whose_stretch_ends_at_its_last_rs_reads_on_to_its_end_7260() -> Re
     }
     Ok(())
 }
+
+/// #7404: the same tails at the end of the last file of a `--seq` list of 4 MiB or more between them,
+/// whose own gate hands the rest of the file on at that RS: the list's tail is read as jq's reader reads
+/// the files as one stream, on past the RS to the end. jq 1.7.1's output.
+#[test]
+fn a_seq_list_whose_last_file_ends_a_stretch_at_its_last_rs_reads_on_to_its_end_7404() -> Result<()>
+{
+    let truncated = |line: usize| {
+        format!("jq: ignoring parse error: Truncated value at line {line}, column 1\n")
+    };
+    let at_eof = |line: usize, column: usize| {
+        format!("jq: ignoring parse error: Potentially truncated top-level numeric value at EOF at line {line}, column {column}\n")
+    };
+    let dir = tempfile::tempdir()?;
+    let first = dir.path().join("a.seq");
+    let plain = records(0..46_000);
+    assert!(plain.len() > 4 << 20);
+    std::fs::write(&first, plain)?;
+    let rows: [(&str, &str, String); 3] = [
+        (
+            "\x1e{\"\\\n\x1enan",
+            "",
+            truncated(46012) + &at_eof(46012, 4),
+        ),
+        (
+            "\x1e{\"\\\n\x1e\x1e7",
+            "",
+            truncated(46012) + &at_eof(46012, 3),
+        ),
+        (
+            "\x1e1 2\n\x1e{\"\\\n\x1e1",
+            "\x1e1\n\x1e2\n",
+            truncated(46013) + &at_eof(46013, 2),
+        ),
+    ];
+    for (tail, out, err) in rows {
+        let last = dir.path().join("b.seq");
+        std::fs::write(&last, format!("{}{tail}", records(0..10)))?;
+        let output = command(ODD).arg(&first).arg(&last).output()?;
+        assert_eq!(shown(&output, None), (out.to_string(), err, 0), "{tail:?}");
+    }
+    Ok(())
+}

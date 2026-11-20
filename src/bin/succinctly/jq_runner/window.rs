@@ -1363,11 +1363,16 @@ pub(super) struct SeqFront {
     pub stream: Vec<u8>,
     /// The failure of a read of the file, which ended it there.
     pub error: Option<io::Error>,
+    /// Where in `stream` the RS it opens with is, when jq's reader met it with a value pending
+    /// ([`SeqTail::faulted_rs`], #7404).
+    pub faulted_rs: Option<usize>,
 }
 
 impl PartialEq for SeqFront {
     fn eq(&self, other: &Self) -> bool {
-        self.stream == other.stream && self.error.is_some() == other.error.is_some()
+        self.stream == other.stream
+            && self.error.is_some() == other.error.is_some()
+            && self.faulted_rs == other.faulted_rs
     }
 }
 
@@ -2514,6 +2519,7 @@ impl WindowedFiles {
                                     front: Some(SeqFront {
                                         stream: tail.stream,
                                         error: tail.error,
+                                        faulted_rs: tail.faulted_rs,
                                     }),
                                 });
                                 self.pending = Vec::new().into_iter();
@@ -5689,6 +5695,7 @@ mod stream_tests {
                     front: Some(SeqFront {
                         stream: crate::cli::jq_seq_reader::resumed_stream(1, rest),
                         error: None,
+                        faulted_rs: None,
                     }),
                 }),
                 "{name}"
