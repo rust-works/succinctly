@@ -1917,7 +1917,9 @@ impl WindowedFile {
                 _ => 0,
             }
         };
-        let mut bytes = crate::cli::jq_seq_reader::resumed_front(lines, self.buf.len() - at + left);
+        let pre_read: usize = self.pre_read.iter().map(Vec::len).sum();
+        let mut bytes =
+            crate::cli::jq_seq_reader::resumed_front(lines, self.buf.len() - at + pre_read + left);
         #[cfg(test)]
         let (reserved_at, reserved_room) = (bytes.as_ptr() as usize, bytes.capacity());
         // #7260: a warning met at the RS the tail opens with is a stretch's, which ended there.
@@ -1925,6 +1927,10 @@ impl WindowedFile {
             && self.notes.iter().any(|&(met, _)| met == at))
         .then_some(bytes.len());
         bytes.extend_from_slice(&self.buf[at..]);
+        // #7260: the blocks of a pipe's probe not read yet come before the rest of the pipe.
+        for block in self.pre_read.drain(..) {
+            bytes.extend_from_slice(&block);
+        }
         // The windows' buffer keeps only the text still to be handed out, so the run does not hold its
         // room beside the tail.
         self.buf.truncate(at);
@@ -2605,10 +2611,24 @@ impl WindowedFiles {
         block: usize,
         slot: SeqTailSlot,
     ) -> Self {
+        Self::seq_pipe_blocks(file, std::collections::VecDeque::from([front]), block, slot)
+    }
+
+    /// [`Self::seq_pipe`] from a probe read in blocks (#7260): the first is the front, and the rest are
+    /// read before the pipe is ([`WindowedFile::pre_read`]).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(super) fn seq_pipe_blocks(
+        file: Rc<File>,
+        mut blocks: std::collections::VecDeque<Vec<u8>>,
+        block: usize,
+        slot: SeqTailSlot,
+    ) -> Self {
+        let front = blocks.pop_front().unwrap_or_default();
         let mut this = Self::new(Vec::new(), block);
         this.count = 1;
         this.next_index = 1;
-        this.current = Some(WindowedFile::from_seq_pipe(file, front, block, slot));
+        this.current =
+            Some(WindowedFile::from_seq_pipe(file, front, block, slot).then_reads(blocks));
         this
     }
 
@@ -3969,20 +3989,28 @@ mod tests {
         let want = whole(&text);
         // A pipe's probe holds the front of the stream before the first window: none of
         // it, half of it and all of it.
-        for (block, probe) in blocks
-            .iter()
-            .flat_map(|&block| [0, stream.len() / 2, stream.len()].map(|p| (block, p)))
-        {
+        // #7260: and the probe read in blocks, each read before the pipe.
+        for (block, probe, split) in blocks.iter().flat_map(|&block| {
+            [0, stream.len() / 2, stream.len()]
+                .into_iter()
+                .flat_map(move |p| [(block, p, false), (block, p, true)])
+        }) {
             let mut file = tempfile::tempfile().expect("a temp file");
             file.write_all(&stream[probe..]).expect("written");
             file.rewind().expect("rewound");
             let slot = SeqTailSlot::default();
-            let mut reader = WindowedFile::from_seq_pipe(
-                Rc::new(file),
-                stream[..probe].to_vec(),
-                block,
-                Rc::clone(&slot),
-            );
+            let mut read: std::collections::VecDeque<Vec<u8>> = if split {
+                stream[..probe]
+                    .chunks(block.max(1))
+                    .map(<[u8]>::to_vec)
+                    .collect()
+            } else {
+                std::collections::VecDeque::from([stream[..probe].to_vec()])
+            };
+            let front = read.pop_front().unwrap_or_default();
+            let mut reader =
+                WindowedFile::from_seq_pipe(Rc::new(file), front, block, Rc::clone(&slot))
+                    .then_reads(read);
             let (mut spans, mut lines, mut notes) = (Vec::new(), Vec::new(), Vec::new());
             // What a run shows, in its order: each warning before the first value that
             // starts after it.
@@ -4010,7 +4038,7 @@ mod tests {
                 assert_eq!(window.split_error, None);
             }
             let case = format!(
-                "{:?} ({} bytes), block {block}, probe {probe}",
+                "{:?} ({} bytes), block {block}, probe {probe}, in blocks {split}",
                 String::from_utf8_lossy(&stream[..stream.len().min(300)]),
                 stream.len()
             );

@@ -12311,14 +12311,18 @@ fn windowed_seq_pipe() -> Option<WindowedSource> {
     if !(kind.is_fifo() || kind.is_socket()) {
         return None;
     }
-    let front = probe_stdin_pipe(&file, window::min_windowed_file_bytes())?;
+    let blocks = probe_stdin_pipe_blocks(
+        &file,
+        window::min_windowed_file_bytes(),
+        window::window_bytes(),
+    )?;
     let slot = window::SeqTailSlot::default();
     SEQ_PIPE_TAIL.with(|tail| *tail.borrow_mut() = Some(std::rc::Rc::clone(&slot)));
     Some((
         Vec::new(),
-        window::WindowedFiles::seq_pipe(
+        window::WindowedFiles::seq_pipe_blocks(
             std::rc::Rc::new(file),
-            front,
+            blocks,
             window::window_bytes(),
             slot,
         ),
