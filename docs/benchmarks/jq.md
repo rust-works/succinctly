@@ -1527,8 +1527,30 @@ These summarise the hand-written tables above, which predate #5409's interleavin
 **Both platforms show similar memory characteristics**:
 - **Dramatically lower memory usage** on large files (1MB+)
 - **3-17x less memory** on larger files: pathological (0.06x), comprehensive (0.09x), mixed (0.10x)
-- **Slightly higher on small files**: 1-2x overhead due to minimum index size (~4-7 MB baseline)
+- **Slightly higher on small files and streams**: a fixed 0.2-2.6 MB over jq, mostly the pages of our own binary (see below)
 - **Streaming output**: Uses lazy cursor evaluation - only materializes values when needed
+
+#### Where succinctly jq still holds more memory than jq ([#7412](https://github.com/rust-works/succinctly/issues/7412))
+
+In the last `succinctly dev compare jq --full --huge` run for #7412 (main `7b7ca8880`, 231 output-gated rows), succinctly jq's peak RSS is above jq 1.7.1's on 86 rows on an AMD Ryzen 9 7950X and on 76 rows on an Apple M4 Pro.
+The geomean of the memory ratio is 0.616 and 0.547; jq is faster on none of the rows.
+The gaps that remain are accepted, for these reasons:
+
+- **The binary's own pages.** Apart from `comprehensive_tostream`, every row above jq is over by at most 2.6 MB (7950X) or 2.0 MB (M4), and its private memory by at most 0.51 MiB (7950X) or 0.63 MiB (M4).
+  The rest is file-backed pages of a 22 MB binary that the process touches (0.9-2.1 MiB on the 7950X, 0.6-1.4 MiB on the M4), against jq's 0.4 MB one.
+  Link order (#7397, #7417) and releasing the relocation tables' pages after start-up (#7417, Linux) already cut it.
+  Not taken:
+  - packed (RELR) relocations, which need glibc 2.36;
+  - a non-PIE build, which gives up ASLR;
+  - ordering `.rodata`, which has no symbols to order by;
+  - a static libgcc, since std's unwinder needs `libgcc_s`;
+  - shrinking `.data.rel.ro`, a large refactor.
+- **Stream windows.** The `ndjson_*`, `seq_*` and `users_stream` rows hold 1.0-1.35 MiB private against jq's 0.84 MiB, whatever the input size.
+  Most of it is the 256 KiB input window and what is built over it (#7415).
+  128 KiB windows were measured and rejected: the M4 was 5% slower on those rows.
+- **`comprehensive_tostream`.** At 10 MB it is 375 MB against jq's 367 on the 7950X and 408 MB against 371 on the M4.
+  Every element of every event's path is a 32-byte `OwnedValue`, where jq's `jv` is 16 bytes.
+  Shrinking the value type would touch every evaluator path, for one row.
 
 ### Why succinctly is faster
 
