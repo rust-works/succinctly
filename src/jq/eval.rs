@@ -43,7 +43,7 @@ use super::array_index;
 use super::document::{
     effective_fields, effective_fields_checked, effective_fields_checked_iter, effective_keys,
     effective_len_checked, key_display_string, key_display_string_kind, tail_gap_ok,
-    DisplayKeyGuard, DocumentCursor, DocumentElements, DocumentFields, EffectiveFields,
+    DisplayKeyGuard, DocumentCursor, DocumentElements, DocumentFields,
 };
 use super::glob::yq_match_key;
 use super::key_index;
@@ -22080,16 +22080,10 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             //
             // #7260: jq mode walks the fields without `effective_fields_checked`'s list, which on a
             // wide object was half this builtin's peak (`effective_fields_checked_iter`); yq mode
-            // indexes the list below, so it keeps it.
-            let checked = if S::COLLAPSE_DUPLICATE_KEYS {
-                effective_fields_checked_iter(&fields, true)
-            } else {
-                effective_fields_checked(&fields, false).map(EffectiveFields::listed)
-            };
-            let checked = match checked {
-                Ok(f) => f,
-                Err(e) => return QueryResult::Error(e),
-            };
+            // indexes the list below, so it keeps it, as the `Vec` itself (#7406: wrapped in the
+            // walk's iterator and collected back, the list was copied, both copies live at once).
+            // Each mode's check runs below, before `f` runs on any field.
+            //
             // `f` on one value: the first output, none, or the control to surface (object construction
             // is atomic in jq -- see `eval_object_construction` -- so a `Partial` surfaces its control).
             let rewrite =
@@ -22139,6 +22133,10 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     }
                 };
             if S::COLLAPSE_DUPLICATE_KEYS {
+                let checked = match effective_fields_checked_iter(&fields, true) {
+                    Ok(walk) => walk,
+                    Err(e) => return QueryResult::Error(e),
+                };
                 // `checked` is already collapsed: one pass, each key checked as it is inserted.
                 let mut result_map = FieldMap::with_capacity(checked.len());
                 let mut guard = DisplayKeyGuard::default();
@@ -22163,7 +22161,10 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 return QueryResult::Owned(OwnedValue::Object(result_map.into()));
             }
 
-            let checked: Vec<_> = checked.collect();
+            let checked = match effective_fields_checked(&fields, false) {
+                Ok(list) => list,
+                Err(e) => return QueryResult::Error(e),
+            };
             // The display key of every field, then which occurrence of each key is its live (last)
             // one. yq's `map_values` rewrites that entry and leaves a repeated key's earlier entries
             // as they were (ADR-0027, #1344); jq mode's `checked` is already collapsed, so every
