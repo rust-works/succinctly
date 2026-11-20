@@ -116,9 +116,19 @@ class Resolve(unittest.TestCase):
     def test_every_copy_is_ordered_once_and_missing_names_are_counted(self):
         mangled = ["_RNv1a", "_RNv1a.llvm.9", "_RNv1b", "_RNv1c"]
         table = link.demangled_to_mangled(mangled, ["a::f", "a::f", "a::g", "a::h"])
-        order, missing = link.resolve(["a::g", "gone::x", "a::f", "a::g"], table)
+        order, missing = link.resolve(["a::g", "gone::x", "a::f", "a::g"], table, "darwin")
         self.assertEqual(order, ["_RNv1b", "_RNv1a", "_RNv1a.llvm.9"])
         self.assertEqual(missing, 1)
+
+    def test_linux_orders_the_c_runtime_start_up_code_first_7412(self):
+        # `_start` and crtbeginS.o's functions are in no Rust object, so they are passed by name.
+        table = link.demangled_to_mangled(["_RNv1a", "main"], ["a::f", "main"])
+        order, missing = link.resolve(["_start", "main", "a::f"], table, "linux")
+        self.assertEqual(order, link.CRT_STARTUP + ["main", "_RNv1a"])
+        self.assertEqual(order[0], "_start")
+        self.assertEqual(missing, 0)
+        order, _ = link.resolve(["_start", "main"], table, "darwin")
+        self.assertEqual(order, ["main"])
 
     def test_comments_and_blank_lines_are_not_names(self):
         with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:

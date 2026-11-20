@@ -152,8 +152,22 @@ def read_list(path):
         return [line.rstrip("\n") for line in f if line.strip() and not line.startswith("#")]
 
 
+# The C runtime's own start-up and exit code, which the `cc` driver links in from `Scrt1.o` and
+# `crtbeginS.o`: `_start` runs first in every process, `frame_dummy` from `.init_array` and
+# `__do_global_dtors_aux` at exit (#7412). No Rust object defines them, so they cannot be looked up
+# like the rest of the list, and lld is given them by name. Left unordered they sit wherever the
+# driver's objects fall, 2 MB past the ordered block, and the page they share kept a large folio of
+# text resident in every run: 256 KB of `succinctly jq -n 1`'s RSS on a Ryzen 9 7950X (Linux 6.18).
+CRT_STARTUP = ["_start", "frame_dummy", "register_tm_clones", "deregister_tm_clones",
+               "__do_global_dtors_aux"]
+
+
 def resolve(names, table, platform=sys.platform):
     out, seen, missing = [], set(), 0
+    if platform.startswith("linux"):
+        # Before the Rust functions: `_start` is the first code a process runs.
+        out, seen = list(CRT_STARTUP), set(CRT_STARTUP)
+        names = [n for n in names if n not in seen]
     for n in names:
         ms = table.get(norm(n))
         if not ms:
