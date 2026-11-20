@@ -112,8 +112,10 @@ libm = "0.2"
 memmap2 = { version = "0.9", optional = true }
 tempfile = { version = "3.10", optional = true }
 serde = { version = "1.0", default-features = false, features = ["alloc", "derive"], optional = true }
-regex = { version = "1.10", optional = true }
-regex-syntax = { version = "0.8", optional = true }
+# regex-syntax 0.8.12 (with regex 1.13.2) keeps a prefix that can match more than one way in each
+# branch of an alternation (rust-lang/regex#1400); jq's leftmost-first match depends on it (#6149).
+regex = { version = "1.13.2", optional = true }
+regex-syntax = { version = "0.8.12", optional = true }
 fancy-regex = { version = "0.20", optional = true, features = ["leftmost_longest"] }
 
 # CLI dependencies (optional, only for binary)

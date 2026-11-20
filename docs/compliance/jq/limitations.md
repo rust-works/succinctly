@@ -8347,7 +8347,7 @@ These keep their loop as written, and still match longer than jq where the shape
   A give-up that no lazy repeat is around, or one past 16 readings, still moves the whole pattern to its next reading.
   Five draws of 4,000 with two lazy repeats beside, in alternation with or nested in each other (`scripts/jq-regex-capture-loop-sweep.py --paired`, one of them under `gi`) fixed 6 to 11 patterns each and broke none, and the `--ways` and `--bounded` draws of #6427 (seeds 3-6) broke none.
   117 to 138 of each `--paired` draw still differ from jq; they were not classified.
-  The rewritten pattern is compiled through `guard_prefix_lifting` ([#6134](#an-alternations-branches-share-a-prefix-that-can-match-more-than-one-way-6134)) like any other: a nested loop writes alternations whose branches share a prefix, and the crate would factor it.
+  A nested loop writes alternations whose branches share a prefix that can match more than one way, which `regex-syntax` keeps in each branch since 0.8.12 ([#6134](#an-alternations-branches-share-a-prefix-that-can-match-more-than-one-way-6134)).
   Over five draws of 5,000 generated loops with `--nest` (one of them under the flags `gi`), 212 to 239 patterns that differed from jq agree and none changed the other way; 17 of the 256 on the first draw still differ.
   Seven draws of 4,000 with loops beside other items in the ways of an outer repeat (`scripts/jq-regex-capture-loop-sweep.py --ways`, one of them under `gi`) fixed 565 to 642 and broke none, and 78 to 112 of each still differed then (the lazy bounded repeat, since written out, and the assertion cases below among them).
   Over two draws of 5,000 generated loops (bodies of two or three ways drawn from 19 atoms, 13 quantifiers, ten strings under `g`), 236 and 236 patterns that differed from jq agree and none changed the other way.
@@ -8468,15 +8468,14 @@ These keep their loop as written, and still match longer than jq where the shape
 
 ## An alternation's branches share a prefix that can match more than one way (#6134)
 
-`regex-syntax` 0.8.11 factors a prefix that every branch of an alternation starts with out of it, `XA|XB` becoming `X(?:A|B)`, which changes the leftmost-first match when `X` can match more than one way ([rust-lang/regex#1400](https://github.com/rust-lang/regex/issues/1400)).
+`regex-syntax` 0.8.11 and earlier factor a prefix that every branch of an alternation starts with out of it, `XA|XB` becoming `X(?:A|B)`, which changes the leftmost-first match when `X` can match more than one way ([rust-lang/regex#1400](https://github.com/rust-lang/regex/issues/1400)).
 `"aab" | match("a*a|a*b")` is `"aa"` in jq 1.7.1 (and in yq v4.53.3) and was `"aab"` here, and the lazy `"aab" | match("(?:a*a|a*b)+?")` went on to `"aab"` too.
 `fancy-regex` hands the alternations it does not run itself to the same constructor, so lookaround and backreference patterns matched the same way.
 Both modes now answer as the reference does.
-An alternation whose branches are all sequences holding a repeat or another alternation gets a first branch that never matches (`[^\s\S]`, with the first branch's leading and trailing assertions so that the alternation keeps its anchoring), and the factoring stops at it (`guard_prefix_lifting` in `src/jq/eval.rs`).
+`regex-syntax` 0.8.12 lifts only a prefix of literals, classes and assertions, each of which matches one way ([rust-lang/regex#1401](https://github.com/rust-lang/regex/pull/1401)), and `succinctly` requires it since [#6149](https://github.com/rust-works/succinctly/issues/6149).
+Before that, #6134 gave each alternation the factoring could get wrong a first branch that never matched (`[^\s\S]`), which stopped the factoring; #6149 removed it, together with the shapes it left factored: a pattern it could not read (a `(?#...)` comment that crosses a line, so `"aab" | match("(?#a\nb)a*a|a*b")` gave `"aab"`), and one whose guarded form the crate refused for its size.
 A differential against jq 1.7.1 over 80,000 generated cases found 882 fixed, 182 still differing for other reasons, and 11 that agreed before and now differ.
 Each of the 11 is a loop whose body can match nothing and holds a capture group, the first bullet of [#6106](#a-loop-ends-at-an-iteration-that-matches-nothing-6106)'s list: the factoring had cancelled that difference out.
-
-A pattern whose guarded form the `regex` crate refuses for its size, where the pattern as written fits, compiles as written and keeps the factored match.
 
 ## `$` before a final newline (#5572)
 

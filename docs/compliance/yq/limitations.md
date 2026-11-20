@@ -2440,8 +2440,8 @@ jq mode keeps Oniguruma's own rules (see the jq limitations).
 ### A prefix shared by every branch of an alternation stays in each branch (#6134)
 
 Go's `regexp` factors only a simple prefix (a literal, a class) out of an alternation, so `.s | match("a*a|a*b")` on `s: aab` is `"aa"` in yq v4.53.3.
-The `regex` crate's parser also factored out a prefix that can match more than one way, and the second branch's `"aab"` won; `succinctly yq` now answers `"aa"` too.
-The mechanism, shared with jq mode, and the one shape it leaves (a pattern whose guarded form the `regex` crate refuses for its size) are in the jq limitations' #6134 entry.
+The `regex` crate's parser (`regex-syntax` before 0.8.12) also factored out a prefix that can match more than one way, and the second branch's `"aab"` won; `succinctly yq` now answers `"aa"` too.
+The history, shared with jq mode, is in the jq limitations' #6134 entry.
 Pinned by `tests/yq_cli/i6134.rs`.
 
 ### Global regex zero-width-match iteration — resolved, real yq uses Go's `regexp`
