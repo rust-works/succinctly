@@ -6,14 +6,14 @@
 //! for the rest of the run, though, and is counted in the process's RSS: 0.42 MB of the 4-5 MB a
 //! `succinctly jq` run with a small input peaks at, where jq 1.7.1's whole binary is 0.4 MB.
 //!
-//! [`release`] unmaps those pages with `MADV_DONTNEED`. They are clean pages of a private,
-//! read-only file mapping, which neither the loader nor anything else wrote, so the page cache
-//! still holds the same bytes and a later read (there is none in a normal run; a backtrace does
-//! not read relocations) faults them back in unchanged. Only whole pages inside a read-only
-//! loadable segment, outside RELRO, are touched: the relocated data itself (`.data.rel.ro`,
-//! `.got`) is in the writable segment and must never be, since dropping it would bring back the
-//! file's unrelocated bytes. An executable with text relocations is left alone, since the loader
-//! wrote its read-only pages.
+//! [`release`] unmaps those pages with `MADV_DONTNEED`. They are clean pages of a private file
+//! mapping that is not writable, which neither the loader nor anything else wrote, so the page
+//! cache still holds the same bytes and a later read (there is none in a normal run; a backtrace
+//! does not read relocations) faults them back in unchanged. Only whole pages of the tables inside
+//! a loadable segment without write permission, outside RELRO, are touched: the relocated data
+//! itself (`.data.rel.ro`, `.got`) is in the writable segment and must never be, since dropping it
+//! would bring back the file's unrelocated bytes. An executable with text relocations is left
+//! alone, since the loader wrote its unwritable pages.
 //!
 //! It runs once, first thing in `main`, before the evaluation thread exists: unmapping in a
 //! process with one thread needs no TLB shootdown on other cores.
@@ -62,7 +62,8 @@ pub(crate) mod imp {
 
     /// The page-aligned `(start, end)` ranges [`release`] unmaps: the relocation tables the dynamic
     /// section names, merged where they touch, cut to the whole pages each lies on, each inside a
-    /// read-only loadable segment and outside RELRO. Empty when the executable has no program
+    /// loadable segment that is not writable (lld gives the tables a read-only segment of their own;
+    /// GNU ld on aarch64 puts them in the one that also holds `.text`) and outside RELRO. Empty when the executable has no program
     /// headers to read, no dynamic section, or text relocations.
     pub(crate) fn ranges() -> Vec<(usize, usize)> {
         // SAFETY: `getauxval` only reads the auxiliary vector the kernel built for the process.
@@ -143,9 +144,9 @@ pub(crate) mod imp {
             let lo = bias.wrapping_add(p.p_vaddr as usize);
             (lo, lo.saturating_add(p.p_filesz as usize))
         };
-        let read_only: Vec<(usize, usize)> = phdrs
+        let unwritable: Vec<(usize, usize)> = phdrs
             .iter()
-            .filter(|p| p.p_type == libc::PT_LOAD && p.p_flags == libc::PF_R)
+            .filter(|p| p.p_type == libc::PT_LOAD && p.p_flags & libc::PF_W == 0)
             .map(segment)
             .collect();
         let relro: Vec<(usize, usize)> = phdrs
@@ -158,7 +159,7 @@ pub(crate) mod imp {
             .collect();
         merged
             .into_iter()
-            .filter(|&(a, b)| read_only.iter().any(|&(lo, hi)| lo <= a && b <= hi))
+            .filter(|&(a, b)| unwritable.iter().any(|&(lo, hi)| lo <= a && b <= hi))
             .filter(|&(a, b)| relro.iter().all(|&(lo, hi)| b <= lo || hi <= a))
             .map(|(a, b)| (a.next_multiple_of(page), b & !(page - 1)))
             .filter(|&(a, b)| a < b)
@@ -168,7 +169,7 @@ pub(crate) mod imp {
     pub(super) fn release() -> usize {
         let mut released = 0;
         for (a, b) in ranges() {
-            // SAFETY: `[a, b)` is whole pages of a read-only, file-backed private mapping of the
+            // SAFETY: `[a, b)` is whole pages of an unwritable, file-backed private mapping of the
             // executable that nothing wrote (no text relocations, outside RELRO), and no Rust
             // reference points into a relocation table. `MADV_DONTNEED` drops the mappings; a read
             // faults the file's own bytes back in.
@@ -198,12 +199,16 @@ mod tests {
     fn the_relocation_table_is_unmapped_and_reads_back_unchanged_7412() {
         // The test binary is a PIE with a relocation table of its own (Rust's default on Linux).
         let ranges = super::imp::ranges();
-        assert!(!ranges.is_empty(), "no relocation table found");
+        assert!(
+            !ranges.is_empty(),
+            "no relocation table found:\n{}",
+            std::fs::read_to_string("/proc/self/maps").unwrap_or_default()
+        );
         // SAFETY: `getauxval` only reads the auxiliary vector.
         let page = unsafe { libc::getauxval(libc::AT_PAGESZ) } as usize;
         let (a, b) = ranges[0];
         assert!(a % page == 0 && b % page == 0 && a < b);
-        // SAFETY: `[a, b)` is mapped and readable: a read-only segment of this executable.
+        // SAFETY: `[a, b)` is mapped and readable: an unwritable segment of this executable.
         let before: Vec<u8> = unsafe { std::slice::from_raw_parts(a as *const u8, b - a) }.to_vec();
         assert!(present(a, page).unwrap_or(true));
         assert!(super::release() >= b - a);
@@ -230,7 +235,11 @@ mod tests {
                     lo <= a && b <= hi
                 })
                 .expect("a range outside any one mapping");
-            assert!(line.contains(" r--p "), "{line}");
+            let perms = line.split_whitespace().nth(1).unwrap();
+            assert!(
+                perms.starts_with('r') && &perms[1..2] == "-" && perms.ends_with('p'),
+                "{line}"
+            );
         }
     }
 }
