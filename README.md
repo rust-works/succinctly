@@ -16,7 +16,7 @@ Succinctly provides space-efficient data structures with fast rank and select op
 - **JSON semi-indexing with SIMD acceleration** - Up to 880 MiB/s throughput on x86_64 (AMD Zen 4) with table-driven PFSM parser
 - **YAML semi-indexing** - Complete YAML 1.2 parser with anchor/alias resolution (~250-400 MiB/s)
 - **DSV/CSV semi-indexing** - High-performance CSV/TSV parsing (85-1676 MiB/s) with BMI2 acceleration
-- **jq/yq-style query expressions** - Navigate JSON and YAML without full parsing
+- **jq/yq-style query expressions** - Navigate JSON and YAML without full parsing (`succinctly jq` follows jq 1.7.1; `succinctly yq` is a preview, see [CLI Tool](#cli-tool))
 - **`no_std` compatible** - Works in embedded and WASM environments
 - **Cross-platform SIMD** - Runtime detection for AVX2, AVX-512, SSE4.2, and ARM NEON
 
@@ -294,7 +294,10 @@ For which tool to pick for which workload (the geomean above counts 50 `identity
 
 ## CLI Tool
 
-The library includes CLI tools for JSON, YAML, and DSV operations:
+The library includes CLI tools for JSON, YAML, and DSV operations.
+
+**Status:** `succinctly jq` (`sjq`) is the supported mode. It follows jq 1.7.1, and the differences it keeps are recorded in [jq limitations](docs/compliance/jq/limitations.md).
+`succinctly yq` (`syq`) is a **preview**: it aims to follow mikefarah/yq v4.53.3, but has known differences, recorded in [yq limitations](docs/compliance/yq/limitations.md) and the [open `yq:` issues](https://github.com/rust-works/succinctly/issues?q=is%3Aissue+is%3Aopen+%22yq%3A%22+in%3Atitle); check its output before you rely on it in place of yq.
 
 ```bash
 # Build the CLI
@@ -307,7 +310,7 @@ succinctly install-aliases
 sjq '.users[].name' input.json
 sjq -r '.users[0]' input.json
 
-# Query YAML files (yq-compatible)
+# Query YAML files (yq-style; a preview, see Status above)
 syq '.users[].name' config.yaml
 syq -o json '.' config.yaml          # Output as JSON
 syq '.spec.containers[]' k8s.yaml
