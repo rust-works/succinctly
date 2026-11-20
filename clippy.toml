@@ -31,3 +31,12 @@ disallowed-methods = [
     { path = "alloc::string::String::reserve", reason = "infallible -- use try_reserve -- see #1670" },
     { path = "alloc::string::String::reserve_exact", reason = "infallible -- use try_reserve_exact -- see #1670" },
 ]
+
+# Clippy's MSRV-gated lints (`unnecessary_map_or` -> `is_none_or`, `manual_is_multiple_of`,
+# `manual_repeat_n`, `io_other_error`, ...) and `incompatible_msrv` read this, not
+# `rust-version` in Cargo.toml. It stays at the crate's old declared floor while `rust-version`
+# moved to the true one (1.89.0, checked by CI's `MSRV` job): at 1.89 clippy suggests ~250
+# rewrites, many on hot paths the perf guard watches, which belong in a change of their own.
+# Until then it only makes clippy more conservative (it still flags std APIs newer than 1.73),
+# and clippy prints that the two MSRVs differ. Remove this line with that change.
+msrv = "1.73.0"

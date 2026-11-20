@@ -284,7 +284,7 @@ mod indent_spec_tests {
 #[must_use]
 pub fn document_token_of<T>(index: &T, bp_bit_len: usize) -> usize {
     // `core::ptr::from_ref` would say this more clearly but is stable only
-    // since 1.76, past this crate's 1.73 MSRV.
+    // since 1.76, past clippy's 1.73 `msrv` (clippy.toml).
     let addr = core::ptr::addr_of!(*index) as usize;
     addr.rotate_left(usize::BITS / 2) ^ bp_bit_len
 }

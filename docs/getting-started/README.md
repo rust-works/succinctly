@@ -20,7 +20,7 @@ See the [main README](../../README.md#performance) for detailed benchmarks.
 
 ## Prerequisites
 
-- Rust 1.73 or later
+- Rust 1.89 or later (the library alone, without the `simd` feature, builds on 1.85)
 - Cargo (comes with Rust)
 
 ## Quick Install

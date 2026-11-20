@@ -1756,8 +1756,8 @@ fn collect_def_names(input: &str) -> BTreeSet<String> {
 /// this identical loop independently (`peek_str`'s own #2975 doc comment has
 /// the "why floor, not ceil" reasoning; not repeated at the other two
 /// call sites, which is exactly the drift risk this collapses). No stable
-/// `core`/`std` equivalent exists at this crate's MSRV (1.73.0) --
-/// `str::floor_char_boundary` is nightly-only.
+/// `core`/`std` equivalent exists at this crate's MSRV (1.89.0) --
+/// `str::floor_char_boundary` is stable only since 1.91.
 ///
 /// `floor` must itself already be a `char` boundary of `s` (code review on
 /// #2984: the loop only stops descending once `idx == floor`, without ever

@@ -146,7 +146,7 @@ pub fn run(
 ) -> Result<Vec<Run>> {
     sweeps
         .iter()
-        // `map_or(true, ..)`: the crate's MSRV predates `Option::is_none_or`.
+        // `map_or(true, ..)`: clippy's `msrv` (clippy.toml) predates `Option::is_none_or`.
         .filter(|s| only.map_or(true, |ids| ids.contains(&s.id)))
         .map(|s| run_one(root, s, reference, subject))
         .collect()

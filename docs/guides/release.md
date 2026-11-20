@@ -286,10 +286,28 @@ Pre-release versions are published to crates.io but won't be installed by defaul
 The Minimum Supported Rust Version (MSRV) is specified in `Cargo.toml`:
 
 ```toml
-rust-version = "1.73.0"
+rust-version = "1.89.0"
 ```
 
+It is the oldest toolchain that checks the shipped CLI feature set (`--features cli,simd,regex,serde`)
+with the committed `Cargo.lock`, and CI's `MSRV` job (`.github/workflows/ci.yml`) holds it there: it reads
+`rust-version` from `Cargo.toml`, installs that toolchain and runs `cargo check --locked` for the library and
+for that feature set on x86_64 Linux. What sets the floor:
+
+- **1.89**: the `simd` feature's AVX-512 VPOPCNTDQ popcount kernel (`src/bits/popcount.rs`) on x86_64, whose
+  intrinsics and target features stabilized in 1.89. Without `simd`, or on aarch64, 1.85 builds the CLI too.
+- **1.85**: edition-2024 dependencies in `Cargo.lock` (`indexmap`, `hashbrown`, `clap`, `rand`, ...); cargo
+  1.84 cannot parse their manifests. This is the floor of the library with default features.
+
+Tests and benches need at least 1.88 for their dev-dependencies (`proptest` 1.12 declares it) and are not
+checked at the MSRV.
+Clippy's own `msrv` in `clippy.toml` stays at 1.73 until its MSRV-gated suggestions (`is_none_or`,
+`is_multiple_of`, `repeat_n`, ...) are applied in a change of their own; it only makes clippy more
+conservative.
+
 When bumping MSRV:
+- Bump `rust-version`; the `MSRV` job follows it, so nothing else in CI names the version
 - This is a **minor** version bump (new feature: support for newer Rust features)
 - Document the change in a `changelog.d/<issue>.changed.md` fragment
-- Update CI workflows if they test older versions
+- A dependency update that raises a crate's `rust-version` above ours fails the `MSRV` job with
+  `rustc <ver> is not supported by the following packages`

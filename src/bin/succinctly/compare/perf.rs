@@ -233,7 +233,7 @@ pub fn split_available<'a>(
 ) -> (Vec<PlannedRow<'a>>, Vec<PlannedRow<'a>>) {
     plan(queries, inputs, top_tier)
         .into_iter()
-        // `map_or(true, ..)`: the crate's MSRV predates `Option::is_none_or`.
+        // `map_or(true, ..)`: clippy's `msrv` (clippy.toml) predates `Option::is_none_or`.
         .partition(|(_, i)| i.map_or(true, |i| available(root, i)))
 }
 

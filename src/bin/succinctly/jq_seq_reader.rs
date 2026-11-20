@@ -2565,8 +2565,8 @@ pub(crate) fn number_is_valid(token: &[u8]) -> bool {
         Some(i) => (&mantissa[..i], Some(&mantissa[i + 1..])),
         None => (mantissa, None),
     };
-    // `map_or(true, ..)` rather than `is_none_or`: the crate's MSRV is
-    // 1.73 and `Option::is_none_or` is 1.82.
+    // `map_or(true, ..)` rather than `is_none_or`: clippy's `msrv`
+    // (clippy.toml) is 1.73 and `Option::is_none_or` is 1.82.
     if integer.is_empty() && fraction.map_or(true, <[u8]>::is_empty) {
         return false;
     }

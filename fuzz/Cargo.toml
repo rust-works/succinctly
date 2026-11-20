@@ -2,7 +2,7 @@
 #
 # Deliberately a SEPARATE workspace with its own lockfile, mirroring
 # bench-compare/. cargo-fuzz requires nightly (-Zsanitizer=address), while the
-# main crate promises rust-version 1.73; isolating the harness keeps
+# main crate promises the rust-version in its Cargo.toml; isolating the harness keeps
 # libfuzzer-sys and arbitrary out of the main dependency graph entirely, so
 # neither the MSRV promise nor `cargo deny check all` is affected.
 #
