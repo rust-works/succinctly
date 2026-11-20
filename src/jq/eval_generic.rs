@@ -50,8 +50,8 @@ use super::document::{
     effective_fields_checked, effective_fields_checked_iter, effective_fields_with_raw_last,
     effective_len_checked, effective_value_cursors_checked, empty_elements_tail_gap_ok,
     empty_fields_tail_gap_ok, key_delimiter_ok, key_display_string, key_display_string_kind,
-    key_hash, key_is_malformed, repeat_plan_checked, resolve_display_key, stream_len, tail_gap_ok,
-    trailing_element_gap_ok, value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors,
+    key_hash, key_is_malformed, raw_walk_len, repeat_plan_checked, resolve_display_key, stream_len,
+    tail_gap_ok, trailing_element_gap_ok, value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors,
     DocumentCursor, DocumentElements, DocumentFields, DocumentValue, EffectiveFields, IndentSpec,
     JsonConvention, LazyKeyLedger,
 };
@@ -41803,15 +41803,25 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 // passes, as the census's did, so only a value that will not materialize can
                 // still stop the walk, at the same field the list's walk stopped at. The list held
                 // 144 bytes per field for the whole loop (18 MiB on `wide-1mb`).
-                let (effective, last_value_cursor) =
-                    match stream_len(&fields, S::COLLAPSE_DUPLICATE_KEYS) {
+                //
+                // #7406: yq mode collapses nothing, so its list is the raw walk itself, and it is
+                // walked whatever the census would say: the checks below are the list's, the
+                // trailing one against the walk's own last value (`raw_last`), so the census decided
+                // nothing but which of two identical walks to take.
+                let (effective, mut last_value_cursor) = if !S::COLLAPSE_DUPLICATE_KEYS {
+                    (EffectiveFields::walk(&fields, raw_walk_len(&fields)), None)
+                } else {
+                    match stream_len(&fields, true) {
                         Some(len) => (EffectiveFields::walk(&fields, len), None),
                         None => {
-                            let (list, last) =
-                                effective_fields_with_raw_last(&fields, S::COLLAPSE_DUPLICATE_KEYS);
+                            let (list, last) = effective_fields_with_raw_last(&fields, true);
                             (EffectiveFields::listed(list), last)
                         }
-                    };
+                    }
+                };
+                // A format without delimiter checks (YAML) passes the trailing one whatever the
+                // cursor, so yq mode keeps the last value only where the check reads it.
+                let raw_last = !S::COLLAPSE_DUPLICATE_KEYS && V::Cursor::HAS_DELIMITER_CHECKS;
                 // A loop for the same reason as the array arm above. Sized by the walk's count,
                 // where pushing grew it to the next power of two (#7260).
                 let mut entries: Vec<OwnedValue> = vec_with_capacity(effective.len());
@@ -41863,6 +41873,9 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                         key,
                         owned_or_suppress!(to_owned_cursor::<S, _>(&field.value_cursor), optional),
                     ));
+                    if raw_last {
+                        last_value_cursor = Some(field.value_cursor);
+                    }
                 }
                 // #2261: trailing stray comma after a real last field
                 // (`{"a":1,}`).
@@ -53753,6 +53766,75 @@ mod tests {
             owned,
             OwnedValue::array_from(vec![expected_entry(1), expected_entry(2)])
         );
+    }
+
+    /// #7406: yq mode's `to_entries` walks a JSON object's fields without the census, and still
+    /// refuses what the field list's checks refused -- a stray comma after the last field (checked
+    /// against the walk's own last value), a missing comma or colon -- while a well-formed object,
+    /// repeated keys and all, gives one entry per field in document order. Over objects narrower
+    /// and wider than the census's cut-offs.
+    #[test]
+    fn yq_to_entries_walks_json_fields_with_the_list_checks_7406() {
+        let wide = |tail: &str| {
+            let members: Vec<String> = (0..300).map(|i| format!("\"k{}\":{i}", i % 250)).collect();
+            format!("{{{}{tail}}}", members.join(","))
+        };
+        let good = [
+            String::from("{}"),
+            String::from(r#"{"a":1}"#),
+            String::from(r#"{"a":1,"b":[2],"a":{"c":3}}"#),
+            wide(""),
+        ];
+        let bad = [
+            String::from(r#"{"a":1,}"#),
+            String::from(r#"{"a":{"b":1},}"#),
+            String::from(r#"{"a":[1],}"#),
+            String::from(r#"{"a":1 "b":2}"#),
+            String::from(r#"{"a" 1,"b":2}"#),
+            wide(","),
+        ];
+        fn run<S: EvalSemantics>(json: &str) -> Result<Option<OwnedValue>, String> {
+            let bytes = json.as_bytes();
+            let index = JsonIndex::build(bytes);
+            match eval_using::<S, _>(
+                &Expr::Builtin(Builtin::ToEntries),
+                index.root(bytes).value(),
+            ) {
+                GenericResult::Error(e) => Err(alloc::format!("{e:?}")),
+                other => other.into_owned::<S>().map_err(|e| alloc::format!("{e:?}")),
+            }
+        }
+        for json in &good {
+            let owned = run::<YqSemantics>(json)
+                .unwrap_or_else(|e| panic!("{json}: {e}"))
+                .expect("one result");
+            let keys: Vec<String> = owned
+                .as_array()
+                .expect("an array")
+                .iter()
+                .map(|entry| {
+                    entry.as_object().unwrap()["key"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect();
+            let index = JsonIndex::build(json.as_bytes());
+            let fields = index.root(json.as_bytes()).value().as_object().unwrap();
+            let raw: Vec<String> = fields
+                .all_fields()
+                .iter()
+                .map(|f| f.key_str().unwrap().into_owned())
+                .collect();
+            assert_eq!(keys, raw, "{json}");
+        }
+        for json in &bad {
+            // jq mode's list route refuses each of these, and so does yq mode's walk, with the
+            // same error.
+            let jq = run::<JqSemantics>(json);
+            assert!(jq.is_err(), "{json}: jq mode answered {jq:?}");
+            assert_eq!(run::<YqSemantics>(json), jq, "{json}");
+        }
     }
 
     /// #1385: the duplicate-key rule follows the evaluation *mode*, not the
