@@ -12,13 +12,22 @@ documentation = "https://docs.rs/succinctly"
 readme = "README.md"
 keywords = ["succinct", "bitvector", "rank", "select", "data-structures"]
 categories = ["data-structures", "algorithms"]
+# The published crate is the library and the CLI, nothing else: `tests/` and
+# `benches/` (about 20 MB, much of it in `tests/jq_cli*` and `tests/yq_cli*`)
+# put the .crate within 50 KB of crates.io's 10 MiB upload limit, so they stay
+# in the repository only. cargo then drops the `[[bench]]` targets from the
+# packaged manifest, as it does the examples. Every `include_str!` of a file
+# under `tests/` (or `comparison/`, `docs/`, `scripts/`) in `src/` sits in a
+# `#[cfg(test)]` module, so the lib and the binary build from the crate alone;
+# `cargo package` verifies that by building it. `scripts/crate_size.py` holds
+# the .crate under a ceiling well below the limit (docs/guides/release.md).
+# The leading `/` anchors each pattern at the root: a bare `README.md` also
+# matched every `docs/**/README.md`.
 include = [
-    "src/**/*",
-    "benches/**/*",
-    "tests/**/*",
-    "Cargo.toml",
-    "LICENSE",
-    "README.md",
+    "/src/**/*",
+    "/Cargo.toml",
+    "/LICENSE",
+    "/README.md",
 ]
 
 # Pinned rather than left at cargo's default (codegen-units = 16, no LTO)
