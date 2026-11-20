@@ -47,12 +47,13 @@ use super::deferred_bind::{
 };
 use super::document::{
     checked_member_key, child_tail_gap_ok, collapsed_fields_if, container_tail_gap_ok,
-    effective_fields_checked, effective_fields_with_raw_last, effective_len_checked,
-    effective_value_cursors_checked, empty_elements_tail_gap_ok, empty_fields_tail_gap_ok,
-    key_delimiter_ok, key_display_string, key_display_string_kind, key_hash, key_is_malformed,
-    repeat_plan_checked, resolve_display_key, stream_len, tail_gap_ok, trailing_element_gap_ok,
-    value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors, DocumentCursor, DocumentElements,
-    DocumentFields, DocumentValue, EffectiveFields, IndentSpec, JsonConvention, LazyKeyLedger,
+    effective_fields_checked, effective_fields_checked_iter, effective_fields_with_raw_last,
+    effective_len_checked, effective_value_cursors_checked, empty_elements_tail_gap_ok,
+    empty_fields_tail_gap_ok, key_delimiter_ok, key_display_string, key_display_string_kind,
+    key_hash, key_is_malformed, repeat_plan_checked, resolve_display_key, stream_len, tail_gap_ok,
+    trailing_element_gap_ok, value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors,
+    DocumentCursor, DocumentElements, DocumentFields, DocumentValue, EffectiveFields, IndentSpec,
+    JsonConvention, LazyKeyLedger,
 };
 use super::element_run::ElementRun;
 use super::encoder_comments::{EncoderComments, EncoderEntry, EncoderMembers, EncoderNodeComments};
@@ -40856,6 +40857,110 @@ fn any_all_generic<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
+/// `map_values(f)` over a document object in jq mode (#7260): what the bridge's
+/// `eval::builtin_map_values` answers over its copy of the object, from the object itself.
+///
+/// The bridge materializes the whole object before `f` runs on any field, so a value that will
+/// not decode raises there first, whichever field holds it and whether or not `f` reads it. Here
+/// [`validate_cursor`] gives that verdict, the same walk keeping nothing it builds (#7412: the
+/// materialized copy it replaced was the run's peak, and freeing it cost a heap consolidation
+/// mid-run). The fields are then the collapsed walk the copy's own fields
+/// were (first position, last value), and each one is `builtin_map_values`' rewrite: `f`'s first
+/// output, materialized, under the display key and its collision guard; no output drops the
+/// field, and a control `f` raises before producing one surfaces.
+///
+/// Declines (`None`, the bridge unchanged) for yq mode, `optional`, a value with no cursor or that
+/// is not an object, a body that reads path context, and a `?//` body.
+///
+/// Out of line, so that its locals do not join `eval_builtin_in`'s frame, which every builtin's
+/// recursion carries.
+#[inline(never)]
+fn map_values_of_document_object<S: EvalSemantics, V: DocumentValue>(
+    builtin: &Builtin,
+    value: &V,
+    optional: bool,
+    cursor: Option<&V::Cursor>,
+) -> Option<GenericResult<V>> {
+    let Builtin::MapValues(f) = builtin else {
+        return None;
+    };
+    if S::TAG != EvalTag::Jq || optional {
+        return None;
+    }
+    let cursor = cursor?;
+    let fields = value.as_object()?;
+    if needs_path_context(f) || crate::jq::eval::has_pattern_alternatives(f) {
+        return None;
+    }
+    Some(map_values_of_fields::<S, V>(f, &fields, cursor))
+}
+
+/// [`map_values_of_document_object`] once it has taken the object.
+fn map_values_of_fields<S: EvalSemantics, V: DocumentValue>(
+    f: &Expr,
+    fields: &V::Fields,
+    cursor: &V::Cursor,
+) -> GenericResult<V> {
+    if let Err(e) = validate_cursor::<S, _>(cursor) {
+        return GenericResult::Error(e);
+    }
+    let walk = match effective_fields_checked_iter(fields, true) {
+        Ok(walk) => walk,
+        Err(e) => return GenericResult::Error(e),
+    };
+    let mut result_map = FieldMap::with_capacity(walk.len());
+    let mut guard = DisplayKeyGuard::default();
+    for field in walk {
+        let Some((key, is_fallback)) = key_display_string_kind(&field.key) else {
+            return GenericResult::Error(fields.malformed_member_error());
+        };
+        let key = key.into_owned();
+        let result = eval_single::<S, V>(f, field.value, false, Some(field.value_cursor));
+        let result = match result.materialize_lazy_checked::<S>() {
+            Ok(result) => result,
+            Err(e) => return GenericResult::Error(e),
+        };
+        let first = match result {
+            GenericResult::One(v) => Some(to_owned::<S, _>(&v)),
+            GenericResult::OneCursor(c) => Some(to_owned_cursor::<S, _>(&c)),
+            GenericResult::Many(vs) => vs.first().map(|v| to_owned::<S, _>(v)),
+            GenericResult::ManyCursor(cs) => cs.first().map(|c| to_owned_cursor::<S, _>(c)),
+            GenericResult::Owned(v) => Some(Ok(v)),
+            GenericResult::ManyOwned(vs) => vs.into_iter().next().map(Ok),
+            // jq's `.[] |= f` takes the first output and leaves, so a control after one is never
+            // reached (`first_output_only`).
+            GenericResult::Partial(vs, control) => match vs.into_iter().next() {
+                Some(v) => Some(Ok(v)),
+                None => return partial_generic(Vec::new(), control),
+            },
+            GenericResult::None => None,
+            other
+            @ (GenericResult::Error(_) | GenericResult::Break(_) | GenericResult::Halt(_)) => {
+                return other
+            }
+            GenericResult::LazyKeys { .. }
+            | GenericResult::LazyIndexRange(_)
+            | GenericResult::LazySeq(_)
+            | GenericResult::LazyObject(_) => {
+                unreachable!("materialize_lazy_checked normalized every lazy variant")
+                // patchcov: coverage tolerate-line reason="unreachable: materialize_lazy_checked answers every lazy variant as a materialized one (#7260)"
+            }
+        };
+        let Some(first) = first else {
+            continue;
+        };
+        let first = match first {
+            Ok(v) => v,
+            Err(e) => return GenericResult::Error(e),
+        };
+        if !guard.check(&result_map, &key, is_fallback) {
+            return GenericResult::Error(EvalError::colliding_display_key(&key));
+        }
+        result_map.insert(key, first);
+    }
+    GenericResult::Owned(OwnedValue::Object(result_map.into()))
+}
+
 fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
     builtin: &Builtin,
     value: V,
@@ -43107,6 +43212,24 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
             if matches!(builtin, Builtin::Pow(..) | Builtin::Atan2(..)) {
                 if let Some(answer) = binary_math_of_document_number::<S, V>(builtin, &value) {
                     return GenericResult::Owned(answer);
+                }
+            }
+            // #7260: jq's `map_values(f)` over a document object, evaluated on the document's own
+            // nodes instead of through the bridge below, which materializes the object, writes it
+            // out as text, indexes that and runs `eval::builtin_map_values` over the copy: on
+            // `wide-1mb` the copy and its text were 9 MiB of the 18 MiB peak, next to the 6 MiB
+            // result. Here, after the doors above, with every test inside the call (#7412): as an
+            // arm of its own its guard cost `with_entries` 4% on an Apple M4 Pro at an unchanged
+            // instruction count, and ahead of `binary_math_of_document_number` it stopped that
+            // door being inlined here, which cost 2%.
+            if matches!(builtin, Builtin::MapValues(_)) {
+                if let Some(answer) = map_values_of_document_object::<S, V>(
+                    builtin,
+                    &value,
+                    optional,
+                    cursor.as_ref(),
+                ) {
+                    return answer;
                 }
             }
             let root = RootWitness::of(cursor.as_ref());

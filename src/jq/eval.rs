@@ -22018,7 +22018,7 @@ fn builtin_map<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// chain can retry after the update's first output (#3524); the retry never
 /// surfaces as a second output through `map_values`' own first-output read, so
 /// the decision comes from the filter's shape (#3666).
-fn has_pattern_alternatives(f: &Expr) -> bool {
+pub(crate) fn has_pattern_alternatives(f: &Expr) -> bool {
     any_subexpr(f, &mut |e| match e {
         Expr::AsPattern { patterns, .. }
         | Expr::Reduce { patterns, .. }

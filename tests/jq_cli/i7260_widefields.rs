@@ -106,3 +106,30 @@ fn malformed_wide_object_raises_before_f_runs_7260() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn undecodable_value_raises_before_f_runs_even_unread_7260() -> Result<()> {
+    // The last of 300 values is a string with an escape JSON never allowed. `f` reads no value
+    // (`1`) or raises its own error on the first field: either way the escape is reported first,
+    // as jq's parser reports it before any filter runs.
+    let mut fields: Vec<String> = (0..299).map(|i| format!("\"k{i}\":{i}")).collect();
+    fields.push("\"k299\":\"\\q\"".to_string());
+    let input = format!("{{{}}}", fields.join(","));
+    let want = format!(
+        "jq: parse error: Invalid escape at line 1, column {}\n",
+        input.len() - 1
+    );
+    for filter in [
+        "map_values(1)",
+        "map_values(error(\"f ran\"))",
+        "to_entries|length",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&input))?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            ("", want.as_str(), 5),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
