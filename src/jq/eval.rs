@@ -102833,14 +102833,15 @@ fn set_value_at_path_impl<S: EvalSemantics, const YQ_SETPATH: bool>(
                 } else {
                     let val =
                         set_value_at_path_impl::<S, YQ_SETPATH>(OwnedValue::Null, rest, new_val)?;
-                    entries.insert(name.to_string(), val);
+                    // The path's own key, as jq's `jv_object_set` stores it (#7401).
+                    entries.insert_shared(name.clone(), val);
                 }
                 Ok(OwnedValue::Object(entries))
             }
             OwnedValue::Null => {
                 let mut entries = FieldMap::new();
-                entries.insert(
-                    String::clone(name),
+                entries.insert_shared(
+                    name.clone(),
                     set_value_at_path_impl::<S, YQ_SETPATH>(OwnedValue::Null, rest, new_val)?,
                 );
                 Ok(OwnedValue::Object(entries.into()))

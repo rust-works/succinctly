@@ -4549,6 +4549,12 @@ impl OwnedValue {
     /// storage it was built with. Computed numbers (`Int`/`Float`) have no
     /// storage in jq either and are left as they are; a JSON document's
     /// numbers all materialize as `NumberLiteral`s, which this promotes.
+    ///
+    /// An object's keys get storage of their own too, one per object (#7401):
+    /// jq's `keys`, `keys_unsorted` and `.[]` hand out the object's own key
+    /// `jv`, so two reads of one key are identical, and the reader's sharing
+    /// of one key among sibling records (#7260) would make keys of two
+    /// objects identical where jq's parser allocated each.
     pub(crate) fn promote_identities(&mut self) {
         match self {
             Self::String(s) => s.promote(),
@@ -4556,7 +4562,10 @@ impl OwnedValue {
                 spelling.promote();
             }
             Self::Array(items) => items.iter_mut().for_each(Self::promote_identities),
-            Self::Object(map) => map.values_mut().for_each(Self::promote_identities),
+            Self::Object(map) => {
+                map.own_keys();
+                map.values_mut().for_each(Self::promote_identities);
+            }
             Self::Null | Self::Bool(_) | Self::Int(_) | Self::Float(_) => {}
         }
     }
@@ -7522,6 +7531,42 @@ mod tests {
         // A clone taken before promotion shares the array's storage with the
         // tree, so `make_mut` copied it; the promoted tree has its own.
         assert!(!jv_identical(&map["e"], &e_storage));
+    }
+
+    /// #7401: every object's keys get storage of their own, and a key the
+    /// reader shared between sibling records (#7260) is split, so a key is
+    /// identical to itself and to nothing in another object.
+    #[test]
+    fn promote_identities_gives_each_objects_keys_their_own_storage_7401() {
+        let mut doc = crate::jq::parse_plain(r#"[{"a":1,"b":2},{"a":3,"b":4}]"#).expect("plain");
+        let records = doc.as_array().expect("an array");
+        let key = |i: usize| {
+            records[i]
+                .as_object()
+                .expect("an object")
+                .key_at(0)
+                .cloned()
+        };
+        let (first, second) = (key(0).expect("a key"), key(1).expect("a key"));
+        assert!(first.ptr_eq(&second), "the reader shares a sibling's key");
+
+        let before = doc.to_json_jq_preserve();
+        doc.promote_identities();
+        assert_eq!(doc.to_json_jq_preserve(), before);
+        let records = doc.as_array().expect("an array");
+        let keys: Vec<&SharableString> = records
+            .iter()
+            .flat_map(|r| r.as_object().expect("an object").iter_stored())
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(keys.len(), 4);
+        for (i, a) in keys.iter().enumerate() {
+            assert!(a.is_shared(), "key {i} has storage");
+            assert!(a.ptr_eq(&(*a).clone()), "key {i} is itself");
+            for (j, b) in keys.iter().enumerate().skip(i + 1) {
+                assert!(!a.ptr_eq(b), "keys {i} and {j} are distinct");
+            }
+        }
     }
 
     /// #3000: the whole point of [`ObjectMap`] is that `OwnedValue` stops

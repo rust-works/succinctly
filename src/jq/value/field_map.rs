@@ -631,6 +631,29 @@ impl<V> FieldMap<V> {
         Some(key.clone())
     }
 
+    /// Moves every inline key behind a refcount, leaving a key that already
+    /// shares its storage as it is, so each key has an identity that a
+    /// handle on it ([`key_at`](Self::key_at)) carries (#7401). Changes how
+    /// the keys are held, not what they are.
+    pub fn promote_keys(&mut self) {
+        for (key, _) in self.entries_mut() {
+            key.promote();
+        }
+    }
+
+    /// Gives every key storage of its own, refcounted: a key that shares its
+    /// storage with another object's (#7260) gets a copy first, so no two
+    /// objects' keys share an identity (#7401). For a map materialized from
+    /// a document, where jq's parser allocates every key on its own.
+    pub fn own_keys(&mut self) {
+        for (key, _) in self.entries_mut() {
+            if key.is_shared() {
+                *key = SharableString::from(key.as_str());
+            }
+            key.promote();
+        }
+    }
+
     /// Removes the field at `pos`, shifting every later one down.
     pub fn shift_remove_index(&mut self, pos: usize) -> Option<(String, V)> {
         self.shift_remove_field(pos)
@@ -869,6 +892,12 @@ impl<V> FieldMap<V> {
     #[inline]
     pub fn iter_mut(&mut self) -> IterMut<'_, V> {
         IterMut(self.entries_mut().iter_mut())
+    }
+
+    /// The fields in order, each key with its storage (#7401).
+    #[inline]
+    pub fn iter_stored(&self) -> core::slice::Iter<'_, (SharableString, V)> {
+        self.entries().iter()
     }
 
     /// The keys in order.
