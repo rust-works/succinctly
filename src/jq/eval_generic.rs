@@ -1697,7 +1697,11 @@ impl<V: Clone + Teardown> ObjectBuilder<V> {
 /// only when the two elements before agreed ([`SiblingShape`]), and the cap
 /// bounds what a wrong one costs: an object after wide siblings holds at most
 /// this many unused slots.
-const MAX_SIBLING_CAPACITY: usize = 16;
+///
+/// One past [`SMALL_FIELDS`](super::value::field_map::SMALL_FIELDS) (#7260),
+/// so that the record after two wide ones starts with its hash index, rather
+/// than scanning its first sixteen keys and then indexing them all.
+const MAX_SIBLING_CAPACITY: usize = super::value::field_map::SMALL_FIELDS + 1;
 
 /// The member counts of the last two elements of an array, which size the
 /// next one's map when they agree, until a guess overshoots (#5594).
