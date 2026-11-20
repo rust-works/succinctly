@@ -14343,7 +14343,10 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
             }
             let stdin =
                 std::io::Cursor::new(pushed_back.unwrap_or_default()).chain(std::io::stdin());
-            (Box::new(stdin), front)
+            // #7260: room for the windows read onto the text after the front, as a file's length is,
+            // so the text is not grown by doubling as they are (a 2.5 MiB buffer copied out of a
+            // 1.25 MiB one at the peak); room not written to is not memory the run holds.
+            (Box::new(stdin), front + 2 * lazy_window_bytes())
         }
         Some(path) => {
             let Ok(file) = std::fs::File::open(path) else {
