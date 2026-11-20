@@ -1722,6 +1722,15 @@ const MAX_SIBLING_CAPACITY: usize = super::value::field_map::SMALL_FIELDS + 1;
 /// period (`wide, wide, narrow, ...`) or an empty object after two records, so
 /// the first object that turns out smaller than the room it was given ends the
 /// guessing for the rest of the array: at most one map per array is oversized.
+///
+/// A stream of records (`parse_plain_stream`, the lazy `inputs` producer) is
+/// one such array, so there the latch lasts for the rest of the stream: after
+/// one record narrower than its room, every later record's map grows from
+/// empty, whatever their shape (#7406). That costs only time and capacity,
+/// never output. It stays a latch: a reset after a run of agreeing records
+/// would size such a stream again, at one oversized map per reset, but it has
+/// not been measured to pay for itself, and a reset on agreement alone would
+/// re-admit the `wide, wide, narrow` period the latch exists to stop.
 #[derive(Default)]
 pub(crate) struct SiblingShape {
     last: usize,
