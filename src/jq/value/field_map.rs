@@ -1174,26 +1174,26 @@ macro_rules! slice_iter {
     };
 }
 
-slice_iter!(
+slice_iter! {
     /// Iteration over a [`FieldMap`]'s fields.
     Iter, Iter, (&'a String, &'a V), |e| (&*e.0, &e.1)
-);
-slice_iter!(
+}
+slice_iter! {
     /// Iteration over a [`FieldMap`]'s fields, values mutably.
     IterMut, IterMut, (&'a String, &'a mut V), |e| (&*e.0, &mut e.1)
-);
-slice_iter!(
+}
+slice_iter! {
     /// Iteration over a [`FieldMap`]'s keys.
     Keys, Iter, &'a String, |e| &*e.0
-);
-slice_iter!(
+}
+slice_iter! {
     /// Iteration over a [`FieldMap`]'s values.
     Values, Iter, &'a V, |e| &e.1
-);
-slice_iter!(
+}
+slice_iter! {
     /// Iteration over a [`FieldMap`]'s values, mutably.
     ValuesMut, IterMut, &'a mut V, |e| &mut e.1
-);
+}
 
 impl<V> Clone for Iter<'_, V> {
     #[inline]
