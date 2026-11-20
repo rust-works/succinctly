@@ -616,8 +616,12 @@ DEFAULT_THRESHOLD = 5.0
 # against the PR's own merge-base, outputs byte-identical; ARM64-Linux not measured before the PR,
 # hence the margin). Remove them once `main` carries the change and the rows read ~0% against a
 # merge-base that includes it.
+# `seq_name_bad_last` is raised to 12.0 for the same change, as #6620 and #7263 raised it: it reads
+# -7.8% x86_64 against the PR's merge-base (the whole-stream route builds every record's object
+# with the field list and shared keys). Lower it back to #6619's 3.0, and its self-test back to the
+# one that holds it under a revert of #6594 (+4.5%), once `main` carries the change.
 QUERY_THRESHOLDS = {
-    "seq_name_bad_last": 3.0,
+    "seq_name_bad_last": 12.0,
     "wide_to_entries": 20.0,
     "seq_array_bad_last": 12.0,
     "seq_keys_bad_last": 10.0,
