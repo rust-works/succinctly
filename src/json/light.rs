@@ -2024,7 +2024,83 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
         }
         (Ok(winner.map(|(_, value_cursor, _)| value_cursor)), index)
     }
+
+    /// [`find_cursor_counted`](Self::find_cursor_counted) for several names in one walk of the
+    /// members (#7260): `found[i]` (as long as `names`) is what the lookup of `names[i]`
+    /// answers, and an `Err` is what the first of those lookups to fail raises.
+    ///
+    /// The checks are the one-name walk's, in its order for each name: every key is a string,
+    /// each winner's `,`/`:` gaps, and the gap after the last member. Every error among them is
+    /// one the others share -- the walk's own key fault, whatever the name, or
+    /// [`EvalError::malformed_json_text`] of this document -- so checking every winner before
+    /// the trailing gap raises what the names' lookups in turn would have.
+    pub fn find_cursors_counted(
+        &self,
+        names: &[&str],
+        found: &mut [Option<JsonCursor<'a, W>>],
+    ) -> (Result<(), EvalError>, usize)
+    where
+        W: Clone,
+    {
+        debug_assert_eq!(names.len(), found.len());
+        if names.len() > MAX_NAMES_PER_WALK {
+            return crate::jq::document::find_cursors_one_by_one(self, names, found);
+        }
+        // STYLE-0013-TAIL: `find_cursor_counted`'s walk for several names, exempt for its reason: the
+        // zero-member `{,}` needs the container cursor this walk never receives, and is closed where
+        // the array of reads is answered (`comma_field_reads`, as at the `Expr::Field` arm, #2594).
+        // (key's own text start, is this field the object's first) of each name's winner so far;
+        // its value cursor goes in `found`.
+        let mut winners = [(0usize, false); MAX_NAMES_PER_WALK];
+        for slot in found.iter_mut() {
+            *slot = None;
+        }
+        let mut fields = *self;
+        let mut last_value_cursor: Option<JsonCursor<'a, W>> = None;
+        let mut index = 0usize;
+        while let Some((field, rest)) = fields.uncons() {
+            let key = field.key();
+            if json_key_is_malformed(&key) {
+                return (Err(fields.malformed_member_error()), 0);
+            }
+            if let StandardJson::String(key) = key {
+                for (i, name) in names.iter().enumerate() {
+                    if key.decodes_to(name) {
+                        winners[i] = (key.start(), index == 0);
+                        found[i] = Some(field.value_cursor());
+                    }
+                }
+            }
+            last_value_cursor = Some(field.value_cursor());
+            fields = rest;
+            index += 1;
+        }
+        // STYLE-0013: as `find_cursor_counted`'s own exemption -- only each winner's `key_start` is
+        // kept, and the check is deferred to the last-write-wins field of each name alone.
+        for (slot, &(key_start, is_first)) in found.iter().zip(winners.iter()) {
+            let Some(value_cursor) = slot else { continue };
+            let comma_expected = if is_first { None } else { Some(b',') };
+            if !preceding_gap_ok(value_cursor.text(), key_start, comma_expected) {
+                return (Err(EvalError::malformed_json_text(value_cursor.text())), 0);
+            }
+            if let Some(value_start) = value_cursor.text_position() {
+                if !preceding_gap_ok(value_cursor.text(), value_start, Some(b':')) {
+                    return (Err(EvalError::malformed_json_text(value_cursor.text())), 0);
+                }
+            }
+        }
+        if let Some(last) = last_value_cursor {
+            if !trailing_element_gap_ok(&last, b'}') {
+                return (Err(EvalError::malformed_json_text(last.text())), 0);
+            }
+        }
+        (Ok(()), index)
+    }
 }
+
+/// The most names [`JsonFields::find_cursors_counted`] looks up in its one walk; a longer list is
+/// looked up a name at a time.
+const MAX_NAMES_PER_WALK: usize = 8;
 
 /// [`key_is_malformed`](crate::jq::document::key_is_malformed) for a JSON key, without decoding it (#7260): its `decoded_key_str` answers
 /// `Ok(None)`, the grammar fault, exactly for a key that is not a string, and a string's decode
@@ -5819,6 +5895,15 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentFields for JsonFields<'a, W> {
     #[inline]
     fn find_cursor_counted(&self, name: &str) -> (Result<Option<Self::Cursor>, EvalError>, usize) {
         JsonFields::find_cursor_counted(self, name)
+    }
+
+    #[inline]
+    fn find_cursors_counted(
+        &self,
+        names: &[&str],
+        found: &mut [Option<Self::Cursor>],
+    ) -> (Result<(), EvalError>, usize) {
+        JsonFields::find_cursors_counted(self, names, found)
     }
 
     /// The retained child cursor *is* the next key node (#3913); an exhausted

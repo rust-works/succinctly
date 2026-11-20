@@ -5058,6 +5058,13 @@ fn materialize_lazy_keys<V: DocumentValue, S: EvalSemantics>(
     sorted: bool,
     collapse: bool,
 ) -> Result<OwnedValue, EvalError> {
+    if sorted && collapse {
+        // #7260: jq's keys are strings, so the string walk that sorts them answers.
+        let keys = crate::jq::document::sorted_effective_keys(fields, collapse)?;
+        return Ok(OwnedValue::array_from(
+            keys.into_iter().map(OwnedValue::string).collect(),
+        ));
+    }
     let mut keys = effective_key_values::<_, S>(fields, collapse)?;
     if sorted {
         // `sorted` is only ever `true` in jq mode -- not by convention, but
@@ -8090,6 +8097,11 @@ fn run_comma_branches<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> BranchesEnd<V> {
+    if S::TAG == EvalTag::Jq && !guarded && tail.is_empty() {
+        if let Some(end) = comma_field_reads::<S, V>(array, branches, value, cursor.as_ref()) {
+            return end;
+        }
+    }
     for expr in CommaBranches::new(branches) {
         let mut result = eval_single::<S, _>(expr, value.clone(), optional, cursor);
         let mut ends_group = false;
@@ -8110,6 +8122,59 @@ fn run_comma_branches<S: EvalSemantics, V: DocumentValue>(
         }
     }
     BranchesEnd::Done
+}
+
+/// The most branches [`comma_field_reads`] answers in one walk of the object.
+const MAX_COMMA_FIELD_READS: usize = 8;
+
+/// [`run_comma_branches`] for a jq-mode `,` of field reads of an object (`[.id, .name]`, the
+/// per-record shape, #7260): one walk of its members answers every name
+/// ([`crate::jq::key_index::find_cursors_memoized`]), where each branch's `Expr::Field` arm walked
+/// them all again. Each name's answer is that arm's: the value's node, `null` for a missing key,
+/// or the first failing lookup's error, which is the array's failure as a branch's raise is.
+/// `None` for any other body or input, which the branches answer one at a time: a branch that is
+/// not a bare `.name`, more than [`MAX_COMMA_FIELD_READS`] of them, or an input that is not an
+/// object (a type error, or `null`'s nulls, are the `Expr::Field` arm's own).
+fn comma_field_reads<S: EvalSemantics, V: DocumentValue>(
+    array: &mut CommaArray<V>,
+    branches: &[Expr],
+    value: &V,
+    cursor: Option<&V::Cursor>,
+) -> Option<BranchesEnd<V>> {
+    let count = branches.len();
+    if !(2..=MAX_COMMA_FIELD_READS).contains(&count) {
+        return None;
+    }
+    let mut names: [&str; MAX_COMMA_FIELD_READS] = [""; MAX_COMMA_FIELD_READS];
+    for (slot, branch) in names.iter_mut().zip(branches) {
+        let Expr::Field(name) = branch else {
+            return None;
+        };
+        *slot = name;
+    }
+    let fields = value.as_object()?;
+    // A raise before any item: what `array.push` hands back for a branch's `GenericResult::Error`.
+    let escape = |err| BranchesEnd::Escape(partial_generic(Vec::new(), Control::Error(err)));
+    // #2594: as the `Expr::Field` arm, a zero-field `{,}` raises before any name is read.
+    if let Err(err) = empty_fields_tail_gap_ok(&fields, cursor) {
+        return Some(escape(err));
+    }
+    let mut found: [Option<V::Cursor>; MAX_COMMA_FIELD_READS] = core::array::from_fn(|_| None);
+    if let Err(err) =
+        crate::jq::key_index::find_cursors_memoized(&fields, &names[..count], &mut found[..count])
+    {
+        return Some(escape(err));
+    }
+    for slot in &mut found[..count] {
+        let item = match slot.take() {
+            Some(c) => GenericResult::OneCursor(c),
+            None => GenericResult::Owned(OwnedValue::Null),
+        };
+        // A node or a null is an item, never an escape.
+        let escaped = array.push::<S>(item);
+        debug_assert!(escaped.is_none());
+    }
+    Some(BranchesEnd::Done)
 }
 
 /// What [`comma_array_generic`] has collected: its items so far, in order,

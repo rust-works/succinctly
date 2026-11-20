@@ -1889,6 +1889,24 @@ pub trait DocumentFields: Sized + Clone {
         (self.find_cursor(name), 0)
     }
 
+    /// [`find_cursor_counted`](Self::find_cursor_counted) for several names at once (#7260):
+    /// `found[i]` is what the lookup of `names[i]` answers, and an `Err` is the error the first
+    /// of those lookups that fails raises, with `found` then meaningless. `found` is as long as
+    /// `names`. The count is the walk's, as for one name.
+    ///
+    /// The default looks each name up in turn. JSON walks the members once for all of them
+    /// (`[.id, .name]` read every member twice), which answers the same because every error a
+    /// lookup there raises is one the others would raise too: a key that is not a string is a
+    /// fault of the walk, whatever the name, and a bad gap around the winner or after the last
+    /// member is the same document's [`EvalError::malformed_json_text`].
+    fn find_cursors_counted(
+        &self,
+        names: &[&str],
+        found: &mut [Option<Self::Cursor>],
+    ) -> (Result<(), EvalError>, usize) {
+        find_cursors_one_by_one(self, names, found)
+    }
+
     /// The key node of the first member this list still holds, or `None` for
     /// an exhausted list or a format that does not support the key index
     /// (#3913).
@@ -5199,6 +5217,70 @@ pub fn effective_keys<F: DocumentFields>(
         return Err(fields.malformed_member_error());
     }
     Ok(keys)
+}
+
+/// [`DocumentFields::find_cursors_counted`] a name at a time (#7260).
+///
+/// Each name's [`find_cursor_counted`](DocumentFields::find_cursor_counted), stopping at the first
+/// error: the trait's default, and JSON's answer for more names than its one walk takes.
+pub fn find_cursors_one_by_one<F: DocumentFields>(
+    fields: &F,
+    names: &[&str],
+    found: &mut [Option<F::Cursor>],
+) -> (Result<(), EvalError>, usize) {
+    let mut walked = 0;
+    for (name, slot) in names.iter().zip(found.iter_mut()) {
+        let (answer, count) = fields.find_cursor_counted(name);
+        match answer {
+            Ok(cursor) => *slot = cursor,
+            Err(err) => return (Err(err), 0),
+        }
+        walked = count;
+    }
+    (Ok(()), walked)
+}
+
+/// [`effective_keys`], sorted: jq's `keys` of an object (#7260).
+///
+/// With `collapse`, an object whose every key is a string with no escape is walked without the
+/// hash probe [`DistinctKeyCursors`] runs to collapse a repeat as it goes: sorting puts a repeat
+/// next to itself, and such a key is its own decoded text, so dropping a neighbour equal to the
+/// one before it leaves what collapsing and then sorting leaves. The walk makes the checks the
+/// collapsing walk makes of every member (the `,`/`:` gaps, an unpaired last child, the gap after
+/// the last member) and raises what [`effective_keys`] raises. An object with any other key (an
+/// escape, which may decode like another key; a key that does not decode, which never collapses;
+/// one that is not a string) is [`effective_keys`]'s, as is every walk without `collapse`.
+pub fn sorted_effective_keys<F: DocumentFields>(
+    fields: &F,
+    collapse: bool,
+) -> Result<Vec<String>, EvalError> {
+    if collapse {
+        if let Some(keys) = plain_sorted_keys(fields) {
+            return keys;
+        }
+    }
+    let mut keys = effective_keys(fields, collapse)?;
+    keys.sort();
+    Ok(keys)
+}
+
+/// [`sorted_effective_keys`]' walk of an object whose keys are all escape-free strings, or `None`
+/// at the first key that is not one.
+fn plain_sorted_keys<F: DocumentFields>(fields: &F) -> Option<Result<Vec<String>, EvalError>> {
+    let mut keys: Vec<String> = Vec::new();
+    let mut cursors = DistinctKeyCursors::new(fields, false);
+    for (key, _) in cursors.by_ref() {
+        // `_with_end`: it declines an unterminated span, where the plain span would hand back a
+        // text the key does not hold.
+        let text = core::str::from_utf8(key.key_raw_unescaped_with_end()?.0).ok()?;
+        keys.push(String::from(text));
+    }
+    if cursors.is_malformed() || !cursors.trailing_gap_ok(b'}') {
+        return Some(Err(fields.malformed_member_error()));
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    Some(Ok(keys))
 }
 
 /// A single field from an object.
