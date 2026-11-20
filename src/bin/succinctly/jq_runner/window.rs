@@ -151,6 +151,17 @@ pub(super) fn min_windowed_seq_file_bytes() -> u64 {
     (window_bytes() / 16) as u64
 }
 
+/// The fewest bytes a pipe on standard input holds for the plain and `--seq` routes to read it a
+/// window at a time, two windows (2 MiB in every build that ships, #7260): its length is not known, so
+/// that many are read first to learn it, and they are what the run holds at its peak. Since a pipe's
+/// windows share their buffers with the thread that certifies them and the probe is freed a block at a
+/// time, a windowed pipe holds about two windows, which a pipe that is read whole holds once it is a
+/// little over one: four windows held a probe of 4 MiB for a run whose windows hold 2.
+#[inline]
+pub(super) fn min_windowed_pipe_bytes() -> u64 {
+    2 * window_bytes() as u64
+}
+
 /// The window of a lone `--seq` file whose first byte is not an RS (#7312): [`SeqGate`] hands the stream
 /// on at that byte whatever is read, so the first read, which is all the gate looks at, is a page and
 /// not a [`WINDOW_BYTES`] block that is filled, found to be all tail and freed, which the allocator

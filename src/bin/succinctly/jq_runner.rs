@@ -12260,8 +12260,9 @@ fn windowed_stdin_file(_min: u64) -> Option<(window::WindowedFiles, std::rc::Rc<
     None
 }
 
-/// Standard input when it is a pipe (or a socket) that holds 4 MiB or more (#7024), read a window at a
-/// time. Its length is not known, so the first 4 MiB are read to find out: a pipe that ends sooner hands
+/// Standard input when it is a pipe (or a socket) that holds two windows or more (#7024; four until
+/// #7260, [`window::min_windowed_pipe_bytes`]), read a window at a time. Its length is not known, so
+/// the first two windows are read to find out: a pipe that ends sooner hands
 /// what it held to the route that reads it whole ([`STDIN_PUSHBACK`]), as if it had read it itself. It
 /// cannot be read again for a fault's wording, so its windows are certified as they are read and the
 /// first fault is kept ([`window::WindowedFile::from_pipe`]). A terminal is left to the route that reads
@@ -12275,7 +12276,7 @@ fn windowed_stdin_pipe() -> Option<WindowedSource> {
     if !(kind.is_fifo() || kind.is_socket()) {
         return None;
     }
-    windowed_pipe(file, window::min_windowed_file_bytes())
+    windowed_pipe(file, window::min_windowed_pipe_bytes())
 }
 
 /// [`windowed_stdin_pipe`] over a pipe it has judged, which is windowed once it holds `min` bytes
@@ -12303,11 +12304,12 @@ fn windowed_stdin_pipe() -> Option<WindowedSource> {
     None
 }
 
-/// A pipe (or a socket) on standard input that holds 4 MiB or more of a `--seq` stream (#7164), read a
-/// window at a time while its records are RFC 7464's own framing ([`window::WindowedFiles::seq_pipe`]),
-/// each RS read as a space as [`windowed_seq_file`] reads a regular file. Its length is not known, so
-/// the first 4 MiB are read to learn it, and a pipe that ends sooner is the whole-stream route's
-/// ([`probe_stdin_pipe`]). The rest of a stream that turns out not to be plain is handed to that route
+/// A pipe (or a socket) on standard input that holds two windows or more of a `--seq` stream (#7164;
+/// four until #7260, [`window::min_windowed_pipe_bytes`]), read a window at a time while its records are
+/// RFC 7464's own framing ([`window::WindowedFiles::seq_pipe`]), each RS read as a space as
+/// [`windowed_seq_file`] reads a regular file. Its length is not known, so the first two windows are
+/// read to learn it, and a pipe that ends sooner is the whole-stream route's
+/// ([`probe_stdin_pipe_blocks`]). The rest of a stream that turns out not to be plain is handed to that route
 /// once the windows before it are out ([`hand_on_seq_pipe_tail`]), so there is no fault to word here.
 #[cfg(unix)]
 fn windowed_seq_pipe() -> Option<WindowedSource> {
@@ -12319,7 +12321,7 @@ fn windowed_seq_pipe() -> Option<WindowedSource> {
     }
     let blocks = probe_stdin_pipe_blocks(
         &file,
-        window::min_windowed_file_bytes(),
+        window::min_windowed_pipe_bytes(),
         window::window_bytes(),
     )?;
     let slot = window::SeqTailSlot::default();
