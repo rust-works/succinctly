@@ -54,6 +54,7 @@ use super::document::{
     value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors, DocumentCursor, DocumentElements,
     DocumentFields, DocumentValue, EffectiveFields, IndentSpec, JsonConvention, LazyKeyLedger,
 };
+use super::element_run::ElementRun;
 use super::encoder_comments::{EncoderComments, EncoderEntry, EncoderMembers, EncoderNodeComments};
 use super::error::EvalEscape;
 use super::eval::{
@@ -9317,18 +9318,21 @@ const MOVED: u8 = 2;
 /// is shorter, or that meets another kind of result in its first [`COMPUTED_RUN_MIN`] elements, is
 /// main's fold throughout: the same batch, flatten, handed-on vector and allocator calls.
 #[inline(always)]
-fn fold_cursor_elements<S: EvalSemantics, V: DocumentValue, I: ExactSizeIterator>(
-    mut elements: I,
-    mut eval: impl FnMut(I::Item) -> GenericResult<V>,
+fn fold_cursor_elements<S: EvalSemantics, V: DocumentValue, T>(
+    elements: Vec<T>,
+    mut eval: impl FnMut(T) -> GenericResult<V>,
 ) -> GenericResult<V> {
     let mut per_element = vec_with_capacity(elements.len());
     // Whether the fold is still watching for a run and whether it has moved, in one byte: as two
     // flags beside the run, main's path kept them in memory and reloaded the batch from it, about
     // 10 more instructions per element (#7267 review, callgrind on the AMD Ryzen 9 7950X).
     let mut mode = WATCHING;
-    // The moved run: empty until the fold moves, and the prefix of the result once a long run
-    // has gone back to the batch.
+    // The prefix of the result once a long run has gone back to the batch.
     let mut values: Vec<OwnedValue> = Vec::new();
+    // #7412: the elements, read from the front. A moved run's values are written over the slots
+    // already read when an element and a value have the same layout (a JSON cursor's), so the fold
+    // never holds every cursor beside every value; otherwise the run holds them on the side.
+    let mut elements = ElementRun::<T, OwnedValue>::new(elements);
     #[cfg(test)]
     let mut went_back = false;
     while let Some(element) = elements.next() {
@@ -9337,13 +9341,13 @@ fn fold_cursor_elements<S: EvalSemantics, V: DocumentValue, I: ExactSizeIterator
             match result {
                 GenericResult::None => continue,
                 GenericResult::Owned(o) => {
-                    values.push(o);
+                    elements.push_value(o);
                     continue;
                 }
                 // #4044, as main's loop body does: a lazy object is built as it arrives.
                 obj @ GenericResult::LazyObject(_) => match obj.materialize_lazy::<S>() {
                     GenericResult::Owned(o) => {
-                        values.push(o);
+                        elements.push_value(o);
                         continue;
                     }
                     failed => {
@@ -9352,7 +9356,9 @@ fn fold_cursor_elements<S: EvalSemantics, V: DocumentValue, I: ExactSizeIterator
                         {
                             went_back = true;
                         }
-                        (values, per_element) = leave_computed_run(values, per_element);
+                        let run;
+                        (elements, run) = elements.take_values();
+                        (values, per_element) = leave_computed_run(run, per_element);
                         per_element.push(failed);
                         continue;
                     }
@@ -9363,7 +9369,9 @@ fn fold_cursor_elements<S: EvalSemantics, V: DocumentValue, I: ExactSizeIterator
                     {
                         went_back = true;
                     }
-                    (values, per_element) = leave_computed_run(values, per_element);
+                    let run;
+                    (elements, run) = elements.take_values();
+                    (values, per_element) = leave_computed_run(run, per_element);
                     // Out of line, so that this loop holds one element's result at a time.
                     match push_element_result_cold::<S, V>(values, per_element, other) {
                         Ok(kept) => (values, per_element) = kept,
@@ -9383,11 +9391,17 @@ fn fold_cursor_elements<S: EvalSemantics, V: DocumentValue, I: ExactSizeIterator
         );
         if mode == WATCHING
             && per_element.len() == COMPUTED_RUN_MIN
-            && elements.len() >= COMPUTED_RUN_MIN
+            && elements.left() >= COMPUTED_RUN_MIN
         {
             mode = MOVED;
-            (per_element, values) = move_computed_run(per_element, elements.len());
+            (per_element, elements) = move_computed_run(per_element, elements);
         }
+    }
+    // A fold that moved and never went back hands its run on: in place, the elements' own buffer.
+    if mode == MOVED {
+        #[cfg(test)]
+        batch_stats_7267::note_in_place(ElementRun::<T, OwnedValue>::IN_PLACE);
+        return finish_computed_run::<S, V>(elements.into_values(), per_element, true);
     }
     // Main's `for` loop consumed the elements, so their cursors were freed before the flatten
     // (#7267 review: kept to here, 100,000 of them held 3.1 MiB more at the peak).
@@ -9400,10 +9414,9 @@ fn fold_cursor_elements<S: EvalSemantics, V: DocumentValue, I: ExactSizeIterator
             &per_element,
         );
     }
-    // A fold that moved has a run sized for its elements, and one that went back with a long run
-    // keeps it; otherwise `values` holds no allocation.
+    // A fold that went back with a long run keeps it; otherwise `values` holds no allocation.
     if values.capacity() != 0 {
-        return finish_computed_run::<S, V>(values, per_element, mode == MOVED);
+        return finish_computed_run::<S, V>(values, per_element, false);
     }
     // Nothing to free; dropping it was an out-of-line call of 25 instructions per fold (#7267
     // review, cachegrind on the AMD Ryzen 9 7950X).
@@ -9459,23 +9472,24 @@ fn push_element_result_cold<S: EvalSemantics, V: DocumentValue>(
     Ok((values, per_element))
 }
 
-/// The move of [`fold_cursor_elements`]: the values of the batch's entries so far into one
-/// vector sized for every element of the fold (#7267). The batch keeps its capacity, one entry
-/// per element, should the fold need it again.
+/// The move of [`fold_cursor_elements`]: the values of the batch's entries so far into the run,
+/// which has room for every element of the fold (#7267): the slots of the elements already read,
+/// one per entry, or a vector of its own (#7412). The batch keeps its capacity, one entry per
+/// element, should the fold need it again.
 #[inline(never)]
-fn move_computed_run<V: DocumentValue>(
+fn move_computed_run<V: DocumentValue, T>(
     mut per_element: Vec<GenericResult<V>>,
-    left: usize,
-) -> (Vec<GenericResult<V>>, Vec<OwnedValue>) {
-    let mut values = vec_with_capacity(per_element.len() + left);
+    mut elements: ElementRun<T, OwnedValue>,
+) -> (Vec<GenericResult<V>>, ElementRun<T, OwnedValue>) {
+    elements.reserve_values(per_element.len() + elements.left());
     // Taken out in place rather than drained, which keeps the batch's capacity.
     for entry in &mut per_element {
         if let GenericResult::Owned(o) = core::mem::replace(entry, GenericResult::None) {
-            values.push(o);
+            elements.push_value(o);
         }
     }
     per_element.clear();
-    (per_element, values)
+    (per_element, elements)
 }
 
 /// The way back of [`fold_cursor_elements`] to main's batch (#7267). A short run goes back as the
@@ -9516,6 +9530,7 @@ fn finish_computed_run<S: EvalSemantics, V: DocumentValue>(
         batch_stats_7267::note_fold(batch_stats_7267::Fold::Values {
             elements: per_element.capacity(),
             reserved,
+            in_place: batch_stats_7267::take_in_place(),
             len: values.len(),
             capacity: values.capacity(),
         });
@@ -9618,6 +9633,9 @@ mod batch_stats_7267 {
             elements: usize,
             /// The capacity of its vector of values before the slack was given back.
             reserved: usize,
+            /// Whether that vector is the elements' own buffer, the values written over the
+            /// elements already read (#7412), rather than one the fold reserved.
+            in_place: bool,
             /// The vector it handed on.
             len: usize,
             capacity: usize,
@@ -9646,6 +9664,16 @@ mod batch_stats_7267 {
 
     std::thread_local! {
         static STATS: RefCell<Stats> = RefCell::new(Stats::default());
+        /// Whether the fold about to be noted wrote its values in place (#7412).
+        static IN_PLACE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    }
+
+    pub(super) fn note_in_place(in_place: bool) {
+        IN_PLACE.with(|c| c.set(in_place));
+    }
+
+    pub(super) fn take_in_place() -> bool {
+        IN_PLACE.with(|c| c.replace(false))
     }
 
     pub(super) fn note_copied(values: usize) {
@@ -9798,7 +9826,33 @@ mod per_element_batch_tests_7267 {
         elements: I,
         eval: impl FnMut(I::Item) -> GenericResult<Doc<'static>>,
     ) -> GenericResult<Doc<'static>> {
-        fold_cursor_elements::<JqSemantics, _, I>(elements, eval)
+        fold_cursor_elements::<JqSemantics, _, I::Item>(elements.collect(), eval)
+    }
+
+    // #7412: a JSON document's cursor has a value's layout, so a fold over its elements writes
+    // its values over the cursors already read instead of holding both. A cursor or value that
+    // grows past the other's size would lose that silently; this fails the test build instead.
+    const _: () = assert!(ElementRun::<Cursor<'static>, OwnedValue>::IN_PLACE);
+
+    /// #7412: the vector a moved fold over a document's elements hands on is the cursors' own.
+    #[test]
+    fn a_moved_fold_hands_on_the_cursors_buffer_7412() {
+        // A power of two, so the cursors' vector has no slack for the fold to give back.
+        let n = 4 * COMPUTED_RUN_MIN;
+        let doc = format!("[{}]", vec!["1"; n].join(","));
+        let cs = cursors(doc.as_bytes());
+        assert_eq!(cs.capacity(), n);
+        let at = cs.as_ptr() as usize;
+        let GenericResult::ManyOwned(values) =
+            fold_cursor_elements::<JqSemantics, Doc<'static>, _>(cs, |_| {
+                GenericResult::Owned(OwnedValue::Int(2))
+            })
+        else {
+            panic!("expected the computed values") // patchcov: coverage tolerate-line reason="the failure message of the pattern above, unreachable in a passing suite (#7412)"
+        };
+        assert_eq!(values.as_ptr() as usize, at);
+        assert_eq!(values.len(), n);
+        assert!(values.iter().all(|v| matches!(v, OwnedValue::Int(2))));
     }
 
     fn capacity(r: &GenericResult<Doc<'static>>) -> Option<usize> {
@@ -10150,7 +10204,7 @@ mod per_element_batch_tests_7267 {
     fn folds_hand_on_tight_vectors_and_copy_linearly_7267() {
         use rand::{RngExt, SeedableRng};
         let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(7267);
-        let (mut released, mut went_back, mut inner_folds) = (0, 0, 0);
+        let (mut released, mut went_back, mut inner_folds, mut in_place_folds) = (0, 0, 0, 0);
         for case in 0..40 {
             let depth = 1 + case % 3;
             let n = rng.random_range(1..if depth == 1 { 600 } else { 40 });
@@ -10188,11 +10242,19 @@ mod per_element_batch_tests_7267 {
                     Fold::Values {
                         elements,
                         reserved,
+                        in_place,
                         len,
                         capacity,
                     } => {
                         produced += len;
-                        assert!(reserved <= elements, "case {case}: {fold:?}");
+                        // #7412: in place the vector is the elements' own buffer, which the fold
+                        // did not reserve; it holds every element, so it is at least that long.
+                        if in_place {
+                            in_place_folds += 1;
+                            assert!(reserved >= elements, "case {case}: {fold:?}");
+                        } else {
+                            assert!(reserved <= elements, "case {case}: {fold:?}");
+                        }
                         assert!(
                             capacity <= len + slack_allowed(len),
                             "case {case}: {fold:?}"
@@ -10237,6 +10299,8 @@ mod per_element_batch_tests_7267 {
         assert!(inner_folds > 30, "{inner_folds} inner folds moved");
         assert!(released > 10, "{released} folds gave slack back");
         assert!(went_back > 10, "{went_back} folds went back to the batch");
+        // A JSON cursor is a value's size, so the folds over the elements wrote in place (#7412).
+        assert!(in_place_folds > 10, "{in_place_folds} folds wrote in place");
     }
 }
 
@@ -15297,7 +15361,7 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
                 let eval = |c: V::Cursor| {
                     eval_single_pipe::<S, _>(rest, &rest_whole, c.value(), optional, Some(c))
                 };
-                return fold_cursor_elements::<S, V, _>(cs.into_iter(), eval);
+                return fold_cursor_elements::<S, V, _>(cs, eval);
             }
             // The whole point of `LazyKeys`: `length` always, and
             // `.[]`, `.[n]`, `first`, and `last` when `!sorted`, all
@@ -32670,7 +32734,7 @@ fn iterate_groups<S: EvalSemantics, V: DocumentValue>(
 ) -> GenericResult<V> {
     #[cfg(test)]
     iterate_groups_count::bump();
-    fold_cursor_elements::<S, V, _>(groups.into_iter(), |group| {
+    fold_cursor_elements::<S, V, _>(groups, |group| {
         fold_pipe_stages::<S, V>(group_value::<V>(group), rest, optional)
     })
 }
