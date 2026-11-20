@@ -15330,12 +15330,7 @@ pub(crate) fn owned_container_key_builtin<S: EvalSemantics>(
 /// very node it came from, as in jq. `None` for anything else, whose
 /// diagnostics stay the evaluator's.
 fn owned_to_entries(input: &OwnedValue) -> Option<OwnedValue> {
-    let entry = |key: OwnedValue, value: &OwnedValue| {
-        OwnedValue::object_from([
-            ("key".to_string(), key),
-            ("value".to_string(), value.clone()),
-        ])
-    };
+    let entry = |key: OwnedValue, value: &OwnedValue| OwnedValue::entry(key, value.clone());
     let entries: Vec<OwnedValue> = match input {
         OwnedValue::Object(fields) => fields
             .occurrences()
@@ -25315,10 +25310,7 @@ fn builtin_to_entries<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     Ok(v) => v,
                     Err(e) => return suppress_or_raise(e, optional),
                 };
-                let mut entry = FieldMap::new();
-                entry.insert("key".to_string(), OwnedValue::Int(i as i64));
-                entry.insert("value".to_string(), val);
-                entries.push(OwnedValue::Object(entry.into()));
+                entries.push(OwnedValue::entry(OwnedValue::Int(i as i64), val));
             }
             QueryResult::Owned(OwnedValue::array_from(entries))
         }
@@ -25358,13 +25350,10 @@ fn builtin_to_entries<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     Err(e) => return suppress_or_raise(e, optional),
                 };
 
-                let mut entry = FieldMap::new();
-                entry.insert(
-                    "key".to_string(),
+                entries.push(OwnedValue::entry(
                     OwnedValue::String(key.into_owned().into()),
-                );
-                entry.insert("value".to_string(), val);
-                entries.push(OwnedValue::Object(entry.into()));
+                    val,
+                ));
             }
             QueryResult::Owned(OwnedValue::array_from(entries))
         }

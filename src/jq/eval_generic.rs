@@ -124,7 +124,7 @@ use super::tail_call::{
 use super::value::FieldMap;
 use super::value::{
     jq_literal_int_to_f64, owned_value_eq, subarray_indices, NumberRepr, ObjectMapOf, OwnedValue,
-    Teardown,
+    SharableString, Teardown,
 };
 
 /// Recursion-depth ceiling for [`to_owned`]/[`to_owned_cursor`]/
@@ -1661,14 +1661,21 @@ impl<V: Clone + Teardown> ObjectBuilder<V> {
     /// Appends a member.
     #[inline]
     pub fn push<S: EvalSemantics>(&mut self, key: String, value: V) {
+        self.push_shared::<S>(SharableString::from(key), value);
+    }
+
+    /// [`push`](Self::push), with a key that may share its storage with the same key of the
+    /// records around this one (#7260).
+    #[inline]
+    pub fn push_shared<S: EvalSemantics>(&mut self, key: SharableString, value: V) {
         if let Some(shadowed) = &mut self.shadowed {
-            shadowed.push_occurrence(key, value);
+            shadowed.push_occurrence(key.into_string(), value);
         } else if S::COLLAPSE_DUPLICATE_KEYS {
-            self.plain.insert(key, value);
+            self.plain.insert_shared(key, value);
         } else {
             // The first repeat: the members so far become the collapsed view, the replaced value
             // the key's earlier entry. One lookup per member until then, as `insert` always was.
-            if let (slot, Some(old)) = self.plain.insert_full(key, value) {
+            if let (slot, Some(old)) = self.plain.insert_shared_full(key, value) {
                 let mut shadowed = ObjectMapOf::from(core::mem::take(&mut self.plain));
                 shadowed.shadow_replaced(slot, old);
                 self.shadowed = Some(shadowed);
@@ -41577,13 +41584,10 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 let cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
                 let mut entries: Vec<OwnedValue> = Vec::new();
                 for (i, elem_cursor) in cursors.into_iter().enumerate() {
-                    let mut entry = FieldMap::with_capacity(2);
-                    entry.insert("key".to_string(), OwnedValue::Int(i as i64));
-                    entry.insert(
-                        "value".to_string(),
+                    entries.push(OwnedValue::entry(
+                        OwnedValue::Int(i as i64),
                         owned_or_suppress!(to_owned_cursor::<S, _>(&elem_cursor), optional),
-                    );
-                    entries.push(OwnedValue::Object(entry.into()));
+                    ));
                 }
                 GenericResult::Owned(OwnedValue::array_from(entries))
             } else if let Some(fields) = value.as_object_rendered() {
@@ -41670,15 +41674,11 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                     if !value_delimiter_ok::<V::Fields>(Some(&field.value), &field.value_cursor) {
                         return GenericResult::Error(fields.malformed_member_error());
                     }
-                    // #7260: sized for its two entries, where `new()` grows to three (192 bytes
-                    // where two take 128, on every entry).
-                    let mut entry = FieldMap::with_capacity(2);
-                    entry.insert("key".to_string(), key);
-                    entry.insert(
-                        "value".to_string(),
+                    // #7260: sized for its two entries, its two keys shared.
+                    entries.push(OwnedValue::entry(
+                        key,
                         owned_or_suppress!(to_owned_cursor::<S, _>(&field.value_cursor), optional),
-                    );
-                    entries.push(OwnedValue::Object(entry.into()));
+                    ));
                 }
                 // #2261: trailing stray comma after a real last field
                 // (`{"a":1,}`).
@@ -46037,10 +46037,7 @@ fn map_family_positioned_builtin(builtin: &Builtin) -> Option<(MapFamily, &Expr)
 
 /// One `{"key": k, "value": v}` entry, as `to_entries` builds it.
 fn map_family_entry(key: OwnedValue, value: OwnedValue) -> OwnedValue {
-    let mut entry = FieldMap::with_capacity(2);
-    entry.insert("key".to_string(), key);
-    entry.insert("value".to_string(), value);
-    OwnedValue::Object(entry.into())
+    OwnedValue::entry(key, value)
 }
 
 /// The `(component, member)` pairs a map-family stage's body runs over, or

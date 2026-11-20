@@ -91,7 +91,7 @@ use core::ops::{Deref, DerefMut};
 use indexmap::IndexMap;
 
 use super::field_map::{self, FieldMap};
-use super::Teardown;
+use super::{SharableString, Teardown};
 
 /// Records a forced copy for [`share_stats`](crate::jq::share_stats), in the
 /// builds that read it.
@@ -297,6 +297,15 @@ impl<V: Teardown> ObjectMapOf<V> {
     #[inline]
     pub fn is_shared(&self) -> bool {
         Rc::strong_count(&self.map) > 1
+    }
+
+    /// A handle on the key at `pos` of the collapsed view that shares its
+    /// storage ([`FieldMap::share_key`]), when this handle owns the map
+    /// alone: a builder's just-built record, whose next sibling repeats the
+    /// key (#7260). `None`, leaving the key as it is, when the map is shared.
+    #[inline]
+    pub fn share_key(&mut self, pos: usize) -> Option<SharableString> {
+        self.unique_map()?.share_key(pos)
     }
 
     /// Whether some key of this object has more than one entry, i.e. whether

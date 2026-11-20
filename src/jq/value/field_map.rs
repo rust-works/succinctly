@@ -51,6 +51,12 @@ use core::hash::BuildHasher;
 use hashbrown::HashTable;
 use indexmap::IndexMap;
 
+use super::SharableString;
+
+/// One field: its key (inline, or shared with the same key of the records
+/// around it, #7260) and its value.
+type Field<V> = (SharableString, V);
+
 /// The most fields an object holds without a hash index (#7260).
 ///
 /// Up to this a lookup is a scan comparing key lengths and last bytes first,
@@ -178,7 +184,7 @@ impl FieldIndex {
     }
 
     /// Indexes every field of `entries` afresh.
-    fn rebuild<V>(&mut self, entries: &[(String, V)]) {
+    fn rebuild<V>(&mut self, entries: &[Field<V>]) {
         self.table.clear();
         self.table.reserve(entries.len(), rehash);
         for (pos, (key, _)) in entries.iter().enumerate() {
@@ -199,14 +205,14 @@ pub struct FieldMap<V>(Repr<V>);
 /// `Option<Box<_>>` index would be 48 bytes and a 64-byte chunk.
 enum Repr<V> {
     /// At most [`SMALL_FIELDS`] fields: looked up by scanning.
-    Small(Vec<(String, V)>),
+    Small(Vec<Field<V>>),
     /// More: the same list plus its hash index.
     Large(Box<Large<V>>),
 }
 
 /// A [`FieldMap`] past [`SMALL_FIELDS`] fields.
 struct Large<V> {
-    entries: Vec<(String, V)>,
+    entries: Vec<Field<V>>,
     index: FieldIndex,
 }
 
@@ -214,12 +220,12 @@ impl<V> Large<V> {
     /// [`FieldMap::insert_full`] in one probe of the table, as `IndexMap`'s
     /// own insert is: a miss leaves the probe at the slot the new field takes.
     #[inline]
-    fn insert_full(&mut self, key: String, value: V) -> (usize, Option<V>) {
+    fn insert_full(&mut self, key: SharableString, value: V) -> (usize, Option<V>) {
         let hash = short_hash(&self.index.state, key.as_str());
         let entries = &self.entries;
         match self.index.table.entry(
             table_hash(hash),
-            |&e| element_hash(e) == hash && entries[element_pos(e)].0 == key,
+            |&e| element_hash(e) == hash && entries[element_pos(e)].0.as_str() == key.as_str(),
             rehash,
         ) {
             hashbrown::hash_table::Entry::Occupied(found) => {
@@ -245,7 +251,7 @@ impl<V> Large<V> {
 
     /// Appends a field whose key is known to be absent and hashes to `hash`.
     #[inline]
-    fn push_absent(&mut self, key: String, value: V, hash: u32) -> usize {
+    fn push_absent(&mut self, key: SharableString, value: V, hash: u32) -> usize {
         let pos = self.entries.len();
         self.index.insert(hash, pos);
         self.reserve_one();
@@ -308,7 +314,7 @@ impl<V> FieldMap<V> {
     }
 
     #[inline]
-    fn entries(&self) -> &Vec<(String, V)> {
+    fn entries(&self) -> &Vec<Field<V>> {
         match &self.0 {
             Repr::Small(entries) => entries,
             Repr::Large(large) => &large.entries,
@@ -318,7 +324,7 @@ impl<V> FieldMap<V> {
     /// The field list, for a change that keeps every key at its position (a
     /// value write) -- or one whose caller fixes the index up itself.
     #[inline]
-    fn entries_mut(&mut self) -> &mut Vec<(String, V)> {
+    fn entries_mut(&mut self) -> &mut Vec<Field<V>> {
         match &mut self.0 {
             Repr::Small(entries) => entries,
             Repr::Large(large) => &mut large.entries,
@@ -332,12 +338,6 @@ impl<V> FieldMap<V> {
             Repr::Small(_) => None,
             Repr::Large(large) => Some(&large.index),
         }
-    }
-
-    /// The fields in order, as a slice of `(key, value)` pairs.
-    #[inline]
-    pub fn as_entries(&self) -> &[(String, V)] {
-        self.entries()
     }
 
     /// How many fields the map holds.
@@ -376,7 +376,7 @@ impl<V> FieldMap<V> {
                 let hash = short_hash(&large.index.state, key);
                 let entries = &large.entries;
                 match large.index.table.find(table_hash(hash), |&e| {
-                    element_hash(e) == hash && entries[element_pos(e)].0 == key
+                    element_hash(e) == hash && entries[element_pos(e)].0.as_str() == key
                 }) {
                     Some(&e) => Probe::Found(element_pos(e)),
                     None => Probe::Absent(Some(hash)),
@@ -424,7 +424,7 @@ impl<V> FieldMap<V> {
     {
         let pos = self.get_index_of(key)?;
         let (k, v) = &self.entries()[pos];
-        Some((k, v))
+        Some((&**k, v))
     }
 
     /// The position, stored key and value for `key`.
@@ -435,7 +435,7 @@ impl<V> FieldMap<V> {
     {
         let pos = self.get_index_of(key)?;
         let (k, v) = &self.entries()[pos];
-        Some((pos, k, v))
+        Some((pos, &**k, v))
     }
 
     /// The value for `key`, mutably.
@@ -456,7 +456,7 @@ impl<V> FieldMap<V> {
     {
         let pos = self.get_index_of(key)?;
         let (k, v) = &mut self.entries_mut()[pos];
-        Some((&*k, v))
+        Some((&**k, v))
     }
 
     /// The position, stored key and value for `key`, mutably.
@@ -467,49 +467,49 @@ impl<V> FieldMap<V> {
     {
         let pos = self.get_index_of(key)?;
         let (k, v) = &mut self.entries_mut()[pos];
-        Some((pos, &*k, v))
+        Some((pos, &**k, v))
     }
 
     /// The field at position `pos`.
     #[inline]
     pub fn get_index(&self, pos: usize) -> Option<(&String, &V)> {
-        self.entries().get(pos).map(|(k, v)| (k, v))
+        self.entries().get(pos).map(|(k, v)| (&**k, v))
     }
 
     /// The field at position `pos`, its value mutably.
     #[inline]
     pub fn get_index_mut(&mut self, pos: usize) -> Option<(&String, &mut V)> {
-        self.entries_mut().get_mut(pos).map(|(k, v)| (&*k, v))
+        self.entries_mut().get_mut(pos).map(|(k, v)| (&**k, v))
     }
 
     /// The first field.
     #[inline]
     pub fn first(&self) -> Option<(&String, &V)> {
-        self.entries().first().map(|(k, v)| (k, v))
+        self.entries().first().map(|(k, v)| (&**k, v))
     }
 
     /// The first field, its value mutably.
     #[inline]
     pub fn first_mut(&mut self) -> Option<(&String, &mut V)> {
-        self.entries_mut().first_mut().map(|(k, v)| (&*k, v))
+        self.entries_mut().first_mut().map(|(k, v)| (&**k, v))
     }
 
     /// The last field.
     #[inline]
     pub fn last(&self) -> Option<(&String, &V)> {
-        self.entries().last().map(|(k, v)| (k, v))
+        self.entries().last().map(|(k, v)| (&**k, v))
     }
 
     /// The last field, its value mutably.
     #[inline]
     pub fn last_mut(&mut self) -> Option<(&String, &mut V)> {
-        self.entries_mut().last_mut().map(|(k, v)| (&*k, v))
+        self.entries_mut().last_mut().map(|(k, v)| (&**k, v))
     }
 
     /// Appends a field whose key is known to be absent; `hash` is the key's
     /// short hash when the map is indexed. Returns its position.
     #[inline]
-    fn push_absent(&mut self, key: String, value: V, hash: Option<u32>) -> usize {
+    fn push_absent(&mut self, key: SharableString, value: V, hash: Option<u32>) -> usize {
         if let Repr::Small(entries) = &mut self.0 {
             if entries.len() < SMALL_FIELDS {
                 let pos = entries.len();
@@ -571,9 +571,23 @@ impl<V> FieldMap<V> {
         self.insert_full(key, value).1
     }
 
+    /// [`insert`](Self::insert) with a key that may share its storage with
+    /// the same key of other objects (#7260). An existing key keeps the
+    /// handle it has.
+    #[inline]
+    pub fn insert_shared(&mut self, key: SharableString, value: V) -> Option<V> {
+        self.insert_shared_full(key, value).1
+    }
+
     /// [`insert`](Self::insert), also returning the field's position.
     #[inline]
     pub fn insert_full(&mut self, key: String, value: V) -> (usize, Option<V>) {
+        self.insert_shared_full(SharableString::from(key), value)
+    }
+
+    /// [`insert_full`](Self::insert_full) with a key that may be shared.
+    #[inline]
+    pub fn insert_shared_full(&mut self, key: SharableString, value: V) -> (usize, Option<V>) {
         if let Repr::Large(large) = &mut self.0 {
             return large.insert_full(key, value);
         }
@@ -599,8 +613,32 @@ impl<V> FieldMap<V> {
         }
     }
 
+    /// The key at `pos`, with its storage.
+    #[inline]
+    pub fn key_at(&self, pos: usize) -> Option<&SharableString> {
+        self.entries().get(pos).map(|(k, _)| k)
+    }
+
+    /// A handle on the key at `pos` that shares its storage: the key is
+    /// moved behind a refcount first if it is inline (#7260). Changes how
+    /// the key is held, not what it is, so a map another handle shares is a
+    /// caller's to avoid: this is for a map a builder still owns alone, whose
+    /// next sibling repeats the key.
+    #[inline]
+    pub fn share_key(&mut self, pos: usize) -> Option<SharableString> {
+        let key = &mut self.entries_mut().get_mut(pos)?.0;
+        key.promote();
+        Some(key.clone())
+    }
+
     /// Removes the field at `pos`, shifting every later one down.
     pub fn shift_remove_index(&mut self, pos: usize) -> Option<(String, V)> {
+        self.shift_remove_field(pos)
+            .map(|(k, v)| (k.into_string(), v))
+    }
+
+    /// [`shift_remove_index`](Self::shift_remove_index), the key as stored.
+    fn shift_remove_field(&mut self, pos: usize) -> Option<Field<V>> {
         let len = self.len();
         if pos >= len {
             return None;
@@ -626,6 +664,12 @@ impl<V> FieldMap<V> {
 
     /// Removes the field at `pos`, moving the last field into its place.
     pub fn swap_remove_index(&mut self, pos: usize) -> Option<(String, V)> {
+        self.swap_remove_field(pos)
+            .map(|(k, v)| (k.into_string(), v))
+    }
+
+    /// [`swap_remove_index`](Self::swap_remove_index), the key as stored.
+    fn swap_remove_field(&mut self, pos: usize) -> Option<Field<V>> {
         let len = self.len();
         if pos >= len {
             return None;
@@ -758,14 +802,16 @@ impl<V> FieldMap<V> {
 
     /// Sorts the fields by key.
     pub fn sort_keys(&mut self) {
-        self.entries_mut().sort_by(|a, b| a.0.cmp(&b.0));
+        self.entries_mut()
+            .sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
         self.reindex_after_reorder();
     }
 
     /// Sorts the fields by key, not keeping equal keys' order (keys are
     /// unique, so the result is [`sort_keys`](Self::sort_keys)').
     pub fn sort_unstable_keys(&mut self) {
-        self.entries_mut().sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        self.entries_mut()
+            .sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
         self.reindex_after_reorder();
     }
 
@@ -846,25 +892,38 @@ impl<V> FieldMap<V> {
     /// The keys in order, by value.
     #[inline]
     pub fn into_keys(self) -> impl DoubleEndedIterator<Item = String> + ExactSizeIterator {
-        self.into_entries().into_iter().map(|(k, _)| k)
+        self.into_fields().into_iter().map(|(k, _)| k.into_string())
     }
 
     /// The values in order, by value.
     #[inline]
     pub fn into_values(self) -> impl DoubleEndedIterator<Item = V> + ExactSizeIterator {
-        self.into_entries().into_iter().map(|(_, v)| v)
+        self.into_fields().into_iter().map(|(_, v)| v)
     }
 
     /// Removes and yields every field, in order.
     #[inline]
-    pub fn drain(&mut self) -> alloc::vec::Drain<'_, (String, V)> {
+    pub fn drain(
+        &mut self,
+    ) -> impl DoubleEndedIterator<Item = (String, V)> + ExactSizeIterator + '_ {
         self.drop_index();
-        self.entries_mut().drain(..)
+        self.entries_mut()
+            .drain(..)
+            .map(|(k, v)| (k.into_string(), v))
     }
 
     /// The fields as a plain list, by move.
     #[inline]
     pub fn into_entries(self) -> Vec<(String, V)> {
+        self.into_fields()
+            .into_iter()
+            .map(|(k, v)| (k.into_string(), v))
+            .collect()
+    }
+
+    /// The fields, keys as stored.
+    #[inline]
+    fn into_fields(self) -> Vec<Field<V>> {
         match self.0 {
             Repr::Small(entries) => entries,
             Repr::Large(large) => large.entries,
@@ -875,6 +934,10 @@ impl<V> FieldMap<V> {
     /// repeats (checked in debug builds).
     #[inline]
     pub fn from_unique_entries(entries: Vec<(String, V)>) -> Self {
+        let entries: Vec<Field<V>> = entries
+            .into_iter()
+            .map(|(k, v)| (SharableString::from(k), v))
+            .collect();
         debug_assert!(
             keys_are_unique(&entries),
             "from_unique_entries given a repeated key"
@@ -888,9 +951,9 @@ impl<V> FieldMap<V> {
 }
 
 /// Whether no key of `entries` repeats (a debug-build check).
-fn keys_are_unique<V>(entries: &[(String, V)]) -> bool {
-    let mut keys: Vec<&String> = entries.iter().map(|(k, _)| k).collect();
-    keys.sort();
+fn keys_are_unique<V>(entries: &[Field<V>]) -> bool {
+    let mut keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+    keys.sort_unstable();
     keys.windows(2).all(|w| w[0] != w[1])
 }
 
@@ -964,7 +1027,7 @@ impl<V, S> From<IndexMap<String, V, S>> for FieldMap<V> {
 impl<V> From<FieldMap<V>> for IndexMap<String, V> {
     #[inline]
     fn from(map: FieldMap<V>) -> Self {
-        map.into_entries().into_iter().collect()
+        map.into_iter().collect()
     }
 }
 
@@ -1002,7 +1065,7 @@ impl<V> IntoIterator for FieldMap<V> {
 
     #[inline]
     fn into_iter(self) -> IntoIter<V> {
-        self.into_entries().into_iter()
+        IntoIter(self.into_fields().into_iter())
     }
 }
 
@@ -1026,13 +1089,38 @@ impl<'a, V> IntoIterator for &'a mut FieldMap<V> {
     }
 }
 
-/// By-value iteration over a [`FieldMap`].
-pub type IntoIter<V> = alloc::vec::IntoIter<(String, V)>;
+/// By-value iteration over a [`FieldMap`]; a shared key comes out as a copy.
+pub struct IntoIter<V>(alloc::vec::IntoIter<Field<V>>);
+
+impl<V> Iterator for IntoIter<V> {
+    type Item = (String, V);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(|(k, v)| (k.into_string(), v))
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+
+impl<V> DoubleEndedIterator for IntoIter<V> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.0.next_back().map(|(k, v)| (k.into_string(), v))
+    }
+}
+
+impl<V> ExactSizeIterator for IntoIter<V> {}
+
+impl<V> core::iter::FusedIterator for IntoIter<V> {}
 
 macro_rules! slice_iter {
     ($(#[$doc:meta])* $name:ident, $slice:ident, $item:ty, |$e:ident| $map:expr) => {
         $(#[$doc])*
-        pub struct $name<'a, V>(core::slice::$slice<'a, (String, V)>);
+        pub struct $name<'a, V>(core::slice::$slice<'a, Field<V>>);
 
         impl<'a, V> Iterator for $name<'a, V> {
             type Item = $item;
@@ -1088,15 +1176,15 @@ macro_rules! slice_iter {
 
 slice_iter!(
     /// Iteration over a [`FieldMap`]'s fields.
-    Iter, Iter, (&'a String, &'a V), |e| (&e.0, &e.1)
+    Iter, Iter, (&'a String, &'a V), |e| (&*e.0, &e.1)
 );
 slice_iter!(
     /// Iteration over a [`FieldMap`]'s fields, values mutably.
-    IterMut, IterMut, (&'a String, &'a mut V), |e| (&e.0, &mut e.1)
+    IterMut, IterMut, (&'a String, &'a mut V), |e| (&*e.0, &mut e.1)
 );
 slice_iter!(
     /// Iteration over a [`FieldMap`]'s keys.
-    Keys, Iter, &'a String, |e| &e.0
+    Keys, Iter, &'a String, |e| &*e.0
 );
 slice_iter!(
     /// Iteration over a [`FieldMap`]'s values.
@@ -1125,14 +1213,6 @@ impl<V> Clone for Values<'_, V> {
     #[inline]
     fn clone(&self) -> Self {
         Self(self.0.clone())
-    }
-}
-
-impl<'a, V> Iter<'a, V> {
-    /// The fields not yet yielded, as a slice.
-    #[inline]
-    pub fn as_slice(&self) -> &'a [(String, V)] {
-        self.0.as_slice()
     }
 }
 
@@ -1235,7 +1315,9 @@ impl<'a, V> VacantEntry<'a, V> {
     /// Appends the key with `value`.
     #[inline]
     pub fn insert(self, value: V) -> &'a mut V {
-        let pos = self.map.push_absent(self.key, value, self.hash);
+        let pos = self
+            .map
+            .push_absent(SharableString::from(self.key), value, self.hash);
         &mut self.map.entries_mut()[pos].1
     }
 }

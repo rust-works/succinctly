@@ -42,6 +42,27 @@ pub use object_map::{
     Occurrences, VacantMapEntry,
 };
 
+/// The keys of a [`OwnedValue::entry`], shared: one refcounted `"key"` and `"value"` per thread.
+#[cfg(feature = "std")]
+fn entry_keys() -> (SharableString, SharableString) {
+    std::thread_local! {
+        static KEYS: (SharableString, SharableString) = {
+            let mut key = SharableString::from("key");
+            key.promote();
+            let mut value = SharableString::from("value");
+            value.promote();
+            (key, value)
+        };
+    }
+    KEYS.with(|(key, value)| (key.clone(), value.clone()))
+}
+
+/// The keys of a [`OwnedValue::entry`]; without `std` there is no thread-local to share them in.
+#[cfg(not(feature = "std"))]
+fn entry_keys() -> (SharableString, SharableString) {
+    (SharableString::from("key"), SharableString::from("value"))
+}
+
 /// Recursion-depth ceiling for tree-walkers over an already-materialized
 /// [`OwnedValue`] (#1005).
 ///
@@ -4327,6 +4348,19 @@ impl OwnedValue {
         Self::Object(pairs.into_iter().collect())
     }
 
+    /// One `{"key": key, "value": value}` entry, as `to_entries` builds it.
+    ///
+    /// The two keys share their storage with every entry built on this thread (#7260), as jq's
+    /// entries hold its constant pool's one `"key"` and `"value"`: an entry is then its map and
+    /// its two values, not two more 3- and 5-byte strings each.
+    pub(crate) fn entry(key: Self, value: Self) -> Self {
+        let (key_key, value_key) = entry_keys();
+        let mut entry = FieldMap::with_capacity(2);
+        entry.insert_shared(key_key, key);
+        entry.insert_shared(value_key, value);
+        Self::Object(entry.into())
+    }
+
     /// Check if this value is null.
     pub fn is_null(&self) -> bool {
         matches!(self, Self::Null | Self::SpelledScalar(ScalarKind::Null, _))
@@ -7381,6 +7415,20 @@ mod tests {
     /// so the shadow-aware mutators are reachable, and an `&mut FieldMap`
     /// annotation still compiles by deref coercion -- which is what the `let`
     /// below exercises.
+    /// #7260: every `to_entries` entry holds the same `"key"` and `"value"` strings, as jq's do
+    /// (with `std`, which has the thread-local they are kept in).
+    #[test]
+    #[cfg(feature = "std")]
+    fn entries_share_their_two_keys_7260() {
+        let a = OwnedValue::entry(OwnedValue::Int(0), OwnedValue::Null);
+        let b = OwnedValue::entry(OwnedValue::string("k"), OwnedValue::Bool(true));
+        assert_eq!(b.to_json(), r#"{"key":"k","value":true}"#);
+        let (a, b) = (a.as_object().unwrap(), b.as_object().unwrap());
+        for pos in 0..2 {
+            assert!(a.key_at(pos).unwrap().ptr_eq(b.key_at(pos).unwrap()));
+        }
+    }
+
     #[test]
     fn as_object_accessors_still_hand_out_a_bare_field_map_3000() {
         let mut value = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
