@@ -8,10 +8,12 @@ This document describes the release process for succinctly.
 
 Releases are automated via GitHub Actions. When you push a tag matching `v*`, the release workflow:
 
-1. Creates a GitHub release
-2. Builds binaries for 4 platforms (linux-x64, linux-arm64, macos-arm64, windows)
-3. Uploads archives to the GitHub release
-4. Publishes the crate to crates.io
+1. Packages the crate and builds it from its own files, and stops if it is too large for crates.io (see
+   [The published crate](#the-published-crate))
+2. Creates a GitHub release
+3. Builds binaries for 4 platforms (linux-x64, linux-arm64, macos-arm64, windows)
+4. Uploads archives to the GitHub release
+5. Publishes the crate to crates.io
 
 ## Prerequisites
 
@@ -205,6 +207,29 @@ a CI cleanup; `scripts/test_ci_runner_pin.py` fails until that is a deliberate e
 A change to those flags is measured the way #5035 was: the same tree built with and without them, and
 `scripts/ab-cli.py` (`--control` first) over `yaml generate-suite` / `json generate-suite` inputs of 1 MB and 10 MB
 ([simd.md](../optimizations/simd.md#per-word-popcounts-on-baseline-x86_64-5035)).
+
+## The published crate
+
+The crate `cargo publish` uploads ships the library and the CLI only: `include` in `Cargo.toml` is `/src/**/*`,
+`/Cargo.toml`, `/LICENSE` and `/README.md`, and cargo adds `Cargo.lock`.
+`tests/`, `benches/`, `examples/` and the docs stay in the repository, so the crate's `[[bench]]` targets are dropped
+from the packaged manifest (cargo prints `ignoring benchmark` for each).
+The tests run from a checkout, not from the downloaded crate: several unit tests `include_str!` fixtures under
+`tests/`, which the crate does not ship.
+crates.io refuses a `.crate` over 10 MiB (10,485,760 bytes), and this workflow publishes last, after the GitHub
+release and its archives exist.
+The v0.8.0 crate with `tests/` and `benches/` still in `include` was 10,434,790 bytes, 51 KB under that limit; without
+them it is about 6.2 MiB.
+`scripts/crate_size.py check --verify --features cli` runs `cargo package --features cli`, which builds the packaged
+library and the `succinctly` binary from the crate's own files, and fails when the `.crate` is over 8 MiB.
+The binary has `required-features = ["cli"]`, so a packaged build without `cli` (such as the one `cargo publish` runs
+by default) compiles only the library and would miss a bad `include_str!` under `src/bin/`.
+It runs in CI's `Crate package` job on every code change, in this workflow's `package-check` job before the release is
+created, and in the pre-push `crate-size` gate (`--full`).
+A file under `src/` may `include_str!` a file outside `include` only inside a `#[cfg(test)]` module; anywhere else the
+packaged build fails.
+When the crate nears the ceiling, keep what does not need to ship out of `include` before raising `CEILING` in the
+script, and never raise it to within 1 MiB of the limit.
 
 ## Troubleshooting
 

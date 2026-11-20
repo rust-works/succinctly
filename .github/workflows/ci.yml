@@ -1321,6 +1321,32 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  # The crate `release.yml` publishes, packaged and built from its own files (`cargo package
+  # --features cli`), against a ceiling 2 MiB under crates.io's 10 MiB upload limit. v0.8.0's crate
+  # came within 51 KB of the limit while it still shipped `tests/` and `benches/`, and the build
+  # catches an `include_str!` of a file outside `include` that is not in a `#[cfg(test)]` module.
+  crate-package:
+    name: Crate package
+    needs: gate
+    # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
+    if: needs.gate.outputs.retest != 'false'
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+        if: needs.gate.outputs.code == 'true'
+
+      - name: Install Rust
+        if: needs.gate.outputs.code == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Crate size self-tests
+        if: needs.gate.outputs.code == 'true'
+        run: python3 scripts/test_crate_size.py -v
+
+      - name: Package the crate and check its size
+        if: needs.gate.outputs.code == 'true'
+        run: python3 scripts/crate_size.py check --verify --features cli
+
   # Pull-request coverage: the sticky patch-coverage comment, diffed against the
   # baseline that coverage-baseline.yml published for the PR's merge-base. Only
   # `pull_request` runs it (#3649): a merge-group build has no PR to comment on

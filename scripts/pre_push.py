@@ -223,6 +223,14 @@ GATES = (
         env={"RUSTDOCFLAGS": "-D warnings"},
     ),
     Gate(
+        "crate-size",
+        "full",
+        ("python3 scripts/crate_size.py check --verify --features cli",),
+        (r"^python3 scripts/crate_size\.py check --verify --features cli$",),
+        paths=("src/*", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "scripts/crate_size.py"),
+        cost=4,
+    ),
+    Gate(
         "no-default-features",
         "full",
         ("cargo test --no-default-features",),

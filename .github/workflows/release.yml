@@ -12,8 +12,21 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # `cargo publish` runs last, after the release and its binaries exist, so a crate crates.io would
+  # refuse (over 10 MiB) or that does not build from its own files is caught here, before anything
+  # is created. scripts/crate_size.py; ci.yml's `Crate package` job runs the same on every PR.
+  package-check:
+    name: Check the crate package
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v7
+    - uses: dtolnay/rust-toolchain@stable
+    - name: Package the crate and check its size
+      run: python3 scripts/crate_size.py check --verify --features cli
+
   create-release:
     name: Create Release
+    needs: package-check
     runs-on: ubuntu-24.04
     outputs:
       upload_url: ${{ steps.create_release.outputs.upload_url }}
