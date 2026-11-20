@@ -8,6 +8,7 @@ use super::*;
 use crate::jq::eval_generic::to_owned;
 use crate::jq::ScalarKind;
 use crate::json::JsonIndex;
+use indexmap::IndexMap;
 
 /// What jq printed: each output compactly, then the uncaught error's message,
 /// if any.

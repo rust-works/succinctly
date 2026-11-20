@@ -2505,6 +2505,28 @@ pub(crate) fn key_display_string_kind<V: DocumentValue>(key: &V) -> Option<(Cow<
     }
 }
 
+/// A map [`DisplayKeyGuard::check`] can ask whether a key is already present:
+/// an object under construction ([`FieldMap`](super::value::FieldMap), #7260)
+/// or a plain `IndexMap` ledger.
+pub trait KeyedMap {
+    /// Whether `key` is present.
+    fn has_key(&self, key: &str) -> bool;
+}
+
+impl<T, S: core::hash::BuildHasher> KeyedMap for IndexMap<String, T, S> {
+    #[inline]
+    fn has_key(&self, key: &str) -> bool {
+        self.contains_key(key)
+    }
+}
+
+impl<T> KeyedMap for super::value::FieldMap<T> {
+    #[inline]
+    fn has_key(&self, key: &str) -> bool {
+        self.contains_key(key)
+    }
+}
+
 /// Guards a display-keyed `IndexMap` (`to_owned`/`materialize`, #1642)
 /// against silently merging two keys that `key_display_string_kind`'s own
 /// contract forbids treating as the same key.
@@ -2540,11 +2562,11 @@ impl DisplayKeyGuard {
     /// collapse two keys that must stay distinct, in which case the caller
     /// should raise instead.
     ///
-    pub fn check<T>(&mut self, map: &IndexMap<String, T>, key: &str, is_fallback: bool) -> bool {
+    pub fn check<M: KeyedMap + ?Sized>(&mut self, map: &M, key: &str, is_fallback: bool) -> bool {
         // The fallback test first: with no fallback key on either side (the
         // ordinary case) it is false without hashing `key` at all (#3478).
         let collides = (is_fallback || self.fallback_keys.iter().any(|seen| seen.as_str() == key))
-            && map.contains_key(key);
+            && map.has_key(key);
         if !collides && is_fallback {
             self.fallback_keys.push(String::from(key));
         }
@@ -2569,9 +2591,9 @@ impl DisplayKeyGuard {
 /// `yq_runner.rs` `--input-format json` bridge (`pub` for that reason,
 /// same as [`DisplayKeyGuard`] and [`key_display_string`] before it) -- one
 /// definition rather than a sixth hand-copied guard-and-raise sequence.
-pub fn resolve_display_key<V: DocumentValue, T>(
+pub fn resolve_display_key<V: DocumentValue, M: KeyedMap + ?Sized>(
     key: &V,
-    map: &IndexMap<String, T>,
+    map: &M,
     guard: &mut DisplayKeyGuard,
 ) -> Result<Option<String>, EvalError> {
     // `display_key_kind`, not `key_display_string_kind`: only a map build
@@ -5377,10 +5399,10 @@ impl<V: DocumentValue, C: DocumentCursor> DocumentField<V, C> {
     /// `Self::Value::Cursor`, which it does not. `F` is inferred from
     /// `fields`, so call sites lose the fully-qualified
     /// `::<<C::Value as DocumentValue>::Fields>` spelling entirely.
-    pub fn checked_key<F, T>(
+    pub fn checked_key<F, M: KeyedMap + ?Sized>(
         &self,
         fields: &F,
-        map: &IndexMap<String, T>,
+        map: &M,
         guard: &mut DisplayKeyGuard,
         is_first: bool,
     ) -> Result<String, EvalError>
@@ -5431,10 +5453,10 @@ impl<V: DocumentValue, C: DocumentCursor> DocumentField<V, C> {
 /// One definition for `checked_key` and for the walks that read a member as
 /// `(key, value, cursor)` ([`DocumentFields::try_for_each_member`]) because
 /// their format checks no delimiters (#2664).
-pub fn checked_member_key<F, T>(
+pub fn checked_member_key<F, M: KeyedMap + ?Sized>(
     key: &F::Value,
     fields: &F,
-    map: &IndexMap<String, T>,
+    map: &M,
     guard: &mut DisplayKeyGuard,
 ) -> Result<String, EvalError>
 where

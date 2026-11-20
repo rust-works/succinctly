@@ -40,8 +40,6 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 
-use indexmap::IndexMap;
-
 use super::c_builtin_identity::{array_index, binop_keeps, format_keeps_input, kept, Kept};
 use super::error::{dump_truncated_with, Control, EvalError};
 use super::eval::{
@@ -60,6 +58,7 @@ use super::resolve::ModuleRun;
 use super::tail_call::{
     declared_tail_call, stage_settles, MAX_LOOP_OUTPUTS, OUTPUT_BUDGET_AFTER_ROUNDS,
 };
+use super::value::FieldMap;
 use super::value::{
     jv_identical, ArrayVec, NumberRepr, OwnedValue, SharableLiteral, SharableString,
 };
@@ -108,7 +107,7 @@ fn unshare_top(value: OwnedValue) -> OwnedValue {
         OwnedValue::Object(map) => OwnedValue::Object(
             map.iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
-                .collect::<IndexMap<_, _>>()
+                .collect::<FieldMap<_>>()
                 .into(),
         ),
         OwnedValue::String(s) => string(&s),
@@ -278,7 +277,7 @@ type Update<'u, 'e> = dyn FnMut(&Interp<'e>, OwnedValue, &mut dyn FnMut(OwnedVal
 
 /// The label value `GENLABEL` makes: `{"__jq": n}`.
 fn label_value(n: u64) -> OwnedValue {
-    let mut map = IndexMap::new();
+    let mut map = FieldMap::new();
     map.insert(String::from("__jq"), OwnedValue::Int(n as i64));
     OwnedValue::Object(map.into())
 }
@@ -1447,7 +1446,7 @@ impl<'e> Interp<'e> {
                 }
                 let entries: Vec<(&'e ObjectKey, &'e Expr)> =
                     entries.iter().map(|e| (&e.key, &e.value)).collect();
-                self.object(&entries, IndexMap::new(), env, &input, &reg, sink)
+                self.object(&entries, FieldMap::new(), env, &input, &reg, sink)
             }
             Expr::RecursiveDescent => self.recurse(None, None, env, input, reg, sink),
             Expr::Arithmetic {
@@ -1961,7 +1960,7 @@ impl<'e> Interp<'e> {
     fn object(
         &self,
         entries: &[(&'e ObjectKey, &'e Expr)],
-        built: IndexMap<String, OwnedValue>,
+        built: FieldMap<OwnedValue>,
         env: &Env<'e>,
         input: &OwnedValue,
         reg: &Reg,
@@ -4197,7 +4196,7 @@ fn unsupported_builtin(builtin: &Builtin) -> Option<&'static str> {
 /// `{"start": s, "end": e}` key selects (`null` bounds default; the start
 /// rounds down and the end up). `None` when a bound is missing or not a
 /// number, which `jv_get` reports as an error.
-fn slice_bounds(len: usize, bounds: &IndexMap<String, OwnedValue>) -> Option<(usize, usize)> {
+fn slice_bounds(len: usize, bounds: &FieldMap<OwnedValue>) -> Option<(usize, usize)> {
     // `jv_object_get` answers *invalid* for a missing key, which is not a
     // number: only an explicit `null` takes the default.
     let bound = |name: &str, default: f64| -> Option<f64> {
@@ -4266,7 +4265,7 @@ fn constant_value(expr: &Expr) -> Option<OwnedValue> {
         Expr::Literal(lit) => literal_value(lit),
         Expr::Paren(inner) => constant_value(inner),
         Expr::Loc { line, file } => {
-            let mut map = IndexMap::new();
+            let mut map = FieldMap::new();
             map.insert(
                 String::from("file"),
                 string(file.as_deref().unwrap_or("<top-level>")),
@@ -4287,7 +4286,7 @@ fn constant_value(expr: &Expr) -> Option<OwnedValue> {
             Some(OwnedValue::Array(values?.into()))
         }
         Expr::Object(entries) => {
-            let mut built: IndexMap<String, OwnedValue> = IndexMap::new();
+            let mut built: FieldMap<OwnedValue> = FieldMap::new();
             for entry in entries {
                 let ObjectKey::Literal(key) = &entry.key else {
                     return None;
@@ -4388,7 +4387,7 @@ fn literal_int(n: i64) -> OwnedValue {
 /// `gen_slice_index`'s key, `{"start": s, "end": e}` (an absent bound is
 /// `null`), fresh per evaluation.
 fn slice_key(start: Option<OwnedValue>, end: Option<OwnedValue>) -> OwnedValue {
-    let mut map = IndexMap::new();
+    let mut map = FieldMap::new();
     map.insert(String::from("start"), start.unwrap_or(OwnedValue::Null));
     map.insert(String::from("end"), end.unwrap_or(OwnedValue::Null));
     OwnedValue::Object(map.into())

@@ -1,12 +1,12 @@
 //! The object container behind `OwnedValue::Object`: a collapsed
-//! `IndexMap` view plus, when a key repeats, the earlier entries of that key
+//! [`FieldMap`] view plus, when a key repeats, the earlier entries of that key
 //! ("shadows") in document order (#1344, ADR-0027).
 //!
 //! # Why
 //!
 //! `yq` keeps a mapping as an ordered list of entries, so `a: 1 / a: 2` is
-//! two entries and a write through `.a` reaches only the last one. An
-//! `IndexMap` holds one value per key, so the first entry is gone before any
+//! two entries and a write through `.a` reaches only the last one. A
+//! map holds one value per key, so the first entry is gone before any
 //! builtin sees the tree. This module gives every `OwnedValue::Object` a place
 //! to keep the earlier entries without changing what any existing reader sees.
 //!
@@ -14,13 +14,15 @@
 //!
 //! [`ObjectMapOf`] is two pointers:
 //!
-//! - `map` is the **collapsed view**: a refcounted `IndexMap` holding each key
-//!   once, at its first entry's position, with its last entry's value (I1).
-//!   Every reader that goes through [`Deref`] sees exactly what it saw when
-//!   the handle was a bare pointer to that map. The heap block is the
-//!   `IndexMap` and nothing else, so an object that repeats no key costs the
-//!   allocator what it always cost (#3000 sized `OwnedValue` and `JqValue`
-//!   against those very chunk sizes).
+//! - `map` is the **collapsed view**: a refcounted [`FieldMap`] holding each
+//!   key once, at its first entry's position, with its last entry's value
+//!   (I1). Every reader that goes through [`Deref`] sees exactly what it saw
+//!   when the handle was a bare pointer to that map. The heap block is the
+//!   map and nothing else, so an object that repeats no key costs the
+//!   allocator nothing for the side list (#3000 sized `OwnedValue` and
+//!   `JqValue` against those very chunk sizes). The map is an `IndexMap`'s
+//!   semantics in a plain field list, hash-indexed only past
+//!   [`SMALL_FIELDS`](super::field_map::SMALL_FIELDS) fields (#7260).
 //! - `shadows` is `None` unless some key repeats (I2). When it is `Some`, it
 //!   lists every entry in document order, so the full view
 //!   ([`ObjectMapOf::occurrences`]) is recoverable.
@@ -44,10 +46,10 @@
 //!
 //! # How the existing call sites stay correct
 //!
-//! An inherent method on [`ObjectMapOf`] is chosen before the `IndexMap`
+//! An inherent method on [`ObjectMapOf`] is chosen before the [`FieldMap`]
 //! method of the same name it would auto-dereference to, so the mutators in
 //! the table below pick up the shadow-aware behaviour without being edited.
-//! [`DerefMut`] hands out the raw `&mut IndexMap`, which cannot keep the
+//! [`DerefMut`] hands out the raw `&mut FieldMap`, which cannot keep the
 //! shadows in step, so it **collapses first**: a raw-map caller can only ever
 //! produce today's answer, never a mix of today's answer and yq's. The
 //! by-value conversions ([`ObjectMapOf::into_index_map`], the owned
@@ -66,14 +68,16 @@
 //!
 //! # Why the map keeps the default hasher
 //!
-//! The map hashes with `IndexMap`'s default, SipHash 1-3 seeded per process, which a document's
-//! keys cannot be crafted against. A fixed hasher would give that up for very little, measured
+//! A large map's index (#7260) hashes with `IndexMap`'s default, SipHash 1-3 seeded per process,
+//! which a document's keys cannot be crafted against (a small map has no index to attack). A fixed hasher would give that up for very little, measured
 //! (#5594) by building the same commit with `indexmap`'s default replaced by an unseeded Fx hash,
 //! the cheapest a swap could get. On the `users` pattern (Apple M5 Max, instructions retired),
 //! `del(.users[0]) | .users | length` went from 1,625M to 1,584M (-2.5%) at 7 MB and -0.8% at
 //! 0.7 MB, an assignment -2.6% and -1.3%, and `tojson` -0.7%. The rest of the insert's cost is the
 //! table itself (probing, growth and its allocations), which no hasher changes. Revisit this
 //! with new numbers, not on the strength of a profile that attributes `insert_full` to hashing.
+//! (Those numbers predate #7260, which took the table off every object of at most
+//! [`SMALL_FIELDS`](super::field_map::SMALL_FIELDS) fields.)
 
 #[cfg(not(test))]
 use alloc::string::String;
@@ -81,12 +85,12 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use alloc::rc::Rc;
-use core::hash::Hash;
 use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
 
-use indexmap::{Equivalent, IndexMap};
+use indexmap::IndexMap;
 
+use super::field_map::{self, FieldMap};
 use super::Teardown;
 
 /// Records a forced copy for [`share_stats`](crate::jq::share_stats), in the
@@ -98,9 +102,9 @@ macro_rules! note_forced_copy {
     };
 }
 
-/// The backing store for an object-valued enum arm: an
-/// [`IndexMap<String, V>`](IndexMap) (the collapsed view) behind a single
-/// pointer, plus the shadows of any repeated key (#1344).
+/// The backing store for an object-valued enum arm: a
+/// [`FieldMap<V>`](FieldMap) (the collapsed view; an `IndexMap` until #7260)
+/// behind a single pointer, plus the shadows of any repeated key (#1344).
 ///
 /// The map is refcounted so that clones share it until one side writes
 /// (#2999), and held behind that one pointer (#3000). The cost is one extra
@@ -113,11 +117,11 @@ macro_rules! note_forced_copy {
 /// repeated key.
 ///
 /// The indirection is invisible to callers. [`Deref`]/[`DerefMut`] expose
-/// the whole `IndexMap` API, [`IntoIterator`] is implemented for the owned,
-/// shared and mutable forms, and [`From`]/[`FromIterator`] build one from
-/// anything an `IndexMap` can be built from -- so `Object(map)` patterns keep
-/// reading and writing the map exactly as before. Only *construction* from a
-/// bare `IndexMap` needs a `.into()`.
+/// the map's `IndexMap`-shaped API, [`IntoIterator`] is implemented for the
+/// owned, shared and mutable forms, and [`From`]/[`FromIterator`] build one
+/// from a [`FieldMap`], an `IndexMap` or pairs -- so `Object(map)` patterns
+/// keep reading and writing the map exactly as before. Only *construction*
+/// from a bare map needs a `.into()`.
 ///
 /// `DerefMut` and the by-value conversions (`into_index_map`, the owned
 /// `IntoIterator`) are where a shared map is copied; both are
@@ -127,9 +131,10 @@ macro_rules! note_forced_copy {
 /// Note for downstream users: the shape of the `OwnedValue::Object` variant
 /// changed in #3000 (boxed) and again in #2999 (refcounted).
 /// [`OwnedValue::as_object_mut`](super::OwnedValue::as_object_mut) returns an
-/// `ObjectMapOf` since #1344, not a bare `IndexMap`. Construct with
+/// `ObjectMapOf` since #1344, not a bare `IndexMap`, and the collapsed view
+/// is a [`FieldMap`] since #7260. Construct with
 /// [`OwnedValue::object_from`](super::OwnedValue::object_from) (or
-/// `IndexMap::....into()`) and read through
+/// `FieldMap::....into()`) and read through
 /// [`OwnedValue::as_object`](super::OwnedValue::as_object).
 pub struct ObjectMapOf<V: Teardown> {
     /// The collapsed view (I1). Released by the wrapper's own `Drop`, never
@@ -143,7 +148,7 @@ pub struct ObjectMapOf<V: Teardown> {
 }
 
 /// [`ObjectMapOf`]'s map: refcounted.
-type ObjectMapInnerOf<V> = Rc<IndexMap<String, V>>;
+type ObjectMapInnerOf<V> = Rc<FieldMap<V>>;
 
 /// [`ObjectMapOf`]'s side list: refcounted.
 type ShadowsInnerOf<V> = Rc<Shadows<V>>;
@@ -229,7 +234,7 @@ impl<V> Shadows<V> {
 /// bound the sharing adds anywhere.
 #[inline]
 #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
-fn map_mut<V: Clone>(map: &mut ObjectMapInnerOf<V>) -> &mut IndexMap<String, V> {
+fn map_mut<V: Clone>(map: &mut ObjectMapInnerOf<V>) -> &mut FieldMap<V> {
     if Rc::strong_count(map) > 1 {
         note_forced_copy!(ObjectMakeMut);
     }
@@ -252,13 +257,13 @@ impl<V: Teardown> ObjectMapOf<V> {
     /// An empty container.
     #[inline]
     pub fn new() -> Self {
-        Self::from(IndexMap::new())
+        Self::from(FieldMap::new())
     }
 
     /// An empty container with room for `capacity` entries.
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
-        Self::from(IndexMap::with_capacity(capacity))
+        Self::from(FieldMap::with_capacity(capacity))
     }
 
     /// Whether `self` and `other` are two handles on the *same*
@@ -333,19 +338,19 @@ impl<V: Teardown> ObjectMapOf<V> {
     /// adding an index.
     pub fn first_occurrence<Q>(&self, key: &Q) -> Option<&V>
     where
-        Q: ?Sized + Hash + Equivalent<String>,
+        Q: ?Sized + AsRef<str>,
     {
         let Some(shadows) = self.shadows.as_deref() else {
             return self.map.get(key);
         };
         for entry in &shadows.order {
             match entry {
-                Occurrence::Shadow(shadow_key, value) if key.equivalent(shadow_key) => {
+                Occurrence::Shadow(shadow_key, value) if shadow_key == key.as_ref() => {
                     return Some(value);
                 }
                 Occurrence::Live(slot) => {
                     let (live_key, value) = self.map.get_index(*slot)?;
-                    if key.equivalent(live_key) {
+                    if live_key == key.as_ref() {
                         return Some(value);
                     }
                 }
@@ -391,7 +396,7 @@ impl<V: Teardown> ObjectMapOf<V> {
 
     /// The map, if this handle owns it alone.
     #[inline]
-    fn unique_map(&mut self) -> Option<&mut IndexMap<String, V>> {
+    fn unique_map(&mut self) -> Option<&mut FieldMap<V>> {
         Rc::get_mut(&mut self.map)
     }
 
@@ -505,6 +510,15 @@ impl<V: Teardown + Clone> ObjectMapOf<V> {
     #[inline]
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     pub fn into_index_map(self) -> IndexMap<String, V> {
+        self.into_field_map().into()
+    }
+
+    /// Consume the wrapper, yielding the collapsed view's [`FieldMap`] -- by
+    /// move when this handle was the last one, by copy otherwise. Shadows are
+    /// dropped.
+    #[inline]
+    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
+    pub fn into_field_map(self) -> FieldMap<V> {
         match Rc::try_unwrap(self.into_parts().0) {
             Ok(map) => map,
             Err(shared) => {
@@ -608,7 +622,7 @@ impl<V: Teardown + Clone> ObjectMapOf<V> {
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     pub fn first_occurrence_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
     where
-        Q: ?Sized + Hash + Equivalent<String>,
+        Q: ?Sized + AsRef<str>,
     {
         let map = map_mut(&mut self.map);
         let Some(shadows) = live_shadows_mut(&mut self.shadows) else {
@@ -617,10 +631,10 @@ impl<V: Teardown + Clone> ObjectMapOf<V> {
         let mut found = None;
         for (pos, entry) in shadows.order.iter().enumerate() {
             let hit = match entry {
-                Occurrence::Shadow(shadow_key, _) => key.equivalent(shadow_key),
+                Occurrence::Shadow(shadow_key, _) => shadow_key == key.as_ref(),
                 Occurrence::Live(slot) => map
                     .get_index(*slot)
-                    .is_some_and(|(live_key, _)| key.equivalent(live_key)),
+                    .is_some_and(|(live_key, _)| live_key == key.as_ref()),
             };
             if hit {
                 found = Some(pos);
@@ -639,7 +653,7 @@ impl<V: Teardown + Clone> ObjectMapOf<V> {
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
     where
-        Q: ?Sized + Hash + Equivalent<String>,
+        Q: ?Sized + AsRef<str>,
     {
         map_mut(&mut self.map).get_mut(key)
     }
@@ -654,14 +668,14 @@ impl<V: Teardown + Clone> ObjectMapOf<V> {
     /// Mutable iteration over the collapsed view's values.
     #[inline]
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
-    pub fn iter_mut(&mut self) -> indexmap::map::IterMut<'_, String, V> {
+    pub fn iter_mut(&mut self) -> field_map::IterMut<'_, V> {
         map_mut(&mut self.map).iter_mut()
     }
 
     /// Mutable iteration over the collapsed view's values.
     #[inline]
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
-    pub fn values_mut(&mut self) -> indexmap::map::ValuesMut<'_, String, V> {
+    pub fn values_mut(&mut self) -> field_map::ValuesMut<'_, V> {
         map_mut(&mut self.map).values_mut()
     }
 
@@ -671,7 +685,7 @@ impl<V: Teardown + Clone> ObjectMapOf<V> {
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     pub fn get_full_mut<Q>(&mut self, key: &Q) -> Option<(usize, &String, &mut V)>
     where
-        Q: ?Sized + Hash + Equivalent<String>,
+        Q: ?Sized + AsRef<str>,
     {
         map_mut(&mut self.map).get_full_mut(key)
     }
@@ -681,7 +695,7 @@ impl<V: Teardown + Clone> ObjectMapOf<V> {
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     pub fn get_key_value_mut<Q>(&mut self, key: &Q) -> Option<(&String, &mut V)>
     where
-        Q: ?Sized + Hash + Equivalent<String>,
+        Q: ?Sized + AsRef<str>,
     {
         map_mut(&mut self.map).get_key_value_mut(key)
     }
@@ -733,10 +747,8 @@ impl<V: Teardown + Clone> ObjectMapOf<V> {
     pub fn entry(&mut self, key: String) -> ObjectMapEntry<'_, V> {
         let map = map_mut(&mut self.map);
         match map.entry(key) {
-            indexmap::map::Entry::Occupied(entry) => {
-                ObjectMapEntry::Occupied(OccupiedMapEntry(entry))
-            }
-            indexmap::map::Entry::Vacant(entry) => ObjectMapEntry::Vacant(VacantMapEntry {
+            field_map::Entry::Occupied(entry) => ObjectMapEntry::Occupied(OccupiedMapEntry(entry)),
+            field_map::Entry::Vacant(entry) => ObjectMapEntry::Vacant(VacantMapEntry {
                 entry,
                 shadows: &mut self.shadows,
             }),
@@ -748,7 +760,7 @@ impl<V: Teardown + Clone> ObjectMapOf<V> {
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     pub fn shift_remove<Q>(&mut self, key: &Q) -> Option<V>
     where
-        Q: ?Sized + Hash + Equivalent<String>,
+        Q: ?Sized + AsRef<str>,
     {
         let map = map_mut(&mut self.map);
         let (slot, _, value) = map.shift_remove_full(key)?;
@@ -761,7 +773,7 @@ impl<V: Teardown + Clone> ObjectMapOf<V> {
                     }
                     true
                 }
-                Occurrence::Shadow(shadow_key, _) => !key.equivalent(shadow_key),
+                Occurrence::Shadow(shadow_key, _) => *shadow_key != key.as_ref(),
             });
             shadows.rebuild_live_pos(map.len());
             if shadows.has_no_shadow(map.len()) {
@@ -781,7 +793,7 @@ impl<V: Teardown + Clone> ObjectMapOf<V> {
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     pub fn swap_remove<Q>(&mut self, key: &Q) -> Option<V>
     where
-        Q: ?Sized + Hash + Equivalent<String>,
+        Q: ?Sized + AsRef<str>,
     {
         let map = map_mut(&mut self.map);
         let (slot, _, value) = map.swap_remove_full(key)?;
@@ -796,7 +808,7 @@ impl<V: Teardown + Clone> ObjectMapOf<V> {
                     }
                     true
                 }
-                Occurrence::Shadow(shadow_key, _) => !key.equivalent(shadow_key),
+                Occurrence::Shadow(shadow_key, _) => *shadow_key != key.as_ref(),
             });
             shadows.rebuild_live_pos(map.len());
             if shadows.has_no_shadow(map.len()) {
@@ -865,11 +877,11 @@ pub enum ObjectMapEntry<'a, V> {
 }
 
 /// An [`ObjectMapEntry`] for a key the object has: its live (last) entry.
-pub struct OccupiedMapEntry<'a, V>(indexmap::map::OccupiedEntry<'a, String, V>);
+pub struct OccupiedMapEntry<'a, V>(field_map::OccupiedEntry<'a, V>);
 
 /// An [`ObjectMapEntry`] for a key the object lacks.
 pub struct VacantMapEntry<'a, V> {
-    entry: indexmap::map::VacantEntry<'a, String, V>,
+    entry: field_map::VacantEntry<'a, V>,
     shadows: &'a mut Option<ShadowsInnerOf<V>>,
 }
 
@@ -979,10 +991,10 @@ pub struct Occurrences<'a, V>(OccurrencesInner<'a, V>);
 
 enum OccurrencesInner<'a, V> {
     /// No key repeats: the collapsed view's own iterator.
-    Plain(indexmap::map::Iter<'a, String, V>),
+    Plain(field_map::Iter<'a, V>),
     /// Some key repeats: the side list, with live entries read from `map`.
     Ordered {
-        map: &'a IndexMap<String, V>,
+        map: &'a FieldMap<V>,
         entries: core::slice::Iter<'a, Occurrence<V>>,
     },
 }
@@ -1008,10 +1020,7 @@ impl<'a, V> Occurrences<'a, V> {
     }
 
     #[inline]
-    fn resolve(
-        map: &'a IndexMap<String, V>,
-        entry: &'a Occurrence<V>,
-    ) -> Option<(&'a String, &'a V)> {
+    fn resolve(map: &'a FieldMap<V>, entry: &'a Occurrence<V>) -> Option<(&'a String, &'a V)> {
         match entry {
             Occurrence::Shadow(key, value) => Some((key, value)),
             Occurrence::Live(slot) => map.get_index(*slot),
@@ -1114,7 +1123,7 @@ impl<V: Teardown + core::fmt::Debug> core::fmt::Debug for ObjectMapOf<V> {
 }
 
 impl<V: Teardown> Deref for ObjectMapOf<V> {
-    type Target = IndexMap<String, V>;
+    type Target = FieldMap<V>;
 
     #[inline]
     fn deref(&self) -> &Self::Target {
@@ -1123,7 +1132,7 @@ impl<V: Teardown> Deref for ObjectMapOf<V> {
 }
 
 /// The copy-on-write point, and the point where shadows are dropped: a raw
-/// `&mut IndexMap` cannot keep them in step, so the caller gets today's
+/// `&mut FieldMap` cannot keep them in step, so the caller gets today's
 /// answer rather than a mix of today's answer and yq's.
 impl<V: Teardown + Clone> DerefMut for ObjectMapOf<V> {
     #[inline]
@@ -1137,6 +1146,13 @@ impl<V: Teardown + Clone> DerefMut for ObjectMapOf<V> {
 impl<V: Teardown> From<IndexMap<String, V>> for ObjectMapOf<V> {
     #[inline]
     fn from(map: IndexMap<String, V>) -> Self {
+        Self::from(FieldMap::from(map))
+    }
+}
+
+impl<V: Teardown> From<FieldMap<V>> for ObjectMapOf<V> {
+    #[inline]
+    fn from(map: FieldMap<V>) -> Self {
         Self {
             map: ManuallyDrop::new(Rc::new(map)),
             shadows: None,
@@ -1155,7 +1171,7 @@ impl<V: Teardown + Clone> From<ObjectMapOf<V>> for IndexMap<String, V> {
 impl<V: Teardown> FromIterator<(String, V)> for ObjectMapOf<V> {
     #[inline]
     fn from_iter<I: IntoIterator<Item = (String, V)>>(iter: I) -> Self {
-        Self::from(IndexMap::from_iter(iter))
+        Self::from(FieldMap::from_iter(iter))
     }
 }
 
@@ -1174,13 +1190,13 @@ impl<V: Teardown + Clone> Extend<(String, V)> for ObjectMapOf<V> {
 /// the whole map first and a second pass to consume it (#2999 review).
 pub enum ObjectMapIntoIter<V> {
     /// This handle owned the map outright.
-    Owned(indexmap::map::IntoIter<String, V>),
+    Owned(field_map::IntoIter<V>),
     /// Another handle still shares the map; the entries in `next..end` are
     /// cloned out, from either end (`DoubleEndedIterator`, like the owned
     /// form).
     Shared {
         /// The map every remaining entry is cloned from.
-        map: Rc<IndexMap<String, V>>,
+        map: Rc<FieldMap<V>>,
         /// Index of the next entry from the front.
         next: usize,
         /// One past the next entry from the back.
@@ -1261,7 +1277,7 @@ impl<V: Teardown + Clone> IntoIterator for ObjectMapOf<V> {
 
 impl<'a, V: Teardown> IntoIterator for &'a ObjectMapOf<V> {
     type Item = (&'a String, &'a V);
-    type IntoIter = indexmap::map::Iter<'a, String, V>;
+    type IntoIter = field_map::Iter<'a, V>;
 
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
@@ -1271,7 +1287,7 @@ impl<'a, V: Teardown> IntoIterator for &'a ObjectMapOf<V> {
 
 impl<'a, V: Teardown + Clone> IntoIterator for &'a mut ObjectMapOf<V> {
     type Item = (&'a String, &'a mut V);
-    type IntoIter = indexmap::map::IterMut<'a, String, V>;
+    type IntoIter = field_map::IterMut<'a, V>;
 
     #[inline]
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
@@ -1691,12 +1707,13 @@ mod tests {
     }
 
     fn key(k: u8) -> String {
-        // A small alphabet, so repeats are common.
-        char::from(b'a' + k % 5).to_string()
+        // A small alphabet, so repeats are common -- but more letters than
+        // `SMALL_FIELDS`, so maps also take the indexed shape (#7260).
+        char::from(b'a' + k % 22).to_string()
     }
 
     fn op() -> impl Strategy<Value = Op> {
-        let k = 0u8..8;
+        let k = 0u8..44;
         let v = 0u32..1000;
         prop_oneof![
             4 => (k.clone(), v.clone()).prop_map(|(k, v)| Op::Insert(k, v)),
@@ -1760,7 +1777,7 @@ mod tests {
         // I2.
         let repeats = reference.entries.len() != reference.collapsed.len();
         assert_eq!(map.has_shadows(), repeats);
-        for k in 0..5 {
+        for k in 0..22 {
             let k = key(k);
             let first = reference.entries.iter().find(|(e, _)| *e == k);
             assert_eq!(map.first_occurrence(&k), first.map(|(_, v)| v));
@@ -1909,7 +1926,7 @@ mod tests {
 
         #[test]
         fn matches_a_multimap_reference_after_every_operation(
-            ops in proptest::collection::vec(op(), 0..48)
+            ops in proptest::collection::vec(op(), 0..128)
         ) {
             let mut map = Map::new();
             let mut reference = Reference {
@@ -1925,7 +1942,7 @@ mod tests {
 
         #[test]
         fn a_sequence_that_never_repeats_a_key_equals_its_index_map(
-            ops in proptest::collection::vec(op(), 0..48)
+            ops in proptest::collection::vec(op(), 0..128)
         ) {
             let mut map = Map::new();
             let mut plain: IndexMap<String, u32> = IndexMap::new();

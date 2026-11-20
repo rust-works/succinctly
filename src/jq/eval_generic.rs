@@ -121,6 +121,7 @@ use super::tail_call::{
     bind_next, body_is_reusable, pipe_settles_before_last, stage_settles, tail_def, tail_reachable,
     Tail, TailRounds,
 };
+use super::value::FieldMap;
 use super::value::{
     jq_literal_int_to_f64, owned_value_eq, subarray_indices, NumberRepr, ObjectMapOf, OwnedValue,
     Teardown,
@@ -1623,7 +1624,7 @@ pub fn validate_cursor<S: EvalSemantics, C: DocumentCursor>(cursor: &C) -> Resul
 /// mode keeps what (#1344).
 #[doc(hidden)]
 pub struct ObjectBuilder<V: Teardown> {
-    plain: IndexMap<String, V>,
+    plain: FieldMap<V>,
     shadowed: Option<ObjectMapOf<V>>,
 }
 
@@ -1643,14 +1644,14 @@ impl<V: Clone + Teardown> ObjectBuilder<V> {
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            plain: IndexMap::with_capacity(capacity),
+            plain: FieldMap::with_capacity(capacity),
             shadowed: None,
         }
     }
 
     /// The collapsed view so far, for the key-collision checks.
     #[inline]
-    pub fn map(&self) -> &IndexMap<String, V> {
+    pub fn map(&self) -> &FieldMap<V> {
         match &self.shadowed {
             Some(shadowed) => shadowed,
             None => &self.plain,
@@ -4985,7 +4986,7 @@ fn to_owned_key_shape<V: DocumentValue, S: EvalSemantics>(
 fn descriptor_key_shape<V: DocumentValue, S: EvalSemantics>(
     fields: &V::Fields,
 ) -> Result<OwnedValue, EvalError> {
-    let mut desc = IndexMap::new();
+    let mut desc = FieldMap::new();
     if S::TAG != EvalTag::Yq {
         for name in ["start", "end"] {
             if let Some(bound) = fields.find(name)? {
@@ -41289,7 +41290,7 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                         }
                     }
 
-                    let mut result_obj = IndexMap::new();
+                    let mut result_obj = FieldMap::new();
                     for key in &all_keys {
                         let mut values = vec_with_capacity(items.len());
                         for item in &items {
@@ -41572,7 +41573,7 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 let cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
                 let mut entries: Vec<OwnedValue> = Vec::new();
                 for (i, elem_cursor) in cursors.into_iter().enumerate() {
-                    let mut entry = IndexMap::with_capacity(2);
+                    let mut entry = FieldMap::with_capacity(2);
                     entry.insert("key".to_string(), OwnedValue::Int(i as i64));
                     entry.insert(
                         "value".to_string(),
@@ -41667,7 +41668,7 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                     }
                     // #7260: sized for its two entries, where `new()` grows to three (192 bytes
                     // where two take 128, on every entry).
-                    let mut entry = IndexMap::with_capacity(2);
+                    let mut entry = FieldMap::with_capacity(2);
                     entry.insert("key".to_string(), key);
                     entry.insert(
                         "value".to_string(),
@@ -46032,7 +46033,7 @@ fn map_family_positioned_builtin(builtin: &Builtin) -> Option<(MapFamily, &Expr)
 
 /// One `{"key": k, "value": v}` entry, as `to_entries` builds it.
 fn map_family_entry(key: OwnedValue, value: OwnedValue) -> OwnedValue {
-    let mut entry = IndexMap::with_capacity(2);
+    let mut entry = FieldMap::with_capacity(2);
     entry.insert("key".to_string(), key);
     entry.insert("value".to_string(), value);
     OwnedValue::Object(entry.into())

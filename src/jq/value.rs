@@ -21,6 +21,7 @@ use alloc::rc::Rc;
 use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
 
+#[cfg(test)]
 use indexmap::IndexMap;
 
 use super::error::EvalError;
@@ -32,8 +33,10 @@ use super::eval::{
 };
 use super::expr::Literal;
 
+pub mod field_map;
 mod object_map;
 
+pub use field_map::FieldMap;
 pub use object_map::{
     FlaggedOccurrences, ObjectMapEntry, ObjectMapIntoIter, ObjectMapOf, OccupiedMapEntry,
     Occurrences, VacantMapEntry,
@@ -4263,7 +4266,7 @@ impl OwnedValue {
 
     /// Create an empty object.
     pub fn object() -> Self {
-        Self::Object(IndexMap::new().into())
+        Self::Object(FieldMap::new().into())
     }
 
     /// Whether this value and `other` are the same *storage* -- jq's
@@ -4465,8 +4468,9 @@ impl OwnedValue {
         }
     }
 
-    /// Convert to an object reference, if possible.
-    pub fn as_object(&self) -> Option<&IndexMap<String, Self>> {
+    /// Convert to an object reference, if possible: the collapsed view, a
+    /// [`FieldMap`] (an `IndexMap` before #7260, with the same API).
+    pub fn as_object(&self) -> Option<&FieldMap<Self>> {
         match self {
             Self::Object(obj) => Some(obj),
             _ => None,
@@ -4475,12 +4479,12 @@ impl OwnedValue {
 
     /// Convert to a mutable object reference, if possible.
     ///
-    /// Hands out the [`ObjectMap`] itself, not its `IndexMap` (#1344), so the
+    /// Hands out the [`ObjectMap`] itself, not its [`FieldMap`] (#1344), so the
     /// copy-on-write point (#2999) is the first mutator called on it -- not
     /// this method, which writes nothing -- and `share-stats` attributes the
     /// copy to that call. The mutators that keep a repeated key's earlier
     /// entries in step are inherent methods of [`ObjectMapOf`]; a raw
-    /// `&mut IndexMap` borrow (`DerefMut`) collapses them first.
+    /// `&mut FieldMap` borrow (`DerefMut`) collapses them first.
     pub fn as_object_mut(&mut self) -> Option<&mut ObjectMap> {
         match self {
             Self::Object(obj) => Some(obj),
@@ -7371,18 +7375,18 @@ mod tests {
         assert!(sized.capacity() >= 8);
     }
 
-    /// `as_object` keeps returning a bare `&IndexMap` (#3000's public-API
-    /// promise): the boxing is not supposed to show up in the signature, only
-    /// in the variant's own payload. `as_object_mut` returns `&mut ObjectMap`
-    /// since #1344 so the shadow-aware mutators are reachable, and an
-    /// `&mut IndexMap` annotation still compiles by deref coercion -- which is
-    /// what the `let` below exercises.
+    /// `as_object` returns the bare collapsed view, a `&FieldMap` since #7260
+    /// (a `&IndexMap` before it, #3000's promise that the boxing does not show
+    /// in the signature). `as_object_mut` returns `&mut ObjectMap` since #1344
+    /// so the shadow-aware mutators are reachable, and an `&mut FieldMap`
+    /// annotation still compiles by deref coercion -- which is what the `let`
+    /// below exercises.
     #[test]
-    fn as_object_accessors_still_hand_out_a_bare_index_map_3000() {
+    fn as_object_accessors_still_hand_out_a_bare_field_map_3000() {
         let mut value = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
-        let read: &IndexMap<String, OwnedValue> = value.as_object().unwrap();
+        let read: &FieldMap<OwnedValue> = value.as_object().unwrap();
         assert_eq!(read.len(), 1);
-        let write: &mut IndexMap<String, OwnedValue> = value.as_object_mut().unwrap();
+        let write: &mut FieldMap<OwnedValue> = value.as_object_mut().unwrap();
         write.insert("b".to_string(), OwnedValue::Int(2));
         assert_eq!(value.as_object().unwrap().len(), 2);
         assert!(OwnedValue::Int(1).as_object().is_none());
