@@ -7422,7 +7422,9 @@ Dropping the span vector alone would take about 0.15 per MiB off the plain route
 
 `-c .`, `-r .name`, `select(...)` and the like, over one regular file of 4 MiB or more with no `--slurp`, `--validate` or `--seq`, read the file in windows (`WindowedFile`, `src/bin/succinctly/jq_runner/window.rs`).
 The route judges the path by `stat` and opens nothing it declines: a named pipe (`<(cmd)`) would otherwise pair with its writer and lose its bytes, and `/dev/stdin` and `/dev/fd/N` name a descriptor the run already holds.
-A window is about 1 MiB and ends at a line break, so the read that completes each document, and with it jq's line for the document, is inside it.
+A window is about 256 KiB (1 MiB before [#7412](https://github.com/rust-works/succinctly/issues/7412)) and ends at a line break, so the read that completes each document, and with it jq's line for the document, is inside it.
+Since #7412 every size this section and the ones below give in MiB for the windowed routes is that of the 1 MiB window, and each is now a quarter of it: a file (or several, between them) is read in windows from 1 MiB, a pipe once it holds 512 KiB, and a document is read on to eight windows (2 MiB) before the end of the file.
+A file under 4 MiB whose window ends inside a document is read on to its end at once instead, as the whole-file route read it before #7412.
 The text a window has run is dropped before the next is read, from the start of the line its last document ended on, and only the number of line breaks dropped is carried.
 Only the bytes a read adds are searched for a line break, and a read that finds none asks for twice as much, so a file with few of them is read in a linear amount of work.
 A document that does not scan before the end of the file is not yet a fault, since the text after it may be what it lacks: it is read on to eight windows, and then to the end of the file.
