@@ -11756,13 +11756,13 @@ fn raw_windowed_source(args: &JqCommand, files: &[PathBuf]) -> Option<RawWindowe
     Some((Box::new(file), Some(len), Vec::new()))
 }
 
-/// Standard input for `-R` (#7024) when it is a regular file with 4 MiB or more left from the offset it
-/// stands at (`jq -R . < log`), or a pipe or socket that holds 4 MiB or more (`cat log | jq -R .`).
-/// A stream of lines has no fault to word, so neither is read again: a duplicate of descriptor 0 is read
-/// from where it stands, and a run that stops early leaves the descriptor where its last window ended,
-/// as jq does. A pipe's length is not known, so its first 4 MiB are read to learn it ([`probe_stdin_pipe`]).
-/// A terminal, a device, and every standard input [`stdin_to_window`] turns down are left to the route that
-/// reads it whole.
+/// Standard input for `-R` (#7024) when it is a regular file with [`raw_window_min_bytes`] or more left
+/// from the offset it stands at (`jq -R . < log`), or a pipe or socket that holds a window or more
+/// ([`raw_window_min_pipe_bytes`], `cat log | jq -R .`). A stream of lines has no fault to word, so
+/// neither is read again: a duplicate of descriptor 0 is read from where it stands, and a run that stops
+/// early leaves the descriptor where its last window ended, as jq does. A pipe's length is not known, so
+/// its front is read to learn it ([`probe_stdin_pipe`]). A terminal, a device, and every standard input
+/// [`stdin_to_window`] turns down are left to the route that reads it whole.
 #[cfg(unix)]
 fn raw_windowed_stdin() -> Option<RawWindowed> {
     use std::os::unix::fs::FileTypeExt;
@@ -11771,7 +11771,7 @@ fn raw_windowed_stdin() -> Option<RawWindowed> {
     if kind.is_file() {
         raw_windowed_regular_stdin(file, &meta, raw_window_min_bytes())
     } else if kind.is_fifo() || kind.is_socket() {
-        raw_windowed_pipe(file, raw_window_min_bytes())
+        raw_windowed_pipe(file, raw_window_min_pipe_bytes())
     } else {
         None
     }
@@ -11794,6 +11794,18 @@ fn raw_windowed_regular_stdin(
 ) -> Option<RawWindowed> {
     regular_stdin_left(&mut file, meta, min)?;
     Some((Box::new(file), None, Vec::new()))
+}
+
+/// The fewest bytes a pipe on standard input holds for `-R` to read it a window at a time: one window
+/// (256 KiB in every build that ships, #7412). The probe that learns it is held until its lines are
+/// run, as the first window, so its size is the run's peak: four windows (1 MiB) held `-R` over a pipe
+/// at 1.68 MiB of anonymous memory on the 7950X at every size from 1 MB to 100 MB, where the same lines
+/// read from a file held 0.91 and jq 1.7.1 holds 0.84. A pipe that ends sooner is read whole, which
+/// holds no more than the window would. A line reader has no certifying thread, so the plain route's
+/// two windows ([`window::min_windowed_pipe_bytes`]) are not needed.
+#[cfg(unix)]
+fn raw_window_min_pipe_bytes() -> u64 {
+    lazy_window_bytes() as u64
 }
 
 /// [`raw_windowed_stdin`] over a pipe it has judged, which is windowed once it holds `min` bytes.
@@ -23400,6 +23412,42 @@ mod tests {
         assert!(STDIN_PUSHBACK_ERROR
             .with(|slot| slot.borrow_mut().take())
             .is_none());
+    }
+
+    /// #7412: `-R` reads a pipe a window at a time once it holds one window (256 KiB), not four: the
+    /// probe is the run's first window, and its buffer is the probe's size, so the run holds a window
+    /// and not four. A pipe a byte short of it is read whole.
+    #[cfg(unix)]
+    #[test]
+    fn a_raw_pipe_is_windowed_from_one_window_7412() {
+        use std::io::Write;
+        let min = raw_window_min_pipe_bytes();
+        assert_eq!(min, 256 << 10);
+        assert_eq!(min, lazy_window_bytes() as u64);
+        let pipe_of = |len: usize| {
+            let (reader, mut writer) = std::io::pipe().expect("pipe");
+            let bytes = b"0123456789abcde\n".repeat(len.div_ceil(16))[..len].to_vec();
+            let feeder = std::thread::spawn(move || writer.write_all(&bytes).expect("write"));
+            let reader = std::fs::File::from(std::os::fd::OwnedFd::from(reader));
+            let windowed = raw_windowed_pipe(reader, min);
+            feeder.join().expect("feeder");
+            windowed
+        };
+        let usize_min = usize::try_from(min).expect("a window fits");
+        let (_, len, front) = pipe_of(usize_min).expect("a window is windowed");
+        assert_eq!(
+            (len, front.len(), front.capacity()),
+            (None, usize_min, usize_min)
+        );
+        STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = None);
+        assert!(
+            pipe_of(usize_min - 1).is_none(),
+            "a byte short is read whole"
+        );
+        assert_eq!(
+            STDIN_PUSHBACK.with(|slot| slot.borrow_mut().take().map(|held| held.len())),
+            Some(usize_min - 1)
+        );
     }
 
     /// #7024: every flag that has `-R` read its input whole keeps standard input off the windowed route
