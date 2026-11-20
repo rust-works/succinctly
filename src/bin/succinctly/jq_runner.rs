@@ -16457,7 +16457,7 @@ fn lazy_json_scan_chunk(raw: &str, from: usize, budget: usize) -> LazyChunk {
     // #7260: a run of containers of plain text is found and checked in one pass each, where the
     // splitter and then serde read every document. Both would agree with it: such a container ends
     // where its brackets match, and serde reads it whole.
-    let (mut spans, plain_end, plain_stopped) = plain_container_prefix(bytes, from, stop_at);
+    let (mut spans, plain_end, plain_stopped) = plain_container_prefix(raw, from, stop_at);
     let (more, split_error, stopped) = if plain_stopped {
         (Vec::new(), None, true)
     } else if bytes[plain_end..]
@@ -16546,10 +16546,11 @@ fn lazy_json_scan_chunk(raw: &str, from: usize, budget: usize) -> LazyChunk {
 /// Each is the span that splitter finds for it and that serde reads, so [`lazy_json_scan_chunk`]
 /// checks only the documents after these with the two.
 fn plain_container_prefix(
-    bytes: &[u8],
+    raw: &str,
     from: usize,
     stop_at: usize,
 ) -> (Vec<(usize, usize)>, usize, bool) {
+    let bytes = raw.as_bytes();
     let mut spans = spans_with_room(stop_at.min(bytes.len()).saturating_sub(from));
     let mut pos = from;
     loop {
@@ -16560,7 +16561,7 @@ fn plain_container_prefix(
         if !matches!(bytes.get(start), Some(b'{' | b'[')) {
             return (spans, pos, false);
         }
-        let Some(end) = jq::plain_value_end(bytes, start) else {
+        let Some(end) = jq::plain_value_end(raw, start) else {
             return (spans, pos, false);
         };
         spans.push((start, end));

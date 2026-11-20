@@ -130,8 +130,15 @@ pub(crate) const PLAIN_END_MAX_DEPTH: usize = 64;
 ///
 /// What follows the value is not looked at. The lazy `inputs` scan finds a document and checks it
 /// with this one pass, where it ran the splitter and then serde over the same text.
-pub(crate) fn plain_value_end(bytes: &[u8], start: usize) -> Option<usize> {
-    let mut skip = Skip { bytes, at: start };
+///
+/// `text` is a `&str` because the walk checks no UTF-8: a string's run of ordinary bytes is skipped
+/// whole, so bytes that are not UTF-8 would pass as a plain value (#7406). The caller's text has
+/// been checked already, and the type keeps a byte-slice caller from handing it unchecked bytes.
+pub(crate) fn plain_value_end(text: &str, start: usize) -> Option<usize> {
+    let mut skip = Skip {
+        bytes: text.as_bytes(),
+        at: start,
+    };
     skip.value(0)?;
     Some(skip.at)
 }
@@ -653,7 +660,7 @@ mod tests {
         if !matches!(bytes.get(start), Some(b'{' | b'[')) {
             return true;
         }
-        let end = plain_value_end(bytes, start);
+        let end = plain_value_end(text, start);
         let mut stream =
             serde_json::Deserializer::from_str(&text[start..]).into_iter::<serde::de::IgnoredAny>();
         let serde_end = matches!(stream.next(), Some(Ok(_))).then(|| start + stream.byte_offset());
@@ -726,15 +733,15 @@ mod tests {
         ] {
             assert!(end_agrees(text), "ends differ on {text:?}");
         }
-        assert_eq!(plain_value_end(b"[1] [2]", 0), Some(3));
-        assert_eq!(plain_value_end(b"[1] [2]", 4), Some(7));
-        assert_eq!(plain_value_end(br#"{"a":{"b":[]}}"#, 0), Some(14));
+        assert_eq!(plain_value_end("[1] [2]", 0), Some(3));
+        assert_eq!(plain_value_end("[1] [2]", 4), Some(7));
+        assert_eq!(plain_value_end(r#"{"a":{"b":[]}}"#, 0), Some(14));
         // Deeper than the limit, a surrogate escape, a repeated key the reader declines: the caller's.
         let deep = |n: usize| alloc::format!("{}{}", "[".repeat(n), "]".repeat(n));
-        assert!(plain_value_end(deep(PLAIN_END_MAX_DEPTH).as_bytes(), 0).is_some());
-        assert!(plain_value_end(deep(PLAIN_END_MAX_DEPTH + 1).as_bytes(), 0).is_none());
-        assert!(plain_value_end(br#"["\ud83d\ude00"]"#, 0).is_none());
-        assert!(plain_value_end(br#"{"a":1,"a":2}"#, 0).is_some());
+        assert!(plain_value_end(&deep(PLAIN_END_MAX_DEPTH), 0).is_some());
+        assert!(plain_value_end(&deep(PLAIN_END_MAX_DEPTH + 1), 0).is_none());
+        assert!(plain_value_end(r#"["\ud83d\ude00"]"#, 0).is_none());
+        assert!(plain_value_end(r#"{"a":1,"a":2}"#, 0).is_some());
     }
 
     #[test]
