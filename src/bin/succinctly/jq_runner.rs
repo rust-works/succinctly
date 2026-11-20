@@ -14477,8 +14477,9 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
 
 /// How much of a lone source the lazy route reads at a time once it is past the front (#7023): the
 /// text it holds is about this much past the documents it has handed out, and a chunk of the scan
-/// ([`LAZY_CHUNK_MAX_BYTES`]) fits in it.
-const LAZY_WINDOW_BYTES: usize = 1 << 20;
+/// ([`LAZY_CHUNK_MAX_BYTES`]) fits in it. It is the plain route's window (256 KiB since #7412, which
+/// took the private memory of `reduce inputs` over 100 MB on the 7950X from 2.6 MiB to 1.3).
+const LAZY_WINDOW_BYTES: usize = 1 << 18;
 
 #[cfg(test)]
 thread_local! {
@@ -14498,7 +14499,7 @@ fn lazy_window_bytes() -> usize {
     if let Some(bytes) = LAZY_WINDOW_OVERRIDE.with(std::cell::Cell::get) {
         return bytes;
     }
-    // A debug build's smaller window (#7376) is this route's too; in a release build both are 1 MiB.
+    // A debug build's smaller window (#7376) is this route's too; in a release build both are 256 KiB.
     LAZY_WINDOW_BYTES.min(window::window_bytes())
 }
 
@@ -14697,8 +14698,12 @@ fn slide_lazy_window(
 /// `-n 1` is 1.1 M (#7264).
 const LAZY_CHUNK_FIRST_BYTES: usize = 1 << 12;
 
-/// The most text a chunk of a lazy stream covers, past its first document.
-const LAZY_CHUNK_MAX_BYTES: usize = 1 << 19;
+/// The most text a chunk of a lazy stream covers, past its first document: a window
+/// ([`LAZY_WINDOW_BYTES`], #7412). It was 512 KiB, half the 1 MiB window; half the 256 KiB one slid the
+/// text after every chunk, which copied 4.1 bytes for every byte of a 10 MB `reduce inputs` where
+/// 512 KiB chunks had copied 2.7 (+1.0% instructions on the 7950X), and a window's chunk copies less
+/// than either (-0.3%) for 0.1 MiB more text.
+const LAZY_CHUNK_MAX_BYTES: usize = 1 << 18;
 
 /// How many doublings take [`LAZY_CHUNK_FIRST_BYTES`] to [`LAZY_CHUNK_MAX_BYTES`].
 const LAZY_CHUNK_DOUBLINGS: u32 =
@@ -14735,8 +14740,9 @@ fn lazy_chunk_budget(index: usize) -> usize {
     (LAZY_CHUNK_FIRST_BYTES << index.min(LAZY_CHUNK_DOUBLINGS as usize)).min(LAZY_CHUNK_MAX_BYTES)
 }
 
-/// The text a batch's index covers is at most this long, past its first document (#5854).
-const LAZY_BATCH_MAX_BYTES: usize = 1 << 20;
+/// The text a batch's index covers is at most this long, past its first document (#5854): a window
+/// ([`LAZY_WINDOW_BYTES`]), as it was of the 1 MiB window before #7412.
+const LAZY_BATCH_MAX_BYTES: usize = 1 << 18;
 
 /// The first batch of a stream covers about this much text, and each batch after it twice the
 /// one before up to [`LAZY_BATCH_MAX_BYTES`], so a program that stops after a few documents
@@ -21590,16 +21596,19 @@ mod tests {
         assert!(spans(&in_string).is_some());
     }
 
-    /// #7264: the chunks of a lazy stream are 4 KiB, 8 KiB, ... up to 512 KiB and stay there. The
-    /// numbers are written out; the const assertions beside the constants keep the first small.
+    /// #7264: the chunks of a lazy stream are 4 KiB, 8 KiB, ... up to 256 KiB, a window (512 KiB before
+    /// #7412), and stay there. The numbers are written out; the const assertions beside the constants
+    /// keep the first small.
     #[test]
-    fn the_lazy_chunks_ramp_from_4_kib_to_512_kib_7264() {
+    fn the_lazy_chunks_ramp_from_4_kib_to_256_kib_7264_7412() {
         let kib = |n: usize| n * 1024;
-        let want = [4, 8, 16, 32, 64, 128, 256, 512, 512, 512];
+        let want = [4, 8, 16, 32, 64, 128, 256, 256, 256];
         for (index, &size) in want.iter().enumerate() {
             assert_eq!(lazy_chunk_budget(index), kib(size), "chunk {index}");
         }
-        assert_eq!(lazy_chunk_budget(1000), kib(512));
+        assert_eq!(lazy_chunk_budget(1000), kib(256));
+        assert_eq!(LAZY_CHUNK_MAX_BYTES, lazy_window_bytes());
+        assert_eq!(LAZY_BATCH_MAX_BYTES, lazy_window_bytes());
         // Which files try the lazy start (longer than this front) is what it was with a 64 KiB first
         // chunk; what the front's first chunk then decides is not (#7264).
         assert_eq!(LAZY_PREFIX_BYTES, kib(256));
@@ -23185,7 +23194,7 @@ mod tests {
             file.seek(SeekFrom::Start(offset)).expect("seek");
             file
         };
-        assert_eq!(window::min_windowed_seq_file_bytes(), 64 << 10);
+        assert_eq!(window::min_windowed_seq_file_bytes(), 16 << 10);
         for min in [
             window::min_windowed_file_bytes(),
             window::min_windowed_seq_file_bytes(),

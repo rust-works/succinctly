@@ -70,7 +70,14 @@ use super::{
 ///
 /// The route reads [`window_bytes`], which is this constant in every build that ships. The limits
 /// below that are multiples of it are functions of that for the same reason.
-pub(super) const WINDOW_BYTES: usize = 1 << 20;
+///
+/// 256 KiB since #7412, 1 MiB before: the window, and the two a pipe holds while its certifying
+/// thread reads one, were most of a streaming run's private memory (2.0 of 2.0 MiB RssAnon for
+/// `jq -r .name` over a 100 MB file on the 7950X, where jq 1.7.1 holds 0.8; 3.2 over a pipe), and a
+/// quarter of the window costs no time on the 7950X or the M4 Pro: a window of 256 KiB is still
+/// thousands of records, so what a window costs on its own (a read, a scan's setup, a hand-off to the
+/// certifying thread) stays a small part of it.
+pub(super) const WINDOW_BYTES: usize = 1 << 18;
 
 /// The environment variable a **debug build only** reads a smaller window from (#7376), so a CLI
 /// test can run the route over a fixture of tens of KiB where the real window needs 4 MiB. It is
@@ -132,15 +139,17 @@ pub(super) const fn window_bytes() -> usize {
     WINDOW_BYTES
 }
 
-/// The smallest file the route reads a window at a time, four windows (4 MiB in every build that
-/// ships): below this it is not worth the second route, and the file is read whole as before.
+/// The smallest file the route reads a window at a time, four windows (1 MiB in every build that
+/// ships, 4 MiB before #7412): below this it is not worth the second route, and the file is read whole
+/// as before.
 #[inline]
 pub(super) fn min_windowed_file_bytes() -> u64 {
     4 * window_bytes() as u64
 }
 
 /// The smallest lone `--seq` regular file (named, or on standard input) the route reads a window at a
-/// time, a sixteenth of a window (64 KiB in every build that ships), where the plain route waits for
+/// time, a sixteenth of a window (16 KiB in every build that ships, 64 KiB before #7412), where the
+/// plain route waits for
 /// [`min_windowed_file_bytes`] (#7260). The whole-file route walks a `--seq` stream that is not plain
 /// records with jq's reader and converts every record to an owned value, which cost a 1 MiB stream with
 /// one bad record 17-18% of its time against the windows that carry on past it (#7322); a stream that
@@ -152,7 +161,8 @@ pub(super) fn min_windowed_seq_file_bytes() -> u64 {
 }
 
 /// The fewest bytes a pipe on standard input holds for the plain and `--seq` routes to read it a
-/// window at a time, two windows (2 MiB in every build that ships, #7260): its length is not known, so
+/// window at a time, two windows (512 KiB in every build that ships, #7412; 2 MiB from #7260): its
+/// length is not known, so
 /// that many are read first to learn it, and they are what the run holds at its peak. Since a pipe's
 /// windows share their buffers with the thread that certifies them and the probe is freed a block at a
 /// time, a windowed pipe holds about two windows, which a pipe that is read whole holds once it is a
@@ -187,6 +197,10 @@ pub(super) fn seq_block_bytes(file: &File, start: u64) -> usize {
 
 /// How many windows a document that does not fit in one is read on to before the rest of the file is.
 const LOOKAHEAD_WINDOWS: usize = 8;
+
+/// A file shorter than this many windows (4 MiB in every build that ships) whose window ends inside a
+/// document is read on to its end at once ([`WindowedFile::small_enough_to_read_whole`], #7412).
+const MAX_READ_WHOLE_WINDOWS: usize = 16;
 
 /// The record separator of a `--seq` stream.
 const RS: u8 = 0x1e;
@@ -604,7 +618,7 @@ impl WindowedFile {
                 // few of them is read in a linear amount of work, and once that is several windows
                 // (it is one long document, or a file of one line) for all of what is left, as
                 // the whole-file route reads it.
-                grow = if grow >= 4 * window_bytes() {
+                grow = if grow >= 4 * window_bytes() || self.small_enough_to_read_whole() {
                     self.rest()
                 } else {
                     grow.saturating_mul(2)
@@ -744,7 +758,7 @@ impl WindowedFile {
                 grow = self.block;
             } else if pending {
                 let lookahead = self.block.saturating_mul(LOOKAHEAD_WINDOWS);
-                grow = if self.buf.len() >= lookahead {
+                grow = if self.buf.len() >= lookahead || self.small_enough_to_read_whole() {
                     self.rest()
                 } else {
                     lookahead - self.buf.len()
@@ -754,6 +768,17 @@ impl WindowedFile {
                 self.drop_consumed();
             }
         }
+    }
+
+    /// #7412: a file of a known length under [`MAX_READ_WHOLE_WINDOWS`] windows whose window ends inside
+    /// a document is read on to its end at once, as the route that read it whole read it while the
+    /// window was 1 MiB and a file under 4 MiB did not take this route. Read on in doubling steps, its
+    /// buffer was grown three times on the way to the length (and copied each time), which held a
+    /// 3 MB file of one document 1.4 MB more on the M4 Pro than reading it whole.
+    fn small_enough_to_read_whole(&self) -> bool {
+        !self.unknown_len
+            && self.file_read.saturating_add(self.remaining)
+                < (MAX_READ_WHOLE_WINDOWS * self.block) as u64
     }
 
     /// What a read onto a pipe's probe asks for once a document in it is open past its window
@@ -3640,7 +3665,7 @@ mod tests {
     /// reads it, is an RS: any other stream is handed on at that byte, so a page is all that is read.
     /// #7376: the debug-build window knob takes a decimal count of bytes from two `--seq` pages to
     /// the real window and refuses everything else, so a test whose small fixture would be read
-    /// whole on the 1 MiB window fails instead of passing without the route. The unit tests
+    /// whole on the shipped window fails instead of passing without the route. The unit tests
     /// themselves run on the constants: `window_bytes` does not read the variable under `cfg(test)`.
     #[test]
     fn the_debug_window_knob_takes_a_window_in_range_and_refuses_the_rest_7376() {
@@ -3650,7 +3675,7 @@ mod tests {
             ("8192", 8192),
             ("65536", 65536),
             ("100000", 100_000),
-            ("1048576", WINDOW_BYTES),
+            ("262144", WINDOW_BYTES),
         ] {
             assert_eq!(
                 debug_window_bytes(Some(OsStr::new(value))),
@@ -3663,7 +3688,7 @@ mod tests {
             "0",
             "1",
             "8191",
-            "1048577",
+            "262145",
             "64k",
             "65536 ",
             " 65536",
@@ -3677,7 +3702,7 @@ mod tests {
             assert_eq!(
                 refusal,
                 format!(
-                    "SUCCINCTLY_DEBUG_JQ_WINDOW_BYTES={value} is not a count of bytes from 8192 to 1048576"
+                    "SUCCINCTLY_DEBUG_JQ_WINDOW_BYTES={value} is not a count of bytes from 8192 to 262144"
                 ),
             );
         }
@@ -3688,11 +3713,12 @@ mod tests {
         }
         assert_eq!(DEBUG_WINDOW_ENV, "SUCCINCTLY_DEBUG_JQ_WINDOW_BYTES");
         // The unit tests' window, and every limit that is a multiple of it, are the shipped ones.
-        assert_eq!(window_bytes(), 1 << 20);
-        assert_eq!(min_windowed_file_bytes(), 4 << 20);
-        assert_eq!(certifier_copy_limit(), 8 << 20);
-        assert_eq!(certifier_keep_bytes(), 2 << 20);
-        assert_eq!(max_seq_stretch(), 4 << 20);
+        assert_eq!(window_bytes(), 256 << 10);
+        assert_eq!(min_windowed_file_bytes(), 1 << 20);
+        assert_eq!(min_windowed_pipe_bytes(), 512 << 10);
+        assert_eq!(certifier_copy_limit(), 2 << 20);
+        assert_eq!(certifier_keep_bytes(), 512 << 10);
+        assert_eq!(max_seq_stretch(), 1 << 20);
     }
 
     #[test]
@@ -3779,6 +3805,42 @@ mod tests {
     }
 
     const BLOCKS: &[usize] = &[1, 2, 3, 5, 8, 13, 64, 4096];
+
+    /// #7412: a file under [`MAX_READ_WHOLE_WINDOWS`] windows whose window ends inside its one document
+    /// is read on to its end at once, into a buffer of the file's length, as the route that read it
+    /// whole read it while such a file did not take this route; a longer one is read on in doubling
+    /// steps, as before. Both give what the file read whole gives.
+    #[test]
+    fn a_small_file_of_one_long_document_is_read_on_to_its_end_at_once_7412() {
+        let block = 1024;
+        let document = |len: usize| {
+            let mut text = String::from("[");
+            while text.len() + 4 < len {
+                text.push_str("1,");
+            }
+            text.push_str("1]\n");
+            text.into_bytes()
+        };
+        let read_on = |text: &[u8]| {
+            let mut reader = open(text, block);
+            let values = reader
+                .next_window()
+                .expect("reads")
+                .expect("a window")
+                .values;
+            assert_eq!(values, vec![(0, text.len() - 1)]);
+            assert!(reader.next_window().expect("reads").is_none());
+            reader.buf.capacity()
+        };
+        let small = document(10 * block);
+        assert!(small.len() < MAX_READ_WHOLE_WINDOWS * block);
+        assert_eq!(read_on(&small), small.len());
+        assert_same(&small, block);
+        let long = document(20 * block);
+        assert!(long.len() > MAX_READ_WHOLE_WINDOWS * block);
+        assert!(read_on(&long) > long.len(), "grown by doubling");
+        assert_same(&long, block);
+    }
 
     /// A read that fails part-way through a document is an I/O failure, not a malformed document:
     /// the cut text goes out without a fault, and the error follows the last window.

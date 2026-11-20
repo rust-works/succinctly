@@ -52,7 +52,7 @@ fn a_window_that_is_not_usable_is_refused_by_a_debug_build_only_7376() -> Result
     std::fs::write(&file, "{\"id\":1}\n{\"id\":2}\n")?;
     let answer = ("1\n2\n".to_string(), String::new(), 0);
     assert_eq!(run(None, &file)?, answer);
-    for value in ["", "0", "4096", "1048577", "64k", "-1", " 65536"] {
+    for value in ["", "0", "4096", "262145", "64k", "-1", " 65536"] {
         let got = run(Some(value), &file)?;
         if cfg!(debug_assertions) {
             assert_eq!(
@@ -60,7 +60,7 @@ fn a_window_that_is_not_usable_is_refused_by_a_debug_build_only_7376() -> Result
                 (
                     String::new(),
                     format!(
-                        "succinctly: {}={value} is not a count of bytes from 8192 to 1048576 \
+                        "succinctly: {}={value} is not a count of bytes from 8192 to 262144 \
                          (a debug-build test knob, #7376)\n",
                         small_window::ENV
                     ),
@@ -72,15 +72,15 @@ fn a_window_that_is_not_usable_is_refused_by_a_debug_build_only_7376() -> Result
             assert_eq!(got, answer, "{value:?}");
         }
     }
-    // Every window the knob takes gives the answer the 1 MiB window gives.
-    for value in ["8192", "65536", "1048576"] {
+    // Every window the knob takes gives the answer the shipped 256 KiB window gives (#7412).
+    for value in ["8192", "65536", "262144"] {
         assert_eq!(run(Some(value), &file)?, answer, "{value:?}");
     }
     Ok(())
 }
 
 /// A file of four small windows is read a window at a time by a debug build told so, and gives
-/// what the same file gives read whole (no variable: it is far under 4 MiB), a runtime error's
+/// what the same file gives read whole (no variable: it is under the shipped 1 MiB), a runtime error's
 /// line and a fault's wording included.
 #[test]
 fn a_file_of_four_small_windows_reads_as_it_does_whole_7376() -> Result<()> {
@@ -94,7 +94,7 @@ fn a_file_of_four_small_windows_reads_as_it_does_whole_7376() -> Result<()> {
         })
         .collect();
     text.push_str("{\"id\": [1 2]}\n");
-    assert!(text.len() >= 4 * (64 << 10) && text.len() < 4 << 20);
+    assert!(text.len() >= 4 * (64 << 10) && text.len() < 4 * (256 << 10));
     let dir = tempfile::tempdir()?;
     let file = dir.path().join("f.json");
     std::fs::write(&file, &text)?;
@@ -112,7 +112,7 @@ fn a_file_of_four_small_windows_reads_as_it_does_whole_7376() -> Result<()> {
 
 /// More than 32 files at the window that ships, in any build: `i7024_many_files`,
 /// `i7024_raw_many_files` and `i7197` run on the small window in a debug build, so without this row
-/// `cargo test` would run that route's 1 MiB window nowhere. No variable is set; the first file is
+/// `cargo test` would run that route's shipped window nowhere. No variable is set; the first file is
 /// over 4 MiB, a number lies across the end of one file and the start of the next, and the answers
 /// are worked out here, not read from another route.
 #[test]
