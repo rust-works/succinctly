@@ -595,12 +595,6 @@ DEFAULT_THRESHOLD = 5.0
 # scan and re-render its comment above names. Remove the override once `main` carries the change
 # and the row reads ~0% against a merge-base that includes it.
 #
-# `users_path_walk` (#7260) carries an override of the same one-off kind: a field lookup over a
-# semi-indexed object compares an unescaped key's bytes with the name instead of decoding every key
-# (and checking it is a string instead of decoding it again), so `.users[] | .age` does less work per
-# record (-13.4% x86_64 / -12.1% ARM64-Linux against the PR's own merge-base, outputs byte-identical).
-# Remove it once `main` carries the change and the row reads ~0% against a merge-base that includes it.
-#
 # `seq_name_bad_last` (#6619) carries a TIGHTER threshold than the default (3.0 against 5.0), the one
 # override here that is not a loosening. #6594 (#6500) converts each record as the queue is read
 # instead of materializing every record first, and what that saves is mostly peak memory (1.1 GB
@@ -608,23 +602,8 @@ DEFAULT_THRESHOLD = 5.0
 # exact: -4.3% x86_64 on this 2 MB row against a merge-base without it (every other row +0.0%). A
 # revert would read +4.5%, which the default 5.0 lets through. Memory and time are watched by the
 # `seq_field_bad_first` / `seq_field_bad_last` rows of `comparison/jq/queries/perf.tsv`.
-#
-# `wide_to_entries`, `seq_array_bad_last` and `seq_keys_bad_last` (#7260) carry overrides of the
-# same one-off kind: an object of at most 16 fields is a plain field list with no hash table, a
-# record shares the keys it repeats of the one before it, and `to_entries` builds its entries from
-# two shared keys, so these rows build their objects with less work (-12.5% / -8.0% / -5.2% x86_64
-# against the PR's own merge-base, outputs byte-identical; ARM64-Linux not measured before the PR,
-# hence the margin). Remove them once `main` carries the change and the rows read ~0% against a
-# merge-base that includes it.
-# `seq_name_bad_last` is raised to 12.0 for the same change, as #6620 and #7263 raised it: it reads
-# -7.8% x86_64 against the PR's merge-base (the whole-stream route builds every record's object
-# with the field list and shared keys). Lower it back to #6619's 3.0, and its self-test back to the
-# one that holds it under a revert of #6594 (+4.5%), once `main` carries the change.
 QUERY_THRESHOLDS = {
-    "seq_name_bad_last": 12.0,
-    "wide_to_entries": 20.0,
-    "seq_array_bad_last": 12.0,
-    "seq_keys_bad_last": 10.0,
+    "seq_name_bad_last": 3.0,
     "wide_keys_unsorted": 10.0,
     "users_yq_raw_test": 65.0,
     "users_yq_raw_slice": 90.0,
@@ -635,7 +614,6 @@ QUERY_THRESHOLDS = {
     "users_update_select": 30.0,
     "users_yq_del_select": 15.0,
     "users_compact_latefail": 85.0,
-    "users_path_walk": 20.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
