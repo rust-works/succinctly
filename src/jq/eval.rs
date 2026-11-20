@@ -26583,11 +26583,20 @@ fn quote_csv_field<S: EvalSemantics>(s: &str) -> String {
 /// `@tsv` and `@html` (confirmed live against jq 1.7.1; `@uri`/`@base64`/
 /// `@text`/`@json` already agree). yq passes the NUL through raw (confirmed
 /// against yq v4.x), so the rewrite is jq-mode only.
+///
+/// The one definition of that rule (#7406): what a NUL is written as, or `None` where it is kept
+/// raw. [`escape_nul`] and the single-pass writers that escape other bytes as they go
+/// ([`push_tsv_escaped`], [`format_html`]) all read it here, so they cannot drift apart.
+#[inline]
+fn nul_escape<S: EvalSemantics>() -> Option<&'static str> {
+    (S::TAG != EvalTag::Yq).then_some("\\0")
+}
+
+/// `s` with every NUL written as [`nul_escape`] says.
 fn escape_nul<S: EvalSemantics>(s: &str) -> Cow<'_, str> {
-    if S::TAG != EvalTag::Yq && s.contains('\0') {
-        Cow::Owned(s.replace('\0', "\\0"))
-    } else {
-        Cow::Borrowed(s)
+    match nul_escape::<S>() {
+        Some(escape) if s.contains('\0') => Cow::Owned(s.replace('\0', escape)),
+        _ => Cow::Borrowed(s),
     }
 }
 
@@ -26813,7 +26822,10 @@ fn push_tsv_escaped<S: EvalSemantics>(out: &mut String, s: &str) {
             b'\t' => "\\t",
             b'\n' => "\\n",
             b'\r' => "\\r",
-            0 if S::TAG != EvalTag::Yq => "\\0",
+            0 => match nul_escape::<S>() {
+                Some(escape) => escape,
+                None => continue,
+            },
             _ => continue,
         };
         out.push_str(&s[from..at]);
@@ -27104,7 +27116,10 @@ fn format_html<S: EvalSemantics>(value: &OwnedValue, _optional: bool) -> Result<
             // jq 1.7.1 spells it `&apos;`, not `&#39;` (#5297).
             b'\'' => "&apos;",
             // #5302: jq mode renders U+0000 as `\0`; yq keeps it raw.
-            0 if S::TAG != EvalTag::Yq => "\\0",
+            0 => match nul_escape::<S>() {
+                Some(escape) => escape,
+                None => continue,
+            },
             _ => continue,
         };
         if start < i {
@@ -146012,6 +146027,46 @@ mod tests {
                 assert_eq!(s, r"\t\n\r\\");
             }
         );
+    }
+
+    /// #7406: the single-pass writers that escape a NUL among other bytes (`@tsv`'s
+    /// `push_tsv_escaped`, `@html`) write it as `escape_nul` does, in both modes: `\0` in jq mode,
+    /// raw in yq mode. `@tsv`'s writer is pinned to the per-field definition it replaced (four
+    /// `replace`s, then `escape_nul`), and `@html` to `escape_nul` on text with no entity, so that
+    /// a change to the rule in one writer and not the others fails here.
+    #[test]
+    fn nul_rule_is_one_rule_across_the_writers_7406() {
+        fn per_field<S: EvalSemantics>(s: &str) -> String {
+            escape_nul::<S>(
+                &s.replace('\\', "\\\\")
+                    .replace('\t', "\\t")
+                    .replace('\n', "\\n")
+                    .replace('\r', "\\r"),
+            )
+            .into_owned()
+        }
+        fn check<S: EvalSemantics>(nul: &str) {
+            for s in [
+                "",
+                "\0",
+                "\0\0",
+                "a\0b",
+                "\0\t\0\n\0\r\0\\\0",
+                "\\0",
+                "é\0ü\u{1}\u{1f}\u{7f}",
+                "plain",
+            ] {
+                let mut row = String::new();
+                push_tsv_escaped::<S>(&mut row, s);
+                assert_eq!(row, per_field::<S>(s), "{s:?}");
+                assert_eq!(escape_nul::<S>(s), s.replace('\0', nul), "{s:?}");
+                // None of these holds a byte `@html` writes as an entity.
+                let html = format_html::<S>(&OwnedValue::String(s.into()), false).unwrap();
+                assert_eq!(html, escape_nul::<S>(s), "{s:?}");
+            }
+        }
+        check::<JqSemantics>("\\0");
+        check::<YqSemantics>("\0");
     }
 
     #[test]
