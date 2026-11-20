@@ -24,7 +24,7 @@ use alloc::vec::Vec;
 
 use super::eval::JqSemantics;
 use super::eval_generic::{ObjectBuilder, SiblingShape};
-use super::value::OwnedValue;
+use super::value::{ObjectMap, OwnedValue, SharableString};
 
 /// Deeper than this the general route decides (it enforces the document nesting ceilings and
 /// words the refusal).
@@ -60,7 +60,7 @@ pub(crate) fn parse_plain_sized(text: &str, capacity: usize) -> Option<OwnedValu
         nodes: 0,
     };
     reader.space();
-    let value = reader.value_sized(0, capacity)?;
+    let value = reader.value_sized(0, capacity, None)?;
     reader.space();
     (reader.at == reader.bytes.len()).then_some(value)
 }
@@ -79,13 +79,18 @@ pub fn parse_plain_stream(text: &str) -> Option<Vec<OwnedValue>> {
         at: 0,
         nodes: 0,
     };
-    let mut values = Vec::new();
+    let mut values: Vec<OwnedValue> = Vec::new();
+    // A stream of records is an array's elements to the sizing and the key sharing (#7260).
+    let mut siblings = SiblingShape::default();
     loop {
         reader.space();
         if reader.at == reader.bytes.len() {
             return Some(values);
         }
-        values.push(reader.value(0)?);
+        let capacity = siblings.capacity();
+        let value = reader.value_sized(0, capacity, values.last_mut())?;
+        siblings.push(object_len(&value), capacity);
+        values.push(value);
         if let Some(next) = reader.bytes.get(reader.at) {
             if !matches!(next, b' ' | b'\t' | b'\n' | b'\r') {
                 return None;
@@ -299,6 +304,15 @@ impl Skip<'_> {
     }
 }
 
+/// How many members `value` has if it is an object, for [`SiblingShape`].
+#[inline]
+fn object_len(value: &OwnedValue) -> Option<usize> {
+    match value {
+        OwnedValue::Object(map) => Some(map.len()),
+        _ => None,
+    }
+}
+
 struct Reader<'a> {
     /// The text as a `&str` when the caller has one (slices are then cut on the checked
     /// boundaries); `None` for bytes of a document, whose slices are validated as they are cut.
@@ -333,18 +347,31 @@ impl<'a> Reader<'a> {
     }
 
     fn value(&mut self, depth: usize) -> Option<OwnedValue> {
-        self.value_sized(depth, 0)
+        self.value_sized(depth, 0, None)
     }
 
     /// [`value`](Self::value), with room for `capacity` members if it is an object (the
-    /// walk's sibling sizing, #5594).
-    fn value_sized(&mut self, depth: usize, capacity: usize) -> Option<OwnedValue> {
+    /// walk's sibling sizing, #5594), and sharing the keys it repeats of `prev`, the value read
+    /// just before it in the same place (the previous element, or the same member of the
+    /// previous record), when both are objects (#7260).
+    fn value_sized(
+        &mut self,
+        depth: usize,
+        capacity: usize,
+        prev: Option<&mut OwnedValue>,
+    ) -> Option<OwnedValue> {
         self.nodes += 1;
         if depth >= MAX_DEPTH {
             return None;
         }
         match *self.bytes.get(self.at)? {
-            b'{' => self.object(depth, capacity),
+            b'{' => {
+                let prev = match prev {
+                    Some(OwnedValue::Object(map)) => Some(map),
+                    _ => None,
+                };
+                self.object(depth, capacity, prev)
+            }
             b'[' => self.array(depth),
             b'"' => self.string().map(|s| OwnedValue::String(s.into())),
             b't' => self.literal(b"true", OwnedValue::Bool(true)),
@@ -353,6 +380,32 @@ impl<'a> Reader<'a> {
             b'-' | b'0'..=b'9' => self.number(),
             _ => None,
         }
+    }
+
+    /// The key at `self.at` when it is the text of `prev`'s key at `pos`, as a handle sharing
+    /// that key's storage, with the reader moved past it; `None` (the reader where it was)
+    /// otherwise, for [`string`](Self::string) to read (#7260).
+    ///
+    /// Byte equality with the decoded key is the decoded equality only for a key with no quote,
+    /// backslash or control byte, whose text is the key itself between quotes; any other key
+    /// takes the plain read. A record keeps its keys' order far more often than not, so the
+    /// previous record's key at the same position is the one to try.
+    fn sibling_key(&mut self, prev: &mut ObjectMap, pos: usize) -> Option<SharableString> {
+        let close = {
+            let key = prev.key_at(pos)?.as_bytes();
+            if key.iter().any(|&b| b == b'"' || b == b'\\' || b < 0x20) {
+                return None;
+            }
+            let open = self.at + 1;
+            let close = open + key.len();
+            if self.bytes.get(open..close)? != key || self.bytes.get(close) != Some(&b'"') {
+                return None;
+            }
+            close
+        };
+        let key = prev.share_key(pos)?;
+        self.at = close + 1;
+        Some(key)
     }
 
     /// The keyword, and not a longer token that starts with it (`nullx`, `true1`).
@@ -492,14 +545,8 @@ impl<'a> Reader<'a> {
         loop {
             self.space();
             let capacity = siblings.capacity();
-            let item = self.value_sized(depth + 1, capacity)?;
-            siblings.push(
-                match &item {
-                    OwnedValue::Object(map) => Some(map.len()),
-                    _ => None,
-                },
-                capacity,
-            );
+            let item = self.value_sized(depth + 1, capacity, items.last_mut())?;
+            siblings.push(object_len(&item), capacity);
             items.push(item);
             self.space();
             match *self.bytes.get(self.at)? {
@@ -513,7 +560,12 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn object(&mut self, depth: usize, capacity: usize) -> Option<OwnedValue> {
+    fn object(
+        &mut self,
+        depth: usize,
+        capacity: usize,
+        mut prev: Option<&mut ObjectMap>,
+    ) -> Option<OwnedValue> {
         self.at += 1;
         self.space();
         let mut members = ObjectBuilder::<OwnedValue>::with_capacity(capacity);
@@ -527,13 +579,29 @@ impl<'a> Reader<'a> {
             if *self.bytes.get(self.at)? != b'"' {
                 return None;
             }
-            let key = self.string()?;
+            // The same key at the same position of the previous record: share its storage.
+            let shared = match prev.as_deref_mut() {
+                Some(prev) => self.sibling_key(prev, count),
+                None => None,
+            };
+            let repeats = shared.is_some();
+            let key = match shared {
+                Some(key) => key,
+                None => SharableString::from(self.string()?),
+            };
             self.nodes += 1;
             self.space();
             self.eat(b':')?;
             self.space();
-            let value = self.value(depth + 1)?;
-            members.push::<JqSemantics>(key, value);
+            // Its value's own sibling is the previous record's value for the same key.
+            let value = match prev.as_deref_mut() {
+                Some(prev) if repeats => {
+                    let sibling = prev.get_index_mut(count).map(|(_, v)| v);
+                    self.value_sized(depth + 1, 0, sibling)?
+                }
+                _ => self.value(depth + 1)?,
+            };
+            members.push_shared::<JqSemantics>(key, value);
             count += 1;
             self.space();
             match *self.bytes.get(self.at)? {
@@ -596,6 +664,47 @@ mod tests {
             return end == Some(text.trim_end_matches([' ', '\t', '\n', '\r']).len());
         }
         true
+    }
+
+    /// The keys of a record, for the sharing tests below.
+    fn keys_of(value: &OwnedValue) -> Vec<&SharableString> {
+        let map = value.as_object().expect("an object");
+        (0..map.len())
+            .map(|i| map.key_at(i).expect("a key"))
+            .collect()
+    }
+
+    /// #7260: a record repeating the previous record's key at the same position shares that key's
+    /// storage (one string for the key of every record), and so does a nested record's key; a
+    /// key the previous record has elsewhere, or one whose text holds an escape, is its own. The
+    /// values are what the indexed route builds either way.
+    #[test]
+    fn records_share_the_keys_they_repeat_7260() {
+        let text = r#"[{"id":1,"name":"a","at":{"x":1}},{"id":2,"name":"b","at":{"x":2}},
+            {"name":"c","id":3},{"id":4,"n\u0061me":"d"},{"id":5,"name":"e"}]"#;
+        assert!(agrees(text));
+        let value = parse_plain(text).expect("plain");
+        let items = value.as_array().expect("an array");
+        let (first, second) = (keys_of(&items[0]), keys_of(&items[1]));
+        assert!(first[0].ptr_eq(second[0]) && first[1].ptr_eq(second[1]));
+        let nested = |i: usize| keys_of(&items[i].as_object().unwrap()["at"])[0].clone();
+        assert!(nested(0).ptr_eq(&nested(1)), "a nested record's key");
+        // Reordered: neither key is at the position it had.
+        let third = keys_of(&items[2]);
+        assert!(!third[0].is_shared() && !third[1].is_shared());
+        // An escaped key reads through the plain path; the next record's plain `"name"` is its
+        // decoded text, so that one shares it.
+        let (fourth, fifth) = (keys_of(&items[3]), keys_of(&items[4]));
+        assert_eq!(fourth[1].as_str(), "name");
+        assert!(fifth[0].ptr_eq(fourth[0]) && fifth[1].ptr_eq(fourth[1]));
+        assert!(
+            !fourth[1].ptr_eq(second[1]),
+            "the escaped key was read, not shared"
+        );
+        // A stream of records shares across its documents.
+        let stream = parse_plain_stream("{\"k\":1}\n{\"k\":2}\n").expect("plain");
+        assert!(keys_of(&stream[0])[0].ptr_eq(keys_of(&stream[1])[0]));
+        assert_eq!(stream[1].to_json(), r#"{"k":2}"#);
     }
 
     #[cfg(feature = "serde")]

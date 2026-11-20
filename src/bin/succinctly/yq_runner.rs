@@ -11471,7 +11471,7 @@ fn join_block_entries(entries: Vec<(String, bool)>) -> String {
 /// always did; only the other cases collect. Kept as one small enum so the iterator's state stays
 /// out of `emit_yaml_value_at_depth`'s frame, which the nesting-depth guard is sized against (#1017).
 enum ObjectEntries<'a> {
-    Plain(indexmap::map::Iter<'a, String, OwnedValue>),
+    Plain(succinctly::jq::field_map::Iter<'a, OwnedValue>),
     Listed(std::vec::IntoIter<ObjectEntry<'a>>),
 }
 

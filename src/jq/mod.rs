@@ -232,11 +232,11 @@ pub use resolve::{
 };
 pub use stream::{StreamError, StreamStats, StreamableValue};
 pub use value::{
-    assert_value_tree_depth, format_number_jq_compat, jq_bare_float_display,
+    assert_value_tree_depth, field_map, format_number_jq_compat, jq_bare_float_display,
     jq_float_is_scientific, nesting_depth_exceeded_message, ArrayIntoIter, ArrayOf, ArrayVec,
-    ArrayVecMut, FlaggedOccurrences, NumberRepr, ObjectMap, ObjectMapEntry, ObjectMapIntoIter,
-    ObjectMapOf, OccupiedMapEntry, Occurrences, OwnedValue, ReindexedDoc, ScalarKind,
-    SharableLiteral, SharableString, Teardown, VacantMapEntry, JQ_MAX_PRINT_DEPTH,
+    ArrayVecMut, FieldMap, FlaggedOccurrences, NumberRepr, ObjectMap, ObjectMapEntry,
+    ObjectMapIntoIter, ObjectMapOf, OccupiedMapEntry, Occurrences, OwnedValue, ReindexedDoc,
+    ScalarKind, SharableLiteral, SharableString, Teardown, VacantMapEntry, JQ_MAX_PRINT_DEPTH,
     MAX_VALUE_TREE_DEPTH, SKIPPED_TOO_DEEP, STACK_FLOOR_NESTING_MESSAGE,
 };
 // `pub(crate)`, not `pub`: only `yaml::light`'s alias-chain resolvers (#1191

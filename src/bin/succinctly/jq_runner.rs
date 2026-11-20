@@ -24,8 +24,8 @@ use succinctly::jq::utf8_document::SubstitutionEdit;
 use succinctly::jq::walk::{map_builtin_subexprs, map_pattern_subexprs, stamp_loc_file};
 use succinctly::jq::{
     self, format_number_jq_compat, jq_bare_float_display, nonfinite_display_string, Builtin,
-    ErrorKind, EvalError, EvalErrorPayload, Expr, FuncDefBound, JqSemantics, JqValue, MetaObject,
-    MetaValue, OwnedValue, Param, Pattern, Program, StreamStats, MAX_VALUE_TREE_DEPTH,
+    ErrorKind, EvalError, EvalErrorPayload, Expr, FieldMap, FuncDefBound, JqSemantics, JqValue,
+    MetaObject, MetaValue, OwnedValue, Param, Pattern, Program, StreamStats, MAX_VALUE_TREE_DEPTH,
 };
 use succinctly::json::light::{preceding_gap_ok, JsonCursor, JsonString, StandardJson};
 use succinctly::json::validate::{self, ValidationError};
@@ -18983,7 +18983,7 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
         // the object before printing any of it).
         GenericResult::LazyObject(obj) => {
             let entries = obj.into_entries();
-            let mut map: IndexMap<String, JqValue<'_, W>> = IndexMap::with_capacity(entries.len());
+            let mut map: FieldMap<JqValue<'_, W>> = FieldMap::with_capacity(entries.len());
             for (key, elem) in entries {
                 let value = match elem {
                     LazyElem::Cursor(c) => {
@@ -19141,7 +19141,7 @@ fn standard_json_to_jq_value<'a, W: Clone + AsRef<[u64]>>(
         }
         StandardJson::Object(fields) => {
             // LAZY: Store cursor references instead of materializing values
-            let mut map: IndexMap<String, JqValue<'a, W>> = IndexMap::new();
+            let mut map: FieldMap<JqValue<'a, W>> = FieldMap::new();
             let mut remaining = fields;
             let mut is_first = true;
             while let Some((f, rest)) = remaining.uncons() {

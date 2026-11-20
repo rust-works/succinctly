@@ -21,6 +21,7 @@ use alloc::rc::Rc;
 use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
 
+#[cfg(test)]
 use indexmap::IndexMap;
 
 use super::error::EvalError;
@@ -32,12 +33,35 @@ use super::eval::{
 };
 use super::expr::Literal;
 
+pub mod field_map;
 mod object_map;
 
+pub use field_map::FieldMap;
 pub use object_map::{
     FlaggedOccurrences, ObjectMapEntry, ObjectMapIntoIter, ObjectMapOf, OccupiedMapEntry,
     Occurrences, VacantMapEntry,
 };
+
+/// The keys of a [`OwnedValue::entry`], shared: one refcounted `"key"` and `"value"` per thread.
+#[cfg(feature = "std")]
+fn entry_keys() -> (SharableString, SharableString) {
+    std::thread_local! {
+        static KEYS: (SharableString, SharableString) = {
+            let mut key = SharableString::from("key");
+            key.promote();
+            let mut value = SharableString::from("value");
+            value.promote();
+            (key, value)
+        };
+    }
+    KEYS.with(|(key, value)| (key.clone(), value.clone()))
+}
+
+/// The keys of a [`OwnedValue::entry`]; without `std` there is no thread-local to share them in.
+#[cfg(not(feature = "std"))]
+fn entry_keys() -> (SharableString, SharableString) {
+    (SharableString::from("key"), SharableString::from("value"))
+}
 
 /// Recursion-depth ceiling for tree-walkers over an already-materialized
 /// [`OwnedValue`] (#1005).
@@ -4263,7 +4287,7 @@ impl OwnedValue {
 
     /// Create an empty object.
     pub fn object() -> Self {
-        Self::Object(IndexMap::new().into())
+        Self::Object(FieldMap::new().into())
     }
 
     /// Whether this value and `other` are the same *storage* -- jq's
@@ -4322,6 +4346,19 @@ impl OwnedValue {
     /// Create an object from key-value pairs.
     pub fn object_from(pairs: impl IntoIterator<Item = (String, Self)>) -> Self {
         Self::Object(pairs.into_iter().collect())
+    }
+
+    /// One `{"key": key, "value": value}` entry, as `to_entries` builds it.
+    ///
+    /// The two keys share their storage with every entry built on this thread (#7260), as jq's
+    /// entries hold its constant pool's one `"key"` and `"value"`: an entry is then its map and
+    /// its two values, not two more 3- and 5-byte strings each.
+    pub(crate) fn entry(key: Self, value: Self) -> Self {
+        let (key_key, value_key) = entry_keys();
+        let mut entry = FieldMap::with_capacity(2);
+        entry.insert_shared(key_key, key);
+        entry.insert_shared(value_key, value);
+        Self::Object(entry.into())
     }
 
     /// Check if this value is null.
@@ -4465,8 +4502,9 @@ impl OwnedValue {
         }
     }
 
-    /// Convert to an object reference, if possible.
-    pub fn as_object(&self) -> Option<&IndexMap<String, Self>> {
+    /// Convert to an object reference, if possible: the collapsed view, a
+    /// [`FieldMap`] (an `IndexMap` before #7260, with the same API).
+    pub fn as_object(&self) -> Option<&FieldMap<Self>> {
         match self {
             Self::Object(obj) => Some(obj),
             _ => None,
@@ -4475,12 +4513,12 @@ impl OwnedValue {
 
     /// Convert to a mutable object reference, if possible.
     ///
-    /// Hands out the [`ObjectMap`] itself, not its `IndexMap` (#1344), so the
+    /// Hands out the [`ObjectMap`] itself, not its [`FieldMap`] (#1344), so the
     /// copy-on-write point (#2999) is the first mutator called on it -- not
     /// this method, which writes nothing -- and `share-stats` attributes the
     /// copy to that call. The mutators that keep a repeated key's earlier
     /// entries in step are inherent methods of [`ObjectMapOf`]; a raw
-    /// `&mut IndexMap` borrow (`DerefMut`) collapses them first.
+    /// `&mut FieldMap` borrow (`DerefMut`) collapses them first.
     pub fn as_object_mut(&mut self) -> Option<&mut ObjectMap> {
         match self {
             Self::Object(obj) => Some(obj),
@@ -7371,18 +7409,32 @@ mod tests {
         assert!(sized.capacity() >= 8);
     }
 
-    /// `as_object` keeps returning a bare `&IndexMap` (#3000's public-API
-    /// promise): the boxing is not supposed to show up in the signature, only
-    /// in the variant's own payload. `as_object_mut` returns `&mut ObjectMap`
-    /// since #1344 so the shadow-aware mutators are reachable, and an
-    /// `&mut IndexMap` annotation still compiles by deref coercion -- which is
-    /// what the `let` below exercises.
+    /// `as_object` returns the bare collapsed view, a `&FieldMap` since #7260
+    /// (a `&IndexMap` before it, #3000's promise that the boxing does not show
+    /// in the signature). `as_object_mut` returns `&mut ObjectMap` since #1344
+    /// so the shadow-aware mutators are reachable, and an `&mut FieldMap`
+    /// annotation still compiles by deref coercion -- which is what the `let`
+    /// below exercises.
+    /// #7260: every `to_entries` entry holds the same `"key"` and `"value"` strings, as jq's do
+    /// (with `std`, which has the thread-local they are kept in).
     #[test]
-    fn as_object_accessors_still_hand_out_a_bare_index_map_3000() {
+    #[cfg(feature = "std")]
+    fn entries_share_their_two_keys_7260() {
+        let a = OwnedValue::entry(OwnedValue::Int(0), OwnedValue::Null);
+        let b = OwnedValue::entry(OwnedValue::string("k"), OwnedValue::Bool(true));
+        assert_eq!(b.to_json(), r#"{"key":"k","value":true}"#);
+        let (a, b) = (a.as_object().unwrap(), b.as_object().unwrap());
+        for pos in 0..2 {
+            assert!(a.key_at(pos).unwrap().ptr_eq(b.key_at(pos).unwrap()));
+        }
+    }
+
+    #[test]
+    fn as_object_accessors_still_hand_out_a_bare_field_map_3000() {
         let mut value = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
-        let read: &IndexMap<String, OwnedValue> = value.as_object().unwrap();
+        let read: &FieldMap<OwnedValue> = value.as_object().unwrap();
         assert_eq!(read.len(), 1);
-        let write: &mut IndexMap<String, OwnedValue> = value.as_object_mut().unwrap();
+        let write: &mut FieldMap<OwnedValue> = value.as_object_mut().unwrap();
         write.insert("b".to_string(), OwnedValue::Int(2));
         assert_eq!(value.as_object().unwrap().len(), 2);
         assert!(OwnedValue::Int(1).as_object().is_none());

@@ -23,7 +23,7 @@ use alloc::string::String;
 use indexmap::IndexMap;
 
 use super::error::EvalError;
-use super::value::{NumberRepr, OwnedValue};
+use super::value::{FieldMap, NumberRepr, OwnedValue};
 
 /// #5118: whether this thread has sliced a container long enough for jq's slice to be a copy.
 ///
@@ -95,7 +95,7 @@ impl SliceBounds {
     /// invalid value, which fails the same check — so `{"start":1}` is
     /// rejected while `{"start":1,"end":null}` is fine. Extra keys are never
     /// looked at.
-    pub(crate) fn from_descriptor(obj: &IndexMap<String, OwnedValue>) -> Result<Self, EvalError> {
+    pub(crate) fn from_descriptor(obj: &FieldMap<OwnedValue>) -> Result<Self, EvalError> {
         Ok(Self {
             start: bound(obj.get("start"))?,
             end: bound(obj.get("end"))?,
@@ -386,7 +386,7 @@ pub(crate) fn slice_str(s: &str, range: Range<usize>) -> String {
 mod tests {
     use super::*;
 
-    fn desc(pairs: &[(&str, OwnedValue)]) -> IndexMap<String, OwnedValue> {
+    fn desc(pairs: &[(&str, OwnedValue)]) -> FieldMap<OwnedValue> {
         pairs
             .iter()
             .map(|(k, v)| ((*k).to_string(), v.clone()))

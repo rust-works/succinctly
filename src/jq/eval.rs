@@ -521,6 +521,7 @@ use super::expr::{
     PatternEntry, PipeStages, SharedArg, SliceBoundKey, StageClass, StringPart, TailPlan,
     TextCodec, Tracked, XmlOptions, YqOutputEncoder,
 };
+use super::value::FieldMap;
 #[cfg(test)]
 use super::value::SharableString;
 use super::value::{
@@ -3813,7 +3814,7 @@ fn to_owned_key_shape<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // ([`bound_shape`]): the copy stays two levels deep and O(1) in the
         // bound's size, as the old empty-object shape was.
         StandardJson::Object(fields) if S::TAG != EvalTag::Yq => {
-            let mut desc = IndexMap::new();
+            let mut desc = FieldMap::new();
             for name in ["start", "end"] {
                 if let Some(bound) = fields.clone().find(name)? {
                     let shape = match bound {
@@ -5950,18 +5951,18 @@ fn is_plain_navigation(expr: &Expr) -> bool {
 /// only visible here. jq mode collects straight into the map, as it always did.
 pub(crate) fn object_from_pairs<S: EvalSemantics>(
     pairs: impl IntoIterator<Item = (String, OwnedValue)>,
-) -> Result<IndexMap<String, OwnedValue>, EvalError> {
+) -> Result<FieldMap<OwnedValue>, EvalError> {
     if S::TAG != EvalTag::Yq {
         return Ok(pairs.into_iter().collect());
     }
     let pairs = pairs.into_iter();
-    let mut map = IndexMap::with_capacity(pairs.size_hint().0);
+    let mut map = FieldMap::with_capacity(pairs.size_hint().0);
     for (key, value) in pairs {
         match map.entry(key) {
-            indexmap::map::Entry::Vacant(slot) => {
+            super::value::field_map::Entry::Vacant(slot) => {
                 slot.insert(value);
             }
-            indexmap::map::Entry::Occupied(mut slot) => {
+            super::value::field_map::Entry::Occupied(mut slot) => {
                 let merged = if matches!(
                     (slot.get(), &value),
                     (OwnedValue::Object(_), OwnedValue::Object(_))
@@ -15329,12 +15330,7 @@ pub(crate) fn owned_container_key_builtin<S: EvalSemantics>(
 /// very node it came from, as in jq. `None` for anything else, whose
 /// diagnostics stay the evaluator's.
 fn owned_to_entries(input: &OwnedValue) -> Option<OwnedValue> {
-    let entry = |key: OwnedValue, value: &OwnedValue| {
-        OwnedValue::object_from([
-            ("key".to_string(), key),
-            ("value".to_string(), value.clone()),
-        ])
-    };
+    let entry = |key: OwnedValue, value: &OwnedValue| OwnedValue::entry(key, value.clone());
     let entries: Vec<OwnedValue> = match input {
         OwnedValue::Object(fields) => fields
             .occurrences()
@@ -22136,7 +22132,7 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 };
             if S::COLLAPSE_DUPLICATE_KEYS {
                 // `checked` is already collapsed: one pass, each key checked as it is inserted.
-                let mut result_map = IndexMap::with_capacity(checked.len());
+                let mut result_map = FieldMap::with_capacity(checked.len());
                 let mut guard = DisplayKeyGuard::default();
                 for field in checked {
                     // `key_display_string_kind`, not `resolve_display_key`: see the guard note
@@ -25132,7 +25128,7 @@ fn yq_sort_mapping<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         keyed.push((sort_key, (key, is_fallback, owned)));
     }
     yq_sort_by::<_, S>(&mut keyed, |(key, _)| key.as_slice());
-    let mut sorted = IndexMap::with_capacity(keyed.len());
+    let mut sorted = FieldMap::with_capacity(keyed.len());
     let mut guard = DisplayKeyGuard::default();
     for (_, (key, is_fallback, value)) in keyed {
         if !guard.check(&sorted, &key, is_fallback) {
@@ -25314,10 +25310,7 @@ fn builtin_to_entries<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     Ok(v) => v,
                     Err(e) => return suppress_or_raise(e, optional),
                 };
-                let mut entry = IndexMap::new();
-                entry.insert("key".to_string(), OwnedValue::Int(i as i64));
-                entry.insert("value".to_string(), val);
-                entries.push(OwnedValue::Object(entry.into()));
+                entries.push(OwnedValue::entry(OwnedValue::Int(i as i64), val));
             }
             QueryResult::Owned(OwnedValue::array_from(entries))
         }
@@ -25357,13 +25350,10 @@ fn builtin_to_entries<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     Err(e) => return suppress_or_raise(e, optional),
                 };
 
-                let mut entry = IndexMap::new();
-                entry.insert(
-                    "key".to_string(),
+                entries.push(OwnedValue::entry(
                     OwnedValue::String(key.into_owned().into()),
-                );
-                entry.insert("value".to_string(), val);
-                entries.push(OwnedValue::Object(entry.into()));
+                    val,
+                ));
             }
             QueryResult::Owned(OwnedValue::array_from(entries))
         }
@@ -30189,7 +30179,7 @@ fn parse_json_object(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String
     }
     *pos += 1;
 
-    let mut entries = IndexMap::new();
+    let mut entries = FieldMap::new();
 
     // Skip whitespace
     while *pos < bytes.len() && matches!(bytes[*pos], b' ' | b'\t' | b'\n' | b'\r') {
@@ -30970,7 +30960,7 @@ fn build_upper_index<'a, W, S: EvalSemantics>(
     rows: &[OwnedValue],
     idx_expr: &Expr,
 ) -> QueryResult<'a, W> {
-    let mut obj = IndexMap::with_capacity(rows.len());
+    let mut obj = FieldMap::with_capacity(rows.len());
     for row in rows {
         // #5306: a plain `.name` read of an object row is its member (null when absent), which
         // the general evaluator below reaches through a fresh result vector per row.
@@ -40336,7 +40326,7 @@ fn build_match_object<S: EvalSemantics>(
     let m0 = caps
         .get(0)
         .expect("capture group 0 is always present on a match");
-    let mut obj = IndexMap::new();
+    let mut obj = FieldMap::new();
 
     obj.insert(
         "offset".to_string(),
@@ -40359,7 +40349,7 @@ fn build_match_object<S: EvalSemantics>(
         if i == 0 {
             continue; // Skip the full match
         }
-        let mut cap_obj = IndexMap::new();
+        let mut cap_obj = FieldMap::new();
         // jq (verified against pinned jq-1.7.1) swaps "string" before
         // "length" whenever a capture's own length is 0 — whether it
         // matched empty or didn't participate at all. A group that never
@@ -40434,13 +40424,13 @@ fn build_match_object_yq(re: &JqRegex, caps: &RegexCaptures) -> OwnedValue {
     let m0 = caps
         .get(0)
         .expect("capture group 0 is always present on a match");
-    let mut obj = IndexMap::new();
+    let mut obj = FieldMap::new();
     obj.insert("string".to_string(), string(m0.as_str()));
     obj.insert("offset".to_string(), int(m0.start()));
     obj.insert("length".to_string(), int(m0.len()));
     let mut captures = Vec::new();
     for (i, name) in re.capture_names().enumerate().skip(1) {
-        let mut cap = IndexMap::new();
+        let mut cap = FieldMap::new();
         match caps.get(i) {
             Some(m) => {
                 cap.insert("string".to_string(), string(m.as_str()));
@@ -41186,7 +41176,7 @@ fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// is `{"x": ""}` (#5502). yq's is Go's: such a group stays `null`.
 #[cfg(feature = "regex")]
 fn capture_object<S: EvalSemantics>(re: &JqRegex, caps: &RegexCaptures) -> OwnedValue {
-    let mut entries = IndexMap::new();
+    let mut entries = FieldMap::new();
     for (i, name) in re.capture_names().enumerate() {
         let Some(name) = name else { continue };
         // #5363: a group that took no part in the match is `null`, not absent -- jq builds this
@@ -45232,7 +45222,7 @@ fn yq_slice_bound_not_integral(v: &OwnedValue) -> bool {
 /// integers`, while `null | .[{"start":1}]` is `null`. Extra keys are
 /// never looked at.
 pub(crate) fn descriptor_slice_bounds(
-    desc: &IndexMap<String, OwnedValue>,
+    desc: &FieldMap<OwnedValue>,
 ) -> (ComputedSliceBound, ComputedSliceBound) {
     let (start, end) = descriptor_bound_sides(desc);
     (start.bound, end.bound)
@@ -45245,7 +45235,7 @@ pub(crate) fn descriptor_slice_bounds(
 /// missing side a failure like a non-number one. `slice::SliceBounds::
 /// from_descriptor` answers the same question for a runtime path component,
 /// which resolves against a length rather than carrying an `i64`.
-fn descriptor_bound_sides(desc: &IndexMap<String, OwnedValue>) -> (PathSliceBound, PathSliceBound) {
+fn descriptor_bound_sides(desc: &FieldMap<OwnedValue>) -> (PathSliceBound, PathSliceBound) {
     let side = |name: &str, round: fn(f64) -> f64| match desc.get(name) {
         Some(v) => PathSliceBound::classify(v.clone(), round),
         None => PathSliceBound {
@@ -50046,7 +50036,7 @@ fn rename_members(root: &mut OwnedValue, renames: &[(Expr, String)]) -> Result<(
         if wanted.iter().all(|(old_key, new_key)| old_key == new_key) {
             continue;
         }
-        let mut renamed: IndexMap<String, OwnedValue> = IndexMap::new();
+        let mut renamed: FieldMap<OwnedValue> = FieldMap::new();
         for (key, value) in map.iter() {
             let name = wanted.get(key.as_str()).copied().unwrap_or(key.as_str());
             if renamed.insert(name.to_string(), value.clone()).is_some() {
@@ -52762,8 +52752,8 @@ fn update_path_with_deletes<S: EvalSemantics>(
                             )?;
                         }
                     } else {
-                        let mut retained = IndexMap::with_capacity(map.len());
-                        // Take the `IndexMap` *through* the `ObjectMap` wrapper
+                        let mut retained = FieldMap::with_capacity(map.len());
+                        // Take the `FieldMap` *through* the `ObjectMap` wrapper
                         // (#3000): taking the wrapper itself would leave a freshly
                         // boxed empty map behind, and the write-back below would
                         // then allocate a second box and free that one -- two heap
@@ -53502,7 +53492,7 @@ fn wrap_fresh(steps: &[Expr], value: OwnedValue, yq_mode: bool) -> Result<OwnedV
         let (component, _optional) = unwrap_path_component(step);
         value = match component {
             Expr::Field(name) => {
-                let mut map = IndexMap::new();
+                let mut map = FieldMap::new();
                 map.insert(name.clone(), value);
                 OwnedValue::Object(map.into())
             }
@@ -55886,7 +55876,7 @@ fn key_to_path_component<S: EvalSemantics>(
 /// spelling, #1326); any other shape -- reordered, extra or missing keys --
 /// is carried whole as [`SliceBoundKey::Verbatim`].
 fn descriptor_path_component<S: EvalSemantics>(
-    desc: &IndexMap<String, OwnedValue>,
+    desc: &FieldMap<OwnedValue>,
     container: &OwnedValue,
 ) -> Result<Expr, EvalError> {
     let (s, e) = descriptor_bound_sides(desc);
@@ -61961,7 +61951,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             // `resolve_node_sink` returns, matching `build_upper_index`'s
             // own "no partial object" rule without its second pass over
             // already-collected rows.
-            let mut obj = IndexMap::new();
+            let mut obj = FieldMap::new();
             let idx_escape = StashedEscape::new();
             let flow = resolve_node_sink::<S>(
                 stream,
@@ -66025,7 +66015,7 @@ fn resolve_recursive_descent_sink<'a>(
 /// ([`resolve_recursive_descent_sink`], #2895).
 enum RecursiveChildren<'a> {
     Array(core::iter::Enumerate<core::slice::Iter<'a, OwnedValue>>),
-    Object(indexmap::map::Iter<'a, String, OwnedValue>),
+    Object(super::value::field_map::Iter<'a, OwnedValue>),
 }
 
 impl<'a> RecursiveChildren<'a> {
@@ -92680,7 +92670,7 @@ fn owned_constructor_step<S: EvalSemantics>(
             if !around_state {
                 return owned_free_object_step::<S>(entries, state);
             }
-            let mut map: IndexMap<String, OwnedValue> = IndexMap::with_capacity(entries.len());
+            let mut map: FieldMap<OwnedValue> = FieldMap::with_capacity(entries.len());
             let mut dot: Option<String> = None;
             let mut dot_live = false;
             for entry in entries {
@@ -92843,7 +92833,7 @@ impl<'e> FreeMember<'e> {
                 Ok(OwnedValue::array_from(out))
             }
             FreeMember::Nested(FreeShape::Object(parts)) => {
-                let mut map: IndexMap<String, OwnedValue> = IndexMap::with_capacity(parts.len());
+                let mut map: FieldMap<OwnedValue> = FieldMap::with_capacity(parts.len());
                 for (key, part) in parts {
                     map.insert(key, part.resolve::<S>(state)?);
                 }
@@ -93087,7 +93077,7 @@ fn owned_free_object_step<S: EvalSemantics>(
     entries: &[ObjectEntry],
     mut state: OwnedValue,
 ) -> Result<OwnedStep, OwnedValue> {
-    let mut map: IndexMap<String, OwnedValue> = IndexMap::with_capacity(entries.len());
+    let mut map: FieldMap<OwnedValue> = FieldMap::with_capacity(entries.len());
     let mut moves: Vec<(String, FreeMember<'_>)> = Vec::new();
     for entry in entries {
         let key = match &entry.key {
@@ -94628,7 +94618,7 @@ fn eval_owned_many_doors_answer<S: EvalSemantics>(
 /// `<top-level>` for the main filter. One spelling for the evaluator's arm and the owned door
 /// (#7132).
 fn owned_loc_value(line: usize, file: Option<&str>) -> OwnedValue {
-    let mut obj = IndexMap::new();
+    let mut obj = FieldMap::new();
     obj.insert(
         "file".into(),
         OwnedValue::String(file.unwrap_or("<top-level>").into()),
@@ -100988,7 +100978,7 @@ fn walk_impl_at_depth<S: EvalSemantics>(
         // hash table, and each value is taken out, walked and its first output put back. A member
         // with no output is deleted afterwards, in one pass that keeps the others' order.
         OwnedValue::Object(mut obj) => {
-            let map: &mut IndexMap<String, OwnedValue> = &mut obj;
+            let map: &mut FieldMap<OwnedValue> = &mut obj;
             let mut deleted: Vec<usize> = Vec::new();
             for at in 0..map.len() {
                 let slot = map.get_index_mut(at).expect("in bounds").1;
@@ -102823,7 +102813,7 @@ fn set_value_at_path_impl<S: EvalSemantics, const YQ_SETPATH: bool>(
                 Ok(OwnedValue::Object(entries))
             }
             OwnedValue::Null => {
-                let mut entries = IndexMap::new();
+                let mut entries = FieldMap::new();
                 entries.insert(
                     String::clone(name),
                     set_value_at_path_impl::<S, YQ_SETPATH>(OwnedValue::Null, rest, new_val)?,
@@ -114540,7 +114530,7 @@ fn environment_object() -> OwnedValue {
 #[cfg(feature = "std")]
 fn environment_object_in(snapshot: bool) -> OwnedValue {
     fn build() -> OwnedValue {
-        let mut env_obj = IndexMap::new();
+        let mut env_obj = FieldMap::new();
         // `vars_os`, not `vars`: `vars` panics on the first name or value that is not UTF-8
         // (#6564); jq substitutes it instead.
         for (key, value) in std::env::vars_os() {
@@ -115258,7 +115248,7 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 resolved_fields.push((key, is_fallback, field));
             }
             // For objects, pick specified string keys
-            let mut result = IndexMap::new();
+            let mut result = FieldMap::new();
             for key in keys {
                 if let OwnedValue::String(k) = key {
                     // Find every field matching this requested key -- not
@@ -115860,7 +115850,7 @@ fn pivot_objects<'a, W: Clone + AsRef<[u64]>>(items: &[OwnedValue]) -> QueryResu
     }
 
     // Build result object with arrays for each key
-    let mut result = IndexMap::new();
+    let mut result = FieldMap::new();
     for key in &all_keys {
         let mut values = vec_with_capacity(items.len());
         for item in items {
@@ -116917,7 +116907,7 @@ pub(crate) fn substitute_destructured_bindings<S: EvalSemantics>(
 /// mode's [`PatternBinding`] (#2649) share one keep-first/keep-last rule
 /// instead of each hand-rolling its own `IndexMap` reduction.
 fn dedup_keep_first_by<T>(items: Vec<T>, name: impl for<'a> Fn(&'a T) -> &'a str) -> Vec<T> {
-    let mut map: IndexMap<String, T> = IndexMap::new();
+    let mut map: FieldMap<T> = FieldMap::new();
     for item in items {
         map.entry(name(&item).to_string()).or_insert(item);
     }
@@ -116931,7 +116921,7 @@ fn dedup_keep_first_by<T>(items: Vec<T>, name: impl for<'a> Fn(&'a T) -> &'a str
 /// duplicate-object-key rule), so this needs no explicit reverse/re-reverse
 /// pass either. See [`dedup_keep_first_by`] for why this is generic.
 fn dedup_keep_last_by<T>(items: Vec<T>, name: impl for<'a> Fn(&'a T) -> &'a str) -> Vec<T> {
-    let mut map: IndexMap<String, T> = IndexMap::new();
+    let mut map: FieldMap<T> = FieldMap::new();
     for item in items {
         map.insert(name(&item).to_string(), item);
     }
@@ -184697,7 +184687,7 @@ mod touched_edge_cases_2999 {
                 .map(|(k, v)| ((*k).to_string(), value(v)))
                 .collect::<Vec<_>>()
         };
-        let render = |map: IndexMap<String, OwnedValue>| OwnedValue::Object(map.into()).to_json();
+        let render = |map: FieldMap<OwnedValue>| OwnedValue::Object(map.into()).to_json();
         for (rows, jq, yq) in [
             (
                 &[("a", r#"{"x":1}"#), ("a", r#"{"y":2}"#)][..],

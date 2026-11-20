@@ -26,12 +26,10 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use indexmap::IndexMap;
-
 use super::error::EvalError;
 use super::eval::{arith_mul, cannot_reserve_cross_product, vec_with_capacity, EvalSemantics};
 use super::expr::MergeFlags;
-use super::value::OwnedValue;
+use super::value::{FieldMap, OwnedValue};
 
 /// What one entry of a `{...}` contributes to the `UNION` `COLLECT_OBJECT` reads.
 pub(crate) enum UnionEntry {
@@ -153,7 +151,7 @@ pub(crate) fn collect_object<S: EvalSemantics>(
 
     // `context.MatchingNodes.Len() == 0`: every entry produced nothing.
     let Some(first) = union.first() else {
-        return Ok(alloc::vec![OwnedValue::Object(IndexMap::new().into())]);
+        return Ok(alloc::vec![OwnedValue::Object(FieldMap::new().into())]);
     };
     let width = content(first).len();
 
@@ -199,7 +197,7 @@ mod tests {
             pairs
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), v.clone()))
-                .collect::<IndexMap<_, _>>()
+                .collect::<FieldMap<_>>()
                 .into(),
         )
     }
