@@ -180,3 +180,40 @@ fn a_pipe_read_in_blocks_reads_as_its_file_does_7260() -> Result<()> {
         .starts_with("jq: parse error: Expected separator between values at line "));
     Ok(())
 }
+
+/// The rest of a lone `--seq` file after a record its windows cannot carry on past (a stretch that is
+/// not plain records to the end of the stream) is handed to the route that reads a stream whole behind
+/// one line break, with the lines before it counted: the warnings and the runtime error name the lines
+/// jq names (jq 1.7.1, captured on the same shape).
+#[test]
+fn a_seq_tail_handed_on_names_the_lines_of_the_whole_stream_7260() -> Result<()> {
+    let record = |id: usize| format!("\x1e{{\"id\":{id}}}\n");
+    let records = small_window::MIN_BYTES / record(1000).len() + 1;
+    let mut bytes: Vec<u8> = (0..records)
+        .flat_map(|i| record(1000 + i).into_bytes())
+        .collect();
+    bytes.extend(b"\x1e{\"cut\n\x1e{\"id\":99}\nzzz");
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("in.seq");
+    std::fs::write(&path, &bytes)?;
+    let program = "if .id == 99 then error(\"x\") else empty end";
+    let named = small_window::apply(Command::new(env!("CARGO_BIN_EXE_succinctly")).arg("jq"))
+        .args(["--seq", "-c", program])
+        .arg(&path)
+        .output()?;
+    let name = path.to_string_lossy();
+    assert_eq!(String::from_utf8_lossy(&named.stdout), "");
+    assert_eq!(
+        String::from_utf8_lossy(&named.stderr),
+        format!(
+            "jq: ignoring parse error: Truncated value at line {}, column 1\n\
+             jq: error (at {name}:{}): x\n\
+             jq: ignoring parse error: Invalid numeric literal at EOF at line {}, column 3\n",
+            records + 2,
+            records + 2,
+            records + 3
+        )
+    );
+    assert_eq!(named.status.code(), Some(5));
+    Ok(())
+}

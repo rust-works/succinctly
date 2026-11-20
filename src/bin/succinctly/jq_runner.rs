@@ -9637,8 +9637,14 @@ fn seq_eof_tail(sources: &[(Option<usize>, Vec<u8>)], ranges: &[(usize, usize)])
                 >= total - last.len() + EofTail::final_read_start(last, 0)
         })
     });
+    // #7260: a resumed stream's one source starts that many line breaks in.
+    let base = if sources.len() == 1 {
+        crate::cli::jq_seq_reader::seeded_line_base()
+    } else {
+        0
+    };
     EofTail {
-        newlines: u32::try_from(count_newlines(last)).unwrap_or(u32::MAX),
+        newlines: u32::try_from(count_newlines(last) + base).unwrap_or(u32::MAX),
         unknown,
     }
 }
@@ -12431,6 +12437,7 @@ fn hand_on_seq_pipe_tail(args: &JqCommand) -> bool {
     };
     crate::cli::jq_seq_reader::seed_token_byte(tail.token_byte);
     crate::cli::jq_seq_reader::seed_faulted_rs(tail.faulted_rs);
+    crate::cli::jq_seq_reader::seed_line_base(tail.line_base);
     // #7260: a file read to its end that held no RS is handed on as no bytes and where it ended.
     HANDED_ON_NO_RS_END.with(|end| end.set(tail.no_rs_end));
     let stream = tail.stream;
@@ -22614,9 +22621,10 @@ mod tests {
                 tail.stream.len(),
                 "{name}: room reserved first"
             );
+            // #7260: the front holds one line break and the tail counts the rest.
             assert_eq!(
-                tail.stream,
-                crate::cli::jq_seq_reader::resumed_stream(before, stream[at..].to_vec()),
+                (tail.stream.clone(), tail.line_base),
+                crate::cli::jq_seq_reader::resumed_stream_counted(before, stream[at..].to_vec()),
                 "{name}"
             );
             // The run's hand-off gives that buffer to the whole-file route as the file's bytes.

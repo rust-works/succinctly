@@ -242,7 +242,8 @@ fn value_locations(
             source = index;
             chunks = fgets_chunk_lens(raw);
             chunk_end = 0;
-            newlines = 0;
+            // #7260: a resumed stream's first source starts that many line breaks in.
+            newlines = if index == 0 { seeded_line_base() } else { 0 };
         }
         // Read chunks until the one holding `local` has been read.
         while chunk_end <= local {
@@ -857,6 +858,42 @@ pub(crate) fn resumed_front(lines: usize, tail: usize) -> Vec<u8> {
     stream
 }
 
+/// [`resumed_front`] with one line break, and the line breaks it stands for besides (#7260), which
+/// [`seed_line_base`] gives the walks of the stream: the front of a stream resumed after a million
+/// records was a megabyte of line breaks, which every walk of it read a chunk at a time (some 200
+/// instructions each). An RS and a line break put jq's reader where the RS and all of them do, at a
+/// line start in `Normal` with its `fgets` reads starting afresh; only the count of lines differs.
+pub(crate) fn resumed_front_counted(lines: usize, tail: usize) -> (Vec<u8>, usize) {
+    (resumed_front(lines.min(1), tail), lines.saturating_sub(1))
+}
+
+/// [`resumed_stream`] with [`resumed_front_counted`]'s front (#7260): the bytes and the line breaks
+/// they stand for besides.
+#[cfg(test)]
+pub(crate) fn resumed_stream_counted(lines: usize, tail: Vec<u8>) -> (Vec<u8>, usize) {
+    let (mut stream, base) = resumed_front_counted(lines, tail.len());
+    stream.extend_from_slice(&tail);
+    (stream, base)
+}
+
+thread_local! {
+    /// The line breaks the first source of every walk made on this thread from now on is taken to
+    /// start after ([`seed_line_base`]).
+    static SEEDED_LINE_BASE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Starts the first source of every walk made on this thread from now on `lines` line breaks into the
+/// stream (#7260): a stream resumed with [`resumed_front_counted`]'s front, whose line breaks it does
+/// not hold. Its warnings count them in their lines, and its values in theirs.
+pub(crate) fn seed_line_base(lines: usize) {
+    SEEDED_LINE_BASE.with(|seed| seed.set(lines));
+}
+
+/// What [`seed_line_base`] set: 0 for a stream that is not resumed.
+pub(crate) fn seeded_line_base() -> usize {
+    SEEDED_LINE_BASE.with(std::cell::Cell::get)
+}
+
 /// The byte jq's token buffer holds at index 1 once its reader has read `records`, a run of records
 /// that each are one RFC 8259 document (#7164), or `None` when they wrote none there (a buffer that
 /// never grew, or one only tokens of a byte or less filled). `check_literal` reads it for a bare `n`
@@ -1115,6 +1152,8 @@ fn walk_stream_placing(
     walks::bump();
     let bom = bom_prefix(raw_bytes);
     let mut reader = Reader::new(bom, emit);
+    // #7260: a resumed stream stands that many line breaks into the stream it resumes.
+    reader.line += seeded_line_base();
     reader.collect_faults = collect_faults;
     reader.scan_cuts = nul_cuts(raw_bytes);
     // jq refills its reader one file at a time, so each source after the
@@ -3930,11 +3969,23 @@ mod tests {
             seed_token_byte(token_byte_after(records.as_bytes()));
             let lines = records.bytes().filter(|&b| b == b'\n').count();
             let resumed = walked(&resumed_stream(lines, rest.clone()));
+            // #7260: the same with a front of one line break that counts the rest.
+            let (counted, base) = resumed_stream_counted(lines, rest.clone());
+            seed_line_base(base);
+            let resumed_counted = walked(&counted);
+            seed_line_base(0);
             seed_token_byte(None);
+            let want = (whole_warnings, whole_values[clean_values..].to_vec());
             assert_eq!(
                 resumed,
-                (whole_warnings, whole_values[clean_values..].to_vec()),
+                want,
                 "case {case}: {records:?} then {:?}",
+                String::from_utf8_lossy(&rest)
+            );
+            assert_eq!(
+                resumed_counted,
+                want,
+                "counted, case {case}: {records:?} then {:?}",
                 String::from_utf8_lossy(&rest)
             );
         }

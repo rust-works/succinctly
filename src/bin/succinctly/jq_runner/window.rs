@@ -1423,6 +1423,9 @@ pub(super) struct SeqTail {
     /// a stretch read before it warned there, which the windows have printed
     /// ([`crate::cli::jq_seq_reader::seed_faulted_rs`], #7260).
     pub faulted_rs: Option<usize>,
+    /// #7260: the line breaks before the tail that `stream`'s front does not hold
+    /// ([`crate::cli::jq_seq_reader::resumed_front_counted`]), which the walks of it are seeded with.
+    pub line_base: usize,
     /// #7260: a regular file that does not open with an RS, read to its end and found to hold no RS jq
     /// sees, is not handed on as its bytes (`stream` is empty): this is the line and column jq's
     /// reader stands at at its end, where it reports `Unfinished abandoned text at EOF`, which is all
@@ -1901,6 +1904,7 @@ impl WindowedFile {
                 error: None,
                 token_byte: gate.token_byte,
                 faulted_rs: None,
+                line_base: 0,
                 no_rs_end: Some(end),
             });
             return at;
@@ -1918,8 +1922,15 @@ impl WindowedFile {
             }
         };
         let pre_read: usize = self.pre_read.iter().map(Vec::len).sum();
-        let mut bytes =
-            crate::cli::jq_seq_reader::resumed_front(lines, self.buf.len() - at + pre_read + left);
+        // #7260: the front of the run's only source holds one line break and counts the rest; a file
+        // of a `--seq` list goes behind a source of its own for the files before it, whose walk counts
+        // every line, so its front holds them all.
+        let room = self.buf.len() - at + pre_read + left;
+        let (mut bytes, line_base) = if self.lone_seq {
+            crate::cli::jq_seq_reader::resumed_front_counted(lines, room)
+        } else {
+            (crate::cli::jq_seq_reader::resumed_front(lines, room), 0)
+        };
         #[cfg(test)]
         let (reserved_at, reserved_room) = (bytes.as_ptr() as usize, bytes.capacity());
         // #7260: a warning met at the RS the tail opens with is a stretch's, which ended there.
@@ -1954,6 +1965,7 @@ impl WindowedFile {
             error,
             token_byte: gate.token_byte,
             faulted_rs,
+            line_base,
             no_rs_end: None,
         });
         at
@@ -3967,7 +3979,9 @@ mod tests {
     /// Without `model`, against jq's reader alone: the model reads a stretch in one walk, which keeps
     /// at most a walk's worth of warnings, where the gate reads one in pieces (#7341).
     fn check_gated_windows(stream: &[u8], blocks: &[usize], model: bool) -> bool {
-        use crate::cli::jq_seq_reader::{resumed_stream, seed_token_byte, walk_stream};
+        use crate::cli::jq_seq_reader::{
+            resumed_stream_counted, seed_line_base, seed_token_byte, walk_stream,
+        };
         let walked = |stream: &[u8]| -> (Vec<String>, Vec<(String, usize)>) {
             let sources = vec![(None, stream.to_vec())];
             let mut warnings = Vec::new();
@@ -4094,16 +4108,22 @@ mod tests {
             if let Some(handed) = handed {
                 if model {
                     let at = at.expect("checked");
+                    // #7260: the front holds one line break and the tail counts the rest.
                     assert_eq!(
-                        handed.stream,
-                        resumed_stream(count_newlines(&stream[..at]), stream[at..].to_vec()),
+                        (handed.stream.clone(), handed.line_base),
+                        resumed_stream_counted(
+                            count_newlines(&stream[..at]),
+                            stream[at..].to_vec()
+                        ),
                         "{case}"
                     );
                     assert_eq!(handed.token_byte, token, "{case}");
                 }
                 seed_token_byte(handed.token_byte);
+                seed_line_base(handed.line_base);
                 let (tail_warnings, tail_values) = walked(&handed.stream);
                 seed_token_byte(None);
+                seed_line_base(0);
                 // The tail's warnings and values, in the order the whole walk has them.
                 let tail_shown = &jq_shown[shown.len()..];
                 let mut tail_events: Vec<&String> = tail_shown.iter().collect();
@@ -4449,8 +4469,8 @@ mod tests {
                                 Some(at) => {
                                     let handed = handed.expect("the rest is handed on");
                                     assert_eq!(
-                                        handed.stream,
-                                        crate::cli::jq_seq_reader::resumed_stream(
+                                        (handed.stream.clone(), handed.line_base),
+                                        crate::cli::jq_seq_reader::resumed_stream_counted(
                                             count_newlines(&stream[..at]),
                                             stream[at..].to_vec()
                                         ),
