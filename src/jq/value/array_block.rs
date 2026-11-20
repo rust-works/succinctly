@@ -14,11 +14,29 @@
 //!
 //! # Layout
 //!
-//! A [`Header`] of three words (`strong`, `len`, `cap`), then `cap` slots
-//! of `V`, of which the first `len` are initialized. Three words, not two
-//! packed ones: an element is 32 bytes, so a block requests 24 + 32n bytes,
-//! which glibc and macOS's allocator round to the same bin as a 16-byte
-//! header would; a narrower header would only cap the length.
+//! A [`Header`] of three words (`strong`, `len`, `bytes`), then as many
+//! slots of `V` as fit in `bytes`, of which the first `len` are initialized.
+//! Three words, not two packed ones: an element is 32 bytes, so a block
+//! requests 24 + 32n bytes, which glibc and macOS's allocator round to the
+//! same bin as a 16-byte header would; a narrower header would only cap the
+//! length.
+//!
+//! The header records the allocation's size in bytes rather than a slot
+//! count, so a `Vec` whose buffer has a spare slot becomes a block *in
+//! place*: its elements move up past the header and the allocation is
+//! untouched (its size is no longer a whole number of slots past the
+//! header, which only the byte count can say). Shrinking it instead cost a
+//! transient second copy of a large array on macOS, whose `realloc` moves a
+//! large block to shrink it (`walk(.)` over 100 MB of records: +21 MB peak
+//! RSS on an M4 Pro).
+//!
+//! A `Vec` of 16 KiB or more becomes an *external* block instead: a 40-byte
+//! block with the header and the `Vec`'s buffer pointer and capacity, its
+//! elements left where they are (`EXTERNAL_MIN_BYTES`). Moving them up past
+//! a header would copy the whole array, and one more small block per large
+//! array is free. `bytes` says which kind a block is; every method below
+//! works on both, and the external buffer converts back to its `Vec` as it
+//! stands.
 //!
 //! There is no weak count (nothing ever made a `Weak` of the `Rc`), and the
 //! window (`start`/`len` of [`ArrayOf`](super::ArrayOf)) stays in the handle:
@@ -55,9 +73,38 @@ struct Header {
     /// Initialized elements, a prefix of the slots. Written only through a
     /// unique handle.
     len: usize,
-    /// Slots allocated after the header. Written only through a unique
-    /// handle.
+    /// The allocation's size, header included. Written only through a
+    /// unique handle.
+    bytes: usize,
+}
+
+/// [`Header::bytes`] of an *external* block: one whose elements stay in the
+/// buffer of the `Vec` it was made from ([`ExternalBlock`]).
+const EXTERNAL: usize = usize::MAX;
+
+/// The smallest `Vec` (in bytes of elements) that becomes an external block
+/// rather than moving its elements up past a header. Below it the move is a
+/// few cache lines; above it, it would be a copy of the whole array (a
+/// 100 MB `[.numbers[] | floor]` moved 320 MB, +1.9% wall-clock on a Ryzen 9
+/// 7950X), and one more 40-byte block per large array costs nothing.
+const EXTERNAL_MIN_BYTES: usize = 16 * 1024;
+
+/// A block whose elements live in a `Vec`'s buffer elsewhere: the header,
+/// then that buffer and its capacity.
+#[repr(C)]
+struct ExternalBlock {
+    header: Header,
+    /// The buffer (`Vec::as_mut_ptr`).
+    buffer: *mut u8,
+    /// The buffer's capacity in elements (`Vec::capacity`).
     cap: usize,
+}
+
+/// The layout of an [`ExternalBlock`] for elements of `V`.
+#[inline]
+fn external_layout<V>() -> Layout {
+    Layout::from_size_align(mem::size_of::<ExternalBlock>(), block_align::<V>())
+        .expect("a header and two words fit")
 }
 
 /// Bytes from the start of a block to its first element.
@@ -144,7 +191,7 @@ impl<V> Block<V> {
             ptr.as_ptr().write(Header {
                 strong: Cell::new(1),
                 len: 0,
-                cap,
+                bytes: layout.size(),
             });
         }
         Self {
@@ -153,12 +200,17 @@ impl<V> Block<V> {
         }
     }
 
-    /// A block holding `vec`'s elements, exactly sized. The `Vec`'s buffer
-    /// becomes the block where its alignment allows (`realloc` to the header
-    /// plus the elements, then the elements move up past the header), so a
-    /// large array is not copied into a second buffer beside the first.
+    /// A block holding `vec`'s elements. The `Vec`'s buffer becomes the block
+    /// where its alignment allows, so a large array is never copied into a
+    /// second buffer beside the first: with a spare slot's room for the header
+    /// the elements just move up past it, and an exactly sized buffer grows by
+    /// the header (`realloc`) first.
     pub(crate) fn from_vec(vec: Vec<V>) -> Self {
         let len = vec.len();
+        if mem::size_of::<V>() != 0 && len.saturating_mul(mem::size_of::<V>()) >= EXTERNAL_MIN_BYTES
+        {
+            return Self::external(vec);
+        }
         if !vec_buffer_is_block_aligned::<V>() || vec.capacity() == 0 {
             let mut block = Self::with_capacity(len);
             let mut vec = ManuallyDrop::new(vec);
@@ -181,17 +233,25 @@ impl<V> Block<V> {
         let old = unsafe {
             Layout::from_size_align_unchecked(cap * mem::size_of::<V>(), mem::align_of::<V>())
         };
-        let Some(new) = block_layout::<V>(len) else {
+        let Some(needed) = block_layout::<V>(len) else {
             capacity_overflow()
         };
-        debug_assert_eq!(new.align(), old.align());
-        // SAFETY: `old` is the buffer's layout; `new.size()` is non-zero and
-        // fits an `isize` (checked by `block_layout`). The first `len`
-        // elements survive a shrink, since `new.size() >= len * size`.
-        let raw = unsafe { realloc(buffer, old, new.size()) };
-        let Some(ptr) = NonNull::new(raw.cast::<Header>()) else {
-            handle_alloc_error(new)
+        debug_assert_eq!(needed.align(), old.align());
+        let (raw, bytes) = if needed.size() <= old.size() {
+            // The header fits in the spare slots: the buffer is the block.
+            (buffer, old.size())
+        } else {
+            // SAFETY: `old` is the buffer's layout; `needed.size()` is
+            // non-zero and fits an `isize` (checked by `block_layout`), and
+            // grows it, so every element survives.
+            let raw = unsafe { realloc(buffer, old, needed.size()) };
+            if raw.is_null() {
+                handle_alloc_error(needed)
+            }
+            (raw, needed.size())
         };
+        // SAFETY: non-null, from the allocator or the `Vec`.
+        let ptr = unsafe { NonNull::new_unchecked(raw.cast::<Header>()) };
         // SAFETY: the block holds the `len` elements at its start; they move
         // up past the header (overlapping), then the header is written into
         // the bytes they left.
@@ -204,13 +264,58 @@ impl<V> Block<V> {
             ptr.as_ptr().write(Header {
                 strong: Cell::new(1),
                 len,
-                cap: len,
+                bytes,
             });
         }
         Self {
             ptr,
             _owns: PhantomData,
         }
+    }
+
+    /// An external block over `vec`'s buffer, which it takes as it stands.
+    #[cold]
+    #[inline(never)]
+    fn external(vec: Vec<V>) -> Self {
+        let layout = external_layout::<V>();
+        // SAFETY: a non-zero size.
+        let raw = unsafe { alloc(layout) };
+        let Some(ptr) = NonNull::new(raw.cast::<Header>()) else {
+            handle_alloc_error(layout)
+        };
+        let mut vec = ManuallyDrop::new(vec);
+        // SAFETY: freshly allocated and aligned for `ExternalBlock`; the
+        // buffer is owned by the block from here on.
+        unsafe {
+            ptr.as_ptr().cast::<ExternalBlock>().write(ExternalBlock {
+                header: Header {
+                    strong: Cell::new(1),
+                    len: vec.len(),
+                    bytes: EXTERNAL,
+                },
+                buffer: vec.as_mut_ptr().cast::<u8>(),
+                cap: vec.capacity(),
+            });
+        }
+        Self {
+            ptr,
+            _owns: PhantomData,
+        }
+    }
+
+    /// Whether the elements live in a separate buffer ([`ExternalBlock`]).
+    #[inline]
+    fn is_external(&self) -> bool {
+        self.header().bytes == EXTERNAL
+    }
+
+    /// An external block's buffer and capacity. Only for an external block.
+    #[inline]
+    fn external_parts(&self) -> (*mut V, usize) {
+        debug_assert!(self.is_external());
+        // SAFETY: an external block is an `ExternalBlock`.
+        let block = unsafe { &*self.ptr.as_ptr().cast::<ExternalBlock>() };
+        (block.buffer.cast::<V>(), block.cap)
     }
 
     #[inline]
@@ -228,6 +333,9 @@ impl<V> Block<V> {
     /// The first element slot.
     #[inline]
     fn elements(&self) -> *mut V {
+        if self.is_external() {
+            return self.external_parts().0;
+        }
         // SAFETY: the offset is within the block (its header's size,
         // rounded to the element's alignment, which the layout includes).
         unsafe {
@@ -272,7 +380,23 @@ impl<V> Block<V> {
     /// Slots the block has.
     #[inline]
     pub(crate) fn capacity(&self) -> usize {
-        self.header().cap
+        if self.is_external() {
+            return self.external_parts().1;
+        }
+        match mem::size_of::<V>() {
+            0 => usize::MAX,
+            size => (self.header().bytes - elements_offset::<V>()) / size,
+        }
+    }
+
+    /// The layout the block was allocated (or last reallocated) with.
+    #[inline]
+    fn layout(&self) -> Layout {
+        if self.is_external() {
+            return external_layout::<V>();
+        }
+        // SAFETY: the size and alignment of a live allocation.
+        unsafe { Layout::from_size_align_unchecked(self.header().bytes, block_align::<V>()) }
     }
 
     /// The block's initialized elements.
@@ -302,10 +426,25 @@ impl<V> Block<V> {
             return Err(self);
         }
         let this = ManuallyDrop::new(self);
-        let (len, cap) = (this.len(), this.capacity());
+        let len = this.len();
         let raw = this.ptr.as_ptr().cast::<u8>();
-        // SAFETY: as `from_vec`'s, in reverse.
-        let layout = block_layout::<V>(cap).expect("a live block's layout fits");
+        let layout = this.layout();
+        if this.is_external() {
+            let (buffer, cap) = this.external_parts();
+            // SAFETY: the buffer and capacity of the `Vec` the block was made
+            // from (or grown since), with `len` initialized elements; the
+            // block itself is freed without touching them.
+            unsafe {
+                dealloc(raw, layout);
+                return Ok(Vec::from_raw_parts(buffer, len, cap));
+            }
+        }
+        // The most slots a `Vec` can say the allocation holds (it has no
+        // header), at least `len`.
+        let cap = match mem::size_of::<V>() {
+            0 => 0,
+            size => layout.size() / size,
+        };
         if !vec_buffer_is_block_aligned::<V>() || cap == 0 {
             let mut vec = Vec::with_capacity(len);
             // SAFETY: the elements move into the new buffer; the block is
@@ -319,16 +458,21 @@ impl<V> Block<V> {
         }
         let bytes = cap * mem::size_of::<V>();
         // SAFETY: the elements move down to the start of the block, over the
-        // header (overlapping); the block then shrinks to exactly the
-        // `Layout::array::<V>(cap)` a `Vec` of capacity `cap` frees with
+        // header (overlapping); the block then has, or shrinks to, exactly
+        // the `Layout::array::<V>(cap)` a `Vec` of capacity `cap` frees with
         // (same alignment, `bytes > 0`).
         unsafe {
             ptr::copy(this.elements(), raw.cast::<V>(), len);
-            let shrunk = realloc(raw, layout, bytes);
-            if shrunk.is_null() {
-                handle_alloc_error(Layout::from_size_align_unchecked(bytes, layout.align()));
-            }
-            Ok(Vec::from_raw_parts(shrunk.cast::<V>(), len, cap))
+            let buffer = if bytes == layout.size() {
+                raw
+            } else {
+                let shrunk = realloc(raw, layout, bytes);
+                if shrunk.is_null() {
+                    handle_alloc_error(Layout::from_size_align_unchecked(bytes, layout.align()));
+                }
+                shrunk
+            };
+            Ok(Vec::from_raw_parts(buffer.cast::<V>(), len, cap))
         }
     }
 
@@ -343,9 +487,18 @@ impl<V> Block<V> {
                 unsafe { dealloc(self.0, self.1) };
             }
         }
-        let layout = block_layout::<V>(self.capacity()).expect("a live block's layout fits");
-        let _free = Free(self.ptr.as_ptr().cast::<u8>(), layout);
+        let _free = Free(self.ptr.as_ptr().cast::<u8>(), self.layout());
         let len = self.len();
+        if self.is_external() {
+            let (buffer, cap) = self.external_parts();
+            // SAFETY: as `try_into_vec`'s; the `Vec` drops the elements and
+            // frees its buffer (even if a destructor panics).
+            unsafe {
+                self.header_mut().len = 0;
+                drop(Vec::from_raw_parts(buffer, len, cap));
+            }
+            return;
+        }
         // SAFETY: this is the last handle; the count is zeroed first so a
         // destructor that reaches this block again sees no element.
         unsafe {
@@ -420,11 +573,50 @@ impl<'a, V> UniqueBlock<'a, V> {
         self.block.capacity()
     }
 
+    /// Run `write` on an external block's buffer as the `Vec` it is, putting
+    /// its buffer, capacity and length back afterwards (also if `write`
+    /// panics, which a `Vec` method leaves consistent).
+    fn with_vec<R>(&mut self, write: impl FnOnce(&mut Vec<V>) -> R) -> R {
+        struct PutBack<'b, V> {
+            vec: ManuallyDrop<Vec<V>>,
+            block: &'b mut Block<V>,
+        }
+        impl<V> Drop for PutBack<'_, V> {
+            fn drop(&mut self) {
+                // SAFETY: the block is external and this is its only handle.
+                unsafe {
+                    let block = &mut *self.block.ptr.as_ptr().cast::<ExternalBlock>();
+                    block.buffer = self.vec.as_mut_ptr().cast::<u8>();
+                    block.cap = self.vec.capacity();
+                    block.header.len = self.vec.len();
+                }
+            }
+        }
+        let (buffer, cap) = self.block.external_parts();
+        // SAFETY: the buffer, length and capacity of a `Vec`, lent out once.
+        let vec = unsafe { Vec::from_raw_parts(buffer, self.len(), cap) };
+        let mut lent = PutBack {
+            vec: ManuallyDrop::new(vec),
+            block: &mut *self.block,
+        };
+        write(&mut lent.vec)
+    }
+
     /// Resize the allocation to exactly `cap` slots (`cap >= len`).
     fn grow_to(&mut self, cap: usize) -> Result<(), ArrayReserveError> {
-        let old_cap = self.capacity();
         debug_assert!(cap >= self.len());
-        let old = block_layout::<V>(old_cap).expect("a live block's layout fits");
+        if self.block.is_external() {
+            return self.with_vec(|vec| {
+                if cap < vec.capacity() {
+                    vec.shrink_to(cap);
+                    Ok(())
+                } else {
+                    vec.try_reserve_exact(cap - vec.len())
+                        .map_err(|_| ArrayReserveError)
+                }
+            });
+        }
+        let old = self.block.layout();
         let new = block_layout::<V>(cap).ok_or(ArrayReserveError)?;
         // SAFETY: the block's own layout; `new.size()` is non-zero and fits
         // an `isize`; the same alignment.
@@ -432,7 +624,7 @@ impl<'a, V> UniqueBlock<'a, V> {
         let ptr = NonNull::new(raw.cast::<Header>()).ok_or(ArrayReserveError)?;
         self.block.ptr = ptr;
         // SAFETY: unique, and the header moved with the block.
-        unsafe { self.block.header_mut().cap = cap };
+        unsafe { self.block.header_mut().bytes = new.size() };
         Ok(())
     }
 
@@ -813,10 +1005,16 @@ mod tests {
         assert_eq!(block.capacity(), 3, "exactly sized");
         let vec = block.try_into_vec().ok().unwrap();
         assert_eq!(vec, [1, 2, 3]);
+        // A buffer with room for the header is the block as it stands, and
+        // goes back to a `Vec` of the same capacity.
         let mut with_room = Vec::with_capacity(10);
         with_room.push(7_i64);
+        let buffer = with_room.as_ptr().cast::<u8>();
         let block = Block::from_vec(with_room);
-        assert_eq!((ints(&block), block.capacity()), (vec![7], 1));
+        assert_eq!((ints(&block), block.capacity()), (vec![7], 7));
+        assert_eq!(block.ptr.as_ptr().cast::<u8>().cast_const(), buffer);
+        let vec = block.try_into_vec().ok().unwrap();
+        assert_eq!((vec.capacity(), vec.as_ptr().cast::<u8>()), (10, buffer));
         assert!(Block::from_vec(Vec::<i64>::new()).is_empty());
         // An element less aligned than the header takes the copying route.
         let small = Block::from_vec(vec![1_u16, 2, 3]);
@@ -872,6 +1070,46 @@ mod tests {
     }
 
     #[test]
+    fn a_large_vec_keeps_its_buffer_and_every_write_still_works() {
+        let n = EXTERNAL_MIN_BYTES / mem::size_of::<i64>() + 500;
+        let mut model: Vec<i64> = (0..n as i64).collect();
+        model.reserve(100);
+        let buffer = model.as_ptr();
+        let mut block = Block::from_vec(model.clone());
+        assert!(block.is_external());
+        assert_eq!(block.as_slice(), &model[..]);
+        let mut unique = block.get_mut().unwrap();
+        for i in 0..300 {
+            unique.push(i);
+            model.push(i);
+        }
+        unique.insert(3, -1);
+        model.insert(3, -1);
+        assert_eq!(unique.remove(9), model.remove(9));
+        unique.retain(|x| x % 5 != 0);
+        model.retain(|x| x % 5 != 0);
+        unique.splice(10..20, [7, 7, 7]);
+        model.splice(10..20, [7, 7, 7]);
+        unique.truncate(n - 300);
+        model.truncate(n - 300);
+        unique.shrink_to_fit();
+        assert_eq!(unique.capacity(), n - 300);
+        assert_eq!(&*unique, &model[..]);
+        let vec = block.try_into_vec().ok().unwrap();
+        assert_eq!(vec, model);
+        // Taken back as it stands: no copy into or out of a block.
+        let block = Block::from_vec(vec);
+        let unchanged = block.as_slice().as_ptr();
+        let back = block.try_into_vec().ok().unwrap();
+        assert_eq!(back.as_ptr(), unchanged);
+        let fresh: Vec<i64> = (0..n as i64).collect();
+        let at = fresh.as_ptr();
+        let fresh = Block::from_vec(fresh);
+        assert_eq!(fresh.as_slice().as_ptr(), at);
+        assert!(!buffer.is_null());
+    }
+
+    #[test]
     fn every_element_drops_once() {
         let drops = Rc::new(Cell::new(0));
         let make = |n: usize| -> Block<Counted> {
@@ -911,6 +1149,16 @@ mod tests {
         assert_eq!(drops.get(), 0, "another handle keeps the elements");
         drop(handle);
         assert_eq!(drops.get(), 2);
+        // An external block drops each element once too, iterated or not.
+        let big = EXTERNAL_MIN_BYTES / mem::size_of::<Counted>() + 1;
+        drops.set(0);
+        drop(make(big));
+        assert_eq!(drops.get(), big);
+        drops.set(0);
+        let mut iter = BlockIntoIter::new(make(big), 2..big - 2).ok().unwrap();
+        drop(iter.next());
+        drop(iter);
+        assert_eq!(drops.get(), big);
         let _ = Rc::try_unwrap(drops).ok();
     }
 
