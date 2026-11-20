@@ -92,6 +92,32 @@ pub(crate) fn named_flag_order(argv: &[String]) -> Vec<NamedFlag> {
     order
 }
 
+/// [`named_flag_order`] read off the matches clap has already made, for a command line with two or more
+/// named flags (fewer have no order to keep): each value pair's position in the words clap parsed.
+/// `named_flag_order` builds a second `JqCommand` definition to find each option's arity, which was most of
+/// the cost of eleven `--arg`s on top of `jq -n 1` (#7260); clap's own parse already knows which word
+/// was a flag. Empty below two, so `run_jq` asks no further.
+pub(crate) fn named_flag_order_of(matches: &clap::ArgMatches) -> Vec<NamedFlag> {
+    const IDS: [(&str, NamedFlag); 4] = [
+        ("arg", NamedFlag::Arg),
+        ("argjson", NamedFlag::ArgJson),
+        ("slurpfile", NamedFlag::SlurpFile),
+        ("rawfile", NamedFlag::RawFile),
+    ];
+    let mut at: Vec<(usize, NamedFlag)> = Vec::new();
+    for (id, kind) in IDS {
+        if let Some(indices) = matches.indices_of(id) {
+            // Two values per flag; the first one's index orders the flag.
+            at.extend(indices.step_by(2).map(|i| (i, kind)));
+        }
+    }
+    if at.len() < 2 {
+        return Vec::new();
+    }
+    at.sort_unstable_by_key(|(i, _)| *i);
+    at.into_iter().map(|(_, kind)| kind).collect()
+}
+
 impl JqCommand {
     /// Whether the output is indented with tabs: `--tab`, or `--indent -1`, which jq 1.7.1 treats
     /// as the same thing (#6017). The one definition for both indent derivations.
@@ -4747,7 +4773,12 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     silence_depth_guard_panic_line();
     args.resolve_positional_args();
     // The order only matters between two or more named flags: a command line with fewer builds no clap definition for it.
-    if (args.arg.len() + args.argjson.len() + args.slurpfile.len() + args.rawfile.len()) / 2 >= 2 {
+    // `parse_jq` has already read it off clap's matches (#7260); a `JqCommand` matched inside the whole `Cli` tree
+    // (a global flag before `jq`) has not, and scans argv here.
+    if args.named_order.is_empty()
+        && (args.arg.len() + args.argjson.len() + args.slurpfile.len() + args.rawfile.len()) / 2
+            >= 2
+    {
         args.named_order = named_flag_order(&std::env::args().collect::<Vec<_>>());
     }
 
@@ -24939,6 +24970,123 @@ mod tests {
                 vec![RawFile, Arg]
             );
             assert_eq!(named_flag_order(&argv(&["jq", "-n", "."])), vec![]);
+        }
+
+        /// #7260: the order `parse_jq` reads off clap's matches is the argv scan's, on every command
+        /// line the scan's own tests use and on the perf suite's `args_many`; below two flags both mean
+        /// "no order to keep", which the matches spell as empty.
+        #[test]
+        fn the_order_from_clap_matches_is_the_argv_scans_7260() {
+            use clap::CommandFactory;
+            let lines: &[&[&str]] = &[
+                &[
+                    "jq",
+                    "-n",
+                    "--rawfile",
+                    "r",
+                    "/dev/null",
+                    "--arg",
+                    "a",
+                    "1",
+                    "--slurpfile",
+                    "s",
+                    "/dev/null",
+                    "--argjson",
+                    "j",
+                    "2",
+                    ".",
+                ],
+                &["jq", "--arg", "--arg", "v", "--", "--arg", "x", "y"],
+                // (`-f --arg` is clap's usage error before any order matters, so an option's value is a path here)
+                &[
+                    "jq",
+                    "-f",
+                    "/dev/null",
+                    "--rawfile",
+                    "r",
+                    "/dev/null",
+                    "--arg",
+                    "a",
+                    "1",
+                ],
+                &["jq", "-n", "."],
+                &["jq", "-n", "--argjson", "j", "1", "--arg", "a", "2", "."],
+                &[
+                    "jq",
+                    "--arg",
+                    "a",
+                    "1",
+                    "-n",
+                    "--arg",
+                    "b",
+                    "-2",
+                    "--argjson",
+                    "c",
+                    "3",
+                    "-c",
+                    ".",
+                ],
+                &[
+                    "jq",
+                    "-n",
+                    "--arg",
+                    "a",
+                    "1",
+                    "--args",
+                    "$ARGS",
+                    "x",
+                    "--argjson",
+                    "b",
+                    "2",
+                ],
+                &[
+                    "jq",
+                    "-n",
+                    "--arg",
+                    "a",
+                    "1",
+                    "--arg",
+                    "b",
+                    "two",
+                    "--arg",
+                    "c",
+                    "3",
+                    "--arg",
+                    "d",
+                    "four",
+                    "--arg",
+                    "e",
+                    "5",
+                    "--arg",
+                    "f",
+                    "six",
+                    "--arg",
+                    "g",
+                    "7",
+                    "--arg",
+                    "h",
+                    "eight",
+                    "--argjson",
+                    "i",
+                    "9",
+                    "--argjson",
+                    "j",
+                    "[10,11]",
+                    "--argjson",
+                    "k",
+                    "{\"l\":12}",
+                    "[$a,$b,$c,$d,$e,$f,$g,$h,$i,$j,$k]|length",
+                ],
+            ];
+            for words in lines {
+                let hoisted = crate::cli::hoist_options_before_positional_flags(argv(words), 1);
+                let matches = JqCommand::command()
+                    .try_get_matches_from(&hoisted)
+                    .unwrap_or_else(|e| panic!("{words:?}: {e}"));
+                let scan = named_flag_order(&argv(words));
+                let want = if scan.len() < 2 { vec![] } else { scan };
+                assert_eq!(named_flag_order_of(&matches), want, "{words:?}");
+            }
         }
 
         #[test]
