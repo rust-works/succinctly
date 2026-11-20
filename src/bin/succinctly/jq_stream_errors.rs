@@ -36,7 +36,7 @@ use crate::cli::jq_seq_reader::{
     c_string, decode_string_in_place, fgets_chunk_len_at, fgets_visible_len, number_is_valid,
     JQ_FGETS_CHUNK,
 };
-use succinctly::jq::OwnedValue;
+use succinctly::jq::{ArrayVec, OwnedValue};
 
 /// What jq's `p->last_seen` can hold.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1282,8 +1282,10 @@ impl Parser {
         self.push(fault.value, Some(fault.message));
     }
 
+    /// The path as it stands, as an array value. Built in its array block directly (#7260):
+    /// cloned into a `Vec` first, every event's path was a second allocation and a copy.
     fn path_value(&self) -> OwnedValue {
-        OwnedValue::array_from(self.path.clone())
+        OwnedValue::Array(ArrayVec::from_slice(&self.path))
     }
 
     /// jq's `make_error` with `JV_PARSE_STREAM_ERRORS`: the message and the path as it stands.
@@ -1495,7 +1497,7 @@ impl Parser {
             return;
         }
         if let Some(value) = self.next.take() {
-            let event = OwnedValue::array_from(vec![self.path_value(), value]);
+            let event = OwnedValue::Array(ArrayVec::from_array([self.path_value(), value]));
             self.yield_value(event);
         }
     }
@@ -1591,7 +1593,10 @@ impl Parser {
     fn check_done(&mut self) -> Option<OwnedValue> {
         if self.path.is_empty() {
             if let Some(value) = self.next.take() {
-                return Some(OwnedValue::array_from(vec![self.path_value(), value]));
+                return Some(OwnedValue::Array(ArrayVec::from_array([
+                    self.path_value(),
+                    value,
+                ])));
             }
         }
         if self.output.is_empty() {
@@ -1601,10 +1606,10 @@ impl Parser {
             // `[path, value, true]`: the leaf takes the value, and `[path]` is left to close.
             self.output.truncate(2);
             let value = self.output.pop().unwrap_or(OwnedValue::Null);
-            let leaf = OwnedValue::array_from(vec![self.output[0].clone(), value]);
-            return Some(leaf);
+            let leaf = ArrayVec::from_array([self.output[0].clone(), value]);
+            return Some(OwnedValue::Array(leaf));
         }
-        Some(OwnedValue::array_from(std::mem::take(&mut self.output)))
+        Some(event_array(std::mem::take(&mut self.output)))
     }
 
     /// jq's `value`, for a streaming parser.
@@ -1858,6 +1863,24 @@ impl Parser {
         self.token_len = 0;
         Ok(())
     }
+}
+
+/// A pending event (`[path]` or `[path, value]`) as an array, moved into a block of its own size
+/// rather than converting the `Vec` (#7260): an exactly sized `Vec` would be grown by the block's
+/// header, a `realloc` per event that the Apple M4 Pro's allocator made a copy.
+fn event_array(output: Vec<OwnedValue>) -> OwnedValue {
+    let mut items = output.into_iter();
+    let array = match (items.next(), items.next(), items.next()) {
+        (Some(path), None, _) => ArrayVec::from_array([path]),
+        (Some(path), Some(value), None) => ArrayVec::from_array([path, value]),
+        (first, second, third) => first
+            .into_iter()
+            .chain(second)
+            .chain(third)
+            .chain(items)
+            .collect(),
+    };
+    OwnedValue::Array(array)
 }
 
 /// The number a token spells, read as the document path reads it but without that path's index

@@ -1916,7 +1916,10 @@ pub mod alias_identity {
     /// Redirect one concrete (`String`/`Int`) path, the form `setpath`/
     /// `delpaths` take. A slice descriptor or any other component shape
     /// leaves the path untouched.
-    pub(crate) fn redirect_concrete_path(path: &mut Vec<OwnedValue>, doc: &OwnedValue) {
+    pub(crate) fn redirect_concrete_path(
+        path: &mut crate::jq::ArrayVecMut<'_, OwnedValue>,
+        doc: &OwnedValue,
+    ) {
         if !active() {
             return;
         }
@@ -1941,7 +1944,8 @@ pub mod alias_identity {
         else {
             return; // patchcov: coverage tolerate-line reason="unreachable: the map above never yields None, since it only ever matches Field/Index (#1351)"
         };
-        *path = concrete;
+        path.clear();
+        path.extend(concrete);
     }
 
     /// After one write expression has run, copy every anchor's new value into
@@ -2255,7 +2259,11 @@ pub mod alias_identity {
         Vec::new()
     }
 
-    pub(crate) fn redirect_concrete_path(_path: &mut Vec<OwnedValue>, _doc: &OwnedValue) {}
+    pub(crate) fn redirect_concrete_path(
+        _path: &mut crate::jq::ArrayVecMut<'_, OwnedValue>,
+        _doc: &OwnedValue,
+    ) {
+    }
 
     pub(crate) fn mirror_after_write(_pre: &OwnedValue, _post: &mut OwnedValue) {}
 
@@ -31048,9 +31056,10 @@ fn builtin_tojsonstream<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
             }
             _ => {
-                let entry = OwnedValue::Array(
-                    vec![OwnedValue::Array(path.clone().into()), value.clone()].into(),
-                );
+                let entry = OwnedValue::Array(crate::jq::ArrayVec::from_array([
+                    OwnedValue::Array(crate::jq::ArrayVec::from_slice(&path[..])),
+                    value.clone(),
+                ]));
                 results.push(entry);
             }
         }
@@ -101949,7 +101958,9 @@ fn collect_paths(
                     share_path_component(&mut component);
                 }
                 current_path.push(component);
-                paths.push(OwnedValue::Array(current_path.clone().into()));
+                paths.push(OwnedValue::Array(crate::jq::ArrayVec::from_slice(
+                    &current_path[..],
+                )));
                 collect_paths(val, current_path, paths);
                 current_path.pop();
             }
@@ -101957,7 +101968,9 @@ fn collect_paths(
         OwnedValue::Array(arr) => {
             for (i, val) in arr.iter().enumerate() {
                 current_path.push(OwnedValue::Int(i as i64));
-                paths.push(OwnedValue::Array(current_path.clone().into()));
+                paths.push(OwnedValue::Array(crate::jq::ArrayVec::from_slice(
+                    &current_path[..],
+                )));
                 collect_paths(val, current_path, paths);
                 current_path.pop();
             }
@@ -102025,16 +102038,19 @@ pub(crate) fn collect_tostream_events(
             }
         }
         leaf => {
-            events.push(OwnedValue::Array(
-                vec![OwnedValue::Array(path.clone().into()), leaf].into(),
-            ));
+            events.push(OwnedValue::Array(crate::jq::ArrayVec::from_array([
+                OwnedValue::Array(crate::jq::ArrayVec::from_slice(&path[..])),
+                leaf,
+            ])));
         }
     }
 }
 
 /// `tostream`'s closing `[path]` event, `path` naming the container's last child.
 fn tostream_closing_event(path: &[OwnedValue]) -> OwnedValue {
-    OwnedValue::Array(vec![OwnedValue::Array(path.to_vec().into())].into())
+    OwnedValue::Array(crate::jq::ArrayVec::from_array([OwnedValue::Array(
+        crate::jq::ArrayVec::from_slice(path),
+    )]))
 }
 
 /// Whether `value` is a non-empty container, i.e. whether a path walk records
@@ -102557,7 +102573,9 @@ fn collect_leaf_paths(
         OwnedValue::Object(entries) => {
             if entries.is_empty() {
                 // Empty object is a leaf
-                paths.push(OwnedValue::Array(current_path.clone().into()));
+                paths.push(OwnedValue::Array(crate::jq::ArrayVec::from_slice(
+                    &current_path[..],
+                )));
             } else {
                 for (key, val) in entries {
                     current_path.push(OwnedValue::String(key.clone().into()));
@@ -102569,7 +102587,9 @@ fn collect_leaf_paths(
         OwnedValue::Array(arr) => {
             if arr.is_empty() {
                 // Empty array is a leaf
-                paths.push(OwnedValue::Array(current_path.clone().into()));
+                paths.push(OwnedValue::Array(crate::jq::ArrayVec::from_slice(
+                    &current_path[..],
+                )));
             } else {
                 for (i, val) in arr.iter().enumerate() {
                     current_path.push(OwnedValue::Int(i as i64));
@@ -102580,7 +102600,9 @@ fn collect_leaf_paths(
         }
         _ => {
             // Scalar value is a leaf
-            paths.push(OwnedValue::Array(current_path.clone().into()));
+            paths.push(OwnedValue::Array(crate::jq::ArrayVec::from_slice(
+                &current_path[..],
+            )));
         }
     }
 }
@@ -102696,7 +102718,10 @@ fn check_paddable_len(len: usize) -> Result<(), EvalError> {
 /// [`MAX_PADDED_ARRAY_LEN`], or one that does not fit in memory. Every shorter
 /// one still grows, which is what keeps `[1,2] | setpath([5]; 9)` agreeing with
 /// jq.
-fn pad_with_nulls(arr: &mut Vec<OwnedValue>, index: usize) -> Result<(), EvalError> {
+fn pad_with_nulls(
+    arr: &mut crate::jq::ArrayVecMut<'_, OwnedValue>,
+    index: usize,
+) -> Result<(), EvalError> {
     // `index + 1` is only an overflow on a 32-bit target, where `usize::MAX`
     // is a reachable index; the refusal is the same either way.
     let len = index
@@ -102735,7 +102760,7 @@ fn pad_with_nulls(arr: &mut Vec<OwnedValue>, index: usize) -> Result<(), EvalErr
 /// caller already establishing `index + 1 > arr.len()` first, same as
 /// this one now does.
 fn extend_array_with_nulls_for_delete(
-    arr: &mut Vec<OwnedValue>,
+    arr: &mut crate::jq::ArrayVecMut<'_, OwnedValue>,
     target_len: usize,
 ) -> Result<(), EvalError> {
     if target_len <= arr.len() {
@@ -103556,7 +103581,10 @@ const YQ_DELETE_REPLAY_LEN_LIMIT: usize = 1 << 22;
 ///
 /// Distinct nodes cannot disturb one another, so they are one pass over the grown array; only a
 /// repeated node is replayed.
-fn yq_delete_index_sequence(arr: &mut Vec<OwnedValue>, steps: &[i64]) -> Result<(), EvalError> {
+fn yq_delete_index_sequence(
+    arr: &mut crate::jq::ArrayVecMut<'_, OwnedValue>,
+    steps: &[i64],
+) -> Result<(), EvalError> {
     let mut len = arr.len();
     let mut nodes: Vec<usize> = vec_with_capacity(steps.len());
     for &step in steps {
@@ -154174,14 +154202,14 @@ mod tests {
 
     #[test]
     fn test_pad_with_nulls_refuses_past_the_bound_without_allocating_5500() {
-        let mut arr = vec![OwnedValue::Null];
-        let err = pad_with_nulls(&mut arr, MAX_PADDED_ARRAY_LEN).unwrap_err();
+        let mut arr = crate::jq::ArrayVec::from(vec![OwnedValue::Null]);
+        let err = pad_with_nulls(&mut arr.make_vec(), MAX_PADDED_ARRAY_LEN).unwrap_err();
         assert_eq!(
             err.to_string(),
             format!("Cannot grow array to {} elements", MAX_PADDED_ARRAY_LEN + 1)
         );
         assert_eq!(arr.len(), 1);
-        assert!(pad_with_nulls(&mut arr, 4).is_ok());
+        assert!(pad_with_nulls(&mut arr.make_vec(), 4).is_ok());
         assert_eq!(arr.len(), 5);
     }
 
@@ -168058,15 +168086,16 @@ mod tests {
 
     #[test]
     fn test_yq_delete_index_sequence_replays_a_repeat_and_refuses_the_absurd_4749() {
-        let mut arr = ints(10..13);
-        yq_delete_index_sequence(&mut arr, &[0, 1, 0]).expect("replay");
+        let mut arr = crate::jq::ArrayVec::from(ints(10..13));
+        yq_delete_index_sequence(&mut arr.make_vec(), &[0, 1, 0]).expect("replay");
         assert_eq!(arr, Vec::<OwnedValue>::new());
 
-        let mut arr = ints(10..13);
-        yq_delete_index_sequence(&mut arr, &[-1, 5]).expect("negative before the growth");
+        let mut arr = crate::jq::ArrayVec::from(ints(10..13));
+        yq_delete_index_sequence(&mut arr.make_vec(), &[-1, 5])
+            .expect("negative before the growth");
         assert_eq!(
             arr,
-            [
+            vec![
                 OwnedValue::Int(10),
                 OwnedValue::Int(11),
                 OwnedValue::Null,
@@ -168076,12 +168105,12 @@ mod tests {
 
         // A negative index that is out of range when it is evaluated raises, as a single
         // `del(.[-5])` does.
-        let mut arr = ints(10..13);
-        yq_delete_index_sequence(&mut arr, &[0, -5]).expect_err("out of range");
+        let mut arr = crate::jq::ArrayVec::from(ints(10..13));
+        yq_delete_index_sequence(&mut arr.make_vec(), &[0, -5]).expect_err("out of range");
 
         // An index no array can grow to is refused by the padding.
-        let mut arr = ints(10..13);
-        yq_delete_index_sequence(&mut arr, &[0, i64::MAX]).expect_err("absurd index");
+        let mut arr = crate::jq::ArrayVec::from(ints(10..13));
+        yq_delete_index_sequence(&mut arr.make_vec(), &[0, i64::MAX]).expect_err("absurd index");
     }
 
     #[test]
@@ -168091,8 +168120,8 @@ mod tests {
         let mut steps: Vec<i64> = vec![0; 7_000];
         steps.push(1);
         assert!(steps.len() * 20_000 > YQ_DELETE_REPLAY_WORK_LIMIT);
-        let mut arr = ints(0..20_000);
-        yq_delete_index_sequence(&mut arr, &steps).expect("set deletion");
+        let mut arr = crate::jq::ArrayVec::from(ints(0..20_000));
+        yq_delete_index_sequence(&mut arr.make_vec(), &steps).expect("set deletion");
         assert_eq!(arr.len(), 19_998);
         assert_eq!(arr[0], OwnedValue::Int(2));
     }
@@ -180756,15 +180785,16 @@ mod tests {
         fn concrete_paths_redirect_and_slice_descriptors_bail() {
             let _guard = alias_identity::enter(table());
             let doc = json(DOC);
-            let mut p = path(&["b", "p"]);
-            alias_identity::redirect_concrete_path(&mut p, &doc);
+            let mut p = crate::jq::ArrayVec::from(path(&["b", "p"]));
+            alias_identity::redirect_concrete_path(&mut p.make_vec(), &doc);
             assert_eq!(p, path(&["a", "p"]));
-            let mut terminal = path(&["b"]);
-            alias_identity::redirect_concrete_path(&mut terminal, &doc);
+            let mut terminal = crate::jq::ArrayVec::from(path(&["b"]));
+            alias_identity::redirect_concrete_path(&mut terminal.make_vec(), &doc);
             assert_eq!(terminal, path(&["b"]));
             let slice = json(r#"{"start":0,"end":1}"#);
-            let mut with_slice = vec![OwnedValue::String("b".into()), slice.clone()];
-            alias_identity::redirect_concrete_path(&mut with_slice, &doc);
+            let mut with_slice =
+                crate::jq::ArrayVec::from(vec![OwnedValue::String("b".into()), slice.clone()]);
+            alias_identity::redirect_concrete_path(&mut with_slice.make_vec(), &doc);
             assert_eq!(with_slice, vec![OwnedValue::String("b".into()), slice]);
         }
 
@@ -180781,8 +180811,8 @@ mod tests {
             )]);
             let _guard = alias_identity::enter(table);
             let doc = json(r#"{"l":[{"p":1},{"p":1}]}"#);
-            let mut p = path(&["l", "1", "p"]);
-            alias_identity::redirect_concrete_path(&mut p, &doc);
+            let mut p = crate::jq::ArrayVec::from(path(&["l", "1", "p"]));
+            alias_identity::redirect_concrete_path(&mut p.make_vec(), &doc);
             assert_eq!(p, path(&["l", "0", "p"]));
         }
 
