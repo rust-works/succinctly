@@ -15177,6 +15177,30 @@ jq 1.8 fixed that ([jqlang/jq@7a1fd72d](https://github.com/jqlang/jq/commit/7a1f
 A named argument is still read first, as in both jq releases: `jq -f --rawfile x nope` reports the missing `--rawfile` file.
 Pinned by `tests/jq_cli/i7439.rs`.
 
+## A broken-down time is read as jq 1.8.2 reads it, not as jq 1.7.1 does (#7532)
+
+`mktime`, `strftime`, `strflocaltime`, `todate` and `todateiso8601` take a broken-down time, an array `[year, month, day, hour, minute, second, weekday, yearday]`, which jq's `jv2tm` copies into a C `struct tm`.
+jq 1.7.1's `jv2tm` needs all 8 elements, casts each double to `int` unchecked and reads NaN as 0.
+jq 1.8 fixed it: upstream commit bc96146 ("jv2tm: fix UB and accept array inputs with not all the values"), [jqlang/jq#3070](https://github.com/jqlang/jq/pull/3070) ("fix signed integer overflow in jv2tm", labelled `bug`, from an oss-fuzz report) and [jqlang/jq#3162](https://github.com/jqlang/jq/pull/3162) ("mktime/0: remove unnecessary length>=6 input requirement", labelled `bug`), listed in its NEWS.md as "Fix `mktime/0` overflow and allow fewer elements in date-time representation array".
+`succinctly jq` follows jq 1.8.2, because upstream calls the 1.7.1 behaviour a bug, and so the difference from the pinned 1.7.1 stands as `newer-than-primary` (the ledger's `features:todate/0` and `features:todateiso8601/0`, whose probe is `[1,2,3]`):
+
+- **NaN** in any of the first 8 elements is `<name> requires parsed datetime inputs`, and so is a NaN number given to `strftime`, `strflocaltime`, `todate` or `todateiso8601`, because the array `gmtime` makes of it has a NaN seconds slot (`nan | gmtime` is `[1970,0,1,0,0,null,4,0]` in both releases).
+  jq 1.7.1 read NaN as 0: `[2024,0,1,0,0,nan,0,0] | mktime` is `1704067200` and `nan | todate` is `"1970-01-01T00:00:00Z"`.
+  `nan | strftime(1)` still reads the format first and keeps its own message (#7533).
+- **A shorter array** is read with its missing fields 0, so a missing year is 1900: `[2024,0,1] | mktime` is `1704067200`, `[2024] | mktime` is `1703980800` (January 0 is December 31) and `[2024,2,15] | strftime("%Y-%m-%dT%H:%M:%SZ")` is `"2024-03-15T00:00:00Z"`.
+  jq 1.7.1 raises `requires parsed datetime inputs` for any array shorter than 8.
+- **Each field saturates** at the C `int` bounds after truncation, the year after 1900 has been taken off it, so the year saturates at 2147485547 and never wraps: `[1e20,0,1,0,0,0,0,0] | mktime` is `67768036160140800` and `[-1e20,0,1,0,0,0,0,0] | strftime("%Y")` is `"-2147481748"`.
+  jq 1.7.1's cast is undefined behaviour; on arm64 it saturates before 1900 is taken off, so the same rows are `67767976201996800` and `"2147483648"` (the year wraps), on x86_64 it gives `INT_MIN`, and the 1.7.1 model this replaced followed the arm64 build (#3083).
+  The order shows on a fractional year just below 1900 too: `[1899.5,0,1,0,0,0,0,0] | strftime("%Y")` is `"1900"` in jq 1.8.2 and `"1899"` in jq 1.7.1.
+
+What `timegm` makes of a saturated or pre-1900 date is the C library's: `[-1e20,0,1,0,0,0,0,0] | mktime` and `[] | mktime` are `invalid gmtime representation` here and in the macOS jq 1.8.2, by the existing pre-1900 rule above, where a glibc jq converts a date before 1900.
+Only the macOS jq 1.8.2 was captured; a glibc jq 1.8.2 was not, and on Linux CI compares these rows with the pinned 1.7.1 alone.
+
+jq 1.8.2 also passes the array through `timegm` (`mktime` for `strflocaltime`) before it formats it, so that the C library fills in the zone ([jqlang/jq#3203](https://github.com/jqlang/jq/pull/3203), NEWS.md "Populate timezone data when formatting time"), and that call normalises the fields: `[2024,0,1,0,0,0,0,0] | strftime("%a")` is `"Mon"` there and `"Sun"` (the weekday given) in jq 1.7.1, and `[2024,5] | strftime("%Y-%m-%d")` is `"2024-05-31"` there and `"2024-06-00"` here.
+`succinctly jq` does not follow that change: it formats the fields as given, as jq 1.7.1 does, and a short array is formatted the same way.
+`succinctly yq` is not changed: real yq has none of these builtins, and `--jq-extensions` reaches the jq code above.
+Pinned by `tests/jq_cli/i7532.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`) under `TZ=UTC` and avoid the C library's share (no `%Z`, `%z` or `%s`, no date before 1900, no field the normalisation would move).
+
 ## `@urid`: jq 1.8.2's behaviour for the format, jq 1.7.1's for `format("urid")`
 
 `@urid` is new in jq 1.8, so the pinned jq 1.7.1 answers `urid is not a valid format` (the `str-format-urid` ledger entry).

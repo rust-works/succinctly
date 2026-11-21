@@ -108597,14 +108597,6 @@ fn jq_tm_field(value: i64) -> i64 {
     value.clamp(i64::from(i32::MIN), i64::from(i32::MAX))
 }
 
-// `tm_year` stores the year relative to 1900. jq subtracts the offset in a
-// 32-bit field, so years from i32::MIN through i32::MIN + 1899 wrap into
-// positive years when the formatter adds 1900 back (#3083).
-fn jq_tm_year(value: i64) -> i64 {
-    let tm_year = (jq_tm_field(value) as i32).wrapping_sub(1900);
-    i64::from(tm_year) + 1900
-}
-
 /// jq's month is 0-indexed in the array; C increments the 32-bit field
 /// before formatting or converting it. The increment wraps at `i32::MAX`.
 fn jq_month_index(month: i64) -> i64 {
@@ -108648,19 +108640,43 @@ fn jq_timegm_secs(
 }
 
 /// The 8 fields of a broken-down-time array (`year, month, day, hour, minute,
-/// second, weekday, yearday`) truncated to integers as jq's `jv2tm` reads
-/// them, or `None` when the array has fewer than 8 elements or a non-number
-/// among its first 8 (#5301). Elements past the 8th are never read.
+/// second, weekday, yearday`) as jq 1.8.2's `jv2tm` reads them into a C
+/// `struct tm` (#7532, upstream fixes jqlang/jq#3070 and #3162), or `None`
+/// for a non-number or NaN among the first 8 elements (#5301). Elements past
+/// the 8th are never read.
+///
+/// - A shorter array is accepted: `jv2tm` stops at its end and a missing field
+///   stays 0 in the zeroed `struct tm`, so a missing year is `tm_year` 0, the
+///   year 1900 (`[] | strftime("%Y")` is `"1900"`).
+/// - Each double is truncated and saturated to C `int` bounds, the year after
+///   1900 has been subtracted from it, so the year saturates at
+///   `i32::MAX + 1900` and never wraps (`[1e20,0,1,0,0,0,0,0] | strftime("%Y")`
+///   is `"2147485547"`, `[1899.5,0,1] | strftime("%Y")` is `"1900"`).
+///
+/// jq 1.7.1 required all 8 elements, cast each double to `int` unchecked (C
+/// undefined behaviour; it saturates on arm64 and the year then wrapped,
+/// #3083) and read NaN as 0. The first field returned is the civil year
+/// (`tm_year + 1900`); the others are the `struct tm` fields as stored.
 fn broken_down_array_fields(arr: &[OwnedValue]) -> Option<[i64; 8]> {
     let mut fields = [0i64; 8];
-    for (slot, element) in fields.iter_mut().zip(arr) {
+    for (i, (slot, element)) in fields.iter_mut().zip(arr).enumerate() {
+        let offset = if i == 0 { 1900 } else { 0 };
         *slot = match element {
-            OwnedValue::Int(n) | OwnedValue::NumberLiteral(NumberRepr::Int(n), _) => *n,
-            OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => *f as i64,
+            OwnedValue::Int(n) | OwnedValue::NumberLiteral(NumberRepr::Int(n), _) => {
+                jq_tm_field(n.saturating_sub(offset))
+            }
+            OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => {
+                if f.is_nan() {
+                    return None;
+                }
+                // `as` truncates toward zero and saturates, as the C clamp does.
+                jq_tm_field((*f - offset as f64) as i64)
+            }
             _ => return None,
         };
     }
-    (arr.len() >= 8).then_some(fields)
+    fields[0] += 1900;
+    Some(fields)
 }
 
 /// Builtin: mktime - convert broken-down time to Unix timestamp
@@ -108687,9 +108703,9 @@ fn builtin_mktime<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         _ => return QueryResult::Error(EvalError::mktime_requires_array()),
     };
 
-    // #5301: jq's `jv2tm` reads all 8 fields -- weekday and yearday included --
-    // and raises one wording for a short array and for a non-number among them
-    // alike, extra elements past the 8th being ignored.
+    // #5301, #7532: jq's `jv2tm` reads up to 8 fields -- weekday and yearday
+    // included -- and raises one wording for a non-number or NaN among them,
+    // extra elements past the 8th being ignored.
     let Some(fields) = broken_down_array_fields(&arr) else {
         if optional {
             return QueryResult::None;
@@ -108697,12 +108713,8 @@ fn builtin_mktime<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         return QueryResult::Error(EvalError::mktime_requires_parsed_datetime());
     };
 
-    let year = jq_tm_year(fields[0]);
     let month = jq_month_index(fields[1]); // jq uses 0-indexed months
-    let day = jq_tm_field(fields[2]);
-    let hour = jq_tm_field(fields[3]);
-    let minute = jq_tm_field(fields[4]);
-    let second = jq_tm_field(fields[5]);
+    let [year, _, day, hour, minute, second, ..] = fields;
 
     let timestamp = match jq_timegm_secs(year, month, day, hour, minute, second) {
         Ok(Some(t)) => t,
@@ -108858,8 +108870,8 @@ fn builtin_strflocaltime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// Parse a value into broken-down-time fields (`year, month, day, hour,
 /// minute, second, weekday, yearday`), accepting either a raw Unix
 /// timestamp number (auto-converted the same way `gmtime`/`localtime`
-/// convert one, shifted into the local zone when `local`) or an 8-element
-/// broken-down-time array -- the two input shapes `strftime` itself
+/// convert one, shifted into the local zone when `local`) or a
+/// broken-down-time array of up to 8 fields -- the two input shapes `strftime` itself
 /// accepts. Shared by `strftime_in_zone` and `builtin_todate` (#3068):
 /// `todate`/`todateiso8601` are literally `strftime(fixed fmt)` in jq, so
 /// they take the identical two input shapes and the identical
@@ -108924,11 +108936,17 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // `int` (`jv2tm`). For a negative timestamp a hair below a whole second that sum rounds
             // up to the next integer: `-1e-17` is second `01` where its truncated second is `00`,
             // and `-1.0000000000000002` is `59 + 0.9999999999999998`, so second `60`
-            // (`23:59:60`), both as in jq. A NaN timestamp keeps the second it has, as jq's does
-            // (an infinite one was refused as out of range above).
-            if !timestamp.is_nan() {
-                t.second = jq_tm_field(broken_down_seconds(t.second, timestamp) as i64);
+            // (`23:59:60`), both as in jq. A NaN timestamp converts (an infinite one was refused as
+            // out of range above), but its seconds slot is NaN, which jq 1.8.2's `jv2tm` refuses
+            // (#7532, jqlang/jq#3070; jq 1.7.1 read it as 0).
+            if timestamp.is_nan() {
+                return Err(if optional {
+                    QueryResult::None // patchcov: coverage tolerate-line reason="`optional` is never true through either caller of this function, same as the array arms below (#3068)"
+                } else {
+                    QueryResult::Error(EvalError::requires_parsed_datetime_inputs(name))
+                });
             }
+            t.second = jq_tm_field(broken_down_seconds(t.second, timestamp) as i64);
             Ok((t, zone))
         }
         // #1820: `scalar_decode_failure` first, same shape as
@@ -108944,18 +108962,9 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
             match to_owned_lossy::<S, _>(value) {
                 OwnedValue::Array(arr) => {
-                    // Real jq requires the full 8-element array — weekday and
-                    // yearday included — not just the 6 fields mktime needs, and
-                    // a number in each of them (#5301): `jv2tm` fails on an
-                    // element that is missing or not a number, with this one
-                    // wording. Confirmed empirically: `[2024,0,15,0,0,0] |
-                    // strftime(...)` errors in real jq for every length 1-7,
-                    // only succeeding at 8, as does `["a",0,15,0,0,0,0,0]`.
-                    // Below 8, this codebase used to default weekday/yearday
-                    // to 0 instead of erroring, which was harmless before this
-                    // PR added specifiers that read those fields (#760) — now it
-                    // would silently produce a wrong date instead of matching
-                    // jq's error.
+                    // `jv2tm` fails on an element that is not a number (#5301)
+                    // or is NaN, with this one wording; a missing one is 0
+                    // (#7532: jq 1.8.2, where 1.7.1 required all 8).
                     let Some(fields) = broken_down_array_fields(&arr) else {
                         if optional {
                             return Err(QueryResult::None); // patchcov: coverage tolerate-line reason="`optional` is never true through either caller of this function -- confirmed live (`eprintln!` probe): `[1,2,3] | todate?` reaches `builtin_todate` with `optional=false`, same as bare `todate`. `?`'s suppression happens entirely outside builtin dispatch here, the same 'optional is never true here' shape eval.rs already documents elsewhere for a different function (#2180's Expr::Object tolerate-line note, ~line 7334) (#3068)"
@@ -108967,15 +108976,16 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
                     let month = jq_month_index(fields[1]);
 
+                    let [year, _, day, hour, minute, second, weekday, yearday] = fields;
                     let t = BrokenDownTime {
-                        year: jq_tm_year(fields[0]),
+                        year,
                         month,
-                        day: jq_tm_field(fields[2]),
-                        hour: jq_tm_field(fields[3]),
-                        minute: jq_tm_field(fields[4]),
-                        second: jq_tm_field(fields[5]),
-                        weekday: jq_tm_field(fields[6]),
-                        yearday: jq_tm_field(fields[7]),
+                        day,
+                        hour,
+                        minute,
+                        second,
+                        weekday,
+                        yearday,
                     };
                     // The fields already are local wall-clock time; the zone
                     // only labels them (`%z`, `%Z`, `%s`). `jq_month_for_time`:
@@ -109094,13 +109104,13 @@ fn strftime_format_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
     }
     match value {
-        StandardJson::Number(_) => {
-            // `optional` is false here: the caller took that arm first.
+        StandardJson::Number(n) => {
+            // `optional` is false here: the caller took that arm first. A NaN converts; jq 1.8.2
+            // refuses its NaN seconds slot only after it has read the format (#7532).
+            let is_nan = n.bridge_nonfinite().is_some_and(f64::is_nan);
             match broken_down_time_fields::<W, S>(value, false, local, false, name) {
-                Err(r) => r,
-                Ok(_) => {
-                    QueryResult::Error(EvalError::type_error("string", &format!("{name} format")))
-                }
+                Err(r) if !is_nan => r,
+                _ => QueryResult::Error(EvalError::type_error("string", &format!("{name} format"))),
             }
         }
         StandardJson::Array(_) => QueryResult::Error(EvalError::requires_string_format(name)),
@@ -110611,8 +110621,8 @@ fn builtin_todate<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'_, W> {
     // #3068: `todate`/`todateiso8601` are literally `def todate:
     // strftime("%Y-%m-%dT%H:%M:%SZ")` in jq, so they accept the identical
-    // two input shapes `strftime` does (a raw Unix timestamp number, or an
-    // 8-element broken-down-time array) and raise the identical
+    // two input shapes `strftime` does (a raw Unix timestamp number, or a
+    // broken-down-time array) and raise the identical
     // `<name>/1 requires parsed datetime inputs` error on anything else --
     // `broken_down_time_fields` is the one shared implementation of that,
     // also used by `strftime_in_zone`. `S` still threads through to it: its
@@ -110805,7 +110815,7 @@ fn parse_iso8601(input: &str) -> Result<f64, String> {
 ///
 /// #3068 review: this used to delegate straight to `builtin_todate`, which
 /// was harmless while `todate` was numeric-only -- but `todate` now also
-/// accepts an 8-element broken-down-time array and raises jq's own
+/// accepts a broken-down-time array and raises jq's own
 /// `strftime/1 requires parsed datetime inputs` on anything else, and real
 /// yq's `from_unix` does neither: it rejects an array the same as any other
 /// non-number (confirmed live against yq v4.53.3: `[1970,0,1,0,0,0,4,0] |
