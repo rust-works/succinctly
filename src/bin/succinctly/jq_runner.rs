@@ -14682,9 +14682,9 @@ fn read_lazy_window(lazy: &mut LazyJsonInputs, more: &mut LazyMore, want: usize)
     #[cfg(test)]
     LAZY_WINDOWS_READ.with(|n| n.set((n.get().0 + 1, n.get().1)));
     // #7264: the window after a short start is read onto the text's own buffer, which has room for the
-    // whole file, instead of a buffer of its own that is then copied: the copy touched 240 KiB of
-    // fresh pages twice (60 more page faults than a start on the whole front, 0.18 ms on a 1 MB
-    // file). The text moves out of its `Rc` for it and goes back.
+    // front and two windows (#7502), instead of a buffer of its own that is then copied: the copy
+    // touched 240 KiB of fresh pages twice (60 more page faults than a start on the whole front,
+    // 0.18 ms on a 1 MB file). The text moves out of its `Rc` for it and goes back.
     let mut appended = false;
     // Unreachable by construction as `true`: nothing but `lazy` holds the text's `Rc`. The guard keeps
     // `Rc::make_mut` below from copying the whole text should something ever hold it.
