@@ -13027,7 +13027,26 @@ This supersedes the 1.7.1 behaviour the #1035, #3044/#3075 and #6049 sections de
 The 1.8 precedence change that came with it is not adopted: jq 1.8 also reads `-` as binding tighter than `*` (`'-' Term`, jqlang/jq#3053, a "Language changes" entry marked breaking), so `-0 * 1` is `(-0) * 1`, which is `0` there.
 `succinctly jq` keeps 1.7.1's `-(0 * 1)`, and the computed `0 * 1` negates to `-0`, as in 1.7.1.
 `-(-0) * 1` is `-0` here for the same reason, where both jq versions answer `0`: it negates the computed `(-0) * 1`, and 1.8's `-0` is the literal `0`.
-Two other 1.8 changes next to this one are not adopted either: `limit` raising for a negative count (jqlang/jq#3181), so `[limit(-1e-400; 1, 2)]` is `[1,2]` here (the count is the literal `-1E-400`, and 1.7.1's `limit` takes every output for a negative count) where 1.8.2 raises, and `length` keeping a literal's precision (jqlang/jq#3275).
+Another 1.8 change next to this one is not adopted either: `limit` raising for a negative count (jqlang/jq#3181), so `[limit(-1e-400; 1, 2)]` is `[1,2]` here (the count is the literal `-1E-400`, and 1.7.1's `limit` takes every output for a negative count) where 1.8.2 raises.
+The `length` half of the fix, jqlang/jq#3275, is adopted by #7534 (next section).
+
+### `length` of a number literal keeps its digits, as in jq 1.8 — newer than the 1.7.1 pin (#7534)
+
+jq 1.7.1's `length` of a number is `fabs` of its double, so `-100000000000000000001 | length` is `1e+20`, `1E-400 | length` is `0`, `1E1000 | length` is `1.7976931348623157e+308` and `1.50 | length` is `1.5`.
+jq 1.8.0 fixed it with the negation fix above: "Preserve numerical precision on unary negation, `abs/0`, `length/0`" in NEWS.md, [jqlang/jq#3275](https://github.com/jqlang/jq/pull/3275) ("Preserve numerical precision on `length/0`") for `length`.
+`jv_number_abs` takes `decNumberAbs` of a literal's decimal, so the result is a literal: it keeps every digit and prints as written (`100000000000000000001`, `1E-400`, `1E+1000`, `1.50`, `1.0`, `0.00001` for `1e-5`), and a zero of either sign is a positive zero with its spelling kept (`-0 | length` is `0`, `-0.0 | length` is `0.0`).
+`succinctly jq` follows jq 1.8.2, because it is the same upstream fix as the negation above, so the difference from the pinned 1.7.1 stands as newer than primary.
+It holds for every number that carries its literal: an input document, `-s`, `inputs`, `--argjson`, `--slurpfile` and a program literal, on both evaluators (`jq_literal_length`, which negates a negative literal with `jq_negated_literal`).
+A computed number keeps the double's answer (`(1 + 0.5) | length` is `1.5`, `(100000000000000000001 * 1) | length` is `1e+20`), and so do NaN, the infinities and every non-number, in which both jq releases agree.
+`abs` needs nothing of its own: jq defines it as `if . < 0 then -. else . end`, so it keeps a literal through the negation above, and `-0 | abs` stays `-0` where `-0 | length` is `0`, in both.
+`succinctly yq` is unchanged: yq's `length` of a number measures its text.
+Pinned by `tests/jq_cli/i7534.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
+
+```console
+$ echo '-100000000000000000001 1E-400 1.50 -0.0' | jq-1.7.1 -c length   # 1e+20 0 1.5 0
+$ echo '-100000000000000000001 1E-400 1.50 -0.0' | jq-1.8.2 -c length   # 100000000000000000001 1E-400 1.50 0.0
+$ echo '-100000000000000000001 1E-400 1.50 -0.0' | sjq      -c length   # 100000000000000000001 1E-400 1.50 0.0
+```
 
 ### A bare trailing decimal point with no exponent (`1.`) reads as the integer (#6052) — divergence closed
 

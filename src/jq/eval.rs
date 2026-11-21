@@ -21340,6 +21340,11 @@ fn builtin_length<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     (None, None) => String::from_utf8_lossy(n.raw_bytes()).chars().count(),
                 };
                 QueryResult::Owned(OwnedValue::Int(width as i64))
+            } else if let Some(length) = (S::TAG == EvalTag::Jq)
+                .then(|| jq_literal_length(OwnedValue::from_json_number::<S>(n)))
+                .flatten()
+            {
+                QueryResult::Owned(length)
             } else if let Ok(i) = n.as_i64() {
                 QueryResult::Owned(numeric_length_owned::<S>(OwnedValue::Int(i)))
             } else if let Ok(f) = json_number_f64::<S>(n) {
@@ -26094,6 +26099,29 @@ fn bridge_integral_float_rendering(text: &[u8]) -> bool {
         let digits = number.strip_prefix(b"-").unwrap_or(number);
         digits.len() > 16 && digits.iter().all(u8::is_ascii_digit)
     })
+}
+
+/// jq 1.8.2's `length` of a number that still carries its literal (#7534): `decNumberAbs` of the
+/// decimal, so the literal keeps every digit (`-100000000000000000001 | length` is
+/// `100000000000000000001`, `1E-400 | length` is `1E-400`, `1.50 | length` is `1.50`), and a zero
+/// of either sign is a positive zero with its spelling otherwise kept (`-0.0 | length` is `0.0`).
+/// jq 1.7.1 took `fabs` of the double (`1e+20`, `0`, `1.5`); upstream fixed that in jqlang/jq#3275
+/// ("Preserve numerical precision on `length/0`"), the `length` half of the #3242 fix that
+/// [`arith_negate`] follows for unary minus (#7453). `None` for a number with no literal (a
+/// computed one, which keeps [`numeric_length_owned`]'s double) and for a NaN. jq mode only: yq's
+/// `length` of a number measures its text.
+pub(crate) fn jq_literal_length(number: OwnedValue) -> Option<OwnedValue> {
+    let OwnedValue::NumberLiteral(repr, text) = number else {
+        return None;
+    };
+    if matches!(repr, NumberRepr::Float(f) if f.is_nan()) {
+        return None;
+    }
+    if !text.starts_with('-') {
+        return Some(OwnedValue::NumberLiteral(repr, text));
+    }
+    let (repr, text) = crate::jq::value::jq_negated_literal(repr, &text)?;
+    Some(OwnedValue::NumberLiteral(repr, text.into()))
 }
 
 /// `Builtin::Length` of a materialized (cursor-less) number: jq's own
