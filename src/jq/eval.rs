@@ -50433,7 +50433,7 @@ fn autovivify_array(root: &mut OwnedValue) {
 fn write_index(arr: &mut ArrayVec, idx: i64, yq_mode: bool) -> Result<&mut OwnedValue, EvalError> {
     let actual_idx = resolve_setpath_index(&OwnedValue::Int(idx), arr.len(), yq_mode)?;
     if actual_idx >= arr.len() {
-        pad_with_nulls(&mut arr.make_vec(), actual_idx)?;
+        pad_with_nulls(&mut arr.make_vec(), actual_idx, yq_mode)?;
     }
     Ok(&mut arr[actual_idx])
 }
@@ -102682,16 +102682,32 @@ fn resolve_setpath_index(key: &OwnedValue, len: usize, yq_mode: bool) -> Result<
     // Still fallible on a 32-bit target, where a large positive index does not
     // fit a `usize`. That is the same refusal as `pad_with_nulls`', not a
     // negative index, so it must not borrow the sentence above.
-    usize::try_from(resolved).map_err(|_| cannot_grow_array(resolved as u64 + 1))
+    usize::try_from(resolved).map_err(|_| array_too_large(resolved as u64 + 1, yq_mode))
 }
 
 /// Refusal for an array length that cannot be allocated.
 ///
 /// Not a jq sentence: jq does not survive the filters that reach this (it dies
 /// on the allocation), so there is no wording to reproduce — see
-/// `docs/compliance/jq/limitations.md`.
+/// `docs/compliance/jq/limitations.md`. It is also what `succinctly yq` says for
+/// a length past [`MAX_PADDED_ARRAY_LEN`] ([`array_too_large`]): yq has no
+/// sentence either.
 fn cannot_grow_array(len: u64) -> EvalError {
     EvalError::new(format!("Cannot grow array to {len} elements"))
+}
+
+/// The refusal for an index write past [`MAX_PADDED_ARRAY_LEN`] (a length of `len`).
+///
+/// `succinctly jq` words it as jq 1.8.2 does, `Array index too large` (CVE-2024-23337: 1.8
+/// bounds `jv_array_set` and answers that sentence; 1.7.1 has no bound and dies, #7536).
+/// `succinctly yq` keeps [`cannot_grow_array`]: the mode decides, and yq has no sentence to
+/// copy.
+fn array_too_large(len: u64, yq_mode: bool) -> EvalError {
+    if yq_mode {
+        cannot_grow_array(len)
+    } else {
+        EvalError::new("Array index too large")
+    }
 }
 
 /// The longest array an index write grows one to: 2^29 elements, so index
@@ -102708,9 +102724,9 @@ pub(crate) const MAX_PADDED_ARRAY_LEN: usize = 536_870_912;
 
 /// The refusal for a write that would grow an array to `len` elements, before
 /// anything is reserved.
-fn check_paddable_len(len: usize) -> Result<(), EvalError> {
+fn check_paddable_len(len: usize, yq_mode: bool) -> Result<(), EvalError> {
     if len > MAX_PADDED_ARRAY_LEN {
-        Err(cannot_grow_array(len as u64))
+        Err(array_too_large(len as u64, yq_mode))
     } else {
         Ok(())
     }
@@ -102725,7 +102741,8 @@ fn check_paddable_len(len: usize) -> Result<(), EvalError> {
 /// which for a library means taking the embedder down with it: `null |
 /// setpath([1e30]; 9)` wants 9.2e18 elements. jq has no sentence to reproduce
 /// here because jq does not survive the same filter either (it dies on the
-/// allocation), so this is succinctly's own wording.
+/// allocation), so this is succinctly's own wording, except for a length past the bound,
+/// which `succinctly jq` words as jq 1.8.2 does ([`array_too_large`]).
 ///
 /// Only the impossible and the absurd are refused: a length past
 /// [`MAX_PADDED_ARRAY_LEN`], or one that does not fit in memory. Every shorter
@@ -102734,16 +102751,17 @@ fn check_paddable_len(len: usize) -> Result<(), EvalError> {
 fn pad_with_nulls(
     arr: &mut crate::jq::ArrayVecMut<'_, OwnedValue>,
     index: usize,
+    yq_mode: bool,
 ) -> Result<(), EvalError> {
     // `index + 1` is only an overflow on a 32-bit target, where `usize::MAX`
     // is a reachable index; the refusal is the same either way.
     let len = index
         .checked_add(1)
-        .ok_or_else(|| cannot_grow_array(index as u64 + 1))?;
+        .ok_or_else(|| array_too_large(index as u64 + 1, yq_mode))?;
     // `try_reserve` alone does not stop `.[1e12] = 1`: the address space it
     // asks for is reservable on a 64-bit target, and `resize` then spends its
     // time (or the host's memory) writing 1e12 nulls (#5500).
-    check_paddable_len(len)?;
+    check_paddable_len(len, yq_mode)?;
     arr.try_reserve(len - arr.len())
         .map_err(|_| cannot_grow_array(len as u64))?;
     // #1670: already guarded -- `try_reserve` above already proved the
@@ -102779,7 +102797,7 @@ fn extend_array_with_nulls_for_delete(
     if target_len <= arr.len() {
         return Ok(());
     }
-    pad_with_nulls(arr, target_len - 1)
+    pad_with_nulls(arr, target_len - 1, true)
 }
 
 /// The text an integer path component names a mapping member by in yq mode (#2801): `path`
@@ -102889,7 +102907,7 @@ fn set_value_at_path_impl<S: EvalSemantics, const YQ_SETPATH: bool>(
             }
             let index = resolve_setpath_index(key, arr.len(), S::TAG == EvalTag::Yq)?;
             if index >= arr.len() {
-                pad_with_nulls(&mut arr.make_vec(), index)?;
+                pad_with_nulls(&mut arr.make_vec(), index, S::TAG == EvalTag::Yq)?;
             }
             let old = core::mem::replace(&mut arr[index], OwnedValue::Null);
             arr[index] = set_value_at_path_impl::<S, YQ_SETPATH>(old, rest, new_val)?;
@@ -103498,7 +103516,7 @@ fn delete_paths_under<S: EvalSemantics>(
                         arr[index] = delete_paths_sorted::<S>(old, paths, start)?;
                     }
                     DeleteIndexResolution::PositiveOutOfRange(index) if yq_mode => {
-                        pad_with_nulls(&mut arr.make_vec(), index)?;
+                        pad_with_nulls(&mut arr.make_vec(), index, true)?;
                         arr[index] = delete_paths_sorted::<S>(OwnedValue::Null, paths, start)?;
                     }
                     DeleteIndexResolution::PositiveOutOfRange(_) | DeleteIndexResolution::Skip => {}
@@ -103603,7 +103621,7 @@ fn yq_delete_index_sequence(
     let mut nodes: Vec<usize> = vec_with_capacity(steps.len());
     for &step in steps {
         if step >= 0 {
-            let index = usize::try_from(step).map_err(|_| cannot_grow_array(step as u64))?;
+            let index = usize::try_from(step).map_err(|_| array_too_large(step as u64, true))?;
             len = len.max(index.saturating_add(1));
             nodes.push(index);
         } else {
@@ -103614,7 +103632,7 @@ fn yq_delete_index_sequence(
         }
     }
     if len > arr.len() {
-        pad_with_nulls(arr, len - 1)?;
+        pad_with_nulls(arr, len - 1, true)?;
     }
     let mut keep = vec![true; len];
     let mut repeated = false;
@@ -105108,7 +105126,7 @@ fn delete_trie_array(
                             *target = delete_trie_apply(old, trie, child, yq_mode)?;
                         }
                         DeleteIndexResolution::PositiveOutOfRange(index) if yq_mode => {
-                            pad_with_nulls(&mut arr.make_vec(), index)?;
+                            pad_with_nulls(&mut arr.make_vec(), index, true)?;
                             let target = &mut arr[index];
                             let old = core::mem::replace(target, OwnedValue::Null);
                             *target = delete_trie_apply(old, trie, child, yq_mode)?;
@@ -107215,7 +107233,7 @@ fn delete_path_steps(
                         // one. Confirmed live (yq v4.53.3): `[1,2] |
                         // del(.[5].a)` is `[1,2,null,null,null,null]`.
                         DeleteIndexResolution::PositiveOutOfRange(index) if yq_mode => {
-                            pad_with_nulls(&mut arr.make_vec(), index)?;
+                            pad_with_nulls(&mut arr.make_vec(), index, true)?;
                             // The freshly padded slot is `null`; whatever
                             // `rest` does with it next (including `.[]`
                             // vivifying it to `[]`, #2323) is handled
@@ -154418,13 +154436,16 @@ mod tests {
     #[test]
     fn test_pad_with_nulls_refuses_past_the_bound_without_allocating_5500() {
         let mut arr = crate::jq::ArrayVec::from(vec![OwnedValue::Null]);
-        let err = pad_with_nulls(&mut arr.make_vec(), MAX_PADDED_ARRAY_LEN).unwrap_err();
+        let err = pad_with_nulls(&mut arr.make_vec(), MAX_PADDED_ARRAY_LEN, true).unwrap_err();
         assert_eq!(
             err.to_string(),
             format!("Cannot grow array to {} elements", MAX_PADDED_ARRAY_LEN + 1)
         );
+        // jq mode (#7536): jq 1.8.2's sentence for the same refusal.
+        let err = pad_with_nulls(&mut arr.make_vec(), MAX_PADDED_ARRAY_LEN, false).unwrap_err();
+        assert_eq!(err.to_string(), "Array index too large");
         assert_eq!(arr.len(), 1);
-        assert!(pad_with_nulls(&mut arr.make_vec(), 4).is_ok());
+        assert!(pad_with_nulls(&mut arr.make_vec(), 4, false).is_ok());
         assert_eq!(arr.len(), 5);
     }
 
@@ -154434,9 +154455,11 @@ mod tests {
     fn test_paddable_len_bound_is_exact_5500() {
         assert_eq!(MAX_PADDED_ARRAY_LEN, 1 << 29);
         assert_eq!(MAX_PADDED_ARRAY_LEN - 1, i32::MAX as usize >> 2);
-        assert!(check_paddable_len(MAX_PADDED_ARRAY_LEN).is_ok());
-        assert!(check_paddable_len(MAX_PADDED_ARRAY_LEN + 1).is_err());
-        assert!(check_paddable_len(0).is_ok());
+        for yq_mode in [false, true] {
+            assert!(check_paddable_len(MAX_PADDED_ARRAY_LEN, yq_mode).is_ok());
+            assert!(check_paddable_len(MAX_PADDED_ARRAY_LEN + 1, yq_mode).is_err());
+            assert!(check_paddable_len(0, yq_mode).is_ok());
+        }
     }
 
     /// The padding length comes from the document, so an absurd index asks for
@@ -154444,12 +154467,11 @@ mod tests {
     /// answers that with a `capacity overflow` *panic*, which for a library
     /// means taking the embedder's process with it. It is a catchable error.
     ///
-    /// The message is matched by prefix because it names the requested length,
-    /// which differs by word size.
+    /// The message is jq 1.8.2's `Array index too large` (#7536).
     #[test]
     fn test_setpath_refuses_a_length_it_cannot_allocate() {
         let err = outcome(b"null", "setpath([1e30]; 9)").unwrap_err();
-        assert!(err.starts_with("Cannot grow array to"), "{err}");
+        assert_eq!(err, "Array index too large");
         // Lengths that do fit still pad, so jq's behaviour is untouched.
         assert_outcomes(&[(b"null", "setpath([3]; 9)", Ok("[null,null,null,9]"))]);
     }
