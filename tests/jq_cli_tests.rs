@@ -106251,21 +106251,24 @@ fn test_tracked_var_in_evaluator_routes_keep_accepting_3036() -> Result<()> {
     Ok(())
 }
 
-/// #3895: jq 1.7.1 evaluates a fold's SOURCE against `null` on every INIT fork
+/// #3895: jq evaluates a `reduce`'s SOURCE against `null` on every INIT fork
 /// after the first (`DUPN` leaves `null` in the slot the next fork resumes
 /// from), so a source that reads `.` sees the real input once and `null` after.
-/// A source that does not read `.` is unaffected.
+/// A source that does not read `.` is unaffected. jq 1.7.1's `foreach` did the
+/// same; jq 1.8 fixed it (jqlang/jq#3266), and since #7519 the `foreach` rows
+/// pin 1.8.2's answer, every fork reading the real input (pins moved from 1.7.1).
 ///
 /// Every row runs on both routes -- stdin through the generic evaluator and
 /// `-n 'input | ...'` through `eval.rs`'s owned fold -- and every expected value
-/// is captured from `/usr/bin/jq` 1.7.1 on `{"a":1}`. The `first(repeat(.))`
+/// is captured on `{"a":1}` from `/usr/bin/jq` 1.7.1 (`reduce`, which 1.8.2
+/// answers alike) or `/opt/homebrew/bin/jq` 1.8.2 (`foreach`). The `first(repeat(.))`
 /// rows reach the eager (unbounded-stream) drive, the `limit`/`first`/`isempty`
 /// rows the demand-driven one.
 #[test]
 fn test_fold_source_runs_against_null_after_first_init_fork_3895() -> Result<()> {
     let rows = [
         (r"[reduce (.) as $x ((.,.); $x)]", r#"[{"a":1},null]"#),
-        (r"[foreach (.) as $x ((.,.); $x; .)]", r#"[{"a":1},null]"#),
+        (r"[foreach (.) as $x ((.,.); $x; .)]", r#"[{"a":1},{"a":1}]"#),
         // The third fork is `null` too, not just the second.
         (
             r"[reduce (.,.) as $x ((.,.,.); $x)]",
@@ -106273,12 +106276,12 @@ fn test_fold_source_runs_against_null_after_first_init_fork_3895() -> Result<()>
         ),
         (
             r"[foreach (.,.) as $x ((.,.); $x)]",
-            r#"[{"a":1},{"a":1},null,null]"#,
+            r#"[{"a":1},{"a":1},{"a":1},{"a":1}]"#,
         ),
         (r"[reduce (.a, .a) as $x ((0,0); . + $x)]", "[2,0]"),
         (
             r"[foreach (.a) as $x ((0,0); . + $x; ., 10)]",
-            "[1,10,0,10]",
+            "[1,10,1,10]",
         ),
         (
             r"[reduce (.a) as $x ((.,.); . + {n:$x})]",
@@ -106286,7 +106289,7 @@ fn test_fold_source_runs_against_null_after_first_init_fork_3895() -> Result<()>
         ),
         (
             r"[foreach (.,.) as $x ((.,.); $x; [., $x])]",
-            r#"[[{"a":1},{"a":1}],[{"a":1},{"a":1}],[null,null],[null,null]]"#,
+            r#"[[{"a":1},{"a":1}],[{"a":1},{"a":1}],[{"a":1},{"a":1}],[{"a":1},{"a":1}]]"#,
         ),
         // The source's own generator and bind forms read `.` the same way.
         (
@@ -106314,7 +106317,7 @@ fn test_fold_source_runs_against_null_after_first_init_fork_3895() -> Result<()>
         ),
         (
             r"[limit(2; foreach (.) as $x ((.,.); $x; .))]",
-            r#"[{"a":1},null]"#,
+            r#"[{"a":1},{"a":1}]"#,
         ),
         (r"[isempty(reduce (.) as $x ((.,.); $x))]", "[false]"),
         // The unbounded-stream fallback drives the same way.
@@ -106324,7 +106327,7 @@ fn test_fold_source_runs_against_null_after_first_init_fork_3895() -> Result<()>
         ),
         (
             r"[foreach (first(repeat(.))) as $x ((.,.); $x)]",
-            r#"[{"a":1},null]"#,
+            r#"[{"a":1},{"a":1}]"#,
         ),
         (
             r"[reduce (.) as $x ((first(repeat(.)),.); $x)]",
@@ -106342,7 +106345,7 @@ fn test_fold_source_runs_against_null_after_first_init_fork_3895() -> Result<()>
             assert_eq!(
                 (stdout.trim(), code),
                 (want, 0),
-                "#3895: `{program}` ({args:?}) must answer as jq 1.7.1 does; stderr={stderr:?}"
+                "#3895/#7519: `{program}` ({args:?}) must answer as jq does; stderr={stderr:?}"
             );
         }
     }
@@ -122498,22 +122501,25 @@ fn test_error_message_is_not_evaluated_past_its_first_output_in_yq_mode_3636() -
 }
 
 /// #3293 slice 4 and #2163: a `?//` retry that supersedes a consumer's stop
-/// lets the fold go on to its next INIT fork, and there the source runs
-/// against `null`, as jq's does (#3895 closed #2163's divergence here). The
-/// answers are jq 1.7.1's: `[1,3]`, `[[1]]`, and an `E2` error.
+/// lets the fold go on to its next INIT fork. There a `reduce`'s source runs
+/// against `null`, as jq's does (#3895 closed #2163's divergence here), and a
+/// `foreach`'s against the real input, as jq 1.8.2's does (#7519: jqlang/jq#3266;
+/// jq 1.7.1 answered `[1,3]` and `[[1]]`, the pins moved from those). The
+/// answers are jq 1.8.2's: `[1,3,101,103]`, `[[1],[1]]`, and an `E2` error
+/// (jq 1.7.1's too).
 #[test]
 fn test_fold_second_fork_source_reads_null_after_retry_2163_3293() -> Result<()> {
     for (input, filter, expected, want_code) in [
         (
             r#"{"starts":[0,100],"items":[{"a":1},{"a":2}]}"#,
             r"[first(foreach (.items[]? as {a: $v} ?// $v | $v | numbers) as $x (.starts[]; . + $x))]",
-            "[1,3]\n",
+            "[1,3,101,103]\n",
             0,
         ),
         (
             "[[1]]",
             r"[first(foreach (. as [$a] ?// [[$b]] | $a // empty) as $x ((0,100); $x; .))]",
-            "[[1]]\n",
+            "[[1],[1]]\n",
             0,
         ),
         (

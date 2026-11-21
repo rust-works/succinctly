@@ -1,0 +1,3 @@
+category = "newer-than-primary"
+reason = "A `foreach` whose INIT is a generator runs its SOURCE on the real input for every INIT output, as jq 1.8 does (jqlang/jq#3266, a bug fix); jq 1.7.1 runs it on `null` after the first output, so `.a[]` raises `Cannot iterate over null` (exit 5) where succinctly and jq 1.8.2 print `[2,4,7,3,5,8]`. `reduce` keeps the 1.7.1 behaviour, as 1.8.2 does."
+issue = "7519"
