@@ -256,6 +256,12 @@ pub struct ModuleLoader {
     search_path: Vec<PathBuf>,
     /// The library directories alone, which `modulemeta` searches (#5321)
     lib_dirs: Vec<PathBuf>,
+    /// The `-L` entries as given, kept so the directories can be worked out again once the
+    /// program and jq origins are known (#7430): a `~/` and a `$ORIGIN/` entry names no
+    /// directory until then.
+    cli_dirs: Vec<PathBuf>,
+    /// The `JQ_LIBRARY_PATH` directories that exist, in the order listed
+    env_dirs: Vec<PathBuf>,
     /// The directory a relative `search` entry in the main program's own directives is
     /// relative to: the working directory, or the `-f` file's directory (#5338)
     prog_origin: PathBuf,
@@ -849,7 +855,11 @@ fn expand_search_entry_with(
 ) -> Option<PathBuf> {
     if let Some(rest) = entry.strip_prefix("~/") {
         // jq refuses a `~/` it cannot expand; here the entry finds nothing.
-        return Some(home?.join(rest));
+        // jq joins with a `/` as text, so an empty `$HOME` gives `/rest`.
+        let mut dir = home?.as_os_str().to_os_string();
+        dir.push("/");
+        dir.push(rest);
+        return Some(PathBuf::from(dir));
     }
     if let Some(rest) = entry.strip_prefix("$ORIGIN/") {
         Some(jq_origin.join(rest))
@@ -861,6 +871,51 @@ fn expand_search_entry_with(
     } else {
         Some(origin.join(entry))
     }
+}
+
+/// jq's own search list when no `-L` is given, unexpanded (`get_search_list` reports it so).
+const DEFAULT_LIBRARY_ENTRIES: [&str; 3] = ["~/.jq", "$ORIGIN/../lib/jq", "$ORIGIN/../lib"];
+
+/// The module library directories (#7428, #7430): the `-L` entries, or jq's default list when
+/// there are none -- never both, so a `-L` turns `~/.jq` and `$ORIGIN/../lib` off.
+///
+/// A `-L` entry that names a directory as written is kept as it stands (jq takes its real path when
+/// it exists, so a directory literally called `~` wins over the `$HOME` expansion). Any other
+/// entry is expanded the way jq's `build_lib_search_chain` does: `~/` under `$HOME`, `$ORIGIN/`
+/// under jq's own directory, an absolute path as it is, `.` as the working directory, and the
+/// rest relative to `origin`; `~` and `$ORIGIN` without a slash are not expanded. An entry that
+/// cannot be expanded (`~/` with no `$HOME`) is skipped, and so is one that is no directory. The
+/// `JQ_LIBRARY_PATH` directories (a succinctly extension) follow the `-L` ones.
+fn library_dirs(
+    cli_dirs: &[PathBuf],
+    env_dirs: &[PathBuf],
+    origin: &Path,
+    jq_origin: &Path,
+) -> Vec<PathBuf> {
+    let home = std::env::var_os("HOME");
+    let expand = |entry: &Path, as_written: bool| -> Option<PathBuf> {
+        if as_written && entry.is_dir() {
+            return Some(entry.to_path_buf());
+        }
+        // An empty `-L ""` searches nothing: jq does not take it for the working directory.
+        let text = entry.to_str().filter(|text| !text.is_empty())?;
+        let dir =
+            expand_search_entry_with(text, home.as_deref().map(Path::new), origin, jq_origin)?;
+        dir.is_dir().then_some(dir)
+    };
+    let mut dirs: Vec<PathBuf> = cli_dirs
+        .iter()
+        .filter_map(|entry| expand(entry, true))
+        .collect();
+    dirs.extend(env_dirs.iter().cloned());
+    if cli_dirs.is_empty() {
+        dirs.extend(
+            DEFAULT_LIBRARY_ENTRIES
+                .iter()
+                .filter_map(|entry| expand(Path::new(entry), false)),
+        );
+    }
+    dirs
 }
 
 /// Resolve a module path to a file path within `search_path`.
@@ -1610,25 +1665,19 @@ impl FailureWalk<'_> {
 impl ModuleLoader {
     /// Create a new module loader with the given search paths.
     pub fn new(library_paths: &[PathBuf]) -> Self {
-        let mut lib_dirs = Vec::new();
         let mut auto_loaded_defs = Vec::new();
         let mut dot_jq = None;
         let mut dot_jq_path = None;
         let mut dot_jq_failure = None;
 
-        // Add command-line -L paths first
-        for path in library_paths {
-            if path.is_dir() {
-                lib_dirs.push(path.clone());
-            }
-        }
-
-        // Add JQ_LIBRARY_PATH environment variable paths
+        // `JQ_LIBRARY_PATH` is not read by jq (1.7.1 and 1.8.2 both ignore it); it is a succinctly
+        // extension that comes after the `-L` directories.
+        let mut env_dirs = Vec::new();
         if let Ok(jq_lib_path) = std::env::var("JQ_LIBRARY_PATH") {
             for path_str in jq_lib_path.split(':') {
                 let path = PathBuf::from(path_str);
                 if path.is_dir() {
-                    lib_dirs.push(path);
+                    env_dirs.push(path);
                 }
             }
         }
@@ -1690,10 +1739,9 @@ impl ModuleLoader {
                         }
                     },
                 }
-            } else if jq_path.is_dir() {
-                // Add ~/.jq directory to search path
-                lib_dirs.push(jq_path);
             }
+            // A `~/.jq` directory is one of jq's default search directories, which
+            // [`library_dirs`] adds when no `-L` was given (#7428).
         }
 
         // #5327: jq 1.7.1 prepends the current directory to the list of every
@@ -1704,12 +1752,16 @@ impl ModuleLoader {
         // directory and next to the module, the current directory's wins).
         // `get_search_list` reports the `-L` list alone, so this does
         // not belong in the CLI facts it reads.
+        let cli_dirs = library_paths.to_vec();
+        let lib_dirs = library_dirs(&cli_dirs, &env_dirs, Path::new("."), Path::new("."));
         let mut search_path = vec![PathBuf::from(".")];
         search_path.extend(lib_dirs.iter().cloned());
 
         Self {
             search_path,
             lib_dirs,
+            cli_dirs,
+            env_dirs,
             prog_origin: PathBuf::from("."),
             jq_origin: PathBuf::from("."),
             loaded_modules: BTreeMap::new(),
@@ -1736,6 +1788,14 @@ impl ModuleLoader {
         if let Some(dir) = jq_origin {
             self.jq_origin = PathBuf::from(dir);
         }
+        self.lib_dirs = library_dirs(
+            &self.cli_dirs,
+            &self.env_dirs,
+            &self.prog_origin,
+            &self.jq_origin,
+        );
+        self.search_path = vec![PathBuf::from(".")];
+        self.search_path.extend(self.lib_dirs.iter().cloned());
     }
 
     /// `path` as a [`Target`] for a directive of the main program, or of the module whose
