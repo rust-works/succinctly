@@ -82057,8 +82057,11 @@ fn resolve_foreach<'a, S: EvalSemantics>(
         // SOURCE's own ambient value, trackability and snapshot mark are
         // all recomputed per INIT fork from wherever that fork's own
         // register stands after INIT ran.
+        // #7519: but every `foreach` fork reads the document, as the first does: jq 1.8 runs each
+        // fork's SOURCE on the fold's real input (jqlang/jq#3266), so the ambient is the first
+        // fork's (`path(foreach (.a) as $k ((0,1); $k))` is `["a"]` twice in jq 1.8.2).
         let ambient = fold_source_ambient::<S>(
-            fork_index,
+            0,
             &reg,
             value,
             &null_ambient,
@@ -98001,13 +98004,10 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
         // never the accumulator's, so it certifies no write jq refuses
         // (`test_fold_container_loop_variable_identity_through_document_input_3896`'s
         // multi-fork rows).
-        let mark = LoopVarSplice::of(mark_loop_vars && first, share_loop_vars);
-        // #3895: jq runs every later fork's SOURCE against `null`.
-        let source_input = if first {
-            SourceInput::Real
-        } else {
-            SourceInput::Null
-        };
+        // #7519: every `foreach` fork reads the real input (jq 1.8's jqlang/jq#3266, below), so
+        // the marking holds on every fork too: `[foreach (.) as $x ((.,.); ($x.a) = 9)]` is
+        // `[{"a":9},{"a":9}]` in jq 1.8.2.
+        let mark = LoopVarSplice::of(mark_loop_vars, share_loop_vars);
         let all_var_names =
             all_var_names.get_or_insert_with(|| pattern_alternatives_var_names(patterns));
         let (update, extract) = *inert_operands.get_or_insert_with(|| {
@@ -98035,7 +98035,9 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
         // the retry generation (#3293).
         let ended = StashedVerdict::<Flow>::new();
 
-        let flow = drive_source(source_input, &mut |input_val| {
+        // #7519: unlike `reduce_forks`, every fork's SOURCE reads the fold's real input, as jq
+        // 1.8 runs it (jqlang/jq#3266, a fix of 1.7.1's `DUPN` handing later forks `null`).
+        let flow = drive_source(SourceInput::Real, &mut |input_val| {
             ended.begin();
             // Substituted per element as it arrives: the demand-driven path
             // sees one element at a time and can never hoist a whole matrix
