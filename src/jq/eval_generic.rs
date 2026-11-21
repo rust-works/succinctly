@@ -463,6 +463,20 @@ fn unary_math_of_document_number<S: EvalSemantics, V: DocumentValue>(
     crate::jq::eval::unary_math_apply::<S>(builtin, n)
 }
 
+/// [`crate::jq::eval::jq_literal_length`] of a document number (#7534): jq 1.8.2's `length` of a
+/// number literal, read as an owned value as [`binary_math_of_document_number`] reads one. `None`
+/// (the double's `numeric_length_owned` below) in yq mode, for a value that is not a valid RFC 8259
+/// number span (a bridge token, a lenient span, a non-number) and for a number with no literal.
+fn jq_literal_length_of_document_number<S: EvalSemantics, V: DocumentValue>(
+    value: &V,
+) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    value.valid_number_text()?;
+    crate::jq::eval::jq_literal_length(to_owned::<S, V>(value).ok()?)
+}
+
 /// `split(SEP)` of a string value, for a literal string `SEP` (#5682): the pieces, read straight
 /// off the value's text. The bridge this stands in for materializes the string, writes it out as
 /// JSON text, indexes that, and has `builtin_split` read it back -- the writing alone cost as much
@@ -41715,6 +41729,8 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                     Ok(len) => GenericResult::Owned(OwnedValue::Int(len as i64)),
                     Err(err) => GenericResult::Error(err),
                 }
+            } else if let Some(length) = jq_literal_length_of_document_number::<S, V>(&value) {
+                GenericResult::Owned(length)
             } else if let Some(i) = value.as_i64() {
                 // Reached only for a value with no source text of its own
                 // to answer from (`as_str()` above already declined), or a

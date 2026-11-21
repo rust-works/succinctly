@@ -21434,6 +21434,11 @@ fn builtin_length<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     (None, None) => String::from_utf8_lossy(n.raw_bytes()).chars().count(),
                 };
                 QueryResult::Owned(OwnedValue::Int(width as i64))
+            } else if let Some(length) = (S::TAG == EvalTag::Jq)
+                .then(|| jq_literal_length(OwnedValue::from_json_number::<S>(n)))
+                .flatten()
+            {
+                QueryResult::Owned(length)
             } else if let Ok(i) = n.as_i64() {
                 QueryResult::Owned(numeric_length_owned::<S>(OwnedValue::Int(i)))
             } else if let Ok(f) = json_number_f64::<S>(n) {
@@ -24579,7 +24584,14 @@ fn builtin_reverse<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// so the two cannot drift on what "empty" means (`0` and `0.0` both are;
 /// jq's `length` of a number is its absolute value, so `-0` is too).
 pub(crate) fn reverse_length_is_empty(length: &OwnedValue) -> bool {
-    matches!(length, OwnedValue::Int(0)) || matches!(length, OwnedValue::Float(f) if *f == 0.0)
+    // #7534: `length` of a literal is a literal (`0.0 | length` is the literal `0.0`, `1e-400 |
+    // length` the literal `1E-400`), and `range(0;length)` reads its double.
+    match length {
+        OwnedValue::Int(0) => true,
+        OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => *f == 0.0,
+        OwnedValue::NumberLiteral(NumberRepr::Int(0), _) => true,
+        _ => false,
+    }
 }
 
 /// jq's own `length`, computed directly on an already-materialized
@@ -26198,6 +26210,35 @@ fn bridge_integral_float_rendering(text: &[u8]) -> bool {
         let digits = number.strip_prefix(b"-").unwrap_or(number);
         digits.len() > 16 && digits.iter().all(u8::is_ascii_digit)
     })
+}
+
+/// jq 1.8.2's `length` of a number that still carries its literal (#7534): `decNumberAbs` of the
+/// decimal, so the literal keeps every digit (`-100000000000000000001 | length` is
+/// `100000000000000000001`, `1E-400 | length` is `1E-400`, `1.50 | length` is `1.50`), and a zero
+/// of either sign is a positive zero with its spelling otherwise kept (`-0.0 | length` is `0.0`).
+/// jq 1.7.1 took `fabs` of the double (`1e+20`, `0`, `1.5`); upstream fixed that in jqlang/jq#3275
+/// ("Preserve numerical precision on `length/0`"), the `length` half of the #3242 fix that
+/// [`arith_negate`] follows for unary minus (#7453). `None` for a number with no literal (a
+/// computed one, which keeps [`numeric_length_owned`]'s double) and for a NaN. jq mode only: yq's
+/// `length` of a number measures its text.
+pub(crate) fn jq_literal_length(number: OwnedValue) -> Option<OwnedValue> {
+    let OwnedValue::NumberLiteral(repr, text) = number else {
+        return None;
+    };
+    match repr {
+        NumberRepr::Float(f) if f.is_nan() => return None,
+        // An integer a double holds exactly prints the same either way (`007` and `-00` print as
+        // `7` and `0` as literals too), so it stays the plain `Int` the double's rule gives.
+        NumberRepr::Int(i) if jq_int_within_exact_f64_range(i) => {
+            return Some(OwnedValue::Int(i.abs()));
+        }
+        _ => {}
+    }
+    if !text.starts_with('-') {
+        return Some(OwnedValue::NumberLiteral(repr, text));
+    }
+    let (repr, text) = crate::jq::value::jq_negated_literal(repr, &text)?;
+    Some(OwnedValue::NumberLiteral(repr, text.into()))
 }
 
 /// `Builtin::Length` of a materialized (cursor-less) number: jq's own
@@ -181649,6 +181690,57 @@ mod tests {
             &numeric_length_owned::<JqSemantics>(OwnedValue::Int(9_007_199_254_740_992)),
             9_007_199_254_740_992
         ));
+    }
+
+    /// #7534: `jq_literal_length`'s arms -- a literal keeps its digits (negated when negative, a
+    /// zero of either sign positive), an integer a double holds is the plain `Int`, and a NaN or a
+    /// number with no literal is the caller's.
+    #[test]
+    fn jq_literal_length_arms_7534() {
+        let lit = |repr, text: &str| OwnedValue::NumberLiteral(repr, text.into());
+        // `OwnedValue`'s `==` compares a literal by its number, so the spelling is checked apart.
+        let spelled = |value: Option<OwnedValue>| match value {
+            Some(OwnedValue::NumberLiteral(repr, text)) => Some((repr, text.to_string())),
+            _ => None,
+        };
+        for (repr, text, want_repr, want_text) in [
+            (
+                NumberRepr::Float(-1e20),
+                "-100000000000000000001",
+                NumberRepr::Float(1e20),
+                "100000000000000000001",
+            ),
+            (
+                NumberRepr::Float(1.5),
+                "1.50",
+                NumberRepr::Float(1.5),
+                "1.50",
+            ),
+            (
+                NumberRepr::Float(0.0),
+                "-1E-400",
+                NumberRepr::Float(0.0),
+                "1E-400",
+            ),
+            (
+                NumberRepr::Float(-0.0),
+                "-0.0",
+                NumberRepr::Float(0.0),
+                "0.0",
+            ),
+        ] {
+            assert_eq!(
+                spelled(jq_literal_length(lit(repr, text))),
+                Some((want_repr, want_text.to_string())),
+                "{text}"
+            );
+        }
+        assert!(matches!(
+            jq_literal_length(lit(NumberRepr::Int(-7), "-007")),
+            Some(OwnedValue::Int(7))
+        ));
+        assert!(jq_literal_length(lit(NumberRepr::Float(f64::NAN), "nan")).is_none());
+        assert!(jq_literal_length(OwnedValue::Float(-1.5)).is_none());
     }
 
     /// #2937: `math_operand`'s five match arms, direct rather than through
