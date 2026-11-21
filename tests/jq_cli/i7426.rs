@@ -269,28 +269,39 @@ fn a_file_name_keeps_its_bytes_7426() -> Result<()> {
     Ok(())
 }
 
-/// On Linux a file can be named by bytes that are not UTF-8: it opens, and `input_filename` is
-/// its U+FFFD text.
-#[cfg(target_os = "linux")]
-#[test]
-fn a_file_named_by_bytes_that_are_not_utf8_opens_7426() -> Result<()> {
+/// A file named `/<stem>.json` opens as an input (plain and `--seq`), as `--rawfile` and as the
+/// `-f` program's input, and `input_filename` ends in `tail` (the `explode` of `/<stem>.json`'s last
+/// eight characters).
+///
+/// The `--seq` input is its own file, under `seq/` with the same name, holding the record with its
+/// RS and newline: `--seq` reads only RS-framed records, and `{"a":1}` alone is jq's `ignoring
+/// parse error: Unfinished abandoned text at EOF` with no output (jq 1.7.1 and 1.8.2 alike).
+fn opens_by_name(stem: &[u8], tail: &str) -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let mut path = dir.path().as_os_str().as_bytes().to_vec();
-    path.extend_from_slice(b"/f\xed\xa0\x80.json");
+    let named = |sub: &[u8], extension: &[u8]| {
+        let mut path = dir.path().as_os_str().as_bytes().to_vec();
+        path.extend_from_slice(sub);
+        path.push(b'/');
+        path.extend_from_slice(stem);
+        path.extend_from_slice(extension);
+        path
+    };
+    let path = named(b"", b".json");
     std::fs::write(OsStr::from_bytes(&path), "{\"a\":1}")?;
-    for program in [".a", "input_filename | explode | .[-8:]"] {
-        for flag in ["-c", "--seq"] {
-            let (stdout, stderr, code) = printed(&jq(&[flag.into(), program.into(), word(&path)])?);
-            let want = if program == ".a" {
-                "1"
-            } else {
-                // `/f`, one U+FFFD, `.json`
-                "[47,102,65533,46,106,115,111,110]"
-            };
+    std::fs::create_dir(dir.path().join("seq"))?;
+    let seq = named(b"/seq", b".json");
+    std::fs::write(OsStr::from_bytes(&seq), "\u{1e}{\"a\":1}\n")?;
+    for (flag, file) in [("-c", &path), ("-c --seq", &seq)] {
+        for (program, want) in [(".a", "1"), ("input_filename | explode | .[-8:]", tail)] {
+            let (stdout, stderr, code) = printed(&jq(&[
+                flag.split(' ').map(OsString::from).collect::<Vec<_>>(),
+                vec![program.into(), word(file)],
+            ]
+            .concat())?);
             assert_eq!(
                 (stdout.trim_start_matches('\u{1e}'), code),
                 (want, Some(0)),
-                "{flag} {program}: {}",
+                "{stem:?} {flag} {program}: {}",
                 String::from_utf8_lossy(&stderr)
             );
         }
@@ -302,14 +313,33 @@ fn a_file_named_by_bytes_that_are_not_utf8_opens_7426() -> Result<()> {
         word(&path),
         "$x".into(),
     ])?);
-    assert_eq!((stdout.as_str(), code), ("\"{\\\"a\\\":1}\"", Some(0)));
-    let mut program = path.clone();
-    program.truncate(program.len() - ".json".len());
-    program.extend_from_slice(b".jq");
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("\"{\\\"a\\\":1}\"", Some(0)),
+        "{stem:?}"
+    );
+    let program = named(b"", b".jq");
     std::fs::write(OsStr::from_bytes(&program), ".a + 1")?;
     let (stdout, _, code) = printed(&jq(&["-f".into(), word(&program), word(&path)])?);
-    assert_eq!((stdout.as_str(), code), ("2", Some(0)));
+    assert_eq!((stdout.as_str(), code), ("2", Some(0)), "{stem:?}");
     Ok(())
+}
+
+/// [`opens_by_name`] on an ASCII name, so every Unix checks the rows the Linux-only test below
+/// runs on a name that is not UTF-8.
+#[test]
+fn a_file_named_in_ascii_opens_on_every_route_7426() -> Result<()> {
+    // `/fx.json`
+    opens_by_name(b"fx", "[47,102,120,46,106,115,111,110]")
+}
+
+/// On Linux a file can be named by bytes that are not UTF-8: it opens by them, and
+/// `input_filename` is its U+FFFD text.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_file_named_by_bytes_that_are_not_utf8_opens_7426() -> Result<()> {
+    // `/f`, one U+FFFD, `.json`
+    opens_by_name(b"f\xed\xa0\x80", "[47,102,65533,46,106,115,111,110]")
 }
 
 /// Every alias and subcommand reads argv without panicking: `sjq`/`jq` as `succinctly jq` does,
