@@ -2999,6 +2999,16 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
                     occurrence_index,
                     module_def: cx.occurrences.module_def(),
                 }));
+                // #7609: jq never compiles the arguments (#2037), so nothing in them is
+                // diagnosed, but their sites are in the source tables the occurrence indexes
+                // point into, as an unreferenced body's are (#3085): they are counted, and the
+                // errors the walk would raise are dropped. Without the count, `ua(ub(1)),
+                // ub(2)` cited the `ub(1)` for the `ub(2)` that fails.
+                let kept = cx.errors.len();
+                for a in args.iter_mut() {
+                    check_in_block(a, cx, reachable);
+                }
+                cx.truncate_errors(kept);
             }
         }
 
@@ -4644,6 +4654,30 @@ mod tests {
                     occurrence_index: 1,
                     module_def: None,
                 }]
+            );
+        }
+
+        /// #7609: a call in the arguments of an unresolved call is counted too,
+        /// in an unreferenced body and in the main program alike, and is still
+        /// not reported (#2037).
+        #[test]
+        fn occurrence_index_counts_calls_in_an_unresolved_calls_arguments_7609() {
+            let call = |name: &str, occurrence_index| UnresolvedCall {
+                name: name.into(),
+                arity: 1,
+                origin: None,
+                occurrence_index,
+                module_def: None,
+            };
+            let mut expr = parse("def d0: ua(ub(1)); ub(2)").expect("filter must parse");
+            assert_eq!(resolve_func_calls_all(&mut expr), [call("ub", 1)]);
+            let mut expr = parse("ua(ub(1); ub(3)), ub(2)").expect("filter must parse");
+            assert_eq!(
+                resolve_func_calls_all(&mut expr)
+                    .iter()
+                    .map(|c| (c.name.as_str(), c.occurrence_index))
+                    .collect::<Vec<_>>(),
+                [("ua", 0), ("ub", 2)]
             );
         }
     }
