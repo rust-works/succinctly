@@ -20,6 +20,9 @@ const ROWS: &[(&str, &str)] = &[
     ("\"a\" | sub(\"(?<x>b)?\"; \"[\\(.x)]\")", "\"[null]a\"\n"),
     ("\"a\" | gsub(\"(?<x>b)?\"; \"[\\(.x)]\")", "\"[null]a[null]\"\n"),
     ("\"a\" | [match(\"(b)?(c)?\"; \"g\") | .captures]", "[[{\"offset\":-1,\"string\":null,\"length\":0,\"name\":null},{\"offset\":-1,\"string\":null,\"length\":0,\"name\":null}],[{\"offset\":-1,\"string\":null,\"length\":0,\"name\":null},{\"offset\":-1,\"string\":null,\"length\":0,\"name\":null}]]\n"),
+    // The `regex_match_g_zero_width` golden program: the golden holds jq 1.7.1's answer and is listed
+    // as `newer_than_primary` in tests/data/jq-golden-known-failures.txt.
+    ("\"  \" | [match(\"( )*\"; \"g\")]", "[{\"offset\":0,\"length\":2,\"string\":\"  \",\"captures\":[{\"offset\":1,\"length\":1,\"string\":\" \",\"name\":null}]},{\"offset\":2,\"length\":0,\"string\":\"\",\"captures\":[{\"offset\":-1,\"string\":null,\"length\":0,\"name\":null}]}]\n"),
     ("\"abc\" | [match(\"( )*\"; \"g\")]", "[{\"offset\":0,\"length\":0,\"string\":\"\",\"captures\":[{\"offset\":-1,\"string\":null,\"length\":0,\"name\":null}]},{\"offset\":1,\"length\":0,\"string\":\"\",\"captures\":[{\"offset\":-1,\"string\":null,\"length\":0,\"name\":null}]},{\"offset\":2,\"length\":0,\"string\":\"\",\"captures\":[{\"offset\":-1,\"string\":null,\"length\":0,\"name\":null}]},{\"offset\":3,\"length\":0,\"string\":\"\",\"captures\":[{\"offset\":-1,\"string\":null,\"length\":0,\"name\":null}]}]\n"),
     ("\"c\" | match(\"(?<x>a)?b?\") | .captures", "[{\"offset\":-1,\"string\":null,\"length\":0,\"name\":\"x\"}]\n"),
     ("\"b\" | match(\"(?<x>a)?b?\") | .captures", "[{\"offset\":-1,\"string\":null,\"length\":0,\"name\":\"x\"}]\n"),
