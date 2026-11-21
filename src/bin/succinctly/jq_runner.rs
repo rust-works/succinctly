@@ -8260,7 +8260,10 @@ fn read_inputs(
         // faults the slurp loop meets come first, one per call, then the array, then whatever the
         // loop left for the calls after it. A program that never asks for one prints its result.
         if args.slurp && args.null_input && stream_by_reader {
-            let read = crate::cli::jq_stream_errors::read_for_deferred_slurp(&raw_bytes);
+            let read = crate::cli::jq_stream_errors::read_for_deferred_slurp(
+                &raw_bytes,
+                !any_open_failure,
+            );
             let place = |at| stream_location(&raw_bytes, at);
             let fault = |message: String, at: (usize, usize)| {
                 let (source, line) = place(at);
@@ -8320,7 +8323,10 @@ fn read_inputs(
             // reader places the fault itself: before the array's last call it is the whole result,
             // and after it (behind a closing event the file before the failure held back) it is not.
             if args.slurp {
-                let deferred = crate::cli::jq_stream_errors::read_for_deferred_slurp(&raw_bytes);
+                let deferred = crate::cli::jq_stream_errors::read_for_deferred_slurp(
+                    &raw_bytes,
+                    !any_open_failure,
+                );
                 if deferred.before.is_empty() {
                     let place = |at| stream_location(&raw_bytes, at);
                     let (array_source, array_line) = place(deferred.slurp_at);
@@ -8376,9 +8382,15 @@ fn read_inputs(
         // #7523), so the closing event of a top-level container that ends the text, which 1.7.1's
         // parser still held at that point and gave out after the array, is in the array: `printf
         // '[1,2]' | jq -c -s --stream .` is one array of all three events. That is `--stream -s`
-        // and `--stream-errors -s`; `--seq` keeps the 1.7.1 model of the loop.
-        let inside = if (args.stream || args.stream_errors) && !args.seq {
-            read.inside + usize::from(values.get(read.inside).is_some_and(crate::cli::jq_stream_errors::is_closing_event))
+        // and `--stream-errors -s`. `--seq` keeps the 1.7.1 model of the loop, and so does a run
+        // with a file that did not open, whose reads this change has not been checked against.
+        let inside = if (args.stream || args.stream_errors) && !args.seq && !any_open_failure {
+            read.inside
+                + usize::from(
+                    values
+                        .get(read.inside)
+                        .is_some_and(crate::cli::jq_stream_errors::is_closing_event),
+                )
         } else {
             read.inside
         };
