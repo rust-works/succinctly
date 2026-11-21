@@ -159,17 +159,20 @@ pub struct TextScan {
     pub nul: bool,
 }
 
-/// The bytes [`scan_utf8_and_nul`] validates before it looks for a NUL in them: few enough to still
-/// be in the core's own cache when the search reads them again.
+/// The bytes [`scan_utf8_and_nul`] reads for their smallest and largest byte before it validates
+/// them: few enough to still be in the core's own cache when the validation reads them again.
 const SCAN_PIECE: usize = 128 * 1024;
 
 /// Validates `text` as UTF-8 and looks for a NUL byte in it, in one read of it from memory (#7437).
 ///
 /// Every route that reads JSON input validates each text before anything else reads it, and the
-/// search for the NUL a number token may hold is a second pass over the same bytes: on a text bigger
-/// than the cache, the cost of that pass is the bytes read from memory again (2 to 3.5 ms on 100 MB),
-/// not its instructions. So the text is validated a piece at a time and each piece searched while
-/// the validation has left it in the cache.
+/// search for the NUL a number token may hold was a second pass over the same bytes: on a text
+/// bigger than the cache it read them from memory again (+1.8-3.1% wall clock on whole-file 100 MB
+/// rows on a Ryzen 9 7950X), and on an Apple M4 Pro even a search of each piece the validation had
+/// just read cost +1.5-2.6%. So each piece of the text is read once for its smallest and largest
+/// byte ([`min_max`](crate::util::simd::nul::min_max)): the smallest is 0 where it holds a NUL, and
+/// a largest under 0x80 is ASCII, which is UTF-8 with no further check. Only a piece with a byte
+/// past 0x7F is validated, while it is still in the cache.
 ///
 /// The pieces are cut before a byte that is not a continuation byte, so no character is cut: a
 /// UTF-8 text cut there is pieces that are each UTF-8, and a text that is not leaves a piece that is
@@ -196,12 +199,12 @@ fn scan_utf8_and_nul_in(text: &[u8], piece: usize) -> TextScan {
             end += 1;
         }
         let bytes = &text[at..end];
-        if scan.utf8 {
+        let (lo, hi) = crate::util::simd::nul::min_max(bytes);
+        // A piece of ASCII bytes is UTF-8: only one with a byte past 0x7F is validated.
+        if scan.utf8 && hi >= 0x80 {
             scan.utf8 = crate::text::utf8::validate_utf8(bytes).is_ok();
         }
-        if !scan.nul {
-            scan.nul = find_nul(bytes).is_some();
-        }
+        scan.nul |= lo == 0;
         if !scan.utf8 && scan.nul {
             break;
         }

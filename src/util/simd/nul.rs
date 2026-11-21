@@ -181,6 +181,115 @@ unsafe fn nul_free_prefix_neon(bytes: &[u8]) -> usize {
     at
 }
 
+/// The smallest and the largest byte of `bytes`, `(u8::MAX, 0)` when there are none (#7437).
+///
+/// What the reading routes ask of each piece of a text they validate
+/// ([`crate::jq::scan_utf8_and_nul`]): a smallest byte of 0 is a NUL, and a largest under 0x80
+/// is text that is all ASCII, which is UTF-8 with no further check. Two folds, an unsigned `min`
+/// and an unsigned `max`, over every vector of bytes.
+#[inline]
+pub fn min_max(bytes: &[u8]) -> (u8, u8) {
+    #[cfg(target_arch = "x86_64")]
+    let (lo, hi, from) = if avx2_available() {
+        // SAFETY: the CPU implements AVX2, which `avx2_available` just checked.
+        unsafe { min_max_avx2(bytes) }
+    } else {
+        // SAFETY: SSE2 is part of the x86_64 baseline.
+        unsafe { min_max_sse2(bytes) }
+    };
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is mandatory on aarch64.
+    let (lo, hi, from) = unsafe { min_max_neon(bytes) };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let (lo, hi, from) = (u8::MAX, 0, 0);
+    bytes[from..]
+        .iter()
+        .fold((lo, hi), |(lo, hi), &byte| (lo.min(byte), hi.max(byte)))
+}
+
+/// The smallest and largest lanes of a vector, stored and folded once a call.
+#[cfg(target_arch = "x86_64")]
+fn lanes_min_max(lo: &[u8], hi: &[u8]) -> (u8, u8) {
+    (
+        lo.iter().copied().min().unwrap_or(u8::MAX),
+        hi.iter().copied().max().unwrap_or(0),
+    )
+}
+
+/// AVX2: two 32-byte vectors a step, folded into a `vpminub` and a `vpmaxub` chain. Returns the
+/// minimum and maximum of the bytes before the third value, which the caller folds the rest into.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn min_max_avx2(bytes: &[u8]) -> (u8, u8, usize) {
+    let load = |p: *const u8| _mm256_loadu_si256(p.cast::<__m256i>());
+    let n = bytes.len();
+    if n < 64 {
+        return (u8::MAX, 0, 0);
+    }
+    let p = bytes.as_ptr();
+    let (mut lo, mut hi) = (load(p), load(p));
+    let mut at = 0;
+    while at + 64 <= n {
+        let (a, b) = (load(p.add(at)), load(p.add(at + 32)));
+        lo = _mm256_min_epu8(lo, _mm256_min_epu8(a, b));
+        hi = _mm256_max_epu8(hi, _mm256_max_epu8(a, b));
+        at += 64;
+    }
+    let (mut l, mut h) = ([0u8; 32], [0u8; 32]);
+    _mm256_storeu_si256(l.as_mut_ptr().cast::<__m256i>(), lo);
+    _mm256_storeu_si256(h.as_mut_ptr().cast::<__m256i>(), hi);
+    let (lo, hi) = lanes_min_max(&l, &h);
+    (lo, hi, at)
+}
+
+/// SSE2: two 16-byte vectors a step, folded into a `pminub` and a `pmaxub` chain.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn min_max_sse2(bytes: &[u8]) -> (u8, u8, usize) {
+    let load = |p: *const u8| _mm_loadu_si128(p.cast::<__m128i>());
+    let n = bytes.len();
+    if n < 32 {
+        return (u8::MAX, 0, 0);
+    }
+    let p = bytes.as_ptr();
+    let (mut lo, mut hi) = (load(p), load(p));
+    let mut at = 0;
+    while at + 32 <= n {
+        let (a, b) = (load(p.add(at)), load(p.add(at + 16)));
+        lo = _mm_min_epu8(lo, _mm_min_epu8(a, b));
+        hi = _mm_max_epu8(hi, _mm_max_epu8(a, b));
+        at += 32;
+    }
+    let (mut l, mut h) = ([0u8; 16], [0u8; 16]);
+    _mm_storeu_si128(l.as_mut_ptr().cast::<__m128i>(), lo);
+    _mm_storeu_si128(h.as_mut_ptr().cast::<__m128i>(), hi);
+    let (lo, hi) = lanes_min_max(&l, &h);
+    (lo, hi, at)
+}
+
+/// NEON: four 16-byte vectors a step, each folded by a tree of `umin`s and of `umax`s into one
+/// chain of each, so a step waits on one `min` and one `max` of the step before.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn min_max_neon(bytes: &[u8]) -> (u8, u8, usize) {
+    let load = |p: *const u8| vld1q_u8(p);
+    let n = bytes.len();
+    if n < 64 {
+        return (u8::MAX, 0, 0);
+    }
+    let p = bytes.as_ptr();
+    let (mut lo, mut hi) = (load(p), load(p));
+    let mut at = 0;
+    while at + 64 <= n {
+        let q = p.add(at);
+        let (a, b, c, d) = (load(q), load(q.add(16)), load(q.add(32)), load(q.add(48)));
+        lo = vminq_u8(lo, vminq_u8(vminq_u8(a, b), vminq_u8(c, d)));
+        hi = vmaxq_u8(hi, vmaxq_u8(vmaxq_u8(a, b), vmaxq_u8(c, d)));
+        at += 64;
+    }
+    (vminvq_u8(lo), vmaxvq_u8(hi), at)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,5 +370,58 @@ mod tests {
         }
         assert_eq!(find_nul(&vec![0xFF; 5000]), None);
         assert_eq!(find_nul(b"ab\0c"), Some(2));
+    }
+
+    /// Every `min_max` kernel this CPU can run against a bytewise fold, at every length up to a few
+    /// steps and over a long buffer, with the extreme bytes at every offset.
+    #[test]
+    fn every_min_max_kernel_folds_as_a_bytewise_fold_does_7437() {
+        type MinMax = fn(&[u8]) -> (u8, u8, usize);
+        let mut kernels: Vec<(&str, MinMax)> = Vec::new();
+        #[cfg(target_arch = "x86_64")]
+        {
+            kernels.push(("sse2", |b| unsafe { min_max_sse2(b) }));
+            if crate::util::simd::note_simd_skip_unless(avx2_available(), "avx2") {
+                kernels.push(("avx2", |b| unsafe { min_max_avx2(b) }));
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        kernels.push(("neon", |b| unsafe { min_max_neon(b) }));
+        let finish = |kernel: MinMax, bytes: &[u8]| {
+            let (lo, hi, from) = kernel(bytes);
+            bytes[from..]
+                .iter()
+                .fold((lo, hi), |(lo, hi), &b| (lo.min(b), hi.max(b)))
+        };
+        let reference = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .fold((u8::MAX, 0), |(lo, hi), &b| (lo.min(b), hi.max(b)))
+        };
+        let mut lens: Vec<usize> = (0..200).collect();
+        lens.extend([4095, 4096, 4097, 131_072, 131_075]);
+        for &len in &lens {
+            // Bytes 0x20..=0x7E, so a 0 or a byte past 0x7F is the only extreme.
+            let base: Vec<u8> = (0..len).map(|i| 0x20 + (i % 95) as u8).collect();
+            let mut ats: Vec<usize> = (0..len.min(140)).collect();
+            ats.extend(len.saturating_sub(140)..len);
+            for (name, kernel) in &kernels {
+                assert_eq!(finish(*kernel, &base), reference(&base), "{name} len {len}");
+                assert_eq!(min_max(&base), reference(&base), "dispatch len {len}");
+                for &at in &ats {
+                    for extreme in [0x00, 0x01, 0x80, 0xFF] {
+                        let mut one = base.clone();
+                        one[at] = extreme;
+                        assert_eq!(
+                            finish(*kernel, &one),
+                            reference(&one),
+                            "{name} len {len} at {at} {extreme:#x}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(min_max(b""), (u8::MAX, 0));
+        assert_eq!(min_max(&vec![0x41; 5000]), (0x41, 0x41));
     }
 }
