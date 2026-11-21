@@ -1,7 +1,11 @@
 //! #6983: `limit($n; f)` and `nth($n; f)` compare their count with `0` as jq does. jq's `$n > 0`,
 //! `$n == 0` and `$n < 0` are comparisons between two number literals, which jq makes exactly, so a
 //! literal too small for a double (`1e-1000`, `-1e-400`) is above or below `0` although its double is
-//! `±0.0`. Every row was captured from jq 1.7.1.
+//! `±0.0`. Every row was captured from jq 1.7.1, except the rows a negated literal reaches: since
+//! #7453 `succinctly jq` negates a literal as jq 1.8 does (jqlang/jq#3242), so `-1e-400` and
+//! `-(1e-400)` are the literal `-1E-400`, below `0`, and `abs` of it is `1E-400`, as in jq 1.8.2.
+//! jq 1.8 also makes `limit` raise for a negative count (jqlang/jq#3181), which is not adopted:
+//! a negative count takes every output, as jq 1.7.1's `limit` does for `"-1e-400" | tonumber`.
 
 use anyhow::Result;
 
@@ -23,9 +27,10 @@ const ROWS: &[(Option<&str>, &str, &str)] = &[
         "[1]\n",
     ),
     (None, "nth(1e-1000; 1, 2)", "1\n"),
-    // A computed count is a double, compared as one: `1e-1000 * 1` and `-(1e-400)` are zero.
+    // A computed count is a double, compared as one: `1e-1000 * 1` is zero.
     (None, "[limit(1e-1000 * 1; 1, 2)]", "[]\n"),
-    (None, "[limit(-(1e-400); 1, 2)]", "[]\n"),
+    // A negated literal is a literal (#7453): `-(1e-400)` is below zero. jq 1.7.1: `[]`.
+    (None, "[limit(-(1e-400); 1, 2)]", "[1,2]\n"),
     (None, "[limit(1e-1000; empty)]", "[]\n"),
     (None, "[limit(0e5; 1, 2)]", "[]\n"),
     // `tonumber` makes a literal.
@@ -39,20 +44,22 @@ const ROWS: &[(Option<&str>, &str, &str)] = &[
     (Some("{\"n\":-1e-400}"), "[limit(.n; 1, 2)]", "[1,2]\n"),
     (Some("[1e-1000]"), "[limit(.[0]; 1, 2)]", "[1]\n"),
     (Some("1e-1000"), "[nth(.; 1, 2, 3)]", "[1]\n"),
-    // jq's parser writes `-1e-400` as the negation of `1e-400`: a computed zero.
-    (None, "[limit(-1e-400; 1, 2)]", "[]\n"),
-    (None, "[nth(-1e-400; 1, 2)]", "[1]\n"),
+    // jq's parser writes `-1e-400` as the negation of `1e-400`, the literal `-1E-400` (#7453).
+    // jq 1.7.1: `[]`; jq 1.8.2 raises (#3181, not adopted).
+    (None, "[limit(-1e-400; 1, 2)]", "[1,2]\n"),
     // `abs` is `if . < 0 then -. else . end` with a literal `0`: `-1e-400` is below it and its
-    // negation is a computed zero, which `limit` and `nth` read as zero.
-    (Some("{\"n\":-1e-400}"), ".n | abs", "0\n"),
+    // negation is the literal `1E-400` (#7453), above zero. jq 1.7.1 negated it to a computed
+    // zero: `0`, `[]` and `[-1E-400,0]`.
+    (Some("{\"n\":-1e-400}"), ".n | abs", "1E-400\n"),
     (Some("{\"n\":-1e-400}"), ".n | abs < 0", "false\n"),
-    (Some("{\"n\":-1e-400}"), "[limit(.n | abs; 1, 2)]", "[]\n"),
+    (Some("{\"n\":-1e-400}"), "[limit(.n | abs; 1, 2)]", "[1]\n"),
     (Some("{\"n\":-1e-400}"), "[nth(.n | abs; 1, 2)]", "[1]\n"),
-    (Some("-1e-400"), "[., abs]", "[-1E-400,0]\n"),
+    (Some("-1e-400"), "[., abs]", "[-1E-400,1E-400]\n"),
     (Some("1e-1000"), "abs", "1E-1000\n"),
     (Some("-0"), "abs", "-0\n"),
     (Some("-2"), "abs", "2\n"),
-    (None, "-1e-400 | abs", "-0\n"),
+    // jq 1.7.1: `-0`.
+    (None, "-1e-400 | abs", "1E-400\n"),
     // Controls: a literal that is zero, and a subnormal a double holds.
     (Some("0.000e9"), "[limit(.; 1, 2, 3)]", "[]\n"),
     (Some("-0e-3"), "[limit(.; 1, 2, 3)]", "[]\n"),
@@ -84,6 +91,8 @@ fn nth_refuses_a_negative_count_literal_whose_double_is_zero_6983() -> Result<()
     for (input, filter, args) in [
         (Some("-1e-400"), "[nth(.; 1, 2, 3)]", vec!["-c"]),
         (None, "[nth(\"-1e-400\" | tonumber; 1, 2)]", vec!["-nc"]),
+        // The literal `-1E-400` since #7453, as in jq 1.8.2 (jq 1.7.1: `[1]`).
+        (None, "[nth(-1e-400; 1, 2)]", vec!["-nc"]),
     ] {
         let mut args = args;
         args.push(filter);

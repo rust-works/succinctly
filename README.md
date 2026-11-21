@@ -317,8 +317,8 @@ syq '.spec.containers[]' k8s.yaml
 syq --doc 0 '.' multi-doc.yaml       # First document only
 
 # Query CSV/TSV files (converted to JSON on-the-fly)
-sjq --input-dsv ',' '.[] | .[0]' users.csv
-sjq --input-dsv '\t' '.[0]' data.tsv
+sjq --input-dsv ',' '.[0]' users.csv                          # each row is one array of strings
+sjq --input-dsv $'\t' '.[0]' data.tsv                         # a tab: the shell makes it ($'\t' in bash/zsh)
 
 # Output as CSV/TSV/DSV
 sjq -r '.users[] | [.name, .age] | @csv' data.json

@@ -392,13 +392,19 @@ pub(super) struct WindowedFile {
     /// Shared with the second read of the stream, which reads by position and so leaves this one's place
     /// alone: a descriptor each, not two.
     file: Rc<File>,
-    /// How much of the file is left to read: its length when it was opened, less what was read. A
-    /// file that grows meanwhile is read as it was, as `std::fs::read` read it, so a run whose
-    /// output is appended to its input ends.
+    /// How much of the file is left of the length it had when it was opened, less what was read: the
+    /// reads ask for no more than that while there is some, and once it is read they go on to the end
+    /// the file has then, as jq's reader reads it to the read that returns nothing (#7446). So a line a
+    /// writer appends while the run reads is read, and a run whose output is appended to its input
+    /// through a pipe (`jq . f | tee -a f`) reads what it wrote, as jq does, a window at a time.
     remaining: u64,
     /// The length is not known (`stat` said 0, as it does of an empty file and of a file of the `/proc`
     /// kind that is not): the file is read to its end, as `std::fs::read` reads it.
     unknown_len: bool,
+    /// The reads end at the length the file had ([`Self::remaining`]), not at the end it has then: a
+    /// `--seq` file whose records the prepass vouched for up to that length (#7082), which has no gate
+    /// to judge records read past it ([`Reread::is_plain_seq_records`]).
+    stop_at_len: bool,
     /// How much a read adds.
     block: usize,
     /// The text: `buf[..validated]` is valid UTF-8 ending at a line break (or the end of the file),
@@ -508,6 +514,7 @@ impl WindowedFile {
             file,
             remaining: if len == 0 { u64::MAX } else { len },
             unknown_len: len == 0,
+            stop_at_len: false,
             block: block.max(1),
             // The carry is on the front, unread as text: its lines are not searched for a break,
             // so the first region the text is judged in covers all of it.
@@ -929,18 +936,20 @@ impl WindowedFile {
         tail
     }
 
-    /// All that is left of the file, for a read that wants it in one go (the file's length is not known:
-    /// a few windows).
+    /// All that is left of the file, for a read that wants it in one go (the file's length is not known,
+    /// or what it had is read and the file is read on past it, #7446: a few windows).
     fn rest(&self) -> usize {
-        if self.unknown_len {
+        if self.unknown_len || self.remaining == 0 {
             4 * window_bytes()
         } else {
             usize::try_from(self.remaining).unwrap_or(usize::MAX)
         }
     }
 
-    /// Reads up to `n` more bytes; a short read, or the length the file had, is the end of the file,
-    /// and an error is kept to be returned after the bytes before it have been run.
+    /// Reads up to `n` more bytes; a short read is the end of the file (and the length it had, for a file
+    /// that stops there, [`Self::stop_at_len`]), and an error is kept to be returned after the bytes
+    /// before it have been run. The read that reaches the length the file had is followed by one more
+    /// ([`Self::read_on_past_len`]), as jq's reader reads on to the read that returns nothing (#7446).
     fn read_more(&mut self, n: usize) {
         if let Some(block) = self.pre_read.pop_front() {
             // #7260: the probe's next block, read before the pipe is, with what is kept in front of it;
@@ -956,23 +965,31 @@ impl WindowedFile {
             self.skip_front_bom();
             return;
         }
-        let n = usize::try_from(self.remaining).map_or(n, |left| n.min(left));
+        // #7446: past the length it had, the file is read on to the end it has now.
+        let n = if self.remaining == 0 && !self.stop_at_len {
+            n
+        } else {
+            usize::try_from(self.remaining).map_or(n, |left| n.min(left))
+        };
         if n == 0 {
             self.eof = true;
         } else if self.buf.try_reserve(n).is_err() {
             self.read_error = Some(io::Error::from(io::ErrorKind::OutOfMemory));
             self.eof = true;
         } else {
+            let had = self.remaining;
             match (&*self.file).take(n as u64).read_to_end(&mut self.buf) {
                 Ok(read) => {
-                    self.remaining -= read as u64;
+                    self.remaining = had.saturating_sub(read as u64);
                     self.file_read += read as u64;
                     #[cfg(test)]
                     {
                         self.bytes_read += read as u64;
                     }
-                    if read < n || self.remaining == 0 {
+                    if read < n || (self.stop_at_len && self.remaining == 0) {
                         self.eof = true;
+                    } else if self.remaining == 0 && had > 0 {
+                        self.read_on_past_len();
                     }
                 }
                 Err(error) => {
@@ -982,6 +999,34 @@ impl WindowedFile {
             }
         }
         self.skip_front_bom();
+    }
+
+    /// The read after the one that reached the length the file had when it was opened (#7446): up to a
+    /// block more, and the end of the file when it is short. A file nothing was appended to ends where it
+    /// always did, at the cost of the one read that returns nothing (which jq's reader makes too), and
+    /// one a writer appended to meanwhile is read on, a window at a time, to the end it has when the
+    /// reads get there, as jq reads it.
+    fn read_on_past_len(&mut self) {
+        match (&*self.file)
+            .take(self.block as u64)
+            .read_to_end(&mut self.buf)
+        {
+            Ok(read) => {
+                self.file_read += read as u64;
+                #[cfg(test)]
+                {
+                    self.bytes_read += read as u64;
+                }
+                if read < self.block {
+                    self.eof = true;
+                }
+            }
+            // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
+            Err(error) => {
+                self.read_error = Some(error);
+                self.eof = true;
+            } // patchcov: coverage end
+        }
     }
 
     /// jq's parser skips a BOM at the start of its input (#5291), as the whole-file route does; with
@@ -1987,6 +2032,11 @@ impl WindowedFile {
         } else {
             (&*self.file).read_to_end(&mut bytes).err()
         };
+        // #7576: a tail there is no room for is jq's `cannot allocate memory`, not a stream that ends
+        // where the room did.
+        if let Some(error) = &error {
+            super::abort_if_out_of_memory(error);
+        }
         self.eof = true;
         let gate = self
             .seq_gate
@@ -2553,7 +2603,8 @@ impl NamedFile {
 
 /// Where each file of a several-files stream comes from (#7024).
 enum StreamFile {
-    /// Open from the start of the run, with how much of it the run reads.
+    /// Open from the start of the run, with the length it had then, which the reads go on past to the
+    /// end it has when they get there (#7446).
     Held(Rc<File>, u64),
     /// Opened when the run reaches it ([`NamedFile`]).
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -2565,7 +2616,7 @@ enum StreamFile {
 /// the whole-file route stitches with), so the documents, the file each is read in and the lines jq
 /// names for it are the whole-file route's.
 pub(super) struct WindowedFiles {
-    /// The files not yet reached, each with how much of it the run reads.
+    /// The files not yet reached, each with the length it had when it was opened.
     pending: std::vec::IntoIter<StreamFile>,
     count: usize,
     block: usize,
@@ -2877,6 +2928,9 @@ impl WindowedFiles {
                     };
                     let mut opened = WindowedFile::in_stream(file, len, block, place);
                     opened.blank_rs = self.blank_rs;
+                    // #7446: a `--seq` file read with no gate of its own was vouched for up to its
+                    // length, so that is where it ends; a gate certifies whatever it reads.
+                    opened.stop_at_len = self.blank_rs && gate.is_none();
                     opened.seq_gate = gate;
                     self.current = Some(opened);
                 }
@@ -3136,6 +3190,8 @@ impl LineWindows {
             };
             if let Err(error) = read {
                 // patchcov: coverage tolerate reason="untestable: a read that fails after the source opened"
+                // #7576: the rest read whole, with no room for it, is jq's `cannot allocate memory`.
+                super::abort_if_out_of_memory(&error);
                 on_error(&error);
                 // patchcov: coverage end
             }
@@ -3190,7 +3246,9 @@ struct RereadSource {
     /// input that is a regular file the offset it was at, since the bytes before it were never the run's.
     #[cfg_attr(not(unix), allow(dead_code))]
     start: u64,
-    /// How much of the file the run could read from `start`: what was left of it when it was opened.
+    /// What was left of the file from `start` when it was opened: how much of it the `--seq` prepass
+    /// vouches for and its run reads. Every other run reads on past it (#7446), and so does the second
+    /// read that words its fault ([`Reread::read_fault`]).
     #[cfg_attr(not(unix), allow(dead_code))]
     len: u64,
 }
@@ -3375,6 +3433,10 @@ impl Reread {
                     (file, *len)
                 }
             };
+            // #7446: the run reads each file on past the length it had, to the end it has when the reads
+            // get there ([`WindowedFile::remaining`]), so the file is read again to the end it has now; a
+            // `--seq` stream ends at the length its records were vouched for up to, as its run does.
+            let len = if self.blank_rs.get() { len } else { u64::MAX };
             if at >= len {
                 source += 1;
                 at = 0;
@@ -4874,19 +4936,81 @@ mod tests {
         assert_eq!((got.spans, got.fault), (want.spans, want.fault));
     }
 
-    /// A file that grows while it is read is read as it was.
-    #[test]
-    fn a_file_that_grows_is_read_as_it_was() {
+    /// The documents a [`WindowedFile`] of `block` bytes a read gives of a file that held `before` when it
+    /// was opened (its length then) and `appended` after that, with the reads stopping at that length
+    /// when `stop_at_len`; and the bytes it read.
+    fn grown(
+        before: &[u8],
+        appended: &[u8],
+        block: usize,
+        stop_at_len: bool,
+    ) -> (Vec<String>, u64) {
         let named = tempfile::NamedTempFile::new().expect("a temp file");
-        std::fs::write(named.path(), b"1\n2\n3\n").expect("written");
-        let mut reader = WindowedFile::new(File::open(named.path()).expect("opens"), 6, 4);
+        std::fs::write(named.path(), before).expect("written");
+        let file = File::open(named.path()).expect("opens");
+        let mut reader = WindowedFile::new(file, before.len() as u64, block);
+        reader.stop_at_len = stop_at_len;
         let mut appender = std::fs::OpenOptions::new()
             .append(true)
             .open(named.path())
             .expect("opens to append");
-        appender.write_all(b"4\n5\n").expect("grown");
-        let mut documents = 0;
+        appender.write_all(appended).expect("grown");
+        let mut documents = Vec::new();
         while let Some(window) = reader.next_window().expect("reads") {
+            assert!(window.split_error.is_none(), "no fault");
+            for &(start, end) in &window.values {
+                documents.push(String::from_utf8_lossy(&window.raw[start..end]).into_owned());
+            }
+        }
+        (documents, reader.bytes_read)
+    }
+
+    /// #7446: a file that grows while it is read is read on past the length it had when it was opened, to
+    /// the end it has when the reads get there, as jq's reader reads it: the lines a writer appended, and
+    /// a last document that was cut short then and completed after, whatever the block. A `--seq` file,
+    /// vouched for up to that length, stops there ([`WindowedFile::stop_at_len`]).
+    #[test]
+    fn a_file_that_grows_is_read_to_the_end_it_has_then_7446() {
+        let all = |n: usize| (1..=n).map(|i| i.to_string()).collect::<Vec<_>>();
+        for block in [1, 2, 4, 6, 7, 64, 4096] {
+            let (documents, read) = grown(b"1\n2\n3\n", b"4\n5\n", block, false);
+            assert_eq!(documents, all(5), "block {block}");
+            assert_eq!(read, 10, "block {block}");
+            let (documents, read) = grown(b"1\n2\n[3,", b"4]\n5\n", block, false);
+            assert_eq!(documents, ["1", "2", "[3,4]", "5"], "block {block}");
+            assert_eq!(read, 12, "block {block}");
+            // A file nothing was appended to reads as it always did.
+            let (documents, read) = grown(b"1\n2\n3\n", b"", block, false);
+            assert_eq!(documents, all(3), "block {block}");
+            assert_eq!(read, 6, "block {block}");
+            let (documents, read) = grown(b"1\n2\n3\n", b"4\n5\n", block, true);
+            assert_eq!(documents, all(3), "block {block}");
+            assert_eq!(read, 6, "block {block}");
+        }
+        // Much more than was there when it was opened, read a block at a time past it.
+        let more: String = (4..=2000).map(|i| format!("{i}\n")).collect();
+        let (documents, _) = grown(b"1\n2\n3\n", more.as_bytes(), 64, false);
+        assert_eq!(documents, all(2000));
+    }
+
+    /// #7446: a file cut short while it is read ends where the reads find its end, short of the length it
+    /// had when it was opened, with no fault for what is gone.
+    #[test]
+    fn a_file_cut_short_while_it_is_read_ends_there_7446() {
+        let named = tempfile::NamedTempFile::new().expect("a temp file");
+        std::fs::write(named.path(), b"1\n2\n3\n4\n5\n").expect("written");
+        let file = File::open(named.path()).expect("opens");
+        let mut reader = WindowedFile::new(file, 10, 4);
+        let first = reader.next_window().expect("reads").expect("a window");
+        assert_eq!(first.values.len(), 2);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(named.path())
+            .and_then(|file| file.set_len(6))
+            .expect("cut short");
+        let mut documents = 2;
+        while let Some(window) = reader.next_window().expect("reads") {
+            assert!(window.split_error.is_none());
             documents += window.values.len();
         }
         assert_eq!(documents, 3);

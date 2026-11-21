@@ -292,8 +292,10 @@ impl JsonIndex<Vec<u64>> {
 
         let ib_len = json.len();
 
-        // Count actual BP bits
-        let bp_bit_count = count_bp_bits(&semi.bp);
+        // Two bits per open; a malformed document short of closes gets them
+        // as zero words (#7482).
+        let mut bp_words = semi.bp;
+        let bp_bit_count = bp_len_supplying_missing_closes(&mut bp_words);
 
         // Build cumulative popcount index for IB
         let ib_rank = build_ib_rank(&semi.ib);
@@ -302,7 +304,7 @@ impl JsonIndex<Vec<u64>> {
             ib: semi.ib,
             ib_len,
             ib_rank,
-            bp: BalancedParens::new(semi.bp, bp_bit_count),
+            bp: BalancedParens::new(bp_words, bp_bit_count),
             lines: OnceCell::new(),
             seq_hint: Cell::new(SeqHint::NONE),
             close_runs: RefCell::new(Vec::new()),
@@ -776,15 +778,30 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
     }
 }
 
-// Helper to count actual BP bits (number of open + close parens)
-fn count_bp_bits(bp_words: &[u64]) -> usize {
-    // For standard cursor, we need to count actual meaningful bits
-    // This is a simplification - in practice we'd track this during indexing
-    // For now, estimate based on popcount (opens) * 2
+/// The balanced-parentheses length of a standard semi-index, two bits per open,
+/// with `bp_words` extended to hold every one of them (#7482).
+///
+/// The scanners record no length, so it is derived as `2 * opens`: the exact
+/// length of a balanced document. A malformed one can be short of closes
+/// (`{"a":[[[1,"b":2}` leaves two arrays open at end of input), and the
+/// missing closes are then the zero bits after the last bit written. While
+/// they fit in the last word nothing more is needed; a deficit that crossed a
+/// word boundary left `len` past the last stored word, and navigation
+/// (`is_open` under `next_sibling`) indexed out of bounds. Zero words appended
+/// here supply those closes, so `len <= 64 * words` holds for every input:
+/// `is_open`, and the sibling and child walks through it, read `words[p / 64]`
+/// for any `p < len` (`find_close` and `rank1` tolerate a shorter slice,
+/// #3140). A balanced document already holds all its bits and is not touched.
+/// (A surplus of closes is the other malformed shape: those past `len` are
+/// simply not part of the sequence.)
+fn bp_len_supplying_missing_closes(bp_words: &mut Vec<u64>) -> usize {
     let total_ones: usize = bp_words.iter().map(|w| w.count_ones() as usize).sum();
-    // Each node has one open and one close, so total bits = opens + closes = 2 * opens
-    // But this is approximate - the actual length should be tracked during build
-    total_ones * 2
+    let len = total_ones * 2;
+    let needed_words = len.div_ceil(64);
+    if bp_words.len() < needed_words {
+        bp_words.resize(needed_words, 0);
+    }
+    len
 }
 
 // ============================================================================
@@ -1900,6 +1917,14 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
             fields = rest;
             index += 1;
         }
+        // #7448: a list the walk stopped on with a child still in hand ends on an
+        // unpaired one. Behind a member the trailing-gap check below also
+        // refuses it, but the lone child of a one-member `{"a":}`, `{"a"}` or
+        // `{:1}` leaves no last value to check, so the lookup answered `null`.
+        // O(1): a list that ran out holds no child.
+        if fields.ends_unpaired() {
+            return Err(fields.malformed_member_error());
+        }
         // STYLE-0013: `preceding_gap_ok` directly, not `key_delimiter_ok`/
         // `value_delimiter_ok` -- both take `is_first`/`text_start` from an
         // already-decoded key/value, but this walk only knows `key_start`
@@ -2013,6 +2038,10 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
             fields = rest;
             index += 1;
         }
+        // #7448: the unpaired lone child of a one-member object, as in `find`.
+        if fields.ends_unpaired() {
+            return (Err(fields.malformed_member_error()), 0);
+        }
         // STYLE-0013: same reason as `find`'s own exemption -- only
         // `key_start` (captured when a candidate becomes `winner`) is kept,
         // and the check is deferred to the last-write-wins field alone.
@@ -2087,6 +2116,10 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
             last_value_cursor = Some(field.value_cursor());
             fields = rest;
             index += 1;
+        }
+        // #7448: the unpaired lone child of a one-member object, as in `find`.
+        if fields.ends_unpaired() {
+            return (Err(fields.malformed_member_error()), 0);
         }
         // STYLE-0013: as `find_cursor_counted`'s own exemption -- only each winner's `key_start` is
         // kept, and the check is deferred to the last-write-wins field of each name alone.
@@ -5456,6 +5489,13 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
         matches!(self.value(), StandardJson::Null | StandardJson::Bool(false))
     }
 
+    /// [`is_falsy`](Self::is_falsy)'s one `value()`, with the token the index
+    /// could not read raising instead of reading as truthy (#7449).
+    #[inline]
+    fn truthiness(&self) -> Result<bool, EvalError> {
+        crate::jq::json_truthiness(&self.value())
+    }
+
     /// #1576: `JsonCursor` now implements both `stream_sequence_*` methods
     /// below (JSON only -- `stream_sequence_yaml` stays at the trait
     /// default; JSON->YAML sequence streaming is a separate, unimplemented
@@ -8154,7 +8194,7 @@ mod tests {
             b"[null",
             b"[nan",
             b"[-nan",
-            b"[Nan4000",
+            b"[Nan0",
             b"[Infinity",
             b"[-Infinity",
             b"[1 ",
@@ -12353,6 +12393,35 @@ mod tests {
     /// #2288: well-formed objects (including a duplicate key, exercising
     /// the same winning-occurrence resolution as the tests above) are
     /// unaffected by the new delimiter and trailing-comma checks.
+    /// #7449: a cursor's truthiness is `is_falsy`'s answer negated for every
+    /// value the index reads, a container and a string with a bad escape
+    /// included, and a decode failure for a token it could not read.
+    #[test]
+    fn test_cursor_truthiness_raises_only_for_an_unreadable_token_7449() {
+        let json: &[u8] = br#"[null,false,true,0,"",[tru],{"a":nul},"\x",tru,nulll,x,1.2.3,-,1e]"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let mut child = root.first_child();
+        let mut verdicts = Vec::new();
+        while let Some(c) = child {
+            let verdict = c.truthiness();
+            if let Ok(truthy) = verdict {
+                assert_eq!(truthy, !c.is_falsy(), "{:?}", c.value());
+            }
+            verdicts.push(verdict.ok());
+            child = c.next_sibling();
+        }
+        let readable = [Some(false), Some(false), Some(true), Some(true), Some(true)];
+        let containers_and_strings = [Some(true), Some(true), Some(true)];
+        let unreadable = [None; 6];
+        let want: Vec<Option<bool>> = readable
+            .into_iter()
+            .chain(containers_and_strings)
+            .chain(unreadable)
+            .collect();
+        assert_eq!(verdicts, want);
+    }
+
     #[test]
     fn test_find_wellformed_unaffected_by_delimiter_check_2288() {
         for json in [
@@ -12369,6 +12438,46 @@ mod tests {
                 .find("a")
                 .unwrap_or_else(|e| panic!("{json:?}: {e:?}"));
             assert!(value.is_some(), "{json:?}: expected to find `a`");
+        }
+    }
+
+    /// #7448: the three name walks raise on a one-member object whose lone
+    /// child has no partner, for the name it holds and for any other. There
+    /// is no last value behind it for the trailing-gap check to read, so this
+    /// answered `Ok(None)`.
+    #[test]
+    fn test_find_walks_reject_a_lone_unpaired_child_7448() {
+        for json in [
+            br#"{"a":}"#.as_slice(),
+            br#"{"a"}"#.as_slice(),
+            br#"{"a":@}"#.as_slice(),
+            br#"{"a":,}"#.as_slice(),
+            br"{:1}".as_slice(),
+        ] {
+            let index = JsonIndex::build(json);
+            let root = index.root(json);
+            let StandardJson::Object(fields) = root.value() else {
+                panic!("{json:?}: expected object");
+            };
+            assert!(fields.ends_unpaired(), "{json:?}");
+            for name in ["a", "b"] {
+                let find = fields.find(name).map(|v| v.is_some());
+                let cursor = fields.find_cursor_counted(name).0.map(|c| c.is_some());
+                let mut found = [None];
+                let several = fields.find_cursors_counted(&[name], &mut found).0;
+                for (walk, err) in [
+                    ("find", find.err()),
+                    ("find_cursor_counted", cursor.err()),
+                    ("find_cursors_counted", several.err()),
+                ] {
+                    let err = err.unwrap_or_else(|| panic!("{json:?} {walk}({name}) answered"));
+                    assert!(
+                        err.message.contains("Invalid JSON text"),
+                        "{json:?} {walk}: {}",
+                        err.message
+                    );
+                }
+            }
         }
     }
 
@@ -14300,8 +14409,8 @@ mod tests {
             ("NaN", None, None),
             ("-nan", None, None),
             ("+nan", None, None),
-            ("nan1", None, None),
-            ("sNaN12", None, None),
+            ("nan0", None, None),
+            ("sNaN0", None, None),
             ("inf", Some(f64::INFINITY), None),
             ("Infinity", Some(f64::INFINITY), None),
             ("iNfInItY", Some(f64::INFINITY), None),
@@ -14438,7 +14547,7 @@ mod tests {
         // ... while a valid signed word is the whole word.
         assert_eq!(nested_number_span(b"[-inf]", 1), 5);
         assert_eq!(nested_number_span(b"[+nan]", 1), 5);
-        assert_eq!(nested_number_span(b"[sNaN12,1]", 1), 7);
+        assert_eq!(nested_number_span(b"[sNaN0,1]", 1), 6);
         // A `+digit` span is exactly what the greedy class already gave.
         assert_eq!(nested_number_span(b"[+1.2.3]", 1), 7);
         assert_eq!(nested_number_span(b"[+1e0e0]", 1), 7);
@@ -14461,8 +14570,8 @@ mod tests {
             (&b"nan"[..], 3),
             (b"nan 1", 3),
             (b"nan\n", 3),
-            (b"NaN5,", 4),
-            (b"sNaN12]", 6),
+            (b"NaN0,", 4),
+            (b"sNaN0]", 5),
             (b"-Infinity}", 9),
             (b"+inf\"", 4),
             (b"inf:", 3),
