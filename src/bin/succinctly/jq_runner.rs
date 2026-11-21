@@ -12937,6 +12937,39 @@ impl Seam {
         self
     }
 
+    /// This seam once the first `dropped` bytes of the file's text are gone (#7480): a source read in
+    /// windows drops its text up to a line start its line count has passed, which is never before the
+    /// bytes moved onto its front, so they all go and the seam keeps only what was moved off its end.
+    fn after_front_dropped(self, dropped: usize) -> Self {
+        if self.base == 0 || dropped == 0 {
+            return self;
+        }
+        debug_assert!(dropped >= self.base, "a window drops the moved bytes whole");
+        if dropped >= self.base {
+            return Self {
+                moved_len: self.moved_len,
+                moved_newline: self.moved_newline,
+                ..Self::NONE
+            };
+        }
+        // patchcov: coverage tolerate reason="unreachable: the counter's line start, the most a window drops, is never before the moved bytes' end"
+        Self {
+            base: self.base - dropped,
+            earlier: self.earlier.map(|earlier| {
+                earlier
+                    .iter()
+                    .map(|part| SeamPart {
+                        end: part.end.saturating_sub(dropped),
+                        ..part.clone()
+                    })
+                    .collect()
+            }),
+            raw_ends: None,
+            ..self
+        }
+        // patchcov: coverage end
+    }
+
     const NONE: Self = Self {
         base: 0,
         moved_len: 0,
@@ -13797,8 +13830,21 @@ fn stitch_json_file_seams<'a>(
     resumes: bool,
     stream: bool,
 ) -> Vec<Seam> {
+    stitch_json_file_seams_onto(raws, resumes, stream, Vec::new())
+}
+
+/// [`stitch_json_file_seams`] over files of which some already start with bytes moved onto them
+/// (#7480): `seams[i]`, where given, is what was moved onto the front of file `i` before (the lazy
+/// route carries a document a file ends inside onto the next file as it reaches that end), and the
+/// stitch goes on from it as it would from a carry of its own.
+fn stitch_json_file_seams_onto<'a>(
+    raws: impl Iterator<Item = &'a mut Vec<u8>>,
+    resumes: bool,
+    stream: bool,
+    mut seams: Vec<Seam>,
+) -> Vec<Seam> {
     let mut raws: Vec<&mut Vec<u8>> = raws.collect();
-    let mut seams = vec![Seam::NONE; raws.len()];
+    seams.extend(std::iter::repeat(Seam::NONE).take(raws.len().saturating_sub(seams.len())));
     let Some(last) = raws.len().checked_sub(1) else {
         return seams;
     };
@@ -14346,6 +14392,10 @@ struct DroppedText {
     bytes: usize,
     /// How many line breaks came before the window.
     newlines: usize,
+    /// How many line breaks were in the bytes an earlier file's cut document moved onto the front of
+    /// the text (#7480), all of which go with the first window dropped: they are not the file's lines,
+    /// but they are in jq's input ahead of the window.
+    moved_newlines: usize,
 }
 
 impl DroppedText {
@@ -14354,7 +14404,7 @@ impl DroppedText {
         if self.bytes == 0 {
             file_start
         } else {
-            (file_start.0 + self.newlines, 0)
+            (file_start.0 + self.moved_newlines + self.newlines, 0)
         }
     }
 
@@ -14566,8 +14616,9 @@ fn several_lazy_windowed_files_by_path(files: &[PathBuf]) -> Option<Vec<window::
 /// the route that reads the files whole takes them lazily without stitching them first
 /// ([`lazy_json_sources`]): its first chunk clean, and, when that chunk is all of it, not ending in a
 /// number or literal the next file could go on with. That route stitches such a file onto the next
-/// and goes on lazily over all of them, where the windowed route would hand the rest of the stream to
-/// the eager reader at its end, so the windowed route turns it down. A file the front
+/// and goes on lazily over all of them, so the windowed route turns it down. (Since #7480 the windowed
+/// route would carry such a file's end onto the next as it carries a later file's; the gate keeps the
+/// choice between the two routes where it was.) A file the front
 /// ([`lazy_prefix_bytes`]) holds whole is asked of [`lazy_json_sources`] itself; a longer one is taken
 /// only when the front's first chunk has more after it, which the whole text's would then too.
 ///
@@ -15124,17 +15175,37 @@ fn slide_lazy_window(
     }
     #[cfg(test)]
     LAZY_WINDOWS_READ.with(|n| n.set((n.get().0, n.get().1 + drop)));
+    // #7480: the bytes an earlier file's cut document moved onto the front go with the first drop (the
+    // counter's line start is never before them); their line breaks are jq's input's, not the file's.
+    // The counter starts its line at their end, which is no line start in jq's input (the cut document
+    // goes on there), so the text waits for a line break of the file's own: a window starts at a line
+    // start, which is what `DroppedText` counts it from.
+    if lazy.seam.base > 0 && drop <= lazy.seam.base {
+        return;
+    }
+    let moved = lazy.seam.base.min(drop);
     // Every line break before the counter's line start is before its position, and counted.
     lazy.dropped = DroppedText {
         bytes: lazy.dropped.bytes + drop,
         newlines: place.newlines_before(),
+        moved_newlines: lazy.dropped.moved_newlines
+            + count_newlines(&lazy.text.as_bytes()[..moved]),
     };
     std::rc::Rc::make_mut(&mut lazy.text).drain(..drop);
     more.scanned_to -= drop;
     more.last_span = more
         .last_span
         .map(|(first, end)| (first, end.saturating_sub(drop)));
-    *lines = lines.take().map(|place| place.after_dropping(drop));
+    lazy.seam = std::mem::take(&mut lazy.seam).after_front_dropped(drop);
+    more.seams = std::mem::take(&mut more.seams)
+        .into_iter()
+        .map(|seam| seam.after_front_dropped(drop))
+        .collect();
+    *lines = lines.take().map(|place| {
+        let mut place = place.after_dropping(drop);
+        place.seam = std::mem::take(&mut place.seam).after_front_dropped(drop);
+        place
+    });
 }
 
 /// The first chunk of a lazy stream covers about this much text, and each chunk after it twice the
@@ -15524,11 +15595,22 @@ fn lazy_scan_on(
         && lazy.spans.last().is_some_and(|&(start, end)| {
             end == lazy.text.len() && !matches!(lazy.text.as_bytes()[start], b'{' | b'[' | b'"')
         });
-    if bare_end {
-        lazy.spans.pop();
-    }
+    let bare = if bare_end { lazy.spans.pop() } else { None };
     let end_of_last = lazy.spans.last().map_or(more.scanned_to, |&(_, end)| end);
     if !later.is_empty() && (chunk.end == ChunkEnd::Fault || bare_end) {
+        // #7480: a document this file ends inside, or a number or literal it ends in, goes on in the
+        // next file, which reads on from it lazily: the stitch the eager reader would make, made here
+        // for this file's end alone. Only a fault no later byte can mend hands the stream over.
+        let cut = match bare {
+            Some((start, _)) => Some((start, Vec::new())),
+            None if chunk.open_tail => cut_document_start(&lazy.text, end_of_last),
+            None => None,
+        };
+        if let Some((start, before)) = cut.filter(|_| !lazy.stitched && more.lossy.is_none()) {
+            lazy.spans.extend(before);
+            carry_cut_document(lazy, start, &mut later[0], lines, more.last_source);
+            return false;
+        }
         let (handed, end) = hand_off_later_sources(lazy, end_of_last, later, more.last_source);
         *tail = handed;
         *exhausted = end;
@@ -15607,6 +15689,91 @@ fn lazy_scan_on(
     false
 }
 
+/// Where the document a file's text ends inside starts, for a chunk that ended at a fault that is only
+/// that (`LazyChunk::open_tail`) after its documents up to `from`: the container or string the text
+/// does not finish, as [`open_tail_start`] finds it for the stitch, and the documents between `from` and
+/// it (a number or literal the scan left before the fault, which the next byte, the cut one's opener,
+/// ends). `None` when the text from `from` on is not that.
+fn cut_document_start(text: &str, from: usize) -> Option<(usize, Vec<(usize, usize)>)> {
+    let bytes = text.as_bytes();
+    let past_space = |at: usize| {
+        bytes[at.min(bytes.len())..]
+            .iter()
+            .position(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+            .map_or(bytes.len(), |offset| at + offset)
+    };
+    let mut start = past_space(from);
+    if !matches!(bytes.get(start), Some(b'{' | b'[' | b'"')) {
+        start = past_space(token_end(bytes, start));
+    }
+    if !matches!(bytes.get(start), Some(b'{' | b'[' | b'"')) || !token_runs_to_end(&bytes[start..])
+    {
+        return None; // patchcov: coverage tolerate-line reason="unreachable: an open tail is the splitter's fault at an opener the text does not close, after at most the one number or literal the scan gives back"
+    }
+    if past_space(from) == start {
+        return Some((start, Vec::new()));
+    }
+    let gap = lazy_json_scan_chunk(&text[..start], from, usize::MAX);
+    (gap.end == ChunkEnd::Done).then_some((start, gap.spans))
+}
+
+/// Moves the document `lazy`'s text ends inside, from byte `start`, onto the front of `next`, the file
+/// after it (#7480), as [`stitch_json_file_seams`] moves it for the files read whole: `lazy` is then
+/// read to `start` and done, and `next` reads on from the moved bytes, its seam saying they are not its
+/// lines. The producer's line count of `lazy` (`lines`) learns the bytes moved off its end, which its
+/// last reads run on into. `next` has read nothing yet: a file read a window at a time holds no text,
+/// one read whole its own.
+///
+/// The eager reader took the rest of the stream here before, and turned every document left into a
+/// value before the first was read: about ten times the text (995 MiB for 100 MB in three files).
+fn carry_cut_document(
+    lazy: &mut LazyJsonInputs,
+    start: usize,
+    next: &mut LazyJsonInputs,
+    lines: &mut Option<LinePlace>,
+    last_source: u32,
+) {
+    debug_assert!(
+        next.spans.is_empty() && next.seam == Seam::NONE && !next.stitched,
+        "the next file has read nothing"
+    );
+    let mut head = std::mem::take(std::rc::Rc::make_mut(&mut lazy.text)).into_bytes();
+    let tail = head.split_off(start);
+    let mut stitcher = SeamStitcher::default();
+    stitcher.move_tail(
+        lazy.source as usize,
+        &mut lazy.seam,
+        start,
+        tail,
+        &head,
+        true,
+    );
+    *std::rc::Rc::make_mut(&mut lazy.text) = stitched_text(head);
+    if let Some(place) = lines.as_mut() {
+        place.seam.moved_len = lazy.seam.moved_len;
+        place.seam.moved_newline = lazy.seam.moved_newline;
+        // The next line break it found may be among the bytes moved off: it is found again.
+        place.next_newline = None;
+    }
+    let carry = stitched_text(stitcher.take_carry(&mut next.seam));
+    // The line breaks a window of `lazy` dropped are ahead of its share.
+    next.seam = std::mem::take(&mut next.seam)
+        .with_lines_before_source(lazy.source as usize, lazy.dropped.newlines);
+    std::rc::Rc::make_mut(&mut next.text).insert_str(0, &carry);
+    // A file of white space, which the route that reads them whole does not scan, scans the moved bytes.
+    let more = next.more.get_or_insert_with(|| LazyMore {
+        scanned_to: 0,
+        chunks: 0,
+        seams: Vec::new(),
+        last_source,
+        lossy: None,
+        last_span: None,
+        recorded_tail: None,
+        rest: None,
+    });
+    more.seams = vec![next.seam.clone()];
+}
+
 /// The eager reader of a stream of several files from byte `from` of `lazy` on (#6455), for a
 /// fault there or a number or literal it ends in: what [`get_inputs`]' loop reads of these files
 /// for a stream it reads eagerly, queued for `input`, and the end of the stream (named on
@@ -15663,7 +15830,16 @@ fn hand_off_later_sources(
             .take(before)
             .chain(std::mem::take(&mut raws))
             .collect();
-        let mut seams = stitch_json_file_seams(all.iter_mut(), true, false);
+        // #7480: `lazy` may start with a document an earlier file ended inside, carried onto it by the
+        // producer; the stitch goes on from that, and records what it moves off `lazy`'s end itself.
+        let carried = Seam {
+            moved_len: 0,
+            moved_newline: None,
+            ..lazy.seam.clone()
+        };
+        let mut seeds = vec![Seam::NONE; before];
+        seeds.push(carried);
+        let mut seams = stitch_json_file_seams_onto(all.iter_mut(), true, false, seeds);
         raws = all.split_off(before);
         // The line breaks ahead of what the stitch moved off `lazy` are counted from its text's front,
         // past what its windows dropped.
@@ -22878,6 +23054,106 @@ mod tests {
             // White space is held until a document follows it; documents are read in windows.
             assert!(peak < docs.len() / 2 + 200_000, "peak {peak}");
         }
+    }
+
+    /// #7480: a document a file ends inside (a container, a string, a number one file ends and the next
+    /// goes on with, a file that is all inside one) is carried onto the front of the next file, and the
+    /// run reads on lazily: nothing is handed to the eager reader, which turned every later document into
+    /// a value up front, and several files read in windows hold a window, not a file. Files read whole
+    /// (shorter than the windowed route's least) carry it on as well. Each run hands out what the eager
+    /// route does. A fault in the cut document still hands the stream over, from the next file. The pin
+    /// fails with the hand-off at every such cut.
+    #[test]
+    fn a_document_cut_across_files_is_carried_on_lazily_7480() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let docs: Vec<u8> = (0..20_000)
+            .flat_map(|n| {
+                if n % 9 == 4 {
+                    format!("{n}\n").into_bytes()
+                } else {
+                    format!("{{\"n\":{n},\n\"pad\":\"xxxxxxxxxxxxxxxxxxxxxx\"}}\n").into_bytes()
+                }
+            })
+            .collect();
+        assert!(docs.len() > 10 * (64 << 10), "{} bytes", docs.len());
+        let third = docs.len() / 3;
+        // A number the first file ends inside, and the byte after an object's opener.
+        let number = docs.windows(6).position(|w| w == b"\n6664\n").unwrap() + 3;
+        let opener = third + docs[third..].iter().position(|&b| b == b'{').unwrap() + 1;
+        let cut = |at: &[usize]| -> Vec<&[u8]> {
+            let mut pieces = Vec::new();
+            let mut prev = 0;
+            for &at in at {
+                pieces.push(&docs[prev..at]);
+                prev = at;
+            }
+            pieces.push(&docs[prev..]);
+            pieces
+        };
+        let shapes: Vec<Vec<&[u8]>> = vec![
+            cut(&[third + 7, 2 * third + 13]),
+            cut(&[third + 1, third + 4, third + 9]),
+            cut(&[number, 2 * third]),
+            cut(&[third + 20, third + 20, 2 * third]),
+            {
+                let mut files = cut(&[opener]);
+                files.insert(1, b"\n \n");
+                files
+            },
+        ];
+        for files in &shapes {
+            let whole = observe_inputs(dir.path(), files, true, None).0;
+            for windowed in [true, false] {
+                if windowed {
+                    LAZY_RAW_MIN_OVERRIDE.with(|c| c.set(Some(0)));
+                    LAZY_WINDOW_OVERRIDE.with(|c| c.set(Some(64 << 10)));
+                }
+                let (handed, started) = (
+                    HAND_OFFS.with(std::cell::Cell::get),
+                    SEVERAL_WINDOWED_STARTS.with(std::cell::Cell::get),
+                );
+                LAZY_TEXT_PEAK.with(|n| n.set(0));
+                let seen = observe_inputs(dir.path(), files, false, None).0;
+                LAZY_RAW_MIN_OVERRIDE.with(|c| c.set(None));
+                LAZY_WINDOW_OVERRIDE.with(|c| c.set(None));
+                assert_eq!(seen, whole, "windowed {windowed}");
+                assert_eq!(
+                    SEVERAL_WINDOWED_STARTS.with(std::cell::Cell::get),
+                    started + usize::from(windowed)
+                );
+                assert_eq!(
+                    HAND_OFFS.with(std::cell::Cell::get),
+                    handed,
+                    "a hand-off, windowed {windowed}"
+                );
+                if windowed {
+                    let peak = LAZY_TEXT_PEAK.with(std::cell::Cell::get);
+                    // A few 64 KiB windows, where a hand-off held every file after the cut.
+                    assert!(peak < 5 * (64 << 10), "peak {peak}");
+                }
+            }
+        }
+        // A fault in the cut document, met in the next file: that file hands the rest over.
+        let at = opener - 1;
+        let broken = [&docs[..at], b"{\"n\":}", &docs[at..]].concat();
+        let files: [&[u8]; 3] = [
+            &broken[..at + 4],
+            &broken[at + 4..2 * third],
+            &broken[2 * third..],
+        ];
+        let whole = observe_inputs(dir.path(), &files, true, None).0;
+        LAZY_RAW_MIN_OVERRIDE.with(|c| c.set(Some(0)));
+        LAZY_WINDOW_OVERRIDE.with(|c| c.set(Some(64 << 10)));
+        let handed = HAND_OFFS.with(std::cell::Cell::get);
+        let seen = observe_inputs(dir.path(), &files, false, None).0;
+        LAZY_RAW_MIN_OVERRIDE.with(|c| c.set(None));
+        LAZY_WINDOW_OVERRIDE.with(|c| c.set(None));
+        assert_eq!(seen, whole);
+        assert_eq!(HAND_OFFS.with(std::cell::Cell::get), handed + 1);
+        assert!(
+            seen.iter().any(|item| item.starts_with("error")),
+            "{seen:?}"
+        );
     }
 
     /// #7024: a first file with a document that the route reading the files whole stitches onto the next
