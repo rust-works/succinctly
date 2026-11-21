@@ -5376,7 +5376,7 @@ mod stream_tests {
         fault: Option<(usize, usize)>,
     }
 
-    /// The seam in the terms a reader of it can tell apart: without `raw_ends`, which the whole-file route
+    /// The seam in the terms a reader of it can tell apart: without `lead` (#7569) and `raw_ends`, which the whole-file route
     /// sets for any substituted file and the windows for one whose front was substituted, and with the
     /// bytes it places clamped to the file's text, as `LineCounter::at_seam` clamps them (a file that
     /// hands its whole text on keeps the place of the bytes as read in the whole-file route).
@@ -5393,6 +5393,9 @@ mod stream_tests {
                     .collect()
             }),
             raw_ends: None,
+            // The BOM's lead counts only on the file's first line, which a window that starts past
+            // dropped blank lines no longer holds: the lines of the documents say whether it counted.
+            lead: 0,
             ..seam.clone()
         }
     }
