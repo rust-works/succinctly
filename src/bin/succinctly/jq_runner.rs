@@ -897,7 +897,8 @@ fn module_meta_outcome(lib_dirs: &[PathBuf], name: &str) -> jq::cli_context::Mod
         return Error(format!("module not found: {name}"));
     };
     let canonical = canonical_or_self(&file);
-    let contents = match std::fs::read_to_string(&file) {
+    // Lossily, as `import` reads a module (#5351, #7429): jq parses the raw bytes.
+    let contents = match read_library(&file) {
         Ok(contents) => contents,
         Err(e) => {
             return LoadFailure(format!(
