@@ -200,22 +200,26 @@ jq: error (at <unknown>): Invalid path expression near attempt to access element
                                                                              # key: still 11 bytes
 ```
 
-## Truncation that splits a multi-byte character: matched (#6434)
+## Truncation that splits a multi-byte character: follows jq 1.8, not the pinned 1.7.1 (#7524)
 
-jq cuts the dump at a byte offset and will split a UTF-8 sequence. The message is then built as a `jv` string, which replaces the partial sequence with one U+FFFD (`ef bf bd`), whether one, two or three bytes of the character were kept:
+jq 1.7.1 cuts the dump of a value in an error message at a byte offset and will split a UTF-8 sequence.
+The message is then built as a `jv` string, which replaces the partial sequence with one U+FFFD (`ef bf bd`), whether one, two or three bytes of the character were kept:
 
 ```bash
-$ echo '"あああああ"' | jq '.[]' | cat -v
+$ echo '"あああああ"' | /usr/bin/jq '.[]' | cat -v
 jq: error (at <stdin>:1): Cannot iterate over string ("M-cM-^AM-^BM-cM-^AM-^BM-cM-^AM-^BM-oM-?M-=...)
                                                      # "あああ, then U+FFFD (M-oM-?M-=)
 ```
 
-`dump_truncated` cuts back to the character boundary and writes that U+FFFD before the `...`, so `try (.[]) catch .` on `"abc😀😀😀"` is `"Cannot iterate over string (\"abc😀�...)"` in both.
+jq 1.8.0 fixed that as a bug ("Fix error messages including long string literal not to break Unicode characters", jqlang/jq#3249): `jv_dump_string_trunc` moves the cut back to the start of the character and writes nothing in its place.
+Its own test, at the 1.7.1 budget, is `"x" * range(0; 12; 2) + "☆" * 5 | try -. catch .`, which prints `"string (\"☆☆☆...) cannot be negated"`, `"string (\"xx☆☆...)`, `"string (\"xxxx☆☆...)`, `"string (\"xxxxxx☆...)`, `"string (\"xxxxxxxx...)` and `"string (\"xxxxxxxxxx...)`.
+ADR-0018's fork order applies: an upstream bug fix is adopted, so `dump_truncated` cuts back to the character boundary and writes no U+FFFD before the `...`, so `try (.[]) catch .` on `"abc😀😀😀"` is `"Cannot iterate over string (\"abc😀...)"`.
 It applies at the wide `path()` budget too.
-The `succinctly yq` messages that embed a cut value (`keys` of a string, `tonumber` of an object) are jq's wording, not yq's, and get the same U+FFFD.
-A cut that lands on a boundary writes none (`"ααααα...`, exactly 11 bytes).
-Before #6434 this page said jq emitted the lone invalid byte, and `succinctly jq` dropped the partial character without a replacement.
-Pinned in `src/jq/error.rs` (`dump_truncation_that_splits_a_character_writes_one_replacement_6434`) and `tests/jq_cli/i6434.rs`.
+The `succinctly yq` messages that embed a cut value (`keys` of a string, `tonumber` of an object) are jq's wording, not yq's, and get the same cut.
+A cut that lands on a boundary is unchanged (`"ααααα...`, exactly 11 bytes).
+The budgets stay 1.7.1's: jq 1.8.2 also widened the preview and closes it with the delimiter (jqlang/jq#3478), which the owner ruled an improvement, not a bug fix, so it is not adopted and `succinctly jq` still prints a long value cut at 11 bytes where jq 1.8.2 prints it whole.
+#6434 had matched 1.7.1's U+FFFD; before that this page said jq emitted the lone invalid byte, and `succinctly jq` dropped the partial character without a replacement, which is what it does again.
+Pinned in `src/jq/error.rs` (`dump_truncation_that_splits_a_character_backs_up_to_its_start_7524`), `tests/jq_cli/i7524.rs` and `tests/jq_cli/i6434.rs` (its rows are the 1.7.1 messages without the U+FFFD).
 
 ## jq's own UTF-8 replacement-character substitution: matched, at each caller's own granularity
 
@@ -1854,6 +1858,7 @@ the probes `assign_negative_index_oob`, `update_negative_index_oob` and
 Unlike the positive case above, `?` does not suppress this one —
 [#498](https://github.com/rust-works/succinctly/issues/498) — because it is a write-time
 bounds check, not a failure to collect the path.
+The path is still collected first, as jq's `reduce path(P)` does: what follows such an index runs against the `null` it reads, so `.[-2][]? = 0` on `[1]` names no path and is `[1]`, and `.[-2][] = 0` raises `Cannot iterate over null (null)` ([#7559](https://github.com/rust-works/succinctly/issues/7559)).
 
 A variable bound outside `reduce`/`foreach` and referenced from inside `UPDATE`/`EXTRACT`
 used to be a third, narrower gap, found reviewing
@@ -7221,17 +7226,21 @@ input: `null | setpath([1e30]; 9)` asks for 9.2e18 elements. jq dies on that fil
 killed on the allocation, with no message to reproduce), and succinctly used to panic with
 `capacity overflow`, which for a library means taking the embedder's process down. It now
 refuses with `Cannot grow array to <n> elements` — succinctly's own wording, since there is
-no jq sentence to copy.
+no jq sentence to copy (for an index past the bound below, jq 1.8.2 does have one, which `succinctly jq` now uses, #7536).
 Only the impossible and the absurd are refused; every length up to the bound below that fits in memory still pads, so `[1,2] | setpath([5]; 9)` still agrees with jq.
 
 A reservation that the address space can satisfy is not an allocation that can be made (#5500).
 `[] | .[1e12] = 1` wants 1e12 elements: a 64-bit target reserves that, and writing the nulls then takes over ten seconds and has ended in an abort.
 jq 1.7.1 dies there too (SIGSEGV, exit 139, with no message to copy) and has no bound of its own: it answers `.[536870912] = 1` and `.[1073741823] = 1`, and dies from `.[2147483647] = 1`.
-succinctly refuses an index write that would grow an array past 536,870,912 elements with the same `Cannot grow array to <n> elements`, before reserving anything.
-That bound is 2^29 elements (index `INT_MAX >> 2`), the one jq 1.8 puts on `jv_array_set` (`Array index too large`).
+succinctly refuses an index write that would grow an array past 536,870,912 elements before reserving anything.
+That bound is 2^29 elements (index `INT_MAX >> 2`), the one jq 1.8 puts on `jv_array_set` (CVE-2024-23337).
+`succinctly jq` words the refusal as jq 1.8.2 does, `Array index too large` (#7536): `null | .[536870912] = 1`, `[] | .[1e12] = 1`, `setpath([536870912]; 1)` and the `|=` and `+=` forms of the same write all print `jq: error (at <unknown>): Array index too large` and exit 5 in jq 1.8.2 and here.
+jq 1.7.1 has no sentence to match: it answers the first by mapping about 4 GB and is killed by SIGSEGV on the second.
+`succinctly yq` keeps `Cannot grow array to <n> elements` for the same bound, since the mode decides and yq has no sentence to copy (it allocates until the host kills it).
+The refusals that are not about the bound (a reservation the allocator cannot make) keep that wording in both modes.
 The indexes between it and 1.7.1's crash (536,870,912 to 1,073,741,823 are the ones observed) are answered by 1.7.1 and refused here: 1.7.1 maps pages it never touches, where succinctly writes every null it pads, so `.[1073741823] = 1` would be a 17 GB write (ADR-0018 rule 4(c), the host process).
 Even at the bound a write is 8.6 GB, so a host with less memory than that can still be taken down by an index below it.
-Pinned by `tests/jq_cli/i5500.rs`; the same bound applies to `succinctly yq`.
+Pinned by `tests/jq_cli/i5500.rs` and `tests/jq_cli/i7536.rs`; the same bound applies to `succinctly yq` (`tests/yq_cli/i7536.rs`).
 
 String repetition (`s * n`) has the identical shape (#1612): `n` comes from the document, so
 `"ab" * 1e30` asks for a byte length `String::repeat` cannot even represent, which used to
@@ -7434,7 +7443,8 @@ A 10 MB stream with 5 MB of lines that only warn in its middle held 1059-1101 Mi
 The rest is still held only from a stretch line the windows cannot end in: a line over 4 MiB with no RS at a line start in it, or one that draws over 65536 warnings.
 Since [#7218](https://github.com/rust-works/succinctly/issues/7218) and [#7221](https://github.com/rust-works/succinctly/issues/7221) it no longer does for `--seq` over several regular files of 4 MiB or more between them while each file is that framing and ends in an LF: from the first that is not, that file and the ones after it are held (below).
 Since #7341 a file that is not, and that opens with an RS, is read by a gate of its own as a lone file is, and only what its gate cannot carry on after is held, with the files after it.
-Every other route that reads the input still holds all of it: `--seq` over a stream that is not that framing (on a pipe, in one regular file or in a file of several that opens with an RS, from the stretch line the windows cannot end in, #7322 and #7341; over several files, also from the first file that is neither that framing nor opens with an RS), `--input-dsv`, `--stream-errors`, standard input that is a terminal or a pipe under 4 MiB (for the plain filter and for `-R`), and the programs that call `input`/`inputs` over several files one of which is not UTF-8, or past a hand-off to the eager reader (below) (`reduce inputs` peaked at 32.8 MiB against 14.6 for one file, on two 11 MB files, until #7024, and `-R length a b` at 30.7 against 12.7).
+Every other route that reads the input still holds all of it: `--seq` over a stream that is not that framing (on a pipe, in one regular file or in a file of several that opens with an RS, from the stretch line the windows cannot end in, #7322 and #7341; over several files, also from the first file that is neither that framing nor opens with an RS), `--input-dsv`, `--stream-errors -s`, standard input that is a terminal or a pipe under 4 MiB (for the plain filter and for `-R`), and the programs that call `input`/`inputs` over several files one of which is not UTF-8, or past a hand-off to the eager reader (below) (`reduce inputs` peaked at 32.8 MiB against 14.6 for one file, on two 11 MB files, until #7024, and `-R length a b` at 30.7 against 12.7).
+A plain `--stream-errors` walk (no `-n`, no `-s`) no longer does since [#7571](https://github.com/rust-works/succinctly/issues/7571): it reads its events through the stream reader a chunk at a time, as `--stream` has since #5498, where it held every event as a value, about 34 times the input (2,029 MiB peak for 63 MB of NDJSON on an M4 Pro, now 4.3, as at 0.6 and 6 MB).
 That is a known limitation, not supported at this stage: it is outside the three reasons ADR-0018 permits a divergence for, so it is a deferred gap and not a deliberate behaviour.
 It is tracked in [#7024](https://github.com/rust-works/succinctly/issues/7024) (the plain filter over a list with a path that is not a regular file; `input`/`inputs` over a file that is not UTF-8).
 The tables below were measured before #6920 and #7023 and show every row as it was; the rows they fixed are the first five of each (`first(inputs)` was flat already).
@@ -7573,9 +7583,14 @@ The windows are read from descriptor 0's own offset, and a run that stops early 
 jq reads its input through stdio one `fgets` chunk at a time (a line, or 4095 bytes of a longer one), and stdio moves a seekable descriptor back to the end of what it handed out when the process exits, so `{ jq -n input; jq -n input; } < f` reads the first document and then the second, and `{ jq -c 'limit(10; inputs)' -n; cat; } < f` hands `cat` the rest.
 Before #7455 every route left a regular file where its own reads had taken it: at the end on the whole-file route, and at the end of the last window (256 KiB) on the windowed ones, so the second `jq -n input` read nothing, or began in the middle of a line.
 Now the descriptor is moved, once, when the run is over (`src/bin/succinctly/stdin_offset.rs`): the items the program took (values, `--stream` events, `-R` lines) are counted again in the file from where the run found it, and the offset is set to the end of the `fgets` chunk whose byte completed the last of them (the closing bracket or quote, the byte after a number, or for a `--stream` scalar inside a container the `,` or closer after it, where jq's streaming parser hands it out); a `-R` line runs to its newline.
+A closer right after a `--stream` scalar completes two events, the scalar's and the close, and jq's parser hands out the second with no byte left to read, so jq's input loop reads the next chunk first: when that closer is the last byte of a 4095-byte chunk, a run that stops on the close leaves the offset at the end of the chunk after it (#7570; jq 1.7.1 and 1.8.2 both, wherever their chunks end at that byte).
 That is the offset jq 1.7.1 leaves for `-n input`, `first(inputs)`, `limit(n; inputs)`, `halt`, `halt_error`, `limit(0; inputs)` (nothing read, nothing moved), with documents separated by lines, spaces or nothing, from a non-zero starting offset, and on lines longer than a chunk, where it is 4095 bytes into the line; jq 1.8.2 reads 4091 bytes at a time (and up to three more to finish a character), so only on such lines does it differ, by its buffer size.
 The count is made again from the start of the run's reads, a block at a time by position, so a run that stops a long way into a large file reads that much of it once more on its way out.
 A run that read to the end (a run without `-n` that does not halt, `[inputs]`, `--slurp`) leaves the offset where the read left it, as jq does, and a pipe has none to move.
+Standard input named as `-` among input files is put back the same way (#7568): jq's reader takes the files in order as one text, each file's chunks starting at its front, so the files before the first `-` are read again from their paths and counted first; an item they complete leaves standard input untouched, as jq's reader never got to it, and one completed past standard input's end leaves it at its end.
+A close that a file's last byte completes right after a scalar is handed out once jq's reader has read the next file's first chunk, as at a chunk's last byte (#7570).
+A main loop that does not halt reads to the end, except when a file before the `-` does not open (or is a directory): jq's main loop then stops once it has the input its reader read past that file (`while (jq_util_input_errors(...) == 0 && ...)`), and standard input is left where that input's chunk ends.
+A missing file or a directory before the `-` is a source with no bytes, as jq's reader reads it, but one that names a descriptor (`/dev/stdin`, `/dev/fd/N`), or a pipe or device, leaves standard input where the reads left it: its bytes cannot be read again as jq read them.
 Three shapes still leave a regular file where the reads left it: a run that ends at a parse error (jq leaves the offset at the end of the chunk where its parser met the error), `--seq`, and `--stream-errors`, whose items this count does not model.
 `-R` over standard input (#7024) is read by the `LineWindows` the `-R` file route reads its file with (#7023, above), and the plain route's machinery is not involved.
 A regular file is read by a duplicate of descriptor 0 from the offset it stands at; a pipe or socket has its first 4 MiB read to learn whether it is long enough, and one that ends sooner hands what it held to the route that reads it whole, as the plain route's pipe does.
@@ -9414,6 +9429,18 @@ The evaluation stack starts at a quarter of the cap, within 16 MiB and its full 
 ADR-0025's floor follows the size it got, so a recursion that reaches it refuses at a proportionally shallower depth instead of overflowing, and a capped run answers where it used to stop with `failed to spawn the evaluation thread`.
 At a cap of 32 MiB the thread cannot be mapped at all.
 A document too large for the cap still aborts on the failed allocation, as jq does.
+
+## An input read whole with no room for it (#7576)
+
+An input `succinctly jq` reads whole that there is no room for ends the run as jq's failed allocation does: `jq: error: cannot allocate memory` and `abort()`, exit 134 to a shell, with nothing on stdout.
+That covers `-s` (with `--stream`, `-n` and `-R` too), `-R -s`, `--slurpfile`, `--rawfile`, `-f`, standard input read whole, and the join `-s` makes of the files it read.
+Captured from jq 1.7.1 on x86_64 Linux under `ulimit -v 400000` over a 300 MiB NDJSON file, for every one of those routes; jq 1.8.2's `memory_exhausted` (src/jv_alloc.c) is unchanged, and was not run (there is no 1.8.2 on the Linux box, and macOS does not enforce `ulimit -v`).
+Before #7576 the failure read as a file that would not open (`jq: error: Could not open file f: out of memory`, exit 2) and the run went on without it, so `-s length` printed `0`; on standard input the read stopped where the room did.
+
+One route still differs.
+jq streams a `--seq` input whatever it holds, so under the same cap `--seq -c .` over NDJSON (no RS anywhere) ends with `jq: ignoring parse error: Unfinished abandoned text at EOF at line 8530001, column 0` and exit 0.
+`succinctly jq` reads a `--seq` stream that does not open with an RS whole (#7312), and the windowed `--seq` routes leave a file they could not hold to that read (#7262), so it answers `cannot allocate memory` there.
+Answering as jq does would take a `--seq` reader that walks text with no RS a window at a time.
 
 ## Input files are one byte stream (#4305)
 
@@ -11601,7 +11628,15 @@ and the `jq-linux-arm64` release binaries):
 - **`TZ` is read once per process**, on the first conversion. An embedder that changes `TZ`
   afterwards (`std::env::set_var`) keeps the first zone; the POSIX-only reading above re-reads it
   on every call. jq cannot change its own environment, so the CLI is unaffected.
-- **A `TZ` jiff cannot read is UTC**, as in jq (`Foo/Bar`, `garbage`, an empty `TZ`). The offset
+- **`TZ` is read as libc reads it** (#7486): one leading `:` is dropped, then the value is a tz file if one opens at `<zoneinfo>/<TZ>` (or at the path itself when it starts with `/`), else a POSIX string.
+  So `TZ=posix/Asia/Tokyo`, `TZ=Asia//Tokyo`, `TZ=Asia/../Asia/Tokyo`, `TZ=posixrules` and `TZ=/usr/share/zoneinfo/Asia/Tokyo` load the zone, and a name matches a file only as the file system matches it: `TZ=asia/tokyo` is UTC on Linux and Tokyo on macOS, as in jq.
+  The zoneinfo directory is `$TZDIR` on Linux, as glibc reads it (an empty `TZDIR` is unset), and `/usr/share/zoneinfo` on macOS, whose libc ignores `TZDIR`.
+  On macOS a `TZ` that starts with `:` and names no file is UTC (`TZ=:JST-9`), as Apple's libc never reads it as a POSIX string; glibc reads it as `JST-9`.
+  Captured from jq 1.7.1 on x86_64 Linux (glibc) over 49 spellings of `TZ` under six `TZDIR` settings, and on macOS for the rows that differ there; jq 1.8.2 agrees on macOS (it was not run on Linux, where there is no 1.8.2 build).
+  Before #7486, `TZ` went through jiff's zone database, which matches names whatever their case, has no `posix/` or `right/` trees and does not open `Asia//Tokyo`, and which read `TZDIR` on macOS too.
+- **A `right/` zone carries no leap seconds here.** glibc counts the leap seconds of a `right/` tz file in every conversion while `TZ` names one, `gmtime` and `mktime` included: under `TZ=right/UTC`, jq 1.7.1's `1700000000 | todate` is `2023-11-14T22:12:53Z` and `1483228826 | todate` is `2016-12-31T23:59:60Z`.
+  `succinctly jq` reads the zone's offsets and abbreviations from the file and counts no leap seconds, so a `right/` zone answers as the same zone outside `right/` does (`2023-11-14T22:13:20Z`), 27 seconds from jq's answer since 2017.
+- **A `TZ` that is neither a tz file nor a POSIX string is UTC**, as in jq (`Foo/Bar`, `garbage`, an empty `TZ`). The offset
   forms libc accepts that jiff does not read as UTC: `TZ=5`, and an offset beyond ±24h
   (`XXX99`, `XXX-25`; jq applies them as written on macOS and clamped to ±24h on glibc).
 - **`TZ=5` with `%Z`** raises `strflocaltime/1: unknown system failure` in jq (libc's `%Z` is empty
@@ -11675,9 +11710,13 @@ What differs from jq 1.7.1:
   A locale layout that prints the zone itself (glibc's `en_GB` `%c` ends in `%Z`) takes the same zone labels.
 - **`%E*` and `%O*` follow the plain specifier.**
   Under a locale whose C library has alternative era or digit forms (`ja_JP` on glibc) the plain form is printed.
-- **An empty result, or one past jq's buffer, is an error.**
+- **An empty result for a format that is not empty, or one past jq's buffer, is an error; an empty format is not (#7542).**
   jq hands the library a buffer of `strlen(fmt) + 100` bytes and raises `strftime/1: unknown system failure` (`strflocaltime/1:` for the local-zone one) when `strftime` returns 0.
-  So does this: an empty format, `%p` under `de_DE` (the library prints nothing there, macOS and glibc alike) and a result of `strlen(fmt) + 100` bytes or more (five `%c`) are that error, and `strftime("...")?` is empty.
+  So does this: `%p` under `de_DE` (the library prints nothing there, macOS and glibc alike) and a result of `strlen(fmt) + 100` bytes or more (five `%c`) are that error, and `strftime("...")?` is empty.
+  jq 1.7.1 raised it for an empty format too, and `succinctly jq` did until #7542.
+  jq 1.8.2 changed the failure test from `n == 0` to `(n == 0 && *fmt) || n > max_size` (jqlang/jq#3271, listed in the 1.8 NEWS under security fixes: "Fix segmentation fault on `strftime/1`, `strflocaltime/1`"), so an empty format answers `""`: `0 | strftime("")`, `strflocaltime("")` and `strftime("\u0000x")`, whose format is empty once the NUL ends it, and `[strftime("")?]` is `[""]`.
+  `succinctly jq` follows 1.8.2 there, because upstream fixed it as a bug, and so the difference from the pinned 1.7.1 stands as `newer-than-primary`.
+  Pinned by `tests/jq_cli/i5754c.rs`, whose empty-format rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
 - **`_`, `-` and `0` are padding flags on the numeric specifiers.**
   They apply to `%d %e %H %I %j %k %l %m %M %S %U %V %W` and to `%z`, which the library prints as a signed `hhmm` number (`+0530` is `+ 530` with `_` and `+530` with `-`).
   Every other specifier ignores them, including `%y %Y %C %g %G`, where a glibc `jq` pads and strips as well.
@@ -13236,7 +13275,26 @@ This supersedes the 1.7.1 behaviour the #1035, #3044/#3075 and #6049 sections de
 The 1.8 precedence change that came with it is not adopted: jq 1.8 also reads `-` as binding tighter than `*` (`'-' Term`, jqlang/jq#3053, a "Language changes" entry marked breaking), so `-0 * 1` is `(-0) * 1`, which is `0` there.
 `succinctly jq` keeps 1.7.1's `-(0 * 1)`, and the computed `0 * 1` negates to `-0`, as in 1.7.1.
 `-(-0) * 1` is `-0` here for the same reason, where both jq versions answer `0`: it negates the computed `(-0) * 1`, and 1.8's `-0` is the literal `0`.
-Two other 1.8 changes next to this one are not adopted either: `limit` raising for a negative count (jqlang/jq#3181), so `[limit(-1e-400; 1, 2)]` is `[1,2]` here (the count is the literal `-1E-400`, and 1.7.1's `limit` takes every output for a negative count) where 1.8.2 raises, and `length` keeping a literal's precision (jqlang/jq#3275).
+Another 1.8 change next to this one is not adopted either: `limit` raising for a negative count (jqlang/jq#3181), so `[limit(-1e-400; 1, 2)]` is `[1,2]` here (the count is the literal `-1E-400`, and 1.7.1's `limit` takes every output for a negative count) where 1.8.2 raises.
+The `length` half of the fix, jqlang/jq#3275, is adopted by #7534 (next section).
+
+### `length` of a number literal keeps its digits, as in jq 1.8 — newer than the 1.7.1 pin (#7534)
+
+jq 1.7.1's `length` of a number is `fabs` of its double, so `-100000000000000000001 | length` is `1e+20`, `1E-400 | length` is `0`, `1E1000 | length` is `1.7976931348623157e+308` and `1.50 | length` is `1.5`.
+jq 1.8.0 fixed it with the negation fix above: "Preserve numerical precision on unary negation, `abs/0`, `length/0`" in NEWS.md, [jqlang/jq#3275](https://github.com/jqlang/jq/pull/3275) ("Preserve numerical precision on `length/0`") for `length`.
+`jv_number_abs` takes `decNumberAbs` of a literal's decimal, so the result is a literal: it keeps every digit and prints as written (`100000000000000000001`, `1E-400`, `1E+1000`, `1.50`, `1.0`, `0.00001` for `1e-5`), and a zero of either sign is a positive zero with its spelling kept (`-0 | length` is `0`, `-0.0 | length` is `0.0`).
+`succinctly jq` follows jq 1.8.2, because it is the same upstream fix as the negation above, so the difference from the pinned 1.7.1 stands as newer than primary.
+It holds for every number that carries its literal: an input document, `-s`, `inputs`, `--argjson`, `--slurpfile` and a program literal, on both evaluators (`jq_literal_length`, which negates a negative literal with `jq_negated_literal`).
+A computed number keeps the double's answer (`(1 + 0.5) | length` is `1.5`, `(100000000000000000001 * 1) | length` is `1e+20`), and so do NaN, the infinities and every non-number, in which both jq releases agree.
+`abs` needs nothing of its own: jq defines it as `if . < 0 then -. else . end`, so it keeps a literal through the negation above, and `-0 | abs` stays `-0` where `-0 | length` is `0`, in both.
+`succinctly yq` is unchanged: yq's `length` of a number measures its text.
+Pinned by `tests/jq_cli/i7534.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
+
+```console
+$ echo '-100000000000000000001 1E-400 1.50 -0.0' | jq-1.7.1 -c length   # 1e+20 0 1.5 0
+$ echo '-100000000000000000001 1E-400 1.50 -0.0' | jq-1.8.2 -c length   # 100000000000000000001 1E-400 1.50 0.0
+$ echo '-100000000000000000001 1E-400 1.50 -0.0' | sjq      -c length   # 100000000000000000001 1E-400 1.50 0.0
+```
 
 ### A bare trailing decimal point with no exponent (`1.`) reads as the integer (#6052) — divergence closed
 
@@ -13367,6 +13425,28 @@ for `007` and `.5`. yq mode is unmoved: `-p json` goes through the YAML parser a
 every spelling as real yq does, `-p json --slurp`/`--eval-all` and yq's `--argjson` refuse
 the non-finite words at their materializer (that mode has nowhere to put a NaN) and admit a
 leading `+` with the spelling dropped, like the `007`/`.5` they already take.
+
+**A NaN with a payload (`NaN1`, `nan123`, `-sNaN10`) is not a number — follows jq 1.8, not the pinned 1.7.1
+([#7522](https://github.com/rust-works/succinctly/issues/7522)).**
+The paragraphs above describe jq 1.7.1's `decNumberFromString`, which reads `nan` followed by any digits.
+jq 1.8.0 fixed that as a security issue (CVE-2024-53427, "Reject NaN with payload while parsing JSON", jqlang/jq a09a4dfd55e6).
+Its NEWS says the fix "drops support for NaN with payload in JSON (like `NaN123`)" and that `NaN` and `Infinity` are still supported.
+jq 1.8.2 (`jv_number_with_literal`) refuses a NaN, quiet or signalling, signed or not, whose payload is not zero.
+`NaN0`, `NaN000`, `sNaN0` and `-nan00` stay numbers, and so do `nan`, `NaN`, `sNaN` and `-NaN`; `NaN1`, `nan12`, `NaN01`, `sNaN1`, `+NaN1` and `-NaN10` are `Invalid numeric literal`.
+ADR-0018's fork order applies: a security fix is an upstream bug fix, not a language change, so the 1.8.2 behaviour is adopted.
+The rule lives once, in `json::validate::jq_special_number`, so every reader of a JSON number follows it: the primary document (every route, nested and top-level), `--stream`, `--seq`, `-n input`/`inputs`, `--slurp`, `fromjson`, `tonumber`, `--argjson`, `--jsonargs` and `--slurpfile`.
+Each reports as jq 1.8.2 does for any other invalid numeric literal: `jq: parse error: Invalid numeric literal at EOF at line 1, column 4` (exit 5) for a document, `Invalid numeric literal at EOF at line 1, column 4 (while parsing 'NaN1')` for `fromjson`, `jq: invalid JSON text passed to --argjson` (exit 2) for `--argjson`.
+`tonumber` refuses the same strings with this tool's existing wording for an invalid string (`Invalid numeric literal ... (while parsing 'NaN1')`); jq 1.8.2 words that `string ("NaN1") cannot be parsed as a number`, a separate difference that predates #7522.
+```console
+$ printf '[NaN1]' | /usr/bin/jq -c .        # jq 1.7.1
+[null]
+$ printf '[NaN1]' | /opt/homebrew/bin/jq -c .   # jq 1.8.2
+jq: parse error: Invalid numeric literal at line 1, column 6
+$ printf '[NaN1]' | succinctly jq -c .
+jq: parse error: Invalid numeric literal at line 1, column 6
+```
+`succinctly yq` is unchanged: its JSON input goes through the YAML parser, which never read these spellings as numbers.
+The ledger entry `cli:shtest-cve-2023-50268-nan-payload` records the one `succinctly dev compare jq` probe that reads a payload (`Nan4000`), as `newer-than-primary`.
 
 **A parsed NaN compared with itself — closed by
 [#3309](https://github.com/rust-works/succinctly/issues/3309); a container compared with
@@ -13998,10 +14078,10 @@ Pinned per entry by `eval_entry_agrees_with_the_cursor_entry_on_unreadable_value
 reason), and in the CLI by `test_unreadable_value_collection_split_3266`
 (`tests/jq_cli_tests.rs`).
 
-### `foreach`/`reduce`'s INIT-fork re-entry: SOURCE reads `null` after the first fork — matched, no carve-out (#534, #2163, #3895)
+### `foreach`/`reduce`'s INIT-fork re-entry: `reduce`'s SOURCE reads `null` after the first fork, as jq 1.7.1 and 1.8.2 do; `foreach`'s reads the real input, as jq 1.8.2 does (#534, #2163, #3895, #7519)
 
 `foreach`/`reduce` accept a top-level comma in the INIT slot (#534), which forks the whole
-construct once per INIT output, each fork re-running over SOURCE. Real jq has an internal quirk
+construct once per INIT output, each fork re-running over SOURCE. jq 1.7.1 has an internal quirk
 here: every fork after the first evaluates SOURCE against a synthetic `null`, not the real input —
 an artifact of how jq's VM threads the input register across a backtrack boundary (`DUPN` leaves
 `null` in the slot the next fork resumes from), not a designed feature. `.[]` on that `null`
@@ -14017,39 +14097,59 @@ $ echo '{"a":1}' | jq -c '[reduce (.) as $x ((.,.,.); $x)]'
 [{"a":1},null,null]
 ```
 
-This was recorded here as an open policy question from #2163 until #3895, and `succinctly jq` now
-matches it: INIT's first output forks a fold whose SOURCE reads the real input, and every later
-output forks one whose SOURCE reads `null`. The decision followed ADR-0018's order — the output is
+**`foreach` follows jq 1.8.2 (#7519).**
+jq 1.8.0 fixed the quirk for `foreach` as a bug: its NEWS lists "Fix `foreach` not to break init backtracking with `DUPN`" (jqlang/jq#3266, labelled `bug`, commit c70ae1a), with `jq -n '[1, 2] | foreach .[] as $x (0, 1; . + $x)'` printing `1 3 2 4` where 1.7.1 raises `Cannot iterate over null`.
+The fix compiles `foreach` as `DUP; INIT; STOREV; DUP; SOURCE; ...`, so every INIT output's SOURCE reads the fold's own input, in value mode and in a path expression alike.
+Under the latest-jq rule `succinctly jq` adopts it, and the difference from the pinned 1.7.1 is recorded as `newer-than-primary` (the ledger's `syntax:foreach-gen-init`):
+
+```console
+$ echo '{"a":1,"c":2}' | succinctly jq -c '[foreach (.a) as $k ((0,.c); $k)]'    # jq 1.8.2 too; 1.7.1: [1,null]
+[1,1]
+$ echo '{"a":1}' | succinctly jq -c '[path(foreach .a as $k ((0,1); $k))]'       # 1.7.1 raises `... element "a" of null`
+[["a"],["a"]]
+$ echo '{"a":1}' | succinctly jq -c '[foreach (.) as $x ((.,.); ($x.a) = 9)]'    # 1.7.1 raises on the second fork
+[{"a":9},{"a":9}]
+```
+
+A path expression that 1.7.1 answered because its later fork's `null` matched a `null` register now raises, as 1.8.2 raises: `path(foreach (.a) as $k ((0,.c); $k))` on `{"c":null}` was `["a"]`, `["c","a"]`, and is `Invalid path expression near attempt to access element "a" of {"c":null}`, since INIT's `.c` moved the register off the document SOURCE navigates.
+A generated matrix over INIT, input, SOURCE and the fold's wrappers (2- and 3-argument `foreach`, nested folds, `path()`, `limit`/`first`/`isempty`, `label`/`break`, `$__loc__`, destructuring and `?//` patterns; 4,800 rows on each route) found no difference between 1.7.1 and 1.8.2 other than this one: on every row where they differ, 1.8.2's answer is 1.7.1's for `INIT as $i | foreach SOURCE as $x ($i; ...)`, and `succinctly jq` answers as 1.8.2 on every row.
+The other 1.8 change to folds, #3205's state variable kept across an UPDATE with no output, was reverted in 1.8.1 (#3349), so 1.8.2 agrees with 1.7.1 there and so does `succinctly jq`.
+`succinctly yq` follows the same rule for `foreach`, a jq extension there behind `--jq-extensions` (real yq's lexer rejects it, ADR-0018 rule 5).
+Pinned by `tests/jq_cli/i7519.rs`, captured from jq 1.8.2 (`/opt/homebrew/bin/jq`) on both routes.
+
+**`reduce` still matches jq 1.7.1, and jq 1.8.2 agrees** (#3895): the upstream fix "does not address `reduce`, which is less trivial", so INIT's first output forks a fold whose SOURCE reads the real input and every later output forks one whose SOURCE reads `null`, in both jq versions and here. The decision followed ADR-0018's order — the output is
 readable, nothing is corrupted and nothing crashes, so no rule-4 condition lets us refuse the
 reference, and matching it costs nothing (a single-INIT fold, which is nearly every fold, never
 reaches the `null` branch).
 
 How it is built: the shared fork cores (`foreach_forks`/`reduce_forks`, `src/jq/eval.rs`) tell each
-fork's source drive whether it is the first (`SourceInput::Real`) or a later one
-(`SourceInput::Null`), and each caller runs a later fork's *as-written* source against `null`: the
+fork's source drive which input it reads: `reduce_forks` the real one (`SourceInput::Real`) on the
+first fork and `null` (`SourceInput::Null`) on a later one, `foreach_forks` the real one on every
+fork (#7519). Each caller runs a later `reduce` fork's *as-written* source against `null`: the
 `eval.rs` evaluator hands it `StandardJson::Null` (`source_value`), the generic one an owned `null`
 (`drive_source_against_null`, the route's `eval_each_owned`, since it has no `null` of its own value
 type). Nothing is cloned or wrapped, so a single-INIT fold pays nothing and `FoldDirectRetry`'s `?//`
 detection reads the same source tree on every fork. The path-context evaluator's
-`resolve_reduce`/`resolve_foreach` already did this for `path()` and assignment targets (#2388), so
-all three agree. `succinctly yq` shares the cores and so reads `null` there too: real yq has no
-`reduce`/`foreach` (its lexer rejects both), so they are an extension there and follow jq (ADR-0018
-rule 5).
+`resolve_reduce` already did this for `path()` and assignment targets (#2388), and the path-mode
+interpreter's `reduce` does it with `FoldInput`; their `foreach` twins read the document on every fork.
+`succinctly yq` shares the cores; its own `reduce` (`ireduce`) is yq's list fold (#6802), which reads
+the source once.
 
-What it ties together, all captured from `/usr/bin/jq` 1.7.1 and pinned by
+What `reduce`'s rule ties together, all captured from `/usr/bin/jq` 1.7.1 (and unchanged in 1.8.2) and pinned by
 `test_fold_source_runs_against_null_after_first_init_fork_3895` (`tests/jq_cli_tests.rs`, both the
-stdin and the `-n 'input | ...'` route, the demand-driven and the unbounded-stream drive):
+stdin and the `-n 'input | ...'` route, the demand-driven and the unbounded-stream drive), whose `foreach` rows moved to 1.8.2 with #7519:
 
 - **Side effects.** `reduce ((.[]|stderr)?) as $x ((0,1); .)` on `{"a":1}` writes `1` once: the
   second fork's `.[]` raises on `null`, the `?` swallows it before `stderr` runs (#2899 had made
   this write `11`).
-- **A `?//` retry that lets the next fork run** (#3293) — the second fork reads `null`:
-  `[first(foreach (. as [$a] ?// [[$b]] | $a // empty) as $x ((0,100); $x; .))]` on `[[1]]` is
-  `[[1]]`, and a `reduce` whose second fork's source raises is jq's `E2` error. Pinned by
-  `test_fold_second_fork_source_reads_null_after_retry_2163_3293`.
+- **A `?//` retry that lets the next fork run** (#3293) — the second fork reads `null`: a
+  `reduce` whose second fork's source raises is jq's `E2` error. Pinned by
+  `test_fold_second_fork_source_reads_null_after_retry_2163_3293`, whose `foreach` row
+  (`[first(foreach (. as [$a] ?// [[$b]] | $a // empty) as $x ((0,100); $x; .))]` on `[[1]]`) moved
+  to 1.8.2's `[[1],[1]]` with #7519.
 - **Consumers.** `first(...)` stops after the first fork and never reaches the `null` one;
   `limit(2; ...)` and `isempty(...)` reach it exactly as jq does.
-- **A loop variable in path position** (#3329): `$x` is `null` on a later fork, so
+- **A loop variable in path position** (#3329): `$x` is `null` on a later `reduce` fork, so
   `reduce (.) as $x ((.,.); ($x.a) = 9)` answers once and then refuses, as it already did.
 
 A source that does not read `.` (`range(3)`, a literal, `$var`) cannot tell the forks apart and is

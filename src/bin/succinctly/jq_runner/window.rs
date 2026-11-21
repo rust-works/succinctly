@@ -2052,6 +2052,11 @@ impl WindowedFile {
         } else {
             (&*self.file).read_to_end(&mut bytes).err()
         };
+        // #7576: a tail there is no room for is jq's `cannot allocate memory`, not a stream that ends
+        // where the room did.
+        if let Some(error) = &error {
+            super::abort_if_out_of_memory(error);
+        }
         self.eof = true;
         let gate = self
             .seq_gate
@@ -3205,6 +3210,8 @@ impl LineWindows {
             };
             if let Err(error) = read {
                 // patchcov: coverage tolerate reason="untestable: a read that fails after the source opened"
+                // #7576: the rest read whole, with no room for it, is jq's `cannot allocate memory`.
+                super::abort_if_out_of_memory(&error);
                 on_error(&error);
                 // patchcov: coverage end
             }

@@ -463,6 +463,20 @@ fn unary_math_of_document_number<S: EvalSemantics, V: DocumentValue>(
     crate::jq::eval::unary_math_apply::<S>(builtin, n)
 }
 
+/// [`crate::jq::eval::jq_literal_length`] of a document number (#7534): jq 1.8.2's `length` of a
+/// number literal, read as an owned value as [`binary_math_of_document_number`] reads one. `None`
+/// (the double's `numeric_length_owned` below) in yq mode, for a value that is not a valid RFC 8259
+/// number span (a bridge token, a lenient span, a non-number) and for a number with no literal.
+fn jq_literal_length_of_document_number<S: EvalSemantics, V: DocumentValue>(
+    value: &V,
+) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    value.valid_number_text()?;
+    crate::jq::eval::jq_literal_length(to_owned::<S, V>(value).ok()?)
+}
+
 /// `split(SEP)` of a string value, for a literal string `SEP` (#5682): the pieces, read straight
 /// off the value's text. The bridge this stands in for materializes the string, writes it out as
 /// JSON text, indexes that, and has `builtin_split` read it back -- the writing alone cost as much
@@ -20345,10 +20359,12 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
 /// ([`embed_table`]). The entry makes the accumulator's first in-place write copy
 /// once, and a live table reshapes owned navigation, neither of which a fold that
 /// cannot certify a marker should pay -- hence the gate. Only the *first* output:
-/// jq 1.7.1 evaluates SOURCE against `null` on every later fork
+/// jq evaluates a `reduce`'s SOURCE against `null` on every later fork
 /// (`[reduce (.) as $x ((.,.); $x)]` is `[{"a":1},null]`), so a loop variable there is
 /// never the accumulator's own node, and an entry would answer a write through it
-/// that jq refuses.
+/// that jq refuses. A `foreach`'s later forks read the real input since #7519, and the
+/// writes through a loop variable that `tests/jq_cli/i7519.rs` pins on them answer as
+/// jq 1.8.2 does without an entry.
 fn drive_foreach_expr_generic<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     value: &V,
@@ -20396,7 +20412,8 @@ fn drive_foreach_expr_generic<S: EvalSemantics, V: DocumentValue>(
 
 /// A fold's SOURCE drive on the generic evaluator (#3895): the first INIT fork
 /// reads the fold's own input through [`drive_foreach_expr_generic`], every
-/// later one reads `null`, as jq 1.7.1 does. This route has no `null` of its
+/// later `reduce` fork reads `null`, as jq does (a `foreach` fork always reads
+/// the real input, #7519). This route has no `null` of its
 /// own value type to hand `eval_each_generic`, so a later fork runs the
 /// as-written source against an owned `null` instead
 /// ([`crate::jq::eval::drive_source_against_null`]).
@@ -41712,6 +41729,8 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                     Ok(len) => GenericResult::Owned(OwnedValue::Int(len as i64)),
                     Err(err) => GenericResult::Error(err),
                 }
+            } else if let Some(length) = jq_literal_length_of_document_number::<S, V>(&value) {
+                GenericResult::Owned(length)
             } else if let Some(i) = value.as_i64() {
                 // Reached only for a value with no source text of its own
                 // to answer from (`as_str()` above already declined), or a

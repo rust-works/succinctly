@@ -728,6 +728,8 @@ fn read_arg_file(
     file: &std::ffi::OsStr,
 ) -> Result<String, BuildContextError> {
     std::fs::read_to_string(file).map_err(|e| {
+        // #7576: a file there is no room for is jq's `cannot allocate memory`, not one that would not open.
+        abort_if_out_of_memory(&e);
         bad_arg_file(
             flag,
             name,
@@ -4950,7 +4952,11 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     super::stdin_offset::start_run();
     silence_depth_guard_panic_line();
     args.resolve_positional_args();
-    super::stdin_offset::set_run(stdin_items(&args), !args.null_input);
+    super::stdin_offset::set_run(
+        stdin_items(&args),
+        !args.null_input,
+        &get_input_files(&args),
+    );
     // The order only matters between two or more named flags: a command line with fewer builds no clap definition for it.
     // `parse_jq` has already read it off clap's matches (#7260); a `JqCommand` matched inside the whole `Cli` tree
     // (a global flag before `jq`) has not, and scans argv here.
@@ -5221,7 +5227,8 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     // the document parse by mistake (`stream_walk_by_reader_agrees_with_get_inputs_5498`).
     // `program_reads_inputs` is that meaning alone; the lazy route's gate below keeps it, so that
     // a clean `--seq` stream still takes #5674's route.
-    let program_reads_inputs = jq::walk::uses_input_builtins(&expr) || stream_walk_by_reader(&args);
+    // #7571: so does a plain `--stream-errors` walk, whose faults are events like any other.
+    let program_reads_inputs = jq::walk::uses_input_builtins(&expr) || walk_by_stream_reader(&args);
     // #6147: a `--seq` run reads through the queue whatever the program is, so that the reader's
     // faults come out in order with the values, as jq's main loop meets them. A clean stream has
     // no fault to order and is taken off the queue again by #5674's probe.
@@ -7188,6 +7195,8 @@ fn get_filter(args: &JqCommand) -> Result<String, BuildContextError> {
     if let Some(ref path) = args.program_file {
         // Filter comes from file.
         let open_error = |e: std::io::Error| {
+            // #7576: a program file there is no room for is jq's `cannot allocate memory`.
+            abort_if_out_of_memory(&e);
             // jq builds this one as a `jv` string, so the file reads as its U+FFFD text (#7426).
             BuildContextError::Usage(
                 format!(
@@ -7238,13 +7247,12 @@ fn get_input_files(args: &JqCommand) -> Vec<std::path::PathBuf> {
 }
 
 /// What the program reads from standard input, one item at a time, for where a run that stops early
-/// leaves a regular file there (#7455): `None` when it reads named files, or reads standard input
-/// in a way whose offset stays where the read left it (`--slurp`, `--seq`, DSV, `--stream-errors`,
-/// `--validate`).
+/// leaves a regular file there (#7455): `None` when it reads standard input in a way whose offset
+/// stays where the read left it (`--slurp`, `--seq`, DSV, `--stream-errors`, `--validate`). Named
+/// input files are left to [`super::stdin_offset::set_run`], which follows a `-` among them (#7568).
 fn stdin_items(args: &JqCommand) -> Option<super::stdin_offset::Items> {
     use super::stdin_offset::Items;
-    if !get_input_files(args).is_empty()
-        || args.slurp
+    if args.slurp
         || args.input_dsv.is_some()
         || args.validate
         || (!args.raw_input && (args.seq || args.stream_errors))
@@ -8462,8 +8470,8 @@ fn read_inputs(
             InputLocations::new(files.iter().map(|p| Some(input_display_name(p))).collect());
         // #5498: the program reads its inputs through `input`/`inputs` (under `-n`) or the driver
         // loop pops them (a plain walk), and the reader hands them out as they are asked for, so a
-        // stream of events is never held. `--stream-errors` without `-n` keeps its eager read.
-        if track_eof && !args.slurp && (args.null_input || stream_walk_by_reader(args)) {
+        // stream of events is never held. Since #7571 that includes `--stream-errors` without `-n`.
+        if track_eof && !args.slurp && (args.null_input || walk_by_stream_reader(args)) {
             LAZY_STREAM_INPUTS.with(|slot| {
                 *slot.borrow_mut() = Some(LazyStreamInputs {
                     files: raw_bytes.iter().map(|(file, _)| *file).collect(),
@@ -8818,7 +8826,10 @@ fn read_inputs(
         let rest: usize = raw_inputs.iter().skip(1).map(|(_, raw)| raw.len()).sum();
         let mut sources = raw_inputs.iter_mut().map(|(_, raw)| raw);
         let mut combined = sources.next().map(std::mem::take).unwrap_or_default();
-        combined.reserve_exact(rest);
+        // #7576: room for several files' text that cannot be had is jq's `cannot allocate memory`.
+        if combined.try_reserve_exact(rest).is_err() {
+            abort_cannot_allocate(); // patchcov: coverage tolerate-line reason="a run that aborts writes no coverage profile (#7576)"
+        }
         for raw in sources {
             combined.push_str(raw);
         }
@@ -9507,13 +9518,28 @@ fn is_eof_fault_event(value: &OwnedValue) -> bool {
 /// a program with no `-n` and no `-s`, over JSON documents. Under `-n` the program asks for its
 /// inputs itself, and `-s` holds the whole array.
 fn stream_walk_by_reader(args: &JqCommand) -> bool {
-    args.stream
-        && !args.stream_errors
-        && !args.null_input
-        && !args.slurp
-        && args.input_dsv.is_none()
-        && !args.raw_input
-        && !args.seq
+    args.stream && !args.stream_errors && plain_walk_over_json(args)
+}
+
+/// Whether a plain `--stream-errors` walk is read by the stream reader through the input queue
+/// (#7571), as a plain `--stream` walk is ([`stream_walk_by_reader`]): it held every event of the
+/// input as an owned value before the program ran, about 34 times the input (350 MB for 9.7 MB of
+/// NDJSON). Kept apart from [`stream_walk_by_reader`] because a fault is an event here, which the
+/// main loop hands the program, where under `--stream` it prints as a parse error.
+fn stream_errors_walk_by_reader(args: &JqCommand) -> bool {
+    args.stream_errors && plain_walk_over_json(args)
+}
+
+/// Whether either plain walk is read by the stream reader ([`stream_walk_by_reader`],
+/// [`stream_errors_walk_by_reader`]): the gate of the reader's seeding, its reading in chunks, and
+/// the queue the main loop pops.
+fn walk_by_stream_reader(args: &JqCommand) -> bool {
+    stream_walk_by_reader(args) || stream_errors_walk_by_reader(args)
+}
+
+/// The shape both plain stream walks share: no `-n`, no `-s`, JSON documents and not `--seq`.
+fn plain_walk_over_json(args: &JqCommand) -> bool {
+    !args.null_input && !args.slurp && args.input_dsv.is_none() && !args.raw_input && !args.seq
 }
 
 /// The source tag and line an input of the stream reader is placed at: `(source, line)` as the
@@ -9847,7 +9873,14 @@ impl EofTail {
         let mut last_event = None;
         let mut offset = 0;
         loop {
-            let (values, malformed) = split_json_values_strict(&last[offset..]);
+            // #7470: past a fault, only through the first depth refusal.
+            let rest = &last[offset..];
+            let read = if offset > 0 {
+                &rest[..depth_refusal_cut(rest, stream)]
+            } else {
+                rest
+            };
+            let (values, malformed) = split_json_values_strict(read);
             if let Some(&(start, end)) = values.last() {
                 // At `last.len()` for a bare token that the end of input completes.
                 last_event = Some(offset + Self::completes_at(&last[offset..], start, end));
@@ -11341,7 +11374,7 @@ fn stream_read_in_chunks(args: &JqCommand, track_eof: bool) -> bool {
         && !args.slurp
         && track_eof
         && (args.stream || args.stream_errors)
-        && (args.null_input || stream_walk_by_reader(args))
+        && (args.null_input || walk_by_stream_reader(args))
 }
 
 /// The input files that opened, how to open each again for the reader, and what the reader says
@@ -11666,16 +11699,21 @@ fn read_stdin_bytes_unreported() -> (Vec<u8>, bool) {
         return (Vec::new(), true);
     }
     if let Some(bytes) = STDIN_PUSHBACK.with(|slot| slot.borrow_mut().take()) {
-        let failed = STDIN_PUSHBACK_ERROR
-            .with(|slot| slot.borrow_mut().take())
-            .is_some();
-        return (bytes, failed);
+        let error = STDIN_PUSHBACK_ERROR.with(|slot| slot.borrow_mut().take());
+        if let Some(error) = &error {
+            abort_if_out_of_memory(error);
+        }
+        return (bytes, error.is_some());
     }
     let mut buf = Vec::new();
     // What `read_to_end` appended before a failure stays in `buf`.
     // #7455: read by a reader that counts what it took, for where the run leaves the descriptor.
-    let failed = super::stdin_offset::Stdin.read_to_end(&mut buf).is_err();
-    (buf, failed)
+    let read = super::stdin_offset::Stdin.read_to_end(&mut buf);
+    // #7576: room that could not be had is jq's `cannot allocate memory`, not an input that ends early.
+    if let Err(error) = &read {
+        abort_if_out_of_memory(error);
+    }
+    (buf, read.is_err())
 }
 
 /// Whether an input file argument is `-`, which jq reads as standard input (#6023).
@@ -11733,7 +11771,38 @@ fn input_display_name(path: &Path) -> String {
 /// rather than letting it escape as `Error: .../Caused by:` at exit 1
 /// (#3098).
 fn read_file_bytes(path: &Path, last: bool) -> std::result::Result<Vec<u8>, InputFileOpenError> {
-    std::fs::read(path).map_err(|e| InputFileOpenError::from_io(path, &e, last))
+    std::fs::read(path).map_err(|e| {
+        abort_if_out_of_memory(&e);
+        InputFileOpenError::from_io(path, &e, last)
+    })
+}
+
+/// jq's answer to an allocation that fails: `jv_mem_alloc`'s `memory_exhausted` prints `jq: error:
+/// cannot allocate memory` and calls `abort()`, which a shell reports as exit 134 (src/jv_alloc.c at
+/// jq-1.7.1 and jq-1.8.2). Captured from jq 1.7.1 under a `ulimit -v` smaller than an input it reads
+/// whole (`-s`, `-R -s`, `--slurpfile`, `--rawfile`, `-f`, standard input) (#7576).
+///
+/// An input read whole is read before anything runs, so there is no output to lose. The rest of a
+/// stream read whole after its windows (a `--seq` tail, text that is not UTF-8) can fail after output
+/// was written: what the output buffer holds is lost then, as jq's `abort()` loses what its `stdout`
+/// buffer holds.
+pub(super) fn abort_cannot_allocate() -> ! {
+    // patchcov: coverage tolerate reason="a run that aborts writes no coverage profile (#7576)"
+    use std::io::Write;
+    let _ = std::io::stderr().write_all(b"jq: error: cannot allocate memory\n");
+    std::process::abort()
+    // patchcov: coverage end
+}
+
+/// [`abort_cannot_allocate`] when `error` is an allocation that failed (`std::fs::read` reserves a
+/// file's length at once, and `read_to_end` each step it grows by, with `try_reserve`) (#7576). That
+/// failure used to read as a file that would not open (`Could not open file ...: out of memory`), or as
+/// standard input ending early, and the run went on over the input as if it were empty or short:
+/// `-s length` printed `0`.
+pub(super) fn abort_if_out_of_memory(error: &std::io::Error) {
+    if error.kind() == std::io::ErrorKind::OutOfMemory {
+        abort_cannot_allocate(); // patchcov: coverage tolerate-line reason="a run that aborts writes no coverage profile (#7576)"
+    }
 }
 
 /// Blanks what jq's number parser never reads of a number token with a NUL byte in it, in each
@@ -12356,7 +12425,7 @@ fn gated_seq_source(files: Vec<PathBuf>) -> Option<WindowedSource> {
         _ => return None, // patchcov: coverage tolerate-line reason="unreachable: several files go to stopping_seq_files_at before this is asked (#7341)"
     };
     // A file the whole-file route could not hold (a sparse file of terabytes) is that route's to report,
-    // as it reads it before it runs anything (`Could not open file ...: out of memory`): read here, the
+    // as it reads it before it runs anything (`jq: error: cannot allocate memory`, #7576): read here, the
     // records before the bad one would be run first.
     let start = file.stream_position().ok()?;
     let left = file.metadata().ok()?.len().saturating_sub(start);
@@ -13620,6 +13689,24 @@ fn meet_fault(
     (detected, line, resume)
 }
 
+/// How many bytes of `text`, which jq's parser reads on into from a fault, a loop that resumes
+/// past faults has to split and parse (#7470): through the bracket jq refuses for its depth limit,
+/// when that is the first fault the parser meets in `text`, or all of it. `--stream` (`stream`)
+/// has no depth limit, so all of it there.
+///
+/// jq stops on that bracket and drops the rest of its read, so nothing after it changes the values
+/// before it or the fault. But a container that deep closes only near the end of the text, and the
+/// splitter, the index and the validators each walked it whole, once per read the loop resumed at:
+/// a deeply nested document's refusal was quadratic in its depth. The cut ends inside the refused
+/// container and leaves it unclosed, so the splitter stops at its start, where over the whole text
+/// the refused span starts, with the same values before it.
+fn depth_refusal_cut(text: &[u8], stream: bool) -> usize {
+    if stream {
+        return text.len();
+    }
+    jq::jq_stream_depth_fault_offset(text).map_or(text.len(), |at| at + 1)
+}
+
 /// The line jq's parser stands on when it meets the fault that ends `raw`'s clean prefix of
 /// `parsed` values, or `None` when the splitter finds no fault there (#5555).
 fn slurp_fault_at(raw: &str, seam: Seam, parsed: usize, stream: bool) -> Option<usize> {
@@ -13992,7 +14079,14 @@ fn open_tail_start(raw: &[u8], resumes: bool, seam: Seam, stream: bool) -> Optio
     let mut offset = 0;
     loop {
         let split = if resumes {
-            split_json_values_strict(&raw[offset..])
+            // #7470: past a fault, only through the first depth refusal.
+            let rest = &raw[offset..];
+            let read = if offset > 0 {
+                &rest[..depth_refusal_cut(rest, stream)]
+            } else {
+                rest
+            };
+            split_json_values_strict(read)
         } else {
             split_json_values(&raw[offset..])
         };
@@ -14192,7 +14286,13 @@ fn read_json_tail(
     // from one file to the next.
     let mut file_end: Option<(usize, usize)> = None;
     loop {
-        let segment = &raw[offset..];
+        let mut segment = &raw[offset..];
+        // #7470: past a fault, only through the first depth refusal. The parse below names the
+        // fault with jq's parser model over these same bytes, which a `lossy` text does not hold
+        // (the model reads the bytes jq read), so that one is read whole.
+        if parser_at.is_some() && cx.lossy.is_none() {
+            segment = &segment[..depth_refusal_cut(segment.as_bytes(), cx.stream)];
+        }
         let seg_pos = (!cx.stream).then(|| {
             parser_at.unwrap_or_else(|| {
                 advance_source(cx.file_start, raw.as_bytes(), cx.lossy, 0..offset)
@@ -14985,6 +15085,11 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
     match reader.read_to_end(&mut bytes) {
         Ok(_) => Ok(LoneStart::Read(bytes)),
         // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
+        // #7576: the rest of standard input, read whole, is jq's `cannot allocate memory` when it
+        // does not fit, not a stream that ended where the room did.
+        Err(error) if from_stdin && error.kind() == std::io::ErrorKind::OutOfMemory => {
+            abort_cannot_allocate()
+        }
         Err(_) if from_stdin => {
             note_stdin_read_failed();
             Ok(LoneStart::Read(bytes))
@@ -17468,7 +17573,15 @@ fn slurp_documents(
     unopened_tail: bool,
 ) -> core::result::Result<SlurpedInput, SlurpFailure> {
     let last = raw_inputs.len().saturating_sub(1);
-    let mut combined = Vec::with_capacity(raw_inputs.iter().map(Vec::len).sum::<usize>() + 2);
+    // #7576: the join is a second copy of the input; when there is no room for it, the answer is jq's
+    // to an allocation that fails, as for the read before it.
+    let mut combined = Vec::new();
+    if combined
+        .try_reserve_exact(raw_inputs.iter().map(Vec::len).sum::<usize>() + 2)
+        .is_err()
+    {
+        abort_cannot_allocate(); // patchcov: coverage tolerate-line reason="a run that aborts writes no coverage profile (#7576)"
+    }
     let mut eof_line = 0;
     combined.push(b'[');
     let mut wrote_value = false;
@@ -25650,11 +25763,22 @@ mod tests {
                 vec!["jq", "--stream", "--input-dsv", ",", "inputs", &clean],
                 false,
             ),
-            (vec!["jq", "--stream-errors", "inputs", &clean], false),
+            // #7571: a plain `--stream-errors` walk is read by the reader too.
+            (vec!["jq", "--stream-errors", "inputs", &clean], true),
+            (vec!["jq", "--stream-errors", "-s", "inputs", &clean], false),
+            (
+                vec!["jq", "--stream-errors", "--seq", "inputs", &clean],
+                false,
+            ),
             (vec!["jq", "inputs", &clean], false),
         ] {
             let cmd = JqCommand::try_parse_from(argv.iter().copied()).unwrap();
-            assert_eq!(stream_walk_by_reader(&cmd), by_reader, "{argv:?}");
+            assert_eq!(walk_by_stream_reader(&cmd), by_reader, "{argv:?}");
+            assert_eq!(
+                stream_walk_by_reader(&cmd),
+                by_reader && !cmd.stream_errors,
+                "{argv:?}"
+            );
             let (inputs, _, _, _, lazy) = read(&argv);
             let stream = LAZY_STREAM_INPUTS.with(|slot| slot.borrow_mut().take());
             assert_eq!(
@@ -29681,7 +29805,7 @@ mod tests {
             ("nan", false),
             ("[NaN]", false),
             ("[-nan]", false),
-            ("[sNaN12]", false),
+            ("[sNaN0]", false),
             ("[nAn]", false),
             ("[Infinity]", false),
             ("[infinity]", false),

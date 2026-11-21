@@ -2502,6 +2502,11 @@ impl<'e> Interp<'e> {
 
     /// `gen_foreach`: as `reduce`, but `EXTRACT` runs straight after each
     /// `UPDATE` output, on that output and at the register `UPDATE` left.
+    /// Every `INIT` output's `SOURCE` sees the input, not only the first's
+    /// (#7519): jq 1.8 compiles `foreach` as `DUP; INIT; STOREV; DUP; SOURCE;
+    /// ...` (jqlang/jq#3266, a fix of the `DUPN` that [`FoldInput`] models for
+    /// `reduce`), so `{"a":1} | [path(foreach .a as $i ((1,2); $i))]` is
+    /// `[["a"],["a"]]` in jq 1.8.2, where jq 1.7.1 raises on the second fork.
     #[allow(clippy::too_many_arguments)]
     fn foreach(
         &self,
@@ -2515,10 +2520,9 @@ impl<'e> Interp<'e> {
         reg: Reg,
         sink: &mut Sink<'_>,
     ) -> R {
-        let fold_input = FoldInput::new(input.clone());
-        self.eval(init, env, input, reg, &mut |initial, reg_init| {
+        self.eval(init, env, input.clone(), reg, &mut |initial, reg_init| {
             let state = RefCell::new(initial);
-            self.eval(source, env, fold_input.take(), reg_init, &mut |s, reg_s| {
+            self.eval(source, env, input.clone(), reg_init, &mut |s, reg_s| {
                 self.destructure(patterns, s, env, reg_s, &mut |env_p, reg_p| {
                     let current = state.replace(OwnedValue::Null);
                     self.eval(update, &env_p, current, reg_p, &mut |u, reg_u| {
@@ -4097,11 +4101,12 @@ fn is_label_payload(error: &EvalError, id: u64) -> bool {
             .is_some_and(|n| n == id as f64)
 }
 
-/// The fold's input as `DUPN` leaves it: `gen_reduce`/`gen_foreach` start
-/// each loop with `DUPN`, which *moves* the input out of a stack slot that
-/// `INIT`'s fork point shares, so every `INIT` output after the first runs
-/// `SOURCE` on `null` (`{"a":1} | [reduce .a as $i ((1,2); [$i,.])]` is
-/// `[[1,1],[null,2]]` in jq 1.7.1, which value mode already reproduces).
+/// The fold's input as `DUPN` leaves it: `gen_reduce` starts each loop with
+/// `DUPN`, which *moves* the input out of a stack slot that `INIT`'s fork
+/// point shares, so every `INIT` output after the first runs `SOURCE` on
+/// `null` (`{"a":1} | [reduce .a as $i ((1,2); [$i,.])]` is `[[1,1],[null,2]]`
+/// in jq 1.7.1 and 1.8.2, which value mode already reproduces). `gen_foreach`
+/// did the same in jq 1.7.1; jq 1.8 dropped its `DUPN` (jqlang/jq#3266, #7519).
 struct FoldInput(RefCell<Option<OwnedValue>>);
 
 impl FoldInput {
