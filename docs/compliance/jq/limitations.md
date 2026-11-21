@@ -13189,6 +13189,28 @@ every spelling as real yq does, `-p json --slurp`/`--eval-all` and yq's `--argjs
 the non-finite words at their materializer (that mode has nowhere to put a NaN) and admit a
 leading `+` with the spelling dropped, like the `007`/`.5` they already take.
 
+**A NaN with a payload (`NaN1`, `nan123`, `-sNaN10`) is not a number — follows jq 1.8, not the pinned 1.7.1
+([#7522](https://github.com/rust-works/succinctly/issues/7522)).**
+The paragraphs above describe jq 1.7.1's `decNumberFromString`, which reads `nan` followed by any digits.
+jq 1.8.0 fixed that as a security issue (CVE-2024-53427, "Reject NaN with payload while parsing JSON", jqlang/jq a09a4dfd55e6).
+Its NEWS says the fix "drops support for NaN with payload in JSON (like `NaN123`)" and that `NaN` and `Infinity` are still supported.
+jq 1.8.2 (`jv_number_with_literal`) refuses a NaN, quiet or signalling, signed or not, whose payload is not zero.
+`NaN0`, `NaN000`, `sNaN0` and `-nan00` stay numbers, and so do `nan`, `NaN`, `sNaN` and `-NaN`; `NaN1`, `nan12`, `NaN01`, `sNaN1`, `+NaN1` and `-NaN10` are `Invalid numeric literal`.
+ADR-0018's fork order applies: a security fix is an upstream bug fix, not a language change, so the 1.8.2 behaviour is adopted.
+The rule lives once, in `json::validate::jq_special_number`, so every reader of a JSON number follows it: the primary document (every route, nested and top-level), `--stream`, `--seq`, `-n input`/`inputs`, `--slurp`, `fromjson`, `tonumber`, `--argjson`, `--jsonargs` and `--slurpfile`.
+Each reports as jq 1.8.2 does for any other invalid numeric literal: `jq: parse error: Invalid numeric literal at EOF at line 1, column 4` (exit 5) for a document, `Invalid numeric literal at EOF at line 1, column 4 (while parsing 'NaN1')` for `fromjson`, `jq: invalid JSON text passed to --argjson` (exit 2) for `--argjson`.
+`tonumber` refuses the same strings with this tool's existing wording for an invalid string (`Invalid numeric literal ... (while parsing 'NaN1')`); jq 1.8.2 words that `string ("NaN1") cannot be parsed as a number`, a separate difference that predates #7522.
+```console
+$ printf '[NaN1]' | /usr/bin/jq -c .        # jq 1.7.1
+[null]
+$ printf '[NaN1]' | /opt/homebrew/bin/jq -c .   # jq 1.8.2
+jq: parse error: Invalid numeric literal at line 1, column 6
+$ printf '[NaN1]' | succinctly jq -c .
+jq: parse error: Invalid numeric literal at line 1, column 6
+```
+`succinctly yq` is unchanged: its JSON input goes through the YAML parser, which never read these spellings as numbers.
+The ledger entry `cli:shtest-cve-2023-50268-nan-payload` records the one `succinctly dev compare jq` probe that reads a payload (`Nan4000`), as `newer-than-primary`.
+
 **A parsed NaN compared with itself — closed by
 [#3309](https://github.com/rust-works/succinctly/issues/3309); a container compared with
 itself — closed by [#3069](https://github.com/rust-works/succinctly/issues/3069), except two

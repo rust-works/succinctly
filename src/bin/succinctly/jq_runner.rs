@@ -29039,7 +29039,7 @@ mod tests {
             ("nan", false),
             ("[NaN]", false),
             ("[-nan]", false),
-            ("[sNaN12]", false),
+            ("[sNaN0]", false),
             ("[nAn]", false),
             ("[Infinity]", false),
             ("[infinity]", false),

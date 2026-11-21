@@ -75,23 +75,18 @@ struct Parser {
 }
 
 /// jq's decNumber reader: an optionally signed decimal with an optional exponent, or
-/// `inf`/`infinity`/`nan`/`snan` in any case (`nan` and `snan` with an optional payload).
+/// `inf`/`infinity`/`nan`/`snan` in any case (`nan` and `snan` with a zero payload only: jq 1.8
+/// refuses a payload, #7522).
 fn is_number_token(token: &[u8]) -> bool {
+    // The word grammar is one definition (#2877, #7522): the readers and this message must agree.
+    if crate::json::validate::jq_special_number(token).is_some() {
+        return true;
+    }
     let body = match token.first() {
         Some(b'+' | b'-') => &token[1..],
         _ => token,
     };
     let lower: Vec<u8> = body.iter().map(u8::to_ascii_lowercase).collect();
-    if lower == b"inf" || lower == b"infinity" {
-        return true;
-    }
-    for word in [&b"snan"[..], b"nan"] {
-        if let Some(payload) = lower.strip_prefix(word) {
-            if payload.iter().all(u8::is_ascii_digit) {
-                return true;
-            }
-        }
-    }
     let digits = |from: usize| {
         lower[from..]
             .iter()

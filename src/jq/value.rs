@@ -9495,7 +9495,7 @@ mod tests {
         // Real jq number spellings read identically on both routes, except
         // that a cursor read of a NaN spelling is a parse instance (#3309),
         // the same NaN once collapsed.
-        for text in ["nan", "sNaN12"] {
+        for text in ["nan", "sNaN0"] {
             let read = read_as_bridge_text::<JqSemantics>(text);
             assert!(
                 matches!(&read, OwnedValue::NumberLiteral(NumberRepr::Float(f), t) if f.is_nan() && &**t == "null"),
@@ -9775,7 +9775,7 @@ mod tests {
     #[test]
     fn test_from_number_bytes_reads_decnumber_specials_and_leading_plus_2877() {
         for word in [
-            "nan", "NaN", "-nan", "+nan", "nan1", "sNaN", "SNAN12", "-sNaN",
+            "nan", "NaN", "-nan", "+nan", "nan0", "sNaN", "SNAN0", "-sNaN",
         ] {
             assert!(
                 matches!(OwnedValue::from_number_bytes::<JqSemantics>(word.as_bytes()), OwnedValue::Float(f) if f.is_nan()),
@@ -9896,7 +9896,7 @@ mod tests {
             "NaN",
             "-nan",
             "+nan",
-            "sNaN12",
+            "sNaN0",
             "inf",
             "-Infinity",
             "+inf",
