@@ -12,6 +12,8 @@
 //! first value's output, then the error, exit 5) and the builtin's order row over a finite
 //! cartesian product (`[B((a1, a2); (b1, b2))]`, which pins jq's per-builtin nesting order).
 //! Every expected value is jq 1.7.1's (`/usr/bin/jq -nc`, `TZ=UTC`); jq 1.8.2 prints the same.
+//! The libm rows were also checked against jq 1.7.1 on glibc (Linux x86_64): `yn`/`jn` differ there
+//! in the last digit, so their rows print `. * 1e6 | round` of the answer.
 
 use std::fs;
 use std::process::{Command, Stdio};
@@ -1020,86 +1022,86 @@ const CASES: &[(&str, &str, i32)] = &[
         0,
     ),
     (
-        r"null | first(yn(repeat(1); 3))",
-        r"0.3246744247918
+        r"null | first(yn(repeat(1); 3)) | . * 1e6 | round",
+        r"324674
 ",
         0,
     ),
     (
-        r"null | [limit(2; yn(repeat(1, 2); 3))]",
-        r"[0.3246744247918,-0.1604003934849237]
+        r"null | [limit(2; yn(repeat(1, 2); 3))] | map(. * 1e6 | round)",
+        r"[324674,-160400]
 ",
         0,
     ),
     (
-        r#"null | yn((1, error("E"), 2); 3)"#,
-        r"0.3246744247918
+        r#"null | yn((1, error("E"), 2); 3) | . * 1e6 | round"#,
+        r"324674
 ",
         5,
     ),
     (
-        r"null | first(yn(1; repeat(3)))",
-        r"0.3246744247918
+        r"null | first(yn(1; repeat(3))) | . * 1e6 | round",
+        r"324674
 ",
         0,
     ),
     (
-        r"null | [limit(2; yn(1; repeat(3, 4)))]",
-        r"[0.3246744247918,0.3979257105571001]
+        r"null | [limit(2; yn(1; repeat(3, 4)))] | map(. * 1e6 | round)",
+        r"[324674,397926]
 ",
         0,
     ),
     (
-        r#"null | yn(1; (3, error("E"), 4))"#,
-        r"0.3246744247918
+        r#"null | yn(1; (3, error("E"), 4)) | . * 1e6 | round"#,
+        r"324674
 ",
         5,
     ),
     (
-        r"null | [yn((1, 2); (3, 4))]",
-        r"[0.3246744247918,-0.1604003934849237,0.3979257105571001,0.21590359460361502]
+        r"null | [yn((1, 2); (3, 4))] | map(. * 1e6 | round)",
+        r"[324674,-160400,397926,215904]
 ",
         0,
     ),
     (
-        r"null | first(jn(repeat(1); 3))",
-        r"0.3390589585259364
+        r"null | first(jn(repeat(1); 3)) | . * 1e6 | round",
+        r"339059
 ",
         0,
     ),
     (
-        r"null | [limit(2; jn(repeat(1, 2); 3))]",
-        r"[0.3390589585259364,0.4860912605858911]
+        r"null | [limit(2; jn(repeat(1, 2); 3))] | map(. * 1e6 | round)",
+        r"[339059,486091]
 ",
         0,
     ),
     (
-        r#"null | jn((1, error("E"), 2); 3)"#,
-        r"0.3390589585259364
+        r#"null | jn((1, error("E"), 2); 3) | . * 1e6 | round"#,
+        r"339059
 ",
         5,
     ),
     (
-        r"null | first(jn(1; repeat(3)))",
-        r"0.3390589585259364
+        r"null | first(jn(1; repeat(3))) | . * 1e6 | round",
+        r"339059
 ",
         0,
     ),
     (
-        r"null | [limit(2; jn(1; repeat(3, 4)))]",
-        r"[0.3390589585259364,-0.06604332802354915]
+        r"null | [limit(2; jn(1; repeat(3, 4)))] | map(. * 1e6 | round)",
+        r"[339059,-66043]
 ",
         0,
     ),
     (
-        r#"null | jn(1; (3, error("E"), 4))"#,
-        r"0.3390589585259364
+        r#"null | jn(1; (3, error("E"), 4)) | . * 1e6 | round"#,
+        r"339059
 ",
         5,
     ),
     (
-        r"null | [jn((1, 2); (3, 4))]",
-        r"[0.3390589585259364,0.4860912605858911,-0.06604332802354915,0.3641281458520728]
+        r"null | [jn((1, 2); (3, 4))] | map(. * 1e6 | round)",
+        r"[339059,486091,-66043,364128]
 ",
         0,
     ),
