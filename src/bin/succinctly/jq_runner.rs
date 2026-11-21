@@ -4879,7 +4879,11 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     super::stdin_offset::start_run();
     silence_depth_guard_panic_line();
     args.resolve_positional_args();
-    super::stdin_offset::set_run(stdin_items(&args), !args.null_input, &get_input_files(&args));
+    super::stdin_offset::set_run(
+        stdin_items(&args),
+        !args.null_input,
+        &get_input_files(&args),
+    );
     // The order only matters between two or more named flags: a command line with fewer builds no clap definition for it.
     // `parse_jq` has already read it off clap's matches (#7260); a `JqCommand` matched inside the whole `Cli` tree
     // (a global flag before `jq`) has not, and scans argv here.
