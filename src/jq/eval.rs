@@ -18801,7 +18801,21 @@ fn arith_sub<S: EvalSemantics>(
 /// made that premise false (binary `-`/`+`/`*` already round past `2^53`),
 /// leaving unary minus as the one holdout still keeping exact fidelity
 /// here. See `docs/compliance/jq/limitations.md`'s removed "#2357" entry.
+///
+/// **A literal operand stays a literal in jq mode (#7453):** jq 1.8's
+/// `jv_number_negate` negates a literal's decimal (jqlang/jq#3242, fixing
+/// jqlang/jq#2704), so `-(1.500)`, `1.500 | -.` and `-$x` on a literal keep
+/// every digit, compare exactly, and a zero negates to positive zero
+/// ([`crate::jq::value::jq_negated_literal`]). The rules above are for a
+/// computed number.
 pub(crate) fn arith_negate<S: EvalSemantics>(operand: OwnedValue) -> Result<OwnedValue, EvalError> {
+    if S::TAG != EvalTag::Yq {
+        if let OwnedValue::NumberLiteral(repr, text) = &operand {
+            if let Some((repr, text)) = crate::jq::value::jq_negated_literal(*repr, text) {
+                return Ok(OwnedValue::NumberLiteral(repr, text.into()));
+            }
+        }
+    }
     match signed_plain_number::<S>(operand) {
         OwnedValue::Int(0) if S::TAG != EvalTag::Yq => Ok(OwnedValue::Float(-0.0)),
         OwnedValue::Int(n) => Ok(if S::OVERFLOW_WRAPS {
@@ -138934,8 +138948,10 @@ mod tests {
     /// double-only model can't represent either way).
     #[test]
     fn test_1035_negative_float_literal_collapses_fidelity_like_jq() {
-        assert_eq!(outputs(b"null", "-1.500"), ["-1.5"]);
-        assert_eq!(outputs(b"null", "-1e2"), ["-100"]);
+        // #7453: jq 1.8 keeps a negated literal's spelling (jqlang/jq#3242);
+        // jq 1.7.1 printed `-1.5` and `-100`.
+        assert_eq!(outputs(b"null", "-1.500"), ["-1.500"]);
+        assert_eq!(outputs(b"null", "-1e2"), ["-1E+2"]);
         // A negative integer literal is unaffected -- still one token, no
         // spelling to lose.
         assert_eq!(outputs(b"null", "-123"), ["-123"]);
@@ -138948,9 +138964,11 @@ mod tests {
     /// fix's `Mul(-1, _)` rewrite printed plain `0` for all three of these.
     #[test]
     fn test_1035_negative_zero_literal_keeps_its_sign() {
-        assert_eq!(outputs(b"null", "-0.0"), ["-0"]);
-        assert_eq!(outputs(b"null", "-0e0"), ["-0"]);
-        assert_eq!(outputs(b"null", "[-0.0]"), ["[-0]"]);
+        // #7453: jq 1.8's `decNumberMinus` negates a zero literal to positive
+        // zero, spelling kept; jq 1.7.1 printed `-0` for all three.
+        assert_eq!(outputs(b"null", "-0.0"), ["0.0"]);
+        assert_eq!(outputs(b"null", "-0e0"), ["0"]);
+        assert_eq!(outputs(b"null", "[-0.0]"), ["[0.0]"]);
     }
 
     /// #1035: a number spelling jq's filter grammar accepts but RFC 8259
@@ -139218,15 +139236,15 @@ mod tests {
             assert_eq!(outputs(b"0", filter), ["0"], "{filter}");
         }
 
-        // A `-0` literal is negative even though `number_repr` reads it as
-        // `Int(0)`: `(-0) * -1` is `+0`, and `0 * -0` / `(-0) * 1` are `-0`.
-        // Without the sign check the `-0` rows regress `(-0) * -1`.
+        // A program's `-0` is the literal `0` in jq 1.8 (#7453), so these
+        // are products of a positive zero: jq 1.8.2's answers. The document
+        // `-0` rows below keep the sign check's coverage.
         for (filter, want) in [
-            ("(-0) * -1", "0"),
-            ("(-0) * 1", "-0"),
-            ("0 * (-0)", "-0"),
+            ("(-0) * -1", "-0"),
+            ("(-0) * 1", "0"),
+            ("0 * (-0)", "0"),
             ("(-0) * (-0)", "0"),
-            ("(-0) * 0", "-0"),
+            ("(-0) * 0", "0"),
         ] {
             assert_eq!(outputs(b"0", filter), [want], "{filter}");
         }
@@ -139252,30 +139270,34 @@ mod tests {
     /// to `intmax_t` there, so a `-0` operand never reaches its result
     /// (`(-0) % 5` is `0`). Rows captured live against jq 1.7.1.
     #[test]
+    ///
+    /// #7453: a program's `-0` is the literal `0` in jq 1.8 (`decNumberMinus`
+    /// of zero), so the rows with a program `-0` operand are jq 1.8.2's
+    /// answers; a document `-0` keeps its sign as before.
     fn test_arithmetic_negative_zero_operand_sign_3442() {
         for (filter, want) in [
             // `+`: negative only when both operands are.
-            ("(-0) + (-0)", "-0"),
-            ("(-0) + (-0.0)", "-0"),
-            ("(-0.0) + (-0)", "-0"),
+            ("(-0) + (-0)", "0"),
+            ("(-0) + (-0.0)", "0"),
+            ("(-0.0) + (-0)", "0"),
             ("(-0) + 0", "0"),
             ("0 + (-0)", "0"),
             // `-`: `-0 - 0` stays negative, `-0.0 - -0` cancels to positive.
-            ("(-0) - 0", "-0"),
-            ("(-0) - 0.0", "-0"),
+            ("(-0) - 0", "0"),
+            ("(-0) - 0.0", "0"),
             ("(-0.0) - (-0)", "0"),
             ("0 - (-0)", "0"),
             ("(-0) - (-0)", "0"),
             // `/`: the quotient's sign is the XOR of the operands'.
-            ("(-0) / 1", "-0"),
-            ("(-0) / 2", "-0"),
-            ("(-0) / -1", "0"),
-            ("(-0) / -5", "0"),
+            ("(-0) / 1", "0"),
+            ("(-0) / 2", "0"),
+            ("(-0) / -1", "-0"),
+            ("(-0) / -5", "-0"),
             ("0 / -1", "-0"),
             // Unary minus flips a `-0` literal back to `0`.
             ("-(-0)", "0"),
-            ("-(-0.0)", "0"),
-            ("-(0)", "-0"),
+            ("-(-0.0)", "0.0"),
+            ("-(0)", "0"),
             // `%` never sees the sign.
             ("(-0) % 5", "0"),
         ] {
@@ -139283,15 +139305,15 @@ mod tests {
         }
         // The same literal arriving as a document number.
         assert_eq!(outputs(b"-0", ". - 0"), ["-0"]);
-        assert_eq!(outputs(b"-0", ". + (-0)"), ["-0"]);
+        assert_eq!(outputs(b"-0", ". + (-0)"), ["0"]);
         assert_eq!(outputs(b"-0", ". + 0"), ["0"]);
         assert_eq!(outputs(b"-0", ". / 5"), ["-0"]);
         assert_eq!(outputs(b"-0", ". / -1"), ["0"]);
         assert_eq!(outputs(b"-0", "-."), ["0"]);
         // Spellings other than `-0`, and operands past 2^53 (which now go
         // through the float path instead of `jq_checked_int_arith`).
-        assert_eq!(outputs(b"null", "(-0e0) + (-0.0)"), ["-0"]);
-        assert_eq!(outputs(b"null", "(-0e0) - 0"), ["-0"]);
+        assert_eq!(outputs(b"null", "(-0e0) + (-0.0)"), ["0"]);
+        assert_eq!(outputs(b"null", "(-0e0) - 0"), ["0"]);
         assert_eq!(
             outputs(b"null", "(-0) + 9007199254740993"),
             ["9007199254740992"]
@@ -139309,13 +139331,10 @@ mod tests {
             ["869389897822472000"]
         );
         // Accumulator and assignment paths reach the same arithmetic.
-        assert_eq!(
-            outputs(b"null", "reduce range(2) as $x (-0; . - 0)"),
-            ["-0"]
-        );
+        assert_eq!(outputs(b"null", "reduce range(2) as $x (-0; . - 0)"), ["0"]);
         assert_eq!(outputs(b"null", "reduce range(2) as $x (-0; . + 0)"), ["0"]);
         assert_eq!(outputs(br#"{"a":-0}"#, ".a -= 0"), [r#"{"a":-0}"#]);
-        assert_eq!(outputs(br#"{"a":-0}"#, ".a += -0"), [r#"{"a":-0}"#]);
+        assert_eq!(outputs(br#"{"a":-0}"#, ".a += -0"), [r#"{"a":0}"#]);
         assert_eq!(outputs(br#"{"a":-0}"#, ".a /= 1"), [r#"{"a":-0}"#]);
         assert_eq!(outputs(br#"{"a":-0,"b":0}"#, ".a - .b"), ["-0"]);
         assert_eq!(outputs(br#"{"a":-0,"b":-0}"#, ".a + .b"), ["-0"]);
@@ -139332,6 +139351,20 @@ mod tests {
     /// YAML document number from the CLI).
     #[test]
     fn test_arithmetic_negative_zero_operand_yq_stays_zero_3442() {
+        // Parsed in yq mode, which keeps the literal `-0` (the jq parser
+        // folds it to `0`, #7453).
+        let outputs_yq = |json: &[u8], filter: &str| -> Vec<String> {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let expr =
+                crate::jq::parser::parse_with_mode(filter, crate::jq::parser::ParserMode::Yq)
+                    .unwrap();
+            eval_full::<Vec<u64>, YqSemantics>(&expr, cursor)
+                .collect_owned::<YqSemantics>()
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect()
+        };
         assert_eq!(outputs_yq(b"null", "(-0) - 0"), ["0"]);
         assert_eq!(outputs_yq(b"null", "(-0) + (-0)"), ["0"]);
         assert_eq!(outputs_yq(b"null", "(-0) * 1"), ["0"]);
@@ -141126,29 +141159,13 @@ mod tests {
     /// below for why that was reverted). Confirmed live against jq 1.7.1.
     #[test]
     fn test_unary_minus_zero_preserves_sign_1056() {
-        query!(br#"{"a":0.0}"#, "-.a",
-            QueryResult::Owned(OwnedValue::Float(f)) => {
-                assert_eq!(f, 0.0);
-                assert!(f.is_sign_negative());
-            }
-        );
-
+        // A computed zero negates to `-0`, as in real jq.
         query!(br"null", "-(1.0-1.0)",
             QueryResult::Owned(OwnedValue::Float(f)) => {
                 assert_eq!(f, 0.0);
                 assert!(f.is_sign_negative());
             }
         );
-
-        // Negating a positive-signed float zero still gives negative zero
-        // (not a no-op) -- same as real jq.
-        query!(br"null", "-(0.0)",
-            QueryResult::Owned(OwnedValue::Float(f)) => {
-                assert_eq!(f, 0.0);
-                assert!(f.is_sign_negative());
-            }
-        );
-
         // The all-integer case: -(1-1) promotes Int(0) to Float(-0.0).
         query!(br"null", "-(1-1)",
             QueryResult::Owned(OwnedValue::Float(f)) => {
@@ -141156,32 +141173,22 @@ mod tests {
                 assert!(f.is_sign_negative());
             }
         );
-
-        // Sanity: ordinary (non-zero) negation is unaffected.
-        query!(br#"{"a":5.5}"#, "-.a",
-            QueryResult::Owned(OwnedValue::Float(f)) => {
-                assert_eq!(f, -5.5);
-            }
-        );
-        query!(br#"{"a":5}"#, "-.a",
-            QueryResult::Owned(OwnedValue::Int(n)) => {
-                assert_eq!(n, -5);
-            }
-        );
-
+        // #7453: a literal operand (a document number, a program literal)
+        // stays a literal, as jq 1.8 negates it (jqlang/jq#3242), and a zero
+        // literal negates to positive zero (`decNumberMinus`). Every row is
+        // jq 1.8.2's answer.
+        for (input, filter, want) in [
+            (r#"{"a":0.0}"#, "-.a", "0.0"),
+            ("null", "-(0.0)", "0.0"),
+            (r#"{"a":5.5}"#, "-.a", "-5.5"),
+            (r#"{"a":5}"#, "-.a", "-5"),
+            ("null", "-(-9223372036854775808)", "9223372036854775808"),
+        ] {
+            assert_eq!(outputs(input.as_bytes(), filter), [want], "{filter}");
+        }
         // Sanity: a generator operand still fans out to one negated result
-        // per output (the dummy `left` in `ArithOp::Negate`'s rewrite must
-        // not collapse this to a single value).
+        // per output.
         assert_eq!(outputs(b"null", "-(1,2,3)"), ["-1", "-2", "-3"]);
-
-        // i64::MIN overflows i64 negation (matching arith_sub's own
-        // 0 - i64::MIN overflow handling): falls back to Float, same
-        // (including precision loss) as real jq's own uniform-double model.
-        query!(br"null", "-(-9223372036854775808)",
-            QueryResult::Owned(OwnedValue::Float(f)) => {
-                assert_eq!(f, 9223372036854775808.0);
-            }
-        );
     }
 
     /// #1056 review: the `Int(0) -> Float(-0.0)` promotion above is jq-mode
@@ -165846,15 +165853,20 @@ mod tests {
     /// being recomputed through `f64`.
     #[test]
     fn test_abs() {
-        query!(b"-5", "abs", QueryResult::Owned(OwnedValue::Int(5)) => {});
+        // #7453: `abs` is `-.` on a negative, and jq 1.8 negates a literal
+        // to a literal (jqlang/jq#3242).
+        query!(b"-5", "abs", QueryResult::Owned(OwnedValue::NumberLiteral(NumberRepr::Int(5), text)) => {
+            assert_eq!(text.as_ref(), "5");
+        });
         // Positive: passed through unchanged, keeping its literal wrapper
         // (as every non-negated number literal does in this codebase),
         // not collapsed to a bare `Int` the way the negated case is.
         query!(b"5", "abs", QueryResult::Owned(OwnedValue::NumberLiteral(NumberRepr::Int(5), text)) => {
             assert_eq!(text.as_ref(), "5");
         });
-        query!(b"-7.25", "abs", QueryResult::Owned(OwnedValue::Float(n)) => {
+        query!(b"-7.25", "abs", QueryResult::Owned(OwnedValue::NumberLiteral(NumberRepr::Float(n), text)) => {
             assert!((n - 7.25).abs() < f64::EPSILON);
+            assert_eq!(text.as_ref(), "7.25");
         });
         // A computed value pins the correct result end to end too, though
         // (confirmed live) it still reaches `builtin_abs` re-baked as a
@@ -166452,25 +166464,11 @@ mod tests {
 
     #[test]
     fn test_range_negative_zero_from_keeps_its_own_spelling_3103() {
-        // `-0` is the one integer spelling that diverges from its own
-        // canonical `i64` print -- confirmed live against `/usr/bin/jq`
-        // 1.7.1: `[range(-0;3)]` is `[-0,1,2]`, not `[0,1,2]`. `PartialEq`
-        // can't distinguish `NumberLiteral(Int(0), "-0")` from `Int(0)` (see
-        // `range_from_literal_override`'s own doc comment), so this checks
-        // the exact variant and its source text, not just `assert_eq!`.
-        query!(b"null", "[range(-0; 3)]",
-            QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert_eq!(arr.len(), 3);
-                match &arr[0] {
-                    OwnedValue::NumberLiteral(NumberRepr::Int(0), text) => {
-                        assert_eq!(text.as_ref(), "-0");
-                    }
-                    other => panic!("expected NumberLiteral(Int(0), \"-0\"), got {other:?}"),
-                }
-                assert_eq!(arr[1], OwnedValue::Int(1));
-                assert_eq!(arr[2], OwnedValue::Int(2));
-            }
-        );
+        // jq 1.7.1 printed `[range(-0;3)]` as `[-0,1,2]`; jq 1.8 negates the
+        // literal `0` to `0` (#7453), so the program's `-0` is a plain zero.
+        // A document `-0` still keeps its spelling as `range`'s first value.
+        assert_eq!(outputs(b"null", "[range(-0; 3)]"), ["[0,1,2]"]);
+        assert_eq!(outputs(b"-0", "[range(.; 3)]"), ["[-0,1,2]"]);
     }
 
     #[test]
@@ -167983,15 +167981,12 @@ mod tests {
                 assert_eq!(v.to_json(), r#"[{"start":1.5,"end":3.5}]"#);
             }
         );
-        // #1088's negation rule applies identically to a slice bound: the
-        // parser's own `-1 * <literal>` split destroys jq's literal
-        // spelling before the slice is ever built, so the bound becomes a
-        // computed double -- which happens to *render* bare when whole
-        // (jq's own convention for a computed value, not evidence the key
-        // was dropped; `-3.5:-1.5` below, non-whole, keeps its `.5`).
+        // #7453: jq 1.8 keeps a negated literal's spelling (jqlang/jq#3242),
+        // so a negative whole-valued bound keeps its `.0` like a positive
+        // one (jq 1.7.1 printed `-3` and `-1`).
         query!(br"[1,2,3,4,5]", r"path(.[-3.0:-1.0])",
             QueryResult::Owned(v) => {
-                assert_eq!(v.to_json(), r#"[{"start":-3,"end":-1}]"#);
+                assert_eq!(v.to_json(), r#"[{"start":-3.0,"end":-1.0}]"#);
             }
         );
         query!(br"[1,2,3,4,5]", r"path(.[-3.5:-1.5])",

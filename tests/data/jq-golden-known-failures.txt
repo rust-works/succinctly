@@ -209,3 +209,12 @@
 # shape it caught stays caught. See
 # tests/data/jq-path-context-sweep-known-divergences.txt for the sweep's own
 # class-level manifest.
+#
+# #7453: the owner chose jq 1.8.2's negation of a number literal (jqlang/jq#3242, fixing
+# jqlang/jq#2704): a negated literal stays a literal and a negated zero is `0`. These goldens
+# hold jq 1.7.1's answers, so the rows a program's `-0` or a negated literal reaches differ:
+# `cbrt`/`frexp`/`modf`/`significand`/`copysign`/`fmod` of `-0`, `floor` of `-0`, and the
+# spelling of a negated index. Each differing value is jq 1.8.2's (docs/compliance/jq/limitations.md).
+math_libm_family  newer_than_primary  a program `-0` is the literal `0` in jq 1.8, so the `-0` rows answer `0` (jq 1.8.2) where jq 1.7.1 answers `-0` — #7453
+math_operand_widening_2937  newer_than_primary  `floor_family_neg_zero`'s program `-0` is the literal `0` in jq 1.8, so it floors to `0` (jq 1.8.2) — #7453
+path_float_index_negated  newer_than_primary  a negated literal keeps its spelling in jq 1.8: `path(.[-1.0])` is `[-1.0]`, `path(.[-1e10])` `[-1E+10]`, `path(.[-0.0])` `[0.0]` (jq 1.8.2) — #7453

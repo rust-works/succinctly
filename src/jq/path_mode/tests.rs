@@ -1339,22 +1339,43 @@ fn owned_interpreter_matches_the_sval_reference_5223() {
     });
 }
 
-/// A negative number is `_negate` of a literal, so it is computed and compares
-/// by value, including the spellings the parser folds itself (`-01`, `-00`,
-/// `-01.5`): each row is `[0]` in jq 1.7.1.
+/// A negative number is `_negate` of a literal, which jq 1.8 answers with a
+/// fresh literal (#7453, jqlang/jq#3242): identical to nothing else, so a path
+/// expression ending in one is refused, however it is spelled. A zero negates
+/// to positive zero. Each row is jq 1.8.2's answer (jq 1.7.1 answered `[0]`
+/// for the first five and kept `-0`'s sign in the last three).
 #[test]
-fn a_negative_number_is_computed_however_spelled_5223() {
+fn a_negative_number_is_a_fresh_literal_however_spelled_7453() {
     on_big_stack(|| {
         check(&[
-            ("null", "[-01] | path(.[0] | -01)", ok(&["[0]"])),
-            ("null", "[-1.5e0] | path(.[0] | -01.5)", ok(&["[0]"])),
-            ("null", "[-1] | path(.[0] | -1)", ok(&["[0]"])),
-            ("null", "[-00] | path(.[0] | -00)", ok(&["[0]"])),
-            ("null", "[-0] | path(.[0] | -0)", ok(&["[0]"])),
-            // The sign survives where path mode takes the number as its register value (#6042).
-            ("null", "-0 | del(empty)", ok(&["-0"])),
-            ("null", "[-0 | try path(error) catch .]", ok(&["[-0]"])),
-            ("null", "[-00 | try pick(error) catch .]", ok(&["[-0]"])),
+            (
+                "null",
+                "[-01] | path(.[0] | -01)",
+                err(&[], "Invalid path expression with result -1"),
+            ),
+            (
+                "null",
+                "[-1.5e0] | path(.[0] | -01.5)",
+                err(&[], "Invalid path expression with result -1.5"),
+            ),
+            (
+                "null",
+                "[-1] | path(.[0] | -1)",
+                err(&[], "Invalid path expression with result -1"),
+            ),
+            (
+                "null",
+                "[-00] | path(.[0] | -00)",
+                err(&[], "Invalid path expression with result 0"),
+            ),
+            (
+                "null",
+                "[-0] | path(.[0] | -0)",
+                err(&[], "Invalid path expression with result 0"),
+            ),
+            ("null", "-0 | del(empty)", ok(&["0"])),
+            ("null", "[-0 | try path(error) catch .]", ok(&["[0]"])),
+            ("null", "[-00 | try pick(error) catch .]", ok(&["[0]"])),
         ]);
     });
 }
