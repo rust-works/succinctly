@@ -37,6 +37,20 @@ pub(crate) fn leading_bom_len(bytes: &[u8]) -> usize {
     }
 }
 
+/// The length of `bytes` when they are the start of a UTF-8 byte-order mark and no more of it
+/// (`EF` or `EF BB`), or 0 for anything else (#7454).
+///
+/// jq's parser keeps its place in the mark between buffers, so a stream that ends inside the mark
+/// has no text and no fault: it is empty input (`printf '\357' | jq .` prints nothing, exit 0). A
+/// mark that breaks off before the end is `Malformed BOM`, which this is not.
+pub(crate) fn truncated_bom_len(bytes: &[u8]) -> usize {
+    if !bytes.is_empty() && bytes.len() < UTF8_BOM.len() && UTF8_BOM.starts_with(bytes) {
+        bytes.len()
+    } else {
+        0
+    }
+}
+
 /// Split `input` into its YAML front matter and trailing body, as yq v4.53.3 does (#6910).
 ///
 /// A first line that is `---` (blanks and a `\r` around it ignored, and a leading UTF-8 BOM
@@ -131,6 +145,22 @@ impl<'a> Iterator for LineScanner<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncated_bom_len_is_the_whole_of_a_mark_that_stops_short_7454() {
+        assert_eq!(truncated_bom_len(b"\xEF"), 1);
+        assert_eq!(truncated_bom_len(b"\xEF\xBB"), 2);
+        for other in [
+            &b""[..],
+            b"\xEF\xBB\xBF",
+            b"\xEF\xBF",
+            b"\xBB",
+            b"\xEF\n",
+            b"{",
+        ] {
+            assert_eq!(truncated_bom_len(other), 0, "{other:?}");
+        }
+    }
 
     /// (input, front matter text, body) as yq v4.53.3 splits them (#6910): the front matter is the text
     /// before the closing line and keeps its opening `---`, the body starts with the closing line.
