@@ -10804,18 +10804,10 @@ fn first_yield_past_failure(raws: &[Vec<u8>], first_failure: usize) -> Option<Yi
     {
         return None;
     }
-    let first = raws.iter().position(|raw| !raw.is_empty());
-    let sources: Vec<(Option<usize>, Vec<u8>)> = raws
-        .iter()
+    let sources: Vec<(Option<usize>, Vec<u8>)> = past_stream_bom(raws)
+        .into_iter()
         .enumerate()
-        .map(|(at, raw)| {
-            let bom = if Some(at) == first {
-                crate::cli::front_matter::leading_bom_len(raw)
-            } else {
-                0
-            };
-            (Some(at), raw[bom..].to_vec())
-        })
+        .map(|(at, text)| (Some(at), text.to_vec()))
         .collect();
     let mut reader = crate::cli::jq_stream_errors::Reader::new(&sources[..]);
     while let Some(yielded) = reader.next_yielded() {
@@ -10992,12 +10984,10 @@ fn first_value_completes_at(raws: &[Vec<u8>], at: usize, args: &JqCommand) -> bo
             };
             return completes && first_stream_fault(&raws[at..=at]).is_none();
         }
-        // jq skips a byte-order mark at the front of its input: of the first file with bytes.
-        let bom = if raws[..at].iter().all(Vec::is_empty) {
-            crate::cli::front_matter::leading_bom_len(raw)
-        } else {
-            0
-        };
+        // jq skips a byte-order mark at the front of its input, which the first files with bytes
+        // may share (#7566).
+        let cuts = crate::cli::front_matter::stream_bom_cuts(raws.iter().map(Vec::as_slice));
+        let bom = crate::cli::front_matter::bom_cut_at(&cuts, at);
         crate::cli::jq_stream_errors::first_event_completes_in(&raw[bom..])
     } else {
         first_value_completes_in(&raws[at], args)
@@ -11012,17 +11002,14 @@ fn first_value_completes_at(raws: &[Vec<u8>], at: usize, args: &JqCommand) -> bo
 fn first_event_completing_file(raws: &[Vec<u8>]) -> Option<usize> {
     let limit = crate::cli::jq_stream_errors::FIRST_EVENT_PREFIX_LIMIT;
     let mut text: Vec<u8> = Vec::new();
+    // jq skips a byte-order mark at the front of its input, which the first files with bytes may
+    // share (#7566).
+    let texts = past_stream_bom(raws);
     let files = raws.iter().enumerate().filter(|(_, raw)| !raw.is_empty());
-    for (position, (at, raw)) in files.enumerate() {
-        // jq skips a byte-order mark at the front of its input: of the first file with bytes.
-        let bom = if position == 0 {
-            crate::cli::front_matter::leading_bom_len(raw)
-        } else {
-            0
-        };
+    for (at, _) in files {
         // Never more than the prefix a first event is read in: a longer one is not worth the copy.
         let room = limit - text.len();
-        let bytes = &raw[bom..];
+        let bytes = texts[at];
         text.extend_from_slice(&bytes[..bytes.len().min(room)]);
         if crate::cli::jq_stream_errors::first_event_completes_in(&text) {
             return Some(at);
@@ -11066,18 +11053,10 @@ fn text_ends_in_string(raws: &[Vec<u8>]) -> bool {
 
 /// The file jq's parser is reading when it meets the first fault of the text the files `raws`
 /// make, and whether that fault is at the end of the text, or `None` when it reads every value
-/// ([`jq::jq_stream_fault_chunk`]). jq skips the byte-order mark at the front of its input: of the
-/// first file with bytes.
+/// ([`jq::jq_stream_fault_chunk`]). jq skips the byte-order mark at the front of its input, which the
+/// first files with bytes may share (#7566).
 fn first_stream_fault(raws: &[Vec<u8>]) -> Option<(usize, bool)> {
-    let first = raws.iter().position(|raw| !raw.is_empty());
-    let chunks = raws.iter().enumerate().map(|(at, raw)| {
-        if Some(at) == first {
-            &raw[crate::cli::front_matter::leading_bom_len(raw)..]
-        } else {
-            raw.as_slice()
-        }
-    });
-    jq::jq_stream_fault_chunk(chunks)
+    jq::jq_stream_fault_chunk(past_stream_bom(raws))
 }
 
 /// Reports the pending open failures a read has reached (#6475): the ones before the source it
@@ -11449,9 +11428,10 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
     let mut opened = Vec::with_capacity(files.len());
     let mut openers: Vec<crate::cli::jq_stream_errors::Opener> =
         Vec::with_capacity(files.len().max(1));
-    let mut look_for_bom = true;
-    // #7454: set while the first source with bytes is the start of the BOM and no later one has any.
-    let mut truncated_bom: Option<std::rc::Rc<std::cell::Cell<bool>>> = None;
+    // Each source's head and the cell its opener reads its cut of the BOM from, set once every
+    // source is probed: the mark may be cut across the first sources with bytes (#7566), and a
+    // stream that ends inside it is empty input (#7454).
+    let mut fronts: Vec<(Vec<u8>, std::rc::Rc<std::cell::Cell<usize>>)> = Vec::new();
     if files.is_empty() {
         let pushed_back = STDIN_PUSHBACK.with(|slot| slot.borrow_mut().take());
         let mut stdin =
@@ -11466,11 +11446,10 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
                 Vec::new()
             })
         };
-        let mut skip = bom_to_skip(&head, &mut look_for_bom);
-        // #7454: all there is of the stream is the start of the mark.
-        if skip == 0 && crate::cli::front_matter::truncated_bom_len(&head) > 0 {
-            skip = head.len();
-        }
+        let skip = crate::cli::front_matter::bom_cut_at(
+            &crate::cli::front_matter::stream_bom_cuts([head.as_slice()]),
+            0,
+        );
         openers.push(Box::new(move || {
             let rest = std::io::Cursor::new(head[skip..].to_vec()).chain(stdin);
             Ok(Box::new(std::io::BufReader::with_capacity(64 * 1024, rest)))
@@ -11485,15 +11464,13 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
         if is_stdin_dash(path) {
             // `-` is standard input: the first one holds it all (kept whole), a later one is empty.
             let first = !std::mem::replace(&mut dash_seen, true);
-            let (mut bytes, failed) = if first {
+            let (bytes, failed) = if first {
                 dash_stdin_read()
             } else {
                 (Vec::new(), false)
             };
-            let first = look_for_bom && !bytes.is_empty();
-            let skip = bom_to_skip(&bytes[..bytes.len().min(3)], &mut look_for_bom);
-            bytes.drain(..skip);
-            let only_the_mark = truncated_bom_head(&bytes, first, skip, &mut truncated_bom);
+            let skip = std::rc::Rc::new(std::cell::Cell::new(0));
+            fronts.push((bytes[..bytes.len().min(3)].to_vec(), skip.clone()));
             opened.push(path.clone());
             openers.push(report_unopened_before(
                 std::mem::take(&mut unopened),
@@ -11502,9 +11479,8 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
                     if failed {
                         note_stdin_read_failed();
                     }
-                    if only_the_mark.is_some_and(|flag| flag.get()) {
-                        bytes.clear();
-                    }
+                    let mut bytes = bytes;
+                    bytes.drain(..skip.get());
                     Ok(Box::new(std::io::Cursor::new(bytes)))
                 }),
             ));
@@ -11525,20 +11501,15 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
             .map_err(|e| InputFileOpenError::from_io(path, &e, at + 1 == files.len()));
         match probed {
             Ok((head, kept)) => {
-                let first = look_for_bom && !head.is_empty();
-                let skip = bom_to_skip(&head, &mut look_for_bom);
-                let only_the_mark = truncated_bom_head(&head, first, skip, &mut truncated_bom);
+                let cut = std::rc::Rc::new(std::cell::Cell::new(0));
+                fronts.push((head.clone(), cut.clone()));
                 let path = path.clone();
                 opened.push(path.clone());
                 openers.push(report_unopened_before(
                     std::mem::take(&mut unopened),
                     Box::new(move || {
                         use std::io::Seek;
-                        let skip = if only_the_mark.is_some_and(|flag| flag.get()) {
-                            head.len()
-                        } else {
-                            skip
-                        };
+                        let skip = cut.get();
                         if let Some(file) = kept {
                             let front = std::io::Cursor::new(head[skip..].to_vec());
                             let rest: Box<dyn std::io::Read> = match file {
@@ -11601,6 +11572,10 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
     let tail_is_source = unopened
         .last()
         .is_some_and(|failure| !failure.is_directory());
+    let cuts = crate::cli::front_matter::stream_bom_cuts(fronts.iter().map(|(head, _)| &head[..]));
+    for (at, (_, cut)) in fronts.iter().enumerate() {
+        cut.set(crate::cli::front_matter::bom_cut_at(&cuts, at));
+    }
     // #6531: and `input_filename` names it from there on, once `get_inputs` hands it to the
     // locations.
     if let Some(failure) = unopened.last().filter(|_| tail_is_source) {
@@ -11655,43 +11630,6 @@ fn read_head(reader: &mut impl std::io::Read) -> std::io::Result<Vec<u8>> {
         }
     }
     Ok(head)
-}
-
-/// How many bytes of a source that starts with `head` are the BOM jq skips: the first source that
-/// has bytes may start with one (`look_for_bom`, cleared once a source has any).
-fn bom_to_skip(head: &[u8], look_for_bom: &mut bool) -> usize {
-    if !*look_for_bom || head.is_empty() {
-        return 0;
-    }
-    *look_for_bom = false;
-    crate::cli::front_matter::leading_bom_len(head)
-}
-
-/// Whether the first source with bytes holds nothing but the start of the BOM (`EF` or `EF BB`),
-/// and so is empty input unless a later source goes on from it (#7454): jq's parser keeps its place
-/// in the mark across a refill and accepts the end of the stream inside it.
-///
-/// `first` says `head` is the head of the first source that has bytes; the answer is a flag the
-/// source's opener reads once every source is probed, and a later source with bytes clears it
-/// (`note_later_bytes`), as that source makes the mark `Malformed BOM` instead.
-fn truncated_bom_head(
-    head: &[u8],
-    first: bool,
-    skip: usize,
-    pending: &mut Option<std::rc::Rc<std::cell::Cell<bool>>>,
-) -> Option<std::rc::Rc<std::cell::Cell<bool>>> {
-    if first {
-        if skip == 0 && crate::cli::front_matter::truncated_bom_len(head) > 0 {
-            let flag = std::rc::Rc::new(std::cell::Cell::new(true));
-            *pending = Some(flag.clone());
-            return Some(flag);
-        }
-    } else if !head.is_empty() {
-        if let Some(flag) = pending {
-            flag.set(false);
-        }
-    }
-    None
 }
 
 /// A read of standard input failed, or it cannot be read at all (`jq . 0>>file`, `jq . 0<&-`,
@@ -11837,25 +11775,29 @@ pub(super) fn abort_if_out_of_memory(error: &std::io::Error) {
 /// stream (#4305), so only the very start of the stream is skipped: a BOM at
 /// the front of a later file is a byte in the middle of a value there, and
 /// stays one. An empty file contributes no bytes, so the BOM may sit at the
-/// front of the first file that has any.
+/// front of the first file that has any, and the mark itself may be cut across
+/// the first files with bytes (#7566): jq's parser matches it a byte at a time.
+/// A stream that ends inside the mark is empty input, not a fault (#7454).
 ///
 /// `-R` and `--seq` never come through here: raw input is never parsed, and
 /// the `--seq` reader accounts for the BOM itself (`bom_prefix`), including
 /// the malformed forms.
 fn strip_leading_json_bom<'a>(raws: impl Iterator<Item = &'a mut Vec<u8>>) {
-    let mut raws = raws.into_iter().filter(|raw| !raw.is_empty());
-    if let Some(first) = raws.next() {
-        let bom_len = crate::cli::front_matter::leading_bom_len(first);
-        // A stream that ends inside the mark is empty input, not a fault (#7454): the mark's
-        // first bytes are all there is, and no later file goes on from them.
-        if bom_len == 0
-            && crate::cli::front_matter::truncated_bom_len(first) > 0
-            && raws.next().is_none()
-        {
-            first.clear();
-        }
-        first.drain(..bom_len);
+    let raws: Vec<&mut Vec<u8>> = raws.collect();
+    let cuts = crate::cli::front_matter::stream_bom_cuts(raws.iter().map(|raw| raw.as_slice()));
+    for (raw, cut) in raws.into_iter().zip(cuts) {
+        raw.drain(..cut);
     }
+}
+
+/// Each of `raws` past the cut [`crate::cli::front_matter::stream_bom_cuts`] gives it: the text
+/// jq's parser reads of each file of a stream that starts with a BOM (#5291, #7566).
+fn past_stream_bom(raws: &[Vec<u8>]) -> Vec<&[u8]> {
+    let cuts = crate::cli::front_matter::stream_bom_cuts(raws.iter().map(Vec::as_slice));
+    raws.iter()
+        .enumerate()
+        .map(|(at, raw)| &raw[crate::cli::front_matter::bom_cut_at(&cuts, at)..])
+        .collect()
 }
 
 /// A main input file [`read_file_bytes`] couldn't open (#3098).
@@ -12488,6 +12430,38 @@ fn windowed_source(args: &JqCommand, min: u64) -> Option<WindowedSource> {
     ))
 }
 
+/// Whether the first of `sources` with a byte holds only the start of the BOM (`EF` or `EF BB`), which
+/// the sources after it go on with or end (#7566). One definition for the windowed route's refusal
+/// ([`bom_cut_across_files`]) and the tests that compare that route with the one that reads the files
+/// whole.
+#[cfg(any(unix, test))]
+fn first_with_bytes_is_a_cut_bom(sources: impl IntoIterator<Item = impl AsRef<[u8]>>) -> bool {
+    sources
+        .into_iter()
+        .find(|source| !source.as_ref().is_empty())
+        .is_some_and(|first| crate::cli::front_matter::truncated_bom_len(first.as_ref()) > 0)
+}
+
+/// Whether the list `files` opens with a mark cut across files ([`first_with_bytes_is_a_cut_bom`]).
+/// The windows skip a mark at the front of the first file with bytes alone, so such a list is left to
+/// the route that reads the files whole, which joins the mark across them ([`strip_leading_json_bom`]).
+/// A file that will not open or read here is left to that route too.
+#[cfg(unix)]
+fn bom_cut_across_files(files: &[PathBuf]) -> bool {
+    let mut unreadable = false;
+    let heads = files.iter().map(|path| {
+        std::fs::File::open(path)
+            .and_then(|mut file| read_head(&mut file))
+            .unwrap_or_else(|_| {
+                // patchcov: coverage tolerate reason="untestable: a file judged readable a moment ago that fails to read"
+                unreadable = true;
+                Vec::new()
+                // patchcov: coverage end
+            })
+    });
+    first_with_bytes_is_a_cut_bom(heads) || unreadable
+}
+
 /// How many files the several-files route holds open: each is kept by the second read that words a
 /// fault, which reads them all again, and a process has only so many descriptors. A process's descriptor
 /// table starts at 64 slots and doubling it waits for an RCU grace period (35 ms on the 7950X's Linux, for
@@ -12512,6 +12486,9 @@ fn windowed_regular_files(
         judge_regular_files(files, window::min_windowed_file_bytes(), |path, _, _| {
             named.push(std::rc::Rc::new(window::NamedFile::new(path.clone())));
         })?;
+        if bom_cut_across_files(files) {
+            return None;
+        }
         return Some((
             window::WindowedFiles::named(&named, window::window_bytes()),
             std::rc::Rc::new(window::Reread::new_named(&named)),
@@ -12521,6 +12498,9 @@ fn windowed_regular_files(
     judge_regular_files(files, window::min_windowed_file_bytes(), |_, file, meta| {
         opened.push((std::rc::Rc::new(file), meta.len()));
     })?;
+    if bom_cut_across_files(files) {
+        return None;
+    }
     let reread = window::Reread::new_many(&opened);
     Some((
         window::WindowedFiles::new(opened, window::window_bytes()),
@@ -14655,6 +14635,8 @@ fn windowed_file_start(
         let mut head = Vec::with_capacity(3);
         (&*file).take(3).read_to_end(&mut head).ok()?;
         *before_first_byte = head.is_empty();
+        // A file that is only the start of the mark, which the files after it go on with (#7566), is
+        // not UTF-8 on its own, so the check below leaves the list to the route that joins it.
         crate::cli::front_matter::leading_bom_len(&head) as u64
     } else {
         0
@@ -17470,28 +17452,25 @@ fn slurp_fault(
 /// that was not slurped names.
 fn reread_stream_fault(files: &[PathBuf]) -> Option<String> {
     let mut unreadable = false;
-    let mut at_front = true;
-    let chunks = files.iter().map_while(|path| {
-        match if is_stdin_dash(path) {
+    // The bytes as read, not as substituted: jq's parser counts those (#5964).
+    let mut raws = files.iter().map_while(|path| {
+        let raw = if is_stdin_dash(path) {
             None
         } else {
             read_again(path)
-        } {
-            Some(mut raw) => {
-                // The bytes as read, not as substituted: jq's parser counts those (#5964).
-                if at_front && !raw.is_empty() {
-                    at_front = false;
-                    raw.drain(..crate::cli::front_matter::leading_bom_len(&raw));
-                }
-                Some(raw)
-            }
-            None => {
-                unreadable = true;
-                None
-            }
-        }
+        };
+        unreadable |= raw.is_none();
+        raw
     });
-    let fault = jq::jq_stream_fault(chunks, 1, 0);
+    // The mark at the front may be cut across the first files with bytes (#7566): the files that
+    // hold the stream's first three bytes settle it.
+    let mut front: Vec<Vec<u8>> = Vec::new();
+    while front.iter().map(Vec::len).sum::<usize>() < crate::cli::front_matter::UTF8_BOM.len() {
+        let Some(raw) = raws.next() else { break };
+        front.push(raw);
+    }
+    strip_leading_json_bom(front.iter_mut());
+    let fault = jq::jq_stream_fault(front.into_iter().chain(raws), 1, 0);
     (!unreadable).then_some(fault).flatten()
 }
 
