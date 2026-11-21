@@ -3744,6 +3744,26 @@ impl<'a> Parser<'a> {
         self.parse_path_step_name().map(PathStep::Field)
     }
 
+    /// The quoted step after a `.`, if one is at the cursor: a string (see [`Self::parse_path_step`])
+    /// or, in jq mode, a format-prefixed one (#7456). jq's `String` production is `FORMAT
+    /// QQSTRING_START ...` as well as `QQSTRING_START ...`, so `.@base64 "x"` is `.["x"]` (a format
+    /// never runs on a string with no interpolation) and `.@base64 "\(1)"` is `.["MQ=="]`.
+    /// `None`, with the cursor where it was, for anything else, so the caller reads a field name or
+    /// reports the stray `@`. Out of line: both callers are on the recursive descent's spine.
+    #[inline(never)]
+    fn parse_quoted_path_step(&mut self) -> Result<Option<PathStep>, ParseError> {
+        match self.peek() {
+            Some('"') => self.parse_path_step().map(Some),
+            // `try_parse_interpolated_key` declines in yq mode, whose lexer rejects a format
+            // followed by a string (#3316), and leaves the cursor alone before anything else.
+            Some('@') => Ok(self.try_parse_interpolated_key()?.map(|key| match key {
+                Expr::Literal(Literal::String(name)) => PathStep::Field(name.into_string()),
+                computed => PathStep::Computed(computed),
+            })),
+            _ => Ok(None),
+        }
+    }
+
     /// The quoted name of a dotted path step, `."key"`, in yq mode (#4916; jq mode goes through
     /// [`Self::parse_path_step`]). yq reads the text between the quotes **raw**, escapes included, up
     /// to the next `"`: `.x."a\tb"` selects the key `a\tb` (a backslash and a `t`), where `.x["a\tb"]`
@@ -5671,16 +5691,15 @@ impl<'a> Parser<'a> {
                     return Ok(Expr::Identity);
                 }
 
-                // Check for quoted field access `."key"`
-                let mut expr = if self.peek() == Some('"') {
-                    match self.parse_path_step()? {
-                        PathStep::Field(name) => self.field_or_wildcard(name),
-                        PathStep::Computed(key) => Expr::index_by(Expr::Identity, key),
+                // Check for quoted field access `."key"` (or `.@fmt "key"`, #7456)
+                let mut expr = match self.parse_quoted_path_step()? {
+                    Some(PathStep::Field(name)) => self.field_or_wildcard(name),
+                    Some(PathStep::Computed(key)) => Expr::index_by(Expr::Identity, key),
+                    None => {
+                        // Field access `.foo`
+                        let name = self.parse_field_ident()?;
+                        self.field_or_wildcard(name)
                     }
-                } else {
-                    // Field access `.foo`
-                    let name = self.parse_field_ident()?;
-                    self.field_or_wildcard(name)
                 };
 
                 // yq lexes a `?` after a space or newline as an error, not a
@@ -7058,6 +7077,29 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// An object pattern's string key, if one is at the cursor: jq's `String ':' Pattern`, a plain
+    /// or interpolated string, or in jq mode a format-prefixed one (`{@base64 "c": $c}`, #7456).
+    /// A string with no interpolation is a literal key (the format never runs on it); one with
+    /// `\(...)` is a computed key. `None`, with the cursor where it was, for anything else.
+    #[inline(never)]
+    fn parse_pattern_string_key(&mut self) -> Result<Option<ObjectKey>, ParseError> {
+        let key = match self.peek() {
+            Some('"') => self.parse_string_or_interpolation()?,
+            Some('@') => match self.try_parse_interpolated_key()? {
+                Some(key) => key,
+                None => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        Ok(Some(match key {
+            Expr::Literal(Literal::String(s)) => ObjectKey::Literal(s.into_string()),
+            interpolated => {
+                self.count_pattern_computed_key()?;
+                ObjectKey::Expr(Box::new(interpolated))
+            }
+        }))
+    }
+
     /// The real `parse_pattern` body, entered only through the depth-checked
     /// wrapper above -- every recursive call goes back through
     /// `self.parse_pattern()`, not this function, so the depth counter sees
@@ -7192,16 +7234,8 @@ impl<'a> Parser<'a> {
                                 }
                             }
                             ObjectKey::Expr(Box::new(key_expr))
-                        } else if self.peek() == Some('"') {
-                            match self.parse_string_or_interpolation()? {
-                                Expr::Literal(Literal::String(s)) => {
-                                    ObjectKey::Literal(s.into_string())
-                                }
-                                interpolated => {
-                                    self.count_pattern_computed_key()?;
-                                    ObjectKey::Expr(Box::new(interpolated))
-                                }
-                            }
+                        } else if let Some(key) = self.parse_pattern_string_key()? {
+                            key
                         } else {
                             ObjectKey::Literal(self.parse_qualified_ident()?)
                         };
@@ -10947,23 +10981,20 @@ impl<'a> Parser<'a> {
                         }
                         push_bracket(&mut chain, bracket);
                     } else {
-                        let name = if self.peek() == Some('"') {
-                            match self.parse_path_step()? {
-                                PathStep::Field(name) => name,
-                                PathStep::Computed(key) => {
-                                    // `.a."b\(0)"` is `.a | .["b\(0)"]` with the key read from the
-                                    // chain's input, as a bracket's is (#6053).
-                                    self.skip_ws();
-                                    let optional = self.at_postfix_question();
-                                    if optional {
-                                        self.next();
-                                    }
-                                    push_bracket(&mut chain, Bracket::Dynamic { key, optional });
-                                    continue;
+                        let name = match self.parse_quoted_path_step()? {
+                            Some(PathStep::Field(name)) => name,
+                            Some(PathStep::Computed(key)) => {
+                                // `.a."b\(0)"` is `.a | .["b\(0)"]` with the key read from the
+                                // chain's input, as a bracket's is (#6053).
+                                self.skip_ws();
+                                let optional = self.at_postfix_question();
+                                if optional {
+                                    self.next();
                                 }
+                                push_bracket(&mut chain, Bracket::Dynamic { key, optional });
+                                continue;
                             }
-                        } else {
-                            self.parse_field_ident()?
+                            None => self.parse_field_ident()?,
                         };
                         let mut field_expr = self.field_or_wildcard(name);
 
@@ -12589,7 +12620,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
 
         // Parse the path string
-        let path = self.parse_string_literal()?;
+        let path = self.parse_import_path()?;
 
         self.skip_ws();
 
@@ -12643,13 +12674,24 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// The path of an `import` or `include`: jq's `ImportFrom`, a constant `String`, which may carry
+    /// a format prefix (`import @text "m" as m;`, #7456). The format never runs on a string with
+    /// no interpolation, so the path is the literal; an interpolated one is refused either way.
+    fn parse_import_path(&mut self) -> Result<String, ParseError> {
+        if self.mode == ParserMode::Jq && self.peek() == Some('@') {
+            self.parse_format_string()?;
+            self.skip_ws();
+        }
+        self.parse_string_literal()
+    }
+
     /// Parse include directive: `include "path";`
     fn parse_include(&mut self, decl_index: usize) -> Result<Include, ParseError> {
         self.consume_keyword("include");
         self.skip_ws();
 
         // Parse the path string
-        let path = self.parse_string_literal()?;
+        let path = self.parse_import_path()?;
 
         self.skip_ws();
 
@@ -17125,6 +17167,57 @@ mod tests {
     fn test_format_prefixed_string_still_rejected_in_yq_mode_3316() {
         assert!(parse_with_mode(r#"@base64 "v=\(1)""#, ParserMode::Yq).is_err());
         assert!(parse_with_mode(r#"@base64"x""#, ParserMode::Yq).is_err());
+    }
+
+    /// #7456: a format-prefixed string is a step after `.`, an object-pattern key and an import
+    /// path, desugaring to the same tree as the string with each interpolation formatted: a literal
+    /// is the field it names, an interpolation the computed key `."...\(E | @fmt)..."` reads.
+    #[test]
+    fn format_prefixed_string_is_a_path_step_pattern_key_and_import_path_7456() {
+        let jq = |source: &str| parse_with_mode(source, ParserMode::Jq).unwrap();
+        for (formatted, plain) in [
+            (r#".@base64 "x""#, ".x"),
+            (r#". @base64 "x""#, ".x"),
+            (r#".@foo "x"?"#, ".x?"),
+            (r#".a.@text "b".c"#, ".a.b.c"),
+            (r#".a . @json "b""#, ".a.b"),
+            (r#"$__loc__.@text "file""#, "$__loc__.file"),
+            (r#".@base64 "\(1)""#, r#"."\(1 | @base64)""#),
+            (r#".a.@json "k\(.n)"?"#, r#".a."k\(.n | @json)"?"#),
+            (r#". as {@base64 "c": $c} | $c"#, r#". as {"c": $c} | $c"#),
+            (
+                r#". as {@uri "\(.k)": $c} | $c"#,
+                r#". as {"\(.k | @uri)": $c} | $c"#,
+            ),
+        ] {
+            assert_eq!(jq(formatted), jq(plain), "{formatted}");
+        }
+        let program = |source: &str| parse_program_with_mode(source, ParserMode::Jq).unwrap();
+        assert_eq!(
+            program(r#"import @text "m" as m; m::f"#),
+            program(r#"import "m" as m; m::f"#)
+        );
+        assert_eq!(
+            program(r#"include @base64 "m"; f"#),
+            program(r#"include "m"; f"#)
+        );
+        // No string after the format: jq's `expecting QQSTRING_START`.
+        for source in [
+            ".@base64",
+            ".@base64 1",
+            "{@base64}",
+            ". as {@base64: $c} | $c",
+        ] {
+            assert!(parse_with_mode(source, ParserMode::Jq).is_err(), "{source}");
+        }
+        // yq's lexer has no format-prefixed string anywhere, and `.@base64` is the key `@base64`.
+        for source in [r#".@base64 "x""#, r#".a.@text "b""#] {
+            assert!(parse_with_mode(source, ParserMode::Yq).is_err(), "{source}");
+        }
+        assert_eq!(
+            parse_with_mode(".@base64", ParserMode::Yq).unwrap(),
+            Expr::Field("@base64".into())
+        );
     }
 
     /// #3357: jq's own grammar accepts any `@name` token at parse time and
