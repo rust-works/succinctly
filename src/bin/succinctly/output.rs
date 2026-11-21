@@ -247,6 +247,8 @@ impl ErrorSink {
             // run of malformed documents quadratic.
             if let Some(fault) = self.stream_fault.take() {
                 if let Some(message) = (fault.0)() {
+                    // #7575: the document the error is in was counted when it was handed over.
+                    super::stdin_offset::note_fault_was_taken();
                     self.report_parse_error(&message);
                     self.parse_stopped = true;
                     return;
@@ -332,6 +334,8 @@ impl ErrorSink {
     /// one, so the caller stops the run, and this fails it like any other report.
     pub fn report_parse_error(&mut self, message: &str) {
         eprintln!("jq: parse error: {message}");
+        // #7575: where jq's reader stopped, for where it leaves standard input.
+        super::stdin_offset::note_main_fault();
         self.hit = true;
         self.report_count += 1;
     }
