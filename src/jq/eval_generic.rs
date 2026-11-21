@@ -740,6 +740,11 @@ fn document_float_to_owned<S: EvalSemantics, V: DocumentValue>(value: &V, f: f64
         // A bridge token for a parsed NaN: the instance it was written from.
         return OwnedValue::from_bridge_float(f);
     }
+    // A document's `Infinity` is a literal in jq (#7469); a bridge token (no address) is the
+    // computed infinity it was written from.
+    if S::DECNUMBER_LITERALS && f.is_infinite() && value.number_token_address().is_some() {
+        return OwnedValue::parsed_infinity(f.is_sign_negative());
+    }
     OwnedValue::from_document_float(f)
 }
 
