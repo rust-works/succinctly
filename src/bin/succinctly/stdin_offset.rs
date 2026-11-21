@@ -181,14 +181,20 @@ pub(crate) fn restore() {
     if until_unopened && BEFORE.with(|b| b.borrow().is_empty()) {
         return;
     }
-    // A main loop that reads its inputs alone stops at the first parse error in the stream, so it
-    // is placed without the count of what came before it, which some routes make for a document
-    // they hand over before its decoding meets the error.
-    let first_fault = main_fault && reads.documents == 0 && reads.faults == 0;
+    // A main loop stops at the first parse error its reads meet, the stream's first unless the
+    // program's own `input` met one before (a route whose main loop does not read through the
+    // queue counts its inputs, so its queue's errors are the program's). It is placed without the
+    // count of what came before it: some routes count a document they hand over before its
+    // decoding meets the error, and some count the error both as the queue's and the loop's.
+    let taken_by_loop = TAKEN.with(Cell::get);
+    if run.main_loop && main_fault && taken_by_loop > 0 && reads.faults > 0 {
+        return;
+    }
+    let first_fault = run.main_loop && main_fault;
     let taken = if first_fault {
         u64::MAX
     } else {
-        reads.documents + TAKEN.with(Cell::get) + faults - counted
+        reads.documents + taken_by_loop + faults - counted
     };
     #[cfg(unix)]
     restore_unix(
