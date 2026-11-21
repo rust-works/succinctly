@@ -335,7 +335,18 @@ pub(crate) fn jq_negated_literal(repr: NumberRepr, text: &str) -> Option<(Number
     } else {
         format!("-{magnitude}")
     };
-    let repr = parse_i64_or_f64_in::<JqSemantics>(&spelled)?;
+    // The negated text parses to the negated repr (`jq_literal_text_to_f64` is
+    // sign-symmetric), so only `i64::MIN`, whose magnitude no `i64` holds,
+    // needs the parse.
+    let repr = match repr {
+        NumberRepr::Int(_) if zero => NumberRepr::Int(0),
+        NumberRepr::Float(_) if zero => NumberRepr::Float(0.0),
+        NumberRepr::Int(n) => match n.checked_neg() {
+            Some(n) => NumberRepr::Int(n),
+            None => parse_i64_or_f64_in::<JqSemantics>(&spelled)?,
+        },
+        NumberRepr::Float(f) => NumberRepr::Float(-f),
+    };
     Some((repr, spelled))
 }
 
