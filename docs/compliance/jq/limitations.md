@@ -13382,7 +13382,9 @@ A mark that breaks off because the input ends (`printf '\xef' | jq .`, or `EF BB
 `succinctly jq` does the same, on standard input and in files, when the stream's only bytes are the start of the mark, with files without bytes before or after it, and when that start is cut across files (`EF` in one and `BB` in the next).
 A mark cut across the first files (`EF BB` in one and `BF [2]` in the next, or a byte in each of three) is skipped as jq skips it, since jq's parser matches the mark a byte at a time whichever file each byte comes from (#7566).
 The routes that read several files a window at a time skip a mark at the front of the first file with bytes only, so a list whose first file with bytes is only the start of the mark is read whole, which joins it.
-The stream routes word their first fault through `jq_stream_fault`, which does not look for a partial BOM; closing that is a separate change.
+`--stream` and `--stream-errors` read with a model of jq's streaming parser that matches the mark as `jv_parser_set_buf` does, and since [#7603](https://github.com/rust-works/succinctly/issues/7603) they answer a mark that breaks off as jq does: `jq: parse error: Malformed BOM`, exit 5, with no event, and under `-n` the error `Malformed BOM` from every `input`, since jq's parser never reads past it.
+Before #7603 `--stream-errors` turned it into a numeric-literal event and exited 0 (`printf '\xef1\n' | jq -c --stream-errors .` printed `["Invalid numeric literal at line 2, column 0",[]]`), and `--stream` worded it as that numeric literal.
+Only the plain routes, which do not read with the streaming parser, keep the numeric-literal wording.
 
 ### A leading BOM is read in jq's first 4,095-byte read, as jq 1.7.1 reads it; jq 1.8.2 reads 4,091 bytes (#7569)
 
