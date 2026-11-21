@@ -1,5 +1,10 @@
 //! Succinctly CLI tool for working with succinct data structures.
 
+// First, so its `eprintln!`/`eprint!` (which ignore a failed write) shadow the standard ones in
+// this file and in every module declared below (#7476).
+#[macro_use]
+mod diag;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
