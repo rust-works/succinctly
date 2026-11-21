@@ -946,11 +946,12 @@ struct JqCommand {
     /// `-r -j`/`-j -r` (see those fields' own attributes below). Applied
     /// per-bool-field rather than as one command-level
     /// `args_override_self` (code review, #2009): that setting also covers
-    /// `ArgAction::Set` value options like `--from-file`/`--input-dsv`,
-    /// and real jq's own `-f a.jq -f b.jq` does *not* behave as simple
-    /// last-wins (live-verified: it errors trying to concatenate both
-    /// files into one program) -- so the blanket command-level version
-    /// would have silently introduced a new, unverified divergence there.
+    /// `ArgAction::Set` value options like `--input-dsv`, whose repeats
+    /// were never verified against jq, so the blanket command-level
+    /// version would have silently introduced new, unverified behaviour
+    /// there. (`-f` is a flag too since #7439, with its own
+    /// `overrides_with`: jq's `-f a.jq -f b.jq` runs `a.jq` over the
+    /// input file `b.jq`.)
     #[arg(short = 'n', long, overrides_with = "null_input")]
     null_input: bool,
 
@@ -1043,9 +1044,20 @@ struct JqCommand {
     indent: Option<i8>,
 
     // === Program Input ===
-    /// Read filter from file instead of command line
-    #[arg(short = 'f', long, value_name = "FILE")]
-    from_file: Option<PathBuf>,
+    /// Read the filter from the file the first positional argument names
+    ///
+    /// A flag, not an option with a value (#7439): jq 1.7.1's `-f` only marks the program as a
+    /// file, and the first non-option word, wherever it sits in argv, is that file (`jq -f -r
+    /// prog.jq`, `jq -rf prog.jq`, `jq prog.jq in.json -f`). `resolve_positional_args` moves that
+    /// word into `program_file`. A repeat is tolerated, as jq tolerates it: `-f a.jq -f b.jq` runs
+    /// `a.jq` over the input file `b.jq`.
+    #[arg(short = 'f', long, overrides_with = "from_file")]
+    from_file: bool,
+
+    /// The program file under `-f`, set by `resolve_positional_args` from the first positional
+    /// word (#7439); `None` when there is none, which is jq 1.8.2's usage error.
+    #[arg(skip)]
+    program_file: Option<PathBuf>,
 
     // === Variables ===
     // `allow_hyphen_values = true` below (#1150) lets a VALUE/FILE that
@@ -1969,12 +1981,12 @@ fn built_jq_command() -> clap::Command {
 }
 
 /// How many words after `flag` the jq option `flag` consumes as its values
-/// (`--arg NAME VALUE` is 2, `-f FILE` is 1, `-c` is 0), read off clap's own
+/// (`--arg NAME VALUE` is 2, `-L DIR` is 1, `-c` and `-f` are 0), read off clap's own
 /// definition so a new option cannot drift from this table. `flag` is one
-/// argv word: a `--long`, `--long=value`, or a short bundle (`-nc`, `-nf`).
+/// argv word: a `--long`, `--long=value`, or a short bundle (`-nc`, `-nL`).
 ///
 /// A bundle ends at the first short that takes a value: when text follows it
-/// in the same word, that text is the value (`-fprog.jq`) and nothing more is
+/// in the same word, that text is the value (`-Llib`) and nothing more is
 /// consumed; when it is the last character, the next word(s) are. An unknown
 /// option consumes nothing, so clap reports it in its own words.
 fn jq_option_arity(cmd: &clap::Command, flag: &str) -> usize {
@@ -4174,15 +4186,20 @@ mod hoist_options_3447 {
             hoist(&["jq", "--args", "$P", "--indent", "1", "a"]),
             strs(&["jq", "--indent", "1", "--args", "$P", "a"])
         );
+        // `-f` is a flag (#7439): the program file is a positional word and stays put.
         assert_eq!(
             hoist(&["jq", "-n", "--args", "-f", "prog.jq", "a", "b"]),
-            strs(&["jq", "-n", "-f", "prog.jq", "--args", "a", "b"])
+            strs(&["jq", "-n", "-f", "--args", "prog.jq", "a", "b"])
         );
         // A bundle ending in a value-taking short takes the next word; one
         // with the value attached, or a `--long=value`, takes nothing more.
         assert_eq!(
+            hoist(&["jq", "--args", "$P", "-nL", "lib", "a"]),
+            strs(&["jq", "-nL", "lib", "--args", "$P", "a"])
+        );
+        assert_eq!(
             hoist(&["jq", "--args", "$P", "-nf", "prog.jq", "a"]),
-            strs(&["jq", "-nf", "prog.jq", "--args", "$P", "a"])
+            strs(&["jq", "-nf", "--args", "$P", "prog.jq", "a"])
         );
         assert_eq!(
             hoist(&["jq", "--args", "$P", "--indent=1", "a"]),

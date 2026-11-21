@@ -132,9 +132,12 @@ impl JqCommand {
     /// `jq -n --args '$ARGS.positional' a b` arrives with the filter inside
     /// `args` and no `filter` at all, and a later `--jsonargs` arrives as one
     /// more `args` value. jq's rule is: the first non-option word is the
-    /// program (unless `-f` supplied it), and every later word takes the mode
-    /// of the most recent `--args`/`--jsonargs`. This walks each captured list
-    /// in order applying exactly that, and a `--` ends the mode switches.
+    /// program, and every later word takes the mode of the most recent
+    /// `--args`/`--jsonargs`. This walks each captured list in order applying
+    /// exactly that, and a `--` ends the mode switches.
+    ///
+    /// Under `-f` that first word is the program's *file* (#7439): it moves
+    /// from `filter` to `program_file`, so `filter` is then always `None`.
     ///
     /// Only words clap already captured are resequenced. By the time clap
     /// sees argv, `hoist_options_before_positional_flags` (`main.rs`) has
@@ -172,7 +175,7 @@ impl JqCommand {
                 }
                 let option_shaped =
                     word.starts_with('-') && !super::looks_like_negative_filter(&word);
-                if self.filter.is_none() && self.from_file.is_none() && !option_shaped {
+                if self.filter.is_none() && !option_shaped {
                     self.filter = Some(word);
                 } else if json {
                     self.positional_words.push(PositionalWord::Json(word));
@@ -181,7 +184,38 @@ impl JqCommand {
                 }
             }
         }
+        if self.from_file {
+            // With no positional word at all `program_file` stays `None`, which `run_jq` answers
+            // with jq's usage text (#7439, [`jq_short_usage`]).
+            self.program_file = self.filter.take().map(PathBuf::from);
+        }
     }
+}
+
+/// What jq 1.8.2 prints to standard error, before exiting 2, for `-f` with no program file
+/// (`usage(2, 1)` in its `main.c`), with this build's version in jq's (#7439).
+///
+/// jq 1.7.1 fell back to the program `.` whenever standard input or output is not a terminal,
+/// and then tried to open `.` as the program file (`jq: Could not open .: It's a directory`, exit
+/// 2). jq fixed that in 1.8 (jqlang/jq commit 7a1fd72d, "Fix missing program from file": the `.`
+/// default no longer applies under `-f`), so this follows 1.8.2; the exit status is 2 in both.
+fn jq_short_usage() -> String {
+    format!(
+        "jq - commandline JSON processor [version {}]\n\
+         \nUsage:\tjq [options] <jq filter> [file...]\n\
+         \tjq [options] --args <jq filter> [strings...]\n\
+         \tjq [options] --jsonargs <jq filter> [JSON_TEXTS...]\n\n\
+         jq is a tool for processing JSON inputs, applying the given filter to\n\
+         its JSON text inputs and producing the filter's results as JSON on\n\
+         standard output.\n\n\
+         The simplest filter is ., which copies jq's input to its output\n\
+         unmodified except for formatting. For more advanced filters see\n\
+         the jq(1) manpage (\"man jq\") and/or https://jqlang.org/.\n\n\
+         Example:\n\n\t$ echo '{{\"foo\": 0}}' | jq .\n\
+         \t{{\n\t  \"foo\": 0\n\t}}\n\n\
+         For listing the command options, use jq --help.\n",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 /// Evaluation context for passing variables to the jq evaluator.
@@ -644,6 +678,18 @@ fn strerror_only(e: &std::io::Error) -> String {
     }
 }
 
+/// The `<detail>` of jq's `Could not open <file>: <detail>` for a file it reads whole (`-f`,
+/// `--slurpfile`, `--rawfile`: jq's `jv_load_file`), which checks for a directory itself and says
+/// `It's a directory` where `strerror` would say `Is a directory` (#7439, captured from jq 1.7.1:
+/// `jq -f`, `jq -n --rawfile x . 1`). Any other failure is `strerror`'s text.
+fn load_file_detail(e: &std::io::Error) -> String {
+    if e.raw_os_error() == Some(EISDIR) {
+        "It's a directory".to_string()
+    } else {
+        strerror_only(e)
+    }
+}
+
 /// Read `--slurpfile`/`--rawfile`'s file argument, wrapped in jq's own
 /// `Bad JSON in --<flag> <name> <file>: Could not open <file>: <detail>`
 /// shape on a read failure (#3051, confirmed live for both flags) -- one
@@ -654,7 +700,7 @@ fn read_arg_file(flag: &str, name: &str, file: &str) -> Result<String, BuildCont
     std::fs::read_to_string(file).map_err(|e| {
         BuildContextError::Usage(format!(
             "Bad JSON in --{flag} {name} {file}: Could not open {file}: {}",
-            strerror_only(&e)
+            load_file_detail(&e)
         ))
     })
 }
@@ -4816,6 +4862,13 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     let mut context = std::mem::ManuallyDrop::new(context);
     share_named_strings(&mut context);
 
+    // `-f` with no program file is jq 1.8.2's usage error (#7439), reached after the named
+    // arguments are read, as jq reads them while it parses argv.
+    if args.from_file && args.program_file.is_none() {
+        eprint!("{}", jq_short_usage());
+        return Ok(exit_codes::USAGE_ERROR);
+    }
+
     // Get the filter expression. An unreadable `-f`/`--from-file` file is
     // jq's own usage error (exit 2), so it gets the same two-arm treatment
     // as the build_context failure above -- mirror that match, don't drift
@@ -6935,13 +6988,13 @@ fn build_args_var(context: &EvalContext) -> OwnedValue {
 /// [`build_context`]'s flag errors rather than sharing the main-input
 /// wording.
 fn get_filter(args: &JqCommand) -> Result<String, BuildContextError> {
-    if let Some(ref path) = args.from_file {
+    if let Some(ref path) = args.program_file {
         // Filter comes from file.
         let contents = std::fs::read_to_string(path).map_err(|e| {
             BuildContextError::Usage(format!(
                 "Could not open {}: {}",
                 path.display(),
-                strerror_only(&e)
+                load_file_detail(&e)
             ))
         })?;
         Ok(contents)
@@ -6957,22 +7010,10 @@ fn get_input_files(args: &JqCommand) -> Vec<std::path::PathBuf> {
     // `--args`/`--jsonargs` take every word after them, so `files` holds only
     // the words *before* the flag, which jq still reads as input files
     // (`jq . data.json --args a`, #3447). The words after it are in
-    // `positional_words`, never here.
-    // When -f is used, the 'filter' field becomes the first input file
-    // because the filter comes from a file instead of command line
-    let mut files: Vec<std::path::PathBuf> = Vec::new();
-
-    if args.from_file.is_some() {
-        // When -f is used, the first positional arg (if any) is an input file
-        if let Some(ref first_file) = args.filter {
-            files.push(std::path::PathBuf::from(first_file));
-        }
-    }
-
-    // Add remaining files
-    files.extend(args.files.iter().map(std::path::PathBuf::from));
-
-    files
+    // `positional_words`, never here. Under `-f` the first positional word
+    // is the program file, already moved out of `filter` (#7439), so the
+    // input files are `files` alone either way.
+    args.files.iter().map(std::path::PathBuf::from).collect()
 }
 
 /// Whether to force a real read under `-n` for `input`/`inputs`/
@@ -9367,7 +9408,7 @@ fn program_context(args: &JqCommand) -> jq::cli_context::ProgramContext {
                 Some(dir) if !dir.as_os_str().is_empty() => dir.to_string_lossy().to_string(),
                 _ => ".".to_string(),
             });
-    let prog_origin = match &args.from_file {
+    let prog_origin = match &args.program_file {
         Some(path) => std::fs::canonicalize(path)
             .ok()
             .and_then(|p| p.parent().map(|dir| dir.to_string_lossy().to_string())),
@@ -25260,11 +25301,11 @@ mod tests {
                 ])),
                 vec![Arg]
             );
-            // ...whichever option takes it (`-f FILE`)
+            // ...whichever option takes it (`-L DIR`)
             assert_eq!(
                 named_flag_order(&argv(&[
                     "jq",
-                    "-f",
+                    "-L",
                     "--arg",
                     "--rawfile",
                     "r",
@@ -25303,11 +25344,10 @@ mod tests {
                     ".",
                 ],
                 &["jq", "--arg", "--arg", "v", "--", "--arg", "x", "y"],
-                // (`-f --arg` is clap's usage error before any order matters, so an option's value is a path here)
                 &[
                     "jq",
-                    "-f",
-                    "/dev/null",
+                    "-L",
+                    "--arg",
                     "--rawfile",
                     "r",
                     "/dev/null",
@@ -25512,6 +25552,39 @@ mod tests {
             let (filter, words) = resolved(&["jq", "-f", "prog.jq", "--args", "a", "b"]);
             assert_eq!(filter, None);
             assert_eq!(words, vec![s("a"), s("b")]);
+        }
+
+        /// #7439: `-f` is a flag, and the first positional word is the program file wherever it
+        /// sits, after `--args` included; with no word at all there is none.
+        #[test]
+        fn from_file_takes_the_first_positional_word_as_the_program_file() {
+            fn program_file(argv: &[&str]) -> (Option<String>, Option<PathBuf>, Vec<String>) {
+                let mut cmd = JqCommand::try_parse_from(argv.iter().copied()).unwrap();
+                cmd.resolve_positional_args();
+                (cmd.filter, cmd.program_file, cmd.files)
+            }
+            let file = |p: &str| Some(PathBuf::from(p));
+            assert_eq!(
+                program_file(&["jq", "-f", "-r", "prog.jq", "in.json"]),
+                (None, file("prog.jq"), vec!["in.json".to_string()])
+            );
+            assert_eq!(
+                program_file(&["jq", "prog.jq", "in.json", "-f"]),
+                (None, file("prog.jq"), vec!["in.json".to_string()])
+            );
+            assert_eq!(
+                program_file(&["jq", "-f", "--args", "prog.jq", "a"]),
+                (None, file("prog.jq"), vec![])
+            );
+            assert_eq!(program_file(&["jq", "-n", "-f"]), (None, None, vec![]));
+            assert_eq!(
+                program_file(&["jq", "prog.jq", "in.json"]),
+                (
+                    Some("prog.jq".to_string()),
+                    None,
+                    vec!["in.json".to_string()]
+                )
+            );
         }
 
         /// jq's program is the first *non-option* word. Applying an option
