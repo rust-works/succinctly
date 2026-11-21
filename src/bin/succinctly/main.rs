@@ -1055,7 +1055,7 @@ struct JqCommand {
     from_file: bool,
 
     /// The program file under `-f`, set by `resolve_positional_args` from the first positional
-    /// word (#7439); `.` when there is none, as jq falls back to `.` and then cannot read it.
+    /// word (#7439); `None` when there is none, which is jq 1.8.2's usage error.
     #[arg(skip)]
     program_file: Option<PathBuf>,
 

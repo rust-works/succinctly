@@ -185,12 +185,37 @@ impl JqCommand {
             }
         }
         if self.from_file {
-            // With no positional word at all jq's program is `.` (stdin or stdout not a terminal),
-            // which `-f` then fails to open as a file: `jq: Could not open .: It's a directory`.
-            let file = self.filter.take().unwrap_or_else(|| ".".to_string());
-            self.program_file = Some(PathBuf::from(file));
+            // With no positional word at all `program_file` stays `None`, which `run_jq` answers
+            // with jq's usage text (#7439, [`jq_short_usage`]).
+            self.program_file = self.filter.take().map(PathBuf::from);
         }
     }
+}
+
+/// What jq 1.8.2 prints to standard error, before exiting 2, for `-f` with no program file
+/// (`usage(2, 1)` in its `main.c`), with this build's version in jq's (#7439).
+///
+/// jq 1.7.1 fell back to the program `.` whenever standard input or output is not a terminal,
+/// and then tried to open `.` as the program file (`jq: Could not open .: It's a directory`, exit
+/// 2). jq fixed that in 1.8 (jqlang/jq commit 7a1fd72d, "Fix missing program from file": the `.`
+/// default no longer applies under `-f`), so this follows 1.8.2; the exit status is 2 in both.
+fn jq_short_usage() -> String {
+    format!(
+        "jq - commandline JSON processor [version {}]\n\
+         \nUsage:\tjq [options] <jq filter> [file...]\n\
+         \tjq [options] --args <jq filter> [strings...]\n\
+         \tjq [options] --jsonargs <jq filter> [JSON_TEXTS...]\n\n\
+         jq is a tool for processing JSON inputs, applying the given filter to\n\
+         its JSON text inputs and producing the filter's results as JSON on\n\
+         standard output.\n\n\
+         The simplest filter is ., which copies jq's input to its output\n\
+         unmodified except for formatting. For more advanced filters see\n\
+         the jq(1) manpage (\"man jq\") and/or https://jqlang.org/.\n\n\
+         Example:\n\n\t$ echo '{{\"foo\": 0}}' | jq .\n\
+         \t{{\n\t  \"foo\": 0\n\t}}\n\n\
+         For listing the command options, use jq --help.\n",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 /// Evaluation context for passing variables to the jq evaluator.
@@ -4836,6 +4861,13 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     // allocations) to a process about to end was a quarter of the run (#5673).
     let mut context = std::mem::ManuallyDrop::new(context);
     share_named_strings(&mut context);
+
+    // `-f` with no program file is jq 1.8.2's usage error (#7439), reached after the named
+    // arguments are read, as jq reads them while it parses argv.
+    if args.from_file && args.program_file.is_none() {
+        eprint!("{}", jq_short_usage());
+        return Ok(exit_codes::USAGE_ERROR);
+    }
 
     // Get the filter expression. An unreadable `-f`/`--from-file` file is
     // jq's own usage error (exit 2), so it gets the same two-arm treatment
@@ -25410,7 +25442,7 @@ mod tests {
         }
 
         /// #7439: `-f` is a flag, and the first positional word is the program file wherever it
-        /// sits, after `--args` included; with no word at all the file is `.`.
+        /// sits, after `--args` included; with no word at all there is none.
         #[test]
         fn from_file_takes_the_first_positional_word_as_the_program_file() {
             fn program_file(argv: &[&str]) -> (Option<String>, Option<PathBuf>, Vec<String>) {
@@ -25431,7 +25463,7 @@ mod tests {
                 program_file(&["jq", "-f", "--args", "prog.jq", "a"]),
                 (None, file("prog.jq"), vec![])
             );
-            assert_eq!(program_file(&["jq", "-n", "-f"]), (None, file("."), vec![]));
+            assert_eq!(program_file(&["jq", "-n", "-f"]), (None, None, vec![]));
             assert_eq!(
                 program_file(&["jq", "prog.jq", "in.json"]),
                 (

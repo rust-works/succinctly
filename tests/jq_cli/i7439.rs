@@ -4,7 +4,9 @@
 //! took the word right after `-f` as the file, so `-f -r prog.jq`, `-fr prog.jq` and
 //! `prog.jq in.json -f` failed and `in.json -f prog.jq` ran the wrong program. Every row captured
 //! from `/usr/bin/jq` 1.7.1 with standard input at `/dev/null` (jq names itself by its argv[0],
-//! `/usr/bin/jq:`, where `succinctly jq` says `jq:`).
+//! `/usr/bin/jq:`, where `succinctly jq` says `jq:`); jq 1.8.2 (`/opt/homebrew/bin/jq`) agrees on
+//! every one of them but `-f` with no program file, where it follows 1.8.2's fix (see
+//! `test_7439_from_file_with_no_program_file_is_jq_1_8_2s_usage_error`).
 
 use anyhow::Result;
 
@@ -90,9 +92,7 @@ const ROWS: &[(&str, &str, &str, i32)] = &[
         "jq: error: f/0 is not defined at <top-level>, line 1:\n-f \njq: 1 compile error\n",
         3,
     ),
-    // No positional word: jq's program falls back to `.`, which `-f` cannot open.
-    ("-f", "", "jq: Could not open .: It's a directory\n", 2),
-    ("-n -f", "", "jq: Could not open .: It's a directory\n", 2),
+    // `.` named as the program file is a directory, in jq's words (1.7.1 and 1.8.2 alike).
     (
         "-f . a.json",
         "",
@@ -119,6 +119,61 @@ fn test_7439_from_file_is_a_flag_and_the_first_positional_is_the_program_file() 
             "jq {argv}"
         );
     }
+    Ok(())
+}
+
+/// `-f` with no positional word at all. jq 1.7.1 fell back to the program `.` (standard input or
+/// output not a terminal) and then failed to open `.` as the file: `/usr/bin/jq: Could not open .:
+/// It's a directory`, exit 2. jq 1.8 fixed that (jqlang/jq commit 7a1fd72d, "Fix missing program
+/// from file"): the `.` default no longer applies under `-f`, and `/opt/homebrew/bin/jq` 1.8.2
+/// prints its short usage text, exit 2. This follows 1.8.2, with this build's version in the
+/// first line. A named argument is still read first (`--rawfile`'s error wins), as in both.
+#[test]
+fn test_7439_from_file_with_no_program_file_is_jq_1_8_2s_usage_error() -> Result<()> {
+    let dir = fixture()?;
+    let usage_tail = "\nUsage:\tjq [options] <jq filter> [file...]\n\
+                      \tjq [options] --args <jq filter> [strings...]\n\
+                      \tjq [options] --jsonargs <jq filter> [JSON_TEXTS...]\n\n\
+                      jq is a tool for processing JSON inputs, applying the given filter to\n\
+                      its JSON text inputs and producing the filter's results as JSON on\n\
+                      standard output.\n\n\
+                      The simplest filter is ., which copies jq's input to its output\n\
+                      unmodified except for formatting. For more advanced filters see\n\
+                      the jq(1) manpage (\"man jq\") and/or https://jqlang.org/.\n\n\
+                      Example:\n\n\t$ echo '{\"foo\": 0}' | jq .\n\
+                      \t{\n\t  \"foo\": 0\n\t}\n\n\
+                      For listing the command options, use jq --help.\n";
+    let usage = format!(
+        "jq - commandline JSON processor [version {}]\n{usage_tail}",
+        env!("CARGO_PKG_VERSION")
+    );
+    for argv in [
+        "-f",
+        "-n -f",
+        "-f -n",
+        "-n -f --args",
+        "-f --",
+        "-f --arg x 1",
+        "-f --jsonargs",
+    ] {
+        let args: Vec<&str> = argv.split(' ').collect();
+        let (stdout, stderr, code) = run_jq_in_dir(dir.path(), &args, None)?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            ("", usage.as_str(), 2),
+            "jq {argv}"
+        );
+    }
+    let (stdout, stderr, code) =
+        run_jq_in_dir(dir.path(), &["-f", "--rawfile", "x", "nope"], None)?;
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        (
+            "",
+            "jq: Bad JSON in --rawfile x nope: Could not open nope: No such file or directory\n",
+            2
+        )
+    );
     Ok(())
 }
 

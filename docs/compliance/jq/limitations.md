@@ -15065,6 +15065,15 @@ These keep the character step, and differ from jq where the shape occurs:
 
 Pinned by `tests/jq_cli/i6326.rs`.
 
+## `-f` with no program file: jq 1.8.2's usage error, not jq 1.7.1's `Could not open .` ([#7439](https://github.com/rust-works/succinctly/issues/7439))
+
+`-f`/`--from-file` is a flag in both jq 1.7.1 and jq 1.8.2: the first positional word, wherever it sits, is the program file.
+With no positional word at all (`jq -f`, `jq -n -f --args`), jq 1.7.1 falls back to the program `.` whenever standard input or output is not a terminal, and then fails to open `.` as the file: `jq: Could not open .: It's a directory`, exit 2.
+jq 1.8 fixed that ([jqlang/jq@7a1fd72d](https://github.com/jqlang/jq/commit/7a1fd72d2d), "Fix missing program from file"): the `.` default no longer applies under `-f`, and jq 1.8.2 prints its short usage text instead, exit 2.
+`succinctly jq` follows jq 1.8.2 here (newer than the pinned 1.7.1), with its own version in the usage text's first line; the exit status is 2 in all three.
+A named argument is still read first, as in both jq releases: `jq -f --rawfile x nope` reports the missing `--rawfile` file.
+Pinned by `tests/jq_cli/i7439.rs`.
+
 ## `@urid`: jq 1.8.2's behaviour for the format, jq 1.7.1's for `format("urid")`
 
 `@urid` is new in jq 1.8, so the pinned jq 1.7.1 answers `urid is not a valid format` (the `str-format-urid` ledger entry).
