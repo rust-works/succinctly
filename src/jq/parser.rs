@@ -2831,7 +2831,12 @@ pub(crate) fn is_value_arg_var(var: &str) -> bool {
 pub(crate) fn unbound_value_args_call(expr: &Expr) -> Option<Expr> {
     let mut sources: Vec<(&str, &Expr)> = Vec::new();
     let mut node = expr;
-    while let Expr::As { expr: source, var, body } = node {
+    while let Expr::As {
+        expr: source,
+        var,
+        body,
+    } = node
+    {
         if !is_value_arg_var(var) {
             break;
         }
@@ -13536,7 +13541,7 @@ mod tests {
     #[test]
     fn test_builtin_generator_value_args_are_bound_in_jq_order_7474() {
         // One argument.
-        let bound = parse(r#"ltrimstr(.[])"#).unwrap();
+        let bound = parse("ltrimstr(.[])").unwrap();
         assert!(
             matches!(&bound, Expr::As { var, body, .. } if var == VALUE_ARG_VAR
                 && matches!(body.as_ref(), Expr::Builtin(Builtin::Ltrimstr(_)))),

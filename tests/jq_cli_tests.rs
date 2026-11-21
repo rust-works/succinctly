@@ -48322,7 +48322,7 @@ fn test_in_upper_in_contains_all_raise_decode_failure_from_cli_2202() {
     for filter in [
         r#"in(error("boom"), {"a":1})"#,
         r#"IN(error("boom"), {"a":1})"#,
-        r#"contains(1)"#,
+        "contains(1)",
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))
             .unwrap_or_else(|e| panic!("`{filter}` failed to run: {e}"));

@@ -3323,12 +3323,16 @@ mod tests {
             .map(|e| format!("{e:?}"))
             .collect();
         assert_eq!(names.len(), 2, "{names:?}");
-        assert!(names[0].contains("foo") && names[1].contains("bar"), "{names:?}");
+        assert!(
+            names[0].contains("foo") && names[1].contains("bar"),
+            "{names:?}"
+        );
 
         // The sources go back into the bindings, and the call is left holding its variables.
-        let mut expr = parse("def p: [\"a\"]; {} | setpath(p, p; 1, 2)").expect("filter must parse");
+        let mut expr =
+            parse("def p: [\"a\"]; {} | setpath(p, p; 1, 2)").expect("filter must parse");
         let before = expr.clone();
-        assert!(resolve_all_jq(&mut expr).is_empty());
+        assert_eq!(resolve_all_jq(&mut expr), Vec::new());
         assert_eq!(expr, before);
 
         let mut odd = Expr::As {

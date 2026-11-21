@@ -71,7 +71,7 @@ fn a_generator_argument_is_bound_one_value_at_a_time_as_jq_does_7474() -> Result
                     failures.push(format!(
                         "{program}\n  want {expected:?} exit {code}\n  got  {stdout:?} exit {got}, stderr {stderr:?}"
                     ));
-                } else if code == 5 && !stderr.contains("E") {
+                } else if code == 5 && !stderr.contains("): E") {
                     failures.push(format!(
                         "{program}: stderr {stderr:?} does not name the error"
                     ));
@@ -193,26 +193,26 @@ const CASES: &[(&str, &str, i32)] = &[
     ),
     (
         r#""2015" | first(strptime(repeat("%Y")))"#,
-        r#"[2015,0,0,0,0,0,3,-1]
-"#,
+        r"[2015,0,0,0,0,0,3,-1]
+",
         0,
     ),
     (
         r#""2015" | [limit(2; strptime(repeat("%Y", "%C%y")))]"#,
-        r#"[[2015,0,0,0,0,0,3,-1],[2015,0,0,0,0,0,3,-1]]
-"#,
+        r"[[2015,0,0,0,0,0,3,-1],[2015,0,0,0,0,0,3,-1]]
+",
         0,
     ),
     (
         r#""2015" | strptime(("%Y", error("E"), "%C%y"))"#,
-        r#"[2015,0,0,0,0,0,3,-1]
-"#,
+        r"[2015,0,0,0,0,0,3,-1]
+",
         5,
     ),
     (
         r#""2015" | [strptime(("%Y", "%C%y"))]"#,
-        r#"[[2015,0,0,0,0,0,3,-1],[2015,0,0,0,0,0,3,-1]]
-"#,
+        r"[[2015,0,0,0,0,0,3,-1],[2015,0,0,0,0,0,3,-1]]
+",
         0,
     ),
     (
@@ -241,50 +241,50 @@ const CASES: &[(&str, &str, i32)] = &[
     ),
     (
         r#""abc" | first(contains(repeat("a")))"#,
-        r#"true
-"#,
+        r"true
+",
         0,
     ),
     (
         r#""abc" | [limit(2; contains(repeat("a", "z")))]"#,
-        r#"[true,false]
-"#,
+        r"[true,false]
+",
         0,
     ),
     (
         r#""abc" | contains(("a", error("E"), "z"))"#,
-        r#"true
-"#,
+        r"true
+",
         5,
     ),
     (
         r#""abc" | [contains(("a", "z"))]"#,
-        r#"[true,false]
-"#,
+        r"[true,false]
+",
         0,
     ),
     (
         r#"{"a":1} | first(has(repeat("a")))"#,
-        r#"true
-"#,
+        r"true
+",
         0,
     ),
     (
         r#"{"a":1} | [limit(2; has(repeat("a", "b")))]"#,
-        r#"[true,false]
-"#,
+        r"[true,false]
+",
         0,
     ),
     (
         r#"{"a":1} | has(("a", error("E"), "b"))"#,
-        r#"true
-"#,
+        r"true
+",
         5,
     ),
     (
         r#"{"a":1} | [has(("a", "b"))]"#,
-        r#"[true,false]
-"#,
+        r"[true,false]
+",
         0,
     ),
     (
@@ -313,26 +313,26 @@ const CASES: &[(&str, &str, i32)] = &[
     ),
     (
         r#"{"a":1,"b":2} | first(getpath(repeat(["a"])))"#,
-        r#"1
-"#,
+        r"1
+",
         0,
     ),
     (
         r#"{"a":1,"b":2} | [limit(2; getpath(repeat(["a"], ["b"])))]"#,
-        r#"[1,2]
-"#,
+        r"[1,2]
+",
         0,
     ),
     (
         r#"{"a":1,"b":2} | getpath((["a"], error("E"), ["b"]))"#,
-        r#"1
-"#,
+        r"1
+",
         5,
     ),
     (
         r#"{"a":1,"b":2} | [getpath((["a"], ["b"]))]"#,
-        r#"[1,2]
-"#,
+        r"[1,2]
+",
         0,
     ),
     (
@@ -451,896 +451,896 @@ const CASES: &[(&str, &str, i32)] = &[
     ),
     (
         r#""xab" | first(endswith(repeat("b")))"#,
-        r#"true
-"#,
+        r"true
+",
         0,
     ),
     (
         r#""xab" | [limit(2; endswith(repeat("b", "x")))]"#,
-        r#"[true,false]
-"#,
+        r"[true,false]
+",
         0,
     ),
     (
         r#""xab" | endswith(("b", error("E"), "x"))"#,
-        r#"true
-"#,
+        r"true
+",
         5,
     ),
     (
         r#""xab" | [endswith(("b", "x"))]"#,
-        r#"[true,false]
-"#,
+        r"[true,false]
+",
         0,
     ),
     (
         r#""xab" | first(startswith(repeat("x")))"#,
-        r#"true
-"#,
+        r"true
+",
         0,
     ),
     (
         r#""xab" | [limit(2; startswith(repeat("x", "b")))]"#,
-        r#"[true,false]
-"#,
+        r"[true,false]
+",
         0,
     ),
     (
         r#""xab" | startswith(("x", error("E"), "b"))"#,
-        r#"true
-"#,
+        r"true
+",
         5,
     ),
     (
         r#""xab" | [startswith(("x", "b"))]"#,
-        r#"[true,false]
-"#,
+        r"[true,false]
+",
         0,
     ),
     (
-        r#"null | first(ldexp(repeat(1); 3))"#,
-        r#"8
-"#,
+        r"null | first(ldexp(repeat(1); 3))",
+        r"8
+",
         0,
     ),
     (
-        r#"null | [limit(2; ldexp(repeat(1, 2); 3))]"#,
-        r#"[8,16]
-"#,
+        r"null | [limit(2; ldexp(repeat(1, 2); 3))]",
+        r"[8,16]
+",
         0,
     ),
     (
         r#"null | ldexp((1, error("E"), 2); 3)"#,
-        r#"8
-"#,
+        r"8
+",
         5,
     ),
     (
-        r#"null | first(ldexp(1; repeat(3)))"#,
-        r#"8
-"#,
+        r"null | first(ldexp(1; repeat(3)))",
+        r"8
+",
         0,
     ),
     (
-        r#"null | [limit(2; ldexp(1; repeat(3, 4)))]"#,
-        r#"[8,16]
-"#,
+        r"null | [limit(2; ldexp(1; repeat(3, 4)))]",
+        r"[8,16]
+",
         0,
     ),
     (
         r#"null | ldexp(1; (3, error("E"), 4))"#,
-        r#"8
-"#,
+        r"8
+",
         5,
     ),
     (
-        r#"null | [ldexp((1, 2); (3, 4))]"#,
-        r#"[8,16,16,32]
-"#,
+        r"null | [ldexp((1, 2); (3, 4))]",
+        r"[8,16,16,32]
+",
         0,
     ),
     (
-        r#"null | first(scalbln(repeat(1); 3))"#,
-        r#"8
-"#,
+        r"null | first(scalbln(repeat(1); 3))",
+        r"8
+",
         0,
     ),
     (
-        r#"null | [limit(2; scalbln(repeat(1, 2); 3))]"#,
-        r#"[8,16]
-"#,
+        r"null | [limit(2; scalbln(repeat(1, 2); 3))]",
+        r"[8,16]
+",
         0,
     ),
     (
         r#"null | scalbln((1, error("E"), 2); 3)"#,
-        r#"8
-"#,
+        r"8
+",
         5,
     ),
     (
-        r#"null | first(scalbln(1; repeat(3)))"#,
-        r#"8
-"#,
+        r"null | first(scalbln(1; repeat(3)))",
+        r"8
+",
         0,
     ),
     (
-        r#"null | [limit(2; scalbln(1; repeat(3, 4)))]"#,
-        r#"[8,16]
-"#,
+        r"null | [limit(2; scalbln(1; repeat(3, 4)))]",
+        r"[8,16]
+",
         0,
     ),
     (
         r#"null | scalbln(1; (3, error("E"), 4))"#,
-        r#"8
-"#,
+        r"8
+",
         5,
     ),
     (
-        r#"null | [scalbln((1, 2); (3, 4))]"#,
-        r#"[8,16,16,32]
-"#,
+        r"null | [scalbln((1, 2); (3, 4))]",
+        r"[8,16,16,32]
+",
         0,
     ),
     (
-        r#"null | first(scalb(repeat(1); 3))"#,
-        r#"8
-"#,
+        r"null | first(scalb(repeat(1); 3))",
+        r"8
+",
         0,
     ),
     (
-        r#"null | [limit(2; scalb(repeat(1, 2); 3))]"#,
-        r#"[8,16]
-"#,
+        r"null | [limit(2; scalb(repeat(1, 2); 3))]",
+        r"[8,16]
+",
         0,
     ),
     (
         r#"null | scalb((1, error("E"), 2); 3)"#,
-        r#"8
-"#,
+        r"8
+",
         5,
     ),
     (
-        r#"null | first(scalb(1; repeat(3)))"#,
-        r#"8
-"#,
+        r"null | first(scalb(1; repeat(3)))",
+        r"8
+",
         0,
     ),
     (
-        r#"null | [limit(2; scalb(1; repeat(3, 4)))]"#,
-        r#"[8,16]
-"#,
+        r"null | [limit(2; scalb(1; repeat(3, 4)))]",
+        r"[8,16]
+",
         0,
     ),
     (
         r#"null | scalb(1; (3, error("E"), 4))"#,
-        r#"8
-"#,
+        r"8
+",
         5,
     ),
     (
-        r#"null | [scalb((1, 2); (3, 4))]"#,
-        r#"[8,16,16,32]
-"#,
+        r"null | [scalb((1, 2); (3, 4))]",
+        r"[8,16,16,32]
+",
         0,
     ),
     (
-        r#"null | first(nexttoward(repeat(1); 3))"#,
-        r#"1.0000000000000002
-"#,
+        r"null | first(nexttoward(repeat(1); 3))",
+        r"1.0000000000000002
+",
         0,
     ),
     (
-        r#"null | [limit(2; nexttoward(repeat(1, 2); 3))]"#,
-        r#"[1.0000000000000002,2.0000000000000004]
-"#,
+        r"null | [limit(2; nexttoward(repeat(1, 2); 3))]",
+        r"[1.0000000000000002,2.0000000000000004]
+",
         0,
     ),
     (
         r#"null | nexttoward((1, error("E"), 2); 3)"#,
-        r#"1.0000000000000002
-"#,
+        r"1.0000000000000002
+",
         5,
     ),
     (
-        r#"null | first(nexttoward(1; repeat(3)))"#,
-        r#"1.0000000000000002
-"#,
+        r"null | first(nexttoward(1; repeat(3)))",
+        r"1.0000000000000002
+",
         0,
     ),
     (
-        r#"null | [limit(2; nexttoward(1; repeat(3, 4)))]"#,
-        r#"[1.0000000000000002,1.0000000000000002]
-"#,
+        r"null | [limit(2; nexttoward(1; repeat(3, 4)))]",
+        r"[1.0000000000000002,1.0000000000000002]
+",
         0,
     ),
     (
         r#"null | nexttoward(1; (3, error("E"), 4))"#,
-        r#"1.0000000000000002
-"#,
+        r"1.0000000000000002
+",
         5,
     ),
     (
-        r#"null | [nexttoward((1, 2); (3, 4))]"#,
-        r#"[1.0000000000000002,2.0000000000000004,1.0000000000000002,2.0000000000000004]
-"#,
+        r"null | [nexttoward((1, 2); (3, 4))]",
+        r"[1.0000000000000002,2.0000000000000004,1.0000000000000002,2.0000000000000004]
+",
         0,
     ),
     (
-        r#"null | first(nextafter(repeat(1); 3))"#,
-        r#"1.0000000000000002
-"#,
+        r"null | first(nextafter(repeat(1); 3))",
+        r"1.0000000000000002
+",
         0,
     ),
     (
-        r#"null | [limit(2; nextafter(repeat(1, 2); 3))]"#,
-        r#"[1.0000000000000002,2.0000000000000004]
-"#,
+        r"null | [limit(2; nextafter(repeat(1, 2); 3))]",
+        r"[1.0000000000000002,2.0000000000000004]
+",
         0,
     ),
     (
         r#"null | nextafter((1, error("E"), 2); 3)"#,
-        r#"1.0000000000000002
-"#,
+        r"1.0000000000000002
+",
         5,
     ),
     (
-        r#"null | first(nextafter(1; repeat(3)))"#,
-        r#"1.0000000000000002
-"#,
+        r"null | first(nextafter(1; repeat(3)))",
+        r"1.0000000000000002
+",
         0,
     ),
     (
-        r#"null | [limit(2; nextafter(1; repeat(3, 4)))]"#,
-        r#"[1.0000000000000002,1.0000000000000002]
-"#,
+        r"null | [limit(2; nextafter(1; repeat(3, 4)))]",
+        r"[1.0000000000000002,1.0000000000000002]
+",
         0,
     ),
     (
         r#"null | nextafter(1; (3, error("E"), 4))"#,
-        r#"1.0000000000000002
-"#,
+        r"1.0000000000000002
+",
         5,
     ),
     (
-        r#"null | [nextafter((1, 2); (3, 4))]"#,
-        r#"[1.0000000000000002,2.0000000000000004,1.0000000000000002,2.0000000000000004]
-"#,
+        r"null | [nextafter((1, 2); (3, 4))]",
+        r"[1.0000000000000002,2.0000000000000004,1.0000000000000002,2.0000000000000004]
+",
         0,
     ),
     (
-        r#"null | first(fmod(repeat(7); 3))"#,
-        r#"1
-"#,
+        r"null | first(fmod(repeat(7); 3))",
+        r"1
+",
         0,
     ),
     (
-        r#"null | [limit(2; fmod(repeat(7, 9); 3))]"#,
-        r#"[1,0]
-"#,
+        r"null | [limit(2; fmod(repeat(7, 9); 3))]",
+        r"[1,0]
+",
         0,
     ),
     (
         r#"null | fmod((7, error("E"), 9); 3)"#,
-        r#"1
-"#,
+        r"1
+",
         5,
     ),
     (
-        r#"null | first(fmod(7; repeat(3)))"#,
-        r#"1
-"#,
+        r"null | first(fmod(7; repeat(3)))",
+        r"1
+",
         0,
     ),
     (
-        r#"null | [limit(2; fmod(7; repeat(3, 4)))]"#,
-        r#"[1,3]
-"#,
+        r"null | [limit(2; fmod(7; repeat(3, 4)))]",
+        r"[1,3]
+",
         0,
     ),
     (
         r#"null | fmod(7; (3, error("E"), 4))"#,
-        r#"1
-"#,
+        r"1
+",
         5,
     ),
     (
-        r#"null | [fmod((7, 9); (3, 4))]"#,
-        r#"[1,0,3,1]
-"#,
+        r"null | [fmod((7, 9); (3, 4))]",
+        r"[1,0,3,1]
+",
         0,
     ),
     (
-        r#"null | first(fmin(repeat(1); 3))"#,
-        r#"1
-"#,
+        r"null | first(fmin(repeat(1); 3))",
+        r"1
+",
         0,
     ),
     (
-        r#"null | [limit(2; fmin(repeat(1, 2); 3))]"#,
-        r#"[1,2]
-"#,
+        r"null | [limit(2; fmin(repeat(1, 2); 3))]",
+        r"[1,2]
+",
         0,
     ),
     (
         r#"null | fmin((1, error("E"), 2); 3)"#,
-        r#"1
-"#,
+        r"1
+",
         5,
     ),
     (
-        r#"null | first(fmin(1; repeat(3)))"#,
-        r#"1
-"#,
+        r"null | first(fmin(1; repeat(3)))",
+        r"1
+",
         0,
     ),
     (
-        r#"null | [limit(2; fmin(1; repeat(3, 4)))]"#,
-        r#"[1,1]
-"#,
+        r"null | [limit(2; fmin(1; repeat(3, 4)))]",
+        r"[1,1]
+",
         0,
     ),
     (
         r#"null | fmin(1; (3, error("E"), 4))"#,
-        r#"1
-"#,
+        r"1
+",
         5,
     ),
     (
-        r#"null | [fmin((1, 2); (3, 4))]"#,
-        r#"[1,2,1,2]
-"#,
+        r"null | [fmin((1, 2); (3, 4))]",
+        r"[1,2,1,2]
+",
         0,
     ),
     (
-        r#"null | first(fmax(repeat(1); 3))"#,
-        r#"3
-"#,
+        r"null | first(fmax(repeat(1); 3))",
+        r"3
+",
         0,
     ),
     (
-        r#"null | [limit(2; fmax(repeat(1, 2); 3))]"#,
-        r#"[3,3]
-"#,
+        r"null | [limit(2; fmax(repeat(1, 2); 3))]",
+        r"[3,3]
+",
         0,
     ),
     (
         r#"null | fmax((1, error("E"), 2); 3)"#,
-        r#"3
-"#,
+        r"3
+",
         5,
     ),
     (
-        r#"null | first(fmax(1; repeat(3)))"#,
-        r#"3
-"#,
+        r"null | first(fmax(1; repeat(3)))",
+        r"3
+",
         0,
     ),
     (
-        r#"null | [limit(2; fmax(1; repeat(3, 4)))]"#,
-        r#"[3,4]
-"#,
+        r"null | [limit(2; fmax(1; repeat(3, 4)))]",
+        r"[3,4]
+",
         0,
     ),
     (
         r#"null | fmax(1; (3, error("E"), 4))"#,
-        r#"3
-"#,
+        r"3
+",
         5,
     ),
     (
-        r#"null | [fmax((1, 2); (3, 4))]"#,
-        r#"[3,3,4,4]
-"#,
+        r"null | [fmax((1, 2); (3, 4))]",
+        r"[3,3,4,4]
+",
         0,
     ),
     (
-        r#"null | first(fma(repeat(1); 3; 5))"#,
-        r#"8
-"#,
+        r"null | first(fma(repeat(1); 3; 5))",
+        r"8
+",
         0,
     ),
     (
-        r#"null | [limit(2; fma(repeat(1, 2); 3; 5))]"#,
-        r#"[8,11]
-"#,
+        r"null | [limit(2; fma(repeat(1, 2); 3; 5))]",
+        r"[8,11]
+",
         0,
     ),
     (
         r#"null | fma((1, error("E"), 2); 3; 5)"#,
-        r#"8
-"#,
+        r"8
+",
         5,
     ),
     (
-        r#"null | first(fma(1; repeat(3); 5))"#,
-        r#"8
-"#,
+        r"null | first(fma(1; repeat(3); 5))",
+        r"8
+",
         0,
     ),
     (
-        r#"null | [limit(2; fma(1; repeat(3, 4); 5))]"#,
-        r#"[8,9]
-"#,
+        r"null | [limit(2; fma(1; repeat(3, 4); 5))]",
+        r"[8,9]
+",
         0,
     ),
     (
         r#"null | fma(1; (3, error("E"), 4); 5)"#,
-        r#"8
-"#,
+        r"8
+",
         5,
     ),
     (
-        r#"null | first(fma(1; 3; repeat(5)))"#,
-        r#"8
-"#,
+        r"null | first(fma(1; 3; repeat(5)))",
+        r"8
+",
         0,
     ),
     (
-        r#"null | [limit(2; fma(1; 3; repeat(5, 6)))]"#,
-        r#"[8,9]
-"#,
+        r"null | [limit(2; fma(1; 3; repeat(5, 6)))]",
+        r"[8,9]
+",
         0,
     ),
     (
         r#"null | fma(1; 3; (5, error("E"), 6))"#,
-        r#"8
-"#,
+        r"8
+",
         5,
     ),
     (
-        r#"null | [fma((1, 2); (3, 4); (5, 6))]"#,
-        r#"[8,11,9,13,9,12,10,14]
-"#,
+        r"null | [fma((1, 2); (3, 4); (5, 6))]",
+        r"[8,11,9,13,9,12,10,14]
+",
         0,
     ),
     (
-        r#"null | first(fdim(repeat(7); 3))"#,
-        r#"4
-"#,
+        r"null | first(fdim(repeat(7); 3))",
+        r"4
+",
         0,
     ),
     (
-        r#"null | [limit(2; fdim(repeat(7, 9); 3))]"#,
-        r#"[4,6]
-"#,
+        r"null | [limit(2; fdim(repeat(7, 9); 3))]",
+        r"[4,6]
+",
         0,
     ),
     (
         r#"null | fdim((7, error("E"), 9); 3)"#,
-        r#"4
-"#,
+        r"4
+",
         5,
     ),
     (
-        r#"null | first(fdim(7; repeat(3)))"#,
-        r#"4
-"#,
+        r"null | first(fdim(7; repeat(3)))",
+        r"4
+",
         0,
     ),
     (
-        r#"null | [limit(2; fdim(7; repeat(3, 4)))]"#,
-        r#"[4,3]
-"#,
+        r"null | [limit(2; fdim(7; repeat(3, 4)))]",
+        r"[4,3]
+",
         0,
     ),
     (
         r#"null | fdim(7; (3, error("E"), 4))"#,
-        r#"4
-"#,
+        r"4
+",
         5,
     ),
     (
-        r#"null | [fdim((7, 9); (3, 4))]"#,
-        r#"[4,6,3,5]
-"#,
+        r"null | [fdim((7, 9); (3, 4))]",
+        r"[4,6,3,5]
+",
         0,
     ),
     (
-        r#"null | first(drem(repeat(7); 3))"#,
-        r#"1
-"#,
+        r"null | first(drem(repeat(7); 3))",
+        r"1
+",
         0,
     ),
     (
-        r#"null | [limit(2; drem(repeat(7, 9); 3))]"#,
-        r#"[1,0]
-"#,
+        r"null | [limit(2; drem(repeat(7, 9); 3))]",
+        r"[1,0]
+",
         0,
     ),
     (
         r#"null | drem((7, error("E"), 9); 3)"#,
-        r#"1
-"#,
+        r"1
+",
         5,
     ),
     (
-        r#"null | first(drem(7; repeat(3)))"#,
-        r#"1
-"#,
+        r"null | first(drem(7; repeat(3)))",
+        r"1
+",
         0,
     ),
     (
-        r#"null | [limit(2; drem(7; repeat(3, 4)))]"#,
-        r#"[1,-1]
-"#,
+        r"null | [limit(2; drem(7; repeat(3, 4)))]",
+        r"[1,-1]
+",
         0,
     ),
     (
         r#"null | drem(7; (3, error("E"), 4))"#,
-        r#"1
-"#,
+        r"1
+",
         5,
     ),
     (
-        r#"null | [drem((7, 9); (3, 4))]"#,
-        r#"[1,0,-1,1]
-"#,
+        r"null | [drem((7, 9); (3, 4))]",
+        r"[1,0,-1,1]
+",
         0,
     ),
     (
-        r#"null | first(copysign(repeat(1); 3))"#,
-        r#"1
-"#,
+        r"null | first(copysign(repeat(1); 3))",
+        r"1
+",
         0,
     ),
     (
-        r#"null | [limit(2; copysign(repeat(1, 2); 3))]"#,
-        r#"[1,2]
-"#,
+        r"null | [limit(2; copysign(repeat(1, 2); 3))]",
+        r"[1,2]
+",
         0,
     ),
     (
         r#"null | copysign((1, error("E"), 2); 3)"#,
-        r#"1
-"#,
+        r"1
+",
         5,
     ),
     (
-        r#"null | first(copysign(1; repeat(3)))"#,
-        r#"1
-"#,
+        r"null | first(copysign(1; repeat(3)))",
+        r"1
+",
         0,
     ),
     (
-        r#"null | [limit(2; copysign(1; repeat(3, -4)))]"#,
-        r#"[1,-1]
-"#,
+        r"null | [limit(2; copysign(1; repeat(3, -4)))]",
+        r"[1,-1]
+",
         0,
     ),
     (
         r#"null | copysign(1; (3, error("E"), -4))"#,
-        r#"1
-"#,
+        r"1
+",
         5,
     ),
     (
-        r#"null | [copysign((1, 2); (3, -4))]"#,
-        r#"[1,2,-1,-2]
-"#,
+        r"null | [copysign((1, 2); (3, -4))]",
+        r"[1,2,-1,-2]
+",
         0,
     ),
     (
-        r#"null | first(yn(repeat(1); 3))"#,
-        r#"0.3246744247918
-"#,
+        r"null | first(yn(repeat(1); 3))",
+        r"0.3246744247918
+",
         0,
     ),
     (
-        r#"null | [limit(2; yn(repeat(1, 2); 3))]"#,
-        r#"[0.3246744247918,-0.1604003934849237]
-"#,
+        r"null | [limit(2; yn(repeat(1, 2); 3))]",
+        r"[0.3246744247918,-0.1604003934849237]
+",
         0,
     ),
     (
         r#"null | yn((1, error("E"), 2); 3)"#,
-        r#"0.3246744247918
-"#,
+        r"0.3246744247918
+",
         5,
     ),
     (
-        r#"null | first(yn(1; repeat(3)))"#,
-        r#"0.3246744247918
-"#,
+        r"null | first(yn(1; repeat(3)))",
+        r"0.3246744247918
+",
         0,
     ),
     (
-        r#"null | [limit(2; yn(1; repeat(3, 4)))]"#,
-        r#"[0.3246744247918,0.3979257105571001]
-"#,
+        r"null | [limit(2; yn(1; repeat(3, 4)))]",
+        r"[0.3246744247918,0.3979257105571001]
+",
         0,
     ),
     (
         r#"null | yn(1; (3, error("E"), 4))"#,
-        r#"0.3246744247918
-"#,
+        r"0.3246744247918
+",
         5,
     ),
     (
-        r#"null | [yn((1, 2); (3, 4))]"#,
-        r#"[0.3246744247918,-0.1604003934849237,0.3979257105571001,0.21590359460361502]
-"#,
+        r"null | [yn((1, 2); (3, 4))]",
+        r"[0.3246744247918,-0.1604003934849237,0.3979257105571001,0.21590359460361502]
+",
         0,
     ),
     (
-        r#"null | first(jn(repeat(1); 3))"#,
-        r#"0.3390589585259364
-"#,
+        r"null | first(jn(repeat(1); 3))",
+        r"0.3390589585259364
+",
         0,
     ),
     (
-        r#"null | [limit(2; jn(repeat(1, 2); 3))]"#,
-        r#"[0.3390589585259364,0.4860912605858911]
-"#,
+        r"null | [limit(2; jn(repeat(1, 2); 3))]",
+        r"[0.3390589585259364,0.4860912605858911]
+",
         0,
     ),
     (
         r#"null | jn((1, error("E"), 2); 3)"#,
-        r#"0.3390589585259364
-"#,
+        r"0.3390589585259364
+",
         5,
     ),
     (
-        r#"null | first(jn(1; repeat(3)))"#,
-        r#"0.3390589585259364
-"#,
+        r"null | first(jn(1; repeat(3)))",
+        r"0.3390589585259364
+",
         0,
     ),
     (
-        r#"null | [limit(2; jn(1; repeat(3, 4)))]"#,
-        r#"[0.3390589585259364,-0.06604332802354915]
-"#,
+        r"null | [limit(2; jn(1; repeat(3, 4)))]",
+        r"[0.3390589585259364,-0.06604332802354915]
+",
         0,
     ),
     (
         r#"null | jn(1; (3, error("E"), 4))"#,
-        r#"0.3390589585259364
-"#,
+        r"0.3390589585259364
+",
         5,
     ),
     (
-        r#"null | [jn((1, 2); (3, 4))]"#,
-        r#"[0.3390589585259364,0.4860912605858911,-0.06604332802354915,0.3641281458520728]
-"#,
+        r"null | [jn((1, 2); (3, 4))]",
+        r"[0.3390589585259364,0.4860912605858911,-0.06604332802354915,0.3641281458520728]
+",
         0,
     ),
     (
-        r#"null | first(remainder(repeat(7); 3))"#,
-        r#"1
-"#,
+        r"null | first(remainder(repeat(7); 3))",
+        r"1
+",
         0,
     ),
     (
-        r#"null | [limit(2; remainder(repeat(7, 9); 3))]"#,
-        r#"[1,0]
-"#,
+        r"null | [limit(2; remainder(repeat(7, 9); 3))]",
+        r"[1,0]
+",
         0,
     ),
     (
         r#"null | remainder((7, error("E"), 9); 3)"#,
-        r#"1
-"#,
+        r"1
+",
         5,
     ),
     (
-        r#"null | first(remainder(7; repeat(3)))"#,
-        r#"1
-"#,
+        r"null | first(remainder(7; repeat(3)))",
+        r"1
+",
         0,
     ),
     (
-        r#"null | [limit(2; remainder(7; repeat(3, 4)))]"#,
-        r#"[1,-1]
-"#,
+        r"null | [limit(2; remainder(7; repeat(3, 4)))]",
+        r"[1,-1]
+",
         0,
     ),
     (
         r#"null | remainder(7; (3, error("E"), 4))"#,
-        r#"1
-"#,
+        r"1
+",
         5,
     ),
     (
-        r#"null | [remainder((7, 9); (3, 4))]"#,
-        r#"[1,0,-1,1]
-"#,
+        r"null | [remainder((7, 9); (3, 4))]",
+        r"[1,0,-1,1]
+",
         0,
     ),
     (
-        r#"null | first(pow(repeat(2); 4))"#,
-        r#"16
-"#,
+        r"null | first(pow(repeat(2); 4))",
+        r"16
+",
         0,
     ),
     (
-        r#"null | [limit(2; pow(repeat(2, 3); 4))]"#,
-        r#"[16,81]
-"#,
+        r"null | [limit(2; pow(repeat(2, 3); 4))]",
+        r"[16,81]
+",
         0,
     ),
     (
         r#"null | pow((2, error("E"), 3); 4)"#,
-        r#"16
-"#,
+        r"16
+",
         5,
     ),
     (
-        r#"null | first(pow(2; repeat(4)))"#,
-        r#"16
-"#,
+        r"null | first(pow(2; repeat(4)))",
+        r"16
+",
         0,
     ),
     (
-        r#"null | [limit(2; pow(2; repeat(4, 5)))]"#,
-        r#"[16,32]
-"#,
+        r"null | [limit(2; pow(2; repeat(4, 5)))]",
+        r"[16,32]
+",
         0,
     ),
     (
         r#"null | pow(2; (4, error("E"), 5))"#,
-        r#"16
-"#,
+        r"16
+",
         5,
     ),
     (
-        r#"null | [pow((2, 3); (4, 5))]"#,
-        r#"[16,81,32,243]
-"#,
+        r"null | [pow((2, 3); (4, 5))]",
+        r"[16,81,32,243]
+",
         0,
     ),
     (
-        r#"null | first(hypot(repeat(3); 4))"#,
-        r#"5
-"#,
+        r"null | first(hypot(repeat(3); 4))",
+        r"5
+",
         0,
     ),
     (
-        r#"null | [limit(2; hypot(repeat(3, 5); 4))]"#,
-        r#"[5,6.4031242374328485]
-"#,
+        r"null | [limit(2; hypot(repeat(3, 5); 4))]",
+        r"[5,6.4031242374328485]
+",
         0,
     ),
     (
         r#"null | hypot((3, error("E"), 5); 4)"#,
-        r#"5
-"#,
+        r"5
+",
         5,
     ),
     (
-        r#"null | first(hypot(3; repeat(4)))"#,
-        r#"5
-"#,
+        r"null | first(hypot(3; repeat(4)))",
+        r"5
+",
         0,
     ),
     (
-        r#"null | [limit(2; hypot(3; repeat(4, 12)))]"#,
-        r#"[5,12.36931687685298]
-"#,
+        r"null | [limit(2; hypot(3; repeat(4, 12)))]",
+        r"[5,12.36931687685298]
+",
         0,
     ),
     (
         r#"null | hypot(3; (4, error("E"), 12))"#,
-        r#"5
-"#,
+        r"5
+",
         5,
     ),
     (
-        r#"null | [hypot((3, 5); (4, 12))]"#,
-        r#"[5,6.4031242374328485,12.36931687685298,13]
-"#,
+        r"null | [hypot((3, 5); (4, 12))]",
+        r"[5,6.4031242374328485,12.36931687685298,13]
+",
         0,
     ),
     (
-        r#"null | first(atan2(repeat(1); 3))"#,
-        r#"0.3217505543966422
-"#,
+        r"null | first(atan2(repeat(1); 3))",
+        r"0.3217505543966422
+",
         0,
     ),
     (
-        r#"null | [limit(2; atan2(repeat(1, 2); 3))]"#,
-        r#"[0.3217505543966422,0.5880026035475675]
-"#,
+        r"null | [limit(2; atan2(repeat(1, 2); 3))]",
+        r"[0.3217505543966422,0.5880026035475675]
+",
         0,
     ),
     (
         r#"null | atan2((1, error("E"), 2); 3)"#,
-        r#"0.3217505543966422
-"#,
+        r"0.3217505543966422
+",
         5,
     ),
     (
-        r#"null | first(atan2(1; repeat(3)))"#,
-        r#"0.3217505543966422
-"#,
+        r"null | first(atan2(1; repeat(3)))",
+        r"0.3217505543966422
+",
         0,
     ),
     (
-        r#"null | [limit(2; atan2(1; repeat(3, 4)))]"#,
-        r#"[0.3217505543966422,0.24497866312686414]
-"#,
+        r"null | [limit(2; atan2(1; repeat(3, 4)))]",
+        r"[0.3217505543966422,0.24497866312686414]
+",
         0,
     ),
     (
         r#"null | atan2(1; (3, error("E"), 4))"#,
-        r#"0.3217505543966422
-"#,
+        r"0.3217505543966422
+",
         5,
     ),
     (
-        r#"null | [atan2((1, 2); (3, 4))]"#,
-        r#"[0.3217505543966422,0.5880026035475675,0.24497866312686414,0.4636476090008061]
-"#,
+        r"null | [atan2((1, 2); (3, 4))]",
+        r"[0.3217505543966422,0.5880026035475675,0.24497866312686414,0.4636476090008061]
+",
         0,
     ),
     (
         r#""a,b,a" | first(indices(repeat(",")))"#,
-        r#"[1,3]
-"#,
+        r"[1,3]
+",
         0,
     ),
     (
         r#""a,b,a" | [limit(2; indices(repeat(",", "a")))]"#,
-        r#"[[1,3],[0,4]]
-"#,
+        r"[[1,3],[0,4]]
+",
         0,
     ),
     (
         r#""a,b,a" | indices((",", error("E"), "a"))"#,
-        r#"[1,3]
-"#,
+        r"[1,3]
+",
         5,
     ),
     (
         r#""a,b,a" | [indices((",", "a"))]"#,
-        r#"[[1,3],[0,4]]
-"#,
+        r"[[1,3],[0,4]]
+",
         0,
     ),
     (
         r#""a,b,a" | first(index(repeat(",")))"#,
-        r#"1
-"#,
+        r"1
+",
         0,
     ),
     (
         r#""a,b,a" | [limit(2; index(repeat(",", "a")))]"#,
-        r#"[1,0]
-"#,
+        r"[1,0]
+",
         0,
     ),
     (
         r#""a,b,a" | index((",", error("E"), "a"))"#,
-        r#"1
-"#,
+        r"1
+",
         5,
     ),
     (
         r#""a,b,a" | [index((",", "a"))]"#,
-        r#"[1,0]
-"#,
+        r"[1,0]
+",
         0,
     ),
     (
         r#""a,b,a" | first(rindex(repeat(",")))"#,
-        r#"3
-"#,
+        r"3
+",
         0,
     ),
     (
         r#""a,b,a" | [limit(2; rindex(repeat(",", "a")))]"#,
-        r#"[3,4]
-"#,
+        r"[3,4]
+",
         0,
     ),
     (
         r#""a,b,a" | rindex((",", error("E"), "a"))"#,
-        r#"3
-"#,
+        r"3
+",
         5,
     ),
     (
         r#""a,b,a" | [rindex((",", "a"))]"#,
-        r#"[3,4]
-"#,
+        r"[3,4]
+",
         0,
     ),
     (
@@ -1368,27 +1368,27 @@ const CASES: &[(&str, &str, i32)] = &[
         0,
     ),
     (
-        r#"[[1,[2]]] | first(flatten(repeat(1)))"#,
-        r#"[1,[2]]
-"#,
+        r"[[1,[2]]] | first(flatten(repeat(1)))",
+        r"[1,[2]]
+",
         0,
     ),
     (
-        r#"[[1,[2]]] | [limit(2; flatten(repeat(1, 0)))]"#,
-        r#"[[1,[2]],[[1,[2]]]]
-"#,
+        r"[[1,[2]]] | [limit(2; flatten(repeat(1, 0)))]",
+        r"[[1,[2]],[[1,[2]]]]
+",
         0,
     ),
     (
         r#"[[1,[2]]] | flatten((1, error("E"), 0))"#,
-        r#"[1,[2]]
-"#,
+        r"[1,[2]]
+",
         5,
     ),
     (
-        r#"[[1,[2]]] | [flatten((1, 0))]"#,
-        r#"[[1,[2]],[[1,[2]]]]
-"#,
+        r"[[1,[2]]] | [flatten((1, 0))]",
+        r"[[1,[2]],[[1,[2]]]]
+",
         0,
     ),
     (
@@ -1459,68 +1459,68 @@ const CASES: &[(&str, &str, i32)] = &[
     ),
     (
         r#""aAbB" | first(test(repeat("a"); ""))"#,
-        r#"true
-"#,
+        r"true
+",
         0,
     ),
     (
         r#""aAbB" | [limit(2; test(repeat("a", "c"); ""))]"#,
-        r#"[true,false]
-"#,
+        r"[true,false]
+",
         0,
     ),
     (
         r#""aAbB" | test(("a", error("E"), "c"); "")"#,
-        r#"true
-"#,
+        r"true
+",
         5,
     ),
     (
         r#""aAbB" | first(test("a"; repeat("")))"#,
-        r#"true
-"#,
+        r"true
+",
         0,
     ),
     (
         r#""aAbB" | [limit(2; test("a"; repeat("", "i")))]"#,
-        r#"[true,true]
-"#,
+        r"[true,true]
+",
         0,
     ),
     (
         r#""aAbB" | test("a"; ("", error("E"), "i"))"#,
-        r#"true
-"#,
+        r"true
+",
         5,
     ),
     (
         r#""aAbB" | [test(("a", "c"); ("", "i"))]"#,
-        r#"[true,false,true,false]
-"#,
+        r"[true,false,true,false]
+",
         0,
     ),
     (
         r#""aAbB" | first(test(repeat("a")))"#,
-        r#"true
-"#,
+        r"true
+",
         0,
     ),
     (
         r#""aAbB" | [limit(2; test(repeat("a", "c")))]"#,
-        r#"[true,false]
-"#,
+        r"[true,false]
+",
         0,
     ),
     (
         r#""aAbB" | test(("a", error("E"), "c"))"#,
-        r#"true
-"#,
+        r"true
+",
         5,
     ),
     (
         r#""aAbB" | [test(("a", "c"))]"#,
-        r#"[true,false]
-"#,
+        r"[true,false]
+",
         0,
     ),
     (
@@ -1862,75 +1862,75 @@ const CASES: &[(&str, &str, i32)] = &[
         0,
     ),
     (
-        r#"[5,6] | first(nth(repeat(0)))"#,
-        r#"5
-"#,
+        r"[5,6] | first(nth(repeat(0)))",
+        r"5
+",
         0,
     ),
     (
-        r#"[5,6] | [limit(2; nth(repeat(0, 1)))]"#,
-        r#"[5,6]
-"#,
+        r"[5,6] | [limit(2; nth(repeat(0, 1)))]",
+        r"[5,6]
+",
         0,
     ),
     (
         r#"[5,6] | nth((0, error("E"), 1))"#,
-        r#"5
-"#,
+        r"5
+",
         5,
     ),
     (
-        r#"[5,6] | [nth((0, 1))]"#,
-        r#"[5,6]
-"#,
+        r"[5,6] | [nth((0, 1))]",
+        r"[5,6]
+",
         0,
     ),
     (
         r#""a" | first(inside(repeat("abc")))"#,
-        r#"true
-"#,
+        r"true
+",
         0,
     ),
     (
         r#""a" | [limit(2; inside(repeat("abc", "xyz")))]"#,
-        r#"[true,false]
-"#,
+        r"[true,false]
+",
         0,
     ),
     (
         r#""a" | inside(("abc", error("E"), "xyz"))"#,
-        r#"true
-"#,
+        r"true
+",
         5,
     ),
     (
         r#""a" | [inside(("abc", "xyz"))]"#,
-        r#"[true,false]
-"#,
+        r"[true,false]
+",
         0,
     ),
     (
-        r#"[1,2,3] | first(bsearch(repeat(2)))"#,
-        r#"1
-"#,
+        r"[1,2,3] | first(bsearch(repeat(2)))",
+        r"1
+",
         0,
     ),
     (
-        r#"[1,2,3] | [limit(2; bsearch(repeat(2, 5)))]"#,
-        r#"[1,-4]
-"#,
+        r"[1,2,3] | [limit(2; bsearch(repeat(2, 5)))]",
+        r"[1,-4]
+",
         0,
     ),
     (
         r#"[1,2,3] | bsearch((2, error("E"), 5))"#,
-        r#"1
-"#,
+        r"1
+",
         5,
     ),
     (
-        r#"[1,2,3] | [bsearch((2, 5))]"#,
-        r#"[1,-4]
-"#,
+        r"[1,2,3] | [bsearch((2, 5))]",
+        r"[1,-4]
+",
         0,
     ),
 ];

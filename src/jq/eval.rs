@@ -127137,7 +127137,9 @@ mod tests {
             )))));
             match eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(BAD_ELEMENT)) {
                 QueryResult::Error(e) if e.is_decode_failure() => {}
-                other => panic!("first(nth((0, .[0]))) unbound: expected a decode failure, got {other:?}"),
+                other => panic!(
+                    "first(nth((0, .[0]))) unbound: expected a decode failure, got {other:?}"
+                ),
             }
             let parsed = parse("first(nth((0, .[0])))").unwrap();
             assert!(
