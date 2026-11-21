@@ -354,6 +354,15 @@ Rows from `printf '<text>' | jq -c .` (a NUL is `\0`), jq 1.7.1 against `succinc
 The last row is the agreement: with a newline in the chunk jq does not truncate either.
 `tests/jq_cli/i5654_nul.rs` pins both sides.
 
+## A `-f` program file with a NUL byte is refused, as jq 1.8.2 refuses it; jq 1.7.1 ends the program at the NUL (#7434)
+
+jq 1.7.1 hands a `-f` program file to its compiler as a C string, so the program ends at the first NUL byte and the rest of the file is dropped without a word: `.a\0| .b` runs `.a`, and `# c\0` followed by a newline and `.a` is a comment alone, which fails with `Top-level program not given`.
+jq 1.8.2 refuses such a file before it compiles it (CVE-2026-41256, upstream commit 5a015deae3, "Fix NUL truncation in program files loaded with -f", listed under the security fixes of its NEWS.md): `jq: program file contains NUL bytes` on stderr, nothing on stdout, exit status 2.
+`succinctly jq` follows 1.8.2, because upstream calls the 1.7.1 behaviour a bug, and so the difference from the pinned 1.7.1 stands as `newer-than-primary`.
+The refusal comes before the input files are opened, as in 1.8.2, and covers a NUL anywhere in the file, in a comment included, and `-f /dev/stdin`.
+`succinctly yq` is not changed.
+Pinned by `tests/jq_cli/i7434.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
+
 ## A standard input that cannot be read: matched, with these differences (#7126)
 
 A standard input that cannot be read is an empty one in jq 1.7.1, which counts the failed read and exits 2 once the run is over, whatever the program left (`-e`'s 4, `input`'s 5), and for a plain read without a word on stderr.
