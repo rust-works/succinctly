@@ -8249,7 +8249,9 @@ Every pass that reads a pattern before the engine does takes the same raised lim
 The engines compile a pattern of 511 nested groups in a debug build on the default stack, which `tests/jq_cli/i7528.rs` runs.
 Still refused earlier than jq: a look-around or an atomic group nested more than 63 deep (`(?=` x 64), because those patterns go to `fancy-regex`, whose recursion limit of 64 is a constant of the crate; jq answers them to 511.
 The refusal there is the crate's rendered parse error, not `parse depth limit over`.
-`succinctly yq` is not affected: its patterns are Go's and read by the crate with its default limit.
+`succinctly yq` reads its patterns (Go's syntax, translated) through the same builder, so the crate's raised nesting limit applies to it too: a pattern the crate reads to about 2,100 nested nodes is now compiled, where the default limit refused it at 250.
+Go's `regexp` accepts up to 999 nested groups and refuses 1000 with `expression nests too deeply`, so `succinctly yq` now agrees with yq for 251 to 999 and still differs from 1000 to about 2,100, where yq refuses (and past that, where it refuses with the crate's own parse error).
+`succinctly yq` does not count groups as jq mode does; the 511 limit is jq mode's.
 Pinned by `tests/jq_cli/i7528.rs`, whose rows are jq 1.8.2's output for every regex builtin.
 
 ### A large counted repeat of a Unicode class is refused, where jq answers it (#6439)
