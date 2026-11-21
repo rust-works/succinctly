@@ -13027,6 +13027,7 @@ This supersedes the 1.7.1 behaviour the #1035, #3044/#3075 and #6049 sections de
 The 1.8 precedence change that came with it is not adopted: jq 1.8 also reads `-` as binding tighter than `*` (`'-' Term`, jqlang/jq#3053, a "Language changes" entry marked breaking), so `-0 * 1` is `(-0) * 1`, which is `0` there.
 `succinctly jq` keeps 1.7.1's `-(0 * 1)`, and the computed `0 * 1` negates to `-0`, as in 1.7.1.
 `-(-0) * 1` is `-0` here for the same reason, where both jq versions answer `0`: it negates the computed `(-0) * 1`, and 1.8's `-0` is the literal `0`.
+Two other 1.8 changes next to this one are not adopted either: `limit` raising for a negative count (jqlang/jq#3181), so `[limit(-1e-400; 1, 2)]` is `[1,2]` here (the count is the literal `-1E-400`, and 1.7.1's `limit` takes every output for a negative count) where 1.8.2 raises, and `length` keeping a literal's precision (jqlang/jq#3275).
 
 ### A bare trailing decimal point with no exponent (`1.`) reads as the integer (#6052) — divergence closed
 
