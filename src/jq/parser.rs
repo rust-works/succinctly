@@ -737,8 +737,20 @@ fn begins_yq_name_outside_an_identifier(c: char) -> bool {
 /// decided to call it -- exactly the "duplicated predicates diverge
 /// silently" failure mode CLAUDE.md's #106 note warns about, now closed by
 /// having one definition instead of three hand-kept copies).
+///
+/// ASCII only (#7433): jq's identifier is `[a-zA-Z_][a-zA-Z_0-9]*` and a letter such as `é` or
+/// `中` is an `INVALID_CHARACTER` in a field name, a `def` name, a `$variable`, an object key
+/// or an import alias (exit 3); yq's lexer rejects them too, except in the unquoted path
+/// element after a `.`, which [`is_yq_path_element_char`] reads. A quoted name takes any text.
 fn is_ident_start_char(c: char) -> bool {
-    c.is_alphabetic() || c == '_'
+    c.is_ascii_alphabetic() || c == '_'
+}
+
+/// The one definition of "does this character continue a bare identifier": the characters of
+/// [`is_ident_start_char`] and the digits. Every identifier scan reads it, so none of them can
+/// take a letter the others refuse (#7433, #106).
+fn is_ident_continue_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
 }
 
 /// `with(PATH; UPDATE)` once its arguments are read: a metadata assignment in the update is a stage
@@ -1608,7 +1620,7 @@ fn collect_def_names(input: &str) -> BTreeSet<String> {
     // at all without succinctly's own extension -- a mode-blind superset
     // only ever widens the (already-imprecise) set, never narrows it.
     fn is_ident_continue(c: char) -> bool {
-        c.is_alphanumeric() || c == '_' || c == '-'
+        is_ident_continue_char(c) || c == '-'
     }
 
     // #2036 review round 2's comment-skip loop, factored out so the
@@ -3138,7 +3150,7 @@ impl<'a> Parser<'a> {
         // subtraction; `sin - approx` still is). Operators and structural
         // words never begin a name, so `-` after them stays a boundary:
         // `true and-1` is `true and (-1)` in yq too.
-        !matches!(next_char, Some(c) if c.is_alphanumeric() || c == '_')
+        !matches!(next_char, Some(c) if is_ident_continue_char(c))
             && (NON_NAME_KEYWORDS.contains(&keyword) || !self.yq_hyphen_continues_ident(after))
     }
 
@@ -3154,7 +3166,7 @@ impl<'a> Parser<'a> {
             && self.input[at + 1..]
                 .chars()
                 .next()
-                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                .is_some_and(is_ident_continue_char)
     }
 
     /// Real yq's lexer has no token for jq-only surface like `paths`,
@@ -3322,7 +3334,7 @@ impl<'a> Parser<'a> {
         // Subsequent characters can be alphanumeric or underscore
         // In Yq mode, also allow hyphens (but not at the end)
         while let Some(c) = self.peek() {
-            if c.is_alphanumeric() || c == '_' {
+            if is_ident_continue_char(c) {
                 self.next();
             } else if self.yq_hyphen_continues_ident(self.pos) {
                 // In Yq mode, allow hyphen if followed by valid ident char
@@ -8363,7 +8375,7 @@ impl<'a> Parser<'a> {
         let rest = &self.input[pos..];
         let end = rest
             .char_indices()
-            .find(|&(_, c)| !(c.is_alphanumeric() || c == '_'))
+            .find(|&(_, c)| !is_ident_continue_char(c))
             .map_or(rest.len(), |(i, _)| i);
         &rest[..end]
     }
