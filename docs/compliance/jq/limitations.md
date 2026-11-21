@@ -15042,13 +15042,10 @@ parser's own error-position/message rules for this one CLI-arg error path — ou
 to this issue's own "Low severity" scope, which was the exit code and the reporting channel,
 not this detail text.
 
-`--rawfile`'s "Could not open" wrapper also covers invalid-UTF-8 file content (`std::io::Error`'s
-`ErrorKind::InvalidData`, since this crate reads the argument as a Rust `String`) — unverifiable
-against jq, which reads raw bytes and never rejects invalid UTF-8 there at all (confirmed live:
-`jq -nc 1 --rawfile x <file with invalid UTF-8>` exits 0, the content silently unused by a filter
-that never reads `$x`). Not the scope of this issue either: it is a pre-existing limitation of
-this crate's whole `--rawfile`/`--slurpfile` pipeline being built on `String`, not something
-#3051 introduces or narrows.
+A `--rawfile`, `--slurpfile` or `-f` file with a byte that is not valid UTF-8 was refused with that wrapper (`Could not open <file>: stream did not contain valid UTF-8`, exit 2) until [#7436](https://github.com/rust-works/succinctly/issues/7436); jq reads it with U+FFFD, and so does `succinctly jq` now.
+jq's `jv_load_file` reads `-f` and `--rawfile` 4,096 bytes at a time, reads on to the end of a character the last byte of a full read starts, and decodes each read on its own, so a sequence cut short by the end of a read is one U+FFFD to that end, and that is matched (`jq_raw_file_text`).
+`--slurpfile` is parsed, and the bytes of its strings are decoded as the main input's are.
+A program whose U+FFFD is outside a string or a comment is a compile error, exit 3, as in jq.
 
 `--jsonargs`, `-f`/`--from-file`, and the main input file had the same exit-1 bug (confirmed
 live: jq exits 2 for a bad `--jsonargs` value, an unreadable filter file, and an unreadable
