@@ -78,6 +78,8 @@ pub mod document;
 mod element_run;
 // Only the `std` build reads the environment; a `no_std` build parses the builtin and refuses it.
 mod encoder_comments;
+#[cfg(all(unix, feature = "std"))]
+mod environ;
 #[cfg_attr(not(feature = "std"), allow(dead_code))]
 mod envsubst;
 mod error;
@@ -145,6 +147,7 @@ mod yq_datetime;
 mod yq_xml;
 
 pub use error::{BinOp, Control, ErrorKind, EvalError, EvalErrorPayload};
+pub(crate) use eval::json_truthiness;
 pub(crate) use eval::last_as_reduce;
 pub(crate) use eval::nonfinite_yaml_spelling;
 #[cfg(feature = "std")]
@@ -186,10 +189,10 @@ pub use eval::snapshot_environment;
 // stream" to seed under a `no_std` embedding with no CLI driver anyway).
 #[cfg(feature = "std")]
 pub use eval::{
-    count_reads_past_end, current_input_location, hold_reads_past_end, pop_input,
-    pop_remaining_input, seed_remaining_inputs, seed_remaining_inputs_from,
+    clear_input_reads, count_reads_past_end, current_input_location, hold_reads_past_end,
+    input_reads, pop_input, pop_remaining_input, seed_remaining_inputs, seed_remaining_inputs_from,
     seed_remaining_inputs_with_error, seed_remaining_inputs_with_errors, set_input_read_hook,
-    InputPop, InputProducer, ProducedInput, UNKNOWN_INPUT_LINE,
+    InputPop, InputProducer, InputReads, ProducedInput, UNKNOWN_INPUT_LINE,
 };
 // `input_queue_is_active` exists under both gates (a `const fn` returning
 // `false` without `std`), so `eval_generic` can consult it unconditionally.
@@ -216,9 +219,9 @@ pub use lazy::JqValue;
 // #5497: jq's parse-depth limit, applied by the CLI's document routes.
 #[doc(hidden)]
 pub use parse_message::{
-    is_jq_depth_fault, jq_depth_fault_offset, jq_input_depth_fault, jq_stream_fault,
-    jq_stream_fault_chunk, jq_stream_fault_end, jq_stream_prefix_fault, InputSource,
-    JQ_MAX_PARSING_DEPTH,
+    is_jq_depth_fault, jq_depth_fault_offset, jq_input_depth_fault, jq_stream_depth_fault_offset,
+    jq_stream_fault, jq_stream_fault_chunk, jq_stream_fault_end, jq_stream_prefix_fault,
+    InputSource, JqStreamFaults, JQ_MAX_PARSING_DEPTH,
 };
 pub use parser::{
     collect_break_sites, collect_call_sites, collect_def_sites, collect_var_sites, parse,

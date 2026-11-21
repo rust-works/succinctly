@@ -272,11 +272,13 @@ const URID_DUMP_KEEP: usize = 25;
 /// and split the two conventions apart, so the correct writer is now available
 /// by name.)
 ///
-/// Where the cut falls: jq cuts at a byte offset and can therefore split a
+/// Where the cut falls: jq 1.7.1 cuts at a byte offset and can therefore split a
 /// multi-byte character, which building the message as a `jv` string turns
-/// into one U+FFFD. The sink snaps back to the character boundary and
-/// [`dump_truncated_at`] writes that U+FFFD (#6434), so the two
-/// agree byte for byte — see `docs/compliance/jq/limitations.md`.
+/// into one U+FFFD. jq 1.8 fixed that (jqlang/jq#3249, "should not break Unicode
+/// characters"): the cut moves back to the character start. The sink does the
+/// same and [`dump_truncated_at`] writes no replacement (#7524); the budget stays
+/// 1.7.1's, as the wider previews of jq 1.8.2 (jqlang/jq#3478) are not adopted —
+/// see `docs/compliance/jq/limitations.md`.
 ///
 /// jq-pinned shim (#1055): delegates to [`dump_truncated_with`] fixed at
 /// [`EvalTag::Jq`]. Migrate a call site to `dump_truncated_with(S::TAG, ..)`
@@ -325,12 +327,11 @@ fn dump_truncated_at(tag: EvalTag, value: &OwnedValue, budget: usize, keep: usiz
     if !sink.overflowed {
         return sink.buf;
     }
-    // #6434: jq copies `keep` bytes and builds the message as a `jv` string, which replaces a
-    // character the cut split with one U+FFFD. yq never cuts a value in its messages; the
-    // yq-mode messages that do are jq's convention (the shims above), so the rule is one.
-    if sink.truncate_to(keep) {
-        sink.buf.push(char::REPLACEMENT_CHARACTER);
-    }
+    // #7524: jq 1.7.1 copies `keep` bytes, so a split character became one U+FFFD in its message
+    // (#6434 matched that); jq 1.8 backs the cut up to the character start instead (jqlang/jq#3249)
+    // and writes nothing in its place. yq never cuts a value in its messages; the yq-mode messages
+    // that do are jq's convention (the shims above), so the rule is one.
+    sink.truncate_to(keep);
     sink.buf.push_str("...");
     sink.buf
 }
@@ -361,8 +362,8 @@ fn stream_value_preview<W: core::fmt::Write>(
 ///   JSON string arrives from the streaming writer as one span, so clamping the
 ///   copy — not just refusing later writes — is what actually bounds the work.
 /// * `buf` stays valid UTF-8: an oversized span is cut back to a `char`
-///   boundary. jq's `strncpy` keeps the split bytes, which its message then
-///   holds as one U+FFFD; [`dump_truncated_at`] writes it (#6434).
+///   boundary. jq 1.7.1's `strncpy` keeps the split bytes, which its message then
+///   holds as one U+FFFD; jq 1.8 and [`dump_truncated_at`] drop them (#7524).
 struct PreviewSink {
     /// The retained prefix; never longer than `cap`, always valid UTF-8.
     buf: String,
@@ -381,13 +382,11 @@ impl PreviewSink {
         }
     }
 
-    /// Cut `buf` back to at most `len` bytes, on a `char` boundary, and say whether the cut split
-    /// a character (so that bytes short of `len` were dropped with it).
-    fn truncate_to(&mut self, len: usize) -> bool {
+    /// Cut `buf` back to at most `len` bytes, on a `char` boundary.
+    fn truncate_to(&mut self, len: usize) {
         let want = len.min(self.buf.len());
         let cut = floor_char_boundary(&self.buf, want, 0);
         self.buf.truncate(cut);
-        cut < want
     }
 }
 
@@ -577,8 +576,8 @@ impl EvalError {
     /// key, `Cannot index <container> with <key type>`.
     ///
     /// jq embeds the key's text only when it is a string, and does not
-    /// truncate it, but leaves it out of a key of 30 bytes or more
-    /// (#5817). A slice reports its key as `object`, because jq models
+    /// truncate it (except at a NUL byte, #7450), but leaves it out of a key of
+    /// 30 bytes or more (#5817). A slice reports its key as `object`, because jq models
     /// `.[a:b]` as indexing with `{"start":a,"end":b}`.
     pub fn cannot_index(container_type: &str, key: &OwnedValue) -> Self {
         if let Some(err) = Self::unreadable_container(container_type) {
@@ -609,8 +608,12 @@ impl EvalError {
         if key.len() >= LONG_INDEX_KEY {
             return Self::new(format!("Cannot index {container_type} with string"));
         }
+        // jq writes the key with a C `%s`, which stops at a NUL byte (#7450): jq 1.7.1 answers
+        // `Cannot index array with string "a"` for the key `"a\u0000b"`, the closing quote and
+        // the rest of the message kept. The length test above reads the whole key.
+        let shown = key.split('\0').next().unwrap_or(key);
         Self::new(format!(
-            "Cannot index {container_type} with string \"{key}\""
+            "Cannot index {container_type} with string \"{shown}\""
         ))
     }
 
@@ -1598,6 +1601,14 @@ impl EvalError {
         Self::subject(value, "number required")
     }
 
+    /// `<v> halt_error/1: number required` -- `halt_error(x)` with a non-number `x`. `<v>` is
+    /// the INPUT value, not `x`: jq's `f_halt_error` raises `type_error(input, ...)`
+    /// (`"in" | halt_error("x")` -> `string ("in") halt_error/1: number required`, jq 1.7.1;
+    /// #7441).
+    pub fn halt_error_number_required(input: &OwnedValue) -> Self {
+        Self::subject(input, "halt_error/1: number required")
+    }
+
     /// `<v> has no length`.
     pub fn has_no_length(value: &OwnedValue) -> Self {
         Self::subject(value, "has no length")
@@ -1700,6 +1711,13 @@ impl EvalError {
     /// `<v> cannot be parsed as a number`.
     pub fn cannot_parse_as_number(value: &OwnedValue) -> Self {
         Self::subject(value, "cannot be parsed as a number")
+    }
+
+    /// `<v> cannot be parsed as a boolean` — `toboolean` (jq 1.8) on anything but a boolean or the
+    /// strings `"true"` and `"false"` (#7529). The value is dumped as JSON, so a control character
+    /// is `\u0001` and not Rust's `\u{1}`, and every type is named with its value.
+    pub fn cannot_parse_as_boolean(value: &OwnedValue) -> Self {
+        Self::subject(value, "cannot be parsed as a boolean")
     }
 
     /// `<v> only strings can be parsed` — `fromjson` on a non-string.
@@ -1981,19 +1999,19 @@ mod tests {
     }
 
     #[test]
-    fn dump_truncation_that_splits_a_character_writes_one_replacement_6434() {
-        // jq cuts mid-character here, and its message holds U+FFFD where the partial character
-        // was (`"あああ\u{FFFD}...`, one replacement whatever is left of the character).
-        assert_eq!(dump_truncated(&s("あああああ")), "\"あああ\u{FFFD}...");
-        assert_eq!(dump_truncated(&s("a😀😀😀")), "\"a😀😀\u{FFFD}...");
-        assert_eq!(dump_truncated(&s("abc😀😀😀")), "\"abc😀\u{FFFD}...");
-        assert_eq!(dump_truncated(&s("abcd😀😀😀")), "\"abcd😀\u{FFFD}...");
+    fn dump_truncation_that_splits_a_character_backs_up_to_its_start_7524() {
+        // jq 1.7.1 cuts mid-character here and its message holds U+FFFD; jq 1.8 (jqlang/jq#3249)
+        // moves the cut back to the character start, and so do we (#7524, which reversed #6434).
+        assert_eq!(dump_truncated(&s("あああああ")), "\"あああ...");
+        assert_eq!(dump_truncated(&s("a😀😀😀")), "\"a😀😀...");
+        assert_eq!(dump_truncated(&s("abc😀😀😀")), "\"abc😀...");
+        assert_eq!(dump_truncated(&s("abcd😀😀😀")), "\"abcd😀...");
         // A cut on a boundary writes none.
         assert_eq!(dump_truncated(&s("ab😀😀😀")), "\"ab😀😀...");
         // One rule in both modes: a yq-mode message that cuts a value uses jq's convention.
         assert_eq!(
             dump_truncated_with(EvalTag::Yq, &s("あああああ")),
-            "\"あああ\u{FFFD}..."
+            "\"あああ..."
         );
     }
 
@@ -2227,6 +2245,28 @@ mod tests {
                 expected
             );
         }
+    }
+
+    /// #7450: the key is written with a C `%s`, which stops at a NUL byte; the length that leaves
+    /// a long key out is the whole key's.
+    #[test]
+    fn an_index_key_stops_at_its_nul_7450() {
+        for (key, want) in [
+            ("a\0b", "Cannot index array with string \"a\""),
+            ("\0", "Cannot index array with string \"\""),
+            ("\u{e9}\0x", "Cannot index array with string \"\u{e9}\""),
+        ] {
+            assert_eq!(EvalError::cannot_index("array", &s(key)).message, want);
+            assert_eq!(
+                EvalError::cannot_index_with_field("array", key).message,
+                want
+            );
+        }
+        let long = format!("a\0{}", "b".repeat(28));
+        assert_eq!(
+            EvalError::cannot_index("array", &s(&long)).message,
+            "Cannot index array with string"
+        );
     }
 
     /// The object-key refusal names the kind and previews the value, and the

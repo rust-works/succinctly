@@ -148,7 +148,7 @@ const ACCEPTED: &[(&str, &str)] = &[
     ("[NaN,1]", "[null,1]\n"),
     ("[Infinity,1]", "[1.7976931348623157e+308,1]\n"),
     ("[-Infinity,1]", "[-1.7976931348623157e+308,1]\n"),
-    ("[Nan4000,1]", "[null,1]\n"),
+    ("[Nan0,1]", "[null,1]\n"),
     ("[true,false,null]", "[true,false,null]\n"),
     ("[1,2]\n[3]", "[1,2]\n[3]\n"),
 ];
