@@ -327,7 +327,7 @@ pub(crate) fn jq_negated_literal(repr: NumberRepr, text: &str) -> Option<(Number
         .or_else(|| text.strip_prefix('+'))
         .unwrap_or(text);
     let zero = magnitude
-        .split(|c| c == 'e' || c == 'E')
+        .split(['e', 'E'])
         .next()
         .is_some_and(|mantissa| mantissa.bytes().all(|b| b == b'0' || b == b'.'));
     let spelled = if zero || text.starts_with('-') {
