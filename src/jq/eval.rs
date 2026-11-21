@@ -9973,7 +9973,11 @@ where
     // recursion, as in `f(n - 1) as $a | f(n - 2) as $b | $a + $b` -- does
     // not run on top of the source's own frames. See
     // `settles_before_consumer`.
-    let flow = if settles_before_consumer(arg_expr) {
+    // #7460: so is a call whose body answers once (`tail_call::call_head_settles`), which reaches
+    // the shapes a recursion threads its state through (`Q(n - 1) as $q1 | ...`).
+    let flow = if settles_before_consumer(arg_expr)
+        || (S::TAG == EvalTag::Jq && super::tail_call::call_head_settles(arg_expr, true))
+    {
         settle_then_replay(
             |collect| eval_each::<W, S>(arg_expr, value, optional, collect),
             &mut on_item,
@@ -11252,7 +11256,16 @@ fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
             }
         };
-        eval_each::<W, S>(first, value, optional, &mut driver)
+        // #7460: a call that settles runs to its one value before the rest of the pipe runs on it,
+        // so a recursion piping one call into the next holds its depth on the stack, not its calls.
+        if S::TAG == EvalTag::Jq && super::tail_call::call_head_settles(first, true) {
+            settle_then_replay(
+                |collect| eval_each::<W, S>(first, value, optional, collect),
+                &mut driver,
+            )
+        } else {
+            eval_each::<W, S>(first, value, optional, &mut driver)
+        }
     };
 
     pipe_terminal_after_retry(

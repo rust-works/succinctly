@@ -123,6 +123,9 @@ const SETTLE_BUDGET: u32 = 1024;
 struct Ctx<'a> {
     jq: bool,
     locals: &'a [&'a str],
+    /// The definition whose body is being walked for [`call_head_settles`] (#7460): a call to
+    /// itself with its arity, and a read of one of its bare parameters, are taken to settle.
+    own: Option<&'a FuncDefData>,
 }
 
 /// Whether `expr` yields at most one output and does nothing observable besides
@@ -148,7 +151,14 @@ struct Ctx<'a> {
 /// In yq mode a key or a slice bound that is computed does not settle: an index
 /// whose key yields nothing answers every child there (`.a[select(false)]`).
 pub(crate) fn stage_settles(expr: &Expr, jq: bool) -> bool {
-    settles_in(expr, &Ctx { jq, locals: &[] })
+    settles_in(
+        expr,
+        &Ctx {
+            jq,
+            locals: &[],
+            own: None,
+        },
+    )
 }
 
 fn settles_in(expr: &Expr, cx: &Ctx<'_>) -> bool {
@@ -189,6 +199,30 @@ fn settles(expr: &Expr, budget: &mut u32, cx: &Ctx<'_>) -> bool {
         // A call to a def declared in the body being walked: optimistic, the bound
         // call is asked the real question when the walk reaches it.
         Expr::FuncCall { name, .. } if cx.locals.contains(&name.as_str()) => true,
+        // #7460: within a definition's body, a call to the definition itself settles by induction
+        // on the recursion (every level's body settles given that its calls do), once its arguments
+        // do, and a bare parameter's read reads an argument its call already checked.
+        Expr::FuncCall { name, args, .. }
+            if cx.own.is_some_and(|def| {
+                (*name == def.name && args.len() == def.params.len())
+                    || (args.is_empty() && def.params.iter().any(|p| p.name() == name))
+            }) =>
+        {
+            args.iter().all(|arg| settles(arg, budget, cx))
+        }
+        // #7460: one value bound, then one body run for it, as `single_valued_pure` reads `as`;
+        // asked only for a call at a pipe's head, so the tail loop's own question is unchanged.
+        Expr::As {
+            expr: source, body, ..
+        } if cx.own.is_some() => settles(source, budget, cx) && settles(body, budget, cx),
+        // One write, or read, per path (and value) its arguments yield: a memoised recursion
+        // stores its answer with `setpath` (Rosetta Code's Hofstadter Q sequence).
+        Expr::Builtin(Builtin::SetPath(path, value)) if cx.own.is_some() => {
+            settles(path, budget, cx) && settles(value, budget, cx)
+        }
+        Expr::Builtin(Builtin::GetPath(path) | Builtin::DelPaths(path)) if cx.own.is_some() => {
+            settles(path, budget, cx)
+        }
         Expr::DefCall { def, args, .. } if args.is_empty() && def.params.is_empty() => def
             .settles_or_init(cx.jq, |body| {
                 let mut fresh = SETTLE_BUDGET;
@@ -198,6 +232,7 @@ fn settles(expr: &Expr, budget: &mut u32, cx: &Ctx<'_>) -> bool {
                     &Ctx {
                         jq: cx.jq,
                         locals: &[],
+                        own: None,
                     },
                 )
             }),
@@ -247,11 +282,66 @@ fn builtin_settles(builtin: &Builtin) -> bool {
     )
 }
 
+/// How many nodes [`call_head_settles`] walks of a call's arguments. Small: they are walked on
+/// every evaluation of the pipe the call leads, and a long one (a lazy argument chain) only keeps the
+/// route the pipe took before.
+const CALL_ARGS_BUDGET: u32 = 128;
+
+/// Whether `expr`, the first stage of a pipe, is a call to a `def` that may be run to its one value
+/// before the rest of the pipe runs on it (#7460), as a tail-call loop runs a stage ahead of its
+/// call ([`stage_settles`]): the call's arguments settle, and so does the definition's body, taking
+/// its own recursive calls and its bare parameters to settle (remembered on the definition).
+///
+/// A tree recursion that pipes one call into the next, `def f($n): if $n == 0 then . + 1 else
+/// f($n - 1) | f($n - 1) end`, ran the second call inside the first call's output sink, so every
+/// call ever made stayed on the native stack until the outermost one returned: 8,192 calls at
+/// depth 13 spent it, where jq's stack holds only the live calls. Settled, the first call returns
+/// before the second runs, and the stack holds the recursion's depth.
+pub(crate) fn call_head_settles(expr: &Expr, jq: bool) -> bool {
+    let (def, args) = match expr {
+        Expr::Paren(inner) => return call_head_settles(inner, jq),
+        Expr::DefCall { def, args, .. } => (def, args),
+        _ => return false,
+    };
+    let body_settles = def.call_settles_or_init(jq, |body| {
+        let mut budget = SETTLE_BUDGET;
+        settles(
+            body,
+            &mut budget,
+            &Ctx {
+                jq,
+                locals: &[],
+                own: Some(def),
+            },
+        )
+    });
+    let mut budget = CALL_ARGS_BUDGET;
+    body_settles
+        && args.iter().all(|arg| {
+            settles(
+                arg,
+                &mut budget,
+                &Ctx {
+                    jq,
+                    locals: &[],
+                    own: None,
+                },
+            )
+        })
+}
+
 /// Whether a pipe's stages in front of its last are all [`stage_settles`], and
 /// the evaluator would not take a different route for the pipe than running
 /// them in order (`needs_path_context`).
 pub(crate) fn pipe_settles_before_last(stages: &PipeStages, jq: bool) -> bool {
-    pipe_settles_in(stages, &Ctx { jq, locals: &[] })
+    pipe_settles_in(
+        stages,
+        &Ctx {
+            jq,
+            locals: &[],
+            own: None,
+        },
+    )
 }
 
 fn pipe_settles_in(stages: &PipeStages, cx: &Ctx<'_>) -> bool {
@@ -299,7 +389,16 @@ fn reach<'a>(body: &'a Expr, def: &FuncDefData, jq: bool, locals: &mut Vec<&'a s
             Expr::As {
                 expr: source, body, ..
             } => {
-                if !jq || !settles_in(source, &Ctx { jq, locals }) {
+                if !jq
+                    || !settles_in(
+                        source,
+                        &Ctx {
+                            jq,
+                            locals,
+                            own: None,
+                        },
+                    )
+                {
                     break false;
                 }
                 expr = body;
@@ -309,7 +408,14 @@ fn reach<'a>(body: &'a Expr, def: &FuncDefData, jq: bool, locals: &mut Vec<&'a s
                 then_branch,
                 else_branch,
             } => {
-                if !settles_in(cond, &Ctx { jq, locals }) {
+                if !settles_in(
+                    cond,
+                    &Ctx {
+                        jq,
+                        locals,
+                        own: None,
+                    },
+                ) {
                     break false;
                 }
                 if reach(then_branch, def, jq, locals) {
@@ -318,7 +424,18 @@ fn reach<'a>(body: &'a Expr, def: &FuncDefData, jq: bool, locals: &mut Vec<&'a s
                 expr = else_branch;
             }
             Expr::Pipe(stages) => match stages.last() {
-                Some(last) if pipe_settles_in(stages, &Ctx { jq, locals }) => expr = last,
+                Some(last)
+                    if pipe_settles_in(
+                        stages,
+                        &Ctx {
+                            jq,
+                            locals,
+                            own: None,
+                        },
+                    ) =>
+                {
+                    expr = last;
+                }
                 _ => break false,
             },
             Expr::Comma(items) => match items.last() {
@@ -699,6 +816,68 @@ mod tests {
             assert_eq!(stage_settles(&call, true), want, "`{def_src}`");
             assert_eq!(stage_settles(&call, true), want, "`{def_src}`, remembered");
         }
+    }
+
+    /// #7460: a call at a pipe's head settles when its arguments do and its definition's body
+    /// does, the definition's own calls and bare parameters taken to settle; asked again, the
+    /// body's answer is read back.
+    #[test]
+    fn a_call_at_a_pipes_head_settles_when_its_body_does_7460() {
+        for (def_src, want) in [
+            (
+                "def f($n): if $n == 0 then . + 1 else f($n - 1) | f($n - 1) end; f(3)",
+                true,
+            ),
+            (
+                "def f(n): if n == 0 then . + 1 else f(n - 1) | f(n - 1) end; f(3)",
+                true,
+            ),
+            (
+                "def f($m; $i): (if $i <= $m then .c += 1 else . end) \
+                 | if $i > $m then . else f($m; $i * 2) | f($m; $i * 2 + 1) end; f(9; 1)",
+                true,
+            ),
+            // What a level computes, bound with `as`.
+            (
+                "def f($n): if $n == 0 then . else ($n - 1) as $m | f($m) | f($m) end; f(3)",
+                true,
+            ),
+            // A memoised answer stored with `setpath`.
+            (
+                "def f($n): if $n == 0 then . else f($n - 1) as $q | $q | setpath([$n]; 1) end; f(3)",
+                true,
+            ),
+            ("def f($n): setpath([$n]; (1, 2)) | f($n - 1); f(3)", false),
+            // A generator in the body, or in an argument, or a call with another arity.
+            ("def f($n): .[] | f($n - 1); f(3)", false),
+            (
+                "def f($n): if $n == 0 then . else f($n - 1) end; f(1, 2)",
+                false,
+            ),
+            ("def f($n): f($n; 1); f(3)", false),
+            ("def f($n): ($n, 1) | f(0); f(3)", false),
+        ] {
+            let Expr::FuncDef {
+                name,
+                params,
+                body,
+                then,
+                ..
+            } = parse(def_src).expect("parses")
+            else {
+                panic!("a def");
+            };
+            let def = Rc::new(FuncDefData::new(name, params, *body));
+            let call = install_def_calls(&then, &def, 0, false);
+            assert_eq!(call_head_settles(&call, true), want, "`{def_src}`");
+            assert_eq!(
+                call_head_settles(&call, true),
+                want,
+                "`{def_src}`, remembered"
+            );
+        }
+        // Only a call: anything else at a pipe's head keeps its route.
+        assert!(!call_head_settles(&parse(". + 1").expect("parses"), true));
     }
 
     /// A body is run again as it is only when its calls are all jumps and it declares nothing
