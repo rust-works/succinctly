@@ -8371,9 +8371,20 @@ fn read_inputs(
         let mut value_locations = read.locations;
         // `--slurp` closes its array at the call that empties jq's buffer, so what that call left
         // behind comes out after the array as inputs of their own.
+        //
+        // jq 1.8 reads once more after the last byte before it closes the array (jqlang/jq#3279,
+        // #7523), so the closing event of a top-level container that ends the text, which 1.7.1's
+        // parser still held at that point and gave out after the array, is in the array: `printf
+        // '[1,2]' | jq -c -s --stream .` is one array of all three events. That is `--stream -s`
+        // and `--stream-errors -s`; `--seq` keeps the 1.7.1 model of the loop.
+        let inside = if (args.stream || args.stream_errors) && !args.seq {
+            read.inside + usize::from(values.get(read.inside).is_some_and(crate::cli::jq_stream_errors::is_closing_event))
+        } else {
+            read.inside
+        };
         let after_array = args.slurp.then(|| {
-            let outside = values.split_off(read.inside);
-            let outside_locations = value_locations.split_off(read.inside - read.locations_from);
+            let outside = values.split_off(inside);
+            let outside_locations = value_locations.split_off(inside - read.locations_from);
             let (source, line) = read.slurp_at;
             values = vec![OwnedValue::array_from(std::mem::take(&mut values))];
             value_locations = vec![(source, line)];

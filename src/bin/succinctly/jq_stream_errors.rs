@@ -1106,12 +1106,27 @@ pub(crate) fn read_for_deferred_slurp(sources: &[(Option<usize>, Vec<u8>)]) -> D
         }
     }
     after.sort_by_key(|(at, _)| *at);
+    // jq 1.8 reads once more after the last byte before it closes the array (jqlang/jq#3279,
+    // #7523), so the closing event its parser still held at that point is in the array. jq 1.7.1
+    // gave it out after the array, as an input of its own.
+    if matches!(after.first(), Some((_, Afterwards::Value(value, _))) if is_closing_event(value)) {
+        if let (_, Afterwards::Value(value, _)) = after.remove(0) {
+            events.push(value);
+        }
+    }
     DeferredSlurp {
         array: events,
         slurp_at: end.slurp_at,
         before,
         after: after.into_iter().map(|(_, item)| item).collect(),
     }
+}
+
+/// Whether `value` is a container's closing event, `[path]`: not a leaf (`[path, value]`) and not a
+/// fault (`[message, path]`).
+pub(crate) fn is_closing_event(value: &OwnedValue) -> bool {
+    matches!(value, OwnedValue::Array(parts)
+        if parts.len() == 1 && matches!(parts[0], OwnedValue::Array(_)))
 }
 
 /// What [`Parser::feed`] did with a refill.
