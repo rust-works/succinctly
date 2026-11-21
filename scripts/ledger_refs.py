@@ -51,7 +51,9 @@ def git(*args, cwd=None):
 
 _STRING_FIELD = re.compile(r'^(\w+)\s*=\s*"((?:[^"\\]|\\.)*)"\s*(?:#.*)?$', re.MULTILINE)
 _ENTRY_HEADER = re.compile(r"^\[\[divergence\]\]\s*$", re.MULTILINE)
-_ENTRY_PATH = re.compile(r"([A-Za-z0-9_-]+)/([A-Za-z0-9_-]+)(?:\.([0-9]+))?\.toml")
+# A suite may hold a `.` after its first character: the differential suites are named after their
+# test file (`upstream-jq.test/1942.toml` is `upstream-jq.test:1942`, src/bin/succinctly/compare/ledger.rs).
+_ENTRY_PATH = re.compile(r"([A-Za-z0-9_-][A-Za-z0-9_.-]*)/([A-Za-z0-9_-]+)(?:\.([0-9]+))?\.toml")
 
 
 def entry_id(rel):
