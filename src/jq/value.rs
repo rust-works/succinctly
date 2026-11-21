@@ -311,6 +311,34 @@ pub(crate) fn parse_i64_exact(s: &str) -> Option<i64> {
     Some(value)
 }
 
+/// jq 1.8's `_negate` of a number literal (#7453): the negated decimal, still
+/// a literal, so it keeps every digit and compares exactly (jqlang/jq#3242,
+/// which fixed jq 1.7.1 turning the operand into a double, jqlang/jq#2704).
+/// `decNumberMinus` computes `0 - x`, so a zero of either sign negates to
+/// positive zero with its spelling otherwise kept (`-0` is `0`, `-0.0` is
+/// `0.0`). Zero is the decimal's, not the double's: `1e-400` negates to
+/// `-1E-400`. `None` for a NaN, which has no decimal to negate.
+pub(crate) fn jq_negated_literal(repr: NumberRepr, text: &str) -> Option<(NumberRepr, String)> {
+    if matches!(repr, NumberRepr::Float(f) if f.is_nan()) {
+        return None;
+    }
+    let magnitude = text
+        .strip_prefix('-')
+        .or_else(|| text.strip_prefix('+'))
+        .unwrap_or(text);
+    let zero = magnitude
+        .split(|c| c == 'e' || c == 'E')
+        .next()
+        .is_some_and(|mantissa| mantissa.bytes().all(|b| b == b'0' || b == b'.'));
+    let spelled = if zero || text.starts_with('-') {
+        magnitude.to_string()
+    } else {
+        format!("-{magnitude}")
+    };
+    let repr = parse_i64_or_f64_in::<JqSemantics>(&spelled)?;
+    Some((repr, spelled))
+}
+
 /// [`parse_i64_or_f64`] under `S`'s number model (#2936): the `Int` arm is
 /// the exact `i64` in both modes (jq widens it through
 /// [`jq_literal_int_to_f64`] only when arithmetic reads it, #2906), and the

@@ -13004,24 +13004,29 @@ jq emits `$from` itself, a literal, as the first value and computes the rest, an
 So `first(range(2;3)) == 2.00000000000000000001` is `true` here and `false` in jq, and `[range(0;3)] | map(. == 1.00000000000000000001)` is jq's `[false,true,false]` here.
 Keeping the first value a literal would cost an allocation per `range` call (a `NumberLiteral` owns its text), for a value that differs only against a decimal literal that is not its own double.
 
-### A negative integer literal compares as a literal, as in jq 1.8 — newer than the 1.7.1 pin (#7453)
+### A negated number literal stays a literal, as in jq 1.8 — newer than the 1.7.1 pin (#7453)
 
-jq 1.7.1 reads `-1` in a program as `_negate` applied to the literal `1`, which drops the literal: the result is a computed double, and a computed number compares with a literal as a double (the #6275 rule above).
-So with `-1.00000000000000000001` as input, `. == -1` is `true` in jq 1.7.1, and so is `1e-400 == -0`.
-Upstream called that a bug ([jqlang/jq#2704](https://github.com/jqlang/jq/issues/2704), labelled `bug`), and jq 1.8.0 fixed it: "Preserve numerical precision on unary negation" ([jqlang/jq#3242](https://github.com/jqlang/jq/pull/3242), in NEWS.md under "Changes to existing functions").
-The negated literal stays a literal, two literals compare exactly, and jq 1.8.2 answers `false` to both.
-`succinctly jq` keeps a negative integer within 2^53 as a literal (the in-range half of the parser's negative-literal fold), so it already answers 1.8.2's way on every comparison consumer (`==`, `<`, `sort`, `unique`, `group_by`, `index`, `IN`, array `-`, object `==`, `select`), wherever the number is carried (`[-1][0]`, `{a: -1}.a`, `null + -1`, `[-1] | add`, `--argjson`).
-That is an upstream bug fix, so it is kept rather than reverted to 1.7.1's answer, and pinned by `tests/jq_cli/i7453.rs`.
+jq 1.7.1's `_negate` turns its operand into a double, so `-1.500` prints `-1.5`, `-1e1000` prints `-1.7976931348623157e+308`, `-9007199254740993` prints `-9007199254740992`, and `-1` compares with an input `-1.00000000000000000001` as a double (equal, the #6275 rule above).
+Upstream called that a bug ([jqlang/jq#2704](https://github.com/jqlang/jq/issues/2704), labelled `bug`), and jq 1.8.0 fixed it: "Preserve numerical precision on unary negation" ([jqlang/jq#3242](https://github.com/jqlang/jq/pull/3242), in NEWS.md under "Changes to existing functions", which also drops the manual's remark that a leading minus converts a number to IEEE754).
+`jv_number_negate` negates a literal's decimal, so the result is a literal: it keeps every digit, prints as written, and compares exactly.
+`decNumberMinus` computes `0 - x`, so a zero negates to positive zero: `-0` is `0` and `-0.0` is `0.0`.
+The owner chose 1.8.2's behaviour, `-0` included, and `succinctly jq` follows it since #7453: the jq parser folds a negative number to the literal as written (a zero to its positive spelling), and `arith_negate` negates a literal operand the same way (`jq_negated_literal`), so `-(1.500)`, `-$x` and `-.` on an input or `--argjson` literal keep it too.
+A computed number is negated as a double, as before (`-(1 + 0)` is `-1`, `-(1.50 + 0)` is `-1.5`).
+A negated literal is a fresh `jv`, so `[-1] | path(.[0] | -1)` is refused (`Invalid path expression with result -1`), where jq 1.7.1 answers `[0]`.
+Pinned by `tests/jq_cli/i7453.rs`.
 
 ```console
-$ echo -1.00000000000000000001 | jq-1.7.1 -c '[. == -1, ([., -1] | unique)]'   # [true,[-1.00000000000000000001]]
-$ echo -1.00000000000000000001 | jq-1.8.2 -c '[. == -1, ([., -1] | unique)]'   # [false,[-1.00000000000000000001,-1]]
-$ echo -1.00000000000000000001 | sjq -c '[. == -1, ([., -1] | unique)]'        # [false,[-1.00000000000000000001,-1]]
+$ jq-1.7.1 -nc '[-1.500, -0, -1e1000, -9007199254740993]'   # [-1.5,-0,-1.7976931348623157e+308,-9007199254740992]
+$ jq-1.8.2 -nc '[-1.500, -0, -1e1000, -9007199254740993]'   # [-1.500,0,-1E+1000,-9007199254740993]
+$ sjq      -nc '[-1.500, -0, -1e1000, -9007199254740993]'   # [-1.500,0,-1E+1000,-9007199254740993]
+$ echo -1.00000000000000000001 | jq-1.7.1 -c '[. == -1, . == -1.0]'   # [true,true]
+$ echo -1.00000000000000000001 | sjq      -c '[. == -1, . == -1.0]'   # [false,false], as jq 1.8.2
 ```
 
-The rest of 1.8's change is not adopted, so `succinctly jq` sits between the two versions there and follows 1.7.1.
-A negative float or exponent literal, an integer past 2^53 and a parenthesised negation are still computed: `-1.500` prints `-1.5` where 1.8.2 prints `-1.500`, `-9007199254740993` prints `-9007199254740992`, and with the input above `. == -1.0` and `. == -(1)` are `true` where 1.8.2 answers `false`.
-`-0` prints `-0`, as in 1.7.1, where 1.8.2 prints `0`.
+This supersedes the 1.7.1 behaviour the #1035, #3044/#3075 and #6049 sections describe, for a literal operand.
+The 1.8 precedence change that came with it is not adopted: jq 1.8 also reads `-` as binding tighter than `*` (`'-' Term`, jqlang/jq#3053, a "Language changes" entry marked breaking), so `-0 * 1` is `(-0) * 1`, which is `0` there.
+`succinctly jq` keeps 1.7.1's `-(0 * 1)`, and the computed `0 * 1` negates to `-0`, as in 1.7.1.
+`-(-0) * 1` is `-0` here for the same reason, where both jq versions answer `0`: it negates the computed `(-0) * 1`, and 1.8's `-0` is the literal `0`.
 
 ### A bare trailing decimal point with no exponent (`1.`) reads as the integer (#6052) — divergence closed
 

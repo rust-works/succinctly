@@ -1466,22 +1466,14 @@ impl<'e> Interp<'e> {
             }
             Expr::Literal(lit) => match self.constant(expr) {
                 Some(value) => sink(value, reg),
-                // A negative number is `_negate` of a literal: computed. The
-                // parser folds some negations itself (`-01`, `-1.5`, a
-                // negative past 2^53) into a spelling-less `Int`/`Float`.
+                // A negative number is `_negate` of a literal, which jq 1.8
+                // answers with a fresh literal (#7453, jqlang/jq#3242): not
+                // a constant, and identical to nothing else. A synthesized
+                // spelling-less `Int`/`Float` is computed.
                 None => match lit {
-                    // `-0` is the one negative whose sign lives only in its
-                    // spelling (`Int(0)` has none): jq computes `-0.0`, a
-                    // number identical to another by its bits (#6042).
-                    Literal::NumberLiteral(NumberRepr::Int(0), _) => {
-                        sink(OwnedValue::Float(-0.0), reg)
-                    }
-                    Literal::NumberLiteral(NumberRepr::Int(i), _) | Literal::Int(i) => {
-                        sink(OwnedValue::Int(*i), reg)
-                    }
-                    Literal::NumberLiteral(NumberRepr::Float(f), _) | Literal::Float(f) => {
-                        sink(OwnedValue::Float(*f), reg)
-                    }
+                    Literal::NumberLiteral(repr, spelling) => sink(literal(*repr, spelling), reg),
+                    Literal::Int(i) => sink(OwnedValue::Int(*i), reg),
+                    Literal::Float(f) => sink(OwnedValue::Float(*f), reg),
                     _ => Err(unsupported("a literal that is not a constant")), // patchcov: coverage tolerate-line reason="unreachable: constant_value answers every literal but a negative number, which the arm above computes"
                 },
             },
@@ -4325,7 +4317,7 @@ fn number_f64(value: &OwnedValue) -> Option<f64> {
 }
 
 /// `-1` is `_negate` applied to the literal `1` at run time (`'-' Exp`), so a
-/// negative number is computed, never a constant.
+/// negative number is a fresh literal (jq 1.8, #7453), never a constant.
 fn literal_value(lit: &Literal) -> Option<OwnedValue> {
     Some(match lit {
         Literal::Null => OwnedValue::Null,

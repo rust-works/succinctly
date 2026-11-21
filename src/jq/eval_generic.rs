@@ -49816,7 +49816,8 @@ mod tests {
             ("map(pow(2; .))", "map(pow(1 + 1; .))"),
             ("map(pow(.; .))", "map(pow(.; . + 0))"),
             ("map(atan2(.; 1))", "map(atan2(.; 1 + 0))"),
-            ("map(atan2(-0; .))", "map(atan2(0 * -1; .))"),
+            // A program's `-0` is the literal `0` in jq 1.8 (#7453).
+            ("map(atan2(-0; .))", "map(atan2(0 * 1; .))"),
             ("map(atan2(.; -1))", "map(atan2(.; 0 - 1))"),
             ("map(. + 0 | pow(.; 2))", "map(. + 0 | pow(.; 1 + 1))"),
         ] {

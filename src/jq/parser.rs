@@ -3946,34 +3946,32 @@ impl<'a> Parser<'a> {
         match self.peek() {
             Some(']') => {
                 self.next();
-                Ok(
-                    match Self::fold_index_key(&key, self.mode == ParserMode::Jq) {
-                        // #3374: a wildcard key is a generator over the matching keys.
-                        Some(Expr::Field(name))
-                            if self.mode == ParserMode::Yq && Expr::is_yq_key_pattern(&name) =>
-                        {
-                            Bracket::Dynamic {
-                                key: Expr::yq_wildcard_keys(&name),
-                                optional: false,
-                            }
+                Ok(match Self::fold_index_key(&key) {
+                    // #3374: a wildcard key is a generator over the matching keys.
+                    Some(Expr::Field(name))
+                        if self.mode == ParserMode::Yq && Expr::is_yq_key_pattern(&name) =>
+                    {
+                        Bracket::Dynamic {
+                            key: Expr::yq_wildcard_keys(&name),
+                            optional: false,
                         }
-                        // #2126: yq reads `.["k0"]` through `traverseArrayOperator`, not the
-                        // `.k0` field traversal, and the two part ways on `null` -- the array
-                        // operator turns a `!!null` it indexes into the empty container the key
-                        // implies (`{}` for a string key), the field traversal leaves it alone.
-                        // Folding the bracket form into `Expr::Field` erases the difference, so a
-                        // `del()` argument keeps a string key as the computed key it is.
-                        Some(Expr::Field(_)) if self.keep_bracket_keys => Bracket::Dynamic {
-                            key,
-                            optional: false,
-                        },
-                        Some(folded) => Bracket::Static(folded),
-                        None => Bracket::Dynamic {
-                            key,
-                            optional: false,
-                        },
+                    }
+                    // #2126: yq reads `.["k0"]` through `traverseArrayOperator`, not the
+                    // `.k0` field traversal, and the two part ways on `null` -- the array
+                    // operator turns a `!!null` it indexes into the empty container the key
+                    // implies (`{}` for a string key), the field traversal leaves it alone.
+                    // Folding the bracket form into `Expr::Field` erases the difference, so a
+                    // `del()` argument keeps a string key as the computed key it is.
+                    Some(Expr::Field(_)) if self.keep_bracket_keys => Bracket::Dynamic {
+                        key,
+                        optional: false,
                     },
-                )
+                    Some(folded) => Bracket::Static(folded),
+                    None => Bracket::Dynamic {
+                        key,
+                        optional: false,
+                    },
+                })
             }
             Some(':') => {
                 // `[n:]` or `[n:m]` - slice.
@@ -4028,9 +4026,8 @@ impl<'a> Parser<'a> {
     /// time and refuses it, so it stays a runtime bound where the pull
     /// helpers can raise (an unreached branch must not).
     fn finish_slice(start: Option<Expr>, end: Option<Expr>, yq: bool) -> Bracket {
-        let fold = |bound: &Expr| {
-            Self::fold_slice_bound(bound, !yq).filter(|(_, key)| !(yq && key.is_some()))
-        };
+        let fold =
+            |bound: &Expr| Self::fold_slice_bound(bound).filter(|(_, key)| !(yq && key.is_some()));
         let start_folded = start.as_ref().and_then(fold);
         let end_folded = end.as_ref().and_then(fold);
         let start_dynamic = start.is_some() && start_folded.is_none();
@@ -4245,9 +4242,9 @@ impl<'a> Parser<'a> {
     /// `true` and `{}` deliberately do *not* fold — they must reach the
     /// evaluator so the error is jq's runtime `Cannot index …`, not a parse
     /// error (issue #360).
-    fn fold_index_key(key: &Expr, jq: bool) -> Option<Expr> {
+    fn fold_index_key(key: &Expr) -> Option<Expr> {
         match key {
-            Expr::Paren(inner) => Self::fold_index_key(inner, jq),
+            Expr::Paren(inner) => Self::fold_index_key(inner),
             Expr::Literal(Literal::String(s)) => Some(Expr::Field(s.to_string())),
             Expr::Literal(Literal::Int(i)) => Some(Expr::Index { idx: *i, key: None }),
             // Every number written in filter source arrives as
@@ -4278,15 +4275,11 @@ impl<'a> Parser<'a> {
             // `key` instead, because jq echoes it back verbatim:
             // `path(.[2.00])` is `[2.00]` and `path(.[1e10])` is `[1E+10]`.
             // `idx` is the identical `i64` either way.
+            // #6049 kept `.[-0]`'s path component the float `-0`, jq 1.7.1's
+            // `_negate` of the literal `0`; jq 1.8 negates it to the literal
+            // `0` (#7453), which the jq parser already folds `-0` to, so it
+            // is the integer index `0` here, as in yq.
             Expr::Literal(Literal::NumberLiteral(repr, text)) => match *repr {
-                // #6049: jq computes `-0` as `_negate` of the literal `0`, so
-                // its path component is the float `-0`, not the integer `0`
-                // its `Int` repr reads as. The spelling is the only place the
-                // sign survives. yq reads it as `0` (`.[-0] | path` is `[0]`).
-                NumberRepr::Int(0) if jq && text.starts_with('-') => Some(Expr::Index {
-                    idx: 0,
-                    key: Some(NumberKey::Float(-0.0)),
-                }),
                 NumberRepr::Int(i) => Some(Expr::Index { idx: i, key: None }),
                 NumberRepr::Float(f)
                     if f.fract() == 0.0 && f >= i64::MIN as f64 && f < i64::MAX as f64 =>
@@ -4325,7 +4318,7 @@ impl<'a> Parser<'a> {
                 right,
                 ..
             } if matches!(**left, Expr::Literal(Literal::Int(-1))) => {
-                match Self::fold_index_key(right, jq)? {
+                match Self::fold_index_key(right)? {
                     // #3044: an `Int`-sourced fold (`key: None`, per the
                     // doc comment below) whose magnitude is past
                     // `jq_int_within_exact_f64_range` must NOT fold here --
@@ -4394,8 +4387,8 @@ impl<'a> Parser<'a> {
     /// navigation step uses, and the key to preserve alongside it, which is
     /// `None` for an integer-spelled bound. `finish_slice` hands each bound's
     /// key straight to [`Expr::Slice`]'s matching field.
-    fn fold_slice_bound(key: &Expr, jq: bool) -> Option<(i64, Option<NumberKey>)> {
-        match Self::fold_index_key(key, jq)? {
+    fn fold_slice_bound(key: &Expr) -> Option<(i64, Option<NumberKey>)> {
+        match Self::fold_index_key(key)? {
             Expr::Index { idx, key } => Some((idx, key)),
             _ => None,
         }
@@ -5376,93 +5369,28 @@ impl<'a> Parser<'a> {
                 }
                 if let Some(lit) = folded {
                     match lit {
-                        // #1035/#3044: jq's own grammar treats a leading `-`
-                        // as unary negation, not part of the number token --
-                        // confirmed against jq 1.7.1, where `-1.500`/`-1e2`
-                        // print `-1.5`/`-100` (fidelity collapses through
-                        // the implied negation) while `1.500`/`1e2` print
-                        // unchanged, and (#3044) a plain integer past
-                        // `2^53` collapses the same way (`-869389897822472004`
-                        // prints `-869389897822472000`, matching binary
-                        // `-`/`+`/`*`'s own #2631/#2906 rounding). yq is the
-                        // opposite: real yq never collapses a negative
-                        // literal's fidelity, at any magnitude (confirmed
-                        // live against yq v4.53.3), so this rewrite is
-                        // jq-only.
+                        // #7453: jq's grammar reads a leading `-` as unary
+                        // negation of the number token, and jq 1.8's
+                        // `_negate` keeps a literal operand a literal
+                        // (jqlang/jq#3242, fixing jq 1.7.1's conversion to a
+                        // double, jqlang/jq#2704): `-1.500` prints `-1.500`,
+                        // `-1e1000` `-1E+1000`, and `-1` compares with an
+                        // input `-1.00000000000000000001` exactly. So the
+                        // folded token is the literal as written, except a
+                        // zero, which decNumber negates to positive zero
+                        // (`-0` is `0`, `-0.0` is `0.0`; see
+                        // `jq_negated_literal`). yq keeps the literal as
+                        // written at every magnitude, `-0` included.
                         //
-                        // Below `2^53` a plain negative *integer* has no
-                        // alternate spelling to lose (no fraction, no
-                        // exponent, and the exact `i64` negation already
-                        // *is* what jq's own arithmetic would compute), so
-                        // folding `-` into the token there stays
-                        // unobservable in jq mode -- and it's what keeps
-                        // the hot `.foo.bar[-1]` index path on
-                        // `fold_index_key`'s cheap literal arm instead of
-                        // this `Mul`-folded shape (see that function's own
-                        // `Mul(-1, ..)` arm, which already understands it).
-                        // `jq_int_within_exact_f64_range` (`eval.rs`) is the
-                        // one shared definition of that boundary -- reused
-                        // here rather than re-derived, so the parser's
-                        // decision can never silently drift from the
-                        // evaluator's own rounding threshold.
-                        Literal::NumberLiteral(repr, text)
-                            if self.mode == ParserMode::Jq
-                                && !matches!(repr, NumberRepr::Int(n) if crate::jq::eval::jq_int_within_exact_f64_range(n)) =>
-                        {
-                            match repr {
-                                // #3075: an `Int` repr only ever reaches this
-                                // arm once its magnitude is past
-                                // `jq_int_within_exact_f64_range` (an
-                                // in-range `Int` fails the guard above and
-                                // falls to the plain-literal arm below), so
-                                // `-1 * n`'s rounding is fully determined at
-                                // parse time -- `jq_literal_int_to_f64`
-                                // applied directly to `n` (still negative,
-                                // as parsed) is exactly what evaluating that
-                                // split would compute, by the sign-symmetry
-                                // its own doc comment describes (no
-                                // `checked_neg`/`i64::MIN` special case
-                                // needed here at all, unlike the split this
-                                // replaces). Fold straight to it instead of
-                                // leaving a runtime `Arithmetic::Mul` that
-                                // re-derives the same value on every
-                                // evaluation of this AST node.
-                                NumberRepr::Int(n) => Ok(Expr::Literal(Literal::Float(
-                                    crate::jq::value::jq_literal_int_to_f64(n),
-                                ))),
-                                // #1035: a `Float` repr reaches this arm at
-                                // *any* magnitude, not just out-of-range --
-                                // e.g. plain `-1.0`/`-1e2` -- because jq's
-                                // grammar always destroys a negative float's
-                                // literal-echo fidelity, regardless of size.
-                                // `fold_index_key` below still needs to see
-                                // through this exact `-1 * <literal>` shape
-                                // to keep a negative float/exponent index or
-                                // slice bound on its static
-                                // `Expr::Index`/`Expr::Slice` fast path
-                                // (`test_1035_negative_float_index_and_slice_bound_still_fold_to_static`),
-                                // so #3075's fold above is deliberately not
-                                // extended to this sub-case -- it stays the
-                                // pre-#3075 split, unchanged.
-                                //
-                                // Multiply rather than subtract from zero:
-                                // `0.0 - 0.0` is IEEE-754 positive zero,
-                                // silently losing the sign of `-0.0`/`-0e0`
-                                // (jq itself prints `-0` for these); `-1.0 *
-                                // 0.0` correctly preserves it. `repr` is
-                                // `text`'s (negative) parsed value, so the
-                                // split-off literal's repr is `-repr` (the
-                                // positive magnitude), not a re-parse.
-                                NumberRepr::Float(f) => Ok(Expr::Arithmetic {
-                                    op: ArithOp::Mul(MergeFlags::default()),
-                                    left: Box::new(Expr::Literal(Literal::Int(-1))),
-                                    right: Box::new(Expr::Literal(Literal::NumberLiteral(
-                                        NumberRepr::Float(-f),
-                                        text[1..].to_string(),
-                                    ))),
-                                    settle: ArithSettleMemo::default(),
-                                }),
-                            }
+                        // Until #7453 this followed jq 1.7.1 instead: a float
+                        // split into `-1 * <literal>` (#1035), an integer past
+                        // `2^53` folded to the rounded `Literal::Float`
+                        // (#3044/#3075) and `-0` kept its sign.
+                        Literal::NumberLiteral(repr, text) if self.mode == ParserMode::Jq => {
+                            let (repr, text) =
+                                crate::jq::value::jq_negated_literal(repr, &text[1..])
+                                    .unwrap_or((repr, text));
+                            Ok(Expr::Literal(Literal::NumberLiteral(repr, text)))
                         }
                         lit => Ok(Expr::Literal(lit)),
                     }
@@ -11663,7 +11591,7 @@ impl<'a> Parser<'a> {
                     key: Some(NumberKey::Float(*f)),
                 })
             }
-            Expr::Literal(Literal::NumberLiteral(..)) => Self::fold_index_key(key, false),
+            Expr::Literal(Literal::NumberLiteral(..)) => Self::fold_index_key(key),
             _ => None,
         }
     }
@@ -14559,38 +14487,6 @@ mod tests {
     }
 
     #[test]
-    fn test_negative_float_literal_splits_into_positive_repr_1062() {
-        // A negative float/exponent literal parses as `-1 * <positive
-        // literal>` in jq mode (the sign is folded into unary negation, not
-        // kept as part of the number token -- see the parser's own comment
-        // above this rewrite). #1062 computes the split-off literal's
-        // `NumberRepr` by negating the *original* (negative) repr rather
-        // than re-parsing the sign-stripped text; this pins that both the
-        // repr and the text agree on the positive magnitude.
-        let Expr::Arithmetic { right, .. } = parse("-1.500").unwrap() else {
-            panic!("expected an Arithmetic node");
-        };
-        assert_eq!(
-            *right,
-            Expr::Literal(Literal::NumberLiteral(
-                NumberRepr::Float(1.5),
-                "1.500".to_string()
-            ))
-        );
-
-        let Expr::Arithmetic { right, .. } = parse("-1e2").unwrap() else {
-            panic!("expected an Arithmetic node");
-        };
-        assert_eq!(
-            *right,
-            Expr::Literal(Literal::NumberLiteral(
-                NumberRepr::Float(100.0),
-                "1e2".to_string()
-            ))
-        );
-    }
-
-    #[test]
     fn test_large_integer_literal_falls_back_to_float() {
         // A *positive* literal beyond i64 range degrades to a float like jq
         // (issue #166), but #1035 keeps the literal's own source spelling
@@ -14618,87 +14514,51 @@ mod tests {
         );
     }
 
-    /// #3044/#3075: a negative literal past `2^53`
-    /// ([`crate::jq::eval::jq_int_within_exact_f64_range`]) is never a
-    /// preserved bare `Literal` -- but the two producers of that split
-    /// diverge as of #3075. A `Float` repr (a magnitude that never fits
-    /// `i64` at all) still splits into `-1 * <positive literal>` (#1035's
-    /// mechanism, kept intact because `fold_index_key` needs to keep
-    /// seeing through this exact shape for a negative float/exponent
-    /// index or slice bound --
-    /// `test_1035_negative_float_index_and_slice_bound_still_fold_to_static`).
-    /// An `Int` repr instead folds straight to the already-known
-    /// `Literal::Float` (#3075): no index/slice fast path needs the
-    /// intermediate `Arithmetic::Mul` shape for *this* sub-case
-    /// (`test_out_of_range_negative_index_and_slice_bound_stay_dynamic_3044`
-    /// stays dynamic either way), so there's nothing to lose by computing
-    /// the rounding once here instead of on every evaluation of the AST
-    /// node.
+    /// #7453: jq 1.8 keeps a negated literal a literal (jqlang/jq#3242), so
+    /// the jq parser folds a negative number to the literal as written at
+    /// every magnitude and spelling -- past `2^53`, past `i64`, a fraction, an
+    /// exponent -- where #1035/#3044/#3075 split or rounded it as jq 1.7.1
+    /// did. A zero negates to positive zero, keeping its spelling otherwise.
+    /// yq keeps the literal as written, `-0` included.
     #[test]
-    fn test_negative_large_integer_literal_splits_or_folds_past_2_53_3044_3075() {
-        // `Float`-repr magnitudes (never fit `i64`): still split into
-        // `-1 * <split-off literal>`, unaffected by #3075. This returns
-        // the split-off literal's own `Expr` so each case only states what
-        // differs (the source and the expected split), not the
-        // let-else/panic boilerplate to get there.
-        fn split_literal(src: &str) -> Expr {
-            let Expr::Arithmetic { left, right, .. } = parse(src).unwrap() else {
-                panic!("`{src}`: expected an Arithmetic node"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the #3044 pin itself, only formatted if the let-else pattern fails to match (#3044)"
-            };
-            assert_eq!(*left, Expr::Literal(Literal::Int(-1)), "`{src}`");
-            *right
+    fn test_negative_literal_is_the_literal_as_written_7453() {
+        for src in [
+            "-123",
+            "-9007199254740993",
+            "-869389897822472004",
+            "-9223372036854775808",
+            "-9223372036854775809",
+            "-9999999999999999999",
+            "-1.500",
+            "-1e2",
+            "-1E1000",
+            "-1e-400",
+        ] {
+            assert_eq!(
+                parse(src).unwrap(),
+                Expr::Literal(Literal::number_literal(src.to_string())),
+                "`{src}`"
+            );
         }
-
-        assert_eq!(
-            split_literal("-9999999999999999999"),
-            Expr::Literal(Literal::NumberLiteral(
-                NumberRepr::Float("9999999999999999999".parse::<f64>().unwrap()),
-                "9999999999999999999".to_string()
-            ))
-        );
-
-        // One past `i64::MIN`'s own magnitude: still doesn't fit `i64`
-        // either direction, so still `Float`-repr, still splits.
-        assert_eq!(
-            split_literal("-9223372036854775809"),
-            Expr::Literal(Literal::NumberLiteral(
-                NumberRepr::Float("9223372036854775809".parse::<f64>().unwrap()),
-                "9223372036854775809".to_string()
-            ))
-        );
-
-        // `Int`-repr magnitudes (fit `i64`, past `2^53`): fold straight to
-        // `Literal::Float` (#3075) instead, no `Arithmetic::Mul` wrapper.
-
-        // Exactly `i64::MIN`: `n` itself fits `i64` (only its *positive*
-        // magnitude, `2^63`, doesn't), so this is an `Int`-repr case --
-        // `jq_literal_int_to_f64` rounds it directly, with no separate
-        // overflow branch needed (unlike the split this replaces, which
-        // had to fall back once `checked_neg` failed on this one value).
-        assert_eq!(
-            parse("-9223372036854775808").unwrap(),
-            Expr::Literal(Literal::Float(crate::jq::value::jq_literal_int_to_f64(
-                i64::MIN
-            )))
-        );
-
-        // Past `2^53` but well within `i64`: same fold, the same rounding
-        // `arith_mul`'s own #2631/#2906 rule used to apply at evaluation
-        // time, now computed once here instead.
-        assert_eq!(
-            parse("-869389897822472004").unwrap(),
-            Expr::Literal(Literal::Float(crate::jq::value::jq_literal_int_to_f64(
-                -869389897822472004
-            )))
-        );
-
-        // Below `2^53`: unaffected, still the cheap identity-literal fold
-        // (see `test_literals`'s own `-123` case) -- confirms the guard
-        // doesn't widen past its intended boundary.
-        assert_eq!(
-            parse("-123").unwrap(),
-            Expr::Literal(Literal::number_literal("-123".to_string()))
-        );
+        for (src, repr, folded) in [
+            ("-0", NumberRepr::Int(0), "0"),
+            ("-00", NumberRepr::Int(0), "00"),
+            ("-0.0", NumberRepr::Float(0.0), "0.0"),
+            ("-0e5", NumberRepr::Float(0.0), "0e5"),
+        ] {
+            assert_eq!(
+                parse(src).unwrap(),
+                Expr::Literal(Literal::NumberLiteral(repr, folded.to_string())),
+                "`{src}`"
+            );
+        }
+        for src in ["-0", "-0.0", "-0e5"] {
+            assert_eq!(
+                parse_with_mode(src, ParserMode::Yq).unwrap(),
+                Expr::Literal(Literal::number_literal(src.to_string())),
+                "yq `{src}`"
+            );
+        }
     }
 
     /// A bare exponent marker with no digits after it (`1e`) is not a
@@ -15384,32 +15244,34 @@ mod tests {
     /// exactly, unaffected -- `test_index_key_constant_folding` above
     /// already pins that.
     #[test]
-    fn test_out_of_range_negative_index_and_slice_bound_stay_dynamic_3044() {
-        assert!(
-            matches!(
-                parse(".[-869389897822472004]").unwrap(),
-                Expr::IndexExpr { .. }
-            ),
-            "an out-of-range negative index must not fold to a static Expr::Index"
+    fn test_negative_index_and_slice_bound_past_2_53_fold_to_static_7453() {
+        // #7453: jq 1.8 keeps `-869389897822472004` the literal, so its path
+        // component keeps every digit (`path(.[-869389897822472004])` is
+        // `[-869389897822472004]` in jq 1.8.2), and the index folds to the
+        // static `Expr::Index` like any in-range one. #3044 kept it dynamic
+        // to pick up jq 1.7.1's rounding.
+        assert_eq!(
+            parse(".[-869389897822472004]").unwrap(),
+            Expr::index(-869389897822472004)
         );
         assert!(matches!(
             parse(".[-869389897822472004:]").unwrap(),
-            Expr::SliceExpr { .. }
+            Expr::Slice {
+                start: Some(-869389897822472004),
+                ..
+            }
         ));
         assert!(matches!(
             parse(".[:-869389897822472004]").unwrap(),
-            Expr::SliceExpr { .. }
+            Expr::Slice {
+                end: Some(-869389897822472004),
+                ..
+            }
         ));
-        // Exactly at the boundary and one below it: still folds, unaffected.
         assert_eq!(
-            parse(".[-9007199254740992]").unwrap(),
-            Expr::index(-9007199254740992)
-        );
-        // One past the boundary: no longer folds.
-        assert!(matches!(
             parse(".[-9007199254740993]").unwrap(),
-            Expr::IndexExpr { .. }
-        ));
+            Expr::index(-9007199254740993)
+        );
     }
 
     /// Both slice bounds accept the same spellings.
@@ -15489,37 +15351,38 @@ mod tests {
     /// unless taught this specific `Arithmetic` shape too.
     #[test]
     fn test_1035_negative_float_index_and_slice_bound_still_fold_to_static() {
-        // #1088: negation is what destroys jq's literal preservation, so a
-        // negated key folds to a bare `NumberKey::Float` -- which is exactly
-        // why `path(.[-1.0])` is `[-1]` while `path(.[1.0])` is `[1.0]`.
+        // #7453: jq 1.8 keeps a negated literal a literal (jqlang/jq#3242),
+        // so a negated key keeps its spelling like a positive one:
+        // `path(.[-1.0])` is `[-1.0]` in jq 1.8.2 (`[-1]` in 1.7.1, #1088).
         assert_eq!(
             parse(".[-1.0]").unwrap(),
             Expr::Index {
                 idx: -1,
-                key: Some(NumberKey::Float(-1.0)),
+                key: Some(NumberKey::Literal(-1.0, "-1.0".into())),
             }
         );
         assert_eq!(
             parse(".[-1e0]").unwrap(),
             Expr::Index {
                 idx: -1,
-                key: Some(NumberKey::Float(-1.0)),
+                key: Some(NumberKey::Literal(-1.0, "-1e0".into())),
             }
         );
-        // #1326: the slice-bound sibling of the index case above --
-        // negation destroys the *literal spelling* the same way, but the
-        // bound still keeps a `NumberKey::Float` rather than dropping to
-        // plain `Expr::Slice` (`path(.[-3.0:-1.0])` is `[{"start":-3,
-        // "end":-1}]`, not `.0`-suffixed, because a *computed* whole-valued
-        // double renders bare in jq's own convention -- confirmed live,
-        // matching real jq exactly).
+        // #1326: the slice-bound sibling of the index case above:
+        // `path(.[-3.0:-1.0])` is `[{"start":-3.0,"end":-1.0}]` in jq 1.8.2.
         assert_eq!(
             parse(".[-3.0:-1.0]").unwrap(),
             Expr::Slice {
                 start: Some(-3),
                 end: Some(-1),
-                start_key: Some(SliceBoundKey::Number(NumberKey::Float(-3.0))),
-                end_key: Some(SliceBoundKey::Number(NumberKey::Float(-1.0))),
+                start_key: Some(SliceBoundKey::Number(NumberKey::Literal(
+                    -3.0,
+                    "-3.0".into()
+                ))),
+                end_key: Some(SliceBoundKey::Number(NumberKey::Literal(
+                    -1.0,
+                    "-1.0".into()
+                ))),
             }
         );
         // A non-integral negative float still can't fold -- same as the
@@ -15598,13 +15461,15 @@ mod tests {
     /// or a debug-build panic).
     #[test]
     fn test_1061_negating_i64_min_does_not_overflow() {
+        // #7453: `-9223372036854775808.0` is the literal `i64::MIN`, with no
+        // negation left to overflow, so it folds to the static index.
         assert!(matches!(
             parse(".[-9223372036854775808.0]").unwrap(),
-            Expr::IndexExpr { .. }
+            Expr::Index { idx: i64::MIN, .. }
         ));
         assert!(matches!(
             parse(".[-9223372036854775808e0]").unwrap(),
-            Expr::IndexExpr { .. }
+            Expr::Index { idx: i64::MIN, .. }
         ));
         // The `right` operand need not come from the negative-literal split
         // at all -- any `-1 * <literal>` shape matches the same arm.
@@ -15624,7 +15489,10 @@ mod tests {
             parse(".[-9223372036854774784.0]").unwrap(),
             Expr::Index {
                 idx: -9223372036854774784,
-                key: Some(NumberKey::Float(-9223372036854774784.0)),
+                key: Some(NumberKey::Literal(
+                    -9223372036854774784.0,
+                    "-9223372036854774784.0".into()
+                )),
             }
         );
     }
@@ -15640,11 +15508,15 @@ mod tests {
             parse(".[1:9223372036854775808.0]").unwrap(),
             Expr::SliceExpr { .. }
         ));
-        // A slice's lower bound at `i64::MIN`'s magnitude no longer
-        // overflows on negation, same as an index.
+        // A slice's lower bound at `i64::MIN` is a literal since #7453, so
+        // nothing is negated and it folds to the static slice, same as an
+        // index.
         assert!(matches!(
             parse(".[-9223372036854775808.0:]").unwrap(),
-            Expr::SliceExpr { .. }
+            Expr::Slice {
+                start: Some(i64::MIN),
+                ..
+            }
         ));
     }
 
