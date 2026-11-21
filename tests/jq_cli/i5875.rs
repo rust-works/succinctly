@@ -26,7 +26,8 @@ fn constructor_folds_answer_as_jq_5875() -> Result<()> {
         (r"0 | until(tojson|length > 12; [.])", None, "[[[[[[0]]]]]]\n", 0),
         (r"reduce range(2) as $i (nan; [.])", None, "[[null]]\n", 0),
         (r"reduce range(2) as $i (100000000000000000000000; [.])", None, "[[100000000000000000000000]]\n", 0),
-        (r"reduce range(2) as $i (-0; [.])", None, "[[-0]]\n", 0),
+        // A program's `-0` is the literal `0` since #7453, as in jq 1.8.2 (jq 1.7.1: `[[-0]]`).
+        (r"reduce range(2) as $i (-0; [.])", None, "[[0]]\n", 0),
         (r"reduce range(1) as $i (1.10; {a: .})", None, "{\"a\":1.10}\n", 0),
         (r#"reduce range(3) as $i (0; [., error("x")])"#, None, "", 5),
         (r"reduce range(3) as $i (0; [., empty])", None, "[[[0]]]\n", 0),

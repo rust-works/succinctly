@@ -40,8 +40,9 @@ impl PathComponent {
 
 /// Check if a key can use dot notation in jq.
 ///
-/// Keys must start with a letter or underscore, and contain only
-/// alphanumeric characters and underscores.
+/// Keys must start with an ASCII letter or underscore, and contain only ASCII
+/// alphanumeric characters and underscores: jq's lexer refuses any other letter
+/// in a `.field`, so `.é` would be a path jq cannot read back (#7433).
 fn can_use_dot_notation(key: &str) -> bool {
     if key.is_empty() {
         return false;
@@ -50,11 +51,11 @@ fn can_use_dot_notation(key: &str) -> bool {
     let mut chars = key.chars();
     let first = chars.next().unwrap();
 
-    if !first.is_alphabetic() && first != '_' {
+    if !first.is_ascii_alphabetic() && first != '_' {
         return false;
     }
 
-    chars.all(|c| c.is_alphanumeric() || c == '_')
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Escape a string for use in jq bracket notation.
@@ -395,6 +396,9 @@ mod tests {
         assert!(!can_use_dot_notation("")); // empty
         assert!(!can_use_dot_notation("123")); // starts with digit
         assert!(!can_use_dot_notation("foo-bar")); // contains hyphen
+        assert!(!can_use_dot_notation("é")); // jq's lexer refuses a non-ASCII letter (#7433)
+        assert!(!can_use_dot_notation("aé"));
+        assert!(!can_use_dot_notation("中"));
         assert!(!can_use_dot_notation("foo.bar")); // contains dot
         assert!(!can_use_dot_notation("foo bar")); // contains space
     }

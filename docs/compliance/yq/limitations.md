@@ -982,6 +982,15 @@ A deeper line under the same header is a different matter: `--- - x: >` / blank 
 Representative cases, each live-verified. These are gaps to close, listed here so they are
 not rediscovered from scratch.
 
+### A command-line word that is not UTF-8 is read as its U+FFFD text everywhere ([#7426](https://github.com/rust-works/succinctly/issues/7426))
+
+`succinctly yq` reads every argv word that is not valid UTF-8 as text, each bad byte one U+FFFD, which is what yq's Go decoding makes of a string literal: `yq -n $'"a\xed\xa0\x80" | length'` is 10 in both.
+Before #7426 any such word panicked (exit 101).
+Two places still differ from yq v4.53.3, which keeps the word's bytes there.
+A path key is one: `yq -n $'.k\xff = 1'` fails with `yaml: cannot marshal invalid UTF-8 data as !!str`, where `succinctly yq` prints `k\u{FFFD}: 1`.
+A file name is the other: yq opens `nof\xff` by its bytes and names it so in `open nof\xff: no such file or directory`, where `succinctly yq` opens and names `nof\u{FFFD}` (its message for a missing file differs from yq's wording anyway).
+Reading them as yq does means carrying the raw bytes through `YqCommand`'s `String` fields and the lexer, which `succinctly jq` does for its file names and yq mode does not yet.
+
 ### String style of output — closed on every route (#3575, #3588); the gaps below remain
 
 `yq -p json -o yaml` writes every string and key in go-yaml's own style, not the JSON text's:

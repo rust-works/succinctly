@@ -46,6 +46,14 @@ jobs). On any other PR the required check reports success with a notice, so a ma
 surfaces as a merge-queue ejection instead; label a PR `ci:macos` when it touches something
 platform-sensitive that the path list misses.
 
+When the queue ejects an entry or a PR leaves it, it deletes the affected groups' `gh-readonly-queue/`
+branches and builds new groups, but nothing cancels the runs of the deleted ones, which kept their
+macOS jobs for hours and stalled the queue (#7552). `.github/workflows/cancel-stale-merge-groups.yml`
+cancels every non-completed `merge_group` run whose branch is gone, on each new group, on `dequeued`
+and by hand (`gh workflow run cancel-stale-merge-groups.yml`); `python3
+scripts/cancel_stale_merge_group_runs.py --dry-run` lists them. Do not give `ci.yml` a shared
+concurrency group for merge groups instead: the queue tests several at once, and it would cancel live ones.
+
 ## Before You Push
 
 `scripts/pre-push.sh` maps the files your branch changed to the CI gates they can fail and runs
@@ -160,7 +168,7 @@ syq-locate config.yaml --offset 42
 syq-locate config.yaml --line 5 --column 10
 
 # DSV/CSV operations
-sjq --input-dsv ',' '.[] | select(.[0] == "Alice")' data.csv
+sjq --input-dsv ',' 'select(.[0] == "Alice")' data.csv   # each row is its own input (one array of strings)
 ./target/release/succinctly dsv generate 1mb -p users -o users.csv
 ./target/release/succinctly dsv generate 1mb -p users --no-header -o users.csv  # without header row
 

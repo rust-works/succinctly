@@ -1,0 +1,3 @@
+category = "newer-than-primary"
+reason = "the same stale `tokenbuf[1]` read as `cli:stream-bare-n-after-u`, in the event `--stream-errors` emits: `[\"Invalid literal at EOF at line 1, column 6\",[]]` in jq 1.7.1, `Invalid numeric literal` in jq 1.8.2 and succinctly (jqlang/jq#3324)."
+issue = "7525"

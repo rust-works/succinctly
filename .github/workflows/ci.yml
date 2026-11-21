@@ -921,6 +921,11 @@ jobs:
       - name: ci-release-downloads self-tests
         run: python3 scripts/test_ci_release_downloads.py -v
 
+      # #7552: the sweep cancel-stale-merge-groups.yml runs: a fake `gh`, no network. It pins that
+      # only runs of a deleted queue branch are cancelled, and that the runs are listed before the refs.
+      - name: cancel-stale-merge-group-runs self-tests
+        run: python3 scripts/test_cancel_stale_merge_group_runs.py -v
+
       # #7390: the stripped-size budget check run after the release build below: a fake strip,
       # no build. It also pins that this job's release build is the one release.yml ships.
       - name: binary_size.py self-tests

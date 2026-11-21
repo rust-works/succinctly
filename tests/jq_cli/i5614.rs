@@ -27,12 +27,13 @@ fn test_empty_fraction_literal_keeps_its_decnumber_spelling_5614() -> Result<()>
         (r#"{"a":1.e1}"#, "{\"a\":1E+1}\n"),
         ("1.e1|tojson", "\"1E+1\"\n"),
         ("\"\\(1.e1)\"", "\"1E+1\"\n"),
-        // Arithmetic, comparison and negation see the value, not the spelling.
+        // Arithmetic and comparison see the value, not the spelling.
         ("1.e1 == 10", "true\n"),
         ("1.e1+0", "10\n"),
         ("3.e2|floor", "300\n"),
-        ("-1.e1", "-10\n"),
-        ("1.e1|-.", "-10\n"),
+        // Negation keeps the literal, as jq 1.8 does (#7453); jq 1.7.1 printed `-10` for both.
+        ("-1.e1", "-1E+1\n"),
+        ("1.e1|-.", "-1E+1\n"),
         // A trailing dot with no exponent keeps the literal's digits too: the dot is dropped
         // before the validity check, where it used to collapse a wide one to the double.
         ("1.", "1\n"),

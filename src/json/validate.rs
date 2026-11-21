@@ -876,12 +876,12 @@ pub fn validate(input: &[u8]) -> Result<(), ValidationError> {
 /// | `1.e5`, `1.E5` | `1E+5` | fraction elided before an exponent (#2240) |
 /// | `"\udc00"` (escaped) | U+FFFD | lone *low* surrogate escape (#2012) |
 /// | `+1`, `+.5`, `+1.500`, `+007.e5` | `1`, `0.5`, `1.500`, `7E+5` | leading `+`, composing with all of the above (#2877, [`strip_leading_plus`]) |
-/// | `nan`, `NaN5`, `sNaN`, `-nan`, `inf`, `Infinity`, `-Infinity`, `+inf` | `null`, `null`, `null`, `null`, `1.7976931348623157e+308`, ... | decNumber's special values, as real NaN/infinity numbers (#2877, [`jq_special_number`]) |
+/// | `nan`, `NaN0`, `sNaN`, `-nan`, `inf`, `Infinity`, `-Infinity`, `+inf` | `null`, `null`, `null`, `null`, `1.7976931348623157e+308`, ... | decNumber's special values, as real NaN/infinity numbers (#2877, [`jq_special_number`]) |
 ///
 /// Nothing else moves. A lone *high* surrogate, a control character in a
 /// string, trailing content, `0x10`, `1_000`, `1.2.3`, a doubled sign
 /// (`+-1`), a word that is not one of decNumber's (`nanx`, `inf1`,
-/// `infinity1`) and a NaN with anything but digits after it (`nan1.5`,
+/// `infinity1`) and a NaN with anything but zeros after it (`nan1`, `nan1.5`,
 /// `nan(1)`) stay rejected, as they are in jq.
 ///
 /// A bare trailing dot (`5.`, `007.`, `0.`) is accepted and read as the integer, as jq does
@@ -1176,10 +1176,16 @@ pub fn has_leading_dot(bytes: &[u8]) -> bool {
     is_valid_number(&fixed)
 }
 
-/// decNumber's special values, as jq 1.7.1 reads them (#2877).
+/// decNumber's special values, as jq reads them (#2877, #7522).
 ///
 /// The grammar is an optional `+`/`-`, then a case-insensitive `inf` |
-/// `infinity` | `nan[0-9]*` | `snan[0-9]*`; the whole slice must match.
+/// `infinity` | `nan[0]*` | `snan[0]*`; the whole slice must match. A NaN
+/// whose payload digits are not all zero is not a number: jq 1.8 rejects it
+/// (CVE-2024-53427, "Reject NaN with payload while parsing JSON": `NaN1`,
+/// `nan123`, `-sNaN10`, `NaN01`), where jq 1.7.1 reads every `nan[0-9]*`
+/// (`docs/compliance/jq/limitations.md` records the divergence from the
+/// pinned 1.7.1). `NaN0`, `NaN000` and `sNaN0` stay numbers in 1.8.2: its
+/// check is "the payload is not zero", not "there are payload digits".
 /// Returns the value -- NaN for either NaN spelling (the sign and the payload
 /// digits are not observable through jq's printer, which renders every NaN
 /// as `null`), `f64::INFINITY` or `f64::NEG_INFINITY` for the infinities.
@@ -1211,7 +1217,8 @@ pub fn has_leading_dot(bytes: &[u8]) -> bool {
 /// use succinctly::json::validate::jq_special_number;
 ///
 /// assert!(jq_special_number(b"NaN").is_some_and(f64::is_nan));
-/// assert!(jq_special_number(b"sNaN12").is_some_and(f64::is_nan));
+/// assert!(jq_special_number(b"sNaN0").is_some_and(f64::is_nan));
+/// assert_eq!(jq_special_number(b"sNaN12"), None);
 /// assert_eq!(jq_special_number(b"-Infinity"), Some(f64::NEG_INFINITY));
 /// assert_eq!(jq_special_number(b"+inf"), Some(f64::INFINITY));
 /// assert_eq!(jq_special_number(b"nanx"), None);
@@ -1240,10 +1247,8 @@ pub fn jq_special_number(bytes: &[u8]) -> Option<f64> {
     if !payload.eq_ignore_ascii_case(b"nan") {
         return None;
     }
-    nan_body[3..]
-        .iter()
-        .all(u8::is_ascii_digit)
-        .then_some(f64::NAN)
+    // jq 1.8's `jv_number_with_literal`: a NaN with a non-zero payload is an invalid literal.
+    nan_body[3..].iter().all(|&b| b == b'0').then_some(f64::NAN)
 }
 
 /// Whether `text` could hold a [`jq_special_number`] NaN anywhere.
@@ -2087,10 +2092,10 @@ mod tests {
             "nAn",
             "-nan",
             "+nan",
-            "nan1",
-            "nan0012",
+            "nan0",
+            "nan000",
             "sNaN",
-            "SNAN12",
+            "SNAN00",
             "-sNaN",
             "inf",
             "INF",
@@ -2272,9 +2277,9 @@ mod tests {
             "+007.e5",
             "nan",
             "-nan",
-            "NaN5",
+            "NaN0",
             "sNaN",
-            "SNAN12",
+            "SNAN00",
             "inf",
             "Infinity",
             "-Infinity",
@@ -2343,8 +2348,8 @@ mod tests {
     #[test]
     fn jq_special_number_is_decnumbers_grammar_2877() {
         for s in [
-            "nan", "NaN", "nAn", "NAN", "-nan", "+nan", "nan1", "nan0012", "sNaN", "snan", "SNAN",
-            "-sNaN", "+sNaN", "sNaN12",
+            "nan", "NaN", "nAn", "NAN", "-nan", "+nan", "nan0", "nan000", "sNaN", "snan", "SNAN",
+            "-sNaN", "+sNaN", "sNaN0", "-snan00",
         ] {
             assert!(
                 jq_special_number(s.as_bytes()).is_some_and(f64::is_nan),
@@ -2385,6 +2390,15 @@ mod tests {
             "nana",
             "nanx",
             "nan.",
+            // A payload (#7522): jq 1.8.2 refuses it (CVE-2024-53427), 1.7.1 reads it.
+            "nan1",
+            "NaN123",
+            "nan0012",
+            "NaN01",
+            "SNAN12",
+            "sNaN1",
+            "-sNaN12",
+            "+NaN1",
             "nan1.5",
             "nan1e3",
             "nan-1",

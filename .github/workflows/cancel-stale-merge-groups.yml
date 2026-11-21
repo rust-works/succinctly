@@ -1,0 +1,41 @@
+name: Cancel stale merge groups
+
+# #7552: when the merge queue ejects an entry or a PR leaves it, the queue deletes the affected
+# groups' `gh-readonly-queue/main/pr-N-<sha>` branches and builds new groups, but the runs of the
+# deleted groups go on (ci.yml's `concurrency` never cancels a `merge_group` run, and must not: the
+# queue tests several groups at once). They held the scarce macOS runners for hours while their
+# result could never be used. `merge_group` has only the `checks_requested` activity type, so
+# nothing fires when a group is destroyed; every rebuild creates groups, though, so this sweep runs
+# on each new group, on `dequeued` (a dequeue can empty the queue) and by hand.
+#
+# Not a required check. It only cancels non-completed `merge_group` runs whose branch is gone;
+# see scripts/cancel_stale_merge_group_runs.py (`--dry-run` lists them locally).
+
+on:
+  merge_group:
+    types: [checks_requested]
+  pull_request:
+    types: [dequeued]
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  sweep:
+    name: Cancel runs of destroyed merge groups
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      # A dequeued PR's merge ref may not exist (it can conflict), so the script comes from the
+      # default branch there; a merge group checks out its own commit.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.repository.default_branch || '' }}
+          sparse-checkout: scripts
+          persist-credentials: false
+      - name: Cancel the runs of destroyed merge groups
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/cancel_stale_merge_group_runs.py

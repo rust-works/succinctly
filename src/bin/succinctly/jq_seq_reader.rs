@@ -1576,24 +1576,15 @@ struct Reader<'a> {
     column: usize,
     st: St,
     stack: Vec<Frame>,
-    /// jq's `tokenbuf`/`tokenpos`, modelled as a buffer that is *not*
-    /// cleared when the token is. `check_literal` reads `tokenbuf[1]`
-    /// without checking `tokenpos`, so a one-byte `n` token is classified
-    /// against whatever the previous token left at index 1: `\x1en` alone
-    /// reports "Invalid numeric literal", but the same `n` after an
-    /// earlier `iu` token reports "Invalid literal" instead. Reproduced
-    /// deliberately (ADR-0018 rule: bug-for-bug), and it is deterministic
-    /// for any given input once some earlier token has written index 1. A
-    /// string leaves the text it decoded to there, not the text it held
-    /// ([`Reader::found_string`], #6513).
-    ///
-    /// Until a token has written index 1, jq reads *uninitialised* heap there
-    /// (`parser_init` leaves `tokenbuf` null and `token()` grows it with
-    /// `jv_mem_realloc`), which is not deterministic: it is not `u` on macOS or
-    /// x86_64 glibc and is `u` on Amazon Linux 2023 aarch64 (#7256). No
-    /// implementation can match that, so an unwritten byte is modelled as not
-    /// `u`, the answer of the first two, and `scripts/jq-seq-oracle-sweep.py`
-    /// skips the streams that depend on it.
+    /// jq's `tokenbuf`/`tokenpos`, modelled as a buffer that is *not* cleared when the token is.
+    /// jq 1.7.1's `check_literal` read `tokenbuf[1]` without checking `tokenpos`, so a one-byte
+    /// `n` token was classified against whatever the previous token left at index 1 (an earlier
+    /// `iu` token made it "Invalid literal", and before any token had written index 1 it was
+    /// uninitialised heap, #7256). jq 1.8.2 tests `tokenpos > 1` first (jqlang/jq#3324), and so
+    /// does [`Reader::check_literal`] since #7525: a bare `n` is always "Invalid numeric literal".
+    /// What an earlier token left at index 1 therefore no longer decides anything, though the
+    /// buffer, the bytes a resumed reader is seeded with ([`token_byte_after`]) and the test that
+    /// holds the two together still model it.
     token_buf: Vec<u8>,
     token_len: usize,
     /// The offset of the first NUL of the literal token being read (#7340). jq reads a number
@@ -2294,13 +2285,13 @@ impl<'a> Reader<'a> {
         // Only `t`, `f` and `nu` take the keyword path. A bare `n` (and so
         // `nan`) falls through to the number path, which is why `\x1en`
         // reports "Invalid numeric literal" and `\x1enul` reports
-        // "Invalid literal".
+        // "Invalid literal", whatever an earlier token left in the buffer.
         let pattern: Option<&[u8]> = match self.token_buf[0] {
             b't' => Some(b"true"),
             b'f' => Some(b"false"),
-            // Deliberately the whole buffer, not just the token: see the
-            // field's docs.
-            b'n' if self.token_buf.get(1) == Some(&b'u') => Some(b"null"),
+            // jq 1.8.2 reads index 1 only when the token has one (`tokenpos > 1`, #7525);
+            // 1.7.1 read whatever an earlier token left there.
+            b'n' if self.token_len > 1 && self.token_buf[1] == b'u' => Some(b"null"),
             _ => None,
         };
         let kind = match pattern {
@@ -3283,7 +3274,7 @@ mod tests {
             b"\x1e+1",
             b"\x1e01",
             b"\x1enan",
-            b"\x1eNaN5",
+            b"\x1eNaN0",
             b"\x1esnan",
             b"\x1einf",
             b"\x1e-Infinity",
@@ -3315,44 +3306,43 @@ mod tests {
     }
 
     /// `nu` takes jq's keyword path while a bare `n` falls through to the
-    /// number parser -- and a one-character number token NUL-terminates
-    /// itself, which is what keeps a later `n` on the number path too.
+    /// number parser, whatever an earlier token left in the buffer (#7525: jq 1.7.1 read the
+    /// stale byte, 1.8.2 checks the token's own length first).
     #[test]
-    fn keyword_path_depends_on_the_second_buffer_byte_1723() {
+    fn keyword_path_depends_on_the_tokens_second_byte_1723() {
         assert_warnings(b"\x1enul", &["Invalid literal at EOF at line 1, column 4"]);
         assert_warnings(
             b"\x1en",
             &["Invalid numeric literal at EOF at line 1, column 2"],
         );
-        // `iu` leaves a `u` at index 1, so the following bare `n` is
-        // measured against `null` -- jq reads the stale byte (#1723).
+        // `iu` leaves a `u` at index 1, which jq 1.7.1 measured the following bare `n` against
+        // (#1723); 1.8.2 does not read it (#7525), and neither does this.
         assert_warnings(
             b"\x1eiu\"n",
             &[
                 "Invalid numeric literal at line 1, column 4 (need RS to resync)",
-                "Invalid literal at EOF at line 1, column 5",
+                "Invalid numeric literal at EOF at line 1, column 5",
             ],
         );
     }
 
-    /// #6513: jq decodes a string's escapes in place over its token buffer, so the byte the next
-    /// bare `n` finds at index 1 is the second byte of the decoded text when that has two or more,
-    /// and the one the string held there when it has one: a `u` (the escape for `A`) takes the
-    /// keyword path and says "Invalid literal", anything else the number path. Every row is jq
-    /// 1.7.1's wording for `\x1e"<string>"\n\x1en\n`.
+    /// #6513, #7525: jq decodes a string's escapes in place over its token buffer, so jq 1.7.1's
+    /// next bare `n` found the second byte of the decoded text at index 1 when that has two or
+    /// more, and the one the string held there when it has one: a `u` (the escape for `A`) took
+    /// the keyword path and said "Invalid literal". jq 1.8.2 never reads the byte, so every row is
+    /// its wording for `\x1e"<string>"\n\x1en\n`: "Invalid numeric literal".
     #[test]
-    fn a_decoded_string_leaves_its_second_byte_at_index_one_6513() {
+    fn a_bare_n_after_a_string_is_a_numeric_literal_whatever_it_decoded_to_6513() {
         let bs = '\\';
         let numeric = "Invalid numeric literal at line 3, column 0 (need RS to resync)";
-        let literal = "Invalid literal at line 3, column 0 (need RS to resync)";
         for (string, expected) in [
             ("a".to_string(), numeric),
             (format!("{bs}n"), numeric),
             // One byte decoded: the `u` of the escape is still at index 1.
-            (format!("{bs}u0041"), literal),
-            (format!("{bs}u0000"), literal),
+            (format!("{bs}u0041"), numeric),
+            (format!("{bs}u0000"), numeric),
             // Two or more: index 1 is a byte of the decoded text.
-            (format!("x{bs}u0075"), literal),
+            (format!("x{bs}u0075"), numeric),
             (format!("{bs}u0041a"), numeric),
             (format!("{bs}u0041{bs}u0042"), numeric),
             (format!("{bs}u00e9"), numeric),
@@ -3363,11 +3353,11 @@ mod tests {
             (format!("{bs}ud83d{bs}ude00"), numeric),
             // An error leaves what was decoded before it.
             (format!("{bs}u00e9{bs}ud800"), numeric),
-            (format!("{bs}u0041{bs}ud800"), literal),
+            (format!("{bs}u0041{bs}ud800"), numeric),
             (format!("{bs}u00e9{bs}x"), numeric),
-            (format!("{bs}u0041{bs}x"), literal),
+            (format!("{bs}u0041{bs}x"), numeric),
             (format!("{bs}u00e9\t"), numeric),
-            (format!("{bs}u0041\t"), literal),
+            (format!("{bs}u0041\t"), numeric),
         ] {
             let input = format!("\x1e\"{string}\"\n\x1en\n").into_bytes();
             let got = warnings(&[&input]);
