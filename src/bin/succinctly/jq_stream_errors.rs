@@ -1186,9 +1186,8 @@ struct Parser {
     output: Vec<OwnedValue>,
     next: Option<OwnedValue>,
     /// jq's `tokenbuf`/`tokenpos`, as in [`crate::cli::jq_seq_reader`]: a buffer that is not cleared
-    /// with the token, because `check_literal` reads `tokenbuf[1]` without checking `tokenpos`.
-    /// Before any token has written index 1 that is uninitialised memory in jq, modelled here
-    /// as not `u` (#7256, see [`crate::cli::jq_seq_reader`]).
+    /// with the token. jq 1.7.1's `check_literal` read `tokenbuf[1]` for a bare `n` without checking
+    /// `tokenpos`; jq 1.8.2 does not, and neither does [`Parser::check_literal`] since #7525.
     token_buf: Vec<u8>,
     token_len: usize,
     source: usize,
@@ -1796,8 +1795,9 @@ impl Parser {
         let pattern: Option<&[u8]> = match self.token_buf[0] {
             b't' => Some(b"true"),
             b'f' => Some(b"false"),
-            // Deliberately the whole buffer, not just the token: see the field's docs.
-            b'n' if self.token_buf.get(1) == Some(&b'u') => Some(b"null"),
+            // jq 1.8.2 reads index 1 only when the token has one (`tokenpos > 1`, #7525);
+            // 1.7.1 read whatever an earlier token left there.
+            b'n' if self.token_len > 1 && self.token_buf[1] == b'u' => Some(b"null"),
             _ => None,
         };
         let value = match pattern {

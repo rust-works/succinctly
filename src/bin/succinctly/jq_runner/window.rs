@@ -2032,6 +2032,11 @@ impl WindowedFile {
         } else {
             (&*self.file).read_to_end(&mut bytes).err()
         };
+        // #7576: a tail there is no room for is jq's `cannot allocate memory`, not a stream that ends
+        // where the room did.
+        if let Some(error) = &error {
+            super::abort_if_out_of_memory(error);
+        }
         self.eof = true;
         let gate = self
             .seq_gate
@@ -3185,6 +3190,8 @@ impl LineWindows {
             };
             if let Err(error) = read {
                 // patchcov: coverage tolerate reason="untestable: a read that fails after the source opened"
+                // #7576: the rest read whole, with no room for it, is jq's `cannot allocate memory`.
+                super::abort_if_out_of_memory(&error);
                 on_error(&error);
                 // patchcov: coverage end
             }
@@ -5356,8 +5363,8 @@ mod tests {
 #[cfg(test)]
 mod stream_tests {
     use super::super::{
-        bare_token_lost_to_fault, parse_error_line_after, stitch_json_file_seams,
-        strip_leading_json_bom, utf8_lossy_document, LineCounter,
+        bare_token_lost_to_fault, first_with_bytes_is_a_cut_bom, parse_error_line_after,
+        stitch_json_file_seams, strip_leading_json_bom, utf8_lossy_document, LineCounter,
     };
     use super::*;
     use std::io::{Seek, Write};
@@ -5520,6 +5527,10 @@ mod stream_tests {
     }
 
     fn assert_same(files: &[Vec<u8>], block: usize) {
+        // A list that opens with a mark cut across files is not the windows' to read (#7566).
+        if first_with_bytes_is_a_cut_bom(files) {
+            return;
+        }
         let want = whole_route(files);
         // Held handles, and the same files opened a file at a time by path (#7024).
         assert_same_as(files, block, &want, windowed_route(files, block).0);

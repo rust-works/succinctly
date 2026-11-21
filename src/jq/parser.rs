@@ -1754,13 +1754,9 @@ fn collect_def_names(input: &str) -> BTreeSet<String> {
         // before the walk inspects what follows it, and the walk bails
         // (keeping whatever it already collected) the moment a token isn't
         // `IDENT` followed by `;`/`,`/`)`, so an unclosed list costs at
-        // most its own length, never a scan of everything after it. `,` is
-        // accepted alongside `;` to match `Parser::parse_func_params`'s own
-        // separator set -- this dialect's grammar, not real jq's (real jq
-        // rejects a comma-separated def parameter list outright, confirmed
-        // live) -- since a comma-separated parameter is otherwise silently
-        // dropped from the shadow set the exact same way (confirmed live:
-        // `def f(a, length): length; f(1;2)` answered `0`, not `2`).
+        // most its own length, never a scan of everything after it. Only `;`
+        // separates parameters, as in `Parser::parse_func_params` and real jq
+        // (a comma-separated parameter list is a syntax error, #7457).
         let after_name = skip_ws_and_comments(after_name_start);
         if let Some(mut rest_params) = after_name.strip_prefix('(') {
             loop {
@@ -1772,7 +1768,7 @@ fn collect_def_names(input: &str) -> BTreeSet<String> {
                 names.insert(pname.to_string());
                 rest_params = skip_ws_and_comments(after_pname);
                 match rest_params.chars().next() {
-                    Some(';' | ',') => rest_params = &rest_params[1..],
+                    Some(';') => rest_params = &rest_params[1..],
                     _ => break,
                 }
             }
@@ -2907,7 +2903,11 @@ pub(crate) fn unbound_value_args_call(expr: &Expr) -> Option<Expr> {
 /// call) is left as written, so it costs nothing at run time. yq mode keeps
 /// [`bind_retrying_value_arg`]: real yq takes the first value of most of these arguments, or
 /// refuses a second one, rather than fanning out.
-fn bind_value_args(mut builtin: Builtin) -> Expr {
+fn bind_value_args(builtin: Builtin) -> Expr {
+    let mut builtin = match retry_collected_arg(builtin) {
+        Ok(retried) => return retried,
+        Err(builtin) => builtin,
+    };
     let mut slots = builtin.value_args_mut();
     let Some(innermost) = slots
         .iter()
@@ -2929,6 +2929,199 @@ fn bind_value_args(mut builtin: Builtin) -> Expr {
             var: var.to_string(),
             body: Box::new(body),
         })
+}
+
+/// The variables [`retry_collected_arg`] binds. They are not [`VALUE_ARG_VARS`]: the argument it
+/// rewrites reads them, so the resolver checks these bindings as the ordinary `as` they are, not as
+/// the call they came from.
+const COLLECTED_RE_VAR: &str = "%re";
+const COLLECTED_ARG_VAR: &str = "%collected";
+const COLLECTED_VALUES_VAR: &str = "%collected_values";
+const IN_INPUT_VAR: &str = "%in";
+
+/// A `?//` bind in an argument jq reads *inside an array it collects* (#7558): `split`'s and
+/// `splits`' flags (`def splits($re; flags): . as $s | [match($re; "g" + flags) | ...] | ...`) and
+/// `combinations`' count (`def combinations(n): . as $dot | [range(n) | $dot] | combinations;`).
+///
+/// A failure the collected expression raises after one of the argument's values (`"g" + 1`, a
+/// regex refusal, `range("x")`) backtracks into the argument's next alternative. The argument
+/// cannot be bound ahead of the call the way [`bind_value_args`] binds the others, because every
+/// value it yields lands in the one array: `split("a"; ("", "i"))` is one split by both, not two.
+/// So its values are collected first, with the step that can fail run right after each one,
+/// where a failure retries the bind, and the call then reads the values that survived:
+/// `[F as $f | (match($re; "g" + $f) | empty), $f] as $fs | splits($re; $fs[])`, and
+/// `[N as $n | range($n; $n), $n] as $ns | combinations($ns[])` (`range(x; x)` yields nothing
+/// for a number and refuses anything else with `range(n)`'s own sentence). The builtin's own
+/// evaluation of the argument cannot retry a bind, which is why the values reach it settled.
+/// `split`'s and `splits`' `$re` is bound first, as jq binds it, so the check matches with the
+/// pattern the call uses.
+///
+/// `in(xs)` is the third shape: `def in(xs): . as $x | xs | has($x);` binds its input before
+/// `xs` runs, so binding `xs` first would put the argument's errors ahead of the input's own
+/// (#2202). An argument that holds a `?//` is spelled out as that definition instead, where a
+/// refusal of `has` retries the bind as any later pipe stage does. Any other argument keeps the
+/// call, which the resolver reports compile errors for as jq does (a closure operand).
+/// `Err` hands back a builtin with none of these arguments.
+fn retry_collected_arg(builtin: Builtin) -> Result<Expr, Builtin> {
+    let var = |name: &str| Expr::Var(name.to_string());
+    // `[source as $c | check, $c] as $cs`, then `body` reading `$cs[]` in the argument's slot.
+    let settled = |source: Box<Expr>, check: Expr, body: &dyn Fn(Box<Expr>) -> Expr| Expr::As {
+        expr: Box::new(Expr::Array(Box::new(Expr::As {
+            expr: source,
+            var: COLLECTED_ARG_VAR.to_string(),
+            body: Box::new(Expr::Comma(vec![check, var(COLLECTED_ARG_VAR)])),
+        }))),
+        var: COLLECTED_VALUES_VAR.to_string(),
+        body: Box::new(body(Box::new(Expr::pipe(vec![
+            var(COLLECTED_VALUES_VAR),
+            Expr::Iterate,
+        ])))),
+    };
+    let split_regex = matches!(builtin, Builtin::SplitRegex(..));
+    match builtin {
+        Builtin::SplitsFlags(re, flags) | Builtin::SplitRegex(re, flags)
+            if contains_retrying_pattern_bind(&flags) =>
+        {
+            let matched = Builtin::MatchFlags(
+                Box::new(var(COLLECTED_RE_VAR)),
+                Box::new(Expr::arithmetic(
+                    ArithOp::Add,
+                    Expr::Literal(Literal::String("g".into())),
+                    var(COLLECTED_ARG_VAR),
+                )),
+            );
+            let check = Expr::pipe(vec![Expr::Builtin(matched), Expr::Builtin(Builtin::Empty)]);
+            let call = settled(flags, check, &|flags| {
+                let re = Box::new(var(COLLECTED_RE_VAR));
+                Expr::Builtin(if split_regex {
+                    Builtin::SplitRegex(re, flags)
+                } else {
+                    Builtin::SplitsFlags(re, flags)
+                })
+            });
+            Ok(Expr::As {
+                expr: re,
+                var: COLLECTED_RE_VAR.to_string(),
+                body: Box::new(call),
+            })
+        }
+        Builtin::In(xs) if contains_retrying_pattern_bind(&xs) => Ok(Expr::As {
+            expr: Box::new(Expr::Identity),
+            var: IN_INPUT_VAR.to_string(),
+            body: Box::new(Expr::pipe(vec![
+                *xs,
+                Expr::Builtin(Builtin::Has(Box::new(var(IN_INPUT_VAR)))),
+            ])),
+        }),
+        Builtin::CombinationsN(count) if contains_retrying_pattern_bind(&count) => {
+            let check = Expr::Range {
+                from: Box::new(var(COLLECTED_ARG_VAR)),
+                to: Some(Box::new(var(COLLECTED_ARG_VAR))),
+                step: None,
+            };
+            Ok(settled(count, check, &|count| {
+                Expr::Builtin(Builtin::CombinationsN(count))
+            }))
+        }
+        other => Err(other),
+    }
+}
+
+/// Which call a [`retry_collected_arg`] shape was parsed from.
+#[derive(Clone, Copy)]
+enum CollectedCall {
+    In,
+    Split,
+    Splits,
+    Combinations,
+}
+
+/// Whether `var` is the outermost binding of a [`retry_collected_arg`] shape, which the resolver
+/// checks as the call it was parsed from (#7558).
+pub(crate) fn is_collected_arg_var(var: &str) -> bool {
+    var == COLLECTED_RE_VAR || var == COLLECTED_VALUES_VAR || var == IN_INPUT_VAR
+}
+
+/// The program's own operands in a [`retry_collected_arg`] shape, in the call's operand order,
+/// or `None` when `expr` is not one.
+fn collected_arg_operands_mut(expr: &mut Expr) -> Option<(CollectedCall, Vec<&mut Expr>)> {
+    // `[source as $c | check, $c] as $cs | body`: the source, and the body.
+    fn settled(expr: &mut Expr) -> Option<(&mut Expr, &mut Expr)> {
+        let Expr::As { expr, var, body } = expr else {
+            return None;
+        };
+        let Expr::Array(inner) = expr.as_mut() else {
+            return None;
+        };
+        let Expr::As { expr: source, .. } = inner.as_mut() else {
+            return None;
+        };
+        (var == COLLECTED_VALUES_VAR).then_some((source.as_mut(), body.as_mut()))
+    }
+    let Expr::As { expr, var, body } = expr else {
+        return None;
+    };
+    match var.as_str() {
+        IN_INPUT_VAR => match body.as_mut() {
+            Expr::Pipe(stages) => Some((CollectedCall::In, stages.iter_mut().take(1).collect())),
+            _ => None,
+        },
+        COLLECTED_RE_VAR => {
+            let (flags, call) = settled(body)?;
+            let kind = match call {
+                Expr::Builtin(Builtin::SplitRegex(..)) => CollectedCall::Split,
+                Expr::Builtin(Builtin::SplitsFlags(..)) => CollectedCall::Splits,
+                _ => return None,
+            };
+            Some((kind, alloc::vec![expr.as_mut(), flags]))
+        }
+        COLLECTED_VALUES_VAR => {
+            let Expr::Array(inner) = expr.as_mut() else {
+                return None;
+            };
+            let Expr::As { expr: count, .. } = inner.as_mut() else {
+                return None;
+            };
+            matches!(body.as_ref(), Expr::Builtin(Builtin::CombinationsN(_)))
+                .then(|| (CollectedCall::Combinations, alloc::vec![count.as_mut()]))
+        }
+        _ => None,
+    }
+}
+
+/// The call a [`retry_collected_arg`] shape was parsed from, with the program's operands moved
+/// out of the shape into it, or `None` when `expr` is not one. The resolver checks the call as
+/// written, as jq compiles it (its operands are closures), then hands it back to
+/// [`restore_collected_arg_call`]. Moving an operand moves none of the boxes inside it, so every
+/// `def` body keeps its address.
+pub(crate) fn take_collected_arg_call(expr: &mut Expr) -> Option<Expr> {
+    let (call, operands) = collected_arg_operands_mut(expr)?;
+    let mut taken = operands
+        .into_iter()
+        .map(|slot| Box::new(core::mem::replace(slot, Expr::Identity)));
+    let mut next = || taken.next().expect("each shape holds its call's operands");
+    Some(Expr::Builtin(match call {
+        CollectedCall::In => Builtin::In(next()),
+        CollectedCall::Split => Builtin::SplitRegex(next(), next()),
+        CollectedCall::Splits => Builtin::SplitsFlags(next(), next()),
+        CollectedCall::Combinations => Builtin::CombinationsN(next()),
+    }))
+}
+
+/// Puts the operands [`take_collected_arg_call`] moved out of `expr` back, from `call`.
+pub(crate) fn restore_collected_arg_call(expr: &mut Expr, call: Expr) {
+    let operands = match call {
+        Expr::Builtin(Builtin::In(xs) | Builtin::CombinationsN(xs)) => alloc::vec![*xs],
+        Expr::Builtin(Builtin::SplitRegex(re, flags) | Builtin::SplitsFlags(re, flags)) => {
+            alloc::vec![*re, *flags]
+        }
+        // patchcov: coverage tolerate-line reason="unreachable: the resolver hands back the call take_collected_arg_call built, and checking a builtin call leaves its variant (#7558)"
+        _ => unreachable!("a collected-argument call checks as the same builtin"),
+    };
+    let (_, slots) = collected_arg_operands_mut(expr).expect("the shape the call was taken from");
+    for (slot, operand) in slots.into_iter().zip(operands) {
+        *slot = operand;
+    }
 }
 
 /// Whether a builtin argument yields at most one value, for [`bind_value_args`]:
@@ -3671,6 +3864,8 @@ impl<'a> Parser<'a> {
             || !yq_string_interpolation()
             || yq_string_interpolations_are_closed(&self.input[self.pos..]);
 
+        // Where the run of escapes the parse is in began (#7445): see `fail_escape_run`.
+        let mut escape_run: Option<usize> = None;
         loop {
             match self.peek() {
                 None => {
@@ -3725,6 +3920,7 @@ impl<'a> Parser<'a> {
                             continue;
                         }
                     }
+                    let backslash_at = self.pos;
                     self.next();
                     // #4916: yq reads a short list of escapes and keeps any other backslash as text.
                     if self.mode == ParserMode::Yq {
@@ -3751,9 +3947,13 @@ impl<'a> Parser<'a> {
                             continue;
                         }
                     }
+                    if self.peek() != Some('(') {
+                        escape_run.get_or_insert(backslash_at);
+                    }
                     match self.peek() {
                         // String interpolation: \(expr)
                         Some('(') => {
+                            escape_run = None;
                             self.next();
                             self.parse_interpolation_slot(&mut parts, &mut current_literal)?;
                         }
@@ -3791,14 +3991,26 @@ impl<'a> Parser<'a> {
                         }
                         Some('u') => {
                             self.next();
-                            let c = self.parse_unicode_escape()?;
-                            current_literal.push(c);
+                            match self.parse_unicode_escape() {
+                                Ok(c) => current_literal.push(c),
+                                Err(error) if self.mode == ParserMode::Jq => {
+                                    self.fail_escape_run(
+                                        escape_run.take().unwrap_or(backslash_at),
+                                        error,
+                                    );
+                                }
+                                Err(error) => return Err(error),
+                            }
                         }
                         Some(c) => {
-                            return Err(ParseError::new(
+                            let error = ParseError::new(
                                 format!("invalid escape sequence '\\{c}'"),
                                 self.pos,
-                            ));
+                            );
+                            if self.mode != ParserMode::Jq {
+                                return Err(error);
+                            }
+                            self.fail_escape_run(escape_run.take().unwrap_or(backslash_at), error);
                         }
                         None => {
                             return Err(ParseError::new("unterminated string", self.pos));
@@ -3806,6 +4018,7 @@ impl<'a> Parser<'a> {
                     }
                 }
                 Some(c) => {
+                    escape_run = None;
                     self.next();
                     current_literal.push(c);
                 }
@@ -3872,6 +4085,26 @@ impl<'a> Parser<'a> {
         self.parse_path_step_name().map(PathStep::Field)
     }
 
+    /// The quoted step after a `.`, if one is at the cursor: a string (see [`Self::parse_path_step`])
+    /// or, in jq mode, a format-prefixed one (#7456). jq's `String` production is `FORMAT
+    /// QQSTRING_START ...` as well as `QQSTRING_START ...`, so `.@base64 "x"` is `.["x"]` (a format
+    /// never runs on a string with no interpolation) and `.@base64 "\(1)"` is `.["MQ=="]`.
+    /// `None`, with the cursor where it was, for anything else, so the caller reads a field name or
+    /// reports the stray `@`. Out of line: both callers are on the recursive descent's spine.
+    #[inline(never)]
+    fn parse_quoted_path_step(&mut self) -> Result<Option<PathStep>, ParseError> {
+        match self.peek() {
+            Some('"') => self.parse_path_step().map(Some),
+            // `try_parse_interpolated_key` declines in yq mode, whose lexer rejects a format
+            // followed by a string (#3316), and leaves the cursor alone before anything else.
+            Some('@') => Ok(self.try_parse_interpolated_key()?.map(|key| match key {
+                Expr::Literal(Literal::String(name)) => PathStep::Field(name.into_string()),
+                computed => PathStep::Computed(computed),
+            })),
+            _ => Ok(None),
+        }
+    }
+
     /// The quoted name of a dotted path step, `."key"`, in yq mode (#4916; jq mode goes through
     /// [`Self::parse_path_step`]). yq reads the text between the quotes **raw**, escapes included, up
     /// to the next `"`: `.x."a\tb"` selects the key `a\tb` (a backslash and a `t`), where `.x["a\tb"]`
@@ -3931,11 +4164,58 @@ impl<'a> Parser<'a> {
         ParseError::new(format!("lexer: invalid input text {quoted}"), at)
     }
 
+    /// Where the run of escapes that starts at `start` ends: jq's lexer reads a string literal's
+    /// escapes a run at a time, `(\\[^u(]|\\u[a-zA-Z0-9]{0,4})+` (a `\(` starts an interpolation, not an
+    /// escape), and hands each run to its JSON decoder as the string `"<run>"` (#7445).
+    fn escape_run_end(&self, start: usize) -> usize {
+        let bytes = self.input.as_bytes();
+        let mut at = start;
+        while bytes.get(at) == Some(&b'\\') {
+            match self.input[at + 1..].chars().next() {
+                None | Some('(') => break,
+                Some('u') => {
+                    at += 2;
+                    let digits = bytes[at..]
+                        .iter()
+                        .take(4)
+                        .take_while(|byte| byte.is_ascii_alphanumeric())
+                        .count();
+                    at += digits;
+                }
+                Some(other) => at += 1 + other.len_utf8(),
+            }
+        }
+        at
+    }
+
+    /// A string literal's bad escape, in jq mode: jq 1.7.1 and 1.8.2 print the message of their JSON
+    /// decoder for the run of escapes it sits in, `Invalid escape at line 1, column 4 (while parsing
+    /// '"\q"')`, not a lexer message of their own (#7445). The run is skipped and the parse goes on,
+    /// as jq's does: every bad run is an error of its own, reported with the others by
+    /// [`Self::finish_all`] (`"\q\(1)\q"` is two). `error` is the wording used when the decoder's port
+    /// reads the run as valid, which it does not for a run this parser refused.
+    fn fail_escape_run(&mut self, start: usize, error: ParseError) {
+        let end = self.escape_run_end(start);
+        let text = format!("\"{}\"", &self.input[start..end]);
+        let message = match super::parse_message::jq_parse_message(text.as_bytes()) {
+            Some(message) => format!("{message} (while parsing '{text}')"),
+            None => error.message,
+        };
+        self.deferred_key_errors
+            .entry(start)
+            .or_insert_with(|| ParseError::new(message, start));
+        // Past the escape that failed at least: a `\(` where no interpolation is read (an object
+        // key's string) ends the run before it, and the parse must still move on.
+        self.pos = end.max(self.pos);
+    }
+
     /// Parse a simple string literal (for object keys, etc.)
     fn parse_string_literal(&mut self) -> Result<String, ParseError> {
         self.expect('"')?;
         let mut result = String::new();
 
+        // Where the run of escapes the parse is in began (#7445): see `fail_escape_run`.
+        let mut escape_run: Option<usize> = None;
         loop {
             match self.peek() {
                 None => {
@@ -3946,6 +4226,7 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 Some('\\') => {
+                    let backslash_at = self.pos;
                     self.next();
                     // #4916: see `parse_string_or_interpolation`.
                     if self.mode == ParserMode::Yq {
@@ -3955,6 +4236,7 @@ impl<'a> Parser<'a> {
                             continue;
                         }
                     }
+                    escape_run.get_or_insert(backslash_at);
                     match self.peek() {
                         Some('"') => {
                             self.next();
@@ -3990,14 +4272,26 @@ impl<'a> Parser<'a> {
                         }
                         Some('u') => {
                             self.next();
-                            let c = self.parse_unicode_escape()?;
-                            result.push(c);
+                            match self.parse_unicode_escape() {
+                                Ok(c) => result.push(c),
+                                Err(error) if self.mode == ParserMode::Jq => {
+                                    self.fail_escape_run(
+                                        escape_run.take().unwrap_or(backslash_at),
+                                        error,
+                                    );
+                                }
+                                Err(error) => return Err(error),
+                            }
                         }
                         Some(c) => {
-                            return Err(ParseError::new(
+                            let error = ParseError::new(
                                 format!("invalid escape sequence '\\{c}'"),
                                 self.pos,
-                            ));
+                            );
+                            if self.mode != ParserMode::Jq {
+                                return Err(error);
+                            }
+                            self.fail_escape_run(escape_run.take().unwrap_or(backslash_at), error);
                         }
                         None => {
                             return Err(ParseError::new("unterminated string", self.pos));
@@ -4005,6 +4299,7 @@ impl<'a> Parser<'a> {
                     }
                 }
                 Some(c) => {
+                    escape_run = None;
                     self.next();
                     result.push(c);
                 }
@@ -5486,10 +5781,7 @@ impl<'a> Parser<'a> {
                     let lit = self.parse_number_literal()?;
                     // #3397: an `as` or a multiplicative operator after the
                     // literal means the negation covers it (jq's `'-' Exp`).
-                    if self.mode == ParserMode::Jq
-                        && !self.expd_operand
-                        && self.negation_scopes_over_what_follows()
-                    {
+                    if self.mode == ParserMode::Jq && self.negation_scopes_over_what_follows() {
                         self.pos = start;
                     } else {
                         folded = Some(lit);
@@ -5734,16 +6026,15 @@ impl<'a> Parser<'a> {
                     return Ok(Expr::Identity);
                 }
 
-                // Check for quoted field access `."key"`
-                let mut expr = if self.peek() == Some('"') {
-                    match self.parse_path_step()? {
-                        PathStep::Field(name) => self.field_or_wildcard(name),
-                        PathStep::Computed(key) => Expr::index_by(Expr::Identity, key),
+                // Check for quoted field access `."key"` (or `.@fmt "key"`, #7456)
+                let mut expr = match self.parse_quoted_path_step()? {
+                    Some(PathStep::Field(name)) => self.field_or_wildcard(name),
+                    Some(PathStep::Computed(key)) => Expr::index_by(Expr::Identity, key),
+                    None => {
+                        // Field access `.foo`
+                        let name = self.parse_field_ident()?;
+                        self.field_or_wildcard(name)
                     }
-                } else {
-                    // Field access `.foo`
-                    let name = self.parse_field_ident()?;
-                    self.field_or_wildcard(name)
                 };
 
                 // yq lexes a `?` after a space or newline as an error, not a
@@ -7121,6 +7412,29 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// An object pattern's string key, if one is at the cursor: jq's `String ':' Pattern`, a plain
+    /// or interpolated string, or in jq mode a format-prefixed one (`{@base64 "c": $c}`, #7456).
+    /// A string with no interpolation is a literal key (the format never runs on it); one with
+    /// `\(...)` is a computed key. `None`, with the cursor where it was, for anything else.
+    #[inline(never)]
+    fn parse_pattern_string_key(&mut self) -> Result<Option<ObjectKey>, ParseError> {
+        let key = match self.peek() {
+            Some('"') => self.parse_string_or_interpolation()?,
+            Some('@') => match self.try_parse_interpolated_key()? {
+                Some(key) => key,
+                None => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        Ok(Some(match key {
+            Expr::Literal(Literal::String(s)) => ObjectKey::Literal(s.into_string()),
+            interpolated => {
+                self.count_pattern_computed_key()?;
+                ObjectKey::Expr(Box::new(interpolated))
+            }
+        }))
+    }
+
     /// The real `parse_pattern` body, entered only through the depth-checked
     /// wrapper above -- every recursive call goes back through
     /// `self.parse_pattern()`, not this function, so the depth counter sees
@@ -7255,16 +7569,8 @@ impl<'a> Parser<'a> {
                                 }
                             }
                             ObjectKey::Expr(Box::new(key_expr))
-                        } else if self.peek() == Some('"') {
-                            match self.parse_string_or_interpolation()? {
-                                Expr::Literal(Literal::String(s)) => {
-                                    ObjectKey::Literal(s.into_string())
-                                }
-                                interpolated => {
-                                    self.count_pattern_computed_key()?;
-                                    ObjectKey::Expr(Box::new(interpolated))
-                                }
-                            }
+                        } else if let Some(key) = self.parse_pattern_string_key()? {
+                            key
                         } else {
                             ObjectKey::Literal(self.parse_qualified_ident()?)
                         };
@@ -7364,8 +7670,11 @@ impl<'a> Parser<'a> {
         if self.peek() != Some('$') {
             return Err(ParseError::new("expected '$' after 'label'", self.pos));
         }
+        let sigil_offset = self.pos;
         self.next();
         let name = self.parse_variable_name()?;
+        // #7458: `label $__loc__` is a syntax error, as the other binding sites are (#3029).
+        self.reject_loc_as_binding_name(&name, Some("BINDING"), sigil_offset)?;
         self.skip_ws();
 
         // Expect '|'
@@ -7419,6 +7728,11 @@ impl<'a> Parser<'a> {
     /// (`needs_path_context`, `owned_identity_step`, `path_context_step_generic`,
     /// ...) has to recognize for no observable benefit outside that one
     /// `def error: .;` construction.
+    ///
+    /// `break $name` is a `Term` in jq's grammar, so a postfix applies to it (#7557): `break
+    /// $f.a`, `break $f[0]` and `break $f.[]` parse, and the postfix never runs. Out of line, so
+    /// the recursive term parser that calls it holds none of this frame (#7069).
+    #[inline(never)]
     fn parse_break_expr(&mut self) -> Result<Expr, ParseError> {
         let keyword_offset = self.pos;
         self.consume_keyword("break");
@@ -7428,8 +7742,11 @@ impl<'a> Parser<'a> {
         if self.peek() != Some('$') {
             return Err(ParseError::new("expected '$' after 'break'", self.pos));
         }
+        let sigil_offset = self.pos;
         self.next();
         let name = self.parse_variable_name()?;
+        // #7458: `break $__loc__` is a syntax error, as is `label $__loc__`.
+        self.reject_loc_as_binding_name(&name, Some("BINDING"), sigil_offset)?;
 
         // #2964: record the site unconditionally -- before the
         // `wrap_shadowable_call` wrapper below decides whether this `break`
@@ -7444,11 +7761,12 @@ impl<'a> Parser<'a> {
         });
 
         let node = Expr::Break(name);
-        if self.shadowable_defs.contains("error") {
-            Ok(Self::wrap_shadowable_call("error", node))
+        let term = if self.shadowable_defs.contains("error") {
+            Self::wrap_shadowable_call("error", node)
         } else {
-            Ok(node)
-        }
+            node
+        };
+        self.parse_postfix(term)
     }
 
     /// Parse a `def`'s optional `(PARAMS)` parameter list, one [`Param`]
@@ -7498,15 +7816,17 @@ impl<'a> Parser<'a> {
                 });
                 self.skip_ws();
 
+                // #7457: parameters are separated by `;` only; jq's grammar has no `,` there
+                // (`def f(a,b): a; f(5;6)` is `unexpected ','`), and yq has no `def` to follow.
                 match self.peek() {
-                    Some(';' | ',') => {
+                    Some(';') => {
                         self.next();
                         self.skip_ws();
                     }
                     Some(')') => break,
                     _ => {
                         return Err(ParseError::new(
-                            "expected ';', ',', or ')' in parameter list",
+                            "expected ';' or ')' in parameter list",
                             self.pos,
                         ));
                     }
@@ -11010,23 +11330,20 @@ impl<'a> Parser<'a> {
                         }
                         push_bracket(&mut chain, bracket);
                     } else {
-                        let name = if self.peek() == Some('"') {
-                            match self.parse_path_step()? {
-                                PathStep::Field(name) => name,
-                                PathStep::Computed(key) => {
-                                    // `.a."b\(0)"` is `.a | .["b\(0)"]` with the key read from the
-                                    // chain's input, as a bracket's is (#6053).
-                                    self.skip_ws();
-                                    let optional = self.at_postfix_question();
-                                    if optional {
-                                        self.next();
-                                    }
-                                    push_bracket(&mut chain, Bracket::Dynamic { key, optional });
-                                    continue;
+                        let name = match self.parse_quoted_path_step()? {
+                            Some(PathStep::Field(name)) => name,
+                            Some(PathStep::Computed(key)) => {
+                                // `.a."b\(0)"` is `.a | .["b\(0)"]` with the key read from the
+                                // chain's input, as a bracket's is (#6053).
+                                self.skip_ws();
+                                let optional = self.at_postfix_question();
+                                if optional {
+                                    self.next();
                                 }
+                                push_bracket(&mut chain, Bracket::Dynamic { key, optional });
+                                continue;
                             }
-                        } else {
-                            self.parse_field_ident()?
+                            None => self.parse_field_ident()?,
                         };
                         let mut field_expr = self.field_or_wildcard(name);
 
@@ -11165,7 +11482,11 @@ impl<'a> Parser<'a> {
     /// must not fold into the token. The unary-minus arm then binds the
     /// positive literal and absorbs the chain. A postfix `?` scopes too:
     /// `-2? * 3` is `-(2? * 3)`; so does a postfix `.name` or `.[...]` (`-1..e1`
-    /// and `-1 .e1` index the number 1, #5615). Consumes nothing.
+    /// and `-1 .e1` index the number 1, #5615) and a postfix `[...]` (`-1[0]`,
+    /// `-1.[]?` and `-1 [0]` are `-(1[0])`, #7497). Consumes nothing.
+    ///
+    /// An object value (`ExpD`, #3397) takes no `as`, no multiplicative chain and no `Exp '?'`,
+    /// but its `'-' ExpD` still negates a whole Term: only a `.` or `[` postfix scopes there.
     fn negation_scopes_over_what_follows(&mut self) -> bool {
         // The byte right after the literal settles nearly every case.
         if matches!(self.peek(), None | Some(',' | ']' | ')' | '}' | ';' | '|')) {
@@ -11174,13 +11495,13 @@ impl<'a> Parser<'a> {
         let start = self.pos;
         self.skip_ws();
         let peek2 = self.peek_str(2);
-        let scopes = self.matches_keyword("as")
-            || self.at_postfix_question()
+        let scopes = (!self.expd_operand
+            && (self.matches_keyword("as") || self.at_postfix_question()))
             || match self.peek() {
-                Some('.') => true,
-                Some('*') => peek2 != "*=",
-                Some('%') => peek2 != "%=",
-                Some('/') => peek2 != "//" && peek2 != "/=",
+                Some('.' | '[') => true,
+                Some('*') => !self.expd_operand && peek2 != "*=",
+                Some('%') => !self.expd_operand && peek2 != "%=",
+                Some('/') => !self.expd_operand && peek2 != "//" && peek2 != "/=",
                 _ => false,
             };
         self.pos = start;
@@ -12652,7 +12973,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
 
         // Parse the path string
-        let path = self.parse_string_literal()?;
+        let path = self.parse_import_path()?;
 
         self.skip_ws();
 
@@ -12675,7 +12996,10 @@ impl<'a> Parser<'a> {
             self.next();
         }
         let alias = self.parse_ident()?;
-        if !data {
+        if data {
+            // #7458: `$__loc__` is its own token, not a `BINDING`, so it names no data import.
+            self.reject_loc_as_binding_name(&alias, Some("IDENT or BINDING"), alias_offset)?;
+        } else {
             self.reject_reserved_word_as_name(&alias, "IDENT or BINDING", alias_offset)?;
         }
 
@@ -12706,13 +13030,24 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// The path of an `import` or `include`: jq's `ImportFrom`, a constant `String`, which may carry
+    /// a format prefix (`import @text "m" as m;`, #7456). The format never runs on a string with
+    /// no interpolation, so the path is the literal; an interpolated one is refused either way.
+    fn parse_import_path(&mut self) -> Result<String, ParseError> {
+        if self.mode == ParserMode::Jq && self.peek() == Some('@') {
+            self.parse_format_string()?;
+            self.skip_ws();
+        }
+        self.parse_string_literal()
+    }
+
     /// Parse include directive: `include "path";`
     fn parse_include(&mut self, decl_index: usize) -> Result<Include, ParseError> {
         self.consume_keyword("include");
         self.skip_ws();
 
         // Parse the path string
-        let path = self.parse_string_literal()?;
+        let path = self.parse_import_path()?;
 
         self.skip_ws();
 
@@ -13430,6 +13765,60 @@ mod tests {
                 Literal::number_literal("1".to_string())
             )))))
         );
+    }
+
+    /// #7558: `split`/`splits`' flags and `combinations`' count are collected and checked
+    /// ahead of the call when they hold a `?//`, and left in their slot otherwise, where several
+    /// values still land in one array (`split(","; ("g", null))` is one split).
+    #[test]
+    fn test_collected_arg_with_an_alternative_bind_is_settled_first_7558() {
+        for (program, splits) in [
+            (r#"split(","; [1] as $q ?// $b | "g")"#, false),
+            (r#"splits(","; [1] as $q ?// $b | "g")"#, true),
+        ] {
+            let Expr::As { var, body, .. } = parse(program).unwrap() else {
+                panic!("{program}: expected `$re` bound first");
+            };
+            assert_eq!(var, COLLECTED_RE_VAR);
+            let Expr::As { expr, var, body } = *body else {
+                panic!("{program}: expected the flags collected");
+            };
+            assert_eq!(var, COLLECTED_VALUES_VAR);
+            assert!(matches!(*expr, Expr::Array(_)), "{program}: {expr:?}");
+            match (*body, splits) {
+                (Expr::Builtin(Builtin::SplitsFlags(re, _)), true)
+                | (Expr::Builtin(Builtin::SplitRegex(re, _)), false) => {
+                    assert!(matches!(*re, Expr::Var(name) if name == COLLECTED_RE_VAR));
+                }
+                (other, _) => panic!("{program}: {other:?}"),
+            }
+        }
+        let Expr::As { var, body, .. } = parse(r"combinations([1] as $q ?// $b | 2)").unwrap()
+        else {
+            panic!("expected the count collected");
+        };
+        assert_eq!(var, COLLECTED_VALUES_VAR);
+        assert!(matches!(*body, Expr::Builtin(Builtin::CombinationsN(_))));
+        // `in(xs)` is its definition, `. as $x | xs | has($x)`, so the input is bound first.
+        let Expr::As { expr, var, body } = parse(r"in([1] as $q ?// $b | {})").unwrap() else {
+            panic!("expected `in`'s input bound first");
+        };
+        assert_eq!(var, IN_INPUT_VAR);
+        assert!(matches!(*expr, Expr::Identity));
+        assert!(matches!(*body, Expr::Pipe(_)), "{body:?}");
+        assert!(matches!(
+            parse(r#"in({"a": 1})"#).unwrap(),
+            Expr::Builtin(Builtin::In(_))
+        ));
+        // No `?//`: untouched, several values and all.
+        assert!(matches!(
+            parse(r#"split(","; ("g", null))"#).unwrap(),
+            Expr::Builtin(Builtin::SplitRegex(..))
+        ));
+        assert!(matches!(
+            parse("combinations(1, 2)").unwrap(),
+            Expr::Builtin(Builtin::CombinationsN(_))
+        ));
     }
 
     /// #3487: a builtin whose argument holds a `?//` bind is parsed as `K as $v | B($v)`, so
@@ -16668,11 +17057,11 @@ mod tests {
             .unwrap_err()
             .message
             .contains("unknown format"));
-        // Invalid escape inside a string literal.
-        assert!(parse(r#""\q""#)
-            .unwrap_err()
-            .message
-            .contains("invalid escape"));
+        // Invalid escape inside a string literal: jq's JSON decoder's message for the run (#7445).
+        assert_eq!(
+            parse(r#""\q""#).unwrap_err().message,
+            "Invalid escape at line 1, column 4 (while parsing '\"\\q\"')"
+        );
         // Unexpected character where an expression is expected.
         assert!(parse("%").is_err());
         // Array index/slice: expected ']' or ':'.
@@ -16839,7 +17228,7 @@ mod tests {
         let err = parse("def f(a b): a; f(1;2)").expect_err("missing separator must error");
         assert!(
             err.message
-                .contains("expected ';', ',', or ')' in parameter list"),
+                .contains("expected ';' or ')' in parameter list"),
             "unexpected error: {}",
             err.message
         );
@@ -17205,6 +17594,57 @@ mod tests {
     fn test_format_prefixed_string_still_rejected_in_yq_mode_3316() {
         assert!(parse_with_mode(r#"@base64 "v=\(1)""#, ParserMode::Yq).is_err());
         assert!(parse_with_mode(r#"@base64"x""#, ParserMode::Yq).is_err());
+    }
+
+    /// #7456: a format-prefixed string is a step after `.`, an object-pattern key and an import
+    /// path, desugaring to the same tree as the string with each interpolation formatted: a literal
+    /// is the field it names, an interpolation the computed key `."...\(E | @fmt)..."` reads.
+    #[test]
+    fn format_prefixed_string_is_a_path_step_pattern_key_and_import_path_7456() {
+        let jq = |source: &str| parse_with_mode(source, ParserMode::Jq).unwrap();
+        for (formatted, plain) in [
+            (r#".@base64 "x""#, ".x"),
+            (r#". @base64 "x""#, ".x"),
+            (r#".@foo "x"?"#, ".x?"),
+            (r#".a.@text "b".c"#, ".a.b.c"),
+            (r#".a . @json "b""#, ".a.b"),
+            (r#"$__loc__.@text "file""#, "$__loc__.file"),
+            (r#".@base64 "\(1)""#, r#"."\(1 | @base64)""#),
+            (r#".a.@json "k\(.n)"?"#, r#".a."k\(.n | @json)"?"#),
+            (r#". as {@base64 "c": $c} | $c"#, r#". as {"c": $c} | $c"#),
+            (
+                r#". as {@uri "\(.k)": $c} | $c"#,
+                r#". as {"\(.k | @uri)": $c} | $c"#,
+            ),
+        ] {
+            assert_eq!(jq(formatted), jq(plain), "{formatted}");
+        }
+        let program = |source: &str| parse_program_with_mode(source, ParserMode::Jq).unwrap();
+        assert_eq!(
+            program(r#"import @text "m" as m; m::f"#),
+            program(r#"import "m" as m; m::f"#)
+        );
+        assert_eq!(
+            program(r#"include @base64 "m"; f"#),
+            program(r#"include "m"; f"#)
+        );
+        // No string after the format: jq's `expecting QQSTRING_START`.
+        for source in [
+            ".@base64",
+            ".@base64 1",
+            "{@base64}",
+            ". as {@base64: $c} | $c",
+        ] {
+            assert!(parse_with_mode(source, ParserMode::Jq).is_err(), "{source}");
+        }
+        // yq's lexer has no format-prefixed string anywhere, and `.@base64` is the key `@base64`.
+        for source in [r#".@base64 "x""#, r#".a.@text "b""#] {
+            assert!(parse_with_mode(source, ParserMode::Yq).is_err(), "{source}");
+        }
+        assert_eq!(
+            parse_with_mode(".@base64", ParserMode::Yq).unwrap(),
+            Expr::Field("@base64".into())
+        );
     }
 
     /// #3357: jq's own grammar accepts any `@name` token at parse time and

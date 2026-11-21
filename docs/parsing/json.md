@@ -91,7 +91,14 @@ The parser uses a 4-state finite state machine:
 | **InJson**   | Outside strings/values | `"` → InString, digit/letter → InValue  |
 | **InString** | Inside quoted string   | `"` → InJson, `\` → InEscape            |
 | **InEscape** | After backslash        | any → InString                          |
-| **InValue**  | Inside unquoted value  | whitespace/delimiter → InJson           |
+| **InValue**  | Inside unquoted value  | any non-value byte → InJson             |
+
+A byte that ends a value is then read as `InJson` would only if it is a bracket or brace: `}`
+or `]` writes its close and `{` or `[` its open, while a `"` glued to the value (`1"a"`) opens
+no string and writes nothing. The definition is `state_machine` in `src/json/standard.rs`; the
+PFSM tables and every SIMD backend reproduce it on any input, malformed input included, and
+`tests/json_builder_differential_properties.rs` checks each builder the target compiles against
+it (#186, #7539).
 
 ### Output (Phi Values)
 

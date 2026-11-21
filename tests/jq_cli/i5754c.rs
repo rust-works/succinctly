@@ -1,9 +1,10 @@
 //! #5754: `strftime` and `strflocaltime` take the `_`, `-` and `0` padding flags on the numeric
 //! specifiers (`%_d` pads with a blank, `%-d` not at all, `%0e` with a zero), print a character
 //! that names nothing bare (`%Q` is `Q`, `%5Y` is `5Y`), and fail with `unknown system failure`
-//! when the result is empty or does not fit the `strlen(fmt) + 100` byte buffer jq gives the libc.
-//! Every expectation is what jq 1.7.1 (`/usr/bin/jq`) prints on macOS: `^`, `#` and a width are
-//! not flags there, and `y`, `Y`, `C`, `g` and `G` ignore the flags (a glibc `jq` pads and strips
+//! when the result does not fit the `strlen(fmt) + 100` byte buffer jq gives the libc (or is empty
+//! for a format that is not; an *empty format* answers `""` since jq 1.8, #7542).
+//! Every expectation is what jq 1.7.1 (`/usr/bin/jq`) prints on macOS, except the empty-format rows,
+//! which are jq 1.8.2's (`/opt/homebrew/bin/jq`). `^`, `#` and a width are not flags there, and `y`, `Y`, `C`, `g` and `G` ignore the flags (a glibc `jq` pads and strips
 //! those, reads `^` and `#`, and prints an unknown `%Q` as written). `%E` and `%O` are modifiers
 //! the libc passes through for every specifier, and a flag may stand on either side of one.
 
@@ -138,11 +139,10 @@ fn flags_pad_the_numeric_specifiers_and_nothing_else() -> Result<()> {
 }
 
 #[test]
-fn an_empty_or_oversized_result_is_a_system_failure() -> Result<()> {
+fn an_oversized_result_is_a_system_failure() -> Result<()> {
     for (function, secs, tz, fmt) in [
-        ("strftime", 1420167845, "UTC", ""),
         ("strftime", 1420167845, "UTC", "%c%c%c%c%c"),
-        ("strflocaltime", 1420167845, "UTC", ""),
+        ("strflocaltime", 1420167845, "UTC", "%c%c%c%c%c"),
         ("strftime", 1420167845, "UTC", "%c%c%c%c%Y%Y%Y%Y%Y%a%a"),
     ] {
         let (out, stderr) = format_time(function, secs, tz, fmt)?;
@@ -155,12 +155,46 @@ fn an_empty_or_oversized_result_is_a_system_failure() -> Result<()> {
     Ok(())
 }
 
+/// #7542: an empty format is not a failure (jq 1.8.2, jqlang/jq#3271: the check became
+/// `(n == 0 && *fmt) || n > max_size`); 1.7.1 raised `unknown system failure` for it. The rows
+/// are jq 1.8.2's: the empty format, a format that is empty once a NUL ends it (written in the
+/// program, as an argument cannot hold a NUL), and the optional form, which now answers the empty
+/// string instead of nothing.
+#[test]
+fn an_empty_format_formats_as_the_empty_string_7542() -> Result<()> {
+    for (function, secs, tz, fmt) in [
+        ("strftime", 1420167845, "UTC", ""),
+        ("strflocaltime", 1420167845, "UTC", ""),
+        ("strftime", 0, "UTC", ""),
+    ] {
+        assert_eq!(
+            format_time(function, secs, tz, fmt)?.0.as_deref(),
+            Some("\"\""),
+            "{secs} | {function}({fmt:?}) in {tz}"
+        );
+    }
+    for (filter, want) in [
+        (r#"1420167845|[strftime("")?]"#, "[\"\"]\n"),
+        (r#"1420167845|strflocaltime("")?"#, "\"\"\n"),
+        (r#"1420167845|strftime("\u0000")"#, "\"\"\n"),
+        (r#"1420167845|strftime("\u0000x")"#, "\"\"\n"),
+        (r#"1420167845|strflocaltime("\u0000x")"#, "\"\"\n"),
+        (r#"[1970,0,1,0,0,0,4,0] | strftime("")"#, "\"\"\n"),
+        (r#"[1970,0,1,0,0,0,4,0] | strflocaltime("")"#, "\"\"\n"),
+        // The vendored jq 1.8.2 test of the same shape.
+        (r#"0 | [strflocaltime("" | ., @uri)]"#, "[\"\",\"\"]\n"),
+    ] {
+        let (out, _stderr, code) = crate::run_jq_full(&["-n", "-c", filter], None)?;
+        assert_eq!((out.as_str(), code), (want, 0), "{filter}");
+    }
+    Ok(())
+}
+
 #[test]
 fn the_optional_form_of_a_failing_format_is_empty() -> Result<()> {
     for filter in [
-        r#"1420167845|strftime("")?"#,
         r#"1420167845|strflocaltime("%c%c%c%c%c")?"#,
-        r#"1420167845|[strftime("")?]|length"#,
+        r#"1420167845|[strftime("%c%c%c%c%c")?]|length"#,
     ] {
         let (out, _stderr, code) = crate::run_jq_full(&["-n", filter], None)?;
         assert_eq!(code, 0, "{filter}");
@@ -174,12 +208,10 @@ fn a_nul_ends_the_format() -> Result<()> {
     let (out, _stderr, code) =
         crate::run_jq_full(&["-n", "-c", r#"1420167845|strftime("a\u0000b%Y")"#], None)?;
     assert_eq!((out.as_str(), code), ("\"a\"\n", 0));
-    let (_out, stderr, code) =
-        crate::run_jq_full(&["-n", r#"1420167845|strftime("\u0000")"#], None)?;
-    assert_eq!(code, 5);
-    assert!(
-        stderr.contains("strftime/1: unknown system failure"),
-        "{stderr}"
-    );
+    // A format that is empty once the NUL ends it is the empty format, which jq 1.8.2 answers
+    // (#7542); jq 1.7.1 raised `unknown system failure`.
+    let (out, _stderr, code) =
+        crate::run_jq_full(&["-n", "-c", r#"1420167845|strftime("\u0000")"#], None)?;
+    assert_eq!((out.as_str(), code), ("\"\"\n", 0));
     Ok(())
 }

@@ -100,8 +100,8 @@ fn test_nth_in_a_path_position_5309() -> Result<()> {
 /// `fromjson` and `tonumber` word a refusal as jq's push parser does: the first fault, where it
 /// was met. The one-line probes in `tests/data/jq-error-probes.tsv` hold the common shapes; these
 /// are the ones a one-line table cannot: a message spanning a newline, and a NUL, which jq's
-/// `fromjson` parses past (it takes a length) and its `tonumber` stops at (it takes a C string),
-/// and which both quote only up to.
+/// `fromjson` parses past (it takes a length) and quotes only up to. jq 1.7.1's `tonumber` stopped
+/// at the NUL too (it takes a C string); jq 1.8.2 refuses the string instead (#7521, pin moved).
 #[test]
 fn test_json_text_refusals_name_the_first_fault_5309() -> Result<()> {
     for (filter, want) in [
@@ -115,12 +115,12 @@ fn test_json_text_refusals_name_the_first_fault_5309() -> Result<()> {
             "\"a\\u0000b c\" | try fromjson catch .",
             "\"Invalid numeric literal at line 1, column 4 (while parsing 'a')\"\n",
         ),
-        // `tonumber` stops at the NUL, so it sees (and quotes) only `x`.
+        // `tonumber` refuses a string with a NUL, as jq 1.8.2 does (#7521): jq 1.7.1 stopped at
+        // the NUL, saw (and quoted) only `x`, and read `1` from `1\u00002`.
         (
             "\"x\\u0000 y\" | try tonumber catch .",
-            "\"Invalid numeric literal at EOF at line 1, column 1 (while parsing 'x')\"\n",
+            "\"string (\\\"x\\\\u0000 y\\\") cannot be parsed as a number\"\n",
         ),
-        ("\"1\\u00002\" | tonumber", "1\n"),
         // A NUL inside a string is a control character.
         (
             "\"\\\"a\\u0000\\\"\" | try fromjson catch .",
