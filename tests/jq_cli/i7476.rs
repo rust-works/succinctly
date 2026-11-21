@@ -187,7 +187,10 @@ fn jq_exits_2_when_stdout_and_stderr_both_fail_7476() -> Result<()> {
 }
 
 /// A stderr pipe with no reader: jq dies of SIGPIPE at its first diagnostic (jq 1.7.1 and 1.8.2 under
-/// the default disposition), and so does `succinctly jq` (#5547), before its buffered `1` is flushed.
+/// the default disposition), before its buffered `1` is flushed, and so does `succinctly jq` on Linux
+/// (#5547), where the signal goes to the thread that wrote. macOS raises it on the process, so the
+/// evaluation thread can reach its own `exit` first and the run then ends as it would have, `1` and
+/// exit 5. Either way it is not the panic (exit 101) this issue was.
 #[test]
 fn jq_dies_of_sigpipe_on_a_stderr_pipe_with_no_reader_7476() -> Result<()> {
     use std::os::unix::process::ExitStatusExt;
@@ -199,8 +202,18 @@ fn jq_dies_of_sigpipe_on_a_stderr_pipe_with_no_reader_7476() -> Result<()> {
         .stdin(Stdio::null())
         .stderr(Stdio::from(write_end))
         .output()?;
-    assert_eq!(output.status.signal(), Some(13));
-    assert_eq!(output.stdout, b"");
+    let outcome = (
+        output.status.signal(),
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+    );
+    let killed = (Some(13), None, String::new());
+    if cfg!(target_os = "linux") {
+        assert_eq!(outcome, killed);
+    } else {
+        let finished = (None, Some(5), "1\n".to_string());
+        assert!(outcome == killed || outcome == finished, "{outcome:?}");
+    }
     Ok(())
 }
 
@@ -257,6 +270,7 @@ fn other_subcommands_keep_their_status_when_stderr_cannot_be_written_7476() -> R
             .output()?;
         assert!(!live.stderr.is_empty(), "{args:?} reports something");
         assert_ne!(live.status.code(), Some(0), "{args:?} fails");
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
         let mut shapes = vec![DeadStderr::FileSizeLimit, DeadStderr::BrokenPipe];
         #[cfg(target_os = "linux")]
         shapes.push(DeadStderr::DevFull);
