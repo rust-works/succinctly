@@ -3667,6 +3667,8 @@ impl<'a> Parser<'a> {
             || !yq_string_interpolation()
             || yq_string_interpolations_are_closed(&self.input[self.pos..]);
 
+        // Where the run of escapes the parse is in began (#7445): see `fail_escape_run`.
+        let mut escape_run: Option<usize> = None;
         loop {
             match self.peek() {
                 None => {
@@ -3721,6 +3723,7 @@ impl<'a> Parser<'a> {
                             continue;
                         }
                     }
+                    let backslash_at = self.pos;
                     self.next();
                     // #4916: yq reads a short list of escapes and keeps any other backslash as text.
                     if self.mode == ParserMode::Yq {
@@ -3747,9 +3750,13 @@ impl<'a> Parser<'a> {
                             continue;
                         }
                     }
+                    if self.peek() != Some('(') {
+                        escape_run.get_or_insert(backslash_at);
+                    }
                     match self.peek() {
                         // String interpolation: \(expr)
                         Some('(') => {
+                            escape_run = None;
                             self.next();
                             self.parse_interpolation_slot(&mut parts, &mut current_literal)?;
                         }
@@ -3787,14 +3794,26 @@ impl<'a> Parser<'a> {
                         }
                         Some('u') => {
                             self.next();
-                            let c = self.parse_unicode_escape()?;
-                            current_literal.push(c);
+                            match self.parse_unicode_escape() {
+                                Ok(c) => current_literal.push(c),
+                                Err(error) if self.mode == ParserMode::Jq => {
+                                    self.fail_escape_run(
+                                        escape_run.take().unwrap_or(backslash_at),
+                                        error,
+                                    );
+                                }
+                                Err(error) => return Err(error),
+                            }
                         }
                         Some(c) => {
-                            return Err(ParseError::new(
+                            let error = ParseError::new(
                                 format!("invalid escape sequence '\\{c}'"),
                                 self.pos,
-                            ));
+                            );
+                            if self.mode != ParserMode::Jq {
+                                return Err(error);
+                            }
+                            self.fail_escape_run(escape_run.take().unwrap_or(backslash_at), error);
                         }
                         None => {
                             return Err(ParseError::new("unterminated string", self.pos));
@@ -3802,6 +3821,7 @@ impl<'a> Parser<'a> {
                     }
                 }
                 Some(c) => {
+                    escape_run = None;
                     self.next();
                     current_literal.push(c);
                 }
@@ -3947,11 +3967,58 @@ impl<'a> Parser<'a> {
         ParseError::new(format!("lexer: invalid input text {quoted}"), at)
     }
 
+    /// Where the run of escapes that starts at `start` ends: jq's lexer reads a string literal's
+    /// escapes a run at a time, `(\\[^u(]|\\u[a-zA-Z0-9]{0,4})+` (a `\(` starts an interpolation, not an
+    /// escape), and hands each run to its JSON decoder as the string `"<run>"` (#7445).
+    fn escape_run_end(&self, start: usize) -> usize {
+        let bytes = self.input.as_bytes();
+        let mut at = start;
+        while bytes.get(at) == Some(&b'\\') {
+            match self.input[at + 1..].chars().next() {
+                None | Some('(') => break,
+                Some('u') => {
+                    at += 2;
+                    let digits = bytes[at..]
+                        .iter()
+                        .take(4)
+                        .take_while(|byte| byte.is_ascii_alphanumeric())
+                        .count();
+                    at += digits;
+                }
+                Some(other) => at += 1 + other.len_utf8(),
+            }
+        }
+        at
+    }
+
+    /// A string literal's bad escape, in jq mode: jq 1.7.1 and 1.8.2 print the message of their JSON
+    /// decoder for the run of escapes it sits in, `Invalid escape at line 1, column 4 (while parsing
+    /// '"\q"')`, not a lexer message of their own (#7445). The run is skipped and the parse goes on,
+    /// as jq's does: every bad run is an error of its own, reported with the others by
+    /// [`Self::finish_all`] (`"\q\(1)\q"` is two). `error` is the wording used when the decoder's port
+    /// reads the run as valid, which it does not for a run this parser refused.
+    fn fail_escape_run(&mut self, start: usize, error: ParseError) {
+        let end = self.escape_run_end(start);
+        let text = format!("\"{}\"", &self.input[start..end]);
+        let message = match super::parse_message::jq_parse_message(text.as_bytes()) {
+            Some(message) => format!("{message} (while parsing '{text}')"),
+            None => error.message,
+        };
+        self.deferred_key_errors
+            .entry(start)
+            .or_insert_with(|| ParseError::new(message, start));
+        // Past the escape that failed at least: a `\(` where no interpolation is read (an object
+        // key's string) ends the run before it, and the parse must still move on.
+        self.pos = end.max(self.pos);
+    }
+
     /// Parse a simple string literal (for object keys, etc.)
     fn parse_string_literal(&mut self) -> Result<String, ParseError> {
         self.expect('"')?;
         let mut result = String::new();
 
+        // Where the run of escapes the parse is in began (#7445): see `fail_escape_run`.
+        let mut escape_run: Option<usize> = None;
         loop {
             match self.peek() {
                 None => {
@@ -3962,6 +4029,7 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 Some('\\') => {
+                    let backslash_at = self.pos;
                     self.next();
                     // #4916: see `parse_string_or_interpolation`.
                     if self.mode == ParserMode::Yq {
@@ -3971,6 +4039,7 @@ impl<'a> Parser<'a> {
                             continue;
                         }
                     }
+                    escape_run.get_or_insert(backslash_at);
                     match self.peek() {
                         Some('"') => {
                             self.next();
@@ -4006,14 +4075,26 @@ impl<'a> Parser<'a> {
                         }
                         Some('u') => {
                             self.next();
-                            let c = self.parse_unicode_escape()?;
-                            result.push(c);
+                            match self.parse_unicode_escape() {
+                                Ok(c) => result.push(c),
+                                Err(error) if self.mode == ParserMode::Jq => {
+                                    self.fail_escape_run(
+                                        escape_run.take().unwrap_or(backslash_at),
+                                        error,
+                                    );
+                                }
+                                Err(error) => return Err(error),
+                            }
                         }
                         Some(c) => {
-                            return Err(ParseError::new(
+                            let error = ParseError::new(
                                 format!("invalid escape sequence '\\{c}'"),
                                 self.pos,
-                            ));
+                            );
+                            if self.mode != ParserMode::Jq {
+                                return Err(error);
+                            }
+                            self.fail_escape_run(escape_run.take().unwrap_or(backslash_at), error);
                         }
                         None => {
                             return Err(ParseError::new("unterminated string", self.pos));
@@ -4021,6 +4102,7 @@ impl<'a> Parser<'a> {
                     }
                 }
                 Some(c) => {
+                    escape_run = None;
                     self.next();
                     result.push(c);
                 }
@@ -16718,11 +16800,11 @@ mod tests {
             .unwrap_err()
             .message
             .contains("unknown format"));
-        // Invalid escape inside a string literal.
-        assert!(parse(r#""\q""#)
-            .unwrap_err()
-            .message
-            .contains("invalid escape"));
+        // Invalid escape inside a string literal: jq's JSON decoder's message for the run (#7445).
+        assert_eq!(
+            parse(r#""\q""#).unwrap_err().message,
+            "Invalid escape at line 1, column 4 (while parsing '\"\\q\"')"
+        );
         // Unexpected character where an expression is expected.
         assert!(parse("%").is_err());
         // Array index/slice: expected ']' or ':'.
