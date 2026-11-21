@@ -176,7 +176,7 @@ impl JqCommand {
                 let option_shaped =
                     word.starts_with('-') && !super::looks_like_negative_filter(&word);
                 if self.filter.is_none() && !option_shaped {
-                    self.filter = Some(word);
+                    self.filter = Some(word.into());
                 } else if json {
                     self.positional_words.push(PositionalWord::Json(word));
                 } else {
@@ -634,7 +634,8 @@ fn report_module_load_error(e: &ModuleLoadError) {
 /// confirmed live against jq 1.7.1. `message` is pre-formatted by each call
 /// site below so [`report_usage_error`] only has to print it.
 enum BuildContextError {
-    Usage(String),
+    /// Bytes, not text: a message names a file by the bytes of its argv word, as jq does (#7426).
+    Usage(Vec<u8>),
     Other(anyhow::Error),
 }
 
@@ -651,6 +652,18 @@ impl From<anyhow::Error> for BuildContextError {
 /// jq's own usage-error wording never includes it.
 fn report_usage_error(message: &str) {
     eprintln!("jq: {message}");
+}
+
+/// [`report_usage_error`] of a message that may hold bytes that are not UTF-8: a file name as
+/// jq's `fprintf` prints it (#7426).
+fn report_usage_error_bytes(message: &[u8]) {
+    use std::io::Write;
+    let mut line = Vec::with_capacity(message.len() + 5);
+    line.extend_from_slice(b"jq: ");
+    line.extend_from_slice(message);
+    line.push(b'\n');
+    // As `eprintln!` would, but a closed standard error is no reason to stop.
+    let _ = std::io::stderr().write_all(&line);
 }
 
 /// The text of a library file -- a module, or `~/.jq` -- read as jq reads it (#5351): jq parses
@@ -696,13 +709,43 @@ fn load_file_detail(e: &std::io::Error) -> String {
 /// place so a future wording tweak can't land on one flag and not the
 /// other the way the two near-identical inline blocks it replaces could
 /// have drifted.
-fn read_arg_file(flag: &str, name: &str, file: &str) -> Result<String, BuildContextError> {
+///
+/// The file is opened by the bytes of its argv word (#7426), and the prefix names the variable and
+/// the file by theirs, as jq's `fprintf` does; the detail after it is jq's own text, so the file
+/// there reads as [`crate::cli::jq_word_text`] makes it.
+fn read_arg_file(
+    flag: &str,
+    name: &std::ffi::OsStr,
+    file: &std::ffi::OsStr,
+) -> Result<String, BuildContextError> {
     std::fs::read_to_string(file).map_err(|e| {
-        BuildContextError::Usage(format!(
-            "Bad JSON in --{flag} {name} {file}: Could not open {file}: {}",
-            load_file_detail(&e)
-        ))
+        bad_arg_file(
+            flag,
+            name,
+            file,
+            &format!(
+                "Could not open {}: {}",
+                crate::cli::jq_word_text(file),
+                load_file_detail(&e)
+            ),
+        )
     })
+}
+
+/// jq's `Bad JSON in --<flag> <name> <file>: <detail>` (#3051), `name` and `file` as the bytes of
+/// their argv words (#7426).
+fn bad_arg_file(
+    flag: &str,
+    name: &std::ffi::OsStr,
+    file: &std::ffi::OsStr,
+    detail: &str,
+) -> BuildContextError {
+    let mut message = format!("Bad JSON in --{flag} ").into_bytes();
+    message.extend_from_slice(&crate::cli::os_word_bytes(name));
+    message.push(b' ');
+    message.extend_from_slice(&crate::cli::os_word_bytes(file));
+    message.extend_from_slice(format!(": {detail}").as_bytes());
+    BuildContextError::Usage(message)
 }
 
 /// Why jq refuses `module_path` as a relative module path before searching for it (#5322): its
@@ -4805,7 +4848,11 @@ impl Drop for RunIndex<'_> {
 /// A value the program builds is bounded by the native-stack floor `main` registered, not by
 /// `MAX_VALUE_TREE_DEPTH`, as jq bounds it by its C stack alone (#5554).
 pub fn run_jq(args: JqCommand) -> Result<i32> {
-    match jq::with_value_depth_on_stack_floor(|| run_jq_on_stack_floor(args)) {
+    let run = jq::with_value_depth_on_stack_floor(|| run_jq_on_stack_floor(args));
+    // #7455: a regular file on standard input the run did not read to the end is left where jq's
+    // reader would have left it.
+    super::stdin_offset::restore();
+    match run {
         // jq's own report and status for a write to standard output that failed, a closed descriptor included (#7214).
         Err(e) => match super::output::output_write_failure(&e) {
             Some(strerror) => {
@@ -4828,8 +4875,10 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     FIRST_OPEN_FAILURE_AT.with(|first| first.set(None));
     // Nor may one carry a standard input that failed (#7126).
     INPUT_READ_FAILED.with(|failed| failed.set(false));
+    super::stdin_offset::start_run();
     silence_depth_guard_panic_line();
     args.resolve_positional_args();
+    super::stdin_offset::set_run(stdin_items(&args), !args.null_input);
     // The order only matters between two or more named flags: a command line with fewer builds no clap definition for it.
     // `parse_jq` has already read it off clap's matches (#7260); a `JqCommand` matched inside the whole `Cli` tree
     // (a global flag before `jq`) has not, and scans argv here.
@@ -4837,7 +4886,12 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         && (args.arg.len() + args.argjson.len() + args.slurpfile.len() + args.rawfile.len()) / 2
             >= 2
     {
-        args.named_order = named_flag_order(&std::env::args().collect::<Vec<_>>());
+        // The words' lossy text, which is all a scan of option shapes reads (`std::env::args` panics on
+        // a word that is not UTF-8, #7426).
+        let argv: Vec<String> = std::env::args_os()
+            .map(|word| word.to_string_lossy().into_owned())
+            .collect();
+        args.named_order = named_flag_order(&argv);
     }
 
     // Handle --version flag
@@ -4864,7 +4918,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     let context = match build_context(&args) {
         Ok(context) => context,
         Err(BuildContextError::Usage(message)) => {
-            report_usage_error(&message);
+            report_usage_error_bytes(&message);
             return Ok(exit_codes::USAGE_ERROR);
         }
         Err(BuildContextError::Other(e)) => return Err(e),
@@ -4888,7 +4942,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     let filter_str = match get_filter(&args) {
         Ok(filter_str) => filter_str,
         Err(BuildContextError::Usage(message)) => {
-            report_usage_error(&message);
+            report_usage_error_bytes(&message);
             return Ok(exit_codes::USAGE_ERROR);
         }
         Err(BuildContextError::Other(e)) => return Err(e),
@@ -5842,6 +5896,8 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     run_stopped = true;
                     break 'files;
                 }
+                // #7455: what the program took, for where a halt leaves standard input.
+                super::stdin_offset::note_taken();
                 while let Some((_, warning)) = notes.next_if(|&(at, _)| at < start) {
                     eprintln!("{warning}");
                 }
@@ -6720,6 +6776,11 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     ended_early = true;
                     break 'documents;
                 }
+                // #7455: what the program took, for where a halt leaves standard input (`-n`'s one
+                // `null` is not read from it).
+                if !args.null_input {
+                    super::stdin_offset::note_taken();
+                }
                 evaluate_input_streaming_via(
                     &document,
                     &expr,
@@ -6857,7 +6918,7 @@ fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
                             "invalid JSON text passed to --argjson\n\
                              Use jq --help for help with command-line options,\n\
                              or see the jq manpage, or online docs  at https://jqlang.github.io/jq"
-                                .to_string(),
+                                .into(),
                         )
                     })?;
                     context.named.insert(name.clone(), json_value);
@@ -6875,19 +6936,16 @@ fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
             // from jq's own diagnostic -- `anyhow::Error`'s alternate Display joins
             // the whole context chain instead.
             NamedFlag::SlurpFile => {
-                if let Some([name, file]) = slurpfile_pairs
+                if let Some(([raw_name, file], name)) = slurpfile_pairs
                     .next()
-                    .filter(|pair| !context.named.contains_key(&pair[0]))
+                    .map(|pair| (pair, crate::cli::jq_word_text(&pair[0])))
+                    .filter(|(_, name)| !context.named.contains_key(name))
                 {
-                    let contents = read_arg_file("slurpfile", name, file)?;
+                    let contents = read_arg_file("slurpfile", raw_name, file)?;
                     let values = parse_json_stream(&contents).map_err(|e| {
-                        BuildContextError::Usage(format!(
-                            "Bad JSON in --slurpfile {name} {file}: {e:#}"
-                        ))
+                        bad_arg_file("slurpfile", raw_name, file, &format!("{e:#}"))
                     })?;
-                    context
-                        .named
-                        .insert(name.clone(), OwnedValue::array_from(values));
+                    context.named.insert(name, OwnedValue::array_from(values));
                 }
             }
             // Process --rawfile name file pairs. Same "Bad JSON in --rawfile ..."
@@ -6895,14 +6953,15 @@ fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
             // parsed as JSON -- jq's own generic arg-file reader uses this wording
             // unconditionally (#3051, confirmed live).
             NamedFlag::RawFile => {
-                if let Some([name, file]) = rawfile_pairs
+                if let Some(([raw_name, file], name)) = rawfile_pairs
                     .next()
-                    .filter(|pair| !context.named.contains_key(&pair[0]))
+                    .map(|pair| (pair, crate::cli::jq_word_text(&pair[0])))
+                    .filter(|(_, name)| !context.named.contains_key(name))
                 {
-                    let contents = read_arg_file("rawfile", name, file)?;
+                    let contents = read_arg_file("rawfile", raw_name, file)?;
                     context
                         .named
-                        .insert(name.clone(), OwnedValue::String(contents.into()));
+                        .insert(name, OwnedValue::String(contents.into()));
                 }
             }
         }
@@ -6926,7 +6985,7 @@ fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
                         "invalid JSON text passed to --jsonargs\n\
                          Use jq --help for help with command-line options,\n\
                          or see the jq manpage, or online docs  at https://jqlang.github.io/jq"
-                            .to_string(),
+                            .into(),
                     )
                 })?;
                 context.positional.push(json_value);
@@ -7002,16 +7061,34 @@ fn build_args_var(context: &EvalContext) -> OwnedValue {
 fn get_filter(args: &JqCommand) -> Result<String, BuildContextError> {
     if let Some(ref path) = args.program_file {
         // Filter comes from file.
-        let contents = std::fs::read_to_string(path).map_err(|e| {
-            BuildContextError::Usage(format!(
-                "Could not open {}: {}",
-                path.display(),
-                load_file_detail(&e)
+        let open_error = |e: std::io::Error| {
+            // jq builds this one as a `jv` string, so the file reads as its U+FFFD text (#7426).
+            BuildContextError::Usage(
+                format!(
+                    "Could not open {}: {}",
+                    crate::cli::jq_word_text(path.as_os_str()),
+                    load_file_detail(&e)
+                )
+                .into(),
+            )
+        };
+        let bytes = std::fs::read(path).map_err(open_error)?;
+        // jq 1.8.2 refuses a program file holding a NUL byte (CVE-2026-41256, #7434); 1.7.1
+        // read it as a C string and ended the program at the NUL. The check runs before the
+        // UTF-8 one, as jq's runs on the loaded text.
+        if bytes.contains(&0) {
+            return Err(BuildContextError::Usage(
+                "program file contains NUL bytes".into(),
+            ));
+        }
+        String::from_utf8(bytes).map_err(|_| {
+            open_error(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stream did not contain valid UTF-8",
             ))
-        })?;
-        Ok(contents)
+        })
     } else if let Some(ref filter) = args.filter {
-        Ok(filter.clone())
+        Ok(crate::cli::jq_word_text(filter))
     } else {
         Ok(".".to_string()) // Default: identity filter
     }
@@ -7026,6 +7103,29 @@ fn get_input_files(args: &JqCommand) -> Vec<std::path::PathBuf> {
     // is the program file, already moved out of `filter` (#7439), so the
     // input files are `files` alone either way.
     args.files.iter().map(std::path::PathBuf::from).collect()
+}
+
+/// What the program reads from standard input, one item at a time, for where a run that stops early
+/// leaves a regular file there (#7455): `None` when it reads named files, or reads standard input
+/// in a way whose offset stays where the read left it (`--slurp`, `--seq`, DSV, `--stream-errors`,
+/// `--validate`).
+fn stdin_items(args: &JqCommand) -> Option<super::stdin_offset::Items> {
+    use super::stdin_offset::Items;
+    if !get_input_files(args).is_empty()
+        || args.slurp
+        || args.input_dsv.is_some()
+        || args.validate
+        || (!args.raw_input && (args.seq || args.stream_errors))
+    {
+        return None;
+    }
+    Some(if args.raw_input {
+        Items::Lines
+    } else if args.stream {
+        Items::Events
+    } else {
+        Items::Values
+    })
 }
 
 /// Whether to force a real read under `-n` for `input`/`inputs`/
@@ -10844,7 +10944,7 @@ fn report_reached_open_failures(read: Option<u32>, fault: bool) {
             return;
         };
         if last_directory {
-            report_usage_error(&failure.to_string());
+            failure.report();
             return;
         }
         let mut failed = false;
@@ -11139,7 +11239,7 @@ fn report_lazy_open_failures(failures: &[InputFileOpenError]) {
     for failure in failures {
         // A directory said last is reported here too: the reader asked past it (#6472 only keeps
         // quiet for a run that ends at it).
-        report_usage_error(&failure.to_string());
+        failure.report();
         LAZY_OPEN_FAILED.with(|seen| seen.set(true));
     }
 }
@@ -11162,7 +11262,7 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
     if files.is_empty() {
         let pushed_back = STDIN_PUSHBACK.with(|slot| slot.borrow_mut().take());
         let mut stdin =
-            std::io::Cursor::new(pushed_back.unwrap_or_default()).chain(std::io::stdin());
+            std::io::Cursor::new(pushed_back.unwrap_or_default()).chain(super::stdin_offset::Stdin);
         // #7126: standard input that cannot be read is an empty one and ends the run with exit 2.
         let head = if crate::cli::stdin_access::unreadable() {
             note_stdin_read_failed();
@@ -11393,7 +11493,8 @@ fn read_stdin_bytes_unreported() -> (Vec<u8>, bool) {
     }
     let mut buf = Vec::new();
     // What `read_to_end` appended before a failure stays in `buf`.
-    let failed = std::io::stdin().read_to_end(&mut buf).is_err();
+    // #7455: read by a reader that counts what it took, for where the run leaves the descriptor.
+    let failed = super::stdin_offset::Stdin.read_to_end(&mut buf).is_err();
     (buf, failed)
 }
 
@@ -11432,11 +11533,14 @@ fn dash_stdin_read() -> (Vec<u8>, bool) {
 }
 
 /// How an input file is named in `input_filename` and in error locations: jq calls `-` `<stdin>`.
+///
+/// A name that is not UTF-8 reads as jq's `jv_string` makes it, each bad sequence one U+FFFD by
+/// jq's rule (#7426).
 fn input_display_name(path: &Path) -> String {
     if is_stdin_dash(path) {
         "<stdin>".to_string()
     } else {
-        path.to_string_lossy().to_string()
+        crate::cli::jq_word_text(path.as_os_str())
     }
 }
 
@@ -11529,6 +11633,20 @@ impl InputFileOpenError {
         failure
     }
 
+    /// [`report_usage_error`] of the failure, naming the file by the bytes of its argv word, as jq's
+    /// `fprintf` does (#7426); [`Display`](std::fmt::Display) can only show their lossy text.
+    fn report(&self) {
+        match self.kind {
+            InputFileErrorKind::Open => {
+                let mut message = b"error: Could not open file ".to_vec();
+                message.extend_from_slice(&crate::cli::os_word_bytes(self.path.as_os_str()));
+                message.extend_from_slice(format!(": {}", self.detail).as_bytes());
+                report_usage_error_bytes(&message);
+            }
+            InputFileErrorKind::Directory { .. } => report_usage_error(&self.to_string()),
+        }
+    }
+
     /// Whether the file is a directory: it opened, and is a source of no bytes (#6472).
     fn is_directory(&self) -> bool {
         matches!(self.kind, InputFileErrorKind::Directory { .. })
@@ -11570,7 +11688,7 @@ fn report_unopenable_input(e: &InputFileOpenError, open_failed: &mut bool) {
     let by_slurp_read = SLURP_DIRECTORY_READ.with(std::cell::Cell::get)
         && REPORTED_BY_READ.with(std::cell::Cell::get);
     if by_slurp_read || !e.is_last_directory() {
-        report_usage_error(&e.to_string());
+        e.report();
     }
     *open_failed = true;
 }
@@ -11750,18 +11868,18 @@ thread_local! {
     static LAZY_RAW_MIN_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
-/// The lone regular file `-R` reads a window at a time (#7023), opened, with its length; or `None` for
-/// a run that is not one. `-R` is a line reader, so it needs no more of the text before a line than
-/// the number of line breaks, which the producer keeps as it goes, and a stream of lines has no fault
-/// to word: every flag that has the route read the stream whole (`--slurp`, `--validate`, DSV), and
-/// every shape [`lone_regular_file`] turns down, keeps the route that reads it whole.
-fn lone_raw_windowed_file(args: &JqCommand, files: &[PathBuf]) -> Option<(std::fs::File, u64)> {
+/// The lone regular file `-R` reads a window at a time (#7023), opened; or `None` for a run that is not
+/// one. `-R` is a line reader, so it needs no more of the text before a line than the number of line
+/// breaks, which the producer keeps as it goes, and a stream of lines has no fault to word: every flag
+/// that has the route read the stream whole (`--slurp`, `--validate`, DSV), and every shape
+/// [`lone_regular_file`] turns down, keeps the route that reads it whole. The file is read to the end it
+/// has when the reads get there, not to the length `stat` gave here, as jq reads it (#7446).
+fn lone_raw_windowed_file(args: &JqCommand, files: &[PathBuf]) -> Option<std::fs::File> {
     if !raw_window_flags(args) {
         return None;
     }
-    let (path, meta) = lone_regular_file(files, raw_window_min_bytes())?;
-    let file = std::fs::File::open(path).ok()?;
-    Some((file, meta.len()))
+    let (path, _) = lone_regular_file(files, raw_window_min_bytes())?;
+    std::fs::File::open(path).ok()
 }
 
 /// Whether `-R` may read its source a window at a time: every flag that has the route read the stream
@@ -11842,8 +11960,9 @@ fn raw_windowed_source(args: &JqCommand, files: &[PathBuf]) -> Option<RawWindowe
             None
         };
     }
-    let (file, len) = lone_raw_windowed_file(args, files)?;
-    Some((Box::new(file), Some(len), Vec::new()))
+    // No length: the file is read to the end it has when the reads get there (#7446).
+    let file = lone_raw_windowed_file(args, files)?;
+    Some((Box::new(file), None, Vec::new()))
 }
 
 /// Standard input for `-R` (#7024) when it is a regular file with [`raw_window_min_bytes`] or more left
@@ -12062,7 +12181,9 @@ type WindowedSource = (
 /// The source [`windowed_plain_file`] and [`windowed_seq_file`] read a window at a time, once their own
 /// flags have let the run through: a regular file of `min` bytes or more named on the command line
 /// (4 MiB for the plain route, [`window::min_windowed_seq_file_bytes`] for `--seq`, #7260), several
-/// regular files (4 MiB or more between them), or standard input when it is one (#7024).
+/// regular files (4 MiB or more between them), or standard input when it is one (#7024). Each file is
+/// read on past the length `stat` gives here, to the end it has when the reads get there, as jq reads it
+/// (#7446); a `--seq` stream stops at that length, which its prepass vouched for.
 fn windowed_source(args: &JqCommand, min: u64) -> Option<WindowedSource> {
     let files = get_input_files(args);
     if files.is_empty() {
@@ -12264,6 +12385,7 @@ fn regular_stdin_left(
         return None;
     }
     let start = file.stream_position().ok()?;
+    super::stdin_offset::note_origin(start);
     let len = meta.len().checked_sub(start)?;
     let unreadable = file
         .read_at(&mut [0u8], start)
@@ -14471,8 +14593,8 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
                 note_stdin_read_failed();
                 return Ok(LoneStart::Read(Vec::new()));
             }
-            let stdin =
-                std::io::Cursor::new(pushed_back.unwrap_or_default()).chain(std::io::stdin());
+            let stdin = std::io::Cursor::new(pushed_back.unwrap_or_default())
+                .chain(super::stdin_offset::Stdin);
             (Box::new(stdin), None)
         }
         Some(path) => {
@@ -14567,7 +14689,6 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
     #[cfg(test)]
     LONE_START_READ.with(|n| n.set(bytes.len()));
     if let Some((chunk, bom, valid_end)) = more {
-        // What the reader has read of the source, which is what is left of it to the windows.
         let read_len = bytes.len();
         let pending = bytes.split_off(valid_end);
         bytes.drain(..bom);
@@ -14580,9 +14701,9 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
                         windows: {
                             let windows = window::LineWindows::new(
                                 reader,
-                                // A file's length is known; stdin ends at a short read.
-                                // (One that grew past it since is read as it was.)
-                                len.map(|len| len.saturating_sub(read_len) as u64),
+                                // No length: a file is read to the end it has when the reads get
+                                // there, as jq reads it (#7446), and stdin ends at a short read.
+                                None,
                                 lazy_window_bytes(),
                                 pending,
                             );
@@ -25673,7 +25794,7 @@ mod tests {
         use super::*;
         use clap::Parser;
 
-        fn resolved(argv: &[&str]) -> (Option<String>, Vec<PositionalWord>) {
+        fn resolved(argv: &[&str]) -> (Option<std::ffi::OsString>, Vec<PositionalWord>) {
             let mut cmd = JqCommand::try_parse_from(argv.iter().copied()).unwrap();
             cmd.resolve_positional_args();
             (cmd.filter, cmd.positional_words)
@@ -25735,7 +25856,12 @@ mod tests {
         /// sits, after `--args` included; with no word at all there is none.
         #[test]
         fn from_file_takes_the_first_positional_word_as_the_program_file() {
-            fn program_file(argv: &[&str]) -> (Option<String>, Option<PathBuf>, Vec<String>) {
+            type Resolved = (
+                Option<std::ffi::OsString>,
+                Option<PathBuf>,
+                Vec<std::ffi::OsString>,
+            );
+            fn program_file(argv: &[&str]) -> Resolved {
                 let mut cmd = JqCommand::try_parse_from(argv.iter().copied()).unwrap();
                 cmd.resolve_positional_args();
                 (cmd.filter, cmd.program_file, cmd.files)
@@ -25743,11 +25869,11 @@ mod tests {
             let file = |p: &str| Some(PathBuf::from(p));
             assert_eq!(
                 program_file(&["jq", "-f", "-r", "prog.jq", "in.json"]),
-                (None, file("prog.jq"), vec!["in.json".to_string()])
+                (None, file("prog.jq"), vec!["in.json".into()])
             );
             assert_eq!(
                 program_file(&["jq", "prog.jq", "in.json", "-f"]),
-                (None, file("prog.jq"), vec!["in.json".to_string()])
+                (None, file("prog.jq"), vec!["in.json".into()])
             );
             assert_eq!(
                 program_file(&["jq", "-f", "--args", "prog.jq", "a"]),
@@ -25756,11 +25882,7 @@ mod tests {
             assert_eq!(program_file(&["jq", "-n", "-f"]), (None, None, vec![]));
             assert_eq!(
                 program_file(&["jq", "prog.jq", "in.json"]),
-                (
-                    Some("prog.jq".to_string()),
-                    None,
-                    vec!["in.json".to_string()]
-                )
+                (Some("prog.jq".into()), None, vec!["in.json".into()])
             );
         }
 

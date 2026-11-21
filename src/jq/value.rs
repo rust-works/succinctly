@@ -4476,8 +4476,12 @@ impl OwnedValue {
             // reaching here for a `Float`).
             Self::Float(f) => Some(Cow::Owned(jq_bare_float_display(*f))),
             // #2802: a spelled integer prints as the number it is in a message.
+            // A negative zero is the exception (#7468): its sign lives in the spelling
+            // (`-00`), which an `i64` has no room for, so it goes through the formatter,
+            // which keeps it as jq prints it (`-0`).
             Self::NumberLiteral(NumberRepr::Int(n), literal)
-                if crate::yaml::is_spelled_int(literal) =>
+                if crate::yaml::is_spelled_int(literal)
+                    && !(*n == 0 && literal.starts_with('-')) =>
             {
                 Some(Cow::Owned(n.to_string()))
             }
@@ -10458,6 +10462,23 @@ mod tests {
         // number_str, via Display rather than format_number_jq_compat.
         assert_eq!(OwnedValue::Int(7).number_str().as_deref(), Some("7"));
         assert_eq!(OwnedValue::Float(2.5).number_str().as_deref(), Some("2.5"));
+    }
+
+    /// #7468: a negative zero spelled with extra zeros keeps its sign in the text, as every
+    /// other spelled integer keeps its value (`-007` is `-7`).
+    #[test]
+    fn number_str_keeps_the_sign_of_a_spelled_negative_zero_7468() {
+        for (literal, text) in [
+            ("-0", "-0"),
+            ("-00", "-0"),
+            ("-0000", "-0"),
+            ("-007", "-7"),
+            ("00", "0"),
+            ("+00", "0"),
+        ] {
+            let value = OwnedValue::from_number_literal::<JqSemantics>(literal);
+            assert_eq!(value.number_str().as_deref(), Some(text), "{literal}");
+        }
     }
 
     #[test]

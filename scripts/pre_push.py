@@ -253,7 +253,8 @@ NOT_MIRRORED = (
     (r"^python3 scripts/binary_size\.py check", "needs the fat-LTO release binary (minutes), and its budget is CI's own measurement (#7390); scripts/test_binary_size.py, run by the script-tests gate, is the local check"),
     (r"^python3 scripts/link-order/generate\.py check", "needs valgrind and a release binary on Linux (#7260); scripts/test_link_order.py, run by the script-tests gate, is the local check"),
     (r"^python3 scripts/ci_leg_times\.py", "reads the Actions API with a token and opens an issue (scheduled.yml); scripts/test_ci_leg_times.py is the local check"),
-    (r"^python3 scripts/changelog\.py check-pr", "needs the PR's title, body and labels"),
+    (r"^python3 scripts/cancel_stale_merge_group_runs\.py$", "not a gate: cancels runs of destroyed merge groups with a token (cancel-stale-merge-groups.yml, #7552); `--dry-run` lists them, and scripts/test_cancel_stale_merge_group_runs.py, run by the script-tests gate, is the local check"),
+    (r"^python3 scripts/changelog\.py check-pr","needs the PR's title, body and labels"),
     (r"^python3 scripts/coverage-(shards|fit-comment)\.py", "the instrumented coverage run and its PR comment (coverage.yml) need cargo-llvm-cov and patchcov; scripts/test_coverage_shards.py is the local check"),
     (r"^\./target/release/succinctly dev compare jq", "the full report (compare-jq.yml); the ledger-fed subset is the ledger-only gate"),
 )

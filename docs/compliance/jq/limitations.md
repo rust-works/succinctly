@@ -354,6 +354,15 @@ Rows from `printf '<text>' | jq -c .` (a NUL is `\0`), jq 1.7.1 against `succinc
 The last row is the agreement: with a newline in the chunk jq does not truncate either.
 `tests/jq_cli/i5654_nul.rs` pins both sides.
 
+## A `-f` program file with a NUL byte is refused, as jq 1.8.2 refuses it; jq 1.7.1 ends the program at the NUL (#7434)
+
+jq 1.7.1 hands a `-f` program file to its compiler as a C string, so the program ends at the first NUL byte and the rest of the file is dropped without a word: `.a\0| .b` runs `.a`, and `# c\0` followed by a newline and `.a` is a comment alone, which fails with `Top-level program not given`.
+jq 1.8.2 refuses such a file before it compiles it (CVE-2026-41256, upstream commit 5a015deae3, "Fix NUL truncation in program files loaded with -f", listed under the security fixes of its NEWS.md): `jq: program file contains NUL bytes` on stderr, nothing on stdout, exit status 2.
+`succinctly jq` follows 1.8.2, because upstream calls the 1.7.1 behaviour a bug, and so the difference from the pinned 1.7.1 stands as `newer-than-primary`.
+The refusal comes before the input files are opened, as in 1.8.2, and covers a NUL anywhere in the file, in a comment included, and `-f /dev/stdin`.
+`succinctly yq` is not changed.
+Pinned by `tests/jq_cli/i7434.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
+
 ## A standard input that cannot be read: matched, with these differences (#7126)
 
 A standard input that cannot be read is an empty one in jq 1.7.1, which counts the failed read and exits 2 once the run is over, whatever the program left (`-e`'s 4, `input`'s 5), and for a plain read without a word on stderr.
@@ -7485,7 +7494,15 @@ A file that is one document, or has one bigger than eight windows, is therefore 
 Invalid UTF-8 is substituted a window at a time, which equals substituting the file because a window is whole lines and a JSON string holds no line break.
 A text where a string does hold one (a backslash before a line break) is not JSON jq reads, and its substitution can differ at a window's edge.
 The stream's first fault is worded by reading the file again (`Reread`): a chunk at a time, by position, through a duplicate of the handle the run read by, on the error path only.
-A file renamed, replaced or appended to meanwhile is worded from the bytes the run read, and the wording's memory is a chunk, not the file.
+A file renamed or replaced meanwhile is worded from the bytes the run read, one appended to from the file read again to the end it then has (#7446), and the wording's memory is a chunk, not the file.
+A file is read on past the length `stat` gave when the run opened it, to the end it has when the reads get there, as jq reads it to the read that returns nothing (#7446): the lone file named or redirected on standard input, the files of a list under the plain filter, the lone file `-R` reads and the lone source the lazy `input`/`inputs` route reads past its front.
+So a line a writer appends while the run goes is read, and so is a last document cut short when the run opened the file and completed after, where each was dropped or reported as cut short at that length before #7446.
+A file read to its length reads once more there, which returns nothing, as jq's reader does; one that grows while it is read (a log a writer appends to, or `jq -c . f | tee -a f`) is read on a window at a time for as long as it grows, in the memory of a window, as jq goes on reading it.
+A file cut short while the run goes ends where the reads find its end, with what was read before it run and no fault for the rest, as in jq.
+A file renamed over the path is not read: the run holds the file it opened, as jq does.
+Two routes still read a file to the length it had, so a line appended during the run is dropped where jq reads it.
+The route that reads a file whole (a file under 1 MiB under the plain filter or `-R`, a path such as `/dev/fd/N`, and every flag that reads the stream whole) reads it before the run starts, so what is appended after that is not read; `--slurp` reads all of its input before the program runs in jq too, and matches.
+A `--seq` file read a window at a time stops at the length its records were vouched for up to before the run (`Reread::is_plain_seq_records`), since a record read past it would be one no prepass judged; a file a gate of its own reads (one the prepass turned down) reads on as a pipe does.
 A depth refusal names the position from the window's line count; where a window was substituted it is worded from the file read again, as the whole-file route words it from the originals.
 Standard input that is a regular file (`jq … < file`, a here-file, a descriptor a parent opened) takes the same route from its current offset: what a shell or parent has read already is not part of the stream, as on a pipe, and a fault is worded from a duplicate of descriptor 0 read by position.
 A terminal, a standard input under 4 MiB and one the run also writes to (`jq . <> f >&0`: its output would land where the next window is read from) read whole as before, and so does a path that names the stdin descriptor a second time.
@@ -7506,7 +7523,14 @@ At 100 MiB, peak RSS falls from 125 to 127 MiB to 23 to 26 MiB on terminus (Ryze
 The run is no slower: `-c .` takes 552 ms against 586 ms (-5.9%) on terminus and 433 ms against 443 ms (-2.3%) on the mini, `-r .name` -5.0% and -3.0%, and `select(.score>50)` -2.7% and -2.4%, where the A/A control moved 0.4% at most.
 At 10 MiB the same rows read +0.2% to +1.1% on terminus (the control, +0.1% to +1.0%) and -2.1% to -1.3% on the mini.
 Certifying on the filter's own thread, as #7024's first version did, cost +3.0% to +10.4% on terminus and +9.3% to +17.4% on the mini at 100 MiB, and the same commit with `certify` returning at once read -6.6% to +0.3% and -5.3% to -3.3%, which is how the cost was attributed to the validator's pass and not to reading in windows (#7106).
-The windows are read from descriptor 0's own offset, so a run that stops early (`first(...)`, `-e`) leaves it where its last window ended, as jq does, where the whole-file route always left it at the end of the file.
+The windows are read from descriptor 0's own offset, and a run that stops early puts it back where jq's reader would have left it (#7455).
+jq reads its input through stdio one `fgets` chunk at a time (a line, or 4095 bytes of a longer one), and stdio moves a seekable descriptor back to the end of what it handed out when the process exits, so `{ jq -n input; jq -n input; } < f` reads the first document and then the second, and `{ jq -c 'limit(10; inputs)' -n; cat; } < f` hands `cat` the rest.
+Before #7455 every route left a regular file where its own reads had taken it: at the end on the whole-file route, and at the end of the last window (256 KiB) on the windowed ones, so the second `jq -n input` read nothing, or began in the middle of a line.
+Now the descriptor is moved, once, when the run is over (`src/bin/succinctly/stdin_offset.rs`): the items the program took (values, `--stream` events, `-R` lines) are counted again in the file from where the run found it, and the offset is set to the end of the `fgets` chunk whose byte completed the last of them (the closing bracket or quote, the byte after a number, or for a `--stream` scalar inside a container the `,` or closer after it, where jq's streaming parser hands it out); a `-R` line runs to its newline.
+That is the offset jq 1.7.1 leaves for `-n input`, `first(inputs)`, `limit(n; inputs)`, `halt`, `halt_error`, `limit(0; inputs)` (nothing read, nothing moved), with documents separated by lines, spaces or nothing, from a non-zero starting offset, and on lines longer than a chunk, where it is 4095 bytes into the line; jq 1.8.2 reads 4091 bytes at a time (and up to three more to finish a character), so only on such lines does it differ, by its buffer size.
+The count is made again from the start of the run's reads, a block at a time by position, so a run that stops a long way into a large file reads that much of it once more on its way out.
+A run that read to the end (a run without `-n` that does not halt, `[inputs]`, `--slurp`) leaves the offset where the read left it, as jq does, and a pipe has none to move.
+Three shapes still leave a regular file where the reads left it: a run that ends at a parse error (jq leaves the offset at the end of the chunk where its parser met the error), `--seq`, and `--stream-errors`, whose items this count does not model.
 `-R` over standard input (#7024) is read by the `LineWindows` the `-R` file route reads its file with (#7023, above), and the plain route's machinery is not involved.
 A regular file is read by a duplicate of descriptor 0 from the offset it stands at; a pipe or socket has its first 4 MiB read to learn whether it is long enough, and one that ends sooner hands what it held to the route that reads it whole, as the plain route's pipe does.
 A stream of lines has no fault to word, so neither is read again and no window is certified: the time #7106 tracks for the plain route's pipe is not spent here.
@@ -7514,7 +7538,7 @@ Measured interleaved against the route that read standard input whole (the commi
 The run is faster too: on a pipe `-R .` reads −7.5% and −5.4%, `-nR 'reduce inputs as $l (0; .+1)'` −15.8% and −6.8%, and `-R 'select(endswith("9}"))'` −11.8% and −6.7% (terminus, then the mini), and redirected −7.6% and −0.9%, −16.3% and −4.5%, and −13.3% and −3.6%, where the A/A control moved 3.6% and 2.5% at most.
 At 10 MiB the rows read −1.4% to −8.5% on terminus and −1.3% to −5.8% on the mini, and at 1 MiB (read whole) and on the named-file route they move no more than the control does.
 The plain filter's pipe route, whose probe this shares, reads within the control's range too, and its peak RSS is the same or 1 MiB less.
-A run that stops early (`first(inputs)`, `-e`, `halt`) leaves the rest of the pipe unread, and a redirected file at the offset its last window ended, as jq does; the whole-file route had read both to the end.
+A run that stops early (`first(inputs)`, `halt`) leaves the rest of the pipe unread, as jq does, and a redirected file just past the last line it read, as jq does (#7455, above); the whole-file route had read both to the end.
 `-R` over several regular files (#7024: up to 32, 4 MiB or more between them, judged as the plain route judges them) is read by one `LineWindows` a file, each a window at a time and in turn.
 Each of those files is read to the end it has when the run reaches it, as jq reads it (#7223), so a line a writer appends to a later file while the run is still in an earlier one is read.
 Up to 32 files the descriptors are held open from the start, so a path removed or replaced while the run goes keeps its old bytes, where jq reads what the path then names.
@@ -7574,7 +7598,8 @@ The second read that words a fault reads each file as the run read it (the same 
 A read that fails part-way through one of the files (an I/O error) runs the documents before the failure, reports `jq: error: <strerror>` and ends the run there with exit 2, as the lone file's does, where the whole-file route reports that file as one that could not be opened and runs the others; jq's own main loop stops fetching input once a read has failed, but the failure needs a read that fails, which no test here can make.
 A list with a path that is not a regular file (a pipe, `-`, a directory, `/dev/stdin`, `/dev/fd/N`), one that does not open, or one that is also the run's standard output or error (`jq . a b 1<>b`: output landing in a file the next window is read from) takes the route that reads the files whole and reports what it finds.
 A file whose `stat` size is 0 (an empty file, or one of the `/proc` kind that reports 0 and has content) is read to its end, as `std::fs::read` reads it.
-A file is read as it was when opened, so a run whose output is appended to its input ends, and a read that fails runs the documents before the failure and then reports it.
+Each file is read on past the length it had when it was opened, to the end it has when the reads get there (#7446), so a line a writer appends to the file the run is in is read before the next file, and a run whose output is appended to its input through a pipe reads what it wrote, as jq does; before #7446 each was read to the length it had when it was opened, which this page had as a run whose output is appended to its input ending.
+A read that fails runs the documents before the failure and then reports it.
 
 Peak resident set size at 100 MiB (993,416 records), in MiB:
 
@@ -7880,6 +7905,9 @@ materializes" — truthiness is not a read that can meet a malformed byte, so th
 belongs there and has no remainder): #2669 only removed the route-dependence, it did not
 newly decide this. A route that genuinely reads a member (`.a and true`) still raises.
 Pinned by `test_boolean_routes_agree_on_a_malformed_document_2669`.
+The one value whose truthiness does meet a malformed byte is a malformed scalar token itself (`tru`, `nul`, `xyz123`, `1.2.3`): the index has already classified it as unreadable, `nul` is not `null`, and so it has no truthiness to answer with.
+Since [#7449](https://github.com/rust-works/succinctly/issues/7449) `not`, `if`, `and`, `or`, `select`, `//`, `any` and `all` on such a token raise jq's parse error and exit 5, as `type` on it does, where they answered as if it were truthy (`[nul] | .[0] | not` was `false`); a container is still truthy whatever it holds, and a string whatever its escapes spell (#5308).
+Pinned by `tests/jq_cli/i7449.rs`.
 
 ## POSIX bracket classes are Unicode-aware, up to the Unicode version (#5367)
 
