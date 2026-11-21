@@ -31,7 +31,14 @@ show what it moved. Run it against a build from before the change as `--base`.
 `--control` puts the fold in the `then` arm only, the shape a change to the literal-`else` code must
 not touch: with `--base` it exits 1 on any row whose output differs between the two builds.
 
-Usage: scripts/jq-foreach-update-if-arm-sweep.py --bin BIN [--base BIN] [--jq JQ] [--n N] [--seed S]
+Which jq a row is judged against (#7519): a row whose INIT yields more than one value (`initN`, `init3`, `initU`)
+runs its later forks' SOURCE on the real input, as jq 1.8.2 does (jqlang/jq#3266), where jq 1.7.1 runs it on `null`.
+`--jq-latest JQ` (jq 1.8.2; `succinctly dev compare jq` passes its secondary reference) judges those rows against it
+and the `init1` rows against `--jq`. Without it every row is judged against `--jq`, and against jq 1.7.1 the
+multi-INIT rows that read the input are ACCEPT_WRONG or DIFF by design (459 of a 6,000-row sample; against jq 1.8.2
+all 6,000 match).
+
+Usage: scripts/jq-foreach-update-if-arm-sweep.py --bin BIN [--base BIN] [--jq JQ] [--jq-latest JQ] [--n N] [--seed S]
                                                   [--show N] [--only SUBSTR[,SUBSTR...]] [--jobs N]
                                                   [--control] [--dump FILE] [--jq-gate]
 """
@@ -188,6 +195,10 @@ def main():
         help="reference succinctly build; a lost match, a new ACCEPT_WRONG or a refusal now answered wrongly fails",
     )
     ap.add_argument("--jq", default="/usr/bin/jq", help="the pinned oracle (jq 1.7.1)")
+    ap.add_argument(
+        "--jq-latest",
+        help="jq 1.8.2, the oracle of the rows whose INIT yields more than one value (#7519); default: --jq",
+    )
     ap.add_argument("--n", type=int, default=40000, help="rows to sample (0 = the whole grid)")
     ap.add_argument("--seed", type=int, default=0, help="sampling seed: the same seed and --n pick the same rows")
     ap.add_argument("--show", type=int, default=20, help="max rows printed per section")
@@ -219,7 +230,9 @@ def main():
 
     def work(row):
         name, prog, doc = row
-        oracle = run([args.jq], prog, doc)
+        # #7519: a multi-output INIT follows jq 1.8's `foreach` fix; the INIT axis is the name's sixth part.
+        multi_init = name.split("/")[5] != "init1"
+        oracle = run([args.jq_latest if multi_init and args.jq_latest else args.jq], prog, doc)
         if oracle[0] == "TIMEOUT":
             return None
         cand = run([args.bin, "jq"], prog, doc)

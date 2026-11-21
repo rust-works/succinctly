@@ -356,10 +356,14 @@ fn an_array_pattern_indexes_its_last_element_first_5223() {
     });
 }
 
-/// `DUPN` moves the fold's input out of a slot `INIT`'s fork point shares, so
-/// every `INIT` output after the first runs `SOURCE` on `null`.
+/// `DUPN` moves a `reduce`'s input out of a slot `INIT`'s fork point shares, so
+/// every `INIT` output after the first runs `SOURCE` on `null`, in jq 1.7.1 and
+/// 1.8.2. jq 1.8 dropped `foreach`'s `DUPN` (jqlang/jq#3266, #7519): every one of
+/// its `INIT` outputs runs `SOURCE` on the input, and the `foreach` rows are jq
+/// 1.8.2's (pins moved from 1.7.1's `[[1,1],[null,2],[null,3]]` and its raise on
+/// the second fork).
 #[test]
-fn a_folds_later_init_outputs_see_a_null_source_input_5223() {
+fn a_reduces_later_init_outputs_see_a_null_source_input_5223() {
     on_big_stack(|| {
         check(&[
             (
@@ -370,15 +374,12 @@ fn a_folds_later_init_outputs_see_a_null_source_input_5223() {
             (
                 r#"{"a":1}"#,
                 "[foreach .a as $i ((1,2,3); [$i,.])]",
-                ok(&["[[1,1],[null,2],[null,3]]"]),
+                ok(&["[[1,1],[1,2],[1,3]]"]),
             ),
             (
                 r#"{"a":{"a":null}}"#,
                 "path(foreach .a as $i ((.,.); .; $i))",
-                err(
-                    &[r#"["a"]"#],
-                    r#"Invalid path expression near attempt to access element "a" of null"#,
-                ),
+                ok(&[r#"["a"]"#, r#"["a"]"#]),
             ),
         ]);
     });

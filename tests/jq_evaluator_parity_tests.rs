@@ -2061,8 +2061,9 @@ fn test_parity_positive_index_trailing_comma_2312() {
 }
 
 /// #2163, closed by #3895: `foreach`/`reduce`'s INIT-fork re-entry (real jq
-/// re-evaluates SOURCE against `null` for every INIT fork after the first,
-/// and so does succinctly — see `docs/compliance/jq/limitations.md`'s
+/// re-evaluates a `reduce`'s SOURCE against `null` for every INIT fork after the
+/// first, and so does succinctly; a `foreach`'s reads the real input, as jq 1.8.2's
+/// does, #7519 — see `docs/compliance/jq/limitations.md`'s
 /// "INIT-fork re-entry" entry and `eval.rs`'s
 /// `test_foreach_reduce_init_fork_source_reads_null_after_first_fork_2163`). Both
 /// front ends here (`full_outputs`/`generic_outputs`) ultimately dispatch to

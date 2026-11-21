@@ -20345,10 +20345,12 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
 /// ([`embed_table`]). The entry makes the accumulator's first in-place write copy
 /// once, and a live table reshapes owned navigation, neither of which a fold that
 /// cannot certify a marker should pay -- hence the gate. Only the *first* output:
-/// jq 1.7.1 evaluates SOURCE against `null` on every later fork
+/// jq evaluates a `reduce`'s SOURCE against `null` on every later fork
 /// (`[reduce (.) as $x ((.,.); $x)]` is `[{"a":1},null]`), so a loop variable there is
 /// never the accumulator's own node, and an entry would answer a write through it
-/// that jq refuses.
+/// that jq refuses. A `foreach`'s later forks read the real input since #7519, and the
+/// writes through a loop variable that `tests/jq_cli/i7519.rs` pins on them answer as
+/// jq 1.8.2 does without an entry.
 fn drive_foreach_expr_generic<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     value: &V,
@@ -20396,7 +20398,8 @@ fn drive_foreach_expr_generic<S: EvalSemantics, V: DocumentValue>(
 
 /// A fold's SOURCE drive on the generic evaluator (#3895): the first INIT fork
 /// reads the fold's own input through [`drive_foreach_expr_generic`], every
-/// later one reads `null`, as jq 1.7.1 does. This route has no `null` of its
+/// later `reduce` fork reads `null`, as jq does (a `foreach` fork always reads
+/// the real input, #7519). This route has no `null` of its
 /// own value type to hand `eval_each_generic`, so a later fork runs the
 /// as-written source against an owned `null` instead
 /// ([`crate::jq::eval::drive_source_against_null`]).

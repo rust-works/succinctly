@@ -82173,8 +82173,11 @@ fn resolve_foreach<'a, S: EvalSemantics>(
         // SOURCE's own ambient value, trackability and snapshot mark are
         // all recomputed per INIT fork from wherever that fork's own
         // register stands after INIT ran.
+        // #7519: but every `foreach` fork reads the document, as the first does: jq 1.8 runs each
+        // fork's SOURCE on the fold's real input (jqlang/jq#3266), so the ambient is the first
+        // fork's (`path(foreach (.a) as $k ((0,1); $k))` is `["a"]` twice in jq 1.8.2).
         let ambient = fold_source_ambient::<S>(
-            fork_index,
+            0,
             &reg,
             value,
             &null_ambient,
@@ -97886,11 +97889,14 @@ pub(crate) type ForeachElementSink<'a> = &'a mut dyn FnMut(OwnedValue) -> Demand
 
 /// What a fold's SOURCE is evaluated against for one INIT fork (#3895).
 ///
-/// jq 1.7.1 hands the *first* fork the fold's real input and every later fork
-/// `null`: `reduce`/`foreach` duplicate the input with `DUPN`, which leaves
-/// `null` behind in the slot the next INIT output resumes from, so
-/// `[reduce (.) as $x ((.,.); $x)]` on `{"a":1}` is `[{"a":1},null]`. A source
-/// that does not read `.` (`range(3)`, a literal) cannot tell the two apart.
+/// jq hands a `reduce`'s *first* fork the fold's real input and every later fork
+/// `null`: `reduce` duplicates the input with `DUPN`, which leaves `null` behind
+/// in the slot the next INIT output resumes from, so
+/// `[reduce (.) as $x ((.,.); $x)]` on `{"a":1}` is `[{"a":1},null]` in jq 1.7.1
+/// and 1.8.2. A source that does not read `.` (`range(3)`, a literal) cannot
+/// tell the two apart. jq 1.7.1's `foreach` did the same; jq 1.8 dropped its
+/// `DUPN` (jqlang/jq#3266, a bug fix), so [`foreach_forks`] reads `Real` on
+/// every fork (#7519).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SourceInput {
     /// The fold's own input: the first INIT fork.
@@ -98020,12 +98026,12 @@ impl FoldDirectRetry {
 /// memory for the duration of a fold whose entire point is not to do that,
 /// even in the overwhelmingly common single-INIT case.
 ///
-/// **Every fork after the first drives it against `null`** (#3895): jq 1.7.1
-/// hands only INIT's first output the fold's real input
-/// (`[reduce (.) as $x ((.,.); $x)]` is `[{"a":1},null]`), so `drive_source` is
-/// told which input the fork reads ([`SourceInput`]) and each caller runs a
-/// later fork's as-written source against `null` -- [`source_value`] on this
-/// evaluator, [`drive_source_against_null`] on the generic one.
+/// **Every fork drives it against the fold's real input** (#7519): jq 1.7.1
+/// handed only INIT's first output the real input and every later one `null`
+/// (#3895), which jq 1.8 fixed for `foreach` (jqlang/jq#3266:
+/// `[1, 2] | [foreach .[] as $x (0, 1; . + $x)]` is `[1,3,2,4]`), so
+/// `drive_source` is always told [`SourceInput::Real`]. [`reduce_forks`] keeps
+/// the `null` forks, as jq 1.8.2 does.
 ///
 /// The step's own verdict outranks the source's, and a *fork's* own verdict
 /// (which folds in the step's) outranks INIT's own: a step or fork that
@@ -98072,10 +98078,8 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
     // written. #3181: a step whose accumulator still is one takes the
     // as-written operand instead (see [`FoldOperand`]).
     // #3329: the loop variables are marked only where the as-written UPDATE or
-    // EXTRACT reads one as a path step, and only for the first INIT fork -- jq
-    // 1.7.1 evaluates SOURCE against `null` on every later fork
-    // (`[reduce (.) as $x ((.,.); $x)]` is `[{"a":1},null]`), so a write through
-    // `$x` there refuses in jq where marking it would answer.
+    // EXTRACT reads one as a path step -- on every INIT fork, since every fork's
+    // SOURCE reads the real input (#7519; `reduce_forks` marks the first only).
     let mark_loop_vars = retry.marks;
     let share_loop_vars = retry.shares;
     let hoisted_update = demote_for_reentry(update, &RootWitness::Owned);
@@ -98117,13 +98121,10 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
         // never the accumulator's, so it certifies no write jq refuses
         // (`test_fold_container_loop_variable_identity_through_document_input_3896`'s
         // multi-fork rows).
-        let mark = LoopVarSplice::of(mark_loop_vars && first, share_loop_vars);
-        // #3895: jq runs every later fork's SOURCE against `null`.
-        let source_input = if first {
-            SourceInput::Real
-        } else {
-            SourceInput::Null
-        };
+        // #7519: every `foreach` fork reads the real input (jq 1.8's jqlang/jq#3266, below), so
+        // the marking holds on every fork too: `[foreach (.) as $x ((.,.); ($x.a) = 9)]` is
+        // `[{"a":9},{"a":9}]` in jq 1.8.2.
+        let mark = LoopVarSplice::of(mark_loop_vars, share_loop_vars);
         let all_var_names =
             all_var_names.get_or_insert_with(|| pattern_alternatives_var_names(patterns));
         let (update, extract) = *inert_operands.get_or_insert_with(|| {
@@ -98151,7 +98152,9 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
         // the retry generation (#3293).
         let ended = StashedVerdict::<Flow>::new();
 
-        let flow = drive_source(source_input, &mut |input_val| {
+        // #7519: unlike `reduce_forks`, every fork's SOURCE reads the fold's real input, as jq
+        // 1.8 runs it (jqlang/jq#3266, a fix of 1.7.1's `DUPN` handing later forks `null`).
+        let flow = drive_source(SourceInput::Real, &mut |input_val| {
             ended.begin();
             // Substituted per element as it arrives: the demand-driven path
             // sees one element at a time and can never hoist a whole matrix
@@ -98253,7 +98256,10 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
     // (see `fold_step_each`); the fold's own callers pass it in as written.
     // #3181: a step whose accumulator still is one takes the as-written
     // UPDATE instead (see [`FoldOperand`]).
-    // #3329: see `foreach_forks`.
+    // #3329: see `foreach_forks`; here only for the first INIT fork -- jq
+    // evaluates a `reduce`'s SOURCE against `null` on every later fork
+    // (`[reduce (.) as $x ((.,.); $x)]` is `[{"a":1},null]`), so a write through
+    // `$x` there refuses in jq where marking it would answer.
     let mark_loop_vars = retry.marks;
     let share_loop_vars = retry.shares;
     let hoisted_update = demote_for_reentry(update, &RootWitness::Owned);
@@ -98283,7 +98289,8 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
         // (`test_fold_container_loop_variable_identity_through_document_input_3896`'s
         // multi-fork rows).
         let mark = LoopVarSplice::of(mark_loop_vars && first, share_loop_vars);
-        // #3895: jq runs every later fork's SOURCE against `null`.
+        // #3895: jq runs every later fork's SOURCE against `null` (still in 1.8.2, unlike
+        // `foreach`'s, #7519).
         let source_input = if first {
             SourceInput::Real
         } else {
@@ -150909,13 +150916,15 @@ mod tests {
             ["1", "2", "3", "6", "6", "12"]
         );
 
-        // INIT-comma: same null-after-the-first-fork rule as `reduce` above
-        // (#3895): jq prints `1,3,6` then errors on the second fork's `.[]`.
+        // INIT-comma: unlike `reduce` above, every fork's `.[]` reads the real
+        // input (#7519): jq 1.8.2 prints `1,3,6,2,4,7`, where jq 1.7.1 printed
+        // `1,3,6` and then raised on the second fork's `.[]` against `null`
+        // (jqlang/jq#3266 fixed `foreach` only).
         let (values, error) = outputs_and_error(b"[1,2,3]", "foreach .[] as $x (0,1; .+$x)");
-        assert_eq!(values, ["1", "3", "6"]);
+        assert_eq!(values, ["1", "3", "6", "2", "4", "7"]);
         assert!(
-            error.is_some_and(|e| e.contains("Cannot iterate over null")),
-            "the second fork's `.[]` runs against null"
+            error.is_none(),
+            "every fork reads the real input: {error:?}"
         );
         assert_eq!(
             outputs(b"[1,2,3]", "foreach range(1;4) as $x (0,1; .+$x)"),
@@ -150924,14 +150933,16 @@ mod tests {
     }
 
     /// #2163, closed by #3895: the INIT-fork rule above isn't specific to a
-    /// `.[]`-iterating SOURCE — a later INIT fork's SOURCE runs against `null`
+    /// `.[]`-iterating SOURCE — a later `reduce` fork's SOURCE runs against `null`
     /// for *any* SOURCE that reads `.`, including a bare field access with no
     /// iteration at all, which answers `null` silently rather than raising.
-    /// Verified live against jq 1.7.1:
+    /// `foreach` reads the real input on every fork since #7519, as jq 1.8.2
+    /// does (pin moved from 1.7.1's `[1,null]`). Verified live against jq 1.8.2
+    /// (`reduce` answers the same in 1.7.1):
     ///
     /// ```console
     /// $ echo '{"a":1,"c":2}' | jq -c '[foreach (.a) as $k ((0,.c); $k)]'
-    /// [1,null]
+    /// [1,1]
     /// $ echo '{"a":1,"c":2}' | jq -c '[reduce (.a) as $k ((0,.c); $k)]'
     /// [1,null]
     /// ```
@@ -150939,7 +150950,7 @@ mod tests {
     fn test_foreach_reduce_init_fork_source_reads_null_after_first_fork_2163() {
         assert_eq!(
             outputs(br#"{"a":1,"c":2}"#, "[foreach (.a) as $k ((0,.c); $k)]"),
-            ["[1,null]"]
+            ["[1,1]"]
         );
         assert_eq!(
             outputs(br#"{"a":1,"c":2}"#, "[reduce (.a) as $k ((0,.c); $k)]"),
