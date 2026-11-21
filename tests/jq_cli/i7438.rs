@@ -180,3 +180,34 @@ fn test_7438_the_aliases_read_argv_as_jq_does() -> Result<()> {
     }
     Ok(())
 }
+
+/// An option word that is not UTF-8 is refused by its bytes, as jq's `fprintf` prints it (#7426):
+/// jq 1.8.2 names `-\xff` for `-n\xff` (1.7.1 names `-n\xff`) and `--wat\xff` for that word.
+#[test]
+#[cfg(unix)]
+fn test_7438_an_unknown_option_that_is_not_utf8_is_named_by_its_bytes() -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    for (word, named) in [
+        (&b"-n\xff"[..], &b"-\xff"[..]),
+        (b"--wat\xff", b"--wat\xff"),
+    ] {
+        let output = std::process::Command::new(crate::succinctly_bin())
+            .arg("jq")
+            .arg(std::ffi::OsStr::from_bytes(word))
+            .arg("1")
+            .output()?;
+        let mut want = b"jq: Unknown option ".to_vec();
+        want.extend_from_slice(named);
+        want.extend_from_slice(&unknown("").as_bytes()["jq: Unknown option ".len()..]);
+        assert_eq!(
+            (
+                output.stdout.as_slice(),
+                output.stderr,
+                output.status.code()
+            ),
+            (&b""[..], want, Some(2)),
+            "{word:?}"
+        );
+    }
+    Ok(())
+}

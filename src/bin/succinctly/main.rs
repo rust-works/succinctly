@@ -874,6 +874,53 @@ fn parse_go_bool(text: &str) -> Result<bool, String> {
     }
 }
 
+/// An argv word's bytes as the operating system passed them (#7426). Unix argv is bytes; anywhere
+/// else a word is whatever text the platform made of it.
+pub(crate) fn os_word_bytes(word: &std::ffi::OsStr) -> std::borrow::Cow<'_, [u8]> {
+    #[cfg(unix)]
+    {
+        std::borrow::Cow::Borrowed(std::os::unix::ffi::OsStrExt::as_bytes(word))
+    }
+    #[cfg(not(unix))]
+    {
+        match word.to_string_lossy() {
+            std::borrow::Cow::Borrowed(text) => std::borrow::Cow::Borrowed(text.as_bytes()),
+            std::borrow::Cow::Owned(text) => std::borrow::Cow::Owned(text.into_bytes()),
+        }
+    }
+}
+
+/// An argv word as jq 1.7.1 reads it (#7426): its `jv_string` replaces each invalid UTF-8
+/// sequence with U+FFFD by jq's own rule, so `--arg x $'a\xff'` binds `"a\u{FFFD}"` and the program
+/// `$'"\xed\xa0\x80"'` is one U+FFFD, not three. Every text word goes through this: the program,
+/// the `--arg`/`--argjson` names and values and the `--args`/`--jsonargs` words. A file name does
+/// not: jq opens it by its bytes.
+pub(crate) fn jq_word_text(word: &std::ffi::OsStr) -> String {
+    match word.to_str() {
+        Some(text) => text.to_owned(),
+        None => succinctly::text::utf8::substitute_invalid_utf8_jq_style(&os_word_bytes(word)),
+    }
+}
+
+/// [`jq_word_text`] as a clap value parser: a text option takes any bytes, where clap's own `String`
+/// parser refuses a word that is not UTF-8.
+fn jq_text() -> impl clap::builder::TypedValueParser<Value = String> {
+    clap::builder::TypedValueParser::map(clap::builder::OsStringValueParser::new(), |word| {
+        jq_word_text(&word)
+    })
+}
+
+/// An argv word as yq v4.53.3 reads it (#7426): Go decodes a string a byte at a time, so each byte
+/// of an invalid sequence is one U+FFFD (`$'"a\xed\xa0\x80"' | length` is 10 in yq, `a` and three
+/// three-byte replacements).
+pub(crate) fn yq_word_text(word: std::ffi::OsString) -> String {
+    word.into_string().unwrap_or_else(|word| {
+        let bytes = succinctly::text::utf8::substitute_invalid_utf8_per_byte(&os_word_bytes(&word));
+        // Valid UTF-8 by construction, so this borrows and copies once.
+        String::from_utf8_lossy(&bytes).into_owned()
+    })
+}
+
 /// `--indent`'s value as jq 1.7.1 reads it (#6017): C's `atoi`, which is `(int)strtol(text, 0, 10)`.
 /// Leading white space and one sign are skipped, the digits that follow are read and anything after
 /// them is ignored, so `" 2"` and `"3x"` are 2 and 3 and text that starts with anything else (`""`,
@@ -923,7 +970,10 @@ fn parse_jq_indent(text: &str) -> Result<i8, String> {
 struct JqCommand {
     /// jq filter expression (e.g., ".", ".foo", ".[]")
     /// If not provided, uses "." (identity)
-    filter: Option<String>,
+    ///
+    /// The word as given (#7426): under `-f` it becomes the program file (`program_file`, #7439),
+    /// which jq opens by its bytes, and as the program text it is read by [`jq_word_text`].
+    filter: Option<std::ffi::OsString>,
 
     /// Input files (reads from stdin if none provided)
     /// Words after --args or --jsonargs are positional values, not files.
@@ -932,7 +982,9 @@ struct JqCommand {
     /// file, flags included, so `jq . data.json -c` and `jq . data.json
     /// --args a` failed with "Could not open file -c". jq reads an option
     /// wherever it appears (#3447).
-    files: Vec<String>,
+    ///
+    /// Not `String`: jq opens a file by the bytes of its name, which need not be UTF-8 (#7426).
+    files: Vec<std::ffi::OsString>,
 
     // === Input Options ===
     /// Don't read any input; use null as the single input value
@@ -1040,7 +1092,7 @@ struct JqCommand {
     ///
     /// The value is read as jq reads it (C's `atoi`, #6017): `-1` is a tab, white space and a
     /// sign are allowed, and text that does not start with a digit is 0.
-    #[arg(long, value_name = "N", value_parser = parse_jq_indent, allow_hyphen_values = true, overrides_with_all = JQ_OUTPUT_FORMAT_FLAGS)]
+    #[arg(long, value_name = "N", value_parser = clap::builder::TypedValueParser::try_map(clap::builder::OsStringValueParser::new(), |word| parse_jq_indent(&jq_word_text(&word))), allow_hyphen_values = true, overrides_with_all = JQ_OUTPUT_FORMAT_FLAGS)]
     indent: Option<i8>,
 
     // === Program Input ===
@@ -1071,28 +1123,30 @@ struct JqCommand {
     // drops -c/compact-output there too). yq mode's `arg`/`argjson` below
     // have no such oracle precedent (real yq has no equivalent flags at
     // all, #284) but carry the same tradeoff for consistency with jq mode.
+    // A text word that is not UTF-8 is read as jq reads it ([`jq_word_text`], #7426); a FILE keeps
+    // its bytes, as jq opens it by them.
     /// Set $name to the string value
-    #[arg(long, value_names = ["NAME", "VALUE"], num_args = 2, action = clap::ArgAction::Append, allow_hyphen_values = true)]
+    #[arg(long, value_names = ["NAME", "VALUE"], num_args = 2, action = clap::ArgAction::Append, allow_hyphen_values = true, value_parser = jq_text())]
     arg: Vec<String>,
 
     /// Set $name to the JSON value
-    #[arg(long, value_names = ["NAME", "VALUE"], num_args = 2, action = clap::ArgAction::Append, allow_hyphen_values = true)]
+    #[arg(long, value_names = ["NAME", "VALUE"], num_args = 2, action = clap::ArgAction::Append, allow_hyphen_values = true, value_parser = jq_text())]
     argjson: Vec<String>,
 
     /// Set $name to an array of JSON values read from file
     #[arg(long, value_names = ["NAME", "FILE"], num_args = 2, action = clap::ArgAction::Append, allow_hyphen_values = true)]
-    slurpfile: Vec<String>,
+    slurpfile: Vec<std::ffi::OsString>,
 
     /// Set $name to the string contents of file
     #[arg(long, value_names = ["NAME", "FILE"], num_args = 2, action = clap::ArgAction::Append, allow_hyphen_values = true)]
-    rawfile: Vec<String>,
+    rawfile: Vec<std::ffi::OsString>,
 
     /// Consume remaining arguments as positional string values
-    #[arg(long, num_args = 0.., value_name = "STRINGS", allow_hyphen_values = true)]
+    #[arg(long, num_args = 0.., value_name = "STRINGS", allow_hyphen_values = true, value_parser = jq_text())]
     args: Vec<String>,
 
     /// Consume remaining arguments as positional JSON values
-    #[arg(long, num_args = 0.., value_name = "JSON_VALUES", allow_hyphen_values = true)]
+    #[arg(long, num_args = 0.., value_name = "JSON_VALUES", allow_hyphen_values = true, value_parser = jq_text())]
     jsonargs: Vec<String>,
 
     /// `--args`/`--jsonargs`' words in argv order, filled by `run_jq`
@@ -1965,22 +2019,6 @@ fn jq_option_arity(cmd: &clap::Command, flag: &str) -> usize {
     0
 }
 
-/// An argv word's bytes as the operating system passed them (#7426). Unix argv is bytes; anywhere
-/// else a word is whatever text the platform made of it.
-pub(crate) fn os_word_bytes(word: &std::ffi::OsStr) -> std::borrow::Cow<'_, [u8]> {
-    #[cfg(unix)]
-    {
-        std::borrow::Cow::Borrowed(std::os::unix::ffi::OsStrExt::as_bytes(word))
-    }
-    #[cfg(not(unix))]
-    {
-        match word.to_string_lossy() {
-            std::borrow::Cow::Borrowed(text) => std::borrow::Cow::Borrowed(text.as_bytes()),
-            std::borrow::Cow::Owned(text) => std::borrow::Cow::Owned(text.into_bytes()),
-        }
-    }
-}
-
 /// The inverse of [`os_word_bytes`], for the part of a word after a letter (`-Llib`'s `lib`).
 fn os_word_from_bytes(bytes: &[u8]) -> std::ffi::OsString {
     #[cfg(unix)]
@@ -2208,8 +2246,11 @@ fn exit_unknown_jq_option(UnknownJqOption(word): UnknownJqOption) -> ! {
 
 /// Returns `Some(exit_code)` if a multi-call alias was detected,
 /// or `None` to fall through to normal `Cli::parse()`.
+///
+/// argv is read as the operating system's words (`args_os`), never `std::env::args`, which panics
+/// on the first one that is not UTF-8 (#7426).
 fn try_multicall() -> Result<Option<i32>> {
-    let binary_name = std::env::args()
+    let binary_name = std::env::args_os()
         .next()
         .as_deref()
         .and_then(|s| std::path::Path::new(s).file_name())
@@ -2223,26 +2264,26 @@ fn try_multicall() -> Result<Option<i32>> {
 
     match name {
         "sjq" | "jq" => {
-            let argv: Vec<String> = std::iter::once(name.to_string())
-                .chain(std::env::args().skip(1))
+            let argv: Vec<std::ffi::OsString> = std::iter::once(name.into())
+                .chain(std::env::args_os().skip(1))
                 .collect();
             Ok(Some(jq_runner::run_jq(parse_jq(argv, None))?))
         }
         "syq" | "yq" => {
-            let argv: Vec<String> = std::iter::once(name.to_string())
-                .chain(std::env::args().skip(1))
+            let argv: Vec<std::ffi::OsString> = std::iter::once(name.into())
+                .chain(std::env::args_os().skip(1))
                 .collect();
             Ok(Some(yq_runner::run_yq(parse_yq(argv, None))?))
         }
         "sjq-locate" | "jq-locate" => {
             let cmd = jq_locate::JqLocateArgs::parse_from(
-                std::iter::once(name.to_string()).chain(std::env::args().skip(1)),
+                std::iter::once(name.into()).chain(std::env::args_os().skip(1)),
             );
             Ok(Some(jq_locate::run_jq_locate(cmd)?))
         }
         "syq-locate" | "yq-locate" => {
             let cmd = yq_locate::YqLocateArgs::parse_from(
-                std::iter::once(name.to_string()).chain(std::env::args().skip(1)),
+                std::iter::once(std::ffi::OsString::from(name)).chain(std::env::args_os().skip(1)),
             );
             Ok(Some(yq_locate::run_yq_locate(cmd)?))
         }
@@ -2437,7 +2478,7 @@ const YQ_SUBCOMMAND_ABOUT: &str = "Command-line YAML processor (jq-compatible sy
 /// jq's grammar is not clap's (#7438, #7494): [`walk_jq_argv`] reads argv as jq does, refusing what
 /// jq refuses, and clap then parses only the options it found, so no positional word (`-1`, `-.a`)
 /// ever reaches clap. One definition serves both, built once.
-fn parse_jq(argv: Vec<String>, about: Option<&'static str>) -> JqCommand {
+fn parse_jq(argv: Vec<std::ffi::OsString>, about: Option<&'static str>) -> JqCommand {
     use clap::{CommandFactory, FromArgMatches};
     let mut command = JqCommand::command();
     if let Some(about) = about {
@@ -2460,31 +2501,31 @@ impl JqCommand {
     /// `-f`, `resolve_positional_args` moves it to `program_file`), and each later one goes where
     /// the mode it was read in sends it: an input file, or an `--args`/`--jsonargs` word.
     fn set_positional_words(&mut self, words: Vec<(WordMode, std::ffi::OsString)>) {
-        // Not UTF-8 only once argv is read as OS words (#7426); until then `std::env::args` has
-        // already refused such a word.
-        let text = |word: std::ffi::OsString| {
-            word.into_string()
-                .unwrap_or_else(|word| word.to_string_lossy().into_owned())
-        };
         let mut words = words.into_iter();
-        self.filter = words.next().map(|(_, word)| text(word));
+        // The program and the files keep their bytes; an `--args`/`--jsonargs` word is text, read
+        // as jq reads it (#7426).
+        self.filter = words.next().map(|(_, word)| word);
         for (mode, word) in words {
             match mode {
-                WordMode::File => self.files.push(text(word)),
+                WordMode::File => self.files.push(word),
                 WordMode::Str => self
                     .positional_words
-                    .push(jq_runner::PositionalWord::Str(text(word))),
+                    .push(jq_runner::PositionalWord::Str(jq_word_text(&word))),
                 WordMode::Json => self
                     .positional_words
-                    .push(jq_runner::PositionalWord::Json(text(word))),
+                    .push(jq_runner::PositionalWord::Json(jq_word_text(&word))),
             }
         }
     }
 }
 
 /// `argv` (program name first) parsed as `yq`; see [`parse_jq`] for `about`.
-fn parse_yq(argv: Vec<String>, about: Option<&'static str>) -> YqCommand {
+///
+/// A word that is not UTF-8 is read as yq reads it ([`yq_word_text`], #7426): the program and
+/// every value as text, a file name included, where yq opens a file by its bytes.
+fn parse_yq(argv: Vec<std::ffi::OsString>, about: Option<&'static str>) -> YqCommand {
     use clap::{CommandFactory, FromArgMatches};
+    let argv: Vec<String> = argv.into_iter().map(yq_word_text).collect();
     let mut command = YqCommand::command();
     if let Some(about) = about {
         command = command.about(about);
@@ -2501,15 +2542,18 @@ fn parse_yq(argv: Vec<String>, about: Option<&'static str>) -> YqCommand {
 /// Everything else, a bare `succinctly`, a global flag before the subcommand and every other
 /// subcommand, goes through [`Cli`] unchanged.
 fn try_direct_subcommand() -> Result<Option<i32>> {
-    let mut args = std::env::args();
+    // `args_os`, as in [`try_multicall`] (#7426).
+    let mut args = std::env::args_os();
     let argv0 = args.next().unwrap_or_default();
     // clap names the binary by its argv[0]'s file name, so `<argv0> jq` reads as `jq` does in the tree.
-    let argv = |subcommand: &str| -> Vec<String> {
-        std::iter::once(format!("{argv0} {subcommand}"))
-            .chain(std::env::args().skip(2))
+    let argv = |subcommand: &str| -> Vec<std::ffi::OsString> {
+        let mut name = argv0.clone();
+        name.push(format!(" {subcommand}"));
+        std::iter::once(name)
+            .chain(std::env::args_os().skip(2))
             .collect()
     };
-    match args.next().as_deref() {
+    match args.next().as_ref().and_then(|word| word.to_str()) {
         Some("jq") => Ok(Some(jq_runner::run_jq(parse_jq(
             argv("jq"),
             Some(JQ_SUBCOMMAND_ABOUT),
