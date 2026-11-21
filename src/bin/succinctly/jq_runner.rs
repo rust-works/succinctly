@@ -728,6 +728,8 @@ fn read_arg_file(
     file: &std::ffi::OsStr,
 ) -> Result<String, BuildContextError> {
     std::fs::read_to_string(file).map_err(|e| {
+        // #7576: a file there is no room for is jq's `cannot allocate memory`, not one that would not open.
+        abort_if_out_of_memory(&e);
         bad_arg_file(
             flag,
             name,
@@ -7185,6 +7187,8 @@ fn get_filter(args: &JqCommand) -> Result<String, BuildContextError> {
     if let Some(ref path) = args.program_file {
         // Filter comes from file.
         let open_error = |e: std::io::Error| {
+            // #7576: a program file there is no room for is jq's `cannot allocate memory`.
+            abort_if_out_of_memory(&e);
             // jq builds this one as a `jv` string, so the file reads as its U+FFFD text (#7426).
             BuildContextError::Usage(
                 format!(
@@ -8812,7 +8816,10 @@ fn read_inputs(
         let rest: usize = raw_inputs.iter().skip(1).map(|(_, raw)| raw.len()).sum();
         let mut sources = raw_inputs.iter_mut().map(|(_, raw)| raw);
         let mut combined = sources.next().map(std::mem::take).unwrap_or_default();
-        combined.reserve_exact(rest);
+        // #7576: room for several files' text that cannot be had is jq's `cannot allocate memory`.
+        if combined.try_reserve_exact(rest).is_err() {
+            abort_cannot_allocate(); // patchcov: coverage tolerate-line reason="a run that aborts writes no coverage profile (#7576)"
+        }
         for raw in sources {
             combined.push_str(raw);
         }
@@ -11660,16 +11667,21 @@ fn read_stdin_bytes_unreported() -> (Vec<u8>, bool) {
         return (Vec::new(), true);
     }
     if let Some(bytes) = STDIN_PUSHBACK.with(|slot| slot.borrow_mut().take()) {
-        let failed = STDIN_PUSHBACK_ERROR
-            .with(|slot| slot.borrow_mut().take())
-            .is_some();
-        return (bytes, failed);
+        let error = STDIN_PUSHBACK_ERROR.with(|slot| slot.borrow_mut().take());
+        if let Some(error) = &error {
+            abort_if_out_of_memory(error);
+        }
+        return (bytes, error.is_some());
     }
     let mut buf = Vec::new();
     // What `read_to_end` appended before a failure stays in `buf`.
     // #7455: read by a reader that counts what it took, for where the run leaves the descriptor.
-    let failed = super::stdin_offset::Stdin.read_to_end(&mut buf).is_err();
-    (buf, failed)
+    let read = super::stdin_offset::Stdin.read_to_end(&mut buf);
+    // #7576: room that could not be had is jq's `cannot allocate memory`, not an input that ends early.
+    if let Err(error) = &read {
+        abort_if_out_of_memory(error);
+    }
+    (buf, read.is_err())
 }
 
 /// Whether an input file argument is `-`, which jq reads as standard input (#6023).
@@ -11727,7 +11739,38 @@ fn input_display_name(path: &Path) -> String {
 /// rather than letting it escape as `Error: .../Caused by:` at exit 1
 /// (#3098).
 fn read_file_bytes(path: &Path, last: bool) -> std::result::Result<Vec<u8>, InputFileOpenError> {
-    std::fs::read(path).map_err(|e| InputFileOpenError::from_io(path, &e, last))
+    std::fs::read(path).map_err(|e| {
+        abort_if_out_of_memory(&e);
+        InputFileOpenError::from_io(path, &e, last)
+    })
+}
+
+/// jq's answer to an allocation that fails: `jv_mem_alloc`'s `memory_exhausted` prints `jq: error:
+/// cannot allocate memory` and calls `abort()`, which a shell reports as exit 134 (src/jv_alloc.c at
+/// jq-1.7.1 and jq-1.8.2). Captured from jq 1.7.1 under a `ulimit -v` smaller than an input it reads
+/// whole (`-s`, `-R -s`, `--slurpfile`, `--rawfile`, `-f`, standard input) (#7576).
+///
+/// An input read whole is read before anything runs, so there is no output to lose. The rest of a
+/// stream read whole after its windows (a `--seq` tail, text that is not UTF-8) can fail after output
+/// was written: what the output buffer holds is lost then, as jq's `abort()` loses what its `stdout`
+/// buffer holds.
+pub(super) fn abort_cannot_allocate() -> ! {
+    // patchcov: coverage tolerate reason="a run that aborts writes no coverage profile (#7576)"
+    use std::io::Write;
+    let _ = std::io::stderr().write_all(b"jq: error: cannot allocate memory\n");
+    std::process::abort()
+    // patchcov: coverage end
+}
+
+/// [`abort_cannot_allocate`] when `error` is an allocation that failed (`std::fs::read` reserves a
+/// file's length at once, and `read_to_end` each step it grows by, with `try_reserve`) (#7576). That
+/// failure used to read as a file that would not open (`Could not open file ...: out of memory`), or as
+/// standard input ending early, and the run went on over the input as if it were empty or short:
+/// `-s length` printed `0`.
+pub(super) fn abort_if_out_of_memory(error: &std::io::Error) {
+    if error.kind() == std::io::ErrorKind::OutOfMemory {
+        abort_cannot_allocate(); // patchcov: coverage tolerate-line reason="a run that aborts writes no coverage profile (#7576)"
+    }
 }
 
 /// Skip the UTF-8 byte-order mark at the front of the JSON input stream (#5291).
@@ -12294,7 +12337,7 @@ fn gated_seq_source(files: Vec<PathBuf>) -> Option<WindowedSource> {
         _ => return None, // patchcov: coverage tolerate-line reason="unreachable: several files go to stopping_seq_files_at before this is asked (#7341)"
     };
     // A file the whole-file route could not hold (a sparse file of terabytes) is that route's to report,
-    // as it reads it before it runs anything (`Could not open file ...: out of memory`): read here, the
+    // as it reads it before it runs anything (`jq: error: cannot allocate memory`, #7576): read here, the
     // records before the bad one would be run first.
     let start = file.stream_position().ok()?;
     let left = file.metadata().ok()?.len().saturating_sub(start);
@@ -14923,6 +14966,11 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
     match reader.read_to_end(&mut bytes) {
         Ok(_) => Ok(LoneStart::Read(bytes)),
         // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
+        // #7576: the rest of standard input, read whole, is jq's `cannot allocate memory` when it
+        // does not fit, not a stream that ended where the room did.
+        Err(error) if from_stdin && error.kind() == std::io::ErrorKind::OutOfMemory => {
+            abort_cannot_allocate()
+        }
         Err(_) if from_stdin => {
             note_stdin_read_failed();
             Ok(LoneStart::Read(bytes))
@@ -17381,7 +17429,15 @@ fn slurp_documents(
     unopened_tail: bool,
 ) -> core::result::Result<SlurpedInput, SlurpFailure> {
     let last = raw_inputs.len().saturating_sub(1);
-    let mut combined = Vec::with_capacity(raw_inputs.iter().map(Vec::len).sum::<usize>() + 2);
+    // #7576: the join is a second copy of the input; when there is no room for it, the answer is jq's
+    // to an allocation that fails, as for the read before it.
+    let mut combined = Vec::new();
+    if combined
+        .try_reserve_exact(raw_inputs.iter().map(Vec::len).sum::<usize>() + 2)
+        .is_err()
+    {
+        abort_cannot_allocate(); // patchcov: coverage tolerate-line reason="a run that aborts writes no coverage profile (#7576)"
+    }
     let mut eof_line = 0;
     combined.push(b'[');
     let mut wrote_value = false;

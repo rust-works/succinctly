@@ -9410,6 +9410,18 @@ ADR-0025's floor follows the size it got, so a recursion that reaches it refuses
 At a cap of 32 MiB the thread cannot be mapped at all.
 A document too large for the cap still aborts on the failed allocation, as jq does.
 
+## An input read whole with no room for it (#7576)
+
+An input `succinctly jq` reads whole that there is no room for ends the run as jq's failed allocation does: `jq: error: cannot allocate memory` and `abort()`, exit 134 to a shell, with nothing on stdout.
+That covers `-s` (with `--stream`, `-n` and `-R` too), `-R -s`, `--slurpfile`, `--rawfile`, `-f`, standard input read whole, and the join `-s` makes of the files it read.
+Captured from jq 1.7.1 on x86_64 Linux under `ulimit -v 400000` over a 300 MiB NDJSON file, for every one of those routes; jq 1.8.2's `memory_exhausted` (src/jv_alloc.c) is unchanged, and was not run (there is no 1.8.2 on the Linux box, and macOS does not enforce `ulimit -v`).
+Before #7576 the failure read as a file that would not open (`jq: error: Could not open file f: out of memory`, exit 2) and the run went on without it, so `-s length` printed `0`; on standard input the read stopped where the room did.
+
+One route still differs.
+jq streams a `--seq` input whatever it holds, so under the same cap `--seq -c .` over NDJSON (no RS anywhere) ends with `jq: ignoring parse error: Unfinished abandoned text at EOF at line 8530001, column 0` and exit 0.
+`succinctly jq` reads a `--seq` stream that does not open with an RS whole (#7312), and the windowed `--seq` routes leave a file they could not hold to that read (#7262), so it answers `cannot allocate memory` there.
+Answering as jq does would take a `--seq` reader that walks text with no RS a window at a time.
+
 ## Input files are one byte stream (#4305)
 
 jq 1.7.1 reads all of its input files as one concatenated byte stream, so a token still open where a
