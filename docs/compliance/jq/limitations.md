@@ -363,6 +363,19 @@ The refusal comes before the input files are opened, as in 1.8.2, and covers a N
 `succinctly yq` is not changed.
 Pinned by `tests/jq_cli/i7434.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
 
+## `--stream --slurp` keeps the last closing event in the array, as jq 1.8.2 does; jq 1.7.1 gives it out after the array (#7523)
+
+jq 1.7.1's slurp loop stops at the call that reads the last byte of the input, so the closing event of a top-level container that ends the text, which its streaming parser still holds, comes out after the array as a value of its own: `printf '[1][2]' | jq -c -s --stream .` printed `[[[0],1],[[0]],[[0],2]]` and then `[[0]]`, and so did `[1,2]` and `{"a":1}` with no newline after them.
+A byte after the closer, or a closer that ends in a container, kept it in the array.
+jq 1.8.2 reads once more before it closes the array (jqlang/jq#3279, commit 4e3088f, listed in the 1.8 NEWS under CLI changes: "Fix `--slurp --stream` when input has no trailing newline character"), so the array has every event whatever the last byte is: `[[[0],1],[[0]],[[0],2],[[0]]]`.
+`succinctly jq` follows 1.8.2 for `--stream -s` and `--stream-errors -s`, with and without `-n`, over standard input and files, because upstream calls the 1.7.1 behaviour a bug, and so the difference from the pinned 1.7.1 stands as `newer-than-primary`.
+This replaces the rule #5548 added, which matched 1.7.1.
+`input_filename` and `input_line_number` read where the array was closed, as they did.
+What the same upstream change does not reach here: a fault at the end of the text (`printf '[1,' | jq -s --stream .`) is raised and the array is not printed in 1.8.2, where 1.7.1 printed the array and then raised, and `succinctly jq` still prints the array first.
+`--seq` keeps the 1.7.1 model of the slurp loop, and so do the cases that read a directory in the middle of the file list.
+`succinctly yq` is not changed.
+Pinned by `tests/jq_cli/i7523.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
+
 ## A standard input that cannot be read: matched, with these differences (#7126)
 
 A standard input that cannot be read is an empty one in jq 1.7.1, which counts the failed read and exits 2 once the run is over, whatever the program left (`-e`'s 4, `input`'s 5), and for a plain read without a word on stderr.
