@@ -29,7 +29,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-succinctly = "0.7"
+succinctly = "0.8"
 ```
 
 Or use cargo:
