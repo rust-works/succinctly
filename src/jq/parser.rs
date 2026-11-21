@@ -1723,13 +1723,9 @@ fn collect_def_names(input: &str) -> BTreeSet<String> {
         // before the walk inspects what follows it, and the walk bails
         // (keeping whatever it already collected) the moment a token isn't
         // `IDENT` followed by `;`/`,`/`)`, so an unclosed list costs at
-        // most its own length, never a scan of everything after it. `,` is
-        // accepted alongside `;` to match `Parser::parse_func_params`'s own
-        // separator set -- this dialect's grammar, not real jq's (real jq
-        // rejects a comma-separated def parameter list outright, confirmed
-        // live) -- since a comma-separated parameter is otherwise silently
-        // dropped from the shadow set the exact same way (confirmed live:
-        // `def f(a, length): length; f(1;2)` answered `0`, not `2`).
+        // most its own length, never a scan of everything after it. Only `;`
+        // separates parameters, as in `Parser::parse_func_params` and real jq
+        // (a comma-separated parameter list is a syntax error, #7457).
         let after_name = skip_ws_and_comments(after_name_start);
         if let Some(mut rest_params) = after_name.strip_prefix('(') {
             loop {
@@ -1741,7 +1737,7 @@ fn collect_def_names(input: &str) -> BTreeSet<String> {
                 names.insert(pname.to_string());
                 rest_params = skip_ws_and_comments(after_pname);
                 match rest_params.chars().next() {
-                    Some(';' | ',') => rest_params = &rest_params[1..],
+                    Some(';') => rest_params = &rest_params[1..],
                     _ => break,
                 }
             }
@@ -7435,15 +7431,17 @@ impl<'a> Parser<'a> {
                 });
                 self.skip_ws();
 
+                // #7457: parameters are separated by `;` only; jq's grammar has no `,` there
+                // (`def f(a,b): a; f(5;6)` is `unexpected ','`), and yq has no `def` to follow.
                 match self.peek() {
-                    Some(';' | ',') => {
+                    Some(';') => {
                         self.next();
                         self.skip_ws();
                     }
                     Some(')') => break,
                     _ => {
                         return Err(ParseError::new(
-                            "expected ';', ',', or ')' in parameter list",
+                            "expected ';' or ')' in parameter list",
                             self.pos,
                         ));
                     }
@@ -16759,7 +16757,7 @@ mod tests {
         let err = parse("def f(a b): a; f(1;2)").expect_err("missing separator must error");
         assert!(
             err.message
-                .contains("expected ';', ',', or ')' in parameter list"),
+                .contains("expected ';' or ')' in parameter list"),
             "unexpected error: {}",
             err.message
         );
