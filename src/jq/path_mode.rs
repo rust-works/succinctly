@@ -147,6 +147,63 @@ fn combine(op: ArithOp, l: &OwnedValue, r: &OwnedValue) -> Result<OwnedValue, Ev
     }
 }
 
+/// Whether a `reduce` update only adds to its state, which
+/// [`Interp::append_step`] runs in place when the state is an array (#7564):
+/// `.`, `. + E`, or `if C then U else U end` of those, each `E` and `C`
+/// [`is_input_free`]. builtin.jq's `add` (`. + $x`) and `_flatten`
+/// (`if $i | ... then . + ($i | _flatten($x-1)) else . + [$i] end`) are.
+fn is_append_update(update: &Expr) -> bool {
+    match update {
+        Expr::Paren(inner) => is_append_update(inner),
+        Expr::Identity => true,
+        Expr::Arithmetic {
+            op: ArithOp::Add,
+            left,
+            right,
+            ..
+        } => matches!(**left, Expr::Identity) && is_input_free(right),
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => is_input_free(cond) && is_append_update(then_branch) && is_append_update(else_branch),
+        _ => false,
+    }
+}
+
+/// Whether `expr` never reads its input, so that running it on `null` gives
+/// what running it on any input gives: constants and variables, and
+/// constructors and operators over them; a pipe reads its input only in its
+/// first stage. Anything else (a call, a builtin, a path) may read it.
+fn is_input_free(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) | Expr::Loc { .. } | Expr::Var(_) | Expr::TrackedVar(_) => true,
+        Expr::Paren(inner) | Expr::Negate(inner) | Expr::Array(inner) => is_input_free(inner),
+        Expr::Pipe(stages) => stages.first().is_some_and(is_input_free),
+        Expr::Comma(items) => items.iter().all(is_input_free),
+        Expr::Object(entries) => entries.iter().all(|entry| {
+            let key_free = match &entry.key {
+                ObjectKey::Literal(_) => true,
+                ObjectKey::Expr(key) => is_input_free(key),
+                ObjectKey::Bare => false,
+            };
+            key_free && is_input_free(&entry.value)
+        }),
+        Expr::Arithmetic { left, right, .. } | Expr::Compare { left, right, .. } => {
+            is_input_free(left) && is_input_free(right)
+        }
+        Expr::And(a, b) | Expr::Or(a, b) | Expr::Alternative(a, b) => {
+            is_input_free(a) && is_input_free(b)
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => is_input_free(cond) && is_input_free(then_branch) && is_input_free(else_branch),
+        _ => false,
+    }
+}
+
 /// `jv_object_merge_recursive`: `b`'s fields set on `a`, a field that is an
 /// object on both sides merged in turn. A merge that sets nothing is `a`
 /// itself, as jq's returns its `a`. Bounded as the shipped `*` is (#1017).
@@ -2331,6 +2388,7 @@ impl<'e> Interp<'e> {
         sink: &mut Sink<'_>,
     ) -> R {
         let fold_input = FoldInput::new(input.clone());
+        let appends = is_append_update(update);
         self.eval(init, env, input, reg, &mut |initial, reg_init| {
             let state = RefCell::new(initial);
             self.eval(
@@ -2340,7 +2398,12 @@ impl<'e> Interp<'e> {
                 reg_init.clone(),
                 &mut |s, reg_s| {
                     self.destructure(patterns, s, env, reg_s, &mut |env_p, reg_p| {
-                        let current = state.replace(OwnedValue::Null);
+                        let current = match state.replace(OwnedValue::Null) {
+                            OwnedValue::Array(items) if appends => {
+                                return self.append_step(update, &env_p, items, reg_p, &state);
+                            }
+                            current => current,
+                        };
                         self.eval(update, &env_p, current, reg_p, &mut |u, _| {
                             *state.borrow_mut() = u;
                             Ok(())
@@ -2350,6 +2413,99 @@ impl<'e> Interp<'e> {
             )?;
             sink(state.into_inner(), reg_init)
         })
+    }
+
+    /// One `reduce` step whose update [`is_append_update`] and whose state is
+    /// the array `items`, run as jq runs it in place (#7564).
+    ///
+    /// jq's `f_plus` frees its input before `jv_array_concat`, so the state
+    /// of `reduce .[] as $x (..; . + $x)` is the only reference to the array
+    /// and every step appends to it in place: `add` and `flatten` are linear.
+    /// The generic arms hold the state three times over (the update's input,
+    /// `binop`'s two subexpression inputs), so `arith_combine` copied the
+    /// whole state on every step, quadratic in the result.
+    ///
+    /// Here the update's right operands and conditions run on `null`, which
+    /// they never read ([`is_input_free`]), so `items` stays unique. Each
+    /// output is `items` cut back to the state's length plus that output's
+    /// operand, in order: a later output of a generator still adds to the
+    /// state, not to the earlier sum, and nothing but the next step reads the
+    /// sum. `null` and `[]` add nothing, which keeps the state itself, as
+    /// `binop_keeps` does; any other operand is `combine`'s type error.
+    fn append_step(
+        &self,
+        update: &'e Expr,
+        env: &Env<'e>,
+        items: ArrayVec,
+        reg: Reg,
+        state: &RefCell<OwnedValue>,
+    ) -> R {
+        let base = items.len();
+        // A state another value shares is kept, so that an output adding
+        // nothing is that value itself (jq's refcount is above one, so it
+        // copies on every append too); a unique one is cut back instead.
+        let shared = items.is_shared().then(|| items.clone());
+        let acc = RefCell::new(items);
+        let mut produced = false;
+        self.append_operands(update, env, &reg, &mut |operand| {
+            let mut acc = acc.borrow_mut();
+            let cut_back = |acc: &mut ArrayVec| match &shared {
+                Some(state) => *acc = state.clone(),
+                None if acc.len() > base => acc.make_vec().truncate(base),
+                None => {}
+            };
+            match operand {
+                OwnedValue::Null => cut_back(&mut acc),
+                OwnedValue::Array(more) if more.is_empty() => cut_back(&mut acc),
+                OwnedValue::Array(more) => {
+                    cut_back(&mut acc);
+                    let mut vec = acc.make_vec();
+                    vec.extend(more.iter().cloned());
+                    vec[base..].iter_mut().for_each(promote_built);
+                }
+                other => {
+                    cut_back(&mut acc);
+                    let state = OwnedValue::Array(acc.clone());
+                    return match combine(ArithOp::Add, &state, &other) {
+                        Err(e) => Err(raise_eval(e)),
+                        Ok(_) => Err(unsupported("an array plus a scalar that is not an error")), // patchcov: coverage tolerate-line reason="unreachable: jq's `+` of an array and a boolean, number, string or object always raises"
+                    };
+                }
+            }
+            produced = true;
+            Ok(())
+        })?;
+        if produced {
+            *state.borrow_mut() = OwnedValue::Array(acc.into_inner());
+        }
+        Ok(())
+    }
+
+    /// The right operands of an [`is_append_update`] update's outputs, in
+    /// the order the generic arms produce its outputs.
+    fn append_operands(
+        &self,
+        update: &'e Expr,
+        env: &Env<'e>,
+        reg: &Reg,
+        f: &mut dyn FnMut(OwnedValue) -> R,
+    ) -> R {
+        match update {
+            Expr::Paren(inner) => self.append_operands(inner, env, reg, f),
+            Expr::Identity => f(OwnedValue::Null),
+            Expr::Arithmetic { right, .. } => {
+                self.eval(right, env, OwnedValue::Null, reg.sub(), &mut |r, _| f(r))
+            }
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => self.eval(cond, env, OwnedValue::Null, reg.sub(), &mut |c, _| {
+                let branch = if truthy(&c) { then_branch } else { else_branch };
+                self.append_operands(branch, env, reg, f)
+            }),
+            _ => Err(unsupported("an update that is not an append")), // patchcov: coverage tolerate-line reason="unreachable: `is_append_update` admits only the arms above"
+        }
     }
 
     /// `gen_foreach`: as `reduce`, but `EXTRACT` runs straight after each
