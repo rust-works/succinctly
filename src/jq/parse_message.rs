@@ -679,19 +679,22 @@ pub fn jq_depth_fault_offset(text: &[u8]) -> Option<usize> {
         .map(|fault| fault.offset)
 }
 
-/// [`jq_depth_fault_offset`] for jq's input stream, read as [`jq_stream_fault_end`] reads it: the
-/// byte of `text` holding the bracket jq refuses for its depth limit, when that is the first fault
-/// its parser meets in the stream of top-level values `text` holds, or `None` (#7470).
+/// The byte of `text` at which jq's parser, reading it as [`jq_stream_fault_end`] reads it, meets
+/// the first fault in the stream of top-level values `text` holds, whatever the fault (#7470,
+/// #7611): the bracket it refuses for its depth limit, the delimiter after a bad token, a string's
+/// closing quote, a stray byte. `None` when it reads to the end without one, which leaves only a
+/// fault at the end of the text (`... at EOF`).
 ///
 /// It reads only as far as the first fault, so a caller can learn where jq stops in a long text
-/// for the cost of the bytes before that point.
+/// for the cost of the bytes before that point. The parser reads a byte at a time and never looks
+/// ahead, so the bytes after the one returned change neither the fault nor anything before it.
 #[doc(hidden)]
-pub fn jq_stream_depth_fault_offset(text: &[u8]) -> Option<usize> {
+pub fn jq_stream_fault_offset(text: &[u8]) -> Option<usize> {
     let mut parser = Parser::new(1, 0, JQ_MAX_PARSING_DEPTH);
     parser.multi = true;
     for (at, &byte) in text.iter().enumerate() {
-        if let Err(Stop::Fault(fault)) = parser.feed(byte) {
-            return (fault == DEPTH_FAULT).then_some(at);
+        if let Err(Stop::Fault(_)) = parser.feed(byte) {
+            return Some(at);
         }
     }
     None
@@ -1158,25 +1161,29 @@ mod tests {
         assert_eq!(jq_depth_fault_offset(b"[1,,2]"), None);
     }
 
-    /// The stream form reads every top-level value, places the fault where the single-text form
-    /// does, and stops there: what follows the refused bracket is never read (#7470).
+    /// The stream form reads every top-level value, places a depth refusal where the single-text
+    /// form does, and stops there: what follows the refused bracket is never read (#7470). A
+    /// fault of any other kind is placed on the byte the parser meets it at (#7611).
     #[test]
-    fn stream_depth_fault_offset_is_the_first_fault_of_the_stream_7470() {
+    fn stream_fault_offset_is_the_first_fault_of_the_stream_7470() {
         let deep = nest("[", "", "]", 300);
-        assert_eq!(jq_stream_depth_fault_offset(deep.as_bytes()), Some(256));
+        assert_eq!(jq_stream_fault_offset(deep.as_bytes()), Some(256));
         let after = format!("1 2 {{\"a\":3}} {deep} 4");
-        assert_eq!(
-            jq_stream_depth_fault_offset(after.as_bytes()),
-            Some(12 + 256)
-        );
-        // Only a depth refusal: a fault of any other kind first is `None`.
+        assert_eq!(jq_stream_fault_offset(after.as_bytes()), Some(12 + 256));
+        // A fault of another kind first is that fault's byte.
         let syntax_first = format!("1 ] {deep}");
-        assert_eq!(jq_stream_depth_fault_offset(syntax_first.as_bytes()), None);
-        assert_eq!(jq_stream_depth_fault_offset(b"[1,,2]"), None);
-        assert_eq!(jq_stream_depth_fault_offset(b"1 2 [3]"), None);
+        assert_eq!(jq_stream_fault_offset(syntax_first.as_bytes()), Some(2));
+        assert_eq!(jq_stream_fault_offset(b"[1,,2]"), Some(3));
+        // A bad token at the delimiter that ends it, a bad string at its closing quote.
+        assert_eq!(jq_stream_fault_offset(b"[x[x[x"), Some(2));
+        assert_eq!(jq_stream_fault_offset(b"1 truex 2"), Some(7));
+        assert_eq!(jq_stream_fault_offset(b"[\"a\x01b\"]"), Some(5));
+        // None before the end: a clean stream, or one only the end leaves unfinished.
+        assert_eq!(jq_stream_fault_offset(b"1 2 [3]"), None);
+        assert_eq!(jq_stream_fault_offset(b"1 [2"), None);
         // What follows the refused bracket is never read, malformed or not.
         let open = format!("{}\u{1}]]", "{\"a\":".repeat(129));
-        assert_eq!(jq_stream_depth_fault_offset(open.as_bytes()), Some(128 * 5));
+        assert_eq!(jq_stream_fault_offset(open.as_bytes()), Some(128 * 5));
         // It agrees with the message `jq_stream_fault_end` gives for the same text.
         for text in [deep.as_str(), after.as_str(), open.as_str()] {
             let (message, _) = jq_stream_fault_end([text], 1, 0).unwrap();
