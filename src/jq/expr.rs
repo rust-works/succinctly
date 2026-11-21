@@ -1805,6 +1805,22 @@ impl FuncDefData {
         };
         memo(slot, || classify(&self.body))
     }
+
+    /// Whether this definition's body settles when its own recursive calls and bare parameters are
+    /// taken to, computing it with `classify` on the first call, for jq (`jq`) or yq mode (#7460):
+    /// the half of `tail_call::call_head_settles` that is a property of the definition.
+    pub(crate) fn call_settles_or_init(
+        &self,
+        jq: bool,
+        classify: impl FnOnce(&Expr) -> bool,
+    ) -> bool {
+        let slot = if jq {
+            &self.tail.call_jq
+        } else {
+            &self.tail.call_yq
+        };
+        memo(slot, || classify(&self.body))
+    }
 }
 
 /// Deliberately leaves out the remembered answer (the trailing `..`), so a
@@ -1839,6 +1855,10 @@ struct TailMemo {
     yq: core::cell::Cell<Option<bool>>,
     settles_jq: core::cell::Cell<Option<bool>>,
     settles_yq: core::cell::Cell<Option<bool>>,
+    /// Whether the body settles with the definition's own calls and bare parameters taken to
+    /// (`tail_call::call_head_settles`, #7460), in jq and yq mode.
+    call_jq: core::cell::Cell<Option<bool>>,
+    call_yq: core::cell::Cell<Option<bool>>,
 }
 
 impl Clone for TailMemo {

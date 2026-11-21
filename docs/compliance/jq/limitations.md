@@ -9395,6 +9395,8 @@ Three differences remain, none of which aborts the process:
   single-valued, effect-free operands that both call a `def` (or an `as`
   source that does) are settled before their consumer runs, and the stack
   follows the depth like any other recursion.
+  A pipe whose first stage is such a call (`f($n - 1) | f($n - 1)`, a depth-first walk that threads its state through the value) ran the rest of the pipe inside the call's output sink the same way, and was refused after about 8,000 calls at depth 13 where jq answers; since [#7460](https://github.com/rust-works/succinctly/issues/7460) a call whose arguments and body answer once (the tail-call loop's test of a stage it runs ahead of its call, #5379, with the definition's own calls and bare parameters taken to, by induction) is run to its value before the rest of the pipe (and so is an `as` source that is such a call), and the stack again holds the recursion's depth.
+  Two Rosetta Code programs the issue names still stop there, for other reasons not yet looked into: the cube-free primes (`out/1`, an `until` loop) and the Sudan function (lazy bare-parameter arguments nested in arguments).
 - **A recursively-built value can exceed `MAX_VALUE_TREE_DEPTH` (384) where jq has no such
   limit.** `def deep(m): if m == 0 then . else [[…]]deep(m-1)[[…]] end; deep(60)` builds
   1,200 levels; jq prints it, and so does succinctly since #5554 (the output check that
