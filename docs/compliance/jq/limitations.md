@@ -14543,12 +14543,13 @@ table, so each message pointed at the *other* one's position. It now visits in s
 re-sequences the diagnostics afterwards (see the order table under #3583 below), so message
 order, count and carets all match.
 
-### A module `include` cycle is a compile error, where jq segfaults — accepted divergence, ADR-0018 rule 4 (#2865)
+### A module cycle is `circular import of <path>`, as jq 1.8.2 words it; jq 1.7.1 segfaults (#2865, #7530)
 
 [#2865](https://github.com/rust-works/succinctly/issues/2865) made a module's own
 `include`/`import` directives load transitively, which makes a cycle between two modules
-reachable for the first time. Real jq 1.7.1 does not diagnose one at all — it recurses
-until the process dies:
+reachable for the first time.
+jq 1.7.1 does not diagnose one at all.
+It recurses until the process dies:
 
 ```console
 $ cat ca.jq
@@ -14558,36 +14559,37 @@ $ cat cb.jq
 include "ca";
 def b: 2;
 
-$ jq -L . -n 'include "ca"; a'; echo "exit=$?"
+$ /usr/bin/jq -L . -n 'include "ca"; a'; echo "exit=$?"     # jq 1.7.1
 exit=139                       # SIGSEGV, nothing on stdout or stderr
 
+$ /opt/homebrew/bin/jq -L . -n 'include "ca"; a'; echo "exit=$?"     # jq 1.8.2
+jq: error: circular import of /tmp/x/ca.jq
+
+jq: 1 compile error
+exit=3
+
 $ succinctly jq -L . -n 'include "ca"; a'; echo "exit=$?"
-jq: error: module cycle detected: ca -> cb -> ca
+jq: error: circular import of /tmp/x/ca.jq
 
 jq: 1 compile error
 exit=3
 ```
 
-A module that includes itself behaves the same way in jq (`exit=139`), and reports
-`module cycle detected: selfinc -> selfinc` here.
+A module that includes itself, an `import` cycle and a cycle through three modules answer the same way, in both jq 1.8.2 and `succinctly jq`.
+jq 1.8.2 fixed the crash as a security issue (CVE-2026-44777, "Detect circular module imports to prevent stack overflow", jqlang/jq commit f58787c41835d9b17795730cb04925fdba25c71c), so its output is the reference: jq 1.7.1 never printed anything for these programs.
+Until #7530 `succinctly jq` worded it `module cycle detected: ca -> cb -> ca`, a divergence under ADR-0018 rule 4 that existed only because there was no reference output; there is now, so it is matched.
 
-This is the **cleanest** of ADR-0018 rule 4's carve-outs rather than a policy stretch:
-the rule permits refusing the reference's behaviour where "matching would take the host
-process down," and matching here means exactly a SIGSEGV. There is no reference *output*
-to be faithful to — jq writes nothing to either stream — so the only open question was
-which shape to leave through, and the answer is the one the other two compile-error kinds
-already use (`jq: N compile error`, exit 3, per "Undefined functions and arity
-mismatches" above).
+The path is the canonical absolute path of the module that is *re-entered*, as jq's `find_lib` resolves it.
+A module that merely leads to the cycle is not named: `x` including `ca` including `cb` including `ca` names `ca.jq`.
+Two spellings of one module name the same file (`alia.jq` containing `include "./alia"` names `.../alia.jq`).
+Detection keys on the resolved file for that reason.
+It cannot use the module memo cache as its guard: a module is absent from that cache for exactly as long as its own dependencies are loading, which is precisely the window in which a cycle closes.
 
-Detection keys on the **resolved** file rather than the module path as written, so one
-module reachable under two spellings still closes a cycle
-(`alia.jq` containing `include "./alia"` reports `alia -> ./alia`); the chain in the
-message keeps the spellings, since those are what the source actually says. It cannot use
-the module memo cache as its guard: a module is absent from that cache for exactly as long
-as its own dependencies are loading, which is precisely the window in which a cycle closes.
+The cycle is an error of its own level, like a module that is not found: jq 1.8.2 prints it, stops that level and returns `1` for it, and the levels above add that `1` to their own count and go on.
+So the walk goes on after a cycle, in jq's order (last-declared directive first): `import "cycle_a" as a; import "m1" as m; null` prints the `m1.jq` cycle, then the `cycle_a.jq` one, and `2 compile errors`.
+Before #7530 `succinctly jq` ended the walk at the first cycle, since jq 1.7.1 had died there.
 
-`test_module_cycle_is_a_compile_error_not_a_hang_2865` (`tests/jq_cli_tests.rs`) pins all
-four shapes (two-module cycle, self-include, aliased spelling, `import`-side cycle).
+`test_module_cycle_is_a_compile_error_not_a_hang_2865` (`tests/jq_cli_tests.rs`) pins the four shapes (two-module cycle, self-include, aliased spelling, `import`-side cycle), and `tests/jq_cli/i7530.rs` pins the exact stderr of fourteen programs captured from jq 1.8.2.
 
 ### Seven module-scoping rules that *are* matched, and read as bugs (#2865)
 

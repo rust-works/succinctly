@@ -418,10 +418,9 @@ modules costs memory linear in its total source (#2955). See
 [jq Limitations](../compliance/jq/limitations.md#seven-module-scoping-rules-that-are-matched-and-read-as-bugs-2865)
 for the full table and the two scoping gaps that remain open.
 
-An `include` cycle is reported as `module cycle detected: a -> b -> a`
-(exit 3) — a deliberate ADR-0018 rule-4 divergence, since real jq
-segfaults instead; see
-[jq Limitations](../compliance/jq/limitations.md#a-module-include-cycle-is-a-compile-error-where-jq-segfaults--accepted-divergence-adr-0018-rule-4-2865).
+A module cycle (`include` or `import`) is reported as `circular import of <path of the module re-entered>`
+(exit 3), as jq 1.8.2 words it; jq 1.7.1 segfaults instead; see
+[jq Limitations](../compliance/jq/limitations.md#a-module-cycle-is-circular-import-of-path-as-jq-182-words-it-jq-171-segfaults-2865-7530).
 
 ### Succinctly Extensions
 These are succinctly-specific extensions not available in standard jq or yq:

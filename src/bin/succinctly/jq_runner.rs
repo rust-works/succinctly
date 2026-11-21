@@ -302,16 +302,15 @@ pub struct ModuleLoader {
     /// holds a main expression. jq refuses to compile anything while it is so, and
     /// [`Self::bind_dot_jq`] raises this.
     dot_jq_failure: Option<ReportEntry>,
-    /// The modules whose own dependencies are currently being loaded, as
-    /// `(resolved canonical file, module path as written)`, outermost first
-    /// (#2865).
+    /// The modules whose own dependencies are currently being loaded, by resolved
+    /// canonical file, outermost first (#2865).
     ///
     /// The cycle guard, and it has to be separate from `loaded_modules`: a
     /// module is *absent* from that cache for exactly as long as its own
     /// dependencies are loading, which is precisely the window in which a
     /// cycle closes. Keyed on the resolved file rather than the written path
     /// so `include "./m"` inside `m.jq` is still caught.
-    loading: Vec<(PathBuf, String)>,
+    loading: Vec<PathBuf>,
     /// Run id per origin, keyed by canonical file (#2951). One id per
     /// *source*, not per directive: a module included once and imported twice
     /// is one id wrapped in three runs, which is right -- the id names where
@@ -401,25 +400,17 @@ pub(crate) enum ReportEntry {
     /// standing in for the missing echo, then the usual trailer. Confirmed
     /// live against jq 1.7.1, byte-for-byte.
     NotFound { module_path: String },
-    /// A module's own `include`/`import` chain leads back to a module already
+    /// A module's own `include`/`import` chain leads back to a module still
     /// being loaded (`ca` includes `cb` includes `ca`, or a module including
-    /// itself).
+    /// itself). jq 1.8.2 reports `circular import of {path}` (CVE-2026-44777, #7530)
+    /// and treats it as a missing module does: it stops that level and returns
+    /// `1` for it, and the levels above go on. `path` is the canonical absolute
+    /// path of the module that was re-entered, as jq names it.
     ///
-    /// **A deliberate ADR-0018 rule-4 divergence** (#2865), under the explicit
-    /// "matching would take the host process down" carve-out: real jq 1.7.1
-    /// does not diagnose this at all, it recurses until it dies --
-    /// `jq -L . -n 'include "ca"; a'` exits **139** (SIGSEGV) with no output on
-    /// either stream, and a self-including module does the same. Reproducing
-    /// that faithfully is not an option, so succinctly reports the cycle and
-    /// ends its walk there, through the same `jq: 1 compile error` / exit 3
-    /// door as the other kinds. What jq printed *before* it died is still
-    /// printed, in jq's order (#3573).
-    ///
-    /// `chain` is the module paths **as written in the `include`/`import`
-    /// directives**, from the outermost module in the cycle through to the
-    /// repeat that closed it (`["ca", "cb", "ca"]`); detection itself keys on
-    /// the *resolved* file, so two spellings of one module still close a cycle.
-    Cycle { chain: Vec<String> },
+    /// jq 1.7.1 does not diagnose this at all: it recurses until it dies
+    /// (`jq -L . -n 'include "ca"; a'` exits **139**, SIGSEGV, with no output on
+    /// either stream), so 1.8.2 is the only reference for the output (#2865).
+    Cycle { path: PathBuf },
     /// The module's own contents failed to parse -- jq's fourth compile-error
     /// kind (#2703). Carries everything [`report_module_load_error`] needs to
     /// build jq's shape: the module's *canonical absolute* path (jq names the
@@ -582,8 +573,8 @@ fn print_report_entry(entry: &ReportEntry) {
             }
             eprintln!();
         }
-        ReportEntry::Cycle { chain } => {
-            eprintln!("jq: error: module cycle detected: {}", chain.join(" -> "));
+        ReportEntry::Cycle { path } => {
+            eprintln!("jq: error: circular import of {}", path.display());
             eprintln!();
         }
         // jq 1.7.1 names the module by its resolved *absolute* path, and the next
@@ -1544,12 +1535,9 @@ struct FailureWalk<'a> {
     /// counts nothing. Recorded when a module is finished, not when it starts,
     /// so a module still being walked is a cycle, not a repeat.
     visited: BTreeSet<PathBuf>,
-    /// The modules whose own directives are being walked, outermost first:
-    /// `(canonical file, path as written)`.
-    chain: Vec<(PathBuf, String)>,
+    /// The modules whose own directives are being walked, by canonical file.
+    chain: Vec<PathBuf>,
     entries: Vec<ReportEntry>,
-    /// A module cycle ends the walk everywhere (jq dies there, #2865).
-    halted: bool,
 }
 
 impl FailureWalk<'_> {
@@ -1585,36 +1573,38 @@ impl FailureWalk<'_> {
                 }
                 continue;
             }
-            errors += self.module(directive.path, &resolved);
-            if self.halted {
+            // A module still being walked is a cycle: reported, and this level stops
+            // and returns `1` for it, as for a missing module (jq 1.8.2, #7530).
+            if self.is_cycle(&resolved) {
                 return 1;
             }
+            errors += self.module(&resolved);
         }
         if let Some(file) = dot_jq {
-            errors += self.module("~/.jq", file);
-            if self.halted {
+            if self.is_cycle(file) {
                 return 1;
             }
+            errors += self.module(file);
         }
         errors
     }
 
+    /// Whether `file` is a module whose own directives are being walked; if so, reports
+    /// `circular import of` it, as jq 1.8.2's `process_dependencies` does when it finds the
+    /// resolved path loading (#7530).
+    fn is_cycle(&mut self, file: &Path) -> bool {
+        let canonical = canonical_or_self(file);
+        if self.chain.contains(&canonical) {
+            self.entries.push(ReportEntry::Cycle { path: canonical });
+            return true;
+        }
+        false
+    }
+
     /// jq's `load_library` for one module: what it adds to its includer's
     /// count.
-    fn module(&mut self, as_written: &str, file: &Path) -> usize {
+    fn module(&mut self, file: &Path) -> usize {
         let canonical = canonical_or_self(file);
-        if let Some(at) = self.chain.iter().position(|(seen, _)| *seen == canonical) {
-            // From the repeat, as the loader names it (see
-            // `ModuleLoader::load_and_bind_module`).
-            let mut chain: Vec<String> = self.chain[at..]
-                .iter()
-                .map(|(_, written)| written.clone())
-                .collect();
-            chain.push(as_written.to_string());
-            self.entries.push(ReportEntry::Cycle { chain });
-            self.halted = true;
-            return 1;
-        }
         if self.visited.contains(&canonical) {
             return 0;
         }
@@ -1628,20 +1618,14 @@ impl FailureWalk<'_> {
                 }));
                 1
             }
-            Ok(contents) => self.parsed_module(as_written, file, &canonical, contents),
+            Ok(contents) => self.parsed_module(file, &canonical, contents),
         };
         self.visited.insert(canonical);
         errors
     }
 
     /// [`Self::module`] for a module whose text was read.
-    fn parsed_module(
-        &mut self,
-        as_written: &str,
-        file: &Path,
-        canonical: &Path,
-        contents: String,
-    ) -> usize {
+    fn parsed_module(&mut self, file: &Path, canonical: &Path, contents: String) -> usize {
         match jq::parse_program(&contents) {
             // A module that does not parse counts once, and its own directives
             // are never reached.
@@ -1660,8 +1644,7 @@ impl FailureWalk<'_> {
                 1
             }
             Ok(program) => {
-                self.chain
-                    .push((canonical.to_path_buf(), as_written.to_string()));
+                self.chain.push(canonical.to_path_buf());
                 let origin = file
                     .parent()
                     .filter(|dir| !dir.as_os_str().is_empty())
@@ -1986,18 +1969,10 @@ impl ModuleLoader {
             })?;
 
         let canonical = canonical_or_self(&file_path);
-        if let Some(at) = self.loading.iter().position(|(seen, _)| *seen == canonical) {
-            // From the repeat, not from the bottom of the stack: the modules
-            // that merely *led* to the cycle are not part of it, and naming
-            // them makes the chain read as a longer cycle than it is. Loading
-            // `x` (which includes `ca`, which includes `cb`, which includes
-            // `ca`) reports `ca -> cb -> ca`, not `x -> ca -> cb -> ca`.
-            let mut chain: Vec<String> = self.loading[at..]
-                .iter()
-                .map(|(_, as_written)| as_written.clone())
-                .collect();
-            chain.push(module_path.to_string());
-            return Err(ModuleLoadError::single(ReportEntry::Cycle { chain }));
+        if self.loading.contains(&canonical) {
+            return Err(ModuleLoadError::single(ReportEntry::Cycle {
+                path: canonical,
+            }));
         }
 
         // Read and parse the module
@@ -2023,14 +1998,7 @@ impl ModuleLoader {
         }
 
         let own_id = self.run_id_for(target);
-        self.bind_parsed_module(
-            program,
-            &contents,
-            file_path,
-            canonical,
-            module_path,
-            own_id,
-        )
+        self.bind_parsed_module(program, &contents, file_path, canonical, own_id)
     }
 
     /// Resolve `~/.jq`'s own `include`/`import` directives and bind its defs to them, as
@@ -2056,7 +2024,6 @@ impl ModuleLoader {
             &dot.contents,
             dot.path,
             canonical,
-            "~/.jq",
             AUTO_LOAD_RUN_ID,
         )?;
         self.auto_loaded_defs = defs;
@@ -2071,10 +2038,9 @@ impl ModuleLoader {
         contents: &str,
         file_path: PathBuf,
         canonical: PathBuf,
-        as_written: &str,
         own_id: u32,
     ) -> Result<(FuncDefList, Vec<BTreeSet<String>>), ModuleLoadError> {
-        self.loading.push((canonical, as_written.to_string()));
+        self.loading.push(canonical);
         let deps = self.module_dep_defs(&program, own_id, &file_path);
         self.loading.pop();
         let (deps, data_bindings) = deps?;
@@ -2505,7 +2471,6 @@ impl ModuleLoader {
             visited: BTreeSet::new(),
             chain: Vec::new(),
             entries: Vec::new(),
-            halted: false,
         };
         let directives = directives_of(program, &self.prog_origin, &self.jq_origin);
         let errors = walk.directives(&directives, self.dot_jq_path.as_deref());
