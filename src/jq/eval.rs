@@ -21222,7 +21222,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::Trunc => builtin_trunc::<W, S>(value, optional),
 
         // Phase 19: Type conversion
-        Builtin::ToBoolean => builtin_toboolean::<W>(value, optional),
+        Builtin::ToBoolean => builtin_toboolean::<W, S>(value, optional),
 
         // Phase 20: Iteration control extension
         Builtin::Skip(n_expr, expr) => builtin_skip::<W, S>(n_expr, expr, value, optional),
@@ -29629,7 +29629,7 @@ fn bn_to_decimal_string(bn: &[u8]) -> String {
 
 /// Builtin: toboolean - convert to boolean
 /// Accepts: true, false, "true", "false"
-fn builtin_toboolean<W: Clone + AsRef<[u64]>>(
+fn builtin_toboolean<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
@@ -29640,16 +29640,17 @@ fn builtin_toboolean<W: Clone + AsRef<[u64]>>(
                 "true" => QueryResult::Owned(OwnedValue::Bool(true)),
                 "false" => QueryResult::Owned(OwnedValue::Bool(false)),
                 _ if optional => QueryResult::None,
-                other => QueryResult::Error(EvalError::new(format!(
-                    "string ({other:?}) cannot be parsed as a boolean"
-                ))),
+                // jq's own wording (`jv_dump_string_trunc` of the string: JSON escapes, #7529).
+                other => QueryResult::Error(EvalError::cannot_parse_as_boolean(
+                    &OwnedValue::String(other.into()),
+                )),
             },
             Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::new(format!(
-            "{} cannot be parsed as a boolean",
-            type_name(&value)
+        // `null (null) cannot be parsed as a boolean`: the value is named, as for every jq type error.
+        _ => QueryResult::Error(EvalError::cannot_parse_as_boolean(&to_owned_lossy::<S, _>(
+            &value,
         ))),
     }
 }
@@ -114699,7 +114700,7 @@ fn builtin_trim<W: Clone + AsRef<[u64]>>(
             Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::new("trim requires string")),
+        _ => QueryResult::Error(EvalError::new("trim input must be a string")),
     }
 }
 
@@ -114715,7 +114716,7 @@ fn builtin_ltrim<W: Clone + AsRef<[u64]>>(
             Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::new("ltrim requires string")),
+        _ => QueryResult::Error(EvalError::new("trim input must be a string")),
     }
 }
 
@@ -114731,7 +114732,7 @@ fn builtin_rtrim<W: Clone + AsRef<[u64]>>(
             Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::new("rtrim requires string")),
+        _ => QueryResult::Error(EvalError::new("trim input must be a string")),
     }
 }
 
@@ -153241,7 +153242,7 @@ mod tests {
         // Non-string input errors.
         query!(b"1", "trim",
             QueryResult::Error(e) => {
-                assert_eq!(e.message, "trim requires string");
+                assert_eq!(e.message, "trim input must be a string");
             }
         );
     }
@@ -153265,7 +153266,7 @@ mod tests {
         // Non-string input errors.
         query!(b"1", "ltrim",
             QueryResult::Error(e) => {
-                assert_eq!(e.message, "ltrim requires string");
+                assert_eq!(e.message, "trim input must be a string");
             }
         );
     }
@@ -153289,7 +153290,7 @@ mod tests {
         // Non-string input errors.
         query!(b"1", "rtrim",
             QueryResult::Error(e) => {
-                assert_eq!(e.message, "rtrim requires string");
+                assert_eq!(e.message, "trim input must be a string");
             }
         );
     }
