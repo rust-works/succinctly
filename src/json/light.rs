@@ -141,10 +141,11 @@ impl<W: core::fmt::Debug> core::fmt::Debug for JsonIndex<W> {
 #[derive(Clone, Copy, Debug)]
 struct SeqHint {
     /// `u32::MAX` means "no previous lookup" -- a rank the index cannot hold,
-    /// since every constructor asserts `ib_len <= u32::MAX` (#188).
+    /// since every constructor holds the interest bits to `u32::MAX` (#188).
     rank: u32,
-    /// Fits: a `Some` from `ib_select1_from` is `< ib_len <= u32::MAX`.
-    pos: u32,
+    /// A text position, which passes `u32::MAX` in a text of 4 GiB or more
+    /// (#7537).
+    pos: usize,
 }
 
 impl SeqHint {
@@ -204,10 +205,11 @@ fn is_closer(b: u8) -> bool {
 /// Build cumulative popcount index for IB.
 /// Returns a vector where entry i = total 1-bits in words [0, i).
 ///
-/// The `u32` accumulator is safe because every constructor asserts
-/// `ib_len <= u32::MAX` (#188), and set bits <= ib_len. Widening to `u64`
-/// would double a hot per-word array (~6.25% of input) for inputs the index
-/// cannot represent anyway.
+/// The `u32` accumulator is safe because every constructor holds the set bits
+/// to `u32::MAX` ([`JsonIndex::MAX_COUNT`], #188, #7537): a text of up to
+/// `u32::MAX` bytes cannot have more, and a longer one is counted first.
+/// Widening to `u64` would double a hot per-word array (~6.25% of input) for
+/// inputs the index cannot represent anyway.
 fn build_ib_rank(words: &[u64]) -> Vec<u32> {
     let mut rank = Vec::with_capacity(words.len() + 1);
     fill_ib_rank(&mut rank, words);
@@ -225,6 +227,59 @@ fn fill_ib_rank(rank: &mut Vec<u32>, words: &[u64]) {
         cumulative += word.count_ones();
         rank.push(cumulative);
     }
+}
+
+/// Whether `words` has more set bits than [`JsonIndex::MAX_COUNT`] (#7537): counted in `u64`, for a
+/// text longer than `u32::MAX` bytes, before [`build_ib_rank`] counts them in `u32`.
+fn ones_exceed_max_count(words: &[u64]) -> bool {
+    let ones: u64 = words.iter().map(|w| u64::from(w.count_ones())).sum();
+    ones > JsonIndex::MAX_COUNT as u64
+}
+
+/// [`LineIndex::to_line_column`](crate::text::LineIndex::to_line_column) by a scan of `text`, for a
+/// text longer than a line index holds (#7537): the same line starts (one after every line break
+/// that has text after it) and the same answer for an offset past the end.
+fn scan_line_column(text: &[u8], offset: usize) -> (usize, usize) {
+    let (mut line, mut start, mut at) = (1, 0, 0);
+    while at < offset.min(text.len()) {
+        let width = crate::text::line_break::line_break_len(text, at);
+        if width == 0 {
+            at += 1;
+            continue;
+        }
+        at += width;
+        if at <= offset && at < text.len() {
+            line += 1;
+            start = at;
+        }
+    }
+    (line, offset - start + 1)
+}
+
+/// [`LineIndex::to_offset`](crate::text::LineIndex::to_offset) by a scan of `text`, as
+/// [`scan_line_column`] is for its sibling (#7537).
+fn scan_offset(text: &[u8], line: usize, column: usize) -> Option<usize> {
+    if column == 0 || line == 0 {
+        return None;
+    }
+    let (mut current, mut at) = (1, 0);
+    while current < line {
+        if at >= text.len() {
+            return None;
+        }
+        let width = crate::text::line_break::line_break_len(text, at);
+        if width == 0 {
+            at += 1;
+            continue;
+        }
+        at += width;
+        if at >= text.len() {
+            return None;
+        }
+        current += 1;
+    }
+    let offset = at + column - 1;
+    (offset < text.len()).then_some(offset)
 }
 
 /// The three heap buffers of a scalar bridge index (#4217): interest bits,
@@ -251,17 +306,62 @@ impl ScalarIndexParts {
 }
 
 impl JsonIndex<Vec<u64>> {
-    /// The longest text, in bytes, an index can hold: `u32::MAX`, just under 4 GiB (#188).
+    /// The longest text, in bytes, every index holds whatever it contains: `u32::MAX`, just under
+    /// 4 GiB (#188). A longer text is held when its counts are within [`Self::MAX_COUNT`]
+    /// ([`try_build`](Self::try_build), #7537).
     pub const MAX_TEXT_LEN: usize = u32::MAX as usize;
 
-    /// Whether [`build`](Self::build) accepts a text of `len` bytes, rather than panicking.
+    /// The most interest bits, and the most balanced-parentheses bits, an index holds: its rank
+    /// directories count both as `u32` (#188). A text of up to [`Self::MAX_TEXT_LEN`] bytes is
+    /// always within it. A longer one is within it unless it holds more than `u32::MAX / 2`
+    /// values, keys included, since each value has one interest bit and two parentheses: a text
+    /// of two bytes a value (`[0,0,...]`) passes that at 4 GiB (#7537).
+    pub const MAX_COUNT: usize = u32::MAX as usize;
+
+    /// Whether [`build`](Self::build) accepts every text of `len` bytes, rather than panicking.
     ///
-    /// The one definition of the ceiling every constructor asserts, so a caller that reads a
-    /// longer text some other way (`succinctly jq` reads a document of 4 GiB or more without an
-    /// index, #7425) asks the same question the assertion does.
+    /// A longer text may still be held: [`try_build`](Self::try_build) says (#7537).
     #[must_use]
     pub const fn can_index(len: usize) -> bool {
         len <= Self::MAX_TEXT_LEN
+    }
+
+    /// [`build`](Self::build), or `None` for a text whose interest bits or balanced parentheses
+    /// pass [`Self::MAX_COUNT`] (#7537). Only a text of more than [`Self::MAX_TEXT_LEN`] bytes
+    /// can, and only such a text pays for the count, after the scan.
+    #[must_use]
+    pub fn try_build(json: &[u8]) -> Option<Self> {
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        let semi = crate::json::simd::build_semi_index_standard(json);
+
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        let semi = crate::json::standard::build_semi_index(json);
+
+        let ib_len = json.len();
+
+        // Two bits per open; a malformed document short of closes gets them
+        // as zero words (#7482).
+        let mut bp_words = semi.bp;
+        let bp_bit_count = bp_len_supplying_missing_closes(&mut bp_words);
+        if !Self::can_index(ib_len)
+            && (bp_bit_count > Self::MAX_COUNT || ones_exceed_max_count(&semi.ib))
+        {
+            return None;
+        }
+
+        // Build cumulative popcount index for IB
+        let ib_rank = build_ib_rank(&semi.ib);
+
+        Some(Self {
+            ib: semi.ib,
+            ib_len,
+            ib_rank,
+            bp: BalancedParens::new(bp_words, bp_bit_count),
+            lines: OnceCell::new(),
+            seq_hint: Cell::new(SeqHint::NONE),
+            close_runs: RefCell::new(Vec::new()),
+            bridge_tokens: false,
+        })
     }
 
     /// Build a JSON index from JSON text.
@@ -275,41 +375,18 @@ impl JsonIndex<Vec<u64>> {
     ///
     /// # Panics
     ///
-    /// Panics if the input exceeds `u32::MAX` bytes (just under 4 GiB): the
-    /// IB rank directory stores cumulative counts as `u32` (#188). Larger
-    /// inputs would previously truncate silently.
+    /// Panics if the input's interest bits or balanced parentheses pass
+    /// [`Self::MAX_COUNT`]: the rank directories store cumulative counts as
+    /// `u32` (#188). Only an input of more than `u32::MAX` bytes (4 GiB) can
+    /// (#7537); [`try_build`](Self::try_build) answers `None` for one instead.
     pub fn build(json: &[u8]) -> Self {
-        assert!(
-            Self::can_index(json.len()),
-            "JsonIndex supports inputs up to u32::MAX (4294967295) bytes; got {} bytes (#188)",
-            json.len()
-        );
-        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-        let semi = crate::json::simd::build_semi_index_standard(json);
-
-        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-        let semi = crate::json::standard::build_semi_index(json);
-
-        let ib_len = json.len();
-
-        // Two bits per open; a malformed document short of closes gets them
-        // as zero words (#7482).
-        let mut bp_words = semi.bp;
-        let bp_bit_count = bp_len_supplying_missing_closes(&mut bp_words);
-
-        // Build cumulative popcount index for IB
-        let ib_rank = build_ib_rank(&semi.ib);
-
-        Self {
-            ib: semi.ib,
-            ib_len,
-            ib_rank,
-            bp: BalancedParens::new(bp_words, bp_bit_count),
-            lines: OnceCell::new(),
-            seq_hint: Cell::new(SeqHint::NONE),
-            close_runs: RefCell::new(Vec::new()),
-            bridge_tokens: false,
-        }
+        Self::try_build(json).unwrap_or_else(|| {
+            panic!(
+                "JsonIndex holds at most u32::MAX (4294967295) interest bits and balanced \
+                 parentheses; a text of {} bytes has more (#188, #7537)",
+                json.len()
+            )
+        })
     }
 
     /// [`build`](Self::build) for text the jq reindex bridge wrote
@@ -327,6 +404,16 @@ impl JsonIndex<Vec<u64>> {
         let mut index = Self::build(json);
         index.bridge_tokens = true;
         index
+    }
+
+    /// [`build_reindex`](Self::build_reindex), or `None` where
+    /// [`try_build`](Self::try_build) is (#7537).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn try_build_reindex(json: &[u8]) -> Option<Self> {
+        let mut index = Self::try_build(json)?;
+        index.bridge_tokens = true;
+        Some(index)
     }
 
     /// [`build_reindex`](Self::build_reindex) for bridge text that is exactly
@@ -357,11 +444,10 @@ impl JsonIndex<Vec<u64>> {
     /// or fewer always is after the first.
     ///
     /// Same contract as `build_reindex_scalar` for `len`.
+    ///
+    /// Any `len` is held: the index has one interest bit and one pair of
+    /// parentheses whatever the token's length (#7537).
     pub(crate) fn build_reindex_scalar_from(len: usize, parts: ScalarIndexParts) -> Self {
-        assert!(
-            Self::can_index(len),
-            "JsonIndex supports inputs up to u32::MAX (4294967295) bytes; got {len} bytes (#188)"
-        );
         let ScalarIndexParts {
             mut ib,
             mut ib_rank,
@@ -417,14 +503,14 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
     ///
     /// # Panics
     ///
-    /// Panics if `ib_len` exceeds `u32::MAX` bits (#188): the IB rank
-    /// directory stores cumulative counts as `u32`. (Pathological JSON can
-    /// also push `bp_len` past `u32::MAX` first; `BalancedParens` asserts its
-    /// own ceiling.)
+    /// Panics if `ib` has more than `u32::MAX` set bits (#188, #7537): the IB
+    /// rank directory stores cumulative counts as `u32`. Only an `ib_len` past
+    /// `u32::MAX` can. (`BalancedParens` asserts its own ceiling on `bp_len`.)
     pub fn from_parts(ib: W, ib_len: usize, bp: W, bp_len: usize) -> Self {
         assert!(
-            JsonIndex::can_index(ib_len),
-            "JsonIndex supports inputs up to u32::MAX (4294967295) bytes; got {ib_len} bits (#188)"
+            JsonIndex::can_index(ib_len) || !ones_exceed_max_count(ib.as_ref()),
+            "JsonIndex holds at most u32::MAX (4294967295) interest bits; {ib_len} bits have more \
+             (#188, #7537)"
         );
         // Build cumulative popcount index for IB
         let ib_rank = build_ib_rank(ib.as_ref());
@@ -535,8 +621,14 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
     ///
     /// O(log lines) via [`LineIndex`](crate::text::LineIndex), plus a one-off
     /// O(n) scan the first time either this or [`Self::to_offset`] is called.
+    ///
+    /// A text longer than [`LineIndex`](crate::text::LineIndex) holds (4 GiB or more) is scanned
+    /// on each call instead (#7537).
     #[inline]
     pub fn to_line_column(&self, offset: usize, text: &[u8]) -> (usize, usize) {
+        if !JsonIndex::can_index(text.len()) {
+            return scan_line_column(text, offset);
+        }
         self.ensure_lines(text).to_line_column(offset)
     }
 
@@ -547,8 +639,13 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
     ///
     /// `text` must be the JSON text the index was built from; the line index
     /// is derived from it on first use and cached (#228).
+    ///
+    /// A text of 4 GiB or more is scanned on each call, as for [`Self::to_line_column`] (#7537).
     #[inline]
     pub fn to_offset(&self, line: usize, column: usize, text: &[u8]) -> Option<usize> {
+        if !JsonIndex::can_index(text.len()) {
+            return scan_offset(text, line, column);
+        }
         self.ensure_lines(text).to_offset(line, column)
     }
 
@@ -661,17 +758,16 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
     pub fn ib_select1_sequential(&self, k: usize) -> Option<usize> {
         let last = self.seq_hint.get();
         if last.rank != u32::MAX && k == last.rank as usize {
-            return Some(last.pos as usize);
+            return Some(last.pos);
         }
         let hint = self.seed_word(k, last);
         let result = self.ib_select1_from(k, hint);
         if let Some(pos) = result {
-            // Both fit: a `Some` means `k < ones <= ib_len` and
-            // `pos < ib_len`, and every constructor asserts
-            // `ib_len <= u32::MAX` (#188).
+            // The rank fits: a `Some` means `k < ones`, and every
+            // constructor holds the ones to `u32::MAX` (#188, #7537).
             self.seq_hint.set(SeqHint {
                 rank: k as u32,
-                pos: pos as u32,
+                pos,
             });
         }
         result
@@ -694,7 +790,7 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
         let (from_rank, from_word) = if last.rank == u32::MAX {
             (0i64, 0i64)
         } else {
-            (i64::from(last.rank), i64::from(last.pos / 64))
+            (i64::from(last.rank), (last.pos / 64) as i64)
         };
         let delta = k as i64 - from_rank;
         // `delta * words` is at most 2^32 * 2^26 in magnitude; no overflow.
@@ -9143,8 +9239,8 @@ mod tests {
         assert_eq!(buf, "{a: .inf, b: -.inf}");
     }
 
-    /// #7425: the ceiling every constructor asserts, at its boundary. `succinctly jq` routes a
-    /// document by this answer, so a longer one is read without an index instead of panicking.
+    /// #7425: the length every index holds, at its boundary. A longer text is held when its
+    /// counts are within `MAX_COUNT` (#7537).
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn can_index_holds_up_to_u32_max_bytes_7425() {
@@ -9155,13 +9251,63 @@ mod tests {
         assert!(!JsonIndex::can_index(usize::MAX));
     }
 
+    /// #7537: the ceiling is the count of interest bits, not the length, so a length past
+    /// `u32::MAX` with few set bits is held. `ib_len` is a plain parameter, so this needs no 4 GiB
+    /// allocation.
     #[test]
-    #[should_panic(expected = "up to u32::MAX")]
     #[cfg(target_pointer_width = "64")]
-    fn test_from_parts_len_guard_panics() {
-        // ib_len is a plain parameter, so exercising the #188 guard needs no
-        // 4 GiB allocation.
-        let _ = JsonIndex::from_parts(vec![], u32::MAX as usize + 1, vec![], 0);
+    fn from_parts_holds_a_length_past_u32_max_with_few_interest_bits_7537() {
+        let index = JsonIndex::from_parts(vec![1u64], u32::MAX as usize + 1, vec![0b01], 2);
+        assert_eq!(index.ib_len(), u32::MAX as usize + 1);
+        assert_eq!(index.ib_select1(0), Some(0));
+        assert_eq!(index.ib_select1_sequential(0), Some(0));
+    }
+
+    /// #7537: the count ceiling at its boundary, `u32::MAX` set bits held and one more refused.
+    /// 512 MiB of words, so it runs with `large-tests` only.
+    #[test]
+    #[cfg(all(feature = "large-tests", target_pointer_width = "64"))]
+    fn the_interest_bit_count_ceiling_is_u32_max_7537() {
+        let mut words = vec![u64::MAX; (u32::MAX as usize).div_ceil(64)];
+        assert!(ones_exceed_max_count(&words));
+        *words.last_mut().unwrap() >>= 1;
+        assert!(!ones_exceed_max_count(&words));
+    }
+
+    /// #7537: the line/column answers for a text a line index cannot hold are the line index's
+    /// own, over every offset (and past the end) of texts with each kind of line break.
+    #[test]
+    fn the_scanned_line_columns_are_the_line_index_answers_7537() {
+        let texts: [&[u8]; 9] = [
+            b"",
+            b"a",
+            b"\n",
+            b"a\nb",
+            b"a\r\nb\rc\n",
+            b"\r\n\r\n",
+            b"{\n  \"a\": [1,\r\n 2]\n}\n",
+            b"\r\r\n\n\rx",
+            b"x\n\n\ny",
+        ];
+        for text in texts {
+            let lines = crate::text::LineIndex::build(text);
+            for offset in 0..text.len() + 3 {
+                assert_eq!(
+                    scan_line_column(text, offset),
+                    lines.to_line_column(offset),
+                    "{text:?} at {offset}"
+                );
+            }
+            for line in 0..6 {
+                for column in 0..text.len() + 3 {
+                    assert_eq!(
+                        scan_offset(text, line, column),
+                        lines.to_offset(line, column),
+                        "{text:?} at {line}:{column}"
+                    );
+                }
+            }
+        }
     }
 
     /// `from_parts`'s success path -- the loading-from-serialized-parts

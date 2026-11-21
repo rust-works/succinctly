@@ -4902,15 +4902,18 @@ struct RunIndex<'a> {
 }
 
 impl<'a> RunIndex<'a> {
+    /// `built` is `json`'s index when the caller built it already (a document of 4 GiB or more,
+    /// #7537).
     fn build(
         json: &[u8],
+        built: Option<JsonIndex>,
         held: &'a mut Option<JsonIndex>,
         last_of_its_run_or_window: bool,
     ) -> Self {
         // A previous window's last index is given back before this one is built.
         *held = None;
         Self {
-            index: Some(JsonIndex::build(json)),
+            index: Some(built.unwrap_or_else(|| JsonIndex::build(json))),
             hold_in: last_of_its_run_or_window.then_some(held),
         }
     }
@@ -6042,9 +6045,12 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     continue;
                 }
 
-                // #7425: a document no index can hold (4 GiB or more, a slurp of that much
-                // included) is read into a tree without one, and the program runs on the tree.
-                if !JsonIndex::can_index(json_bytes.len()) {
+                // #7537: a document of 4 GiB or more (a slurp of that much included) is indexed
+                // like any other unless it holds more than 2^31 values; #7425: one no index can
+                // hold is read into a tree without one, and the program runs on the tree.
+                let long_index = (!JsonIndex::can_index(json_bytes.len()))
+                    .then(|| JsonIndex::try_build(json_bytes));
+                if let Some(None) = long_index {
                     let at = ErrorAt::Fixed(locator.at(end));
                     evaluate_unindexable_document(
                         json_bytes,
@@ -6079,7 +6085,12 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 }
 
                 // Slow path: build index and evaluate expression
-                let index = RunIndex::build(json_bytes, &mut held_index, is_last_value);
+                let index = RunIndex::build(
+                    json_bytes,
+                    long_index.flatten(),
+                    &mut held_index,
+                    is_last_value,
+                );
                 // #5497: jq's parser refuses a document past its depth limit before any filter
                 // runs, and reads nothing after it, this file or any later one.
                 let source = if slurped.is_some() {
@@ -19038,13 +19049,12 @@ fn evaluate_input_streaming_via(
         }
         let doc = if preserve {
             let text = input.to_json_jq_preserve();
-            // #7425: no index holds a text of 4 GiB or more.
-            if !JsonIndex::can_index(text.len()) {
+            // #7425, #7537: no index holds a text of 4 GiB or more with more than 2^31 values.
+            let Some(index) = JsonIndex::try_build(text.as_bytes()) else {
                 return Some(jq::Control::Error(EvalError::resource_limit(
                     jq::index_ceiling_message(text.len()),
                 )));
-            }
-            let index = JsonIndex::build(text.as_bytes());
+            };
             InputDoc::Preserve(text, index)
         } else {
             match bridge_doc_of(input) {
@@ -21110,10 +21120,10 @@ fn json_document_to_owned_value(
     at: Option<&dyn Fn() -> (usize, usize)>,
     delimiters: Delimiters,
 ) -> core::result::Result<OwnedValue, EvalError> {
-    if !JsonIndex::can_index(bytes.len()) {
+    // #7537: a document of 4 GiB or more is indexed unless it holds more than 2^31 values.
+    let Some(index) = JsonIndex::try_build(bytes) else {
         return unindexable_document_value(bytes);
-    }
-    let index = JsonIndex::build(bytes);
+    };
     if let Some(at) = at {
         if let Some(message) =
             jq::jq_input_depth_fault(bytes, index.bp(), jq::InputSource::Stream, at)
@@ -29339,7 +29349,7 @@ mod tests {
         let json: &[u8] = b"[1,2,3]";
         let plain = JsonIndex::build(json);
 
-        let inner = RunIndex::build(json, &mut held, false);
+        let inner = RunIndex::build(json, None, &mut held, false);
         assert_eq!(inner.bp().len(), plain.bp().len());
         drop(inner);
         assert!(
@@ -29347,16 +29357,16 @@ mod tests {
             "a value that is not the last leaves nothing"
         );
 
-        drop(RunIndex::build(json, &mut held, true));
+        drop(RunIndex::build(json, None, &mut held, true));
         assert!(held.is_some(), "the last value leaves its index");
 
-        let next = RunIndex::build(json, &mut held, false);
+        let next = RunIndex::build(json, None, &mut held, false);
         assert!(next.root(json).value().is_array());
         drop(next);
         assert!(held.is_none(), "the next value gave it back first");
 
-        drop(RunIndex::build(json, &mut held, true));
-        drop(RunIndex::build(json, &mut held, true));
+        drop(RunIndex::build(json, None, &mut held, true));
+        drop(RunIndex::build(json, None, &mut held, true));
         assert!(
             held.is_some(),
             "two windows' last values: one held, not two"
@@ -30316,9 +30326,9 @@ mod tests {
             assert_eq!(
                 error.message,
                 format!(
-                    "Cannot index a value of {} bytes: the index holds at most 4294967295 bytes \
-                     (4 GiB), and the document is not plain JSON, which is all that is read \
-                     without an index",
+                    "Cannot index a value of {} bytes: the index holds at most 2147483647 values, \
+                     and the document is not plain JSON, which is all that is read without an \
+                     index",
                     unread.len()
                 ),
                 "{unread:.20}"
