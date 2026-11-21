@@ -5399,8 +5399,10 @@ mod stream_tests {
 
     fn whole_route(files: &[Vec<u8>]) -> Run {
         let mut raws: Vec<Vec<u8>> = files.to_vec();
-        strip_leading_json_bom(raws.iter_mut());
+        let cuts = strip_leading_json_bom(raws.iter_mut());
         let mut seams = stitch_json_file_seams(raws.iter_mut(), false, false);
+        // The mark jq's first read held, as `get_inputs` records it (#7569).
+        super::super::note_bom_leads(&mut seams, &cuts, raws.len());
         let raws: Vec<Vec<u8>> = raws
             .into_iter()
             .enumerate()
