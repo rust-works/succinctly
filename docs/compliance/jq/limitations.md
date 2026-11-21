@@ -1853,6 +1853,7 @@ the probes `assign_negative_index_oob`, `update_negative_index_oob` and
 Unlike the positive case above, `?` does not suppress this one —
 [#498](https://github.com/rust-works/succinctly/issues/498) — because it is a write-time
 bounds check, not a failure to collect the path.
+The path is still collected first, as jq's `reduce path(P)` does: what follows such an index runs against the `null` it reads, so `.[-2][]? = 0` on `[1]` names no path and is `[1]`, and `.[-2][] = 0` raises `Cannot iterate over null (null)` ([#7559](https://github.com/rust-works/succinctly/issues/7559)).
 
 A variable bound outside `reduce`/`foreach` and referenced from inside `UPDATE`/`EXTRACT`
 used to be a third, narrower gap, found reviewing
