@@ -1585,7 +1585,8 @@ The C-coded `halt_error/1` is bound the same way.
 `split`'s and `splits`' flags and `combinations`' count cannot be bound ahead of the call: jq reads them inside the array it collects (`[match($re; "g" + flags) | ...]`, `[range(n) | $dot]`), so every value lands in one array and `split(","; ("g", null))` is one split, not two.
 When such an argument holds a `?//`, its values are collected first, each followed by the step that can fail (`match($re; "g" + $f)`, `range($n; $n)`), where a failure still retries the bind, and the builtin then reads the values that survived.
 jq 1.8.2 retries the same way; its `splits` binds the flags as a `$flags` parameter since jqlang/jq#3260's refactor, which splits once per flags value, and 1.7.1 stays the reference for that.
-A `?//` inside the body of `with_entries(f)` or of `to_entries | map(f)` still does not retry a failure raised in `f` (`with_entries(select(has([1, "key"] as [$a] ?// [$b, $a] | $a)))` on `{"a":1}`): that route evaluates `f` its own way.
+`map(f)`, `with_entries(f)` and `walk(f)` whose `f` holds a `?//` are parsed as jq's own definitions of them since [#7602](https://github.com/rust-works/succinctly/issues/7602) (`def map(f): [.[] | f];`, `to_entries | map(f) | from_entries`, `walk`'s recursive `def`), with `f` a closure parameter as in jq, so its compile errors still hide under its block's.
+Their own element walks ran `f` where a builtin's refusal could not retry the bind: `["x"] | map(startswith([1, "x"] as [$a] ?// [$b, $a] | $a))` raised `startswith() requires string inputs` and `with_entries(select(has([1, "key"] as [$a] ?// [$b, $a] | $a)))` on `{"a":1}` raised too, where jq answers `[true]` and `{"a":1}`.
 
 ## `while`/`until` and a `?//` retry in `update` or `cond` (#3503, #3617)
 
