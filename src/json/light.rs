@@ -12374,7 +12374,7 @@ mod tests {
             br#"{"a"}"#.as_slice(),
             br#"{"a":@}"#.as_slice(),
             br#"{"a":,}"#.as_slice(),
-            br#"{:1}"#.as_slice(),
+            br"{:1}".as_slice(),
         ] {
             let index = JsonIndex::build(json);
             let root = index.root(json);

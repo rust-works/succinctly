@@ -19,7 +19,7 @@ const BAD: &[(&str, &str, usize)] = &[
     (r#"{"a"}"#, "Objects must consist of key:value pairs", 5),
     (r#"{"a":@}"#, "Invalid numeric literal", 7),
     (r#"{"a":,}"#, "Expected value before ','", 6),
-    (r#"{:1}"#, "Expected string key before ':'", 2),
+    ("{:1}", "Expected string key before ':'", 2),
 ];
 
 /// A filter that reads the object's members by name, and what jq prints for it on `{}` and on
