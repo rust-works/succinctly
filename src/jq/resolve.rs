@@ -64,7 +64,10 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use super::eval::pattern_alternatives_var_names;
-use super::parser::{is_value_arg_var, join_expr_operands_mut, JOIN_IDX_VAR};
+use super::parser::{
+    is_collected_arg_var, is_value_arg_var, join_expr_operands_mut, restore_collected_arg_call,
+    take_collected_arg_call, JOIN_IDX_VAR,
+};
 use super::walk::{any_subexpr, builtin_kids, map_builtin_subexprs, BuiltinKids};
 use super::{Builtin, Expr, ObjectKey, Pattern, StringPart};
 
@@ -2569,14 +2572,19 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
         // #7474: a builtin call whose arguments the parser bound first.
         Expr::As { var, .. } if is_value_arg_var(var) => check_bound_value_args(expr, cx, reachable),
 
+        // #7558: a builtin call whose collected argument the parser settled first, checked as
+        // the call it was written as.
+        Expr::As { var, .. } if is_collected_arg_var(var) => match take_collected_arg_call(expr) {
+            Some(mut call) => {
+                check(&mut call, cx, reachable);
+                restore_collected_arg_call(expr, call);
+            }
+            None => check_as_binding(expr, cx, reachable),
+        },
+
         // #2734: binds `var` in `body` only, not `expr` -- `.foo as $x | ...`
         // evaluates `.foo` before `$x` exists.
-        Expr::As { expr, var, body } => {
-            check(expr, cx, reachable);
-            cx.var_scope.push(var.clone());
-            check(body, cx, reachable);
-            cx.var_scope.pop();
-        }
+        Expr::As { .. } => check_as_binding(expr, cx, reachable),
 
         // #2734: `patterns` is every `?//`-alternative (usually just one);
         // jq requires each alternative bind the same variable set, so the
@@ -3090,6 +3098,17 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
             cx.reorder_reversed(&marks);
         }
     }
+}
+
+/// [`check`] for `.foo as $x | body`: `var` is bound in `body` only (#2734).
+fn check_as_binding(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
+    let Expr::As { expr, var, body } = expr else {
+        unreachable!("called on an `as` binding"); // patchcov: coverage tolerate-line reason="unreachable: both callers match Expr::As first"
+    };
+    check(expr, cx, reachable);
+    cx.var_scope.push(var.clone());
+    check(body, cx, reachable);
+    cx.var_scope.pop();
 }
 
 /// [`check`] for `B(a; b)` that `parser::bind_value_args` parsed as `b as $v | a as $u | B($u;

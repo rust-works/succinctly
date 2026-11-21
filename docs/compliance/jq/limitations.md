@@ -1614,6 +1614,15 @@ What it leaves:
 - **A shadowed builtin name** (`def ltrimstr(x): ...` anywhere in the program) leaves every call to it as written, as above.
 - **Where jq never answers** (`sub("a"; repeat("X"))`, `split("a"; repeat(""))`, `sort_by(repeat(.))`), succinctly still raises its `repeat: maximum iterations exceeded` cap.
 
+## `in`, `halt_error` and a collected argument with a `?//` (#7558)
+
+The C-coded `halt_error/1` is bound the same way.
+`in(xs)` whose argument holds a `?//` is parsed as its definition, `. as $x | xs | has($x)`, which binds the input before the argument runs (so #2202's order of an argument's error against an undecodable input stays as it was), and `"a" | in([[1], {"a":1}] as [$a] ?// [$b, $a] | $a)` retries `has`'s refusal of `[1]` and answers `true`, as jq does.
+`split`'s and `splits`' flags and `combinations`' count cannot be bound ahead of the call: jq reads them inside the array it collects (`[match($re; "g" + flags) | ...]`, `[range(n) | $dot]`), so every value lands in one array and `split(","; ("g", null))` is one split, not two.
+When such an argument holds a `?//`, its values are collected first, each followed by the step that can fail (`match($re; "g" + $f)`, `range($n; $n)`), where a failure still retries the bind, and the builtin then reads the values that survived.
+jq 1.8.2 retries the same way; its `splits` binds the flags as a `$flags` parameter since jqlang/jq#3260's refactor, which splits once per flags value, and 1.7.1 stays the reference for that.
+A `?//` inside the body of `with_entries(f)` or of `to_entries | map(f)` still does not retry a failure raised in `f` (`with_entries(select(has([1, "key"] as [$a] ?// [$b, $a] | $a)))` on `{"a":1}`): that route evaluates `f` its own way.
+
 ## `while`/`until` and a `?//` retry in `update` or `cond` (#3503, #3617)
 
 A `?//` in the `update` or the `cond` of `while(cond; update)` / `until(cond; update)` retries past
