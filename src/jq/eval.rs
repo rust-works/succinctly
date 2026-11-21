@@ -107527,6 +107527,13 @@ fn delete_path_steps(
 
 // Phase 12: Additional builtins
 
+/// jq's `now` reading of a clock: `tv_sec + tv_usec / 1000000.0` from `gettimeofday`, so whole microseconds on every
+/// platform. `Duration::as_secs_f64` keeps the nanoseconds a Linux clock has, which jq never prints (#7484).
+#[cfg(feature = "std")]
+fn unix_seconds_in_microseconds(since_epoch: std::time::Duration) -> f64 {
+    since_epoch.as_secs() as f64 + f64::from(since_epoch.subsec_micros()) / 1_000_000.0
+}
+
 /// Builtin: now - current Unix timestamp
 ///
 /// yq's `now` is a `!!timestamp`: RFC 3339 text in the local zone, with no fraction (#5863).
@@ -107538,7 +107545,9 @@ fn builtin_now<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>() -> QueryResult<'
             Ok(duration) if S::TAG == EvalTag::Yq => QueryResult::Owned(OwnedValue::String(
                 super::yq_datetime::now(duration.as_nanos() as i128).into(),
             )),
-            Ok(duration) => QueryResult::Owned(OwnedValue::Float(duration.as_secs_f64())),
+            Ok(duration) => {
+                QueryResult::Owned(OwnedValue::Float(unix_seconds_in_microseconds(duration)))
+            }
             Err(_) => QueryResult::Error(EvalError::new("failed to get current time")),
         }
     }
@@ -165824,6 +165833,22 @@ mod tests {
     }
 
     // Phase 12 tests: Additional builtins
+
+    /// #7484: a clock reading is cut to whole microseconds, as jq's `gettimeofday` one is, and the nanoseconds
+    /// (`as_secs_f64` kept them: 1795225997.4185658 against jq's 1795225997.418565) are dropped, not rounded.
+    #[cfg(feature = "std")]
+    #[test]
+    fn now_is_a_whole_number_of_microseconds_7484() {
+        use std::time::Duration;
+        let reading = Duration::new(1_795_225_997, 418_565_899);
+        assert_ne!(reading.as_secs_f64(), 1_795_225_997.418_565);
+        assert_eq!(unix_seconds_in_microseconds(reading), 1_795_225_997.418_565);
+        assert_eq!(
+            unix_seconds_in_microseconds(Duration::new(5, 999_999_999)),
+            5.999_999
+        );
+        assert_eq!(unix_seconds_in_microseconds(Duration::new(7, 0)), 7.0);
+    }
 
     #[test]
     fn test_now() {
