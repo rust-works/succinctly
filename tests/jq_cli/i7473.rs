@@ -1,7 +1,8 @@
-//! #7473: an `until`/`while`/`last(while)` round that adds an entry to an object in its state under a
+//! #7473: an `until`/`while` round that adds an entry to an object in its state under a
 //! key read off the state (`.p["k\(.i)"] = 1`, `(.i|tostring) as $cs | .p[$cs] = ..`) fell to the
 //! evaluator's route every round, which re-indexed and rebuilt the whole state: quadratic in the rounds
-//! where jq 1.7.1 is linear. The owned loop step now reads such a key off the tree: a string
+//! where jq 1.7.1 is linear. The `last(while ...)` rows pin jq's output only: that shape still copies the
+//! state every round and stays quadratic. The owned loop step now reads such a key off the tree: a string
 //! interpolation whose slots are scalars read off the state, and `READ | tostring` of one. These rows pin
 //! the answers -- every key shape over every kind of scalar the state holds (a float literal, a big
 //! integer, an infinity, a string with an escape, `null`, a boolean), a container slot and a raising or

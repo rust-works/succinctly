@@ -63866,6 +63866,8 @@ mod tests {
                 r#"[{i:0,p:{}} | while(.i<50; .p["k\(.i)"]=1 | .i += 1)] | [length, (.[-1].p|length)]"#,
                 "[50,49]",
             ),
+            // `last(while ...)` re-indexes no round either, but it still copies the state every round
+            // and stays quadratic (#7473); this row pins the reindex count and jq's output only.
             (
                 r#"{i:0,p:{}} | last(while(.i<50; .p["k\(.i)"]=1 | .i += 1)) | [.i, (.p|length)]"#,
                 "[49,49]",
