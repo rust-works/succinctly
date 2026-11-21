@@ -53814,9 +53814,9 @@ mod tests {
             }
         }
         for json in &good {
-            let owned = run::<YqSemantics>(json)
-                .unwrap_or_else(|e| panic!("{json}: {e}"))
-                .expect("one result");
+            let answer = run::<YqSemantics>(json);
+            assert!(answer.is_ok(), "{json}: {answer:?}");
+            let owned = answer.unwrap().expect("one result");
             let keys: Vec<String> = owned
                 .as_array()
                 .expect("an array")

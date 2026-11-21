@@ -144163,6 +144163,13 @@ mod tests {
         query!(br"[1 2, 3]", "map_values(.+1)",
             QueryResult::Error(_) => {}
         );
+        // #7406: yq mode takes its own field list, and raises on the same members.
+        yq_query!(br#"{"a" 1, "b": 2}"#, "map_values(. + 1)",
+            QueryResult::Error(_) => {}
+        );
+        yq_query!(br#"{"a": 1, "b": 2,}"#, "map_values(. + 1)",
+            QueryResult::Error(_) => {}
+        );
         // Positive control: a well-formed array is unaffected.
         query!(br"[1, 2, 3]", "map_values(.+1)",
             QueryResult::Owned(OwnedValue::Array(arr)) => assert_eq!(arr.len(), 3)
