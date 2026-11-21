@@ -1900,6 +1900,14 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
             fields = rest;
             index += 1;
         }
+        // #7448: a list the walk stopped on with a child still in hand ends on an
+        // unpaired one. Behind a member the trailing-gap check below also
+        // refuses it, but the lone child of a one-member `{"a":}`, `{"a"}` or
+        // `{:1}` leaves no last value to check, so the lookup answered `null`.
+        // O(1): a list that ran out holds no child.
+        if fields.ends_unpaired() {
+            return Err(fields.malformed_member_error());
+        }
         // STYLE-0013: `preceding_gap_ok` directly, not `key_delimiter_ok`/
         // `value_delimiter_ok` -- both take `is_first`/`text_start` from an
         // already-decoded key/value, but this walk only knows `key_start`
@@ -2013,6 +2021,10 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
             fields = rest;
             index += 1;
         }
+        // #7448: the unpaired lone child of a one-member object, as in `find`.
+        if fields.ends_unpaired() {
+            return (Err(fields.malformed_member_error()), 0);
+        }
         // STYLE-0013: same reason as `find`'s own exemption -- only
         // `key_start` (captured when a candidate becomes `winner`) is kept,
         // and the check is deferred to the last-write-wins field alone.
@@ -2087,6 +2099,10 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
             last_value_cursor = Some(field.value_cursor());
             fields = rest;
             index += 1;
+        }
+        // #7448: the unpaired lone child of a one-member object, as in `find`.
+        if fields.ends_unpaired() {
+            return (Err(fields.malformed_member_error()), 0);
         }
         // STYLE-0013: as `find_cursor_counted`'s own exemption -- only each winner's `key_start` is
         // kept, and the check is deferred to the last-write-wins field of each name alone.
@@ -12369,6 +12385,46 @@ mod tests {
                 .find("a")
                 .unwrap_or_else(|e| panic!("{json:?}: {e:?}"));
             assert!(value.is_some(), "{json:?}: expected to find `a`");
+        }
+    }
+
+    /// #7448: the three name walks raise on a one-member object whose lone
+    /// child has no partner, for the name it holds and for any other. There
+    /// is no last value behind it for the trailing-gap check to read, so this
+    /// answered `Ok(None)`.
+    #[test]
+    fn test_find_walks_reject_a_lone_unpaired_child_7448() {
+        for json in [
+            br#"{"a":}"#.as_slice(),
+            br#"{"a"}"#.as_slice(),
+            br#"{"a":@}"#.as_slice(),
+            br#"{"a":,}"#.as_slice(),
+            br"{:1}".as_slice(),
+        ] {
+            let index = JsonIndex::build(json);
+            let root = index.root(json);
+            let StandardJson::Object(fields) = root.value() else {
+                panic!("{json:?}: expected object");
+            };
+            assert!(fields.ends_unpaired(), "{json:?}");
+            for name in ["a", "b"] {
+                let find = fields.find(name).map(|v| v.is_some());
+                let cursor = fields.find_cursor_counted(name).0.map(|c| c.is_some());
+                let mut found = [None];
+                let several = fields.find_cursors_counted(&[name], &mut found).0;
+                for (walk, err) in [
+                    ("find", find.err()),
+                    ("find_cursor_counted", cursor.err()),
+                    ("find_cursors_counted", several.err()),
+                ] {
+                    let err = err.unwrap_or_else(|| panic!("{json:?} {walk}({name}) answered"));
+                    assert!(
+                        err.message.contains("Invalid JSON text"),
+                        "{json:?} {walk}: {}",
+                        err.message
+                    );
+                }
+            }
         }
     }
 
