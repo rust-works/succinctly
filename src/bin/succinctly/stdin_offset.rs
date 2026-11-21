@@ -16,6 +16,7 @@
 //! early.
 
 #![allow(unsafe_code)] // `read`, `fstat`, `lseek` and `pread` on descriptor 0
+#![cfg_attr(not(unix), allow(dead_code))] // only Unix descriptors have an offset to put back
 
 use std::cell::Cell;
 
@@ -95,8 +96,8 @@ pub(crate) struct Stdin;
 impl std::io::Read for Stdin {
     #[cfg(unix)]
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        // macOS refuses a count above `INT_MAX`.
-        let len = buf.len().min(i32::MAX as usize >> 1);
+        // macOS refuses a count above `INT_MAX`, as Rust's own standard input allows for.
+        let len = buf.len().min(i32::MAX as usize - 1);
         // SAFETY: `buf` is valid for writes of `len` bytes.
         let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), len) };
         if n < 0 {
@@ -113,7 +114,7 @@ impl std::io::Read for Stdin {
 
     #[cfg(not(unix))]
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        std::io::stdin().read(buf)
+        std::io::Read::read(&mut std::io::stdin(), buf)
     }
 }
 
@@ -139,6 +140,8 @@ pub(crate) fn restore() {
         origin,
         read,
     );
+    #[cfg(not(unix))]
+    let _ = (run.items, origin, read);
 }
 
 #[cfg(unix)]
