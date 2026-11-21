@@ -7285,7 +7285,7 @@ The answer is jq's for a plain document, which nearly every large document is: `
 
 Three cases are refused with an error at exit 5 where jq answers, a known limitation rather than one of ADR-0018's permitted divergences:
 
-- A document that is not plain RFC 8259 JSON: a repeated key, a `\u` surrogate escape, a jq leniency such as `nan` or `007`, or nesting past 128 levels.
+- A document that is not plain RFC 8259 JSON: a repeated key, a lone low `\u` surrogate escape (jq reads it as U+FFFD), a jq leniency such as `nan` or `007`, or nesting past 128 levels.
   The one-pass reader declines these, and the route that reads them needs the index.
   The message is `Cannot index a value of N bytes: the index holds at most 4294967295 bytes (4 GiB), and the document is not plain JSON, which is all that is read without an index`.
 - A program whose stage the owned evaluator answers only by indexing a value of 4 GiB or more (its reindex bridge): `Cannot index a value of N bytes: the index holds at most 4294967295 bytes (4 GiB)`.

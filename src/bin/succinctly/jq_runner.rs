@@ -20313,8 +20313,8 @@ fn json_document_to_owned_value_checked(
 /// indexed route does, and nearly every large document is such text. What it declines is either a
 /// fault jq's parser meets (its depth limit included), returned as the decode failure the indexed
 /// route returns for a malformed document, so a caller words it as it words that one; or text jq
-/// reads that only the indexed route reads (a repeated key, a surrogate escape, `nan`, nesting past
-/// 128 levels), refused with a resource-limit error, a divergence recorded in
+/// reads that only the indexed route reads (a repeated key, a lone low surrogate escape, `nan`,
+/// nesting past 128 levels), refused with a resource-limit error, a divergence recorded in
 /// `docs/compliance/jq/limitations.md`.
 fn unindexable_document_value(bytes: &[u8]) -> core::result::Result<OwnedValue, EvalError> {
     if let Some(value) = core::str::from_utf8(bytes).ok().and_then(jq::parse_plain) {
@@ -29216,6 +29216,7 @@ mod tests {
             "{\"a\":tru}".to_string(),
             "[1,,2]".to_string(),
             "[\"\\q\"]".to_string(),
+            r#"["\ud83d"]"#.to_string(),
             deep(10_001),
         ] {
             let error = unindexable_document_value(malformed.as_bytes()).expect_err("malformed");
@@ -29223,7 +29224,8 @@ mod tests {
         }
         for unread in [
             r#"{"a":1,"a":2}"#.to_string(),
-            r#"["\ud83d\ude00"]"#.to_string(),
+            // A lone low half: jq reads it as U+FFFD (a lone high half is a fault it reports).
+            r#"["\udc00"]"#.to_string(),
             "[nan]".to_string(),
             "[007]".to_string(),
             deep(200),
