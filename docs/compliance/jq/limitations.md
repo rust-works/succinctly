@@ -13696,6 +13696,15 @@ A mark cut across the first files (`EF BB` in one and `BF [2]` in the next, or a
 The routes that read several files a window at a time skip a mark at the front of the first file with bytes only, so a list whose first file with bytes is only the start of the mark is read whole, which joins it.
 The stream routes word their first fault through `jq_stream_fault`, which does not look for a partial BOM; closing that is a separate change.
 
+### A leading BOM is read in jq's first 4,095-byte read, as jq 1.7.1 reads it; jq 1.8.2 reads 4,091 bytes (#7569)
+
+`input_line_number` and the line of `(at FILE:N)` count the line breaks jq's `fgets` has read, 4,095 bytes at a time along a line, so a value on a line longer than a read is counted with the next line's break once the read that holds that break has been made.
+jq's parser skips a UTF-8 byte-order mark at the front of the stream, but `fgets` reads it, so the mark is three of the first read's bytes and the reads of the first line start 3 bytes earlier in its text than they would without it.
+`succinctly jq` counts the reads that way on every route (`Seam::lead` on the routes that read the files whole or a window at a time, the stream reader's first chunk of a source), and a mark cut across files (#7566) is part of the first read of each file that holds a byte of it.
+Before #7569 the reads were counted from the text after the mark, so `printf '\xef\xbb\xbf'` and 2,048 `1 ` values, a line break, `2` and a line break printed `input_line_number` 0 for 2,047 values and 1 for one, where jq 1.7.1 prints 0 for 2,046 and 1 for two.
+jq 1.8.2 reads 4,091 bytes at a time, and up to three more to finish a character, so on a line longer than that its counts differ from 1.7.1's with or without a mark (the same input is 0 for 2,044 values and 1 for four); that is a change of its read size, so 1.7.1 stays the reference.
+Pinned by `tests/jq_cli/i7569.rs`.
+
 ### A malformed nested number raises when read; jq rejects the document (#966, #3034, #3222) — accepted uniform divergence
 
 A number *inside* an array or object is recovered by a greedy span (`[0-9.eE+-]`, plus
