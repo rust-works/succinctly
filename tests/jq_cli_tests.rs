@@ -70910,11 +70910,12 @@ fn test_argument_navigation_raises_on_an_untracked_value_2746() -> Result<()> {
 /// boundary, and unlike `first`/`limit`/`nth`, which forward the argument's
 /// own live path. A genuinely empty generator raises nothing at all, since
 /// none of the three ever navigate anything in that case. Captured live
-/// from jq 1.7.1.
+/// from jq 1.7.1, except `last(f)` of an empty `f`, which is jq 1.8.2's (#7518): it yields
+/// nothing, so there is no path to refuse and no value (1.7.1 folded to a `null`, which it
+/// rejected as `Invalid path expression with result null`).
 #[test]
 fn test_argument_navigation_builtins_forward_a_computed_result_2746() -> Result<()> {
     for (filter, result) in [
-        ("path(last(.[]))", "result null"),
         ("path(isempty(.[]))", "result true"),
         ("path(INDEX(.[]; .))", "result {}"),
     ] {
@@ -70925,10 +70926,12 @@ fn test_argument_navigation_builtins_forward_a_computed_result_2746() -> Result<
             "{filter}: {stderr:?}"
         );
     }
+    let (stdout, stderr, code) = run_jq_full(&["-c", "path(last(.[]))"], Some("{}"))?;
+    assert_eq!((stdout.as_str(), stderr.as_str(), code), ("", "", 0));
     // Not discarded, and not navigated by `path()` at all: plain value mode
     // on the same empty-generator inputs is unaffected.
     for (filter, expected) in [
-        ("last(.[])", "null"),
+        ("last(.[])", ""),
         ("isempty(.[])", "true"),
         ("INDEX(.[]; .)", "{}"),
     ] {
@@ -84165,7 +84168,8 @@ fn test_path_register_last_f_does_not_move_it_3643() -> Result<()> {
         ("[1,2,3]", r"path(. as $x | last(.[]) | $x)", "[]\n", "", 0),
         (doc, r"path(. as $x | last(.a | .b?) | $x)", "[]\n", "", 0),
         (doc, r"path(. as $x | last(first(.a)) | $x)", "[]\n", "", 0),
-        (doc, r"path(. as $x | last(empty) | $x)", "[]\n", "", 0),
+        // jq 1.8.2 (#7518): `last(empty)` yields nothing, so there is no path; 1.7.1 said `[]`.
+        (doc, r"path(. as $x | last(empty) | $x)", "", "", 0),
         (doc, r"path(. as $x | (last(.a)) | $x)", "[]\n", "", 0),
         // A node below the root: the register stays on `.a`, so `$x` frozen
         // there re-establishes it.
@@ -84792,13 +84796,8 @@ fn test_path_register_last_f_keeps_the_identity_of_its_output_3766() -> Result<(
             "Invalid path expression with result 1",
             5,
         ),
-        (
-            doc,
-            r"path(last(empty))",
-            "",
-            "Invalid path expression with result null",
-            5,
-        ),
+        // jq 1.8.2 (#7518): no output, no path; 1.7.1 raised on the `null` it made up.
+        (doc, r"path(last(empty))", "", "", 0),
         (
             doc,
             r"path(. as $x | last(.a) | .a)",
@@ -97494,7 +97493,8 @@ fn test_walk_residue_constructs_jq_2416() -> anyhow::Result<()> {
         ("limit(0; .[]) | key", "", 0),
         ("last(.[]) | key", "\"u\"", 0),
         ("last(empty) | key", "", 0),
-        ("last(empty) | path", "[]", 0),
+        // jq 1.8.2 (#7518): nothing reaches `path`; 1.7.1's made-up `null` stood at the input.
+        ("last(empty) | path", "", 0),
         ("(.[], empty) | key", "\"a\"
 \"c\"
 \"n\"
