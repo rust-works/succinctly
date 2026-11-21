@@ -13211,9 +13211,9 @@ impl<'a> LineCounter<'a> {
     /// The read holding `at`, a byte inside the bytes moved onto this file from the previous
     /// ones (#4376), which only a value or fault after a resumed fault can be in: the line jq has
     /// counted through the end of that read, and where it ends. Those bytes are the earlier
-    /// files', so the read ends at the next newline or at the end of the file `at` is in, which
-    /// is the seam when it is the last (#5936); jq has counted that file's lines. `None` outside
-    /// the moved bytes.
+    /// files', so the read ends at the next newline, [`JQ_READ_CHUNK`] bytes from the start of
+    /// its line, or the end of the file `at` is in, which is the seam when it is the last (#5936);
+    /// jq has counted that file's lines. `None` outside the moved bytes.
     fn moved_read(&self, at: usize) -> Option<(usize, usize)> {
         let base = self.seam.base.min(self.bytes.len());
         if at >= base {
@@ -13221,10 +13221,18 @@ impl<'a> LineCounter<'a> {
         }
         let (start, part) = self.seam.part_at(at);
         let end = part.end.min(base);
-        let read_end = self.bytes[at..end]
+        // A read is [`JQ_READ_CHUNK`] bytes at most, counted from the start of the line, as
+        // [`read_end`](Self::read_end) counts it for this file's own bytes (#7573): a fault in the
+        // first 4095 bytes of a long first line is met before that line's break is read.
+        let line_start = self.bytes[start..at]
             .iter()
-            .position(|&b| b == b'\n')
-            .map_or(end, |newline| at + newline + 1);
+            .rposition(|&b| b == b'\n')
+            .map_or(start, |newline| start + newline + 1);
+        let chunk_end = line_start + ((at - line_start) / JQ_READ_CHUNK + 1) * JQ_READ_CHUNK;
+        let read_end = match self.bytes[at..end].iter().position(|&b| b == b'\n') {
+            Some(newline) if at + newline < chunk_end => at + newline + 1,
+            _ => chunk_end.min(end),
+        };
         Some((
             part.lines + count_newlines(&self.bytes[start..read_end]),
             read_end,
