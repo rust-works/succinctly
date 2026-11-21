@@ -11319,6 +11319,87 @@ is still flushed as it is written. Pinned by `test_print_json_writes_no_partial_
 
 ## Deliberate divergences (ADR-0018 rule 4)
 
+### jq 1.8's hard limits are not adopted (#7526, #7540, #7541, #7527, #7500)
+
+jq 1.8.x added fixed limits to protect its C implementation: a depth cap on its recursive value walks, signed 32-bit string and token lengths, a digit count, and a parameter count.
+Each is a security fix upstream, and each refuses an input that jq 1.7.1 takes (and that 1.7.1 often crashes on).
+`succinctly jq` is written in Rust with 64-bit sizes and answers every one of these inputs correctly, with no crash and no hang.
+The repo owner decided on 2026-11-21 not to adopt any of them.
+Each is a recorded, deliberate divergence from jq 1.8.2 and, where 1.7.1 crashes or misbehaves on the same input, from 1.7.1 as well (ADR-0018 rule 4: a reference that takes the process down is not matched).
+The reason is the same for all five: the caps guard a C implementation's memory safety, succinctly answers these inputs correctly, so refusing them would remove capability with no safety gain.
+Not covered here, and still open: the regex group nesting limit (#7528, where succinctly is stricter than both jq versions), the error wording of #7525, #7530 and #7536, and the NaN payload of #7522.
+
+**Depth: 10,000 levels (#7526).**
+jq 1.8.2 refuses a value or a path deeper than 10,000 levels in these consumers, with a message each:
+
+| Consumer                                                                                               | jq 1.8.2 message             | Upstream       |
+|--------------------------------------------------------------------------------------------------------|------------------------------|----------------|
+| `==`, `!=`, `index`/`indices` of a deep array (`jv_equal`)                                             | `Equality check too deep`    | CVE-2026-47770 |
+| `<`, `sort`, `unique`, `group_by`, `min` (`jv_cmp`)                                                    | `Comparison too deep`        | CVE-2026-47770 |
+| `contains`, `inside`                                                                                   | `Containment check too deep` | CVE-2026-40612 |
+| recursive object merge `*`                                                                             | `Object merge too deep`      | CVE-2026-43896 |
+| `setpath`, `getpath`, `delpaths` with a path longer than 10,000, and `tostream` (which uses `getpath`) | `Path too deep`              | CVE-2026-33947 |
+
+The caps are macros of 10,000 each (`MAX_EQUAL_DEPTH`, `MAX_CMP_DEPTH`, `MAX_CONTAINS_DEPTH`, `MAX_OBJECT_MERGE_DEPTH`, `MAX_PATH_DEPTH`); all five are in jq 1.8.2's NEWS under "Security fixes".
+At exactly 10,000 levels all three tools agree.
+At 10,001 and 20,000 levels, captured on this change (a value built by `reduce range(N) as $_ ([]; [.])`, `{a: .}` for the merge), jq 1.7.1 and `succinctly jq` answer alike and jq 1.8.2 refuses:
+
+| Program, N = 10,001 or 20,000                                   | jq 1.7.1    | jq 1.8.2                       | `succinctly jq` |
+|-----------------------------------------------------------------|-------------|--------------------------------|-----------------|
+| `$x == $y` over two N-deep arrays                               | `true`      | `"Equality check too deep"`    | `true`          |
+| `[$x, $y] \| sort \| length`, `$x < $y`                         | `2`, `true` | `"Comparison too deep"`        | `2`, `true`     |
+| `$x \| contains($x)`                                            | `true`      | `"Containment check too deep"` | `true`          |
+| `$o * $o \| length` over two N-deep objects                     | `1`         | `"Object merge too deep"`      | `1`             |
+| `setpath([range(N)\|0]; 0) \| length`                           | `1`         | `"Path too deep"`              | `1`             |
+| `getpath([range(N)\|0])` on `null`, `delpaths([[range(N)\|0]])` | `null`      | `"Path too deep"`              | `null`          |
+| `[tostream] \| length`                                          | `N + 1`     | `"Path too deep"`              | `N + 1`         |
+
+(1.8.2 raises these as catchable errors, exit 5 uncaught; the table shows what `try ... catch .` yields.)
+Unaffected in 1.8.2, and so equal in all three: `[paths] | length`, `flatten`, `del(.[0][0])`.
+At 200,000 levels jq 1.7.1 on macOS dies with SIGSEGV (exit 139) in these consumers; jq 1.8.2 refuses and `succinctly jq` answers (`getpath` of a 200,000-deep path re-run here; the others are the issue's rows, captured in a debug build).
+`succinctly jq` has no 10,000-level cap in any of them.
+What bounds it: a document read from input is held to jq's own parse limit of 256 levels ([Nesting depth](#nesting-depth-5497)), so a value deeper than that exists only because the program built it, and every recursive walk over a built value checks ADR-0025's native-stack floor once per level, refusing with `nesting depth exceeds limit of the native stack` (exit 5, uncatchable) where the walk has spent half the evaluation thread's stack.
+On a release build on an Apple Silicon laptop `contains`, `*` and `sort` reach that refusal at 1,000,000 levels and `==` at 3,000,000; the depth differs per build, per architecture and per consumer, and a debug build refuses sooner.
+`succinctly yq` is separately bounded by the YAML parser's 128 levels.
+
+**String length: 2^31 - 9 bytes (#7540).**
+jq 1.8.2 refuses a string result of 2,147,483,639 bytes or more (`currlen + len >= INT_MAX - sizeof(jvp_string)/2` in `jvp_string_append`) with `String too long`, from `+`, `add`, `join`, string interpolation and `--rawfile` (`jq: Bad JSON in --rawfile x FILE: String too long`, exit 2).
+Upstream: CVE-2026-32316 (`jvp_string_append` and `jvp_string_copy_replace_bad`) and CVE-2026-49839 (raw file loading), both in jq 1.8.2's NEWS.
+jq 1.7.1 overflows its heap there: SIGSEGV from `"x" * 1100000000 | . + .`, and a wrapped length of 52,516,352 from `--rawfile` of a 2,200,000,000-byte file.
+`succinctly jq` builds the string and answers `2200000000` on every one of those rows (about 9 to 11 GB resident for the in-program builds, 2.2 GB for `--rawfile`).
+These rows are the issue's measurements; they were not re-run for this change, since each needs several GB.
+What bounds it: available memory, and the allocation refusal below.
+`-R`/`-Rs` over a 2.2 GB line is not part of this entry: jq 1.8.2 has no check there either and answers a wrapped `52515461`, where `succinctly jq` answers `2200000000`.
+
+**Token size: 1 GiB, and 999,999,999 digits (#7541).**
+jq 1.8.2's `tokenadd` refuses to grow its token buffer past `INT_MAX / 2`, so a single token (a string body, a number, a literal) of about 2^30 bytes is `parse error: Token too long at line 1, column 1073741825` (exit 5; upstream GHSA-hj52-j2c9-r8r4).
+A number literal of more than 999,999,999 characters (`DEC_MAX_DIGITS`) is `parse error: Invalid numeric literal` (upstream CVE-2026-43894).
+jq 1.7.1 aborts (SIGABRT, exit 134) on a 2.2 GB string token and reads the 1,000,000,001-digit number (`"number"`).
+`succinctly jq` reads both: `length` of the 2.2 GB string is `2200000000` and `type` of the 1,000,000,001-digit number is `"number"` (1.2 GB resident).
+These rows are the issue's measurements, not re-run here.
+What bounds it: the 4 GiB document limit of the index, beyond which a document is read without one ([A document of 4 GiB or more](#a-document-of-4-gib-or-more-is-read-without-an-index-7425)), and available memory.
+
+**Function parameters: 4,095 (#7527).**
+jq 1.8.2 refuses a `def` with more than 4,095 parameters (4,096 is refused, 4,095 is accepted) with `jq: error: too many function parameters or local function definitions (max 4095)` and `jq: 1 compile error`, exit 3.
+Upstream: "Limit the number of function parameters and definitions to prevent SEGV" (jqlang/jq#3460, commit a2741ee; the overflow it fixes is jqlang/jq#3458).
+jq 1.7.1 and `succinctly jq` compile and run the same program (`null`, exit 0) at 4,096, 4,097 and 20,000 parameters; captured on this change, where 4,095 agrees in all three.
+What bounds it: the program's own size and available memory.
+Upstream's second test, 4,097 sibling local definitions, is refused by `succinctly jq` for another reason (`expression nesting exceeds depth limit of 256`, #7435), not by this divergence.
+
+**String repetition: 2^31 bytes (#7500).**
+jq 1.8.2 refuses `s * n` with a result of 2,147,483,639 bytes or more (1.8.0 had the plain `INT_MAX` bound; 1.8.2 tightened it with the other string bounds above) with `Repeat string result too long`, in `jv_string_repeat`.
+Upstream gives it no CVE of its own.
+jq 1.7.1 has no such check and its answer is the platform's: on x86_64 Linux the count is cast to `int`, which is `INT_MIN` for any count of 2^31 or more, so `"x" * 2147483648`, `"x" * 4294967296`, `"x" * 1e19` and `"x" * infinite` answer `""` at once; on arm64 (macOS) the cast saturates and 1.7.1 builds the 2 GiB string, running past a 20 s timeout.
+The x86_64 rows are the issue's measurements, captured on a Linux x86_64 host; not re-run here.
+`succinctly jq` builds the string of any length the allocator can reserve, and refuses otherwise with its own wording, `Cannot repeat string to <n> bytes` (the "Refusing an allocation jq does not survive" section above, #1612): `"x" * 1e19` and `"x" * infinite` are that error at exit 5 (`Cannot repeat string to 9223372036854775807 bytes`, re-run here), and `"x" * 4294967296 | length` is `4294967296` after a 4 GiB allocation (the issue's measurement).
+That bound is the allocation, not a count; the one fixed bound on this axis is in yq mode, where `succinctly yq` refuses a result of more than 10,485,760 bytes with yq's own wording (`result of repeating string (1 bytes) by 10485761 would exceed 10485760 bytes`, re-run here).
+
+Bounds `succinctly jq` does have, on the axes above, so that this is not read as unbounded: jq's own 256-level parse limit for documents; the native-stack floor for walks over built values; 2^29 elements for an array an index write pads (`Cannot grow array to <n> elements`, #5500); the allocation refusals of "Refusing an allocation jq does not survive"; the index's 4 GiB text limit; and the host's memory, which is the only bound on the multi-gigabyte string and token rows.
+A host with less memory than those rows need is taken to an out-of-memory failure by them, as it is by any large input; that is a resource limit, not a cap on the language.
+
+The ledger (`comparison/jq/divergences/`) has no entry for these: the probes `succinctly dev compare jq` runs are against jq 1.7.1 and none reaches a 10,001-level walk, a string past 2 GiB, a 1 GiB token, a 4,096-parameter `def` or a repeat count of 2^31.
+Pinned by `tests/jq_cli/i7526.rs` for the rows that are cheap to run: depth 10,001 and 20,000 through `==`, `<`, `sort`, `contains`, `*`, `setpath`, `getpath`, `delpaths` and `tostream`, a `def` of 4,096 and 4,097 parameters, and the refusal of a repeat count of `1e19`, so a later fidelity change cannot add the caps without failing it.
+
 ### `fromdate` parses exactly `%Y-%m-%dT%H:%M:%SZ`; yq's `to_unix` stays lenient (#4967)
 
 `fromdate`/`fromdateiso8601` run `strptime("%Y-%m-%dT%H:%M:%SZ") | mktime` as jq defines them: a date alone, no `Z`,
