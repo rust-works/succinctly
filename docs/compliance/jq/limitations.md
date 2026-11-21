@@ -407,6 +407,16 @@ Only the NUL changes: the rest of 1.8.2's reworded `tonumber` failures and its r
 `succinctly yq` is not changed.
 Pinned by `tests/jq_cli/i7521.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
 
+## A group that takes no part in an empty match is unmatched, as jq 1.8.2 reports it; jq 1.7.1 reports it as empty (#7520)
+
+When the whole match is empty, jq 1.7.1's `f_match` writes every capture group as an empty string at the match's offset, including a group that took no part: `"a" | match("(b)?") | .captures` is `[{"offset":0,"string":"","length":0,"name":null}]`, and `capture`, `scan` and `sub`'s named captures follow (`"a" | capture("(?<x>b)?")` is `{"x":""}`, `[scan("(b)?")]` is `[[""],[""]]`, `sub("(?<x>b)?"; "[\(.x)]")` is `"[]a"`).
+jq 1.8.2 reports such a group as unmatched, as it already did when the whole match is not empty: `{"offset":-1,"string":null,"length":0,"name":null}`, `{"x":null}`, `[[null],[null]]` and `"[null]a"` (jqlang/jq#3238, commit 2755664 "Non-matched optional capture group should be null and offset -1", listed in the 1.8 NEWS under changes to existing functions, fixing jqlang/jq#3093).
+`succinctly jq` follows 1.8.2, because upstream calls the 1.7.1 behaviour a bug, and so the difference from the pinned 1.7.1 stands as `newer-than-primary`.
+A group that took part in the empty match is unchanged in both versions: an empty match at the whole match's offset, whatever it captured (`"abc" | match("(?=(b))").captures[0].string` is `""`).
+The matches that 1.7.1 repeats at each continuation byte of a multibyte character (#6326) carry the same groups as the match they repeat.
+`succinctly yq` is not changed: Go's `regexp` already reports such a group as unmatched.
+Pinned by `tests/jq_cli/i7520.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
+
 ## A standard input that cannot be read: matched, with these differences (#7126)
 
 A standard input that cannot be read is an empty one in jq 1.7.1, which counts the failed read and exits 2 once the run is over, whatever the program left (`-e`'s 4, `input`'s 5), and for a plain read without a word on stderr.

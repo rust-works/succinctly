@@ -128,10 +128,11 @@ fn test_fancy_route_follows_the_pattern_structure_5502() -> Result<()> {
     ])
 }
 
-/// jq reports every group of an empty overall match as an empty match at its position, whatever
-/// it captured or whether it took part: `capture`, `scan` and `sub`'s `.` are built from `match`'s
-/// `captures`, so they show the same `""` (they showed `null` here before). A group inside a
-/// lookahead is the case only lookaround can reach.
+/// jq reports a group that took part in an empty overall match as an empty match at that match's
+/// position, whatever it captured, and (jq 1.8.2, jqlang/jq#3238, #7520) a group that took no part
+/// as unmatched, offset -1 and `null`. `capture`, `scan` and `sub`'s `.` are built from `match`'s
+/// `captures`, so they show the same. jq 1.7.1 reported the group that took no part as `""` too
+/// (pin moved, #7520). A group inside a lookahead is the case only lookaround can reach.
 #[test]
 fn test_empty_match_reports_every_group_empty_5502() -> Result<()> {
     assert_rows(&[
@@ -139,13 +140,13 @@ fn test_empty_match_reports_every_group_empty_5502() -> Result<()> {
             r#""abc" | [match("(?=(b))") | .captures[0] | .offset, .string]"#,
             r#"[1,""]"#,
         ),
-        (r#""" | capture("(?<x>a)?")"#, r#"{"x":""}"#),
+        (r#""" | capture("(?<x>a)?")"#, r#"{"x":null}"#),
         (
             r#""b" | [capture("(?<x>a)?"; "g")]"#,
-            r#"[{"x":""},{"x":""}]"#,
+            r#"[{"x":null},{"x":null}]"#,
         ),
-        (r#""b" | [scan("(a)?")]"#, r#"[[""],[""]]"#),
-        (r#""" | sub("(?<x>a)?"; "[\(.x)]")"#, r#""[]""#),
+        (r#""b" | [scan("(a)?")]"#, "[[null],[null]]"),
+        (r#""" | sub("(?<x>a)?"; "[\(.x)]")"#, r#""[null]""#),
         // A non-empty match keeps #5363's `null` for a group that took no part.
         (r#""b" | [scan("(a)?b")]"#, "[[null]]"),
         (
