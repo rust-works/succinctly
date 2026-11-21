@@ -354,6 +354,15 @@ Rows from `printf '<text>' | jq -c .` (a NUL is `\0`), jq 1.7.1 against `succinc
 The last row is the agreement: with a newline in the chunk jq does not truncate either.
 `tests/jq_cli/i5654_nul.rs` pins both sides.
 
+## A `-f` program file with a NUL byte is refused, as jq 1.8.2 refuses it; jq 1.7.1 ends the program at the NUL (#7434)
+
+jq 1.7.1 hands a `-f` program file to its compiler as a C string, so the program ends at the first NUL byte and the rest of the file is dropped without a word: `.a\0| .b` runs `.a`, and `# c\0` followed by a newline and `.a` is a comment alone, which fails with `Top-level program not given`.
+jq 1.8.2 refuses such a file before it compiles it (CVE-2026-41256, upstream commit 5a015deae3, "Fix NUL truncation in program files loaded with -f", listed under the security fixes of its NEWS.md): `jq: program file contains NUL bytes` on stderr, nothing on stdout, exit status 2.
+`succinctly jq` follows 1.8.2, because upstream calls the 1.7.1 behaviour a bug, and so the difference from the pinned 1.7.1 stands as `newer-than-primary`.
+The refusal comes before the input files are opened, as in 1.8.2, and covers a NUL anywhere in the file, in a comment included, and `-f /dev/stdin`.
+`succinctly yq` is not changed.
+Pinned by `tests/jq_cli/i7434.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
+
 ## A standard input that cannot be read: matched, with these differences (#7126)
 
 A standard input that cannot be read is an empty one in jq 1.7.1, which counts the failed read and exits 2 once the run is over, whatever the program left (`-e`'s 4, `input`'s 5), and for a plain read without a word on stderr.
@@ -6749,6 +6758,18 @@ $ echo '[0x1,2]'  | sjq -c '.[1]'        # 2                exit 0
 $ echo '[0x1,2]'  | sjq -c 'map(.)'      # (raises)         exit 5
 $ echo '[1,0x1]'  | sjq -c 'length'      # (raises)         exit 5
 $ echo '[2x,1]'   | sjq -c 'length'      # (raises)         exit 5
+```
+
+A value under a key that a later member repeats is read by the same rule ([#7427](https://github.com/rust-works/succinctly/issues/7427)).
+jq keeps a repeated key's last value, but only after parsing every value, so `{"a":tru,"a":1}` is its parse error whatever the filter.
+Every route that reads the values an object keeps (`.`, `-s .`, `.[]`, `to_entries`, `with_entries(f)`, `map_values(f)`, `tojson`) now reads the value the repeat shadows too, and raises jq's message with exit 5, where the collapse used to drop it unread and print `{"a":1}`.
+A filter that reads no value of the object, or only the value that wins, answers as it does for a malformed value no key shadows:
+
+```
+$ echo '{"a":tru,"b":2,"a":1}' | jq  -c '.'      # (parses nothing) exit 5
+$ echo '{"a":tru,"b":2,"a":1}' | sjq -c '.'      # (raises)         exit 5
+$ echo '{"a":tru,"b":2,"a":1}' | sjq -c 'length' # 2                exit 0
+$ echo '{"a":tru,"b":2,"a":1}' | sjq -c '.a'     # 1                exit 0
 ```
 
 ### A string with an invalid escape or a lone high surrogate is echoed by a filter that only forwards it (#5308)
