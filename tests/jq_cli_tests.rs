@@ -32233,15 +32233,8 @@ fn test_def_param_shadow_scoping_2723() -> Result<()> {
         ("def f(a; length; b): [a,length,b]; f(1;2;3)", "[1,2,3]"),
         // A comment between the parameter name and `)` still counts.
         ("def f(#c\nlength): length; f(1)", "1"),
-        // `,` is accepted as a parameter separator alongside `;`, matching
-        // `Parser::parse_func_params`'s own grammar (a succinctly
-        // extension -- real jq rejects a comma-separated def parameter
-        // list outright, confirmed live). A first cut of this scan split
-        // only on `;`, silently dropping a comma-separated parameter from
-        // the shadow set the same way the original #2723 bug dropped an
-        // unscanned one (#2805 review; confirmed live pre-fix: `def f(a,
-        // length): length; f(1;2)` answered `0`, not `2`).
-        ("def f(a, length): length; f(1;2)", "2"),
+        // A comma between parameters is a syntax error in jq (#7457,
+        // `tests/jq_cli/i7457.rs`), so no program of that shape is here.
         // #2805 review: a `#`-comment *inside* the parameter list can
         // contain a `)` or `;` of its own -- a naive `find(')')`/
         // `split(';')` over the raw text is fooled by either, mistaking
