@@ -139,9 +139,10 @@ fn literal(token: &[u8]) -> Result<Pending, Stop> {
     }
 }
 
-/// The offset of the first NUL byte in `hay` (#7437): the one search [`blank_nul_number_tails`]
-/// and the CLI's reading routes make for it, which costs a NUL-free text one unsigned `min` per
-/// vector of bytes ([`crate::util::simd::nul`]).
+/// The offset of the first NUL byte in `hay` (#7437).
+///
+/// The one search for a NUL that [`blank_nul_number_tails`] and the CLI's reading routes make. A
+/// text with no NUL costs one unsigned `min` per vector of bytes (`util::simd::nul`).
 #[inline]
 pub fn find_nul(hay: &[u8]) -> Option<usize> {
     crate::util::simd::nul::find_nul(hay)

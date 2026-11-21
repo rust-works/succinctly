@@ -187,6 +187,9 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
+    /// A kernel: how many bytes at the front hold no NUL.
+    type Kernel = fn(&[u8]) -> usize;
+
     fn reference(bytes: &[u8]) -> Option<usize> {
         bytes.iter().position(|&byte| byte == 0)
     }
@@ -195,7 +198,7 @@ mod tests {
     /// NUL at every offset around the block and vector edges, and two NULs.
     #[test]
     fn every_kernel_finds_the_first_nul_as_a_bytewise_search_does_7437() {
-        let mut kernels: Vec<(&str, fn(&[u8]) -> usize)> = Vec::new();
+        let mut kernels: Vec<(&str, Kernel)> = Vec::new();
         #[cfg(target_arch = "x86_64")]
         {
             kernels.push(("sse2", |b| unsafe { nul_free_prefix_sse2(b) }));
@@ -206,7 +209,7 @@ mod tests {
         #[cfg(target_arch = "aarch64")]
         kernels.push(("neon", |b| unsafe { nul_free_prefix_neon(b) }));
         kernels.push(("dispatch", nul_free_prefix));
-        let find = |kernel: fn(&[u8]) -> usize, bytes: &[u8]| {
+        let find = |kernel: Kernel, bytes: &[u8]| {
             let from = kernel(bytes);
             assert!(reference(&bytes[..from]).is_none(), "a NUL before {from}");
             bytes[from..]
