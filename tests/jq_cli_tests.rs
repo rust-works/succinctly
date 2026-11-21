@@ -12527,11 +12527,11 @@ fn test_first_last_expr_path_context_resolves_2074() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "2");
 
-    // `last(empty)` still answers `null`, not nothing (#1521) -- the
-    // path-context arm must preserve that, not just the ordinary one.
+    // `last(empty)` answers nothing, not `null` (jq 1.8.2; #7518 moved the
+    // #1521 pin) -- the path-context arm must agree with the ordinary one.
     let (stdout, _, code) = run_jq_full(&["-c", ".a | [last(empty)]"], Some(r#"{"a":1}"#))?;
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "[null]");
+    assert_eq!(stdout.trim(), "[]");
 
     // `paired` + `QueryResult::Partial` (the body itself produces some
     // outputs before a terminating control): `first` can short-circuit
@@ -12616,11 +12616,10 @@ fn test_first_last_expr_path_context_resolves_2074() -> Result<()> {
     // Same bare-terminator cases for `last`.
     let (stdout, _, code) = run_jq_full(&["-c", ".a | last(empty) | key"], Some(r#"{"a":1}"#))?;
     assert_eq!(code, 0);
-    // Empty body -> `null` (#1521), continuing `rest` from the fallback
-    // (ambient) path since no real navigation happened -- `key` there
-    // answers the *enclosing* container's own key, `"a"`, not a fabricated
-    // one.
-    assert_eq!(stdout.trim(), "\"a\"");
+    // Empty body -> nothing (jq 1.8.2; #7518 moved the #1521 pin, where the
+    // `null` carried on from the ambient path and `key` answered `"a"`), so
+    // `rest` never runs.
+    assert!(stdout.trim().is_empty(), "{:?}", stdout.trim());
 
     let (stdout, stderr, code) =
         run_jq_full(&["-c", ".a | last(error(\"x\")) | key"], Some(r#"{"a":1}"#))?;
