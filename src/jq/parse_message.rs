@@ -139,18 +139,12 @@ fn literal(token: &[u8]) -> Result<Pending, Stop> {
     }
 }
 
-/// The offset of the first NUL byte in `hay`: a block at a time, where a block with none costs one
-/// comparison a byte and no branch, which the compiler vectorizes.
-fn find_nul(hay: &[u8]) -> Option<usize> {
-    const BLOCK: usize = 64;
-    let mut start = 0;
-    for block in hay.chunks(BLOCK) {
-        if block.iter().fold(0u8, |seen, &b| seen | u8::from(b == 0)) != 0 {
-            return block.iter().position(|&b| b == 0).map(|at| start + at);
-        }
-        start += block.len();
-    }
-    None
+/// The offset of the first NUL byte in `hay` (#7437): the one search [`blank_nul_number_tails`]
+/// and the CLI's reading routes make for it, which costs a NUL-free text one unsigned `min` per
+/// vector of bytes ([`crate::util::simd::nul`]).
+#[inline]
+pub fn find_nul(hay: &[u8]) -> Option<usize> {
+    crate::util::simd::nul::find_nul(hay)
 }
 
 /// Whether `byte` ends a bare token for jq's tokenizer (`classify` in `jv_parse.c`): whitespace,

@@ -11822,7 +11822,7 @@ fn blank_nul_number_tails_in<'a>(raws: impl Iterator<Item = &'a mut Vec<u8>>) {
     for at in 0..raws.len() {
         let (before, rest) = raws.split_at_mut(at);
         let raw = &mut *rest[0];
-        let Some(nul) = crate::cli::jq_seq_reader::find_byte(0, raw) else {
+        let Some(nul) = succinctly::jq::find_nul(raw) else {
             continue;
         };
         let bom = if Some(at) == front {
@@ -15288,7 +15288,7 @@ fn blank_lazy_window_nul_tails(text: &mut [u8], kept: usize) {
         .iter()
         .rposition(|&b| b == b'\n')
         .map_or(0, |at| at + 1);
-    if crate::cli::jq_seq_reader::find_byte(0, &text[line_start..]).is_some() {
+    if succinctly::jq::find_nul(&text[line_start..]).is_some() {
         succinctly::jq::blank_nul_number_tails(
             &mut text[line_start..],
             Some(crate::cli::jq_seq_reader::JQ_FGETS_CHUNK),
