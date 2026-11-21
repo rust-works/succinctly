@@ -2659,3 +2659,121 @@ fn an_object_key_is_one_value_per_object_7401() {
         ]);
     });
 }
+
+/// The `reduce` update of a prelude definition.
+fn prelude_reduce_update(prelude: &Prelude, name: &str, arity: usize) -> Expr {
+    let Expr::FuncDef { body, .. } = prelude.find(name, arity).expect(name).expr() else {
+        panic!("{name} is a definition");
+    };
+    match &**body {
+        Expr::Reduce { update, .. } => (**update).clone(),
+        other => panic!("{name}'s body is a reduce: {other:?}"),
+    }
+}
+
+/// builtin.jq's `add` and `_flatten` only append to their state, so their steps run in place
+/// (#7564); an update that reads its input, or adds anything but its operand, does not.
+#[test]
+fn add_and_flatten_steps_append_in_place_7564() {
+    with_prelude(|prelude| {
+        assert!(is_append_update(&prelude_reduce_update(
+            prelude, "_sp_add", 0
+        )));
+        assert!(is_append_update(&prelude_reduce_update(
+            prelude,
+            "_sp__flatten",
+            1
+        )));
+    });
+    let update = |src: &str| match parse(&format!("reduce empty as $x ([]; {src})")) {
+        Ok(Expr::Reduce { update, .. }) => *update,
+        other => panic!("{src}: {other:?}"),
+    };
+    for src in [
+        ". + $x",
+        "(. + [$x, {k: $x}])",
+        "if $x | type == \"array\" then . + $x else . + [$x] end",
+        ".",
+        ". + ($x | length | [.])",
+    ] {
+        assert!(is_append_update(&update(src)), "{src}");
+    }
+    for src in [
+        ". + [.[0]]",
+        ". + [length]",
+        "$x + .",
+        ". - $x",
+        "if . == [] then . + $x else . end",
+        ". + f($x)",
+        ". + {a}",
+    ] {
+        assert!(!is_append_update(&update(src)), "{src}");
+    }
+}
+
+/// The in-place step's answers, each captured from jq 1.7.1 (jq 1.8.2 agrees): an operand per
+/// generator output added to the state as it was, `null` and `[]` adding nothing (a state the
+/// input shares then stays that value, which `path` sees), no output leaving `null`, and a
+/// scalar operand raising with the state as it was (#7564).
+#[test]
+fn the_append_step_answers_as_jq_7564() {
+    check(&[
+        (
+            "null",
+            "reduce range(2) as $i ([0]; . + ([$i], [$i*10]))",
+            ok(&["[0,0,10]"]),
+        ),
+        (
+            "null",
+            "reduce (null, [], [1], [[2]]) as $x ([]; . + $x)",
+            ok(&["[1,[2]]"]),
+        ),
+        (
+            "[[1,[2]],[[3,[4]]]]",
+            "flatten, flatten(1)",
+            ok(&["[1,2,3,4]", "[1,[2],[3,[4]]]"]),
+        ),
+        (
+            "null",
+            "reduce range(3) as $i ([]; if $i == 1 then . else . + [$i] end)",
+            ok(&["[0,2]"]),
+        ),
+        ("null", "reduce range(3) as $i ([]; empty)", ok(&["null"])),
+        (
+            "null",
+            "[1] as $a | reduce range(2) as $i ($a; . + (null, [$i]))",
+            ok(&["[1,0,1]"]),
+        ),
+        ("[[1,2],[3],null,[]]", "add", ok(&["[1,2,3]"])),
+        (
+            "null",
+            r#"reduce range(2) as $i ([]; . + ([1], 2, error("x")))"#,
+            err(&[], "array ([]) and number (2) cannot be added"),
+        ),
+        (
+            "null",
+            r#"reduce range(2) as $i ([]; . + ([1], error("x")))"#,
+            err(&[], "x"),
+        ),
+        (
+            "[[1]]",
+            "path(.[0] | reduce (null,[]) as $x (.; . + $x))",
+            ok(&["[0]"]),
+        ),
+        (
+            "[[1]]",
+            "path(.[0] | reduce (1) as $x (.; . + ([2], null)))",
+            ok(&["[0]"]),
+        ),
+        (
+            "[[1]]",
+            "path(.[0] | reduce ([1]) as $x (.; . + $x))",
+            err(&[], "Invalid path expression with result [1,1]"),
+        ),
+        (
+            "[[1],[2]]",
+            "path(add)",
+            err(&[], "Invalid path expression with result [1,2]"),
+        ),
+    ]);
+}
