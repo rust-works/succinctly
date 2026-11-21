@@ -3979,7 +3979,9 @@ impl<'a> Parser<'a> {
         self.deferred_key_errors
             .entry(start)
             .or_insert_with(|| ParseError::new(message, start));
-        self.pos = end;
+        // Past the escape that failed at least: a `\(` where no interpolation is read (an object
+        // key's string) ends the run before it, and the parse must still move on.
+        self.pos = end.max(self.pos);
     }
 
     /// Parse a simple string literal (for object keys, etc.)

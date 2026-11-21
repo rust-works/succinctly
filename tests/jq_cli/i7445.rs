@@ -206,3 +206,17 @@ fn test_good_escapes_in_a_program_string_still_decode_7445() -> Result<()> {
     assert_eq!(stdout, "\"\u{fffd}\"\n\"\u{1f600}\"\n\"a\\tb\u{e9}1\\n\"\n");
     Ok(())
 }
+
+/// A `\(` in a string the parser reads without interpolation (an `import` path, an `@dsv` delimiter)
+/// is still a refusal, and the parse moves on past it (#7445: the run of escapes before it ends
+/// at the `\(`, so skipping the run must not stand still). jq words the import path's refusal as
+/// `Import path must be constant`, which is not matched here (the wording is succinctly's own).
+#[test]
+fn test_interpolation_in_an_import_path_is_refused_not_looped_on_7445() -> Result<()> {
+    for program in [r#"import "\(1)" as x; 0"#, r#"include "a\q\(1)"; 0"#] {
+        let (stdout, stderr, code) = run_jq_full(&["-n", program], None)?;
+        assert_eq!((stdout.as_str(), code), ("", 3), "{program}: {stderr}");
+        assert!(stderr.starts_with("jq: error: "), "{program}: {stderr}");
+    }
+    Ok(())
+}
