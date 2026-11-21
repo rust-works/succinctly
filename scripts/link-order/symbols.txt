@@ -1082,7 +1082,6 @@ succinctly::jq::eval::empty_match_is_position_free::assertion_free
 <succinctly::jq::parser::Parser>::parse_first_expr
 <regex_automata::meta::strategy::Pre<regex_automata::util::prefilter::memmem::Memmem> as regex_automata::meta::strategy::Strategy>::create_cache
 succinctly::cli::jq_runner::seq_fault_errors_of
-succinctly::jq::eval::guard_prefix_lifting
 <regex_syntax::ast::parse::NestLimiter<&mut regex_syntax::ast::parse::Parser>>::increment_depth
 <std::thread::local::LocalKey<core::cell::RefCell<core::option::Option<alloc::vec::Vec<(u32, alloc::string::String)>>>>>::with::<succinctly::cli::jq_runner::read_inputs::{closure#77}, ()>
 succinctly::jq::eval::eval_each_pipe::<alloc::vec::Vec<u64>, succinctly::jq::eval::JqSemantics>
