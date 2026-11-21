@@ -5,7 +5,8 @@
 //! not through the bridge that wrote it out as JSON and indexed it again per call (3 to 13 ms over
 //! 100,000 elements, jq's 0.06 to 0.4). Every row was captured from jq 1.7.1 (`/usr/bin/jq -c`): stdout,
 //! stderr and the exit status, over ten input documents and twenty stage shapes in two binding forms,
-//! including each error a stage raises (`nth(-1)`, `first` of an object).
+//! including each error a stage raises (`nth(-1)`, `first` of an object). Two rows take `length` of a
+//! number literal a double does not hold and are jq 1.8.2's answers since #7534 (marked).
 
 use std::time::{Duration, Instant};
 
@@ -2388,10 +2389,11 @@ const DOCUMENT_ROWS: &[(&str, &str, &str, &str, i32)] = &[
         "",
         0,
     ),
+    // jq 1.8.2's `length` keeps the literal (jqlang/jq#3275, #7534); jq 1.7.1 printed the double.
     (
         "[1.5,9007199254740993,\"x\"]",
         ".[]? as $a | [range(2) | $a | length | tostring]",
-        "[\"1.5\",\"1.5\"]\n[\"9007199254740992\",\"9007199254740992\"]\n[\"1\",\"1\"]\n",
+        "[\"1.5\",\"1.5\"]\n[\"9007199254740993\",\"9007199254740993\"]\n[\"1\",\"1\"]\n",
         "",
         0,
     ),
@@ -2528,10 +2530,11 @@ const DOCUMENT_ROWS: &[(&str, &str, &str, &str, i32)] = &[
         "",
         0,
     ),
+    // jq 1.8.2's `length` keeps the literal (jqlang/jq#3275, #7534); jq 1.7.1 printed the double.
     (
         "[1.5,9007199254740993,\"x\"]",
         ".[]? as $a | [range(2) | $a | {n: (length|tostring)}]",
-        "[{\"n\":\"1.5\"},{\"n\":\"1.5\"}]\n[{\"n\":\"9007199254740992\"},{\"n\":\"9007199254740992\"}]\n[{\"n\":\"1\"},{\"n\":\"1\"}]\n",
+        "[{\"n\":\"1.5\"},{\"n\":\"1.5\"}]\n[{\"n\":\"9007199254740993\"},{\"n\":\"9007199254740993\"}]\n[{\"n\":\"1\"},{\"n\":\"1\"}]\n",
         "",
         0,
     ),

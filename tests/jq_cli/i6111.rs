@@ -56,16 +56,22 @@ fn a_number_that_does_not_convert_reports_the_conversion() -> Result<()> {
     Ok(())
 }
 
-/// jq aborts on an assertion here (#3046), so there is no wording to match: this build raises.
+/// jq 1.7.1 aborts on an assertion here (#3046); jq 1.8.2 refuses the format with the words it
+/// uses for an array input (jqlang/jq@1411ce6, #7533). The rows are jq 1.8.2's.
 #[test]
-fn a_number_that_converts_keeps_the_format_error() -> Result<()> {
+fn a_number_that_converts_meets_the_format_error() -> Result<()> {
+    for name in ["strftime", "strflocaltime"] {
+        for fmt in ["1", "null", "[]", "{}", "true"] {
+            assert_eq!(
+                caught(&format!("{name}({fmt})"), "0")?,
+                format!(r#""{name}/1 requires a string format""#),
+                "{name}({fmt})"
+            );
+        }
+    }
     assert_eq!(
-        caught("strftime(1)", "0")?,
-        r#""expected string, got strftime format""#
-    );
-    assert_eq!(
-        caught("strflocaltime([])", "0")?,
-        r#""expected string, got strflocaltime format""#
+        caught("[strftime(\"%Y\", {})]", "0")?,
+        r#""strftime/1 requires a string format""#
     );
     Ok(())
 }

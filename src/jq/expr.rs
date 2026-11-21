@@ -4226,8 +4226,66 @@ macro_rules! value_arg_builtins {
                     _ => None,
                 }
             }
+
+            /// [`Self::value_arg`], for replacing in place.
+            fn value_arg_mut(&mut self) -> Option<&mut Expr> {
+                match self {
+                    $(Self::$variant(arg) => Some(arg),)*
+                    _ => None,
+                }
+            }
         }
     };
+}
+
+impl Builtin {
+    /// Every argument jq binds once per value for this builtin, in jq's binding order: the
+    /// outermost loop first, the one varying fastest last (#7474).
+    ///
+    /// jq runs `B(a; b)` as nested bindings, `b as $b | a as $a | B($a; $b)` for a C-coded
+    /// builtin (its rightmost argument varies slowest) and `a as $a | b as $b | ...` for a
+    /// jq-defined `def f($a; $b)`, so `B`'s first output comes from the first value of each
+    /// argument and a consumer's stop ends every argument generator. The order is the one
+    /// jq 1.7.1 prints for `B((a1, a2); (b1, b2))`, captured per builtin (`tests/jq_cli/i7474.rs`):
+    /// `setpath`, `pow`, `atan2`, the two- and three-argument libm functions and the flags of
+    /// `test`/`match`/`capture` nest rightmost-outermost; `scan`'s and `sub`/`gsub`'s nest
+    /// leftmost-outermost. A closure argument is not listed: `sub`'s replacement runs once per
+    /// match, and `split`/`splits`'s flags are read inside the array of matches, so
+    /// `split("a"; ("", "i"))` is two outputs in jq, not four.
+    pub fn value_args_mut(&mut self) -> Vec<&mut Expr> {
+        if self.value_arg().is_some() {
+            return self.value_arg_mut().into_iter().collect();
+        }
+        match self {
+            // `format/1` and `halt_error/1` (#7558) are C-coded; `nth/1` is `def nth($n):
+            // .[$n];`. `in(xs)` binds its input before `xs` runs, so the parser spells it out
+            // when `xs` holds a `?//` (`parser::retry_collected_arg`).
+            Self::FormatNamed(arg) | Self::Nth(arg) | Self::HaltErrorCode(arg) => {
+                alloc::vec![&mut **arg]
+            }
+            Self::SetPath(path, value) => alloc::vec![&mut **value, &mut **path],
+            Self::Pow(a, b) | Self::Atan2(a, b) | Self::Libm2(_, a, b) => {
+                alloc::vec![&mut **b, &mut **a]
+            }
+            Self::Libm3(_, a, b, c) => alloc::vec![&mut **c, &mut **b, &mut **a],
+            Self::TestFlags(re, flags)
+            | Self::MatchFlags(re, flags)
+            | Self::CaptureFlags(re, flags) => {
+                alloc::vec![&mut **flags, &mut **re]
+            }
+            Self::ScanFlags(re, flags) => alloc::vec![&mut **re, &mut **flags],
+            Self::SubFlags(re, _, flags) | Self::GsubFlags(re, _, flags) => {
+                alloc::vec![&mut **re, &mut **flags]
+            }
+            Self::SplitRegex(re, _)
+            | Self::SplitsFlags(re, _)
+            | Self::Sub(re, _)
+            | Self::Gsub(re, _) => {
+                alloc::vec![&mut **re]
+            }
+            _ => Vec::new(),
+        }
+    }
 }
 
 value_arg_builtins!(

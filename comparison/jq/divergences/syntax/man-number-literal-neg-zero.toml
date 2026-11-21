@@ -1,0 +1,3 @@
+category = "newer-than-primary"
+reason = "jq 1.8 negates a literal to a literal (jqlang/jq#3242, fixing jqlang/jq#2704) and a zero to positive zero, so `[-0, -0.0, 0e5]` is `[0,0.0,0E+5]`; jq 1.7.1 answers `[-0,-0,0E+5]`. succinctly follows 1.8.2 (docs/compliance/jq/limitations.md, #7453)."
+issue = "7453"
