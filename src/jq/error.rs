@@ -1598,6 +1598,14 @@ impl EvalError {
         Self::subject(value, "number required")
     }
 
+    /// `<v> halt_error/1: number required` -- `halt_error(x)` with a non-number `x`. `<v>` is
+    /// the INPUT value, not `x`: jq's `f_halt_error` raises `type_error(input, ...)`
+    /// (`"in" | halt_error("x")` -> `string ("in") halt_error/1: number required`, jq 1.7.1;
+    /// #7441).
+    pub fn halt_error_number_required(input: &OwnedValue) -> Self {
+        Self::subject(input, "halt_error/1: number required")
+    }
+
     /// `<v> has no length`.
     pub fn has_no_length(value: &OwnedValue) -> Self {
         Self::subject(value, "has no length")

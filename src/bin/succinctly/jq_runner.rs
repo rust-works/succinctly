@@ -5176,6 +5176,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     // so the failure is remembered here, and `jq_exit_code` turns the ones its
     // `--on-error` mode counts into exit 5 (#355, #5471).
     let mut sink = ErrorSink::default();
+    sink.set_halt_negative_as_abs(args.exit_status);
     // An input file jq could not open is reported and skipped, and the run then exits 2
     // whatever else happened (#5472).
     let mut open_failed = false;
