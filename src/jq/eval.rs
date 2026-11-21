@@ -53796,7 +53796,10 @@ fn pattern_is_plain(pattern: &Pattern) -> bool {
 /// is not the container it names, so a pattern bind (the `foreach` source's or its own) is read only
 /// `caught`, inside a `try`/`?` that swallows the raise; a `$name` pattern never raises, and a pattern
 /// with a computed key is never read (its key is an expression of its own).
-fn expr_is_inert(e: &Expr, caught: bool) -> bool {
+///
+/// Also the test `eval_generic`'s lazy `map` chain applies before it fuses a `map(g)` onto the stages already on
+/// it (#7565): fusing runs the stages element by element, which is unobservable only when one side is inert.
+pub(crate) fn expr_is_inert(e: &Expr, caught: bool) -> bool {
     fn patterns_are_inert(patterns: &[Pattern], caught: bool) -> bool {
         patterns.iter().all(|pattern| {
             matches!(pattern, Pattern::Var(_)) || caught && pattern_is_plain(pattern)

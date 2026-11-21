@@ -9525,6 +9525,10 @@ $ echo '[1,"x",3]' | jq          -c 'first(map(.+1) | .[])'     # error, exit 5
 $ echo '[1,"x",3]' | succinctly jq -c 'first(map(.+1) | .[])'   # 2, exit 0
 ```
 
+Only the last `map` of a chain is skipped this way.
+Since [#7565](https://github.com/rust-works/succinctly/issues/7565) a `map(g)` joins the chain of the `map(f)` before it only when `g`, or every stage already on the chain, can neither raise nor have an effect, so `map(f) | map(g) | first` runs `f` on every element, as jq does, and `g` on the first only.
+Before #7565 the stages ran element by element, which also let `g`'s error, `debug` line or `input` come before `f` had run on a later element, with no truncating consumer at all.
+
 Deliberate, and the whole point of the laziness: skipping elements that cannot affect the
 requested output is the optimization, and restoring jq's atomicity would mean draining the
 sequence before emitting anything — reinstating exactly the O(n) cost

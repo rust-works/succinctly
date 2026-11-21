@@ -5704,6 +5704,22 @@ impl<V: DocumentValue> LazySeq<V> {
         }
     }
 
+    /// Whether pushing a `map(h)` stage onto this chain would change what can be observed
+    /// (#7565): jq runs every stage on every element before the next stage starts, and the
+    /// chain runs them element by element, so the two orders differ only when `h` and a stage
+    /// already on the chain can each raise or have an effect, which
+    /// [`expr_is_inert`](super::eval::expr_is_inert) is the one test of. jq mode only:
+    /// `succinctly yq` keeps the chain as it was (yq's own evaluation order is #7405).
+    fn fusing_is_observable<S: EvalSemantics>(&self, h: &Expr) -> bool {
+        S::TAG == EvalTag::Jq
+            && !super::eval::expr_is_inert(h, false)
+            && self
+                .instructions
+                .iter()
+                .flat_map(|rc| rc.iter())
+                .any(|instr| !super::eval::expr_is_inert(&instr.f, false))
+    }
+
     /// Builder-style wrapper around [`Self::push_map_in_place`], for the
     /// fresh-construction call sites that chain straight off `LazySeq::new`.
     fn push_map(mut self, f: &Expr, tag: EvalTag) -> Self {
@@ -16134,6 +16150,22 @@ fn fold_lazy_seq_stage<S: EvalSemantics, V: DocumentValue>(
         // same-size replacement -- the hot path for a chained
         // `map(f) | map(g) | map(h)`, where this arm runs once per stage.
         Expr::Builtin(Builtin::Map(h)) => {
+            // #7565: jq's `map(f)` is `[.[] | f]`, so `map(f) | map(g)` runs `f` on every
+            // element before `g` sees the array. Fusing `h` onto the chain runs the stages
+            // element by element instead, which is unobservable only when `h` or every stage
+            // already on the chain is inert; otherwise `h`'s error, `debug` or `input` came
+            // before a later element's `f`. Such a chain is drained first (the cursors stay
+            // cursors, nothing is decoded) and `h` starts a new one over what it answered.
+            if seq.fusing_is_observable::<S>(h) {
+                return match seq.drain_atomic() {
+                    Ok(elems) => GenericResult::LazySeq(Box::new(
+                        LazySeq::from_mixed(elems).push_map(h, S::TAG),
+                    )),
+                    Err(Control::Error(e)) => GenericResult::Error(e),
+                    Err(Control::Break(label)) => GenericResult::Break(label),
+                    Err(Control::Halt(code)) => GenericResult::Halt(code),
+                };
+            }
             seq.push_map_in_place(h, S::TAG);
             GenericResult::LazySeq(seq)
         }
@@ -53248,6 +53280,35 @@ mod tests {
                 .into()
             )
         );
+    }
+
+    /// #7565: a `map(g)` joins the chain only when running the stages element by element
+    /// cannot be seen (`g`, or every stage already on it, is inert); otherwise the chain is
+    /// drained first and `g` is the one stage of a new one, as jq's `[.[] | f]` builds the array
+    /// before `map(g)` starts. yq mode keeps fusing (#7405).
+    #[test]
+    fn test_map_map_fuses_only_when_the_order_is_unobservable_7565() {
+        fn stages<S: EvalSemantics>(filter: &str) -> usize {
+            let json = br"[1,2,3]";
+            let index = JsonIndex::build(json);
+            let expr = crate::jq::parse(filter).unwrap();
+            match eval_with_cursor_using::<S, _>(&expr, index.root(json)) {
+                GenericResult::LazySeq(seq) => seq.instructions.as_deref().map_or(0, Vec::len),
+                other => panic!("{filter}: not a LazySeq: {other:?}"),
+            }
+        }
+        for (filter, jq) in [
+            ("map(. + 1) | map(. * 10)", 1),
+            ("map(. + 1) | map(.) | map(. * 10)", 1),
+            ("map(.) | map(. + 1)", 2),
+            ("map(. + 1) | map(tostring)", 2),
+            ("map(. + 1) | map(.)", 2),
+            ("map(.) | map(.) | map(. + 1)", 3),
+            ("map(. + 1) | map(. + 2) | map(.)", 2),
+        ] {
+            assert_eq!(stages::<JqSemantics>(filter), jq, "jq: {filter}");
+        }
+        assert_eq!(stages::<YqSemantics>("map(. + 1) | map(. * 10)"), 2);
     }
 
     #[test]
