@@ -189,8 +189,8 @@ fn jq_exits_2_when_stdout_and_stderr_both_fail_7476() -> Result<()> {
 /// A stderr pipe with no reader: jq dies of SIGPIPE at its first diagnostic (jq 1.7.1 and 1.8.2 under
 /// the default disposition), before its buffered `1` is flushed, and so does `succinctly jq` on Linux
 /// (#5547), where the signal goes to the thread that wrote. macOS raises it on the process, so the
-/// evaluation thread can reach its own `exit` first and the run then ends as it would have, `1` and
-/// exit 5. Either way it is not the panic (exit 101) this issue was.
+/// evaluation thread can flush its `1`, or reach its own `exit` first and end as it would have (`1`
+/// and exit 5), before the signal lands. Either way it is not the panic (exit 101) this issue was.
 #[test]
 fn jq_dies_of_sigpipe_on_a_stderr_pipe_with_no_reader_7476() -> Result<()> {
     use std::os::unix::process::ExitStatusExt;
@@ -211,8 +211,12 @@ fn jq_dies_of_sigpipe_on_a_stderr_pipe_with_no_reader_7476() -> Result<()> {
     if cfg!(target_os = "linux") {
         assert_eq!(outcome, killed);
     } else {
+        let killed_after_flush = (Some(13), None, "1\n".to_string());
         let finished = (None, Some(5), "1\n".to_string());
-        assert!(outcome == killed || outcome == finished, "{outcome:?}");
+        assert!(
+            [killed, killed_after_flush, finished].contains(&outcome),
+            "{outcome:?}"
+        );
     }
     Ok(())
 }
