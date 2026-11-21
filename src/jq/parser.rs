@@ -691,6 +691,25 @@ fn yq_string_interpolations_are_closed(rest: &str) -> bool {
     true
 }
 
+/// Length in bytes of the exponent that starts `rest`, `[eE][+-]?[0-9]+`, or 0 when `rest` does
+/// not start one. jq's lexer matches the longest number token, so an `e` that no digit follows
+/// ends the number before it and starts the next token (`2else`, `3end`, #7496).
+fn number_exponent_len(rest: &[u8]) -> usize {
+    if !matches!(rest.first(), Some(b'e' | b'E')) {
+        return 0;
+    }
+    let sign = usize::from(matches!(rest.get(1), Some(b'+' | b'-')));
+    let digits = rest[1 + sign..]
+        .iter()
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    if digits == 0 {
+        0
+    } else {
+        1 + sign + digits
+    }
+}
+
 /// `text` with the redundant leading zeros of its integer part dropped (`007.50` is `7.50`,
 /// `-00e1` is `-0e1`, `00` is `0`), or `None` when it has none (#5615).
 fn strip_redundant_leading_zeros(text: &str) -> Option<String> {
@@ -3447,22 +3466,11 @@ impl<'a> Parser<'a> {
         }
 
         // Check for exponent
-        if matches!(self.peek(), Some('e' | 'E')) {
+        // #7496: jq's lexer takes `[eE][+-]?[0-9]+` or nothing (longest match), so `2else` is
+        // the number `2` and the keyword `else`; an `e` with no digit after it is not consumed.
+        let exponent_len = number_exponent_len(&self.input.as_bytes()[self.pos..]);
+        for _ in 0..exponent_len {
             self.next();
-
-            // Optional sign
-            if matches!(self.peek(), Some('+' | '-')) {
-                self.next();
-            }
-
-            // Exponent digits
-            while let Some(c) = self.peek() {
-                if c.is_ascii_digit() {
-                    self.next();
-                } else {
-                    break;
-                }
-            }
         }
 
         let spelled = &self.input[start..self.pos];
