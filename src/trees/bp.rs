@@ -4546,8 +4546,17 @@ mod tests {
         let bp = BalancedParens::new(vec![u64::MAX], 128);
         assert_eq!(bp.find_close(63), None);
         assert_eq!(bp.next_sibling(63), None);
+        // The JSON index no longer builds that shape (#7482): it stores the
+        // closes a truncated document lacks as zero words, so `[` x 64 closes
+        // its innermost open at bit 64 and the outermost at the end, as `[` x
+        // 10 already did from the padding of its one word.
         let index = crate::json::JsonIndex::build(&[b'['; 64]);
-        assert_eq!(index.bp().find_close(63), None);
+        assert_eq!(index.bp().words().len(), 2);
+        assert_eq!(index.bp().find_close(63), Some(64));
+        assert_eq!(index.bp().find_close(0), Some(127));
+        let index = crate::json::JsonIndex::build(&[b'['; 10]);
+        assert_eq!(index.bp().find_close(9), Some(10));
+        assert_eq!(index.bp().find_close(0), Some(19));
 
         // Leaves and nested nodes mixed over 286 bits (five words), every
         // open checked against the linear scan: "(" + "()((" x 47 +
