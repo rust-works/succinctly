@@ -7407,6 +7407,11 @@ impl<'a> Parser<'a> {
     /// (`needs_path_context`, `owned_identity_step`, `path_context_step_generic`,
     /// ...) has to recognize for no observable benefit outside that one
     /// `def error: .;` construction.
+    ///
+    /// `break $name` is a `Term` in jq's grammar, so a postfix applies to it (#7557): `break
+    /// $f.a`, `break $f[0]` and `break $f.[]` parse, and the postfix never runs. Out of line, so
+    /// the recursive term parser that calls it holds none of this frame (#7069).
+    #[inline(never)]
     fn parse_break_expr(&mut self) -> Result<Expr, ParseError> {
         let keyword_offset = self.pos;
         self.consume_keyword("break");
@@ -7432,11 +7437,12 @@ impl<'a> Parser<'a> {
         });
 
         let node = Expr::Break(name);
-        if self.shadowable_defs.contains("error") {
-            Ok(Self::wrap_shadowable_call("error", node))
+        let term = if self.shadowable_defs.contains("error") {
+            Self::wrap_shadowable_call("error", node)
         } else {
-            Ok(node)
-        }
+            node
+        };
+        self.parse_postfix(term)
     }
 
     /// Parse a `def`'s optional `(PARAMS)` parameter list, one [`Param`]
