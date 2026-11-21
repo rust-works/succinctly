@@ -124,7 +124,7 @@ fn test_the_closer_is_in_the_one_array_the_program_reads_5548() -> Result<()> {
     // ... and an error on it names the file.
     let (_, stderr, _, paths) =
         run_jq_over_files(&["-c", "--stream", "-s", r#"error("boom")"#], &["[1,2]"])?;
-    assert_eq!(stderr, format!("jq: error (at {}:0): boom\n", paths[0]),);
+    assert_eq!(stderr, format!("jq: error (at {}:0): boom\n", paths[0]));
     // Without `-s` the events are the same stream either way.
     let (stdout, _, code) = run_jq_full(&["-c", "--stream", "."], Some("[1,2]"))?;
     assert_eq!((stdout.as_str(), code), ("[[0],1]\n[[1],2]\n[[1]]\n", 0));
