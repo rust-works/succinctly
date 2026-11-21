@@ -11704,9 +11704,13 @@ What differs from jq 1.7.1:
   A locale layout that prints the zone itself (glibc's `en_GB` `%c` ends in `%Z`) takes the same zone labels.
 - **`%E*` and `%O*` follow the plain specifier.**
   Under a locale whose C library has alternative era or digit forms (`ja_JP` on glibc) the plain form is printed.
-- **An empty result, or one past jq's buffer, is an error.**
+- **An empty result for a format that is not empty, or one past jq's buffer, is an error; an empty format is not (#7542).**
   jq hands the library a buffer of `strlen(fmt) + 100` bytes and raises `strftime/1: unknown system failure` (`strflocaltime/1:` for the local-zone one) when `strftime` returns 0.
-  So does this: an empty format, `%p` under `de_DE` (the library prints nothing there, macOS and glibc alike) and a result of `strlen(fmt) + 100` bytes or more (five `%c`) are that error, and `strftime("...")?` is empty.
+  So does this: `%p` under `de_DE` (the library prints nothing there, macOS and glibc alike) and a result of `strlen(fmt) + 100` bytes or more (five `%c`) are that error, and `strftime("...")?` is empty.
+  jq 1.7.1 raised it for an empty format too, and `succinctly jq` did until #7542.
+  jq 1.8.2 changed the failure test from `n == 0` to `(n == 0 && *fmt) || n > max_size` (jqlang/jq#3271, listed in the 1.8 NEWS under security fixes: "Fix segmentation fault on `strftime/1`, `strflocaltime/1`"), so an empty format answers `""`: `0 | strftime("")`, `strflocaltime("")` and `strftime("\u0000x")`, whose format is empty once the NUL ends it, and `[strftime("")?]` is `[""]`.
+  `succinctly jq` follows 1.8.2 there, because upstream fixed it as a bug, and so the difference from the pinned 1.7.1 stands as `newer-than-primary`.
+  Pinned by `tests/jq_cli/i5754c.rs`, whose empty-format rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
 - **`_`, `-` and `0` are padding flags on the numeric specifiers.**
   They apply to `%d %e %H %I %j %k %l %m %M %S %U %V %W` and to `%z`, which the library prints as a signed `hhmm` number (`+0530` is `+ 530` with `_` and `+530` with `-`).
   Every other specifier ignores them, including `%y %Y %C %g %G`, where a glibc `jq` pads and strips as well.
