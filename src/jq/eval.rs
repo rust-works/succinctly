@@ -76481,6 +76481,11 @@ fn transparent_outputs(source: &Expr, input_tracked: bool, swallowed: bool) -> O
         // raises (`(.o | (walk(.)?) as $y | $y) = 1` is a silent no-op).
         leaf if is_walk_identity(leaf) => (!swallowed).then_some(false),
         leaf if is_transparent_leaf(leaf) => Some(false),
+        // #7474: a call whose generator argument the parser bound first is judged as written.
+        bound @ Expr::As { var, .. } if crate::jq::parser::is_value_arg_var(var) => {
+            let call = crate::jq::parser::unbound_value_args_call(bound)?;
+            transparent_outputs(&call, input_tracked, swallowed)
+        }
         Expr::Comma(exprs) => all(&mut exprs.iter()),
         // A handler's output is untracked; one that may see the register as its
         // error payload ([`try_body_may_raise_alias`]) is not placed at all, so the
@@ -127254,9 +127259,6 @@ mod tests {
             // `fanout_arg`'s lazy sink, flushing a *buffered* first body
             // result when the next argument value arrives...
             (b"[\"\xff\xfe\", 2]", "nth((0, 1))"),
-            // ...and the same flush on the way out of an undecodable
-            // argument value of its own.
-            (BAD_ELEMENT, "first(nth((0, .[0])))"),
         ] {
             let index = JsonIndex::build(json_bytes);
             let cursor = index.root(json_bytes);
@@ -127271,6 +127273,29 @@ mod tests {
                 }
                 other => panic!("{filter}: expected a decode failure, got {other:?}"),
             }
+        }
+        // ...and the same flush on the way out of an undecodable argument value of its own. #7474
+        // parses `first(nth((0, .[0])))` as `first((0, .[0]) as $v | nth($v))`, which stops after
+        // the first value as jq does, so the flush is reached by a call built without that binding.
+        {
+            let index = JsonIndex::build(BAD_ELEMENT);
+            let expr = Expr::FirstExpr(Box::new(Expr::Builtin(Builtin::Nth(Box::new(
+                parse("0, .[0]").unwrap(),
+            )))));
+            match eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(BAD_ELEMENT)) {
+                QueryResult::Error(e) if e.is_decode_failure() => {}
+                other => panic!(
+                    "first(nth((0, .[0]))) unbound: expected a decode failure, got {other:?}"
+                ),
+            }
+            let parsed = parse("first(nth((0, .[0])))").unwrap();
+            assert!(
+                !matches!(
+                    eval_full::<Vec<u64>, JqSemantics>(&parsed, index.root(BAD_ELEMENT)),
+                    QueryResult::Error(_)
+                ),
+                "first(nth((0, .[0]))) reads only the first argument value"
+            );
         }
         // Positive control for `each_index_expr`'s borrowed-key arm: a
         // *decodable* document string used as the computed key still
