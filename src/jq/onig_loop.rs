@@ -3897,7 +3897,7 @@ mod tests {
     }
 
     fn ops(pattern: &str) -> Option<usize> {
-        let ast = super::onig_ast_parser().parse(pattern).unwrap();
+        let ast = crate::jq::onig_ast_parser().parse(pattern).unwrap();
         onig_ops(&ast, may_fold_case(pattern))
     }
 
@@ -3993,7 +3993,7 @@ mod tests {
         // that starts a fold or a class may be more than one operation, any other letter and `.`
         // is one.
         let folding =
-            |pattern: &str| onig_ops(&super::onig_ast_parser().parse(pattern).unwrap(), true);
+            |pattern: &str| onig_ops(&crate::jq::onig_ast_parser().parse(pattern).unwrap(), true);
         assert_eq!(folding("b"), Some(1));
         assert_eq!(folding("."), Some(1));
         assert_eq!(folding("s"), None);
@@ -4343,7 +4343,7 @@ mod tests {
     #[test]
     fn a_ways_first_and_last_character_are_read_as_to_a_newline_6425() {
         let edges = |pattern: &str| {
-            let ast = super::onig_ast_parser().parse(pattern).unwrap();
+            let ast = crate::jq::onig_ast_parser().parse(pattern).unwrap();
             (edge(&ast, false), edge(&ast, true))
         };
         use Edge::{Either, Newline, Nothing, Plain};
