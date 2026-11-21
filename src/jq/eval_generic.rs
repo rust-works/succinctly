@@ -28678,6 +28678,12 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
+    // #7572: a target with an effect runs depth-first, as in `eval::eval_index_expr`.
+    if crate::jq::eval::index_target_runs_depth_first::<S>(target) {
+        return collect_drive_generic::<S, V>(|sink| {
+            each_index_expr_generic::<S, V>(target, key, value, optional, cursor, sink)
+        });
+    }
     let sum_or_merge = crate::jq::eval::yq_sum_or_merge_read::<S>(target);
     // Keys first: an empty key stream must not evaluate the target at all.
     //
@@ -37451,8 +37457,18 @@ fn collect_each_generic<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
+    collect_drive_generic::<S, V>(|sink| {
+        eval_each_generic::<S, V>(expr, value, optional, cursor, sink)
+    })
+}
+
+/// [`collect_each_generic`] over any demand-driven producer `drive` runs into the sink it is given:
+/// its outputs, ended by the flow it returns, as one result.
+fn collect_drive_generic<S: EvalSemantics, V: DocumentValue>(
+    drive: impl FnOnce(&mut dyn Sink<V>) -> Flow,
+) -> GenericResult<V> {
     let mut collected = Collected::Empty;
-    let flow = eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| {
+    let flow = drive(&mut |item| {
         collected.push(item);
         Demand::Continue
     });

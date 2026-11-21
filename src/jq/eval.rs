@@ -6253,6 +6253,25 @@ pub(crate) fn streams_escaped_generator_prefix<S: EvalSemantics>() -> bool {
     S::TAG != EvalTag::Yq
 }
 
+/// Whether the eager `E[K]` (`eval_index_expr`, both evaluators) runs its target depth-first
+/// through the demand-driven `each_index_expr` instead (#7572): jq mode, a target that can fan
+/// out, and one with an effect or a read of the input state ([`stage_may_have_effect`], the
+/// pipe's #4293 rule). `inputs[.]` then indexes each input as it is read, as jq does, so an index
+/// error names the line of the input it raised on and leaves the rest unread. Every other target
+/// keeps the eager fold, which keeps a document's nodes borrowed; `repeat` keeps it too, for the
+/// iteration cap only that route has ([`streams_unbounded`]).
+///
+/// `S::TAG == EvalTag::Jq` is the condition under which `each_index_expr` (and its generic twin)
+/// pulls a fanning target itself rather than calling back into `eval_index_expr`, so the two
+/// cannot recurse into each other.
+pub(crate) fn index_target_runs_depth_first<S: EvalSemantics>(target: &Expr) -> bool {
+    S::TAG == EvalTag::Jq
+        && S::PIPE_EFFECTS_RUN_DEPTH_FIRST
+        && !yields_at_most_one_value(target)
+        && !streams_unbounded(target)
+        && stage_may_have_effect(target)
+}
+
 /// The one definition of the four-step tail every indexing-like construct's
 /// *target* `Partial` arm runs: gate on [`streams_escaped_generator_prefix`]
 /// (yq escapes immediately, discarding the prefix), promote the running
@@ -21773,16 +21792,15 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // the full argument, including what deferring this would also require
     // of `eval_as`.
     let key_owned = to_owned_or_suppress!(&value, optional);
-    let (candidates, xs_escape) = eval_owned_multi_keep_partial::<S>(obj_expr, &key_owned);
-    // `key_owned` doesn't change across `candidates`, so this is computed
+    // `key_owned` doesn't change across the candidates, so this is computed
     // once rather than once per candidate (#909 review). Semantics-aware --
     // see `numeric_key_to_array_index`'s own doc comment for why yq mode
     // doesn't just truncate a Float key the way jq does.
     let key_idx = numeric_key_to_array_index::<S>(&key_owned);
 
-    let mut results: Vec<OwnedValue> = vec_with_capacity(candidates.len());
+    let mut results: Vec<OwnedValue> = Vec::new();
     let mut check_escape: Option<EvalEscape> = None;
-    for obj_owned in candidates {
+    let mut check = |obj_owned: OwnedValue| -> Demand {
         match (&key_owned, &obj_owned) {
             (OwnedValue::String(key), OwnedValue::Object(fields)) => {
                 results.push(OwnedValue::Bool(fields.keys().any(|k| k == key)));
@@ -21823,10 +21841,30 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     obj_owned.type_name(),
                     key_owned.type_name(),
                 )));
+                return Demand::Stop;
+            }
+        }
+        Demand::Continue
+    };
+    // #7572: jq mode checks each candidate as `xs` produces it, as jq's `. as $x | xs | has($x)`
+    // pipe does, so a mismatch stops `xs` there: collecting every candidate first ran
+    // `in(inputs)` over the whole input before its first check raised. yq mode keeps the
+    // collected candidates, as its pipes do (`PIPE_EFFECTS_RUN_DEPTH_FIRST`).
+    let xs_escape = if S::PIPE_EFFECTS_RUN_DEPTH_FIRST {
+        match eval_each_owned::<S>(obj_expr, &key_owned, false, Reentry::REBUILT, &mut check) {
+            // A stop is the check's own escape, which `check_escape` holds and which comes first.
+            Flow::Exhausted | Flow::Stopped { .. } => None,
+            Flow::Escaped(control) => Some(EvalEscape::from(control)),
+        }
+    } else {
+        let (candidates, xs_escape) = eval_owned_multi_keep_partial::<S>(obj_expr, &key_owned);
+        for candidate in candidates {
+            if check(candidate) == Demand::Stop {
                 break;
             }
         }
-    }
+        xs_escape
+    };
 
     // `check_escape` (a type mismatch on an already-produced candidate)
     // always precedes `xs_escape` (whatever ended `xs`'s own stream after
@@ -43908,6 +43946,29 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // #7572: a target with an effect is run depth-first, as jq's `E | .[$k]` runs it and as a pipe
+    // with an effect before its last stage is run (#4293): collecting every output of `inputs`
+    // before indexing the first read the whole input, so an index error named the end of the
+    // input (`<unknown>`) and the inputs jq leaves for the main loop were gone.
+    if index_target_runs_depth_first::<S>(target) {
+        let mut outputs = Vec::new();
+        let mut conversion_error = None;
+        let flow = each_index_expr::<W, S>(target, key, value, optional, &mut |item| match item
+            .into_owned::<S>()
+        {
+            Ok(item) => {
+                outputs.push(item);
+                Demand::Continue
+            }
+            Err(error) => stop_with_escape(&mut conversion_error, Control::Error(error)),
+        });
+        // Not `finish_fork_from_flow`: `.[k]?` covers the index step alone, which
+        // `each_index_expr` has already applied, so a target's error is raised either way.
+        return match resume_from_escape(conversion_error, flow) {
+            Flow::Exhausted | Flow::Stopped { .. } => owned_vec_to_result(outputs),
+            Flow::Escaped(control) => partial(outputs, control),
+        };
+    }
     let sum_or_merge = yq_sum_or_merge_read::<S>(target);
     // (3) Keys first: an empty key stream must not evaluate the target.
     //
@@ -102155,38 +102216,27 @@ fn builtin_fromstream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // prefix of events is processed below like any other, and the control
     // is re-attached to whatever it produced via `partial()` at the end,
     // instead of being silently dropped.
-    let (events, control) = match eval_single::<W, S>(f, value, optional) {
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        QueryResult::Break(label) => return QueryResult::Break(label),
-        // A bare halt has no prior events to fall back to, unlike a
-        // `Partial`'s trailing control below — falling into
-        // `result.collect_owned::<S>()` would silently treat it as "zero events"
-        // instead of halting (#791).
-        QueryResult::Halt(code) => return QueryResult::Halt(code),
-        QueryResult::Partial(vs, control) => (vs, Some(control)),
-        // #2188: `stream_outputs`, not bare `collect_owned` --
-        // `collect_owned`'s `One`/`Many` arms use unchecked `to_owned_lossy`,
-        // silently substituting `""` for an undecodable event leaf instead
-        // of raising, the same #1746-shaped bug this whole family has
-        // already been fixed for elsewhere. `stream_outputs` gives
-        // the identical `(Vec<OwnedValue>, Option<Control>)` shape this
-        // match already destructures into, so no call-site restructuring is
-        // needed -- its own `Error`/`Break`/`Halt`/`Partial` arms are simply
-        // unreachable here, since this match's own arms above already
-        // intercept those variants before `result` can carry one.
-        result => stream_outputs::<_, S>(result),
-    };
-
+    //
+    // #7572: `f` is pulled one event at a time, each event folded in as it arrives, as jq's
+    // `foreach f as $i` runs it: collecting every event first read the whole input under
+    // `fromstream(inputs)` before the first event was looked at, so an error on an early event
+    // named the end of the input, and the inputs jq leaves unread for the main loop were gone.
+    // #2188: an event is decoded with `into_owned`, which raises on an undecodable leaf rather
+    // than substituting `""`.
     let mut outputs = Vec::new();
     let mut x = OwnedValue::Null;
     let mut e = false;
-
-    for event in events {
+    let mut raised = None;
+    let mut fold = |item: Item<'a, W>| {
+        let event = match item.into_owned::<S>() {
+            Ok(event) => event,
+            Err(err) => return stop_with_escape(&mut raised, Control::Error(err)),
+        };
         if e {
             x = OwnedValue::Null;
         }
         // jq's own definition, event by event (#4971).
-        match fromstream_generic_event::<S>(x, &event) {
+        match fromstream_generic_event::<S>(core::mem::replace(&mut x, OwnedValue::Null), &event) {
             Ok((next, ended)) => {
                 x = next;
                 e = ended;
@@ -102194,16 +102244,24 @@ fn builtin_fromstream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // The values completed before a malformed event are emitted first, then the error is
             // raised, as jq's lazy `foreach` does (#5489); `try`/`?` keep them too. With none
             // completed `partial` is the bare error.
-            Err(err) => return partial(outputs, Control::Error(err)),
+            Err(err) => return stop_with_escape(&mut raised, Control::Error(err)),
         }
         if e {
             outputs.push(x.clone());
         }
-    }
+        Demand::Continue
+    };
+    // `repeat` keeps the eager route, whose iteration cap the demand-driven one does not have
+    // ([`streams_unbounded`]).
+    let flow = if streams_unbounded(f) {
+        drain_result(eval_single::<W, S>(f, value, optional), &mut fold)
+    } else {
+        eval_each::<W, S>(f, value, optional, &mut fold)
+    };
 
-    match control {
-        Some(control) => partial(outputs, control),
-        None => owned_vec_to_result(outputs),
+    match resume_from_escape(raised, flow) {
+        Flow::Exhausted | Flow::Stopped { .. } => owned_vec_to_result(outputs),
+        Flow::Escaped(control) => partial(outputs, control),
     }
 }
 
