@@ -148,7 +148,10 @@ fn report(program: &Expr, input: OwnedValue, raw: bool) -> i32 {
         Outcome::Done => 0,
         Outcome::Error(error) => {
             match &error.payload() {
-                OwnedValue::String(s) => eprintln!("jq: error (at <unknown>): {}", s.as_str()),
+                OwnedValue::String(s) => eprintln!(
+                    "jq: error (at <unknown>): {}",
+                    crate::cli::output::c_string_prefix(s.as_str())
+                ),
                 other => eprintln!(
                     "jq: error (at <unknown>) (not a string): {}",
                     other.to_json_jq_preserve()
