@@ -7301,8 +7301,11 @@ impl<'a> Parser<'a> {
         if self.peek() != Some('$') {
             return Err(ParseError::new("expected '$' after 'label'", self.pos));
         }
+        let sigil_offset = self.pos;
         self.next();
         let name = self.parse_variable_name()?;
+        // #7458: `label $__loc__` is a syntax error, as the other binding sites are (#3029).
+        self.reject_loc_as_binding_name(&name, Some("BINDING"), sigil_offset)?;
         self.skip_ws();
 
         // Expect '|'
@@ -7365,8 +7368,11 @@ impl<'a> Parser<'a> {
         if self.peek() != Some('$') {
             return Err(ParseError::new("expected '$' after 'break'", self.pos));
         }
+        let sigil_offset = self.pos;
         self.next();
         let name = self.parse_variable_name()?;
+        // #7458: `break $__loc__` is a syntax error, as is `label $__loc__`.
+        self.reject_loc_as_binding_name(&name, Some("BINDING"), sigil_offset)?;
 
         // #2964: record the site unconditionally -- before the
         // `wrap_shadowable_call` wrapper below decides whether this `break`
@@ -12612,7 +12618,10 @@ impl<'a> Parser<'a> {
             self.next();
         }
         let alias = self.parse_ident()?;
-        if !data {
+        if data {
+            // #7458: `$__loc__` is its own token, not a `BINDING`, so it names no data import.
+            self.reject_loc_as_binding_name(&alias, Some("IDENT or BINDING"), alias_offset)?;
+        } else {
             self.reject_reserved_word_as_name(&alias, "IDENT or BINDING", alias_offset)?;
         }
 
