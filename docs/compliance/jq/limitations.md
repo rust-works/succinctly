@@ -7342,6 +7342,7 @@ First output when one record is written, the pipe is held open for two seconds, 
 
 The two spellings of `-n` are the partial case.
 A lone source starts its lazy read on its front since [#6451](https://github.com/rust-works/succinctly/issues/6451), reading the first 256 KiB, so they stop on an endless stream; on a quiet pipe they wait for 256 KiB or for EOF.
+A first document longer than that is read to its end first ([#7447](https://github.com/rust-works/succinctly/issues/7447)), as jq has to read it.
 `--stream` reads a chunk at a time (`ChunkedSources`, [#5498](https://github.com/rust-works/succinctly/issues/5498)).
 The cause on the other routes is that `read_stdin_bytes` is `read_to_end`, and the plain route then splits the whole text into values before its loop.
 
@@ -7444,6 +7445,9 @@ What holds the memory, from the slope between 10 and 100 MiB (MiB of peak per Mi
   A fault is worded from the end of the last good document by the eager reader, which never needed the text before it, so the file is not read again and standard input is windowed as a file is.
   `-R` reads whole lines in windows the same way, and settles the end of the stream from the lines its producer counted.
   A container or string left open at a window's end (the splitter found no end to it) reads the source on, twice as far each time, so a stream whose last document never closes is read to its end once, as it was before.
+  Since [#7447](https://github.com/rust-works/succinctly/issues/7447) the start reads on the same way when the first document is longer than the 256 KiB front, for a lone source and for the first of several files with a document: until then such a start was turned down and the whole stream read, so an NDJSON file whose first line is a 300 KB string held the file (`-n 'reduce inputs as $x (0;.+1)'` on an M4 Pro: 105, 305 and 1029 MiB at 100 MiB, 300 MiB and 1 GiB; 305 MiB at 300 MiB on the 7950X), where the same line anywhere later held a window, and holds 5.6 to 5.8 MiB at all three sizes (6.1 on the 7950X).
+  A first chunk that cannot end in more text (a fault no byte can change, a BOM, a byte that is not UTF-8) still reads the source whole, as before.
+  Since [#7502](https://github.com/rust-works/succinctly/issues/7502) the start's buffer is no longer sized for the whole file: that reservation, never written past the front, aborted the run (`memory allocation of <file size> bytes failed`, exit 134) under a `ulimit -v` smaller than the file, where the route reads a window at a time and jq streams.
 - **A span per document, about 0.15 per MiB more, on the plain route (fixed for a regular file by #6920).**
   `-c .`, `.name` and `select` sloped at 1.15 to 1.17.
   That route called `split_json_values` over the whole file before its loop, which returns a `Vec<(usize, usize)>` of every document's byte range: 16 bytes for each of the 993,416 records, 15.2 MiB.
