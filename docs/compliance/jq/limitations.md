@@ -5837,6 +5837,16 @@ Only the first read of a malformed member asks, and a stream jq's parser reads c
 A `--slurp` stream is read again from its files, so one slurped from stdin keeps the evaluator's wording and its `(at <stdin>:N)` marker: the original bytes are gone once the values are joined, and keeping them would hold a second copy of the whole input for the run.
 `input`/`inputs` and `-n` are not on this route, and word their faults as [#5555](https://github.com/rust-works/succinctly/issues/5555) does.
 
+### A parse error past 2^31 lines or columns reports the true position ([#7461](https://github.com/rust-works/succinctly/issues/7461))
+
+jq's parser keeps its line and column in C `int`s (`int line, column;` in `src/jv_parse.c`, at jq-1.7.1 and at jq-1.8.2, printed with `%d`), so a parse error past 2^31-1 newlines in the stream, or 2^31-1 bytes on one line, reports a negative position.
+A 2 GiB stream of newlines followed by a stray `}` is `jq: parse error: Unmatched '}' at line -2147483641, column 1` in jq 1.7.1 and 1.8.2, and `... at line 2147483655, column 1` in `succinctly jq`.
+A line of 2^31+10 spaces and a `}` is `... at line 1, column -2147483636` in jq and `... at line 1, column 2147483660` in `succinctly jq`.
+`succinctly jq` prints the true number: a wrapped negative position is useless for finding the fault, and the difference shows only on an input of 2 GiB or more.
+Standard output and the exit status are jq's, and below 2^31 the messages agree.
+jq's `(at FILE:N)` marker and `input_line_number` are `size_t` in jq and do not wrap.
+No test reads 2 GiB; this record is the pin.
+
 jq builds a DOM before the program runs, so it rejects the document whatever the filter is.
 Reproducing that means validating every document up front, which costs roughly a second
 index-building pass over the input — the whole advantage this crate is built for. `--validate`
@@ -7275,6 +7285,30 @@ already-valid `n`. Real jq hangs on this exact shape rather than erroring (confi
 against the pinned jq 1.7.1 binary), so refusing with a catchable error is the same
 "would take the host process down" exception as the rest of this entry, not a new kind of
 divergence.
+
+## A document of 4 GiB or more is read without an index (#7425)
+
+`succinctly jq` indexes a document before it runs the program on it, and the index holds a text of at most `u32::MAX` bytes ([Input Size Limits](../../reference/limits.md)).
+A document longer than that, a `-s` slurp of a stream that long included, is read into a tree instead, by the one-pass reader of plain JSON (`jq::parse_plain`), and the program runs on the tree with the owned evaluator.
+Before #7425 such a document panicked with exit 101 where jq 1.7.1 (and 1.8.2) answers.
+Measured over a 4,296,011,781-byte array of 4097 strings of 1 MiB and a last `"x"` (Apple M5 Max, against `/usr/bin/jq` 1.7.1): `length` prints `4098` as jq does, named or on a pipe, and so does `-s length` over the same strings one per line; `keys | length`, `.[-1], (.[0] | length)`, `.[1:3] | length` and `-s '.[4097]'` print jq's answers too.
+`length` took 14 s and 8.6 GB at its peak (the text and the tree), where jq took about 60 s and 4.2 GB.
+
+Three cases are refused with an error at exit 5 where jq answers, a known limitation: it is outside the three reasons ADR-0018 permits a divergence for, so it is a deferred gap and not a deliberate behaviour.
+Lifting it needs an index that holds longer texts (64-bit rank directories), which is a change of its own.
+
+- A program the owned evaluator answers only by indexing the whole document (its reindex bridge): `Cannot index a value of N bytes: the index holds at most 4294967295 bytes (4 GiB)`.
+  On the array above this is `map(length) | add`, `[.[] | length]`, `[.[] | select(length > 1)]`, `first(.[])`, `sort`, `to_entries`, `del(.[0])`, `.[0] = 1` and `[paths]`, and any comma or pipe that has one of them as a stage.
+  A program that first steps to a smaller value (`.[0]`, `.key`, `.[1:3]`) indexes only that value.
+- A document that is not plain RFC 8259 JSON: a repeated key, a lone low `\u` surrogate escape (jq reads it as U+FFFD), a jq leniency such as `nan` or `007`, or nesting past 128 levels.
+  The one-pass reader declines these, and the route that reads them needs the index.
+  The message is `Cannot index a value of N bytes: the index holds at most 4294967295 bytes (4 GiB), and the document is not plain JSON, which is all that is read without an index`.
+- `--preserve-input`, which writes such a document out and indexes the text, with the first message.
+
+A malformed document of that length is reported as jq's parser reports it, at exit 5 as jq exits, with one difference: jq's column counter is a 32-bit `int`, so past 4 GiB on one line it wraps (`Expected another array element at line 1, column 1044485` for the array above with its last `]` replaced by `,]`), and succinctly prints the real column, `4296011781`.
+`tostring | length` over the array prints `4296011780` where jq 1.7.1 prints `1044484`, the same wrap in jq's string length.
+
+`jq-locate` refuses an input that long with an error at exit 1 rather than panicking; `succinctly yq -p json` already refused it with the `InputTooLarge` wording its YAML input gives.
 
 ## Standard input is read to EOF before the program runs (#6499)
 
@@ -13136,8 +13170,8 @@ leading `+` with the spelling dropped, like the `007`/`.5` they already take.
 
 **A parsed NaN compared with itself — closed by
 [#3309](https://github.com/rust-works/succinctly/issues/3309); a container compared with
-itself — closed by [#3069](https://github.com/rust-works/succinctly/issues/3069), except a
-partial slice (recorded below).**
+itself — closed by [#3069](https://github.com/rust-works/succinctly/issues/3069), except two
+slices of one array (recorded below).**
 jq's `jv_equal` short-circuits on pointer identity before comparing values, and a parsed
 number literal is an allocated `jv`, so the *same* parsed NaN is equal to itself there while a
 computed NaN is not. succinctly now keeps that identity: a NaN jq mode parses (from a document,
@@ -13180,6 +13214,7 @@ is rebuilt (`map(.)`, `sort`, `[] + .`, `[.[]]`) is a new allocation in jq too a
 | `map(nan) \| . == .` on stdin `[1]`                     | `true` | `true`     |
 | `{a:[nan]} \| .a as $x \| .a \| path($x)`               | `[]`   | `[]`       |
 | `[nan,1] \| .[0:1] == .[0:1]`                           | `true` | `false`    |
+| `.[0:1] == .[0:1]` on stdin `[NaN,1]`                   | `true` | `true`     |
 | `[nan] \| . as $a \| [$a] \| indices([$a])`             | `[0]`  | `[0]`      |
 
 The shortcut fires only where `==` is handed two handles on one storage, so the other half of
@@ -13222,16 +13257,56 @@ Still different:
   The stored member is rebuilt, because the in-place step takes a rebind only as `$r as $s | ASSIGNMENT`, a single assignment under it.
   `.a = $s.items`, `.a += $s.items`, `.[$s.n] = $s.items` and a rebind of a rebind match jq.
   The comparison needs a NaN-bearing container to observe this.
-- **Slices.** `.[0:]` and any other full-range slice hand back the array itself, as jq's view
-  does. An equal-bounds *partial* slice is a view onto the same storage in jq (pointer, offset
-  and size all equal), so `.[0:1] == .[0:1]` is identical there; here each slice is a new
-  array. Matching it would need a slice representation, which a NaN is the only way to observe.
+- **Slices.** `.[0:]` and any other full-range slice hand back the array itself, as jq's view does.
+  A partial slice is a view on its array's storage in both (#6659), so on stdin `.[0:1] == .[0:1]` over `[NaN,1]` is `true` in both; under `-n`, `[nan,1] | .[0:1] == .[0:1]` is still `false` here.
+  Two *different* slices of one array are a separate, deliberate divergence that needs no NaN: see the next section.
 - **`no_std` builds.** The bridge registry is a thread-local, so without `std` every bridge
   read rebuilds, as before, and the bridged rows above answer `false` there.
 
 Ordering is unchanged in both: NaN sorts below NaN, itself included. A mixed-instance
 `sort`/`unique`/`group_by` (`[.a,.b,.a] | unique` over two NaN tokens) depends on the sort's
 comparison order in jq, and may group differently here.
+
+### Two equally long slices of one array are `==` in jq, and are compared by content here (#7459)
+
+jq's `jv_equal` answers `true` for two arrays with the same length and the same storage pointer before it compares any element, and it does not compare the slice offset.
+A slice is a view on its array's storage in jq, so any two equally long slices of one array are `==` there, whatever they hold.
+`succinctly jq` compares their contents instead, deliberately: matching jq would make `unique`, `group_by` and array `-` silently merge or drop arrays that differ (ADR-0018 rule 4(b)), and the repo owner chose to keep the content comparison on #7459.
+
+The rule holds for slices, slices of slices, slices bound to variables or nested in arrays and objects at any depth, `x + []`, `null + x`, `first`/`last`/`limit` of a slice, `getpath` with a slice descriptor, and a `reduce` that slices its state.
+Every consumer of `jv_equal` observes it: `==`, `!=`, `unique`, `unique_by`, `group_by`, array `-`, `index`/`indices`/`rindex` with an array argument, `IN`, `any`/`all`, and object equality.
+`bsearch` observes it in 1.7.1 only: 1.8.2 implements it in C with `jv_cmp`, which compares by value.
+Ordering (`<`, `sort`, `min`, `max`, `min_by`), `contains`/`inside` and `tojson` compare by value in all three.
+So does any copy: `map(.)`, `[.[]]`, `[] + x`, `tojson | fromjson`, a write, `del`, `walk`, and a slice starting 65,536 or more elements into its storage, which jq copies (`[range(70000)] | .[65530:65534] == .[65534:65538]` is `true` in jq, `.[65536:65540] == .[65540:65544]` is `false`).
+A string slice is always a copy, so `"abcdef" | .[:3] == .[3:]` is `false` in all three, as are slices of two different arrays.
+The stdin and `-n` routes answer alike in all three tools.
+
+| Filter on `[1,2,3,4,5,6]`                              | jq 1.7.1            | jq 1.8.2            | succinctly          |
+|--------------------------------------------------------|---------------------|---------------------|---------------------|
+| `.[:3] == .[3:]`                                       | `true`              | `true`              | `false`             |
+| `.[:3] != .[3:]`                                       | `false`             | `false`             | `true`              |
+| `.[1:] == .[:-1]`                                      | `true`              | `true`              | `false`             |
+| `.[:3] == (.[3:] \| .[:3])`                            | `true`              | `true`              | `false`             |
+| `[.[:3]] == [.[3:]]`                                   | `true`              | `true`              | `false`             |
+| `.[:3] as $a \| .[3:] as $b \| [$a == $b, $a < $b]`    | `[true,true]`       | `[true,true]`       | `[false,true]`      |
+| `(.[:3] + []) == .[3:]`                                | `true`              | `true`              | `false`             |
+| `[.[:3], .[3:]] \| unique`                             | `[[1,2,3]]`         | `[[1,2,3]]`         | `[[1,2,3],[4,5,6]]` |
+| `[.[:3], .[3:]] \| group_by(.) \| length`              | `1`                 | `1`                 | `2`                 |
+| `[.[:3]] - [.[3:]]`                                    | `[]`                | `[]`                | `[[1,2,3]]`         |
+| `. as $x \| [$x[:3]] \| indices([$x[3:]])`             | `[0]`               | `[0]`               | `[]`                |
+| `. as $x \| $x[:3] \| IN($x[3:])`                      | `true`              | `true`              | `false`             |
+| `. as $x \| [[0], $x[:2], $x[4:]] \| bsearch($x[2:4])` | `1`                 | `-3`                | `-3`                |
+| `.[:3] == .[1:3]`                                      | `false`             | `false`             | `false`             |
+| `map(.) as $c \| .[:3] == $c[3:]`                      | `false`             | `false`             | `false`             |
+| `[.[:3], .[3:]] \| sort`                               | `[[1,2,3],[4,5,6]]` | `[[1,2,3],[4,5,6]]` | `[[1,2,3],[4,5,6]]` |
+| `. as $x \| [$x[:3]] \| contains([$x[3:]])`            | `false`             | `false`             | `false`             |
+
+Upstream, the shortcut is `jv_equal`'s `a.kind_flags == b.kind_flags && a.size == b.size && a.u.ptr == b.u.ptr` in `src/jv.c` (`jvp_equal` in 1.8), the same at jq-1.7.1, jq-1.8.2 and master (5c001b18d7, 2026-11-02).
+`jv_identical` and `jvp_array_equal` both compare the offset.
+Blame puts the missing term in jqlang/jq@74a14f5de7 ("Refactor jv structure.", 2013), which replaced a check of the pointer, offset and size with one of the kind, size and pointer.
+No upstream issue or fix was found (searched `slice equal`, `jv_equal`, `unique slice`).
+If upstream fixes it, the latest-jq rule closes this divergence.
+`tests/jq_cli/i7459.rs` pins the content answers in both routes.
 
 ### NaN ties in `sort`, `unique`, `group_by`, `min` and `max` keep jq's order (#6008)
 
@@ -14981,6 +15056,13 @@ The `,` is bare and the `:` carries the object color (#3110).
 Until #5473 succinctly reset after every token and wrote each color once, which looked the same on a terminal and differed in every byte.
 `succinctly yq -C -o json` keeps that older per-token framing: real yq's JSON colors and framing are a third thing (`{` plain, keys `36`, numbers `95`), so neither framing matches it, and it is a separate difference from this one.
 
+**An empty eighth `JQ_COLORS` field followed by `:` keeps the default key color ([#7431](https://github.com/rust-works/succinctly/issues/7431)).**
+`JQ_COLORS=1:2:3:4:5:6:7::` (and `::::::::`, `::::::::8`) sets the object-key color to the empty color `ESC[m` in jq 1.7.1, whose `jq_set_colors` loop reads an eighth field while text remains after the seventh `:`.
+`succinctly jq` keeps the default key color `1;34`, as jq 1.8.2 does, whose rewritten `jq_set_colors` (jqlang/jq#3282, "dynamically allocate space for `JQ_COLORS`") ignores an empty last field.
+The owner chose to leave this as it is rather than follow 1.7.1: upstream changed it in a rewrite that adds larger escapes, not as a fix of this case.
+`printf '{"a":1}' | JQ_COLORS=1:2:3:4:5:6:7:: jq -C -c .` writes the key as `ESC[m"a"` in 1.7.1, and `ESC[1;34m"a"` in 1.8.2 and in `succinctly jq`.
+An empty eighth field that is the last one (`1:2:3:4:5:6:7:`), an empty field among the first seven and an invalid eighth field already agree with 1.7.1.
+
 **`null`'s default color, and NaN's own double wrap (#3413).** jq 1.7.1's default color for
 `null` is `0;90` (bright black), confirmed live on both the macOS system build and the Linux
 release binary -- not `1;30` as an earlier default-colors table here assumed. A NaN -- from
@@ -15064,6 +15146,15 @@ These keep the character step, and differ from jq where the shape occurs:
   3 of the 1,854 patterns are of this kind.
 
 Pinned by `tests/jq_cli/i6326.rs`.
+
+## `-f` with no program file: jq 1.8.2's usage error, not jq 1.7.1's `Could not open .` ([#7439](https://github.com/rust-works/succinctly/issues/7439))
+
+`-f`/`--from-file` is a flag in both jq 1.7.1 and jq 1.8.2: the first positional word, wherever it sits, is the program file.
+With no positional word at all (`jq -f`, `jq -n -f --args`), jq 1.7.1 falls back to the program `.` whenever standard input or output is not a terminal, and then fails to open `.` as the file: `jq: Could not open .: It's a directory`, exit 2.
+jq 1.8 fixed that ([jqlang/jq@7a1fd72d](https://github.com/jqlang/jq/commit/7a1fd72d2d), "Fix missing program from file"): the `.` default no longer applies under `-f`, and jq 1.8.2 prints its short usage text instead, exit 2.
+`succinctly jq` follows jq 1.8.2 here (newer than the pinned 1.7.1), with its own version in the usage text's first line; the exit status is 2 in all three.
+A named argument is still read first, as in both jq releases: `jq -f --rawfile x nope` reports the missing `--rawfile` file.
+Pinned by `tests/jq_cli/i7439.rs`.
 
 ## `@urid`: jq 1.8.2's behaviour for the format, jq 1.7.1's for `format("urid")`
 

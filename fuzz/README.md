@@ -12,7 +12,7 @@ search for the next one.
 
 This is a standalone workspace with its own `Cargo.lock`, mirroring
 [`bench-compare/`](../bench-compare/). `cargo-fuzz` needs nightly
-(`-Zsanitizer=address`) while the main crate promises `rust-version = "1.73.0"`,
+(`-Zsanitizer=address`) while the main crate promises the `rust-version` in its `Cargo.toml`,
 so isolating the harness keeps `libfuzzer-sys` and `arbitrary` out of the main
 dependency graph entirely — neither the MSRV promise nor `cargo deny check all`
 is affected.

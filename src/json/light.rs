@@ -251,6 +251,19 @@ impl ScalarIndexParts {
 }
 
 impl JsonIndex<Vec<u64>> {
+    /// The longest text, in bytes, an index can hold: `u32::MAX`, just under 4 GiB (#188).
+    pub const MAX_TEXT_LEN: usize = u32::MAX as usize;
+
+    /// Whether [`build`](Self::build) accepts a text of `len` bytes, rather than panicking.
+    ///
+    /// The one definition of the ceiling every constructor asserts, so a caller that reads a
+    /// longer text some other way (`succinctly jq` reads a document of 4 GiB or more without an
+    /// index, #7425) asks the same question the assertion does.
+    #[must_use]
+    pub const fn can_index(len: usize) -> bool {
+        len <= Self::MAX_TEXT_LEN
+    }
+
     /// Build a JSON index from JSON text.
     ///
     /// This parses the JSON to build the interest bits (IB) and balanced
@@ -267,7 +280,7 @@ impl JsonIndex<Vec<u64>> {
     /// inputs would previously truncate silently.
     pub fn build(json: &[u8]) -> Self {
         assert!(
-            u32::try_from(json.len()).is_ok(),
+            Self::can_index(json.len()),
             "JsonIndex supports inputs up to u32::MAX (4294967295) bytes; got {} bytes (#188)",
             json.len()
         );
@@ -344,7 +357,7 @@ impl JsonIndex<Vec<u64>> {
     /// Same contract as `build_reindex_scalar` for `len`.
     pub(crate) fn build_reindex_scalar_from(len: usize, parts: ScalarIndexParts) -> Self {
         assert!(
-            u32::try_from(len).is_ok(),
+            Self::can_index(len),
             "JsonIndex supports inputs up to u32::MAX (4294967295) bytes; got {len} bytes (#188)"
         );
         let ScalarIndexParts {
@@ -408,7 +421,7 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
     /// own ceiling.)
     pub fn from_parts(ib: W, ib_len: usize, bp: W, bp_len: usize) -> Self {
         assert!(
-            u32::try_from(ib_len).is_ok(),
+            JsonIndex::can_index(ib_len),
             "JsonIndex supports inputs up to u32::MAX (4294967295) bytes; got {ib_len} bits (#188)"
         );
         // Build cumulative popcount index for IB
@@ -9088,6 +9101,18 @@ mod tests {
         let mut buf = String::new();
         stream_json_as_yaml(&mut buf, value, 0, 0).unwrap();
         assert_eq!(buf, "{a: .inf, b: -.inf}");
+    }
+
+    /// #7425: the ceiling every constructor asserts, at its boundary. `succinctly jq` routes a
+    /// document by this answer, so a longer one is read without an index instead of panicking.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn can_index_holds_up_to_u32_max_bytes_7425() {
+        assert_eq!(JsonIndex::MAX_TEXT_LEN, 4_294_967_295);
+        assert!(JsonIndex::can_index(0));
+        assert!(JsonIndex::can_index(u32::MAX as usize));
+        assert!(!JsonIndex::can_index(u32::MAX as usize + 1));
+        assert!(!JsonIndex::can_index(usize::MAX));
     }
 
     #[test]

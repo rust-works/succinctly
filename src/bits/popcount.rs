@@ -218,12 +218,11 @@ unsafe fn popcount_64bytes_neon(ptr: *const u8) -> u32 {
 ))]
 #[inline]
 #[target_feature(enable = "avx512f,avx512vpopcntdq")]
-// `_mm512_loadu_si512`/`_mm512_popcnt_epi64`/`_mm512_reduce_add_epi64` stabilized in
-// Rust 1.89, above the crate's declared MSRV (1.73.0). This fn is only reachable
-// behind the opt-in `simd` feature + x86_64 + a runtime
-// `is_x86_feature_detected!("avx512vpopcntdq")` check, and CI always builds with
-// latest stable, so the crate-wide MSRV floor (which covers the rest of the library)
-// doesn't need to move for this one opt-in kernel.
+// `_mm512_loadu_si512`/`_mm512_popcnt_epi64`/`_mm512_reduce_add_epi64` and the
+// `avx512f`/`avx512vpopcntdq` target features stabilized in Rust 1.89, and this kernel
+// is what puts `rust-version` at 1.89.0: without `simd`, or off x86_64, the crate
+// builds on 1.85 (docs/guides/release.md#msrv-policy). The allow is for clippy's own
+// `msrv`, which clippy.toml still holds at 1.73.
 #[allow(clippy::incompatible_msrv)]
 unsafe fn popcount_words_avx512vpopcntdq(words: &[u64]) -> usize {
     use core::arch::x86_64::*;

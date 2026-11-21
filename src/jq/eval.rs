@@ -2338,7 +2338,7 @@ pub struct DefScope<'e> {
 /// expanding-set and the memo.
 ///
 /// A plain cast, not `core::ptr::from_ref`: that is stable only since 1.76
-/// and this crate's MSRV is 1.73 (`clippy::incompatible_msrv` is the only
+/// and clippy's `msrv` is 1.73 (clippy.toml; `clippy::incompatible_msrv` is the only
 /// thing that catches the difference — it builds either way).
 #[must_use]
 pub fn expr_key(expr: &Expr) -> usize {
@@ -4621,8 +4621,8 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // after the first element or an end before the last never does, which is every
                 // narrow slice of a loop.
                 //
-                // `map_or(true, ..)` rather than `is_none_or`: the crate's MSRV is 1.73 and
-                // `Option::is_none_or` is stable since 1.82.
+                // `map_or(true, ..)` rather than `is_none_or`: clippy's `msrv` (clippy.toml) is 1.73
+                // and `Option::is_none_or` is stable since 1.82.
                 #[allow(clippy::unnecessary_map_or)]
                 let may_be_full = start.map_or(true, |s| s <= 0) && end.map_or(true, |e| e >= 0);
                 if S::TAG != EvalTag::Yq
@@ -7206,7 +7206,7 @@ pub(crate) fn suppresses(e: &EvalError, optional: bool) -> bool {
 /// shortcut evaluates nothing, so no `Shared` read is skipped that a stack
 /// check (ADR-0025) would have guarded.
 ///
-/// Not `Option::is_none_or`: the crate's MSRV is 1.73 and that is 1.82.
+/// Not `Option::is_none_or`: clippy's `msrv` (clippy.toml) is 1.73 and that is 1.82.
 pub(crate) fn try_swallows_scalar_iteration(expr: &Expr, catch: Option<&Expr>) -> bool {
     matches!(unwrap_bind_source(expr), Expr::Iterate) && catch.map_or(true, is_empty_handler)
 }
@@ -23246,7 +23246,7 @@ fn extremum_by_elements<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Ok(key) => key,
             Err(escape) => return escape,
         };
-        // `map_or(true, ..)`, not `is_none_or`: the crate's MSRV is 1.73.
+        // `map_or(true, ..)`, not `is_none_or`: clippy's `msrv` is 1.73 (clippy.toml).
         let replaces = held.as_ref().map_or(true, |(best, _)| {
             let order = compare_key_arrays::<S>(&key, best);
             if want_max {
@@ -48597,8 +48597,8 @@ fn resolves_to_at_most_one_path(expr: &Expr) -> bool {
             resolves_to_at_most_one_path(target) && yields_at_most_one_value(key)
         }
         Expr::SliceExpr { target, start, end } => {
-            // `map_or(true, ..)` rather than `is_none_or`: the crate's MSRV
-            // is 1.73 and `Option::is_none_or` is stable since 1.82, which
+            // `map_or(true, ..)` rather than `is_none_or`: clippy's `msrv`
+            // (clippy.toml) is 1.73 and `Option::is_none_or` is stable since 1.82, which
             // `clippy::incompatible_msrv` rejects -- the same substitution
             // `jq_seq_reader.rs`/`yq_runner.rs` already make.
             #[allow(clippy::unnecessary_map_or)]
@@ -100238,8 +100238,8 @@ fn range_batch_f64(
     // caller passing some other variant (or a value numerically unequal to
     // `from`) would silently splice a wrong value into a numeric range's
     // output with no other defense.
-    // `map_or(true, ..)` rather than `is_none_or`: the crate's MSRV is 1.73
-    // and `Option::is_none_or` is 1.82.
+    // `map_or(true, ..)` rather than `is_none_or`: clippy's `msrv` (clippy.toml) is
+    // 1.73 and `Option::is_none_or` is 1.82.
     debug_assert!(
         first_value.map_or(true, |v| matches!(v, OwnedValue::NumberLiteral(..))),
         "range's first_value override must be a NumberLiteral, got {first_value:?}"
@@ -114351,29 +114351,31 @@ fn builtin_halt_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Err(control) => Err(control.into()),
             };
             match n_result {
-                // Clamped into `0..=i32::MAX`, not wrapped, to match real jq:
-                // verified live against jq 1.7.1 that an out-of-range
-                // positive exit code clamps to `i32::MAX` (e.g.
-                // `halt_error(4294967296)` exits 255, `i32::MAX`'s low byte —
-                // not 0, which a wrapping `as i32` cast would give), and that
-                // every negative `halt_error(n)`, from `-1` through `-1e300`,
-                // exits 0 rather than the OS's usual two's-complement
-                // byte-truncation of a negative process-exit status (#791).
-                // The `i64`-typed arm needs an explicit `clamp` for this,
-                // since `as i32` on an integer wraps instead; the `f64` arm's
-                // `.max(0.0)` (floors before the saturating `as i32` cast,
-                // which already handles the upper bound, NaN, and +/-infinity
-                // by Rust's cast semantics since 1.45) is the float twin.
+                // Saturated into `i32`, not wrapped, to match real jq (which assigns the
+                // number to an `int`): verified live against jq 1.7.1 that an out-of-range
+                // positive exit code clamps to `i32::MAX` (e.g. `halt_error(4294967296)`
+                // exits 255, `i32::MAX`'s low byte -- not 0, which a wrapping `as i32` cast
+                // would give). A negative code is handed over as it is (#7440): jq's `-e`
+                // exits with its absolute value (`halt_error(-300)` exits 44) and without
+                // `-e` it exits 0 for every negative from `-1` through `-1e300` (#791), a
+                // choice the CLI makes in `ErrorSink::request_halt`, which knows the flag.
+                // The `i64`-typed arm needs an explicit `clamp` for this, since `as i32` on an
+                // integer wraps instead; the `f64` arm's `as i32` already saturates, sends NaN
+                // to 0 and truncates a fraction toward zero (Rust's cast semantics since 1.45).
                 Ok(OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _)) => {
-                    i.clamp(0, i64::from(i32::MAX)) as i32
+                    i.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
                 }
                 Ok(OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _)) => {
-                    f.max(0.0) as i32
+                    f as i32
                 }
+                // #7441: jq's `f_halt_error` raises a `type_error` on the INPUT value
+                // (`<type> (<input>) halt_error/1: number required`), not on the argument.
                 Ok(_) => {
-                    return QueryResult::Error(EvalError::new(
-                        "halt_error/1 requires a number exit code",
-                    ));
+                    let message = match to_owned::<S, _>(&value) {
+                        Ok(owned) => EvalError::halt_error_number_required(&owned),
+                        Err(e) => e,
+                    };
+                    return suppress_or_raise(message, optional);
                 }
                 Err(e) => return e.into(),
             }

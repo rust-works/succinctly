@@ -5835,8 +5835,8 @@ fn scan_anchor_soundness<'v, 'c>(
         // No such declaration yet (missing entirely, or emitted later than
         // this alias), or one whose value has since diverged from this one.
         // Spelled as a negated `matches!` rather than clippy's suggested
-        // `is_none_or`, which is stable only since 1.82 and this crate's
-        // MSRV is 1.73.
+        // `is_none_or`, which is stable only since 1.82 and clippy's
+        // `msrv` (clippy.toml) is 1.73.
         // `identical`, not `==` (#1360): jq value equality says `NaN` differs
         // from itself, so an anchored `.nan` reported a divergence that never
         // happened and lost its alias mark. It is also too loose in the other

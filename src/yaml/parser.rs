@@ -1654,8 +1654,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         let frames = &self.pending_block.frames;
         let column = self.pending_block.column;
         let next_column = next.map(|(_, c)| c);
-        // `next_column.is_none_or(..)` is stable only since 1.82; the MSRV
-        // is 1.73.
+        // `next_column.is_none_or(..)` is stable only since 1.82; clippy's
+        // `msrv` (clippy.toml) is 1.73.
         let closing = |frame: &CommentFrame| next_column.map_or(true, |c| frame.indent > c);
         let start = frames
             .iter()

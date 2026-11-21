@@ -246,6 +246,9 @@ pub use value::{
 // depth-guard helper on docs.rs with no external caller to justify the
 // exposure.
 pub(crate) use value::assert_depth;
+// For the CLI's reader of a document no index can hold (#7425).
+#[cfg(feature = "cli")]
+pub(crate) use value::index_ceiling_message;
 // `pub(crate)` for the same reason (#2206): `json::light`'s number
 // writer is the only caller, and the predicate is an implementation
 // detail of `format_number_jq_compat`'s fast path -- not something an

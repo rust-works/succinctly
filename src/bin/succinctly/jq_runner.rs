@@ -132,9 +132,12 @@ impl JqCommand {
     /// `jq -n --args '$ARGS.positional' a b` arrives with the filter inside
     /// `args` and no `filter` at all, and a later `--jsonargs` arrives as one
     /// more `args` value. jq's rule is: the first non-option word is the
-    /// program (unless `-f` supplied it), and every later word takes the mode
-    /// of the most recent `--args`/`--jsonargs`. This walks each captured list
-    /// in order applying exactly that, and a `--` ends the mode switches.
+    /// program, and every later word takes the mode of the most recent
+    /// `--args`/`--jsonargs`. This walks each captured list in order applying
+    /// exactly that, and a `--` ends the mode switches.
+    ///
+    /// Under `-f` that first word is the program's *file* (#7439): it moves
+    /// from `filter` to `program_file`, so `filter` is then always `None`.
     ///
     /// Only words clap already captured are resequenced. By the time clap
     /// sees argv, `hoist_options_before_positional_flags` (`main.rs`) has
@@ -172,7 +175,7 @@ impl JqCommand {
                 }
                 let option_shaped =
                     word.starts_with('-') && !super::looks_like_negative_filter(&word);
-                if self.filter.is_none() && self.from_file.is_none() && !option_shaped {
+                if self.filter.is_none() && !option_shaped {
                     self.filter = Some(word.into());
                 } else if json {
                     self.positional_words.push(PositionalWord::Json(word));
@@ -181,7 +184,38 @@ impl JqCommand {
                 }
             }
         }
+        if self.from_file {
+            // With no positional word at all `program_file` stays `None`, which `run_jq` answers
+            // with jq's usage text (#7439, [`jq_short_usage`]).
+            self.program_file = self.filter.take().map(PathBuf::from);
+        }
     }
+}
+
+/// What jq 1.8.2 prints to standard error, before exiting 2, for `-f` with no program file
+/// (`usage(2, 1)` in its `main.c`), with this build's version in jq's (#7439).
+///
+/// jq 1.7.1 fell back to the program `.` whenever standard input or output is not a terminal,
+/// and then tried to open `.` as the program file (`jq: Could not open .: It's a directory`, exit
+/// 2). jq fixed that in 1.8 (jqlang/jq commit 7a1fd72d, "Fix missing program from file": the `.`
+/// default no longer applies under `-f`), so this follows 1.8.2; the exit status is 2 in both.
+fn jq_short_usage() -> String {
+    format!(
+        "jq - commandline JSON processor [version {}]\n\
+         \nUsage:\tjq [options] <jq filter> [file...]\n\
+         \tjq [options] --args <jq filter> [strings...]\n\
+         \tjq [options] --jsonargs <jq filter> [JSON_TEXTS...]\n\n\
+         jq is a tool for processing JSON inputs, applying the given filter to\n\
+         its JSON text inputs and producing the filter's results as JSON on\n\
+         standard output.\n\n\
+         The simplest filter is ., which copies jq's input to its output\n\
+         unmodified except for formatting. For more advanced filters see\n\
+         the jq(1) manpage (\"man jq\") and/or https://jqlang.org/.\n\n\
+         Example:\n\n\t$ echo '{{\"foo\": 0}}' | jq .\n\
+         \t{{\n\t  \"foo\": 0\n\t}}\n\n\
+         For listing the command options, use jq --help.\n",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 /// Evaluation context for passing variables to the jq evaluator.
@@ -657,6 +691,18 @@ fn strerror_only(e: &std::io::Error) -> String {
     }
 }
 
+/// The `<detail>` of jq's `Could not open <file>: <detail>` for a file it reads whole (`-f`,
+/// `--slurpfile`, `--rawfile`: jq's `jv_load_file`), which checks for a directory itself and says
+/// `It's a directory` where `strerror` would say `Is a directory` (#7439, captured from jq 1.7.1:
+/// `jq -f`, `jq -n --rawfile x . 1`). Any other failure is `strerror`'s text.
+fn load_file_detail(e: &std::io::Error) -> String {
+    if e.raw_os_error() == Some(EISDIR) {
+        "It's a directory".to_string()
+    } else {
+        strerror_only(e)
+    }
+}
+
 /// Read `--slurpfile`/`--rawfile`'s file argument, wrapped in jq's own
 /// `Bad JSON in --<flag> <name> <file>: Could not open <file>: <detail>`
 /// shape on a read failure (#3051, confirmed live for both flags) -- one
@@ -680,7 +726,7 @@ fn read_arg_file(
             &format!(
                 "Could not open {}: {}",
                 crate::cli::jq_word_text(file),
-                strerror_only(&e)
+                load_file_detail(&e)
             ),
         )
     })
@@ -3694,8 +3740,8 @@ fn write_json_string_zero_copy<Out: Write>(
 
 /// Trim leading and trailing ASCII whitespace from a byte slice.
 ///
-/// Equivalent to `<[u8]>::trim_ascii` but usable on our MSRV (1.73), which
-/// predates that method's stabilization (1.80).
+/// Equivalent to `<[u8]>::trim_ascii` (stable since 1.80), which clippy's
+/// `msrv` (1.73, clippy.toml) still rejects.
 fn trim_ascii_ws(bytes: &[u8]) -> &[u8] {
     let start = bytes
         .iter()
@@ -4711,8 +4757,8 @@ fn jq_exit_code(
 /// once rather than swapped per call: the hook is process-global, so a
 /// per-call take/restore would interleave across threads and nest one
 /// wrapper deeper per call.
-// `PanicInfo` is the hook's type on this crate's 1.73 MSRV; newer toolchains
-// renamed it `PanicHookInfo` and deprecate the old name.
+// `PanicInfo` is the hook's type on clippy's 1.73 `msrv` (clippy.toml); 1.81
+// renamed it `PanicHookInfo` and deprecates the old name.
 #[allow(deprecated)]
 pub(crate) fn silence_depth_guard_panic_line() {
     static INSTALLED: std::sync::Once = std::sync::Once::new();
@@ -4863,6 +4909,13 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     // allocations) to a process about to end was a quarter of the run (#5673).
     let mut context = std::mem::ManuallyDrop::new(context);
     share_named_strings(&mut context);
+
+    // `-f` with no program file is jq 1.8.2's usage error (#7439), reached after the named
+    // arguments are read, as jq reads them while it parses argv.
+    if args.from_file && args.program_file.is_none() {
+        eprint!("{}", jq_short_usage());
+        return Ok(exit_codes::USAGE_ERROR);
+    }
 
     // Get the filter expression. An unreadable `-f`/`--from-file` file is
     // jq's own usage error (exit 2), so it gets the same two-arm treatment
@@ -5224,6 +5277,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     // so the failure is remembered here, and `jq_exit_code` turns the ones its
     // `--on-error` mode counts into exit 5 (#355, #5471).
     let mut sink = ErrorSink::default();
+    sink.set_halt_negative_as_abs(args.exit_status);
     // An input file jq could not open is reported and skipped, and the run then exits 2
     // whatever else happened (#5472).
     let mut open_failed = false;
@@ -5864,6 +5918,42 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     }
                     output_config.write_identity_bytes(&mut out, json_bytes)?;
                     out.write_all(b"\n")?;
+                    continue;
+                }
+
+                // #7425: a document no index can hold (4 GiB or more, a slurp of that much
+                // included) is read into a tree without one, and the program runs on the tree.
+                if !JsonIndex::can_index(json_bytes.len()) {
+                    let at = ErrorAt::Fixed(locator.at(end));
+                    evaluate_unindexable_document(
+                        json_bytes,
+                        &expr,
+                        &context,
+                        &at,
+                        &mut sink,
+                        &output_config,
+                        &mut |sink, result| {
+                            had_output = true;
+                            // Its truthiness, as the lazy route records an owned result's.
+                            if args.exit_status {
+                                last_output = Some(OwnedValue::Bool(!matches!(
+                                    result,
+                                    OwnedValue::Null | OwnedValue::Bool(false)
+                                )));
+                            }
+                            let stop = route_write_error(
+                                sink,
+                                &mut out,
+                                || at.resolve(),
+                                |o| write_output_owned_value(o, &result, &output_config),
+                            )?;
+                            Ok(!stop)
+                        },
+                    )?;
+                    if let Some(code) = sink.halted() {
+                        out.flush()?;
+                        return Ok(halt_exit_code(code, open_failed));
+                    }
                     continue;
                 }
 
@@ -6944,7 +7034,7 @@ fn build_args_var(context: &EvalContext) -> OwnedValue {
 /// [`build_context`]'s flag errors rather than sharing the main-input
 /// wording.
 fn get_filter(args: &JqCommand) -> Result<String, BuildContextError> {
-    if let Some(ref path) = args.from_file {
+    if let Some(ref path) = args.program_file {
         // Filter comes from file.
         let contents = std::fs::read_to_string(path).map_err(|e| {
             // jq builds this one as a `jv` string, so the file reads as its U+FFFD text (#7426).
@@ -6952,7 +7042,7 @@ fn get_filter(args: &JqCommand) -> Result<String, BuildContextError> {
                 format!(
                     "Could not open {}: {}",
                     crate::cli::jq_word_text(path.as_os_str()),
-                    strerror_only(&e)
+                    load_file_detail(&e)
                 )
                 .into(),
             )
@@ -6970,22 +7060,10 @@ fn get_input_files(args: &JqCommand) -> Vec<std::path::PathBuf> {
     // `--args`/`--jsonargs` take every word after them, so `files` holds only
     // the words *before* the flag, which jq still reads as input files
     // (`jq . data.json --args a`, #3447). The words after it are in
-    // `positional_words`, never here.
-    // When -f is used, the 'filter' field becomes the first input file
-    // because the filter comes from a file instead of command line
-    let mut files: Vec<std::path::PathBuf> = Vec::new();
-
-    if args.from_file.is_some() {
-        // When -f is used, the first positional arg (if any) is an input file
-        if let Some(ref first_file) = args.filter {
-            files.push(std::path::PathBuf::from(first_file));
-        }
-    }
-
-    // Add remaining files
-    files.extend(args.files.iter().map(std::path::PathBuf::from));
-
-    files
+    // `positional_words`, never here. Under `-f` the first positional word
+    // is the program file, already moved out of `filter` (#7439), so the
+    // input files are `files` alone either way.
+    args.files.iter().map(std::path::PathBuf::from).collect()
 }
 
 /// Whether to force a real read under `-n` for `input`/`inputs`/
@@ -9380,7 +9458,7 @@ fn program_context(args: &JqCommand) -> jq::cli_context::ProgramContext {
                 Some(dir) if !dir.as_os_str().is_empty() => dir.to_string_lossy().to_string(),
                 _ => ".".to_string(),
             });
-    let prog_origin = match &args.from_file {
+    let prog_origin = match &args.program_file {
         Some(path) => std::fs::canonicalize(path)
             .ok()
             .and_then(|p| p.parent().map(|dir| dir.to_string_lossy().to_string())),
@@ -13349,7 +13427,7 @@ fn non_string_key_fault(bytes: &[u8], at: usize, stream: bool) -> usize {
             // A fault inside the container is met before the container is a value.
             Err(_) => return parse_error_detection(bytes, at, stream),
         },
-        // (`map_or(true, ..)`, not `is_none_or`: the crate's MSRV is 1.73.)
+        // (`map_or(true, ..)`, not `is_none_or`: clippy's `msrv` is 1.73, clippy.toml.)
         Some(&b) if !is_jq_token_boundary(b) => {
             let end = token_end(bytes, at);
             if validate_jq_lenient(&bytes[at..end]).is_err() {
@@ -13387,7 +13465,7 @@ fn fault_past_invalid_utf8(
     let mut mapped = None;
     let mut rest = tail;
     while !rest.is_empty() {
-        // (`Utf8Chunks` is newer than this crate's MSRV.)
+        // (`Utf8Chunks` is newer than clippy's `msrv`, clippy.toml.)
         let (valid, invalid) = match core::str::from_utf8(rest) {
             Ok(_) => (rest.len(), 0),
             Err(e) => (
@@ -17943,11 +18021,14 @@ impl InputDoc {
 }
 
 /// The bridge document of an owned input (see [`InputDoc::Bridge`]); the one place it is built, so
-/// a test can count the inputs that needed one (#5624).
-fn bridge_doc_of(input: &OwnedValue) -> succinctly::jq::ReindexedDoc {
+/// a test can count the inputs that needed one (#5624). An error for an input whose text no index
+/// can hold (#7425).
+fn bridge_doc_of(
+    input: &OwnedValue,
+) -> core::result::Result<succinctly::jq::ReindexedDoc, EvalError> {
     #[cfg(test)]
     bridge_docs::bump();
-    input.input_bridge_doc()
+    input.try_input_bridge_doc()
 }
 
 /// Test-only count of [`bridge_doc_of`] calls on this thread.
@@ -18023,6 +18104,38 @@ fn evaluate_input_streaming(
         on_value,
     )
     .map(|_| ())
+}
+
+/// Runs `expr` over a document no [`JsonIndex`] can hold (#7425), read into a tree by
+/// [`unindexable_document_value`] and evaluated where it is, as the owned evaluator evaluates a
+/// `--stream` event; a document that reader refuses is reported to `sink` as the lazy route
+/// reports a malformed one, which words it as jq's parser does.
+fn evaluate_unindexable_document(
+    bytes: &[u8],
+    expr: &jq::Expr,
+    context: &EvalContext,
+    at: &ErrorAt<'_>,
+    sink: &mut ErrorSink,
+    output_config: &OutputConfig,
+    on_value: &mut dyn FnMut(&mut ErrorSink, OwnedValue) -> Result<bool>,
+) -> Result<()> {
+    match unindexable_document_value(bytes) {
+        Ok(value) => evaluate_input_streaming_via(
+            &value,
+            expr,
+            context,
+            at,
+            sink,
+            output_config,
+            OwnedRoute::Always,
+            on_value,
+        )
+        .map(|_| ()),
+        Err(error) => {
+            sink.report(DiagStyle::Jq, &error, &at.resolve());
+            Ok(())
+        }
+    }
 }
 
 /// The route `run_jq` gives an input that is already a tree (#5681, #5764): a
@@ -18274,10 +18387,25 @@ fn evaluate_input_streaming_via(
         }
         let doc = if preserve {
             let text = input.to_json_jq_preserve();
+            // #7425: no index holds a text of 4 GiB or more.
+            if !JsonIndex::can_index(text.len()) {
+                return Some(jq::Control::Error(EvalError::resource_limit(
+                    jq::index_ceiling_message(text.len()),
+                )));
+            }
             let index = JsonIndex::build(text.as_bytes());
             InputDoc::Preserve(text, index)
         } else {
-            InputDoc::Bridge(bridge_doc_of(input))
+            match bridge_doc_of(input) {
+                Ok(doc) => InputDoc::Bridge(doc),
+                // #7425: an input whose text no index holds is read where it is, by the owned
+                // evaluator, whose own bridge refuses only a stage it would have to index it for.
+                Err(_) => {
+                    return jq::eval_generic::eval_each_owned_input(expr, input, &mut |v| {
+                        deliver(sink, Some(v))
+                    });
+                }
+            }
         };
         let cursor = doc.root();
         jq::eval_generic::eval_each_with_cursor(expr, cursor, &mut |result| {
@@ -20287,6 +20415,29 @@ fn json_document_to_owned_value_checked(
     json_document_to_owned_value(bytes, at, Delimiters::Walk)
 }
 
+/// A document of `bytes` that no [`JsonIndex`] can hold (4 GiB or more, #7425), read into a tree
+/// without one.
+///
+/// jq's one-pass reader of plain RFC 8259 text ([`jq::parse_plain`]) builds what it accepts as the
+/// indexed route does, and nearly every large document is such text. What it declines is either a
+/// fault jq's parser meets (its depth limit included), returned as the decode failure the indexed
+/// route returns for a malformed document, so a caller words it as it words that one; or text jq
+/// reads that only the indexed route reads (a repeated key, a lone low surrogate escape, `nan`,
+/// nesting past 128 levels), refused with a resource-limit error, a divergence recorded in
+/// `docs/compliance/jq/limitations.md`.
+fn unindexable_document_value(bytes: &[u8]) -> core::result::Result<OwnedValue, EvalError> {
+    if let Some(value) = core::str::from_utf8(bytes).ok().and_then(jq::parse_plain) {
+        return Ok(value);
+    }
+    if jq::jq_stream_fault([bytes], 1, 0).is_some() {
+        return Err(EvalError::malformed_json_text(bytes));
+    }
+    Err(EvalError::resource_limit(format!(
+        "{}, and the document is not plain JSON, which is all that is read without an index",
+        jq::index_ceiling_message(bytes.len())
+    )))
+}
+
 /// How [`json_document_to_owned_value`] establishes that the delimiters of `bytes` are in place
 /// before it builds a value.
 #[derive(Clone, Copy)]
@@ -20308,6 +20459,9 @@ fn json_document_to_owned_value(
     at: Option<&dyn Fn() -> (usize, usize)>,
     delimiters: Delimiters,
 ) -> core::result::Result<OwnedValue, EvalError> {
+    if !JsonIndex::can_index(bytes.len()) {
+        return unindexable_document_value(bytes);
+    }
     let index = JsonIndex::build(bytes);
     if let Some(at) = at {
         if let Some(message) =
@@ -25214,11 +25368,11 @@ mod tests {
                 ])),
                 vec![Arg]
             );
-            // ...whichever option takes it (`-f FILE`)
+            // ...whichever option takes it (`-L DIR`)
             assert_eq!(
                 named_flag_order(&argv(&[
                     "jq",
-                    "-f",
+                    "-L",
                     "--arg",
                     "--rawfile",
                     "r",
@@ -25257,11 +25411,10 @@ mod tests {
                     ".",
                 ],
                 &["jq", "--arg", "--arg", "v", "--", "--arg", "x", "y"],
-                // (`-f --arg` is clap's usage error before any order matters, so an option's value is a path here)
                 &[
                     "jq",
-                    "-f",
-                    "/dev/null",
+                    "-L",
+                    "--arg",
                     "--rawfile",
                     "r",
                     "/dev/null",
@@ -25466,6 +25619,39 @@ mod tests {
             let (filter, words) = resolved(&["jq", "-f", "prog.jq", "--args", "a", "b"]);
             assert_eq!(filter, None);
             assert_eq!(words, vec![s("a"), s("b")]);
+        }
+
+        /// #7439: `-f` is a flag, and the first positional word is the program file wherever it
+        /// sits, after `--args` included; with no word at all there is none.
+        #[test]
+        fn from_file_takes_the_first_positional_word_as_the_program_file() {
+            fn program_file(argv: &[&str]) -> (Option<String>, Option<PathBuf>, Vec<String>) {
+                let mut cmd = JqCommand::try_parse_from(argv.iter().copied()).unwrap();
+                cmd.resolve_positional_args();
+                (cmd.filter, cmd.program_file, cmd.files)
+            }
+            let file = |p: &str| Some(PathBuf::from(p));
+            assert_eq!(
+                program_file(&["jq", "-f", "-r", "prog.jq", "in.json"]),
+                (None, file("prog.jq"), vec!["in.json".to_string()])
+            );
+            assert_eq!(
+                program_file(&["jq", "prog.jq", "in.json", "-f"]),
+                (None, file("prog.jq"), vec!["in.json".to_string()])
+            );
+            assert_eq!(
+                program_file(&["jq", "-f", "--args", "prog.jq", "a"]),
+                (None, file("prog.jq"), vec![])
+            );
+            assert_eq!(program_file(&["jq", "-n", "-f"]), (None, None, vec![]));
+            assert_eq!(
+                program_file(&["jq", "prog.jq", "in.json"]),
+                (
+                    Some("prog.jq".to_string()),
+                    None,
+                    vec!["in.json".to_string()]
+                )
+            );
         }
 
         /// jq's program is the first *non-option* word. Applying an option
@@ -29136,6 +29322,150 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #7425: a document no index can hold is read by [`unindexable_document_value`], which builds
+    /// what the indexed route builds for plain JSON, number spellings and string escapes included.
+    /// The reader takes any length, so documents of a few bytes stand in for ones of 4 GiB; which
+    /// route a length takes is `JsonIndex::can_index`'s, pinned at its boundary in `json::light`.
+    #[test]
+    fn a_document_no_index_holds_is_read_as_the_indexed_route_reads_it_7425() {
+        let docs = [
+            "[1,2.50,1e1000,-0,100000000000000000001,0.1e-2]",
+            r#"{"a":{"b":[true,false,null]},"c":"\u00e9\n\t\"x\" \u20ac","d":{}}"#,
+            r#"["a","b",[[],[{}]],{"k":[1,{"z":0}]}]"#,
+            "\"just a string\"",
+            "  42  ",
+            &format!("{}{}", "[".repeat(100), "]".repeat(100)),
+        ];
+        for doc in docs {
+            let indexed = json_bytes_to_owned_value_checked(doc.as_bytes()).expect("indexed");
+            let read = unindexable_document_value(doc.as_bytes()).expect("read");
+            assert_eq!(read.to_json(), indexed.to_json(), "{doc}");
+            assert_eq!(read, indexed, "{doc}");
+        }
+    }
+
+    /// #7425: what the index-free reader declines. A fault jq's parser meets, its depth limit
+    /// included, is the decode failure the indexed route gives a malformed document, so the lazy
+    /// route words it as jq's parse error; text jq reads that only the indexed route reads is a
+    /// resource limit, the recorded divergence.
+    #[test]
+    fn a_document_no_index_holds_is_refused_only_where_it_is_not_plain_7425() {
+        let deep = |n: usize| format!("{}{}", "[".repeat(n), "]".repeat(n));
+        for malformed in [
+            "{\"a\":tru}".to_string(),
+            "[1,,2]".to_string(),
+            "[\"\\q\"]".to_string(),
+            r#"["\ud83d"]"#.to_string(),
+            deep(10_001),
+        ] {
+            let error = unindexable_document_value(malformed.as_bytes()).expect_err("malformed");
+            assert!(error.is_decode_failure(), "{malformed:.20}: {error:?}");
+        }
+        for unread in [
+            r#"{"a":1,"a":2}"#.to_string(),
+            // A lone low half: jq reads it as U+FFFD (a lone high half is a fault it reports).
+            r#"["\udc00"]"#.to_string(),
+            "[nan]".to_string(),
+            "[007]".to_string(),
+            deep(200),
+        ] {
+            assert!(
+                json_bytes_to_owned_value_checked(unread.as_bytes()).is_ok(),
+                "{unread:.20}: the indexed route reads it"
+            );
+            let error = unindexable_document_value(unread.as_bytes()).expect_err("not plain");
+            assert!(error.is_resource_limit(), "{unread:.20}: {error:?}");
+            assert_eq!(
+                error.message,
+                format!(
+                    "Cannot index a value of {} bytes: the index holds at most 4294967295 bytes \
+                     (4 GiB), and the document is not plain JSON, which is all that is read \
+                     without an index",
+                    unread.len()
+                ),
+                "{unread:.20}"
+            );
+        }
+    }
+
+    /// #7425: a document no index holds is evaluated on its tree, and prints what the indexed
+    /// route prints; one the reader refuses is reported, and nothing is printed for it.
+    #[test]
+    fn a_document_no_index_holds_prints_what_the_indexed_route_prints_7425() {
+        let config = OutputConfig {
+            compact: true,
+            raw_output: false,
+            join_output: false,
+            raw_output0: false,
+            ascii_output: false,
+            color_output: false,
+            color_scheme: ColorScheme::default(),
+            sort_keys: false,
+            indent_string: String::new(),
+            unbuffered: false,
+            seq: false,
+            convention: JsonConvention::JqCompat,
+        };
+        let doc = r#"{"a":[1,2.50,{"b":"x"}],"c":1e1000,"d":"\u00e9"}"#;
+        let run = |bytes: &[u8], filter: &str, unindexed: bool| -> (Vec<String>, bool) {
+            let expr = jq::parse(filter).expect("parses");
+            let mut outputs = Vec::new();
+            let mut sink = ErrorSink::default();
+            let at = ErrorAt::Fixed(InputLocation::unknown());
+            let mut on_value = |_: &mut ErrorSink, value: OwnedValue| {
+                outputs.push(value.to_json());
+                Ok(true)
+            };
+            if unindexed {
+                evaluate_unindexable_document(
+                    bytes,
+                    &expr,
+                    &EvalContext::default(),
+                    &at,
+                    &mut sink,
+                    &config,
+                    &mut on_value,
+                )
+            } else {
+                let input = json_bytes_to_owned_value_checked(bytes).expect("indexed");
+                evaluate_input_streaming(
+                    &input,
+                    &expr,
+                    &EvalContext::default(),
+                    &at,
+                    &mut sink,
+                    &config,
+                    &mut on_value,
+                )
+            }
+            .expect("evaluates");
+            (outputs, sink.hit())
+        };
+        for filter in [
+            ".",
+            "length",
+            ".a[]",
+            "[.a[] | numbers] | add",
+            ".c, .d",
+            "keys",
+            "to_entries | map(.key)",
+            "[paths]",
+            "tojson",
+            ".a[1] | tostring",
+            "[limit(2; .a[])]",
+            ".a | map(type)",
+            "error(\"boom\")",
+            "{x: .a[2].b} | .x",
+            "with_entries(.value |= type)",
+        ] {
+            let want = run(doc.as_bytes(), filter, false);
+            assert_eq!(run(doc.as_bytes(), filter, true), want, "{filter}");
+        }
+        // Refused: reported, and the program never runs.
+        let (outputs, hit) = run(br#"{"a":1,"a":2}"#, "1", true);
+        assert_eq!((outputs.len(), hit), (0, true));
     }
 
     /// #6620: the route of a record the main loop pops. Every output comparison passes whichever

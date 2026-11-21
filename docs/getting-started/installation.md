@@ -131,7 +131,7 @@ If you see performance warnings about SIMD:
 If cargo build fails:
 
 1. Update Rust: `rustup update`
-2. Ensure Rust 1.73 or later: `rustc --version`
+2. Ensure Rust 1.89 or later (`rust-version` in `Cargo.toml`): `rustc --version`
 3. Clear cache: `cargo clean`
 
 ## See Also
