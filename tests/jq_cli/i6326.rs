@@ -46,7 +46,7 @@ fn test_a_multibyte_character_gives_an_empty_match_per_continuation_byte_6326() 
         ),
         (
             r#""éé" | [match("(x)?";"g") | [.offset,(.captures|map(.string))]]"#,
-            r#"[[0,[null]],[1,[null]],[1,[null]],[2,[null]],[2,[null]]]"#,
+            r"[[0,[null]],[1,[null]],[1,[null]],[2,[null]],[2,[null]]]",
         ),
         (
             r#""é" | [match("(?<n>x*)";"g") | .captures[0] | [.name,.offset,.string]]"#,

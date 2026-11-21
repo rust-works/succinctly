@@ -40,9 +40,9 @@ fn a_zero_count_group_with_no_later_group_has_a_capture_entry() -> Result<()> {
 fn a_zero_count_group_in_an_empty_match_is_an_empty_string_at_the_offset() -> Result<()> {
     assert_eq!(
         captures("ab", "(a){0}")?,
-        r#"[[[-1,null]],[[-1,null]],[[-1,null]]]"#
+        r"[[[-1,null]],[[-1,null]],[[-1,null]]]"
     );
-    assert_eq!(captures("", "(a){0}")?, r#"[[[-1,null]]]"#);
+    assert_eq!(captures("", "(a){0}")?, r"[[[-1,null]]]");
     Ok(())
 }
 

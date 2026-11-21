@@ -60,10 +60,7 @@ fn test_the_builtins_over_a_loop_with_a_capture_group_agree_with_jq_6310() -> Re
     assert_rows(&[
         (r#""ba" | sub("(?:b*|(a))+"; "X")"#, r#""Xa""#),
         (r#""foo-bar" | gsub("(?:\\w*|(-))+"; "X")"#, r#""XX-XX""#),
-        (
-            r#""ba" | [scan("(?:b*|(a))+")]"#,
-            r#"[[null],[null],[null]]"#,
-        ),
+        (r#""ba" | [scan("(?:b*|(a))+")]"#, r"[[null],[null],[null]]"),
         (
             r#""BA" | [match("(?:b*|(a))+";"gi") | .string]"#,
             r#"["B","",""]"#,
