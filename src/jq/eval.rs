@@ -8274,6 +8274,14 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Expr::Builtin(Builtin::PathsFilter(f)) => {
             each_paths_filter::<W, S>(f, value, optional, sink)
         }
+        // #7463: `fromstream` and `truncate_stream` hand each value on as its events arrive, so
+        // `first(fromstream(inputs))` stops reading the input at the first value, where the
+        // collecting builtins read all of it first (2 GB for a 52 MB array, and never an end on
+        // an endless pipe).
+        Expr::Builtin(Builtin::FromStream(f)) => each_fromstream::<W, S>(f, value, optional, sink),
+        Expr::Builtin(Builtin::TruncateStream(f)) => {
+            each_truncate_stream_of::<W, S>(f, value, optional, sink)
+        }
         // #1459 (Stage 4): the demand-aware twin of `eval_compare`'s fanout.
         // [`binary_fanout_each`] owns the loop order; passing `eval_each` as
         // the operand strategy is what makes the *right* operand — jq's outer
@@ -102224,6 +102232,30 @@ fn builtin_fromstream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // #2188: an event is decoded with `into_owned`, which raises on an undecodable leaf rather
     // than substituting `""`.
     let mut outputs = Vec::new();
+    let flow = each_fromstream::<W, S>(f, value, optional, &mut |item| {
+        outputs.push(item.into_owned_from_owned_producer::<S>());
+        Demand::Continue
+    });
+    match flow {
+        Flow::Exhausted | Flow::Stopped { .. } => owned_vec_to_result(outputs),
+        Flow::Escaped(control) => partial(outputs, control),
+    }
+}
+
+/// `fromstream(f)` with each value handed to `sink` as the event that completes it arrives (#7463),
+/// as jq's `foreach f as $i (...; ...; if .e then .x else empty end)` emits it: a consumer that
+/// stops (`first(fromstream(inputs))`) stops `f`, so the inputs after that event are not read, and
+/// a program reading the input state after a value (`input_line_number`) reads it where that
+/// value's last event left it. [`builtin_fromstream`] collects it.
+// Out of line: `eval_each` is on every recursion's path, and its frame is what a deep recursion's
+// stack depth is made of (a frame grown by an inlined arm took `r(12000; 7)` past the depth limit).
+#[inline(never)]
+fn each_fromstream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    f: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
     let mut x = OwnedValue::Null;
     let mut e = false;
     let mut raised = None;
@@ -102247,7 +102279,8 @@ fn builtin_fromstream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(err) => return stop_with_escape(&mut raised, Control::Error(err)),
         }
         if e {
-            outputs.push(x.clone());
+            // The next event starts a fresh value, so the completed one is handed on, not copied.
+            return sink(Item::Owned(core::mem::replace(&mut x, OwnedValue::Null)));
         }
         Demand::Continue
     };
@@ -102258,11 +102291,7 @@ fn builtin_fromstream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     } else {
         eval_each::<W, S>(f, value, optional, &mut fold)
     };
-
-    match resume_from_escape(raised, flow) {
-        Flow::Exhausted | Flow::Stopped { .. } => owned_vec_to_result(outputs),
-        Flow::Escaped(control) => partial(outputs, control),
-    }
+    resume_from_escape(raised, flow)
 }
 
 /// Builtin: truncate_stream(stream) - drop the leading `.` path components
@@ -102297,75 +102326,95 @@ fn builtin_truncate_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // for a *container* `depth` that merely contains an undecodable
     // string, where jq would just proceed unaffected.
     let depth = to_owned_lossy::<S, _>(&value);
-
-    // A `Partial`'s trailing control is not intercepted here (#694): its
-    // prefix of events is processed below like any other, and the control
-    // is re-attached to whatever it produced via `partial()` at the end,
-    // instead of being silently dropped.
-    // #4971: jq 1.7.1 defines it as `. as $n | null | stream | ..`, so `stream` runs on `null`, not on the depth.
-    let (events, control) = match eval_single::<W, S>(stream_expr, StandardJson::Null, optional) {
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        QueryResult::Break(label) => return QueryResult::Break(label),
-        // See the matching arm in `builtin_fromstream`.
-        QueryResult::Halt(code) => return QueryResult::Halt(code),
-        QueryResult::Partial(vs, control) => (vs, Some(control)),
-        // #2188 audit: unlike `builtin_fromstream`'s identical shape, bare
-        // `collect_owned` here is safe by construction, not just untested --
-        // `stream_expr` is evaluated against this same `value`, which also
-        // becomes `depth` a few lines up. `value` itself being an undecodable
-        // `String` is not `depth`'s only non-scalar-in-effect case either:
-        // whether `value` is a container reachable via a nested field/index,
-        // or is directly the undecodable string, `depth` ends up either a
-        // container or a `String` -- and a `String`/container both always
-        // sort above any `Int` path length in jq's ordering (`compare_values`
-        // just below) -- so `path_len > depth` is provably false for every
-        // event whenever `depth` is non-numeric, meaning every event is
-        // dropped before an undecodable leaf's silently-substituted `""`
-        // could ever reach `outputs`. `stream_expr` has no other source of
-        // document-backed (as opposed to literal/computed) content to draw
-        // an undecodable value from, so this holds for any `stream_expr`,
-        // not just one that reads `value` directly.
-        result => (result.collect_owned::<S>(), None),
-    };
-
-    // `if (.[0]|length) > $n then setpath([0]; .[0][$n:]) else empty end` over every event (#4971).
-    let null = OwnedValue::Null;
     let mut outputs = Vec::new();
-    for event in events {
+    let flow = each_truncate_stream::<W, S>(stream_expr, &depth, optional, &mut |item| {
+        outputs.push(item.into_owned_from_owned_producer::<S>());
+        Demand::Continue
+    });
+    match flow {
+        Flow::Exhausted | Flow::Stopped { .. } => owned_vec_to_result(outputs),
+        Flow::Escaped(control) => partial(outputs, control),
+    }
+}
+
+/// `truncate_stream(stream)` at depth `depth` with each kept event handed to `sink` as `stream`
+/// produces it (#7463), as jq's `. as $n | null | stream | ...` pipe runs it: a consumer that stops
+/// (`first(1|truncate_stream(inputs))`) stops `stream`, so the inputs after that event are not
+/// read. [`builtin_truncate_stream`] collects it. The events before one that raises are handed on
+/// first, as jq emits them.
+/// [`each_truncate_stream`] at the depth `value` holds, for `eval_each`; out of line, as
+/// [`each_fromstream`] is.
+#[inline(never)]
+fn each_truncate_stream_of<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    stream_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    let depth = to_owned_lossy::<S, _>(&value);
+    each_truncate_stream::<W, S>(stream_expr, &depth, optional, sink)
+}
+
+#[inline(never)]
+fn each_truncate_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    stream_expr: &Expr,
+    depth: &OwnedValue,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    // #2188 audit: the lossy materialization of an event is safe by construction, not just
+    // untested -- `stream_expr` runs on `null` (#4971: jq 1.7.1 defines it as
+    // `. as $n | null | stream | ..`), so it has no document-backed content to draw an
+    // undecodable value from but what it reads itself, and an event's path length is compared
+    // against `depth` before anything of it is kept.
+    let null = OwnedValue::Null;
+    let mut raised = None;
+    let mut keep = |item: Item<'a, W>| {
+        let event = item.into_owned_lossy::<S>();
+        // `if (.[0]|length) > $n then setpath([0]; .[0][$n:]) else empty end` (#4971).
         let first = match &event {
             OwnedValue::Array(items) => items.first().unwrap_or(&null),
             OwnedValue::Null => &null,
             other => {
-                return QueryResult::Error(EvalError::cannot_index_with_type(
-                    other.type_name(),
-                    "number",
-                ))
+                return stop_with_escape(
+                    &mut raised,
+                    Control::Error(EvalError::cannot_index_with_type(
+                        other.type_name(),
+                        "number",
+                    )),
+                )
             }
         };
         let path_len = match jq_length_of::<S>(first) {
             Ok(n) => OwnedValue::Float(n),
-            Err(e) => return QueryResult::Error(e),
+            Err(e) => return stop_with_escape(&mut raised, Control::Error(e)),
         };
-        if compare_values::<S>(&path_len, &depth) != core::cmp::Ordering::Greater {
-            continue;
+        if compare_values::<S>(&path_len, depth) != core::cmp::Ordering::Greater {
+            return Demand::Continue;
         }
-        let sliced = match jq_slice_from(first, &depth) {
+        let sliced = match jq_slice_from(first, depth) {
             Ok(v) => v,
-            Err(e) => return QueryResult::Error(e),
+            Err(e) => return stop_with_escape(&mut raised, Control::Error(e)),
         };
-        outputs.push(match event {
+        sink(Item::Owned(match event {
             OwnedValue::Array(mut parts) if !parts.is_empty() => {
                 parts[0] = sliced;
                 OwnedValue::Array(parts)
             }
             _ => OwnedValue::array_from(vec![sliced]),
-        });
-    }
-
-    match control {
-        Some(control) => partial(outputs, control),
-        None => owned_vec_to_result(outputs),
-    }
+        }))
+    };
+    // `repeat` keeps the eager route, whose iteration cap the demand-driven one does not have
+    // ([`streams_unbounded`]), as in [`each_fromstream`].
+    let flow = if streams_unbounded(stream_expr) {
+        drain_result(
+            eval_single::<W, S>(stream_expr, StandardJson::Null, optional),
+            &mut keep,
+        )
+    } else {
+        eval_each::<W, S>(stream_expr, StandardJson::Null, optional, &mut keep)
+    };
+    resume_from_escape(raised, flow)
 }
 
 /// Builtin: paths - all paths to values (excluding empty paths)
