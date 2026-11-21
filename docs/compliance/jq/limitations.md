@@ -13136,8 +13136,8 @@ leading `+` with the spelling dropped, like the `007`/`.5` they already take.
 
 **A parsed NaN compared with itself — closed by
 [#3309](https://github.com/rust-works/succinctly/issues/3309); a container compared with
-itself — closed by [#3069](https://github.com/rust-works/succinctly/issues/3069), except a
-partial slice (recorded below).**
+itself — closed by [#3069](https://github.com/rust-works/succinctly/issues/3069), except two
+slices of one array (recorded below).**
 jq's `jv_equal` short-circuits on pointer identity before comparing values, and a parsed
 number literal is an allocated `jv`, so the *same* parsed NaN is equal to itself there while a
 computed NaN is not. succinctly now keeps that identity: a NaN jq mode parses (from a document,
@@ -13180,6 +13180,7 @@ is rebuilt (`map(.)`, `sort`, `[] + .`, `[.[]]`) is a new allocation in jq too a
 | `map(nan) \| . == .` on stdin `[1]`                     | `true` | `true`     |
 | `{a:[nan]} \| .a as $x \| .a \| path($x)`               | `[]`   | `[]`       |
 | `[nan,1] \| .[0:1] == .[0:1]`                           | `true` | `false`    |
+| `.[0:1] == .[0:1]` on stdin `[NaN,1]`                   | `true` | `true`     |
 | `[nan] \| . as $a \| [$a] \| indices([$a])`             | `[0]`  | `[0]`      |
 
 The shortcut fires only where `==` is handed two handles on one storage, so the other half of
@@ -13222,10 +13223,17 @@ Still different:
   The stored member is rebuilt, because the in-place step takes a rebind only as `$r as $s | ASSIGNMENT`, a single assignment under it.
   `.a = $s.items`, `.a += $s.items`, `.[$s.n] = $s.items` and a rebind of a rebind match jq.
   The comparison needs a NaN-bearing container to observe this.
-- **Slices.** `.[0:]` and any other full-range slice hand back the array itself, as jq's view
-  does. An equal-bounds *partial* slice is a view onto the same storage in jq (pointer, offset
-  and size all equal), so `.[0:1] == .[0:1]` is identical there; here each slice is a new
-  array. Matching it would need a slice representation, which a NaN is the only way to observe.
+- **Slices** ([#7459](https://github.com/rust-works/succinctly/issues/7459)).
+  `.[0:]` and any other full-range slice hand back the array itself, as jq's view does.
+  A partial slice is a view on its array's storage in both (#6659), so on stdin `.[0:1] == .[0:1]` over `[NaN,1]` is `true` in both; under `-n`, `[nan,1] | .[0:1] == .[0:1]` is still `false` here.
+  The wider difference needs no NaN.
+  jq 1.7.1's `jvp_array_equal` checks two arrays' length and then their storage pointer, not the slice offset, before it compares elements, so any two equally long slices of one array are `==` in jq whatever they hold.
+  `[1,2,3,4,5,6] | .[:3] == .[3:]` and `.[1:] == .[:-1]` are `true` in jq and `false` here, and so is the same pair inside an array or object (`[.[:3]] == [.[3:]]`), bound to variables, or sliced again (`.[:3] == (.[3:] | .[:3])`).
+  Every builtin that compares with `==` follows: `[.[:3], .[3:]] | unique` is `[[1,2,3]]` in jq and both arrays here, and `unique_by`, `group_by`, array `-`, `index`/`indices`/`rindex` with an array argument, `IN`, `any`/`all` and `bsearch` differ the same way.
+  Ordering (`<`, `sort`, `min`, `max`), `contains`/`inside` and `tojson` compare by value in both.
+  A copy shares no storage and compares by value in both: `map(.)`, `[.[]]`, `tojson | fromjson`, a write, and a slice starting 65,536 or more elements into its storage, which jq copies.
+  jq 1.8.2 answers as 1.7.1 does, except `bsearch`, which compares by value there.
+  Whether to reproduce jq's answers is open in #7459.
 - **`no_std` builds.** The bridge registry is a thread-local, so without `std` every bridge
   read rebuilds, as before, and the bridged rows above answer `false` there.
 
