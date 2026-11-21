@@ -24515,7 +24515,19 @@ fn eval_each_pipe_generic_stages<S: EvalSemantics, V: DocumentValue>(
                 }
             }
         });
-        eval_each_generic::<S, V>(first, value, optional, cursor, &mut driver)
+        // #7460: `eval_each_pipe`'s rule, for a call that settles.
+        if S::TAG == EvalTag::Jq && crate::jq::tail_call::call_head_settles(first, true) {
+            settle_then_replay(
+                |collect| {
+                    eval_each_generic::<S, V>(first, value, optional, cursor, &mut |item| {
+                        collect(item)
+                    })
+                },
+                |item| driver.push(item),
+            )
+        } else {
+            eval_each_generic::<S, V>(first, value, optional, cursor, &mut driver)
+        }
     };
 
     crate::jq::eval::pipe_terminal_after_retry(
@@ -27869,7 +27881,10 @@ fn settled_each_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
-    if !settles_before_consumer(expr) {
+    // #7460: or a call whose body answers once, as `eval::fanout_arg_each_inner` settles it.
+    if !(settles_before_consumer(expr)
+        || (S::TAG == EvalTag::Jq && crate::jq::tail_call::call_head_settles(expr, true)))
+    {
         return eval_each_generic::<S, V>(expr, value, optional, cursor, sink);
     }
     settle_then_replay(
