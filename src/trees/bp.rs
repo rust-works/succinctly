@@ -1799,7 +1799,6 @@ fn build_bp_index(
         "BalancedParens supports at most u32::MAX (4294967295) bits; got {len}. \
          The rank directory stores absolute cumulative counts as u32 (#188)"
     );
-
     if words.is_empty() || len == 0 {
         return (
             Vec::new(),
@@ -2652,9 +2651,10 @@ impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
         // state machine below, which costs ~170 instructions even when its
         // first word scan finds the match at once (#3140).
         //
-        // `get`, not `is_close`: a truncated document can leave `len` past
-        // the last stored word (`[` x 64 gives one word and `len` 128), and
-        // the state machine answers `None` there rather than indexing.
+        // `get`, not `is_close`: a truncated JSON document used to leave
+        // `len` past the last stored word (`[` x 64 gave one word and `len`
+        // 128; its index now stores the missing closes, #7482), and the
+        // state machine answers `None` there rather than indexing.
         //
         // Everything past this probe is out of line (#3344), so this
         // function stays small enough to inline into the sibling walks.

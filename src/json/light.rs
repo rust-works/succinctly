@@ -279,8 +279,10 @@ impl JsonIndex<Vec<u64>> {
 
         let ib_len = json.len();
 
-        // Count actual BP bits
-        let bp_bit_count = count_bp_bits(&semi.bp);
+        // Two bits per open; a malformed document short of closes gets them
+        // as zero words (#7482).
+        let mut bp_words = semi.bp;
+        let bp_bit_count = bp_len_supplying_missing_closes(&mut bp_words);
 
         // Build cumulative popcount index for IB
         let ib_rank = build_ib_rank(&semi.ib);
@@ -289,7 +291,7 @@ impl JsonIndex<Vec<u64>> {
             ib: semi.ib,
             ib_len,
             ib_rank,
-            bp: BalancedParens::new(semi.bp, bp_bit_count),
+            bp: BalancedParens::new(bp_words, bp_bit_count),
             lines: OnceCell::new(),
             seq_hint: Cell::new(SeqHint::NONE),
             close_runs: RefCell::new(Vec::new()),
@@ -763,15 +765,30 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
     }
 }
 
-// Helper to count actual BP bits (number of open + close parens)
-fn count_bp_bits(bp_words: &[u64]) -> usize {
-    // For standard cursor, we need to count actual meaningful bits
-    // This is a simplification - in practice we'd track this during indexing
-    // For now, estimate based on popcount (opens) * 2
+/// The balanced-parentheses length of a standard semi-index, two bits per open,
+/// with `bp_words` extended to hold every one of them (#7482).
+///
+/// The scanners record no length, so it is derived as `2 * opens`: the exact
+/// length of a balanced document. A malformed one can be short of closes
+/// (`{"a":[[[1,"b":2}` leaves two arrays open at end of input), and the
+/// missing closes are then the zero bits after the last bit written. While
+/// they fit in the last word nothing more is needed; a deficit that crossed a
+/// word boundary left `len` past the last stored word, and navigation
+/// (`is_open` under `next_sibling`) indexed out of bounds. Zero words appended
+/// here supply those closes, so `len <= 64 * words` holds for every input:
+/// `is_open`, and the sibling and child walks through it, read `words[p / 64]`
+/// for any `p < len` (`find_close` and `rank1` tolerate a shorter slice,
+/// #3140). A balanced document already holds all its bits and is not touched.
+/// (A surplus of closes is the other malformed shape: those past `len` are
+/// simply not part of the sequence.)
+fn bp_len_supplying_missing_closes(bp_words: &mut Vec<u64>) -> usize {
     let total_ones: usize = bp_words.iter().map(|w| w.count_ones() as usize).sum();
-    // Each node has one open and one close, so total bits = opens + closes = 2 * opens
-    // But this is approximate - the actual length should be tracked during build
-    total_ones * 2
+    let len = total_ones * 2;
+    let needed_words = len.div_ceil(64);
+    if bp_words.len() < needed_words {
+        bp_words.resize(needed_words, 0);
+    }
+    len
 }
 
 // ============================================================================
