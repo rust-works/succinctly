@@ -16738,11 +16738,11 @@ mod tests {
             .unwrap_err()
             .message
             .contains("unknown format"));
-        // Invalid escape inside a string literal.
-        assert!(parse(r#""\q""#)
-            .unwrap_err()
-            .message
-            .contains("invalid escape"));
+        // Invalid escape inside a string literal: jq's JSON decoder's message for the run (#7445).
+        assert_eq!(
+            parse(r#""\q""#).unwrap_err().message,
+            "Invalid escape at line 1, column 4 (while parsing '\"\\q\"')"
+        );
         // Unexpected character where an expression is expected.
         assert!(parse("%").is_err());
         // Array index/slice: expected ']' or ':'.
