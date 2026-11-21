@@ -373,6 +373,24 @@ jq 1.8.2 gets the polyglot to run through a deliberate language change instead (
 That is a feature and not a bug fix, so jq 1.7.1 stays the reference: `1`, then `# \`, then `+2` on its own lines is `3` in jq 1.7.1 and `succinctly jq`, and `1` in jq 1.8.2, whose comment swallows the `+2`.
 Pinned over a matrix of 156 files captured from jq 1.7.1 by `tests/jq_cli/i7481.rs`.
 
+## A module path with a NUL byte is refused, as jq 1.8.2 refuses it; jq 1.7.1 reads the path up to the NUL (#7450)
+
+jq 1.7.1 looks a module path up as a C string, so the path ends at the first NUL byte: `include "a\u0000b"` reads `jq: error: module not found: a`, and `"a\u0000b" | modulemeta` raises `module not found: a`.
+jq 1.8.2 refuses the path before it searches or checks it (CVE-2026-43895, upstream commit 9d223f153c, "Reject embedded NUL bytes in module import paths", under the security fixes of its NEWS.md): `jq: error: Module path contains a NUL byte`, then the blank line and `jq: 1 compile error`, exit status 3.
+`modulemeta` raises the same text as an error of the filter (exit status 5, or the string a `catch` receives).
+`succinctly jq` follows 1.8.2, because upstream calls the 1.7.1 behaviour a bug, and so the difference from the pinned 1.7.1 stands as `newer-than-primary`.
+The check comes first, ahead of the backslash, `..` and equal-components checks, and covers `import`, `include`, a data import, a directive in a module, and a directive with `search` metadata.
+Pinned by `tests/jq_cli/i7450.rs`, whose module rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
+
+## `Cannot index <type> with string "<key>"` stops the key at a NUL byte, as jq 1.7.1 does; jq 1.8.2 words the message differently (#7450)
+
+jq 1.7.1 writes the key with a C `%s`, so the key `a\u0000b` shows as `a`, with the closing quote and the rest of the message kept: `[] | try .["a\u0000b"] catch .` is `Cannot index array with string "a"`.
+The string a `try` catches is the cut one, and so is the text on stderr.
+Whether the key is left out for being 30 bytes or more (#5817) is judged on the whole key, the NUL and what follows it included.
+jq 1.8.2 rewords every `Cannot index` message on purpose (jqlang/jq#3478): `Cannot index array with string ("a\u0000b")`, with the key dumped as JSON.
+That is a change of wording, not a fix, so `succinctly jq` stays with the pinned 1.7.1 for all of them.
+Pinned by `tests/jq_cli/i7450.rs`, whose rows were captured from `/usr/bin/jq`.
+
 ## A standard input that cannot be read: matched, with these differences (#7126)
 
 A standard input that cannot be read is an empty one in jq 1.7.1, which counts the failed read and exits 2 once the run is over, whatever the program left (`-e`'s 4, `input`'s 5), and for a plain read without a word on stderr.

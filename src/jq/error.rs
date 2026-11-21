@@ -577,8 +577,8 @@ impl EvalError {
     /// key, `Cannot index <container> with <key type>`.
     ///
     /// jq embeds the key's text only when it is a string, and does not
-    /// truncate it, but leaves it out of a key of 30 bytes or more
-    /// (#5817). A slice reports its key as `object`, because jq models
+    /// truncate it (except at a NUL byte, #7450), but leaves it out of a key of
+    /// 30 bytes or more (#5817). A slice reports its key as `object`, because jq models
     /// `.[a:b]` as indexing with `{"start":a,"end":b}`.
     pub fn cannot_index(container_type: &str, key: &OwnedValue) -> Self {
         if let Some(err) = Self::unreadable_container(container_type) {
@@ -609,8 +609,12 @@ impl EvalError {
         if key.len() >= LONG_INDEX_KEY {
             return Self::new(format!("Cannot index {container_type} with string"));
         }
+        // jq writes the key with a C `%s`, which stops at a NUL byte (#7450): jq 1.7.1 answers
+        // `Cannot index array with string "a"` for the key `"a\u0000b"`, the closing quote and
+        // the rest of the message kept. The length test above reads the whole key.
+        let shown = key.split('\0').next().unwrap_or(key);
         Self::new(format!(
-            "Cannot index {container_type} with string \"{key}\""
+            "Cannot index {container_type} with string \"{shown}\""
         ))
     }
 
@@ -2235,6 +2239,28 @@ mod tests {
                 expected
             );
         }
+    }
+
+    /// #7450: the key is written with a C `%s`, which stops at a NUL byte; the length that leaves
+    /// a long key out is the whole key's.
+    #[test]
+    fn an_index_key_stops_at_its_nul_7450() {
+        for (key, want) in [
+            ("a\0b", "Cannot index array with string \"a\""),
+            ("\0", "Cannot index array with string \"\""),
+            ("\u{e9}\0x", "Cannot index array with string \"\u{e9}\""),
+        ] {
+            assert_eq!(EvalError::cannot_index("array", &s(key)).message, want);
+            assert_eq!(
+                EvalError::cannot_index_with_field("array", key).message,
+                want
+            );
+        }
+        let long = format!("a\0{}", "b".repeat(28));
+        assert_eq!(
+            EvalError::cannot_index("array", &s(&long)).message,
+            "Cannot index array with string"
+        );
     }
 
     /// The object-key refusal names the kind and previews the value, and the
