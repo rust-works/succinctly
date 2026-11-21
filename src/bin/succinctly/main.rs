@@ -971,8 +971,8 @@ struct JqCommand {
     /// jq filter expression (e.g., ".", ".foo", ".[]")
     /// If not provided, uses "." (identity)
     ///
-    /// The word as given (#7426): under `-f` it is the first input file, which jq opens by its
-    /// bytes, and as the program it is read by [`jq_word_text`].
+    /// The word as given (#7426): under `-f` it becomes the program file (`program_file`, #7439),
+    /// which jq opens by its bytes, and as the program text it is read by [`jq_word_text`].
     filter: Option<std::ffi::OsString>,
 
     /// Input files (reads from stdin if none provided)
