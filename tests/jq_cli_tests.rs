@@ -4725,7 +4725,14 @@ proptest! {
         // reached a shape the hand-written tests did not. `select`'s row is
         // here to do the same job for #2692's move.
         assert_jq_answers(&label, "path(.bad)", &["-c"], "path(.bad)", &doc, r#"["bad"]"#);
-        assert_jq_answers(&label, "select(.bad) | .keep", &["-c"], "select(.bad) | .keep", &doc, "5");
+        // #7449: except at depth 0 of a structural error, where `.bad` *is*
+        // the token the index could not read: it has no truthiness, so
+        // testing it reads it.
+        if path.is_empty() && matches!(malformation, FuzzMalformation::StructuralError) {
+            assert_jq_raises(&label, "select(.bad) | .keep", &["-c"], "select(.bad) | .keep", &doc, 5, expect_stderr);
+        } else {
+            assert_jq_answers(&label, "select(.bad) | .keep", &["-c"], "select(.bad) | .keep", &doc, "5");
+        }
     }
 }
 
