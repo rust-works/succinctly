@@ -29355,8 +29355,9 @@ pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, Ev
     // a doubled one, or one behind whitespace, is refused. The errors below still name `s`, BOM
     // and all, as jq does.
     //
-    // `tonumber` passes jq's parser a C string, so a NUL ends the text it sees (`"1\u00002" |
-    // tonumber` is 1); `fromjson`, which passes a length, does not (#5309).
+    // jq 1.7.1 passes its parser a C string, so a NUL ended the text it saw (`"1\u00002" |
+    // tonumber` was 1); jq 1.8.2 refuses a string with a NUL in it (jqlang/jq#3496, #7521).
+    // `fromjson`, which passes a length, never stopped there (#5309).
     // yq reads the text with `parseInt64` and keeps it as the node's value: `"0x10" | tonumber`
     // prints `0x10` and `"007"` `007`, while the JSON writers print the number (#1356).
     if yq_mode {
@@ -29371,19 +29372,18 @@ pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, Ev
             return Ok(OwnedValue::NumberLiteral(NumberRepr::Float(f), s.into()));
         }
     }
-    let c_text = if yq_mode {
-        s
-    } else {
-        s.split('\0').next().unwrap_or(s)
-    };
+    if !yq_mode && s.contains('\0') {
+        return Err(EvalError::cannot_parse_as_number(&OwnedValue::String(
+            s.to_string().into(),
+        )));
+    }
     let trimmed = if yq_mode {
         s
     } else {
         // jq's parser skips only space, tab, CR and LF, not the Unicode whitespace `trim`
         // knows (`"\u000b1" | tonumber` is refused).
-        c_text
-            .strip_prefix('\u{feff}')
-            .unwrap_or(c_text)
+        s.strip_prefix('\u{feff}')
+            .unwrap_or(s)
             .trim_matches(|c| matches!(c, ' ' | '\t' | '\r' | '\n'))
     };
     // jq reads a bare trailing dot as the integer (`"99999999999999999." | tonumber` is
@@ -29563,7 +29563,7 @@ pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, Ev
             s.to_string().into(),
         )))
     } else {
-        Err(EvalError::json_parse_failure(c_text))
+        Err(EvalError::json_parse_failure(s))
     }
 }
 

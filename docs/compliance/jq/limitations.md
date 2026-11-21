@@ -395,6 +395,18 @@ jq 1.8.2 rewords every `Cannot index` message on purpose (jqlang/jq#3478): `Cann
 That is a change of wording, not a fix, so `succinctly jq` stays with the pinned 1.7.1 for all of them.
 Pinned by `tests/jq_cli/i7450.rs`, whose rows were captured from `/usr/bin/jq`.
 
+## `tonumber` refuses a string with a NUL byte in it, as jq 1.8.2 does; jq 1.7.1 reads up to the NUL (#7521)
+
+jq 1.7.1 hands the string to its number parser as a C string, so the text ends at the first NUL byte and the rest is dropped without a word: `"1\u00002" | tonumber` is `1`, `"12\u0000abc" | tonumber` is `12`.
+jq 1.8.2 refuses every such string (jqlang/jq#3496, listed in the 1.8 NEWS under changes to existing functions: "Fix `tonumber` and `toboolean` to reject strings with embedded null bytes"): `string ("1\u00002") cannot be parsed as a number`.
+A long string is cut with `...` as in any such message; when a NUL falls inside the quoted, cut-off text, `succinctly jq` quotes the string only up to the NUL (`string ("1234567890...)`) where 1.8.2 quotes all of it, which this change does not touch.
+`succinctly jq` follows 1.8.2, because upstream calls the 1.7.1 behaviour a bug, and so the difference from the pinned 1.7.1 stands as `newer-than-primary`.
+The refusal covers a NUL anywhere in the string, including a string that 1.7.1 also refuses (`"a\u0000b"`, which it words as a parse fault in `a`), and `tonumber?` is then empty.
+Only the NUL changes: the rest of 1.8.2's reworded `tonumber` failures and its refusal of surrounding whitespace (`" 1 " | tonumber`) come from a separate upstream change (jqlang/jq#3055) and stay as the 1.7.1 behaviour recorded in the conversion-diagnostics section above.
+`fromjson` is not affected: it hands its parser a length in both versions.
+`succinctly yq` is not changed.
+Pinned by `tests/jq_cli/i7521.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
+
 ## A standard input that cannot be read: matched, with these differences (#7126)
 
 A standard input that cannot be read is an empty one in jq 1.7.1, which counts the failed read and exits 2 once the run is over, whatever the program left (`-e`'s 4, `input`'s 5), and for a plain read without a word on stderr.
@@ -466,6 +478,7 @@ Only space, tab, CR and LF are whitespace to jq's parser, so `"\u000b1" | tonumb
 What is still not matched is on the *accepting* side, not the wording.
 The validator refuses a text jq reads, so the message here falls back to the older `Invalid numeric literal` form.
 The two cases are a bare trailing decimal point (`"5." | fromjson`, see the accepted divergence below) and a number token with a NUL after it (`"1\u00002" | fromjson`, which jq reads as `1` because it hands its number reader a C string).
+`tonumber` no longer reads up to a NUL: jq 1.8.2 refuses the string, and so does `succinctly jq` (#7521).
 
 ## The math builtins print the platform libm's last bit, as jq does (#3045)
 
