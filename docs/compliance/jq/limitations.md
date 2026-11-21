@@ -13223,23 +13223,56 @@ Still different:
   The stored member is rebuilt, because the in-place step takes a rebind only as `$r as $s | ASSIGNMENT`, a single assignment under it.
   `.a = $s.items`, `.a += $s.items`, `.[$s.n] = $s.items` and a rebind of a rebind match jq.
   The comparison needs a NaN-bearing container to observe this.
-- **Slices** ([#7459](https://github.com/rust-works/succinctly/issues/7459)).
-  `.[0:]` and any other full-range slice hand back the array itself, as jq's view does.
+- **Slices.** `.[0:]` and any other full-range slice hand back the array itself, as jq's view does.
   A partial slice is a view on its array's storage in both (#6659), so on stdin `.[0:1] == .[0:1]` over `[NaN,1]` is `true` in both; under `-n`, `[nan,1] | .[0:1] == .[0:1]` is still `false` here.
-  The wider difference needs no NaN.
-  jq 1.7.1's `jvp_array_equal` checks two arrays' length and then their storage pointer, not the slice offset, before it compares elements, so any two equally long slices of one array are `==` in jq whatever they hold.
-  `[1,2,3,4,5,6] | .[:3] == .[3:]` and `.[1:] == .[:-1]` are `true` in jq and `false` here, and so is the same pair inside an array or object (`[.[:3]] == [.[3:]]`), bound to variables, or sliced again (`.[:3] == (.[3:] | .[:3])`).
-  Every builtin that compares with `==` follows: `[.[:3], .[3:]] | unique` is `[[1,2,3]]` in jq and both arrays here, and `unique_by`, `group_by`, array `-`, `index`/`indices`/`rindex` with an array argument, `IN`, `any`/`all` and `bsearch` differ the same way.
-  Ordering (`<`, `sort`, `min`, `max`), `contains`/`inside` and `tojson` compare by value in both.
-  A copy shares no storage and compares by value in both: `map(.)`, `[.[]]`, `tojson | fromjson`, a write, and a slice starting 65,536 or more elements into its storage, which jq copies.
-  jq 1.8.2 answers as 1.7.1 does, except `bsearch`, which compares by value there.
-  Whether to reproduce jq's answers is open in #7459.
+  Two *different* slices of one array are a separate, deliberate divergence that needs no NaN: see the next section.
 - **`no_std` builds.** The bridge registry is a thread-local, so without `std` every bridge
   read rebuilds, as before, and the bridged rows above answer `false` there.
 
 Ordering is unchanged in both: NaN sorts below NaN, itself included. A mixed-instance
 `sort`/`unique`/`group_by` (`[.a,.b,.a] | unique` over two NaN tokens) depends on the sort's
 comparison order in jq, and may group differently here.
+
+### Two equally long slices of one array are `==` in jq, and are compared by content here (#7459)
+
+jq's `jv_equal` answers `true` for two arrays with the same length and the same storage pointer before it compares any element, and it does not compare the slice offset.
+A slice is a view on its array's storage in jq, so any two equally long slices of one array are `==` there, whatever they hold.
+`succinctly jq` compares their contents instead, deliberately: matching jq would make `unique`, `group_by` and array `-` silently merge or drop arrays that differ (ADR-0018 rule 4(b)), and the repo owner chose to keep the content comparison on #7459.
+
+The rule holds for slices, slices of slices, slices bound to variables or nested in arrays and objects at any depth, `x + []`, `null + x`, `first`/`last`/`limit` of a slice, `getpath` with a slice descriptor, and a `reduce` that slices its state.
+Every consumer of `jv_equal` observes it: `==`, `!=`, `unique`, `unique_by`, `group_by`, array `-`, `index`/`indices`/`rindex` with an array argument, `IN`, `any`/`all`, and object equality.
+`bsearch` observes it in 1.7.1 only: 1.8.2 implements it in C with `jv_cmp`, which compares by value.
+Ordering (`<`, `sort`, `min`, `max`, `min_by`), `contains`/`inside` and `tojson` compare by value in all three.
+So does any copy: `map(.)`, `[.[]]`, `[] + x`, `tojson | fromjson`, a write, `del`, `walk`, and a slice starting 65,536 or more elements into its storage, which jq copies (`[range(70000)] | .[65530:65534] == .[65534:65538]` is `true` in jq, `.[65536:65540] == .[65540:65544]` is `false`).
+A string slice is always a copy, so `"abcdef" | .[:3] == .[3:]` is `false` in all three, as are slices of two different arrays.
+The stdin and `-n` routes answer alike in all three tools.
+
+| Filter on `[1,2,3,4,5,6]`                              | jq 1.7.1            | jq 1.8.2            | succinctly          |
+|--------------------------------------------------------|---------------------|---------------------|---------------------|
+| `.[:3] == .[3:]`                                       | `true`              | `true`              | `false`             |
+| `.[:3] != .[3:]`                                       | `false`             | `false`             | `true`              |
+| `.[1:] == .[:-1]`                                      | `true`              | `true`              | `false`             |
+| `.[:3] == (.[3:] \| .[:3])`                            | `true`              | `true`              | `false`             |
+| `[.[:3]] == [.[3:]]`                                   | `true`              | `true`              | `false`             |
+| `.[:3] as $a \| .[3:] as $b \| [$a == $b, $a < $b]`    | `[true,true]`       | `[true,true]`       | `[false,true]`      |
+| `(.[:3] + []) == .[3:]`                                | `true`              | `true`              | `false`             |
+| `[.[:3], .[3:]] \| unique`                             | `[[1,2,3]]`         | `[[1,2,3]]`         | `[[1,2,3],[4,5,6]]` |
+| `[.[:3], .[3:]] \| group_by(.) \| length`              | `1`                 | `1`                 | `2`                 |
+| `[.[:3]] - [.[3:]]`                                    | `[]`                | `[]`                | `[[1,2,3]]`         |
+| `. as $x \| [$x[:3]] \| indices([$x[3:]])`             | `[0]`               | `[0]`               | `[]`                |
+| `. as $x \| $x[:3] \| IN($x[3:])`                      | `true`              | `true`              | `false`             |
+| `. as $x \| [[0], $x[:2], $x[4:]] \| bsearch($x[2:4])` | `1`                 | `-3`                | `-3`                |
+| `.[:3] == .[1:3]`                                      | `false`             | `false`             | `false`             |
+| `map(.) as $c \| .[:3] == $c[3:]`                      | `false`             | `false`             | `false`             |
+| `[.[:3], .[3:]] \| sort`                               | `[[1,2,3],[4,5,6]]` | `[[1,2,3],[4,5,6]]` | `[[1,2,3],[4,5,6]]` |
+| `. as $x \| [$x[:3]] \| contains([$x[3:]])`            | `false`             | `false`             | `false`             |
+
+Upstream, the shortcut is `jv_equal`'s `a.kind_flags == b.kind_flags && a.size == b.size && a.u.ptr == b.u.ptr` in `src/jv.c` (`jvp_equal` in 1.8), the same at jq-1.7.1, jq-1.8.2 and master (5c001b18d7, 2026-11-02).
+`jv_identical` and `jvp_array_equal` both compare the offset.
+Blame puts the missing term in jqlang/jq@74a14f5de7 ("Refactor jv structure.", 2013), which replaced a check of the pointer, offset and size with one of the kind, size and pointer.
+No upstream issue or fix was found (searched `slice equal`, `jv_equal`, `unique slice`).
+If upstream fixes it, the latest-jq rule closes this divergence.
+`tests/jq_cli/i7459.rs` pins the content answers in both routes.
 
 ### NaN ties in `sort`, `unique`, `group_by`, `min` and `max` keep jq's order (#6008)
 
