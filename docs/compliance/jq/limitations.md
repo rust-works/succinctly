@@ -7840,6 +7840,9 @@ materializes" — truthiness is not a read that can meet a malformed byte, so th
 belongs there and has no remainder): #2669 only removed the route-dependence, it did not
 newly decide this. A route that genuinely reads a member (`.a and true`) still raises.
 Pinned by `test_boolean_routes_agree_on_a_malformed_document_2669`.
+The one value whose truthiness does meet a malformed byte is a malformed scalar token itself (`tru`, `nul`, `xyz123`, `1.2.3`): the index has already classified it as unreadable, `nul` is not `null`, and so it has no truthiness to answer with.
+Since [#7449](https://github.com/rust-works/succinctly/issues/7449) `not`, `if`, `and`, `or`, `select`, `//`, `any` and `all` on such a token raise jq's parse error and exit 5, as `type` on it does, where they answered as if it were truthy (`[nul] | .[0] | not` was `false`); a container is still truthy whatever it holds, and a string whatever its escapes spell (#5308).
+Pinned by `tests/jq_cli/i7449.rs`.
 
 ## POSIX bracket classes are Unicode-aware, up to the Unicode version (#5367)
 

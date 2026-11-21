@@ -181451,6 +181451,13 @@ mod tests {
             "try .x catch 1",
             "try length catch 1",
             "try type catch 1",
+            // #7449: a filter that branches on the value reads it -- `nul` is
+            // not `null`, so it has no truthiness to branch on.
+            "not",
+            "if . then 1 else 2 end",
+            ". and true",
+            "(. // 1) | 2",
+            "select(.) | 1",
         ];
         let mut escaped = Vec::new();
         for json in ["[1.2.3]", "[tru]", "[1ee5]"] {
@@ -181488,16 +181495,11 @@ mod tests {
         );
 
         // And a filter that never reads the value answers in both
-        // evaluators, exactly as it does for a real number (#2692: truthiness
-        // decodes nothing; #2168: navigation validates only what it
-        // navigates). `.` and `values` pass the value on to whatever reads it
-        // next, the printer included, so they are pinned by the CLI sweep.
+        // evaluators, exactly as it does for a real number (#2168: navigation
+        // validates only what it navigates). `.` and `values` pass the value
+        // on to whatever reads it next, the printer included, so they are
+        // pinned by the CLI sweep. Branching on it reads it (#7449, above).
         const NON_READERS: &[&str] = &[
-            "not",
-            "if . then 1 else 2 end",
-            ". and true",
-            "(. // 1) | 2",
-            "select(.) | 1",
             "first(.) | 1",
             "isvalid(.)",
             "empty",
@@ -181578,7 +181580,8 @@ mod tests {
         //  `eval_using`, `eval_with_cursor_using` and therefore `eval`)
         const ROWS: &[(&str, &str, Outcome, Outcome)] = &[
             ("[1.2.3]", "1", Some("1"), Some("1")),
-            ("[1.2.3]", "not", None, Some("false")),
+            // #7449: branching on the value reads it.
+            ("[1.2.3]", "not", None, None),
             ("[1.2.3]", "[.] | length", None, Some("1")),
             ("[tru]", "[.] | length", None, Some("1")),
             ("[1.2.3]", "[limit(1; .)] | length", None, Some("1")),
@@ -181587,7 +181590,7 @@ mod tests {
             ("[tru]", "path(.)", None, Some("[]")),
             ("[1.2.3]", "[paths]", Some("[]"), Some("[]")),
             ("[tru]", "[paths]", Some("[]"), Some("[]")),
-            ("[1.2.3]", "getpath([]) | not", None, Some("false")),
+            ("[1.2.3]", "getpath([]) | not", None, None),
             (OBJ, "path(.a)", None, Some(r#"["a"]"#)),
             (OBJ, "[paths] | length", Some("2"), Some("2")),
             (
@@ -181661,7 +181664,8 @@ mod tests {
                 Some("1"),
                 Some("1"),
             ),
-            (OBJ, "[.b // 1] | length", Some("1"), Some("1")),
+            // #7449: `//` branches on `.b`, so it reads it.
+            (OBJ, "[.b // 1] | length", None, None),
             (OBJ, "[try .b] | length", Some("1"), Some("1")),
         ];
         fn generic<V: crate::jq::document::DocumentValue>(r: GenericResult<V>) -> Outcome {

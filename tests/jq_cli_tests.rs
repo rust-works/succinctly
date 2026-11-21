@@ -4219,6 +4219,24 @@ fn test_select_passes_through_corruption_it_only_tests_1645_2692() -> Result<()>
     ];
 
     for (label, doc, tests_only, materializes, now_answers, want_stderr) in cases {
+        // #7449: a token the index could not read (`xyz123`), tested directly,
+        // has no truthiness, so testing it reads it: every filter here
+        // raises. A string with a bad escape is still truthy whatever its
+        // escapes spell (#5308), and a container whatever it holds (#2692).
+        if *label == "structural error, tested directly" {
+            for filter in [*tests_only, *materializes, *now_answers] {
+                let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+                assert_eq!(
+                    code, 5,
+                    "[{label}] `{filter}` reads the token and must raise\nstdout: {stdout:?}"
+                );
+                assert!(
+                    names_fault(&stderr, want_stderr),
+                    "[{label}] `{filter}`: stderr {stderr:?} lacks {want_stderr:?}"
+                );
+            }
+            continue;
+        }
         let (stdout, stderr, code) = run_jq_full(&["-c", tests_only], Some(doc))?;
         assert_eq!(
             code, 0,
@@ -4454,14 +4472,28 @@ fn test_select_and_materialize_agree_on_corruption_1645() -> Result<()> {
             doc,
             r#"["bad"]"#,
         );
-        assert_jq_answers(
-            label,
-            "select(.bad) | .keep",
-            &["-c"],
-            "select(.bad) | .keep",
-            doc,
-            "5",
-        );
+        // #7449: except where `.bad` *is* the malformed token -- a token the
+        // index could not read has no truthiness, so testing it reads it.
+        if label == "structural error, top level" {
+            assert_jq_raises(
+                label,
+                "select(.bad) | .keep",
+                &["-c"],
+                "select(.bad) | .keep",
+                doc,
+                5,
+                expect_stderr,
+            );
+        } else {
+            assert_jq_answers(
+                label,
+                "select(.bad) | .keep",
+                &["-c"],
+                "select(.bad) | .keep",
+                doc,
+                "5",
+            );
+        }
     }
     Ok(())
 }
@@ -98762,13 +98794,15 @@ fn test_any_all_no_longer_reject_a_malformed_array_2692() -> Result<()> {
 /// `null` roots, where `any`/`all` raise a *type* error of their own; and its
 /// object rows reach `any`/`all`'s own object arm, which is the one place
 /// these builtins genuinely read rather than test. Every row here is
-/// therefore a container, and every row but one answers.
+/// therefore a container, and every row but two answers.
 ///
 /// The exception is the point of the test. `{123: 1}` still raises, because
 /// jq iterates an *object's values* (#422) under its own last-occurrence
 /// duplicate-key rule, so `effective_fields_checked` has to resolve the keys
-/// -- and resolving a key reads it. Every array row answers, because scanning
-/// elements for truthiness reads none of them. That is the whole of #2692's
+/// -- and resolving a key reads it. Every other array row answers, because
+/// scanning elements for truthiness reads none of them; `[xyz123]` raises,
+/// because an element the index could not read has no truthiness (#7449).
+/// That is the whole of #2692's
 /// rule applied inside a single builtin, which is why it is worth pinning
 /// here rather than only in the arm's own focused test.
 ///
@@ -98782,7 +98816,9 @@ fn test_any_all_validate_only_the_keys_they_resolve_2476_2692() -> Result<()> {
         // The one raising row: an object, so the keys are resolved.
         ("#1194 non-string key", "{123: 1}", 5),
         ("decode failure, in array", r#"["\x"]"#, 0),
-        ("structural error, in array", "[xyz123]", 0),
+        // #7449: an element the index could not read has no truthiness, so
+        // scanning for it reads it.
+        ("structural error, in array", "[xyz123]", 5),
         (
             "#1642 colliding undecodable keys",
             r#"{"\ud800":1,"\ud800":2}"#,
@@ -113695,6 +113731,13 @@ fn test_malformed_number_route_sweep_3222() -> Result<()> {
         "try (.[0] | .x) catch \"caught\"",
         "try (.[0] | type) catch \"caught\"",
         "[.[] | tostring?]",
+        // #7449: branching on the value reads it.
+        ".[0] | not",
+        ".[0] | if . then 1 else 2 end",
+        ".[0] | . and true",
+        ".[0] | select(.) | 1",
+        "[.[] | select(.)] | length",
+        ".[0] | (. // 1) | 2",
     ];
     for doc in ["[1.2.3,2]", "[1ee5,2]", "[9e999e999,2]", "[+1.2.3,2]"] {
         for filter in READERS {
@@ -113715,12 +113758,6 @@ fn test_malformed_number_route_sweep_3222() -> Result<()> {
         "length",
         "keys",
         "[paths]",
-        ".[0] | not",
-        ".[0] | if . then 1 else 2 end",
-        ".[0] | . and true",
-        ".[0] | select(.) | 1",
-        "[.[] | select(.)] | length",
-        ".[0] | (. // 1) | 2",
         ".[0] | [.] | length",
         ".[0] | path(.)",
         ".[0] | empty",
@@ -114067,7 +114104,8 @@ fn test_unreadable_value_collection_split_3266() -> Result<()> {
         ),
         (&["-c"], "[1.2.3]", ".[0] | path(.)", "[]\n", 0),
         (&["-c"], "[tru]", ".[0] | [paths]", "[]\n", 0),
-        (&["-c"], "[1.2.3]", ".[0] | getpath([]) | not", "false\n", 0),
+        // #7449: branching on the value reads it.
+        (&["-c"], "[1.2.3]", ".[0] | getpath([]) | not", "", 5),
         (&["-c"], OBJ, ".[0] | path(.a)", "[\"a\"]\n", 0),
         (&["-c"], OBJ, ".[0] | [paths] | length", "2\n", 0),
         (
@@ -114188,7 +114226,8 @@ fn test_unreadable_value_collection_split_3266() -> Result<()> {
             "1\n",
             0,
         ),
-        (&["-c"], OBJ, ".[0] | [.b // 1] | length", "1\n", 0),
+        // #7449: `//` branches on `.b`, so it reads it.
+        (&["-c"], OBJ, ".[0] | [.b // 1] | length", "", 5),
         (&["-c"], OBJ, ".[0] | [try .b] | length", "1\n", 0),
         (&["-c"], OBJ, ".[0] | path(.a), input_line_number", "", 5),
         // #2847: `-s` is the default route's own reads over one more array
