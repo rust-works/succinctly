@@ -485,7 +485,6 @@ def _sp_all(condition): all(.[]; condition);
 def _sp_any(condition): any(.[]; condition);
 def _sp_all: all(.[]; .);
 def _sp_any: any(.[]; .);
-def _sp_last(g): reduce g as $item (null; $item);
 def _sp_nth($n; g):
   if $n < 0 then error("nth doesn't support negative indices")
   else label $out | foreach g as $item ($n + 1; . - 1; if . <= 0 then $item, break $out else empty end) end;
@@ -1767,6 +1766,37 @@ impl<'e> Interp<'e> {
         })
     }
 
+    /// `last(g)` as jq 1.8 compiles it (`gen_last_1`, jqlang/jq#3179, #7518):
+    ///
+    /// ```text
+    /// DUP; null; STOREV last; DUP; true; STOREV is_empty;
+    /// FORK [CALL g; DUP; STOREV last; false; STOREV is_empty; BACKTRACK];
+    /// LOADVN is_empty; JUMP_F L; BACKTRACK; L: LOADVN last
+    /// ```
+    ///
+    /// `g` runs from the entry register and its movement is undone by the
+    /// backtrack, as it is for a `reduce` source; the last value it emitted is
+    /// answered at the entry register, and nothing at all when `g` emitted
+    /// nothing (1.7.1's `reduce g as $item (null; $item)` answered `null`).
+    fn last_fold(
+        &self,
+        g: &'e Expr,
+        env: &Env<'e>,
+        input: SVal,
+        reg: Reg,
+        sink: &mut Sink<'_>,
+    ) -> R {
+        let last: RefCell<Option<SVal>> = RefCell::new(None);
+        self.eval(g, env, input, reg.clone(), &mut |v, _| {
+            *last.borrow_mut() = Some(v);
+            Ok(())
+        })?;
+        match last.into_inner() {
+            Some(v) => sink(v, reg),
+            None => Ok(()),
+        }
+    }
+
     fn call_prelude(
         &self,
         name: &str,
@@ -1776,6 +1806,11 @@ impl<'e> Interp<'e> {
         reg: Reg,
         sink: &mut Sink<'_>,
     ) -> R {
+        // `last(g)` is bytecoded in jq 1.8 (`gen_last_1`), not a `reduce`: see
+        // [`Self::last_fold`]. The 0-arity `last` is still the prelude's `.[-1]`.
+        if name == "_sp_last" && args.len() == 1 {
+            return self.last_fold(args[0], env, input, reg, sink);
+        }
         let callee = self
             .prelude_env
             .lookup_func(name, args.len())

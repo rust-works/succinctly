@@ -39774,35 +39774,30 @@ fn test_jq_field_named_input_is_not_an_input_builtin_1309() -> Result<()> {
     Ok(())
 }
 
-/// #1521: `last(f)` over an empty stream answers `null`, not nothing.
+/// #1521, moved by #7518: `last(f)` over an empty stream yields nothing, as `first(f)` does.
 ///
-/// jq defines it as `reduce f as $x (null; $x)` and `reduce` always produces
-/// exactly one output, so an empty operand yields the seed. succinctly mapped
-/// the empty case to "no output" in all three of its `last` paths
-/// (`eval_last_expr`, `builtin_last_stream`, `eval_first_or_last_generic`).
+/// jq 1.7.1 defined it as `reduce f as $x (null; $x)`, and `reduce` always produces exactly one
+/// output, so an empty operand answered the seed `null`; #1521 pinned that. jq 1.8 compiles `last`
+/// itself and backtracks when `f` produced nothing (jqlang/jq#3179), and succinctly follows 1.8.2:
+/// every row that was `null` is now the jq 1.8.2 answer (pin moved, #7518).
 ///
-/// Every expectation is pinned jq 1.7.1's own output. The `first` rows are the
-/// guard against over-fixing: jq's `first(f)` is `label $out | (f, break $out)`,
-/// which genuinely yields nothing, and the asymmetry is jq's own — ADR-0018
-/// rule 3 says reproduce it rather than normalise it. The 0-arity `first`/`last`
-/// are `.[0]`/`.[-1]`, a different construct that was already correct.
+/// The `first` rows and the 0-arity rows are unchanged: jq's `first(f)` is `label $out | (f,
+/// break $out)`, which has always yielded nothing, and the 0-arity `first`/`last` are
+/// `.[0]`/`.[-1]`, a different construct that answers `null` on `[]` in both versions.
 #[test]
-fn test_jq_last_of_an_empty_stream_is_null_1521() -> Result<()> {
+fn test_jq_last_of_an_empty_stream_yields_nothing_1521_7518() -> Result<()> {
     for (filter, input, expected) in [
-        // The fix.
-        ("last(empty)", "null", "null\n"),
-        ("last(.[])", "[]", "null\n"),
-        ("last(limit(0; 1,2))", "null", "null\n"),
-        ("[last(empty)]", "null", "[null]\n"),
+        // Moved by #7518.
+        ("last(empty)", "null", ""),
+        ("last(.[])", "[]", ""),
+        ("last(limit(0; 1,2))", "null", ""),
+        ("[last(empty)]", "null", "[]\n"),
         (r#"last(empty)//"alt""#, "null", "\"alt\"\n"),
-        // `?` must not turn the (non-erroring) empty case into no output...
-        ("last(empty)?", "null", "null\n"),
-        // ...but a genuinely raising operand under `?` still yields nothing,
-        // which is why `last` evaluates its operand unswallowed and suppresses
-        // the error itself.
+        ("last(empty)?", "null", ""),
+        // A genuinely raising operand under `?` yields nothing too.
         (r#"[last(error("x"))?]"#, "null", "[]\n"),
         (r#"[last(1,2,error("x"))?]"#, "null", "[]\n"),
-        // `first` is deliberately NOT symmetric.
+        // `first` is unchanged.
         ("[first(empty)]", "null", "[]\n"),
         ("[first(empty)?]", "null", "[]\n"),
         // 0-arity forms, unchanged.
