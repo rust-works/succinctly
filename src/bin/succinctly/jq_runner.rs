@@ -17237,11 +17237,57 @@ struct SlurpedInput {
 /// The bytes of the regular file `path`, read again, or `None` when it cannot be (#6628): a named
 /// pipe, a socket or a device gives its bytes once, and opening it again waits for a writer that is
 /// not coming. A message that needs the re-read is then left as the run found it.
+///
+/// Two more read again (#7444). The null device (any path to it) gave nothing and gives nothing
+/// again. And a regular file is read from its start by position, because a path naming a held
+/// descriptor (`/dev/fd/N`, `/dev/stdin`) can open as that descriptor (macOS duplicates it), whose
+/// offset the run's own read left at the end, so a plain read would see nothing. A positional read
+/// neither uses nor moves that offset.
 fn read_again(path: &Path) -> Option<Vec<u8>> {
-    std::fs::metadata(path)
-        .ok()
-        .filter(std::fs::Metadata::is_file)
-        .and_then(|_| std::fs::read(path).ok())
+    let meta = std::fs::metadata(path).ok()?;
+    if is_dev_null(&meta) {
+        return Some(Vec::new());
+    }
+    if !meta.is_file() {
+        return None;
+    }
+    read_from_start(&std::fs::File::open(path).ok()?)
+}
+
+/// Whether `meta` is that of the null device.
+#[cfg(unix)]
+fn is_dev_null(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    meta.file_type().is_char_device()
+        && std::fs::metadata("/dev/null").is_ok_and(|null| null.rdev() == meta.rdev())
+}
+
+#[cfg(not(unix))]
+fn is_dev_null(_: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// Every byte of the regular file `file` from offset 0, read by position (see [`read_again`]).
+#[cfg(unix)]
+fn read_from_start(file: &std::fs::File) -> Option<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+    let mut bytes = Vec::with_capacity(file.metadata().ok()?.len().try_into().unwrap_or(0));
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        match file.read_at(&mut chunk, bytes.len() as u64) {
+            Ok(0) => return Some(bytes),
+            Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn read_from_start(mut file: &std::fs::File) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok().map(|_| bytes)
 }
 
 /// jq's parse error for a `--slurp` stream the splitter gave up on in `raw`, file `idx` of `files`
@@ -27401,6 +27447,34 @@ mod tests {
             if made.is_ok_and(|status| status.success()) {
                 assert_eq!(read_again(&fifo), None);
             }
+        }
+    }
+
+    /// #7444: the null device reads again as empty, and a regular file read through a descriptor
+    /// whose offset is at its end is still read from its start, without moving that offset.
+    #[cfg(unix)]
+    #[test]
+    fn read_again_reads_dev_null_and_a_held_descriptors_file_7444() {
+        use std::io::{Read, Seek, Write};
+        use std::os::unix::io::AsRawFd;
+        assert_eq!(
+            read_again(Path::new("/dev/null")).as_deref(),
+            Some(&b""[..])
+        );
+        let mut held = tempfile::tempfile().expect("temp file");
+        held.write_all(b"{\"a\":[}").expect("write");
+        let at_end = held.stream_position().expect("offset");
+        let path = PathBuf::from(format!("/dev/fd/{}", held.as_raw_fd()));
+        if path.exists() {
+            assert_eq!(read_again(&path).as_deref(), Some(&b"{\"a\":[}"[..]));
+        }
+        assert_eq!(held.stream_position().expect("offset"), at_end);
+        let mut rest = Vec::new();
+        held.read_to_end(&mut rest).expect("read");
+        assert_eq!(rest, b"", "the descriptor's offset did not move");
+        // A character device other than the null device is still not read again.
+        if Path::new("/dev/zero").exists() {
+            assert_eq!(read_again(Path::new("/dev/zero")), None);
         }
     }
 
