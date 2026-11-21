@@ -29,11 +29,13 @@ fn test_leading_zero_literal_keeps_its_decnumber_spelling_5615() -> Result<()> {
         ("[00e1,007e1]", "[0E+1,7E+1]\n"),
         ("00e1|tojson", "\"0E+1\"\n"),
         ("\"\\(00e1)\"", "\"0E+1\"\n"),
-        // Arithmetic, comparison and negation see the value, not the spelling.
+        // Arithmetic and comparison see the value, not the spelling.
         ("00e1 == 0", "true\n"),
         ("007e1+0", "70\n"),
-        ("-007e1", "-70\n"),
-        ("-00e1", "-0\n"),
+        // Negation keeps the literal, as jq 1.8 does (#7453), and a zero negates to positive
+        // zero; jq 1.7.1 printed `-70` and `-0`.
+        ("-007e1", "-7E+1\n"),
+        ("-00e1", "0E+1\n"),
         ("-007.5e1|.+0", "-75\n"),
     ] {
         let (out, err, code) = run_jq_full(&["-nc", program], None)?;

@@ -3283,7 +3283,7 @@ mod tests {
             b"\x1e+1",
             b"\x1e01",
             b"\x1enan",
-            b"\x1eNaN5",
+            b"\x1eNaN0",
             b"\x1esnan",
             b"\x1einf",
             b"\x1e-Infinity",

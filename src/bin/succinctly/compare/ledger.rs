@@ -79,6 +79,15 @@ fn is_name(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// A suite directory's name: a name, or one with a `.` after its first character, because the
+/// differential suites are named after their test file (`upstream-jq.test`, so the entry of
+/// its case at line 1942 is `upstream-jq.test/1942.toml`). A leading `.` is a dotfile, which
+/// `load` skips. The arity rule reads only the probe's file name, so a dotted suite is no
+/// ambiguity.
+fn is_suite_name(s: &str) -> bool {
+    !s.starts_with('.') && is_name(&s.replace('.', "_"))
+}
+
 /// The id of the entry in `<suite>/<file_name>`: `features` and `strftime.1.toml` are
 /// `features:strftime/1`. A name that no id maps to is an error, so a stray or misspelt file
 /// cannot be silently ignored.
@@ -94,10 +103,11 @@ pub fn id_of(suite: &str, file_name: &str) -> Result<String> {
         _ => stem.to_string(),
     };
     let name = probe.split_once('/').map_or(probe.as_str(), |(n, _)| n);
-    if !is_name(suite) || !is_name(name) {
+    if !is_suite_name(suite) || !is_name(name) {
         anyhow::bail!(
             "{suite}/{file_name}: no id maps to this path (a suite and a probe use only \
-             letters, digits, `_` and `-`; an arity is written `.N`)"
+             letters, digits, `_` and `-`, a suite also a `.` after its first character; \
+             an arity is written `.N`)"
         );
     }
     Ok(format!("{suite}:{probe}"))
@@ -329,6 +339,8 @@ mod tests {
                 "features:get_jq_origin/0",
             ),
             ("since-secondary", "add.1.toml", "since-secondary:add/1"),
+            ("upstream-jq.test", "1942.toml", "upstream-jq.test:1942"),
+            ("upstream-man.test", "12.toml", "upstream-man.test:12"),
         ] {
             assert_eq!(id_of(suite, file).unwrap(), id);
         }
@@ -343,6 +355,9 @@ mod tests {
             ("cli", "a.1.2.toml"),
             ("", "a.toml"),
             ("c li", "a.toml"),
+            (".hidden", "a.toml"),
+            ("upstream-jq.test", "a.b.toml"),
+            ("upstream:jq.test", "a.toml"),
         ] {
             assert!(id_of(suite, file).is_err(), "{suite}/{file}");
         }

@@ -16916,8 +16916,40 @@ fn is_canonical_int_text(n: i64, text: &str) -> bool {
 fn owned_key_step<S: EvalSemantics>(key: &Expr, at: &OwnedValue) -> Option<StepKey<'static>> {
     match owned_assign_operand::<S>(key, at)? {
         OwnedValue::String(name) => Some(StepKey::Field(Cow::Owned(name.into_string()))),
-        key => Some(StepKey::Index(integral_key(&key)?)),
+        key => {
+            let whole_float = || match S::TAG {
+                EvalTag::Jq => whole_float_key(&key),
+                _ => None,
+            };
+            Some(StepKey::Index(integral_key(&key).or_else(whole_float)?))
+        }
     }
+}
+
+/// A float-represented key whose value is a whole number no larger than 2^53 (`1e4`, `3.0`,
+/// `$i * 1.0`, `-0.0`, an element of `[range(1e4)]`), as the index it names (#7495). jq keeps
+/// every number as a double and a write truncates a key to an `int`, so a whole one names exactly
+/// the slot its integer spelling does (`[1,2,3] | .[1.0] = 9` is `[1,9,3]`, `.[-0.0]` is `.[0]`).
+/// [`owned_assign_step`] only writes, so the spelling `path()` keeps (#1088) is never seen. Without
+/// this a fold such as `reduce range(1e4) as $i ([]; .[$i] = 1)` declined to the evaluator's
+/// route, which rebuilt the whole accumulator every step and went quadratic.
+///
+/// A fractional key, a NaN, an infinity and anything past 2^53 stay the evaluator's, with its
+/// rules and its errors; so does every float key in yq mode, whose array index rejects one
+/// (`cannot index array with '1.0'`). Written with comparisons and casts only, which `core` has.
+fn whole_float_key(key: &OwnedValue) -> Option<i64> {
+    const LIMIT: f64 = 9_007_199_254_740_992.0;
+    let (OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _)) = key else {
+        return None;
+    };
+    let f = *f;
+    // A NaN fails both comparisons; within the limit the cast is exact, so the round trip holds
+    // exactly when `f` has no fraction.
+    if !(-LIMIT..=LIMIT).contains(&f) {
+        return None;
+    }
+    let n = f as i64;
+    (n as f64 == f).then_some(n)
 }
 
 /// Where `step` lands inside `container`: `Some(child)` when
@@ -18769,7 +18801,21 @@ fn arith_sub<S: EvalSemantics>(
 /// made that premise false (binary `-`/`+`/`*` already round past `2^53`),
 /// leaving unary minus as the one holdout still keeping exact fidelity
 /// here. See `docs/compliance/jq/limitations.md`'s removed "#2357" entry.
+///
+/// **A literal operand stays a literal in jq mode (#7453):** jq 1.8's
+/// `jv_number_negate` negates a literal's decimal (jqlang/jq#3242, fixing
+/// jqlang/jq#2704), so `-(1.500)`, `1.500 | -.` and `-$x` on a literal keep
+/// every digit, compare exactly, and a zero negates to positive zero
+/// ([`crate::jq::value::jq_negated_literal`]). The rules above are for a
+/// computed number.
 pub(crate) fn arith_negate<S: EvalSemantics>(operand: OwnedValue) -> Result<OwnedValue, EvalError> {
+    if S::TAG != EvalTag::Yq {
+        if let OwnedValue::NumberLiteral(repr, text) = &operand {
+            if let Some((repr, text)) = crate::jq::value::jq_negated_literal(*repr, text) {
+                return Ok(OwnedValue::NumberLiteral(repr, text.into()));
+            }
+        }
+    }
     match signed_plain_number::<S>(operand) {
         OwnedValue::Int(0) if S::TAG != EvalTag::Yq => Ok(OwnedValue::Float(-0.0)),
         OwnedValue::Int(n) => Ok(if S::OVERFLOW_WRAPS {
@@ -21283,7 +21329,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::Trunc => builtin_trunc::<W, S>(value, optional),
 
         // Phase 19: Type conversion
-        Builtin::ToBoolean => builtin_toboolean::<W>(value, optional),
+        Builtin::ToBoolean => builtin_toboolean::<W, S>(value, optional),
 
         // Phase 20: Iteration control extension
         Builtin::Skip(n_expr, expr) => builtin_skip::<W, S>(n_expr, expr, value, optional),
@@ -29690,7 +29736,7 @@ fn bn_to_decimal_string(bn: &[u8]) -> String {
 
 /// Builtin: toboolean - convert to boolean
 /// Accepts: true, false, "true", "false"
-fn builtin_toboolean<W: Clone + AsRef<[u64]>>(
+fn builtin_toboolean<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
@@ -29701,16 +29747,17 @@ fn builtin_toboolean<W: Clone + AsRef<[u64]>>(
                 "true" => QueryResult::Owned(OwnedValue::Bool(true)),
                 "false" => QueryResult::Owned(OwnedValue::Bool(false)),
                 _ if optional => QueryResult::None,
-                other => QueryResult::Error(EvalError::new(format!(
-                    "string ({other:?}) cannot be parsed as a boolean"
-                ))),
+                // jq's own wording (`jv_dump_string_trunc` of the string: JSON escapes, #7529).
+                other => QueryResult::Error(EvalError::cannot_parse_as_boolean(
+                    &OwnedValue::String(other.into()),
+                )),
             },
             Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::new(format!(
-            "{} cannot be parsed as a boolean",
-            type_name(&value)
+        // `null (null) cannot be parsed as a boolean`: the value is named, as for every jq type error.
+        _ => QueryResult::Error(EvalError::cannot_parse_as_boolean(&to_owned_lossy::<S, _>(
+            &value,
         ))),
     }
 }
@@ -50386,7 +50433,7 @@ fn autovivify_array(root: &mut OwnedValue) {
 fn write_index(arr: &mut ArrayVec, idx: i64, yq_mode: bool) -> Result<&mut OwnedValue, EvalError> {
     let actual_idx = resolve_setpath_index(&OwnedValue::Int(idx), arr.len(), yq_mode)?;
     if actual_idx >= arr.len() {
-        pad_with_nulls(&mut arr.make_vec(), actual_idx)?;
+        pad_with_nulls(&mut arr.make_vec(), actual_idx, yq_mode)?;
     }
     Ok(&mut arr[actual_idx])
 }
@@ -52250,6 +52297,35 @@ mod deferred_update_delete_path_tests {
         .unwrap_err();
         assert!(format!("{error:?}").contains("Cannot index array with string"));
     }
+
+    // #7562: an array key the filter deletes is queued, and `delpaths` refuses it at the end,
+    // so a later path's error can come first; with no queue it is refused at once.
+    #[test]
+    fn an_array_key_deletion_is_queued_and_refused_at_the_end_7562() {
+        let key = Expr::ArrayKey(Box::new(parse_complete_json("[1]", false).unwrap()));
+        let empty = parse("empty").unwrap();
+        let mut root = parse_complete_json("[1,2]", false).unwrap();
+        let mut deletes = DeferredUpdateDeletes::default();
+        let wrote = update_path_with_deletes::<JqSemantics>(
+            &mut root,
+            &key,
+            &empty,
+            false,
+            ScalarNoop::Off,
+            None,
+            Some(&mut deletes),
+        );
+        assert!(matches!(wrote, Ok(false)));
+        assert_eq!(root.to_json(), "[1,2]");
+        let error = finish_deferred_update_deletes::<JqSemantics>(root, deletes).unwrap_err();
+        assert!(format!("{error:?}").contains("Cannot delete array element of array"));
+
+        let mut root = parse_complete_json("[1,2]", false).unwrap();
+        let error =
+            update_path::<JqSemantics>(&mut root, &key, &empty, false, ScalarNoop::Off, None)
+                .unwrap_err();
+        assert!(format!("{error:?}").contains("Cannot delete array element of array"));
+    }
 }
 
 fn update_delete_component(expr: &Expr) -> Option<OwnedValue> {
@@ -52851,6 +52927,15 @@ fn update_path_with_deletes<S: EvalSemantics>(
             // jq's `delpaths` leaves a `null` or absent parent as it is (`{"c":null} | .c[nan] |=
             // empty`), and never returns on an array. The document stays as it is.
             if !wrote && is_nan_index_key(key) {
+                return Ok(false);
+            }
+            // #7562: with several paths, `_modify` queues the deletion and runs one `delpaths`
+            // once every path is collected, so a later path's error comes first and this key's
+            // refusal is `delpaths`' own, raised at the end.
+            if let (false, Some(deletes)) = (wrote, deletes) {
+                deletes.enter(OwnedValue::clone(key));
+                deletes.record();
+                deletes.leave();
                 return Ok(false);
             }
             Err(array_key_write_error(
@@ -53796,7 +53881,10 @@ fn pattern_is_plain(pattern: &Pattern) -> bool {
 /// is not the container it names, so a pattern bind (the `foreach` source's or its own) is read only
 /// `caught`, inside a `try`/`?` that swallows the raise; a `$name` pattern never raises, and a pattern
 /// with a computed key is never read (its key is an expression of its own).
-fn expr_is_inert(e: &Expr, caught: bool) -> bool {
+///
+/// Also the test `eval_generic`'s lazy `map` chain applies before it fuses a `map(g)` onto the stages already on
+/// it (#7565): fusing runs the stages element by element, which is unobservable only when one side is inert.
+pub(crate) fn expr_is_inert(e: &Expr, caught: bool) -> bool {
     fn patterns_are_inert(patterns: &[Pattern], caught: bool) -> bool {
         patterns.iter().all(|pattern| {
             matches!(pattern, Pattern::Var(_)) || caught && pattern_is_plain(pattern)
@@ -76481,6 +76569,11 @@ fn transparent_outputs(source: &Expr, input_tracked: bool, swallowed: bool) -> O
         // raises (`(.o | (walk(.)?) as $y | $y) = 1` is a silent no-op).
         leaf if is_walk_identity(leaf) => (!swallowed).then_some(false),
         leaf if is_transparent_leaf(leaf) => Some(false),
+        // #7474: a call whose generator argument the parser bound first is judged as written.
+        bound @ Expr::As { var, .. } if crate::jq::parser::is_value_arg_var(var) => {
+            let call = crate::jq::parser::unbound_value_args_call(bound)?;
+            transparent_outputs(&call, input_tracked, swallowed)
+        }
         Expr::Comma(exprs) => all(&mut exprs.iter()),
         // A handler's output is untracked; one that may see the register as its
         // error payload ([`try_body_may_raise_alias`]) is not placed at all, so the
@@ -82118,8 +82211,11 @@ fn resolve_foreach<'a, S: EvalSemantics>(
         // SOURCE's own ambient value, trackability and snapshot mark are
         // all recomputed per INIT fork from wherever that fork's own
         // register stands after INIT ran.
+        // #7519: but every `foreach` fork reads the document, as the first does: jq 1.8 runs each
+        // fork's SOURCE on the fold's real input (jqlang/jq#3266), so the ambient is the first
+        // fork's (`path(foreach (.a) as $k ((0,1); $k))` is `["a"]` twice in jq 1.8.2).
         let ambient = fold_source_ambient::<S>(
-            fork_index,
+            0,
             &reg,
             value,
             &null_ambient,
@@ -97831,11 +97927,14 @@ pub(crate) type ForeachElementSink<'a> = &'a mut dyn FnMut(OwnedValue) -> Demand
 
 /// What a fold's SOURCE is evaluated against for one INIT fork (#3895).
 ///
-/// jq 1.7.1 hands the *first* fork the fold's real input and every later fork
-/// `null`: `reduce`/`foreach` duplicate the input with `DUPN`, which leaves
-/// `null` behind in the slot the next INIT output resumes from, so
-/// `[reduce (.) as $x ((.,.); $x)]` on `{"a":1}` is `[{"a":1},null]`. A source
-/// that does not read `.` (`range(3)`, a literal) cannot tell the two apart.
+/// jq hands a `reduce`'s *first* fork the fold's real input and every later fork
+/// `null`: `reduce` duplicates the input with `DUPN`, which leaves `null` behind
+/// in the slot the next INIT output resumes from, so
+/// `[reduce (.) as $x ((.,.); $x)]` on `{"a":1}` is `[{"a":1},null]` in jq 1.7.1
+/// and 1.8.2. A source that does not read `.` (`range(3)`, a literal) cannot
+/// tell the two apart. jq 1.7.1's `foreach` did the same; jq 1.8 dropped its
+/// `DUPN` (jqlang/jq#3266, a bug fix), so [`foreach_forks`] reads `Real` on
+/// every fork (#7519).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SourceInput {
     /// The fold's own input: the first INIT fork.
@@ -97965,12 +98064,12 @@ impl FoldDirectRetry {
 /// memory for the duration of a fold whose entire point is not to do that,
 /// even in the overwhelmingly common single-INIT case.
 ///
-/// **Every fork after the first drives it against `null`** (#3895): jq 1.7.1
-/// hands only INIT's first output the fold's real input
-/// (`[reduce (.) as $x ((.,.); $x)]` is `[{"a":1},null]`), so `drive_source` is
-/// told which input the fork reads ([`SourceInput`]) and each caller runs a
-/// later fork's as-written source against `null` -- [`source_value`] on this
-/// evaluator, [`drive_source_against_null`] on the generic one.
+/// **Every fork drives it against the fold's real input** (#7519): jq 1.7.1
+/// handed only INIT's first output the real input and every later one `null`
+/// (#3895), which jq 1.8 fixed for `foreach` (jqlang/jq#3266:
+/// `[1, 2] | [foreach .[] as $x (0, 1; . + $x)]` is `[1,3,2,4]`), so
+/// `drive_source` is always told [`SourceInput::Real`]. [`reduce_forks`] keeps
+/// the `null` forks, as jq 1.8.2 does.
 ///
 /// The step's own verdict outranks the source's, and a *fork's* own verdict
 /// (which folds in the step's) outranks INIT's own: a step or fork that
@@ -98017,10 +98116,8 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
     // written. #3181: a step whose accumulator still is one takes the
     // as-written operand instead (see [`FoldOperand`]).
     // #3329: the loop variables are marked only where the as-written UPDATE or
-    // EXTRACT reads one as a path step, and only for the first INIT fork -- jq
-    // 1.7.1 evaluates SOURCE against `null` on every later fork
-    // (`[reduce (.) as $x ((.,.); $x)]` is `[{"a":1},null]`), so a write through
-    // `$x` there refuses in jq where marking it would answer.
+    // EXTRACT reads one as a path step -- on every INIT fork, since every fork's
+    // SOURCE reads the real input (#7519; `reduce_forks` marks the first only).
     let mark_loop_vars = retry.marks;
     let share_loop_vars = retry.shares;
     let hoisted_update = demote_for_reentry(update, &RootWitness::Owned);
@@ -98062,13 +98159,10 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
         // never the accumulator's, so it certifies no write jq refuses
         // (`test_fold_container_loop_variable_identity_through_document_input_3896`'s
         // multi-fork rows).
-        let mark = LoopVarSplice::of(mark_loop_vars && first, share_loop_vars);
-        // #3895: jq runs every later fork's SOURCE against `null`.
-        let source_input = if first {
-            SourceInput::Real
-        } else {
-            SourceInput::Null
-        };
+        // #7519: every `foreach` fork reads the real input (jq 1.8's jqlang/jq#3266, below), so
+        // the marking holds on every fork too: `[foreach (.) as $x ((.,.); ($x.a) = 9)]` is
+        // `[{"a":9},{"a":9}]` in jq 1.8.2.
+        let mark = LoopVarSplice::of(mark_loop_vars, share_loop_vars);
         let all_var_names =
             all_var_names.get_or_insert_with(|| pattern_alternatives_var_names(patterns));
         let (update, extract) = *inert_operands.get_or_insert_with(|| {
@@ -98096,7 +98190,9 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
         // the retry generation (#3293).
         let ended = StashedVerdict::<Flow>::new();
 
-        let flow = drive_source(source_input, &mut |input_val| {
+        // #7519: unlike `reduce_forks`, every fork's SOURCE reads the fold's real input, as jq
+        // 1.8 runs it (jqlang/jq#3266, a fix of 1.7.1's `DUPN` handing later forks `null`).
+        let flow = drive_source(SourceInput::Real, &mut |input_val| {
             ended.begin();
             // Substituted per element as it arrives: the demand-driven path
             // sees one element at a time and can never hoist a whole matrix
@@ -98198,7 +98294,10 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
     // (see `fold_step_each`); the fold's own callers pass it in as written.
     // #3181: a step whose accumulator still is one takes the as-written
     // UPDATE instead (see [`FoldOperand`]).
-    // #3329: see `foreach_forks`.
+    // #3329: see `foreach_forks`; here only for the first INIT fork -- jq
+    // evaluates a `reduce`'s SOURCE against `null` on every later fork
+    // (`[reduce (.) as $x ((.,.); $x)]` is `[{"a":1},null]`), so a write through
+    // `$x` there refuses in jq where marking it would answer.
     let mark_loop_vars = retry.marks;
     let share_loop_vars = retry.shares;
     let hoisted_update = demote_for_reentry(update, &RootWitness::Owned);
@@ -98228,7 +98327,8 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
         // (`test_fold_container_loop_variable_identity_through_document_input_3896`'s
         // multi-fork rows).
         let mark = LoopVarSplice::of(mark_loop_vars && first, share_loop_vars);
-        // #3895: jq runs every later fork's SOURCE against `null`.
+        // #3895: jq runs every later fork's SOURCE against `null` (still in 1.8.2, unlike
+        // `foreach`'s, #7519).
         let source_input = if first {
             SourceInput::Real
         } else {
@@ -102620,16 +102720,32 @@ fn resolve_setpath_index(key: &OwnedValue, len: usize, yq_mode: bool) -> Result<
     // Still fallible on a 32-bit target, where a large positive index does not
     // fit a `usize`. That is the same refusal as `pad_with_nulls`', not a
     // negative index, so it must not borrow the sentence above.
-    usize::try_from(resolved).map_err(|_| cannot_grow_array(resolved as u64 + 1))
+    usize::try_from(resolved).map_err(|_| array_too_large(resolved as u64 + 1, yq_mode))
 }
 
 /// Refusal for an array length that cannot be allocated.
 ///
 /// Not a jq sentence: jq does not survive the filters that reach this (it dies
 /// on the allocation), so there is no wording to reproduce — see
-/// `docs/compliance/jq/limitations.md`.
+/// `docs/compliance/jq/limitations.md`. It is also what `succinctly yq` says for
+/// a length past [`MAX_PADDED_ARRAY_LEN`] ([`array_too_large`]): yq has no
+/// sentence either.
 fn cannot_grow_array(len: u64) -> EvalError {
     EvalError::new(format!("Cannot grow array to {len} elements"))
+}
+
+/// The refusal for an index write past [`MAX_PADDED_ARRAY_LEN`] (a length of `len`).
+///
+/// `succinctly jq` words it as jq 1.8.2 does, `Array index too large` (CVE-2024-23337: 1.8
+/// bounds `jv_array_set` and answers that sentence; 1.7.1 has no bound and dies, #7536).
+/// `succinctly yq` keeps [`cannot_grow_array`]: the mode decides, and yq has no sentence to
+/// copy.
+fn array_too_large(len: u64, yq_mode: bool) -> EvalError {
+    if yq_mode {
+        cannot_grow_array(len)
+    } else {
+        EvalError::new("Array index too large")
+    }
 }
 
 /// The longest array an index write grows one to: 2^29 elements, so index
@@ -102646,9 +102762,9 @@ pub(crate) const MAX_PADDED_ARRAY_LEN: usize = 536_870_912;
 
 /// The refusal for a write that would grow an array to `len` elements, before
 /// anything is reserved.
-fn check_paddable_len(len: usize) -> Result<(), EvalError> {
+fn check_paddable_len(len: usize, yq_mode: bool) -> Result<(), EvalError> {
     if len > MAX_PADDED_ARRAY_LEN {
-        Err(cannot_grow_array(len as u64))
+        Err(array_too_large(len as u64, yq_mode))
     } else {
         Ok(())
     }
@@ -102663,7 +102779,8 @@ fn check_paddable_len(len: usize) -> Result<(), EvalError> {
 /// which for a library means taking the embedder down with it: `null |
 /// setpath([1e30]; 9)` wants 9.2e18 elements. jq has no sentence to reproduce
 /// here because jq does not survive the same filter either (it dies on the
-/// allocation), so this is succinctly's own wording.
+/// allocation), so this is succinctly's own wording, except for a length past the bound,
+/// which `succinctly jq` words as jq 1.8.2 does ([`array_too_large`]).
 ///
 /// Only the impossible and the absurd are refused: a length past
 /// [`MAX_PADDED_ARRAY_LEN`], or one that does not fit in memory. Every shorter
@@ -102672,16 +102789,17 @@ fn check_paddable_len(len: usize) -> Result<(), EvalError> {
 fn pad_with_nulls(
     arr: &mut crate::jq::ArrayVecMut<'_, OwnedValue>,
     index: usize,
+    yq_mode: bool,
 ) -> Result<(), EvalError> {
     // `index + 1` is only an overflow on a 32-bit target, where `usize::MAX`
     // is a reachable index; the refusal is the same either way.
     let len = index
         .checked_add(1)
-        .ok_or_else(|| cannot_grow_array(index as u64 + 1))?;
+        .ok_or_else(|| array_too_large(index as u64 + 1, yq_mode))?;
     // `try_reserve` alone does not stop `.[1e12] = 1`: the address space it
     // asks for is reservable on a 64-bit target, and `resize` then spends its
     // time (or the host's memory) writing 1e12 nulls (#5500).
-    check_paddable_len(len)?;
+    check_paddable_len(len, yq_mode)?;
     arr.try_reserve(len - arr.len())
         .map_err(|_| cannot_grow_array(len as u64))?;
     // #1670: already guarded -- `try_reserve` above already proved the
@@ -102717,7 +102835,7 @@ fn extend_array_with_nulls_for_delete(
     if target_len <= arr.len() {
         return Ok(());
     }
-    pad_with_nulls(arr, target_len - 1)
+    pad_with_nulls(arr, target_len - 1, true)
 }
 
 /// The text an integer path component names a mapping member by in yq mode (#2801): `path`
@@ -102827,7 +102945,7 @@ fn set_value_at_path_impl<S: EvalSemantics, const YQ_SETPATH: bool>(
             }
             let index = resolve_setpath_index(key, arr.len(), S::TAG == EvalTag::Yq)?;
             if index >= arr.len() {
-                pad_with_nulls(&mut arr.make_vec(), index)?;
+                pad_with_nulls(&mut arr.make_vec(), index, S::TAG == EvalTag::Yq)?;
             }
             let old = core::mem::replace(&mut arr[index], OwnedValue::Null);
             arr[index] = set_value_at_path_impl::<S, YQ_SETPATH>(old, rest, new_val)?;
@@ -103436,7 +103554,7 @@ fn delete_paths_under<S: EvalSemantics>(
                         arr[index] = delete_paths_sorted::<S>(old, paths, start)?;
                     }
                     DeleteIndexResolution::PositiveOutOfRange(index) if yq_mode => {
-                        pad_with_nulls(&mut arr.make_vec(), index)?;
+                        pad_with_nulls(&mut arr.make_vec(), index, true)?;
                         arr[index] = delete_paths_sorted::<S>(OwnedValue::Null, paths, start)?;
                     }
                     DeleteIndexResolution::PositiveOutOfRange(_) | DeleteIndexResolution::Skip => {}
@@ -103541,7 +103659,7 @@ fn yq_delete_index_sequence(
     let mut nodes: Vec<usize> = vec_with_capacity(steps.len());
     for &step in steps {
         if step >= 0 {
-            let index = usize::try_from(step).map_err(|_| cannot_grow_array(step as u64))?;
+            let index = usize::try_from(step).map_err(|_| array_too_large(step as u64, true))?;
             len = len.max(index.saturating_add(1));
             nodes.push(index);
         } else {
@@ -103552,7 +103670,7 @@ fn yq_delete_index_sequence(
         }
     }
     if len > arr.len() {
-        pad_with_nulls(arr, len - 1)?;
+        pad_with_nulls(arr, len - 1, true)?;
     }
     let mut keep = vec![true; len];
     let mut repeated = false;
@@ -105046,7 +105164,7 @@ fn delete_trie_array(
                             *target = delete_trie_apply(old, trie, child, yq_mode)?;
                         }
                         DeleteIndexResolution::PositiveOutOfRange(index) if yq_mode => {
-                            pad_with_nulls(&mut arr.make_vec(), index)?;
+                            pad_with_nulls(&mut arr.make_vec(), index, true)?;
                             let target = &mut arr[index];
                             let old = core::mem::replace(target, OwnedValue::Null);
                             *target = delete_trie_apply(old, trie, child, yq_mode)?;
@@ -107153,7 +107271,7 @@ fn delete_path_steps(
                         // one. Confirmed live (yq v4.53.3): `[1,2] |
                         // del(.[5].a)` is `[1,2,null,null,null,null]`.
                         DeleteIndexResolution::PositiveOutOfRange(index) if yq_mode => {
-                            pad_with_nulls(&mut arr.make_vec(), index)?;
+                            pad_with_nulls(&mut arr.make_vec(), index, true)?;
                             // The freshly padded slot is `null`; whatever
                             // `rest` does with it next (including `.[]`
                             // vivifying it to `[]`, #2323) is handled
@@ -107476,6 +107594,13 @@ fn delete_path_steps(
 
 // Phase 12: Additional builtins
 
+/// jq's `now` reading of a clock: `tv_sec + tv_usec / 1000000.0` from `gettimeofday`, so whole microseconds on every
+/// platform. `Duration::as_secs_f64` keeps the nanoseconds a Linux clock has, which jq never prints (#7484).
+#[cfg(feature = "std")]
+fn unix_seconds_in_microseconds(since_epoch: std::time::Duration) -> f64 {
+    since_epoch.as_secs() as f64 + f64::from(since_epoch.subsec_micros()) / 1_000_000.0
+}
+
 /// Builtin: now - current Unix timestamp
 ///
 /// yq's `now` is a `!!timestamp`: RFC 3339 text in the local zone, with no fraction (#5863).
@@ -107487,7 +107612,9 @@ fn builtin_now<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>() -> QueryResult<'
             Ok(duration) if S::TAG == EvalTag::Yq => QueryResult::Owned(OwnedValue::String(
                 super::yq_datetime::now(duration.as_nanos() as i128).into(),
             )),
-            Ok(duration) => QueryResult::Owned(OwnedValue::Float(duration.as_secs_f64())),
+            Ok(duration) => {
+                QueryResult::Owned(OwnedValue::Float(unix_seconds_in_microseconds(duration)))
+            }
             Err(_) => QueryResult::Error(EvalError::new("failed to get current time")),
         }
     }
@@ -109194,7 +109321,9 @@ fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
             // jq hands the libc a buffer of `strlen(fmt) + 100` bytes and fails when `strftime`
             // returns 0: an empty result, or one that does not fit with its terminator (#5754).
-            if result.is_empty() || result.len() >= fmt.len() + 100 {
+            // jq 1.8 no longer fails on an empty *format*, whose empty result is the answer
+            // (`(n == 0 && *fmt) || n > max_size`, jqlang/jq#3271, #7542): 1.7.1 raised there too.
+            if (result.is_empty() && !fmt.is_empty()) || result.len() >= fmt.len() + 100 {
                 return if optional {
                     QueryResult::None // patchcov: coverage tolerate-line reason="`optional` is never true through either caller of this function, same as the arms above (#3068); a trailing ? is caught by the enclosing try"
                 } else {
@@ -114583,8 +114712,25 @@ fn environment_object() -> OwnedValue {
 fn environment_object_in(snapshot: bool) -> OwnedValue {
     fn build() -> OwnedValue {
         let mut env_obj = FieldMap::new();
+        // jq splits every `environ` string at its first `=`; `std` skips a name that is empty and
+        // reads `=X=1` as `X`, so Unix reads the strings themselves (#7487). An entry with no `=`
+        // is no variable, as in jq.
+        #[cfg(unix)]
+        for entry in super::environ::entries() {
+            use std::os::unix::ffi::OsStrExt;
+            let Some(eq) = entry.iter().position(|&b| b == b'=') else {
+                continue;
+            };
+            env_obj.insert(
+                environment_text(std::ffi::OsStr::from_bytes(&entry[..eq])),
+                OwnedValue::String(
+                    environment_text(std::ffi::OsStr::from_bytes(&entry[eq + 1..])).into(),
+                ),
+            );
+        }
         // `vars_os`, not `vars`: `vars` panics on the first name or value that is not UTF-8
         // (#6564); jq substitutes it instead.
+        #[cfg(not(unix))]
         for (key, value) in std::env::vars_os() {
             env_obj.insert(
                 environment_text(&key),
@@ -114830,7 +114976,7 @@ fn builtin_trim<W: Clone + AsRef<[u64]>>(
             Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::new("trim requires string")),
+        _ => QueryResult::Error(EvalError::new("trim input must be a string")),
     }
 }
 
@@ -114846,7 +114992,7 @@ fn builtin_ltrim<W: Clone + AsRef<[u64]>>(
             Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::new("ltrim requires string")),
+        _ => QueryResult::Error(EvalError::new("trim input must be a string")),
     }
 }
 
@@ -114862,7 +115008,7 @@ fn builtin_rtrim<W: Clone + AsRef<[u64]>>(
             Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::new("rtrim requires string")),
+        _ => QueryResult::Error(EvalError::new("trim input must be a string")),
     }
 }
 
@@ -120682,6 +120828,111 @@ mod tests {
             unreachable!() // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this arm only fires if `state` stopped being an Object, which every write in the loop above preserves (#3138)"
         };
         assert_eq!(fields.len(), 65);
+    }
+
+    /// #7495: a whole float key (`1e4`, `$i * 1.0`, an element of `[range(1e4)]`) is the index
+    /// its integer spelling names, so a fold's array write by one is answered in place, as an
+    /// integer key's is. It used to decline, and the evaluator's route rebuilt the accumulator
+    /// every step: `reduce range(1e4) as $i ([]; .[$i] = 1)` went quadratic. The unchanged
+    /// sibling's text being the same allocation after every step is the in-place proof. A
+    /// fractional, non-finite or huge key, a float key on an object, and every float key in yq
+    /// mode still decline to the evaluator, whose rules and errors they need.
+    #[test]
+    fn owned_assign_step_takes_a_whole_float_index_in_place_7495() {
+        let literal = "x".repeat(100_000);
+        let text_ptr = |state: &OwnedValue| match state {
+            OwnedValue::Array(items) => match items.first() {
+                Some(OwnedValue::String(text)) => text.as_ptr(),
+                other => panic!("missing sibling: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- slot 0 holds the tracked string, which no write below touches (#7495)"
+            },
+            other => panic!("expected array: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- every write below keeps the state an array (#7495)"
+        };
+        for src in [
+            ".[$k] = $k",
+            ".[$k] |= 7",
+            ".[$k] += 1",
+            ".[$k] //= 1",
+            ".a[$k] = 1",
+            ".a[$k] += 1",
+        ] {
+            let wrap = src.starts_with(".a");
+            let start = OwnedValue::array_from(vec![OwnedValue::string(&literal)]);
+            let mut state = if wrap {
+                OwnedValue::object_from([("a".to_string(), start)])
+            } else {
+                start
+            };
+            let array = |state: &OwnedValue| -> OwnedValue {
+                match state {
+                    OwnedValue::Object(fields) => fields.get("a").cloned().unwrap(),
+                    other => other.clone(),
+                }
+            };
+            let before = text_ptr(&array(&state));
+            for i in 1..64 {
+                let key = if i % 2 == 0 {
+                    OwnedValue::Float(i as f64)
+                } else {
+                    OwnedValue::from_number_literal::<JqSemantics>(&alloc::format!("{i}.0"))
+                };
+                let expr = substitute_vars(&parse(src).unwrap(), [("k", &key)]);
+                state = match try_eval_owned_step::<JqSemantics>(&expr, state) {
+                    OwnedStep::Handled(Ok(next)) => next,
+                    _ => panic!("{src}: step {i} was not handled"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if a whole float key declined, which is the regression this test pins (#7495)"
+                };
+            }
+            let items = array(&state);
+            assert_eq!(text_ptr(&items), before, "{src}: the sibling was copied");
+            let OwnedValue::Array(items) = items else {
+                unreachable!() // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- every write above keeps the target an array (#7495)"
+            };
+            assert_eq!(items.len(), 64, "{src}");
+        }
+        // `-0.0` is index 0; `5.0` into a three-element array pads, which is the evaluator's.
+        let three = || OwnedValue::array_from(vec![OwnedValue::Int(1); 3]);
+        let step = |src: &str, key: OwnedValue, state: OwnedValue, yq: bool| {
+            let expr = substitute_vars(&parse(src).unwrap(), [("k", &key)]);
+            if yq {
+                try_eval_owned_step::<YqSemantics>(&expr, state)
+            } else {
+                try_eval_owned_step::<JqSemantics>(&expr, state)
+            }
+        };
+        let OwnedStep::Handled(Ok(zero)) =
+            step(".[$k] = 9", OwnedValue::Float(-0.0), three(), false)
+        else {
+            panic!("-0.0 is a whole key"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- fires only if -0.0 stopped naming index 0 (#7495)"
+        };
+        assert_eq!(
+            zero,
+            OwnedValue::array_from(vec![
+                OwnedValue::Int(9),
+                OwnedValue::Int(1),
+                OwnedValue::Int(1)
+            ])
+        );
+        let object = || OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
+        for (key, state, yq) in [
+            (OwnedValue::Float(1.5), three(), false),
+            (OwnedValue::Float(-1.7), three(), false),
+            (OwnedValue::Float(f64::NAN), three(), false),
+            (OwnedValue::Float(f64::INFINITY), three(), false),
+            (OwnedValue::Float(f64::NEG_INFINITY), three(), false),
+            (OwnedValue::Float(1e300), three(), false),
+            (OwnedValue::Float(9_007_199_254_740_994.0), three(), false),
+            (OwnedValue::Float(-1.0), three(), false),
+            (OwnedValue::Float(5.0), three(), false),
+            (OwnedValue::Float(0.0), object(), false),
+            (OwnedValue::Float(1.0), three(), true),
+        ] {
+            assert!(
+                matches!(
+                    step(".[$k] = 9", key.clone(), state, yq),
+                    OwnedStep::Declined(_)
+                ),
+                "{key:?} (yq: {yq}) must stay the evaluator's"
+            );
+        }
     }
 
     /// #3944: a right side built from the loop variable with a comparison, an
@@ -127254,9 +127505,6 @@ mod tests {
             // `fanout_arg`'s lazy sink, flushing a *buffered* first body
             // result when the next argument value arrives...
             (b"[\"\xff\xfe\", 2]", "nth((0, 1))"),
-            // ...and the same flush on the way out of an undecodable
-            // argument value of its own.
-            (BAD_ELEMENT, "first(nth((0, .[0])))"),
         ] {
             let index = JsonIndex::build(json_bytes);
             let cursor = index.root(json_bytes);
@@ -127271,6 +127519,29 @@ mod tests {
                 }
                 other => panic!("{filter}: expected a decode failure, got {other:?}"),
             }
+        }
+        // ...and the same flush on the way out of an undecodable argument value of its own. #7474
+        // parses `first(nth((0, .[0])))` as `first((0, .[0]) as $v | nth($v))`, which stops after
+        // the first value as jq does, so the flush is reached by a call built without that binding.
+        {
+            let index = JsonIndex::build(BAD_ELEMENT);
+            let expr = Expr::FirstExpr(Box::new(Expr::Builtin(Builtin::Nth(Box::new(
+                parse("0, .[0]").unwrap(),
+            )))));
+            match eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(BAD_ELEMENT)) {
+                QueryResult::Error(e) if e.is_decode_failure() => {}
+                other => panic!(
+                    "first(nth((0, .[0]))) unbound: expected a decode failure, got {other:?}"
+                ),
+            }
+            let parsed = parse("first(nth((0, .[0])))").unwrap();
+            assert!(
+                !matches!(
+                    eval_full::<Vec<u64>, JqSemantics>(&parsed, index.root(BAD_ELEMENT)),
+                    QueryResult::Error(_)
+                ),
+                "first(nth((0, .[0]))) reads only the first argument value"
+            );
         }
         // Positive control for `each_index_expr`'s borrowed-key arm: a
         // *decodable* document string used as the computed key still
@@ -138772,8 +139043,10 @@ mod tests {
     /// double-only model can't represent either way).
     #[test]
     fn test_1035_negative_float_literal_collapses_fidelity_like_jq() {
-        assert_eq!(outputs(b"null", "-1.500"), ["-1.5"]);
-        assert_eq!(outputs(b"null", "-1e2"), ["-100"]);
+        // #7453: jq 1.8 keeps a negated literal's spelling (jqlang/jq#3242);
+        // jq 1.7.1 printed `-1.5` and `-100`.
+        assert_eq!(outputs(b"null", "-1.500"), ["-1.500"]);
+        assert_eq!(outputs(b"null", "-1e2"), ["-1E+2"]);
         // A negative integer literal is unaffected -- still one token, no
         // spelling to lose.
         assert_eq!(outputs(b"null", "-123"), ["-123"]);
@@ -138786,9 +139059,11 @@ mod tests {
     /// fix's `Mul(-1, _)` rewrite printed plain `0` for all three of these.
     #[test]
     fn test_1035_negative_zero_literal_keeps_its_sign() {
-        assert_eq!(outputs(b"null", "-0.0"), ["-0"]);
-        assert_eq!(outputs(b"null", "-0e0"), ["-0"]);
-        assert_eq!(outputs(b"null", "[-0.0]"), ["[-0]"]);
+        // #7453: jq 1.8's `decNumberMinus` negates a zero literal to positive
+        // zero, spelling kept; jq 1.7.1 printed `-0` for all three.
+        assert_eq!(outputs(b"null", "-0.0"), ["0.0"]);
+        assert_eq!(outputs(b"null", "-0e0"), ["0"]);
+        assert_eq!(outputs(b"null", "[-0.0]"), ["[0.0]"]);
     }
 
     /// #1035: a number spelling jq's filter grammar accepts but RFC 8259
@@ -139056,15 +139331,15 @@ mod tests {
             assert_eq!(outputs(b"0", filter), ["0"], "{filter}");
         }
 
-        // A `-0` literal is negative even though `number_repr` reads it as
-        // `Int(0)`: `(-0) * -1` is `+0`, and `0 * -0` / `(-0) * 1` are `-0`.
-        // Without the sign check the `-0` rows regress `(-0) * -1`.
+        // A program's `-0` is the literal `0` in jq 1.8 (#7453), so these
+        // are products of a positive zero: jq 1.8.2's answers. The document
+        // `-0` rows below keep the sign check's coverage.
         for (filter, want) in [
-            ("(-0) * -1", "0"),
-            ("(-0) * 1", "-0"),
-            ("0 * (-0)", "-0"),
+            ("(-0) * -1", "-0"),
+            ("(-0) * 1", "0"),
+            ("0 * (-0)", "0"),
             ("(-0) * (-0)", "0"),
-            ("(-0) * 0", "-0"),
+            ("(-0) * 0", "0"),
         ] {
             assert_eq!(outputs(b"0", filter), [want], "{filter}");
         }
@@ -139090,30 +139365,34 @@ mod tests {
     /// to `intmax_t` there, so a `-0` operand never reaches its result
     /// (`(-0) % 5` is `0`). Rows captured live against jq 1.7.1.
     #[test]
+    ///
+    /// #7453: a program's `-0` is the literal `0` in jq 1.8 (`decNumberMinus`
+    /// of zero), so the rows with a program `-0` operand are jq 1.8.2's
+    /// answers; a document `-0` keeps its sign as before.
     fn test_arithmetic_negative_zero_operand_sign_3442() {
         for (filter, want) in [
             // `+`: negative only when both operands are.
-            ("(-0) + (-0)", "-0"),
-            ("(-0) + (-0.0)", "-0"),
-            ("(-0.0) + (-0)", "-0"),
+            ("(-0) + (-0)", "0"),
+            ("(-0) + (-0.0)", "0"),
+            ("(-0.0) + (-0)", "0"),
             ("(-0) + 0", "0"),
             ("0 + (-0)", "0"),
             // `-`: `-0 - 0` stays negative, `-0.0 - -0` cancels to positive.
-            ("(-0) - 0", "-0"),
-            ("(-0) - 0.0", "-0"),
+            ("(-0) - 0", "0"),
+            ("(-0) - 0.0", "0"),
             ("(-0.0) - (-0)", "0"),
             ("0 - (-0)", "0"),
             ("(-0) - (-0)", "0"),
             // `/`: the quotient's sign is the XOR of the operands'.
-            ("(-0) / 1", "-0"),
-            ("(-0) / 2", "-0"),
-            ("(-0) / -1", "0"),
-            ("(-0) / -5", "0"),
+            ("(-0) / 1", "0"),
+            ("(-0) / 2", "0"),
+            ("(-0) / -1", "-0"),
+            ("(-0) / -5", "-0"),
             ("0 / -1", "-0"),
             // Unary minus flips a `-0` literal back to `0`.
             ("-(-0)", "0"),
-            ("-(-0.0)", "0"),
-            ("-(0)", "-0"),
+            ("-(-0.0)", "0.0"),
+            ("-(0)", "0"),
             // `%` never sees the sign.
             ("(-0) % 5", "0"),
         ] {
@@ -139121,15 +139400,15 @@ mod tests {
         }
         // The same literal arriving as a document number.
         assert_eq!(outputs(b"-0", ". - 0"), ["-0"]);
-        assert_eq!(outputs(b"-0", ". + (-0)"), ["-0"]);
+        assert_eq!(outputs(b"-0", ". + (-0)"), ["0"]);
         assert_eq!(outputs(b"-0", ". + 0"), ["0"]);
         assert_eq!(outputs(b"-0", ". / 5"), ["-0"]);
         assert_eq!(outputs(b"-0", ". / -1"), ["0"]);
         assert_eq!(outputs(b"-0", "-."), ["0"]);
         // Spellings other than `-0`, and operands past 2^53 (which now go
         // through the float path instead of `jq_checked_int_arith`).
-        assert_eq!(outputs(b"null", "(-0e0) + (-0.0)"), ["-0"]);
-        assert_eq!(outputs(b"null", "(-0e0) - 0"), ["-0"]);
+        assert_eq!(outputs(b"null", "(-0e0) + (-0.0)"), ["0"]);
+        assert_eq!(outputs(b"null", "(-0e0) - 0"), ["0"]);
         assert_eq!(
             outputs(b"null", "(-0) + 9007199254740993"),
             ["9007199254740992"]
@@ -139147,13 +139426,10 @@ mod tests {
             ["869389897822472000"]
         );
         // Accumulator and assignment paths reach the same arithmetic.
-        assert_eq!(
-            outputs(b"null", "reduce range(2) as $x (-0; . - 0)"),
-            ["-0"]
-        );
+        assert_eq!(outputs(b"null", "reduce range(2) as $x (-0; . - 0)"), ["0"]);
         assert_eq!(outputs(b"null", "reduce range(2) as $x (-0; . + 0)"), ["0"]);
         assert_eq!(outputs(br#"{"a":-0}"#, ".a -= 0"), [r#"{"a":-0}"#]);
-        assert_eq!(outputs(br#"{"a":-0}"#, ".a += -0"), [r#"{"a":-0}"#]);
+        assert_eq!(outputs(br#"{"a":-0}"#, ".a += -0"), [r#"{"a":0}"#]);
         assert_eq!(outputs(br#"{"a":-0}"#, ".a /= 1"), [r#"{"a":-0}"#]);
         assert_eq!(outputs(br#"{"a":-0,"b":0}"#, ".a - .b"), ["-0"]);
         assert_eq!(outputs(br#"{"a":-0,"b":-0}"#, ".a + .b"), ["-0"]);
@@ -139170,6 +139446,20 @@ mod tests {
     /// YAML document number from the CLI).
     #[test]
     fn test_arithmetic_negative_zero_operand_yq_stays_zero_3442() {
+        // Parsed in yq mode, which keeps the literal `-0` (the jq parser
+        // folds it to `0`, #7453).
+        let outputs_yq = |json: &[u8], filter: &str| -> Vec<String> {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let expr =
+                crate::jq::parser::parse_with_mode(filter, crate::jq::parser::ParserMode::Yq)
+                    .unwrap();
+            eval_full::<Vec<u64>, YqSemantics>(&expr, cursor)
+                .collect_owned::<YqSemantics>()
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect()
+        };
         assert_eq!(outputs_yq(b"null", "(-0) - 0"), ["0"]);
         assert_eq!(outputs_yq(b"null", "(-0) + (-0)"), ["0"]);
         assert_eq!(outputs_yq(b"null", "(-0) * 1"), ["0"]);
@@ -140964,29 +141254,13 @@ mod tests {
     /// below for why that was reverted). Confirmed live against jq 1.7.1.
     #[test]
     fn test_unary_minus_zero_preserves_sign_1056() {
-        query!(br#"{"a":0.0}"#, "-.a",
-            QueryResult::Owned(OwnedValue::Float(f)) => {
-                assert_eq!(f, 0.0);
-                assert!(f.is_sign_negative());
-            }
-        );
-
+        // A computed zero negates to `-0`, as in real jq.
         query!(br"null", "-(1.0-1.0)",
             QueryResult::Owned(OwnedValue::Float(f)) => {
                 assert_eq!(f, 0.0);
                 assert!(f.is_sign_negative());
             }
         );
-
-        // Negating a positive-signed float zero still gives negative zero
-        // (not a no-op) -- same as real jq.
-        query!(br"null", "-(0.0)",
-            QueryResult::Owned(OwnedValue::Float(f)) => {
-                assert_eq!(f, 0.0);
-                assert!(f.is_sign_negative());
-            }
-        );
-
         // The all-integer case: -(1-1) promotes Int(0) to Float(-0.0).
         query!(br"null", "-(1-1)",
             QueryResult::Owned(OwnedValue::Float(f)) => {
@@ -140994,32 +141268,22 @@ mod tests {
                 assert!(f.is_sign_negative());
             }
         );
-
-        // Sanity: ordinary (non-zero) negation is unaffected.
-        query!(br#"{"a":5.5}"#, "-.a",
-            QueryResult::Owned(OwnedValue::Float(f)) => {
-                assert_eq!(f, -5.5);
-            }
-        );
-        query!(br#"{"a":5}"#, "-.a",
-            QueryResult::Owned(OwnedValue::Int(n)) => {
-                assert_eq!(n, -5);
-            }
-        );
-
+        // #7453: a literal operand (a document number, a program literal)
+        // stays a literal, as jq 1.8 negates it (jqlang/jq#3242), and a zero
+        // literal negates to positive zero (`decNumberMinus`). Every row is
+        // jq 1.8.2's answer.
+        for (input, filter, want) in [
+            (r#"{"a":0.0}"#, "-.a", "0.0"),
+            ("null", "-(0.0)", "0.0"),
+            (r#"{"a":5.5}"#, "-.a", "-5.5"),
+            (r#"{"a":5}"#, "-.a", "-5"),
+            ("null", "-(-9223372036854775808)", "9223372036854775808"),
+        ] {
+            assert_eq!(outputs(input.as_bytes(), filter), [want], "{filter}");
+        }
         // Sanity: a generator operand still fans out to one negated result
-        // per output (the dummy `left` in `ArithOp::Negate`'s rewrite must
-        // not collapse this to a single value).
+        // per output.
         assert_eq!(outputs(b"null", "-(1,2,3)"), ["-1", "-2", "-3"]);
-
-        // i64::MIN overflows i64 negation (matching arith_sub's own
-        // 0 - i64::MIN overflow handling): falls back to Float, same
-        // (including precision loss) as real jq's own uniform-double model.
-        query!(br"null", "-(-9223372036854775808)",
-            QueryResult::Owned(OwnedValue::Float(f)) => {
-                assert_eq!(f, 9223372036854775808.0);
-            }
-        );
     }
 
     /// #1056 review: the `Int(0) -> Float(-0.0)` promotion above is jq-mode
@@ -150727,13 +150991,15 @@ mod tests {
             ["1", "2", "3", "6", "6", "12"]
         );
 
-        // INIT-comma: same null-after-the-first-fork rule as `reduce` above
-        // (#3895): jq prints `1,3,6` then errors on the second fork's `.[]`.
+        // INIT-comma: unlike `reduce` above, every fork's `.[]` reads the real
+        // input (#7519): jq 1.8.2 prints `1,3,6,2,4,7`, where jq 1.7.1 printed
+        // `1,3,6` and then raised on the second fork's `.[]` against `null`
+        // (jqlang/jq#3266 fixed `foreach` only).
         let (values, error) = outputs_and_error(b"[1,2,3]", "foreach .[] as $x (0,1; .+$x)");
-        assert_eq!(values, ["1", "3", "6"]);
+        assert_eq!(values, ["1", "3", "6", "2", "4", "7"]);
         assert!(
-            error.is_some_and(|e| e.contains("Cannot iterate over null")),
-            "the second fork's `.[]` runs against null"
+            error.is_none(),
+            "every fork reads the real input: {error:?}"
         );
         assert_eq!(
             outputs(b"[1,2,3]", "foreach range(1;4) as $x (0,1; .+$x)"),
@@ -150742,14 +151008,16 @@ mod tests {
     }
 
     /// #2163, closed by #3895: the INIT-fork rule above isn't specific to a
-    /// `.[]`-iterating SOURCE — a later INIT fork's SOURCE runs against `null`
+    /// `.[]`-iterating SOURCE — a later `reduce` fork's SOURCE runs against `null`
     /// for *any* SOURCE that reads `.`, including a bare field access with no
     /// iteration at all, which answers `null` silently rather than raising.
-    /// Verified live against jq 1.7.1:
+    /// `foreach` reads the real input on every fork since #7519, as jq 1.8.2
+    /// does (pin moved from 1.7.1's `[1,null]`). Verified live against jq 1.8.2
+    /// (`reduce` answers the same in 1.7.1):
     ///
     /// ```console
     /// $ echo '{"a":1,"c":2}' | jq -c '[foreach (.a) as $k ((0,.c); $k)]'
-    /// [1,null]
+    /// [1,1]
     /// $ echo '{"a":1,"c":2}' | jq -c '[reduce (.a) as $k ((0,.c); $k)]'
     /// [1,null]
     /// ```
@@ -150757,7 +151025,7 @@ mod tests {
     fn test_foreach_reduce_init_fork_source_reads_null_after_first_fork_2163() {
         assert_eq!(
             outputs(br#"{"a":1,"c":2}"#, "[foreach (.a) as $k ((0,.c); $k)]"),
-            ["[1,null]"]
+            ["[1,1]"]
         );
         assert_eq!(
             outputs(br#"{"a":1,"c":2}"#, "[reduce (.a) as $k ((0,.c); $k)]"),
@@ -153375,7 +153643,7 @@ mod tests {
         // Non-string input errors.
         query!(b"1", "trim",
             QueryResult::Error(e) => {
-                assert_eq!(e.message, "trim requires string");
+                assert_eq!(e.message, "trim input must be a string");
             }
         );
     }
@@ -153399,7 +153667,7 @@ mod tests {
         // Non-string input errors.
         query!(b"1", "ltrim",
             QueryResult::Error(e) => {
-                assert_eq!(e.message, "ltrim requires string");
+                assert_eq!(e.message, "trim input must be a string");
             }
         );
     }
@@ -153423,7 +153691,7 @@ mod tests {
         // Non-string input errors.
         query!(b"1", "rtrim",
             QueryResult::Error(e) => {
-                assert_eq!(e.message, "rtrim requires string");
+                assert_eq!(e.message, "trim input must be a string");
             }
         );
     }
@@ -154208,13 +154476,16 @@ mod tests {
     #[test]
     fn test_pad_with_nulls_refuses_past_the_bound_without_allocating_5500() {
         let mut arr = crate::jq::ArrayVec::from(vec![OwnedValue::Null]);
-        let err = pad_with_nulls(&mut arr.make_vec(), MAX_PADDED_ARRAY_LEN).unwrap_err();
+        let err = pad_with_nulls(&mut arr.make_vec(), MAX_PADDED_ARRAY_LEN, true).unwrap_err();
         assert_eq!(
             err.to_string(),
             format!("Cannot grow array to {} elements", MAX_PADDED_ARRAY_LEN + 1)
         );
+        // jq mode (#7536): jq 1.8.2's sentence for the same refusal.
+        let err = pad_with_nulls(&mut arr.make_vec(), MAX_PADDED_ARRAY_LEN, false).unwrap_err();
+        assert_eq!(err.to_string(), "Array index too large");
         assert_eq!(arr.len(), 1);
-        assert!(pad_with_nulls(&mut arr.make_vec(), 4).is_ok());
+        assert!(pad_with_nulls(&mut arr.make_vec(), 4, false).is_ok());
         assert_eq!(arr.len(), 5);
     }
 
@@ -154224,9 +154495,11 @@ mod tests {
     fn test_paddable_len_bound_is_exact_5500() {
         assert_eq!(MAX_PADDED_ARRAY_LEN, 1 << 29);
         assert_eq!(MAX_PADDED_ARRAY_LEN - 1, i32::MAX as usize >> 2);
-        assert!(check_paddable_len(MAX_PADDED_ARRAY_LEN).is_ok());
-        assert!(check_paddable_len(MAX_PADDED_ARRAY_LEN + 1).is_err());
-        assert!(check_paddable_len(0).is_ok());
+        for yq_mode in [false, true] {
+            assert!(check_paddable_len(MAX_PADDED_ARRAY_LEN, yq_mode).is_ok());
+            assert!(check_paddable_len(MAX_PADDED_ARRAY_LEN + 1, yq_mode).is_err());
+            assert!(check_paddable_len(0, yq_mode).is_ok());
+        }
     }
 
     /// The padding length comes from the document, so an absurd index asks for
@@ -154234,12 +154507,11 @@ mod tests {
     /// answers that with a `capacity overflow` *panic*, which for a library
     /// means taking the embedder's process with it. It is a catchable error.
     ///
-    /// The message is matched by prefix because it names the requested length,
-    /// which differs by word size.
+    /// The message is jq 1.8.2's `Array index too large` (#7536).
     #[test]
     fn test_setpath_refuses_a_length_it_cannot_allocate() {
         let err = outcome(b"null", "setpath([1e30]; 9)").unwrap_err();
-        assert!(err.starts_with("Cannot grow array to"), "{err}");
+        assert_eq!(err, "Array index too large");
         // Lengths that do fit still pad, so jq's behaviour is untouched.
         assert_outcomes(&[(b"null", "setpath([3]; 9)", Ok("[null,null,null,9]"))]);
     }
@@ -165656,6 +165928,22 @@ mod tests {
 
     // Phase 12 tests: Additional builtins
 
+    /// #7484: a clock reading is cut to whole microseconds, as jq's `gettimeofday` one is, and the nanoseconds
+    /// (`as_secs_f64` kept them: 1795225997.4185658 against jq's 1795225997.418565) are dropped, not rounded.
+    #[cfg(feature = "std")]
+    #[test]
+    fn now_is_a_whole_number_of_microseconds_7484() {
+        use std::time::Duration;
+        let reading = Duration::new(1_795_225_997, 418_565_899);
+        assert_ne!(reading.as_secs_f64(), 1_795_225_997.418_565);
+        assert_eq!(unix_seconds_in_microseconds(reading), 1_795_225_997.418_565);
+        assert_eq!(
+            unix_seconds_in_microseconds(Duration::new(5, 999_999_999)),
+            5.999_999
+        );
+        assert_eq!(unix_seconds_in_microseconds(Duration::new(7, 0)), 7.0);
+    }
+
     #[test]
     fn test_now() {
         // now returns current Unix timestamp as a float (std), or a fixed
@@ -165684,15 +165972,20 @@ mod tests {
     /// being recomputed through `f64`.
     #[test]
     fn test_abs() {
-        query!(b"-5", "abs", QueryResult::Owned(OwnedValue::Int(5)) => {});
+        // #7453: `abs` is `-.` on a negative, and jq 1.8 negates a literal
+        // to a literal (jqlang/jq#3242).
+        query!(b"-5", "abs", QueryResult::Owned(OwnedValue::NumberLiteral(NumberRepr::Int(5), text)) => {
+            assert_eq!(text.as_ref(), "5");
+        });
         // Positive: passed through unchanged, keeping its literal wrapper
         // (as every non-negated number literal does in this codebase),
         // not collapsed to a bare `Int` the way the negated case is.
         query!(b"5", "abs", QueryResult::Owned(OwnedValue::NumberLiteral(NumberRepr::Int(5), text)) => {
             assert_eq!(text.as_ref(), "5");
         });
-        query!(b"-7.25", "abs", QueryResult::Owned(OwnedValue::Float(n)) => {
+        query!(b"-7.25", "abs", QueryResult::Owned(OwnedValue::NumberLiteral(NumberRepr::Float(n), text)) => {
             assert!((n - 7.25).abs() < f64::EPSILON);
+            assert_eq!(text.as_ref(), "7.25");
         });
         // A computed value pins the correct result end to end too, though
         // (confirmed live) it still reaches `builtin_abs` re-baked as a
@@ -166290,25 +166583,11 @@ mod tests {
 
     #[test]
     fn test_range_negative_zero_from_keeps_its_own_spelling_3103() {
-        // `-0` is the one integer spelling that diverges from its own
-        // canonical `i64` print -- confirmed live against `/usr/bin/jq`
-        // 1.7.1: `[range(-0;3)]` is `[-0,1,2]`, not `[0,1,2]`. `PartialEq`
-        // can't distinguish `NumberLiteral(Int(0), "-0")` from `Int(0)` (see
-        // `range_from_literal_override`'s own doc comment), so this checks
-        // the exact variant and its source text, not just `assert_eq!`.
-        query!(b"null", "[range(-0; 3)]",
-            QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert_eq!(arr.len(), 3);
-                match &arr[0] {
-                    OwnedValue::NumberLiteral(NumberRepr::Int(0), text) => {
-                        assert_eq!(text.as_ref(), "-0");
-                    }
-                    other => panic!("expected NumberLiteral(Int(0), \"-0\"), got {other:?}"),
-                }
-                assert_eq!(arr[1], OwnedValue::Int(1));
-                assert_eq!(arr[2], OwnedValue::Int(2));
-            }
-        );
+        // jq 1.7.1 printed `[range(-0;3)]` as `[-0,1,2]`; jq 1.8 negates the
+        // literal `0` to `0` (#7453), so the program's `-0` is a plain zero.
+        // A document `-0` still keeps its spelling as `range`'s first value.
+        assert_eq!(outputs(b"null", "[range(-0; 3)]"), ["[0,1,2]"]);
+        assert_eq!(outputs(b"-0", "[range(.; 3)]"), ["[-0,1,2]"]);
     }
 
     #[test]
@@ -167821,15 +168100,12 @@ mod tests {
                 assert_eq!(v.to_json(), r#"[{"start":1.5,"end":3.5}]"#);
             }
         );
-        // #1088's negation rule applies identically to a slice bound: the
-        // parser's own `-1 * <literal>` split destroys jq's literal
-        // spelling before the slice is ever built, so the bound becomes a
-        // computed double -- which happens to *render* bare when whole
-        // (jq's own convention for a computed value, not evidence the key
-        // was dropped; `-3.5:-1.5` below, non-whole, keeps its `.5`).
+        // #7453: jq 1.8 keeps a negated literal's spelling (jqlang/jq#3242),
+        // so a negative whole-valued bound keeps its `.0` like a positive
+        // one (jq 1.7.1 printed `-3` and `-1`).
         query!(br"[1,2,3,4,5]", r"path(.[-3.0:-1.0])",
             QueryResult::Owned(v) => {
-                assert_eq!(v.to_json(), r#"[{"start":-3,"end":-1}]"#);
+                assert_eq!(v.to_json(), r#"[{"start":-3.0,"end":-1.0}]"#);
             }
         );
         query!(br"[1,2,3,4,5]", r"path(.[-3.5:-1.5])",

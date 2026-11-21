@@ -64,7 +64,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use super::eval::pattern_alternatives_var_names;
-use super::parser::{join_expr_operands_mut, JOIN_IDX_VAR};
+use super::parser::{is_value_arg_var, join_expr_operands_mut, JOIN_IDX_VAR};
 use super::walk::{any_subexpr, builtin_kids, map_builtin_subexprs, BuiltinKids};
 use super::{Builtin, Expr, ObjectKey, Pattern, StringPart};
 
@@ -2559,6 +2559,9 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
             }
         }
 
+        // #7474: a builtin call whose arguments the parser bound first.
+        Expr::As { var, .. } if is_value_arg_var(var) => check_bound_value_args(expr, cx, reachable),
+
         // #2734: binds `var` in `body` only, not `expr` -- `.foo as $x | ...`
         // evaluates `.foo` before `$x` exists.
         Expr::As { expr, var, body } => {
@@ -3082,6 +3085,56 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
     }
 }
 
+/// [`check`] for `B(a; b)` that `parser::bind_value_args` parsed as `b as $v | a as $u | B($u;
+/// $v)` (#7474), checked as the call it was written as.
+///
+/// jq compiles the call as written, so its unresolved names are reported in the builtin's own
+/// operand order and compile units (`builtin_operands_are_inline`): checking the bindings instead
+/// reported `setpath(foo; bar)`'s `bar` before `foo`, and a bound flags argument, now part of the
+/// calling block, hid an error in `sub`'s replacement closure. Each bound source is swapped back
+/// into its slot, the builtin is checked, and the resolved operands are swapped back out. A swap
+/// moves the operand's `Expr` but none of the boxes inside it, so every `def` body keeps the
+/// address `reachable` names it by.
+fn check_bound_value_args(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
+    let mut sources: Vec<(String, &mut Expr)> = Vec::new();
+    let mut node: &mut Expr = expr;
+    let call = loop {
+        if !matches!(&*node, Expr::As { var, .. } if is_value_arg_var(var)) {
+            break node;
+        }
+        let Expr::As { expr, var, body } = node else {
+            unreachable!("matched just above");
+        };
+        sources.push((var.clone(), &mut **expr));
+        node = &mut **body;
+    };
+    let Expr::Builtin(builtin) = call else {
+        // Not a shape the parser builds; check it as the bindings it is.
+        for (_, source) in sources {
+            check(source, cx, reachable);
+        }
+        check(call, cx, reachable);
+        return;
+    };
+    // Which slot of the call each source was bound from, by position in `value_args_mut`.
+    let mut moved: Vec<(usize, usize)> = Vec::new();
+    for (at, slot) in builtin.value_args_mut().into_iter().enumerate() {
+        let Expr::Var(name) = &*slot else { continue };
+        if let Some(index) = sources.iter().position(|(var, _)| var == name) {
+            core::mem::swap(slot, &mut *sources[index].1);
+            moved.push((at, index));
+        }
+    }
+    check(call, cx, reachable);
+    let Expr::Builtin(builtin) = call else {
+        unreachable!("checking a builtin call leaves a builtin call");
+    };
+    let mut slots = builtin.value_args_mut();
+    for (at, index) in moved {
+        core::mem::swap(&mut *slots[at], &mut *sources[index].1);
+    }
+}
+
 /// Whether `builtin`'s operands are evaluated inline in the block that calls
 /// it, rather than being closures -- compile units of their own (#3391, see
 /// [`Blocks`]).
@@ -3254,6 +3307,41 @@ mod tests {
     fn resolve(filter: &str) -> Result<(), String> {
         let mut expr = parse(filter).expect("filter must parse");
         resolve_func_calls(&mut expr).map_err(|e| format!("{e}"))
+    }
+
+    /// #7474: a call the parser bound first is checked as written: `setpath(foo; bar)` is
+    /// parsed `bar as $a | foo as $b | setpath($b; $a)`, and jq 1.7.1 reports `foo` first
+    /// (its errors are checked in the builtin's own order), then the bound sources go back into
+    /// the bindings resolved. A binding of that name over anything but a call is checked as an
+    /// ordinary binding.
+    #[test]
+    fn a_bound_builtin_call_is_checked_as_written_7474() {
+        let mut expr = parse("setpath(foo; bar)").expect("filter must parse");
+        assert!(matches!(&expr, Expr::As { .. }), "{expr:?}");
+        let names: Vec<String> = resolve_all_jq(&mut expr)
+            .iter()
+            .map(|e| format!("{e:?}"))
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(
+            names[0].contains("foo") && names[1].contains("bar"),
+            "{names:?}"
+        );
+
+        // The sources go back into the bindings, and the call is left holding its variables.
+        let mut expr =
+            parse("def p: [\"a\"]; {} | setpath(p, p; 1, 2)").expect("filter must parse");
+        let before = expr.clone();
+        assert_eq!(resolve_all_jq(&mut expr), Vec::new());
+        assert_eq!(expr, before);
+
+        let mut odd = Expr::As {
+            expr: Box::new(parse("nosuch").expect("filter must parse")),
+            var: "%arg".to_string(),
+            body: Box::new(Expr::Identity),
+        };
+        let errors = resolve_all_jq(&mut odd);
+        assert_eq!(errors.len(), 1, "{errors:?}");
     }
 
     /// The compiled-in roster must match what `./scripts/sync-jq-builtin-names.sh`

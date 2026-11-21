@@ -5704,6 +5704,22 @@ impl<V: DocumentValue> LazySeq<V> {
         }
     }
 
+    /// Whether pushing a `map(h)` stage onto this chain would change what can be observed
+    /// (#7565): jq runs every stage on every element before the next stage starts, and the
+    /// chain runs them element by element, so the two orders differ only when `h` and a stage
+    /// already on the chain can each raise or have an effect, which
+    /// [`expr_is_inert`](super::eval::expr_is_inert) is the one test of. jq mode only:
+    /// `succinctly yq` keeps the chain as it was (yq's own evaluation order is #7405).
+    fn fusing_is_observable<S: EvalSemantics>(&self, h: &Expr) -> bool {
+        S::TAG == EvalTag::Jq
+            && !super::eval::expr_is_inert(h, false)
+            && self
+                .instructions
+                .iter()
+                .flat_map(|rc| rc.iter())
+                .any(|instr| !super::eval::expr_is_inert(&instr.f, false))
+    }
+
     /// Builder-style wrapper around [`Self::push_map_in_place`], for the
     /// fresh-construction call sites that chain straight off `LazySeq::new`.
     fn push_map(mut self, f: &Expr, tag: EvalTag) -> Self {
@@ -16134,6 +16150,22 @@ fn fold_lazy_seq_stage<S: EvalSemantics, V: DocumentValue>(
         // same-size replacement -- the hot path for a chained
         // `map(f) | map(g) | map(h)`, where this arm runs once per stage.
         Expr::Builtin(Builtin::Map(h)) => {
+            // #7565: jq's `map(f)` is `[.[] | f]`, so `map(f) | map(g)` runs `f` on every
+            // element before `g` sees the array. Fusing `h` onto the chain runs the stages
+            // element by element instead, which is unobservable only when `h` or every stage
+            // already on the chain is inert; otherwise `h`'s error, `debug` or `input` came
+            // before a later element's `f`. Such a chain is drained first (the cursors stay
+            // cursors, nothing is decoded) and `h` starts a new one over what it answered.
+            if seq.fusing_is_observable::<S>(h) {
+                return match seq.drain_atomic() {
+                    Ok(elems) => GenericResult::LazySeq(Box::new(
+                        LazySeq::from_mixed(elems).push_map(h, S::TAG),
+                    )),
+                    Err(Control::Error(e)) => GenericResult::Error(e),
+                    Err(Control::Break(label)) => GenericResult::Break(label),
+                    Err(Control::Halt(code)) => GenericResult::Halt(code),
+                };
+            }
             seq.push_map_in_place(h, S::TAG);
             GenericResult::LazySeq(seq)
         }
@@ -20313,10 +20345,12 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
 /// ([`embed_table`]). The entry makes the accumulator's first in-place write copy
 /// once, and a live table reshapes owned navigation, neither of which a fold that
 /// cannot certify a marker should pay -- hence the gate. Only the *first* output:
-/// jq 1.7.1 evaluates SOURCE against `null` on every later fork
+/// jq evaluates a `reduce`'s SOURCE against `null` on every later fork
 /// (`[reduce (.) as $x ((.,.); $x)]` is `[{"a":1},null]`), so a loop variable there is
 /// never the accumulator's own node, and an entry would answer a write through it
-/// that jq refuses.
+/// that jq refuses. A `foreach`'s later forks read the real input since #7519, and the
+/// writes through a loop variable that `tests/jq_cli/i7519.rs` pins on them answer as
+/// jq 1.8.2 does without an entry.
 fn drive_foreach_expr_generic<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     value: &V,
@@ -20364,7 +20398,8 @@ fn drive_foreach_expr_generic<S: EvalSemantics, V: DocumentValue>(
 
 /// A fold's SOURCE drive on the generic evaluator (#3895): the first INIT fork
 /// reads the fold's own input through [`drive_foreach_expr_generic`], every
-/// later one reads `null`, as jq 1.7.1 does. This route has no `null` of its
+/// later `reduce` fork reads `null`, as jq does (a `foreach` fork always reads
+/// the real input, #7519). This route has no `null` of its
 /// own value type to hand `eval_each_generic`, so a later fork runs the
 /// as-written source against an owned `null` instead
 /// ([`crate::jq::eval::drive_source_against_null`]).
@@ -34662,6 +34697,11 @@ fn path_context_is_navigational_at(expr: &Expr, unfolded: u8) -> bool {
                 && end.as_deref().map_or(true, path_context_component_walkable)
         }
         Expr::Builtin(Builtin::GetPath(path_expr)) => path_context_component_walkable(path_expr),
+        // #7474: a call whose generator argument the parser bound first walks as written
+        // (`getpath(G)`, `nth(G)`), so the walk keeps pulling `G` one path at a time (#2259).
+        bound @ Expr::As { var, .. } if crate::jq::parser::is_value_arg_var(var) => {
+            crate::jq::parser::unbound_value_args_call(bound).is_some_and(|call| nav(&call))
+        }
         // spine 2416 (walk residue): the transparent wrappers step their
         // body; what they evaluate besides it (`if`'s condition, `limit`'s
         // count, a `catch` handler, an `error` message) is evaluated at the
@@ -35170,6 +35210,12 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             Ok(())
         }
         Expr::Paren(inner) => path_context_step_generic::<S, V>(inner, pos, out),
+        // #7474: see `path_context_is_navigational_at`'s arm.
+        bound @ Expr::As { var, .. } if crate::jq::parser::is_value_arg_var(var) => {
+            let call = crate::jq::parser::unbound_value_args_call(bound)
+                .expect("path_context_is_navigational_at admitted only a bound call");
+            path_context_step_generic::<S, V>(&call, pos, out)
+        }
         Expr::Field(_) | Expr::Index { .. } | Expr::Iterate => {
             // `path_step_generic` is the same navigation `Builtin::Path`'s
             // cursor walk (#2058) uses, absent nodes included, so the two
@@ -49859,14 +49905,19 @@ mod tests {
             ("map(pow(2; .))", "map(pow(1 + 1; .))"),
             ("map(pow(.; .))", "map(pow(.; . + 0))"),
             ("map(atan2(.; 1))", "map(atan2(.; 1 + 0))"),
-            ("map(atan2(-0; .))", "map(atan2(0 * -1; .))"),
+            // A program's `-0` is the literal `0` in jq 1.8 (#7453).
+            ("map(atan2(-0; .))", "map(atan2(0 * 1; .))"),
             ("map(atan2(.; -1))", "map(atan2(.; 0 - 1))"),
             ("map(. + 0 | pow(.; 2))", "map(. + 0 | pow(.; 1 + 1))"),
         ] {
             assert_eq!(answers(fast), answers(evaluator), "{fast}");
         }
-        // A generator operand, a computed operand and a non-number keep the evaluator.
-        assert!(run("map([pow(.; (1, 2))] | .[0])").1 > 0);
+        // A computed operand and a non-number keep the evaluator. A generator operand is bound
+        // first since #7474 (`(1, 2) as $v | pow(.; $v)`), so each call is a variable operand.
+        assert_eq!(
+            run("map([pow(.; (1, 2))] | .[0])").0,
+            join(numbers.map(|n| math::pow(n, 1.0)).to_vec())
+        );
         assert!(run("map(pow(. + 1; 2))").1 > 0);
         assert!(run("map(tostring | try pow(.; 2) catch 0)").1 > 0);
     }
@@ -53248,6 +53299,35 @@ mod tests {
                 .into()
             )
         );
+    }
+
+    /// #7565: a `map(g)` joins the chain only when running the stages element by element
+    /// cannot be seen (`g`, or every stage already on it, is inert); otherwise the chain is
+    /// drained first and `g` is the one stage of a new one, as jq's `[.[] | f]` builds the array
+    /// before `map(g)` starts. yq mode keeps fusing (#7405).
+    #[test]
+    fn test_map_map_fuses_only_when_the_order_is_unobservable_7565() {
+        fn stages<S: EvalSemantics>(filter: &str) -> usize {
+            let json = br"[1,2,3]";
+            let index = JsonIndex::build(json);
+            let expr = crate::jq::parse(filter).unwrap();
+            match eval_with_cursor_using::<S, _>(&expr, index.root(json)) {
+                GenericResult::LazySeq(seq) => seq.instructions.as_deref().map_or(0, Vec::len),
+                other => panic!("{filter}: not a LazySeq: {other:?}"),
+            }
+        }
+        for (filter, jq) in [
+            ("map(. + 1) | map(. * 10)", 1),
+            ("map(. + 1) | map(.) | map(. * 10)", 1),
+            ("map(.) | map(. + 1)", 2),
+            ("map(. + 1) | map(tostring)", 2),
+            ("map(. + 1) | map(.)", 2),
+            ("map(.) | map(.) | map(. + 1)", 3),
+            ("map(. + 1) | map(. + 2) | map(.)", 2),
+        ] {
+            assert_eq!(stages::<JqSemantics>(filter), jq, "jq: {filter}");
+        }
+        assert_eq!(stages::<YqSemantics>("map(. + 1) | map(. * 10)"), 2);
     }
 
     #[test]
