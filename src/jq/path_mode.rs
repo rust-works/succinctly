@@ -1047,8 +1047,9 @@ pub struct Interp<'e> {
     prelude_env: Env<'e>,
     /// One `jv` per constant site, as `LOADK` hands out (keyed by the `Expr`'s
     /// address, which is stable: the interpreter never rewrites the program).
-    /// A substituted variable (`Expr::TrackedVar`) is one `jv` too, keyed by
-    /// its marker, and so is an object constructor's literal key, keyed by its
+    /// A path component's key (`Expr::Field`, `Expr::Index`) is one `jv` per
+    /// site too (#7465). A substituted variable (`Expr::TrackedVar`) is one
+    /// `jv` too, keyed by its marker, and so is an object constructor's literal key, keyed by its
     /// `ObjectKey`'s address (#7401), which holds no `Expr` inline and so is no
     /// `Expr`'s address.
     consts: RefCell<BTreeMap<usize, OwnedValue>>,
@@ -1540,9 +1541,12 @@ impl<'e> Interp<'e> {
                     .ok_or_else(|| unsupported("a location that is not a constant"))?;
                 sink(value, reg)
             }
-            Expr::Field(name) => self.index(input, reg, string(name), false, sink),
+            Expr::Field(name) => {
+                let key = self.site_key(expr, || string(name));
+                self.index(input, reg, key, false, sink)
+            }
             Expr::Index { idx, key } => {
-                let key = index_key(*idx, key.as_ref());
+                let key = self.site_key(expr, || index_key(*idx, key.as_ref()));
                 self.index(input, reg, key, false, sink)
             }
             Expr::Slice {
@@ -1844,6 +1848,22 @@ impl<'e> Interp<'e> {
         Some(value)
     }
 
+    /// The key a path component spells, the `"a"` of `.a` or the `0` of
+    /// `.[0]`: one `jv` per site, as jq's `gen_index(gen_noop(),
+    /// gen_const(k))` loads it with `LOADK` (#7465). So the key read at two
+    /// elements is identical (`[.[] | path(.a)[0]] | .[0] as $k | .[1] |
+    /// path($k)` is `[]`), and a step allocates no key. Kept with the
+    /// constants, by the component's address.
+    fn site_key(&self, site: &'e Expr, make: impl FnOnce() -> OwnedValue) -> OwnedValue {
+        let at = site as *const Expr as usize;
+        if let Some(value) = self.consts.borrow().get(&at) {
+            return value.clone();
+        }
+        let value = make();
+        self.consts.borrow_mut().insert(at, value.clone());
+        value
+    }
+
     /// `INDEX`/`INDEX_OPT` on `container` with `key`: `path_intact` first
     /// (a failure raises even under `INDEX_OPT`), then `jv_get`, then
     /// `path_append` with the key as given. 1.7.1 does not renormalize a
@@ -2029,9 +2049,12 @@ impl<'e> Interp<'e> {
         sink: &mut Sink<'_>,
     ) -> R {
         match inner {
-            Expr::Field(name) => self.index(input, reg, string(name), true, sink),
+            Expr::Field(name) => {
+                let key = self.site_key(inner, || string(name));
+                self.index(input, reg, key, true, sink)
+            }
             Expr::Index { idx, key } => {
-                let key = index_key(*idx, key.as_ref());
+                let key = self.site_key(inner, || index_key(*idx, key.as_ref()));
                 self.index(input, reg, key, true, sink)
             }
             Expr::Slice {
