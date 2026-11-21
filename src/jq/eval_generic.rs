@@ -8970,12 +8970,14 @@ fn push_generic_document_validation_error<C: DocumentCursor>(
 }
 
 /// The one rule every cursor-backed truthiness check in this file answers
-/// by: `is_falsy()`, negated. Pulled out so `//`/`and`/`or`/`not`
+/// by: [`DocumentCursor::truthiness`]. Pulled out so `//`/`and`/`or`/`not`
 /// structurally cannot drift on what "truthy" means — previously enforced
 /// only by [`push_generic_truthiness`] and [`retain_truthy_generic`]'s
-/// matching doc comments (#2665 item 3).
-fn cursor_is_truthy<C: DocumentCursor>(c: &C) -> bool {
-    !c.is_falsy()
+/// matching doc comments (#2665 item 3). `Err` for a token the index could
+/// not read (`tru`, `1.2.3`), which has no truthiness (#7449).
+#[inline]
+fn cursor_truthiness<C: DocumentCursor>(c: &C) -> Result<bool, EvalError> {
+    c.truthiness()
 }
 
 /// Append one truthiness bit per output of a `GenericResult` stream to
@@ -9011,8 +9013,9 @@ fn push_generic_truthiness<V: DocumentValue, S: EvalSemantics>(
             // about what a later `-e`/JSON-output convention would sanitize
             // it to -- `Preserve` keeps a malformed number truthy here the
             // same way it always has (see `StreamableValue::is_falsy`'s own
-            // doc comment for the convention this parameter selects).
-            out.push(cursor_is_truthy(&c));
+            // doc comment for the convention this parameter selects). A token
+            // the index could not read raises (#7449).
+            out.push(push_or_control!(cursor_truthiness(&c)));
         }
         GenericResult::Many(vs) => {
             for v in &vs {
@@ -9021,7 +9024,7 @@ fn push_generic_truthiness<V: DocumentValue, S: EvalSemantics>(
         }
         GenericResult::ManyCursor(cs) => {
             for c in &cs {
-                out.push(cursor_is_truthy(c));
+                out.push(push_or_control!(cursor_truthiness(c)));
             }
         }
         // A lazy keys array, materialized or not, sorted or not, is
@@ -9115,9 +9118,10 @@ fn owned_prefix_partial<V: DocumentValue, T>(
 /// Every arm answers truthiness by exactly the rule its
 /// `push_generic_truthiness` counterpart uses, so `//` and `and`/`or`/`not`
 /// cannot drift apart on what "truthy" means: `OneCursor`/`ManyCursor` share
-/// [`cursor_is_truthy`] and nothing else, validating nothing (#2692 -- see
+/// [`cursor_truthiness`] and nothing else, validating nothing (#2692 -- see
 /// that function's `OneCursor` arm for why reading truthiness decodes
-/// nothing and so raises nothing, and a malformed *number* stays truthy);
+/// nothing and so raises nothing, though a token the index could not read
+/// -- a malformed number or keyword -- raises, having no truthiness, #7449);
 /// `LazyKeys`/`LazyIndexRange` are array-shaped and therefore always truthy
 /// without materializing; `LazySeq` must still be pulled, because it runs
 /// arbitrary `map(f)` whose failure has to surface rather than be reported as
@@ -9144,13 +9148,11 @@ fn retain_truthy_generic<V: DocumentValue, S: EvalSemantics>(
             Ok(_) => GenericResult::None,
             Err(e) => GenericResult::Error(e),
         },
-        GenericResult::OneCursor(c) => {
-            if cursor_is_truthy(&c) {
-                GenericResult::OneCursor(c)
-            } else {
-                GenericResult::None
-            }
-        }
+        GenericResult::OneCursor(c) => match cursor_truthiness(&c) {
+            Ok(true) => GenericResult::OneCursor(c),
+            Ok(false) => GenericResult::None,
+            Err(e) => GenericResult::Error(e),
+        },
         GenericResult::Many(vs) => {
             let mut kept: Vec<V> = Vec::new();
             for v in vs {
@@ -9175,8 +9177,14 @@ fn retain_truthy_generic<V: DocumentValue, S: EvalSemantics>(
         GenericResult::ManyCursor(cs) => {
             let mut kept: Vec<V::Cursor> = Vec::new();
             for c in cs {
-                if cursor_is_truthy(&c) {
-                    kept.push(c);
+                match cursor_truthiness(&c) {
+                    Ok(true) => kept.push(c),
+                    Ok(false) => {}
+                    // #7449: a token the index could not read raises. The kept
+                    // prefix goes with it: the document is one jq rejects
+                    // before answering anything, and keeping it would hand
+                    // `owned_prefix_partial` a cursor never converted.
+                    Err(e) => return GenericResult::Error(e),
                 }
             }
             cursor_vec_to_generic_result(kept)
@@ -18521,7 +18529,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // `push_generic_truthiness` -- built for genuinely multi-output
         // streams -- via a `vec_with_capacity(1)`/push/index round-trip to
         // extract one guaranteed bit. Inlined directly here instead (#2665
-        // item 4): [`cursor_is_truthy`] for the cursor case is the exact
+        // item 4): [`cursor_truthiness`] for the cursor case is the exact
         // same rule that function's `OneCursor` arm uses, and the `None`
         // case is the exact same `to_owned`-then-`is_truthy` its `One` arm
         // uses, with the identical error surfaced the same way
@@ -18529,7 +18537,10 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // `GenericResult::Error` -- see `partial_generic` above).
         Expr::Not => {
             let truthy = match cursor {
-                Some(c) => cursor_is_truthy(&c),
+                Some(c) => match cursor_truthiness(&c) {
+                    Ok(truthy) => truthy,
+                    Err(e) => return GenericResult::Error(e),
+                },
                 // STYLE-0012: raises regardless of `optional`, and must --
                 // `not` has never consulted it. Two reasons, either
                 // sufficient. (1) `to_owned` raises only decode failures,
@@ -20507,11 +20518,22 @@ fn recurse_cond_keeps_cursor<S: EvalSemantics, V: DocumentValue>(
     }
     let mut keep = false;
     let mut verdicts = 0u32;
+    let mut unreadable: Option<EvalError> = None;
     let flow = eval_each_generic::<S, V>(cond, cursor.value(), false, Some(cursor), &mut |item| {
         verdicts += 1;
-        keep |= generic_item_is_truthy(&item);
+        match pushed_item_truthiness(&item) {
+            Ok(truthy) => keep |= truthy,
+            // #7449: a verdict on a token the index could not read raises.
+            Err(e) => {
+                unreadable = Some(e);
+                return Demand::Stop;
+            }
+        }
         Demand::Continue
     });
+    if let Some(e) = unreadable {
+        return Err(Control::Error(e));
+    }
     // The walk's bound rests on the admission rule: a second verdict would visit a child once per
     // truthy output where this visits it once.
     debug_assert!(
@@ -20601,7 +20623,9 @@ fn direct_cond_verdict_with<S: EvalSemantics, V: DocumentValue>(
         Expr::Paren(inner) => direct_cond_verdict_with::<S, V>(inner, cursor, owned),
         Expr::Literal(Literal::Bool(b)) => Some(*b),
         Expr::Literal(Literal::Null) => Some(false),
-        Expr::Identity => Some(cursor_is_truthy(cursor)),
+        // A token the index could not read has no verdict: the general route
+        // raises it (#7449).
+        Expr::Identity => cursor_truthiness(cursor).ok(),
         Expr::Pipe(stages) => match &stages[..] {
             [head, Expr::Not] => direct_cond_verdict_with::<S, V>(head, cursor, owned).map(|b| !b),
             _ => None, // patchcov: coverage tolerate-line reason="unreachable: direct_cond_verdict checks is_direct_grammar before this runs, and that grammar admits only the shapes the arms above answer (#4095)"
@@ -26694,14 +26718,16 @@ fn each_alternative_generic<S: EvalSemantics, V: DocumentValue>(
             // through `generic_item_to_result` would otherwise collapse to a
             // bare `OneCursor`, discarding it and forcing a second cursor
             // `.value()` resolve on every item this forwards. Truthiness only
-            // needs the cursor, so answer it directly via `cursor_is_truthy`
+            // needs the cursor, so answer it directly via `cursor_truthiness`
             // and keep the pair intact -- the same shared rule, not a second
             // inlined copy of it (#2665 item 3 follow-up: this site was the one
-            // cursor-backed truthiness check `cursor_is_truthy`'s doc comment
+            // cursor-backed truthiness check `cursor_truthiness`'s doc comment
             // claimed to cover but didn't actually reach).
             if let GenericItem::OneCursorValue(ref c, _) = item {
-                if !cursor_is_truthy(c) {
-                    return Demand::Continue;
+                match cursor_truthiness(c) {
+                    Ok(true) => {}
+                    Ok(false) => return Demand::Continue,
+                    Err(e) => return handle_flow(Flow::Escaped(Control::Error(e))),
                 }
                 forwarded += 1;
                 return handle_flow(push_one_generic(item, sink));
@@ -26744,18 +26770,27 @@ fn each_alternative_generic<S: EvalSemantics, V: DocumentValue>(
 /// `is_falsy`, a decoded or computed value by its truthiness, and the lazy shapes
 /// (`keys`, an index range, a built array) are always truthy -- a lazy array that fails to
 /// build raises where its consumer pulls it, not here.
+///
+/// The yq-only routes ask this one: yq mode reads JSON through its YAML parser, whose cursors
+/// always have a truthiness, so [`pushed_item_truthiness`]'s `Err` cannot reach them.
 fn generic_item_is_truthy<V: DocumentValue>(item: &GenericItem<V>) -> bool {
-    match item {
+    pushed_item_truthiness(item).unwrap_or(true)
+}
+
+/// [`generic_item_is_truthy`], with a cursor at a token the index could not read raising
+/// (#7449, [`cursor_truthiness`]).
+fn pushed_item_truthiness<V: DocumentValue>(item: &GenericItem<V>) -> Result<bool, EvalError> {
+    Ok(match item {
         // Falsy is `null` or `false`, which the value says without decoding a container (#2692's
         // rule for a cursor: reading truthiness decodes nothing).
         GenericItem::One(v) => !(v.is_null() || v.as_bool() == Some(false)), // patchcov: coverage tolerate-line reason="a document value pushed without a cursor: every left output the CLI's cursor route produces carries one, so only a caller driving this route without a cursor reaches this arm; it is the cursor arm below with the value's own null/false test (#2817)"
-        GenericItem::OneCursor(c) | GenericItem::OneCursorValue(c, _) => cursor_is_truthy(c),
+        GenericItem::OneCursor(c) | GenericItem::OneCursorValue(c, _) => cursor_truthiness(c)?,
         GenericItem::Owned(o) => o.is_truthy(),
         GenericItem::LazyKeys { .. }
         | GenericItem::LazyIndexRange(_)
         | GenericItem::LazySeq(_)
         | GenericItem::LazyObject(_) => true,
-    }
+    })
 }
 
 /// yq's `//` as a pushed stream over the cursor route
@@ -40830,8 +40865,12 @@ fn any_all_generic<S: EvalSemantics, V: DocumentValue>(
         while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
             // `Preserve`, the same convention `push_generic_truthiness`/
             // `retain_truthy_generic` read truthiness under, so `any`/`all`
-            // and `select`/`//`/`not` cannot drift on what truthy means.
-            let truthy = !elem_cursor.is_falsy();
+            // and `select`/`//`/`not` cannot drift on what truthy means
+            // (#7449: an element the index could not read raises).
+            let truthy = match cursor_truthiness(&elem_cursor) {
+                Ok(truthy) => truthy,
+                Err(e) => return GenericResult::Error(e),
+            };
             if truthy == target_truthy {
                 return answer(target_truthy);
             }
@@ -40845,7 +40884,10 @@ fn any_all_generic<S: EvalSemantics, V: DocumentValue>(
         match effective_value_cursors_checked(&fields, S::COLLAPSE_DUPLICATE_KEYS, false) {
             Ok(cursors) => {
                 for value_cursor in cursors {
-                    let truthy = !value_cursor.is_falsy();
+                    let truthy = match cursor_truthiness(&value_cursor) {
+                        Ok(truthy) => truthy,
+                        Err(e) => return GenericResult::Error(e),
+                    };
                     if truthy == target_truthy {
                         return answer(target_truthy);
                     }

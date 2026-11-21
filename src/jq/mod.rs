@@ -145,6 +145,7 @@ mod yq_datetime;
 mod yq_xml;
 
 pub use error::{BinOp, Control, ErrorKind, EvalError, EvalErrorPayload};
+pub(crate) use eval::json_truthiness;
 pub(crate) use eval::last_as_reduce;
 pub(crate) use eval::nonfinite_yaml_spelling;
 #[cfg(feature = "std")]

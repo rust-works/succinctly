@@ -5489,6 +5489,13 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
         matches!(self.value(), StandardJson::Null | StandardJson::Bool(false))
     }
 
+    /// [`is_falsy`](Self::is_falsy)'s one `value()`, with the token the index
+    /// could not read raising instead of reading as truthy (#7449).
+    #[inline]
+    fn truthiness(&self) -> Result<bool, EvalError> {
+        crate::jq::json_truthiness(&self.value())
+    }
+
     /// #1576: `JsonCursor` now implements both `stream_sequence_*` methods
     /// below (JSON only -- `stream_sequence_yaml` stays at the trait
     /// default; JSON->YAML sequence streaming is a separate, unimplemented
@@ -12386,6 +12393,35 @@ mod tests {
     /// #2288: well-formed objects (including a duplicate key, exercising
     /// the same winning-occurrence resolution as the tests above) are
     /// unaffected by the new delimiter and trailing-comma checks.
+    /// #7449: a cursor's truthiness is `is_falsy`'s answer negated for every
+    /// value the index reads, a container and a string with a bad escape
+    /// included, and a decode failure for a token it could not read.
+    #[test]
+    fn test_cursor_truthiness_raises_only_for_an_unreadable_token_7449() {
+        let json: &[u8] = br#"[null,false,true,0,"",[tru],{"a":nul},"\x",tru,nulll,x,1.2.3,-,1e]"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let mut child = root.first_child();
+        let mut verdicts = Vec::new();
+        while let Some(c) = child {
+            let verdict = c.truthiness();
+            if let Ok(truthy) = verdict {
+                assert_eq!(truthy, !c.is_falsy(), "{:?}", c.value());
+            }
+            verdicts.push(verdict.ok());
+            child = c.next_sibling();
+        }
+        let readable = [Some(false), Some(false), Some(true), Some(true), Some(true)];
+        let containers_and_strings = [Some(true), Some(true), Some(true)];
+        let unreadable = [None; 6];
+        let want: Vec<Option<bool>> = readable
+            .into_iter()
+            .chain(containers_and_strings)
+            .chain(unreadable)
+            .collect();
+        assert_eq!(verdicts, want);
+    }
+
     #[test]
     fn test_find_wellformed_unaffected_by_delimiter_check_2288() {
         for json in [

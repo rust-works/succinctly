@@ -3881,12 +3881,32 @@ pub(crate) fn bound_shape(type_name: &str) -> OwnedValue {
 /// test *every* output rather than just the first.
 ///
 /// A value the index could not read (`1.2.3`, #3222; `tru`, #3035) is
-/// truthy: truthiness decodes nothing (#2692), and the generic evaluator's
-/// `DocumentCursor::is_falsy` answers the same. This used to follow
+/// truthy here, as the generic evaluator's `DocumentCursor::is_falsy`
+/// answers. A filter that branches on a value asks [`json_truthiness`]
+/// instead, which raises for it (#7449); `retain_truthy`, the caller left,
+/// asks this one only once that has cleared every value. It used to follow
 /// `to_owned_lossy`'s `Error` -> `null` mapping and call it falsy, so
 /// `select(.)` dropped it here and kept it there.
 fn json_is_truthy<W>(value: &StandardJson<'_, W>) -> bool {
     !matches!(value, StandardJson::Null | StandardJson::Bool(false))
+}
+
+/// [`json_is_truthy`] for a filter that branches on the value (`not`, `if`,
+/// `and`, `or`, `select`, `//`, `any`, `all`): a token the index could not
+/// read (`tru`, `nulll`, `1.2.3`, #3035/#3222) raises the decode failure its
+/// `type` raises, where it used to read as truthy (#7449). `nul` is not
+/// `null`, so neither verdict would be jq's, which rejects the document.
+///
+/// Still decodes nothing (#2692): the value's kind is already in hand, a
+/// container is truthy whatever it holds, and a string whatever its escapes
+/// spell (#5308).
+#[inline]
+pub(crate) fn json_truthiness<W>(value: &StandardJson<'_, W>) -> Result<bool, EvalError> {
+    match value {
+        StandardJson::Null | StandardJson::Bool(false) => Ok(false),
+        StandardJson::Error(message) => Err(EvalError::decode_failure(*message)),
+        _ => Ok(true),
+    }
 }
 
 /// Check if an expression contains PathNoArg, Parent, or Key builtins that need path context.
@@ -7643,13 +7663,12 @@ fn result_to_owned_full<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// document-derived stream keeps the zero-copy path.
 fn retain_truthy<W: Clone + AsRef<[u64]>>(result: QueryResult<'_, W>) -> QueryResult<'_, W> {
     match result.materialize_cursor() {
-        QueryResult::One(v) => {
-            if json_is_truthy(&v) {
-                QueryResult::One(v)
-            } else {
-                QueryResult::None
-            }
-        }
+        QueryResult::One(v) => match json_truthiness(&v) {
+            Ok(true) => QueryResult::One(v),
+            Ok(false) => QueryResult::None,
+            // #7449: a token the index could not read has no truthiness.
+            Err(e) => QueryResult::Error(e),
+        },
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
         QueryResult::Owned(v) => {
             if v.is_truthy() {
@@ -7659,6 +7678,9 @@ fn retain_truthy<W: Clone + AsRef<[u64]>>(result: QueryResult<'_, W>) -> QueryRe
             }
         }
         QueryResult::Many(mut vs) => {
+            if let Some(e) = vs.iter().find_map(|v| json_truthiness(v).err()) {
+                return QueryResult::Error(e);
+            }
             vs.retain(json_is_truthy);
             borrowed_vec_to_result(vs)
         }
@@ -7699,10 +7721,21 @@ fn push_truthiness<W: Clone + AsRef<[u64]>>(
     out: &mut Vec<bool>,
 ) -> Option<Control> {
     match result.materialize_cursor() {
-        QueryResult::One(v) => out.push(json_is_truthy(&v)),
+        QueryResult::One(v) => match json_truthiness(&v) {
+            Ok(truthy) => out.push(truthy),
+            // #7449: a token the index could not read has no truthiness.
+            Err(e) => return Some(Control::Error(e)),
+        },
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
         QueryResult::Owned(v) => out.push(v.is_truthy()),
-        QueryResult::Many(vs) => out.extend(vs.iter().map(json_is_truthy)),
+        QueryResult::Many(vs) => {
+            for v in &vs {
+                match json_truthiness(v) {
+                    Ok(truthy) => out.push(truthy),
+                    Err(e) => return Some(Control::Error(e)),
+                }
+            }
+        }
         QueryResult::ManyOwned(vs) => out.extend(vs.iter().map(OwnedValue::is_truthy)),
         QueryResult::None => {}
         QueryResult::Error(e) => return Some(Control::Error(e)),
@@ -7903,10 +7936,13 @@ impl<W: Clone + AsRef<[u64]>> Item<'_, W> {
     /// string's *content* never changes the verdict and an undecodable one
     /// must not raise here (#1820). [`each_alternative`] and
     /// [`each_boolean`] are the callers.
-    fn is_truthy(&self) -> bool {
+    ///
+    /// `Err` for a borrowed token the index could not read (`tru`, `1.2.3`),
+    /// which has no truthiness (#7449, [`json_truthiness`]).
+    fn truthiness(&self) -> Result<bool, EvalError> {
         match self {
-            Item::Borrowed(v) => json_is_truthy(v),
-            Item::Owned(v) => v.is_truthy(),
+            Item::Borrowed(v) => json_truthiness(v),
+            Item::Owned(v) => Ok(v.is_truthy()),
         }
     }
 
@@ -8742,10 +8778,10 @@ fn each_if<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #3293: a re-invocation after a stop is a `?//` retry inside the
         // driven operand; it supersedes whatever the retried-past call decided.
         escape.begin();
-        let branch = if item.is_truthy() {
-            then_branch
-        } else {
-            else_branch
+        let branch = match item.truthiness() {
+            Ok(true) => then_branch,
+            Ok(false) => else_branch,
+            Err(e) => return escape.stop(Control::Error(e)),
         };
         match eval_each::<W, S>(branch, value.clone(), optional, sink) {
             Flow::Exhausted => Demand::Continue,
@@ -10274,12 +10310,16 @@ fn each_alternative<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
     let mut forwarded = 0usize;
     let mut outer_stopped = false;
+    let escape = StashedEscape::new();
     let left_flow = eval_each::<W, S>(left, value.clone(), optional, &mut |item| {
+        escape.begin();
         // `retain_truthy`, one output at a time -- a falsy output is dropped
         // and the left operand keeps producing, exactly as the filtered
-        // `Vec` did.
-        if !item.is_truthy() {
-            return Demand::Continue;
+        // `Vec` did. A token the index could not read raises (#7449).
+        match item.truthiness() {
+            Ok(true) => {}
+            Ok(false) => return Demand::Continue,
+            Err(e) => return escape.stop(Control::Error(e)),
         }
         forwarded += 1;
         if sink(item) == Demand::Stop {
@@ -10289,6 +10329,7 @@ fn each_alternative<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Demand::Continue
         }
     });
+    let left_flow = escape.resume(left_flow, direct_pattern_retry(left));
 
     if outer_stopped {
         return left_flow;
@@ -10335,7 +10376,8 @@ fn each_alternative_per_left_output<'a, W: Clone + AsRef<[u64]>, S: EvalSemantic
     let mut escape: Option<Control> = None;
     let left_flow = eval_each::<W, S>(left, value.clone(), optional, &mut |item| {
         produced = true;
-        if item.is_truthy() {
+        // yq mode: a YAML cursor never presents an unreadable token (#7449).
+        if item.truthiness().unwrap_or(true) {
             let demand = sink(item);
             outer_stopped |= demand == Demand::Stop;
             return demand;
@@ -10385,9 +10427,16 @@ fn boolean_operand_bits<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     bit_sink: &mut dyn FnMut(bool) -> Demand,
 ) -> Flow {
-    eval_each::<W, S>(operand, value, optional, &mut |item| {
-        bit_sink(item.is_truthy())
-    })
+    let escape = StashedEscape::new();
+    let flow = eval_each::<W, S>(operand, value, optional, &mut |item| {
+        escape.begin();
+        match item.truthiness() {
+            Ok(truthy) => bit_sink(truthy),
+            // #7449: a token the index could not read has no truthiness.
+            Err(e) => escape.stop(Control::Error(e)),
+        }
+    });
+    escape.resume(flow, direct_pattern_retry(operand))
 }
 
 /// Demand-forwarding twin of [`eval_boolean`] (#2180 WP2a) -- `and`/`or`
@@ -10451,15 +10500,23 @@ fn each_select<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // #6130: the condition reads read-only, the sink does not (it runs inside the condition's own).
     let previous = yq_read_only_context::active();
     let _scope = yq_as_source_scope::<S>();
-    eval_each::<W, S>(cond, value.clone(), optional, &mut |item| {
+    let escape = StashedEscape::new();
+    let flow = eval_each::<W, S>(cond, value.clone(), optional, &mut |item| {
         let _sink_scope =
             S::READ_ONLY_ABSENT_KEY_IS_EMPTY.then(|| yq_read_only_context::restore(previous));
-        if select_emits::<S>(item.is_truthy(), &mut already_emitted) {
+        escape.begin();
+        let truthy = match item.truthiness() {
+            Ok(truthy) => truthy,
+            // #7449: a token the index could not read has no truthiness.
+            Err(e) => return escape.stop(Control::Error(e)),
+        };
+        if select_emits::<S>(truthy, &mut already_emitted) {
             sink(Item::Borrowed(value.clone()))
         } else {
             Demand::Continue
         }
-    })
+    });
+    escape.resume(flow, direct_pattern_retry(cond))
 }
 
 /// Demand-forwarding twin of [`eval_negate`]/[`negate_fanout_core`] (#2180
@@ -20138,7 +20195,11 @@ fn eval_not<W: Clone + AsRef<[u64]>>(value: StandardJson<'_, W>) -> QueryResult<
     // merely *contains* an undecodable string (always truthy, regardless
     // of what's inside), it wrongly raises where jq would just answer
     // `false`. Use the O(1), non-recursive check instead.
-    QueryResult::Owned(OwnedValue::Bool(!json_is_truthy(&value)))
+    // #7449: but a token the index could not read (`tru`) has no truthiness.
+    match json_truthiness(&value) {
+        Ok(truthy) => QueryResult::Owned(OwnedValue::Bool(!truthy)),
+        Err(e) => QueryResult::Error(e),
+    }
 }
 
 /// Evaluate alternative operator (`//`).
@@ -118668,7 +118729,10 @@ fn tail_step<'e, 'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     Some(Ok(truthy)) => truthy,
                     Some(Err(error)) => return Tail::Done(Flow::Escaped(Control::Error(error))),
                     None => match tail_one::<W, S>(cond, cur, optional) {
-                        Ok(Some(TailValue::Borrowed(v))) => json_is_truthy(&v),
+                        Ok(Some(TailValue::Borrowed(v))) => match json_truthiness(&v) {
+                            Ok(truthy) => truthy,
+                            Err(error) => return Tail::Done(Flow::Escaped(Control::Error(error))),
+                        },
                         Ok(Some(TailValue::Owned(v))) => v.is_truthy(),
                         Ok(None) => return Tail::Done(Flow::Exhausted),
                         Err(flow) => return Tail::Done(flow),
@@ -181470,6 +181534,13 @@ mod tests {
             "try .x catch 1",
             "try length catch 1",
             "try type catch 1",
+            // #7449: a filter that branches on the value reads it -- `nul` is
+            // not `null`, so it has no truthiness to branch on.
+            "not",
+            "if . then 1 else 2 end",
+            ". and true",
+            "(. // 1) | 2",
+            "select(.) | 1",
         ];
         let mut escaped = Vec::new();
         for json in ["[1.2.3]", "[tru]", "[1ee5]"] {
@@ -181507,16 +181578,11 @@ mod tests {
         );
 
         // And a filter that never reads the value answers in both
-        // evaluators, exactly as it does for a real number (#2692: truthiness
-        // decodes nothing; #2168: navigation validates only what it
-        // navigates). `.` and `values` pass the value on to whatever reads it
-        // next, the printer included, so they are pinned by the CLI sweep.
+        // evaluators, exactly as it does for a real number (#2168: navigation
+        // validates only what it navigates). `.` and `values` pass the value
+        // on to whatever reads it next, the printer included, so they are
+        // pinned by the CLI sweep. Branching on it reads it (#7449, above).
         const NON_READERS: &[&str] = &[
-            "not",
-            "if . then 1 else 2 end",
-            ". and true",
-            "(. // 1) | 2",
-            "select(.) | 1",
             "first(.) | 1",
             "isvalid(.)",
             "empty",
@@ -181597,7 +181663,8 @@ mod tests {
         //  `eval_using`, `eval_with_cursor_using` and therefore `eval`)
         const ROWS: &[(&str, &str, Outcome, Outcome)] = &[
             ("[1.2.3]", "1", Some("1"), Some("1")),
-            ("[1.2.3]", "not", None, Some("false")),
+            // #7449: branching on the value reads it.
+            ("[1.2.3]", "not", None, None),
             ("[1.2.3]", "[.] | length", None, Some("1")),
             ("[tru]", "[.] | length", None, Some("1")),
             ("[1.2.3]", "[limit(1; .)] | length", None, Some("1")),
@@ -181606,7 +181673,7 @@ mod tests {
             ("[tru]", "path(.)", None, Some("[]")),
             ("[1.2.3]", "[paths]", Some("[]"), Some("[]")),
             ("[tru]", "[paths]", Some("[]"), Some("[]")),
-            ("[1.2.3]", "getpath([]) | not", None, Some("false")),
+            ("[1.2.3]", "getpath([]) | not", None, None),
             (OBJ, "path(.a)", None, Some(r#"["a"]"#)),
             (OBJ, "[paths] | length", Some("2"), Some("2")),
             (
@@ -181680,7 +181747,8 @@ mod tests {
                 Some("1"),
                 Some("1"),
             ),
-            (OBJ, "[.b // 1] | length", Some("1"), Some("1")),
+            // #7449: `//` branches on `.b`, so it reads it.
+            (OBJ, "[.b // 1] | length", None, None),
             (OBJ, "[try .b] | length", Some("1"), Some("1")),
         ];
         fn generic<V: crate::jq::document::DocumentValue>(r: GenericResult<V>) -> Outcome {
