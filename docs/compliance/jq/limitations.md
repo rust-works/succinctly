@@ -363,6 +363,16 @@ The refusal comes before the input files are opened, as in 1.8.2, and covers a N
 `succinctly yq` is not changed.
 Pinned by `tests/jq_cli/i7434.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
 
+## A `-f` program file that opens with the shell/jq polyglot: jq 1.7.1's `skip_shebang`, not jq 1.8.2's comment continuation (#7481)
+
+A `-f` file that starts `#!/bin/sh`, then `# \`, then `exec jq -n -f "$0" "$@"` runs as a jq program in both jq versions, so the same file works as a shell script and as a jq script.
+jq 1.7.1 does it in `src/main.c`: `skip_shebang` drops the first three lines of a `-f` file when line 1 starts with `#!`, line 2 starts with `#` and ends in exactly one backslash (two backslashes, or a CR before the newline, are no match), line 2 is followed by a line that does not start with `#` and is not the end of the text, and that line ends in a newline.
+Its lexer still ends every comment at the newline, so a comment ending in a backslash anywhere else does not continue.
+`succinctly jq` implements that rule for `-f` and `--from-file` files only; a program given as an argument is parsed whole.
+jq 1.8.2 gets the polyglot to run through a deliberate language change instead (Tcl-style multiline comments, jqlang/jq#2989, listed under the language changes of its NEWS.md): any comment ending in an odd number of backslashes continues on the next line, in every program.
+That is a feature and not a bug fix, so jq 1.7.1 stays the reference: `1`, then `# \`, then `+2` on its own lines is `3` in jq 1.7.1 and `succinctly jq`, and `1` in jq 1.8.2, whose comment swallows the `+2`.
+Pinned over a matrix of 156 files captured from jq 1.7.1 by `tests/jq_cli/i7481.rs`.
+
 ## A standard input that cannot be read: matched, with these differences (#7126)
 
 A standard input that cannot be read is an empty one in jq 1.7.1, which counts the failed read and exits 2 once the run is over, whatever the program left (`-e`'s 4, `input`'s 5), and for a plain read without a word on stderr.
