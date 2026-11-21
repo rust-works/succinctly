@@ -2770,17 +2770,6 @@ fn parse_json_values(
     bytes: &[u8],
     parse_value: impl Fn(&[u8]) -> Result<Vec<OwnedValue>>,
 ) -> Result<Vec<OwnedValue>> {
-    // #7425: a JSON document no index can hold is refused as `YamlIndex` refuses a YAML input that
-    // long (`InputTooLarge`), where building the index would panic.
-    let parse_value = |value: &[u8]| {
-        if !JsonIndex::can_index(value.len()) {
-            anyhow::bail!(
-                "{}",
-                succinctly::yaml::YamlError::InputTooLarge { len: value.len() }
-            );
-        }
-        parse_value(value)
-    };
     let split = split_json_values(bytes);
     if let (Some(at), false) = (split.stopped_at, split.pieces.is_empty()) {
         anyhow::bail!("YAML parse error: unexpected content at byte offset {at}");
@@ -5846,8 +5835,8 @@ fn scan_anchor_soundness<'v, 'c>(
         // No such declaration yet (missing entirely, or emitted later than
         // this alias), or one whose value has since diverged from this one.
         // Spelled as a negated `matches!` rather than clippy's suggested
-        // `is_none_or`, which is stable only since 1.82 and this crate's
-        // MSRV is 1.73.
+        // `is_none_or`, which is stable only since 1.82 and clippy's
+        // `msrv` (clippy.toml) is 1.73.
         // `identical`, not `==` (#1360): jq value equality says `NaN` differs
         // from itself, so an anchored `.nan` reported a divergence that never
         // happened and lost its alias mark. It is also too loose in the other
