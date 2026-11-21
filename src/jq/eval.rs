@@ -33843,7 +33843,7 @@ fn look_behind_alternatives_differ(pattern: &str) -> bool {
 /// `sized`: [`super::onig_look_behind`] has sized those (#6519) and its verdict is the one that counts.
 #[cfg(feature = "regex")]
 fn look_behind_alternatives_differ_but(pattern: &str, sized: &[usize]) -> bool {
-    use regex_syntax::ast::{self, Ast, RepetitionKind, RepetitionRange};
+    use regex_syntax::ast::{Ast, RepetitionKind, RepetitionRange};
 
     /// The one width `ast` can match, if it has one and this can tell.
     fn fixed(ast: &Ast, opaque: &[usize], behind: &[usize]) -> Option<usize> {
@@ -34036,7 +34036,7 @@ fn look_behind_alternatives_differ_but(pattern: &str, sized: &[usize]) -> bool {
     let Some(shadow) = oniguruma_shadow(pattern) else {
         return false;
     };
-    let Ok(ast) = ast::parse::Parser::new().parse(&shadow.text) else {
+    let Ok(ast) = crate::jq::onig_ast_parser().parse(&shadow.text) else {
         return false;
     };
     // The look-behind groups are among the opaque offsets; their bodies are read.
@@ -37316,6 +37316,12 @@ fn build_regex_uncached<S: EvalSemantics>(
                 _ => EvalError::new("Regex failure: too big number for repeat range"),
             });
         }
+        // #7528: jq 1.8.2 refuses a pattern that nests groups more than 511 deep; the engines'
+        // own limit is higher (and counts other nodes), so it is checked here. As the count past
+        // an interval, it waits for the flags to be read.
+        if deferred_refusal.is_none() && exceeds_onig_parse_depth(pattern, extended) {
+            deferred_refusal = Some(EvalError::new("Regex failure: parse depth limit over"));
+        }
         // #6252: the absence operator is written as the loop it is.
         let absence = rewrite_absence_operator(pattern, extended);
         let pattern = absence.as_deref().unwrap_or(pattern);
@@ -37841,7 +37847,7 @@ fn oniguruma_refusal(pattern: &str) -> Option<String> {
 /// reads and looking again, up to `retries` times, for an error Oniguruma would meet later.
 #[cfg(feature = "regex")]
 fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
-    use regex_syntax::ast::{self, ErrorKind};
+    use regex_syntax::ast::ErrorKind;
     let retry = |rewritten: String| {
         retries
             .checked_sub(1)
@@ -37857,7 +37863,7 @@ fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
     };
     const UNMATCHED_OPEN: &str = "end pattern with unmatched parenthesis";
     let at = |offset: usize| pattern.get(offset..).unwrap_or_default();
-    match ast::parse::Parser::new().parse(pattern) {
+    match crate::jq::onig_ast_parser().parse(pattern) {
         Err(error) => {
             let start = error.span().start.offset;
             match error.kind() {
@@ -37868,6 +37874,8 @@ fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
                 }
                 ErrorKind::GroupUnclosed => Some(UNMATCHED_OPEN.into()),
                 ErrorKind::GroupUnopened => Some("unmatched close parenthesis".into()),
+                // jq 1.8.2's parse depth limit, which `ONIG_NEST_LIMIT` is the crate's name for (#7528).
+                ErrorKind::NestLimitExceeded(_) => Some("parse depth limit over".into()),
                 ErrorKind::RepetitionCountInvalid => {
                     Some("upper is smaller than lower in repeat range".into())
                 }
@@ -38010,7 +38018,7 @@ fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
                 _ => None,
             }
         }
-        Ok(_) => match regex_syntax::Parser::new().parse(pattern) {
+        Ok(_) => match crate::jq::onig_hir_parser().parse(pattern) {
             Err(regex_syntax::Error::Translate(error))
                 if matches!(
                     error.kind(),
@@ -38035,7 +38043,7 @@ fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
 /// (look-around, a back-reference, `\K`) is not one.
 #[cfg(feature = "regex")]
 fn empty_match_is_position_free(pattern: &str) -> bool {
-    use regex_syntax::ast::{self, Ast};
+    use regex_syntax::ast::Ast;
     fn assertion_free(ast: &Ast) -> bool {
         match ast {
             Ast::Assertion(_) => false,
@@ -38046,7 +38054,7 @@ fn empty_match_is_position_free(pattern: &str) -> bool {
             _ => true,
         }
     }
-    ast::parse::Parser::new()
+    crate::jq::onig_ast_parser()
         .parse(pattern)
         .is_ok_and(|ast| assertion_free(&ast))
 }
@@ -38225,10 +38233,71 @@ fn compose_group_copies(
     })
 }
 
+/// Whether `pattern` nests groups deeper than jq 1.8.2 reads ([`ONIG_PARSE_DEPTH_LIMIT`], #7528): at
+/// most that many groups open at once. `(?i)` and the like are flags, not groups; `(?i:` and `(?:`
+/// are groups. A pattern the crate's parser cannot read (a look-around, an atomic group) is not
+/// counted: it goes to `fancy-regex`, whose own limit is much lower (`limitations.md`).
+///
+/// Reads the pattern's AST with a visitor that keeps its own stack, so a deep pattern costs no
+/// native stack here, and returns before parsing for one too short to hold that many groups.
+#[cfg(feature = "regex")]
+fn exceeds_onig_parse_depth(pattern: &str, extended: bool) -> bool {
+    use super::ONIG_PARSE_DEPTH_LIMIT;
+    use regex_syntax::ast::{self, Ast};
+    // Each group is at least a `(` and a `)`.
+    if pattern.len() <= 2 * ONIG_PARSE_DEPTH_LIMIT {
+        return false;
+    }
+    struct GroupDepth {
+        open: usize,
+        deepest: usize,
+    }
+    impl ast::Visitor for GroupDepth {
+        type Output = usize;
+        type Err = core::convert::Infallible;
+        fn finish(self) -> Result<usize, Self::Err> {
+            Ok(self.deepest)
+        }
+        fn visit_pre(&mut self, node: &Ast) -> Result<(), Self::Err> {
+            if matches!(node, Ast::Group(_)) {
+                self.open += 1;
+                self.deepest = self.deepest.max(self.open);
+            }
+            Ok(())
+        }
+        fn visit_post(&mut self, node: &Ast) -> Result<(), Self::Err> {
+            if matches!(node, Ast::Group(_)) {
+                self.open -= 1;
+            }
+            Ok(())
+        }
+    }
+    // The `x` flag is the argument's, so a `#` comment in the pattern is only one with it written in.
+    let text;
+    let source = if extended {
+        text = format!("(?x){pattern}");
+        text.as_str()
+    } else {
+        pattern
+    };
+    let Ok(tree) = super::onig_ast_parser().parse(source) else {
+        return false;
+    };
+    let Ok(deepest) = ast::visit(
+        &tree,
+        GroupDepth {
+            open: 0,
+            deepest: 0,
+        },
+    );
+    deepest > ONIG_PARSE_DEPTH_LIMIT
+}
+
 /// The `regex` crate's compilation of `pattern` as given, within [`STD_REGEX_SIZE_LIMIT`] (#6439).
 #[cfg(feature = "regex")]
 fn compile_std(pattern: &str) -> Result<regex::Regex, regex::Error> {
     regex::RegexBuilder::new(pattern)
+        .nest_limit(crate::jq::ONIG_NEST_LIMIT)
         .size_limit(STD_REGEX_SIZE_LIMIT)
         .dfa_size_limit(STD_REGEX_SIZE_LIMIT)
         .build()
@@ -38298,9 +38367,7 @@ impl FancyModes {
 /// `regex` crate's parser refuses.
 #[cfg(feature = "regex")]
 fn is_fancy_syntax(pattern: &str) -> bool {
-    regex_syntax::ast::parse::Parser::new()
-        .parse(pattern)
-        .is_err()
+    crate::jq::onig_ast_parser().parse(pattern).is_err()
 }
 
 /// What bounds the length of a match of `pattern`: whether some input may make it empty (so `n`
@@ -38309,7 +38376,7 @@ fn is_fancy_syntax(pattern: &str) -> bool {
 /// bound.
 #[cfg(feature = "regex")]
 fn pattern_match_lengths(pattern: &str) -> (bool, Option<usize>) {
-    match regex_syntax::Parser::new().parse(pattern) {
+    match crate::jq::onig_hir_parser().parse(pattern) {
         Ok(hir) => {
             let properties = hir.properties();
             (
@@ -38325,7 +38392,7 @@ fn pattern_match_lengths(pattern: &str) -> (bool, Option<usize>) {
 /// (lookaround, a backreference) is taken to.
 #[cfg(feature = "regex")]
 fn pattern_is_variable_length(pattern: &str) -> bool {
-    match regex_syntax::Parser::new().parse(pattern) {
+    match crate::jq::onig_hir_parser().parse(pattern) {
         Ok(hir) => {
             let properties = hir.properties();
             properties.minimum_len() != properties.maximum_len()

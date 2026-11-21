@@ -8236,6 +8236,22 @@ A refusal of a construct jq accepts (a call `\g<a>` to a group the pattern has, 
 The rows are pinned against jq 1.7.1 in `tests/jq_cli/i6423.rs` and `tests/jq_cli/i6433.rs`.
 `succinctly yq` is not affected: its patterns are Go's, refused in Go's words (``error parsing regexp: missing closing ]: `[` ``).
 
+### A pattern nests groups at most 511 deep, as in jq 1.8.2 (#7528)
+
+jq 1.8.1 gave Oniguruma a parse depth limit (GHSA-f946-j5j2-4w5m, "Fix stack overflow in `node_min_byte_len` of oniguruma").
+jq 1.8.2 answers a pattern that nests up to 511 groups and refuses 512 with `Regex failure: parse depth limit over`: `"a" | test("(" * 511 + "a" + ")" * 511)` is `true`, with 512 it is that refusal.
+jq 1.7.1 accepted up to 2,047 groups and refused 2,048 with the same words.
+`succinctly jq` follows 1.8.2, since the limit is a fix for a crash in the reference; before #7528 it stopped at 250, where the `regex` crate's own nesting limit refused the pattern with the crate's rendered parse error.
+So the patterns with 251 to 511 nested groups, which both jq versions answer, are answered here, and 512 or more is refused in jq 1.8.2's words (jq 1.7.1 answers 512 to 2,047, which is the one place it differs from the 1.8.2 target).
+Capturing groups, `(?:`, `(?i:` and a repeat or an alternation between two of them count alike; `(?i)` and the other flag switches are flags, not groups.
+The crate's own limit counts every node of the syntax tree (a group, its alternation, a concatenation, a repeat), so it is raised to what 511 groups can come to and the group nesting is counted separately before the pattern is compiled (`exceeds_onig_parse_depth`), by a visitor that keeps its own stack.
+Every pass that reads a pattern before the engine does takes the same raised limit, so a pattern that is rewritten for Oniguruma's semantics is rewritten at any depth jq answers.
+The engines compile a pattern of 511 nested groups in a debug build on the default stack, which `tests/jq_cli/i7528.rs` runs.
+Still refused earlier than jq: a look-around or an atomic group nested more than 63 deep (`(?=` x 64), because those patterns go to `fancy-regex`, whose recursion limit of 64 is a constant of the crate; jq answers them to 511.
+The refusal there is the crate's rendered parse error, not `parse depth limit over`.
+`succinctly yq` is not affected: its patterns are Go's and read by the crate with its default limit.
+Pinned by `tests/jq_cli/i7528.rs`, whose rows are jq 1.8.2's output for every regex builtin.
+
 ### A large counted repeat of a Unicode class is refused, where jq answers it (#6439)
 
 A pattern whose compiled form passes the `regex` crate's size limit is refused in jq's words: `try test("\\w{3000}") catch .` is `"Regex failure: Compiled regex exceeds size limit of 134217728 bytes."`, and jq 1.7.1 answers `false`.

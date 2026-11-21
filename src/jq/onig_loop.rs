@@ -721,7 +721,7 @@ pub(crate) fn parse_distinct_names(pattern: &str) -> Option<DistinctNames> {
     // Each pass renames one use; a pattern with more repeated uses than this keeps its text.
     // One parse more than renames, so that the last rename is read.
     for _ in 0..=MAX_NAME_RENAMES {
-        match ast::parse::Parser::new().parse(&text) {
+        match super::onig_ast_parser().parse(&text) {
             Ok(tree) => {
                 return Some(DistinctNames {
                     text,
@@ -900,11 +900,11 @@ fn written_with_groups(input: &str, reading: usize, not_empty: bool) -> Option<G
 
 /// `pattern` parsed as written, or through the copy that writes its Oniguruma-only syntax plainly.
 fn parse_either(pattern: &str) -> Option<Ast> {
-    match ast::parse::Parser::new().parse(pattern) {
+    match super::onig_ast_parser().parse(pattern) {
         Ok(tree) => Some(tree),
         Err(_) => {
             let shadow = super::eval::oniguruma_shadow(pattern)?;
-            ast::parse::Parser::new().parse(&shadow.text).ok()
+            super::onig_ast_parser().parse(&shadow.text).ok()
         }
     }
 }
@@ -1040,11 +1040,11 @@ fn rewrite_parsed(
     // `\K`) is parsed through a copy that writes that syntax plainly at the same offsets. A pattern
     // the parser reads as written is read as written.
     let shadow;
-    let (parsed, ast, opaque) = match ast::parse::Parser::new().parse(pattern) {
+    let (parsed, ast, opaque) = match super::onig_ast_parser().parse(pattern) {
         Ok(ast) => (pattern, ast, &[][..]),
         Err(_) => {
             shadow = super::eval::oniguruma_shadow(pattern)?;
-            let ast = ast::parse::Parser::new().parse(&shadow.text).ok()?;
+            let ast = super::onig_ast_parser().parse(&shadow.text).ok()?;
             (shadow.text.as_str(), ast, shadow.opaque.as_slice())
         }
     };
@@ -2581,7 +2581,7 @@ impl Rewriter<'_> {
     /// budget, as building the text was.
     fn captures_of(&self, text: &str) -> Option<Vec<Option<String>>> {
         self.work.set(self.work.get().saturating_add(text.len()));
-        let ast = ast::parse::Parser::new().parse(text).ok()?;
+        let ast = super::onig_ast_parser().parse(text).ok()?;
         let mut found = Vec::new();
         collect_captures(&ast, &mut found);
         Some(found)
@@ -3897,7 +3897,7 @@ mod tests {
     }
 
     fn ops(pattern: &str) -> Option<usize> {
-        let ast = ast::parse::Parser::new().parse(pattern).unwrap();
+        let ast = super::onig_ast_parser().parse(pattern).unwrap();
         onig_ops(&ast, may_fold_case(pattern))
     }
 
@@ -3993,7 +3993,7 @@ mod tests {
         // that starts a fold or a class may be more than one operation, any other letter and `.`
         // is one.
         let folding =
-            |pattern: &str| onig_ops(&ast::parse::Parser::new().parse(pattern).unwrap(), true);
+            |pattern: &str| onig_ops(&super::onig_ast_parser().parse(pattern).unwrap(), true);
         assert_eq!(folding("b"), Some(1));
         assert_eq!(folding("."), Some(1));
         assert_eq!(folding("s"), None);
@@ -4343,7 +4343,7 @@ mod tests {
     #[test]
     fn a_ways_first_and_last_character_are_read_as_to_a_newline_6425() {
         let edges = |pattern: &str| {
-            let ast = ast::parse::Parser::new().parse(pattern).unwrap();
+            let ast = super::onig_ast_parser().parse(pattern).unwrap();
             (edge(&ast, false), edge(&ast, true))
         };
         use Edge::{Either, Newline, Nothing, Plain};
