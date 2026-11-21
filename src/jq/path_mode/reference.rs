@@ -1531,6 +1531,8 @@ impl<'e> Interp<'e> {
 
     /// `gen_foreach`: as `reduce`, but `EXTRACT` runs straight after each
     /// `UPDATE` output, on that output and at the register `UPDATE` left.
+    /// Every `INIT` output's `SOURCE` sees the input (#7519): jq 1.8 compiles
+    /// `foreach` without the `DUPN` [`FoldInput`] models (jqlang/jq#3266).
     #[allow(clippy::too_many_arguments)]
     fn foreach(
         &self,
@@ -1544,10 +1546,9 @@ impl<'e> Interp<'e> {
         reg: Reg,
         sink: &mut Sink<'_>,
     ) -> R {
-        let fold_input = FoldInput::new(input.clone());
-        self.eval(init, env, input, reg, &mut |initial, reg_init| {
+        self.eval(init, env, input.clone(), reg, &mut |initial, reg_init| {
             let state = RefCell::new(initial);
-            self.eval(source, env, fold_input.take(), reg_init, &mut |s, reg_s| {
+            self.eval(source, env, input.clone(), reg_init, &mut |s, reg_s| {
                 self.destructure(patterns, s, env, reg_s, &mut |env_p, reg_p| {
                     let current = state.replace(SVal::Null);
                     self.eval(update, &env_p, current, reg_p, &mut |u, reg_u| {

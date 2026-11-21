@@ -329,7 +329,6 @@ fn process_chunk_standard(
                 let bit = 1u16 << i;
                 let is_open = (class.opens & bit) != 0;
                 let is_close = (class.closes & bit) != 0;
-                let is_quote = (class.quotes & bit) != 0;
                 let is_value_char = (class.value_chars & bit) != 0;
 
                 if is_open {
@@ -340,15 +339,12 @@ fn process_chunk_standard(
                     bp.write_0();
                     ib.write_0();
                     state = State::InJson;
-                } else if is_quote {
-                    // Value start: BP=10, IB=1
-                    bp.write_1();
-                    bp.write_0();
-                    ib.write_1();
-                    state = State::InString;
                 } else if is_value_char {
                     ib.write_0();
                 } else {
+                    // Any other byte ends the value, a `"` included: glued to a value it
+                    // opens nothing, as in the state machine (`standard::state_machine`),
+                    // which every backend reproduces on malformed input too (#7539).
                     ib.write_0();
                     state = State::InJson;
                 }

@@ -242,10 +242,12 @@ timeout_s = 1200
 
 # `--jq-gate`: without `--base` this sweep fails only on a timeout; the flag fails it on any wrong
 # answer against jq too. The default 40,000-row sample of the 7.9M-row product, under a fixed seed.
+# Its rows with a multi-output INIT are judged against jq 1.8.2 (`--jq-latest`), whose `foreach` fix
+# succinctly follows (#7519); the rest against the primary.
 [[sweep]]
 id = "foreach-update-if-arm"
 script = "scripts/jq-foreach-update-if-arm-sweep.py"
-args = ["--bin", "{subject}", "--jq", "{jq}", "--jq-gate"]
+args = ["--bin", "{subject}", "--jq", "{jq}", "--jq-latest", "{jq_secondary}", "--jq-gate"]
 timeout_s = 1200
 
 # `--jq-gate` without `--base`: the default fixed-seed 40,000-row draw, 97 s.

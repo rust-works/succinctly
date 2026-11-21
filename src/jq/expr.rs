@@ -4257,8 +4257,12 @@ impl Builtin {
             return self.value_arg_mut().into_iter().collect();
         }
         match self {
-            // `format/1` is C-coded; `nth/1` is `def nth($n): .[$n];`.
-            Self::FormatNamed(arg) | Self::Nth(arg) => alloc::vec![&mut **arg],
+            // `format/1` and `halt_error/1` (#7558) are C-coded; `nth/1` is `def nth($n):
+            // .[$n];`. `in(xs)` binds its input before `xs` runs, so the parser spells it out
+            // when `xs` holds a `?//` (`parser::retry_collected_arg`).
+            Self::FormatNamed(arg) | Self::Nth(arg) | Self::HaltErrorCode(arg) => {
+                alloc::vec![&mut **arg]
+            }
             Self::SetPath(path, value) => alloc::vec![&mut **value, &mut **path],
             Self::Pow(a, b) | Self::Atan2(a, b) | Self::Libm2(_, a, b) => {
                 alloc::vec![&mut **b, &mut **a]
