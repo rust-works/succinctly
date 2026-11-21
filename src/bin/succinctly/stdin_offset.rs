@@ -216,6 +216,11 @@ struct Scan {
     found: Option<u64>,
     /// Whether the last item has completed, and its chunk is being read to its end.
     completed: bool,
+    /// The items the byte being read has completed so far.
+    completed_here: u8,
+    /// Whether the last item was not the first one its byte completed (the close after a scalar's
+    /// `--stream` event), so that jq's parser handed it out with no byte left to read.
+    completed_second: bool,
     in_string: bool,
     escape: bool,
     in_literal: bool,
@@ -242,6 +247,8 @@ impl Scan {
             chunk_start: 0,
             found: (taken == 0).then_some(0),
             completed: false,
+            completed_here: 0,
+            completed_second: false,
             in_string: false,
             escape: false,
             in_literal: false,
@@ -268,6 +275,7 @@ impl Scan {
                 continue;
             }
             self.in_bom &= self.pos < 3 && b == b"\xef\xbb\xbf"[self.pos as usize];
+            self.completed_here = 0;
             if !self.in_bom {
                 match self.items {
                     Items::Lines => {
@@ -289,17 +297,28 @@ impl Scan {
 
     /// Ends the chunk once the last item has completed: at a newline, or after a chunk's worth of
     /// bytes (a `-R` line runs to its newline).
+    ///
+    /// jq's input loop reads the next chunk before it asks the parser for an item whenever the
+    /// parser has no byte left, so an item handed out with none left (the second one the chunk's
+    /// last byte completed: the close after a scalar's `--stream` event) stands at the end of the
+    /// chunk after it (#7570).
     fn end_chunk_at(&mut self, b: u8) {
         let full = self.items != Items::Lines && self.pos + 1 - self.chunk_start == CHUNK;
-        if b == b'\n' || full {
+        // Only the completing byte itself can leave the parser with nothing to read.
+        let second = std::mem::take(&mut self.completed_second);
+        if full && second {
+            self.chunk_start = self.pos + 1;
+        } else if b == b'\n' || full {
             self.found = Some(self.pos + 1);
         }
     }
 
     fn complete(&mut self) {
         self.left -= 1;
+        self.completed_here += 1;
         if self.left == 0 {
             self.completed = true;
+            self.completed_second = self.completed_here > 1;
         }
     }
 
@@ -464,6 +483,33 @@ mod tests {
         // An empty container's event is its own closer.
         assert_eq!(ends(Items::Events, b"[[]\n,2]\n[9]\n", 1), Some(4));
         assert_eq!(ends(Items::Events, b"\"top\"\n[9]\n", 1), Some(6));
+    }
+
+    #[test]
+    fn a_second_event_completed_by_a_chunks_last_byte_stands_after_the_next_chunk_7570() {
+        // Captured from jq 1.7.1 and 1.8.2: `[2]` ends at byte 4094, the last of the first chunk.
+        // Its scalar event is handed out at the `]`; its close is handed out once the next chunk
+        // (` 3\n`) has been read.
+        let f = format!("{}[2] 3\n4\n", "1 ".repeat(2046)).into_bytes();
+        assert_eq!(ends(Items::Events, &f, 2047), Some(4095));
+        assert_eq!(ends(Items::Events, &f, 2048), Some(4098));
+        assert_eq!(ends(Items::Events, &f, 2049), Some(4098));
+        // `2]` ends at byte 4094: the scalar and the innermost close, then the next two closes.
+        let g = format!("{}[[[2]]] 3\n4\n", "1 ".repeat(2045)).into_bytes();
+        assert_eq!(ends(Items::Events, &g, 2046), Some(4095));
+        for taken in 2047..=2050 {
+            assert_eq!(ends(Items::Events, &g, taken), Some(4100), "{taken}");
+        }
+        // The next chunk is itself a full one when the line runs on.
+        let long = format!("{}[2]{}\n", "1 ".repeat(2046), " 3".repeat(3000)).into_bytes();
+        assert_eq!(ends(Items::Events, &long, 2048), Some(8190));
+        // A close completed with its scalar anywhere else in a chunk ends with that chunk.
+        let early = format!("[2]{}\n", " 3".repeat(3000)).into_bytes();
+        assert_eq!(ends(Items::Events, &early, 2), Some(4095));
+        // One item per byte: an empty array's event at the chunk's last byte, and values.
+        let empty = format!("{}[[]] 3\n4\n", "1 ".repeat(2046)).into_bytes();
+        assert_eq!(ends(Items::Events, &empty, 2047), Some(4095));
+        assert_eq!(ends(Items::Values, &f, 2047), Some(4095));
     }
 
     #[test]
