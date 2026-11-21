@@ -50814,6 +50814,47 @@ fn iterate_suffix_len(steps: &[Expr]) -> usize {
         .map_or(usize::MAX, |at| steps.len() - at)
 }
 
+/// Whether the index `idx` is still negative after counting back from the end of an array of
+/// `len` elements: a position no element can stand at, which jq reads as `null` and refuses to
+/// write (`resolve_setpath_index`).
+fn negative_index_names_no_element(idx: i64, len: usize) -> bool {
+    idx < 0 && (len as i64).saturating_add(idx) < 0
+}
+
+/// `=` through a negative index that names no element, with path left after it that holds an
+/// `.[]` (#7559): [`set_path_steps`]'s only frame that reaches this is one whose `rest` does.
+///
+/// jq's `=` is `reduce path(P) as $p (.; setpath($p; $v))`, so the write-time refusal
+/// (`Out of bounds negative array index`) needs a path, and the path is collected first. `path`
+/// reads `.[-2]` of `[1]` as the `null` there, so the rest of the path runs against that `null`,
+/// and an `.[]` over it either raises (`Cannot iterate over null (null)`, the error jq reports for
+/// `.[-2][] = 0`) or, under `?`, yields no path at all (`.[-2][]? = 0` is the input unchanged).
+/// So the rest is walked over a detached `null`: an error there is the path's, and a walk that
+/// leaves it untouched named no path, so nothing is written. One that does write (no shape is
+/// known to: an `.[]` over the `null` has no element) named a path, and the refusal stands.
+fn set_path_past_absent_negative_index<S: EvalSemantics>(
+    rest: &[Expr],
+    new_value: OwnedValue,
+    scalar_noop: ScalarNoop,
+    container_noop: bool,
+    iterate_suffix: usize,
+) -> Result<(), EvalError> {
+    let mut absent = OwnedValue::Null;
+    set_path_steps::<S>(
+        &mut absent,
+        rest,
+        new_value,
+        scalar_noop,
+        container_noop,
+        iterate_suffix,
+    )?;
+    match absent {
+        OwnedValue::Null => Ok(()),
+        // patchcov: coverage tolerate-line reason="unreachable: rest holds an .[] (the caller's frame exists only then), and an .[] over the detached null writes nothing; kept so a path that does reach a write keeps jq's refusal (#7559)"
+        _ => Err(EvalError::out_of_bounds_negative_index()),
+    }
+}
+
 /// Walk a *flat* list of atomic path components, peeling one per call, and
 /// write `new_value` at the end (#1429).
 ///
@@ -51071,6 +51112,19 @@ fn set_path_steps<S: EvalSemantics>(
             autovivify_array(root);
             if let OwnedValue::Array(arr) = root {
                 let original_len = arr.len();
+                if S::TAG == EvalTag::Jq && negative_index_names_no_element(*idx, original_len) {
+                    let result = set_path_past_absent_negative_index::<S>(
+                        rest,
+                        new_value,
+                        scalar_noop,
+                        container_noop,
+                        iterate_suffix,
+                    );
+                    if result.is_ok() && root_was_null && arr.is_empty() {
+                        *root = OwnedValue::Null;
+                    }
+                    return result;
+                }
                 let (result, stranded) = {
                     // A still-negative index after counting back from the
                     // end is jq's write-time bounds check, which `?` never
