@@ -5213,7 +5213,8 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     // the document parse by mistake (`stream_walk_by_reader_agrees_with_get_inputs_5498`).
     // `program_reads_inputs` is that meaning alone; the lazy route's gate below keeps it, so that
     // a clean `--seq` stream still takes #5674's route.
-    let program_reads_inputs = jq::walk::uses_input_builtins(&expr) || stream_walk_by_reader(&args);
+    // #7571: so does a plain `--stream-errors` walk, whose faults are events like any other.
+    let program_reads_inputs = jq::walk::uses_input_builtins(&expr) || walk_by_stream_reader(&args);
     // #6147: a `--seq` run reads through the queue whatever the program is, so that the reader's
     // faults come out in order with the values, as jq's main loop meets them. A clean stream has
     // no fault to order and is taken off the queue again by #5674's probe.
@@ -8448,8 +8449,8 @@ fn read_inputs(
             InputLocations::new(files.iter().map(|p| Some(input_display_name(p))).collect());
         // #5498: the program reads its inputs through `input`/`inputs` (under `-n`) or the driver
         // loop pops them (a plain walk), and the reader hands them out as they are asked for, so a
-        // stream of events is never held. `--stream-errors` without `-n` keeps its eager read.
-        if track_eof && !args.slurp && (args.null_input || stream_walk_by_reader(args)) {
+        // stream of events is never held. Since #7571 that includes `--stream-errors` without `-n`.
+        if track_eof && !args.slurp && (args.null_input || walk_by_stream_reader(args)) {
             LAZY_STREAM_INPUTS.with(|slot| {
                 *slot.borrow_mut() = Some(LazyStreamInputs {
                     files: raw_bytes.iter().map(|(file, _)| *file).collect(),
@@ -9493,13 +9494,28 @@ fn is_eof_fault_event(value: &OwnedValue) -> bool {
 /// a program with no `-n` and no `-s`, over JSON documents. Under `-n` the program asks for its
 /// inputs itself, and `-s` holds the whole array.
 fn stream_walk_by_reader(args: &JqCommand) -> bool {
-    args.stream
-        && !args.stream_errors
-        && !args.null_input
-        && !args.slurp
-        && args.input_dsv.is_none()
-        && !args.raw_input
-        && !args.seq
+    args.stream && !args.stream_errors && plain_walk_over_json(args)
+}
+
+/// Whether a plain `--stream-errors` walk is read by the stream reader through the input queue
+/// (#7571), as a plain `--stream` walk is ([`stream_walk_by_reader`]): it held every event of the
+/// input as an owned value before the program ran, about 34 times the input (350 MB for 9.7 MB of
+/// NDJSON). Kept apart from [`stream_walk_by_reader`] because a fault is an event here, which the
+/// main loop hands the program, where under `--stream` it prints as a parse error.
+fn stream_errors_walk_by_reader(args: &JqCommand) -> bool {
+    args.stream_errors && plain_walk_over_json(args)
+}
+
+/// Whether either plain walk is read by the stream reader ([`stream_walk_by_reader`],
+/// [`stream_errors_walk_by_reader`]): the gate of the reader's seeding, its reading in chunks, and
+/// the queue the main loop pops.
+fn walk_by_stream_reader(args: &JqCommand) -> bool {
+    stream_walk_by_reader(args) || stream_errors_walk_by_reader(args)
+}
+
+/// The shape both plain stream walks share: no `-n`, no `-s`, JSON documents and not `--seq`.
+fn plain_walk_over_json(args: &JqCommand) -> bool {
+    !args.null_input && !args.slurp && args.input_dsv.is_none() && !args.raw_input && !args.seq
 }
 
 /// The source tag and line an input of the stream reader is placed at: `(source, line)` as the
@@ -11327,7 +11343,7 @@ fn stream_read_in_chunks(args: &JqCommand, track_eof: bool) -> bool {
         && !args.slurp
         && track_eof
         && (args.stream || args.stream_errors)
-        && (args.null_input || stream_walk_by_reader(args))
+        && (args.null_input || walk_by_stream_reader(args))
 }
 
 /// The input files that opened, how to open each again for the reader, and what the reader says
@@ -25509,11 +25525,22 @@ mod tests {
                 vec!["jq", "--stream", "--input-dsv", ",", "inputs", &clean],
                 false,
             ),
-            (vec!["jq", "--stream-errors", "inputs", &clean], false),
+            // #7571: a plain `--stream-errors` walk is read by the reader too.
+            (vec!["jq", "--stream-errors", "inputs", &clean], true),
+            (vec!["jq", "--stream-errors", "-s", "inputs", &clean], false),
+            (
+                vec!["jq", "--stream-errors", "--seq", "inputs", &clean],
+                false,
+            ),
             (vec!["jq", "inputs", &clean], false),
         ] {
             let cmd = JqCommand::try_parse_from(argv.iter().copied()).unwrap();
-            assert_eq!(stream_walk_by_reader(&cmd), by_reader, "{argv:?}");
+            assert_eq!(walk_by_stream_reader(&cmd), by_reader, "{argv:?}");
+            assert_eq!(
+                stream_walk_by_reader(&cmd),
+                by_reader && !cmd.stream_errors,
+                "{argv:?}"
+            );
             let (inputs, _, _, _, lazy) = read(&argv);
             let stream = LAZY_STREAM_INPUTS.with(|slot| slot.borrow_mut().take());
             assert_eq!(
