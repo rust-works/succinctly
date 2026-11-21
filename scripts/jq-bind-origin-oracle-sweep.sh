@@ -258,6 +258,12 @@ fi
 # `read -d ''`, not `$(cat <<EOF)`: bash scans a command substitution's body for
 # quotes and parens even inside a quoted heredoc, so a filter or a reason with an
 # apostrophe or an unbalanced paren in it used to break the whole script (#3120).
+# Which jq the rows compare with (#7519): every row is judged against `$JQ`, jq 1.7.1. A `foreach` with a
+# multi-output INIT whose source reads the input follows jq 1.8.2 instead (jqlang/jq#3266: every INIT output's
+# source reads the real input, where 1.7.1 reads `null` after the first), so no such row is kept here: the one this
+# list had, `[foreach (.) as $x ((.,.); ($x.a) = 9; .)]` (1.7.1 refuses on the second fork, 1.8.2 writes on both),
+# is pinned against jq 1.8.2 in tests/jq_cli_tests.rs (`test_fold_loop_variable_in_path_position_3329`).
+# Its `reduce` twin, `fold-loop-var-later-init-fork-refuses`, still refuses in both jq versions.
 read -r -d '' CASES <<'CASES_EOF' || true
 same-node-sibling-pipe	{"a":{"b":1},"c":{"b":1}}	path(.a as $y | .a | $y)
 equal-sibling-pipe	{"a":{"b":1},"c":{"b":1}}	path(.a as $y | .c | $y)
@@ -1191,7 +1197,6 @@ fold-loop-var-roundtrip-acc-refuses	{"a":1}	reduce (.) as $x (.; tojson | fromjs
 fold-loop-var-roundtrip-source-refuses	{"a":1}	reduce (. | tojson | fromjson) as $x (.; path($x))
 fold-loop-var-equal-sibling-refuses	{"a":{"b":1},"c":{"b":1}}	reduce .a as $x (.c; ($x.b) = 9)
 fold-loop-var-later-init-fork-refuses	{"a":1}	reduce (.) as $x ((.,.); ($x.a) = 9)
-fold-loop-var-later-init-fork-foreach-refuses	{"a":1}	[foreach (.) as $x ((.,.); ($x.a) = 9; .)]
 fold-loop-var-scalar-refuses	"s"	reduce (.) as $x (.; path($x))
 fold-loop-var-below-init	[{"a":1}]	reduce .[] as $x (.; del(.[0] | $x))
 fold-loop-var-below-init-object	{"a":{"b":1}}	reduce .a as $x (.; del(.a | $x))

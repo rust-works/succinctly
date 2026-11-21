@@ -5704,6 +5704,22 @@ impl<V: DocumentValue> LazySeq<V> {
         }
     }
 
+    /// Whether pushing a `map(h)` stage onto this chain would change what can be observed
+    /// (#7565): jq runs every stage on every element before the next stage starts, and the
+    /// chain runs them element by element, so the two orders differ only when `h` and a stage
+    /// already on the chain can each raise or have an effect, which
+    /// [`expr_is_inert`](super::eval::expr_is_inert) is the one test of. jq mode only:
+    /// `succinctly yq` keeps the chain as it was (yq's own evaluation order is #7405).
+    fn fusing_is_observable<S: EvalSemantics>(&self, h: &Expr) -> bool {
+        S::TAG == EvalTag::Jq
+            && !super::eval::expr_is_inert(h, false)
+            && self
+                .instructions
+                .iter()
+                .flat_map(|rc| rc.iter())
+                .any(|instr| !super::eval::expr_is_inert(&instr.f, false))
+    }
+
     /// Builder-style wrapper around [`Self::push_map_in_place`], for the
     /// fresh-construction call sites that chain straight off `LazySeq::new`.
     fn push_map(mut self, f: &Expr, tag: EvalTag) -> Self {
@@ -8970,12 +8986,14 @@ fn push_generic_document_validation_error<C: DocumentCursor>(
 }
 
 /// The one rule every cursor-backed truthiness check in this file answers
-/// by: `is_falsy()`, negated. Pulled out so `//`/`and`/`or`/`not`
+/// by: [`DocumentCursor::truthiness`]. Pulled out so `//`/`and`/`or`/`not`
 /// structurally cannot drift on what "truthy" means — previously enforced
 /// only by [`push_generic_truthiness`] and [`retain_truthy_generic`]'s
-/// matching doc comments (#2665 item 3).
-fn cursor_is_truthy<C: DocumentCursor>(c: &C) -> bool {
-    !c.is_falsy()
+/// matching doc comments (#2665 item 3). `Err` for a token the index could
+/// not read (`tru`, `1.2.3`), which has no truthiness (#7449).
+#[inline]
+fn cursor_truthiness<C: DocumentCursor>(c: &C) -> Result<bool, EvalError> {
+    c.truthiness()
 }
 
 /// Append one truthiness bit per output of a `GenericResult` stream to
@@ -9011,8 +9029,9 @@ fn push_generic_truthiness<V: DocumentValue, S: EvalSemantics>(
             // about what a later `-e`/JSON-output convention would sanitize
             // it to -- `Preserve` keeps a malformed number truthy here the
             // same way it always has (see `StreamableValue::is_falsy`'s own
-            // doc comment for the convention this parameter selects).
-            out.push(cursor_is_truthy(&c));
+            // doc comment for the convention this parameter selects). A token
+            // the index could not read raises (#7449).
+            out.push(push_or_control!(cursor_truthiness(&c)));
         }
         GenericResult::Many(vs) => {
             for v in &vs {
@@ -9021,7 +9040,7 @@ fn push_generic_truthiness<V: DocumentValue, S: EvalSemantics>(
         }
         GenericResult::ManyCursor(cs) => {
             for c in &cs {
-                out.push(cursor_is_truthy(c));
+                out.push(push_or_control!(cursor_truthiness(c)));
             }
         }
         // A lazy keys array, materialized or not, sorted or not, is
@@ -9115,9 +9134,10 @@ fn owned_prefix_partial<V: DocumentValue, T>(
 /// Every arm answers truthiness by exactly the rule its
 /// `push_generic_truthiness` counterpart uses, so `//` and `and`/`or`/`not`
 /// cannot drift apart on what "truthy" means: `OneCursor`/`ManyCursor` share
-/// [`cursor_is_truthy`] and nothing else, validating nothing (#2692 -- see
+/// [`cursor_truthiness`] and nothing else, validating nothing (#2692 -- see
 /// that function's `OneCursor` arm for why reading truthiness decodes
-/// nothing and so raises nothing, and a malformed *number* stays truthy);
+/// nothing and so raises nothing, though a token the index could not read
+/// -- a malformed number or keyword -- raises, having no truthiness, #7449);
 /// `LazyKeys`/`LazyIndexRange` are array-shaped and therefore always truthy
 /// without materializing; `LazySeq` must still be pulled, because it runs
 /// arbitrary `map(f)` whose failure has to surface rather than be reported as
@@ -9144,13 +9164,11 @@ fn retain_truthy_generic<V: DocumentValue, S: EvalSemantics>(
             Ok(_) => GenericResult::None,
             Err(e) => GenericResult::Error(e),
         },
-        GenericResult::OneCursor(c) => {
-            if cursor_is_truthy(&c) {
-                GenericResult::OneCursor(c)
-            } else {
-                GenericResult::None
-            }
-        }
+        GenericResult::OneCursor(c) => match cursor_truthiness(&c) {
+            Ok(true) => GenericResult::OneCursor(c),
+            Ok(false) => GenericResult::None,
+            Err(e) => GenericResult::Error(e),
+        },
         GenericResult::Many(vs) => {
             let mut kept: Vec<V> = Vec::new();
             for v in vs {
@@ -9175,8 +9193,14 @@ fn retain_truthy_generic<V: DocumentValue, S: EvalSemantics>(
         GenericResult::ManyCursor(cs) => {
             let mut kept: Vec<V::Cursor> = Vec::new();
             for c in cs {
-                if cursor_is_truthy(&c) {
-                    kept.push(c);
+                match cursor_truthiness(&c) {
+                    Ok(true) => kept.push(c),
+                    Ok(false) => {}
+                    // #7449: a token the index could not read raises. The kept
+                    // prefix goes with it: the document is one jq rejects
+                    // before answering anything, and keeping it would hand
+                    // `owned_prefix_partial` a cursor never converted.
+                    Err(e) => return GenericResult::Error(e),
                 }
             }
             cursor_vec_to_generic_result(kept)
@@ -16126,6 +16150,22 @@ fn fold_lazy_seq_stage<S: EvalSemantics, V: DocumentValue>(
         // same-size replacement -- the hot path for a chained
         // `map(f) | map(g) | map(h)`, where this arm runs once per stage.
         Expr::Builtin(Builtin::Map(h)) => {
+            // #7565: jq's `map(f)` is `[.[] | f]`, so `map(f) | map(g)` runs `f` on every
+            // element before `g` sees the array. Fusing `h` onto the chain runs the stages
+            // element by element instead, which is unobservable only when `h` or every stage
+            // already on the chain is inert; otherwise `h`'s error, `debug` or `input` came
+            // before a later element's `f`. Such a chain is drained first (the cursors stay
+            // cursors, nothing is decoded) and `h` starts a new one over what it answered.
+            if seq.fusing_is_observable::<S>(h) {
+                return match seq.drain_atomic() {
+                    Ok(elems) => GenericResult::LazySeq(Box::new(
+                        LazySeq::from_mixed(elems).push_map(h, S::TAG),
+                    )),
+                    Err(Control::Error(e)) => GenericResult::Error(e),
+                    Err(Control::Break(label)) => GenericResult::Break(label),
+                    Err(Control::Halt(code)) => GenericResult::Halt(code),
+                };
+            }
             seq.push_map_in_place(h, S::TAG);
             GenericResult::LazySeq(seq)
         }
@@ -18521,7 +18561,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // `push_generic_truthiness` -- built for genuinely multi-output
         // streams -- via a `vec_with_capacity(1)`/push/index round-trip to
         // extract one guaranteed bit. Inlined directly here instead (#2665
-        // item 4): [`cursor_is_truthy`] for the cursor case is the exact
+        // item 4): [`cursor_truthiness`] for the cursor case is the exact
         // same rule that function's `OneCursor` arm uses, and the `None`
         // case is the exact same `to_owned`-then-`is_truthy` its `One` arm
         // uses, with the identical error surfaced the same way
@@ -18529,7 +18569,10 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // `GenericResult::Error` -- see `partial_generic` above).
         Expr::Not => {
             let truthy = match cursor {
-                Some(c) => cursor_is_truthy(&c),
+                Some(c) => match cursor_truthiness(&c) {
+                    Ok(truthy) => truthy,
+                    Err(e) => return GenericResult::Error(e),
+                },
                 // STYLE-0012: raises regardless of `optional`, and must --
                 // `not` has never consulted it. Two reasons, either
                 // sufficient. (1) `to_owned` raises only decode failures,
@@ -20302,10 +20345,12 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
 /// ([`embed_table`]). The entry makes the accumulator's first in-place write copy
 /// once, and a live table reshapes owned navigation, neither of which a fold that
 /// cannot certify a marker should pay -- hence the gate. Only the *first* output:
-/// jq 1.7.1 evaluates SOURCE against `null` on every later fork
+/// jq evaluates a `reduce`'s SOURCE against `null` on every later fork
 /// (`[reduce (.) as $x ((.,.); $x)]` is `[{"a":1},null]`), so a loop variable there is
 /// never the accumulator's own node, and an entry would answer a write through it
-/// that jq refuses.
+/// that jq refuses. A `foreach`'s later forks read the real input since #7519, and the
+/// writes through a loop variable that `tests/jq_cli/i7519.rs` pins on them answer as
+/// jq 1.8.2 does without an entry.
 fn drive_foreach_expr_generic<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     value: &V,
@@ -20353,7 +20398,8 @@ fn drive_foreach_expr_generic<S: EvalSemantics, V: DocumentValue>(
 
 /// A fold's SOURCE drive on the generic evaluator (#3895): the first INIT fork
 /// reads the fold's own input through [`drive_foreach_expr_generic`], every
-/// later one reads `null`, as jq 1.7.1 does. This route has no `null` of its
+/// later `reduce` fork reads `null`, as jq does (a `foreach` fork always reads
+/// the real input, #7519). This route has no `null` of its
 /// own value type to hand `eval_each_generic`, so a later fork runs the
 /// as-written source against an owned `null` instead
 /// ([`crate::jq::eval::drive_source_against_null`]).
@@ -20507,11 +20553,22 @@ fn recurse_cond_keeps_cursor<S: EvalSemantics, V: DocumentValue>(
     }
     let mut keep = false;
     let mut verdicts = 0u32;
+    let mut unreadable: Option<EvalError> = None;
     let flow = eval_each_generic::<S, V>(cond, cursor.value(), false, Some(cursor), &mut |item| {
         verdicts += 1;
-        keep |= generic_item_is_truthy(&item);
+        match pushed_item_truthiness(&item) {
+            Ok(truthy) => keep |= truthy,
+            // #7449: a verdict on a token the index could not read raises.
+            Err(e) => {
+                unreadable = Some(e);
+                return Demand::Stop;
+            }
+        }
         Demand::Continue
     });
+    if let Some(e) = unreadable {
+        return Err(Control::Error(e));
+    }
     // The walk's bound rests on the admission rule: a second verdict would visit a child once per
     // truthy output where this visits it once.
     debug_assert!(
@@ -20601,7 +20658,9 @@ fn direct_cond_verdict_with<S: EvalSemantics, V: DocumentValue>(
         Expr::Paren(inner) => direct_cond_verdict_with::<S, V>(inner, cursor, owned),
         Expr::Literal(Literal::Bool(b)) => Some(*b),
         Expr::Literal(Literal::Null) => Some(false),
-        Expr::Identity => Some(cursor_is_truthy(cursor)),
+        // A token the index could not read has no verdict: the general route
+        // raises it (#7449).
+        Expr::Identity => cursor_truthiness(cursor).ok(),
         Expr::Pipe(stages) => match &stages[..] {
             [head, Expr::Not] => direct_cond_verdict_with::<S, V>(head, cursor, owned).map(|b| !b),
             _ => None, // patchcov: coverage tolerate-line reason="unreachable: direct_cond_verdict checks is_direct_grammar before this runs, and that grammar admits only the shapes the arms above answer (#4095)"
@@ -26694,14 +26753,16 @@ fn each_alternative_generic<S: EvalSemantics, V: DocumentValue>(
             // through `generic_item_to_result` would otherwise collapse to a
             // bare `OneCursor`, discarding it and forcing a second cursor
             // `.value()` resolve on every item this forwards. Truthiness only
-            // needs the cursor, so answer it directly via `cursor_is_truthy`
+            // needs the cursor, so answer it directly via `cursor_truthiness`
             // and keep the pair intact -- the same shared rule, not a second
             // inlined copy of it (#2665 item 3 follow-up: this site was the one
-            // cursor-backed truthiness check `cursor_is_truthy`'s doc comment
+            // cursor-backed truthiness check `cursor_truthiness`'s doc comment
             // claimed to cover but didn't actually reach).
             if let GenericItem::OneCursorValue(ref c, _) = item {
-                if !cursor_is_truthy(c) {
-                    return Demand::Continue;
+                match cursor_truthiness(c) {
+                    Ok(true) => {}
+                    Ok(false) => return Demand::Continue,
+                    Err(e) => return handle_flow(Flow::Escaped(Control::Error(e))),
                 }
                 forwarded += 1;
                 return handle_flow(push_one_generic(item, sink));
@@ -26744,18 +26805,27 @@ fn each_alternative_generic<S: EvalSemantics, V: DocumentValue>(
 /// `is_falsy`, a decoded or computed value by its truthiness, and the lazy shapes
 /// (`keys`, an index range, a built array) are always truthy -- a lazy array that fails to
 /// build raises where its consumer pulls it, not here.
+///
+/// The yq-only routes ask this one: yq mode reads JSON through its YAML parser, whose cursors
+/// always have a truthiness, so [`pushed_item_truthiness`]'s `Err` cannot reach them.
 fn generic_item_is_truthy<V: DocumentValue>(item: &GenericItem<V>) -> bool {
-    match item {
+    pushed_item_truthiness(item).unwrap_or(true)
+}
+
+/// [`generic_item_is_truthy`], with a cursor at a token the index could not read raising
+/// (#7449, [`cursor_truthiness`]).
+fn pushed_item_truthiness<V: DocumentValue>(item: &GenericItem<V>) -> Result<bool, EvalError> {
+    Ok(match item {
         // Falsy is `null` or `false`, which the value says without decoding a container (#2692's
         // rule for a cursor: reading truthiness decodes nothing).
         GenericItem::One(v) => !(v.is_null() || v.as_bool() == Some(false)), // patchcov: coverage tolerate-line reason="a document value pushed without a cursor: every left output the CLI's cursor route produces carries one, so only a caller driving this route without a cursor reaches this arm; it is the cursor arm below with the value's own null/false test (#2817)"
-        GenericItem::OneCursor(c) | GenericItem::OneCursorValue(c, _) => cursor_is_truthy(c),
+        GenericItem::OneCursor(c) | GenericItem::OneCursorValue(c, _) => cursor_truthiness(c)?,
         GenericItem::Owned(o) => o.is_truthy(),
         GenericItem::LazyKeys { .. }
         | GenericItem::LazyIndexRange(_)
         | GenericItem::LazySeq(_)
         | GenericItem::LazyObject(_) => true,
-    }
+    })
 }
 
 /// yq's `//` as a pushed stream over the cursor route
@@ -34627,6 +34697,11 @@ fn path_context_is_navigational_at(expr: &Expr, unfolded: u8) -> bool {
                 && end.as_deref().map_or(true, path_context_component_walkable)
         }
         Expr::Builtin(Builtin::GetPath(path_expr)) => path_context_component_walkable(path_expr),
+        // #7474: a call whose generator argument the parser bound first walks as written
+        // (`getpath(G)`, `nth(G)`), so the walk keeps pulling `G` one path at a time (#2259).
+        bound @ Expr::As { var, .. } if crate::jq::parser::is_value_arg_var(var) => {
+            crate::jq::parser::unbound_value_args_call(bound).is_some_and(|call| nav(&call))
+        }
         // spine 2416 (walk residue): the transparent wrappers step their
         // body; what they evaluate besides it (`if`'s condition, `limit`'s
         // count, a `catch` handler, an `error` message) is evaluated at the
@@ -35135,6 +35210,12 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             Ok(())
         }
         Expr::Paren(inner) => path_context_step_generic::<S, V>(inner, pos, out),
+        // #7474: see `path_context_is_navigational_at`'s arm.
+        bound @ Expr::As { var, .. } if crate::jq::parser::is_value_arg_var(var) => {
+            let call = crate::jq::parser::unbound_value_args_call(bound)
+                .expect("path_context_is_navigational_at admitted only a bound call");
+            path_context_step_generic::<S, V>(&call, pos, out)
+        }
         Expr::Field(_) | Expr::Index { .. } | Expr::Iterate => {
             // `path_step_generic` is the same navigation `Builtin::Path`'s
             // cursor walk (#2058) uses, absent nodes included, so the two
@@ -40830,8 +40911,12 @@ fn any_all_generic<S: EvalSemantics, V: DocumentValue>(
         while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
             // `Preserve`, the same convention `push_generic_truthiness`/
             // `retain_truthy_generic` read truthiness under, so `any`/`all`
-            // and `select`/`//`/`not` cannot drift on what truthy means.
-            let truthy = !elem_cursor.is_falsy();
+            // and `select`/`//`/`not` cannot drift on what truthy means
+            // (#7449: an element the index could not read raises).
+            let truthy = match cursor_truthiness(&elem_cursor) {
+                Ok(truthy) => truthy,
+                Err(e) => return GenericResult::Error(e),
+            };
             if truthy == target_truthy {
                 return answer(target_truthy);
             }
@@ -40845,7 +40930,10 @@ fn any_all_generic<S: EvalSemantics, V: DocumentValue>(
         match effective_value_cursors_checked(&fields, S::COLLAPSE_DUPLICATE_KEYS, false) {
             Ok(cursors) => {
                 for value_cursor in cursors {
-                    let truthy = !value_cursor.is_falsy();
+                    let truthy = match cursor_truthiness(&value_cursor) {
+                        Ok(truthy) => truthy,
+                        Err(e) => return GenericResult::Error(e),
+                    };
                     if truthy == target_truthy {
                         return answer(target_truthy);
                     }
@@ -49817,14 +49905,19 @@ mod tests {
             ("map(pow(2; .))", "map(pow(1 + 1; .))"),
             ("map(pow(.; .))", "map(pow(.; . + 0))"),
             ("map(atan2(.; 1))", "map(atan2(.; 1 + 0))"),
-            ("map(atan2(-0; .))", "map(atan2(0 * -1; .))"),
+            // A program's `-0` is the literal `0` in jq 1.8 (#7453).
+            ("map(atan2(-0; .))", "map(atan2(0 * 1; .))"),
             ("map(atan2(.; -1))", "map(atan2(.; 0 - 1))"),
             ("map(. + 0 | pow(.; 2))", "map(. + 0 | pow(.; 1 + 1))"),
         ] {
             assert_eq!(answers(fast), answers(evaluator), "{fast}");
         }
-        // A generator operand, a computed operand and a non-number keep the evaluator.
-        assert!(run("map([pow(.; (1, 2))] | .[0])").1 > 0);
+        // A computed operand and a non-number keep the evaluator. A generator operand is bound
+        // first since #7474 (`(1, 2) as $v | pow(.; $v)`), so each call is a variable operand.
+        assert_eq!(
+            run("map([pow(.; (1, 2))] | .[0])").0,
+            join(numbers.map(|n| math::pow(n, 1.0)).to_vec())
+        );
         assert!(run("map(pow(. + 1; 2))").1 > 0);
         assert!(run("map(tostring | try pow(.; 2) catch 0)").1 > 0);
     }
@@ -53206,6 +53299,35 @@ mod tests {
                 .into()
             )
         );
+    }
+
+    /// #7565: a `map(g)` joins the chain only when running the stages element by element
+    /// cannot be seen (`g`, or every stage already on it, is inert); otherwise the chain is
+    /// drained first and `g` is the one stage of a new one, as jq's `[.[] | f]` builds the array
+    /// before `map(g)` starts. yq mode keeps fusing (#7405).
+    #[test]
+    fn test_map_map_fuses_only_when_the_order_is_unobservable_7565() {
+        fn stages<S: EvalSemantics>(filter: &str) -> usize {
+            let json = br"[1,2,3]";
+            let index = JsonIndex::build(json);
+            let expr = crate::jq::parse(filter).unwrap();
+            match eval_with_cursor_using::<S, _>(&expr, index.root(json)) {
+                GenericResult::LazySeq(seq) => seq.instructions.as_deref().map_or(0, Vec::len),
+                other => panic!("{filter}: not a LazySeq: {other:?}"),
+            }
+        }
+        for (filter, jq) in [
+            ("map(. + 1) | map(. * 10)", 1),
+            ("map(. + 1) | map(.) | map(. * 10)", 1),
+            ("map(.) | map(. + 1)", 2),
+            ("map(. + 1) | map(tostring)", 2),
+            ("map(. + 1) | map(.)", 2),
+            ("map(.) | map(.) | map(. + 1)", 3),
+            ("map(. + 1) | map(. + 2) | map(.)", 2),
+        ] {
+            assert_eq!(stages::<JqSemantics>(filter), jq, "jq: {filter}");
+        }
+        assert_eq!(stages::<YqSemantics>("map(. + 1) | map(. * 10)"), 2);
     }
 
     #[test]

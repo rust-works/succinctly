@@ -304,6 +304,7 @@ impl ErrorSink {
             (true, false) => 0,
         };
         self.halt = self.halt.or(Some(exit_code));
+        super::stdin_offset::note_halt();
     }
 
     /// Make a negative `halt_error` code exit as its absolute value, which jq's `-e` does
@@ -345,6 +346,7 @@ impl ErrorSink {
         match style {
             DiagStyle::Jq => {
                 let marker = if not_a_string { " (not a string)" } else { "" };
+                let message = c_string_prefix(message);
                 eprintln!("jq: error (at {at}){marker}: {message}");
             }
             // yq carries neither marker; `Error:` matches the prefix already
@@ -534,23 +536,26 @@ fn is_output_write_failed(err: &std::io::Error) -> bool {
 /// with `>&-` printed nothing and exited 0 where jq reports the failed write (#7214). This writer returns the
 /// error, tagged [`OutputWriteFailed`]. It is unbuffered: wrap it in a [`LoudFlushWriter`].
 pub struct JqStdout {
-    /// A duplicate of descriptor 1, or why there is none (`EBADF` when standard output is closed).
+    /// Descriptor 1 itself, never closed: a duplicate of it would cost the one free descriptor a run under
+    /// `ulimit -n 4` has to open its input file with (#7477), where jq needs none.
     #[cfg(unix)]
-    fd: Result<std::fs::File, std::io::Error>,
+    fd: std::mem::ManuallyDrop<std::fs::File>,
     #[cfg(not(unix))]
     out: std::io::Stdout,
 }
 
 impl JqStdout {
+    #[allow(unsafe_code)] // one `File::from_raw_fd(1)`, wrapped so that it is never dropped
     pub fn new() -> Self {
         #[cfg(unix)]
         {
-            use std::os::fd::AsFd;
+            use std::os::fd::FromRawFd;
             Self {
-                fd: std::io::stdout()
-                    .as_fd()
-                    .try_clone_to_owned()
-                    .map(std::fs::File::from),
+                // SAFETY: descriptor 1 is open for the whole run (Rust's runtime reopens a closed one on
+                // `/dev/null` before `main`, so `>&-` still has a descriptor 1), and `ManuallyDrop` leaves it
+                // open when this value goes away. A write to a descriptor that cannot be written fails with
+                // `EBADF`, which `write` reports.
+                fd: std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(1) }),
             }
         }
         #[cfg(not(unix))]
@@ -586,13 +591,7 @@ impl Default for JqStdout {
 impl Write for JqStdout {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         #[cfg(unix)]
-        let r = match &mut self.fd {
-            Ok(file) => file.write(buf),
-            // `io::Error` is not `Clone`: rebuild it from its OS code (`EBADF`, 9, when there is none).
-            Err(e) => Err(std::io::Error::from_raw_os_error(
-                e.raw_os_error().unwrap_or(9),
-            )),
-        };
+        let r = self.fd.write(buf);
         #[cfg(not(unix))]
         let r = self.out.write(buf);
         r.map_err(Self::tag)
@@ -1923,6 +1922,16 @@ fn push_nan(scheme: &ColorScheme, result: &mut String) {
     result.push_str(&scheme.reset);
 }
 
+/// `message` up to its first NUL byte, as jq's own `%s` writes it (#7442).
+///
+/// jq prints an uncaught error with `fprintf(stderr, "jq: error (at %s): %s\n", ...)` over the
+/// message's C string, so the text after a NUL (`error("a\u0000b")`) is never written, in jq 1.7.1
+/// and 1.8.2 alike. The error value itself stays whole: `try error("a\u0000b") catch length` is 3.
+/// A non-string value is dumped as JSON, which escapes its NULs, and needs no cut.
+pub(crate) fn c_string_prefix(message: &str) -> &str {
+    message.split('\0').next().unwrap_or(message)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1947,24 +1956,17 @@ mod tests {
         assert!(output_write_failure(&anyhow::anyhow!("other")).is_none());
     }
 
-    /// A descriptor 1 that could not be duplicated fails every write with its own OS error, and `Default` is `new`.
+    /// `JqStdout` writes to descriptor 1 without owning it (#7477), so it has no `Drop` that could close it, and
+    /// `Default` is `new`. An empty write is a no-op on any descriptor.
     #[cfg(unix)]
     #[test]
-    fn jq_stdout_without_a_descriptor_fails_each_write_7214() {
-        let mut out = JqStdout {
-            fd: Err(std::io::Error::from_raw_os_error(24)),
-        };
-        let err = out.write(b"x").unwrap_err();
-        assert_eq!(
-            output_write_failure(&anyhow::Error::new(err)),
-            Some("Too many open files")
-        );
-        let mut bare = JqStdout {
-            fd: Err(std::io::Error::other("no code")),
-        };
-        assert!(is_output_write_failed(&bare.write(b"x").unwrap_err()));
+    fn jq_stdout_does_not_own_descriptor_1_7477() {
+        assert!(!std::mem::needs_drop::<JqStdout>());
+        let mut out = JqStdout::new();
+        assert_eq!(out.write(b"").unwrap(), 0);
         assert!(out.flush().is_ok());
-        let _ = JqStdout::default();
+        let mut again = JqStdout::default();
+        assert_eq!(again.write(b"").unwrap(), 0);
     }
 
     #[test]

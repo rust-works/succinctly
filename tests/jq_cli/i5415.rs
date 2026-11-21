@@ -28,7 +28,7 @@ fn strip_ansi(text: &str) -> String {
 
 /// A NaN is `null` in jq's output, but colored as a number wrapping a null (#3413). The streamed
 /// render marks it for the colorizer: from a computed owned value, whose literal text is `null`
-/// and whose repr is the NaN, and from jq's own `nan`/`sNaN12` words.
+/// and whose repr is the NaN, and from jq's own `nan`/`sNaN0` words.
 #[test]
 fn test_nan_keeps_its_double_wrapped_color_5415() -> Result<()> {
     let nan = "\u{1b}[0;39m\u{1b}[0;90mnull\u{1b}[0m\u{1b}[0m";
@@ -43,7 +43,7 @@ fn test_nan_keeps_its_double_wrapped_color_5415() -> Result<()> {
         let (out, code) = run_jq_stdin(filter, doc, &["-C", "-c"])?;
         assert_eq!((out.as_str(), code), (want, 0), "{doc} | {filter}");
     }
-    let (out, code) = run_jq_stdin("to_entries?", r#"{"a":nan,"b":sNaN12}"#, &["-C", "-c"])?;
+    let (out, code) = run_jq_stdin("to_entries?", r#"{"a":nan,"b":sNaN0}"#, &["-C", "-c"])?;
     assert_eq!(code, 0);
     assert_eq!(out.matches(nan).count(), 2, "{out:?}");
     // A string that merely holds the word is not a NaN.
