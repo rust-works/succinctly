@@ -1592,10 +1592,10 @@ fn test_jq_number_spellings_every_input_path_2877() -> Result<()> {
         ("nAn", "null"),
         ("-nan", "null"),
         ("+nan", "null"),
-        ("nan1", "null"),
-        ("nan0012", "null"),
+        ("nan0", "null"),
+        ("nan000", "null"),
         ("sNaN", "null"),
-        ("SNAN12", "null"),
+        ("SNAN0", "null"),
         ("-sNaN", "null"),
         ("inf", "1.7976931348623157e+308"),
         ("INF", "1.7976931348623157e+308"),
@@ -1844,7 +1844,7 @@ fn test_bridge_tokens_still_round_trip_computed_values_3034() -> Result<()> {
 fn test_jq_number_spellings_builtins_2877() -> Result<()> {
     for (input, filter, expected) in [
         (
-            "[SNAN,+Infinity,NaN5,-Inf,+.5e1,+1.50,-snan00]",
+            "[SNAN,+Infinity,NaN0,-Inf,+.5e1,+1.50,-snan00]",
             "., map(type)",
             "[null,1.7976931348623157e+308,null,-1.7976931348623157e+308,5,1.50,null]\n\
              [\"number\",\"number\",\"number\",\"number\",\"number\",\"number\",\"number\"]",
@@ -2061,7 +2061,7 @@ fn test_jq_number_spellings_preserve_input_echoes_verbatim_2877() -> Result<()> 
 fn test_tonumber_reads_decnumber_specials_2877() -> Result<()> {
     for (input, expected) in [
         (r#""sNaN""#, "null"),
-        (r#""nan12""#, "null"),
+        (r#""nan00""#, "null"),
         (r#""-sNaN00""#, "null"),
         (r#""NaN""#, "null"),
         (r#""Infinity""#, "1.7976931348623157e+308"),
@@ -2077,7 +2077,15 @@ fn test_tonumber_reads_decnumber_specials_2877() -> Result<()> {
     )?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim_end(), r#"["number",true]"#);
-    for input in [r#""nanx""#, r#""nan1.5""#, r#""inf1""#, r#""+-1""#] {
+    for input in [
+        r#""nanx""#,
+        r#""nan1.5""#,
+        r#""inf1""#,
+        r#""+-1""#,
+        // #7522: a payload is refused, as in jq 1.8.
+        r#""nan12""#,
+        r#""-sNaN10""#,
+    ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", "tonumber"], Some(input))?;
         assert_eq!(code, 5, "{input}: {stdout:?}");
         assert!(
