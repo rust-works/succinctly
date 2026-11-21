@@ -4761,11 +4761,12 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // member. yq keeps every occurrence, so `effective_fields`
             // degenerates to the plain walk this used to do inline.
             StandardJson::Object(fields) => {
-                let results: Vec<_> = effective_fields(&fields, S::COLLAPSE_DUPLICATE_KEYS)
-                    .into_iter()
-                    .map(|f| f.value)
-                    .collect();
-                QueryResult::Many(results)
+                // `Err` is a malformed value a repeated key shadows (#7427): a
+                // decode failure, which `?` never suppresses (#1247).
+                match effective_fields(&fields, S::COLLAPSE_DUPLICATE_KEYS) {
+                    Ok(fields) => QueryResult::Many(fields.into_iter().map(|f| f.value).collect()),
+                    Err(e) => QueryResult::Error(e),
+                }
             }
             _ => scalar_fallback(&value, optional || S::TAG == EvalTag::Yq, || {
                 EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy::<S, _>(&value))
@@ -22409,10 +22410,14 @@ fn builtin_any<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         StandardJson::Object(_) if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
         // #2658: effective values under the mode's duplicate-key rule, as
         // `any_all_f`'s object arm -- see its comment.
-        StandardJson::Object(fields) => owned_bool(any_all_over::<_, S>(
-            effective_fields(&fields, true).into_iter().map(|f| f.value),
-            true,
-        )),
+        StandardJson::Object(fields) => match effective_fields(&fields, true) {
+            Ok(fields) => owned_bool(any_all_over::<_, S>(
+                fields.into_iter().map(|f| f.value),
+                true,
+            )),
+            // A malformed value a repeated key shadows (#7427).
+            Err(e) => QueryResult::Error(e),
+        },
         _ if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
         // #1989: `scalar_fallback`, not a bare `_ if optional` + type error.
         // jq mode's wildcard also catches `String`, so an undecodable string
@@ -22453,10 +22458,14 @@ fn builtin_all<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         StandardJson::Object(_) if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
         // #2658: effective values under the mode's duplicate-key rule, as
         // `any_all_f`'s object arm -- see its comment.
-        StandardJson::Object(fields) => owned_bool(any_all_over::<_, S>(
-            effective_fields(&fields, true).into_iter().map(|f| f.value),
-            false,
-        )),
+        StandardJson::Object(fields) => match effective_fields(&fields, true) {
+            Ok(fields) => owned_bool(any_all_over::<_, S>(
+                fields.into_iter().map(|f| f.value),
+                false,
+            )),
+            // A malformed value a repeated key shadows (#7427).
+            Err(e) => QueryResult::Error(e),
+        },
         _ if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
         // #1989: same `scalar_fallback` conversion as `builtin_any` above --
         // see its comment for why the jq-mode wildcard needed one too.
@@ -22611,11 +22620,13 @@ fn any_all_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // in); the library's eager entry point always had it. `true`, not
         // `S::COLLAPSE_DUPLICATE_KEYS`: that constant governs the *keys*
         // builtins, where yq keeps every occurrence.
-        StandardJson::Object(fields) => any_all_f_over::<W, S>(
-            cond,
-            effective_fields(&fields, true).into_iter().map(|f| f.value),
-            target_truthy,
-        ),
+        StandardJson::Object(fields) => match effective_fields(&fields, true) {
+            Ok(fields) => {
+                any_all_f_over::<W, S>(cond, fields.into_iter().map(|f| f.value), target_truthy)
+            }
+            // A malformed value a repeated key shadows (#7427).
+            Err(e) => QueryResult::Error(e),
+        },
         // #1989: `scalar_fallback`, for the same reason as bare
         // `any`/`all` above -- `any(cond)`/`all(cond)` on an undecodable
         // string input reported `Cannot iterate over string ("")` (or
