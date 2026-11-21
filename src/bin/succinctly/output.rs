@@ -304,6 +304,7 @@ impl ErrorSink {
             (true, false) => 0,
         };
         self.halt = self.halt.or(Some(exit_code));
+        super::stdin_offset::note_halt();
     }
 
     /// Make a negative `halt_error` code exit as its absolute value, which jq's `-e` does
@@ -345,6 +346,7 @@ impl ErrorSink {
         match style {
             DiagStyle::Jq => {
                 let marker = if not_a_string { " (not a string)" } else { "" };
+                let message = c_string_prefix(message);
                 eprintln!("jq: error (at {at}){marker}: {message}");
             }
             // yq carries neither marker; `Error:` matches the prefix already
@@ -1921,6 +1923,16 @@ fn push_nan(scheme: &ColorScheme, result: &mut String) {
     result.push_str("null");
     result.push_str(&scheme.reset);
     result.push_str(&scheme.reset);
+}
+
+/// `message` up to its first NUL byte, as jq's own `%s` writes it (#7442).
+///
+/// jq prints an uncaught error with `fprintf(stderr, "jq: error (at %s): %s\n", ...)` over the
+/// message's C string, so the text after a NUL (`error("a\u0000b")`) is never written, in jq 1.7.1
+/// and 1.8.2 alike. The error value itself stays whole: `try error("a\u0000b") catch length` is 3.
+/// A non-string value is dumped as JSON, which escapes its NULs, and needs no cut.
+pub(crate) fn c_string_prefix(message: &str) -> &str {
+    message.split('\0').next().unwrap_or(message)
 }
 
 #[cfg(test)]

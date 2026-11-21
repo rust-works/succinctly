@@ -1340,6 +1340,21 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     }
     // patchcov: coverage end
 
+    /// jq truthiness of the value at this cursor for a filter that branches on
+    /// it (`not`, `if`, `and`, `or`, `select`, `//`, `any`, `all`), or the
+    /// error a value the index could not read raises (#7449).
+    ///
+    /// Like [`is_falsy`](Self::is_falsy) it decodes nothing: a container is
+    /// truthy whatever it holds (#2692), and a string is truthy whatever its
+    /// escapes spell (#5308). Only a token the index already classified as
+    /// unreadable (`tru`, `nulll`, `1.2.3`, #3035/#3222) has no truthiness, as
+    /// it has no `type`: `nul` is not `null`, so neither answer would be jq's.
+    /// The default is `is_falsy`'s answer, for a format whose index never
+    /// presents such a token.
+    fn truthiness(&self) -> Result<bool, EvalError> {
+        Ok(!self.is_falsy())
+    }
+
     /// Whether [`stream_yaml_as_document`](Self::stream_yaml_as_document) writes this cursor as
     /// only the verbatim header the first document carries, so that header's own line break
     /// already ends the output and the caller's per-result terminator must not follow (#5721).

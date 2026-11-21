@@ -3,7 +3,9 @@
 //! `$x != 0` per level; `if $by > 0 then $from | while(. < $upto; . + $by) elif $by < 0 ...`), and two
 //! number literals compare exactly as decimals there, so a literal too small for a double
 //! (`1e-1000`, `-1e-400`) is not zero, and `range`'s first `$from < $upto` can tell apart two
-//! literals whose doubles tie. Every row was captured from jq 1.7.1.
+//! literals whose doubles tie. Every row was captured from jq 1.7.1, except the three a program's
+//! `-1e-400` reaches: since #7453 it is the literal `-1E-400`, as jq 1.8 negates a literal
+//! (jqlang/jq#3242), so it is below zero there too; those rows are jq 1.8.2's.
 
 use anyhow::Result;
 
@@ -23,7 +25,6 @@ const ROWS: &[(Option<&str>, &str, &str)] = &[
     ),
     (None, "[[[[1]]]] | flatten(1e-1000)", "[1]\n"),
     (None, "[[[[1]]]] | flatten(0e5)", "[[[[1]]]]\n"),
-    (None, "[[[[1]]]] | flatten(-1e-400)", "[[[[1]]]]\n"),
     (None, "[[[[1]]]] | flatten(1.5)", "[1]\n"),
     (None, "[[[[1]]]] | flatten(2)", "[[1]]\n"),
     (None, "[[[[1]]]] | flatten(1e-1000 * 1)", "[[[[1]]]]\n"),
@@ -46,8 +47,9 @@ const ROWS: &[(Option<&str>, &str, &str)] = &[
     (None, "first(range(5; 6; 1e-1000))", "5\n"),
     (None, "[range(0; 1e-1000; 1)]", "[0]\n"),
     (None, "[range(1e-1000; 0; -1)]", "[1E-1000]\n"),
-    (None, "[range(-1e-400; 0; 1)]", "[]\n"),
-    (None, "[range(0; -1e-400; -1)]", "[]\n"),
+    // jq 1.7.1: `[]` for both (`-1e-400` was a computed zero).
+    (None, "[range(-1e-400; 0; 1)]", "[-1E-400]\n"),
+    (None, "[range(0; -1e-400; -1)]", "[0]\n"),
     (None, "[range(0.1; 0.10000000000000000001; 1)]", "[0.1]\n"),
     (
         None,
@@ -111,6 +113,12 @@ const ERRORS: &[(Option<&str>, &str, &str)] = &[
     (
         None,
         "[[[[1]]]] | flatten(-0.5)",
+        "flatten depth must not be negative",
+    ),
+    // A literal below zero since #7453, as in jq 1.8.2 (jq 1.7.1: `[[[[1]]]]`).
+    (
+        None,
+        "[[[[1]]]] | flatten(-1e-400)",
         "flatten depth must not be negative",
     ),
 ];

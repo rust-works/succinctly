@@ -186,7 +186,8 @@ fn test_fold_compound_store_over_a_null_state_keeps_the_element_5761() -> Result
             "1",
         ),
         // Scalars, literals and operands that raise or yield several values are unchanged.
-        ("reduce (-0) as $v (null; . += $v)", "-0"),
+        // A program's `-0` is the literal `0` since #7453, as in jq 1.8.2 (jq 1.7.1: `-0`).
+        ("reduce (-0) as $v (null; . += $v)", "0"),
         (
             "reduce (100000000000000000000000000) as $v (null; . //= $v)",
             "100000000000000000000000000",

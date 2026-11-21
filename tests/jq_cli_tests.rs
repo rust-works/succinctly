@@ -2614,10 +2614,11 @@ fn test_negative_filter_program_accepted_without_dashdash_3389() -> Result<()> {
     // A genuine unknown flag must keep erroring, never silently become the
     // filter -- this is the reason `allow_hyphen_values` alone isn't the
     // fix (it can't tell `-x` apart from `-1`, both being "hyphen values").
+    // It is jq's own refusal since #7438.
     let (stdout, stderr, code) = run_jq_full(&["-c", "-x"], Some("[1]"))?;
-    assert_ne!(code, 0, "stdout: {stdout:?}");
+    assert_eq!((stdout.as_str(), code), ("", 2));
     assert!(
-        stderr.contains("unexpected argument") || stderr.contains("unrecognized"),
+        stderr.starts_with("jq: Unknown option -x\n"),
         "stderr: {stderr:?}"
     );
 
@@ -2697,14 +2698,14 @@ fn test_negative_filter_boundary_characters_3389() -> Result<()> {
         "stderr: {stderr:?}"
     );
 
-    // Still rejected: second character is a letter or another `-`, so
-    // clap's own short-flag-bundle parsing (or long-flag matching) is
-    // exactly right here and must be left alone.
-    for filter in ["-x", "-n1", "--bogus"] {
+    // Still rejected: second character is a letter or another `-`, so the
+    // word is an option, and jq names the first letter it does not define
+    // (jq 1.8.2's in-order bundle parser, #7438).
+    for (filter, named) in [("-x", "-x"), ("-n1", "-1"), ("--bogus", "--bogus")] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("null"))?;
-        assert_ne!(code, 0, "`{filter}`: stdout={stdout:?}");
+        assert_eq!((stdout.as_str(), code), ("", 2), "`{filter}`");
         assert!(
-            stderr.contains("unexpected argument"),
+            stderr.starts_with(&format!("jq: Unknown option {named}\n")),
             "`{filter}`: stderr={stderr:?}"
         );
     }
@@ -2726,10 +2727,9 @@ fn test_negative_filter_unary_minus_as_binding_matches_jq_3397() -> Result<()> {
 }
 
 /// #3389's fix has two call sites: `succinctly jq`'s own subcommand
-/// dispatch (`parse_cli_allowing_negative_filter`, exercised by every test
-/// above) and the `sjq`/`jq` multi-call alias dispatch
-/// (`parse_allowing_negative_filter`, reached only when argv[0]'s file name
-/// is `sjq` or `jq` -- `try_multicall`). A symlink named `sjq` pointing at
+/// dispatch (exercised by every test above) and the `sjq`/`jq` multi-call
+/// alias dispatch (reached only when argv[0]'s file name is `sjq` or `jq` --
+/// `try_multicall`); both read argv through `walk_jq_argv` since #7438. A symlink named `sjq` pointing at
 /// the built binary reproduces that argv[0] the same way
 /// `install-aliases` does for real users.
 #[test]
@@ -2775,8 +2775,11 @@ fn test_negative_filter_accepted_via_sjq_multicall_alias_3389() -> Result<()> {
         Some(b"[1]"),
     )?;
     let stderr = String::from_utf8(output.stderr)?;
-    assert_ne!(code, 0);
-    assert!(stderr.contains("unexpected argument"), "stderr: {stderr:?}");
+    assert_eq!(code, 2);
+    assert!(
+        stderr.starts_with("jq: Unknown option -x\n"),
+        "stderr: {stderr:?}"
+    );
     Ok(())
 }
 
@@ -4219,6 +4222,24 @@ fn test_select_passes_through_corruption_it_only_tests_1645_2692() -> Result<()>
     ];
 
     for (label, doc, tests_only, materializes, now_answers, want_stderr) in cases {
+        // #7449: a token the index could not read (`xyz123`), tested directly,
+        // has no truthiness, so testing it reads it: every filter here
+        // raises. A string with a bad escape is still truthy whatever its
+        // escapes spell (#5308), and a container whatever it holds (#2692).
+        if *label == "structural error, tested directly" {
+            for filter in [*tests_only, *materializes, *now_answers] {
+                let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+                assert_eq!(
+                    code, 5,
+                    "[{label}] `{filter}` reads the token and must raise\nstdout: {stdout:?}"
+                );
+                assert!(
+                    names_fault(&stderr, want_stderr),
+                    "[{label}] `{filter}`: stderr {stderr:?} lacks {want_stderr:?}"
+                );
+            }
+            continue;
+        }
         let (stdout, stderr, code) = run_jq_full(&["-c", tests_only], Some(doc))?;
         assert_eq!(
             code, 0,
@@ -4454,14 +4475,28 @@ fn test_select_and_materialize_agree_on_corruption_1645() -> Result<()> {
             doc,
             r#"["bad"]"#,
         );
-        assert_jq_answers(
-            label,
-            "select(.bad) | .keep",
-            &["-c"],
-            "select(.bad) | .keep",
-            doc,
-            "5",
-        );
+        // #7449: except where `.bad` *is* the malformed token -- a token the
+        // index could not read has no truthiness, so testing it reads it.
+        if label == "structural error, top level" {
+            assert_jq_raises(
+                label,
+                "select(.bad) | .keep",
+                &["-c"],
+                "select(.bad) | .keep",
+                doc,
+                5,
+                expect_stderr,
+            );
+        } else {
+            assert_jq_answers(
+                label,
+                "select(.bad) | .keep",
+                &["-c"],
+                "select(.bad) | .keep",
+                doc,
+                "5",
+            );
+        }
     }
     Ok(())
 }
@@ -4693,7 +4728,14 @@ proptest! {
         // reached a shape the hand-written tests did not. `select`'s row is
         // here to do the same job for #2692's move.
         assert_jq_answers(&label, "path(.bad)", &["-c"], "path(.bad)", &doc, r#"["bad"]"#);
-        assert_jq_answers(&label, "select(.bad) | .keep", &["-c"], "select(.bad) | .keep", &doc, "5");
+        // #7449: except at depth 0 of a structural error, where `.bad` *is*
+        // the token the index could not read: it has no truthiness, so
+        // testing it reads it.
+        if path.is_empty() && matches!(malformation, FuzzMalformation::StructuralError) {
+            assert_jq_raises(&label, "select(.bad) | .keep", &["-c"], "select(.bad) | .keep", &doc, 5, expect_stderr);
+        } else {
+            assert_jq_answers(&label, "select(.bad) | .keep", &["-c"], "select(.bad) | .keep", &doc, "5");
+        }
     }
 }
 
@@ -9156,8 +9198,14 @@ fn test_range_int_from_keeps_negative_zero_literal_spelling_3103() -> Result<()>
     // `-0` is the one integer spelling that diverges from its own canonical
     // `i64` print (no leading zeros/`+`/underscores are legal JSON/jq number
     // syntax otherwise, so this is the sole int-side case #3103 also covers).
-    // jq 1.7.1: `[range(-0;3)]` => `[-0,1,2]`, not `[0,1,2]`.
+    // jq 1.7.1: `[range(-0;3)]` => `[-0,1,2]`, not `[0,1,2]`. Since #7453 a
+    // program's `-0` is jq 1.8's negation of the literal `0`, which is `0`
+    // (jqlang/jq#3242), so the spelling that still carries the sign is a
+    // document `-0`.
     let (output, code) = run_jq_null("[range(-0; 3)]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[0,1,2]");
+    let (output, code) = run_jq_stdin("[range(.; 3)]", "-0", &["-c"])?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), "[-0,1,2]");
     Ok(())
@@ -42261,12 +42309,11 @@ fn test_jq_raw_input_line_number_unterminated_single_file_1809() -> Result<()> {
 /// `numeric_key_to_index` and emit a bare integer. Every expectation here is
 /// pinned jq 1.7.1's own output.
 ///
-/// The `path(.[-1.0])` → `[-1]` case is not an index-specific asymmetry, and
-/// is here to keep anyone from "fixing" it into `[-1.0]`: jq's unary minus
-/// destroys number-literal preservation (`jq -n '-1.0'` is already `-1`), so
-/// the negated key is a plain double before indexing happens at all. The
-/// `from-data` case is the control that proves it — a negative float that
-/// never passes through unary minus *does* keep its spelling.
+/// The negated keys follow jq 1.8.2 since #7453: jq 1.8's unary minus keeps a
+/// literal a literal (jqlang/jq#3242), so `path(.[-1.0])` is `[-1.0]`, where
+/// jq 1.7.1 turned the key into a double first (`[-1]`). The `from-data` case
+/// is the control: a negative float that never passes through unary minus
+/// keeps its spelling in both versions.
 #[test]
 fn test_1088_path_reports_float_index_as_written() {
     let arr = Some("[1,2,3,4,5]");
@@ -42280,11 +42327,11 @@ fn test_1088_path_reports_float_index_as_written() {
         // An integer-spelled key is unchanged — nothing to preserve.
         ("path(.[2])", "[2]\n"),
         ("path(.[-1])", "[-1]\n"),
-        // Negated literals: jq's own unary minus already collapsed them.
-        ("path(.[-1.0])", "[-1]\n"),
+        // Negated literals keep their spelling, as in jq 1.8.2 (#7453).
+        ("path(.[-1.0])", "[-1.0]\n"),
         ("path(.[-2.5])", "[-2.5]\n"),
-        ("path(.[-1e10])", "[-10000000000]\n"),
-        ("path(.[-0.0])", "[-0]\n"),
+        ("path(.[-1e10])", "[-1E+10]\n"),
+        ("path(.[-0.0])", "[0.0]\n"),
         // A dynamic key resolves through `key_to_path_component`, not the
         // parser's constant fold — both had to be fixed.
         ("(2.0) as $x | path(.[$x])", "[2.0]\n"),
@@ -48306,17 +48353,23 @@ fn test_decode_failure_not_caught_by_try_catch_1620() {
 /// `eval_generic.rs` bridge (`bridge_to_full_evaluator`/
 /// `bridge_to_each_owned_flow`) materializes the input one layer before any
 /// of `in`/`IN`/`contains`'s own `eval.rs` argument-vs-input ordering can
-/// run, so all three raise the identical decode failure from `succinctly
-/// jq` -- including `contains`, whose #1800 deferral only wins on the
-/// library route (see `test_contains_defers_past_decode_failure_unlike_in_2202`
-/// in `src/jq/eval.rs`).
+/// run, so these raise the identical decode failure from `succinctly
+/// jq`. `contains(error("boom"), 1)` is no longer one of them since #7474: its
+/// generator argument is bound first (`(error("boom"), 1) as $v | contains($v)`),
+/// so it raises `boom` as that spelling always did and as the library route's
+/// #1800 deferral does (`test_contains_defers_past_decode_failure_unlike_in_2202`
+/// in `src/jq/eval.rs`). jq has no answer for either: it rejects the document.
 #[test]
 fn test_in_upper_in_contains_all_raise_decode_failure_from_cli_2202() {
     let doc = r#""\ud800""#;
+    let (_, stderr, code) = run_jq_full(&["-c", r#"contains(error("boom"), 1)"#], Some(doc))
+        .unwrap_or_else(|e| panic!("contains failed to run: {e}"));
+    assert_eq!(code, 5, "stderr: {stderr}");
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
     for filter in [
         r#"in(error("boom"), {"a":1})"#,
         r#"IN(error("boom"), {"a":1})"#,
-        r#"contains(error("boom"), 1)"#,
+        "contains(1)",
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))
             .unwrap_or_else(|e| panic!("`{filter}` failed to run: {e}"));
@@ -52057,7 +52110,10 @@ fn test_todate_non_number_matches_strftime_wording_3068() -> Result<()> {
 /// keeps its own literal spelling instead of being recomputed through
 /// `f64`, and `null`/`false`/`true` (which sort *below* every number) raise
 /// through `-.`'s own "cannot be negated" error. Every row confirmed live
-/// against jq 1.7.1.
+/// against jq 1.7.1, except a negative literal's `abs`: since #7453 `-.`
+/// keeps a literal a literal, as jq 1.8 does (jqlang/jq#3242), so
+/// `(-1.50) | abs` is `1.50` and `(-0.0) | abs` is `0.0` (jq 1.7.1: `1.5`,
+/// `-0`), as in jq 1.8.2.
 #[test]
 fn test_abs_matches_jq_total_ordering_semantics_3041() -> Result<()> {
     for (filter, want) in [
@@ -52065,10 +52121,10 @@ fn test_abs_matches_jq_total_ordering_semantics_3041() -> Result<()> {
         ("[1,2] | abs", "[1,2]"),
         ("{} | abs", "{}"),
         ("1.50 | abs", "1.50"),
-        ("(-1.50) | abs", "1.5"),
+        ("(-1.50) | abs", "1.50"),
         ("(-1) | abs", "1"),
         ("0 | abs", "0"),
-        ("(-0.0) | abs", "-0"),
+        ("(-0.0) | abs", "0.0"),
         ("nan | abs", "null"),
         ("infinite | abs", "1.7976931348623157e+308"),
     ] {
@@ -68494,19 +68550,26 @@ fn test_range_i64_overflow_keeps_exact_prefix_2219() -> Result<()> {
 /// consistent exception. Fixed by routing a literal-adjacent `-` through
 /// the same `-1 * <literal>` split the float/exponent case already used
 /// (`parser.rs`) and closing the same gap in `arith_negate` for the
-/// parenthesized/piped spellings (`eval.rs`). `-1.10` is the
-/// magnitude-specific control: below `2^53`, `double` holds the value
-/// exactly either way, so this was never observable there.
+/// parenthesized/piped spellings (`eval.rs`).
+///
+/// #7453 superseded that with jq 1.8's rule, which upstream fixed as a bug
+/// (jqlang/jq#3242, jqlang/jq#2704): unary minus negates a literal to a
+/// literal, so every literal row below keeps its digits, and only a
+/// computed operand rounds.
 #[test]
 fn test_unary_minus_matches_jq_past_2_53_3044() -> Result<()> {
     for (filter, want) in [
-        ("-9223372036854775758", "-9223372036854776000"),
-        ("-9007199254740993", "-9007199254740992"),
-        ("-(9223372036854775758)", "-9223372036854776000"),
-        ("9223372036854775758 | -.", "-9223372036854776000"),
-        ("-9223372036854775808", "-9223372036854776000"), // i64::MIN
-        ("-1.10", "-1.1"),
-        ("-123", "-123"), // below 2^53: unaffected, still exact
+        // #7453: a negated literal keeps every digit, as in jq 1.8.2; jq
+        // 1.7.1 answers `-9223372036854776000`, `-9007199254740992` and `-1.1`.
+        ("-9223372036854775758", "-9223372036854775758"),
+        ("-9007199254740993", "-9007199254740993"),
+        ("-(9223372036854775758)", "-9223372036854775758"),
+        ("9223372036854775758 | -.", "-9223372036854775758"),
+        ("-9223372036854775808", "-9223372036854775808"), // i64::MIN
+        ("-1.10", "-1.10"),
+        ("-123", "-123"),
+        // A computed operand still negates as a double.
+        ("-(9223372036854775758 + 0)", "-9223372036854776000"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-nc", "--", filter], None)?;
         assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
@@ -68530,19 +68593,22 @@ fn test_unary_minus_matches_jq_past_2_53_3044() -> Result<()> {
 /// or slice bound kept the divergence
 /// `test_unary_minus_matches_jq_past_2_53_3044` just closed for every other
 /// spelling -- `path(.[-869389897822472004])` stayed `[-869389897822472004]`
-/// where jq gives `[-869389897822472000]`. A magnitude within range
-/// (`.[-1]`) must keep folding exactly, unaffected.
+/// where jq 1.7.1 gives `[-869389897822472000]`. A magnitude within range
+/// (`.[-1]`) must keep folding exactly, unaffected. Since #7453 the jq 1.8.2
+/// answer is the pin: a negated literal keeps its digits (jqlang/jq#3242).
 #[test]
 fn test_unary_minus_matches_jq_in_index_and_slice_bounds_3044() -> Result<()> {
     for (filter, want) in [
-        ("path(.[-869389897822472004])", "[-869389897822472000]"),
+        // #7453: the negated literal keeps its digits, as in jq 1.8.2 (jq
+        // 1.7.1: `-869389897822472000`).
+        ("path(.[-869389897822472004])", "[-869389897822472004]"),
         (
             "path(.[-869389897822472004:])",
-            r#"[{"start":-869389897822472000,"end":null}]"#,
+            r#"[{"start":-869389897822472004,"end":null}]"#,
         ),
         (
             "path(.[:-869389897822472004])",
-            r#"[{"start":null,"end":-869389897822472000}]"#,
+            r#"[{"start":null,"end":-869389897822472004}]"#,
         ),
         ("[1,2,3] | .[-1]", "3"),
         ("path(.[-123])", "[-123]"),
@@ -98762,13 +98828,15 @@ fn test_any_all_no_longer_reject_a_malformed_array_2692() -> Result<()> {
 /// `null` roots, where `any`/`all` raise a *type* error of their own; and its
 /// object rows reach `any`/`all`'s own object arm, which is the one place
 /// these builtins genuinely read rather than test. Every row here is
-/// therefore a container, and every row but one answers.
+/// therefore a container, and every row but two answers.
 ///
 /// The exception is the point of the test. `{123: 1}` still raises, because
 /// jq iterates an *object's values* (#422) under its own last-occurrence
 /// duplicate-key rule, so `effective_fields_checked` has to resolve the keys
-/// -- and resolving a key reads it. Every array row answers, because scanning
-/// elements for truthiness reads none of them. That is the whole of #2692's
+/// -- and resolving a key reads it. Every other array row answers, because
+/// scanning elements for truthiness reads none of them; `[xyz123]` raises,
+/// because an element the index could not read has no truthiness (#7449).
+/// That is the whole of #2692's
 /// rule applied inside a single builtin, which is why it is worth pinning
 /// here rather than only in the arm's own focused test.
 ///
@@ -98782,7 +98850,9 @@ fn test_any_all_validate_only_the_keys_they_resolve_2476_2692() -> Result<()> {
         // The one raising row: an object, so the keys are resolved.
         ("#1194 non-string key", "{123: 1}", 5),
         ("decode failure, in array", r#"["\x"]"#, 0),
-        ("structural error, in array", "[xyz123]", 0),
+        // #7449: an element the index could not read has no truthiness, so
+        // scanning for it reads it.
+        ("structural error, in array", "[xyz123]", 5),
         (
             "#1642 colliding undecodable keys",
             r#"{"\ud800":1,"\ud800":2}"#,
@@ -110542,7 +110612,8 @@ fn test_float_literal_rounding_reaches_every_reader_2936() -> Result<()> {
         ("2.7293109604053567083 | sqrt", "1.6520626381603563"),
         ("2.7293109604053567083 | length", "2.7293109604053565"),
         ("2.7293109604053567083 | fabs", "2.7293109604053565"),
-        ("2.7293109604053567083 | -.", "-2.7293109604053565"),
+        // `-.` keeps a literal a literal since #7453, as in jq 1.8.2 (jq 1.7.1 rounded it).
+        ("2.7293109604053567083 | -.", "-2.7293109604053567083"),
         ("2.7293109604053567083 * 1", "2.7293109604053565"),
         // the overflow boundary: 17 digits round *down* to DBL_MAX
         ("1.797693134862315808e308 | isinfinite", "false"),
@@ -110740,10 +110811,11 @@ fn test_large_int_literal_rounds_to_17_digits_from_input_sources_2906() -> Resul
 /// #2906 must-not-regress companion: a literal that is only *displayed*
 /// keeps its exact spelling, 17-or-fewer-digit literals are unchanged (the
 /// rounding is the identity below 10^17), genuine `i64` overflow still goes
-/// through the pre-existing float path, and (#3044, superseding the former
-/// #2357 divergence this row used to pin the opposite way) a negative
-/// literal past `2^53` now rounds the same as every other operator. jq's
-/// answers captured live against `/usr/bin/jq` 1.7.1 except where noted.
+/// through the pre-existing float path, and a negative literal past `2^53`
+/// keeps its digits: jq 1.8 negates a literal to a literal (jqlang/jq#3242),
+/// which `succinctly jq` follows since #7453 (#3044 had rounded it as jq
+/// 1.7.1 does). jq's answers captured live against `/usr/bin/jq` 1.7.1,
+/// except that row, which is jq 1.8.2's.
 #[test]
 fn test_large_int_literal_rounding_leaves_display_and_small_ints_alone_2906() -> Result<()> {
     for (filter, want) in [
@@ -110758,7 +110830,7 @@ fn test_large_int_literal_rounding_leaves_display_and_small_ints_alone_2906() ->
             "9223372036854775807 + 9223372036854775807",
             "18446744073709552000",
         ),
-        ("0 | -869389897822472004", "-869389897822472000"),
+        ("0 | -869389897822472004", "-869389897822472004"),
     ] {
         let (output, code) = run_jq_null(filter, &["-c"])?;
         assert_eq!(code, 0, "`{filter}`");
@@ -113695,6 +113767,13 @@ fn test_malformed_number_route_sweep_3222() -> Result<()> {
         "try (.[0] | .x) catch \"caught\"",
         "try (.[0] | type) catch \"caught\"",
         "[.[] | tostring?]",
+        // #7449: branching on the value reads it.
+        ".[0] | not",
+        ".[0] | if . then 1 else 2 end",
+        ".[0] | . and true",
+        ".[0] | select(.) | 1",
+        "[.[] | select(.)] | length",
+        ".[0] | (. // 1) | 2",
     ];
     for doc in ["[1.2.3,2]", "[1ee5,2]", "[9e999e999,2]", "[+1.2.3,2]"] {
         for filter in READERS {
@@ -113715,12 +113794,6 @@ fn test_malformed_number_route_sweep_3222() -> Result<()> {
         "length",
         "keys",
         "[paths]",
-        ".[0] | not",
-        ".[0] | if . then 1 else 2 end",
-        ".[0] | . and true",
-        ".[0] | select(.) | 1",
-        "[.[] | select(.)] | length",
-        ".[0] | (. // 1) | 2",
         ".[0] | [.] | length",
         ".[0] | path(.)",
         ".[0] | empty",
@@ -114067,7 +114140,8 @@ fn test_unreadable_value_collection_split_3266() -> Result<()> {
         ),
         (&["-c"], "[1.2.3]", ".[0] | path(.)", "[]\n", 0),
         (&["-c"], "[tru]", ".[0] | [paths]", "[]\n", 0),
-        (&["-c"], "[1.2.3]", ".[0] | getpath([]) | not", "false\n", 0),
+        // #7449: branching on the value reads it.
+        (&["-c"], "[1.2.3]", ".[0] | getpath([]) | not", "", 5),
         (&["-c"], OBJ, ".[0] | path(.a)", "[\"a\"]\n", 0),
         (&["-c"], OBJ, ".[0] | [paths] | length", "2\n", 0),
         (
@@ -114188,7 +114262,8 @@ fn test_unreadable_value_collection_split_3266() -> Result<()> {
             "1\n",
             0,
         ),
-        (&["-c"], OBJ, ".[0] | [.b // 1] | length", "1\n", 0),
+        // #7449: `//` branches on `.b`, so it reads it.
+        (&["-c"], OBJ, ".[0] | [.b // 1] | length", "", 5),
         (&["-c"], OBJ, ".[0] | [try .b] | length", "1\n", 0),
         (&["-c"], OBJ, ".[0] | path(.a), input_line_number", "", 5),
         // #2847: `-s` is the default route's own reads over one more array
@@ -125744,7 +125819,9 @@ const AS_BINDING_GUARD_ROWS_3397: &[(&str, &str, &str, i32)] = &[
     (r"[4]", r"[1 and 2 as $x | $x]", "[true]\n", 0),
     (r"[4]", r"1 == 1 as $x | $x", "true\n", 0),
     (r"[4]", r"-reduce (1,2) as $i (0; .+$i) as $z | $z", "", 3),
-    (r"[4]", r"[-1e2 as $x | $x]", "[-100]\n", 0),
+    // `-(1e2 as $x | $x)`: the negated literal keeps its spelling since #7453, as in jq 1.8.2
+    // (jq 1.7.1: `[-100]`).
+    (r"[4]", r"[-1e2 as $x | $x]", "[-1E+2]\n", 0),
     (r"[4]", r"[.[-1] as $x | $x]", "[4]\n", 0),
     (r"[4]", r"[.[] as $x | $x * 2]", "[8]\n", 0),
     (r"[4]", r"[reduce .[] as $x (0; . + $x)]", "[4]\n", 0),
