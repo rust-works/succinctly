@@ -1805,6 +1805,22 @@ impl FuncDefData {
         };
         memo(slot, || classify(&self.body))
     }
+
+    /// Whether this definition's body settles when its own recursive calls and bare parameters are
+    /// taken to, computing it with `classify` on the first call, for jq (`jq`) or yq mode (#7460):
+    /// the half of `tail_call::call_head_settles` that is a property of the definition.
+    pub(crate) fn call_settles_or_init(
+        &self,
+        jq: bool,
+        classify: impl FnOnce(&Expr) -> bool,
+    ) -> bool {
+        let slot = if jq {
+            &self.tail.call_jq
+        } else {
+            &self.tail.call_yq
+        };
+        memo(slot, || classify(&self.body))
+    }
 }
 
 /// Deliberately leaves out the remembered answer (the trailing `..`), so a
@@ -1839,6 +1855,10 @@ struct TailMemo {
     yq: core::cell::Cell<Option<bool>>,
     settles_jq: core::cell::Cell<Option<bool>>,
     settles_yq: core::cell::Cell<Option<bool>>,
+    /// Whether the body settles with the definition's own calls and bare parameters taken to
+    /// (`tail_call::call_head_settles`, #7460), in jq and yq mode.
+    call_jq: core::cell::Cell<Option<bool>>,
+    call_yq: core::cell::Cell<Option<bool>>,
 }
 
 impl Clone for TailMemo {
@@ -4257,8 +4277,12 @@ impl Builtin {
             return self.value_arg_mut().into_iter().collect();
         }
         match self {
-            // `format/1` is C-coded; `nth/1` is `def nth($n): .[$n];`.
-            Self::FormatNamed(arg) | Self::Nth(arg) => alloc::vec![&mut **arg],
+            // `format/1` and `halt_error/1` (#7558) are C-coded; `nth/1` is `def nth($n):
+            // .[$n];`. `in(xs)` binds its input before `xs` runs, so the parser spells it out
+            // when `xs` holds a `?//` (`parser::retry_collected_arg`).
+            Self::FormatNamed(arg) | Self::Nth(arg) | Self::HaltErrorCode(arg) => {
+                alloc::vec![&mut **arg]
+            }
             Self::SetPath(path, value) => alloc::vec![&mut **value, &mut **path],
             Self::Pow(a, b) | Self::Atan2(a, b) | Self::Libm2(_, a, b) => {
                 alloc::vec![&mut **b, &mut **a]
