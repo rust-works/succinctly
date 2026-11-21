@@ -15,7 +15,11 @@
 //! (`let _ = writeln!(std::io::stderr(), ...)`).
 //!
 //! The panic hook is not changed: the standard library's own hook already ignores a failed write
-//! of the panic message, so a panic on a dead standard error is still exit 101, not an abort.
+//! of the panic message, so a panic on a dead standard error is still exit 101, not an abort. Nor is
+//! `src/main.rs`, which the shadow does not reach (it is the binary's own crate): the `Error: ...`
+//! report of an error it returns is printed by the standard `Termination` impl, which ignores a
+//! failed write since Rust 1.85 (below the crate's MSRV), and the scan below fails on any `eprint`
+//! there.
 
 /// `eprint!` that ignores a failed write, as jq ignores `fprintf(stderr, ...)`.
 macro_rules! eprint {
@@ -80,7 +84,9 @@ mod tests {
         let cli = root.join("src/bin/succinctly");
         let mut files = Vec::new();
         rust_files(&cli, &mut files);
-        files.push(root.join("src/main.rs"));
+        // The binary's own crate: the shadow does not reach it, so any `eprint` there is std's.
+        let binary_root = root.join("src/main.rs");
+        files.push(binary_root.clone());
         let this_file = cli.join("diag.rs");
 
         let mut offenders = Vec::new();
@@ -88,12 +94,15 @@ mod tests {
             if *file == this_file {
                 continue;
             }
+            let needles: &[&str] = if *file == binary_root {
+                &["eprint", "dbg!("]
+            } else {
+                &["std::eprint", "dbg!("]
+            };
             let text = std::fs::read_to_string(file).expect("readable source file");
             for (number, line) in text.lines().enumerate() {
                 let code = code_of(line);
-                let bypasses_the_shadow = ["std::eprint", "::std::eprint", "dbg!("]
-                    .iter()
-                    .any(|needle| code.contains(needle));
+                let bypasses_the_shadow = needles.iter().any(|needle| code.contains(needle));
                 if bypasses_the_shadow {
                     offenders.push(format!(
                         "{}:{}: {}",
