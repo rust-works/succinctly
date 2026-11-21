@@ -30,7 +30,7 @@ fn a_path_element_after_a_dot_takes_non_ascii_letters_7433() -> Result<()> {
 #[test]
 fn every_other_spelling_of_a_non_ascii_name_is_refused_7433() -> Result<()> {
     for filter in [
-        "{é:1}",
+        "{ é:1}",
         "def é: 1; é",
         ". as $é | $é",
         ".a as $é | 1",
