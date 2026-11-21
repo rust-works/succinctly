@@ -273,18 +273,23 @@ unsafe fn min_max_sse2(bytes: &[u8]) -> (u8, u8, usize) {
 #[target_feature(enable = "neon")]
 unsafe fn min_max_neon(bytes: &[u8]) -> (u8, u8, usize) {
     let load = |p: *const u8| vld1q_u8(p);
-    let n = bytes.len();
-    if n < 64 {
+    let len = bytes.len();
+    if len < 64 {
         return (u8::MAX, 0, 0);
     }
-    let p = bytes.as_ptr();
-    let (mut lo, mut hi) = (load(p), load(p));
+    let base = bytes.as_ptr();
+    let (mut lo, mut hi) = (load(base), load(base));
     let mut at = 0;
-    while at + 64 <= n {
-        let q = p.add(at);
-        let (a, b, c, d) = (load(q), load(q.add(16)), load(q.add(32)), load(q.add(48)));
-        lo = vminq_u8(lo, vminq_u8(vminq_u8(a, b), vminq_u8(c, d)));
-        hi = vmaxq_u8(hi, vmaxq_u8(vmaxq_u8(a, b), vmaxq_u8(c, d)));
+    while at + 64 <= len {
+        let step = base.add(at);
+        let v = [
+            load(step),
+            load(step.add(16)),
+            load(step.add(32)),
+            load(step.add(48)),
+        ];
+        lo = vminq_u8(lo, vminq_u8(vminq_u8(v[0], v[1]), vminq_u8(v[2], v[3])));
+        hi = vmaxq_u8(hi, vmaxq_u8(vmaxq_u8(v[0], v[1]), vmaxq_u8(v[2], v[3])));
         at += 64;
     }
     (vminvq_u8(lo), vmaxvq_u8(hi), at)

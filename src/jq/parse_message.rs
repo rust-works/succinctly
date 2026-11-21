@@ -170,7 +170,7 @@ const SCAN_PIECE: usize = 128 * 1024;
 /// bigger than the cache it read them from memory again (+1.8-3.1% wall clock on whole-file 100 MB
 /// rows on a Ryzen 9 7950X), and on an Apple M4 Pro even a search of each piece the validation had
 /// just read cost +1.5-2.6%. So each piece of the text is read once for its smallest and largest
-/// byte ([`min_max`](crate::util::simd::nul::min_max)): the smallest is 0 where it holds a NUL, and
+/// byte (`util::simd::nul::min_max`): the smallest is 0 where it holds a NUL, and
 /// a largest under 0x80 is ASCII, which is UTF-8 with no further check. Only a piece with a byte
 /// past 0x7F is validated, while it is still in the cache.
 ///
