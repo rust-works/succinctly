@@ -155,7 +155,15 @@ fn test_def_with_more_than_4095_parameters_7527() -> Result<()> {
         let names: Vec<String> = (0..params).map(|i| format!("a{i}")).collect();
         let args: Vec<String> = (0..params).map(|i| i.to_string()).collect();
         let program = format!("def f({}): .; f({})", names.join(";"), args.join(";"));
-        assert_eq!(answer(&program)?, "null\n", "{params} parameters");
+        // The 20,000-parameter program is about 230 KB, over Linux's 128 KiB limit on one argv
+        // word (`MAX_ARG_STRLEN`), so every row goes through a program file.
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("params.jq");
+        std::fs::write(&path, &program)?;
+        let path = path.to_str().expect("a UTF-8 temp path");
+        let (stdout, stderr, code) = run_jq_full(&["-nc", "-f", path], None)?;
+        assert_eq!(code, 0, "{params} parameters: {stderr}");
+        assert_eq!(stdout, "null\n", "{params} parameters");
     }
     Ok(())
 }
