@@ -6082,8 +6082,8 @@ impl<V: DocumentValue> Iterator for LazySeq<V> {
             // (#2913). Only the `Cursors` constructors build such a sequence
             // (a directly printed `[.[]]` #2575, the reordering builtins
             // #1687); `map(.)` pushes an identity stage and does not qualify.
-            // `map_or(true, ..)` rather than `is_none_or`: the crate's MSRV
-            // is 1.73 and `Option::is_none_or` is stable since 1.82.
+            // `map_or(true, ..)` rather than `is_none_or`: clippy's `msrv`
+            // (clippy.toml) is 1.73 and `Option::is_none_or` is stable since 1.82.
             if self.instructions.as_deref().map_or(true, Vec::is_empty) {
                 return Some(Ok(elem));
             }
@@ -30238,8 +30238,8 @@ fn is_pure_slice_operand(expr: &Expr) -> bool {
 fn is_pure_fusable_slice(slice: &Expr) -> bool {
     match slice {
         Expr::SliceExpr { target, start, end } => {
-            // `map_or(true, ..)` rather than `is_none_or`: the crate's MSRV is 1.73 and
-            // `Option::is_none_or` is stable since 1.82.
+            // `map_or(true, ..)` rather than `is_none_or`: clippy's `msrv` (clippy.toml) is 1.73
+            // and `Option::is_none_or` is stable since 1.82.
             let pure_bound =
                 |bound: &Option<Box<Expr>>| bound.as_deref().map_or(true, is_pure_slice_operand);
             is_pure_slice_operand(target) && pure_bound(start) && pure_bound(end)
@@ -32252,7 +32252,7 @@ fn extremum_by_streaming_generic<S: EvalSemantics, V: DocumentValue>(
             Ok(key) => key,
             Err(control) => return sort_family_control(control),
         };
-        // `map_or(true, ..)`, not `is_none_or`: the crate's MSRV is 1.73.
+        // `map_or(true, ..)`, not `is_none_or`: clippy's `msrv` is 1.73 (clippy.toml).
         let replaces = held.as_ref().map_or(true, |(best, _)| {
             let order = compare_key_arrays::<S>(&key, best);
             if want_max {
@@ -38157,7 +38157,7 @@ fn resumed_slot<C: DocumentCursor>(c: &C, parent: &C) -> Option<CursorSlot<C>> {
     // the walk gates itself on its own estimate and bound, and when it
     // declines the forward resume decides.
     if let Some((high, index)) = after {
-        // `map_or(true, ..)`, not `is_none_or`: the MSRV is 1.73.
+        // `map_or(true, ..)`, not `is_none_or`: clippy's `msrv` is 1.73 (clippy.toml).
         if before.map_or(true, |(low, _, _)| high - target < target - low) {
             if let Some(slot) = resumed_slot_back(c, parent, high, index) {
                 return Some(slot);

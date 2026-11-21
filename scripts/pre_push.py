@@ -246,6 +246,7 @@ NOT_MIRRORED = (
     (r"^cargo build\b", "builds a binary for a later step; a gate that needs one builds it itself"),
     (r"^cargo bench\b", "scheduled benchmarks"),
     (r"^cargo check --manifest-path fuzz/", "compiles the separate fuzz crate; CI-only"),
+    (r"^cargo check --locked (--lib|--features cli,simd,regex,serde)$", "ci.yml's MSRV job, run with the `rust-version` toolchain, which a dev machine need not have; `rustup toolchain install <rust-version> --profile minimal`, then the same commands as `cargo +<rust-version> check ...`, reproduce it"),
     (r"^\./scripts/sync-[\w-]+\.sh", "golden and corpus drift checks need the pinned yq/jq/corpus tooling CI installs"),
     (r"^\./scripts/gh-release-download\.sh", "fetches a pinned tool onto the CI runner (#6652); scripts/test_ci_release_downloads.py, run by the script-tests gate, is the local check"),
     (r"^python3 scripts/perf-guard\.py", "needs valgrind and a release binary on Linux"),

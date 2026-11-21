@@ -953,8 +953,8 @@ impl<T: Copy> FnScope<T> {
                 })
             })
             .and_then(|(_, listed)| listed.last().copied())
-            // `map_or(true, ..)`, not `is_none_or`: the crate's MSRV (1.73)
-            // predates it (1.82).
+            // `map_or(true, ..)`, not `is_none_or`: clippy's `msrv` (1.73,
+            // clippy.toml) predates it (1.82).
             .filter(|&at| crosses_floors || floor.map_or(true, |open| at > open));
         if let Some(at) = reached {
             // As `scan_scope`: a hit reports no run, which no caller reads.

@@ -2338,7 +2338,7 @@ pub struct DefScope<'e> {
 /// expanding-set and the memo.
 ///
 /// A plain cast, not `core::ptr::from_ref`: that is stable only since 1.76
-/// and this crate's MSRV is 1.73 (`clippy::incompatible_msrv` is the only
+/// and clippy's `msrv` is 1.73 (clippy.toml; `clippy::incompatible_msrv` is the only
 /// thing that catches the difference — it builds either way).
 #[must_use]
 pub fn expr_key(expr: &Expr) -> usize {
@@ -4621,8 +4621,8 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // after the first element or an end before the last never does, which is every
                 // narrow slice of a loop.
                 //
-                // `map_or(true, ..)` rather than `is_none_or`: the crate's MSRV is 1.73 and
-                // `Option::is_none_or` is stable since 1.82.
+                // `map_or(true, ..)` rather than `is_none_or`: clippy's `msrv` (clippy.toml) is 1.73
+                // and `Option::is_none_or` is stable since 1.82.
                 #[allow(clippy::unnecessary_map_or)]
                 let may_be_full = start.map_or(true, |s| s <= 0) && end.map_or(true, |e| e >= 0);
                 if S::TAG != EvalTag::Yq
@@ -7206,7 +7206,7 @@ pub(crate) fn suppresses(e: &EvalError, optional: bool) -> bool {
 /// shortcut evaluates nothing, so no `Shared` read is skipped that a stack
 /// check (ADR-0025) would have guarded.
 ///
-/// Not `Option::is_none_or`: the crate's MSRV is 1.73 and that is 1.82.
+/// Not `Option::is_none_or`: clippy's `msrv` (clippy.toml) is 1.73 and that is 1.82.
 pub(crate) fn try_swallows_scalar_iteration(expr: &Expr, catch: Option<&Expr>) -> bool {
     matches!(unwrap_bind_source(expr), Expr::Iterate) && catch.map_or(true, is_empty_handler)
 }
@@ -23246,7 +23246,7 @@ fn extremum_by_elements<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Ok(key) => key,
             Err(escape) => return escape,
         };
-        // `map_or(true, ..)`, not `is_none_or`: the crate's MSRV is 1.73.
+        // `map_or(true, ..)`, not `is_none_or`: clippy's `msrv` is 1.73 (clippy.toml).
         let replaces = held.as_ref().map_or(true, |(best, _)| {
             let order = compare_key_arrays::<S>(&key, best);
             if want_max {
@@ -48597,8 +48597,8 @@ fn resolves_to_at_most_one_path(expr: &Expr) -> bool {
             resolves_to_at_most_one_path(target) && yields_at_most_one_value(key)
         }
         Expr::SliceExpr { target, start, end } => {
-            // `map_or(true, ..)` rather than `is_none_or`: the crate's MSRV
-            // is 1.73 and `Option::is_none_or` is stable since 1.82, which
+            // `map_or(true, ..)` rather than `is_none_or`: clippy's `msrv`
+            // (clippy.toml) is 1.73 and `Option::is_none_or` is stable since 1.82, which
             // `clippy::incompatible_msrv` rejects -- the same substitution
             // `jq_seq_reader.rs`/`yq_runner.rs` already make.
             #[allow(clippy::unnecessary_map_or)]
@@ -100238,8 +100238,8 @@ fn range_batch_f64(
     // caller passing some other variant (or a value numerically unequal to
     // `from`) would silently splice a wrong value into a numeric range's
     // output with no other defense.
-    // `map_or(true, ..)` rather than `is_none_or`: the crate's MSRV is 1.73
-    // and `Option::is_none_or` is 1.82.
+    // `map_or(true, ..)` rather than `is_none_or`: clippy's `msrv` (clippy.toml) is
+    // 1.73 and `Option::is_none_or` is 1.82.
     debug_assert!(
         first_value.map_or(true, |v| matches!(v, OwnedValue::NumberLiteral(..))),
         "range's first_value override must be a NumberLiteral, got {first_value:?}"

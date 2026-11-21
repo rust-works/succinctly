@@ -892,7 +892,7 @@ pub fn substitute_invalid_utf8_jq_style_observed(
 /// assert_eq!(substitute_invalid_utf8_per_byte("h\u{e9}llo".as_bytes()), "h\u{e9}llo".as_bytes());
 /// ```
 pub fn substitute_invalid_utf8_per_byte(input: &[u8]) -> alloc::vec::Vec<u8> {
-    // Not `<[u8]>::utf8_chunks`, which is 1.79 and the crate's floor is 1.73;
+    // Not `<[u8]>::utf8_chunks`, which is 1.79 and clippy's `msrv` is 1.73;
     // `Utf8Error` carries the same two facts.
     const REPLACEMENT: &[u8] = "\u{FFFD}".as_bytes();
     let mut out = alloc::vec::Vec::with_capacity(input.len());

@@ -3651,8 +3651,8 @@ fn write_json_string_zero_copy<Out: Write>(
 
 /// Trim leading and trailing ASCII whitespace from a byte slice.
 ///
-/// Equivalent to `<[u8]>::trim_ascii` but usable on our MSRV (1.73), which
-/// predates that method's stabilization (1.80).
+/// Equivalent to `<[u8]>::trim_ascii` (stable since 1.80), which clippy's
+/// `msrv` (1.73, clippy.toml) still rejects.
 fn trim_ascii_ws(bytes: &[u8]) -> &[u8] {
     let start = bytes
         .iter()
@@ -4668,8 +4668,8 @@ fn jq_exit_code(
 /// once rather than swapped per call: the hook is process-global, so a
 /// per-call take/restore would interleave across threads and nest one
 /// wrapper deeper per call.
-// `PanicInfo` is the hook's type on this crate's 1.73 MSRV; newer toolchains
-// renamed it `PanicHookInfo` and deprecate the old name.
+// `PanicInfo` is the hook's type on clippy's 1.73 `msrv` (clippy.toml); 1.81
+// renamed it `PanicHookInfo` and deprecates the old name.
 #[allow(deprecated)]
 pub(crate) fn silence_depth_guard_panic_line() {
     static INSTALLED: std::sync::Once = std::sync::Once::new();
@@ -13282,7 +13282,7 @@ fn non_string_key_fault(bytes: &[u8], at: usize, stream: bool) -> usize {
             // A fault inside the container is met before the container is a value.
             Err(_) => return parse_error_detection(bytes, at, stream),
         },
-        // (`map_or(true, ..)`, not `is_none_or`: the crate's MSRV is 1.73.)
+        // (`map_or(true, ..)`, not `is_none_or`: clippy's `msrv` is 1.73, clippy.toml.)
         Some(&b) if !is_jq_token_boundary(b) => {
             let end = token_end(bytes, at);
             if validate_jq_lenient(&bytes[at..end]).is_err() {
@@ -13320,7 +13320,7 @@ fn fault_past_invalid_utf8(
     let mut mapped = None;
     let mut rest = tail;
     while !rest.is_empty() {
-        // (`Utf8Chunks` is newer than this crate's MSRV.)
+        // (`Utf8Chunks` is newer than clippy's `msrv`, clippy.toml.)
         let (valid, invalid) = match core::str::from_utf8(rest) {
             Ok(_) => (rest.len(), 0),
             Err(e) => (
