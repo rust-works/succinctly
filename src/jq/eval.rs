@@ -15511,6 +15511,8 @@ fn closed_expr_shape(expr: &Expr) -> bool {
         | Expr::And(left, right)
         | Expr::Or(left, right)
         | Expr::Alternative(left, right) => closed_expr_shape(left) && closed_expr_shape(right),
+        // #7563: `-$i`, its operand closed.
+        Expr::Negate(inner) => closed_expr_shape(inner),
         // #6574: `if C then A else B end`, all three closed (an `elif` is a nested `if`).
         Expr::If {
             cond,
@@ -15638,6 +15640,25 @@ fn closed_if_to_owned<S: EvalSemantics>(
         else_branch
     };
     closed_expr_to_owned_at_depth::<S>(branch, depth + 1, escaped)
+}
+
+/// [`closed_expr_to_owned_node`]'s `Negate` arm (#7563): `-E` of a closed `E` is [`arith_negate`]
+/// of its one value, the evaluator's own negation. A fold that writes `.[-$i]` reads its key here:
+/// without the arm the key was evaluated on a re-indexed copy of the whole accumulator, twice per
+/// step. An operand that is not a number raises, which declines to the evaluator's route and text.
+/// Its own function, not inline in the arm, for the reason [`closed_index_expr`] gives.
+#[inline(never)]
+fn closed_negate_to_owned<S: EvalSemantics>(
+    inner: &Expr,
+    depth: usize,
+    escaped: &mut bool,
+) -> Option<OwnedValue> {
+    arith_negate::<S>(closed_expr_to_owned_at_depth::<S>(
+        inner,
+        depth + 1,
+        escaped,
+    )?)
+    .ok()
 }
 
 /// [`closed_expr_to_owned_node`]'s `Pipe` arm: a closed head, then each later stage answered
@@ -15824,6 +15845,10 @@ fn closed_expr_to_owned_node<S: EvalSemantics>(
             else_branch,
         } if S::TAG == EvalTag::Jq => {
             closed_if_to_owned::<S>(cond, then_branch, else_branch, depth, escaped)
+        }
+        // #7563: `-$i` with `$i` spliced in; see [`closed_negate_to_owned`]. jq mode only.
+        Expr::Negate(inner) if S::TAG == EvalTag::Jq => {
+            closed_negate_to_owned::<S>(inner, depth, escaped)
         }
         // `[$x]` is a *bare* element inside `Expr::Array`: the parser only
         // adds `Expr::Comma` when a `,` is present (#2152).
@@ -16162,8 +16187,8 @@ fn owned_assign_step<S: EvalSemantics>(
     // `.i += 1` loop ~6% of its instructions.
     match owned_assign_single_step::<S>(path, state) {
         SingleStep::Unclosed => None,
-        SingleStep::Step(key) => {
-            let old = owned_assign_step_child(&key, state)?;
+        SingleStep::Step(mut key) => {
+            let old = owned_write_child::<S>(&mut key, state)?;
             // #5273: `+` onto a container the slot holds, with the slot's own handle, so the
             // array, object or string grows where it is instead of being copied.
             if S::TAG == EvalTag::Jq && owned_grows_in_place(old, &rhs) {
@@ -16201,8 +16226,8 @@ fn owned_assign_step<S: EvalSemantics>(
                 return None;
             }
             let mut old: &OwnedValue = state;
-            for step in &steps {
-                old = owned_assign_step_child(step, old)?;
+            for step in &mut steps {
+                old = owned_write_child::<S>(step, old)?;
             }
             if S::TAG == EvalTag::Jq && owned_grows_in_place(old, &rhs) {
                 let (OwnedAssignRhs::Combine(_, right) | OwnedAssignRhs::DefaultCombine(_, right)) =
@@ -16912,6 +16937,47 @@ fn owned_assign_step_child<'v>(
         (StepKey::Index(idx), OwnedValue::Array(items)) => {
             let idx = usize::try_from(*idx).ok()?;
             (idx <= items.len()).then(|| items.get(idx).unwrap_or(&OwnedValue::Null))
+        }
+        _ => None,
+    }
+}
+
+/// [`owned_assign_step_child`] for the step a write takes, widened in jq mode to the two index
+/// steps jq resolves rather than refuses (#7563, #7452): a negative index into an array, which
+/// counts back from its end, and an index past the end of an array or into `null`, which pads
+/// with `null`s. The write itself is [`set_index`]/[`set_path`]'s, which resolve and pad exactly
+/// so (both are [`write_index`]); declining them sent every fold step that wrote one
+/// (`reduce .. ([range(n)]; .[-$i] = $i)`, `reduce .. ([]; .[$t][799] = 1)`) through the
+/// re-index bridge, which copied the whole accumulator, so the fold was quadratic.
+///
+/// A negative `step` is rewritten to the index it names (`len + idx`), so that every later use of
+/// it -- the slot a `+` grows ([`owned_slot_mut`]) and the write -- names that same slot. An index
+/// still negative after counting back is jq's `Out of bounds negative array index`, a negative
+/// index into `null` is too, and a padding index that would grow an array past
+/// [`MAX_PADDED_ARRAY_LEN`] is refused by the write: each declines, so the evaluator raises it
+/// with its own rules (`?` does not suppress the first). jq reads `null` at a slot a write pads
+/// to, which is what `|=`, `+=` and `//=` see as the old value there. yq mode keeps the narrow
+/// gate: its index writes are the evaluator's (see [`owned_assign_new_value`]).
+fn owned_write_child<'v, S: EvalSemantics>(
+    step: &mut StepKey<'_>,
+    container: &'v OwnedValue,
+) -> Option<&'v OwnedValue> {
+    if let Some(child) = owned_assign_step_child(step, container) {
+        return Some(child);
+    }
+    let (EvalTag::Jq, StepKey::Index(idx)) = (S::TAG, &mut *step) else {
+        return None;
+    };
+    match container {
+        OwnedValue::Array(items) if *idx < 0 => {
+            let at = usize::try_from(items.len() as i64 + *idx).ok()?;
+            *idx = at as i64;
+            items.get(at)
+        }
+        OwnedValue::Array(_) | OwnedValue::Null
+            if usize::try_from(*idx).is_ok_and(|at| at < MAX_PADDED_ARRAY_LEN) =>
+        {
+            Some(&OwnedValue::Null)
         }
         _ => None,
     }
@@ -120373,6 +120439,16 @@ mod tests {
             // produces a `StepKey::Index`, exercising `StepKey::
             // into_component`'s `Index` arm.
             (".a[0] = 1", with_empty_array.clone()),
+            // #7563, #7452: an index jq counts back from the end, or pads to, is the same write.
+            (".[-1] = 1", array.clone()),
+            (".[-2] |= . + 1", array.clone()),
+            (".[5] = 1", array.clone()),
+            (".[1] = 1", OwnedValue::Null),
+            (".a[3] = 1", with_empty_array.clone()),
+            (
+                ".[-1][2] = 1",
+                OwnedValue::array_from(vec![OwnedValue::Null]),
+            ),
         ];
         for (src, input) in handled {
             let expr = subst(src);
@@ -120405,9 +120481,8 @@ mod tests {
             (".[$r.name] = 1", array.clone()),       // string key into an array
             (".[$r.id] = 1", object.clone()),        // number key into an object
             (".[$r.tag] = 1", object.clone()),       // null key
-            (".[-1] = 1", array.clone()),            // negative index
-            (".[5] = 1", array.clone()),             // padding index
-            (".[1] = 1", OwnedValue::Null),          // padding from null
+            (".[-3] = 1", array.clone()),            // negative past the start: raises
+            (".[-1] = 1", OwnedValue::Null),         // negative into null: raises
             (".[1.5] = 1", array.clone()),           // float key
             (".a[$r.name] = 1", object.clone()),     // through a boolean
             (".[$r.name] -= \"s\"", object.clone()), // combine fails
@@ -120627,7 +120702,7 @@ mod tests {
             };
             assert_eq!(items.len(), 64, "{src}");
         }
-        // `-0.0` is index 0; `5.0` into a three-element array pads, which is the evaluator's.
+        // `-0.0` is index 0; `-1.0` counts back from the end and `5.0` pads (#7563, #7452).
         let three = || OwnedValue::array_from(vec![OwnedValue::Int(1); 3]);
         let step = |src: &str, key: OwnedValue, state: OwnedValue, yq: bool| {
             let expr = substitute_vars(&parse(src).unwrap(), [("k", &key)]);
@@ -120650,6 +120725,29 @@ mod tests {
                 OwnedValue::Int(1)
             ])
         );
+        let one = OwnedValue::Int(1);
+        let nine = OwnedValue::Int(9);
+        for (key, want) in [
+            (-1.0, vec![one.clone(), one.clone(), nine.clone()]),
+            (
+                5.0,
+                vec![
+                    one.clone(),
+                    one.clone(),
+                    one,
+                    OwnedValue::Null,
+                    OwnedValue::Null,
+                    nine,
+                ],
+            ),
+        ] {
+            let OwnedStep::Handled(Ok(written)) =
+                step(".[$k] = 9", OwnedValue::Float(key), three(), false)
+            else {
+                panic!("{key} is a whole key jq resolves"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- fires only if a negative or padding whole float key declined again (#7563)"
+            };
+            assert_eq!(written, OwnedValue::array_from(want), "{key}");
+        }
         let object = || OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
         for (key, state, yq) in [
             (OwnedValue::Float(1.5), three(), false),
@@ -120659,8 +120757,7 @@ mod tests {
             (OwnedValue::Float(f64::NEG_INFINITY), three(), false),
             (OwnedValue::Float(1e300), three(), false),
             (OwnedValue::Float(9_007_199_254_740_994.0), three(), false),
-            (OwnedValue::Float(-1.0), three(), false),
-            (OwnedValue::Float(5.0), three(), false),
+            (OwnedValue::Float(-4.0), three(), false),
             (OwnedValue::Float(0.0), object(), false),
             (OwnedValue::Float(1.0), three(), true),
         ] {
@@ -120670,6 +120767,86 @@ mod tests {
                     OwnedStep::Declined(_)
                 ),
                 "{key:?} (yq: {yq}) must stay the evaluator's"
+            );
+        }
+    }
+
+    /// #7563, #7452: a fold step that writes an array slot by a negative index (`.[-$k]`, `.[-1]`)
+    /// or by one that pads (`.[$k][5]` into the new row, `.[$k * 2]`) is answered in place. Both
+    /// declined, and the evaluator's route re-indexed and rebuilt the whole accumulator every step:
+    /// `reduce range(1;n) as $i ([range(n)]; .[-$i] = $i)` and `reduce range(n) as $t ([];
+    /// .[$t][799] = 1)` were quadratic. A sibling string the writes never touch being the same
+    /// allocation after every step is the in-place proof, and no step may re-index the state (the
+    /// `-$k` key included, which was evaluated on a rebuilt copy of the state). An index still
+    /// negative after counting back, a negative index into `null`, and yq mode still decline.
+    #[test]
+    fn owned_assign_step_takes_negative_and_padding_indexes_in_place_7563() {
+        let literal = "x".repeat(100_000);
+        let text_ptr = |state: &OwnedValue| match state {
+            OwnedValue::Array(items) => match items.first() {
+                Some(OwnedValue::String(text)) => text.as_ptr(),
+                other => panic!("missing sibling: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- slot 0 holds the tracked string, which no write below touches (#7563)"
+            },
+            other => panic!("expected array: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- every write below keeps the state an array (#7563)"
+        };
+        let negative = |len: usize| {
+            let mut items = vec![OwnedValue::string(&literal)];
+            items.extend((1..len as i64).map(OwnedValue::Int));
+            OwnedValue::array_from(items)
+        };
+        let padding = || OwnedValue::array_from(vec![OwnedValue::string(&literal)]);
+        // (step, state, rounds, final length): `$k` is the round, 1-based.
+        let rows: [(&str, OwnedValue, i64, usize); 9] = [
+            (".[-$k] = $k", negative(64), 63, 64),
+            (".[-$k] |= 7", negative(64), 63, 64),
+            (".[-$k] += 1", negative(64), 63, 64),
+            (".[-$k] //= 1", negative(64), 63, 64),
+            (".[-1] = $k", negative(64), 63, 64),
+            (".[$k][5] = 1", padding(), 63, 64),
+            (".[$k][$k] = 1", padding(), 63, 64),
+            (".[$k].a[3] = 1", padding(), 63, 64),
+            (".[$k * 2] = $k", padding(), 31, 63),
+        ];
+        for (src, start, rounds, len) in rows {
+            let before = text_ptr(&start);
+            let mut state = start;
+            let reindexed = crate::jq::value::reindex_count::get();
+            for k in 1..=rounds {
+                let expr = substitute_vars(&parse(src).unwrap(), [("k", &OwnedValue::Int(k))]);
+                state = match try_eval_owned_step::<JqSemantics>(&expr, state) {
+                    OwnedStep::Handled(Ok(next)) => next,
+                    _ => panic!("{src}: step {k} was not handled"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if a negative or padding index declined, which is the regression this test pins (#7563)"
+                };
+            }
+            assert_eq!(text_ptr(&state), before, "{src}: the sibling was copied");
+            assert_eq!(
+                crate::jq::value::reindex_count::get(),
+                reindexed,
+                "{src}: a step re-indexed the state"
+            );
+            let OwnedValue::Array(items) = &state else {
+                unreachable!() // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- text_ptr above already proved the state is an array (#7563)"
+            };
+            assert_eq!(items.len(), len, "{src}");
+        }
+        let three = || OwnedValue::array_from(vec![OwnedValue::Int(1); 3]);
+        for (src, state, yq) in [
+            (".[-4] = 9", three(), false),
+            (".[-$k] = 9", three(), false),
+            (".[-1] = 9", OwnedValue::Null, false),
+            (".[0][-1] = 9", OwnedValue::Null, false),
+            (".[-1] = 9", three(), true),
+            (".[5] = 9", three(), true),
+        ] {
+            let expr = substitute_vars(&parse(src).unwrap(), [("k", &OwnedValue::Int(4))]);
+            let declined = if yq {
+                try_eval_owned_step::<YqSemantics>(&expr, state)
+            } else {
+                try_eval_owned_step::<JqSemantics>(&expr, state)
+            };
+            assert!(
+                matches!(declined, OwnedStep::Declined(_)),
+                "{src} (yq: {yq}) must stay the evaluator's"
             );
         }
     }
