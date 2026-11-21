@@ -5819,6 +5819,42 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     continue;
                 }
 
+                // #7425: a document no index can hold (4 GiB or more, a slurp of that much
+                // included) is read into a tree without one, and the program runs on the tree.
+                if !JsonIndex::can_index(json_bytes.len()) {
+                    let at = ErrorAt::Fixed(locator.at(end));
+                    evaluate_unindexable_document(
+                        json_bytes,
+                        &expr,
+                        &context,
+                        &at,
+                        &mut sink,
+                        &output_config,
+                        &mut |sink, result| {
+                            had_output = true;
+                            // Its truthiness, as the lazy route records an owned result's.
+                            if args.exit_status {
+                                last_output = Some(OwnedValue::Bool(!matches!(
+                                    result,
+                                    OwnedValue::Null | OwnedValue::Bool(false)
+                                )));
+                            }
+                            let stop = route_write_error(
+                                sink,
+                                &mut out,
+                                || at.resolve(),
+                                |o| write_output_owned_value(o, &result, &output_config),
+                            )?;
+                            Ok(!stop)
+                        },
+                    )?;
+                    if let Some(code) = sink.halted() {
+                        out.flush()?;
+                        return Ok(halt_exit_code(code, open_failed));
+                    }
+                    continue;
+                }
+
                 // Slow path: build index and evaluate expression
                 let index = RunIndex::build(json_bytes, &mut held_index, is_last_value);
                 // #5497: jq's parser refuses a document past its depth limit before any filter
@@ -17876,11 +17912,14 @@ impl InputDoc {
 }
 
 /// The bridge document of an owned input (see [`InputDoc::Bridge`]); the one place it is built, so
-/// a test can count the inputs that needed one (#5624).
-fn bridge_doc_of(input: &OwnedValue) -> succinctly::jq::ReindexedDoc {
+/// a test can count the inputs that needed one (#5624). An error for an input whose text no index
+/// can hold (#7425).
+fn bridge_doc_of(
+    input: &OwnedValue,
+) -> core::result::Result<succinctly::jq::ReindexedDoc, EvalError> {
     #[cfg(test)]
     bridge_docs::bump();
-    input.input_bridge_doc()
+    input.try_input_bridge_doc()
 }
 
 /// Test-only count of [`bridge_doc_of`] calls on this thread.
@@ -17956,6 +17995,38 @@ fn evaluate_input_streaming(
         on_value,
     )
     .map(|_| ())
+}
+
+/// Runs `expr` over a document no [`JsonIndex`] can hold (#7425), read into a tree by
+/// [`unindexable_document_value`] and evaluated where it is, as the owned evaluator evaluates a
+/// `--stream` event; a document that reader refuses is reported to `sink` as the lazy route
+/// reports a malformed one, which words it as jq's parser does.
+fn evaluate_unindexable_document(
+    bytes: &[u8],
+    expr: &jq::Expr,
+    context: &EvalContext,
+    at: &ErrorAt<'_>,
+    sink: &mut ErrorSink,
+    output_config: &OutputConfig,
+    on_value: &mut dyn FnMut(&mut ErrorSink, OwnedValue) -> Result<bool>,
+) -> Result<()> {
+    match unindexable_document_value(bytes) {
+        Ok(value) => evaluate_input_streaming_via(
+            &value,
+            expr,
+            context,
+            at,
+            sink,
+            output_config,
+            OwnedRoute::Always,
+            on_value,
+        )
+        .map(|_| ()),
+        Err(error) => {
+            sink.report(DiagStyle::Jq, &error, &at.resolve());
+            Ok(())
+        }
+    }
 }
 
 /// The route `run_jq` gives an input that is already a tree (#5681, #5764): a
@@ -18207,10 +18278,25 @@ fn evaluate_input_streaming_via(
         }
         let doc = if preserve {
             let text = input.to_json_jq_preserve();
+            // #7425: no index holds a text of 4 GiB or more.
+            if !JsonIndex::can_index(text.len()) {
+                return Some(jq::Control::Error(EvalError::resource_limit(
+                    jq::index_ceiling_message(text.len()),
+                )));
+            }
             let index = JsonIndex::build(text.as_bytes());
             InputDoc::Preserve(text, index)
         } else {
-            InputDoc::Bridge(bridge_doc_of(input))
+            match bridge_doc_of(input) {
+                Ok(doc) => InputDoc::Bridge(doc),
+                // #7425: an input whose text no index holds is read where it is, by the owned
+                // evaluator, whose own bridge refuses only a stage it would have to index it for.
+                Err(_) => {
+                    return jq::eval_generic::eval_each_owned_input(expr, input, &mut |v| {
+                        deliver(sink, Some(v))
+                    });
+                }
+            }
         };
         let cursor = doc.root();
         jq::eval_generic::eval_each_with_cursor(expr, cursor, &mut |result| {
@@ -20220,6 +20306,29 @@ fn json_document_to_owned_value_checked(
     json_document_to_owned_value(bytes, at, Delimiters::Walk)
 }
 
+/// A document of `bytes` that no [`JsonIndex`] can hold (4 GiB or more, #7425), read into a tree
+/// without one.
+///
+/// jq's one-pass reader of plain RFC 8259 text ([`jq::parse_plain`]) builds what it accepts as the
+/// indexed route does, and nearly every large document is such text. What it declines is either a
+/// fault jq's parser meets (its depth limit included), returned as the decode failure the indexed
+/// route returns for a malformed document, so a caller words it as it words that one; or text jq
+/// reads that only the indexed route reads (a repeated key, a lone low surrogate escape, `nan`,
+/// nesting past 128 levels), refused with a resource-limit error, a divergence recorded in
+/// `docs/compliance/jq/limitations.md`.
+fn unindexable_document_value(bytes: &[u8]) -> core::result::Result<OwnedValue, EvalError> {
+    if let Some(value) = core::str::from_utf8(bytes).ok().and_then(jq::parse_plain) {
+        return Ok(value);
+    }
+    if jq::jq_stream_fault([bytes], 1, 0).is_some() {
+        return Err(EvalError::malformed_json_text(bytes));
+    }
+    Err(EvalError::resource_limit(format!(
+        "{}, and the document is not plain JSON, which is all that is read without an index",
+        jq::index_ceiling_message(bytes.len())
+    )))
+}
+
 /// How [`json_document_to_owned_value`] establishes that the delimiters of `bytes` are in place
 /// before it builds a value.
 #[derive(Clone, Copy)]
@@ -20241,6 +20350,9 @@ fn json_document_to_owned_value(
     at: Option<&dyn Fn() -> (usize, usize)>,
     delimiters: Delimiters,
 ) -> core::result::Result<OwnedValue, EvalError> {
+    if !JsonIndex::can_index(bytes.len()) {
+        return unindexable_document_value(bytes);
+    }
     let index = JsonIndex::build(bytes);
     if let Some(at) = at {
         if let Some(message) =
@@ -29069,6 +29181,150 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #7425: a document no index can hold is read by [`unindexable_document_value`], which builds
+    /// what the indexed route builds for plain JSON, number spellings and string escapes included.
+    /// The reader takes any length, so documents of a few bytes stand in for ones of 4 GiB; which
+    /// route a length takes is `JsonIndex::can_index`'s, pinned at its boundary in `json::light`.
+    #[test]
+    fn a_document_no_index_holds_is_read_as_the_indexed_route_reads_it_7425() {
+        let docs = [
+            "[1,2.50,1e1000,-0,100000000000000000001,0.1e-2]",
+            r#"{"a":{"b":[true,false,null]},"c":"\u00e9\n\t\"x\" \u20ac","d":{}}"#,
+            r#"["a","b",[[],[{}]],{"k":[1,{"z":0}]}]"#,
+            "\"just a string\"",
+            "  42  ",
+            &format!("{}{}", "[".repeat(100), "]".repeat(100)),
+        ];
+        for doc in docs {
+            let indexed = json_bytes_to_owned_value_checked(doc.as_bytes()).expect("indexed");
+            let read = unindexable_document_value(doc.as_bytes()).expect("read");
+            assert_eq!(read.to_json(), indexed.to_json(), "{doc}");
+            assert_eq!(read, indexed, "{doc}");
+        }
+    }
+
+    /// #7425: what the index-free reader declines. A fault jq's parser meets, its depth limit
+    /// included, is the decode failure the indexed route gives a malformed document, so the lazy
+    /// route words it as jq's parse error; text jq reads that only the indexed route reads is a
+    /// resource limit, the recorded divergence.
+    #[test]
+    fn a_document_no_index_holds_is_refused_only_where_it_is_not_plain_7425() {
+        let deep = |n: usize| format!("{}{}", "[".repeat(n), "]".repeat(n));
+        for malformed in [
+            "{\"a\":tru}".to_string(),
+            "[1,,2]".to_string(),
+            "[\"\\q\"]".to_string(),
+            r#"["\ud83d"]"#.to_string(),
+            deep(10_001),
+        ] {
+            let error = unindexable_document_value(malformed.as_bytes()).expect_err("malformed");
+            assert!(error.is_decode_failure(), "{malformed:.20}: {error:?}");
+        }
+        for unread in [
+            r#"{"a":1,"a":2}"#.to_string(),
+            // A lone low half: jq reads it as U+FFFD (a lone high half is a fault it reports).
+            r#"["\udc00"]"#.to_string(),
+            "[nan]".to_string(),
+            "[007]".to_string(),
+            deep(200),
+        ] {
+            assert!(
+                json_bytes_to_owned_value_checked(unread.as_bytes()).is_ok(),
+                "{unread:.20}: the indexed route reads it"
+            );
+            let error = unindexable_document_value(unread.as_bytes()).expect_err("not plain");
+            assert!(error.is_resource_limit(), "{unread:.20}: {error:?}");
+            assert_eq!(
+                error.message,
+                format!(
+                    "Cannot index a value of {} bytes: the index holds at most 4294967295 bytes \
+                     (4 GiB), and the document is not plain JSON, which is all that is read \
+                     without an index",
+                    unread.len()
+                ),
+                "{unread:.20}"
+            );
+        }
+    }
+
+    /// #7425: a document no index holds is evaluated on its tree, and prints what the indexed
+    /// route prints; one the reader refuses is reported, and nothing is printed for it.
+    #[test]
+    fn a_document_no_index_holds_prints_what_the_indexed_route_prints_7425() {
+        let config = OutputConfig {
+            compact: true,
+            raw_output: false,
+            join_output: false,
+            raw_output0: false,
+            ascii_output: false,
+            color_output: false,
+            color_scheme: ColorScheme::default(),
+            sort_keys: false,
+            indent_string: String::new(),
+            unbuffered: false,
+            seq: false,
+            convention: JsonConvention::JqCompat,
+        };
+        let doc = r#"{"a":[1,2.50,{"b":"x"}],"c":1e1000,"d":"\u00e9"}"#;
+        let run = |bytes: &[u8], filter: &str, unindexed: bool| -> (Vec<String>, bool) {
+            let expr = jq::parse(filter).expect("parses");
+            let mut outputs = Vec::new();
+            let mut sink = ErrorSink::default();
+            let at = ErrorAt::Fixed(InputLocation::unknown());
+            let mut on_value = |_: &mut ErrorSink, value: OwnedValue| {
+                outputs.push(value.to_json());
+                Ok(true)
+            };
+            if unindexed {
+                evaluate_unindexable_document(
+                    bytes,
+                    &expr,
+                    &EvalContext::default(),
+                    &at,
+                    &mut sink,
+                    &config,
+                    &mut on_value,
+                )
+            } else {
+                let input = json_bytes_to_owned_value_checked(bytes).expect("indexed");
+                evaluate_input_streaming(
+                    &input,
+                    &expr,
+                    &EvalContext::default(),
+                    &at,
+                    &mut sink,
+                    &config,
+                    &mut on_value,
+                )
+            }
+            .expect("evaluates");
+            (outputs, sink.hit())
+        };
+        for filter in [
+            ".",
+            "length",
+            ".a[]",
+            "[.a[] | numbers] | add",
+            ".c, .d",
+            "keys",
+            "to_entries | map(.key)",
+            "[paths]",
+            "tojson",
+            ".a[1] | tostring",
+            "[limit(2; .a[])]",
+            ".a | map(type)",
+            "error(\"boom\")",
+            "{x: .a[2].b} | .x",
+            "with_entries(.value |= type)",
+        ] {
+            let want = run(doc.as_bytes(), filter, false);
+            assert_eq!(run(doc.as_bytes(), filter, true), want, "{filter}");
+        }
+        // Refused: reported, and the program never runs.
+        let (outputs, hit) = run(br#"{"a":1,"a":2}"#, "1", true);
+        assert_eq!((outputs.len(), hit), (0, true));
     }
 
     /// #6620: the route of a record the main loop pops. Every output comparison passes whichever

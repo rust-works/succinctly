@@ -54,6 +54,15 @@ pub fn run_jq_locate(args: JqLocateArgs) -> Result<i32> {
     // it, and so does this: the same `n` names the same node in both. Editors show the same text.
     let bom_len = crate::cli::front_matter::leading_bom_len(&file_bytes);
     let text = &file_bytes[bom_len..];
+    // #7425: the line index and the JSON index each hold a text of at most `u32::MAX` bytes.
+    if !JsonIndex::can_index(text.len()) {
+        anyhow::bail!(
+            "{} is {} bytes: jq-locate reads a document of at most {} bytes (4 GiB)",
+            args.file.display(),
+            text.len(),
+            JsonIndex::MAX_TEXT_LEN
+        );
+    }
 
     // Determine the byte offset
     let offset = match (args.offset, args.line, args.column) {

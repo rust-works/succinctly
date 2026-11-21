@@ -5575,7 +5575,7 @@ impl OwnedValue {
             }
         }
         Ok(ReindexedDoc::new(
-            self.to_json_for_reindex::<S>()?,
+            indexable_bridge_text(self.to_json_for_reindex::<S>()?)?,
             S::REINDEX_BRIDGE_KEEPS_IDENTITY.then_some(self),
             self.is_scalar_root(),
         ))
@@ -5593,7 +5593,7 @@ impl OwnedValue {
         #[cfg(test)]
         reindex_count::bump();
         let mut doc = ReindexedDoc::new(
-            self.to_json_for_reindex::<S>()?,
+            indexable_bridge_text(self.to_json_for_reindex::<S>()?)?,
             None,
             self.is_scalar_root(),
         );
@@ -5601,6 +5601,16 @@ impl OwnedValue {
             doc.root_string = Some(self.clone());
         }
         Ok(doc)
+    }
+
+    /// [`input_bridge_doc`](Self::input_bridge_doc), or the error
+    /// [`reindexed`](Self::reindexed) gives for a value whose text the index cannot hold (#7425),
+    /// where `input_bridge_doc` panics.
+    pub fn try_input_bridge_doc(&self) -> Result<ReindexedDoc, EvalError> {
+        #[cfg(test)]
+        reindex_count::bump();
+        let text = indexable_bridge_text(self.to_json_input_bridge())?;
+        Ok(ReindexedDoc::new(text, None, self.is_scalar_root()))
     }
 
     /// [`to_json_input_bridge`](Self::to_json_input_bridge)'s text, indexed
@@ -5620,6 +5630,27 @@ impl OwnedValue {
     fn is_scalar_root(&self) -> bool {
         !matches!(self, Self::Array(_) | Self::Object(_))
     }
+}
+
+/// `text` if a [`JsonIndex`](crate::json::JsonIndex) can hold it; otherwise the bridge's refusal
+/// (#7425), a resource limit like the bridge's depth refusal, since jq has no ceiling here: a value
+/// of 4 GiB or more is one only a document that large (or a program building one) gives.
+fn indexable_bridge_text(text: String) -> Result<String, EvalError> {
+    if crate::json::JsonIndex::can_index(text.len()) {
+        Ok(text)
+    } else {
+        Err(EvalError::resource_limit(index_ceiling_message(text.len())))
+    }
+}
+
+/// The refusal of a value or document of `len` bytes that no [`JsonIndex`](crate::json::JsonIndex)
+/// can hold, for the reindex bridge and for the CLI's reader of such a document (#7425).
+#[must_use]
+pub(crate) fn index_ceiling_message(len: usize) -> String {
+    alloc::format!(
+        "Cannot index a value of {len} bytes: the index holds at most {} bytes (4 GiB)",
+        crate::json::JsonIndex::MAX_TEXT_LEN
+    )
 }
 
 /// How many times an [`OwnedValue`] was serialized and indexed on this thread
