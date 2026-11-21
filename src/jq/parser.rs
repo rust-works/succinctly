@@ -35,8 +35,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::eval::{
     apply_compare_op, arith_combine, contains_retrying_pattern_bind,
-    pattern_alternatives_var_names, try_compare_op, EvalError, EvalSemantics, JqSemantics,
-    YqSemantics,
+    pattern_alternatives_var_names, try_compare_op, yields_at_most_one_value, EvalError,
+    EvalSemantics, JqSemantics, YqSemantics,
 };
 use super::eval_generic::is_empty_object_literal;
 use super::expr::{
@@ -2811,6 +2811,80 @@ fn bind_retrying_value_arg(builtin: Builtin) -> Expr {
         expr: Box::new(source),
         var: VALUE_ARG_VAR.to_string(),
         body: Box::new(Expr::Builtin(bound)),
+    }
+}
+
+/// The variables [`bind_value_args`] binds a builtin's arguments to, in binding order. The first
+/// is [`VALUE_ARG_VAR`], so a one-argument builtin is bound exactly as
+/// [`bind_retrying_value_arg`] binds it; none is spellable in source.
+const VALUE_ARG_VARS: [&str; 3] = [VALUE_ARG_VAR, "%arg1", "%arg2"];
+
+/// Whether `var` is one [`bind_value_args`] binds: the resolver checks such a binding as the call
+/// it was parsed from (#7474).
+pub(crate) fn is_value_arg_var(var: &str) -> bool {
+    VALUE_ARG_VARS.contains(&var)
+}
+
+/// `B(G)` as jq runs it, `G as $v | B($v)`, in jq mode, when an argument jq binds per value
+/// can yield more than one value or holds a `?//` bind (#7474, #3487).
+///
+/// The evaluators run a builtin's argument to the end and then call the builtin once per value,
+/// collecting every output before the first reaches a consumer: `first(ltrimstr(repeat("x")))`
+/// never returned and `first(ltrimstr(inputs | tostring))` read every input. An `as` binding
+/// already drives its source through a live sink on every route, so binding the value first
+/// makes each call's output reach the consumer before the argument's next value is pulled, and
+/// a consumer's stop, or an error the call raises, ends the argument generator where jq does.
+///
+/// The arguments are bound in jq's own nesting order ([`Builtin::value_args_mut`]), from the
+/// outermost down to the innermost one that needs it; an argument inside that stays in place,
+/// where the builtin already evaluates it once per combination of the bound ones. A call whose
+/// arguments each yield at most one value (`ltrimstr("x")`, `getpath(["a", $k])`, nearly every
+/// call) is left as written, so it costs nothing at run time. yq mode keeps
+/// [`bind_retrying_value_arg`]: real yq takes the first value of most of these arguments, or
+/// refuses a second one, rather than fanning out.
+fn bind_value_args(mut builtin: Builtin) -> Expr {
+    let mut slots = builtin.value_args_mut();
+    let Some(innermost) = slots
+        .iter()
+        .rposition(|arg| !binds_at_most_one_value(arg) || contains_retrying_pattern_bind(arg))
+    else {
+        return Expr::Builtin(builtin);
+    };
+    slots.truncate(innermost + 1);
+    let sources: Vec<(&str, Expr)> = slots
+        .into_iter()
+        .zip(VALUE_ARG_VARS)
+        .map(|(slot, var)| (var, core::mem::replace(slot, Expr::Var(var.to_string()))))
+        .collect();
+    sources
+        .into_iter()
+        .rev()
+        .fold(Expr::Builtin(builtin), |body, (var, source)| Expr::As {
+            expr: Box::new(source),
+            var: var.to_string(),
+            body: Box::new(body),
+        })
+}
+
+/// Whether a builtin argument yields at most one value, for [`bind_value_args`]:
+/// [`yields_at_most_one_value`], which also admits an array or object construction whose parts
+/// do. `[f]` is one value however many `f` yields, and `contains(["a", "b"])` or
+/// `getpath(["a", "b"])` is the common spelling that rule refuses (it recurses into the array's
+/// comma). A wrong refusal only costs an `as` binding; a wrong admission keeps the eager call.
+fn binds_at_most_one_value(expr: &Expr) -> bool {
+    match expr {
+        Expr::Array(_) => true,
+        Expr::Paren(inner) | Expr::Optional(inner) => binds_at_most_one_value(inner),
+        Expr::Object(entries) => entries.iter().all(|entry| {
+            binds_at_most_one_value(&entry.value)
+                && match &entry.key {
+                    ObjectKey::Literal(_) => true,
+                    ObjectKey::Expr(key) => binds_at_most_one_value(key),
+                    // yq's bare entry contributes its raw outputs, however many.
+                    ObjectKey::Bare => false,
+                }
+        }),
+        _ => yields_at_most_one_value(expr),
     }
 }
 
@@ -6018,7 +6092,7 @@ impl<'a> Parser<'a> {
                                         self.in_path_arg == 0,
                                     )
                                 } else {
-                                    bind_retrying_value_arg(builtin)
+                                    bind_value_args(builtin)
                                 },
                             )
                         }
@@ -13424,6 +13498,72 @@ mod tests {
         ));
         assert!(Builtin::Map(Box::new(Expr::Identity)).value_arg().is_none());
         assert!(Builtin::Type.with_value_arg(Expr::Identity).is_none());
+    }
+
+    /// #7474: a value argument that can yield more than one value is bound first, in jq's
+    /// nesting order, from the outermost argument down to the innermost one that needs it; a
+    /// call whose arguments each yield one value (an array or object construction included)
+    /// keeps its builtin shape, and yq mode never binds a generator.
+    #[test]
+    fn test_builtin_generator_value_args_are_bound_in_jq_order_7474() {
+        // One argument.
+        let bound = parse(r#"ltrimstr(.[])"#).unwrap();
+        assert!(
+            matches!(&bound, Expr::As { var, body, .. } if var == VALUE_ARG_VAR
+                && matches!(body.as_ref(), Expr::Builtin(Builtin::Ltrimstr(_)))),
+            "{bound:?}"
+        );
+        // `setpath(p; v)` nests `v` outermost; a generator `p` binds `v` too, so `v` is still
+        // evaluated first.
+        let Expr::As {
+            expr: outer,
+            var: outer_var,
+            body,
+        } = parse("setpath(.[]; 1)").unwrap()
+        else {
+            panic!("expected an outer binding");
+        };
+        assert_eq!(
+            (outer.as_ref(), outer_var.as_str()),
+            (
+                &Expr::Literal(Literal::number_literal("1".to_string())),
+                VALUE_ARG_VARS[0]
+            )
+        );
+        assert!(
+            matches!(body.as_ref(), Expr::As { expr, var, body }
+                if matches!(expr.as_ref(), Expr::Iterate) && var == VALUE_ARG_VARS[1]
+                && matches!(body.as_ref(), Expr::Builtin(Builtin::SetPath(p, v))
+                    if matches!(p.as_ref(), Expr::Var(n) if n == VALUE_ARG_VARS[1])
+                    && matches!(v.as_ref(), Expr::Var(n) if n == VALUE_ARG_VARS[0]))),
+            "{body:?}"
+        );
+        // A generator `v` binds only `v`: `p` is inner and stays in place.
+        assert!(matches!(
+            parse("setpath([\"a\"]; .[])").unwrap(),
+            Expr::As { body, .. } if matches!(body.as_ref(), Expr::Builtin(Builtin::SetPath(p, _))
+                if matches!(p.as_ref(), Expr::Array(_)))
+        ));
+        // `sub`'s replacement is a closure: a generator there is not bound.
+        assert!(matches!(
+            parse(r#"sub("a"; ("X", "Y"))"#).unwrap(),
+            Expr::Builtin(Builtin::Sub(..))
+        ));
+        // Single-valued arguments, constructions included, keep the builtin shape.
+        for program in [
+            r#"getpath(["a", "b"])"#,
+            r#"contains({"a": [1, 2]})"#,
+            r#"test("a"; "i")"#,
+            "has($k)",
+            "pow(.a; 2)",
+        ] {
+            let parsed = parse(program).unwrap();
+            assert!(matches!(parsed, Expr::Builtin(_)), "{program}: {parsed:?}");
+        }
+        // yq mode keeps the call as written.
+        let yq = parse_with_mode(r#"has(("a", "b"))"#, ParserMode::Yq).unwrap();
+        assert!(format!("{yq:?}").contains("Builtin(Has("), "{yq:?}");
+        assert!(!format!("{yq:?}").contains("As {"), "{yq:?}");
     }
 
     #[test]

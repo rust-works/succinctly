@@ -1536,18 +1536,28 @@ jq's `K | error`), which every route already drives through a live sink. It cove
 (`path(getpath(K))` and `del(getpath(K))` retry, as in jq). A program with no `?//` parses as
 before. What it leaves:
 
-- **Two-argument builtins** (`setpath`, `sub`, ...) and the closure-parameter builtins
-  (`with_entries(K)`) are not rebound.
-- **Only a `?//` written in the argument is bound.** An argument that reaches one through a user
-  function or a closure parameter (`def f: [1] as $q ?// $b | "a"; ... ltrimstr(f)`, `def g(x):
-  ltrimstr(x); g(K)`) or an imported one makes a single attempt where jq retries: the parser cannot
-  see behind the call, and binding every argument that calls a function changes how undefined
-  names are reported. A builtin whose name a definition shadows (`def has(x): ...`) is left as
-  written, so a call that still resolves to the builtin keeps the old behaviour.
+- **Since #7474 the binding covers more, in jq mode.**
+  An argument that can yield more than one value is bound too, so a user function or a closure parameter that reaches a `?//` (`def f: [1] as $q ?// $b | "a"; ... ltrimstr(f)`, `def g(x): ltrimstr(x); g(K)`) now retries as in jq, and so do the multi-argument builtins (`setpath`, `pow`, the libm functions, `test`/`match`/`capture`/`scan` with flags, `sub`/`gsub`'s regex and flags) and `format`, `nth`; see "A builtin's generator argument" below.
+  The closure-parameter builtins (`with_entries(K)`, `sub`'s replacement) are not rebound.
+  A builtin whose name a definition shadows (`def has(x): ...`) is left as written, so a call that still resolves to the builtin keeps the old behaviour.
 - **`path(B(K))` for a builtin that is not a path expression** (`path(ltrimstr(K))`,
   `path(inside(K))`, which jq answers or refuses on its own terms) retries where jq makes a
   single attempt: the path-mode retry of an "Invalid path expression" refusal is jq-specific and
   was already divergent before this change. `has` and the rest of the list above match.
+
+## A builtin's generator argument (#7474)
+
+jq runs a builtin whose argument it binds per value once per value of that argument, emitting each call's output before it pulls the next value.
+succinctly ran the argument to the end first and collected every call's output, so `"xa" | first(ltrimstr(repeat("x")))` never answered (growing memory) where jq prints `"a"`, and `"x" | first(ltrimstr(inputs | tostring))` read every input.
+In jq mode the parser now binds such an argument first, `G as $v | B($v)`, in jq's nesting order for the builtin (a C builtin's rightmost argument varies slowest, a `def f($a; $b)`'s leftmost), so a consumer's stop or an error the call raises ends the argument where jq does.
+A sweep of every builtin of arity 1 or more in jq 1.7.1's roster, with an endless generator in each argument position, found 81 positions jq answers and succinctly did not; `tests/jq_cli/i7474.rs` pins each one with its finite cartesian order and its error position.
+A call whose arguments each yield at most one value, an array or object construction included, is parsed as before.
+The compile-error report is unchanged: the resolver checks the binding as the call it was written as (`check_bound_value_args`).
+What it leaves:
+
+- **yq mode** is not rebound: real yq takes the first value of most of these arguments or refuses a second one, so `succinctly yq` keeps evaluating the argument before the call.
+- **A shadowed builtin name** (`def ltrimstr(x): ...` anywhere in the program) leaves every call to it as written, as above.
+- **Where jq never answers** (`sub("a"; repeat("X"))`, `split("a"; repeat(""))`, `sort_by(repeat(.))`), succinctly still raises its `repeat: maximum iterations exceeded` cap.
 
 ## `while`/`until` and a `?//` retry in `update` or `cond` (#3503, #3617)
 
