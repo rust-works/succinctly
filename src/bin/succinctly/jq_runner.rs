@@ -25625,7 +25625,12 @@ mod tests {
         /// sits, after `--args` included; with no word at all there is none.
         #[test]
         fn from_file_takes_the_first_positional_word_as_the_program_file() {
-            fn program_file(argv: &[&str]) -> (Option<String>, Option<PathBuf>, Vec<String>) {
+            type Resolved = (
+                Option<std::ffi::OsString>,
+                Option<PathBuf>,
+                Vec<std::ffi::OsString>,
+            );
+            fn program_file(argv: &[&str]) -> Resolved {
                 let mut cmd = JqCommand::try_parse_from(argv.iter().copied()).unwrap();
                 cmd.resolve_positional_args();
                 (cmd.filter, cmd.program_file, cmd.files)
@@ -25633,11 +25638,11 @@ mod tests {
             let file = |p: &str| Some(PathBuf::from(p));
             assert_eq!(
                 program_file(&["jq", "-f", "-r", "prog.jq", "in.json"]),
-                (None, file("prog.jq"), vec!["in.json".to_string()])
+                (None, file("prog.jq"), vec!["in.json".into()])
             );
             assert_eq!(
                 program_file(&["jq", "prog.jq", "in.json", "-f"]),
-                (None, file("prog.jq"), vec!["in.json".to_string()])
+                (None, file("prog.jq"), vec!["in.json".into()])
             );
             assert_eq!(
                 program_file(&["jq", "-f", "--args", "prog.jq", "a"]),
@@ -25646,11 +25651,7 @@ mod tests {
             assert_eq!(program_file(&["jq", "-n", "-f"]), (None, None, vec![]));
             assert_eq!(
                 program_file(&["jq", "prog.jq", "in.json"]),
-                (
-                    Some("prog.jq".to_string()),
-                    None,
-                    vec!["in.json".to_string()]
-                )
+                (Some("prog.jq".into()), None, vec!["in.json".into()])
             );
         }
 
