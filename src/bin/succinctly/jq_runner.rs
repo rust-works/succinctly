@@ -1077,7 +1077,13 @@ fn read_data_file(path: &Path) -> Result<OwnedValue, DataFileFailure> {
         path: canonical_or_self(path),
         detail,
     };
-    let contents = std::fs::read_to_string(path).map_err(|e| unreadable(strerror_only(&e)))?;
+    let bytes = std::fs::read(path).map_err(|e| unreadable(strerror_only(&e)))?;
+    // jq's parser reads the bytes (`jv_load_file`, as for `--slurpfile`), and a string's that are
+    // not UTF-8 are U+FFFD by the rule the main input's are (#7604).
+    let contents = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(e) => succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(e.as_bytes()),
+    };
     let values = parse_json_stream(&contents).map_err(|e| unreadable(format!("{e:#}")))?;
     Ok(OwnedValue::array_from(values))
 }
