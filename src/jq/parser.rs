@@ -14542,7 +14542,7 @@ mod tests {
         }
         for (src, repr, folded) in [
             ("-0", NumberRepr::Int(0), "0"),
-            ("-00", NumberRepr::Int(0), "00"),
+            ("-00", NumberRepr::Int(0), "0"),
             ("-0.0", NumberRepr::Float(0.0), "0.0"),
             ("-0e5", NumberRepr::Float(0.0), "0e5"),
         ] {

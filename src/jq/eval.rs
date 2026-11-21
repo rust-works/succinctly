@@ -167672,15 +167672,12 @@ mod tests {
                 assert_eq!(v.to_json(), r#"[{"start":1.5,"end":3.5}]"#);
             }
         );
-        // #1088's negation rule applies identically to a slice bound: the
-        // parser's own `-1 * <literal>` split destroys jq's literal
-        // spelling before the slice is ever built, so the bound becomes a
-        // computed double -- which happens to *render* bare when whole
-        // (jq's own convention for a computed value, not evidence the key
-        // was dropped; `-3.5:-1.5` below, non-whole, keeps its `.5`).
+        // #7453: jq 1.8 keeps a negated literal's spelling (jqlang/jq#3242),
+        // so a negative whole-valued bound keeps its `.0` like a positive
+        // one (jq 1.7.1 printed `-3` and `-1`).
         query!(br"[1,2,3,4,5]", r"path(.[-3.0:-1.0])",
             QueryResult::Owned(v) => {
-                assert_eq!(v.to_json(), r#"[{"start":-3,"end":-1}]"#);
+                assert_eq!(v.to_json(), r#"[{"start":-3.0,"end":-1.0}]"#);
             }
         );
         query!(br"[1,2,3,4,5]", r"path(.[-3.5:-1.5])",
