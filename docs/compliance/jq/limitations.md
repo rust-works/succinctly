@@ -10287,7 +10287,7 @@ jq 1.8.2 fixed the read as a memory-safety bug (jqlang/jq#3324, "Fix use of unin
 On 1.8.2 `printf '\x1en'` and `printf '\x1e"iu"\n\x1en\n'` both report `Invalid numeric literal` (the source says the same on every platform), where 1.7.1 reports `Invalid literal` for the second.
 `succinctly jq` follows 1.8.2 on every route that reads a stream of JSON texts: `--seq`, `--stream`, `--stream-errors`, and the plain, `-n` and `-s` routes (which never modelled the quirk).
 A token that really starts `nu` (`nu`, `nul`, `nulx`) is still `Invalid literal`, as in both versions.
-The difference from the pinned 1.7.1 is the ledger entries `cli:seq-bare-n-after-u` and `cli:stream-bare-n-after-u` (`newer-than-primary`), and `scripts/jq-seq-oracle-sweep.py`, which compares against 1.7.1, skips the streams that read the byte (`--expect-artifacts` includes them).
+The difference from the pinned 1.7.1 is the ledger entries `cli:stream-bare-n-after-u`, `cli:stream-errors-bare-n-after-u` and `cli:inputs-bare-n-after-u` (`newer-than-primary`; the compare harness reads stdout and the exit status, so `--seq`'s warning on standard error has none), and `scripts/jq-seq-oracle-sweep.py`, which compares against 1.7.1, skips the streams that read the byte (`--expect-artifacts` includes them).
 Pinned by `tests/jq_cli/i7525.rs`, whose rows are jq 1.8.2's output.
 
 The value path uses the same reader: values jq hands off before a malformed suffix are
