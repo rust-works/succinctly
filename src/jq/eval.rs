@@ -109063,7 +109063,9 @@ fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
             // jq hands the libc a buffer of `strlen(fmt) + 100` bytes and fails when `strftime`
             // returns 0: an empty result, or one that does not fit with its terminator (#5754).
-            if result.is_empty() || result.len() >= fmt.len() + 100 {
+            // jq 1.8 no longer fails on an empty *format*, whose empty result is the answer
+            // (`(n == 0 && *fmt) || n > max_size`, jqlang/jq#3271, #7542): 1.7.1 raised there too.
+            if (result.is_empty() && !fmt.is_empty()) || result.len() >= fmt.len() + 100 {
                 return if optional {
                     QueryResult::None // patchcov: coverage tolerate-line reason="`optional` is never true through either caller of this function, same as the arms above (#3068); a trailing ? is caught by the enclosing try"
                 } else {
